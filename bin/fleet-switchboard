@@ -3958,6 +3958,7 @@ class Switchboard:
             self._note("v2_reads.deferred", None, {"reads": self.reads.deferred})
         feed_tick(self)   # #290: the event feed's bounded re-sync and reconciliation reads (never raises)
         record_v2_calls(self)
+        record_github_calls(self)
         return report
 
     # -- render: the sidebar badge and the toast
@@ -9147,6 +9148,50 @@ def record_v2_calls(engine):
             pass
 
 
+GITHUB_CALLS_FILE = "github-calls.json"
+
+
+def record_github_calls(engine):
+    """After a pass: leave the GitHub read figures (by account and endpoint, the 304s, a pause) where `status` can read them. Never raises."""
+    try:
+        accounts = getattr(engine, "accounts", None)
+        if engine.state_dir is None or not isinstance(accounts, GhAccounts):
+            return
+        summary = accounts.call_summary(engine.now())
+        path = Path(engine.state_dir) / GITHUB_CALLS_FILE
+        state_write(path, json.dumps(summary, sort_keys=True) + "\n", _without(summary, "at"), STATE_HEARTBEAT_SECONDS, nofollow=True)
+    except Exception as err:
+        try:
+            engine._note("github_calls.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+        except Exception:
+            pass
+
+
+def github_calls_status(state_dir, now):
+    """The `status` lines for GitHub reads: `github calls/min by account: work 14 (issues/# 9, pulls 4), default 2 (5-min average 11/min; 5 not modified)`, and
+    `github: rate limited until 14:05, reads paused` while an account is paused. Empty list without a record."""
+    try:
+        body = json.loads((Path(state_dir) / GITHUB_CALLS_FILE).read_text())
+        lines = []
+        last = body["last_minute"]
+        parts = []
+        for account, endpoints in sorted(last.items(), key=lambda kv: -sum(kv[1].values())):
+            top = ", ".join("%s %d" % (name, n) for name, n in sorted(endpoints.items(), key=lambda kv: -kv[1])[:3])
+            parts.append("%s %d (%s)" % (_plain(account, 40), sum(endpoints.values()), top))
+        text = "%s (5-min average %.0f/min; %d not modified)" % (", ".join(parts) or "none", body["avg_5min"], body.get("not_modified", 0))
+        at = parse_iso(body.get("at"))
+        if at is not None and now - at > 120:
+            text += "; recorded %s ago: the daemon is not passing" % format_age(now - at)
+        lines.append("github calls/min by account: " + text)
+        for account, until in sorted((body.get("paused") or {}).items()):
+            moment = parse_iso(until)
+            if moment is not None and moment > now:
+                lines.append("github: rate limited until %s, reads paused (account %s)" % (time.strftime("%H:%M", time.localtime(moment)), _plain(account, 40)))
+        return lines
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return []
+
+
 def v2_calls_status(state_dir, now):
     """The `status` line text: `14/min (session.get 9, ...; 5-min average 11/min)`, or None without a record. Says so when the record is old."""
     try:
@@ -12076,7 +12121,19 @@ class GitHubHub:
         engine.hub = self  # PR 14: the decisions derivation reads the awaiting-user issues from it
         self.discover = lambda: engine.discover(engine.now())
         engine.sources.append(self.fact_source())
+        shared = getattr(engine, "accounts", None)
+        if isinstance(shared, GhAccounts):
+            self.accounts = shared   # the hub reads through the engine's gate: one pause and one counter for the account
+        reader = getattr(engine, "intents", None)
+        if reader is not None:
+            reader.live = self.forwarder_generation   # a repo with a live forwarder: its webhook invalidates, so an Intent may be trusted longer
         return engine
+
+    def forwarder_generation(self, repo):
+        """The number of times `repo`'s forwarder has started while it is running now, or None when it is not live (polling, down, starting): an entry
+        cached under one generation is trusted for the long time only while that same forwarder runs, so an event missed in a gap is never trusted."""
+        watch = self.watches.get(repo)
+        return watch.starts if watch is not None and watch.mode == "forwarder" else None
 
     def _audit(self, event, subject, detail):
         if self.audit is not None:
@@ -12247,9 +12304,17 @@ class GitHubHub:
     # -- an edit to an ask's Intent (PR 6's item and toast, which nothing called until now)
 
     def note_issue_edit(self, event, repo, payload):
-        """On an edited issue: drop its cached Intent, so the next message carries the new lines (a
+        """On a sub-issue event: forget the cached parent link and issue of both ends (a long-trusted entry must not outlive a change of the tree).
+        On an edited issue: drop its cached Intent, so the next message carries the new lines (a
         message built from the old cache said the old Done when), and hold the edit for the Chief of
         Staff when the Intent section itself changed. Never raises: a bad payload is only not surfaced."""
+        if event == "sub_issues":
+            reader = getattr(self.engine, "intents", None)
+            for key in ("sub_issue", "parent_issue"):
+                number = (payload.get(key) or {}).get("number")
+                if reader is not None and isinstance(number, int):
+                    reader.invalidate(number, repo)
+            return
         if event != "issues" or payload.get("action") != "edited":
             return
         try:
@@ -12742,8 +12807,15 @@ class GitHubHub:
         env = self.child_env(named.group(1)) if named else None
         extra = {"env": env} if env is not None else {}
         try:
-            done = self.runner(argv, capture_output=True, text=True,
-                               timeout=timeout or self.config["call_timeout_seconds"], **extra)
+            if named:   # counted, conditional (a 304 costs nothing) and paused while the account is rate limited
+                done = self.accounts.read(self.runner, path, named.group(1), timeout or self.config["call_timeout_seconds"], paginate=paginate)
+            else:
+                done = self.runner(argv, capture_output=True, text=True,
+                                   timeout=timeout or self.config["call_timeout_seconds"], **extra)
+        except GhRateLimited as err:
+            raise GitHubUnavailable(str(err)) from None
+        except AccountError as err:
+            raise GitHubUnavailable(str(err)) from None
         except (OSError, subprocess.SubprocessError) as err:
             raise GitHubUnavailable("gh api %s: %s" % (path.split("?")[0],
                                                        self.accounts.scrub(_one_line(str(err))))) from None
@@ -13203,6 +13275,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
     if state_ok:
         report["decisions"] = decisions_summary(state, now)
         report["v2_calls"] = v2_calls_status(state, now())
+        report["github_calls"] = github_calls_status(state, now())
         if config_ok and disk_guard_settings(config) is not None:
             report["disk"] = disk_status_line(config, state)   # one stat of the volume
         if config_ok and config.get("v2_light"):
@@ -13401,6 +13474,7 @@ def format_status(report):
     lines.extend(format_decisions_status(report["decisions"]) if "decisions" in report else [])
     lines.extend("      disk       " + report["disk"] for _ in [0] if report.get("disk"))
     lines.extend("      v2 calls   " + report["v2_calls"] for _ in [0] if report.get("v2_calls"))
+    lines.extend("      " + text for text in report.get("github_calls") or [])
     lines.extend("      v2_light   " + report["v2_light"] for _ in [0] if report.get("v2_light"))
     lines.extend(sweep_status_lines(report.get("sweep")))  # #117
     lines.extend(triage_status_lines(report.get("triage")))  # #130
@@ -13537,6 +13611,9 @@ def build_engine(runner, now, actor, writable=True, socket_call=None):
     engine = Switchboard(config, v2, herdr, audit, fact_sources(state), now, actor,
                          intents=intent_reader_for(config, runner, now), state_dir=state)
     engine.accounts = GhAccounts(config, runner, now)  # PR 15
+    engine.accounts.audit, engine.accounts.actor = audit, actor   # the rate-limit pause is audited, once per episode
+    if engine.intents is not None:
+        engine.intents.accounts = engine.accounts   # ONE gate for every read of one account: one pause, one counter, one set of remembered answers
     engine.gh_runner = runner  # PR notices
     return engine, state, config
 
@@ -14178,6 +14255,45 @@ TOKEN_ENV_NAMES = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_EN
 TOKEN_TTL = 60  # seconds a token is kept in memory; never written anywhere
 
 
+class GhRateLimited(Exception):
+    """A read the daemon did not make because the account's rate limit is spent until `until` (epoch)."""
+
+    def __init__(self, account, until):
+        self.account, self.until = account, until
+        super().__init__("github: rate limited until %s, reads paused" % time.strftime("%H:%M", time.localtime(until)))
+
+
+GH_ETAG_MAX = 400            # remembered answers (for a conditional read); the oldest go
+GH_ETAG_BODY_MAX = 262144    # an answer larger than this is not remembered
+GH_ETAG_BYTES_MAX = 8 * 1024 * 1024   # and all the remembered answers together stay under this: the oldest go
+GH_LIMIT_MIN_PAUSE = 30      # a pause is at least this long (a reset that is in the past is not a reason to try at once)
+GH_LIMIT_MAX_PAUSE = 3700    # and at most an hour and a little: a bad header cannot stop reads for a day
+GH_LIMIT_DEFAULT_PAUSE = 120 # the limit was said but not when it lifts
+_HTTP_HEAD = re.compile(r"\AHTTP/\S+\s+(\d{3})[^\r\n]*\r?\n")
+
+
+def _split_http(text):
+    """(status, {lower-case header: value}, body) of `gh api -i` output, or (None, {}, text) when it has no HTTP header block."""
+    found = _HTTP_HEAD.match(text or "")
+    if found is None:
+        return None, {}, text
+    rest = text[found.end():]
+    split = re.search(r"\r?\n\r?\n", rest)
+    head, body = (rest[:split.start()], rest[split.end():]) if split else (rest, "")
+    headers = {}
+    for line in head.splitlines():
+        name, _, value = line.partition(":")
+        if value:
+            headers[name.strip().lower()] = value.strip()
+    return int(found.group(1)), headers, body
+
+
+def _endpoint_of(path):
+    """A path as the counter groups it: no repo, no query, numbers as `#` (`repos/o/r/issues/12/parent` -> `issues/#/parent`)."""
+    bare = re.sub(r"^repos/[^/]+/[^/]+/?", "", path.split("?")[0])
+    return re.sub(r"\d+", "#", bare) or "repo"
+
+
 class GhAccounts:
     """Which gh account a repo uses, and its token at the moment of use.
 
@@ -14192,6 +14308,12 @@ class GhAccounts:
         self.config, self.runner, self.now = config, runner, now
         self.environ = os.environ if environ is None else environ
         self._tokens = {}
+        self.etags = collections.OrderedDict()   # (account, path) -> (etag, body): for a conditional read; memory only, bounded
+        self.calls = collections.deque()         # (time, account, endpoint, answered 304) of every read through `read`, newest last
+        self.paused = {}                         # account -> epoch until which its non-essential reads wait (the limit's reset)
+        self.limited_once = set()                # accounts whose pause was audited, so it is said once per episode
+        self.lock = threading.Lock()             # the hub's threads and the pass read through one gate
+        self.audit, self.actor = None, "daemon"
 
     def account_for(self, repo):
         if fault("one-account"):
@@ -14243,6 +14365,101 @@ class GhAccounts:
     def describe(self, repo):
         """The account name `status` shows. Never a token."""
         return self.account_for(repo) or "default"
+
+    # -- reads: counted, conditional (ETag) and paused while the account is rate limited
+
+    def read(self, runner, path, repo, timeout, essential=False, paginate=False, **run_kwargs):
+        """One `gh api <path>` GET with the repo's account. Returns a CompletedProcess like the runner's, its stdout the BODY only:
+
+          - a read GitHub answered `304 Not Modified` to (we send the ETag we hold) is answered from memory and costs nothing against the limit;
+          - every read is counted by account and endpoint (`status` shows them);
+          - a 403/429 that says the limit is spent pauses every NON-essential read of that account until the limit resets (GhRateLimited is raised
+            at once, no process is started); `essential` reads (a delivery, a re-check before a write) are never held back.
+        A runner whose answer has no HTTP header block (a fake, `--paginate`) is passed through as it is."""
+        account = self.describe(repo)
+        now = self.now()
+        with self.lock:
+            until = self.paused.get(account)
+            if until is not None and now >= until:
+                self.paused.pop(account, None)
+                self.limited_once.discard(account)
+                self._audit("github.rate_resumed", account, {})
+                until = None
+            if until is not None and not essential:
+                raise GhRateLimited(account, until)
+            cached = None if paginate else self.etags.get((account, path))
+        argv = [self.config["gh"], "api"] + (["--paginate"] if paginate else []) + [path]
+        if not paginate:
+            argv += ["-i"] + (["-H", "If-None-Match: " + cached[0]] if cached else [])
+        env = self.env_for(repo) if repo else None
+        if env is not None:
+            run_kwargs["env"] = env
+        done = runner(argv, capture_output=True, text=True, timeout=timeout, **run_kwargs)
+        status, headers, body = _split_http(done.stdout) if not paginate else (None, {}, done.stdout)
+        with self.lock:
+            self.calls.append((now, account, _endpoint_of(path), status == 304))
+            while self.calls and self.calls[0][0] < now - 600:
+                self.calls.popleft()
+        if status is None:
+            return done
+        if status == 304 and cached is not None:
+            with self.lock:
+                self.etags.move_to_end((account, path))
+            return subprocess.CompletedProcess(argv, 0, cached[1], "")
+        if 200 <= status < 300:
+            etag = headers.get("etag")
+            if etag and len(body) <= GH_ETAG_BODY_MAX and "since=" not in path:   # a moving window never repeats: nothing to be conditional about
+                with self.lock:
+                    self.etags[(account, path)] = (etag, body)
+                    self.etags.move_to_end((account, path))
+                    while len(self.etags) > GH_ETAG_MAX or sum(len(v[1]) for v in self.etags.values()) > GH_ETAG_BYTES_MAX:
+                        self.etags.popitem(last=False)
+            return subprocess.CompletedProcess(argv, done.returncode, body, done.stderr)
+        if status in (403, 429):
+            reset = self._limit_reset(status, headers, body, now)
+            if reset is not None:
+                with self.lock:
+                    self.paused[account] = reset
+                    first = account not in self.limited_once
+                    self.limited_once.add(account)
+                if first:
+                    self._audit("github.rate_limited", account, {"until": iso(reset), "status": status})
+        return subprocess.CompletedProcess(argv, done.returncode or 1, body, done.stderr or ("HTTP %d" % status))
+
+    @staticmethod
+    def _limit_reset(status, headers, body, now):
+        """When a 403/429 that is the rate limit lets reads go on again (epoch), or None when it is some other refusal (a 403 for a private repo)."""
+        remaining, reset, retry = headers.get("x-ratelimit-remaining"), headers.get("x-ratelimit-reset"), headers.get("retry-after")
+        limited = status == 429 or remaining == "0" or retry is not None or re.search(r"rate limit", body or "", re.I) is not None
+        if not limited:
+            return None
+        until = None
+        if retry is not None and retry.isdigit():
+            until = now + int(retry)
+        elif remaining == "0" and reset is not None and reset.isdigit():
+            until = float(reset)
+        if until is None:
+            until = now + GH_LIMIT_DEFAULT_PAUSE
+        return min(max(until, now + GH_LIMIT_MIN_PAUSE), now + GH_LIMIT_MAX_PAUSE)
+
+    def _audit(self, event, subject, detail):
+        try:
+            if self.audit is not None:
+                self.audit.append(self.actor, event, subject, detail)
+        except Exception:
+            pass   # evidence only
+
+    def call_summary(self, now):
+        """{"at", "last_minute": {account: {endpoint: n}}, "avg_5min": n/min, "not_modified": n (last minute), "paused": {account: iso}}."""
+        with self.lock:
+            recent = [c for c in self.calls if c[0] >= now - 300]
+            paused = {a: u for a, u in self.paused.items() if u > now}
+        last = collections.defaultdict(collections.Counter)
+        for at, account, endpoint, _ in recent:
+            if at >= now - 60:
+                last[account][endpoint] += 1
+        return {"at": iso(now), "last_minute": {a: dict(c) for a, c in sorted(last.items())}, "avg_5min": round(len(recent) / 5.0, 1),
+                "not_modified": sum(1 for c in recent if c[0] >= now - 60 and c[3]), "paused": {a: iso(u) for a, u in sorted(paused.items())}}
 
 
 def launch_account_problem(config, accounts, repo):
@@ -14302,6 +14519,7 @@ DEFAULTS.update(INTENT_DEFAULTS)
 
 NO_INTENT = "no intent recorded"
 INTENT_TTL = 300        # seconds a cached issue is trusted; a webhook invalidates it sooner
+INTENT_TTL_LIVE = 1800  # ... while the repo's webhook forwarder is live (the same one that cached it): the webhook is what invalidates
 INTENT_LINE_LIMIT = 240  # characters per header line
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
@@ -14428,6 +14646,7 @@ class IntentReader:
         self.timeout, self.ttl = timeout, ttl
         self.accounts = accounts  # PR 15: a GhAccounts; None reads every repo with the default account
         self._cache = {}
+        self.live, self.live_ttl = None, INTENT_TTL_LIVE   # live(repo) -> the running forwarder's generation, or None (the hub sets it)
 
     # -- GitHub
 
@@ -14445,8 +14664,15 @@ class IntentReader:
         env = self.env_for(repo)
         extra = {"env": env} if env is not None else {}
         try:
-            result = self.runner(argv, capture_output=True, text=True, timeout=self.timeout,
-                                 stdin=subprocess.DEVNULL, **extra)
+            if self.accounts is not None and repo:   # counted, conditional (a 304 costs nothing) and paused while the account is rate limited
+                result = self.accounts.read(self.runner, path, repo, self.timeout, stdin=subprocess.DEVNULL)
+            else:
+                result = self.runner(argv, capture_output=True, text=True, timeout=self.timeout,
+                                     stdin=subprocess.DEVNULL, **extra)
+        except GhRateLimited as err:
+            raise IntentError("unavailable", str(err)) from None
+        except AccountError as err:
+            raise IntentError("gh", str(err)) from None
         except subprocess.TimeoutExpired:
             raise IntentError("unavailable", "gh did not answer within %ss" % self.timeout) from None
         except OSError as err:
@@ -14463,12 +14689,24 @@ class IntentReader:
         except ValueError:
             raise IntentError("gh", "gh returned non-JSON: %s" % _one_line(result.stdout, 120)) from None
 
+    def _generation(self, key):
+        """The running forwarder's generation for this entry's repo (for the long-lived kinds), or None."""
+        if self.live is None or self.ttl <= 0 or key[0] not in ("issue", "parent"):
+            return None
+        try:
+            return self.live(key[1])
+        except Exception:
+            return None
+
     def _cached(self, key, fetch):
         hit = self._cache.get(key)
-        if hit is not None and self.now() - hit[0] < self.ttl:
-            return hit[1]
+        if hit is not None:
+            gen = hit[2] if len(hit) > 2 else None
+            ttl = self.live_ttl if gen is not None and gen == self._generation(key) else self.ttl   # long only under the SAME live forwarder: its webhook invalidates
+            if self.now() - hit[0] < ttl:
+                return hit[1]
         value = fetch()
-        self._cache[key] = (self.now(), value)
+        self._cache[key] = (self.now(), value, self._generation(key))
         return value
 
     def invalidate(self, issue, repo=None):
