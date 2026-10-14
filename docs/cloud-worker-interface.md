@@ -20,7 +20,7 @@ One program, `cloud-worker <command>`; every command takes `--json` (one JSON ob
 
 Exit codes: `0` done; `1` the end hook could not push, **the pod is kept** (stop only); `2` bad usage or unknown worker;
 `3` the cloud refused (quota, identity, cap); `4` timed out waiting for the worker; `5` the spend cap is reached
-(create only; **OPEN**: who sets the cap and where). Every other failure is `1` with a one-line reason on stderr.
+(create only; **OPEN**: who sets the cap and where); `6` refused: `delete` before the end hook ran without `--force`, or `extend` past `--max-hard`. Every other failure is `1` with a one-line reason on stderr.
 A command is idempotent: a repeated `stop` or `delete` of a worker that is gone exits `0`.
 
 ## 2. Worker environment (slices A and B)
@@ -38,15 +38,14 @@ scan that fails the image build when any stored credential, host key or build us
 
 ## 3. Endpoint record and the switchboard mapping (slices B and C)
 
-Kept by the switchboard per cloud worker, in its state directory, mode 0600 (a JSON file per worker):
+Owned by the switchboard (slice C), in its state directory, mode 0600 (a JSON file per worker, path built only from the validated worker name). Slice B never touches the file: `create`, `extend`, `stop` and `delete` print their result and C applies it to the record. The record's deadlines are the source of truth; the pod's `FLEET_HARD_DEADLINE` is its start-time copy and the reaper re-reads the record.
 
 ```json
 {"worker": "coder7", "url": "https://worker-coder7.example.internal:4096", "auth_ref": "file:/run/fleet/coder7.password",
  "runtime_id": "pod/coder7-7f9c", "idle_deadline": "2026-10-14T12:10:00Z", "hard_deadline": "2026-10-14T14:00:00Z"}
 ```
 
-`auth_ref` names where the password is (a file path); the record never holds it. `create` writes the record, `stop` and
-`delete` remove it.
+`auth_ref` names where the switchboard host keeps its own copy of the password (a file path, never taken from caller input, mode 0600: it protects only against other local users); the record never holds it. The pod's copy (`/run/fleet/server-password`) is a separate file on the pod side. `create` returns the password once, on a file descriptor named in its output, for C to store. C creates the record from `create`'s output and removes it after `stop` or `delete`.
 
 | Switchboard verb | On a cloud worker |
 |---|---|
@@ -64,16 +63,16 @@ else). Reachability is over a private network and a TLS proxy (A and B own that;
 One line per `create`, `stop`, `extend` and `delete`, appended before the action returns, JSON, no secret:
 
 ```json
-{"ts": "2026-10-14T12:00:00Z", "worker": "coder7", "runtime_id": "pod/coder7-7f9c", "action": "create", "cost_estimate_usd": 0.07}
+{"ts": "2026-10-14T12:00:00Z", "worker": "coder7", "runtime_id": "pod/coder7-7f9c", "action": "create", "cost_estimate_usd": 0.07, "ok": true, "actor": "operator", "reason": ""}
 ```
 
 `cost_estimate_usd` is the list-price estimate of the pod so far (zero on create; elapsed hours times the shape's rate
-on the others). It is an estimate, not a billed figure. A failed action still writes its line with `"ok": false`.
+on the others). It is an estimate, not a billed figure. A failed action still writes its line with `"ok": false`. `actor` is taken from the session, never from an argument; `reason` carries `--reason` (for `stop`, `extend` and `delete --force`).
 
 ## 5. End hook (slices A and B)
 
 Runs inside the pod on `stop`, a hard deadline, an idle stop and a node drain notice, before anything is deleted:
-1. If the working tree has uncommitted changes, commit them on a WIP commit; if HEAD is on no remote branch, push it to `<worker>/wip`.
+1. If the working tree has uncommitted changes, commit them (files matching the secret-scan patterns and the ignore list are left out, and the hook reports them) on a WIP commit; if HEAD is on no remote branch, push it to `<worker>/wip`.
 2. Push success: report `{pushed: true, wip_branch}` and let the launcher delete the pod.
 3. Push failure: **keep the pod**, report the reason, and `stop` exits `1`. The pod stays until `delete --force` or its next stop succeeds. A kept pod still obeys the hard limit's cost cap (**OPEN**: whether a kept pod may exceed the hard limit, and who is alerted).
 
