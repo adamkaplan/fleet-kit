@@ -39902,8 +39902,9 @@ class FakePruneDocker:
     `prune_calls` are the prune commands only (the read-only questions are in `calls`)."""
 
     def __init__(self, version="29.7.2", volumes=(), exits=(0, 0, 0), outputs=("Total reclaimed space: 1.2GB", "Total reclaimed space: 300MB", "Total reclaimed space: 5MB"),
-                 version_code=0):
+                 version_code=0, platform="Docker Desktop 4.89.0", server_api="1.55", client_api="1.55", df_fails=False):
         self.version, self.volumes, self.version_code = version, list(volumes), version_code
+        self.platform, self.server_api, self.client_api, self.df_fails = platform, server_api, client_api, df_fails
         self.calls, self.prune_calls = [], []
         self.replies = iter(zip(exits, outputs))
 
@@ -39912,7 +39913,7 @@ class FakePruneDocker:
         self.calls.append(a)
         out = lambda text, code=0, err="": subprocess.CompletedProcess(argv, code, text, err)
         if a[:1] == ["version"]:
-            return out(self.version + "\n", self.version_code, "no server" if self.version_code else "")
+            return out("%s|%s|%s|%s\n" % (self.version, self.platform, self.server_api, self.client_api), self.version_code, "no server" if self.version_code else "")
         if a[:2] == ["volume", "ls"]:
             return out("\n".join(v[0] for v in self.volumes if v[2]))
         if a[:1] == ["inspect"]:
@@ -39920,6 +39921,8 @@ class FakePruneDocker:
             return out(json.dumps([{"Name": v[0], "Labels": ({"com.docker.volume.anonymous": ""} if v[1] else {"x": "y"})} for v in self.volumes if v[0] in ids]))
         if a[:2] == ["system", "df"] and "-v" not in a:
             return out("TYPE TOTAL SIZE\nImages 3 1.2GB\n")
+        if a[:2] == ["system", "df"] and self.df_fails:
+            return out("", 1, "df failed")
         if a[:2] == ["system", "df"]:
             return out(json.dumps([{"Name": v[0], "Size": v[3]} for v in self.volumes]))
         if "prune" in a:
@@ -40019,7 +40022,7 @@ class TestDiskReport(Base):
     def test_s2_docker_is_asked_once_by_the_report_and_never_by_the_status_pass(self):
         code, out, err = self.report("report")
         self.assertEqual(self.calls.count(["system", "df"]), 1, "one docker system df")
-        self.assertEqual([c for c in self.calls if c[:1] in (["rm"], ["prune"]) or "prune" in c or "rm" in c], [], "the report only asks")
+        self.assertEqual([c for c in self.calls if "prune" in c or "rm" in c], [], "the report only asks")
         self.assertIn("Images 3 1.2GB", out)
         self.calls.clear()
         with captured():
@@ -40130,7 +40133,7 @@ class TestDiskReport(Base):
         self.assertEqual(code, 0, err)
         self.assertIn("orphans", out)
         with captured() as (out, err):
-            code = sb.main(["disk", "prune", "--dry-run", "--docker", str(self.docker_path)], runner=self.runner(), now=self.world.clock.now)
+            code = sb.main(["disk", "prune", "--dry-run", "--docker", str(self.docker_path)], runner=FakePruneDocker(), now=self.world.clock.now)
         self.assertEqual(code, 0)
         self.assertIn("builder prune", out.getvalue())
         self.assertIn("image prune", out.getvalue())
@@ -40621,27 +40624,66 @@ class TestDiskGuard(Base):
         self.assertNotIn("\x1b", out)
         self.assertIn("would run docker volume prune -f (never -a)", out)
 
-    def test_an_old_or_unreadable_server_refuses_the_volume_prune_and_the_other_two_still_run(self):
-        for version, code_ in (("22.0.1", 0), ("", 1)):
-            with self.subTest(version=version):
-                fake = FakePruneDocker(version=version, version_code=code_, exits=(0, 0), outputs=("", ""))
+    def test_an_unsafe_or_unreadable_server_refuses_the_volume_prune_and_the_other_two_still_run(self):
+        cases = (("22.0.1", {"server_api": "1.41", "client_api": "1.41"}, sb.EXIT_OK), ("", {"version_code": 1}, sb.EXIT_ERROR),
+                 ("29.7.2", {"client_api": "1.41"}, sb.EXIT_OK),                       # a new server reached by an old-API client
+                 ("29.7.2", {"platform": "podman 5.1"}, sb.EXIT_OK))                  # a compatible program, not Docker
+        for version, extra, want in cases:
+            with self.subTest(version=version, extra=extra):
+                fake = FakePruneDocker(version=version or "29.7.2", exits=(0, 0), outputs=("", ""), **extra)
                 code, out, err, calls = self.prune(fake=fake)
                 self.assertEqual([c[1:3] for c in calls], [["builder", "prune"], ["image", "prune"]])
                 self.assertIn("volume prune: refused", out)
-                self.assertEqual(code, sb.EXIT_OK if version else sb.EXIT_ERROR)
-        fake = FakePruneDocker(version="23.0.0", exits=(0, 0, 0), outputs=("", "", ""))
-        self.assertEqual(len(self.prune(fake=fake)[3]), 3, "23.0 is the first version that runs it")
+                self.assertEqual(code, want)
+        with mock.patch.dict(os.environ, {"DOCKER_API_VERSION": "1.41"}):
+            code, out, err, calls = self.prune(fake=FakePruneDocker(exits=(0, 0), outputs=("", "")))
+        self.assertEqual(len(calls), 2)
+        self.assertIn("DOCKER_API_VERSION=1.41", out)
+        fake = FakePruneDocker(version="23.0.0", server_api="1.42", client_api="1.42", exits=(0, 0, 0), outputs=("", "", ""))
+        self.assertEqual(len(self.prune(fake=fake)[3]), 3, "23.0 and API 1.42 are the first that run it")
+
+    def test_a_dry_run_on_an_unsafe_server_says_refused_and_does_not_say_it_would_run(self):
+        code, out, err, calls = self.prune("--dry-run", fake=FakePruneDocker(version="22.0.1", server_api="1.41", client_api="1.41"))
+        self.assertIn("volume prune: refused", out)
+        self.assertNotIn("would run docker volume prune", out)
+
+    def test_a_dry_run_caps_its_list_counts_past_the_examine_limit_and_says_when_a_size_or_list_is_unreadable(self):
+        many = tuple(("v%03d" % i, True, True, "1MB") for i in range(25))
+        code, out, err, calls = self.prune("--dry-run", fake=FakePruneDocker(volumes=many))
+        self.assertIn("candidate anonymous volumes: 25 (25.0 MB)", out)
+        self.assertIn("5 more", out)
+        with mock.patch.object(sb, "DISK_VOLUME_LIMIT", 10):
+            code, out, err, calls = self.prune("--dry-run", fake=FakePruneDocker(volumes=many))
+        self.assertIn("candidate anonymous volumes: >=10 ", out)
+        code, out, err, calls = self.prune("--dry-run", fake=FakePruneDocker(volumes=many, df_fails=True))
+        self.assertIn("25 (size not read)", out)
+
+    def test_a_failing_or_raising_volume_prune_is_said_exits_with_an_error_and_the_first_two_still_ran(self):
+        fake = FakePruneDocker(exits=(0, 0, 1), outputs=("", "", ""))
+        code, out, err, calls = self.prune(fake=fake)
+        self.assertEqual((code, len(calls)), (sb.EXIT_ERROR, 3))
+        self.assertIn("volume prune: failed (exit 1)", out)
+        real = FakePruneDocker()
+
+        def runner(argv, **kwargs):
+            if argv[1:3] == ["volume", "prune"]:
+                raise subprocess.TimeoutExpired(argv, 600)
+            return real(argv, **kwargs)
+        with captured() as (out, err):
+            code = sb.main(["disk", "prune", "--docker", self.fake_docker()], runner=runner, now=self.world.clock.now)
+        self.assertEqual(code, sb.EXIT_ERROR)
+        self.assertIn("volume prune: failed", out.getvalue())
 
     def test_the_volume_prune_never_carries_all_in_any_server_version(self):
         for version in ("23.0.0", "27.3.1", "29.7.2"):
             fake = FakePruneDocker(version=version)
             self.prune(fake=fake)
             self.assertIn(["volume", "prune", "-f"], fake.prune_calls)
-            self.assertEqual([c for c in fake.prune_calls if "-a" in c and "volume" in c or "--all" in c], [])
+            self.assertEqual([c for c in fake.prune_calls if ("-a" in c and "volume" in c) or "--all" in c], [])
 
     def test_the_docs_state_the_three_commands_the_version_gate_and_the_reason(self):
         text = (REPO / "docs" / "switchboard.md").read_text()
-        for phrase in ("docker volume prune -f", "23.0", "cannot carry labels", "never `-a` or `--all`"):
+        for phrase in ("docker volume prune -f", "23.0", "1.42", "cannot carry labels", "never `-a` or `--all`"):
             self.assertIn(phrase, text)
 
     def test_without_docker_it_refuses_and_runs_nothing(self):

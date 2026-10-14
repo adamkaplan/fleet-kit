@@ -18075,6 +18075,8 @@ DISK_PRUNE_COMMANDS = (("docker", "builder", "prune", "-f", "--filter", "until=1
 DISK_PRUNE_TIMEOUT = 600
 DISK_VOLUME_PRUNE = ("volume", "prune", "-f")       # NEVER -a or --all
 DISK_VOLUME_MIN_ENGINE = (23, 0)                    # from here `volume prune` removes only ANONYMOUS volumes
+DISK_VOLUME_MIN_API = (1, 42)                       # the API of Docker 23.0
+DISK_VOLUME_READ_BYTES = 1000000                    # docker output parsed: no more than this
 DISK_ANONYMOUS_LABEL = "com.docker.volume.anonymous"
 DISK_VOLUME_LIMIT = 200                             # volumes examined: past it the count is "at least"
 DISK_VOLUME_SECONDS = 30
@@ -18082,14 +18084,34 @@ _SIZE_UNITS = {"B": 1, "KB": 10 ** 3, "MB": 10 ** 6, "GB": 10 ** 9, "TB": 10 ** 
 _RECLAIMED = re.compile(r"Total reclaimed space:\s*(\S+)", re.I)
 
 
-def docker_server_version(docker, runner):
-    """(major, minor) of the docker SERVER, or None when it cannot be read."""
-    try:
-        done = runner([docker, "version", "--format", "{{.Server.Version}}"], capture_output=True, text=True, timeout=DISK_VOLUME_SECONDS, stdin=subprocess.DEVNULL)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    found = re.match(r"\s*(\d{1,4})\.(\d{1,4})", done.stdout or "") if done.returncode == 0 else None
+def _version_pair(text):
+    found = re.match(r"\s*(\d{1,4})\.(\d{1,4})", text or "")
     return (int(found.group(1)), int(found.group(2))) if found else None
+
+
+def docker_volume_prune_gate(docker, runner):
+    """(ok, why): is it safe to run `docker volume prune -f`? Only when ALL hold: the server is Docker (Engine or Desktop: a compatible program such as podman
+    prunes every unused volume), its version is 23.0 or newer, the API both ends speak is 1.42 or newer (an older API makes the daemon prune EVERY unused
+    volume, named ones too, whatever the server version), and `DOCKER_API_VERSION` does not pin it lower. Anything unreadable refuses."""
+    try:
+        done = runner([docker, "version", "--format", "{{.Server.Version}}|{{.Server.Platform.Name}}|{{.Server.APIVersion}}|{{.Client.APIVersion}}"],
+                      capture_output=True, text=True, timeout=DISK_VOLUME_SECONDS, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return False, "the docker server version could not be read"
+    parts = (done.stdout or "")[:2000].strip().split("|") if done.returncode == 0 else []
+    if len(parts) != 4 or _version_pair(parts[0]) is None or _version_pair(parts[2]) is None or _version_pair(parts[3]) is None:
+        return False, "the docker server version could not be read"
+    version, platform, server_api, client_api = _version_pair(parts[0]), parts[1], _version_pair(parts[2]), _version_pair(parts[3])
+    if not platform.strip().lower().startswith("docker"):
+        return False, "the server is %r, not Docker Engine or Docker Desktop" % _plain(platform, 40)
+    if version < DISK_VOLUME_MIN_ENGINE:
+        return False, "docker server %d.%d is older than 23.0, where `volume prune` removes named volumes too" % version
+    pinned = os.environ.get("DOCKER_API_VERSION", "").strip()
+    if pinned and (_version_pair(pinned) is None or _version_pair(pinned) < DISK_VOLUME_MIN_API):
+        return False, "DOCKER_API_VERSION=%s pins the API below 1.42, where `volume prune` removes named volumes too" % _plain(pinned, 20)
+    if min(server_api, client_api) < DISK_VOLUME_MIN_API:
+        return False, "the docker API in use is %d.%d, below 1.42, where `volume prune` removes named volumes too" % min(server_api, client_api)
+    return True, ""
 
 
 def _volume_bytes(text):
@@ -18105,7 +18127,7 @@ def anonymous_volumes(docker, runner):
         done = runner([docker] + list(argv), capture_output=True, text=True, timeout=DISK_VOLUME_SECONDS, stdin=subprocess.DEVNULL)
         if done.returncode != 0:
             raise OSError("docker %s: exit %s: %s" % (" ".join(argv[:2]), done.returncode, _plain(done.stderr or done.stdout, 160)))
-        return done.stdout or ""
+        return (done.stdout or "")[:DISK_VOLUME_READ_BYTES]
     listed = [l.strip() for l in run(("volume", "ls", "-q", "-f", "dangling=true")).splitlines() if l.strip()]
     ids = [l for l in listed if _DOCKER_ID["volume"].fullmatch(l)]
     complete = len(ids) <= DISK_VOLUME_LIMIT
@@ -18134,11 +18156,9 @@ def anonymous_volumes_line(docker, runner):
 
 def disk_volume_step(docker, runner, dry_run):
     """The third prune step. Returns (status, lines). Refused unless the server is 23.0 or newer."""
-    version = docker_server_version(docker, runner)
-    if version is None:
-        return EXIT_ERROR, ["volume prune: refused: the docker server version could not be read, and before 23.0 `volume prune` removes named volumes too"]
-    if version < DISK_VOLUME_MIN_ENGINE:
-        return EXIT_OK, ["volume prune: refused: docker server %d.%d is older than 23.0, where `volume prune` removes named volumes too; the other two ran" % version]
+    ok, why = docker_volume_prune_gate(docker, runner)
+    if not ok:
+        return (EXIT_ERROR if "could not be read" in why else EXIT_OK), ["volume prune: refused: %s; the other two ran" % why]
     lines = []
     if dry_run:
         try:
@@ -18198,9 +18218,10 @@ def cmd_disk_prune(args, runner, now):
         print("dry run: %s would run, in order, and nothing else (never `-a` on a volume, a running container or `system prune`):" % PROG)
         for argv in commands:
             print("  " + " ".join(shlex.quote(a) for a in argv))
-        for line in disk_volume_step(docker, runner, True)[1]:
+        volume_status, volume_lines = disk_volume_step(docker, runner, True)
+        for line in volume_lines:
             print(line)
-        return EXIT_OK
+        return volume_status
     before = disk_free(ensure_state_dir())
     status = EXIT_OK
     for argv in commands:
