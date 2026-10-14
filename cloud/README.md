@@ -108,3 +108,14 @@ kubectl delete pod worker-s10
 
 Not run by the author (no cluster available): everything in this section. The token-lifetime half of S10 (at most 60
 minutes) belongs to the launcher.
+
+## Trust boundaries and limits
+
+- `containerd-fix.yaml` is a node-root component: privileged, `hostPID`, and a ClusterRole that can `get` and `patch`
+  nodes. The label `sysbox-install=yes` is the only gate on where it runs; restrict who may label nodes.
+- Sysbox is the boundary that makes the worker's `docker` group and `sudo start-dockerd` safe. Do not run the image
+  outside a Sysbox pod with `WORKER_DOCKER` left at 1 on a shared host.
+- The scan finds known credential shapes only; "0 hits" is not proof that no secret exists.
+- `OPENCODE_VERSION` defaults to `latest` and the fixer image is pinned by tag, not digest: pin both for a release.
+- `cloud/tests/test-cloud` is not yet run by CI (this change is limited to `cloud/`); it needs Docker for the image cases
+  (`CLOUD_TEST_SKIP_DOCKER=1` skips them explicitly).
