@@ -245,7 +245,7 @@ class TestConfig(Base):
             "awaiting_cos_label": None, "decisions_cos_grace_seconds": 300, "cos_orders_file": None,  # PR 18
             "pr_notice_hold_minutes": 0,  # PR notices
             "intent_repo": None, "intent_required": True,
-            "gh_users": {}, "github_poll_seconds": 60,  # PR 15
+            "gh_users": {}, "github_poll_seconds": 60, "intent_live_silence_minutes": 10,  # PR 15
             "classifier_mode": "shadow", "busy_poll_seconds": 1,  # PR 8
             "policy": sb.POLICY_DEFAULTS,  # PR 9
             **sb.V1_MOVE_DEFAULTS})  # PR 10: pinned in TestImportV1Config
