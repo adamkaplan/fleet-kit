@@ -838,6 +838,9 @@ def _one_line(text, limit=300):
 
 
 STATE_HEARTBEAT_SECONDS = 60   # a status file whose own timestamp is its liveness signal is rewritten at least this often, changed or not (`status` calls v2-calls stale past 120 s: a pass of 30 s fits twice)
+HEARTBEAT_HEALTH = STATE_HEARTBEAT_SECONDS * 8   # pane-health.json: 8 minutes (nothing reads its times as liveness)
+HEARTBEAT_SWEEP = STATE_HEARTBEAT_SECONDS * 4    # sweep.json and triage.json: 4 minutes (their `at` is shown as an absolute "as of")
+HEARTBEAT_PR_STATE = 300                         # pr-state.json: 5 minutes
 _STATE_LAST = {}               # path -> (stable text, monotonic time written): what this process last wrote
 
 
@@ -4590,12 +4593,12 @@ def read_pane_health(state_dir):
 
 
 def write_pane_health(state_dir, data):
-    """pane-health.json, only when it changed (its `at`, each agent's `seen` and a live pane's `at` do not count), and at least every 12 minutes."""
+    """pane-health.json, only when it changed (its `at`, each agent's `seen` and a live pane's `at` do not count), and at least every HEARTBEAT_HEALTH seconds (8 minutes)."""
     stable = {k: v for k, v in data.items() if k != "at"}
     stable["agents"] = {name: {k: v for k, v in (row if isinstance(row, dict) else {}).items() if k != "seen"} for name, row in (data.get("agents") or {}).items()}   # `seen` moves every pass and nothing reads it
     stable["states"] = {name: {k: v for k, v in (row if isinstance(row, dict) else {}).items() if k != "at" or (row or {}).get("state") == PANE_DEAD}
                         for name, row in (data.get("states") or {}).items()}   # a live pane's `at` is when it was last checked; only a dead one's is read (when to forget it)
-    state_write(Path(state_dir) / PANE_HEALTH_FILE, json.dumps(data, indent=1, sort_keys=True) + "\n", json.dumps(stable, sort_keys=True), STATE_HEARTBEAT_SECONDS * 8, fsync=True)
+    state_write(Path(state_dir) / PANE_HEALTH_FILE, json.dumps(data, indent=1, sort_keys=True) + "\n", json.dumps(stable, sort_keys=True), HEARTBEAT_HEALTH, fsync=True)
 
 
 def pane_health_pass(engine, now):
@@ -8734,7 +8737,7 @@ def sweep_write(engine, state):
     """sweep.json: the last run's counts, for `status` (a display; nothing decides from it). Written on a change."""
     path = Path(engine.state_dir) / SWEEP_FILE
     try:
-        state_write(path, json.dumps(state.current, sort_keys=True) + "\n", _without(state.current, "at"), STATE_HEARTBEAT_SECONDS * 4)   # its `at` is when it last ran: a heartbeat keeps it honest
+        state_write(path, json.dumps(state.current, sort_keys=True) + "\n", _without(state.current, "at"), HEARTBEAT_SWEEP)   # its `at` is when it last ran: a heartbeat keeps it honest
     except OSError:
         pass
 
@@ -9418,7 +9421,7 @@ def triage_write(engine, state):
     path = Path(engine.state_dir) / TRIAGE_FILE
     body = json.dumps(state.current, sort_keys=True)
     try:
-        state_write(path, body + "\n", _without(state.current, "at"), STATE_HEARTBEAT_SECONDS * 4)
+        state_write(path, body + "\n", _without(state.current, "at"), HEARTBEAT_SWEEP)
     except OSError:
         pass
 
@@ -15774,7 +15777,7 @@ def write_pr_state(engine, state, now):
         newest = sorted(state.pr_state.items(), key=lambda kv: kv[1].get("at", 0), reverse=True)[:PR_STATE_MAX]
         body = {"written_at": int(now), "daemon_pid": os.getpid(), "prs": dict(newest)}
         path = Path(engine.state_dir) / PR_STATE_FILE
-        state_write(path, json.dumps(body, sort_keys=True), _without(body, "written_at", "daemon_pid"), 300, fsync=True, nofollow=True)   # only when the picture changed (or every 5 minutes)
+        state_write(path, json.dumps(body, sort_keys=True), _without(body, "written_at", "daemon_pid"), HEARTBEAT_PR_STATE, fsync=True, nofollow=True)   # only when the picture changed (or every 5 minutes)
     except OSError as err:
         engine._note("pr_state.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})   # `_note` says it once per change of the error; the age on every line shows a stale file
 

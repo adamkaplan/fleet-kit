@@ -38776,11 +38776,11 @@ class TestWriteOnlyOnChange(Base):
                 world.engine.run_pass()
                 world.tick(30)
                 self.clock[0] += 30   # the process clock the heartbeats read moves with the passes (20 minutes in all)
-        self.assertLessEqual(seen["pane-health.json"], 3, dict(seen))   # once, plus a heartbeat every 8 minutes
-        self.assertLessEqual(seen["sweep.json"], 6, dict(seen))          # once, plus a heartbeat every 4 minutes
+        self.assertLessEqual(seen["pane-health.json"], 1 + 1200 // sb.HEARTBEAT_HEALTH, dict(seen))   # once, plus a heartbeat per HEARTBEAT_HEALTH
+        self.assertLessEqual(seen["sweep.json"], 1 + 1200 // sb.HEARTBEAT_SWEEP, dict(seen))          # once, plus a heartbeat per HEARTBEAT_SWEEP
         self.assertGreaterEqual(seen["v2-calls.json"], 1)
         self.assertLessEqual(seen["decisions.json"], 2, "decisions.json keeps its touch: its mtime is the signal, and a touch is not a rewrite")
-        self.assertLess(sum(seen.values()), 40 + 20, dict(seen), )   # it was 40 + 40 + 40 + more
+        self.assertLess(sum(seen.values()), 3 * 40 // 2, dict(seen))   # three files alone used to be written 40 times each
 
     def test_the_status_files_of_the_pass_keep_a_heartbeat(self):
         world = World(self, agents=("a0",), config={})
@@ -38811,24 +38811,61 @@ class TestWriteOnlyOnChange(Base):
         self.assertTrue(self.rewritten(path))
 
     def test_every_status_file_with_a_timestamp_keeps_its_heartbeat_and_none_waits_past_what_status_tolerates(self):
-        """`status` calls the v2 record stale past 120 s: the heartbeat of every file whose `at` is read as liveness is shorter than that with a 30 s pass to spare."""
+        """`status` calls the v2 record stale past 120 s: the heartbeat of every file whose `at` is read as liveness is shorter than that with a 30 s pass to spare.
+        Each case changes ONLY the timestamp between the first and second write, then lets the heartbeat pass with the timestamp fixed."""
         self.assertLessEqual(sb.STATE_HEARTBEAT_SECONDS + 30, 120)
         world = World(self, agents=("a0",), config={})
         engine, state = world.engine, sb.CiRecordState()
-        cases = (("ci-record-status.json", lambda: sb.write_ci_record_status(engine, state, self.clock[0] + 1000 * len(sb._STATE_LAST), 1)),
-                 ("sweep.json", lambda: sb.sweep_write(engine, types.SimpleNamespace(current={"counts": {}, "at": "t%f" % self.clock[0]}))),
-                 ("triage.json", lambda: sb.triage_write(engine, types.SimpleNamespace(current={"counts": {}, "at": "t%f" % self.clock[0]}))))
-        for name, write in cases:
+        at = [100]
+
+        def sweep():
+            sb.sweep_write(engine, types.SimpleNamespace(current={"counts": {}, "at": "t%d" % at[0]}))
+
+        def triage():
+            sb.triage_write(engine, types.SimpleNamespace(current={"counts": {}, "at": "t%d" % at[0]}))
+
+        def ci_record():
+            sb.write_ci_record_status(engine, types.SimpleNamespace(written=0, last_record=None, recorded=0), at[0], 1)
+        for name, write, heartbeat in (("sweep.json", sweep, sb.HEARTBEAT_SWEEP), ("triage.json", triage, sb.HEARTBEAT_SWEEP),
+                                       ("ci-record-status.json", ci_record, sb.STATE_HEARTBEAT_SECONDS)):
             with self.subTest(file=name):
                 write()
                 path = world.state / name
                 self.assertTrue(path.exists())
                 self.age(path)
+                at[0] += 50                      # only the timestamp moved
                 write()
-                self.assertFalse(self.rewritten(path), "only the time moved")
-                self.clock[0] += sb.STATE_HEARTBEAT_SECONDS * 4 + 1
+                self.assertFalse(self.rewritten(path), "only the time moved: not written")
+                self.clock[0] += heartbeat + 1   # the heartbeat passes (the timestamp stays what it is)
                 write()
-                self.assertTrue(self.rewritten(path), "the heartbeat rewrites it")
+                self.assertTrue(self.rewritten(path), "the heartbeat rewrites it, with the newer time")
+                self.assertIn(str(at[0]), path.read_text())
+
+    def test_the_pane_health_and_pr_state_heartbeats(self):
+        data = {"agents": {"a": {"pane": "p1", "seen": 1}}, "states": {}, "missing": {}, "at": 1}
+        sb.write_pane_health(self.dir, data)
+        path = self.dir / sb.PANE_HEALTH_FILE
+        self.age(path)
+        self.clock[0] += sb.HEARTBEAT_HEALTH - 1
+        sb.write_pane_health(self.dir, dict(data, at=2))
+        self.assertFalse(self.rewritten(path))
+        self.clock[0] += 2
+        sb.write_pane_health(self.dir, dict(data, at=3))
+        self.assertTrue(self.rewritten(path), "past the pane-health heartbeat")
+        world = World(self, agents=("a0",), config={})
+        state = sb.CiRecordState()
+        state.pr_state = {"acme/app#1": {"state": "open", "head": "a" * 40, "labels": [], "at": 1.0}}
+        sb.write_pr_state(world.engine, state, 1000)
+        prs = world.state / sb.PR_STATE_FILE
+        self.age(prs)
+        state.pr_state_written = 0
+        self.clock[0] += sb.HEARTBEAT_PR_STATE - 1
+        sb.write_pr_state(world.engine, state, 1100)
+        self.assertFalse(self.rewritten(prs))
+        state.pr_state_written = 0
+        self.clock[0] += 2
+        sb.write_pr_state(world.engine, state, 1200)
+        self.assertTrue(self.rewritten(prs), "past the pr-state heartbeat")
 
     def test_the_link_status_keeps_a_heartbeat_and_a_symlink_is_refused_where_nofollow_is_asked(self):
         link = self.dir / "v2-link.json"
