@@ -4113,7 +4113,8 @@ class Switchboard:
                     repo=repo or issue_repo(issue))
         outcome = self.send_fact(fact, discovery, now, interrupt=interrupt)
         if outcome.get("sent") and sender != recipient and sender in discovery.agents and self.state_dir is not None:
-            record_last_send(self.state_dir, sender, recipient, now, repo=repo or issue_repo(issue), issue=issue)   # beside `report`'s record: both count as being in touch with that boss
+            record_last_send(self.state_dir, sender, recipient, now, repo=repo or issue_repo(issue),
+                             issue=issue if outcome.get("action") == "wake" else None)   # #352: only a send that woke the boss is one a report folds into   # beside `report`'s record: both count as being in touch with that boss
         return outcome
 
     def repos_in_play(self):

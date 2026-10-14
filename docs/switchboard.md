@@ -214,9 +214,10 @@ message. A `send` from another agent skips the batch.
 - **A report folds into the send before it (#352).** A done, failed, blocked or
   question report that comes within 10 minutes of a message the same agent
   delivered to the same boss on the same issue is not a second wake: it is
-  delivered in full as a note (an unread note is still converted to a wake, so
-  nothing is lost), with its state first (`question: ...`) and a mark that it
-  follows the earlier message. A different issue, another recipient, an older
+  delivered in full as a note (an unread note is still converted to a wake, except
+  under `v2_light`, so a folded report can be seen later, never lost), with its state first (`question: ...`) and a mark that it
+  follows the earlier message. Only a send that woke the boss counts: one that
+  was itself a note, or was held, folds nothing. A different issue, another recipient, an older
   send or no send at all is delivered as before. The record is `send_on` in
   `last-reports.json` (at most 8 recipients per sender); the logic is
   `bin/report_fold.py`.

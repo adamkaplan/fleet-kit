@@ -18805,6 +18805,19 @@ class TestReportFold(ReportBase):
         self.report_on(2)
         self.assertIn("working: halfway", self.last()["text"])
 
+    def test_a_send_that_was_held_or_only_a_note_is_not_one_a_report_folds_into(self):
+        self.world.you("platform")                 # engaged with the boss: the send is a note, not a wake
+        out = self.send()
+        self.assertEqual(out["action"], "note")
+        self.world.tick(60)
+        self.assertTrue(self.report_on(2, state="question", text="which?")["sent"])
+        record = json.loads((self.world.state / sb.LAST_REPORT_FILE).read_text())["coder"]
+        self.assertNotIn("send_on", {k: v for k, v in record.items() if v})   # nothing recorded for the note
+        self.world.herdr.panes[self.world.panes["platform"]]["status"] = "blocked"
+        held = self.world.new_engine("cli").send("coder", "platform", "held", 2, None)
+        self.assertFalse(held["sent"])
+        self.assertNotIn("send_on", json.loads((self.world.state / sb.LAST_REPORT_FILE).read_text())["coder"])
+
     def test_the_boundaries_of_follows(self):
         fold = sb.load_report_fold()
         entry = fold.record({}, "boss", "acme/api", 2, 1000)
