@@ -736,14 +736,15 @@ def main(args):
     if verdict is not None:
         args = verdict[1]
     credential = is_git_credential(args)
+    extra = {"credential": True} if credential else {}   # only the git credential route passes the keyword: every other call is exactly as it was
     try:
-        env = account_env(gh, lookup, strict=is_write(args), credential=credential)
+        env = account_env(gh, lookup, strict=is_write(args), **extra)
     except NoAccountMapped as err:
         sys.stderr.write("gh: no GitHub account is mapped for %s: git cannot authenticate as a guess (add the repository or its owner to gh_users)\n" % _clean_reason(str(err)))
         return 1
     except AccountLookupFailed:
         try:
-            env = account_env(gh, Lookup(write=True), strict=True, credential=credential)   # retry the lookup ONCE with a fresh deadline
+            env = account_env(gh, Lookup(write=True), strict=True, **extra)   # retry the lookup ONCE with a fresh deadline
         except NoAccountMapped as err:
             sys.stderr.write("gh: no GitHub account is mapped for %s: git cannot authenticate as a guess (add the repository or its owner to gh_users)\n" % _clean_reason(str(err)))
             return 1
