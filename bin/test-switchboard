@@ -4914,6 +4914,30 @@ class TestLaunch(Base):
         with mock.patch.object(sb.HerdrClient, "pane_list", return_value=["not-a-dict"]):
             self.assertIn("cannot say none works in it", sb.worktree_in_use(engine, str(wt)))
 
+    def test_a_worktree_that_is_the_session_directory_of_a_non_retired_agent_is_kept_though_its_pane_sits_elsewhere(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.make_repo()
+        self.worker()
+        self.world.add_agent("elsewhere", fleet={"role": "coder"})
+        wt = self.add_worktree("w-session")
+        sb.register_worktree(self.world.state, str(wt), "worker", None, "w-session", 1)
+        self.world.v2.sessions[self.world.sessions["elsewhere"]]["directory"] = str(wt / "sub")      # its pane's cwd stays /tmp
+        engine = self.world.new_engine("cli")
+        engine.discover(self.world.clock.now())
+        self.assertIn("the session of elsewhere", sb.worktree_in_use(engine, str(wt)))
+        status, line = sb.reclaim_worktree(engine, subprocess.run, str(wt), {"agent": "worker"}, True)
+        self.assertEqual((status, wt.exists()), ("kept", True), line)
+        self.assertIn("runs in it", line)
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {"elsewhere": {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": "s", "auto": False}})
+        self.assertIsNone(sb.worktree_in_use(engine, str(wt)), "a retired agent's session no longer holds it")
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {})
+        self.world.v2.sessions[self.world.sessions["elsewhere"]]["directory"] = str(wt) + "2"        # a sibling sharing a name prefix
+        self.assertIsNone(sb.worktree_in_use(engine, str(wt)))
+        with mock.patch.object(sb.V2Client, "session_get", side_effect=sb.V2Error("timeout", None, "slow")):
+            self.assertIn("cannot read the session", sb.worktree_in_use(engine, str(wt)))
+        with mock.patch.object(sb.V2Client, "session_get", side_effect=sb.V2Error("http", 404, "gone")):
+            self.assertIsNone(sb.worktree_in_use(engine, str(wt)))
+
     def test_the_worktree_reclaim_config_is_validated(self):
         base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
         sb.validate_config(dict(base, worktree_reclaim={"enabled": True, "on_done": False}))
