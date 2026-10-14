@@ -18854,6 +18854,28 @@ class TestReportFold(ReportBase):
         self.assertEqual(report_fold.record({}, "boss", None, None, 5), {})
 
 
+class TestReportFoldLight(TestReportFold):
+    """#352: under v2_light nothing folds (an unread note is not converted to a wake there): the same cases wake."""
+
+    def make_world(self, **kwargs):
+        config = dict(kwargs.pop("config", None) or {}, v2_light=True)
+        return super().make_world(config=config, **kwargs)
+
+    def test_a_report_within_ten_minutes_of_a_send_on_the_same_issue_is_a_note_and_still_delivered(self):
+        self.send()
+        self.world.tick(240)
+        out = self.report_on(2)
+        self.assertEqual(out["action"], "wake")
+        self.assertTrue(self.last()["resume"])
+        self.assertNotIn("follows", self.last()["text"])
+
+    test_a_folded_question_still_reads_as_a_question_and_says_it_follows = None
+    test_a_folded_report_stays_a_note_through_the_re_check = None
+    test_a_progress_report_stays_a_rider_and_a_later_done_still_carries_it = None
+    test_a_send_that_was_held_or_only_a_note_is_not_one_a_report_folds_into = None
+    test_the_report_does_not_forget_the_send_and_the_record_is_bounded = None
+
+
 class TestUnreportedStop(ReportBase):
     def facts(self):
         return self.derive()

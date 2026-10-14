@@ -4181,7 +4181,7 @@ class Switchboard:
                     "next message to %s and never wakes it" % boss, "key": fact.key, "recipient": boss}
         waiting = [f for f in report_rider_facts(self) if f.recipient == boss]
         earlier = None
-        if self.state_dir is not None:   # #352: read BEFORE this report is recorded
+        if self.state_dir is not None and not self.light:   # #352: read BEFORE this report is recorded. Never under v2_light: an unread note is not converted to a wake there, so a folded question could sit unread
             earlier = load_report_fold().follows(_read_small(self.state_dir, LAST_REPORT_FILE).get(sender), boss, repo, number, now)
         if earlier is not None:
             fact.summary = load_report_fold().marked(fact.summary, earlier, now)
