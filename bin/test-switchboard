@@ -644,7 +644,7 @@ class TestHerdrClient(Base):
         public = sorted(name for name, _ in inspect.getmembers(sb.HerdrClient, inspect.isfunction)
                         if not name.startswith("_"))
         self.assertEqual(public, ["agent_get", "agent_list", "notification_show", "open_tab_running",
-                                  "pane_clear_token", "pane_close", "pane_get", "pane_process_info", "pane_read_visible",
+                                  "pane_clear_token", "pane_close", "pane_get", "pane_list", "pane_process_info", "pane_read_visible",
                                   "pane_report_metadata_token", "tab_close", "tab_get", "workspace_create", "workspace_list"])  # PR 16
 
     def test_a_workspace_is_listed_and_created_focused_with_the_one_focus_flag(self):
@@ -1977,7 +1977,7 @@ class FakeHerdr:
                    ("agent", "prompt"): self._agent_prompt, ("pane", "report-metadata"): self._report_metadata,
                    ("notification", "show"): self._notification_show, ("pane", "process-info"): self._process_info,
                    ("pane", "close"): self._pane_close, ("workspace", "list"): self._workspace_list,
-                   ("workspace", "create"): self._workspace_create, ("pane", "get"): self._pane_get,
+                   ("workspace", "create"): self._workspace_create, ("pane", "get"): self._pane_get, ("pane", "list"): self._pane_list,
                    ("tab", "close"): self._tab_close, ("tab", "get"): self._tab_get}.get(tuple(args[:2]))
         if tuple(args[:2]) == ("pane", "read"):
             positional, flags = parse_flags(args[2:], ("--source", "--lines", "--format"))
@@ -2001,6 +2001,16 @@ class FakeHerdr:
         if pane not in self.panes:
             raise LookupError("no agent in pane %s" % pane)
         return pane
+
+    def _pane_list(self, rest):
+        """Every pane: the agent panes and `plain_terminals` (a list of {"pane_id", "cwd", "foreground_cwd"}), as `herdr pane list` shows them."""
+        parse_flags(rest, ())
+        panes = []
+        for pane in sorted(self.panes):
+            entry = self.panes[pane]
+            panes.append({"pane_id": pane, "cwd": entry.get("cwd") or "/tmp", "foreground_cwd": entry.get("foreground_cwd") or entry.get("cwd") or "/tmp"})
+        panes.extend(getattr(self, "plain_terminals", []))
+        return {"result": {"type": "pane_list", "panes": panes}}
 
     def _agent_list(self, rest):
         parse_flags(rest, ())
@@ -4844,7 +4854,7 @@ class TestLaunch(Base):
         self.assertIn("is working in it", sb.reclaim_worktree(engine, subprocess.run, str(root), {"agent": "worker"}, True)[1])
         self.assertEqual(sb.reclaim_worktree(engine, subprocess.run, str(sibling), {"agent": "worker"}, True)[0], "removed",
                          "a path that only shares a name prefix is not inside it")
-        with mock.patch.object(sb.HerdrClient, "agent_list", side_effect=sb.HerdrError("unavailable", "down")):
+        with mock.patch.object(sb.HerdrClient, "pane_list", side_effect=sb.HerdrError("unavailable", "down")):
             status, line = sb.reclaim_worktree(engine, subprocess.run, str(root), {"agent": "worker"}, True)
         self.assertEqual((status, root.exists()), ("kept", True))
         self.assertIn("herdr cannot say", line)
@@ -4882,21 +4892,27 @@ class TestLaunch(Base):
             self.health(n)
         self.assertTrue(clean.exists())
 
-    def test_more_panes_than_the_look_cap_or_a_failing_pane_read_keeps_the_worktree(self):
+    def test_a_plain_terminal_or_a_foreground_process_in_the_worktree_blocks_removal_and_an_unreadable_pane_list_keeps_it(self):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
         self.make_repo()
         self.worker()
-        wt = self.add_worktree("w-cap")
+        wt = self.add_worktree("w-term")
         engine = self.world.new_engine("cli")
-        with mock.patch.object(sb.HerdrClient, "agent_list", return_value=[{"pane_id": "p%d" % n} for n in range(sb.WORKTREE_PANE_LOOKS + 1)]), \
-                mock.patch.object(sb.HerdrClient, "pane_get", return_value={"cwd": "/tmp"}):
-            self.assertIn("more than", sb.worktree_in_use(engine, str(wt)))
-        with mock.patch.object(sb.HerdrClient, "agent_list", return_value=[{"pane_id": "p1"}]), \
-                mock.patch.object(sb.HerdrClient, "pane_get", side_effect=sb.HerdrError("exit", "gone")):
+        self.assertIsNone(sb.worktree_in_use(engine, str(wt)))
+        self.world.herdr.plain_terminals = [{"pane_id": "w1:p9", "cwd": str(wt / "src"), "foreground_cwd": "/tmp"}]      # a terminal with no agent
+        self.assertIn("w1:p9", sb.worktree_in_use(engine, str(wt)))
+        status, line = sb.reclaim_worktree(engine, subprocess.run, str(wt), {"agent": "worker"}, True)
+        self.assertEqual((status, wt.exists()), ("kept", True), line)
+        self.world.herdr.plain_terminals = [{"pane_id": "w1:p9", "cwd": "/tmp", "foreground_cwd": str(wt)}]               # only its foreground process is there
+        self.assertIn("foreground_cwd", sb.worktree_in_use(engine, str(wt)))
+        self.world.herdr.plain_terminals = [{"pane_id": "w1:p9", "cwd": str(wt) + "2", "foreground_cwd": "/tmp"}]         # a sibling sharing a name prefix
+        self.assertIsNone(sb.worktree_in_use(engine, str(wt)))
+        self.world.herdr.plain_terminals = [{"pane_id": "w1:p%d" % n, "cwd": "/tmp"} for n in range(60)] + [{"pane_id": "w1:p99", "cwd": str(wt)}]
+        self.assertIn("w1:p99", sb.worktree_in_use(engine, str(wt)), "no row cap: the 61st pane is read too")
+        with mock.patch.object(sb.HerdrClient, "pane_list", side_effect=sb.HerdrError("unavailable", "down")):
             self.assertIn("herdr cannot say", sb.worktree_in_use(engine, str(wt)))
-        with mock.patch.object(sb.HerdrClient, "agent_list", return_value=[{"pane_id": "p1"}]), \
-                mock.patch.object(sb.HerdrClient, "pane_get", return_value={"cwd": None}):
-            self.assertIsNone(sb.worktree_in_use(engine, str(wt)))
+        with mock.patch.object(sb.HerdrClient, "pane_list", return_value=["not-a-dict"]):
+            self.assertIn("cannot say none works in it", sb.worktree_in_use(engine, str(wt)))
 
     def test_the_worktree_reclaim_config_is_validated(self):
         base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
