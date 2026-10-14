@@ -9,6 +9,12 @@ on:
 permissions:
   contents: read
 
+# A newer push to a pull request cancels that pull request's older, superseded run (the macOS job queues for an hour when every push keeps
+# its own run). A push to main is NEVER cancelled: its group is its own ref and cancel-in-progress is false for it, so two pushes to main both finish.
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     strategy:

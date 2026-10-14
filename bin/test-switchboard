@@ -7923,6 +7923,16 @@ class TestHygiene(unittest.TestCase):
         self.assertIn("bin/test-switchboard 2>&1", workflow)
         self.assertIn("run: bin/fleet-scenario validate", workflow)
 
+    def test_ci_cancels_a_pull_requests_superseded_run_but_never_a_push_to_main_and_runs_one_macos_job_per_run(self):
+        workflow = (REPO / ".github" / "workflows" / "test.yml").read_text()
+        top, jobs = workflow.split("\njobs:\n", 1)
+        self.assertIn("\nconcurrency:\n", top, "the concurrency block is top-level (before jobs)")
+        self.assertIn("group: test-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}", top)
+        self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", top)
+        self.assertNotIn("cancel-in-progress: true", workflow, "an unconditional cancel would cancel a push to main")
+        self.assertEqual(workflow.count("macos-latest"), 1, "one macOS job per run: a single matrix entry")
+        self.assertIn("os: [ubuntu-latest, macos-latest]", jobs)
+
 
 # ======================================================================
 # PR 4: worker events, reminders, toasts and their scenarios
