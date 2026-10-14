@@ -39623,6 +39623,28 @@ class TestDockerReaper(Base):
         self.assertEqual([e["subject"] for e in self.audits()], [hex_id("n_old"), "v_old"])
         self.assertIn("in use", out)
 
+    def test_an_audit_that_fails_after_a_removal_is_an_error_and_the_rest_go_on(self):
+        docker = self.world_docker()
+
+        class Broken:
+            def append(self, *a, **k):
+                raise ValueError("audit full")
+        result = sb.docker_reap("docker", docker, self.NOW, True, Broken())
+        self.assertEqual(len(result["removed"]), 3, "all three were removed and counted")
+        self.assertEqual(len(result["errors"]), 3)
+        self.assertIn("audit of", result["errors"][0])
+
+    def test_a_missing_docker_is_tried_again_in_an_hour_by_the_daemon(self):
+        docker = self.world_docker()
+        engine, source = self.daily(docker)
+        engine.now = lambda: self.NOW
+        with mock.patch.object(sb, "_docker_executable", lambda name: None):
+            source()
+            source.thread.join(10)
+        self.assertEqual(docker.calls, [])
+        stamp = json.loads((self.world.state / sb.DOCKER_REAP_FILE).read_text())["at"]
+        self.assertEqual(stamp + sb.DOCKER_REAP_INTERVAL, self.NOW + sb.DOCKER_REAP_RETRY)
+
     def test_without_docker_it_refuses_and_runs_nothing(self):
         docker = self.world_docker()
         with captured() as (out, err):
