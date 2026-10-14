@@ -300,6 +300,7 @@ DEFAULTS = {
     "send_timeout_seconds": 60,    # `send` as a whole (the sum of its v2 and herdr calls): past it, a clear failure line, never a silent minutes-long wait
     "poll_seconds": 5,
     "disk_guard": None,            # free space of the state directory's volume: None = defaults (min_free_gb 50, hard_free_gb 10); false = off; or {"min_free_gb": n, "hard_free_gb": n}
+    "docker_reaper": True,         # the daily removal of EXPIRED labelled docker containers, networks and volumes (`disk reap-docker`): false is the kill switch
     "v2_events": "auto",           # the daemon's news of sessions: "auto" (the service's event stream, where the HTTP route exists; reads only what an event did not say) or "off" (the old reads)
     "v2_transport": "auto",        # how v2 calls travel: "auto" (HTTP to the service when it can, else the CLI) or "cli" (always `opencode api`: the kill switch)
     # The daemon's reads of v2 (every one is an `opencode api` process): what it may remember, and how much it may read.
@@ -441,6 +442,8 @@ def validate_config(raw, source="config"):
                 raise ConfigError("%s: %r value for %s must be a string" % (source, key, name))
         envs[key] = dict(env)
     validate_disk_guard(config["disk_guard"], source)
+    if not isinstance(config["docker_reaper"], bool):
+        raise ConfigError("%s: 'docker_reaper' must be true or false, got %r" % (source, config["docker_reaper"]))
     if config["v2_events"] not in ("auto", "off"):
         raise ConfigError("%s: 'v2_events' must be \"auto\" or \"off\", got %r" % (source, config["v2_events"]))
     if not isinstance(config["v2_light"], bool):
@@ -2123,6 +2126,183 @@ class DiskFacts:
         return [Fact("disk.low:%d" % int(episode), name, "disk", text, episode, sender="switchboard") for name in chiefs]
 
 
+# ---------------------------------------------------------------- the docker reaper (ask #321)
+#
+# A test stack or a compose project that an agent starts carries two labels: `fleet.owner=<agent>` and `fleet.expires=<epoch seconds>`. The reaper removes
+# ONLY objects that carry BOTH and whose expiry has passed: containers (`docker rm -f <id>`, never `-v`: an anonymous volume is not ours), then networks
+# (`docker network rm <id>`), then volumes (`docker volume rm <name>`, never one a running container mounts). An unlabelled object, a live one and a
+# label that is not an epoch are never touched; docker itself and the daemon's own files are not reachable from here. No `system prune`, no sudo.
+# A dry run is the default for the command (`--apply` removes); the daemon applies once a day while `docker_reaper` is not false.
+DOCKER_LABEL_OWNER = "fleet.owner"
+DOCKER_LABEL_EXPIRES = "fleet.expires"
+DOCKER_REAP_TIMEOUT = 60
+DOCKER_REAP_FILE = "docker-reap.json"
+DOCKER_REAP_INTERVAL = 86400
+DOCKER_REAP_RETRY = 3600
+_DOCKER_LIST_IDS = {   # the ids only (never a label in a line: a label value may hold a newline), then `inspect` says the truth
+    "container": ("ps", "-a", "-q", "--no-trunc", "--filter", "label=" + DOCKER_LABEL_EXPIRES),
+    "network": ("network", "ls", "-q", "--no-trunc", "--filter", "label=" + DOCKER_LABEL_EXPIRES),
+    "volume": ("volume", "ls", "-q", "--filter", "label=" + DOCKER_LABEL_EXPIRES),
+}
+_DOCKER_RUNNING_IDS = ("ps", "-q", "--no-trunc", "--filter", "status=running")
+_DOCKER_REMOVE = {"container": ("rm", "-f", "--"), "network": ("network", "rm", "--"), "volume": ("volume", "rm", "--")}
+_DOCKER_ID = {"container": re.compile(r"[0-9a-f]{64}"), "network": re.compile(r"[0-9a-f]{64}"), "volume": re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,254}")}
+DOCKER_EPOCH_MIN = 10 ** 9      # an expiry before the year 2001 is not a plan, it is a way to get an object removed at once
+DOCKER_INSPECT_CHUNK = 100
+
+
+def _docker_run(docker, runner, argv):
+    done = runner([docker] + list(argv), capture_output=True, text=True, timeout=DOCKER_REAP_TIMEOUT, stdin=subprocess.DEVNULL)
+    if done.returncode != 0:
+        raise OSError("docker %s: exit %s: %s" % (" ".join(argv[:2]), done.returncode, _plain(done.stderr or done.stdout, 160)))
+    return done.stdout or ""
+
+
+def _docker_inspect(docker, runner, kind, ids):
+    """The inspect records of `ids` (a list of dicts): the labels as docker says they are NOW."""
+    found = []
+    for start in range(0, len(ids), DOCKER_INSPECT_CHUNK):
+        try:
+            records = json.loads(_docker_run(docker, runner, ("inspect", "--type", kind) + ("--",) + tuple(ids[start:start + DOCKER_INSPECT_CHUNK])) or "[]")
+        except ValueError:
+            raise OSError("docker inspect: not JSON")
+        found.extend(r for r in records if isinstance(r, dict))
+    return found
+
+
+def _docker_labelled(kind, record):
+    """(id, owner, expires) when the record carries BOTH labels with an owner and an epoch expiry, else None. The id is checked against the strict shape for its kind."""
+    labels = ((record.get("Config") or {}).get("Labels") if kind == "container" else record.get("Labels")) or {}
+    ident = record.get("Id") if kind != "volume" else record.get("Name")
+    owner, expires = labels.get(DOCKER_LABEL_OWNER), labels.get(DOCKER_LABEL_EXPIRES)
+    if not (isinstance(ident, str) and _DOCKER_ID[kind].fullmatch(ident) and isinstance(owner, str) and owner.strip()
+            and isinstance(expires, str) and re.fullmatch(r"\d{1,12}", expires) and int(expires) >= DOCKER_EPOCH_MIN):
+        return None
+    return ident, owner.strip(), int(expires)
+
+
+def docker_reap(docker, runner, now, apply, audit=None, actor="daemon"):
+    """Remove (apply) or list (dry run) the EXPIRED labelled docker objects. Returns {"removed": [...], "kept": [...], "errors": [...]}; each entry is
+    (kind, id, owner, expires[, reason]). What is listed is only ids; each object's labels are read from `docker inspect` (not from a text line a label
+    could forge), and an id must have docker's own shape. A listing that fails ends the run before anything is removed. The listing and the removal are
+    two steps: a volume a container starts to use in between is refused by docker itself, which is the backstop."""
+    result = {"removed": [], "kept": [], "errors": []}
+    expired = {}
+    try:
+        for kind, argv in _DOCKER_LIST_IDS.items():
+            ids = [line.strip() for line in _docker_run(docker, runner, argv).splitlines() if _DOCKER_ID[kind].fullmatch(line.strip())]
+            expired[kind] = []
+            for record in _docker_inspect(docker, runner, kind, ids) if ids else []:
+                labelled = _docker_labelled(kind, record)
+                if labelled is None:
+                    continue
+                if labelled[2] <= now:
+                    expired[kind].append(labelled)
+                else:
+                    result["kept"].append((kind,) + labelled + ("not expired",))
+    except (OSError, subprocess.SubprocessError) as err:
+        result["errors"].append(_plain(str(err), 200))
+        return result
+
+    def remove(kind, ident, owner, expires):
+        if apply:
+            try:
+                _docker_run(docker, runner, _DOCKER_REMOVE[kind] + (ident,))
+            except (OSError, subprocess.SubprocessError) as err:
+                result["errors"].append(_plain("%s %s: %s" % (kind, ident, err), 200))
+                return
+            result["removed"].append((kind, ident, owner, expires))
+            try:
+                if audit is not None:
+                    audit.append(actor, "docker.reaped", ident, {"kind": kind, "owner": owner, "expires": expires})
+            except Exception as err:   # the object is already gone: say the audit failed and go on with the rest
+                result["errors"].append(_plain("audit of %s %s failed: %s" % (kind, ident, err), 200))
+            return
+        result["removed"].append((kind, ident, owner, expires))
+
+    for labelled in expired["container"]:
+        remove("container", *labelled)
+    for labelled in expired["network"]:
+        remove("network", *labelled)
+    if expired["volume"]:
+        try:
+            running = [line.strip() for line in _docker_run(docker, runner, _DOCKER_RUNNING_IDS).splitlines() if _DOCKER_ID["container"].fullmatch(line.strip())]
+            in_use = {m.get("Name") for r in (_docker_inspect(docker, runner, "container", running) if running else []) for m in (r.get("Mounts") or [])
+                      if isinstance(m, dict) and m.get("Type") == "volume"}   # after the containers went: what a still-running one holds
+        except (OSError, subprocess.SubprocessError) as err:
+            result["errors"].append(_plain(str(err), 200))
+            return result
+        for ident, owner, expires in expired["volume"]:
+            if ident in in_use:
+                result["kept"].append(("volume", ident, owner, expires, "a running container mounts it"))
+            else:
+                remove("volume", ident, owner, expires)
+    return result
+
+
+def _docker_executable(name):
+    if os.sep in name:
+        return name if os.access(name, os.X_OK) else None
+    return shutil.which(name)
+
+
+class DockerReapFacts:
+    """The daily reap: once `DOCKER_REAP_INTERVAL` has passed since the last run (kept in `docker-reap.json`, so a restart does not run it again), the
+    daemon starts the reaper on a background thread (docker may be slow: a pass never waits for it). Only a daemon that set `docker_reap_runner` runs
+    it (a test engine does not), and never while `docker_reaper` is false. Returns no facts."""
+
+    __name__ = "docker_reap_facts"
+
+    def __init__(self):
+        self.engine, self.thread = None, None
+
+    def bind(self, engine):
+        self.engine = engine
+
+    def _last(self, state_dir):
+        try:
+            return float(json.loads((Path(state_dir) / DOCKER_REAP_FILE).read_text()[:1024])["at"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
+    def __call__(self):
+        engine = self.engine
+        runner = getattr(engine, "docker_reap_runner", None) if engine is not None else None
+        if runner is None or engine.state_dir is None or not engine.config.get("docker_reaper", True):
+            return []
+        if self.thread is not None and self.thread.is_alive():
+            return []
+        now = engine.now()
+        last = self._last(engine.state_dir)
+        if last is not None and now - last < DOCKER_REAP_INTERVAL:
+            return []
+        self.thread = threading.Thread(target=self._run, args=(engine, runner, now), name="docker-reap", daemon=True)
+        self.thread.start()
+        return []
+
+    def _run(self, engine, runner, now):
+        stamp = now   # a failed run (no docker, a docker that would not answer) is tried again in an hour, not tomorrow
+        try:
+            docker = _docker_executable("docker")
+            if docker is None:
+                engine._note("docker.reap_unavailable", None, {})
+                stamp = now - DOCKER_REAP_INTERVAL + DOCKER_REAP_RETRY
+            else:
+                result = docker_reap(docker, runner, now, True, engine.audit, engine.actor)
+                engine._note("docker.reap", None, {"removed": len(result["removed"]), "errors": result["errors"][:3]})
+                if result["errors"]:
+                    stamp = now - DOCKER_REAP_INTERVAL + DOCKER_REAP_RETRY
+            path = Path(engine.state_dir) / DOCKER_REAP_FILE
+            temp = path.with_name("%s.%d.tmp" % (DOCKER_REAP_FILE, os.getpid()))
+            with open(str(temp), "w") as handle:
+                handle.write(json.dumps({"at": stamp}))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(str(temp), str(path))
+        except Exception as err:   # a reaper never stops the daemon
+            engine._note("docker.reap_error", None, {"error": _plain("%s: %s" % (type(err).__name__, err), 160)})
+
+
 class Fact:
     """Something one fleet agent should be told.
 
@@ -2231,7 +2411,7 @@ def fact_sources(state_dir):
     the same rule, and stores nothing.
     """
     return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir),
-            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), JobFacts(), PaneFacts(), DiskFacts()]
+            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), JobFacts(), PaneFacts(), DiskFacts(), DockerReapFacts()]
 
 
 # --------------------------------------------------------- observing the fleet
@@ -13210,6 +13390,7 @@ def cmd_run(args, runner, now, wait):
     if args.standby:  # PR 16: the service waits for the lock instead of exiting and being restarted
         while run_lock_held(state):
             time.sleep(STANDBY_SECONDS)
+    engine.docker_reap_runner = runner   # the daily reap of expired labelled docker objects runs only in the real daemon
     hub = attach_github(engine, config, state, runner, now)
     start_event_feed(engine, config, now)
     judge_server = start_judge_server(config, state, runner, now)  # PR 9: the daemon holds the key, not v2
@@ -17789,6 +17970,32 @@ DISK_PRUNE_TIMEOUT = 600
 _RECLAIMED = re.compile(r"Total reclaimed space:\s*(\S+)", re.I)
 
 
+def cmd_disk_reap_docker(args, runner, now):
+    """`disk reap-docker [--apply]`: list (the default) or remove the expired labelled docker objects."""
+    docker = _docker_executable(args.docker)
+    if docker is None:
+        sys.stderr.write("%s: disk reap-docker: docker is not installed or not on PATH (%s): nothing was run\n" % (PROG, _plain(args.docker, 160)))
+        return EXIT_USAGE
+    apply = bool(args.apply)
+    if apply and not load_config().get("docker_reaper", True):
+        sys.stderr.write("%s: disk reap-docker: docker_reaper is false in the config (the kill switch): nothing was removed\n" % PROG)
+        return EXIT_USAGE
+    audit = AuditLog(ensure_state_dir() / "audit.jsonl") if apply else None
+    result = docker_reap(docker, runner, now(), apply, audit, "operator")
+    print("%s: %d expired labelled object(s)%s" % ("removed" if apply else "dry run (nothing removed; --apply removes)", len(result["removed"]), ""))
+    for kind, ident, owner, expires in result["removed"]:
+        print("  %s %s  owner %s  expired %s" % (kind, _plain(ident, 80), _plain(owner, 60), iso(expires)))
+    for kind, ident, owner, expires, why in result["kept"]:
+        if why != "not expired":
+            print("  kept %s %s: %s" % (kind, _plain(ident, 80), why))
+    for error in result["errors"]:
+        print("  error: %s" % error)
+    return EXIT_ERROR if result["errors"] else EXIT_OK
+
+
+cmd_disk_reap_docker.direct = True
+
+
 def cmd_disk_prune(args, runner, now):
     """`disk prune [--dry-run]`."""
     docker = shutil.which(args.docker) if os.sep not in args.docker else (args.docker if os.access(args.docker, os.X_OK) else None)
@@ -17823,9 +18030,9 @@ def cmd_disk_prune(args, runner, now):
 
 
 def cmd_disk(args, runner, now):
-    """The `disk` group: `prune` (the disk guard, #319) and `reclaim-worktrees` / `register-worktree` (the worktree lifecycle, #321)."""
+    """The `disk` group: `prune` (the disk guard, #319), `reap-docker` (#326) and `reclaim-worktrees` / `register-worktree` (the worktree lifecycle, #321)."""
     try:   # `direct` skips dispatch's error mapping, so refusals are mapped here for every subcommand
-        return {"prune": cmd_disk_prune, "reclaim-worktrees": cmd_disk_reclaim_worktrees, "register-worktree": cmd_disk_register_worktree}[args.disk_action](args, runner, now)
+        return {"prune": cmd_disk_prune, "reap-docker": cmd_disk_reap_docker, "reclaim-worktrees": cmd_disk_reclaim_worktrees, "register-worktree": cmd_disk_register_worktree}[args.disk_action](args, runner, now)
     except (LaunchError, ConfigError, CallerError, LockError) as err:
         sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err))))
         return EXIT_ERROR
@@ -17843,6 +18050,13 @@ def add_disk_parsers(sub):
                                             "`until=168h` is the image's age, not its last use: a locally built image with no registry copy is removed too if no "
                                             "container uses it.")
     prune.add_argument("--dry-run", action="store_true", help="Print the two commands and run neither")
+    reap = disk_sub.add_parser("reap-docker", help="remove EXPIRED docker containers, networks and volumes that carry fleet.owner and fleet.expires labels",
+                               description="Lists (the default) or, with --apply, removes docker containers (`rm -f`), networks and volumes that carry BOTH labels "
+                                           "`fleet.owner=<agent>` and `fleet.expires=<epoch seconds>` and whose expiry has passed. Never an unlabelled object, a live "
+                                           "one, or a volume a running container mounts; no `system prune`, no sudo. The daemon applies this daily unless the config "
+                                           "key `docker_reaper` is false. Each removal is one `docker.reaped` audit line.")
+    reap.add_argument("--apply", action="store_true", help="Remove them (the default only lists)")
+    reap.add_argument("--docker", default="docker", help="The docker executable (default: docker on PATH)")
     prune.add_argument("--docker", default="docker", help="The docker executable (default: docker on PATH)")
     reclaim = disk_sub.add_parser("reclaim-worktrees", help="Remove the registered worktrees of retired agents when clean and pushed; else keep and say why (a dry run unless --apply)")
     reclaim.add_argument("--apply", action="store_true", help="Do it (default: a dry run)")
