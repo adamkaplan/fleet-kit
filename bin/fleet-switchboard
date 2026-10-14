@@ -138,6 +138,23 @@ def load_plan_ledger():
     return module
 
 
+def load_disk_janitor():
+    """The temp-directory janitor, bin/disk_janitor.py (#321), loaded by path like plan_check."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "disk_janitor.py")
+    held = sys.modules.get("disk_janitor")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("disk_janitor", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["disk_janitor"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("disk_janitor", None)
+        raise
+    return module
+
+
 def load_impact_floor():
     """The impact floor and hold table, bin/impact_floor.py (#179, L3), loaded by path like plan_check."""
     path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "impact_floor.py")
@@ -377,7 +394,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "temp_janitor"}
 
 
 def config_known_keys():
@@ -469,6 +486,10 @@ def validate_config(raw, source="config"):
     validate_external_config(config, source)
     validate_friction_config(config, source)
     validate_worktree_config(config, source)
+    try:
+        load_disk_janitor().validate(config.get("temp_janitor"), source)
+    except ValueError as err:
+        raise ConfigError(str(err))
     if config.get("impact_hold") is not None:   # #179 L4: the hold is off unless `enabled` is true
         try:
             impact_floor.validate_hold_config(config["impact_hold"])
@@ -18443,10 +18464,64 @@ def cmd_disk_report(args, runner, now):
     return EXIT_OK
 
 
+def janitor_busy_function(engine, runner, janitor):
+    """`busy(path)` for the temp janitor: why an entry is in use, else None; raises janitor.Unknown when something cannot be read (the entry is then kept).
+    In use = a herdr pane (an agent's or a plain terminal) works in it, a non-retired agent's session runs in it (both from `worktree_in_use`), or ANY live
+    process has it as its working directory (one `lsof -a -d cwd -Fn` per run, bounded by a timeout)."""
+    held = {}
+
+    def process_directories():
+        if "dirs" not in held:
+            try:
+                done = runner(["lsof", "-a", "-d", "cwd", "-Fn"], capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+            except (OSError, subprocess.SubprocessError) as err:
+                raise janitor.Unknown("lsof did not run: %s" % _one_line(str(err), 80))
+            if done.returncode not in (0, 1) or (done.returncode == 1 and not (done.stdout or "").strip()):
+                raise janitor.Unknown("lsof failed (exit %s)" % done.returncode)
+            lines = (done.stdout or "").splitlines()
+            if len(lines) > 200000:
+                raise janitor.Unknown("lsof listed more than 200000 lines: a process past the limit would not protect its directory")
+            held["dirs"] = [os.path.realpath(l[1:]) for l in lines if l.startswith("n/")]
+        return held["dirs"]
+
+    def busy(path):
+        why = worktree_in_use(engine, path)
+        if why:
+            return why
+        root = os.path.realpath(path).rstrip("/") + "/"
+        for where in process_directories():
+            if (where.rstrip("/") + "/").startswith(root):
+                return "a live process has it as its working directory (%s)" % _plain(where, 100)
+        return None
+    return busy
+
+
+def cmd_disk_janitor(args, runner, now):
+    """`disk janitor [--apply]`: the temp-directory janitor (bin/disk_janitor.py). A dry run by default; `--apply` is the operator's or the Chief of Staff's."""
+    janitor = load_disk_janitor()
+    engine, state, config = build_engine(runner, now, "cli", writable=bool(args.apply))
+    cfg = janitor.settings(config.get("temp_janitor"))
+    if args.apply:
+        kind = gates_caller_kind(runner, now)
+        if not (kind[0] == "person" or (kind[0] == "agent" and len(kind) > 2 and kind[2] == "chief-of-staff")):
+            raise LaunchError("refused: only the operator or the Chief of Staff may --apply the temp janitor (%s is %s)" % (kind[1], "an agent" if kind[0] == "agent" else "not known"))
+        if not cfg["enabled"]:
+            raise LaunchError("the temp janitor is switched off (temp_janitor.enabled is false)")
+    temp = Path(cfg["dir"]) if cfg.get("dir") else janitor.default_dir()
+    with worktree_sweep(engine):   # one session.list for every in-use check of this run
+        lines, removed, kept = janitor.run(temp, state, now(), cfg, bool(args.apply),
+                                           lambda name, detail: engine.audit.append(engine.actor, "temp.removed", _plain(name, 120), detail),
+                                           busy=janitor_busy_function(engine, runner, janitor))
+    for line in lines:
+        print(_plain(line, 300))
+    print("%s: %d %s, %d kept (%s)" % (PROG, removed, "removed" if args.apply else "would be removed (a dry run: add --apply)", kept, _plain(temp, 160)))
+    return EXIT_OK
+
+
 def cmd_disk(args, runner, now):
     """The `disk` group: `prune` (the disk guard, #319), `reap-docker` (#326) and `reclaim-worktrees` / `register-worktree` (the worktree lifecycle, #321)."""
     try:   # `direct` skips dispatch's error mapping, so refusals are mapped here for every subcommand
-        return {"report": cmd_disk_report, None: cmd_disk_report, "prune": cmd_disk_prune, "reap-docker": cmd_disk_reap_docker, "reclaim-worktrees": cmd_disk_reclaim_worktrees, "register-worktree": cmd_disk_register_worktree}[args.disk_action](args, runner, now)
+        return {"report": cmd_disk_report, None: cmd_disk_report, "prune": cmd_disk_prune, "reap-docker": cmd_disk_reap_docker, "janitor": cmd_disk_janitor, "reclaim-worktrees": cmd_disk_reclaim_worktrees, "register-worktree": cmd_disk_register_worktree}[args.disk_action](args, runner, now)
     except (LaunchError, ConfigError, CallerError, LockError) as err:
         sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err))))
         return EXIT_ERROR
@@ -18476,6 +18551,11 @@ def add_disk_parsers(sub):
     reap.add_argument("--apply", action="store_true", help="Remove them (the default only lists)")
     reap.add_argument("--docker", default=argparse.SUPPRESS, help="The docker executable (default: docker on PATH)")
     prune.add_argument("--docker", default=argparse.SUPPRESS, help="The docker executable (default: docker on PATH)")
+    janitor = disk_sub.add_parser("janitor", help="remove old, unnamed entries of the opencode temp directory (a dry run unless --apply)",
+                                  description="Lists (the default) or, with --apply, removes the top-level entries of the temp directory whose newest file is older than "
+                                              "temp_janitor.days (default 7) and that no state file of the fleet names, no keep glob matches and no .fleet-keep marker "
+                                              "protects. Never follows a link, never touches another user's entry. Each removal is one temp.removed audit line.")
+    janitor.add_argument("--apply", action="store_true", help="Remove them (the default only lists)")
     reclaim = disk_sub.add_parser("reclaim-worktrees", help="Remove the registered worktrees of retired agents when clean and pushed; else keep and say why (a dry run unless --apply)")
     reclaim.add_argument("--apply", action="store_true", help="Do it (default: a dry run)")
     register = disk_sub.add_parser("register-worktree", help="Record a linked worktree for an agent (launch records its own)")
