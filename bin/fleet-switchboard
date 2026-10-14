@@ -138,6 +138,23 @@ def load_plan_ledger():
     return module
 
 
+def load_disk_janitor():
+    """The temp-directory janitor, bin/disk_janitor.py (#321), loaded by path like plan_check."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "disk_janitor.py")
+    held = sys.modules.get("disk_janitor")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("disk_janitor", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["disk_janitor"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("disk_janitor", None)
+        raise
+    return module
+
+
 def load_impact_floor():
     """The impact floor and hold table, bin/impact_floor.py (#179, L3), loaded by path like plan_check."""
     path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "impact_floor.py")
@@ -377,7 +394,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "temp_janitor"}
 
 
 def config_known_keys():
@@ -470,6 +487,10 @@ def validate_config(raw, source="config"):
     validate_friction_config(config, source)
     validate_worktree_config(config, source)
     validate_orphan_config(config, source)
+    try:
+        load_disk_janitor().validate(config.get("temp_janitor"), source)
+    except ValueError as err:
+        raise ConfigError(str(err))
     if config.get("impact_hold") is not None:   # #179 L4: the hold is off unless `enabled` is true
         try:
             impact_floor.validate_hold_config(config["impact_hold"])
@@ -4071,7 +4092,10 @@ class Switchboard:
         fact = Fact("send:%s:%s" % (sender, uuid.uuid4().hex[:16]), recipient, "send", text, now,
                     issue=None if issue is None else int(issue), batch=False, sender=sender,
                     repo=repo or issue_repo(issue))
-        return self.send_fact(fact, discovery, now, interrupt=interrupt)
+        outcome = self.send_fact(fact, discovery, now, interrupt=interrupt)
+        if outcome.get("sent") and sender != recipient and sender in discovery.agents and self.state_dir is not None:
+            record_last_send(self.state_dir, sender, recipient, now)   # beside `report`'s record: both count as being in touch with that boss
+        return outcome
 
     def repos_in_play(self):
         """The repos messages may be about: every watched repo. With one, a message names `#2`; with
@@ -5295,7 +5319,7 @@ PANE_SETTLE_SECONDS = 5      # the two looks before a close are this far apart: 
 PANE_READ_MAX = 8000         # characters of a pane's screen kept
 PANE_FORGET_SECONDS = 3 * 86400   # a dead agent nobody repaired is forgotten (and stops waking cos) after this
 RETIRED_FILE = "retired.json"            # {name: {"at", "by", "reason", "session", "auto"}}: finished workers, skipped by detection and reattach
-LAST_REPORT_FILE = "last-reports.json"   # {sender: {"state", "at"}}: the last report each worker made (written by `report`, read by the daemon)
+LAST_REPORT_FILE = "last-reports.json"   # {sender: {"state", "at", "send_to": {recipient: epoch}}}: the last report each worker made and the last send to each recipient (written by `report` and `send`, read by the daemon); an entry may hold only `send_to`
 RETIRED_SHOW_DAYS = 7                    # a retired agent is listed once in `status` as retired, then dropped after this many days
 PANE_HEALTH_FILE = "pane-health.json"
 PANE_CHECK_SECONDS = 60      # a pane is looked at again after this
@@ -5462,6 +5486,35 @@ def read_retired(state_dir):
     return _read_small(state_dir, RETIRED_FILE)
 
 
+def _prune_last_reports(data):
+    """Bounded: the 500 entries with the oldest last sign of life go."""
+    if len(data) > 500:
+        stamp = lambda k: max([data[k].get("at", 0)] + list((data[k].get("send_to") or {}).values()))
+        for old in sorted(data, key=stamp)[:len(data) - 500]:
+            data.pop(old, None)
+
+
+def record_last_send(state_dir, sender, recipient, now):
+    """Remember that `sender` last SENT something to `recipient` (`send_to: {recipient: epoch}`, beside the last report's `state` and `at`, which it never
+    changes; at most 8 recipients kept): a worker that messages its boss is in touch, which the overdue-checkpoint check counts as reporting to THAT boss
+    even where no transcript is read (v2_light). Best effort, under a lock; never raises into `send`."""
+    try:
+        with agent_lock(state_dir, "files", seconds=2):
+            data = _read_small(state_dir, LAST_REPORT_FILE)
+            entry = dict(data.get(sender) or {})
+            sends = {k: v for k, v in (entry.get("send_to") or {}).items() if isinstance(k, str) and _is_number(v)}
+            sends[recipient] = int(now)
+            for old in sorted(sends, key=sends.get)[:max(0, len(sends) - 8)]:
+                sends.pop(old, None)
+            entry["send_to"] = sends
+            data[sender] = entry
+            _prune_last_reports(data)
+            _write_small(state_dir, LAST_REPORT_FILE, data)
+        return True
+    except Exception:
+        return False
+
+
 def record_last_report(state_dir, sender, state, now):
     """Remember the last report `sender` made (state and time): what lets the daemon tell a worker its boss closed on purpose after its final `done`
     from one that died. Best effort, under a lock, never raises into `report`. Returns whether it was written: a failure is the SAFE direction (the
@@ -5469,10 +5522,11 @@ def record_last_report(state_dir, sender, state, now):
     try:
         with agent_lock(state_dir, "files", seconds=2):
             data = _read_small(state_dir, LAST_REPORT_FILE)
-            data[sender] = {"state": state, "at": int(now)}
-            if len(data) > 500:   # bounded: the oldest go
-                for old in sorted(data, key=lambda k: data[k].get("at", 0))[:len(data) - 500]:
-                    data.pop(old, None)
+            entry = {"state": state, "at": int(now)}
+            if isinstance((data.get(sender) or {}).get("send_to"), dict):
+                entry["send_to"] = data[sender]["send_to"]   # a report does not forget the last sends
+            data[sender] = entry
+            _prune_last_reports(data)
             _write_small(state_dir, LAST_REPORT_FILE, data)
         return True
     except Exception:
@@ -5480,7 +5534,13 @@ def record_last_report(state_dir, sender, state, now):
             try:
                 with agent_lock(state_dir, "files", seconds=1):
                     data = _read_small(state_dir, LAST_REPORT_FILE)
-                    if data.pop(sender, None) is not None:
+                    stale = data.get(sender)
+                    if stale is not None:   # the stale `done` goes; the record of sends stays
+                        sends = stale.get("send_to")
+                        if isinstance(sends, dict) and sends:
+                            data[sender] = {"send_to": sends}
+                        else:
+                            data.pop(sender, None)
                         _write_small(state_dir, LAST_REPORT_FILE, data)
             except Exception:
                 pass
@@ -5998,11 +6058,12 @@ def worktree_in_use(engine, path):
 @contextmanager
 def worktree_sweep(engine):
     """One session.list serves every in-use check inside the block; the cache is dropped on the way out, whatever happens."""
+    before = (getattr(engine, "_wt_sweep", False), getattr(engine, "_wt_session_index", None))
     engine._wt_sweep, engine._wt_session_index = True, None
     try:
         yield
     finally:
-        engine._wt_sweep, engine._wt_session_index = False, None
+        engine._wt_sweep, engine._wt_session_index = before
 
 
 WORKTREE_SESSION_PAGES = 20    # pages of session.list read once per sweep; a list longer than this is incomplete
@@ -6274,7 +6335,7 @@ def orphan_kind(command, roots=None):
     return None
 
 
-def orphan_candidates(table=None, config=None, roots=None, me=None):
+def orphan_reap_candidates(table=None, config=None, roots=None, me=None):
     """([(pid, kind, age, command)] past the grace, [same] still within it): processes of this user whose parent is pid 1 and that match the allow-list."""
     grace = orphan_config(config)["grace_seconds"]
     uid, mine = os.getuid(), me or {1, os.getpid(), os.getppid()}
@@ -6292,7 +6353,7 @@ def orphan_status_line(config, table=None):
     """`orphans 2: node-test 4242 (9 h), ...`, or None when there is none or the reaper is off."""
     if not orphan_config(config)["enabled"]:
         return None
-    due, young = orphan_candidates(table, config)
+    due, young = orphan_reap_candidates(table, config)
     if not due:
         return None
     shown = ", ".join("%s %d (%d h)" % (kind, pid, age // 3600) for pid, kind, age, _ in due[:5])
@@ -6303,7 +6364,7 @@ def reap_orphans(engine, apply, table=None, kill=None, sleep=None, roots=None, b
     """Plan or do the reap: a dict with `due`, `young` and, applied, `results` [(pid, kind, outcome)]. Each signal is audited."""
     config = engine.config
     kill, sleep = kill or os.kill, sleep or time.sleep   # looked up at call time, so a test can replace them
-    due, young = orphan_candidates(table, config, roots)
+    due, young = orphan_reap_candidates(table, config, roots)
     out = {"due": due, "young": young, "results": []}
     if not apply:
         return out
@@ -11279,6 +11340,29 @@ class ReminderFacts:
                 return "%s is %s" % (ref, state)
         return None
 
+    def last_report(self, worker, boss=None):
+        """When `worker` last made a report (to anyone) or sent a message to `boss` (epoch seconds, from `last-reports.json`), or None. A time in the
+        future is no sign of life: a damaged or forged record cannot silence the wake for good."""
+        try:
+            entry = _read_small(self.state_dir, LAST_REPORT_FILE).get(worker, {})
+            sends = entry.get("send_to") if isinstance(entry.get("send_to"), dict) else {}
+            times = [entry.get("at"), sends.get(boss) if isinstance(boss, str) else None]
+        except (OSError, AttributeError):
+            return None
+        now = self.engine.now() if self.engine else time.time()
+        times = [float(t) for t in times if _is_number(t) and t <= now + 60]
+        return max(times) if times else None
+
+    def overdue_text(self, item):
+        """The wake's text with the fact the boss needs: when the worker last reported, or that it has not since the launch."""
+        worker, since = item["condition"].get("unless_report_from"), item["condition"].get("since", 0)
+        last = self.last_report(worker, item["to"]) if isinstance(worker, str) else None
+        if last is None:
+            tail = "no report from %s since launch" % _plain(worker, 60)
+        else:
+            tail = "last report from %s %s ago%s" % (_plain(worker, 60), _age_text(max(0, int(self.engine.now() - last))), "" if not _is_number(since) or last >= since else " (before this launch)")
+        return "%s (%s)" % (item["text"], tail)
+
     def verdict(self, item):
         """For a due conditional reminder: None (cannot tell yet: it stays), "deliver", or the reason to drop it.
         One read of the boss's transcript and inbox, and only for a reminder that is due and has a condition."""
@@ -11299,6 +11383,9 @@ class ReminderFacts:
                 self.engine.audit.append(self.engine.actor, "reminder.condition_unusable", item["to"],
                                          {"id": item["id"]})
             return "deliver"
+        last = self.last_report(worker, item["to"])
+        if last is not None and last >= since:   # the durable record `report` writes for EVERY report (a rider, a direct one, to any boss): it needs no read of the boss's transcript, which v2_light never makes and a delivered rider no longer shows
+            return "%s reported to its boss since the launch (%s ago)" % (worker, _age_text(max(0, int(self.engine.now() - last))))
         if boss is None:
             return None
         try:
@@ -11327,7 +11414,8 @@ class ReminderFacts:
                         self.engine.audit.append(self.engine.actor, "reminder.drop", item["to"],
                                                  {"id": item["id"], "why": found})
                     continue
-            facts.append(Fact("reminder:" + item["id"], item["to"], "reminder", item["text"], item["at"],
+            text = self.overdue_text(item) if isinstance(item.get("condition"), dict) and isinstance(item["condition"].get("unless_report_from"), str) and self.engine else item["text"]
+            facts.append(Fact("reminder:" + item["id"], item["to"], "reminder", text, item["at"],
                               issue=item.get("issue"), batch=False, sender=item.get("from"), repo=item.get("repo")))
         return facts
 
@@ -18246,13 +18334,120 @@ def add_impact_parsers(sub):
 
 # ---------------------------------------------------------------- `disk prune`: reclaim old docker build cache and images, and nothing else
 #
-# The two commands below are the ONLY ones it runs, with exactly these arguments: old build cache and old unused images (a week). Never a volume, never a
-# running container (`image prune -a` keeps every image a container uses), never `system prune`. It refuses when there is no docker. `--dry-run` prints the
-# commands and runs none. Nothing runs it on its own: the docs give a launchd snippet for a weekly run, not installed.
+# The two commands below, and the volume step after them, are the ONLY ones it runs, with exactly these arguments: old build cache and old unused images (a
+# week), then `docker volume prune -f` (never `-a`: docker's own anonymous-only prune, which removes only anonymous volumes no container references, stopped ones
+# included) and ONLY when the docker server is 23.0 or newer (before that, `volume prune` removed every unused volume, named ones too). Never a running
+# container (`image prune -a` keeps every image a container uses), never `system prune`. It refuses when there is no docker. `--dry-run` prints the commands and
+# runs none. Nothing runs it on its own: the docs give a launchd snippet for a weekly run, not installed.
 DISK_PRUNE_COMMANDS = (("docker", "builder", "prune", "-f", "--filter", "until=168h"),
                        ("docker", "image", "prune", "-a", "-f", "--filter", "until=168h"))
 DISK_PRUNE_TIMEOUT = 600
+DISK_VOLUME_PRUNE = ("volume", "prune", "-f")       # NEVER -a or --all
+DISK_VOLUME_MIN_ENGINE = (23, 0)                    # from here `volume prune` removes only ANONYMOUS volumes
+DISK_VOLUME_MIN_API = (1, 42)                       # the API of Docker 23.0
+DISK_VOLUME_READ_BYTES = 1000000                    # docker output parsed: no more than this
+DISK_ANONYMOUS_LABEL = "com.docker.volume.anonymous"
+DISK_VOLUME_LIMIT = 200                             # volumes examined: past it the count is "at least"
+DISK_VOLUME_SECONDS = 30
+_SIZE_UNITS = {"B": 1, "KB": 10 ** 3, "MB": 10 ** 6, "GB": 10 ** 9, "TB": 10 ** 12}
 _RECLAIMED = re.compile(r"Total reclaimed space:\s*(\S+)", re.I)
+
+
+def _version_pair(text):
+    found = re.match(r"\s*(\d{1,4})\.(\d{1,4})", text or "")
+    return (int(found.group(1)), int(found.group(2))) if found else None
+
+
+def docker_volume_prune_gate(docker, runner):
+    """(ok, why, kind): is it safe to run `docker volume prune -f`? Only when ALL hold: the server is Docker (Engine or Desktop: a compatible program such as podman
+    prunes every unused volume), its version is 23.0 or newer, the API both ends speak is 1.42 or newer (an older API makes the daemon prune EVERY unused
+    volume, named ones too, whatever the server version), and `DOCKER_API_VERSION` does not pin it lower. Anything unreadable refuses."""
+    try:
+        done = runner([docker, "version", "--format", "{{.Server.Version}}|{{.Server.Platform.Name}}|{{.Server.APIVersion}}|{{.Client.APIVersion}}"],
+                      capture_output=True, text=True, timeout=DISK_VOLUME_SECONDS, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return False, "the docker server version could not be read (is docker running?)", "unreadable"
+    parts = (done.stdout or "")[:2000].strip().split("|") if done.returncode == 0 else []
+    if len(parts) != 4 or _version_pair(parts[0]) is None or _version_pair(parts[2]) is None or _version_pair(parts[3]) is None:
+        return False, "the docker server version could not be read (is docker running?)", "unreadable"
+    version, platform, server_api, client_api = _version_pair(parts[0]), parts[1], _version_pair(parts[2]), _version_pair(parts[3])
+    if not platform.strip().lower().startswith("docker"):
+        return False, "the server is %r, not Docker Engine or Docker Desktop (use Docker's own engine, or run the prune by hand)" % _plain(platform, 40), "unsafe"
+    if version < DISK_VOLUME_MIN_ENGINE:
+        return False, "docker server %d.%d is older than 23.0, where `volume prune` removes named volumes too (upgrade docker)" % version, "unsafe"
+    pinned = os.environ.get("DOCKER_API_VERSION", "").strip()
+    if pinned and (_version_pair(pinned) is None or _version_pair(pinned) < DISK_VOLUME_MIN_API):
+        return False, "DOCKER_API_VERSION=%s pins the API below 1.42, where `volume prune` removes named volumes too (unset it)" % _plain(pinned, 20), "unsafe"
+    if min(server_api, client_api) < DISK_VOLUME_MIN_API:
+        return False, "the docker API in use is %d.%d, below 1.42, where `volume prune` removes named volumes too (upgrade the docker client or server)" % min(server_api, client_api), "unsafe"
+    return True, "", ""
+
+
+def _volume_bytes(text):
+    found = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([kKMGT]?B)\s*", text or "")
+    return int(float(found.group(1)) * _SIZE_UNITS[found.group(2).upper()]) if found else None
+
+
+def anonymous_volumes(docker, runner):
+    """(names, bytes or None, complete): the volumes docker lists as dangling (no container references them, stopped ones included) whose inspect shows the
+    anonymous label. Names are checked against docker's own shape, so nothing hostile is printed. `bytes` is the sum of their sizes from `docker system df -v`,
+    None when docker would not say; `complete` is False past DISK_VOLUME_LIMIT. Read only. Raises OSError when docker cannot answer."""
+    def run(argv):
+        done = runner([docker] + list(argv), capture_output=True, text=True, timeout=DISK_VOLUME_SECONDS, stdin=subprocess.DEVNULL)
+        if done.returncode != 0:
+            raise OSError("docker %s: exit %s: %s" % (" ".join(argv[:2]), done.returncode, _plain(done.stderr or done.stdout, 160)))
+        return (done.stdout or "")[:DISK_VOLUME_READ_BYTES]
+    listed = [l.strip() for l in run(("volume", "ls", "-q", "-f", "dangling=true")).splitlines() if l.strip()]
+    ids = [l for l in listed if _DOCKER_ID["volume"].fullmatch(l)]
+    complete = len(ids) <= DISK_VOLUME_LIMIT
+    ids = ids[:DISK_VOLUME_LIMIT]
+    found = [r.get("Name") for r in (_docker_inspect(docker, runner, "volume", ids) if ids else [])
+             if isinstance(r.get("Labels"), dict) and DISK_ANONYMOUS_LABEL in r["Labels"] and isinstance(r.get("Name"), str)]
+    names = [n for n in found if _DOCKER_ID["volume"].fullmatch(n)]
+    size = None
+    if names:
+        try:
+            rows = json.loads(run(("system", "df", "-v", "--format", "{{json .Volumes}}")) or "[]")
+            sizes = {r.get("Name"): _volume_bytes(r.get("Size")) for r in rows if isinstance(r, dict)}
+            size = sum(sizes[n] for n in names) if all(sizes.get(n) is not None for n in names) else None
+        except (OSError, ValueError, subprocess.SubprocessError):
+            size = None
+    return names, size, complete
+
+
+def anonymous_volumes_line(docker, runner):
+    try:
+        names, size, complete = anonymous_volumes(docker, runner)
+    except (OSError, subprocess.SubprocessError) as err:
+        return "unmounted anonymous volumes: not readable (%s)" % _plain(str(err), 120)
+    return "unmounted anonymous volumes: %s%d (%s)" % ("" if complete else ">=", len(names), _human(size) if size is not None else "size not read")
+
+
+def disk_volume_step(docker, runner, dry_run):
+    """The third prune step. Returns (status, lines). Refused unless the server is 23.0 or newer."""
+    ok, why, kind = docker_volume_prune_gate(docker, runner)
+    if not ok:
+        return (EXIT_ERROR if kind == "unreadable" else EXIT_OK), ["volume prune: refused: %s; %s" % (why, "the other two would still run" if dry_run else "the other two ran")]
+    lines = []
+    if dry_run:
+        try:
+            names, size, complete = anonymous_volumes(docker, runner)
+            lines.append("candidate anonymous volumes: %s%d (%s)" % ("" if complete else ">=", len(names), _human(size) if size is not None else "size not read"))
+            lines.extend("  " + n for n in names[:20])
+            if len(names) > 20:
+                lines.append("  %d more" % (len(names) - 20))
+        except (OSError, subprocess.SubprocessError) as err:
+            lines.append("candidate anonymous volumes: not readable (%s)" % _plain(str(err), 120))
+        lines.append("would run %s (never -a)" % " ".join(["docker"] + list(DISK_VOLUME_PRUNE)))
+        return EXIT_OK, lines
+    try:
+        done = runner([docker] + list(DISK_VOLUME_PRUNE), capture_output=True, text=True, timeout=DISK_PRUNE_TIMEOUT, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as err:
+        return EXIT_ERROR, ["volume prune: failed: %s" % _plain(str(err), 160)]
+    if done.returncode != 0:
+        return EXIT_ERROR, ["volume prune: failed (exit %s): %s" % (done.returncode, _plain(done.stderr or done.stdout, 200))]
+    found = _RECLAIMED.search(done.stdout or "")
+    return EXIT_OK, ["volume prune: reclaimed %s" % (_plain(found.group(1), 40) if found else "nothing reported")]
 
 
 def cmd_disk_reap_docker(args, runner, now):
@@ -18289,10 +18484,13 @@ def cmd_disk_prune(args, runner, now):
         return EXIT_USAGE
     commands = [(docker,) + argv[1:] for argv in DISK_PRUNE_COMMANDS]
     if args.dry_run:
-        print("dry run: %s would run, in order, and nothing else (never a volume, a running container or `system prune`):" % PROG)
+        print("dry run: %s would run, in order, and nothing else (never `-a` on a volume, a running container or `system prune`):" % PROG)
         for argv in commands:
             print("  " + " ".join(shlex.quote(a) for a in argv))
-        return EXIT_OK
+        volume_status, volume_lines = disk_volume_step(docker, runner, True)
+        for line in volume_lines:
+            print(line)
+        return volume_status
     before = disk_free(ensure_state_dir())
     status = EXIT_OK
     for argv in commands:
@@ -18308,16 +18506,204 @@ def cmd_disk_prune(args, runner, now):
             status = EXIT_ERROR
         else:
             print("%s: reclaimed %s" % (" ".join(argv[1:3]), _plain(found.group(1), 40) if found else "nothing reported"))
+    volume_status, volume_lines = disk_volume_step(docker, runner, False)
+    for line in volume_lines:
+        print(line)
+    status = max(status, volume_status)
     after = disk_free(ensure_state_dir())
     if before and after:
         print("disk: %d GB free before, %d GB after" % (before[0] / 1e9, after[0] / 1e9))
     return status
 
 
+# ---------------------------------------------------------------- `disk report` (#321 slice 1): what holds the disk, read only
+#
+# On demand only: the daemon's pass never runs it (the status line stays one stat). It lists free space, docker usage (ONE `docker system df`), the
+# registered worktrees per agent with size and git state (capped), cache sizes (a bounded walk, no `du`), and orphan CANDIDATES (a process
+# parented to init that works inside a registered worktree or the temp dir: a count, never a kill). It writes and removes nothing.
+
+DISK_REPORT_WORKTREES = 20       # worktrees whose git state is read per report: git is a process per question
+DISK_WALK_ENTRIES = 200000       # entries one size walk looks at; past it the size is "at least"
+DISK_WALK_SECONDS = 5.0
+DISK_PS_SECONDS = 20
+DISK_PS_LINES = 20000             # lines of the process table scanned
+OPENCODE_DATA_DIR = "~/.local/share/opencode"
+
+
+def tree_size(path, entries=DISK_WALK_ENTRIES, seconds=DISK_WALK_SECONDS, clock=time.monotonic):
+    """(bytes, complete): the sum of the file sizes under `path` by a bounded walk (symlinks are not followed and counted at their own size).
+    `complete` is False when the entry or time budget ran out: the number is then a lower bound."""
+    total, seen, deadline = 0, 0, clock() + seconds
+    pending = [str(path)]
+    while pending:
+        try:
+            scan = os.scandir(pending.pop())
+        except OSError:
+            continue
+        with scan:
+            for entry in scan:
+                seen += 1
+                if seen > entries or clock() > deadline:
+                    return total, False
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        pending.append(entry.path)
+                    else:
+                        total += entry.stat(follow_symlinks=False).st_size
+                except OSError:
+                    continue
+    return total, True
+
+
+def _human(size):
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1000 or unit == "GB":
+            return "%d %s" % (size, unit) if unit == "B" else "%.1f %s" % (size, unit)
+        size /= 1000.0
+
+
+def disk_temp_dir():
+    return Path(tempfile.gettempdir()) / "opencode"
+
+
+def orphan_candidates(table, roots):
+    """The rows of a `ps -axo pid=,ppid=,etime=,command=` text whose parent is init (pid 1) and whose command line names a path under one of `roots`:
+    [(pid, etime, command)]. Read only: slice 4 decides what may be killed."""
+    found = []
+    prefixes = tuple(r.rstrip("/") + "/" for r in roots if r)
+    for line in table.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 4 or parts[1] != "1" or not parts[0].isdigit():
+            continue
+        if any(p in parts[3] for p in prefixes):
+            found.append((int(parts[0]), parts[2], parts[3]))
+    return found
+
+
+def disk_report(args, runner, now, out=print):
+    """The five sections as a list of lines. Never raises for a tool that is missing: that section says so."""
+    engine, state, config = build_engine(runner, now, "cli", writable=False)
+    lines = ["free"]
+    status = disk_status_line(config, state)
+    lines.append("  state volume: %s" % (status or "not readable"))
+    lines.append("docker")
+    docker = _docker_executable(args.docker)
+    if docker is None:
+        lines.append("  docker: not installed or not on PATH (%s)" % _plain(args.docker, 120))
+    else:
+        try:
+            done = runner([docker, "system", "df"], capture_output=True, text=True, timeout=DOCKER_REAP_TIMEOUT, stdin=subprocess.DEVNULL)
+            if done.returncode != 0:
+                lines.append("  docker: error: %s" % _plain(done.stderr or done.stdout, 160))
+            else:
+                lines.extend("  " + _plain(l, 160) for l in (done.stdout or "").splitlines()[:12])
+        except (OSError, subprocess.SubprocessError) as err:
+            lines.append("  docker: error: %s" % _plain(str(err), 160))
+        lines.append("  " + anonymous_volumes_line(docker, runner))
+    lines.append("worktrees")
+    registry = {p: e for p, e in read_worktrees(state).items() if isinstance(e, dict)}
+    shown = sorted(registry.items(), key=lambda kv: (str(kv[1].get("agent")), kv[0]))
+    if not shown:
+        lines.append("  none registered")
+    for path, entry in shown[:DISK_REPORT_WORKTREES]:
+        facts = worktree_facts(runner, path)
+        if not facts["exists"]:
+            lines.append("  %s  %s  gone (registered, directory missing)" % (_plain(entry.get("agent"), 40), _plain(path, 120)))
+            continue
+        size, complete = tree_size(path)
+        git = facts["why"] or "%s, %s" % ("dirty" if facts["dirty"] else "clean", "pushed" if facts["pushed"] else "unpushed")
+        lines.append("  %s  %s  %s%s  %s" % (_plain(entry.get("agent"), 40), _plain(path, 120), "" if complete else ">=", _human(size), git))
+    if len(shown) > DISK_REPORT_WORKTREES:
+        lines.append("  %d more not read (cap %d)" % (len(shown) - DISK_REPORT_WORKTREES, DISK_REPORT_WORKTREES))
+    lines.append("caches")
+    temp = disk_temp_dir()
+    for label, path in (("state dir", state), ("opencode data", Path(os.path.expanduser(OPENCODE_DATA_DIR))), ("temp dir", temp)):
+        if not Path(path).is_dir():
+            lines.append("  %s: not present (%s)" % (label, _plain(path, 120)))
+            continue
+        size, complete = tree_size(path)
+        lines.append("  %s: %s%s (%s)" % (label, "" if complete else ">=", _human(size), _plain(path, 120)))
+    lines.append("orphans")
+    try:
+        done = runner(["ps", "-axo", "pid=,ppid=,etime=,command="], capture_output=True, text=True, timeout=DISK_PS_SECONDS, stdin=subprocess.DEVNULL)
+        table = "\n".join((done.stdout or "").splitlines()[:DISK_PS_LINES]) if done.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        table = None
+    if table is None:
+        lines.append("  candidates: not readable (ps failed)")
+    else:
+        found = orphan_candidates(table, list(registry) + [str(temp)])
+        lines.append("  candidates: %d (parent is init and the command names a registered worktree or the temp dir; reported only, nothing is killed)" % len(found))
+        for pid, etime, command in found[:10]:
+            lines.append("    %d  up %s  %s" % (pid, etime, _plain(command.split(None, 1)[0], 100)))   # the program only: its arguments could carry a secret
+    return lines
+
+
+def cmd_disk_report(args, runner, now):
+    """`disk report` (and a bare `disk`): free space, docker usage, worktrees per agent, cache sizes and orphan candidates. Read only."""
+    for line in disk_report(args, runner, now):
+        print(line)
+    return EXIT_OK
+
+
+def janitor_busy_function(engine, runner, janitor):
+    """`busy(path)` for the temp janitor: why an entry is in use, else None; raises janitor.Unknown when something cannot be read (the entry is then kept).
+    In use = a herdr pane (an agent's or a plain terminal) works in it, a non-retired agent's session runs in it (both from `worktree_in_use`), or ANY live
+    process has it as its working directory (one `lsof -a -d cwd -Fn` per run, bounded by a timeout)."""
+    held = {}
+
+    def process_directories():
+        if "dirs" not in held:
+            try:
+                done = runner(["lsof", "-a", "-d", "cwd", "-Fn"], capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+            except (OSError, subprocess.SubprocessError) as err:
+                raise janitor.Unknown("lsof did not run: %s" % _one_line(str(err), 80))
+            if done.returncode not in (0, 1) or (done.returncode == 1 and not (done.stdout or "").strip()):
+                raise janitor.Unknown("lsof failed (exit %s)" % done.returncode)
+            lines = (done.stdout or "").splitlines()
+            if len(lines) > 200000:
+                raise janitor.Unknown("lsof listed more than 200000 lines: a process past the limit would not protect its directory")
+            held["dirs"] = [os.path.realpath(l[1:]) for l in lines if l.startswith("n/")]
+        return held["dirs"]
+
+    def busy(path):
+        why = worktree_in_use(engine, path)
+        if why:
+            return why
+        root = os.path.realpath(path).rstrip("/") + "/"
+        for where in process_directories():
+            if (where.rstrip("/") + "/").startswith(root):
+                return "a live process has it as its working directory (%s)" % _plain(where, 100)
+        return None
+    return busy
+
+
+def cmd_disk_janitor(args, runner, now):
+    """`disk janitor [--apply]`: the temp-directory janitor (bin/disk_janitor.py). A dry run by default; `--apply` is the operator's or the Chief of Staff's."""
+    janitor = load_disk_janitor()
+    engine, state, config = build_engine(runner, now, "cli", writable=bool(args.apply))
+    cfg = janitor.settings(config.get("temp_janitor"))
+    if args.apply:
+        kind = gates_caller_kind(runner, now)
+        if not (kind[0] == "person" or (kind[0] == "agent" and len(kind) > 2 and kind[2] == "chief-of-staff")):
+            raise LaunchError("refused: only the operator or the Chief of Staff may --apply the temp janitor (%s is %s)" % (kind[1], "an agent" if kind[0] == "agent" else "not known"))
+        if not cfg["enabled"]:
+            raise LaunchError("the temp janitor is switched off (temp_janitor.enabled is false)")
+    temp = Path(cfg["dir"]) if cfg.get("dir") else janitor.default_dir()
+    with worktree_sweep(engine):   # one session.list for every in-use check of this run
+        lines, removed, kept = janitor.run(temp, state, now(), cfg, bool(args.apply),
+                                           lambda name, detail: engine.audit.append(engine.actor, "temp.removed", _plain(name, 120), detail),
+                                           busy=janitor_busy_function(engine, runner, janitor))
+    for line in lines:
+        print(_plain(line, 300))
+    print("%s: %d %s, %d kept (%s)" % (PROG, removed, "removed" if args.apply else "would be removed (a dry run: add --apply)", kept, _plain(temp, 160)))
+    return EXIT_OK
+
+
 def cmd_disk(args, runner, now):
     """The `disk` group: `prune` (the disk guard, #319), `reap-docker` (#326) and `reclaim-worktrees` / `register-worktree` (the worktree lifecycle, #321)."""
     try:   # `direct` skips dispatch's error mapping, so refusals are mapped here for every subcommand
-        return {"prune": cmd_disk_prune, "reap-docker": cmd_disk_reap_docker, "reap-orphans": cmd_disk_reap_orphans, "reclaim-worktrees": cmd_disk_reclaim_worktrees, "register-worktree": cmd_disk_register_worktree}[args.disk_action](args, runner, now)
+        return {"report": cmd_disk_report, None: cmd_disk_report, "prune": cmd_disk_prune, "reap-docker": cmd_disk_reap_docker, "janitor": cmd_disk_janitor, "reap-orphans": cmd_disk_reap_orphans, "reclaim-worktrees": cmd_disk_reclaim_worktrees, "register-worktree": cmd_disk_register_worktree}[args.disk_action](args, runner, now)
     except (LaunchError, ConfigError, CallerError, LockError) as err:
         sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err))))
         return EXIT_ERROR
@@ -18327,22 +18713,31 @@ cmd_disk.direct = True   # an operator's command on the machine: no daemon start
 
 
 def add_disk_parsers(sub):
-    disk = sub.add_parser("disk", help="Disk tools: `disk prune` removes old docker build cache and images (never volumes or running containers); `disk reclaim-worktrees` removes the clean, pushed worktrees of retired agents")
-    disk_sub = disk.add_subparsers(dest="disk_action", required=True)
-    prune = disk_sub.add_parser("prune", help="docker builder prune and docker image prune -a, older than a week, and nothing else",
+    disk = sub.add_parser("disk", help="Disk tools: `disk report` (a bare `disk`) shows what holds the disk, read only; `disk prune` removes old docker build cache and images (never volumes or running containers); `disk reclaim-worktrees` removes the clean, pushed worktrees of retired agents")
+    disk_sub = disk.add_subparsers(dest="disk_action", required=False)
+    disk.add_argument("--docker", default="docker", help="The docker executable the bare `disk` report asks (default: docker on PATH)")
+    report = disk_sub.add_parser("report", help="what holds the disk: free space, docker usage, worktrees per agent, cache sizes, orphan candidates (read only; also a bare `disk`)")
+    report.add_argument("--docker", default=argparse.SUPPRESS, help="The docker executable (default: docker on PATH)")
+    prune = disk_sub.add_parser("prune", help="docker builder prune, docker image prune -a (older than a week) and, on docker 23.0 or newer, docker volume prune -f (anonymous volumes only), and nothing else",
                                 description="Runs exactly `docker builder prune -f --filter until=168h` and `docker image prune -a -f --filter until=168h` and prints what "
-                                            "was reclaimed. Never a volume, never a running container, never `system prune`. Refuses without docker. NOTE: "
+                                            "was reclaimed, then (only when the docker server is 23.0 or newer, where it removes ANONYMOUS volumes no container references and nothing named) "
+                                            "`docker volume prune -f`, never `-a`. Never a running container, never `system prune`. Refuses without docker. NOTE: "
                                             "`until=168h` is the image's age, not its last use: a locally built image with no registry copy is removed too if no "
                                             "container uses it.")
-    prune.add_argument("--dry-run", action="store_true", help="Print the two commands and run neither")
+    prune.add_argument("--dry-run", action="store_true", help="Print the commands and the candidate anonymous volumes and run none of them")
     reap = disk_sub.add_parser("reap-docker", help="remove EXPIRED docker containers, networks and volumes that carry fleet.owner and fleet.expires labels",
                                description="Lists (the default) or, with --apply, removes docker containers (`rm -f`), networks and volumes that carry BOTH labels "
                                            "`fleet.owner=<agent>` and `fleet.expires=<epoch seconds>` and whose expiry has passed. Never an unlabelled object, a live "
                                            "one, or a volume a running container mounts; no `system prune`, no sudo. The daemon applies this daily unless the config "
                                            "key `docker_reaper` is false. Each removal is one `docker.reaped` audit line.")
     reap.add_argument("--apply", action="store_true", help="Remove them (the default only lists)")
-    reap.add_argument("--docker", default="docker", help="The docker executable (default: docker on PATH)")
-    prune.add_argument("--docker", default="docker", help="The docker executable (default: docker on PATH)")
+    reap.add_argument("--docker", default=argparse.SUPPRESS, help="The docker executable (default: docker on PATH)")
+    prune.add_argument("--docker", default=argparse.SUPPRESS, help="The docker executable (default: docker on PATH)")
+    janitor = disk_sub.add_parser("janitor", help="remove old, unnamed entries of the opencode temp directory (a dry run unless --apply)",
+                                  description="Lists (the default) or, with --apply, removes the top-level entries of the temp directory whose newest file is older than "
+                                              "temp_janitor.days (default 7) and that no state file of the fleet names, no keep glob matches and no .fleet-keep marker "
+                                              "protects. Never follows a link, never touches another user's entry. Each removal is one temp.removed audit line.")
+    janitor.add_argument("--apply", action="store_true", help="Remove them (the default only lists)")
     orphans = disk_sub.add_parser("reap-orphans", help="Signal (SIGTERM, then SIGKILL) orphaned test helpers past the grace: parent launchd, an exact allow-list; a dry run unless --apply")
     orphans.add_argument("--apply", action="store_true", help="Do it (default: a dry run)")
     reclaim = disk_sub.add_parser("reclaim-worktrees", help="Remove the registered worktrees of retired agents when clean and pushed; else keep and say why (a dry run unless --apply)")
