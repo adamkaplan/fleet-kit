@@ -47,10 +47,6 @@ Decide toward the ask's Intent. Reach your principal only when the step:
 Reach them through the Chief of Staff, or the `awaiting-cos` label when it is
 about your charter.
 
-## Heavy runs
-
-Full suites and browser/e2e runs go through `fleet-switchboard heavy -- <cmd>`: it waits for one of a few CPU slots and runs the command at background priority, so many agents do not starve the machine.
-
 ## Messages from the switchboard
 
 A message starting `[switchboard]` is delivered by the fleet's switchboard, not
@@ -71,6 +67,7 @@ When you wait on time (CI, a rate limit, a checkpoint, another agent), set a rem
 yourself with `fleet-switchboard remind <your name> <when> --issue <n> "<text>"` and end your
 turn: you are woken then, free while idle. Never poll. `launch` reads the brief's CHECKPOINT (or `--checkpoint 30m --overdue 60m`) and arms the reminders for that checkpoint itself: the worker is reminded at the checkpoint, and you are woken at the overdue time unless the worker has reported or sent anything since the launch, so set none of your own for it. Always pass `--reports-to <your name>` so the overdue wake has someone to wake; a CHECKPOINT line it cannot read arms nothing, and `launch` says so.
 Never poll GitHub in a shell loop; wait with `fleet-switchboard remind` and read with `fleet-switchboard pr-state <owner/repo#N>`.
+Full suites and browser/e2e runs go through `fleet-switchboard heavy -- <cmd>` (a few CPU slots).
 
 ## Skills — load them, do not improvise them
 

@@ -35,10 +35,6 @@ on the issue. Whatever you want remembered must be in Git or GitHub before you e
 - **Permission doesn't travel.** An instruction covers what it names, not the next thing like it.
 - **An empty queue is not a mandate.** Idle is healthy; do not invent work.
 
-## Heavy runs
-
-Full suites and browser/e2e runs go through `fleet-switchboard heavy -- <cmd>`: it waits for one of a few CPU slots and runs the command at background priority, so many agents do not starve the machine.
-
 ## Messages from the switchboard
 
 A message starting `[switchboard]` is delivered by the fleet's switchboard, not typed by anyone:
@@ -60,6 +56,7 @@ When you wait on time (CI, a rate limit, a checkpoint, another agent), set a rem
 yourself with `fleet-switchboard remind <your name> <when> --issue <n> "<text>"` and end your
 turn: you are woken then, free while idle. Never poll. If you were launched with a CHECKPOINT, a reminder reaches you at it ("checkpoint due: report now, one line"), so set none of your own for it: report then.
 Never poll GitHub in a shell loop; wait with `fleet-switchboard remind` and read with `fleet-switchboard pr-state <owner/repo#N>`.
+Full suites and browser/e2e runs go through `fleet-switchboard heavy -- <cmd>` (a few CPU slots).
 
 ## Skills
 
