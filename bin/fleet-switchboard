@@ -6307,7 +6307,8 @@ def _under(path, roots):
 
 
 def orphan_roots():
-    temps = {os.path.realpath(t) + "/" for t in (tempfile.gettempdir(), "/tmp", "/private/tmp", "/var/folders", "/private/var/folders")}
+    """(temp roots, worktree roots): this user's own temp directory (`tempfile.gettempdir()`, not all of /tmp or /var/folders) and the fleet's worktrees."""
+    temps = {os.path.realpath(tempfile.gettempdir()) + "/"}
     worktrees = {os.path.realpath(os.path.expanduser("~/Code/fleet-kit.wt")) + "/"}
     return temps, worktrees
 
@@ -6368,6 +6369,8 @@ def reap_orphans(engine, apply, table=None, kill=None, sleep=None, roots=None, b
     out = {"due": due, "young": young, "results": []}
     if not apply:
         return out
+    if engine.audit is None:
+        raise LaunchError("no audit log is open: nothing was signalled (every signal is audited first)")
 
     def same(pid, command, age):   # the pid still names the process judged: same parent, owner and command, and no younger (a reused pid restarts at 0)
         for row in (table() if table else ps_table()):
@@ -6421,7 +6424,7 @@ def cmd_disk_reap_orphans(args, runner, now):
         print("  %s: %s" % (pid or "-", outcome) if kind == "-" else "  %d %s: %s" % (pid, kind, outcome))
     print("%s: %d orphan(s) past %d h%s; %d younger left alone%s" % (PROG, len(result["due"]), settings["grace_seconds"] // 3600,
           "" if args.apply else " (a dry run: add --apply)", len(result["young"]), "" if settings["enabled"] else "; the reaper is switched off"))
-    return EXIT_OK
+    return EXIT_ERROR if any(o.startswith(("failed", "changed")) for _, _, o in result["results"]) else EXIT_OK
 
 
 def identify_who(engine, runner, now):
