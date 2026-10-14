@@ -1964,8 +1964,12 @@ class DiskFacts:
             with os.fdopen(fd, "w") as handle:
                 handle.write(json.dumps({"low": bool(low), "episode": episode, "hard": bool(hard)}, sort_keys=True))
             os.replace(str(temp), str(path))
-        except OSError:
-            pass
+        except OSError as err:
+            try:
+                temp.unlink()
+            except (OSError, UnboundLocalError):
+                pass
+            engine._note("disk.guard_file", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})   # said once per change: after a restart a second episode could begin
 
     def __call__(self):
         engine = self.engine
@@ -1973,7 +1977,8 @@ class DiskFacts:
         if guard is None or engine.state_dir is None:
             return []
         found = disk_free(engine.state_dir)
-        if found is None:
+        if found is None:   # FAIL OPEN, on purpose: a guard that cannot read the volume says so once (audit) and wakes nobody: a false alarm helps no one
+            engine._note("disk.unreadable", None, {"path": str(engine.state_dir)})
             return []
         free_gb, now = found[0] / 1e9, engine.now()
         if self.episode is None:
@@ -1982,7 +1987,9 @@ class DiskFacts:
             engine._note("disk.recovered", None, {"free_gb": int(free_gb), "min_free_gb": guard["min_free_gb"]})
             self.episode = None
             self._save(engine, False, None, False)
-        if self.episode is None and free_gb < guard["min_free_gb"]:
+        discovery = getattr(engine, "discovery", None)
+        chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff") if discovery is not None and not discovery.problems else []
+        if self.episode is None and free_gb < guard["min_free_gb"] and chiefs:   # an episode begins when there is someone to tell: with no Chief of Staff running, the next pass tries again
             self.episode = (now, free_gb < guard["hard_free_gb"])
             if engine.audit is not None:
                 engine.audit.append(engine.actor, "disk.low", None, {"free_gb": int(free_gb), "min_free_gb": guard["min_free_gb"],
@@ -1995,12 +2002,10 @@ class DiskFacts:
             self.episode = (episode, True)
             engine._note("disk.hard", None, {"free_gb": int(free_gb), "hard_free_gb": guard["hard_free_gb"]})
             self._save(engine, True, episode, True)
-        discovery = getattr(engine, "discovery", None)
-        if discovery is None or discovery.problems:
+        if not chiefs:
             return []
-        chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff")
         text = "disk low: %d GB free on the volume holding the state directory (the guard is %g GB, hard line %g GB). `%s disk prune --dry-run` shows what would be " \
-               "pruned (docker build cache and images older than a week, never volumes)" % (free_gb, guard["min_free_gb"], guard["hard_free_gb"], PROG)
+               "pruned (docker build cache and images older than a week, never volumes; it measures the state directory's volume, so check where docker keeps its data)" % (free_gb, guard["min_free_gb"], guard["hard_free_gb"], PROG)
         return [Fact("disk.low:%d" % int(episode), name, "disk", text, episode, sender="switchboard") for name in chiefs]
 
 
@@ -17217,7 +17222,9 @@ def add_disk_parsers(sub):
     disk_sub = disk.add_subparsers(dest="disk_action", required=True)
     prune = disk_sub.add_parser("prune", help="docker builder prune and docker image prune -a, older than a week, and nothing else",
                                 description="Runs exactly `docker builder prune -f --filter until=168h` and `docker image prune -a -f --filter until=168h` and prints what "
-                                            "was reclaimed. Never a volume, never a running container, never `system prune`. Refuses without docker.")
+                                            "was reclaimed. Never a volume, never a running container, never `system prune`. Refuses without docker. NOTE: "
+                                            "`until=168h` is the image's age, not its last use: a locally built image with no registry copy is removed too if no "
+                                            "container uses it.")
     prune.add_argument("--dry-run", action="store_true", help="Print the two commands and run neither")
     prune.add_argument("--docker", default="docker", help="The docker executable (default: docker on PATH)")
 

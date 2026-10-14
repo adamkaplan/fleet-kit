@@ -39166,6 +39166,44 @@ class TestDiskGuard(Base):
         self.facts(restarted)
         self.assertEqual(len(self.audits("disk.hard")), 1, "worse inside the episode: said once, not a second wake")
 
+    def test_the_config_key_is_checked_by_validate_config_too(self):
+        sb.validate_config({"opencode": FAKE_OPENCODE, "disk_guard": {"min_free_gb": 80}})
+        for bad in ("yes", {"hard_free_gb": 99}):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_config({"opencode": FAKE_OPENCODE, "disk_guard": bad})
+
+    def test_with_no_chief_of_staff_no_episode_begins_until_there_is_one_and_an_unreadable_volume_is_audited_once(self):
+        solo = World(self, agents=("coder",), config={})
+        solo.engine.discover(solo.clock.now())
+        self.free[0] = 5 * self.GB
+        found, _ = solo.engine.collect_facts()
+        self.assertEqual([f for f in found if f.kind == "disk"], [])
+        self.assertFalse((solo.state / sb.DISK_GUARD_FILE).exists(), "no episode was opened: nobody to tell")
+        solo.add_agent("cos", fleet={"role": "chief-of-staff"})
+        solo.engine.discover(solo.clock.now())
+        found, _ = solo.engine.collect_facts()
+        self.assertEqual(len([f for f in found if f.kind == "disk"]), 1, "the first pass with a Chief of Staff tells it")
+        with mock.patch.object(sb.shutil, "disk_usage", side_effect=OSError("gone")):
+            self.facts()
+            self.facts()
+        self.assertEqual(len(self.audits("disk.unreadable")), 1)
+
+    def test_an_episode_that_starts_below_the_hard_line_and_a_zero_size_volume(self):
+        self.free[0] = 4 * self.GB
+        (fact,) = self.facts()
+        self.assertEqual(len(self.audits("disk.low")), 1)
+        self.assertTrue(self.audits("disk.low")[0]["detail"]["hard"])
+        self.assertEqual(self.audits("disk.hard"), [], "it began hard: nothing worse to say")
+        with mock.patch.object(sb.shutil, "disk_usage", lambda path: collections.namedtuple("u", "total used free")(0, 0, 7 * self.GB)):
+            self.assertEqual(sb.disk_status_line({}, self.world.state), "7 GB free: VERY LOW (below 50 GB; hard line 10 GB)")
+
+    def test_a_failed_save_of_the_episode_is_said_and_leaves_no_temp_file(self):
+        self.free[0] = 40 * self.GB
+        with mock.patch.object(sb.os, "replace", side_effect=OSError("disk full")):
+            self.assertEqual(len(self.facts()), 1, "the guard still works in memory")
+        self.assertEqual(list(self.world.state.glob("disk-guard.json.*.tmp")), [])
+        self.assertEqual(len(self.audits("disk.guard_file")), 1)
+
     def test_a_guard_that_is_off_or_a_volume_that_cannot_be_read_tells_nobody(self):
         self.free[0] = 1 * self.GB
         self.engine.config["disk_guard"] = False
@@ -39204,7 +39242,7 @@ class TestDiskGuard(Base):
             self.assertFalse({"volume", "system", "container", "--volumes"} & set(argv), "never a volume, a container or a system prune")
         self.assertIn("builder prune: reclaimed 1.2GB", out)
         self.assertIn("image prune: reclaimed 300MB", out)
-        self.assertIn("disk: ", out)
+        self.assertRegex(out, r"disk: 200 GB free before, 200 GB after")
 
     def test_a_dry_run_prints_the_commands_and_runs_none(self):
         code, out, err, calls = self.prune("--dry-run")
@@ -39216,6 +39254,15 @@ class TestDiskGuard(Base):
         code, out, err, calls = self.prune(docker="/nonexistent/docker")
         self.assertEqual((code, calls), (sb.EXIT_USAGE, []))
         self.assertIn("docker is not installed", err)
+
+    def test_a_docker_that_cannot_run_is_said_per_command_and_exits_with_an_error(self):
+        def runner(argv, **kwargs):
+            raise subprocess.TimeoutExpired(argv, 600)
+        docker = self.fake_docker()
+        with captured() as (out, err):
+            code = sb.main(["disk", "prune", "--docker", docker], runner=runner, now=self.world.clock.now)
+        self.assertEqual(code, sb.EXIT_ERROR)
+        self.assertEqual(out.getvalue().count("failed"), 2)
 
     def test_one_failing_command_is_said_and_the_other_still_runs(self):
         code, out, err, calls = self.prune(exits=(1, 0), outputs=("", "Total reclaimed space: 5MB"))
