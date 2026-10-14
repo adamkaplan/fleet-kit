@@ -36,6 +36,7 @@ permissions:
   - {action: shell, resource: "gh pr view *--web*", effect: deny}
   - {action: shell, resource: "gh pr checks *--w*", effect: deny}
   - {action: shell, resource: "gh pr checks * -w*", effect: deny}
+  - {action: shell, resource: "gh pr checks -w*", effect: deny}
   - {action: shell, resource: "*>*", effect: deny}
   - {action: shell, resource: "*>>*", effect: deny}
 ---
