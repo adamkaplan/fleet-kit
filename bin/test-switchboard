@@ -11189,8 +11189,9 @@ class TestSelfRegisteringCli(unittest.TestCase):
                 stale.unlink()
             for name in sorted(choices):
                 (self.SURFACE_DIR / ("%s.json" % name)).write_text(json.dumps({"command": name, "help": self.plain(choices[name].format_help())}, indent=1, sort_keys=True) + "\n")
+        failure = self.snapshot_failure(self.SURFACE_DIR)
+        self.assertIsNone(failure, failure)
         snap = self.read_surface()
-        self.assertEqual(sorted(choices), snap["commands"], "the set of subcommands changed")
         for name in snap["commands"]:
             with self.subTest(command=name):
                 self.assertEqual(self.plain(choices[name].format_help()), snap["help"][name])
