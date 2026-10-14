@@ -35,6 +35,10 @@ on the issue. Whatever you want remembered must be in Git or GitHub before you e
 - **Permission doesn't travel.** An instruction covers what it names, not the next thing like it.
 - **An empty queue is not a mandate.** Idle is healthy; do not invent work.
 
+## Heavy runs
+
+Full suites and browser/e2e runs go through `fleet-switchboard heavy -- <cmd>`: it waits for one of a few CPU slots and runs the command at background priority, so many agents do not starve the machine.
+
 ## Messages from the switchboard
 
 A message starting `[switchboard]` is delivered by the fleet's switchboard, not typed by anyone:

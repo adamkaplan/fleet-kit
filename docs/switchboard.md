@@ -4528,6 +4528,14 @@ The daemon makes ONE `disk_usage` of the volume holding the state directory per 
 </plist>
 ```
 
+### `heavy`: CPU slots for full suites and e2e runs
+
+`fleet-switchboard heavy [--slots N] [--wait-max SECONDS] [--name WHO] -- <command...>` runs a heavy command (a full test suite, a browser or e2e run) only when one of N slots is free (default 3; config `"heavy": {"slots": n}`), so many agents starting suites at once do not starve the machine. It is a slot semaphore made of `heavy-slot-<i>.lock` files in the state directory, each held with `flock` by the RUNNING COMMAND (the command inherits the locked descriptor): a slot is busy exactly while the command runs, the kernel frees it when the holder dies (kill the process group and the slot is free, with nothing to clean up), and no pid file can lie. Killing only the wrapper leaves the slot busy while its command still runs, which is what a slot is for.
+
+While every slot is busy it prints `heavy: waiting for a slot (3 of 3 busy: <name> <command> (pid N), ...)` every 30 s; after `--wait-max` seconds (default 1800) it exits 75 and does not run the command. The command runs as `taskpolicy -b <command>` (macOS background class), else `nice -n 10 <command>`; its arguments, environment, working directory, stdin and stdout are untouched, nothing goes through a shell, its exit status is returned (128 + n when a signal ended it) and SIGINT/SIGTERM/SIGHUP sent to the wrapper are forwarded. The holder's name comes from `--name`, else `FLEET_HEAVY_NAME`, else the OpenCode session id, else the user (no lookup: the wrapper makes no reads of its own). `bin/heavy_slots.py` also gives `holders(state_dir)`, the slots held now as `[{"slot", "name", "pid", "command", "since"}]` (the `status` cpu line reads it).
+
+`bin/test-switchboard`, run directly, takes a slot itself (it re-runs through `heavy`); `FLEET_HEAVY=off`, a CI run (`CI=true`), a run already inside a slot, or a state directory that cannot be written (then ONE line on stderr) run it as it is. Put full suites and browser/e2e runs behind `heavy` in your own scripts too.
+
 ### GitHub reads: conditional, counted, paused when the limit is spent
 
 Every read the daemon makes with `gh api` (the Intent reader's issue and parent reads, the hub's catch-up lists and single-item reads) goes through ONE gate per account (`GhAccounts.read`):

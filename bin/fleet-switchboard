@@ -172,6 +172,23 @@ def load_disk_janitor():
     return module
 
 
+def load_heavy_slots():
+    """The CPU slots for heavy commands, bin/heavy_slots.py (#34), loaded by path like the other modules."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "heavy_slots.py")
+    held = sys.modules.get("heavy_slots")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("heavy_slots", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["heavy_slots"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("heavy_slots", None)
+        raise
+    return module
+
+
 def load_impact_floor():
     """The impact floor and hold table, bin/impact_floor.py (#179, L3), loaded by path like plan_check."""
     path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "impact_floor.py")
@@ -354,6 +371,7 @@ DEFAULTS = {
     "send_timeout_seconds": 60,    # `send` as a whole (the sum of its v2 and herdr calls): past it, a clear failure line, never a silent minutes-long wait
     "poll_seconds": 5,
     "disk_guard": None,            # free space of the state directory's volume: None = defaults (min_free_gb 50, hard_free_gb 10); false = off; or {"min_free_gb": n, "hard_free_gb": n}
+    "heavy": None,                 # CPU slots for `heavy -- <command>` (full suites, e2e runs): None = 3 slots; or {"slots": n}
     "docker_reaper": True,         # the daily removal of EXPIRED labelled docker containers, networks and volumes (`disk reap-docker`): false is the kill switch
     "v2_events": "auto",           # the daemon's news of sessions: "auto" (the service's event stream, where the HTTP route exists; reads only what an event did not say) or "off" (the old reads)
     "v2_transport": "auto",        # how v2 calls travel: "auto" (HTTP to the service when it can, else the CLI) or "cli" (always `opencode api`: the kill switch)
@@ -496,6 +514,10 @@ def validate_config(raw, source="config"):
                 raise ConfigError("%s: %r value for %s must be a string" % (source, key, name))
         envs[key] = dict(env)
     validate_disk_guard(config["disk_guard"], source)
+    try:
+        load_heavy_slots().settings(config["heavy"])
+    except Exception as err:
+        raise ConfigError("%s: %s" % (source, err)) from None
     if not isinstance(config["docker_reaper"], bool):
         raise ConfigError("%s: 'docker_reaper' must be true or false, got %r" % (source, config["docker_reaper"]))
     if config["v2_events"] not in ("auto", "off"):
@@ -19071,6 +19093,40 @@ def cmd_disk(args, runner, now):
 
 
 cmd_disk.direct = True   # an operator's command on the machine: no daemon start
+
+
+def cmd_heavy(args):
+    """`heavy [--slots N] [--wait-max S] -- <command...>`: run the command in a CPU slot (ask #34); its exit status is ours."""
+    module = load_heavy_slots()
+    command = list(args.command)
+    if command[:1] == ["--"]:
+        command = command[1:]
+    try:
+        if not command:
+            raise module.HeavyError("no command: heavy [--slots N] [--wait-max S] -- <command...>")
+        if args.slots is not None and not 1 <= args.slots <= module.SLOTS_MAX:
+            raise module.HeavyError("--slots must be from 1 to %d" % module.SLOTS_MAX)
+        if args.wait_max is not None and args.wait_max < 0:
+            raise module.HeavyError("--wait-max must be 0 or more")
+        configured = module.settings(load_config().get("heavy") if config_path().exists() else None)
+    except (module.HeavyError, ConfigError) as err:
+        sys.stderr.write("%s: heavy: %s\n" % (PROG, err))
+        return EXIT_USAGE
+    return module.run(command, ensure_state_dir(), args.slots or configured, module.DEFAULT_WAIT_MAX if args.wait_max is None else args.wait_max, args.name)
+
+
+cmd_heavy.direct = True   # the wrapper of someone else's command: no daemon start, no error mapping
+
+
+def add_heavy_parsers(sub):
+    heavy = sub.add_parser("heavy", help="Run a heavy command (a full test suite, a browser or e2e run) in one of a few CPU slots, at background priority",
+                           description="`heavy [--slots N] [--wait-max SECONDS] [--name WHO] -- <command...>`: waits for a free slot (default 3, config `heavy.slots`; one line "
+                                       "every 30 s says who holds them), then runs the command as `taskpolicy -b <command>` (else `nice -n 10`) with its stdin, stdout, "
+                                       "exit status and signals passed through. After --wait-max seconds (default 1800) it exits 75 and does not run the command.")
+    heavy.add_argument("--slots", type=int, help="How many commands may run at once (default: config heavy.slots, else 3)")
+    heavy.add_argument("--wait-max", type=int, dest="wait_max", help="Give up after this many seconds without a slot: exit 75 (default 1800)")
+    heavy.add_argument("--name", help="Who the slot is held for (default: FLEET_HEAVY_NAME, the OpenCode session id, the user)")
+    heavy.add_argument("command", nargs=argparse.REMAINDER, help="-- <command...>")
 
 
 def add_disk_parsers(sub):

@@ -10733,6 +10733,7 @@ class TestSelfRegisteringCli(unittest.TestCase):
         "status": ("cmd_status", ("args", "runner", "now")), "poke": ("cmd_poke", ("args",)), "policy-report": ("cmd_policy_report", ("args", "runner", "now")),
         "agents": ("cmd_agents", ("args", "runner", "now")), "job": ("cmd_job", ("args", "runner", "now", "spawn")), "review-laws": ("cmd_review_laws", ("args", "runner", "now")), "review": ("cmd_review", ("args", "runner", "now")), "pr-explain": ("cmd_pr_explain", ("args", "runner", "now")), "disk": ("cmd_disk", ("args", "runner", "now")), "pr-state": ("cmd_pr_state", ("args", "runner", "now")),
         "reattach": ("cmd_reattach", ("args", "runner", "now", "socket_call")),
+        "heavy": ("cmd_heavy", ("args",)),
         "retire": ("cmd_retire", ("args", "runner", "now")),
         "impact": ("cmd_impact", ("args", "runner", "now")), "judge-tool": ("cmd_judge_tool", ("args", "runner", "now")),
         "ensure": ("cmd_ensure", ("args", "spawn")), "install": ("cmd_install", ("args", "runner", "now", "spawn")), "key": ("cmd_key", ("args", "runner", "now")),
@@ -41404,6 +41405,237 @@ class TestTempJanitor(Base):
             self.assertIn(phrase, text)
 
 
+class TestHeavySlots(Base):
+    """`fleet-switchboard heavy` (ask #34): a flock slot semaphore in the state directory; the COMMAND holds the lock; the queue, the kill, the exit status, taskpolicy
+    or nice, the holder list, the wait limit and the no-shell guarantee are each run for real with small commands."""
+
+    def setUp(self):
+        super().setUp()
+        self.hs = sb.load_heavy_slots()
+        self.dir = self.home / "slots"
+        self.dir.mkdir()
+        self.procs = []
+        self.addCleanup(self.cleanup)
+
+    def cleanup(self):
+        for proc in self.procs:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+
+    def env(self, **more):
+        env = dict(os.environ, XDG_STATE_HOME=str(self.dir), FLEET_HEAVY_REPORT_SECONDS="0.3", PATH=os.environ["PATH"])
+        env.pop("FLEET_HEAVY_SLOT", None)
+        env.update(more)
+        return env
+
+    def state(self):
+        path = self.dir / "fleet-switchboard"
+        path.mkdir(mode=0o700, exist_ok=True)
+        return path
+
+    def start(self, *words, slots=3, wait_max=None, name="t", env=None, new_session=True, **popen):
+        argv = [sys.executable, str(SWITCHBOARD), "heavy", "--slots", str(slots), "--name", name]
+        if wait_max is not None:
+            argv += ["--wait-max", str(wait_max)]
+        proc = subprocess.Popen(argv + ["--"] + list(words), env=env or self.env(), start_new_session=new_session, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                stdin=popen.pop("stdin", subprocess.DEVNULL), text=True, **popen)
+        self.procs.append(proc)
+        return proc
+
+    def waiter(self, tag):
+        """A command that says it started and runs until its release file exists."""
+        script = 'touch "%s/started.%s"; while [ ! -e "%s/release.%s" ]; do sleep 0.05; done' % (self.home, tag, self.home, tag)
+        return ["sh", "-c", script]
+
+    def until(self, test, seconds=15):
+        end = time.time() + seconds
+        while time.time() < end:
+            if test():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def started(self):
+        return sorted(p.name for p in self.home.glob("started.*"))
+
+    def test_s1_four_callers_of_three_slots_queue_and_the_fourth_runs_when_one_frees(self):
+        procs = {tag: self.start(*self.waiter(tag), name="who-%s" % tag) for tag in "abcd"[:3]}
+        self.assertTrue(self.until(lambda: len(self.started()) == 3))
+        fourth = self.start(*self.waiter("d"), name="who-d")
+        time.sleep(1.2)
+        self.assertEqual(len(self.started()), 3, "at most 3 run at once")
+        (self.home / "release.a").write_text("")
+        self.assertTrue(self.until(lambda: "started.d" in self.started()), "the fourth runs once a slot is free")
+        for tag in "bcd":
+            (self.home / ("release." + tag)).write_text("")
+        for proc in list(procs.values()) + [fourth]:
+            proc.wait(timeout=15)
+        err = fourth.stderr.read()
+        self.assertIn("heavy: waiting for a slot (3 of 3 busy", err)
+        self.assertRegex(err, r"who-[abc] sh")
+
+    def test_s2_a_holder_killed_with_its_whole_group_frees_its_slot_by_itself(self):
+        holder = self.start(*self.waiter("h"), slots=1, name="doomed")
+        self.assertTrue(self.until(lambda: "started.h" in self.started()))
+        self.assertEqual([h["name"] for h in self.hs.holders(self.state(), 1)], ["doomed"])
+        os.killpg(holder.pid, signal.SIGKILL)
+        holder.wait(timeout=5)
+        waiter = self.start("sh", "-c", 'touch "%s/second"' % self.home, slots=1)
+        self.assertEqual(waiter.wait(timeout=10), 0)
+        self.assertTrue((self.home / "second").exists(), "no cleanup was needed")
+        self.assertEqual(self.hs.holders(self.state(), 1), [])
+
+    def test_s3_stdin_stdout_and_the_exit_status_pass_through_and_a_signal_reaches_the_command(self):
+        proc = self.start("sh", "-c", "cat; exit 3", stdin=subprocess.PIPE)
+        out, err = proc.communicate("some data\n", timeout=15)
+        self.assertEqual((out, proc.returncode), ("some data\n", 3))
+        pidfile = self.home / "pid"
+        proc = self.start("sh", "-c", 'echo $$ > "%s"; exec sleep 60' % pidfile)
+        self.assertTrue(self.until(pidfile.exists))
+        time.sleep(0.3)
+        child = int(pidfile.read_text())
+        proc.send_signal(signal.SIGTERM)   # to the wrapper alone: it forwards it
+        self.assertEqual(proc.wait(timeout=10), 128 + signal.SIGTERM)
+        self.assertTrue(self.until(lambda: not self.alive(child)), "the command was stopped and reaped: nothing is left behind")
+
+    @staticmethod
+    def alive(pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        try:
+            done, _ = os.waitpid(pid, os.WNOHANG)   # a zombie of ours would still answer kill(0)
+            return done == 0
+        except ChildProcessError:
+            return True
+
+    def test_s3_the_wrapper_reaps_its_child_and_leaves_no_zombie(self):
+        proc = self.start("true")
+        proc.wait(timeout=10)
+        ps = subprocess.run(["ps", "-A", "-o", "stat=,ppid="], capture_output=True, text=True).stdout.split("\n")
+        self.assertEqual([line for line in ps if line.strip().startswith("Z") and line.split()[-1] == str(proc.pid)], [])
+
+    def test_s4_the_command_runs_under_taskpolicy_when_it_exists_and_nice_when_it_does_not(self):
+        fake = self.home / "fakebin"
+        fake.mkdir()
+        record = self.home / "record"
+        (fake / "taskpolicy").write_text('#!/bin/sh\necho "$1" > "%s"\nshift\nexec "$@"\n' % record)
+        os.chmod(str(fake / "taskpolicy"), 0o755)
+        env = self.env(PATH="%s:%s" % (fake, os.environ["PATH"]))
+        for name, wanted in (("taskpolicy", ["-b"]),):
+            self.assertEqual(self.start("true", env=env).wait(timeout=10), 0)
+        self.assertEqual(record.read_text().strip(), "-b", "run as taskpolicy -b <command>")
+        self.assertEqual(self.hs.command_prefix(lambda n: "/x/taskpolicy" if n == "taskpolicy" else "/x/nice"), ["/x/taskpolicy", "-b"])
+        self.assertEqual(self.hs.command_prefix(lambda n: "/x/nice" if n == "nice" else None), ["/x/nice", "-n", "10"])
+        self.assertEqual(self.hs.command_prefix(lambda n: None), [])
+        # and with no taskpolicy the real nice runs it at a lower priority
+        stub = self.home / "nobin"
+        stub.mkdir()
+        for tool in ("nice", "sh", "ps"):
+            found = shutil.which(tool)
+            if found:
+                os.symlink(found, str(stub / tool))
+        out = self.home / "niceness"
+        proc = self.start("sh", "-c", 'ps -o nice= -p $$ > "%s"' % out, env=self.env(PATH=str(stub)))
+        self.assertEqual(proc.wait(timeout=10), 0, proc.stderr.read())
+        self.assertEqual(int(out.read_text().strip()), min(20, os.nice(0) + 10), "ten above this process's own niceness")
+
+    def test_s5_the_holder_list_names_who_holds_a_slot_and_a_free_slot_says_nothing(self):
+        proc = self.start("sleep", "5", slots=2, name="the-coder")
+        self.assertTrue(self.until(lambda: len(self.hs.holders(self.state(), 2)) == 1))
+        (entry,) = self.hs.holders(self.state(), 2)
+        self.assertEqual((entry["name"], entry["command"]), ("the-coder", "sleep"))
+        self.assertIsInstance(entry["pid"], int)
+        self.assertLessEqual(abs(entry["since"] - time.time()), 30)
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=5)
+        self.assertTrue(self.until(lambda: self.hs.holders(self.state(), 2) == []))
+        mode = os.stat(str(self.state() / "heavy-slot-0.lock")).st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+
+    def test_s6_past_the_wait_limit_it_exits_75_and_does_not_run_the_command(self):
+        holder = self.start("sleep", "30", slots=1, name="busy-one")
+        self.assertTrue(self.until(lambda: len(self.hs.holders(self.state(), 1)) == 1))
+        marker = self.home / "marker"
+        late = self.start("touch", str(marker), slots=1, wait_max=1)
+        self.assertEqual(late.wait(timeout=15), 75)
+        self.assertIn("heavy: no slot after", late.stderr.read())
+        self.assertFalse(marker.exists())
+
+    def test_s7_the_suite_takes_a_slot_unless_it_is_off_inside_one_or_in_ci(self):
+        self.assertEqual(self.hs.should_take_slot({}), "taken")
+        self.assertEqual(self.hs.should_take_slot({"FLEET_HEAVY": "off"}), "off")
+        self.assertEqual(self.hs.should_take_slot({"CI": "true"}), "off")
+        self.assertEqual(self.hs.should_take_slot({"FLEET_HEAVY_SLOT": "1"}), "inside")
+        env = {"XDG_STATE_HOME": str(self.dir)}
+        wrapped = self.hs.wrap_argv(["TestX"], env, "/py", "/sw", "/dir/test-switchboard")
+        self.assertEqual(wrapped, ["/py", "/sw", "heavy", "--name", "test-switchboard", "--", "/py", "/dir/test-switchboard", "TestX"])
+        self.assertIsNone(self.hs.wrap_argv([], dict(env, FLEET_HEAVY="off"), "/py", "/sw", "/s"))
+        self.assertIsNone(self.hs.wrap_argv([], dict(env, FLEET_HEAVY_SLOT="0"), "/py", "/sw", "/s"))
+
+    def test_s7_a_state_directory_that_cannot_be_written_runs_the_suite_unslotted_with_one_line(self):
+        blocked = self.home / "blocked"
+        blocked.write_text("a file, so no directory can be made under it")
+        import io
+        err = io.StringIO()
+        self.assertIsNone(self.hs.wrap_argv([], {"XDG_STATE_HOME": str(blocked)}, "/py", "/sw", "/s", err=err))
+        self.assertEqual(err.getvalue().count("\n"), 1)
+        self.assertIn("running without a slot", err.getvalue())
+
+    def test_u1_a_wrapper_killed_alone_leaves_the_slot_busy_exactly_while_its_command_runs(self):
+        pidfile = self.home / "orphan-pid"
+        wrapper = self.start("sh", "-c", 'echo $$ > "%s"; exec sleep 3' % pidfile, slots=1)
+        self.assertTrue(self.until(pidfile.exists))
+        time.sleep(0.3)
+        os.kill(wrapper.pid, signal.SIGKILL)   # the wrapper only: the command goes on
+        wrapper.wait(timeout=5)
+        self.assertEqual(len(self.hs.holders(self.state(), 1)), 1, "busy while the command runs")
+        self.assertTrue(self.until(lambda: self.hs.holders(self.state(), 1) == [], 15), "free once it ends")
+
+    def test_u2_the_command_is_not_run_through_a_shell_and_keeps_its_environment_and_directory(self):
+        work = self.home / "cwd"
+        work.mkdir()
+        proc = self.start(sys.executable, "-c", "import sys, os; print(sys.argv[1:], os.environ['X_MARK'], os.getcwd())", "a b;c", "$HOME",
+                          env=self.env(X_MARK="kept"), cwd=str(work))
+        out, err = proc.communicate(timeout=15)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertEqual(out.strip(), "['a b;c', '$HOME'] kept %s" % os.path.realpath(str(work)))
+
+    def test_a_missing_command_and_misuse_are_said_plainly(self):
+        self.assertEqual(self.start("no-such-command-here").wait(timeout=10), 127)
+        for words in ([], ["--slots", "0", "--", "true"], ["--slots", "x", "--", "true"], ["--wait-max", "-1", "--", "true"]):
+            proc = subprocess.Popen([sys.executable, str(SWITCHBOARD), "heavy"] + words, env=self.env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            proc.communicate(timeout=10)
+            self.assertEqual(proc.returncode, sb.EXIT_USAGE, words)
+
+    def test_the_config_key_is_validated(self):
+        for ok in (None, {}, {"slots": 1}, {"slots": 8}):
+            self.hs.settings(ok)
+        for bad in (3, {"slots": 0}, {"slots": "3"}, {"slots": True}, {"slots": 100}, {"cores": 2}):
+            with self.assertRaises(self.hs.HeavyError):
+                self.hs.settings(bad)
+        self.assertEqual(self.hs.settings(None), 3)
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "heavy": {"slots": 0}})
+
+    def test_the_documents_name_the_command_and_the_agent_definitions_say_it_once(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        self.assertIn("fleet-switchboard heavy", text)
+        line = "full suites and browser/e2e runs go through `fleet-switchboard heavy -- <cmd>`"
+        for path in ("agents/opencode/coder.md", "agents/opencode/orchestrator.md", "skills/fleet-coordination/SKILL.md"):
+            found = (REPO / path).read_text()
+            self.assertEqual(found.lower().count(line), 1, path)
+
+
 class TestDockerReaper(Base):
     """The docker reaper (ask #321): only EXPIRED objects carrying both labels, dry run by default, one audit line per removal, no sudo."""
 
@@ -44922,4 +45154,12 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
+    # already in a slot, or a state directory that cannot be written run it as it is.
+    _wrapped = sb.load_heavy_slots().wrap_argv(sys.argv[1:], os.environ, sys.executable, str(SWITCHBOARD), os.path.abspath(__file__))
+    if _wrapped is not None:
+        try:
+            os.execv(_wrapped[0], _wrapped)
+        except OSError as _err:
+            sys.stderr.write("heavy: cannot start the slot wrapper (%s): running without a slot\n" % (_err.strerror or _err))
     sys.exit(main(sys.argv[1:]))
