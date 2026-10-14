@@ -4960,6 +4960,99 @@ class TestLaunch(Base):
         self.assertEqual(code, 0, err)
         self.assertFalse(wt.exists(), out)
 
+    def orphan_rows(self):
+        tmp = Path(os.path.realpath(str(self.home)))
+        fake = str(tmp / "host-mctx-1" / "fake-agent.py")
+        helper = os.path.expanduser("~/Code/fleet-kit.wt/sb-x/tools/helper.py")
+        me = os.getuid()
+        H = 3600
+        return [
+            (4001, 1, me, 7 * H, "/usr/bin/python3 %s --serve" % fake),                    # due: a fake agent in a temp host-mctx dir
+            (4002, 1, me, 9 * H, "node --test test/a.test.js"),                            # due: a node test runner
+            (4003, 1, me, 8 * H, "python3 %s" % helper),                                   # due: a python helper in a fleet worktree
+            (4004, 1, me, 1 * H, "/usr/bin/python3 %s" % fake),                            # younger than the grace
+            (4005, 777, me, 9 * H, "node --test"),                                         # its parent is alive: not an orphan
+            (4006, 1, me + 1, 9 * H, "node --test"),                                       # another user's
+            (os.getpid(), 1, me, 9 * H, "node --test"),                                    # this process
+            (4007, 1, me, 9 * H, "node --test /x/opencode/test.js"),                       # names opencode
+            (4008, 1, me, 9 * H, "/usr/bin/python3 /Users/someone/Code/fleet-kit/bin/x.py"),   # a main checkout script: not on the allow-list
+            (4009, 1, me, 9 * H, "sleep 1000"),                                            # not on the allow-list
+            (1, 0, 0, 99 * H, "/sbin/launchd"),
+        ]
+
+    def test_the_orphan_allow_list_picks_only_exact_matches_of_this_user_past_the_grace_and_never_a_protected_target(self):
+        rows = self.orphan_rows()
+        due, young = sb.orphan_candidates(lambda: rows, {})
+        self.assertEqual(sorted((pid, kind) for pid, kind, _, _ in due), [(4001, "fake-agent"), (4002, "node-test"), (4003, "python-helper")])
+        self.assertEqual([pid for pid, *_ in young], [4004])
+        due, _ = sb.orphan_candidates(lambda: rows, {"orphan_reaper": {"grace_hours": 8}})
+        self.assertEqual(sorted(pid for pid, *_ in due), [4002, 4003], "the grace is configurable")
+        line = sb.orphan_status_line({}, lambda: rows)
+        self.assertRegex(line, r"^3: .*4001.*past 6 h")
+        self.assertIsNone(sb.orphan_status_line({"orphan_reaper": {"enabled": False}}, lambda: rows))
+        self.assertIsNone(sb.orphan_status_line({}, lambda: rows[3:4]))
+
+    def test_the_reap_is_a_dry_run_by_default_signals_term_then_kill_audited_and_refuses_a_stranger_and_the_kill_switch(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.worker()
+        self.world.add_agent("stranger", fleet={"role": "coder"})
+        alive = {r[0]: r for r in self.orphan_rows()}
+        sent = []
+
+        def fake_kill(pid, sig):
+            sent.append((pid, sig))
+            if sig == signal.SIGTERM and pid != 4002:       # 4002 ignores SIGTERM
+                alive.pop(pid, None)
+            if sig == signal.SIGKILL:
+                alive.pop(pid, None)
+
+        with mock.patch.object(sb, "ps_table", lambda: list(alive.values())), mock.patch.object(os, "kill", fake_kill), mock.patch.object(time, "sleep", lambda s: None):
+            os.environ.pop("HERDR_PANE_ID", None)
+            code, out, err = self.run_cli("disk", "reap-orphans")
+            self.assertEqual((code, sent), (0, []), err)
+            self.assertIn("3 orphan(s) past 6 h (a dry run: add --apply); 1 younger left alone", out)
+            os.environ["HERDR_PANE_ID"] = self.world.panes["stranger"]
+            code, out, err = self.run_cli("disk", "reap-orphans", "--apply")
+            self.assertNotEqual(code, 0)
+            self.assertEqual(sent, [])
+            os.environ.pop("HERDR_PANE_ID", None)
+            self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "orphan_reaper": {"enabled": False}})
+            code, out, err = self.run_cli("disk", "reap-orphans", "--apply")
+            self.assertNotEqual(code, 0)
+            self.assertIn("switched off", err)
+            self.assertEqual(sent, [])
+            self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+            code, out, err = self.run_cli("disk", "reap-orphans", "--apply")
+            self.assertEqual(code, 0, err)
+        self.assertEqual(sorted(sent), sorted([(4001, signal.SIGTERM), (4002, signal.SIGTERM), (4002, signal.SIGKILL), (4003, signal.SIGTERM)]))
+        self.assertIn("4001 fake-agent: terminated", out)
+        self.assertIn("4002 node-test: killed", out)
+        events = [e["event"] for e in self.world.audit() if e["event"].startswith("orphan.")]
+        self.assertEqual(sorted(events), ["orphan.kill", "orphan.term", "orphan.term", "orphan.term"])
+        self.assertIn(4004, alive, "a younger process and every protected one are left")
+        self.assertTrue({4005, 4006, 4007, 4008, 4009, 1} <= set(alive))
+
+    def test_a_pid_whose_command_changed_before_the_signal_is_not_signalled_and_the_orphan_config_is_validated(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        rows = self.orphan_rows()
+        reads = {"n": 0}
+
+        def table():
+            reads["n"] += 1
+            if reads["n"] == 1:
+                return rows
+            return [r if r[0] != 4002 else (4002, 1, r[2], r[3], "node server.js") for r in rows]     # the pid now names something else
+
+        sent = []
+        engine = self.world.new_engine("cli")
+        out = sb.reap_orphans(engine, True, table, kill=lambda pid, sig: sent.append((pid, sig)), sleep=lambda s: None)
+        self.assertNotIn(4002, [pid for pid, _ in sent])
+        self.assertIn((4002, "node-test", "changed: not signalled"), out["results"])
+        for bad in ({"enabled": "no"}, {"grace_hours": 0}, {"grace_hours": True}, {"x": 1}, "yes"):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "orphan_reaper": bad})
+        sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "orphan_reaper": {"enabled": False, "grace_hours": 12}})
+
     def test_the_worktree_reclaim_config_is_validated(self):
         base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
         sb.validate_config(dict(base, worktree_reclaim={"enabled": True, "on_done": False}))
