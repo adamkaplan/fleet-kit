@@ -41605,8 +41605,8 @@ class TestHeavySlots(Base):
         pidfile = self.home / "pid"
         proc = self.start("sh", "-c", 'echo $$ > "%s"; exec sleep 60' % pidfile)
         self.assertTrue(self.until(pidfile.exists))
-        time.sleep(0.3)
         child = int(pidfile.read_text())
+        self.assertTrue(self.until(lambda: any(h["pid"] == child for h in self.hs.holders(self.state(), 3))), "the wrapper has recorded its command")
         proc.send_signal(signal.SIGTERM)   # to the wrapper alone: it forwards it
         self.assertEqual(proc.wait(timeout=10), 128 + signal.SIGTERM)
         self.assertTrue(self.until(lambda: not self.alive(child)), "the command was stopped and reaped: nothing is left behind")
@@ -41626,10 +41626,19 @@ class TestHeavySlots(Base):
             return True
 
     def test_s3_the_wrapper_reaps_its_child_and_leaves_no_zombie(self):
-        proc = self.start("true")
-        proc.wait(timeout=10)
-        ps = subprocess.run(["ps", "-A", "-o", "stat=,ppid="], capture_output=True, text=True).stdout.split("\n")
-        self.assertEqual([line for line in ps if line.strip().startswith("Z") and line.split()[-1] == str(proc.pid)], [])
+        """While the wrapper is still alive (kept so by a grandchild that holds the output pipe open), the finished command must not be a zombie of it."""
+        child_pid = self.home / "short-pid"
+        proc = self.start("sh", "-c", 'echo $$ > "%s"; (sleep 3 &) ; exit 0' % child_pid)
+        self.assertTrue(self.until(child_pid.exists))
+        pid = int(child_pid.read_text())
+        time.sleep(0.5)   # the command has exited; the wrapper must have reaped it by now, however busy the machine
+        self.assertTrue(self.until(lambda: self.state_of(pid) is None, 10), "no zombie (state %r)" % self.state_of(pid))
+        proc.wait(timeout=15)
+
+    @staticmethod
+    def state_of(pid):
+        out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+        return out or None
 
     def test_s4_the_command_runs_under_taskpolicy_when_it_exists_and_nice_when_it_does_not(self):
         fake = self.home / "fakebin"
@@ -41638,8 +41647,7 @@ class TestHeavySlots(Base):
         (fake / "taskpolicy").write_text('#!/bin/sh\necho "$1" > "%s"\nshift\nexec "$@"\n' % record)
         os.chmod(str(fake / "taskpolicy"), 0o755)
         env = self.env(PATH="%s:%s" % (fake, os.environ["PATH"]))
-        for name, wanted in (("taskpolicy", ["-b"]),):
-            self.assertEqual(self.start("true", env=env).wait(timeout=10), 0)
+        self.assertEqual(self.start("true", env=env).wait(timeout=10), 0)
         self.assertEqual(record.read_text().strip(), "-b", "run as taskpolicy -b <command>")
         self.assertEqual(self.hs.command_prefix(lambda n: "/x/taskpolicy" if n == "taskpolicy" else "/x/nice"), ["/x/taskpolicy", "-b"])
         self.assertEqual(self.hs.command_prefix(lambda n: "/x/nice" if n == "nice" else None), ["/x/nice", "-n", "10"])
@@ -41700,12 +41708,13 @@ class TestHeavySlots(Base):
 
     def test_u1_a_wrapper_killed_alone_leaves_the_slot_busy_exactly_while_its_command_runs(self):
         pidfile = self.home / "orphan-pid"
-        wrapper = self.start("sh", "-c", 'echo $$ > "%s"; exec sleep 3' % pidfile, slots=1)
+        wrapper = self.start("sh", "-c", 'echo $$ > "%s"; while [ ! -e "%s/orphan-release" ]; do sleep 0.05; done' % (pidfile, self.home), slots=1)
         self.assertTrue(self.until(pidfile.exists))
-        time.sleep(0.3)
+        self.assertTrue(self.until(lambda: any(h["pid"] == int(pidfile.read_text()) for h in self.hs.holders(self.state(), 1))))
         os.kill(wrapper.pid, signal.SIGKILL)   # the wrapper only: the command goes on
         wrapper.wait(timeout=5)
         self.assertEqual(len(self.hs.holders(self.state(), 1)), 1, "busy while the command runs")
+        (self.home / "orphan-release").write_text("")
         self.assertTrue(self.until(lambda: self.hs.holders(self.state(), 1) == [], 15), "free once it ends")
 
     def test_u2_the_command_is_not_run_through_a_shell_and_keeps_its_environment_and_directory(self):
@@ -41716,6 +41725,38 @@ class TestHeavySlots(Base):
         out, err = proc.communicate(timeout=15)
         self.assertEqual(proc.returncode, 0, err)
         self.assertEqual(out.strip(), "['a b;c', '$HOME'] kept %s" % os.path.realpath(str(work)))
+
+    def test_a_signal_while_waiting_a_zero_wait_limit_and_a_command_that_cannot_start(self):
+        holder = self.start("sleep", "30", slots=1)
+        self.assertTrue(self.until(lambda: len(self.hs.holders(self.state(), 1)) == 1))
+        waiting = self.start("true", slots=1)
+        time.sleep(1.0)
+        waiting.send_signal(signal.SIGTERM)
+        self.assertEqual(waiting.wait(timeout=10), 128 + signal.SIGTERM, "a wrapper that is still waiting just ends")
+        zero = self.start("true", slots=1, wait_max=0)
+        self.assertEqual(zero.wait(timeout=10), 75)
+        not_executable = self.home / "notexec"
+        not_executable.write_text("#!/bin/sh\n")   # present, not executable
+        self.assertEqual(self.start(str(not_executable), slots=2).wait(timeout=10), 127)
+
+    def test_what_is_shown_about_a_holder_never_carries_a_terminal_escape(self):
+        state = self.state()
+        (state / "heavy-slot-0.lock").write_text(json.dumps({"name": "\x1b[2Jevil\x9b31m", "command": "a\nb", "pid": 1, "since": 1}))
+        fd = os.open(str(state / "heavy-slot-0.lock"), os.O_RDWR)
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            (entry,) = self.hs.holders(state, 1)
+        finally:
+            os.close(fd)
+        shown = entry["name"] + entry["command"]
+        self.assertEqual([c for c in shown if ord(c) < 32 or 0x7f <= ord(c) <= 0x9f], [])
+        self.assertIn("evil", shown)
+        self.assertEqual(self.hs.holder_name({"FLEET_HEAVY_NAME": "x\x1b[0my"}), "x [0my")
+
+    def test_a_bad_report_interval_falls_back_to_the_default(self):
+        out = self.start("true", env=self.env(FLEET_HEAVY_REPORT_SECONDS="soon"))
+        self.assertEqual(out.wait(timeout=10), 0)
 
     def test_a_missing_command_and_misuse_are_said_plainly(self):
         self.assertEqual(self.start("no-such-command-here").wait(timeout=10), 127)
@@ -45263,7 +45304,8 @@ def main(argv):
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.
-    _wrapped = sb.load_heavy_slots().wrap_argv(sys.argv[1:], os.environ, sys.executable, str(SWITCHBOARD), os.path.abspath(__file__))
+    _wrapped = sb.load_heavy_slots().wrap_argv(sys.argv[1:], os.environ, sys.executable, str(SWITCHBOARD), os.path.abspath(__file__),
+                                                                  state_dir=sb.state_dir_path())
     if _wrapped is not None:
         try:
             os.execv(_wrapped[0], _wrapped)

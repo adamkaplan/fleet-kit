@@ -13,7 +13,8 @@ Full test suites and browser/e2e runs starve the machine when many agents start 
     sent to the wrapper are forwarded to it. The child is always reaped: no zombie.
   - `holders(state_dir)` says who holds a slot NOW: [{"slot", "name", "pid", "command", "since"}], read from the slot file of a slot whose lock is held.
 
-Pure of the switchboard: the caller hands it the state directory, the clock, the settings and the output."""
+Pure of the switchboard: the caller hands it the state directory, the clock, the settings and the output. The slots are a courtesy limit among cooperating agents,
+not a boundary: FLEET_HEAVY=off, a CI run or a preset FLEET_HEAVY_SLOT skip them, and a holder's name is whatever its environment says."""
 
 import errno
 import fcntl
@@ -64,40 +65,9 @@ def should_take_slot(environ):
     return "taken"
 
 
-def parse(argv):
-    """(slots or None, wait_max or None, name or None, command) from the words after `heavy`: options, then `--`, then the command. HeavyError on misuse."""
-    slots = wait_max = name = None
-    words = list(argv)
-    command = []
-    while words:
-        word = words.pop(0)
-        if word == "--":
-            command = words
-            break
-        if word in ("--slots", "--wait-max", "--name"):
-            if not words:
-                raise HeavyError("%s needs a value" % word)
-            value = words.pop(0)
-            if word == "--name":
-                name = value
-                continue
-            try:
-                number = int(value)
-            except ValueError:
-                raise HeavyError("%s needs a whole number, got %r" % (word, value)) from None
-            if word == "--slots":
-                if not 1 <= number <= SLOTS_MAX:
-                    raise HeavyError("--slots must be from 1 to %d" % SLOTS_MAX)
-                slots = number
-            else:
-                if number < 0:
-                    raise HeavyError("--wait-max must be 0 or more")
-                wait_max = number
-            continue
-        raise HeavyError("unexpected %r: put `--` before the command (heavy [--slots N] [--wait-max S] -- <command...>)" % word)
-    if not command:
-        raise HeavyError("no command: heavy [--slots N] [--wait-max S] -- <command...>")
-    return slots, wait_max, name, command
+def _plain(text, limit=80):
+    """Printable characters only, cut to `limit`: what is shown to a person never carries a terminal escape (a slot file or an environment variable is not trusted)."""
+    return "".join(c if c.isprintable() and c not in "\x7f" else " " for c in str(text))[:limit]
 
 
 def holder_name(environ):
@@ -105,7 +75,7 @@ def holder_name(environ):
     for key in ("FLEET_HEAVY_NAME", "OPENCODE_SESSION_ID", "USER", "LOGNAME"):
         value = environ.get(key)
         if value:
-            return str(value)[:80]
+            return _plain(value)
     return "unknown"
 
 
@@ -144,8 +114,8 @@ def holders(state_dir, slots=DEFAULT_SLOTS):
                 if err.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
                     continue
             info = _read_info(fd)
-            found.append({"slot": index, "name": str(info.get("name", "?"))[:80], "pid": info.get("pid") if isinstance(info.get("pid"), int) else None,
-                          "command": str(info.get("command", "?"))[:80], "since": info.get("since") if isinstance(info.get("since"), (int, float)) else None})
+            found.append({"slot": index, "name": _plain(info.get("name", "?")), "pid": info.get("pid") if isinstance(info.get("pid"), int) else None,
+                          "command": _plain(info.get("command", "?")), "since": info.get("since") if isinstance(info.get("since"), (int, float)) else None})
         finally:
             os.close(fd)
     return found
@@ -206,7 +176,10 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
         return EXIT_NOT_FOUND
     name = name or holder_name(environ)
     started = clock()
-    every = float(environ.get("FLEET_HEAVY_REPORT_SECONDS") or WAIT_REPORT_SECONDS)   # 30 s; a test shortens it
+    try:
+        every = float(environ.get("FLEET_HEAVY_REPORT_SECONDS") or WAIT_REPORT_SECONDS)   # 30 s; a test shortens it
+    except ValueError:
+        every = WAIT_REPORT_SECONDS
     next_report = started + every
     got = {"signal": None}
     child = {"p": None}
@@ -250,6 +223,11 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
             out.write("heavy: cannot run %s: %s\n" % (command[0], err.strerror or err))
             return EXIT_NOT_FOUND
         _record(fd, name, child["p"].pid, command[0], clock())
+        if got["signal"] is not None:   # it arrived between taking the slot and the start: the command gets it too
+            try:
+                child["p"].send_signal(got["signal"])
+            except OSError:
+                pass
         while True:
             try:
                 status = child["p"].wait()
@@ -261,21 +239,17 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
         for number, handler in old.items():
             signal.signal(number, handler)
         if fd is not None:
-            try:
-                os.ftruncate(fd, 0)   # the record goes with the command (a slot that is free says nothing)
-            except OSError:
-                pass
-            os.close(fd)
+            os.close(fd)   # the record stays: `holders` lists only slots whose lock is held, and the next holder overwrites it
 
 
-def wrap_argv(argv, environ, python, switchboard, script, err=None):
+def wrap_argv(argv, environ, python, switchboard, script, err=None, state_dir=None):
     """The command line that re-runs `script argv` through `heavy`, or None when it should run as it is (FLEET_HEAVY=off, a CI run, already in a slot, or the
     state directory cannot be written: then ONE line on `err` and the caller runs unslotted: a missing slot machinery never stops the suite). Used by bin/test-switchboard."""
     err = sys.stderr if err is None else err
     if should_take_slot(environ) != "taken":
         return None
     try:
-        probe = os.path.join(environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state"), "fleet-switchboard")
+        probe = str(state_dir) if state_dir is not None else os.path.join(environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state"), "fleet-switchboard")
         os.makedirs(probe, mode=0o700, exist_ok=True)
         if not os.access(probe, os.W_OK):
             raise OSError("not writable")
