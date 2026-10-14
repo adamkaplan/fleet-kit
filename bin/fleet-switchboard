@@ -2414,7 +2414,6 @@ class CpuFacts:
         self.thread = None
         self.begin_at = None          # the engine's clock when this process began the episode (None: it was loaded from the file)
         self.waked_without = False    # the wake went out while the consumers were still being read
-        self.followed = False         # the one follow-up note has been made
         self.saved_episode = None     # the episode the file holds (None: closed)
         self.saved_mem = None
 
@@ -2485,7 +2484,7 @@ class CpuFacts:
         now = engine.now()
         event = self.tracker.step(ratio, now, cfg, can_begin=bool(chiefs))
         if event == "begin":
-            self.detail, self.begin_at, self.waked_without, self.followed = "", now, False, False
+            self.detail, self.begin_at, self.waked_without = "", now, False
             self._start_ps(engine, cg)
             if engine.audit is not None:
                 engine.audit.append(engine.actor, "cpu.high", None, {"load1": round(load1, 1), "load5": round(load5, 1), "cores": cores, "ratio5": round(ratio, 2),
@@ -2517,13 +2516,9 @@ class CpuFacts:
         text = "cpu high: load %d on %d cores (%.1fx over five minutes; the guard is %gx for %g minutes). %s `%s status` shows the line; heavy work should wait for a slot." % (
             round(load5), cores, ratio, cfg["high_ratio"], cfg["minutes"], consumers, PROG)
         facts = [Fact("cpu.high:%d" % int(episode), name, "cpu", " ".join(text.split()), episode, sender="switchboard") for name in chiefs]
-        if self.waked_without and self.detail and not self.followed:
-            self.followed = True
+        if self.waked_without and self.detail:   # the answer came after the wake: ONE follow-up note (the same key on every pass, so it is delivered once)
             note = "cpu consumers (the answer came after the cpu high note): %s." % self.detail
             facts.extend(Fact("cpu.top:%d" % int(episode), name, "cpu-top", note, episode, sender="switchboard") for name in chiefs)
-        elif self.waked_without and self.detail:
-            facts.extend(Fact("cpu.top:%d" % int(episode), name, "cpu-top", "cpu consumers (the answer came after the cpu high note): %s." % self.detail, episode,
-                              sender="switchboard") for name in chiefs)   # the same key every pass: delivered once
         return facts
 
     def _mem(self, engine, cg, mem_cfg, chiefs):

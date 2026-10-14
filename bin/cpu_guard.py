@@ -33,6 +33,7 @@ LANE_PIDS = 10                      # the top processes whose lane is looked up 
 WAKE_GRACE_SECONDS = PS_SECONDS + LSOF_SECONDS + 2   # the wake waits this long for the consumers; a later answer is ONE follow-up note
 PS_BYTES = 2000000
 CATEGORIES = 5
+PROGRAMS_MAX = 2000                 # distinct program names kept by the process-table walk
 
 
 def _number(value):
@@ -199,8 +200,12 @@ def process_table(limit_seconds=2.0, clock=time.monotonic):
                 info = TaskInfo()
                 if pid <= 0 or lib.proc_pidinfo(pid, 4, 0, ctypes.byref(info), ctypes.sizeof(info)) <= 0:
                     continue   # not this user's, or gone
-                lib.proc_name(pid, name, 256)
+                name.value = b""   # a failed call never leaves the previous process's name behind
+                if lib.proc_name(pid, name, 256) <= 0:
+                    continue
                 program = _clean_name(name.value.decode("utf-8", "replace"))
+                if program not in totals and len(totals) >= PROGRAMS_MAX:
+                    continue
                 held = totals.get(program, (0, 0))
                 totals[program] = (held[0] + 1, held[1] + int(info.resident))
             return totals
@@ -217,6 +222,8 @@ def process_table(limit_seconds=2.0, clock=time.monotonic):
                     with open("/proc/%s/comm" % entry) as handle:
                         program = _clean_name(handle.read(200))
                 except (OSError, ValueError, IndexError):
+                    continue
+                if program not in totals and len(totals) >= PROGRAMS_MAX:
                     continue
                 held = totals.get(program, (0, 0))
                 totals[program] = (held[0] + 1, held[1] + resident)

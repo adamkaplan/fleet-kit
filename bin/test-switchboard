@@ -43855,6 +43855,10 @@ class TestGithubWritingRule(unittest.TestCase):
         self.assertNotIn("shims/gh", changed)
 
 
+_CG = sb.load_cpu_guard()
+ORIGINAL_MEMORY_READING, ORIGINAL_PROCESS_TABLE = _CG.memory_reading, _CG.process_table   # the real readers, kept before a test patches them
+
+
 class TestCpuConsumersAndMemory(Base):
     """Ask #420: the cpu alarm names its consumers by program and lane (a late answer is one follow-up note), and a mem line and alarm that read the kernel's
     counters and process table without starting a process."""
@@ -43910,6 +43914,8 @@ class TestCpuConsumersAndMemory(Base):
         last = []
         for _ in range(int(minutes * 60 / step)):
             self.world.tick(step)
+            if self.block[0] is None:
+                self.settle()   # the consumers thread has finished before the next pass: no race with the clock
             last = self.facts(kinds)
         return last
 
@@ -44060,6 +44066,45 @@ class TestCpuConsumersAndMemory(Base):
         self.mem[0] = self.cg.Memory(int(9.9 * self.GB), 10 * self.GB, 1 * self.GB)
         self.engine.config["cpu_guard"] = False
         self.assertEqual(self.run_for(10), [])
+
+    def test_the_parsers_and_the_linux_readers_are_tested_directly(self):
+        self.assertEqual(self.cg.parse_lsof("p7\nfcwd\nn/a/b\np8\nfcwd\nn/c\nn/ignored-second\nxjunk\n"), {7: "/a/b", 8: "/c"})
+        self.assertEqual(self.cg.parse_lsof(""), {})
+        rows = self.cg.process_rows("  12  3.5 /bin/a\n 7.0 /bin/b c\n bad line\n  9  nan /x\n  8 -1 /y\n")
+        self.assertEqual([(p, c) for p, c, _ in rows], [(12, 3.5), (None, 7.0)], "a non-finite or negative pcpu and a malformed line are dropped")
+        self.assertEqual(self.cg.top_pids([(1, 5.0, "a"), (None, 9.0, "b"), (2, 7.0, "c"), (3, 1.0, "d")], limit=2), [2, 1])
+        meminfo = "MemTotal: 1000 kB\nMemAvailable:    2048 kB\nSwapTotal:   10240 kB\nSwapFree:     4096 kB\n"
+        real = sb.load_cpu_guard()
+        with mock.patch.object(real.sys, "platform", "linux"), mock.patch("builtins.open", mock.mock_open(read_data=meminfo)):
+            got = ORIGINAL_MEMORY_READING()
+        self.assertEqual((got.swap_used, got.swap_total, got.free, got.problem), (6144 * 1024, 10240 * 1024, 2048 * 1024, None))
+        with mock.patch.object(real.sys, "platform", "linux"), mock.patch("builtins.open", mock.mock_open(read_data="MemTotal: 1 kB\n")):
+            self.assertIn("no swap figures", ORIGINAL_MEMORY_READING().problem)
+        with mock.patch.object(real.sys, "platform", "plan9"):
+            self.assertIn("no memory counters", ORIGINAL_MEMORY_READING().problem)
+        with mock.patch.object(real.sys, "platform", "linux"), mock.patch("builtins.open", side_effect=OSError("denied")):
+            self.assertEqual(ORIGINAL_MEMORY_READING().problem, "OSError: denied")
+        with mock.patch.object(real.sys, "platform", "plan9"):
+            self.assertIsNone(ORIGINAL_PROCESS_TABLE())
+
+    def test_the_real_counters_and_process_table_start_no_process(self):
+        if sys.platform not in ("darwin",) and not sys.platform.startswith("linux"):
+            self.skipTest("no kernel counters on this platform")
+        with mock.patch.object(subprocess, "run", side_effect=AssertionError("a process was started")), \
+                mock.patch.object(subprocess, "Popen", side_effect=AssertionError("a process was started")):
+            mem = ORIGINAL_MEMORY_READING()
+            table = ORIGINAL_PROCESS_TABLE()
+        self.assertIsNone(mem.problem, "the kernel's counters could not be read here")
+        self.assertTrue(mem.swap_total >= 0 and mem.swap_used <= max(mem.swap_total, mem.swap_used))
+        self.assertTrue(table and all(count >= 1 and resident >= 0 for count, resident in table.values()))
+        self.assertLessEqual(len(table), self.cg.PROGRAMS_MAX)
+
+    def test_the_process_table_walk_stops_at_its_deadline(self):
+        if sys.platform != "darwin" and not sys.platform.startswith("linux"):
+            self.skipTest("no kernel counters on this platform")
+        ticks = iter(range(0, 10 ** 6, 10))
+        table = ORIGINAL_PROCESS_TABLE(limit_seconds=5, clock=lambda: next(ticks))   # the clock jumps past the deadline at once
+        self.assertLessEqual(sum(count for count, _ in (table or {}).values()), 1)
 
     def test_the_process_table_ranking_and_a_missing_table_are_handled(self):
         self.assertEqual(self.cg.biggest_holders(None), [])
