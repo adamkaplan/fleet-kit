@@ -4839,6 +4839,15 @@ class TestLaunch(Base):
         self.world.herdr.panes[self.world.panes["neighbour"]]["cwd"] = "/tmp"
         status, line = sb.reclaim_worktree(engine, subprocess.run, str(wt), {"agent": "worker"}, True)
         self.assertEqual((status, wt.exists()), ("removed", False), line)
+        sibling, root = self.add_worktree("w-busy2"), self.add_worktree("w-busy3")
+        self.world.herdr.panes[self.world.panes["neighbour"]]["cwd"] = str(root)   # exactly the root of a worktree
+        self.assertIn("is working in it", sb.reclaim_worktree(engine, subprocess.run, str(root), {"agent": "worker"}, True)[1])
+        self.assertEqual(sb.reclaim_worktree(engine, subprocess.run, str(sibling), {"agent": "worker"}, True)[0], "removed",
+                         "a path that only shares a name prefix is not inside it")
+        with mock.patch.object(sb.HerdrClient, "agent_list", side_effect=sb.HerdrError("unavailable", "down")):
+            status, line = sb.reclaim_worktree(engine, subprocess.run, str(root), {"agent": "worker"}, True)
+        self.assertEqual((status, root.exists()), ("kept", True))
+        self.assertIn("herdr cannot say", line)
 
     def test_the_worktree_reclaim_config_is_validated(self):
         base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}

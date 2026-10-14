@@ -5982,7 +5982,8 @@ def worktree_in_use(engine, path):
         panes = [e.get("pane_id") for e in herdr.agent_list() if isinstance(e, dict) and e.get("pane_id")]
         root = os.path.realpath(path).rstrip("/") + "/"
         for pane in panes[:WORKTREE_PANE_LOOKS]:
-            cwd = herdr.pane_get(pane).get("cwd")
+            got = herdr.pane_get(pane)
+            cwd = got.get("cwd") if isinstance(got, dict) else None
             if isinstance(cwd, str) and (os.path.realpath(cwd) + "/").startswith(root):
                 return "herdr pane %s is working in it: close that pane first" % pane
         if len(panes) > WORKTREE_PANE_LOOKS:
