@@ -15472,7 +15472,29 @@ def cmd_plan_check(args, runner, now):
     except (PlanInputError, ValueError, ConfigError, IntentError) as err:
         return finish(EXIT_USAGE, {"result": "error", "error": _one_line(str(err), 300)}, [], _one_line(str(err), 300))
     result["source"] = source
-    return finish(EXIT_OK if result["result"] == "pass" else EXIT_ERROR, result, plan_check.render(result, source))
+    return finish(EXIT_OK if result["result"] == "pass" else EXIT_ERROR, result, plan_check.render(result, source, explaining=getattr(args, "explain", False)))
+
+
+def cmd_plan_template(args, runner, now):
+    """`plan template <ask>` (or `--done-when TEXT`): print a prefilled plan for the ask: its Done-when clauses numbered and one scenario stub
+    per clause. Reads only (a GET of the ask); never writes GitHub. Exit 0, or 2 when the ask or its Done-when cannot be read."""
+    try:
+        done_when, source = args.done_when, None
+        if not done_when:
+            if not args.ask:
+                raise PlanInputError("give the ask (owner/repo#N) or --done-when TEXT")
+            config = load_config()
+            repo, number, _ = parse_plan_source(args.ask, config.get("intent_repo"))
+            reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"], accounts=GhAccounts(config, runner, now))
+            done_when, source = reader.issue(number, repo).done_when, "%s#%d" % (repo, number)
+        clauses = plan_check.clauses_of(done_when)
+        if not (done_when or "").strip() or not clauses:
+            raise PlanInputError("the ask has no Done-when line: nothing to prefill (write the plan by hand, or add the Done-when first)")
+    except (PlanInputError, ValueError, ConfigError, IntentError) as err:
+        sys.stderr.write("%s: plan template: %s\n" % (PROG, _one_line(str(err), 300)))
+        return EXIT_USAGE
+    print("\n".join(plan_check.template(clauses, source)))
+    return EXIT_OK
 
 
 # ---------------------------------------------------------------- `plan review` (#109 part 2, slice R2)
@@ -19428,6 +19450,10 @@ def add_plan_parsers(sub):
     check.add_argument("--ask", help="The ask whose Done-when to cover when the plan issue has none of its own")
     check.add_argument("--done-when", dest="done_when", help="The Done-when line to cover (overrides the issue's)")
     check.add_argument("--json", action="store_true", help="Machine-readable result")
+    check.add_argument("--explain", action="store_true", help="After each defect (and warning) say the rule it breaks and how to fix it")
+    template = plan_sub.add_parser("template", help="Print a prefilled plan for an ask: its Done-when clauses and one scenario stub per clause (read-only)")
+    template.add_argument("ask", nargs="?", help="owner/repo#N, an issue URL, or N with intent_repo set: the ask whose Done-when to prefill")
+    template.add_argument("--done-when", dest="done_when", help="The Done-when line to prefill from, instead of reading the ask")
     review = plan_sub.add_parser("review", help="The plan review engine (off unless plan_review.enabled): adversarial lanes, at most 3 rounds")
     review_sub = review.add_subparsers(dest="review_action", required=True)
     start = review_sub.add_parser("start", help="Open a review of a plan for its ask and launch the lanes")
@@ -22064,6 +22090,8 @@ def cmd_plan(args, runner, now, socket_call=None):
     """`plan check` (the default) or `plan review` (#109 part 2: writes the ledger and launches lanes; off unless plan_review.enabled)."""
     if args.plan_action == "review":
         return cmd_plan_review(args, runner, now, socket_call)
+    if args.plan_action == "template":
+        return cmd_plan_template(args, runner, now)
     return cmd_plan_check(args, runner, now)
 
 
