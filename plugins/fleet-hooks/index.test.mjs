@@ -196,3 +196,53 @@ test("a flip is told to the next child once", async () => {
   const told = calls.map((c) => c.env.FLEET_SWITCHBOARD_MODE_FLIPS).filter(Boolean);
   assert.deepEqual(told, ["ses_1:shadow>enforcing"]);
 });
+
+// ---- #357: approximate tool-call tally for the health view
+import { makeTally, TALLY_MINUTES, TALLY_SESSIONS, TALLY_HEARTBEAT_MS } from "./index.js";
+
+test("every evaluation is counted per session and minute, judged or not", async () => {
+  let clock = 60000 * 100;
+  const tally = makeTally({ dir: "/nowhere", now: () => clock });
+  const { spawnFn } = fakeSpawn(() => ({ outcome: "allow", reason: "ok" }));
+  const h = makeHandler({ bin: "/x", spawnFn, tally, now: () => clock });
+  for (let i = 0; i < 7; i++) await h({ ...input("ses_a"), action: "read" }); // an action the plugin does not forward
+  clock += 60000;
+  for (let i = 0; i < 2; i++) await h(input("ses_a"));
+  await h(input("ses_b"));
+  const body = tally.body();
+  assert.deepEqual(body.sessions.ses_a, { 100: 7, 101: 2 });
+  assert.deepEqual(body.sessions.ses_b, { 101: 1 });
+});
+
+test("the tally is bounded in minutes and sessions", () => {
+  let clock = 0;
+  const tally = makeTally({ dir: "/nowhere", now: () => clock });
+  for (let i = 0; i < TALLY_SESSIONS + 50; i++) tally.count("ses_" + i);
+  assert.equal(Object.keys(tally.body().sessions).length, TALLY_SESSIONS);
+  tally.count("ses_old");
+  clock += 60000 * (TALLY_MINUTES + 1);
+  assert.equal(tally.body().sessions.ses_old, undefined);
+});
+
+test("a throwing or failing tally never changes the outcome", async () => {
+  const tally = { count() { throw new Error("boom"); } };
+  const { spawnFn } = fakeSpawn(() => ({ outcome: "deny", reason: "no", judged: true }));
+  const h = makeHandler({ bin: "/x", spawnFn, tally });
+  const i = input("ses_a");
+  await h(i);
+  assert.equal(i.effect, "deny");
+});
+
+test("flush writes only when something moved or the heartbeat is due, and survives a write error", async () => {
+  let clock = 1000000;
+  const writes = [];
+  const tally = makeTally({ dir: "/d", now: () => clock, writeFile: async (f, c) => writes.push(f), rename: async () => {} });
+  assert.equal(await tally.flush(), true); // first: heartbeat due
+  assert.equal(await tally.flush(), false);
+  tally.count("ses_a");
+  assert.equal(await tally.flush(), true);
+  clock += TALLY_HEARTBEAT_MS + 1;
+  assert.equal(await tally.flush(), true);
+  const bad = makeTally({ dir: "/d", now: () => clock, writeFile: async () => { throw new Error("ENOENT"); } });
+  assert.equal(await bad.flush(), false);
+});

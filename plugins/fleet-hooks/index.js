@@ -182,7 +182,76 @@ function setMode(state, session, shadow, now) {
   if (modes.size > MAX_SESSIONS) modes.delete(modes.keys().next().value);
 }
 
-export function makeHandler({ bin, timeoutMs = DEFAULT_TIMEOUT_MS, spawnFn = spawn, now = Date.now, state = null }) {
+// #357: an approximate tool-call rate per session for the health view. Each permission evaluation is counted in memory (one
+// Map update, no I/O on the tool-call path); a timer writes `tool-rate.json` in the switchboard's state directory at most every
+// TALLY_FLUSH_MS (and every TALLY_HEARTBEAT_MS even when nothing moved, so a reader can tell a quiet agent from a plugin that is not
+// running). It holds names and counts only, keeps TALLY_MINUTES minutes and TALLY_SESSIONS sessions, and a fault of any kind is ignored.
+export const TALLY_FLUSH_MS = 15000;
+export const TALLY_HEARTBEAT_MS = 60000;
+export const TALLY_MINUTES = 20;
+export const TALLY_SESSIONS = 200;
+export const TALLY_FILE = "tool-rate.json";
+
+export function stateDirOf(env = process.env, home = os.homedir()) {
+  const base = env.XDG_STATE_HOME && path.isAbsolute(env.XDG_STATE_HOME) ? env.XDG_STATE_HOME : path.join(home, ".local", "state");
+  return path.join(base, "fleet-switchboard");
+}
+
+export function makeTally({ dir, now = Date.now, writeFile = fs.promises.writeFile, rename = fs.promises.rename }) {
+  const sessions = new Map(); // session -> Map(minute epoch -> count)
+  let dirty = false;
+  let lastWrite = 0;
+  let writing = false;
+  const prune = (minute) => {
+    for (const [session, minutes] of sessions) {
+      for (const m of minutes.keys()) if (m <= minute - TALLY_MINUTES) minutes.delete(m);
+      if (minutes.size === 0) sessions.delete(session);
+    }
+  };
+  const tally = {
+    count(session) {
+      try {
+        const minute = Math.floor(now() / 60000);
+        let minutes = sessions.get(session);
+        if (!minutes) {
+          if (sessions.size >= TALLY_SESSIONS) sessions.delete(sessions.keys().next().value);
+          minutes = new Map();
+          sessions.set(session, minutes);
+        }
+        minutes.set(minute, (minutes.get(minute) || 0) + 1);
+        dirty = true;
+      } catch { /* never in the way of a tool call */ }
+    },
+    body() {
+      const t = now();
+      prune(Math.floor(t / 60000));
+      const out = {};
+      for (const [session, minutes] of sessions) out[session] = Object.fromEntries(minutes);
+      return { written_at: Math.floor(t / 1000), sessions: out };
+    },
+    async flush() {
+      const t = now();
+      if (writing || !dir || (!dirty && t - lastWrite < TALLY_HEARTBEAT_MS)) return false;
+      writing = true;
+      try {
+        const file = path.join(dir, TALLY_FILE);
+        const tmp = `${file}.${process.pid}.tmp`;
+        await writeFile(tmp, JSON.stringify(tally.body()), { mode: 0o600 });
+        await rename(tmp, file);
+        dirty = false;
+        lastWrite = t;
+        return true;
+      } catch {
+        return false; // the state directory may not exist yet: the view says "not recorded"
+      } finally {
+        writing = false;
+      }
+    },
+  };
+  return tally;
+}
+
+export function makeHandler({ bin, timeoutMs = DEFAULT_TIMEOUT_MS, spawnFn = spawn, now = Date.now, state = null, tally = null }) {
   const mode = state || {};
   mode.inflight = mode.inflight || 0;
   mode.dropped = mode.dropped || 0;
@@ -191,6 +260,7 @@ export function makeHandler({ bin, timeoutMs = DEFAULT_TIMEOUT_MS, spawnFn = spa
   return async function evaluate(input) {
     try {
       if (!input || !OUTCOMES.includes(input.effect) || typeof input.sessionID !== "string") return;
+      if (tally) { try { tally.count(input.sessionID); } catch { /* a counter fault never touches judging */ } } // every evaluation, judged or not: an approximate tool-call count
       if (toolOf(input.action) === null) return; // not an action this plugin forwards: the configured outcome stands
       const request = requestOf(input);
       const known = mode.modes.get(input.sessionID);
@@ -277,7 +347,12 @@ export default {
   async setup(api, env = process.env, deps = {}) {
     const { bin, timeoutMs, shims } = resolveSettings(env, deps);
     if (shims && api.shell && typeof api.shell.hook === "function") api.shell.hook("create.before", makeShellHook(shims));
-    if (!bin) return; // not configured: tool calls follow the configured rules alone
-    api.permission.hook("evaluate", makeHandler({ bin, timeoutMs }));
+    if (!bin) return; // not configured: tool calls follow the configured rules alone (and none is counted)
+    const tally = deps.tally === undefined ? makeTally({ dir: stateDirOf(env, deps.home) }) : deps.tally;
+    if (tally) {
+      const timer = setInterval(() => { tally.flush().catch(() => {}); }, TALLY_FLUSH_MS);
+      timer.unref?.();
+    }
+    api.permission.hook("evaluate", makeHandler({ bin, timeoutMs, tally }));
   },
 };

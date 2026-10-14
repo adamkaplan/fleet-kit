@@ -155,6 +155,59 @@ def load_disk_janitor():
     return module
 
 
+def load_health_records():
+    """The health recorders, bin/health_records.py (#357), loaded by path like disk_janitor."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "health_records.py")
+    held = sys.modules.get("health_records")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("health_records", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["health_records"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("health_records", None)
+        raise
+    return module
+
+
+def health_recorder(engine):
+    """The engine's recorder of what it has already read (#357), made on first use. None when it cannot be made: health is never in a pass's way."""
+    held = getattr(engine, "health", None)
+    if held is None:
+        try:
+            held = engine.health = load_health_records().Recorder(time.time)
+        except Exception:
+            return None
+    return held
+
+
+def health_ingest_messages(engine, session, page):
+    """Messages the feed has just read, handed to the recorder. No read of its own; a fault is ignored."""
+    try:
+        recorder = health_recorder(engine)
+        if recorder is not None and isinstance(page, list):
+            for message in page[:20]:
+                recorder.ingest_message(session, message)
+    except Exception:
+        pass
+
+
+def health_write(engine, state, now):
+    """After a pass (#357): the pushes seen in the PR picture, and `health-records.json` (written only when its content changed, or on the heartbeat)."""
+    try:
+        recorder = health_recorder(engine)
+        if recorder is None or engine.state_dir is None:
+            return
+        recorder.ingest_prs(state.pr_state)
+        records = load_health_records()
+        body = recorder.body(records.read_tool_file(engine.state_dir))
+        state_write(Path(engine.state_dir) / records.FILE, json.dumps(body, sort_keys=True), _without(body, "written_at"), HEARTBEAT_PR_STATE, nofollow=True)
+    except Exception:
+        pass
+
+
 def load_impact_floor():
     """The impact floor and hold table, bin/impact_floor.py (#179, L3), loaded by path like plan_check."""
     path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "impact_floor.py")
@@ -3234,6 +3287,7 @@ class EventFeed:
                 entry["tried"] = now   # every failed attempt: a persistently failing few go to the back, whatever their last good read
             return False
         newest = page[0].get("id") if isinstance(page, list) and page and isinstance(page[0], dict) else None
+        health_ingest_messages(engine, session, page)
         with self.lock:
             entry = self._entry(session)
             known, entry["read"] = entry["assistant"], now
@@ -17163,6 +17217,7 @@ def ci_record_pass(engine, now):
                                                                       "retry_in": delay})
     write_ci_record_status(engine, state, now, len(repos))
     write_pr_state(engine, state, now)
+    health_write(engine, state, now)
 
 
 # ---- `pr-state`: what the daemon already knows of a PR, for an agent that would otherwise poll GitHub in a loop. The daemon's ci recorder
