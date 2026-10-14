@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""cloud-worker: launcher, reaper and audit for FleetKit cloud workers (slice B).
+"""cloud-worker: launcher, reaper and audit for fleet-kit cloud workers (slice B).
 
 Built to docs/cloud-worker-interface.md. Commands: create, stop, extend, delete, status, reap.
 The cloud is reached only through `kubectl` (the binary is FLEET_KUBECTL, so tests fake it). Nothing here
