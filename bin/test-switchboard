@@ -23521,7 +23521,7 @@ class TestDecisionsFile(DecisionsBase):
         self.world.engine.config["triage"] = False
         with mock.patch.object(sb.os, "replace", wraps=os.replace) as replaced:
             self.pass_()
-        (call,) = replaced.call_args_list
+        (call,) = [c for c in replaced.call_args_list if str(c[0][1]).endswith(sb.DECISIONS_FILE)]   # the other state files are written by rename too, now only when they changed
         self.assertTrue(call[0][0].endswith(".tmp"))
         self.assertEqual(sorted(p.name for p in self.world.state.iterdir() if "decisions" in p.name),
                          [sb.DECISIONS_FILE])
@@ -38628,7 +38628,13 @@ class TestV2CallAccounting(Base):
 
     def test_a_failure_to_record_is_said_once_leaves_no_temp_file_and_never_fails_the_pass(self):
         world = World(self, agents=("platform",))
-        with mock.patch.object(sb.os, "rename", side_effect=OSError("disk full")):
+        real = os.replace
+
+        def failing(src, dst):
+            if str(dst).endswith(sb.V2_CALLS_FILE):
+                raise OSError("disk full")
+            return real(src, dst)
+        with mock.patch.object(sb.os, "replace", failing):
             world.engine.run_pass()
             world.engine.run_pass()
         errors = [e for e in world.audit() if e["event"] == "v2_calls.error"]
@@ -38857,6 +38863,288 @@ class TestV2ReadVolume(Base):
         for key, value in (("v2_cache_seconds", -1), ("v2_reads_per_pass", "8"), ("v2_reads_per_minute", True)):
             with self.subTest(key=key), self.assertRaises(sb.ConfigError):
                 sb.validate_config({"opencode": FAKE_OPENCODE, key: value})
+
+
+class TestWriteOnlyOnChange(Base):
+    """The per-pass state files are written only when their content changed (an mtime moves only on a write, and every write is a rename the file
+    watchers see): state_write, and each file that used to be rewritten at every pass. A status whose own timestamp is read as liveness is
+    rewritten on a heartbeat; decisions.json, whose mtime IS the signal, is untouched."""
+
+    def setUp(self):
+        super().setUp()
+        self.dir = Path(tempfile.mkdtemp(prefix="wc-"))
+        self.addCleanup(shutil.rmtree, str(self.dir), True)
+        sb._STATE_LAST.clear()
+        self.old = time.time() - 3600
+        self.clock = [1000.0]
+        patcher = mock.patch.object(sb.time, "monotonic", lambda: self.clock[0])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def age(self, path):
+        """Make the file look old, so a rewrite shows as a newer mtime."""
+        os.utime(str(path), (self.old, self.old))
+
+    def rewritten(self, path):
+        return os.stat(str(path)).st_mtime > self.old + 1
+
+    def test_unchanged_content_is_not_rewritten_and_changed_content_is(self):
+        path = self.dir / "a.json"
+        self.assertTrue(sb.state_write(path, '{"n": 1}'))
+        self.age(path)
+        self.assertFalse(sb.state_write(path, '{"n": 1}'))
+        self.assertFalse(self.rewritten(path), "same content: the mtime did not move")
+        self.assertTrue(sb.state_write(path, '{"n": 2}'))
+        self.assertTrue(self.rewritten(path))
+        self.assertEqual(stat.S_IMODE(os.stat(str(path)).st_mode), 0o600)
+        self.assertEqual(path.read_text(), '{"n": 2}')
+
+    def test_a_file_that_is_there_with_the_same_content_is_left_alone_after_a_restart_and_a_missing_one_is_written(self):
+        path = self.dir / "a.json"
+        path.write_text("same")
+        self.age(path)
+        sb._STATE_LAST.clear()   # a new process
+        self.assertFalse(sb.state_write(path, "same"))
+        self.assertFalse(self.rewritten(path))
+        path.unlink()
+        self.assertTrue(sb.state_write(path, "same"), "missing: written")
+
+    def test_a_volatile_field_does_not_count_but_a_heartbeat_rewrites_it(self):
+        path = self.dir / "s.json"
+        first = {"at": 1, "n": 5}
+        self.assertTrue(sb.state_write(path, json.dumps(first), sb._without(first, "at"), 90))
+        self.age(path)
+        second = {"at": 2, "n": 5}
+        self.assertFalse(sb.state_write(path, json.dumps(second), sb._without(second, "at"), 90))
+        self.assertFalse(self.rewritten(path), "only the timestamp moved")
+        self.clock[0] += 91
+        self.assertTrue(sb.state_write(path, json.dumps(second), sb._without(second, "at"), 90), "the heartbeat keeps the liveness timestamp fresh")
+        self.assertEqual(json.loads(path.read_text())["at"], 2)
+        third = {"at": 3, "n": 6}
+        self.age(path)
+        self.assertTrue(sb.state_write(path, json.dumps(third), sb._without(third, "at"), 90), "a real change is written at once")
+
+    def test_a_failed_write_leaves_no_temp_file_and_raises(self):
+        path = self.dir / "a.json"
+        with mock.patch.object(sb.os, "replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                sb.state_write(path, "x")
+        self.assertEqual(list(self.dir.glob("*.tmp")), [])
+        self.assertFalse(path.exists())
+
+    def test_pane_health_is_not_rewritten_when_only_the_times_moved(self):
+        data = {"agents": {"a": {"pane": "p1", "session": "s", "seen": 100}}, "states": {"a": {"state": "attached", "at": 100}}, "missing": {}, "at": 100}
+        sb.write_pane_health(self.dir, data)
+        path = self.dir / sb.PANE_HEALTH_FILE
+        self.age(path)
+        later = json.loads(json.dumps(data))
+        later["at"], later["agents"]["a"]["seen"], later["states"]["a"]["at"] = 160, 160, 160
+        sb.write_pane_health(self.dir, later)
+        self.assertFalse(self.rewritten(path))
+        later["states"]["a"] = {"state": "dead", "at": 170}
+        sb.write_pane_health(self.dir, later)
+        self.assertTrue(self.rewritten(path), "a pane that died is a change")
+        self.age(path)
+        dead_later = json.loads(json.dumps(later))
+        dead_later["states"]["a"]["at"] = 400   # a dead pane's `at` is read (when to forget it): it counts
+        sb.write_pane_health(self.dir, dead_later)
+        self.assertTrue(self.rewritten(path))
+
+    def test_the_daemons_idle_passes_rewrite_the_per_pass_files_once_not_every_pass(self):
+        world = World(self, agents=tuple("a%d" % n for n in range(6)), config={"v2_cache_seconds": 120})
+        seen = collections.Counter()
+        real_replace, real_rename = os.replace, os.rename
+
+        def count(real):
+            def wrapper(a, b):
+                seen[os.path.basename(str(b))] += 1
+                return real(a, b)
+            return wrapper
+        with mock.patch.object(os, "replace", count(real_replace)), mock.patch.object(os, "rename", count(real_rename)):
+            for _ in range(40):
+                world.engine.run_pass()
+                world.tick(30)
+                self.clock[0] += 30   # the process clock the heartbeats read moves with the passes (20 minutes in all)
+        self.assertLessEqual(seen["pane-health.json"], 1 + 1200 // sb.HEARTBEAT_HEALTH, dict(seen))   # once, plus a heartbeat per HEARTBEAT_HEALTH
+        self.assertLessEqual(seen["sweep.json"], 1 + 1200 // sb.HEARTBEAT_SWEEP, dict(seen))          # once, plus a heartbeat per HEARTBEAT_SWEEP
+        self.assertGreaterEqual(seen["v2-calls.json"], 1)
+        self.assertLessEqual(seen["decisions.json"], 2, "decisions.json keeps its touch: its mtime is the signal, and a touch is not a rewrite")
+        self.assertLess(sum(seen.values()), 3 * 40 // 2, dict(seen))   # three files alone used to be written 40 times each
+
+    def test_the_status_files_of_the_pass_keep_a_heartbeat(self):
+        world = World(self, agents=("a0",), config={})
+        engine = world.engine
+        sb.record_v2_calls(engine)
+        path = world.state / sb.V2_CALLS_FILE
+        self.age(path)
+        sb.record_v2_calls(engine)
+        self.assertFalse(self.rewritten(path), "nothing changed")
+        self.clock[0] += sb.STATE_HEARTBEAT_SECONDS + 1
+        sb.record_v2_calls(engine)
+        self.assertTrue(self.rewritten(path), "past the heartbeat the status says it is alive")
+
+    def test_pr_state_is_rewritten_when_the_picture_changes_not_when_only_the_clock_does(self):
+        world = World(self, agents=("a0",), config={})
+        engine = world.engine
+        state = sb.CiRecordState()
+        state.pr_state = {"acme/app#1": {"state": "open", "head": "a" * 40, "labels": [], "at": 100.0}}
+        sb.write_pr_state(engine, state, 1000)
+        path = world.state / sb.PR_STATE_FILE
+        self.age(path)
+        state.pr_state_written = 0
+        sb.write_pr_state(engine, state, 1100)   # only written_at would differ
+        self.assertFalse(self.rewritten(path))
+        state.pr_state["acme/app#1"]["state"] = "merged"
+        state.pr_state_written = 0
+        sb.write_pr_state(engine, state, 1200)
+        self.assertTrue(self.rewritten(path))
+
+    def test_every_status_file_with_a_timestamp_keeps_its_heartbeat_and_none_waits_past_what_status_tolerates(self):
+        """`status` calls the v2 record stale past 120 s: the heartbeat of every file whose `at` is read as liveness is shorter than that with a 30 s pass to spare.
+        Each case changes ONLY the timestamp between the first and second write, then lets the heartbeat pass with the timestamp fixed."""
+        self.assertLessEqual(sb.STATE_HEARTBEAT_SECONDS + 30, 120)
+        world = World(self, agents=("a0",), config={})
+        engine, state = world.engine, sb.CiRecordState()
+        at = [100]
+
+        def sweep():
+            sb.sweep_write(engine, types.SimpleNamespace(current={"counts": {}, "at": "t%d" % at[0]}))
+
+        def triage():
+            sb.triage_write(engine, types.SimpleNamespace(current={"counts": {}, "at": "t%d" % at[0]}))
+
+        def ci_record():
+            sb.write_ci_record_status(engine, types.SimpleNamespace(written=0, last_record=None, recorded=0), at[0], 1)
+        for name, write, heartbeat in (("sweep.json", sweep, sb.HEARTBEAT_SWEEP), ("triage.json", triage, sb.HEARTBEAT_SWEEP),
+                                       ("ci-record-status.json", ci_record, sb.STATE_HEARTBEAT_SECONDS)):
+            with self.subTest(file=name):
+                write()
+                path = world.state / name
+                self.assertTrue(path.exists())
+                self.age(path)
+                at[0] += 50                      # only the timestamp moved
+                write()
+                self.assertFalse(self.rewritten(path), "only the time moved: not written")
+                self.clock[0] += heartbeat + 1   # the heartbeat passes (the timestamp stays what it is)
+                write()
+                self.assertTrue(self.rewritten(path), "the heartbeat rewrites it, with the newer time")
+                self.assertIn(str(at[0]), path.read_text())
+
+    def test_the_pane_health_and_pr_state_heartbeats(self):
+        data = {"agents": {"a": {"pane": "p1", "seen": 1}}, "states": {}, "missing": {}, "at": 1}
+        sb.write_pane_health(self.dir, data)
+        path = self.dir / sb.PANE_HEALTH_FILE
+        self.age(path)
+        self.clock[0] += sb.HEARTBEAT_HEALTH - 1
+        sb.write_pane_health(self.dir, dict(data, at=2))
+        self.assertFalse(self.rewritten(path))
+        self.clock[0] += 2
+        sb.write_pane_health(self.dir, dict(data, at=3))
+        self.assertTrue(self.rewritten(path), "past the pane-health heartbeat")
+        world = World(self, agents=("a0",), config={})
+        state = sb.CiRecordState()
+        state.pr_state = {"acme/app#1": {"state": "open", "head": "a" * 40, "labels": [], "at": 1.0}}
+        sb.write_pr_state(world.engine, state, 1000)
+        prs = world.state / sb.PR_STATE_FILE
+        self.age(prs)
+        state.pr_state_written = 0
+        self.clock[0] += sb.HEARTBEAT_PR_STATE - 1
+        sb.write_pr_state(world.engine, state, 1100)
+        self.assertFalse(self.rewritten(prs))
+        state.pr_state_written = 0
+        self.clock[0] += 2
+        sb.write_pr_state(world.engine, state, 1200)
+        self.assertTrue(self.rewritten(prs), "past the pr-state heartbeat")
+
+    def test_the_link_status_keeps_a_heartbeat_and_a_symlink_is_refused_where_nofollow_is_asked(self):
+        link = self.dir / "v2-link.json"
+        body = {"at": 1, "transport": "http"}
+        sb.state_write(link, json.dumps(body), sb._without(body, "at"), sb.STATE_HEARTBEAT_SECONDS)
+        self.age(link)
+        sb.state_write(link, json.dumps(dict(body, at=2)), sb._without(body, "at"), sb.STATE_HEARTBEAT_SECONDS)
+        self.assertFalse(self.rewritten(link))
+        self.clock[0] += sb.STATE_HEARTBEAT_SECONDS + 1
+        sb.state_write(link, json.dumps(dict(body, at=3)), sb._without(body, "at"), sb.STATE_HEARTBEAT_SECONDS)
+        self.assertTrue(self.rewritten(link))
+        target = self.dir / "secret"
+        target.write_text("keep")
+        os.symlink(str(target), str(self.dir / ("p.json.%d.tmp" % os.getpid())))   # a planted symlink where the temp file goes
+        with self.assertRaises(OSError):
+            sb.state_write(self.dir / "p.json", "x", nofollow=True)
+        self.assertEqual(target.read_text(), "keep", "the link was not followed")
+
+    def test_an_outside_rewrite_is_repaired_at_the_next_call_and_a_touch_is_not_a_rewrite(self):
+        path = self.dir / "s.json"
+        sb.state_write(path, "aaaa", None, 90)
+        self.age(path)
+        self.assertFalse(sb.state_write(path, "aaaa", None, 90), "unchanged")
+        inode = os.stat(str(path)).st_ino
+        os.utime(str(path), (self.old + 5, self.old + 5))          # touched: the mtime moved, the content did not
+        self.assertFalse(sb.state_write(path, "aaaa", None, 90))
+        self.assertEqual(os.stat(str(path)).st_ino, inode, "a touch is not a rewrite: the file was not replaced")
+        path.write_text("bbbb")                                      # an outside writer (retire --undo): the same size, other bytes
+        self.age(path)
+        self.assertTrue(sb.state_write(path, "aaaa", None, 90), "repaired at the next call, not at the heartbeat")
+        self.assertEqual(path.read_text(), "aaaa")
+        path.write_text("a much longer outside rewrite")             # another size
+        self.assertTrue(sb.state_write(path, "aaaa", None, 90))
+        self.assertEqual(path.read_text(), "aaaa")
+        path.unlink()
+        self.assertTrue(sb.state_write(path, "aaaa", None, 90), "deleted: written again")
+
+    def test_pane_health_is_repaired_after_an_outside_rewrite_at_the_next_pass(self):
+        world = World(self, agents=("a0", "a1"), config={"v2_cache_seconds": 120})
+        world.engine.run_pass()
+        path = world.state / sb.PANE_HEALTH_FILE
+        good = path.read_text()
+        self.assertTrue(json.loads(good)["states"])
+        path.write_text(json.dumps({"agents": {}, "states": {}, "missing": {}, "at": 1}))   # what `retire --undo` style rewrites do
+        world.tick(30)
+        world.engine.run_pass()
+        repaired = json.loads(path.read_text())
+        self.assertEqual(sorted(repaired["states"]), ["a0", "a1"], "the next pass wrote the picture again")
+
+    def test_the_pane_recheck_cadence_is_unchanged_now_that_the_file_is_not_rewritten_every_pass(self):
+        world = World(self, agents=("a0", "a1", "a2"), config={"v2_cache_seconds": 120})
+        checks = collections.Counter()
+        real = sb.pane_state
+
+        def counting(engine, name, *args, **kwargs):
+            checks[name] += 1
+            return real(engine, name, *args, **kwargs)
+        with mock.patch.object(sb, "pane_state", counting):
+            for _ in range(40):                 # 20 minutes of 30 s passes
+                world.engine.run_pass()
+                world.tick(30)
+        for name in ("a0", "a1", "a2"):
+            self.assertLessEqual(checks[name], 1200 // sb.PANE_CHECK_SECONDS + 2, "%s: one look per PANE_CHECK_SECONDS, not one per pass: %s" % (name, dict(checks)))
+            self.assertGreaterEqual(checks[name], 1200 // sb.PANE_CHECK_SECONDS - 1)
+        self.assertLessEqual(len((world.state / sb.PANE_HEALTH_FILE).read_text()), 10000)
+
+    def test_a_policy_cache_entry_with_the_same_value_is_not_rewritten_while_young(self):
+        clock = SimClock()
+        cache = sb.BoundedFileCache(self.dir / "c.json", clock.now, 100, 5)
+        cache.put("k", {"v": 1})
+        self.age(self.dir / "c.json")
+        clock.t += 10
+        self.assertTrue(cache.put("k", {"v": 1}))
+        self.assertFalse(self.rewritten(self.dir / "c.json"), "same value, young: no write")
+        clock.t += 60
+        cache.put("k", {"v": 1})
+        self.assertTrue(self.rewritten(self.dir / "c.json"), "older than half the ttl: refreshed so it does not expire")
+        self.age(self.dir / "c.json")
+        cache.put("k", {"v": 2})
+        self.assertTrue(self.rewritten(self.dir / "c.json"), "a new value is written")
+
+    def test_the_link_tables_of_the_decision_sync_are_not_rewritten_unchanged(self):
+        path = str(self.dir / "links.json")
+        body = {"version": 1, "links": {"k": {"id": 1}}}
+        sb.decision_sync._write_json(path, body)
+        self.age(path)
+        sb.decision_sync._write_json(path, dict(body))
+        self.assertFalse(self.rewritten(path))
+        sb.decision_sync._write_json(path, {"version": 1, "links": {}})
+        self.assertTrue(self.rewritten(path))
 
 
 class TestAuditRotation(unittest.TestCase):
