@@ -10678,7 +10678,7 @@ class SweepFacts:
 
 TRIAGE_DEFAULTS = {"enabled": False, "repos": None, "required_labels": {}, "sla": {}, "sla_overrides": {},
                    "our_logins": None, "daily_summary": True, "realarm_hours": 24, "max_findings": 30,
-                   "calls_per_pass": 30, "pass_seconds": 10, "backoff": True}
+                   "calls_per_pass": 30, "pass_seconds": 10, "backoff": True, "digest_interval_minutes": 60}
 # Every `_days` value is in days and may be a fraction (2/24 is two hours); `t7_ours_hours` is in hours.
 TRIAGE_SLA = {"t1_days": 1, "t2_days": 1 / 24, "t3_ask_days": 1, "t3_other_days": 3, "t5_days": 2 / 24, "t6_days": 2,
               "t7_ours_hours": 4, "t7_other_days": 2, "t8_days": 1, "t9_days": 3, "t11_days": 1}
@@ -10765,6 +10765,8 @@ def validate_triage_config(config, source):
         raise ConfigError("%s.repos' must be OWNER/REPO names, got %r" % (where, section["repos"]))
     if not _is_number(section["realarm_hours"]) or section["realarm_hours"] <= 0:
         raise ConfigError("%s.realarm_hours' must be a positive number, got %r" % (where, section["realarm_hours"]))
+    if not _is_number(section["digest_interval_minutes"]) or section["digest_interval_minutes"] < 0:
+        raise ConfigError("%s.digest_interval_minutes' must be a number of minutes, 0 or more (0 sends a digest every pass that has one), got %r" % (where, section["digest_interval_minutes"]))
     cap = section["max_findings"]
     if not isinstance(cap, int) or isinstance(cap, bool) or not 1 <= cap <= 200:
         raise ConfigError("%s.max_findings' must be a whole number from 1 to 200, got %r" % (where, cap))
@@ -10844,6 +10846,7 @@ class TriageState:
         self.started, self.day, self.day_counts = 0, None, {}
         self.summarised = None
         self.seen = None         # #349: the stale digest's memory (bin/triage_digest.py), loaded at the first pass
+        self.meta = None         # #406: its cadence (warm-up done, the last delivery), kept in the same file
 
 
 def triage_state(engine):
@@ -11295,10 +11298,24 @@ def triage_pass(engine, decisions, now, errors=()):
     flagged = [(r, ref) for r, ref, _ in findings if r == "OO" and now - state.alarmed.get((r, ref), 0) >= cfg["realarm_hours"] * 3600]
     due, invalid = triage_digest_due(engine, state, [(r, ref) for r, ref, _ in findings if r != "OO"],
                                      [(r, ref) for r, ref, _ in candidates if r != "OO"], cfg, now)
+    if cfg["enabled"] and cfg.get("backoff", True):   # #406: warm up first, then at most one digest per interval; a held digest keeps its memory untouched
+        before = state.meta["swept"]
+        open_units = sum(len(u) for u in unchecked_units.values()) + sum(1 for r in repos if (r, "issues") not in state.units and r not in state.unreadable)   # a list not read yet is a finding not checked
+        allowed, digest = triage_digest.gate(state.meta, now, unchecked + open_units, cfg.get("digest_interval_minutes", 60) * 60)
+        state.current["digest"] = digest
+        triage_write(engine, state)
+        if state.meta["swept"] != before:
+            triage_digest.write_seen(engine.state_dir, state.seen, state.meta)
+        if not allowed:
+            due, invalid = [], []
     if cfg["enabled"] and (due or invalid):   # never a wake solely for other-owner flags: they ride along when a wake happens anyway
         text = triage_queue_fact(state, due, now, cfg, len(flagged), invalid)
         triage_digest.cost_record(engine.state_dir, now, text)
+        state.meta["last"] = now
         triage_digest_commit(engine, state, due[:cfg["max_findings"]], invalid, now)
+        if state.current.get("digest", {}).get("state") == "ready" and cfg.get("digest_interval_minutes", 60) > 0:
+            state.current["digest"] = {"state": "held", "next_at": now + cfg["digest_interval_minutes"] * 60}
+            triage_write(engine, state)
         for pair in flagged:
             state.alarmed[pair] = now
         for rule, _ in due:
@@ -11322,6 +11339,7 @@ def triage_digest_due(engine, state, ours, candidates, cfg, now):
     """([(rule, ref)] for this pass's one digest, [ref] with an invalid parked label); see bin/triage_digest.py."""
     if state.seen is None:
         state.seen = triage_digest.load_seen(engine.state_dir)
+        state.meta = triage_digest.load_meta(engine.state_dir)
     triage_digest.prune(state.seen, candidates)
     mutes = triage_digest.load_mutes(engine.state_dir) if engine.state_dir else {}
     return triage_digest.select(state.seen, triage_digest_items(state), mutes, ours, now, cfg.get("backoff", True), state.alarmed,
@@ -11332,7 +11350,7 @@ def triage_digest_commit(engine, state, shown, invalid, now):
     triage_digest.commit(state.seen, triage_digest_items(state), shown, invalid, now)
     for ref in invalid:
         engine._note("triage.parked_invalid", ref, {"ref": ref, "why": "a parked label without one valid `Parked until: YYYY-MM-DD` line"})
-    triage_digest.write_seen(engine.state_dir, state.seen)
+    triage_digest.write_seen(engine.state_dir, state.seen, state.meta)
 
 
 def triage_queue_fact(state, due, now, cfg, other_owner=0, invalid=()):
@@ -11426,6 +11444,9 @@ def triage_status_lines(triage):
                      "raised nor audited" % (triage["unchecked"], extra))
     if triage.get("truncated"):
         lines.append("      triage     lists capped for " + ", ".join(triage["truncated"]))
+    cadence = triage_digest.digest_line(triage.get("digest"), parse_iso(triage.get("at")) or time.time())   # #406
+    if cadence:
+        lines.append("      triage     " + cadence)
     if "cost" in triage:   # #349: what the digests cost the Chief of Staff to read, per day
         lines.extend(triage_digest.cost_lines(triage["cost"], str(triage.get("at") or "")[:10]) if triage["cost"]
                      else ["      triage     cost per day: not recorded (nothing delivered yet)"])
