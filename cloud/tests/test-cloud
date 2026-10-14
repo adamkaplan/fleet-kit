@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Tests for cloud/: manifests parse and dry-run, the containerd fix rewrites the legacy
+# stanza (and is idempotent), and the secret scan finds a planted secret and passes clean.
+set -u
+here=$(cd "$(dirname "$0")/.." && pwd); fail=0
+ok() { echo "ok   $1"; }; bad() { echo "FAIL $1"; fail=1; }
+
+# 1. manifests
+if command -v kubectl >/dev/null; then
+  # `apply --dry-run=client` needs a reachable API server for discovery; with none, fall back to an
+  # offline parse (`label --local`) so the check still runs with no cluster.
+  for f in "$here"/k8s/*.yaml; do
+    if kubectl apply --dry-run=client --validate=false -f "$f" -o name >/dev/null 2>&1; then ok "apply --dry-run=client $(basename "$f")"
+    elif KUBECONFIG=/dev/null kubectl label --local --dry-run=client -f "$f" x=y -o name >/dev/null 2>&1; then ok "offline parse $(basename "$f")"
+    else bad "manifest $(basename "$f")"; fi
+  done
+else echo "skip kubectl not installed"; fi
+
+# 2. the fix script's rewrite, on a legacy-keyed config
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+cat > "$tmp/config.toml" <<'T'
+version = 3
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc]
+  runtime_type = 'io.containerd.runc.v2'
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.sysbox-runc]
+  runtime_type = "io.containerd.runc.v2"
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.sysbox-runc.options]
+  BinaryName = "/usr/bin/sysbox-runc"
+T
+# run the very sed line from the manifest, on a copy
+line=$(grep -m1 'sed -i -E' "$here/k8s/containerd-fix.yaml" | sed 's/^ *//')
+cp "$tmp/config.toml" "$tmp/out"
+NEW="io.containerd.cri.v1.runtime" OLD="io.containerd.grpc.v1.cri"
+eval "$(echo "$line" | sed 's#"\$CFG.tmp"#"$tmp/out"#; s#sed -i -E#sed -i.bak -E#')"
+grep -q "grpc.v1.cri" "$tmp/out" && bad "legacy key left" || ok "legacy key rewritten by the manifest's sed"
+[ "$(grep -c "cri.v1.runtime'.containerd.runtimes.sysbox-runc" "$tmp/out")" = 2 ] && ok "both sysbox tables moved" || bad "sysbox tables"
+cp "$tmp/out" "$tmp/out2"; eval "$(echo "$line" | sed 's#"\$CFG.tmp"#"$tmp/out2"#; s#sed -i -E#sed -i.bak -E#')"
+cmp -s "$tmp/out" "$tmp/out2" && ok "second pass changes nothing" || bad "not idempotent"
+
+# 3. secret scan on a directory
+mkdir "$tmp/clean" "$tmp/dirty"; echo "hello" > "$tmp/clean/a.txt"
+printf 'GH_TOKEN=%s\n' "ghp_$(printf 'a%.0s' $(seq 36))" > "$tmp/dirty/env"
+"$here/worker/scan-secrets.sh" --dir "$tmp/clean" >/dev/null 2>&1 && ok "clean dir: 0 hits" || bad "clean dir"
+out=$("$here/worker/scan-secrets.sh" --dir "$tmp/dirty" 2>&1); rc=$?
+[ "$rc" = 1 ] && ok "planted token: fails" || bad "planted token rc=$rc"
+mkdir "$tmp/key"; printf -- '-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n' > "$tmp/key/k"
+"$here/worker/scan-secrets.sh" --dir "$tmp/key" >/dev/null 2>&1 && bad "private key passed" || ok "private key fails"
+echo "$out" | grep -q 'ghp_' && bad "scan printed the value" || ok "scan never prints the value"
+
+# 4. image scan, only when docker is up
+if docker info >/dev/null 2>&1; then
+  printf 'FROM busybox\nRUN echo "GITHUB_TOKEN=ghp_%s" > /t\n' "$(printf 'b%.0s' $(seq 36))" > "$tmp/Dockerfile"
+  printf 'FROM busybox\nRUN echo hi > /t\n' > "$tmp/Dockerfile.clean"
+  if docker build -q -t fk-scan-dirty -f "$tmp/Dockerfile" "$tmp" >/dev/null 2>&1 && docker build -q -t fk-scan-clean -f "$tmp/Dockerfile.clean" "$tmp" >/dev/null 2>&1; then
+    "$here/worker/scan-secrets.sh" fk-scan-clean >/dev/null 2>&1 && ok "clean image: 0 hits" || bad "clean image"
+    "$here/worker/scan-secrets.sh" fk-scan-dirty >/dev/null 2>&1 && bad "baked-in token passed" || ok "baked-in token image fails"
+    docker rmi fk-scan-dirty fk-scan-clean >/dev/null 2>&1
+  else echo "skip image build failed (offline?)"; fi
+else echo "skip docker not running"; fi
+[ $fail = 0 ] && echo "RESULT: PASS" || { echo "RESULT: FAIL"; exit 1; }

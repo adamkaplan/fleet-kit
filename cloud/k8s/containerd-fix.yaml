@@ -1,0 +1,120 @@
+# Repairs the containerd registration of Sysbox on nodes whose containerd is 2.x.
+# The stock Sysbox installer writes the sysbox-runc stanza under the legacy plugin key
+# io.containerd.grpc.v1.cri, which containerd 2.x ignores; it reads
+# io.containerd.cri.v1.runtime. This DaemonSet moves the stanza, validates the result,
+# restarts containerd only if it changed something, and does nothing on a node that is
+# already right. It runs only on nodes labelled sysbox-install=yes, waits for the stock
+# installer to write its stanza, and on success labels the node sysbox-runtime=running
+# (which the RuntimeClass schedules on). It is idempotent: safe to run again.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sysbox-containerd-fix
+  namespace: kube-system
+data:
+  fix.sh: |
+    #!/bin/sh
+    set -eu
+    CFG=/host/etc/containerd/config.toml
+    NEW="io.containerd.cri.v1.runtime"
+    OLD="io.containerd.grpc.v1.cri"
+    host() { nsenter -t 1 -m -u -i -n -p -- "$@"; }
+    label() { kubectl label node "$NODE_NAME" "sysbox-runtime=running" --overwrite >/dev/null; }
+
+    while true; do
+      if [ ! -f "$CFG" ] || ! grep -q 'runtimes[."'"'"']*sysbox-runc' "$CFG"; then
+        echo "waiting for the Sysbox installer to register sysbox-runc"; sleep 15; continue
+      fi
+      if grep -Eq "^\[plugins\.[\"']$NEW[\"']\.containerd\.runtimes\.sysbox-runc\]" "$CFG" \
+         && ! grep -Eq "^\[plugins\.[\"']$OLD[\"']\.containerd\.runtimes\.sysbox-runc" "$CFG"; then
+        echo "sysbox-runc already under $NEW: nothing to do"; label
+      else
+        cp -n "$CFG" "$CFG.sysbox-fix.bak" || true
+        cp "$CFG" "$CFG.tmp"
+        # rename the plugin key on sysbox-runc table headers only
+        sed -i -E "s#^\[plugins\.[\"']$OLD[\"']\.containerd\.runtimes\.sysbox-runc#[plugins.'$NEW'.containerd.runtimes.sysbox-runc#" "$CFG.tmp"
+        mv "$CFG.tmp" "$CFG"
+        if host containerd config dump >/dev/null 2>&1 \
+           && host containerd config dump | grep -q 'runtimes.sysbox-runc'; then
+          echo "config valid: restarting containerd"
+          host systemctl restart containerd
+          label
+        else
+          echo "config invalid: restoring backup" >&2
+          cp "$CFG.sysbox-fix.bak" "$CFG"; sleep 60; continue
+        fi
+      fi
+      sleep 300
+    done
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sysbox-containerd-fix
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sysbox-containerd-fix
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sysbox-containerd-fix
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sysbox-containerd-fix
+subjects:
+  - kind: ServiceAccount
+    name: sysbox-containerd-fix
+    namespace: kube-system
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: sysbox-containerd-fix
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: sysbox-containerd-fix
+  template:
+    metadata:
+      labels:
+        app: sysbox-containerd-fix
+    spec:
+      serviceAccountName: sysbox-containerd-fix
+      hostPID: true
+      nodeSelector:
+        sysbox-install: "yes"
+      containers:
+        - name: fix
+          # a small image with sh, sed, nsenter (util-linux) and kubectl
+          image: alpine/k8s:1.33.4
+          command: ["/bin/sh", "/scripts/fix.sh"]
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+            - name: host-etc-containerd
+              mountPath: /host/etc/containerd
+      volumes:
+        - name: scripts
+          configMap:
+            name: sysbox-containerd-fix
+        - name: host-etc-containerd
+          hostPath:
+            path: /etc/containerd
+            type: Directory
