@@ -47707,6 +47707,32 @@ class TestLoadAlert(Base):
         self.assertEqual(self.latest()["a"]["open_asks"], 1)
         self.assertTrue(any("charters not readable" in p for p in json.loads((self.state_dir / "load.json").read_text())["problems"]))
 
+    def test_the_busy_coders_rule_is_quiet_while_things_move_and_loud_when_stuck_or_outnumbered(self):
+        def fig(**kw):
+            base = {"name": "o", "open_asks": 2, "stalled": 0, "stalled_asks": [], "moved_1h": 1, "moved_backlog": 1, "busy": 2, "idle": 0, "messages": 0, "decisions": 0}
+            return dict(base, **kw)
+        cfg = dict(self.health.DEFAULTS)
+        self.assertEqual(self.health.judge(fig(), cfg, None)[0], None)                         # busy, 0 stalled, 1 moved: no wake
+        self.assertEqual(self.health.judge(fig(open_asks=9, moved_backlog=5, moved_1h=2), cfg, None)[0], None)   # outnumbered but moving
+        text = self.health.judge(fig(open_asks=3, moved_backlog=0, moved_1h=0), cfg, None)[0]  # 3 asks, 0 moved in 4 h, coders full
+        self.assertIn("at least twice those moved in 4 h and none moved in the last hour", text)
+        text = self.health.judge(fig(stalled=1, stalled_asks=[7], moved_1h=3, moved_backlog=3, open_asks=4), cfg, None)[0]   # one ask stalled, coders full
+        self.assertIn("an ask is stalled (#7)", text)
+        self.assertEqual(self.health.judge(fig(open_asks=3, moved_backlog=0, moved_1h=0, idle=1), cfg, None)[0], None)   # idle coders: no
+        self.assertEqual(self.health.judge(fig(stalled=1, stalled_asks=[7], idle=1), cfg, None)[0], None)                # one stalled but not full: below the 2-ask rule
+
+    def test_references_in_a_body_and_branch_count_not_only_closes(self):
+        ref = lambda body, branch=None: self.health.references(body, branch, "acme/widget")
+        self.assertEqual(ref("Part of #12"), [12])
+        self.assertEqual(ref("Refs #13, see also #14"), [13, 14])
+        self.assertEqual(ref("PLAN: https://github.com/acme/widget/issues/348#issuecomment-1"), [348])
+        self.assertEqual(ref("fixes other/repo#99 and #5"), [5])                  # another repository's number is not ours
+        self.assertEqual(ref("", "feature/4022-load-fix"), [4022])
+        self.assertEqual(ref("&#39; is not an issue"), [])
+        row = self.health.move_rows("pull_request", {"action": "synchronize", "pull_request": {"number": 4303, "body": "Part of #4022", "head": {"ref": "x/3115-y"}}},
+                                    "acme/widget", 5, sb.closing_numbers)[0]
+        self.assertEqual((row["numbers"], row["refs"]), ([4303, 4022, 3115], [4022, 3115]))
+
     def test_an_idle_pass_rewrites_nothing(self):
         self.asks = {1: [1]}
         self.tick(self.T0, {"o": self.orch(busy=1, charter=1)})

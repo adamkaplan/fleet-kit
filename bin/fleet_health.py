@@ -54,6 +54,29 @@ def validate(raw, where):
 
 # ---- movement records
 
+_REF_PLAIN = re.compile(r"(?<![\w/&])#(\d{1,7})\b")
+_REF_URL = re.compile(r"/issues/(\d{1,7})\b")
+_REF_BRANCH = re.compile(r"(?:^|[/_-])(\d{2,7})(?=$|[/_-])")
+PARENT_LEVELS = 3                # how far up the parent chain a referenced issue is followed
+PARENTS_KEEP = 3000              # resolved parents kept (a parent never changes)
+
+
+def references(text, branch=None, repo=None):
+    """Every issue number a pull request body (and its branch name) refers to: `Closes #N`, `Part of #N`, `Refs #N`, a plain `#N` or an issues URL
+    of the same repository. `owner/other#N` of another repository is not this repository's issue. Order kept, no repeats."""
+    found = []
+    body = text if isinstance(text, str) else ""
+    for match in re.finditer(r"([\w.-]+/[\w.-]+)#(\d{1,7})\b", body):   # a number in another repository is never ours
+        if repo and match.group(1).lower() != str(repo).lower():
+            body = body.replace(match.group(0), " ")
+    for pattern, source in ((_REF_PLAIN, body), (_REF_URL, body), (_REF_BRANCH, branch if isinstance(branch, str) else "")):
+        for match in pattern.finditer(source):
+            n = int(match.group(1))
+            if n not in found:
+                found.append(n)
+    return found
+
+
 def move_rows(event, payload, repo, now, closing=lambda text: []):
     """[(repo, numbers, kind)] a webhook delivery says about real movement: a push (a pull request synchronised), a pull request opened or
     merged. `numbers` are the pull request and the issues its body closes. Comments, reviews and labels are not movement."""
@@ -71,8 +94,10 @@ def move_rows(event, payload, repo, now, closing=lambda text: []):
         kind = "pr_merged"
     else:
         return []
-    numbers = ([number] + [n for n in closing(pr.get("body")) if n != number])[:MOVES_NUMBERS_MAX]
-    return [{"at": now, "repo": repo, "numbers": numbers, "kind": kind}]
+    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+    refs = [n for n in list(closing(pr.get("body"))) + references(pr.get("body"), head.get("ref"), repo) if n != number]
+    refs = list(dict.fromkeys(refs))[:MOVES_NUMBERS_MAX - 1]
+    return [{"at": now, "repo": repo, "numbers": [number] + refs, "refs": refs, "kind": kind}]
 
 
 @contextmanager
@@ -232,8 +257,13 @@ def crossing(fig, cfg):
     if fig["stalled"] >= cfg["stalled_asks"]:
         reasons.append("stalled"); severity += fig["stalled"]
     full = fig["busy"] is not None and fig["idle"] is not None and fig["busy"] > 0 and fig["idle"] == 0
-    if full and fig.get("moved_backlog") is not None and fig["open_asks"] > fig["moved_backlog"]:
-        reasons.append("backlog"); severity += fig["open_asks"] - fig["moved_backlog"]
+    if full and fig.get("moved_backlog") is not None and fig.get("moved_1h") is not None:
+        # all coders busy: only when something is stuck (an ask stalled) or open asks clearly outnumber what moves and nothing moved in the last hour
+        outnumbered = fig["open_asks"] >= 2 * fig["moved_backlog"] and fig["open_asks"] > fig["moved_backlog"] and fig["moved_1h"] == 0
+        if fig["stalled"] >= 1 and "stalled" not in reasons:
+            reasons.append("busy_stalled"); severity += max(1, fig["stalled"])
+        elif outnumbered:
+            reasons.append("outnumbered"); severity += max(1, fig["open_asks"] - fig["moved_backlog"])
     return severity, reasons
 
 
@@ -247,8 +277,10 @@ def wake_text(fig, reasons, cfg):
     actions = []
     if "stalled" in reasons:
         actions.append("move the stalled asks (%s) to another lane" % (asks or "named above"))
-    if "backlog" in reasons:
-        actions.append("split a lane or add coders (all are busy and asks queue faster than they move)")
+    if "busy_stalled" in reasons:
+        actions.append("split a lane or add coders: all coders are busy and an ask is stalled (%s)" % (asks or "named above"))
+    if "outnumbered" in reasons:
+        actions.append("split a lane or add coders: all coders are busy, open asks are at least twice those moved in %g h and none moved in the last hour" % cfg["backlog_hours"])
     return text + " Recommended: " + "; or ".join(actions) + "."
 
 
