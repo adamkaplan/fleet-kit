@@ -8860,6 +8860,104 @@ class TestCheckpointReminders(SelfWakeBase):
                 (drop,) = self.events("reminder.drop")
                 self.assertIn("reported", drop["detail"]["why"])
 
+    # -- the false "has not reported since launch" wakes: the durable record of every report (last-reports.json) is what is read
+
+    def overdue(self):
+        return [t for t in self.texts("platform") if "overdue checkpoint" in t]
+
+    def test_a_report_made_under_v2_light_cancels_it_the_boss_transcript_is_never_read_there(self):
+        self.set_reminders()
+        self.world.tick(60)
+        self.world.new_engine("cli").report("coder", "question", "which one?")
+        self.world.engine.light = True   # the live machine's setting: no read of any transcript
+        self.wait(3600)
+        self.assertEqual(self.overdue(), [])
+        self.assertIn("reported", self.events("reminder.drop")[0]["detail"]["why"])
+
+    def test_a_rider_already_delivered_and_forgotten_still_counts_as_a_report(self):
+        self.set_reminders()
+        self.world.tick(60)
+        self.world.new_engine("cli").report("coder", "working", "half way")
+        self.assertTrue(sb.read_report_riders(self.world.state), "the rider is waiting")
+        (self.world.state / sb.REPORT_RIDERS).write_text(json.dumps({"riders": []}))   # delivered with a later message and pruned: the rider record is gone
+        self.wait(3600)
+        self.assertEqual(self.overdue(), [])
+
+    def test_a_report_to_another_boss_than_the_launch_names_still_counts(self):
+        self.world.add_agent("other")
+        self.world.engine.discover(self.world.clock.now())
+        self.set_reminders(boss="other")
+        self.world.tick(60)
+        self.world.new_engine("cli").report("coder", "question", "for my own boss")   # goes to the agent's own reports_to, not to "other"
+        self.wait(3600)
+        self.assertEqual([t for t in self.texts("other") if "overdue checkpoint" in t], [])
+
+    def test_a_plain_send_to_the_boss_counts_even_where_no_transcript_is_read(self):
+        self.set_reminders()
+        self.world.tick(60)
+        self.world.new_engine("cli").send("coder", "platform", "quick question", None, None)
+        self.world.engine.light = True
+        self.wait(3600)
+        self.assertEqual(self.overdue(), [])
+
+    def test_a_send_to_a_peer_does_not_silence_the_wake_to_the_boss(self):
+        self.world.add_agent("peer")
+        self.world.engine.discover(self.world.clock.now())
+        self.set_reminders()
+        self.world.tick(60)
+        self.world.new_engine("cli").send("coder", "peer", "hello", None, None)
+        self.wait(3600)
+        self.assertEqual(len(self.overdue()), 1, "a message to a peer is not a report to the boss: %s" % [e["detail"] for e in self.events("reminder.drop")])
+
+    def test_a_time_in_the_future_in_the_record_silences_nothing(self):
+        self.set_reminders()
+        (self.world.state / sb.LAST_REPORT_FILE).write_text(json.dumps({"coder": {"state": "working", "at": EPOCH + 10 ** 9}}))
+        self.wait(3600)
+        self.assertEqual(len(self.overdue()), 1)
+
+    def test_the_wake_says_the_last_report_when_it_came_after_the_launch_but_cannot_cancel(self):
+        self.set_reminders()
+        self.world.tick(60)
+        sb.record_last_send(self.world.state, "coder", "somebody-else", self.world.clock.now())
+        self.wait(3600)
+        (text,) = self.overdue()
+        self.assertIn("(no report from coder since launch)", text)
+
+    def test_a_send_never_changes_the_last_reports_state_and_a_report_keeps_the_send(self):
+        self.world.new_engine("cli").report("coder", "done", "finished")
+        before = json.loads((self.world.state / sb.LAST_REPORT_FILE).read_text())["coder"]
+        self.world.tick(30)
+        self.world.new_engine("cli").send("coder", "platform", "one more thing", None, None)
+        mid = json.loads((self.world.state / sb.LAST_REPORT_FILE).read_text())["coder"]
+        self.assertEqual((mid["state"], mid["at"]), (before["state"], before["at"]), "the final done still reads as done")
+        self.assertGreater(mid["send_to"]["platform"], before["at"])
+        self.world.tick(30)
+        self.world.new_engine("cli").report("coder", "working", "again")
+        after = json.loads((self.world.state / sb.LAST_REPORT_FILE).read_text())["coder"]
+        self.assertEqual((after["state"], after["send_to"]), ("working", mid["send_to"]))
+
+    def test_the_wake_says_when_the_worker_last_reported_or_that_it_never_did(self):
+        self.set_reminders()
+        self.wait(3600)
+        (text,) = self.overdue()
+        self.assertIn("(no report from coder since launch)", text)
+
+    def test_the_wake_names_a_report_from_before_the_launch_as_such(self):
+        self.world.new_engine("cli").report("coder", "done", "an older task")
+        self.world.tick(120)
+        self.set_reminders()
+        self.wait(3600)
+        (text,) = self.overdue()
+        self.assertRegex(text, r"\(last report from coder \d+m ago \(before this launch\)\)")
+
+    def test_a_damaged_report_record_is_no_report_and_the_old_checks_still_run(self):
+        self.set_reminders()
+        self.world.tick(60)
+        self.world.new_engine("cli").report("coder", "question", "x")
+        (self.world.state / sb.LAST_REPORT_FILE).write_text("{not json")
+        self.wait(3600)
+        self.assertEqual(self.overdue(), [], "the report is still in the boss's transcript: found there")
+
     def test_a_send_after_the_launch_also_cancels_it(self):
         self.set_reminders()
         self.world.tick(60)
