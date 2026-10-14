@@ -4582,6 +4582,31 @@ class TestLaunch(Base):
         with mock.patch.object(sb, "_write_small", side_effect=OSError(28, "No space")):
             self.assertFalse(sb.record_last_report(self.world.state, "worker", "done", 1))
 
+    def test_a_failed_progress_record_drops_a_stale_done_the_cap_prunes_and_a_write_failure_is_a_line_not_a_traceback(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.worker()
+        sb.record_last_report(self.world.state, "worker", "done", 1000)
+        real = sb._write_small
+        calls = []
+
+        def fail_first(state_dir, name, data):
+            calls.append(name)
+            if len(calls) == 1:
+                raise OSError(28, "No space left")
+            return real(state_dir, name, data)
+        with mock.patch.object(sb, "_write_small", fail_first):
+            self.assertFalse(sb.record_last_report(self.world.state, "worker", "working", 2000))
+        self.assertNotIn("worker", sb._read_small(self.world.state, sb.LAST_REPORT_FILE), "the stale done must not stand when the newer state could not be saved")
+        old = {"x": {"at": 1}, "y": {"at": 10 ** 9}}
+        self.assertEqual(sorted(sb.prune_retired(old, 10 ** 9 + 5)), ["y"])
+        self.as_("boss")
+        self.health()
+        with mock.patch.object(sb, "_write_small", side_effect=OSError(28, "No space left")):
+            code, out, err = self.run_cli("retire", "worker")
+        self.assertNotEqual(code, 0)
+        self.assertIn("was not retired, try again", err)
+        self.assertNotIn("Traceback", err)
+
     def test_a_relaunched_worker_with_a_new_session_is_not_hidden_by_an_old_retirement(self):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
         self.worker()

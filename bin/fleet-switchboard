@@ -3265,8 +3265,8 @@ class Switchboard:
                     now, issue=number, batch=False, sender=sender, repo=repo,
                     rider=state in REPORT_PROGRESS and not fault("no-rider"))
         if fact.rider:
-            if self.state_dir is not None:
-                record_last_report(self.state_dir, sender, state, now)
+            if self.state_dir is not None and not record_last_report(self.state_dir, sender, state, now):
+                self._note("fleetpane.error", sender, {"error": "last-reports.json not written: %s's final report will not retire it automatically" % sender})
             record_report_rider(self, fact)
             return {"sent": False, "action": "rider", "reason": "a progress report is a rider: it rides in the "
                     "next message to %s and never wakes it" % boss, "key": fact.key, "recipient": boss}
@@ -4566,6 +4566,13 @@ def _write_small(state_dir, name, data):
         raise
 
 
+def prune_retired(retired, now):
+    """Entries long past the status window are dropped: the one bound, used by every writer of retired.json."""
+    for old in [n for n, v in retired.items() if now - (v.get("at") or 0) > 4 * RETIRED_SHOW_DAYS * 86400]:
+        retired.pop(old, None)
+    return retired
+
+
 def read_retired(state_dir):
     return _read_small(state_dir, RETIRED_FILE)
 
@@ -4584,6 +4591,14 @@ def record_last_report(state_dir, sender, state, now):
             _write_small(state_dir, LAST_REPORT_FILE, data)
         return True
     except Exception:
+        if state in ("working", "paused", "blocked", "question", "withdrawn"):   # a progress report must not leave an older `done` standing
+            try:
+                with agent_lock(state_dir, "files", seconds=1):
+                    data = _read_small(state_dir, LAST_REPORT_FILE)
+                    if data.pop(sender, None) is not None:
+                        _write_small(state_dir, LAST_REPORT_FILE, data)
+            except Exception:
+                pass
         return False
 
 
@@ -4676,7 +4691,7 @@ def pane_health_pass(engine, now):
                          "session": agents[name].get("session"), "auto": True}
                 try:
                     with agent_lock(engine.state_dir, "files", seconds=2):
-                        current = read_retired(engine.state_dir)
+                        current = prune_retired(read_retired(engine.state_dir), now)
                         current[name] = entry
                         _write_small(engine.state_dir, RETIRED_FILE, current)
                     retired[name] = entry
@@ -4930,7 +4945,10 @@ def cmd_retire(args, runner, now):
             if retired.pop(name, None) is None:
                 print("%s is not retired" % name)
                 return EXIT_OK
-            _write_small(state, RETIRED_FILE, retired)
+            try:
+                _write_small(state, RETIRED_FILE, retired)
+            except OSError as err:
+                raise LaunchError("%s could not be updated (%s): nothing changed, try `%s retire --undo %s` again" % (RETIRED_FILE, err.strerror or err, PROG, name)) from None
             data = read_pane_health(state)
             data["states"].pop(name, None)
             data["missing"].pop(name, None)
@@ -4944,11 +4962,13 @@ def cmd_retire(args, runner, now):
             return EXIT_OK
         if seen is None and not known:
             raise LaunchError("%s is not a fleet agent this switchboard has seen (see `%s status`)" % (name, PROG))
-        for old in [n for n, v in retired.items() if now() - (v.get("at") or 0) > 4 * RETIRED_SHOW_DAYS * 86400]:
-            retired.pop(old, None)               # bounded: entries long past the status window are dropped
+        prune_retired(retired, now())
         retired[name] = {"at": int(now()), "by": identify_who(engine, runner, now), "reason": reason or "finished",
                          "session": (seen.session_id if seen else None) or known.get("session"), "auto": False}
-        _write_small(state, RETIRED_FILE, retired)
+        try:
+            _write_small(state, RETIRED_FILE, retired)
+        except OSError as err:
+            raise LaunchError("%s could not be written (%s): %s was not retired, try again" % (RETIRED_FILE, err.strerror or err, name)) from None
     data = read_pane_health(state)
     data["states"].pop(name, None)
     try:
