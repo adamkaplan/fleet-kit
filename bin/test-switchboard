@@ -40586,14 +40586,22 @@ class TestTempJanitor(Base):
             code, out, err = self.run_cli("--apply")
             self.assertTrue(victim.exists(), code_)
             self.assertIn("cannot say whether anything is using it", out)
-        def boom(argv, **kwargs):
-            if argv[0] == "lsof":
-                raise OSError("no lsof")
-            return self.world.route(argv, **kwargs)
-        with captured() as (out, err):
-            sb.main(["disk", "janitor", "--apply"], runner=boom, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        for failure in (OSError("no lsof"), subprocess.TimeoutExpired(["lsof"], 30)):
+            def boom(argv, **kwargs):
+                if argv[0] == "lsof":
+                    raise failure
+                return self.world.route(argv, **kwargs)
+            with captured() as (out, err):
+                sb.main(["disk", "janitor", "--apply"], runner=boom, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+            self.assertTrue(victim.exists())
+            self.assertIn("lsof did not run", out.getvalue())
+
+    def test_a_process_list_past_its_cap_keeps_every_candidate(self):
+        victim = self.old("old-victim.txt")
+        self.lsof = "p1\nfcwd\nn/\n" * 70000
+        code, out, err = self.run_cli("--apply")
         self.assertTrue(victim.exists())
-        self.assertIn("lsof did not run", out.getvalue())
+        self.assertIn("lsof listed more than 200000 lines", out)
 
     def test_an_old_modification_time_with_a_recent_change_time_is_kept(self):
         restored = self.old("restored-from-tar", days=30, directory=True)
@@ -40614,13 +40622,25 @@ class TestTempJanitor(Base):
         code, out, err = self.run_cli("--apply")
         self.assertTrue(victim.exists())
         self.assertIn("could not be read in full", out)
+        lines, removed, kept = self.jan.run(self.temp, self.world.state, self.now, self.jan.settings({}), True, lambda *a: None)   # and directly: an empty state directory judges nothing
+        self.assertEqual(removed, 0)
+        self.assertTrue(victim.exists())
 
-    def test_a_scan_that_spends_its_time_budget_keeps_the_rest(self):
+    def test_a_scan_that_spends_its_time_budget_keeps_the_rest_and_judges_those_before_it(self):
         self.old("a-old.txt")
         self.old("b-old.txt")
-        ticks = iter(range(0, 10000, 1000))
-        rows = self.jan.scan(self.temp, self.world.state, self.now, self.jan.settings({}), clock=lambda: next(ticks))
-        self.assertTrue(any("time budget was spent" in r["why"] for r in rows))
+        t = [0]
+        real = self.jan.judge
+
+        def judge_then_pass_the_budget(*a, **k):
+            row = real(*a, **k)
+            t[0] += 1000   # the first entry's judging takes longer than the whole budget
+            return row
+        with mock.patch.object(self.jan, "judge", judge_then_pass_the_budget):
+            rows = self.jan.scan(self.temp, self.world.state, self.now, self.jan.settings({}), clock=lambda: t[0])
+        self.assertEqual(rows[0]["action"], "remove", "the entry reached before the budget ran out is judged")
+        self.assertIn("time budget was spent", rows[1]["why"])
+        self.assertEqual(rows[1]["action"], "keep")
 
     def test_a_hostile_name_is_printed_as_plain_text(self):
         self.old("bad\x1b[2Jname.txt")

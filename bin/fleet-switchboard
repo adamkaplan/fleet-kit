@@ -18478,7 +18478,10 @@ def janitor_busy_function(engine, runner, janitor):
                 raise janitor.Unknown("lsof did not run: %s" % _one_line(str(err), 80))
             if done.returncode not in (0, 1) or (done.returncode == 1 and not (done.stdout or "").strip()):
                 raise janitor.Unknown("lsof failed (exit %s)" % done.returncode)
-            held["dirs"] = [os.path.realpath(l[1:]) for l in (done.stdout or "").splitlines()[:200000] if l.startswith("n/")]
+            lines = (done.stdout or "").splitlines()
+            if len(lines) > 200000:
+                raise janitor.Unknown("lsof listed more than 200000 lines: a process past the limit would not protect its directory")
+            held["dirs"] = [os.path.realpath(l[1:]) for l in lines if l.startswith("n/")]
         return held["dirs"]
 
     def busy(path):
