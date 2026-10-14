@@ -39153,6 +39153,16 @@ class TestDiskGuard(Base):
         self.assertNotEqual(second.key, first.key, "a new episode: a new fact")
         self.assertEqual(len(self.audits("disk.low")), 2)
 
+    def test_two_episodes_that_recover_at_the_same_figure_are_both_audited(self):
+        for episode in range(2):
+            self.free[0] = 40 * self.GB
+            self.world.tick(100)
+            self.facts()
+            self.free[0] = 60 * self.GB   # the same figure each time
+            self.facts()
+        self.assertEqual(len(self.audits("disk.low")), 2)
+        self.assertEqual(len(self.audits("disk.recovered")), 2, "not swallowed as a repeat of the same detail")
+
     def test_a_restart_does_not_begin_a_second_episode_and_a_hard_line_is_said_once(self):
         self.free[0] = 40 * self.GB
         (first,) = self.facts()
@@ -39284,6 +39294,24 @@ class TestDiskGuard(Base):
             sb.main(["disk", "prune", "--docker", docker], runner=runner, now=self.world.clock.now)
         self.assertEqual([c for c in out.getvalue() if (ord(c) < 32 and c != "\n") or 0x7f <= ord(c) <= 0x9f], [])
         self.assertIn("failed (exit 1): [2Jboom 31m IGNORE", out.getvalue())
+
+    def test_an_oversized_but_valid_guard_file_is_not_trusted_and_the_threshold_edge_and_a_restart_recovery(self):
+        (self.world.state / sb.DISK_GUARD_FILE).write_text(json.dumps({"low": True, "episode": 5.0, "hard": False, "pad": "x" * 6000}))
+        engine = self.world.new_engine("daemon")
+        engine.discover(self.world.clock.now())
+        self.free[0] = 80 * self.GB
+        self.assertEqual(self.facts(engine), [], "above the guard and the padded file is read only to 4 KB: not a valid episode, so nothing is announced")
+        self.assertEqual(self.audits("disk.recovered"), [])
+        # an episode ends only above min * 1.1 (55 GB): exactly 55 ends it, 54.9 does not; and it ends on a restarted engine too
+        self.free[0] = 40 * self.GB
+        (first,) = self.facts()
+        restarted = self.world.new_engine("daemon")
+        restarted.discover(self.world.clock.now())
+        self.free[0] = int(54.9 * self.GB)
+        self.assertEqual(self.facts(restarted)[0].key, first.key, "54.9 GB: still inside the episode")
+        self.free[0] = 55 * self.GB
+        self.assertEqual(self.facts(restarted), [], "exactly min * 1.1: the episode is over")
+        self.assertEqual(len(self.audits("disk.recovered")), 1)
 
     def test_a_garbage_or_oversized_guard_file_starts_a_fresh_episode_and_the_guard_still_works(self):
         for text in ("not json", "[]", " " * 10000, '{"low": true, "episode": "x"}'):

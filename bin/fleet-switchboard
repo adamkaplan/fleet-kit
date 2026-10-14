@@ -1880,7 +1880,7 @@ class FactError(ValueError):
 
 
 DISK_GUARD_DEFAULTS = {"min_free_gb": 50, "hard_free_gb": 10}
-DISK_REARM_FACTOR = 1.1                 # an episode ends when the free space is back above the threshold plus 10%
+DISK_REARM_PERCENT = 110                # an episode ends when the free space is back at the threshold plus 10% (integer arithmetic: 50 * 1.1 is 55.00000000000001)
 DISK_GUARD_FILE = "disk-guard.json"     # {"low": bool, "episode": <epoch the episode began>, "hard": bool}: so a restart does not start a second episode
 
 
@@ -1986,8 +1986,9 @@ class DiskFacts:
         free_gb, now = found[0] / 1e9, engine.now()
         if self.episode is None:
             self.episode = self._load(engine.state_dir)
-        if self.episode is not None and free_gb >= guard["min_free_gb"] * DISK_REARM_FACTOR:
-            engine._note("disk.recovered", None, {"free_gb": int(free_gb), "min_free_gb": guard["min_free_gb"]})
+        if self.episode is not None and free_gb >= guard["min_free_gb"] * DISK_REARM_PERCENT / 100:
+            if engine.audit is not None:   # appended, not `_note`d: a second episode that recovers at the same figure is still news
+                engine.audit.append(engine.actor, "disk.recovered", None, {"free_gb": int(free_gb), "min_free_gb": guard["min_free_gb"], "episode": int(self.episode[0])})
             self.episode = None
             self._save(engine, False, None, False)
         discovery = getattr(engine, "discovery", None)
@@ -2003,7 +2004,8 @@ class DiskFacts:
         episode, hard = self.episode
         if free_gb < guard["hard_free_gb"] and not hard:   # it got worse inside the episode: said in the status line and the audit, not a second wake
             self.episode = (episode, True)
-            engine._note("disk.hard", None, {"free_gb": int(free_gb), "hard_free_gb": guard["hard_free_gb"]})
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "disk.hard", None, {"free_gb": int(free_gb), "hard_free_gb": guard["hard_free_gb"], "episode": int(episode)})
             self._save(engine, True, episode, True)
         if not chiefs:
             return []
@@ -17188,7 +17190,7 @@ def cmd_disk(args, runner, now):
     """`disk prune [--dry-run]`."""
     docker = shutil.which(args.docker) if os.sep not in args.docker else (args.docker if os.access(args.docker, os.X_OK) else None)
     if docker is None:
-        sys.stderr.write("%s: disk prune: docker is not installed or not on PATH (%s): nothing was run\n" % (PROG, args.docker))
+        sys.stderr.write("%s: disk prune: docker is not installed or not on PATH (%s): nothing was run\n" % (PROG, _plain(args.docker, 160)))
         return EXIT_USAGE
     commands = [(docker,) + argv[1:] for argv in DISK_PRUNE_COMMANDS]
     if args.dry_run:
