@@ -1,0 +1,4 @@
+{
+ "command": "gates-check",
+ "help": "usage: fleet-switchboard gates-check [-h] --for {ready,merge} [--plan PLAN] [--ask ASK] [--json] pr positional arguments: pr The pull request: owner/repo#N or its URL options: -h, --help show this help message and exit --for {ready,merge} --plan PLAN --ask ASK --json"
+}
