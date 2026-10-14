@@ -19320,6 +19320,136 @@ class TestReportCommand(ReportBase):
             self.assertIn(word, text)
 
 
+class TestReportFold(ReportBase):
+    """#352: a report that follows the sender's own send to the same boss on the same issue, within 10 minutes, is a note and wakes nobody twice."""
+
+    def send(self, to="platform", issue=2, text="here is the finding"):
+        out = self.world.new_engine("cli").send("coder", to, text, issue, None)
+        self.assertTrue(out["sent"], out)
+        return out
+
+    def report_on(self, issue=None, state="done", text="finished"):
+        return self.world.new_engine("cli").report("coder", state, text, issue)
+
+    def last(self):
+        return self.world.admissions("platform")[-1]
+
+    def test_a_report_within_ten_minutes_of_a_send_on_the_same_issue_is_a_note_and_still_delivered(self):
+        self.send()
+        self.assertTrue(self.last()["resume"], "the send itself woke the boss")
+        self.world.tick(240)
+        out = self.report_on(2)
+        self.assertTrue(out["sent"], out)
+        self.assertEqual(out["action"], "note")
+        messages = self.world.admissions("platform")
+        self.assertEqual(len(messages), 2)
+        self.assertFalse(messages[-1]["resume"])
+        self.assertIn("done: finished", messages[-1]["text"])
+
+    def test_a_report_with_no_such_send_wakes_as_before(self):
+        cases = []
+        self.send(issue=2)
+        self.world.tick(660)                       # the send is 11 minutes old
+        cases.append(self.report_on(2)["action"])
+        self.send(issue=5)                         # another issue
+        self.world.tick(10)
+        cases.append(self.report_on(2)["action"])
+        self.world.add_agent("peer")
+        self.send(to="peer", issue=2)              # another recipient
+        self.world.tick(10)
+        cases.append(self.report_on(2)["action"])
+        self.assertEqual(cases, ["wake"] * 3)
+
+    def test_a_report_with_no_send_at_all_wakes(self):
+        self.assertEqual(self.report_on(2)["action"], "wake")
+
+    def test_a_folded_question_still_reads_as_a_question_and_says_it_follows(self):
+        self.send()
+        self.world.tick(240)
+        self.report_on(2, state="question", text="which branch?")
+        text = self.last()["text"]
+        self.assertIn("question: which branch?", text)
+        self.assertIn("follows", text)
+
+    def test_a_progress_report_stays_a_rider_and_a_later_done_still_carries_it(self):
+        self.send()
+        out = self.report_on(2, state="working", text="halfway")
+        self.assertEqual(out["action"], "rider")
+        self.world.tick(60)
+        self.report_on(2)
+        self.assertIn("working: halfway", self.last()["text"])
+
+    def test_a_send_that_was_held_or_only_a_note_is_not_one_a_report_folds_into(self):
+        self.world.you("platform")                 # engaged with the boss: the send is a note, not a wake
+        out = self.send()
+        self.assertEqual(out["action"], "note")
+        self.world.tick(60)
+        self.assertTrue(self.report_on(2, state="question", text="which?")["sent"])
+        record = json.loads((self.world.state / sb.LAST_REPORT_FILE).read_text())["coder"]
+        self.assertNotIn("send_on", {k: v for k, v in record.items() if v})   # nothing recorded for the note
+        self.world.herdr.panes[self.world.panes["platform"]]["status"] = "blocked"
+        held = self.world.new_engine("cli").send("coder", "platform", "held", 2, None)
+        self.assertFalse(held["sent"])
+        self.assertNotIn("send_on", json.loads((self.world.state / sb.LAST_REPORT_FILE).read_text())["coder"])
+
+    def test_the_boundaries_of_follows(self):
+        fold = sb.load_report_fold()
+        entry = fold.record({}, "boss", "acme/api", 2, 1000)
+        at = lambda now, repo="acme/api", issue=2: fold.follows(entry, "boss", repo, issue, now)
+        self.assertEqual(at(1000), 1000)                       # age 0
+        self.assertEqual(at(1000 + fold.WINDOW_SECONDS), 1000)  # exactly 600 s: still folds
+        self.assertIsNone(at(1000 + fold.WINDOW_SECONDS + 1))   # 601 s: does not
+        self.assertIsNone(at(999))                              # a clock that went backwards folds nothing
+        self.assertIsNone(at(1010, repo="acme/web"))            # a different repo, same number
+        self.assertEqual(at(1010, repo=None), 1000)             # a repo missing on one side does not exclude
+        self.assertIsNone(at(1010, issue=3))
+        self.assertIsNone(fold.follows(entry, "other", "acme/api", 2, 1010))
+        self.assertEqual(fold.follows(fold.record({}, "boss", None, 2, 1000), "boss", "acme/api", 2, 1010), 1000)
+
+    def test_a_folded_report_stays_a_note_through_the_re_check(self):
+        # The delivery re-observes the boss and re-decides: that says "wake", and the folded plan must stay a note
+        # (without the demotion in `deliver`, every fold test here would be refused as "not sent").
+        self.send()
+        self.world.tick(60)
+        self.report_on(2, state="blocked", text="stuck")
+        self.assertFalse(self.last()["resume"])
+        self.assertEqual(len(self.world.admissions("platform")), 2)
+
+    def test_the_report_does_not_forget_the_send_and_the_record_is_bounded(self):
+        self.send()
+        self.report_on(2, state="blocked", text="stuck")
+        record = json.loads((self.world.state / sb.LAST_REPORT_FILE).read_text())["coder"]
+        self.assertEqual(record["send_on"]["platform"]["issue"], 2)
+        report_fold = sb.load_report_fold()
+        entry = {}
+        for n in range(20):
+            entry = report_fold.record(entry, "r%d" % n, None, 2, 1000 + n)
+        self.assertEqual(len(entry["send_on"]), report_fold.KEEP)
+        self.assertEqual(report_fold.record({}, "boss", None, None, 5), {})
+
+
+class TestReportFoldLight(TestReportFold):
+    """#352: under v2_light nothing folds (an unread note is not converted to a wake there): the same cases wake."""
+
+    def make_world(self, **kwargs):
+        config = dict(kwargs.pop("config", None) or {}, v2_light=True)
+        return super().make_world(config=config, **kwargs)
+
+    def test_a_report_within_ten_minutes_of_a_send_on_the_same_issue_is_a_note_and_still_delivered(self):
+        self.send()
+        self.world.tick(240)
+        out = self.report_on(2)
+        self.assertEqual(out["action"], "wake")
+        self.assertTrue(self.last()["resume"])
+        self.assertNotIn("follows", self.last()["text"])
+
+    test_a_folded_question_still_reads_as_a_question_and_says_it_follows = None
+    test_a_folded_report_stays_a_note_through_the_re_check = None
+    test_a_progress_report_stays_a_rider_and_a_later_done_still_carries_it = None
+    test_a_send_that_was_held_or_only_a_note_is_not_one_a_report_folds_into = None
+    test_the_report_does_not_forget_the_send_and_the_record_is_bounded = None
+
+
 class TestUnreportedStop(ReportBase):
     def facts(self):
         return self.derive()
