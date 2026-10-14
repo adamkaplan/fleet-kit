@@ -230,23 +230,49 @@ def last_moves(asks, rows):
     return found
 
 
+WAIT_LABELS = ("awaiting-user", "awaiting-cos", "parked")   # matched by suffix, whatever the owner's prefix
+PARKED_MAX_DAYS = 366            # a park reaches at most this far ahead (the same bound as the switchboard's parked_until users)
+
+
+def ask_wait(ask, now):
+    """What an ask is waiting on, by its labels: "owner" (awaiting-user), "cos" (awaiting-cos), "parked" (a parked label and a valid future date: the
+    call site parsed the `Parked until:` line with the switchboard's own parser) or None. awaiting wins over parked, and the owner over the Chief of Staff."""
+    labels = [str(l) for l in (ask.get("labels") or [])]
+    has = lambda name: any(l == name or l.endswith(":" + name) for l in labels)
+    if has("awaiting-user"):
+        return "owner"
+    if has("awaiting-cos"):
+        return "cos"
+    until = ask.get("parked_until")
+    if has("parked") and isinstance(until, (int, float)) and not isinstance(until, bool) and now < until <= now + PARKED_MAX_DAYS * 86400.0:
+        return "parked"
+    return None
+
+
 def figures(name, info, rows, now, cfg):
     """One orchestrator's figures. `info`: asks [{repo, number, first_seen}] or None (unreadable), busy, idle, messages, decisions."""
     out = {"name": name, "busy": info["busy"], "idle": info["idle"], "messages": info["messages"], "decisions": info["decisions"],
-           "open_asks": None, "stalled": None, "stalled_asks": [], "oldest_stall_hours": None, "moved_1h": None, "moved_backlog": None}
+           "open_asks": None, "active_asks": None, "stalled": None, "stalled_asks": [], "oldest_stall_hours": None, "moved_1h": None, "moved_backlog": None,
+           "waiting_owner": None, "waiting_cos": None, "parked": None}
     asks = info.get("asks")
     if asks is None:
         return out
     last = last_moves(asks, rows)
     out["open_asks"] = len(asks)
-    ages, stalled = [], []
+    ages, stalled, waits = [], [], {"owner": 0, "cos": 0, "parked": 0}
     for ask in asks:
+        wait = ask_wait(ask, now)
+        if wait:
+            waits[wait] += 1   # waiting on someone or deliberately parked: counted by itself, never as stalled
+            continue
         at = last[(ask["repo"], ask["number"])]
         at = max(at, ask["first_seen"]) if at is not None else ask["first_seen"]   # never seen to move: unmoved since it was first seen
         ages.append(now - at)
         if now - at >= cfg["stalled_hours"] * 3600:
             stalled.append(ask["number"])
     out["stalled"], out["stalled_asks"] = len(stalled), sorted(stalled)
+    out["waiting_owner"], out["waiting_cos"], out["parked"] = waits["owner"], waits["cos"], waits["parked"]
+    out["active_asks"] = len(asks) - sum(waits.values())
     out["oldest_stall_hours"] = round(max(ages) / 3600.0, 1) if ages else 0.0
     moved = lambda hours: sum(1 for ask in asks if last[(ask["repo"], ask["number"])] is not None and now - last[(ask["repo"], ask["number"])] < hours * 3600)
     out["moved_1h"], out["moved_backlog"] = moved(1), moved(cfg["backlog_hours"])
@@ -263,11 +289,12 @@ def crossing(fig, cfg):
     full = fig["busy"] is not None and fig["idle"] is not None and fig["busy"] > 0 and fig["idle"] == 0
     if full and fig.get("moved_backlog") is not None and fig.get("moved_1h") is not None:
         # all coders busy: only when something is stuck (an ask stalled) or open asks clearly outnumber what moves and nothing moved in the last hour
-        outnumbered = fig["open_asks"] >= 2 * fig["moved_backlog"] and fig["open_asks"] > fig["moved_backlog"] and fig["moved_1h"] == 0
+        active = fig["active_asks"] if fig.get("active_asks") is not None else fig["open_asks"]   # asks waiting on someone or parked are not queued work
+        outnumbered = active >= 2 * fig["moved_backlog"] and active > fig["moved_backlog"] and fig["moved_1h"] == 0
         if fig["stalled"] >= 1 and "stalled" not in reasons:
             reasons.append("busy_stalled"); severity += max(1, fig["stalled"])
         elif outnumbered:
-            reasons.append("outnumbered"); severity += max(1, fig["open_asks"] - fig["moved_backlog"])
+            reasons.append("outnumbered"); severity += max(1, active - fig["moved_backlog"])
     return severity, reasons
 
 
@@ -433,6 +460,15 @@ def _resolve_charters(ctx, state, now, budget):
     return out, problems
 
 
+def _wait_fields(ask):
+    """The few label facts kept with a cached ask: only the labels that matter and the parsed park date."""
+    labels = [l for l in (ask.get("labels") or []) if isinstance(l, str) and any(l == w or l.endswith(":" + w) for w in WAIT_LABELS)][:6]
+    out = {"labels": labels} if labels else {}
+    if isinstance(ask.get("parked_until"), (int, float)) and not isinstance(ask.get("parked_until"), bool):
+        out["parked_until"] = ask["parked_until"]
+    return out
+
+
 def _parent_of(ctx, state, budget, repo, number, now, problems):
     """(parent number or None, resolved): a parent never changes, so one read per number is kept for good (a failure is retried after RETRY_SECONDS).
     Unresolved when it cannot be read or the account's budget is spent or paused: nothing is guessed."""
@@ -513,7 +549,7 @@ def _refresh_asks(ctx, state, now, rows=()):
             cache[name] = dict(entry, tried=now, error=text)
             continue
         seen = {(a["repo"], a["number"]): a["first_seen"] for a in entry.get("list", [])}
-        cache[name] = {"at": now, "list": [{"repo": a["repo"], "number": a["number"], "first_seen": seen.get((a["repo"], a["number"]), now)} for a in found]}
+        cache[name] = {"at": now, "list": [dict({"repo": a["repo"], "number": a["number"], "first_seen": seen.get((a["repo"], a["number"]), now)}, **_wait_fields(a)) for a in found]}
     for gone in [n for n in cache if n not in ctx.orchestrators]:
         del cache[gone]
     asks_by_name = {n: (cache.get(n) or {}).get("list") or [] for n in ctx.orchestrators}
@@ -558,7 +594,7 @@ def tick(ctx):
             for gone in sorted(history)[:-HISTORY_DAYS]:
                 del history[gone]
         mine = old if isinstance(old, dict) and old.get("day") == day else {"day": day, "hours": {}}
-        mine["hours"][hour] = {k: fig[k] for k in ("open_asks", "stalled", "stalled_asks", "moved_1h", "moved_backlog", "busy", "idle", "messages", "decisions", "oldest_stall_hours")}
+        mine["hours"][hour] = {k: fig[k] for k in ("open_asks", "active_asks", "waiting_owner", "waiting_cos", "parked", "stalled", "stalled_asks", "moved_1h", "moved_backlog", "busy", "idle", "messages", "decisions", "oldest_stall_hours")}
         series[name] = mine
         before = episodes.get(name)
         text, episodes[name] = judge(fig, ctx.cfg, before)
@@ -588,9 +624,9 @@ def status_lines(state_dir, now):
     out = ["load        %d orchestrator(s); alert %s" % (len(latest), "on" if state.get("alert") else "off")]
     for name in sorted(latest):
         f = latest[name]
-        out.append("  %-12s asks %s, stalled %s (oldest %s h), moved 1h %s; waiting %d msg %s dec; coders %d busy %d idle" % (
-            name, num(f["open_asks"]), num(f["stalled"]), num(f["oldest_stall_hours"]), num(f["moved_1h"]),
-            f["messages"], num(f["decisions"]), f["busy"], f["idle"]))
+        out.append("  %-12s asks %s, stalled %s, waiting on owner %s, parked %s, waiting on cos %s, oldest stall %s h, moved 1h %s; waiting %d msg %s dec; coders %d busy %d idle" % (
+            name, num(f["open_asks"]), num(f["stalled"]), num(f.get("waiting_owner")), num(f.get("parked")), num(f.get("waiting_cos")),
+            num(f["oldest_stall_hours"]), num(f["moved_1h"]), f["messages"], num(f["decisions"]), f["busy"], f["idle"]))
     if state.get("unattributed"):
         out.append("  %d movement(s) not attributed (a referenced issue's parent could not be read)" % state["unattributed"])
     if state.get("problems"):

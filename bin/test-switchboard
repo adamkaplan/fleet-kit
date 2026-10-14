@@ -48658,6 +48658,98 @@ class TestLoadAlert(Base):
         parents = json.loads((self.state_dir / "load.json").read_text())["parents"]
         self.assertEqual(parents, {"acme/widget#200": 100, "acme/widget#201": 0})          # a parent in another repository is no parent here
 
+    DAY = 86400.0
+
+    def wait_world(self, asks, **cfg):
+        """One orchestrator whose asks are `asks` (number -> {labels, parked_until}); a first pass, then one 3 hours later with nothing moved."""
+        self.waits = asks
+        orch = {"o": {"charter": 1, "repo": "r", "busy": 0, "idle": 1, "messages": 0}}
+        def run(at):
+            def read_asks(charter, repo):
+                return [dict({"repo": "r", "number": n}, **self.waits[n]) for n in sorted(self.waits)]
+            return self.health.tick(self.health.Context(now=at, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS, **cfg), orchestrators=orch,
+                                                        read_asks=read_asks, cos="cos", wake=self.woken.append))
+        run(self.T0)
+        run(self.T0 + 3 * 3600)
+        return self.latest()["o"]
+
+    def test_an_ask_awaiting_the_owner_is_waiting_not_stalled(self):
+        got = self.wait_world({1: {"labels": ["me:awaiting-user"]}})
+        self.assertEqual((got["stalled"], got["waiting_owner"], got["waiting_cos"], got["parked"]), (0, 1, 0, 0))
+
+    def test_an_ask_awaiting_the_chief_of_staff_is_counted_apart(self):
+        got = self.wait_world({1: {"labels": ["me:awaiting-cos"]}})
+        self.assertEqual((got["stalled"], got["waiting_cos"], got["waiting_owner"]), (0, 1, 0))
+
+    def test_a_parked_ask_with_a_future_date_is_parked_and_one_whose_date_passed_is_stalled_again(self):
+        got = self.wait_world({1: {"labels": ["me:parked"], "parked_until": self.T0 + 10 * self.DAY}})
+        self.assertEqual((got["stalled"], got["parked"]), (0, 1))
+        shutil.rmtree(str(self.state_dir)); self.state_dir.mkdir(mode=0o700)
+        got = self.wait_world({1: {"labels": ["me:parked"], "parked_until": self.T0 + 3600}})   # the date passes within the 3 hours
+        self.assertEqual((got["stalled"], got["parked"]), (1, 0))
+
+    def test_a_parked_label_without_a_valid_future_date_is_not_parked(self):
+        for case in ({"labels": ["me:parked"]}, {"labels": ["me:parked"], "parked_until": None},
+                     {"labels": ["me:parked"], "parked_until": self.T0 + 5000 * self.DAY}):   # no date / a date beyond the bound
+            shutil.rmtree(str(self.state_dir)); self.state_dir.mkdir(mode=0o700)
+            got = self.wait_world({1: case})
+            self.assertEqual((got["stalled"], got["parked"]), (1, 0), case)
+
+    def test_the_real_parser_gives_none_for_a_missing_malformed_or_impossible_date_and_the_labels_flow_from_the_asks_list(self):
+        labels = ["me:parked"]
+        body = lambda line: "## Intent\nx\n\n" + line + "\n"
+        for line in ("", "Parked until: soon", "Parked until: 2026-02-30", "Parked until: 2026-10-20\nParked until: 2026-10-21"):
+            self.assertIsNone(sb.parked_until(body(line), labels), line)
+        self.assertEqual(sb.parked_until(body("Parked until: 2026-10-20"), labels), _dt.datetime(2026, 10, 21, tzinfo=_dt.timezone.utc).timestamp())
+        issue = sb.IssueIntent.from_api({"number": 5, "state": "open", "title": "t", "body": body("Parked until: 2026-10-20"), "labels": [{"name": "me:parked"}, {"name": "x"}]})
+        self.assertEqual((issue.labels, issue.parked_until), (["me:parked", "x"], _dt.datetime(2026, 10, 21, tzinfo=_dt.timezone.utc).timestamp()))
+        self.assertEqual(self.health.PARKED_MAX_DAYS, sb.PARKED_MAX_DAYS)
+
+    def test_a_mixed_fleet_shows_the_split_in_status_and_only_the_plain_stall_counts(self):
+        got = self.wait_world({1: {"labels": []}, 2: {"labels": ["me:awaiting-user"]}, 3: {"labels": ["me:awaiting-cos"]},
+                               4: {"labels": ["me:parked"], "parked_until": self.T0 + 9 * self.DAY}, 5: {"labels": []}})
+        self.assertEqual((got["open_asks"], got["stalled"], got["waiting_owner"], got["waiting_cos"], got["parked"]), (5, 2, 1, 1, 1))
+        self.health.append_moves(str(self.state_dir), [{"at": self.T0 + 3 * 3600 - 10, "repo": "r", "numbers": [5], "refs": [5], "kind": "push"}])
+        got = self.wait_world({1: {"labels": []}, 2: {"labels": ["me:awaiting-user"]}, 3: {"labels": ["me:awaiting-cos"]},
+                               4: {"labels": ["me:parked"], "parked_until": self.T0 + 9 * self.DAY}, 5: {"labels": []}})
+        self.assertEqual((got["stalled"], got["stalled_asks"]), (1, [1]))
+        row = [l for l in self.health.status_lines(str(self.state_dir), self.T0) if l.strip().startswith("o ")][0]
+        self.assertIn("stalled 1, waiting on owner 1, parked 1, waiting on cos 1", row)
+
+    def test_wait_labels_take_precedence_owner_then_cos_then_parked_and_the_bare_label_counts(self):
+        future = self.T0 + 9 * self.DAY
+        got = self.wait_world({1: {"labels": ["me:awaiting-cos", "me:awaiting-user", "me:parked"], "parked_until": future},   # all three: the owner wins
+                               2: {"labels": ["me:awaiting-cos", "me:parked"], "parked_until": future},                       # cos beats parked
+                               3: {"labels": ["awaiting-user"]},                                                                # a bare, unprefixed label
+                               4: {"labels": ["me:parked"], "parked_until": future},
+                               5: {"labels": ["unrelated:label"]}})
+        self.assertEqual((got["waiting_owner"], got["waiting_cos"], got["parked"], got["stalled"]), (2, 1, 1, 1))
+
+    def test_asks_waiting_or_parked_do_not_make_the_busy_coders_rule_fire(self):
+        def fig(**kw):
+            base = {"name": "o", "open_asks": 6, "active_asks": 6, "stalled": 0, "stalled_asks": [], "moved_1h": 0, "moved_backlog": 1, "busy": 2, "idle": 0,
+                    "messages": 0, "decisions": 0}
+            return dict(base, **kw)
+        cfg = dict(self.health.DEFAULTS)
+        self.assertIn("at least twice", self.health.judge(fig(), cfg, None)[0])                       # 6 active asks, 1 moved, nothing in the last hour: fires
+        self.assertIsNone(self.health.judge(fig(active_asks=1, waiting_owner=3, waiting_cos=1, parked=1), cfg, None)[0])   # 5 of the 6 only wait or are parked: 1 active, no wake
+        # the same through a real pass: 6 asks, 5 waiting or parked, coders full, nothing moved
+        got = self.wait_world({1: {"labels": ["me:awaiting-user"]}, 2: {"labels": ["me:awaiting-user"]}, 3: {"labels": ["me:awaiting-cos"]},
+                               4: {"labels": ["me:parked"], "parked_until": self.T0 + 9 * self.DAY}, 5: {"labels": ["me:parked"], "parked_until": self.T0 + 9 * self.DAY},
+                               6: {"labels": []}}, enabled=True)
+        self.assertEqual((got["open_asks"], got["active_asks"]), (6, 1))
+
+    def test_waiting_asks_never_wake_the_chief_of_staff_but_plain_stalls_do(self):
+        self.wait_world({1: {"labels": ["me:awaiting-user"]}, 2: {"labels": ["me:awaiting-user"]}}, enabled=True)
+        for hours in (4, 5, 6):
+            self.health.tick(self.health.Context(now=self.T0 + hours * 3600, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS, enabled=True),
+                                                 orchestrators={"o": {"charter": 1, "repo": "r", "busy": 0, "idle": 1, "messages": 0}},
+                                                 read_asks=lambda c, r: [dict({"repo": "r", "number": n}, **self.waits[n]) for n in sorted(self.waits)], cos="cos", wake=self.woken.append))
+        self.assertEqual(self.woken, [])
+        shutil.rmtree(str(self.state_dir)); self.state_dir.mkdir(mode=0o700)
+        self.wait_world({1: {"labels": []}, 2: {"labels": []}}, enabled=True)
+        self.assertEqual(len(self.woken), 1)
+
     def test_an_idle_pass_rewrites_nothing(self):
         self.asks = {1: [1]}
         self.tick(self.T0, {"o": self.orch(busy=1, charter=1)})
