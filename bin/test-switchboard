@@ -4980,7 +4980,7 @@ class TestLaunch(Base):
             (4006, 1, me + 1, 9 * H, "node --test"),                                       # another user's
             (os.getpid(), 1, me, 9 * H, "node --test"),                                    # this process
             (4007, 1, me, 9 * H, "node --test /x/opencode/test.js"),                       # names opencode
-            (4008, 1, me, 9 * H, "/usr/bin/python3 /Users/someone/Code/fleet-kit/bin/x.py"),   # a main checkout script: not on the allow-list
+            (4008, 1, me, 9 * H, "/usr/bin/python3 /opt/checkout/bin/x.py"),   # a main checkout script: not on the allow-list
             (4009, 1, me, 9 * H, "sleep 1000"),                                            # not on the allow-list
             (4010, 1, me, 9 * H, "node --test"),                                           # a bare node --test: no path to place it
             (4011, 1, me, 9 * H, "node --test %s/ssh/t.js" % tmp),                         # names ssh
