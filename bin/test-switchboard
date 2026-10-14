@@ -40585,7 +40585,8 @@ class TestDiskGuard(Base):
     def prune(self, *argv, exits=(0, 0, 0), outputs=("Total reclaimed space: 1.2GB", "Total reclaimed space: 300MB", "Total reclaimed space: 5MB"), docker=None, fake=None):
         fake = fake or FakePruneDocker(exits=exits, outputs=outputs)
         path = docker or self.fake_docker()
-        with captured() as (out, err):
+        with mock.patch.dict(os.environ), captured() as (out, err):
+            os.environ.pop("DOCKER_API_VERSION", None)   # a developer's own pin must not decide a test
             code = sb.main(["disk", "prune", "--docker", path, *argv], runner=fake, now=self.world.clock.now)
         self.last_fake = fake
         return code, out.getvalue(), err.getvalue(), [[path] + c for c in fake.prune_calls]
@@ -40636,7 +40637,10 @@ class TestDiskGuard(Base):
                 self.assertIn("volume prune: refused", out)
                 self.assertEqual(code, want)
         with mock.patch.dict(os.environ, {"DOCKER_API_VERSION": "1.41"}):
-            code, out, err, calls = self.prune(fake=FakePruneDocker(exits=(0, 0), outputs=("", "")))
+            fake = FakePruneDocker(exits=(0, 0), outputs=("", ""))
+            with captured() as (out_, err_):
+                sb.main(["disk", "prune", "--docker", self.fake_docker()], runner=fake, now=self.world.clock.now)
+            out, calls = out_.getvalue(), fake.prune_calls
         self.assertEqual(len(calls), 2)
         self.assertIn("DOCKER_API_VERSION=1.41", out)
         fake = FakePruneDocker(version="23.0.0", server_api="1.42", client_api="1.42", exits=(0, 0, 0), outputs=("", "", ""))
@@ -40645,7 +40649,9 @@ class TestDiskGuard(Base):
     def test_a_dry_run_on_an_unsafe_server_says_refused_and_does_not_say_it_would_run(self):
         code, out, err, calls = self.prune("--dry-run", fake=FakePruneDocker(version="22.0.1", server_api="1.41", client_api="1.41"))
         self.assertIn("volume prune: refused", out)
+        self.assertIn("the other two would still run", out)
         self.assertNotIn("would run docker volume prune", out)
+        self.assertNotIn("the other two ran", out)
 
     def test_a_dry_run_caps_its_list_counts_past_the_examine_limit_and_says_when_a_size_or_list_is_unreadable(self):
         many = tuple(("v%03d" % i, True, True, "1MB") for i in range(25))
@@ -40657,6 +40663,18 @@ class TestDiskGuard(Base):
         self.assertIn("candidate anonymous volumes: >=10 ", out)
         code, out, err, calls = self.prune("--dry-run", fake=FakePruneDocker(volumes=many, df_fails=True))
         self.assertIn("25 (size not read)", out)
+
+    def test_a_dry_run_whose_volume_list_is_unreadable_says_so_and_still_names_the_command(self):
+        real = FakePruneDocker()
+
+        def runner(argv, **kwargs):
+            if argv[1:3] == ["volume", "ls"]:
+                return subprocess.CompletedProcess(argv, 1, "", "daemon down")
+            return real(argv, **kwargs)
+        with captured() as (out, err):
+            code = sb.main(["disk", "prune", "--dry-run", "--docker", self.fake_docker()], runner=runner, now=self.world.clock.now)
+        self.assertIn("candidate anonymous volumes: not readable", out.getvalue())
+        self.assertIn("would run docker volume prune -f", out.getvalue())
 
     def test_a_failing_or_raising_volume_prune_is_said_exits_with_an_error_and_the_first_two_still_ran(self):
         fake = FakePruneDocker(exits=(0, 0, 1), outputs=("", "", ""))

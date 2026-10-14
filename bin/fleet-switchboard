@@ -18090,28 +18090,28 @@ def _version_pair(text):
 
 
 def docker_volume_prune_gate(docker, runner):
-    """(ok, why): is it safe to run `docker volume prune -f`? Only when ALL hold: the server is Docker (Engine or Desktop: a compatible program such as podman
+    """(ok, why, kind): is it safe to run `docker volume prune -f`? Only when ALL hold: the server is Docker (Engine or Desktop: a compatible program such as podman
     prunes every unused volume), its version is 23.0 or newer, the API both ends speak is 1.42 or newer (an older API makes the daemon prune EVERY unused
     volume, named ones too, whatever the server version), and `DOCKER_API_VERSION` does not pin it lower. Anything unreadable refuses."""
     try:
         done = runner([docker, "version", "--format", "{{.Server.Version}}|{{.Server.Platform.Name}}|{{.Server.APIVersion}}|{{.Client.APIVersion}}"],
                       capture_output=True, text=True, timeout=DISK_VOLUME_SECONDS, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
-        return False, "the docker server version could not be read"
+        return False, "the docker server version could not be read (is docker running?)", "unreadable"
     parts = (done.stdout or "")[:2000].strip().split("|") if done.returncode == 0 else []
     if len(parts) != 4 or _version_pair(parts[0]) is None or _version_pair(parts[2]) is None or _version_pair(parts[3]) is None:
-        return False, "the docker server version could not be read"
+        return False, "the docker server version could not be read (is docker running?)", "unreadable"
     version, platform, server_api, client_api = _version_pair(parts[0]), parts[1], _version_pair(parts[2]), _version_pair(parts[3])
     if not platform.strip().lower().startswith("docker"):
-        return False, "the server is %r, not Docker Engine or Docker Desktop" % _plain(platform, 40)
+        return False, "the server is %r, not Docker Engine or Docker Desktop (use Docker's own engine, or run the prune by hand)" % _plain(platform, 40), "unsafe"
     if version < DISK_VOLUME_MIN_ENGINE:
-        return False, "docker server %d.%d is older than 23.0, where `volume prune` removes named volumes too" % version
+        return False, "docker server %d.%d is older than 23.0, where `volume prune` removes named volumes too (upgrade docker)" % version, "unsafe"
     pinned = os.environ.get("DOCKER_API_VERSION", "").strip()
     if pinned and (_version_pair(pinned) is None or _version_pair(pinned) < DISK_VOLUME_MIN_API):
-        return False, "DOCKER_API_VERSION=%s pins the API below 1.42, where `volume prune` removes named volumes too" % _plain(pinned, 20)
+        return False, "DOCKER_API_VERSION=%s pins the API below 1.42, where `volume prune` removes named volumes too (unset it)" % _plain(pinned, 20), "unsafe"
     if min(server_api, client_api) < DISK_VOLUME_MIN_API:
-        return False, "the docker API in use is %d.%d, below 1.42, where `volume prune` removes named volumes too" % min(server_api, client_api)
-    return True, ""
+        return False, "the docker API in use is %d.%d, below 1.42, where `volume prune` removes named volumes too (upgrade the docker client or server)" % min(server_api, client_api), "unsafe"
+    return True, "", ""
 
 
 def _volume_bytes(text):
@@ -18156,9 +18156,9 @@ def anonymous_volumes_line(docker, runner):
 
 def disk_volume_step(docker, runner, dry_run):
     """The third prune step. Returns (status, lines). Refused unless the server is 23.0 or newer."""
-    ok, why = docker_volume_prune_gate(docker, runner)
+    ok, why, kind = docker_volume_prune_gate(docker, runner)
     if not ok:
-        return (EXIT_ERROR if "could not be read" in why else EXIT_OK), ["volume prune: refused: %s; the other two ran" % why]
+        return (EXIT_ERROR if kind == "unreadable" else EXIT_OK), ["volume prune: refused: %s; %s" % (why, "the other two would still run" if dry_run else "the other two ran")]
     lines = []
     if dry_run:
         try:
