@@ -1,0 +1,4 @@
+#!/bin/sh
+# test-cloud-worker: offline tests for the cloud-worker launcher (fake kubectl, fake clock). Prints RESULT: PASS.
+cd "$(dirname "$0")/.." || exit 1
+if python3 cloud/launcher/tests/test_cloud_worker.py "$@"; then echo "RESULT: PASS"; else echo "RESULT: FAIL"; exit 1; fi

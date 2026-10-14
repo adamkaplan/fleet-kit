@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""A fake kubectl for the offline tests: state is one JSON file (FAKE_KUBE_STATE). Supports only what cloud-worker uses."""
+import json, os, subprocess, sys
+HERE = os.path.dirname(os.path.abspath(__file__))
+path = os.environ["FAKE_KUBE_STATE"]
+st = json.load(open(path))
+args = sys.argv[1:]
+assert args[0] == "-n"
+args = args[2:]
+cmd = args[0]
+def save():
+    json.dump(st, open(path, "w"))
+def missing(what):
+    print('Error from server (NotFound): %s not found' % what, file=sys.stderr); sys.exit(1)
+if cmd == "apply":
+    obj = json.load(sys.stdin)
+    if st.get("fail_apply"):
+        print("Error from server (Forbidden): quota exceeded", file=sys.stderr); sys.exit(1)
+    st.setdefault("applied", []).append(obj)
+    if obj["kind"] == "Secret":
+        st.setdefault("secrets", {})[obj["metadata"]["name"]] = 1
+    else:
+        obj["status"] = {"phase": "Pending" if st.get("never_ready") else "Running",
+                         "conditions": [] if st.get("never_ready") else [{"type": "Ready", "status": "True"}]}
+        st.setdefault("pods", {})[obj["metadata"]["name"]] = obj
+    save()
+elif cmd == "get" and args[1] == "pod":
+    if args[2] not in st.get("pods", {}): missing('pods "%s"' % args[2])
+    print(json.dumps(st["pods"][args[2]]))
+elif cmd == "get" and args[1] == "pods":
+    print(json.dumps({"items": list(st.get("pods", {}).values())}))
+elif cmd == "annotate":
+    pod = st["pods"][args[2]]
+    for kv in args[4:]:
+        k, v = kv.split("=", 1); pod["metadata"]["annotations"][k] = v
+    save()
+elif cmd == "delete":
+    kind, name = args[1], args[2]
+    (st.get("pods" if kind == "pod" else "secrets", {})).pop(name, None)
+    save()
+elif cmd == "exec":
+    name, tool = args[1], args[3]
+    if tool == "fleet-worker-activity":
+        print(json.dumps(st["activity"][name]))
+    elif tool == "fleet-end-hook":
+        env = dict(os.environ, **st["hook_env"])
+        p = subprocess.run([sys.executable, os.path.join(HERE, "..", "end_hook.py")], env=env, capture_output=True, text=True)
+        sys.stdout.write(p.stdout)
+        if p.returncode:
+            sys.stderr.write(p.stdout); sys.exit(p.returncode)
+else:
+    sys.exit("fake kubectl: unsupported " + " ".join(args))
