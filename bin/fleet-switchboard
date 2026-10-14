@@ -203,12 +203,14 @@ def health_ingest_messages(engine, session, page):
 
 
 def health_write(engine, state, now):
-    """After a pass (#357): the pushes seen in the PR picture, and `health-records.json` (written only when its content changed, or on the heartbeat)."""
+    """End of every pass (#357, from `finish_pass`, so it runs whatever is configured): the pushes seen in the PR picture, when one exists
+    (`state` is the ci recorder's, or None: the engine's own is used), and `health-records.json` (written only when its content changed, or on the heartbeat)."""
     try:
         recorder = health_recorder(engine)
         if recorder is None or engine.state_dir is None:
             return
-        recorder.ingest_prs(state.pr_state)
+        state = state if state is not None else getattr(engine, "ci_record_state", None)
+        recorder.ingest_prs(getattr(state, "pr_state", None))
         records = load_health_records()
         body = recorder.body(records.read_tool_file(engine.state_dir))
         state_write(Path(engine.state_dir) / records.FILE, json.dumps(body, sort_keys=True), _without(body, "written_at"), HEARTBEAT_PR_STATE, nofollow=True)
@@ -9561,6 +9563,10 @@ def finish_pass(engine, discovery, report):
         publish_decisions(engine)
     except Exception as err:
         engine._failed("decisions", "decisions", err, report)
+    try:
+        health_write(engine, None, engine.now())   # #357: not tied to the GitHub ci recorder, which returns early on a fleet with no plan_gates
+    except Exception as err:
+        engine._failed("health-records", "health-records", err, report)
     schedule_judge_warm(engine, discovery)
 
 
@@ -17225,7 +17231,6 @@ def ci_record_pass(engine, now):
                                                                       "retry_in": delay})
     write_ci_record_status(engine, state, now, len(repos))
     write_pr_state(engine, state, now)
-    health_write(engine, state, now)
 
 
 # ---- `pr-state`: what the daemon already knows of a PR, for an agent that would otherwise poll GitHub in a loop. The daemon's ci recorder

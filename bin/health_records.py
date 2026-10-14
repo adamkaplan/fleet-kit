@@ -17,6 +17,7 @@ the newest assistant message of a session, so a message it never read is not cou
 
 import json
 import os
+import threading
 
 VERSION = 1
 FILE = "health-records.json"
@@ -119,9 +120,14 @@ class Recorder:
         self.heads = {}         # "owner/repo#N" -> last head sha
         self.pushes = {}        # "owner/repo" -> {hour: n}
         self.dirty = False
+        self.lock = threading.Lock()   # the feed's thread ingests messages while the pass thread builds the body
 
     def ingest_message(self, session, message):
         """One assistant message the daemon already read. True when it was new."""
+        with self.lock:
+            return self._ingest_message(session, message)
+
+    def _ingest_message(self, session, message):
         name = _name(session)
         if name is None or not isinstance(message, dict) or message.get("type") not in (None, "assistant"):
             return False
@@ -153,6 +159,10 @@ class Recorder:
 
     def ingest_prs(self, prs):
         """The pr-state picture (`{"owner/repo#N": {"head": sha, ...}}`): a CHANGED head, never a first sighting, is one push."""
+        with self.lock:
+            self._ingest_prs(prs)
+
+    def _ingest_prs(self, prs):
         if not isinstance(prs, dict):
             return
         now = self.clock()
@@ -178,6 +188,10 @@ class Recorder:
 
     def body(self, tool_body=None):
         """The derived file's content. Bounded by hours kept, agents kept and FILE_CAP."""
+        with self.lock:
+            return self._body(tool_body)
+
+    def _body(self, tool_body=None):
         now = self.clock()
         oldest = _hour(now) - (HOUR_KEEP - 1) * 3600
         for table in (self.hours, self.pushes):
