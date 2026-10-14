@@ -325,6 +325,23 @@ def health_write(engine, state, now):
         _health_fault(engine, "write", err)
 
 
+def load_reds():
+    """`reds`, bin/reds.py (#342), loaded by path like the other modules."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "reds.py")
+    held = sys.modules.get("reds")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("reds", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["reds"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("reds", None)
+        raise
+    return module
+
+
 def load_impact_floor():
     """The impact floor and hold table, bin/impact_floor.py (#179, L3), loaded by path like plan_check."""
     path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "impact_floor.py")
@@ -548,6 +565,7 @@ DEFAULTS = {
     "poll_seconds": 5,
     "cpu_guard": None,             # load over cores: None = defaults (high_ratio 3 for 5 minutes wakes the Chief of Staff once per episode); false = off; or {"high_ratio": n, "minutes": n}
     "disk_guard": None,            # free space of the state directory's volume: None = defaults (min_free_gb 50, hard_free_gb 10); false = off; or {"min_free_gb": n, "hard_free_gb": n}
+    "reds": None,                  # `reds` (#342): {"reference_events": {"owner/repo": ["merge_group", "schedule"]}}: the events whose runs on the default branch are "main's runs" (default: push)
     "heavy": None,                 # CPU slots for `heavy -- <command>` (full suites, e2e runs): None = 3 slots; or {"slots": n}
     "docker_reaper": True,         # the daily removal of EXPIRED labelled docker containers, networks and volumes (`disk reap-docker`): false is the kill switch
     "v2_events": "auto",           # the daemon's news of sessions: "auto" (the service's event stream, where the HTTP route exists; reads only what an event did not say) or "off" (the old reads)
@@ -692,6 +710,10 @@ def validate_config(raw, source="config"):
                 raise ConfigError("%s: %r value for %s must be a string" % (source, key, name))
         envs[key] = dict(env)
     validate_disk_guard(config["disk_guard"], source)
+    try:
+        load_reds().settings(config["reds"])
+    except ValueError as err:
+        raise ConfigError("%s: %s" % (source, err)) from None
     try:
         load_heavy_slots().settings(config["heavy"])
     except Exception as err:
@@ -19706,6 +19728,65 @@ def cmd_disk(args, runner, now):
 
 
 cmd_disk.direct = True   # an operator's command on the machine: no daemon start
+
+
+class _RedsReader:
+    """GET-only reads for `reds` through the repo's own gh account: JSON through the account gate (counted, paused when the limit is spent); the artifact as bytes
+    straight from the runner (not counted by the gate; its size was checked against the artifact list before this is called)."""
+
+    def __init__(self, config, runner, now, repo):
+        self.config, self.runner, self.repo = config, runner, repo
+        self.accounts = GhAccounts(config, runner, now)
+
+    def json(self, path):
+        done = self.accounts.read(self.runner, path, self.repo, self.config["call_timeout_seconds"], stdin=subprocess.DEVNULL)
+        if done.returncode != 0:
+            raise load_reds().RedsError("gh api %s: %s" % (path.split("?")[0], self.accounts.scrub(_one_line(done.stderr or done.stdout or "exit %d" % done.returncode, 120))))
+        try:
+            return json.loads(done.stdout)
+        except ValueError:
+            raise load_reds().RedsError("gh api %s: not JSON" % path.split("?")[0]) from None
+
+    def zip(self, path):
+        env = self.accounts.env_for(self.repo)
+        extra = {"env": env} if env is not None else {}
+        done = self.runner([self.config["gh"], "api", path], capture_output=True, timeout=max(60, self.config["call_timeout_seconds"]), stdin=subprocess.DEVNULL, **extra)
+        if done.returncode != 0:
+            err = done.stderr if isinstance(done.stderr, str) else (done.stderr or b"").decode("utf-8", "replace")
+            raise load_reds().RedsError("gh api %s: %s" % (path.split("?")[0], self.accounts.scrub(_one_line(err, 120)) or "exit %d" % done.returncode))
+        return done.stdout
+
+
+def cmd_reds(args, runner, now):
+    """`reds <owner/repo#N>`: classify a pull request's failing tests (#342): failing on main's latest run, flaky there, or new. Read only."""
+    module = load_reds()
+    match = re.fullmatch(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]{1,9})", args.pr)
+    if match is None:
+        sys.stderr.write("%s: reds: %r is not OWNER/REPO#N\n" % (PROG, _plain(args.pr, 80)))
+        return EXIT_USAGE
+    repo, number = match.group(1), int(match.group(2))
+    config = load_config()
+    events = (module.settings(config.get("reds")).get(repo)) or list(module.DEFAULT_EVENTS)
+    try:
+        cache_dir = ensure_state_dir()
+    except Exception:
+        cache_dir = None   # no cache is only more calls
+    reader = _RedsReader(config, runner, now, repo)
+    return module.run(reader, repo, number, events, cache_dir, now, sys.stdout)
+
+
+cmd_reds.direct = True   # reads GitHub on its own terms: no daemon start
+
+
+def add_reds_parsers(sub):
+    reds = sub.add_parser("reds", help="Classify a pull request's failing tests: failing on main's latest run, flaky there, or new (read only)",
+                          description="`reds OWNER/REPO#N` reads the `failing-tests` artifact (failing-tests.json v1) of the pull request's run and of main's last runs and "
+                                      "prints which failing names also fail on main's latest run, which are flaky there (2 or more of its last 5 usable runs) and which "
+                                      "are new. Main's runs are the runs of the repo's reference events on the default branch (config reds.reference_events, default push; "
+                                      "a merge_group reference is read by its gh-readonly-queue ref). Main is judged ONLY by main's own runs: the pull request's list "
+                                      "and its `complete` flag are its own claim. A run with no artifact, an expired one or complete=false is UNKNOWN, never passing. "
+                                      "Names match in full, else by a UNIQUE leaf (marked 'matched by name only'). Bounded calls, cached by run id; it writes nothing to GitHub.")
+    reds.add_argument("pr", help="OWNER/REPO#N")
 
 
 def cmd_heavy(args):
