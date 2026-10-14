@@ -15493,7 +15493,7 @@ def cmd_plan_template(args, runner, now):
     except (PlanInputError, ValueError, ConfigError, IntentError) as err:
         sys.stderr.write("%s: plan template: %s\n" % (PROG, _one_line(str(err), 300)))
         return EXIT_USAGE
-    print("\n".join(plan_check.template(clauses, source)))
+    print("\n".join(plan_check.template(clauses, _plain(source, 120) if source else None)))
     return EXIT_OK
 
 

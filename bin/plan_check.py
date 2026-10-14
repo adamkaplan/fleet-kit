@@ -902,9 +902,13 @@ def explain(code):
     return EXPLAIN.get(code)
 
 
+TEMPLATE_CLAUSE_MAX = 300   # characters of one clause printed by `plan template`
+
+
 def template(clauses, source=None):
     """The lines of a prefilled plan for an ask with `clauses` (the Done-when clause texts): format, size, the clauses and one scenario stub per
     clause plus an unchanged one. Placeholders are written `<...>`; replace each before `plan check`."""
+    clauses = [" ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(c)).split())[:TEMPLATE_CLAUSE_MAX] for c in clauses]   # the ask is untrusted text printed to a terminal (R-SEC-4)
     lines = ["## Plan (scenarios)", "", "plan-format: 2", "size: <S|M|L|XL> (<what makes it that size>)", "",
              "Done-when (copied from %s):" % (source or "the ask")]
     lines += ["(%d) %s" % (n, c) for n, c in enumerate(clauses, 1)]
@@ -912,7 +916,7 @@ def template(clauses, source=None):
               "Risks and rollback: <what could go wrong; how it is undone>", "Tier S light, claim pr.", "", "```yaml", "scenarios:"]
     for number, clause in enumerate(clauses, 1):
         lines += ["  - id: S%d" % number, "    covers: DW-%d" % number,
-                  "    text: <Given ..., when ..., then ...: %s>" % " ".join(clause.split())[:60],
+                  "    text: <Given ..., when ..., then ...: %s>" % clause[:60],
                   "    proof: test", "    pass: <an observable: exit status is 0, exactly 3 items, shows \"Ready\">",
                   "    discriminates: <a build that does X and so shows Y>", "    evaluator: ci"]
     lines += ["  - id: U1", "    covers: PC-1", "    text: <Given ..., when ..., then behaviour that must not change is unchanged>",

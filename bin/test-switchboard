@@ -23626,6 +23626,29 @@ class TestPlanExplain(Base):
         self.assertEqual(code, 0, result)
         self.assertIn("plan check: PASS", result)
 
+    def test_control_characters_and_long_text_in_the_ask_never_reach_the_terminal(self):
+        self.issue["body"] = "## Intent\nx\nDone when: (1) first \x1b]0;owned\x07 clause (2) %s\n" % ("y" * 900)
+        code, out, _ = self.cmd("template", "acme/app#7")
+        self.assertEqual(code, 0)
+        self.assertNotRegex(out, "[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+        self.assertIn("first", out)
+        self.assertLessEqual(max(len(l) for l in out.splitlines()), 340)
+
+    def test_template_with_neither_ask_nor_done_when_and_with_an_unreadable_ask_are_errors(self):
+        code, _, err = self.cmd("template")
+        self.assertEqual(code, 2)
+        self.assertIn("give the ask", err)
+        self.down = True
+        code, out, err = self.cmd("template", "acme/app#7")
+        self.assertEqual((code, out), (2, ""))
+
+    def test_explain_follows_a_warning_too(self):
+        path = self.plan_file(self.BAD.replace("proof: test", "proof: test").replace("evaluator: ci", "evaluator: adam"))
+        _, out, _ = self.cmd("check", "--file", path, "--done-when", "(1) a thing works", "--explain")
+        lines = out.splitlines()
+        at = next(i for i, l in enumerate(lines) if l.startswith("WARN") and "adam" in l)
+        self.assertTrue(lines[at + 1].strip().startswith("WHY evaluator-alias"))
+
     def test_an_ask_with_no_done_when_is_said_not_prefilled(self):
         self.issue["body"] = "## Intent\nx\n"
         code, out, err = self.cmd("template", "acme/app#7")
