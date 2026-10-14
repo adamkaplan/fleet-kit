@@ -4515,6 +4515,15 @@ The daemon makes ONE `disk_usage` of the volume holding the state directory per 
 </plist>
 ```
 
+### GitHub reads: conditional, counted, paused when the limit is spent
+
+Every read the daemon makes with `gh api` (the Intent reader's issue and parent reads, the hub's catch-up lists and single-item reads) goes through ONE gate per account (`GhAccounts.read`):
+
+- **Conditional reads** (the daemon only; a one-shot command or a test reads plainly, so its `gh` command line is the old one). The read asks with `-i` and keeps the answer's `ETag` (in memory, at most 400 answers and 8 MB; not for a moving `since=` window). The next read of the same path sends `If-None-Match`; GitHub's `304 Not Modified` is answered from the remembered body and does not count against the 5000/hour limit.
+- **Rate limit.** A 403 or 429 that says the limit is spent (`X-RateLimit-Remaining: 0`, `Retry-After`, or the message) pauses every non-essential read of THAT account until its reset (at least 30 s, at most about an hour). While paused no `gh` process is started: the read fails at once with `github: rate limited until HH:MM, reads paused`, which the callers already treat as GitHub being unavailable. `status` shows that line and the audit gets one `github.rate_limited` (and `github.rate_resumed`). Writes and the reads a delivery or a re-check before a write needs are never held back (`essential`). A plain read, with no header block, pauses too when gh says in words that the limit is spent. A 403 that is not the limit (a private repo) pauses nothing.
+- **Counter.** `status` shows `github calls/min by account: work 14 (issues/# 9, pulls 4, ...) (5-min average 11/min; 5 not modified)`, from `github-calls.json` (written by the daemon each pass).
+- **Intent cache.** An Intent is trusted for 300 s, and for 1800 s while the repo's webhook forwarder is live AND is the same forwarder that was running when the entry was read (a restart, a drop or a polling repo means 300 s again: what it missed in the gap is not trusted). Edited-issue and sub-issue events forget the entries at once.
+
 ### Docker: label convention and `disk reap-docker`
 
 A test stack or compose project an agent starts carries two labels: `fleet.owner=<agent>` and `fleet.expires=<epoch seconds>` (when it should be gone: the run's start plus a generous limit). In a compose file:
