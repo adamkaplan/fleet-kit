@@ -136,7 +136,7 @@ class AccountLookupFailed(Exception):
 
 
 READ_SUBCOMMANDS = {"view", "list", "status", "diff", "checks", "download", "watch", "get", "clone", "ls", "show", "tree", "search", "contents"}
-READ_GROUPS = {"search", "status", "browse", "completion", "help", "version", "auth", "config", "alias", "extension", "ext", "attestation", "agent-task"}
+READ_GROUPS = {"search", "status", "browse", "completion", "help", "version", "auth", "config", "alias", "extension", "ext", "attestation"}
 
 
 def command_words(args):
