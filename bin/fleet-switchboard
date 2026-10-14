@@ -5991,6 +5991,39 @@ def worktree_in_use(engine, path):
             where = pane.get(key)
             if isinstance(where, str) and where and (os.path.realpath(where) + "/").startswith(root):
                 return "herdr pane %s is working in it (%s): close it or leave that directory first" % (pane.get("pane_id"), key)
+    return worktree_session_in_use(engine, root)
+
+
+WORKTREE_SESSION_LOOKS = 200   # sessions read per removal; more keeps the worktree
+
+
+def worktree_session_in_use(engine, root):
+    """None when no NON-RETIRED agent's OpenCode session runs with its directory inside `root` (realpath, trailing "/"), else why it is kept. A session
+    can run in a worktree while its pane sits elsewhere. The agents are those the switchboard knows (the pane-health registry and the last discovery);
+    a session that cannot be read keeps the worktree, and a session v2 no longer has (404) is no one's directory."""
+    if engine.state_dir is None:
+        return None
+    retired = read_retired(engine.state_dir)
+    known = {}
+    for name, info in (read_pane_health(engine.state_dir).get("agents") or {}).items():
+        if isinstance(info, dict) and isinstance(info.get("session"), str):
+            known[name] = info["session"]
+    for name, obs in (getattr(getattr(engine, "discovery", None), "agents", None) or {}).items():
+        if getattr(obs, "session_id", None):
+            known[name] = obs.session_id
+    todo = sorted((name, sid) for name, sid in known.items() if name not in retired)
+    if len(todo) > WORKTREE_SESSION_LOOKS:
+        return "more than %d agent sessions: cannot say none runs in it" % WORKTREE_SESSION_LOOKS
+    for name, sid in todo:
+        try:
+            session = engine.v2.session_get(sid)
+        except V2Error as err:
+            if err.reason == "http" and err.status == 404:
+                continue
+            return "cannot read the session of %s (%s): cannot say it does not run in it" % (name, _one_line(str(err), 80))
+        where = ((session.get("location") or {}).get("directory") or session.get("directory")) if isinstance(session, dict) else None
+        if isinstance(where, str) and where and (os.path.realpath(where) + "/").startswith(root):
+            return "the session of %s (%s) runs in it: retire it first" % (name, sid)
     return None
 
 
