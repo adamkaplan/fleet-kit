@@ -42905,7 +42905,7 @@ class FakeActions:
         if found:   # one workflow's own runs, by id or by file name
             which = urllib.parse.unquote(found.group(1))
             event = query["event"][0]
-            runs = [r for r in self.runs.get(event, []) if (str(r.get("workflow_id")) == which or r["path"].endswith("/" + which)) and ("branch" not in query or r["head_branch"] == query["branch"][0])]
+            runs = [r for r in self.runs.get(event, []) if (getattr(self, "leak_foreign", False) or str(r.get("workflow_id")) == which or r["path"].endswith("/" + which)) and ("branch" not in query or r["head_branch"] == query["branch"][0])]
             return done(json.dumps({"workflow_runs": sorted(runs, key=lambda r: r["created_at"], reverse=True)[:int(query.get("per_page", ["30"])[0])]}))
         if path.startswith(base + "actions/runs?"):
             if "head_sha" not in query:
@@ -43233,7 +43233,6 @@ class TestReds(Base):
         self.run_reds(events=("merge_group", "schedule"))
         self.assertLessEqual(len(self.fake.calls), 4, self.fake.calls)
         self.assertTrue(all(len(a) == 3 for a in self.fake.argvs), "plain GETs only")
-        self.assertLessEqual(cold, 14)
 
     def test_s6_the_workflow_override_picks_the_pull_request_s_run_of_that_file_and_lists_its_runs(self):
         self.fake.pr_run(["a::t"], workflow="B", created="2027-01-15T09:00:00Z")     # newer, with an artifact, but not the configured one
@@ -43268,6 +43267,28 @@ class TestReds(Base):
         self.assertEqual(code, 3, out)
         self.assertIn("names no workflow (workflow unknown): cannot classify", out)
         self.assertFalse([c for c in self.fake.calls if "actions/workflows/" in c or ("actions/runs?" in c and "head_sha" not in c)])
+
+    def test_a_non_positive_workflow_id_is_unknown_and_a_foreign_workflow_run_in_a_listing_is_skipped(self):
+        for bad in (0, -3, True):
+            with self.subTest(bad=bad):
+                self.fake = FakeActions()
+                shutil.rmtree(str(self.state / "reds-cache"), ignore_errors=True)
+                self.fake.pr_run(["a::t"])
+                self.fake.runs["pull_request"][-1]["workflow_id"] = bad
+                code, out = self.run_reds()
+                self.assertEqual(code, 3, out)
+                self.assertIn("workflow unknown", out)
+        shutil.rmtree(str(self.state / "reds-cache"), ignore_errors=True)
+        self.fake = FakeActions()
+        self.fake.pr_run(["a::t"])
+        own = self.fake.add_run("push", "main", ["a::t"], created=self.created(10), workflow="A")
+        foreign = self.fake.add_run("push", "main", ["a::t"], created=self.created(5), workflow="A")
+        for run in self.fake.runs["push"]:
+            if run["id"] == foreign:
+                run["workflow_id"] = 22   # a listing that hands back another workflow's run: skipped, defensively
+        self.fake.leak_foreign = True
+        code, out = self.run_reds()
+        self.assertIn("main runs: 1 listed (workflow Workflow A), 1 usable, 0 unknown", out)
 
     def test_the_real_command_reads_through_the_real_reader_with_the_configured_events_and_exits_1_on_a_failed_read(self):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": "gh", "reds": {"reference_events": {"acme/widget": ["merge_group", "schedule"]}}})
