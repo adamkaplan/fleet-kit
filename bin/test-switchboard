@@ -4568,10 +4568,28 @@ class TestLaunch(Base):
         list(sb.PaneFacts.__call__(self.fact_source()))
         self.assertEqual({p.name: p.read_bytes() for p in self.world.state.iterdir() if p.is_file()}, before)
 
+    def test_dead_hint_agrees_with_the_reminder_wakes_last_report_and_edge_paths(self):
+        """One rule for 'the newest sign of life': the hint's and the reminder wake's must give the same time for the same entry."""
+        now = self.world.clock.now()
+        source = sb.ReminderFacts(self.world.state)
+        source.bind(self.engine)
+        entries = [{"state": "working", "at": now - 500}, {"state": "working", "at": now - 500, "send_to": {"boss": now - 20, "other": now - 5}},
+                   {"state": "working", "at": now + 9999}, {"send_to": {"boss": now - 90}}, {"state": "x", "at": "late"}, {}]
+        for number, entry in enumerate(entries):
+            (self.world.state / sb.LAST_REPORT_FILE).write_text(json.dumps({"worker": entry}))
+            sign = sb.dead_hint.last_sign(entry, now, "boss")
+            self.assertEqual(source.last_report("worker", "boss"), sign[1] if sign else None, number)
+        # the paths `status` takes: no boss known (a send to anyone counts), and a report dated far ahead counts for nothing
+        self.assertIn("a message sent 5s ago", sb.dead_hint.hint("w", {"send_to": {"x": now - 5}}, now))
+        self.assertIn("no report since launch", sb.dead_hint.hint("w", {"state": "done", "at": now + 3600}, now))
+
     def test_dead_hint_s8_a_500_character_state_or_name_is_bounded(self):
         now = self.world.clock.now()
         text = sb.dead_hint.hint("n" * 500, {"state": "s" * 500, "at": now - 60}, now)
         self.assertLessEqual(len(text), 240)
+        text = sb.dead_hint.hint("n" * 500, {"state": "s" * 500, "at": now - 60}, now)
+        self.assertIn("retire", text)       # the name is cut short, so the commands survive
+        self.assertIn("reattach", text)
 
     def test_retire_stops_dead_and_detached_reports_and_all_detached_skips_it_and_undo_brings_it_back(self):
         os.environ["HERDR_WORKSPACE_ID"] = "w1"
