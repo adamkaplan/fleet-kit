@@ -18065,13 +18065,100 @@ def add_impact_parsers(sub):
 
 # ---------------------------------------------------------------- `disk prune`: reclaim old docker build cache and images, and nothing else
 #
-# The two commands below are the ONLY ones it runs, with exactly these arguments: old build cache and old unused images (a week). Never a volume, never a
-# running container (`image prune -a` keeps every image a container uses), never `system prune`. It refuses when there is no docker. `--dry-run` prints the
-# commands and runs none. Nothing runs it on its own: the docs give a launchd snippet for a weekly run, not installed.
+# The two commands below, and the volume step after them, are the ONLY ones it runs, with exactly these arguments: old build cache and old unused images (a
+# week), then `docker volume prune -f` (never `-a`: docker's own anonymous-only prune, which removes only anonymous volumes no container references, stopped ones
+# included) and ONLY when the docker server is 23.0 or newer (before that, `volume prune` removed every unused volume, named ones too). Never a running
+# container (`image prune -a` keeps every image a container uses), never `system prune`. It refuses when there is no docker. `--dry-run` prints the commands and
+# runs none. Nothing runs it on its own: the docs give a launchd snippet for a weekly run, not installed.
 DISK_PRUNE_COMMANDS = (("docker", "builder", "prune", "-f", "--filter", "until=168h"),
                        ("docker", "image", "prune", "-a", "-f", "--filter", "until=168h"))
 DISK_PRUNE_TIMEOUT = 600
+DISK_VOLUME_PRUNE = ("volume", "prune", "-f")       # NEVER -a or --all
+DISK_VOLUME_MIN_ENGINE = (23, 0)                    # from here `volume prune` removes only ANONYMOUS volumes
+DISK_ANONYMOUS_LABEL = "com.docker.volume.anonymous"
+DISK_VOLUME_LIMIT = 200                             # volumes examined: past it the count is "at least"
+DISK_VOLUME_SECONDS = 30
+_SIZE_UNITS = {"B": 1, "KB": 10 ** 3, "MB": 10 ** 6, "GB": 10 ** 9, "TB": 10 ** 12}
 _RECLAIMED = re.compile(r"Total reclaimed space:\s*(\S+)", re.I)
+
+
+def docker_server_version(docker, runner):
+    """(major, minor) of the docker SERVER, or None when it cannot be read."""
+    try:
+        done = runner([docker, "version", "--format", "{{.Server.Version}}"], capture_output=True, text=True, timeout=DISK_VOLUME_SECONDS, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    found = re.match(r"\s*(\d{1,4})\.(\d{1,4})", done.stdout or "") if done.returncode == 0 else None
+    return (int(found.group(1)), int(found.group(2))) if found else None
+
+
+def _volume_bytes(text):
+    found = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([kKMGT]?B)\s*", text or "")
+    return int(float(found.group(1)) * _SIZE_UNITS[found.group(2).upper()]) if found else None
+
+
+def anonymous_volumes(docker, runner):
+    """(names, bytes or None, complete): the volumes docker lists as dangling (no container references them, stopped ones included) whose inspect shows the
+    anonymous label. Names are checked against docker's own shape, so nothing hostile is printed. `bytes` is the sum of their sizes from `docker system df -v`,
+    None when docker would not say; `complete` is False past DISK_VOLUME_LIMIT. Read only. Raises OSError when docker cannot answer."""
+    def run(argv):
+        done = runner([docker] + list(argv), capture_output=True, text=True, timeout=DISK_VOLUME_SECONDS, stdin=subprocess.DEVNULL)
+        if done.returncode != 0:
+            raise OSError("docker %s: exit %s: %s" % (" ".join(argv[:2]), done.returncode, _plain(done.stderr or done.stdout, 160)))
+        return done.stdout or ""
+    listed = [l.strip() for l in run(("volume", "ls", "-q", "-f", "dangling=true")).splitlines() if l.strip()]
+    ids = [l for l in listed if _DOCKER_ID["volume"].fullmatch(l)]
+    complete = len(ids) <= DISK_VOLUME_LIMIT
+    ids = ids[:DISK_VOLUME_LIMIT]
+    found = [r.get("Name") for r in (_docker_inspect(docker, runner, "volume", ids) if ids else [])
+             if isinstance(r.get("Labels"), dict) and DISK_ANONYMOUS_LABEL in r["Labels"] and isinstance(r.get("Name"), str)]
+    names = [n for n in found if _DOCKER_ID["volume"].fullmatch(n)]
+    size = None
+    if names:
+        try:
+            rows = json.loads(run(("system", "df", "-v", "--format", "{{json .Volumes}}")) or "[]")
+            sizes = {r.get("Name"): _volume_bytes(r.get("Size")) for r in rows if isinstance(r, dict)}
+            size = sum(sizes[n] for n in names) if all(sizes.get(n) is not None for n in names) else None
+        except (OSError, ValueError, subprocess.SubprocessError):
+            size = None
+    return names, size, complete
+
+
+def anonymous_volumes_line(docker, runner):
+    try:
+        names, size, complete = anonymous_volumes(docker, runner)
+    except (OSError, subprocess.SubprocessError) as err:
+        return "unmounted anonymous volumes: not readable (%s)" % _plain(str(err), 120)
+    return "unmounted anonymous volumes: %s%d (%s)" % ("" if complete else ">=", len(names), _human(size) if size is not None else "size not read")
+
+
+def disk_volume_step(docker, runner, dry_run):
+    """The third prune step. Returns (status, lines). Refused unless the server is 23.0 or newer."""
+    version = docker_server_version(docker, runner)
+    if version is None:
+        return EXIT_ERROR, ["volume prune: refused: the docker server version could not be read, and before 23.0 `volume prune` removes named volumes too"]
+    if version < DISK_VOLUME_MIN_ENGINE:
+        return EXIT_OK, ["volume prune: refused: docker server %d.%d is older than 23.0, where `volume prune` removes named volumes too; the other two ran" % version]
+    lines = []
+    if dry_run:
+        try:
+            names, size, complete = anonymous_volumes(docker, runner)
+            lines.append("candidate anonymous volumes: %s%d (%s)" % ("" if complete else ">=", len(names), _human(size) if size is not None else "size not read"))
+            lines.extend("  " + n for n in names[:20])
+            if len(names) > 20:
+                lines.append("  %d more" % (len(names) - 20))
+        except (OSError, subprocess.SubprocessError) as err:
+            lines.append("candidate anonymous volumes: not readable (%s)" % _plain(str(err), 120))
+        lines.append("would run %s (never -a)" % " ".join(["docker"] + list(DISK_VOLUME_PRUNE)))
+        return EXIT_OK, lines
+    try:
+        done = runner([docker] + list(DISK_VOLUME_PRUNE), capture_output=True, text=True, timeout=DISK_PRUNE_TIMEOUT, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as err:
+        return EXIT_ERROR, ["volume prune: failed: %s" % _plain(str(err), 160)]
+    if done.returncode != 0:
+        return EXIT_ERROR, ["volume prune: failed (exit %s): %s" % (done.returncode, _plain(done.stderr or done.stdout, 200))]
+    found = _RECLAIMED.search(done.stdout or "")
+    return EXIT_OK, ["volume prune: reclaimed %s" % (_plain(found.group(1), 40) if found else "nothing reported")]
 
 
 def cmd_disk_reap_docker(args, runner, now):
@@ -18108,9 +18195,11 @@ def cmd_disk_prune(args, runner, now):
         return EXIT_USAGE
     commands = [(docker,) + argv[1:] for argv in DISK_PRUNE_COMMANDS]
     if args.dry_run:
-        print("dry run: %s would run, in order, and nothing else (never a volume, a running container or `system prune`):" % PROG)
+        print("dry run: %s would run, in order, and nothing else (never `-a` on a volume, a running container or `system prune`):" % PROG)
         for argv in commands:
             print("  " + " ".join(shlex.quote(a) for a in argv))
+        for line in disk_volume_step(docker, runner, True)[1]:
+            print(line)
         return EXIT_OK
     before = disk_free(ensure_state_dir())
     status = EXIT_OK
@@ -18127,6 +18216,10 @@ def cmd_disk_prune(args, runner, now):
             status = EXIT_ERROR
         else:
             print("%s: reclaimed %s" % (" ".join(argv[1:3]), _plain(found.group(1), 40) if found else "nothing reported"))
+    volume_status, volume_lines = disk_volume_step(docker, runner, False)
+    for line in volume_lines:
+        print(line)
+    status = max(status, volume_status)
     after = disk_free(ensure_state_dir())
     if before and after:
         print("disk: %d GB free before, %d GB after" % (before[0] / 1e9, after[0] / 1e9))
@@ -18216,6 +18309,7 @@ def disk_report(args, runner, now, out=print):
                 lines.extend("  " + _plain(l, 160) for l in (done.stdout or "").splitlines()[:12])
         except (OSError, subprocess.SubprocessError) as err:
             lines.append("  docker: error: %s" % _plain(str(err), 160))
+        lines.append("  " + anonymous_volumes_line(docker, runner))
     lines.append("worktrees")
     registry = {p: e for p, e in read_worktrees(state).items() if isinstance(e, dict)}
     shown = sorted(registry.items(), key=lambda kv: (str(kv[1].get("agent")), kv[0]))
@@ -18280,12 +18374,13 @@ def add_disk_parsers(sub):
     disk.add_argument("--docker", default="docker", help="The docker executable the bare `disk` report asks (default: docker on PATH)")
     report = disk_sub.add_parser("report", help="what holds the disk: free space, docker usage, worktrees per agent, cache sizes, orphan candidates (read only; also a bare `disk`)")
     report.add_argument("--docker", default=argparse.SUPPRESS, help="The docker executable (default: docker on PATH)")
-    prune = disk_sub.add_parser("prune", help="docker builder prune and docker image prune -a, older than a week, and nothing else",
+    prune = disk_sub.add_parser("prune", help="docker builder prune, docker image prune -a (older than a week) and, on docker 23.0 or newer, docker volume prune -f (anonymous volumes only), and nothing else",
                                 description="Runs exactly `docker builder prune -f --filter until=168h` and `docker image prune -a -f --filter until=168h` and prints what "
-                                            "was reclaimed. Never a volume, never a running container, never `system prune`. Refuses without docker. NOTE: "
+                                            "was reclaimed, then (only when the docker server is 23.0 or newer, where it removes ANONYMOUS volumes no container references and nothing named) "
+                                            "`docker volume prune -f`, never `-a`. Never a running container, never `system prune`. Refuses without docker. NOTE: "
                                             "`until=168h` is the image's age, not its last use: a locally built image with no registry copy is removed too if no "
                                             "container uses it.")
-    prune.add_argument("--dry-run", action="store_true", help="Print the two commands and run neither")
+    prune.add_argument("--dry-run", action="store_true", help="Print the commands and the candidate anonymous volumes and run none of them")
     reap = disk_sub.add_parser("reap-docker", help="remove EXPIRED docker containers, networks and volumes that carry fleet.owner and fleet.expires labels",
                                description="Lists (the default) or, with --apply, removes docker containers (`rm -f`), networks and volumes that carry BOTH labels "
                                            "`fleet.owner=<agent>` and `fleet.expires=<epoch seconds>` and whose expiry has passed. Never an unlabelled object, a live "
