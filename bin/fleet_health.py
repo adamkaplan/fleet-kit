@@ -28,6 +28,7 @@ AUDIT_TAIL_BYTES = 8 << 20
 HISTORY_DAYS = 3                 # finished days of the hourly series kept for the replay
 READ_BUDGET = 10                 # GitHub reads of asks lists in any hour, for the whole fleet
 ASKS_FRESH_SECONDS = 3600        # a cached list of asks is re-read at most this often
+RETRY_SECONDS = 300              # after a failed read the same source is not tried again for this long
 ASKS_STALE_SECONDS = 3 * 3600    # a list older than this is not believed: the figure is not recorded
 DEFAULTS = {"enabled": False, "stalled_hours": 2.0, "stalled_asks": 2, "backlog_hours": 4.0}
 _REF = re.compile(r"report on (?:([\w.-]+)/)?([\w.-]*)#(\d+)")
@@ -320,7 +321,9 @@ def _resolve_charters(ctx, state, now, reads):
     repos = sorted({info.get("repo") for info in ctx.orchestrators.values() if info.get("repo")})
     for repo in repos:
         entry = cache.get(repo) or {}
-        if entry.get("at") and now - entry["at"] < ASKS_FRESH_SECONDS:
+        if (entry.get("at") and now - entry["at"] < ASKS_FRESH_SECONDS) or now - entry.get("tried", -1e9) < RETRY_SECONDS:
+            if entry.get("error") and now - entry.get("tried", -1e9) < RETRY_SECONDS:
+                problems.append(entry["error"])   # still failing: said every pass, read again only after the retry wait
             continue
         if getattr(ctx, "read_charters", None) is None or len(reads) + 2 > READ_BUDGET:
             continue
@@ -328,7 +331,9 @@ def _resolve_charters(ctx, state, now, reads):
         try:
             found = ctx.read_charters(repo)
         except Exception as err:
-            problems.append("%s: charters not readable (%s)" % (repo, str(err).splitlines()[0][:60] if str(err) else type(err).__name__))
+            text = "%s: charters not readable (%s)" % (repo, str(err).splitlines()[0][:60] if str(err) else type(err).__name__)
+            problems.append(text)
+            cache[repo] = dict(entry, tried=now, error=text)
             continue
         named = {}
         for number, body in found:
@@ -354,7 +359,9 @@ def _refresh_asks(ctx, state, now):
     for name in sorted(ctx.orchestrators, key=lambda n: cache.get(n, {}).get("at", 0)):
         info = dict(ctx.orchestrators[name], charter=charters.get(name))
         entry = cache.get(name) or {}
-        if entry.get("at") and now - entry["at"] < ASKS_FRESH_SECONDS:
+        if (entry.get("at") and now - entry["at"] < ASKS_FRESH_SECONDS) or now - entry.get("tried", -1e9) < RETRY_SECONDS:
+            if entry.get("error") and now - entry.get("tried", -1e9) < RETRY_SECONDS:
+                problems.append(entry["error"])
             continue
         if not info.get("charter") or len(reads) >= READ_BUDGET:
             continue
@@ -362,7 +369,9 @@ def _refresh_asks(ctx, state, now):
         try:
             found = ctx.read_asks(info["charter"], info.get("repo"))
         except Exception as err:   # an unreadable source is told, not guessed
-            problems.append("%s: asks not readable (%s)" % (name, str(err).splitlines()[0][:80] if str(err) else type(err).__name__))
+            text = "%s: asks not readable (%s)" % (name, str(err).splitlines()[0][:80] if str(err) else type(err).__name__)
+            problems.append(text)
+            cache[name] = dict(entry, tried=now, error=text)
             continue
         seen = {(a["repo"], a["number"]): a["first_seen"] for a in entry.get("list", [])}
         cache[name] = {"at": now, "list": [{"repo": a["repo"], "number": a["number"], "first_seen": seen.get((a["repo"], a["number"]), now)} for a in found]}

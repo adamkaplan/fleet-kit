@@ -31058,8 +31058,15 @@ class OrdersDeliveryCase(OrdersCase):
     def order_messages(self, name):
         return [a for a in self.world.admissions(name) if any(k.startswith("orders:") for k in a["keys"])]
 
+    LOAD_READS = ("/sub_issues", "/labels?", "&labels=")   # the load figure's own reads (#348): the asks of a charter, and the labels and labelled issues that find a charter
+
+    def load_gets(self):
+        return len([c for c in self.gh.calls if "--method" not in c and any(m in str(part) for part in c for m in self.LOAD_READS)])
+
     def gh_gets(self):
-        return len([c for c in self.gh.calls if "--method" not in c and not any("/sub_issues" in str(part) for part in c)])   # the load figure's own asks read (#348) is not the charter read
+        # Deliberate (#348): the load line runs every pass, alert on or off, and reads through the same reader: two reads per repository an hour to find charters
+        # (labels, then labelled issues) and the asks of each charter. They are counted by load_gets; the orders and Intent code's own reads are counted here.
+        return len([c for c in self.gh.calls if "--method" not in c and not any(m in str(part) for part in c for m in self.LOAD_READS)])
 
 
 class TestCompactionShape(unittest.TestCase):
@@ -31240,10 +31247,12 @@ class TestOrdersDelivery(OrdersDeliveryCase):
     def test_the_charter_is_read_once_per_cache_lifetime_not_once_per_pass(self):
         self.run_pass()
         first = self.gh_gets()
+        loads = self.load_gets()
         for _ in range(6):
             self.world.tick(10)
             self.run_pass()
         self.assertEqual(self.gh_gets(), first)
+        self.assertEqual(self.load_gets(), loads)   # the load line's reads are cached an hour too
 
     def test_it_reuses_the_judges_warmed_read_of_the_charter(self):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": FAKE_REPO,
@@ -46075,16 +46084,42 @@ class TestLoadAlert(Base):
         problems = json.loads((self.state_dir / "load.json").read_text())["problems"]
         self.assertTrue(any(p.startswith("no charter recorded for o0, o1") and p.endswith("and 3 more") for p in problems), problems)
 
-    def test_with_the_alert_off_there_are_no_reads_no_state_and_no_status_line(self):
+    def test_with_the_alert_off_the_line_is_still_kept_and_nobody_is_woken(self):
         seen = lambda name, fleet: types.SimpleNamespace(name=name, fleet=fleet, status="idle")
+        clock = [self.T0]
         api = []
-        intents = types.SimpleNamespace(repo="acme/widget", _api=lambda path, repo: api.append(path) or [], open_asks=lambda c, r: api.append("asks") or [])
-        discovery = types.SimpleNamespace(agents={"o": seen("o", {"role": "orchestrator", "charter": 3, "repo": "acme/widget"})})
+        intents = types.SimpleNamespace(repo="acme/widget", _api=lambda path, repo: api.append(path) or [],
+                                        open_asks=lambda c, r: [types.SimpleNamespace(repo="acme/widget", number=n) for n in (1, 2)])
+        discovery = types.SimpleNamespace(agents={"o": seen("o", {"role": "orchestrator", "charter": 3, "repo": "acme/widget"}), "cos": seen("cos", {"role": "chief-of-staff"})})
         for config in ({}, {"load_alert": self.health.validate(None, "x")}):
-            engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.T0, audit=None, actor="daemon", intents=intents, config=config)
+            shutil.rmtree(str(self.state_dir)); self.state_dir.mkdir(mode=0o700)
+            engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: clock[0], audit=None, actor="daemon", intents=intents, config=config)
+            sb.load_tick(engine, discovery)
+            clock[0] = self.T0 + 3 * 3600                    # two asks stalled 3 h: a crossing, with the alert off
             self.assertEqual(sb.load_tick(engine, discovery), [])
-        self.assertEqual(api, [])
-        self.assertFalse((self.state_dir / "load.json").exists())
+            self.assertEqual(sb.read_reminders(str(self.state_dir)), [])     # no wake
+            lines = self.health.status_lines(str(self.state_dir), clock[0])
+            self.assertEqual(len([l for l in lines if l.strip().startswith("o ")]), 1)   # the line stays
+            self.assertIn("alert off", lines[0])
+            clock[0] = self.T0
+        self.assertTrue(api)                                 # the charter reads feed the line
+
+    def test_a_failing_read_is_not_retried_every_pass_and_is_still_said(self):
+        calls = []
+        def fail(*a):
+            calls.append(a)
+            raise RuntimeError("gh is down")
+        orch = {"a": {"charter": 3, "repo": "r", "busy": 0, "idle": 1, "messages": 0}}
+        for at in (0, 10, 20, 290):
+            ctx = self.health.Context(now=self.T0 + at, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS), orchestrators=orch,
+                                      read_asks=fail, read_charters=fail, cos="cos", wake=self.woken.append)
+            self.health.tick(ctx)
+            problems = json.loads((self.state_dir / "load.json").read_text())["problems"]
+            self.assertTrue(any("asks not readable" in p for p in problems) and any("charters not readable" in p for p in problems), (at, problems))
+        self.assertEqual(len(calls), 2)                      # one charters read and one asks read, then nothing for 5 minutes
+        self.health.tick(self.health.Context(now=self.T0 + 400, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS), orchestrators=orch,
+                                             read_asks=fail, read_charters=fail, cos="cos", wake=self.woken.append))
+        self.assertEqual(len(calls), 4)                      # tried again after the wait
 
     def test_a_metadata_charter_that_names_another_agent_is_dropped_but_an_unnamed_one_is_kept(self):
         calls = []

@@ -13901,7 +13901,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         report["v2_link"] = v2_link_status_line(state, now())
         if config_ok:
             report["friction"] = friction_status_line(config, state)
-            report["load"] = load_fleet_health().status_lines(state, now()) if (config.get("load_alert") or {}).get("enabled") else []
+            report["load"] = load_fleet_health().status_lines(state, now())
         report["stopped_news"] = stopped_news_summary(state, now())
         line = external_status_line(config, state, now()) if config_ok else None
         if line is not None:   # only when external decisions are on: off prints nothing
@@ -21515,8 +21515,6 @@ def load_tick(engine, discovery):
         return []
     health, now = load_fleet_health(), engine.now()
     cfg = engine.config.get("load_alert") or dict(health.DEFAULTS)
-    if not cfg.get("enabled"):
-        return []   # off: no figures, no status line and no GitHub reads at all (the charter and asks reads are only for this feature)
     reminders = read_reminders(engine.state_dir)
     orchestrators = {}
     for name, seen in sorted(discovery.agents.items()):
