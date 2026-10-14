@@ -10705,8 +10705,35 @@ def triage_context(engine, repo, items, discovery):
                     charters.add(value)
     charters |= {n for n, i in items.items() if any(str(l).endswith(":orchestrator") for l in i["labels"])}
     asks = {n for n, i in items.items() if i["parent"] in charters}
-    work = {n for n, i in items.items() if i["parent"] in asks}
-    return {"charters": charters, "asks": asks, "chain": charters | asks | work, "owned": owned}
+    below, unresolved = triage_charter_descendants(items, charters)
+    return {"charters": charters, "asks": asks, "chain": charters | below, "owned": owned, "unresolved": unresolved}
+
+
+TRIAGE_ANCESTOR_DEPTH = 8   # #396: how many parent links the owner walk follows (a deeper chain ends the walk)
+
+
+def triage_charter_descendants(items, charters):
+    """(numbers whose parent chain reaches a charter within TRIAGE_ANCESTOR_DEPTH links, numbers whose chain leaves the issues read first).
+    Memory only: the parent links of the lists already held, so no read. A cycle or a too-deep chain ends the walk (neither). A parent that
+    is not among the issues read (another repo, closed) makes the answer unknown, never a missing owner."""
+    below, unresolved = set(), set()
+    for start in items:
+        seen, current = {start}, start
+        for _ in range(TRIAGE_ANCESTOR_DEPTH):
+            parent = items[current]["parent"]
+            if parent is None:
+                break                                  # the root of the chain: no charter above it
+            if parent in charters:
+                below.add(start)
+                break
+            if parent not in items:
+                unresolved.add(start)
+                break
+            if parent in seen:
+                break                                  # a cycle: the walk ends
+            seen.add(parent)
+            current = parent
+    return below, unresolved
 
 
 def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs, window_ok=True, captain_skip=False):
@@ -10722,7 +10749,8 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
     ask = number in ctx["asks"]
     if not item["pr"]:
         named = item.get("owner_body", False)   # an explicit `Owner: <name>` or `owned by <name>` line names the owner
-        if not item["assignees"] and not chain and not named and number not in ctx["owned"] and age_created >= sla["t1_days"]:
+        if not item["assignees"] and not chain and not named and number not in ctx["owned"] and number not in ctx["unresolved"] \
+                and age_created >= sla["t1_days"]:
             found["T1"] = {"created_days": round(age_created, 2)}
         group_missing = [g for g in required if not any(l in item["labels"] for l in (g if isinstance(g, list) else [g]))]
         if group_missing and age_created >= sla["t2_days"]:
