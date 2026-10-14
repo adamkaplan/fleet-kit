@@ -45992,6 +45992,59 @@ class TestLoadAlert(Base):
             self.assertEqual([r["numbers"] for r in self.health.read_moves(d, 0)], [[4]])
             self.assertLess((self.state_dir / "ask-moves.jsonl").stat().st_size, 2000)
 
+    def test_an_orchestrator_with_no_charter_says_so_and_one_with_only_an_issue_is_read(self):
+        asked = []
+        def read_asks(charter, repo):
+            asked.append(charter)
+            return [{"repo": "acme/widget", "number": 5}]
+        no_charter = {"charter": None, "repo": "acme/widget", "busy": 0, "idle": 1, "messages": 0}
+        ctx = self.health.Context(now=self.T0, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS, enabled=True),
+                                  orchestrators={"a": no_charter, "b": dict(no_charter, charter=34)}, read_asks=read_asks, cos="cos", wake=self.woken.append)
+        self.health.tick(ctx)
+        self.assertEqual(asked, [34])
+        problems = json.loads((self.state_dir / "load.json").read_text())["problems"]
+        self.assertIn("no charter recorded for a", problems)
+        self.assertIsNone(self.latest()["a"]["open_asks"])
+        self.assertEqual(self.latest()["b"]["open_asks"], 1)
+
+    def test_the_charter_is_the_issue_whose_yaml_names_the_agent_never_the_agents_own_issue(self):
+        seen = lambda name, fleet: types.SimpleNamespace(name=name, fleet=fleet, status="idle")
+        asked, api = [], []
+        labels = [{"name": "me:orchestrator"}, {"name": "me:other"}]
+        issues = [{"number": 34, "body": "```yaml\norchestrator: fleetkit\n```"}, {"number": 350, "body": "```yaml\norchestrator: fleet-insight\nworkspace: x\n```"},
+                  {"number": 9, "body": "no yaml"}]
+        def _api(path, repo):
+            api.append(path)
+            return labels if "/labels" in path else issues
+        intents = types.SimpleNamespace(repo="acme/widget", _api=_api, open_asks=lambda charter, repo: asked.append(charter) or [])
+        engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.T0, audit=None, actor="daemon", intents=intents,
+                                       config={"load_alert": self.health.validate({"enabled": True}, "x")})
+        discovery = types.SimpleNamespace(agents={
+            "fleet-insight": seen("fleet-insight", {"role": "orchestrator", "issue": 34, "repo": "acme/widget"}),   # its metadata issue is another orchestrator's charter
+            "fleetkit": seen("fleetkit", {"role": "orchestrator", "repo": "acme/widget"}),
+            "legacy": seen("legacy", {"role": "orchestrator", "charter": 7, "repo": "acme/widget"}),   # no yaml names it: the metadata charter is the fallback
+            "stray": seen("stray", {"role": "orchestrator", "issue": 9, "repo": "acme/widget"})})      # an issue that is no charter is never used
+        sb.load_tick(engine, discovery)
+        self.assertEqual(sorted(asked), [7, 34, 350])   # fleet-insight -> 350 (not 34); fleetkit -> 34; legacy -> 7
+        self.assertEqual(len(api), 2)                   # one labels read and one issues read for the repo
+        problems = json.loads((self.state_dir / "load.json").read_text())["problems"]
+        self.assertIn("no charter recorded for stray", problems)
+        sb.load_tick(engine, discovery)
+        self.assertEqual(len(api), 2)                   # cached for an hour
+
+    def test_charters_that_cannot_be_read_fall_back_and_are_said(self):
+        def read_charters(repo):
+            raise RuntimeError("gh is down")
+        no_charter = {"charter": 7, "repo": "acme/widget", "busy": 0, "idle": 1, "messages": 0}
+        self.asks = {7: [1]}
+        def read_asks(charter, repo):
+            return [{"repo": "acme/widget", "number": n} for n in self.asks[charter]]
+        ctx = self.health.Context(now=self.T0, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS), orchestrators={"a": no_charter},
+                                  read_asks=read_asks, read_charters=read_charters, cos="cos", wake=self.woken.append)
+        self.health.tick(ctx)
+        self.assertEqual(self.latest()["a"]["open_asks"], 1)
+        self.assertTrue(any("charters not readable" in p for p in json.loads((self.state_dir / "load.json").read_text())["problems"]))
+
     def test_an_idle_pass_rewrites_nothing(self):
         self.asks = {1: [1]}
         self.tick(self.T0, {"o": self.orch(busy=1, charter=1)})

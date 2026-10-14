@@ -306,11 +306,45 @@ def decisions_waiting(state_dir):
     return found
 
 
+def charter_agent(body):
+    """The agent a charter issue names: the `orchestrator: <name>` line of its yaml block, or None."""
+    found = re.search(r"^orchestrator:[ \t]*([A-Za-z0-9][A-Za-z0-9._-]*)[ \t]*$", body if isinstance(body, str) else "", re.M)
+    return found.group(1) if found else None
+
+
+def _resolve_charters(ctx, state, now, reads):
+    """{orchestrator: charter number or None} and problems. The charter is the open issue whose yaml block says `orchestrator: <its name>`
+    (one `ctx.read_charters(repo) -> [(number, body)]` per repo, cached an hour and counted in the read budget as 2), else the `charter` of its
+    fleet metadata; an issue number in its metadata is NEVER taken as the charter on its own (it may be another orchestrator's)."""
+    cache, problems, out = state.setdefault("charters", {}), [], {}
+    repos = sorted({info.get("repo") for info in ctx.orchestrators.values() if info.get("repo")})
+    for repo in repos:
+        entry = cache.get(repo) or {}
+        if entry.get("at") and now - entry["at"] < ASKS_FRESH_SECONDS:
+            continue
+        if getattr(ctx, "read_charters", None) is None or len(reads) + 2 > READ_BUDGET:
+            continue
+        reads.extend([now, now])
+        try:
+            found = ctx.read_charters(repo)
+        except Exception as err:
+            problems.append("%s: charters not readable (%s)" % (repo, str(err).splitlines()[0][:60] if str(err) else type(err).__name__))
+            continue
+        cache[repo] = {"at": now, "map": {a: n for n, body in found for a in [charter_agent(body)] if a}}
+    for name, info in ctx.orchestrators.items():
+        mapped = ((cache.get(info.get("repo")) or {}).get("map") or {}).get(name)
+        out[name] = mapped if mapped is not None else info.get("charter")
+    return out, problems
+
+
 def _refresh_asks(ctx, state, now):
     """Re-read at most READ_BUDGET asks lists an hour (the oldest first); a failed read keeps the cached list and is told."""
     cache, reads, problems = state.setdefault("asks", {}), [t for t in state.get("reads", []) if now - t < 3600], []
+    charters, more = _resolve_charters(ctx, state, now, reads)
+    problems.extend(more)
+    state["charter_of"] = {n: c for n, c in charters.items() if c is not None}
     for name in sorted(ctx.orchestrators, key=lambda n: cache.get(n, {}).get("at", 0)):
-        info = ctx.orchestrators[name]
+        info = dict(ctx.orchestrators[name], charter=charters.get(name))
         entry = cache.get(name) or {}
         if entry.get("at") and now - entry["at"] < ASKS_FRESH_SECONDS:
             continue
@@ -345,13 +379,16 @@ def tick(ctx):
         problems.append("decisions: decisions.json cannot be read")
     day, hour = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d"), datetime.fromtimestamp(now, timezone.utc).strftime("%H")
     series, sent, episodes, latest = state.get("series", {}), [], state.get("episodes", {}), {}
+    unchartered = []
     for name in sorted(ctx.orchestrators):
         info, entry = ctx.orchestrators[name], (state.get("asks") or {}).get(name)
         asks = None
         if entry and now - entry.get("at", 0) < ASKS_STALE_SECONDS:
             asks = entry["list"]
-        elif info.get("charter"):
+        elif (state.get("charter_of") or {}).get(name):
             problems.append("%s: no recent list of its open asks" % name) if (name + ": ") not in " ".join(problems) else None
+        else:
+            unchartered.append(name)
         fig = figures(name, {"asks": asks, "busy": info["busy"], "idle": info["idle"], "messages": info["messages"],
                              "decisions": None if waiting is None else waiting.get(name, 0)}, rows, now, ctx.cfg)
         latest[name] = fig
@@ -371,6 +408,8 @@ def tick(ctx):
             sent.append((name, text))
         elif text:
             episodes[name] = before   # not sent (off, or no Chief of Staff to tell): the episode is still open
+    if unchartered:   # no charter issue is recorded in its fleet metadata: its asks cannot be found, said once for all of them
+        problems.append("no charter recorded for %s" % ", ".join(unchartered[:6]) + (" and %d more" % (len(unchartered) - 6) if len(unchartered) > 6 else ""))
     state.pop("at", None)
     state.update({"series": {n: series[n] for n in latest}, "episodes": {n: episodes.get(n) for n in latest},
                   "latest": latest, "problems": problems, "alert": bool(ctx.cfg["enabled"])})

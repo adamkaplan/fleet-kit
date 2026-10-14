@@ -21522,7 +21522,7 @@ def load_tick(engine, discovery):
         if fleet.get("role") != "orchestrator":
             continue
         coders = [o for o in discovery.agents.values() if (o.fleet or {}).get("reports_to") == name and (o.fleet or {}).get("role") == "coder"]
-        orchestrators[name] = {"charter": fleet.get("charter") if _is_issue_number(fleet.get("charter")) else None,
+        orchestrators[name] = {"charter": fleet.get("charter") if _is_issue_number(fleet.get("charter")) else None,   # a fallback: the charter is found by the yaml that names the agent
                                "repo": _fleet_repo(fleet, engine.config) or (engine.intents.repo if engine.intents is not None else None),
                                "busy": sum(1 for c in coders if c.status == "working"), "idle": sum(1 for c in coders if c.status == "idle"),
                                "messages": sum(1 for r in reminders if r.get("to") == name and isinstance(r.get("at"), (int, float)) and r["at"] <= now)}
@@ -21533,12 +21533,23 @@ def load_tick(engine, discovery):
             raise RuntimeError("no ask repo is configured")
         return [{"repo": issue.repo or repo, "number": issue.number} for issue in engine.intents.open_asks(charter, repo)]
 
+    def read_charters(repo):
+        """The open issues of `repo` that carry the orchestrator label (whatever the owner's prefix) as [(number, body)]: two bounded reads."""
+        if engine.intents is None:
+            raise RuntimeError("no ask repo is configured")
+        labels = engine.intents._api("repos/%s/labels?per_page=100" % repo, repo)
+        names = [l.get("name") for l in labels if isinstance(l, dict) and str(l.get("name")).endswith(":orchestrator")] if isinstance(labels, list) else []
+        if not names:
+            return []
+        found = engine.intents._api("repos/%s/issues?state=open&per_page=100&labels=%s" % (repo, urllib.parse.quote(names[0])), repo)
+        return [(i["number"], i.get("body") or "") for i in found if isinstance(i, dict) and isinstance(i.get("number"), int)] if isinstance(found, list) else []
+
     def wake(text):
         add_reminder(engine.state_dir, cos, now, now, text)
         if engine.audit is not None:
             engine.audit.append(engine.actor, "load.alert", cos, {"text": _one_line(text, 400)})
 
-    return health.tick(health.Context(now=now, state_dir=engine.state_dir, cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, cos=cos, wake=wake))
+    return health.tick(health.Context(now=now, state_dir=engine.state_dir, cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, read_charters=read_charters, cos=cos, wake=wake))
 
 
 def cmd_load_replay(args, runner, now):
