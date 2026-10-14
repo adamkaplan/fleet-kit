@@ -40350,12 +40350,14 @@ class TestTempJanitor(Base):
         ok, why = self.jan.safe_dir(outside)
         self.assertFalse(ok)
         self.assertIn("not under the system temp directory", why)
-        with mock.patch.object(tempfile, "gettempdir", lambda: str(self.home)):   # a system temp directory the test owns: the reason does not depend on who owns /tmp
-            ok, why = self.jan.safe_dir(self.home)
+        systmp = self.home / "systmp"
+        (systmp / "opencode").mkdir(parents=True)
+        with mock.patch.object(tempfile, "gettempdir", lambda: str(systmp)):   # a system temp directory the test owns: the reasons do not depend on who owns /tmp
+            ok, why = self.jan.safe_dir(systmp)
             self.assertFalse(ok)
             self.assertIn("is the system temp directory itself", why)
-            self.assertTrue(self.jan.safe_dir(self.temp)[0])
-        self.assertTrue(self.jan.safe_dir(self.temp)[0])
+            self.assertTrue(self.jan.safe_dir(systmp / "opencode")[0])
+            self.assertIn("not under the system temp directory", self.jan.safe_dir(self.temp)[1])
         lines, removed, kept = self.jan.run(outside, self.world.state, self.now, self.jan.settings({}), True, lambda *a: None)
         self.assertEqual((removed, lines[0][:8]), (0, "refused:"))
 
