@@ -2948,6 +2948,7 @@ class V2Reads:
 
     A read just BEFORE A WRITE is never served from here (`fresh=True`): invariant 4 holds. `v2_cache_seconds` 0 remembers nothing."""
 
+    LIST_PAGE = 100   # one `session.list` page: the records of up to this many sessions in ONE call
     PROMPT_READ = 10
     PROMPT_READ_WIDE = 50   # when the newest PROMPT_READ user messages are all the fleet's: one wider read, then stop
 
@@ -2969,9 +2970,35 @@ class V2Reads:
         self.engine = engine
         self.sessions, self.prompts, self.inboxes, self.compactions = {}, {}, {}, {}   # session id -> remembered answer; memory only
         self.pass_fills, self.deferred, self.minute = 0, 0, collections.deque()
+        self.listing, self.listed_at, self.pass_lists = {}, None, 0   # the last `session.list` page: session id -> record, and when it was read
 
     def begin_pass(self):
-        self.pass_fills, self.deferred = 0, 0
+        self.pass_fills, self.deferred, self.pass_lists = 0, 0, 0
+
+    def _list_due(self, now):
+        """True when this pass may still read the shared list: its one call is not spent and the last page is half a cache lifetime old."""
+        return (not self.engine.light and self.ttl() > 0 and self.pass_lists == 0
+                and (self.listed_at is None or now - self.listed_at >= self.ttl() / 2.0))
+
+    def listed(self, session_id, now):
+        """The record of a session from ONE shared `session.list` call, or None (then the caller reads that session alone). The list is read at most
+        once per pass and once per half of `v2_cache_seconds`, and counts as one background read however many sessions it refreshes: a fleet of N
+        agents costs one call where it cost N `session.get`. A failed list is not retried before that half is up. Sessions past the page, or a
+        session the list does not hold, are read one by one as before."""
+        ttl = self.ttl()
+        if self.engine.light or ttl <= 0:
+            return None
+        if (self.listed_at is None or now - self.listed_at >= ttl / 2.0) and self.pass_lists == 0 and self.may_fill(now):
+            self.pass_lists += 1
+            self.listed_at = now
+            try:
+                page, _ = self.engine.v2.session_list_page(None, None, self.LIST_PAGE)
+                self.listing = {row["id"]: row for row in page if isinstance(row, dict) and isinstance(row.get("id"), str)}
+                self.filled(now)
+            except V2Error:
+                self.listing = {}
+        found = self.listing.get(session_id)
+        return found if self.listed_at is not None and found is not None else None
 
     def ttl(self):
         return self.engine.config["v2_cache_seconds"]
@@ -3003,19 +3030,30 @@ class V2Reads:
     def session_info(self, session_id, status, now, fresh=False):
         """`session.get`, remembered. `status` is what herdr says the agent is doing now: a change reads again at once."""
         entry, ttl = self.sessions.get(session_id), self.ttl()
+        changed = False
         if entry is not None and not fresh and ttl > 0:
             info, at, was = entry
+            changed = was != status
             if was == status:
                 if now - at < ttl:
                     return info
-                if not self.may_fill(now):
+                if not self.may_fill(now) and not self._list_due(now):
                     self.deferred += 1
                     return info
-            elif now - at < STATUS_REREAD_GAP or not self.may_fill(now):
+            elif now - at < STATUS_REREAD_GAP or (not self.may_fill(now) and not self._list_due(now)):
                 # herdr says the state changed, but this agent was read a moment ago (a flapping agent is read at most once per gap) or the
                 # budget is spent: keep what is remembered and try again at the next pass; a read before a write is fresh whatever this says
                 self.deferred += 1
                 return info
+        if not fresh:
+            row = self.listed(session_id, now)
+            # a row no newer than what is remembered says nothing new, and a row read before herdr's state change cannot show it: those are read alone
+            if row is not None and (entry is None or (self.listed_at or 0) > entry[1]) and (not changed or self.listed_at == now):
+                self.sessions[session_id] = (row, self.listed_at, status)   # aged from when the list was read, so a record never outlives `v2_cache_seconds`
+                return row
+            if entry is not None and not self.may_fill(now):
+                self.deferred += 1
+                return entry[0]
         info = self.engine.v2.session_get(session_id) or {}
         if ttl > 0:
             self.sessions[session_id] = (info, now, status)
