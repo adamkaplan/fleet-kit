@@ -245,7 +245,7 @@ class TestConfig(Base):
             "awaiting_cos_label": None, "decisions_cos_grace_seconds": 300, "cos_orders_file": None,  # PR 18
             "pr_notice_hold_minutes": 0,  # PR notices
             "intent_repo": None, "intent_required": True,
-            "gh_users": {}, "github_poll_seconds": 60,  # PR 15
+            "gh_users": {}, "github_poll_seconds": 60, "intent_live_silence_minutes": 10,  # PR 15
             "classifier_mode": "shadow", "busy_poll_seconds": 1,  # PR 8
             "policy": sb.POLICY_DEFAULTS,  # PR 9
             **sb.V1_MOVE_DEFAULTS})  # PR 10: pinned in TestImportV1Config
@@ -4500,6 +4500,97 @@ class TestLaunch(Base):
     def kill(self, name):
         del self.world.herdr.panes[self.world.panes[name]]
 
+    def dead_worker(self, entry="absent"):
+        """A DEAD worker (its pane is gone) under a boss, with the given last-reports.json entry; a chief of staff to be woken."""
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.worker()
+        if entry != "absent":
+            (self.world.state / sb.LAST_REPORT_FILE).write_text(json.dumps({"worker": entry}) if entry is not None else "{not json")
+        self.health()
+        self.kill("worker")
+        for n in range(sb.PANE_MISSING_PASSES):
+            self.health(n)
+        self.assertEqual(sb.read_pane_health(self.world.state)["states"]["worker"]["state"], "dead")
+
+    def test_dead_hint_s1_status_says_the_last_report_and_both_hints(self):
+        now = self.world.clock.now()
+        self.dead_worker({"state": "working", "at": now - 3 * 3600})
+        lines = "\n".join(sb.pane_health_status_lines(self.world.state, now))
+        self.assertIn("last report: working 3h ago", lines)   # a final done would have retired it already
+        self.assertIn("fleet-switchboard retire worker", lines)
+        self.assertIn("fleet-switchboard reattach worker", lines)
+
+    def test_dead_hint_s2_the_wake_says_no_report_since_launch_and_both_hints(self):
+        self.dead_worker()
+        facts = [f for f in sb.PaneFacts.__call__(self.fact_source()) if "worker is DEAD" in f.summary]
+        self.assertEqual(len(facts), 1)
+        for text in ("no report since launch", "fleet-switchboard retire worker", "fleet-switchboard reattach worker"):
+            self.assertIn(text, facts[0].summary)
+
+    def test_dead_hint_s3_the_newer_of_a_report_and_a_send_to_the_boss_is_shown(self):
+        now = self.world.clock.now()
+        sign = sb.dead_hint.hint("worker", {"state": "working", "at": now - 7200, "send_to": {"boss": now - 300, "other": now - 10}}, now, "boss")
+        self.assertIn("last report: a message sent 5m ago", sign)
+        self.assertNotIn("working", sign)
+        self.assertIn("working 2h ago", sb.dead_hint.hint("worker", {"state": "working", "at": now - 7200, "send_to": {"boss": now + 9999}}, now, "boss"))
+
+    def test_dead_hint_s4_detached_and_other_lines_do_not_change(self):
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.detach()
+        self.health()
+        self.health(1)
+        lines = sb.pane_health_status_lines(self.world.state)
+        self.assertEqual(len(lines), 2)
+        self.assertIn("platform DETACHED", lines[0])
+        self.assertEqual(lines[1], "        run `fleet-switchboard reattach <name>`")
+        self.assertNotIn("last report", "\n".join(lines))
+        facts = [f for f in sb.PaneFacts.__call__(self.fact_source())]
+        self.assertNotIn("last report", facts[0].summary)
+
+    def test_dead_hint_s5_both_cases_carry_both_hints_within_the_bound(self):
+        now = self.world.clock.now()
+        for entry in ({"state": "done", "at": now - 60}, None):
+            text = sb.dead_hint.hint("alpha", entry, now)
+            self.assertIn("fleet-switchboard retire alpha", text)
+            self.assertIn("fleet-switchboard reattach alpha", text)
+            self.assertLessEqual(len(text), 240)
+
+    def test_dead_hint_s6_a_corrupt_file_says_no_report_since_launch(self):
+        self.dead_worker(None)
+        lines = "\n".join(sb.pane_health_status_lines(self.world.state, self.world.clock.now()))
+        self.assertIn("no report since launch", lines)
+
+    def test_dead_hint_s7_nothing_is_written(self):
+        now = self.world.clock.now()
+        self.dead_worker({"state": "working", "at": now - 3 * 3600})
+        before = {p.name: p.read_bytes() for p in self.world.state.iterdir() if p.is_file()}
+        sb.pane_health_status_lines(self.world.state, now)
+        list(sb.PaneFacts.__call__(self.fact_source()))
+        self.assertEqual({p.name: p.read_bytes() for p in self.world.state.iterdir() if p.is_file()}, before)
+
+    def test_dead_hint_agrees_with_the_reminder_wakes_last_report_and_edge_paths(self):
+        """One rule for 'the newest sign of life': the hint's and the reminder wake's must give the same time for the same entry."""
+        now = self.world.clock.now()
+        source = sb.ReminderFacts(self.world.state)
+        source.bind(self.engine)
+        entries = [{"state": "working", "at": now - 500}, {"state": "working", "at": now - 500, "send_to": {"boss": now - 20, "other": now - 5}},
+                   {"state": "working", "at": now + 9999}, {"send_to": {"boss": now - 90}}, {"state": "x", "at": "late"}, {}]
+        for number, entry in enumerate(entries):
+            (self.world.state / sb.LAST_REPORT_FILE).write_text(json.dumps({"worker": entry}))
+            sign = sb.dead_hint.last_sign(entry, now, "boss")
+            self.assertEqual(source.last_report("worker", "boss"), sign[1] if sign else None, number)
+        # the paths `status` takes: no boss known (a send to anyone counts), and a report dated far ahead counts for nothing
+        self.assertIn("a message sent 5s ago", sb.dead_hint.hint("w", {"send_to": {"x": now - 5}}, now))
+        self.assertIn("no report since launch", sb.dead_hint.hint("w", {"state": "done", "at": now + 3600}, now))
+
+    def test_dead_hint_s8_a_500_character_state_or_name_is_bounded(self):
+        now = self.world.clock.now()
+        text = sb.dead_hint.hint("n" * 500, {"state": "s" * 500, "at": now - 60}, now)
+        self.assertLessEqual(len(text), 240)
+        text = sb.dead_hint.hint("n" * 500, {"state": "s" * 500, "at": now - 60}, now)
+        self.assertIn("retire", text)       # the name is cut short, so the commands survive
+        self.assertIn("reattach", text)
+
     def test_retire_stops_dead_and_detached_reports_and_all_detached_skips_it_and_undo_brings_it_back(self):
         os.environ["HERDR_WORKSPACE_ID"] = "w1"
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
@@ -6441,6 +6532,121 @@ class TestGithubVerification(Base):
         self.assertNotIn("==", inspect.getsource(sb.signature_matches))
 
 
+class TestPrEventFill(Base):
+    """#354: `pr-state` is filled from the forwarder's verified pull_request events: a PR of a watched repo (not under plan_gates) is known from open."""
+
+    def setUp(self):
+        super().setUp()
+        self.rig = GithubRig(self)
+        self.hub, self.gh, self.engine = self.rig.hub, self.rig.gh, self.rig.world.engine
+        self.hub.tick()
+        self.secret = self.gh.procs[-1].secret
+        self.ref = "%s#31" % GH_REPO
+
+    def event(self, action="opened", number=31, head="a" * 40, labels=(), draft=False, merged=False, state="open", secret=None, repo=GH_REPO, signature="auto", raw=None):
+        payload = {"action": action, "number": number, "repository": {"full_name": repo},
+                   "pull_request": {"number": number, "head": {"sha": head}, "draft": draft, "merged": merged, "state": state,
+                                    "labels": [{"name": n} for n in labels]}}
+        body = raw if raw is not None else json.dumps(payload).encode()
+        headers = {"X-GitHub-Event": "pull_request", "X-GitHub-Delivery": "d-%s-%s" % (action, number)}
+        if signature == "auto":
+            signature = sb.sign_body(secret or self.secret, body)
+        if signature is not None:
+            headers["X-Hub-Signature-256"] = signature
+        return self.hub.receive("/github", headers, body)
+
+    def snapshot_entry(self, ref=None):
+        sb.pr_events_pass(self.engine, self.rig.world.clock.now())
+        body, why = sb.pr_state_read(self.rig.world.state, self.rig.world.clock.now())
+        self.assertIsNone(why)
+        return body["prs"].get(ref or self.ref)
+
+    def test_an_opened_event_for_a_never_seen_pr_is_known_with_head_draft_and_labels_and_no_gh_call(self):
+        calls = len(self.gh.api_calls)
+        self.assertEqual(self.event("opened", labels=("bug", "ready")), (202, "accepted"))
+        entry = self.snapshot_entry()
+        self.assertEqual((entry["state"], entry["head"], entry["labels"]), ("open", "a" * 40, ["bug", "ready"]))
+        body, _ = sb.pr_state_read(self.rig.world.state, self.rig.world.clock.now())
+        line = sb.pr_state_line(sb.pr_state_view(self.ref, body, [], self.rig.world.clock.now()))
+        self.assertIn("open", line)
+        self.assertIn("head aaaaaaaa", line)
+        self.assertEqual(len(self.gh.api_calls), calls, "no read of GitHub")
+        self.rig.world.tick(sb.PR_STATE_WRITE_GAP + 1)
+        self.event("opened", number=32, draft=True)
+        self.assertEqual(self.snapshot_entry("%s#32" % GH_REPO)["state"], "draft")
+
+    def test_later_events_update_the_entry_in_turn(self):
+        self.event("opened")
+        self.rig.world.tick(sb.PR_STATE_WRITE_GAP + 1)
+        self.event("synchronize", head="b" * 40)
+        self.assertEqual(self.snapshot_entry()["head"], "b" * 40)
+        self.rig.world.tick(sb.PR_STATE_WRITE_GAP + 1)
+        self.event("labeled", head="b" * 40, labels=("hold",))
+        self.assertEqual(self.snapshot_entry()["labels"], ["hold"])
+        self.rig.world.tick(sb.PR_STATE_WRITE_GAP + 1)
+        self.event("converted_to_draft", head="b" * 40, labels=("hold",), draft=True)
+        self.assertEqual(self.snapshot_entry()["state"], "draft")
+        self.rig.world.tick(sb.PR_STATE_WRITE_GAP + 1)
+        self.event("closed", head="b" * 40, merged=True, state="closed")
+        entry = self.snapshot_entry()
+        self.assertEqual(entry["state"], "merged")
+        self.assertIn("webhook", entry["why"])
+
+    def test_an_examination_at_the_same_head_is_kept_and_a_new_head_clears_it(self):
+        self.event("opened")
+        state = self.engine.__dict__.setdefault("ci_record_state", sb.CiRecordState())
+        self.snapshot_entry()
+        state.pr_state[self.ref].update({"checks": [{"name": "t", "conclusion": "success"}, {"name": "u", "conclusion": "success"}], "ci": "green", "examined_head": "a" * 40, "examined_at": 1})
+        self.rig.world.tick(sb.PR_STATE_WRITE_GAP + 1)
+        self.event("labeled", labels=("x",))        # the same head
+        self.assertEqual(len(self.snapshot_entry()["checks"]), 2)
+        self.rig.world.tick(sb.PR_STATE_WRITE_GAP + 1)
+        self.event("synchronize", head="c" * 40)    # a new head
+        self.assertNotIn("checks", self.snapshot_entry())
+
+    def test_an_unsigned_a_foreign_and_a_malformed_event_change_nothing(self):
+        self.assertEqual(self.event("opened", signature=None)[0], 401)
+        self.assertEqual(self.event("opened", signature="sha256=00")[0], 401)
+        self.assertEqual(self.event("opened", repo="other/unwatched")[0], 202)    # names another repo than the one it was verified for
+        self.assertEqual(self.event("opened", raw=b"not json")[0], 400)
+        self.assertEqual(self.hub.pr_event_snapshot(), {})
+        self.assertEqual(self.event("opened", number=-4)[0], 202)
+        self.assertEqual(self.event("assigned")[0], 202)
+        self.assertEqual(self.hub.pr_event_snapshot(), {})
+
+    def test_the_picture_stays_bounded_and_private_when_events_exceed_the_cap(self):
+        for n in range(1, sb.PR_STATE_MAX + 51):
+            self.hub.note_pr_event("pull_request", GH_REPO, {"action": "opened", "pull_request": {"number": n, "head": {"sha": "d" * 40}}})
+            self.rig.world.tick(1)
+        self.assertEqual(len(self.hub.pr_event_snapshot()), sb.PR_STATE_MAX)
+        sb.pr_events_pass(self.engine, self.rig.world.clock.now())
+        path = self.rig.world.state / sb.PR_STATE_FILE
+        self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
+        self.assertEqual(len(json.loads(path.read_text())["prs"]), sb.PR_STATE_MAX)
+
+    def test_a_list_read_older_than_an_event_does_not_undo_it_and_a_newer_one_does(self):
+        self.event("opened", head="e" * 40)
+        state = self.engine.__dict__.setdefault("ci_record_state", sb.CiRecordState())
+        self.snapshot_entry()
+        old_at = self.rig.world.clock.now() - 100
+        state.lists["fleet/scratch"] = (old_at, [{"number": 31, "head": {"sha": "f" * 40}, "labels": []}])
+        sb.pr_state_from_lists(state, [GH_REPO])
+        self.assertEqual(state.pr_state[self.ref]["head"], "e" * 40)
+        state.lists["fleet/scratch"] = (self.rig.world.clock.now() + 100, [{"number": 31, "head": {"sha": "f" * 40}, "labels": []}])
+        sb.pr_state_from_lists(state, [GH_REPO])
+        self.assertEqual(state.pr_state[self.ref]["head"], "f" * 40)
+
+    def test_the_pure_rule(self):
+        pe = sb.load_pr_events()
+        self.assertIsNone(pe.entry_for(None, "issues", {"action": "opened"}, 1))
+        self.assertIsNone(pe.entry_for(None, "pull_request", {"action": "assigned", "pull_request": {"number": 1}}, 1))
+        number, entry = pe.entry_for(None, "pull_request", {"action": "opened", "pull_request": {"number": 5, "head": {"sha": "x"}, "labels": [{"name": "a\x1b[31mb"}]}}, 7)
+        self.assertEqual((number, entry["state"], entry["labels"], entry["at"], entry["listed_at"]), (5, "open", ["a [31mb"], 7, 7))
+        picture = {"r#1": {"at": 5, "head": "h", "labels": []}}
+        self.assertEqual(pe.fold(picture, {"r#1": {"at": 3, "head": "old"}, "r#2": {"at": 9, "head": "n"}}, 10), 1)
+        self.assertEqual((picture["r#1"]["head"], picture["r#2"]["head"]), ("h", "n"))
+
+
 class TestGithubReceive(Base):
     def setUp(self):
         super().setUp()
@@ -7922,6 +8128,26 @@ class TestHygiene(unittest.TestCase):
         workflow = (REPO / ".github" / "workflows" / "test.yml").read_text()
         self.assertIn("bin/test-switchboard 2>&1", workflow)
         self.assertIn("run: bin/fleet-scenario validate", workflow)
+
+    def test_ci_cancels_a_pull_requests_superseded_run_but_never_a_push_to_main_and_runs_one_macos_job_per_run(self):
+        workflow = (REPO / ".github" / "workflows" / "test.yml").read_text()
+        top, jobs = workflow.split("\njobs:\n", 1)
+        self.assertIn("\nconcurrency:\n", top, "the concurrency block is top-level (before jobs)")
+        self.assertIn("group: test-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}", top)
+        self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", top)
+        self.assertNotIn("cancel-in-progress: true", workflow, "an unconditional cancel would cancel a push to main")
+        self.assertNotIn("github.ref }}", top, "a push to main must not share a group: GitHub drops a PENDING run of a shared group even without cancel-in-progress")
+        self.assertEqual(workflow.count("macos-latest"), 1, "one macOS job per run: a single matrix entry")
+        on = top.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+        self.assertIn("\n  workflow_dispatch:\n", on, "a head can be re-run without a push")
+        self.assertNotIn("inputs:", workflow, "a dispatch takes no inputs")
+        self.assertNotIn("secrets.", workflow.replace("secrets.PRIVATE_NAMES", ""), "no secret beyond today's")
+        self.assertEqual(top.count("permissions:"), 1)
+        self.assertIn("permissions:\n  contents: read\n", top, "read-only permissions unchanged")
+        self.assertIn("name: test\n", top)       # the workflow and job names give the check names `test (<os>)` for a dispatch as for a pull request
+        self.assertIn("\njobs:\n  test:\n", workflow)
+        self.assertIn("github.event.pull_request.number || github.sha }}", top, "a dispatch groups by its commit sha: it never shares, and so never cancels, the pull request run's group")
+        self.assertIn("os: [ubuntu-latest, macos-latest]", jobs)
 
 
 # ======================================================================
@@ -9894,7 +10120,7 @@ class IntentCase(Base):
 
 class TestGithubReadGate(IntentCase):
     """What stands between the daemon and `gh api` for reads (#130): a read GitHub answers 304 to costs nothing, a rate-limited account's optional reads
-    wait until its limit resets (its essential ones do not), the Intent cache is trusted longer only under a live forwarder, and every call is counted."""
+    wait until its limit resets (none is exempt), the Intent cache is trusted longer only under a live forwarder, and every call is counted."""
 
     def setUp(self):
         super().setUp()
@@ -9978,9 +10204,8 @@ class TestGithubReadGate(IntentCase):
         self.assertEqual(len(calls), 1, "no process was started while it is paused")
         self.assertEqual(len([e for e in self.world.audit() if e["event"] == "github.rate_limited"]), 1, "said once")
         self.assertEqual(accounts.call_summary(now())["paused"].keys(), {"default"})
-        # an essential read (a delivery, the re-check before a write) is never held back
-        essential = accounts.read(runner, "repos/%s/issues/2" % FAKE_REPO, FAKE_REPO, 5, essential=True)
-        self.assertEqual((len(calls), essential.returncode), (2, 1))
+        # #367: no read is exempt any more: the unused `essential` flag is gone
+        self.assertNotIn("essential", inspect.signature(accounts.read).parameters)
         self.tick(601)
         calls_before = len(calls)
         with self.assertRaises(sb.IntentError):
@@ -10157,6 +10382,172 @@ class TestGithubReadGate(IntentCase):
         hub.attach(engine)
         self.assertIs(hub.accounts, self.accounts)
         self.assertEqual(self.reader.live, hub.forwarder_generation)
+
+
+class TestIntentLiveSilence(IntentCase):
+    """#367: a forwarder that is alive but has heard nothing for N minutes does not give an Intent the long trust."""
+
+    def reads(self):
+        return len(self.gh.calls)
+
+    def hub_with_forwarder(self, last_event):
+        hub = sb.GitHubHub(self.world.config, self.world.state, None, self.gh, None, self.world.clock.now)
+        hub.config["intent_live_silence_minutes"] = 10
+        watch = hub.watches.setdefault(FAKE_REPO, sb.Watch(FAKE_REPO))
+        watch.proc, watch.starts, watch.started, watch.last_event = types.SimpleNamespace(poll=lambda: None, pid=1), 1, self.world.clock.now() - 3600, last_event
+        self.reader.live = hub.forwarder_generation
+        return hub, watch
+
+    def test_s3_a_silent_live_forwarder_gets_only_the_short_trust(self):
+        self.hub_with_forwarder(self.world.clock.now() - 3000)       # alive for an hour, last event 50 minutes ago
+        self.reader.issue(2)
+        self.tick(301)
+        self.reader.issue(2)
+        self.assertEqual(self.reads(), 2, "301 s: read again (the long trust is not given)")
+
+    def test_s4_a_live_forwarder_that_hears_events_keeps_the_long_trust(self):
+        hub, watch = self.hub_with_forwarder(self.world.clock.now() - 60)
+        self.reader.issue(2)
+        self.tick(500)
+        watch.last_event = self.world.clock.now()                    # an event arrives
+        self.tick(500)
+        self.reader.issue(2)
+        self.assertEqual(self.reads(), 1, "1000 s: served from the cache")
+
+    def test_the_receive_path_stamps_the_watch_with_the_time_of_the_event(self):
+        hub, watch = self.hub_with_forwarder(None)
+        hub.engine = types.SimpleNamespace(intents=self.reader, sources=[], now=self.world.clock.now)
+        self.assertIsNone(hub.forwarder_generation(FAKE_REPO))       # started an hour ago, nothing heard: silent
+        with mock.patch.object(hub, "_verified_repo", return_value=FAKE_REPO):
+            code, _ = hub.receive("/github", {"X-Hub-Signature-256": "sha256=x", "X-GitHub-Event": "ping"}, b'{"zen": "x"}')
+        self.assertEqual(code, 202)
+        self.assertEqual(watch.last_event, self.world.clock.now())
+        self.assertEqual(hub.forwarder_generation(FAKE_REPO), 1)     # the event is what keeps the long trust
+
+    def test_a_zero_keeps_the_old_rule_and_an_event_time_ends_the_silence(self):
+        hub, watch = self.hub_with_forwarder(None)
+        hub.config["intent_live_silence_minutes"] = 0
+        self.assertEqual(hub.forwarder_generation(FAKE_REPO), 1)     # 0 = trusted as before
+        hub.config["intent_live_silence_minutes"] = 10
+        self.assertIsNone(hub.forwarder_generation(FAKE_REPO))       # started an hour ago, nothing heard
+        watch.last_event = self.world.clock.now()
+        self.assertEqual(hub.forwarder_generation(FAKE_REPO), 1)
+
+
+class TestAgentShellCalls(Base):
+    """#367: calls made from an agent's shell are counted per account and per hour, with nothing else recorded."""
+
+    def setUp(self):
+        Base.setUp(self)
+        if time.time() % 3600 > 3570 or time.time() % 3600 < 10:   # the shim stamps real time: never start these across an hour boundary
+            time.sleep(40)
+        self.bin = self.home / "realbin"
+        self.bin.mkdir()
+        fake = self.bin / "gh"
+        fake.write_text("#!/bin/sh\n[ \"$1\" = auth ] && { echo faketoken; exit 0; }\necho real gh out\nexit 7\n")
+        fake.chmod(0o755)
+        self.sb = self.home / "fakesb"
+        self.sb.write_text("#!/bin/sh\nif [ \"$1\" = whoami ]; then\n  if [ \"$2\" = --json ]; then echo '{\"name\": \"worker\", \"repo\": \"acme/app\"}'; else echo worker; fi; exit 0; fi\nexit 2\n")
+        self.sb.chmod(0o755)
+        self.state = self.home / "state"
+        self.state.mkdir()
+        self.users({"acme/app": "acme-a"})
+        sb.agent_calls.fold(str(self.state), time.time() - 7200)     # the daemon switches counting on, two hours ago
+
+    def users(self, mapping):
+        config = self.home / ".config" / "fleet-switchboard" / "config.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(json.dumps({"gh_users": mapping}))
+
+    def shim(self, *args, env=None):
+        environ = {"PATH": "%s:%s:%s" % (SHIM.parent, self.bin, SAFE_PATH), "HOME": str(self.home), "FLEET_SWITCHBOARD_STATE": str(self.state),
+                   "FLEET_SWITCHBOARD_BIN": str(self.sb), "FLEET_SHIM_LOOKUP_SECONDS": SHIM_LOOKUP_SECONDS}
+        environ.update(env or {})
+        return subprocess.run([sys.executable, str(SHIM), *args], capture_output=True, text=True, env=environ, timeout=60)
+
+    def test_s1_calls_are_counted_per_account(self):
+        for _ in range(5):
+            self.shim("api", "repos/acme/app/issues/5")
+        self.users({"acme/app": "acme-b"})
+        for _ in range(3):
+            self.shim("api", "repos/acme/app/issues/6")
+        text = "\n".join(sb.agent_calls.status_lines(str(self.state), time.time()))
+        self.assertIn("agent shell calls this hour: acme-a 5, acme-b 3", text)
+
+    def test_s2_the_hours_are_listed_and_an_hour_before_counting_began_is_not_recorded(self):
+        now = time.time()
+        sb.agent_calls.fold(str(self.state), now, {"acme-a": 4})
+        lines = [l for l in sb.agent_calls.status_lines(str(self.state), now) if " hour " in l and "Z:" in l]
+        self.assertEqual(len(lines), 6)
+        self.assertEqual(len([l for l in lines if "not recorded" in l]), 3)                 # the 3 hours before counting began
+        self.assertEqual(len([l for l in lines if "agent shell" in l]), 3)
+        self.assertIn("daemon 4", lines[-1])
+
+    def test_s6_a_counting_failure_changes_nothing_the_caller_sees(self):
+        (self.state / "agent-calls.jsonl").mkdir()                                            # the spool cannot be opened for appending
+        done = self.shim("api", "repos/acme/app/issues/5")
+        self.assertEqual((done.returncode, done.stdout.strip()), (7, "real gh out"))
+
+    def test_s7_only_the_account_the_class_and_the_time_are_stored(self):
+        done = self.shim("api", "repos/acme/app/issues/5?token=queryvalue", "-f", "body=secretbody", env={"GH_TOKEN": "secrettoken"})
+        text = (self.state / "agent-calls.jsonl").read_text()
+        for leak in ("secrettoken", "faketoken", "secretbody", "queryvalue", "acme/app"):
+            self.assertNotIn(leak, text)
+        row = json.loads(text.splitlines()[0])
+        self.assertEqual((row["account"], row["endpoint"], sorted(row)), ("acme-a", "api issues/#", ["account", "endpoint", "ts"]))
+
+    def test_nothing_is_counted_until_the_daemon_has_switched_counting_on_and_the_switchboards_own_calls_are_not(self):
+        (self.state / "agent-calls-hours.json").unlink()
+        self.shim("api", "repos/acme/app/issues/5")
+        self.assertFalse((self.state / "agent-calls.jsonl").exists())
+        sb.agent_calls.fold(str(self.state), time.time())
+        self.shim("api", "repos/acme/app/issues/5", env={"FLEET_SWITCHBOARD_OWN_GH": "1"})
+        self.shim("auth", "status")
+        self.assertFalse((self.state / "agent-calls.jsonl").exists())
+
+    def test_s8_a_corrupt_count_file_starts_a_fresh_count_and_status_still_reads(self):
+        (self.state / "agent-calls-hours.json").write_text("{not json")
+        self.assertIn("not recorded", "\n".join(sb.agent_calls.status_lines(str(self.state), time.time())))
+        self.shim("api", "repos/acme/app/issues/5")
+        self.assertTrue(sb.agent_calls.fold(str(self.state), time.time(), {"acme-a": 1}))   # the daemon's next fold rebuilds the file
+        self.assertEqual(json.loads((self.state / "agent-calls-hours.json").read_text())["v"], 1)
+        self.assertEqual(sum(sum(r.get("agent", {}).values()) for r in sb.agent_calls.load_hours(str(self.state))[0].values()), 1)
+
+    def test_a_full_spool_takes_no_more_lines_and_the_hours_kept_are_bounded(self):
+        (self.state / "agent-calls.jsonl").write_text("x" * 300000)
+        self.shim("api", "repos/acme/app/issues/5")
+        self.assertEqual(len((self.state / "agent-calls.jsonl").read_text()), 300000)
+        (self.state / "agent-calls.jsonl").unlink()
+        now = time.time()
+        for back in range(sb.agent_calls.HOURS_KEPT + 5):
+            sb.agent_calls.fold(str(self.state), now - back * 3600, {"acme-a": 1})
+        self.assertLessEqual(len(sb.agent_calls.load_hours(str(self.state))[0]), sb.agent_calls.HOURS_KEPT)
+
+    def test_the_daemon_counts_only_its_new_calls_each_pass_and_keeps_them_when_the_write_fails(self):
+        accounts = sb.GhAccounts({"gh": FAKE_GH, "call_timeout_seconds": 5, "gh_users": {}}, lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "{}", ""),
+                                 time.time, environ={})
+        engine = types.SimpleNamespace(accounts=accounts, state_dir=self.state, now=time.time, _note=lambda *a, **k: None)
+        accounts.read(accounts.runner, "repos/acme/app/issues/1", "acme/app", 5)
+        sb.record_github_calls(engine)
+        sb.record_github_calls(engine)                                                      # nothing new: nothing added
+        hours, _ = sb.agent_calls.load_hours(str(self.state))
+        self.assertEqual(sum(sum(r.get("daemon", {}).values()) for r in hours.values()), 1)
+        accounts.read(accounts.runner, "repos/acme/app/issues/2", "acme/app", 5)
+        with mock.patch.object(sb.agent_calls, "_write_json", return_value=False):
+            sb.record_github_calls(engine)
+        sb.record_github_calls(engine)                                                      # the failed pass's call is counted now
+        hours, _ = sb.agent_calls.load_hours(str(self.state))
+        self.assertEqual(sum(sum(r.get("daemon", {}).values()) for r in hours.values()), 2)
+
+    def test_the_fold_moves_the_spool_into_the_hours_and_loses_no_line(self):
+        for _ in range(2):
+            self.shim("api", "repos/acme/app/issues/5")
+        now = time.time()
+        self.assertTrue(sb.agent_calls.fold(str(self.state), now))
+        self.assertFalse((self.state / "agent-calls.jsonl").exists())
+        hours, since = sb.agent_calls.load_hours(str(self.state))
+        self.assertEqual(sum(sum(r.get("agent", {}).values()) for r in hours.values()), 2)
+        self.assertEqual(stat.S_IMODE(os.stat(str(self.state / "agent-calls-hours.json")).st_mode), 0o600)
 
 
 class TestIntentReader(IntentCase):
@@ -19085,6 +19476,85 @@ class TestTriageDigest(Base):
         self.assertEqual([d for d, _ in self.passes(3, backoff=False)], [0, 1, 2, 3])   # the fixed 24-hour re-alarm is back
 
 
+class TestTriageAncestors(Base):
+    """#396: T1 accepts any charter ancestor (up to TRIAGE_ANCESTOR_DEPTH links) as the owner; the walk reads memory only. It reuses the
+    triage harness's setup without inheriting (and so re-running) its tests."""
+    COS, USER = TestTriage.COS, TestTriage.USER
+
+    def setUp(self):
+        Base.setUp(self)
+        self.world = World(self, agents=(), config={"github_repos": ["acme/api"]})
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.hub = FakeTriageHub()
+        self.engine = self.world.engine
+        self.engine.hub = self.hub
+        self.prs, self.pr_calls = {}, []
+        self.engine.gh_runner = self.pr_runner
+        self.engine.config["awaiting_label"], self.engine.config["awaiting_cos_label"] = self.USER, self.COS
+        self.engine.config["triage"] = dict(sb.TRIAGE_DEFAULTS, repos=["acme/api"], our_logins=["bot"])
+        self.engine.discover(self.world.clock.now())
+        self.hub.open["acme/api"] = {}
+        self.add(1, created=30, updated=0.1, labels=["x:orchestrator", "kind"], assignees=["bot"], body="## Decision required\nx")
+
+    pr_runner = TestTriage.pr_runner
+    add = TestTriage.add
+    go = TestTriage.go
+    found = TestTriage.found
+    only = TestTriage.only
+
+    def child(self, number, parent):
+        self.add(number, created=5, updated=0.2, parent=parent, labels=["kind"], body="Next: go")
+
+    def test_s1_a_charter_at_any_depth_up_to_the_bound_is_an_owner(self):
+        for number, parent in ((2, 1), (3, 2), (4, 3), (5, 4), (6, 5)):       # parent, grandparent, great-grandparent, and deeper
+            self.child(number, parent)
+        self.go()
+        self.assertEqual(self.only("T1"), [])
+
+    def test_s2_an_issue_with_no_charter_ancestor_still_gets_t1(self):
+        self.add(10, created=5, updated=0.2, labels=["kind"], body="Next: go")
+        self.child(11, 12)
+        self.add(12, created=5, updated=0.2, labels=["kind"], body="Next: go")
+        self.go()
+        self.assertEqual(self.only("T1"), ["acme/api#10", "acme/api#11", "acme/api#12"])
+
+    def test_s3_a_cycle_and_a_too_deep_chain_end_the_walk_without_reads_or_repeats(self):
+        for number, parent in ((20, 22), (21, 20), (22, 21)):                    # a cycle of three
+            self.child(number, parent)
+        previous = 1
+        for number in range(30, 50):                                             # 20 levels, the charter only at the top
+            self.child(number, previous)
+            previous = number
+        self.go(passes=3)
+        t1 = self.only("T1")
+        self.assertEqual(sorted(t1)[:3], ["acme/api#20", "acme/api#21", "acme/api#22"])
+        self.assertEqual(len(t1), len(set(t1)))                                  # each at most once
+        self.assertNotIn("acme/api#30", t1)                                      # within the bound: owned
+        self.assertIn("acme/api#49", t1)                                         # beyond it: the walk ended
+        self.assertFalse([c for c in self.hub.calls if "/parent" in c])          # the walk reads nothing
+
+    def test_s4_a_parent_that_was_not_read_is_unknown_never_a_missing_owner(self):
+        self.child(60, 999)
+        self.go()
+        self.assertEqual(self.only("T1"), [])
+
+    def test_s5_a_muted_item_stays_muted_across_a_restart_of_the_memory(self):
+        self.add(70, created=5, updated=0.2, labels=["kind"], body="Next: go")
+        self.go(enabled=True)
+        self.assertEqual(len([k for k in self.engine.triage.facts if "summary" not in k]), 1)
+        self.engine.triage.facts.clear()
+        sb.triage_digest.mute_command(str(self.world.state), "seen-leave", "acme/api#70", self.world.clock.now())
+        self.engine.triage = sb.TriageState()                                    # a daemon restart: memory rebuilt from the files
+        self.world.tick(3 * 86400)
+        self.go(enabled=True)
+        self.assertEqual([k for k in self.engine.triage.facts if "summary" not in k], [])
+        self.world.tick(60)
+        self.add(70, created=5, updated=0.001, labels=["kind"], body="Next: go")     # a change after the mute
+        self.engine.triage = sb.TriageState()
+        self.go(enabled=True)
+        self.assertEqual(len([k for k in self.engine.triage.facts if "summary" not in k]), 1)
+
+
 class TestCaptainTriage(TestTriage):
     def test_t6_shows_the_hold_reasons_and_a_label_held_pr_is_not_t7(self):
         self.charter()
@@ -23862,6 +24332,113 @@ class TestPlanCheckCommand(Base):
         self.assertTrue(self.calls)
         self.assertTrue(all(c[1] == "api" and "--method" not in c for c in self.calls))
         self.assertNotIn("plan", sb.ENSURE_ON_USE_COMMANDS)
+
+
+class TestPlanExplain(Base):
+    """#353: `plan check --explain` and `plan template`."""
+
+    DONE = "(1) a thing works (2) the other is shown"
+    BAD = ("```yaml\nscenarios:\n  - id: S1\n    covers: DW-1\n    text: Given a thing, when it runs, then it works\n    proof: test\n"
+           "    pass: works\n    discriminates: a stub that returns an empty list fails the count\n    evaluator: ci\n```\n")
+
+    def setUp(self):
+        super().setUp()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": "acme/app"})
+        self.calls, self.comments, self.down = [], [], False
+        self.issue = {"number": 7, "state": "open", "title": "t", "updated_at": "2026-01-01T00:00:00Z",
+                      "body": "## Intent\nx\nDone when: %s\n" % self.DONE}
+
+    runner = TestPlanCheckCommand.runner
+    world_now = TestPlanCheckCommand.world_now
+
+    def cmd(self, *argv):
+        with captured() as (out, err):
+            code = sb.main(["plan", *argv], runner=self.runner, now=self.world_now)
+        return code, out.getvalue(), err.getvalue()
+
+    def plan_file(self, text):
+        path = Path(self.home) / "plan.md"
+        path.write_text(text)
+        return str(path)
+
+    def test_every_defect_is_followed_by_its_rule_and_fix(self):
+        path = self.plan_file(self.BAD)
+        code, out, _ = self.cmd("check", "--file", path, "--done-when", self.DONE, "--explain")
+        self.assertEqual(code, 1)
+        defects = [l for l in out.splitlines() if l.strip().startswith("DEFECT")]
+        whys = [l for l in out.splitlines() if l.strip().startswith("WHY ")]
+        self.assertEqual((len(defects), len(whys)), (3, 3), out)   # vague pass, uncovered DW-2, no unchanged scenario
+        self.assertEqual(len([l for l in out.splitlines() if l.strip().startswith("FIX ")]), 3)
+
+    def test_every_code_the_checker_can_produce_has_an_explanation(self):
+        source = Path(sb.plan_check.__file__).read_text()
+        codes = set(re.findall(r'bad\((?:ident|"-"), "([a-z-]+)"', source)) | set(re.findall(r'"code": "([a-z-]+)"', source))
+        codes |= {"missing-size", "bad-size", "size-in-days"} | {"missing-%s" % key for key in sb.plan_check.REQUIRED}
+        codes.discard("missing-%s")
+        self.assertGreater(len(codes), 20)
+        self.assertEqual([c for c in sorted(codes) if sb.plan_check.explain(c) is None], [])
+
+    def test_without_the_flag_the_output_is_what_it_was(self):
+        path = self.plan_file(self.BAD)
+        _, plain, _ = self.cmd("check", "--file", path, "--done-when", self.DONE)
+        _, explained, _ = self.cmd("check", "--file", path, "--done-when", self.DONE, "--explain")
+        self.assertNotIn("WHY ", plain)
+        self.assertEqual([l for l in explained.splitlines() if not l.strip().startswith(("WHY ", "FIX "))], plain.splitlines())
+        pick = lambda text: re.search(r"plan hash: (sha256:[0-9a-f]{64})", text).group(1)
+        self.assertEqual(pick(plain), pick(explained))
+
+    def test_the_template_has_the_clauses_and_one_stub_each_and_is_read_only(self):
+        code, out, err = self.cmd("template", "acme/app#7")
+        self.assertEqual(code, 0, err)
+        self.assertIn("plan-format: 2", out)
+        self.assertEqual(len(re.findall(r"covers: DW-", out)), 2)
+        self.assertIn("(2) the other is shown", out)
+        self.assertTrue(self.calls and all(c[1] == "api" and "--method" not in c for c in self.calls))
+
+    def test_the_template_with_its_placeholders_filled_in_passes(self):
+        code, out, _ = self.cmd("template", "--done-when", self.DONE)
+        self.assertEqual(code, 0)
+        filled = out.replace("<S|M|L|XL> (<what makes it that size>)", "S (one file)")
+        counter = iter(range(1, 100))
+        def fill(match):
+            n = next(counter)
+            return {"text": "Given case %d is set up, when it runs, then it behaves" % n, "pass": "the call number %d returns status 200 and exactly %d items" % (n, n),
+                    "discriminates": "a stub that returns an empty list for item %d fails the count" % n}.get(match.group(1), "something real and long enough for %d" % n)
+        filled = re.sub(r"(?m)^(    (?:text|pass|discriminates): )<.*>$", lambda m: m.group(1) + fill(re.match(r"(\w+)", m.group(0).strip())), filled)
+        filled = re.sub(r"(?m)^(PC-1|Out of scope|Areas touched|Risks and rollback): <.*>$", lambda m: m.group(1) + ": something real", filled)
+        self.assertNotIn("<", filled)
+        code, result, _ = self.cmd("check", "--file", self.plan_file(filled), "--done-when", self.DONE)
+        self.assertEqual(code, 0, result)
+        self.assertIn("plan check: PASS", result)
+
+    def test_control_characters_and_long_text_in_the_ask_never_reach_the_terminal(self):
+        self.issue["body"] = "## Intent\nx\nDone when: (1) first \x1b]0;owned\x07 clause (2) %s\n" % ("y" * 900)
+        code, out, _ = self.cmd("template", "acme/app#7")
+        self.assertEqual(code, 0)
+        self.assertNotRegex(out, "[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+        self.assertIn("first", out)
+        self.assertLessEqual(max(len(l) for l in out.splitlines()), 340)
+
+    def test_template_with_neither_ask_nor_done_when_and_with_an_unreadable_ask_are_errors(self):
+        code, _, err = self.cmd("template")
+        self.assertEqual(code, 2)
+        self.assertIn("give the ask", err)
+        self.down = True
+        code, out, err = self.cmd("template", "acme/app#7")
+        self.assertEqual((code, out), (2, ""))
+
+    def test_explain_follows_a_warning_too(self):
+        path = self.plan_file(self.BAD.replace("proof: test", "proof: test").replace("evaluator: ci", "evaluator: adam"))
+        _, out, _ = self.cmd("check", "--file", path, "--done-when", "(1) a thing works", "--explain")
+        lines = out.splitlines()
+        at = next(i for i, l in enumerate(lines) if l.startswith("WARN") and "adam" in l)
+        self.assertTrue(lines[at + 1].strip().startswith("WHY evaluator-alias"))
+
+    def test_an_ask_with_no_done_when_is_said_not_prefilled(self):
+        self.issue["body"] = "## Intent\nx\n"
+        code, out, err = self.cmd("template", "acme/app#7")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("no Done-when", err)
 
 
 class TestPlanTemplateDoc(unittest.TestCase):
@@ -29922,6 +30499,117 @@ class TestOrdersCLI(OrdersCase):
             os.environ.pop("HERDR_PANE_ID", None)
             self.assertEqual(self.main("notice", "ack", notices[0]["id"])[0], 0)
         self.assertEqual([n["action"] for n in sb.read_order_notices(self.world.audit_path.parent)], ["remove"])
+
+    def order_entries(self, at, **config):
+        engine = types.SimpleNamespace(state_dir=self.world.audit_path.parent, config=config)
+        return sb.decisions_from_order_notices(engine, at)
+
+    def record(self, charter, action, text, at, repo="acme/widget"):
+        return sb.record_order_notice(self.world.audit_path.parent, repo, charter, action, text, "chief-of-staff", None, at)
+
+    def test_the_heads_up_leads_with_what_differs_so_a_narrow_row_never_cuts_the_number(self):
+        base = 1_000_000.0
+        self.record(4230, "add", "approve every production deploy before it starts", base)
+        self.record(4230, "remove", "approve every production deploy before it starts", base + 5)
+        entries, problems = self.order_entries(base + 60)
+        self.assertEqual(problems, [])
+        self.assertEqual(len(entries), 2)
+        self.assertTrue(entries[0]["headline"].startswith("widget#4230 order +: approve"), entries[0]["headline"])
+        self.assertTrue(entries[1]["headline"].startswith("widget#4230 order -: approve"), entries[1]["headline"])
+        for entry in entries:
+            self.assertIn("#4230", entry["headline"][:sb.decision_core.HEADLINE_WIDTH], entry["headline"])
+        long_repo = self.record(77, "add", "x", base + 9, repo="acme/a-very-long-repository-name")
+        (long_entry,) = [e for e in self.order_entries(base + 60)[0] if e["number"] == 77]
+        self.assertTrue(long_entry["headline"].startswith("a-very-long-repository-name#77 order +:"), long_entry["headline"])
+
+    def test_a_burst_of_orders_on_one_charter_is_one_entry_with_a_count_and_two_charters_are_two(self):
+        base = 1_000_000.0
+        ids4230 = [self.record(4230, "add", "tighten gate %d" % n, base + n * 10)["id"] for n in range(19)]
+        for n in range(3):
+            self.record(17, "add", "other %d" % n, base + n * 10)
+        entries, problems = self.order_entries(base + 600)
+        self.assertEqual(problems, [])
+        self.assertEqual(len(entries), 2, [e["headline"] for e in entries])
+        big = next(e for e in entries if e["number"] == 4230)
+        self.assertIn("19 orders added by chief-of-staff", big["headline"].replace("\n", " "))
+        self.assertIn("widget#4230", big["headline"][:sb.decision_core.HEADLINE_WIDTH])
+        self.assertEqual(big["id"], "%s+19" % ids4230[0])
+        for member in ids4230:
+            self.assertIn(member, big["note"], "the member ids stay in the note")
+        small = next(e for e in entries if e["number"] == 17)
+        self.assertIn("3 orders added", small["headline"].replace("\n", " "))
+        entries0, _ = self.order_entries(base + 600, order_notice_burst_minutes=0)     # a window of 0 groups nothing
+        self.assertEqual(len(entries0), 22)
+        self.record(4230, "add", "much later", base + 3600)                            # an hour on is not the same burst
+        again, _ = self.order_entries(base + 3700)
+        self.assertEqual(len([e for e in again if e["number"] == 4230]), 2)
+        self.record(4230, "remove", "x", base + 20)                            # another action on the same charter is its own entry
+        self.assertEqual(len([e for e in self.order_entries(base + 3700)[0] if e["number"] == 4230]), 3)
+
+    def test_acking_the_group_id_drops_the_whole_burst_and_an_old_single_id_still_drops_just_that_one(self):
+        base = float(int(self.world.clock.now()))
+        ids = [self.record(4230, "add", "x %d" % n, base + n)["id"] for n in range(5)]
+        (entry,), _ = self.order_entries(base + 30)
+        self.as_agent("orch")
+        self.assertEqual(self.main("notice", "ack", entry["id"])[0], 2, "an agent may not ack")
+        with mock.patch.dict(os.environ):
+            os.environ.pop("HERDR_PANE_ID", None)
+            self.assertEqual(self.main("notice", "ack", ids[2])[0], 0)                     # an old single id drops only that one
+            self.assertEqual(len(sb.read_order_notices(self.world.audit_path.parent)), 4)
+            self.assertEqual(self.main("notice", "ack", entry["id"])[0], 2, "the row now holds 4: the old +5 id is refused, nothing dropped")
+            (fresh,), _ = self.order_entries(base + 30)
+            self.assertTrue(fresh["id"].endswith("+4"))
+            self.assertEqual(self.main("notice", "ack", fresh["id"])[0], 0)                # the group id (first id + 4) drops the whole burst
+            self.assertEqual(sb.read_order_notices(self.world.audit_path.parent), [])
+            self.assertEqual(self.main("notice", "ack", fresh["id"])[0], 2, "gone is gone")
+
+    def test_a_pr_notice_leads_with_the_number_and_names_the_repo_only_when_it_is_not_the_default(self):
+        facts = {"title": "tighten the production deploy gate and say why", "state": "open"}
+        mine = sb.decision_core.notice_entry("acme/widget", 366, "acme/widget", facts, False, "coder", 1_000_000.0, None, 0, "acme/widget")
+        other = sb.decision_core.notice_entry("acme/gadget", 12, "acme/gadget", facts, False, "coder", 1_000_000.0, None, 0, "acme/widget")
+        plain = sb.decision_core.notice_entry("acme/widget", 366, "widget", facts, False, "coder", 1_000_000.0, None, 0)
+        self.assertTrue(mine["headline"].startswith("#366 tighten"), mine["headline"])
+        self.assertTrue(other["headline"].startswith("gadget#12 tighten"), other["headline"])
+        self.assertTrue(plain["headline"].startswith("widget#366 tighten"), "with no default repo the form is as before")
+        self.assertEqual((mine["id"], other["id"], plain["id"]), ("pr:acme/widget#366", "pr:acme/gadget#12", "pr:widget#366"), "ids are unchanged")
+
+    def test_the_burst_window_config_is_validated(self):
+        for bad in (-1, "x", True, 99999, 1441):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "order_notice_burst_minutes": bad})
+        sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "order_notice_burst_minutes": 0})
+        sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "order_notice_burst_minutes": 5})
+        sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "order_notice_burst_minutes": 1440})
+        sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "order_notice_burst_minutes": 2.5})
+
+    def test_a_group_ack_binds_to_what_was_shown_a_late_member_expired_firsts_and_a_changed_window(self):
+        base = float(int(self.world.clock.now()))
+        ids = [self.record(4230, "add", "x %d" % n, base + n)["id"] for n in range(5)]
+        (entry,), _ = self.order_entries(base + 30)
+        self.record(4230, "add", "arrived after the row was shown", base + 40)              # joins the burst: the owner has not seen it
+        with mock.patch.dict(os.environ):
+            os.environ.pop("HERDR_PANE_ID", None)
+            code, out, err = self.main("notice", "ack", entry["id"])
+            self.assertEqual(code, 2)
+            self.assertIn("changed since it was shown (it now holds 6 orders)", err)
+            self.assertEqual(len(sb.read_order_notices(self.world.audit_path.parent)), 6, "nothing was dropped")
+            (newer,), _ = self.order_entries(base + 50)
+            self.assertTrue(newer["id"].endswith("+6"))
+            self.assertEqual(self.main("notice", "ack", newer["id"])[0], 0)
+            self.assertEqual(sb.read_order_notices(self.world.audit_path.parent), [])
+
+    def test_the_ack_groups_exactly_what_the_panel_shows_with_the_same_window_and_without_expired_orders(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "order_notice_burst_minutes": 60})
+        now = self.world.clock.now()
+        old = self.record(4230, "add", "expired first", now - sb.ORDER_NOTICE_TTL_SECONDS - 5)
+        ids = [self.record(4230, "add", "x %d" % n, now - 1800 + n * 60)["id"] for n in range(4)]     # a 30 minute burst: ONE entry at a 60 minute window
+        (entry,), _ = self.order_entries(now, order_notice_burst_minutes=60)
+        self.assertEqual(entry["id"], "%s+4" % ids[0], "the expired order is not the group's first")
+        with mock.patch.dict(os.environ):
+            os.environ.pop("HERDR_PANE_ID", None)
+            self.assertEqual(self.main("notice", "ack", entry["id"])[0], 0)
+        left = [i["id"] for i in sb.read_order_notices(self.world.audit_path.parent)]
+        self.assertEqual(left, [old["id"]], "only the group was dropped (the expired one is left for the expiry)")
 
     def test_a_body_that_changed_in_between_is_read_again_once(self):
         self.as_agent("chief-of-staff")
