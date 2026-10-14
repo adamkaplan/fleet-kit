@@ -4447,6 +4447,117 @@ class TestLaunch(Base):
                           ("echo ses_abc123", False)):
             self.assertEqual(sb.runs_session([{"cmdline": cmd}], sid), want, cmd)
 
+    def worker(self, reports_to="boss"):
+        self.world.add_agent("boss", fleet={"role": "orchestrator"})
+        self.world.add_agent("worker", fleet={"role": "coder", "reports_to": reports_to})
+        self.world.v2.sessions[self.world.sessions["worker"]]["directory"] = str(self.work)
+        self.engine.state_dir = self.world.state
+
+    def as_(self, who):
+        os.environ["HERDR_PANE_ID"] = self.world.panes[who]
+
+    def run_cli(self, *argv):
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def kill(self, name):
+        del self.world.herdr.panes[self.world.panes[name]]
+
+    def test_retire_stops_dead_and_detached_reports_and_all_detached_skips_it_and_undo_brings_it_back(self):
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.worker()
+        self.health()
+        self.kill("worker")
+        for n in range(sb.PANE_MISSING_PASSES):
+            self.health(n)
+        self.assertEqual(sb.read_pane_health(self.world.state)["states"]["worker"]["state"], "dead")      # no report: still DEAD
+        self.as_("boss")
+        code, out, err = self.run_cli("retire", "worker", "--reason", "the factory run is finished")
+        self.assertEqual(code, 0, err)
+        self.assertIn("worker is retired", out)
+        self.assertNotIn("worker", sb.read_pane_health(self.world.state)["states"])
+        self.health(100)
+        self.assertEqual(getattr(self.engine, "pane_alerts", {}), {})
+        lines = sb.pane_health_status_lines(self.world.state)
+        self.assertTrue(any("retired" in l and "worker" in l for l in lines))
+        self.assertFalse(any("DEAD" in l for l in lines))
+        code, out, err = self.run_cli("reattach", "--all-detached")
+        self.assertEqual((code, out.strip()), (0, "no agent is detached or dead"))
+        code, out, err = self.run_cli("reattach", "worker")
+        self.assertNotEqual(code, 0)
+        self.assertIn("is retired", err)
+        self.assertEqual((self.world.herdr.closed, [e for e in self.world.audit() if e["event"] == "fleetpane.retired"][0]["detail"]["by"]), ([], "boss"))
+        code, out, err = self.run_cli("retire", "--undo", "worker")
+        self.assertIn("no longer retired", out)
+        self.health(200)
+        self.health(300)
+        self.assertEqual(sb.read_pane_health(self.world.state)["states"].get("worker", {}).get("state"), None)   # gone from the list, so it is `missing` again
+        for n in range(sb.PANE_MISSING_PASSES):
+            self.health(400 + n)
+        self.assertEqual(sb.read_pane_health(self.world.state)["states"]["worker"]["state"], "dead")      # watched again
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "fleetpane.unretired"])
+
+    def test_only_the_boss_the_chief_of_staff_or_the_operator_may_retire_and_a_refusal_is_audited(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.worker()
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.world.add_agent("stranger", fleet={"role": "coder"})
+        self.as_("stranger")
+        code, out, err = self.run_cli("retire", "worker")
+        self.assertNotEqual(code, 0)
+        self.assertIn("may not reattach worker", err)
+        self.assertEqual(sb.read_retired(self.world.state), {})
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "fleetpane.retire_refused"]), 1)
+        for who in ("cos", "boss"):
+            self.as_(who)
+            self.assertEqual(self.run_cli("retire", "worker")[0], 0, who)
+            self.run_cli("retire", "--undo", "worker")
+        os.environ.pop("HERDR_PANE_ID", None)                                   # the operator at their own terminal
+        self.assertEqual(self.run_cli("retire", "worker")[0], 0)
+        self.assertEqual(sb.read_retired(self.world.state)["worker"]["by"], "the operator")
+
+    def test_a_worker_whose_pane_closed_after_its_final_done_report_is_retired_automatically_and_one_closed_while_working_is_dead(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.worker()
+        self.world.add_agent("busy", fleet={"role": "coder", "reports_to": "boss"})
+        self.world.v2.sessions[self.world.sessions["busy"]]["directory"] = str(self.work)
+        self.health()
+        now = self.world.clock.now()
+        sb.record_last_report(self.world.state, "worker", "done", now)
+        sb.record_last_report(self.world.state, "busy", "working", now)           # a progress report is not a final one
+        self.kill("worker")
+        self.kill("busy")
+        for n in range(sb.PANE_MISSING_PASSES):
+            self.health(n)
+        states = sb.read_pane_health(self.world.state)["states"]
+        self.assertNotIn("worker", states)
+        self.assertEqual(sb.read_retired(self.world.state)["worker"]["auto"], True)
+        self.assertIn("final done report", sb.read_retired(self.world.state)["worker"]["reason"])
+        self.assertEqual(states["busy"]["state"], "dead")
+        self.assertEqual(sorted(getattr(self.engine, "pane_alerts", {})), ["busy"])
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "fleetpane.retired" and e["detail"]["auto"]])
+
+    def test_an_old_final_report_beyond_the_lookback_does_not_retire_and_report_records_the_last_state(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.worker()
+        self.health()
+        self.world.new_engine("cli").report("worker", "done", "all finished")
+        self.assertEqual(sb._read_small(self.world.state, sb.LAST_REPORT_FILE)["worker"]["state"], "done")
+        self.world.new_engine("cli").report("worker", "working", "one more thing")          # a rider: still recorded
+        self.assertEqual(sb._read_small(self.world.state, sb.LAST_REPORT_FILE)["worker"]["state"], "working")
+        sb.record_last_report(self.world.state, "worker", "failed", self.world.clock.now() - 3 * 86400)
+        self.kill("worker")
+        for n in range(sb.PANE_MISSING_PASSES):
+            self.health(n)
+        self.assertEqual(sb.read_pane_health(self.world.state)["states"]["worker"]["state"], "dead")
+        self.assertEqual(sb.read_retired(self.world.state), {})
+
+    def test_a_retired_listing_is_dropped_from_status_after_the_show_days(self):
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {"old": {"at": 1, "by": "x", "reason": "y", "session": "s", "auto": False}})
+        self.assertEqual(sb.pane_health_status_lines(self.world.state), [])
+
     def test_a_screen_that_cannot_be_read_is_unknown_never_detached_and_nothing_is_closed(self):
         pane = self.detach()
         self.world.herdr.panes[pane]["read_fails"] = True

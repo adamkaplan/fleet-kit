@@ -336,3 +336,7 @@ the order already answers. The Chief of Staff's own orders are one local file,
 `standing-orders.md` beside the switchboard config: only the owner edits it
 (`fleet-switchboard orders --cos` prints it), and it is told them at its start, after each
 compaction and when the file changes.
+
+**Finished a worker? Retire it.** When a worker has made its final `done` or `failed` report and you close its tab, run
+`fleet-switchboard retire <name> [--reason "..."]` so the fleet does not report it dead or invite a reattach. (If you close the tab after its final
+report the switchboard retires it by itself; retire is for the cases it cannot tell.) `retire --undo <name>` reverses it; nothing is deleted.
