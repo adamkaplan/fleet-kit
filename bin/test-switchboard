@@ -39620,7 +39620,7 @@ class TestSettledOutside(ExternalWorld):
         for _ in range(3):
             self.run_pass(120)
         (event,) = self.audit_events("external.settled_outside")
-        self.assertEqual(event["detail"]["op"], "revise")
+        self.assertEqual((event["detail"]["op"], event["detail"]["dropped_ops"]), ("revise", 1))
         self.assertEqual(self.audit_events("external.permanent_failure"), [])
         self.assertNotIn("permanent failure", self.count_line())
         (link,) = self.links().values()
@@ -39717,8 +39717,28 @@ class TestSettledOutside(ExternalWorld):
         self.run_pass(120)
         self.assertEqual(len([c for c in self.fake.calls if c[0] == "raise"]), 2, "the new decision is raised once, as before")
 
+    def test_an_already_decided_reply_to_a_raise_has_no_link_to_settle_so_it_stays_a_permanent_refusal_tried_once(self):
+        self.turn_on()
+        self.fake.refuse["raise"] = AlreadyDecidedRefusal("409: already decided: Bearer abc123secret")
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        for _ in range(3):
+            self.run_pass(120)
+        self.assertEqual(len([c for c in self.fake.calls if c[0] == "raise"]), 1, "not looped")
+        self.assertEqual(self.audit_events("external.settled_outside"), [])
+        (event,) = self.audit_events("external.permanent_failure")
+        self.assertNotIn("abc123secret", json.dumps(event), "outside text is redacted")
+
+    def test_the_settled_audit_reason_is_redacted(self):
+        ext = self.open_decision()
+        self.fake.refuse["revise"] = AlreadyDecidedRefusal("409: already decided: Bearer abc123secret")
+        self.gh.issues[(API, 2)]["title"] = "Which database should it use?"
+        self.run_pass(120)
+        (event,) = self.audit_events("external.settled_outside")
+        self.assertNotIn("abc123secret", json.dumps(event))
+
     def test_the_real_adapter_error_says_it_is_settled_outside_and_only_that_one(self):
         self.assertTrue(EA.AlreadyDecided.settled_outside)
+        self.assertFalse(EA.AdapterError.settled_outside)
         for cls in (EA.Conflict, EA.InvalidRequest, EA.NotFound, EA.CredentialError, EA.DisabledError, EA.Unsupported, EA.MappingError):
             self.assertFalse(getattr(cls, "settled_outside", False), cls.__name__)
 

@@ -320,7 +320,7 @@ class SyncEngine:
                     raise RuntimeError("no outside id is linked yet")
                 answer = self.adapter.push(operation, op["id"]) or {}
             except Exception as err:
-                if getattr(err, "settled_outside", False) is True:   # "already decided (or closed): read its answer instead": not a failure
+                if getattr(err, "settled_outside", False) is True and op["op"] != "raise":   # "already decided (or closed): read its answer instead": not a failure (a raise has no link to settle: it stays a permanent refusal, not tried again)
                     self._settle_outside(op, err, now)
                     blocked.add(op["key"])
                     continue
@@ -349,8 +349,9 @@ class SyncEngine:
         decision) are dropped, the link is marked `decided_outside` so nothing more is planned for it, any earlier failure of the key is cleared, and the next
         cycle pulls at once so the answer is applied here. A link that was already answered or closed here has nothing left to pull."""
         key = op["key"]
+        before = len(self.ops)
         self.ops = [o for o in self.ops if o["key"] != key]
-        self.host.audit("external.settled_outside", key, {"op": op["op"], "reason": core.one_line("%s: %s" % (type(err).__name__, err), 200), "dropped_ops": 1})
+        self.host.audit("external.settled_outside", key, {"op": op["op"], "reason": core.line_of("%s: %s" % (type(err).__name__, err), 200), "dropped_ops": before - len(self.ops)})
         if op.get("note_only"):
             return
         self.failed.pop(key, None)
@@ -366,7 +367,7 @@ class SyncEngine:
         """The other side refused this operation for good: drop it and the operations queued behind it for the decision
         (they were planned on it), say so in the audit, mark the link, and remember it so that nothing is enqueued
         again until the decision changes. Never a withdraw, an answer or a retry."""
-        key, text = op["key"], core.one_line("%s: %s" % (type(err).__name__, err), 200)
+        key, text = op["key"], core.line_of("%s: %s" % (type(err).__name__, err), 200)   # redacted like every other outside text
         self.ops = [o for o in self.ops if o["key"] != key]
         self.host.audit("external.permanent_failure", key, {"op": op["op"], "error": text, "dropped_ops": 1})
         if op.get("note_only"):

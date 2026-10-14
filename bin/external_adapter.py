@@ -130,6 +130,7 @@ class AdapterError(Exception):
     disabled integration); False for what may pass (RateLimited, Unavailable)."""
 
     permanent = False
+    settled_outside = False   # True only for "already decided (or closed): read its answer instead": the sync engine settles the link outside, it is no failure
 
     def __init__(self, message, status=None, code=None):
         Exception.__init__(self, message)
