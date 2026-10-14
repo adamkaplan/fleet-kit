@@ -5613,9 +5613,8 @@ def reclaim_worktree(engine, runner, path, entry, apply=True, keep_cwd=False):
     agent = entry.get("agent")
     facts = worktree_facts(runner, path)
     if not facts["exists"]:
-        if apply:
-            _unregister_worktree(engine.state_dir, path)
-        return "gone", "%s: already gone%s" % (path, "; dropped from the registry" if apply else "")
+        dropped = apply and _unregister_worktree(engine.state_dir, path)
+        return "gone", "%s: already gone%s" % (path, "; dropped from the registry" if dropped else ("; the registry entry could not be dropped" if apply else ""))
     if facts["why"]:
         return "kept", "%s: kept: %s" % (path, facts["why"])
     if not facts["linked"]:
@@ -5662,6 +5661,8 @@ def reclaim_for_agent(engine, runner, name, apply=True, why="retired", keep_cwd=
         lines.append(line)
         if status == "kept" and engine.audit is not None:
             engine.audit.append(engine.actor, "worktree.kept", name, {"path": path, "reason": _one_line(line, 160), "after": why})
+    if len(mine) > WORKTREE_RECLAIM_MAX:
+        lines.append("%d of %d worktree(s) handled (cap %d); `disk reclaim-worktrees` does the rest" % (WORKTREE_RECLAIM_MAX, len(mine), WORKTREE_RECLAIM_MAX))
     return lines
 
 
@@ -5694,6 +5695,8 @@ def cmd_disk_reclaim_worktrees(args, runner, now):
         print(line)
         removed += status in ("removed", "would-remove", "gone")
         kept += status in ("kept", "refused")
+    if len(todo) > WORKTREE_RECLAIM_MAX:
+        print("%s: only %d of %d worktree(s) handled (cap %d): run it again for the rest" % (PROG, WORKTREE_RECLAIM_MAX, len(todo), WORKTREE_RECLAIM_MAX))
     print("%s: %d registered worktree(s) of retired agents: %d %s, %d kept%s; %d registered in all, %d of agents not retired are left alone" % (
         PROG, len(todo), removed, "removed" if args.apply else "would be removed", kept, "" if args.apply else " (a dry run: add --apply)",
         len(registry), len(registry) - len(todo)))
