@@ -15,6 +15,8 @@ Local todo lists are mirrors, never the record. One owner holds an assignment at
 time; reassigning it needs an explicit handoff from the orchestrator, not a coder
 deciding to pick something up.
 
+Write GitHub text so a person can read it: short paragraphs, real Markdown lists with one item per line, headings for sections, never an inline "(1) ... (2) ..." chain, and code and commands in code spans or blocks.
+
 ## The brief
 
 Send one self-contained brief at dispatch. Later updates can be shorthand; the

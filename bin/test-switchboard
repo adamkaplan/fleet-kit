@@ -42884,6 +42884,52 @@ class TestCpuGuard(Base):
         self.assertNotIn("\x1b", self.cg.detail(cats))
 
 
+class TestGithubWritingRule(unittest.TestCase):
+    """Ask #401, slice 1: the same one-sentence writing rule for GitHub text in the two skills, the coder and orchestrator definitions of both runtimes and the
+    pull request template."""
+
+    RULE = ('Write GitHub text so a person can read it: short paragraphs, real Markdown lists with one item per line, headings for sections, '
+            'never an inline "(1) ... (2) ..." chain, and code and commands in code spans or blocks.')
+    FILES = ("skills/fleet-charter/SKILL.md", "skills/fleet-coordination/SKILL.md", "agents/opencode/coder.md", "agents/opencode/orchestrator.md",
+             "agents/copilot/coder.agent.md", "agents/copilot/orchestrator.agent.md", ".github/pull_request_template.md")
+
+    def test_s1_every_file_carries_the_rule_sentence_exactly(self):
+        for rel in self.FILES:
+            with self.subTest(file=rel):
+                self.assertIn(self.RULE, (REPO / rel).read_text())
+
+    def test_s2_it_is_one_sentence_everywhere_and_never_inside_a_code_fence(self):
+        found = set()
+        for rel in self.FILES:
+            text = (REPO / rel).read_text()
+            for line in text.splitlines():
+                at = line.find("Write GitHub text so a person can read it")
+                if at >= 0:
+                    found.add(line[at:].replace(" -->", "").rstrip())
+            inside, fenced = False, False
+            for line in text.splitlines():
+                if line.strip().startswith("```"):
+                    inside = not inside
+                elif inside and "Write GitHub text so a person can read it" in line:
+                    fenced = True
+            self.assertFalse(fenced, "%s: the rule sits inside a code fence" % rel)
+        self.assertEqual(found, {self.RULE})
+
+    def test_the_rule_is_not_in_the_front_matter_of_a_definition(self):
+        for rel in self.FILES[2:6]:
+            text = (REPO / rel).read_text()
+            head = text.split("\n---\n", 1)[0]
+            self.assertNotIn("Write GitHub text", head, rel)
+            self.assertTrue(text.startswith("---\n"), rel)
+
+    def test_s3_the_change_adds_text_only_and_leaves_the_shim_alone(self):
+        done = subprocess.run(["git", "diff", "--name-only", "origin/main...HEAD"], capture_output=True, text=True, cwd=str(REPO))
+        if done.returncode != 0 or not done.stdout.strip():
+            self.skipTest("no base to compare with")
+        changed = set(done.stdout.split())
+        self.assertNotIn("shims/gh", changed)
+
+
 class TestDiskGuard(Base):
     """The disk guard: one stat of the state directory's volume per pass; the Chief of Staff is told once per episode below disk_guard.min_free_gb; `status`
     says how much is free; `disk prune` runs exactly two docker commands and refuses without docker."""

@@ -57,6 +57,10 @@ yourself with `fleet-switchboard remind <your name> <when> --issue <n> "<text>"`
 turn: you are woken then, free while idle. Never poll. If you were launched with a CHECKPOINT, a reminder reaches you at it ("checkpoint due: report now, one line"), so set none of your own for it: report then.
 Never poll GitHub in a shell loop; wait with `fleet-switchboard remind` and read with `fleet-switchboard pr-state <owner/repo#N>`.
 
+## Writing
+
+Write GitHub text so a person can read it: short paragraphs, real Markdown lists with one item per line, headings for sections, never an inline "(1) ... (2) ..." chain, and code and commands in code spans or blocks.
+
 ## Skills
 
 **Before your first report, load the `fleet-coordination` skill.** It carries the

@@ -79,6 +79,10 @@ yourself with `fleet-switchboard remind <your name> <when> --issue <n> "<text>"`
 turn: you are woken then, free while idle. Never poll. `launch` reads the brief's CHECKPOINT (or `--checkpoint 30m --overdue 60m`) and arms the reminders for that checkpoint itself: the worker is reminded at the checkpoint, and you are woken at the overdue time unless the worker has reported or sent anything since the launch, so set none of your own for it. Always pass `--reports-to <your name>` so the overdue wake has someone to wake; a CHECKPOINT line it cannot read arms nothing, and `launch` says so.
 Never poll GitHub in a shell loop; wait with `fleet-switchboard remind` and read with `fleet-switchboard pr-state <owner/repo#N>`.
 
+## Writing
+
+Write GitHub text so a person can read it: short paragraphs, real Markdown lists with one item per line, headings for sections, never an inline "(1) ... (2) ..." chain, and code and commands in code spans or blocks.
+
 ## Skills
 
 - **Before your first charter action** — opening a charter, queueing a
