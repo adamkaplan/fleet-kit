@@ -14,6 +14,7 @@ is non-zero on failure.
 """
 import ast
 import base64
+import calendar
 import collections
 import contextlib
 import errno
@@ -38,6 +39,7 @@ import re
 from urllib.parse import unquote
 import shlex
 import shutil
+import zipfile
 import signal
 import socket
 import stat
@@ -239,7 +241,7 @@ class TestConfig(Base):
             "worker_lookback_hours": 24, "send_to_working": "steer",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
-            "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "heavy": None, "docker_reaper": True,
+            "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "reds": None, "heavy": None, "docker_reaper": True,
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
                               "check_suite", "workflow_run"],
             "awaiting_label": None, "decisions_lookback_hours": 72,  # PR 14
@@ -11157,6 +11159,7 @@ class TestSelfRegisteringCli(unittest.TestCase):
         "agents": ("cmd_agents", ("args", "runner", "now")), "job": ("cmd_job", ("args", "runner", "now", "spawn")), "review-laws": ("cmd_review_laws", ("args", "runner", "now")), "review": ("cmd_review", ("args", "runner", "now")), "pr-explain": ("cmd_pr_explain", ("args", "runner", "now")), "disk": ("cmd_disk", ("args", "runner", "now")), "pr-state": ("cmd_pr_state", ("args", "runner", "now")),
         "reattach": ("cmd_reattach", ("args", "runner", "now", "socket_call")),
         "heavy": ("cmd_heavy", ("args",)),
+        "reds": ("cmd_reds", ("args", "runner", "now")),
         "retire": ("cmd_retire", ("args", "runner", "now")),
         "impact": ("cmd_impact", ("args", "runner", "now")), "judge-tool": ("cmd_judge_tool", ("args", "runner", "now")),
         "ensure": ("cmd_ensure", ("args", "spawn")), "install": ("cmd_install", ("args", "runner", "now", "spawn")), "key": ("cmd_key", ("args", "runner", "now")),
@@ -11354,7 +11357,7 @@ class TestSelfRegisteringCli(unittest.TestCase):
         # was in a shared list is still in its group, and the only additions are commands that already said `direct` themselves
         self.assertTrue(set(self.OLD_DIRECT) <= set(sb.DIRECT_ACTIONS))
         # these already said `cmd_x.direct = True` before this change, so they already ran direct: the views only make that visible
-        self.assertEqual(set(sb.DIRECT_ACTIONS) - set(self.OLD_DIRECT), {"disk", "heavy", "load-replay", "pr-state", "triage"})
+        self.assertEqual(set(sb.DIRECT_ACTIONS) - set(self.OLD_DIRECT), {"disk", "heavy", "load-replay", "pr-state", "reds", "triage"})
         self.assertEqual(sorted(sb.LEDGER_ACTIONS), sorted(self.OLD_LEDGER))
         self.assertEqual(sorted(sb.ENSURE_ON_USE_COMMANDS), sorted(self.OLD_ENSURE_ON_USE))
         known = self.commands()[0].commands
@@ -42846,6 +42849,394 @@ class TestHeavySlots(Base):
         for path in ("agents/opencode/coder.md", "agents/opencode/orchestrator.md", "skills/fleet-coordination/SKILL.md"):
             found = (REPO / path).read_text()
             self.assertEqual(found.lower().count(line), 1, path)
+
+
+def _artifact_zip(names, complete=True, run=1, head="a" * 40):
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, "w") as archive:
+        archive.writestr("failing-tests.json", json.dumps({"v": 1, "run": run, "head": head, "complete": complete, "failed": names}))
+    return stream.getvalue()
+
+
+class FakeActions:
+    """A fake GitHub for `reds`: a pull request, runs per event, an artifact list and artifact zips. Records every path it is asked (all GETs)."""
+
+    REPO = "acme/widget"
+
+    def __init__(self):
+        self.calls, self.argvs, self.runs, self.artifacts, self.zips = [], [], {}, {}, {}
+        self.pull = {"head": {"sha": "b" * 40}, "base": {"repo": {"default_branch": "main"}}}
+        self.fail_paths = set()
+        self.next_id = 100
+
+    def pr_run(self, names, complete=True, artifact=True):
+        return self.add_run("pull_request", "feature", names, complete, "2027-01-15T08:00:00Z", artifact, sha="b" * 40)
+
+    def add_run(self, event, branch, names, complete=True, created="2027-01-15T07:00:00Z", artifact=True, sha=None, expired=False, raw=None):
+        self.next_id += 1
+        run = {"id": self.next_id, "event": event, "head_branch": branch, "head_sha": sha or ("%07d" % self.next_id) + "c" * 33, "created_at": created, "status": "completed"}
+        self.runs.setdefault(event, []).append(run)
+        if artifact:
+            self.zips[self.next_id + 5000] = raw if raw is not None else _artifact_zip(names, complete, self.next_id)
+            self.artifacts[self.next_id] = {"id": self.next_id + 5000, "expired": expired, "workflow_run": {"id": self.next_id}, "size_in_bytes": len(self.zips[self.next_id + 5000])}
+        return self.next_id
+
+    def __call__(self, argv, **kwargs):
+        argv = list(argv)
+        path = argv[-1]
+        self.calls.append(path)
+        self.argvs.append(argv)
+        if len(argv) != 3 or argv[1] != "api" or any(a.startswith("-") for a in argv[2:]):
+            raise AssertionError("fake github serves `gh api <path>`, a plain GET; got %r" % argv)
+        done = lambda text, code=0, err="": subprocess.CompletedProcess(argv, code, text, err)
+        if any(bad in path for bad in self.fail_paths):
+            return done("", 1, "gh: HTTP 500")
+        base = "repos/%s/" % self.REPO
+        if path == base + "pulls/12":
+            return done(json.dumps(self.pull))
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+        if path.startswith(base + "actions/runs?"):
+            event = query["event"][0]
+            runs = [r for r in self.runs.get(event, []) if ("head_sha" not in query or r["head_sha"] == query["head_sha"][0]) and ("branch" not in query or r["head_branch"] == query["branch"][0])]
+            return done(json.dumps({"workflow_runs": sorted(runs, key=lambda r: r["created_at"], reverse=True)[:int(query.get("per_page", ["30"])[0])]}))
+        if path.startswith(base + "actions/artifacts?"):
+            return done(json.dumps({"artifacts": list(self.artifacts.values())}))
+        found = re.fullmatch(re.escape(base) + r"actions/artifacts/(\d+)/zip", path)
+        if found:
+            return subprocess.CompletedProcess(argv, 0, self.zips[int(found.group(1))], b"")
+        raise AssertionError("fake github: no route for %r" % path)
+
+
+class TestReds(Base):
+    """`reds OWNER/REPO#N` (ask #342): classify from failing-tests artifacts: main's latest run, flaky (2 of main's last 5 usable runs), or new."""
+
+    def setUp(self):
+        super().setUp()
+        self.hs = sb.load_reds()
+        self.fake = FakeActions()
+        self.state = self.home / "reds-state"
+        self.state.mkdir(mode=0o700)
+        self.clock = [1_800_000_000.0]
+
+    def now(self):
+        return self.clock[0]
+
+    def created(self, minutes_ago):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.clock[0] - minutes_ago * 60))
+
+    class Reader:
+        def __init__(self, runner, repo):
+            self.runner, self.repo = runner, repo
+
+        def json(self, path):
+            done = self.runner(["gh", "api", path])
+            if done.returncode != 0:
+                raise sb.load_reds().RedsError(done.stderr)
+            return json.loads(done.stdout)
+
+        def zip(self, path):
+            done = self.runner(["gh", "api", path])
+            if done.returncode != 0:
+                raise sb.load_reds().RedsError(done.stderr)
+            return done.stdout
+
+    def run_reds(self, events=("push",), cache=True):
+        out = io.StringIO()
+        code = self.hs.run(self.Reader(self.fake, FakeActions.REPO), FakeActions.REPO, 12, list(events), self.state if cache else None, self.now, out)
+        return code, out.getvalue()
+
+    def main_runs(self, histories, event="push", branch="main"):
+        """histories: failing-name lists, newest first."""
+        for position, names in enumerate(histories):
+            self.fake.add_run(event, branch, names, created=self.created(10 + position * 60))
+
+    def test_s1_a_name_on_main_s_latest_run_is_main_two_of_five_is_flaky_and_the_rest_is_new(self):
+        self.fake.pr_run(["t/a.test::a", "t/b.test::b", "t/c.test::c"])
+        self.main_runs([["t/a.test::a"], ["t/b.test::b"], [], ["t/b.test::b"], []])
+        code, out = self.run_reds()
+        self.assertEqual(code, 0, out)
+        lines = out.splitlines()
+        self.assertEqual(len([l for l in lines if l.startswith("    t/a.test::a")]), 1)
+        self.assertIn("also failing on main (1):\n    t/a.test::a (1 of 5 main runs)", out)
+        self.assertIn("flaky on main (1):\n    t/b.test::b (2 of 5 main runs)", out)
+        self.assertIn("new (1):\n    t/c.test::c", out)
+        self.assertRegex(out, r"main's latest run: push [0-9c]{7} \d+m ago \(reference events: push\)")
+
+    def test_s2_one_failure_in_five_is_not_flaky_two_is(self):
+        self.fake.pr_run(["x::once", "y::twice"])
+        self.main_runs([[], ["x::once", "y::twice"], [], ["y::twice"], []])
+        code, out = self.run_reds()
+        self.assertIn("flaky on main (1):\n    y::twice (2 of 5 main runs)", out)
+        self.assertIn("new (1):\n    x::once (1 of 5 main runs)", out)
+
+    def test_s3_runs_without_an_artifact_incomplete_or_expired_are_unknown_and_never_passing(self):
+        self.fake.pr_run(["f::flaky-one"])
+        self.fake.add_run("push", "main", ["f::flaky-one"], created=self.created(10))
+        self.fake.add_run("push", "main", ["f::flaky-one"], created=self.created(70))
+        self.fake.add_run("push", "main", [], created=self.created(130), artifact=False)
+        self.fake.add_run("push", "main", ["f::flaky-one"], complete=False, created=self.created(190))
+        self.fake.add_run("push", "main", ["f::flaky-one"], created=self.created(250), expired=True)
+        code, out = self.run_reds()
+        self.assertEqual(code, 0, out)
+        self.assertIn("main runs: 5 listed, 2 usable, 3 unknown", out)
+        self.assertIn("flaky on main", out)
+        self.assertNotIn("flaky-one (2 of 5", out)
+        self.assertIn("(2 of 2 main runs)", out)
+
+    def test_s3_an_unknown_latest_run_means_failing_on_main_cannot_be_said(self):
+        self.fake.pr_run(["a::fails"])
+        self.fake.add_run("push", "main", ["a::fails"], created=self.created(10), artifact=False)
+        self.fake.add_run("push", "main", ["a::fails"], created=self.created(70))
+        code, out = self.run_reds()
+        self.assertIn('UNKNOWN (no artifact), so "failing on main" cannot be said', out)
+        self.assertNotIn("also failing on main (1)", out)
+
+    def test_s4_names_are_stripped_bounded_and_at_most_two_thousand_are_read(self):
+        names = ["bad\x1b[2Jname\x9b\u2028::x", "L" * 500] + ["n%d" % i for i in range(3000)]
+        self.fake.pr_run(names)
+        self.main_runs([[]])
+        code, out = self.run_reds()
+        self.assertEqual([c for c in out if (ord(c) < 32 and c != "\n") or 0x7f <= ord(c) <= 0x9f or c in "\u2028\u2029"], [])
+        self.assertLessEqual(max(len(line) for line in out.splitlines()), 240)
+        self.assertIn("2000 failing in the pull request's run", out)
+
+    def test_s5_cold_and_warm_calls_stay_within_the_limits_and_nothing_is_written(self):
+        self.fake.pr_run(["a::t"])
+        self.main_runs([["a::t"], [], ["a::t"], [], ["a::t"]])
+        self.run_reds()
+        cold = len(self.fake.calls)
+        self.assertLessEqual(cold, 12, self.fake.calls)
+        del self.fake.calls[:]
+        self.run_reds()
+        self.assertLessEqual(len(self.fake.calls), 3, self.fake.calls)
+        self.assertTrue(self.fake.argvs and all(a[1] == "api" and len(a) == 3 for a in self.fake.argvs), "every call is a plain `gh api <path>` GET")
+        # two reference events: 14 and 4
+        second = FakeActions()
+        second.pr_run(["a::t"])
+        for position in range(3):
+            second.add_run("merge_group", "gh-readonly-queue/main/pr-%d-abc" % position, ["a::t"], created=self.created(10 + position * 60))
+        for position in range(2):
+            second.add_run("schedule", "main", ["a::t"], created=self.created(40 + position * 60))
+        shutil.rmtree(str(self.state))
+        self.state.mkdir(mode=0o700)
+        self.fake = second
+        self.run_reds(events=("merge_group", "schedule"))
+        self.assertLessEqual(len(second.calls), 14, second.calls)
+        del second.calls[:]
+        self.run_reds(events=("merge_group", "schedule"))
+        self.assertLessEqual(len(second.calls), 4, second.calls)
+
+    def test_s5_without_a_cache_every_call_is_made_again(self):
+        self.fake.pr_run(["a::t"])
+        self.main_runs([["a::t"]] * 5)
+        self.run_reds(cache=False)
+        first = len(self.fake.calls)
+        self.run_reds(cache=False)
+        self.assertEqual(len(self.fake.calls), 2 * first)
+
+    def test_s6_a_repo_with_only_merge_group_and_schedule_runs_uses_them_and_the_default_uses_push(self):
+        self.fake.pr_run(["a::t", "b::u"])
+        self.fake.add_run("merge_group", "gh-readonly-queue/main/pr-9-aaa", ["a::t"], created=self.created(10))
+        self.fake.add_run("merge_group", "gh-readonly-queue/release/pr-9-aaa", ["b::u"], created=self.created(5))   # another branch's queue: not main
+        self.fake.add_run("schedule", "main", ["b::u"], created=self.created(70))
+        self.fake.add_run("schedule", "feature", ["b::u"], created=self.created(1))
+        code, out = self.run_reds(events=("merge_group", "schedule"))
+        self.assertIn("main runs: 2 listed, 2 usable, 0 unknown", out)
+        self.assertRegex(out, r"main's latest run: merge_group [0-9c]{7} ")
+        self.assertIn("also failing on main (1):\n    a::t", out)
+        code, out = self.run_reds(events=("push",))
+        self.assertIn("main's latest run: none found", out)
+        self.assertEqual(self.hs.DEFAULT_EVENTS, ["push"])
+
+    def test_s7_full_name_first_then_a_unique_leaf_marked_and_a_duplicate_leaf_is_never_guessed(self):
+        self.fake.pr_run(["a/x.test::exact", "p/y.test::renamed", "q/z.test::dup", "m::lonely"])
+        self.main_runs([["a/x.test::exact", "other/y.test::renamed", "r/one.test::dup", "s/two.test::dup", "lonely"]])
+        code, out = self.run_reds()
+        self.assertIn("a/x.test::exact (1 of 1 main runs)\n", out)
+        self.assertIn("p/y.test::renamed (1 of 1 main runs); matched by name only", out)
+        self.assertIn("m::lonely (1 of 1 main runs); matched by name only", out)
+        self.assertIn("new (1):\n    q/z.test::dup\n", out, "a leaf that is not unique stays unmatched")
+
+    def test_s8_the_prs_own_incomplete_flag_never_judges_main(self):
+        self.fake.pr_run(["a::t"], complete=False)
+        self.main_runs([["a::t"], []])
+        code, out = self.run_reds()
+        self.assertIn("its list is INCOMPLETE", out)
+        self.assertIn("main runs: 2 listed, 2 usable, 0 unknown", out)
+        self.assertIn("also failing on main (1)", out)
+
+    def test_u1_a_failed_read_says_so_classifies_nothing_and_exits_1(self):
+        self.fake.pr_run(["a::t"])
+        self.main_runs([["a::t"]])
+        for bad in ("pulls/12", "actions/runs?head_sha", "actions/runs?event=push", "actions/artifacts?name"):
+            fake = self.fake
+            fake.fail_paths = {bad}
+            code, out = self.run_reds(cache=False)
+            self.assertEqual(code, 1, bad)
+            self.assertIn("nothing was classified", out)
+            self.assertNotIn("also failing on main", out)
+        self.fake.fail_paths = set()
+
+    def test_a_garbage_artifact_a_pr_without_a_run_and_a_pr_without_an_artifact_are_said(self):
+        self.fake.pr_run(["a::t"], artifact=False)
+        code, out = self.run_reds()
+        self.assertEqual(code, 3, "unknown, not classified")
+        self.assertIn("no usable failing-tests artifact (no artifact): unknown, nothing was classified", out)
+        broken = FakeActions()
+        broken.add_run("pull_request", "feature", [], created=self.created(1), sha="b" * 40, raw=b"not a zip")
+        self.fake = broken
+        code, out = self.run_reds()
+        self.assertIn("unknown, nothing was classified", out)
+        empty = FakeActions()
+        self.fake = empty
+        code, out = self.run_reds()
+        self.assertIn("no completed pull_request run", out)
+
+    def unknown_case(self, build):
+        self.fake = FakeActions()
+        shutil.rmtree(str(self.state / "reds-cache"), ignore_errors=True)
+        self.fake.pr_run(["a::t", "b::u"])
+        build(self.fake)
+        return self.run_reds()
+
+    def assert_cannot_classify(self, code, out, why):
+        self.assertEqual(code, self.hs.EXIT_UNKNOWN, out)
+        self.assertIn("no usable reference run (%s): cannot classify" % why, out)
+        self.assertIn("unknown (2):\n    a::t\n    b::u", out)
+        self.assertNotIn("new (", out, "a red is never called new on no evidence")
+        self.assertNotIn("also failing on main", out)
+        self.assertNotIn("flaky on main", out)
+
+    def test_with_no_usable_reference_run_the_reds_are_unknown_never_new(self):
+        code, out = self.unknown_case(lambda fake: None)
+        self.assert_cannot_classify(code, out, "none found")
+        code, out = self.unknown_case(lambda fake: [fake.add_run("push", "main", ["a::t"], created=self.created(10 + n * 60), expired=True) for n in range(3)])
+        self.assert_cannot_classify(code, out, "no artifact: expired or never uploaded")
+        code, out = self.unknown_case(lambda fake: [fake.add_run("push", "main", ["a::t"], complete=False, created=self.created(10 + n * 60)) for n in range(3)])
+        self.assert_cannot_classify(code, out, "incomplete: not all tests ran")
+        code, out = self.unknown_case(lambda fake: fake.add_run("push", "main", [], created=self.created(10), raw=b"not a zip"))
+        self.assert_cannot_classify(code, out, "unreadable: the artifact is not a zip")
+        code, out = self.unknown_case(lambda fake: (fake.add_run("push", "main", [], created=self.created(10), artifact=False),
+                                                    fake.add_run("push", "main", ["a::t"], complete=False, created=self.created(70))))
+        self.assert_cannot_classify(code, out, "incomplete: not all tests ran; no artifact: expired or never uploaded")
+
+    def test_an_unknown_latest_run_with_older_complete_runs_classifies_by_those_alone_and_says_so(self):
+        def build(fake):
+            fake.add_run("push", "main", ["a::t"], complete=False, created=self.created(10))   # latest: incomplete
+            fake.add_run("push", "main", ["a::t"], created=self.created(70))
+            fake.add_run("push", "main", ["a::t"], created=self.created(130))
+        code, out = self.unknown_case(build)
+        self.assertEqual(code, 0, out)
+        self.assertIn("main's latest run is unknown: classified by the 2 older complete run(s) only; \"failing on main\" is not said", out)
+        self.assertIn("flaky on main (1):\n    a::t (2 of 2 main runs)", out)
+        self.assertIn("new (1):\n    b::u\n", out, "absent from every COMPLETE run: new is allowed here")
+        self.assertNotIn("also failing on main (1)", out)
+
+    def test_a_mix_of_unknown_and_one_complete_run_classifies_from_the_complete_one(self):
+        def build(fake):
+            fake.add_run("push", "main", [], created=self.created(10), artifact=False)
+            fake.add_run("push", "main", ["a::t"], complete=False, created=self.created(70))
+            fake.add_run("push", "main", ["a::t"], created=self.created(130))
+        code, out = self.unknown_case(build)
+        self.assertEqual(code, 0, out)
+        self.assertIn("1 older complete run(s) only", out)
+        self.assertIn("new (2):\n    a::t (1 of 1 main runs)\n    b::u\n", out)
+        self.assertIn("main runs: 3 listed, 1 usable, 2 unknown", out)
+
+    def test_the_real_command_reads_through_the_real_reader_with_the_configured_events_and_exits_1_on_a_failed_read(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": "gh", "reds": {"reference_events": {"acme/widget": ["merge_group", "schedule"]}}})
+        self.fake.pr_run(["a::t", "b::u"])
+        self.fake.add_run("merge_group", "gh-readonly-queue/main/pr-1-x", ["a::t"], created=self.created(10))
+        self.fake.add_run("schedule", "main", ["b::u"], created=self.created(70))
+        self.fake.add_run("push", "main", ["b::u"], created=self.created(5))   # a push run: not a reference event of this repo
+        with captured() as (out, err):
+            code = sb.main(["reds", "acme/widget#12"], runner=self.fake, now=self.now)
+        self.assertEqual(code, 0, out.getvalue() + err.getvalue())
+        self.assertIn("main runs: 2 listed, 2 usable, 0 unknown", out.getvalue())
+        self.assertIn("(reference events: merge_group, schedule)", out.getvalue())
+        self.assertTrue(any("event=merge_group" in c for c in self.fake.calls) and not any("event=push" in c for c in self.fake.calls))
+        self.fake.fail_paths = {"actions/artifacts?name"}
+        shutil.rmtree(str(sb.state_dir_path() / "reds-cache"), ignore_errors=True)
+        with captured() as (out, err):
+            code = sb.main(["reds", "acme/widget#12"], runner=self.fake, now=self.now)
+        self.assertEqual(code, 1)
+        self.assertIn("nothing was classified", out.getvalue())
+        self.assertNotIn("also failing on main", out.getvalue())
+
+    def test_an_oversized_or_unsized_artifact_is_refused_before_the_download_and_a_full_artifact_page_is_said(self):
+        self.fake.pr_run(["a::t"])
+        run = self.fake.add_run("push", "main", ["a::t"], created=self.created(10))
+        self.fake.artifacts[run]["size_in_bytes"] = self.hs.ZIP_MAX + 1
+        code, out = self.run_reds()
+        self.assertIn("main runs: 1 listed, 0 usable, 1 unknown; run %d: artifact too large" % run, out)
+        self.assertFalse([c for c in self.fake.calls if c.endswith("/zip") and str(self.fake.artifacts[run]["id"]) in c], "never downloaded")
+        del self.fake.artifacts[run]["size_in_bytes"]
+        shutil.rmtree(str(self.state / "reds-cache"))
+        code, out = self.run_reds()
+        self.assertIn("artifact too large or of unknown size", out)
+        # a full page: a run missing from it may be older than the page
+        self.fake.artifacts.update({10_000 + n: {"id": 20_000 + n, "expired": False, "workflow_run": {"id": 10_000 + n}, "size_in_bytes": 10} for n in range(100)})
+        missing = self.fake.add_run("push", "main", ["a::t"], created=self.created(5), artifact=False)
+        shutil.rmtree(str(self.state / "reds-cache"))
+        code, out = self.run_reds()
+        self.assertIn("run %d: no artifact in the newest 100" % missing, out)
+
+    def test_main_s_artifacts_are_capped_too_and_a_corrupt_cache_entry_is_a_miss(self):
+        self.fake.pr_run(["n1"])
+        self.main_runs([["n%d" % i for i in range(3000)]])
+        code, out = self.run_reds()
+        self.assertIn("n1 (1 of 1 main runs)", out)
+        cached = sorted((self.state / "reds-cache" / "acme_widget").glob("*.json"))
+        for path in cached:
+            body = json.loads(path.read_text())
+            self.assertLessEqual(len(body.get("failed", [])), self.hs.NAMES_MAX)
+            path.write_text("{garbage")
+        del self.fake.calls[:]
+        code, out = self.run_reds()
+        self.assertEqual(code, 0, "a corrupt cache entry is read again, not trusted")
+        self.assertGreater(len(self.fake.calls), 4)
+
+    def test_the_age_is_right_in_any_time_zone(self):
+        stamp = calendar.timegm((2027, 1, 15, 8, 0, 0))
+        for zone in ("UTC", "America/New_York", "Asia/Kolkata"):
+            with mock.patch.dict(os.environ, {"TZ": zone}):
+                time.tzset()
+                self.assertEqual(self.hs._when("2027-01-15T07:00:00Z", stamp), 3600)
+        time.tzset()
+
+    def test_the_artifact_reader_is_bounded_and_strict(self):
+        for raw in (b"x" * (self.hs.ZIP_MAX + 1), b"PK not really", ):
+            with self.assertRaises(self.hs.RedsError):
+                self.hs.read_zip(raw)
+        with self.assertRaises(self.hs.RedsError):
+            self.hs.read_zip("a text, not bytes")
+        for body in ('{"v": 2, "complete": true, "failed": []}', '{"v": 1, "complete": "yes", "failed": []}', "[1]", "nope"):
+            with self.assertRaises(self.hs.RedsError):
+                self.hs.parse_artifact(body)
+
+    def test_the_cache_is_private_bounded_and_remembers_a_missing_artifact_only_for_a_while(self):
+        self.fake.pr_run(["a::t"])
+        self.main_runs([["a::t"]])
+        self.run_reds()
+        files = list((self.state / "reds-cache" / "acme_widget").glob("*.json"))
+        self.assertEqual(len(files), 2)
+        self.assertEqual({f.stat().st_mode & 0o777 for f in files}, {0o600})
+        cache = self.hs.Cache(self.state, "acme/widget", self.now)
+        cache.put(5, {"unknown": "no artifact"})
+        self.assertEqual(cache.get(5)["unknown"], "no artifact")
+        self.clock[0] += self.hs.UNKNOWN_TTL + 1
+        self.assertIsNone(cache.get(5), "a missing artifact is looked for again later")
+
+    def test_the_config_key_is_validated_and_the_command_takes_only_owner_repo_n(self):
+        self.assertEqual(self.hs.settings({"reference_events": {"acme/widget": ["merge_group", "schedule"]}}), {"acme/widget": ["merge_group", "schedule"]})
+        for bad in (3, {"x": 1}, {"reference_events": []}, {"reference_events": {"nope": ["push"]}}, {"reference_events": {"a/b": []}},
+                    {"reference_events": {"a/b": ["pushh"]}}, {"reference_events": {"a/b": ["push", "push"]}}):
+            with self.assertRaises(ValueError):
+                self.hs.settings(bad)
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "reds": {"reference_events": {"a": ["push"]}}})
+        with captured() as (out, err):
+            self.assertEqual(sb.main(["reds", "no-hash"], runner=self.fake, now=self.now), sb.EXIT_USAGE)
 
 
 class TestDockerReaper(Base):
