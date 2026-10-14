@@ -67,6 +67,7 @@ When you wait on time (CI, a rate limit, a checkpoint, another agent), set a rem
 yourself with `fleet-switchboard remind <your name> <when> --issue <n> "<text>"` and end your
 turn: you are woken then, free while idle. Never poll. `launch` reads the brief's CHECKPOINT (or `--checkpoint 30m --overdue 60m`) and arms the reminders for that checkpoint itself: the worker is reminded at the checkpoint, and you are woken at the overdue time unless the worker has reported or sent anything since the launch, so set none of your own for it. Always pass `--reports-to <your name>` so the overdue wake has someone to wake; a CHECKPOINT line it cannot read arms nothing, and `launch` says so.
 Never poll GitHub in a shell loop; wait with `fleet-switchboard remind` and read with `fleet-switchboard pr-state <owner/repo#N>`.
+Full suites and browser/e2e runs go through `fleet-switchboard heavy -- <cmd>` (a few CPU slots).
 
 ## Writing
 
