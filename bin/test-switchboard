@@ -18296,6 +18296,11 @@ class TestIdentityCheck(ReportBase):
                 self.assertNotIn("inherited-personal-token", done.stdout + done.stderr)
         done, seen = self.run_gh_shim("acme-other/thing", users, {}, args=cred, extra_env={"FLEET_SWITCHBOARD_BIN": ""})
         self.assertEqual(done.returncode, 1, "no switchboard to name the repository")
+        self.assertIn("no GitHub account is mapped for this shell (no switchboard", done.stderr)
+        self.assertIsNone(seen)
+        done, seen = self.run_gh_shim("acme-other/thing", {"acme-ops/service": ["not", "a", "string"]}, {}, args=cred)   # a map that cannot be read as accounts
+        self.assertEqual(done.returncode, 1)
+        self.assertIsNone(seen, "trouble on the credential route refuses, it never falls through")
         done, seen = self.run_gh_shim("acme-ops/service", users, {"acct-ops": "tok-ops"}, args=cred)
         self.assertEqual((done.returncode, seen["token"]), (0, "tok-ops"), "a mapped repository still works")
         done, seen = self.run_gh_shim("acme-other/thing", None, {}, args=cred)

@@ -232,6 +232,8 @@ def account_env(gh, lookup=None, strict=False, credential=False):
     except (AccountLookupFailed, NoAccountMapped):
         raise
     except Exception:
+        if credential:
+            raise NoAccountMapped("this shell (its account could not be worked out)")   # the credential route never guesses: any trouble refuses
         return None
 
 
