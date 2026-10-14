@@ -5,6 +5,7 @@
 // watched; one slow re-read covers a missed event, and one timer fires when a list would turn stale.
 import { createSignal, ErrorBoundary, For, Show } from "solid-js"
 import { watch } from "node:fs"
+import { concernsHealth, healthRows, loadInputs } from "./health.mjs"
 import { HEAVY, THIN, safeUrl, ROW_WIDTH, SAFETY_MS, buildView, concernsFile, hasNotices, loadSnapshot, msUntilStale, panelModeOf, stateDirOf, styledRows, themeColors, viewOf } from "./decisions.mjs"
 
 export default {
@@ -22,6 +23,12 @@ export default {
       }
       return { view: buildView(snapshot, now, ROW_WIDTH, who), rows, next: msUntilStale(snapshot) }
     }
+    // The workspace health block above the Decisions rows (ask #357). Any error drawing it draws nothing: the Decisions never depend on it.
+    const readHealth = () => {
+      if (!dir || process.env.FLEET_SWITCHBOARD_HEALTH === "off") return []
+      try { return healthRows(loadInputs(dir, Date.now()), Date.now(), ROW_WIDTH) } catch { return [] }
+    }
+    const [health, setHealth] = createSignal<any[]>(readHealth())
     const first = read()
     const [view, setView] = createSignal(first.view)
     const [rows, setRows] = createSignal(first.rows)
@@ -30,6 +37,7 @@ export default {
       const { view: next, rows: nextRows, next: staleIn } = read()
       setView(next)
       setRows(nextRows)
+      setHealth(readHealth())
       if (stale) clearTimeout(stale)
       stale = staleIn == null ? undefined : setTimeout(refresh, staleIn)
     }
@@ -37,7 +45,7 @@ export default {
     if (dir) {
       try {
         watcher = watch(dir, { persistent: false }, (_event, filename) => {
-          if (concernsFile(filename)) refresh()
+          if (concernsFile(filename) || concernsHealth(filename)) refresh()
         })
         watcher.on("error", () => {})
       } catch {
@@ -157,13 +165,31 @@ export default {
         </For>
       </box>
     )
+    const healthPanel = () => (
+      <Show when={health().length > 0}>
+        <ErrorBoundary fallback={() => <box />}>
+          <box flexDirection="column">
+            <For each={health()}>
+              {(line: any) => (
+                <text wrapMode="none">
+                  <Pieces segs={line.segs} />
+                </text>
+              )}
+            </For>
+          </box>
+        </ErrorBoundary>
+      </Show>
+    )
     api.ui.slot({
       append: "sidebar.content",
-      // any error while drawing the styled panel falls back to the plain one
+      // any error while drawing the styled panel falls back to the plain one; the health block sits above it
       render: () => (
-        <Show when={rows() != null} fallback={plainPanel()}>
-          <ErrorBoundary fallback={() => plainPanel()}>{styledPanel()}</ErrorBoundary>
-        </Show>
+        <box flexDirection="column">
+          {healthPanel()}
+          <Show when={rows() != null} fallback={plainPanel()}>
+            <ErrorBoundary fallback={() => plainPanel()}>{styledPanel()}</ErrorBoundary>
+          </Show>
+        </box>
       ),
     })
     return () => {
