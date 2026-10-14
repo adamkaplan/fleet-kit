@@ -23166,6 +23166,45 @@ class TestPlanCheckFeedback(unittest.TestCase):
         self.assertEqual(len(result["defects"]), 8, "the data (--json) has every defect")
 
 
+class TestPlanCheckHash(unittest.TestCase):
+    """#364: a `#` inside a clause or scenario field is text; only `#` then a space (or the end) starts an inline comment."""
+
+    def block(self, lines):
+        return "```yaml\nclauses:\n%s```\n" % "".join("  %s\n" % l for l in lines)
+
+    def test_a_hash_with_digits_is_kept_in_a_clause_quoted_or_not(self):
+        for first in ("see #348", '"see #348"', "'see #348'"):
+            self.assertEqual(sb.plan_check.declared_clauses(self.block(["DW-1: " + first, "DW-2: other"])), ["see #348", "other"], first)
+
+    def test_a_hash_with_digits_is_kept_in_scenario_fields_quoted_or_not(self):
+        for value in ("exits 1 for issue #12", '"exits 1 for issue #12"'):
+            text = ("scenarios:\n  - id: S1\n    covers: DW-1\n    text: Given issue #12 is open, when run, then it is shown\n    proof: test\n"
+                    "    pass: %s\n    discriminates: a build that cuts at #12 reads a shorter text\n    evaluator: ci\n" % value)
+            (scenario,) = sb.plan_check.parse_scenarios(text.splitlines())
+            self.assertEqual(scenario["pass"], "exits 1 for issue #12")
+            self.assertEqual(scenario["text"], "Given issue #12 is open, when run, then it is shown")
+            self.assertEqual(scenario["discriminates"], "a build that cuts at #12 reads a shorter text")
+
+    def test_a_comment_is_still_a_comment(self):
+        for value in ("alpha # a comment", "alpha #", "alpha   #  more"):
+            self.assertEqual(sb.plan_check.declared_clauses(self.block(["DW-1: " + value])), ["alpha"], value)
+        self.assertEqual(sb.plan_check.declared_clauses(self.block(["# a comment line", "DW-1: alpha"])), ["alpha"])
+
+    def test_a_mismatch_names_the_first_differing_clause_and_what_was_declared(self):
+        done = "(1) plans are recorded (2) alignment is reviewed (3) the plan is approved"
+        text = ("```yaml\nscenarios:\n  - id: S1\n    covers: DW-1\n    text: Given a thing, when run, then it behaves\n    proof: test\n"
+                "    pass: the call returns status 200 and exactly 1 items\n    discriminates: a stub that returns an empty list fails the count\n"
+                "    evaluator: ci\n```\n" + self.block(["DW-1: plans are recorded", "DW-2: alignment is see", "DW-3: the plan is approved"]))
+        messages = [d["message"] for d in sb.plan_check.check(text, done)["defects"] if d["code"] == "declared-clauses-mismatch"]
+        self.assertEqual(len(messages), 1)
+        self.assertIn("DW-2 differs: declared 'alignment is see'", messages[0])
+        self.assertIn("alignment is reviewed", messages[0])
+        one = "plans are recorded, alignment is reviewed, the plan is approved"
+        text2 = text.split("```yaml\nclauses:")[0] + self.block(["DW-1: plans are recorded", "DW-2: alignment is see", "DW-3: the plan is approved"])
+        messages = [d["message"] for d in sb.plan_check.check(text2, one)["defects"] if d["code"] == "declared-clauses-mismatch"]
+        self.assertIn("DW-2 does not continue the ask: declared 'alignment is see'", messages[0])
+
+
 class TestPlanCheckRules(unittest.TestCase):
     """#135: every validation, both ways."""
 

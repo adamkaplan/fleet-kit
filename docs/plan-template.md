@@ -113,7 +113,7 @@ tab in the indentation, too large, GitHub unreadable). It only reads (GET); it n
 
 There is no yaml library and nothing is evaluated. The parser reads a flat list of maps with scalar values: plain,
 `'single'` or `"double"` quoted (quote a value that starts with `[ { & * ! | > % @` or a backtick), continued on
-deeper-indented lines, or a `|`/`>` block. Comments (`# ...`) are allowed. Refused, naming the block line: tabs, nested
+deeper-indented lines, or a `|`/`>` block. Comments (`# ...`) are allowed: a `#` starts an inline comment only when a space (or the end of the value) follows it, so `see #348` and `issue #12` stay whole. Refused, naming the block line: tabs, nested
 lists or maps, flow lists `[a, b]`, anchors and tags, duplicate keys, a second document, over 100 KB or 200 scenarios.
 
 ## A good example
