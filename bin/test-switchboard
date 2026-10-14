@@ -41339,7 +41339,6 @@ class TestDockerReaper(Base):
         dest.mkdir()
         (dest / "docker").write_text("#!/bin/sh\nexit 0\n")
         os.chmod(str(dest / "docker"), 0o755)
-        os.symlink(str(dest / "docker"), str(self.home / "linked-docker-dir"))
         sub = self.home / "viaLink"
         sub.mkdir()
         os.symlink(str(dest / "docker"), str(sub / "docker"))
@@ -41361,9 +41360,23 @@ class TestDockerReaper(Base):
         open_dir.write_text("#!/bin/sh\nexit 0\n")
         os.chmod(str(open_dir), 0o755)
         os.chmod(str(open_dir.parent), 0o777)
-        self.assertIn("group or other can change", sb._docker_problem(str(open_dir))[1])
+        self.assertIn("others can change", sb._docker_problem(str(open_dir))[1])
         os.chmod(str(open_dir.parent), 0o1777)
         self.assertEqual(sb._docker_problem(str(open_dir))[1], None, "a sticky directory is fine")
+        # a standard install sits under a root-owned, group-writable ancestor (/Applications): fine; a group-writable ancestor of another owner is not
+        real_stat, ancestor = os.stat, os.path.realpath(str(self.home.parent))
+
+        def fake_stat(path, *a, **k):
+            info = real_stat(path, *a, **k)
+            if os.path.realpath(str(path)) == ancestor:
+                return types.SimpleNamespace(st_mode=0o40775, st_uid=owner[0])
+            return info
+
+        owner = [0]
+        with mock.patch.object(sb.os, "stat", fake_stat):
+            self.assertEqual(sb._docker_problem(good)[1], None, "a root-owned group-writable ancestor is the operating system's own")
+            owner[0] = os.getuid() + 1
+            self.assertIn("others can change", sb._docker_problem(good)[1])
         plain = self.home / "plain" / "docker"
         plain.parent.mkdir()
         plain.write_text("#!/bin/sh\nexit 0\n")

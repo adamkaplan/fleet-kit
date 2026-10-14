@@ -2290,11 +2290,16 @@ def _docker_problem(name):
             return None, "belongs to another user: not trusted"
         if info.st_mode & 0o022:
             return None, "is writable by group or other: not trusted"
-        here = os.path.dirname(real)
+        here, first = os.path.dirname(real), True
         while True:
-            mode = os.stat(here).st_mode
-            if mode & 0o022 and not mode & 0o1000:
-                return None, "sits in a directory (%s) that group or other can change: not trusted" % _plain(here, 80)
+            at = os.stat(here)
+            mode = at.st_mode
+            if not mode & 0o1000:   # a sticky directory (/tmp) lets nobody replace another's file
+                # the file's own directory must be closed to group and other; an ancestor only to OTHER, or to a group when it is not root's (a root-owned
+                # group-writable /Applications or /usr/local, where a standard Docker install lives, is the operating system's own)
+                if (first and mode & 0o022) or mode & 0o002 or (mode & 0o020 and at.st_uid not in (0,)):
+                    return None, "sits in a directory (%s) that others can change: not trusted; pass the absolute path of a docker kept in a directory only you or root can write" % _plain(here, 80)
+            first = False
             parent = os.path.dirname(here)
             if parent == here:
                 break
