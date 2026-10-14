@@ -11358,7 +11358,7 @@ class TestSelfRegisteringCli(unittest.TestCase):
         # was in a shared list is still in its group, and the only additions are commands that already said `direct` themselves
         self.assertTrue(set(self.OLD_DIRECT) <= set(sb.DIRECT_ACTIONS))
         # these already said `cmd_x.direct = True` before this change, so they already ran direct: the views only make that visible
-        self.assertEqual(set(sb.DIRECT_ACTIONS) - set(self.OLD_DIRECT), {"disk", "heavy", "load-replay", "pr-state", "read", "reds", "triage"})
+        self.assertEqual(set(sb.DIRECT_ACTIONS) - set(self.OLD_DIRECT), {"disk", "heavy", "load-replay", "pr-state", "reds", "triage"})
         self.assertEqual(sorted(sb.LEDGER_ACTIONS), sorted(self.OLD_LEDGER))
         self.assertEqual(sorted(sb.ENSURE_ON_USE_COMMANDS), sorted(self.OLD_ENSURE_ON_USE))
         known = self.commands()[0].commands
