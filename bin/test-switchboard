@@ -29,6 +29,7 @@ import importlib.util
 import inspect
 import http.client
 import io
+import select
 import json
 import os
 os.environ.setdefault("FLEET_SWITCHBOARD_UNDER_TEST", "1")   # the suite never runs the real opencode (refuse_real_opencode_under_test)
@@ -41626,14 +41627,14 @@ class TestHeavySlots(Base):
             return True
 
     def test_s3_the_wrapper_reaps_its_child_and_leaves_no_zombie(self):
-        """While the wrapper is still alive (kept so by a grandchild that holds the output pipe open), the finished command must not be a zombie of it."""
-        child_pid = self.home / "short-pid"
-        proc = self.start("sh", "-c", 'echo $$ > "%s"; (sleep 3 &) ; exit 0' % child_pid)
-        self.assertTrue(self.until(child_pid.exists))
-        pid = int(child_pid.read_text())
-        time.sleep(0.5)   # the command has exited; the wrapper must have reaped it by now, however busy the machine
-        self.assertTrue(self.until(lambda: self.state_of(pid) is None, 10), "no zombie (state %r)" % self.state_of(pid))
-        proc.wait(timeout=15)
+        """In this very process (so the wrapper IS the parent): when `run` returns, its child has already been waited for, not left a zombie."""
+        pidfile = self.home / "short-pid"
+        err = io.StringIO()
+        status = self.hs.run(["sh", "-c", 'echo $$ > "%s"' % pidfile], self.state(), 1, 10, name="inproc", environ=dict(os.environ), out=err)
+        self.assertEqual(status, 0, err.getvalue())
+        pid = int(pidfile.read_text())
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(pid, os.WNOHANG)   # nothing of ours is left to reap: a zombie would answer here
 
     @staticmethod
     def state_of(pid):
@@ -41700,7 +41701,6 @@ class TestHeavySlots(Base):
     def test_s7_a_state_directory_that_cannot_be_written_runs_the_suite_unslotted_with_one_line(self):
         blocked = self.home / "blocked"
         blocked.write_text("a file, so no directory can be made under it")
-        import io
         err = io.StringIO()
         self.assertIsNone(self.hs.wrap_argv([], {"XDG_STATE_HOME": str(blocked)}, "/py", "/sw", "/s", err=err))
         self.assertEqual(err.getvalue().count("\n"), 1)
@@ -41730,7 +41730,12 @@ class TestHeavySlots(Base):
         holder = self.start("sleep", "30", slots=1)
         self.assertTrue(self.until(lambda: len(self.hs.holders(self.state(), 1)) == 1))
         waiting = self.start("true", slots=1)
-        time.sleep(1.0)
+        seen = ""
+        end = time.time() + 10
+        while "waiting for a slot" not in seen and time.time() < end:   # the wrapper says so once it is queued
+            if select.select([waiting.stderr], [], [], 0.2)[0]:
+                seen += os.read(waiting.stderr.fileno(), 4096).decode()
+        self.assertIn("waiting for a slot", seen)
         waiting.send_signal(signal.SIGTERM)
         self.assertEqual(waiting.wait(timeout=10), 128 + signal.SIGTERM, "a wrapper that is still waiting just ends")
         zero = self.start("true", slots=1, wait_max=0)
