@@ -1,4 +1,4 @@
 {
  "command": "retire",
- "help": "usage: fleet-switchboard retire [-h] [--reason REASON] [--undo] name positional arguments: name The agent's fleet name options: -h, --help show this help message and exit --reason REASON Why (one line) --undo Watch it again"
+ "help": "usage: fleet-switchboard retire [-h] [--reason REASON] [--undo] [--close] [--force] name positional arguments: name The agent's fleet name options: -h, --help show this help message and exit --reason REASON Why (one line) --undo Watch it again --close Also close the agent's terminal pane (frees its memory): only its boss, the Chief of Staff for a direct report, or the operator; the pane is read again and must still hold the agent's own session; never your own pane --force With --close: close a pane that is still working (refused for a worker with unpushed or uncommitted work in a registered worktree)"
 }
