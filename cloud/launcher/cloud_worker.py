@@ -7,7 +7,7 @@ holds a credential: the cluster login is kubectl's own, and a worker's GitHub to
 """
 import argparse
 import datetime as dt
-import getpass
+import pwd
 import hashlib
 import json
 import os
@@ -160,7 +160,7 @@ class Launcher:
     def audit(self, worker, runtime_id, action, cost, ok, reason=""):
         os.makedirs(os.path.dirname(self.audit_path), exist_ok=True)
         line = {"ts": iso(self.clock()), "worker": worker, "runtime_id": runtime_id, "action": action,
-                "cost_estimate_usd": cost, "ok": ok, "actor": getpass.getuser(), "reason": reason}
+                "cost_estimate_usd": cost, "ok": ok, "actor": pwd.getpwuid(os.getuid()).pw_name, "reason": reason}
         try:
             fd = os.open(self.audit_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
             with os.fdopen(fd, "a") as f:  # one short O_APPEND write: atomic enough for one line, the chosen guarantee
@@ -179,6 +179,9 @@ class Launcher:
         except CloudError as e:
             self.audit(worker, info["rid"], action, info["cost"], False, reason or str(e))
             raise
+        except (ValueError, TypeError, KeyError) as e:  # a bad annotation or reply still writes its ok:false line
+            self.audit(worker, info["rid"], action, info["cost"], False, reason or str(e)[:300])
+            raise CloudError("unexpected cloud data: %s" % str(e)[:200])
         self.audit(worker, info["rid"], action, info["cost"], True, reason)
         return result
 
@@ -258,6 +261,8 @@ class Launcher:
             res = json.loads(out.strip().splitlines()[-1])
         except (ValueError, IndexError):
             return {"pushed": False, "wip_branch": None, "error": "end hook gave no result"}
+        if not isinstance(res, dict):
+            return {"pushed": False, "wip_branch": None, "error": "end hook gave no result"}
         if res.get("error"):  # text from inside the pod and the remote: printable, short, before it is shown or audited
             res["error"] = re.sub(r"[^\x20-\x7e]", "?", str(res["error"]))[:300]
         return res
@@ -280,8 +285,11 @@ class Launcher:
                 raise CloudError("end hook could not push, pod kept: %s" % res["error"], EXIT_HOOK)
             self.kube.annotate(name, hook_ran="true")
             self.kube.delete(name)
+            skipped = [re.sub(r"[^\x20-\x7e]", "?", str(x))[:200] for x in (res.get("skipped") or [])][:50]
+            if skipped:  # these files were not pushed and went with the pod: say so, loudly
+                print("cloud-worker: WARNING: not saved (secret-looking names): %s" % ", ".join(skipped), file=sys.stderr)
             return {"worker": worker, "runtime_id": "pod/" + name, "pushed": bool(res.get("pushed")),
-                    "wip_branch": res.get("wip_branch")}
+                    "wip_branch": res.get("wip_branch"), "skipped": skipped}
         return self._audited(worker, "stop", go, reason)
 
     def delete(self, a):

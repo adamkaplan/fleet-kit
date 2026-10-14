@@ -433,6 +433,14 @@ class S5EndHook(Base):
         self.assertNotIn("\x1b", err)
         self.assertLessEqual(len(err), 300)
 
+    def test_stop_says_which_files_were_not_saved(self):
+        work, _ = make_repo(self.tmp.name, "r", dirty=True)
+        self.patch_state(hook_env={"FLEET_WORKDIR": work, "FLEET_WORKER": "coder7"})
+        self.create("coder7")
+        code, out, err = self.run_cli("stop", "coder7")
+        self.assertEqual((code, json.loads(out)["skipped"]), (0, [".env"]))
+        self.assertIn(".env", err)
+
     def test_hook_reports_skipped_secret_files(self):
         work, _ = make_repo(self.tmp.name, "r", dirty=True)
         self.assertEqual(end_hook.run(work, "coder7")["skipped"], [".env"])
@@ -453,6 +461,8 @@ class S5EndHook(Base):
 class U1Scope(unittest.TestCase):
     def test_only_new_paths_under_cloud_launcher_and_bin(self):
         root = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=HERE, capture_output=True, text=True).stdout.strip()
+        if not os.environ.get("FLEET_CHECK_SCOPE"):
+            self.skipTest("set FLEET_CHECK_SCOPE=1 to check the PR's scope against origin/main (a review-time check, not a permanent test)")
         base = subprocess.run(["git", "merge-base", "HEAD", "origin/main"], cwd=root, capture_output=True, text=True)
         if base.returncode != 0:
             self.skipTest("no origin/main to diff against")

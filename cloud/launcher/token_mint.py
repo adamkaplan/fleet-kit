@@ -17,7 +17,16 @@ IDENTITY_FILE = "/var/run/secrets/azure/tokens/azure-identity-token"
 OUT_FILE = "/run/fleet-tmp/github-token"
 
 
-def mint(endpoint, identity_file=IDENTITY_FILE, out_file=OUT_FILE, now=None, opener=urllib.request.urlopen):
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None  # the identity token goes to the named endpoint only
+
+
+def _open(req, timeout):
+    return urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout)
+
+
+def mint(endpoint, identity_file=IDENTITY_FILE, out_file=OUT_FILE, now=None, opener=_open):
     u = urllib.parse.urlparse(endpoint)
     if u.scheme != "https" and u.hostname not in ("127.0.0.1", "localhost"):
         raise ValueError("the token endpoint must be https")
