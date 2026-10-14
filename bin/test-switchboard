@@ -39569,6 +39569,160 @@ class TestPermanentRefusals(ExternalWorld):
         self.assertEqual(self.fake.items[self.ext_of("issue")]["state"], "open")
 
 
+class AlreadyDecidedRefusal(Exception):
+    """What the real adapter raises for a 409 "already decided": a permanent refusal that says it is settled outside."""
+
+    permanent = True
+    settled_outside = True
+
+
+class TestSettledOutside(ExternalWorld):
+    """Ask #53: an "already decided (or closed)" reply to a revise or withdraw is the other side's answer, not a failure."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake = PickyExternal()
+        self.pulls = 0
+        real = self.fake.pull_changes
+
+        def counting(cursor):
+            self.pulls += 1
+            return real(cursor)
+        self.fake.pull_changes = counting
+
+    def links(self):
+        return json.loads((self.world.state / "external-links.json").read_text())["links"]
+
+    def count_line(self):
+        return self.cmd("you", "status")["out"]
+
+    def open_decision(self):
+        self.turn_on()
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        self.run_pass()
+        return self.ext_of("issue")
+
+    def test_s1_a_withdraw_answered_already_decided_is_settled_outside_and_counts_for_nothing(self):
+        self.open_decision()
+        self.fake.refuse["withdraw"] = AlreadyDecidedRefusal("409: already decided")
+        self.assertEqual(self.cmd("you", "decisions", "resolve", "api#2")["code"], 0)
+        for _ in range(3):
+            self.run_pass(120)
+        self.assertEqual(len([c for c in self.fake.calls if c[0] == "withdraw"]), 1, "not tried again")
+        self.assertEqual(len(self.audit_events("external.settled_outside")), 1)
+        self.assertEqual(self.audit_events("external.permanent_failure"), [])
+        self.assertNotIn("permanent failure", self.count_line())
+
+    def test_s2_a_revise_answered_already_decided_or_closed_is_the_same(self):
+        ext = self.open_decision()
+        self.fake.refuse["revise"] = AlreadyDecidedRefusal("409: already decided or closed")
+        self.gh.issues[(API, 2)]["title"] = "Which database should it use?"
+        for _ in range(3):
+            self.run_pass(120)
+        (event,) = self.audit_events("external.settled_outside")
+        self.assertEqual(event["detail"]["op"], "revise")
+        self.assertEqual(self.audit_events("external.permanent_failure"), [])
+        self.assertNotIn("permanent failure", self.count_line())
+        (link,) = self.links().values()
+        self.assertTrue(link["decided_outside"])
+        self.assertNotIn("last_error", link)
+
+    def test_s3_nothing_more_is_queued_for_a_settled_link_and_the_answer_is_pulled_and_applied(self):
+        ext = self.open_decision()
+        self.fake.refuse["revise"] = AlreadyDecidedRefusal("409: already decided")
+        self.gh.issues[(API, 2)]["title"] = "Which database should it use?"
+        self.run_pass(120)
+        revises = len([c for c in self.fake.calls if c[0] == "revise"])
+        self.assertEqual(revises, 1)
+        pulls = self.pulls
+        self.gh.issues[(API, 2)]["title"] = "Which database should the service use?"   # changes again: still no operation for it
+        self.fake.refuse.clear()
+        for _ in range(3):
+            self.run_pass(120)
+        self.assertEqual(len([c for c in self.fake.calls if c[0] in ("revise", "withdraw", "status")]), revises)
+        self.assertEqual(json.loads((self.world.state / "external-outbox.json").read_text())["ops"], [])
+        self.assertGreater(self.pulls, pulls, "the answer is looked for")
+        self.event(ext, kind="answered", by="human")
+        self.run_pass(120)
+        self.assertEqual(len(self.audit_events("external.answered")), 1, "the answer that was decided outside is applied here")
+
+    def test_s3_the_settle_pulls_on_the_same_cycle(self):
+        self.turn_on(poll_seconds=600)   # a long poll: only the settle itself can make the pull happen now
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        self.run_pass()
+        ext = self.ext_of("issue")
+        self.fake.refuse["revise"] = AlreadyDecidedRefusal("409: already decided")
+        self.event(ext, kind="answered", by="human")
+        self.gh.issues[(API, 2)]["title"] = "Which database should it use?"
+        self.run_pass(1)   # one cycle: the flush settles, and the pull of that same cycle takes the answer
+        self.assertEqual(len(self.audit_events("external.settled_outside")), 1)
+        self.assertEqual(len(self.audit_events("external.answered")), 1)
+
+    def test_s4_a_real_permanent_error_still_counts(self):
+        self.turn_on()
+        self.fake.refuse["raise"] = PermanentRefusal("400: invalid request")
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        for _ in range(3):
+            self.run_pass(120)
+        self.assertEqual(len(self.audit_events("external.permanent_failure")), 1)
+        self.assertEqual(self.audit_events("external.settled_outside"), [])
+        self.assertIn("1 permanent failure(s)", self.count_line())
+
+    def test_s6_other_permanent_refusals_are_counted_and_none_is_settled(self):
+        for name in ("invalid request", "unknown item", "refused credential"):
+            with self.subTest(name=name):
+                self.setUp()
+                self.turn_on()
+                self.fake.refuse["raise"] = PermanentRefusal("4xx: %s" % name)
+                self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+                self.run_pass(120)
+                self.assertEqual((len(self.audit_events("external.permanent_failure")), len(self.audit_events("external.settled_outside"))), (1, 0))
+
+    def test_s5_a_failure_is_cleared_when_its_link_closes_and_a_failed_raise_with_no_link_stays(self):
+        ext = self.open_decision()
+        self.fake.refuse["revise"] = PermanentRefusal("400: invalid request")
+        self.gh.issues[(API, 2)]["title"] = "Which database should it use?"
+        self.run_pass(120)
+        self.assertIn("1 permanent failure(s)", self.count_line())
+        self.fake.refuse.clear()
+        self.event(ext, kind="answered", by="human")
+        self.run_pass(120)
+        self.assertNotIn("permanent failure", self.count_line(), "its link closed: the old failure is not a failure to show")
+        self.fake.refuse["raise"] = PermanentRefusal("400: invalid request")
+        self.gh.issue(API, 3, "Another one?", labels=["me:awaiting-cos"])
+        self.run_pass(120)
+        self.run_pass(120)
+        self.assertIn("1 permanent failure(s)", self.count_line(), "a failed raise has no link and still counts")
+
+    def test_s5_a_settled_failure_entry_of_the_same_decision_is_cleared(self):
+        ext = self.open_decision()
+        self.fake.refuse["revise"] = PermanentRefusal("400: invalid request")
+        self.gh.issues[(API, 2)]["title"] = "Which database should it use?"
+        self.run_pass(120)
+        self.assertIn("1 permanent failure(s)", self.count_line())
+        self.fake.refuse["withdraw"] = AlreadyDecidedRefusal("409: already decided")
+        self.fake.refuse.pop("revise")
+        self.assertEqual(self.cmd("you", "decisions", "resolve", "api#2")["code"], 0)
+        self.run_pass(120)
+        self.run_pass(120)
+        self.assertNotIn("permanent failure", self.count_line())
+
+    def test_s7_what_is_pushed_for_other_decisions_is_unchanged_after_a_settle(self):
+        self.open_decision()
+        self.fake.refuse["revise"] = AlreadyDecidedRefusal("409: already decided")
+        self.gh.issues[(API, 2)]["title"] = "Which database should it use?"
+        self.run_pass(120)
+        self.fake.refuse.clear()
+        self.gh.issue(API, 3, "Another decision?", labels=["me:awaiting-cos"])
+        self.run_pass(120)
+        self.assertEqual(len([c for c in self.fake.calls if c[0] == "raise"]), 2, "the new decision is raised once, as before")
+
+    def test_the_real_adapter_error_says_it_is_settled_outside_and_only_that_one(self):
+        self.assertTrue(EA.AlreadyDecided.settled_outside)
+        for cls in (EA.Conflict, EA.InvalidRequest, EA.NotFound, EA.CredentialError, EA.DisabledError, EA.Unsupported, EA.MappingError):
+            self.assertFalse(getattr(cls, "settled_outside", False), cls.__name__)
+
+
 LINK_HARNESS = r"""
 import * as d from "%(url)s";
 const now = Date.parse("2026-03-04T12:00:00Z");

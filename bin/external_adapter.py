@@ -171,7 +171,10 @@ class Conflict(AdapterError):
 
 
 class AlreadyDecided(Conflict):
-    """The item is already decided or finished: read its answer instead."""
+    """The item is already decided or finished: read its answer instead. The sync engine does NOT count this as a failure: the link is settled outside
+    (`settled_outside`), nothing more is pushed for it and the answer is pulled."""
+
+    settled_outside = True
 
 
 class RateLimited(AdapterError):
