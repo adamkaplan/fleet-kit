@@ -146,8 +146,8 @@ def _strip_comment(value):
         elif char in "'\"":
             if index == 0 or value[index - 1] in " \t":
                 quote = char
-        elif char == "#" and (index == 0 or value[index - 1] in " \t"):
-            return value[:index].rstrip()
+        elif char == "#" and (index == 0 or value[index - 1] in " \t") and (index + 1 == len(value) or value[index + 1] in " \t"):
+            return value[:index].rstrip()   # a comment is `#` then a space (or the end): `#348` and `issue #12` are text (#364)
     return value.rstrip()
 
 
@@ -385,6 +385,30 @@ def declared_clauses(text):
 
 def _words(text):
     return re.findall(r"[a-z0-9]+", re.sub(r"\([0-9]+\)", " ", str(text).lower()))
+
+
+def first_difference(declared, clauses, done_when):
+    """One sentence naming the FIRST declared clause that does not match the ask, with what was declared for it (#364). `clauses` is the ask's
+    numbered clause list (when it has more than one); otherwise the declared clauses must continue the ask's own words in order."""
+    if len(clauses) > 1:
+        for number, ask in enumerate(clauses, 1):
+            if number > len(declared):
+                return "DW-%d is missing: the ask has %r" % (number, " ".join(str(ask).split())[:100])
+            if _words(declared[number - 1]) != _words(ask):
+                return "DW-%d differs: declared %r, the ask has %r" % (number, declared[number - 1][:100], " ".join(str(ask).split())[:100])
+        if len(declared) > len(clauses):
+            return "DW-%d is declared but the ask has only %d clauses: %r" % (len(clauses) + 1, len(clauses), declared[len(clauses)][:100])
+        return None
+    ask, position = _words(done_when), 0
+    for number, text in enumerate(declared, 1):
+        words = _words(text)
+        if ask[position:position + len(words)] != words:
+            return "DW-%d does not continue the ask: declared %r, the ask has %r at that point" % (
+                number, text[:100], " ".join(ask[position:position + len(words)])[:100])
+        position += len(words)
+    if position != len(ask):
+        return "the declared clauses stop early: the ask goes on with %r" % " ".join(ask[position:])[:100]
+    return None
 
 
 def verify_declared(declared, done_when):
@@ -800,7 +824,7 @@ def check(text, done_when, plan_done_when=None):
             if len(declared) != len(clauses) or not verify_declared(declared, done_when):
                 extra.append({"id": "-", "code": "declared-clauses-mismatch", "message": "declared clauses do not match the "
                               "ask: the ask has %d numbered clauses and the plan declares %d (a plan can never merge or drop "
-                              "clauses). The ask has: %r" % (len(clauses), len(declared), _normal(done_when)[:160])})
+                              "clauses). First difference: %s. The ask has: %r" % (len(clauses), len(declared), (first_difference(declared, clauses, done_when) or "the clauses differ"), _normal(done_when)[:160])})
         elif not _words(done_when):
             extra.append({"id": "-", "code": "no-done-when", "message": "the plan declares clauses but the ask has no "
                           "Done-when to check them against"})
@@ -809,7 +833,7 @@ def check(text, done_when, plan_done_when=None):
         else:
             extra.append({"id": "-", "code": "declared-clauses-mismatch", "message": "declared clauses do not match the ask: "
                           "joined in order they must reproduce the Done-when text (case, spacing, punctuation and `(n)` "
-                          "numbers are ignored). The ask has: %r" % _normal(done_when)[:160]})
+                          "numbers are ignored). First difference: %s. The ask has: %r" % ((first_difference(declared, clauses, done_when) or "the clauses differ"), _normal(done_when)[:160])})
     defects, warnings = validate(scenarios, clauses, text)
     defects = [d for d in defects if not (extra and d["code"] == "no-done-when")] + extra
     if declared is None and len(clauses) == 1 and len(re.findall(r"[;,]", clauses[0])) >= 3 and not re.search(r"\([0-9]+\)", done_when or ""):
