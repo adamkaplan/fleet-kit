@@ -837,6 +837,54 @@ def _one_line(text, limit=300):
     return decision_core.one_line(text, limit)
 
 
+STATE_HEARTBEAT_SECONDS = 90   # a status file whose own timestamp is its liveness signal is rewritten at least this often, changed or not
+_STATE_LAST = {}               # path -> (stable text, monotonic time written): what this process last wrote
+
+
+def state_write(path, text, stable=None, heartbeat=None, fsync=False, nofollow=False):
+    """Write `text` to `path` (a private file: a temp file, mode 0600, renamed into place) ONLY WHEN IT CHANGED. Returns True when it wrote.
+
+    `stable` is the text to compare: the content without its volatile fields (a timestamp that moves every pass), default `text` itself.
+    What this process last wrote decides while the file is there; a file that is missing is written. `heartbeat` (seconds) keeps a status
+    whose own timestamp is read as liveness fresh: it is rewritten when its last write is older than that. A write nobody needs costs the disk
+    a write, an fsync and a rename that every file watcher sees: about twenty files used to be rewritten every pass."""
+    path = Path(path)
+    key, clock = str(path), time.monotonic()
+    stable = text if stable is None else stable
+    last = _STATE_LAST.get(key)
+    try:
+        exists = path.exists()
+        if exists and last is not None and last[0] == stable and (heartbeat is None or clock - last[1] < heartbeat):
+            return False
+        if exists and last is None and heartbeat is None and path.read_text() == text:
+            _STATE_LAST[key] = (stable, clock)
+            return False
+    except OSError:
+        pass
+    temp = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))
+    try:
+        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | (os.O_NOFOLLOW if nofollow else 0), 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+            if fsync:
+                handle.flush()
+                os.fsync(handle.fileno())
+        os.replace(str(temp), str(path))
+    except BaseException:
+        try:
+            os.unlink(str(temp))
+        except OSError:
+            pass
+        raise
+    _STATE_LAST[key] = (stable, clock)
+    return True
+
+
+def _without(body, *names):
+    """`body` (a dict) as sorted JSON without the top-level `names`: the stable part of a status."""
+    return json.dumps({k: v for k, v in body.items() if k not in names}, sort_keys=True)
+
+
 CURSOR_LIMIT = 2000  # characters of one v2 cursor token we will pass back on an argv
 MAX_READ_PAGES = 12   # pages of SYNTHETIC_PAGE messages `delivered_keys` reads before it holds (600 messages, newest first, stopping at the first old enough)
 SYNTHETIC_PAGE = 50   # messages of one such read: a long history never answers a big page
@@ -1270,12 +1318,7 @@ class V2Client:
                 "breaker": self.breaker.state, "episodes": self.breaker.episode,
                 "p95_ms": None if self.breaker.p95() is None else int(self.breaker.p95() * 1000)}
         try:
-            target = Path(self.state_dir) / V2_LINK_STATUS_FILE
-            temp = target.with_name("%s.%d.tmp" % (V2_LINK_STATUS_FILE, os.getpid()))
-            fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w") as handle:
-                handle.write(json.dumps(body, sort_keys=True))
-            os.replace(str(temp), str(target))
+            state_write(Path(self.state_dir) / V2_LINK_STATUS_FILE, json.dumps(body, sort_keys=True), _without(body, "at"), STATE_HEARTBEAT_SECONDS)
         except OSError:
             self.count_errors += 1   # a status line is best effort; the failure is counted, and the line shows its own age
 
@@ -4546,21 +4589,12 @@ def read_pane_health(state_dir):
 
 
 def write_pane_health(state_dir, data):
-    path = Path(state_dir) / PANE_HEALTH_FILE
-    temp = path.with_name("%s.%d.tmp" % (PANE_HEALTH_FILE, os.getpid()))
-    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(fd, "w") as handle:
-            handle.write(json.dumps(data, indent=1, sort_keys=True) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.rename(str(temp), str(path))   # atomic over an existing file on POSIX
-    except OSError:
-        try:
-            os.unlink(str(temp))
-        except OSError:
-            pass
-        raise
+    """pane-health.json, only when it changed (its `at`, each agent's `seen` and a live pane's `at` do not count), and at least every 12 minutes."""
+    stable = {k: v for k, v in data.items() if k != "at"}
+    stable["agents"] = {name: {k: v for k, v in (row if isinstance(row, dict) else {}).items() if k != "seen"} for name, row in (data.get("agents") or {}).items()}   # `seen` moves every pass and nothing reads it
+    stable["states"] = {name: {k: v for k, v in (row if isinstance(row, dict) else {}).items() if k != "at" or (row or {}).get("state") == PANE_DEAD}
+                        for name, row in (data.get("states") or {}).items()}   # a live pane's `at` is when it was last checked; only a dead one's is read (when to forget it)
+    state_write(Path(state_dir) / PANE_HEALTH_FILE, json.dumps(data, indent=1, sort_keys=True) + "\n", json.dumps(stable, sort_keys=True), STATE_HEARTBEAT_SECONDS * 8, fsync=True)
 
 
 def pane_health_pass(engine, now):
@@ -7714,11 +7748,7 @@ def record_v2_calls(engine):
         if summary is None:
             return
         path = Path(engine.state_dir) / V2_CALLS_FILE
-        temp = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))
-        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)   # private, like the rest of the state directory
-        with os.fdopen(fd, "w") as handle:
-            handle.write(json.dumps(summary, sort_keys=True) + "\n")
-        os.rename(str(temp), str(path))
+        state_write(path, json.dumps(summary, sort_keys=True) + "\n", _without(summary, "at"), STATE_HEARTBEAT_SECONDS, nofollow=True)   # private; `status` reads its `at` as liveness, so a heartbeat
     except Exception as err:   # evidence only: a pass never fails for it, but the failure is said (once per change), and no temp file is left
         if temp is not None:
             try:
@@ -8708,16 +8738,8 @@ def sweep_queue_fact(state, due, now, cfg):
 def sweep_write(engine, state):
     """sweep.json: the last run's counts, for `status` (a display; nothing decides from it). Written on a change."""
     path = Path(engine.state_dir) / SWEEP_FILE
-    body = json.dumps(state.current, sort_keys=True)
-    if getattr(state, "written", None) == body:
-        return
     try:
-        temp = path.with_name(SWEEP_FILE + ".tmp")
-        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as handle:
-            handle.write(body + "\n")
-        os.replace(str(temp), str(path))
-        state.written = body
+        state_write(path, json.dumps(state.current, sort_keys=True) + "\n", _without(state.current, "at"), STATE_HEARTBEAT_SECONDS * 4)   # its `at` is when it last ran: a heartbeat keeps it honest
     except OSError:
         pass
 
@@ -9400,15 +9422,8 @@ def triage_daily_summary(engine, state, cfg, now, day, repos):
 def triage_write(engine, state):
     path = Path(engine.state_dir) / TRIAGE_FILE
     body = json.dumps(state.current, sort_keys=True)
-    if getattr(state, "written", None) == body:
-        return
     try:
-        temp = path.with_name(TRIAGE_FILE + ".tmp")
-        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as handle:
-            handle.write(body + "\n")
-        os.replace(str(temp), str(path))
-        state.written = body
+        state_write(path, body + "\n", _without(state.current, "at"), STATE_HEARTBEAT_SECONDS * 4)
     except OSError:
         pass
 
@@ -15764,18 +15779,8 @@ def write_pr_state(engine, state, now):
         newest = sorted(state.pr_state.items(), key=lambda kv: kv[1].get("at", 0), reverse=True)[:PR_STATE_MAX]
         body = {"written_at": int(now), "daemon_pid": os.getpid(), "prs": dict(newest)}
         path = Path(engine.state_dir) / PR_STATE_FILE
-        temp = path.with_name("%s.%d.tmp" % (PR_STATE_FILE, os.getpid()))
-        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "w") as handle:
-            handle.write(json.dumps(body, sort_keys=True))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(str(temp), str(path))
+        state_write(path, json.dumps(body, sort_keys=True), _without(body, "written_at", "daemon_pid"), 300, fsync=True, nofollow=True)   # only when the picture changed (or every 5 minutes)
     except OSError as err:
-        try:
-            temp.unlink()
-        except (OSError, UnboundLocalError):
-            pass
         engine._note("pr_state.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})   # `_note` says it once per change of the error; the age on every line shows a stale file
 
 
@@ -15926,11 +15931,7 @@ def write_ci_record_status(engine, state, now, repos):
     body = {"at": int(now), "repos": repos, "recorded": state.recorded,
             "last_record": None if state.last_record is None else int(state.last_record)}
     try:
-        temp = Path(engine.state_dir) / ("%s.%d.tmp" % (CI_RECORD_STATUS_FILE, os.getpid()))
-        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as handle:
-            handle.write(json.dumps(body, sort_keys=True))
-        os.replace(str(temp), str(Path(engine.state_dir) / CI_RECORD_STATUS_FILE))
+        state_write(Path(engine.state_dir) / CI_RECORD_STATUS_FILE, json.dumps(body, sort_keys=True), _without(body, "at"), STATE_HEARTBEAT_SECONDS)
     except OSError:
         pass   # a status line is best effort
 
@@ -17939,6 +17940,9 @@ class BoundedFileCache:
         if not self.ttl:
             return False
         entries = self._fresh()
+        held = entries.get(key)
+        if held is not None and held.get("value") == value and self.now() - held["at"] < self.ttl / 2:
+            return True   # the same answer, still young: rewriting the whole file to move its time would only touch the disk
         entries[key] = {"at": self.now(), "value": value}
         for old in sorted(entries, key=lambda k: entries[k]["at"])[:max(0, len(entries) - self.limit)]:
             del entries[old]

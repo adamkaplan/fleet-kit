@@ -62,6 +62,12 @@ def _read_json(path):
 
 
 def _write_json(path, body):
+    try:   # unchanged: not rewritten (about twenty state files were rewritten every pass, which kept the disk and the file watchers busy)
+        with open(path) as held:
+            if held.read() == json.dumps(body, indent=1, sort_keys=True) + "\n":
+                return
+    except (OSError, ValueError):
+        pass
     temp = "%s.%d.tmp" % (path, os.getpid())
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
