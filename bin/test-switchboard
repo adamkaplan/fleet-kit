@@ -41577,7 +41577,12 @@ class TestHeavySlots(Base):
         procs = {tag: self.start(*self.waiter(tag), name="who-%s" % tag) for tag in "abcd"[:3]}
         self.assertTrue(self.until(lambda: len(self.started()) == 3))
         fourth = self.start(*self.waiter("d"), name="who-d")
-        time.sleep(1.2)
+        err = ""
+        end = time.time() + 30
+        while "waiting for a slot" not in err and time.time() < end:   # the wrapper says so once it is queued (its start-up time varies with the machine)
+            if select.select([fourth.stderr], [], [], 0.2)[0]:
+                err += os.read(fourth.stderr.fileno(), 4096).decode()
+        self.assertIn("waiting for a slot", err)
         self.assertEqual(len(self.started()), 3, "at most 3 run at once")
         (self.home / "release.a").write_text("")
         self.assertTrue(self.until(lambda: "started.d" in self.started()), "the fourth runs once a slot is free")
@@ -41585,7 +41590,7 @@ class TestHeavySlots(Base):
             (self.home / ("release." + tag)).write_text("")
         for proc in list(procs.values()) + [fourth]:
             proc.wait(timeout=15)
-        err = fourth.stderr.read()
+        err += fourth.stderr.read()
         self.assertIn("heavy: waiting for a slot (3 of 3 busy", err)
         self.assertRegex(err, r"who-[abc] sh")
 
