@@ -13624,6 +13624,7 @@ def cmd_run(args, runner, now, wait):
             os.environ.pop(name, None)
     signature = config_signature(config_path())  # taken before the read: an edit in between is seen as a change
     engine, state, config = build_engine(runner, now, "daemon")
+    engine.accounts.conditional = True   # the daemon's reads keep ETags (a 304 is free); a one-shot command reads plainly
     if args.once:
         with single_instance(state):
             report = engine.run_pass()
@@ -14288,6 +14289,11 @@ def _split_http(text):
     return int(found.group(1)), headers, body
 
 
+def _says_rate_limited(*texts):
+    """True when gh's own words say the rate limit is spent (`API rate limit exceeded`, `secondary rate limit`, HTTP 429)."""
+    return any(re.search(r"rate limit|\bHTTP 429\b|abuse detection", text or "", re.I) for text in texts)
+
+
 def _endpoint_of(path):
     """A path as the counter groups it: no repo, no query, numbers as `#` (`repos/o/r/issues/12/parent` -> `issues/#/parent`)."""
     bare = re.sub(r"^repos/[^/]+/[^/]+/?", "", path.split("?")[0])
@@ -14314,6 +14320,7 @@ class GhAccounts:
         self.limited_once = set()                # accounts whose pause was audited, so it is said once per episode
         self.lock = threading.Lock()             # the hub's threads and the pass read through one gate
         self.audit, self.actor = None, "daemon"
+        self.conditional = False                 # ask with `-i` and keep the ETag: the daemon turns it on; a one-shot command or a test reads plainly
 
     def account_for(self, repo):
         if fault("one-account"):
@@ -14388,19 +14395,21 @@ class GhAccounts:
             if until is not None and not essential:
                 raise GhRateLimited(account, until)
             cached = None if paginate else self.etags.get((account, path))
-        argv = [self.config["gh"], "api"] + (["--paginate"] if paginate else []) + [path]
-        if not paginate:
-            argv += ["-i"] + (["-H", "If-None-Match: " + cached[0]] if cached else [])
+        use_head = self.conditional and not paginate
+        flags = ["--paginate"] if paginate else (["-i"] + (["-H", "If-None-Match: " + cached[0]] if cached else []) if use_head else [])
+        argv = [self.config["gh"], "api"] + flags + [path]   # the path stays last
         env = self.env_for(repo) if repo else None
         if env is not None:
             run_kwargs["env"] = env
         done = runner(argv, capture_output=True, text=True, timeout=timeout, **run_kwargs)
-        status, headers, body = _split_http(done.stdout) if not paginate else (None, {}, done.stdout)
+        status, headers, body = _split_http(done.stdout) if use_head else (None, {}, done.stdout)
         with self.lock:
             self.calls.append((now, account, _endpoint_of(path), status == 304))
             while self.calls and self.calls[0][0] < now - 600:
                 self.calls.popleft()
         if status is None:
+            if done.returncode != 0 and _says_rate_limited(done.stderr, done.stdout):   # a plain read: no header block, but gh says it in words
+                self._pause(account, now + GH_LIMIT_DEFAULT_PAUSE, 0)
             return done
         if status == 304 and cached is not None:
             with self.lock:
@@ -14418,13 +14427,16 @@ class GhAccounts:
         if status in (403, 429):
             reset = self._limit_reset(status, headers, body, now)
             if reset is not None:
-                with self.lock:
-                    self.paused[account] = reset
-                    first = account not in self.limited_once
-                    self.limited_once.add(account)
-                if first:
-                    self._audit("github.rate_limited", account, {"until": iso(reset), "status": status})
+                self._pause(account, reset, status)
         return subprocess.CompletedProcess(argv, done.returncode or 1, body, done.stderr or ("HTTP %d" % status))
+
+    def _pause(self, account, until, status):
+        with self.lock:
+            self.paused[account] = until
+            first = account not in self.limited_once
+            self.limited_once.add(account)
+        if first:
+            self._audit("github.rate_limited", account, {"until": iso(until), "status": status})
 
     @staticmethod
     def _limit_reset(status, headers, body, now):

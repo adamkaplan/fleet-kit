@@ -57,14 +57,15 @@ REPO = BIN.parent
 
 
 def with_http_head(serve, argv, kwargs, counters=None):
-    """What `gh api <path> -i [-H "If-None-Match: <etag>"]` does, over a fake that answers `gh api <path>` (`serve(argv_without_flags, kwargs)`): the answer
+    """What `gh api -i [-H "If-None-Match: <etag>"] <path>` does, over a fake that answers `gh api <path>` (`serve(argv_without_flags, kwargs)`): the answer
     gets an HTTP header block with an ETag (a hash of the body) and a conditional read whose tag still matches is answered 304 (exit 1, as the real gh
     does). Anything that is not exactly that shape goes to `serve` untouched."""
     argv = list(argv)
-    tag_in = argv[5].split(": ", 1)[1] if argv[3:5] == ["-i", "-H"] and len(argv) == 6 and argv[5].startswith("If-None-Match: ") else None
-    if not (argv[3:4] == ["-i"] and (len(argv) == 4 or tag_in is not None)):
+    flags = argv[2:-1]
+    tag_in = flags[2].split(": ", 1)[1] if flags[:2] == ["-i", "-H"] and len(flags) == 3 and flags[2].startswith("If-None-Match: ") else None
+    if not (flags[:1] == ["-i"] and (len(flags) == 1 or tag_in is not None)):
         return serve(argv, kwargs)
-    plain = serve(argv[:3], kwargs)
+    plain = serve(argv[:2] + argv[-1:], kwargs)
     if counters is not None:
         counters["http"] = counters.get("http", 0) + 1
     if plain.returncode != 0:
@@ -75,6 +76,8 @@ def with_http_head(serve, argv, kwargs, counters=None):
             counters["not_modified"] = counters.get("not_modified", 0) + 1
         return subprocess.CompletedProcess(argv, 1, "HTTP/2.0 304 Not Modified\r\nEtag: %s\r\n\r\n" % tag, "gh: HTTP 304\n")
     return subprocess.CompletedProcess(argv, 0, "HTTP/2.0 200 OK\r\nEtag: %s\r\nX-Ratelimit-Remaining: 4000\r\n\r\n%s" % (tag, plain.stdout), plain.stderr)
+
+
 SWITCHBOARD = BIN / "fleet-switchboard"
 SCENARIO = BIN / "fleet-scenario"
 
@@ -9764,6 +9767,7 @@ class TestGithubReadGate(IntentCase):
     def setUp(self):
         super().setUp()
         self.accounts = sb.GhAccounts({"gh": FAKE_GH, "call_timeout_seconds": 5, "gh_users": {}}, self.gh, self.world.clock.now, environ={})
+        self.accounts.conditional = True
         self.reader = sb.IntentReader(FAKE_GH, FAKE_REPO, self.gh, self.world.clock.now, 5, accounts=self.accounts)
         self.audit = sb.AuditLog(self.world.audit_path)
         self.accounts.audit = self.audit
@@ -9828,6 +9832,7 @@ class TestGithubReadGate(IntentCase):
             calls.append(argv)
             return self.limited(now())
         accounts = sb.GhAccounts({"gh": FAKE_GH, "call_timeout_seconds": 5, "gh_users": {}}, runner, now, environ={})
+        accounts.conditional = True
         accounts.audit = self.audit
         reader = sb.IntentReader(FAKE_GH, FAKE_REPO, runner, now, 5, accounts=accounts)
         with self.assertRaises(sb.IntentError):
@@ -9860,11 +9865,28 @@ class TestGithubReadGate(IntentCase):
             return self.limited(now()) if (kw.get("env") or {}).get("GH_TOKEN") == "tok-a" else self.gh(argv, **kw)
         config = {"gh": FAKE_GH, "call_timeout_seconds": 5, "gh_users": {"acme/*": "account-a", FAKE_REPO: "account-b"}}
         accounts = sb.GhAccounts(config, runner, now, environ={})
+        accounts.conditional = True
         accounts._tokens = {"account-a": (now() + 9999, "tok-a"), "account-b": (now() + 9999, "tok-b")}
         accounts.read(runner, "repos/acme/other/issues/1", "acme/other", 5)
         with self.assertRaises(sb.GhRateLimited):
             accounts.read(runner, "repos/acme/other/issues/1", "acme/other", 5)
         self.assertEqual(accounts.read(runner, "repos/%s/issues/2" % FAKE_REPO, FAKE_REPO, 5).returncode, 0, "the other account reads on")
+
+    def test_a_plain_read_has_the_old_command_line_and_still_pauses_when_gh_says_the_limit_is_spent(self):
+        now = self.world.clock.now
+        seen = []
+
+        def runner(argv, **kw):
+            seen.append(list(argv))
+            return subprocess.CompletedProcess(argv, 1, "", "gh: API rate limit exceeded for user ID 1 (HTTP 403)")
+        accounts = sb.GhAccounts({"gh": FAKE_GH, "call_timeout_seconds": 5, "gh_users": {}}, runner, now, environ={})   # conditional is off: a one-shot command or a test
+        accounts.read(runner, "repos/%s/issues/2" % FAKE_REPO, FAKE_REPO, 5)
+        self.assertEqual(seen, [[FAKE_GH, "api", "repos/%s/issues/2" % FAKE_REPO]])
+        with self.assertRaises(sb.GhRateLimited):
+            accounts.read(runner, "repos/%s/issues/2" % FAKE_REPO, FAKE_REPO, 5)
+
+    def test_only_the_daemon_turns_conditional_reads_on(self):
+        self.assertFalse(sb.GhAccounts({"gh": FAKE_GH}, None, time.time, environ={}).conditional)
 
     def test_a_403_that_is_not_the_limit_pauses_nothing(self):
         now = self.world.clock.now
@@ -9872,6 +9894,7 @@ class TestGithubReadGate(IntentCase):
         def runner(argv, **kw):
             return subprocess.CompletedProcess(argv, 1, "HTTP/2.0 403 Forbidden\r\nX-Ratelimit-Remaining: 4000\r\n\r\n{\"message\": \"Resource not accessible\"}", "gh: HTTP 403")
         accounts = sb.GhAccounts({"gh": FAKE_GH, "call_timeout_seconds": 5, "gh_users": {}}, runner, now, environ={})
+        accounts.conditional = True
         for _ in range(3):
             accounts.read(runner, "repos/%s/issues/2" % FAKE_REPO, FAKE_REPO, 5)
         self.assertEqual(accounts.call_summary(now())["paused"], {})
@@ -9899,6 +9922,7 @@ class TestGithubReadGate(IntentCase):
     def test_an_answer_without_a_header_block_passes_through_untouched(self):
         plain = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, '{"a": 1}', "")
         accounts = sb.GhAccounts({"gh": FAKE_GH, "call_timeout_seconds": 5, "gh_users": {}}, plain, self.world.clock.now, environ={})
+        accounts.conditional = True
         done = accounts.read(plain, "repos/%s/issues/1" % FAKE_REPO, FAKE_REPO, 5)
         self.assertEqual(done.stdout, '{"a": 1}')
 
