@@ -1001,6 +1001,68 @@ def _one_line(text, limit=300):
     return decision_core.one_line(text, limit)
 
 
+STATE_HEARTBEAT_SECONDS = 60   # a status file whose own timestamp is its liveness signal is rewritten at least this often, changed or not (`status` calls v2-calls stale past 120 s: a pass of 30 s fits twice)
+HEARTBEAT_HEALTH = STATE_HEARTBEAT_SECONDS * 8   # pane-health.json: 8 minutes (nothing reads its times as liveness)
+HEARTBEAT_SWEEP = STATE_HEARTBEAT_SECONDS * 4    # sweep.json and triage.json: 4 minutes (their `at` is shown as an absolute "as of")
+HEARTBEAT_PR_STATE = 300                         # pr-state.json: 5 minutes
+_STATE_LAST = {}               # path -> (stable text, monotonic time written): what this process last wrote
+
+
+def state_write(path, text, stable=None, heartbeat=None, fsync=False, nofollow=False):
+    """Write `text` to `path` (a private file: a temp file, mode 0600, renamed into place) ONLY WHEN IT CHANGED. Returns True when it wrote.
+
+    `stable` is the text to compare: the content without its volatile fields (a timestamp that moves every pass), default `text` itself.
+    The comparison is with what is on the DISK: the file's size and modification time are checked against what this process wrote (one stat), and
+    a file that changed meanwhile (an outside writer, `retire --undo`) is read and compared with what was written, so an external rewrite is
+    repaired at the next call, not at the heartbeat; a mere touch is not. A file that is missing is written. `heartbeat` (seconds) keeps a status
+    whose own timestamp is read as liveness fresh: it is rewritten when its last write is older than that. A write nobody needs costs the disk
+    a write, an fsync and a rename that every file watcher sees: about twenty files used to be rewritten every pass."""
+    path = Path(path)
+    key, clock = str(path), time.monotonic()
+    stable = text if stable is None else stable
+    last = _STATE_LAST.get(key)
+    try:
+        info = path.stat()
+        if last is not None and last[0] == stable and (heartbeat is None or clock - last[1] < heartbeat):
+            if (info.st_mtime_ns, info.st_size) == (last[3], last[4]):
+                return False
+            if path.read_text() == last[2]:   # touched, not rewritten: the content is what this process wrote
+                _STATE_LAST[key] = (last[0], last[1], last[2], info.st_mtime_ns, info.st_size)
+                return False
+            # the file is not what was written: an outside writer changed it; fall through and write it again
+        if last is None and heartbeat is None and info.st_size == len(text.encode("utf-8")) and path.read_text() == text:   # a file of another size is not even read
+            _STATE_LAST[key] = (stable, clock, text, info.st_mtime_ns, info.st_size)
+            return False
+    except OSError:
+        pass
+    temp = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))
+    try:
+        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | (os.O_NOFOLLOW if nofollow else 0), 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+            if fsync:
+                handle.flush()
+                os.fsync(handle.fileno())
+        os.replace(str(temp), str(path))
+    except BaseException:
+        try:
+            os.unlink(str(temp))
+        except OSError:
+            pass
+        raise
+    try:
+        info = path.stat()
+        _STATE_LAST[key] = (stable, clock, text, info.st_mtime_ns, info.st_size)
+    except OSError:
+        _STATE_LAST.pop(key, None)
+    return True
+
+
+def _without(body, *names):
+    """`body` (a dict) as sorted JSON without the top-level `names`: the stable part of a status."""
+    return json.dumps({k: v for k, v in body.items() if k not in names}, sort_keys=True)
+
+
 CURSOR_LIMIT = 2000  # characters of one v2 cursor token we will pass back on an argv
 MAX_READ_PAGES = 12   # pages of SYNTHETIC_PAGE messages `delivered_keys` reads before it holds (600 messages, newest first, stopping at the first old enough)
 SYNTHETIC_PAGE = 50   # messages of one such read: a long history never answers a big page
@@ -1482,12 +1544,7 @@ class V2Client:
                 "breaker": self.breaker.state, "episodes": self.breaker.episode,
                 "p95_ms": None if self.breaker.p95() is None else int(self.breaker.p95() * 1000)}
         try:
-            target = Path(self.state_dir) / V2_LINK_STATUS_FILE
-            temp = target.with_name("%s.%d.tmp" % (V2_LINK_STATUS_FILE, os.getpid()))
-            fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w") as handle:
-                handle.write(json.dumps(body, sort_keys=True))
-            os.replace(str(temp), str(target))
+            state_write(Path(self.state_dir) / V2_LINK_STATUS_FILE, json.dumps(body, sort_keys=True), _without(body, "at"), STATE_HEARTBEAT_SECONDS)
         except OSError:
             self.count_errors += 1   # a status line is best effort; the failure is counted, and the line shows its own age
 
@@ -3208,6 +3265,7 @@ class V2Reads:
 
     A read just BEFORE A WRITE is never served from here (`fresh=True`): invariant 4 holds. `v2_cache_seconds` 0 remembers nothing."""
 
+    LIST_PAGE = 100   # one `session.list` page: the records of up to this many sessions in ONE call
     PROMPT_READ = 10
     PROMPT_READ_WIDE = 50   # when the newest PROMPT_READ user messages are all the fleet's: one wider read, then stop
 
@@ -3229,9 +3287,35 @@ class V2Reads:
         self.engine = engine
         self.sessions, self.prompts, self.inboxes, self.compactions = {}, {}, {}, {}   # session id -> remembered answer; memory only
         self.pass_fills, self.deferred, self.minute = 0, 0, collections.deque()
+        self.listing, self.listed_at, self.pass_lists = {}, None, 0   # the last `session.list` page: session id -> record, and when it was read
 
     def begin_pass(self):
-        self.pass_fills, self.deferred = 0, 0
+        self.pass_fills, self.deferred, self.pass_lists = 0, 0, 0
+
+    def _list_due(self, now):
+        """True when this pass may still read the shared list: its one call is not spent and the last page is half a cache lifetime old."""
+        return (not self.engine.light and self.ttl() > 0 and self.pass_lists == 0
+                and (self.listed_at is None or now - self.listed_at >= self.ttl() / 2.0))
+
+    def listed(self, session_id, now):
+        """The record of a session from ONE shared `session.list` call, or None (then the caller reads that session alone). The list is read at most
+        once per pass and once per half of `v2_cache_seconds`, and counts as one background read however many sessions it refreshes: a fleet of N
+        agents costs one call where it cost N `session.get`. A failed list is not retried before that half is up. Sessions past the page, or a
+        session the list does not hold, are read one by one as before."""
+        ttl = self.ttl()
+        if self.engine.light or ttl <= 0:
+            return None
+        if (self.listed_at is None or now - self.listed_at >= ttl / 2.0) and self.pass_lists == 0 and self.may_fill(now):
+            self.pass_lists += 1
+            self.listed_at = now
+            try:
+                page, _ = self.engine.v2.session_list_page(None, None, self.LIST_PAGE)
+                self.listing = {row["id"]: row for row in page if isinstance(row, dict) and isinstance(row.get("id"), str)}
+                self.filled(now)
+            except V2Error:
+                self.listing = {}
+        found = self.listing.get(session_id)
+        return found if self.listed_at is not None and found is not None else None
 
     def ttl(self):
         return self.engine.config["v2_cache_seconds"]
@@ -3263,19 +3347,30 @@ class V2Reads:
     def session_info(self, session_id, status, now, fresh=False):
         """`session.get`, remembered. `status` is what herdr says the agent is doing now: a change reads again at once."""
         entry, ttl = self.sessions.get(session_id), self.ttl()
+        changed = False
         if entry is not None and not fresh and ttl > 0:
             info, at, was = entry
+            changed = was != status
             if was == status:
                 if now - at < ttl:
                     return info
-                if not self.may_fill(now):
+                if not self.may_fill(now) and not self._list_due(now):
                     self.deferred += 1
                     return info
-            elif now - at < STATUS_REREAD_GAP or not self.may_fill(now):
+            elif now - at < STATUS_REREAD_GAP or (not self.may_fill(now) and not self._list_due(now)):
                 # herdr says the state changed, but this agent was read a moment ago (a flapping agent is read at most once per gap) or the
                 # budget is spent: keep what is remembered and try again at the next pass; a read before a write is fresh whatever this says
                 self.deferred += 1
                 return info
+        if not fresh:
+            row = self.listed(session_id, now)
+            # a row no newer than what is remembered says nothing new, and a row read before herdr's state change cannot show it: those are read alone
+            if row is not None and (entry is None or (self.listed_at or 0) > entry[1]) and (not changed or self.listed_at == now):
+                self.sessions[session_id] = (row, self.listed_at, status)   # aged from when the list was read, so a record never outlives `v2_cache_seconds`
+                return row
+            if entry is not None and not self.may_fill(now):
+                self.deferred += 1
+                return entry[0]
         info = self.engine.v2.session_get(session_id) or {}
         if ttl > 0:
             self.sessions[session_id] = (info, now, status)
@@ -5377,21 +5472,12 @@ def read_pane_health(state_dir):
 
 
 def write_pane_health(state_dir, data):
-    path = Path(state_dir) / PANE_HEALTH_FILE
-    temp = path.with_name("%s.%d.tmp" % (PANE_HEALTH_FILE, os.getpid()))
-    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(fd, "w") as handle:
-            handle.write(json.dumps(data, indent=1, sort_keys=True) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.rename(str(temp), str(path))   # atomic over an existing file on POSIX
-    except OSError:
-        try:
-            os.unlink(str(temp))
-        except OSError:
-            pass
-        raise
+    """pane-health.json, only when it changed (its `at`, each agent's `seen` and a live pane's `at` do not count), and at least every HEARTBEAT_HEALTH seconds (8 minutes)."""
+    stable = {k: v for k, v in data.items() if k != "at"}
+    stable["agents"] = {name: {k: v for k, v in (row if isinstance(row, dict) else {}).items() if k != "seen"} for name, row in (data.get("agents") or {}).items()}   # `seen` moves every pass and nothing reads it
+    stable["states"] = {name: {k: v for k, v in (row if isinstance(row, dict) else {}).items() if k != "at" or (row or {}).get("state") == PANE_DEAD}
+                        for name, row in (data.get("states") or {}).items()}   # a live pane's `at` is when it was last checked; only a dead one's is read (when to forget it)
+    state_write(Path(state_dir) / PANE_HEALTH_FILE, json.dumps(data, indent=1, sort_keys=True) + "\n", json.dumps(stable, sort_keys=True), HEARTBEAT_HEALTH, fsync=True)
 
 
 def pane_health_pass(engine, now):
@@ -5415,11 +5501,14 @@ def pane_health_pass(engine, now):
             states.pop(name, None)       # a retired agent is not judged; it stays listed under its own heading
             continue
         prev = states.get(name) or {}
-        due = prev.get("session") != obs.session_id or prev.get("pane") != obs.pane or now - (prev.get("at") or 0) >= PANE_CHECK_SECONDS
+        # The schedule is the LAST CHECK, which the file no longer records every pass (its `at` is written only on a change): this process remembers it.
+        checked = max(prev.get("at") or 0, engine.__dict__.setdefault("pane_checked", {}).get(name, 0))
+        due = prev.get("session") != obs.session_id or prev.get("pane") != obs.pane or now - checked >= PANE_CHECK_SECONDS
         if due and budget > 0:
             budget -= 1
             state, why, info = pane_state(engine, name, obs.session_id, obs.pane, names, sessions)
-            if state != PANE_UNKNOWN:
+            if state != PANE_UNKNOWN:   # an unreadable look is not a check: it is repeated, as before
+                engine.pane_checked[name] = int(now)
                 if state != prev.get("state") and engine.audit is not None:
                     event = {PANE_DETACHED: "fleetpane.detached", PANE_DEAD: "fleetpane.dead"}.get(state, "fleetpane.recovered" if prev.get("state") in (PANE_DETACHED, PANE_DEAD) else None)
                     if event:
@@ -6543,6 +6632,10 @@ def triage_stop(engine, source, observation, boss, idle_ms, reply):
         return None   # v2_light: no transcript read, so a stop is only its idle rider
     if now - observation.idle_at > engine.config["rider_max_age_seconds"]:
         return None  # a stop that old is not news, and a nudge would be late
+    if engine.state_dir is not None:   # a RETIRED worker is finished on purpose: no nudge, no "stopped without reporting" to its boss (no state dir: triaged as before)
+        kept = read_retired(engine.state_dir).get(observation.name)
+        if kept is not None and kept.get("session") in (None, observation.session_id):
+            return None
     boss_view = engine.discovery.agents.get(boss) if engine.discovery else None
     if boss_view is None:  # the boss cannot be read, so nothing can be said to have been reported: tell it (held)
         verdict = {"outcome": "stopped", "reason": "the boss %s is not running, so its transcript cannot show a report" % boss}
@@ -8644,7 +8737,6 @@ def v2_calls_summary(v2, now):
 
 def record_v2_calls(engine):
     """After a pass: leave the figures where `status` can read them (a small file, renamed into place). Never raises."""
-    temp = None
     try:
         if engine.state_dir is None:
             return
@@ -8654,17 +8746,8 @@ def record_v2_calls(engine):
         if getattr(engine, "feed", None) is not None:
             summary["events"] = engine.feed.status()   # the event feed's figures beside the call figures: the same file, the same line
         path = Path(engine.state_dir) / V2_CALLS_FILE
-        temp = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))
-        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)   # private, like the rest of the state directory
-        with os.fdopen(fd, "w") as handle:
-            handle.write(json.dumps(summary, sort_keys=True) + "\n")
-        os.rename(str(temp), str(path))
-    except Exception as err:   # evidence only: a pass never fails for it, but the failure is said (once per change), and no temp file is left
-        if temp is not None:
-            try:
-                temp.unlink()
-            except OSError:
-                pass
+        state_write(path, json.dumps(summary, sort_keys=True) + "\n", _without(summary, "at"), STATE_HEARTBEAT_SECONDS, nofollow=True)   # private; `status` reads its `at` as liveness, so a heartbeat
+    except Exception as err:   # evidence only: a pass never fails for it, but the failure is said (once per change); state_write leaves no temp file
         try:
             engine._note("v2_calls.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
         except Exception:
@@ -9652,16 +9735,8 @@ def sweep_queue_fact(state, due, now, cfg):
 def sweep_write(engine, state):
     """sweep.json: the last run's counts, for `status` (a display; nothing decides from it). Written on a change."""
     path = Path(engine.state_dir) / SWEEP_FILE
-    body = json.dumps(state.current, sort_keys=True)
-    if getattr(state, "written", None) == body:
-        return
     try:
-        temp = path.with_name(SWEEP_FILE + ".tmp")
-        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as handle:
-            handle.write(body + "\n")
-        os.replace(str(temp), str(path))
-        state.written = body
+        state_write(path, json.dumps(state.current, sort_keys=True) + "\n", _without(state.current, "at"), HEARTBEAT_SWEEP)   # its `at` is when it last ran: a heartbeat keeps it honest
     except OSError:
         pass
 
@@ -10344,15 +10419,8 @@ def triage_daily_summary(engine, state, cfg, now, day, repos):
 def triage_write(engine, state):
     path = Path(engine.state_dir) / TRIAGE_FILE
     body = json.dumps(state.current, sort_keys=True)
-    if getattr(state, "written", None) == body:
-        return
     try:
-        temp = path.with_name(TRIAGE_FILE + ".tmp")
-        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as handle:
-            handle.write(body + "\n")
-        os.replace(str(temp), str(path))
-        state.written = body
+        state_write(path, body + "\n", _without(state.current, "at"), HEARTBEAT_SWEEP)
     except OSError:
         pass
 
@@ -16715,18 +16783,8 @@ def write_pr_state(engine, state, now):
         newest = sorted(state.pr_state.items(), key=lambda kv: kv[1].get("at", 0), reverse=True)[:PR_STATE_MAX]
         body = {"written_at": int(now), "daemon_pid": os.getpid(), "prs": dict(newest)}
         path = Path(engine.state_dir) / PR_STATE_FILE
-        temp = path.with_name("%s.%d.tmp" % (PR_STATE_FILE, os.getpid()))
-        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "w") as handle:
-            handle.write(json.dumps(body, sort_keys=True))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(str(temp), str(path))
+        state_write(path, json.dumps(body, sort_keys=True), _without(body, "written_at", "daemon_pid"), HEARTBEAT_PR_STATE, fsync=True, nofollow=True)   # only when the picture changed (or every 5 minutes)
     except OSError as err:
-        try:
-            temp.unlink()
-        except (OSError, UnboundLocalError):
-            pass
         engine._note("pr_state.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})   # `_note` says it once per change of the error; the age on every line shows a stale file
 
 
@@ -16877,11 +16935,7 @@ def write_ci_record_status(engine, state, now, repos):
     body = {"at": int(now), "repos": repos, "recorded": state.recorded,
             "last_record": None if state.last_record is None else int(state.last_record)}
     try:
-        temp = Path(engine.state_dir) / ("%s.%d.tmp" % (CI_RECORD_STATUS_FILE, os.getpid()))
-        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as handle:
-            handle.write(json.dumps(body, sort_keys=True))
-        os.replace(str(temp), str(Path(engine.state_dir) / CI_RECORD_STATUS_FILE))
+        state_write(Path(engine.state_dir) / CI_RECORD_STATUS_FILE, json.dumps(body, sort_keys=True), _without(body, "at"), STATE_HEARTBEAT_SECONDS)
     except OSError:
         pass   # a status line is best effort
 
@@ -18984,6 +19038,9 @@ class BoundedFileCache:
         if not self.ttl:
             return False
         entries = self._fresh()
+        held = entries.get(key)
+        if held is not None and held.get("value") == value and self.now() - held["at"] < self.ttl / 2:
+            return True   # the same answer, still young: rewriting the whole file to move its time would only touch the disk
         entries[key] = {"at": self.now(), "value": value}
         for old in sorted(entries, key=lambda k: entries[k]["at"])[:max(0, len(entries) - self.limit)]:
             del entries[old]
