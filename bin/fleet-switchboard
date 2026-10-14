@@ -172,6 +172,23 @@ def load_disk_janitor():
     return module
 
 
+def load_cpu_guard():
+    """The CPU guard, bin/cpu_guard.py (the P0 CPU order), loaded by path like plan_check."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cpu_guard.py")
+    held = sys.modules.get("cpu_guard")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("cpu_guard", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["cpu_guard"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("cpu_guard", None)
+        raise
+    return module
+
+
 def load_impact_floor():
     """The impact floor and hold table, bin/impact_floor.py (#179, L3), loaded by path like plan_check."""
     path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "impact_floor.py")
@@ -353,6 +370,7 @@ DEFAULTS = {
     "call_timeout_seconds": 20,
     "send_timeout_seconds": 60,    # `send` as a whole (the sum of its v2 and herdr calls): past it, a clear failure line, never a silent minutes-long wait
     "poll_seconds": 5,
+    "cpu_guard": None,             # load over cores: None = defaults (high_ratio 3 for 5 minutes wakes the Chief of Staff once per episode); false = off; or {"high_ratio": n, "minutes": n}
     "disk_guard": None,            # free space of the state directory's volume: None = defaults (min_free_gb 50, hard_free_gb 10); false = off; or {"min_free_gb": n, "hard_free_gb": n}
     "docker_reaper": True,         # the daily removal of EXPIRED labelled docker containers, networks and volumes (`disk reap-docker`): false is the kill switch
     "v2_events": "auto",           # the daemon's news of sessions: "auto" (the service's event stream, where the HTTP route exists; reads only what an event did not say) or "off" (the old reads)
@@ -496,6 +514,10 @@ def validate_config(raw, source="config"):
                 raise ConfigError("%s: %r value for %s must be a string" % (source, key, name))
         envs[key] = dict(env)
     validate_disk_guard(config["disk_guard"], source)
+    try:
+        load_cpu_guard().validate(config["cpu_guard"], source)
+    except ValueError as err:
+        raise ConfigError(str(err))
     if not isinstance(config["docker_reaper"], bool):
         raise ConfigError("%s: 'docker_reaper' must be true or false, got %r" % (source, config["docker_reaper"]))
     if config["v2_events"] not in ("auto", "off"):
@@ -2189,6 +2211,81 @@ class DiskFacts:
         return [Fact("disk.low:%d" % int(episode), name, "disk", text, episode, sender="switchboard") for name in chiefs]
 
 
+class CpuFacts:
+    """The CPU guard's fact source (bin/cpu_guard.py): ONE `os.getloadavg()` per pass, no process. When the load over the cores stays above the guard for the
+    configured minutes the Chief of Staff is told ONCE for the episode (`cpu.high:<episode>`: the key is stable, so it is delivered once), `cpu.high` is audited
+    with the top process categories from ONE bounded `ps` run when the episode begins (never on another pass), and the episode ends (`cpu.recovered`) below
+    two thirds of the guard. The episode is kept in `cpu-guard.json`, so a restart does not begin a second one."""
+
+    __name__ = "cpu_facts"
+
+    def __init__(self):
+        self.engine = None
+        self.tracker = None
+        self.detail = ""
+        self.thread = None
+
+    def bind(self, engine):
+        self.engine = engine
+
+    def _start_ps(self, engine, cg):
+        """ONE bounded `ps` on a thread: a starved machine must never hang the daemon's pass. The result lands in `self.detail` when it is done; the fact
+        keeps its text until delivered, so it carries the categories when they came back in time."""
+        runner = getattr(engine, "cpu_ps_runner", None) or subprocess.run
+
+        def work():
+            try:
+                done = runner(cg.PS_ARGV, capture_output=True, text=True, timeout=cg.PS_SECONDS, stdin=subprocess.DEVNULL)
+                self.detail = cg.detail(cg.categories(done.stdout)) if done.returncode == 0 else ""
+            except Exception:
+                self.detail = ""
+        self.thread = threading.Thread(target=work, name="cpu-ps", daemon=True)
+        self.thread.start()
+
+    def __call__(self):
+        engine = self.engine
+        if engine is None or engine.state_dir is None:
+            return []
+        cg = load_cpu_guard()
+        cfg = cg.settings(engine.config.get("cpu_guard"))
+        if cfg is None:
+            return []
+        read = cg.reading()
+        if read is None:   # FAIL OPEN: a guard that cannot read the load tells nobody
+            return []
+        discovery = getattr(engine, "discovery", None)
+        chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff") if discovery is not None and not discovery.problems else []
+        if self.tracker is None:
+            self.tracker = cg.Episode(cg.load_episode(engine.state_dir))
+        load1, load5, cores = read
+        ratio = load5 / cores   # the five-minute average decides: a one-minute spike never wakes the Chief of Staff
+        event = self.tracker.step(ratio, engine.now(), cfg, can_begin=bool(chiefs))
+        if event == "begin":
+            self.detail = ""
+            self._start_ps(engine, cg)
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "cpu.high", None, {"load1": round(load1, 1), "load5": round(load5, 1), "cores": cores, "ratio5": round(ratio, 2),
+                                                                      "high_ratio": cfg["high_ratio"], "minutes": cfg["minutes"]})
+            self._save(engine, cg, self.tracker.episode)
+        elif event == "end":
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "cpu.recovered", None, {"load1": round(load1, 1), "load5": round(load5, 1), "cores": cores, "ratio5": round(ratio, 2)})
+            self.detail = ""
+            self._save(engine, cg, None)
+        episode = self.tracker.episode
+        if episode is None or not chiefs:
+            return []
+        text = "cpu high: load %d on %d cores (%.1fx over five minutes; the guard is %gx for %g minutes). %s `%s status` shows the line; heavy work should wait for a slot." % (
+            round(load5), cores, ratio, cfg["high_ratio"], cfg["minutes"], self.detail + "." if self.detail else "", PROG)
+        return [Fact("cpu.high:%d" % int(episode), name, "cpu", " ".join(text.split()), episode, sender="switchboard") for name in chiefs]
+
+    def _save(self, engine, cg, episode):
+        try:
+            cg.save_episode(engine.state_dir, episode)
+        except OSError as err:
+            engine._note("cpu.guard_file", None, {"error": _plain("%s: %s" % (type(err).__name__, err), 160)})
+
+
 # ---------------------------------------------------------------- the docker reaper (ask #321)
 #
 # A test stack or a compose project that an agent starts carries two labels: `fleet.owner=<agent>` and `fleet.expires=<epoch seconds>`. The reaper removes
@@ -2474,7 +2571,7 @@ def fact_sources(state_dir):
     the same rule, and stores nothing.
     """
     return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir),
-            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), JobFacts(), PaneFacts(), DiskFacts(), DockerReapFacts()]
+            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), JobFacts(), PaneFacts(), DiskFacts(), CpuFacts(), DockerReapFacts()]
 
 
 # --------------------------------------------------------- observing the fleet
@@ -13583,6 +13680,11 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         if config_ok and disk_guard_settings(config) is not None:
             report["disk"] = disk_status_line(config, state)   # one stat of the volume
         if config_ok:
+            cg = load_cpu_guard()
+            cpu_cfg = cg.settings(config.get("cpu_guard"))
+            if cpu_cfg is not None:
+                report["cpu"] = cg.status_line(cpu_cfg, cg.reading(), cg.slots_text(config, state))   # a system call (and the optional heavy_slots module): no process
+        if config_ok:
             report["orphans"] = orphan_status_line(config)   # one `ps`; None when there is none or the reaper is off
         if config_ok and config.get("v2_light"):
             try:
@@ -13779,6 +13881,7 @@ def format_status(report):
     lines.extend(format_github(report["github"]) if "github" in report else [])
     lines.extend(format_decisions_status(report["decisions"]) if "decisions" in report else [])
     lines.extend("      disk       " + report["disk"] for _ in [0] if report.get("disk"))
+    lines.extend("      cpu        " + report["cpu"] for _ in [0] if report.get("cpu"))
     lines.extend("      orphans    " + report["orphans"] for _ in [0] if report.get("orphans"))
     lines.extend("      v2 calls   " + report["v2_calls"] for _ in [0] if report.get("v2_calls"))
     lines.extend("      " + text for text in report.get("github_calls") or [])
