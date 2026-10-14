@@ -394,7 +394,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "temp_janitor"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "temp_janitor"}
 
 
 def config_known_keys():
@@ -486,6 +486,7 @@ def validate_config(raw, source="config"):
     validate_external_config(config, source)
     validate_friction_config(config, source)
     validate_worktree_config(config, source)
+    validate_orphan_config(config, source)
     try:
         load_disk_janitor().validate(config.get("temp_janitor"), source)
     except ValueError as err:
@@ -6243,6 +6244,187 @@ def cmd_disk_register_worktree(args, runner, now):
         engine.audit.append(engine.actor, "worktree.registered", args.agent, {"path": found[0], "branch": found[1], "by": "register-worktree"})
     print("registered %s (branch %s) for %s" % (found[0], found[1], args.agent))
     return EXIT_OK
+
+
+# ---------------------------------------------------------------- the orphan reaper (#321 slice S7)
+#
+# A process whose parent is launchd (pid 1) and whose command matches an EXACT allow-list, that this user owns and that has run longer than the grace
+# (`orphan_reaper.grace_hours`, default 6), is an orphan of a finished test or agent: it is listed by `status` and by `disk reap-orphans`, and
+# `disk reap-orphans --apply` sends it SIGTERM, then SIGKILL after a few seconds, each audited. A dry run is the default; the kill switch is
+# `orphan_reaper.enabled: false`. Never pid 1, this process or its parent, never another user's process, never a process whose parent is not 1,
+# never anything that names opencode, herdr, the switchboard or docker, never a command outside the allow-list. The process is read again and must
+# be the same (pid, parent, owner, command) just before each signal, so a pid that was reused is not signalled.
+ORPHAN_GRACE_HOURS = 6
+ORPHAN_MAX_PER_RUN = 20
+ORPHAN_TERM_WAIT_SECONDS = 5
+ORPHAN_NEVER = ("opencode", "herdr", "fleet-switchboard", "docker", "launchd", "ssh", "gpg-agent", "tmux")
+_PS_ROW = re.compile(r"^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.*\S)\s*$")
+
+
+def orphan_config(config):
+    section = (config or {}).get("orphan_reaper") or {}
+    grace = section.get("grace_hours", ORPHAN_GRACE_HOURS)
+    return {"enabled": section.get("enabled", True) is not False, "grace_seconds": int(grace * 3600)}
+
+
+def validate_orphan_config(config, source):
+    raw = config.get("orphan_reaper")
+    if raw is None:
+        return
+    ok = isinstance(raw, dict) and not set(raw) - {"enabled", "grace_hours"} and isinstance(raw.get("enabled", True), bool)
+    grace = raw.get("grace_hours", ORPHAN_GRACE_HOURS) if isinstance(raw, dict) else None
+    if not ok or isinstance(grace, bool) or not isinstance(grace, (int, float)) or not 0.5 <= grace <= 24 * 30:
+        raise ConfigError("%s: 'orphan_reaper' must be {\"enabled\": true|false, \"grace_hours\": 0.5 to 720}, got %r" % (source, raw))
+
+
+def _etime_seconds(text):
+    """ps etime `[[dd-]hh:]mm:ss` in seconds, or None."""
+    m = re.match(r"^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$", text or "")
+    if not m:
+        return None
+    days, hours, minutes, seconds = (int(g or 0) for g in m.groups())
+    return ((days * 24 + hours) * 60 + minutes) * 60 + seconds
+
+
+def ps_table():
+    """[(pid, ppid, uid, age seconds, command)] from one `ps`; [] when it cannot be run (nothing is then a candidate)."""
+    try:
+        done = subprocess.run(["ps", "-axo", "pid=,ppid=,uid=,etime=,command="], capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    rows = []
+    for line in (done.stdout or "").splitlines():
+        m = _PS_ROW.match(line)
+        age = _etime_seconds(m.group(4)) if m else None
+        if m and age is not None:
+            rows.append((int(m.group(1)), int(m.group(2)), int(m.group(3)), age, m.group(5)))
+    return rows
+
+
+def _under(path, roots):
+    real = os.path.realpath(path) + "/"
+    return any(real.startswith(root) for root in roots)
+
+
+def orphan_roots():
+    """(temp roots, worktree roots): this user's own temp directory (`tempfile.gettempdir()`, not all of /tmp or /var/folders) and the fleet's worktrees."""
+    temps = {os.path.realpath(tempfile.gettempdir()) + "/"}
+    worktrees = {os.path.realpath(os.path.expanduser("~/Code/fleet-kit.wt")) + "/"}
+    return temps, worktrees
+
+
+def orphan_kind(command, roots=None):
+    """The allow-list: `fake-agent` (a test double under a temp host-mctx directory), `node-test` (a `node --test` runner) or `python-helper` (a python
+    script that lives in a worktree of the fleet or in a temp directory); None for anything else."""
+    temps, worktrees = roots or orphan_roots()
+    parts = command.split()
+    if not parts or any(word in command.lower() for word in ORPHAN_NEVER):
+        return None
+    exe = os.path.basename(parts[0])
+    args = parts[1:]
+    if exe == "node":   # a test runner whose command line names a path in a fleet worktree or a temp directory (a bare `node --test` is not matched)
+        paths = [a for a in args if os.path.isabs(a) and ".." not in a.split("/")]
+        return "node-test" if "--test" in args and any(_under(a, worktrees | temps) for a in paths) else None
+    if re.fullmatch(r"[Pp]ython[0-9.]*", exe):
+        script = next((a for a in args if not a.startswith("-")), None)
+        if script is None or not script.endswith(".py") or not os.path.isabs(script) or ".." in script.split("/"):
+            return None
+        if os.path.basename(script) == "fake-agent.py" and "host-mctx" in script and _under(script, temps):
+            return "fake-agent"
+        if _under(script, worktrees | temps):
+            return "python-helper"
+    return None
+
+
+def orphan_reap_candidates(table=None, config=None, roots=None, me=None):
+    """([(pid, kind, age, command)] past the grace, [same] still within it): processes of this user whose parent is pid 1 and that match the allow-list."""
+    grace = orphan_config(config)["grace_seconds"]
+    uid, mine = os.getuid(), me or {1, os.getpid(), os.getppid()}
+    due, young = [], []
+    for pid, ppid, owner, age, command in (table() if table else ps_table()):
+        if pid in mine or ppid != 1 or owner != uid:
+            continue
+        kind = orphan_kind(command, roots)
+        if kind is not None:
+            (due if age >= grace else young).append((pid, kind, age, command))
+    return due, young
+
+
+def orphan_status_line(config, table=None):
+    """`orphans 2: node-test 4242 (9 h), ...`, or None when there is none or the reaper is off."""
+    if not orphan_config(config)["enabled"]:
+        return None
+    due, young = orphan_reap_candidates(table, config)
+    if not due:
+        return None
+    shown = ", ".join("%s %d (%d h)" % (kind, pid, age // 3600) for pid, kind, age, _ in due[:5])
+    return "%d: %s%s (past %d h: `disk reap-orphans --apply`)" % (len(due), shown, ", ..." if len(due) > 5 else "", orphan_config(config)["grace_seconds"] // 3600)
+
+
+def reap_orphans(engine, apply, table=None, kill=None, sleep=None, roots=None, by=None):
+    """Plan or do the reap: a dict with `due`, `young` and, applied, `results` [(pid, kind, outcome)]. Each signal is audited."""
+    config = engine.config
+    kill, sleep = kill or os.kill, sleep or time.sleep   # looked up at call time, so a test can replace them
+    due, young = orphan_reap_candidates(table, config, roots)
+    out = {"due": due, "young": young, "results": []}
+    if not apply:
+        return out
+    if engine.audit is None:
+        raise LaunchError("no audit log is open: nothing was signalled (every signal is audited first)")
+
+    def same(pid, command, age):   # the pid still names the process judged: same parent, owner and command, and no younger (a reused pid restarts at 0)
+        for row in (table() if table else ps_table()):
+            if row[0] == pid:
+                return row[1] == 1 and row[2] == os.getuid() and row[4] == command and row[3] >= age
+        return False
+
+    for pid, kind, age, command in due[:ORPHAN_MAX_PER_RUN]:
+        detail = {"by": by, "pid": pid, "kind": kind, "age_hours": age // 3600, "command": _one_line(command, 160)}
+        if not same(pid, command, age):
+            out["results"].append((pid, kind, "changed: not signalled"))
+            continue
+        try:
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "orphan.term", str(pid), detail)
+            kill(pid, signal.SIGTERM)
+            for _ in range(ORPHAN_TERM_WAIT_SECONDS):
+                sleep(1)
+                if not same(pid, command, age):
+                    break
+            if same(pid, command, age):
+                if engine.audit is not None:
+                    engine.audit.append(engine.actor, "orphan.kill", str(pid), detail)
+                kill(pid, signal.SIGKILL)
+                out["results"].append((pid, kind, "killed"))
+            else:
+                out["results"].append((pid, kind, "terminated"))
+        except ProcessLookupError:
+            out["results"].append((pid, kind, "already gone"))
+        except OSError as err:
+            out["results"].append((pid, kind, "failed: %s" % _one_line(str(err), 80)))
+    if len(due) > ORPHAN_MAX_PER_RUN:
+        out["results"].append((0, "-", "%d of %d handled (cap %d): run it again" % (ORPHAN_MAX_PER_RUN, len(due), ORPHAN_MAX_PER_RUN)))
+    return out
+
+
+def cmd_disk_reap_orphans(args, runner, now):
+    """`disk reap-orphans [--apply]`: list (the default) or signal the orphans past the grace. `--apply` is the operator's or the Chief of Staff's."""
+    engine, state, config = build_engine(runner, now, "cli", writable=bool(args.apply))
+    settings = orphan_config(config)
+    if args.apply:
+        kind = gates_caller_kind(runner, now)
+        if not (kind[0] == "person" or (kind[0] == "agent" and len(kind) > 2 and kind[2] == "chief-of-staff")):
+            raise LaunchError("refused: only the operator or the Chief of Staff may --apply an orphan reap (%s is %s)" % (kind[1], "an agent" if kind[0] == "agent" else "not known"))
+        if not settings["enabled"]:
+            raise LaunchError("the orphan reaper is switched off (orphan_reaper.enabled is false): nothing was signalled")
+    result = reap_orphans(engine, bool(args.apply), by=identify_who(engine, runner, now) if args.apply else None)
+    for pid, kind, age, command in result["due"]:
+        print("  %s %d  %d h old  %s" % (kind, pid, age // 3600, _one_line(command, 100)))
+    for pid, kind, outcome in result["results"]:
+        print("  %s: %s" % (pid or "-", outcome) if kind == "-" else "  %d %s: %s" % (pid, kind, outcome))
+    print("%s: %d orphan(s) past %d h%s; %d younger left alone%s" % (PROG, len(result["due"]), settings["grace_seconds"] // 3600,
+          "" if args.apply else " (a dry run: add --apply)", len(result["young"]), "" if settings["enabled"] else "; the reaper is switched off"))
+    return EXIT_ERROR if any(o.startswith(("failed", "changed")) for _, _, o in result["results"]) else EXIT_OK
 
 
 def identify_who(engine, runner, now):
@@ -13226,6 +13408,8 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         report["v2_calls"] = v2_calls_status(state, now())
         if config_ok and disk_guard_settings(config) is not None:
             report["disk"] = disk_status_line(config, state)   # one stat of the volume
+        if config_ok:
+            report["orphans"] = orphan_status_line(config)   # one `ps`; None when there is none or the reaper is off
         if config_ok and config.get("v2_light"):
             try:
                 unknown = SentLedger(state).unknown_count()
@@ -13421,6 +13605,7 @@ def format_status(report):
     lines.extend(format_github(report["github"]) if "github" in report else [])
     lines.extend(format_decisions_status(report["decisions"]) if "decisions" in report else [])
     lines.extend("      disk       " + report["disk"] for _ in [0] if report.get("disk"))
+    lines.extend("      orphans    " + report["orphans"] for _ in [0] if report.get("orphans"))
     lines.extend("      v2 calls   " + report["v2_calls"] for _ in [0] if report.get("v2_calls"))
     lines.extend("      v2_light   " + report["v2_light"] for _ in [0] if report.get("v2_light"))
     lines.extend(sweep_status_lines(report.get("sweep")))  # #117
@@ -18521,7 +18706,7 @@ def cmd_disk_janitor(args, runner, now):
 def cmd_disk(args, runner, now):
     """The `disk` group: `prune` (the disk guard, #319), `reap-docker` (#326) and `reclaim-worktrees` / `register-worktree` (the worktree lifecycle, #321)."""
     try:   # `direct` skips dispatch's error mapping, so refusals are mapped here for every subcommand
-        return {"report": cmd_disk_report, None: cmd_disk_report, "prune": cmd_disk_prune, "reap-docker": cmd_disk_reap_docker, "janitor": cmd_disk_janitor, "reclaim-worktrees": cmd_disk_reclaim_worktrees, "register-worktree": cmd_disk_register_worktree}[args.disk_action](args, runner, now)
+        return {"report": cmd_disk_report, None: cmd_disk_report, "prune": cmd_disk_prune, "reap-docker": cmd_disk_reap_docker, "janitor": cmd_disk_janitor, "reap-orphans": cmd_disk_reap_orphans, "reclaim-worktrees": cmd_disk_reclaim_worktrees, "register-worktree": cmd_disk_register_worktree}[args.disk_action](args, runner, now)
     except (LaunchError, ConfigError, CallerError, LockError) as err:
         sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err))))
         return EXIT_ERROR
@@ -18556,6 +18741,8 @@ def add_disk_parsers(sub):
                                               "temp_janitor.days (default 7) and that no state file of the fleet names, no keep glob matches and no .fleet-keep marker "
                                               "protects. Never follows a link, never touches another user's entry. Each removal is one temp.removed audit line.")
     janitor.add_argument("--apply", action="store_true", help="Remove them (the default only lists)")
+    orphans = disk_sub.add_parser("reap-orphans", help="Signal (SIGTERM, then SIGKILL) orphaned test helpers past the grace: parent launchd, an exact allow-list; a dry run unless --apply")
+    orphans.add_argument("--apply", action="store_true", help="Do it (default: a dry run)")
     reclaim = disk_sub.add_parser("reclaim-worktrees", help="Remove the registered worktrees of retired agents when clean and pushed; else keep and say why (a dry run unless --apply)")
     reclaim.add_argument("--apply", action="store_true", help="Do it (default: a dry run)")
     register = disk_sub.add_parser("register-worktree", help="Record a linked worktree for an agent (launch records its own)")
