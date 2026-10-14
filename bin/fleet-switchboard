@@ -431,7 +431,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "temp_janitor"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "temp_janitor"}
 
 
 def config_known_keys():
@@ -524,6 +524,7 @@ def validate_config(raw, source="config"):
     validate_friction_config(config, source)
     validate_worktree_config(config, source)
     validate_orphan_config(config, source)
+    validate_order_burst(config, source)
     try:
         load_disk_janitor().validate(config.get("temp_janitor"), source)
     except ValueError as err:
@@ -8686,7 +8687,7 @@ def decisions_from_notices(engine, now):
             continue   # it was last seen open a while ago and cannot be confirmed now: a row derived from OPEN state is not listed (the notice stays)
         tag = repo if len(in_play) > 1 else repo.split("/")[-1]
         entry = decision_core.notice_entry(repo, number, tag, facts or {}, held["stale"], item.get("from"),
-                                           item["created"], item.get("note"), hold)
+                                           item["created"], item.get("note"), hold, engine.config.get("intent_repo"))
         evidence = captain_evidence(facts, set(notice_senders(item))) if facts and facts.get("captain") else []
         if evidence == [] and now - item["created"] >= CAPTAIN_NO_REVIEW_SECONDS:
             pass  # nothing stalls silently: the notice's own clock (a new head does not restart it) lists it
@@ -8829,20 +8830,67 @@ def record_order_notice(state_dir, repo, charter, action, text, caller, ordered_
     return item
 
 
-def ack_order_notice(state_dir, ident):
-    """Drop one heads-up; True when it was there."""
+def ack_order_notice(state_dir, ident, window=None):
+    """Drop one heads-up, or a whole burst when `ident` is a group id (`<first id>+<count>`); True when something was there. An old single id still
+    drops just that one."""
     with order_notices_lock(state_dir):
         items = read_order_notices(state_dir)
-        kept = [i for i in items if i["id"] != ident]
+        gone = {ident}
+        m = _GROUP_ID.match(ident)
+        if m and not any(i["id"] == ident for i in items):
+            for group in order_groups(items, ORDER_BURST_MINUTES * 60 if window is None else window):
+                if group[0]["id"] == m.group(1):
+                    gone = {g["id"] for g in group}
+                    break
+        kept = [i for i in items if i["id"] not in gone]
         if len(kept) == len(items):
             return False
         write_order_notices(state_dir, kept)
     return True
 
 
+ORDER_BURST_MINUTES = 10   # orders of the same action by the same actor on the same charter within this many minutes of the first are ONE heads-up
+_GROUP_ID = re.compile(r"^(order:.+)\+([0-9]+)$")
+
+
+def order_burst_seconds(config):
+    value = (config or {}).get("order_notice_burst_minutes", ORDER_BURST_MINUTES)
+    return 0 if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0 else int(value * 60)
+
+
+def validate_order_burst(config, source):
+    raw = config.get("order_notice_burst_minutes")
+    if raw is not None and (isinstance(raw, bool) or not isinstance(raw, (int, float)) or not 0 <= raw <= 1440):
+        raise ConfigError("%s: 'order_notice_burst_minutes' must be a number of minutes from 0 (no grouping) to 1440, got %r" % (source, raw))
+
+
+def order_groups(items, window):
+    """[[item, ...]] oldest first: consecutive orders of the same action by the same actor on the same charter, each within `window` seconds of the
+    FIRST of its group, form one group (a window of 0 groups nothing)."""
+    groups, open_by_key = [], {}
+    for item in sorted(items, key=lambda i: (i["created"], i["id"])):
+        key = (item["repo"], item["charter"], item.get("action"), item.get("from"))
+        group = open_by_key.get(key)
+        if window > 0 and group is not None and item["created"] - group[0]["created"] <= window:
+            group.append(item)
+        else:
+            group = [item]
+            open_by_key[key] = group
+            groups.append(group)
+    return groups
+
+
+def order_group_id(group):
+    return group[0]["id"] if len(group) == 1 else "%s+%d" % (group[0]["id"], len(group))
+
+
 def decisions_from_order_notices(engine, now):
     """(entries, problems): each unexpired order heads-up as an entry of kind `notice` (tier `human`, id `order:<repo>#N.<time>`):
-    information for the owner, never a decision, never counted. Read-only: an expired one is only left out here."""
+    information for the owner, never a decision, never counted. Read-only: an expired one is only left out here.
+
+    The headline LEADS WITH WHAT DIFFERS (`<repo>#<charter> order +: <text> (cos)`, `+` added, `-` removed), so the number is never what a narrow
+    row cuts; the text is. A burst (orders of one action by one actor on one charter within `order_notice_burst_minutes`) is ONE entry,
+    `<repo>#<charter>: 19 orders added by cos: <first words>`, whose id is the first id plus the count and whose note lists the member ids."""
     state_dir = getattr(engine, "state_dir", None)
     if state_dir is None:
         return [], []
@@ -8850,20 +8898,27 @@ def decisions_from_order_notices(engine, now):
         items = read_order_notices(state_dir)
     except NoticeError as err:
         return [], [str(err)]
+    window = order_burst_seconds(getattr(engine, "config", None))
+    live = [i for i in items if now - i["created"] < ORDER_NOTICE_TTL_SECONDS]
     entries = []
-    for item in items:
-        if now - item["created"] >= ORDER_NOTICE_TTL_SECONDS:
-            continue
-        what = "added" if item.get("action") == "add" else "removed"
-        headline = decision_core.fit_lines("order %s by cos on %s#%d: %s" % (
-            what, item["repo"].split("/")[-1], item["charter"], item.get("text") or ""))
-        entries.append({"id": item["id"], "title": decision_core.line_of(headline, decision_core.DECISION_TITLE_MAX),
-                        "headline": headline, "ask": None, "repo": item["repo"], "agent": item.get("from"),
-                        "kind": "notice", "tier": "human", "since": iso(item["created"]), "number": item["charter"],
-                        "url": "https://github.com/%s/issues/%d" % (item["repo"], item["charter"]),
+    for group in order_groups(live, window):
+        first = group[0]
+        short, sign = first["repo"].split("/")[-1], "+" if first.get("action") == "add" else "-"
+        who = first.get("from") or "cos"
+        text = first.get("text") or ""
+        if len(group) == 1:
+            headline = decision_core.fit_lines("%s#%d order %s: %s (%s)" % (short, first["charter"], sign, text, who))
+            note = "not ack'd: `%s notice ack %s` drops it" % (PROG, first["id"])
+        else:
+            word = "added" if sign == "+" else "removed"
+            headline = decision_core.fit_lines("%s#%d: %d orders %s by %s: %s" % (short, first["charter"], len(group), word, who, text))
+            note = "not ack'd: `%s notice ack %s` drops all %d (members: %s)" % (PROG, order_group_id(group), len(group), ", ".join(g["id"] for g in group))
+        entries.append({"id": order_group_id(group), "title": decision_core.line_of(headline, decision_core.DECISION_TITLE_MAX),
+                        "headline": headline, "ask": None, "repo": first["repo"], "agent": first.get("from"),
+                        "kind": "notice", "tier": "human", "since": iso(first["created"]), "number": first["charter"],
+                        "url": "https://github.com/%s/issues/%d" % (first["repo"], first["charter"]),
                         "state": None, "additions": None, "deletions": None, "files": None, "ci": None,
-                        "review": None, "stale": False, "note": "not ack'd: `%s notice ack %s` drops it" % (PROG, item["id"]),
-                        "merge_after": None})
+                        "review": None, "stale": False, "note": note, "merge_after": None})
     return entries, []
 
 
@@ -14392,7 +14447,7 @@ def _notice_ack(args, engine, state):
         if caller is not None:
             sys.stderr.write("%s: only the owner, in a plain shell, acks a heads-up; %s is a fleet agent\n" % (PROG, caller))
             return EXIT_USAGE
-        found = ack_order_notice(state, args.pr)
+        found = ack_order_notice(state, args.pr, order_burst_seconds(engine.config))
     except (NoticeError, OSError) as err:
         sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 400)))
         return EXIT_USAGE

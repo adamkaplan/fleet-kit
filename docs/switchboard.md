@@ -3994,6 +3994,8 @@ for the cos only. An orchestrator's pending ask has no timeout in OpenCode v2 (t
   that drops after a day or when you run `fleet-switchboard notice ack <id>` in a plain shell (an agent is refused). The order stands if the
   comment fails; the command then says so and exits 1.
 
+**What a heads-up row says (leading with what differs).** The panel's row is 34 characters wide, so the part that differs comes FIRST and only the text is cut: an order heads-up reads `<repo>#<charter> order +: <text> (cos)` (`+` added, `-` removed). **A burst is one entry**: orders of the same action by the same actor on the same charter within `order_notice_burst_minutes` (default 10; 0 groups nothing; a window counts from the first order of the group) read `<repo>#<charter>: 19 orders added by cos: <first words of the first order>`; its id is the first order's id plus the count (`order:<repo>#N.<time>+19`), its note lists every member id, and `notice ack <that id>` drops the whole burst (the owner only, in a plain shell, as before); acking an old single order id still drops just that one. A PR heads-up reads `#<number> <title>`, with the repo's short name in front only when the repo is not the configured `intent_repo` (with none configured the form is unchanged). The ids of PR heads-ups do not change.
+
 ### Second review (#108 at fa7dc6f)
 
 - Shell text splices: quotes are denied in every read command (`git cat head tail grep wc ls az gh` reads, merge/ready/reopen); free text (`send`, `report`,
