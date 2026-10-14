@@ -50,6 +50,7 @@ import collections
 import errno
 import fcntl
 import getpass
+import gzip
 import hashlib
 import hmac
 import importlib.util
@@ -775,8 +776,22 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+AUDIT_ROTATE_BYTES = 20 << 20    # the active audit file is rotated when an append finds it larger than this
+AUDIT_KEEP_SECONDS = 86400       # ... keeping the last day in the active file (and never more than half of AUDIT_ROTATE_BYTES)
+AUDIT_ARCHIVE_DAYS = 14          # archives (audit-<UTC date>.jsonl.gz) older than this are deleted
+AUDIT_SYNC_SECONDS = 1.0         # fsync of a non-intent append at most this often (an `intent` is always synced: it must be on disk before the write it announces)
+_AUDIT_TS = re.compile(rb'"ts": "([^"]+)"')
+
+
 class AuditLog:
-    """Append-only JSON lines. Never read by a decision; written before and after."""
+    """Append-only JSON lines. Never read by a decision; written before and after.
+
+    Appenders open the file per write (O_APPEND), so a rotation may swap the file under them: it archives the old part to
+    `audit-<UTC date>.jsonl.gz` (0600, written to a temp file and renamed), carries what was appended meanwhile into the new
+    active file, and loses at most a line appended in the instant of the swap. An `intent` entry is fsynced before the write it announces; the
+    others at most once a second (a process crash loses nothing either way: the data is in the OS by `write`)."""
+
+    _synced = {}   # path -> monotonic time of the last fsync, shared by every AuditLog of the process
 
     def __init__(self, path):
         self.path = Path(path)
@@ -787,11 +802,111 @@ class AuditLog:
         entry.update(redact(extra))
         line = json.dumps(entry, sort_keys=True, default=str) + "\n"
         fd = os.open(str(self.path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        size = 0
         with os.fdopen(fd, "a") as handle:
             handle.write(line)
             handle.flush()
-            os.fsync(handle.fileno())
+            size = os.fstat(handle.fileno()).st_size
+            key, clock = str(self.path), time.monotonic()
+            if extra.get("phase") == "intent" or clock - AuditLog._synced.get(key, -1e9) >= AUDIT_SYNC_SECONDS:
+                os.fsync(handle.fileno())
+                AuditLog._synced[key] = clock
+        if size > AUDIT_ROTATE_BYTES:
+            try:
+                self.rotate()
+            except Exception:   # a rotation that fails is tried again at a later append; it never fails the append
+                pass
         return entry
+
+    def rotate(self, now=None):
+        """Archive the old part of the active file and keep the recent part. One rotator at a time (a lock file); another process that finds it
+        held skips. Returns the archive path, or None when there was nothing to do."""
+        now = time.time() if now is None else now
+        lock_path = self.path.with_name(self.path.name + ".rotate.lock")
+        fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as guard:
+            try:
+                fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return None
+            archive = self._rotate_locked(now)
+            self._prune_archives(now)
+            return archive
+
+    def _rotate_locked(self, now):
+        cutoff = datetime.fromtimestamp(now - AUDIT_KEEP_SECONDS, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        try:
+            seen = self.path.stat().st_size
+        except OSError:
+            return None
+        if seen <= AUDIT_ROTATE_BYTES:
+            return None   # another process rotated first
+        floor = max(0, seen - AUDIT_ROTATE_BYTES // 2)   # never keep more than half the threshold, whatever the clock says
+        stamp = datetime.fromtimestamp(now, timezone.utc)
+        archive = self.path.with_name("audit-%s.jsonl.gz" % stamp.strftime("%Y-%m-%d"))
+        if archive.exists():
+            archive = self.path.with_name("audit-%s.jsonl.gz" % stamp.strftime("%Y-%m-%dT%H%M%S"))
+        keep_temp = self.path.with_name("%s.%d.keep.tmp" % (self.path.name, os.getpid()))
+        placed = False
+        gz_temp = archive.with_name("%s.%d.tmp" % (archive.name, os.getpid()))
+        try:
+            offset, archived = 0, 0
+            with open(str(self.path), "rb") as source:
+                with os.fdopen(os.open(str(gz_temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600), "wb") as raw, \
+                        gzip.GzipFile(fileobj=raw, mode="wb", filename="") as packed, \
+                        os.fdopen(os.open(str(keep_temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600), "wb") as kept:
+                    keeping = False
+                    for line in source:
+                        if offset >= seen:
+                            break
+                        if not keeping:
+                            found = _AUDIT_TS.search(line)
+                            stamp_text = found.group(1).decode("ascii", "replace")[:19] if found else ""
+                            keeping = offset >= floor and (stamp_text >= cutoff or not found)
+                        offset += len(line)
+                        if keeping:
+                            kept.write(line)
+                        else:
+                            packed.write(line)
+                            archived += 1
+                    raw.flush()
+                    os.fsync(raw.fileno())
+                    kept.flush()
+                    os.fsync(kept.fileno())
+            if not archived:
+                os.unlink(str(gz_temp))
+                os.unlink(str(keep_temp))
+                return None
+            os.rename(str(gz_temp), str(archive))
+            placed = True
+            self._swap(keep_temp, offset)
+            return archive
+        except BaseException:
+            for temp in (gz_temp, keep_temp, archive if placed else None):   # a swap that failed leaves the log whole: its archive would be a duplicate of it
+                try:
+                    if temp is not None:
+                        os.unlink(str(temp))
+                except OSError:
+                    pass
+            raise
+
+    def _swap(self, keep_temp, offset):
+        """Carry what was appended after `offset` into the kept part, then put it in place of the active file."""
+        with open(str(self.path), "rb") as source, open(str(keep_temp), "ab") as kept:
+            source.seek(offset)
+            kept.write(source.read())
+            kept.flush()
+            os.fsync(kept.fileno())
+        os.replace(str(keep_temp), str(self.path))
+
+    def _prune_archives(self, now):
+        horizon = now - AUDIT_ARCHIVE_DAYS * 86400
+        for path in self.path.parent.glob("audit-*.jsonl.gz"):
+            try:
+                if path.stat().st_mtime < horizon:
+                    path.unlink()
+            except OSError:
+                pass
 
     @contextmanager
     def external(self, actor, event, subject=None, detail=None):
@@ -10786,7 +10901,7 @@ class GitHubHub:
         self.note_issue_edit(event, repo, payload)
         self.note_awaiting_event(event, repo, payload)
         self._audit("github.received", repo, {"event": event, "delivery": _header(headers, "X-GitHub-Delivery"),
-                                              "keys": [item.key for item in items]})
+                                              "keys": [_one_line(item.key, 80) for item in items[:5]], "count": len(items)})   # ids, not bodies: the first few of them
         return 202, "accepted"
 
     def enqueue(self, items):
@@ -18281,13 +18396,14 @@ class PolicyJudge:
     def _audit(self, request, reply, box, shadow=None):
         detail, combined = box["detail"], box["detail"].get("combined") or {}
         state = dict(detail.get("state") or {})
-        state["arguments"] = _one_line(state.get("arguments"), 300)
         entry = {"agent": detail.get("agent"), "role": detail.get("role"), "session": request["session"],
                  "tool": request["tool"], "configured": request["configured"], "outcome": reply["outcome"],
                  "judged": reply["judged"], "cached": reply["cached"], "reason": reply["reason"],
                  "latency_ms": reply["latency_ms"], "ask": detail.get("ask"), "fired": combined.get("fired"),
                  "answers": combined.get("answers"), "thresholds": detail.get("thresholds"),
-                 "question": {"state": state, "ids": list(POLICY_QUESTIONS)} if state else None,
+                 # the question's full state (the tool's arguments and the context the judge was shown, ~2 KB a call) is not kept: ids, outcome and
+                 # latency are what the reports read; the tool and a short clip of its arguments say what was judged
+                 "question": {"ids": list(POLICY_QUESTIONS), "arguments": _plain(state.get("arguments"), 100), "intent": _plain(state.get("intent"), 160)} if state else None,
                  "model": combined.get("model"), "usage": combined.get("usage"), "error": detail.get("error")}
         if shadow is not None:
             entry.update(shadow=True, verdict=shadow)

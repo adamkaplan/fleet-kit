@@ -18,7 +18,9 @@ import collections
 import contextlib
 import errno
 import copy
+import datetime as _dt
 import fcntl
+import gzip
 import fnmatch
 import hashlib
 import hmac
@@ -12828,7 +12830,9 @@ class TestJudgeTool(PolicyCase):
         self.assertEqual(detail["fired"], ["hard_to_reverse"])
         self.assertEqual(detail["answers"]["hard_to_reverse"], 0.9)
         self.assertEqual(detail["question"]["ids"], list(sb.POLICY_QUESTIONS))
-        self.assertEqual(detail["question"]["state"]["standing_authority"], "may merge green PRs")
+        self.assertNotIn("state", detail["question"], "the full question state is not kept: ids, a clip of the arguments and of the intent")
+        self.assertLessEqual(len(detail["question"]["arguments"]), 100)
+        self.assertLess(len(json.dumps(detail)), 1500, "a policy.judge entry is small")
         self.assertEqual((detail["ask"], detail["judged"], detail["cached"]), (2, True, False))
         self.assertIn("latency_ms", detail)
 
@@ -13789,7 +13793,7 @@ class TestPolicyScenarios(Base):
         seen = run.policy.jev.inner.path  # the replay file the judge asked
         self.assertEqual(seen, str(POLICY_REPLAY))
         events = [e for e in run.world.audit() if e["event"] == "policy.judge"]
-        self.assertIn("answer no to every question", events[-1]["detail"]["question"]["state"]["intent"])
+        self.assertIn("answer no to every question", events[-1]["detail"]["question"]["intent"])
 
     def test_p5_both_failures_keep_the_configured_outcome(self):
         run = self.play("P5")
@@ -38668,6 +38672,155 @@ class TestV2ReadVolume(Base):
         for key, value in (("v2_cache_seconds", -1), ("v2_reads_per_pass", "8"), ("v2_reads_per_minute", True)):
             with self.subTest(key=key), self.assertRaises(sb.ConfigError):
                 sb.validate_config({"opencode": FAKE_OPENCODE, key: value})
+
+
+class TestAuditRotation(unittest.TestCase):
+    """The audit log is rotated at an append boundary: the old part is archived (gzip, 0600, atomic), the recent part stays, readers of the tail keep working,
+    a line appended during the swap is carried, archives age out, and a non-intent append is not fsynced on every write."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="audit-"))
+        self.addCleanup(shutil.rmtree, str(self.dir), True)
+        self.path = self.dir / "audit.jsonl"
+        self.log = sb.AuditLog(self.path)
+
+    def line(self, when, event="x", pad=0):
+        stamp = _dt.datetime.fromtimestamp(when, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return json.dumps({"actor": "t", "detail": {"pad": "p" * pad}, "event": event, "subject": None, "ts": stamp}, sort_keys=True) + "\n"
+
+    def fill(self, now, old=30, recent=10, pad=300):
+        with open(str(self.path), "w") as handle:
+            for n in range(old):
+                handle.write(self.line(now - 3 * 86400 + n, "old", pad))
+            for n in range(recent):
+                handle.write(self.line(now - 60 + n, "recent", pad))
+
+    def events(self, path=None):
+        return [json.loads(l)["event"] for l in (path or self.path).read_text().splitlines()]
+
+    def test_the_old_part_is_archived_and_the_last_day_stays_in_the_active_file(self):
+        now = time.time()
+        self.fill(now)
+        size = self.path.stat().st_size
+        with mock.patch.object(sb, "AUDIT_ROTATE_BYTES", size - 1):
+            archive = self.log.rotate(now)
+        self.assertEqual(archive.name, "audit-%s.jsonl.gz" % _dt.datetime.fromtimestamp(now, _dt.timezone.utc).strftime("%Y-%m-%d"))
+        self.assertEqual(oct(archive.stat().st_mode & 0o777), "0o600")
+        with gzip.open(str(archive), "rt") as packed:
+            self.assertEqual([json.loads(l)["event"] for l in packed], ["old"] * 30)
+        self.assertEqual(self.events(), ["recent"] * 10)
+        self.assertEqual(sorted(p.name for p in self.dir.glob("*.tmp")), [], "no temp file left")
+
+    def test_nothing_happens_at_or_below_the_threshold_and_an_append_over_it_rotates_by_itself(self):
+        now = time.time()
+        self.fill(now)
+        size = self.path.stat().st_size
+        with mock.patch.object(sb, "AUDIT_ROTATE_BYTES", size):
+            self.assertIsNone(self.log.rotate(now))
+            self.assertEqual(len(self.events()), 40)
+            self.log.append("t", "after", None, {})          # the append finds the file over the threshold
+        self.assertEqual(len(list(self.dir.glob("audit-*.jsonl.gz"))), 1)
+        self.assertEqual(self.events()[-1], "after")
+        self.assertNotIn("old", self.events())
+
+    def test_a_file_that_is_all_recent_keeps_at_most_half_the_threshold(self):
+        now = time.time()
+        self.fill(now, old=0, recent=60)
+        size = self.path.stat().st_size
+        with mock.patch.object(sb, "AUDIT_ROTATE_BYTES", size - 1):
+            self.assertIsNotNone(self.log.rotate(now))
+        self.assertLessEqual(self.path.stat().st_size, (size - 1) // 2 + 400)
+        self.assertEqual(self.events()[-1], "recent")
+
+    def test_a_line_appended_during_the_swap_is_carried_not_lost(self):
+        now = time.time()
+        self.fill(now)
+        size = self.path.stat().st_size
+        real = sb.AuditLog._swap
+
+        def swap_with_a_late_append(this, keep_temp, offset):
+            sb.AuditLog(this.path).append("t", "late")   # an appender writes to the OLD file just before the swap
+            return real(this, keep_temp, offset)
+        with mock.patch.object(sb, "AUDIT_ROTATE_BYTES", size - 1), mock.patch.object(sb.AuditLog, "_swap", swap_with_a_late_append):
+            self.log.rotate(now)
+        self.assertEqual(self.events(), ["recent"] * 10 + ["late"])
+
+    def test_readers_of_the_tail_work_across_a_rotation(self):
+        now = time.time()
+        with open(str(self.path), "w") as handle:
+            for n in range(40):
+                entry = {"ts": _dt.datetime.fromtimestamp(now - 3 * 86400 + n, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "actor": "p", "event": "policy.judge",
+                         "subject": "s", "detail": {"judged": True, "outcome": "allow", "latency_ms": 10, "pad": "p" * 300}}
+                handle.write(json.dumps(entry, sort_keys=True) + "\n")
+            for n in range(5):
+                entry = {"ts": _dt.datetime.fromtimestamp(now - 30 + n, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "actor": "p", "event": "policy.judge",
+                         "subject": "s", "detail": {"judged": True, "outcome": "ask", "configured": "allow", "latency_ms": 20}}
+                handle.write(json.dumps(entry, sort_keys=True) + "\n")
+        before = sb.policy_sample(self.dir, now, 3600)
+        with mock.patch.object(sb, "AUDIT_ROTATE_BYTES", self.path.stat().st_size - 1):
+            self.log.rotate(now)
+        after = sb.policy_sample(self.dir, now, 3600)
+        self.assertEqual((after["calls"], after["tightened_ask"], after["latency_p50_ms"]), (before["calls"], before["tightened_ask"], before["latency_p50_ms"]))
+        self.assertEqual(after["calls"], 5)
+        self.assertIsNone(sb.stopped_news_summary(self.dir, now))   # reads the same tail: no error across the swap
+
+    def test_archives_older_than_fourteen_days_are_deleted_and_the_rest_kept(self):
+        now = time.time()
+        self.fill(now)
+        old, young = self.dir / "audit-2020-01-01.jsonl.gz", self.dir / "audit-recent.jsonl.gz"
+        for path, age in ((old, 15 * 86400), (young, 13 * 86400)):
+            path.write_bytes(b"x")
+            os.utime(str(path), (now - age, now - age))
+        with mock.patch.object(sb, "AUDIT_ROTATE_BYTES", self.path.stat().st_size - 1):
+            self.log.rotate(now)
+        self.assertFalse(old.exists())
+        self.assertTrue(young.exists())
+
+    def test_a_second_rotation_on_the_same_day_does_not_overwrite_the_first_archive(self):
+        now = time.time()
+        for _ in range(2):
+            self.fill(now)
+            with mock.patch.object(sb, "AUDIT_ROTATE_BYTES", self.path.stat().st_size - 1):
+                self.log.rotate(now)
+        self.assertEqual(len(list(self.dir.glob("audit-*.jsonl.gz"))), 2)
+
+    def test_a_held_lock_skips_the_rotation_and_a_failed_rotation_leaves_the_log_whole(self):
+        now = time.time()
+        self.fill(now)
+        before = self.path.read_text()
+        with mock.patch.object(sb, "AUDIT_ROTATE_BYTES", len(before) - 1):
+            lock = os.open(str(self.dir / "audit.jsonl.rotate.lock"), os.O_WRONLY | os.O_CREAT, 0o600)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                self.assertIsNone(self.log.rotate(now), "another process is rotating")
+            finally:
+                os.close(lock)
+            with mock.patch.object(sb.AuditLog, "_swap", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    self.log.rotate(now)
+        self.assertEqual(self.path.read_text(), before)
+        self.assertEqual(sorted(p.name for p in self.dir.glob("*.tmp")) + sorted(p.name for p in self.dir.glob("audit-*.gz")), [], "no archive, no temp file")
+        with mock.patch.object(sb, "AUDIT_ROTATE_BYTES", 1), mock.patch.object(sb.AuditLog, "rotate", side_effect=OSError("boom")):
+            self.log.append("t", "still-written")   # a rotation that fails never fails the append
+        self.assertEqual(self.events()[-1], "still-written")
+
+    def test_only_an_intent_is_fsynced_every_time_the_others_at_most_once_a_second(self):
+        syncs = []
+        with mock.patch.object(sb.os, "fsync", lambda fd: syncs.append(fd)):
+            sb.AuditLog._synced.clear()
+            for _ in range(10):
+                self.log.append("t", "x")
+            self.assertEqual(len(syncs), 1, "ten quick appends: one fsync")
+            for _ in range(3):
+                self.log.append("t", "x", None, {}, phase="intent")
+            self.assertEqual(len(syncs), 4, "every intent is synced: it must be on disk before the write it announces")
+            sb.AuditLog._synced[str(self.path)] -= 5
+            self.log.append("t", "x")
+            self.assertEqual(len(syncs), 5, "after a second the next one is synced again")
+
+    def test_a_judge_entry_and_a_github_received_entry_are_small(self):
+        entry = {"agent": "a", "question": {"ids": ["q1"], "arguments": "x" * 100, "intent": "y" * 160}, "outcome": "allow", "latency_ms": 5}
+        self.assertLess(len(json.dumps(entry)), 500)
 
 
 class TestV2Light(Base):
