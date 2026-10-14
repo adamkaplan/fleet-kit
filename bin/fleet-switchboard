@@ -3778,7 +3778,7 @@ class Switchboard:
         outcome = self.send_fact(fact, discovery, now, waiting)
         if state == "done" and outcome.get("sent") and self.state_dir is not None and worktree_config(self.config)["on_done"]:
             try:   # a final done report reclaims the worker's registered worktrees: removed when clean and pushed, else kept with the reason
-                lines = reclaim_for_agent(self, subprocess.run, sender, True, "done report")
+                lines = reclaim_for_agent(self, subprocess.run, sender, True, "done report", keep_cwd=True)
                 if lines:
                     outcome = dict(outcome, worktrees=lines)
             except Exception as err:
@@ -4854,8 +4854,12 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
     if engine.state_dir is not None:   # a launch into a linked worktree records it, so retire and a done report can reclaim it later
         try:
             found = worktree_of_directory(subprocess.run, directory)
-            if found is not None and register_worktree(engine.state_dir, found[0], name, repo, found[1], engine.now()) and engine.audit is not None:
-                engine.audit.append(engine.actor, "worktree.registered", name, {"path": found[0], "branch": found[1], "repo": repo, "by": "launch"})
+            if found is not None:
+                if register_worktree(engine.state_dir, found[0], name, repo, found[1], engine.now()):
+                    if engine.audit is not None:
+                        engine.audit.append(engine.actor, "worktree.registered", name, {"path": found[0], "branch": found[1], "repo": repo, "by": "launch"})
+                else:   # it will not be reclaimed later: say so now
+                    engine._note("worktree.error", name, {"error": "the worktree %s could not be recorded in the registry: it will not be reclaimed automatically" % found[0]})
         except Exception as err:
             engine._note("worktree.error", name, {"error": _one_line(str(err), 120)})
     return {"name": name, "session": session_id, "pane": pane, "tab": opened["tab_id"]}
@@ -5493,8 +5497,11 @@ def cmd_retire(args, runner, now):
     if engine.audit is not None:
         engine.audit.append(engine.actor, "fleetpane.retired", name, {"auto": False, "reason": retired[name]["reason"], "by": retired[name]["by"]})
     print("%s is retired: not watched, not reattached by --all-detached; nothing was deleted or closed (`%s retire --undo %s` reverses)" % (name, PROG, name))
-    for line in reclaim_for_agent(engine, runner, name, True, "retired"):   # its registered worktrees: removed when clean and pushed, else kept with the reason
-        print("worktree: " + line)
+    try:
+        for line in reclaim_for_agent(engine, runner, name, True, "retired"):   # its registered worktrees: removed when clean and pushed, else kept with the reason
+            print("worktree: " + line)
+    except Exception as err:   # the retirement above is already written: a reclaim problem is said, never a traceback
+        sys.stderr.write("%s: worktree reclaim failed (%s): the agent is retired; run `%s disk reclaim-worktrees --apply` to retry\n" % (PROG, _one_line(str(err), 100), PROG))
     return EXIT_OK
 
 
@@ -5507,6 +5514,10 @@ def cmd_retire(args, runner, now):
 
 WORKTREES_FILE = "worktrees.json"
 WORKTREE_GIT_SECONDS = 20
+WORKTREE_RECLAIM_MAX = 20     # worktrees looked at per call: a pass or a command never does unbounded git work
+# Ignored files that are regenerable build output: deleting them with the worktree loses nothing. ANY OTHER ignored file (.env, local config, data)
+# is unrecoverable local state, so its worktree is kept.
+IGNORED_SAFE = ("node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "dist", "build", ".venv", "venv", ".DS_Store", ".tox")
 
 
 def worktree_config(config):
@@ -5552,6 +5563,12 @@ def worktree_facts(runner, path):
         facts["why"] = "git status failed (%s)" % _one_line(status.stderr, 80)
         return facts
     facts["dirty"] = [l for l in status.stdout.splitlines() if l.strip()]
+    ignored = _git(runner, path, "status", "--porcelain", "--ignored", "--untracked-files=all")
+    if ignored.returncode != 0:
+        facts["why"] = "git could not list the ignored files (%s)" % _one_line(ignored.stderr, 80)
+        return facts
+    facts["ignored"] = [l[3:] for l in ignored.stdout.splitlines() if l.startswith("!! ")
+                        and not any(part in IGNORED_SAFE or part.endswith(".pyc") for part in l[3:].strip("/").split("/"))]
     contains = _git(runner, path, "branch", "-r", "--contains", "HEAD")
     if contains.returncode != 0:
         facts["why"] = "git could not say whether HEAD is pushed (%s)" % _one_line(contains.stderr, 80)
@@ -5577,18 +5594,22 @@ def register_worktree(state_dir, path, agent, repo, branch, now):
 
 
 def _unregister_worktree(state_dir, path):
+    """Drop a registry entry. Returns whether it is gone (False: the registry could not be written; the caller says so)."""
     try:
         with agent_lock(state_dir, "files", seconds=2):
             data = read_worktrees(state_dir)
             if data.pop(str(path), None) is not None:
                 _write_small(state_dir, WORKTREES_FILE, data)
+        return True
     except Exception:
-        pass
+        return False
 
 
-def reclaim_worktree(engine, runner, path, entry, apply=True):
+def reclaim_worktree(engine, runner, path, entry, apply=True, keep_cwd=False):
     """(status, line) for ONE registered worktree: `removed`, `would-remove`, `kept` (with the reason), `gone` (the directory is already gone: the entry is
     dropped) or `refused` (not a linked worktree: never touched). Never forces, never removes a branch."""
+    if not isinstance(entry, dict) or not isinstance(path, str) or not os.path.isabs(path) or path.startswith("-"):
+        return "refused", "%s: refused: not a usable registry entry" % _one_line(str(path), 60)
     agent = entry.get("agent")
     facts = worktree_facts(runner, path)
     if not facts["exists"]:
@@ -5601,31 +5622,43 @@ def reclaim_worktree(engine, runner, path, entry, apply=True):
         return "refused", "%s: refused: it is a main checkout, never touched" % path
     if facts["dirty"]:
         return "kept", "%s: kept: uncommitted changes (%d file(s), e.g. %s)" % (path, len(facts["dirty"]), _one_line(facts["dirty"][0], 60))
+    if facts.get("ignored"):
+        return "kept", "%s: kept: ignored local file(s) that are not known build output would be lost (%d, e.g. %s)" % (path, len(facts["ignored"]), _one_line(facts["ignored"][0], 60))
     if not facts["pushed"]:
         return "kept", "%s: kept: unpushed (HEAD %s is on no remote branch)" % (path, facts["branch"] or "detached")
+    if keep_cwd:
+        try:
+            inside = os.path.realpath(os.getcwd()).startswith(os.path.realpath(path).rstrip("/") + "/") or os.path.realpath(os.getcwd()) == os.path.realpath(path)
+        except OSError:
+            inside = False
+        if inside:   # the caller's own working directory: a worker that goes on after `done` must not lose it
+            return "kept", "%s: kept: you are working in it; `retire` or `disk reclaim-worktrees --apply` removes it later" % path
     if not apply:
         return "would-remove", "%s: would remove (clean, pushed; branch %s)" % (path, facts["branch"])
-    done = _git(runner, facts["main"], "worktree", "remove", str(path))
+    again = _git(runner, path, "status", "--porcelain", "--untracked-files=all")   # the window between the check and the remove is as short as it can be
+    if again.returncode != 0 or again.stdout.strip():
+        return "kept", "%s: kept: it changed while it was being checked" % path
+    done = _git(runner, facts["main"], "worktree", "remove", "--", str(path))
     if done.returncode != 0:
         return "kept", "%s: kept: git refused to remove it (%s)" % (path, _one_line(done.stderr, 100))
-    _unregister_worktree(engine.state_dir, path)
+    stale = "" if _unregister_worktree(engine.state_dir, path) else "; the registry entry could not be dropped (it is harmless: the directory is gone)"
     if engine.audit is not None:
         engine.audit.append(engine.actor, "worktree.removed", agent or path, {"path": str(path), "branch": facts["branch"], "repo": entry.get("repo")})
-    return "removed", "%s: removed (clean, pushed; branch %s kept)" % (path, facts["branch"])
+    return "removed", "%s: removed (clean, pushed; branch %s kept)%s" % (path, facts["branch"], stale)
 
 
-def reclaim_for_agent(engine, runner, name, apply=True, why="retired"):
+def reclaim_for_agent(engine, runner, name, apply=True, why="retired", keep_cwd=False):
     """Reclaim every REGISTERED worktree of agent `name`. Returns the one-line results (empty when it has none). Off with worktree_reclaim.enabled false."""
     if engine.state_dir is None:
         return []
-    mine = {p: e for p, e in read_worktrees(engine.state_dir).items() if e.get("agent") == name}
+    mine = {p: e for p, e in read_worktrees(engine.state_dir).items() if isinstance(e, dict) and e.get("agent") == name}
     if not mine:
         return []
     if not worktree_config(engine.config)["enabled"]:
         return ["worktree reclaim is switched off (worktree_reclaim.enabled is false): %d worktree(s) of %s kept" % (len(mine), name)]
     lines = []
-    for path, entry in sorted(mine.items()):
-        status, line = reclaim_worktree(engine, runner, path, entry, apply)
+    for path, entry in sorted(mine.items())[:WORKTREE_RECLAIM_MAX]:
+        status, line = reclaim_worktree(engine, runner, path, entry, apply, keep_cwd)
         lines.append(line)
         if status == "kept" and engine.audit is not None:
             engine.audit.append(engine.actor, "worktree.kept", name, {"path": path, "reason": _one_line(line, 160), "after": why})
@@ -5654,9 +5687,9 @@ def cmd_disk_reclaim_worktrees(args, runner, now):
             raise LaunchError("worktree reclaim is switched off (worktree_reclaim.enabled is false)")
     retired = read_retired(state)
     registry = read_worktrees(state)
-    todo = {p: e for p, e in registry.items() if e.get("agent") in retired}
+    todo = {p: e for p, e in registry.items() if isinstance(e, dict) and e.get("agent") in retired}
     removed = kept = 0
-    for path, entry in sorted(todo.items()):
+    for path, entry in sorted(todo.items())[:WORKTREE_RECLAIM_MAX]:
         status, line = reclaim_worktree(engine, runner, path, entry, bool(args.apply))
         print(line)
         removed += status in ("removed", "would-remove", "gone")

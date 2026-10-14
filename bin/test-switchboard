@@ -4767,6 +4767,50 @@ class TestLaunch(Base):
         self.assertEqual(status, "refused")
         self.assertTrue(self.repo_main.exists())
 
+    def test_an_ignored_local_file_keeps_the_worktree_but_known_build_output_does_not_and_a_bad_entry_or_a_git_refusal_removes_nothing(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.make_repo()
+        self.worker()
+        (self.repo_main / ".gitignore").write_text(".env\nnode_modules/\n")
+        self.git(self.repo_main, "add", ".")
+        self.git(self.repo_main, "commit", "-qm", "ignore")
+        self.git(self.repo_main, "push", "-q", "origin", "main")
+        secret, build = self.add_worktree("w-env"), self.add_worktree("w-build")
+        (secret / ".env").write_text("TOKEN=x\n")
+        (build / "node_modules").mkdir()
+        (build / "node_modules" / "m.js").write_text("1\n")
+        engine = self.world.new_engine("cli")
+        status, line = sb.reclaim_worktree(engine, subprocess.run, str(secret), {"agent": "worker"}, True)
+        self.assertEqual(status, "kept")
+        self.assertIn("ignored local file", line)
+        self.assertTrue(secret.exists())
+        status, line = sb.reclaim_worktree(engine, subprocess.run, str(build), {"agent": "worker"}, True)
+        self.assertEqual(status, "removed", line)
+        for bad in ("relative/path", "-rf", 5):
+            self.assertEqual(sb.reclaim_worktree(engine, subprocess.run, bad, {"agent": "worker"}, True)[0], "refused")
+        self.assertEqual(sb.reclaim_worktree(engine, subprocess.run, str(secret), "not-a-dict", True)[0], "refused")
+        calm = self.add_worktree("w-git-refuses")
+        self.git(self.repo_main, "worktree", "lock", str(calm))        # git itself refuses to remove a locked worktree
+        status, line = sb.reclaim_worktree(engine, subprocess.run, str(calm), {"agent": "worker"}, True)
+        self.assertEqual((status, calm.exists()), ("kept", True))
+        self.assertIn("git refused", line)
+
+    def test_a_done_report_made_from_inside_the_worktree_keeps_it_and_says_so(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.make_repo()
+        self.worker()
+        wt = self.add_worktree("w-inside")
+        sb.register_worktree(self.world.state, str(wt), "worker", None, "w-inside", 1)
+        engine = self.world.new_engine("cli")
+        here = os.getcwd()
+        try:
+            os.chdir(str(wt))
+            status, line = sb.reclaim_worktree(engine, subprocess.run, str(wt), {"agent": "worker"}, True, keep_cwd=True)
+        finally:
+            os.chdir(here)
+        self.assertEqual((status, wt.exists()), ("kept", True))
+        self.assertIn("you are working in it", line)
+
     def test_the_worktree_reclaim_config_is_validated(self):
         base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
         sb.validate_config(dict(base, worktree_reclaim={"enabled": True, "on_done": False}))
@@ -9982,6 +10026,7 @@ class TestSelfRegisteringCli(unittest.TestCase):
         "agents": ("cmd_agents", ("args", "runner", "now")), "job": ("cmd_job", ("args", "runner", "now", "spawn")), "review-laws": ("cmd_review_laws", ("args", "runner", "now")), "review": ("cmd_review", ("args", "runner", "now")), "pr-explain": ("cmd_pr_explain", ("args", "runner", "now")), "pr-state": ("cmd_pr_state", ("args", "runner", "now")),
         "reattach": ("cmd_reattach", ("args", "runner", "now", "socket_call")),
         "retire": ("cmd_retire", ("args", "runner", "now")),
+        "disk": ("cmd_disk", ("args", "runner", "now")),
         "impact": ("cmd_impact", ("args", "runner", "now")), "judge-tool": ("cmd_judge_tool", ("args", "runner", "now")),
         "ensure": ("cmd_ensure", ("args", "spawn")), "install": ("cmd_install", ("args", "runner", "now", "spawn")), "key": ("cmd_key", ("args", "runner", "now")),
         "restart": ("cmd_restart", ("args", "runner", "spawn")), "bootstrap": ("cmd_bootstrap", ("args", "runner", "now", "socket_call")),
