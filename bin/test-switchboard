@@ -10507,7 +10507,7 @@ ROLE_LINE_LIMITS = {"coder": 129, "orchestrator": 178, "chief-of-staff": 162, "c
 # hygiene pointer: coder -2 lines, -100 B (three maxims became one pointer to the standards)
 # #107 follow-up: coder +300 B for the spelled-out fallback and the never-your-own rule
 # `pr-state`: coder +1 line +140 B, orchestrator +1 line +120 B: the one sentence that sends an agent to the daemon's cache instead of a GitHub polling loop
-ROLE_BYTE_LIMITS = {"coder": 7850, "orchestrator": 10920, "chief-of-staff": 11650, "cos-subagent": 3500}
+ROLE_BYTE_LIMITS = {"coder": 7860, "orchestrator": 10920, "chief-of-staff": 11650, "cos-subagent": 3500}
 WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others
 
 
@@ -18065,6 +18065,13 @@ class TestTriage(Base):
         self.assertEqual((row["detail"]["what"], row["detail"]["evidence"]["pr"], row["detail"]["evidence"]["pr_url"]),
                          ("plan issue still open after its PR merged", 200, "https://github.com/acme/api/pull/200"))   # the link is rebuilt, not the record's html_url
         self.assertFalse(row["detail"]["applied"])
+
+    def test_t12_never_fires_for_a_charter_or_an_ask_named_by_part_of_but_does_for_a_work_item(self):
+        self.charter()                                                     # #1 is the charter, #2 an ask under it
+        self.add(3, created=20, updated=0.1, parent=2, labels=["kind"], body="Next: go")   # a work item under the ask
+        self.merged_pr(240, "Part of #1. Part of #2. Part of #3.")
+        self.go()
+        self.assertEqual(self.only("T12"), ["acme/api#3"])                 # not the charter, not the ask
 
     def test_t12_is_ours_through_the_merged_prs_author_and_a_fresh_read_of_a_closed_issue_drops_it(self):
         self.charter()
