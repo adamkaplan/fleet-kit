@@ -35,7 +35,7 @@ UNKNOWN_TTL = 6 * 3600             # "no artifact yet" is remembered this long (
 CACHE_MAX = 300                    # cache files kept
 DEFAULT_EVENTS = ["push"]
 EVENTS_OK = ("push", "merge_group", "schedule", "workflow_dispatch", "pull_request")
-EXIT_OK, EXIT_ERROR, EXIT_USAGE = 0, 1, 64
+EXIT_OK, EXIT_ERROR, EXIT_USAGE, EXIT_UNKNOWN = 0, 1, 64, 3   # EXIT_UNKNOWN: it could not classify for want of evidence (never 'new' on no evidence)
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 
 
@@ -184,6 +184,15 @@ def classify(pr_names, runs):
     return out
 
 
+def _why(reason):
+    """A run's unknown reason for the 'no usable reference run' line."""
+    if reason.startswith("no artifact"):
+        return "no artifact: expired or never uploaded"
+    if reason.startswith("incomplete"):
+        return "incomplete: not all tests ran"
+    return "unreadable: " + clean(reason, 40)
+
+
 def _age(seconds):
     seconds = max(0, int(seconds))
     return "%ds" % seconds if seconds < 120 else "%dm" % (seconds // 60) if seconds < 7200 else "%dh" % (seconds // 3600) if seconds < 172800 else "%dd" % (seconds // 86400)
@@ -279,7 +288,7 @@ def run(reader, repo, number, events, cache_dir, now, out):
         listing = [None]
         if not pr_runs:
             out.write("reds %s#%d: no completed pull_request run for head %s: nothing to classify\n" % (repo, number, head[:7]))
-            return EXIT_OK
+            return EXIT_UNKNOWN
         pr_run = pr_runs[0]
         pr_entry = load_run(reader, repo, pr_run["id"], None, cache, listing)
         refs = reference_runs(reader, repo, default_branch, events, MAIN_RUNS)
@@ -292,7 +301,7 @@ def run(reader, repo, number, events, cache_dir, now, out):
         return EXIT_ERROR
     if "unknown" in pr_entry:
         out.write("reds %s#%d: the pull request's run %s has no usable failing-tests artifact (%s): unknown, nothing was classified\n" % (repo, number, pr_run["id"], pr_entry["unknown"]))
-        return EXIT_OK
+        return EXIT_UNKNOWN
     pr_names = list(dict.fromkeys(pr_entry["failed"]))
     stamp = now()
     usable, unknown = [], []
@@ -315,6 +324,19 @@ def run(reader, repo, number, events, cache_dir, now, out):
         out.write(line + "\n")
     else:
         out.write("main's latest run: none found among the runs of the reference events (%s)\n" % ", ".join(events))
+    if not usable:
+        # No complete reference run: nothing to compare with. A red is NEVER called new on no evidence: say why and list the names as unknown.
+        reasons = sorted({_why(r[1]) for r in unknown}) or ["none found"]
+        out.write("no usable reference run (%s): cannot classify\n" % "; ".join(reasons))
+        out.write("  unknown (%d):\n" % len(pr_names))
+        for name in pr_names[:200]:
+            out.write("    %s\n" % clean(name))
+        if len(pr_names) > 200:
+            out.write("    ... %d more\n" % (len(pr_names) - 200))
+        out.write("main runs: %d listed, 0 usable, %d unknown%s\n" % (len(loaded), len(unknown), "".join("; run %d: %s" % (r[0][0], clean(r[1], 60)) for r in unknown[:5])))
+        return EXIT_UNKNOWN
+    if not usable[0]["latest"]:
+        out.write("main's latest run is unknown: classified by the %d older complete run(s) only; \"failing on main\" is not said\n" % len(usable))
     labels = classify(pr_names, usable)
     for title, key in (("also failing on main", "main"), ("flaky on main", "flaky"), ("new", "new")):
         rows = [n for n in pr_names if labels[n][0] == key]

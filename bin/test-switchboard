@@ -43079,7 +43079,7 @@ class TestReds(Base):
     def test_a_garbage_artifact_a_pr_without_a_run_and_a_pr_without_an_artifact_are_said(self):
         self.fake.pr_run(["a::t"], artifact=False)
         code, out = self.run_reds()
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 3, "unknown, not classified")
         self.assertIn("no usable failing-tests artifact (no artifact): unknown, nothing was classified", out)
         broken = FakeActions()
         broken.add_run("pull_request", "feature", [], created=self.created(1), sha="b" * 40, raw=b"not a zip")
@@ -43090,6 +43090,57 @@ class TestReds(Base):
         self.fake = empty
         code, out = self.run_reds()
         self.assertIn("no completed pull_request run", out)
+
+    def unknown_case(self, build):
+        self.fake = FakeActions()
+        shutil.rmtree(str(self.state / "reds-cache"), ignore_errors=True)
+        self.fake.pr_run(["a::t", "b::u"])
+        build(self.fake)
+        return self.run_reds()
+
+    def assert_cannot_classify(self, code, out, why):
+        self.assertEqual(code, self.hs.EXIT_UNKNOWN, out)
+        self.assertIn("no usable reference run (%s): cannot classify" % why, out)
+        self.assertIn("unknown (2):\n    a::t\n    b::u", out)
+        self.assertNotIn("new (", out, "a red is never called new on no evidence")
+        self.assertNotIn("also failing on main", out)
+        self.assertNotIn("flaky on main", out)
+
+    def test_with_no_usable_reference_run_the_reds_are_unknown_never_new(self):
+        code, out = self.unknown_case(lambda fake: None)
+        self.assert_cannot_classify(code, out, "none found")
+        code, out = self.unknown_case(lambda fake: [fake.add_run("push", "main", ["a::t"], created=self.created(10 + n * 60), expired=True) for n in range(3)])
+        self.assert_cannot_classify(code, out, "no artifact: expired or never uploaded")
+        code, out = self.unknown_case(lambda fake: [fake.add_run("push", "main", ["a::t"], complete=False, created=self.created(10 + n * 60)) for n in range(3)])
+        self.assert_cannot_classify(code, out, "incomplete: not all tests ran")
+        code, out = self.unknown_case(lambda fake: fake.add_run("push", "main", [], created=self.created(10), raw=b"not a zip"))
+        self.assert_cannot_classify(code, out, "unreadable: the artifact is not a zip")
+        code, out = self.unknown_case(lambda fake: (fake.add_run("push", "main", [], created=self.created(10), artifact=False),
+                                                    fake.add_run("push", "main", ["a::t"], complete=False, created=self.created(70))))
+        self.assert_cannot_classify(code, out, "incomplete: not all tests ran; no artifact: expired or never uploaded")
+
+    def test_an_unknown_latest_run_with_older_complete_runs_classifies_by_those_alone_and_says_so(self):
+        def build(fake):
+            fake.add_run("push", "main", ["a::t"], complete=False, created=self.created(10))   # latest: incomplete
+            fake.add_run("push", "main", ["a::t"], created=self.created(70))
+            fake.add_run("push", "main", ["a::t"], created=self.created(130))
+        code, out = self.unknown_case(build)
+        self.assertEqual(code, 0, out)
+        self.assertIn("main's latest run is unknown: classified by the 2 older complete run(s) only; \"failing on main\" is not said", out)
+        self.assertIn("flaky on main (1):\n    a::t (2 of 2 main runs)", out)
+        self.assertIn("new (1):\n    b::u\n", out, "absent from every COMPLETE run: new is allowed here")
+        self.assertNotIn("also failing on main (1)", out)
+
+    def test_a_mix_of_unknown_and_one_complete_run_classifies_from_the_complete_one(self):
+        def build(fake):
+            fake.add_run("push", "main", [], created=self.created(10), artifact=False)
+            fake.add_run("push", "main", ["a::t"], complete=False, created=self.created(70))
+            fake.add_run("push", "main", ["a::t"], created=self.created(130))
+        code, out = self.unknown_case(build)
+        self.assertEqual(code, 0, out)
+        self.assertIn("1 older complete run(s) only", out)
+        self.assertIn("new (2):\n    a::t (1 of 1 main runs)\n    b::u\n", out)
+        self.assertIn("main runs: 3 listed, 1 usable, 2 unknown", out)
 
     def test_the_real_command_reads_through_the_real_reader_with_the_configured_events_and_exits_1_on_a_failed_read(self):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": "gh", "reds": {"reference_events": {"acme/widget": ["merge_group", "schedule"]}}})
