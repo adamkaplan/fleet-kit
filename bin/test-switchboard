@@ -39761,7 +39761,8 @@ class TestComposeTrap(Base):
         script.write_text("#!/usr/bin/env bash\n. %s\nfleet_compose_trap -p proj -f compose.test.yml\n%s\n" % (
             REPO / "tools" / "fleet-compose-trap.sh", "exit 0" if how == "exit" else "sleep 30 &\ntouch %s\nwait" % (self.home / "ready")))
         env = dict(os.environ, PATH="%s:%s" % (fake, os.environ["PATH"]))
-        proc = subprocess.Popen(["bash", str(script)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(["bash", str(script)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))   # a suite started in the background inherits SIGINT ignored, which no trap can undo
         if how != "exit":
             for _ in range(200):   # the child says when its trap is set and it waits
                 if (self.home / "ready").exists():
