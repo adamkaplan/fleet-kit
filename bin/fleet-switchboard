@@ -11101,6 +11101,24 @@ class ReminderFacts:
                 return "%s is %s" % (ref, state)
         return None
 
+    def last_report(self, worker):
+        """When `worker` last made a report (epoch seconds, from `last-reports.json`), or None."""
+        try:
+            at = _read_small(self.state_dir, LAST_REPORT_FILE).get(worker, {}).get("at")
+        except (OSError, AttributeError):
+            return None
+        return float(at) if _is_number(at) else None
+
+    def overdue_text(self, item):
+        """The wake's text with the fact the boss needs: when the worker last reported, or that it has not since the launch."""
+        worker, since = item["condition"].get("unless_report_from"), item["condition"].get("since", 0)
+        last = self.last_report(worker) if isinstance(worker, str) else None
+        if last is None:
+            tail = "no report from %s since launch" % worker
+        else:
+            tail = "last report from %s %s ago%s" % (worker, _age_text(max(0, int(self.engine.now() - last))), "" if not _is_number(since) or last >= since else " (before this launch)")
+        return "%s (%s)" % (item["text"], tail)
+
     def verdict(self, item):
         """For a due conditional reminder: None (cannot tell yet: it stays), "deliver", or the reason to drop it.
         One read of the boss's transcript and inbox, and only for a reminder that is due and has a condition."""
@@ -11121,6 +11139,9 @@ class ReminderFacts:
                 self.engine.audit.append(self.engine.actor, "reminder.condition_unusable", item["to"],
                                          {"id": item["id"]})
             return "deliver"
+        last = self.last_report(worker)
+        if last is not None and last >= since:   # the durable record `report` writes for EVERY report (a rider, a direct one, to any boss): it needs no read of the boss's transcript, which v2_light never makes and a delivered rider no longer shows
+            return "%s reported to its boss since the launch (%s ago)" % (worker, _age_text(max(0, int(self.engine.now() - last))))
         if boss is None:
             return None
         try:
@@ -11149,7 +11170,8 @@ class ReminderFacts:
                         self.engine.audit.append(self.engine.actor, "reminder.drop", item["to"],
                                                  {"id": item["id"], "why": found})
                     continue
-            facts.append(Fact("reminder:" + item["id"], item["to"], "reminder", item["text"], item["at"],
+            text = self.overdue_text(item) if isinstance(item.get("condition"), dict) and isinstance(item["condition"].get("unless_report_from"), str) and self.engine else item["text"]
+            facts.append(Fact("reminder:" + item["id"], item["to"], "reminder", text, item["at"],
                               issue=item.get("issue"), batch=False, sender=item.get("from"), repo=item.get("repo")))
         return facts
 

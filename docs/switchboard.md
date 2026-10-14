@@ -2431,7 +2431,7 @@ not count, so a worker that stopped twice without reporting its new work is stil
 | Reminder | To | At | Text | Condition |
 |---|---|---|---|---|
 | checkpoint | the worker | the checkpoint | `checkpoint due: report now, one line` | the worker is still running; if it is gone the reminder is dropped |
-| overdue | `--reports-to` (the launching orchestrator) | the overdue time | `<worker> has not reported since launch: overdue checkpoint` | delivered **only if the worker has not reported or sent anything to that orchestrator since the launch**; otherwise, or when the worker is gone, dropped |
+| overdue | `--reports-to` (the launching orchestrator) | the overdue time | `<worker> has not reported since launch: overdue checkpoint` | delivered **only if the worker has not reported to anyone, or sent anything to that orchestrator, since the launch** (the check reads `last-reports.json`, which every report writes, so it holds under `v2_light` and after a rider was delivered and pruned; then the boss's transcript and riders); otherwise, or when the worker is gone, dropped. The text ends with `(last report from <worker> 12m ago)` or `(no report from <worker> since launch)` |
 
 The times come from `--checkpoint 30m --overdue 60m` (a delay or an ISO time with a zone; the documented way), or, when
 neither flag is given, from a best-effort parse of the brief's `CHECKPOINT:` line: `Report at 30 minutes ... overdue
