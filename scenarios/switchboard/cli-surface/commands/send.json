@@ -1,0 +1,4 @@
+{
+ "command": "send",
+ "help": "usage: fleet-switchboard send [-h] [--issue ISSUE] [--interrupt] [--from SENDER] name text [text ...] positional arguments: name The recipient's fleet name text The message options: -h, --help show this help message and exit --issue ISSUE The issue the message is about --interrupt Stop and hold orders only: abort the recipient's running turn (its in-flight tool call is cut), then deliver the message as a wake. Only a boss to its own worker. --from SENDER Lab only: the sender's fleet name"
+}

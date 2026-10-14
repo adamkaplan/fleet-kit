@@ -1,0 +1,4 @@
+{
+ "command": "agents",
+ "help": "usage: fleet-switchboard agents [-h] {verify} ... positional arguments: {verify} verify Ask the running OpenCode service for its agents and compare each of ours with its expected mode and the rules its definition declares options: -h, --help show this help message and exit"
+}

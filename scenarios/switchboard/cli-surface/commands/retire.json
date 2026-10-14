@@ -1,0 +1,4 @@
+{
+ "command": "retire",
+ "help": "usage: fleet-switchboard retire [-h] [--reason REASON] [--undo] name positional arguments: name The agent's fleet name options: -h, --help show this help message and exit --reason REASON Why (one line) --undo Watch it again"
+}

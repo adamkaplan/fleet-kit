@@ -29,6 +29,7 @@ import importlib.util
 import inspect
 import http.client
 import io
+import select
 import json
 import os
 os.environ.setdefault("FLEET_SWITCHBOARD_UNDER_TEST", "1")   # the suite never runs the real opencode (refuse_real_opencode_under_test)
@@ -238,7 +239,7 @@ class TestConfig(Base):
             "worker_lookback_hours": 24, "send_to_working": "steer",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
-            "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_transport": "auto", "disk_guard": None, "docker_reaper": True,
+            "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "heavy": None, "docker_reaper": True,
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
                               "check_suite", "workflow_run"],
             "awaiting_label": None, "decisions_lookback_hours": 72,  # PR 14
@@ -2422,7 +2423,7 @@ class TestFacts(Base):
     def test_the_registration_point_lists_the_lab_source(self):
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "disk_facts", "docker_reap_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "disk_facts", "cpu_facts", "docker_reap_facts"])
 
 
 # ---------------------------------------------------------------- observing
@@ -6672,6 +6673,24 @@ class TestGithubReceive(Base):
     def rejected(self):
         return [e for e in self.rig.world.audit() if e["event"] == "github.rejected"]
 
+    def pr_payload(self, action, **pr):
+        return {"action": action, "pull_request": dict({"id": 91, "number": 9, "body": "Closes #12", "state": "open", "title": "t"}, **pr),
+                "repository": {"full_name": GH_REPO}}
+
+    def test_a_pull_request_push_and_a_comment_through_the_hub_leave_one_movement_row(self):
+        self.assertEqual(self.post()[0], 202)
+        self.assertEqual(self.post("pull_request", self.pr_payload("synchronize"))[0], 202)
+        rows = sb.load_fleet_health().read_moves(str(self.rig.world.state), 0)
+        self.assertEqual([(r["kind"], r["numbers"], r["repo"]) for r in rows], [("push", [9, 12], GH_REPO)])
+        self.assertEqual(stat.S_IMODE((self.rig.world.state / "ask-moves.jsonl").stat().st_mode), 0o600)
+
+    def test_a_movement_row_that_cannot_be_written_is_audited_and_the_delivery_still_succeeds(self):
+        with mock.patch.object(sb.load_fleet_health(), "append_moves", side_effect=OSError("disk full")):
+            self.assertEqual(self.post("pull_request", self.pr_payload("opened"))[0], 202)
+        failed = [e for e in self.rig.world.audit() if e["event"] == "load.moves_failed"]
+        self.assertEqual(len(failed), 1)
+        self.assertIn("disk full", failed[0]["detail"]["error"])
+
     def test_a_signed_event_is_accepted_and_queued_by_its_object_id(self):
         self.assertEqual(self.post()[0], 202)
         self.assertEqual(self.rig.keys(), ["github.comment:5001"])
@@ -9414,7 +9433,7 @@ class TestFrictionWake(FrictionBase):
         self.assertNotIn("friction_wake", sb.DEFAULTS)
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "disk_facts", "docker_reap_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "disk_facts", "cpu_facts", "docker_reap_facts"])
         self.assertNotIn("friction_wake", sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}))
         self.assertEqual(sb.FRICTION_DEFAULTS, {"enabled": False, "hour": 9, "to": "cos", "cos_to": "improver", "text": None})
         self.make("off")
@@ -10883,7 +10902,7 @@ COS_ONLY_MAXIMS = ("message stands alone", "No change, no message",
                    "Evidence, consequence, options, recommendation")
 RUBRIC = ("grows the contract", "can't be undone", "speaks for your principal", "a key that isn't yours",
           "ready for your principal's eyes", "stuck after trying")
-ROLE_LINE_LIMITS = {"coder": 129, "orchestrator": 178, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
+ROLE_LINE_LIMITS = {"coder": 130, "orchestrator": 178, "chief-of-staff": 162, "cos-subagent": 70}  # lines; they must not grow
 # chief-of-staff +350: the quiet `.` ack (#96). chief-of-staff +150: the signed-comment sentence. PR 13 (`report`): coder +300, orchestrator +150, chief-of-staff +100
 # chief-of-staff +400: read-only/merge STOP lines (#105; the native permissions list is excluded from the count)
 # #129: the waiting definitions (the label and the Decision-required rule, in the coder and orchestrator; the same-turn
@@ -10894,11 +10913,12 @@ ROLE_LINE_LIMITS = {"coder": 129, "orchestrator": 178, "chief-of-staff": 162, "c
 # #109: coder +1 line, +100 B; orchestrator +100 B: the fleet-planning load line
 # #109: chief-of-staff +100 B: the fleet-planning load line
 # one-command verdict text: coder +2 lines +450 B, orchestrator +150 B
+# #34: the one `heavy` line (full suites and e2e runs go through fleet-switchboard heavy): coder +1 line +100 B, orchestrator +90 B
 # two maxims restored in the coder: +2 lines, +200 B
 # hygiene pointer: coder -2 lines, -100 B (three maxims became one pointer to the standards)
 # #107 follow-up: coder +300 B for the spelled-out fallback and the never-your-own rule
 # `pr-state`: coder +1 line +140 B, orchestrator +1 line +120 B: the one sentence that sends an agent to the daemon's cache instead of a GitHub polling loop
-ROLE_BYTE_LIMITS = {"coder": 7790, "orchestrator": 10920, "chief-of-staff": 11650, "cos-subagent": 3500}
+ROLE_BYTE_LIMITS = {"coder": 7960, "orchestrator": 11010, "chief-of-staff": 11650, "cos-subagent": 3500}
 WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others
 
 
@@ -11118,12 +11138,25 @@ class TestSelfRegisteringCli(unittest.TestCase):
     """The front door (#179 follow-up): commands register and dispatch BY NAME, so a new command edits no shared list. What must not change: the set of
     subcommands and each one's help, the function each runs and what it is given, the daemon start, the error mapping; and a hostile name never runs
     an arbitrary function."""
-    SURFACE = REPO / "scenarios" / "switchboard" / "cli-surface" / "commands.json"
+    SURFACE_DIR = REPO / "scenarios" / "switchboard" / "cli-surface" / "commands"   # ONE file per command: two PRs adding different commands never touch the same file
+
+    @classmethod
+    def read_surface(cls):
+        """{"commands": [sorted names], "help": {name: help}} read from the per-command files; a file whose name and `command` disagree is an error."""
+        found = {}
+        for path in sorted(cls.SURFACE_DIR.glob("*.json")):
+            entry = json.loads(path.read_text())
+            if entry.get("command") != path.stem:
+                raise AssertionError("%s describes %r: a snapshot file is named for its command" % (path.name, entry.get("command")))
+            found[path.stem] = entry["help"]
+        return {"commands": sorted(found), "help": found}
     # Written from the OLD dispatch chain, not derived from the new code: action -> (function, the arguments it was called with)
     OLD = {
         "status": ("cmd_status", ("args", "runner", "now")), "poke": ("cmd_poke", ("args",)), "policy-report": ("cmd_policy_report", ("args", "runner", "now")),
         "agents": ("cmd_agents", ("args", "runner", "now")), "job": ("cmd_job", ("args", "runner", "now", "spawn")), "review-laws": ("cmd_review_laws", ("args", "runner", "now")), "review": ("cmd_review", ("args", "runner", "now")), "pr-explain": ("cmd_pr_explain", ("args", "runner", "now")), "disk": ("cmd_disk", ("args", "runner", "now")), "pr-state": ("cmd_pr_state", ("args", "runner", "now")),
         "reattach": ("cmd_reattach", ("args", "runner", "now", "socket_call")),
+        "heavy": ("cmd_heavy", ("args",)),
+        "read": ("cmd_read", ("args", "runner", "now")),
         "retire": ("cmd_retire", ("args", "runner", "now")),
         "impact": ("cmd_impact", ("args", "runner", "now")), "judge-tool": ("cmd_judge_tool", ("args", "runner", "now")),
         "ensure": ("cmd_ensure", ("args", "spawn")), "install": ("cmd_install", ("args", "runner", "now", "spawn")), "key": ("cmd_key", ("args", "runner", "now")),
@@ -11135,7 +11168,7 @@ class TestSelfRegisteringCli(unittest.TestCase):
         "decisions": ("cmd_decisions", ("args", "runner", "now")), "comment": ("cmd_comment", ("args", "runner", "now")), "whoami": ("cmd_whoami", ("args", "runner", "now")),
         "pending": ("cmd_pending", ("args", "runner", "now")), "remind": ("cmd_remind", ("args", "runner", "now")), "intent": ("cmd_intent", ("args", "runner", "now")),
         "intents": ("cmd_intents", ("args", "runner", "now")), "import-v1": ("cmd_import_v1", ("args", "runner", "now")), "orders": ("cmd_orders", ("args", "runner", "now")),
-        "labels": ("cmd_labels", ("args", "runner", "now")), "read": ("cmd_read", ("args", "runner", "now")), "plan": ("cmd_plan", ("args", "runner", "now", "socket_call")),
+        "load-replay": ("cmd_load_replay", ("args", "runner", "now")), "labels": ("cmd_labels", ("args", "runner", "now")), "plan": ("cmd_plan", ("args", "runner", "now", "socket_call")),
         "triage": ("cmd_triage", ("args", "runner", "now"))}
     OLD_ENSURE_ON_USE = ("send", "report", "notice", "launch", "handoff", "comment", "remind", "decisions", "intent", "bootstrap")
     OLD_DIRECT = ("status", "poke", "policy-report", "review-laws", "review", "pr-explain", "impact", "plan", "judge-tool")
@@ -11155,12 +11188,113 @@ class TestSelfRegisteringCli(unittest.TestCase):
     def test_every_subcommand_of_the_snapshot_still_exists_with_the_same_help(self):
         _, choices = self.commands()
         if os.environ.get("CLI_SURFACE_UPDATE") == "1":
-            self.SURFACE.write_text(json.dumps({"commands": sorted(choices), "help": {n: self.plain(choices[n].format_help()) for n in sorted(choices)}}, indent=1, sort_keys=True))
-        snap = json.loads(self.SURFACE.read_text())
-        self.assertEqual(sorted(choices), snap["commands"], "the set of subcommands changed")
+            self.SURFACE_DIR.mkdir(parents=True, exist_ok=True)
+            for stale in self.SURFACE_DIR.glob("*.json"):
+                stale.unlink()
+            for name in sorted(choices):
+                (self.SURFACE_DIR / ("%s.json" % name)).write_text(json.dumps({"command": name, "help": self.plain(choices[name].format_help())}, indent=1, sort_keys=True) + "\n")
+        failure = self.snapshot_failure(self.SURFACE_DIR)
+        self.assertIsNone(failure, failure)
+        snap = self.read_surface()
         for name in snap["commands"]:
             with self.subTest(command=name):
                 self.assertEqual(self.plain(choices[name].format_help()), snap["help"][name])
+
+    def snapshot_failure(self, surface_dir):
+        """The message of the REAL surface comparison (the body of test_every_subcommand_of_the_snapshot...) run against `surface_dir`, or None when it passes."""
+        _, choices = self.commands()
+        try:
+            with mock.patch.object(self.__class__, "SURFACE_DIR", surface_dir):
+                snap = self.read_surface()
+            self.assertEqual(sorted(choices), snap["commands"], "the set of subcommands changed: only in the code %s, only in the snapshot %s" % (
+                sorted(set(choices) - set(snap["commands"])), sorted(set(snap["commands"]) - set(choices))))
+        except AssertionError as err:
+            return str(err)
+        return None
+
+    def test_a_command_without_a_snapshot_file_and_a_file_without_a_command_each_fail_and_name_it(self):
+        with tempfile.TemporaryDirectory() as work:
+            copy = Path(work)
+            for source in self.SURFACE_DIR.glob("*.json"):
+                (copy / source.name).write_text(source.read_text())
+            self.assertIsNone(self.snapshot_failure(copy), "a complete copy passes")
+            (copy / "status.json").unlink()                                              # a command with no snapshot file
+            message = self.snapshot_failure(copy)
+            self.assertIsNotNone(message)
+            self.assertIn("only in the code ['status']", message)
+            (copy / "status.json").write_text((self.SURFACE_DIR / "status.json").read_text())
+            (copy / "ghost-command.json").write_text(json.dumps({"command": "ghost-command", "help": "x"}))    # a file with no command
+            message = self.snapshot_failure(copy)
+            self.assertIsNotNone(message)
+            self.assertIn("only in the snapshot ['ghost-command']", message)
+            (copy / "ghost-command.json").unlink()
+            (copy / "alpha.json").write_text(json.dumps({"command": "beta", "help": "x"}))                     # a file named for one command, describing another
+            message = self.snapshot_failure(copy)
+            self.assertIn("alpha.json", message)
+
+    def test_the_snapshot_is_one_file_per_command_with_a_full_help_text(self):
+        files = sorted(self.SURFACE_DIR.glob("*.json"))
+        self.assertGreater(len(files), 40)
+        self.assertFalse((self.SURFACE_DIR.parent / "commands.json").exists(), "the old single shared file is gone")
+        for path in files:
+            entry = json.loads(path.read_text())
+            self.assertEqual(sorted(entry), ["command", "help"], path.name)
+            self.assertTrue(entry["help"].startswith("usage: fleet-switchboard " + path.stem), path.name)
+
+    def test_a_new_command_edits_no_shared_table_it_registers_says_its_group_beside_itself_and_dispatches(self):
+        calls, ensured = [], []
+
+        def add_fixture_parsers(sub):
+            sub.add_parser("fixture", help="a command added with no shared edit")
+
+        def cmd_fixture(args, runner, now):
+            calls.append("fixture")
+            raise sb.LedgerCommandError("a ledger error is a usage error")
+
+        cmd_fixture.ledger = True
+        cmd_fixture.ensure_on_use = True
+        names = {"add_fixture_parsers": add_fixture_parsers, "cmd_fixture": cmd_fixture}
+        before = (sb.DIRECT_ACTIONS, sb.LEDGER_ACTIONS, sb.ENSURE_ON_USE_COMMANDS)
+        with mock.patch.dict(sb.__dict__, names), mock.patch.object(sb, "ensure_on_use", lambda spawn=None: ensured.append("ensured")):
+            parser = sb.build_parser()
+            self.assertIn("fixture", parser.commands)
+            code = sb.dispatch(types.SimpleNamespace(action="fixture"), parser.commands, runner="R", now="N")
+            sb.derive_action_groups()
+            self.assertIn("fixture", sb.LEDGER_ACTIONS)
+            self.assertIn("fixture", sb.ENSURE_ON_USE_COMMANDS)
+            self.assertNotIn("fixture", sb.DIRECT_ACTIONS)
+        sb.derive_action_groups()
+        self.assertEqual((sb.DIRECT_ACTIONS, sb.LEDGER_ACTIONS, sb.ENSURE_ON_USE_COMMANDS), before, "the groups return to what the module defines")
+        self.assertEqual((calls, ensured, code), (["fixture"], ["ensured"], sb.EXIT_USAGE), "it ran, the daemon was ensured first, the ledger error mapped to a usage error")
+
+    def test_two_branches_that_add_different_commands_touch_no_common_file_and_merge_cleanly(self):
+        with tempfile.TemporaryDirectory() as work:
+            env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.test", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.test",
+                       GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
+
+            def git(*args):
+                done = subprocess.run(["git", "-C", work] + list(args), capture_output=True, text=True, env=env)
+                self.assertEqual(done.returncode, 0, "git %s: %s%s" % (args, done.stdout, done.stderr))
+                return done.stdout
+
+            git("init", "-q", "-b", "main")
+            target = Path(work) / "scenarios" / "switchboard" / "cli-surface" / "commands"
+            target.mkdir(parents=True)
+            for existing in self.SURFACE_DIR.glob("*.json"):
+                (target / existing.name).write_text(existing.read_text())
+            git("add", ".")
+            git("commit", "-qm", "base")
+            touched = []
+            for branch, name in (("one", "alpha-cmd"), ("two", "beta-cmd")):
+                git("checkout", "-q", "-b", branch, "main")
+                (target / ("%s.json" % name)).write_text(json.dumps({"command": name, "help": "usage: fleet-switchboard %s" % name}))
+                git("add", ".")
+                git("commit", "-qm", name)
+                touched.append(set(git("diff", "--name-only", "main", branch).split()))
+            self.assertEqual(touched[0] & touched[1], set(), "0 files changed by both branches")
+            git("checkout", "-q", "one")
+            git("merge", "--no-edit", "two")
+            self.assertTrue((target / "alpha-cmd.json").exists() and (target / "beta-cmd.json").exists())
 
     def test_the_old_dispatch_table_covers_every_command_but_version(self):
         parser, choices = self.commands()
@@ -11216,7 +11350,11 @@ class TestSelfRegisteringCli(unittest.TestCase):
         self.assertIn(sb.VERSION, out.getvalue())
 
     def test_the_error_mapping_and_the_special_groups_are_what_they_were(self):
-        self.assertEqual(sorted(sb.DIRECT_ACTIONS), sorted(self.OLD_DIRECT))
+        # the groups are VIEWS of the `direct`, `ledger` and `ensure_on_use` attributes each command sets next to its own definition: every command that
+        # was in a shared list is still in its group, and the only additions are commands that already said `direct` themselves
+        self.assertTrue(set(self.OLD_DIRECT) <= set(sb.DIRECT_ACTIONS))
+        # these already said `cmd_x.direct = True` before this change, so they already ran direct: the views only make that visible
+        self.assertEqual(set(sb.DIRECT_ACTIONS) - set(self.OLD_DIRECT), {"disk", "heavy", "load-replay", "pr-state", "triage"})
         self.assertEqual(sorted(sb.LEDGER_ACTIONS), sorted(self.OLD_LEDGER))
         self.assertEqual(sorted(sb.ENSURE_ON_USE_COMMANDS), sorted(self.OLD_ENSURE_ON_USE))
         known = self.commands()[0].commands
@@ -18044,6 +18182,7 @@ class FakeTriageHub:
 
     def __init__(self):
         self.open, self.comments, self.closed, self.live = {}, {}, {}, {}   # per repo: open {n: rec}; comments [rec]; closed {label: [rec]}
+        self.pulls = {}   # per repo: [recently closed pull request records] (#384)
         self.calls, self.unreadable = [], set()
 
     def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
@@ -18056,6 +18195,8 @@ class FakeTriageHub:
             return [c for c in self.comments.get(repo, []) if c["issue_url"].endswith("/%s" % match.group(1))][::-1], False
         if "/issues/comments" in path:
             return list(self.comments.get(repo, [])), False
+        if re.search(r"/pulls\?", path):
+            return list(self.pulls.get(repo, [])), False
         if "state=closed" in path:
             label = unquote(re.search(r"labels=([^&]+)", path).group(1))
             return list(self.closed.get(repo, {}).get(label, [])), False
@@ -18434,6 +18575,159 @@ class TestTriage(Base):
         self.assertEqual([f for f in self.found() if f[1] == "acme/api#120"], [("OO", "acme/api#120")])
         row = [e for e in self.world.audit() if e["event"] == "triage.finding" and e["detail"]["rule"] == "OO"][0]
         self.assertEqual(row["detail"]["evidence"]["would_be"], ["T1", "T2", "T3"])
+
+    def merged_pr(self, number, body, hours_ago=2.0, merged=True, author="bot"):
+        record = {"number": number, "body": body, "user": {"login": author}, "html_url": "https://evil.example/\x1b[31m%d" % number,
+                  "merged_at": sb.iso(self.world.clock.now() - hours_ago * 3600) if merged else None, "state": "closed"}
+        self.hub.pulls.setdefault("acme/api", []).append(record)
+
+    def test_t12_an_open_plan_issue_whose_pr_merged_is_that_finding_with_the_pr_link_and_not_no_owner(self):
+        self.charter()
+        self.add(130, created=60, labels=["kind"])                         # unowned and old: it would be T1
+        self.add(131, created=60, labels=["kind"])
+        self.merged_pr(200, "Part of #130.")
+        self.merged_pr(201, "PLAN: https://github.com/acme/api/issues/131\n\nCloses #999")
+        self.go()
+        self.assertEqual(self.only("T12"), ["acme/api#130", "acme/api#131"])
+        self.assertEqual((self.only("T1"), self.only("T11")), ([], []))
+        row = [e for e in self.world.audit() if e["event"] == "triage.finding" and e["detail"]["ref"] == "acme/api#130" and e["detail"]["rule"] == "T12"][0]
+        self.assertEqual((row["detail"]["what"], row["detail"]["evidence"]["pr"], row["detail"]["evidence"]["pr_url"]),
+                         ("plan issue still open after its PR merged", 200, "https://github.com/acme/api/pull/200"))   # the link is rebuilt, not the record's html_url
+        self.assertFalse(row["detail"]["applied"])
+
+    def ledger(self, *rows):
+        """Write a real hash-chained plan ledger into the state dir (proof / verdict rows for acme/api#200)."""
+        for kind, scenario, result in rows:
+            sb.plan_ledger.append_entry(self.world.state, {"kind": kind, "pr": "acme/api#200", "scenario": scenario, "result": result,
+                                                           "evaluator": "tester", "plan_hash": "sha256:x", "head": "a" * 40, "by": "someone"}, self.world.clock.now())
+
+    def test_t12_s1_an_open_sub_issue_suppresses_it(self):
+        self.charter()
+        self.add(300, created=60, labels=["kind"], assignees=["bot"])
+        self.hub.open["acme/api"][300]["sub_issues_summary"] = {"total": 2, "completed": 1}
+        self.merged_pr(200, "Part of #300.")
+        self.go()
+        self.assertEqual(self.only("T12"), [])
+        self.assertEqual(self.only("T1"), [])                               # still not reported as unowned: its PR merged
+
+    def test_t12_s2_its_own_text_saying_work_is_left_suppresses_it_and_quotes_do_not(self):
+        self.charter()
+        self.add(301, created=60, labels=["kind"], assignees=["bot"], body="Done when:\n- [x] code\n- [ ] the three day live proof")
+        self.add(302, created=60, labels=["kind"], assignees=["bot"], body="The cost figure: pending live proof over three days.")
+        self.add(303, created=60, labels=["kind"], assignees=["bot"], body="Notes\n> - [ ] quoted, not ours\n```\n- [ ] in code\n```")
+        self.merged_pr(200, "Part of #301. Part of #302. Part of #303.")
+        self.go()
+        self.assertEqual(self.only("T12"), ["acme/api#303"])               # only the quoted and fenced one: nothing is really left
+
+    def test_t12_s3_a_proof_with_no_passing_verdict_in_the_ledger_suppresses_it_until_the_verdict(self):
+        self.charter()
+        self.add(304, created=60, labels=["kind"], assignees=["bot"])
+        self.merged_pr(200, "Part of #304.")
+        self.ledger(("proof", "S9", "pass"))
+        self.go(passes=1)
+        self.assertEqual(self.only("T12"), [])                              # proved, not judged
+        self.ledger(("verdict", "S9", "pass"))
+        self.world.tick(sb.TRIAGE_TTL + 5)
+        self.go(passes=1)
+        self.assertEqual(self.only("T12"), ["acme/api#304"])               # judged: done
+
+    def test_t12_s4_all_merged_and_nothing_pending_fires_with_the_usual_evidence(self):
+        self.charter()
+        self.add(305, created=60, labels=["kind"], assignees=["bot"], body="Done when:\n- [x] everything")
+        self.merged_pr(200, "Part of #305.")
+        self.ledger(("proof", "S1", "pass"), ("verdict", "S1", "pass"))
+        self.go()
+        self.assertEqual(self.only("T12"), ["acme/api#305"])
+        row = [e for e in self.world.audit() if e["event"] == "triage.finding" and e["detail"]["rule"] == "T12"][0]
+        self.assertEqual((row["detail"]["evidence"]["pr"], row["detail"]["evidence"]["pr_url"]), (200, "https://github.com/acme/api/pull/200"))
+
+    def test_t12_s5_a_tampered_ledger_is_unknown_and_gives_no_finding(self):
+        self.charter()
+        self.add(306, created=60, labels=["kind"], assignees=["bot"])
+        self.merged_pr(200, "Part of #306.")
+        self.ledger(("proof", "S1", "pass"), ("verdict", "S1", "pass"))
+        path = self.world.state / sb.plan_ledger.LEDGER_FILE
+        path.write_text(path.read_text().replace('"pass"', '"fail"', 1))   # an edit breaks the chain
+        self.go()
+        self.assertEqual(self.only("T12"), [])
+
+    def test_t12_s6_no_extra_github_read_is_made_for_the_pending_check(self):
+        self.charter()
+        self.add(307, created=60, labels=["kind"], assignees=["bot"], body="- [ ] left")
+        self.merged_pr(200, "Part of #307.")
+        self.go(passes=1)
+        before = len(self.hub.calls)
+        self.engine.triage.confirmed.clear()
+        self.go(passes=1)
+        reads = [c for c in self.hub.calls[before:] if "/issues/307" in c or "sub_issues" in c or "/comments" in c and "since" not in c]
+        self.assertEqual(reads, [])
+
+    def test_t12_never_fires_for_a_charter_or_an_ask_named_by_part_of_but_does_for_a_work_item(self):
+        self.charter()                                                     # #1 is the charter, #2 an ask under it
+        self.add(3, created=20, updated=0.1, parent=2, labels=["kind"], body="Next: go")   # a work item under the ask
+        self.merged_pr(240, "Part of #1. Part of #2. Part of #3.")
+        self.go()
+        self.assertEqual(self.only("T12"), ["acme/api#3"])                 # not the charter, not the ask
+
+    def test_t12_is_ours_through_the_merged_prs_author_and_a_fresh_read_of_a_closed_issue_drops_it(self):
+        self.charter()
+        self.add(170, created=60, labels=["kind"], author="stranger")          # not assigned to us, not in a chain, opened by someone else
+        self.merged_pr(230, "PLAN: acme/api#170", author="bot")                # but the merged PR is ours
+        self.go(passes=1)
+        self.assertEqual(self.only("T12"), ["acme/api#170"])
+        self.assertNotIn(("OO", "acme/api#170"), self.found())
+        self.hub.live["acme/api"] = {170: dict(self.hub.open["acme/api"][170], state="closed")}   # a fresh read shows it closed since
+        self.world.tick(sb.TRIAGE_TTL + 5)
+        state = sb.triage_state(self.engine)
+        self.assertFalse(sb.triage_verify(self.engine, state, "T12", "acme/api#170", self.engine.config["triage"], self.world.clock.now(), [10]))
+
+    def test_t12_no_finding_for_a_pr_closed_unmerged_a_closed_issue_or_another_repo(self):
+        self.charter()
+        self.add(140, created=60, labels=["kind"], assignees=["bot"])
+        self.add(141, created=60, labels=["kind"], assignees=["bot"])
+        self.merged_pr(210, "Part of #140", merged=False)                  # closed without merging: it implemented nothing
+        self.merged_pr(211, "Closes other/repo#141\nPLAN: https://github.com/other/repo/issues/141")
+        self.merged_pr(212, "Part of #142")                                # #142 is not open (closed or never listed)
+        self.go()
+        self.assertEqual(self.only("T12"), [])
+
+    def test_t12_a_pr_of_someone_elses_naming_an_issue_that_is_not_ours_is_only_a_flag(self):
+        self.charter()
+        self.add(150, created=60, labels=["kind"], author="stranger")
+        self.merged_pr(220, "Part of #150", author="stranger")
+        self.go()
+        self.assertEqual(self.only("T12"), [])
+        self.assertIn(("OO", "acme/api#150"), self.found())
+
+    def test_t12_reads_one_page_of_closed_pull_requests_per_repo_and_stays_inside_the_budget(self):
+        self.charter()
+        self.add(160, created=60, labels=["kind"], assignees=["bot"])
+        self.go(passes=1)
+        pulls = [c for c in self.hub.calls if "/pulls?" in c]
+        self.assertEqual(len(pulls), 1)
+        self.assertIn("per_page=%d" % sb.TRIAGE_MERGED_PER_PAGE, pulls[0])
+        self.assertIn("state=closed", pulls[0])
+        self.hub.calls.clear()
+        self.world.tick(sb.TRIAGE_TTL + 5)
+        self.go(passes=1, calls_per_pass=5)
+        self.assertLessEqual(len(self.hub.calls), 5)                      # the pass's budget of calls_per_pass: reads and fresh checks together
+
+    def test_t12_the_reference_rules(self):
+        refs = sb.load_triage_plan_open().references
+        self.assertEqual(refs("Closes #5. fixes #6, Resolved #7 and Part of #8", "acme/api"), {5, 6, 7, 8})
+        self.assertEqual(refs("PLAN: acme/api#9", "acme/api"), {9})
+        self.assertEqual(refs("PLAN: <https://github.com/ACME/api/issues/10>", "acme/api"), {10})
+        self.assertEqual(refs("Closes acme/web#11 and see #12 and PLAN: https://github.com/acme/web/issues/13", "acme/api"), set())
+        self.assertEqual(refs(None, "acme/api"), set())
+        links = sb.load_triage_plan_open().merged_links([{"number": 1, "body": "Part of #5", "merged_at": "2026-01-01T00:00:00Z"},
+                                                          {"number": 2, "body": "Part of #5", "merged_at": "2026-02-01T00:00:00Z"},
+                                                          {"number": 3, "body": "Part of #5", "merged_at": None}, "junk"], "acme/api")
+        self.assertEqual(links[5]["pr"], 2)          # the latest merge wins; an unmerged one is ignored
+
+    def test_the_pr_template_and_both_coder_definitions_name_the_plan_issue_with_closes(self):
+        for path in (REPO / ".github" / "pull_request_template.md", REPO / "agents" / "opencode" / "coder.md", REPO / "agents" / "copilot" / "coder.agent.md"):
+            with self.subTest(file=path.name):
+                self.assertEqual(path.read_text().count("Closes #"), 1)
 
     def test_an_unreadable_repo_is_reported_once_and_gives_no_findings(self):
         self.engine.config["triage"]["repos"] = ["acme/api", "acme/gone"]
@@ -19437,6 +19731,121 @@ class TestTriageDigest(Base):
         self.assertEqual(cost["days"][sb.triage_digest.day_of(now)], {"messages": 3, "chars": 1200})
         line = sb.triage_digest.cost_lines(cost, sb.triage_digest.day_of(now))[-1]
         self.assertIn("1200 chars, ~300 tokens", line)
+
+    # -- #406: warm up first, then at most one digest per hour
+
+    def stepped(self, steps, seconds=60, every=None, **cfg):
+        """Passes `seconds` apart; returns [(step, [(rule, ref)])] of the digests sent, and the digest state seen at each step."""
+        self.engine.config["triage"].update(enabled=True, **cfg)
+        sent, states, real = [], [], sb.triage_queue_fact
+        def spy(state, due, *a, **k):
+            sent.append((step, list(due)))
+            return real(state, due, *a, **k)
+        with mock.patch.object(sb, "triage_queue_fact", spy):
+            for step in range(steps):
+                self.world.tick(seconds if step else 1)
+                sb.triage_pass(self.engine, [], self.world.clock.now(), ())
+                if every:
+                    every(step)
+                states.append(dict(self.engine.triage.current.get("digest") or {}))
+        return sent, states
+
+    def test_s1_nothing_is_delivered_until_every_finding_is_checked_then_one_digest(self):
+        for n in range(100, 112):
+            self.add(n, created=3, updated=0.2, labels=["kind"])
+        sent, states = self.stepped(40, seconds=1, calls_per_pass=4)
+        self.assertGreaterEqual(len([s for s in states if s.get("state") == "warming"]), 1)    # it did hold at least one pass
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(len({ref for _, ref in sent[0][1]}), 12)                                 # 12 of 12 in the one digest
+        first = [i for i, s in enumerate(states) if s.get("state") != "warming"][0]
+        self.assertEqual(sent[0][0], first)                                                        # and not before the sweep ended
+
+    def test_s2_a_finding_that_qualifies_inside_the_hour_waits_and_goes_in_the_next_digest(self):
+        self.add(140, created=3, updated=0.2, labels=["kind"])
+        def later(step):
+            if step == 10:
+                self.add(141, created=3, updated=0.2, labels=["kind"])
+                self.engine.triage.units.clear()
+        sent, _ = self.stepped(75, every=later)
+        self.assertEqual([step for step, _ in sent], [0, 60])
+        self.assertEqual({ref for _, ref in sent[0][1]}, {"acme/api#140"})
+        self.assertIn("acme/api#141", {ref for _, ref in sent[1][1]})
+
+    def test_s3_held_findings_all_go_out_together_and_the_first_items_backoff_has_not_moved(self):
+        self.add(140, created=3, updated=0.2, labels=["kind"])
+        def later(step):
+            if step == 10:
+                for n in (150, 151, 152):
+                    self.add(n, created=3, updated=0.2, labels=["kind"])
+                self.engine.triage.units.clear()
+        sent, _ = self.stepped(75, every=later)
+        self.assertEqual({ref for _, ref in sent[1][1]} >= {"acme/api#150", "acme/api#151", "acme/api#152"}, True)
+        rec = self.engine.triage.seen["T1 acme/api#140"] if "T1 acme/api#140" in self.engine.triage.seen else [r for k, r in self.engine.triage.seen.items() if k.endswith("#140")][0]
+        self.assertEqual(rec["n"], 1)                                                              # not advanced by the held pass
+
+    def test_s4_a_restart_with_the_memory_intact_neither_re_warms_nor_resets_the_hour(self):
+        self.add(140, created=3, updated=0.2, labels=["kind"])
+        sent, _ = self.stepped(1)
+        self.assertEqual(len(sent), 1)
+        self.engine.triage = sb.TriageState()                                                      # a restart: memory rebuilt from the files
+        self.add(141, created=3, updated=0.2, labels=["kind"])
+        sent, states = self.stepped(10)
+        self.assertEqual(sent, [])                                                                 # inside the hour: nothing
+        self.assertEqual({s.get("state") for s in states}, {"held"})                               # and it is not warming up again
+
+    def test_s5_a_lost_memory_file_warms_up_again_and_delivers_one_digest_after_the_sweep(self):
+        for n in range(100, 112):
+            self.add(n, created=3, updated=0.2, labels=["kind"])
+        sent, _ = self.stepped(40, seconds=1, calls_per_pass=4)
+        self.assertEqual(len(sent), 1)
+        (self.world.state / sb.triage_digest.SEEN_FILE).write_text("{not json")
+        self.engine.triage = sb.TriageState()
+        self.engine.triage.units.clear()
+        sent, states = self.stepped(40, seconds=1, calls_per_pass=4)
+        self.assertGreaterEqual(len([s for s in states if s.get("state") == "warming"]), 1)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(len({ref for _, ref in sent[0][1]}), 12)
+
+    def test_the_interval_is_validated_zero_means_every_pass_and_a_legacy_file_does_not_re_warm(self):
+        for bad in (-1, "x", True):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_triage_config({"triage": {"digest_interval_minutes": bad}}, "cfg")
+        sb.validate_triage_config({"triage": {"digest_interval_minutes": 0}}, "cfg")
+        self.add(140, created=3, updated=0.2, labels=["kind"])
+        sent, _ = self.stepped(3, seconds=1, digest_interval_minutes=0)
+        self.assertEqual(len(sent), 1)                                                             # one finding: shown once (its backoff), not per pass
+        self.add(141, created=3, updated=0.2, labels=["kind"])
+        self.engine.triage.units.clear()
+        sent, _ = self.stepped(1, seconds=1, digest_interval_minutes=0)
+        self.assertEqual(len(sent), 1)                                                             # a new finding goes out at once: no hourly cap
+        # a memory file written before the cadence existed: no `swept`, no `last`: it counts as swept and does not warm up again
+        (self.world.state / sb.triage_digest.SEEN_FILE).write_text(json.dumps({"v": 1, "items": {}}))
+        self.assertEqual(sb.triage_digest.load_meta(str(self.world.state)), {"known": True, "swept": True, "last": None})
+
+    def test_a_warm_up_that_cannot_finish_ends_after_its_maximum_and_never_silences_the_digest_for_good(self):
+        meta = {"known": False, "swept": False, "last": None}
+        self.assertEqual(sb.triage_digest.gate(meta, 100, 5, 3600, 100), (False, {"state": "warming", "unchecked": 5}))
+        self.assertEqual(sb.triage_digest.gate(meta, 100 + sb.triage_digest.WARMUP_MAX_SECONDS, 5, 3600, 100), (True, {"state": "ready"}))
+        self.assertTrue(meta["swept"])
+
+    def test_backoff_false_keeps_the_old_per_pass_behaviour_whole(self):
+        self.add(140, created=3, updated=0.2, labels=["kind"])
+        sent, states = self.stepped(1, seconds=1, backoff=False)
+        self.add(141, created=3, updated=0.2, labels=["kind"])
+        self.engine.triage.units.clear()
+        more, states2 = self.stepped(3, seconds=1, backoff=False)
+        self.assertEqual(len(sent) + len(more), 2)                                                 # a digest on each pass that had something new: no hourly cap
+        self.assertEqual(states + states2, [{}, {}, {}, {}])                                       # and no cadence state at all
+
+    def test_s6_status_says_warming_with_the_unchecked_count_and_when_the_next_digest_may_go_out(self):
+        now = self.world.clock.now()
+        base = {"counts": {}, "total": 0, "repos": 1, "at": sb.iso(now)}
+        warming = "\n".join(sb.triage_status_lines(dict(base, digest={"state": "warming", "unchecked": 7})))
+        self.assertIn("warming up", warming)
+        self.assertIn("7 unchecked", warming)
+        held = "\n".join(sb.triage_status_lines(dict(base, digest={"state": "held", "next_at": now + 40 * 60})))
+        self.assertIn("next digest", held)
+        self.assertIn("40m", held)
 
     def test_s5_seen_leave_mutes_until_a_change(self):
         self.add(160, created=3, updated=0.2, labels=["kind"])
@@ -25898,7 +26307,7 @@ class TestDecisionsPluginSource(unittest.TestCase):
         self.assertIn("setInterval(refresh, SAFETY_MS)", text)
 
     def test_it_is_read_only_holds_no_credential_spawns_nothing_and_calls_nothing_over_the_network(self):
-        for name in ("tui.tsx", "decisions.mjs"):
+        for name in ("tui.tsx", "decisions.mjs", "health.mjs"):
             # the one link host the panel may name (https://github.com, a row's issue or PR) and the one mouse
             # handler it may have (onMouseUp on a row: copy its link) are the only exceptions; nothing else changes
             code = self.code(name).lower().replace("https:", "").replace("onmouseup", "")
@@ -25930,7 +26339,7 @@ class TestTrialDecisionsPlugin(Base):
         trial = self.trial()
         self.assertEqual(trial.install_decisions_plugin(), "installed")
         target = Path(trial.lab.opencode_config) / "fleet-decisions"
-        for name in ("tui.tsx", "decisions.mjs"):
+        for name in ("tui.tsx", "decisions.mjs", "health.mjs"):
             self.assertEqual((target / name).read_text(), (REPO / "plugins" / "fleet-decisions-tui" / name).read_text())
         self.assertEqual(self.cli_json(trial), {"plugins": ["./fleet-decisions"]})
 
@@ -26010,7 +26419,7 @@ class TestTrialDecisionsPlugin(Base):
         self.assertRegex(out.getvalue(), r"decisions plugin\s+installed")
 
     def test_the_plugin_files_the_trial_installs_are_the_kits_own(self):
-        self.assertEqual(sorted(sb.DECISIONS_PLUGIN_FILES), ["decisions.mjs", "tui.tsx"])  # PR 16: the shared installer's
+        self.assertEqual(sorted(sb.DECISIONS_PLUGIN_FILES), ["decisions.mjs", "health.mjs", "tui.tsx"])  # PR 16: the shared installer's
         for name in sb.DECISIONS_PLUGIN_FILES:
             self.assertTrue((REPO / "plugins" / "fleet-decisions-tui" / name).is_file())
 
@@ -30951,8 +31360,15 @@ class OrdersDeliveryCase(OrdersCase):
     def order_messages(self, name):
         return [a for a in self.world.admissions(name) if any(k.startswith("orders:") for k in a["keys"])]
 
+    LOAD_READS = ("/sub_issues", "/labels?", "&labels=")   # the load figure's own reads (#348): the asks of a charter, and the labels and labelled issues that find a charter
+
+    def load_gets(self):
+        return len([c for c in self.gh.calls if "--method" not in c and any(m in str(part) for part in c for m in self.LOAD_READS)])
+
     def gh_gets(self):
-        return len([c for c in self.gh.calls if "--method" not in c])
+        # Deliberate (#348): the load line runs every pass, alert on or off, and reads through the same reader: two reads per repository an hour to find charters
+        # (labels, then labelled issues) and the asks of each charter. They are counted by load_gets; the orders and Intent code's own reads are counted here.
+        return len([c for c in self.gh.calls if "--method" not in c and not any(m in str(part) for part in c for m in self.LOAD_READS)])
 
 
 class TestCompactionShape(unittest.TestCase):
@@ -31133,10 +31549,12 @@ class TestOrdersDelivery(OrdersDeliveryCase):
     def test_the_charter_is_read_once_per_cache_lifetime_not_once_per_pass(self):
         self.run_pass()
         first = self.gh_gets()
+        loads = self.load_gets()
         for _ in range(6):
             self.world.tick(10)
             self.run_pass()
         self.assertEqual(self.gh_gets(), first)
+        self.assertEqual(self.load_gets(), loads)   # the load line's reads are cached an hour too
 
     def test_it_reuses_the_judges_warmed_read_of_the_charter(self):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": FAKE_REPO,
@@ -42092,6 +42510,344 @@ class TestTempJanitor(Base):
             self.assertIn(phrase, text)
 
 
+class TestHeavySlots(Base):
+    """`fleet-switchboard heavy` (ask #34): a flock slot semaphore in the state directory; the COMMAND holds the lock; the queue, the kill, the exit status, taskpolicy
+    or nice, the holder list, the wait limit and the no-shell guarantee are each run for real with small commands."""
+
+    def setUp(self):
+        super().setUp()
+        self.hs = sb.load_heavy_slots()
+        self.dir = self.home / "slots"
+        self.dir.mkdir()
+        self.procs = []
+        self.addCleanup(self.cleanup)
+
+    def cleanup(self):
+        for proc in self.procs:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+            try:
+                proc.wait(timeout=90)
+            except Exception:
+                pass
+
+    def env(self, **more):
+        env = dict(os.environ, XDG_STATE_HOME=str(self.dir), FLEET_HEAVY_REPORT_SECONDS="0.3", PATH=os.environ["PATH"])
+        for key in ("FLEET_HEAVY_SLOT", "FLEET_HEAVY", "CI"):   # the suite may itself run in a slot, under FLEET_HEAVY=off, or in CI: these tests are about the slots
+            env.pop(key, None)
+        env.update(more)
+        return env
+
+    def state(self):
+        path = self.dir / "fleet-switchboard"
+        path.mkdir(mode=0o700, exist_ok=True)
+        return path
+
+    def start(self, *words, slots=3, wait_max=None, name="t", env=None, new_session=True, **popen):
+        argv = [sys.executable, str(SWITCHBOARD), "heavy", "--slots", str(slots), "--name", name]
+        if wait_max is not None:
+            argv += ["--wait-max", str(wait_max)]
+        proc = subprocess.Popen(argv + ["--"] + list(words), env=env or self.env(), start_new_session=new_session, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                stdin=popen.pop("stdin", subprocess.DEVNULL), text=True, **popen)
+        self.procs.append(proc)
+        return proc
+
+    def waiter(self, tag):
+        """A command that says it started and runs until its release file exists."""
+        script = 'touch "%s/started.%s"; while [ ! -e "%s/release.%s" ]; do sleep 0.05; done' % (self.home, tag, self.home, tag)
+        return ["sh", "-c", script]
+
+    def until(self, test, seconds=90):
+        end = time.time() + seconds
+        while time.time() < end:
+            if test():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def started(self):
+        return sorted(p.name for p in self.home.glob("started.*"))
+
+    def test_s1_four_callers_of_three_slots_queue_and_the_fourth_runs_when_one_frees(self):
+        procs = {tag: self.start(*self.waiter(tag), name="who-%s" % tag) for tag in "abcd"[:3]}
+        self.assertTrue(self.until(lambda: len(self.started()) == 3))
+        fourth = self.start(*self.waiter("d"), name="who-d")
+        err = ""
+        end = time.time() + 90
+        while "waiting for a slot" not in err and time.time() < end:   # the wrapper says so once it is queued (its start-up time varies with the machine)
+            if select.select([fourth.stderr], [], [], 0.2)[0]:
+                err += os.read(fourth.stderr.fileno(), 4096).decode()
+        self.assertIn("waiting for a slot", err, "the fourth wrapper (exit %r) said nothing; started: %s" % (fourth.poll(), self.started()))
+        self.assertEqual(len(self.started()), 3, "at most 3 run at once")
+        (self.home / "release.a").write_text("")
+        self.assertTrue(self.until(lambda: "started.d" in self.started()), "the fourth runs once a slot is free")
+        for tag in "bcd":
+            (self.home / ("release." + tag)).write_text("")
+        for proc in list(procs.values()) + [fourth]:
+            proc.wait(timeout=90)
+        err += fourth.stderr.read()
+        self.assertIn("heavy: waiting for a slot (3 of 3 busy", err)
+        self.assertRegex(err, r"who-[abc] sh")
+
+    def test_s2_a_holder_killed_with_its_whole_group_frees_its_slot_by_itself(self):
+        holder = self.start(*self.waiter("h"), slots=1, name="doomed")
+        self.assertTrue(self.until(lambda: "started.h" in self.started()))
+        self.assertEqual([h["name"] for h in self.hs.holders(self.state(), 1)], ["doomed"])
+        os.killpg(holder.pid, signal.SIGKILL)
+        holder.wait(timeout=90)
+        waiter = self.start("sh", "-c", 'touch "%s/second"' % self.home, slots=1)
+        self.assertEqual(waiter.wait(timeout=90), 0)
+        self.assertTrue((self.home / "second").exists(), "no cleanup was needed")
+        self.assertEqual(self.hs.holders(self.state(), 1), [])
+
+    def test_s3_stdin_stdout_and_the_exit_status_pass_through_and_a_signal_reaches_the_command(self):
+        proc = self.start("sh", "-c", "cat; exit 3", stdin=subprocess.PIPE)
+        out, err = proc.communicate("some data\n", timeout=90)
+        self.assertEqual((out, proc.returncode), ("some data\n", 3))
+        pidfile = self.home / "pid"
+        proc = self.start("sh", "-c", 'echo $$ > "%s"; exec sleep 60' % pidfile)
+        self.assertTrue(self.until(pidfile.exists))
+        child = int(pidfile.read_text())
+        self.assertTrue(self.until(lambda: any(h["pid"] == child for h in self.hs.holders(self.state(), 3))), "the wrapper has recorded its command")
+        proc.send_signal(signal.SIGTERM)   # to the wrapper alone: it forwards it
+        self.assertEqual(proc.wait(timeout=90), 128 + signal.SIGTERM)
+        self.assertTrue(self.until(lambda: not self.alive(child)), "the command was stopped and reaped: nothing is left behind")
+
+    @staticmethod
+    def alive(pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        try:
+            done, _ = os.waitpid(pid, os.WNOHANG)   # a zombie of ours would still answer kill(0)
+            return done == 0
+        except ChildProcessError:
+            return True
+
+    def test_s3_the_wrapper_reaps_its_child_and_leaves_no_zombie(self):
+        """In this very process (so the wrapper IS the parent): when `run` returns, its child has already been waited for, not left a zombie."""
+        pidfile = self.home / "short-pid"
+        err = io.StringIO()
+        status = self.hs.run(["sh", "-c", 'echo $$ > "%s"' % pidfile], self.state(), 1, 10, name="inproc", environ=self.env(), out=err)
+        self.assertEqual(status, 0, err.getvalue())
+        pid = int(pidfile.read_text())
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(pid, os.WNOHANG)   # nothing of ours is left to reap: a zombie would answer here
+
+    @staticmethod
+    def state_of(pid):
+        out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+        return out or None
+
+    def test_s4_the_command_runs_under_taskpolicy_when_it_exists_and_nice_when_it_does_not(self):
+        fake = self.home / "fakebin"
+        fake.mkdir()
+        record = self.home / "record"
+        (fake / "taskpolicy").write_text('#!/bin/sh\necho "$1" > "%s"\nshift\nexec "$@"\n' % record)
+        os.chmod(str(fake / "taskpolicy"), 0o755)
+        env = self.env(PATH="%s:%s" % (fake, os.environ["PATH"]))
+        self.assertEqual(self.start("true", env=env).wait(timeout=90), 0)
+        self.assertEqual(record.read_text().strip(), "-b", "run as taskpolicy -b <command>")
+        self.assertEqual(self.hs.command_prefix(lambda n: "/x/taskpolicy" if n == "taskpolicy" else "/x/nice"), ["/x/taskpolicy", "-b"])
+        self.assertEqual(self.hs.command_prefix(lambda n: "/x/nice" if n == "nice" else None), ["/x/nice", "-n", "10"])
+        self.assertEqual(self.hs.command_prefix(lambda n: None), [])
+        # and with no taskpolicy the real nice runs it at a lower priority
+        stub = self.home / "nobin"
+        stub.mkdir()
+        for tool in ("nice", "sh", "ps"):
+            found = shutil.which(tool)
+            if found:
+                os.symlink(found, str(stub / tool))
+        out = self.home / "niceness"
+        proc = self.start("sh", "-c", 'ps -o nice= -p $$ > "%s"' % out, env=self.env(PATH=str(stub)))
+        self.assertEqual(proc.wait(timeout=90), 0, proc.stderr.read())
+        self.assertEqual(int(out.read_text().strip()), min(20, os.nice(0) + 10), "ten above this process's own niceness")
+
+    def test_s5_the_holder_list_names_who_holds_a_slot_and_a_free_slot_says_nothing(self):
+        proc = self.start("sleep", "5", slots=2, name="the-coder")
+        self.assertTrue(self.until(lambda: len(self.hs.holders(self.state(), 2)) == 1))
+        (entry,) = self.hs.holders(self.state(), 2)
+        self.assertEqual((entry["name"], entry["command"]), ("the-coder", "sleep"))
+        self.assertIsInstance(entry["pid"], int)
+        self.assertLessEqual(abs(entry["since"] - time.time()), 30)
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=90)
+        self.assertTrue(self.until(lambda: self.hs.holders(self.state(), 2) == []))
+        mode = os.stat(str(self.state() / "heavy-slot-0.lock")).st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+
+    def test_s6_past_the_wait_limit_it_exits_75_and_does_not_run_the_command(self):
+        holder = self.start("sleep", "30", slots=1, name="busy-one")
+        self.assertTrue(self.until(lambda: len(self.hs.holders(self.state(), 1)) == 1))
+        marker = self.home / "marker"
+        late = self.start("touch", str(marker), slots=1, wait_max=1)
+        self.assertEqual(late.wait(timeout=90), 75)
+        self.assertIn("heavy: no slot after", late.stderr.read())
+        self.assertFalse(marker.exists())
+
+    def test_s7_the_suite_takes_a_slot_unless_it_is_off_inside_one_or_in_ci(self):
+        self.assertEqual(self.hs.should_take_slot({}), "taken")
+        self.assertEqual(self.hs.should_take_slot({"FLEET_HEAVY": "off"}), "off")
+        self.assertEqual(self.hs.should_take_slot({"CI": "true"}), "off")
+        self.assertEqual(self.hs.should_take_slot({"FLEET_HEAVY_SLOT": "1"}), "inside")
+        env = {"XDG_STATE_HOME": str(self.dir)}
+        wrapped = self.hs.wrap_argv(["TestX"], env, "/py", "/sw", "/dir/test-switchboard")
+        self.assertEqual(wrapped, ["/py", "/sw", "heavy", "--name", "test-switchboard", "--", "/py", "/dir/test-switchboard", "TestX"])
+        self.assertIsNone(self.hs.wrap_argv([], dict(env, FLEET_HEAVY="off"), "/py", "/sw", "/s"))
+        self.assertIsNone(self.hs.wrap_argv([], dict(env, FLEET_HEAVY_SLOT="0"), "/py", "/sw", "/s"))
+
+    def test_s7_a_state_directory_that_cannot_be_written_runs_the_suite_unslotted_with_one_line(self):
+        blocked = self.home / "blocked"
+        blocked.write_text("a file, so no directory can be made under it")
+        err = io.StringIO()
+        self.assertIsNone(self.hs.wrap_argv([], {"XDG_STATE_HOME": str(blocked)}, "/py", "/sw", "/s", err=err))
+        self.assertEqual(err.getvalue().count("\n"), 1)
+        self.assertIn("running without a slot", err.getvalue())
+
+    def test_u1_a_wrapper_killed_alone_leaves_the_slot_busy_exactly_while_its_command_runs(self):
+        pidfile = self.home / "orphan-pid"
+        wrapper = self.start("sh", "-c", 'echo $$ > "%s"; while [ ! -e "%s/orphan-release" ]; do sleep 0.05; done' % (pidfile, self.home), slots=1)
+        self.assertTrue(self.until(pidfile.exists))
+        self.assertTrue(self.until(lambda: any(h["pid"] == int(pidfile.read_text()) for h in self.hs.holders(self.state(), 1))))
+        os.kill(wrapper.pid, signal.SIGKILL)   # the wrapper only: the command goes on
+        wrapper.wait(timeout=90)
+        self.assertEqual(len(self.hs.holders(self.state(), 1)), 1, "busy while the command runs")
+        (self.home / "orphan-release").write_text("")
+        self.assertTrue(self.until(lambda: self.hs.holders(self.state(), 1) == [], 90), "free once it ends")
+
+    def test_u2_the_command_is_not_run_through_a_shell_and_keeps_its_environment_and_directory(self):
+        work = self.home / "cwd"
+        work.mkdir()
+        proc = self.start(sys.executable, "-c", "import sys, os; print(sys.argv[1:], os.environ['X_MARK'], os.getcwd())", "a b;c", "$HOME",
+                          env=self.env(X_MARK="kept"), cwd=str(work))
+        out, err = proc.communicate(timeout=90)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertEqual(out.strip(), "['a b;c', '$HOME'] kept %s" % os.path.realpath(str(work)))
+
+    def test_a_signal_while_waiting_a_zero_wait_limit_and_a_command_that_cannot_start(self):
+        holder = self.start("sleep", "30", slots=1)
+        self.assertTrue(self.until(lambda: len(self.hs.holders(self.state(), 1)) == 1))
+        waiting = self.start("true", slots=1)
+        seen = ""
+        end = time.time() + 90
+        while "waiting for a slot" not in seen and time.time() < end:   # the wrapper says so once it is queued
+            if select.select([waiting.stderr], [], [], 0.2)[0]:
+                seen += os.read(waiting.stderr.fileno(), 4096).decode()
+        self.assertIn("waiting for a slot", seen)
+        waiting.send_signal(signal.SIGTERM)
+        self.assertEqual(waiting.wait(timeout=90), 128 + signal.SIGTERM, "a wrapper that is still waiting just ends")
+        zero = self.start("true", slots=1, wait_max=0)
+        self.assertEqual(zero.wait(timeout=90), 75)
+        not_executable = self.home / "notexec"
+        not_executable.write_text("#!/bin/sh\n")   # present, not executable
+        self.assertEqual(self.start(str(not_executable), slots=2).wait(timeout=90), 127)
+
+    def test_what_is_shown_about_a_holder_never_carries_a_terminal_escape(self):
+        state = self.state()
+        (state / "heavy-slot-0.lock").write_text(json.dumps({"name": "\x1b[2Jevil\x9b31m", "command": "a\nb", "pid": 1, "since": 1}))
+        fd = os.open(str(state / "heavy-slot-0.lock"), os.O_RDWR)
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            (entry,) = self.hs.holders(state, 1)
+        finally:
+            os.close(fd)
+        shown = entry["name"] + entry["command"]
+        self.assertEqual([c for c in shown if ord(c) < 32 or 0x7f <= ord(c) <= 0x9f], [])
+        self.assertIn("evil", shown)
+        self.assertEqual(self.hs.holder_name({"FLEET_HEAVY_NAME": "x\x1b[0my"}), "x [0my")
+
+    def test_a_bad_report_interval_falls_back_to_the_default(self):
+        out = self.start("true", env=self.env(FLEET_HEAVY_REPORT_SECONDS="soon"))
+        self.assertEqual(out.wait(timeout=90), 0)
+
+    def test_a_missing_or_unwritable_state_directory_runs_the_command_without_a_slot_with_one_line(self):
+        marker = self.home / "ran"
+        blocked = self.home / "blocked"
+        blocked.write_text("a file: no directory can be made under it")
+        proc = self.start("sh", "-c", 'touch "%s"' % marker, env=self.env(XDG_STATE_HOME=str(blocked)))
+        out, err = proc.communicate(timeout=90)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertTrue(marker.exists(), "the command ran")
+        self.assertEqual(err.count("heavy: no slot ("), 1, err)
+        self.assertNotIn("Traceback", err)
+        marker.unlink()
+        readonly = self.home / "readonly"
+        readonly.mkdir()
+        os.chmod(str(readonly), 0o500)
+        self.addCleanup(os.chmod, str(readonly), 0o700)
+        proc = self.start("sh", "-c", 'touch "%s"' % marker, env=self.env(XDG_STATE_HOME=str(readonly)))
+        out, err = proc.communicate(timeout=90)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertTrue(marker.exists())
+        self.assertNotIn("Traceback", err)
+        # and in process: a directory that does not exist at all
+        errors = io.StringIO()
+        self.assertEqual(self.hs.run(["true"], str(self.home / "no" / "such" / "dir"), 1, 5, environ=self.env(), out=errors), 0)
+        self.assertEqual(errors.getvalue().count("heavy: no slot ("), 1)
+
+    def test_nested_heavy_inside_a_slot_takes_no_second_slot_so_four_levels_of_three_slots_finish(self):
+        inner = ['"%s"' % sys.executable, '"%s"' % SWITCHBOARD, "heavy", "--slots", "3", "--wait-max", "20", "--"]
+        script = "echo level-4"
+        for level in (3, 2, 1):
+            script = " ".join(inner) + " sh -c '%s'" % script.replace("'", "'\\''")
+        proc = self.start("sh", "-c", script, slots=3, wait_max=20)
+        out, err = proc.communicate(timeout=90)
+        self.assertEqual((proc.returncode, out.strip()), (0, "level-4"), err)
+        self.assertEqual(err.count("already inside a slot"), 3)
+        self.assertNotIn("no slot after", err)
+
+    def test_heavy_off_runs_the_command_directly_with_no_slot_and_no_line(self):
+        out = self.home / "off-out"
+        proc = self.start("sh", "-c", 'echo "$FLEET_HEAVY_SLOT" > "%s"' % out, env=self.env(FLEET_HEAVY="off"))
+        stdout, err = proc.communicate(timeout=90)
+        self.assertEqual((proc.returncode, err), (0, ""))
+        self.assertEqual(out.read_text().strip(), "", "no slot variable: it ran as it is")
+        self.assertFalse(list(self.state().glob("heavy-slot-*.lock")), "no slot file was even made")
+
+    def test_the_cpu_line_shows_the_slots_in_use_through_the_real_heavy_module(self):
+        cg = sb.load_cpu_guard()
+        self.assertEqual(cg.slots_text({}, self.state()), "heavy slots 0/3")
+        holder = self.start("sleep", "30", name="the-coder")
+        self.assertTrue(self.until(lambda: len(self.hs.holders(self.state(), 3)) == 1))
+        line = cg.slots_text({}, self.state())
+        self.assertRegex(line, r"^heavy slots 1/3 \(the-coder sleep \d+[ms]\)$")
+        self.assertEqual(cg.slots_text({"heavy": {"slots": 5}}, self.state())[:15], "heavy slots 1/5")
+        os.killpg(holder.pid, signal.SIGKILL)
+        holder.wait(timeout=90)
+        self.assertTrue(self.until(lambda: cg.slots_text({}, self.state()) == "heavy slots 0/3"), "a killed holder is not shown")
+
+    def test_a_missing_command_and_misuse_are_said_plainly(self):
+        self.assertEqual(self.start("no-such-command-here").wait(timeout=90), 127)
+        for words in ([], ["--slots", "0", "--", "true"], ["--slots", "x", "--", "true"], ["--wait-max", "-1", "--", "true"]):
+            proc = subprocess.Popen([sys.executable, str(SWITCHBOARD), "heavy"] + words, env=self.env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            proc.communicate(timeout=90)
+            self.assertEqual(proc.returncode, sb.EXIT_USAGE, words)
+
+    def test_the_config_key_is_validated(self):
+        for ok in (None, {}, {"slots": 1}, {"slots": 8}):
+            self.hs.settings(ok)
+        for bad in (3, {"slots": 0}, {"slots": "3"}, {"slots": True}, {"slots": 100}, {"cores": 2}):
+            with self.assertRaises(self.hs.HeavyError):
+                self.hs.settings(bad)
+        self.assertEqual(self.hs.settings(None), 3)
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "heavy": {"slots": 0}})
+
+    def test_the_documents_name_the_command_and_the_agent_definitions_say_it_once(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        self.assertIn("fleet-switchboard heavy", text)
+        line = "full suites and browser/e2e runs go through `fleet-switchboard heavy -- <cmd>`"
+        for path in ("agents/opencode/coder.md", "agents/opencode/orchestrator.md", "skills/fleet-coordination/SKILL.md"):
+            found = (REPO / path).read_text()
+            self.assertEqual(found.lower().count(line), 1, path)
+
+
 class TestDockerReaper(Base):
     """The docker reaper (ask #321): only EXPIRED objects carrying both labels, dry run by default, one audit line per removal, no sudo."""
 
@@ -42351,6 +43107,315 @@ class TestComposeTrap(Base):
 
     def test_the_helper_never_uses_sudo(self):
         self.assertNotIn("sudo", (REPO / "tools" / "fleet-compose-trap.sh").read_text().replace("Never uses sudo.", ""))
+
+
+class TestCpuGuard(Base):
+    """The CPU guard (P0 CPU item D): one os.getloadavg per pass, a status line, one wake per episode, no process in a normal pass."""
+
+    PS = "  60.0 /usr/local/bin/node\n  25.5 /Applications/Docker.app/Contents/MacOS/com.docker.backend\n  12.0 /usr/bin/python3\n  2.0 /bin/zsh\n  garbage\n"
+
+    def setUp(self):
+        super().setUp()
+        self.load = [86.0]    # the five-minute average (what the alarm reads)
+        self.load1 = [None]   # the one-minute average; None = the same
+        self.cores = 14
+        self.loads_read = []
+        self.world = World(self, agents=("coder",), config={})
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.engine = self.world.engine
+        self.engine.discover(self.world.clock.now())
+        self.cg = sb.load_cpu_guard()
+        self.ps_calls = []
+
+        def getloadavg():
+            self.loads_read.append(self.load[0])
+            return (self.load1[0] if self.load1[0] is not None else self.load[0], self.load[0], self.load[0])
+        patcher = mock.patch.object(os, "getloadavg", getloadavg)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher2 = mock.patch.object(os, "cpu_count", lambda: self.cores)
+        patcher2.start()
+        self.addCleanup(patcher2.stop)
+
+        def ps(argv, **kwargs):
+            self.ps_calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, self.PS, "")
+        self.engine.cpu_ps_runner = ps
+
+    def settle(self, engine=None):
+        """Wait for the ps thread of the engine's CPU source (it runs off the pass)."""
+        for source in (engine or self.engine).sources:
+            if isinstance(source, sb.CpuFacts) and source.thread is not None:
+                source.thread.join(10)
+
+    def facts(self, engine=None):
+        engine = engine or self.engine
+        found, problems = engine.collect_facts()
+        self.assertEqual(problems, [])
+        return [f for f in found if f.kind == "cpu"]
+
+    def audits(self, name):
+        return [e for e in self.world.audit() if e["event"] == name]
+
+    def run_for(self, minutes, step=30, engine=None):
+        """Passes every `step` seconds for `minutes`; returns the facts of the last pass."""
+        last = []
+        for _ in range(int(minutes * 60 / step)):
+            self.world.tick(step)
+            last = self.facts(engine)
+        return last
+
+    def test_s1_the_status_line_reads_load_cores_and_ratio_marks_high_only_above_the_guard_and_starts_no_process(self):
+        cfg = self.cg.settings(None)
+        self.load1[0] = None
+        with mock.patch.object(subprocess, "run", side_effect=AssertionError("a process was started")), \
+                mock.patch.object(subprocess, "Popen", side_effect=AssertionError("a process was started")):
+            self.assertEqual(self.cg.status_line(cfg, self.cg.reading()), "load 86 on 14 cores (6.1x) [HIGH]")
+            self.load[0] = 4.0
+            self.assertEqual(self.cg.status_line(cfg, self.cg.reading()), "load 4 on 14 cores (0.3x)")
+            self.load[0] = 42.0
+            self.assertEqual(self.cg.status_line(cfg, self.cg.reading()), "load 42 on 14 cores (3.0x)", "exactly at the guard is not above it")
+            self.world.tick(60)
+            self.facts()   # a daemon pass with a normal load
+        self.assertEqual(self.ps_calls, [])
+
+    def test_s1_status_shows_the_cpu_line(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.assertIn("cpu        load 86 on 14 cores (6.1x) [HIGH]", sb.format_status(sb.collect_status(self.world.route, self.world.clock.now)))
+
+    def test_s2_one_wake_per_episode_after_the_minutes_and_one_bounded_ps(self):
+        self.assertEqual(self.run_for(4), [], "4 minutes above the guard: not yet")
+        self.assertEqual(self.ps_calls, [])
+        keys = set()
+        for _ in range(40):
+            for fact in self.run_for(0.5):
+                keys.add(fact.key)
+        self.assertEqual(len(keys), 1, "the same key on every later pass")
+        self.settle()
+        (fact,) = self.facts()
+        self.assertIn("cpu high: load 86 on 14 cores (6.1x over five minutes", fact.summary)
+        self.assertIn("top: node 60%", fact.summary)
+        self.assertEqual(len(self.audits("cpu.high")), 1)
+        self.assertEqual(self.ps_calls, [self.cg.PS_ARGV], "exactly one ps in the whole episode")
+        self.assertNotIn("/Applications", fact.summary, "only base names")
+
+    def test_s3_the_episode_ends_below_two_thirds_of_the_guard_and_a_second_rise_is_a_second_episode(self):
+        self.run_for(6)
+        self.settle()
+        (first,) = self.facts()
+        self.load[0] = 35.0   # 2.5x: between the re-arm ratio and the guard
+        self.assertEqual([f.key for f in self.run_for(1)], [first.key])
+        self.assertEqual(self.audits("cpu.recovered"), [])
+        self.load[0] = 20.0   # 1.4x
+        self.assertEqual(self.run_for(1), [])
+        self.assertEqual(len(self.audits("cpu.recovered")), 1)
+        self.load[0] = 90.0
+        self.run_for(6)
+        self.settle()
+        (second,) = self.facts()
+        self.assertNotEqual(second.key, first.key)
+        self.assertEqual(len(self.audits("cpu.high")), 2)
+        self.assertEqual(len(self.ps_calls), 2, "one ps per episode")
+
+    def test_a_dip_below_the_guard_before_the_minutes_resets_the_clock(self):
+        self.run_for(4)
+        self.load[0] = 10.0
+        self.run_for(1)
+        self.load[0] = 86.0
+        self.assertEqual(self.run_for(4), [])
+        self.assertEqual(self.audits("cpu.high"), [])
+
+    def test_s4_a_restart_does_not_begin_a_second_episode(self):
+        self.run_for(6)
+        self.settle()
+        (first,) = self.facts()
+        restarted = self.world.new_engine("daemon")
+        restarted.discover(self.world.clock.now())
+        restarted.cpu_ps_runner = self.engine.cpu_ps_runner
+        facts = self.run_for(2, engine=restarted)
+        self.assertEqual([f.key for f in facts], [first.key])
+        self.assertEqual(len(self.audits("cpu.high")), 1)
+        self.assertEqual(len(self.ps_calls), 1)
+
+    def test_s5_false_turns_everything_off_and_the_load_is_not_read(self):
+        self.engine.config["cpu_guard"] = False
+        self.assertEqual(self.run_for(10), [])
+        self.assertEqual(self.loads_read, [])
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "cpu_guard": False})
+        self.assertNotIn("cpu        ", sb.format_status(sb.collect_status(self.world.route, self.world.clock.now)))
+        self.assertEqual(self.loads_read, [])
+
+    def test_s6_the_line_adds_the_heavy_slots_only_from_a_working_heavy_slots_module(self):
+        cfg = self.cg.settings(None)
+        read = self.cg.reading()
+        plain = "load 86 on 14 cores (6.1x) [HIGH]"
+        module = self.home / "heavy_slots.py"
+        with mock.patch.object(self.cg, "HEAVY_SLOTS_PATH", str(self.home / "absent.py")):
+            self.assertIsNone(self.cg.slots_text({}, self.world.state), "no heavy module yet: no slots text")
+        good = ("def settings(raw):\n    return (raw or {}).get('slots', 3)\n"
+                "def holders(state_dir, maximum):\n    return [{'slot': 1, 'name': 'coder-live', 'pid': 7, 'command': 'make test', 'since': 1000.0}, "
+                "{'slot': 2, 'name': 'coder\\x1b[2J', 'pid': 8, 'command': 'npm', 'since': 'soon'}]\n")
+        for label, body, want in (("a good module", good, "heavy slots 2/3 (coder-live make test 6m, coder??2J npm)"),
+                                  ("no holders", "def settings(raw):\n    return 3\ndef holders(state_dir, maximum):\n    return []\n", "heavy slots 0/3"),
+                                  ("a raising module", "def settings(raw):\n    raise RuntimeError('x')\ndef holders(state_dir, maximum):\n    return []\n", None),
+                                  ("bad types", "def settings(raw):\n    return 'three'\ndef holders(state_dir, maximum):\n    return []\n", None),
+                                  ("a module that does not parse", "def settings(:\n", None)):
+            with self.subTest(label):
+                module.write_text(body)
+                with mock.patch.object(self.cg, "HEAVY_SLOTS_PATH", str(module)):
+                    text = self.cg.slots_text({}, self.world.state, now=1000.0 + 360)
+                self.assertEqual(text, want)
+                self.assertEqual(self.cg.status_line(cfg, read, text), plain + ("; " + want if want else ""))
+        module.write_text(good)
+        with mock.patch.object(self.cg, "HEAVY_SLOTS_PATH", str(module)):
+            self.assertIn("heavy slots 2/5", self.cg.slots_text({"heavy": {"slots": 5}}, self.world.state, now=1500.0), "the module's own settings read the config's heavy section")
+
+    def test_a_one_minute_spike_never_wakes_anyone_only_the_five_minute_average_does(self):
+        self.load[0] = 10.0        # the five-minute average is fine
+        self.load1[0] = 200.0      # the one-minute average is a spike
+        self.assertEqual(self.run_for(20), [])
+        self.assertEqual(self.audits("cpu.high"), [])
+        self.assertIn("[HIGH]", self.cg.status_line(self.cg.settings(None), self.cg.reading()), "the displayed one-minute load still shows it")
+
+    def test_the_ps_runs_off_the_pass_so_a_hung_ps_never_delays_it(self):
+        release, entered = threading.Event(), threading.Event()
+
+        def hung(argv, **kwargs):
+            entered.set()
+            release.wait(30)
+            return subprocess.CompletedProcess(argv, 0, self.PS, "")
+        self.engine.cpu_ps_runner = hung
+        self.run_for(6)   # the passes return while the ps is still blocked: if a pass waited for it, this would not come back until `release` (30 s)
+        self.assertTrue(entered.wait(10))
+        self.assertFalse(release.is_set())
+        (fact,) = self.facts()
+        self.assertNotIn("top:", fact.summary, "the categories are not there yet")
+        release.set()
+        self.settle()
+        (fact,) = self.facts()
+        self.assertIn("top: node 60%", fact.summary)
+
+    def test_a_slow_ps_of_an_earlier_episode_never_overwrites_a_later_ones_text(self):
+        self.run_for(6)
+        self.settle()
+        stale = threading.Event()
+        gate = threading.Event()
+
+        def slow(argv, **kwargs):
+            gate.wait(30)
+            return subprocess.CompletedProcess(argv, 0, "  99.0 /usr/bin/stale\n", "")
+        self.engine.cpu_ps_runner = slow
+        self.load[0] = 20.0
+        self.run_for(1)   # the first episode ends
+        self.load[0] = 90.0
+        self.run_for(6)   # a second begins; its ps is blocked
+        self.engine.cpu_ps_runner = self.engine.cpu_ps_runner
+        source = [s for s in self.engine.sources if isinstance(s, sb.CpuFacts)][0]
+        old_thread = source.thread
+        source.thread = None   # the engine's view of the episode moves on
+        gate.set()
+        old_thread.join(10)
+        self.assertEqual(source.detail, "", "a thread that is no longer the current one wrote nothing")
+
+    def test_no_chief_of_staff_means_no_episode_until_one_is_running(self):
+        self.engine.discovery.agents.pop("cos", None)
+        self.assertEqual(self.run_for(7), [])
+        self.assertEqual(self.audits("cpu.high"), [])
+        self.world.add_agent("cos2", fleet={"role": "chief-of-staff"})
+        self.engine.discover(self.world.clock.now())
+        facts = self.run_for(6)
+        self.assertEqual(len({fact.key for fact in facts}), 1, "the episode begins once a Chief of Staff exists, with one key")
+        self.assertTrue(facts)
+        self.assertEqual(len(self.audits("cpu.high")), 1)
+
+    def test_the_episode_file_is_atomic_0600_bounded_and_a_failed_save_is_said_and_tried_again(self):
+        self.run_for(6)
+        path = self.world.state / self.cg.STATE_FILE
+        self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
+        self.assertEqual(list(self.world.state.glob(self.cg.STATE_FILE + ".*.tmp")), [])
+        for bad in ("not json", "[]", "x" * 10000, json.dumps({"episode": "soon"})):
+            path.write_text(bad)
+            self.assertIsNone(self.cg.load_episode(self.world.state), bad[:12])
+        self.load[0] = 20.0
+        with mock.patch.object(self.cg.os, "replace", side_effect=OSError("disk full")):
+            self.run_for(1)   # the episode ends but the file cannot be written
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "cpu.guard_file"]), 1)
+        self.assertEqual(list(self.world.state.glob(self.cg.STATE_FILE + ".*.tmp")), [])
+        self.run_for(1)   # the next pass tries again, and now it works
+        self.assertEqual(self.cg.load_episode(self.world.state), None)
+
+    def test_a_ps_that_fails_or_a_runaway_holders_list_changes_nothing_but_the_text(self):
+        self.engine.cpu_ps_runner = lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "no")
+        self.run_for(6)
+        self.settle()
+        (fact,) = self.facts()
+        self.assertNotIn("top:", fact.summary)
+        module = self.home / "heavy_slots.py"
+        module.write_text("def settings(raw):\n    return 1000\ndef holders(state_dir, maximum):\n    return range(10 ** 9)\n")
+        with mock.patch.object(self.cg, "HEAVY_SLOTS_PATH", str(module)):
+            self.assertEqual(self.cg.slots_text({}, self.world.state), "heavy slots 1001/1000", "the count is cut at one past the cap, never walked")
+        module.write_text("import sys\nsys.exit(3)\n")
+        with mock.patch.object(self.cg, "HEAVY_SLOTS_PATH", str(module)):
+            self.assertIsNone(self.cg.slots_text({}, self.world.state), "a module that exits takes nobody down")
+
+    def test_bad_inputs_are_said_and_never_guessed_a_missing_core_count_is_not_one_core(self):
+        cfg = self.cg.settings(None)
+        for label, cores, want in (("no core count", None, "load 20, cores unknown"), ("zero cores", 0, "load 20, cores unknown"), ("negative cores", -3, "load 20, cores unknown"),
+                                   ("a core count that is not a number", "many", "load 20, cores unknown")):
+            with self.subTest(label):
+                self.cores, self.load[0] = cores, 20.0
+                self.assertEqual(self.cg.status_line(cfg, self.cg.reading()), want, "no ratio and no marker: never one core")
+                self.assertEqual(self.run_for(10), [], "a normal load on an unknown core count wakes nobody")
+                self.assertEqual(self.audits("cpu.high"), [])
+        self.cores = 14
+        for label, value, reason in (("nan", float("nan"), "not a finite number"), ("inf", float("inf"), "not a finite number"), ("negative", -1.0, "not a finite number")):
+            with self.subTest(label):
+                self.load[0] = value
+                line = self.cg.status_line(cfg, self.cg.reading())
+                self.assertEqual(line, "unreadable: the load average is not a finite number of at least 0")
+                self.assertEqual(self.run_for(10), [], "a bad load wakes nobody and raises nothing")
+        self.load[0] = 86.0
+        with mock.patch.object(os, "getloadavg", side_effect=OSError("no load average")):
+            self.assertEqual(self.cg.status_line(cfg, self.cg.reading()), "unreadable: OSError: no load average")
+        with mock.patch.object(os, "getloadavg", return_value=()):
+            self.assertEqual(self.cg.status_line(cfg, self.cg.reading()), "unreadable: IndexError: tuple index out of range")
+        self.assertEqual(self.cg.status_line(cfg, self.cg.reading()), "load 86 on 14 cores (6.1x) [HIGH]", "and a good reading is as before")
+
+    def test_status_says_when_the_load_or_the_cores_are_unknown_instead_of_leaving_the_line_out(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.load[0] = float("nan")
+        self.assertIn("cpu        unreadable: the load average is not a finite number", sb.format_status(sb.collect_status(self.world.route, self.world.clock.now)))
+        self.load[0], self.cores = 20.0, None
+        self.assertIn("cpu        load 20, cores unknown", sb.format_status(sb.collect_status(self.world.route, self.world.clock.now)))
+
+    def test_s7_the_config_key_is_validated(self):
+        for ok in (None, False, {}, {"high_ratio": 4.5, "minutes": 10}, {"minutes": 1}):
+            sb.validate_config(dict({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}, cpu_guard=ok), "t")
+        self.assertEqual({k: v for k, v in self.cg.settings(None).items() if k != "rearm_ratio"}, {"high_ratio": 3.0, "minutes": 5})
+        self.assertIsNone(self.cg.settings(False))
+        got = self.cg.settings({"high_ratio": 4.5, "minutes": 10})
+        self.assertEqual((got["high_ratio"], got["minutes"], got["rearm_ratio"]), (4.5, 10, 3.0))
+        for bad in (True, 5, [], {"high_ratio": 0}, {"high_ratio": -1}, {"high_ratio": "3"}, {"minutes": 0}, {"minutes": 500}, {"nope": 1}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(sb.ConfigError):
+                    sb.validate_config(dict({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}, cpu_guard=bad), "t")
+
+    def test_an_unreadable_load_says_nothing_and_a_failing_ps_still_wakes(self):
+        with mock.patch.object(os, "getloadavg", side_effect=OSError("no")):
+            self.assertEqual(self.run_for(7), [])
+            self.assertTrue(self.cg.status_line(self.cg.settings(None), self.cg.reading()).startswith("unreadable: OSError"))
+        self.settle()
+        self.engine.cpu_ps_runner = lambda argv, **kw: (_ for _ in ()).throw(OSError("no ps"))
+        self.run_for(6)
+        self.settle()
+        (fact,) = self.facts()
+        self.assertNotIn("top:", fact.summary)
+        self.assertIn("cpu high", fact.summary)
+
+    def test_the_categories_are_summed_by_base_name_and_hostile_names_are_cleaned(self):
+        cats = self.cg.categories("  10 /a/node\n  5 /b/node\n  3 \x1b[2Jevil\n  1 /c/x y\n")
+        self.assertEqual(cats[0], ("node", 15.0))
+        self.assertNotIn("\x1b", self.cg.detail(cats))
 
 
 class TestDiskGuard(Base):
@@ -45579,6 +46644,494 @@ class TestEventFeedReads(unittest.TestCase):
             self.assertIn("events: DOWN: old reads", sb.v2_calls_status(tmp, 1000.0))
 
 
+class TestLoadAlert(Base):
+    """#348: the load figures per orchestrator, the hourly series, the `status` lines and the once-per-episode alert to the Chief of Staff."""
+    T0 = _dt.datetime(2026, 10, 14, 10, 0, tzinfo=_dt.timezone.utc).timestamp()
+
+    def setUp(self):
+        super().setUp()
+        self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(str(self.state_dir), 0o700)
+        self.health = sb.load_fleet_health()
+        self.asks = {}       # orchestrator -> [numbers]
+        self.reads = []
+        self.woken = []
+        self.fail_reads = False
+
+    def orch(self, busy=0, idle=0, messages=0, charter=1):
+        return {"charter": charter, "repo": "acme/widget", "busy": busy, "idle": idle, "messages": messages}
+
+    def tick(self, at, orchestrators, **cfg):
+        def read_asks(charter, repo):
+            self.reads.append((at, charter))
+            if self.fail_reads:
+                raise RuntimeError("gh is down")
+            return [{"repo": "acme/widget", "number": n} for n in self.asks[charter]]
+        ctx = self.health.Context(now=at, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS, **dict({"enabled": True}, **cfg)), orchestrators=orchestrators,
+                                  read_asks=read_asks, cos="cos", wake=self.woken.append)
+        return self.health.tick(ctx)
+
+    def latest(self):
+        return json.loads((self.state_dir / "load.json").read_text())["latest"]
+
+    def move(self, at, number, kind="push"):
+        self.health.append_moves(str(self.state_dir), [{"at": at, "repo": "acme/widget", "numbers": [number], "kind": kind}])
+
+    def test_each_orchestrator_has_the_five_figures_from_the_records(self):
+        self.asks = {1: [10, 11, 12], 2: [20], 3: [30, 31]}
+        orchestrators = {"orch-a": self.orch(busy=2, idle=1, messages=1, charter=1), "orch-b": self.orch(idle=1, charter=2), "orch-c": self.orch(busy=1, charter=3)}
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [{"agent": "orch-a"}, {"agent": "orch-a"}, {"agent": "orch-b", "closed": True}]}))
+        self.tick(self.T0, orchestrators)                      # first sight of every ask
+        self.move(self.T0 + 3 * 3600 - 60, 10)                 # ask 10 moved 1 minute ago; 20 and 30 moved 3 h ago
+        self.move(self.T0 + 3 * 3600 - 60, 12)
+        self.tick(self.T0 + 3 * 3600, orchestrators)
+        got = self.latest()
+        a = got["orch-a"]
+        self.assertEqual((a["open_asks"], a["stalled"], a["stalled_asks"], a["moved_1h"], a["busy"], a["idle"], a["messages"], a["decisions"]),
+                         (3, 1, [11], 2, 2, 1, 1, 2))
+        self.assertEqual((got["orch-b"]["open_asks"], got["orch-b"]["stalled"], got["orch-b"]["decisions"]), (1, 1, 0))
+        self.assertEqual((got["orch-c"]["open_asks"], got["orch-c"]["stalled"], got["orch-c"]["oldest_stall_hours"]), (2, 2, 3.0))
+
+    def test_five_movement_kinds_reset_the_clock_and_a_comment_does_not(self):
+        self.asks = {1: [1, 2, 3, 4, 5, 6]}
+        self.tick(self.T0, {"o": self.orch(busy=1, charter=1)})
+        late = self.T0 + 3 * 3600
+        for number, kind in ((1, "push"), (2, "pr_opened"), (3, "pr_merged")):
+            self.move(late - 100, number, kind)
+        ts = lambda at: _dt.datetime.fromtimestamp(at, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        with open(str(self.state_dir / "audit.jsonl"), "w") as handle:
+            for entry in ({"ts": ts(late - 100), "event": "v2.synthetic", "phase": "intent", "subject": "cos",
+                           "detail": {"description": "switchboard: worker report on widget#4: done"}},
+                          {"ts": ts(late - 100), "event": "plan.review.consensus", "subject": "acme/widget#5", "detail": {}},
+                          {"ts": ts(late - 100), "event": "github.comment", "subject": "acme/widget#6", "detail": {}}):   # a plain comment
+                handle.write(json.dumps(entry) + "\n")
+        self.tick(late, {"o": self.orch(busy=1, charter=1)})
+        self.assertEqual((self.latest()["o"]["stalled"], self.latest()["o"]["stalled_asks"], self.latest()["o"]["moved_1h"]), (1, [6], 5))
+
+    def test_move_rows_come_from_webhooks_and_a_comment_makes_none(self):
+        pr = {"number": 7, "body": "Closes #3", "merged": True}
+        rows = lambda event, action, **kw: self.health.move_rows(event, {"action": action, "pull_request": dict(pr, **kw)}, "acme/widget", 5, sb.closing_numbers)
+        self.assertEqual([r["kind"] for r in rows("pull_request", "synchronize")], ["push"])
+        self.assertEqual([r["kind"] for r in rows("pull_request", "opened")], ["pr_opened"])
+        self.assertEqual([r["kind"] for r in rows("pull_request", "closed")], ["pr_merged"])
+        self.assertEqual(rows("pull_request", "closed", merged=False), [])
+        self.assertEqual(rows("pull_request", "synchronize")[0]["numbers"], [7, 3])
+        self.assertEqual(self.health.move_rows("issue_comment", {"action": "created"}, "acme/widget", 5), [])
+
+    def test_the_hourly_series_has_one_entry_per_hour_with_a_pass(self):
+        self.asks = {1: [1]}
+        for hour in range(6):
+            self.tick(self.T0 + hour * 3600 + 120, {"o": self.orch(charter=1)})
+        series = json.loads((self.state_dir / "load.json").read_text())["series"]["o"]
+        self.assertEqual(sorted(series["hours"]), ["10", "11", "12", "13", "14", "15"])
+        self.assertEqual(series["day"], "2026-10-14")
+
+    def test_status_prints_one_line_per_orchestrator_with_the_figures(self):
+        self.asks = {1: [1], 2: []}
+        self.tick(self.T0, {"orch-a": self.orch(busy=1, charter=1), "orch-b": self.orch(idle=2, charter=2)})
+        lines = self.health.status_lines(str(self.state_dir), self.T0)
+        self.assertEqual(len([l for l in lines if l.strip().startswith("orch-")]), 2)
+        self.assertIn("asks 1, stalled 0", lines[1])
+        self.assertIn("coders 1 busy 0 idle", lines[1])
+        self.assertEqual(self.health.status_lines(str(self.state_dir / "nowhere"), self.T0), [])
+        status = sb.format_status(dict(self.status_skeleton(), load=lines))
+        self.assertEqual(len([l for l in status.splitlines() if "asks 1, stalled 0" in l or "asks 0, stalled 0" in l]), 2)
+
+    def status_skeleton(self):
+        report = sb.collect_status(runner=lambda *a, **k: types.SimpleNamespace(returncode=1, stdout="", stderr=""), now=lambda: self.T0)
+        report["load"] = []
+        return report
+
+    def stalled_world(self, count=2):
+        self.asks = {1: list(range(1, count + 1))}
+        self.tick(self.T0, {"o": self.orch(idle=1, charter=1)})
+
+    def test_two_stalled_asks_wake_once_over_three_passes_with_figures_and_an_action(self):
+        self.stalled_world(2)
+        for hour in (2, 3, 4):
+            self.tick(self.T0 + hour * 3600, {"o": self.orch(idle=1, charter=1)})
+        self.assertEqual(len(self.woken), 1)
+        text = self.woken[0]
+        for part in ("o is overloaded", "2 open ask(s)", "2 with no real movement in 2 h", "#1, #2", "Recommended: move the stalled asks"):
+            self.assertIn(part, text)
+
+    def test_a_full_coder_team_with_a_backlog_wakes_once_and_idle_coders_do_not(self):
+        self.asks = {1: [1, 2, 3], 2: [4, 5, 6]}
+        both = {"full": self.orch(busy=2, idle=0, charter=1), "free": self.orch(busy=2, idle=1, charter=2)}
+        self.tick(self.T0, both)
+        for number in (1, 4):
+            self.move(self.T0 + 3600, number)
+        self.tick(self.T0 + 3700, both)
+        self.assertEqual([t.split(" is ")[0] for t in self.woken], ["Load alert: full"])
+        self.assertIn("split a lane or add coders", self.woken[0])
+
+    def test_worse_wakes_again_and_recovery_then_a_new_crossing_wakes_again(self):
+        self.stalled_world(2)
+        o = {"o": self.orch(idle=1, charter=1)}
+        self.tick(self.T0 + 2 * 3600, o)
+        self.assertEqual(len(self.woken), 1)
+        self.asks[1] = [1, 2, 3]
+        self.tick(self.T0 + 3 * 3600 + 10, o)              # the list is re-read after an hour; ask 3 is new, 1 and 2 still stalled: 2 stalled, not worse
+        self.assertEqual(len(self.woken), 1)
+        self.tick(self.T0 + 5 * 3600 + 20, o)              # ask 3 has now gone 2 h too: 3 stalled, worse
+        self.assertEqual(len(self.woken), 2)
+        self.asks[1] = []
+        self.tick(self.T0 + 6 * 3600 + 30, o)              # recovered
+        self.assertEqual(len(self.woken), 2)
+        self.asks[1] = [7, 8]
+        self.tick(self.T0 + 7 * 3600 + 40, o)              # two new asks, first seen now
+        self.tick(self.T0 + 9 * 3600 + 50, o)              # stalled again: a new crossing after recovery
+        self.assertEqual(len(self.woken), 3)
+
+    def test_configured_thresholds_are_followed(self):
+        self.stalled_world(2)
+        self.tick(self.T0 + 3 * 3600, {"o": self.orch(idle=1, charter=1)}, stalled_asks=3)
+        self.assertEqual(self.woken, [])
+        self.asks[1] = [1, 2, 3]
+        self.tick(self.T0 + 4 * 3600 + 5, {"o": self.orch(idle=1, charter=1)}, stalled_asks=3)
+        self.tick(self.T0 + 6 * 3600 + 10, {"o": self.orch(idle=1, charter=1)}, stalled_asks=3)
+        self.assertEqual(len(self.woken), 1)
+        with self.assertRaises(ValueError):
+            self.health.validate({"stalled_asks": 0}, "x")
+        self.assertEqual(self.health.validate(None, "x"), self.health.DEFAULTS)
+
+    def test_reads_are_bounded_and_an_unreadable_source_means_no_wake(self):
+        self.asks = {n: [n] for n in range(1, 41)}
+        many = {"o%d" % n: self.orch(charter=n) for n in range(1, 41)}
+        self.tick(self.T0, many)
+        self.tick(self.T0 + 1800, many)
+        self.assertLessEqual(len(self.reads), 10)
+        # an unreadable source: the cache goes stale, the asks are not believed, nobody is woken, and status says so once
+        self.fail_reads = True
+        self.woken.clear()
+        later = {"x": self.orch(charter=1)}
+        self.asks = {1: [1, 2, 3]}
+        self.tick(self.T0 + 10 * 3600, later)
+        self.assertEqual(self.woken, [])
+        self.assertIsNone(self.latest()["x"]["open_asks"])
+        lines = self.health.status_lines(str(self.state_dir), self.T0)
+        self.assertEqual(len([l for l in lines if "unreadable" in l]), 1)
+        self.assertIn("asks not recorded", lines[1])
+
+    def test_the_kill_switch_keeps_the_line_and_sends_no_wake(self):
+        self.stalled_world(2)
+        self.tick(self.T0 + 3 * 3600, {"o": self.orch(idle=1, charter=1)}, enabled=False)
+        self.assertEqual(self.woken, [])
+        self.assertEqual(len([l for l in self.health.status_lines(str(self.state_dir), self.T0) if l.strip().startswith("o ")]), 1)
+        self.tick(self.T0 + 4 * 3600, {"o": self.orch(idle=1, charter=1)})   # switched on later: the open episode still fires
+        self.assertEqual(len(self.woken), 1)
+
+    def test_the_fixed_text_names_nothing_and_every_name_comes_from_the_records(self):
+        def render(boss):
+            self.woken.clear()
+            shutil.rmtree(str(self.state_dir)); self.state_dir.mkdir(mode=0o700)
+            self.asks = {1: [1, 2]}
+            self.tick(self.T0, {boss: self.orch(idle=1, charter=1)})
+            self.tick(self.T0 + 3 * 3600, {boss: self.orch(idle=1, charter=1)})
+            return self.woken[0] + "\n" + "\n".join(self.health.status_lines(str(self.state_dir), 0))
+        self.assertEqual(render("orch-a").replace("orch-a", "N"), render("orch-b").replace("orch-b", "N"))
+
+    def test_the_daemon_tick_without_an_ask_repo_wakes_nobody_and_says_so(self):
+        self.asks = {1: [1, 2]}
+        engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.T0, audit=None, actor="daemon", intents=None,
+                                       config={"load_alert": self.health.validate({"enabled": True}, "x")})
+        seen = lambda name, fleet, status: types.SimpleNamespace(name=name, fleet=fleet, status=status)
+        discovery = types.SimpleNamespace(agents={"orch": seen("orch", {"role": "orchestrator", "charter": 1, "repo": "acme/widget"}, "idle"),
+                                                  "cos": seen("cos", {"role": "chief-of-staff"}, "idle")})
+        self.assertEqual(sb.load_tick(engine, discovery), [])   # no ask repo: the asks are unreadable, so no wake
+        self.assertIn("no ask repo", " ".join(json.loads((self.state_dir / "load.json").read_text())["problems"]))
+        self.assertEqual(sb.read_reminders(str(self.state_dir)), [])
+
+    def test_the_daemon_tick_turns_a_crossing_into_one_reminder_and_one_audit_line(self):
+        clock = [self.T0]
+        audited = []
+        audit = types.SimpleNamespace(append=lambda actor, event, subject, detail: audited.append((event, subject, detail)))
+        intents = types.SimpleNamespace(repo="acme/widget", open_asks=lambda charter, repo: [types.SimpleNamespace(repo="acme/widget", number=n) for n in (1, 2)])
+        engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: clock[0], audit=audit, actor="daemon", intents=intents,
+                                       config={"load_alert": self.health.validate({"enabled": True}, "x")})
+        seen = lambda name, fleet, status: types.SimpleNamespace(name=name, fleet=fleet, status=status)
+        discovery = types.SimpleNamespace(agents={"orch": seen("orch", {"role": "orchestrator", "charter": 1, "repo": "acme/widget"}, "idle"),
+                                                  "cos": seen("cos", {"role": "chief-of-staff"}, "idle")})
+        sb.load_tick(engine, discovery)
+        for hours in (3, 4):
+            clock[0] = self.T0 + hours * 3600
+            sb.load_tick(engine, discovery)
+        reminders = sb.read_reminders(str(self.state_dir))
+        self.assertEqual([r["to"] for r in reminders], ["cos"])
+        self.assertIn("orch is overloaded", reminders[0]["text"])
+        self.assertIn("2 with no real movement in 2 h", reminders[0]["text"])
+        self.assertEqual([a[0] for a in audited], ["load.alert"])
+
+    def test_the_move_log_survives_torn_lines_a_burst_and_a_prune(self):
+        d = str(self.state_dir)
+        (self.state_dir / "ask-moves.jsonl").write_text('{"at": 1, "numbers": [1], "repo": "r"}\nnot json\n{"at": 2')
+        self.health.append_moves(d, [{"at": self.T0, "repo": "r", "numbers": [3], "kind": "push"}])
+        self.assertEqual([r["numbers"] for r in self.health.read_moves(d, 0)], [[1], [3]])
+        self.health.append_moves(d, [{"at": 5, "repo": "r", "numbers": [9], "kind": "push"} for _ in range(300)])
+        self.health.prune_moves(d, self.T0)
+        self.assertEqual([r["numbers"] for r in self.health.read_moves(d, 0)], [[3]])
+        body = " ".join("Closes #%d." % n for n in range(1, 60))
+        row = self.health.move_rows("pull_request", {"action": "opened", "pull_request": {"number": 7, "body": body}}, "r", 1, sb.closing_numbers)[0]
+        self.assertEqual(len(row["numbers"]), self.health.MOVES_NUMBERS_MAX)
+
+    def test_unreadable_decisions_and_a_torn_audit_tail_are_not_zero_and_not_fatal(self):
+        self.assertIsNone(self.health.decisions_waiting(str(self.state_dir)))
+        (self.state_dir / "audit.jsonl").write_text("x" * 100 + "\n")
+        with mock.patch.object(self.health, "AUDIT_TAIL_BYTES", 40):
+            self.assertEqual(self.health.audit_moves(str(self.state_dir), 0), [])
+        self.assertIsNone(self.health.audit_moves(str(self.state_dir / "nowhere"), 0))
+
+    def test_the_replay_of_a_recorded_overloaded_day_says_when_it_would_have_fired(self):
+        self.asks = {1: [1, 2]}
+        o = {"o": self.orch(idle=1, charter=1)}
+        for hour in range(0, 6):
+            self.tick(self.T0 + hour * 3600 + 5, o)       # the stall builds: 2 asks unmoved from 10:00, a stall of 2 h at 12:00
+        days, firings = self.health.replay(str(self.state_dir), dict(self.health.DEFAULTS))
+        self.assertEqual(days, ["2026-10-14"])
+        self.assertEqual([(f["orchestrator"], f["hour"]) for f in firings], [("o", "2026-10-14 12:00Z")])
+        self.assertEqual(self.health.replay(str(self.state_dir), dict(self.health.DEFAULTS, stalled_asks=3))[1], [])
+        self.assertIsNone(self.health.replay(str(self.state_dir), dict(self.health.DEFAULTS), "2026-01-01")[1])
+        # a finished day stays replayable after the day rolls over
+        self.tick(self.T0 + 24 * 3600, o)
+        days, firings = self.health.replay(str(self.state_dir), dict(self.health.DEFAULTS), "2026-10-14")
+        self.assertEqual((days, len(firings)), (["2026-10-14", "2026-10-15"], 1))
+        with captured() as (out, err):
+            self.assertEqual(sb.main(["load-replay", "--day", "2026-10-14"], runner=None), 0, err.getvalue())
+        self.assertIn("would have fired 1 time(s)", out.getvalue())
+        self.assertIn("o is overloaded", out.getvalue())
+
+    def test_a_past_day_is_rebuilt_from_the_audit_and_its_archive_and_says_what_is_not_recorded(self):
+        def line(ts, event, subject, detail, **extra):
+            return json.dumps(dict({"ts": ts, "actor": "cli", "event": event, "subject": subject, "detail": detail}, **extra))
+        archive = [line("2026-10-12T22:00:00.000Z", "v2.session.create", "coder1", {"fleet": {"reports_to": "orch", "issue": 5}}),
+                   line("2026-10-12T22:00:00.000Z", "reminder.add", "orch", {"from": "orch", "issue": 6, "repo": "acme/widget"})]
+        with gzip.open(str(self.state_dir / "audit-2026-10-13.jsonl.gz"), "wt") as handle:
+            handle.write("\n".join(archive) + "\n")
+        os.utime(str(self.state_dir / "audit-2026-10-13.jsonl.gz"), (self.T0, self.T0))
+        (self.state_dir / "audit.jsonl").write_text(line("2026-10-13T01:30:00.000Z", "v2.synthetic", "cos", {"description": "switchboard: coder1 report on widget#5: done"}, phase="intent") + "\n")
+        firings, notes = self.health.replay_audit(str(self.state_dir), dict(self.health.DEFAULTS), "2026-10-13")
+        self.assertEqual([(f["orchestrator"], f["hour"]) for f in firings], [("orch", "2026-10-13 00:59Z"), ("orch", "2026-10-13 03:59Z")])
+        self.assertIn("coders not recorded busy", firings[0]["text"])
+        self.assertIn("coders busy and idle", notes)
+        self.assertIsNone(self.health.replay_audit(str(self.state_dir / "nowhere"), dict(self.health.DEFAULTS), "2026-10-13")[0])
+        with captured() as (out, err):
+            self.assertEqual(sb.main(["load-replay", "--day", "2026-10-13"], runner=None), 0, err.getvalue())
+        self.assertIn("from the audit log and its archives (best effort)", out.getvalue())
+        self.assertIn("not recorded for it:", out.getvalue())
+        self.assertIn("would have fired 2 time(s)", out.getvalue())
+
+    def test_load_replay_refuses_a_bad_day_and_names_today_for_a_rebuild_with_no_series(self):
+        for bad in ("foo", "2026-13-45"):
+            with captured() as (out, err):
+                self.assertEqual(sb.main(["load-replay", "--day", bad], runner=None), 2, bad)
+            self.assertIn("load-replay: --day", err.getvalue())
+        (self.state_dir / "audit.jsonl").write_text("")
+        with captured() as (out, err), mock.patch.object(sb.time, "time", lambda: self.T0):
+            self.assertEqual(sb.main(["load-replay", "--from-audit"], runner=None, now=lambda: self.T0), 0, err.getvalue())
+        self.assertIn("load alert replay over 2026-10-14 from the audit log", out.getvalue())
+        self.assertIn("would have fired 0 time(s)", out.getvalue())
+
+    def test_a_hostile_orchestrator_name_is_one_short_clean_line_in_the_wake(self):
+        self.asks = {1: [1, 2]}
+        name = "o\nrm -rf\x1b[31m " + "x" * 100
+        self.tick(self.T0, {name: self.orch(idle=1, charter=1)})
+        self.tick(self.T0 + 3 * 3600, {name: self.orch(idle=1, charter=1)})
+        text = self.woken[0]
+        self.assertNotRegex(text, "[\x00-\x1f\x7f]")
+        self.assertEqual(text.split(" is overloaded")[0].replace("Load alert: ", ""), ("o rm -rf [31m " + "x" * 100)[:60])
+
+    def test_an_oversize_move_file_is_pruned_to_the_recent_rows(self):
+        d = str(self.state_dir)
+        with mock.patch.object(self.health, "MOVES_READ_BYTES", 2000):
+            self.health.append_moves(d, [{"at": 5, "repo": "r", "numbers": [9], "kind": "push"} for _ in range(100)])
+            self.health.append_moves(d, [{"at": self.T0, "repo": "r", "numbers": [4], "kind": "push"}])
+            self.assertGreater((self.state_dir / "ask-moves.jsonl").stat().st_size, 2000)
+            self.health.prune_moves(d, self.T0)
+            self.assertEqual([r["numbers"] for r in self.health.read_moves(d, 0)], [[4]])
+            self.assertLess((self.state_dir / "ask-moves.jsonl").stat().st_size, 2000)
+
+    def test_an_orchestrator_with_no_charter_says_so_and_one_with_only_an_issue_is_read(self):
+        asked = []
+        def read_asks(charter, repo):
+            asked.append(charter)
+            return [{"repo": "acme/widget", "number": 5}]
+        no_charter = {"charter": None, "repo": "acme/widget", "busy": 0, "idle": 1, "messages": 0}
+        ctx = self.health.Context(now=self.T0, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS, enabled=True),
+                                  orchestrators={"a": no_charter, "b": dict(no_charter, charter=34)}, read_asks=read_asks, cos="cos", wake=self.woken.append)
+        self.health.tick(ctx)
+        self.assertEqual(asked, [34])
+        problems = json.loads((self.state_dir / "load.json").read_text())["problems"]
+        self.assertIn("no charter recorded for a", problems)
+        self.assertIsNone(self.latest()["a"]["open_asks"])
+        self.assertEqual(self.latest()["b"]["open_asks"], 1)
+
+    def test_the_charter_is_the_issue_whose_yaml_names_the_agent_never_the_agents_own_issue(self):
+        seen = lambda name, fleet: types.SimpleNamespace(name=name, fleet=fleet, status="idle")
+        asked, api = [], []
+        labels = [{"name": "me:orchestrator"}, {"name": "me:other"}]
+        issues = [{"number": 34, "body": "```yaml\norchestrator: fleetkit\n```"}, {"number": 350, "body": "```yaml\norchestrator: fleet-insight\nworkspace: x\n```"},
+                  {"number": 9, "body": "no yaml"}]
+        def _api(path, repo):
+            api.append(path)
+            return labels if "/labels" in path else issues
+        intents = types.SimpleNamespace(repo="acme/widget", _api=_api, open_asks=lambda charter, repo: asked.append(charter) or [])
+        engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.T0, audit=None, actor="daemon", intents=intents,
+                                       config={"load_alert": self.health.validate({"enabled": True}, "x")})
+        discovery = types.SimpleNamespace(agents={
+            "fleet-insight": seen("fleet-insight", {"role": "orchestrator", "issue": 34, "repo": "acme/widget"}),   # its metadata issue is another orchestrator's charter
+            "fleetkit": seen("fleetkit", {"role": "orchestrator", "repo": "acme/widget"}),
+            "legacy": seen("legacy", {"role": "orchestrator", "charter": 7, "repo": "acme/widget"}),   # no yaml names it: the metadata charter is the fallback
+            "stray": seen("stray", {"role": "orchestrator", "issue": 9, "repo": "acme/widget"})})      # an issue that is no charter is never used
+        sb.load_tick(engine, discovery)
+        self.assertEqual(sorted(asked), [7, 34, 350])   # fleet-insight -> 350 (not 34); fleetkit -> 34; legacy -> 7
+        self.assertEqual(len(api), 2)                   # one labels read and one issues read for the repo
+        problems = json.loads((self.state_dir / "load.json").read_text())["problems"]
+        self.assertIn("no charter recorded for stray", problems)
+        sb.load_tick(engine, discovery)
+        self.assertEqual(len(api), 2)                   # cached for an hour
+
+    def test_a_pull_request_in_the_issues_list_never_names_a_charter(self):
+        seen = lambda name, fleet: types.SimpleNamespace(name=name, fleet=fleet, status="idle")
+        asked = []
+        issues = [{"number": 60, "body": "orchestrator: o1", "pull_request": {"url": "u"}}, {"number": 61, "body": "orchestrator: o1"}]
+        intents = types.SimpleNamespace(repo="acme/widget", _api=lambda path, repo: [{"name": "me:orchestrator"}] if "/labels" in path else issues,
+                                        open_asks=lambda charter, repo: asked.append(charter) or [])
+        engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.T0, audit=None, actor="daemon", intents=intents,
+                                       config={"load_alert": self.health.validate({"enabled": True}, "x")})
+        sb.load_tick(engine, types.SimpleNamespace(agents={"o1": seen("o1", {"role": "orchestrator", "repo": "acme/widget"})}))
+        self.assertEqual(asked, [61])
+
+    def charters_ctx(self, at, calls, orchestrators, reads_before=()):
+        def read_charters(repo):
+            calls.append((at, repo))
+            return [(5, "orchestrator: a")]
+        return self.health.Context(now=at, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS), orchestrators=orchestrators,
+                                   read_asks=lambda charter, repo: [], read_charters=read_charters, cos="cos", wake=self.woken.append)
+
+    def test_the_charters_cache_expires_after_an_hour_and_a_spent_budget_refuses_the_read(self):
+        calls = []
+        orch = {"a": {"charter": None, "repo": "acme/widget", "busy": 0, "idle": 1, "messages": 0}}
+        self.health.tick(self.charters_ctx(self.T0, calls, orch))
+        self.health.tick(self.charters_ctx(self.T0 + 600, calls, orch))
+        self.assertEqual(len(calls), 1)                       # cached
+        self.health.tick(self.charters_ctx(self.T0 + self.health.ASKS_FRESH_SECONDS + 5, calls, orch))
+        self.assertEqual(len(calls), 2)                       # expired: read again
+        # a budget with fewer than 2 reads left refuses the charters read (the asks read may still use the last one)
+        state = json.loads((self.state_dir / "load.json").read_text())
+        now = self.T0 + 2 * self.health.ASKS_FRESH_SECONDS + 10
+        state["charters"] = {}
+        state["reads"] = [now - 60] * (self.health.READ_BUDGET - 1)
+        (self.state_dir / "load.json").write_text(json.dumps(state))
+        self.health.tick(self.charters_ctx(now, calls, orch))
+        self.assertEqual(len(calls), 2)                       # refused: no third call
+
+    def test_many_orchestrators_with_no_charter_are_named_with_a_count(self):
+        orch = {"o%d" % n: {"charter": None, "repo": None, "busy": 0, "idle": 0, "messages": 0} for n in range(9)}
+        ctx = self.health.Context(now=self.T0, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS), orchestrators=orch,
+                                  read_asks=lambda c, r: [], cos="cos", wake=self.woken.append)
+        self.health.tick(ctx)
+        problems = json.loads((self.state_dir / "load.json").read_text())["problems"]
+        self.assertTrue(any(p.startswith("no charter recorded for o0, o1") and p.endswith("and 3 more") for p in problems), problems)
+
+    def test_with_the_alert_off_the_line_is_still_kept_and_nobody_is_woken(self):
+        seen = lambda name, fleet: types.SimpleNamespace(name=name, fleet=fleet, status="idle")
+        clock = [self.T0]
+        api = []
+        intents = types.SimpleNamespace(repo="acme/widget", _api=lambda path, repo: api.append(path) or [],
+                                        open_asks=lambda c, r: [types.SimpleNamespace(repo="acme/widget", number=n) for n in (1, 2)])
+        discovery = types.SimpleNamespace(agents={"o": seen("o", {"role": "orchestrator", "charter": 3, "repo": "acme/widget"}), "cos": seen("cos", {"role": "chief-of-staff"})})
+        for config in ({}, {"load_alert": self.health.validate(None, "x")}):
+            shutil.rmtree(str(self.state_dir)); self.state_dir.mkdir(mode=0o700)
+            engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: clock[0], audit=None, actor="daemon", intents=intents, config=config)
+            sb.load_tick(engine, discovery)
+            clock[0] = self.T0 + 3 * 3600                    # two asks stalled 3 h: a crossing, with the alert off
+            self.assertEqual(sb.load_tick(engine, discovery), [])
+            self.assertEqual(sb.read_reminders(str(self.state_dir)), [])     # no wake
+            lines = self.health.status_lines(str(self.state_dir), clock[0])
+            self.assertEqual(len([l for l in lines if l.strip().startswith("o ")]), 1)   # the line stays
+            self.assertIn("alert off", lines[0])
+            clock[0] = self.T0
+        self.assertTrue(api)                                 # the charter reads feed the line
+
+    def test_a_failing_read_is_not_retried_every_pass_and_is_still_said(self):
+        calls = []
+        def fail(*a):
+            calls.append(a)
+            raise RuntimeError("gh is down")
+        orch = {"a": {"charter": 3, "repo": "r", "busy": 0, "idle": 1, "messages": 0}}
+        for at in (0, 10, 20, 290):
+            ctx = self.health.Context(now=self.T0 + at, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS), orchestrators=orch,
+                                      read_asks=fail, read_charters=fail, cos="cos", wake=self.woken.append)
+            self.health.tick(ctx)
+            problems = json.loads((self.state_dir / "load.json").read_text())["problems"]
+            self.assertTrue(any("asks not readable" in p for p in problems) and any("charters not readable" in p for p in problems), (at, problems))
+        self.assertEqual(len(calls), 2)                      # one charters read and one asks read, then nothing for 5 minutes
+        self.health.tick(self.health.Context(now=self.T0 + 400, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS), orchestrators=orch,
+                                             read_asks=fail, read_charters=fail, cos="cos", wake=self.woken.append))
+        self.assertEqual(len(calls), 4)                      # tried again after the wait
+
+    def test_a_metadata_charter_that_names_another_agent_is_dropped_but_an_unnamed_one_is_kept(self):
+        calls = []
+        def read_charters(repo):
+            return [(34, "orchestrator: other"), (350, "orchestrator: fleet-insight")]
+        orch = {"fleet-insight": {"charter": 34, "repo": "r", "busy": 0, "idle": 1, "messages": 0},     # 34 is another agent's: resolved by yaml to 350
+                "stray": {"charter": 34, "repo": "r", "busy": 0, "idle": 1, "messages": 0},             # no yaml names it, and 34 is another's: dropped
+                "legacy": {"charter": 99, "repo": "r", "busy": 0, "idle": 1, "messages": 0}}            # 99 is no charter with yaml: kept
+        ctx = self.health.Context(now=self.T0, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS), orchestrators=orch,
+                                  read_asks=lambda c, r: calls.append(c) or [], read_charters=read_charters, cos="cos", wake=self.woken.append)
+        self.health.tick(ctx)
+        self.assertEqual(sorted(calls), [99, 350])
+        self.assertIn("no charter recorded for stray", json.loads((self.state_dir / "load.json").read_text())["problems"])
+
+    def test_the_orchestrator_line_tolerates_crlf_and_a_trailing_comment_and_the_lowest_number_wins(self):
+        names = lambda body: self.health.charter_agent(body)
+        self.assertEqual(names("```yaml\r\norchestrator: ok # the name\r\nstatus: active\r\n```"), "ok")
+        self.assertEqual(names("orchestrator: a.b-c  "), "a.b-c")
+        self.assertIsNone(names("  orchestrator: indented"))
+        self.assertIsNone(names("orchestrator: bad name"))
+        ctx = self.health.Context(now=self.T0, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS),
+                                  orchestrators={"a": {"charter": None, "repo": "r", "busy": 0, "idle": 1, "messages": 0}},
+                                  read_asks=lambda c, r: self.reads.append(c) or [], read_charters=lambda r: [(9, "orchestrator: a"), (4, "orchestrator: a")], cos="cos", wake=self.woken.append)
+        self.health.tick(ctx)
+        self.assertEqual(self.reads, [4])
+
+    def test_every_owner_prefix_of_the_orchestrator_label_is_read(self):
+        seen = lambda name, fleet: types.SimpleNamespace(name=name, fleet=fleet, status="idle")
+        paths, asked = [], []
+        def _api(path, repo):
+            paths.append(path)
+            if "/labels" in path:
+                return [{"name": "me:orchestrator"}, {"name": "you:orchestrator"}, {"name": "me:other"}]
+            return [{"number": 11, "body": "orchestrator: a"}] if "me%3Aorchestrator" in path else [{"number": 12, "body": "orchestrator: b"}]
+        intents = types.SimpleNamespace(repo="r", _api=_api, open_asks=lambda c, r: asked.append(c) or [])
+        engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.T0, audit=None, actor="daemon", intents=intents,
+                                       config={"load_alert": self.health.validate({"enabled": True}, "x")})
+        sb.load_tick(engine, types.SimpleNamespace(agents={"a": seen("a", {"role": "orchestrator", "repo": "r"}), "b": seen("b", {"role": "orchestrator", "repo": "r"})}))
+        self.assertEqual(sorted(asked), [11, 12])
+        self.assertEqual(len(paths), 3)
+
+    def test_charters_that_cannot_be_read_fall_back_and_are_said(self):
+        def read_charters(repo):
+            raise RuntimeError("gh is down")
+        no_charter = {"charter": 7, "repo": "acme/widget", "busy": 0, "idle": 1, "messages": 0}
+        self.asks = {7: [1]}
+        def read_asks(charter, repo):
+            return [{"repo": "acme/widget", "number": n} for n in self.asks[charter]]
+        ctx = self.health.Context(now=self.T0, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS), orchestrators={"a": no_charter},
+                                  read_asks=read_asks, read_charters=read_charters, cos="cos", wake=self.woken.append)
+        self.health.tick(ctx)
+        self.assertEqual(self.latest()["a"]["open_asks"], 1)
+        self.assertTrue(any("charters not readable" in p for p in json.loads((self.state_dir / "load.json").read_text())["problems"]))
+
+    def test_an_idle_pass_rewrites_nothing(self):
+        self.asks = {1: [1]}
+        self.tick(self.T0, {"o": self.orch(busy=1, charter=1)})
+        before = (self.state_dir / "load.json").stat().st_mtime_ns
+        self.tick(self.T0 + 60, {"o": self.orch(busy=1, charter=1)})
+        self.assertEqual((self.state_dir / "load.json").stat().st_mtime_ns, before)
+
+
+
 def main(argv):
     loader = unittest.TestLoader()
     suite = loader.loadTestsFromModule(sys.modules[__name__])
@@ -45610,4 +47163,13 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
+    # already in a slot, or a state directory that cannot be written run it as it is.
+    _wrapped = sb.load_heavy_slots().wrap_argv(sys.argv[1:], os.environ, sys.executable, str(SWITCHBOARD), os.path.abspath(__file__),
+                                                                  state_dir=sb.state_dir_path())
+    if _wrapped is not None:
+        try:
+            os.execv(_wrapped[0], _wrapped)
+        except OSError as _err:
+            sys.stderr.write("heavy: cannot start the slot wrapper (%s): running without a slot\n" % (_err.strerror or _err))
     sys.exit(main(sys.argv[1:]))
