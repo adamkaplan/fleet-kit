@@ -39005,8 +39005,10 @@ class TestEventStream(Base):
     def test_a_refused_password_a_bad_status_a_refused_connection_and_an_oversized_line(self):
         route = self.route()
         self.service.password = "rotated"
-        with self.assertRaises(sb.V2Unreachable):
+        with self.assertRaises(sb.V2Unreachable) as caught:
             list(route.stream_lines())
+        for secret in ("pw-secret-1", "rotated", "Basic", base64.b64encode(b"opencode:pw-secret-1").decode()):
+            self.assertNotIn(secret, str(caught.exception), "the credential is in no error")
         self.service.password = "pw-secret-1"
         self.service.status = 500
         with self.assertRaises(sb.V2Error):
