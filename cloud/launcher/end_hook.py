@@ -38,6 +38,7 @@ def run(workdir, worker):
             if git(workdir, "diff", "--cached", "--quiet", check=False).returncode != 0:
                 git(workdir, "-c", "user.name=fleet-worker", "-c", "user.email=fleet-worker@invalid",
                     "commit", "-m", "WIP: work in progress saved by %s at the end of the worker" % worker)
+    git(workdir, "fetch", "--prune", "origin")  # refs must be current: a stale one could call unpushed work safe
     contained = git(workdir, "branch", "-r", "--contains", "HEAD").stdout.strip()
     if contained:
         return {"pushed": False, "wip_branch": None, "skipped": skipped}

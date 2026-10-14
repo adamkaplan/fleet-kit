@@ -87,7 +87,8 @@ class Kube:
         if p.returncode != 0:
             if ok_missing and "NotFound" in p.stderr:
                 return None
-            raise CloudError("kubectl %s: %s" % (args[0], (p.stderr.strip().splitlines() or ["failed"])[-1]))
+            last = (p.stderr.strip().splitlines() or ["failed"])[-1]
+            raise CloudError("kubectl %s: %s" % (args[0], re.sub(r"[^\x20-\x7e]", "?", last)[:300]))
         return p.stdout
 
     def apply(self, obj):
@@ -158,9 +159,12 @@ class Launcher:
         os.makedirs(os.path.dirname(self.audit_path), exist_ok=True)
         line = {"ts": iso(self.clock()), "worker": worker, "runtime_id": runtime_id, "action": action,
                 "cost_estimate_usd": cost, "ok": ok, "actor": getpass.getuser(), "reason": reason}
-        fd = os.open(self.audit_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-        with os.fdopen(fd, "a") as f:
-            f.write(json.dumps(line, sort_keys=True) + "\n")
+        try:
+            fd = os.open(self.audit_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            with os.fdopen(fd, "a") as f:  # one short O_APPEND write: atomic enough for one line, the chosen guarantee
+                f.write(json.dumps(line, sort_keys=True) + "\n")
+        except OSError as e:
+            print("cloud-worker: WARNING: the action ran but its audit line could not be written: %s" % e, file=sys.stderr)
 
     def cost(self, pod):
         hours = (self.clock() - parse_iso(ann(pod, "started"))).total_seconds() / 3600
@@ -351,7 +355,7 @@ class Launcher:
                 with open(os.path.join(rd, ann(pod, "worker") + ".json")) as f:
                     hard = parse_iso(json.load(f)["hard_deadline"])
             except (OSError, ValueError, KeyError):
-                pass
+                print("cloud-worker: WARNING: no usable record for %s; using the pod's own deadline" % ann(pod, "worker"), file=sys.stderr)
         return min(hard, parse_iso(ann(pod, "max-hard", iso(hard))))  # a record never lengthens a life past the cap
 
     def reap(self):

@@ -416,6 +416,12 @@ class S5EndHook(Base):
         self.assertEqual((code, json.loads(out)["pushed"]), (0, False))
         self.assertEqual(self.run_cli("delete", "coder7")[0], 0)  # gone: idempotent
 
+    def test_stale_remote_ref_does_not_make_unpushed_work_look_safe(self):
+        work, origin = make_repo(self.tmp.name, "r", dirty=False)
+        subprocess.run(["git", "-C", origin, "update-ref", "-d", "refs/heads/main"], check=True)  # gone upstream
+        res = end_hook.run(work, "coder7")
+        self.assertEqual((res["pushed"], res["wip_branch"]), (True, "coder7/wip"))
+
     def test_hook_reports_skipped_secret_files(self):
         work, _ = make_repo(self.tmp.name, "r", dirty=True)
         self.assertEqual(end_hook.run(work, "coder7")["skipped"], [".env"])

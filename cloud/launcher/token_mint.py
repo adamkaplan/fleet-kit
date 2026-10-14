@@ -37,7 +37,11 @@ def mint(endpoint, identity_file=IDENTITY_FILE, out_file=OUT_FILE, now=None, ope
     if life <= 0:
         raise ValueError("the minted token is already expired")
     tmp = out_file + ".new"  # written whole, then renamed: a reader never sees a partial token
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.unlink(tmp)  # a stale or planted file is never reused
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as f:
         f.write(reply["token"])
     os.replace(tmp, out_file)
