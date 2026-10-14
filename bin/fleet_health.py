@@ -9,15 +9,21 @@ Loaded by path from bin/fleet-switchboard (load_fleet_health), like plan_ledger.
 Real movement of an ask: a push, a pull request opened or merged, a plan approved, a report naming it. A comment is not movement.
 A figure whose source cannot be read is None (`not recorded`), never zero, and an orchestrator with an unreadable source is never alerted.
 """
+import fcntl
 import json
 import os
 import re
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
 STATE_FILE = "load.json"
 MOVES_FILE = "ask-moves.jsonl"
 MOVES_KEEP_SECONDS = 24 * 3600
+MOVES_READ_BYTES = 4 << 20       # the end of the movement file that is read: it is fed from outside, so it is never read whole
+MOVES_NUMBERS_MAX = 20           # issue numbers kept from one pull request body
+MOVES_ROWS_MAX = 20000
+ARCHIVE_READ_BYTES = 64 << 20    # per audit archive read by the replay
 AUDIT_TAIL_BYTES = 8 << 20
 HISTORY_DAYS = 3                 # finished days of the hourly series kept for the replay
 READ_BUDGET = 10                 # GitHub reads of asks lists in any hour, for the whole fleet
@@ -64,48 +70,72 @@ def move_rows(event, payload, repo, now, closing=lambda text: []):
         kind = "pr_merged"
     else:
         return []
-    numbers = [number] + [n for n in closing(pr.get("body")) if n != number]
+    numbers = ([number] + [n for n in closing(pr.get("body")) if n != number])[:MOVES_NUMBERS_MAX]
     return [{"at": now, "repo": repo, "numbers": numbers, "kind": kind}]
+
+
+@contextmanager
+def _moves_lock(state_dir):
+    """One flock for the append (the webhook thread) and the prune's read-and-replace (the daemon pass): a row appended meanwhile is not lost."""
+    fd = os.open(str(Path(state_dir) / (MOVES_FILE + ".lock")), os.O_WRONLY | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "w") as guard:
+        fcntl.flock(guard, fcntl.LOCK_EX)
+        yield
 
 
 def append_moves(state_dir, rows):
     if not rows:
         return
-    fd = os.open(str(Path(state_dir) / MOVES_FILE), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-    with os.fdopen(fd, "a") as handle:
-        handle.write("".join(json.dumps(row, sort_keys=True) + "\n" for row in rows))
+    with _moves_lock(state_dir):
+        path = Path(state_dir) / MOVES_FILE
+        try:   # a torn last line (a crash mid-append) must not swallow the next row
+            with open(str(path), "rb") as tail:
+                tail.seek(0, os.SEEK_END)
+                torn = tail.tell() > 0 and (tail.seek(-1, os.SEEK_END) or tail.read(1)) != b"\n"
+        except OSError:
+            torn = False
+        fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a") as handle:
+            handle.write("\n" if torn else "")
+            handle.write("".join(json.dumps(row, sort_keys=True) + "\n" for row in rows))
 
 
 def read_moves(state_dir, since):
     path = Path(state_dir) / MOVES_FILE
     rows = []
     try:
-        for line in path.read_text().splitlines():
+        with open(str(path), "rb") as handle:   # only the end of the file: a torn first line is dropped
+            size = handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, size - MOVES_READ_BYTES))
+            lines = handle.read().decode("utf-8", "replace").splitlines()[1 if size > MOVES_READ_BYTES else 0:]
+        for line in lines:
             try:
                 row = json.loads(line)
             except ValueError:
                 continue
             if isinstance(row, dict) and isinstance(row.get("at"), (int, float)) and row["at"] >= since and isinstance(row.get("numbers"), list):
                 rows.append(row)
+        rows = rows[-MOVES_ROWS_MAX:]
     except OSError:
         pass
     return rows
 
 
 def prune_moves(state_dir, now):
-    """Drop rows older than a day, when the file has any (a rewrite, atomic)."""
-    rows = read_moves(state_dir, now - MOVES_KEEP_SECONDS)
+    """Drop rows older than a day, when the file has any (a rewrite, atomic, under the same lock as the append)."""
     path = Path(state_dir) / MOVES_FILE
-    try:
-        if len(path.read_text().splitlines()) <= len(rows) + 200:
+    with _moves_lock(state_dir):
+        rows = read_moves(state_dir, now - MOVES_KEEP_SECONDS)
+        try:
+            if len(path.read_bytes().splitlines()) <= len(rows) + 200 and path.stat().st_size <= MOVES_READ_BYTES:
+                return
+        except OSError:
             return
-    except OSError:
-        return
-    temp = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))
-    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as handle:
-        handle.write("".join(json.dumps(r, sort_keys=True) + "\n" for r in rows))
-    os.replace(str(temp), str(path))
+        temp = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))
+        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write("".join(json.dumps(r, sort_keys=True) + "\n" for r in rows))
+        os.replace(str(temp), str(path))
 
 
 def _epoch(text):
@@ -426,7 +456,7 @@ def _audit_events(state_dir, first, last, events):
     for path in files:
         try:
             with (gzip.open(str(path), "rt", encoding="utf-8", errors="replace") if path.suffix == ".gz" else open(str(path), encoding="utf-8", errors="replace")) as handle:
-                for line in handle:
+                for line in handle.read(ARCHIVE_READ_BYTES).splitlines():   # an operator's replay: bounded per file
                     if not any(e in line for e in events):
                         continue
                     try:
@@ -482,7 +512,7 @@ def reconstruct_day(state_dir, day, cfg=DEFAULTS):
         hours = {}
         for hour in range(24):
             end = start + (hour + 1) * 3600
-            present, cfg_asks = [], []
+            present = []
             for (repo, number), seen in asks.items():
                 seen = [t for t in seen if end - RECONSTRUCT_WINDOW <= t < end]
                 if seen:   # with no pushes in the audit, the baseline is the newest mention of any kind, so a quiet ask is not an alarm for what the audit cannot see

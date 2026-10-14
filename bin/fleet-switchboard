@@ -12484,8 +12484,8 @@ class GitHubHub:
         self.note_awaiting_event(event, repo, payload)
         try:   # #348: a push, a PR opened or merged is real movement of the ask it closes: one small row, for the load figure
             load_fleet_health().append_moves(self.state_dir, load_fleet_health().move_rows(event, payload, repo, self.now(), closing_numbers))
-        except Exception:
-            pass
+        except Exception as err:   # the load figure then under-counts movement: say so in the audit, never fail the delivery
+            self._audit("load.moves_failed", repo, {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
         self._audit("github.received", repo, {"event": event, "delivery": _header(headers, "X-GitHub-Delivery"),
                                               "keys": [_one_line(item.key, 80) for item in items[:5]], "count": len(items)})   # ids, not bodies: the first few of them
         return 202, "accepted"

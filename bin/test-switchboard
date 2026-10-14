@@ -6466,6 +6466,24 @@ class TestGithubReceive(Base):
     def rejected(self):
         return [e for e in self.rig.world.audit() if e["event"] == "github.rejected"]
 
+    def pr_payload(self, action, **pr):
+        return {"action": action, "pull_request": dict({"id": 91, "number": 9, "body": "Closes #12", "state": "open", "title": "t"}, **pr),
+                "repository": {"full_name": GH_REPO}}
+
+    def test_a_pull_request_push_and_a_comment_through_the_hub_leave_one_movement_row(self):
+        self.assertEqual(self.post()[0], 202)
+        self.assertEqual(self.post("pull_request", self.pr_payload("synchronize"))[0], 202)
+        rows = sb.load_fleet_health().read_moves(str(self.rig.world.state), 0)
+        self.assertEqual([(r["kind"], r["numbers"], r["repo"]) for r in rows], [("push", [9, 12], GH_REPO)])
+        self.assertEqual(stat.S_IMODE((self.rig.world.state / "ask-moves.jsonl").stat().st_mode), 0o600)
+
+    def test_a_movement_row_that_cannot_be_written_is_audited_and_the_delivery_still_succeeds(self):
+        with mock.patch.object(sb.load_fleet_health(), "append_moves", side_effect=OSError("disk full")):
+            self.assertEqual(self.post("pull_request", self.pr_payload("opened"))[0], 202)
+        failed = [e for e in self.rig.world.audit() if e["event"] == "load.moves_failed"]
+        self.assertEqual(len(failed), 1)
+        self.assertIn("disk full", failed[0]["detail"]["error"])
+
     def test_a_signed_event_is_accepted_and_queued_by_its_object_id(self):
         self.assertEqual(self.post()[0], 202)
         self.assertEqual(self.rig.keys(), ["github.comment:5001"])
@@ -44666,8 +44684,13 @@ class TestLoadAlert(Base):
         self.assertIn("asks 1, stalled 0", lines[1])
         self.assertIn("coders 1 busy 0 idle", lines[1])
         self.assertEqual(self.health.status_lines(str(self.state_dir / "nowhere"), self.T0), [])
-        report = {"load": lines}
-        self.assertTrue(any("orch-a" in l for l in (("      " + x) for x in report["load"])))
+        status = sb.format_status(dict(self.status_skeleton(), load=lines))
+        self.assertEqual(len([l for l in status.splitlines() if "asks 1, stalled 0" in l or "asks 0, stalled 0" in l]), 2)
+
+    def status_skeleton(self):
+        report = sb.collect_status(runner=lambda *a, **k: types.SimpleNamespace(returncode=1, stdout="", stderr=""), now=lambda: self.T0)
+        report["load"] = []
+        return report
 
     def stalled_world(self, count=2):
         self.asks = {1: list(range(1, count + 1))}
@@ -44758,7 +44781,7 @@ class TestLoadAlert(Base):
             return self.woken[0] + "\n" + "\n".join(self.health.status_lines(str(self.state_dir), 0))
         self.assertEqual(render("orch-a").replace("orch-a", "N"), render("orch-b").replace("orch-b", "N"))
 
-    def test_the_daemon_tick_wakes_the_chief_of_staff_by_a_reminder(self):
+    def test_the_daemon_tick_without_an_ask_repo_wakes_nobody_and_says_so(self):
         self.asks = {1: [1, 2]}
         engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.T0, audit=None, actor="daemon", intents=None,
                                        config={"load_alert": self.health.validate({"enabled": True}, "x")})
@@ -44768,6 +44791,45 @@ class TestLoadAlert(Base):
         self.assertEqual(sb.load_tick(engine, discovery), [])   # no ask repo: the asks are unreadable, so no wake
         self.assertIn("no ask repo", " ".join(json.loads((self.state_dir / "load.json").read_text())["problems"]))
         self.assertEqual(sb.read_reminders(str(self.state_dir)), [])
+
+    def test_the_daemon_tick_turns_a_crossing_into_one_reminder_and_one_audit_line(self):
+        clock = [self.T0]
+        audited = []
+        audit = types.SimpleNamespace(append=lambda actor, event, subject, detail: audited.append((event, subject, detail)))
+        intents = types.SimpleNamespace(repo="acme/widget", open_asks=lambda charter, repo: [types.SimpleNamespace(repo="acme/widget", number=n) for n in (1, 2)])
+        engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: clock[0], audit=audit, actor="daemon", intents=intents,
+                                       config={"load_alert": self.health.validate({"enabled": True}, "x")})
+        seen = lambda name, fleet, status: types.SimpleNamespace(name=name, fleet=fleet, status=status)
+        discovery = types.SimpleNamespace(agents={"orch": seen("orch", {"role": "orchestrator", "charter": 1, "repo": "acme/widget"}, "idle"),
+                                                  "cos": seen("cos", {"role": "chief-of-staff"}, "idle")})
+        sb.load_tick(engine, discovery)
+        for hours in (3, 4):
+            clock[0] = self.T0 + hours * 3600
+            sb.load_tick(engine, discovery)
+        reminders = sb.read_reminders(str(self.state_dir))
+        self.assertEqual([r["to"] for r in reminders], ["cos"])
+        self.assertIn("orch is overloaded", reminders[0]["text"])
+        self.assertIn("2 with no real movement in 2 h", reminders[0]["text"])
+        self.assertEqual([a[0] for a in audited], ["load.alert"])
+
+    def test_the_move_log_survives_torn_lines_a_burst_and_a_prune(self):
+        d = str(self.state_dir)
+        (self.state_dir / "ask-moves.jsonl").write_text('{"at": 1, "numbers": [1], "repo": "r"}\nnot json\n{"at": 2')
+        self.health.append_moves(d, [{"at": self.T0, "repo": "r", "numbers": [3], "kind": "push"}])
+        self.assertEqual([r["numbers"] for r in self.health.read_moves(d, 0)], [[1], [3]])
+        self.health.append_moves(d, [{"at": 5, "repo": "r", "numbers": [9], "kind": "push"} for _ in range(300)])
+        self.health.prune_moves(d, self.T0)
+        self.assertEqual([r["numbers"] for r in self.health.read_moves(d, 0)], [[3]])
+        body = " ".join("Closes #%d." % n for n in range(1, 60))
+        row = self.health.move_rows("pull_request", {"action": "opened", "pull_request": {"number": 7, "body": body}}, "r", 1, sb.closing_numbers)[0]
+        self.assertEqual(len(row["numbers"]), self.health.MOVES_NUMBERS_MAX)
+
+    def test_unreadable_decisions_and_a_torn_audit_tail_are_not_zero_and_not_fatal(self):
+        self.assertIsNone(self.health.decisions_waiting(str(self.state_dir)))
+        (self.state_dir / "audit.jsonl").write_text("x" * 100 + "\n")
+        with mock.patch.object(self.health, "AUDIT_TAIL_BYTES", 40):
+            self.assertEqual(self.health.audit_moves(str(self.state_dir), 0), [])
+        self.assertIsNone(self.health.audit_moves(str(self.state_dir / "nowhere"), 0))
 
     def test_the_replay_of_a_recorded_overloaded_day_says_when_it_would_have_fired(self):
         self.asks = {1: [1, 2]}
@@ -44815,12 +44877,6 @@ class TestLoadAlert(Base):
         self.tick(self.T0 + 60, {"o": self.orch(busy=1, charter=1)})
         self.assertEqual((self.state_dir / "load.json").stat().st_mtime_ns, before)
 
-    def test_a_pull_request_webhook_leaves_one_movement_row(self):
-        hub = sb.GitHubHub.__new__(sb.GitHubHub)
-        rows = self.health.move_rows("pull_request", {"action": "synchronize", "pull_request": {"number": 9, "body": "fixes #4"}}, "acme/widget", self.T0, sb.closing_numbers)
-        self.health.append_moves(str(self.state_dir), rows)
-        self.assertEqual(self.health.read_moves(str(self.state_dir), 0)[0]["numbers"], [9, 4])
-        self.assertEqual(stat.S_IMODE((self.state_dir / "ask-moves.jsonl").stat().st_mode), 0o600)
 
 
 def main(argv):
