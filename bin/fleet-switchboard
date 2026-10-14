@@ -4091,7 +4091,10 @@ class Switchboard:
         fact = Fact("send:%s:%s" % (sender, uuid.uuid4().hex[:16]), recipient, "send", text, now,
                     issue=None if issue is None else int(issue), batch=False, sender=sender,
                     repo=repo or issue_repo(issue))
-        return self.send_fact(fact, discovery, now, interrupt=interrupt)
+        outcome = self.send_fact(fact, discovery, now, interrupt=interrupt)
+        if outcome.get("sent") and sender != recipient and sender in discovery.agents and self.state_dir is not None:
+            record_last_send(self.state_dir, sender, recipient, now)   # beside `report`'s record: both count as being in touch with that boss
+        return outcome
 
     def repos_in_play(self):
         """The repos messages may be about: every watched repo. With one, a message names `#2`; with
@@ -5315,7 +5318,7 @@ PANE_SETTLE_SECONDS = 5      # the two looks before a close are this far apart: 
 PANE_READ_MAX = 8000         # characters of a pane's screen kept
 PANE_FORGET_SECONDS = 3 * 86400   # a dead agent nobody repaired is forgotten (and stops waking cos) after this
 RETIRED_FILE = "retired.json"            # {name: {"at", "by", "reason", "session", "auto"}}: finished workers, skipped by detection and reattach
-LAST_REPORT_FILE = "last-reports.json"   # {sender: {"state", "at"}}: the last report each worker made (written by `report`, read by the daemon)
+LAST_REPORT_FILE = "last-reports.json"   # {sender: {"state", "at", "send_to": {recipient: epoch}}}: the last report each worker made and the last send to each recipient (written by `report` and `send`, read by the daemon); an entry may hold only `send_to`
 RETIRED_SHOW_DAYS = 7                    # a retired agent is listed once in `status` as retired, then dropped after this many days
 PANE_HEALTH_FILE = "pane-health.json"
 PANE_CHECK_SECONDS = 60      # a pane is looked at again after this
@@ -5482,6 +5485,35 @@ def read_retired(state_dir):
     return _read_small(state_dir, RETIRED_FILE)
 
 
+def _prune_last_reports(data):
+    """Bounded: the 500 entries with the oldest last sign of life go."""
+    if len(data) > 500:
+        stamp = lambda k: max([data[k].get("at", 0)] + list((data[k].get("send_to") or {}).values()))
+        for old in sorted(data, key=stamp)[:len(data) - 500]:
+            data.pop(old, None)
+
+
+def record_last_send(state_dir, sender, recipient, now):
+    """Remember that `sender` last SENT something to `recipient` (`send_to: {recipient: epoch}`, beside the last report's `state` and `at`, which it never
+    changes; at most 8 recipients kept): a worker that messages its boss is in touch, which the overdue-checkpoint check counts as reporting to THAT boss
+    even where no transcript is read (v2_light). Best effort, under a lock; never raises into `send`."""
+    try:
+        with agent_lock(state_dir, "files", seconds=2):
+            data = _read_small(state_dir, LAST_REPORT_FILE)
+            entry = dict(data.get(sender) or {})
+            sends = {k: v for k, v in (entry.get("send_to") or {}).items() if isinstance(k, str) and _is_number(v)}
+            sends[recipient] = int(now)
+            for old in sorted(sends, key=sends.get)[:max(0, len(sends) - 8)]:
+                sends.pop(old, None)
+            entry["send_to"] = sends
+            data[sender] = entry
+            _prune_last_reports(data)
+            _write_small(state_dir, LAST_REPORT_FILE, data)
+        return True
+    except Exception:
+        return False
+
+
 def record_last_report(state_dir, sender, state, now):
     """Remember the last report `sender` made (state and time): what lets the daemon tell a worker its boss closed on purpose after its final `done`
     from one that died. Best effort, under a lock, never raises into `report`. Returns whether it was written: a failure is the SAFE direction (the
@@ -5489,10 +5521,11 @@ def record_last_report(state_dir, sender, state, now):
     try:
         with agent_lock(state_dir, "files", seconds=2):
             data = _read_small(state_dir, LAST_REPORT_FILE)
-            data[sender] = {"state": state, "at": int(now)}
-            if len(data) > 500:   # bounded: the oldest go
-                for old in sorted(data, key=lambda k: data[k].get("at", 0))[:len(data) - 500]:
-                    data.pop(old, None)
+            entry = {"state": state, "at": int(now)}
+            if isinstance((data.get(sender) or {}).get("send_to"), dict):
+                entry["send_to"] = data[sender]["send_to"]   # a report does not forget the last sends
+            data[sender] = entry
+            _prune_last_reports(data)
             _write_small(state_dir, LAST_REPORT_FILE, data)
         return True
     except Exception:
@@ -5500,7 +5533,13 @@ def record_last_report(state_dir, sender, state, now):
             try:
                 with agent_lock(state_dir, "files", seconds=1):
                     data = _read_small(state_dir, LAST_REPORT_FILE)
-                    if data.pop(sender, None) is not None:
+                    stale = data.get(sender)
+                    if stale is not None:   # the stale `done` goes; the record of sends stays
+                        sends = stale.get("send_to")
+                        if isinstance(sends, dict) and sends:
+                            data[sender] = {"send_to": sends}
+                        else:
+                            data.pop(sender, None)
                         _write_small(state_dir, LAST_REPORT_FILE, data)
             except Exception:
                 pass
@@ -11122,6 +11161,29 @@ class ReminderFacts:
                 return "%s is %s" % (ref, state)
         return None
 
+    def last_report(self, worker, boss=None):
+        """When `worker` last made a report (to anyone) or sent a message to `boss` (epoch seconds, from `last-reports.json`), or None. A time in the
+        future is no sign of life: a damaged or forged record cannot silence the wake for good."""
+        try:
+            entry = _read_small(self.state_dir, LAST_REPORT_FILE).get(worker, {})
+            sends = entry.get("send_to") if isinstance(entry.get("send_to"), dict) else {}
+            times = [entry.get("at"), sends.get(boss) if isinstance(boss, str) else None]
+        except (OSError, AttributeError):
+            return None
+        now = self.engine.now() if self.engine else time.time()
+        times = [float(t) for t in times if _is_number(t) and t <= now + 60]
+        return max(times) if times else None
+
+    def overdue_text(self, item):
+        """The wake's text with the fact the boss needs: when the worker last reported, or that it has not since the launch."""
+        worker, since = item["condition"].get("unless_report_from"), item["condition"].get("since", 0)
+        last = self.last_report(worker, item["to"]) if isinstance(worker, str) else None
+        if last is None:
+            tail = "no report from %s since launch" % _plain(worker, 60)
+        else:
+            tail = "last report from %s %s ago%s" % (_plain(worker, 60), _age_text(max(0, int(self.engine.now() - last))), "" if not _is_number(since) or last >= since else " (before this launch)")
+        return "%s (%s)" % (item["text"], tail)
+
     def verdict(self, item):
         """For a due conditional reminder: None (cannot tell yet: it stays), "deliver", or the reason to drop it.
         One read of the boss's transcript and inbox, and only for a reminder that is due and has a condition."""
@@ -11142,6 +11204,9 @@ class ReminderFacts:
                 self.engine.audit.append(self.engine.actor, "reminder.condition_unusable", item["to"],
                                          {"id": item["id"]})
             return "deliver"
+        last = self.last_report(worker, item["to"])
+        if last is not None and last >= since:   # the durable record `report` writes for EVERY report (a rider, a direct one, to any boss): it needs no read of the boss's transcript, which v2_light never makes and a delivered rider no longer shows
+            return "%s reported to its boss since the launch (%s ago)" % (worker, _age_text(max(0, int(self.engine.now() - last))))
         if boss is None:
             return None
         try:
@@ -11170,7 +11235,8 @@ class ReminderFacts:
                         self.engine.audit.append(self.engine.actor, "reminder.drop", item["to"],
                                                  {"id": item["id"], "why": found})
                     continue
-            facts.append(Fact("reminder:" + item["id"], item["to"], "reminder", item["text"], item["at"],
+            text = self.overdue_text(item) if isinstance(item.get("condition"), dict) and isinstance(item["condition"].get("unless_report_from"), str) and self.engine else item["text"]
+            facts.append(Fact("reminder:" + item["id"], item["to"], "reminder", text, item["at"],
                               issue=item.get("issue"), batch=False, sender=item.get("from"), repo=item.get("repo")))
         return facts
 
