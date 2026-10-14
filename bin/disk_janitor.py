@@ -71,16 +71,24 @@ def safe_dir(path):
     real = os.path.realpath(str(path))
     if len(Path(real).parts) < 3 or real == os.path.realpath(os.path.expanduser("~")):
         return False, "%s is too close to the root or the home directory to clean" % path
+    import tempfile
+    base = os.path.realpath(tempfile.gettempdir())
+    if real != base and not real.startswith(base.rstrip("/") + "/"):
+        return False, "%s is not under the system temp directory (%s): the janitor only cleans there" % (path, base)
+    if real == base:
+        return False, "%s is the system temp directory itself: name a folder inside it" % path
     return True, ""
 
 
 def named_text(state_dir):
-    """The text of the fleet's own records: what a path must not occur in. Bounded; unreadable files are skipped."""
-    parts, total = [], 0
+    """(text, complete): the text of the fleet's own records, which a path must not occur in. A big file is read by its TAIL (by design: records older than
+    that are not seen, and the docs say so). `complete` is False when the directory cannot be listed, a record cannot be read or the total limit was
+    reached: the caller then judges NOTHING (an entry the records name must never look unnamed because a record was unreadable)."""
+    parts, total, complete = [], 0, True
     try:
         names = sorted(os.listdir(str(state_dir)))
     except OSError:
-        return ""
+        return "", False
     for name in names:
         if not (name.endswith(".json") or name.endswith(".jsonl")):
             continue
@@ -94,44 +102,51 @@ def named_text(state_dir):
                     handle.seek(info.st_size - STATE_FILE_BYTES)
                 data = handle.read(STATE_FILE_BYTES).decode("utf-8", "replace")
         except OSError:
+            complete = False
             continue
         total += len(data)
         parts.append(data)
         if total > STATE_TOTAL_BYTES:
-            break
-    return "\n".join(parts)
+            return "\n".join(parts), False
+    return "\n".join(parts), complete
 
 
-def _newest(path, deadline):
-    """(newest mtime under path, complete): a bounded walk that never follows a link."""
+def _newest(path, deadline, clock=time.monotonic):
+    """(newest mtime under path, complete): a bounded walk that never follows a link and never crosses onto another device. Incomplete when a
+    directory cannot be read, the walk is too big or too slow, or another device is mounted inside."""
     try:
         info = os.lstat(path)
     except OSError:
         return None, False
-    newest, seen, pending = info.st_mtime, 0, []
+    newest, seen, pending, complete = info.st_mtime, 0, [], True
     if stat.S_ISDIR(info.st_mode):
         pending.append(path)
     while pending:
         try:
-            scan = os.scandir(pending.pop())
+            scan_ = os.scandir(pending.pop())
         except OSError:
+            complete = False
             continue
-        with scan:
-            for entry in scan:
+        with scan_:
+            for entry in scan_:
                 seen += 1
-                if seen > WALK_ENTRIES or time.monotonic() > deadline:
+                if seen > WALK_ENTRIES or clock() > deadline:
                     return newest, False
                 try:
                     st = entry.stat(follow_symlinks=False)
                 except OSError:
+                    complete = False
                     continue
                 newest = max(newest, st.st_mtime)
                 if stat.S_ISDIR(st.st_mode):
+                    if st.st_dev != info.st_dev:
+                        complete = False
+                        continue
                     pending.append(entry.path)
-    return newest, True
+    return newest, complete
 
 
-def _size(path):
+def _size(path, deadline, clock=time.monotonic):
     try:
         info = os.lstat(path)
     except OSError:
@@ -139,13 +154,13 @@ def _size(path):
     total = info.st_size
     if stat.S_ISDIR(info.st_mode):
         stack, seen = [path], 0
-        while stack and seen <= WALK_ENTRIES:
+        while stack and seen <= WALK_ENTRIES and clock() <= deadline:
             try:
-                scan = os.scandir(stack.pop())
+                scan_ = os.scandir(stack.pop())
             except OSError:
                 continue
-            with scan:
-                for entry in scan:
+            with scan_:
+                for entry in scan_:
                     seen += 1
                     try:
                         st = entry.stat(follow_symlinks=False)
@@ -157,51 +172,65 @@ def _size(path):
     return total
 
 
-def scan(temp_dir, state_dir, now, cfg, uid=None, clock=time.monotonic):
-    """[{"name", "path", "action": "remove" | "keep", "why", "size", "age_days"}] for each top-level entry, sorted by name. Reads only."""
+def _forms(value):
+    """The raw text and its JSON-escaped form: a record stores a path with its backslashes and non-ASCII characters escaped."""
+    import json
+    return {value, json.dumps(value)[1:-1], json.dumps(value, ensure_ascii=False)[1:-1]}
+
+
+def judge(path, text, now, cfg, uid=None, clock=time.monotonic):
+    """One top-level entry: {"name", "path", "action": "remove" | "keep", "why", "size", "age_days", "ident"}. `ident` is (device, inode, newest mtime):
+    run compares it again right before removing. Reads only."""
     uid = os.getuid() if uid is None else uid
-    cutoff = now - cfg["days"] * 86400
-    text = named_text(state_dir)
+    name = os.path.basename(path)
+    row = {"name": name, "path": path, "action": "keep", "why": "", "size": 0, "age_days": 0, "ident": None}
+    try:
+        info = os.lstat(path)
+    except OSError:
+        row["why"] = "vanished"
+        return row
+    if info.st_uid != uid:
+        row["why"] = "owned by another user"
+        return row
     keep = list(cfg.get("keep") or [])
+    if any(fnmatch.fnmatchcase(name, g) or fnmatch.fnmatchcase(path, g) for g in keep):
+        row["why"] = "matches a keep glob"
+        return row
+    if stat.S_ISDIR(info.st_mode) and os.path.lexists(os.path.join(path, KEEP_MARKER)):
+        row["why"] = "holds a %s marker" % KEEP_MARKER
+        return row
     deadline = clock() + WALK_SECONDS
-    rows = []
+    newest, complete = _newest(path, deadline, clock)
+    if newest is None:
+        row["why"] = "cannot be read"
+        return row
+    row["age_days"] = int((now - newest) / 86400)
+    if not complete:
+        row["why"] = "too many files, too slow, unreadable or another device inside: kept"
+        return row
+    if newest > now - cfg["days"] * 86400:
+        row["why"] = "newer than %d day(s)" % cfg["days"]
+        return row
+    if any(form in text for form in _forms(path)) or (len(name) >= MIN_NAME and any(form in text for form in _forms(name))):
+        row["why"] = "named by the fleet's records"
+        return row
+    row["action"], row["size"] = "remove", _size(path, deadline, clock)
+    row["ident"] = (info.st_dev, info.st_ino, newest)
+    return row
+
+
+def scan(temp_dir, state_dir, now, cfg, uid=None, clock=time.monotonic):
+    """[judge rows] for each top-level entry, sorted by name; every entry is kept when the fleet's records could not be read in full. Reads only."""
+    text, complete = named_text(state_dir)
     try:
         names = sorted(os.listdir(str(temp_dir)))
     except OSError:
-        return rows
-    for name in names:
-        path = os.path.join(str(temp_dir), name)
-        row = {"name": name, "path": path, "action": "keep", "why": "", "size": 0, "age_days": 0}
-        rows.append(row)
-        try:
-            info = os.lstat(path)
-        except OSError:
-            row["why"] = "vanished"
-            continue
-        if info.st_uid != uid:
-            row["why"] = "owned by another user"
-            continue
-        if any(fnmatch.fnmatchcase(name, g) or fnmatch.fnmatchcase(path, g) for g in keep):
-            row["why"] = "matches a keep glob"
-            continue
-        if stat.S_ISDIR(info.st_mode) and os.path.lexists(os.path.join(path, KEEP_MARKER)):
-            row["why"] = "holds a %s marker" % KEEP_MARKER
-            continue
-        newest, complete = _newest(path, deadline)
-        if newest is None:
-            row["why"] = "cannot be read"
-            continue
-        row["age_days"] = int((now - newest) / 86400)
-        if not complete:
-            row["why"] = "too many files (or too slow) to judge: kept"
-            continue
-        if newest > cutoff:
-            row["why"] = "newer than %d day(s)" % cfg["days"]
-            continue
-        if path in text or (len(name) >= MIN_NAME and name in text):
-            row["why"] = "named by the fleet's records"
-            continue
-        row["action"], row["size"] = "remove", _size(path)
+        return []
+    rows = [judge(os.path.join(str(temp_dir), n), text, now, cfg, uid, clock) for n in names]
+    if not complete:
+        for row in rows:
+            if row["action"] == "remove":
+                row["action"], row["why"] = "keep", "the fleet's records could not be read in full: nothing is judged"
     return rows
 
 
@@ -217,13 +246,15 @@ def remove_entry(path):
         os.unlink(path)
 
 
-def run(temp_dir, state_dir, now, cfg, apply, audit, uid=None):
-    """Returns (lines, removed, kept). `audit(name, detail)` is called once for each removal that happened."""
+def run(temp_dir, state_dir, now, cfg, apply, audit, uid=None, clock=time.monotonic):
+    """Returns (lines, removed, kept). `audit(name, detail)` is called once for each removal that happened; if it raises, removing STOPS and the line says so.
+    Right before each removal the entry is judged again from the records as they are then, and removed only if it is still eligible and is the same
+    entry (device, inode and newest modification time)."""
     lines, removed, kept = [], 0, 0
     ok, why = safe_dir(temp_dir)
     if not ok:
         return ["refused: %s" % why], 0, 0
-    rows = scan(temp_dir, state_dir, now, cfg, uid)
+    rows = scan(temp_dir, state_dir, now, cfg, uid, clock)
     for row in rows:
         if row["action"] != "remove":
             kept += 1
@@ -235,6 +266,12 @@ def run(temp_dir, state_dir, now, cfg, apply, audit, uid=None):
             lines.append("would remove %s (%d day(s) old, %d bytes)" % (row["name"], row["age_days"], row["size"]))
             removed += 1
             continue
+        again_text, again_complete = named_text(state_dir)
+        again = judge(row["path"], again_text, now, cfg, uid, clock)
+        if not again_complete or again["action"] != "remove" or again["ident"] != row["ident"] or not safe_dir(temp_dir)[0]:
+            lines.append("kept %s: it changed since the scan" % row["name"])
+            kept += 1
+            continue
         try:
             remove_entry(row["path"])
         except OSError as err:
@@ -242,9 +279,13 @@ def run(temp_dir, state_dir, now, cfg, apply, audit, uid=None):
             kept += 1
             continue
         removed += 1
-        audit(row["name"], {"path": row["path"], "age_days": row["age_days"], "bytes": row["size"]})
         lines.append("removed %s (%d day(s) old, %d bytes)" % (row["name"], row["age_days"], row["size"]))
+        try:
+            audit(row["name"], {"path": row["path"], "age_days": row["age_days"], "bytes": row["size"]})
+        except Exception as err:   # a record that cannot be written stops the removing: nothing goes unrecorded after this one
+            lines.append("STOPPED: %s was removed but its audit line could not be written (%s)" % (row["name"], err))
+            return lines, removed, kept
     for row in rows:
-        if row["action"] == "keep" and row["why"] not in ("newer than %d day(s)" % cfg["days"],):
+        if row["action"] == "keep" and not row["why"].startswith("newer than"):
             lines.append("kept %s: %s" % (row["name"], row["why"]))
     return lines, removed, kept

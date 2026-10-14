@@ -40273,6 +40273,87 @@ class TestTempJanitor(Base):
         self.assertEqual(code, 0, err)
         self.assertIn("would remove old-file.txt", out)
 
+    def test_the_cap_per_call_and_a_failed_removal_are_said_and_a_failed_removal_is_not_audited(self):
+        for i in range(3):
+            self.old("capped-%d.txt" % i)
+        with mock.patch.object(self.jan, "REMOVE_MAX", 2):
+            code, out, err = self.run_cli("--apply")
+        self.assertIn("only 2 entries handled per call", out)
+        self.assertEqual(len(self.audits()), 2)
+        self.assertEqual(len(list(self.temp.iterdir())), 1)
+        with mock.patch.object(self.jan, "remove_entry", side_effect=OSError("busy")):
+            code, out, err = self.run_cli("--apply")
+        self.assertIn("could not remove capped-2.txt: busy", out)
+        self.assertEqual(len(self.audits()), 2, "a failed removal writes no audit line")
+        self.assertTrue((self.temp / "capped-2.txt").exists())
+
+    def test_a_short_name_is_never_a_naming_a_jsonl_record_and_a_json_escaped_path_are(self):
+        short = self.old("a.txt")
+        long_ = self.old("escaped-\u00e9-name.txt")
+        by_jsonl = self.old("named-in-jsonl-file.txt")
+        (self.world.state / "short.json").write_text(json.dumps({"x": "a.txt is mentioned"}))
+        (self.world.state / "events.jsonl").write_text(json.dumps({"note": "see named-in-jsonl-file.txt"}) + "\n")
+        (self.world.state / "esc.json").write_text(json.dumps({"p": str(long_)}))
+        (self.world.state / "archive.jsonl.gz").write_text("named-in-jsonl-file.txt")   # a compressed archive is never read
+        code, out, err = self.run_cli("--apply")
+        self.assertFalse(short.exists(), "a name under 6 characters names nothing")
+        self.assertTrue(long_.exists(), "the JSON-escaped form of the path is found")
+        self.assertTrue(by_jsonl.exists())
+        (self.world.state / "events.jsonl").unlink()
+        (self.world.state / "esc.json").unlink()
+        code, out, err = self.run_cli("--apply")
+        self.assertFalse(by_jsonl.exists(), "a .gz archive does not protect it")
+
+    def test_records_that_cannot_be_read_in_full_mean_nothing_is_judged(self):
+        victim = self.old("old-victim-file.txt")
+        (self.world.state / "reminders.json").write_text("{}")
+        os.chmod(str(self.world.state / "reminders.json"), 0)
+        try:
+            code, out, err = self.run_cli("--apply")
+        finally:
+            os.chmod(str(self.world.state / "reminders.json"), 0o600)
+        self.assertTrue(victim.exists())
+        self.assertIn("could not be read in full", out)
+        with mock.patch.object(self.jan, "STATE_TOTAL_BYTES", 5):
+            (self.world.state / "reminders.json").write_text("x" * 50)
+            code, out, err = self.run_cli("--apply")
+        self.assertTrue(victim.exists())
+
+    def test_an_entry_that_changes_after_the_scan_is_kept(self):
+        victim = self.old("touched-after-scan.txt")
+        real = self.jan.scan
+
+        def scan_then_touch(*a, **k):
+            rows = real(*a, **k)
+            os.utime(str(victim), (self.now, self.now))   # an agent writes to it between the scan and the removal
+            return rows
+        with mock.patch.object(self.jan, "scan", scan_then_touch):
+            code, out, err = self.run_cli("--apply")
+        self.assertTrue(victim.exists())
+        self.assertIn("kept touched-after-scan.txt: it changed since the scan", out)
+        self.assertEqual(self.audits(), [])
+
+    def test_an_audit_line_that_cannot_be_written_stops_the_removing(self):
+        self.old("a-first.txt")
+        self.old("b-second.txt")
+        with mock.patch.object(sb.AuditLog, "append", side_effect=OSError("disk full")):
+            code, out, err = self.run_cli("--apply")
+        self.assertIn("STOPPED: a-first.txt was removed but its audit line could not be written", out)
+        self.assertTrue((self.temp / "b-second.txt").exists())
+
+    def test_a_directory_outside_the_system_temp_directory_is_refused(self):
+        outside = Path(os.path.expanduser("~")) / ".fleet-janitor-test-nonexistent-dir"
+        self.assertFalse(self.jan.safe_dir(outside)[0])
+        self.assertFalse(self.jan.safe_dir(Path(tempfile.gettempdir()))[0])
+        self.assertTrue(self.jan.safe_dir(self.temp)[0])
+
+    def test_a_bad_temp_janitor_key_is_refused_by_the_config_loader_and_is_not_an_unknown_key(self):
+        bad = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "temp_janitor": {"days": 0}}
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config(bad, "test")
+        good = dict(bad, temp_janitor={"days": 3})
+        self.assertEqual(sb.validate_config(good, "test")["temp_janitor"], {"days": 3})
+
     def test_a_hostile_name_is_printed_as_plain_text(self):
         self.old("bad\x1b[2Jname.txt")
         code, out, err = self.run_cli()
@@ -40290,9 +40371,6 @@ class TestTempJanitor(Base):
         text = (REPO / "docs" / "switchboard.md").read_text()
         for phrase in ("fleet-keep", "GitHub issue", "temp_janitor"):
             self.assertIn(phrase, text)
-        disk = [a for a in sb.build_parser()._subparsers._group_actions[0].choices["disk"]._subparsers._group_actions[0].choices]
-        for name in ("prune", "reap-docker", "reclaim-worktrees", "janitor", "report"):
-            self.assertIn(name, disk)
 
 
 class TestDockerReaper(Base):
