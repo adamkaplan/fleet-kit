@@ -6673,6 +6673,24 @@ class TestGithubReceive(Base):
     def rejected(self):
         return [e for e in self.rig.world.audit() if e["event"] == "github.rejected"]
 
+    def pr_payload(self, action, **pr):
+        return {"action": action, "pull_request": dict({"id": 91, "number": 9, "body": "Closes #12", "state": "open", "title": "t"}, **pr),
+                "repository": {"full_name": GH_REPO}}
+
+    def test_a_pull_request_push_and_a_comment_through_the_hub_leave_one_movement_row(self):
+        self.assertEqual(self.post()[0], 202)
+        self.assertEqual(self.post("pull_request", self.pr_payload("synchronize"))[0], 202)
+        rows = sb.load_fleet_health().read_moves(str(self.rig.world.state), 0)
+        self.assertEqual([(r["kind"], r["numbers"], r["repo"]) for r in rows], [("push", [9, 12], GH_REPO)])
+        self.assertEqual(stat.S_IMODE((self.rig.world.state / "ask-moves.jsonl").stat().st_mode), 0o600)
+
+    def test_a_movement_row_that_cannot_be_written_is_audited_and_the_delivery_still_succeeds(self):
+        with mock.patch.object(sb.load_fleet_health(), "append_moves", side_effect=OSError("disk full")):
+            self.assertEqual(self.post("pull_request", self.pr_payload("opened"))[0], 202)
+        failed = [e for e in self.rig.world.audit() if e["event"] == "load.moves_failed"]
+        self.assertEqual(len(failed), 1)
+        self.assertIn("disk full", failed[0]["detail"]["error"])
+
     def test_a_signed_event_is_accepted_and_queued_by_its_object_id(self):
         self.assertEqual(self.post()[0], 202)
         self.assertEqual(self.rig.keys(), ["github.comment:5001"])
@@ -10900,7 +10918,7 @@ ROLE_LINE_LIMITS = {"coder": 130, "orchestrator": 178, "chief-of-staff": 162, "c
 # hygiene pointer: coder -2 lines, -100 B (three maxims became one pointer to the standards)
 # #107 follow-up: coder +300 B for the spelled-out fallback and the never-your-own rule
 # `pr-state`: coder +1 line +140 B, orchestrator +1 line +120 B: the one sentence that sends an agent to the daemon's cache instead of a GitHub polling loop
-ROLE_BYTE_LIMITS = {"coder": 7890, "orchestrator": 11010, "chief-of-staff": 11650, "cos-subagent": 3500}
+ROLE_BYTE_LIMITS = {"coder": 7960, "orchestrator": 11010, "chief-of-staff": 11650, "cos-subagent": 3500}
 WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others
 
 
@@ -11138,7 +11156,7 @@ class TestSelfRegisteringCli(unittest.TestCase):
         "decisions": ("cmd_decisions", ("args", "runner", "now")), "comment": ("cmd_comment", ("args", "runner", "now")), "whoami": ("cmd_whoami", ("args", "runner", "now")),
         "pending": ("cmd_pending", ("args", "runner", "now")), "remind": ("cmd_remind", ("args", "runner", "now")), "intent": ("cmd_intent", ("args", "runner", "now")),
         "intents": ("cmd_intents", ("args", "runner", "now")), "import-v1": ("cmd_import_v1", ("args", "runner", "now")), "orders": ("cmd_orders", ("args", "runner", "now")),
-        "labels": ("cmd_labels", ("args", "runner", "now")), "plan": ("cmd_plan", ("args", "runner", "now", "socket_call")),
+        "load-replay": ("cmd_load_replay", ("args", "runner", "now")), "labels": ("cmd_labels", ("args", "runner", "now")), "plan": ("cmd_plan", ("args", "runner", "now", "socket_call")),
         "triage": ("cmd_triage", ("args", "runner", "now"))}
     OLD_ENSURE_ON_USE = ("send", "report", "notice", "launch", "handoff", "comment", "remind", "decisions", "intent", "bootstrap")
     OLD_DIRECT = ("status", "poke", "policy-report", "review-laws", "review", "pr-explain", "impact", "plan", "judge-tool")
@@ -18047,6 +18065,7 @@ class FakeTriageHub:
 
     def __init__(self):
         self.open, self.comments, self.closed, self.live = {}, {}, {}, {}   # per repo: open {n: rec}; comments [rec]; closed {label: [rec]}
+        self.pulls = {}   # per repo: [recently closed pull request records] (#384)
         self.calls, self.unreadable = [], set()
 
     def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
@@ -18059,6 +18078,8 @@ class FakeTriageHub:
             return [c for c in self.comments.get(repo, []) if c["issue_url"].endswith("/%s" % match.group(1))][::-1], False
         if "/issues/comments" in path:
             return list(self.comments.get(repo, [])), False
+        if re.search(r"/pulls\?", path):
+            return list(self.pulls.get(repo, [])), False
         if "state=closed" in path:
             label = unquote(re.search(r"labels=([^&]+)", path).group(1))
             return list(self.closed.get(repo, {}).get(label, [])), False
@@ -18437,6 +18458,92 @@ class TestTriage(Base):
         self.assertEqual([f for f in self.found() if f[1] == "acme/api#120"], [("OO", "acme/api#120")])
         row = [e for e in self.world.audit() if e["event"] == "triage.finding" and e["detail"]["rule"] == "OO"][0]
         self.assertEqual(row["detail"]["evidence"]["would_be"], ["T1", "T2", "T3"])
+
+    def merged_pr(self, number, body, hours_ago=2.0, merged=True, author="bot"):
+        record = {"number": number, "body": body, "user": {"login": author}, "html_url": "https://evil.example/\x1b[31m%d" % number,
+                  "merged_at": sb.iso(self.world.clock.now() - hours_ago * 3600) if merged else None, "state": "closed"}
+        self.hub.pulls.setdefault("acme/api", []).append(record)
+
+    def test_t12_an_open_plan_issue_whose_pr_merged_is_that_finding_with_the_pr_link_and_not_no_owner(self):
+        self.charter()
+        self.add(130, created=60, labels=["kind"])                         # unowned and old: it would be T1
+        self.add(131, created=60, labels=["kind"])
+        self.merged_pr(200, "Part of #130.")
+        self.merged_pr(201, "PLAN: https://github.com/acme/api/issues/131\n\nCloses #999")
+        self.go()
+        self.assertEqual(self.only("T12"), ["acme/api#130", "acme/api#131"])
+        self.assertEqual((self.only("T1"), self.only("T11")), ([], []))
+        row = [e for e in self.world.audit() if e["event"] == "triage.finding" and e["detail"]["ref"] == "acme/api#130" and e["detail"]["rule"] == "T12"][0]
+        self.assertEqual((row["detail"]["what"], row["detail"]["evidence"]["pr"], row["detail"]["evidence"]["pr_url"]),
+                         ("plan issue still open after its PR merged", 200, "https://github.com/acme/api/pull/200"))   # the link is rebuilt, not the record's html_url
+        self.assertFalse(row["detail"]["applied"])
+
+    def test_t12_never_fires_for_a_charter_or_an_ask_named_by_part_of_but_does_for_a_work_item(self):
+        self.charter()                                                     # #1 is the charter, #2 an ask under it
+        self.add(3, created=20, updated=0.1, parent=2, labels=["kind"], body="Next: go")   # a work item under the ask
+        self.merged_pr(240, "Part of #1. Part of #2. Part of #3.")
+        self.go()
+        self.assertEqual(self.only("T12"), ["acme/api#3"])                 # not the charter, not the ask
+
+    def test_t12_is_ours_through_the_merged_prs_author_and_a_fresh_read_of_a_closed_issue_drops_it(self):
+        self.charter()
+        self.add(170, created=60, labels=["kind"], author="stranger")          # not assigned to us, not in a chain, opened by someone else
+        self.merged_pr(230, "PLAN: acme/api#170", author="bot")                # but the merged PR is ours
+        self.go(passes=1)
+        self.assertEqual(self.only("T12"), ["acme/api#170"])
+        self.assertNotIn(("OO", "acme/api#170"), self.found())
+        self.hub.live["acme/api"] = {170: dict(self.hub.open["acme/api"][170], state="closed")}   # a fresh read shows it closed since
+        self.world.tick(sb.TRIAGE_TTL + 5)
+        state = sb.triage_state(self.engine)
+        self.assertFalse(sb.triage_verify(self.engine, state, "T12", "acme/api#170", self.engine.config["triage"], self.world.clock.now(), [10]))
+
+    def test_t12_no_finding_for_a_pr_closed_unmerged_a_closed_issue_or_another_repo(self):
+        self.charter()
+        self.add(140, created=60, labels=["kind"], assignees=["bot"])
+        self.add(141, created=60, labels=["kind"], assignees=["bot"])
+        self.merged_pr(210, "Part of #140", merged=False)                  # closed without merging: it implemented nothing
+        self.merged_pr(211, "Closes other/repo#141\nPLAN: https://github.com/other/repo/issues/141")
+        self.merged_pr(212, "Part of #142")                                # #142 is not open (closed or never listed)
+        self.go()
+        self.assertEqual(self.only("T12"), [])
+
+    def test_t12_a_pr_of_someone_elses_naming_an_issue_that_is_not_ours_is_only_a_flag(self):
+        self.charter()
+        self.add(150, created=60, labels=["kind"], author="stranger")
+        self.merged_pr(220, "Part of #150", author="stranger")
+        self.go()
+        self.assertEqual(self.only("T12"), [])
+        self.assertIn(("OO", "acme/api#150"), self.found())
+
+    def test_t12_reads_one_page_of_closed_pull_requests_per_repo_and_stays_inside_the_budget(self):
+        self.charter()
+        self.add(160, created=60, labels=["kind"], assignees=["bot"])
+        self.go(passes=1)
+        pulls = [c for c in self.hub.calls if "/pulls?" in c]
+        self.assertEqual(len(pulls), 1)
+        self.assertIn("per_page=%d" % sb.TRIAGE_MERGED_PER_PAGE, pulls[0])
+        self.assertIn("state=closed", pulls[0])
+        self.hub.calls.clear()
+        self.world.tick(sb.TRIAGE_TTL + 5)
+        self.go(passes=1, calls_per_pass=5)
+        self.assertLessEqual(len(self.hub.calls), 5)                      # the pass's budget of calls_per_pass: reads and fresh checks together
+
+    def test_t12_the_reference_rules(self):
+        refs = sb.load_triage_plan_open().references
+        self.assertEqual(refs("Closes #5. fixes #6, Resolved #7 and Part of #8", "acme/api"), {5, 6, 7, 8})
+        self.assertEqual(refs("PLAN: acme/api#9", "acme/api"), {9})
+        self.assertEqual(refs("PLAN: <https://github.com/ACME/api/issues/10>", "acme/api"), {10})
+        self.assertEqual(refs("Closes acme/web#11 and see #12 and PLAN: https://github.com/acme/web/issues/13", "acme/api"), set())
+        self.assertEqual(refs(None, "acme/api"), set())
+        links = sb.load_triage_plan_open().merged_links([{"number": 1, "body": "Part of #5", "merged_at": "2026-01-01T00:00:00Z"},
+                                                          {"number": 2, "body": "Part of #5", "merged_at": "2026-02-01T00:00:00Z"},
+                                                          {"number": 3, "body": "Part of #5", "merged_at": None}, "junk"], "acme/api")
+        self.assertEqual(links[5]["pr"], 2)          # the latest merge wins; an unmerged one is ignored
+
+    def test_the_pr_template_and_both_coder_definitions_name_the_plan_issue_with_closes(self):
+        for path in (REPO / ".github" / "pull_request_template.md", REPO / "agents" / "opencode" / "coder.md", REPO / "agents" / "copilot" / "coder.agent.md"):
+            with self.subTest(file=path.name):
+                self.assertEqual(path.read_text().count("Closes #"), 1)
 
     def test_an_unreadable_repo_is_reported_once_and_gives_no_findings(self):
         self.engine.config["triage"]["repos"] = ["acme/api", "acme/gone"]
@@ -30955,7 +31062,7 @@ class OrdersDeliveryCase(OrdersCase):
         return [a for a in self.world.admissions(name) if any(k.startswith("orders:") for k in a["keys"])]
 
     def gh_gets(self):
-        return len([c for c in self.gh.calls if "--method" not in c])
+        return len([c for c in self.gh.calls if "--method" not in c and not any("/sub_issues" in str(part) for part in c)])   # the load figure's own asks read (#348) is not the charter read
 
 
 class TestCompactionShape(unittest.TestCase):
@@ -42164,7 +42271,7 @@ class TestHeavySlots(Base):
         while "waiting for a slot" not in err and time.time() < end:   # the wrapper says so once it is queued (its start-up time varies with the machine)
             if select.select([fourth.stderr], [], [], 0.2)[0]:
                 err += os.read(fourth.stderr.fileno(), 4096).decode()
-        self.assertIn("waiting for a slot", err)
+        self.assertIn("waiting for a slot", err, "the fourth wrapper (exit %r) said nothing; started: %s" % (fourth.poll(), self.started()))
         self.assertEqual(len(self.started()), 3, "at most 3 run at once")
         (self.home / "release.a").write_text("")
         self.assertTrue(self.until(lambda: "started.d" in self.started()), "the fourth runs once a slot is free")
@@ -45906,6 +46013,321 @@ class TestEventFeedReads(unittest.TestCase):
             engine.feed.connected = False
             sb.record_v2_calls(engine)
             self.assertIn("events: DOWN: old reads", sb.v2_calls_status(tmp, 1000.0))
+
+
+class TestLoadAlert(Base):
+    """#348: the load figures per orchestrator, the hourly series, the `status` lines and the once-per-episode alert to the Chief of Staff."""
+    T0 = _dt.datetime(2026, 10, 14, 10, 0, tzinfo=_dt.timezone.utc).timestamp()
+
+    def setUp(self):
+        super().setUp()
+        self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(str(self.state_dir), 0o700)
+        self.health = sb.load_fleet_health()
+        self.asks = {}       # orchestrator -> [numbers]
+        self.reads = []
+        self.woken = []
+        self.fail_reads = False
+
+    def orch(self, busy=0, idle=0, messages=0, charter=1):
+        return {"charter": charter, "repo": "acme/widget", "busy": busy, "idle": idle, "messages": messages}
+
+    def tick(self, at, orchestrators, **cfg):
+        def read_asks(charter, repo):
+            self.reads.append((at, charter))
+            if self.fail_reads:
+                raise RuntimeError("gh is down")
+            return [{"repo": "acme/widget", "number": n} for n in self.asks[charter]]
+        ctx = self.health.Context(now=at, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS, **dict({"enabled": True}, **cfg)), orchestrators=orchestrators,
+                                  read_asks=read_asks, cos="cos", wake=self.woken.append)
+        return self.health.tick(ctx)
+
+    def latest(self):
+        return json.loads((self.state_dir / "load.json").read_text())["latest"]
+
+    def move(self, at, number, kind="push"):
+        self.health.append_moves(str(self.state_dir), [{"at": at, "repo": "acme/widget", "numbers": [number], "kind": kind}])
+
+    def test_each_orchestrator_has_the_five_figures_from_the_records(self):
+        self.asks = {1: [10, 11, 12], 2: [20], 3: [30, 31]}
+        orchestrators = {"orch-a": self.orch(busy=2, idle=1, messages=1, charter=1), "orch-b": self.orch(idle=1, charter=2), "orch-c": self.orch(busy=1, charter=3)}
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [{"agent": "orch-a"}, {"agent": "orch-a"}, {"agent": "orch-b", "closed": True}]}))
+        self.tick(self.T0, orchestrators)                      # first sight of every ask
+        self.move(self.T0 + 3 * 3600 - 60, 10)                 # ask 10 moved 1 minute ago; 20 and 30 moved 3 h ago
+        self.move(self.T0 + 3 * 3600 - 60, 12)
+        self.tick(self.T0 + 3 * 3600, orchestrators)
+        got = self.latest()
+        a = got["orch-a"]
+        self.assertEqual((a["open_asks"], a["stalled"], a["stalled_asks"], a["moved_1h"], a["busy"], a["idle"], a["messages"], a["decisions"]),
+                         (3, 1, [11], 2, 2, 1, 1, 2))
+        self.assertEqual((got["orch-b"]["open_asks"], got["orch-b"]["stalled"], got["orch-b"]["decisions"]), (1, 1, 0))
+        self.assertEqual((got["orch-c"]["open_asks"], got["orch-c"]["stalled"], got["orch-c"]["oldest_stall_hours"]), (2, 2, 3.0))
+
+    def test_five_movement_kinds_reset_the_clock_and_a_comment_does_not(self):
+        self.asks = {1: [1, 2, 3, 4, 5, 6]}
+        self.tick(self.T0, {"o": self.orch(busy=1, charter=1)})
+        late = self.T0 + 3 * 3600
+        for number, kind in ((1, "push"), (2, "pr_opened"), (3, "pr_merged")):
+            self.move(late - 100, number, kind)
+        ts = lambda at: _dt.datetime.fromtimestamp(at, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        with open(str(self.state_dir / "audit.jsonl"), "w") as handle:
+            for entry in ({"ts": ts(late - 100), "event": "v2.synthetic", "phase": "intent", "subject": "cos",
+                           "detail": {"description": "switchboard: worker report on widget#4: done"}},
+                          {"ts": ts(late - 100), "event": "plan.review.consensus", "subject": "acme/widget#5", "detail": {}},
+                          {"ts": ts(late - 100), "event": "github.comment", "subject": "acme/widget#6", "detail": {}}):   # a plain comment
+                handle.write(json.dumps(entry) + "\n")
+        self.tick(late, {"o": self.orch(busy=1, charter=1)})
+        self.assertEqual((self.latest()["o"]["stalled"], self.latest()["o"]["stalled_asks"], self.latest()["o"]["moved_1h"]), (1, [6], 5))
+
+    def test_move_rows_come_from_webhooks_and_a_comment_makes_none(self):
+        pr = {"number": 7, "body": "Closes #3", "merged": True}
+        rows = lambda event, action, **kw: self.health.move_rows(event, {"action": action, "pull_request": dict(pr, **kw)}, "acme/widget", 5, sb.closing_numbers)
+        self.assertEqual([r["kind"] for r in rows("pull_request", "synchronize")], ["push"])
+        self.assertEqual([r["kind"] for r in rows("pull_request", "opened")], ["pr_opened"])
+        self.assertEqual([r["kind"] for r in rows("pull_request", "closed")], ["pr_merged"])
+        self.assertEqual(rows("pull_request", "closed", merged=False), [])
+        self.assertEqual(rows("pull_request", "synchronize")[0]["numbers"], [7, 3])
+        self.assertEqual(self.health.move_rows("issue_comment", {"action": "created"}, "acme/widget", 5), [])
+
+    def test_the_hourly_series_has_one_entry_per_hour_with_a_pass(self):
+        self.asks = {1: [1]}
+        for hour in range(6):
+            self.tick(self.T0 + hour * 3600 + 120, {"o": self.orch(charter=1)})
+        series = json.loads((self.state_dir / "load.json").read_text())["series"]["o"]
+        self.assertEqual(sorted(series["hours"]), ["10", "11", "12", "13", "14", "15"])
+        self.assertEqual(series["day"], "2026-10-14")
+
+    def test_status_prints_one_line_per_orchestrator_with_the_figures(self):
+        self.asks = {1: [1], 2: []}
+        self.tick(self.T0, {"orch-a": self.orch(busy=1, charter=1), "orch-b": self.orch(idle=2, charter=2)})
+        lines = self.health.status_lines(str(self.state_dir), self.T0)
+        self.assertEqual(len([l for l in lines if l.strip().startswith("orch-")]), 2)
+        self.assertIn("asks 1, stalled 0", lines[1])
+        self.assertIn("coders 1 busy 0 idle", lines[1])
+        self.assertEqual(self.health.status_lines(str(self.state_dir / "nowhere"), self.T0), [])
+        status = sb.format_status(dict(self.status_skeleton(), load=lines))
+        self.assertEqual(len([l for l in status.splitlines() if "asks 1, stalled 0" in l or "asks 0, stalled 0" in l]), 2)
+
+    def status_skeleton(self):
+        report = sb.collect_status(runner=lambda *a, **k: types.SimpleNamespace(returncode=1, stdout="", stderr=""), now=lambda: self.T0)
+        report["load"] = []
+        return report
+
+    def stalled_world(self, count=2):
+        self.asks = {1: list(range(1, count + 1))}
+        self.tick(self.T0, {"o": self.orch(idle=1, charter=1)})
+
+    def test_two_stalled_asks_wake_once_over_three_passes_with_figures_and_an_action(self):
+        self.stalled_world(2)
+        for hour in (2, 3, 4):
+            self.tick(self.T0 + hour * 3600, {"o": self.orch(idle=1, charter=1)})
+        self.assertEqual(len(self.woken), 1)
+        text = self.woken[0]
+        for part in ("o is overloaded", "2 open ask(s)", "2 with no real movement in 2 h", "#1, #2", "Recommended: move the stalled asks"):
+            self.assertIn(part, text)
+
+    def test_a_full_coder_team_with_a_backlog_wakes_once_and_idle_coders_do_not(self):
+        self.asks = {1: [1, 2, 3], 2: [4, 5, 6]}
+        both = {"full": self.orch(busy=2, idle=0, charter=1), "free": self.orch(busy=2, idle=1, charter=2)}
+        self.tick(self.T0, both)
+        for number in (1, 4):
+            self.move(self.T0 + 3600, number)
+        self.tick(self.T0 + 3700, both)
+        self.assertEqual([t.split(" is ")[0] for t in self.woken], ["Load alert: full"])
+        self.assertIn("split a lane or add coders", self.woken[0])
+
+    def test_worse_wakes_again_and_recovery_then_a_new_crossing_wakes_again(self):
+        self.stalled_world(2)
+        o = {"o": self.orch(idle=1, charter=1)}
+        self.tick(self.T0 + 2 * 3600, o)
+        self.assertEqual(len(self.woken), 1)
+        self.asks[1] = [1, 2, 3]
+        self.tick(self.T0 + 3 * 3600 + 10, o)              # the list is re-read after an hour; ask 3 is new, 1 and 2 still stalled: 2 stalled, not worse
+        self.assertEqual(len(self.woken), 1)
+        self.tick(self.T0 + 5 * 3600 + 20, o)              # ask 3 has now gone 2 h too: 3 stalled, worse
+        self.assertEqual(len(self.woken), 2)
+        self.asks[1] = []
+        self.tick(self.T0 + 6 * 3600 + 30, o)              # recovered
+        self.assertEqual(len(self.woken), 2)
+        self.asks[1] = [7, 8]
+        self.tick(self.T0 + 7 * 3600 + 40, o)              # two new asks, first seen now
+        self.tick(self.T0 + 9 * 3600 + 50, o)              # stalled again: a new crossing after recovery
+        self.assertEqual(len(self.woken), 3)
+
+    def test_configured_thresholds_are_followed(self):
+        self.stalled_world(2)
+        self.tick(self.T0 + 3 * 3600, {"o": self.orch(idle=1, charter=1)}, stalled_asks=3)
+        self.assertEqual(self.woken, [])
+        self.asks[1] = [1, 2, 3]
+        self.tick(self.T0 + 4 * 3600 + 5, {"o": self.orch(idle=1, charter=1)}, stalled_asks=3)
+        self.tick(self.T0 + 6 * 3600 + 10, {"o": self.orch(idle=1, charter=1)}, stalled_asks=3)
+        self.assertEqual(len(self.woken), 1)
+        with self.assertRaises(ValueError):
+            self.health.validate({"stalled_asks": 0}, "x")
+        self.assertEqual(self.health.validate(None, "x"), self.health.DEFAULTS)
+
+    def test_reads_are_bounded_and_an_unreadable_source_means_no_wake(self):
+        self.asks = {n: [n] for n in range(1, 41)}
+        many = {"o%d" % n: self.orch(charter=n) for n in range(1, 41)}
+        self.tick(self.T0, many)
+        self.tick(self.T0 + 1800, many)
+        self.assertLessEqual(len(self.reads), 10)
+        # an unreadable source: the cache goes stale, the asks are not believed, nobody is woken, and status says so once
+        self.fail_reads = True
+        self.woken.clear()
+        later = {"x": self.orch(charter=1)}
+        self.asks = {1: [1, 2, 3]}
+        self.tick(self.T0 + 10 * 3600, later)
+        self.assertEqual(self.woken, [])
+        self.assertIsNone(self.latest()["x"]["open_asks"])
+        lines = self.health.status_lines(str(self.state_dir), self.T0)
+        self.assertEqual(len([l for l in lines if "unreadable" in l]), 1)
+        self.assertIn("asks not recorded", lines[1])
+
+    def test_the_kill_switch_keeps_the_line_and_sends_no_wake(self):
+        self.stalled_world(2)
+        self.tick(self.T0 + 3 * 3600, {"o": self.orch(idle=1, charter=1)}, enabled=False)
+        self.assertEqual(self.woken, [])
+        self.assertEqual(len([l for l in self.health.status_lines(str(self.state_dir), self.T0) if l.strip().startswith("o ")]), 1)
+        self.tick(self.T0 + 4 * 3600, {"o": self.orch(idle=1, charter=1)})   # switched on later: the open episode still fires
+        self.assertEqual(len(self.woken), 1)
+
+    def test_the_fixed_text_names_nothing_and_every_name_comes_from_the_records(self):
+        def render(boss):
+            self.woken.clear()
+            shutil.rmtree(str(self.state_dir)); self.state_dir.mkdir(mode=0o700)
+            self.asks = {1: [1, 2]}
+            self.tick(self.T0, {boss: self.orch(idle=1, charter=1)})
+            self.tick(self.T0 + 3 * 3600, {boss: self.orch(idle=1, charter=1)})
+            return self.woken[0] + "\n" + "\n".join(self.health.status_lines(str(self.state_dir), 0))
+        self.assertEqual(render("orch-a").replace("orch-a", "N"), render("orch-b").replace("orch-b", "N"))
+
+    def test_the_daemon_tick_without_an_ask_repo_wakes_nobody_and_says_so(self):
+        self.asks = {1: [1, 2]}
+        engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.T0, audit=None, actor="daemon", intents=None,
+                                       config={"load_alert": self.health.validate({"enabled": True}, "x")})
+        seen = lambda name, fleet, status: types.SimpleNamespace(name=name, fleet=fleet, status=status)
+        discovery = types.SimpleNamespace(agents={"orch": seen("orch", {"role": "orchestrator", "charter": 1, "repo": "acme/widget"}, "idle"),
+                                                  "cos": seen("cos", {"role": "chief-of-staff"}, "idle")})
+        self.assertEqual(sb.load_tick(engine, discovery), [])   # no ask repo: the asks are unreadable, so no wake
+        self.assertIn("no ask repo", " ".join(json.loads((self.state_dir / "load.json").read_text())["problems"]))
+        self.assertEqual(sb.read_reminders(str(self.state_dir)), [])
+
+    def test_the_daemon_tick_turns_a_crossing_into_one_reminder_and_one_audit_line(self):
+        clock = [self.T0]
+        audited = []
+        audit = types.SimpleNamespace(append=lambda actor, event, subject, detail: audited.append((event, subject, detail)))
+        intents = types.SimpleNamespace(repo="acme/widget", open_asks=lambda charter, repo: [types.SimpleNamespace(repo="acme/widget", number=n) for n in (1, 2)])
+        engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: clock[0], audit=audit, actor="daemon", intents=intents,
+                                       config={"load_alert": self.health.validate({"enabled": True}, "x")})
+        seen = lambda name, fleet, status: types.SimpleNamespace(name=name, fleet=fleet, status=status)
+        discovery = types.SimpleNamespace(agents={"orch": seen("orch", {"role": "orchestrator", "charter": 1, "repo": "acme/widget"}, "idle"),
+                                                  "cos": seen("cos", {"role": "chief-of-staff"}, "idle")})
+        sb.load_tick(engine, discovery)
+        for hours in (3, 4):
+            clock[0] = self.T0 + hours * 3600
+            sb.load_tick(engine, discovery)
+        reminders = sb.read_reminders(str(self.state_dir))
+        self.assertEqual([r["to"] for r in reminders], ["cos"])
+        self.assertIn("orch is overloaded", reminders[0]["text"])
+        self.assertIn("2 with no real movement in 2 h", reminders[0]["text"])
+        self.assertEqual([a[0] for a in audited], ["load.alert"])
+
+    def test_the_move_log_survives_torn_lines_a_burst_and_a_prune(self):
+        d = str(self.state_dir)
+        (self.state_dir / "ask-moves.jsonl").write_text('{"at": 1, "numbers": [1], "repo": "r"}\nnot json\n{"at": 2')
+        self.health.append_moves(d, [{"at": self.T0, "repo": "r", "numbers": [3], "kind": "push"}])
+        self.assertEqual([r["numbers"] for r in self.health.read_moves(d, 0)], [[1], [3]])
+        self.health.append_moves(d, [{"at": 5, "repo": "r", "numbers": [9], "kind": "push"} for _ in range(300)])
+        self.health.prune_moves(d, self.T0)
+        self.assertEqual([r["numbers"] for r in self.health.read_moves(d, 0)], [[3]])
+        body = " ".join("Closes #%d." % n for n in range(1, 60))
+        row = self.health.move_rows("pull_request", {"action": "opened", "pull_request": {"number": 7, "body": body}}, "r", 1, sb.closing_numbers)[0]
+        self.assertEqual(len(row["numbers"]), self.health.MOVES_NUMBERS_MAX)
+
+    def test_unreadable_decisions_and_a_torn_audit_tail_are_not_zero_and_not_fatal(self):
+        self.assertIsNone(self.health.decisions_waiting(str(self.state_dir)))
+        (self.state_dir / "audit.jsonl").write_text("x" * 100 + "\n")
+        with mock.patch.object(self.health, "AUDIT_TAIL_BYTES", 40):
+            self.assertEqual(self.health.audit_moves(str(self.state_dir), 0), [])
+        self.assertIsNone(self.health.audit_moves(str(self.state_dir / "nowhere"), 0))
+
+    def test_the_replay_of_a_recorded_overloaded_day_says_when_it_would_have_fired(self):
+        self.asks = {1: [1, 2]}
+        o = {"o": self.orch(idle=1, charter=1)}
+        for hour in range(0, 6):
+            self.tick(self.T0 + hour * 3600 + 5, o)       # the stall builds: 2 asks unmoved from 10:00, a stall of 2 h at 12:00
+        days, firings = self.health.replay(str(self.state_dir), dict(self.health.DEFAULTS))
+        self.assertEqual(days, ["2026-10-14"])
+        self.assertEqual([(f["orchestrator"], f["hour"]) for f in firings], [("o", "2026-10-14 12:00Z")])
+        self.assertEqual(self.health.replay(str(self.state_dir), dict(self.health.DEFAULTS, stalled_asks=3))[1], [])
+        self.assertIsNone(self.health.replay(str(self.state_dir), dict(self.health.DEFAULTS), "2026-01-01")[1])
+        # a finished day stays replayable after the day rolls over
+        self.tick(self.T0 + 24 * 3600, o)
+        days, firings = self.health.replay(str(self.state_dir), dict(self.health.DEFAULTS), "2026-10-14")
+        self.assertEqual((days, len(firings)), (["2026-10-14", "2026-10-15"], 1))
+        with captured() as (out, err):
+            self.assertEqual(sb.main(["load-replay", "--day", "2026-10-14"], runner=None), 0, err.getvalue())
+        self.assertIn("would have fired 1 time(s)", out.getvalue())
+        self.assertIn("o is overloaded", out.getvalue())
+
+    def test_a_past_day_is_rebuilt_from_the_audit_and_its_archive_and_says_what_is_not_recorded(self):
+        def line(ts, event, subject, detail, **extra):
+            return json.dumps(dict({"ts": ts, "actor": "cli", "event": event, "subject": subject, "detail": detail}, **extra))
+        archive = [line("2026-10-12T22:00:00.000Z", "v2.session.create", "coder1", {"fleet": {"reports_to": "orch", "issue": 5}}),
+                   line("2026-10-12T22:00:00.000Z", "reminder.add", "orch", {"from": "orch", "issue": 6, "repo": "acme/widget"})]
+        with gzip.open(str(self.state_dir / "audit-2026-10-13.jsonl.gz"), "wt") as handle:
+            handle.write("\n".join(archive) + "\n")
+        os.utime(str(self.state_dir / "audit-2026-10-13.jsonl.gz"), (self.T0, self.T0))
+        (self.state_dir / "audit.jsonl").write_text(line("2026-10-13T01:30:00.000Z", "v2.synthetic", "cos", {"description": "switchboard: coder1 report on widget#5: done"}, phase="intent") + "\n")
+        firings, notes = self.health.replay_audit(str(self.state_dir), dict(self.health.DEFAULTS), "2026-10-13")
+        self.assertEqual([(f["orchestrator"], f["hour"]) for f in firings], [("orch", "2026-10-13 00:59Z"), ("orch", "2026-10-13 03:59Z")])
+        self.assertIn("coders not recorded busy", firings[0]["text"])
+        self.assertIn("coders busy and idle", notes)
+        self.assertIsNone(self.health.replay_audit(str(self.state_dir / "nowhere"), dict(self.health.DEFAULTS), "2026-10-13")[0])
+        with captured() as (out, err):
+            self.assertEqual(sb.main(["load-replay", "--day", "2026-10-13"], runner=None), 0, err.getvalue())
+        self.assertIn("from the audit log and its archives (best effort)", out.getvalue())
+        self.assertIn("not recorded for it:", out.getvalue())
+        self.assertIn("would have fired 2 time(s)", out.getvalue())
+
+    def test_load_replay_refuses_a_bad_day_and_names_today_for_a_rebuild_with_no_series(self):
+        for bad in ("foo", "2026-13-45"):
+            with captured() as (out, err):
+                self.assertEqual(sb.main(["load-replay", "--day", bad], runner=None), 2, bad)
+            self.assertIn("load-replay: --day", err.getvalue())
+        (self.state_dir / "audit.jsonl").write_text("")
+        with captured() as (out, err), mock.patch.object(sb.time, "time", lambda: self.T0):
+            self.assertEqual(sb.main(["load-replay", "--from-audit"], runner=None, now=lambda: self.T0), 0, err.getvalue())
+        self.assertIn("load alert replay over 2026-10-14 from the audit log", out.getvalue())
+        self.assertIn("would have fired 0 time(s)", out.getvalue())
+
+    def test_a_hostile_orchestrator_name_is_one_short_clean_line_in_the_wake(self):
+        self.asks = {1: [1, 2]}
+        name = "o\nrm -rf\x1b[31m " + "x" * 100
+        self.tick(self.T0, {name: self.orch(idle=1, charter=1)})
+        self.tick(self.T0 + 3 * 3600, {name: self.orch(idle=1, charter=1)})
+        text = self.woken[0]
+        self.assertNotRegex(text, "[\x00-\x1f\x7f]")
+        self.assertEqual(text.split(" is overloaded")[0].replace("Load alert: ", ""), ("o rm -rf [31m " + "x" * 100)[:60])
+
+    def test_an_oversize_move_file_is_pruned_to_the_recent_rows(self):
+        d = str(self.state_dir)
+        with mock.patch.object(self.health, "MOVES_READ_BYTES", 2000):
+            self.health.append_moves(d, [{"at": 5, "repo": "r", "numbers": [9], "kind": "push"} for _ in range(100)])
+            self.health.append_moves(d, [{"at": self.T0, "repo": "r", "numbers": [4], "kind": "push"}])
+            self.assertGreater((self.state_dir / "ask-moves.jsonl").stat().st_size, 2000)
+            self.health.prune_moves(d, self.T0)
+            self.assertEqual([r["numbers"] for r in self.health.read_moves(d, 0)], [[4]])
+            self.assertLess((self.state_dir / "ask-moves.jsonl").stat().st_size, 2000)
+
+    def test_an_idle_pass_rewrites_nothing(self):
+        self.asks = {1: [1]}
+        self.tick(self.T0, {"o": self.orch(busy=1, charter=1)})
+        before = (self.state_dir / "load.json").stat().st_mtime_ns
+        self.tick(self.T0 + 60, {"o": self.orch(busy=1, charter=1)})
+        self.assertEqual((self.state_dir / "load.json").stat().st_mtime_ns, before)
+
 
 
 def main(argv):
