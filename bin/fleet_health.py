@@ -127,7 +127,10 @@ def prune_moves(state_dir, now):
     with _moves_lock(state_dir):
         rows = read_moves(state_dir, now - MOVES_KEEP_SECONDS)
         try:
-            if len(path.read_bytes().splitlines()) <= len(rows) + 200 and path.stat().st_size <= MOVES_READ_BYTES:
+            with open(str(path), "rb") as handle:   # a bounded count: the file is fed from outside
+                stored = len(handle.read(MOVES_READ_BYTES + 1).splitlines())
+                oversize = handle.seek(0, os.SEEK_END) > MOVES_READ_BYTES
+            if stored <= len(rows) + 200 and not oversize:   # a few hundred stale rows are not worth a rewrite
                 return
         except OSError:
             return
@@ -235,9 +238,10 @@ def crossing(fig, cfg):
 
 def wake_text(fig, reasons, cfg):
     asks = ", ".join("#%d" % n for n in fig["stalled_asks"][:5])
+    name = re.sub(r"\s+", " ", str(fig["name"]))[:60]
     text = ("Load alert: %s is overloaded. %d open ask(s); %d with no real movement in %g h%s; moved %d in the last hour and %d in %g h; "
             "coders %s busy, %s idle; waiting on it: %s message(s), %s decision(s)." % (
-                fig["name"], fig["open_asks"], fig["stalled"], cfg["stalled_hours"], " (%s)" % asks if asks else "",
+                name, fig["open_asks"], fig["stalled"], cfg["stalled_hours"], " (%s)" % asks if asks else "",
                 fig["moved_1h"], fig["moved_backlog"], cfg["backlog_hours"], *["not recorded" if fig[k] is None else fig[k] for k in ("busy", "idle", "messages", "decisions")]))
     actions = []
     if "stalled" in reasons:

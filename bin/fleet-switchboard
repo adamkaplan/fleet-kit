@@ -21120,15 +21120,25 @@ def cmd_load_replay(args, runner, now):
     except ValueError as err:
         sys.stderr.write("%s: load-replay: %s\n" % (PROG, err))
         return EXIT_USAGE
+    if args.day is not None and not re.fullmatch(r"\d{4}-\d\d-\d\d", args.day):
+        sys.stderr.write("%s: load-replay: --day must be a UTC date, YYYY-MM-DD, got %r\n" % (PROG, args.day[:20]))
+        return EXIT_USAGE
+    try:
+        if args.day is not None:
+            datetime.strptime(args.day, "%Y-%m-%d")
+    except ValueError:
+        sys.stderr.write("%s: load-replay: --day %r is not a calendar date\n" % (PROG, args.day))
+        return EXIT_USAGE
     days, firings = health.replay(state_dir_path(), cfg, args.day)
+    chosen = args.day or datetime.fromtimestamp(now(), timezone.utc).strftime("%Y-%m-%d")
     source, notes = "the recorded hourly series", None
     if args.from_audit or (firings is None and args.day):
-        firings, notes = health.replay_audit(state_dir_path(), cfg, args.day or datetime.fromtimestamp(now(), timezone.utc).strftime("%Y-%m-%d"))
+        firings, notes = health.replay_audit(state_dir_path(), cfg, chosen)
         source = "the audit log and its archives (best effort)"
     if firings is None:
         print("no recorded day%s and no audit log to rebuild it from; recorded days: %s" % (" " + args.day if args.day else "", ", ".join(days) or "none"))
         return EXIT_USAGE if args.day else EXIT_OK
-    day = args.day or days[-1]
+    day = chosen if source != "the recorded hourly series" else (args.day or days[-1])
     if args.json:
         print(json.dumps({"day": day, "source": source, "not_recorded": notes, "days": days, "firings": firings}, indent=2, sort_keys=True))
         return EXIT_OK

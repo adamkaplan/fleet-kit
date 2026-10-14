@@ -44870,6 +44870,17 @@ class TestLoadAlert(Base):
         self.assertIn("not recorded for it:", out.getvalue())
         self.assertIn("would have fired 2 time(s)", out.getvalue())
 
+    def test_load_replay_refuses_a_bad_day_and_names_today_for_a_rebuild_with_no_series(self):
+        for bad in ("foo", "2026-13-45"):
+            with captured() as (out, err):
+                self.assertEqual(sb.main(["load-replay", "--day", bad], runner=None), 2, bad)
+            self.assertIn("load-replay: --day", err.getvalue())
+        (self.state_dir / "audit.jsonl").write_text("")
+        with captured() as (out, err), mock.patch.object(sb.time, "time", lambda: self.T0):
+            self.assertEqual(sb.main(["load-replay", "--from-audit"], runner=None, now=lambda: self.T0), 0, err.getvalue())
+        self.assertIn("load alert replay over 2026-10-14 from the audit log", out.getvalue())
+        self.assertIn("would have fired 0 time(s)", out.getvalue())
+
     def test_an_idle_pass_rewrites_nothing(self):
         self.asks = {1: [1]}
         self.tick(self.T0, {"o": self.orch(busy=1, charter=1)})
