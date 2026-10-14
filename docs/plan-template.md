@@ -98,6 +98,13 @@ spacing, punctuation and `(n)` numbers are ignored, so you may split on the Done
 `declared clauses do not match the ask`. The ask stays the authority: when the ask already has numbered parts (or a numbered list) those ARE the clauses and a declared list can only repeat them (same count, same text), else `declared-clauses-mismatch`; the declared list is used only to split a one-sentence Done-when. A plan can never declare fewer, merged or different clauses to weaken coverage. Without a declared list, a one-sentence Done-when with many separators prints a warning telling you to
 declare it.
 
+### Help while you write
+
+`fleet-switchboard plan check ... --explain` follows every defect and warning with a `WHY` line (the rule) and a `FIX` line (what to do); the
+default output and the hashes are unchanged. `fleet-switchboard plan template <owner/repo#N>` (or `--done-when TEXT`) prints a prefilled plan:
+`plan-format: 2`, a `size:` placeholder, the ask's Done-when clauses numbered, and one scenario stub per clause plus an unchanged one. Replace every
+`<...>` before checking it; it only reads the ask.
+
 ### Output, hash, exit codes
 
 `fleet-switchboard plan check <owner/repo#N | issue URL | --file PATH> [--json]` prints `PASS` or `FAIL`, one `DEFECT

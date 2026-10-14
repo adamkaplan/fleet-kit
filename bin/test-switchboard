@@ -23864,6 +23864,113 @@ class TestPlanCheckCommand(Base):
         self.assertNotIn("plan", sb.ENSURE_ON_USE_COMMANDS)
 
 
+class TestPlanExplain(Base):
+    """#353: `plan check --explain` and `plan template`."""
+
+    DONE = "(1) a thing works (2) the other is shown"
+    BAD = ("```yaml\nscenarios:\n  - id: S1\n    covers: DW-1\n    text: Given a thing, when it runs, then it works\n    proof: test\n"
+           "    pass: works\n    discriminates: a stub that returns an empty list fails the count\n    evaluator: ci\n```\n")
+
+    def setUp(self):
+        super().setUp()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": "acme/app"})
+        self.calls, self.comments, self.down = [], [], False
+        self.issue = {"number": 7, "state": "open", "title": "t", "updated_at": "2026-01-01T00:00:00Z",
+                      "body": "## Intent\nx\nDone when: %s\n" % self.DONE}
+
+    runner = TestPlanCheckCommand.runner
+    world_now = TestPlanCheckCommand.world_now
+
+    def cmd(self, *argv):
+        with captured() as (out, err):
+            code = sb.main(["plan", *argv], runner=self.runner, now=self.world_now)
+        return code, out.getvalue(), err.getvalue()
+
+    def plan_file(self, text):
+        path = Path(self.home) / "plan.md"
+        path.write_text(text)
+        return str(path)
+
+    def test_every_defect_is_followed_by_its_rule_and_fix(self):
+        path = self.plan_file(self.BAD)
+        code, out, _ = self.cmd("check", "--file", path, "--done-when", self.DONE, "--explain")
+        self.assertEqual(code, 1)
+        defects = [l for l in out.splitlines() if l.strip().startswith("DEFECT")]
+        whys = [l for l in out.splitlines() if l.strip().startswith("WHY ")]
+        self.assertEqual((len(defects), len(whys)), (3, 3), out)   # vague pass, uncovered DW-2, no unchanged scenario
+        self.assertEqual(len([l for l in out.splitlines() if l.strip().startswith("FIX ")]), 3)
+
+    def test_every_code_the_checker_can_produce_has_an_explanation(self):
+        source = Path(sb.plan_check.__file__).read_text()
+        codes = set(re.findall(r'bad\((?:ident|"-"), "([a-z-]+)"', source)) | set(re.findall(r'"code": "([a-z-]+)"', source))
+        codes |= {"missing-size", "bad-size", "size-in-days"} | {"missing-%s" % key for key in sb.plan_check.REQUIRED}
+        codes.discard("missing-%s")
+        self.assertGreater(len(codes), 20)
+        self.assertEqual([c for c in sorted(codes) if sb.plan_check.explain(c) is None], [])
+
+    def test_without_the_flag_the_output_is_what_it_was(self):
+        path = self.plan_file(self.BAD)
+        _, plain, _ = self.cmd("check", "--file", path, "--done-when", self.DONE)
+        _, explained, _ = self.cmd("check", "--file", path, "--done-when", self.DONE, "--explain")
+        self.assertNotIn("WHY ", plain)
+        self.assertEqual([l for l in explained.splitlines() if not l.strip().startswith(("WHY ", "FIX "))], plain.splitlines())
+        pick = lambda text: re.search(r"plan hash: (sha256:[0-9a-f]{64})", text).group(1)
+        self.assertEqual(pick(plain), pick(explained))
+
+    def test_the_template_has_the_clauses_and_one_stub_each_and_is_read_only(self):
+        code, out, err = self.cmd("template", "acme/app#7")
+        self.assertEqual(code, 0, err)
+        self.assertIn("plan-format: 2", out)
+        self.assertEqual(len(re.findall(r"covers: DW-", out)), 2)
+        self.assertIn("(2) the other is shown", out)
+        self.assertTrue(self.calls and all(c[1] == "api" and "--method" not in c for c in self.calls))
+
+    def test_the_template_with_its_placeholders_filled_in_passes(self):
+        code, out, _ = self.cmd("template", "--done-when", self.DONE)
+        self.assertEqual(code, 0)
+        filled = out.replace("<S|M|L|XL> (<what makes it that size>)", "S (one file)")
+        counter = iter(range(1, 100))
+        def fill(match):
+            n = next(counter)
+            return {"text": "Given case %d is set up, when it runs, then it behaves" % n, "pass": "the call number %d returns status 200 and exactly %d items" % (n, n),
+                    "discriminates": "a stub that returns an empty list for item %d fails the count" % n}.get(match.group(1), "something real and long enough for %d" % n)
+        filled = re.sub(r"(?m)^(    (?:text|pass|discriminates): )<.*>$", lambda m: m.group(1) + fill(re.match(r"(\w+)", m.group(0).strip())), filled)
+        filled = re.sub(r"(?m)^(PC-1|Out of scope|Areas touched|Risks and rollback): <.*>$", lambda m: m.group(1) + ": something real", filled)
+        self.assertNotIn("<", filled)
+        code, result, _ = self.cmd("check", "--file", self.plan_file(filled), "--done-when", self.DONE)
+        self.assertEqual(code, 0, result)
+        self.assertIn("plan check: PASS", result)
+
+    def test_control_characters_and_long_text_in_the_ask_never_reach_the_terminal(self):
+        self.issue["body"] = "## Intent\nx\nDone when: (1) first \x1b]0;owned\x07 clause (2) %s\n" % ("y" * 900)
+        code, out, _ = self.cmd("template", "acme/app#7")
+        self.assertEqual(code, 0)
+        self.assertNotRegex(out, "[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+        self.assertIn("first", out)
+        self.assertLessEqual(max(len(l) for l in out.splitlines()), 340)
+
+    def test_template_with_neither_ask_nor_done_when_and_with_an_unreadable_ask_are_errors(self):
+        code, _, err = self.cmd("template")
+        self.assertEqual(code, 2)
+        self.assertIn("give the ask", err)
+        self.down = True
+        code, out, err = self.cmd("template", "acme/app#7")
+        self.assertEqual((code, out), (2, ""))
+
+    def test_explain_follows_a_warning_too(self):
+        path = self.plan_file(self.BAD.replace("proof: test", "proof: test").replace("evaluator: ci", "evaluator: adam"))
+        _, out, _ = self.cmd("check", "--file", path, "--done-when", "(1) a thing works", "--explain")
+        lines = out.splitlines()
+        at = next(i for i, l in enumerate(lines) if l.startswith("WARN") and "adam" in l)
+        self.assertTrue(lines[at + 1].strip().startswith("WHY evaluator-alias"))
+
+    def test_an_ask_with_no_done_when_is_said_not_prefilled(self):
+        self.issue["body"] = "## Intent\nx\n"
+        code, out, err = self.cmd("template", "acme/app#7")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("no Done-when", err)
+
+
 class TestPlanTemplateDoc(unittest.TestCase):
     TEMPLATE = REPO / "docs" / "plan-template.md"
 
