@@ -138,6 +138,23 @@ def load_plan_ledger():
     return module
 
 
+def load_report_fold():
+    """The report fold's pure core, bin/report_fold.py (#352), loaded by path like plan_check."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "report_fold.py")
+    held = sys.modules.get("report_fold")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("report_fold", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["report_fold"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("report_fold", None)
+        raise
+    return module
+
+
 def load_disk_janitor():
     """The temp-directory janitor, bin/disk_janitor.py (#321), loaded by path like plan_check."""
     path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "disk_janitor.py")
@@ -3804,6 +3821,8 @@ class Switchboard:
             fresh, why = self.reobserve(observation, self.now())
             again = decide(plan.recipient, plan.pending, fresh, self.now(), self.batch_seconds,
                            self.engaged_seconds, why)
+            if getattr(plan, "folded", False) and again.action == "wake":
+                again.action = "note"   # #352: a folded report stays a note
             if again.action != plan.action and not (interrupt and again.action in ("note", "wake")):
                 detail = {"was": plan.action, "now": again.action, "reason": again.reason,
                           "keys": [fact.key for fact in plan.pending]}
@@ -4093,7 +4112,7 @@ class Switchboard:
                     repo=repo or issue_repo(issue))
         outcome = self.send_fact(fact, discovery, now, interrupt=interrupt)
         if outcome.get("sent") and sender != recipient and sender in discovery.agents and self.state_dir is not None:
-            record_last_send(self.state_dir, sender, recipient, now)   # beside `report`'s record: both count as being in touch with that boss
+            record_last_send(self.state_dir, sender, recipient, now, repo=repo or issue_repo(issue), issue=issue)   # beside `report`'s record: both count as being in touch with that boss
         return outcome
 
     def repos_in_play(self):
@@ -4102,10 +4121,13 @@ class Switchboard:
         discovery = getattr(self, "discovery", None)
         return watched_repos(self.config, discovered_fleets(discovery))
 
-    def send_fact(self, fact, discovery, now, carried=(), interrupt=False):
-        """The one delivery path of `send` and `report`: `fact` (and any `carried` riders) now, by the rule."""
+    def send_fact(self, fact, discovery, now, carried=(), interrupt=False, folded=False):
+        """The one delivery path of `send` and `report`: `fact` (and any `carried` riders) now, by the rule. `folded` (#352): a report that
+        follows the sender's own earlier send is delivered as a note: it never wakes the boss a second time."""
         recipient = fact.recipient
         plan = self.plan(recipient, [fact] + list(carried), discovery, now)
+        if folded and plan is not None and plan.action == "wake":
+            plan.action, plan.reason, plan.folded = "note", "folded into the sender's earlier message: no second wake", True
         if plan.action == "hold":
             if self.audit is not None:
                 self.audit.append(self.actor, "hold", recipient, {"reason": plan.reason, "keys": [fact.key]})
@@ -4156,9 +4178,14 @@ class Switchboard:
             return {"sent": False, "action": "rider", "reason": "a progress report is a rider: it rides in the "
                     "next message to %s and never wakes it" % boss, "key": fact.key, "recipient": boss}
         waiting = [f for f in report_rider_facts(self) if f.recipient == boss]
+        earlier = None
+        if self.state_dir is not None:   # #352: read BEFORE this report is recorded
+            earlier = load_report_fold().follows(_read_small(self.state_dir, LAST_REPORT_FILE).get(sender), boss, repo, number, now)
+        if earlier is not None:
+            fact.summary = load_report_fold().marked(fact.summary, earlier, now)
         if self.state_dir is not None and not record_last_report(self.state_dir, sender, state, now):
             self._note("fleetpane.error", sender, {"error": "last-reports.json not written: %s's final report will not retire it automatically" % sender})
-        outcome = self.send_fact(fact, discovery, now, waiting)
+        outcome = self.send_fact(fact, discovery, now, waiting, folded=earlier is not None)
         if state == "done" and outcome.get("sent") and self.state_dir is not None and worktree_config(self.config)["on_done"]:
             try:   # a final done report reclaims the worker's registered worktrees: removed when clean and pushed, else kept with the reason
                 lines = reclaim_for_agent(self, subprocess.run, sender, False, "done report")   # a dry run: a worker often goes on in the same worktree, so only `retire` or `disk reclaim-worktrees --apply` removes
@@ -5493,7 +5520,7 @@ def _prune_last_reports(data):
             data.pop(old, None)
 
 
-def record_last_send(state_dir, sender, recipient, now):
+def record_last_send(state_dir, sender, recipient, now, repo=None, issue=None):
     """Remember that `sender` last SENT something to `recipient` (`send_to: {recipient: epoch}`, beside the last report's `state` and `at`, which it never
     changes; at most 8 recipients kept): a worker that messages its boss is in touch, which the overdue-checkpoint check counts as reporting to THAT boss
     even where no transcript is read (v2_light). Best effort, under a lock; never raises into `send`."""
@@ -5506,6 +5533,7 @@ def record_last_send(state_dir, sender, recipient, now):
             for old in sorted(sends, key=sends.get)[:max(0, len(sends) - 8)]:
                 sends.pop(old, None)
             entry["send_to"] = sends
+            entry = load_report_fold().record(entry, recipient, repo, issue, now)   # #352: what a later report on this issue folds into
             data[sender] = entry
             _prune_last_reports(data)
             _write_small(state_dir, LAST_REPORT_FILE, data)
@@ -5524,6 +5552,8 @@ def record_last_report(state_dir, sender, state, now):
             entry = {"state": state, "at": int(now)}
             if isinstance((data.get(sender) or {}).get("send_to"), dict):
                 entry["send_to"] = data[sender]["send_to"]   # a report does not forget the last sends
+            if isinstance((data.get(sender) or {}).get("send_on"), dict):
+                entry["send_on"] = data[sender]["send_on"]   # nor what a later report folds into (#352)
             data[sender] = entry
             _prune_last_reports(data)
             _write_small(state_dir, LAST_REPORT_FILE, data)

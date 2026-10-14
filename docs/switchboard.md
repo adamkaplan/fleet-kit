@@ -211,6 +211,15 @@ message. A `send` from another agent skips the batch.
   per sender, and a rider older than `rider_max_age_seconds` (default 3600) is
   dropped. Delivered riders are recorded by key like any fact. `pending` and
   `status` still list riders, marked `[rider]`.
+- **A report folds into the send before it (#352).** A done, failed, blocked or
+  question report that comes within 10 minutes of a message the same agent
+  delivered to the same boss on the same issue is not a second wake: it is
+  delivered in full as a note (an unread note is still converted to a wake, so
+  nothing is lost), with its state first (`question: ...`) and a mark that it
+  follows the earlier message. A different issue, another recipient, an older
+  send or no send at all is delivered as before. The record is `send_on` in
+  `last-reports.json` (at most 8 recipients per sender); the logic is
+  `bin/report_fold.py`.
 - **One line in the TUI (PR 13).** v2's TUI does not show a synthetic message's
   text, but it shows its `description` as one row. Every message the switchboard
   writes carries one, at most 200 characters, no newline: `switchboard: <sender>
