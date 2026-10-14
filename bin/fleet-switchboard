@@ -2080,16 +2080,17 @@ DOCKER_LABEL_EXPIRES = "fleet.expires"
 DOCKER_REAP_TIMEOUT = 60
 DOCKER_REAP_FILE = "docker-reap.json"
 DOCKER_REAP_INTERVAL = 86400
-_DOCKER_LISTS = (
-    ("container", ("ps", "-a", "--no-trunc", "--filter", "label=" + DOCKER_LABEL_EXPIRES, "--format",
-                   '{{.ID}}|{{.State}}|{{.Label "%s"}}|{{.Label "%s"}}' % (DOCKER_LABEL_EXPIRES, DOCKER_LABEL_OWNER))),
-    ("network", ("network", "ls", "--no-trunc", "--filter", "label=" + DOCKER_LABEL_EXPIRES, "--format",
-                 '{{.ID}}|-|{{.Label "%s"}}|{{.Label "%s"}}' % (DOCKER_LABEL_EXPIRES, DOCKER_LABEL_OWNER))),
-    ("volume", ("volume", "ls", "--filter", "label=" + DOCKER_LABEL_EXPIRES, "--format",
-                '{{.Name}}|-|{{.Label "%s"}}|{{.Label "%s"}}' % (DOCKER_LABEL_EXPIRES, DOCKER_LABEL_OWNER))),
-)
-_DOCKER_RUNNING_MOUNTS = ("ps", "--filter", "status=running", "--no-trunc", "--format", "{{.Mounts}}")
-_DOCKER_REMOVE = {"container": ("rm", "-f"), "network": ("network", "rm"), "volume": ("volume", "rm")}
+DOCKER_REAP_RETRY = 3600
+_DOCKER_LIST_IDS = {   # the ids only (never a label in a line: a label value may hold a newline), then `inspect` says the truth
+    "container": ("ps", "-a", "-q", "--no-trunc", "--filter", "label=" + DOCKER_LABEL_EXPIRES),
+    "network": ("network", "ls", "-q", "--no-trunc", "--filter", "label=" + DOCKER_LABEL_EXPIRES),
+    "volume": ("volume", "ls", "-q", "--filter", "label=" + DOCKER_LABEL_EXPIRES),
+}
+_DOCKER_RUNNING_IDS = ("ps", "-q", "--no-trunc", "--filter", "status=running")
+_DOCKER_REMOVE = {"container": ("rm", "-f", "--"), "network": ("network", "rm", "--"), "volume": ("volume", "rm", "--")}
+_DOCKER_ID = {"container": re.compile(r"[0-9a-f]{64}"), "network": re.compile(r"[0-9a-f]{64}"), "volume": re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,254}")}
+DOCKER_EPOCH_MIN = 10 ** 9      # an expiry before the year 2001 is not a plan, it is a way to get an object removed at once
+DOCKER_INSPECT_CHUNK = 100
 
 
 def _docker_run(docker, runner, argv):
@@ -2099,33 +2100,48 @@ def _docker_run(docker, runner, argv):
     return done.stdout or ""
 
 
-def _docker_objects(text, kind):
-    """(id, state, expires, owner) of each listed object that carries BOTH labels; a line without them, or an expiry that is not an epoch, is not ours."""
+def _docker_inspect(docker, runner, kind, ids):
+    """The inspect records of `ids` (a list of dicts): the labels as docker says they are NOW."""
     found = []
-    for line in text.splitlines():
-        parts = line.split("|", 3)
-        if len(parts) != 4:
-            continue
-        ident, state, expires, owner = (part.strip() for part in parts)
-        if not ident or not owner or not re.fullmatch(r"\d{1,12}", expires):
-            continue
-        found.append((ident, state, int(expires), owner))
+    for start in range(0, len(ids), DOCKER_INSPECT_CHUNK):
+        try:
+            records = json.loads(_docker_run(docker, runner, ("inspect", "--type", kind) + ("--",) + tuple(ids[start:start + DOCKER_INSPECT_CHUNK])) or "[]")
+        except ValueError:
+            raise OSError("docker inspect: not JSON")
+        found.extend(r for r in records if isinstance(r, dict))
     return found
+
+
+def _docker_labelled(kind, record):
+    """(id, owner, expires) when the record carries BOTH labels with an owner and an epoch expiry, else None. The id is checked against the strict shape for its kind."""
+    labels = ((record.get("Config") or {}).get("Labels") if kind == "container" else record.get("Labels")) or {}
+    ident = record.get("Id") if kind != "volume" else record.get("Name")
+    owner, expires = labels.get(DOCKER_LABEL_OWNER), labels.get(DOCKER_LABEL_EXPIRES)
+    if not (isinstance(ident, str) and _DOCKER_ID[kind].fullmatch(ident) and isinstance(owner, str) and owner.strip()
+            and isinstance(expires, str) and re.fullmatch(r"\d{1,12}", expires) and int(expires) >= DOCKER_EPOCH_MIN):
+        return None
+    return ident, owner.strip(), int(expires)
 
 
 def docker_reap(docker, runner, now, apply, audit=None, actor="daemon"):
     """Remove (apply) or list (dry run) the EXPIRED labelled docker objects. Returns {"removed": [...], "kept": [...], "errors": [...]}; each entry is
-    (kind, id, owner, expires) with a reason for a kept one. A listing that fails ends the run before anything is removed."""
+    (kind, id, owner, expires[, reason]). What is listed is only ids; each object's labels are read from `docker inspect` (not from a text line a label
+    could forge), and an id must have docker's own shape. A listing that fails ends the run before anything is removed. The listing and the removal are
+    two steps: a volume a container starts to use in between is refused by docker itself, which is the backstop."""
     result = {"removed": [], "kept": [], "errors": []}
     expired = {}
     try:
-        for kind, argv in _DOCKER_LISTS:
+        for kind, argv in _DOCKER_LIST_IDS.items():
+            ids = [line.strip() for line in _docker_run(docker, runner, argv).splitlines() if _DOCKER_ID[kind].fullmatch(line.strip())]
             expired[kind] = []
-            for ident, state, expires, owner in _docker_objects(_docker_run(docker, runner, argv), kind):
-                if expires <= now:
-                    expired[kind].append((ident, owner, expires))
+            for record in _docker_inspect(docker, runner, kind, ids) if ids else []:
+                labelled = _docker_labelled(kind, record)
+                if labelled is None:
+                    continue
+                if labelled[2] <= now:
+                    expired[kind].append(labelled)
                 else:
-                    result["kept"].append((kind, ident, owner, expires, "not expired"))
+                    result["kept"].append((kind,) + labelled + ("not expired",))
     except (OSError, subprocess.SubprocessError) as err:
         result["errors"].append(_plain(str(err), 200))
         return result
@@ -2137,21 +2153,27 @@ def docker_reap(docker, runner, now, apply, audit=None, actor="daemon"):
             except (OSError, subprocess.SubprocessError) as err:
                 result["errors"].append(_plain("%s %s: %s" % (kind, ident, err), 200))
                 return
-            if audit is not None:
-                audit.append(actor, "docker.reaped", ident, {"kind": kind, "owner": owner, "expires": expires})
+            result["removed"].append((kind, ident, owner, expires))
+            try:
+                if audit is not None:
+                    audit.append(actor, "docker.reaped", ident, {"kind": kind, "owner": owner, "expires": expires})
+            except Exception as err:   # the object is already gone: say the audit failed and go on with the rest
+                result["errors"].append(_plain("audit of %s %s failed: %s" % (kind, ident, err), 200))
+            return
         result["removed"].append((kind, ident, owner, expires))
 
-    for ident, owner, expires in expired["container"]:
-        remove("container", ident, owner, expires)
-    for ident, owner, expires in expired["network"]:
-        remove("network", ident, owner, expires)
+    for labelled in expired["container"]:
+        remove("container", *labelled)
+    for labelled in expired["network"]:
+        remove("network", *labelled)
     if expired["volume"]:
         try:
-            mounted = _docker_run(docker, runner, _DOCKER_RUNNING_MOUNTS)   # after the containers went: what a still-running one holds
+            running = [line.strip() for line in _docker_run(docker, runner, _DOCKER_RUNNING_IDS).splitlines() if _DOCKER_ID["container"].fullmatch(line.strip())]
+            in_use = {m.get("Name") for r in (_docker_inspect(docker, runner, "container", running) if running else []) for m in (r.get("Mounts") or [])
+                      if isinstance(m, dict) and m.get("Type") == "volume"}   # after the containers went: what a still-running one holds
         except (OSError, subprocess.SubprocessError) as err:
             result["errors"].append(_plain(str(err), 200))
             return result
-        in_use = {name.strip() for line in mounted.splitlines() for name in line.split(",") if name.strip()}
         for ident, owner, expires in expired["volume"]:
             if ident in in_use:
                 result["kept"].append(("volume", ident, owner, expires, "a running container mounts it"))
@@ -2201,16 +2223,23 @@ class DockerReapFacts:
         return []
 
     def _run(self, engine, runner, now):
+        stamp = now   # a failed run (no docker, a docker that would not answer) is tried again in an hour, not tomorrow
         try:
             docker = _docker_executable("docker")
-            if docker is None:   # said, and tried again tomorrow: a machine without docker has nothing to reap
+            if docker is None:
                 engine._note("docker.reap_unavailable", None, {})
+                stamp = now - DOCKER_REAP_INTERVAL + DOCKER_REAP_RETRY
             else:
                 result = docker_reap(docker, runner, now, True, engine.audit, engine.actor)
                 engine._note("docker.reap", None, {"removed": len(result["removed"]), "errors": result["errors"][:3]})
+                if result["errors"]:
+                    stamp = now - DOCKER_REAP_INTERVAL + DOCKER_REAP_RETRY
             path = Path(engine.state_dir) / DOCKER_REAP_FILE
             temp = path.with_name("%s.%d.tmp" % (DOCKER_REAP_FILE, os.getpid()))
-            temp.write_text(json.dumps({"at": now}))
+            with open(str(temp), "w") as handle:
+                handle.write(json.dumps({"at": stamp}))
+                handle.flush()
+                os.fsync(handle.fileno())
             os.replace(str(temp), str(path))
         except Exception as err:   # a reaper never stops the daemon
             engine._note("docker.reap_error", None, {"error": _plain("%s: %s" % (type(err).__name__, err), 160)})

@@ -12,6 +12,7 @@
 # volumes are what filled a disk; the labels in docs/switchboard.md ("Docker: label convention") are the second line of defence: `fleet-switchboard
 # disk reap-docker` removes what carries an expired `fleet.expires` label.
 #
+# It replaces any EXIT, INT or TERM trap the harness set before: register it first, or call your own cleanup after it.
 # Never uses sudo. `DOCKER` names the docker executable (default: docker).
 
 FLEET_COMPOSE_TRAP_ARGS=()
