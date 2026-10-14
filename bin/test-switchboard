@@ -47087,7 +47087,7 @@ class TestLoadAlert(Base):
     def test_reads_answered_304_are_free_and_not_counted(self):
         orch = self.many(40)
         asks = []
-        ctx = self.budget_ctx(self.T0, orch, asks, begin_read=lambda: 0, read_cost=lambda token: 0)   # every read answered 304
+        ctx = self.budget_ctx(self.T0, orch, asks, begin_read=lambda: 0, read_cost=lambda token, repo: 0)   # every read answered 304
         self.health.tick(ctx)
         self.assertEqual(len(asks), 40)                       # past the 30 budget: none was billed
         self.assertEqual(json.loads((self.state_dir / "load.json").read_text())["reads"], [])
@@ -47100,9 +47100,48 @@ class TestLoadAlert(Base):
         self.assertEqual((len([1 for _, repo, _ in asks if repo == "a/r"]), len([1 for _, repo, _ in asks if repo == "b/r"])), (30, 30))
         self.assertEqual(len(json.loads((self.state_dir / "load.json").read_text())["reads"]), 60)
 
+    def test_old_bare_number_rows_count_for_the_default_account_and_junk_rows_are_dropped(self):
+        orch = self.many(40)
+        (self.state_dir / "load.json").write_text(json.dumps({"reads": [self.T0 - 60] * 25 + [["x"], "junk", [self.T0 - 60, "default", 1], [self.T0 - 99999, "default"]]}))
+        asks = []
+        self.health.tick(self.budget_ctx(self.T0, orch, asks))
+        self.assertEqual(len(asks), 5)                        # 30 - 25 old rows left; the junk and the expired row count for nothing
+
+    def test_a_read_that_fails_is_still_charged(self):
+        def failing(charter, repo):
+            raise RuntimeError("gh is down")
+        ctx = self.health.Context(now=self.T0, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS), orchestrators=self.many(3),
+                                  read_asks=failing, cos="cos", wake=self.woken.append)
+        self.health.tick(ctx)
+        self.assertEqual(len(json.loads((self.state_dir / "load.json").read_text())["reads"]), 3)
+
+    def test_the_billing_snapshot_is_taken_under_the_accounts_lock_and_only_for_the_account(self):
+        calls = collections.deque()
+        lock = threading.Lock()
+        accounts = types.SimpleNamespace(calls=calls, lock=lock, paused={}, describe=lambda repo: repo.split("/")[0])
+        held = []
+        class Spy(collections.deque):
+            def __iter__(inner):
+                held.append(lock.locked())
+                return super().__iter__()
+        spy = Spy()
+        accounts.calls = spy
+        def _api(path, repo):
+            spy.append((self.T0 + len(spy) + 1, "a", "x", False))
+            spy.append((self.T0 + len(spy) + 1, "b", "x", False))   # another account's read at the same moment
+            return []
+        seen = lambda name, fleet: types.SimpleNamespace(name=name, fleet=fleet, status="idle")
+        intents = types.SimpleNamespace(repo="a/r", _api=_api, accounts=accounts, open_asks=lambda c, r: [])
+        engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.T0, audit=None, actor="daemon", intents=intents,
+                                       config={"load_alert": self.health.validate(None, "x")})
+        sb.load_tick(engine, types.SimpleNamespace(agents={"o": seen("o", {"role": "orchestrator", "charter": 1, "repo": "a/r"})}))
+        self.assertTrue(held and all(held))                    # every iteration of the shared deque happened with the lock held
+        reads = json.loads((self.state_dir / "load.json").read_text())["reads"]
+        self.assertEqual({a for _, a in reads}, {"a"})         # the other account's concurrent read is not charged
+
     def test_the_daemon_counts_what_github_billed_and_not_the_304s_nor_a_paused_account(self):
         calls = collections.deque()
-        accounts = types.SimpleNamespace(calls=calls, paused={"work": self.T0 + 600}, describe=lambda repo: "work" if repo.startswith("w/") else "default")
+        accounts = types.SimpleNamespace(calls=calls, lock=threading.Lock(), paused={"work": self.T0 + 600}, describe=lambda repo: "work" if repo.startswith("w/") else "default")
         def _api(path, repo):
             calls.append((self.T0 + len(calls) + 1, accounts.describe(repo), "x", "etag" in path))   # a path containing 'etag' stands for a 304
             return []

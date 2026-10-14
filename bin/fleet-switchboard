@@ -22832,10 +22832,18 @@ def load_tick(engine, discovery):
     meter = {}
     accounts = getattr(engine.intents, "accounts", None)
     if accounts is not None:   # the gh accounts' own books: which account a repo uses, whether it is paused (#361), and the reads GitHub really billed (a 304 is free)
-        def read_cost(since):
-            return sum(1 for call in list(accounts.calls) if call[0] > since and not call[3])
+        def snapshot():
+            with accounts.lock:   # GhAccounts.read appends and trims the deque from other threads under this lock
+                return list(accounts.calls)
+
+        def begin_read():
+            return max([call[0] for call in snapshot()] or [0])   # the newest read so far: what happens after it is this read's
+
+        def read_cost(since, repo):
+            account = accounts.describe(repo)   # only this account's reads are charged to it, and a 304 is free
+            return sum(1 for call in snapshot() if call[0] > since and call[1] == account and not call[3])
         meter = {"account_of": accounts.describe, "paused": lambda repo: accounts.paused.get(accounts.describe(repo), 0) > now,
-                 "begin_read": lambda: max([call[0] for call in list(accounts.calls)] or [0]), "read_cost": read_cost}
+                 "begin_read": begin_read, "read_cost": read_cost}
     return health.tick(health.Context(now=now, state_dir=engine.state_dir, cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, read_charters=read_charters, cos=cos, wake=wake, **meter))
 
 

@@ -319,7 +319,7 @@ def charter_agent(body):
 
 class _Budget:
     """The reads of the last hour, counted for each gh account (the repositories one account reads share its count). `ctx` may supply
-    `account_of(repo)`, `paused(repo)` and `begin_read()` / `read_cost(token)` (the reads GitHub really billed: a 304 is free); without them every
+    `account_of(repo)`, `paused(repo)` and `begin_read()` / `read_cost(token, repo)` (the reads GitHub really billed: a 304 is free); without them every
     repository is one account, nothing is paused and a read costs what the caller says."""
 
     def __init__(self, ctx, state, now):
@@ -358,7 +358,7 @@ class _Budget:
         try:
             return call()
         finally:
-            cost = cost_of(token) if begin and cost_of else default_cost
+            cost = cost_of(token, repo) if begin and cost_of else default_cost
             self.rows.extend([self.now, self.account(repo)] for _ in range(cost))
 
     def to_state(self):
