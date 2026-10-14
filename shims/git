@@ -79,7 +79,7 @@ def routed(args):
         if verb_at is None or not is_network(args, verb_at):
             return args
         if any(s.split("=", 1)[0].strip().lower().startswith("credential.") for s in settings):
-            return args   # the caller chose its own credential configuration
+            return args   # the caller chose its own credential configuration (any credential.* key opts out, for any host)
         return args[:verb_at] + ["-c", RESET_HELPER, "-c", FLEET_HELPER] + args[verb_at:]
     except Exception:
         return args   # never let the routing stop a command
@@ -90,7 +90,11 @@ def main(args):
     if git is None:
         sys.stderr.write("git: not found on PATH (the fleet shim found no real git behind it)\n")
         return 127
-    os.execv(git, [git] + routed(args))
+    try:
+        os.execv(git, [git] + routed(args))
+    except OSError as err:
+        sys.stderr.write("git: cannot run %s (%s)\n" % (git, err.strerror or err))
+        return 126
 
 
 if __name__ == "__main__":

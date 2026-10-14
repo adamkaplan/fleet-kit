@@ -11899,7 +11899,7 @@ class TestGitShim(Base):
                     self.assertEqual(done.returncode, 0, done.stderr)
                     self.assertEqual(seen["argv"], self.routed(*globals_, verb=verb, rest=rest))
         done, seen = self.run_git("remote", "update", "--prune")
-        self.assertEqual(seen["argv"], ["remote", "update", "--prune"][:0] + self.routed(verb="remote", rest=["update", "--prune"]))
+        self.assertEqual(seen["argv"], self.routed(verb="remote", rest=["update", "--prune"]))
         done, seen = self.run_git("-C", "/w", "remote", "-v", "update")
         self.assertEqual(seen["argv"], self.routed("-C", "/w", verb="remote", rest=["-v", "update"]))
 
@@ -11940,6 +11940,19 @@ class TestGitShim(Base):
         done, seen = self.run_git("status", path="%s:%s" % (GIT_SHIM.parent, SAFE_PATH), env={"FLEET_REAL_GIT": str(self.bin / "git")})
         self.assertEqual((done.returncode, seen["argv"]), (0, ["status"]), "FLEET_REAL_GIT names the real git")
 
+    def test_a_parse_it_does_not_understand_and_a_real_git_that_cannot_start_never_block_the_command(self):
+        for args in (("-c",), ("-C",), ("-c", "user.name=x")):   # a value option with no value, or no verb at all: nothing to route
+            with self.subTest(args=args):
+                done, seen = self.run_git(*args)
+                self.assertEqual(seen["argv"], list(args))
+        broken = self.home / "brokenbin"
+        broken.mkdir()
+        (broken / "git").write_text("#!/nonexistent/interpreter\n")
+        (broken / "git").chmod(0o755)
+        done, seen = self.run_git("status", path="%s:%s" % (GIT_SHIM.parent, broken))
+        self.assertEqual((done.returncode, seen), (126, None))
+        self.assertIn("git: cannot run", done.stderr)
+
     def test_the_shim_reads_no_token_and_prints_nothing_of_its_own(self):
         done, seen = self.run_git("push", env={"GH_TOKEN": "tok-secret"})
         self.assertNotIn("tok-secret", " ".join(seen["argv"]) + done.stdout + done.stderr)
@@ -11949,6 +11962,7 @@ class TestGitShim(Base):
         skill = " ".join((REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text().split())
         self.assertIn("git push works as the repository's account", skill)
         self.assertIn("no manual -c", skill)
+        self.assertIn("guardrail, not a boundary", skill)
 
     def test_the_shim_is_executable_stdlib_only_and_impersonal(self):
         text = GIT_SHIM.read_text()
