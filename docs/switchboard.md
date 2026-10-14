@@ -211,6 +211,17 @@ message. A `send` from another agent skips the batch.
   per sender, and a rider older than `rider_max_age_seconds` (default 3600) is
   dropped. Delivered riders are recorded by key like any fact. `pending` and
   `status` still list riders, marked `[rider]`.
+- **A report folds into the send before it (#352).** A done, failed, blocked or
+  question report that comes within 10 minutes of a message the same agent
+  delivered to the same boss on the same issue is not a second wake: it is
+  delivered in full as a note (an unread note is still converted to a wake), with
+  its state first (`question: ...`) and a mark that it follows the earlier message.
+  Only a send that woke the boss counts: one that was itself a note, or was held,
+  folds nothing. A different issue, another recipient, an older send or no send at
+  all is delivered as before. Under `v2_light` nothing folds, because a note is
+  not converted to a wake there: the report wakes as before, unmarked. The record is `send_on` in
+  `last-reports.json` (at most 8 recipients per sender); the logic is
+  `bin/report_fold.py`.
 - **One line in the TUI (PR 13).** v2's TUI does not show a synthetic message's
   text, but it shows its `description` as one row. Every message the switchboard
   writes carries one, at most 200 characters, no newline: `switchboard: <sender>
@@ -2272,6 +2283,8 @@ numbers below are the defaults; every `_days` value is in days and may be a frac
 | T9 | an ask with no activity (T3 takes precedence) | 3 days |
 | T10 | a closed issue still carrying an awaiting label | immediate |
 | T11 | an orphan: in no chain, no assignee, untouched (T1 takes precedence, so it covers items an agent works on) | 1 day |
+
+**The stale digest (#349).** What reaches the Chief of Staff is tuned, and its logic lives in `bin/triage_digest.py`. One digest per pass at most (an empty one is never sent). An item surfaces once, then again 1 day after, 3 days after that, 7 days after that, and from then on weekly; a change (a comment, a push, a label or a state change) shows it at once and restarts the steps. A `<user>:parked` item with a valid `Parked until:` date still ahead is skipped; a parked label with no valid date is treated as not parked (listed like any item) and flagged once. `fleet-switchboard triage seen-leave OWNER/REPO#N` mutes an item until it changes (`triage unmute`, `triage muted`); it writes one private file, nothing on GitHub. The memory is `triage-seen.json` (private, bounded); a lost or corrupt file makes every item surface once. `triage.backoff: false` restores the fixed `realarm_hours` re-alarm. `status` shows, for the last 7 days, the digests sent, the characters delivered and an estimate of tokens (characters / 4), from `triage-cost.json`; a day before the first record says `not recorded`.
 
 T4 and T12 are the sweep's S5 and the report fold; they are not repeated. **Another person's or team's issue or PR is never
 our violation:** an item whose author and assignees are none of ours (`our_logins`), that is in no chain, is not
