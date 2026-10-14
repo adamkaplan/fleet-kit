@@ -89,16 +89,22 @@ if docker info >/dev/null 2>&1; then
   printf 'FROM busybox\nRUN echo "GITHUB_TOKEN=ghp_%s" > /t\nRUN rm /t\n' "$(printf 'c%.0s' $(seq 36))" > "$tmp/Dockerfile.deleted"
   # a secret in the image env
   printf 'FROM busybox\nENV GH_TOKEN=ghp_%s\n' "$(printf 'd%.0s' $(seq 36))" > "$tmp/Dockerfile.env"
-  for v in deleted env; do docker build -q -t "fk-scan-$v" -f "$tmp/Dockerfile.$v" "$tmp" >/dev/null 2>&1; done
-  for v in deleted env; do
-    "$here/worker/scan-secrets.sh" "fk-scan-$v" >/dev/null 2>&1 && bad "$v-layer secret passed" || ok "image with secret ($v) fails"
-    docker rmi "fk-scan-$v" >/dev/null 2>&1
+  # build every image; a failed build is a test failure, never a pass
+  cp "$tmp/Dockerfile" "$tmp/Dockerfile.baked"
+  built=1
+  for v in baked deleted env clean; do
+    docker build -q -t "fk-scan-$v" -f "$tmp/Dockerfile.$v" "$tmp" >/dev/null 2>&1 || { bad "image build failed: $v"; built=0; }
   done
-  if docker build -q -t fk-scan-dirty -f "$tmp/Dockerfile" "$tmp" >/dev/null 2>&1 && docker build -q -t fk-scan-clean -f "$tmp/Dockerfile.clean" "$tmp" >/dev/null 2>&1; then
+  if [ $built = 1 ]; then
+    # secret images: exit exactly 1 and the report names the pattern
+    for v in baked deleted env; do
+      out=$("$here/worker/scan-secrets.sh" "fk-scan-$v" 2>&1); rc=$?
+      [ "$rc" = 1 ] && echo "$out" | grep -q 'github-token\|generic-token-assignment' \
+        && ok "image with secret ($v): exit 1 and pattern named" || bad "image with secret ($v) rc=$rc"
+    done
     "$here/worker/scan-secrets.sh" fk-scan-clean >/dev/null 2>&1 && ok "clean image: 0 hits" || bad "clean image"
-    "$here/worker/scan-secrets.sh" fk-scan-dirty >/dev/null 2>&1 && bad "baked-in token passed" || ok "baked-in token image fails"
-    docker rmi fk-scan-dirty fk-scan-clean >/dev/null 2>&1
-  else echo "skip image build failed (offline?)"; fi
+  fi
+  docker rmi fk-scan-baked fk-scan-deleted fk-scan-env fk-scan-clean >/dev/null 2>&1
 else
   [ "${CLOUD_TEST_SKIP_DOCKER:-0}" = 1 ] && echo "skip docker not running (CLOUD_TEST_SKIP_DOCKER=1)" || bad "docker is required for the image-scan cases (set CLOUD_TEST_SKIP_DOCKER=1 to skip)"
 fi
