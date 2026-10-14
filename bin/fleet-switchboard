@@ -7040,6 +7040,9 @@ def cmd_handoff(args, runner, now, socket_call=None):
     return EXIT_OK
 
 
+cmd_handoff.ensure_on_use = True   # the daemon is alive when it runs
+
+
 def cmd_comment(args, runner, now):
     """Post a comment as the calling agent, signed so the switchboard does not deliver it back."""
     engine, _, config = build_engine(runner, now, "cli")
@@ -7057,6 +7060,9 @@ def cmd_comment(args, runner, now):
     url = post_ask_comment(engine, number, body, author=caller, repo=repo)
     print(json.dumps({"issue": number, "author": caller, "comment": url}, sort_keys=True))
     return EXIT_OK
+
+
+cmd_comment.ensure_on_use = True   # the daemon is alive when it runs
 
 
 def cmd_whoami(args, runner, now):
@@ -9921,6 +9927,9 @@ def cmd_decisions(args, runner, now):
     return EXIT_ERROR if report["stale"] else EXIT_OK
 
 
+cmd_decisions.ensure_on_use = True   # the daemon is alive when it runs
+
+
 def decisions_summary(state_dir, now):
     """For `status`: how many decisions the file lists (and how many of them are yours, the Chief of Staff's, an
     orchestrator's), and whether the daemon keeps it current."""
@@ -12023,6 +12032,9 @@ def cmd_remind(args, runner, now):
     return EXIT_OK
 
 
+cmd_remind.ensure_on_use = True   # the daemon is alive when it runs
+
+
 # ======================================================= GitHub events (PR 5)
 #
 # One section, self-contained. The pieces, in the order they are built:
@@ -14116,6 +14128,9 @@ def cmd_status(args, runner=subprocess.run, now=time.time):
     return EXIT_OK if report["ok"] else EXIT_ERROR
 
 
+cmd_status.direct = True   # no error mapping, no daemon start
+
+
 class CallerError(Exception):
     """`send` cannot tell which fleet agent is calling."""
 
@@ -14307,6 +14322,9 @@ def cmd_poke(args):
     return EXIT_OK
 
 
+cmd_poke.direct = True   # no error mapping, no daemon start
+
+
 def read_brief(path, stdin):
     """The brief for `launch`: a file, or `-` for standard input. None when not given."""
     if path is None:
@@ -14389,6 +14407,9 @@ def cmd_launch(args, runner, now, socket_call=None):
     if note and (brief or args.checkpoint or args.overdue):
         sys.stderr.write("%s: %s\n" % (PROG, note))
     return EXIT_OK
+
+
+cmd_launch.ensure_on_use = True   # the daemon is alive when it runs
 
 
 
@@ -14541,6 +14562,9 @@ def cmd_send(args, runner, now):
     return code
 
 
+cmd_send.ensure_on_use = True   # the daemon is alive when it runs
+
+
 def _cmd_send(args, runner, now):
     engine, _, config = build_engine(runner, now, "cli")
     refusal = intent_refusal(config, args.issue)
@@ -14613,6 +14637,9 @@ def cmd_report(args, runner, now):
     for line in outcome.get("worktrees") or []:
         sys.stderr.write("%s: worktree: %s\n" % (PROG, line))
     return EXIT_OK
+
+
+cmd_report.ensure_on_use = True   # the daemon is alive when it runs
 
 
 def notice_boss(engine, sender):
@@ -14744,6 +14771,9 @@ def cmd_notice(args, runner, now):
                      "(nobody was messaged)\n" % (PROG, repo, number, "refreshed" if refreshed else "recorded"))
     print("%s#%d" % (repo, number))
     return EXIT_OK
+
+
+cmd_notice.ensure_on_use = True   # the daemon is alive when it runs
 
 
 def cmd_pending(args, runner, now):
@@ -15689,6 +15719,9 @@ def cmd_intent(args, runner, now):
     _, ask_header, _, work_header = found
     print("\n".join(ask_header + work_header))
     return EXIT_OK
+
+
+cmd_intent.ensure_on_use = True   # the daemon is alive when it runs
 
 
 def caller_fleet(herdr, v2, environ):
@@ -16868,6 +16901,9 @@ def cmd_prove(args, runner, now):
     return EXIT_OK
 
 
+cmd_prove.ledger = True   # state and GETs only; its own errors are usage errors
+
+
 def cmd_verdict(args, runner, now):
     """`verdict <scenario> --pr <repo#N> --as <evaluator> --result ...`: record the evaluator's verdict for a scenario. Only
     the evaluator the scenario names, only by an agent registered for it (`plan_evaluators`), never by a writer of the PR."""
@@ -16931,6 +16967,9 @@ def cmd_verdict(args, runner, now):
     return EXIT_OK
 
 
+cmd_verdict.ledger = True   # state and GETs only; its own errors are usage errors
+
+
 def cmd_waive(args, runner, now):
     """`waive <repo#N> --gates G0a,G1 --reason "..."`: the logged override of G0 to G5 for ONE PR at ITS CURRENT HEAD, for a hotfix.
     The chief of staff or a person at a shell only (an unknown session is refused, never read as a person: #138); never G6, G7 or
@@ -16971,6 +17010,9 @@ def cmd_waive(args, runner, now):
     return EXIT_OK
 
 
+cmd_waive.ledger = True   # state and GETs only; its own errors are usage errors
+
+
 def cmd_gates(args, runner, now):
     """`gates <repo#N>`: read-only. One line per gate G0a to G8: status, who decides it, what is missing. Exit 0 when every
     tracked gate that applies to a PR is satisfied, 1 when something is missing, 2 when it cannot be read. Enforces nothing."""
@@ -17008,6 +17050,9 @@ def cmd_gates(args, runner, now):
         print("\n".join(lines))
     ok = report["ready"] if getattr(args, "all_gates", False) else report["ready_enforced"]   # --all: the full board
     return EXIT_OK if ok else EXIT_ERROR
+
+
+cmd_gates.ledger = True   # state and GETs only; its own errors are usage errors
 
 
 def gates_stats_core(entries, merged_at, limit=10):
@@ -17103,6 +17148,9 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
 def cmd_impact(args, runner, now):
     """`impact floor|hold|clear`."""
     return {"floor": cmd_impact_floor, "hold": cmd_impact_hold, "clear": cmd_impact_clear}[args.impact_action](args, runner, now)
+
+
+cmd_impact.direct = True   # no error mapping, no daemon start
 
 
 def cmd_impact_floor(args, runner, now):
@@ -17670,6 +17718,9 @@ def cmd_gates_check(args, runner, now):
     elif payload["verdict"] == "fail-open":
         sys.stderr.write("%s: gates-check: could not check (%s): allowed\n" % (PROG, payload["reason"]))
     return exit_code
+
+
+cmd_gates_check.ledger = True   # state and GETs only; its own errors are usage errors
 
 
 ANCESTOR_DEPTH = 25
@@ -18466,6 +18517,9 @@ def cmd_review_laws(args, runner, now):
     return EXIT_OK
 
 
+cmd_review_laws.direct = True   # no error mapping, no daemon start
+
+
 # ---------------------------------------------------------------- `review record` and `review laws` (#179, slice L2)
 
 REVIEW_LAW_FILES = REVIEW_LAWS_FILES + ("REVIEW_OVERLAY.md",)   # the laws a reviewer loads, and the repository's own overlay
@@ -18648,6 +18702,9 @@ def cmd_review(args, runner, now):
     except (ReviewError, plan_ledger.LedgerError, ConfigError, IdentityUncertain, CallerError) as err:
         sys.stderr.write("%s: review: %s\n" % (PROG, _one_line(str(err), 400)))
         return EXIT_USAGE
+
+
+cmd_review.direct = True   # no error mapping, no daemon start
 
 
 # ---------------------------------------------------------------- `review measure` (#179, slice L7)
@@ -19003,6 +19060,9 @@ def cmd_pr_explain(args, runner, now):
     else:
         print(block)
     return EXIT_OK
+
+
+cmd_pr_explain.direct = True   # no error mapping, no daemon start
 
 
 def add_pr_explain_parsers(sub):
@@ -21319,6 +21379,9 @@ def cmd_judge_tool(args, runner, now, stdin=None):
     return EXIT_OK
 
 
+cmd_judge_tool.direct = True   # no error mapping, no daemon start
+
+
 POLICY_LIVENESS_SECONDS = 30 * 60   # agents active and no policy.judge for this long is an alarm
 POLICY_AUDIT_TAIL = 8 << 20         # bytes of the audit log's end that a report reads
 
@@ -21440,6 +21503,9 @@ def cmd_policy_report(args, runner, now):
     print("  enforced       %d ask, %d deny" % (sample["tightened_ask"], sample["tightened_deny"]))
     print("  latency        p50 %s ms, p95 %s ms" % ("-" if p50 is None else p50, "-" if p95 is None else p95))
     return EXIT_OK
+
+
+cmd_policy_report.direct = True   # no error mapping, no daemon start
 
 
 def record_mode_flips(environ=None):
@@ -22597,14 +22663,14 @@ def build_parser():
 #
 # A command is two functions named for it and nothing else: `add_<name>_parsers(sub)` (registers its argparse parsers; found by name) and
 # `cmd_<action with - as _>(args, ...)` (runs it; found by name). `main` lists neither. The few special cases are explicit, here, and are the only
-# things a new command could ever need to edit: DIRECT_ACTIONS (run outside the error mapping and without ensuring the daemon),
-# LEDGER_ACTIONS (their own errors are usage errors) and ENSURE_ON_USE_COMMANDS (the daemon is started first).
+# things a new command could ever need to edit: nothing shared. Its dispatch group is said next to its own definition, as an attribute of the
+# function: `cmd_x.direct = True` (run outside the error mapping and without ensuring the daemon), `cmd_x.ledger = True` (its own errors are usage
+# errors) and `cmd_x.ensure_on_use = True` (the daemon is started first). DIRECT_ACTIONS, LEDGER_ACTIONS and ENSURE_ON_USE_COMMANDS below are VIEWS of
+# those attributes, derived once everything is defined (see `derive_action_groups`), never lists to edit; `dispatch` asks the view AND the attribute
+# (a test that swaps a command's function for a recorder keeps the group the module defined).
 
 COMMAND_NAME_RE = re.compile(r"[a-z][a-z0-9-]*")
 REGISTRAR_NAME_RE = re.compile(r"add_[a-z0-9_]+_parsers")
-DIRECT_ACTIONS = frozenset({"status", "poke", "policy-report", "review-laws", "review", "pr-explain", "impact", "plan", "judge-tool"})   # no error mapping, no daemon start
-# A new command may instead say it is direct next to its own definition (`cmd_x.direct = True`), so it edits no shared line either.
-LEDGER_ACTIONS = frozenset({"prove", "verdict", "waive", "gates", "gates-check"})   # #107: state and GETs only; their own errors are usage errors
 COMMAND_ARGUMENTS = ("args", "runner", "now", "spawn", "socket_call", "wait")   # what a command function may ask for, by parameter name
 
 
@@ -22642,6 +22708,9 @@ def cmd_plan(args, runner, now, socket_call=None):
     return cmd_plan_check(args, runner, now)
 
 
+cmd_plan.direct = True   # no error mapping, no daemon start
+
+
 def dispatch(args, known, runner=subprocess.run, now=time.time, wait=None, spawn=subprocess.Popen, socket_call=None):
     """Run the parsed command: the exit code. `known` is the set of registered subcommands (parser.commands)."""
     available = {"args": args, "runner": runner, "now": now, "spawn": spawn, "socket_call": socket_call, "wait": wait}
@@ -22653,9 +22722,9 @@ def dispatch(args, known, runner=subprocess.run, now=time.time, wait=None, spawn
         return call_command(handler, **available)
     try:
         if handler is not None:
-            if args.action in ENSURE_ON_USE_COMMANDS:  # PR 16: the daemon is alive when a command needs it
+            if args.action in ENSURE_ON_USE_COMMANDS or getattr(handler, "ensure_on_use", False) is True:  # PR 16: the daemon is alive when a command needs it
                 ensure_on_use(spawn)
-            if args.action in LEDGER_ACTIONS:
+            if args.action in LEDGER_ACTIONS or getattr(handler, "ledger", False) is True:
                 try:
                     return call_command(handler, **available)
                 except (LedgerCommandError, PlanInputError, plan_ledger.LedgerError) as err:
@@ -22730,8 +22799,7 @@ COS_WORKSPACE_LABEL = "Chief of Staff"
 NO_KEY_NOTICE = "No decision-model key: messages are not classified and tool calls are not judged."
 
 ENSURE_ON_USE = True  # tests switch it off: a command run in a test must never start a real daemon
-ENSURE_ON_USE_COMMANDS = ("send", "report", "notice", "launch", "handoff", "comment", "remind", "decisions", "intent",
-                          "bootstrap")  # never `judge-tool`: it runs inside v2 on every tool call
+ENSURE_ON_USE_COMMANDS = ()   # derived at the end of the module from `cmd_x.ensure_on_use` (never `judge-tool`: it runs inside v2 on every tool call)
 USE_ENSURE_PATIENCE = 2.0  # seconds a command waits for a daemon it started; then it goes on without
 
 
@@ -23087,6 +23155,9 @@ def cmd_bootstrap(args, runner, now, socket_call=None):
         return EXIT_ERROR
     print(json.dumps(done, sort_keys=True))
     return EXIT_OK
+
+
+cmd_bootstrap.ensure_on_use = True   # the daemon is alive when it runs
 
 
 # ------------------------------------------------- the profile pieces (shared)
@@ -25699,6 +25770,27 @@ def add_decision_list_flags(parser, suppress=False):
     parser.add_argument("--watch", action="store_true", help="Redraw when the list changes, until Ctrl-C (a "
                                                             "fallback for a terminal without the TUI plugin)", **given)
     parser.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name", **given)
+
+
+
+def derive_action_groups():
+    """Fill DIRECT_ACTIONS, LEDGER_ACTIONS and ENSURE_ON_USE_COMMANDS from the `direct`, `ledger` and `ensure_on_use` attributes of the `cmd_*`
+    functions (a command says its group next to its own definition; nothing shared is edited to add one). Called once, last."""
+    global DIRECT_ACTIONS, LEDGER_ACTIONS, ENSURE_ON_USE_COMMANDS
+    chosen = {"direct": set(), "ledger": set(), "ensure_on_use": []}
+    registered = build_parser().commands
+    for name in sorted(n for n in globals() if n.startswith("cmd_") and callable(globals()[n])):
+        action = name[4:].replace("_", "-")
+        if action not in registered:   # a helper of a command (`cmd_disk_prune`), not a command
+            continue
+        for group in chosen:
+            if getattr(globals()[name], group, False) is True:
+                (chosen[group].add if group != "ensure_on_use" else chosen[group].append)(action)
+    DIRECT_ACTIONS, LEDGER_ACTIONS = frozenset(chosen["direct"]), frozenset(chosen["ledger"])
+    ENSURE_ON_USE_COMMANDS = tuple(chosen["ensure_on_use"])
+
+
+derive_action_groups()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,4 @@
+{
+ "command": "impact",
+ "help": "usage: fleet-switchboard impact [-h] {floor,hold,clear} ... positional arguments: {floor,hold,clear} floor What the path-glob floor (and an optional independent rating) would decide for a PR hold What the daemon would label as held right now (read-only dry run; the daemon writes the labels) clear The owner's own terminal only: clear a false impact hold for this head, with a reason options: -h, --help show this help message and exit"
+}

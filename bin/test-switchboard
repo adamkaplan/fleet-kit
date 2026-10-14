@@ -11136,7 +11136,18 @@ class TestSelfRegisteringCli(unittest.TestCase):
     """The front door (#179 follow-up): commands register and dispatch BY NAME, so a new command edits no shared list. What must not change: the set of
     subcommands and each one's help, the function each runs and what it is given, the daemon start, the error mapping; and a hostile name never runs
     an arbitrary function."""
-    SURFACE = REPO / "scenarios" / "switchboard" / "cli-surface" / "commands.json"
+    SURFACE_DIR = REPO / "scenarios" / "switchboard" / "cli-surface" / "commands"   # ONE file per command: two PRs adding different commands never touch the same file
+
+    @classmethod
+    def read_surface(cls):
+        """{"commands": [sorted names], "help": {name: help}} read from the per-command files; a file whose name and `command` disagree is an error."""
+        found = {}
+        for path in sorted(cls.SURFACE_DIR.glob("*.json")):
+            entry = json.loads(path.read_text())
+            if entry.get("command") != path.stem:
+                raise AssertionError("%s describes %r: a snapshot file is named for its command" % (path.name, entry.get("command")))
+            found[path.stem] = entry["help"]
+        return {"commands": sorted(found), "help": found}
     # Written from the OLD dispatch chain, not derived from the new code: action -> (function, the arguments it was called with)
     OLD = {
         "status": ("cmd_status", ("args", "runner", "now")), "poke": ("cmd_poke", ("args",)), "policy-report": ("cmd_policy_report", ("args", "runner", "now")),
@@ -11173,12 +11184,97 @@ class TestSelfRegisteringCli(unittest.TestCase):
     def test_every_subcommand_of_the_snapshot_still_exists_with_the_same_help(self):
         _, choices = self.commands()
         if os.environ.get("CLI_SURFACE_UPDATE") == "1":
-            self.SURFACE.write_text(json.dumps({"commands": sorted(choices), "help": {n: self.plain(choices[n].format_help()) for n in sorted(choices)}}, indent=1, sort_keys=True))
-        snap = json.loads(self.SURFACE.read_text())
+            self.SURFACE_DIR.mkdir(parents=True, exist_ok=True)
+            for stale in self.SURFACE_DIR.glob("*.json"):
+                stale.unlink()
+            for name in sorted(choices):
+                (self.SURFACE_DIR / ("%s.json" % name)).write_text(json.dumps({"command": name, "help": self.plain(choices[name].format_help())}, indent=1, sort_keys=True) + "\n")
+        snap = self.read_surface()
         self.assertEqual(sorted(choices), snap["commands"], "the set of subcommands changed")
         for name in snap["commands"]:
             with self.subTest(command=name):
                 self.assertEqual(self.plain(choices[name].format_help()), snap["help"][name])
+
+    def test_a_command_without_a_snapshot_file_and_a_file_without_a_command_each_fail_and_name_it(self):
+        _, choices = self.commands()
+        snap = self.read_surface()
+        for pretend, expect in (({"commands": sorted(set(snap["commands"]) - {"status"}), "help": snap["help"]}, "status"),
+                                ({"commands": sorted(set(snap["commands"]) | {"ghost-command"}), "help": snap["help"]}, "ghost-command")):
+            with self.subTest(expect=expect):
+                with self.assertRaises(AssertionError) as raised:
+                    self.assertEqual(sorted(choices), pretend["commands"], "the set of subcommands changed")
+                self.assertIn(expect, str(raised.exception) + " ".join(sorted(set(choices) ^ set(pretend["commands"]))))
+        with tempfile.TemporaryDirectory() as work:      # a file named for one command but describing another is refused
+            bad = Path(work) / "alpha.json"
+            bad.write_text(json.dumps({"command": "beta", "help": "x"}))
+            with mock.patch.object(self.__class__, "SURFACE_DIR", Path(work)):
+                with self.assertRaises(AssertionError) as raised:
+                    self.read_surface()
+            self.assertIn("alpha.json", str(raised.exception))
+
+    def test_the_snapshot_is_one_file_per_command_with_a_full_help_text(self):
+        files = sorted(self.SURFACE_DIR.glob("*.json"))
+        self.assertGreater(len(files), 40)
+        self.assertFalse((self.SURFACE_DIR.parent / "commands.json").exists(), "the old single shared file is gone")
+        for path in files:
+            entry = json.loads(path.read_text())
+            self.assertEqual(sorted(entry), ["command", "help"], path.name)
+            self.assertTrue(entry["help"].startswith("usage: fleet-switchboard " + path.stem), path.name)
+
+    def test_a_new_command_edits_no_shared_table_it_registers_says_its_group_beside_itself_and_dispatches(self):
+        calls, ensured = [], []
+
+        def add_fixture_parsers(sub):
+            sub.add_parser("fixture", help="a command added with no shared edit")
+
+        def cmd_fixture(args, runner, now):
+            calls.append("fixture")
+            raise sb.LedgerCommandError("a ledger error is a usage error")
+
+        cmd_fixture.ledger = True
+        cmd_fixture.ensure_on_use = True
+        names = {"add_fixture_parsers": add_fixture_parsers, "cmd_fixture": cmd_fixture}
+        before = (sb.DIRECT_ACTIONS, sb.LEDGER_ACTIONS, sb.ENSURE_ON_USE_COMMANDS)
+        with mock.patch.dict(sb.__dict__, names), mock.patch.object(sb, "ensure_on_use", lambda spawn=None: ensured.append("ensured")):
+            parser = sb.build_parser()
+            self.assertIn("fixture", parser.commands)
+            code = sb.dispatch(types.SimpleNamespace(action="fixture"), parser.commands, runner="R", now="N")
+            sb.derive_action_groups()
+            self.assertIn("fixture", sb.LEDGER_ACTIONS)
+            self.assertIn("fixture", sb.ENSURE_ON_USE_COMMANDS)
+            self.assertNotIn("fixture", sb.DIRECT_ACTIONS)
+        sb.derive_action_groups()
+        self.assertEqual((sb.DIRECT_ACTIONS, sb.LEDGER_ACTIONS, sb.ENSURE_ON_USE_COMMANDS), before, "the groups return to what the module defines")
+        self.assertEqual((calls, ensured, code), (["fixture"], ["ensured"], sb.EXIT_USAGE), "it ran, the daemon was ensured first, the ledger error mapped to a usage error")
+
+    def test_two_branches_that_add_different_commands_touch_no_common_file_and_merge_cleanly(self):
+        with tempfile.TemporaryDirectory() as work:
+            env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.test", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.test",
+                       GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
+
+            def git(*args):
+                done = subprocess.run(["git", "-C", work] + list(args), capture_output=True, text=True, env=env)
+                self.assertEqual(done.returncode, 0, "git %s: %s%s" % (args, done.stdout, done.stderr))
+                return done.stdout
+
+            git("init", "-q", "-b", "main")
+            target = Path(work) / "scenarios" / "switchboard" / "cli-surface" / "commands"
+            target.mkdir(parents=True)
+            for existing in self.SURFACE_DIR.glob("*.json"):
+                (target / existing.name).write_text(existing.read_text())
+            git("add", ".")
+            git("commit", "-qm", "base")
+            touched = []
+            for branch, name in (("one", "alpha-cmd"), ("two", "beta-cmd")):
+                git("checkout", "-q", "-b", branch, "main")
+                (target / ("%s.json" % name)).write_text(json.dumps({"command": name, "help": "usage: fleet-switchboard %s" % name}))
+                git("add", ".")
+                git("commit", "-qm", name)
+                touched.append(set(git("diff", "--name-only", "main", branch).split()))
+            self.assertEqual(touched[0] & touched[1], set(), "0 files changed by both branches")
+            git("checkout", "-q", "one")
+            git("merge", "--no-edit", "two")
+            self.assertTrue((target / "alpha-cmd.json").exists() and (target / "beta-cmd.json").exists())
 
     def test_the_old_dispatch_table_covers_every_command_but_version(self):
         parser, choices = self.commands()
@@ -11234,7 +11330,10 @@ class TestSelfRegisteringCli(unittest.TestCase):
         self.assertIn(sb.VERSION, out.getvalue())
 
     def test_the_error_mapping_and_the_special_groups_are_what_they_were(self):
-        self.assertEqual(sorted(sb.DIRECT_ACTIONS), sorted(self.OLD_DIRECT))
+        # the groups are VIEWS of the `direct`, `ledger` and `ensure_on_use` attributes each command sets next to its own definition: every command that
+        # was in a shared list is still in its group, and the only additions are commands that already said `direct` themselves
+        self.assertTrue(set(self.OLD_DIRECT) <= set(sb.DIRECT_ACTIONS))
+        self.assertEqual(set(sb.DIRECT_ACTIONS) - set(self.OLD_DIRECT), {"disk", "load-replay", "pr-state", "triage"})
         self.assertEqual(sorted(sb.LEDGER_ACTIONS), sorted(self.OLD_LEDGER))
         self.assertEqual(sorted(sb.ENSURE_ON_USE_COMMANDS), sorted(self.OLD_ENSURE_ON_USE))
         known = self.commands()[0].commands
