@@ -19,6 +19,7 @@ STATE_FILE = "load.json"
 MOVES_FILE = "ask-moves.jsonl"
 MOVES_KEEP_SECONDS = 24 * 3600
 AUDIT_TAIL_BYTES = 8 << 20
+HISTORY_DAYS = 3                 # finished days of the hourly series kept for the replay
 READ_BUDGET = 10                 # GitHub reads of asks lists in any hour, for the whole fleet
 ASKS_FRESH_SECONDS = 3600        # a cached list of asks is re-read at most this often
 ASKS_STALE_SECONDS = 3 * 3600    # a list older than this is not believed: the figure is not recorded
@@ -197,7 +198,7 @@ def crossing(fig, cfg):
     if fig["stalled"] >= cfg["stalled_asks"]:
         reasons.append("stalled"); severity += fig["stalled"]
     full = fig["busy"] > 0 and fig["idle"] == 0
-    if full and fig["open_asks"] > fig["moved_backlog"]:
+    if full and fig.get("moved_backlog") is not None and fig["open_asks"] > fig["moved_backlog"]:
         reasons.append("backlog"); severity += fig["open_asks"] - fig["moved_backlog"]
     return severity, reasons
 
@@ -320,8 +321,14 @@ def tick(ctx):
         fig = figures(name, {"asks": asks, "busy": info["busy"], "idle": info["idle"], "messages": info["messages"],
                              "decisions": None if waiting is None else waiting.get(name, 0)}, rows, now, ctx.cfg)
         latest[name] = fig
-        mine = series.get(name) if isinstance(series.get(name), dict) and series[name].get("day") == day else {"day": day, "hours": {}}
-        mine["hours"][hour] = {k: fig[k] for k in ("open_asks", "stalled", "moved_1h", "busy", "idle", "messages", "decisions", "oldest_stall_hours")}
+        old = series.get(name)
+        if isinstance(old, dict) and old.get("day") != day and old.get("hours"):   # a new UTC day: the finished day stays replayable for a few days
+            history = state.setdefault("history", {})
+            history.setdefault(old["day"], {})[name] = old["hours"]
+            for gone in sorted(history)[:-HISTORY_DAYS]:
+                del history[gone]
+        mine = old if isinstance(old, dict) and old.get("day") == day else {"day": day, "hours": {}}
+        mine["hours"][hour] = {k: fig[k] for k in ("open_asks", "stalled", "stalled_asks", "moved_1h", "moved_backlog", "busy", "idle", "messages", "decisions", "oldest_stall_hours")}
         series[name] = mine
         before = episodes.get(name)
         text, episodes[name] = judge(fig, ctx.cfg, before)
@@ -355,3 +362,31 @@ def status_lines(state_dir, now):
     if state.get("problems"):
         out.append("  unreadable: %s" % "; ".join(state["problems"][:3]))
     return out
+
+
+def replay(state_dir, cfg, day=None):
+    """What the alert WOULD have done over a recorded day of the hourly series (the current day, or `day` while it is kept): a list of
+    {orchestrator, hour, severity, reasons, text}, one per wake, in time order, by the same rule the daemon applies (once per episode).
+    (days, firings): the days that are recorded, and the firings of the one asked for (None when it is not recorded)."""
+    state = _read_state(state_dir)
+    by_day = {d: dict(names) for d, names in (state.get("history") or {}).items() if isinstance(names, dict)}
+    for name, entry in (state.get("series") or {}).items():
+        if isinstance(entry, dict) and entry.get("day") and isinstance(entry.get("hours"), dict):
+            by_day.setdefault(entry["day"], {})[name] = entry["hours"]
+    days = sorted(by_day)
+    chosen = day or (days[-1] if days else None)
+    if chosen not in by_day:
+        return days, None
+    firings = []
+    for name in sorted(by_day[chosen]):
+        previous = None
+        for hour in sorted(by_day[chosen][name]):
+            fig = dict(by_day[chosen][name][hour], name=name)
+            if fig.get("open_asks") is None:
+                continue
+            text, previous = judge(fig, cfg, previous)
+            if text:
+                severity, reasons = crossing(fig, cfg)
+                firings.append({"orchestrator": name, "hour": "%s %s:00Z" % (chosen, hour), "severity": severity, "reasons": reasons, "text": text})
+    firings.sort(key=lambda f: (f["hour"], f["orchestrator"]))
+    return days, firings

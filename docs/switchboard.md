@@ -2484,7 +2484,7 @@ The alert is off unless enabled (the load line is always kept):
 | `stalled_asks` | `2` | crossing 1: this many asks of one orchestrator stalled |
 | `backlog_hours` | `4` | crossing 2: more open asks than were moved in this many hours while its coders are all busy (at least one coder, none idle) |
 
-On a crossing the Chief of Staff gets ONE reminder (the ordinary delivery rule; audit event `load.alert`) with the figures and a recommended action (move the named stalled asks to another lane; split a lane or add coders). It gets another only when the load is worse than at the last wake, or after the orchestrator recovered below both thresholds and crossed again. Known limit: a pull request counts for an ask only when its body closes that ask's own issue number (not a work item under it), and a push is seen only on a pull request.
+On a crossing the Chief of Staff gets ONE reminder (the ordinary delivery rule; audit event `load.alert`) with the figures and a recommended action (move the named stalled asks to another lane; split a lane or add coders). It gets another only when the load is worse than at the last wake, or after the orchestrator recovered below both thresholds and crossed again. `fleet-switchboard load-replay [--day YYYY-MM-DD] [--stalled-asks N ...] [--json]` replays a recorded day of the hourly series (the current day and the last 3 finished days are kept in `load.json`) and prints when the alert WOULD have fired, by the same once-per-episode rule; it sends nothing, and the thresholds can be tried with other values. Known limit: a pull request counts for an ask only when its body closes that ask's own issue number (not a work item under it), and a push is seen only on a pull request.
 
 ### Data
 

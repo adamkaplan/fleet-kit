@@ -10744,7 +10744,7 @@ class TestSelfRegisteringCli(unittest.TestCase):
         "decisions": ("cmd_decisions", ("args", "runner", "now")), "comment": ("cmd_comment", ("args", "runner", "now")), "whoami": ("cmd_whoami", ("args", "runner", "now")),
         "pending": ("cmd_pending", ("args", "runner", "now")), "remind": ("cmd_remind", ("args", "runner", "now")), "intent": ("cmd_intent", ("args", "runner", "now")),
         "intents": ("cmd_intents", ("args", "runner", "now")), "import-v1": ("cmd_import_v1", ("args", "runner", "now")), "orders": ("cmd_orders", ("args", "runner", "now")),
-        "labels": ("cmd_labels", ("args", "runner", "now")), "plan": ("cmd_plan", ("args", "runner", "now", "socket_call"))}
+        "load-replay": ("cmd_load_replay", ("args", "runner", "now")), "labels": ("cmd_labels", ("args", "runner", "now")), "plan": ("cmd_plan", ("args", "runner", "now", "socket_call"))}
     OLD_ENSURE_ON_USE = ("send", "report", "notice", "launch", "handoff", "comment", "remind", "decisions", "intent", "bootstrap")
     OLD_DIRECT = ("status", "poke", "policy-report", "review-laws", "review", "pr-explain", "impact", "plan", "judge-tool")
     OLD_LEDGER = ("prove", "verdict", "waive", "gates", "gates-check")
@@ -44768,6 +44768,25 @@ class TestLoadAlert(Base):
         self.assertEqual(sb.load_tick(engine, discovery), [])   # no ask repo: the asks are unreadable, so no wake
         self.assertIn("no ask repo", " ".join(json.loads((self.state_dir / "load.json").read_text())["problems"]))
         self.assertEqual(sb.read_reminders(str(self.state_dir)), [])
+
+    def test_the_replay_of_a_recorded_overloaded_day_says_when_it_would_have_fired(self):
+        self.asks = {1: [1, 2]}
+        o = {"o": self.orch(idle=1, charter=1)}
+        for hour in range(0, 6):
+            self.tick(self.T0 + hour * 3600 + 5, o)       # the stall builds: 2 asks unmoved from 10:00, a stall of 2 h at 12:00
+        days, firings = self.health.replay(str(self.state_dir), dict(self.health.DEFAULTS))
+        self.assertEqual(days, ["2026-10-14"])
+        self.assertEqual([(f["orchestrator"], f["hour"]) for f in firings], [("o", "2026-10-14 12:00Z")])
+        self.assertEqual(self.health.replay(str(self.state_dir), dict(self.health.DEFAULTS, stalled_asks=3))[1], [])
+        self.assertIsNone(self.health.replay(str(self.state_dir), dict(self.health.DEFAULTS), "2026-01-01")[1])
+        # a finished day stays replayable after the day rolls over
+        self.tick(self.T0 + 24 * 3600, o)
+        days, firings = self.health.replay(str(self.state_dir), dict(self.health.DEFAULTS), "2026-10-14")
+        self.assertEqual((days, len(firings)), (["2026-10-14", "2026-10-15"], 1))
+        with captured() as (out, err):
+            self.assertEqual(sb.main(["load-replay", "--day", "2026-10-14"], runner=None), 0, err.getvalue())
+        self.assertIn("would have fired 1 time(s)", out.getvalue())
+        self.assertIn("o is overloaded", out.getvalue())
 
     def test_an_idle_pass_rewrites_nothing(self):
         self.asks = {1: [1]}

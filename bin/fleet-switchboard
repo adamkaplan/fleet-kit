@@ -21103,6 +21103,50 @@ def load_tick(engine, discovery):
     return health.tick(health.Context(now=now, state_dir=engine.state_dir, cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, cos=cos, wake=wake))
 
 
+def cmd_load_replay(args, runner, now):
+    """`load-replay`: when the load alert WOULD have fired over a recorded day of the hourly series (read-only; sends nothing)."""
+    health = load_fleet_health()
+    cfg = dict(health.DEFAULTS)
+    try:
+        configured = load_config().get("load_alert")
+        cfg = dict(cfg, **(configured or {}))
+    except ConfigError:
+        pass
+    for key, value in (("stalled_hours", args.stalled_hours), ("stalled_asks", args.stalled_asks), ("backlog_hours", args.backlog_hours)):
+        if value is not None:
+            cfg[key] = value
+    try:
+        cfg = health.validate(cfg, "load-replay")
+    except ValueError as err:
+        sys.stderr.write("%s: load-replay: %s\n" % (PROG, err))
+        return EXIT_USAGE
+    days, firings = health.replay(state_dir_path(), cfg, args.day)
+    if firings is None:
+        print("no recorded day%s; recorded days: %s" % (" " + args.day if args.day else "", ", ".join(days) or "none"))
+        return EXIT_USAGE if args.day else EXIT_OK
+    if args.json:
+        print(json.dumps({"days": days, "firings": firings}, indent=2, sort_keys=True))
+        return EXIT_OK
+    print("load alert replay over %s (thresholds: %d stalled ask(s) of %g h, backlog %g h); recorded days: %s" % (
+        args.day or days[-1], cfg["stalled_asks"], cfg["stalled_hours"], cfg["backlog_hours"], ", ".join(days)))
+    print("would have fired %d time(s)%s" % (len(firings), ":" if firings else ""))
+    for firing in firings:
+        print("  %s  %s  %s" % (firing["hour"], firing["orchestrator"], firing["text"]))
+    return EXIT_OK
+
+
+cmd_load_replay.direct = True   # reads a file: no daemon start
+
+
+def add_load_replay_parsers(sub):
+    replay = sub.add_parser("load-replay", help="When the load alert WOULD have fired over a recorded day of the hourly load series (read-only)")
+    replay.add_argument("--day", help="A UTC date, YYYY-MM-DD (default: the newest recorded day; the last few days are kept)")
+    replay.add_argument("--stalled-asks", type=int, default=None, help="Try another threshold: asks stalled")
+    replay.add_argument("--stalled-hours", type=float, default=None, help="Try another threshold: hours without movement")
+    replay.add_argument("--backlog-hours", type=float, default=None, help="Try another threshold: hours of moved asks in the backlog test")
+    replay.add_argument("--json", action="store_true")
+
+
 # PR 10: move a v1 session into v2 (`import-v1`)
 #
 # One section, so the stack rebases cleanly. docs/switchboard.md, "v1
