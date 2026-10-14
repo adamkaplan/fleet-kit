@@ -26,4 +26,4 @@ a regular expression (case-insensitive), `case:<regex>` (case-sensitive), `ignor
 ## Tests
 
 Run the suites before you open a PR: `bin/test-switchboard`, `bin/test-fleet-doctor`, `bin/test-fleet-doctor-config`,
-`bin/test-fleet-doctor-heartbeat`, `bin/test-heartbeat` (each prints `RESULT: PASS`), and `node --test plugins/fleet-hooks/index.test.mjs`.
+`bin/test-fleet-doctor-heartbeat`, `bin/test-heartbeat` (each prints `RESULT: PASS`), `node --test plugins/fleet-hooks/index.test.mjs` and `node --test plugins/fleet-decisions-tui/health.test.mjs`.
