@@ -13,7 +13,7 @@ import tempfile
 DEFAULTS = {"high_ratio": 3.0, "minutes": 5}
 STATE_FILE = "cpu-guard.json"
 SLOTS_FILE = "heavy-slots.json"
-REARM_NUM, REARM_DEN = 2, 3        # re-arm below high_ratio * 2/3 (integer arithmetic on the ratio would be exact enough; floats are compared directly)
+REARM_NUM, REARM_DEN = 2, 3        # re-arm below high_ratio * 2/3 (floats, compared directly)
 HEAVY_SLOTS_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "heavy_slots.py")   # the optional module of the `heavy` command
 PS_ARGV = ["ps", "-axo", "pcpu=,comm="]
 PS_SECONDS = 5
@@ -74,11 +74,12 @@ def slots_text(config, state_dir):
         spec = importlib.util.spec_from_file_location("heavy_slots", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        total, held = module.slots(config), len(list(module.holders(state_dir)))
+        import itertools
+        total, held = module.slots(config), len(list(itertools.islice(module.holders(state_dir), 1001)))   # a runaway holders list is cut
         if isinstance(total, bool) or not isinstance(total, int) or not 1 <= total <= 1000:
             return None
         return "heavy slots %d/%d" % (held, total)
-    except Exception:
+    except BaseException:   # a module that exits or raises must not take `status` or the daemon's pass with it
         return None
 
 

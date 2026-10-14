@@ -41793,14 +41793,6 @@ class TestCpuGuard(Base):
         self.assertEqual(len(self.audits("cpu.high")), 1)
         self.assertEqual(len(self.ps_calls), 1)
 
-    def test_no_chief_of_staff_means_no_episode_yet(self):
-        self.world.add_agent("other", fleet={"role": "coder"})
-        engine = self.world.new_engine("daemon")
-        engine.cpu_ps_runner = self.engine.cpu_ps_runner
-        self.engine.discovery.agents.pop("cos", None)
-        self.assertEqual(self.run_for(7), [])
-        self.assertEqual(self.audits("cpu.high"), [])
-
     def test_s5_false_turns_everything_off_and_the_load_is_not_read(self):
         self.engine.config["cpu_guard"] = False
         self.assertEqual(self.run_for(10), [])
@@ -41835,21 +41827,85 @@ class TestCpuGuard(Base):
         self.assertIn("[HIGH]", self.cg.status_line(self.cg.settings(None), self.cg.reading()), "the displayed one-minute load still shows it")
 
     def test_the_ps_runs_off_the_pass_so_a_hung_ps_never_delays_it(self):
-        release = threading.Event()
+        release, entered = threading.Event(), threading.Event()
 
         def hung(argv, **kwargs):
+            entered.set()
             release.wait(30)
             return subprocess.CompletedProcess(argv, 0, self.PS, "")
         self.engine.cpu_ps_runner = hung
-        started = time.monotonic()
-        self.run_for(6)
-        self.assertLess(time.monotonic() - started, 5, "the passes did not wait for ps")
+        self.run_for(6)   # the passes return while the ps is still blocked: if a pass waited for it, this would not come back until `release` (30 s)
+        self.assertTrue(entered.wait(10))
+        self.assertFalse(release.is_set())
         (fact,) = self.facts()
         self.assertNotIn("top:", fact.summary, "the categories are not there yet")
         release.set()
         self.settle()
         (fact,) = self.facts()
         self.assertIn("top: node 60%", fact.summary)
+
+    def test_a_slow_ps_of_an_earlier_episode_never_overwrites_a_later_ones_text(self):
+        self.run_for(6)
+        self.settle()
+        stale = threading.Event()
+        gate = threading.Event()
+
+        def slow(argv, **kwargs):
+            gate.wait(30)
+            return subprocess.CompletedProcess(argv, 0, "  99.0 /usr/bin/stale\n", "")
+        self.engine.cpu_ps_runner = slow
+        self.load[0] = 20.0
+        self.run_for(1)   # the first episode ends
+        self.load[0] = 90.0
+        self.run_for(6)   # a second begins; its ps is blocked
+        self.engine.cpu_ps_runner = self.engine.cpu_ps_runner
+        source = [s for s in self.engine.sources if isinstance(s, sb.CpuFacts)][0]
+        old_thread = source.thread
+        source.thread = None   # the engine's view of the episode moves on
+        gate.set()
+        old_thread.join(10)
+        self.assertEqual(source.detail, "", "a thread that is no longer the current one wrote nothing")
+
+    def test_no_chief_of_staff_means_no_episode_until_one_is_running(self):
+        self.engine.discovery.agents.pop("cos", None)
+        self.assertEqual(self.run_for(7), [])
+        self.assertEqual(self.audits("cpu.high"), [])
+        self.world.add_agent("cos2", fleet={"role": "chief-of-staff"})
+        self.engine.discover(self.world.clock.now())
+        facts = self.run_for(6)
+        self.assertEqual(len({fact.key for fact in facts}), 1, "the episode begins once a Chief of Staff exists, with one key")
+        self.assertTrue(facts)
+        self.assertEqual(len(self.audits("cpu.high")), 1)
+
+    def test_the_episode_file_is_atomic_0600_bounded_and_a_failed_save_is_said_and_tried_again(self):
+        self.run_for(6)
+        path = self.world.state / self.cg.STATE_FILE
+        self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
+        self.assertEqual(list(self.world.state.glob(self.cg.STATE_FILE + ".*.tmp")), [])
+        for bad in ("not json", "[]", "x" * 10000, json.dumps({"episode": "soon"})):
+            path.write_text(bad)
+            self.assertIsNone(self.cg.load_episode(self.world.state), bad[:12])
+        self.load[0] = 20.0
+        with mock.patch.object(self.cg.os, "replace", side_effect=OSError("disk full")):
+            self.run_for(1)   # the episode ends but the file cannot be written
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "cpu.guard_file"]), 1)
+        self.assertEqual(list(self.world.state.glob(self.cg.STATE_FILE + ".*.tmp")), [])
+        self.run_for(1)   # the next pass tries again, and now it works
+        self.assertEqual(self.cg.load_episode(self.world.state), None)
+
+    def test_a_ps_that_fails_or_a_runaway_holders_list_changes_nothing_but_the_text(self):
+        self.engine.cpu_ps_runner = lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "no")
+        self.run_for(6)
+        self.settle()
+        (fact,) = self.facts()
+        self.assertNotIn("top:", fact.summary)
+        module = self.home / "heavy_slots.py"
+        module.write_text("def slots(config):\n    return 1000\ndef holders(state_dir):\n    return range(10 ** 9)\n")
+        with mock.patch.object(self.cg, "HEAVY_SLOTS_PATH", str(module)):
+            self.assertEqual(self.cg.slots_text({}, self.world.state), "heavy slots 1001/1000", "the count is cut at one past the cap, never walked")
+        module.write_text("import sys\nsys.exit(3)\n")
+        with mock.patch.object(self.cg, "HEAVY_SLOTS_PATH", str(module)):
+            self.assertIsNone(self.cg.slots_text({}, self.world.state), "a module that exits takes nobody down")
 
     def test_s7_the_config_key_is_validated(self):
         for ok in (None, False, {}, {"high_ratio": 4.5, "minutes": 10}, {"minutes": 1}):

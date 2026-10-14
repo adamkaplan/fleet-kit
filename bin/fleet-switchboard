@@ -2224,6 +2224,7 @@ class CpuFacts:
         self.tracker = None
         self.detail = ""
         self.thread = None
+        self.saved_episode = None   # the episode the file holds (None: closed)
 
     def bind(self, engine):
         self.engine = engine
@@ -2236,9 +2237,11 @@ class CpuFacts:
         def work():
             try:
                 done = runner(cg.PS_ARGV, capture_output=True, text=True, timeout=cg.PS_SECONDS, stdin=subprocess.DEVNULL)
-                self.detail = cg.detail(cg.categories(done.stdout)) if done.returncode == 0 else ""
+                text = cg.detail(cg.categories(done.stdout)) if done.returncode == 0 else ""
             except Exception:
-                self.detail = ""
+                text = ""
+            if self.thread is threading.current_thread():   # a slow ps of an earlier episode never overwrites a later one's text
+                self.detail = text
         self.thread = threading.Thread(target=work, name="cpu-ps", daemon=True)
         self.thread.start()
 
@@ -2257,6 +2260,7 @@ class CpuFacts:
         chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff") if discovery is not None and not discovery.problems else []
         if self.tracker is None:
             self.tracker = cg.Episode(cg.load_episode(engine.state_dir))
+            self.saved_episode = self.tracker.episode
         load1, load5, cores = read
         ratio = load5 / cores   # the five-minute average decides: a one-minute spike never wakes the Chief of Staff
         event = self.tracker.step(ratio, engine.now(), cfg, can_begin=bool(chiefs))
@@ -2271,8 +2275,11 @@ class CpuFacts:
             if engine.audit is not None:
                 engine.audit.append(engine.actor, "cpu.recovered", None, {"load1": round(load1, 1), "load5": round(load5, 1), "cores": cores, "ratio5": round(ratio, 2)})
             self.detail = ""
+            self.thread = None
             self._save(engine, cg, None)
         episode = self.tracker.episode
+        if self.saved_episode != episode:   # a save that failed is tried again on the next pass
+            self._save(engine, cg, episode)
         if episode is None or not chiefs:
             return []
         text = "cpu high: load %d on %d cores (%.1fx over five minutes; the guard is %gx for %g minutes). %s `%s status` shows the line; heavy work should wait for a slot." % (
@@ -2282,6 +2289,7 @@ class CpuFacts:
     def _save(self, engine, cg, episode):
         try:
             cg.save_episode(engine.state_dir, episode)
+            self.saved_episode = episode
         except OSError as err:
             engine._note("cpu.guard_file", None, {"error": _plain("%s: %s" % (type(err).__name__, err), 160)})
 
