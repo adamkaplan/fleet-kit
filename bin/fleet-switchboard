@@ -13901,7 +13901,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         report["v2_link"] = v2_link_status_line(state, now())
         if config_ok:
             report["friction"] = friction_status_line(config, state)
-            report["load"] = load_fleet_health().status_lines(state, now())
+            report["load"] = load_fleet_health().status_lines(state, now()) if (config.get("load_alert") or {}).get("enabled") else []
         report["stopped_news"] = stopped_news_summary(state, now())
         line = external_status_line(config, state, now()) if config_ok else None
         if line is not None:   # only when external decisions are on: off prints nothing
@@ -21515,6 +21515,8 @@ def load_tick(engine, discovery):
         return []
     health, now = load_fleet_health(), engine.now()
     cfg = engine.config.get("load_alert") or dict(health.DEFAULTS)
+    if not cfg.get("enabled"):
+        return []   # off: no figures, no status line and no GitHub reads at all (the charter and asks reads are only for this feature)
     reminders = read_reminders(engine.state_dir)
     orchestrators = {}
     for name, seen in sorted(discovery.agents.items()):
@@ -21538,12 +21540,13 @@ def load_tick(engine, discovery):
         if engine.intents is None:
             raise RuntimeError("no ask repo is configured")
         labels = engine.intents._api("repos/%s/labels?per_page=100" % repo, repo)
-        names = [l.get("name") for l in labels if isinstance(l, dict) and str(l.get("name")).endswith(":orchestrator")] if isinstance(labels, list) else []
-        if not names:
-            return []
-        found = engine.intents._api("repos/%s/issues?state=open&per_page=100&labels=%s" % (repo, urllib.parse.quote(names[0])), repo)
-        return [(i["number"], i.get("body") or "") for i in found   # the issues list also returns pull requests: a PR body never names a charter
-                if isinstance(i, dict) and isinstance(i.get("number"), int) and "pull_request" not in i] if isinstance(found, list) else []
+        names = sorted({l["name"] for l in labels if isinstance(l, dict) and str(l.get("name")).endswith(":orchestrator")}) if isinstance(labels, list) else []
+        out = []
+        for name in names[:2]:   # every owner's prefix, at most two (each is one more read)
+            found = engine.intents._api("repos/%s/issues?state=open&per_page=100&labels=%s" % (repo, urllib.parse.quote(name)), repo)
+            out.extend((i["number"], i.get("body") or "") for i in found   # the issues list also returns pull requests: a PR body never names a charter
+                       if isinstance(i, dict) and isinstance(i.get("number"), int) and "pull_request" not in i) if isinstance(found, list) else None
+        return out
 
     def wake(text):
         add_reminder(engine.state_dir, cos, now, now, text)

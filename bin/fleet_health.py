@@ -308,14 +308,14 @@ def decisions_waiting(state_dir):
 
 def charter_agent(body):
     """The agent a charter issue names: the `orchestrator: <name>` line of its yaml block, or None."""
-    found = re.search(r"^orchestrator:[ \t]*([A-Za-z0-9][A-Za-z0-9._-]*)[ \t]*$", body if isinstance(body, str) else "", re.M)
+    found = re.search(r"^orchestrator:[ \t]*([A-Za-z0-9][A-Za-z0-9._-]*)[ \t]*(?:#[^\r\n]*)?\r?$", body if isinstance(body, str) else "", re.M)   # a trailing comment and a CRLF line end are fine
     return found.group(1) if found else None
 
 
 def _resolve_charters(ctx, state, now, reads):
     """{orchestrator: charter number or None} and problems. The charter is the open issue whose yaml block says `orchestrator: <its name>`
     (one `ctx.read_charters(repo) -> [(number, body)]` per repo, cached an hour and counted in the read budget as 2), else the `charter` of its
-    fleet metadata; an issue number in its metadata is NEVER taken as the charter on its own (it may be another orchestrator's)."""
+    fleet metadata, unless that issue's own yaml names another agent; an `issue` number of its metadata is never used (it may be another orchestrator's)."""
     cache, problems, out = state.setdefault("charters", {}), [], {}
     repos = sorted({info.get("repo") for info in ctx.orchestrators.values() if info.get("repo")})
     for repo in repos:
@@ -330,10 +330,18 @@ def _resolve_charters(ctx, state, now, reads):
         except Exception as err:
             problems.append("%s: charters not readable (%s)" % (repo, str(err).splitlines()[0][:60] if str(err) else type(err).__name__))
             continue
-        cache[repo] = {"at": now, "map": {a: n for n, body in found for a in [charter_agent(body)] if a}}
+        named = {}
+        for number, body in found:
+            agent = charter_agent(body)
+            if agent:
+                named[number] = agent
+        cache[repo] = {"at": now, "map": {a: n for n, a in sorted(named.items(), reverse=True)}, "named": {str(n): a for n, a in named.items()}}   # the lowest number wins a duplicate
     for name, info in ctx.orchestrators.items():
-        mapped = ((cache.get(info.get("repo")) or {}).get("map") or {}).get(name)
-        out[name] = mapped if mapped is not None else info.get("charter")
+        entry = cache.get(info.get("repo")) or {}
+        mapped, fallback = (entry.get("map") or {}).get(name), info.get("charter")
+        if mapped is None and fallback is not None and (entry.get("named") or {}).get(str(fallback), name) != name:
+            fallback = None   # the metadata charter's own yaml names another orchestrator: it is not this one's
+        out[name] = mapped if mapped is not None else fallback
     return out, problems
 
 
