@@ -78,13 +78,15 @@ class Kube:
         self.bin = env.get("FLEET_KUBECTL", "kubectl")
         self.ns = env.get("FLEET_CLOUD_NAMESPACE", "fleet-workers")
 
-    def run(self, args, stdin=None, ok_missing=False):
+    def run(self, args, stdin=None, ok_missing=False, keep_stdout=False):
         cmd = [self.bin, "-n", self.ns] + args
         try:
             p = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=120, env=self.env)
         except (OSError, subprocess.TimeoutExpired) as e:
             raise CloudError("kubectl failed: %s" % e)
         if p.returncode != 0:
+            if keep_stdout and p.stdout.strip():
+                return p.stdout  # the caller reads the failure from the tool's own JSON
             if ok_missing and "NotFound" in p.stderr:
                 return None
             last = (p.stderr.strip().splitlines() or ["failed"])[-1]
@@ -108,8 +110,8 @@ class Kube:
         self.run(["delete", "pod", name, "--ignore-not-found", "--wait=false"])
         self.run(["delete", "secret", name + "-pw", "--ignore-not-found"])
 
-    def exec(self, name, *cmd):
-        return self.run(["exec", name, "--"] + list(cmd))
+    def exec(self, name, *cmd, keep_stdout=False):
+        return self.run(["exec", name, "--"] + list(cmd), keep_stdout=keep_stdout)
 
 
 def ann(pod, key, default=None):
@@ -163,7 +165,7 @@ class Launcher:
             fd = os.open(self.audit_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
             with os.fdopen(fd, "a") as f:  # one short O_APPEND write: atomic enough for one line, the chosen guarantee
                 f.write(json.dumps(line, sort_keys=True) + "\n")
-        except OSError as e:
+        except OSError as e:  # fail-open, decided: the action already ran; a loud warning beats undoing it
             print("cloud-worker: WARNING: the action ran but its audit line could not be written: %s" % e, file=sys.stderr)
 
     def cost(self, pod):
@@ -251,11 +253,14 @@ class Launcher:
 
     # -- end hook, stop, delete --
     def run_hook(self, name):
-        out = self.kube.exec(name, "fleet-end-hook")
+        out = self.kube.exec(name, "fleet-end-hook", keep_stdout=True)
         try:
-            return json.loads(out.strip().splitlines()[-1])
+            res = json.loads(out.strip().splitlines()[-1])
         except (ValueError, IndexError):
             return {"pushed": False, "wip_branch": None, "error": "end hook gave no result"}
+        if res.get("error"):  # text from inside the pod and the remote: printable, short, before it is shown or audited
+            res["error"] = re.sub(r"[^\x20-\x7e]", "?", str(res["error"]))[:300]
+        return res
 
     def stop(self, a, reason=None):
         worker, name = a.worker, pod_name(a.worker)

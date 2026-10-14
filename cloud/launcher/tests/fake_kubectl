@@ -47,6 +47,6 @@ elif cmd == "exec":
         p = subprocess.run([sys.executable, os.path.join(HERE, "..", "end_hook.py")], env=env, capture_output=True, text=True)
         sys.stdout.write(p.stdout)
         if p.returncode:
-            sys.stderr.write(p.stdout); sys.exit(p.returncode)
+            sys.stdout.write(p.stdout); sys.exit(p.returncode)
 else:
     sys.exit("fake kubectl: unsupported " + " ".join(args))

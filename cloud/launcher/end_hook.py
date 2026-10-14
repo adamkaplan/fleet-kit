@@ -55,7 +55,7 @@ def main():
     try:
         print(json.dumps(run(workdir, worker)))
         return 0
-    except RuntimeError as e:
+    except (RuntimeError, OSError) as e:
         print(json.dumps({"pushed": False, "wip_branch": None, "error": str(e)}))
         return 1
 

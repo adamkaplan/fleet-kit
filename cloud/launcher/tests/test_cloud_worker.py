@@ -399,6 +399,7 @@ class S5EndHook(Base):
         code, _, err = self.run_cli("stop", "coder7")
         self.assertEqual(code, 1)
         self.assertIn("pod kept", err)
+        self.assertNotIn("kubectl exec", err)  # the hook's own reason reaches the operator
         self.assertIsNotNone(self.pod())
         self.assertEqual(self.pod()["metadata"]["annotations"]["fleet/kept"], "true")
         self.assertFalse(self.audit_lines()[-1]["ok"])
@@ -421,6 +422,16 @@ class S5EndHook(Base):
         subprocess.run(["git", "-C", origin, "update-ref", "-d", "refs/heads/main"], check=True)  # gone upstream
         res = end_hook.run(work, "coder7")
         self.assertEqual((res["pushed"], res["wip_branch"]), (True, "coder7/wip"))
+        subprocess.run(["git", "-C", origin, "rev-parse", "--verify", "coder7/wip"], check=True, capture_output=True)
+
+    def test_hook_error_text_is_printable_and_short(self):
+        class Fake(cw.Kube):
+            def exec(self, name, *cmd, keep_stdout=False):
+                return json.dumps({"pushed": False, "error": "\x1b[31mboom\x1b[0m" + "x" * 500}) + "\n"
+        L = cw.Launcher(Fake(self.env), self.env, self.clock)
+        err = L.run_hook("p")["error"]
+        self.assertNotIn("\x1b", err)
+        self.assertLessEqual(len(err), 300)
 
     def test_hook_reports_skipped_secret_files(self):
         work, _ = make_repo(self.tmp.name, "r", dirty=True)
