@@ -42149,6 +42149,22 @@ class TestReviewLawsStarterSet(Base):
         self.assertIn("the impact matrix below", rules["R-LAW-11"])
         self.assertNotIn("also holds changes", text, "the floor is a numbered rule, not an uncited aside")
 
+    def test_r_law_16_and_17_are_in_both_copies_after_r_law_15_and_the_version_is_bumped(self):
+        docs = (self.DIR / "REVIEW_LAWS.md").read_text()
+        root = (REPO / "REVIEW_LAWS.md").read_text()
+        self.assertEqual(docs, root, "the repository's own copy equals the starter set")
+        for name in self.FILES:   # the repository's own copies may carry a section of their own; they open with the same version line
+            self.assertEqual((self.DIR / name).read_text().splitlines()[0], (REPO / name).read_text().splitlines()[0], name)
+        ids = [l.split(" ", 2)[1].strip("*") for l in docs.splitlines() if l.startswith("- **R-LAW-")]
+        self.assertEqual(ids[ids.index("R-LAW-15") + 1:ids.index("R-LAW-15") + 3], ["R-LAW-16", "R-LAW-17"])
+        self.assertEqual((self.DIR / "VERSION").read_text().strip(), "review-laws-2")
+        rules = {l.split(" ", 2)[1].strip("*"): l for l in docs.splitlines() if l.startswith("- **R-LAW-")}
+        for needle in ("A block about behaviour names its check", "check result not read", "stays at most a note", "it never blocks (R-LAW-14)", "reading the head's check results is reading"):
+            self.assertIn(needle, rules["R-LAW-16"])
+        self.assertNotIn("is a proposal and does not block", rules["R-LAW-16"])
+        for needle in ("never the author's to chase", "once per head", "never by the author of the change", "counts for nothing in place of the missing one"):
+            self.assertIn(needle, rules["R-LAW-17"])
+
     def test_owner_evaluators_are_rare_and_the_laws_say_so(self):
         text = (self.DIR / "REVIEW_LAWS.md").read_text()
         rule = next(l for l in text.splitlines() if l.startswith("- **R-LAW-15 "))
@@ -42234,7 +42250,7 @@ class TestReviewLawsStarterSet(Base):
         target.mkdir()
         code, out, err = self.install(str(target))
         self.assertNotIn("vreview-laws", out)
-        self.assertIn("(review-laws-1)", out)
+        self.assertIn("(review-laws-2)", out)
 
     def test_install_refuses_a_path_that_is_not_a_directory(self):
         code, out, err = self.install(str(self.home / "nowhere"))
@@ -42320,7 +42336,7 @@ class TestReviewerSubagents(LedgerBase):
                 self.assertEqual(sorted(allows), sorted([("read", "*"), ("glob", "*"), ("grep", "*"),
                                                          ("shell", "fleet-switchboard review laws *"),
                                                          ("shell", "git diff *"), ("shell", "git log *"), ("shell", "git show *"),
-                                                         ("shell", "gh pr diff *"), ("shell", "gh pr view *")]))
+                                                         ("shell", "gh pr diff *"), ("shell", "gh pr view *"), ("shell", "gh pr checks *")]))
                 self.assertIn(("edit", "*", "deny"), perms)
                 for word in ("make", "pytest", "python", "node", "npm", "cargo", "go", "bin/test"):
                     self.assertFalse([1 for a, r, e in perms if e == "allow" and a == "shell" and r.startswith(word)], word)   # not allowed: default deny covers it
@@ -42481,6 +42497,16 @@ class TestReviewerSubagents(LedgerBase):
                     self.assertNotIn(" #", value, "%s: quote the value (' #' starts a comment)" % m.group(1))
                     self.assertFalse(value.endswith(":"), m.group(1))
 
+    def test_each_reviewer_is_told_how_to_read_the_heads_checks_and_the_skill_mentions_it(self):
+        for role in self.ROLES:
+            text = self.front(role)[0]
+            self.assertIn("gh pr checks <pr> --repo <owner/repo>", text, role)
+            self.assertIn("bare, no pipes", text, role)
+            self.assertIn("check result not read", text, role)
+        skill = " ".join((REPO / "skills" / "fleet-review" / "SKILL.md").read_text().split())
+        for needle in ("gh pr checks <pr> --repo <owner/repo>", "R-LAW-16", "`--web`, `-w` and `--watch` are refused"):
+            self.assertIn(needle, skill)
+
     def test_each_reviewer_parses_as_a_subagent_with_a_quoted_description_and_enough_rules(self):
         for role in self.ROLES:
             with self.subTest(role=role):
@@ -42504,8 +42530,10 @@ class TestReviewerSubagents(LedgerBase):
                 effect = e
         return effect
 
-    BARE = ("fleet-switchboard review laws acme/app#9", "gh pr diff 9", "gh pr diff 9 --repo acme/app", "gh pr view 9 --json files", "git diff abc..def", "git log -5", "git show abc")
-    REFUSED = ("fleet-switchboard review laws 230 2>&1", "gh pr diff 230 2>&1", "git diff abc > out.txt", "gh pr view 9 >> out", "git diff abc..def --output=out", "gh pr view 9 --web")
+    BARE = ("fleet-switchboard review laws acme/app#9", "gh pr diff 9", "gh pr diff 9 --repo acme/app", "gh pr view 9 --json files", "git diff abc..def", "git log -5", "git show abc",
+            "gh pr checks 1 --repo a/b")
+    REFUSED = ("fleet-switchboard review laws 230 2>&1", "gh pr diff 230 2>&1", "git diff abc > out.txt", "gh pr view 9 >> out", "git diff abc..def --output=out", "gh pr view 9 --web",
+               "gh pr checks 1 --web", "gh pr checks 1 -w", "gh pr checks 1 --watch", "gh pr checks -w 1", "gh pr checks --watch 1", "gh pr checks --web 1", "gh pr checks 1 --repo a/b > out", "gh pr checks 1 2>&1")
 
     def test_the_documented_bare_commands_are_allowed_and_the_redirect_forms_refused_for_every_reviewer(self):
         for role in self.ROLES:
@@ -42534,7 +42562,7 @@ class TestReviewerSubagents(LedgerBase):
             with self.subTest(role=role):
                 text, head, perms = self.front(role)
                 denies = {(a, r) for a, r, e in perms if e == "deny"}
-                for resource in ("git *--output*", "git *--ext-diff*", "git *--textconv*", "git *--no-index*", "gh pr view *--web*", "*>*", "*>>*"):
+                for resource in ("git *--output*", "git *--ext-diff*", "git *--textconv*", "git *--no-index*", "gh pr view *--web*", "gh pr checks *--w*", "gh pr checks * -w*", "gh pr checks -w*", "*>*", "*>>*"):
                     self.assertIn(("shell", resource), denies, resource)
                 self.assertIn(("external_directory", "*"), denies, "reads outside the checkout are denied")
                 import fnmatch
