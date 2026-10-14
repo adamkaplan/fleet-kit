@@ -4619,6 +4619,161 @@ class TestLaunch(Base):
             self.health(n)
         self.assertEqual(sb.read_pane_health(self.world.state)["states"]["worker"]["state"], "dead")
 
+    # -- the worktree lifecycle (#321): launch registers, retire / a done report / `disk reclaim-worktrees` reclaim only what is clean and pushed
+
+    GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com",
+               "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+
+    def git(self, cwd, *args):
+        with mock.patch.dict(os.environ, self.GIT_ENV):
+            done = subprocess.run(["git", "-C", str(cwd)] + list(args), capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, "git %s: %s" % (args, done.stderr))
+        return done.stdout
+
+    def make_repo(self):
+        """A main checkout with a bare remote, one pushed commit on main, and a helper to add linked worktrees."""
+        root = Path(os.path.realpath(str(self.home))) / "repos"
+        root.mkdir(exist_ok=True)
+        remote, main = root / "remote.git", root / "main"
+        subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+        subprocess.run(["git", "init", "-q", "-b", "main", str(main)], check=True)
+        (main / "a.txt").write_text("a\n")
+        self.git(main, "add", ".")
+        self.git(main, "commit", "-qm", "first")
+        self.git(main, "remote", "add", "origin", str(remote))
+        self.git(main, "push", "-q", "origin", "main")
+        self.repo_main = main
+        return main
+
+    def add_worktree(self, name, push=True, dirty=False, unpushed=False):
+        main = self.repo_main
+        path = main.parent / name
+        self.git(main, "worktree", "add", "-q", "-b", name, str(path))
+        if push:
+            self.git(path, "push", "-q", "origin", name)
+        if unpushed:
+            (path / "new.txt").write_text("x\n")
+            self.git(path, "add", ".")
+            self.git(path, "commit", "-qm", "local only")
+        if dirty:
+            (path / "scratch.txt").write_text("edit\n")
+        return path
+
+    def registered(self):
+        return sb.read_worktrees(self.world.state)
+
+    def test_launch_into_a_linked_worktree_registers_it_and_a_plain_or_main_directory_is_never_registered(self):
+        self.make_repo()
+        wt = self.add_worktree("feat-a")
+        self.engine.state_dir = self.world.state
+        done = self.launch(name="coder", directory=str(wt), brief=None)
+        (entry,) = self.registered().items()
+        self.assertEqual((entry[0], entry[1]["agent"], entry[1]["branch"]), (str(wt), "coder", "feat-a"))
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "worktree.registered" and e["detail"]["by"] == "launch"])
+        self.assertEqual(oct(os.stat(self.world.state / sb.WORKTREES_FILE).st_mode & 0o777), "0o600")
+        self.world.herdr.panes.clear()
+        self.world.add_agent("coder2")
+        self.launch(name="coder9", directory=str(self.work), brief=None)                      # a plain directory
+        self.launch(name="coder8", directory=str(self.repo_main), brief=None)                 # a main checkout
+        self.assertEqual(list(self.registered()), [str(wt)])
+
+    def retire_as_operator(self, name):
+        os.environ.pop("HERDR_PANE_ID", None)
+        return self.run_cli("retire", name)
+
+    def test_retire_removes_a_clean_pushed_worktree_and_keeps_the_dirty_and_the_unpushed_ones_saying_why_and_never_touches_an_unregistered_one(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.make_repo()
+        self.worker()
+        clean, dirty, unpushed = self.add_worktree("w-clean"), self.add_worktree("w-dirty", dirty=True), self.add_worktree("w-unpushed", unpushed=True)
+        stranger = self.add_worktree("w-unregistered")
+        for wt in (clean, dirty, unpushed):
+            self.assertTrue(sb.register_worktree(self.world.state, str(wt), "worker", None, wt.name, 1))
+        self.health()
+        code, out, err = self.retire_as_operator("worker")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(clean.exists())
+        self.assertTrue(dirty.exists() and unpushed.exists() and stranger.exists())
+        self.assertRegex(out, r"w-dirty: kept: uncommitted changes \(1 file")
+        self.assertRegex(out, r"w-unpushed: kept: unpushed")
+        self.assertNotIn("w-unregistered", out)
+        self.assertEqual(sorted(Path(p).name for p in self.registered()), ["w-dirty", "w-unpushed"], "the removed one left the registry; the kept ones stay")
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "worktree.removed"]), 1)
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "worktree.kept"]), 2)
+        self.assertIn("w-clean", self.git(self.repo_main, "branch", "--list", "w-clean"), "the branch is never deleted")
+
+    def test_a_final_done_report_reclaims_the_workers_clean_worktree_and_the_kill_switches_stop_it(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.make_repo()
+        self.worker()
+        wt = self.add_worktree("w-done")
+        sb.register_worktree(self.world.state, str(wt), "worker", None, "w-done", 1)
+        for config, expect_removed in (({"worktree_reclaim": {"on_done": False}}, False), ({"worktree_reclaim": {"enabled": False}}, False), ({}, True)):
+            self.world.config.pop("worktree_reclaim", None)
+            self.world.config.update(config)
+            outcome = self.world.new_engine("cli").report("worker", "done", "all finished")
+            self.assertEqual(wt.exists(), not expect_removed, config)
+        self.assertTrue(outcome.get("worktrees") and "removed" in outcome["worktrees"][0])
+        self.assertEqual(self.registered(), {})
+
+    def test_the_sweep_is_a_dry_run_by_default_only_considers_retired_agents_and_apply_is_the_operators_or_cos(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.make_repo()
+        self.worker()
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.world.add_agent("stranger", fleet={"role": "coder"})
+        done_wt, live_wt, gone_wt = self.add_worktree("w-retired"), self.add_worktree("w-live"), self.add_worktree("w-gone")
+        sb.register_worktree(self.world.state, str(done_wt), "worker", None, "w-retired", 1)
+        sb.register_worktree(self.world.state, str(live_wt), "boss", None, "w-live", 1)            # an agent that is NOT retired
+        sb.register_worktree(self.world.state, str(gone_wt), "worker", None, "w-gone", 1)
+        self.git(self.repo_main, "worktree", "remove", str(gone_wt))                                # already deleted by hand
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {"worker": {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": "s", "auto": False}})
+        os.environ["HERDR_PANE_ID"] = self.world.panes["stranger"]
+        code, out, err = self.run_cli("disk", "reclaim-worktrees")
+        self.assertEqual(code, 0, err)
+        self.assertIn("w-retired: would remove", out)
+        self.assertIn("w-gone: already gone", out)
+        self.assertRegex(out, r"2 registered worktree\(s\) of retired agents: 2 would be removed, 0 kept")
+        self.assertTrue(done_wt.exists() and live_wt.exists(), "a dry run changes nothing")
+        code, out, err = self.run_cli("disk", "reclaim-worktrees", "--apply")                       # a stranger may not apply
+        self.assertNotEqual(code, 0)
+        self.assertIn("only the operator or the Chief of Staff", err)
+        self.assertTrue(done_wt.exists())
+        os.environ["HERDR_PANE_ID"] = self.world.panes["cos"]
+        code, out, err = self.run_cli("disk", "reclaim-worktrees", "--apply")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(done_wt.exists())
+        self.assertTrue(live_wt.exists(), "a worktree of an agent that is not retired is left alone")
+        self.assertEqual([Path(p).name for p in self.registered()], ["w-live"])
+
+    def test_a_main_checkout_registered_by_mistake_is_refused_and_register_worktree_needs_a_linked_worktree_and_the_caller_rule(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.make_repo()
+        self.worker()
+        os.environ.pop("HERDR_PANE_ID", None)
+        code, out, err = self.run_cli("disk", "register-worktree", str(self.repo_main), "--agent", "worker")
+        self.assertNotEqual(code, 0)
+        self.assertIn("not a linked git worktree", err)
+        wt = self.add_worktree("w-reg")
+        self.assertEqual(self.run_cli("disk", "register-worktree", str(wt), "--agent", "worker")[0], 0)
+        self.assertEqual(list(self.registered()), [str(wt)])
+        self.world.add_agent("stranger", fleet={"role": "coder"})
+        os.environ["HERDR_PANE_ID"] = self.world.panes["stranger"]
+        self.assertNotEqual(self.run_cli("disk", "register-worktree", str(wt), "--agent", "worker")[0], 0)
+        # a forged registry entry for a main checkout: the reclaim refuses it and removes nothing
+        sb.register_worktree(self.world.state, str(self.repo_main), "worker", None, "main", 1)
+        engine = self.world.new_engine("cli")
+        status, line = sb.reclaim_worktree(engine, subprocess.run, str(self.repo_main), {"agent": "worker"}, True)
+        self.assertEqual(status, "refused")
+        self.assertTrue(self.repo_main.exists())
+
+    def test_the_worktree_reclaim_config_is_validated(self):
+        base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
+        sb.validate_config(dict(base, worktree_reclaim={"enabled": True, "on_done": False}))
+        for bad in ({"enabled": "no"}, {"when": True}, [], {"on_done": 1}):
+            with self.subTest(bad=bad), self.assertRaises(sb.ConfigError):
+                sb.validate_config(dict(base, worktree_reclaim=bad))
+
     def test_a_screen_that_cannot_be_read_is_unknown_never_detached_and_nothing_is_closed(self):
         pane = self.detach()
         self.world.herdr.panes[pane]["read_fails"] = True
