@@ -2274,7 +2274,7 @@ numbers below are the defaults; every `_days` value is in days and may be a frac
 
 | Rule | Finding | Default SLA |
 |---|---|---|
-| T1 | open issue with no assignee, not in a charter's chain (charter, ask, work item, by the parent links) and not worked by an agent | 1 day after creation |
+| T1 | open issue with no assignee, not in a charter's chain (a charter, and any issue whose parent links reach a charter within 8 levels, read from the issues already held: no extra read; a parent that was not read makes the chain unknown and raises no T1, a cycle or a deeper chain ends the walk) and not worked by an agent | 1 day after creation |
 | T2 | a required label group missing (config only) | 1 hour (`1/24` day) |
 | T3 | no next step: no `## Decision required`, no awaiting label, no `Next:` line or checklist item in the body or the recent comments, no open sub-issue | an ask quiet 1 day, other issues 3 days |
 | T5 / T6 | a human-tier decision unanswered / a `MERGE: captain` PR waiting (from the decision list, judged only when it is whole) | T5 2 hours (`2/24` day; at that age it goes to cos in the batched fact and cos reminds the person), T6 2 days |
