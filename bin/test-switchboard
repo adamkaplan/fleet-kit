@@ -10916,7 +10916,7 @@ ROLE_LINE_LIMITS = {"coder": 129, "orchestrator": 178, "chief-of-staff": 162, "c
 # hygiene pointer: coder -2 lines, -100 B (three maxims became one pointer to the standards)
 # #107 follow-up: coder +300 B for the spelled-out fallback and the never-your-own rule
 # `pr-state`: coder +1 line +140 B, orchestrator +1 line +120 B: the one sentence that sends an agent to the daemon's cache instead of a GitHub polling loop
-ROLE_BYTE_LIMITS = {"coder": 7790, "orchestrator": 10920, "chief-of-staff": 11650, "cos-subagent": 3500}
+ROLE_BYTE_LIMITS = {"coder": 7860, "orchestrator": 10920, "chief-of-staff": 11650, "cos-subagent": 3500}
 WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others
 
 
@@ -18062,6 +18062,7 @@ class FakeTriageHub:
 
     def __init__(self):
         self.open, self.comments, self.closed, self.live = {}, {}, {}, {}   # per repo: open {n: rec}; comments [rec]; closed {label: [rec]}
+        self.pulls = {}   # per repo: [recently closed pull request records] (#384)
         self.calls, self.unreadable = [], set()
 
     def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
@@ -18074,6 +18075,8 @@ class FakeTriageHub:
             return [c for c in self.comments.get(repo, []) if c["issue_url"].endswith("/%s" % match.group(1))][::-1], False
         if "/issues/comments" in path:
             return list(self.comments.get(repo, [])), False
+        if re.search(r"/pulls\?", path):
+            return list(self.pulls.get(repo, [])), False
         if "state=closed" in path:
             label = unquote(re.search(r"labels=([^&]+)", path).group(1))
             return list(self.closed.get(repo, {}).get(label, [])), False
@@ -18452,6 +18455,92 @@ class TestTriage(Base):
         self.assertEqual([f for f in self.found() if f[1] == "acme/api#120"], [("OO", "acme/api#120")])
         row = [e for e in self.world.audit() if e["event"] == "triage.finding" and e["detail"]["rule"] == "OO"][0]
         self.assertEqual(row["detail"]["evidence"]["would_be"], ["T1", "T2", "T3"])
+
+    def merged_pr(self, number, body, hours_ago=2.0, merged=True, author="bot"):
+        record = {"number": number, "body": body, "user": {"login": author}, "html_url": "https://evil.example/\x1b[31m%d" % number,
+                  "merged_at": sb.iso(self.world.clock.now() - hours_ago * 3600) if merged else None, "state": "closed"}
+        self.hub.pulls.setdefault("acme/api", []).append(record)
+
+    def test_t12_an_open_plan_issue_whose_pr_merged_is_that_finding_with_the_pr_link_and_not_no_owner(self):
+        self.charter()
+        self.add(130, created=60, labels=["kind"])                         # unowned and old: it would be T1
+        self.add(131, created=60, labels=["kind"])
+        self.merged_pr(200, "Part of #130.")
+        self.merged_pr(201, "PLAN: https://github.com/acme/api/issues/131\n\nCloses #999")
+        self.go()
+        self.assertEqual(self.only("T12"), ["acme/api#130", "acme/api#131"])
+        self.assertEqual((self.only("T1"), self.only("T11")), ([], []))
+        row = [e for e in self.world.audit() if e["event"] == "triage.finding" and e["detail"]["ref"] == "acme/api#130" and e["detail"]["rule"] == "T12"][0]
+        self.assertEqual((row["detail"]["what"], row["detail"]["evidence"]["pr"], row["detail"]["evidence"]["pr_url"]),
+                         ("plan issue still open after its PR merged", 200, "https://github.com/acme/api/pull/200"))   # the link is rebuilt, not the record's html_url
+        self.assertFalse(row["detail"]["applied"])
+
+    def test_t12_never_fires_for_a_charter_or_an_ask_named_by_part_of_but_does_for_a_work_item(self):
+        self.charter()                                                     # #1 is the charter, #2 an ask under it
+        self.add(3, created=20, updated=0.1, parent=2, labels=["kind"], body="Next: go")   # a work item under the ask
+        self.merged_pr(240, "Part of #1. Part of #2. Part of #3.")
+        self.go()
+        self.assertEqual(self.only("T12"), ["acme/api#3"])                 # not the charter, not the ask
+
+    def test_t12_is_ours_through_the_merged_prs_author_and_a_fresh_read_of_a_closed_issue_drops_it(self):
+        self.charter()
+        self.add(170, created=60, labels=["kind"], author="stranger")          # not assigned to us, not in a chain, opened by someone else
+        self.merged_pr(230, "PLAN: acme/api#170", author="bot")                # but the merged PR is ours
+        self.go(passes=1)
+        self.assertEqual(self.only("T12"), ["acme/api#170"])
+        self.assertNotIn(("OO", "acme/api#170"), self.found())
+        self.hub.live["acme/api"] = {170: dict(self.hub.open["acme/api"][170], state="closed")}   # a fresh read shows it closed since
+        self.world.tick(sb.TRIAGE_TTL + 5)
+        state = sb.triage_state(self.engine)
+        self.assertFalse(sb.triage_verify(self.engine, state, "T12", "acme/api#170", self.engine.config["triage"], self.world.clock.now(), [10]))
+
+    def test_t12_no_finding_for_a_pr_closed_unmerged_a_closed_issue_or_another_repo(self):
+        self.charter()
+        self.add(140, created=60, labels=["kind"], assignees=["bot"])
+        self.add(141, created=60, labels=["kind"], assignees=["bot"])
+        self.merged_pr(210, "Part of #140", merged=False)                  # closed without merging: it implemented nothing
+        self.merged_pr(211, "Closes other/repo#141\nPLAN: https://github.com/other/repo/issues/141")
+        self.merged_pr(212, "Part of #142")                                # #142 is not open (closed or never listed)
+        self.go()
+        self.assertEqual(self.only("T12"), [])
+
+    def test_t12_a_pr_of_someone_elses_naming_an_issue_that_is_not_ours_is_only_a_flag(self):
+        self.charter()
+        self.add(150, created=60, labels=["kind"], author="stranger")
+        self.merged_pr(220, "Part of #150", author="stranger")
+        self.go()
+        self.assertEqual(self.only("T12"), [])
+        self.assertIn(("OO", "acme/api#150"), self.found())
+
+    def test_t12_reads_one_page_of_closed_pull_requests_per_repo_and_stays_inside_the_budget(self):
+        self.charter()
+        self.add(160, created=60, labels=["kind"], assignees=["bot"])
+        self.go(passes=1)
+        pulls = [c for c in self.hub.calls if "/pulls?" in c]
+        self.assertEqual(len(pulls), 1)
+        self.assertIn("per_page=%d" % sb.TRIAGE_MERGED_PER_PAGE, pulls[0])
+        self.assertIn("state=closed", pulls[0])
+        self.hub.calls.clear()
+        self.world.tick(sb.TRIAGE_TTL + 5)
+        self.go(passes=1, calls_per_pass=5)
+        self.assertLessEqual(len(self.hub.calls), 5)                      # the pass's budget of calls_per_pass: reads and fresh checks together
+
+    def test_t12_the_reference_rules(self):
+        refs = sb.load_triage_plan_open().references
+        self.assertEqual(refs("Closes #5. fixes #6, Resolved #7 and Part of #8", "acme/api"), {5, 6, 7, 8})
+        self.assertEqual(refs("PLAN: acme/api#9", "acme/api"), {9})
+        self.assertEqual(refs("PLAN: <https://github.com/ACME/api/issues/10>", "acme/api"), {10})
+        self.assertEqual(refs("Closes acme/web#11 and see #12 and PLAN: https://github.com/acme/web/issues/13", "acme/api"), set())
+        self.assertEqual(refs(None, "acme/api"), set())
+        links = sb.load_triage_plan_open().merged_links([{"number": 1, "body": "Part of #5", "merged_at": "2026-01-01T00:00:00Z"},
+                                                          {"number": 2, "body": "Part of #5", "merged_at": "2026-02-01T00:00:00Z"},
+                                                          {"number": 3, "body": "Part of #5", "merged_at": None}, "junk"], "acme/api")
+        self.assertEqual(links[5]["pr"], 2)          # the latest merge wins; an unmerged one is ignored
+
+    def test_the_pr_template_and_both_coder_definitions_name_the_plan_issue_with_closes(self):
+        for path in (REPO / ".github" / "pull_request_template.md", REPO / "agents" / "opencode" / "coder.md", REPO / "agents" / "copilot" / "coder.agent.md"):
+            with self.subTest(file=path.name):
+                self.assertEqual(path.read_text().count("Closes #"), 1)
 
     def test_an_unreadable_repo_is_reported_once_and_gives_no_findings(self):
         self.engine.config["triage"]["repos"] = ["acme/api", "acme/gone"]

@@ -155,6 +155,23 @@ def load_report_fold():
     return module
 
 
+def load_triage_plan_open():
+    """The plan-issue-still-open rule, bin/triage_plan_open.py (#384), loaded by path like plan_check."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "triage_plan_open.py")
+    held = sys.modules.get("triage_plan_open")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("triage_plan_open", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["triage_plan_open"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("triage_plan_open", None)
+        raise
+    return module
+
+
 def load_pr_events():
     """The webhook-event rule for `pr-state`, bin/pr_events.py (#354), loaded by path like plan_check."""
     path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pr_events.py")
@@ -10691,7 +10708,7 @@ TRIAGE_SLA = {"t1_days": 1, "t2_days": 1 / 24, "t3_ask_days": 1, "t3_other_days"
 TRIAGE_KINDS = {"T1": "owner missing", "T2": "required label missing", "T3": "no next step",
                 "T5": "human-tier decision unanswered", "T6": "MERGE: captain PR waiting", "T7": "PR with no review",
                 "T8": "blocked ask", "T9": "ask with no activity", "T10": "closed but still labelled awaiting",
-                "T11": "orphan", "OO": "other-owner (flag only)"}
+                "T11": "orphan", "T12": "plan issue still open after its PR merged", "OO": "other-owner (flag only)"}
 TRIAGE_T10_GRACE = 600         # seconds after a close in which a still-set awaiting label is not yet a finding
 TRIAGE_TTL = 900               # seconds a unit read is kept
 TRIAGE_CALLS_PER_PASS = TRIAGE_DEFAULTS["calls_per_pass"]   # default of `triage.calls_per_pass` (reads and fresh checks alike)
@@ -10699,6 +10716,7 @@ TRIAGE_CALLS_CAP = 100
 TRIAGE_PASS_SECONDS = TRIAGE_DEFAULTS["pass_seconds"]       # default of `triage.pass_seconds`; cap TRIAGE_SECONDS_CAP
 TRIAGE_SECONDS_CAP = 60
 TRIAGE_LIST_PAGES = 2
+TRIAGE_MERGED_PER_PAGE = 50    # #384: the recently closed pull requests read per repo per refresh (one page)
 TRIAGE_COMMENT_DAYS = 14       # the comment window: next-step markers and review comments are looked for in it
 TRIAGE_UNREADABLE_RETRY = 3600
 TRIAGE_FILE = "triage.json"
@@ -10943,7 +10961,7 @@ def triage_charter_descendants(items, charters):
     return below, unresolved
 
 
-def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs, window_ok=True, captain_skip=False):
+def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs, window_ok=True, captain_skip=False, merged=None):
     """{rule: evidence} for one OPEN item (a pure function: the list copy and the fresh copy go through it alike), and
     whether the item is ours. `comments` is None when the comment unit is not read (T3 and T7 are then not judged).
     Evidence holds only labels' names, ages in days and owner logins."""
@@ -10976,6 +10994,12 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
             found["T9"] = {"quiet_days": round(age_updated, 2)}
         if not chain and not item["assignees"] and not named and "T1" not in found and age_updated >= sla["t11_days"]:
             found["T11"] = {"quiet_days": round(age_updated, 2)}
+        link = (merged or {}).get(number) if number not in ctx["charters"] and number not in ctx["asks"] else None   # a charter or an ask is a long-lived umbrella: a merged part does not finish it
+        if link:   # #384: its PR merged and it is still open: that is the finding, not "no owner"; ours when the PR's author is ours
+            found.pop("T1", None)
+            found.pop("T11", None)
+            found["T12"] = load_triage_plan_open().evidence(link, max(0.0, now - (parse_iso(link["merged_at"]) or now)) / day)
+            ours = ours or link["by"] in ours_logins
     elif not item["draft"] and comments is not None and ours and not captain_skip:
         # Only OUR PRs: our agents review by signed comment, which is in the data; other teams use formal GitHub reviews,
         # which the triage does not read, so a PR of theirs cannot be called unreviewed (it would be a false positive).
@@ -10992,6 +11016,8 @@ def triage_read_unit(hub, repo, unit, now, budget):
     if unit == "issues":
         path = "repos/%s/issues?state=open&per_page=100" % repo
         records, cut = hub.read_pages(path, cap=TRIAGE_LIST_PAGES)
+    elif unit == "merged":   # #384: ONE page of the recently closed pull requests; those with a merge date name the issues they implemented
+        records, cut = hub.read_pages("repos/%s/pulls?state=closed&sort=updated&direction=desc&per_page=%d" % (repo, TRIAGE_MERGED_PER_PAGE), cap=1)
     elif unit == "comments":
         since = iso(now - TRIAGE_COMMENT_DAYS * 86400)
         records, cut = hub.read_pages("repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100"
@@ -11067,6 +11093,8 @@ def triage_findings(engine, state, repos, decisions, cfg, now, errors):
                 n = _url_number(c.get("issue_url"))
                 if n is not None:
                     by_number.setdefault(n, []).append(c)
+        merged_unit = state.units.get((repo, "merged"))   # #384: not read yet (or no unit): no T12, never a guess
+        links = load_triage_plan_open().merged_links(merged_unit["data"], repo) if merged_unit is not None else {}
         sla, required = triage_sla(cfg, repo), (cfg.get("required_labels") or {}).get(repo) or []
         if comments_unit is None:
             unchecked.setdefault(repo, []).append("comments")
@@ -11075,7 +11103,7 @@ def triage_findings(engine, state, repos, decisions, cfg, now, errors):
             # a `MERGE: captain` PR already in the decision list is T6's; while the list is incomplete a captain PR waits
             captain_skip = item["captain"] and ((repo, number) in captain_listed or bool(errors))
             found, ours = triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs.get(repo, set()),
-                                       captain_skip=captain_skip)
+                                       captain_skip=captain_skip, merged=links)
             if not found:
                 continue
             ref = "%s#%d" % (repo, number)
@@ -11144,6 +11172,8 @@ def triage_verify(engine, state, rule, ref, cfg, now, budget, evidence=None):
                 and not triage_t10_graced(engine, cfg, data, now))
     if data.get("state") != "open":
         return False
+    if rule == "T12":   # #384: the merged PR was read in the list; the issue still being open is what a fresh read confirms
+        return True
     item = triage_norm(data)
     if item is None:
         return None
@@ -11239,7 +11269,7 @@ def triage_pass(engine, decisions, now, errors=()):
     state.started = engine.now()
     budget = [cfg.get("calls_per_pass", TRIAGE_CALLS_PER_PASS)]
     seconds = cfg.get("pass_seconds", TRIAGE_PASS_SECONDS)
-    units = ["issues", "comments"] + ["closed:" + l for l in sorted(triage_awaiting_labels(engine))]
+    units = ["issues", "comments", "merged"] + ["closed:" + l for l in sorted(triage_awaiting_labels(engine))]
     triage_refresh(engine, state, repos, units, now, budget, max(1, budget[0] // 3), seconds)  # a third kept for fresh checks
     candidates, unchecked_units, truncated = triage_findings(engine, state, repos, decisions, cfg, now, errors)
     findings, unchecked, unchecked_other, oldest = [], 0, 0, 0.0
