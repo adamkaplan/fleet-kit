@@ -9775,12 +9775,24 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
                      "timeout 5 fleet-switchboard waive acme/app#5 --gates G8 --reason x", "timeout 5 fleet-switchboard decisions batch --title x"):
             self.assertEqual(self.evaluate(rules, "shell", gate), "deny", gate)   # the collapsed denies still catch both the bare and the timeout forms
 
+    def test_retire_is_allowed_for_the_chief_of_staff_and_every_write_next_to_it_stays_denied(self):
+        _, rules = self.rules()
+        for command in ("fleet-switchboard retire worker --reason done", "fleet-switchboard retire --undo worker", "fleet-switchboard retire worker"):
+            self.assertEqual(self.evaluate(rules, "shell", command), "allow", command)
+        for command in ("timeout 30 fleet-switchboard retire worker", "fleet-switchboard review record acme/api#5 --reviewer code --block f",
+                        "fleet-switchboard impact clear acme/api#5 --reason x", "fleet-switchboard verdict --all --pr acme/api#5",
+                        "herdr pane close w1:p1", "herdr tab close w1:t1", "fleet-switchboard gates mode acme/app enforce"):
+            self.assertEqual(self.evaluate(rules, "shell", command), "deny", command)        # no raw herdr, and the other writes are as before
+        for path in self.PATHS:
+            _, lines, _ = self.block(path)
+            self.assertLess(len(lines), self.MAX_BLOCK_LINES)
+
     def test_the_subagent_has_the_same_list_without_handoff_or_launch(self):
         _, rules = self.parse(self.PATHS[1])
         self.assertEqual(self.evaluate(rules, "shell", "fleet-switchboard send x y"), "allow")
         self.assertEqual(self.evaluate(rules, "shell", "fleet-switchboard handoff --issue 5"), "deny")
         self.assertEqual(self.evaluate(rules, "shell", "fleet-switchboard launch v --agent orchestrator"), "deny")
-        for command in ("fleet-switchboard reattach x", "fleet-switchboard relaunch x"):
+        for command in ("fleet-switchboard reattach x", "fleet-switchboard relaunch x", "fleet-switchboard retire x"):
             self.assertEqual(self.evaluate(rules, "shell", command), "deny", command)
         self.assertEqual(self.evaluate(rules, "shell", "make build"), "deny")
 
@@ -18214,6 +18226,32 @@ class TestUnreportedStop(ReportBase):
     def test_a_stop_with_no_report_and_no_send_still_nudges(self):
         self.stop("OWED-ME: the migration is finished")
         self.assertIn("nudge", [f.kind for f in self.facts()])
+
+    def retire_entry(self, **fields):
+        entry = {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": self.world.sessions["coder"], "auto": False}
+        entry.update(fields)
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {"coder": entry} if entry is not None else {})
+        for source in self.world.engine.sources:                      # a stop is judged once and remembered: forget it so the next look decides afresh
+            getattr(source, "_stops", {}).clear()
+
+    def test_a_retired_worker_is_not_nudged_nor_reported_as_stopped_and_the_model_is_not_asked(self):
+        self.stop("OWED-ME: the migration is finished")
+        self.world.engine.state_dir = self.world.state
+        self.retire_entry()
+        self.assertEqual(self.kinds(self.facts()), [("worker.idle", "platform", True)])       # only the idle rider: the rest is silenced
+        self.assertEqual(self.triage_events(), [], "the decision model is not asked about a retired worker")
+
+    def test_a_retirement_of_another_session_or_another_name_does_not_silence_a_stop_and_one_with_no_session_does(self):
+        self.stop("OWED-ME: the migration is finished")
+        self.world.engine.state_dir = self.world.state
+        self.retire_entry(session="ses_a_session_this_worker_no_longer_has")
+        self.assertIn("nudge", [f.kind for f in self.facts()], "a stale retirement of an older session still lets the stop be nudged")
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {"someone-else": {"at": 1, "by": "x", "reason": "y", "session": self.world.sessions["coder"], "auto": False}})
+        for source in self.world.engine.sources:
+            getattr(source, "_stops", {}).clear()
+        self.assertIn("nudge", [f.kind for f in self.facts()], "another name's retirement does nothing")
+        self.retire_entry(session=None)
+        self.assertNotIn("nudge", [f.kind for f in self.facts()], "an entry that names no session retires the name")
 
     def test_a_stop_with_no_report_and_a_jev_answer_of_owed_nudges_the_worker_once(self):
         self.stop("OWED-ME: the migration is finished")
