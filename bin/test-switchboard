@@ -11195,22 +11195,37 @@ class TestSelfRegisteringCli(unittest.TestCase):
             with self.subTest(command=name):
                 self.assertEqual(self.plain(choices[name].format_help()), snap["help"][name])
 
-    def test_a_command_without_a_snapshot_file_and_a_file_without_a_command_each_fail_and_name_it(self):
+    def snapshot_failure(self, surface_dir):
+        """The message of the REAL surface comparison (the body of test_every_subcommand_of_the_snapshot...) run against `surface_dir`, or None when it passes."""
         _, choices = self.commands()
-        snap = self.read_surface()
-        for pretend, expect in (({"commands": sorted(set(snap["commands"]) - {"status"}), "help": snap["help"]}, "status"),
-                                ({"commands": sorted(set(snap["commands"]) | {"ghost-command"}), "help": snap["help"]}, "ghost-command")):
-            with self.subTest(expect=expect):
-                with self.assertRaises(AssertionError) as raised:
-                    self.assertEqual(sorted(choices), pretend["commands"], "the set of subcommands changed")
-                self.assertIn(expect, str(raised.exception) + " ".join(sorted(set(choices) ^ set(pretend["commands"]))))
-        with tempfile.TemporaryDirectory() as work:      # a file named for one command but describing another is refused
-            bad = Path(work) / "alpha.json"
-            bad.write_text(json.dumps({"command": "beta", "help": "x"}))
-            with mock.patch.object(self.__class__, "SURFACE_DIR", Path(work)):
-                with self.assertRaises(AssertionError) as raised:
-                    self.read_surface()
-            self.assertIn("alpha.json", str(raised.exception))
+        try:
+            with mock.patch.object(self.__class__, "SURFACE_DIR", surface_dir):
+                snap = self.read_surface()
+            self.assertEqual(sorted(choices), snap["commands"], "the set of subcommands changed: only in the code %s, only in the snapshot %s" % (
+                sorted(set(choices) - set(snap["commands"])), sorted(set(snap["commands"]) - set(choices))))
+        except AssertionError as err:
+            return str(err)
+        return None
+
+    def test_a_command_without_a_snapshot_file_and_a_file_without_a_command_each_fail_and_name_it(self):
+        with tempfile.TemporaryDirectory() as work:
+            copy = Path(work)
+            for source in self.SURFACE_DIR.glob("*.json"):
+                (copy / source.name).write_text(source.read_text())
+            self.assertIsNone(self.snapshot_failure(copy), "a complete copy passes")
+            (copy / "status.json").unlink()                                              # a command with no snapshot file
+            message = self.snapshot_failure(copy)
+            self.assertIsNotNone(message)
+            self.assertIn("only in the code ['status']", message)
+            (copy / "status.json").write_text((self.SURFACE_DIR / "status.json").read_text())
+            (copy / "ghost-command.json").write_text(json.dumps({"command": "ghost-command", "help": "x"}))    # a file with no command
+            message = self.snapshot_failure(copy)
+            self.assertIsNotNone(message)
+            self.assertIn("only in the snapshot ['ghost-command']", message)
+            (copy / "ghost-command.json").unlink()
+            (copy / "alpha.json").write_text(json.dumps({"command": "beta", "help": "x"}))                     # a file named for one command, describing another
+            message = self.snapshot_failure(copy)
+            self.assertIn("alpha.json", message)
 
     def test_the_snapshot_is_one_file_per_command_with_a_full_help_text(self):
         files = sorted(self.SURFACE_DIR.glob("*.json"))
@@ -11333,6 +11348,7 @@ class TestSelfRegisteringCli(unittest.TestCase):
         # the groups are VIEWS of the `direct`, `ledger` and `ensure_on_use` attributes each command sets next to its own definition: every command that
         # was in a shared list is still in its group, and the only additions are commands that already said `direct` themselves
         self.assertTrue(set(self.OLD_DIRECT) <= set(sb.DIRECT_ACTIONS))
+        # these four already said `cmd_x.direct = True` before this change, so they already ran direct: the views only make that visible
         self.assertEqual(set(sb.DIRECT_ACTIONS) - set(self.OLD_DIRECT), {"disk", "load-replay", "pr-state", "triage"})
         self.assertEqual(sorted(sb.LEDGER_ACTIONS), sorted(self.OLD_LEDGER))
         self.assertEqual(sorted(sb.ENSURE_ON_USE_COMMANDS), sorted(self.OLD_ENSURE_ON_USE))
