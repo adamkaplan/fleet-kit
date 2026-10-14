@@ -75,9 +75,59 @@ def load_seen(state_dir):
     return seen
 
 
-def write_seen(state_dir, seen):
+def load_meta(state_dir):
+    """The digest's cadence memory, kept in the same file: {"known", "swept", "last"}. A missing or corrupt file is NOT known: the digest
+    warms up again. A file written before the cadence existed has no `swept` and counts as swept (an upgrade does not re-warm)."""
+    raw = read_json(os.path.join(state_dir, SEEN_FILE)) if state_dir else None
+    if raw is None or not isinstance(raw.get("items"), dict):
+        return {"known": False, "swept": False, "last": None}
+    last = raw.get("last")
+    return {"known": True, "swept": bool(raw.get("swept", True)), "last": float(last) if _number(last) else None}
+
+
+def write_seen(state_dir, seen, meta=None):
     if state_dir:
-        write_json(os.path.join(state_dir, SEEN_FILE), {"v": 1, "items": seen})
+        meta = meta or {"swept": True, "last": None}
+        write_json(os.path.join(state_dir, SEEN_FILE), {"v": 1, "items": seen, "swept": bool(meta.get("swept")), "last": meta.get("last")})
+
+
+WARMUP_MAX_SECONDS = 1800   # a sweep that cannot finish (a list that never reads) ends its warm-up after this: the digest must never stay silent for good
+
+
+def gate(meta, now, unchecked, interval_seconds, warming_since=None):
+    """(may a digest go out now, the state `status` shows). Warm-up: nothing goes out while any finding is unchecked; the first pass with none
+    ends it (`meta["swept"]` is set, the caller saves it). Then at most one digest per `interval_seconds` from the last delivered one
+    (0 = no cap). A held digest drops nothing: the caller leaves its memory untouched, so the same items are due next time."""
+    if not meta["swept"]:
+        if unchecked > 0 and not (warming_since is not None and now - warming_since >= WARMUP_MAX_SECONDS):
+            return False, {"state": "warming", "unchecked": int(unchecked)}
+        meta["swept"] = True
+    if interval_seconds > 0 and meta["last"] is not None and now - meta["last"] < interval_seconds:
+        return False, {"state": "held", "next_at": meta["last"] + interval_seconds}
+    return True, {"state": "ready"}
+
+
+def digest_line(digest, now, interval_minutes=60):
+    """The `status` line for the digest's cadence, or None."""
+    if not isinstance(digest, dict):
+        return None
+    state = digest.get("state")
+    if state == "warming":
+        return "digest warming up: %d unchecked; nothing is delivered until every finding has been checked once" % int(digest.get("unchecked") or 0)
+    if state == "held" and _number(digest.get("next_at")):
+        return "digest: the next digest may go out in %s (at most one per %s)" % (age_text(max(0, int(digest["next_at"] - now))), interval_text(interval_minutes))
+    if state == "ready":
+        return "digest ready: one goes out when something qualifies (at most one per %s)" % interval_text(interval_minutes)
+    return None
+
+
+def interval_text(minutes):
+    minutes = int(minutes) if _number(minutes) else 60
+    return "hour" if minutes == 60 else "%d minutes" % minutes if minutes % 60 else "%d hours" % (minutes // 60)
+
+
+def age_text(seconds):
+    return "%ds" % seconds if seconds < 120 else "%dm" % (seconds // 60) if seconds < 7200 else "%dh" % (seconds // 3600)
 
 
 def load_mutes(state_dir):

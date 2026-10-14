@@ -19545,6 +19545,121 @@ class TestTriageDigest(Base):
         line = sb.triage_digest.cost_lines(cost, sb.triage_digest.day_of(now))[-1]
         self.assertIn("1200 chars, ~300 tokens", line)
 
+    # -- #406: warm up first, then at most one digest per hour
+
+    def stepped(self, steps, seconds=60, every=None, **cfg):
+        """Passes `seconds` apart; returns [(step, [(rule, ref)])] of the digests sent, and the digest state seen at each step."""
+        self.engine.config["triage"].update(enabled=True, **cfg)
+        sent, states, real = [], [], sb.triage_queue_fact
+        def spy(state, due, *a, **k):
+            sent.append((step, list(due)))
+            return real(state, due, *a, **k)
+        with mock.patch.object(sb, "triage_queue_fact", spy):
+            for step in range(steps):
+                self.world.tick(seconds if step else 1)
+                sb.triage_pass(self.engine, [], self.world.clock.now(), ())
+                if every:
+                    every(step)
+                states.append(dict(self.engine.triage.current.get("digest") or {}))
+        return sent, states
+
+    def test_s1_nothing_is_delivered_until_every_finding_is_checked_then_one_digest(self):
+        for n in range(100, 112):
+            self.add(n, created=3, updated=0.2, labels=["kind"])
+        sent, states = self.stepped(40, seconds=1, calls_per_pass=4)
+        self.assertGreaterEqual(len([s for s in states if s.get("state") == "warming"]), 1)    # it did hold at least one pass
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(len({ref for _, ref in sent[0][1]}), 12)                                 # 12 of 12 in the one digest
+        first = [i for i, s in enumerate(states) if s.get("state") != "warming"][0]
+        self.assertEqual(sent[0][0], first)                                                        # and not before the sweep ended
+
+    def test_s2_a_finding_that_qualifies_inside_the_hour_waits_and_goes_in_the_next_digest(self):
+        self.add(140, created=3, updated=0.2, labels=["kind"])
+        def later(step):
+            if step == 10:
+                self.add(141, created=3, updated=0.2, labels=["kind"])
+                self.engine.triage.units.clear()
+        sent, _ = self.stepped(75, every=later)
+        self.assertEqual([step for step, _ in sent], [0, 60])
+        self.assertEqual({ref for _, ref in sent[0][1]}, {"acme/api#140"})
+        self.assertIn("acme/api#141", {ref for _, ref in sent[1][1]})
+
+    def test_s3_held_findings_all_go_out_together_and_the_first_items_backoff_has_not_moved(self):
+        self.add(140, created=3, updated=0.2, labels=["kind"])
+        def later(step):
+            if step == 10:
+                for n in (150, 151, 152):
+                    self.add(n, created=3, updated=0.2, labels=["kind"])
+                self.engine.triage.units.clear()
+        sent, _ = self.stepped(75, every=later)
+        self.assertEqual({ref for _, ref in sent[1][1]} >= {"acme/api#150", "acme/api#151", "acme/api#152"}, True)
+        rec = self.engine.triage.seen["T1 acme/api#140"] if "T1 acme/api#140" in self.engine.triage.seen else [r for k, r in self.engine.triage.seen.items() if k.endswith("#140")][0]
+        self.assertEqual(rec["n"], 1)                                                              # not advanced by the held pass
+
+    def test_s4_a_restart_with_the_memory_intact_neither_re_warms_nor_resets_the_hour(self):
+        self.add(140, created=3, updated=0.2, labels=["kind"])
+        sent, _ = self.stepped(1)
+        self.assertEqual(len(sent), 1)
+        self.engine.triage = sb.TriageState()                                                      # a restart: memory rebuilt from the files
+        self.add(141, created=3, updated=0.2, labels=["kind"])
+        sent, states = self.stepped(10)
+        self.assertEqual(sent, [])                                                                 # inside the hour: nothing
+        self.assertEqual({s.get("state") for s in states}, {"held"})                               # and it is not warming up again
+
+    def test_s5_a_lost_memory_file_warms_up_again_and_delivers_one_digest_after_the_sweep(self):
+        for n in range(100, 112):
+            self.add(n, created=3, updated=0.2, labels=["kind"])
+        sent, _ = self.stepped(40, seconds=1, calls_per_pass=4)
+        self.assertEqual(len(sent), 1)
+        (self.world.state / sb.triage_digest.SEEN_FILE).write_text("{not json")
+        self.engine.triage = sb.TriageState()
+        self.engine.triage.units.clear()
+        sent, states = self.stepped(40, seconds=1, calls_per_pass=4)
+        self.assertGreaterEqual(len([s for s in states if s.get("state") == "warming"]), 1)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(len({ref for _, ref in sent[0][1]}), 12)
+
+    def test_the_interval_is_validated_zero_means_every_pass_and_a_legacy_file_does_not_re_warm(self):
+        for bad in (-1, "x", True):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_triage_config({"triage": {"digest_interval_minutes": bad}}, "cfg")
+        sb.validate_triage_config({"triage": {"digest_interval_minutes": 0}}, "cfg")
+        self.add(140, created=3, updated=0.2, labels=["kind"])
+        sent, _ = self.stepped(3, seconds=1, digest_interval_minutes=0)
+        self.assertEqual(len(sent), 1)                                                             # one finding: shown once (its backoff), not per pass
+        self.add(141, created=3, updated=0.2, labels=["kind"])
+        self.engine.triage.units.clear()
+        sent, _ = self.stepped(1, seconds=1, digest_interval_minutes=0)
+        self.assertEqual(len(sent), 1)                                                             # a new finding goes out at once: no hourly cap
+        # a memory file written before the cadence existed: no `swept`, no `last`: it counts as swept and does not warm up again
+        (self.world.state / sb.triage_digest.SEEN_FILE).write_text(json.dumps({"v": 1, "items": {}}))
+        self.assertEqual(sb.triage_digest.load_meta(str(self.world.state)), {"known": True, "swept": True, "last": None})
+
+    def test_a_warm_up_that_cannot_finish_ends_after_its_maximum_and_never_silences_the_digest_for_good(self):
+        meta = {"known": False, "swept": False, "last": None}
+        self.assertEqual(sb.triage_digest.gate(meta, 100, 5, 3600, 100), (False, {"state": "warming", "unchecked": 5}))
+        self.assertEqual(sb.triage_digest.gate(meta, 100 + sb.triage_digest.WARMUP_MAX_SECONDS, 5, 3600, 100), (True, {"state": "ready"}))
+        self.assertTrue(meta["swept"])
+
+    def test_backoff_false_keeps_the_old_per_pass_behaviour_whole(self):
+        self.add(140, created=3, updated=0.2, labels=["kind"])
+        sent, states = self.stepped(1, seconds=1, backoff=False)
+        self.add(141, created=3, updated=0.2, labels=["kind"])
+        self.engine.triage.units.clear()
+        more, states2 = self.stepped(3, seconds=1, backoff=False)
+        self.assertEqual(len(sent) + len(more), 2)                                                 # a digest on each pass that had something new: no hourly cap
+        self.assertEqual(states + states2, [{}, {}, {}, {}])                                       # and no cadence state at all
+
+    def test_s6_status_says_warming_with_the_unchecked_count_and_when_the_next_digest_may_go_out(self):
+        now = self.world.clock.now()
+        base = {"counts": {}, "total": 0, "repos": 1, "at": sb.iso(now)}
+        warming = "\n".join(sb.triage_status_lines(dict(base, digest={"state": "warming", "unchecked": 7})))
+        self.assertIn("warming up", warming)
+        self.assertIn("7 unchecked", warming)
+        held = "\n".join(sb.triage_status_lines(dict(base, digest={"state": "held", "next_at": now + 40 * 60})))
+        self.assertIn("next digest", held)
+        self.assertIn("40m", held)
+
     def test_s5_seen_leave_mutes_until_a_change(self):
         self.add(160, created=3, updated=0.2, labels=["kind"])
         self.assertEqual(sb.triage_digest.mute_command(str(self.world.state), "seen-leave", "acme/api#160", self.world.clock.now())[0], 0)
