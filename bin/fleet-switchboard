@@ -21542,7 +21542,8 @@ def load_tick(engine, discovery):
         if not names:
             return []
         found = engine.intents._api("repos/%s/issues?state=open&per_page=100&labels=%s" % (repo, urllib.parse.quote(names[0])), repo)
-        return [(i["number"], i.get("body") or "") for i in found if isinstance(i, dict) and isinstance(i.get("number"), int)] if isinstance(found, list) else []
+        return [(i["number"], i.get("body") or "") for i in found   # the issues list also returns pull requests: a PR body never names a charter
+                if isinstance(i, dict) and isinstance(i.get("number"), int) and "pull_request" not in i] if isinstance(found, list) else []
 
     def wake(text):
         add_reminder(engine.state_dir, cos, now, now, text)

@@ -46032,6 +46032,49 @@ class TestLoadAlert(Base):
         sb.load_tick(engine, discovery)
         self.assertEqual(len(api), 2)                   # cached for an hour
 
+    def test_a_pull_request_in_the_issues_list_never_names_a_charter(self):
+        seen = lambda name, fleet: types.SimpleNamespace(name=name, fleet=fleet, status="idle")
+        asked = []
+        issues = [{"number": 60, "body": "orchestrator: o1", "pull_request": {"url": "u"}}, {"number": 61, "body": "orchestrator: o1"}]
+        intents = types.SimpleNamespace(repo="acme/widget", _api=lambda path, repo: [{"name": "me:orchestrator"}] if "/labels" in path else issues,
+                                        open_asks=lambda charter, repo: asked.append(charter) or [])
+        engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.T0, audit=None, actor="daemon", intents=intents,
+                                       config={"load_alert": self.health.validate({"enabled": True}, "x")})
+        sb.load_tick(engine, types.SimpleNamespace(agents={"o1": seen("o1", {"role": "orchestrator", "repo": "acme/widget"})}))
+        self.assertEqual(asked, [61])
+
+    def charters_ctx(self, at, calls, orchestrators, reads_before=()):
+        def read_charters(repo):
+            calls.append((at, repo))
+            return [(5, "orchestrator: a")]
+        return self.health.Context(now=at, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS), orchestrators=orchestrators,
+                                   read_asks=lambda charter, repo: [], read_charters=read_charters, cos="cos", wake=self.woken.append)
+
+    def test_the_charters_cache_expires_after_an_hour_and_a_spent_budget_refuses_the_read(self):
+        calls = []
+        orch = {"a": {"charter": None, "repo": "acme/widget", "busy": 0, "idle": 1, "messages": 0}}
+        self.health.tick(self.charters_ctx(self.T0, calls, orch))
+        self.health.tick(self.charters_ctx(self.T0 + 600, calls, orch))
+        self.assertEqual(len(calls), 1)                       # cached
+        self.health.tick(self.charters_ctx(self.T0 + self.health.ASKS_FRESH_SECONDS + 5, calls, orch))
+        self.assertEqual(len(calls), 2)                       # expired: read again
+        # a budget with fewer than 2 reads left refuses the charters read (the asks read may still use the last one)
+        state = json.loads((self.state_dir / "load.json").read_text())
+        now = self.T0 + 2 * self.health.ASKS_FRESH_SECONDS + 10
+        state["charters"] = {}
+        state["reads"] = [now - 60] * (self.health.READ_BUDGET - 1)
+        (self.state_dir / "load.json").write_text(json.dumps(state))
+        self.health.tick(self.charters_ctx(now, calls, orch))
+        self.assertEqual(len(calls), 2)                       # refused: no third call
+
+    def test_many_orchestrators_with_no_charter_are_named_with_a_count(self):
+        orch = {"o%d" % n: {"charter": None, "repo": None, "busy": 0, "idle": 0, "messages": 0} for n in range(9)}
+        ctx = self.health.Context(now=self.T0, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS), orchestrators=orch,
+                                  read_asks=lambda c, r: [], cos="cos", wake=self.woken.append)
+        self.health.tick(ctx)
+        problems = json.loads((self.state_dir / "load.json").read_text())["problems"]
+        self.assertTrue(any(p.startswith("no charter recorded for o0, o1") and p.endswith("and 3 more") for p in problems), problems)
+
     def test_charters_that_cannot_be_read_fall_back_and_are_said(self):
         def read_charters(repo):
             raise RuntimeError("gh is down")
