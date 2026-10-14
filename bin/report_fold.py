@@ -46,4 +46,4 @@ def follows(entry, recipient, repo, issue, now, window=WINDOW_SECONDS):
 def marked(summary, sent_at, now):
     """The report line with a mark that it follows the earlier message and wakes nobody again; its state stays first (`question: ...`)."""
     minutes = max(0, int((now - sent_at) // 60))
-    return "%s [follows this agent's message of %d min ago on the same issue: no second wake]" % (summary, minutes)
+    return "%s [follows its message %d min ago]" % (summary, minutes)

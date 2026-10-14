@@ -2658,6 +2658,7 @@ class Plan:
     def __init__(self, recipient, action, reason, pending, observation=None, ready_at=None):
         self.recipient, self.action, self.reason = recipient, action, reason
         self.pending, self.observation, self.ready_at = pending, observation, ready_at
+        self.folded = False   # #352: a report folded into the sender's earlier send: a note, never a second wake
 
     def to_json(self):
         return {"recipient": self.recipient, "action": self.action, "reason": self.reason,
@@ -3821,7 +3822,7 @@ class Switchboard:
             fresh, why = self.reobserve(observation, self.now())
             again = decide(plan.recipient, plan.pending, fresh, self.now(), self.batch_seconds,
                            self.engaged_seconds, why)
-            if getattr(plan, "folded", False) and again.action == "wake":
+            if plan.folded and again.action == "wake":
                 again.action = "note"   # #352: a folded report stays a note
             if again.action != plan.action and not (interrupt and again.action in ("note", "wake")):
                 detail = {"was": plan.action, "now": again.action, "reason": again.reason,
