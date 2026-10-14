@@ -172,6 +172,40 @@ def load_report_fold():
     return module
 
 
+def load_triage_plan_open():
+    """The plan-issue-still-open rule, bin/triage_plan_open.py (#384), loaded by path like plan_check."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "triage_plan_open.py")
+    held = sys.modules.get("triage_plan_open")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("triage_plan_open", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["triage_plan_open"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("triage_plan_open", None)
+        raise
+    return module
+
+
+def load_pr_events():
+    """The webhook-event rule for `pr-state`, bin/pr_events.py (#354), loaded by path like plan_check."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pr_events.py")
+    held = sys.modules.get("pr_events")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("pr_events", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["pr_events"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("pr_events", None)
+        raise
+    return module
+
+
 def load_disk_janitor():
     """The temp-directory janitor, bin/disk_janitor.py (#321), loaded by path like plan_check."""
     path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "disk_janitor.py")
@@ -187,6 +221,103 @@ def load_disk_janitor():
         sys.modules.pop("disk_janitor", None)
         raise
     return module
+
+
+def load_heavy_slots():
+    """The CPU slots for heavy commands, bin/heavy_slots.py (#34), loaded by path like the other modules."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "heavy_slots.py")
+    held = sys.modules.get("heavy_slots")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("heavy_slots", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["heavy_slots"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("heavy_slots", None)
+        raise
+    return module
+
+
+def load_cpu_guard():
+    """The CPU guard, bin/cpu_guard.py (the P0 CPU order), loaded by path like plan_check."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cpu_guard.py")
+    held = sys.modules.get("cpu_guard")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("cpu_guard", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["cpu_guard"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("cpu_guard", None)
+        raise
+    return module
+
+
+def load_health_records():
+    """The health recorders, bin/health_records.py (#357), loaded by path like disk_janitor."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "health_records.py")
+    held = sys.modules.get("health_records")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("health_records", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["health_records"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("health_records", None)
+        raise
+    return module
+
+
+def health_recorder(engine):
+    """The engine's recorder of what it has already read (#357), made on first use. None when it cannot be made: health is never in a pass's way."""
+    held = getattr(engine, "health", None)
+    if held is None:
+        try:
+            held = engine.health = load_health_records().Recorder(time.time)
+        except Exception:
+            return None
+    return held
+
+
+def _health_fault(engine, where, err):
+    """A recorder fault is never in a pass's way, but it is said once per change of the error (`_note`), so a recorder that never records leaves a trace."""
+    try:
+        engine._note("health.error", where, {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
+    except Exception:
+        pass
+
+
+def health_ingest_messages(engine, session, page):
+    """Messages the feed has just read, handed to the recorder. No read of its own; a fault is ignored."""
+    try:
+        recorder = health_recorder(engine)
+        if recorder is not None and isinstance(page, list):
+            for message in page[:20]:
+                recorder.ingest_message(session, message)
+    except Exception as err:
+        _health_fault(engine, "ingest", err)
+
+
+def health_write(engine, state, now):
+    """End of every pass (#357, from `finish_pass`, so it runs whatever is configured): the pushes seen in the PR picture, when one exists
+    (`state` is the ci recorder's, or None: the engine's own is used), and `health-records.json` (written only when its content changed, or on the heartbeat)."""
+    try:
+        recorder = health_recorder(engine)
+        if recorder is None or engine.state_dir is None:
+            return
+        state = state if state is not None else getattr(engine, "ci_record_state", None)
+        recorder.ingest_prs(getattr(state, "pr_state", None))
+        records = load_health_records()
+        body = recorder.body(records.read_tool_file(engine.state_dir))
+        state_write(Path(engine.state_dir) / records.FILE, json.dumps(body, sort_keys=True), _without(body, "written_at"), HEARTBEAT_PR_STATE, nofollow=True)
+    except Exception as err:
+        _health_fault(engine, "write", err)
 
 
 def load_impact_floor():
@@ -322,6 +453,26 @@ def load_work_sync():
 work_sync = load_work_sync()
 
 
+def load_agent_calls():
+    """The agent-shell call counter, bin/agent_calls.py (#367), loaded by path like the others."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "agent_calls.py")
+    held = sys.modules.get("agent_calls")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("agent_calls", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["agent_calls"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("agent_calls", None)
+        raise
+    return module
+
+
+agent_calls = load_agent_calls()
+
+
 def load_triage_digest():
     """The stale digest's rules and files, bin/triage_digest.py (#349), loaded by path like the others."""
     path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "triage_digest.py")
@@ -340,6 +491,26 @@ def load_triage_digest():
 
 
 triage_digest = load_triage_digest()
+
+
+def load_dead_hint():
+    """The DEAD agent's hint, bin/dead_hint.py (#379), loaded by path like the others."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "dead_hint.py")
+    held = sys.modules.get("dead_hint")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("dead_hint", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["dead_hint"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("dead_hint", None)
+        raise
+    return module
+
+
+dead_hint = load_dead_hint()
 
 VERSION = "0.1.0"
 PROG = "fleet-switchboard"
@@ -370,7 +541,9 @@ DEFAULTS = {
     "call_timeout_seconds": 20,
     "send_timeout_seconds": 60,    # `send` as a whole (the sum of its v2 and herdr calls): past it, a clear failure line, never a silent minutes-long wait
     "poll_seconds": 5,
+    "cpu_guard": None,             # load over cores: None = defaults (high_ratio 3 for 5 minutes wakes the Chief of Staff once per episode); false = off; or {"high_ratio": n, "minutes": n}
     "disk_guard": None,            # free space of the state directory's volume: None = defaults (min_free_gb 50, hard_free_gb 10); false = off; or {"min_free_gb": n, "hard_free_gb": n}
+    "heavy": None,                 # CPU slots for `heavy -- <command>` (full suites, e2e runs): None = 3 slots; or {"slots": n}
     "docker_reaper": True,         # the daily removal of EXPIRED labelled docker containers, networks and volumes (`disk reap-docker`): false is the kill switch
     "v2_events": "auto",           # the daemon's news of sessions: "auto" (the service's event stream, where the HTTP route exists; reads only what an event did not say) or "off" (the old reads)
     "v2_transport": "auto",        # how v2 calls travel: "auto" (HTTP to the service when it can, else the CLI) or "cli" (always `opencode api`: the kill switch)
@@ -399,6 +572,7 @@ DEFAULTS = {
     "cos_orders_file": None,        # PR 18: the Chief of Staff's own standing orders, an absolute path; None means standing-orders.md beside config.json
     # PR 15: many repos, one fleet. "owner/repo" or "owner/*" -> the gh account whose token that repo uses
     "gh_users": {},
+    "intent_live_silence_minutes": 10,  # #367: a live forwarder whose last event (or start) is older than this does not get the long intent trust (0 = always trusted, as before)
     "github_poll_seconds": 60,  # PR 15: how often a repo without a forwarder is read (the catch-up read, on a poll)
 }
 
@@ -448,7 +622,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "temp_janitor"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "temp_janitor", "load_alert"}
 
 
 def config_known_keys():
@@ -513,6 +687,14 @@ def validate_config(raw, source="config"):
                 raise ConfigError("%s: %r value for %s must be a string" % (source, key, name))
         envs[key] = dict(env)
     validate_disk_guard(config["disk_guard"], source)
+    try:
+        load_heavy_slots().settings(config["heavy"])
+    except Exception as err:
+        raise ConfigError("%s: %s" % (source, err)) from None
+    try:
+        load_cpu_guard().validate(config["cpu_guard"], source)
+    except ValueError as err:
+        raise ConfigError(str(err))
     if not isinstance(config["docker_reaper"], bool):
         raise ConfigError("%s: 'docker_reaper' must be true or false, got %r" % (source, config["docker_reaper"]))
     if config["v2_events"] not in ("auto", "off"):
@@ -539,8 +721,10 @@ def validate_config(raw, source="config"):
     validate_decisions_config(config, source)  # PR 14
     validate_external_config(config, source)
     validate_friction_config(config, source)
+    validate_load_alert_config(config, source)
     validate_worktree_config(config, source)
     validate_orphan_config(config, source)
+    validate_order_burst(config, source)
     try:
         load_disk_janitor().validate(config.get("temp_janitor"), source)
     except ValueError as err:
@@ -2206,6 +2390,89 @@ class DiskFacts:
         return [Fact("disk.low:%d" % int(episode), name, "disk", text, episode, sender="switchboard") for name in chiefs]
 
 
+class CpuFacts:
+    """The CPU guard's fact source (bin/cpu_guard.py): ONE `os.getloadavg()` per pass, no process. When the load over the cores stays above the guard for the
+    configured minutes the Chief of Staff is told ONCE for the episode (`cpu.high:<episode>`: the key is stable, so it is delivered once), `cpu.high` is audited
+    with the top process categories from ONE bounded `ps` run when the episode begins (never on another pass), and the episode ends (`cpu.recovered`) below
+    two thirds of the guard. The episode is kept in `cpu-guard.json`, so a restart does not begin a second one."""
+
+    __name__ = "cpu_facts"
+
+    def __init__(self):
+        self.engine = None
+        self.tracker = None
+        self.detail = ""
+        self.thread = None
+        self.saved_episode = None   # the episode the file holds (None: closed)
+
+    def bind(self, engine):
+        self.engine = engine
+
+    def _start_ps(self, engine, cg):
+        """ONE bounded `ps` on a thread: a starved machine must never hang the daemon's pass. The result lands in `self.detail` when it is done; the fact
+        keeps its text until delivered, so it carries the categories when they came back in time."""
+        runner = getattr(engine, "cpu_ps_runner", None) or subprocess.run
+
+        def work():
+            try:
+                done = runner(cg.PS_ARGV, capture_output=True, text=True, timeout=cg.PS_SECONDS, stdin=subprocess.DEVNULL)
+                text = cg.detail(cg.categories(done.stdout)) if done.returncode == 0 else ""
+            except Exception:
+                text = ""
+            if self.thread is threading.current_thread():   # a slow ps of an earlier episode never overwrites a later one's text
+                self.detail = text
+        self.thread = threading.Thread(target=work, name="cpu-ps", daemon=True)
+        self.thread.start()
+
+    def __call__(self):
+        engine = self.engine
+        if engine is None or engine.state_dir is None:
+            return []
+        cg = load_cpu_guard()
+        cfg = cg.settings(engine.config.get("cpu_guard"))
+        if cfg is None:
+            return []
+        read = cg.reading()
+        if not read.ratio_known:   # FAIL OPEN: a load or a core count that cannot be read tells nobody (the status line says so), and never counts as one core
+            return []
+        discovery = getattr(engine, "discovery", None)
+        chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff") if discovery is not None and not discovery.problems else []
+        if self.tracker is None:
+            self.tracker = cg.Episode(cg.load_episode(engine.state_dir))
+            self.saved_episode = self.tracker.episode
+        load1, load5, cores = read.load1, read.load5, read.cores
+        ratio = load5 / cores   # the five-minute average decides: a one-minute spike never wakes the Chief of Staff
+        event = self.tracker.step(ratio, engine.now(), cfg, can_begin=bool(chiefs))
+        if event == "begin":
+            self.detail = ""
+            self._start_ps(engine, cg)
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "cpu.high", None, {"load1": round(load1, 1), "load5": round(load5, 1), "cores": cores, "ratio5": round(ratio, 2),
+                                                                      "high_ratio": cfg["high_ratio"], "minutes": cfg["minutes"]})
+            self._save(engine, cg, self.tracker.episode)
+        elif event == "end":
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "cpu.recovered", None, {"load1": round(load1, 1), "load5": round(load5, 1), "cores": cores, "ratio5": round(ratio, 2)})
+            self.detail = ""
+            self.thread = None
+            self._save(engine, cg, None)
+        episode = self.tracker.episode
+        if self.saved_episode != episode:   # a save that failed is tried again on the next pass
+            self._save(engine, cg, episode)
+        if episode is None or not chiefs:
+            return []
+        text = "cpu high: load %d on %d cores (%.1fx over five minutes; the guard is %gx for %g minutes). %s `%s status` shows the line; heavy work should wait for a slot." % (
+            round(load5), cores, ratio, cfg["high_ratio"], cfg["minutes"], self.detail + "." if self.detail else "", PROG)
+        return [Fact("cpu.high:%d" % int(episode), name, "cpu", " ".join(text.split()), episode, sender="switchboard") for name in chiefs]
+
+    def _save(self, engine, cg, episode):
+        try:
+            cg.save_episode(engine.state_dir, episode)
+            self.saved_episode = episode
+        except OSError as err:
+            engine._note("cpu.guard_file", None, {"error": _plain("%s: %s" % (type(err).__name__, err), 160)})
+
+
 # ---------------------------------------------------------------- the docker reaper (ask #321)
 #
 # A test stack or a compose project that an agent starts carries two labels: `fleet.owner=<agent>` and `fleet.expires=<epoch seconds>`. The reaper removes
@@ -2491,7 +2758,7 @@ def fact_sources(state_dir):
     the same rule, and stores nothing.
     """
     return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir),
-            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), JobFacts(), PaneFacts(), DiskFacts(), DockerReapFacts()]
+            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), JobFacts(), PaneFacts(), DiskFacts(), CpuFacts(), DockerReapFacts()]
 
 
 # --------------------------------------------------------- observing the fleet
@@ -3290,6 +3557,7 @@ class EventFeed:
                 entry["tried"] = now   # every failed attempt: a persistently failing few go to the back, whatever their last good read
             return False
         newest = page[0].get("id") if isinstance(page, list) and page and isinstance(page[0], dict) else None
+        health_ingest_messages(engine, session, page)
         with self.lock:
             entry = self._entry(session)
             known, entry["read"] = entry["assistant"], now
@@ -5752,6 +6020,9 @@ class PaneFacts:
             word = "DETACHED" if info["state"] == PANE_DETACHED else "DEAD"
             summary = ("%s is %s: pane %s, session %s (%s). Repair it with `%s reattach %s`; if the session is gone, `relaunch` is the next step."
                        % (name, word, info.get("pane"), info.get("session"), _one_line(info.get("why"), 120), PROG, name))
+            if info["state"] == PANE_DEAD:   # #379: what is known of it, and what to do (best effort: the hint is read-only, bounded and total on any file content)
+                summary += " " + dead_hint.hint(name, _read_small(engine.state_dir, LAST_REPORT_FILE).get(name), engine.now(),
+                                                boss_name(discovery, discovery.agents.get(name)) if name in discovery.agents else None) + "."
             for chief in chiefs:
                 if chief != name:
                     out.append(Fact("pane:%s:%s:%s" % (name, info["state"], info.get("session")), chief, "pane", summary,
@@ -5767,12 +6038,14 @@ def pane_health_status_lines(state_dir, now=None):
     retired = read_retired(state_dir)
     bad = [(n, v) for n, v in sorted(data["states"].items()) if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n not in retired]
     clock = time.time() if now is None else now
+    last = _read_small(state_dir, LAST_REPORT_FILE)
     gone = [n for n, v in sorted(retired.items()) if clock - (v.get("at") or 0) <= RETIRED_SHOW_DAYS * 86400]
     tail = (["      retired    %d finished worker(s), not watched: %s (`%s retire --undo <name>` reverses)" % (len(gone), ", ".join(gone[:8]), PROG)] if gone else [])
     if not bad:
         return tail
     return ["      panes      %d agent(s) need repair: %s" % (len(bad), "; ".join("%s %s (pane %s)" % (n, v["state"].upper(), v.get("pane")) for n, v in bad[:6]))
-            ] + ["        run `%s reattach <name>`" % PROG] + tail
+            ] + ["        run `%s reattach <name>`" % PROG] + [
+        "        %s: %s" % (_one_line(n, 60), dead_hint.hint(n, last.get(n), clock)) for n, v in bad[:6] if v.get("state") == PANE_DEAD] + tail
 
 
 def charter_pane_update(engine, runner, fleet, new_pane):
@@ -6911,6 +7184,9 @@ def cmd_handoff(args, runner, now, socket_call=None):
     return EXIT_OK
 
 
+cmd_handoff.ensure_on_use = True   # the daemon is alive when it runs
+
+
 def cmd_comment(args, runner, now):
     """Post a comment as the calling agent, signed so the switchboard does not deliver it back."""
     engine, _, config = build_engine(runner, now, "cli")
@@ -6928,6 +7204,9 @@ def cmd_comment(args, runner, now):
     url = post_ask_comment(engine, number, body, author=caller, repo=repo)
     print(json.dumps({"issue": number, "author": caller, "comment": url}, sort_keys=True))
     return EXIT_OK
+
+
+cmd_comment.ensure_on_use = True   # the daemon is alive when it runs
 
 
 def cmd_whoami(args, runner, now):
@@ -8703,7 +8982,7 @@ def decisions_from_notices(engine, now):
             continue   # it was last seen open a while ago and cannot be confirmed now: a row derived from OPEN state is not listed (the notice stays)
         tag = repo if len(in_play) > 1 else repo.split("/")[-1]
         entry = decision_core.notice_entry(repo, number, tag, facts or {}, held["stale"], item.get("from"),
-                                           item["created"], item.get("note"), hold)
+                                           item["created"], item.get("note"), hold, engine.config.get("intent_repo"))
         evidence = captain_evidence(facts, set(notice_senders(item))) if facts and facts.get("captain") else []
         if evidence == [] and now - item["created"] >= CAPTAIN_NO_REVIEW_SECONDS:
             pass  # nothing stalls silently: the notice's own clock (a new head does not restart it) lists it
@@ -8846,20 +9125,72 @@ def record_order_notice(state_dir, repo, charter, action, text, caller, ordered_
     return item
 
 
-def ack_order_notice(state_dir, ident):
-    """Drop one heads-up; True when it was there."""
+def ack_order_notice(state_dir, ident, window=None, now=None):
+    """Drop one heads-up, or a whole burst when `ident` is a group id (`<first id>+<count>`). Returns True when something was dropped, False when
+    nothing matched, and the string `changed:<n>` when the burst the id names now has n members (not `count`): nothing is dropped, so an order that
+    joined after the owner saw the row is never dropped unseen. Groups are made the way the panel's rows are: from the unexpired orders only and
+    with the same window. An old single id still drops just that one."""
     with order_notices_lock(state_dir):
         items = read_order_notices(state_dir)
-        kept = [i for i in items if i["id"] != ident]
+        gone = {ident}
+        m = _GROUP_ID.match(ident)
+        if m and not any(i["id"] == ident for i in items):
+            live = [i for i in items if (now if now is not None else time.time()) - i["created"] < ORDER_NOTICE_TTL_SECONDS]
+            for group in order_groups(live, ORDER_BURST_MINUTES * 60 if window is None else window):
+                if group[0]["id"] == m.group(1):
+                    if len(group) != int(m.group(2)):
+                        return "changed:%d" % len(group)
+                    gone = {g["id"] for g in group}
+                    break
+        kept = [i for i in items if i["id"] not in gone]
         if len(kept) == len(items):
             return False
         write_order_notices(state_dir, kept)
     return True
 
 
+ORDER_BURST_MINUTES = 10   # orders of the same action by the same actor on the same charter within this many minutes of the first are ONE heads-up
+_GROUP_ID = re.compile(r"^(order:.+)\+([0-9]+)$")
+
+
+def order_burst_seconds(config):
+    value = (config or {}).get("order_notice_burst_minutes", ORDER_BURST_MINUTES)
+    return 0 if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0 else int(value * 60)
+
+
+def validate_order_burst(config, source):
+    raw = config.get("order_notice_burst_minutes")
+    if raw is not None and (isinstance(raw, bool) or not isinstance(raw, (int, float)) or not 0 <= raw <= 1440):
+        raise ConfigError("%s: 'order_notice_burst_minutes' must be a number of minutes from 0 (no grouping) to 1440, got %r" % (source, raw))
+
+
+def order_groups(items, window):
+    """[[item, ...]] oldest first: consecutive orders of the same action by the same actor on the same charter, each within `window` seconds of the
+    FIRST of its group, form one group (a window of 0 groups nothing)."""
+    groups, open_by_key = [], {}
+    for item in sorted(items, key=lambda i: (i["created"], i["id"])):
+        key = (item["repo"], item["charter"], item.get("action"), item.get("from"))
+        group = open_by_key.get(key)
+        if window > 0 and group is not None and item["created"] - group[0]["created"] <= window:
+            group.append(item)
+        else:
+            group = [item]
+            open_by_key[key] = group
+            groups.append(group)
+    return groups
+
+
+def order_group_id(group):
+    return group[0]["id"] if len(group) == 1 else "%s+%d" % (group[0]["id"], len(group))
+
+
 def decisions_from_order_notices(engine, now):
     """(entries, problems): each unexpired order heads-up as an entry of kind `notice` (tier `human`, id `order:<repo>#N.<time>`):
-    information for the owner, never a decision, never counted. Read-only: an expired one is only left out here."""
+    information for the owner, never a decision, never counted. Read-only: an expired one is only left out here.
+
+    The headline LEADS WITH WHAT DIFFERS (`<repo>#<charter> order +: <text> (cos)`, `+` added, `-` removed), so the number is never what a narrow
+    row cuts; the text is. A burst (orders of one action by one actor on one charter within `order_notice_burst_minutes`) is ONE entry,
+    `<repo>#<charter>: 19 orders added by cos: <first words>`, whose id is the first id plus the count and whose note lists the member ids."""
     state_dir = getattr(engine, "state_dir", None)
     if state_dir is None:
         return [], []
@@ -8867,20 +9198,27 @@ def decisions_from_order_notices(engine, now):
         items = read_order_notices(state_dir)
     except NoticeError as err:
         return [], [str(err)]
+    window = order_burst_seconds(getattr(engine, "config", None))
+    live = [i for i in items if now - i["created"] < ORDER_NOTICE_TTL_SECONDS]
     entries = []
-    for item in items:
-        if now - item["created"] >= ORDER_NOTICE_TTL_SECONDS:
-            continue
-        what = "added" if item.get("action") == "add" else "removed"
-        headline = decision_core.fit_lines("order %s by cos on %s#%d: %s" % (
-            what, item["repo"].split("/")[-1], item["charter"], item.get("text") or ""))
-        entries.append({"id": item["id"], "title": decision_core.line_of(headline, decision_core.DECISION_TITLE_MAX),
-                        "headline": headline, "ask": None, "repo": item["repo"], "agent": item.get("from"),
-                        "kind": "notice", "tier": "human", "since": iso(item["created"]), "number": item["charter"],
-                        "url": "https://github.com/%s/issues/%d" % (item["repo"], item["charter"]),
+    for group in order_groups(live, window):
+        first = group[0]
+        short, sign = first["repo"].split("/")[-1], "+" if first.get("action") == "add" else "-"
+        who = first.get("from") or "cos"
+        text = first.get("text") or ""
+        if len(group) == 1:
+            headline = decision_core.fit_lines("%s#%d order %s: %s (%s)" % (short, first["charter"], sign, text, who))
+            note = "not ack'd: `%s notice ack %s` drops it" % (PROG, first["id"])
+        else:
+            word = "added" if sign == "+" else "removed"
+            headline = decision_core.fit_lines("%s#%d: %d orders %s by %s: %s" % (short, first["charter"], len(group), word, who, text))
+            note = "not ack'd: `%s notice ack %s` drops all %d (members: %s)" % (PROG, order_group_id(group), len(group), ", ".join(g["id"] for g in group))
+        entries.append({"id": order_group_id(group), "title": decision_core.line_of(headline, decision_core.DECISION_TITLE_MAX),
+                        "headline": headline, "ask": None, "repo": first["repo"], "agent": first.get("from"),
+                        "kind": "notice", "tier": "human", "since": iso(first["created"]), "number": first["charter"],
+                        "url": "https://github.com/%s/issues/%d" % (first["repo"], first["charter"]),
                         "state": None, "additions": None, "deletions": None, "files": None, "ci": None,
-                        "review": None, "stale": False, "note": "not ack'd: `%s notice ack %s` drops it" % (PROG, item["id"]),
-                        "merge_after": None})
+                        "review": None, "stale": False, "note": note, "merge_after": None})
     return entries, []
 
 
@@ -9434,6 +9772,13 @@ def record_github_calls(engine):
         summary = accounts.call_summary(engine.now())
         path = Path(engine.state_dir) / GITHUB_CALLS_FILE
         state_write(path, json.dumps(summary, sort_keys=True) + "\n", _without(summary, "at"), STATE_HEARTBEAT_SECONDS, nofollow=True)
+        cursor, fresh = getattr(engine, "agent_calls_cursor", None), {}   # #367: the daemon's new calls, and the agent shells' spool, into the hourly count
+        with accounts.lock:
+            for at, account, _, _ in accounts.calls:
+                if cursor is None or at > cursor:
+                    fresh[account] = fresh.get(account, 0) + 1
+        if agent_calls.fold(str(engine.state_dir), engine.now(), fresh) or not fresh:
+            engine.agent_calls_cursor = engine.now()   # advanced only once the calls are written: a failed write is counted at the next pass
     except Exception as err:
         try:
             engine._note("github_calls.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
@@ -9505,6 +9850,10 @@ def publish_decisions(engine):
         triage_pass(engine, decisions, now, errors)  # #130: audits and counts; writes nothing to GitHub; never raises
     except Exception as err:
         engine._note("triage.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+    try:
+        pr_events_pass(engine, now)   # #354: folds the webhook events into the pr-state picture and writes it, for watched repos too; no GitHub call
+    except Exception as err:
+        engine._note("pr_state.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
     try:
         ci_record_pass(engine, now)   # #107: records ci verdicts for open PRs under a plan; reads GitHub, writes only the ledger and audit
     except Exception as err:
@@ -9722,6 +10071,9 @@ def cmd_decisions(args, runner, now):
     return EXIT_ERROR if report["stale"] else EXIT_OK
 
 
+cmd_decisions.ensure_on_use = True   # the daemon is alive when it runs
+
+
 def decisions_summary(state_dir, now):
     """For `status`: how many decisions the file lists (and how many of them are yours, the Chief of Staff's, an
     orchestrator's), and whether the daemon keeps it current."""
@@ -9790,6 +10142,10 @@ def finish_pass(engine, discovery, report):
     except Exception as err:
         engine._failed("friction-wake", "friction-wake", err, report)
     try:
+        load_tick(engine, discovery)
+    except Exception as err:
+        engine._failed("load-alert", "load-alert", err, report)
+    try:
         prune_report_riders(engine, discovery)
     except Exception as err:
         engine._failed("report-riders", "report-riders", err, report)
@@ -9797,6 +10153,10 @@ def finish_pass(engine, discovery, report):
         publish_decisions(engine)
     except Exception as err:
         engine._failed("decisions", "decisions", err, report)
+    try:
+        health_write(engine, None, engine.now())   # #357: not tied to the GitHub ci recorder, which returns early on a fleet with no plan_gates
+    except Exception as err:
+        engine._failed("health-records", "health-records", err, report)
     schedule_judge_warm(engine, discovery)
 
 
@@ -10493,7 +10853,7 @@ class SweepFacts:
 
 TRIAGE_DEFAULTS = {"enabled": False, "repos": None, "required_labels": {}, "sla": {}, "sla_overrides": {},
                    "our_logins": None, "daily_summary": True, "realarm_hours": 24, "max_findings": 30,
-                   "calls_per_pass": 30, "pass_seconds": 10, "backoff": True}
+                   "calls_per_pass": 30, "pass_seconds": 10, "backoff": True, "digest_interval_minutes": 60}
 # Every `_days` value is in days and may be a fraction (2/24 is two hours); `t7_ours_hours` is in hours.
 TRIAGE_SLA = {"t1_days": 1, "t2_days": 1 / 24, "t3_ask_days": 1, "t3_other_days": 3, "t5_days": 2 / 24, "t6_days": 2,
               "t7_ours_hours": 4, "t7_other_days": 2, "t8_days": 1, "t9_days": 3, "t11_days": 1}
@@ -10501,7 +10861,7 @@ TRIAGE_SLA = {"t1_days": 1, "t2_days": 1 / 24, "t3_ask_days": 1, "t3_other_days"
 TRIAGE_KINDS = {"T1": "owner missing", "T2": "required label missing", "T3": "no next step",
                 "T5": "human-tier decision unanswered", "T6": "MERGE: captain PR waiting", "T7": "PR with no review",
                 "T8": "blocked ask", "T9": "ask with no activity", "T10": "closed but still labelled awaiting",
-                "T11": "orphan", "OO": "other-owner (flag only)"}
+                "T11": "orphan", "T12": "plan issue still open after its PR merged", "OO": "other-owner (flag only)"}
 TRIAGE_T10_GRACE = 600         # seconds after a close in which a still-set awaiting label is not yet a finding
 TRIAGE_TTL = 900               # seconds a unit read is kept
 TRIAGE_CALLS_PER_PASS = TRIAGE_DEFAULTS["calls_per_pass"]   # default of `triage.calls_per_pass` (reads and fresh checks alike)
@@ -10509,6 +10869,7 @@ TRIAGE_CALLS_CAP = 100
 TRIAGE_PASS_SECONDS = TRIAGE_DEFAULTS["pass_seconds"]       # default of `triage.pass_seconds`; cap TRIAGE_SECONDS_CAP
 TRIAGE_SECONDS_CAP = 60
 TRIAGE_LIST_PAGES = 2
+TRIAGE_MERGED_PER_PAGE = 50    # #384: the recently closed pull requests read per repo per refresh (one page)
 TRIAGE_COMMENT_DAYS = 14       # the comment window: next-step markers and review comments are looked for in it
 TRIAGE_UNREADABLE_RETRY = 3600
 TRIAGE_FILE = "triage.json"
@@ -10580,6 +10941,8 @@ def validate_triage_config(config, source):
         raise ConfigError("%s.repos' must be OWNER/REPO names, got %r" % (where, section["repos"]))
     if not _is_number(section["realarm_hours"]) or section["realarm_hours"] <= 0:
         raise ConfigError("%s.realarm_hours' must be a positive number, got %r" % (where, section["realarm_hours"]))
+    if not _is_number(section["digest_interval_minutes"]) or section["digest_interval_minutes"] < 0:
+        raise ConfigError("%s.digest_interval_minutes' must be a number of minutes, 0 or more (0 sends a digest every pass that has one), got %r" % (where, section["digest_interval_minutes"]))
     cap = section["max_findings"]
     if not isinstance(cap, int) or isinstance(cap, bool) or not 1 <= cap <= 200:
         raise ConfigError("%s.max_findings' must be a whole number from 1 to 200, got %r" % (where, cap))
@@ -10659,6 +11022,7 @@ class TriageState:
         self.started, self.day, self.day_counts = 0, None, {}
         self.summarised = None
         self.seen = None         # #349: the stale digest's memory (bin/triage_digest.py), loaded at the first pass
+        self.meta = None         # #406: its cadence (warm-up done, the last delivery), kept in the same file
 
 
 def triage_state(engine):
@@ -10691,6 +11055,7 @@ def triage_norm(issue):
             "parked_until": parked_until(body, {(l.get("name") if isinstance(l, dict) else l) for l in issue.get("labels") or []}),
             "owner_body": triage_names_owner(body),
             "open_sub": isinstance(total, int) and isinstance(done, int) and total > done,
+            "pending_text": load_triage_plan_open().pending_text(body),   # #410: its own text says work is left
             "captain": is_captain({"labels": {(l.get("name") if isinstance(l, dict) else l) for l in issue.get("labels") or []},
                                    "body": body})}
 
@@ -10704,6 +11069,23 @@ def triage_comment_facts(records):
         if at is not None:
             found.append({"at": at, "next": bool(TRIAGE_NEXT_RE.search(text)), "review": triage_says_reviewed(text)})
     return sorted(found, key=lambda c: c["at"])
+
+
+def triage_pending_proofs(engine, links, items, repo):
+    """#410: the open issues of `links` whose linked merged PR still has a proof the ledger has not seen pass. The ledger is one local file, read only
+    when a T12 candidate exists; an unreadable or tampered one makes every candidate unknown (suppressed this pass), never a finding."""
+    candidates = {n: l for n, l in links.items() if n in items}
+    if not candidates:
+        return set()
+    if engine.state_dir is None:
+        return set()   # no state directory: no ledger exists
+    try:
+        entries, problem = plan_ledger.read_ledger(engine.state_dir)
+    except Exception:
+        return set(candidates)
+    if problem:
+        return set(candidates)
+    return load_triage_plan_open().pending_issues(candidates, entries, repo)
 
 
 def triage_context(engine, repo, items, discovery):
@@ -10722,11 +11104,38 @@ def triage_context(engine, repo, items, discovery):
                     charters.add(value)
     charters |= {n for n, i in items.items() if any(str(l).endswith(":orchestrator") for l in i["labels"])}
     asks = {n for n, i in items.items() if i["parent"] in charters}
-    work = {n for n, i in items.items() if i["parent"] in asks}
-    return {"charters": charters, "asks": asks, "chain": charters | asks | work, "owned": owned}
+    below, unresolved = triage_charter_descendants(items, charters)
+    return {"charters": charters, "asks": asks, "chain": charters | below, "owned": owned, "unresolved": unresolved}
 
 
-def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs, window_ok=True, captain_skip=False):
+TRIAGE_ANCESTOR_DEPTH = 8   # #396: how many parent links the owner walk follows (a deeper chain ends the walk)
+
+
+def triage_charter_descendants(items, charters):
+    """(numbers whose parent chain reaches a charter within TRIAGE_ANCESTOR_DEPTH links, numbers whose chain leaves the issues read first).
+    Memory only: the parent links of the lists already held, so no read. A cycle or a too-deep chain ends the walk (neither). A parent that
+    is not among the issues read (another repo, closed) makes the answer unknown, never a missing owner."""
+    below, unresolved = set(), set()
+    for start in items:
+        seen, current = {start}, start
+        for _ in range(TRIAGE_ANCESTOR_DEPTH):
+            parent = items[current]["parent"]
+            if parent is None:
+                break                                  # the root of the chain: no charter above it
+            if parent in charters:
+                below.add(start)
+                break
+            if parent not in items:
+                unresolved.add(start)
+                break
+            if parent in seen:
+                break                                  # a cycle: the walk ends
+            seen.add(parent)
+            current = parent
+    return below, unresolved
+
+
+def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs, window_ok=True, captain_skip=False, merged=None, pending=None):
     """{rule: evidence} for one OPEN item (a pure function: the list copy and the fresh copy go through it alike), and
     whether the item is ours. `comments` is None when the comment unit is not read (T3 and T7 are then not judged).
     Evidence holds only labels' names, ages in days and owner logins."""
@@ -10739,7 +11148,8 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
     ask = number in ctx["asks"]
     if not item["pr"]:
         named = item.get("owner_body", False)   # an explicit `Owner: <name>` or `owned by <name>` line names the owner
-        if not item["assignees"] and not chain and not named and number not in ctx["owned"] and age_created >= sla["t1_days"]:
+        if not item["assignees"] and not chain and not named and number not in ctx["owned"] and number not in ctx["unresolved"] \
+                and age_created >= sla["t1_days"]:
             found["T1"] = {"created_days": round(age_created, 2)}
         group_missing = [g for g in required if not any(l in item["labels"] for l in (g if isinstance(g, list) else [g]))]
         if group_missing and age_created >= sla["t2_days"]:
@@ -10758,6 +11168,13 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
             found["T9"] = {"quiet_days": round(age_updated, 2)}
         if not chain and not item["assignees"] and not named and "T1" not in found and age_updated >= sla["t11_days"]:
             found["T11"] = {"quiet_days": round(age_updated, 2)}
+        link = (merged or {}).get(number) if number not in ctx["charters"] and number not in ctx["asks"] else None   # a charter or an ask is a long-lived umbrella: a merged part does not finish it
+        if link:   # #384: its PR merged and it is still open: that is the finding, not "no owner"; ours when the PR's author is ours
+            found.pop("T1", None)
+            found.pop("T11", None)
+            if not (item["open_sub"] or item["pending_text"] or number in (pending or ())):   # #410: not truly done: an open sub-issue, pending work in its text or a proof not passed
+                found["T12"] = load_triage_plan_open().evidence(link, max(0.0, now - (parse_iso(link["merged_at"]) or now)) / day)
+                ours = ours or link["by"] in ours_logins
     elif not item["draft"] and comments is not None and ours and not captain_skip:
         # Only OUR PRs: our agents review by signed comment, which is in the data; other teams use formal GitHub reviews,
         # which the triage does not read, so a PR of theirs cannot be called unreviewed (it would be a false positive).
@@ -10774,6 +11191,8 @@ def triage_read_unit(hub, repo, unit, now, budget):
     if unit == "issues":
         path = "repos/%s/issues?state=open&per_page=100" % repo
         records, cut = hub.read_pages(path, cap=TRIAGE_LIST_PAGES)
+    elif unit == "merged":   # #384: ONE page of the recently closed pull requests; those with a merge date name the issues they implemented
+        records, cut = hub.read_pages("repos/%s/pulls?state=closed&sort=updated&direction=desc&per_page=%d" % (repo, TRIAGE_MERGED_PER_PAGE), cap=1)
     elif unit == "comments":
         since = iso(now - TRIAGE_COMMENT_DAYS * 86400)
         records, cut = hub.read_pages("repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100"
@@ -10849,6 +11268,9 @@ def triage_findings(engine, state, repos, decisions, cfg, now, errors):
                 n = _url_number(c.get("issue_url"))
                 if n is not None:
                     by_number.setdefault(n, []).append(c)
+        merged_unit = state.units.get((repo, "merged"))   # #384: not read yet (or no unit): no T12, never a guess
+        links = load_triage_plan_open().merged_links(merged_unit["data"], repo) if merged_unit is not None else {}
+        pending = triage_pending_proofs(engine, links, items, repo)
         sla, required = triage_sla(cfg, repo), (cfg.get("required_labels") or {}).get(repo) or []
         if comments_unit is None:
             unchecked.setdefault(repo, []).append("comments")
@@ -10857,7 +11279,7 @@ def triage_findings(engine, state, repos, decisions, cfg, now, errors):
             # a `MERGE: captain` PR already in the decision list is T6's; while the list is incomplete a captain PR waits
             captain_skip = item["captain"] and ((repo, number) in captain_listed or bool(errors))
             found, ours = triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs.get(repo, set()),
-                                       captain_skip=captain_skip)
+                                       captain_skip=captain_skip, merged=links, pending=pending)
             if not found:
                 continue
             ref = "%s#%d" % (repo, number)
@@ -10926,6 +11348,8 @@ def triage_verify(engine, state, rule, ref, cfg, now, budget, evidence=None):
                 and not triage_t10_graced(engine, cfg, data, now))
     if data.get("state") != "open":
         return False
+    if rule == "T12":   # #384: the merged PR was read in the list; the issue still being open is what a fresh read confirms
+        return True
     item = triage_norm(data)
     if item is None:
         return None
@@ -11021,7 +11445,7 @@ def triage_pass(engine, decisions, now, errors=()):
     state.started = engine.now()
     budget = [cfg.get("calls_per_pass", TRIAGE_CALLS_PER_PASS)]
     seconds = cfg.get("pass_seconds", TRIAGE_PASS_SECONDS)
-    units = ["issues", "comments"] + ["closed:" + l for l in sorted(triage_awaiting_labels(engine))]
+    units = ["issues", "comments", "merged"] + ["closed:" + l for l in sorted(triage_awaiting_labels(engine))]
     triage_refresh(engine, state, repos, units, now, budget, max(1, budget[0] // 3), seconds)  # a third kept for fresh checks
     candidates, unchecked_units, truncated = triage_findings(engine, state, repos, decisions, cfg, now, errors)
     findings, unchecked, unchecked_other, oldest = [], 0, 0, 0.0
@@ -11077,15 +11501,33 @@ def triage_pass(engine, decisions, now, errors=()):
                      "other_owner": other_owner, "at": iso(now),
                      "unchecked": unchecked, "unchecked_other_owner": unchecked_other,
                      "oldest_unchecked_seconds": int(oldest), "unchecked_units": {r: sorted(u) for r, u in unchecked_units.items()},
-                     "unreadable": sorted(state.unreadable), "truncated": sorted(truncated), "repos": len(repos)}
+                     "unreadable": sorted(state.unreadable), "truncated": sorted(truncated), "repos": len(repos),
+                     "digest_interval_minutes": cfg.get("digest_interval_minutes", 60)}
     triage_write(engine, state)
     flagged = [(r, ref) for r, ref, _ in findings if r == "OO" and now - state.alarmed.get((r, ref), 0) >= cfg["realarm_hours"] * 3600]
     due, invalid = triage_digest_due(engine, state, [(r, ref) for r, ref, _ in findings if r != "OO"],
                                      [(r, ref) for r, ref, _ in candidates if r != "OO"], cfg, now)
+    if cfg["enabled"] and cfg.get("backoff", True):   # #406: warm up first, then at most one digest per interval; a held digest keeps its memory untouched
+        before = state.meta["swept"]
+        open_units = sum(len(u) for u in unchecked_units.values()) + sum(1 for r in repos if (r, "issues") not in state.units and r not in state.unreadable)   # a list not read yet is a finding not checked
+        if not state.meta["swept"] and getattr(state, "warming_since", None) is None:
+            state.warming_since = now
+        allowed, digest = triage_digest.gate(state.meta, now, unchecked + open_units, cfg.get("digest_interval_minutes", 60) * 60,
+                                             getattr(state, "warming_since", None))
+        state.current["digest"] = digest
+        triage_write(engine, state)
+        if state.meta["swept"] != before:
+            triage_digest.write_seen(engine.state_dir, state.seen, state.meta)
+        if not allowed:
+            due, invalid = [], []
     if cfg["enabled"] and (due or invalid):   # never a wake solely for other-owner flags: they ride along when a wake happens anyway
         text = triage_queue_fact(state, due, now, cfg, len(flagged), invalid)
         triage_digest.cost_record(engine.state_dir, now, text)
+        state.meta["last"] = now
         triage_digest_commit(engine, state, due[:cfg["max_findings"]], invalid, now)
+        if state.current.get("digest", {}).get("state") == "ready" and cfg.get("digest_interval_minutes", 60) > 0:
+            state.current["digest"] = {"state": "held", "next_at": now + cfg["digest_interval_minutes"] * 60}
+            triage_write(engine, state)
         for pair in flagged:
             state.alarmed[pair] = now
         for rule, _ in due:
@@ -11105,10 +11547,16 @@ def triage_digest_items(state):
     return index
 
 
+def triage_digest_memory(engine, state):
+    """The digest's memory and its cadence, loaded once together (the gate and the commit both need `state.meta`)."""
+    if state.seen is None or state.meta is None:
+        state.seen = triage_digest.load_seen(engine.state_dir)
+        state.meta = triage_digest.load_meta(engine.state_dir)
+
+
 def triage_digest_due(engine, state, ours, candidates, cfg, now):
     """([(rule, ref)] for this pass's one digest, [ref] with an invalid parked label); see bin/triage_digest.py."""
-    if state.seen is None:
-        state.seen = triage_digest.load_seen(engine.state_dir)
+    triage_digest_memory(engine, state)
     triage_digest.prune(state.seen, candidates)
     mutes = triage_digest.load_mutes(engine.state_dir) if engine.state_dir else {}
     return triage_digest.select(state.seen, triage_digest_items(state), mutes, ours, now, cfg.get("backoff", True), state.alarmed,
@@ -11119,7 +11567,7 @@ def triage_digest_commit(engine, state, shown, invalid, now):
     triage_digest.commit(state.seen, triage_digest_items(state), shown, invalid, now)
     for ref in invalid:
         engine._note("triage.parked_invalid", ref, {"ref": ref, "why": "a parked label without one valid `Parked until: YYYY-MM-DD` line"})
-    triage_digest.write_seen(engine.state_dir, state.seen)
+    triage_digest.write_seen(engine.state_dir, state.seen, state.meta)
 
 
 def triage_queue_fact(state, due, now, cfg, other_owner=0, invalid=()):
@@ -11226,6 +11674,9 @@ def triage_status_lines(triage):
                      "raised nor audited" % (triage["unchecked"], extra))
     if triage.get("truncated"):
         lines.append("      triage     lists capped for " + ", ".join(triage["truncated"]))
+    cadence = triage_digest.digest_line(triage.get("digest"), parse_iso(triage.get("at")) or time.time(), triage.get("digest_interval_minutes", 60))   # #406
+    if cadence:
+        lines.append("      triage     " + cadence)
     if "cost" in triage:   # #349: what the digests cost the Chief of Staff to read, per day
         lines.extend(triage_digest.cost_lines(triage["cost"], str(triage.get("at") or "")[:10]) if triage["cost"]
                      else ["      triage     cost per day: not recorded (nothing delivered yet)"])
@@ -11788,6 +12239,9 @@ def cmd_remind(args, runner, now):
     return EXIT_OK
 
 
+cmd_remind.ensure_on_use = True   # the daemon is alive when it runs
+
+
 # ======================================================= GitHub events (PR 5)
 #
 # One section, self-contained. The pieces, in the order they are built:
@@ -11883,6 +12337,9 @@ def _validate_github(config, source):
     if not _is_number(poll) or poll < GITHUB_POLL_MIN:
         raise ConfigError("%s: 'github_poll_seconds' must be a number of at least %d (each read of a repo costs "
                           "several API calls), got %r" % (source, GITHUB_POLL_MIN, poll))
+    silence = config["intent_live_silence_minutes"]
+    if not _is_number(silence) or silence < 0:
+        raise ConfigError("%s: 'intent_live_silence_minutes' must be a number of minutes, 0 or more (0 keeps the long trust always), got %r" % (source, silence))
 
 
 # ------------------------------------------------------------- verification
@@ -12331,6 +12788,7 @@ class Watch:
         self.next_start = 0.0
         self.started = self.catchup_at = self.last_catch_up = None
         self.last_error = self.catch_up_error = None
+        self.last_event = None   # #367: when a webhook event last arrived for this repo (memory only)
         self.drops = []          # #77: (time dropped, seconds it had run), the last hour's worth; memory only
         self.down_since = None   # when the forwarder last stopped, until it runs again
         # PR 15: a repo whose forwarder cannot work (no such repo yet, no right to make a webhook) is read on
@@ -12444,6 +12902,7 @@ class GitHubHub:
         self.engine = None
         self.intent_verdicts = {}  # intent.edit key -> (wakes the Chief of Staff, why): decided once per edit
         self.intent_edits = {}  # intent.edit key -> the `issues` payload, until delivered (PR 6's item, wired here)
+        self.pr_events = {}     # #354: "owner/repo#N" -> the `pr-state` entry the last verified pull_request event made (memory only; the pass folds it in)
         self.awaiting = {}      # PR 14: (repo, number) -> {"title", "since", "parent"} of an open issue with the label
         self.awaiting_read = {}  # PR 14: repo -> None (read fine) or the error of the last labelled read; absent: never
 
@@ -12467,7 +12926,14 @@ class GitHubHub:
         """The number of times `repo`'s forwarder has started while it is running now, or None when it is not live (polling, down, starting): an entry
         cached under one generation is trusted for the long time only while that same forwarder runs, so an event missed in a gap is never trusted."""
         watch = self.watches.get(repo)
-        return watch.starts if watch is not None and watch.mode == "forwarder" else None
+        if watch is None or watch.mode != "forwarder":
+            return None
+        silence = self.config.get("intent_live_silence_minutes")   # #367: alive but silent (lag, a stuck connection) is not trusted for the long time
+        if _is_number(silence) and silence > 0:
+            heard = max(watch.last_event or 0, watch.started or 0)
+            if self.now() - heard > silence * 60:
+                return None
+        return watch.starts
 
     def _audit(self, event, subject, detail):
         if self.audit is not None:
@@ -12603,11 +13069,18 @@ class GitHubHub:
         self.enqueue(items)
         with self.lock:  # live traffic moves the marker, unless a catch-up still has a gap to close
             watch = self.watches.get(repo)
+            if watch is not None:
+                watch.last_event = self.now()
             live = watch is not None and watch.catchup_at is None and repo in self.markers
         if live:
             self._set_marker(repo, self.now())
         self.note_issue_edit(event, repo, payload)
         self.note_awaiting_event(event, repo, payload)
+        try:   # #348: a push, a PR opened or merged is real movement of the ask it closes: one small row, for the load figure
+            load_fleet_health().append_moves(self.state_dir, load_fleet_health().move_rows(event, payload, repo, self.now(), closing_numbers))
+        except Exception as err:   # the load figure then under-counts movement: say so in the audit, never fail the delivery
+            self._audit("load.moves_failed", repo, {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
+        self.note_pr_event(event, repo, payload)
         self._audit("github.received", repo, {"event": event, "delivery": _header(headers, "X-GitHub-Delivery"),
                                               "keys": [_one_line(item.key, 80) for item in items[:5]], "count": len(items)})   # ids, not bodies: the first few of them
         return 202, "accepted"
@@ -13012,6 +13485,25 @@ class GitHubHub:
             else:
                 self.awaiting.pop(key, None)
 
+    def note_pr_event(self, event, repo, payload):
+        """A verified `pull_request` event: keep the entry for its PR in memory, with no read at all (#354). Never raises: a bad payload is not kept."""
+        try:
+            number = (payload.get("pull_request") or {}).get("number") if isinstance(payload, dict) else None
+            ref = "%s#%s" % (plan_ledger.normal_repo(repo), number)
+            with self.lock:
+                made = load_pr_events().entry_for(self.pr_events.get(ref), event, payload, self.now())
+                if made is not None:
+                    self.pr_events[ref] = made[1]
+                    while len(self.pr_events) > PR_STATE_MAX:
+                        self.pr_events.pop(min(self.pr_events, key=lambda r: self.pr_events[r].get("at", 0)))
+        except Exception as err:
+            self._audit("github.rejected", repo, {"reason": "pull_request event not kept: %s" % _one_line(str(err))})
+
+    def pr_event_snapshot(self):
+        """A copy of the entries the events made, for the pass that folds them into the picture."""
+        with self.lock:
+            return {ref: dict(entry) for ref, entry in self.pr_events.items()}
+
     def note_awaiting_event(self, event, repo, payload):
         """A webhook event that carries an issue: keep the picture current with no read at all."""
         issue = payload.get("issue") if event in ("issues", "issue_comment") else None
@@ -13146,7 +13638,7 @@ class GitHubHub:
             else:
                 done = self.runner(argv, capture_output=True, text=True,
                                    timeout=timeout or self.config["call_timeout_seconds"], **extra)
-        except GhRateLimited as err:   # fail closed, on purpose: while the account is paused every hub read says "unavailable" (callers already hold on that); no hub read is `essential`
+        except GhRateLimited as err:   # fail closed, on purpose: while the account is paused every hub read says "unavailable" (callers already hold on that); no hub read is exempt
             raise GitHubUnavailable(str(err)) from None
         except AccountError as err:
             raise GitHubUnavailable(str(err)) from None
@@ -13610,9 +14102,14 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
     if state_ok:
         report["decisions"] = decisions_summary(state, now)
         report["v2_calls"] = v2_calls_status(state, now())
-        report["github_calls"] = github_calls_status(state, now())
+        report["github_calls"] = github_calls_status(state, now()) + agent_calls.status_lines(str(state), now())   # #367
         if config_ok and disk_guard_settings(config) is not None:
             report["disk"] = disk_status_line(config, state)   # one stat of the volume
+        if config_ok:
+            cg = load_cpu_guard()
+            cpu_cfg = cg.settings(config.get("cpu_guard"))
+            if cpu_cfg is not None:
+                report["cpu"] = cg.status_line(cpu_cfg, cg.reading(), cg.slots_text(config, state))   # a system call (and the optional heavy_slots module): no process
         if config_ok:
             report["orphans"] = orphan_status_line(config)   # one `ps`; None when there is none or the reaper is off
         if config_ok and config.get("v2_light"):
@@ -13629,6 +14126,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         report["v2_link"] = v2_link_status_line(state, now())
         if config_ok:
             report["friction"] = friction_status_line(config, state)
+            report["load"] = load_fleet_health().status_lines(state, now())
         report["stopped_news"] = stopped_news_summary(state, now())
         line = external_status_line(config, state, now()) if config_ok else None
         if line is not None:   # only when external decisions are on: off prints nothing
@@ -13810,6 +14308,7 @@ def format_status(report):
     lines.extend(format_github(report["github"]) if "github" in report else [])
     lines.extend(format_decisions_status(report["decisions"]) if "decisions" in report else [])
     lines.extend("      disk       " + report["disk"] for _ in [0] if report.get("disk"))
+    lines.extend("      cpu        " + report["cpu"] for _ in [0] if report.get("cpu"))
     lines.extend("      orphans    " + report["orphans"] for _ in [0] if report.get("orphans"))
     lines.extend("      v2 calls   " + report["v2_calls"] for _ in [0] if report.get("v2_calls"))
     lines.extend("      " + text for text in report.get("github_calls") or [])
@@ -13821,6 +14320,7 @@ def format_status(report):
     lines.extend(report.get("pane_lines") or [])
     lines.extend("      " + report["v2_link"] for _ in [0] if report.get("v2_link"))
     lines.extend("      " + report["friction"] for _ in [0] if report.get("friction"))
+    lines.extend("      " + line for line in report.get("load") or [])   # #348
     counts = report.get("stopped_news")
     if counts:  # #96: only when the judge ran in the last hour
         lines.append("      stopped    %d note(s) judged for news in the last hour: %d dropped, %d would be dropped (shadow)"
@@ -13841,6 +14341,9 @@ def cmd_status(args, runner=subprocess.run, now=time.time):
     else:
         print(format_status(report))
     return EXIT_OK if report["ok"] else EXIT_ERROR
+
+
+cmd_status.direct = True   # no error mapping, no daemon start
 
 
 class CallerError(Exception):
@@ -14034,6 +14537,9 @@ def cmd_poke(args):
     return EXIT_OK
 
 
+cmd_poke.direct = True   # no error mapping, no daemon start
+
+
 def read_brief(path, stdin):
     """The brief for `launch`: a file, or `-` for standard input. None when not given."""
     if path is None:
@@ -14121,6 +14627,9 @@ def cmd_launch(args, runner, now, socket_call=None):
     if note and (brief or args.checkpoint or args.overdue):
         sys.stderr.write("%s: %s\n" % (PROG, note))
     return EXIT_OK
+
+
+cmd_launch.ensure_on_use = True   # the daemon is alive when it runs
 
 
 
@@ -14273,6 +14782,9 @@ def cmd_send(args, runner, now):
     return code
 
 
+cmd_send.ensure_on_use = True   # the daemon is alive when it runs
+
+
 def _cmd_send(args, runner, now):
     engine, _, config = build_engine(runner, now, "cli")
     refusal = intent_refusal(config, args.issue)
@@ -14345,6 +14857,9 @@ def cmd_report(args, runner, now):
     for line in outcome.get("worktrees") or []:
         sys.stderr.write("%s: worktree: %s\n" % (PROG, line))
     return EXIT_OK
+
+
+cmd_report.ensure_on_use = True   # the daemon is alive when it runs
 
 
 def notice_boss(engine, sender):
@@ -14429,9 +14944,13 @@ def _notice_ack(args, engine, state):
         if caller is not None:
             sys.stderr.write("%s: only the owner, in a plain shell, acks a heads-up; %s is a fleet agent\n" % (PROG, caller))
             return EXIT_USAGE
-        found = ack_order_notice(state, args.pr)
+        found = ack_order_notice(state, args.pr, order_burst_seconds(engine.config), engine.now())
     except (NoticeError, OSError) as err:
         sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 400)))
+        return EXIT_USAGE
+    if isinstance(found, str) and found.startswith("changed:"):
+        sys.stderr.write("%s: heads-up %s changed since it was shown (it now holds %s orders): nothing was dropped; ack the row as it reads now\n"
+                         % (PROG, args.pr, found.split(":", 1)[1]))
         return EXIT_USAGE
     if engine.audit is not None and found:
         engine.audit.append(engine.actor, "notice.ack", args.pr, {})
@@ -14472,6 +14991,9 @@ def cmd_notice(args, runner, now):
                      "(nobody was messaged)\n" % (PROG, repo, number, "refreshed" if refreshed else "recorded"))
     print("%s#%d" % (repo, number))
     return EXIT_OK
+
+
+cmd_notice.ensure_on_use = True   # the daemon is alive when it runs
 
 
 def cmd_pending(args, runner, now):
@@ -14667,7 +15189,7 @@ class GhAccounts:
         self._tokens = {}
         self.etags = collections.OrderedDict()   # (account, path) -> (etag, body): for a conditional read; memory only, bounded
         self.calls = collections.deque()         # (time, account, endpoint, answered 304) of every read through `read`, newest last
-        self.paused = {}                         # account -> epoch until which its non-essential reads wait (the limit's reset)
+        self.paused = {}                         # account -> epoch until which its reads wait (the limit's reset)
         self.limited_once = set()                # accounts whose pause was audited, so it is said once per episode
         self.lock = threading.Lock()             # the hub's threads and the pass read through one gate
         self.audit, self.actor = None, "daemon"
@@ -14726,13 +15248,13 @@ class GhAccounts:
 
     # -- reads: counted, conditional (ETag) and paused while the account is rate limited
 
-    def read(self, runner, path, repo, timeout, essential=False, paginate=False, **run_kwargs):
+    def read(self, runner, path, repo, timeout, paginate=False, **run_kwargs):
         """One `gh api <path>` GET with the repo's account. Returns a CompletedProcess like the runner's, its stdout the BODY only:
 
           - a read GitHub answered `304 Not Modified` to (we send the ETag we hold) is answered from memory and costs nothing against the limit;
           - every read is counted by account and endpoint (`status` shows them);
-          - a 403/429 that says the limit is spent pauses every NON-essential read of that account until the limit resets (GhRateLimited is raised
-            at once, no process is started); `essential` reads (a delivery, a re-check before a write) are never held back.
+          - a 403/429 that says the limit is spent pauses every read of that account until the limit resets (GhRateLimited is raised
+            at once, no process is started). No read is exempt: writes do not go through here.
         A runner whose answer has no HTTP header block (a fake, `--paginate`) is passed through as it is."""
         account = self.describe(repo)
         now = self.now()
@@ -14743,7 +15265,7 @@ class GhAccounts:
                 self.limited_once.discard(account)
                 self._audit("github.rate_resumed", account, {})
                 until = None
-            if until is not None and not essential:
+            if until is not None:
                 raise GhRateLimited(account, until)
             cached = None if paginate else self.etags.get((account, path))
         use_head = self.conditional and not paginate
@@ -15419,6 +15941,9 @@ def cmd_intent(args, runner, now):
     return EXIT_OK
 
 
+cmd_intent.ensure_on_use = True   # the daemon is alive when it runs
+
+
 def caller_fleet(herdr, v2, environ):
     """The caller's `metadata.fleet`: HERDR_PANE_ID -> herdr agent -> v2 session."""
     fleet = session_identity(herdr, v2, environ)
@@ -15610,7 +16135,29 @@ def cmd_plan_check(args, runner, now):
     except (PlanInputError, ValueError, ConfigError, IntentError) as err:
         return finish(EXIT_USAGE, {"result": "error", "error": _one_line(str(err), 300)}, [], _one_line(str(err), 300))
     result["source"] = source
-    return finish(EXIT_OK if result["result"] == "pass" else EXIT_ERROR, result, plan_check.render(result, source))
+    return finish(EXIT_OK if result["result"] == "pass" else EXIT_ERROR, result, plan_check.render(result, source, explaining=getattr(args, "explain", False)))
+
+
+def cmd_plan_template(args, runner, now):
+    """`plan template <ask>` (or `--done-when TEXT`): print a prefilled plan for the ask: its Done-when clauses numbered and one scenario stub
+    per clause. Reads only (a GET of the ask); never writes GitHub. Exit 0, or 2 when the ask or its Done-when cannot be read."""
+    try:
+        done_when, source = args.done_when, None
+        if not done_when:
+            if not args.ask:
+                raise PlanInputError("give the ask (owner/repo#N) or --done-when TEXT")
+            config = load_config()
+            repo, number, _ = parse_plan_source(args.ask, config.get("intent_repo"))
+            reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"], accounts=GhAccounts(config, runner, now))
+            done_when, source = reader.issue(number, repo).done_when, "%s#%d" % (repo, number)
+        clauses = plan_check.clauses_of(done_when)
+        if not (done_when or "").strip() or not clauses:
+            raise PlanInputError("the ask has no Done-when line: nothing to prefill (write the plan by hand, or add the Done-when first)")
+    except (PlanInputError, ValueError, ConfigError, IntentError) as err:
+        sys.stderr.write("%s: plan template: %s\n" % (PROG, _one_line(str(err), 300)))
+        return EXIT_USAGE
+    print("\n".join(plan_check.template(clauses, _plain(source, 120) if source else None)))
+    return EXIT_OK
 
 
 # ---------------------------------------------------------------- `plan review` (#109 part 2, slice R2)
@@ -16574,6 +17121,9 @@ def cmd_prove(args, runner, now):
     return EXIT_OK
 
 
+cmd_prove.ledger = True   # state and GETs only; its own errors are usage errors
+
+
 def launched_testers_for(ctx):
     """({name: launch record}, {name: session id}, {name: metadata.fleet}) from ONE read of the running agents: the testers the launch record makes testers
     of this PR's repo (#372), and what the lane rule needs. Never raises: a discovery that fails gives nothing launched (so only the configured list
@@ -16662,6 +17212,9 @@ def cmd_verdict(args, runner, now):
     return EXIT_OK
 
 
+cmd_verdict.ledger = True   # state and GETs only; its own errors are usage errors
+
+
 def cmd_waive(args, runner, now):
     """`waive <repo#N> --gates G0a,G1 --reason "..."`: the logged override of G0 to G5 for ONE PR at ITS CURRENT HEAD, for a hotfix.
     The chief of staff or a person at a shell only (an unknown session is refused, never read as a person: #138); never G6, G7 or
@@ -16702,6 +17255,9 @@ def cmd_waive(args, runner, now):
     return EXIT_OK
 
 
+cmd_waive.ledger = True   # state and GETs only; its own errors are usage errors
+
+
 def cmd_gates(args, runner, now):
     """`gates <repo#N>`: read-only. One line per gate G0a to G8: status, who decides it, what is missing. Exit 0 when every
     tracked gate that applies to a PR is satisfied, 1 when something is missing, 2 when it cannot be read. Enforces nothing."""
@@ -16739,6 +17295,9 @@ def cmd_gates(args, runner, now):
         print("\n".join(lines))
     ok = report["ready"] if getattr(args, "all_gates", False) else report["ready_enforced"]   # --all: the full board
     return EXIT_OK if ok else EXIT_ERROR
+
+
+cmd_gates.ledger = True   # state and GETs only; its own errors are usage errors
 
 
 def gates_stats_core(entries, merged_at, limit=10):
@@ -16834,6 +17393,9 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
 def cmd_impact(args, runner, now):
     """`impact floor|hold|clear`."""
     return {"floor": cmd_impact_floor, "hold": cmd_impact_hold, "clear": cmd_impact_clear}[args.impact_action](args, runner, now)
+
+
+cmd_impact.direct = True   # no error mapping, no daemon start
 
 
 def cmd_impact_floor(args, runner, now):
@@ -17403,6 +17965,9 @@ def cmd_gates_check(args, runner, now):
     return exit_code
 
 
+cmd_gates_check.ledger = True   # state and GETs only; its own errors are usage errors
+
+
 ANCESTOR_DEPTH = 25
 AGENT_PROCESS_NAMES = ("opencode", "fleet-opencode", "copilot")
 
@@ -17779,6 +18344,17 @@ PR_STATE_MAX = 400          # PRs kept in the file: the most recently seen
 PR_STATE_WRITE_GAP = 20     # seconds between writes of the file (unless something changed enough to matter: the pass always writes the first)
 
 
+def pr_events_pass(engine, now):
+    """Fold the entries the hub's verified pull_request events made into the picture and leave it for `pr-state`; a repo that is only watched (not under
+    `plan_gates`) is known from the moment a PR opens (#354). Reads nothing from GitHub; never raises into the pass."""
+    hub = getattr(engine, "hub", None)
+    if hub is None or engine.state_dir is None or not hasattr(hub, "pr_event_snapshot"):
+        return
+    state = engine.__dict__.setdefault("ci_record_state", CiRecordState())
+    load_pr_events().fold(state.pr_state, hub.pr_event_snapshot(), PR_STATE_MAX)
+    write_pr_state(engine, state, now)
+
+
 def pr_state_from_lists(state, repos):
     """The base entry of every open PR the pass's lists hold (head, draft, labels, when the list was read); a PR that left the list since is marked so."""
     for repo in repos:
@@ -17791,6 +18367,8 @@ def pr_state_from_lists(state, repos):
                 continue
             ref = "%s#%d" % (key, number)
             seen.add(ref)
+            if (state.pr_state.get(ref) or {}).get("via") == "event" and state.pr_state[ref].get("at", 0) > at:
+                continue   # #354: a webhook event newer than this list read is fresher than the list
             head = (record.get("head") or {}).get("sha") if isinstance(record.get("head"), dict) else None
             labels = sorted(_plain(name, 60) for name in ((l.get("name") if isinstance(l, dict) else l) for l in (record.get("labels") if isinstance(record.get("labels"), list) else [])[:20]) if isinstance(name, str) and name)   # label names are GitHub's, set by anyone who can label: one line, no control characters, bounded
             old = state.pr_state.get(ref) or {}
@@ -18184,6 +18762,9 @@ def cmd_review_laws(args, runner, now):
     return EXIT_OK
 
 
+cmd_review_laws.direct = True   # no error mapping, no daemon start
+
+
 # ---------------------------------------------------------------- `review record` and `review laws` (#179, slice L2)
 
 REVIEW_LAW_FILES = REVIEW_LAWS_FILES + ("REVIEW_OVERLAY.md",)   # the laws a reviewer loads, and the repository's own overlay
@@ -18366,6 +18947,9 @@ def cmd_review(args, runner, now):
     except (ReviewError, plan_ledger.LedgerError, ConfigError, IdentityUncertain, CallerError) as err:
         sys.stderr.write("%s: review: %s\n" % (PROG, _one_line(str(err), 400)))
         return EXIT_USAGE
+
+
+cmd_review.direct = True   # no error mapping, no daemon start
 
 
 # ---------------------------------------------------------------- `review measure` (#179, slice L7)
@@ -18721,6 +19305,9 @@ def cmd_pr_explain(args, runner, now):
     else:
         print(block)
     return EXIT_OK
+
+
+cmd_pr_explain.direct = True   # no error mapping, no daemon start
 
 
 def add_pr_explain_parsers(sub):
@@ -19133,6 +19720,45 @@ def cmd_disk(args, runner, now):
 
 
 cmd_disk.direct = True   # an operator's command on the machine: no daemon start
+
+
+def cmd_heavy(args):
+    """`heavy [--slots N] [--wait-max S] -- <command...>`: run the command in a CPU slot (ask #34); its exit status is ours."""
+    module = load_heavy_slots()
+    command = list(args.command)
+    if command[:1] == ["--"]:
+        command = command[1:]
+    try:
+        if not command:
+            raise module.HeavyError("no command: heavy [--slots N] [--wait-max S] -- <command...>")
+        if args.slots is not None and not 1 <= args.slots <= module.SLOTS_MAX:
+            raise module.HeavyError("--slots must be from 1 to %d" % module.SLOTS_MAX)
+        if args.wait_max is not None and args.wait_max < 0:
+            raise module.HeavyError("--wait-max must be 0 or more")
+        configured = module.settings(load_config().get("heavy") if config_path().exists() else None)
+    except (module.HeavyError, ConfigError) as err:
+        sys.stderr.write("%s: heavy: %s\n" % (PROG, err))
+        return EXIT_USAGE
+    try:
+        state = ensure_state_dir()
+    except Exception as err:   # a state directory that cannot be made or is refused: the command still runs, without a slot (heavy never fails someone else's command)
+        sys.stderr.write("heavy: no slot (%s): running without one\n" % _one_line(str(err), 160))
+        state = None
+    return module.run(command, state, args.slots or configured, module.DEFAULT_WAIT_MAX if args.wait_max is None else args.wait_max, args.name)
+
+
+cmd_heavy.direct = True   # the wrapper of someone else's command: no daemon start, no error mapping
+
+
+def add_heavy_parsers(sub):
+    heavy = sub.add_parser("heavy", help="Run a heavy command (a full test suite, a browser or e2e run) in one of a few CPU slots, at background priority",
+                           description="`heavy [--slots N] [--wait-max SECONDS] [--name WHO] -- <command...>`: waits for a free slot (default 3, config `heavy.slots`; one line "
+                                       "every 30 s says who holds them), then runs the command as `taskpolicy -b <command>` (else `nice -n 10`) with its stdin, stdout, "
+                                       "exit status and signals passed through. After --wait-max seconds (default 1800) it exits 75 and does not run the command.")
+    heavy.add_argument("--slots", type=int, help="How many commands may run at once (default: config heavy.slots, else 3)")
+    heavy.add_argument("--wait-max", type=int, dest="wait_max", help="Give up after this many seconds without a slot: exit 75 (default 1800)")
+    heavy.add_argument("--name", help="Who the slot is held for (default: FLEET_HEAVY_NAME, the OpenCode session id, the user)")
+    heavy.add_argument("command", nargs=argparse.REMAINDER, help="-- <command...>")
 
 
 def add_disk_parsers(sub):
@@ -19591,6 +20217,10 @@ def add_plan_parsers(sub):
     check.add_argument("--ask", help="The ask whose Done-when to cover when the plan issue has none of its own")
     check.add_argument("--done-when", dest="done_when", help="The Done-when line to cover (overrides the issue's)")
     check.add_argument("--json", action="store_true", help="Machine-readable result")
+    check.add_argument("--explain", action="store_true", help="After each defect (and warning) say the rule it breaks and how to fix it")
+    template = plan_sub.add_parser("template", help="Print a prefilled plan for an ask: its Done-when clauses and one scenario stub per clause (read-only)")
+    template.add_argument("ask", nargs="?", help="owner/repo#N, an issue URL, or N with intent_repo set: the ask whose Done-when to prefill")
+    template.add_argument("--done-when", dest="done_when", help="The Done-when line to prefill from, instead of reading the ask")
     review = plan_sub.add_parser("review", help="The plan review engine (off unless plan_review.enabled): adversarial lanes, at most 3 rounds")
     review_sub = review.add_subparsers(dest="review_action", required=True)
     start = review_sub.add_parser("start", help="Open a review of a plan for its ask and launch the lanes")
@@ -21033,6 +21663,9 @@ def cmd_judge_tool(args, runner, now, stdin=None):
     return EXIT_OK
 
 
+cmd_judge_tool.direct = True   # no error mapping, no daemon start
+
+
 POLICY_LIVENESS_SECONDS = 30 * 60   # agents active and no policy.judge for this long is an alarm
 POLICY_AUDIT_TAIL = 8 << 20         # bytes of the audit log's end that a report reads
 
@@ -21156,6 +21789,9 @@ def cmd_policy_report(args, runner, now):
     return EXIT_OK
 
 
+cmd_policy_report.direct = True   # no error mapping, no daemon start
+
+
 def record_mode_flips(environ=None):
     """#113: the plugin tells the next child when a session's cached mode flipped (shadow <-> enforcing): audited as
     `policy.mode`, so the window in which a call ran under the old mode is visible."""
@@ -21193,6 +21829,8 @@ def add_policy_parsers(sub):
                                                              "was judged for 30 minutes")
     sub.add_parser("judge-tool", help="Judge one tool call: JSON on stdin, one JSON line out, exit 0 "
                                       "(the fleet-hooks plugin runs this; the judge only tightens)")
+
+
 # PR 10: move a v1 session into v2 (`import-v1`)
 #
 # One section, so the stack rebases cleanly. docs/switchboard.md, "v1
@@ -22183,18 +22821,153 @@ def build_parser():
     return parser
 
 
+# ---- the load of each orchestrator and the threshold alert (#348); the logic is in bin/fleet_health.py, this supplies the facts
+def load_fleet_health():
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "fleet_health.py")
+    held = sys.modules.get("fleet_health")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("fleet_health", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["fleet_health"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("fleet_health", None)
+        raise
+    return module
+
+
+def validate_load_alert_config(config, source):
+    """`load_alert`: absent or null is off (the load figures are still kept and shown)."""
+    if "load_alert" not in config:
+        return
+    try:
+        config["load_alert"] = load_fleet_health().validate(config["load_alert"], "%s: 'load_alert'" % source)
+    except ValueError as err:
+        raise ConfigError(str(err)) from None
+
+
+def load_tick(engine, discovery):
+    """The end of a pass: the load figures per orchestrator, and the alert to the Chief of Staff when a threshold is crossed. Reads no v2 and
+    makes at most a bounded number of GitHub reads an hour; a source it cannot read means no wake. Returns what was sent."""
+    if discovery is None or engine.state_dir is None:
+        return []
+    health, now = load_fleet_health(), engine.now()
+    cfg = engine.config.get("load_alert") or dict(health.DEFAULTS)
+    reminders = read_reminders(engine.state_dir)
+    orchestrators = {}
+    for name, seen in sorted(discovery.agents.items()):
+        fleet = seen.fleet or {}
+        if fleet.get("role") != "orchestrator":
+            continue
+        coders = [o for o in discovery.agents.values() if (o.fleet or {}).get("reports_to") == name and (o.fleet or {}).get("role") == "coder"]
+        orchestrators[name] = {"charter": fleet.get("charter") if _is_issue_number(fleet.get("charter")) else None,   # a fallback: the charter is found by the yaml that names the agent
+                               "repo": _fleet_repo(fleet, engine.config) or (engine.intents.repo if engine.intents is not None else None),
+                               "busy": sum(1 for c in coders if c.status == "working"), "idle": sum(1 for c in coders if c.status == "idle"),
+                               "messages": sum(1 for r in reminders if r.get("to") == name and isinstance(r.get("at"), (int, float)) and r["at"] <= now)}
+    cos = next((n for n, o in sorted(discovery.agents.items()) if (o.fleet or {}).get("role") == "chief-of-staff"), None)
+
+    def read_asks(charter, repo):
+        if engine.intents is None:
+            raise RuntimeError("no ask repo is configured")
+        return [{"repo": issue.repo or repo, "number": issue.number} for issue in engine.intents.open_asks(charter, repo)]
+
+    def read_charters(repo):
+        """The open issues of `repo` that carry the orchestrator label (whatever the owner's prefix) as [(number, body)]: two bounded reads."""
+        if engine.intents is None:
+            raise RuntimeError("no ask repo is configured")
+        labels = engine.intents._api("repos/%s/labels?per_page=100" % repo, repo)
+        names = sorted({l["name"] for l in labels if isinstance(l, dict) and str(l.get("name")).endswith(":orchestrator")}) if isinstance(labels, list) else []
+        out = []
+        for name in names[:2]:   # every owner's prefix, at most two (each is one more read)
+            found = engine.intents._api("repos/%s/issues?state=open&per_page=100&labels=%s" % (repo, urllib.parse.quote(name)), repo)
+            out.extend((i["number"], i.get("body") or "") for i in found   # the issues list also returns pull requests: a PR body never names a charter
+                       if isinstance(i, dict) and isinstance(i.get("number"), int) and "pull_request" not in i) if isinstance(found, list) else None
+        return out
+
+    def wake(text):
+        add_reminder(engine.state_dir, cos, now, now, text)
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "load.alert", cos, {"text": _one_line(text, 400)})
+
+    return health.tick(health.Context(now=now, state_dir=engine.state_dir, cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, read_charters=read_charters, cos=cos, wake=wake))
+
+
+def cmd_load_replay(args, runner, now):
+    """`load-replay`: when the load alert WOULD have fired over a recorded day of the hourly series (read-only; sends nothing)."""
+    health = load_fleet_health()
+    cfg = dict(health.DEFAULTS)
+    try:
+        configured = load_config().get("load_alert")
+        cfg = dict(cfg, **(configured or {}))
+    except ConfigError:
+        pass
+    for key, value in (("stalled_hours", args.stalled_hours), ("stalled_asks", args.stalled_asks), ("backlog_hours", args.backlog_hours)):
+        if value is not None:
+            cfg[key] = value
+    try:
+        cfg = health.validate(cfg, "load-replay")
+    except ValueError as err:
+        sys.stderr.write("%s: load-replay: %s\n" % (PROG, err))
+        return EXIT_USAGE
+    if args.day is not None and not re.fullmatch(r"\d{4}-\d\d-\d\d", args.day):
+        sys.stderr.write("%s: load-replay: --day must be a UTC date, YYYY-MM-DD, got %r\n" % (PROG, args.day[:20]))
+        return EXIT_USAGE
+    try:
+        if args.day is not None:
+            datetime.strptime(args.day, "%Y-%m-%d")
+    except ValueError:
+        sys.stderr.write("%s: load-replay: --day %r is not a calendar date\n" % (PROG, args.day))
+        return EXIT_USAGE
+    days, firings = health.replay(state_dir_path(), cfg, args.day)
+    chosen = args.day or datetime.fromtimestamp(now(), timezone.utc).strftime("%Y-%m-%d")
+    source, notes = "the recorded hourly series", None
+    if args.from_audit or (firings is None and args.day):
+        firings, notes = health.replay_audit(state_dir_path(), cfg, chosen)
+        source = "the audit log and its archives (best effort)"
+    if firings is None:
+        print("no recorded day%s and no audit log to rebuild it from; recorded days: %s" % (" " + args.day if args.day else "", ", ".join(days) or "none"))
+        return EXIT_USAGE if args.day else EXIT_OK
+    day = chosen if source != "the recorded hourly series" else (args.day or days[-1])
+    if args.json:
+        print(json.dumps({"day": day, "source": source, "not_recorded": notes, "days": days, "firings": firings}, indent=2, sort_keys=True))
+        return EXIT_OK
+    print("load alert replay over %s from %s (thresholds: %d stalled ask(s) of %g h, backlog %g h); recorded days: %s" % (
+        day, source, cfg["stalled_asks"], cfg["stalled_hours"], cfg["backlog_hours"], ", ".join(days) or "none"))
+    if notes:
+        print("not recorded for it: %s" % notes)
+    print("would have fired %d time(s)%s" % (len(firings), ":" if firings else ""))
+    for firing in firings:
+        print("  %s  %s  %s" % (firing["hour"], firing["orchestrator"], firing["text"]))
+    return EXIT_OK
+
+
+cmd_load_replay.direct = True   # reads a file: no daemon start
+
+
+def add_load_replay_parsers(sub):
+    replay = sub.add_parser("load-replay", help="When the load alert WOULD have fired over a recorded day of the hourly load series (read-only)")
+    replay.add_argument("--day", help="A UTC date, YYYY-MM-DD (default: the newest recorded day; the last few days are kept)")
+    replay.add_argument("--stalled-asks", type=int, default=None, help="Try another threshold: asks stalled")
+    replay.add_argument("--stalled-hours", type=float, default=None, help="Try another threshold: hours without movement")
+    replay.add_argument("--backlog-hours", type=float, default=None, help="Try another threshold: hours of moved asks in the backlog test")
+    replay.add_argument("--from-audit", action="store_true", help="Rebuild the day from the audit log and its archives even when the series holds it (a past day is rebuilt this way when the series does not)")
+    replay.add_argument("--json", action="store_true")
+
+
 # ---------------------------------------------------------------- the front door: self-registering commands
 #
 # A command is two functions named for it and nothing else: `add_<name>_parsers(sub)` (registers its argparse parsers; found by name) and
 # `cmd_<action with - as _>(args, ...)` (runs it; found by name). `main` lists neither. The few special cases are explicit, here, and are the only
-# things a new command could ever need to edit: DIRECT_ACTIONS (run outside the error mapping and without ensuring the daemon),
-# LEDGER_ACTIONS (their own errors are usage errors) and ENSURE_ON_USE_COMMANDS (the daemon is started first).
+# things a new command could ever need to edit: nothing shared. Its dispatch group is said next to its own definition, as an attribute of the
+# function: `cmd_x.direct = True` (run outside the error mapping and without ensuring the daemon), `cmd_x.ledger = True` (its own errors are usage
+# errors) and `cmd_x.ensure_on_use = True` (the daemon is started first). DIRECT_ACTIONS, LEDGER_ACTIONS and ENSURE_ON_USE_COMMANDS below are VIEWS of
+# those attributes, derived once everything is defined (see `derive_action_groups`), never lists to edit; `dispatch` asks the view AND the attribute
+# (a test that swaps a command's function for a recorder keeps the group the module defined).
 
 COMMAND_NAME_RE = re.compile(r"[a-z][a-z0-9-]*")
 REGISTRAR_NAME_RE = re.compile(r"add_[a-z0-9_]+_parsers")
-DIRECT_ACTIONS = frozenset({"status", "poke", "policy-report", "review-laws", "review", "pr-explain", "impact", "plan", "judge-tool"})   # no error mapping, no daemon start
-# A new command may instead say it is direct next to its own definition (`cmd_x.direct = True`), so it edits no shared line either.
-LEDGER_ACTIONS = frozenset({"prove", "verdict", "waive", "gates", "gates-check"})   # #107: state and GETs only; their own errors are usage errors
 COMMAND_ARGUMENTS = ("args", "runner", "now", "spawn", "socket_call", "wait")   # what a command function may ask for, by parameter name
 
 
@@ -22227,7 +23000,12 @@ def cmd_plan(args, runner, now, socket_call=None):
     """`plan check` (the default) or `plan review` (#109 part 2: writes the ledger and launches lanes; off unless plan_review.enabled)."""
     if args.plan_action == "review":
         return cmd_plan_review(args, runner, now, socket_call)
+    if args.plan_action == "template":
+        return cmd_plan_template(args, runner, now)
     return cmd_plan_check(args, runner, now)
+
+
+cmd_plan.direct = True   # no error mapping, no daemon start
 
 
 def dispatch(args, known, runner=subprocess.run, now=time.time, wait=None, spawn=subprocess.Popen, socket_call=None):
@@ -22241,9 +23019,9 @@ def dispatch(args, known, runner=subprocess.run, now=time.time, wait=None, spawn
         return call_command(handler, **available)
     try:
         if handler is not None:
-            if args.action in ENSURE_ON_USE_COMMANDS:  # PR 16: the daemon is alive when a command needs it
+            if args.action in ENSURE_ON_USE_COMMANDS or getattr(handler, "ensure_on_use", False) is True:  # PR 16: the daemon is alive when a command needs it
                 ensure_on_use(spawn)
-            if args.action in LEDGER_ACTIONS:
+            if args.action in LEDGER_ACTIONS or getattr(handler, "ledger", False) is True:
                 try:
                     return call_command(handler, **available)
                 except (LedgerCommandError, PlanInputError, plan_ledger.LedgerError) as err:
@@ -22296,7 +23074,7 @@ KIT_ROOT = Path(__file__).resolve().parent.parent
 STANDARD_MODEL = "github-copilot/claude-sonnet-5.5"  # the model every kit agent file gets
 KIT_AGENTS = ("chief-of-staff", "orchestrator", "coder", "cos-subagent", "reviewer-code", "reviewer-architecture", "reviewer-security", "reviewer-impact", "reviewer-test")
 DECISIONS_PLUGIN_NAME = "fleet-decisions"  # the directory in the profile's opencode config, named in cli.json
-DECISIONS_PLUGIN_FILES = ("tui.tsx", "decisions.mjs")
+DECISIONS_PLUGIN_FILES = ("tui.tsx", "decisions.mjs", "health.mjs")
 HOOKS_PLUGIN_FILE = "fleet-hooks.js"
 TODOLIST_PLUGIN_NAME = "opencode-todolist"  # the directory (the vendored src/) in the profile's opencode config
 TODOLIST_LOADER_FILE = "opencode-todolist.ts"  # plugins/<this>: the one line OpenCode loads
@@ -22318,8 +23096,7 @@ COS_WORKSPACE_LABEL = "Chief of Staff"
 NO_KEY_NOTICE = "No decision-model key: messages are not classified and tool calls are not judged."
 
 ENSURE_ON_USE = True  # tests switch it off: a command run in a test must never start a real daemon
-ENSURE_ON_USE_COMMANDS = ("send", "report", "notice", "launch", "handoff", "comment", "remind", "decisions", "intent",
-                          "bootstrap")  # never `judge-tool`: it runs inside v2 on every tool call
+ENSURE_ON_USE_COMMANDS = ()   # derived at the end of the module from `cmd_x.ensure_on_use` (never `judge-tool`: it runs inside v2 on every tool call)
 USE_ENSURE_PATIENCE = 2.0  # seconds a command waits for a daemon it started; then it goes on without
 
 
@@ -22675,6 +23452,9 @@ def cmd_bootstrap(args, runner, now, socket_call=None):
         return EXIT_ERROR
     print(json.dumps(done, sort_keys=True))
     return EXIT_OK
+
+
+cmd_bootstrap.ensure_on_use = True   # the daemon is alive when it runs
 
 
 # ------------------------------------------------- the profile pieces (shared)
@@ -25287,6 +26067,27 @@ def add_decision_list_flags(parser, suppress=False):
     parser.add_argument("--watch", action="store_true", help="Redraw when the list changes, until Ctrl-C (a "
                                                             "fallback for a terminal without the TUI plugin)", **given)
     parser.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name", **given)
+
+
+
+def derive_action_groups():
+    """Fill DIRECT_ACTIONS, LEDGER_ACTIONS and ENSURE_ON_USE_COMMANDS from the `direct`, `ledger` and `ensure_on_use` attributes of the `cmd_*`
+    functions (a command says its group next to its own definition; nothing shared is edited to add one). Called once, last."""
+    global DIRECT_ACTIONS, LEDGER_ACTIONS, ENSURE_ON_USE_COMMANDS
+    chosen = {"direct": set(), "ledger": set(), "ensure_on_use": []}
+    registered = build_parser().commands
+    for name in sorted(n for n in globals() if n.startswith("cmd_") and callable(globals()[n])):
+        action = name[4:].replace("_", "-")
+        if action not in registered:   # a helper of a command (`cmd_disk_prune`), not a command
+            continue
+        for group in chosen:
+            if getattr(globals()[name], group, False) is True:
+                (chosen[group].add if group != "ensure_on_use" else chosen[group].append)(action)
+    DIRECT_ACTIONS, LEDGER_ACTIONS = frozenset(chosen["direct"]), frozenset(chosen["ledger"])
+    ENSURE_ON_USE_COMMANDS = tuple(chosen["ensure_on_use"])
+
+
+derive_action_groups()
 
 
 if __name__ == "__main__":

@@ -31,6 +31,46 @@ REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 TOKEN_ENV_NAMES = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
 
 
+COUNT_ACCOUNT = [None]
+CALLS_SPOOL = "agent-calls.jsonl"
+CALLS_LIMIT = 262144
+CALLS_ON = "agent-calls-hours.json"   # the daemon makes this file: counting is on only while a daemon folds the spool
+NO_NETWORK_GROUPS = ("auth", "config", "alias", "completion", "extension", "help", "version")
+
+
+def call_endpoint(args):
+    """The class of a gh call for the counter: `api issues/#` (numbers as `#`, no repo, no query) or the first two words (`pr view`). Never a value."""
+    words = command_words(args)
+    if not words:
+        return None
+    if words[0] == "api" and len(words) > 1:
+        bare = re.sub(r"^/?repos/[^/]+/[^/]+/?", "", words[1].split("?")[0])
+        return "api " + (re.sub(r"\d+", "#", bare) or "repo")[:60]
+    return " ".join(words[:2])[:40]
+
+
+def count_call(args):
+    """Best effort, never fails or delays the command: one line (time, account name, endpoint class) for the daemon's hourly count. The switchboard's
+    own calls are counted by the daemon, not here. Nothing else is recorded: no token, no argument, no body, no repo."""
+    try:
+        if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":
+            return
+        words = command_words(args)
+        if not words or words[0] in NO_NETWORK_GROUPS:
+            return
+        endpoint = call_endpoint(args)
+        state = os.environ.get("FLEET_SWITCHBOARD_STATE") or os.path.join(
+            os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state"), "fleet-switchboard")
+        path = os.path.join(state, CALLS_SPOOL)
+        if endpoint and os.path.exists(os.path.join(state, CALLS_ON)) and (not os.path.exists(path) or os.path.getsize(path) < CALLS_LIMIT):
+            line = json.dumps({"ts": int(time.time()), "account": COUNT_ACCOUNT[0] or "default", "endpoint": endpoint}, sort_keys=True)
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            with os.fdopen(fd, "a") as out:
+                out.write(line + "\n")
+    except Exception:
+        pass
+
+
 def real_gh():
     """The first executable named gh on PATH that is not this shim's own directory."""
     own = os.path.realpath(os.path.dirname(os.path.abspath(__file__)))
@@ -202,6 +242,7 @@ def account_env(gh, lookup=None, strict=False):
         account = users.get(repo) or users.get(repo.split("/")[0] + "/*")
         if not isinstance(account, str) or not account:
             return None
+        COUNT_ACCOUNT[0] = account   # for the call counter: the account's NAME only
         clean = {k: v for k, v in os.environ.items() if k not in TOKEN_ENV_NAMES}
         got = lookup.run([gh, "auth", "token", "--user", account], stdin=subprocess.DEVNULL, env=clean)
         token = got.stdout.strip() if got is not None and got.returncode == 0 else ""
@@ -717,6 +758,7 @@ def main(args):
             sys.stderr.write("gh: account lookup failed, retry (the fleet shim could not find which GitHub account this write is for, and will not "
                              "fall back to the inherited token)\n")
             return 1
+    count_call(args)
     if plan is None:
         if env is not None:
             os.execve(gh, [gh] + args, env)
