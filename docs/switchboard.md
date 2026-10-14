@@ -3959,8 +3959,8 @@ for the cos only. An orchestrator's pending ask has no timeout in OpenCode v2 (t
   to `/` in both the pattern and the command, so a backslash guard would deny every path; `./` and `../` anywhere are denied instead (`.\ssh` is `./ssh`).
   Dot-segments (`/.x`, ` .x`, `:.x`, `=.x`) are denied everywhere, plus secret-looking names for the readers, `/etc` and friends. The `read`, `grep`
   and `glob` tools deny `*/.*` and secret names too.
-- `az` is allowed only as `az <group> [<sub>] show|list*` (`list`, `list-usage`, ...; `list-keys` and any `*secret*`, `*credential*`, `*keys *`, `*connection-string*`, `*get-access-token*` stay denied; `az containerapp show` and `revision list` are reads and allowed) (verb in the verb position, so `az vm resize --name show` cannot match), plus `graph query`,
-  `monitor log-analytics query`, `webapp log tail`. `az account|ad|rest|login|extension|containerapp|appconfig|deployment|webapp config|app-insights`
+- `az` is allowed only as `az <group> [<sub>] show|list|list-usage` (any `*secret*`, `*credential*`, `*key*`, `*connection-string*`, `*get-access-token*` stay denied; `az containerapp show` and `revision list` are reads and allowed) (verb in the verb position, so `az vm resize --name show` cannot match), plus `graph query`,
+  `monitor log-analytics query`, `webapp log tail`. `az account|ad|rest|login|extension|appconfig|deployment|webapp config|app-insights`
   and `--debug` are denied. `gh api` only as `gh api repos/*`, without `..`, contents, logs, actions, keys, secrets, user, notifications.
 - `gh`: the owner's words cover comments and close/merge; the owner's later answers also covered reopen, edit, ready and review. `--approve` is denied
   (an approval can satisfy the independent-review rule); `gh issue close|reopen|edit`, `gh pr edit|ready|reopen` remain on his answers.

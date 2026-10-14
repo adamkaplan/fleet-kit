@@ -10669,7 +10669,7 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
                 for command in self.AZ_READS + ("gh issue create --title x --body y", "fleet-switchboard disk", "fleet-switchboard disk janitor --apply",
                                                 "timeout 30 gh pr view 5", "timeout 30 gh issue list --repo acme/api"):
                     self.assertEqual(self.evaluate(rules, "shell", command), "allow", command)
-                for command in self.TIMEOUT_WRITES + ("fleet-switchboard disk prune --docker /bin/sh", "fleet-switchboard disk --docker /tmp/x report",
+                for command in self.TIMEOUT_WRITES + ("fleet-switchboard disk prune --docker /bin/sh", "fleet-switchboard disk prune --docker=/bin/sh", "fleet-switchboard disk --docker /tmp/x report",
                                                       "fleet-switchboard disk reap-docker --apply --docker /tmp/x/docker", "fleet-switchboard disk report --docker=/bin/sh"):
                     self.assertEqual(self.evaluate(rules, "shell", command), "deny", command)
                 for command in ("fleet-switchboard disk prune", "fleet-switchboard disk prune --dry-run", "fleet-switchboard disk report"):
@@ -41306,33 +41306,65 @@ class TestDockerReaper(Base):
         self.assertEqual(stamp + sb.DOCKER_REAP_INTERVAL, self.NOW + sb.DOCKER_REAP_RETRY)
 
     def test_the_docker_option_runs_only_a_docker_binary_it_can_trust_in_every_disk_command(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        os.chmod(str(self.home), 0o755)
         for target in ("/bin/sh", "/bin/ls", "/usr/bin/env"):
-            for argv in (["disk", "prune", "--dry-run", "--docker", target], ["disk", "reap-docker", "--docker", target]):
+            for argv in (["disk", "prune", "--dry-run", "--docker", target], ["disk", "reap-docker", "--docker", target], ["disk", "report", "--docker", target],
+                         ["disk", "prune", "--dry-run", "--docker=" + target], ["disk", "--docker", target, "report"]):
                 with self.subTest(argv=argv):
-                    err = io.StringIO()
+                    err, calls = io.StringIO(), []
                     with mock.patch.object(sys, "stderr", err), mock.patch.object(sys, "stdout", io.StringIO()) as out, \
                             mock.patch.object(subprocess, "run", side_effect=AssertionError("ran an executable that is not docker")):
-                        code = sb.main(argv, runner=FakePruneDocker(), now=self.world.clock.now)
+                        code = sb.main(argv, runner=lambda a, **k: calls.append(a) or subprocess.CompletedProcess(a, 0, "", ""), now=self.world.clock.now)
                     self.assertIn("refused", err.getvalue() + out.getvalue())
+                    self.assertFalse([c for c in calls if c and os.path.basename(str(c[0])) in ("sh", "ls", "env")], "nothing was run")
+                    if argv[1] != "report" and argv[1] != "--docker":
+                        self.assertEqual(code, sb.EXIT_USAGE)
+        for abbreviated in ("--dock", "--doc", "--do"):                                          # an abbreviation of the option is not accepted
+            err = io.StringIO()
+            try:
+                with mock.patch.object(sys, "stderr", err), mock.patch.object(sys, "stdout", io.StringIO()), \
+                        mock.patch.object(subprocess, "run", side_effect=AssertionError("ran an executable")):
+                    code = sb.main(["disk", "prune", abbreviated, "/bin/sh"], runner=FakePruneDocker(), now=self.world.clock.now)
+            except SystemExit as stop:
+                code = stop.code
+            self.assertNotEqual(code, 0, abbreviated)
+            self.assertIn("unrecognized arguments", err.getvalue(), abbreviated)
         good = self.home / "docker"
         good.write_text("#!/bin/sh\nexit 0\n")
         os.chmod(str(good), 0o755)
         good = str(good)
-        self.assertEqual(sb._docker_problem(good), (good, None))
-        link = self.home / "docker-link"
+        self.assertEqual(sb._docker_problem(good), (os.path.realpath(good), None))
+        dest = self.home / "real"
+        dest.mkdir()
+        (dest / "docker").write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(str(dest / "docker"), 0o755)
+        os.symlink(str(dest / "docker"), str(self.home / "linked-docker-dir"))
+        sub = self.home / "viaLink"
+        sub.mkdir()
+        os.symlink(str(dest / "docker"), str(sub / "docker"))
+        self.assertEqual(sb._docker_problem(str(sub / "docker")), (os.path.realpath(str(dest / "docker")), None), "a link named docker to a file named docker is fine")
         other = self.home / "tool"
         other.write_text("#!/bin/sh\nexit 0\n")
         os.chmod(str(other), 0o755)
-        bad_link = self.home / "sub" / "docker"
-        bad_link.parent.mkdir()
-        os.symlink(str(other), str(bad_link))
-        self.assertIn("not a docker binary", sb._docker_problem(str(bad_link))[1])        # a link named docker that points at another tool
+        bad = self.home / "sub" / "docker"
+        bad.parent.mkdir()
+        os.symlink(str(other), str(bad))
+        self.assertIn("not a docker binary", sb._docker_problem(str(bad))[1])        # a link named docker that points at another tool
         loose = self.home / "loose" / "docker"
         loose.parent.mkdir()
         loose.write_text("#!/bin/sh\nexit 0\n")
         os.chmod(str(loose), 0o775)
         self.assertIn("writable by group or other", sb._docker_problem(str(loose))[1])
-        plain = loose.parent / "plain" / "docker"
+        open_dir = self.home / "open" / "docker"
+        open_dir.parent.mkdir()
+        open_dir.write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(str(open_dir), 0o755)
+        os.chmod(str(open_dir.parent), 0o777)
+        self.assertIn("group or other can change", sb._docker_problem(str(open_dir))[1])
+        os.chmod(str(open_dir.parent), 0o1777)
+        self.assertEqual(sb._docker_problem(str(open_dir))[1], None, "a sticky directory is fine")
+        plain = self.home / "plain" / "docker"
         plain.parent.mkdir()
         plain.write_text("#!/bin/sh\nexit 0\n")
         os.chmod(str(plain), 0o644)
@@ -41340,6 +41372,8 @@ class TestDockerReaper(Base):
         self.assertIn("not installed", sb._docker_problem("/nonexistent/docker")[1])
         self.assertIn("not a usable", sb._docker_problem("--help")[1])
         self.assertIn("not a docker binary", sb._docker_problem("/bin/sh")[1])
+        for p in (str(self.home / "open"), str(self.home / "loose")):
+            os.chmod(p, 0o755)
 
     def test_without_docker_it_refuses_and_runs_nothing(self):
         docker = self.world_docker()
