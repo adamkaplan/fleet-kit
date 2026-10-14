@@ -91,12 +91,15 @@ def write_seen(state_dir, seen, meta=None):
         write_json(os.path.join(state_dir, SEEN_FILE), {"v": 1, "items": seen, "swept": bool(meta.get("swept")), "last": meta.get("last")})
 
 
-def gate(meta, now, unchecked, interval_seconds):
+WARMUP_MAX_SECONDS = 1800   # a sweep that cannot finish (a list that never reads) ends its warm-up after this: the digest must never stay silent for good
+
+
+def gate(meta, now, unchecked, interval_seconds, warming_since=None):
     """(may a digest go out now, the state `status` shows). Warm-up: nothing goes out while any finding is unchecked; the first pass with none
     ends it (`meta["swept"]` is set, the caller saves it). Then at most one digest per `interval_seconds` from the last delivered one
     (0 = no cap). A held digest drops nothing: the caller leaves its memory untouched, so the same items are due next time."""
     if not meta["swept"]:
-        if unchecked > 0:
+        if unchecked > 0 and not (warming_since is not None and now - warming_since >= WARMUP_MAX_SECONDS):
             return False, {"state": "warming", "unchecked": int(unchecked)}
         meta["swept"] = True
     if interval_seconds > 0 and meta["last"] is not None and now - meta["last"] < interval_seconds:
@@ -104,7 +107,7 @@ def gate(meta, now, unchecked, interval_seconds):
     return True, {"state": "ready"}
 
 
-def digest_line(digest, now):
+def digest_line(digest, now, interval_minutes=60):
     """The `status` line for the digest's cadence, or None."""
     if not isinstance(digest, dict):
         return None
@@ -112,10 +115,15 @@ def digest_line(digest, now):
     if state == "warming":
         return "digest warming up: %d unchecked; nothing is delivered until every finding has been checked once" % int(digest.get("unchecked") or 0)
     if state == "held" and _number(digest.get("next_at")):
-        return "digest: the next digest may go out in %s (at most one per hour)" % age_text(max(0, int(digest["next_at"] - now)))
+        return "digest: the next digest may go out in %s (at most one per %s)" % (age_text(max(0, int(digest["next_at"] - now))), interval_text(interval_minutes))
     if state == "ready":
-        return "digest ready: one goes out when something qualifies (at most one per hour)"
+        return "digest ready: one goes out when something qualifies (at most one per %s)" % interval_text(interval_minutes)
     return None
+
+
+def interval_text(minutes):
+    minutes = int(minutes) if _number(minutes) else 60
+    return "hour" if minutes == 60 else "%d minutes" % minutes if minutes % 60 else "%d hours" % (minutes // 60)
 
 
 def age_text(seconds):
