@@ -385,6 +385,26 @@ def load_work_sync():
 work_sync = load_work_sync()
 
 
+def load_agent_calls():
+    """The agent-shell call counter, bin/agent_calls.py (#367), loaded by path like the others."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "agent_calls.py")
+    held = sys.modules.get("agent_calls")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("agent_calls", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["agent_calls"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("agent_calls", None)
+        raise
+    return module
+
+
+agent_calls = load_agent_calls()
+
+
 def load_triage_digest():
     """The stale digest's rules and files, bin/triage_digest.py (#349), loaded by path like the others."""
     path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "triage_digest.py")
@@ -482,6 +502,7 @@ DEFAULTS = {
     "cos_orders_file": None,        # PR 18: the Chief of Staff's own standing orders, an absolute path; None means standing-orders.md beside config.json
     # PR 15: many repos, one fleet. "owner/repo" or "owner/*" -> the gh account whose token that repo uses
     "gh_users": {},
+    "intent_live_silence_minutes": 10,  # #367: a live forwarder whose last event (or start) is older than this does not get the long intent trust (0 = always trusted, as before)
     "github_poll_seconds": 60,  # PR 15: how often a repo without a forwarder is read (the catch-up read, on a poll)
 }
 
@@ -9583,6 +9604,13 @@ def record_github_calls(engine):
         summary = accounts.call_summary(engine.now())
         path = Path(engine.state_dir) / GITHUB_CALLS_FILE
         state_write(path, json.dumps(summary, sort_keys=True) + "\n", _without(summary, "at"), STATE_HEARTBEAT_SECONDS, nofollow=True)
+        cursor, fresh = getattr(engine, "agent_calls_cursor", None), {}   # #367: the daemon's new calls, and the agent shells' spool, into the hourly count
+        with accounts.lock:
+            for at, account, _, _ in accounts.calls:
+                if cursor is None or at > cursor:
+                    fresh[account] = fresh.get(account, 0) + 1
+        if agent_calls.fold(str(engine.state_dir), engine.now(), fresh) or not fresh:
+            engine.agent_calls_cursor = engine.now()   # advanced only once the calls are written: a failed write is counted at the next pass
     except Exception as err:
         try:
             engine._note("github_calls.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
@@ -12055,6 +12083,9 @@ def _validate_github(config, source):
     if not _is_number(poll) or poll < GITHUB_POLL_MIN:
         raise ConfigError("%s: 'github_poll_seconds' must be a number of at least %d (each read of a repo costs "
                           "several API calls), got %r" % (source, GITHUB_POLL_MIN, poll))
+    silence = config["intent_live_silence_minutes"]
+    if not _is_number(silence) or silence < 0:
+        raise ConfigError("%s: 'intent_live_silence_minutes' must be a number of minutes, 0 or more (0 keeps the long trust always), got %r" % (source, silence))
 
 
 # ------------------------------------------------------------- verification
@@ -12503,6 +12534,7 @@ class Watch:
         self.next_start = 0.0
         self.started = self.catchup_at = self.last_catch_up = None
         self.last_error = self.catch_up_error = None
+        self.last_event = None   # #367: when a webhook event last arrived for this repo (memory only)
         self.drops = []          # #77: (time dropped, seconds it had run), the last hour's worth; memory only
         self.down_since = None   # when the forwarder last stopped, until it runs again
         # PR 15: a repo whose forwarder cannot work (no such repo yet, no right to make a webhook) is read on
@@ -12640,7 +12672,14 @@ class GitHubHub:
         """The number of times `repo`'s forwarder has started while it is running now, or None when it is not live (polling, down, starting): an entry
         cached under one generation is trusted for the long time only while that same forwarder runs, so an event missed in a gap is never trusted."""
         watch = self.watches.get(repo)
-        return watch.starts if watch is not None and watch.mode == "forwarder" else None
+        if watch is None or watch.mode != "forwarder":
+            return None
+        silence = self.config.get("intent_live_silence_minutes")   # #367: alive but silent (lag, a stuck connection) is not trusted for the long time
+        if _is_number(silence) and silence > 0:
+            heard = max(watch.last_event or 0, watch.started or 0)
+            if self.now() - heard > silence * 60:
+                return None
+        return watch.starts
 
     def _audit(self, event, subject, detail):
         if self.audit is not None:
@@ -12776,6 +12815,8 @@ class GitHubHub:
         self.enqueue(items)
         with self.lock:  # live traffic moves the marker, unless a catch-up still has a gap to close
             watch = self.watches.get(repo)
+            if watch is not None:
+                watch.last_event = self.now()
             live = watch is not None and watch.catchup_at is None and repo in self.markers
         if live:
             self._set_marker(repo, self.now())
@@ -13339,7 +13380,7 @@ class GitHubHub:
             else:
                 done = self.runner(argv, capture_output=True, text=True,
                                    timeout=timeout or self.config["call_timeout_seconds"], **extra)
-        except GhRateLimited as err:   # fail closed, on purpose: while the account is paused every hub read says "unavailable" (callers already hold on that); no hub read is `essential`
+        except GhRateLimited as err:   # fail closed, on purpose: while the account is paused every hub read says "unavailable" (callers already hold on that); no hub read is exempt
             raise GitHubUnavailable(str(err)) from None
         except AccountError as err:
             raise GitHubUnavailable(str(err)) from None
@@ -13802,7 +13843,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
     if state_ok:
         report["decisions"] = decisions_summary(state, now)
         report["v2_calls"] = v2_calls_status(state, now())
-        report["github_calls"] = github_calls_status(state, now())
+        report["github_calls"] = github_calls_status(state, now()) + agent_calls.status_lines(str(state), now())   # #367
         if config_ok and disk_guard_settings(config) is not None:
             report["disk"] = disk_status_line(config, state)   # one stat of the volume
         if config_ok:
@@ -14857,7 +14898,7 @@ class GhAccounts:
         self._tokens = {}
         self.etags = collections.OrderedDict()   # (account, path) -> (etag, body): for a conditional read; memory only, bounded
         self.calls = collections.deque()         # (time, account, endpoint, answered 304) of every read through `read`, newest last
-        self.paused = {}                         # account -> epoch until which its non-essential reads wait (the limit's reset)
+        self.paused = {}                         # account -> epoch until which its reads wait (the limit's reset)
         self.limited_once = set()                # accounts whose pause was audited, so it is said once per episode
         self.lock = threading.Lock()             # the hub's threads and the pass read through one gate
         self.audit, self.actor = None, "daemon"
@@ -14916,13 +14957,13 @@ class GhAccounts:
 
     # -- reads: counted, conditional (ETag) and paused while the account is rate limited
 
-    def read(self, runner, path, repo, timeout, essential=False, paginate=False, **run_kwargs):
+    def read(self, runner, path, repo, timeout, paginate=False, **run_kwargs):
         """One `gh api <path>` GET with the repo's account. Returns a CompletedProcess like the runner's, its stdout the BODY only:
 
           - a read GitHub answered `304 Not Modified` to (we send the ETag we hold) is answered from memory and costs nothing against the limit;
           - every read is counted by account and endpoint (`status` shows them);
-          - a 403/429 that says the limit is spent pauses every NON-essential read of that account until the limit resets (GhRateLimited is raised
-            at once, no process is started); `essential` reads (a delivery, a re-check before a write) are never held back.
+          - a 403/429 that says the limit is spent pauses every read of that account until the limit resets (GhRateLimited is raised
+            at once, no process is started). No read is exempt: writes do not go through here.
         A runner whose answer has no HTTP header block (a fake, `--paginate`) is passed through as it is."""
         account = self.describe(repo)
         now = self.now()
@@ -14933,7 +14974,7 @@ class GhAccounts:
                 self.limited_once.discard(account)
                 self._audit("github.rate_resumed", account, {})
                 until = None
-            if until is not None and not essential:
+            if until is not None:
                 raise GhRateLimited(account, until)
             cached = None if paginate else self.etags.get((account, path))
         use_head = self.conditional and not paginate
