@@ -4824,6 +4824,22 @@ class TestLaunch(Base):
         lines = sb.reclaim_for_agent(self.world.new_engine("cli"), subprocess.run, "worker", True)
         self.assertTrue(any("handled (cap %d)" % sb.WORKTREE_RECLAIM_MAX in l for l in lines), lines)
 
+    def test_a_worktree_a_herdr_pane_is_working_in_is_kept_until_that_pane_is_closed(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.make_repo()
+        self.worker()
+        self.world.add_agent("neighbour", fleet={"role": "coder"})
+        wt = self.add_worktree("w-busy")
+        sb.register_worktree(self.world.state, str(wt), "worker", None, "w-busy", 1)
+        self.world.herdr.panes[self.world.panes["neighbour"]]["cwd"] = str(wt / "sub")
+        engine = self.world.new_engine("cli")
+        status, line = sb.reclaim_worktree(engine, subprocess.run, str(wt), {"agent": "worker"}, True)
+        self.assertEqual((status, wt.exists()), ("kept", True))
+        self.assertIn("is working in it", line)
+        self.world.herdr.panes[self.world.panes["neighbour"]]["cwd"] = "/tmp"
+        status, line = sb.reclaim_worktree(engine, subprocess.run, str(wt), {"agent": "worker"}, True)
+        self.assertEqual((status, wt.exists()), ("removed", False), line)
+
     def test_the_worktree_reclaim_config_is_validated(self):
         base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
         sb.validate_config(dict(base, worktree_reclaim={"enabled": True, "on_done": False}))

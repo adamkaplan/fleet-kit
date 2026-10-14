@@ -5969,6 +5969,29 @@ def _unregister_worktree(state_dir, path):
         return False
 
 
+WORKTREE_PANE_LOOKS = 40   # herdr panes read per removal
+
+
+def worktree_in_use(engine, path):
+    """None when no herdr pane has its working directory inside `path`, else why it is kept. Anything herdr cannot say keeps the worktree (no proof, no removal).
+    Only panes herdr lists as agents are seen: a plain terminal of the operator is not, which the docs say."""
+    herdr = getattr(engine, "herdr", None)
+    if herdr is None:
+        return None
+    try:
+        panes = [e.get("pane_id") for e in herdr.agent_list() if isinstance(e, dict) and e.get("pane_id")]
+        root = os.path.realpath(path).rstrip("/") + "/"
+        for pane in panes[:WORKTREE_PANE_LOOKS]:
+            cwd = herdr.pane_get(pane).get("cwd")
+            if isinstance(cwd, str) and (os.path.realpath(cwd) + "/").startswith(root):
+                return "herdr pane %s is working in it: close that pane first" % pane
+        if len(panes) > WORKTREE_PANE_LOOKS:
+            return "more than %d herdr panes: cannot say none works in it" % WORKTREE_PANE_LOOKS
+    except HerdrError as err:
+        return "herdr cannot say whether a pane works in it (%s)" % _one_line(str(err), 80)
+    return None
+
+
 def reclaim_worktree(engine, runner, path, entry, apply=True):
     """(status, line) for ONE registered worktree: `removed`, `would-remove`, `kept` (with the reason), `gone` (the directory is already gone: the entry is
     dropped) or `refused` (not a linked worktree: never touched). Never forces, never removes a branch."""
@@ -5989,6 +6012,9 @@ def reclaim_worktree(engine, runner, path, entry, apply=True):
         return "kept", "%s: kept: ignored local file(s) that are not known build output would be lost (%d, e.g. %s)" % (path, len(facts["ignored"]), _one_line(facts["ignored"][0], 60))
     if not facts["pushed"]:
         return "kept", "%s: kept: unpushed (HEAD %s is on no remote branch)" % (path, facts["branch"] or "detached")
+    busy = worktree_in_use(engine, path)
+    if busy:
+        return "kept", "%s: kept: %s" % (path, busy)
     if not apply:
         return "would-remove", "%s: would remove (clean, pushed; branch %s)" % (path, facts["branch"])
     again = _git(runner, path, "status", "--porcelain", "--untracked-files=all")   # the window between the check and the remove is as short as it can be
