@@ -41794,7 +41794,7 @@ class TestDaemonPriority(Base):
         self.assertEqual(written["ProcessType"], "Interactive")
         self.assertEqual(written["ProgramArguments"][-2:], ["run", "--standby"])
         self.assertEqual(written["ProgramArguments"][0], values["__PYTHON__"])
-        self.assertNotIn("__", json.dumps(written), "every placeholder is filled")
+        self.assertIsNone(re.search(r"__[A-Z_]+__", json.dumps(written)), "every placeholder is filled")
 
     def test_s3_ensures_own_start_is_unchanged(self):
         seen = []
@@ -41807,7 +41807,7 @@ class TestDaemonPriority(Base):
         self.assertEqual(kw["cwd"], str(self.world_state()))
         self.assertNotIn("HERDR_PANE_ID", kw["env"])
         self.assertNotIn("FLEET_SWITCHBOARD_ROLE", kw["env"])
-        self.assertFalse({"launchctl", "taskpolicy", "nice", "sudo"} & set(argv), "no wrapper around the start")
+        self.assertFalse({"launchctl", "taskpolicy", "nice", "sudo"} & {os.path.basename(a) for a in argv}, "no wrapper around the start, by name or by path")
 
     def world_state(self):
         path = self.home / "state"

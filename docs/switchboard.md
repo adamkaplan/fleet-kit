@@ -4513,7 +4513,7 @@ On a machine kept busy far past its cores the daemon can be starved: at a load o
 
 To run the daemon under launchd with the Interactive class, run `fleet-switchboard install`: it writes `~/Library/LaunchAgents/com.fleet-kit.switchboard.plist` from `templates/com.fleet-kit.switchboard.plist` (a user agent: no `UserName`, no `Nice`) and loads it. A daemon `ensure` already started keeps the lock; the agent's `--standby` waits and takes over when that daemon goes away. To check what class the agent has, run `launchctl print gui/$(id -u)/com.fleet-kit.switchboard` and read its `process type` line. To go back, `fleet-switchboard install --uninstall` unloads and removes the agent, and `ensure` starts the daemon again as before. There is no sudo anywhere in this.
 
-What was measured (a fixed 0.55-second CPU task on a 14-core machine, run with 28 busy processes, a load average of 104): the default class took 1.6 s, and the **Background** class (`taskpolicy -b`, what the template asked for before) did not finish in 60 s. The Interactive class itself could not be measured without installing the agent, which was not done on the live machine; it is at least the default class.
+What was measured (a fixed 0.55-second CPU task on a 14-core machine, run with 28 busy processes, a load average of 104): the default class took 1.6 s, and the **Background** class (`taskpolicy -b`, what the template asked for until this change) did not finish in 60 s. The Interactive class itself could not be measured without installing the agent, which was not done on the live machine; it is at least the default class.
 
 ### The disk guard and `disk prune`
 
