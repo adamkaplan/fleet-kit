@@ -18133,10 +18133,137 @@ def cmd_disk_prune(args, runner, now):
     return status
 
 
+# ---------------------------------------------------------------- `disk report` (#321 slice 1): what holds the disk, read only
+#
+# On demand only: the daemon's pass never runs it (the status line stays one stat). It lists free space, docker usage (ONE `docker system df`), the
+# registered worktrees per agent with size and git state (capped), cache sizes (a bounded walk, no `du`), and orphan CANDIDATES (a process
+# parented to init that works inside a registered worktree or the temp dir: a count, never a kill). It writes and removes nothing.
+
+DISK_REPORT_WORKTREES = 20       # worktrees whose git state is read per report: git is a process per question
+DISK_WALK_ENTRIES = 200000       # entries one size walk looks at; past it the size is "at least"
+DISK_WALK_SECONDS = 5.0
+OPENCODE_DATA_DIR = "~/.local/share/opencode"
+
+
+def tree_size(path, entries=DISK_WALK_ENTRIES, seconds=DISK_WALK_SECONDS, clock=time.monotonic):
+    """(bytes, complete): the sum of the file sizes under `path` by a bounded walk (symlinks are not followed and counted at their own size).
+    `complete` is False when the entry or time budget ran out: the number is then a lower bound."""
+    total, seen, deadline = 0, 0, clock() + seconds
+    pending = [str(path)]
+    while pending:
+        try:
+            scan = os.scandir(pending.pop())
+        except OSError:
+            continue
+        with scan:
+            for entry in scan:
+                seen += 1
+                if seen > entries or clock() > deadline:
+                    return total, False
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        pending.append(entry.path)
+                    else:
+                        total += entry.stat(follow_symlinks=False).st_size
+                except OSError:
+                    continue
+    return total, True
+
+
+def _human(size):
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1000 or unit == "GB":
+            return "%d %s" % (size, unit) if unit == "B" else "%.1f %s" % (size, unit)
+        size /= 1000.0
+
+
+def disk_temp_dir():
+    return Path(tempfile.gettempdir()) / "opencode"
+
+
+def orphan_candidates(table, roots):
+    """The rows of a `ps -axo pid=,ppid=,etime=,command=` text whose parent is init (pid 1) and whose command line names a path under one of `roots`:
+    [(pid, etime, command)]. Read only: slice 4 decides what may be killed."""
+    found = []
+    prefixes = tuple(r.rstrip("/") + "/" for r in roots if r)
+    for line in table.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 4 or parts[1] != "1" or not parts[0].isdigit():
+            continue
+        if any(p in parts[3] for p in prefixes):
+            found.append((int(parts[0]), parts[2], parts[3]))
+    return found
+
+
+def disk_report(args, runner, now, out=print):
+    """The five sections as a list of lines. Never raises for a tool that is missing: that section says so."""
+    engine, state, config = build_engine(runner, now, "cli", writable=False)
+    lines = ["free"]
+    status = disk_status_line(config, state)
+    lines.append("  state volume: %s" % (status or "not readable"))
+    lines.append("docker")
+    docker = _docker_executable(args.docker)
+    if docker is None:
+        lines.append("  docker: not installed or not on PATH (%s)" % _plain(args.docker, 120))
+    else:
+        try:
+            done = runner([docker, "system", "df"], capture_output=True, text=True, timeout=DOCKER_REAP_TIMEOUT, stdin=subprocess.DEVNULL)
+            if done.returncode != 0:
+                lines.append("  docker: error: %s" % _plain(done.stderr or done.stdout, 160))
+            else:
+                lines.extend("  " + _plain(l, 160) for l in (done.stdout or "").splitlines()[:12])
+        except (OSError, subprocess.SubprocessError) as err:
+            lines.append("  docker: error: %s" % _plain(str(err), 160))
+    lines.append("worktrees")
+    registry = {p: e for p, e in read_worktrees(state).items() if isinstance(e, dict)}
+    shown = sorted(registry.items(), key=lambda kv: (str(kv[1].get("agent")), kv[0]))
+    if not shown:
+        lines.append("  none registered")
+    for path, entry in shown[:DISK_REPORT_WORKTREES]:
+        facts = worktree_facts(runner, path)
+        if not facts["exists"]:
+            lines.append("  %s  %s  gone (registered, directory missing)" % (_plain(entry.get("agent"), 40), _plain(path, 120)))
+            continue
+        size, complete = tree_size(path)
+        git = facts["why"] or "%s, %s" % ("dirty" if facts["dirty"] else "clean", "pushed" if facts["pushed"] else "unpushed")
+        lines.append("  %s  %s  %s%s  %s" % (_plain(entry.get("agent"), 40), _plain(path, 120), "" if complete else ">=", _human(size), git))
+    if len(shown) > DISK_REPORT_WORKTREES:
+        lines.append("  %d more not read (cap %d)" % (len(shown) - DISK_REPORT_WORKTREES, DISK_REPORT_WORKTREES))
+    lines.append("caches")
+    temp = disk_temp_dir()
+    for label, path in (("state dir", state), ("opencode data", Path(os.path.expanduser(OPENCODE_DATA_DIR))), ("temp dir", temp)):
+        if not Path(path).is_dir():
+            lines.append("  %s: not present (%s)" % (label, _plain(path, 120)))
+            continue
+        size, complete = tree_size(path)
+        lines.append("  %s: %s%s (%s)" % (label, "" if complete else ">=", _human(size), _plain(path, 120)))
+    lines.append("orphans")
+    try:
+        done = runner(["ps", "-axo", "pid=,ppid=,etime=,command="], capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL)
+        table = done.stdout or "" if done.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        table = None
+    if table is None:
+        lines.append("  candidates: not readable (ps failed)")
+    else:
+        found = orphan_candidates(table, list(registry) + [str(temp)])
+        lines.append("  candidates: %d (parent is init and the command names a registered worktree or the temp dir; reported only, nothing is killed)" % len(found))
+        for pid, etime, command in found[:10]:
+            lines.append("    %d  up %s  %s" % (pid, etime, _plain(command, 100)))
+    return lines
+
+
+def cmd_disk_report(args, runner, now):
+    """`disk report` (and a bare `disk`): free space, docker usage, worktrees per agent, cache sizes and orphan candidates. Read only."""
+    for line in disk_report(args, runner, now):
+        print(line)
+    return EXIT_OK
+
+
 def cmd_disk(args, runner, now):
     """The `disk` group: `prune` (the disk guard, #319), `reap-docker` (#326) and `reclaim-worktrees` / `register-worktree` (the worktree lifecycle, #321)."""
     try:   # `direct` skips dispatch's error mapping, so refusals are mapped here for every subcommand
-        return {"prune": cmd_disk_prune, "reap-docker": cmd_disk_reap_docker, "reclaim-worktrees": cmd_disk_reclaim_worktrees, "register-worktree": cmd_disk_register_worktree}[args.disk_action](args, runner, now)
+        return {"report": cmd_disk_report, None: cmd_disk_report, "prune": cmd_disk_prune, "reap-docker": cmd_disk_reap_docker, "reclaim-worktrees": cmd_disk_reclaim_worktrees, "register-worktree": cmd_disk_register_worktree}[args.disk_action](args, runner, now)
     except (LaunchError, ConfigError, CallerError, LockError) as err:
         sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err))))
         return EXIT_ERROR
@@ -18146,8 +18273,11 @@ cmd_disk.direct = True   # an operator's command on the machine: no daemon start
 
 
 def add_disk_parsers(sub):
-    disk = sub.add_parser("disk", help="Disk tools: `disk prune` removes old docker build cache and images (never volumes or running containers); `disk reclaim-worktrees` removes the clean, pushed worktrees of retired agents")
-    disk_sub = disk.add_subparsers(dest="disk_action", required=True)
+    disk = sub.add_parser("disk", help="Disk tools: `disk report` (a bare `disk`) shows what holds the disk, read only; `disk prune` removes old docker build cache and images (never volumes or running containers); `disk reclaim-worktrees` removes the clean, pushed worktrees of retired agents")
+    disk_sub = disk.add_subparsers(dest="disk_action", required=False)
+    disk.add_argument("--docker", default="docker", help="The docker executable the bare `disk` report asks (default: docker on PATH)")
+    report = disk_sub.add_parser("report", help="what holds the disk: free space, docker usage, worktrees per agent, cache sizes, orphan candidates (read only; also a bare `disk`)")
+    report.add_argument("--docker", default="docker", help="The docker executable (default: docker on PATH)")
     prune = disk_sub.add_parser("prune", help="docker builder prune and docker image prune -a, older than a week, and nothing else",
                                 description="Runs exactly `docker builder prune -f --filter until=168h` and `docker image prune -a -f --filter until=168h` and prints what "
                                             "was reclaimed. Never a volume, never a running container, never `system prune`. Refuses without docker. NOTE: "
