@@ -12844,6 +12844,8 @@ class TestJudgeTool(PolicyCase):
         self.assertEqual(detail["question"]["ids"], list(sb.POLICY_QUESTIONS))
         self.assertNotIn("state", detail["question"], "the full question state is not kept: ids, a clip of the arguments and of the intent")
         self.assertLessEqual(len(detail["question"]["arguments"]), 100)
+        self.assertLessEqual(len(detail["question"]["intent"]), 160)
+        self.assertEqual([e["event"] for e in self.audit_events()][-1:], ["policy.judge"], "the event name, subject and ts are unchanged: only fields were dropped")
         self.assertLess(len(json.dumps(detail)), 1500, "a policy.judge entry is small")
         self.assertEqual((detail["ask"], detail["judged"], detail["cached"]), (2, True, False))
         self.assertIn("latency_ms", detail)
@@ -38744,13 +38746,13 @@ class TestAuditRotation(unittest.TestCase):
         self.assertEqual(self.events()[-1], "after")
         self.assertNotIn("old", self.events())
 
-    def test_a_file_that_is_all_recent_keeps_at_most_half_the_threshold(self):
+    def test_a_file_that_is_all_recent_keeps_at_most_three_quarters_of_the_threshold(self):
         now = time.time()
         self.fill(now, old=0, recent=60)
         size = self.path.stat().st_size
         with mock.patch.object(sb, "AUDIT_ROTATE_BYTES", size - 1):
             self.assertIsNotNone(self.log.rotate(now))
-        self.assertLessEqual(self.path.stat().st_size, (size - 1) // 2 + 400)
+        self.assertLessEqual(self.path.stat().st_size, (size - 1) * 3 // 4 + 400)
         self.assertEqual(self.events()[-1], "recent")
 
     def test_a_line_appended_during_the_swap_is_carried_not_lost(self):
@@ -38788,14 +38790,15 @@ class TestAuditRotation(unittest.TestCase):
     def test_archives_older_than_fourteen_days_are_deleted_and_the_rest_kept(self):
         now = time.time()
         self.fill(now)
-        old, young = self.dir / "audit-2020-01-01.jsonl.gz", self.dir / "audit-recent.jsonl.gz"
+        old, young = self.dir / "audit-2020-01-01.jsonl.gz", self.dir / "audit-archive-20261014T0100.jsonl.gz"   # the second: a hand-made archive of another name
         for path, age in ((old, 15 * 86400), (young, 13 * 86400)):
             path.write_bytes(b"x")
             os.utime(str(path), (now - age, now - age))
         with mock.patch.object(sb, "AUDIT_ROTATE_BYTES", self.path.stat().st_size - 1):
             self.log.rotate(now)
         self.assertFalse(old.exists())
-        self.assertTrue(young.exists())
+        self.assertTrue(young.exists(), "a hand-made archive is kept, by its mtime, and never renamed or opened")
+        self.assertEqual(young.read_bytes(), b"x")
 
     def test_a_second_rotation_on_the_same_day_does_not_overwrite_the_first_archive(self):
         now = time.time()
@@ -38839,24 +38842,24 @@ class TestAuditRotation(unittest.TestCase):
             self.log.append("t", "x")
             self.assertEqual(len(syncs), 5, "after a second the next one is synced again")
 
-    def test_an_appender_waits_out_the_swap_and_its_line_lands_in_the_new_file(self):
-        now = time.time()
-        self.fill(now)
-        size = self.path.stat().st_size
-        real, results = os.replace, []
-
-        def slow_replace(src, dst):
-            thread = threading.Thread(target=lambda: results.append(sb.AuditLog(self.path).append("t", "during")))
-            thread.start()
-            time.sleep(0.2)   # the appender is blocked on the shared lock the swap holds exclusively
-            self.assertEqual(results, [])
-            real(src, dst)
-            thread.join(5)
-        with mock.patch.object(sb, "AUDIT_ROTATE_BYTES", size - 1), mock.patch.object(sb.os, "replace", slow_replace):
-            self.log.rotate(now)
-        self.assertEqual(len(results), 1)
-        self.assertEqual(self.events()[-1], "during")
-        self.assertEqual([e for e in self.events() if e == "during"], ["during"])
+    def test_an_appender_waits_for_the_exclusive_swap_lock_and_then_writes_to_the_file_in_place(self):
+        """The swap holds `audit.jsonl.append.lock` exclusively: an appender started meanwhile blocks (the lock decides, so there is no race here) and writes after."""
+        self.log.append("t", "before")
+        lock = os.open(str(self.dir / "audit.jsonl.append.lock"), os.O_WRONLY | os.O_CREAT, 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        done = []
+        thread = threading.Thread(target=lambda: done.append(sb.AuditLog(self.path).append("t", "during")))
+        thread.start()
+        thread.join(0.3)
+        self.assertTrue(thread.is_alive(), "the appender is blocked on the lock the swap holds")
+        self.assertEqual(self.events(), ["before"])
+        os.replace(str(self.path), str(self.dir / "moved"))      # the swap: the file is replaced while the appender waits
+        (self.dir / "audit.jsonl").write_text(self.line(time.time(), "carried"))
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        os.close(lock)
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(self.events(), ["carried", "during"], "the line landed in the NEW file, not the replaced one")
 
     def test_a_line_with_no_timestamp_in_the_recent_part_is_kept_and_a_file_already_rotated_is_left_alone(self):
         now = time.time()

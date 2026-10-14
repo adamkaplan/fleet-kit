@@ -777,7 +777,7 @@ def utc_now():
 
 
 AUDIT_ROTATE_BYTES = 20 << 20    # the active audit file is rotated when an append finds it larger than this
-AUDIT_KEEP_SECONDS = 86400       # ... keeping the last day in the active file (and never more than half of AUDIT_ROTATE_BYTES)
+AUDIT_KEEP_SECONDS = 86400       # ... keeping the last day in the active file (and never more than three quarters of AUDIT_ROTATE_BYTES)
 AUDIT_ARCHIVE_DAYS = 14          # archives (audit-<UTC date>.jsonl.gz) older than this are deleted
 AUDIT_SYNC_SECONDS = 1.0         # fsync of a non-intent append at most this often (an `intent` is always synced: it must be on disk before the write it announces)
 _AUDIT_TS = re.compile(rb'"ts": "([^"]+)"')
@@ -873,7 +873,7 @@ class AuditLog:
             return None
         if seen <= AUDIT_ROTATE_BYTES:
             return None   # another process rotated first
-        floor = max(0, seen - AUDIT_ROTATE_BYTES // 2)   # never keep more than half the threshold, whatever the clock says
+        floor = max(0, seen - AUDIT_ROTATE_BYTES * 3 // 4)   # never keep more than three quarters of the threshold (room to grow before the next rotation), whatever the clock says
         stamp = datetime.fromtimestamp(now, timezone.utc)
         archive = self.path.with_name("audit-%s.jsonl.gz" % stamp.strftime("%Y-%m-%d"))
         if archive.exists():
