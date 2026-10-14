@@ -299,6 +299,7 @@ DEFAULTS = {
     "call_timeout_seconds": 20,
     "send_timeout_seconds": 60,    # `send` as a whole (the sum of its v2 and herdr calls): past it, a clear failure line, never a silent minutes-long wait
     "poll_seconds": 5,
+    "disk_guard": None,            # free space of the state directory's volume: None = defaults (min_free_gb 50, hard_free_gb 10); false = off; or {"min_free_gb": n, "hard_free_gb": n}
     "v2_events": "auto",           # the daemon's news of sessions: "auto" (the service's event stream, where the HTTP route exists; reads only what an event did not say) or "off" (the old reads)
     "v2_transport": "auto",        # how v2 calls travel: "auto" (HTTP to the service when it can, else the CLI) or "cli" (always `opencode api`: the kill switch)
     # The daemon's reads of v2 (every one is an `opencode api` process): what it may remember, and how much it may read.
@@ -439,6 +440,7 @@ def validate_config(raw, source="config"):
             if not isinstance(value, str):
                 raise ConfigError("%s: %r value for %s must be a string" % (source, key, name))
         envs[key] = dict(env)
+    validate_disk_guard(config["disk_guard"], source)
     if config["v2_events"] not in ("auto", "off"):
         raise ConfigError("%s: 'v2_events' must be \"auto\" or \"off\", got %r" % (source, config["v2_events"]))
     if not isinstance(config["v2_light"], bool):
@@ -1985,6 +1987,141 @@ class FactError(ValueError):
     """A fact that cannot be used: a missing field, or a value of the wrong type."""
 
 
+DISK_GUARD_DEFAULTS = {"min_free_gb": 50, "hard_free_gb": 10}
+DISK_REARM_PERCENT = 110                # an episode ends when the free space is back at the threshold plus 10% (integer arithmetic: 50 * 1.1 is 55.00000000000001)
+DISK_GUARD_FILE = "disk-guard.json"     # {"low": bool, "episode": <epoch the episode began>, "hard": bool}: so a restart does not start a second episode
+
+
+def validate_disk_guard(raw, source):
+    """`disk_guard`: absent or null = the defaults; false = off; else {"min_free_gb", "hard_free_gb"} (numbers, hard at most min)."""
+    if raw is None or raw is False:
+        return
+    if not isinstance(raw, dict):
+        raise ConfigError("%s: 'disk_guard' must be false, null or an object, got %r" % (source, raw))
+    unknown = sorted(set(raw) - set(DISK_GUARD_DEFAULTS))
+    if unknown:
+        raise ConfigError("%s: 'disk_guard' has unknown key(s) %s (it takes %s)" % (source, ", ".join(unknown), ", ".join(DISK_GUARD_DEFAULTS)))
+    for key, value in raw.items():
+        if not _is_number(value) or value < 0:
+            raise ConfigError("%s: 'disk_guard.%s' must be a number of gigabytes of at least 0, got %r" % (source, key, value))
+    merged = dict(DISK_GUARD_DEFAULTS, **raw)
+    if merged["hard_free_gb"] > merged["min_free_gb"]:
+        raise ConfigError("%s: 'disk_guard.hard_free_gb' (%r) must not be more than 'min_free_gb' (%r)" % (source, merged["hard_free_gb"], merged["min_free_gb"]))
+
+
+def disk_guard_settings(config):
+    """{"min_free_gb", "hard_free_gb"}, or None when the guard is off."""
+    raw = config.get("disk_guard")
+    if raw is False:
+        return None
+    return dict(DISK_GUARD_DEFAULTS, **(raw or {}))
+
+
+def disk_free(path):
+    """(free bytes, total bytes) of the volume holding `path`: ONE stat, no walk; None when it cannot be read."""
+    try:
+        usage = shutil.disk_usage(str(path))
+    except OSError:
+        return None
+    return usage.free, usage.total
+
+
+def disk_status_line(config, state_dir):
+    """`238 GB free (24%)`, with LOW and the thresholds when below the guard; None when the volume cannot be read."""
+    found = disk_free(state_dir)
+    if found is None:
+        return None
+    free, total = found
+    gb = free / 1e9
+    line = "%d GB free (%d%%)" % (gb, round(100.0 * free / total)) if total else "%d GB free" % gb
+    guard = disk_guard_settings(config)
+    if guard is not None and gb < guard["min_free_gb"]:
+        line += ": %s (below %g GB; hard line %g GB)" % ("VERY LOW" if gb < guard["hard_free_gb"] else "LOW", guard["min_free_gb"], guard["hard_free_gb"])
+    return line
+
+
+class DiskFacts:
+    """The disk guard: ONE `disk_usage` of the state directory's volume per pass. Below `disk_guard.min_free_gb` the Chief of Staff is told ONCE for
+    the episode (`disk.low:<episode>`, the fact stays pending until delivered and the key is stable, so it is not told again), `disk.low` is
+    audited, and the episode ends (`disk.recovered`) when the free space is back above the threshold plus 10%. The episode is kept in `disk-guard.json`
+    so a restart does not begin a second one. Reads nothing else: no `du`, no walk."""
+
+    __name__ = "disk_facts"
+
+    def __init__(self):
+        self.engine = None
+        self.episode = None   # (episode epoch, hard flag) while low, from the file or this process
+
+    def bind(self, engine):
+        self.engine = engine
+
+    def _load(self, state_dir):
+        try:
+            with open(str(Path(state_dir) / DISK_GUARD_FILE)) as handle:
+                raw = json.loads(handle.read(4096))   # a few bytes are all it ever holds
+            if raw.get("low") and _is_number(raw.get("episode")):
+                return float(raw["episode"]), bool(raw.get("hard"))
+        except (OSError, ValueError, AttributeError, TypeError):
+            pass
+        return None
+
+    def _save(self, engine, low, episode, hard):
+        try:
+            path = Path(engine.state_dir) / DISK_GUARD_FILE   # written only on a change of episode: a handful of times a year
+            temp = path.with_name("%s.%d.tmp" % (DISK_GUARD_FILE, os.getpid()))
+            fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                handle.write(json.dumps({"low": bool(low), "episode": episode, "hard": bool(hard)}, sort_keys=True))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(str(temp), str(path))
+        except OSError as err:
+            try:
+                temp.unlink()
+            except (OSError, UnboundLocalError):
+                pass
+            engine._note("disk.guard_file", None, {"error": _plain("%s: %s" % (type(err).__name__, err), 160)})   # said once per change: after a restart a second episode could begin
+
+    def __call__(self):
+        engine = self.engine
+        guard = disk_guard_settings(engine.config) if engine is not None else None
+        if guard is None or engine.state_dir is None:
+            return []
+        found = disk_free(engine.state_dir)
+        if found is None:   # FAIL OPEN, on purpose: a guard that cannot read the volume says so once (audit) and wakes nobody: a false alarm helps no one
+            engine._note("disk.unreadable", None, {"path": str(engine.state_dir)})
+            return []
+        free_gb, now = found[0] / 1e9, engine.now()
+        if self.episode is None:
+            self.episode = self._load(engine.state_dir)
+        if self.episode is not None and free_gb >= guard["min_free_gb"] * DISK_REARM_PERCENT / 100:
+            if engine.audit is not None:   # appended, not `_note`d: a second episode that recovers at the same figure is still news
+                engine.audit.append(engine.actor, "disk.recovered", None, {"free_gb": int(free_gb), "min_free_gb": guard["min_free_gb"], "episode": int(self.episode[0])})
+            self.episode = None
+            self._save(engine, False, None, False)
+        discovery = getattr(engine, "discovery", None)
+        chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff") if discovery is not None and not discovery.problems else []
+        if self.episode is None and free_gb < guard["min_free_gb"] and chiefs:   # an episode begins when there is someone to tell: with no Chief of Staff running, the next pass tries again
+            self.episode = (now, free_gb < guard["hard_free_gb"])
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "disk.low", None, {"free_gb": int(free_gb), "min_free_gb": guard["min_free_gb"],
+                                                                      "hard_free_gb": guard["hard_free_gb"], "hard": self.episode[1]})
+            self._save(engine, True, now, self.episode[1])
+        if self.episode is None:
+            return []
+        episode, hard = self.episode
+        if free_gb < guard["hard_free_gb"] and not hard:   # it got worse inside the episode: said in the status line and the audit, not a second wake
+            self.episode = (episode, True)
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "disk.hard", None, {"free_gb": int(free_gb), "hard_free_gb": guard["hard_free_gb"], "episode": int(episode)})
+            self._save(engine, True, episode, True)
+        if not chiefs:
+            return []
+        text = "disk low: %d GB free on the volume holding the state directory (the guard is %g GB, hard line %g GB). `%s disk prune --dry-run` shows what would be " \
+               "pruned (docker build cache and images older than a week, never volumes; it measures the state directory's volume, so check where docker keeps its data)" % (free_gb, guard["min_free_gb"], guard["hard_free_gb"], PROG)
+        return [Fact("disk.low:%d" % int(episode), name, "disk", text, episode, sender="switchboard") for name in chiefs]
+
+
 class Fact:
     """Something one fleet agent should be told.
 
@@ -2093,7 +2230,7 @@ def fact_sources(state_dir):
     the same rule, and stores nothing.
     """
     return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir),
-            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), JobFacts(), PaneFacts()]
+            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), JobFacts(), PaneFacts(), DiskFacts()]
 
 
 # --------------------------------------------------------- observing the fleet
@@ -2458,7 +2595,7 @@ def collapse_riders(facts, now, max_age):
 
 
 DESCRIBED_AS = {"send": "message", "report": "report", "worker.idle": "finished", "worker.stopped": "stopped",
-                "worker.blocked": "blocked", "nudge": "nudge", "sweep": "sweep", "triage": "triage"}
+                "worker.blocked": "blocked", "nudge": "nudge", "sweep": "sweep", "triage": "triage", "disk": "disk guard"}
 
 
 def _line_of(text, limit):
@@ -12466,6 +12603,8 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
     if state_ok:
         report["decisions"] = decisions_summary(state, now)
         report["v2_calls"] = v2_calls_status(state, now())
+        if config_ok and disk_guard_settings(config) is not None:
+            report["disk"] = disk_status_line(config, state)   # one stat of the volume
         if config_ok and config.get("v2_light"):
             try:
                 unknown = SentLedger(state).unknown_count()
@@ -12660,6 +12799,7 @@ def format_status(report):
         lines.append("      agents     %s" % agents["error"])
     lines.extend(format_github(report["github"]) if "github" in report else [])
     lines.extend(format_decisions_status(report["decisions"]) if "decisions" in report else [])
+    lines.extend("      disk       " + report["disk"] for _ in [0] if report.get("disk"))
     lines.extend("      v2 calls   " + report["v2_calls"] for _ in [0] if report.get("v2_calls"))
     lines.extend("      v2_light   " + report["v2_light"] for _ in [0] if report.get("v2_light"))
     lines.extend(sweep_status_lines(report.get("sweep")))  # #117
@@ -17384,6 +17524,65 @@ def add_impact_parsers(sub):
     clear = impact_sub.add_parser("clear", help="The owner's own terminal only: clear a false impact hold for this head, with a reason")
     clear.add_argument("pr", help="The pull request: owner/repo#N or its URL")
     clear.add_argument("--reason", required=True, help="Why the hold is false (at least 10 characters), logged")
+
+
+# ---------------------------------------------------------------- `disk prune`: reclaim old docker build cache and images, and nothing else
+#
+# The two commands below are the ONLY ones it runs, with exactly these arguments: old build cache and old unused images (a week). Never a volume, never a
+# running container (`image prune -a` keeps every image a container uses), never `system prune`. It refuses when there is no docker. `--dry-run` prints the
+# commands and runs none. Nothing runs it on its own: the docs give a launchd snippet for a weekly run, not installed.
+DISK_PRUNE_COMMANDS = (("docker", "builder", "prune", "-f", "--filter", "until=168h"),
+                       ("docker", "image", "prune", "-a", "-f", "--filter", "until=168h"))
+DISK_PRUNE_TIMEOUT = 600
+_RECLAIMED = re.compile(r"Total reclaimed space:\s*(\S+)", re.I)
+
+
+def cmd_disk(args, runner, now):
+    """`disk prune [--dry-run]`."""
+    docker = shutil.which(args.docker) if os.sep not in args.docker else (args.docker if os.access(args.docker, os.X_OK) else None)
+    if docker is None:
+        sys.stderr.write("%s: disk prune: docker is not installed or not on PATH (%s): nothing was run\n" % (PROG, _plain(args.docker, 160)))
+        return EXIT_USAGE
+    commands = [(docker,) + argv[1:] for argv in DISK_PRUNE_COMMANDS]
+    if args.dry_run:
+        print("dry run: %s would run, in order, and nothing else (never a volume, a running container or `system prune`):" % PROG)
+        for argv in commands:
+            print("  " + " ".join(shlex.quote(a) for a in argv))
+        return EXIT_OK
+    before = disk_free(ensure_state_dir())
+    status = EXIT_OK
+    for argv in commands:
+        try:
+            done = runner(list(argv), capture_output=True, text=True, timeout=DISK_PRUNE_TIMEOUT, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError) as err:
+            print("%s: failed: %s" % (" ".join(argv[1:3]), _plain(str(err), 160)))
+            status = EXIT_ERROR
+            continue
+        found = _RECLAIMED.search(done.stdout or "")
+        if done.returncode != 0:
+            print("%s: failed (exit %s): %s" % (" ".join(argv[1:3]), done.returncode, _plain(done.stderr or done.stdout, 200)))
+            status = EXIT_ERROR
+        else:
+            print("%s: reclaimed %s" % (" ".join(argv[1:3]), _plain(found.group(1), 40) if found else "nothing reported"))
+    after = disk_free(ensure_state_dir())
+    if before and after:
+        print("disk: %d GB free before, %d GB after" % (before[0] / 1e9, after[0] / 1e9))
+    return status
+
+
+cmd_disk.direct = True   # an operator's command on the machine: no daemon start
+
+
+def add_disk_parsers(sub):
+    disk = sub.add_parser("disk", help="Disk guard tools: `disk prune` removes old docker build cache and images (never volumes or running containers)")
+    disk_sub = disk.add_subparsers(dest="disk_action", required=True)
+    prune = disk_sub.add_parser("prune", help="docker builder prune and docker image prune -a, older than a week, and nothing else",
+                                description="Runs exactly `docker builder prune -f --filter until=168h` and `docker image prune -a -f --filter until=168h` and prints what "
+                                            "was reclaimed. Never a volume, never a running container, never `system prune`. Refuses without docker. NOTE: "
+                                            "`until=168h` is the image's age, not its last use: a locally built image with no registry copy is removed too if no "
+                                            "container uses it.")
+    prune.add_argument("--dry-run", action="store_true", help="Print the two commands and run neither")
+    prune.add_argument("--docker", default="docker", help="The docker executable (default: docker on PATH)")
 
 
 # ---------------------------------------------------------------- `agents verify` (#179): did the service register OUR agents as written?
