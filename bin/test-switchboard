@@ -39897,6 +39897,210 @@ class FakeDocker:
         return [c for c in self.calls if "rm" in c and "--" in c]
 
 
+class TestDiskReport(Base):
+    """`disk report` (ask #321, slice 1): five sections, read only, docker asked only by the report, worktrees per agent with their git state."""
+
+    GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com",
+               "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+    PS = "  101 1 01:02:03 python3 /tmp/leaky/WT/test.py\n  102 7 00:01 python3 /tmp/leaky/WT/test.py\n  103 1 00:09 /usr/bin/other\n"
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("coder",), config={})
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.docker_path = self.home / "docker"
+        self.docker_path.write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(str(self.docker_path), 0o755)
+        self.calls = []
+        self.temp = self.home / "tmpdir"
+        self.temp.mkdir()
+        (self.temp / "old.bin").write_bytes(b"x" * 3000)
+        patcher = mock.patch.object(sb, "disk_temp_dir", lambda: self.temp)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.ps_text = self.PS
+
+    def git(self, cwd, *args):
+        with mock.patch.dict(os.environ, self.GIT_ENV):
+            done = subprocess.run(["git", "-C", str(cwd)] + list(args), capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, "git %s: %s" % (args, done.stderr))
+
+    def make_repo(self):
+        root = Path(os.path.realpath(str(self.home))) / "repos"
+        root.mkdir()
+        remote, main = root / "remote.git", root / "main"
+        subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+        subprocess.run(["git", "init", "-q", "-b", "main", str(main)], check=True)
+        (main / "a.txt").write_text("a\n")
+        self.git(main, "add", ".")
+        self.git(main, "commit", "-qm", "first")
+        self.git(main, "remote", "add", "origin", str(remote))
+        self.git(main, "push", "-q", "origin", "main")
+        self.main = main
+
+    def add_worktree(self, name, agent, dirty=False, unpushed=False):
+        path = self.main.parent / name
+        self.git(self.main, "worktree", "add", "-q", "-b", name, str(path))
+        self.git(path, "push", "-q", "origin", name)
+        if unpushed:
+            (path / "n.txt").write_text("x\n")
+            self.git(path, "add", ".")
+            self.git(path, "commit", "-qm", "local only")
+        if dirty:
+            (path / "scratch.txt").write_text("edit\n")
+        self.assertTrue(sb.register_worktree(self.world.state, str(path), agent, None, name, 1))
+        return path
+
+    def runner(self, docker_text="TYPE TOTAL SIZE\nImages 3 1.2GB\n", docker_code=0):
+        def run(argv, **kwargs):
+            if argv[0] == str(self.docker_path) or os.path.basename(argv[0]) == "docker":   # ANY docker, by name or by path
+                self.calls.append(list(argv[1:]))
+                return subprocess.CompletedProcess(argv, docker_code, docker_text, "daemon down" if docker_code else "")
+            if argv[0] == "ps":
+                return subprocess.CompletedProcess(argv, 0, self.ps_text, "")
+            return self.world.route(argv, **kwargs)
+        return run
+
+    def report(self, *argv, runner=None, docker=None):
+        with captured() as (out, err):
+            code = sb.main(["disk", *argv, "--docker", docker or str(self.docker_path)], runner=runner or self.runner(), now=self.world.clock.now)
+        return code, out.getvalue(), err.getvalue()
+
+    def listing(self):
+        return sorted((str(p.relative_to(self.world.state)), p.stat().st_size, p.stat().st_mtime_ns) for p in self.world.state.rglob("*"))
+
+    def test_s1_five_sections_and_nothing_is_written_or_removed(self):
+        self.make_repo()
+        self.add_worktree("w-one", "coder")
+        before = self.listing()
+        code, out, err = self.report("report")
+        self.assertEqual(code, 0, err)
+        self.assertEqual([l for l in out.splitlines() if not l.startswith(" ")], ["free", "docker", "worktrees", "caches", "orphans"])
+        self.assertIn("state volume: ", out)
+        self.assertIn("temp dir: 3.0 KB", out)
+        self.assertEqual(self.listing(), before, "the report wrote into the state directory")
+        self.assertFalse(self.audit_exists())
+
+    def audit_exists(self):
+        return bool(self.world.audit())
+
+    def test_s2_docker_is_asked_once_by_the_report_and_never_by_the_status_pass(self):
+        code, out, err = self.report("report")
+        self.assertEqual(self.calls, [["system", "df"]])
+        self.assertIn("Images 3 1.2GB", out)
+        self.calls.clear()
+        with captured():
+            sb.main(["status"], runner=self.runner(), now=self.world.clock.now)
+        self.assertEqual(self.calls, [], "the status pass asked docker")
+        self.runner()(["docker", "ps"])   # the guard can fail: a call by bare name is recorded
+        self.assertEqual(self.calls, [["ps"]])
+
+    def test_s2_a_missing_docker_is_said_and_the_other_sections_still_print(self):
+        code, out, err = self.report("report", docker="/nonexistent/docker")
+        self.assertEqual(code, 0, err)
+        self.assertIn("docker: not installed", out)
+        self.assertEqual([l for l in out.splitlines() if not l.startswith(" ")], ["free", "docker", "worktrees", "caches", "orphans"])
+
+    def test_s2_a_docker_that_fails_is_said_in_its_section(self):
+        code, out, err = self.report("report", runner=self.runner(docker_code=1))
+        self.assertEqual(code, 0)
+        self.assertIn("docker: error: daemon down", out)
+
+    def test_s3_worktrees_are_listed_per_agent_with_their_state_and_none_is_removed(self):
+        self.make_repo()
+        paths = [self.add_worktree("w-clean", "alpha"), self.add_worktree("w-dirty", "beta", dirty=True), self.add_worktree("w-ahead", "beta", unpushed=True)]
+        code, out, err = self.report("report")
+        self.assertRegex(out, r"alpha  \S+w-clean  \S+ \w+  clean, pushed")
+        self.assertRegex(out, r"beta  \S+w-dirty  \S+ \w+  dirty, pushed")
+        self.assertRegex(out, r"beta  \S+w-ahead  \S+ \w+  clean, unpushed")
+        self.assertTrue(all(p.exists() for p in paths))
+        self.assertEqual(len(sb.read_worktrees(self.world.state)), 3)
+
+    def test_s3_past_the_cap_the_rest_are_counted_and_a_missing_directory_is_said(self):
+        self.make_repo()
+        one, two, three = (self.add_worktree("w-%d" % i, "alpha") for i in range(3))
+        shutil.rmtree(str(three))
+        with mock.patch.object(sb, "DISK_REPORT_WORKTREES", 2):
+            code, out, err = self.report("report")
+        self.assertIn("1 more not read (cap 2)", out)
+        code, out, err = self.report("report")
+        self.assertIn("gone (registered, directory missing)", out)
+
+    def test_orphan_candidates_are_init_children_that_name_a_registered_worktree_or_the_temp_dir(self):
+        self.make_repo()
+        wt = self.add_worktree("WT", "alpha")
+        self.ps_text = "  101 1 01:02:03 python3 %s/test.py\n  102 7 00:01 python3 %s/test.py\n  103 1 00:09 /usr/bin/other\n  104 1 5 sleep %s/x\n" % (wt, wt, self.temp)
+        code, out, err = self.report("report")
+        self.assertIn("candidates: 2 ", out)
+        self.assertIn("101  up 01:02:03", out)
+        self.assertNotIn("102  up", out)
+        self.assertIn("nothing is killed", out)
+
+    def test_orphan_lines_show_the_program_only_and_are_capped_at_ten(self):
+        self.ps_text = "".join("  %d 1 00:0%d python3 --token=SECRET %s/x\n" % (200 + i, i % 10, self.temp) for i in range(11))
+        code, out, err = self.report("report")
+        self.assertIn("candidates: 11 ", out)
+        self.assertEqual(len([l for l in out.splitlines() if l.startswith("    2")]), 10)
+        self.assertNotIn("SECRET", out)
+
+    def test_a_walk_past_its_time_budget_is_a_lower_bound_and_the_report_marks_it(self):
+        ticks = iter(range(0, 1000, 10))
+        size, complete = sb.tree_size(self.temp, seconds=5, clock=lambda: next(ticks))
+        self.assertFalse(complete)
+        with mock.patch.object(sb, "tree_size", lambda path: (1234, False)):
+            code, out, err = self.report("report")
+        self.assertIn("temp dir: >=1.2 KB", out)
+
+    def test_a_registered_directory_that_is_not_a_git_repository_is_said_not_cleaned(self):
+        plain = self.home / "not-git"
+        plain.mkdir()
+        (plain / "f").write_text("x")
+        self.assertTrue(sb.register_worktree(self.world.state, str(plain), "alpha", None, "x", 1))
+        code, out, err = self.report("report")
+        self.assertRegex(out, r"alpha  \S+not-git  .*git cannot read it")
+        self.assertTrue(plain.exists())
+
+    def test_a_docker_option_before_the_action_is_honoured(self):
+        code, out, err = self.report("report", docker="/nonexistent/docker")
+        self.assertIn("docker: not installed", out)
+        with captured() as (out, err):
+            code = sb.main(["disk", "--docker", "/nonexistent/docker", "report"], runner=self.runner(), now=self.world.clock.now)
+        self.assertIn("docker: not installed", out.getvalue())
+
+    def test_orphans_say_so_when_ps_fails(self):
+        def run(argv, **kwargs):
+            if argv[0] == "ps":
+                return subprocess.CompletedProcess(argv, 1, "", "no")
+            return self.runner()(argv, **kwargs)
+        code, out, err = self.report("report", runner=run)
+        self.assertIn("candidates: not readable", out)
+
+    def test_s5_a_bare_disk_runs_the_report_and_the_other_commands_are_unchanged(self):
+        code, out, err = self.report()
+        self.assertEqual(code, 0, err)
+        self.assertIn("orphans", out)
+        with captured() as (out, err):
+            code = sb.main(["disk", "prune", "--dry-run", "--docker", str(self.docker_path)], runner=self.runner(), now=self.world.clock.now)
+        self.assertEqual(code, 0)
+        self.assertIn("builder prune", out.getvalue())
+        self.assertIn("image prune", out.getvalue())
+
+    def test_the_size_walk_stops_at_its_budget_and_says_it_is_a_lower_bound(self):
+        for i in range(5):
+            (self.temp / ("f%d" % i)).write_bytes(b"x" * 10)
+        size, complete = sb.tree_size(self.temp, entries=3)
+        self.assertFalse(complete)
+        self.assertEqual(sb.tree_size(self.temp)[1], True)
+        self.assertEqual(sb.tree_size(self.temp)[0], 3050)
+
+    def test_s4_the_docs_say_what_the_reap_docker_dry_run_prints_and_ignores(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        section = text[text.index("### Docker: label convention"):]
+        section = section[:section.index("\n### ", 10)] if "\n### " in section[10:] else section
+        for phrase in ("ignored silently", "expired", "kept", "error:"):
+            self.assertIn(phrase, section.lower())
+
+
 class TestDockerReaper(Base):
     """The docker reaper (ask #321): only EXPIRED objects carrying both labels, dry run by default, one audit line per removal, no sudo."""
 
