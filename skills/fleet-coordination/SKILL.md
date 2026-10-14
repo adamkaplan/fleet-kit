@@ -340,3 +340,7 @@ compaction and when the file changes.
 **Finished a worker? Retire it.** When a worker has made its final `done` or `failed` report and you close its tab, run
 `fleet-switchboard retire <name> [--reason "..."]` so the fleet does not report it dead or invite a reattach. (If you close the tab after its final
 report the switchboard retires it by itself; retire is for the cases it cannot tell.) `retire --undo <name>` reverses it; nothing is deleted.
+
+## Heavy runs
+
+Full suites and browser/e2e runs go through `fleet-switchboard heavy -- <cmd>`: it waits for one of a few CPU slots and runs the command at background priority, so many agents do not starve the machine.
