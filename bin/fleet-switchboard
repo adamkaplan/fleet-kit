@@ -5938,6 +5938,10 @@ def triage_stop(engine, source, observation, boss, idle_ms, reply):
         return None   # v2_light: no transcript read, so a stop is only its idle rider
     if now - observation.idle_at > engine.config["rider_max_age_seconds"]:
         return None  # a stop that old is not news, and a nudge would be late
+    if engine.state_dir is not None:   # a RETIRED worker is finished on purpose: no nudge, no "stopped without reporting" to its boss
+        kept = read_retired(engine.state_dir).get(observation.name)
+        if kept is not None and kept.get("session") in (None, observation.session_id):
+            return None
     boss_view = engine.discovery.agents.get(boss) if engine.discovery else None
     if boss_view is None:  # the boss cannot be read, so nothing can be said to have been reported: tell it (held)
         verdict = {"outcome": "stopped", "reason": "the boss %s is not running, so its transcript cannot show a report" % boss}
