@@ -10316,7 +10316,8 @@ class TestSelfRegisteringCli(unittest.TestCase):
         "decisions": ("cmd_decisions", ("args", "runner", "now")), "comment": ("cmd_comment", ("args", "runner", "now")), "whoami": ("cmd_whoami", ("args", "runner", "now")),
         "pending": ("cmd_pending", ("args", "runner", "now")), "remind": ("cmd_remind", ("args", "runner", "now")), "intent": ("cmd_intent", ("args", "runner", "now")),
         "intents": ("cmd_intents", ("args", "runner", "now")), "import-v1": ("cmd_import_v1", ("args", "runner", "now")), "orders": ("cmd_orders", ("args", "runner", "now")),
-        "labels": ("cmd_labels", ("args", "runner", "now")), "plan": ("cmd_plan", ("args", "runner", "now", "socket_call"))}
+        "labels": ("cmd_labels", ("args", "runner", "now")), "plan": ("cmd_plan", ("args", "runner", "now", "socket_call")),
+        "triage": ("cmd_triage", ("args", "runner", "now"))}
     OLD_ENSURE_ON_USE = ("send", "report", "notice", "launch", "handoff", "comment", "remind", "decisions", "intent", "bootstrap")
     OLD_DIRECT = ("status", "poke", "policy-report", "review-laws", "review", "pr-explain", "impact", "plan", "judge-tool")
     OLD_LEDGER = ("prove", "verdict", "waive", "gates", "gates-check")
