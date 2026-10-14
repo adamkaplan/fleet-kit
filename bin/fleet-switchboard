@@ -2973,8 +2973,10 @@ class V2Reads:
     def session_info(self, session_id, status, now, fresh=False):
         """`session.get`, remembered. `status` is what herdr says the agent is doing now: a change reads again at once."""
         entry, ttl = self.sessions.get(session_id), self.ttl()
+        changed = False
         if entry is not None and not fresh and ttl > 0:
             info, at, was = entry
+            changed = was != status
             if was == status:
                 if now - at < ttl:
                     return info
@@ -2988,8 +2990,9 @@ class V2Reads:
                 return info
         if not fresh:
             row = self.listed(session_id, now)
-            if row is not None and (entry is None or (self.listed_at or 0) > entry[1]):   # a row no newer than what is remembered says nothing new: the state change is read alone
-                self.sessions[session_id] = (row, now, status)
+            # a row no newer than what is remembered says nothing new, and a row read before herdr's state change cannot show it: those are read alone
+            if row is not None and (entry is None or (self.listed_at or 0) > entry[1]) and (not changed or self.listed_at == now):
+                self.sessions[session_id] = (row, self.listed_at, status)   # aged from when the list was read, so a record never outlives `v2_cache_seconds`
                 return row
             if entry is not None and not self.may_fill(now):
                 self.deferred += 1

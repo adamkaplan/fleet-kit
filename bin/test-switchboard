@@ -38709,8 +38709,7 @@ class TestV2ReadVolume(Base):
         self.passes(world, 40)                      # 200 s: the 120 s memory expires once
         ops = self.ops(world)
         self.assertEqual(ops.get("session.get", 0), 0, ops)
-        self.assertLessEqual(ops.get("session.list", 0), 4, ops)
-        self.assertGreaterEqual(ops.get("session.list", 0), 2, "the list is read again, not only once")
+        self.assertEqual(ops.get("session.list", 0), 2, "one at the start and one when the memory expires: %s" % ops)
         self.assertEqual(len(world.engine.discover(world.clock.now()).agents), 20)
 
     def test_a_session_whose_time_moved_shows_its_new_time_after_the_next_list(self):
@@ -38724,6 +38723,27 @@ class TestV2ReadVolume(Base):
         world.engine.run_pass()
         self.assertGreaterEqual(world.engine.reads.sessions[sid][0]["time"]["updated"], before + 1)
         self.assertEqual(self.ops(world, mark).get("session.get", 0), 0)
+
+    def test_a_state_change_after_the_list_was_read_is_read_alone_not_from_the_older_list(self):
+        world = self.world()
+        self.passes(world, 2)                       # the list was read in the first pass
+        sid = world.sessions["agent3"]
+        world.tick(20)
+        world.v2.start_turn(sid, "a task", fleet=True, lasts=30)
+        mark = len(world.v2.calls)
+        world.engine.run_pass()
+        ops = self.ops(world, mark)
+        self.assertEqual((ops.get("session.get"), ops.get("session.list")), (1, None), ops)
+
+    def test_a_record_taken_from_the_list_ages_from_when_the_list_was_read(self):
+        world = self.world()
+        self.passes(world, 2)
+        listed_at = world.engine.reads.listed_at
+        world.tick(130)
+        world.engine.run_pass()
+        entry = world.engine.reads.sessions[world.sessions["agent5"]]
+        self.assertEqual(entry[1], world.engine.reads.listed_at)
+        self.assertGreater(entry[1], listed_at)
 
     def test_a_session_the_list_page_does_not_hold_is_read_alone(self):
         world = self.world()
