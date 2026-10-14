@@ -5995,6 +5995,16 @@ def worktree_in_use(engine, path):
     return worktree_session_in_use(engine, root)
 
 
+@contextmanager
+def worktree_sweep(engine):
+    """One session.list serves every in-use check inside the block; the cache is dropped on the way out, whatever happens."""
+    engine._wt_sweep, engine._wt_session_index = True, None
+    try:
+        yield
+    finally:
+        engine._wt_sweep, engine._wt_session_index = False, None
+
+
 WORKTREE_SESSION_PAGES = 20    # pages of session.list read once per sweep; a list longer than this is incomplete
 
 
@@ -6045,7 +6055,13 @@ def worktree_session_in_use(engine, root):
         if sid not in index:
             if not complete:
                 return "the session of %s is not in the first %d pages of the session list: cannot say it does not run in it" % (name, WORKTREE_SESSION_PAGES)
-            continue
+            try:   # a list may hide a session `session.get` can read: ask for the one that is missing before calling it gone
+                got = engine.v2.session_get(sid)
+            except V2Error as err:
+                if err.reason == "http" and err.status == 404:
+                    continue
+                return "cannot read the session of %s (%s): cannot say it does not run in it" % (name, _one_line(str(err), 80))
+            index = dict(index, **{sid: ((got.get("location") or {}).get("directory") or got.get("directory")) if isinstance(got, dict) else None})
         where = index[sid]
         if isinstance(where, str) and where and (os.path.realpath(where) + "/").startswith(root):
             return "the session of %s (%s) runs in it: retire it first" % (name, sid)
@@ -6099,11 +6115,8 @@ def reclaim_for_agent(engine, runner, name, apply=True, why="retired"):
     if not worktree_config(engine.config)["enabled"]:
         return ["worktree reclaim is switched off (worktree_reclaim.enabled is false): %d worktree(s) of %s kept" % (len(mine), name)]
     lines = []
-    engine._wt_sweep, engine._wt_session_index = True, None   # one session.list for the whole sweep
-    try:
+    with worktree_sweep(engine):   # one session.list for the whole sweep
         results = [(path,) + reclaim_worktree(engine, runner, path, entry, apply) for path, entry in sorted(mine.items())[:WORKTREE_RECLAIM_MAX]]
-    finally:
-        engine._wt_sweep, engine._wt_session_index = False, None
     for path, status, line in results:
         lines.append(line)
         if status == "kept" and engine.audit is not None:
@@ -6137,11 +6150,8 @@ def cmd_disk_reclaim_worktrees(args, runner, now):
     registry = read_worktrees(state)
     todo = {p: e for p, e in registry.items() if isinstance(e, dict) and e.get("agent") in retired}
     removed = kept = 0
-    engine._wt_sweep, engine._wt_session_index = True, None   # one session.list for the whole sweep
-    try:
+    with worktree_sweep(engine):   # one session.list for the whole sweep
         results = [reclaim_worktree(engine, runner, path, entry, bool(args.apply)) for path, entry in sorted(todo.items())[:WORKTREE_RECLAIM_MAX]]
-    finally:
-        engine._wt_sweep, engine._wt_session_index = False, None
     for status, line in results:
         print(line)
         removed += status in ("removed", "would-remove", "gone")
@@ -6186,7 +6196,7 @@ def cmd_disk_register_worktree(args, runner, now):
 ORPHAN_GRACE_HOURS = 6
 ORPHAN_MAX_PER_RUN = 20
 ORPHAN_TERM_WAIT_SECONDS = 5
-ORPHAN_NEVER = ("opencode", "herdr", "fleet-switchboard", "docker", "launchd", "sshd", "ssh-agent", "gpg-agent", "tmux")
+ORPHAN_NEVER = ("opencode", "herdr", "fleet-switchboard", "docker", "launchd", "ssh", "gpg-agent", "tmux")
 _PS_ROW = re.compile(r"^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.*\S)\s*$")
 
 
@@ -6250,8 +6260,9 @@ def orphan_kind(command, roots=None):
         return None
     exe = os.path.basename(parts[0])
     args = parts[1:]
-    if exe == "node":
-        return "node-test" if "--test" in args else None
+    if exe == "node":   # a test runner whose command line names a path in a fleet worktree or a temp directory (a bare `node --test` is not matched)
+        paths = [a for a in args if os.path.isabs(a) and ".." not in a.split("/")]
+        return "node-test" if "--test" in args and any(_under(a, worktrees | temps) for a in paths) else None
     if re.fullmatch(r"[Pp]ython[0-9.]*", exe):
         script = next((a for a in args if not a.startswith("-")), None)
         if script is None or not script.endswith(".py") or not os.path.isabs(script) or ".." in script.split("/"):
@@ -6288,7 +6299,7 @@ def orphan_status_line(config, table=None):
     return "%d: %s%s (past %d h: `disk reap-orphans --apply`)" % (len(due), shown, ", ..." if len(due) > 5 else "", orphan_config(config)["grace_seconds"] // 3600)
 
 
-def reap_orphans(engine, apply, table=None, kill=None, sleep=None, roots=None):
+def reap_orphans(engine, apply, table=None, kill=None, sleep=None, roots=None, by=None):
     """Plan or do the reap: a dict with `due`, `young` and, applied, `results` [(pid, kind, outcome)]. Each signal is audited."""
     config = engine.config
     kill, sleep = kill or os.kill, sleep or time.sleep   # looked up at call time, so a test can replace them
@@ -6297,15 +6308,15 @@ def reap_orphans(engine, apply, table=None, kill=None, sleep=None, roots=None):
     if not apply:
         return out
 
-    def same(pid, command):   # the pid still names the process judged: same parent, owner and command
+    def same(pid, command, age):   # the pid still names the process judged: same parent, owner and command, and no younger (a reused pid restarts at 0)
         for row in (table() if table else ps_table()):
             if row[0] == pid:
-                return row[1] == 1 and row[2] == os.getuid() and row[4] == command
+                return row[1] == 1 and row[2] == os.getuid() and row[4] == command and row[3] >= age
         return False
 
     for pid, kind, age, command in due[:ORPHAN_MAX_PER_RUN]:
-        detail = {"pid": pid, "kind": kind, "age_hours": age // 3600, "command": _one_line(command, 160)}
-        if not same(pid, command):
+        detail = {"by": by, "pid": pid, "kind": kind, "age_hours": age // 3600, "command": _one_line(command, 160)}
+        if not same(pid, command, age):
             out["results"].append((pid, kind, "changed: not signalled"))
             continue
         try:
@@ -6314,9 +6325,9 @@ def reap_orphans(engine, apply, table=None, kill=None, sleep=None, roots=None):
             kill(pid, signal.SIGTERM)
             for _ in range(ORPHAN_TERM_WAIT_SECONDS):
                 sleep(1)
-                if not same(pid, command):
+                if not same(pid, command, age):
                     break
-            if same(pid, command):
+            if same(pid, command, age):
                 if engine.audit is not None:
                     engine.audit.append(engine.actor, "orphan.kill", str(pid), detail)
                 kill(pid, signal.SIGKILL)
@@ -6342,7 +6353,7 @@ def cmd_disk_reap_orphans(args, runner, now):
             raise LaunchError("refused: only the operator or the Chief of Staff may --apply an orphan reap (%s is %s)" % (kind[1], "an agent" if kind[0] == "agent" else "not known"))
         if not settings["enabled"]:
             raise LaunchError("the orphan reaper is switched off (orphan_reaper.enabled is false): nothing was signalled")
-    result = reap_orphans(engine, bool(args.apply))
+    result = reap_orphans(engine, bool(args.apply), by=identify_who(engine, runner, now) if args.apply else None)
     for pid, kind, age, command in result["due"]:
         print("  %s %d  %d h old  %s" % (kind, pid, age // 3600, _one_line(command, 100)))
     for pid, kind, outcome in result["results"]:
