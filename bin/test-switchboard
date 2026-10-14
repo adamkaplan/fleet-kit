@@ -4713,7 +4713,13 @@ class TestLaunch(Base):
             self.world.config.update(config)
             outcome = self.world.new_engine("cli").report("worker", "done", "all finished")
             self.assertTrue(wt.exists(), "a done report never removes a worktree: %s" % config)
-        self.assertTrue(outcome.get("worktrees") and "reclaimable" in outcome["worktrees"][0], outcome)
+            text = " ".join(outcome.get("worktrees", []))
+            if config.get("worktree_reclaim") == {"on_done": False}:
+                self.assertNotIn("worktrees", outcome)
+            elif config.get("worktree_reclaim") == {"enabled": False}:
+                self.assertIn("switched off", text)
+            else:
+                self.assertIn("reclaimable", text)
         self.assertEqual(list(self.registered()), [str(wt)], "still registered: retire removes it")
         self.assertEqual([e for e in self.world.audit() if e["event"] == "worktree.removed"], [])
 
@@ -4812,6 +4818,7 @@ class TestLaunch(Base):
         self.engine.state_dir = self.world.state
         self.launch(name="other2", directory=str(wt), brief=None)     # a launch into it does not claim it either
         self.assertEqual(self.registered()[str(wt)]["agent"], "worker")
+        self.assertFalse([e for e in self.world.audit() if e["event"] == "worktree.registered" and e["subject"] == "other2"])
         for n in range(sb.WORKTREE_RECLAIM_MAX + 2):    # the cap is said, not silent
             sb.register_worktree(self.world.state, "/nonexistent/w%02d" % n, "worker", None, "b", 1)
         lines = sb.reclaim_for_agent(self.world.new_engine("cli"), subprocess.run, "worker", True)

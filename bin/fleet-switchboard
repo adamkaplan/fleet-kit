@@ -5686,10 +5686,11 @@ def cmd_retire(args, runner, now):
 
 # ---------------------------------------------------------------- worktree lifecycle (#321 slices S2, S3, S10)
 #
-# `launch` records every worktree it creates in a registry (`worktrees.json`: path, agent, repo, branch, created). `retire`, a worker's final
-# `done` report and `disk reclaim-worktrees --apply` remove a REGISTERED worktree only when `git status` is clean AND its HEAD is on a remote branch
-# (pushed or merged); otherwise they keep it and say why in one line. Never an unregistered worktree, never a main checkout, never `--force`,
-# never a branch. The kill switch is the config key `worktree_reclaim.enabled: false` (and `on_done: false` for the done report alone).
+# `launch` records a linked worktree it is pointed at ONLY when no other agent holds it (it does not run `git worktree add`, so it cannot prove it
+# created it: the owner is inferred, which the docs say; an existing owner is never overwritten). `retire`, an automatic retire and
+# `disk reclaim-worktrees --apply` remove a REGISTERED worktree only when `git status` is clean AND its HEAD is on a remote branch (pushed or
+# merged); otherwise they keep it and say why in one line. A `done` report only says a worktree is reclaimable. Never an unregistered worktree,
+# never a main checkout, never `--force`, never a branch. The kill switch is `worktree_reclaim.enabled: false` (and `on_done: false` for the done note).
 
 WORKTREES_FILE = "worktrees.json"
 WORKTREE_GIT_SECONDS = 20
@@ -5788,7 +5789,7 @@ def _unregister_worktree(state_dir, path):
         return False
 
 
-def reclaim_worktree(engine, runner, path, entry, apply=True, keep_cwd=False):
+def reclaim_worktree(engine, runner, path, entry, apply=True):
     """(status, line) for ONE registered worktree: `removed`, `would-remove`, `kept` (with the reason), `gone` (the directory is already gone: the entry is
     dropped) or `refused` (not a linked worktree: never touched). Never forces, never removes a branch."""
     if not isinstance(entry, dict) or not isinstance(path, str) or not os.path.isabs(path) or path.startswith("-"):
@@ -5808,13 +5809,6 @@ def reclaim_worktree(engine, runner, path, entry, apply=True, keep_cwd=False):
         return "kept", "%s: kept: ignored local file(s) that are not known build output would be lost (%d, e.g. %s)" % (path, len(facts["ignored"]), _one_line(facts["ignored"][0], 60))
     if not facts["pushed"]:
         return "kept", "%s: kept: unpushed (HEAD %s is on no remote branch)" % (path, facts["branch"] or "detached")
-    if keep_cwd:
-        try:
-            inside = os.path.realpath(os.getcwd()).startswith(os.path.realpath(path).rstrip("/") + "/") or os.path.realpath(os.getcwd()) == os.path.realpath(path)
-        except OSError:
-            inside = False
-        if inside:   # the caller's own working directory: a worker that goes on after `done` must not lose it
-            return "kept", "%s: kept: you are working in it; `retire` or `disk reclaim-worktrees --apply` removes it later" % path
     if not apply:
         return "would-remove", "%s: would remove (clean, pushed; branch %s)" % (path, facts["branch"])
     again = _git(runner, path, "status", "--porcelain", "--untracked-files=all")   # the window between the check and the remove is as short as it can be
@@ -5829,7 +5823,7 @@ def reclaim_worktree(engine, runner, path, entry, apply=True, keep_cwd=False):
     return "removed", "%s: removed (clean, pushed; branch %s kept)%s" % (path, facts["branch"], stale)
 
 
-def reclaim_for_agent(engine, runner, name, apply=True, why="retired", keep_cwd=False):
+def reclaim_for_agent(engine, runner, name, apply=True, why="retired"):
     """Reclaim every REGISTERED worktree of agent `name`. Returns the one-line results (empty when it has none). Off with worktree_reclaim.enabled false."""
     if engine.state_dir is None:
         return []
@@ -5840,7 +5834,7 @@ def reclaim_for_agent(engine, runner, name, apply=True, why="retired", keep_cwd=
         return ["worktree reclaim is switched off (worktree_reclaim.enabled is false): %d worktree(s) of %s kept" % (len(mine), name)]
     lines = []
     for path, entry in sorted(mine.items())[:WORKTREE_RECLAIM_MAX]:
-        status, line = reclaim_worktree(engine, runner, path, entry, apply, keep_cwd)
+        status, line = reclaim_worktree(engine, runner, path, entry, apply)
         lines.append(line)
         if status == "kept" and engine.audit is not None:
             engine.audit.append(engine.actor, "worktree.kept", name, {"path": path, "reason": _one_line(line, 160), "after": why})
@@ -17830,10 +17824,8 @@ def cmd_disk_prune(args, runner, now):
 
 def cmd_disk(args, runner, now):
     """The `disk` group: `prune` (the disk guard, #319) and `reclaim-worktrees` / `register-worktree` (the worktree lifecycle, #321)."""
-    if args.disk_action == "prune":
-        return cmd_disk_prune(args, runner, now)
-    try:   # `direct` skips dispatch's error mapping, so the worktree commands' refusals are mapped here
-        return {"reclaim-worktrees": cmd_disk_reclaim_worktrees, "register-worktree": cmd_disk_register_worktree}[args.disk_action](args, runner, now)
+    try:   # `direct` skips dispatch's error mapping, so refusals are mapped here for every subcommand
+        return {"prune": cmd_disk_prune, "reclaim-worktrees": cmd_disk_reclaim_worktrees, "register-worktree": cmd_disk_register_worktree}[args.disk_action](args, runner, now)
     except (LaunchError, ConfigError, CallerError, LockError) as err:
         sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err))))
         return EXIT_ERROR
