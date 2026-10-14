@@ -155,6 +155,23 @@ def load_report_fold():
     return module
 
 
+def load_pr_events():
+    """The webhook-event rule for `pr-state`, bin/pr_events.py (#354), loaded by path like plan_check."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pr_events.py")
+    held = sys.modules.get("pr_events")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("pr_events", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["pr_events"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("pr_events", None)
+        raise
+    return module
+
+
 def load_disk_janitor():
     """The temp-directory janitor, bin/disk_janitor.py (#321), loaded by path like plan_check."""
     path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "disk_janitor.py")
@@ -324,6 +341,26 @@ def load_triage_digest():
 
 triage_digest = load_triage_digest()
 
+
+def load_dead_hint():
+    """The DEAD agent's hint, bin/dead_hint.py (#379), loaded by path like the others."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "dead_hint.py")
+    held = sys.modules.get("dead_hint")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("dead_hint", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["dead_hint"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("dead_hint", None)
+        raise
+    return module
+
+
+dead_hint = load_dead_hint()
+
 VERSION = "0.1.0"
 PROG = "fleet-switchboard"
 
@@ -431,7 +468,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "temp_janitor", "load_alert"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "temp_janitor", "load_alert"}
 
 
 def config_known_keys():
@@ -525,6 +562,7 @@ def validate_config(raw, source="config"):
     validate_load_alert_config(config, source)
     validate_worktree_config(config, source)
     validate_orphan_config(config, source)
+    validate_order_burst(config, source)
     try:
         load_disk_janitor().validate(config.get("temp_janitor"), source)
     except ValueError as err:
@@ -5736,6 +5774,9 @@ class PaneFacts:
             word = "DETACHED" if info["state"] == PANE_DETACHED else "DEAD"
             summary = ("%s is %s: pane %s, session %s (%s). Repair it with `%s reattach %s`; if the session is gone, `relaunch` is the next step."
                        % (name, word, info.get("pane"), info.get("session"), _one_line(info.get("why"), 120), PROG, name))
+            if info["state"] == PANE_DEAD:   # #379: what is known of it, and what to do (best effort: the hint is read-only, bounded and total on any file content)
+                summary += " " + dead_hint.hint(name, _read_small(engine.state_dir, LAST_REPORT_FILE).get(name), engine.now(),
+                                                boss_name(discovery, discovery.agents.get(name)) if name in discovery.agents else None) + "."
             for chief in chiefs:
                 if chief != name:
                     out.append(Fact("pane:%s:%s:%s" % (name, info["state"], info.get("session")), chief, "pane", summary,
@@ -5751,12 +5792,14 @@ def pane_health_status_lines(state_dir, now=None):
     retired = read_retired(state_dir)
     bad = [(n, v) for n, v in sorted(data["states"].items()) if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n not in retired]
     clock = time.time() if now is None else now
+    last = _read_small(state_dir, LAST_REPORT_FILE)
     gone = [n for n, v in sorted(retired.items()) if clock - (v.get("at") or 0) <= RETIRED_SHOW_DAYS * 86400]
     tail = (["      retired    %d finished worker(s), not watched: %s (`%s retire --undo <name>` reverses)" % (len(gone), ", ".join(gone[:8]), PROG)] if gone else [])
     if not bad:
         return tail
     return ["      panes      %d agent(s) need repair: %s" % (len(bad), "; ".join("%s %s (pane %s)" % (n, v["state"].upper(), v.get("pane")) for n, v in bad[:6]))
-            ] + ["        run `%s reattach <name>`" % PROG] + tail
+            ] + ["        run `%s reattach <name>`" % PROG] + [
+        "        %s: %s" % (_one_line(n, 60), dead_hint.hint(n, last.get(n), clock)) for n, v in bad[:6] if v.get("state") == PANE_DEAD] + tail
 
 
 def charter_pane_update(engine, runner, fleet, new_pane):
@@ -8687,7 +8730,7 @@ def decisions_from_notices(engine, now):
             continue   # it was last seen open a while ago and cannot be confirmed now: a row derived from OPEN state is not listed (the notice stays)
         tag = repo if len(in_play) > 1 else repo.split("/")[-1]
         entry = decision_core.notice_entry(repo, number, tag, facts or {}, held["stale"], item.get("from"),
-                                           item["created"], item.get("note"), hold)
+                                           item["created"], item.get("note"), hold, engine.config.get("intent_repo"))
         evidence = captain_evidence(facts, set(notice_senders(item))) if facts and facts.get("captain") else []
         if evidence == [] and now - item["created"] >= CAPTAIN_NO_REVIEW_SECONDS:
             pass  # nothing stalls silently: the notice's own clock (a new head does not restart it) lists it
@@ -8830,20 +8873,72 @@ def record_order_notice(state_dir, repo, charter, action, text, caller, ordered_
     return item
 
 
-def ack_order_notice(state_dir, ident):
-    """Drop one heads-up; True when it was there."""
+def ack_order_notice(state_dir, ident, window=None, now=None):
+    """Drop one heads-up, or a whole burst when `ident` is a group id (`<first id>+<count>`). Returns True when something was dropped, False when
+    nothing matched, and the string `changed:<n>` when the burst the id names now has n members (not `count`): nothing is dropped, so an order that
+    joined after the owner saw the row is never dropped unseen. Groups are made the way the panel's rows are: from the unexpired orders only and
+    with the same window. An old single id still drops just that one."""
     with order_notices_lock(state_dir):
         items = read_order_notices(state_dir)
-        kept = [i for i in items if i["id"] != ident]
+        gone = {ident}
+        m = _GROUP_ID.match(ident)
+        if m and not any(i["id"] == ident for i in items):
+            live = [i for i in items if (now if now is not None else time.time()) - i["created"] < ORDER_NOTICE_TTL_SECONDS]
+            for group in order_groups(live, ORDER_BURST_MINUTES * 60 if window is None else window):
+                if group[0]["id"] == m.group(1):
+                    if len(group) != int(m.group(2)):
+                        return "changed:%d" % len(group)
+                    gone = {g["id"] for g in group}
+                    break
+        kept = [i for i in items if i["id"] not in gone]
         if len(kept) == len(items):
             return False
         write_order_notices(state_dir, kept)
     return True
 
 
+ORDER_BURST_MINUTES = 10   # orders of the same action by the same actor on the same charter within this many minutes of the first are ONE heads-up
+_GROUP_ID = re.compile(r"^(order:.+)\+([0-9]+)$")
+
+
+def order_burst_seconds(config):
+    value = (config or {}).get("order_notice_burst_minutes", ORDER_BURST_MINUTES)
+    return 0 if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0 else int(value * 60)
+
+
+def validate_order_burst(config, source):
+    raw = config.get("order_notice_burst_minutes")
+    if raw is not None and (isinstance(raw, bool) or not isinstance(raw, (int, float)) or not 0 <= raw <= 1440):
+        raise ConfigError("%s: 'order_notice_burst_minutes' must be a number of minutes from 0 (no grouping) to 1440, got %r" % (source, raw))
+
+
+def order_groups(items, window):
+    """[[item, ...]] oldest first: consecutive orders of the same action by the same actor on the same charter, each within `window` seconds of the
+    FIRST of its group, form one group (a window of 0 groups nothing)."""
+    groups, open_by_key = [], {}
+    for item in sorted(items, key=lambda i: (i["created"], i["id"])):
+        key = (item["repo"], item["charter"], item.get("action"), item.get("from"))
+        group = open_by_key.get(key)
+        if window > 0 and group is not None and item["created"] - group[0]["created"] <= window:
+            group.append(item)
+        else:
+            group = [item]
+            open_by_key[key] = group
+            groups.append(group)
+    return groups
+
+
+def order_group_id(group):
+    return group[0]["id"] if len(group) == 1 else "%s+%d" % (group[0]["id"], len(group))
+
+
 def decisions_from_order_notices(engine, now):
     """(entries, problems): each unexpired order heads-up as an entry of kind `notice` (tier `human`, id `order:<repo>#N.<time>`):
-    information for the owner, never a decision, never counted. Read-only: an expired one is only left out here."""
+    information for the owner, never a decision, never counted. Read-only: an expired one is only left out here.
+
+    The headline LEADS WITH WHAT DIFFERS (`<repo>#<charter> order +: <text> (cos)`, `+` added, `-` removed), so the number is never what a narrow
+    row cuts; the text is. A burst (orders of one action by one actor on one charter within `order_notice_burst_minutes`) is ONE entry,
+    `<repo>#<charter>: 19 orders added by cos: <first words>`, whose id is the first id plus the count and whose note lists the member ids."""
     state_dir = getattr(engine, "state_dir", None)
     if state_dir is None:
         return [], []
@@ -8851,20 +8946,27 @@ def decisions_from_order_notices(engine, now):
         items = read_order_notices(state_dir)
     except NoticeError as err:
         return [], [str(err)]
+    window = order_burst_seconds(getattr(engine, "config", None))
+    live = [i for i in items if now - i["created"] < ORDER_NOTICE_TTL_SECONDS]
     entries = []
-    for item in items:
-        if now - item["created"] >= ORDER_NOTICE_TTL_SECONDS:
-            continue
-        what = "added" if item.get("action") == "add" else "removed"
-        headline = decision_core.fit_lines("order %s by cos on %s#%d: %s" % (
-            what, item["repo"].split("/")[-1], item["charter"], item.get("text") or ""))
-        entries.append({"id": item["id"], "title": decision_core.line_of(headline, decision_core.DECISION_TITLE_MAX),
-                        "headline": headline, "ask": None, "repo": item["repo"], "agent": item.get("from"),
-                        "kind": "notice", "tier": "human", "since": iso(item["created"]), "number": item["charter"],
-                        "url": "https://github.com/%s/issues/%d" % (item["repo"], item["charter"]),
+    for group in order_groups(live, window):
+        first = group[0]
+        short, sign = first["repo"].split("/")[-1], "+" if first.get("action") == "add" else "-"
+        who = first.get("from") or "cos"
+        text = first.get("text") or ""
+        if len(group) == 1:
+            headline = decision_core.fit_lines("%s#%d order %s: %s (%s)" % (short, first["charter"], sign, text, who))
+            note = "not ack'd: `%s notice ack %s` drops it" % (PROG, first["id"])
+        else:
+            word = "added" if sign == "+" else "removed"
+            headline = decision_core.fit_lines("%s#%d: %d orders %s by %s: %s" % (short, first["charter"], len(group), word, who, text))
+            note = "not ack'd: `%s notice ack %s` drops all %d (members: %s)" % (PROG, order_group_id(group), len(group), ", ".join(g["id"] for g in group))
+        entries.append({"id": order_group_id(group), "title": decision_core.line_of(headline, decision_core.DECISION_TITLE_MAX),
+                        "headline": headline, "ask": None, "repo": first["repo"], "agent": first.get("from"),
+                        "kind": "notice", "tier": "human", "since": iso(first["created"]), "number": first["charter"],
+                        "url": "https://github.com/%s/issues/%d" % (first["repo"], first["charter"]),
                         "state": None, "additions": None, "deletions": None, "files": None, "ci": None,
-                        "review": None, "stale": False, "note": "not ack'd: `%s notice ack %s` drops it" % (PROG, item["id"]),
-                        "merge_after": None})
+                        "review": None, "stale": False, "note": note, "merge_after": None})
     return entries, []
 
 
@@ -9489,6 +9591,10 @@ def publish_decisions(engine):
         triage_pass(engine, decisions, now, errors)  # #130: audits and counts; writes nothing to GitHub; never raises
     except Exception as err:
         engine._note("triage.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+    try:
+        pr_events_pass(engine, now)   # #354: folds the webhook events into the pr-state picture and writes it, for watched repos too; no GitHub call
+    except Exception as err:
+        engine._note("pr_state.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
     try:
         ci_record_pass(engine, now)   # #107: records ci verdicts for open PRs under a plan; reads GitHub, writes only the ledger and audit
     except Exception as err:
@@ -12419,6 +12525,7 @@ class GitHubHub:
         self.engine = None
         self.intent_verdicts = {}  # intent.edit key -> (wakes the Chief of Staff, why): decided once per edit
         self.intent_edits = {}  # intent.edit key -> the `issues` payload, until delivered (PR 6's item, wired here)
+        self.pr_events = {}     # #354: "owner/repo#N" -> the `pr-state` entry the last verified pull_request event made (memory only; the pass folds it in)
         self.awaiting = {}      # PR 14: (repo, number) -> {"title", "since", "parent"} of an open issue with the label
         self.awaiting_read = {}  # PR 14: repo -> None (read fine) or the error of the last labelled read; absent: never
 
@@ -12587,6 +12694,7 @@ class GitHubHub:
             load_fleet_health().append_moves(self.state_dir, load_fleet_health().move_rows(event, payload, repo, self.now(), closing_numbers))
         except Exception as err:   # the load figure then under-counts movement: say so in the audit, never fail the delivery
             self._audit("load.moves_failed", repo, {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
+        self.note_pr_event(event, repo, payload)
         self._audit("github.received", repo, {"event": event, "delivery": _header(headers, "X-GitHub-Delivery"),
                                               "keys": [_one_line(item.key, 80) for item in items[:5]], "count": len(items)})   # ids, not bodies: the first few of them
         return 202, "accepted"
@@ -12990,6 +13098,25 @@ class GitHubHub:
                                       "raised_by": raised if rows else None, "closed": closed, "waits_for": waits}
             else:
                 self.awaiting.pop(key, None)
+
+    def note_pr_event(self, event, repo, payload):
+        """A verified `pull_request` event: keep the entry for its PR in memory, with no read at all (#354). Never raises: a bad payload is not kept."""
+        try:
+            number = (payload.get("pull_request") or {}).get("number") if isinstance(payload, dict) else None
+            ref = "%s#%s" % (plan_ledger.normal_repo(repo), number)
+            with self.lock:
+                made = load_pr_events().entry_for(self.pr_events.get(ref), event, payload, self.now())
+                if made is not None:
+                    self.pr_events[ref] = made[1]
+                    while len(self.pr_events) > PR_STATE_MAX:
+                        self.pr_events.pop(min(self.pr_events, key=lambda r: self.pr_events[r].get("at", 0)))
+        except Exception as err:
+            self._audit("github.rejected", repo, {"reason": "pull_request event not kept: %s" % _one_line(str(err))})
+
+    def pr_event_snapshot(self):
+        """A copy of the entries the events made, for the pass that folds them into the picture."""
+        with self.lock:
+            return {ref: dict(entry) for ref, entry in self.pr_events.items()}
 
     def note_awaiting_event(self, event, repo, payload):
         """A webhook event that carries an issue: keep the picture current with no read at all."""
@@ -14403,9 +14530,13 @@ def _notice_ack(args, engine, state):
         if caller is not None:
             sys.stderr.write("%s: only the owner, in a plain shell, acks a heads-up; %s is a fleet agent\n" % (PROG, caller))
             return EXIT_USAGE
-        found = ack_order_notice(state, args.pr)
+        found = ack_order_notice(state, args.pr, order_burst_seconds(engine.config), engine.now())
     except (NoticeError, OSError) as err:
         sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 400)))
+        return EXIT_USAGE
+    if isinstance(found, str) and found.startswith("changed:"):
+        sys.stderr.write("%s: heads-up %s changed since it was shown (it now holds %s orders): nothing was dropped; ack the row as it reads now\n"
+                         % (PROG, args.pr, found.split(":", 1)[1]))
         return EXIT_USAGE
     if engine.audit is not None and found:
         engine.audit.append(engine.actor, "notice.ack", args.pr, {})
@@ -15584,7 +15715,29 @@ def cmd_plan_check(args, runner, now):
     except (PlanInputError, ValueError, ConfigError, IntentError) as err:
         return finish(EXIT_USAGE, {"result": "error", "error": _one_line(str(err), 300)}, [], _one_line(str(err), 300))
     result["source"] = source
-    return finish(EXIT_OK if result["result"] == "pass" else EXIT_ERROR, result, plan_check.render(result, source))
+    return finish(EXIT_OK if result["result"] == "pass" else EXIT_ERROR, result, plan_check.render(result, source, explaining=getattr(args, "explain", False)))
+
+
+def cmd_plan_template(args, runner, now):
+    """`plan template <ask>` (or `--done-when TEXT`): print a prefilled plan for the ask: its Done-when clauses numbered and one scenario stub
+    per clause. Reads only (a GET of the ask); never writes GitHub. Exit 0, or 2 when the ask or its Done-when cannot be read."""
+    try:
+        done_when, source = args.done_when, None
+        if not done_when:
+            if not args.ask:
+                raise PlanInputError("give the ask (owner/repo#N) or --done-when TEXT")
+            config = load_config()
+            repo, number, _ = parse_plan_source(args.ask, config.get("intent_repo"))
+            reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"], accounts=GhAccounts(config, runner, now))
+            done_when, source = reader.issue(number, repo).done_when, "%s#%d" % (repo, number)
+        clauses = plan_check.clauses_of(done_when)
+        if not (done_when or "").strip() or not clauses:
+            raise PlanInputError("the ask has no Done-when line: nothing to prefill (write the plan by hand, or add the Done-when first)")
+    except (PlanInputError, ValueError, ConfigError, IntentError) as err:
+        sys.stderr.write("%s: plan template: %s\n" % (PROG, _one_line(str(err), 300)))
+        return EXIT_USAGE
+    print("\n".join(plan_check.template(clauses, _plain(source, 120) if source else None)))
+    return EXIT_OK
 
 
 # ---------------------------------------------------------------- `plan review` (#109 part 2, slice R2)
@@ -17728,6 +17881,17 @@ PR_STATE_MAX = 400          # PRs kept in the file: the most recently seen
 PR_STATE_WRITE_GAP = 20     # seconds between writes of the file (unless something changed enough to matter: the pass always writes the first)
 
 
+def pr_events_pass(engine, now):
+    """Fold the entries the hub's verified pull_request events made into the picture and leave it for `pr-state`; a repo that is only watched (not under
+    `plan_gates`) is known from the moment a PR opens (#354). Reads nothing from GitHub; never raises into the pass."""
+    hub = getattr(engine, "hub", None)
+    if hub is None or engine.state_dir is None or not hasattr(hub, "pr_event_snapshot"):
+        return
+    state = engine.__dict__.setdefault("ci_record_state", CiRecordState())
+    load_pr_events().fold(state.pr_state, hub.pr_event_snapshot(), PR_STATE_MAX)
+    write_pr_state(engine, state, now)
+
+
 def pr_state_from_lists(state, repos):
     """The base entry of every open PR the pass's lists hold (head, draft, labels, when the list was read); a PR that left the list since is marked so."""
     for repo in repos:
@@ -17740,6 +17904,8 @@ def pr_state_from_lists(state, repos):
                 continue
             ref = "%s#%d" % (key, number)
             seen.add(ref)
+            if (state.pr_state.get(ref) or {}).get("via") == "event" and state.pr_state[ref].get("at", 0) > at:
+                continue   # #354: a webhook event newer than this list read is fresher than the list
             head = (record.get("head") or {}).get("sha") if isinstance(record.get("head"), dict) else None
             labels = sorted(_plain(name, 60) for name in ((l.get("name") if isinstance(l, dict) else l) for l in (record.get("labels") if isinstance(record.get("labels"), list) else [])[:20]) if isinstance(name, str) and name)   # label names are GitHub's, set by anyone who can label: one line, no control characters, bounded
             old = state.pr_state.get(ref) or {}
@@ -19540,6 +19706,10 @@ def add_plan_parsers(sub):
     check.add_argument("--ask", help="The ask whose Done-when to cover when the plan issue has none of its own")
     check.add_argument("--done-when", dest="done_when", help="The Done-when line to cover (overrides the issue's)")
     check.add_argument("--json", action="store_true", help="Machine-readable result")
+    check.add_argument("--explain", action="store_true", help="After each defect (and warning) say the rule it breaks and how to fix it")
+    template = plan_sub.add_parser("template", help="Print a prefilled plan for an ask: its Done-when clauses and one scenario stub per clause (read-only)")
+    template.add_argument("ask", nargs="?", help="owner/repo#N, an issue URL, or N with intent_repo set: the ask whose Done-when to prefill")
+    template.add_argument("--done-when", dest="done_when", help="The Done-when line to prefill from, instead of reading the ask")
     review = plan_sub.add_parser("review", help="The plan review engine (off unless plan_review.enabled): adversarial lanes, at most 3 rounds")
     review_sub = review.add_subparsers(dest="review_action", required=True)
     start = review_sub.add_parser("start", help="Open a review of a plan for its ask and launch the lanes")
@@ -22300,6 +22470,8 @@ def cmd_plan(args, runner, now, socket_call=None):
     """`plan check` (the default) or `plan review` (#109 part 2: writes the ledger and launches lanes; off unless plan_review.enabled)."""
     if args.plan_action == "review":
         return cmd_plan_review(args, runner, now, socket_call)
+    if args.plan_action == "template":
+        return cmd_plan_template(args, runner, now)
     return cmd_plan_check(args, runner, now)
 
 

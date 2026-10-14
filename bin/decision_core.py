@@ -657,11 +657,13 @@ def build_entries(items, ids, home, known_title, tier_flat=False, known_parent=N
     return decisions
 
 
-def notice_entry(repo, number, tag, facts, stale, sender, created, note, hold_minutes):
+def notice_entry(repo, number, tag, facts, stale, sender, created, note, hold_minutes, default_repo=None):
     """The entry of a recorded PR notice (kind `notice`, tier `human`, id `pr:<tag>#N`): information, not a
     decision. `facts` is what `gh pr view` said (or {}), `stale` that it could not be read now, `created` the
     notice's epoch time, `hold_minutes` the merge hold (0 for none)."""
-    headline = fit_lines(" ".join(("%s#%d" % (tag, number), facts.get("title") or "")).strip())
+    # with a default repo configured the headline leads with `#N` (the repo's short name only when it is NOT the default), so what differs is first
+    lead = "%s#%d" % (tag, number) if not default_repo else ("#%d" % number if repo == default_repo else "%s#%d" % (repo.split("/")[-1], number))
+    headline = fit_lines(" ".join((lead, facts.get("title") or "")).strip())
     return {"id": "pr:%s#%d" % (tag, number), "title": line_of(headline, DECISION_TITLE_MAX),
             "headline": headline, "ask": None, "repo": repo, "agent": sender, "kind": "notice",
             "tier": "human", "since": iso(created), "number": number,
