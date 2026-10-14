@@ -41,11 +41,11 @@ scan that fails the image build when any stored credential, host key or build us
 Owned by the switchboard (slice C), in its state directory, mode 0600 (a JSON file per worker, path built only from the validated worker name). Slice B never touches the file: `create`, `extend`, `stop` and `delete` print their result and C applies it to the record. The record's deadlines are the source of truth; the pod's `FLEET_HARD_DEADLINE` is its start-time copy and the reaper re-reads the record.
 
 ```json
-{"worker": "coder7", "url": "https://worker-coder7.example.internal:4096", "auth_ref": "file:/run/fleet/coder7.password",
+{"worker": "coder7", "url": "https://worker-coder7.example.internal:4096", "auth_ref": "file:<state>/cloud/coder7.password",
  "runtime_id": "pod/coder7-7f9c", "idle_deadline": "2026-10-14T12:10:00Z", "hard_deadline": "2026-10-14T14:00:00Z"}
 ```
 
-`auth_ref` names where the switchboard host keeps its own copy of the password (a file path, never taken from caller input, mode 0600: it protects only against other local users); the record never holds it. The pod's copy (`/run/fleet/server-password`) is a separate file on the pod side. `create` returns the password once, on a file descriptor named in its output, for C to store. C creates the record from `create`'s output and removes it after `stop` or `delete`.
+`auth_ref` names where the switchboard host keeps its own copy of the password (a file path the switchboard chooses itself under its state directory; whatever the launcher prints for it is ignored; it is never taken from caller input, mode 0600: it protects only against other local users); the record never holds it. The pod's copy (`/run/fleet/server-password`) is a separate file on the pod side. `create` returns the password once, on a file descriptor named in its output, for C to store. C creates the record from `create`'s output and removes it after `stop` or `delete`.
 
 | Switchboard verb | On a cloud worker |
 |---|---|

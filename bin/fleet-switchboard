@@ -13738,7 +13738,10 @@ def format_status(report):
 
 def cmd_status(args, runner=subprocess.run, now=time.time):
     report = collect_status(runner, now)
-    cloud_lines, cloud_rows = cloud().status_extra(runner)   # cloud workers (#371): nothing when there are none
+    try:
+        cloud_lines, cloud_rows = cloud().status_extra(runner)   # cloud workers (#371): nothing when there are none
+    except Exception as err:   # the module missing or broken must not take `status` down for a local-only fleet
+        cloud_lines, cloud_rows = ["      cloud workers: unavailable (%s)" % _one_line(str(err), 100)], []
     if cloud_rows:
         report["cloud"] = cloud_rows
     if args.json:
