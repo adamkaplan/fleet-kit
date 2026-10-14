@@ -4049,6 +4049,14 @@ names, for example `{"reviewer": ["reviewer-1"], "tester": ["tester-1"]}`. An ev
 for, which keeps a fresh install from accepting verdicts nobody was trusted to give. The **writers** of a PR are the author GitHub reports for it, anyone who recorded a proof for it, and the sender of its `notice pr`; a verdict is refused until at least one writer is known, so a writer that declared nothing cannot be its own evaluator; an author's verdict is refused when recorded, and ignored by `gates` if it is
 in the file anyway. The caller's identity is the session-based one, a guard against mistakes: it does not stop an agent that sets another agent's session variable. `verdict` requires `--evidence` like `prove`, and `--head` must be the PR's head. A scenario that still names the old personal evaluator spelling is judged by `owner`.
 
+**Testers from the launch record (#372).** The `tester` list is the configured one PLUS every running agent whose launch record (`launch --role tester`, kept in
+its session's fleet metadata) says: role `tester`, the PR's repo, and a boss whose own record is `orchestrator` for that same repo; a retired tester does not
+count. So a tester launched by a repo's orchestrator may record tester verdicts for that repo and no other. This widens who can record a verdict, and only
+for `tester`: `reviewer`, `ci` and `owner` never come from a launch record. A tester is independent when it is not a writer of the PR, runs in the session of no
+writer, and is a different agent from every coder launched on its work item; otherwise the verdict is refused. Each verdict a launched tester records is
+audited with the launch record it relied on (`launch_record` in `plan.verdict`), and `status` lists the resolved testers with their source (`config` or
+`launch record`). The rules are `bin/launch_testers.py`.
+
 **`gates`** prints one line per gate G0a to G8 with its status (`ok`, `missing`, `waiting`, `untracked`, `n/a`), who decides
 it, and what is missing, and exits 0 when every gate it tracks and that applies to a PR is satisfied, 1 when something is
 missing, 2 when it cannot run. Tracked now: **G0a** (the plan passes `plan check`), **G1** (every per-PR scenario has a passing
