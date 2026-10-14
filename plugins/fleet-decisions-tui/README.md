@@ -67,3 +67,25 @@ a terminal wide enough to show it.
 `bin/test-switchboard` with node. `tui.tsx` is the thin layer over them and is checked in the Lab.
 
 A `MERGE: captain` PR row is linked and named like an issue row: it links to its pull request (built from its repo and number with the same checks as an issue link) and shows the short ref `repo#N` (the repo's full name when another repo shares the short one), never the internal key `pr:org/repo#N`, so its age stays on the line.
+
+## The workspace health block (ask #357)
+
+Above the Decisions rows, one dense block per workspace that has an orchestrator (or the Chief of Staff), hottest first, two lines each:
+
+```
+●! alpha     work ▁▂▃▄▅▆▇█▇▆▅▄▃▂▁≈
+▁▂▃▅▂▇▄█ q6 s3 d1 c2/3 p2 ctx45%
+```
+
+- **Line 1:** a state dot and word (`work`, `idle`, `wait` for owner, `dead`, `?` when it cannot be told), `!` when the load alert (#348) is on for it,
+  the name, and the tool calls per minute over 15 minutes as a sparkline (`≈`: approximate, permission evaluations).
+- **Line 2:** asks moved per hour so far today (UTC; `·` is an hour with no record), then `q` open asks, `s` stalled over 2 h, `d` decisions waiting on it,
+  `c` coders busy/total, `p` pushes this hour, `ctx` context use. A figure whose source is missing, unreadable or too old reads `not recorded`, never 0.
+  A line is cut at 34 characters, so a row with several missing figures shows the first ones.
+- **Sources (all read from the state directory; nothing polled, nothing spawned):** `health-records.json` (bin/health_records.py: tool calls, tokens, context,
+  pushes), `load.json` (the load alert's figures and today's hourly series), `pane-health.json` (which agents sit in which workspace, and whether the pane
+  is alive) and `decisions.json` (what waits on the person). Hottest = alert, then stalled asks, open asks, recent tool calls.
+- **The producers are separate changes:** `bin/health_records.py` (#373) and the load alert's `load.json` (#348) land on their own; until they do, the figures they carry read `not recorded`.
+- **Not drawn:** a workspace with no orchestrator; the whole block when none of those files can be read. `FLEET_SWITCHBOARD_HEALTH=off` hides it.
+  A fault while drawing it draws nothing: the Decisions never depend on it. It is a separate file (`health.mjs`) that the installer copies with the other two.
+- Tests: `node --test plugins/fleet-decisions-tui/health.test.mjs`.
