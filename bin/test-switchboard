@@ -5272,13 +5272,25 @@ class TestLaunch(Base):
         self.assertEqual(self.world.herdr.closed, [])
         self.assertEqual(err.count("no longer holds worker's session"), 1, err)
         self.assertNotIn("worker", sb.read_retired(self.world.state), "a refused close retires nothing")
+        (row,) = self.close_audit("fleetpane.close_refused")
+        self.assertEqual((row["subject"], row["detail"]["pane"]), ("worker", stale))
+        self.assertIn("no longer holds", row["detail"]["why"])
 
     def test_retire_close_never_closes_the_callers_own_pane_or_its_own_agent(self):
         self.close_world()
+        engine = self.world.new_engine("cli")
+        discovery = engine.discover(self.world.clock.now())
+        worker = discovery.agents["worker"]
+        with mock.patch.object(sb, "gates_caller_kind", return_value=("agent", "worker", "coder")):       # an agent naming ITSELF
+            pane, why = sb.retire_close_problem(engine, subprocess.run, self.world.clock.now, discovery, "worker", worker, False)
+        self.assertEqual((pane, why), (None, "an agent cannot close its own pane"))
+        with mock.patch.object(sb, "gates_caller_kind", return_value=("person", "the operator")), mock.patch.dict(os.environ, {"HERDR_PANE_ID": worker.pane}):
+            pane, why = sb.retire_close_problem(engine, subprocess.run, self.world.clock.now, discovery, "worker", worker, False)
+        self.assertEqual(pane, None)
+        self.assertIn("the one you are in", why)
         self.as_("worker")
         code, out, err = self.run_cli("retire", "worker", "--close")
-        self.assertEqual(code, 1)
-        self.assertEqual(self.world.herdr.closed, [])
+        self.assertEqual((code, self.world.herdr.closed), (1, []))
         self.world.add_agent("boss2", fleet={"role": "orchestrator"})
         self.world.add_agent("kid", fleet={"role": "coder", "reports_to": "boss2"})
         self.world.herdr.panes[self.world.panes["kid"]]["status"] = "idle"
@@ -5289,6 +5301,33 @@ class TestLaunch(Base):
         os.environ.pop(sb.SESSION_ENV, None)
         self.assertEqual((code, self.world.herdr.closed), (1, []))
         self.assertIn("the one you are in", err)
+        self.assertEqual(len(self.close_audit("fleetpane.close_refused")), 1)
+
+    def test_a_blocked_agent_needs_force_and_the_close_judges_everything_again_just_before_closing(self):
+        self.close_world(status="blocked")
+        self.as_("boss")
+        code, out, err = self.run_cli("retire", "worker", "--close")
+        self.assertEqual((code, self.world.herdr.closed), (1, []))
+        self.assertIn("is blocked: pass --force", err)
+        self.assertEqual(len(self.close_audit("fleetpane.close_refused")), 1)
+        self.world.herdr.panes[self.world.panes["worker"]]["status"] = "idle"
+        real = sb.retire_close_problem
+        calls = []
+
+        def second_look_finds_it_working(engine, runner, now, discovery, name, seen, force):
+            calls.append(1)
+            if len(calls) == 2:                                           # the agent resumed work after the first judgment
+                self.world.herdr.panes[self.world.panes["worker"]]["status"] = "working"
+            return real(engine, runner, now, discovery, name, seen, force)
+
+        with mock.patch.object(sb, "retire_close_problem", second_look_finds_it_working):
+            code, out, err = self.run_cli("retire", "worker", "--close")
+        self.assertEqual(len(calls), 2, "judged before the retirement and again just before the close")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.world.herdr.closed, [], "it was working at the second look: not closed")
+        self.assertIn("was not closed", out)
+        self.assertIn("worker", sb.read_retired(self.world.state))
+        self.assertEqual(len(self.close_audit("fleetpane.close_failed")), 1)
 
     def test_retire_close_is_refused_for_a_stranger_audited_and_allowed_for_the_boss_cos_for_a_direct_report_and_the_operator(self):
         self.close_world()
@@ -5302,8 +5341,7 @@ class TestLaunch(Base):
         self.as_("stranger")
         code, out, err = self.run_cli("retire", "worker", "--close")
         self.assertEqual((code, self.world.herdr.closed), (1, []))
-        self.assertEqual(len(self.close_audit("fleetpane.close_refused")), 0)      # refused by the retire caller rule first (its own audit line)
-        self.assertTrue([e for e in self.world.audit() if e["event"] == "fleetpane.retire_refused"])
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "fleetpane.retire_refused"], "a stranger is refused by the retire caller rule, audited")
         self.as_("cos")
         code, out, err = self.run_cli("retire", "deep", "--close")               # cos is not deep's boss: a retire is allowed, a close is not
         self.assertEqual((code, self.world.herdr.closed), (1, []), err)
@@ -5330,6 +5368,7 @@ class TestLaunch(Base):
         code, out, err = self.run_cli("retire", "worker", "--close", "--force")
         self.assertEqual((code, self.world.herdr.closed), (1, []), "unpushed work: --force refused")
         self.assertIn("unpushed", err)
+        self.assertEqual(len(self.close_audit("fleetpane.close_refused")), 2)
         clean = self.add_worktree("w-clean-close")
         sb._write_small(self.world.state, sb.WORKTREES_FILE, {str(clean): {"agent": "worker", "repo": None, "branch": "w-clean-close", "created": 1}})
         code, out, err = self.run_cli("retire", "worker", "--close", "--force")

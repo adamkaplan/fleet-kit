@@ -6229,8 +6229,8 @@ def retire_close_problem(engine, runner, now, discovery, name, seen, force):
             return None, "%s may not close %s's pane: only the operator, or the agent's own boss (the Chief of Staff for a direct report), may" % (who, name)
     else:
         return None, "%s: only the operator or the agent's own boss may close a pane" % kind[1]
-    if seen is None or not seen.pane:
-        return None, "%s has no pane the switchboard can see: nothing to close" % name
+    if seen is None or not seen.pane or not seen.session_id:
+        return None, "%s has no pane and session the switchboard can see: nothing to close" % name
     pane = seen.pane
     if os.environ.get("HERDR_PANE_ID") == pane:
         return None, "pane %s is the one you are in: never closed by you" % pane
@@ -6251,13 +6251,17 @@ def retire_close_problem(engine, runner, now, discovery, name, seen, force):
     return pane, None
 
 
-def retire_close_pane(engine, name, pane, session_id, caller):
-    """Close `pane` after one more live look (the first was before the retirement): audited whether it closes or not. (status line, ok)"""
+def retire_close_pane(engine, runner, now, name, pane, caller, force):
+    """Close `pane` after judging EVERYTHING again from a fresh discovery (the first judgment was before the retirement lock and the worktree reclaim):
+    who may, which pane, its session, its status and the worktree guard. Audited whether it closes or not. (status line, ok)"""
     detail = {"pane": pane, "by": caller}
     try:
-        live = engine.herdr.agent_get(pane)
-        if agent_session(live) != session_id:
-            raise HerdrError("moved", "pane %s no longer holds the agent's session" % pane)
+        fresh = engine.discover(engine.now())
+        again, why = retire_close_problem(engine, runner, now, fresh, name, fresh.agents.get(name), force)
+        if why:
+            raise HerdrError("refused", why)
+        if again != pane:
+            raise HerdrError("moved", "the agent's pane is now %s, not %s" % (again, pane))
         with engine._external("herdr.pane.close", name, {"pane": pane, "why": "retire --close"}):
             engine.herdr.pane_close(pane)
     except Exception as err:
@@ -6271,8 +6275,9 @@ def retire_close_pane(engine, name, pane, session_id, caller):
 
 def cmd_retire(args, runner, now):
     """`retire <name> [--reason TEXT]` / `retire --undo <name>`: a finished worker is RETIRED: the daemon stops reporting it DEAD or DETACHED, `reattach
-    --all-detached` skips it, and it is shown once in `status` as retired (dropped after RETIRED_SHOW_DAYS). Nothing is deleted and no tab is closed. The
-    caller rule is `reattach`'s: the operator, the Chief of Staff or the agent's own boss; others are refused and audited."""
+    --all-detached` skips it, and it is shown once in `status` as retired (dropped after RETIRED_SHOW_DAYS). Nothing is deleted and no tab is closed, unless
+    `--close` is given: then the agent's terminal PANE is closed too (see `retire_close_problem`). The caller rule is `reattach`'s: the operator, the
+    Chief of Staff or the agent's own boss; others are refused and audited."""
     engine, state, _ = build_engine(runner, now, "cli")
     name = args.name
     if not NAME_RE.match(name or ""):
@@ -6336,7 +6341,7 @@ def cmd_retire(args, runner, now):
     if engine.audit is not None:
         engine.audit.append(engine.actor, "fleetpane.retired", name, {"auto": False, "reason": retired[name]["reason"], "by": retired[name]["by"]})
     if close_pane is not None:
-        line, _ = retire_close_pane(engine, name, close_pane, seen.session_id, close_by)
+        line, _ = retire_close_pane(engine, runner, now, name, close_pane, close_by, getattr(args, "force", False))
         print("%s is retired: not watched, not reattached by --all-detached; %s (`%s retire --undo %s` reverses the retirement)" % (name, line, PROG, name))
     else:
         print("%s is retired: not watched, not reattached by --all-detached; nothing was deleted or closed (`%s retire --undo %s` reverses)" % (name, PROG, name))
