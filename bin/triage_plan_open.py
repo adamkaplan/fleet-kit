@@ -41,8 +41,7 @@ def merged_links(prs, repo):
         number = _number(record.get("number"))
         if number is None:
             continue
-        url = record.get("html_url")
-        url = url if isinstance(url, str) and url.startswith("https://github.com/") and len(url) < 200 else "https://github.com/%s/pull/%d" % (repo, number)
+        url = "https://github.com/%s/pull/%d" % (repo, number)   # rebuilt from what we know, never taken from the record (control characters, another host)
         by = ((record.get("user") or {}).get("login") or "") if isinstance(record.get("user"), dict) else ""
         for issue in references(record.get("body"), repo):
             old = links.get(issue)

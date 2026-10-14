@@ -18048,7 +18048,7 @@ class TestTriage(Base):
         self.assertEqual(row["detail"]["evidence"]["would_be"], ["T1", "T2", "T3"])
 
     def merged_pr(self, number, body, hours_ago=2.0, merged=True, author="bot"):
-        record = {"number": number, "body": body, "user": {"login": author}, "html_url": "https://github.com/acme/api/pull/%d" % number,
+        record = {"number": number, "body": body, "user": {"login": author}, "html_url": "https://evil.example/\x1b[31m%d" % number,
                   "merged_at": sb.iso(self.world.clock.now() - hours_ago * 3600) if merged else None, "state": "closed"}
         self.hub.pulls.setdefault("acme/api", []).append(record)
 
@@ -18063,8 +18063,20 @@ class TestTriage(Base):
         self.assertEqual((self.only("T1"), self.only("T11")), ([], []))
         row = [e for e in self.world.audit() if e["event"] == "triage.finding" and e["detail"]["ref"] == "acme/api#130" and e["detail"]["rule"] == "T12"][0]
         self.assertEqual((row["detail"]["what"], row["detail"]["evidence"]["pr"], row["detail"]["evidence"]["pr_url"]),
-                         ("plan issue still open after its PR merged", 200, "https://github.com/acme/api/pull/200"))
+                         ("plan issue still open after its PR merged", 200, "https://github.com/acme/api/pull/200"))   # the link is rebuilt, not the record's html_url
         self.assertFalse(row["detail"]["applied"])
+
+    def test_t12_is_ours_through_the_merged_prs_author_and_a_fresh_read_of_a_closed_issue_drops_it(self):
+        self.charter()
+        self.add(170, created=60, labels=["kind"], author="stranger")          # not assigned to us, not in a chain, opened by someone else
+        self.merged_pr(230, "PLAN: acme/api#170", author="bot")                # but the merged PR is ours
+        self.go(passes=1)
+        self.assertEqual(self.only("T12"), ["acme/api#170"])
+        self.assertNotIn(("OO", "acme/api#170"), self.found())
+        self.hub.live["acme/api"] = {170: dict(self.hub.open["acme/api"][170], state="closed")}   # a fresh read shows it closed since
+        self.world.tick(sb.TRIAGE_TTL + 5)
+        state = sb.triage_state(self.engine)
+        self.assertFalse(sb.triage_verify(self.engine, state, "T12", "acme/api#170", self.engine.config["triage"], self.world.clock.now(), [10]))
 
     def test_t12_no_finding_for_a_pr_closed_unmerged_a_closed_issue_or_another_repo(self):
         self.charter()
@@ -18095,7 +18107,7 @@ class TestTriage(Base):
         self.hub.calls.clear()
         self.world.tick(sb.TRIAGE_TTL + 5)
         self.go(passes=1, calls_per_pass=5)
-        self.assertLessEqual(len(self.hub.calls), 5 + 5)                  # the reads and fresh checks: never past the budget by more than the check reserve
+        self.assertLessEqual(len(self.hub.calls), 5)                      # the pass's budget of calls_per_pass: reads and fresh checks together
 
     def test_t12_the_reference_rules(self):
         refs = sb.load_triage_plan_open().references
