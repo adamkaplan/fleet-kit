@@ -20016,6 +20016,86 @@ class LedgerBase(Base):
             self.assertEqual(self.verdict(who, sid, ev)[0], 0, (who, sid))
 
 
+class TestLaunchTesters(LedgerBase):
+    """#372: a tester launched with --role tester for its orchestrator's repo may record tester verdicts, beside the configured list."""
+
+    def setUp(self):
+        super().setUp()
+        add = self.world.add_agent
+        add("orch", fleet={"role": "orchestrator", "repo": "acme/app", "issue": 7})
+        add("orch-web", fleet={"role": "orchestrator", "repo": "acme/web", "issue": 8})
+        add("ltst", fleet={"role": "tester", "repo": "acme/app", "reports_to": "orch", "issue": 7})
+        add("ltst-web", fleet={"role": "tester", "repo": "acme/web", "reports_to": "orch-web", "issue": 8})
+        add("ltst-nobody", fleet={"role": "tester", "repo": "acme/app", "reports_to": "coder", "issue": 7})
+        add("lrev", fleet={"role": "reviewer", "repo": "acme/app", "reports_to": "orch", "issue": 7})
+        self.configure(evaluators={"reviewer": ["rev"], "tester": ["tst"], "owner": ["own"], "ci": ["cibot"]})
+        self.assertEqual(self.prove("coder", "S2")[0], 0)
+
+    def test_launch_records_the_role_with_the_repo_and_the_boss(self):
+        record = sb.fleet_record("ltst", "tester", "orch", 7, None, "acme/app")
+        self.assertEqual((record["role"], record["repo"], record["reports_to"]), ("tester", "acme/app", "orch"))
+
+    def test_a_launched_tester_is_accepted_for_its_repo_and_refused_for_another(self):
+        self.assertEqual(self.verdict("ltst", "S2", "tester")[0], 0)
+        code, _, err = self.verdict("ltst-web", "S2", "tester")      # acme/web's tester on an acme/app PR
+        self.assertEqual(code, 2)
+        self.assertIn("not registered", err)
+        self.assertEqual([e["by"] for e in self.ledger() if e["kind"] == "verdict"], ["ltst"])
+
+    def test_a_tester_whose_boss_is_not_an_orchestrator_of_the_repo_is_refused(self):
+        for who in ("ltst-nobody", "lrev"):    # boss is a coder; or the role is reviewer
+            code, _, err = self.verdict(who, "S2", "tester")
+            self.assertEqual(code, 2, who)
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "verdict"], [])
+
+    def test_a_tester_that_proved_the_pr_is_refused_as_a_writer(self):
+        self.assertEqual(self.prove("ltst", "S1")[0], 0)
+        code, _, err = self.verdict("ltst", "S2", "tester")
+        self.assertEqual(code, 2)
+        self.assertIn("wrote this PR", err)
+
+    def test_a_launched_tester_is_never_a_reviewer_ci_or_owner(self):
+        for sid, evaluator in (("S3", "reviewer"), ("S1", "ci"), ("S2", "owner")):
+            code, _, err = self.verdict("ltst", sid, evaluator)
+            self.assertNotEqual(code, 0, evaluator)
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "verdict"], [])
+
+    def test_the_configured_tester_still_works_and_the_audit_names_the_record_only_for_a_launched_one(self):
+        self.assertEqual(self.verdict("tst", "S2", "tester")[0], 0)
+        self.assertEqual(self.verdict("ltst", "S2", "tester")[0], 0)
+        events = [e for e in self.world.audit() if e["event"] == "plan.verdict"]
+        configured, launched = [e["detail"] for e in events if e["detail"]["by"] == "tst"][0], [e["detail"] for e in events if e["detail"]["by"] == "ltst"][0]
+        self.assertNotIn("launch_record", configured)
+        self.assertEqual({k: launched["launch_record"][k] for k in ("name", "role", "repo", "reports_to")},
+                         {"name": "ltst", "role": "tester", "repo": "acme/app", "reports_to": "orch"})
+
+    def test_a_retired_tester_stops_counting_and_is_not_listed(self):
+        sb.write_retired = getattr(sb, "write_retired", None)
+        retired = {"ltst": {"at": 1, "by": "orch", "reason": "done", "session": self.world.sessions["ltst"], "auto": False}}
+        (self.world.state / sb.RETIRED_FILE).write_text(json.dumps(retired))
+        code, _, err = self.verdict("ltst", "S2", "tester")
+        self.assertEqual(code, 2)
+        self.assertEqual(sb.load_launch_testers().launched({"ltst": {"role": "tester", "repo": "acme/app", "reports_to": "orch"}, "orch": {"role": "orchestrator", "repo": "acme/app"}},
+                                                           {"ltst": self.world.sessions["ltst"]}, "acme/app", lambda f: f.get("repo"), retired), {})
+
+    def test_the_pure_rules_and_the_status_lines(self):
+        lt = sb.load_launch_testers()
+        fleets = {"orch": {"role": "orchestrator", "repo": "acme/app"}, "t1": {"role": "tester", "repo": "acme/app", "reports_to": "orch"},
+                  "t2": {"role": "tester", "repo": "acme/web", "reports_to": "orch"}}
+        repo_of = lambda f: f.get("repo")
+        self.assertEqual(sorted(lt.launched(fleets, {}, "acme/app", repo_of)), ["t1"])
+        self.assertEqual(lt.evaluators({"tester": ["tst"], "ci": ["bot"]}, {"t1": {}}), {"tester": ["tst", "t1"], "ci": ["bot"]})
+        self.assertEqual(lt.evaluators({"reviewer": ["r"]}, {}), {"reviewer": ["r"]})
+        self.assertIsNone(lt.lane_refusal("t1", {"t1": {}}, {"coder"}, {"t1": "s1", "coder": "s2"}))
+        coders = {"t1": {"role": "tester", "issue": 7}, "c1": {"role": "coder", "issue": 7}, "c2": {"role": "coder", "issue": 9}}
+        self.assertIn("not a different agent from c1", lt.lane_refusal("t1", {"t1": {}}, set(), {"t1": "s1", "c1": "s1"}, coders))
+        self.assertIsNone(lt.lane_refusal("t1", {"t1": {}}, set(), {"t1": "s1", "c2": "s1"}, coders))   # a coder of another work item
+        self.assertIn("session of a writer", lt.lane_refusal("t1", {"t1": {}}, {"coder"}, {"t1": "s1", "coder": "s1"}))
+        self.assertEqual(lt.status_lines({"tester": ["tst"]}, fleets, {}, {"acme/app"}, repo_of),
+                         ["      tester     tst: config (any repo)", "      tester     t1: launch record (acme/app)"])
+        self.assertEqual(lt.source_of("tst", {"tester": ["tst"]}, {"tst": {}}), "config")
+
+
 class TestPlanLedger(LedgerBase):
     # -- prove
 

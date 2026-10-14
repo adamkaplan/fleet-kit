@@ -138,6 +138,23 @@ def load_plan_ledger():
     return module
 
 
+def load_launch_testers():
+    """The launch-record testers' pure core, bin/launch_testers.py (#372), loaded by path like plan_check."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "launch_testers.py")
+    held = sys.modules.get("launch_testers")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("launch_testers", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["launch_testers"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("launch_testers", None)
+        raise
+    return module
+
+
 def load_disk_janitor():
     """The temp-directory janitor, bin/disk_janitor.py (#321), loaded by path like plan_check."""
     path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "disk_janitor.py")
@@ -11074,6 +11091,19 @@ def triage_summary(state_dir):
     return raw if isinstance(raw, dict) and isinstance(raw.get("counts"), dict) else None
 
 
+def testers_status(config, agents, fleets, state):
+    """The `status` lines of the resolved testers per repo with their source (#372); [] when there are none or the picture is unreadable."""
+    try:
+        if not (agents.get("ok") and fleets is not None):
+            return []
+        sessions = {entry["observation"]["name"]: entry["observation"].get("session") for entry in (agents.get("list") or []) if entry.get("observation")}
+        repo_of = lambda fleet: _fleet_repo(fleet, config)
+        repos = {repo_of(fleet) for fleet in fleets.values() if isinstance(fleet, dict) and fleet.get("role") == "orchestrator"} - {None}
+        return load_launch_testers().status_lines(config.get("plan_evaluators"), fleets, sessions, repos, repo_of, read_retired(state))
+    except Exception:
+        return []
+
+
 def triage_status_lines(triage):
     if not triage:
         return []
@@ -13475,6 +13505,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         fleets = {entry["observation"]["name"]: entry["observation"].get("fleet") or {}
                   for entry in (agents.get("list") or []) if agents.get("ok") and entry.get("observation")}
         report["github"] = github_status(config, state, fleets, now())
+        report["testers"] = testers_status(config, agents, fleets, state)   # #372
     if state_ok:
         report["decisions"] = decisions_summary(state, now)
         report["v2_calls"] = v2_calls_status(state, now())
@@ -13683,6 +13714,7 @@ def format_status(report):
     lines.extend("      " + text for text in report.get("github_calls") or [])
     lines.extend("      v2_light   " + report["v2_light"] for _ in [0] if report.get("v2_light"))
     lines.extend(sweep_status_lines(report.get("sweep")))  # #117
+    lines.extend(report.get("testers") or [])   # #372
     lines.extend(triage_status_lines(report.get("triage")))  # #130
     lines.extend("      " + report["ci_record"] for _ in [0] if report.get("ci_record"))
     lines.extend(report.get("pane_lines") or [])
@@ -16436,6 +16468,27 @@ def cmd_prove(args, runner, now):
     return EXIT_OK
 
 
+def launched_fleets_for(ctx):
+    """{name: metadata.fleet} of the running agents, for the lane rule (#372); {} when discovery fails."""
+    try:
+        return {name: (seen.fleet or {}) for name, seen in ctx.engine.discover(ctx.engine.now()).agents.items()}
+    except Exception:
+        return {}
+
+
+def launched_testers_for(ctx):
+    """({name: launch record}, {name: session id}) of the running agents that the launch record makes testers of this PR's repo (#372). Never raises:
+    a discovery that fails or an unreadable retired list gives nothing launched, so only the configured list counts."""
+    try:
+        agents = ctx.engine.discover(ctx.engine.now()).agents
+        fleets = {name: (seen.fleet or {}) for name, seen in agents.items()}
+        sessions = {name: seen.session_id for name, seen in agents.items()}
+        retired = read_retired(ctx.engine.state_dir) if ctx.engine.state_dir is not None else {}
+        return load_launch_testers().launched(fleets, sessions, ctx.repo, lambda fleet: _fleet_repo(fleet, ctx.config), retired), sessions
+    except Exception:
+        return {}, {}
+
+
 def cmd_verdict(args, runner, now):
     """`verdict <scenario> --pr <repo#N> --as <evaluator> --result ...`: record the evaluator's verdict for a scenario. Only
     the evaluator the scenario names, only by an agent registered for it (`plan_evaluators`), never by a writer of the PR."""
@@ -16471,8 +16524,15 @@ def cmd_verdict(args, runner, now):
         if not plan_ledger.known_writers(ctx.entries, ctx.pr, senders):
             raise LedgerCommandError("refused: no writer of %s is known to the switchboard (nobody has recorded a proof or sent its "
                                      "`notice pr`): its author must do that first, so the author can be excluded" % ctx.pr)
-        ok, why = plan_ledger.may_record_verdict(named, caller, ctx.config.get("plan_evaluators"),
-                                                 plan_ledger.authors_of(ctx.entries, ctx.pr, senders, ctx.facts.get("author")))
+        allowed, launch, sessions = ctx.config.get("plan_evaluators"), {}, {}
+        authors = plan_ledger.authors_of(ctx.entries, ctx.pr, senders, ctx.facts.get("author"))
+        if named == "tester":   # #372: the configured list UNION the testers the launch record names for this repo; any trouble reading it is the configured list alone
+            launch, sessions = launched_testers_for(ctx)
+            allowed = load_launch_testers().evaluators(allowed, launch)
+        ok, why = plan_ledger.may_record_verdict(named, caller, allowed, authors)
+        if ok and named == "tester" and caller in launch:
+            why = load_launch_testers().lane_refusal(caller, launch, authors, sessions, launched_fleets_for(ctx))
+            ok = why is None
     if not ok:
         if ctx.engine.audit is not None:
             ctx.engine.audit.append(ctx.engine.actor, "plan.verdict.refused", ctx.pr,
@@ -16491,9 +16551,10 @@ def cmd_verdict(args, runner, now):
         raise LedgerCommandError("%s" % err) from None
     for entry, one in zip(entries, stored):
         if ctx.engine.audit is not None:
-            ctx.engine.audit.append(ctx.engine.actor, "plan.verdict", ctx.pr,
-                                    {"scenario": entry["scenario"], "result": entry["result"], "seq": one["seq"], "by": entry["by"],
-                                     "chain": one["hash"]})
+            detail = {"scenario": entry["scenario"], "result": entry["result"], "seq": one["seq"], "by": entry["by"], "chain": one["hash"]}
+            if named == "tester" and caller in launch and load_launch_testers().source_of(caller, ctx.config.get("plan_evaluators"), launch) == "launch record":
+                detail["launch_record"] = {k: v for k, v in launch[caller].items() if v is not None}   # #372: the record this verdict relied on
+            ctx.engine.audit.append(ctx.engine.actor, "plan.verdict", ctx.pr, detail)
         print("recorded %s verdict #%d: %s %s at %s (%s), bound to plan %s" % (named, one["seq"], entry["scenario"], args.result,
                                                                              head[:8], ctx.pr, entry["plan_hash"][:19]))
     return EXIT_OK
