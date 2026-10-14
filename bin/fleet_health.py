@@ -58,6 +58,29 @@ def validate(raw, where):
 
 # ---- movement records
 
+_REF_PLAIN = re.compile(r"(?<![\w/&])#(\d{1,7})\b")
+_REF_URL = re.compile(r"/issues/(\d{1,7})\b")
+_REF_BRANCH = re.compile(r"(?:^|[/_-])(\d{2,7})(?=$|[/_-])")
+PARENT_LEVELS = 3                # how far up the parent chain a referenced issue is followed
+PARENTS_KEEP = 3000              # resolved parents kept (a parent never changes)
+
+
+def references(text, branch=None, repo=None):
+    """Every issue number a pull request body (and its branch name) refers to: `Closes #N`, `Part of #N`, `Refs #N`, a plain `#N` or an issues URL
+    of the same repository. `owner/other#N` of another repository is not this repository's issue. Order kept, no repeats."""
+    found = []
+    body = text if isinstance(text, str) else ""
+    for match in re.finditer(r"([\w.-]+/[\w.-]+)#(\d{1,7})\b", body):   # a number in another repository is never ours
+        if repo and match.group(1).lower() != str(repo).lower():
+            body = body.replace(match.group(0), " ")
+    for pattern, source in ((_REF_PLAIN, body), (_REF_URL, body), (_REF_BRANCH, branch if isinstance(branch, str) else "")):
+        for match in pattern.finditer(source):
+            n = int(match.group(1))
+            if n not in found:
+                found.append(n)
+    return found
+
+
 def move_rows(event, payload, repo, now, closing=lambda text: []):
     """[(repo, numbers, kind)] a webhook delivery says about real movement: a push (a pull request synchronised), a pull request opened or
     merged. `numbers` are the pull request and the issues its body closes. Comments, reviews and labels are not movement."""
@@ -75,8 +98,10 @@ def move_rows(event, payload, repo, now, closing=lambda text: []):
         kind = "pr_merged"
     else:
         return []
-    numbers = ([number] + [n for n in closing(pr.get("body")) if n != number])[:MOVES_NUMBERS_MAX]
-    return [{"at": now, "repo": repo, "numbers": numbers, "kind": kind}]
+    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+    refs = [n for n in list(closing(pr.get("body"))) + references(pr.get("body"), head.get("ref"), repo) if n != number]
+    refs = list(dict.fromkeys(refs))[:MOVES_NUMBERS_MAX - 1]
+    return [{"at": now, "repo": repo, "numbers": [number] + refs, "refs": refs, "kind": kind}]
 
 
 @contextmanager
@@ -236,8 +261,13 @@ def crossing(fig, cfg):
     if fig["stalled"] >= cfg["stalled_asks"]:
         reasons.append("stalled"); severity += fig["stalled"]
     full = fig["busy"] is not None and fig["idle"] is not None and fig["busy"] > 0 and fig["idle"] == 0
-    if full and fig.get("moved_backlog") is not None and fig["open_asks"] > fig["moved_backlog"]:
-        reasons.append("backlog"); severity += fig["open_asks"] - fig["moved_backlog"]
+    if full and fig.get("moved_backlog") is not None and fig.get("moved_1h") is not None:
+        # all coders busy: only when something is stuck (an ask stalled) or open asks clearly outnumber what moves and nothing moved in the last hour
+        outnumbered = fig["open_asks"] >= 2 * fig["moved_backlog"] and fig["open_asks"] > fig["moved_backlog"] and fig["moved_1h"] == 0
+        if fig["stalled"] >= 1 and "stalled" not in reasons:
+            reasons.append("busy_stalled"); severity += max(1, fig["stalled"])
+        elif outnumbered:
+            reasons.append("outnumbered"); severity += max(1, fig["open_asks"] - fig["moved_backlog"])
     return severity, reasons
 
 
@@ -251,8 +281,10 @@ def wake_text(fig, reasons, cfg):
     actions = []
     if "stalled" in reasons:
         actions.append("move the stalled asks (%s) to another lane" % (asks or "named above"))
-    if "backlog" in reasons:
-        actions.append("split a lane or add coders (all are busy and asks queue faster than they move)")
+    if "busy_stalled" in reasons:
+        actions.append("split a lane or add coders: all coders are busy and an ask is stalled (%s)" % (asks or "named above"))
+    if "outnumbered" in reasons:
+        actions.append("split a lane or add coders: all coders are busy, open asks are at least twice those moved in %g h and none moved in the last hour" % cfg["backlog_hours"])
     return text + " Recommended: " + "; or ".join(actions) + "."
 
 
@@ -401,7 +433,63 @@ def _resolve_charters(ctx, state, now, budget):
     return out, problems
 
 
-def _refresh_asks(ctx, state, now):
+def _parent_of(ctx, state, budget, repo, number, now, problems):
+    """(parent number or None, resolved): a parent never changes, so one read per number is kept for good (a failure is retried after RETRY_SECONDS).
+    Unresolved when it cannot be read or the account's budget is spent or paused: nothing is guessed."""
+    parents, failed, key = state.setdefault("parents", {}), state.setdefault("parents_failed", {}), "%s#%d" % (repo, number)
+    if key in parents:
+        return (parents[key] or None), True
+    if now - failed.get(key, -1e9) < RETRY_SECONDS or getattr(ctx, "read_parent", None) is None:
+        return None, False
+    if budget.paused(repo, problems) or budget.left(budget.account(repo)) < 1:
+        return None, False
+    try:
+        parent = budget.metered(repo, 1, lambda: ctx.read_parent(repo, number))
+    except Exception:
+        failed[key] = now
+        while len(failed) > PARENTS_KEEP:
+            failed.pop(next(iter(failed)))
+        return None, False
+    parents[key] = parent or 0
+    while len(parents) > PARENTS_KEEP:
+        parents.pop(next(iter(parents)))   # the oldest: it is only read again
+    return parent, True
+
+
+def expand_rows(ctx, state, budget, rows, asks_by_name, now, problems):
+    """Attribute each movement to the asks on the parent chain of the issues it refers to: a work item whose parent is an ask moves that ask (up to
+    PARENT_LEVELS levels). Returns (rows with the chain's numbers added, the count of movements whose reference could not be resolved)."""
+    known = {(a["repo"], a["number"]) for lst in asks_by_name.values() for a in lst}
+    is_ask = lambda repo, n: any(_same_repo(r, repo) and k == n for r, k in known)
+    window = now - max(ctx.cfg.get("stalled_hours", 2.0), ctx.cfg.get("backlog_hours", 4.0)) * 3600   # older movements cannot change a figure
+    out, unattributed = [], 0
+    for row in rows:
+        refs = row.get("refs") if isinstance(row.get("refs"), list) else []
+        if not refs or row["at"] < window or not row.get("repo"):
+            out.append(row)
+            continue
+        extra, stuck = [], False
+        for ref in refs[:MOVES_NUMBERS_MAX]:
+            if not isinstance(ref, int) or is_ask(row["repo"], ref):
+                continue
+            cur = ref
+            for _ in range(PARENT_LEVELS):
+                parent, resolved = _parent_of(ctx, state, budget, row["repo"], cur, now, problems)
+                if not resolved:
+                    stuck = True
+                    break
+                if not parent:
+                    break
+                extra.append(parent)
+                cur = parent
+                if is_ask(row["repo"], cur):
+                    break
+        unattributed += 1 if stuck else 0
+        out.append(dict(row, numbers=list(row["numbers"]) + [n for n in extra if n not in row["numbers"]]) if extra else row)
+    return out, unattributed
+
+
+def _refresh_asks(ctx, state, now, rows=()):
     """Re-read each asks list at most hourly, the oldest first, within each account's read budget; a failed read keeps the cached list and is told."""
     cache, problems = state.setdefault("asks", {}), []
     budget = _Budget(ctx, state, now)
@@ -428,20 +516,23 @@ def _refresh_asks(ctx, state, now):
         cache[name] = {"at": now, "list": [{"repo": a["repo"], "number": a["number"], "first_seen": seen.get((a["repo"], a["number"]), now)} for a in found]}
     for gone in [n for n in cache if n not in ctx.orchestrators]:
         del cache[gone]
+    asks_by_name = {n: (cache.get(n) or {}).get("list") or [] for n in ctx.orchestrators}
+    rows, unattributed = expand_rows(ctx, state, budget, list(rows), asks_by_name, now, problems)
+    state["unattributed"] = unattributed
     state["reads"] = budget.to_state()
-    return problems
+    return problems, rows
 
 
 def tick(ctx):
     """One pass. Returns the list of (orchestrator, wake text) sent. Never raises for a source it cannot read."""
     now, state = ctx.now, _read_state(ctx.state_dir)
     before_state = json.loads(json.dumps(state))
-    problems = _refresh_asks(ctx, state, now)
     rows = read_moves(ctx.state_dir, now - 24 * 3600)
     audited = audit_moves(ctx.state_dir, now - 24 * 3600)
+    rows += audited or []
+    problems, rows = _refresh_asks(ctx, state, now, rows)
     if audited is None:
         problems.append("movement: the audit log cannot be read")
-    rows += audited or []
     waiting = decisions_waiting(ctx.state_dir)
     if waiting is None:
         problems.append("decisions: decisions.json cannot be read")
@@ -500,6 +591,8 @@ def status_lines(state_dir, now):
         out.append("  %-12s asks %s, stalled %s (oldest %s h), moved 1h %s; waiting %d msg %s dec; coders %d busy %d idle" % (
             name, num(f["open_asks"]), num(f["stalled"]), num(f["oldest_stall_hours"]), num(f["moved_1h"]),
             f["messages"], num(f["decisions"]), f["busy"], f["idle"]))
+    if state.get("unattributed"):
+        out.append("  %d movement(s) not attributed (a referenced issue's parent could not be read)" % state["unattributed"])
     if state.get("problems"):
         out.append("  unreadable: %s" % "; ".join(state["problems"][:3]))
     return out

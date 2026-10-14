@@ -23077,6 +23077,15 @@ def load_tick(engine, discovery):
                        if isinstance(i, dict) and isinstance(i.get("number"), int) and "pull_request" not in i) if isinstance(found, list) else None
         return out
 
+    def read_parent(repo, number):
+        """The parent issue number of `repo#number` in the same repository (None when it has none): one read."""
+        if engine.intents is None:
+            raise RuntimeError("no ask repo is configured")
+        data = engine.intents._api("repos/%s/issues/%d" % (repo, number), repo)
+        url = data.get("parent_issue_url") if isinstance(data, dict) else None
+        found = re.search(r"/repos/([^/]+/[^/]+)/issues/(\d+)$", url) if isinstance(url, str) else None
+        return int(found.group(2)) if found and found.group(1).lower() == str(repo).lower() else None
+
     def wake(text):
         add_reminder(engine.state_dir, cos, now, now, text)
         if engine.audit is not None:
@@ -23097,7 +23106,7 @@ def load_tick(engine, discovery):
             return sum(1 for call in snapshot() if call[0] > since and call[1] == account and not call[3])
         meter = {"account_of": accounts.describe, "paused": lambda repo: accounts.paused.get(accounts.describe(repo), 0) > now,
                  "begin_read": begin_read, "read_cost": read_cost}
-    return health.tick(health.Context(now=now, state_dir=engine.state_dir, cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, read_charters=read_charters, cos=cos, wake=wake, **meter))
+    return health.tick(health.Context(now=now, state_dir=engine.state_dir, cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, read_charters=read_charters, read_parent=read_parent, cos=cos, wake=wake, **meter))
 
 
 def cmd_load_replay(args, runner, now):
