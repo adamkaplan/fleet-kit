@@ -20078,6 +20078,14 @@ class TestLaunchTesters(LedgerBase):
         self.assertEqual(sb.load_launch_testers().launched({"ltst": {"role": "tester", "repo": "acme/app", "reports_to": "orch"}, "orch": {"role": "orchestrator", "repo": "acme/app"}},
                                                            {"ltst": self.world.sessions["ltst"]}, "acme/app", lambda f: f.get("repo"), retired), {})
 
+    def test_status_lists_the_resolved_testers_with_their_source(self):
+        fleets = {"orch": {"role": "orchestrator", "repo": "acme/app"}, "ltst": {"role": "tester", "repo": "acme/app", "reports_to": "orch"},
+                  "tst": {"role": "tester", "repo": "acme/app", "reports_to": "orch"}}
+        agents = {"ok": True, "list": [{"observation": {"name": n, "session": "s-" + n}} for n in fleets]}
+        lines = sb.testers_status({"plan_evaluators": {"tester": ["tst"]}, "intent_repo": "acme/app"}, agents, fleets, self.world.state)
+        self.assertEqual(lines, ["      tester     tst: config (any repo)", "      tester     ltst: launch record (acme/app)"])
+        self.assertEqual(sb.testers_status({}, {"ok": False}, {}, self.world.state), [])
+
     def test_the_pure_rules_and_the_status_lines(self):
         lt = sb.load_launch_testers()
         fleets = {"orch": {"role": "orchestrator", "repo": "acme/app"}, "t1": {"role": "tester", "repo": "acme/app", "reports_to": "orch"},
