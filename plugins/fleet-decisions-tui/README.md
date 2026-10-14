@@ -85,6 +85,7 @@ Above the Decisions rows, one dense block per workspace that has an orchestrator
 - **Sources (all read from the state directory; nothing polled, nothing spawned):** `health-records.json` (bin/health_records.py: tool calls, tokens, context,
   pushes), `load.json` (the load alert's figures and today's hourly series), `pane-health.json` (which agents sit in which workspace, and whether the pane
   is alive) and `decisions.json` (what waits on the person). Hottest = alert, then stalled asks, open asks, recent tool calls.
+- **The producers are separate changes:** `bin/health_records.py` (#373) and the load alert's `load.json` (#348) land on their own; until they do, the figures they carry read `not recorded`.
 - **Not drawn:** a workspace with no orchestrator; the whole block when none of those files can be read. `FLEET_SWITCHBOARD_HEALTH=off` hides it.
   A fault while drawing it draws nothing: the Decisions never depend on it. It is a separate file (`health.mjs`) that the installer copies with the other two.
 - Tests: `node --test plugins/fleet-decisions-tui/health.test.mjs`.

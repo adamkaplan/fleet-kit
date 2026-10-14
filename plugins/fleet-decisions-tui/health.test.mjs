@@ -13,10 +13,12 @@ const pane = {
     alpha1: { role: "coder", workspace: "w1", session: "ses_a1", repo: null },
     beta: { role: "orchestrator", workspace: "w2", session: "ses_b", repo: "acme/web" },
     gamma: { role: "orchestrator", workspace: "w3", session: "ses_c", repo: "acme/ops" },
+    delta: { role: "orchestrator", workspace: "w6", session: "ses_d", repo: "acme/d" },
+    eps: { role: "orchestrator", workspace: "w7", session: "ses_e", repo: "acme/e" },
     cos: { role: "chief-of-staff", workspace: "w4", session: "ses_cos", repo: null },
     loner: { role: "coder", workspace: "w5", session: "ses_l", repo: null },
   },
-  states: { alpha: { state: "attached" }, alpha1: { state: "attached" }, beta: { state: "attached" }, gamma: { state: "unknown" }, cos: { state: "attached" } },
+  states: { alpha: { state: "attached" }, alpha1: { state: "attached" }, beta: { state: "attached" }, gamma: { state: "dead" }, delta: { state: "detached" }, eps: { state: "unknown" }, cos: { state: "attached" } },
   missing: {},
 }
 const minutes = (n, last = 0) => Array.from({ length: 15 }, (_, i) => (i >= 15 - n ? last || i : 0))
@@ -39,7 +41,7 @@ const text = (segs) => segs.map((s) => s[0]).join("")
 
 test("workspaces are ordered hottest first, each block is at most 2 lines, and lines fit the width", () => {
   const blocks = buildBlocks(full, NOW)
-  assert.deepEqual(blocks.map((b) => b.name), ["alpha", "beta", "cos", "gamma"]) // alert + stalled first, then open asks, then name order for the cold ones
+  assert.deepEqual(blocks.map((b) => b.name), ["alpha", "beta", "cos", "delta", "eps", "gamma"]) // alert + stalled first, then open asks, then name order for the cold ones
   for (const b of blocks) {
     const lines = blockLines(b, 34)
     assert.equal(lines.length, 2)
@@ -69,9 +71,7 @@ test("a figure with no source says not recorded and is never 0", () => {
 test("an empty tool-call table, a stale file and a malformed one are all not recorded, an idle fleet is idle", () => {
   assert.equal(toolSeries({ tool_calls: {} }, ["ses_a"]), null)
   assert.equal(toolSeries(null, ["ses_a"]), null)
-  const idle = buildBlocks({ ...full, load: null }, NOW).find((b) => b.name === "gamma" || b.name === "beta")
-  assert.ok(idle)
-  const quiet = buildBlocks({ ...full, decisions: { decisions: [] }, load: null }, NOW).find((b) => b.name === "beta")
+    const quiet = buildBlocks({ ...full, decisions: { decisions: [] }, load: null }, NOW).find((b) => b.name === "beta")
   assert.equal(quiet.state, "idle")
 })
 
@@ -79,7 +79,9 @@ test("states: dead beats waiting beats working beats idle", () => {
   const by = Object.fromEntries(buildBlocks(full, NOW).map((b) => [b.name, b.state]))
   assert.equal(by.alpha, "work")
   assert.equal(by.beta, "wait") // one open human decision (the closed one does not count)
-  assert.equal(by.gamma, "dead") // its pane is not attached
+  assert.equal(by.gamma, "dead") // the switchboard found its pane dead
+  assert.equal(by.delta, null) // detached: not recorded, shown as ?
+  assert.equal(by.eps, null) // not checked yet: not dead
   assert.equal(by.cos, "idle") // the plugin is recording and this session made no calls in 15 minutes
 })
 
@@ -104,7 +106,7 @@ test("loadInputs: files are read from the state directory, a stale or oversize f
 
 test("the rows start with a heading, add 2 lines per workspace, and are empty when no workspace has an orchestrator", () => {
   const rows = healthRows(full, NOW, 34)
-  assert.equal(rows.length, 1 + 2 * 4 + 1)
+  assert.equal(rows.length, 1 + 2 * 6 + 1)
   assert.equal(text(rows[0].segs).startsWith("Workspaces"), true)
   assert.deepEqual(healthRows({ records: null, load: null, pane: null, decisions: null }, NOW, 34), [])
 })
@@ -128,4 +130,10 @@ test("context with no percent shows the size used; with neither it says not reco
   assert.match(blockLines(alpha, 120).map(text)[1], /ctx123k/)
   const [none] = buildBlocks({ ...full, records: { ...records, usage: {} } }, NOW)
   assert.match(blockLines(none, 120).map(text)[1], /ctx not recorded/)
+})
+
+test("an agent the pane file does not know, or a missing pane file, is a state not recorded, not dead", () => {
+  const unknown = buildBlocks({ ...full, pane: { ...pane, states: {} } }, NOW).find((b) => b.name === "alpha")
+  assert.equal(unknown.state, null)
+  assert.match(text(blockLines(unknown, 80)[0]), /alpha\s+\?\s/)
 })

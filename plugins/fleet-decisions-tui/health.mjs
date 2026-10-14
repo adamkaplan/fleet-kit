@@ -106,7 +106,6 @@ const ROLES = ["orchestrator", "chief-of-staff"]
 export function buildBlocks(inputs, now) {
   const agents = obj(obj(inputs.pane).agents)
   const states = obj(obj(inputs.pane).states)
-  const missing = obj(obj(inputs.pane).missing)
   const load = obj(inputs.load)
   const latest = obj(load.latest)
   const hour = Math.floor(now / 3600_000) * 3600
@@ -132,11 +131,16 @@ export function buildBlocks(inputs, now) {
     const sessions = members.map((m) => m.session).filter((s) => typeof s === "string")
     const series = toolSeries(inputs.records, sessions)
     const fig = obj(latest[lead.name])
-    const dead = inputs.pane ? states[lead.name] === undefined || states[lead.name].state !== "attached" || lead.name in missing : null
+    // Only a pane the switchboard has found dead is "dead". An unchecked (unknown) or detached pane, or a pane file that does not know the agent,
+    // is not recorded: the state word is "?".
+    const paneState = inputs.pane ? obj(states[lead.name]).state : undefined
+    const dead = paneState === "dead"
+    const uncertain = paneState !== "attached" && paneState !== "dead"
     const waiting = listed ? waitingFor.get(lead.name) ?? 0 : null
     const recent = series ? series.slice(-WORKING_MINUTES).reduce((a, b) => a + b, 0) : null
     let state = null
-    if (dead === true) state = "dead"
+    if (dead) state = "dead"
+    else if (uncertain) state = null
     else if (waiting) state = "wait"
     else if (recent !== null) state = recent > 0 ? "work" : "idle"
     const episode = obj(obj(load.episodes)[lead.name])
