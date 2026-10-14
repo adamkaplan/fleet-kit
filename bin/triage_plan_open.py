@@ -53,3 +53,37 @@ def merged_links(prs, repo):
 def evidence(link, merged_age_days):
     """The finding's evidence: the PR that merged, its link, and how long ago."""
     return {"pr": link["pr"], "pr_url": link["url"], "merged_days": round(merged_age_days, 2)}
+
+
+# -- #410: T12 fires only for an issue that is truly done. Pending work is read from records already held, never from a new GitHub read.
+PENDING_TASK_RE = re.compile(r"^[ \t]*(?:[-*][ \t]+)\[ \][ \t]+\S", re.M)
+PENDING_TEXT_RE = re.compile(r"\b(?:pending[ \t]+(?:live[ \t]+|tester[ \t]+)?proof|(?:awaiting|waiting[ \t]+for)[ \t]+(?:the[ \t]+)?(?:live[ \t]+|tester[ \t]+)?proof)\b", re.I)
+QUOTED_RE = re.compile(r"```.*?```|^[ \t]*>.*$", re.S | re.M)
+
+
+def pending_text(body):
+    """True when the issue's own text (outside code and quotes) says work is left: an unchecked task-list item or a `pending proof` line."""
+    if not isinstance(body, str):
+        return False
+    text = QUOTED_RE.sub(" ", body[:MAX_BODY])
+    return bool(PENDING_TASK_RE.search(text) or PENDING_TEXT_RE.search(text))
+
+
+def ledger_pending(entries, repo, pr):
+    """True when the ledger holds, for pull request `pr` of `repo`, a scenario with a recorded proof whose latest verdict is missing or not a pass
+    (a proof not yet judged, or judged failed). Entries are the plain records of the plan ledger."""
+    ref = "%s#%d" % (repo, pr)
+    proofs, verdicts = set(), {}
+    for entry in entries or []:
+        if not isinstance(entry, dict) or entry.get("pr") != ref:
+            continue
+        if entry.get("kind") == "proof":
+            proofs.add(entry.get("scenario"))
+        elif entry.get("kind") == "verdict":
+            verdicts[entry.get("scenario")] = entry.get("result")   # entries are oldest first: the last one wins
+    return any(verdicts.get(sid) != "pass" for sid in proofs if sid)
+
+
+def pending_issues(links, entries, repo):
+    """The issue numbers of `links` whose linked merged pull request still has a proof not passed in the ledger."""
+    return {issue for issue, link in links.items() if ledger_pending(entries, repo, link["pr"])}

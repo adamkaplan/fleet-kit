@@ -206,6 +206,23 @@ def load_disk_janitor():
     return module
 
 
+def load_heavy_slots():
+    """The CPU slots for heavy commands, bin/heavy_slots.py (#34), loaded by path like the other modules."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "heavy_slots.py")
+    held = sys.modules.get("heavy_slots")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("heavy_slots", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["heavy_slots"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("heavy_slots", None)
+        raise
+    return module
+
+
 def load_cpu_guard():
     """The CPU guard, bin/cpu_guard.py (the P0 CPU order), loaded by path like plan_check."""
     path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cpu_guard.py")
@@ -509,6 +526,7 @@ DEFAULTS = {
     "poll_seconds": 5,
     "cpu_guard": None,             # load over cores: None = defaults (high_ratio 3 for 5 minutes wakes the Chief of Staff once per episode); false = off; or {"high_ratio": n, "minutes": n}
     "disk_guard": None,            # free space of the state directory's volume: None = defaults (min_free_gb 50, hard_free_gb 10); false = off; or {"min_free_gb": n, "hard_free_gb": n}
+    "heavy": None,                 # CPU slots for `heavy -- <command>` (full suites, e2e runs): None = 3 slots; or {"slots": n}
     "docker_reaper": True,         # the daily removal of EXPIRED labelled docker containers, networks and volumes (`disk reap-docker`): false is the kill switch
     "v2_events": "auto",           # the daemon's news of sessions: "auto" (the service's event stream, where the HTTP route exists; reads only what an event did not say) or "off" (the old reads)
     "v2_transport": "auto",        # how v2 calls travel: "auto" (HTTP to the service when it can, else the CLI) or "cli" (always `opencode api`: the kill switch)
@@ -652,6 +670,10 @@ def validate_config(raw, source="config"):
                 raise ConfigError("%s: %r value for %s must be a string" % (source, key, name))
         envs[key] = dict(env)
     validate_disk_guard(config["disk_guard"], source)
+    try:
+        load_heavy_slots().settings(config["heavy"])
+    except Exception as err:
+        raise ConfigError("%s: %s" % (source, err)) from None
     try:
         load_cpu_guard().validate(config["cpu_guard"], source)
     except ValueError as err:
@@ -10814,7 +10836,7 @@ class SweepFacts:
 
 TRIAGE_DEFAULTS = {"enabled": False, "repos": None, "required_labels": {}, "sla": {}, "sla_overrides": {},
                    "our_logins": None, "daily_summary": True, "realarm_hours": 24, "max_findings": 30,
-                   "calls_per_pass": 30, "pass_seconds": 10, "backoff": True}
+                   "calls_per_pass": 30, "pass_seconds": 10, "backoff": True, "digest_interval_minutes": 60}
 # Every `_days` value is in days and may be a fraction (2/24 is two hours); `t7_ours_hours` is in hours.
 TRIAGE_SLA = {"t1_days": 1, "t2_days": 1 / 24, "t3_ask_days": 1, "t3_other_days": 3, "t5_days": 2 / 24, "t6_days": 2,
               "t7_ours_hours": 4, "t7_other_days": 2, "t8_days": 1, "t9_days": 3, "t11_days": 1}
@@ -10902,6 +10924,8 @@ def validate_triage_config(config, source):
         raise ConfigError("%s.repos' must be OWNER/REPO names, got %r" % (where, section["repos"]))
     if not _is_number(section["realarm_hours"]) or section["realarm_hours"] <= 0:
         raise ConfigError("%s.realarm_hours' must be a positive number, got %r" % (where, section["realarm_hours"]))
+    if not _is_number(section["digest_interval_minutes"]) or section["digest_interval_minutes"] < 0:
+        raise ConfigError("%s.digest_interval_minutes' must be a number of minutes, 0 or more (0 sends a digest every pass that has one), got %r" % (where, section["digest_interval_minutes"]))
     cap = section["max_findings"]
     if not isinstance(cap, int) or isinstance(cap, bool) or not 1 <= cap <= 200:
         raise ConfigError("%s.max_findings' must be a whole number from 1 to 200, got %r" % (where, cap))
@@ -10981,6 +11005,7 @@ class TriageState:
         self.started, self.day, self.day_counts = 0, None, {}
         self.summarised = None
         self.seen = None         # #349: the stale digest's memory (bin/triage_digest.py), loaded at the first pass
+        self.meta = None         # #406: its cadence (warm-up done, the last delivery), kept in the same file
 
 
 def triage_state(engine):
@@ -11013,6 +11038,7 @@ def triage_norm(issue):
             "parked_until": parked_until(body, {(l.get("name") if isinstance(l, dict) else l) for l in issue.get("labels") or []}),
             "owner_body": triage_names_owner(body),
             "open_sub": isinstance(total, int) and isinstance(done, int) and total > done,
+            "pending_text": load_triage_plan_open().pending_text(body),   # #410: its own text says work is left
             "captain": is_captain({"labels": {(l.get("name") if isinstance(l, dict) else l) for l in issue.get("labels") or []},
                                    "body": body})}
 
@@ -11026,6 +11052,23 @@ def triage_comment_facts(records):
         if at is not None:
             found.append({"at": at, "next": bool(TRIAGE_NEXT_RE.search(text)), "review": triage_says_reviewed(text)})
     return sorted(found, key=lambda c: c["at"])
+
+
+def triage_pending_proofs(engine, links, items, repo):
+    """#410: the open issues of `links` whose linked merged PR still has a proof the ledger has not seen pass. The ledger is one local file, read only
+    when a T12 candidate exists; an unreadable or tampered one makes every candidate unknown (suppressed this pass), never a finding."""
+    candidates = {n: l for n, l in links.items() if n in items}
+    if not candidates:
+        return set()
+    if engine.state_dir is None:
+        return set()   # no state directory: no ledger exists
+    try:
+        entries, problem = plan_ledger.read_ledger(engine.state_dir)
+    except Exception:
+        return set(candidates)
+    if problem:
+        return set(candidates)
+    return load_triage_plan_open().pending_issues(candidates, entries, repo)
 
 
 def triage_context(engine, repo, items, discovery):
@@ -11075,7 +11118,7 @@ def triage_charter_descendants(items, charters):
     return below, unresolved
 
 
-def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs, window_ok=True, captain_skip=False, merged=None):
+def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs, window_ok=True, captain_skip=False, merged=None, pending=None):
     """{rule: evidence} for one OPEN item (a pure function: the list copy and the fresh copy go through it alike), and
     whether the item is ours. `comments` is None when the comment unit is not read (T3 and T7 are then not judged).
     Evidence holds only labels' names, ages in days and owner logins."""
@@ -11112,8 +11155,9 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
         if link:   # #384: its PR merged and it is still open: that is the finding, not "no owner"; ours when the PR's author is ours
             found.pop("T1", None)
             found.pop("T11", None)
-            found["T12"] = load_triage_plan_open().evidence(link, max(0.0, now - (parse_iso(link["merged_at"]) or now)) / day)
-            ours = ours or link["by"] in ours_logins
+            if not (item["open_sub"] or item["pending_text"] or number in (pending or ())):   # #410: not truly done: an open sub-issue, pending work in its text or a proof not passed
+                found["T12"] = load_triage_plan_open().evidence(link, max(0.0, now - (parse_iso(link["merged_at"]) or now)) / day)
+                ours = ours or link["by"] in ours_logins
     elif not item["draft"] and comments is not None and ours and not captain_skip:
         # Only OUR PRs: our agents review by signed comment, which is in the data; other teams use formal GitHub reviews,
         # which the triage does not read, so a PR of theirs cannot be called unreviewed (it would be a false positive).
@@ -11209,6 +11253,7 @@ def triage_findings(engine, state, repos, decisions, cfg, now, errors):
                     by_number.setdefault(n, []).append(c)
         merged_unit = state.units.get((repo, "merged"))   # #384: not read yet (or no unit): no T12, never a guess
         links = load_triage_plan_open().merged_links(merged_unit["data"], repo) if merged_unit is not None else {}
+        pending = triage_pending_proofs(engine, links, items, repo)
         sla, required = triage_sla(cfg, repo), (cfg.get("required_labels") or {}).get(repo) or []
         if comments_unit is None:
             unchecked.setdefault(repo, []).append("comments")
@@ -11217,7 +11262,7 @@ def triage_findings(engine, state, repos, decisions, cfg, now, errors):
             # a `MERGE: captain` PR already in the decision list is T6's; while the list is incomplete a captain PR waits
             captain_skip = item["captain"] and ((repo, number) in captain_listed or bool(errors))
             found, ours = triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs.get(repo, set()),
-                                       captain_skip=captain_skip, merged=links)
+                                       captain_skip=captain_skip, merged=links, pending=pending)
             if not found:
                 continue
             ref = "%s#%d" % (repo, number)
@@ -11439,15 +11484,33 @@ def triage_pass(engine, decisions, now, errors=()):
                      "other_owner": other_owner, "at": iso(now),
                      "unchecked": unchecked, "unchecked_other_owner": unchecked_other,
                      "oldest_unchecked_seconds": int(oldest), "unchecked_units": {r: sorted(u) for r, u in unchecked_units.items()},
-                     "unreadable": sorted(state.unreadable), "truncated": sorted(truncated), "repos": len(repos)}
+                     "unreadable": sorted(state.unreadable), "truncated": sorted(truncated), "repos": len(repos),
+                     "digest_interval_minutes": cfg.get("digest_interval_minutes", 60)}
     triage_write(engine, state)
     flagged = [(r, ref) for r, ref, _ in findings if r == "OO" and now - state.alarmed.get((r, ref), 0) >= cfg["realarm_hours"] * 3600]
     due, invalid = triage_digest_due(engine, state, [(r, ref) for r, ref, _ in findings if r != "OO"],
                                      [(r, ref) for r, ref, _ in candidates if r != "OO"], cfg, now)
+    if cfg["enabled"] and cfg.get("backoff", True):   # #406: warm up first, then at most one digest per interval; a held digest keeps its memory untouched
+        before = state.meta["swept"]
+        open_units = sum(len(u) for u in unchecked_units.values()) + sum(1 for r in repos if (r, "issues") not in state.units and r not in state.unreadable)   # a list not read yet is a finding not checked
+        if not state.meta["swept"] and getattr(state, "warming_since", None) is None:
+            state.warming_since = now
+        allowed, digest = triage_digest.gate(state.meta, now, unchecked + open_units, cfg.get("digest_interval_minutes", 60) * 60,
+                                             getattr(state, "warming_since", None))
+        state.current["digest"] = digest
+        triage_write(engine, state)
+        if state.meta["swept"] != before:
+            triage_digest.write_seen(engine.state_dir, state.seen, state.meta)
+        if not allowed:
+            due, invalid = [], []
     if cfg["enabled"] and (due or invalid):   # never a wake solely for other-owner flags: they ride along when a wake happens anyway
         text = triage_queue_fact(state, due, now, cfg, len(flagged), invalid)
         triage_digest.cost_record(engine.state_dir, now, text)
+        state.meta["last"] = now
         triage_digest_commit(engine, state, due[:cfg["max_findings"]], invalid, now)
+        if state.current.get("digest", {}).get("state") == "ready" and cfg.get("digest_interval_minutes", 60) > 0:
+            state.current["digest"] = {"state": "held", "next_at": now + cfg["digest_interval_minutes"] * 60}
+            triage_write(engine, state)
         for pair in flagged:
             state.alarmed[pair] = now
         for rule, _ in due:
@@ -11467,10 +11530,16 @@ def triage_digest_items(state):
     return index
 
 
+def triage_digest_memory(engine, state):
+    """The digest's memory and its cadence, loaded once together (the gate and the commit both need `state.meta`)."""
+    if state.seen is None or state.meta is None:
+        state.seen = triage_digest.load_seen(engine.state_dir)
+        state.meta = triage_digest.load_meta(engine.state_dir)
+
+
 def triage_digest_due(engine, state, ours, candidates, cfg, now):
     """([(rule, ref)] for this pass's one digest, [ref] with an invalid parked label); see bin/triage_digest.py."""
-    if state.seen is None:
-        state.seen = triage_digest.load_seen(engine.state_dir)
+    triage_digest_memory(engine, state)
     triage_digest.prune(state.seen, candidates)
     mutes = triage_digest.load_mutes(engine.state_dir) if engine.state_dir else {}
     return triage_digest.select(state.seen, triage_digest_items(state), mutes, ours, now, cfg.get("backoff", True), state.alarmed,
@@ -11481,7 +11550,7 @@ def triage_digest_commit(engine, state, shown, invalid, now):
     triage_digest.commit(state.seen, triage_digest_items(state), shown, invalid, now)
     for ref in invalid:
         engine._note("triage.parked_invalid", ref, {"ref": ref, "why": "a parked label without one valid `Parked until: YYYY-MM-DD` line"})
-    triage_digest.write_seen(engine.state_dir, state.seen)
+    triage_digest.write_seen(engine.state_dir, state.seen, state.meta)
 
 
 def triage_queue_fact(state, due, now, cfg, other_owner=0, invalid=()):
@@ -11575,6 +11644,9 @@ def triage_status_lines(triage):
                      "raised nor audited" % (triage["unchecked"], extra))
     if triage.get("truncated"):
         lines.append("      triage     lists capped for " + ", ".join(triage["truncated"]))
+    cadence = triage_digest.digest_line(triage.get("digest"), parse_iso(triage.get("at")) or time.time(), triage.get("digest_interval_minutes", 60))   # #406
+    if cadence:
+        lines.append("      triage     " + cadence)
     if "cost" in triage:   # #349: what the digests cost the Chief of Staff to read, per day
         lines.extend(triage_digest.cost_lines(triage["cost"], str(triage.get("at") or "")[:10]) if triage["cost"]
                      else ["      triage     cost per day: not recorded (nothing delivered yet)"])
@@ -19586,6 +19658,45 @@ def cmd_disk(args, runner, now):
 
 
 cmd_disk.direct = True   # an operator's command on the machine: no daemon start
+
+
+def cmd_heavy(args):
+    """`heavy [--slots N] [--wait-max S] -- <command...>`: run the command in a CPU slot (ask #34); its exit status is ours."""
+    module = load_heavy_slots()
+    command = list(args.command)
+    if command[:1] == ["--"]:
+        command = command[1:]
+    try:
+        if not command:
+            raise module.HeavyError("no command: heavy [--slots N] [--wait-max S] -- <command...>")
+        if args.slots is not None and not 1 <= args.slots <= module.SLOTS_MAX:
+            raise module.HeavyError("--slots must be from 1 to %d" % module.SLOTS_MAX)
+        if args.wait_max is not None and args.wait_max < 0:
+            raise module.HeavyError("--wait-max must be 0 or more")
+        configured = module.settings(load_config().get("heavy") if config_path().exists() else None)
+    except (module.HeavyError, ConfigError) as err:
+        sys.stderr.write("%s: heavy: %s\n" % (PROG, err))
+        return EXIT_USAGE
+    try:
+        state = ensure_state_dir()
+    except Exception as err:   # a state directory that cannot be made or is refused: the command still runs, without a slot (heavy never fails someone else's command)
+        sys.stderr.write("heavy: no slot (%s): running without one\n" % _one_line(str(err), 160))
+        state = None
+    return module.run(command, state, args.slots or configured, module.DEFAULT_WAIT_MAX if args.wait_max is None else args.wait_max, args.name)
+
+
+cmd_heavy.direct = True   # the wrapper of someone else's command: no daemon start, no error mapping
+
+
+def add_heavy_parsers(sub):
+    heavy = sub.add_parser("heavy", help="Run a heavy command (a full test suite, a browser or e2e run) in one of a few CPU slots, at background priority",
+                           description="`heavy [--slots N] [--wait-max SECONDS] [--name WHO] -- <command...>`: waits for a free slot (default 3, config `heavy.slots`; one line "
+                                       "every 30 s says who holds them), then runs the command as `taskpolicy -b <command>` (else `nice -n 10`) with its stdin, stdout, "
+                                       "exit status and signals passed through. After --wait-max seconds (default 1800) it exits 75 and does not run the command.")
+    heavy.add_argument("--slots", type=int, help="How many commands may run at once (default: config heavy.slots, else 3)")
+    heavy.add_argument("--wait-max", type=int, dest="wait_max", help="Give up after this many seconds without a slot: exit 75 (default 1800)")
+    heavy.add_argument("--name", help="Who the slot is held for (default: FLEET_HEAVY_NAME, the OpenCode session id, the user)")
+    heavy.add_argument("command", nargs=argparse.REMAINDER, help="-- <command...>")
 
 
 def add_disk_parsers(sub):

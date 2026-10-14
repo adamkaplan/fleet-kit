@@ -1,0 +1,4 @@
+{
+ "command": "heavy",
+ "help": "usage: fleet-switchboard heavy [-h] [--slots SLOTS] [--wait-max WAIT_MAX] [--name NAME] ... `heavy [--slots N] [--wait-max SECONDS] [--name WHO] -- <command...>`: waits for a free slot (default 3, config `heavy.slots`; one line every 30 s says who holds them), then runs the command as `taskpolicy -b <command>` (else `nice -n 10`) with its stdin, stdout, exit status and signals passed through. After --wait-max seconds (default 1800) it exits 75 and does not run the command. positional arguments: command -- <command...> options: -h, --help show this help message and exit --slots SLOTS How many commands may run at once (default: config heavy.slots, else 3) --wait-max WAIT_MAX Give up after this many seconds without a slot: exit 75 (default 1800) --name NAME Who the slot is held for (default: FLEET_HEAVY_NAME, the OpenCode session id, the user)"
+}
