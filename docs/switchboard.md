@@ -2469,6 +2469,23 @@ state directory holds the slot last asked), so a restart or the next pass makes 
 lost file means at most one extra wake. `fleet-switchboard status` shows one line, for example
 `friction wake: on, 09:00 to cos; cos to improver; last slot 2026-10-11T09:00:00Z` (`off` when disabled).
 
+**The load of each orchestrator, and the overload alert (#348).** Every daemon pass computes, per orchestrator (a fleet agent with the role `orchestrator`), a load figure from records the switchboard already has, keeps an hourly series for the current UTC day in `load.json`, and shows one line per orchestrator in `status` (`asks 3, stalled 1 (oldest 2.5 h), moved 1h 2; waiting 1 msg 2 dec; coders 2 busy 1 idle`). The figures: open asks (the open sub-issues of its charter, read from GitHub at most once an hour per charter and at most 10 reads an hour for the whole fleet, otherwise the cached list); asks with no real movement in 2 h; messages (its reminders already due) and decisions (`decisions.json`) waiting on it; its coders busy and idle; asks moved in the last hour. **Real movement** of an ask is a push, a pull request opened or merged (recorded from the forwarder's webhooks into `ask-moves.jsonl`, 0600, kept one day, naming the pull request and the issues its body closes), a plan approved (the audit log's review consensus) or a report naming it (the audit log); a comment is not movement. An ask never seen to move counts as unmoved since the daemon first saw it. A figure whose source cannot be read is shown as `not recorded`, never zero, and an orchestrator whose asks cannot be read is never alerted: `status` says what was unreadable.
+
+The alert is off unless enabled (the load line is always kept):
+
+```json
+"load_alert": {"enabled": true, "stalled_hours": 2, "stalled_asks": 2, "backlog_hours": 4}
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | the Chief of Staff is woken on a crossing only when `true` |
+| `stalled_hours` | `2` | an ask with no real movement for this long is stalled |
+| `stalled_asks` | `2` | crossing 1: this many asks of one orchestrator stalled |
+| `backlog_hours` | `4` | crossing 2: more open asks than were moved in this many hours while its coders are all busy (at least one coder, none idle) |
+
+On a crossing the Chief of Staff gets ONE reminder (the ordinary delivery rule; audit event `load.alert`) with the figures and a recommended action (move the named stalled asks to another lane; split a lane or add coders). It gets another only when the load is worse than at the last wake, or after the orchestrator recovered below both thresholds and crossed again. Known limit: a pull request counts for an ask only when its body closes that ask's own issue number (not a work item under it), and a push is seen only on a pull request.
+
 ### Data
 
 The switchboard keeps almost nothing. Each fact lives in the system that owns

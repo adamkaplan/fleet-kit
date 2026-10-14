@@ -1,0 +1,354 @@
+"""fleet_health: the load of each orchestrator and the threshold alert to the Chief of Staff (#348).
+
+Every daemon pass `tick` computes, per orchestrator, a load figure from records the switchboard already has (its cached list of open asks,
+its coders' states, the movement of each ask, the decisions and reminders waiting on it), keeps an hourly series for the current UTC day
+in load.json, and, when the alert is on, wakes the Chief of Staff ONCE per episode when a threshold is crossed. `status` prints one line per
+orchestrator from load.json. All decisions live here; bin/fleet-switchboard only supplies the facts (`Context`) and the delivery.
+Loaded by path from bin/fleet-switchboard (load_fleet_health), like plan_ledger.
+
+Real movement of an ask: a push, a pull request opened or merged, a plan approved, a report naming it. A comment is not movement.
+A figure whose source cannot be read is None (`not recorded`), never zero, and an orchestrator with an unreadable source is never alerted.
+"""
+import json
+import os
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+
+STATE_FILE = "load.json"
+MOVES_FILE = "ask-moves.jsonl"
+MOVES_KEEP_SECONDS = 24 * 3600
+AUDIT_TAIL_BYTES = 8 << 20
+READ_BUDGET = 10                 # GitHub reads of asks lists in any hour, for the whole fleet
+ASKS_FRESH_SECONDS = 3600        # a cached list of asks is re-read at most this often
+ASKS_STALE_SECONDS = 3 * 3600    # a list older than this is not believed: the figure is not recorded
+DEFAULTS = {"enabled": False, "stalled_hours": 2.0, "stalled_asks": 2, "backlog_hours": 4.0}
+_REF = re.compile(r"report on (?:([\w.-]+)/)?([\w.-]*)#(\d+)")
+
+
+def validate(raw, where):
+    """The `load_alert` section: absent or null is off. Raises ValueError with a message."""
+    raw = {} if raw is None else raw
+    if not isinstance(raw, dict):
+        raise ValueError("%s must be an object, got %r" % (where, type(raw).__name__))
+    section = dict(DEFAULTS, **raw)
+    if not isinstance(section["enabled"], bool):
+        raise ValueError("%s.enabled must be true or false, got %r" % (where, section["enabled"]))
+    for key in ("stalled_hours", "backlog_hours"):
+        value = section[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 168:
+            raise ValueError("%s.%s must be a number of hours above 0 and at most 168, got %r" % (where, key, value))
+    count = section["stalled_asks"]
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        raise ValueError("%s.stalled_asks must be a whole number of 1 or more, got %r" % (where, count))
+    return section
+
+
+# ---- movement records
+
+def move_rows(event, payload, repo, now, closing=lambda text: []):
+    """[(repo, numbers, kind)] a webhook delivery says about real movement: a push (a pull request synchronised), a pull request opened or
+    merged. `numbers` are the pull request and the issues its body closes. Comments, reviews and labels are not movement."""
+    if event != "pull_request" or not isinstance(payload, dict):
+        return []
+    pr = payload.get("pull_request") if isinstance(payload.get("pull_request"), dict) else {}
+    number, action = pr.get("number"), payload.get("action")
+    if not isinstance(number, int) or isinstance(number, bool):
+        return []
+    if action == "synchronize":
+        kind = "push"
+    elif action in ("opened", "reopened"):
+        kind = "pr_opened"
+    elif action == "closed" and (pr.get("merged") or pr.get("merged_at")):
+        kind = "pr_merged"
+    else:
+        return []
+    numbers = [number] + [n for n in closing(pr.get("body")) if n != number]
+    return [{"at": now, "repo": repo, "numbers": numbers, "kind": kind}]
+
+
+def append_moves(state_dir, rows):
+    if not rows:
+        return
+    fd = os.open(str(Path(state_dir) / MOVES_FILE), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "a") as handle:
+        handle.write("".join(json.dumps(row, sort_keys=True) + "\n" for row in rows))
+
+
+def read_moves(state_dir, since):
+    path = Path(state_dir) / MOVES_FILE
+    rows = []
+    try:
+        for line in path.read_text().splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict) and isinstance(row.get("at"), (int, float)) and row["at"] >= since and isinstance(row.get("numbers"), list):
+                rows.append(row)
+    except OSError:
+        pass
+    return rows
+
+
+def prune_moves(state_dir, now):
+    """Drop rows older than a day, when the file has any (a rewrite, atomic)."""
+    rows = read_moves(state_dir, now - MOVES_KEEP_SECONDS)
+    path = Path(state_dir) / MOVES_FILE
+    try:
+        if len(path.read_text().splitlines()) <= len(rows) + 200:
+            return
+    except OSError:
+        return
+    temp = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))
+    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write("".join(json.dumps(r, sort_keys=True) + "\n" for r in rows))
+    os.replace(str(temp), str(path))
+
+
+def _epoch(text):
+    try:
+        return datetime.fromisoformat(str(text).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def audit_moves(state_dir, since):
+    """Movement the audit log holds: a report naming an ask (a delivered report's description) and a plan approved (a review consensus, whose
+    subject is `repo#ask`). Only the end of the active file is read; None when it cannot be read."""
+    path = Path(state_dir) / "audit.jsonl"
+    try:
+        with open(str(path), "rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, size - AUDIT_TAIL_BYTES))
+            data = handle.read()
+            torn = size > AUDIT_TAIL_BYTES
+    except OSError:
+        return None
+    rows = []
+    for number, line in enumerate(data.decode("utf-8", "replace").splitlines()):
+        if (number == 0 and torn) or ("report on" not in line and "plan.review.consensus" not in line):
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        at = _epoch(entry.get("ts")) if isinstance(entry, dict) else None
+        if at is None or at < since:
+            continue
+        detail = entry.get("detail") if isinstance(entry.get("detail"), dict) else {}
+        if entry.get("event") == "v2.synthetic" and entry.get("phase") == "intent":
+            found = _REF.search(str(detail.get("description") or ""))
+            if found:
+                rows.append({"at": at, "repo": (found.group(1) + "/" if found.group(1) else "") + found.group(2), "numbers": [int(found.group(3))], "kind": "report"})
+        elif entry.get("event") == "plan.review.consensus" and "#" in str(entry.get("subject")):
+            repo, _, ask = str(entry["subject"]).rpartition("#")
+            if ask.isdigit():
+                rows.append({"at": at, "repo": repo, "numbers": [int(ask)], "kind": "plan"})
+    return rows
+
+
+def _same_repo(want, have):
+    """A moved row names a repo as `owner/name`, `name` or nothing; an ask's repo is `owner/name`."""
+    want, have = str(want or "").lower(), str(have or "").lower()
+    return not have or not want or want == have or want.rpartition("/")[2] == have.rpartition("/")[2]
+
+
+# ---- the figures
+
+def last_moves(asks, rows):
+    """{(repo, number): the newest movement time among `rows`, or None}."""
+    found = {}
+    for ask in asks:
+        times = [row["at"] for row in rows if ask["number"] in row["numbers"] and _same_repo(ask["repo"], row.get("repo"))]
+        found[(ask["repo"], ask["number"])] = max(times) if times else None
+    return found
+
+
+def figures(name, info, rows, now, cfg):
+    """One orchestrator's figures. `info`: asks [{repo, number, first_seen}] or None (unreadable), busy, idle, messages, decisions."""
+    out = {"name": name, "busy": info["busy"], "idle": info["idle"], "messages": info["messages"], "decisions": info["decisions"],
+           "open_asks": None, "stalled": None, "stalled_asks": [], "oldest_stall_hours": None, "moved_1h": None, "moved_backlog": None}
+    asks = info.get("asks")
+    if asks is None:
+        return out
+    last = last_moves(asks, rows)
+    out["open_asks"] = len(asks)
+    ages, stalled = [], []
+    for ask in asks:
+        at = last[(ask["repo"], ask["number"])]
+        at = max(at, ask["first_seen"]) if at is not None else ask["first_seen"]   # never seen to move: unmoved since it was first seen
+        ages.append(now - at)
+        if now - at >= cfg["stalled_hours"] * 3600:
+            stalled.append(ask["number"])
+    out["stalled"], out["stalled_asks"] = len(stalled), sorted(stalled)
+    out["oldest_stall_hours"] = round(max(ages) / 3600.0, 1) if ages else 0.0
+    moved = lambda hours: sum(1 for ask in asks if last[(ask["repo"], ask["number"])] is not None and now - last[(ask["repo"], ask["number"])] < hours * 3600)
+    out["moved_1h"], out["moved_backlog"] = moved(1), moved(cfg["backlog_hours"])
+    return out
+
+
+def crossing(fig, cfg):
+    """(severity, reasons): 0 and [] when no threshold is crossed. Unreadable asks never cross."""
+    if fig["open_asks"] is None:
+        return 0, []
+    reasons, severity = [], 0
+    if fig["stalled"] >= cfg["stalled_asks"]:
+        reasons.append("stalled"); severity += fig["stalled"]
+    full = fig["busy"] > 0 and fig["idle"] == 0
+    if full and fig["open_asks"] > fig["moved_backlog"]:
+        reasons.append("backlog"); severity += fig["open_asks"] - fig["moved_backlog"]
+    return severity, reasons
+
+
+def wake_text(fig, reasons, cfg):
+    asks = ", ".join("#%d" % n for n in fig["stalled_asks"][:5])
+    text = ("Load alert: %s is overloaded. %d open ask(s); %d with no real movement in %g h%s; moved %d in the last hour and %d in %g h; "
+            "coders %d busy, %d idle; waiting on it: %d message(s), %s decision(s)." % (
+                fig["name"], fig["open_asks"], fig["stalled"], cfg["stalled_hours"], " (%s)" % asks if asks else "",
+                fig["moved_1h"], fig["moved_backlog"], cfg["backlog_hours"], fig["busy"], fig["idle"], fig["messages"], "not recorded" if fig["decisions"] is None else fig["decisions"]))
+    actions = []
+    if "stalled" in reasons:
+        actions.append("move the stalled asks (%s) to another lane" % (asks or "named above"))
+    if "backlog" in reasons:
+        actions.append("split a lane or add coders (all are busy and asks queue faster than they move)")
+    return text + " Recommended: " + "; or ".join(actions) + "."
+
+
+def judge(fig, cfg, previous):
+    """(wake text or None, the episode's new state). Once per episode: again only when worse, or after recovery and a new crossing."""
+    severity, reasons = crossing(fig, cfg)
+    if fig["open_asks"] is None:
+        return None, previous   # nothing believed: no change, no wake
+    if not severity:
+        return None, {"sent": 0}
+    if severity > (previous or {}).get("sent", 0):
+        return wake_text(fig, reasons, cfg), {"sent": severity}
+    return None, previous
+
+
+# ---- the pass
+
+class Context:
+    """What the daemon supplies: `now`, `state_dir`, `cfg` (validated section), `orchestrators` {name: {charter, repo, busy, idle, messages}},
+    `read_asks(charter, repo) -> [{repo, number}]` (may raise), `cos` (the Chief of Staff's name or None) and `wake(text)`."""
+
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+def _read_state(state_dir):
+    try:
+        data = json.loads((Path(state_dir) / STATE_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_state(state_dir, data):
+    path = Path(state_dir) / STATE_FILE
+    temp = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))
+    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        json.dump(data, handle, sort_keys=True, indent=1)
+        handle.write("\n")
+    os.replace(str(temp), str(path))
+
+
+def decisions_waiting(state_dir):
+    """{agent: open decisions} from decisions.json, or None when it cannot be read."""
+    try:
+        listed = json.loads((Path(state_dir) / "decisions.json").read_text()).get("decisions")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(listed, list):
+        return None
+    found = {}
+    for item in listed:
+        if isinstance(item, dict) and not item.get("closed"):
+            found[str(item.get("agent"))] = found.get(str(item.get("agent")), 0) + 1
+    return found
+
+
+def _refresh_asks(ctx, state, now):
+    """Re-read at most READ_BUDGET asks lists an hour (the oldest first); a failed read keeps the cached list and is told."""
+    cache, reads, problems = state.setdefault("asks", {}), [t for t in state.get("reads", []) if now - t < 3600], []
+    for name in sorted(ctx.orchestrators, key=lambda n: cache.get(n, {}).get("at", 0)):
+        info = ctx.orchestrators[name]
+        entry = cache.get(name) or {}
+        if entry.get("at") and now - entry["at"] < ASKS_FRESH_SECONDS:
+            continue
+        if not info.get("charter") or len(reads) >= READ_BUDGET:
+            continue
+        reads.append(now)
+        try:
+            found = ctx.read_asks(info["charter"], info.get("repo"))
+        except Exception as err:   # an unreadable source is told, not guessed
+            problems.append("%s: asks not readable (%s)" % (name, str(err).splitlines()[0][:80] if str(err) else type(err).__name__))
+            continue
+        seen = {(a["repo"], a["number"]): a["first_seen"] for a in entry.get("list", [])}
+        cache[name] = {"at": now, "list": [{"repo": a["repo"], "number": a["number"], "first_seen": seen.get((a["repo"], a["number"]), now)} for a in found]}
+    for gone in [n for n in cache if n not in ctx.orchestrators]:
+        del cache[gone]
+    state["reads"] = reads
+    return problems
+
+
+def tick(ctx):
+    """One pass. Returns the list of (orchestrator, wake text) sent. Never raises for a source it cannot read."""
+    now, state = ctx.now, _read_state(ctx.state_dir)
+    problems = _refresh_asks(ctx, state, now)
+    rows = read_moves(ctx.state_dir, now - 24 * 3600)
+    audited = audit_moves(ctx.state_dir, now - 24 * 3600)
+    if audited is None:
+        problems.append("movement: the audit log cannot be read")
+    rows += audited or []
+    waiting = decisions_waiting(ctx.state_dir)
+    if waiting is None:
+        problems.append("decisions: decisions.json cannot be read")
+    day, hour = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d"), datetime.fromtimestamp(now, timezone.utc).strftime("%H")
+    series, sent, episodes, latest = state.get("series", {}), [], state.get("episodes", {}), {}
+    for name in sorted(ctx.orchestrators):
+        info, entry = ctx.orchestrators[name], (state.get("asks") or {}).get(name)
+        asks = None
+        if entry and now - entry.get("at", 0) < ASKS_STALE_SECONDS:
+            asks = entry["list"]
+        elif info.get("charter"):
+            problems.append("%s: no recent list of its open asks" % name) if (name + ": ") not in " ".join(problems) else None
+        fig = figures(name, {"asks": asks, "busy": info["busy"], "idle": info["idle"], "messages": info["messages"],
+                             "decisions": None if waiting is None else waiting.get(name, 0)}, rows, now, ctx.cfg)
+        latest[name] = fig
+        mine = series.get(name) if isinstance(series.get(name), dict) and series[name].get("day") == day else {"day": day, "hours": {}}
+        mine["hours"][hour] = {k: fig[k] for k in ("open_asks", "stalled", "moved_1h", "busy", "idle", "messages", "decisions", "oldest_stall_hours")}
+        series[name] = mine
+        before = episodes.get(name)
+        text, episodes[name] = judge(fig, ctx.cfg, before)
+        if text and ctx.cfg["enabled"] and ctx.cos:
+            ctx.wake(text)
+            sent.append((name, text))
+        elif text:
+            episodes[name] = before   # not sent (off, or no Chief of Staff to tell): the episode is still open
+    state.update({"at": now, "series": {n: series[n] for n in latest}, "episodes": {n: episodes.get(n) for n in latest},
+                  "latest": latest, "problems": problems, "alert": bool(ctx.cfg["enabled"])})
+    _write_state(ctx.state_dir, state)
+    prune_moves(ctx.state_dir, now)
+    return sent
+
+
+def status_lines(state_dir, now):
+    """The `status` lines: one per orchestrator, then what could not be read. Empty until the daemon has made a pass."""
+    state = _read_state(state_dir)
+    latest = state.get("latest")
+    if not isinstance(latest, dict) or not latest:
+        return []
+    num = lambda value: "not recorded" if value is None else str(value)
+    out = ["load        %d orchestrator(s); alert %s" % (len(latest), "on" if state.get("alert") else "off")]
+    for name in sorted(latest):
+        f = latest[name]
+        out.append("  %-12s asks %s, stalled %s (oldest %s h), moved 1h %s; waiting %d msg %s dec; coders %d busy %d idle" % (
+            name, num(f["open_asks"]), num(f["stalled"]), num(f["oldest_stall_hours"]), num(f["moved_1h"]),
+            f["messages"], num(f["decisions"]), f["busy"], f["idle"]))
+    if state.get("problems"):
+        out.append("  unreadable: %s" % "; ".join(state["problems"][:3]))
+    return out

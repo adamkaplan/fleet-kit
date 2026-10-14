@@ -44576,6 +44576,207 @@ class TestEventFeedReads(unittest.TestCase):
             self.assertIn("events: DOWN: old reads", sb.v2_calls_status(tmp, 1000.0))
 
 
+class TestLoadAlert(Base):
+    """#348: the load figures per orchestrator, the hourly series, the `status` lines and the once-per-episode alert to the Chief of Staff."""
+    T0 = _dt.datetime(2026, 10, 14, 10, 0, tzinfo=_dt.timezone.utc).timestamp()
+
+    def setUp(self):
+        super().setUp()
+        self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(str(self.state_dir), 0o700)
+        self.health = sb.load_fleet_health()
+        self.asks = {}       # orchestrator -> [numbers]
+        self.reads = []
+        self.woken = []
+        self.fail_reads = False
+
+    def orch(self, busy=0, idle=0, messages=0, charter=1):
+        return {"charter": charter, "repo": "acme/widget", "busy": busy, "idle": idle, "messages": messages}
+
+    def tick(self, at, orchestrators, **cfg):
+        def read_asks(charter, repo):
+            self.reads.append((at, charter))
+            if self.fail_reads:
+                raise RuntimeError("gh is down")
+            return [{"repo": "acme/widget", "number": n} for n in self.asks[charter]]
+        ctx = self.health.Context(now=at, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS, **dict({"enabled": True}, **cfg)), orchestrators=orchestrators,
+                                  read_asks=read_asks, cos="cos", wake=self.woken.append)
+        return self.health.tick(ctx)
+
+    def latest(self):
+        return json.loads((self.state_dir / "load.json").read_text())["latest"]
+
+    def move(self, at, number, kind="push"):
+        self.health.append_moves(str(self.state_dir), [{"at": at, "repo": "acme/widget", "numbers": [number], "kind": kind}])
+
+    def test_each_orchestrator_has_the_five_figures_from_the_records(self):
+        self.asks = {1: [10, 11, 12], 2: [20], 3: [30, 31]}
+        orchestrators = {"orch-a": self.orch(busy=2, idle=1, messages=1, charter=1), "orch-b": self.orch(idle=1, charter=2), "orch-c": self.orch(busy=1, charter=3)}
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [{"agent": "orch-a"}, {"agent": "orch-a"}, {"agent": "orch-b", "closed": True}]}))
+        self.tick(self.T0, orchestrators)                      # first sight of every ask
+        self.move(self.T0 + 3 * 3600 - 60, 10)                 # ask 10 moved 1 minute ago; 20 and 30 moved 3 h ago
+        self.move(self.T0 + 3 * 3600 - 60, 12)
+        self.tick(self.T0 + 3 * 3600, orchestrators)
+        got = self.latest()
+        a = got["orch-a"]
+        self.assertEqual((a["open_asks"], a["stalled"], a["stalled_asks"], a["moved_1h"], a["busy"], a["idle"], a["messages"], a["decisions"]),
+                         (3, 1, [11], 2, 2, 1, 1, 2))
+        self.assertEqual((got["orch-b"]["open_asks"], got["orch-b"]["stalled"], got["orch-b"]["decisions"]), (1, 1, 0))
+        self.assertEqual((got["orch-c"]["open_asks"], got["orch-c"]["stalled"], got["orch-c"]["oldest_stall_hours"]), (2, 2, 3.0))
+
+    def test_five_movement_kinds_reset_the_clock_and_a_comment_does_not(self):
+        self.asks = {1: [1, 2, 3, 4, 5, 6]}
+        self.tick(self.T0, {"o": self.orch(busy=1, charter=1)})
+        late = self.T0 + 3 * 3600
+        for number, kind in ((1, "push"), (2, "pr_opened"), (3, "pr_merged")):
+            self.move(late - 100, number, kind)
+        ts = lambda at: _dt.datetime.fromtimestamp(at, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        with open(str(self.state_dir / "audit.jsonl"), "w") as handle:
+            for entry in ({"ts": ts(late - 100), "event": "v2.synthetic", "phase": "intent", "subject": "cos",
+                           "detail": {"description": "switchboard: worker report on widget#4: done"}},
+                          {"ts": ts(late - 100), "event": "plan.review.consensus", "subject": "acme/widget#5", "detail": {}},
+                          {"ts": ts(late - 100), "event": "github.comment", "subject": "acme/widget#6", "detail": {}}):   # a plain comment
+                handle.write(json.dumps(entry) + "\n")
+        self.tick(late, {"o": self.orch(busy=1, charter=1)})
+        self.assertEqual((self.latest()["o"]["stalled"], self.latest()["o"]["stalled_asks"], self.latest()["o"]["moved_1h"]), (1, [6], 5))
+
+    def test_move_rows_come_from_webhooks_and_a_comment_makes_none(self):
+        pr = {"number": 7, "body": "Closes #3", "merged": True}
+        rows = lambda event, action, **kw: self.health.move_rows(event, {"action": action, "pull_request": dict(pr, **kw)}, "acme/widget", 5, sb.closing_numbers)
+        self.assertEqual([r["kind"] for r in rows("pull_request", "synchronize")], ["push"])
+        self.assertEqual([r["kind"] for r in rows("pull_request", "opened")], ["pr_opened"])
+        self.assertEqual([r["kind"] for r in rows("pull_request", "closed")], ["pr_merged"])
+        self.assertEqual(rows("pull_request", "closed", merged=False), [])
+        self.assertEqual(rows("pull_request", "synchronize")[0]["numbers"], [7, 3])
+        self.assertEqual(self.health.move_rows("issue_comment", {"action": "created"}, "acme/widget", 5), [])
+
+    def test_the_hourly_series_has_one_entry_per_hour_with_a_pass(self):
+        self.asks = {1: [1]}
+        for hour in range(6):
+            self.tick(self.T0 + hour * 3600 + 120, {"o": self.orch(charter=1)})
+        series = json.loads((self.state_dir / "load.json").read_text())["series"]["o"]
+        self.assertEqual(sorted(series["hours"]), ["10", "11", "12", "13", "14", "15"])
+        self.assertEqual(series["day"], "2026-10-14")
+
+    def test_status_prints_one_line_per_orchestrator_with_the_figures(self):
+        self.asks = {1: [1], 2: []}
+        self.tick(self.T0, {"orch-a": self.orch(busy=1, charter=1), "orch-b": self.orch(idle=2, charter=2)})
+        lines = self.health.status_lines(str(self.state_dir), self.T0)
+        self.assertEqual(len([l for l in lines if l.strip().startswith("orch-")]), 2)
+        self.assertIn("asks 1, stalled 0", lines[1])
+        self.assertIn("coders 1 busy 0 idle", lines[1])
+        self.assertEqual(self.health.status_lines(str(self.state_dir / "nowhere"), self.T0), [])
+        report = {"load": lines}
+        self.assertTrue(any("orch-a" in l for l in (("      " + x) for x in report["load"])))
+
+    def stalled_world(self, count=2):
+        self.asks = {1: list(range(1, count + 1))}
+        self.tick(self.T0, {"o": self.orch(idle=1, charter=1)})
+
+    def test_two_stalled_asks_wake_once_over_three_passes_with_figures_and_an_action(self):
+        self.stalled_world(2)
+        for hour in (2, 3, 4):
+            self.tick(self.T0 + hour * 3600, {"o": self.orch(idle=1, charter=1)})
+        self.assertEqual(len(self.woken), 1)
+        text = self.woken[0]
+        for part in ("o is overloaded", "2 open ask(s)", "2 with no real movement in 2 h", "#1, #2", "Recommended: move the stalled asks"):
+            self.assertIn(part, text)
+
+    def test_a_full_coder_team_with_a_backlog_wakes_once_and_idle_coders_do_not(self):
+        self.asks = {1: [1, 2, 3], 2: [4, 5, 6]}
+        both = {"full": self.orch(busy=2, idle=0, charter=1), "free": self.orch(busy=2, idle=1, charter=2)}
+        self.tick(self.T0, both)
+        for number in (1, 4):
+            self.move(self.T0 + 3600, number)
+        self.tick(self.T0 + 3700, both)
+        self.assertEqual([t.split(" is ")[0] for t in self.woken], ["Load alert: full"])
+        self.assertIn("split a lane or add coders", self.woken[0])
+
+    def test_worse_wakes_again_and_recovery_then_a_new_crossing_wakes_again(self):
+        self.stalled_world(2)
+        o = {"o": self.orch(idle=1, charter=1)}
+        self.tick(self.T0 + 2 * 3600, o)
+        self.assertEqual(len(self.woken), 1)
+        self.asks[1] = [1, 2, 3]
+        self.tick(self.T0 + 3 * 3600 + 10, o)              # the list is re-read after an hour; ask 3 is new, 1 and 2 still stalled: 2 stalled, not worse
+        self.assertEqual(len(self.woken), 1)
+        self.tick(self.T0 + 5 * 3600 + 20, o)              # ask 3 has now gone 2 h too: 3 stalled, worse
+        self.assertEqual(len(self.woken), 2)
+        self.asks[1] = []
+        self.tick(self.T0 + 6 * 3600 + 30, o)              # recovered
+        self.assertEqual(len(self.woken), 2)
+        self.asks[1] = [7, 8]
+        self.tick(self.T0 + 7 * 3600 + 40, o)              # two new asks, first seen now
+        self.tick(self.T0 + 9 * 3600 + 50, o)              # stalled again: a new crossing after recovery
+        self.assertEqual(len(self.woken), 3)
+
+    def test_configured_thresholds_are_followed(self):
+        self.stalled_world(2)
+        self.tick(self.T0 + 3 * 3600, {"o": self.orch(idle=1, charter=1)}, stalled_asks=3)
+        self.assertEqual(self.woken, [])
+        self.asks[1] = [1, 2, 3]
+        self.tick(self.T0 + 4 * 3600 + 5, {"o": self.orch(idle=1, charter=1)}, stalled_asks=3)
+        self.tick(self.T0 + 6 * 3600 + 10, {"o": self.orch(idle=1, charter=1)}, stalled_asks=3)
+        self.assertEqual(len(self.woken), 1)
+        with self.assertRaises(ValueError):
+            self.health.validate({"stalled_asks": 0}, "x")
+        self.assertEqual(self.health.validate(None, "x"), self.health.DEFAULTS)
+
+    def test_reads_are_bounded_and_an_unreadable_source_means_no_wake(self):
+        self.asks = {n: [n] for n in range(1, 41)}
+        many = {"o%d" % n: self.orch(charter=n) for n in range(1, 41)}
+        self.tick(self.T0, many)
+        self.tick(self.T0 + 1800, many)
+        self.assertLessEqual(len(self.reads), 10)
+        # an unreadable source: the cache goes stale, the asks are not believed, nobody is woken, and status says so once
+        self.fail_reads = True
+        self.woken.clear()
+        later = {"x": self.orch(charter=1)}
+        self.asks = {1: [1, 2, 3]}
+        self.tick(self.T0 + 10 * 3600, later)
+        self.assertEqual(self.woken, [])
+        self.assertIsNone(self.latest()["x"]["open_asks"])
+        lines = self.health.status_lines(str(self.state_dir), self.T0)
+        self.assertEqual(len([l for l in lines if "unreadable" in l]), 1)
+        self.assertIn("asks not recorded", lines[1])
+
+    def test_the_kill_switch_keeps_the_line_and_sends_no_wake(self):
+        self.stalled_world(2)
+        self.tick(self.T0 + 3 * 3600, {"o": self.orch(idle=1, charter=1)}, enabled=False)
+        self.assertEqual(self.woken, [])
+        self.assertEqual(len([l for l in self.health.status_lines(str(self.state_dir), self.T0) if l.strip().startswith("o ")]), 1)
+        self.tick(self.T0 + 4 * 3600, {"o": self.orch(idle=1, charter=1)})   # switched on later: the open episode still fires
+        self.assertEqual(len(self.woken), 1)
+
+    def test_the_fixed_text_names_nothing_and_every_name_comes_from_the_records(self):
+        def render(boss):
+            self.woken.clear()
+            shutil.rmtree(str(self.state_dir)); self.state_dir.mkdir(mode=0o700)
+            self.asks = {1: [1, 2]}
+            self.tick(self.T0, {boss: self.orch(idle=1, charter=1)})
+            self.tick(self.T0 + 3 * 3600, {boss: self.orch(idle=1, charter=1)})
+            return self.woken[0] + "\n" + "\n".join(self.health.status_lines(str(self.state_dir), 0))
+        self.assertEqual(render("orch-a").replace("orch-a", "N"), render("orch-b").replace("orch-b", "N"))
+
+    def test_the_daemon_tick_wakes_the_chief_of_staff_by_a_reminder(self):
+        self.asks = {1: [1, 2]}
+        engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.T0, audit=None, actor="daemon", intents=None,
+                                       config={"load_alert": self.health.validate({"enabled": True}, "x")})
+        seen = lambda name, fleet, status: types.SimpleNamespace(name=name, fleet=fleet, status=status)
+        discovery = types.SimpleNamespace(agents={"orch": seen("orch", {"role": "orchestrator", "charter": 1, "repo": "acme/widget"}, "idle"),
+                                                  "cos": seen("cos", {"role": "chief-of-staff"}, "idle")})
+        self.assertEqual(sb.load_tick(engine, discovery), [])   # no ask repo: the asks are unreadable, so no wake
+        self.assertIn("no ask repo", " ".join(json.loads((self.state_dir / "load.json").read_text())["problems"]))
+        self.assertEqual(sb.read_reminders(str(self.state_dir)), [])
+
+    def test_a_pull_request_webhook_leaves_one_movement_row(self):
+        hub = sb.GitHubHub.__new__(sb.GitHubHub)
+        rows = self.health.move_rows("pull_request", {"action": "synchronize", "pull_request": {"number": 9, "body": "fixes #4"}}, "acme/widget", self.T0, sb.closing_numbers)
+        self.health.append_moves(str(self.state_dir), rows)
+        self.assertEqual(self.health.read_moves(str(self.state_dir), 0)[0]["numbers"], [9, 4])
+        self.assertEqual(stat.S_IMODE((self.state_dir / "ask-moves.jsonl").stat().st_mode), 0o600)
+
+
 def main(argv):
     loader = unittest.TestLoader()
     suite = loader.loadTestsFromModule(sys.modules[__name__])
