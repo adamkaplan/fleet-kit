@@ -10112,14 +10112,33 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
                         'fleet-switchboard report done --issue 5 "$(cat %s/x)"' % self.TEMP):
             self.assertEqual(self.evaluate(rules, "shell", command), "allow", command)
         for command in ("make build", "git push", "git -C /home/a/Code/widget push", "git commit -m x", "git fetch", "git pull", "git -c core.pager=sh log",
-                        "git status; git push", "rm -rf x", "az keyvault secret show --name x", "az account get-access-token", "az containerapp show -n a -g g",
-                        "az containerapp env show -n e -g g", "az vm delete -n x", "cat /home/a/.ssh/id_rsa", "gh pr merge 5 --admin", "gh pr merge 5 --auto",
+                        "git status; git push", "rm -rf x", "az keyvault secret show --name x", "az account get-access-token",
+                        "az vm delete -n x", "cat /home/a/.ssh/id_rsa", "gh pr merge 5 --admin", "gh pr merge 5 --auto",
                         "gh pr review 5 --approve", "gh repo delete o/r", "curl https://example.com", "timeout 5 rm -rf x", "fleet-switchboard decisions batch --title x",
                         "gh api repos/o/r/issues -fa=b", "gh api repos/o/r/issues --raw-field a=b", "gh api repos/o/r/issues -Fa=@f", "git credential fill", "gh auth status -t", "gh auth status --show-token", "az acr credential show -n r", "az webapp config appsettings list -n a -g g", "fleet-switchboard gates mode acme/app enforce", "fleet-switchboard gates mode acme/app ENFORCE", "fleet-switchboard gates on",
-                        "timeout 30 fleet-switchboard gates mode acme/app enforce", "timeout 5 fleet-switchboard gates on", "timeout 5 az keyvault secret show --name x", "timeout 30 az acr credential show -n r", "timeout 30 az webapp config appsettings list -n a -g g", "timeout 30 az storage account keys list -n s", "timeout 30 az containerapp show -n a -g g", "timeout 5 gh api repos/o/r/issues -X POST", "timeout 5 git ls-remote ext::sh",
+                        "timeout 30 fleet-switchboard gates mode acme/app enforce", "timeout 5 fleet-switchboard gates on", "timeout 5 az keyvault secret show --name x", "timeout 30 az acr credential show -n r", "timeout 30 az webapp config appsettings list -n a -g g", "timeout 30 az storage account keys list -n s", "timeout 5 gh api repos/o/r/issues -X POST", "timeout 5 git ls-remote ext::sh",
                         "fleet-switchboard waive acme/app#5 --gates G6 --reason x", "timeout 5 fleet-switchboard waive acme/app#5 --gates G6 --reason x",
                         "timeout 90 fleet-switchboard decisions list --tier all", "herdr agent prompt a1 hi", "herdr pane send p1 ls", "herdr pane keys p1 Enter", "herdr pane close p1"):
             self.assertEqual(self.evaluate(rules, "shell", command), "deny", command)
+
+    AZ_READS = ("az vm list-usage --location eastus", "az containerapp revision list -n a -g g", "az containerapp show -n a -g g", "az containerapp env show -n e -g g",
+                "az vm list -g g", "az vmss list -g g", "az group list", "az webapp show -n a -g g", "az account show", "az containerapp list -g g")
+    AZ_SECRETS = ("az keyvault secret show --name x", "az keyvault secret list --vault-name v", "az account get-access-token", "az ad app credential list --id x",
+                  "az ad sp credential reset --id x", "az storage account keys list -n s", "az cosmosdb keys list -n c -g g", "az cosmosdb list-keys -n c -g g",
+                  "az webapp config connection-string list -n a -g g", "az webapp config appsettings list -n a -g g", "az containerapp secret list -n a -g g",
+                  "az containerapp secret show -n a -g g --secret-name s", "az functionapp keys list -n f -g g", "az sql db show-connection-string -n d",
+                  "az containerapp exec -n a -g g", "az containerapp up -n a", "az containerapp delete -n a -g g", "az containerapp update -n a -g g", "az vm start -n v -g g",
+                  "az rest --method get --url https://x", "az acr credential show -n r")
+
+    def test_az_reads_are_allowed_generally_and_every_secret_reading_or_writing_verb_stays_denied(self):
+        for path in self.PATHS:
+            with self.subTest(file=path.name):
+                _, rules = self.parse(path)
+                for command in self.AZ_READS:
+                    self.assertEqual(self.evaluate(rules, "shell", command), "allow", command)
+                for command in self.AZ_SECRETS:
+                    self.assertEqual(self.evaluate(rules, "shell", command), "deny", command)
+                    self.assertEqual(self.evaluate(rules, "shell", "timeout 30 " + command), "deny", "timeout 30 " + command)
 
     READ_ONLY_ADDED = ("fleet-switchboard review measure --since 7", "fleet-switchboard review laws acme/api#5", "fleet-switchboard impact floor acme/api#5 --json",
                        "fleet-switchboard impact hold --dry-run", "fleet-switchboard pr-explain acme/api#5 --check", "fleet-switchboard agents verify")

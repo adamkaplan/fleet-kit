@@ -55,7 +55,7 @@ permissions:
   - {action: shell, resource: "gh issue edit *", effect: allow}
   - {action: shell, resource: "git *", effect: allow}
   - {action: shell, resource: "az * show *", effect: allow}
-  - {action: shell, resource: "az * list *", effect: allow}
+  - {action: shell, resource: "az * list*", effect: allow}
   - {action: shell, resource: "az * log *", effect: allow}
   - {action: shell, resource: "az * logs *", effect: allow}
   - {action: shell, resource: "az * status *", effect: allow}
@@ -184,7 +184,8 @@ permissions:
   - {action: shell, resource: "az *appsettings*", effect: deny}
   - {action: shell, resource: "az *get-access-token*", effect: deny}
   - {action: shell, resource: "az rest*", effect: deny}
-  - {action: shell, resource: "az containerapp*", effect: deny}
+  - {action: shell, resource: "az containerapp exec*", effect: deny}
+  - {action: shell, resource: "az *list-keys*", effect: deny}
   - {action: shell, resource: "az *connection-string*", effect: deny}
   - {action: shell, resource: "az *keys *", effect: deny}
   - {action: shell, resource: "az *assword*", effect: deny}
