@@ -26008,7 +26008,7 @@ class TestDecisionsPluginSource(unittest.TestCase):
         self.assertIn("setInterval(refresh, SAFETY_MS)", text)
 
     def test_it_is_read_only_holds_no_credential_spawns_nothing_and_calls_nothing_over_the_network(self):
-        for name in ("tui.tsx", "decisions.mjs"):
+        for name in ("tui.tsx", "decisions.mjs", "health.mjs"):
             # the one link host the panel may name (https://github.com, a row's issue or PR) and the one mouse
             # handler it may have (onMouseUp on a row: copy its link) are the only exceptions; nothing else changes
             code = self.code(name).lower().replace("https:", "").replace("onmouseup", "")
@@ -26040,7 +26040,7 @@ class TestTrialDecisionsPlugin(Base):
         trial = self.trial()
         self.assertEqual(trial.install_decisions_plugin(), "installed")
         target = Path(trial.lab.opencode_config) / "fleet-decisions"
-        for name in ("tui.tsx", "decisions.mjs"):
+        for name in ("tui.tsx", "decisions.mjs", "health.mjs"):
             self.assertEqual((target / name).read_text(), (REPO / "plugins" / "fleet-decisions-tui" / name).read_text())
         self.assertEqual(self.cli_json(trial), {"plugins": ["./fleet-decisions"]})
 
@@ -26120,7 +26120,7 @@ class TestTrialDecisionsPlugin(Base):
         self.assertRegex(out.getvalue(), r"decisions plugin\s+installed")
 
     def test_the_plugin_files_the_trial_installs_are_the_kits_own(self):
-        self.assertEqual(sorted(sb.DECISIONS_PLUGIN_FILES), ["decisions.mjs", "tui.tsx"])  # PR 16: the shared installer's
+        self.assertEqual(sorted(sb.DECISIONS_PLUGIN_FILES), ["decisions.mjs", "health.mjs", "tui.tsx"])  # PR 16: the shared installer's
         for name in sb.DECISIONS_PLUGIN_FILES:
             self.assertTrue((REPO / "plugins" / "fleet-decisions-tui" / name).is_file())
 

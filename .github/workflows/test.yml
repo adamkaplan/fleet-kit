@@ -83,6 +83,10 @@ jobs:
           bin/test-switchboard 2>&1 | tee "$RUNNER_TEMP/out.txt"
           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
 
+      - name: node --test plugins/fleet-decisions-tui/health.test.mjs
+        if: ${{ !cancelled() }}
+        run: node --test plugins/fleet-decisions-tui/health.test.mjs
+
       - name: bin/fleet-scenario validate
         if: ${{ !cancelled() }}
         run: bin/fleet-scenario validate
