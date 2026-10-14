@@ -183,6 +183,14 @@ def health_recorder(engine):
     return held
 
 
+def _health_fault(engine, where, err):
+    """A recorder fault is never in a pass's way, but it is said once per change of the error (`_note`), so a recorder that never records leaves a trace."""
+    try:
+        engine._note("health.error", where, {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
+    except Exception:
+        pass
+
+
 def health_ingest_messages(engine, session, page):
     """Messages the feed has just read, handed to the recorder. No read of its own; a fault is ignored."""
     try:
@@ -190,8 +198,8 @@ def health_ingest_messages(engine, session, page):
         if recorder is not None and isinstance(page, list):
             for message in page[:20]:
                 recorder.ingest_message(session, message)
-    except Exception:
-        pass
+    except Exception as err:
+        _health_fault(engine, "ingest", err)
 
 
 def health_write(engine, state, now):
@@ -204,8 +212,8 @@ def health_write(engine, state, now):
         records = load_health_records()
         body = recorder.body(records.read_tool_file(engine.state_dir))
         state_write(Path(engine.state_dir) / records.FILE, json.dumps(body, sort_keys=True), _without(body, "written_at"), HEARTBEAT_PR_STATE, nofollow=True)
-    except Exception:
-        pass
+    except Exception as err:
+        _health_fault(engine, "write", err)
 
 
 def load_impact_floor():

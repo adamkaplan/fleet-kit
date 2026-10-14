@@ -118,15 +118,27 @@ class Bounds(unittest.TestCase):
         self.assertGreaterEqual(oldest, hr._hour(clock[0]) - 47 * 3600)
         self.assertLessEqual(len(rec.seen), hr.MAX_SEEN)
 
-    def test_file_is_private_and_atomic(self):
-        with tempfile.TemporaryDirectory() as d:
-            rec = hr.Recorder(lambda: time.time())
-            rec.ingest_message("ses_a", msg("m1", 5, 0.1, time.time()))
-            self.assertTrue(hr.write(d, rec.body()))
-            self.assertEqual(os.stat(os.path.join(d, hr.FILE)).st_mode & 0o777, 0o600)
-            self.assertEqual(os.listdir(d), [hr.FILE])
-            self.assertIsNotNone(hr.read(d, time.time()))
-            self.assertIsNone(hr.read(d, time.time() + 10000))
+    def test_file_cap_trims_oldest_hours_first(self):
+        clock = [NOW]
+        rec = hr.Recorder(lambda: clock[0])
+        n = 0
+        for hour in range(40):
+            clock[0] = NOW + hour * 3600
+            for agent in range(30):
+                n += 1
+                rec.ingest_message("ses_%d" % agent, msg("m%d" % n, 100, 0.001, clock[0]))
+        full = len(json.dumps(rec.body(), sort_keys=True))
+        old_cap, hr.FILE_CAP = hr.FILE_CAP, full // 2
+        try:
+            body = rec.body()
+        finally:
+            hr.FILE_CAP = old_cap
+        self.assertLessEqual(len(json.dumps(body, sort_keys=True)), full // 2)
+        newest = hr._hour(clock[0])
+        kept = [int(h) for u in body["usage"].values() for h in u["hours"]]
+        self.assertIn(newest, kept)           # the newest hour survives
+        self.assertGreater(newest - min(kept), -1)
+        self.assertLess(len(kept), 40 * 30)   # something was dropped
 
     def test_only_names_and_numbers(self):
         rec = hr.Recorder(lambda: NOW)
@@ -135,7 +147,7 @@ class Bounds(unittest.TestCase):
 
 
 class Hooks(unittest.TestCase):
-    """The daemon's hooks make no request of their own."""
+    """The daemon's hooks make no request of their own, write only on a change, and say a fault once."""
 
     @classmethod
     def setUpClass(cls):
@@ -145,17 +157,33 @@ class Hooks(unittest.TestCase):
         sys.modules["sb_under_test"] = cls.sb
         loader.exec_module(cls.sb)
 
-    def test_ingest_and_write_without_any_client(self):
-        class Engine:
-            state_dir = None
-            v2 = None   # any use of it raises: a recorder that reads would fail the test
+    def engine(self, d):
+        class Client:
+            calls = []
+            def __getattr__(self, name):
+                def call(*a, **k):
+                    Client.calls.append(name)
+                    raise AssertionError("the recorder made a request: " + name)
+                return call
 
+        class Engine:
+            state_dir = d
+            v2 = Client()
+            notes = []
+            def _note(self, event, subject, detail):
+                self.notes.append((event, subject, detail))
+
+        engine = Engine()
+        engine.notes = []
+        Client.calls = []
+        return engine
+
+    def test_ingest_and_write_without_any_client(self):
         class State:
             pr_state = {"acme/api#1": {"head": "a"}}
 
         with tempfile.TemporaryDirectory() as d:
-            engine = Engine()
-            engine.state_dir = d
+            engine = self.engine(d)
             self.sb.health_ingest_messages(engine, "ses_a", [msg("m1", 10, 0.5, time.time())])
             self.sb.health_write(engine, State, time.time())
             State.pr_state = {"acme/api#1": {"head": "b"}}
@@ -165,12 +193,97 @@ class Hooks(unittest.TestCase):
             self.assertEqual(body["usage"]["ses_a"]["context"]["tokens"], 10)
             self.assertEqual(sum(list(body["pushes"]["acme/api"].values())), 1)
             self.assertEqual(body["tool_calls"], {})   # no plugin file: not recorded
+            self.assertEqual(engine.v2.calls, [])      # no OpenCode request
+            self.assertEqual(engine.notes, [])
+            self.assertEqual(oct(os.stat(os.path.join(d, hr.FILE)).st_mode & 0o777), "0o600")
 
-    def test_a_fault_never_raises(self):
+    def test_written_only_when_the_content_changed(self):
+        class State:
+            pr_state = {}
+
+        with tempfile.TemporaryDirectory() as d:
+            engine = self.engine(d)
+            path = os.path.join(d, hr.FILE)
+            self.sb.health_ingest_messages(engine, "ses_a", [msg("m1", 10, 0.5, time.time())])
+            self.sb.health_write(engine, State, time.time())
+            first = os.stat(path).st_mtime_ns
+            time.sleep(0.02)
+            self.sb.health_write(engine, State, time.time() + 5)   # nothing new; only the timestamp moved
+            self.assertEqual(os.stat(path).st_mtime_ns, first)
+            self.sb.health_ingest_messages(engine, "ses_a", [msg("m2", 10, 0.5, time.time())])
+            self.sb.health_write(engine, State, time.time())
+            self.assertGreater(os.stat(path).st_mtime_ns, first)
+
+    def test_a_fault_never_raises_and_is_said_once_per_change(self):
+        class State:
+            pr_state = {}
+
+        engine = self.engine("/nonexistent-dir-for-test")
+        engine.health = None
+        self.sb.health_ingest_messages(engine, "ses_a", "not a list")   # nothing to ingest: no fault
+        self.sb.health_write(engine, State, time.time())
+        self.assertEqual([n[0] for n in engine.notes], ["health.error"])
+        self.assertEqual(engine.notes[0][1], "write")
+
+    def test_the_feed_hands_what_it_read_to_the_recorder(self):
+        class Stream:
+            pass
+
+        class V2:
+            def message_list(self, session, limit=None, order=None, type=None, cursor=None):
+                return [msg("m7", 70, 0.7, time.time())]
+
         class Engine:
-            state_dir = "/nonexistent-dir-for-test"
-        self.sb.health_ingest_messages(Engine(), "ses_a", "not a list")
-        self.sb.health_write(Engine(), type("S", (), {"pr_state": None}), time.time())
+            v2 = V2()
+            health = None
+
+        engine = Engine()
+        feed = self.sb.EventFeed(Stream())
+        self.assertTrue(feed._read(engine, "ses_feed", time.time(), announced=False))
+        self.assertEqual(engine.health.context["ses_feed"]["tokens"], 70)
+
+
+class StateDirRule(unittest.TestCase):
+    """The plugin (plugins/fleet-hooks `stateDirOf`) and the daemon (`state_dir_path`) must name the same directory."""
+
+    CASES = [({"XDG_STATE_HOME": "/xdg/state"}, "/xdg/state/fleet-switchboard"),
+             ({"XDG_STATE_HOME": "relative/state"}, "/home/user/.local/state/fleet-switchboard"),
+             ({}, "/home/user/.local/state/fleet-switchboard")]
+
+    def test_daemon_and_plugin_agree(self):
+        import subprocess
+        loader = importlib.machinery.SourceFileLoader("sb_state_rule", os.path.join(HERE, "fleet-switchboard"))
+        sp = importlib.util.spec_from_loader("sb_state_rule", loader)
+        sb = importlib.util.module_from_spec(sp)
+        sys.modules["sb_state_rule"] = sb
+        loader.exec_module(sb)
+        plugin = os.path.join(HERE, "..", "plugins", "fleet-hooks", "index.js")
+        code = ("import(%r).then(m => console.log(JSON.stringify(%s.map(e => m.stateDirOf(e, '/home/user')))))"
+                % ("file://" + os.path.realpath(plugin), json.dumps([env for env, _ in self.CASES])))
+        out = subprocess.run(["node", "-e", code], capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        theirs = json.loads(out.stdout)
+        keep = {k: os.environ.get(k) for k in ("XDG_STATE_HOME", "HOME")}
+        try:
+            for (env, want), plugin_says in zip(self.CASES, theirs):
+                os.environ.pop("XDG_STATE_HOME", None)
+                os.environ.update(env)
+                os.environ["HOME"] = "/home/user"
+                import pathlib
+                real_home = pathlib.Path.home
+                pathlib.Path.home = classmethod(lambda cls: pathlib.Path("/home/user"))
+                try:
+                    daemon_says = str(sb.state_dir_path())
+                finally:
+                    pathlib.Path.home = real_home
+                self.assertEqual(daemon_says, want)
+                self.assertEqual(plugin_says, want)
+        finally:
+            for k, v in keep.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 pr-state picture, the tool-call counter file the fleet-hooks plugin leaves) and a clock. Nothing here makes a network, GitHub or OpenCode
 request, and nothing holds text: only agent/session names and numbers.
 
-It publishes ONE derived file, `health-records.json` (0600, renamed into place, capped at FILE_CAP bytes), which the health reader merges:
+It publishes ONE derived file, `health-records.json` (written by the daemon through `state_write`: 0600, renamed into place, capped at FILE_CAP bytes), which the health reader merges:
 
     {"version": 1, "written_at": <s>,
      "tool_calls":  {"<session>": {"per_minute": [15 ints, oldest first], "approx": true}},           # absent key = not recorded
@@ -17,7 +17,6 @@ the newest assistant message of a session, so a message it never read is not cou
 
 import json
 import os
-import tempfile
 
 VERSION = 1
 FILE = "health-records.json"
@@ -209,37 +208,3 @@ class Recorder:
                 if u["hours"]:
                     u["hours"].pop(min(u["hours"], key=int))
         return out
-
-
-def write(state_dir, body):
-    """Atomic, private. Returns True when written. Never raises."""
-    try:
-        directory = str(state_dir)
-        fd, tmp = tempfile.mkstemp(prefix=".health-records.", dir=directory)
-        try:
-            with os.fdopen(fd, "w") as handle:
-                json.dump(body, handle, sort_keys=True)
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, os.path.join(directory, FILE))
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-        return True
-    except OSError:
-        return False
-
-
-def read(state_dir, now, stale=600):
-    """The derived file as a body, or None when missing, malformed or older than `stale` seconds."""
-    try:
-        with open(os.path.join(str(state_dir), FILE), "rb") as handle:
-            raw = handle.read(FILE_CAP + 1)
-        body = json.loads(raw.decode("utf-8")) if len(raw) <= FILE_CAP else None
-    except (OSError, ValueError):
-        return None
-    if not isinstance(body, dict) or not _num(body.get("written_at")) or now - body["written_at"] > stale:
-        return None
-    return body

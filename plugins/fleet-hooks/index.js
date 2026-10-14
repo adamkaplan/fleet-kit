@@ -9,6 +9,7 @@
 // configured rules alone: a reply that is not stricter is ignored, and the
 // child process has a hard timeout, after which the configured outcome stands.
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -235,8 +236,8 @@ export function makeTally({ dir, now = Date.now, writeFile = fs.promises.writeFi
       writing = true;
       try {
         const file = path.join(dir, TALLY_FILE);
-        const tmp = `${file}.${process.pid}.tmp`;
-        await writeFile(tmp, JSON.stringify(tally.body()), { mode: 0o600 });
+        const tmp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`; // a name nobody can predict, created exclusively
+        await writeFile(tmp, JSON.stringify(tally.body()), { mode: 0o600, flag: "wx" });
         await rename(tmp, file);
         dirty = false;
         lastWrite = t;

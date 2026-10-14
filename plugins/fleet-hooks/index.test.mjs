@@ -246,3 +246,34 @@ test("flush writes only when something moved or the heartbeat is due, and surviv
   const bad = makeTally({ dir: "/d", now: () => clock, writeFile: async () => { throw new Error("ENOENT"); } });
   assert.equal(await bad.flush(), false);
 });
+
+test("setup wires the tally into the evaluate hook, and only when judging is configured", async () => {
+  const { home } = fakeHome();
+  const seen = [];
+  const tally = { count: (s) => seen.push(s), flush: async () => false };
+  let evaluate;
+  const api = { shell: { hook() {} }, permission: { hook: (name, fn) => { evaluate = fn; } } };
+  await plugin.setup(api, {}, { home, tally });
+  await evaluate({ sessionID: "ses_w", action: "read", effect: "allow" });
+  assert.deepEqual(seen, ["ses_w"]);
+  const off = [];
+  await plugin.setup({ permission: { hook: () => off.push(1) }, shell: { hook() {} } }, {}, { home: fs.mkdtempSync(path.join(os.tmpdir(), "fleet-hooks-")), tally });
+  assert.deepEqual(off, []); // no switchboard found: nothing registered, nothing counted
+});
+
+test("the tally's temporary file has an unpredictable name and is created exclusively", async () => {
+  const names = [];
+  const flags = [];
+  const mk = () => makeTally({ dir: "/d", now: () => 1000000, writeFile: async (f, c, o) => { names.push(f); flags.push(o.flag); }, rename: async () => {} });
+  await mk().flush();
+  await mk().flush();
+  assert.notEqual(names[0], names[1]);
+  assert.deepEqual(flags, ["wx", "wx"]);
+});
+
+import { stateDirOf } from "./index.js";
+test("stateDirOf: an absolute XDG_STATE_HOME wins; a relative or unset one falls back to the home", () => {
+  assert.equal(stateDirOf({ XDG_STATE_HOME: "/xdg/state" }, "/home/user"), "/xdg/state/fleet-switchboard");
+  assert.equal(stateDirOf({ XDG_STATE_HOME: "relative" }, "/home/user"), "/home/user/.local/state/fleet-switchboard");
+  assert.equal(stateDirOf({}, "/home/user"), "/home/user/.local/state/fleet-switchboard");
+});
