@@ -4500,6 +4500,97 @@ class TestLaunch(Base):
     def kill(self, name):
         del self.world.herdr.panes[self.world.panes[name]]
 
+    def dead_worker(self, entry="absent"):
+        """A DEAD worker (its pane is gone) under a boss, with the given last-reports.json entry; a chief of staff to be woken."""
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.worker()
+        if entry != "absent":
+            (self.world.state / sb.LAST_REPORT_FILE).write_text(json.dumps({"worker": entry}) if entry is not None else "{not json")
+        self.health()
+        self.kill("worker")
+        for n in range(sb.PANE_MISSING_PASSES):
+            self.health(n)
+        self.assertEqual(sb.read_pane_health(self.world.state)["states"]["worker"]["state"], "dead")
+
+    def test_dead_hint_s1_status_says_the_last_report_and_both_hints(self):
+        now = self.world.clock.now()
+        self.dead_worker({"state": "working", "at": now - 3 * 3600})
+        lines = "\n".join(sb.pane_health_status_lines(self.world.state, now))
+        self.assertIn("last report: working 3h ago", lines)   # a final done would have retired it already
+        self.assertIn("fleet-switchboard retire worker", lines)
+        self.assertIn("fleet-switchboard reattach worker", lines)
+
+    def test_dead_hint_s2_the_wake_says_no_report_since_launch_and_both_hints(self):
+        self.dead_worker()
+        facts = [f for f in sb.PaneFacts.__call__(self.fact_source()) if "worker is DEAD" in f.summary]
+        self.assertEqual(len(facts), 1)
+        for text in ("no report since launch", "fleet-switchboard retire worker", "fleet-switchboard reattach worker"):
+            self.assertIn(text, facts[0].summary)
+
+    def test_dead_hint_s3_the_newer_of_a_report_and_a_send_to_the_boss_is_shown(self):
+        now = self.world.clock.now()
+        sign = sb.dead_hint.hint("worker", {"state": "working", "at": now - 7200, "send_to": {"boss": now - 300, "other": now - 10}}, now, "boss")
+        self.assertIn("last report: a message sent 5m ago", sign)
+        self.assertNotIn("working", sign)
+        self.assertIn("working 2h ago", sb.dead_hint.hint("worker", {"state": "working", "at": now - 7200, "send_to": {"boss": now + 9999}}, now, "boss"))
+
+    def test_dead_hint_s4_detached_and_other_lines_do_not_change(self):
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.detach()
+        self.health()
+        self.health(1)
+        lines = sb.pane_health_status_lines(self.world.state)
+        self.assertEqual(len(lines), 2)
+        self.assertIn("platform DETACHED", lines[0])
+        self.assertEqual(lines[1], "        run `fleet-switchboard reattach <name>`")
+        self.assertNotIn("last report", "\n".join(lines))
+        facts = [f for f in sb.PaneFacts.__call__(self.fact_source())]
+        self.assertNotIn("last report", facts[0].summary)
+
+    def test_dead_hint_s5_both_cases_carry_both_hints_within_the_bound(self):
+        now = self.world.clock.now()
+        for entry in ({"state": "done", "at": now - 60}, None):
+            text = sb.dead_hint.hint("alpha", entry, now)
+            self.assertIn("fleet-switchboard retire alpha", text)
+            self.assertIn("fleet-switchboard reattach alpha", text)
+            self.assertLessEqual(len(text), 240)
+
+    def test_dead_hint_s6_a_corrupt_file_says_no_report_since_launch(self):
+        self.dead_worker(None)
+        lines = "\n".join(sb.pane_health_status_lines(self.world.state, self.world.clock.now()))
+        self.assertIn("no report since launch", lines)
+
+    def test_dead_hint_s7_nothing_is_written(self):
+        now = self.world.clock.now()
+        self.dead_worker({"state": "working", "at": now - 3 * 3600})
+        before = {p.name: p.read_bytes() for p in self.world.state.iterdir() if p.is_file()}
+        sb.pane_health_status_lines(self.world.state, now)
+        list(sb.PaneFacts.__call__(self.fact_source()))
+        self.assertEqual({p.name: p.read_bytes() for p in self.world.state.iterdir() if p.is_file()}, before)
+
+    def test_dead_hint_agrees_with_the_reminder_wakes_last_report_and_edge_paths(self):
+        """One rule for 'the newest sign of life': the hint's and the reminder wake's must give the same time for the same entry."""
+        now = self.world.clock.now()
+        source = sb.ReminderFacts(self.world.state)
+        source.bind(self.engine)
+        entries = [{"state": "working", "at": now - 500}, {"state": "working", "at": now - 500, "send_to": {"boss": now - 20, "other": now - 5}},
+                   {"state": "working", "at": now + 9999}, {"send_to": {"boss": now - 90}}, {"state": "x", "at": "late"}, {}]
+        for number, entry in enumerate(entries):
+            (self.world.state / sb.LAST_REPORT_FILE).write_text(json.dumps({"worker": entry}))
+            sign = sb.dead_hint.last_sign(entry, now, "boss")
+            self.assertEqual(source.last_report("worker", "boss"), sign[1] if sign else None, number)
+        # the paths `status` takes: no boss known (a send to anyone counts), and a report dated far ahead counts for nothing
+        self.assertIn("a message sent 5s ago", sb.dead_hint.hint("w", {"send_to": {"x": now - 5}}, now))
+        self.assertIn("no report since launch", sb.dead_hint.hint("w", {"state": "done", "at": now + 3600}, now))
+
+    def test_dead_hint_s8_a_500_character_state_or_name_is_bounded(self):
+        now = self.world.clock.now()
+        text = sb.dead_hint.hint("n" * 500, {"state": "s" * 500, "at": now - 60}, now)
+        self.assertLessEqual(len(text), 240)
+        text = sb.dead_hint.hint("n" * 500, {"state": "s" * 500, "at": now - 60}, now)
+        self.assertIn("retire", text)       # the name is cut short, so the commands survive
+        self.assertIn("reattach", text)
+
     def test_retire_stops_dead_and_detached_reports_and_all_detached_skips_it_and_undo_brings_it_back(self):
         os.environ["HERDR_WORKSPACE_ID"] = "w1"
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
@@ -6439,6 +6530,121 @@ class TestGithubVerification(Base):
     def test_the_comparison_is_constant_time(self):
         self.assertIn("hmac.compare_digest", inspect.getsource(sb.signature_matches))
         self.assertNotIn("==", inspect.getsource(sb.signature_matches))
+
+
+class TestPrEventFill(Base):
+    """#354: `pr-state` is filled from the forwarder's verified pull_request events: a PR of a watched repo (not under plan_gates) is known from open."""
+
+    def setUp(self):
+        super().setUp()
+        self.rig = GithubRig(self)
+        self.hub, self.gh, self.engine = self.rig.hub, self.rig.gh, self.rig.world.engine
+        self.hub.tick()
+        self.secret = self.gh.procs[-1].secret
+        self.ref = "%s#31" % GH_REPO
+
+    def event(self, action="opened", number=31, head="a" * 40, labels=(), draft=False, merged=False, state="open", secret=None, repo=GH_REPO, signature="auto", raw=None):
+        payload = {"action": action, "number": number, "repository": {"full_name": repo},
+                   "pull_request": {"number": number, "head": {"sha": head}, "draft": draft, "merged": merged, "state": state,
+                                    "labels": [{"name": n} for n in labels]}}
+        body = raw if raw is not None else json.dumps(payload).encode()
+        headers = {"X-GitHub-Event": "pull_request", "X-GitHub-Delivery": "d-%s-%s" % (action, number)}
+        if signature == "auto":
+            signature = sb.sign_body(secret or self.secret, body)
+        if signature is not None:
+            headers["X-Hub-Signature-256"] = signature
+        return self.hub.receive("/github", headers, body)
+
+    def snapshot_entry(self, ref=None):
+        sb.pr_events_pass(self.engine, self.rig.world.clock.now())
+        body, why = sb.pr_state_read(self.rig.world.state, self.rig.world.clock.now())
+        self.assertIsNone(why)
+        return body["prs"].get(ref or self.ref)
+
+    def test_an_opened_event_for_a_never_seen_pr_is_known_with_head_draft_and_labels_and_no_gh_call(self):
+        calls = len(self.gh.api_calls)
+        self.assertEqual(self.event("opened", labels=("bug", "ready")), (202, "accepted"))
+        entry = self.snapshot_entry()
+        self.assertEqual((entry["state"], entry["head"], entry["labels"]), ("open", "a" * 40, ["bug", "ready"]))
+        body, _ = sb.pr_state_read(self.rig.world.state, self.rig.world.clock.now())
+        line = sb.pr_state_line(sb.pr_state_view(self.ref, body, [], self.rig.world.clock.now()))
+        self.assertIn("open", line)
+        self.assertIn("head aaaaaaaa", line)
+        self.assertEqual(len(self.gh.api_calls), calls, "no read of GitHub")
+        self.rig.world.tick(sb.PR_STATE_WRITE_GAP + 1)
+        self.event("opened", number=32, draft=True)
+        self.assertEqual(self.snapshot_entry("%s#32" % GH_REPO)["state"], "draft")
+
+    def test_later_events_update_the_entry_in_turn(self):
+        self.event("opened")
+        self.rig.world.tick(sb.PR_STATE_WRITE_GAP + 1)
+        self.event("synchronize", head="b" * 40)
+        self.assertEqual(self.snapshot_entry()["head"], "b" * 40)
+        self.rig.world.tick(sb.PR_STATE_WRITE_GAP + 1)
+        self.event("labeled", head="b" * 40, labels=("hold",))
+        self.assertEqual(self.snapshot_entry()["labels"], ["hold"])
+        self.rig.world.tick(sb.PR_STATE_WRITE_GAP + 1)
+        self.event("converted_to_draft", head="b" * 40, labels=("hold",), draft=True)
+        self.assertEqual(self.snapshot_entry()["state"], "draft")
+        self.rig.world.tick(sb.PR_STATE_WRITE_GAP + 1)
+        self.event("closed", head="b" * 40, merged=True, state="closed")
+        entry = self.snapshot_entry()
+        self.assertEqual(entry["state"], "merged")
+        self.assertIn("webhook", entry["why"])
+
+    def test_an_examination_at_the_same_head_is_kept_and_a_new_head_clears_it(self):
+        self.event("opened")
+        state = self.engine.__dict__.setdefault("ci_record_state", sb.CiRecordState())
+        self.snapshot_entry()
+        state.pr_state[self.ref].update({"checks": [{"name": "t", "conclusion": "success"}, {"name": "u", "conclusion": "success"}], "ci": "green", "examined_head": "a" * 40, "examined_at": 1})
+        self.rig.world.tick(sb.PR_STATE_WRITE_GAP + 1)
+        self.event("labeled", labels=("x",))        # the same head
+        self.assertEqual(len(self.snapshot_entry()["checks"]), 2)
+        self.rig.world.tick(sb.PR_STATE_WRITE_GAP + 1)
+        self.event("synchronize", head="c" * 40)    # a new head
+        self.assertNotIn("checks", self.snapshot_entry())
+
+    def test_an_unsigned_a_foreign_and_a_malformed_event_change_nothing(self):
+        self.assertEqual(self.event("opened", signature=None)[0], 401)
+        self.assertEqual(self.event("opened", signature="sha256=00")[0], 401)
+        self.assertEqual(self.event("opened", repo="other/unwatched")[0], 202)    # names another repo than the one it was verified for
+        self.assertEqual(self.event("opened", raw=b"not json")[0], 400)
+        self.assertEqual(self.hub.pr_event_snapshot(), {})
+        self.assertEqual(self.event("opened", number=-4)[0], 202)
+        self.assertEqual(self.event("assigned")[0], 202)
+        self.assertEqual(self.hub.pr_event_snapshot(), {})
+
+    def test_the_picture_stays_bounded_and_private_when_events_exceed_the_cap(self):
+        for n in range(1, sb.PR_STATE_MAX + 51):
+            self.hub.note_pr_event("pull_request", GH_REPO, {"action": "opened", "pull_request": {"number": n, "head": {"sha": "d" * 40}}})
+            self.rig.world.tick(1)
+        self.assertEqual(len(self.hub.pr_event_snapshot()), sb.PR_STATE_MAX)
+        sb.pr_events_pass(self.engine, self.rig.world.clock.now())
+        path = self.rig.world.state / sb.PR_STATE_FILE
+        self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
+        self.assertEqual(len(json.loads(path.read_text())["prs"]), sb.PR_STATE_MAX)
+
+    def test_a_list_read_older_than_an_event_does_not_undo_it_and_a_newer_one_does(self):
+        self.event("opened", head="e" * 40)
+        state = self.engine.__dict__.setdefault("ci_record_state", sb.CiRecordState())
+        self.snapshot_entry()
+        old_at = self.rig.world.clock.now() - 100
+        state.lists["fleet/scratch"] = (old_at, [{"number": 31, "head": {"sha": "f" * 40}, "labels": []}])
+        sb.pr_state_from_lists(state, [GH_REPO])
+        self.assertEqual(state.pr_state[self.ref]["head"], "e" * 40)
+        state.lists["fleet/scratch"] = (self.rig.world.clock.now() + 100, [{"number": 31, "head": {"sha": "f" * 40}, "labels": []}])
+        sb.pr_state_from_lists(state, [GH_REPO])
+        self.assertEqual(state.pr_state[self.ref]["head"], "f" * 40)
+
+    def test_the_pure_rule(self):
+        pe = sb.load_pr_events()
+        self.assertIsNone(pe.entry_for(None, "issues", {"action": "opened"}, 1))
+        self.assertIsNone(pe.entry_for(None, "pull_request", {"action": "assigned", "pull_request": {"number": 1}}, 1))
+        number, entry = pe.entry_for(None, "pull_request", {"action": "opened", "pull_request": {"number": 5, "head": {"sha": "x"}, "labels": [{"name": "a\x1b[31mb"}]}}, 7)
+        self.assertEqual((number, entry["state"], entry["labels"], entry["at"], entry["listed_at"]), (5, "open", ["a [31mb"], 7, 7))
+        picture = {"r#1": {"at": 5, "head": "h", "labels": []}}
+        self.assertEqual(pe.fold(picture, {"r#1": {"at": 3, "head": "old"}, "r#2": {"at": 9, "head": "n"}}, 10), 1)
+        self.assertEqual((picture["r#1"]["head"], picture["r#2"]["head"]), ("h", "n"))
 
 
 class TestGithubReceive(Base):
@@ -30118,6 +30324,117 @@ class TestOrdersCLI(OrdersCase):
             os.environ.pop("HERDR_PANE_ID", None)
             self.assertEqual(self.main("notice", "ack", notices[0]["id"])[0], 0)
         self.assertEqual([n["action"] for n in sb.read_order_notices(self.world.audit_path.parent)], ["remove"])
+
+    def order_entries(self, at, **config):
+        engine = types.SimpleNamespace(state_dir=self.world.audit_path.parent, config=config)
+        return sb.decisions_from_order_notices(engine, at)
+
+    def record(self, charter, action, text, at, repo="acme/widget"):
+        return sb.record_order_notice(self.world.audit_path.parent, repo, charter, action, text, "chief-of-staff", None, at)
+
+    def test_the_heads_up_leads_with_what_differs_so_a_narrow_row_never_cuts_the_number(self):
+        base = 1_000_000.0
+        self.record(4230, "add", "approve every production deploy before it starts", base)
+        self.record(4230, "remove", "approve every production deploy before it starts", base + 5)
+        entries, problems = self.order_entries(base + 60)
+        self.assertEqual(problems, [])
+        self.assertEqual(len(entries), 2)
+        self.assertTrue(entries[0]["headline"].startswith("widget#4230 order +: approve"), entries[0]["headline"])
+        self.assertTrue(entries[1]["headline"].startswith("widget#4230 order -: approve"), entries[1]["headline"])
+        for entry in entries:
+            self.assertIn("#4230", entry["headline"][:sb.decision_core.HEADLINE_WIDTH], entry["headline"])
+        long_repo = self.record(77, "add", "x", base + 9, repo="acme/a-very-long-repository-name")
+        (long_entry,) = [e for e in self.order_entries(base + 60)[0] if e["number"] == 77]
+        self.assertTrue(long_entry["headline"].startswith("a-very-long-repository-name#77 order +:"), long_entry["headline"])
+
+    def test_a_burst_of_orders_on_one_charter_is_one_entry_with_a_count_and_two_charters_are_two(self):
+        base = 1_000_000.0
+        ids4230 = [self.record(4230, "add", "tighten gate %d" % n, base + n * 10)["id"] for n in range(19)]
+        for n in range(3):
+            self.record(17, "add", "other %d" % n, base + n * 10)
+        entries, problems = self.order_entries(base + 600)
+        self.assertEqual(problems, [])
+        self.assertEqual(len(entries), 2, [e["headline"] for e in entries])
+        big = next(e for e in entries if e["number"] == 4230)
+        self.assertIn("19 orders added by chief-of-staff", big["headline"].replace("\n", " "))
+        self.assertIn("widget#4230", big["headline"][:sb.decision_core.HEADLINE_WIDTH])
+        self.assertEqual(big["id"], "%s+19" % ids4230[0])
+        for member in ids4230:
+            self.assertIn(member, big["note"], "the member ids stay in the note")
+        small = next(e for e in entries if e["number"] == 17)
+        self.assertIn("3 orders added", small["headline"].replace("\n", " "))
+        entries0, _ = self.order_entries(base + 600, order_notice_burst_minutes=0)     # a window of 0 groups nothing
+        self.assertEqual(len(entries0), 22)
+        self.record(4230, "add", "much later", base + 3600)                            # an hour on is not the same burst
+        again, _ = self.order_entries(base + 3700)
+        self.assertEqual(len([e for e in again if e["number"] == 4230]), 2)
+        self.record(4230, "remove", "x", base + 20)                            # another action on the same charter is its own entry
+        self.assertEqual(len([e for e in self.order_entries(base + 3700)[0] if e["number"] == 4230]), 3)
+
+    def test_acking_the_group_id_drops_the_whole_burst_and_an_old_single_id_still_drops_just_that_one(self):
+        base = float(int(self.world.clock.now()))
+        ids = [self.record(4230, "add", "x %d" % n, base + n)["id"] for n in range(5)]
+        (entry,), _ = self.order_entries(base + 30)
+        self.as_agent("orch")
+        self.assertEqual(self.main("notice", "ack", entry["id"])[0], 2, "an agent may not ack")
+        with mock.patch.dict(os.environ):
+            os.environ.pop("HERDR_PANE_ID", None)
+            self.assertEqual(self.main("notice", "ack", ids[2])[0], 0)                     # an old single id drops only that one
+            self.assertEqual(len(sb.read_order_notices(self.world.audit_path.parent)), 4)
+            self.assertEqual(self.main("notice", "ack", entry["id"])[0], 2, "the row now holds 4: the old +5 id is refused, nothing dropped")
+            (fresh,), _ = self.order_entries(base + 30)
+            self.assertTrue(fresh["id"].endswith("+4"))
+            self.assertEqual(self.main("notice", "ack", fresh["id"])[0], 0)                # the group id (first id + 4) drops the whole burst
+            self.assertEqual(sb.read_order_notices(self.world.audit_path.parent), [])
+            self.assertEqual(self.main("notice", "ack", fresh["id"])[0], 2, "gone is gone")
+
+    def test_a_pr_notice_leads_with_the_number_and_names_the_repo_only_when_it_is_not_the_default(self):
+        facts = {"title": "tighten the production deploy gate and say why", "state": "open"}
+        mine = sb.decision_core.notice_entry("acme/widget", 366, "acme/widget", facts, False, "coder", 1_000_000.0, None, 0, "acme/widget")
+        other = sb.decision_core.notice_entry("acme/gadget", 12, "acme/gadget", facts, False, "coder", 1_000_000.0, None, 0, "acme/widget")
+        plain = sb.decision_core.notice_entry("acme/widget", 366, "widget", facts, False, "coder", 1_000_000.0, None, 0)
+        self.assertTrue(mine["headline"].startswith("#366 tighten"), mine["headline"])
+        self.assertTrue(other["headline"].startswith("gadget#12 tighten"), other["headline"])
+        self.assertTrue(plain["headline"].startswith("widget#366 tighten"), "with no default repo the form is as before")
+        self.assertEqual((mine["id"], other["id"], plain["id"]), ("pr:acme/widget#366", "pr:acme/gadget#12", "pr:widget#366"), "ids are unchanged")
+
+    def test_the_burst_window_config_is_validated(self):
+        for bad in (-1, "x", True, 99999, 1441):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "order_notice_burst_minutes": bad})
+        sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "order_notice_burst_minutes": 0})
+        sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "order_notice_burst_minutes": 5})
+        sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "order_notice_burst_minutes": 1440})
+        sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "order_notice_burst_minutes": 2.5})
+
+    def test_a_group_ack_binds_to_what_was_shown_a_late_member_expired_firsts_and_a_changed_window(self):
+        base = float(int(self.world.clock.now()))
+        ids = [self.record(4230, "add", "x %d" % n, base + n)["id"] for n in range(5)]
+        (entry,), _ = self.order_entries(base + 30)
+        self.record(4230, "add", "arrived after the row was shown", base + 40)              # joins the burst: the owner has not seen it
+        with mock.patch.dict(os.environ):
+            os.environ.pop("HERDR_PANE_ID", None)
+            code, out, err = self.main("notice", "ack", entry["id"])
+            self.assertEqual(code, 2)
+            self.assertIn("changed since it was shown (it now holds 6 orders)", err)
+            self.assertEqual(len(sb.read_order_notices(self.world.audit_path.parent)), 6, "nothing was dropped")
+            (newer,), _ = self.order_entries(base + 50)
+            self.assertTrue(newer["id"].endswith("+6"))
+            self.assertEqual(self.main("notice", "ack", newer["id"])[0], 0)
+            self.assertEqual(sb.read_order_notices(self.world.audit_path.parent), [])
+
+    def test_the_ack_groups_exactly_what_the_panel_shows_with_the_same_window_and_without_expired_orders(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "order_notice_burst_minutes": 60})
+        now = self.world.clock.now()
+        old = self.record(4230, "add", "expired first", now - sb.ORDER_NOTICE_TTL_SECONDS - 5)
+        ids = [self.record(4230, "add", "x %d" % n, now - 1800 + n * 60)["id"] for n in range(4)]     # a 30 minute burst: ONE entry at a 60 minute window
+        (entry,), _ = self.order_entries(now, order_notice_burst_minutes=60)
+        self.assertEqual(entry["id"], "%s+4" % ids[0], "the expired order is not the group's first")
+        with mock.patch.dict(os.environ):
+            os.environ.pop("HERDR_PANE_ID", None)
+            self.assertEqual(self.main("notice", "ack", entry["id"])[0], 0)
+        left = [i["id"] for i in sb.read_order_notices(self.world.audit_path.parent)]
+        self.assertEqual(left, [old["id"]], "only the group was dropped (the expired one is left for the expiry)")
 
     def test_a_body_that_changed_in_between_is_read_again_once(self):
         self.as_agent("chief-of-staff")
