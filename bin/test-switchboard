@@ -50818,6 +50818,143 @@ class TestDecisionIdForms(WriteWorld):
         self.assertEqual(self.gh.names(API, 5), ["me:awaiting-cos"])
 
 
+class TestTempJanitorResume(Base):
+    """Ask #469: a scan that runs out of its time budget records the name it stopped at, and the next run continues there."""
+
+    def setUp(self):
+        super().setUp()
+        self.jan = sb.load_disk_janitor()
+        self.temp = self.home / "jtmp"
+        self.temp.mkdir()
+        self.state = self.home / "jstate"
+        self.state.mkdir()
+        (self.state / "state-marker.json").write_text("{}")
+        self.now = time.time() + 10 * 86400
+        self.t = [0.0]
+        self.judged = []
+        real = self.jan.judge
+
+        def counting(path, *a, **k):
+            self.judged.append(os.path.basename(path))
+            row = real(path, *a, **k)
+            self.t[0] += 1.0
+            return row
+        patcher = mock.patch.object(self.jan, "judge", counting)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def entry(self, name, days):
+        path = self.temp / name
+        path.write_text("x")
+        stamp = self.now - days * 86400
+        os.utime(str(path), (stamp, stamp))
+        return path
+
+    def twelve(self, old_from=None):
+        for n in range(1, 13):
+            self.entry("e%02d.txt" % n, 20 if old_from and n >= old_from else 1)
+
+    def run_once(self, seconds=4.5, apply=True, **extra):
+        self.t[0] = 0.0
+        self.judged.clear()
+        cfg = self.jan.settings(dict({"scan_seconds": seconds}, **extra))
+        lines, removed, kept = self.jan.run(self.temp, self.state, self.now, cfg, apply, lambda *a: None, clock=lambda: self.t[0], busy=lambda path: None)
+        return lines, removed, kept, list(self.judged)
+
+    def cursor(self):
+        return self.jan.read_cursor(self.state)
+
+    def test_s1_every_entry_is_judged_exactly_once_over_three_runs(self):
+        self.twelve()
+        seen = []
+        for _ in range(3):
+            seen.extend(self.run_once()[3])
+        self.assertEqual(sorted(seen), ["e%02d.txt" % n for n in range(1, 13)])
+        self.assertEqual(len(seen), len(set(seen)), "none judged twice before the cycle completes")
+
+    def test_s2_a_cursor_naming_a_deleted_entry_resumes_at_the_next_name(self):
+        self.twelve()
+        self.run_once()
+        self.assertEqual(self.cursor(), "e05.txt")
+        (self.temp / "e05.txt").unlink()
+        self.assertEqual(self.run_once()[3][0], "e06.txt", "by name, not by position: nothing after the deleted entry is skipped")
+
+    def test_s3_an_entry_that_was_not_reached_is_never_removed_and_is_not_judged(self):
+        self.twelve(old_from=6)
+        lines, removed, kept, judged = self.run_once()
+        self.assertEqual(removed, 0 + sum(1 for n in judged if int(n[1:3]) >= 6), "only judged entries can be removed")
+        for n in range(6, 13):
+            name = "e%02d.txt" % n
+            self.assertEqual((self.temp / name).exists(), name not in judged, name)
+        self.assertIn("7 not judged", " ".join(lines) if len(judged) == 5 else "7 not judged")
+        self.assertFalse(any(line.startswith("kept e") and "time budget" in line for line in lines), "not judged is never reported as kept for a reason")
+
+    def test_s4_each_report_says_judged_and_not_judged_and_the_last_says_the_cycle_is_complete(self):
+        self.twelve()
+        reports = [self.run_once()[0] for _ in range(3)]
+        self.assertIn("5 judged, 7 not judged", reports[0])
+        self.assertIn("5 judged, 2 not judged", reports[1])
+        self.assertIn("2 judged, 0 not judged", reports[2])
+        self.assertIn("cycle complete", reports[2])
+        self.assertEqual(sum(line == "cycle complete" for report in reports for line in report), 1)
+        self.assertIsNone(self.cursor(), "a finished cycle clears the cursor")
+
+    def test_s5_a_missing_empty_or_corrupt_cursor_starts_at_the_first_name(self):
+        self.twelve()
+        path = self.state / self.jan.CURSOR_FILE
+        for content in (None, "", "{garbage", '{"after": 5}', '{"after": ""}'):
+            if content is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_text(content)
+            self.assertEqual(self.run_once(apply=False)[3][0], "e01.txt", repr(content))
+
+    def test_s6_the_weekly_budget_is_longer_and_both_come_from_configuration(self):
+        cfg = self.jan.settings({})
+        self.assertGreater(cfg["weekly_scan_seconds"], cfg["scan_seconds"])
+        self.jan.validate({"scan_seconds": 30, "weekly_scan_seconds": 900}, "config")
+        for bad in ({"scan_seconds": 0}, {"weekly_scan_seconds": "long"}, {"scan_seconds": True}, {"weekly_scan_seconds": 10 ** 9}):
+            with self.assertRaises(ValueError) as caught:
+                self.jan.validate(bad, "config")
+            self.assertIn(list(bad)[0], str(caught.exception))
+        self.twelve()
+        self.assertEqual(len(self.run_once(seconds=2.5, weekly_scan_seconds=8.5, apply=False)[3]), 3)
+        self.t[0] = 0.0
+        self.judged.clear()
+        lines, removed, kept = self.jan.run(self.temp, self.state, self.now, self.jan.settings({"scan_seconds": 2.5, "weekly_scan_seconds": 8.5}), False,
+                                            lambda *a: None, clock=lambda: self.t[0], busy=lambda path: None, weekly=True)
+        self.assertEqual(len(self.judged), 9, "the weekly run uses the longer budget")
+
+    def test_s7_a_scan_that_finishes_behaves_as_before_and_clears_the_cursor(self):
+        self.twelve(old_from=11)
+        (self.state / self.jan.CURSOR_FILE).write_text('{"after": "e10.txt"}')
+        lines, removed, kept, judged = self.run_once(seconds=100)
+        self.assertEqual(sorted(set(judged)), ["e11.txt", "e12.txt"], "(each removal candidate is judged once more right before it is removed)")
+        self.assertEqual(removed, 2)
+        self.assertIn("cycle complete", lines)
+        self.assertFalse((self.state / self.jan.CURSOR_FILE).exists())
+
+    def test_s8_no_thread_and_no_process_is_added(self):
+        self.twelve()
+        before = threading.active_count()
+        with mock.patch.object(subprocess, "run", side_effect=AssertionError("a process was started")), \
+                mock.patch.object(subprocess, "Popen", side_effect=AssertionError("a process was started")):
+            self.run_once()
+            self.run_once()
+        self.assertEqual(threading.active_count(), before)
+
+    def test_a_dry_run_reads_the_cursor_and_never_moves_it_and_the_file_is_private(self):
+        self.twelve()
+        self.run_once(apply=False)
+        self.assertIsNone(self.cursor(), "a preview does not change what the next real run covers")
+        self.run_once()
+        mode = os.stat(str(self.state / self.jan.CURSOR_FILE)).st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+        stamp = os.stat(str(self.state / self.jan.CURSOR_FILE)).st_mtime_ns
+        self.jan.write_cursor(self.state, self.cursor())
+        self.assertEqual(os.stat(str(self.state / self.jan.CURSOR_FILE)).st_mtime_ns, stamp, "written only when it changes")
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.
