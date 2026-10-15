@@ -49987,6 +49987,21 @@ class TestOwnerHoldRule(unittest.TestCase):
         review = sb.load_module("plan_review")
         self.assertEqual(review.path_hits(["shims/a\nb", "docs/x.md"], ["shims/**"]), ["shims/a\nb"], "the held-path glob of the review tier has the same rule")
 
+    def test_a_variant_spelling_of_a_top_tier_path_is_that_path_and_a_path_that_leaves_the_repository_holds(self):
+        review = sb.load_module("plan_review")
+        for path in ("Shims/GH", "shims//gh", "shims/./gh", "shims/x/../gh", "a/../shims/gh", "shims\\gh", "./shims/gh", "/shims/gh",
+                     "agents/../AGENTS/opencode/../opencode/chief-of-staff.md", "BIN/Plan_Ledger.py", "bin//plan_ledger.py", "bin\\plan_ledger.py"):
+            self.assertEqual(self.decide([path])[0], "hold", repr(path))
+            self.assertEqual(review.path_hits([path], ["shims/**", "agents/**", "bin/plan_ledger.py"]), [path], "review tier: " + repr(path))
+        for path in ("../x", "../../shims/gh", "a/../../x", "shims/../../x"):
+            decision, reasons = self.decide([path])
+            self.assertEqual(decision, "hold", repr(path))
+            self.assertTrue(any("outside the repository" in r for r in reasons), reasons)
+            self.assertEqual(review.path_hits([path], ["docs/**"]), [path], "a path that cannot be read inside the repository is held by the review tier too")
+            self.assertEqual(self.floor.floor_paths([path], ["docs/**"], ["docs/x/**"]), [path])
+        for path in ("docs/notes.md", "docs/./notes.md", "Docs//Notes.md", "docs/a/../b.md"):
+            self.assertEqual(self.decide([path])[0], "none", "a variant of a path outside the top tier stays outside: " + repr(path))
+
     def home_file(self, name, text):
         tmp = Path(tempfile.mkdtemp(prefix="ohr"))
         self.addCleanup(shutil.rmtree, tmp, True)

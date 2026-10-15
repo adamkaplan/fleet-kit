@@ -78,16 +78,41 @@ def _build(pattern):
     return re.compile("".join(out), re.DOTALL)   # DOTALL and fullmatch (below): a newline, a tab or a NUL in a path never escapes a glob, and a trailing newline never makes an exact file match
 
 
+def canonical(path):
+    """(the path as the file system would read it, lower-cased, escapes): backslashes become `/`, empty and `.` segments are dropped, `..` removes the
+    segment before it. `escapes` is True when a `..` has nothing to remove (the path leaves the repository). A variant of a path (`Shims/GH`, `shims//gh`,
+    `shims/./gh`, `shims/x/../gh`, `a/../shims/gh`, `shims\\gh`) names the same file as the plain one, so it must be judged as that file."""
+    parts, escapes = [], False
+    for segment in str(path).replace("\\", "/").split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == "..":
+            if parts:
+                parts.pop()
+            else:
+                escapes = True
+            continue
+        parts.append(segment)
+    return "/".join(parts).lower(), escapes
+
+
+def escapes(path):
+    """True when the path cannot be read as a path inside the repository: it is HELD (when in doubt, hold)."""
+    return canonical(path)[1]
+
+
 def matches(path, patterns):
-    """Case-insensitive: the fleet runs on case-insensitive checkouts where `SHIMS/x` and `shims/x` are one file (a false hold costs little)."""
+    """Case-insensitive, and judged as the file the path names (see `canonical`): the fleet runs on case-insensitive checkouts where `SHIMS/x` and `shims/x`
+    are one file. A variant can only ADD a hit: the raw lower-cased spelling and the canonical one are both tried (a false hold costs little)."""
     lowered = path.lower()
-    return any(_glob_regex(p).fullmatch(lowered) for p in patterns)
+    named = canonical(path)[0]
+    return any(_glob_regex(p).fullmatch(lowered) or _glob_regex(p).fullmatch(named) for p in patterns)
 
 
 def floor_paths(paths, globs, exclude=(), force=()):
     """The paths of a change that trigger the floor: inside a floor glob and not excluded (a `force` path is never excluded). A deletion
     counts like any change (the caller passes deleted paths too; so does the OLD path of a rename); one outside the globs never does."""
-    return sorted({p for p in paths if isinstance(p, str) and matches(p, globs) and (not matches(p, exclude) or matches(p, force))})
+    return sorted({p for p in paths if isinstance(p, str) and (escapes(p) or (matches(p, globs) and (not matches(p, exclude) or matches(p, force))))})
 
 
 def floor_for(repo, config=None):
@@ -230,6 +255,9 @@ def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=()):
         reasons.append("owner_hold rule missing or malformed in the impact matrix file: every change holds")
     if unknown:
         reasons.append("floor unknown: %s" % unknown)
+    lost = sorted({p for p in paths if isinstance(p, str) and escapes(p)})
+    if lost:   # a path that leaves the repository cannot be judged as a file of it: hold
+        reasons.append("path outside the repository or not normalisable: %s" % ", ".join(repr(p)[:60] for p in lost[:3]))
     for cls, got in sorted(top_tier_hits(paths, matrix).items()):
         reasons.append("top tier path (%s): %s" % (cls, ", ".join(got[:5]) + (" ..." if len(got) > 5 else "")))
     rated = []

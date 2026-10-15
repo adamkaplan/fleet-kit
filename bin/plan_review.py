@@ -67,10 +67,34 @@ def _norm_path(path):
     return path[1:] if path.startswith("/") else path
 
 
+def _canonical(path):
+    """(the path as the file system reads it, lower-cased, escapes): backslashes become `/`, empty and `.` segments go, `..` removes the segment before it;
+    `escapes` when a `..` has nothing to remove. The same rule as impact_floor.canonical: a variant of a held path is that path."""
+    parts, escapes = [], False
+    for segment in str(path).replace("\\", "/").split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == "..":
+            if parts:
+                parts.pop()
+            else:
+                escapes = True
+            continue
+        parts.append(segment)
+    return "/".join(parts).lower(), escapes
+
+
 def path_hits(paths, held_globs):
-    """The paths that match any held-path glob (`**` across directories, `*` within a name). Deterministic."""
-    compiled = [_glob_regex(g) for g in held_globs or ()]
-    return sorted({str(p) for p in paths or () if any(c.fullmatch(_norm_path(p)) for c in compiled)})
+    """The paths that match any held-path glob (`**` across directories, `*` within a name), case-insensitively and as the file the path names (`Shims//gh`,
+    `shims/./gh`, `shims\\gh` and `a/../shims/gh` are `shims/gh`); a path that leaves the repository is a hit (when in doubt, hold). Deterministic."""
+    compiled = [_glob_regex(str(g).lower()) for g in held_globs or ()]
+    hits = set()
+    for p in paths or ():
+        named, escapes = _canonical(p)
+        raw = _norm_path(p).lower()
+        if escapes or any(c.fullmatch(raw) or c.fullmatch(named) for c in compiled):
+            hits.add(str(p))
+    return sorted(hits)
 
 
 def lanes_for_tier(tier, held_area=False):
