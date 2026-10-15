@@ -8537,8 +8537,8 @@ def short_ref_of(ref):
     return decision_core.short_ref_of(ref)
 
 
-def parse_batch_row(line, full=False):
-    return decision_core.parse_batch_row(line, full)
+def parse_batch_row(line):
+    return decision_core.parse_batch_row(line)
 
 
 def row_repo(ref):
@@ -27385,7 +27385,7 @@ def read_batch_rows(args):
     if len(lines) > decision_core.BATCH_RAISE_ROWS_MAX:
         raise BatchError("a batch is at most %d rows (this one is %d): raise the rest as a second batch"
                          % (decision_core.BATCH_RAISE_ROWS_MAX, len(lines)))
-    rows = [parse_batch_row(line, full=True) for line in lines]   # the FULL text: it is cut only when a list or the panel draws it
+    rows = [parse_batch_row(line) for line in lines]   # the FULL text: it is cut only when a list or the panel draws it
     for number, row in enumerate(rows, 1):
         for part, text in (("finding", row["finding"]), ("recommendation", row["recommendation"])):
             if len(text) > decision_core.BATCH_ROW_MAX_CHARS:

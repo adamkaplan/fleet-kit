@@ -370,10 +370,9 @@ def short_ref_of(ref):
     return ref.split("/")[-1] if "/" in ref else ref
 
 
-def parse_batch_row(line, full=False):
+def parse_batch_row(line):
     """One row line `<ref> | <finding> | <recommendation>` as {ref, short, finding, recommendation, text}. Raises
-    BatchError for an empty part, a ref that names no issue, or a fence in the text; a part over its cap is cut for DISPLAY,
-    unless `full` (a row being raised: its text is kept whole, the command bounds its length)."""
+    BatchError for an empty part, a ref that names no issue, or a fence in the text. The text is kept whole (the command bounds its length)."""
     parts = [" ".join(part.split()) for part in line.split("|", 2)]
     if len(parts) != 3 or not all(parts):
         raise BatchError("a row is `<repo#N> | <finding> | <recommendation>`, each part not empty: %r" % one_line(line, 80))
@@ -382,7 +381,7 @@ def parse_batch_row(line, full=False):
         raise BatchError("a row may not contain a code fence: %r" % one_line(line, 80))
     if len(ref) > BATCH_REF_MAX or not (_ROW_REF.match(ref) or _GITHUB_REF.match(ref)):
         raise BatchError("%r is not an issue: write repo#N, owner/repo#N or the issue's URL" % one_line(ref, 60))
-    return row_of(ref, finding, rec, full)
+    return row_of(ref, finding, rec)
 
 
 def row_repo(ref):
@@ -393,13 +392,17 @@ def row_repo(ref):
     return ref.split("#")[0] if "/" in ref.split("#")[0] else None
 
 
-def row_of(ref, finding, rec, full=False):
-    cut = lambda text, width: text if len(text) <= width else text[:width - 1] + "\u2026"
-    if not full:   # the row as the decision list and the panel draw it: cut for display, never in the stored body
-        finding, rec = cut(finding, BATCH_FINDING_MAX), cut(rec, BATCH_REC_MAX)
+def display_cut(text, width):
+    """The ONLY cut a row's text takes: for drawing. Nothing stored, answered, escalated or synced ever goes through it."""
+    return text if len(text) <= width else text[:width - 1] + "\u2026"
+
+
+def row_of(ref, finding, rec):
+    """A row, whole: `finding` and `recommendation` are exactly the stored text (every reader that acts on a row uses these). `text` is the one DISPLAY field (what the
+    decision list and the panel draw), the recommendation cut for drawing."""
     short = short_ref_of(ref)
     return {"ref": ref, "short": short, "finding": finding, "recommendation": rec,
-            "text": "%s: %s" % (short, short_refs(rec))}
+            "text": "%s: %s" % (short, display_cut(short_refs(rec), BATCH_REC_MAX))}
 
 
 _MD_ACTIVE = re.compile(r"([\\<>@\[\]`*_])")
