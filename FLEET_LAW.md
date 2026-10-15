@@ -2,17 +2,17 @@
 
 **DRAFT, for the owner's edits. Not in force until the owner approves the text.**
 
-The laws every change to FleetKit is designed and reviewed against. They say how FleetKit itself is built. **How a change is
+The laws every change to fleet-kit is designed and reviewed against. They say how fleet-kit itself is built. **How a change is
 reviewed, and what blocks it, is `REVIEW_LAWS.md`** (`docs/review-laws/`), and the general standards are `CODING_STANDARDS.md`,
 `SECURITY_STANDARDS.md` and `TEST_STANDARDS.md`: this file points to them and never copies a rule, so a rule id lives in one file only.
-Where a law here builds on a standard it says which, and states only what is particular to FleetKit. A reviewer cites a law by its id
+Where a law here builds on a standard it says which, and states only what is particular to fleet-kit. A reviewer cites a law by its id
 (`FK-LAW-3`) the way it cites a standard (`R-SEC-5`).
 
 A law has three parts, each running until the next blank line: the rule; **Why:** the real failure it comes from, as issue or pull request
 numbers in this repository; and **Check:** one line per check, written `<kind>: <what is asserted>`, where the kind is `test` (a test
 in the repository), `gate` (a merge or plan gate), `reviewer` (a review agent's finding) or `note only` (a judgement, never a block). The
 kinds are this file's own; the `diff`, `search` and `test` hints of `REVIEW_LAWS.md` apply to its rules. A law with no failure behind it,
-or no check, does not belong here. An **environment** is a place FleetKit's work runs: a person's workstation, a cloud worker, CI.
+or no check, does not belong here. An **environment** is a place fleet-kit's work runs: a person's workstation, a cloud worker, CI.
 
 ## FK-LAW-1 Enforce where the action takes effect
 
@@ -63,7 +63,7 @@ cluster context, because the active one moves when work happens in another clust
 When a guard cannot read what it decides on (a rule table, a ledger, a diff, an identity), it holds. Unreadable is never a pass, and
 an uncertain identity is refused, not guessed.
 
-Narrows R-CODE-2, which lets a guard fail open or closed on purpose: in FleetKit a guard fails closed. Builds on R-SEC-1 and R-SEC-10.
+Narrows R-CODE-2, which lets a guard fail open or closed on purpose: in fleet-kit a guard fails closed. Builds on R-SEC-1 and R-SEC-10.
 
 **Why:** #489: the gate that cannot read the floor at the head holds, rather than passing a change it cannot judge. #138: a mixed tool
 environment after a restart made one agent speak as another; an identity that cannot be told apart is refused.
