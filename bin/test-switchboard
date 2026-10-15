@@ -47957,7 +47957,7 @@ class TestLoadAlert(Base):
     def test_each_orchestrator_has_the_five_figures_from_the_records(self):
         self.asks = {1: [10, 11, 12], 2: [20], 3: [30, 31]}
         orchestrators = {"orch-a": self.orch(busy=2, idle=1, messages=1, charter=1), "orch-b": self.orch(idle=1, charter=2), "orch-c": self.orch(busy=1, charter=3)}
-        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [{"agent": "orch-a"}, {"agent": "orch-a"}, {"agent": "orch-b", "closed": True}]}))
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [{"agent": "x", "ask": 10, "repo": "acme/widget"}, {"agent": "x", "ask": 11, "repo": "acme/widget"}, {"agent": "orch-b", "ask": 20, "repo": "acme/widget", "closed": True}]}))   # owned by the ask's chain, not by the agent field)
         self.tick(self.T0, orchestrators)                      # first sight of every ask
         self.move(self.T0 + 3 * 3600 - 60, 10)                 # ask 10 moved 1 minute ago; 20 and 30 moved 3 h ago
         self.move(self.T0 + 3 * 3600 - 60, 12)
@@ -48749,6 +48749,88 @@ class TestLoadAlert(Base):
         shutil.rmtree(str(self.state_dir)); self.state_dir.mkdir(mode=0o700)
         self.wait_world({1: {"labels": []}, 2: {"labels": []}}, enabled=True)
         self.assertEqual(len(self.woken), 1)
+
+    def decisions_world(self, decisions, parents, orchestrators=None, asks=None, charters=None, tick_at=None, **extra):
+        """Passes of orchestrators with charters (`charters`: name -> number) and asks, over a decisions.json of `decisions` and issue parents `parents`."""
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": decisions}))
+        reads = []
+        def read_parent(repo, number):
+            reads.append(number)
+            if number not in parents:
+                raise RuntimeError("gh is down")
+            return parents[number]
+        orch = orchestrators or {"a": {"charter": 1, "repo": "r", "busy": 0, "idle": 1, "messages": 0}, "b": {"charter": 2, "repo": "r", "busy": 0, "idle": 1, "messages": 0}}
+        asks = asks or {1: [10], 2: [20]}
+        def read_asks(charter, repo):
+            return [{"repo": "r", "number": n} for n in asks[charter]]
+        def tick(at=None, **kw):
+            ctx = self.health.Context(now=at or self.T0, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS, **kw.pop("cfg", {})), orchestrators=orch,
+                                      read_asks=read_asks, read_parent=read_parent, cos="cos", wake=self.woken.append, **dict(extra, **kw))
+            return self.health.tick(ctx)
+        return tick, reads
+
+    def test_an_old_format_row_is_followed_through_the_issues_it_closed(self):
+        tick, reads = self.chain_world({200: 100})
+        tick(self.T0)
+        late = self.T0 + 3 * 3600
+        tick(late, [{"at": late - 60, "repo": "r", "numbers": [900, 200], "kind": "push"}])     # written before refs existed: the pull request and what it closed
+        self.assertEqual((self.latest()["o"]["moved_1h"], reads), (1, [200]))
+
+    def test_a_pull_request_under_the_charter_with_no_ask_is_charter_movement_and_credits_no_ask(self):
+        tick, reads = self.chain_world({300: 1})                       # issue 300's parent is the charter 1 itself
+        tick(self.T0)
+        late = self.T0 + 3 * 3600
+        tick(late, [self.move_row(late - 60, [300])])
+        got = self.latest()["o"]
+        self.assertEqual((got["charter_moves_1h"], got["moved_1h"], got["stalled"]), (1, 0, 1))
+        lines = self.health.status_lines(str(self.state_dir), late)
+        self.assertIn("charter moves 1h 1", [l for l in lines if l.strip().startswith("o ")][0])
+
+    def test_charter_movement_keeps_the_busy_coders_rule_quiet(self):
+        orch = {"o": {"charter": 1, "repo": "r", "busy": 2, "idle": 0, "messages": 0}}
+        self.asks = {1: [10, 11, 12]}
+        def tick(at, rows=()):
+            if rows:
+                self.health.append_moves(str(self.state_dir), list(rows))
+            return self.health.tick(self.health.Context(now=at, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS, enabled=True), orchestrators=orch,
+                                                        read_asks=lambda c, r: [{"repo": "r", "number": n} for n in self.asks[c]],
+                                                        read_parent=lambda repo, n: 1, cos="cos", wake=self.woken.append))
+        tick(self.T0, [{"at": self.T0 - 60, "repo": "r", "numbers": [900, 300], "refs": [300], "kind": "push"}])   # the lane is moving: no wake for outnumbered asks
+        tick(self.T0 + 600)
+        self.assertEqual(self.woken, [])
+        shutil.rmtree(str(self.state_dir)); self.state_dir.mkdir(mode=0o700)
+        tick(self.T0)                                                                                      # nothing moved at all: the same fixture fires
+        self.assertEqual(len(self.woken), 1)
+
+    def test_a_decision_belongs_to_the_charter_on_its_chain_not_to_its_agent_field(self):
+        tick, reads = self.decisions_world([{"agent": "b", "ask": 500, "repo": "r"}], {500: 10, 10: 1})   # 500 -> ask 10 of orchestrator a; the field says b
+        tick()
+        got = self.latest()
+        self.assertEqual((got["a"]["decisions"], got["b"]["decisions"]), (1, 0))
+
+    def test_every_decision_is_attributed_to_the_charter_that_holds_it_even_with_no_agent(self):
+        tick, reads = self.decisions_world([{"agent": None, "ask": 10, "repo": "r"}, {"agent": "a", "ask": 20, "repo": "r"}, {"agent": None, "ask": 600, "repo": "r"}],
+                                           {600: 2})
+        tick()
+        got = self.latest()
+        self.assertEqual((got["a"]["decisions"], got["b"]["decisions"]), (1, 2))                         # 10 -> a's ask; 20 -> b's ask; 600 -> charter 2 (b)
+
+    def test_a_decision_whose_chain_cannot_be_resolved_belongs_to_nobody_and_status_says_so(self):
+        tick, reads = self.decisions_world([{"agent": "a", "ask": 700, "repo": "r"}], {})              # the parent read fails
+        tick()
+        got = self.latest()
+        self.assertEqual((got["a"]["decisions"], got["b"]["decisions"]), (0, 0))                        # the agent field is not used as a fallback
+        lines = self.health.status_lines(str(self.state_dir), self.T0)
+        self.assertEqual(len([l for l in lines if "1 decision(s) not attributed" in l]), 1)
+
+    def test_decision_chains_are_read_once_and_count_in_the_account_budget(self):
+        tick, reads = self.decisions_world([{"agent": "a", "ask": 500, "repo": "r"}, {"agent": "a", "ask": 501, "repo": "r"}], {500: 10, 501: 10})
+        for k in range(3):
+            tick(self.T0 + k * 600)
+        self.assertEqual(sorted(reads), [500, 501])
+        state = json.loads((self.state_dir / "load.json").read_text())
+        self.assertEqual(len([r for r in state["reads"] if True]) >= 2, True)
+        self.assertEqual(state["parents"], {"r#500": 10, "r#501": 10})
 
     def test_an_idle_pass_rewrites_nothing(self):
         self.asks = {1: [1]}
