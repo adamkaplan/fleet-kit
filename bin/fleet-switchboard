@@ -11679,7 +11679,8 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
             found["T8"] = {"quiet_days": round(age_updated, 2)}
         if ask and "T3" not in found and age_updated >= sla["t9_days"]:
             found["T9"] = {"quiet_days": round(age_updated, 2)}
-        if not chain and not item["assignees"] and not named and "T1" not in found and age_updated >= sla["t11_days"]:
+        if not chain and not item["assignees"] and not named and "T1" not in found and number not in ctx["unresolved"] \
+                and age_updated >= sla["t11_days"]:
             found["T11"] = {"quiet_days": round(age_updated, 2)}
         link = (merged or {}).get(number) if number not in ctx["charters"] and number not in ctx["asks"] else None   # a charter or an ask is a long-lived umbrella: a merged part does not finish it
         if link:   # #384: its PR merged and it is still open: that is the finding, not "no owner"; ours when the PR's author is ours

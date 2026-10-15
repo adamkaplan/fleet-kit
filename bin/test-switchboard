@@ -21579,6 +21579,16 @@ class TestTriageAncestors(Base):
         self.go()
         self.assertEqual(self.only("T1"), [])
 
+    def test_s4b_t11_never_fires_for_an_unresolved_chain_but_still_for_a_fully_read_orphan(self):
+        self.world.add_agent("coder", fleet={"role": "coder", "issue": 81, "repo": "acme/api"})   # an agent works on 81 (no T1), as in the T11 test above
+        self.engine.discover(self.world.clock.now())
+        self.world.tick(sb.TRIAGE_TTL + 5)
+        self.add(80, created=5, updated=3, parent=999, labels=["kind"], body="Next: go")      # middle parent not read; 999's parent is a charter
+        self.add(81, created=5, updated=3, labels=["kind"], body="Next: go")                  # chain read completely, no charter
+        self.add(82, created=5, updated=3, parent=1, labels=["kind"], body="Next: go")        # chain reaches a charter
+        self.go()
+        self.assertEqual(self.only("T11"), ["acme/api#81"])
+
     def test_s5_a_muted_item_stays_muted_across_a_restart_of_the_memory(self):
         self.add(70, created=5, updated=0.2, labels=["kind"], body="Next: go")
         self.go(enabled=True)
