@@ -13566,6 +13566,148 @@ class TestShimHygiene(unittest.TestCase):
             self.assertIsNone(pattern.search(line), "%d: %s" % (number, line))
 
 
+GIT_SHIM = REPO / "shims" / "git"
+
+
+class TestGitShim(Base):
+    """The `git` shim: the network verbs get the fleet's credential helper, everything else runs the real git unchanged. A fake real git records what it got."""
+
+    RESET = "credential.https://github.com.helper="
+    HELPER = "credential.https://github.com.helper=!gh auth git-credential"
+
+    def setUp(self):
+        super().setUp()
+        self.bin = self.home / "realbin"
+        self.bin.mkdir()
+        self.log = self.home / "git-log.json"
+        self.starts = self.home / "git-starts"
+        fake = self.bin / "git"
+        fake.write_text("#!/usr/bin/env python3\nimport json,os,sys\n"
+                        "open(%r,'a').write('x')\n"
+                        "json.dump({'argv': sys.argv[1:], 'stdin': None if sys.stdin.isatty() else sys.stdin.read(), 'token_env': os.environ.get('GH_TOKEN')}, open(%r,'w'))\n"
+                        "print('real git out'); sys.exit(int(os.environ.get('FAKE_GIT_EXIT','0')))\n" % (str(self.starts), str(self.log)))
+        fake.chmod(0o755)
+        self.write_users({"acme/*": "acct-acme"})
+
+    def write_users(self, users):
+        config = self.home / "xdg-config" / "fleet-switchboard"
+        config.mkdir(parents=True, exist_ok=True)
+        (config / "config.json").write_text(json.dumps({"gh_users": users} if users is not None else {}))
+
+    def run_git(self, *args, stdin="", env=None, path=None):
+        environ = {"PATH": path or "%s:%s:%s" % (GIT_SHIM.parent, self.bin, SAFE_PATH), "HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / "xdg-config")}
+        environ.update(env or {})
+        for p in (self.log, self.starts):
+            if p.exists():
+                p.unlink()
+        done = subprocess.run([sys.executable, str(GIT_SHIM)] + list(args), input=stdin, capture_output=True, text=True, env=environ, timeout=60)
+        seen = json.loads(self.log.read_text()) if self.log.exists() else None
+        return done, seen
+
+    def routed(self, *globals_, verb, rest=()):
+        return list(globals_) + ["-c", self.RESET, "-c", self.HELPER, verb] + list(rest)
+
+    def test_s1_every_network_verb_gets_the_reset_then_the_fleets_helper_right_before_the_verb(self):
+        cases = (("push", ["origin", "branch"]), ("fetch", ["--all"]), ("pull", ["--ff-only"]), ("clone", ["https://github.com/acme/api.git", "x"]),
+                 ("ls-remote", ["origin"]))
+        for verb, rest in cases:
+            for globals_ in ([], ["-C", "/work/tree"], ["-c", "user.name=x", "--no-pager"], ["--git-dir=/g", "-C", "/w", "-p"]):
+                with self.subTest(verb=verb, globals=globals_):
+                    done, seen = self.run_git(*globals_, verb, *rest)
+                    self.assertEqual(done.returncode, 0, done.stderr)
+                    self.assertEqual(seen["argv"], self.routed(*globals_, verb=verb, rest=rest))
+        done, seen = self.run_git("remote", "update", "--prune")
+        self.assertEqual(seen["argv"], self.routed(verb="remote", rest=["update", "--prune"]))
+        done, seen = self.run_git("-C", "/w", "remote", "-v", "update")
+        self.assertEqual(seen["argv"], self.routed("-C", "/w", verb="remote", rest=["-v", "update"]))
+
+    def test_s2_every_other_command_runs_the_real_git_with_the_same_arguments_input_and_exit_status(self):
+        for args in (("status", "-sb"), ("log", "--oneline", "-5"), ("diff", "--stat"), ("commit", "-m", "x"), ("remote", "add", "o", "u"), ("remote", "-v"),
+                     ("config", "credential.helper"), ("stash", "list"), ("-C", "/w", "checkout", "-b", "x"), ("--version",), (), ("push-like",)):
+            with self.subTest(args=args):
+                done, seen = self.run_git(*args, stdin="input text", env={"FAKE_GIT_EXIT": "3"})
+                self.assertEqual(done.returncode, 3)
+                self.assertEqual(seen["argv"], list(args))
+                self.assertEqual(seen["stdin"], "input text")
+                self.assertEqual(done.stdout, "real git out\n")
+        done, seen = self.run_git("push", "origin", stdin="in", env={"FAKE_GIT_EXIT": "5"})
+        self.assertEqual((done.returncode, seen["stdin"]), (5, "in"), "a network verb keeps its input and exit status too")
+
+    def test_s3_a_callers_own_credential_configuration_is_left_alone(self):
+        for args in (("-c", "credential.helper=store", "push", "origin"), ("-c", "credential.https://github.com.helper=!x", "fetch"),
+                     ("--config-env", "credential.helper=SOME_ENV", "pull"), ("--config-env=credential.helper=SOME_ENV", "push"),
+                     ("-c", "Credential.UseHttpPath=true", "push")):
+            with self.subTest(args=args):
+                done, seen = self.run_git(*args)
+                self.assertEqual(seen["argv"], list(args))
+        done, seen = self.run_git("-c", "user.name=x", "push")
+        self.assertEqual(seen["argv"], self.routed("-c", "user.name=x", verb="push"), "a -c that is not a credential setting does not count")
+
+    def test_s3_it_finds_the_real_git_behind_its_own_directory_and_never_runs_itself(self):
+        twice = "%s:%s:%s:%s" % (GIT_SHIM.parent, GIT_SHIM.parent, self.bin, SAFE_PATH)
+        done, seen = self.run_git("status", path=twice)
+        self.assertEqual((done.returncode, seen["argv"], self.starts.read_text()), (0, ["status"], "x"), "the fake started once")
+        done, seen = self.run_git("status", path=str(GIT_SHIM.parent))
+        self.assertEqual((done.returncode, seen), (127, None))
+        self.assertIn("no real git", done.stderr)
+        link = self.home / "linkdir"
+        link.mkdir()
+        (link / "git").symlink_to(GIT_SHIM)
+        done, seen = self.run_git("status", path="%s:%s" % (link, str(GIT_SHIM.parent)))
+        self.assertEqual((done.returncode, seen), (127, None), "a symlink to the shim is the shim, not a real git")
+        done, seen = self.run_git("status", path="%s:%s" % (GIT_SHIM.parent, SAFE_PATH), env={"FLEET_REAL_GIT": str(self.bin / "git")})
+        self.assertEqual((done.returncode, seen["argv"]), (0, ["status"]), "FLEET_REAL_GIT names the real git")
+
+    def test_a_parse_it_does_not_understand_and_a_real_git_that_cannot_start_never_block_the_command(self):
+        for args in (("-c",), ("-C",), ("-c", "user.name=x")):   # a value option with no value, or no verb at all: nothing to route
+            with self.subTest(args=args):
+                done, seen = self.run_git(*args)
+                self.assertEqual(seen["argv"], list(args))
+        broken = self.home / "brokenbin"
+        broken.mkdir()
+        (broken / "git").write_text("#!/nonexistent/interpreter\n")
+        (broken / "git").chmod(0o755)
+        done, seen = self.run_git("status", path="%s:%s" % (GIT_SHIM.parent, broken))
+        self.assertEqual((done.returncode, seen), (126, None))
+        self.assertIn("git: cannot run", done.stderr)
+
+    def test_it_routes_only_when_accounts_are_mapped_and_not_switched_off(self):
+        for label, setup, env in (("no gh_users at all", lambda: self.write_users(None), {}), ("an empty map", lambda: self.write_users({}), {}),
+                                  ("switched off", lambda: self.write_users({"acme/*": "a"}), {"FLEET_GIT_SHIM": "off"}),
+                                  ("an unreadable config", lambda: (self.home / "xdg-config" / "fleet-switchboard" / "config.json").write_text("{bad"), {})):
+            with self.subTest(label):
+                setup()
+                done, seen = self.run_git("push", "origin", env=env)
+                self.assertEqual(seen["argv"], ["push", "origin"], "git keeps its own credentials")
+        self.write_users({"acme/*": "a"})
+        done, seen = self.run_git("push", "origin")
+        self.assertEqual(seen["argv"], self.routed(verb="push", rest=["origin"]))
+        for sub in ("show", "prune", "update"):
+            done, seen = self.run_git("remote", sub, "origin")
+            self.assertEqual(seen["argv"], self.routed(verb="remote", rest=[sub, "origin"]), sub)
+        done, seen = self.run_git("remote", "add", "o", "u")
+        self.assertEqual(seen["argv"], ["remote", "add", "o", "u"])
+
+    def test_the_shim_reads_no_token_and_prints_nothing_of_its_own(self):
+        done, seen = self.run_git("push", env={"GH_TOKEN": "tok-secret"})
+        self.assertNotIn("tok-secret", " ".join(seen["argv"]) + done.stdout + done.stderr)
+        self.assertEqual(done.stderr, "")
+
+    def test_s5_the_fleet_coordination_skill_says_git_push_needs_no_manual_credential_route(self):
+        skill = " ".join((REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text().split())
+        self.assertIn("git push works as the repository's account", skill)
+        self.assertIn("no manual -c", skill)
+        self.assertIn("guardrail, not a boundary", skill)
+
+    def test_the_shim_is_executable_stdlib_only_and_impersonal(self):
+        text = GIT_SHIM.read_text()
+        self.assertTrue(os.access(str(GIT_SHIM), os.X_OK))
+        self.assertEqual(text.splitlines()[0], "#!/usr/bin/env python3")
+        pattern = re.compile("|".join(["jan" + "us", "sp" + "ire", "adk" + "aplan", "/Us" + "ers/"]), re.IGNORECASE)
+        for number, line in enumerate(text.splitlines(), 1):
+            self.assertIsNone(pattern.search(line), "%d: %s" % (number, line))
+
+
 class TestGhShimGateProbe(Base):
     """The shim asks `gates-check` before `pr ready` and `pr merge`: a refusal (exit 10, only in an enforcing repo) stops the command."""
 
@@ -20059,6 +20201,50 @@ class TestIdentityCheck(ReportBase):
                    ("workflow", "run", "ci.yml"), ("run", "rerun", "7"), ("secret", "set", "X"), ("gist", "create", "f"), ("pr", "checkout", "5"),
                    ("api", "repos/a/b/issues", "-fa=b"), ("api", "repos/a/b/issues", "--field=a=b"), ("some-alias", "go"))
     MORE_READS = (("pr", "view", "-R", "acme-ops/service", "5"), ("run", "view", "7"), ("api", "repos/a/b/issues", "--jq", ".[0]"), ("--version",))
+
+    def test_s4_git_credential_through_the_shim_is_bound_to_the_repos_account_and_a_failed_lookup_refuses_it(self):
+        users = {"acme-ops/service": "acct-ops"}
+        done, seen = self.run_gh_shim("acme-ops/service", users, {"acct-ops": "tok-ops"}, args=("auth", "git-credential", "get"))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(seen["token"], "tok-ops", "the mapped account's token, not the inherited one")
+        self.assertNotIn("tok-ops", " ".join(seen["argv"]) + done.stdout + done.stderr)
+        for label, tokens, extra in (("the token lookup fails", {}, {}), ("the identity lookup times out", {"acct-ops": "tok-ops"}, dict(wedge=True, seconds=0.3))):
+            with self.subTest(label):
+                done, seen = self.run_gh_shim("acme-ops/service", users, tokens, args=("auth", "git-credential", "get"), **extra)
+                self.assertEqual(done.returncode, 1)
+                self.assertIn("account lookup failed", done.stderr)
+                self.assertIsNone(seen, "the real gh never ran: no fallback to the stored or inherited login")
+        done, seen = self.run_gh_shim("acme-ops/service", users, {}, args=("auth", "status"))
+        self.assertEqual((done.returncode, seen["token"]), (0, "inherited-personal-token"), "auth status is still a read")
+        self.assertTrue(self.shim().is_write(["auth", "git-credential", "get"]))
+        self.assertFalse(self.shim().is_write(["auth", "status"]))
+
+    def test_git_credential_for_a_repository_with_no_mapped_account_or_no_identity_is_refused_never_the_inherited_token(self):
+        users = {"acme-ops/service": "acct-ops"}
+        cred = ("auth", "git-credential", "get")
+        for label, repo, extra in (("an unmapped repository", "acme-other/thing", {}), ("no repository identity", None, {})):
+            with self.subTest(label):
+                done, seen = self.run_gh_shim(repo, users, {"acct-ops": "tok-ops"}, args=cred, **extra)
+                self.assertEqual(done.returncode, 1)
+                self.assertIn("no GitHub account is mapped for", done.stderr)
+                self.assertIn("git cannot authenticate as a guess", done.stderr)
+                self.assertIsNone(seen, "the real gh (and so the inherited token) never ran")
+                self.assertNotIn("inherited-personal-token", done.stdout + done.stderr)
+        done, seen = self.run_gh_shim("acme-other/thing", users, {}, args=cred, extra_env={"FLEET_SWITCHBOARD_BIN": ""})
+        self.assertEqual(done.returncode, 1, "no switchboard to name the repository")
+        self.assertIn("no GitHub account is mapped for this shell (no switchboard", done.stderr)
+        self.assertIsNone(seen)
+        done, seen = self.run_gh_shim("acme-other/thing", {"acme-ops/service": ["not", "a", "string"]}, {}, args=cred)   # a map that cannot be read as accounts
+        self.assertEqual(done.returncode, 1)
+        self.assertIsNone(seen, "trouble on the credential route refuses, it never falls through")
+        done, seen = self.run_gh_shim("acme-ops/service", users, {"acct-ops": "tok-ops"}, args=cred)
+        self.assertEqual((done.returncode, seen["token"]), (0, "tok-ops"), "a mapped repository still works")
+        done, seen = self.run_gh_shim("acme-other/thing", None, {}, args=cred)
+        self.assertEqual((done.returncode, seen["token"]), (0, "inherited-personal-token"), "with no gh_users at all nothing is bound: unchanged")
+        done, seen = self.run_gh_shim("acme-other/thing", users, {}, args=("issue", "list"))
+        self.assertEqual((done.returncode, seen["token"]), (0, "inherited-personal-token"), "other gh commands keep the rule of #270: a read falls through")
+        done, seen = self.run_gh_shim("acme-other/thing", users, {}, args=("issue", "comment", "2", "--body", "x"))
+        self.assertEqual(done.returncode, 0, "an unmapped repository is not a failure for a gh write (#270)")
 
     def test_a_write_the_shim_does_not_list_or_a_flag_before_the_verb_is_still_a_write_and_unknown_is_not_a_read(self):
         shim = self.shim()

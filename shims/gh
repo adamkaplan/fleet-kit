@@ -172,6 +172,10 @@ class Lookup:
         return self._ident
 
 
+class NoAccountMapped(Exception):
+    """git's credential helper was asked, `gh_users` is set, and this caller has no repository or no account mapped for it: git must not authenticate as a guess."""
+
+
 class AccountLookupFailed(Exception):
     """The account lookup failed where an account WAS expected (a mapping exists): a write must not fall back to the inherited token."""
 
@@ -215,11 +219,20 @@ def is_write(args):
                 return method != "GET"
             return any(a in ("-f", "-F", "--field", "--raw-field", "--input") or a.startswith(("--field=", "--raw-field=", "--input=", "-f", "-F"))
                        for a in args[1:] if a.startswith("-") and not a.startswith("--jq") and not a.startswith("--paginate") and not a.startswith("--slurp"))
+        if words[:2] == ["auth", "git-credential"]:
+            return True   # git's credential helper (the `git` shim routes push and fetch to it): bound to the repo's account, and a failed lookup refuses, never the stored login
         if words[0] in READ_GROUPS:
             return False
         return not (len(words) >= 2 and words[1] in READ_SUBCOMMANDS)
     except Exception:
         return True   # cannot tell: treat as a write, the safe side
+
+
+def is_git_credential(args):
+    try:
+        return command_words(args)[:2] == ["auth", "git-credential"]
+    except Exception:
+        return False
 
 
 EXPLICIT_REPO_GROUPS = {"issue", "pr"}
@@ -270,7 +283,7 @@ def explicit_repo(args):
         return None
 
 
-def account_env(gh, lookup=None, strict=False, args=None):
+def account_env(gh, lookup=None, strict=False, credential=False, args=None):
     """The environment for the real gh with GH_TOKEN of the account that `gh_users` maps to the repo of the caller's RESOLVED
     identity (`fleet-switchboard whoami --json`: its session, never an inherited variable), the same map and the same
     `gh auth token --user` the daemon uses; so an inherited token never decides who an agent acts as. None leaves the
@@ -280,7 +293,11 @@ def account_env(gh, lookup=None, strict=False, args=None):
         if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":
             return None   # the switchboard's own call (the daemon's, or a command's): it named its account; never re-identified
         users = config_users()
-        if not users or not switchboard_binary():
+        if not users:
+            return None   # no per-repository accounts are configured: nothing to bind to, whatever the caller is
+        if not switchboard_binary():
+            if credential:
+                raise NoAccountMapped("this shell (no switchboard to say which repository it is)")
             return None
         lookup = lookup or Lookup()
         ident = lookup.identity()
@@ -292,9 +309,13 @@ def account_env(gh, lookup=None, strict=False, args=None):
         if not repo:
             if strict and lookup.failed:
                 raise AccountLookupFailed("identity")
+            if credential:
+                raise NoAccountMapped("this shell (it has no repository identity)")
             return None
         account = users.get(repo) or users.get(repo.split("/")[0] + "/*")
         if not isinstance(account, str) or not account:
+            if credential:
+                raise NoAccountMapped("repository %s" % repo)
             return None
         COUNT_ACCOUNT[0] = account   # for the call counter: the account's NAME only
         clean = {k: v for k, v in os.environ.items() if k not in TOKEN_ENV_NAMES}
@@ -303,10 +324,16 @@ def account_env(gh, lookup=None, strict=False, args=None):
         if not token and strict:
             raise AccountLookupFailed("token")
         return dict(os.environ, GH_TOKEN=token) if token else None
-    except AccountLookupFailed:
+    except (AccountLookupFailed, NoAccountMapped):
         raise
     except Exception:
+        if credential:
+            raise NoAccountMapped("this shell (its account could not be worked out)")   # the credential route never guesses: any trouble refuses
         return None
+
+
+def _clean_reason(text):
+    return "".join(c if 32 <= ord(c) < 127 else " " for c in text)[:120]
 
 
 def my_name(lookup=None):
@@ -803,11 +830,19 @@ def main(args):
         return 10
     if verdict is not None:
         args = verdict[1]
+    credential = is_git_credential(args)
+    extra = {"credential": True} if credential else {}   # only the git credential route passes the keyword: every other call is exactly as it was
     try:
-        env = account_env(gh, lookup, strict=is_write(args), args=args)
+        env = account_env(gh, lookup, strict=is_write(args), args=args, **extra)
+    except NoAccountMapped as err:
+        sys.stderr.write("gh: no GitHub account is mapped for %s: git cannot authenticate as a guess (add the repository or its owner to gh_users)\n" % _clean_reason(str(err)))
+        return 1
     except AccountLookupFailed:
         try:
-            env = account_env(gh, Lookup(write=True), strict=True, args=args)   # retry the lookup ONCE with a fresh deadline
+            env = account_env(gh, Lookup(write=True), strict=True, args=args, **extra)   # retry the lookup ONCE with a fresh deadline
+        except NoAccountMapped as err:
+            sys.stderr.write("gh: no GitHub account is mapped for %s: git cannot authenticate as a guess (add the repository or its owner to gh_users)\n" % _clean_reason(str(err)))
+            return 1
         except AccountLookupFailed:
             sys.stderr.write("gh: account lookup failed, retry (the fleet shim could not find which GitHub account this write is for, and will not "
                              "fall back to the inherited token)\n")
