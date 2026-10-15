@@ -61,7 +61,7 @@ def read_overrides(state_dir):
         return {}, None
     except OSError as err:
         return {}, "%s cannot be read: %s" % (FILE, err.strerror or err)
-    key = (stat.st_mtime_ns, stat.st_size)
+    key = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
     hit = _cache.get(str(path))
     if hit and hit[0] == key:
         return hit[1], None
@@ -82,8 +82,8 @@ def overlay(state_dir, fleet, session_id):
         entry = read_overrides(state_dir)[0].get((fleet or {}).get("name"))
     except Exception:
         return fleet
-    if entry is None or entry["session"] != session_id:
-        return fleet
+    if entry is None or entry["session"] != session_id or time.time() - entry["at"] > MAX_AGE_DAYS * 86400:
+        return fleet   # another session's, or older than the limit (an expired override never applies, even before the next write drops it)
     return dict(fleet, reports_to=entry["boss"])
 
 
@@ -101,6 +101,11 @@ def write_overrides(state_dir, overrides):
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(str(temp), str(path))
+        dir_fd = os.open(str(Path(state_dir)), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     except BaseException:
         try:
             os.unlink(str(temp))
@@ -132,6 +137,17 @@ class locked:
         os.close(self.fd)
 
 
+def clean(sb, text, limit=64):
+    """Text a caller typed, as one short safe line for a message or the audit (no control characters, bounded)."""
+    return sb._one_line(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(text)), limit)
+
+
+def matching(overrides, worker, session):
+    """The worker's override when it belongs to THIS session, else None."""
+    entry = overrides.get(worker)
+    return entry if entry is not None and entry["session"] == session else None
+
+
 def check_caller(caller, role):
     """The refusal text, or None: only the Chief of Staff or the operator (a plain shell: `caller` is None) reassigns. A worker never does."""
     if caller is None or role == "chief-of-staff":
@@ -159,6 +175,7 @@ def run_reassign(sb, worker, to, consent, undo, caller, role, out, err):
     """`reassign <worker> --to <orchestrator> --consent-from <current boss>` or `--undo`. Exit 0 done; 1 the caller is refused (audited) or a write
     failed or a notice failed (the override stands, the output says which); 2 refused for a reason that is not the caller (nothing written)."""
     engine = sb.engine
+    worker, to, consent = (clean(sb, v) if isinstance(v, str) else v for v in (worker, to, consent))   # typed text: one safe bounded line, before it is echoed or audited
     subject = "agent:%s" % worker
     audit = lambda event, **detail: engine.audit.append(engine.actor, event, subject, dict(detail, caller=caller or OPERATOR, worker=worker))
     refusal = check_caller(caller, role)
@@ -197,14 +214,19 @@ def run_reassign(sb, worker, to, consent, undo, caller, role, out, err):
     if to == current:
         return refuse("%s already reports to %s" % (worker, to))
     now = engine.now()
+    before, _ = read_overrides(state)
+    seen_entry = matching(before, worker, seen.session_id)   # the override the consent was checked against
     try:
         with locked(state):
             overrides, problem = read_overrides(state)
             if problem:
                 return refuse("the override record cannot be used (%s)" % problem)
+            held = matching(overrides, worker, seen.session_id)
+            if (held is None) != (seen_entry is None) or (held is not None and held["boss"] != seen_entry["boss"]):
+                return refuse("%s's boss changed while this was being checked (consent was taken from %s); run it again" % (worker, current))   # checked again at the point of effect
             retired = sb.read_retired(state)
             prune(overrides, retired, now)
-            original = (overrides.get(worker) or {}).get("original") or (seen.fleet or {}).get("reports_to") or ""
+            original = (held or {}).get("original") or (seen.fleet or {}).get("reports_to") or ""   # an override of ANOTHER session never lends its launch boss
             overrides[worker] = {"boss": to, "was": current, "original": original, "session": seen.session_id, "by": caller or OPERATOR, "at": float(now)}
             with engine._external("reassign", subject, {"caller": caller or OPERATOR, "worker": worker, "from": current, "to": to, "consent": consent}):
                 write_overrides(state, overrides)

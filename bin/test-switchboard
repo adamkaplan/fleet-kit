@@ -51429,7 +51429,10 @@ class TestReassign(IntentCase):
         code, out, err = self.reassign()
         self.assertEqual((code, err), (0, ""), out)
         self.assertEqual(self.boss(), "orch-b", "1 boss record changed")
-        self.assertEqual(len(self.audit("reassign")), 2, "audited before and after the write, as every write is")
+        written = self.audit("reassign")
+        details = [e.get("detail") or {} for e in written]
+        self.assertTrue(details and all(d.get("caller") == "chief-of-staff" and d.get("worker") == "worker" for d in details if d), "audited with the caller and the worker")
+        self.assertTrue(any(d.get("from") == "orch-a" and d.get("to") == "orch-b" for d in details))
         self.assertEqual([len(self.world.admissions(n)) for n in ("orch-a", "orch-b", "worker")], [1, 1, 1])
         self.assertEqual(oct(self.record().stat().st_mode & 0o777), "0o600")
         entry = json.loads(self.record().read_text())["overrides"]["worker"]
@@ -51529,6 +51532,96 @@ class TestReassign(IntentCase):
         fresh = {"keep": {"boss": "b", "at": 1000.0}, "old": {"boss": "b", "at": 1.0}, "gone": {"boss": "b", "at": 1000.0}}
         self.assertEqual(ra.prune(fresh, {"gone": {}}, 1000.0 + ra.MAX_AGE_DAYS * 86400 - 1), 2)
         self.assertEqual(sorted(fresh), ["keep"])
+
+    def test_a_relaunched_worker_does_not_inherit_the_old_sessions_launch_boss(self):
+        ra = sb.load_module("reassign")
+        self.reassign()
+        old = json.loads(self.record().read_text())
+        old["overrides"]["worker"]["session"] = "ses_example_previous"   # the override is of an earlier session of the same name
+        old["overrides"]["worker"]["original"] = "orch-b"
+        self.record().write_text(json.dumps(old))
+        self.assertEqual(self.boss(), "orch-a", "the new session reports to its own boss")
+        self.world.add_agent("orch-c", fleet={"role": "orchestrator", "charter": 11})
+        self.assertEqual(self.main("reassign", "worker", "--to", "orch-c", "--consent-from", "orch-a")[0], 0)
+        self.main("reassign", "worker", "--undo")
+        self.assertEqual(self.boss(), "orch-a", "undo restores the NEW session's launch boss")
+
+    def test_a_boss_that_changes_between_the_check_and_the_write_refuses_the_command(self):
+        ra = sb.load_module("reassign")
+        real = ra.locked.__enter__
+
+        def enter(lock):
+            result = real(lock)
+            ra.write_overrides(self.world.state, {"worker": {"boss": "orch-b", "was": "orch-a", "original": "orch-a",
+                                                           "session": self.world.sessions["worker"], "by": "someone", "at": self.world.clock.now()}})
+            return result
+        with mock.patch.object(ra.locked, "__enter__", enter):
+            code, _, err = self.reassign()
+        self.assertEqual(code, 2)
+        self.assertIn("boss changed while this was being checked", err)
+
+    def test_a_failed_write_a_failed_notice_and_an_undo_without_an_override(self):
+        ra = sb.load_module("reassign")
+        with mock.patch.object(ra, "write_overrides", side_effect=OSError("disk full")):
+            code, _, err = self.reassign()
+        self.assertEqual(code, 1)
+        self.assertIn("nothing was changed", err)
+        self.assertFalse(self.record().exists())
+        code, out, err = self.main("reassign", "worker", "--undo")
+        self.assertEqual(code, 2)
+        self.assertIn("has no override to undo", err)
+        with mock.patch.object(sb.Switchboard, "send", side_effect=RuntimeError("herdr is down")):
+            code, out, err = self.reassign()
+        self.assertEqual(code, 1)
+        self.assertIn("the change stands, but these were not told", err)
+        self.assertEqual(self.boss(), "orch-b", "the override stands")
+
+    def test_a_retired_workers_override_is_dropped_by_the_next_reassign(self):
+        ra = sb.load_module("reassign")
+        self.world.add_agent("worker2", fleet={"role": "coder", "issue": 4, "reports_to": "orch-a"})
+        self.assertEqual(self.main("reassign", "worker2", "--to", "orch-b", "--consent-from", "orch-a")[0], 0)
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {"worker2": {"at": int(self.world.clock.now()), "by": "x", "reason": "done", "session": "s", "auto": False}})
+        self.assertEqual(self.reassign()[0], 0)
+        self.assertEqual(sorted(ra.read_overrides(self.world.state)[0]), ["worker"], "the retired worker's override is gone")
+
+    def test_a_worker_with_no_override_keeps_its_launch_boss_through_discovery(self):
+        self.reassign()
+        self.world.add_agent("worker3", fleet={"role": "coder", "issue": 5, "reports_to": "orch-b"})
+        self.assertEqual((self.boss("worker3"), self.boss("worker")), ("orch-b", "orch-b"))
+        self.main("reassign", "worker", "--undo")
+        self.assertEqual((self.boss("worker3"), self.boss("worker")), ("orch-b", "orch-a"))
+
+    def test_typed_text_is_one_clean_bounded_line_in_the_message_and_the_audit(self):
+        evil = "orch-a\x1b]0;x\x07" + "y" * 200
+        code, _, err = self.main("reassign", "worker", "--to", "orch-b", "--consent-from", evil)
+        self.assertEqual(code, 2)
+        self.assertNotIn("\x1b", err)
+        for e in self.audit("reassign.refused"):
+            self.assertNotIn("\x1b", json.dumps(e))
+            self.assertLessEqual(len(e["detail"]["consent"]), 64)
+
+    def test_an_expired_override_does_not_apply(self):
+        ra = sb.load_module("reassign")
+        self.reassign()
+        data = json.loads(self.record().read_text())
+        data["overrides"]["worker"]["at"] = 1.0
+        self.record().write_text(json.dumps(data))
+        fleet = {"name": "worker", "reports_to": "orch-a"}
+        with mock.patch.object(ra.time, "time", return_value=1.0 + (ra.MAX_AGE_DAYS + 1) * 86400):
+            self.assertEqual(ra.overlay(self.world.state, fleet, self.world.sessions["worker"])["reports_to"], "orch-a")
+
+    def test_a_dead_reassigned_workers_new_boss_may_reattach_it_and_the_old_boss_may_not(self):
+        self.reassign()
+        discovery = self.world.new_engine().discover(self.world.clock.now())
+        sid = self.world.sessions["worker"]
+        discovery.agents.pop("worker")   # it died: not discovered, its boss comes from the stored session
+        engine = self.world.new_engine()
+        got = {}
+        for who in ("orch-b", "orch-a"):
+            self.as_agent(who)
+            got[who] = sb.reattach_caller_problem(engine, self.world.route, self.world.clock.now, discovery, "worker", sid)
+        self.assertIsNone(got["orch-b"])
+        self.assertIn("may not reattach", got["orch-a"])
 
     def test_the_command_is_registered_and_starts_the_daemon(self):
         self.assertIn("reassign", sb.build_parser().commands)

@@ -6426,6 +6426,7 @@ def reattach_caller_problem(engine, runner, now, discovery, name, session=None):
         try:
             known = read_pane_health(engine.state_dir)["agents"].get(name) or {}
             stored = _fleet_meta(engine.v2.session_get(session or known.get("session"))) or {} if (session or known.get("session")) else {}
+            stored = load_module("reassign").overlay(engine.state_dir, stored, session or known.get("session")) if stored else stored   # a reassigned worker's new boss, not the one it was launched with
             boss = resolve_boss(discovery, stored.get("reports_to")) if stored.get("reports_to") else None
         except Exception:
             boss = None
