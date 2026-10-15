@@ -23395,6 +23395,15 @@ class TestImpactFloorCommandAndPass(LedgerBase):
         self.assertEqual(len([line for line in err.splitlines() if line.strip()]), 1, err)
         self.assertIn("cannot be read", err)
 
+    def test_the_floor_report_carries_the_owner_hold_tier_as_advisory_information(self):
+        report = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])
+        self.assertEqual(report["decision"], "hold", "the labels still follow the old decision")
+        self.assertEqual(report["owner_decision"], "second-review", "a floor path outside the top tier: no owner clear")
+        self.pr.update({"changedFiles": 1, "files": [{"path": "shims/gh", "additions": 1, "deletions": 0}]})
+        report = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])
+        self.assertEqual(report["owner_decision"], "hold")
+        self.assertTrue(any("shims/gh" in reason for reason in report["owner_reasons"]), report["owner_reasons"])
+
     def test_the_pass_is_off_when_disabled_or_killed_and_unlisted_repos_are_not_read(self):
         for edit in ("disabled", "killed"):
             with self.subTest(edit=edit):
@@ -49966,6 +49975,17 @@ class TestOwnerHoldRule(unittest.TestCase):
                 self.floor.floor_for("adamkaplan/fleet-kit")
         self.floor._MATRIX_CACHE.clear()
         self.assertTrue(self.floor.floor_for("adamkaplan/fleet-kit")[0], "the real file reads again")
+
+    def test_an_odd_character_in_a_path_never_escapes_a_glob_and_a_suffix_never_makes_an_exact_file_match(self):
+        for path in ("shims/a\nb", "shims/a\tb", "shims/a\x00b", "shims/a b ", "shims/" + "x" * 5000, "agents/x\nz.md", "agents/opencode/\x00x.md",
+                     "plugins/fleet-hooks/a\nb", "SHIMS/A\nB"):
+            self.assertEqual(self.decide([path])[0], "hold", repr(path[:40]))
+            self.assertTrue(self.floor.matches(path, ["shims/**", "agents/**", "plugins/fleet-hooks/**"]), repr(path[:40]))
+        for path in ("bin/plan_ledger.py\nx", "bin/plan_ledger.py\n", "bin/plan_ledger.py ", "bin/plan_ledger.pyx"):
+            self.assertEqual(self.decide([path])[0], "none", "an exact file with a suffix is a different file: %r" % path)
+        self.assertEqual(self.decide(["bin/plan_ledger.py"])[0], "hold")
+        review = sb.load_module("plan_review")
+        self.assertEqual(review.path_hits(["shims/a\nb", "docs/x.md"], ["shims/**"]), ["shims/a\nb"], "the held-path glob of the review tier has the same rule")
 
     def home_file(self, name, text):
         tmp = Path(tempfile.mkdtemp(prefix="ohr"))

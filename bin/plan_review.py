@@ -55,7 +55,7 @@ def _glob_regex(glob):
             out, i = out + "[^/]", i + 1
         else:
             out, i = out + re.escape(glob[i]), i + 1
-    return re.compile("^" + out + "$")
+    return re.compile(out, re.DOTALL)   # matched with fullmatch: a newline in a path never escapes a glob
 
 
 def _norm_path(path):
@@ -70,7 +70,7 @@ def _norm_path(path):
 def path_hits(paths, held_globs):
     """The paths that match any held-path glob (`**` across directories, `*` within a name). Deterministic."""
     compiled = [_glob_regex(g) for g in held_globs or ()]
-    return sorted({str(p) for p in paths or () if any(c.match(_norm_path(p)) for c in compiled)})
+    return sorted({str(p) for p in paths or () if any(c.fullmatch(_norm_path(p)) for c in compiled)})
 
 
 def lanes_for_tier(tier, held_area=False):

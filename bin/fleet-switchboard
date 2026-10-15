@@ -17612,6 +17612,7 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
     matrix = impact_floor.load_matrix()
     rated = impact_floor.rate(matrix, list(rated_pairs))
     decision, reasons = impact_floor.decide(hit, rated, unknown)
+    owner = impact_floor.owner_decide(matrix, paths, [(sev, prob, None) for sev, prob in rated_pairs], unknown, hit)   # advisory (#451): which tier the owner-hold rule puts it in; the labels still follow `decision` until the re-judge slice
     head = raw.get("headRefOid")
     if engine.state_dir is not None and isinstance(head, str):
         review, problem = impact_review_hold(engine.state_dir, "%s#%d" % (repo, number), head)
@@ -17625,7 +17626,7 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
             decision = "hold"
     return {"pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude,
             "floor_paths": hit, "files_read": len(files), "complete": complete, "unknown": unknown, "rated": [list(r) for r in rated],
-            "decision": decision, "reasons": reasons}
+            "decision": decision, "reasons": reasons, "owner_decision": owner[0], "owner_reasons": owner[1]}
 
 
 def cmd_impact(args, runner, now):

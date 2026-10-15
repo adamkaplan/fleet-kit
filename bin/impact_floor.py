@@ -75,13 +75,13 @@ def _build(pattern):
         else:
             out.append(re.escape(pattern[i]))
             i += 1
-    return re.compile("^" + "".join(out) + "$")
+    return re.compile("".join(out), re.DOTALL)   # DOTALL and fullmatch (below): a newline, a tab or a NUL in a path never escapes a glob, and a trailing newline never makes an exact file match
 
 
 def matches(path, patterns):
     """Case-insensitive: the fleet runs on case-insensitive checkouts where `SHIMS/x` and `shims/x` are one file (a false hold costs little)."""
     lowered = path.lower()
-    return any(_glob_regex(p).match(lowered) for p in patterns)
+    return any(_glob_regex(p).fullmatch(lowered) for p in patterns)
 
 
 def floor_paths(paths, globs, exclude=(), force=()):
