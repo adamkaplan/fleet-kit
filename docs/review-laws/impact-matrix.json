@@ -152,6 +152,7 @@
         "bin/reassign.py",
         "bin/launch_testers.py",
         "bin/plan_review.py",
+        "bin/decision_core.py",
         "docs/review-laws/impact-matrix.json",
         "plugins/fleet-hooks/**",
         "tools/cos-permissions-proof/**",
@@ -186,6 +187,7 @@
           "bin/reassign.py",
           "bin/launch_testers.py",
           "bin/plan_review.py",
+          "bin/decision_core.py",
           "docs/review-laws/impact-matrix.json"
         ],
         "exclude": [
@@ -234,7 +236,6 @@
         "waiver"
       ],
       "exempt": {
-        "bin/decision_core.py": "answer_authority only orders the roles that may answer a decision (a tier ladder); clearing a hold, carrying a clear and merging are decided elsewhere. The module is large and generic: listing it would hold every decision change for the owner. Revisit if it ever decides a clear.",
         "bin/spotlight_guard.py": "holds_files tells whether a folder holds an entry; no authority.",
         "bin/triage_digest.py": "gate is a rate limit on digests (warm-up and interval); no authority.",
         "bin/triage_plan_open.py": "merged_links reads which links a text names; it decides nothing about who may merge.",

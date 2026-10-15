@@ -53613,7 +53613,7 @@ class TestAuthorityModulesGuard(unittest.TestCase):
 
     def test_s1_the_named_modules_are_top_tier_paths_and_every_one_is_also_in_the_floor(self):
         globs, exclude, force = self.floor.floor_for("adamkaplan/fleet-kit")
-        named = ["bin/chat_clear.py", "bin/clear_carry.py", "bin/reassign.py", "bin/launch_testers.py", "bin/plan_review.py", "bin/impact_floor.py", "bin/plan_ledger.py"]
+        named = ["bin/chat_clear.py", "bin/clear_carry.py", "bin/reassign.py", "bin/launch_testers.py", "bin/plan_review.py", "bin/decision_core.py", "bin/impact_floor.py", "bin/plan_ledger.py"]
         for module in named:
             self.assertIn(module, self.floor.top_tier_hits([module], self.matrix).get("authority", []), module + " is a top tier path")
             self.assertTrue(self.floor.floor_paths([module], globs, exclude, force), module + " is in the floor")
