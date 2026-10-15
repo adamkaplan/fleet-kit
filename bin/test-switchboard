@@ -50011,6 +50011,7 @@ class TestOwnerHoldRule(unittest.TestCase):
         review = sb.load_module("plan_review")
         for path in ("Shims/GH", "a/../x", "../x", "shims//./gh", "x\\y", "", "/", "..", "a/b/../../..", "bin\\..\\shims\\gh", "/etc/x", "~/x", "C:/x", "c:\\x", "a//b/./c/../d", "Ünï/../Ünï/x", "x\n/../y", "\u017fhims/gh", "\u212aeep/x", "ﬁle", "e\u0301", "\u00e9", "STRASSE/ß", "İ/i̇"):
             self.assertEqual(review._canonical(path), self.floor.canonical(path), repr(path))
+            self.assertEqual(review._folds(path), self.floor.folds(path), "the fold copies agree: " + repr(path))
 
     def test_a_unicode_fold_of_a_top_tier_path_is_that_path_on_a_case_and_normalisation_insensitive_file_system(self):
         review = sb.load_module("plan_review")
@@ -50019,8 +50020,14 @@ class TestOwnerHoldRule(unittest.TestCase):
             self.assertEqual(review.path_hits([path], ["shims/**", ".github/workflows/**", "agents/**", "bin/plan_ledger.py"]), [path], "review tier: " + repr(path))
         self.assertTrue(self.floor.matches("e\u0301.txt", ["\u00e9.txt"]), "a decomposed accent is the composed one, in a glob too")
         self.assertTrue(self.floor.matches("\u00e9.txt", ["e\u0301.txt"]))
-        self.assertEqual(self.floor.folds("\ufb01"), {"fi"}, "a ligature folds to its letters")
+        self.assertEqual(self.floor.folds("\ufb01"), {"fi", "\ufb01"}, "a ligature folds to its letters, and its lower-case spelling is kept too")
         self.assertEqual(self.decide(["docs/\u017fhims.md"])[0], "none", "a fold of a name that matches no top tier glob stays outside")
+
+    def test_the_fold_is_a_superset_of_the_old_lower_case_match(self):
+        self.assertTrue(self.floor.matches("shims/\u00df", ["shims/?"]), "casefold turns a sharp s into ss, but the lower-case spelling is still tried")
+        self.assertIn("\u00df", self.floor.folds("\u00df"))
+        for text in ("SHIMS/Gh", "Agents/X.md", "\u00c9COLE"):
+            self.assertTrue({text.lower()} <= self.floor.folds(text), text)
 
     def home_file(self, name, text):
         tmp = Path(tempfile.mkdtemp(prefix="ohr"))

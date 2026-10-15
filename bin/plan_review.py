@@ -69,9 +69,9 @@ def _norm_path(path):
 
 
 def _folds(text):
-    """A COPY of `impact_floor.folds`: the NFC and the NFD form of the casefold (a parity test keeps them equal)."""
+    """A COPY of `impact_floor.folds`: the NFC and the NFD form of the casefold and of the lower-case (a parity test keeps them equal)."""
     text = str(text)
-    return {unicodedata.normalize(form, unicodedata.normalize(form, text).casefold()) for form in ("NFC", "NFD")}
+    return frozenset(unicodedata.normalize(form, getattr(unicodedata.normalize(form, text), method)()) for form in ("NFC", "NFD") for method in ("casefold", "lower"))
 
 
 def _canonical(path):

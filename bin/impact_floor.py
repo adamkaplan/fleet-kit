@@ -44,12 +44,20 @@ def default_floors(matrix=None):
     return {name: entry for name, entry in floors.items() if isinstance(entry, dict)}
 
 
+_FOLDS = {}
+
+
 def folds(text):
-    """The case- and normalisation-folded spellings of `text`: the NFC and the NFD form of its casefold. A case-insensitive, normalisation-insensitive file
-    system (APFS) reads `SHIMS/gh`, `\u017fhims/gh` (a long s) and a decomposed accent as one file, and `str.lower()` misses most of them. BOTH forms are tried
-    (when in doubt, hold: a fold that makes an unrelated path hit only adds a hold)."""
+    """The case- and normalisation-folded spellings of `text`: the NFC and the NFD form of its casefold AND of its lower-case (so this is a superset of what
+    `str.lower()` alone gave). A case-insensitive, normalisation-insensitive file system (APFS) reads `SHIMS/gh`, `\u017fhims/gh` (a long s) and a decomposed
+    accent as one file, and `str.lower()` misses most of them. ALL forms are tried (when in doubt, hold: a fold that makes an unrelated path hit only adds a hold)."""
     text = str(text)
-    return {unicodedata.normalize(form, unicodedata.normalize(form, text).casefold()) for form in ("NFC", "NFD")}
+    got = _FOLDS.get(text)
+    if got is None:
+        got = frozenset(unicodedata.normalize(form, getattr(unicodedata.normalize(form, text), method)()) for form in ("NFC", "NFD") for method in ("casefold", "lower"))
+        if len(_FOLDS) < 20000:
+            _FOLDS[text] = got
+    return got
 
 
 def _glob_regex(pattern):
