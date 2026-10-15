@@ -12,7 +12,9 @@ import hashlib
 import json
 import os
 import re
+import math
 import secrets
+import signal
 import subprocess
 import sys
 import time
@@ -22,6 +24,7 @@ SHAPES = {"S": {"cpu": "2", "memory": "4Gi", "usd_per_hour": 0.10},
           "M": {"cpu": "4", "memory": "8Gi", "usd_per_hour": 0.20}}  # list-price estimates, not billed figures
 MAX_TOKEN_SECONDS = 3600
 DEFAULT_MAX_HARD = "8h"  # OPEN in the contract: value
+DEFAULT_SPEND_CAP_USD = 25.0  # the prototype's cap; applies when FLEET_CLOUD_SPEND_CAP_USD is unset or empty
 LABEL = "fleet-worker"
 EXIT_DONE, EXIT_HOOK, EXIT_USAGE, EXIT_CLOUD, EXIT_TIMEOUT, EXIT_CAP, EXIT_REFUSED = 0, 1, 2, 3, 4, 5, 6
 
@@ -33,9 +36,43 @@ ALLOWED_ENV_NAMES = {"FLEET_TOKEN_ENDPOINT"}  # a URL, not a token
 
 
 class CloudError(Exception):
+    audited = False  # True when the failure already wrote its own audit line
+
     def __init__(self, msg, code=EXIT_CLOUD):
         super().__init__(msg)
         self.code = code
+
+
+class Interrupted(BaseException):
+    """SIGINT or SIGTERM during create: not an Exception, so no handler in between swallows it."""
+
+
+EXIT_INTERRUPTED = 130
+
+
+def _raise_interrupted(signum, frame):
+    raise Interrupted("signal %d" % signum)
+
+
+def spend_cap(env):
+    """The cap in USD: the setting, else the default. Zero, negative, non-numeric, nan or inf refuse (fail closed)."""
+    raw = (env.get("FLEET_CLOUD_SPEND_CAP_USD") or "").strip()
+    if not raw:
+        return DEFAULT_SPEND_CAP_USD
+    try:
+        cap = float(raw)
+    except ValueError:
+        cap = float("nan")
+    if not math.isfinite(cap) or cap <= 0:
+        raise CloudError("FLEET_CLOUD_SPEND_CAP_USD must be a positive finite number of USD; refusing to create", EXIT_CAP)
+    return cap
+
+
+def as_cost(x):
+    """A finite non-negative number, or refuse: a cost that cannot be read is not a cost of zero."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or x < 0:
+        raise CloudError("cost estimate unreadable; refusing to create (the spend cap cannot be checked)", EXIT_CAP)
+    return float(x)
 
 
 def parse_duration(text):
@@ -77,9 +114,14 @@ class Kube:
         self.env = dict(os.environ, **env)
         self.bin = env.get("FLEET_KUBECTL", "kubectl")
         self.ns = env.get("FLEET_CLOUD_NAMESPACE", "fleet-workers")
+        self.context = (env.get("FLEET_KUBE_CONTEXT") or "").strip()
+        self.kubeconfig = (env.get("FLEET_KUBECONFIG") or "").strip()
 
     def run(self, args, stdin=None, ok_missing=False, keep_stdout=False):
-        cmd = [self.bin, "-n", self.ns] + args
+        if not self.context:  # never fall back to the active context
+            raise CloudError("FLEET_KUBE_CONTEXT is not set; refusing to run kubectl against an unnamed context", EXIT_USAGE)
+        cmd = [self.bin] + (["--kubeconfig", self.kubeconfig] if self.kubeconfig else []) + \
+              ["--context", self.context, "-n", self.ns] + args
         try:
             p = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=120, env=self.env)
         except (OSError, subprocess.TimeoutExpired) as e:
@@ -106,9 +148,15 @@ class Kube:
     def annotate(self, name, **kv):
         self.run(["annotate", "pod", name, "--overwrite"] + ["fleet/%s=%s" % (k.replace("_", "-"), v) for k, v in kv.items()])
 
-    def delete(self, name):
+    def delete_pod(self, name):
         self.run(["delete", "pod", name, "--ignore-not-found", "--wait=false"])
+
+    def delete_secret(self, name):
         self.run(["delete", "secret", name + "-pw", "--ignore-not-found"])
+
+    def delete(self, name):
+        self.delete_pod(name)
+        self.delete_secret(name)
 
     def exec(self, name, *cmd, keep_stdout=False):
         return self.run(["exec", name, "--"] + list(cmd), keep_stdout=keep_stdout)
@@ -177,7 +225,8 @@ class Launcher:
         try:
             result = fn(info)
         except CloudError as e:
-            self.audit(worker, info["rid"], action, info["cost"], False, reason or str(e))
+            if not e.audited:
+                self.audit(worker, info["rid"], action, info["cost"], False, reason or str(e))
             raise
         except (ValueError, TypeError, KeyError) as e:  # a bad annotation or reply still writes its ok:false line
             self.audit(worker, info["rid"], action, info["cost"], False, reason or str(e)[:300])
@@ -191,9 +240,27 @@ class Launcher:
         pod = self.kube.get_pod(pod_name(worker))
         return pod
 
+    def estimate(self, shape, seconds):
+        return SHAPES[shape]["usd_per_hour"] * seconds / 3600
+
+    def check_cap(self, shape, hard_seconds):
+        cap = spend_cap(self.env)
+        try:
+            spent = sum(as_cost(self.cost(p)) for p in self.kube.list_pods())
+            launch = as_cost(self.estimate(shape, hard_seconds))
+        except CloudError as e:
+            if e.code == EXIT_CAP:
+                raise
+            raise CloudError("could not read the running cost; refusing to create: %s" % e, EXIT_CAP)
+        except Exception as e:
+            raise CloudError("could not read the cost; refusing to create: %s" % str(e)[:200], EXIT_CAP)
+        if spent >= cap or spent + launch > cap:
+            raise CloudError("spend cap reached (cap USD %s, spent %.4f, this launch %.4f)" % (cap, spent, launch), EXIT_CAP)
+
     # -- create --
     def create(self, a):
         worker, name = a.worker, pod_name(a.worker)
+        made = {"secret": False, "pod": False}  # set before the call that may create it: an interrupt may land after
 
         def go(info):
             info["rid"] = "pod/" + name
@@ -206,9 +273,7 @@ class Launcher:
             max_hard = now + dt.timedelta(seconds=parse_duration(a.max_hard))
             if hard > max_hard:
                 raise CloudError("--hard is past --max-hard", EXIT_REFUSED)
-            cap = self.env.get("FLEET_CLOUD_SPEND_CAP_USD")  # OPEN in the contract: who sets it; an env value for now
-            if cap and sum(self.cost(p) for p in self.kube.list_pods()) >= float(cap):
-                raise CloudError("spend cap reached", EXIT_CAP)
+            self.check_cap(a.shape, int((hard - now).total_seconds()))
             spec = render_pod(a, worker, name, now, hard, self.env)
             hits = scan_credentials(spec)
             if hits:
@@ -218,28 +283,78 @@ class Launcher:
             password = secrets.token_urlsafe(32)
             # Single operator assumed: the check above and the applies below are not one atomic step.
             try:
+                made["secret"] = True
                 self.kube.apply({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": name + "-pw", "labels": {"app": LABEL}},
                                  "type": "Opaque", "stringData": {"password": password}})
+                made["pod"] = True
                 self.kube.apply(spec)
                 self._wait_ready(name, a.wait)
                 if a.password_fd is not None:
                     with os.fdopen(os.dup(a.password_fd), "w") as f:
                         f.write(password)
             except (CloudError, OSError) as e:
-                self._cleanup(name)  # nothing is left running (and costing) or holding a password
-                raise e if isinstance(e, CloudError) else CloudError("could not hand over the password: %s" % e)
+                left = self._cleanup(name, made)  # nothing is left running (and costing) or holding a password
+                err = e if isinstance(e, CloudError) else CloudError("could not hand over the password: %s" % e)
+                if left:
+                    err = CloudError("%s; CLEANUP FAILED, REMAINS: %s" % (err, ", ".join(left)), err.code)
+                raise err
+            except BaseException as e:  # interrupt or an unexpected exception: clean up, audit, say what was cleaned
+                self._abort(worker, name, made, e)
             domain = self.env.get("FLEET_CLOUD_DOMAIN", "example.internal")
             return {"worker": worker, "url": "https://worker-%s.%s:4096" % (name, domain),
                     "auth_ref": "file:/run/fleet/%s.password" % worker, "runtime_id": "pod/" + name,
                     "idle_deadline": iso(now + dt.timedelta(seconds=parse_duration(a.idle))), "hard_deadline": iso(hard),
                     "password_fd": a.password_fd}
-        return self._audited(worker, "create", go)
-
-    def _cleanup(self, name):
+        old = self._catch_signals()
         try:
-            self.kube.delete(name)
-        except CloudError:
-            pass  # the original failure is the one to report
+            return self._audited(worker, "create", go)
+        finally:
+            self._restore_signals(old)
+
+    @staticmethod
+    def _catch_signals():
+        try:
+            return {s: signal.signal(s, _raise_interrupted) for s in (signal.SIGINT, signal.SIGTERM)}
+        except ValueError:  # not the main thread (tests): no handler, the try/except still runs
+            return {}
+
+    @staticmethod
+    def _restore_signals(old):
+        for s, h in old.items():
+            signal.signal(s, h)
+
+    def _cleanup(self, name, made):
+        """Delete what create made, each on its own so one failure does not skip the other. Returns what REMAINS."""
+        old = {}
+        try:
+            old = {s: signal.signal(s, signal.SIG_IGN) for s in (signal.SIGINT, signal.SIGTERM)}  # a second Ctrl-C must not abandon it
+        except ValueError:
+            pass
+        left = []
+        try:
+            for kind, fn, label in (("pod", self.kube.delete_pod, "pod/" + name), ("secret", self.kube.delete_secret, "secret/%s-pw" % name)):
+                if made[kind]:
+                    try:
+                        fn(name)
+                    except CloudError:
+                        left.append(label)
+        finally:
+            self._restore_signals(old)
+        if left:
+            print("cloud-worker: CLEANUP FAILED, REMAINS in the cluster (delete by hand): %s" % ", ".join(left), file=sys.stderr)
+        return left
+
+    def _abort(self, worker, name, made, exc):
+        interrupted = isinstance(exc, (Interrupted, KeyboardInterrupt))
+        left = self._cleanup(name, made)
+        cleaned = [l for k, l in (("pod", "pod/" + name), ("secret", "secret/%s-pw" % name)) if made[k] and l not in left]
+        reason = "%s; cleaned: %s" % ("interrupted" if interrupted else "failed: %s" % str(exc)[:200], ", ".join(cleaned) or "nothing")
+        if left:
+            reason += "; REMAINS: %s" % ", ".join(left)
+        self.audit(worker, "pod/" + name, "create.interrupted" if interrupted else "create.failed", 0.0, False, reason)
+        err = CloudError("create %s" % reason, EXIT_INTERRUPTED if interrupted else EXIT_CLOUD)
+        err.audited = True
+        raise err from None
 
     def _wait_ready(self, name, seconds):
         end = self.clock() + dt.timedelta(seconds=seconds)
@@ -443,6 +558,9 @@ def main(argv=None, env=None, clock=None, sleep=time.sleep):
         a = build_parser().parse_args(argv)
     except SystemExit as e:
         return EXIT_USAGE if e.code else 0
+    if not (env.get("FLEET_KUBE_CONTEXT") or "").strip():
+        print("cloud-worker: FLEET_KUBE_CONTEXT is not set; refusing to run (the active kubectl context is never used)", file=sys.stderr)
+        return EXIT_USAGE
     L = Launcher(Kube(env), env, clock, sleep)
     try:
         if a.cmd == "reap":
@@ -458,6 +576,9 @@ def main(argv=None, env=None, clock=None, sleep=time.sleep):
     except CloudError as e:
         print("cloud-worker: %s" % e, file=sys.stderr)
         return e.code
+    except (Interrupted, KeyboardInterrupt):
+        print("cloud-worker: interrupted", file=sys.stderr)
+        return EXIT_INTERRUPTED
 
 
 if __name__ == "__main__":

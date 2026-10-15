@@ -3,10 +3,18 @@
 import json, os, subprocess, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 path = os.environ["FAKE_KUBE_STATE"]
-st = json.load(open(path))
 args = sys.argv[1:]
-assert args[0] == "-n"
-args = args[2:]
+if os.environ.get("FAKE_KUBE_CALLS"):
+    with open(os.environ["FAKE_KUBE_CALLS"], "a") as f:
+        f.write(json.dumps(args) + "\n")
+if args[0] == "--kubeconfig":
+    args = args[2:]
+assert args[0] == "--context", "no explicit --context"
+assert args[2] == "-n"
+args = args[4:]
+st = json.load(open(path))
+if st.get("fail_delete") and args[0] == "delete":
+    print("Error from server (Forbidden): delete denied", file=sys.stderr); sys.exit(1)
 cmd = args[0]
 def save():
     json.dump(st, open(path, "w"))

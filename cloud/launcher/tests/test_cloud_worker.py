@@ -45,7 +45,8 @@ class Base(unittest.TestCase):
         self.write_state({"pods": {}})
         self.env = {"FLEET_KUBECTL": os.path.join(HERE, "fake_kubectl"), "FAKE_KUBE_STATE": self.state,
                     "FLEET_CLOUD_AUDIT": os.path.join(d, "audit.jsonl"), "FLEET_CLOUD_IMAGE": "registry.example.internal/worker:1",
-                    "FLEET_TOKEN_ENDPOINT": "https://tokens.example.internal/mint", "FLEET_CLOUD_DOMAIN": "example.internal"}
+                    "FLEET_TOKEN_ENDPOINT": "https://tokens.example.internal/mint", "FLEET_CLOUD_DOMAIN": "example.internal",
+                    "FLEET_KUBE_CONTEXT": "acme-fleet", "FAKE_KUBE_CALLS": os.path.join(d, "calls.jsonl")}
         self.clock = Clock()
 
     def write_state(self, st):
@@ -339,7 +340,7 @@ class S4Audit(Base):
         self.assertFalse(self.audit_lines()[-1]["ok"])
 
     def test_spend_cap_exit_5(self):
-        self.env["FLEET_CLOUD_SPEND_CAP_USD"] = "0.05"
+        self.env["FLEET_CLOUD_SPEND_CAP_USD"] = "0.25"
         self.create("coder7")
         self.clock.advance(hours=1)
         self.assertEqual(self.run_cli("create", "coder8", "--repo", "a/b", "--branch", "m")[0], 5)
@@ -456,6 +457,214 @@ class S5EndHook(Base):
         self.assertEqual(res, [("coder7", "hard limit", 1)])
         self.assertIsNotNone(self.pod())
         self.assertEqual(self.run_cli("reap")[0], 1)
+
+
+class S6Context(Base):
+    def calls(self):
+        if not os.path.exists(self.env["FAKE_KUBE_CALLS"]):
+            return []
+        with open(self.env["FAKE_KUBE_CALLS"]) as f:
+            return [json.loads(x) for x in f]
+
+    def test_every_call_carries_the_configured_context_and_kubeconfig(self):
+        self.env["FLEET_KUBECONFIG"] = "/home/user/.kube/fleet-config"
+        self.patch_state(hook_env={"FLEET_WORKDIR": make_repo(self.tmp.name, "r", False)[0], "FLEET_WORKER": "x"})
+        self.create("coder7")
+        self.set_activity("coder7", False, self.clock())
+        self.run_cli("status")
+        self.run_cli("extend", "coder7", "--hard", "+10m")
+        self.run_cli("reap")
+        self.run_cli("stop", "coder7")
+        self.create("coder8")
+        self.run_cli("delete", "coder8", "--force")
+        calls = self.calls()
+        self.assertGreater(len(calls), 15)
+        verbs = {c[c.index("-n") + 2] for c in calls}
+        self.assertTrue({"apply", "get", "annotate", "delete", "exec"} <= verbs, verbs)
+        for c in calls:
+            self.assertEqual(c[:4], ["--kubeconfig", "/home/user/.kube/fleet-config", "--context", "acme-fleet"], c)
+
+    def test_context_without_kubeconfig_has_no_kubeconfig_flag(self):
+        self.create("coder7")
+        for c in self.calls():
+            self.assertEqual(c[:2], ["--context", "acme-fleet"])
+            self.assertNotIn("--kubeconfig", c)
+
+    def test_unset_or_empty_context_refuses_every_command_and_calls_nothing(self):
+        for value in (None, "", "  "):
+            if value is None:
+                self.env.pop("FLEET_KUBE_CONTEXT")
+            else:
+                self.env["FLEET_KUBE_CONTEXT"] = value
+            for argv in (("create", "coder7", "--repo", "a/b", "--branch", "m"), ("stop", "coder7"), ("extend", "coder7", "--hard", "+1h"),
+                         ("delete", "coder7"), ("status",), ("reap",)):
+                code, out, err = self.run_cli(*argv)
+                self.assertEqual(code, 2, argv)
+                self.assertIn("FLEET_KUBE_CONTEXT", err)
+        self.assertEqual(self.calls(), [])
+
+
+class S7Interrupt(Base):
+    def run_create(self):
+        return self.run_cli("create", "coder7", "--repo", "a/b", "--branch", "m")
+
+    def assert_clean(self, action, code_nonzero=True):
+        st = self.st()
+        self.assertEqual(st["pods"], {})
+        self.assertEqual(st.get("secrets", {}), {})
+        last = self.audit_lines()[-1]
+        self.assertEqual(last["action"], action)
+        self.assertFalse(last["ok"])
+        return last
+
+    def test_interrupt_after_secret_before_pod(self):
+        real = cw.Kube.apply
+
+        def apply(kube, obj):
+            if obj["kind"] == "Pod":
+                raise KeyboardInterrupt
+            real(kube, obj)
+        cw.Kube.apply = apply
+        self.addCleanup(setattr, cw.Kube, "apply", real)
+        code, _, err = self.run_create()
+        self.assertEqual(code, 130)
+        last = self.assert_clean("create.interrupted")
+        self.assertIn("secret/", last["reason"])
+        self.assertNotIn("REMAINS", last["reason"])
+
+    def test_interrupt_after_pod_created(self):
+        real = cw.Launcher._wait_ready
+
+        def boom(self_, name, seconds):
+            self.assertIn(cw.pod_name("coder7"), self.st()["pods"])
+            raise cw.Interrupted("signal 15")
+        cw.Launcher._wait_ready = boom
+        self.addCleanup(setattr, cw.Launcher, "_wait_ready", real)
+        code, _, _ = self.run_create()
+        self.assertEqual(code, 130)
+        last = self.assert_clean("create.interrupted")
+        self.assertIn("pod/", last["reason"])
+        self.assertIn("secret/", last["reason"])
+
+    def test_unexpected_exception_is_cleaned_and_audited_as_failed(self):
+        real = cw.Launcher._wait_ready
+
+        def boom(self_, name, seconds):
+            raise RuntimeError("surprise")
+        cw.Launcher._wait_ready = boom
+        self.addCleanup(setattr, cw.Launcher, "_wait_ready", real)
+        code, _, _ = self.run_create()
+        self.assertNotEqual(code, 0)
+        self.assert_clean("create.failed")
+
+    def test_real_sigterm_is_handled(self):
+        import signal
+        real = cw.Launcher._wait_ready
+
+        def boom(self_, name, seconds):
+            os.kill(os.getpid(), signal.SIGTERM)
+            self.sleep_forever = True
+        cw.Launcher._wait_ready = boom
+        self.addCleanup(setattr, cw.Launcher, "_wait_ready", real)
+        code, _, _ = self.run_create()
+        self.assertEqual(code, 130)
+        self.assert_clean("create.interrupted")
+
+    def test_failed_cleanup_names_what_remains_loudly(self):
+        real = cw.Launcher._wait_ready
+
+        def boom(self_, name, seconds):
+            self.patch_state(fail_delete=True)
+            raise cw.Interrupted("signal 2")
+        cw.Launcher._wait_ready = boom
+        self.addCleanup(setattr, cw.Launcher, "_wait_ready", real)
+        code, _, err = self.run_create()
+        self.assertEqual(code, 130)
+        name = cw.pod_name("coder7")
+        self.assertIn("REMAINS", err)
+        self.assertIn("pod/" + name, err)
+        self.assertIn("secret/%s-pw" % name, err)
+        last = self.audit_lines()[-1]
+        self.assertEqual(last["action"], "create.interrupted")
+        self.assertIn("REMAINS: pod/%s, secret/%s-pw" % (name, name), last["reason"])
+
+    def test_failed_cleanup_after_a_cloud_error_exits_nonzero_and_names_remains(self):
+        self.patch_state(never_ready=True)
+        real = cw.Kube.delete_pod
+
+        def deny(kube, name):
+            raise cw.CloudError("denied")
+        cw.Kube.delete_pod = deny
+        self.addCleanup(setattr, cw.Kube, "delete_pod", real)
+        code, _, err = self.run_cli("create", "coder7", "--repo", "a/b", "--branch", "m", "--wait", "4")
+        self.assertEqual(code, 4)
+        self.assertIn("REMAINS: pod/", err)
+        self.assertEqual(len([x for x in self.audit_lines() if x["action"] == "create"]), 1)
+        self.assertIn("REMAINS", self.audit_lines()[-1]["reason"])
+        self.assertEqual(self.st().get("secrets", {}), {})  # the secret delete still ran
+
+
+class S8Cap(Base):
+    def create_code(self):
+        return self.run_cli("create", "coder7", "--repo", "a/b", "--branch", "m")
+
+    def refused(self, value):
+        self.env["FLEET_CLOUD_SPEND_CAP_USD"] = value
+        code, _, err = self.create_code()
+        self.assertEqual(code, 5, value)
+        self.assertIn("FLEET_CLOUD_SPEND_CAP_USD", err)
+        self.assertEqual(self.st()["pods"], {})
+        self.assertEqual(self.st().get("applied", []), [])
+
+    def test_unset_and_empty_default_to_25(self):
+        for value in (None, "", " "):
+            if value is None:
+                self.env.pop("FLEET_CLOUD_SPEND_CAP_USD", None)
+            else:
+                self.env["FLEET_CLOUD_SPEND_CAP_USD"] = value
+            self.assertEqual(cw.spend_cap(self.env), 25.0)
+        self.assertEqual(self.create_code()[0], 0)  # a normal launch is under 25
+        self.run_cli("delete", "coder7", "--force")
+
+    def test_unset_cap_refuses_a_launch_estimated_above_25(self):
+        self.env.pop("FLEET_CLOUD_SPEND_CAP_USD", None)
+        real = cw.Launcher.estimate
+        cw.Launcher.estimate = lambda self_, shape, seconds: 25.01
+        self.addCleanup(setattr, cw.Launcher, "estimate", real)
+        self.assertEqual(self.create_code()[0], 5)
+        self.assertEqual(self.st()["pods"], {})
+
+    def test_unset_cap_refuses_when_running_pods_already_cost_25(self):
+        self.create("coder8")
+        self.clock.advance(hours=300)  # 0.10 USD/h
+        self.assertEqual(self.create_code()[0], 5)
+
+    def test_zero_negative_and_junk_are_refused(self):
+        for v in ("0", "-5", "abc", "nan", "inf", "-inf", "NaN", "Infinity"):
+            self.refused(v)
+
+    def test_explicit_cap_is_honoured(self):
+        self.env["FLEET_CLOUD_SPEND_CAP_USD"] = "100"
+        self.assertEqual(self.create_code()[0], 0)
+
+    def test_unreadable_cost_is_refused(self):
+        real = cw.Launcher.estimate
+        self.addCleanup(setattr, cw.Launcher, "estimate", real)
+
+        def raises(self_, shape, seconds):
+            raise ValueError("no price")
+        for bad in (raises, lambda s_, sh, sec: "free", lambda s_, sh, sec: float("nan"), lambda s_, sh, sec: None):
+            cw.Launcher.estimate = bad
+            code, _, err = self.create_code()
+            self.assertEqual(code, 5)
+            self.assertEqual(self.st()["pods"], {})
+
+    def test_unreadable_running_pod_cost_is_refused(self):
+        self.create("coder8")
+        pod = self.pod("coder8")
+        pod["metadata"]["annotations"]["fleet/started"] = "garbage"
+        self.patch_state(pods={cw.pod_name("coder8"): pod})
+        self.assertEqual(self.create_code()[0], 5)
 
 
 class U1Scope(unittest.TestCase):
