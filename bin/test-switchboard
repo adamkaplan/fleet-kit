@@ -11423,6 +11423,17 @@ class TestChatClearOffers(unittest.TestCase):
         self.assertIs(refreshed["offers"]["acme/widget#100"]["shown"], False, "a PR whose entry was damaged is recorded again as NOT shown")
         self.assertIs(refreshed["offers"]["acme/widget#1"]["shown"], True, "a whole entry beside the damaged ones keeps what it was")
         self.assertEqual(len(refreshed["damaged"]), len(bad))
+        for n, shape in enumerate(bad):   # every damaged shape, held again, comes back as NOT shown
+            path.write_text(json.dumps({"offers": {"acme/widget#%d" % (300 + n): bad[shape]}}))
+            again = self.cc.refresh_offers(self.state, [self.hold(300 + n, ["u:hold-impact"])], self.NAMES, 3000 + n)
+            self.assertIs(again["offers"]["acme/widget#%d" % (300 + n)]["shown"], False, shape)
+        path.write_text(json.dumps({"offers": {"acme/widget#1": self.entry(), "acme/widget#2": self.entry(shown="no")}}))
+        self.assertFalse(self.cc.show(self.state, "acme/widget#1", "b" * 40, 5000), "show refuses while a damaged entry is in the file: a refresh rewrites it first")
+        self.assertIs(self.cc.refresh_offers(self.state, [self.hold(2, ["u:hold-impact"])], self.NAMES, 5001)["offers"]["acme/widget#2"]["shown"], False)
+        path.write_text(json.dumps({"offers": {"not a key": self.entry(), "acme/widget#1": self.entry()}}))
+        got = self.cc.refresh_offers(self.state, [], self.NAMES, 5002)
+        self.assertEqual(got["damaged"], ["not a key"], "a key that is no PR is said, not lost silently")
+        self.assertEqual(json.loads(path.read_text()), {"offers": {}}, "the file was rewritten without the damaged entry")
         self.assertFalse(self.cc.head_matches({"head": "a" * 40}, "a" * 40), "an entry with no `shown` at all never matches")
 
     def user(self, mid, text, t, **extra):
@@ -11576,6 +11587,8 @@ class TestChatClearOffers(unittest.TestCase):
         for joined in ("366-367", "366/367", "366,367", "366, 367", "366..367", "366...367", "366+367", "366&367", "366 and 367", "366 & 367", "#366 #367", "366;367", "366_367", "366 to 367", "366\u2013367"):
             self.assertEqual(n(joined), [366, 367], joined)
         self.assertEqual(n("0.97 sure, v2.0.28"), [0, 97, 2, 28], "digits inside decimals and versions are numbers too: it fails toward asking")
+        self.assertEqual(n("\u0663\u0666\u0666 and \uff13\uff16\uff16"), [], "only ASCII digits are digits")
+        self.assertLessEqual(len(str(max(n("9" * 5000 + " 1")))), self.cc.TEXT_MAX, "a huge digit run never raises and is cut at the text cap")
 
     def test_the_screen_never_lets_a_judge_widen_what_the_message_and_the_offers_say(self):
         offers = self.offers(366, 389, 400)    # shown at 1000
@@ -11586,7 +11599,8 @@ class TestChatClearOffers(unittest.TestCase):
         for text, why in (("all impacts cleared", "no_number"), ("the launchd one is good to go", "no_number"), ("366 and 389 are good to go", "several_numbers"),
                           ("366-367 are good to go", "several_numbers"), ("366/367 are good to go", "several_numbers"), ("366, 389 good to go", "several_numbers"),
                           ("366..389 good to go", "several_numbers"), ("366+389 good to go", "several_numbers"), ("366&389 good to go", "several_numbers"),
-                          ("abc366 is good to go", "unclear_number"), ("366abc is good to go", "unclear_number"), ("3.66 is good to go", "several_numbers"),
+                          ("abc366 is good to go", "unclear_number"), ("366abc is good to go", "unclear_number"), ("366_ is good to go", "unclear_number"),
+                          ("_366 is good to go", "unclear_number"), ("0366 is good to go", "unclear_number"), ("3.66 is good to go", "several_numbers"),
                           ("v366.1 is good to go", "several_numbers"), ("500 is good to go", "not_offered")):
             got = sc(text)
             self.assertEqual((got["verdict"], got["why"]), ("question", why), text)
@@ -11607,6 +11621,10 @@ class TestChatClearOffers(unittest.TestCase):
         for bad in (None, "1001", float("nan"), True):
             self.assertEqual(sc(bad, 1100)["why"], "no_time", repr(bad))
         self.assertEqual(self.cc.screen("366 is good to go", offers, 1001, None)["why"], "no_time")
+        self.assertEqual(sc(1000 + self.cc.MESSAGE_SKEW + 101, 1100)["why"], "no_time", "a message from the future")
+        self.assertEqual(self.cc.screen("366 is good to go", {"acme/widget#366": self.entry(shown_at=2000)}, 2001, 1000)["why"], "no_time", "an offer shown in the future")
+        for bad in ({"head": "a" * 40}, {"head": "a" * 40, "shown_at": "1000"}, {"head": "a" * 40, "shown_at": 1.5}):
+            self.assertEqual(self.cc.screen("366 is good to go", {"acme/widget#366": bad}, 1001, 1100)["why"], "no_time", bad)
         self.cc.show(self.state, "acme/widget#366", "a" * 40, 5000)   # shown again at 5000: an older message no longer counts
         again = self.cc.read_offers(self.state)
         self.assertEqual(self.cc.screen("366 is good to go", again, 4000, 5100)["why"], "before_offer")

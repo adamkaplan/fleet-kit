@@ -37,7 +37,7 @@ SUMMARY_MAX = 200
 LOCK_FILE = "chat-clear-offers.lock"
 LOCK_SECONDS = 5
 CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
-DIGITS = re.compile(r"\d+")
+DIGITS = re.compile(r"[0-9]+")   # ASCII digits only
 OFFER_TTL = 7 * 86400          # seconds: an offer older than this is not clearable (the owner is shown it again first)
 
 
@@ -122,12 +122,13 @@ def _load(state_dir):
         return {}, "the offers file is not an object of offers", set()
     good, damaged = {}, set()
     for key, offer in offers.items():
-        if not (isinstance(key, str) and re.match(r"^[^/#\s]+/[^/#\s]+#\d{1,9}$", key)):
+        if not (isinstance(key, str) and re.match(r"^[^/#\s]+/[^/#\s]+#[0-9]{1,9}$", key)):
+            damaged.add(str(key)[:200])   # a key that is no PR: said, never silently lost
             continue
         if _valid_offer(offer) and len(good) < OFFERS_MAX:
             good[key] = offer
-        elif not _valid_offer(offer):
-            damaged.add(key)
+        else:
+            damaged.add(key)   # a damaged entry, or a whole one past the cap: neither is trusted again as shown
     return good, None, damaged
 
 
@@ -216,17 +217,20 @@ def refresh_offers(state_dir, holds, names, now, lock_seconds=LOCK_SECONDS):
             else:
                 after[pr] = dict(kept, labels=labels, summary=summary or kept.get("summary", ""))
         dropped = sorted(set(before) - set(after))
-        if after != before:
+        if after != before or damaged:   # damaged entries are written out of the file, so the loss is said once and not re-read forever
             write_offers(state_dir, after)
     return {"offers": after, "added": added, "dropped": dropped, "problem": problem, "quarantined": quarantined, "capped": capped,
             "damaged": sorted(damaged)}
 
 
 def show(state_dir, pr, head, now, lock_seconds=LOCK_SECONDS):
-    """The owner has just been shown `pr` at `head` (a question that names it): the offer's shown head moves to it. False when `pr` has no offer.
+    """The owner has just been shown `pr` at `head` (a question that names it): the offer's shown head moves to it. False when `pr` has no offer, or when
+    the file holds a damaged entry (a refresh must rewrite it first, so the memory of what was damaged is not lost by this write).
     Raises OffersBusy when the lock wait runs out."""
     with _locked(state_dir, lock_seconds):
-        offers = read_offers(state_dir)
+        offers, _, damaged = _load(state_dir)
+        if damaged:   # the file has entries nobody can trust: only a refresh (the showing) rewrites it, and it records them as not shown
+            return False
         if pr not in offers or not isinstance(head, str) or not head:
             return False
         offers[pr] = dict(offers[pr], head=head, shown=True, shown_at=int(now))
@@ -307,7 +311,7 @@ def numbers_in(text):
     """Every number written in `text`, in order, once each: EVERY run of digits, whatever is around it (`366-367`, `366/367`, `366, 389`, `366..389`, `366+367`,
     `366&367`, `366 and 389` are two numbers; so is `0.97`, which fails toward asking). One message names one pull request."""
     seen = []
-    for found in DIGITS.finditer(text or ""):
+    for found in DIGITS.finditer((text or "")[:TEXT_MAX]):   # bounded: no digit run longer than the text cap
         number = int(found.group(0))
         if number not in seen:
             seen.append(number)
@@ -315,27 +319,25 @@ def numbers_in(text):
 
 
 def _standalone(text, number):
-    """True when every run of digits that spells `number` stands alone: not inside a word (`abc366`, `366abc`) or a decimal or dotted number (`3.66`, `v366.1`)."""
+    """True when every run of digits that spells `number` stands alone: not inside a word (`abc366`, `366abc`, `366_1`) and without a leading zero (`0366`)."""
     for found in DIGITS.finditer(text or ""):
         if int(found.group(0)) != number:
             continue
         before = text[found.start() - 1] if found.start() else " "
         after = text[found.end()] if found.end() < len(text) else " "
-        after2 = text[found.end() + 1] if found.end() + 1 < len(text) else " "
-        if before.isalnum() or before == "_" or after.isalnum() or after == "_" or (before == "." and text[found.start() - 2:found.start() - 1].isdigit()) \
-                or (after == "." and after2.isdigit()):
+        if before.isalnum() or before == "_" or after.isalnum() or after == "_" or (len(found.group(0)) > 1 and found.group(0).startswith("0")):
             return False
     return True
 
 
 def timing_problem(offer, created, now):
-    """None when the message may clear this offer, else why not: `no_time` (the message's time is not known), `before_offer` (it was written before the
+    """None when the message may clear this offer, else why not: `no_time` (a time is not known, or lies more than MESSAGE_SKEW seconds ahead of the clock), `before_offer` (it was written before the
     owner was shown the offer, or at the same second: only a message AFTER the showing counts) or `expired` (the offer is older than OFFER_TTL)."""
     if isinstance(created, bool) or not isinstance(created, (int, float)) or created != created or not isinstance(now, (int, float)):
         return "no_time"
     shown_at = (offer or {}).get("shown_at")
-    if not isinstance(shown_at, int) or isinstance(shown_at, bool):
-        return "no_time"
+    if not isinstance(shown_at, int) or isinstance(shown_at, bool) or shown_at > now + MESSAGE_SKEW or created - now > MESSAGE_SKEW:
+        return "no_time"   # a time from the future (the offer's or the message's) is not to be trusted
     if created <= shown_at:
         return "before_offer"
     if now - shown_at > OFFER_TTL:
