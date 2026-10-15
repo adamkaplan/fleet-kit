@@ -44647,13 +44647,20 @@ class TestHeavySlots(Base):
     def test_s1_four_callers_of_three_slots_queue_and_the_fourth_runs_when_one_frees(self):
         procs = {tag: self.start(*self.waiter(tag), name="who-%s" % tag) for tag in "abcd"[:3]}
         self.assertTrue(self.until(lambda: len(self.started()) == 3))
+        # the three locks are really held now (the kernel's own answer, not a file): the fourth cannot take one, whatever the machine's speed
+        self.assertTrue(self.until(lambda: len(self.hs.holders(self.state(), 3)) == 3), "3 of 3 slots held before the fourth starts")
         fourth = self.start(*self.waiter("d"), name="who-d")
-        err = ""
-        end = time.time() + 90
-        while "waiting for a slot" not in err and time.time() < end:   # the wrapper says so once it is queued (its start-up time varies with the machine)
-            if select.select([fourth.stderr], [], [], 0.2)[0]:
-                err += os.read(fourth.stderr.fileno(), 4096).decode()
-        self.assertIn("waiting for a slot", err, "the fourth wrapper (exit %r) said nothing; started: %s" % (fourth.poll(), self.started()))
+        lines, queued = [], threading.Event()
+
+        def pump():   # event driven: the wrapper's stderr is read as it arrives, so no poll interval or start-up time decides anything
+            for line in fourth.stderr:
+                lines.append(line)
+                if "waiting for a slot" in line:
+                    queued.set()
+        reader = threading.Thread(target=pump, daemon=True)
+        reader.start()
+        self.assertTrue(queued.wait(90), "the fourth wrapper (exit %r) never said it was waiting; holders: %s; started: %s" % (
+            fourth.poll(), self.hs.holders(self.state(), 3), self.started()))
         self.assertEqual(len(self.started()), 3, "at most 3 run at once")
         (self.home / "release.a").write_text("")
         self.assertTrue(self.until(lambda: "started.d" in self.started()), "the fourth runs once a slot is free")
@@ -44661,7 +44668,8 @@ class TestHeavySlots(Base):
             (self.home / ("release." + tag)).write_text("")
         for proc in list(procs.values()) + [fourth]:
             proc.wait(timeout=90)
-        err += fourth.stderr.read()
+        reader.join(timeout=90)
+        err = "".join(lines)
         self.assertIn("heavy: waiting for a slot (3 of 3 busy", err)
         self.assertRegex(err, r"who-[abc] sh")
 
