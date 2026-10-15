@@ -11707,8 +11707,10 @@ class TestChatClearOffers(unittest.TestCase):
         source = (Path(sb.__file__).parent / "chat_clear.py").read_text()
         for word in ("subprocess", "urllib", "socket", "change_issue_labels"):
             self.assertNotIn(word, source, "slice 1 reaches nothing: no process, no network, no GitHub write")
+        import ast
         main = (Path(sb.__file__).parent / "fleet-switchboard").read_text()
-        self.assertNotIn("chat_clear", main, "no command or hook calls it yet in this slice (slice 3 adds the one hook and changes this test)")
+        for fn in [n for n in ast.walk(ast.parse(main)) if isinstance(n, ast.FunctionDef) and n.name.startswith("cmd_")]:
+            self.assertNotIn("chat_clear", ast.get_source_segment(main, fn), "%s: no command reaches the chat clear (slice 3's hook is the daemon's alone; TestChatClearHook S7 counts the call sites)" % fn.name)
 
 
 class _StubJev:
@@ -11958,6 +11960,327 @@ class TestChatClearJudge(unittest.TestCase):
             got = {text: self.decide(text, jev) for text in ("366 is good to go", "389 also good to go", "all impacts cleared")}
         self.assertEqual([(g["action"], g["pr"]) for g in got.values()], [("clear", self.P366), ("clear", self.P389), ("ask", None)])
         self.assertEqual(got["all impacts cleared"]["judge"]["jev_choice"], "several")
+
+
+class TestChatClearHook(Base):
+    """#457 slice 3: the daemon hook that records the offers, reads the owner's NEW messages in the Chief of Staff's session, judges each once and (only when `chat_clear.live`) clears.
+    Fixtures only: a fake gh records every call, the decisions are written by hand, and nothing real is touched."""
+
+    PR, REPO, NUMBER = "acme/app#9", "acme/app", 9
+    H1, H2 = "a" * 40, "b" * 40
+
+    def setUp(self):
+        super().setUp()
+        self.writes, self.reads, self.t0 = [], 0, None
+        self.live = False
+        self.build()
+
+    def build(self, live=None, extra=None):
+        chat = {"live": self.live if live is None else live}
+        self.writes.clear()
+        for stale in Path(sb.ensure_state_dir(None)).glob("chat-clear-*"):
+            stale.unlink()
+        impact = Path(sb.ensure_state_dir(None)) / sb.IMPACT_STATE_FILE
+        if impact.exists():
+            impact.unlink()
+        self.world = World(self, agents=("cos", "coder"), config=dict({"gh": FAKE_GH, "jev": {"replay": "/fake/replay.json"}, "chat_clear": chat}, **(extra or {})))
+        self.world.v2.sessions[self.world.sessions["cos"]]["metadata"]["fleet"]["role"] = "chief-of-staff"
+        self.engine = self.world.new_engine("daemon")
+        self.engine.gh_runner, self.engine.state_dir = self.route, self.world.state
+        self.names = sb.label_names(self.engine.config)
+        self.jev = self.engine.jev = FakeJev(self.picks(self.PR, 0.97))
+        self.pr = {"state": "OPEN", "headRefOid": self.H1, "title": "t", "labels": [{"name": self.names["merge-captain"]}, {"name": self.names["hold-impact"]}]}
+        self.engine.discover(self.world.clock.now())
+
+    def picks(self, option, top=0.97):
+        def answer(state, questions):
+            criteria = list(questions["clears"]["criteria"])
+            rest = [o for o in criteria if o != option]
+            probabilities = {option: top}
+            probabilities.update({o: (1 - top) / len(rest) for o in rest})
+            return {"clears": {"type": "choice", "choice": option, "probabilities": probabilities}}
+        return answer
+
+    def route(self, argv, **kwargs):
+        if argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"]:
+            self.reads += 1
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self.pr), "")
+        if argv[0] == FAKE_GH and "--method" in argv:
+            method = argv[argv.index("--method") + 1]
+            if method == "GET":
+                return subprocess.CompletedProcess(argv, 0, "{}", "")
+            self.writes.append((method, argv[2], json.loads(kwargs["input"]) if kwargs.get("input") else None))
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+        return self.world.route(argv, **kwargs)
+
+    def decisions(self, head=None, holds=("impact",), number=None, repo=None, kind="captain"):
+        return [{"kind": kind, "repo": repo or self.REPO, "number": number or self.NUMBER, "head": head or self.H1, "holds": list(holds),
+                 "headline": "#9 changes the migrations", "review_evidence": "reviewed at aaaaaaaa by rev"}]
+
+    def hook(self, decisions=None):
+        self.engine.discover(self.world.clock.now())
+        sb.chat_clear_pass(self.engine, self.decisions() if decisions is None else decisions, self.world.clock.now())
+
+    def say(self, text, lasts=0, **kw):
+        self.world.tick(5)
+        self.world.v2.start_turn(self.world.sessions["cos"], text, fleet=False, lasts=lasts, **kw)
+
+    def shown_then_say(self, text, decisions=None):
+        self.hook(decisions)            # the offer is recorded (shown) first
+        self.say(text)
+        self.hook(decisions)
+
+    def events(self, name):
+        return [e for e in self.world.audit() if e["event"] == name]
+
+    def label_deletes(self):
+        return sorted(w[1].rsplit("/", 1)[1].replace("%3A", ":") for w in self.writes if w[0] == "DELETE")
+
+    def comments(self):
+        return [w for w in self.writes if w[1].endswith("/comments")]
+
+    def cos_texts(self):
+        return [a["text"] for a in self.world.admissions("cos") if "chat clear" in a["text"]]
+
+    def test_s1_live_a_confirmed_clear_is_made_at_the_shown_head_and_quotes_his_words_in_the_comment_the_audit_and_the_reply(self):
+        self.live = True
+        self.build()
+        self.shown_then_say("366 is good to go")  # not an offer: the number names nothing held
+        self.assertEqual(self.writes, [])
+        self.build(live=True)
+        self.pr["number"] = 9
+        self.shown_then_say("9 is good to go")
+        self.assertEqual(self.label_deletes(), sorted([self.names["hold-impact"], self.names["merge-captain"]]))
+        self.assertEqual([w for w in self.writes if w[0] == "POST" and w[1].endswith("/labels")], [], "a clear never ADDS a label")
+        (comment,) = self.comments()
+        self.assertIn("9 is good to go", comment[2]["body"])
+        self.assertIn("`%s`" % self.H1[:8], comment[2]["body"])
+        (cleared,) = self.events("gate.hold_cleared")
+        self.assertEqual((cleared["detail"]["head"], cleared["detail"]["reason"], cleared["detail"]["by"]), (self.H1, "9 is good to go", "owner (chat)"))
+        self.assertTrue(cleared["detail"]["via"].startswith("chat:"))
+        (verdict,) = [e for e in self.events("chat_clear.verdict") if e["detail"]["action"] == "clear"]
+        self.assertEqual((verdict["detail"]["quote"], verdict["detail"]["live"], verdict["detail"]["would_clear"]), ("9 is good to go", True, True))
+        self.assertTrue(any("Cleared acme/app#9" in t and "9 is good to go" in t for t in self.cos_texts()), self.cos_texts())
+        self.assertEqual(sb.read_impact_state(self.world.state)[0]["clears"][self.PR]["head"], self.H1, "the head-bound state stops the daemon re-adding it")
+
+    def test_s2_the_default_is_shadow_the_verdict_is_logged_with_probabilities_and_nothing_is_written_or_sent(self):
+        self.shown_then_say("9 is good to go")
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.cos_texts(), [])
+        self.assertEqual(self.events("gate.hold_cleared"), [])
+        (verdict,) = self.events("chat_clear.verdict")
+        detail = verdict["detail"]
+        self.assertEqual((detail["live"], detail["would_clear"], detail["action"], detail["quote"]), (False, True, "clear", "9 is good to go"))
+        self.assertGreaterEqual(detail["probabilities"][self.PR], 0.9)
+        self.assertEqual(sb.chat_clear_config({}), {"enabled": True, "live": False})
+        for value in ("yes", 1, None, "true", [True]):
+            self.assertEqual(sb.chat_clear_config({"chat_clear": {"live": value}}), {"enabled": True, "live": False}, "only a real true is live: %r" % (value,))
+        self.assertEqual(sb.chat_clear_config({"chat_clear": {"live": True}}), {"enabled": True, "live": True})
+        self.assertEqual(sb.chat_clear_config({"chat_clear": {"enabled": False, "live": True}}), {"enabled": False, "live": True})
+        for bad in ({"live": "true"}, {"live": 1}, {"other": True}, [True], "live"):
+            with self.assertRaises(sb.ConfigError, msg=bad):
+                sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "chat_clear": bad})
+        self.assertEqual(sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "chat_clear": {"live": True}})["chat_clear"], {"live": True})
+
+    def test_s12_in_shadow_an_unsure_message_is_logged_once_and_nothing_is_sent(self):
+        self.jev.rule = self.picks(self.PR, 0.6)
+        self.hook()
+        self.say("9 is good to go")
+        for _ in range(3):
+            self.hook()
+            self.world.tick(5)
+        (verdict,) = self.events("chat_clear.verdict")
+        self.assertEqual((verdict["detail"]["action"], verdict["detail"]["live"], verdict["detail"]["why"]), ("ask", False, "jev"))
+        self.assertIn("unsure", verdict["detail"]["reason"])
+        self.assertEqual((self.writes, self.cos_texts()), ([], []))
+        self.assertEqual(len(self.jev.calls), 1)
+
+    def test_s3_the_same_words_from_an_agent_or_with_fleet_metadata_are_never_read_and_cost_no_call(self):
+        self.live = True
+        self.build()
+        self.hook()
+        self.world.tick(5)
+        self.world.v2.start_turn(self.world.sessions["cos"], "9 is good to go", fleet=True, lasts=0)
+        self.hook()
+        self.assertEqual((self.jev.calls, self.writes, self.events("chat_clear.verdict")), ([], [], []))
+
+    def test_s4_unsure_several_hedged_unreachable_and_another_pr_write_nothing_and_ask_once_per_message(self):
+        self.live = True
+        for text, rule, fragment in (("all impacts cleared", self.picks("several", 0.95), "names no pull request number"), ("9 is good to go once CI passes", self.picks(self.PR, 0.99), "not a plain clearing sentence"),
+                                     ("9 is good to go", self.picks(self.PR, 0.6), "could not be sure"), ("9 is good to go", None, "could not be sure"),
+                                     ("9 is good to go", self.picks("acme/app#10", 0.99), "could not be sure")):
+            with self.subTest(text=text, fragment=fragment):
+                self.build()
+                verdicts_before = len(self.events("chat_clear.verdict"))
+                self.jev.rule = rule
+                decisions = self.decisions() + self.decisions(number=10)
+                self.shown_then_say(text, decisions)
+                self.assertEqual(self.writes, [])
+                (asked,) = self.cos_texts()
+                self.assertIn(fragment, asked)
+                self.assertIn("acme/app#9", asked)
+                for _ in range(3):
+                    self.world.tick(5)
+                    self.hook(decisions)
+                self.assertEqual(len(self.cos_texts()), 1, "one question per message, however many passes")
+                self.assertEqual(len(self.events("chat_clear.verdict")) - verdicts_before, 1)
+
+    def test_s5_a_push_after_the_offer_clears_nothing_and_the_question_shows_the_new_head(self):
+        self.live = True
+        self.build()
+        self.hook()
+        self.say("9 is good to go")
+        self.pr["headRefOid"] = self.H2   # the push
+        self.hook(self.decisions(head=self.H2))
+        self.assertEqual(self.writes, [])
+        (asked,) = self.cos_texts()
+        self.assertIn("new head since you were shown it", asked)
+        self.assertIn(self.H2[:8], asked)
+        (verdict,) = self.events("chat_clear.verdict")
+        self.assertEqual((verdict["detail"]["action"], verdict["detail"]["why"]), ("ask", "head_changed"))
+        self.assertEqual(sb.load_module("chat_clear").read_offers(self.world.state)[self.PR]["head"], self.H2, "the question put the new head in front of him")
+        self.say("9 also good to go")
+        self.hook(self.decisions(head=self.H2))
+        self.assertEqual(self.label_deletes(), sorted([self.names["hold-impact"], self.names["merge-captain"]]), "after he was shown the new head, his next words clear it")
+        self.assertEqual(sb.read_impact_state(self.world.state)[0]["clears"][self.PR]["head"], self.H2, "the state is bound to the head he was shown and GitHub confirmed")
+
+    def test_s5b_a_head_that_moves_between_the_decision_and_the_effect_is_refused_at_the_point_of_effect(self):
+        self.live = True
+        self.build()
+        self.hook()
+        self.say("9 is good to go")
+        self.pr["headRefOid"] = self.H2   # GitHub's head moved after the daemon's picture was made
+        self.hook()
+        self.assertEqual(self.label_deletes(), [])
+        self.assertEqual(len(self.events("chat_clear.failed")), 1)
+        (asked,) = self.cos_texts()
+        self.assertIn("no longer held for you or its labels changed", asked)
+        self.assertEqual(sb.read_impact_state(self.world.state)[0]["clears"], {})
+
+    def test_s6_only_owner_tier_hold_labels_and_the_captain_marker_are_removed_and_another_hold_is_never_offered_or_touched(self):
+        self.live = True
+        self.build()
+        self.pr["labels"] = [{"name": self.names["hold-credential"]}, {"name": self.names["parked"]}, {"name": "bug"}]
+        self.shown_then_say("9 is good to go", self.decisions(holds=("credential",)))
+        self.assertEqual(self.label_deletes(), [self.names["hold-credential"]], "the credential hold goes; parked, bug and the rest stay")
+        self.build()
+        self.pr["labels"] = [{"name": self.names["hold-impact"]}, {"name": self.names["hold-security"]}, {"name": self.names["merge-captain"]}]
+        self.shown_then_say("9 is good to go", self.decisions(holds=("impact", "security")))
+        self.assertEqual(self.writes, [], "a PR that also has another hold label is never offered, so never touched")
+        self.assertEqual(self.jev.calls, [], "and with nothing offered nothing is judged")
+        self.build()
+        self.pr["labels"] = [{"name": self.names["parked"]}]
+        self.shown_then_say("9 is good to go", self.decisions(holds=()))   # a row with no owner-tier label
+        self.assertEqual(self.writes, [], "his words name it, but at the point of effect it carries no owner-tier label: refused, nothing removed")
+        self.assertEqual(len(self.events("chat_clear.failed")), 1)
+
+    def test_s7_nothing_but_the_daemons_publish_calls_the_hook_and_no_command_takes_text_as_the_owners_word(self):
+        import ast
+        tree = ast.parse((Path(sb.__file__)).read_text())
+        callers = {}
+        for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+            for call in [c for c in ast.walk(fn) if isinstance(c, ast.Call)]:
+                name = call.func.id if isinstance(call.func, ast.Name) else None
+                if name in ("chat_clear_pass", "_chat_clear_act", "chat_clear_apply", "_chat_clear_pass"):
+                    callers.setdefault(name, set()).add(fn.name)
+        self.assertEqual(callers, {"chat_clear_pass": {"publish_decisions"}, "_chat_clear_pass": {"chat_clear_pass"}, "_chat_clear_act": {"_chat_clear_pass"}, "chat_clear_apply": {"_chat_clear_act"}})
+        self.assertFalse([n for n in callers if any(f.startswith("cmd_") for f in callers[n])], "no command calls the chat clear")
+        engine = self.world.new_engine("cli")   # a command's engine: the hook is inert
+        engine.gh_runner, engine.jev, engine.discovery = self.route, self.jev, self.engine.discovery
+        self.live = True
+        self.build(live=True)
+        cli = self.world.new_engine("cli")
+        cli.gh_runner, cli.jev = self.route, self.jev
+        self.hook()
+        self.say("9 is good to go")
+        sb.chat_clear_pass(cli, self.decisions(), self.world.clock.now())
+        self.assertEqual((self.writes, self.jev.calls), ([], []), "only the daemon's engine runs it")
+
+    def test_s8_the_quote_is_one_line_at_most_300_characters_with_no_control_characters_and_no_secret(self):
+        self.live = True
+        self.build()
+        self.hook()
+        self.say("9 is good to go" + " ok" * 200)   # a plain sentence that passes the floor and is far over the quote limit
+        self.hook()
+        (comment,) = self.comments()
+        (cleared,) = self.events("gate.hold_cleared")
+        (verdict,) = self.events("chat_clear.verdict")
+        for text in (cleared["detail"]["reason"], verdict["detail"]["quote"]):
+            self.assertLessEqual(len(text), 300)
+            self.assertTrue(text.startswith("9 is good to go ok ok"))
+            self.assertNotIn("\n", text)
+        self.assertLessEqual(len(comment[2]["body"]), 700)
+        # a message that is refused still has its words quoted, with control characters and secret-like strings taken out, in the log and in the reply
+        self.build()
+        token = "ghp_" + "A1b2C3d4" * 4
+        self.hook()
+        self.say("9 is good to go\x1b[31m\n\t" + "x " * 200 + token)
+        self.hook()
+        self.assertEqual(self.writes, [])
+        for text in (json.dumps(self.events("chat_clear.verdict")), "\n".join(self.cos_texts())):
+            self.assertNotIn(token, text)
+            self.assertNotIn("\x1b", text)
+        (refused,) = [e for e in self.events("chat_clear.verdict")][-1:]
+        self.assertLessEqual(len(refused["detail"]["quote"]), 300)
+        self.assertIn("[secret]", refused["detail"]["quote"] + "[secret]" if len(refused["detail"]["quote"]) >= 300 else refused["detail"]["quote"])
+
+    def test_s9_with_nothing_held_nothing_is_read_or_asked_and_each_message_is_judged_once_across_passes_and_restarts(self):
+        self.live = True
+        self.build()
+        self.say("9 is good to go")
+        self.hook(decisions=[])
+        self.assertEqual((self.jev.calls, self.events("chat_clear.verdict")), ([], []), "no offer: his messages are not even read")
+        self.world.v2.sessions[self.world.sessions["cos"]]["messages"].clear()
+        self.hook()
+        self.say("all impacts cleared")
+        for _ in range(4):
+            self.hook()
+        self.assertEqual(len(self.jev.calls), 1, "ONE Jev call for the one new message, however many passes")
+        self.engine = self.world.new_engine("daemon")   # a restart: the handled messages are remembered on disk
+        self.engine.gh_runner, self.engine.jev, self.engine.state_dir = self.route, self.jev, self.world.state
+        self.hook()
+        self.assertEqual(len(self.jev.calls), 1, "and not again after a restart")
+        self.assertEqual(len(self.cos_texts()), 1)
+        for n in range(5):
+            self.say("is 9 good to go %d" % n)
+        self.hook()
+        self.assertLessEqual(len(self.jev.calls), 1 + sb.CHAT_CLEAR_NEW_PER_PASS, "at most a few new messages are judged per pass")
+
+    def test_s10_a_clear_stays_for_its_head_and_the_daemon_judges_a_new_head_again(self):
+        self.live = True
+        self.build()
+        self.shown_then_say("9 is good to go")
+        state = sb.read_impact_state(self.world.state)[0]
+        self.assertEqual(state["clears"][self.PR]["head"], self.H1)
+        report = {"pr": self.PR, "head": self.H1, "reasons": ["x"], "floor_paths": [], "globs": []}
+        self.assertEqual(sb.apply_impact_hold(self.engine, self.REPO, 9, report, {"labels": []}), 0, "the same head: the daemon does not re-add the hold")
+        self.assertEqual([w for w in self.writes if w[0] == "POST"], [w for w in self.writes if w[1].endswith("/comments")])
+        self.assertGreater(sb.apply_impact_hold(self.engine, self.REPO, 9, dict(report, head=self.H2), {"labels": []}), 0, "a new head is judged and held again")
+
+    def test_s11_the_core_removes_only_owner_tier_labels_and_refuses_anything_else_or_a_moved_head(self):
+        self.build(live=True)
+        with self.assertRaises(RuntimeError):
+            sb.impact_clear_core(self.engine, self.route, self.REPO, 9, "owner (chat)", "x" * 12, remove=[self.names["parked"]])
+        with self.assertRaises(RuntimeError):
+            sb.impact_clear_core(self.engine, self.route, self.REPO, 9, "owner (chat)", "x" * 12, remove=[self.names["hold-impact"], "bug"])
+        with self.assertRaises(RuntimeError):
+            sb.impact_clear_core(self.engine, self.route, self.REPO, 9, "owner (chat)", "x" * 12, remove=[])
+        with self.assertRaises(sb.NoticeError):
+            sb.impact_clear_core(self.engine, self.route, self.REPO, 9, "owner (chat)", "x" * 12, remove=[self.names["hold-impact"]], head=self.H2)
+        self.assertEqual(self.writes, [])
+        self.assertEqual(sb.read_impact_state(self.world.state)[0]["clears"], {}, "a refused clear leaves no state")
+        for label in ("hold-impact", "hold-credential", "hold-policy", "merge-captain"):
+            self.writes.clear()
+            sb.impact_clear_core(self.engine, self.route, self.REPO, 9, "owner (chat)", "x" * 12, remove=[self.names[label]], head=self.H1)
+            self.assertEqual(self.label_deletes(), [self.names[label]])
+
+    def test_u1_the_existing_clear_without_the_new_arguments_is_what_it_was(self):
+        self.build(live=True)
+        lines = sb.impact_clear_core(self.engine, self.route, self.REPO, 9, "the owner", "a false hold: the file is a fixture")
+        self.assertEqual(self.label_deletes(), [self.names["hold-impact"]], "no state says the switchboard added merge-captain: only hold-impact goes")
+        self.assertIn("cleared the impact hold of acme/app#9", lines[0])
+        (cleared,) = self.events("gate.hold_cleared")
+        self.assertNotIn("via", cleared["detail"])
 
 
 class TestHeadlessPresence(Base):
