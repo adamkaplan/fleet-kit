@@ -51130,6 +51130,20 @@ class TestEarlyDecisionsWrite(DecisionsBase):
         self.world.engine.sources.append(source)
         return source
 
+    def test_the_early_derivation_leaves_the_notice_time_accounting_as_it_was(self):
+        engine = self.world.engine
+        engine.notice_obs = {"last": 5.0}
+        engine.notice_effects = {"drop": set(), "unreadable": {}, "observed": {}}
+        real = sb.derive_decisions
+
+        def touching(eng, now):
+            eng.notice_obs["last"] = now
+            eng.notice_effects["observed"]["acme/api#7"] = 99
+            return real(eng, now)
+        with mock.patch.object(sb, "derive_decisions", touching):
+            self.assertTrue(sb.early_decisions(engine, types.SimpleNamespace(problems=[])))
+        self.assertEqual((engine.notice_obs, engine.notice_effects["observed"]), ({"last": 5.0}, {}))
+
     def test_s1_a_first_pass_with_slow_reads_has_written_the_file_by_120_seconds(self):
         self.ask_the_boss("Which database?")
         started = self.world.clock.now()

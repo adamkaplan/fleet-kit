@@ -47,6 +47,7 @@ import urllib.parse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import collections
+import copy
 import errno
 import fcntl
 import getpass
@@ -10326,7 +10327,15 @@ def early_decisions(engine, discovery=None):
         worker = next((x for x in engine.sources if isinstance(x, WorkerFacts)), None)
         if worker is not None:
             engine._early_facts = {id(worker): worker()}   # the pending requests are filled by this call; collect_facts reuses its facts
-        decisions, errors = derive_decisions(engine, now)
+        kept = {name: copy.deepcopy(engine.__dict__[name]) for name in ("notice_obs", "notice_effects") if name in engine.__dict__}
+        try:
+            decisions, errors = derive_decisions(engine, now)
+        finally:   # the derivation advances the notice time accounting: the end of the pass derives again and must see it as it was
+            for name in ("notice_obs", "notice_effects"):
+                if name in kept:
+                    engine.__dict__[name] = kept[name]
+                else:
+                    engine.__dict__.pop(name, None)
         return bool(decision_store(engine).publish(decisions, errors, now))
     except Exception as err:   # a pass that cannot read its decision sources writes nothing here; the end of the pass says the same
         engine._early_facts = {}
