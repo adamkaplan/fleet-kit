@@ -235,6 +235,42 @@ for sig in TERM INT; do
     && [ "$(sed -n 's/^count=//p' "$mk")" = 1 ] && grep -q 'rolling back' "$tmp/err" && [ "$(grep -c 'ctr version' "$tmp/log")" -ge 2 ] \
     && ok "fix: SIG$sig in the first wait: trap restores byte for byte, restarts, health check, non-zero, no label" || bad "fix: SIG$sig trap (rc=$rc restarts=$(restarts))"
 done
+# a failing label command after a healthy restart: no rollback, config stays new, exit non-zero, flag gone, loud line
+printf '#!/bin/sh\necho label >> "$TMP_LOG"\nexit 1\n' > "$tmp/labelfail"; chmod +x "$tmp/labelfail"
+cp "$fx" "$tmp/config.toml"; rm -f "$mk" "$ip"; : > "$tmp/log"
+TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/host" LABEL_CMD="$tmp/labelfail" READY_CMD="$tmp/ready" ONCE=1 WAIT=2 POLL=1 sh "$tmp/fix.sh" >"$tmp/out" 2>"$tmp/err"; rc=$?
+[ $rc = 1 ] && ! grep -q 'grpc.v1.cri' "$tmp/config.toml" && [ "$(restarts)" = 1 ] && [ ! -e "$ip" ] && ! grep -q 'rolling back' "$tmp/err" && grep -q 'runtime healthy but the label could not be set' "$tmp/err" \
+  && ok "fix: label fails: no rollback, config stays new, exit non-zero, loud line" || bad "fix: label failure (rc=$rc restarts=$(restarts))"
+# SIGTERM during the label command: the healthy runtime and the new config are kept, no second restart
+printf '#!/bin/sh\necho label >> "$TMP_LOG"\nsleep 3\n' > "$tmp/labelslow"; chmod +x "$tmp/labelslow"
+cp "$fx" "$tmp/config.toml"; rm -f "$mk" "$ip"; : > "$tmp/log"
+TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/host" LABEL_CMD="$tmp/labelslow" READY_CMD="$tmp/ready" ONCE=1 WAIT=2 POLL=1 sh "$tmp/fix.sh" >"$tmp/out" 2>"$tmp/err" &
+pid=$!; i=0
+while ! grep -q '^label' "$tmp/log" && [ $i -lt 200 ]; do sleep 0.1; i=$((i + 1)); done
+[ $i -lt 200 ] || { bad "fix: label-window test: the label never started"; kill -9 $pid; }
+kill -TERM $pid; wait $pid; rc=$?
+[ $rc != 0 ] && ! grep -q 'grpc.v1.cri' "$tmp/config.toml" && [ "$(restarts)" = 1 ] && [ ! -e "$ip" ] && ! grep -q 'rolling back' "$tmp/err" \
+  && ok "fix: SIGTERM during labelling: healthy runtime and new config kept, no rollback" || bad "fix: TERM in the label window (rc=$rc restarts=$(restarts))"
+rm -f "$mk" "$ip"
+# a rollback that cannot restore health sets the cap at once, keeps the flag, exits once; the next start touches nothing
+cp "$fx" "$tmp/config.toml"; rm -f "$mk" "$ip"
+RESTART_FAIL_ON="1 2" WAIT=2 POLL=1 runfix; rc=$?
+[ $rc = 1 ] && [ "$(sed -n 's/^count=//p' "$mk")" = 2 ] && [ -e "$ip" ] \
+  && ok "fix: rollback cannot restore health: marker set to the cap, flag kept, exit 1" || bad "fix: unhealthy after rollback (rc=$rc)"
+runfix; rc=$?
+[ $rc = 4 ] && [ "$(restarts)" = 0 ] && [ -e "$ip" ] && ! grep -q label "$tmp/log" && [ "$(sed -n 's/^count=//p' "$mk")" = 2 ] \
+  && ok "fix: next start at the cap: no recovery, no restart, flag kept, idles" || bad "fix: next start after unrecoverable (rc=$rc restarts=$(restarts))"
+# the same with a failed restore (no saved copy)
+cp "$fx" "$tmp/config.toml"; rm -f "$mk" "$ip"
+KILL_BAK=1 DOWN_UNTIL=999 WAIT=2 POLL=1 runfix; rc=$?
+[ $rc = 1 ] && [ "$(sed -n 's/^count=//p' "$mk")" = 2 ] && [ -e "$ip" ] && ok "fix: failed restore: marker set to the cap, flag kept" || bad "fix: failed restore cap (rc=$rc)"
+runfix; rc=$?
+[ $rc = 4 ] && [ "$(restarts)" = 0 ] && ok "fix: failed restore, next start: nothing touched, idles" || bad "fix: failed restore next start (rc=$rc)"
+# a flag with count at the cap does nothing (no recovery), even though the config is edited
+killed_pre() { cp "$tmp/after_ok" "$tmp/config.toml"; cp "$fx" "$tmp/config.toml.sysbox-fix.bak"; : > "$ip"; }
+killed_pre; printf 'count=2\ntime=x\n' > "$mk"; runfix; rc=$?
+[ $rc = 4 ] && [ "$(restarts)" = 0 ] && cmp -s "$tmp/after_ok" "$tmp/config.toml" && [ -e "$ip" ] && ok "fix: flag with count at the cap: no recovery, nothing touched" || bad "fix: flag at the cap (rc=$rc)"
+rm -f "$mk" "$ip"
 # (c) simulated SIGKILL: the flag and the edited config are left; the next start recovers and counts one failed attempt
 killed() { cp "$tmp/after_ok" "$tmp/config.toml"; cp "$fx" "$tmp/config.toml.sysbox-fix.bak"; : > "$ip"; }
 killed; rm -f "$mk"
@@ -272,6 +308,20 @@ for v in declared bare; do
   [ $rc = 1 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && [ ! -e "$tmp/config.toml.sysbox-fix.bak" ] && [ "$(restarts)" = 0 ] && ! grep -q label "$tmp/log" \
     && ok "fix: version 1 config ($v) refused, node untouched" || bad "fix: v1 guard $v (rc=$rc)"
 done
+# the sysbox-runtime=running label must never gate anything: no nodeSelector, affinity or scheduling on it
+gate=$(python3 - "$here" <<'PYX'
+import re, sys, pathlib
+root = pathlib.Path(sys.argv[1]); hits = []
+for f in list(root.glob("k8s/*.yaml")) + [root / "README.md"]:
+    text = f.read_text(); lines = text.splitlines()
+    for n, l in enumerate(lines):
+        if re.search(r"nodeSelector|nodeAffinity|matchExpressions|matchLabels|scheduling|--node-selector", l) and not l.lstrip().startswith("#"):
+            if any("sysbox-runtime" in x for x in lines[n:n + 5]): hits.append(f"{f.name}:{n + 1}")
+    if f.name == "README.md" and "expect: running" in text: hits.append(f.name + ": label presented as proof")
+print("\n".join(hits))
+PYX
+)
+[ -z "$gate" ] && ok "the sysbox-runtime label gates nothing and is not presented as proof" || bad "label gates scheduling or is shown as proof: $gate"
 # the worker's activity reader (stub server, no network)
 nice python3 -m unittest discover -s "$here/worker/tests" -p 'test_*.py' >"$tmp/ut" 2>&1 \
   && ok "worker activity reader tests" || { bad "worker activity reader tests"; tail -20 "$tmp/ut"; }

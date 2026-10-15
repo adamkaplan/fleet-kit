@@ -26,7 +26,7 @@ The stock Sysbox installer writes the `sysbox-runc` runtime under the legacy plu
 `io.containerd.cri.v1.runtime`, so pods fail with `RuntimeClass handler "sysbox-runc" ... is not known`.
 `k8s/containerd-fix.yaml` runs on every node labelled `sysbox-install=yes`: it waits for the installer's stanza, renames
 the plugin key on the `sysbox-runc` tables, checks `containerd config dump`, restarts containerd only if it changed
-the file (restoring a backup if the dump fails), then labels the node `sysbox-runtime=running`. A node already right is
+the file (restoring a backup if the dump fails), then labels the node `sysbox-runtime=running` (a record only: the installer sets the same label before containerd knows the runtime, so it is not a health signal and no pod may be selected or placed by it). A node already right is
 left alone.
 
 The node file shape it handles: table headers may be indented (2 spaces per level) and use either quote style. The
@@ -63,6 +63,16 @@ docker push <registry>/cw-worker:<tag>                            # only after t
 The scan covers every layer (including files deleted in a later layer) and the image config (env, history). It prints
 `path: pattern-name`, never the value. A hit exits 1, so a build pipeline that runs it fails the build.
 
+### Resetting a node the fix gave up on
+
+When the fix cannot bring a node back (a failed restore, or containerd still unhealthy after the rollback) it sets its
+failed-attempt marker to the cap and exits non-zero once; later pods then idle and restart nothing. After the node has
+been repaired by a person, reset BOTH files on the node, then delete the fix pod:
+
+```sh
+rm -f /etc/containerd/config.toml.sysbox-fix.failed /etc/containerd/config.toml.sysbox-fix.inprogress
+```
+
 ## Live proof (S10 runtime half and S12), run on a cluster
 
 Needs a cluster with one Ubuntu node whose containerd is 2.x, and `kubectl` pointed at it. Replace `<image>` with the
@@ -81,7 +91,11 @@ kubectl -n kube-system set image ds/sysbox-deploy-k8s \
 kubectl apply -f cloud/k8s/containerd-fix.yaml
 kubectl apply -f cloud/k8s/runtimeclass.yaml      # if the installer already created it, this updates it
 kubectl -n kube-system logs ds/sysbox-containerd-fix --tail=20
-kubectl get node "$NODE" -L sysbox-runtime        # expect: running (no manual edit of config.toml)
+# The node label sysbox-runtime=running is NOT proof: the stock installer sets it before containerd knows the runtime.
+# The proof is (a) the fix pod's log (above) showing containerd answered ('ctr version') after the restart, and
+# (b) a nested pod on the sysbox-runc class running Docker (no manual edit of config.toml):
+kubectl run sysbox-check --restart=Never --rm -i --image=<image> --overrides='{"spec":{"runtimeClassName":"sysbox-runc","hostUsers":false}}' \
+  --command -- /bin/bash -c 'docker run --rm hello-world'     # expect: "Hello from Docker!", exit 0
 
 # 2. S12: a compose stack of a database and an app, inside one worker, then gone
 cat <<'YAML' | kubectl apply -f -

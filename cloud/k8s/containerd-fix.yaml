@@ -27,7 +27,7 @@ data:
     WAIT=${WAIT:-60}; POLL=${POLL:-2}
     # A failed restart (rolled back) is recorded in a marker on the node, beside the config, so
     # the count survives pod restarts. At MAX_ATTEMPTS the fix stays off: it edits nothing,
-    # restarts nothing, labels nothing, and idles. To retry, delete the marker on the node.
+    # restarts nothing, labels nothing, and idles. To retry, delete the marker AND the in-progress flag on the node.
     MARKER="$CFG.sysbox-fix.failed"; MAX_ATTEMPTS=${MAX_ATTEMPTS:-2}
     restore_backup() { cp "$CFG.sysbox-fix.bak" "$CFG.restore.tmp" && mv "$CFG.restore.tmp" "$CFG" && sync; }
 
@@ -51,12 +51,18 @@ data:
     }
     # Restart containerd and check it is healthy: any failure of either is a failure.
     restart_and_check() { $HOST systemctl restart containerd || return 1; healthy_after_restart; }
-    manual_repair() {
-      armed=0   # nothing more the trap could do; the in-progress flag stays so the next start tries again
-      echo "config restore FAILED: node needs manual repair: $CFG (saved copy: $CFG.sysbox-fix.bak)" >&2; exit 1
+    # The node cannot be brought back by this script: set the marker to the cap at once (no retry by the
+    # script: a crash loop of containerd restarts on a node that needs a person), keep the in-progress flag.
+    set_cap() {
+      { printf 'count=%s\ntime=%s\n' "$MAX_ATTEMPTS" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$MARKER.tmp" && mv "$MARKER.tmp" "$MARKER" && sync; } \
+        || echo "WARNING: could not set the cap in $MARKER" >&2
     }
-    # CRITICAL SECTION. From just before the config is edited until the health check has passed and the
-    # node is labelled, a file flag on the node beside the config says "in progress" (fail closed:
+    manual_repair() {
+      armed=0   # nothing more the trap could do
+      set_cap
+      echo "config restore FAILED: node needs manual repair: $CFG (saved copy: $CFG.sysbox-fix.bak); then rm -f $MARKER $INPROG" >&2; exit 1
+    }
+    # CRITICAL SECTION. From just before the config is edited until the health check has passed, a file flag on the node beside the config says "in progress" (fail closed:
     # the flag is removed only on completion or after a verified restore). Two mechanisms use it:
     #  - the TRAP (TERM, INT, EXIT) covers a run that is stopped but still alive to react: pod deleted
     #    (SIGTERM), Ctrl-C, or any exit while armed=1. It takes the rollback path below, once.
@@ -76,7 +82,8 @@ data:
         || echo "WARNING: could not record the failed attempt in $MARKER" >&2
       if ! restore_backup || ! cmp -s "$CFG.sysbox-fix.bak" "$CFG"; then manual_repair; fi
       if ! restart_and_check; then
-        echo "config restored but containerd is NOT healthy after the second restart: node needs manual repair: $CFG" >&2; exit 1
+        set_cap
+        echo "config restored but containerd is NOT healthy after the second restart: node needs manual repair: $CFG (then rm -f $MARKER $INPROG)" >&2; exit 1
       fi
       rm -f "$INPROG"
       echo "ERROR: config restored, containerd healthy again; failed attempt $((prev + 1)) recorded in $MARKER" >&2
@@ -99,20 +106,26 @@ data:
     trap 'exit 143' TERM; trap 'exit 130' INT; trap on_exit EXIT
     # A previous run was killed mid-way (SIGKILL: no trap ran) and left the flag: roll back first. It
     # counts as one failed attempt; the cap check in the loop then decides to go on or stay off.
+    # The cap comes FIRST: at the cap (or an unreadable marker) nothing is restarted and nothing is recovered;
+    # the flag stays as it is and the pod idles quietly until an operator resets both files.
+    cap_reached() {
+      [ -e "$MARKER" ] || return 1
+      n=$(sed -n 's/^count=\([0-9][0-9]*\)$/\1/p' "$MARKER" 2>/dev/null | head -n 1)
+      case "$n" in ''|*[!0-9]*) n=$MAX_ATTEMPTS ;; esac   # unreadable marker: fail closed
+      [ "$n" -ge "$MAX_ATTEMPTS" ]
+    }
+    idle_disabled() {
+      echo "sysbox fix disabled on this node after $n failed attempts; to retry, remove both files on the node: rm -f $MARKER $INPROG" >&2
+      [ "${ONCE:-0}" = 1 ] && exit 4
+      while true; do sleep 3600; done
+    }
+    if cap_reached; then idle_disabled; fi
     if [ -e "$INPROG" ]; then
       rollback_core "a previous run was killed before it finished (in-progress flag found)"
     fi
 
     while true; do
-      if [ -e "$MARKER" ]; then
-        n=$(sed -n 's/^count=\([0-9][0-9]*\)$/\1/p' "$MARKER" 2>/dev/null | head -n 1)
-        case "$n" in ''|*[!0-9]*) n=$MAX_ATTEMPTS ;; esac   # unreadable marker: fail closed
-        if [ "$n" -ge "$MAX_ATTEMPTS" ]; then
-          echo "sysbox fix disabled on this node after $n failed attempts; remove $MARKER on the node to retry" >&2
-          [ "${ONCE:-0}" = 1 ] && exit 4
-          while true; do sleep 3600; done
-        fi
-      fi
+      if cap_reached; then idle_disabled; fi
       if [ ! -f "$CFG" ] || ! grep -q 'runtimes[."'"'"']*sysbox-runc' "$CFG"; then
         echo "waiting for the Sysbox installer to register sysbox-runc"
         [ "${ONCE:-0}" = 1 ] && exit 3
@@ -177,9 +190,13 @@ data:
            && grep -Eq "${HDR}$NEW[\"']\\.containerd\\.runtimes\\.sysbox-runc\\]" "$CFG"; then
           echo "config valid: restarting containerd"
           restart_and_check || rollback
+          armed=0; rm -f "$INPROG"   # the health check passed: the critical section ends HERE, before labelling
           rm -f "$MARKER"
-          $LABEL_CMD >/dev/null
-          armed=0; rm -f "$INPROG"   # complete: healthy and labelled
+          # The label is not a health signal (the stock installer sets sysbox-runtime=running before containerd knows
+          # the runtime); this script's own health check above is. Nothing may schedule on the label.
+          # Labelling is outside the rollback window: a failed label or a signal during it must not undo a healthy
+          # runtime. On failure exit non-zero; the next pass sees the config already right and retries the label.
+          $LABEL_CMD >/dev/null || { echo "ERROR: runtime healthy but the label could not be set: exiting non-zero (config kept; the next pass retries the label)" >&2; exit 1; }
           bad=0
         else
           bad=$((bad + 1))
