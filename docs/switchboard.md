@@ -1430,6 +1430,7 @@ is unchanged.
 | `github_repos` | `[]` | The baseline of watched repos; the derived set adds to it |
 | `excluded_repos` | `[]` | Repositories the switchboard never watches and never reads, whatever an agent's metadata or a charter says (matched case-insensitively, `owner/name`; a bad list is refused at load). It is applied where the watched set is derived, so forwarders, the sweep and triage never see them, and every `gh` read of one is refused at the lowest layer (`GhAccounts.read`, plus `read_pr_json`, `read_ref_state`, the intent reader, the hub's environment for a forwarder or a read, `review measure` and the `reds` artifact read), so no process is started for it: the hub's reads, PR notices, intent reads and `reds` all say it is excluded. Writes are not the watchers' and are unchanged (an agent's own `gh` calls, an intent edit). `status` says each one is excluded, once. Agents working in an excluded repository still launch, send, report and retire |
 | `gh_users` | `{}` | `"owner/repo"` or `"owner/*"` to a `gh` account name |
+| `hold_labels` | `{}` | `"owner/repo"` to `{label, message, allowed_removers}`: the `gh` shim refuses merge, close, approving review, base edit and label removal on a pull request that carries the label (see "The hold label of the `gh` shim") |
 | `github_poll_seconds` | `60` | How often a repo with no forwarder is read; at least 15 |
 
 | Fault (Lab only) | What it switches off | Proved by |
@@ -2365,6 +2366,64 @@ no mapping for the repo, no switchboard (or one too old to answer `whoami --repo
 it was, says nothing, and `gh` runs. The whole lookup (who am I, which account, its token) is ONE `whoami --json` call plus at most one
 `gh auth token`, under one shared deadline of 3 seconds for a read and 10 seconds for a WRITE (`FLEET_SHIM_LOOKUP_SECONDS` sets both, kept between 0.2 and 10): `gh` is never blocked,
 and a wedged daemon or v2 adds at most that, after which a READ is signed `agent` and runs with the environment's token. **Writes fail closed (a guardrail, not a boundary: the boundary is which account's token a pane can reach):** when `gh_users` is set and the identity or token lookup FAILS (it times out, `whoami` does not answer, or `gh auth token` gives nothing), a WRITE (every `gh` command that is not KNOWN to read: reads are the groups `auth`, `config`, `search`, `status`, `browse`, the sub-commands `view`, `list`, `status`, `diff`, `checks`, `download`, `watch`, and `gh api` with no method but GET and no fields; a flag before the verb, as in `gh pr -R o/r merge`, does not hide it; `workflow run`, `run rerun`, `secret set`, `gist`, `pr checkout` and an alias count as writes) is retried once with a fresh deadline and then refused with `gh: account lookup failed, retry` (exit 1) rather than run with the inherited token; reads still fall through. A switchboard too old for `--json` (the plain `whoami` answers) and a repo with no mapping are not failures. **A pane the switchboard opens is an agent's, so it never carries the marker:** `launch` and `restart` name `FLEET_SWITCHBOARD_OWN_GH` with an empty value in the pane's environment (the shim reads only `1` as set), so an inherited marker does not make the shim skip the per-repo account. `launch` also refuses an `--agent` the OpenCode service does not list (it would start as the default Build agent with the brief unsent), naming the primary agents that are registered, and refuses one the service knows only as a subagent (a pane runs a primary agent, or one registered for both modes; a subagent is run by another agent's Task tool); an unreachable service does not block it. **The daemon is nobody's agent.** The switchboard's own `gh` calls (the daemon's forwarders, intent reads, sweep and triage reads, a command's own reads) already name their account (`GhAccounts`); the shim must never swap it. So (1) every switchboard process sets `FLEET_SWITCHBOARD_OWN_GH=1`, `GhAccounts`' per-repo environments carry it, and the shim leaves the token of such a call alone; (2) the daemon never carries a caller's identity: `daemon_environment` (the hook and `ensure` start) and `run` itself drop `HERDR_PANE_ID`, `HERDR_TAB_ID`, `HERDR_WORKSPACE_ID`, `OPENCODE_SESSION_ID`, `FLEET_SWITCHBOARD_ROLE` and `FLEET_SWITCHBOARD_REPO`, whichever agent's shell started it (a daemon that inherited an agent's session would otherwise resolve as that agent, and its calls to every other organisation's repos would 404 under the wrong account). Real agents' own typed `gh` calls carry no marker and are re-identified as before.
+
+### The hold label of the `gh` shim, and the audit of every `gh` write (#376)
+
+A project that must merge a pull request itself can hold it with a label. The config names, per repository, the label, the message and
+the agents that may remove it (names below are invented):
+
+```json
+"hold_labels": {
+  "acme-org/widget-api": {
+    "label": "acme:hold-proof",
+    "message": "held: the project merges this one itself",
+    "allowed_removers": ["coordinator"]
+  }
+}
+```
+
+On a pull request of that repository that carries the label the shim refuses (exit status 1, the message printed once, the real `gh` not
+run): `gh pr merge` in every form (`--admin`, `--auto` and `--disable-auto` included), `gh pr close`, `gh pr review --approve`, `gh pr edit
+--base`, and the same writes through `gh api` (`pulls/N/merge`, `pulls/N` with `state` or `base`, `pulls/N/reviews` and `.../events` with
+`event=APPROVE`, `issues/N` with `state=closed`). Removing the label (`gh pr edit --remove-label`, `gh issue edit --remove-label`, `gh label
+delete` or `gh label edit --name` on it, `gh api` label DELETE, PUT or a `labels` field) is refused unless the caller (the
+fleet name `whoami` gives) is in `allowed_removers`. It only ever ADDS refusals: reads, other repositories and unlabelled pull requests run as
+before, and a repository with no entry costs no GitHub call. Repository names match case-insensitively, with or without `.git`, spaces or a
+host; label names compare with NFKC and case folded; a target may be a number, a URL, a branch name or nothing (the real `gh` then says which pull
+request it is). One bounded read (`FLEET_SHIM_HOLD_SECONDS`, default 5, between 0.2 and 10) answers which pull request and which labels, with
+the account the write would use.
+
+**Fail closed.** A label read that fails, times out or answers something unreadable, a config that cannot be read or whose entry is
+malformed, a command shape the shim cannot follow (an unknown flag that may take a value, more than one target), a numeric `repositories/ID`
+path, a `gh api graphql` mutation that names `mergePullRequest`, `closePullRequest`, `addPullRequestReview`, `enablePullRequestAutoMerge`
+and the like (a node id cannot be tied to a repository: use the `gh pr` verbs), an alias (checked with `gh alias list`) and a shim whose
+`gh_hold.py` cannot be loaded while the config names a hold, all refuse the write with a retry message. A failure is never remembered: the next
+call reads again. Reads are never refused. `fleet-switchboard` checks the key when it loads the config (`hold_labels` entries need a
+printable `label`, a one-line `message` and `allowed_removers` as agent names). The switchboard's own marker (`FLEET_SWITCHBOARD_OWN_GH`) does
+not bypass it: an agent can set it.
+
+**Live with no restart, and how to check it.** The shim directory is read on every call, so once the change is on the checkout and the config
+names a repository, the next `gh` call is checked. On a labelled pull request run `gh pr merge <n> -R <owner/repo>`: it exits 1 with the
+configured message and nothing is merged; on an unlabelled one it behaves as before. Removing the config entry switches it off.
+
+**Audit of every `gh` write.** Each write the shim passes on, and each it refuses, leaves one JSON line (`ts`, `verb`, `repo`, `number`,
+`caller`, `outcome` = `passed` or `refused`) in `gh-writes.jsonl` in the directory beside the state directory with `-audit` added
+(`~/.local/state/fleet-switchboard-audit/` by default), so "who merged this pull request" has an answer. A command line, a body, a token or a
+query value is never copied; `repo` and `number` are `null` when the command names neither (a number of the current branch); `passed` means
+handed to the real `gh`, not that it succeeded; the file is rotated at 1 MiB; a failed audit write changes nothing. Git credential calls and the
+switchboard's own calls are not audited.
+
+**The audit of the writes the shim lets through.** What the shim passes on that this hold does NOT check, by design or because it cannot tell
+which pull request it touches, so that nobody mistakes it for a boundary (GitHub's branch protection and required reviews are the boundary):
+
+- `gh pr update-branch`, `gh pr ready`, `gh pr reopen`, `gh pr lock`, `gh pr comment`, `gh pr review --comment` and `--request-changes`, `gh pr create`,
+  every `gh issue` verb except `close` and `edit --remove-label`, `gh release`, `gh run`, `gh workflow`, `gh secret`, `gh variable`, `gh repo`,
+  `gh gist`, `gh ruleset`, `gh codespace`, `gh cache`, `gh extension`, `gh config`, `gh auth`.
+- `gh api` writes that are not one of the shapes above: `repos/o/r/merges`, `git/refs` (a branch delete or move), `pulls/N/update-branch`,
+  `pulls/N/requested_reviewers`, comments, `branches/.../protection`, and anything addressed by `repositories/ID` for a path outside the guarded shapes.
+- A `gh api graphql` call whose query names none of the guarded mutations, and a query the shim reads only up to 256 KiB.
+- A shell or alias that runs the real `gh` by its absolute path, or `git push` of a branch (the `git` shim routes credentials, it does not read holds).
+- The existing review check (`--over-review`) and the plan gates are separate mechanisms, still fail-open as documented, and run after the hold.
 The policy judge never reads the
 pane variable: it judges the plugin's own `sessionID`, and `plugins/fleet-hooks` does the same. `status` lists the agent each live
 session resolves to, a `WARNING` for any disagreement (a session shown in two panes, a name claimed by two sessions, a pane labelled

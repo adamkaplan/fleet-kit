@@ -13,6 +13,7 @@ It signs the body of `gh issue comment`, `gh pr comment`, `gh pr review`,
 --body-file/-F (a file, or - for stdin). Everything else, and anything it does
 not understand, runs the real gh unchanged: this must never block a command.
 """
+import importlib.util
 import json
 import os
 import re
@@ -817,6 +818,58 @@ def gate_bind_merge(args, parsed, repo, number, payload):
     return ("args", new + [MATCH_FLAG, head])
 
 
+HOLD_MODULE = [None, False]   # (module, tried): gh_hold.py beside this file, loaded by path (a plain `import` would need a package)
+
+
+def load_hold():
+    """The hold-label and audit module, or None when it cannot be loaded."""
+    if not HOLD_MODULE[1]:
+        HOLD_MODULE[1] = True
+        try:
+            path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "gh_hold.py")
+            spec = importlib.util.spec_from_file_location("gh_hold", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            HOLD_MODULE[0] = module
+        except Exception:
+            HOLD_MODULE[0] = None
+    return HOLD_MODULE[0]
+
+
+def hold_probe(args, lookup, gh, write):
+    """(refusal text or None, repo or None, number or None): see gh_hold.py. A missing or broken module refuses a WRITE while the config names a hold
+    (fail closed) and is otherwise silent. The label read uses the account the write would use."""
+    try:
+        module = load_hold()
+        if module is None:
+            with open(os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config"),
+                                   "fleet-switchboard", "config.json")) as handle:
+                named = "hold_labels" in handle.read()
+            return ("gh: the hold-label check could not be loaded, retry (the fleet shim refuses this write rather than let it through)"
+                    if named and write else None), None, None
+        env = None
+        try:
+            env = account_env(gh, lookup, args=args)
+        except Exception:
+            env = None
+        got = module.check(args, module.Ctx(gh, env, lambda: lookup.identity().get("name"), write))
+        return got.refusal, got.repo, got.number
+    except Exception:
+        return None, None, None   # no config to read (or no way to tell): nothing configured, nothing to enforce
+
+
+def audit_write(args, lookup, outcome, write, repo=None, number=None):
+    """One audit line for a gh write (never a command line); best effort, never changes the command."""
+    try:
+        if not write or os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1" or is_git_credential(args):
+            return
+        module = load_hold()
+        if module is not None:
+            module.write_audit(args, my_name(lookup), outcome, repo, number)
+    except Exception:
+        pass
+
+
 def refusal_text(err):
     """The one line a refused credential request says. A worker with no repository of its own gets the fix by name; any other refusal names the repository."""
     if isinstance(err, NoOwnRepository):
@@ -832,7 +885,13 @@ def main(args):
         return 127
     plan = None
     args, over_found, over_reason = take_over_review(args)   # the shim's own flag never reaches gh or the signing
-    lookup = Lookup(write=is_write(args))   # one identity lookup, one deadline, for the name and the account together
+    write = is_write(args)
+    lookup = Lookup(write=write)   # one identity lookup, one deadline, for the name and the account together
+    held, hold_repo, hold_number = hold_probe(args, lookup, gh, write)   # a hold label refuses before anything else is asked (#376)
+    if held:
+        sys.stderr.write(held.strip() + "\n")
+        audit_write(args, lookup, "refused", write, hold_repo, hold_number)
+        return 1
     try:
         plan = signed_call(args, my_name(lookup)) if len(args) >= 3 and (args[0], args[1]) in SIGNED_COMMANDS else None
     except Exception:
@@ -840,10 +899,12 @@ def main(args):
     refusal = review_probe(args, over_found, over_reason, lookup, gh)
     if refusal is not None:
         sys.stderr.write(refusal + "\n")
+        audit_write(args, lookup, "refused", write, hold_repo, hold_number)
         return 10
     verdict = gate_probe(args, lookup, gh)
     if verdict is not None and verdict[0] == "refuse":
         sys.stderr.write(gate_clean(verdict[1]) + "\n")
+        audit_write(args, lookup, "refused", write, hold_repo, hold_number)
         return 10
     if verdict is not None:
         args = verdict[1]
@@ -863,7 +924,9 @@ def main(args):
         except AccountLookupFailed:
             sys.stderr.write("gh: account lookup failed, retry (the fleet shim could not find which GitHub account this write is for, and will not "
                              "fall back to the inherited token)\n")
+            audit_write(args, lookup, "refused", write, hold_repo, hold_number)
             return 1
+    audit_write(args, lookup, "passed", write, hold_repo, hold_number)
     count_call(args)
     if plan is None:
         if env is not None:

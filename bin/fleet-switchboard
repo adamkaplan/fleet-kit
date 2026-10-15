@@ -479,7 +479,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "chat_clear", "temp_janitor", "load_alert", "spotlight_guard", "excluded_repos", "source_budgets"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "chat_clear", "temp_janitor", "load_alert", "spotlight_guard", "excluded_repos", "source_budgets", "hold_labels"}
 
 
 def config_known_keys():
@@ -617,6 +617,7 @@ def validate_config(raw, source="config"):
     validate_plan_evaluators(config, source)  # #107: who may record a plan scenario's verdict
     validate_plan_gates_config(config, source)  # #107 slice 3a
     validate_plan_review_config(config, source)  # #109 part 2, R2
+    validate_hold_labels_config(config, source)  # #376
     return config
 
 
@@ -649,6 +650,21 @@ def validate_plan_review_config(config, source):
         if out[key] is not None and not isinstance(out[key], str):
             raise ConfigError("%s: 'plan_review.%s' must be text" % (source, key))
     config["plan_review"] = out
+
+
+def validate_hold_labels_config(config, source):
+    """`hold_labels`: per repository, the label the gh shim holds a pull request by (shims/gh_hold.py reads it live from this file). Absent means none."""
+    if config.get("hold_labels") is None:
+        config.pop("hold_labels", None)
+        return
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "shims", "gh_hold.py")
+    spec = importlib.util.spec_from_file_location("gh_hold_check", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    try:
+        module.validate_config(config["hold_labels"])
+    except ValueError as err:
+        raise ConfigError("%s: %s" % (source, err)) from None
 
 
 def validate_plan_gates_config(config, source):
