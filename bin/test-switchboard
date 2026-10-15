@@ -12236,7 +12236,6 @@ class TestChatClearHook(Base):
         cc = sb.load_module("chat_clear")
         self.assertEqual(cc.quote("a @b `c`"), "a @b `c`")
         self.build(live=True)
-        offer = sb.load_module("chat_clear").read_offers(self.world.state)
         self.hook()
         sb.chat_clear_apply(self.engine, cc, self.PR, sb.load_module("chat_clear").read_offers(self.world.state)[self.PR], "ok @someone `x`", "m1", self.world.clock.now())
         (comment,) = self.comments()
@@ -12263,7 +12262,7 @@ class TestChatClearHook(Base):
         for n in range(5):
             self.say("is 9 good to go %d" % n)
         self.hook()
-        self.assertLessEqual(len(self.jev.calls), 1 + sb.CHAT_CLEAR_NEW_PER_PASS, "at most a few new messages are judged per pass")
+        self.assertEqual(len(self.jev.calls), 1 + sb.CHAT_CLEAR_NEW_PER_PASS, "exactly the cap of new messages is judged in one pass")
 
     def test_s10_a_clear_stays_for_its_head_and_the_daemon_judges_a_new_head_again(self):
         self.live = True
@@ -12295,7 +12294,7 @@ class TestChatClearHook(Base):
 
     def test_a_hold_label_added_or_a_close_between_the_two_reads_is_refused_by_the_core_on_the_read_it_clears_from(self):
         self.live = True
-        for change, fragment in (({"labels": lambda names: [{"name": names["hold-impact"]}, {"name": names["hold-security"]}]}, "no longer held"), ({"state": lambda names: "CLOSED"}, "no longer held")):
+        for change in ({"labels": lambda names: [{"name": names["hold-impact"]}, {"name": names["hold-security"]}]}, {"state": lambda names: "CLOSED"}):
             self.build()
             self.hook()
             self.say("9 is good to go")
@@ -12315,14 +12314,49 @@ class TestChatClearHook(Base):
             self.assertEqual(self.writes, [], change)
             self.assertEqual(reads["n"], 2, "the pre-read and the core's own read")
             self.assertEqual(sb.read_impact_state(self.world.state)[0]["clears"], {}, "no clear state for a refused clear")
-            self.assertTrue([e for e in self.events("chat_clear.failed")], change)
+            (failed,) = self.events("chat_clear.failed")[-1:]
+            self.assertIn("changed since the owner was shown it" if "labels" in change else "is not open any more", failed["detail"]["error"], change)
+            self.assertIn("no longer held for you", "\n".join(self.cos_texts()), change)
+
+    def test_a_failed_point_of_effect_read_refuses_and_the_read_goes_through_the_repos_own_account_for_the_current_head(self):
+        self.live = True
+        self.build()
+        self.hook()
+        self.say("9 is good to go")
+        real = self.route
+
+        def failing(argv, **kwargs):
+            if argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"]:
+                return subprocess.CompletedProcess(argv, 1, "", "HTTP 502")
+            return real(argv, **kwargs)
+
+        self.engine.gh_runner = failing
+        self.hook()
+        self.assertEqual(self.writes, [])
+        self.assertEqual(sb.read_impact_state(self.world.state)[0]["clears"], {})
+        self.assertEqual(len(self.events("chat_clear.failed")), 1, "a read that fails refuses the clear: one question, no write")
+        seen = []
+        self.build(live=True)
+        self.engine.accounts = sb.GhAccounts({"gh": FAKE_GH, "call_timeout_seconds": 5, "gh_users": {"acme/*": "acct-app"}}, lambda argv, **k: subprocess.CompletedProcess(argv, 0, "tok-app\n", ""), self.world.clock.now, environ={})
+        real = self.route
+
+        def watching(argv, **kwargs):
+            if argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"]:
+                seen.append(kwargs.get("env", {}).get("GH_TOKEN"))
+            return real(argv, **kwargs)
+
+        self.engine.gh_runner = watching
+        self.hook()
+        self.say("9 is good to go")
+        self.hook()
+        self.assertTrue(seen and all(token == "tok-app" for token in seen), "every point-of-effect read runs as the repo's own account: %r" % seen)
+        self.assertEqual(len(seen), 2, "one pre-read and the core's own read, nothing from memory")
 
     def test_the_hook_fails_quietly_and_never_clears_on_trouble(self):
         self.live = True
         self.build()
         self.hook()
         self.say("9 is good to go")
-        original = sb.load_module("chat_clear").decide
         with mock.patch.object(sb.load_module("chat_clear"), "decide", side_effect=RuntimeError("boom")):
             self.hook()
         self.assertEqual(self.writes, [])
