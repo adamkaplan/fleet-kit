@@ -351,11 +351,11 @@ def timing_problem(offer, created, now):
     return None
 
 
-PLAIN_WORDS = frozenset(("a also ahead approve approved are be clear cleared fine go goes going good i is it lgtm looks merge ok okay pr please ready release "
+PLAIN_WORDS = frozenset(("a also ahead approve approved are be clear cleared fine go goes going good is it lgtm looks merge ok okay pr please ready release "
                          "s ship thank thanks the through to you now for with then").split())
 # Past-tense and report words are NOT in the list (was, were, had, has, been, got, already, merged, shipped, released, done, went, yesterday, earlier, last ...): a message
 # about the past is a report, not a grant. `cleared` and `approved` are the owner's own grant words ("366 cleared", "366 is approved"), so they are allowed ONLY as a
-# state AFTER the number: "cleared 366" and "approved 366" read as a report of what was done, and are refused.
+# state AFTER the number and followed by nothing but thanks: "cleared 366" and "approved 366" read as a report of what was done, and are refused.
 PARTICIPLES = frozenset(("cleared", "approved"))
 LETTERS = re.compile(r"[^\W\d_]+", re.UNICODE)
 
@@ -386,6 +386,9 @@ def _plain_clearing(text):
     gap = text[first.end():]
     direct = bool(after) and re.match(r"^\s*" + re.escape(after[0]), gap) is not None   # the first word after the number follows it with nothing but space between
     for n, word in enumerate(after):
+        if word.lower() in PARTICIPLES:   # a state of the PR: directly after the number (or after is/also/are) and followed by nothing but thanks: "366 cleared", "366 is approved, thanks"
+            if not ((n == 0 and direct) or (n == 1 and after[0].lower() in ("is", "also", "are"))) or any(w.lower() not in ("now", "thanks", "thank", "you", "please") for w in after[n + 1:]):
+                return False
         if word.lower() in QUESTION_OPENERS and not (n == 0 and direct):
             return False
         if word.lower() in QUESTION_OPENERS and n + 1 < len(after) and after[n + 1].lower() in PRONOUNS:

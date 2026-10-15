@@ -11765,16 +11765,18 @@ class TestChatClearJudge(unittest.TestCase):
         past = ("366 was merged", "366 was good to go", "366 shipped", "366 released", "366 merged", "366 cleared yesterday", "366 was cleared", "366 were cleared", "366 has been cleared",
                 "366 had been approved", "366 already cleared", "366 got merged", "366 is done", "366 went out", "366 was good, go ahead", "cleared 366", "approved 366",
                 "last 366 good to go", "earlier 366 is good to go", "366 good to go yesterday", "366 is already good to go", "366 has been good to go", "366 was approved",
-                "I cleared 366", "I approved 366", "we shipped 366", "366 was released", "366 released yesterday", "366 would be good to go", "366 had good to go")
+                "I cleared 366", "I approved 366", "we shipped 366", "366 was released", "366 released yesterday", "366 would be good to go", "366 had good to go",
+                "366. I cleared it", "366 I cleared it", "366 you approved it", "366 I approved", "366 you cleared it", "366 cleared it", "366 approved it", "please cleared 366",
+                "366 good to go cleared", "366 also cleared it", "366 is cleared it", "366 cleared, I think", "366 is approved by you")
         for text in past:
             got = self.decide(text, jev)
             self.assertNotEqual(got["action"], "clear", text)
             if self.cc.CLEARISH.search(text):
                 self.assertEqual((got["action"], got["why"]), ("ask", "hedged"), text)
         for text in ("366 is cleared", "366 cleared", "clear 366", "366 is approved", "366 approved", "approve 366", "ship 366", "release 366", "merge 366", "366 is good to go",
-                     "366 also good to go", "#366 is cleared.", "ok to merge 366", "go ahead ship 366", "please clear 366"):
+                     "366 also good to go", "#366 is cleared.", "366 cleared, thanks", "366 is approved, thank you", "366 also approved", "ok to merge 366", "go ahead ship 366", "please clear 366"):
             self.assertEqual(self.decide(text, jev)["action"], "clear", text)
-        for word in ("was", "were", "had", "has", "have", "been", "got", "already", "merged", "shipped", "released", "done", "went", "yesterday", "earlier", "last"):
+        for word in ("i", "was", "were", "had", "has", "have", "been", "got", "already", "merged", "shipped", "released", "done", "went", "yesterday", "earlier", "last"):
             self.assertNotIn(word, self.cc.PLAIN_WORDS, word)
 
     def test_a_bad_nan_boolean_or_lower_bar_is_the_floor_and_the_bar_can_only_be_raised(self):
