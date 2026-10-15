@@ -11659,6 +11659,26 @@ class TestHeadlessPresence(Base):
         self.assertIn("other/thing", done["identity"])
         self.assertIn("it has no repo", self.launch_hl(name="norepo")["identity"])
 
+    def test_the_named_account_refusal_holds_for_every_spelling_of_a_mapped_repo_exact_and_wildcard_with_a_default_token_set(self):
+        users = {"acme/widget": "acct-ops", "wild-org/*": "acct-ops"}
+        self.engine.accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5, "gh_users": users}, self.world.route, self.world.clock.now, environ={"GH_TOKEN": "x"})
+        sessions_before = set(self.world.v2.sessions)
+        for spelling in ("acme/widget", "Acme/Widget", "ACME/WIDGET", " acme/widget ", "acme/widget.git", "acme/widget/", "wild-org/any", "WILD-ORG/any", "Wild-Org/Any.git"):
+            with self.assertRaises(sb.LaunchError, msg=spelling) as raised:
+                self.launch_hl(name="pin", repo=spelling)
+            self.assertIn("Use a terminal launch", str(raised.exception), spelling)
+        self.assertEqual(set(self.world.v2.sessions), sessions_before, "nothing was created for any spelling")
+        mixed = {"Acme/Widget": "acct-ops", "WILD-ORG/*": "acct-ops"}   # the keys are spelled differently too
+        self.engine.accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5, "gh_users": mixed}, self.world.route, self.world.clock.now, environ={"GH_TOKEN": "x"})
+        for spelling in ("acme/widget", "ACME/WIDGET", "wild-org/any"):
+            with self.assertRaises(sb.LaunchError, msg=spelling):
+                self.launch_hl(name="pin", repo=spelling)
+        done = self.launch_hl(name="free", repo="Other-Org/Thing")   # an unmapped repo still launches, whatever its case
+        self.assertIn("gh_users has no entry for Other-Org/Thing", done["identity"])
+        self.assertIn("it has no repo", self.launch_hl(name="norepo")["identity"], "no repo: nothing to map, so it acts as the service's own account, and says so")
+        accounts = self.engine.accounts
+        self.assertEqual([accounts.account_for(r) for r in ("ACME/Widget", "acme/widget.git", "x/y", None, 5)], ["acct-ops", "acct-ops", None, None, None])
+
     def test_retire_frees_the_name_of_a_headless_worker_and_undo_restores_the_record_unless_the_name_was_taken(self):
         done = self.launch_hl()
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})

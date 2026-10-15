@@ -15670,13 +15670,27 @@ class GhAccounts:
         self.audit, self.actor = None, "daemon"
         self.conditional = False                 # ask with `-i` and keep the ETag: the daemon turns it on; a one-shot command or a test reads plainly
 
+    @staticmethod
+    def normal_repo(repo):
+        """`owner/name` the way GitHub treats it: whitespace and a trailing `.git` or `/` off, lower case (GitHub names are not case sensitive). None when
+        it is not a string. Used for the repo and for every `gh_users` key, so a different spelling of a mapped repo is still the mapped repo."""
+        if not isinstance(repo, str):
+            return None
+        text = repo.strip().rstrip("/")
+        if text.lower().endswith(".git"):
+            text = text[:-4]
+        return text.lower()
+
     def account_for(self, repo):
         if fault("one-account"):
             return None  # the fault: the default token reads every repo
-        users = self.config.get("gh_users") or {}
-        if repo in users:
-            return users[repo]
-        return users.get("%s/*" % repo.split("/")[0]) if isinstance(repo, str) and "/" in repo else None
+        want = self.normal_repo(repo)
+        if not want:
+            return None
+        users = {self.normal_repo(key): account for key, account in (self.config.get("gh_users") or {}).items() if isinstance(key, str)}
+        if want in users:
+            return users[want]
+        return users.get("%s/*" % want.split("/")[0]) if "/" in want else None
 
     def default_available(self):
         return any(self.environ.get(name) for name in ("GH_TOKEN", "GITHUB_TOKEN"))
