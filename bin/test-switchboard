@@ -11336,6 +11336,337 @@ class TestVerdictRecordingText(unittest.TestCase):
         self.assertIn("a coder's only extra step is `prove`", planning)
 
 
+class TestChatClearOffers(unittest.TestCase):
+    """#457 slice 1: the offers, the person's messages and the checks no model can waive. Fixtures only: nothing here touches a real PR."""
+
+    NAMES = {"merge-captain": "u:merge-captain", "hold-impact": "u:hold-impact", "hold-credential": "u:hold-credential",
+             "hold-policy": "u:hold-policy", "hold-security": "u:hold-security", "hold-contract": "u:hold-contract",
+             "hold-prod-config": "u:hold-prod-config", "hold-other-area": "u:hold-other-area", "parked": "u:parked"}
+
+    def setUp(self):
+        self.cc = sb.load_module("chat_clear")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = self.tmp.name
+
+    def hold(self, number, labels, head="a" * 40, repo="acme/widget", summary="touches the gate"):
+        return {"pr": "%s#%d" % (repo, number), "head": head, "labels": labels, "summary": summary}
+
+    def offers(self, *numbers, head="a" * 40):
+        holds = [self.hold(n, ["u:hold-impact"], head=head) for n in numbers]
+        return self.cc.refresh_offers(self.state, holds, self.NAMES, 1000)["offers"]
+
+    def test_the_owner_tier_labels_are_offered_however_they_were_put_on_and_other_holds_and_parked_are_not(self):
+        for labels in (["u:hold-impact"], ["u:hold-credential"], ["u:hold-policy"], ["u:merge-captain"],
+                       [{"name": "u:hold-credential"}, {"name": "u:parked"}]):
+            self.assertTrue(self.cc.is_offerable(self.NAMES, labels), labels)
+        for labels in (["u:parked"], [], ["u:hold-impact", "u:hold-security"], ["u:merge-captain", "u:hold-prod-config"], ["bug"]):
+            self.assertFalse(self.cc.is_offerable(self.NAMES, labels), labels)
+        self.assertEqual(self.cc.owner_tier_labels(self.NAMES, ["u:parked", "u:hold-credential", "u:merge-captain"]),
+                         ["u:hold-credential", "u:merge-captain"], "only owner-tier labels, never parked")
+
+    def test_an_offer_keeps_the_head_he_was_shown_until_a_question_shows_him_the_new_one(self):
+        self.offers(366)
+        refreshed = self.cc.refresh_offers(self.state, [self.hold(366, ["u:hold-impact"], head="b" * 40)], self.NAMES, 2000)
+        self.assertEqual(refreshed["offers"]["acme/widget#366"]["head"], "a" * 40, "a push does not change what he was shown")
+        self.assertEqual(refreshed["added"], [])
+        offer = self.cc.read_offers(self.state)["acme/widget#366"]
+        self.assertFalse(self.cc.head_matches(offer, "b" * 40), "a push after the offer clears nothing")
+        self.assertTrue(self.cc.head_matches(offer, "a" * 40))
+        self.assertTrue(self.cc.show(self.state, "acme/widget#366", "b" * 40, 3000))
+        self.assertTrue(self.cc.head_matches(self.cc.read_offers(self.state)["acme/widget#366"], "b" * 40))
+        self.assertFalse(self.cc.show(self.state, "acme/widget#999", "b" * 40, 3000), "no offer, nothing moved")
+
+    def test_a_pr_that_is_no_longer_held_loses_its_offer_and_an_unchanged_set_writes_nothing(self):
+        self.offers(366, 389)
+        path = Path(self.state) / "chat-clear-offers.json"
+        writes = []
+        real = self.cc.write_offers
+        self.cc.write_offers = lambda *a, **k: writes.append(a) or real(*a, **k)
+        self.addCleanup(setattr, self.cc, "write_offers", real)
+        same = self.cc.refresh_offers(self.state, [self.hold(366, ["u:hold-impact"]), self.hold(389, ["u:hold-impact"])], self.NAMES, 1001)
+        self.assertEqual((same["added"], same["dropped"]), ([], []))
+        self.assertEqual(writes, [], "nothing changed: write_offers was not called")
+        gone = self.cc.refresh_offers(self.state, [self.hold(389, ["u:hold-impact"]), self.hold(400, ["u:parked"])], self.NAMES, 1002)
+        self.assertEqual(sorted(gone["offers"]), ["acme/widget#389"])
+        self.assertEqual(gone["dropped"], ["acme/widget#366"])
+        self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
+
+    def entry(self, **kw):
+        return dict({"head": "a" * 40, "shown": True, "shown_at": 1000, "labels": ["u:hold-impact"], "summary": "s"}, **kw)
+
+    def test_an_unreadable_or_oversized_offers_file_offers_nothing_and_a_bad_entry_is_dropped_alone(self):
+        path = Path(self.state) / "chat-clear-offers.json"
+        path.write_text("{not json")
+        self.assertEqual(self.cc.read_offers(self.state), {})
+        path.write_text(json.dumps({"offers": {"bad key": self.entry(), "acme/widget#1": self.entry(head=""), "acme/widget#2": self.entry()}}))
+        self.assertEqual(sorted(self.cc.read_offers(self.state)), ["acme/widget#2"])
+        path.write_text(" " * (self.cc.OFFERS_MAX_BYTES + 1))
+        self.assertEqual(self.cc.read_offers(self.state), {})
+        self.assertEqual(self.cc.read_offers(Path(self.state) / "nowhere"), {})
+
+    def test_a_damaged_entry_is_dropped_never_defaulted_to_shown_and_never_touches_the_others(self):
+        path = Path(self.state) / "chat-clear-offers.json"
+        bad = {"no_shown": {k: v for k, v in self.entry().items() if k != "shown"}, "shown_str": self.entry(shown="true"), "shown_one": self.entry(shown=1),
+               "shown_null": self.entry(shown=None), "no_at": {k: v for k, v in self.entry().items() if k != "shown_at"}, "at_str": self.entry(shown_at="1000"),
+               "at_neg": self.entry(shown_at=-1), "at_bool": self.entry(shown_at=True), "labels_str": self.entry(labels="u:hold-impact"),
+               "labels_mixed": self.entry(labels=["u:hold-impact", 5]), "no_summary": {k: v for k, v in self.entry().items() if k != "summary"},
+               "summary_int": self.entry(summary=5), "head_int": self.entry(head=5), "not_dict": "x"}
+        entries = {"acme/widget#%d" % (100 + n): v for n, v in enumerate(bad.values())}
+        entries["acme/widget#1"] = self.entry()
+        entries["acme/widget#2"] = self.entry(shown=False)
+        path.write_text(json.dumps({"offers": entries}))
+        loaded = self.cc.read_offers(self.state)
+        self.assertEqual(sorted(loaded), ["acme/widget#1", "acme/widget#2"], "every damaged entry is dropped, the 2 whole ones are kept as they were")
+        self.assertIs(loaded["acme/widget#2"]["shown"], False)
+        refreshed = self.cc.refresh_offers(self.state, [self.hold(100, ["u:hold-impact"], head="c" * 40), self.hold(1, ["u:hold-impact"])], self.NAMES, 2000)
+        self.assertIs(refreshed["offers"]["acme/widget#100"]["shown"], False, "a PR whose entry was damaged is recorded again as NOT shown")
+        self.assertIs(refreshed["offers"]["acme/widget#1"]["shown"], True, "a whole entry beside the damaged ones keeps what it was")
+        self.assertEqual(len(refreshed["damaged"]), len(bad))
+        for n, shape in enumerate(bad):   # every damaged shape, held again, comes back as NOT shown
+            path.write_text(json.dumps({"offers": {"acme/widget#%d" % (300 + n): bad[shape]}}))
+            again = self.cc.refresh_offers(self.state, [self.hold(300 + n, ["u:hold-impact"])], self.NAMES, 3000 + n)
+            self.assertIs(again["offers"]["acme/widget#%d" % (300 + n)]["shown"], False, shape)
+        path.write_text(json.dumps({"offers": {"acme/widget#1": self.entry(), "acme/widget#2": self.entry(shown="no")}}))
+        self.assertFalse(self.cc.show(self.state, "acme/widget#1", "b" * 40, 5000), "show refuses while a damaged entry is in the file: a refresh rewrites it first")
+        self.assertIs(self.cc.refresh_offers(self.state, [self.hold(2, ["u:hold-impact"])], self.NAMES, 5001)["offers"]["acme/widget#2"]["shown"], False)
+        path.write_text(json.dumps({"offers": {"not a key": self.entry(), "acme/widget#1": self.entry()}}))
+        got = self.cc.refresh_offers(self.state, [], self.NAMES, 5002)
+        self.assertEqual(got["damaged"], ["not a key"], "a key that is no PR is said, not lost silently")
+        self.assertEqual(json.loads(path.read_text()), {"offers": {}}, "the file was rewritten without the damaged entry")
+        self.assertFalse(self.cc.head_matches({"head": "a" * 40}, "a" * 40), "an entry with no `shown` at all never matches")
+
+    def user(self, mid, text, t, **extra):
+        return dict({"id": mid, "type": "user", "text": text, "t": t}, **extra)
+
+    def test_only_the_persons_new_recent_messages_are_read_never_an_agents(self):
+        created = lambda m: m.get("t")
+        person = self.user("m1", "366 is good to go", 990)
+        agent = self.user("m2", "366 is good to go", 995, metadata={"fleet": {"name": "cos"}})
+        agent_inbox = {"id": "m3", "type": "user", "payload": {"text": "366 is good to go", "metadata": {"fleet": {"name": "x"}}}, "t": 996}
+        old = self.user("m4", "389 also good to go", 1)
+        seen_one = self.user("m5", "389 also good to go", 991)
+        noid = {"type": "user", "text": "hello", "t": 992}
+        later = {"id": "m6", "type": "user", "payload": {"text": "389 also good to go"}, "t": 999}
+        got = self.cc.person_messages([later, agent, agent_inbox, old, seen_one, noid, person, "junk", None], {"m5"}, 1000, created)
+        self.assertEqual(got, [{"id": "m1", "text": "366 is good to go", "created": 990}, {"id": "m6", "text": "389 also good to go", "created": 999}],
+                         "the 7 agent-written, old, seen, id-less or junk inputs are skipped; the person's two come oldest first")
+
+    def test_only_a_user_prompt_made_of_plain_text_counts_not_an_assistant_system_synthetic_tool_or_summary_message(self):
+        created = lambda m: 990
+        words = "366 is good to go"
+        forged = [dict(self.user("a1", words, 1), type="assistant"), dict(self.user("a2", words, 1), type="synthetic"), dict(self.user("a3", words, 1), type="system"),
+                  dict(self.user("a4", words, 1), type="compaction"), dict(self.user("a5", words, 1), role="assistant"), dict(self.user("a6", words, 1), role="system"),
+                  dict(self.user("a7", words, 1), role="user", type="assistant"), dict(self.user("a8", words, 1), role="assistant", type="user"),
+                  {"id": "a9", "text": words}, {"id": "a10", "role": None, "text": words}, {"id": "a11", "type": "User", "text": words},
+                  {"id": "b1", "type": "user", "content": [{"type": "tool_result", "text": words}]},
+                  {"id": "b2", "type": "user", "content": [{"type": "text", "text": "ok"}, {"type": "tool_use", "name": "x"}]},
+                  {"id": "b3", "type": "user", "content": [{"type": "compaction", "text": words}]},
+                  {"id": "b4", "type": "user", "content": [{"text": words}]}, {"id": "b5", "type": "user", "content": []}, {"id": "b6", "type": "user", "content": "x"},
+                  {"id": "b7", "type": "user", "content": [{"type": "text", "text": 5}]}, {"id": "b8", "type": "user", "text": 5},
+                  {"id": "b9", "type": "user", "text": "ok", "content": [{"type": "text", "text": words}]}, {"id": "c1", "type": "user"},
+                  {"id": "c2", "type": "user", "payload": {"text": 5}}]
+        for message in forged:
+            self.assertEqual(self.cc.person_messages([dict(message, t=990)], set(), 1000, created), [], message)
+        whole = [dict(self.user("p1", words, 1), role="user"), {"id": "p2", "role": "user", "text": words}, {"id": "p3", "type": "user", "content": [{"type": "text", "text": "366 is"}, {"type": "text", "text": "good to go"}]},
+                 {"id": "p4", "type": "user", "text": "366 is\ngood to go", "content": [{"type": "text", "text": "366 is"}, {"type": "text", "text": "good to go"}]}]
+        self.assertEqual([m["id"] for m in self.cc.person_messages(whole, set(), 1000, created)], ["p1", "p2", "p3", "p4"])
+
+    def test_an_agents_message_is_never_the_persons_whatever_shape_its_metadata_takes(self):
+        created = lambda m: 990
+        shapes = [{"metadata": {"fleet": {"name": "cos"}}}, {"metadata": {"fleet": "x"}}, {"metadata": {"fleet": True}},
+                  {"metadata": {"fleet": None}}, {"metadata": "x"}, {"metadata": ["fleet"]},
+                  {"metadata": {}, "payload": {"metadata": {"fleet": {"name": "x"}}}}, {"metadata": {"a": 1}, "payload": {"metadata": {"fleet": 1}}},
+                  {"payload": "x"}, {"payload": {"metadata": "x"}}]
+        for n, shape in enumerate(shapes):
+            message = dict(shape, id="a%d" % n, type="user", text="366 is good to go")
+            self.assertEqual(self.cc.person_messages([message], set(), 1000, created), [], shape)
+        person = [self.user("p1", "366", 1), self.user("p2", "366", 1, metadata={}), self.user("p3", "366", 1, metadata={"a": 1}, payload={"metadata": {}})]
+        self.assertEqual([m["id"] for m in self.cc.person_messages(person, set(), 1000, created)], ["p1", "p2", "p3"])
+
+    def test_the_age_the_future_the_cap_and_the_text_length_of_messages(self):
+        times = {"edge": 100, "over": 99, "ahead": 1060, "farahead": 1061, "none": None, "str": "100", "nan": float("nan"), "bool": True}
+        created = lambda m: times.get(m["id"], 1000)
+        ids = lambda prompts: [m["id"] for m in self.cc.person_messages(prompts, set(), 1000, created, max_age=900)]
+        self.assertEqual(ids([{"id": k, "type": "user", "text": "x"} for k in times]), ["edge", "ahead"], "exactly max_age old is read, one second older and a time too far ahead are not, no time or a non-number is not")
+        long = {"id": "long", "type": "user", "content": [{"type": "text", "text": "a" * 5000}, {"type": "text", "text": "b"}]}
+        self.assertEqual(len(self.cc.person_messages([long], set(), 1000, created)[0]["text"]), self.cc.TEXT_MAX)
+        many = [{"id": "m%d" % n, "type": "user", "text": "x"} for n in range(80)]
+        self.assertEqual(len(self.cc.person_messages(many, set(), 1000, created)), self.cc.MESSAGES_SCANNED)
+
+    def test_at_most_offers_max_offers_the_existing_ones_first_and_the_summary_is_cut_and_clean(self):
+        self.offers(7)
+        holds = [self.hold(n, ["u:hold-impact"]) for n in range(100, 100 + self.cc.OFFERS_MAX + 1)] + [self.hold(7, ["u:hold-impact"])]
+        got = self.cc.refresh_offers(self.state, holds, self.NAMES, 1005)
+        self.assertEqual(len(got["offers"]), self.cc.OFFERS_MAX)
+        self.assertTrue(got["capped"])
+        self.assertIn("acme/widget#7", got["offers"], "an offer that already existed is kept before a new one is taken")
+        long = self.cc.refresh_offers(self.state, [self.hold(1, ["u:hold-impact"], summary="x\x1b[31m" + "y" * 500 + "\n")], self.NAMES, 1006)["offers"]["acme/widget#1"]["summary"]
+        self.assertEqual(len(long), self.cc.SUMMARY_MAX)
+        self.assertNotIn("\x1b", long)
+
+    def test_head_matches_refuses_what_is_not_a_shown_exact_head(self):
+        offer = {"head": "a" * 40, "shown": True}
+        self.assertTrue(self.cc.head_matches(offer, "a" * 40))
+        for current in (None, "", 5, "b" * 40):
+            self.assertFalse(self.cc.head_matches(offer, current), repr(current))
+        for bad in (None, "x", {"head": "a" * 40, "shown": False}, {"head": "a" * 40, "shown": "yes"}):
+            self.assertFalse(self.cc.head_matches(bad, "a" * 40), repr(bad))
+
+    def test_a_file_that_cannot_be_used_is_set_aside_and_what_is_recorded_after_it_is_not_clearable_until_shown(self):
+        path = Path(self.state) / "chat-clear-offers.json"
+        path.write_text("{not json")
+        got = self.cc.refresh_offers(self.state, [self.hold(366, ["u:hold-impact"])], self.NAMES, 1000)
+        self.assertIn("cannot be read", got["problem"])
+        self.assertEqual(got["quarantined"], "chat-clear-offers.json.corrupt-1000")
+        self.assertEqual((Path(self.state) / got["quarantined"]).read_text(), "{not json", "the bad file is kept, never overwritten")
+        offer = got["offers"]["acme/widget#366"]
+        self.assertFalse(offer["shown"])
+        self.assertFalse(self.cc.head_matches(offer, "a" * 40), "recorded after a loss and never shown: nothing clears")
+        self.assertTrue(self.cc.show(self.state, "acme/widget#366", "a" * 40, 1001))
+        self.assertTrue(self.cc.head_matches(self.cc.read_offers(self.state)["acme/widget#366"], "a" * 40))
+
+    def test_a_missing_label_name_makes_a_pr_not_offerable_and_a_lock_held_elsewhere_changes_nothing(self):
+        names = {k: v for k, v in self.NAMES.items() if k != "hold-contract"}
+        self.assertFalse(self.cc.is_offerable(names, ["u:hold-impact"]), "a hold it cannot name is a hold it cannot see")
+        self.offers(366)
+        with self.cc._locked(self.state):
+            with self.assertRaises(self.cc.OffersBusy):
+                self.cc.refresh_offers(self.state, [], self.NAMES, 2000, lock_seconds=0)
+            with self.assertRaises(self.cc.OffersBusy):
+                self.cc.show(self.state, "acme/widget#366", "b" * 40, 2000, lock_seconds=0)
+        self.assertEqual(self.cc.read_offers(self.state)["acme/widget#366"]["head"], "a" * 40, "a busy lock changed nothing")
+
+    def test_a_failed_write_leaves_no_temporary_file_and_the_old_offers(self):
+        self.offers(366)
+        real = os.replace
+        def boom(*a):
+            raise OSError("disk full")
+        os.replace = boom
+        try:
+            with self.assertRaises(OSError):
+                self.cc.write_offers(self.state, {})
+        finally:
+            os.replace = real
+        self.assertEqual(sorted(p.name for p in Path(self.state).iterdir() if p.name.startswith("chat-clear-offers.json.")), [])
+        self.assertIn("acme/widget#366", self.cc.read_offers(self.state))
+
+    def test_a_hold_that_gains_another_hold_label_loses_its_offer_and_a_malformed_hold_is_skipped(self):
+        self.offers(366)
+        got = self.cc.refresh_offers(self.state, [self.hold(366, ["u:hold-impact", "u:hold-security"]), {"pr": None, "head": "a", "labels": ["u:hold-impact"]},
+                                                  {"pr": "acme/widget#5", "head": 7, "labels": ["u:hold-impact"]}, {"head": "a"}], self.NAMES, 1010)
+        self.assertEqual((got["offers"], got["dropped"]), ({}, ["acme/widget#366"]))
+        path = Path(self.state) / "chat-clear-offers.json"
+        asides = set()
+        for body in (" " * (self.cc.OFFERS_MAX_BYTES + 1), json.dumps([1]), json.dumps({"offers": 5})):
+            path.write_text(body)
+            got = self.cc.refresh_offers(self.state, [], self.NAMES, 1011)
+            self.assertTrue(got["problem"] and got["quarantined"], body[:10])
+            self.assertTrue(got["quarantined"].startswith("chat-clear-offers.json.corrupt-1011"))
+            asides.add(got["quarantined"])
+            self.assertFalse(path.exists(), "the unusable file was set aside, not rewritten in place")
+        self.assertEqual(len(asides), 3, "three unusable files, three distinct aside names")
+
+    def test_a_non_ascii_summary_is_kept_whole(self):
+        got = self.cc.refresh_offers(self.state, [self.hold(1, ["u:hold-impact"], summary="caf\u00e9 \u2014 gate")], self.NAMES, 1)
+        self.assertEqual(got["offers"]["acme/widget#1"]["summary"], "caf\u00e9 \u2014 gate")
+        self.assertEqual(self.cc.read_offers(self.state)["acme/widget#1"]["summary"], "caf\u00e9 \u2014 gate")
+        self.assertIn("caf\u00e9".encode("utf-8"), (Path(self.state) / "chat-clear-offers.json").read_bytes(), "written as UTF-8, not escaped")
+        lone = self.cc.refresh_offers(self.state, [self.hold(2, ["u:hold-impact"], summary="bad \ud800 text")], self.NAMES, 2)
+        self.assertEqual(lone["offers"]["acme/widget#2"]["summary"], "bad ? text", "a lone surrogate never stops a refresh")
+        twice = self.cc.refresh_offers(self.state, [self.hold(3, ["u:hold-impact"], head="a" * 40), self.hold(3, ["u:hold-impact"], head="b" * 40)], self.NAMES, 3)
+        self.assertEqual((twice["added"], twice["offers"]["acme/widget#3"]["head"]), (["acme/widget#3"], "a" * 40), "a PR twice in one read is offered once")
+
+    def test_every_run_of_digits_is_a_number_however_it_is_joined_and_one_message_names_one(self):
+        n = self.cc.numbers_in
+        self.assertEqual(n("366 is good to go"), [366])
+        self.assertEqual(n("#389 also good to go"), [389])
+        self.assertEqual(n("366 and 389, 366 again"), [366, 389])
+        self.assertEqual(n("the launchd one is good to go"), [])
+        self.assertEqual(n("all impacts cleared"), [])
+        for joined in ("366-367", "366/367", "366,367", "366, 367", "366..367", "366...367", "366+367", "366&367", "366 and 367", "366 & 367", "#366 #367", "366;367", "366_367", "366 to 367", "366\u2013367"):
+            self.assertEqual(n(joined), [366, 367], joined)
+        self.assertEqual(n("0.97 sure, v2.0.28"), [0, 97, 2, 28], "digits inside decimals and versions are numbers too: it fails toward asking")
+        self.assertEqual(n("\u0663\u0666\u0666 and \uff13\uff16\uff16"), [], "only ASCII digits are digits")
+        self.assertLessEqual(len(str(max(n("9" * 5000 + " 1")))), self.cc.TEXT_MAX, "a huge digit run never raises and is cut at the text cap")
+
+    def test_the_screen_never_lets_a_judge_widen_what_the_message_and_the_offers_say(self):
+        offers = self.offers(366, 389, 400)    # shown at 1000
+        sc = lambda text, o=offers, created=1001, now=1002: self.cc.screen(text, o, created, now)
+        self.assertEqual(sc("366 is good to go"), {"verdict": "candidate", "pr": "acme/widget#366"})
+        self.assertEqual(sc("366 is good to go.")["verdict"], "candidate", "a full stop after the number is fine")
+        self.assertEqual(sc("#366 is good to go")["verdict"], "candidate")
+        for text, why in (("all impacts cleared", "no_number"), ("the launchd one is good to go", "no_number"), ("366 and 389 are good to go", "several_numbers"),
+                          ("366-367 are good to go", "several_numbers"), ("366/367 are good to go", "several_numbers"), ("366, 389 good to go", "several_numbers"),
+                          ("366..389 good to go", "several_numbers"), ("366+389 good to go", "several_numbers"), ("366&389 good to go", "several_numbers"),
+                          ("abc366 is good to go", "unclear_number"), ("366abc is good to go", "unclear_number"), ("366_ is good to go", "unclear_number"),
+                          ("_366 is good to go", "unclear_number"), ("0366 is good to go", "unclear_number"), ("3.66 is good to go", "several_numbers"),
+                          ("v366.1 is good to go", "several_numbers"), ("500 is good to go", "not_offered")):
+            got = sc(text)
+            self.assertEqual((got["verdict"], got["why"]), ("question", why), text)
+        self.assertEqual(sc("366 is good to go", {})["why"], "no_offers")
+        twice = {"acme/widget#366": self.entry(), "acme/other#366": self.entry(head="b" * 40)}
+        got = sc("366 is good to go", twice)
+        self.assertEqual((got["why"], got["prs"]), ("ambiguous_number", ["acme/other#366", "acme/widget#366"]))
+
+    def test_a_message_that_reaches_the_text_cap_is_a_question_whatever_it_says_and_odd_text_is_no_number(self):
+        offers = self.offers(366)
+        for text in ("9" * 5000 + " is good to go", "366 is good to go" + " " * self.cc.TEXT_MAX + "389", "366 is good to go" + " " * (self.cc.TEXT_MAX - len("366 is good to go"))):
+            self.assertEqual(self.cc.screen(text, offers, 1001, 1002)["why"], "too_long", len(text))
+        under = "366 is good to go" + " " * (self.cc.TEXT_MAX - len("366 is good to go") - 1)
+        self.assertEqual(len(under), self.cc.TEXT_MAX - 1)
+        self.assertEqual(self.cc.screen(under, offers, 1001, 1002)["verdict"], "candidate", "one under the cap is read whole")
+        self.assertEqual(self.cc.screen("9" * (self.cc.TEXT_MAX - 1), offers, 1001, 1002)["why"], "not_offered", "a long digit run under the cap is one number, never an error")
+        self.assertEqual(self.cc.screen(None, offers, 1001, 1002)["why"], "no_number")
+        self.assertEqual(self.cc.screen(5, offers, 1001, 1002)["why"], "no_number")
+
+    def test_a_key_with_a_trailing_newline_is_no_pr_and_entries_past_the_cap_come_back_not_shown(self):
+        path = Path(self.state) / "chat-clear-offers.json"
+        path.write_text(json.dumps({"offers": {"acme/widget#1\n": self.entry(), "acme/widget#2": self.entry()}}))
+        loaded, problem, damaged = self.cc._load(self.state)
+        self.assertEqual(sorted(loaded), ["acme/widget#2"])
+        self.assertEqual(damaged, {"acme/widget#1\n"}, "the key with the newline is said, not lost")
+        extra = self.cc.OFFERS_MAX + 2
+        many = {"acme/widget#%d" % n: self.entry() for n in range(1, extra + 1)}
+        path.write_text(json.dumps({"offers": many}))
+        loaded, problem, damaged = self.cc._load(self.state)
+        self.assertEqual(sorted(loaded), sorted("acme/widget#%d" % n for n in range(1, self.cc.OFFERS_MAX + 1)), "the first OFFERS_MAX in file order are kept")
+        self.assertEqual(damaged, {"acme/widget#%d" % n for n in range(self.cc.OFFERS_MAX + 1, extra + 1)}, "the 2 past the cap are said, not silently lost")
+        first = "acme/widget#%d" % (self.cc.OFFERS_MAX + 1)
+        got = self.cc.refresh_offers(self.state, [self.hold(self.cc.OFFERS_MAX + 1, ["u:hold-impact"])], self.NAMES, 9000)
+        self.assertEqual(list(got["offers"]), [first])
+        self.assertIs(got["offers"][first]["shown"], False, "a PR that was past the cap and is held alone is recorded as NOT shown")
+        self.assertEqual(got["damaged"], sorted(damaged))
+
+    def test_a_message_counts_only_if_it_was_written_after_the_offer_was_shown_and_an_offer_expires(self):
+        offers = self.offers(366)   # shown_at 1000
+        sc = lambda created, now: self.cc.screen("366 is good to go", offers, created, now)
+        self.assertEqual(sc(999, 1100)["why"], "before_offer", "written before the offer was shown")
+        self.assertEqual(sc(1000, 1100)["why"], "before_offer", "the same second: refused")
+        self.assertEqual(sc(1001, 1100)["verdict"], "candidate", "one second after: counts")
+        last = 1000 + self.cc.OFFER_TTL
+        self.assertEqual(sc(1001, last)["verdict"], "candidate", "exactly the lifetime old: still counts")
+        self.assertEqual(sc(1001, last + 1)["why"], "expired")
+        for bad in (None, "1001", float("nan"), True):
+            self.assertEqual(sc(bad, 1100)["why"], "no_time", repr(bad))
+        self.assertEqual(self.cc.screen("366 is good to go", offers, 1001, None)["why"], "no_time")
+        self.assertEqual(sc(1000 + self.cc.MESSAGE_SKEW + 101, 1100)["why"], "no_time", "a message from the future")
+        self.assertEqual(self.cc.screen("366 is good to go", {"acme/widget#366": self.entry(shown_at=2000)}, 2001, 1000)["why"], "no_time", "an offer shown in the future")
+        for bad in ({"head": "a" * 40}, {"head": "a" * 40, "shown_at": "1000"}, {"head": "a" * 40, "shown_at": 1.5}):
+            self.assertEqual(self.cc.screen("366 is good to go", {"acme/widget#366": bad}, 1001, 1100)["why"], "no_time", bad)
+        self.cc.show(self.state, "acme/widget#366", "a" * 40, 5000)   # shown again at 5000: an older message no longer counts
+        again = self.cc.read_offers(self.state)
+        self.assertEqual(self.cc.screen("366 is good to go", again, 4000, 5100)["why"], "before_offer")
+        self.assertEqual(self.cc.screen("366 is good to go", again, 5001, 5100)["verdict"], "candidate")
+
+    def test_this_module_has_no_command_and_no_caller_in_the_cli_and_writes_no_label(self):
+        source = (Path(sb.__file__).parent / "chat_clear.py").read_text()
+        for word in ("subprocess", "urllib", "socket", "change_issue_labels"):
+            self.assertNotIn(word, source, "slice 1 reaches nothing: no process, no network, no GitHub write")
+        main = (Path(sb.__file__).parent / "fleet-switchboard").read_text()
+        self.assertNotIn("chat_clear", main, "no command or hook calls it yet in this slice (slice 3 adds the one hook and changes this test)")
+
+
 class TestHeadlessPresence(Base):
     """#433 slice 2: a worker with NO terminal. Its state comes from the OpenCode service alone (bin/agent_presence.py); discovery lists it with the
     pane `(headless)`; a delivery to it is not held; a service that does not answer makes it `unknown`, never dead and never working."""
