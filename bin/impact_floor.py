@@ -294,10 +294,39 @@ _YAML_BLOCK_SCALAR = re.compile(r"(?:^|[\s:-])[|>][+\-0-9]*\s*$")     # a block 
 _LINE_BREAKS = ("\x85", "\u2028", "\u2029")                            # line ends a YAML 1.1 reader honours and `split` does not
 
 
+def _closed_on_its_line(line):
+    """True when every quoted scalar and flow collection that OPENS on `line` also closes on it. A quote opens only where a value can start (after `:`, `-`,
+    `,`, `[` or `{`, or at the start), so an apostrophe inside a plain scalar is a letter; a `#` after a space outside quotes starts a comment. A scalar or collection
+    left open would continue on the next line, where a reader may fold a column 0 `key:` into it: such a definition cannot be judged line by line."""
+    depth, quote, previous, index = 0, None, "", 0
+    while index < len(line):
+        char = line[index]
+        if quote:
+            if quote == '"' and char == "\\":
+                index += 1
+            elif char == quote:
+                if quote == "'" and line[index + 1:index + 2] == "'":
+                    index += 1   # a doubled apostrophe is an escaped one
+                else:
+                    quote = None
+        elif char in "\"'" and (previous == "" or previous in ":-,[{"):
+            quote = char
+        elif char == "#" and index and line[index - 1] in " \t":
+            break
+        elif char in "[{":
+            depth += 1
+        elif char in "]}":
+            depth -= 1
+        if not quote and not char.isspace():
+            previous = char
+        index += 1
+    return quote is None and depth == 0
+
+
 def permission_block(text, keys):
     """{key: [normalised lines]} of the top level front matter keys `keys` in `text`, or None when it cannot be judged: no front matter, not text, too
     large, or anything outside the plain subset of YAML that this reader understands (a quoted or merge key or any other column 0 line that is no plain
-    `key:`; an anchor, alias or tag; a repeated tracked key; a block scalar under a tracked key; a front matter closed anywhere but at column 0; a Unicode
+    `key:`; an anchor, alias or tag; a repeated tracked key; a block scalar under a tracked key; a front matter closed anywhere but at column 0; a quoted scalar or flow collection that does not close on its own line; a Unicode
     line break). The caller holds on None. A key's block is its line and every following line up to the next top level key; blank lines and comments at
     column 0 are dropped, line ends and trailing space are normalised. Two versions have the same permission block when these dicts are equal."""
     if not isinstance(text, str) or len(text) > NARROW_TEXT_MAX or any(mark in text for mark in _LINE_BREAKS):
@@ -312,7 +341,7 @@ def permission_block(text, keys):
     for line in lines[1:end]:
         if not line.strip():
             continue
-        if not line.lstrip().startswith("#") and _YAML_INDIRECTION.search(_YAML_QUOTED.sub('""', line)):
+        if not line.lstrip().startswith("#") and (_YAML_INDIRECTION.search(_YAML_QUOTED.sub('""', line)) or not _closed_on_its_line(line)):
             return None
         indented = line[0] in " \t"
         if not indented and line.startswith("#"):

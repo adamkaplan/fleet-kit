@@ -24114,10 +24114,18 @@ class TestImpactClassAndNarrowForm(LedgerBase):
         for label, text in (("a block scalar under a tracked key", "---\npermissions: |\n  # keep\n  x\n---\n"),
                             ("an anchor", "---\nx: &m subagent\nmode: *m\n---\n"), ("a tag", "---\nmode: !!str x\n---\n"),
                             ("a merge key", "---\n<<: *base\nmode: x\n---\n"), ("a repeated tracked key", "---\nmode: a\nmode: b\n---\n"),
-                            ("a closing line that is indented", "---\nmode: x\n  ---\nmode: y\n---\n"), ("a Unicode line break", "---\ndescription: x\u2028mode: y\n---\n")):
+                            ("a closing line that is indented", "---\nmode: x\n  ---\nmode: y\n---\n"),
+                            ("a quoted scalar left open across lines", "---\ndescription: 'x\nmode: subagent\nother: y'\n---\n"),
+                            ("a flow collection left open", "---\npermissions: {a: 1,\nmode: x}\n---\n"),
+                            ("a double quoted scalar left open", '---\ndescription: "x\nmode: y\n---\n'),
+                            ("a folded block scalar", "---\npermissions: >\n  x\n---\n"),
+                            ("a Unicode line break", "---\ndescription: x\u2028mode: y\n---\n")):
             self.assertIsNone(f.permission_block(text, keys), label)
         self.assertEqual(f.permission_block("---\ndescription: \"say *\" and 'a!b'\npermissions:\n  - {action: shell, resource: \"gh * view *\", effect: allow}\n---\n", keys),
                          {"permissions": ["permissions:", '  - {action: shell, resource: "gh * view *", effect: allow}']}, "quoted globs are not indirection")
+        self.assertEqual(f.permission_block("---\ndescription: the Chief of Staff's helper, it's fine\nmode: x # a comment with ' in it\n---\n", keys), {"mode": ["mode: x # a comment with ' in it"]},
+                         "an apostrophe inside a plain scalar or a comment is not a quote")
+        self.assertEqual(f.permission_block("---\npermissions:\n  - {action: read, resource: 'it''s', effect: allow}\n---\n", keys)["permissions"][1].count("it''s"), 1)
         self.assertNotEqual(f.permission_block("---\npermissions:\n  # keep\n  - x\n---\n", keys), f.permission_block("---\npermissions:\n  # kept\n  - x\n---\n", keys),
                             "a # line inside a tracked block is content")
 
