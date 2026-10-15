@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""git, with the network verbs' credentials routed through the fleet's gh shim.
+
+Git's global credential helper is whatever the machine set (often one stored github.com login), so `git push` from an agent's shell went out as that
+login and GitHub answered 403 for a repository another account owns. The fleet's `gh` shim already picks the right GitHub account for the caller's
+repository, from its session (the `gh_users` map). This shim is put first on an agent's PATH by the `fleet-hooks` plugin's shell hook, next to `gh`, so an agent
+keeps typing plain `git push` and the credential comes from `gh auth git-credential` (the shim: which fails closed when the account lookup fails or no account is mapped for the caller's repository).
+
+When `gh_users` is configured (and FLEET_GIT_SHIM is not `off`), for the NETWORK verbs only (push, fetch, pull, clone, ls-remote, `remote update|show|prune`) it puts, BEFORE the verb and after any global options,
+    -c credential.https://github.com.helper=                          (empty: reset the helper list for this host)
+    -c 'credential.https://github.com.helper=!gh auth git-credential'  (the fleet's gh)
+Everything else, and anything it does not understand, runs the real git with the arguments, standard input and exit status unchanged: this must
+never block a command. A caller that passes its own `-c credential.*` (or `--config-env=credential.*`) is left alone. No token is read, printed or
+put in an argument here: the helper does that, in git's own process. The real git is found by skipping this shim's own directory (never itself).
+"""
+import json
+import os
+import sys
+
+NETWORK_VERBS = {"push", "fetch", "pull", "clone", "ls-remote"}
+VALUE_OPTIONS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env", "--attr-source"}
+RESET_HELPER = "credential.https://github.com.helper="
+FLEET_HELPER = "credential.https://github.com.helper=!gh auth git-credential"
+
+
+def routing_wanted():
+    """Route only when per-repository accounts are in use (`gh_users` of the switchboard's config is not empty) and FLEET_GIT_SHIM is not `off`: a fleet with one
+    account, or none, keeps git's own credentials exactly as they were."""
+    if os.environ.get("FLEET_GIT_SHIM", "").strip().lower() == "off":
+        return False
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    try:
+        with open(os.path.join(base, "fleet-switchboard", "config.json")) as handle:
+            users = json.load(handle).get("gh_users")
+    except (OSError, ValueError, AttributeError):
+        return False
+    return isinstance(users, dict) and bool(users)
+
+
+def real_git():
+    """FLEET_REAL_GIT when set and executable, else the first executable named git on PATH that is not this shim (by directory and by file)."""
+    own_file = os.path.realpath(os.path.abspath(__file__))
+    own_dir = os.path.dirname(own_file)
+    override = os.environ.get("FLEET_REAL_GIT")
+    if override and os.path.isabs(override) and os.access(override, os.X_OK) and os.path.realpath(override) != own_file:
+        return override
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry or os.path.realpath(entry) == own_dir:
+            continue
+        candidate = os.path.join(entry, "git")
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK) and os.path.realpath(candidate) != own_file:
+            return candidate
+    return None
+
+
+def parse(args):
+    """(index of the verb or None, the global `-c`/`--config-env` settings given before it). Only git's own global options are skipped; an
+    option this does not know ends the search with no verb (the command then runs unchanged)."""
+    settings, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a in VALUE_OPTIONS:
+            if i + 1 >= len(args):
+                return None, settings
+            if a in ("-c", "--config-env"):
+                settings.append(args[i + 1])
+            i += 2
+        elif a.startswith("--config-env="):
+            settings.append(a.split("=", 1)[1])
+            i += 1
+        elif a.startswith("--") and "=" in a:
+            i += 1   # --git-dir=x, --exec-path=x, --work-tree=x ...
+        elif a.startswith("-"):
+            i += 1   # a global flag without a value (-p, -P, --no-pager, --bare, --paginate, ...)
+        else:
+            return i, settings
+    return None, settings
+
+
+def is_network(args, verb_at):
+    verb = args[verb_at]
+    if verb in NETWORK_VERBS:
+        return True
+    if verb == "remote":
+        rest = [a for a in args[verb_at + 1:] if not a.startswith("-")]
+        return bool(rest) and rest[0] in ("update", "show", "prune")
+    return False
+
+
+def routed(args):
+    """The arguments to give the real git."""
+    try:
+        verb_at, settings = parse(args)
+        if verb_at is None or not is_network(args, verb_at) or not routing_wanted():
+            return args
+        if any(s.split("=", 1)[0].strip().lower().startswith("credential.") for s in settings):
+            return args   # the caller chose its own credential configuration (any credential.* key opts out, for any host)
+        return args[:verb_at] + ["-c", RESET_HELPER, "-c", FLEET_HELPER] + args[verb_at:]
+    except Exception:
+        return args   # never let the routing stop a command
+
+
+def main(args):
+    git = real_git()
+    if git is None:
+        sys.stderr.write("git: not found on PATH (the fleet shim found no real git behind it)\n")
+        return 127
+    try:
+        os.execv(git, [git] + routed(args))
+    except OSError as err:
+        sys.stderr.write("git: cannot run %s (%s)\n" % (git, err.strerror or err))
+        return 126
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -108,7 +108,7 @@
   "as": "you",
   "code": 1,
   "err": "",
-  "out": "api#2: refused: no decision api#2 is waiting\n"
+  "out": "api#2: refused: no decision api#2 is waiting (a decision numbered 2 is listed as web#2)\n"
  },
  {
   "derived_after": {
