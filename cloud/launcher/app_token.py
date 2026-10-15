@@ -28,6 +28,7 @@ import urllib.request
 
 API = "https://api.github.com"
 MAX_TOKEN_SECONDS = 61 * 60
+MAX_BYTES = 1_000_000  # the most of any GitHub answer or vault command output that is read
 EXPECTED_PERMISSIONS = {"contents": "write", "pull_requests": "write", "metadata": "read"}
 
 
@@ -52,6 +53,8 @@ def vault(env_name, secret):
                 "--name", secret, "--query", "value", "-o", "tsv"]
     try:
         p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        if len(p.stdout) > MAX_BYTES:
+            die("the vault command for %s printed more than %d bytes" % (secret, MAX_BYTES))
     except (OSError, subprocess.TimeoutExpired):
         die("could not run the command for %s" % secret)
     val = p.stdout.strip() if secret != "cw-app-key" else p.stdout
@@ -111,8 +114,7 @@ def check_permissions(perms):
 
 def mint(target):
     """Return a token for target (OWNER/REPO), or exit through die(). Never prints."""
-    argv = [target]
-    repo = argv[0].split("/", 1)[1]
+    repo = target.split("/", 1)[1]
     app_id = vault("CW_APP_ID_CMD", "cw-app-id").strip()
     inst = vault("CW_APP_INSTALLATION_CMD", "cw-app-installation-id").strip()
     if not app_id.isdigit() or not inst.isdigit():
@@ -131,7 +133,10 @@ def mint(target):
                                           "User-Agent": "cw-app-token"})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
-            ans = json.load(r)
+            raw = r.read(MAX_BYTES + 1)
+        if len(raw) > MAX_BYTES:
+            die("the GitHub answer is larger than %d bytes" % MAX_BYTES)
+        ans = json.loads(raw)
     except urllib.error.HTTPError as e:
         die("GitHub refused the request (HTTP %d)" % e.code)
     except (OSError, ValueError):
@@ -143,7 +148,7 @@ def mint(target):
     if not isinstance(repos, list) or len(repos) != 1 or not isinstance(repos[0], dict) or repos[0].get("name") != repo:
         die("refusing: the token does not cover exactly the one target repository")
     full = repos[0].get("full_name")
-    if full is not None and full.lower() != argv[0].lower():
+    if full is not None and full.lower() != target.lower():
         die("refusing: the token does not cover exactly the one target repository")
     try:
         exp = dt.datetime.strptime(ans["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).timestamp()

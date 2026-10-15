@@ -37,6 +37,8 @@ class Stub(http.server.BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if Stub.fail == "badjson":
             return self.reply(200, b"<html>")
+        if Stub.fail == "huge":
+            return self.reply(200, b" " * 1_100_000 + b"{}")
         if Stub.fail and path.endswith(Stub.fail):
             return self.reply(500, {})
         if path == "/repos/" + REPO:
@@ -119,9 +121,15 @@ class Preflight(unittest.TestCase):
         Stub.fail = None
         self.assertEqual(self.run_pf(CW_PREFLIGHT_TOKEN_CMD="false").returncode, 2)
 
+    def test_a_huge_answer_or_a_full_page_of_rules_exits_2(self):
+        Stub.rules = ["x%d" % i for i in range(100)]
+        self.assertEqual(self.run_pf().returncode, 2)
+        Stub.fail = "huge"
+        self.assertEqual(self.run_pf().returncode, 2)
+
     def test_bad_usage_and_non_loopback_base(self):
         self.assertEqual(subprocess.run([sys.executable, PREFLIGHT], capture_output=True).returncode, 2)
-        self.assertNotEqual(self.run_pf(CW_GITHUB_API_BASE="http://example.com").returncode, 0)
+        self.assertEqual(self.run_pf(CW_GITHUB_API_BASE="http://example.com").returncode, 2)
 
     def test_a_planted_secret_in_the_token_command_env_appears_nowhere(self):
         planted = "planted-secret-value-9Lm"

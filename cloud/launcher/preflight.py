@@ -50,7 +50,10 @@ def get(base, path, token):
                                           "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "cw-preflight"})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
-            return json.load(r)
+            raw = r.read(app_token.MAX_BYTES + 1)
+        if len(raw) > app_token.MAX_BYTES:
+            raise Unreadable("the answer to GET %s is larger than %d bytes" % (path, app_token.MAX_BYTES))
+        return json.loads(raw)
     except urllib.error.HTTPError as e:
         raise Unreadable("GitHub refused GET %s (HTTP %d)" % (path, e.code))
     except (OSError, ValueError):
@@ -90,20 +93,26 @@ def main(argv):
         return 2
     target = argv[0]
     try:
-        base = app_token.api_base()
+        try:
+            base = app_token.api_base()
+        except SystemExit:  # already said why on stderr
+            raise Unreadable("the API base is refused")
         token = get_token(target)
         repo = get(base, "/repos/" + target, token)
         branch = branch or (repo.get("default_branch") if isinstance(repo, dict) else None)
         if not isinstance(branch, str) or not branch:
             raise Unreadable("the repository answer has no default branch")
         q = urllib.parse.quote(branch, safe="")
-        rules = get(base, "/repos/%s/rules/branches/%s" % (target, q), token)
+        rules = get(base, "/repos/%s/rules/branches/%s?per_page=100" % (target, q), token)
         info = get(base, "/repos/%s/branches/%s" % (target, q), token)
     except Unreadable as e:
         say("cannot read: %s" % e)
         return 2
     if not isinstance(rules, list) or not isinstance(info, dict):
         say("cannot read: unexpected answer shape")
+        return 2
+    if len(rules) >= 100:
+        say("cannot read: 100 or more rules apply; the answer may be paginated and is not read in full")
         return 2
     types = {r.get("type") for r in rules if isinstance(r, dict)}
     missing = [what for alts, what in NEED if not (types & set(alts.split("|")))]
