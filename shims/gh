@@ -353,6 +353,22 @@ def my_name(lookup=None):
         return "agent"
 
 
+def marker_is_off(args, lookup):
+    """True when the config's `gh_unmarked_repos` covers the ONE repository this write resolves to (logic in bin/gh_marker_switch.py, beside the checkout's bin/).
+    Fails toward the marker: a module that is missing or broken, any error, anything unclear is False."""
+    try:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "bin", "gh_marker_switch.py")
+        spec = importlib.util.spec_from_file_location("gh_marker_switch", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        if not module.entries(module.load_config()):
+            return False   # nothing configured: no identity read, no change
+        return module.marker_off(args, lookup.identity(), VALUE_FLAGS)
+    except Exception:
+        return False
+
+
 def sign(body, name):
     return body if SIGNED_RE.search(body) else body.rstrip("\n") + "\n\n" + MARK % name + "\n"
 
@@ -834,7 +850,8 @@ def main(args):
     args, over_found, over_reason = take_over_review(args)   # the shim's own flag never reaches gh or the signing
     lookup = Lookup(write=is_write(args))   # one identity lookup, one deadline, for the name and the account together
     try:
-        plan = signed_call(args, my_name(lookup)) if len(args) >= 3 and (args[0], args[1]) in SIGNED_COMMANDS else None
+        signing = len(args) >= 3 and (args[0], args[1]) in SIGNED_COMMANDS
+        plan = signed_call(args, my_name(lookup)) if signing and not marker_is_off(args, lookup) else None
     except Exception:
         plan = None  # never let signing stop the command
     refusal = review_probe(args, over_found, over_reason, lookup, gh)

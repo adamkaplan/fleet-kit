@@ -469,7 +469,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "chat_clear", "temp_janitor", "load_alert", "spotlight_guard", "excluded_repos", "source_budgets"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "chat_clear", "temp_janitor", "load_alert", "spotlight_guard", "excluded_repos", "source_budgets", "gh_unmarked_repos"}
 
 
 def config_known_keys():
@@ -552,6 +552,10 @@ def validate_config(raw, source="config"):
         raise ConfigError(str(err)) from None
     try:
         load_module("repo_exclusion").validate(config.get("excluded_repos"), source)
+    except ValueError as err:
+        raise ConfigError(str(err)) from None
+    try:
+        load_module("gh_marker_switch").validate(config.get("gh_unmarked_repos"), source)
     except ValueError as err:
         raise ConfigError(str(err)) from None
     if not isinstance(config["docker_reaper"], bool):

@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""test-gh-marker-switch: offline tests for the gh shim's per-repository marker switch (ask #417, bin/gh_marker_switch.py and shims/gh).
+A fake `gh` records the argv, files and stdin it is given; a fake switchboard answers `whoami --json`. No network.
+
+    bin/test-gh-marker-switch
+
+The last line printed is `RESULT: PASS` or `RESULT: FAIL`. Names are neutral: acme-org/widget-api and friends."""
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+ROOT = os.path.dirname(HERE)
+SHIM = os.path.join(ROOT, "shims", "gh")
+spec = importlib.util.spec_from_file_location("gh_marker_switch", os.path.join(HERE, "gh_marker_switch.py"))
+gms = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(gms)
+
+MARK = "fleet-switchboard:from="
+FAKE_GH = """#!/usr/bin/env python3
+import json, os, sys
+files = {a: open(a).read() for a in sys.argv[1:] if os.path.isfile(a)}
+json.dump({'argv': sys.argv[1:], 'stdin': None if sys.stdin.isatty() else sys.stdin.read(), 'files': files}, open(%r, 'w'))
+"""
+FAKE_SB = """#!/bin/sh
+[ "$1" = whoami ] || exit 2
+[ -n "$FAKE_WHO_EXIT" ] && exit $FAKE_WHO_EXIT
+if [ "$2" = --json ]; then echo "{\\"name\\": \\"worker\\", \\"repo\\": \\"${FAKE_REPO:-acme-org/widget-api}\\", \\"own\\": ${FAKE_OWN:-true}}"; else echo worker; fi
+"""
+
+
+class Rig(unittest.TestCase):
+    def setUp(self):
+        self.home = tempfile.mkdtemp(prefix="gms-")
+        self.addCleanup(shutil.rmtree, self.home, True)
+        self.bin = os.path.join(self.home, "realbin")
+        os.mkdir(self.bin)
+        self.log = os.path.join(self.home, "gh-log.json")
+        self.write_exec(os.path.join(self.bin, "gh"), FAKE_GH % self.log)
+        self.sb = os.path.join(self.home, "sb")
+        self.write_exec(self.sb, FAKE_SB)
+        subprocess.run([self.sb, "whoami", "--json"], capture_output=True, timeout=60)
+
+    @staticmethod
+    def write_exec(path, text):
+        with open(path, "w") as handle:
+            handle.write(text)
+        os.chmod(path, 0o755)
+
+    def config(self, value, raw=None):
+        path = os.path.join(self.home, ".config", "fleet-switchboard", "config.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as handle:
+            handle.write(raw if raw is not None else json.dumps({"gh_unmarked_repos": value} if value is not None else {}))
+
+    def shim(self, *args, stdin="", env=None):
+        environ = {"PATH": "%s:%s:/usr/bin:/bin" % (os.path.dirname(SHIM), self.bin), "HOME": self.home, "FLEET_SWITCHBOARD_BIN": self.sb,
+                   "FLEET_SHIM_LOOKUP_SECONDS": "10"}
+        environ.update(env or {})
+        if os.path.exists(self.log):
+            os.unlink(self.log)
+        done = subprocess.run([sys.executable, SHIM, *args], input=stdin, capture_output=True, text=True, env=environ, timeout=60)
+        with open(self.log) as handle:
+            return json.load(handle)
+
+    def body_of(self, seen):
+        return " ".join([a for a in seen["argv"]] + list(seen["files"].values()) + [seen["stdin"] or ""])
+
+    def marked(self, *args, **kwargs):
+        return MARK in self.body_of(self.shim(*args, **kwargs))
+
+
+class TestSwitch(Rig):
+    def test_s1_a_configured_repository_gets_no_marker_on_all_three_writes(self):
+        self.config(["acme-org/widget-api"])
+        for args in (("issue", "comment", "3", "--body", "hi", "-R", "acme-org/widget-api"),
+                     ("pr", "create", "--title", "t", "--body", "hi", "--repo", "acme-org/widget-api"),
+                     ("issue", "create", "--title", "t", "--body", "hi")):   # no -R: the caller's own repository
+            self.assertFalse(self.marked(*args), args)
+
+    def test_s1_the_body_file_and_stdin_forms_reach_gh_untouched(self):
+        self.config(["acme-org/widget-api"])
+        path = os.path.join(self.home, "body.md")
+        with open(path, "w") as handle:
+            handle.write("from a file")
+        seen = self.shim("issue", "comment", "3", "-F", path)
+        self.assertEqual(seen["argv"][-1], path)
+        self.assertEqual(seen["files"][path], "from a file")
+        seen = self.shim("issue", "comment", "3", "-F", "-", stdin="from stdin")
+        self.assertEqual(seen["stdin"], "from stdin")
+
+    def test_s2_an_owner_wildcard_covers_every_repository_of_the_owner_and_no_other(self):
+        self.config(["acme-org/*"])
+        self.assertFalse(self.marked("issue", "comment", "1", "--body", "x", "-R", "acme-org/widget-api"))
+        self.assertFalse(self.marked("issue", "comment", "1", "--body", "x", "-R", "acme-org/widget-web"))
+        self.assertTrue(self.marked("issue", "comment", "1", "--body", "x", "-R", "other-org/widget-api"))
+
+    def test_s3_nothing_configured_or_an_unreadable_config_keeps_the_marker(self):
+        for value, raw in ((None, None), (None, "{not json"), (None, "[]"), (None, json.dumps({"gh_unmarked_repos": "acme-org/widget-api"})),
+                           (None, json.dumps({"gh_unmarked_repos": {"acme-org/widget-api": True}})), ([], None)):
+            self.config(value, raw)
+            self.assertTrue(self.marked("issue", "comment", "1", "--body", "x", "-R", "acme-org/widget-api"), raw)
+        os.unlink(os.path.join(self.home, ".config", "fleet-switchboard", "config.json"))
+        self.assertTrue(self.marked("issue", "comment", "1", "--body", "x"))
+
+    def test_s7_a_repository_that_is_not_configured_keeps_the_marker(self):
+        self.config(["acme-org/widget-web"])
+        self.assertTrue(self.marked("issue", "comment", "1", "--body", "x"))
+        self.assertTrue(self.marked("issue", "comment", "1", "--body", "x", "-R", "acme-org/widget-api"))
+
+    def test_s4_a_body_that_already_holds_a_marker_is_left_as_written(self):
+        self.config(["acme-org/widget-api"])
+        body = "hello\n\n<!-- %selsewhere -->\n" % MARK
+        seen = self.shim("issue", "comment", "1", "--body", body)
+        self.assertEqual(seen["argv"][4], body)
+
+    def test_the_marker_is_added_as_before_where_it_is_not_switched_off(self):
+        self.config(["acme-org/widget-web"])
+        seen = self.shim("issue", "comment", "1", "--body", "x")
+        self.assertEqual(seen["argv"][4], "x\n\n<!-- %sworker -->\n" % MARK)
+
+
+class TestHostile(Rig):
+    """Anything unclear keeps the marker (fail closed); only a certain match turns it off."""
+
+    def test_spellings_of_the_same_repository_match(self):
+        self.config(["acme-org/widget-api"])
+        for spelling in ("ACME-ORG/Widget-API", "acme-org/widget-api.git", "https://github.com/acme-org/widget-api",
+                         "https://github.com/acme-org/widget-api/", "https://github.com/Acme-Org/widget-api/issues/4"):
+            self.assertFalse(self.marked("issue", "comment", "1", "--body", "x", "-R", spelling), spelling)
+        self.assertFalse(self.marked("issue", "comment", "1", "--body", "x", "--repo=ACME-ORG/widget-api"))
+        self.assertFalse(self.marked("issue", "comment", "1", "--body", "x", "-Racme-org/widget-api"))
+        self.assertFalse(self.marked("issue", "comment", "https://github.com/acme-org/widget-api/issues/9", "--body", "x"))
+
+    def test_look_alikes_whitespace_and_path_variants_keep_the_marker(self):
+        self.config(["acme-org/widget-api", "acme-org/*"])
+        self.config(["acme-org/widget-api"])
+        for spelling in (" acme-org/widget-api", "acme-org/widget-api ", "acme-org/widget-api\n", "acme-org /widget-api", "acme-org//widget-api",
+                         "acme-org/widget-api/", "/acme-org/widget-api", "acme-org/widget-api/extra", "acme-org/widget-api.git.git", "./acme-org/widget-api",
+                         "acme-org/widget-apı", "acme-org/widget-api", "аcme-org/widget-api",   # a dotless i, a Cyrillic a
+                         "\uff41cme-org/widget-api", "github.com/acme-org/widget-api", "https://ghe.example.com/acme-org/widget-api",
+                         "http://github.com/acme-org/widget-api", "https://github.com/acme-org/widget-api/tree/main", "acme-org/widget-api\u200b", "", "acme-org", "*/*"):
+            if spelling == "acme-org/widget-api":
+                continue   # the plain spelling is the match itself (listed twice above only to keep the look-alikes visible)
+            self.assertTrue(self.marked("issue", "comment", "1", "--body", "x", "-R", spelling), repr(spelling))
+
+    def test_two_different_repositories_named_or_an_unreadable_one_keep_the_marker(self):
+        self.config(["acme-org/*"])
+        self.assertTrue(self.marked("issue", "comment", "1", "--body", "x", "-R", "acme-org/widget-api", "--repo", "other-org/x"))
+        self.assertTrue(self.marked("issue", "comment", "https://github.com/other-org/x/issues/1", "--body", "x", "-R", "acme-org/widget-api"))
+        self.assertTrue(self.marked("issue", "comment", "1", "--body", "x", "-R"))
+
+    def test_a_body_or_title_that_looks_like_a_flag_is_never_read_as_a_repository(self):
+        self.config(["acme-org/widget-api"])
+        self.assertTrue(self.marked("issue", "comment", "1", "-R", "other-org/x", "--body", "--repo=acme-org/widget-api"))
+        self.assertTrue(self.marked("issue", "create", "-R", "other-org/x", "--title", "-R", "--body", "acme-org/widget-api"))
+        self.assertTrue(self.marked("issue", "comment", "1", "-R", "other-org/x", "--body", "https://github.com/acme-org/widget-api/issues/1"))
+
+    def test_gh_repo_in_the_environment_is_a_named_repository(self):
+        self.config(["acme-org/widget-api"])
+        self.assertTrue(self.marked("issue", "comment", "1", "--body", "x", env={"GH_REPO": "other-org/x"}))
+        self.assertFalse(self.marked("issue", "comment", "1", "--body", "x", env={"GH_REPO": "acme-org/widget-api"}))
+        self.assertTrue(self.marked("issue", "comment", "1", "--body", "x", env={"GH_REPO": "acme-org/widget-api "}))
+
+    def test_the_callers_repository_is_used_only_when_it_is_its_own_and_known(self):
+        self.config(["acme-org/widget-api"])
+        self.assertTrue(self.marked("issue", "comment", "1", "--body", "x", env={"FAKE_REPO": "other-org/x"}))
+        self.assertTrue(self.marked("issue", "comment", "1", "--body", "x", env={"FAKE_OWN": "false"}))   # only the default repository: not the caller's
+        self.assertTrue(self.marked("issue", "comment", "1", "--body", "x", env={"FAKE_WHO_EXIT": "3"}))   # the lookup failed
+        self.assertTrue(self.marked("issue", "comment", "1", "--body", "x", env={"FAKE_REPO": "acme-org/widget-api\\n"}))
+        self.assertTrue(self.marked("issue", "comment", "1", "--body", "x", env={"FLEET_SWITCHBOARD_BIN": os.path.join(self.home, "missing")}))
+
+    def test_a_broken_or_missing_module_keeps_the_marker(self):
+        self.config(["acme-org/widget-api"])
+        copy = os.path.join(self.home, "kit")
+        os.makedirs(os.path.join(copy, "shims"))
+        shutil.copy(SHIM, os.path.join(copy, "shims", "gh"))
+        environ = {"PATH": "%s:/usr/bin:/bin" % self.bin, "HOME": self.home, "FLEET_SWITCHBOARD_BIN": self.sb, "FLEET_SHIM_LOOKUP_SECONDS": "10"}
+        subprocess.run([sys.executable, os.path.join(copy, "shims", "gh"), "issue", "comment", "1", "--body", "x"], env=environ, capture_output=True, timeout=60)
+        with open(self.log) as handle:
+            self.assertIn(MARK, handle.read())
+        os.makedirs(os.path.join(copy, "bin"))
+        with open(os.path.join(copy, "bin", "gh_marker_switch.py"), "w") as handle:
+            handle.write("raise RuntimeError('broken')\n")
+        subprocess.run([sys.executable, os.path.join(copy, "shims", "gh"), "issue", "comment", "1", "--body", "x"], env=environ, capture_output=True, timeout=60)
+        with open(self.log) as handle:
+            self.assertIn(MARK, handle.read())
+
+    def test_commands_that_are_not_issue_or_pr_writes_are_not_changed(self):
+        self.config(["acme-org/widget-api"])
+        seen = self.shim("api", "repos/acme-org/widget-api/issues/1/comments", "-f", "body=x")
+        self.assertNotIn(MARK, self.body_of(seen))
+        self.assertTrue(self.marked("pr", "review", "1", "--body", "x", env={"FAKE_REPO": "other-org/x"}))
+
+
+class TestValidator(unittest.TestCase):
+    def test_a_good_list_and_absent_pass(self):
+        gms.validate(None, "c")
+        gms.validate([], "c")
+        gms.validate(["acme-org/widget-api", "acme-org/*"], "c")
+
+    def test_a_bad_list_is_refused_naming_the_key(self):
+        for bad in ("acme-org/x", {"a": 1}, [1], ["acme-org"], ["*/*"], ["*"], ["acme-org/x\n"], ["acme-org/x", "ACME-ORG/X"], ["acme-org/x y"],
+                    ["acmé/x"], ["../x"], ["acme-org/x"] * 201, [None]):
+            with self.assertRaises(ValueError, msg=repr(bad)) as caught:
+                gms.validate(bad, "config")
+            self.assertIn("gh_unmarked_repos", str(caught.exception))
+
+    def test_the_switchboard_loads_the_key_and_refuses_a_bad_one(self):
+        import importlib.machinery
+        sb = importlib.machinery.SourceFileLoader("fleet_switchboard_gms", os.path.join(HERE, "fleet-switchboard"))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader("fleet_switchboard_gms", sb))
+        sys.modules["fleet_switchboard_gms"] = module
+        sb.exec_module(module)
+        self.assertEqual(module.validate_config({"gh_unmarked_repos": ["acme-org/*"]})["gh_unmarked_repos"], ["acme-org/*"])
+        with self.assertRaises(module.ConfigError):
+            module.validate_config({"gh_unmarked_repos": ["acme-org"]})
+
+
+class TestHygiene(unittest.TestCase):
+    def test_the_docs_name_the_key_and_the_files_carry_no_private_name(self):
+        with open(os.path.join(ROOT, "docs", "switchboard.md")) as handle:
+            self.assertIn("gh_unmarked_repos", handle.read())
+        checker = os.path.join(HERE, "check-public-names")
+        done = subprocess.run([sys.executable, checker], cwd=ROOT, capture_output=True, text=True, timeout=120)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+
+if __name__ == "__main__":
+    result = unittest.main(exit=False, verbosity=1).result
+    print("RESULT: PASS" if result.wasSuccessful() else "RESULT: FAIL")
+    sys.exit(0 if result.wasSuccessful() else 1)
