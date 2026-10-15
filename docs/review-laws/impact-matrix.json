@@ -147,6 +147,11 @@
       "authority": [
         "bin/plan_ledger.py",
         "bin/impact_floor.py",
+        "bin/chat_clear.py",
+        "bin/clear_carry.py",
+        "bin/reassign.py",
+        "bin/launch_testers.py",
+        "bin/plan_review.py",
         "docs/review-laws/impact-matrix.json",
         "plugins/fleet-hooks/**",
         "tools/cos-permissions-proof/**",
@@ -176,6 +181,11 @@
           "tools/cos-permissions-proof/**",
           "bin/plan_ledger.py",
           "bin/impact_floor.py",
+          "bin/chat_clear.py",
+          "bin/clear_carry.py",
+          "bin/reassign.py",
+          "bin/launch_testers.py",
+          "bin/plan_review.py",
           "docs/review-laws/impact-matrix.json"
         ],
         "exclude": [
@@ -197,6 +207,42 @@
       ".github/workflows/**",
       "bin/switchboard-trial"
     ],
+    "authority_modules": {
+      "meaning": "Every module in bin/ that defines a function whose name has a word of `vocabulary` (names split at underscores) decides who may clear, hold, release, carry, consent to, record a verdict for or merge something, so it must be a top tier path above or be named in `exempt` with the reason it is not. A test reads this block and fails, naming the module, when a module is neither. The vocabulary is data: adding a word here widens the guard with no code change.",
+      "vocabulary": [
+        "clear",
+        "clearing",
+        "hold",
+        "holds",
+        "release",
+        "carry",
+        "consent",
+        "verdict",
+        "authority",
+        "owner",
+        "gate",
+        "gates",
+        "approve",
+        "approved",
+        "allow",
+        "allowed",
+        "allows",
+        "may",
+        "merge",
+        "merged",
+        "waive",
+        "waiver"
+      ],
+      "exempt": {
+        "bin/decision_core.py": "answer_authority only orders the roles that may answer a decision (a tier ladder); clearing a hold, carrying a clear and merging are decided elsewhere. The module is large and generic: listing it would hold every decision change for the owner. Revisit if it ever decides a clear.",
+        "bin/spotlight_guard.py": "holds_files tells whether a folder holds an entry; no authority.",
+        "bin/triage_digest.py": "gate is a rate limit on digests (warm-up and interval); no authority.",
+        "bin/triage_plan_open.py": "merged_links reads which links a text names; it decides nothing about who may merge.",
+        "bin/charter_check.py": "decides which issue is a charter and which repository may be touched by a move or an order copy; the Chief-of-Staff-only rule lives in the commands that use it. It decides no clear, hold or merge.",
+        "bin/lanes.py": "moves an ask between charters; the caller rule is in the command. No clear, hold or merge.",
+        "bin/orders_copy.py": "copies standing orders between charters; the caller rule is in the command. No clear, hold or merge."
+      }
+    },
     "note": "top_tier_outside_floor lists the top tier paths that are deliberately not in the floor globs (the floor excludes agent definitions, which are captain pull requests); a test checks that every other top tier path is inside the floor. bin/fleet-switchboard selects accounts and mints tokens but is not a top tier path (it would hold nearly every change): a change there to credentials or identity must be rated with that class by the independent review."
   }
 }
