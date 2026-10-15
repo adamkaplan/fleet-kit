@@ -49,8 +49,10 @@ def read_state(v2, session_id, active=None, last_message=None):
     `("missing", ...)`: the session is gone, which is not a state of a worker."""
     try:
         if active is None:
-            active = v2.session_active() or {}
-        entry = active.get(session_id) if isinstance(active, dict) else None
+            active = v2.session_active()
+        if not isinstance(active, dict):   # a list, a string or null is an answer nobody can read: never idle
+            return UNKNOWN, "the service answered session.active with something unreadable"
+        entry = active.get(session_id)
         permissions = forms = None
         if entry:   # the lists matter only while it runs: an idle session cannot be waiting for an answer
             permissions, forms = v2.permission_list(session_id), v2.form_list(session_id)

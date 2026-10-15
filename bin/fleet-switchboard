@@ -3043,10 +3043,13 @@ class Observation:
         return self.last_human_prompt is not None and now - self.last_human_prompt < window
 
     def to_json(self):
-        return {"name": self.name, "session": self.session_id, "pane": self.pane, "headless": self.headless, "status": self.status,
-                "fleet": self.fleet, "idle_at": iso(self.idle_at), "outcome": self.outcome,
-                "last_human_prompt": iso(self.last_human_prompt), "problem": self.problem,
-                "wrong_program": self.wrong_program, "conflict": self.conflict}
+        out = {"name": self.name, "session": self.session_id, "pane": self.pane, "status": self.status,
+               "fleet": self.fleet, "idle_at": iso(self.idle_at), "outcome": self.outcome,
+               "last_human_prompt": iso(self.last_human_prompt), "problem": self.problem,
+               "wrong_program": self.wrong_program, "conflict": self.conflict}
+        if self.headless:   # present only for a headless worker: a terminal-only fleet's output is what it always was
+            out["headless"] = True
+        return out
 
 
 class Discovery:
@@ -4082,7 +4085,9 @@ class Switchboard:
             return
         active, down = None, None
         try:
-            active = self.v2.session_active() or {}
+            active = self.v2.session_active()
+            if not isinstance(active, dict):   # a list, a string or null cannot be read: unknown, never idle
+                active, down = None, "session.active answered something unreadable"
         except V2Error as err:
             down = _one_line(str(err), 100)
         for record in records:

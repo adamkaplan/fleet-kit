@@ -11368,6 +11368,31 @@ class TestHeadlessPresence(Base):
         self.world.v2.down = False
         self.assertEqual(self.discover().agents["hw"].status, "idle", "back as soon as the service answers")
 
+    def test_an_active_answer_that_is_not_a_dict_is_unknown_never_idle(self):
+        sid = self.headless()
+        class Stub:
+            def __init__(self, answer):
+                self.answer = answer
+            def session_active(self):
+                return self.answer
+        for answer in ([], ["x"], "running", None, 7):
+            state, why = self.ap.read_state(Stub(answer), sid)
+            self.assertEqual(state, "unknown", repr(answer))
+            self.assertIn("unreadable", why)
+        self.assertEqual(self.ap.read_state(Stub({}), sid)[0], "idle", "an empty dict is a real answer: nothing is active")
+        original = self.world.v2.op_session_active
+        for answer in ([], "x", None):
+            self.world.v2.op_session_active = lambda params, body, answer=answer: answer
+            found = self.discover().agents["hw"]
+            self.assertEqual(found.status, "unknown", repr(answer))
+        self.world.v2.op_session_active = original
+
+    def test_a_terminal_only_fleet_has_no_headless_key_and_a_headless_worker_has_it(self):
+        sid = self.headless()
+        agents = self.discover().agents
+        self.assertIs(agents["hw"].to_json()["headless"], True)
+        self.assertNotIn("headless", agents["boss"].to_json(), "a terminal worker's JSON is what it was before")
+
     def test_a_record_alone_is_not_presence_the_session_must_exist_and_carry_the_workers_name(self):
         self.headless(name="gone")
         del self.world.v2.sessions[next(iter(s for s, v in self.world.v2.sessions.items() if v["metadata"]["fleet"]["name"] == "gone"))]
