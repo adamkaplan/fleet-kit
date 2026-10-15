@@ -89,8 +89,8 @@ def save_record(state, name, session, url, now=None):
     it was launched: informational only, NEVER used to send a request (discovery goes through the switchboard's own service client)."""
     if not isinstance(session, str) or not session.startswith("ses_") or len(session) > 128:
         raise ValueError("not a session id")
-    if not isinstance(url, str) or not LOOPBACK_URL_RE.match(url):
-        raise ValueError("a local worker's url is plain http to a loopback address")
+    if url is not None and (not isinstance(url, str) or not LOOPBACK_URL_RE.match(url)):
+        raise ValueError("a local worker's url is plain http to a loopback address (or none)")
     path = record_path(state, name)
     body = {"worker": name, "url": url, "session": session, "kind": LOCAL, "created": int(now if now is not None else time.time())}
     temp = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))

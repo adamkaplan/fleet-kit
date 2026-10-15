@@ -1455,6 +1455,17 @@ class V2Http:
             return True   # not ours to signal, so it exists
         return True
 
+    def base_url(self):
+        """`http://host:port` of the service (never the password), or None when the service file cannot be read."""
+        with self._lock:
+            try:
+                if self._info is None:
+                    self._load()
+                host, port, _ = self._info
+                return "http://%s:%d" % (host if ":" not in host else "[%s]" % host, port)
+            except Exception:
+                return None
+
     def _load(self):
         try:
             parent = os.lstat(str(self.file.parent))
@@ -1915,6 +1926,10 @@ class V2Client:
     def _limit(limit):
         """A page of a transcript is never larger than V2_READ_LIMIT_MAX messages, whatever a caller asks."""
         return min(limit, V2_READ_LIMIT_MAX) if isinstance(limit, int) and not isinstance(limit, bool) else limit
+
+    def service_url(self):
+        """Where the service is, `http://127.0.0.1:<port>`, or None (the CLI transport, or no readable service file)."""
+        return self.http.base_url() if self.http is not None and hasattr(self.http, "base_url") else None
 
     def server_info(self):
         return self._call("server.info")
@@ -5615,8 +5630,8 @@ def launch_agent_problem(config, runner, agent):
             "(primary agents registered: %s). Install its definition, restart the service, and check it with `fleet-switchboard agents verify`" % (agent, known))
 
 
-def launch_problems(name, agent, directory, workspace, issue, charter=None):
-    """Why these launch arguments cannot be used (empty when they can)."""
+def launch_problems(name, agent, directory, workspace, issue, charter=None, headless=False):
+    """Why these launch arguments cannot be used (empty when they can). A headless worker has no terminal, so it needs no workspace."""
     problems = []
     if not NAME_RE.match(name or ""):
         problems.append("name must match %s (lower case, digits, - and _), got %r" % (NAME_RE.pattern, name))
@@ -5626,7 +5641,7 @@ def launch_problems(name, agent, directory, workspace, issue, charter=None):
         problems.append("--agent is required")
     if not directory or not os.path.isabs(directory) or not os.path.isdir(directory):
         problems.append("--dir must be an absolute path of an existing directory, got %r" % directory)
-    if not workspace:
+    if not workspace and not headless:
         problems.append("no target workspace: pass --workspace or run from a herdr pane")
     if issue is not None and not (isinstance(issue, int) and not isinstance(issue, bool) and issue >= 1):
         problems.append("--issue must be an issue number, got %r" % (issue,))
@@ -5768,21 +5783,72 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
         left = close_own_pane(engine, name, pane, "launch failed: %s" % _one_line(str(err), 120)) if pane \
             else "no pane was opened"
         raise LaunchError("%s (session %s was created; %s)" % (_one_line(str(err)), session_id, left)) from err
-    if engine.state_dir is not None:   # a launch into a linked worktree records it, so retire and a done report can reclaim it later
-        try:
-            found = worktree_of_directory(subprocess.run, directory)
-            if found is not None:
-                done = register_worktree(engine.state_dir, found[0], name, repo, found[1], engine.now())
-                if isinstance(done, str):   # already claimed by another agent: never taken over
-                    engine._note("worktree.error", name, {"error": "the worktree %s is already registered to %s: %s does not claim it and will not reclaim it" % (found[0], done, name)})
-                elif done is True:
-                    if engine.audit is not None:
-                        engine.audit.append(engine.actor, "worktree.registered", name, {"path": found[0], "branch": found[1], "repo": repo, "by": "launch"})
-                else:   # it will not be reclaimed later: say so now
-                    engine._note("worktree.error", name, {"error": "the worktree %s could not be recorded in the registry: it will not be reclaimed automatically" % found[0]})
-        except Exception as err:
-            engine._note("worktree.error", name, {"error": _one_line(str(err), 120)})
+    register_launch_worktree(engine, name, directory, repo)
     return {"name": name, "session": session_id, "pane": pane, "tab": opened["tab_id"]}
+
+
+def register_launch_worktree(engine, name, directory, repo):
+    """A launch into a linked worktree records it, so retire and a done report can reclaim it later. Never raises."""
+    if engine.state_dir is None:
+        return
+    try:
+        found = worktree_of_directory(subprocess.run, directory)
+        if found is not None:
+            done = register_worktree(engine.state_dir, found[0], name, repo, found[1], engine.now())
+            if isinstance(done, str):   # already claimed by another agent: never taken over
+                engine._note("worktree.error", name, {"error": "the worktree %s is already registered to %s: %s does not claim it and will not reclaim it" % (found[0], done, name)})
+            elif done is True:
+                if engine.audit is not None:
+                    engine.audit.append(engine.actor, "worktree.registered", name, {"path": found[0], "branch": found[1], "repo": repo, "by": "launch"})
+            else:   # it will not be reclaimed later: say so now
+                engine._note("worktree.error", name, {"error": "the worktree %s could not be recorded in the registry: it will not be reclaimed automatically" % found[0]})
+    except Exception as err:
+        engine._note("worktree.error", name, {"error": _one_line(str(err), 120)})
+
+
+def launch_headless(engine, name, agent, directory, role=None, reports_to=None, issue=None, brief=None, charter=None, repo=None):
+    """Create a fleet agent with NO terminal (#433): a v2 session in the OpenCode service, a private record (state-dir/headless/<name>.json) and the
+    brief through the API. Nothing is opened in herdr. Presence is proved by the service: the new session must answer and carry the worker's name
+    before the brief is sent. Returns {"name", "session", "pane": None, "tab": None, "headless": True}.
+
+    What differs from a terminal worker, and is said in the docs: its tools run in the SERVICE's environment, not in a pane's. There is no
+    per-worker environment (no GH_TOKEN of its repo's account, no view variables); it is identified by the OPENCODE_SESSION_ID the service sets for
+    its tools, and the gh shim picks its account from the session's stored repo."""
+    problems = launch_problems(name, agent, directory, None, issue, charter, headless=True)
+    if problems:
+        raise LaunchError("; ".join(problems))
+    if engine.state_dir is None:
+        raise LaunchError("no state directory: a headless worker needs its record")
+    taken = engine.discover(engine.now()).agents.get(name)
+    if taken is not None:
+        raise LaunchError("a fleet agent named %s already exists (%s)" % (name, "headless" if taken.headless else "in pane %s" % taken.pane))
+    ap = load_agent_presence()
+    if ap.read_record(engine.state_dir, name)[0] is not None:
+        raise LaunchError("a headless record for %s already exists: `%s retire %s` first, or pick another name" % (name, PROG, name))
+    accounts = getattr(engine, "accounts", None)
+    if repo and accounts is not None:
+        problem = launch_account_problem(engine.config, accounts, repo)
+        if problem:
+            raise LaunchError(problem)
+    fleet = fleet_record(name, role, reports_to, issue, charter, repo)
+    fleet["headless"] = True
+    with engine._external("v2.session.create", name, {"agent": agent, "directory": directory, "fleet": fleet, "headless": True}) as result:
+        session_id = engine.v2.session_create(agent, name, directory, {"fleet": fleet})["id"]
+        result["session"] = session_id
+    try:
+        ap.save_record(engine.state_dir, name, session_id, engine.v2.service_url(), now=engine.now())
+        info = engine.v2.session_get(session_id) or {}
+        if ((_fleet_meta(info) or {}).get("name")) != name:
+            raise LaunchError("the service does not show the new session as %s: nothing was sent" % name)
+        if brief:
+            send_brief(engine, name, session_id, brief)
+    except Exception as err:
+        raise LaunchError("%s (session %s was created and its record kept, so `%s status` shows it: send it its brief with `%s send`, or `%s retire %s`)" % (
+            _one_line(str(err)), session_id, PROG, PROG, PROG, name)) from err
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, "headless.launched", name, {"session": session_id, "agent": agent, "directory": _one_line(directory, 160), "brief_chars": len(brief or "")})
+    register_launch_worktree(engine, name, directory, repo)
+    return {"name": name, "session": session_id, "pane": None, "tab": None, "headless": True}
 
 
 def resume_agent(engine, name, session_id, workspace, patience=LAUNCH_PATIENCE, sleep=time.sleep, replace=False):
@@ -6481,8 +6547,10 @@ def cmd_retire(args, runner, now):
     reason = " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", args.reason or "").split())[:200]
     seen = discovery.agents.get(name)
     known = read_pane_health(state)["agents"].get(name) or {}
-    close_pane, close_by = None, None
-    if getattr(args, "close", False) and not args.undo:
+    close_pane, close_by, close_note = None, None, None
+    if getattr(args, "close", False) and not args.undo and seen is not None and seen.headless:
+        close_note = "headless: it has no terminal, so there is nothing to close"
+    elif getattr(args, "close", False) and not args.undo:
         close_pane, why = retire_close_problem(engine, runner, now, discovery, name, seen, getattr(args, "force", False))
         close_by = identify_who(engine, runner, now)
         if why:
@@ -6530,7 +6598,9 @@ def cmd_retire(args, runner, now):
         pass
     if engine.audit is not None:
         engine.audit.append(engine.actor, "fleetpane.retired", name, {"auto": False, "reason": retired[name]["reason"], "by": retired[name]["by"]})
-    if close_pane is not None:
+    if close_note is not None:
+        print("%s is retired: not watched, not reattached by --all-detached; %s (`%s retire --undo %s` reverses the retirement)" % (name, close_note, PROG, name))
+    elif close_pane is not None:
         line, _ = retire_close_pane(engine, runner, now, name, close_pane, close_by, getattr(args, "force", False))
         print("%s is retired: not watched, not reattached by --all-detached; %s (`%s retire --undo %s` reverses the retirement)" % (name, line, PROG, name))
     else:
@@ -14840,6 +14910,8 @@ def cmd_launch(args, runner, now, socket_call=None):
         return EXIT_OK
     if not args.agent or not args.dir:
         raise LaunchError("--agent and --dir are required (or --resume SESSION for an existing agent)")
+    if getattr(args, "headless", False) and (args.workspace or args.new_workspace):
+        raise LaunchError("--headless opens no terminal, so it takes no --workspace or --new-workspace (`%s watch NAME` opens one later)" % PROG)
     if (args.name or "").startswith(LANE_NAME_PREFIX):
         raise LaunchError("names starting %r are the plan review engine's reviewer lanes: only it launches them" % LANE_NAME_PREFIX)
     repo = launch_repo(args)
@@ -14866,8 +14938,12 @@ def cmd_launch(args, runner, now, socket_call=None):
             created = workspace = result["workspace"] = engine.herdr.workspace_create(
                 args.dir, args.new_workspace, focus=False)["workspace_id"]
     try:
-        done = launch_agent(engine, args.name, args.agent, args.dir, workspace, args.role, args.reports_to,
-                            None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo)
+        if getattr(args, "headless", False):
+            done = launch_headless(engine, args.name, args.agent, args.dir, args.role, args.reports_to,
+                                   None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo)
+        else:
+            done = launch_agent(engine, args.name, args.agent, args.dir, workspace, args.role, args.reports_to,
+                                None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo)
     except LaunchError as err:
         if created:
             raise LaunchError("%s (workspace %s was created and is left for you to close)" % (err, created)) from err
@@ -23072,6 +23148,8 @@ def build_parser():
     launch.add_argument("--dir", help="The agent's working directory (absolute)")
     launch.add_argument("--resume", metavar="SESSION", help="Open a tab on this existing session of NAME instead "
                                                            "of creating one (a restart that keeps the conversation)")
+    launch.add_argument("--headless", action="store_true", help="Start the worker with NO terminal: a session in the OpenCode service, the brief sent through "
+                        "the API (about 2 MB instead of a terminal's 200 to 400 MB). Its tools run in the service's environment; opt in")
     launch.add_argument("--workspace", help="The herdr workspace for the new tab (default: $HERDR_WORKSPACE_ID)")
     launch.add_argument("--role", help="metadata.fleet.role")
     launch.add_argument("--reports-to", dest="reports_to", help="metadata.fleet.reports_to")

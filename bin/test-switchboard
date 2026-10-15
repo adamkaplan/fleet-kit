@@ -11516,6 +11516,77 @@ class TestHeadlessPresence(Base):
         self.assertIn("not the user's own real directory", problems[0])
         self.assertIsNone(self.ap.load_record(self.world.state, "w000"))
 
+    def launch_hl(self, **overrides):
+        args = dict(name="hw", agent="coder", directory=str(self.home), role="coder", reports_to="boss", issue=9, brief="Add a health check")
+        args.update(overrides)
+        return sb.launch_headless(self.engine, **args)
+
+    def test_launch_headless_creates_the_session_and_its_record_sends_the_brief_and_opens_no_terminal(self):
+        panes_before, calls_before = dict(self.world.herdr.panes), list(self.world.herdr.socket_calls)
+        done = self.launch_hl()
+        self.assertEqual((done["name"], done["pane"], done["tab"], done["headless"]), ("hw", None, None, True))
+        session = self.world.v2.sessions[done["session"]]
+        self.assertEqual(session["metadata"]["fleet"], {"name": "hw", "role": "coder", "reports_to": "boss", "issue": 9, "headless": True})
+        self.assertEqual((session["agent"], session["directory"], session["title"]), ("coder", str(self.home), "hw"))
+        self.assertEqual(self.world.herdr.panes, panes_before, "no pane appeared")
+        self.assertEqual(self.world.herdr.socket_calls, calls_before, "herdr was asked for no layout, tab or pane")
+        brief = [m for m in session["messages"] if m["type"] == "user"]
+        self.assertEqual([(m["text"], m["metadata"]) for m in brief], [("Add a health check", {"fleet": {"from": "switchboard", "brief": True}})])
+        record = self.ap.load_record(self.world.state, "hw")
+        self.assertEqual((record["worker"], record["session"], record["kind"]), ("hw", done["session"], "local"))
+        found = self.discover().agents["hw"]
+        self.assertEqual((found.headless, found.pane, found.session_id), (True, None, done["session"]))
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "headless.launched" and e["subject"] == "hw"])
+
+    def test_send_report_and_retire_work_for_a_headless_worker_unchanged(self):
+        done = self.launch_hl()
+        self.assertTrue(self.engine.send("boss", "hw", "second thought", None, None)["sent"])
+        report = self.world.new_engine("cli").report("hw", "done", "finished the health check")
+        self.assertTrue(report.get("sent"), report)
+        boss_texts = [m.get("text", "") for m in self.world.v2.sessions[self.world.sessions["boss"]]["messages"] if m["type"] in ("user", "synthetic")]
+        self.assertTrue(any("finished the health check" in t for t in boss_texts), boss_texts)
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]
+        code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 0, err)
+        self.assertIn("hw is retired", out)
+        self.assertIn("nothing to close", out)
+        self.assertEqual(self.world.herdr.closed, [], "no pane was closed")
+        self.assertIn("hw", sb.read_retired(self.world.state))
+
+    def test_a_headless_launch_refuses_a_taken_name_bad_arguments_and_a_terminal_option_and_a_failed_brief_leaves_a_record_it_names(self):
+        self.launch_hl()
+        with self.assertRaises(sb.LaunchError) as raised:
+            self.launch_hl()
+        self.assertIn("already exists (headless)", str(raised.exception))
+        self.world.add_agent("termworker", fleet={"role": "coder", "reports_to": "boss"})
+        with self.assertRaises(sb.LaunchError) as raised:
+            self.launch_hl(name="termworker")
+        self.assertIn("in pane", str(raised.exception))
+        for bad in (dict(name="Bad Name"), dict(directory="relative/dir"), dict(agent=""), dict(name="switchboard")):
+            with self.assertRaises(sb.LaunchError, msg=bad):
+                self.launch_hl(**dict(bad, name=bad.get("name", "other")))
+        self.assertEqual(sorted(p.stem for p in (Path(self.world.state) / "headless").glob("*.json")), ["hw"], "a refused launch writes no record")
+        with mock.patch.object(sb, "send_brief", side_effect=sb.V2Error("exit", None, "boom")):
+            with self.assertRaises(sb.LaunchError) as raised:
+                self.launch_hl(name="halfway")
+        text = str(raised.exception)
+        self.assertIn("was created and its record kept", text)
+        self.assertIn("retire halfway", text)
+        self.assertIsNotNone(self.ap.load_record(self.world.state, "halfway"))
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        code, out, err = self.run_cli("launch", "again", "--agent", "coder", "--dir", str(self.home), "--headless", "--workspace", "w1")
+        self.assertNotEqual(code, 0)
+        self.assertIn("--headless opens no terminal", err)
+
+    def test_the_headless_service_url_is_recorded_when_the_service_file_is_readable_and_never_a_password(self):
+        with mock.patch.object(sb.V2Client, "service_url", lambda self_: "http://127.0.0.1:49374"):
+            self.launch_hl()
+        record = self.ap.load_record(self.world.state, "hw")
+        self.assertEqual(record["url"], "http://127.0.0.1:49374")
+        self.assertNotIn("password", json.dumps(record))
+        self.assertIsNone(sb.V2Client(FAKE_OPENCODE, {}, self.world.v2, 5).service_url(), "no HTTP transport: no url, and the record says none")
+
     def test_remove_record_deletes_it_once_and_says_so(self):
         sid = self.headless()
         path = Path(self.world.state) / "headless" / "hw.json"
