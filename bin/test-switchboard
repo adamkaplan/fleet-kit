@@ -29842,7 +29842,7 @@ USE_COMMANDS = {
     "handoff": ["handoff", "--issue", "1", "--brief-file", "-"], "comment": ["comment", "--issue", "1", "--body-file", "-"],
     "remind": ["remind", "other", "1h", "later"], "decisions": ["decisions"], "intent": ["intent", "1"],
     "bootstrap": ["bootstrap"], "notice": ["notice", "pr", "acme/api#7", "--from", "coder"],
-    "move": ["move", "1", "--to", "2", "--from", "coder"],
+    "move": ["move", "1", "--to", "2", "--from", "coder"], "reassign": ["reassign", "coder", "--undo", "--from", "coder"],
 }
 
 
@@ -51383,6 +51383,304 @@ class LaneGH(FakeGH):
             self.calls.append(argv)
             return subprocess.CompletedProcess(argv, 0, json.dumps(self.pulls[int(pull.group(1))]), "")
         return super().serve(argv, kwargs)
+
+
+class TestReassign(IntentCase):
+    """The Chief of Staff, two orchestrators and a worker that reports to the first; `reassign` hands the worker to the second."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": FAKE_REPO})
+        self.world.add_agent("chief-of-staff", fleet={"role": "chief-of-staff"})
+        self.world.add_agent("orch-a", fleet={"role": "orchestrator", "charter": 1})
+        self.world.add_agent("orch-b", fleet={"role": "orchestrator", "charter": 10})
+        self.world.add_agent("worker", fleet={"role": "coder", "issue": 3, "reports_to": "orch-a"})
+        patcher = mock.patch.object(sb, "owner_terminal_problem", return_value=None)   # no test is a terminal; the person check is tested on its own below
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.as_agent("chief-of-staff")
+
+    def main(self, *argv):
+        def route(argv, **kwargs):
+            return self.gh(argv, **kwargs) if argv[0] == FAKE_GH else self.world.route(argv, **kwargs)
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=route, now=self.world.clock.now, wait=lambda sock, s: False,
+                           socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def as_agent(self, name):
+        os.environ["HERDR_PANE_ID"] = self.world.panes[name]
+
+    def boss(self, name="worker"):
+        discovery = self.world.new_engine().discover(self.world.clock.now())
+        return sb.boss_name(discovery, discovery.agents[name])
+
+    def record(self):
+        return Path(self.world.state) / "boss-overrides.json"
+
+    def audit(self, event):
+        return [e for e in self.world.audit() if e["event"] == event]
+
+    def reassign(self, *extra, to="orch-b", consent="orch-a"):
+        return self.main("reassign", "worker", "--to", to, "--consent-from", consent, *extra)
+
+    def test_s20_with_the_current_bosss_consent_the_boss_changes_and_everyone_is_told(self):
+        self.assertEqual(self.boss(), "orch-a")
+        code, out, err = self.reassign()
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(self.boss(), "orch-b", "1 boss record changed")
+        written = self.audit("reassign")
+        details = [e.get("detail") or {} for e in written]
+        self.assertTrue(details and all(d.get("caller") == "chief-of-staff" and d.get("worker") == "worker" for d in details if d), "audited with the caller and the worker")
+        self.assertTrue(any(d.get("from") == "orch-a" and d.get("to") == "orch-b" for d in details))
+        self.assertEqual([len(self.world.admissions(n)) for n in ("orch-a", "orch-b", "worker")], [1, 1, 1])
+        self.assertEqual(oct(self.record().stat().st_mode & 0o777), "0o600")
+        entry = json.loads(self.record().read_text())["overrides"]["worker"]
+        self.assertEqual((entry["boss"], entry["was"], entry["original"], entry["by"]), ("orch-b", "orch-a", "orch-a", "chief-of-staff"))
+
+    def test_s20_no_consent_or_the_wrong_consent_or_an_unusable_target_changes_nothing(self):
+        self.world.add_agent("coder-x", fleet={"role": "coder", "issue": 4, "reports_to": "orch-b"})
+        cases = ((("reassign", "worker", "--to", "orch-b"), "needs --to"),
+                 (("reassign", "worker", "--to", "orch-b", "--consent-from", "orch-b"), "CURRENT boss"),
+                 (("reassign", "worker", "--to", "orch-b", "--consent-from", "chief-of-staff"), "CURRENT boss"),
+                 (("reassign", "worker", "--to", "coder-x", "--consent-from", "orch-a"), "the target coder-x is not an orchestrator"),
+                 (("reassign", "worker", "--to", "nobody", "--consent-from", "orch-a"), "the target nobody is not in the current discovery"),
+                 (("reassign", "worker", "--to", "orch-a", "--consent-from", "orch-a"), "already reports"),
+                 (("reassign", "nobody", "--to", "orch-b", "--consent-from", "orch-a"), "not a fleet agent"),
+                 (("reassign", "orch-a", "--to", "orch-b", "--consent-from", "chief-of-staff"), "not a worker"))
+        for argv, text in cases:
+            with self.subTest(argv=argv):
+                code, _, err = self.main(*argv)
+                self.assertEqual(code, 2)
+                self.assertIn(text, err)
+                self.assertFalse(self.record().exists(), "0 changes")
+        self.assertEqual(len(self.audit("reassign.refused")), len(cases), "every attempt is audited")
+        self.assertEqual(self.boss(), "orch-a")
+
+    def test_s20_a_current_boss_that_is_not_live_cannot_consent(self):
+        sid = self.world.sessions.pop("orch-a")
+        self.world.v2.sessions[sid]["metadata"]["fleet"]["role"] = "coder"
+        code, _, err = self.reassign()
+        self.assertEqual(code, 2)
+        self.assertIn("the consenting boss orch-a is not an orchestrator", err)
+        self.assertFalse(self.record().exists())
+
+    def test_s20_only_the_chief_of_staff_or_the_operator_and_a_refusal_is_audited(self):
+        for who in ("orch-a", "orch-b", "worker"):
+            with self.subTest(who=who):
+                self.as_agent(who)
+                code, _, err = self.reassign()
+                self.assertEqual(code, 1)
+                self.assertIn("only the chief-of-staff or the operator", err)
+                self.assertFalse(self.record().exists())
+                self.assertEqual(self.main("reassign", "worker", "--undo")[0], 1, "a worker cannot clear one either")
+        self.assertEqual(len(self.audit("reassign.refused")), 6)
+        os.environ.pop("HERDR_PANE_ID", None)
+        with mock.patch.object(sb, "owner_terminal_problem", return_value="not a terminal"):
+            self.assertEqual(self.reassign()[0], 1)
+        self.assertFalse(self.record().exists())
+        self.assertEqual(self.reassign()[0], 0, "the operator at the owner's own terminal may")
+
+    def test_s21_reports_follow_the_new_boss_and_undo_restores_the_old_one(self):
+        self.assertEqual(self.reassign()[0], 0)
+        before = {n: len(self.world.admissions(n)) for n in ("orch-a", "orch-b")}
+        self.as_agent("worker")
+        self.assertEqual(self.main("report", "done", "finished the widget")[0], 0)
+        after = {n: len(self.world.admissions(n)) for n in ("orch-a", "orch-b")}
+        self.assertEqual((after["orch-b"] - before["orch-b"], after["orch-a"] - before["orch-a"]), (1, 0), "1 report to the new boss, 0 to the old")
+        self.as_agent("chief-of-staff")
+        code, out, _ = self.main("reassign", "worker", "--undo")
+        self.assertEqual(code, 0, out)
+        self.assertFalse(json.loads(self.record().read_text())["overrides"])
+        self.assertEqual(self.boss(), "orch-a")
+        before = len(self.world.admissions("orch-a"))
+        self.as_agent("worker")
+        self.main("report", "done", "and again")
+        self.assertEqual(len(self.world.admissions("orch-a")) - before, 1, "after --undo the report goes to the old boss")
+
+    def test_a_second_reassign_keeps_the_launch_boss_for_undo(self):
+        self.world.add_agent("orch-c", fleet={"role": "orchestrator", "charter": 11})
+        self.reassign()
+        self.assertEqual(self.main("reassign", "worker", "--to", "orch-c", "--consent-from", "orch-b")[0], 0)
+        self.assertEqual(self.boss(), "orch-c")
+        self.main("reassign", "worker", "--undo")
+        self.assertEqual(self.boss(), "orch-a")
+
+    def test_an_override_belongs_to_the_session_and_is_ignored_for_another(self):
+        ra = sb.load_module("reassign")
+        self.reassign()
+        fleet = {"name": "worker", "role": "coder", "reports_to": "orch-a"}
+        self.assertEqual(ra.overlay(self.world.state, fleet, self.world.sessions["worker"])["reports_to"], "orch-b")
+        self.assertEqual(ra.overlay(self.world.state, fleet, "ses_example_other")["reports_to"], "orch-a", "a worker launched again under the name is not affected")
+
+    def test_a_damaged_record_applies_no_override_and_blocks_a_new_one(self):
+        ra = sb.load_module("reassign")
+        self.reassign()
+        self.record().write_text("{not json")
+        self.assertEqual(self.boss(), "orch-a", "the launch-time boss applies")
+        code, _, err = self.reassign()
+        self.assertEqual(code, 2)
+        self.assertIn("cannot be used", err)
+        self.record().write_text(json.dumps({"overrides": {"worker": {"boss": "../x", "session": "s", "at": 1}, "w2": 5}}))
+        self.assertEqual(ra.read_overrides(self.world.state)[0], {}, "an entry with a bad name or shape is dropped")
+
+    def test_the_record_is_bounded_and_stale_entries_are_dropped(self):
+        ra = sb.load_module("reassign")
+        many = {"w%d" % i: {"boss": "orch-b", "was": "", "original": "", "session": "s", "by": "x", "at": 1.0} for i in range(ra.MAX_ENTRIES + 1)}
+        with self.assertRaises(ValueError):
+            ra.write_overrides(self.world.state, many)
+        fresh = {"keep": {"boss": "b", "at": 1000.0}, "old": {"boss": "b", "at": 1.0}, "gone": {"boss": "b", "at": 1000.0}}
+        self.assertEqual(ra.prune(fresh, {"gone": {}}, 1000.0 + ra.MAX_AGE_DAYS * 86400 - 1), 2)
+        self.assertEqual(sorted(fresh), ["keep"])
+
+    def test_a_relaunched_worker_does_not_inherit_the_old_sessions_launch_boss(self):
+        ra = sb.load_module("reassign")
+        self.reassign()
+        old = json.loads(self.record().read_text())
+        old["overrides"]["worker"]["session"] = "ses_example_previous"   # the override is of an earlier session of the same name
+        old["overrides"]["worker"]["original"] = "orch-b"
+        self.record().write_text(json.dumps(old))
+        self.assertEqual(self.boss(), "orch-a", "the new session reports to its own boss")
+        self.world.add_agent("orch-c", fleet={"role": "orchestrator", "charter": 11})
+        self.assertEqual(self.main("reassign", "worker", "--to", "orch-c", "--consent-from", "orch-a")[0], 0)
+        self.main("reassign", "worker", "--undo")
+        self.assertEqual(self.boss(), "orch-a", "undo restores the NEW session's launch boss")
+
+    def test_a_boss_that_changes_between_the_check_and_the_write_refuses_the_command(self):
+        ra = sb.load_module("reassign")
+        real = ra.locked.__enter__
+
+        def enter(lock):
+            result = real(lock)
+            ra.write_overrides(self.world.state, {"worker": {"boss": "orch-b", "was": "orch-a", "original": "orch-a",
+                                                           "session": self.world.sessions["worker"], "by": "someone", "at": self.world.clock.now()}})
+            return result
+        with mock.patch.object(ra.locked, "__enter__", enter):
+            code, _, err = self.reassign()
+        self.assertEqual(code, 2)
+        self.assertIn("boss changed while this was being checked", err)
+
+    def test_a_failed_write_a_failed_notice_and_an_undo_without_an_override(self):
+        ra = sb.load_module("reassign")
+        with mock.patch.object(ra, "write_overrides", side_effect=OSError("disk full")):
+            code, _, err = self.reassign()
+        self.assertEqual(code, 1)
+        self.assertIn("nothing was changed", err)
+        self.assertFalse(self.record().exists())
+        code, out, err = self.main("reassign", "worker", "--undo")
+        self.assertEqual(code, 2)
+        self.assertIn("has no override to undo", err)
+        with mock.patch.object(sb.Switchboard, "send", side_effect=RuntimeError("herdr is down")):
+            code, out, err = self.reassign()
+        self.assertEqual(code, 1)
+        self.assertIn("the change stands, but these were not told", err)
+        self.assertEqual(self.boss(), "orch-b", "the override stands")
+
+    def test_a_retired_workers_override_is_dropped_by_the_next_reassign(self):
+        ra = sb.load_module("reassign")
+        self.world.add_agent("worker2", fleet={"role": "coder", "issue": 4, "reports_to": "orch-a"})
+        self.assertEqual(self.main("reassign", "worker2", "--to", "orch-b", "--consent-from", "orch-a")[0], 0)
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {"worker2": {"at": int(self.world.clock.now()), "by": "x", "reason": "done", "session": "s", "auto": False}})
+        self.assertEqual(self.reassign()[0], 0)
+        self.assertEqual(sorted(ra.read_overrides(self.world.state)[0]), ["worker"], "the retired worker's override is gone")
+
+    def test_a_worker_with_no_override_keeps_its_launch_boss_through_discovery(self):
+        self.reassign()
+        self.world.add_agent("worker3", fleet={"role": "coder", "issue": 5, "reports_to": "orch-b"})
+        self.assertEqual((self.boss("worker3"), self.boss("worker")), ("orch-b", "orch-b"))
+        self.main("reassign", "worker", "--undo")
+        self.assertEqual((self.boss("worker3"), self.boss("worker")), ("orch-b", "orch-a"))
+
+    def test_typed_text_is_one_clean_bounded_line_in_the_message_and_the_audit(self):
+        evil = "orch-a\x1b]0;x\x07" + "y" * 200
+        code, _, err = self.main("reassign", "worker", "--to", "orch-b", "--consent-from", evil)
+        self.assertEqual(code, 2)
+        self.assertNotIn("\x1b", err)
+        for e in self.audit("reassign.refused"):
+            self.assertNotIn("\x1b", json.dumps(e))
+            self.assertLessEqual(len(e["detail"]["consent"]), 64)
+
+    def test_an_expired_override_does_not_apply(self):
+        ra = sb.load_module("reassign")
+        self.reassign()
+        data = json.loads(self.record().read_text())
+        data["overrides"]["worker"]["at"] = 1.0
+        self.record().write_text(json.dumps(data))
+        fleet = {"name": "worker", "reports_to": "orch-a"}
+        with mock.patch.object(ra.time, "time", return_value=1.0 + (ra.MAX_AGE_DAYS + 1) * 86400):
+            self.assertEqual(ra.overlay(self.world.state, fleet, self.world.sessions["worker"])["reports_to"], "orch-a")
+
+    def test_a_dead_reassigned_workers_new_boss_may_reattach_it_and_the_old_boss_may_not(self):
+        self.reassign()
+        discovery = self.world.new_engine().discover(self.world.clock.now())
+        sid = self.world.sessions["worker"]
+        discovery.agents.pop("worker")   # it died: not discovered, its boss comes from the stored session
+        engine = self.world.new_engine()
+        got = {}
+        for who in ("orch-b", "orch-a"):
+            self.as_agent(who)
+            got[who] = sb.reattach_caller_problem(engine, self.world.route, self.world.clock.now, discovery, "worker", sid)
+        self.assertIsNone(got["orch-b"])
+        self.assertIn("may not reattach", got["orch-a"])
+
+    def test_a_retired_or_excluded_orchestrator_is_refused_as_the_target_and_as_the_consenting_boss(self):
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {"orch-b": {"at": int(self.world.clock.now()), "by": "x", "reason": "done", "session": "s", "auto": False}})
+        code, _, err = self.reassign()
+        self.assertEqual(code, 2)
+        self.assertIn("the target orch-b is retired", err)
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {"orch-a": {"at": int(self.world.clock.now()), "by": "x", "reason": "done", "session": "s", "auto": False}})
+        code, _, err = self.reassign()
+        self.assertEqual(code, 2)
+        self.assertIn("the consenting boss orch-a is retired", err)
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {})
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": FAKE_REPO, "excluded_repos": [FAKE_REPO]})
+        code, _, err = self.reassign()
+        self.assertEqual(code, 2)
+        self.assertIn("excluded or unknown", err)
+        self.assertFalse(self.record().exists(), "0 writes")
+
+    def arm_launch_reminders(self):
+        """What `launch` arms for a worker with a checkpoint: a reminder for the worker, and the overdue one for its boss."""
+        epoch = self.world.clock.now()
+        sb.add_reminder(self.world.state, "worker", epoch + 1800, epoch, "checkpoint due: report now, one line", 3, "orch-a", FAKE_REPO,
+                        condition={"while_running": "worker"})
+        sb.add_reminder(self.world.state, "orch-a", epoch + 3600, epoch, "worker has not reported since launch: overdue checkpoint", 3, "worker", FAKE_REPO,
+                        condition={"unless_report_from": "worker", "since": epoch})
+
+    def overdue_texts(self, name):
+        return [t for t in (a["text"] for a in self.world.admissions(name)) if "overdue checkpoint" in t]
+
+    def test_the_overdue_reminder_follows_the_override_and_undo_points_it_back(self):
+        self.arm_launch_reminders()
+        code, out, err = self.reassign()
+        self.assertEqual(code, 0, err)
+        self.assertIn("1 overdue reminder(s) of worker now go to orch-b", out)
+        self.world.tick(3700)
+        self.world.engine.run_pass()
+        self.assertEqual((len(self.overdue_texts("orch-b")), len(self.overdue_texts("orch-a"))), (1, 0), "only the new boss is woken")
+        self.arm_launch_reminders()   # a second launch of the same arming, to test the undo direction
+        sb.remove_reminders(self.world.state, {r["id"] for r in sb.read_reminders(self.world.state) if r["to"] == "orch-a"})
+        epoch = self.world.clock.now()
+        sb.add_reminder(self.world.state, "orch-b", epoch + 3600, epoch, "worker has not reported since launch: overdue checkpoint", 3, "worker", FAKE_REPO,
+                        condition={"unless_report_from": "worker", "since": epoch})
+        code, out, err = self.main("reassign", "worker", "--undo")
+        self.assertEqual(code, 0, err)
+        self.assertIn("overdue reminder(s) of worker now go to orch-a", out)
+        self.world.tick(3700)
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.overdue_texts("orch-a")), 1, "after --undo only the old boss is woken")
+        self.assertEqual(len(self.overdue_texts("orch-b")), 1, "and the new boss is not woken a second time")
+
+    def test_a_reminder_file_that_cannot_be_used_is_said_and_the_override_stands(self):
+        with mock.patch.object(sb, "read_reminders", side_effect=sb.ReminderError("reminders.json is damaged")):
+            code, out, err = self.reassign()
+        self.assertEqual(code, 1)
+        self.assertIn("overdue reminder was not pointed at orch-b", err)
+        self.assertEqual(self.boss(), "orch-b")
+
+    def test_the_command_is_registered_and_starts_the_daemon(self):
+        self.assertIn("reassign", sb.build_parser().commands)
+        self.assertTrue(getattr(sb.cmd_reassign, "ensure_on_use", False))
 
 
 class LanesCase(IntentCase):
