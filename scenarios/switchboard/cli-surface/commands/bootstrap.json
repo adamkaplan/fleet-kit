@@ -1,0 +1,4 @@
+{
+ "command": "bootstrap",
+ "help": "usage: fleet-switchboard bootstrap [-h] [--workspace LABEL] [--dir DIR] [--no-focus] options: -h, --help show this help message and exit --workspace LABEL The workspace's label (default: Chief of Staff) --dir DIR The Chief of Staff's working directory (default: here) --no-focus Open the workspace without taking focus (for scripts and trials)"
+}

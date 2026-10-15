@@ -5,9 +5,20 @@ on:
   pull_request:
   push:
     branches: [main]
+  # A head can be re-run without a push or a close and reopen: `gh workflow run test.yml --ref <branch>`. No inputs. The run is on the branch's head
+  # commit, so its checks (the same check names as a pull request run) count for that head. Its concurrency group is its commit sha:
+  # it never cancels the pull request's own run, and cancel-in-progress is false for it.
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+# A newer push to a pull request cancels that pull request's older, superseded run (the macOS job queues for an hour when every push keeps
+# its own run). A push to main has a group of its OWN (its commit sha) and cancel-in-progress is false for it: no run of a push to main is ever
+# cancelled, running or pending (a shared group would let GitHub drop a pending run when a third push queued behind it).
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
@@ -42,6 +53,12 @@ jobs:
           bin/test-heartbeat 2>&1 | tee "$RUNNER_TEMP/out.txt"
           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
 
+      - name: bin/test-health-records
+        if: ${{ !cancelled() }}
+        run: |
+          bin/test-health-records 2>&1 | tee "$RUNNER_TEMP/out.txt"
+          grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
+
       - name: bin/test-fleet-doctor
         if: ${{ !cancelled() }}
         run: |
@@ -65,6 +82,10 @@ jobs:
         run: |
           bin/test-switchboard 2>&1 | tee "$RUNNER_TEMP/out.txt"
           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
+
+      - name: node --test plugins/fleet-decisions-tui/health.test.mjs
+        if: ${{ !cancelled() }}
+        run: node --test plugins/fleet-decisions-tui/health.test.mjs
 
       - name: bin/fleet-scenario validate
         if: ${{ !cancelled() }}

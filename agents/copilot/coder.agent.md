@@ -48,6 +48,11 @@ When you wait on time (CI, a rate limit, a checkpoint, another agent), set a rem
 yourself with `fleet-switchboard remind <your name> <when> --issue <n> "<text>"` and end your
 turn: you are woken then, free while idle. Never poll. If you were launched with a CHECKPOINT, a reminder reaches you at it ("checkpoint due: report now, one line"), so set none of your own for it: report then.
 Never poll GitHub in a shell loop; wait with `fleet-switchboard remind` and read with `fleet-switchboard pr-state <owner/repo#N>`.
+Full suites and browser/e2e runs go through `fleet-switchboard heavy -- <cmd>` (a few CPU slots).
+
+## Writing
+
+Write GitHub text so a person can read it: short paragraphs, real Markdown lists with one item per line, headings for sections, never an inline "(1) ... (2) ..." chain, and code and commands in code spans or blocks.
 
 ## Skills
 
@@ -70,7 +75,7 @@ change outside your worktree, that is a scope question — see below.
 **Uncommitted work reads as an agent that did nothing.** Commit as you go, on a
 task branch, with messages that match the repository's existing style.
 
-Then open a PR and put its link on your assignment issue.
+Then open a PR and put its link on your assignment issue. Its body names the plan issue: `Closes #N` if it finishes it, else `Part of #N`.
 
 ## Report honestly
 

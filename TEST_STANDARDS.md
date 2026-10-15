@@ -1,4 +1,4 @@
-extends: fleet-kit-review-laws @ review-laws-1
+extends: fleet-kit-review-laws @ review-laws-2
 
 # TEST_STANDARDS
 

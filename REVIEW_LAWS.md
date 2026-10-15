@@ -1,4 +1,4 @@
-extends: fleet-kit-review-laws @ review-laws-1
+extends: fleet-kit-review-laws @ review-laws-2
 
 # REVIEW_LAWS
 
@@ -26,6 +26,8 @@ The reviewers read this file together with `CODING_STANDARDS.md`, `SECURITY_STAN
 - **R-LAW-13 The floor is the matrix's companion.** A deterministic floor of path rules holds changes to the paths a repository names, whatever the rating says; its authority is the matrix (R-LAW-11), it can only add a hold and never lower one, and the size of a change is never a hold by itself. _check: test: the floor paths are listed in the repository's own copy, and the hold fixture is unchanged._
 - **R-LAW-14 Judgement rules are note only.** A rule marked `check: note only` can be cited in a finding but never blocks by itself; every other rule names how it is checked (`diff`, `search` or `test`), and a block rests on that check. _check: search: each rule line ends with a check hint._
 - **R-LAW-15 Owner evaluators are rare.** A plan names the owner as an evaluator only where the owner's own eyes are the test (how an infographic looks, an access grant), and proves it once at the epic's integrated head, never per pull request; a routine pull request never waits on the owner. _check: search: a scenario with the evaluator `owner` also has `claim: epic`._
+- **R-LAW-16 A block about behaviour names its check.** A finding that blocks because of how the change behaves, when a test or check in the change's own tree exercises that behaviour, names that test or check and says whether it covers the claim. A green covering check at the head drops the finding or lowers it to a note, with the reason. A pending check, a failing one, or `no checks reported` does not clear a finding: only a green covering check does, and a result that is pending or absent counts as not read. A reviewer that cannot read the check result says `check result not read`, and its finding stays at most a note: it is reported, it cites this rule, and it never blocks (R-LAW-14). A reviewer still never runs, builds or tests anything (R-LAW-2): reading the head's check results is reading. _check: search: a blocking finding about behaviour names a test or check, or says `check result not read`._
+- **R-LAW-17 A missing verdict is never the author's to chase.** A reviewer that has not posted at the head is waited for or re-run by the reviewing side, once per head, never by the author of the change (the author's first invocation of its reviewers, before offering the change, is not a chase); the author's own review of its work is recorded as its own and counts for nothing in place of the missing one. _check: note only: judged by the reviewing side at the head._
 
 ## Verdict format
 

@@ -31,6 +31,46 @@ REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 TOKEN_ENV_NAMES = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
 
 
+COUNT_ACCOUNT = [None]
+CALLS_SPOOL = "agent-calls.jsonl"
+CALLS_LIMIT = 262144
+CALLS_ON = "agent-calls-hours.json"   # the daemon makes this file: counting is on only while a daemon folds the spool
+NO_NETWORK_GROUPS = ("auth", "config", "alias", "completion", "extension", "help", "version")
+
+
+def call_endpoint(args):
+    """The class of a gh call for the counter: `api issues/#` (numbers as `#`, no repo, no query) or the first two words (`pr view`). Never a value."""
+    words = command_words(args)
+    if not words:
+        return None
+    if words[0] == "api" and len(words) > 1:
+        bare = re.sub(r"^/?repos/[^/]+/[^/]+/?", "", words[1].split("?")[0])
+        return "api " + (re.sub(r"\d+", "#", bare) or "repo")[:60]
+    return " ".join(words[:2])[:40]
+
+
+def count_call(args):
+    """Best effort, never fails or delays the command: one line (time, account name, endpoint class) for the daemon's hourly count. The switchboard's
+    own calls are counted by the daemon, not here. Nothing else is recorded: no token, no argument, no body, no repo."""
+    try:
+        if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":
+            return
+        words = command_words(args)
+        if not words or words[0] in NO_NETWORK_GROUPS:
+            return
+        endpoint = call_endpoint(args)
+        state = os.environ.get("FLEET_SWITCHBOARD_STATE") or os.path.join(
+            os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state"), "fleet-switchboard")
+        path = os.path.join(state, CALLS_SPOOL)
+        if endpoint and os.path.exists(os.path.join(state, CALLS_ON)) and (not os.path.exists(path) or os.path.getsize(path) < CALLS_LIMIT):
+            line = json.dumps({"ts": int(time.time()), "account": COUNT_ACCOUNT[0] or "default", "endpoint": endpoint}, sort_keys=True)
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            with os.fdopen(fd, "a") as out:
+                out.write(line + "\n")
+    except Exception:
+        pass
+
+
 def real_gh():
     """The first executable named gh on PATH that is not this shim's own directory."""
     own = os.path.realpath(os.path.dirname(os.path.abspath(__file__)))
@@ -121,7 +161,8 @@ class Lookup:
         if isinstance(data, dict):
             name, repo = data.get("name"), data.get("repo")
             self._ident = {"name": name if isinstance(name, str) and NAME_RE.match(name) else None,
-                           "repo": repo if isinstance(repo, str) and REPO_RE.match(repo) else None}
+                           "repo": repo if isinstance(repo, str) and REPO_RE.match(repo) else None,
+                           "own": data.get("own") is not False}   # False: the repo is only the default (`intent_repo`), the caller has none of its own
             return self._ident
         plain = self.run([binary, "whoami"])   # an older switchboard: the name only
         if plain is not None and plain.returncode != 0:
@@ -194,7 +235,55 @@ def is_git_credential(args):
         return False
 
 
-def account_env(gh, lookup=None, strict=False, credential=False):
+EXPLICIT_REPO_GROUPS = {"issue", "pr"}
+URL_REPO_RE = re.compile(r"^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(?:issues|pull)/[0-9]+(?:[/?#].*)?$")
+
+
+VALUE_FLAGS = {"-b", "--body", "-F", "--body-file", "-t", "--title", "-l", "--label", "-a", "--assignee", "-m", "--milestone", "-p", "--project",
+               "-r", "--reviewer", "-B", "--base", "-H", "--head", "-q", "--jq", "--json", "--template", "-s", "--state",
+               "-S", "--search", "-L", "--limit", "--author", "--app", "--add-label", "--remove-label", "--add-assignee", "--remove-assignee",
+               "--add-reviewer", "--remove-reviewer", "--add-project", "--remove-project", "--reason"}
+TARGET_VERBS = {"view", "comment", "edit", "close", "reopen", "ready", "checks", "diff", "lock", "unlock", "status"}
+
+
+def explicit_repo(args):
+    """The repo a `gh issue ...` or `gh pr ...` command NAMES, or None: from the real `-R`/`--repo` flag (never from the value of another flag such as
+    `--body` or `--title`) or from an issue or pull request URL that is the target argument right after the verb. Never for `merge`: a merge keeps
+    the caller's own rule. Only `issue` and `pr` commands: nothing else (`repo`, `secret`, `workflow`, `run`, `api`) picks an account by what it names.
+    Two different repos named, or anything it cannot tell, give None (the command then runs as it always did)."""
+    try:
+        words = command_words(args)
+        if len(words) < 2 or words[0] not in EXPLICIT_REPO_GROUPS or words[1] == "merge":
+            return None
+        found, skip = set(), False
+        for i, a in enumerate(args):
+            if skip:
+                skip = False
+            elif a in ("-R", "--repo") and i + 1 < len(args):
+                found.add(args[i + 1])
+                skip = True
+            elif a.startswith("--repo="):
+                found.add(a.split("=", 1)[1])
+            elif a.startswith("-R") and len(a) > 2 and not a.startswith("--"):
+                found.add(a[2:].lstrip("="))
+            elif a in VALUE_FLAGS:
+                skip = True      # the next argument is that flag's value (a body or title may hold anything): never read it as a repo
+        if not found and words[1] in TARGET_VERBS:
+            verb_at = args.index(words[1]) if words[1] in args else -1
+            if verb_at >= 0 and verb_at + 1 < len(args):
+                m = URL_REPO_RE.match(args[verb_at + 1])
+                if m:
+                    found.add(m.group(1))
+        found = {f for f in found if isinstance(f, str)}
+        if len(found) != 1:
+            return None
+        repo = found.pop()
+        return repo if REPO_RE.match(repo) else None
+    except Exception:
+        return None
+
+
+def account_env(gh, lookup=None, strict=False, credential=False, args=None):
     """The environment for the real gh with GH_TOKEN of the account that `gh_users` maps to the repo of the caller's RESOLVED
     identity (`fleet-switchboard whoami --json`: its session, never an inherited variable), the same map and the same
     `gh auth token --user` the daemon uses; so an inherited token never decides who an agent acts as. None leaves the
@@ -211,7 +300,12 @@ def account_env(gh, lookup=None, strict=False, credential=False):
                 raise NoAccountMapped("this shell (no switchboard to say which repository it is)")
             return None
         lookup = lookup or Lookup()
-        repo = lookup.identity().get("repo")
+        ident = lookup.identity()
+        repo = ident.get("repo")
+        if (not repo or ident.get("own") is False) and not lookup.failed:
+            # a caller with no repo of its own (the Chief of Staff: whoami gives only the default `intent_repo`, own false) acts as the account of the
+            # repo the command names; with nothing named it keeps the default repo's account as before
+            repo = explicit_repo(args or []) or repo
         if not repo:
             if strict and lookup.failed:
                 raise AccountLookupFailed("identity")
@@ -223,6 +317,7 @@ def account_env(gh, lookup=None, strict=False, credential=False):
             if credential:
                 raise NoAccountMapped("repository %s" % repo)
             return None
+        COUNT_ACCOUNT[0] = account   # for the call counter: the account's NAME only
         clean = {k: v for k, v in os.environ.items() if k not in TOKEN_ENV_NAMES}
         got = lookup.run([gh, "auth", "token", "--user", account], stdin=subprocess.DEVNULL, env=clean)
         token = got.stdout.strip() if got is not None and got.returncode == 0 else ""
@@ -738,13 +833,13 @@ def main(args):
     credential = is_git_credential(args)
     extra = {"credential": True} if credential else {}   # only the git credential route passes the keyword: every other call is exactly as it was
     try:
-        env = account_env(gh, lookup, strict=is_write(args), **extra)
+        env = account_env(gh, lookup, strict=is_write(args), args=args, **extra)
     except NoAccountMapped as err:
         sys.stderr.write("gh: no GitHub account is mapped for %s: git cannot authenticate as a guess (add the repository or its owner to gh_users)\n" % _clean_reason(str(err)))
         return 1
     except AccountLookupFailed:
         try:
-            env = account_env(gh, Lookup(write=True), strict=True, **extra)   # retry the lookup ONCE with a fresh deadline
+            env = account_env(gh, Lookup(write=True), strict=True, args=args, **extra)   # retry the lookup ONCE with a fresh deadline
         except NoAccountMapped as err:
             sys.stderr.write("gh: no GitHub account is mapped for %s: git cannot authenticate as a guess (add the repository or its owner to gh_users)\n" % _clean_reason(str(err)))
             return 1
@@ -752,6 +847,7 @@ def main(args):
             sys.stderr.write("gh: account lookup failed, retry (the fleet shim could not find which GitHub account this write is for, and will not "
                              "fall back to the inherited token)\n")
             return 1
+    count_call(args)
     if plan is None:
         if env is not None:
             os.execve(gh, [gh] + args, env)
