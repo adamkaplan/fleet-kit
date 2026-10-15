@@ -455,7 +455,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "temp_janitor", "load_alert", "spotlight_guard", "excluded_repos", "source_budgets"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "chat_clear", "temp_janitor", "load_alert", "spotlight_guard", "excluded_repos", "source_budgets"}
 
 
 def config_known_keys():
@@ -575,6 +575,9 @@ def validate_config(raw, source="config"):
         load_disk_janitor().validate(config.get("temp_janitor"), source)
     except ValueError as err:
         raise ConfigError(str(err))
+    raw_chat = config.get("chat_clear")
+    if raw_chat is not None and (not isinstance(raw_chat, dict) or set(raw_chat) - {"enabled", "live"} or any(not isinstance(v, bool) for v in raw_chat.values())):
+        raise ConfigError("%s: 'chat_clear' must be {\"enabled\": true|false, \"live\": true|false}, got %r" % (source, raw_chat))   # #457: live is the owner's key
     if config.get("impact_hold") is not None:   # #179 L4: the hold is off unless `enabled` is true
         try:
             impact_floor.validate_hold_config(config["impact_hold"])
@@ -10375,6 +10378,7 @@ def publish_decisions(engine):
         pane_health_pass(engine, now)   # the control plane: detached or dead panes, reads only, wakes the Chief of Staff
     except Exception as err:
         engine._note("fleetpane.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+    chat_clear_pass(engine, decisions, now)   # #457: the owner clears a held PR in his chat; SHADOW unless chat_clear.live; never raises
     try:
         impact_would_hold_pass(engine, now)   # #179 L3: audits gate.would_hold from the diff's floor; ADVISORY, writes nothing to GitHub
     except Exception as err:
@@ -18257,29 +18261,51 @@ def _apply_impact_hold_locked(engine, repo, number, report, record):
     return spent
 
 
-def impact_clear_core(engine, runner, repo, number, who, reason):
+def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, head=None, via=None, verify=None):
     """The owner's clear: record it head-bound (the daemon does not re-add the hold for that head) and remove `hold-impact`, and
-    `merge-captain` too when the switchboard itself added it for this hold. Returns the lines to print."""
+    `merge-captain` too when the switchboard itself added it for this hold. Returns the lines to print.
+
+    `remove` (the chat clear, #457) names the labels to take off instead: the caller has already read the PR and checked that each is an owner-tier hold label or the captain
+    marker; here every one of them is checked again against the owner-tier set, so no other label can ever be removed. `head` is the head the owner was shown: the clear
+    is refused when the PR's head is any other. `verify(raw)` (the chat clear's) is run on the PR this call just read, before anything is written, and raises NoticeError to refuse:
+    the check and the effect use ONE read. `via` is said in the audit line. The head-bound clear state is recorded for any clear, even one that removes no impact label: it only
+    stops the daemon adding its impact hold for that head. Nothing here ever ADDS a label."""
     pr = "%s#%d" % (repo, number)
     if engine.audit is None:   # a clear is a logged act: with no audit sink it is refused, loudly, before anything changes
         raise RuntimeError("no audit sink: an impact clear is refused rather than made unlogged")
     raw = read_pr_json(engine, repo, number)
-    head = raw.get("headRefOid")
-    if not isinstance(head, str) or not head:
+    current = raw.get("headRefOid")
+    if not isinstance(current, str) or not current:
         raise NoticeError("the PR's head is unknown")
+    if head is not None and current != head:
+        raise NoticeError("the PR's head moved since the owner was shown it (%s, not %s): nothing was cleared" % (current[:8], head[:8]))
+    if verify is not None:
+        verify(raw)
     names = label_names(engine.config)
+    if remove is not None:
+        cc = load_module("chat_clear")
+        allowed = {names[key] for key in cc.HOLD_KEYS + (cc.CAPTAIN_KEY,)}
+        if not remove or any(label not in allowed for label in remove):
+            raise RuntimeError("a clear removes owner-tier hold labels and the captain marker only: refused %r" % (sorted(set(remove) - allowed),))
     with impact_state_lock(engine.state_dir):   # the same lock as the daemon's write: the clear and its removal are one step
         state, problem = read_impact_state(engine.state_dir)
         _impact_state_noted(engine, problem)
         ours = state["applied"].get(pr) or {}
-        remove = [names["hold-impact"]]
-        if ours.get("merge_label_added"):
-            remove.append(names["merge-captain"])
-        state["clears"][pr] = {"head": head, "reason": reason, "by": who, "at": int(engine.now())}
+        if remove is None:
+            remove = [names["hold-impact"]]
+            if ours.get("merge_label_added"):
+                remove.append(names["merge-captain"])
+        else:
+            remove = list(remove)
+        head_now = current
+        state["clears"][pr] = {"head": head_now, "reason": reason, "by": who, "at": int(engine.now())}
         write_impact_state(engine.state_dir, state)   # the clear first: a failed removal never leaves a hold the daemon would re-add
         change_issue_labels(engine, runner, repo, number, remove=remove)
-        engine.audit.append(engine.actor, "gate.hold_cleared", pr, {"head": head, "by": who, "reason": reason, "removed": remove})   # inside the lock
-    return ["cleared the impact hold of %s at %s: removed %s; the daemon will not re-add it for this head" % (pr, head[:8], ", ".join(remove))]
+        detail = {"head": head_now, "by": who, "reason": reason, "removed": remove}
+        if via:
+            detail["via"] = via
+        engine.audit.append(engine.actor, "gate.hold_cleared", pr, detail)   # inside the lock
+    return ["cleared the impact hold of %s at %s: removed %s; the daemon will not re-add it for this head" % (pr, head_now[:8], ", ".join(remove))]
 
 
 def cmd_impact_clear(args, runner, now):
@@ -18358,6 +18384,181 @@ def cmd_impact_hold(args, runner, now):
     print("%s: %d PR(s) would be held (a dry run: nothing was written; impact_hold is %s)" % (
         PROG, shown, impact_floor.hold_mode(config, repos[0] if repos else "")))
     return EXIT_OK
+
+
+CHAT_CLEAR_NEW_PER_PASS = 3   # the owner's new messages judged in one pass (one Jev call each): the rest wait for the next pass
+
+
+def chat_clear_config(config):
+    """{"enabled", "live"} of the owner's `chat_clear` key. On by default but in SHADOW: `live` is true only when the owner's own config says `"live": true`. This build never sets it."""
+    raw = config.get("chat_clear") if isinstance(config, dict) else None
+    raw = raw if isinstance(raw, dict) else {}
+    return {"enabled": raw.get("enabled") is not False, "live": raw.get("live") is True}
+
+
+CHAT_CLEAR_OFF_FILE = "chat-clear.off"   # the owner's panic stop: its mere presence in the state directory forces SHADOW, checked every pass
+
+
+def chat_clear_live_now(engine):
+    """(live, why): may the hook WRITE on this pass? Only when ALL hold, judged afresh every pass: the config this daemon runs on says `live` (a real true), the kill file
+    `chat-clear.off` is not in the state directory, and the CURRENT config file, read now, is valid and also says `live` and not `enabled: false`. The daemon keeps its last good
+    config when a reload fails, so an invalid or half-edited file would otherwise leave the owner's `live` on: here it means SHADOW at once. `why` is None when live or when
+    shadow is simply the configured mode, else a short reason."""
+    if not chat_clear_config(engine.config)["live"]:
+        return False, None
+    if os.path.lexists(str(Path(engine.state_dir) / CHAT_CLEAR_OFF_FILE)):   # ANY entry, even a dangling symlink, is the panic stop
+        return False, "kill file"
+    try:
+        current = chat_clear_config(load_runnable_config())
+    except Exception as err:   # an invalid, unreadable or missing config file: never live on a file that cannot be read
+        return False, "config invalid: %s" % _one_line(str(err), 120)
+    if not (current["live"] and current["enabled"]):
+        return False, "config says shadow"
+    return True, None
+
+
+def chat_clear_holds(decisions, names):
+    """The holds the owner is shown, read from the SAME decisions the Decisions list is made of: [{"pr", "head", "labels", "summary"}] for every `captain` row that names its head,
+    with the owner-tier labels that row stands for (the captain label, and one `hold-*` label for each hold reason it lists). A reason this build cannot name drops the PR."""
+    holds = []
+    for d in decisions or []:
+        if not isinstance(d, dict) or d.get("kind") != "captain":
+            continue
+        repo, number, head = d.get("repo"), d.get("number"), d.get("head")
+        if not (isinstance(repo, str) and isinstance(number, int) and not isinstance(number, bool) and isinstance(head, str) and head):
+            continue
+        reasons = [h for h in (d.get("holds") or []) if isinstance(h, str)]
+        if any("hold-%s" % h not in names for h in reasons):
+            continue
+        holds.append({"pr": "%s#%d" % (repo, number), "head": head, "labels": [names["merge-captain"]] + [names["hold-%s" % h] for h in reasons],
+                      "summary": d.get("review_evidence") or d.get("headline") or d.get("title") or ""})
+    return holds
+
+
+def chat_clear_pass(engine, decisions, now):
+    """THE daemon hook of #457, called once at the end of a pass with the decisions the Decisions list is made of. Records the offers (the owner-tier holds at the heads shown), and
+    only when there is at least one reads the owner's NEW messages in the Chief of Staff's session (one read, inside v2_light and the call budget), judges each once (one Jev call) and,
+    in LIVE mode only (`chat_clear.live`), clears or asks once. In SHADOW (the default) it logs what it would do and writes nothing to GitHub and sends nothing. Never raises.
+    No command, verb or agent reaches it: only `publish_decisions` calls it, and only the daemon runs that."""
+    try:
+        _chat_clear_pass(engine, decisions, now)
+    except Exception as err:
+        engine._note("chat_clear.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+
+
+def _chat_clear_pass(engine, decisions, now):
+    cfg = chat_clear_config(engine.config)
+    if not cfg["enabled"] or engine.actor != "daemon" or engine.state_dir is None or engine.audit is None or engine.jev is None:
+        return
+    live, why = chat_clear_live_now(engine)
+    cfg = dict(cfg, live=live)
+    mode = "live" if live else ("shadow (%s)" % why if why else "shadow")
+    if engine.__dict__.get("chat_clear_mode") != mode:   # said once per change, loudly: the owner's switch took (or stopped taking) effect
+        previous = engine.__dict__.get("chat_clear_mode")
+        engine.__dict__["chat_clear_mode"] = mode
+        if previous is not None or why:
+            engine.audit.append(engine.actor, "chat_clear.mode", "chat_clear", {"mode": mode, "was": previous, "why": why})
+    cc = load_module("chat_clear")
+    names = label_names(engine.config)
+    holds = chat_clear_holds(decisions, names)
+    refreshed = cc.refresh_offers(engine.state_dir, holds, names, now)
+    if refreshed["added"] or refreshed["dropped"] or refreshed["problem"] or refreshed["damaged"]:
+        engine.audit.append(engine.actor, "chat_clear.offers", "chat_clear", {"added": refreshed["added"][:20], "dropped": refreshed["dropped"][:20],
+                                                                              "problem": refreshed["problem"], "damaged": refreshed["damaged"][:20]})
+    offers = refreshed["offers"]
+    if not offers:
+        return   # nothing is held for the owner: no read of his messages, no Jev call
+    if getattr(engine, "light", False):
+        return   # v2_light: no background read of any session (the same rule as the classifier's reader)
+    discovery = getattr(engine, "discovery", None)
+    cos = next((o for o in (discovery.agents.values() if discovery is not None else []) if (o.fleet or {}).get("role") == "chief-of-staff" and not o.problem and o.session_id), None)
+    if cos is None:
+        return
+    messages = cc.person_messages(newest_prompts(engine, cos.session_id), cc.read_seen(engine.state_dir), now, _created)
+    current_heads = {h["pr"]: h["head"] for h in holds}
+    bar = (engine.config.get("jev") or {}).get("min_confidence", cc.HIGH_CONFIDENCE)
+    for message in messages[:CHAT_CLEAR_NEW_PER_PASS]:
+        cc.mark_seen(engine.state_dir, message["id"], now)   # BEFORE anything is done: one attempt per message, whatever happens
+        offers = cc.read_offers(engine.state_dir)
+        if not offers:
+            engine.audit.append(engine.actor, "chat_clear.dropped", "chat_clear", {"message_id": message["id"], "why": "the offers went away before the message was judged"})
+            return
+        verdict = cc.decide(engine.jev, message["text"], offers, message["created"], now, bar)
+        live_now, _ = chat_clear_live_now(engine)   # AGAIN, right before acting: a kill file or a broken config that appears during this pass stops the very next message
+        _chat_clear_act(engine, cc, dict(cfg, live=live_now), message, verdict, offers, current_heads, now)
+
+
+def _chat_clear_act(engine, cc, cfg, message, verdict, offers, current_heads, now):
+    live, quoted = cfg["live"], cc.quote(message["text"])
+    action, pr, why = verdict["action"], verdict.get("pr"), verdict.get("why")
+    judge = verdict.get("judge") or {}
+    if action == "clear" and not cc.head_matches(offers.get(pr), current_heads.get(pr)):
+        # the head moved since he was shown it (or the offer was never shown): never a clear. The question shows the new head.
+        action, why = "ask", "head_changed"
+        verdict = dict(verdict, question=cc.question_text("head_changed", offers, [pr], current_heads), shown=[pr])
+    detail = {"message_id": message["id"], "quote": quoted, "action": action, "why": why, "pr": pr, "live": live, "would_clear": action == "clear",
+              "probabilities": judge.get("probabilities"), "jev_choice": judge.get("jev_choice"), "model": judge.get("model"), "reason": judge.get("reason"),
+              "screen": (verdict.get("screen") or {}).get("why")}
+    engine.audit.append(engine.actor, "chat_clear.verdict", pr or "chat_clear", detail)
+    if action == "none" or not live:
+        return   # shadow: the verdict is logged and nothing else happens
+    if action == "clear":
+        try:
+            chat_clear_apply(engine, cc, pr, offers[pr], quoted, message["id"], now)
+        except Exception as err:   # the clear failed or was refused at the point of effect: one question, nothing more
+            engine.audit.append(engine.actor, "chat_clear.failed", pr, {"message_id": message["id"], "error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+            verdict = dict(verdict, question=cc.question_text("failed" if not isinstance(err, NoticeError) else "not_held", offers, [pr], current_heads), shown=[pr])
+            action = "ask"
+        else:
+            return
+    if action == "ask":
+        text = "[chat clear] %s\n(your words: \"%s\")" % (verdict["question"], quoted)
+        try:
+            engine.send("switchboard", "chief-of-staff", text)
+        except Exception as err:
+            engine.audit.append(engine.actor, "chat_clear.reply_failed", pr or "chat_clear", {"error": _one_line(str(err), 160)})
+            return
+        for shown in verdict.get("shown") or []:   # the owner was just shown these: their shown head is the one the question named
+            head = current_heads.get(shown)
+            if head:
+                cc.show(engine.state_dir, shown, head, now)
+
+
+def chat_clear_apply(engine, cc, pr, offer, quoted, message_id, now):
+    """THE clear. Called only by the daemon's hook, in LIVE mode, for a message that is the owner's own, names exactly this one PR, was confirmed by Jev at the high bar and is newer
+    than the offer. At the point of effect it READS THE PR AGAIN: it must be open, at exactly the head the owner was shown, with only owner-tier hold labels and the captain marker
+    (any other hold label refuses). It then removes those labels (never any other, never adds one) through the same head-bound core `impact clear` uses, comments with his words,
+    and tells the Chief of Staff."""
+    repo, _, number = pr.rpartition("#")
+    number = int(number)
+    runner = getattr(engine, "gh_runner", None) or subprocess.run
+    names = label_names(engine.config)
+    seen = {}
+
+    def verify(raw):   # run by the core on the SAME read it clears from: open, at the shown head (the core checks), only owner-tier labels
+        if str(raw.get("state") or "").upper() != "OPEN":
+            raise NoticeError("%s is not open any more" % pr)
+        labels = raw.get("labels") or []
+        if raw.get("headRefOid") != offer["head"] or not cc.is_offerable(names, labels):
+            raise NoticeError("%s changed since the owner was shown it: its head or its labels are not what he saw" % pr)
+        seen["remove"] = cc.owner_tier_labels(names, labels)
+
+    raw = read_pr_json(engine, repo, number)
+    verify(raw)   # a cheap refusal before the core's own read; the core verifies again on the read it clears from
+    lines = impact_clear_core(engine, runner, repo, number, "owner (chat)", quoted, remove=seen["remove"], head=offer["head"], via="chat:%s" % message_id, verify=verify)
+    remove = seen["remove"]
+    short = offer["head"][:8]
+    shown_words = quoted.replace("@", "@\u200b").replace("`", "'")   # a public comment: no @mention and no code span can come out of his words
+    body = "The owner cleared this hold in his chat with the Chief of Staff, at head `%s`. His words: \"%s\"\n\nRemoved: %s." % (short, shown_words, ", ".join("`%s`" % l for l in remove))
+    try:
+        comment_as(engine, runner, repo, number, body, "switchboard")
+    except Exception as err:   # the clear is made and audited; a comment that cannot be posted is said, not undone
+        engine.audit.append(engine.actor, "chat_clear.comment_failed", pr, {"error": _one_line(str(err), 160)})
+    try:
+        engine.send("switchboard", "chief-of-staff", "[chat clear] Cleared %s at %s on your words: \"%s\" (removed %s)." % (pr, short, quoted, ", ".join(remove)))
+    except Exception as err:
+        engine.audit.append(engine.actor, "chat_clear.reply_failed", pr, {"error": _one_line(str(err), 160)})
+    return lines
 
 
 def impact_would_hold_pass(engine, now):

@@ -534,7 +534,9 @@ REASONS = {"no_number": "your message names no pull request number", "several_nu
            "hedged": "your message is not a plain clearing sentence (it asks, negates, sets a condition or says something else)",
            "too_long": "your message is too long to read a pull request number from", "unclear_number": "the number in your message sits inside a word",
            "no_time": "the time of your message or of the offer could not be read", "before_offer": "your message was written before you were shown that pull request",
-           "expired": "that offer is old and must be shown to you again first", "jev": "I could not be sure you meant to clear it"}
+           "expired": "that offer is old and must be shown to you again first", "jev": "I could not be sure you meant to clear it",
+           "head_changed": "that pull request has a new head since you were shown it", "not_held": "that pull request is no longer held for you or its labels changed",
+           "failed": "the clear did not finish cleanly: look at the pull request's labels before you rely on it"}
 
 
 def question_text(why, offers, prs=None, current_heads=None):
@@ -592,3 +594,61 @@ def decide(jev, text, offers, created, now, min_confidence=HIGH_CONFIDENCE):
             return dict(base, action="none", why="not about clearing")
         why, prs = checked["why"], checked.get("prs") or None
     return dict(base, action="ask", why=why, question=question_text(why, offers, prs), shown=sorted(prs or offers)[:QUESTION_OFFERS_MAX])
+
+
+# ----------------------------------------------------------------------------- slice 3: what the hook remembers and how it quotes
+#
+# The hook (bin/fleet-switchboard, `chat_clear_pass`, run by the daemon at the end of a pass) records the offers, reads the owner's NEW messages in the Chief of Staff's session,
+# decides, and in LIVE mode only clears. This module holds the pieces that do not touch GitHub: the messages already handled (a message is judged ONCE, across passes and
+# restarts) and the quote of the owner's words.
+
+SEEN_FILE = "chat-clear-seen.json"
+SEEN_MAX = 500
+SEEN_MAX_BYTES = 131072
+QUOTE_MAX = 300
+
+
+def quote(text):
+    """The owner's words as they are written to a PR comment, the audit and the Chief of Staff: one line, control characters out, token-shaped text replaced, at most QUOTE_MAX characters."""
+    return _clean(text, QUOTE_MAX)
+
+
+def read_seen(state_dir):
+    """{message id: epoch seconds it was handled}. An unreadable, oversized or malformed file is EMPTY, which is safe: a message older than MESSAGE_MAX_AGE is never read again,
+    so only the last few minutes could be judged a second time (and a second judgement of one message changes nothing that its first one did not)."""
+    path = Path(state_dir) / SEEN_FILE
+    try:
+        if path.stat().st_size > SEEN_MAX_BYTES:
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    seen = data.get("seen") if isinstance(data, dict) else None
+    if not isinstance(seen, dict):
+        return {}
+    return {k: v for k, v in seen.items() if isinstance(k, str) and 0 < len(k) <= 200 and isinstance(v, int) and not isinstance(v, bool)}
+
+
+def mark_seen(state_dir, message_id, now, lock_seconds=LOCK_SECONDS):
+    """Record that `message_id` has been handled, BEFORE anything is done about it (one attempt per message, whatever happens). Keeps the newest SEEN_MAX. Atomic, private."""
+    with _locked(state_dir, lock_seconds):
+        seen = read_seen(state_dir)
+        seen[message_id] = int(now)
+        if len(seen) > SEEN_MAX:
+            for old in sorted(seen, key=lambda k: seen[k])[:len(seen) - SEEN_MAX]:
+                del seen[old]
+        directory = Path(state_dir)
+        fd, tmp = tempfile.mkstemp(prefix=SEEN_FILE + ".", dir=str(directory))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump({"seen": seen}, handle, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, str(directory / SEEN_FILE))
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
