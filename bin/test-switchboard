@@ -24191,12 +24191,20 @@ class TestImpactRejudge(LedgerBase):
     def listed(self, number, labels=(), head=LEDGER_HEAD):
         return {"number": number, "head": {"sha": head}, "body": "PLAN: acme/app#7", "draft": False, "labels": [{"name": l} for l in labels]}
 
-    def seed_applied(self, numbers, merge_label_added=True, head=LEDGER_HEAD):
+    def seed_applied(self, numbers, merge_label_added=True, head=LEDGER_HEAD, legacy=False, added=None, at=1):
+        """impact-hold.json as the daemon wrote it: the labels it added are listed (`added`); `legacy` is the older record with `merge_label_added` only."""
         path = self.world.state / "impact-hold.json"
-        path.write_text(json.dumps({"clears": {}, "applied": {"acme/app#%d" % n: {"head": head, "merge_label_added": merge_label_added} for n in numbers}}))
+        names = [self.names["merge-captain"], self.names["hold-impact"]]
+        listed = added if added is not None else (names if merge_label_added else [self.names["hold-impact"]])
+        record = {"head": head, "merge_label_added": merge_label_added}
+        if not legacy:
+            record.update(added=listed, at=at)
+        path.write_text(json.dumps({"clears": {}, "applied": {"acme/app#%d" % n: dict(record) for n in numbers}}))
 
     def passes(self, records, advance=0):
         self.t += advance
+        for item in records:   # the pull request's labels as the live read sees them
+            self.prs.setdefault(item["number"], {})["labels"] = [dict(l) for l in item["labels"]]
         if not hasattr(self, "engine"):
             self.hub = FakeHub({"acme/app": records})
             self.engine = self.world.new_engine("daemon")
@@ -24256,6 +24264,49 @@ class TestImpactRejudge(LedgerBase):
         self.view_reads.clear()
         self.passes([self.listed(9, self.both())])
         self.assertEqual(self.removals(), [], "a state file nobody can read removes nothing")
+
+    def test_a_hold_label_a_person_added_first_is_not_removed_when_the_record_lists_only_the_merge_label(self):
+        self.files(9, "migrations/0002.sql")
+        self.seed_applied([9], added=[self.names["merge-captain"]])
+        self.passes([self.listed(9, self.both())])
+        self.assertEqual([w[1].rsplit("/", 1)[-1] for w in self.removals(9)], [urllib.parse.quote(self.names["merge-captain"], safe="")])
+
+    def test_a_record_written_before_the_list_existed_is_read_as_both_labels_ours(self):
+        self.files(9, "migrations/0002.sql")
+        self.seed_applied([9], legacy=True)
+        self.passes([self.listed(9, self.both())])
+        self.assertEqual(len(self.removals(9)), 2)
+
+    def test_after_the_owners_clear_a_record_of_ours_releases_nothing(self):
+        self.files(9, "migrations/0002.sql")
+        (self.world.state / "impact-hold.json").write_text(json.dumps({
+            "clears": {"acme/app#9": {"head": LEDGER_HEAD, "reason": "a false hold", "by": "own", "at": 50}},
+            "applied": {"acme/app#9": {"head": LEDGER_HEAD, "merge_label_added": True, "added": self.both(), "at": 10}}}))
+        self.passes([self.listed(9, self.both())])   # a person put the labels back after the clear: they are not ours
+        self.assertEqual(self.removals(), [])
+
+    def test_the_live_labels_decide_not_the_listed_copy(self):
+        self.files(9, "migrations/0002.sql")
+        self.seed_applied([9])
+        live = {"labels": [{"name": self.names["merge-captain"]}], "headRefOid": LEDGER_HEAD, "files": [{"path": "migrations/0002.sql"}], "changedFiles": 1}
+        with mock.patch.object(sb, "read_pr_json", lambda engine, repo, number, extra="": dict(live)):   # the hold label was already taken off by somebody
+            self.passes([self.listed(9, self.both())])
+        self.assertEqual([w[1].rsplit("/", 1)[-1] for w in self.removals(9)], [urllib.parse.quote(self.names["merge-captain"], safe="")])
+
+    def test_an_independent_hold_that_arrives_before_the_release_keeps_the_hold(self):
+        self.files(9, "migrations/0002.sql")
+        self.seed_applied([9])
+        code, out, err = self.run_as("coder", "review", "record", "acme/app#9", "--reviewer", "impact", "--verdict", "approve", "--impact-action", "hold", "--impact-class", "credentials")
+        self.assertEqual(code, 0, err)
+        self.passes([self.listed(9, self.both())])
+        self.assertEqual(self.removals(), [])
+
+    def test_a_re_apply_adds_to_what_an_earlier_apply_recorded(self):
+        self.files(10, "shims/gh")
+        self.seed_applied([10], added=[self.names["hold-impact"]])
+        self.passes([self.listed(10, [self.names["hold-impact"]])])   # the merge label is missing: the daemon adds only that one
+        recorded = json.loads((self.world.state / "impact-hold.json").read_text())["applied"]["acme/app#10"]
+        self.assertEqual(sorted(recorded["added"]), sorted(self.both()))
 
     # -- S4: when it judges again
 
