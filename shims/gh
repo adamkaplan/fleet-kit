@@ -176,6 +176,11 @@ class NoAccountMapped(Exception):
     """git's credential helper was asked, `gh_users` is set, and this caller has no repository or no account mapped for it: git must not authenticate as a guess."""
 
 
+class NoOwnRepository(NoAccountMapped):
+    """The credential route for a caller with no repository of its own: only the configured DEFAULT repository is known for it, and the default repository's account
+    is never a guess git may use (#473). The launcher records a worker's repository from its working directory; a worker with none is refused here."""
+
+
 class AccountLookupFailed(Exception):
     """The account lookup failed where an account WAS expected (a mapping exists): a write must not fall back to the inherited token."""
 
@@ -302,6 +307,10 @@ def account_env(gh, lookup=None, strict=False, credential=False, args=None):
         lookup = lookup or Lookup()
         ident = lookup.identity()
         repo = ident.get("repo")
+        if credential and ident.get("own") is False and not lookup.failed:
+            # the caller has no repository of its own (`own` false: the repo is only the config's default). Nothing a git push names says which account it is for, and
+            # the default repository's account is a guess that pushes as the wrong account: refuse. Nothing here reads a directory's remote.
+            raise NoOwnRepository("this worker")
         if (not repo or ident.get("own") is False) and not lookup.failed:
             # a caller with no repo of its own (the Chief of Staff: whoami gives only the default `intent_repo`, own false) acts as the account of the
             # repo the command names; with nothing named it keeps the default repo's account as before
@@ -808,6 +817,14 @@ def gate_bind_merge(args, parsed, repo, number, payload):
     return ("args", new + [MATCH_FLAG, head])
 
 
+def refusal_text(err):
+    """The one line a refused credential request says. A worker with no repository of its own gets the fix by name; any other refusal names the repository."""
+    if isinstance(err, NoOwnRepository):
+        return ("gh: this worker has no repository of its own (it was launched without --repo and its working directory had no usable origin), so git cannot "
+                "authenticate as a guess: the default repository's account is never used. Relaunch it with `fleet-switchboard launch ... --repo OWNER/NAME`\n")
+    return "gh: no GitHub account is mapped for %s: git cannot authenticate as a guess (add the repository or its owner to gh_users)\n" % _clean_reason(str(err))
+
+
 def main(args):
     gh = real_gh()
     if gh is None:
@@ -835,13 +852,13 @@ def main(args):
     try:
         env = account_env(gh, lookup, strict=is_write(args), args=args, **extra)
     except NoAccountMapped as err:
-        sys.stderr.write("gh: no GitHub account is mapped for %s: git cannot authenticate as a guess (add the repository or its owner to gh_users)\n" % _clean_reason(str(err)))
+        sys.stderr.write(refusal_text(err))
         return 1
     except AccountLookupFailed:
         try:
             env = account_env(gh, Lookup(write=True), strict=True, args=args, **extra)   # retry the lookup ONCE with a fresh deadline
         except NoAccountMapped as err:
-            sys.stderr.write("gh: no GitHub account is mapped for %s: git cannot authenticate as a guess (add the repository or its owner to gh_users)\n" % _clean_reason(str(err)))
+            sys.stderr.write(refusal_text(err))
             return 1
         except AccountLookupFailed:
             sys.stderr.write("gh: account lookup failed, retry (the fleet shim could not find which GitHub account this write is for, and will not "

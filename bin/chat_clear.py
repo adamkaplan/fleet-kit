@@ -162,8 +162,14 @@ def write_offers(state_dir, offers):
         raise
 
 
+SECRET_SHAPES = re.compile(r"(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|sk-[A-Za-z0-9_-]{16,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{12,}"
+                           r"|(?i:bearer)\s+[A-Za-z0-9._~+/=-]{16,}|\b[A-Fa-f0-9]{40,}\b|\b[A-Za-z0-9+/]{40,}={0,2}(?![A-Za-z0-9+/=]))")
+
+
 def _clean(text, limit):
-    return " ".join(CONTROL.sub(" ", str(text or "")).split())[:limit].encode("utf-8", "replace").decode("utf-8")   # a lone surrogate cannot be written: it becomes ?
+    """One line, control characters out, anything shaped like a token or key replaced by `[secret]`, at most `limit` characters (and always writable text)."""
+    text = SECRET_SHAPES.sub("[secret]", " ".join(CONTROL.sub(" ", str(text or "")[:limit + 300]).split()))   # bounded BEFORE the scan; 300 more than is kept, so a token that straddles the cut is still seen whole
+    return text[:limit].encode("utf-8", "replace").decode("utf-8")   # a lone surrogate cannot be written: it becomes ?
 
 
 def _quarantine(state_dir, now):
@@ -345,6 +351,58 @@ def timing_problem(offer, created, now):
     return None
 
 
+PLAIN_WORDS = frozenset(("a also ahead approve approved are be clear cleared fine go goes going good is it lgtm looks merge ok okay pr please ready release "
+                         "s ship thank thanks the through to you now then").split())
+# Past-tense and report words are NOT in the list (was, were, had, has, been, got, already, merged, shipped, released, done, went, yesterday, earlier, last ...): a message
+# about the past is a report, not a grant. `cleared` and `approved` are the owner's own grant words ("366 cleared", "366 is approved"), so they are allowed ONLY as a
+# state AFTER the number and followed by nothing but thanks: "cleared 366" and "approved 366" read as a report of what was done, and are refused.
+PARTICIPLES = frozenset(("cleared", "approved"))
+# What may come BEFORE the number: only the imperative way in ("ok to merge 366", "please clear 366", "go ahead ship 366"). Thanks, pronouns and "for the" before it read as a thank-you for
+# something already done, which is a report.
+BEFORE_WORDS = frozenset(("please ok okay to merge ship clear approve release go ahead lgtm a pr then now").split())
+LETTERS = re.compile(r"[^\W\d_]+", re.UNICODE)
+
+
+ALLOWED_MARKS = frozenset("#.,! ")
+QUESTION_OPENERS = frozenset(("is", "was", "are", "be", "s"))   # "is 366 good to go" asks by word order, with no question mark
+PRONOUNS = frozenset(("it", "you", "i", "we", "they"))          # "366 is it good to go" is a question too
+
+
+def _plain_clearing(text):
+    """True only when the message is a plain, PRESENT-TENSE clearing sentence: every WORD is in the short allow-list (the number and the marks `#.,!` aside), nothing else but ASCII digits,
+    letters and white space appears (no emoji, no `/s`, no apostrophe form such as "isn't" or "isn\u2019t", no dash, colon, `?` or non-ASCII digit), and no question
+    opener (`is`, `was`, `are`, `be`) except as the word DIRECTLY after the number and not followed by a pronoun ("366 is good to go" is a statement; "is 366 good to go",
+    "366, is it good to go" and "366 is it good to go" are questions without a question mark). Anything else is not plain, whatever a judge would say: the
+    deterministic floor is an allow-list, not a list of hedges."""
+    if any(not ((ch.isalnum() and (ch.isascii() or not ch.isdigit())) or ch.isspace() or ch in ALLOWED_MARKS) for ch in text):
+        return False
+    words = LETTERS.findall(text)
+    if not all(word.lower() in PLAIN_WORDS for word in words):
+        return False
+    lowered = [word.lower() for word in words]
+    thanks_at = next((n for n, word in enumerate(lowered) if word in ("thanks", "thank")), None)
+    if thanks_at is not None and any(word not in ("you", "thanks", "thank", "please", "now") for word in lowered[thanks_at + 1:]):
+        return False   # thanks ends a message ("ok to merge 366, thanks"); "366 thanks for the release" thanks for something already done
+    first = DIGITS.search(text)
+    if first is None:
+        return not any(word.lower() in QUESTION_OPENERS for word in words)
+    before = LETTERS.findall(text[:first.start()])
+    after = LETTERS.findall(text[first.end():])
+    if any(word.lower() not in BEFORE_WORDS for word in before):
+        return False
+    gap = text[first.end():]
+    direct = bool(after) and re.match(r"^\s*" + re.escape(after[0]), gap) is not None   # the first word after the number follows it with nothing but space between
+    for n, word in enumerate(after):
+        if word.lower() in PARTICIPLES:   # a state of the PR: directly after the number (or after is/also/are), NOTHING before the number, and followed by nothing but thanks
+            if before or not ((n == 0 and direct) or (n == 1 and after[0].lower() in ("is", "also", "are"))) or any(w.lower() not in ("now", "thanks", "thank", "you", "please") for w in after[n + 1:]):
+                return False
+        if word.lower() in QUESTION_OPENERS and not (n == 0 and direct):
+            return False
+        if word.lower() in QUESTION_OPENERS and n + 1 < len(after) and after[n + 1].lower() in PRONOUNS:
+            return False
+    return True
+
+
 def screen(text, offers, created, now):
     """The checks no model can waive. Returns {"verdict": "candidate", "pr"} when the message names exactly ONE number, that number stands alone, exactly one
     offer has it and the message came AFTER the owner was shown that offer, else {"verdict": "question", "why": <code>, "prs": [...]} (the owner is asked,
@@ -357,6 +415,9 @@ def screen(text, offers, created, now):
     * `unclear_number`: its one number sits inside a word or a decimal (`abc366`, `3.66`);
     * `not_offered`: the number is not one of the offers;
     * `ambiguous_number`: more than one offer has that number (the same number in two repositories);
+    * `hedged`: the message is not a plain clearing sentence: it asks, negates, conditions or says anything outside a short allow-list of clearing words
+      ("is 366 good to go?", "366 is not good to go", "366 isn\u2019t good to go", "366 is good to go once CI passes", "366 is good to go except the docs"): a clear is never
+      inferred from words like that, whatever a judge would say. A missed clear is one more sentence from the owner;
     * `no_time`, `before_offer`, `expired`: see `timing_problem` (`created` is the message's time, `now` the clock)."""
     text = text if isinstance(text, str) else ""
     prs = sorted(offers or {})
@@ -371,6 +432,8 @@ def screen(text, offers, created, now):
         return {"verdict": "question", "why": "several_numbers", "prs": prs}
     if not _standalone(text, numbers[0]):
         return {"verdict": "question", "why": "unclear_number", "prs": prs}
+    if not _plain_clearing(text):
+        return {"verdict": "question", "why": "hedged", "prs": prs}
     matches = [pr for pr in prs if int(pr.rsplit("#", 1)[1]) == numbers[0]]
     if not matches:
         return {"verdict": "question", "why": "not_offered", "prs": prs}
@@ -387,3 +450,205 @@ def head_matches(offer, current_head):
     that was recorded after the offers were lost and has not been shown (`shown: false`)."""
     return isinstance(offer, dict) and offer.get("shown") is True and isinstance(current_head, str) and bool(current_head) \
         and offer.get("head") == current_head
+
+
+# ----------------------------------------------------------------------------- slice 2: the judge's question and the decision
+#
+# Jev answers ONE choice question with a probability for every option. It can only CONFIRM what the deterministic checks already found (the message
+# names exactly one offered PR, unhedged) or VETO it; it never adds a PR the checks did not name. Anything else (unsure, unreachable, a different
+# offer, "several") is a question to the owner, asked once. Nothing here clears anything: slice 3 acts on `decide`'s "clear".
+
+JUDGE_ID = "clears"
+OPT_SEVERAL, OPT_ASKS, OPT_NOTHING = "several", "asks", "nothing"
+HIGH_CONFIDENCE = 0.9          # the bar for a clear: the config's min_confidence may only raise it
+NOTHING_CONFIDENCE = 0.5       # "this message is not about clearing" needs this much before the owner is NOT asked
+JUDGE_TEXT_MAX = 1000
+JUDGE_OFFERS_MAX = 40
+JUDGE_INSTRUCTIONS = (
+    "The owner of a software fleet holds some pull requests until he says they may go. He has just sent a message to his assistant. "
+    "Does this message clear exactly one of the held pull requests listed below, clear several of them, ask something about them, "
+    "or say nothing about clearing a held pull request?")
+
+
+def judge_request(text, offers):
+    """(state, questions) for one judge call: the message and the offers (PR, short head, one-line summary), and the options."""
+    shown = [(pr, offers[pr]) for pr in sorted(offers)[:JUDGE_OFFERS_MAX]]
+    state = {"message": _clean(text, JUDGE_TEXT_MAX),
+             "held": [{"pr": pr, "head": _clean(str(offer.get("head", ""))[:8], 8), "summary": _clean(offer.get("summary"), SUMMARY_MAX)} for pr, offer in shown]}
+    criteria = {}
+    for pr, offer in shown:
+        criteria[pr] = "The message clears %s (%s) and no other held pull request: the owner says it may go." % (pr, _clean(offer.get("summary"), SUMMARY_MAX) or "no summary")
+    criteria[OPT_SEVERAL] = "The message clears more than one held pull request, or all of them, or does not say which."
+    criteria[OPT_ASKS] = "The message asks a question about a held pull request, or sets a condition, or says it is NOT ready."
+    criteria[OPT_NOTHING] = "The message says nothing about clearing a held pull request."
+    return state, {JUDGE_ID: {"type": "choice", "instructions": JUDGE_INSTRUCTIONS, "criteria": criteria}}
+
+
+def judge(jev, text, offers, min_confidence=HIGH_CONFIDENCE):
+    """One Jev call. {"choice", "confident", "probabilities", "reason", "jev_choice", ...}; NEVER raises. No judge, an unreachable or erring one, an answer with no
+    probabilities and an answer below the bar all give `choice` None and `confident` False: they confirm nothing."""
+    bar = min_confidence if isinstance(min_confidence, (int, float)) and not isinstance(min_confidence, bool) and min_confidence == min_confidence \
+        and min_confidence <= 1 and min_confidence > HIGH_CONFIDENCE else HIGH_CONFIDENCE   # a bad, NaN or lower bar is the floor: the bar can only be raised
+    out = {"choice": None, "confident": False, "probabilities": None, "reason": "", "jev_choice": None, "model": None, "usage": {}, "latency_ms": None, "validated": False}
+    if jev is None:
+        out["reason"] = "no judge is configured"
+        return out
+    state, questions = judge_request(text, offers)
+    try:
+        result = jev.decide(state, questions)
+        answer = result["answers"][JUDGE_ID]
+    except Exception as err:   # JevError (unreachable, timeout, bad answer, ...): its reason is the only thing kept, never its text
+        out["reason"] = "jev %s" % re.sub(r"[^a-z_ ]", "", str(getattr(err, "reason", type(err).__name__)).lower())[:40]
+        out["latency_ms"] = getattr(err, "latency_ms", None)
+        return out
+    if not isinstance(answer, dict):
+        out["reason"] = "jev gave an unreadable answer"
+        return out
+    probabilities = answer.get("probabilities")
+    options = questions[JUDGE_ID]["criteria"]
+    choice = answer.get("choice")
+    out.update(jev_choice=_clean(choice, 80) if isinstance(choice, str) else None, model=_clean(result.get("model"), 60) if isinstance(result.get("model"), str) else None,
+               latency_ms=result.get("latency_ms") if isinstance(result.get("latency_ms"), (int, float)) and not isinstance(result.get("latency_ms"), bool) else None)
+    if not (isinstance(probabilities, dict) and probabilities and all(isinstance(k, str) and isinstance(v, (int, float)) and not isinstance(v, bool) and v == v and 0 <= v <= 1
+                                                                      for k, v in probabilities.items())):
+        out["reason"] = "jev gave no probabilities" if not probabilities else "jev gave an unreadable answer"
+        return out
+    probabilities = {k: v for k, v in probabilities.items() if k in options}   # only the options that were offered are kept
+    numbers = list(probabilities.values())
+    top = probabilities.get(choice) if isinstance(choice, str) else None
+    if top is None or top < max(numbers) or abs(sum(numbers) - 1) > 0.01:
+        out["reason"] = "jev gave an unreadable answer"   # the choice is not an option, or is not the most probable one, or the probabilities do not add up to 1
+        return out
+    tied = sum(1 for v in numbers if v == top) > 1
+    out.update(probabilities=probabilities, usage=result.get("usage") if isinstance(result.get("usage"), dict) else {}, validated=not tied)
+    if top < bar or tied:
+        out["reason"] = "unsure: %s at %s is below %.2f or tied" % (out["jev_choice"], top, bar)
+        return out
+    out.update(choice=answer["choice"], confident=True, reason="confident: %s at %.2f" % (answer["choice"], top))
+    return out
+
+
+QUESTION_OFFERS_MAX = 10
+REASONS = {"no_number": "your message names no pull request number", "several_numbers": "your message names more than one pull request",
+           "not_offered": "that number is not one of the held pull requests", "ambiguous_number": "that number is held in more than one repository",
+           "hedged": "your message is not a plain clearing sentence (it asks, negates, sets a condition or says something else)",
+           "too_long": "your message is too long to read a pull request number from", "unclear_number": "the number in your message sits inside a word",
+           "no_time": "the time of your message or of the offer could not be read", "before_offer": "your message was written before you were shown that pull request",
+           "expired": "that offer is old and must be shown to you again first", "jev": "I could not be sure you meant to clear it",
+           "head_changed": "that pull request has a new head since you were shown it", "not_held": "that pull request is no longer held for you or its labels changed",
+           "failed": "the clear did not finish cleanly: look at the pull request's labels before you rely on it"}
+
+
+def question_text(why, offers, prs=None, current_heads=None):
+    """The ONE question the owner is asked: why nothing was cleared, what is held for him (PR, short head, summary) and how to clear one. Control characters
+    are out of every line. `current_heads` {pr: head} adds the PR's new head where it differs from the one he was shown (a push since)."""
+    names = sorted(prs if prs else offers)[:QUESTION_OFFERS_MAX]
+    lines = ["Nothing was cleared: %s." % REASONS.get(why, why)]
+    if names:
+        lines.append("Held for you now:")
+    for pr in names:
+        offer = offers.get(pr) or {}
+        line = "- %s at %s: %s" % (pr, _clean(str(offer.get("head", ""))[:8], 8), _clean(offer.get("summary"), SUMMARY_MAX) or "no summary")
+        now = (current_heads or {}).get(pr)
+        if isinstance(now, str) and now and now != offer.get("head"):
+            line += " (it has a new head, %s, since you were shown this one)" % _clean(now[:8], 8)
+        lines.append(line)
+    if len(offers) > len(names) and not prs:
+        lines.append("... and %d more." % (len(offers) - len(names)))
+    lines.append("To clear one, say its number, for example: `%s is good to go`." % (names[0].rsplit("#", 1)[1] if names else "366"))
+    return "\n".join(lines)
+
+
+CLEARISH = re.compile(r"\b(?:good to go|ok(?:ay)? to (?:go|merge|ship)|go(?:es)? ahead|clear(?:ed|ing)?|approved?|approving|lgtm|ship(?:ped)?|merge(?:d)?|release[ds]?|unhold|let it (?:go|through)|fine to (?:go|merge)|ready to (?:go|merge|ship))\b", re.IGNORECASE)
+
+
+def decide(jev, text, offers, created, now, min_confidence=HIGH_CONFIDENCE):
+    """What to do about the owner's message. {"action": "clear" | "ask" | "none", "pr", "why", "screen", "judge", "question", "shown"}.
+
+    * no offers, or a message with no clearing words (`good to go`, `cleared`, `approved`, `ship it`, ...): `none`; the judge is not called;
+    * the screen refuses (no number, several, not offered, ambiguous, hedged, too long, a message from before the offer, an old offer): the judge is asked only whether the message is about clearing at all:
+      "nothing" at NOTHING_CONFIDENCE means `none` (the owner is not bothered), anything else is `ask`. A judge's high-confidence "clears it" changes nothing here;
+    * the screen found ONE candidate: `clear` only when the judge picks exactly that PR at the high bar; "nothing" at its bar is `none`; every other
+      answer (unsure, unreachable, another offer, several, asks) is `ask`.
+    `shown` lists the PRs the question puts in front of the owner, for `show()` to move their shown heads."""
+    text = text if isinstance(text, str) else ""
+    checked = screen(text, offers, created, now)
+    if checked.get("why") == "no_offers":
+        return {"action": "none", "pr": None, "why": "no_offers", "screen": checked, "judge": None, "question": None, "shown": []}
+    if not CLEARISH.search(text or ""):   # chat that has no clearing words in it is not asked about and costs no judge call
+        return {"action": "none", "pr": None, "why": "no clearing words", "screen": checked, "judge": None, "question": None, "shown": []}
+    verdict = judge(jev, text, offers, min_confidence)
+    base = {"pr": None, "screen": checked, "judge": verdict, "question": None, "shown": []}
+    probabilities = verdict.get("probabilities") or {}
+    says_nothing = bool(verdict.get("validated")) and verdict.get("jev_choice") == OPT_NOTHING and probabilities.get(OPT_NOTHING, 0.0) >= NOTHING_CONFIDENCE   # only an ANSWER that passed every check can say "not about clearing"
+    if checked["verdict"] == "candidate":
+        pr = checked["pr"]
+        if verdict["confident"] and verdict["choice"] == pr:
+            return dict(base, action="clear", pr=pr, why="confirmed")
+        if verdict["confident"] and verdict["choice"] == OPT_NOTHING:
+            return dict(base, action="none", why="not about clearing")
+        why = "jev"
+        prs = [pr]
+    else:
+        if says_nothing:
+            return dict(base, action="none", why="not about clearing")
+        why, prs = checked["why"], checked.get("prs") or None
+    return dict(base, action="ask", why=why, question=question_text(why, offers, prs), shown=sorted(prs or offers)[:QUESTION_OFFERS_MAX])
+
+
+# ----------------------------------------------------------------------------- slice 3: what the hook remembers and how it quotes
+#
+# The hook (bin/fleet-switchboard, `chat_clear_pass`, run by the daemon at the end of a pass) records the offers, reads the owner's NEW messages in the Chief of Staff's session,
+# decides, and in LIVE mode only clears. This module holds the pieces that do not touch GitHub: the messages already handled (a message is judged ONCE, across passes and
+# restarts) and the quote of the owner's words.
+
+SEEN_FILE = "chat-clear-seen.json"
+SEEN_MAX = 500
+SEEN_MAX_BYTES = 131072
+QUOTE_MAX = 300
+
+
+def quote(text):
+    """The owner's words as they are written to a PR comment, the audit and the Chief of Staff: one line, control characters out, token-shaped text replaced, at most QUOTE_MAX characters."""
+    return _clean(text, QUOTE_MAX)
+
+
+def read_seen(state_dir):
+    """{message id: epoch seconds it was handled}. An unreadable, oversized or malformed file is EMPTY, which is safe: a message older than MESSAGE_MAX_AGE is never read again,
+    so only the last few minutes could be judged a second time (and a second judgement of one message changes nothing that its first one did not)."""
+    path = Path(state_dir) / SEEN_FILE
+    try:
+        if path.stat().st_size > SEEN_MAX_BYTES:
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    seen = data.get("seen") if isinstance(data, dict) else None
+    if not isinstance(seen, dict):
+        return {}
+    return {k: v for k, v in seen.items() if isinstance(k, str) and 0 < len(k) <= 200 and isinstance(v, int) and not isinstance(v, bool)}
+
+
+def mark_seen(state_dir, message_id, now, lock_seconds=LOCK_SECONDS):
+    """Record that `message_id` has been handled, BEFORE anything is done about it (one attempt per message, whatever happens). Keeps the newest SEEN_MAX. Atomic, private."""
+    with _locked(state_dir, lock_seconds):
+        seen = read_seen(state_dir)
+        seen[message_id] = int(now)
+        if len(seen) > SEEN_MAX:
+            for old in sorted(seen, key=lambda k: seen[k])[:len(seen) - SEEN_MAX]:
+                del seen[old]
+        directory = Path(state_dir)
+        fd, tmp = tempfile.mkstemp(prefix=SEEN_FILE + ".", dir=str(directory))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump({"seen": seen}, handle, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, str(directory / SEEN_FILE))
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
