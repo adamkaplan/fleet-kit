@@ -53872,6 +53872,20 @@ class TestAuthorityModulesGuard(unittest.TestCase):
             self.assertTrue(module in listed or module in self.block["authority_modules"]["exempt"], module)
         self.assertGreaterEqual(len(found & listed), 10, "the modules the guard finds that are listed")
 
+    def test_every_exemption_carries_a_trace_of_where_its_values_go_and_the_limits_are_stated(self):
+        exempt = self.block["authority_modules"]["exempt"]
+        self.assertTrue(exempt)
+        for module, reason in exempt.items():
+            self.assertIn("Trace:", reason, module + ": an exemption says where its values go (no value of it feeds an authority function)")
+        limits = self.block["authority_modules"]["limits"]
+        self.assertTrue(isinstance(limits, list) and len(limits) >= 3 and all(isinstance(x, str) and len(x) > 40 for x in limits))
+        self.assertIn("cannot see", " ".join(limits))
+
+    def test_the_external_adapter_that_feeds_answered_by_is_listed_not_exempted(self):
+        listed = {g for globs in self.block["top_tier_paths"].values() for g in globs}
+        self.assertNotIn("bin/external_adapter.py", self.block["authority_modules"]["exempt"])
+        self.assertIn("bin/external_adapter.py", listed)
+
     def test_every_exemption_names_a_real_module_with_a_reason_and_is_not_also_listed(self):
         listed = {g for globs in self.block["top_tier_paths"].values() for g in globs}
         for module, reason in self.block["authority_modules"]["exempt"].items():
