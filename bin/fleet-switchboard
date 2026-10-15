@@ -2466,23 +2466,23 @@ class SpotlightFacts:
             saved = sg.load(engine.state_dir)
             self.tracker = sg.Tracker((saved or {}).get("folders"))
             self.saved = sg.stable(saved) if saved else None
-            self.counts = {f: e.get("count") for f, e in ((saved or {}).get("folders") or {}).items() if isinstance(e, dict)}
+            self.counts = {f: sg.clean_count(e.get("count")) for f, e in ((saved or {}).get("folders") or {}).items() if isinstance(e, dict)}
         with self.lock:
             results, self.done = self.done, None
         if results:
             self._apply(engine, sg, results)
-        facts = self._open(engine, sg)   # EVERY pass while an episode is open: the delivery layer batches (a fact must still be pending when the batch is ripe) and dedups by the stable key
+        facts = self._open(engine, sg, cfg["folders"])   # EVERY pass while an episode is open: the delivery layer batches (a fact must still be pending when the batch is ripe) and dedups by the stable key
         alive = self.thread is not None and self.thread.is_alive()
         if not alive and (self.started is None or engine.now() - self.started >= sg.CHECK_SECONDS):
             self._start(engine, sg, cfg)
         return facts
 
-    def _open(self, engine, sg):
+    def _open(self, engine, sg, folders):
         """The wake of each open episode, one fact per Chief of Staff, the same key and `created` on every pass."""
         chiefs = self._chiefs(engine)
         facts = []
         for folder, episode in sorted(self.tracker.episode.items()):
-            if episode is None or not chiefs:
+            if episode is None or not chiefs or folder not in folders:   # a folder no longer guarded wakes nobody
                 continue
             text = sg.wake_text(folder, self.counts.get(folder), PROG)
             key = "spotlight.lost:%s:%d" % (hashlib.sha256(folder.encode()).hexdigest()[:10], int(episode))

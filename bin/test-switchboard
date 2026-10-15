@@ -48957,6 +48957,22 @@ class TestSpotlightGuard(Base):
         self.engine.run_pass()
         self.assertEqual(len(self.spotlight_sends()), 1)
 
+    def test_a_damaged_state_file_never_reaches_a_wake_or_a_line_nor_breaks_the_pass(self):
+        folder = self.dirs[0]
+        Path(self.world.state, "spotlight-guard.json").write_text(json.dumps({"folders": {
+            folder: {"state": "indexed", "count": "\x1b[31mevil", "streak": 2, "episode": 1.0},
+            self.dirs[1]: {"state": "indexed", "count": 5, "streak": 2, "episode": float("inf")},
+            "/not/guarded": {"state": "indexed", "count": 5, "streak": 2, "episode": 1.0}}, "checked_at": 1.0}))
+        fresh = sb.SpotlightFacts()
+        fresh.bind(self.engine)
+        facts = fresh()
+        self.assertEqual(len(facts), 1, "only the guarded folder with a sane episode wakes; an unguarded folder and an infinite episode wake nobody")
+        self.assertNotIn("\x1b", facts[0].summary)
+        self.assertIn("some entries", facts[0].summary)
+        cfg = self.sg.settings(self.engine.config.get("spotlight_guard"))
+        lines = self.sg.status_lines(cfg, self.sg.load(self.world.state), 1.0)
+        self.assertFalse(any("\x1b" in line for line in lines), lines)
+
     def test_s5_a_normal_pass_starts_nothing_and_a_slow_tool_never_delays_it(self):
         gate = threading.Event()
         self.block[0] = gate

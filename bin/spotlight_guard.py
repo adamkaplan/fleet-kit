@@ -12,6 +12,7 @@ Per folder the answer is one of `excluded` (count 0), `indexed` (count above 0),
 `unknown` (the tool is missing, timed out or printed something that is not a count: never excluded, never a warning)."""
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -129,7 +130,8 @@ class Tracker:
             if isinstance(entry, dict):
                 streak, episode = entry.get("streak"), entry.get("episode")
                 self.streak[folder] = streak if isinstance(streak, int) and not isinstance(streak, bool) and 0 <= streak < 1000 else 0
-                self.episode[folder] = float(episode) if isinstance(episode, (int, float)) and not isinstance(episode, bool) else None
+                good = isinstance(episode, (int, float)) and not isinstance(episode, bool) and math.isfinite(episode) and episode > 0
+                self.episode[folder] = float(episode) if good else None
 
     def step(self, folder, state, now):
         """The event of this check: "begin", "end" or None."""
@@ -207,7 +209,8 @@ def status_lines(cfg, saved, now):
         if not isinstance(entry, dict):
             lines.append("%s: not checked yet" % shown)
             continue
-        state, count = entry.get("state"), entry.get("count")
+        state, count = entry.get("state"), clean_count(entry.get("count"))
+        count = "?" if count is None else count
         if state == EXCLUDED:
             lines.append("%s: excluded from Spotlight" % shown)
         elif state == INDEXED and entry.get("episode") is not None:
@@ -221,6 +224,11 @@ def status_lines(cfg, saved, now):
     return lines
 
 
+def clean_count(value):
+    """A count from the state file: a whole number from 0 up to 10**12, else None (a damaged or hostile file never reaches a line or a wake)."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and 0 <= value < 10 ** 12 else None
+
+
 def wake_text(folder, count, prog):
     return ("spotlight: %s is being indexed again (%s entries in the index on two checks in a row). The exclusion was lost: add the folder back under System Settings, "
-            "Spotlight, Search Privacy. `%s status` shows the line." % (_plain(folder), count, prog))
+            "Spotlight, Search Privacy. `%s status` shows the line." % (_plain(folder), clean_count(count) if clean_count(count) is not None else "some", prog))
