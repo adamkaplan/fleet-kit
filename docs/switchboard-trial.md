@@ -118,7 +118,7 @@ Each of these is something the stack claims; watch whether it holds.
    question "<one line>"`: within a few seconds a row appears with an id, how long
    it has waited and its title. Refer to it by id in chat ("answer #5: yes"). Take
    the label off, or answer the coder with `send`, and the row goes. An empty list
-   shows `none`. Stop the daemon (`down`, then wait two minutes) and the section
+   shows `none`. Stop the daemon (`down`, then wait three minutes) and the section
    reads `daemon not updating` rather than a stale list. In a terminal without the
    plugin, or before you restart a TUI, `fleet-switchboard decisions` prints the
    same list (run it with the trial's config, as for `pending` below) and

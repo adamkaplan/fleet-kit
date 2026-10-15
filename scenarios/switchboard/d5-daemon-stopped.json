@@ -14,7 +14,7 @@
   "steps": [
     {"at": "10s", "actor": "coder", "do": "report", "state": "question", "text": "Which database?", "issue": 2},
     {"at": "30s", "actor": "world", "do": "kill-daemon"},
-    {"at": "4m", "actor": "world", "do": "wait", "why": "More than two minutes with no pass"}
+    {"at": "4m", "actor": "world", "do": "wait", "why": "More than three minutes with no pass"}
   ],
   "expect": [
     {"name": "current-while-alive", "that": "decisions", "at": "25s", "count": 1, "text": "Which database?"},

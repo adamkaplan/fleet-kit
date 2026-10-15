@@ -8162,7 +8162,7 @@ def prune_report_riders(engine, discovery):
 # ======================================================================
 
 DECISIONS_FILE = "decisions.json"
-DECISIONS_STALE_SECONDS = 120   # a file this old (by mtime, which every pass refreshes) is not current
+DECISIONS_STALE_SECONDS = 180   # a file this old (by mtime, which every pass refreshes) is not current
 DECISION_TITLE_MAX = decision_core.DECISION_TITLE_MAX
 DECISION_REPORT_TITLE_MAX = decision_core.DECISION_REPORT_TITLE_MAX
 DECISION_SOURCES = ("github", "v2", "reports")

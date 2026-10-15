@@ -7,7 +7,7 @@ import { isAbsolute, join } from "node:path"
 
 export const STATE_ENV = "FLEET_SWITCHBOARD_STATE"
 export const DECISIONS_FILE = "decisions.json"
-export const STALE_MS = 120_000       // older than this (by mtime, which every daemon pass refreshes): not current
+export const STALE_MS = 180_000       // older than this (by mtime, which every daemon pass refreshes): not current
 export const SAFETY_MS = 60_000       // one slow re-read in case a file event was missed
 export const ROW_WIDTH = 34           // characters of one row: the sidebar is about 36 wide (Lab, 160 columns); titles wrap to it
 export const LONG_WAIT_SECONDS = 3600  // a decision waiting longer than this is "over 1h" (the CLI's status line counts the same way)

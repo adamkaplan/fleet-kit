@@ -26467,10 +26467,10 @@ class TestDecisionsCommand(DecisionsBase):
                 self.assertEqual(code, 1)
                 self.assertIn("the daemon is not updating this list", out)
 
-    def test_a_file_older_than_two_minutes_is_stale_not_current(self):
+    def test_a_file_older_than_the_stale_bound_is_stale_not_current(self):
         self.ask_the_boss("Which database?")
         self.pass_()
-        self.world.tick(121)
+        self.world.tick(sb.DECISIONS_STALE_SECONDS + 1)
         code, out, err = self.cli("decisions")
         self.assertEqual(code, 1)
         self.assertIn("the daemon is not updating this list", out)
@@ -26478,7 +26478,7 @@ class TestDecisionsCommand(DecisionsBase):
         code, out, err = self.cli("decisions", "--json")
         self.assertEqual((json.loads(out)["stale"], code), (True, 1))
         self.world.clock.t -= 10
-        self.assertEqual(self.cli("decisions")[0], 0, "two minutes is the edge")
+        self.assertEqual(self.cli("decisions")[0], 0, "the stale bound is the edge")
 
     def test_a_file_that_is_not_json_is_unreadable_not_empty(self):
         self.pass_()
@@ -26660,10 +26660,10 @@ put({ decisions: list, errors: [] });
 const ok = d.loadSnapshot(dir, now);
 results.ok = { status: ok.status, n: ok.decisions.length };
 results.view = d.buildView(ok, now);
-put({ decisions: list, errors: [] }, 121000);
+put({ decisions: list, errors: [] }, d.STALE_MS + 1000);
 results.staleStatus = d.loadSnapshot(dir, now).status;
 results.staleView = d.buildView(d.loadSnapshot(dir, now), now);
-put({ decisions: list, errors: [] }, 119000);
+put({ decisions: list, errors: [] }, d.STALE_MS - 1000);
 results.edge = d.loadSnapshot(dir, now).status;
 put({ decisions: [], errors: [] });
 results.emptyView = d.buildView(d.loadSnapshot(dir, now), now);
@@ -26788,7 +26788,7 @@ class TestDecisionsPlugin(Base):
         self.assertEqual(lines[10:13], ["web#2 50m", "\u2504" * 34, "newer web"])  # a thin rule between entries
         self.assertEqual(lines[13], "web#9 5m")
 
-    def test_a_file_older_than_two_minutes_is_not_current_and_says_so(self):
+    def test_a_file_older_than_the_stale_bound_is_not_current_and_says_so(self):
         self.assertEqual((self.r["staleStatus"], self.r["edge"]), ("stale", "ok"))
         self.assertEqual(self.r["staleView"], {"title": "Decisions (?)", "groups": [], "rows": [{"key": "state", "text": "daemon not updating"}]})
 
@@ -26809,7 +26809,7 @@ class TestDecisionsPlugin(Base):
                          self.r["ages"])
 
     def test_the_stale_timer_and_the_event_filter(self):
-        self.assertEqual(self.r["until"], [21000, 121000, None])
+        self.assertEqual(self.r["until"], [sb.DECISIONS_STALE_SECONDS * 1000 - 99000, sb.DECISIONS_STALE_SECONDS * 1000 + 1000, None])
         self.assertEqual(self.r["concerns"], [True, True, False, True, True])
         self.assertEqual(self.r["oneLine"], ["a b c", "xxxxxxxxx\u2026", ""])
 
@@ -36673,7 +36673,7 @@ class TestDecisionBaselineViews(BaselineWorld):
         self.daemon_pass()
         out["empty, you"] = self.cmd("you", "decisions")
         out["empty, cos"] = self.cmd("cos", "decisions")
-        self.world.tick(121)
+        self.world.tick(sb.DECISIONS_STALE_SECONDS + 1)
         out["stale"] = self.cmd("you", "decisions")
         out["stale, json"] = self.cmd("you", "decisions", "--json")
         self.world.clock.t -= 1
@@ -36721,7 +36721,7 @@ class TestDecisionBaselineStatus(BaselineWorld):
         self.daemon_pass()
         out["the full house"] = self.line()
         self.world.engine.run_pass()
-        self.world.tick(130)
+        self.world.tick(sb.DECISIONS_STALE_SECONDS + 10)
         out["a file the daemon stopped keeping"] = self.line()
         baseline_golden(self, "status-line", out)
 
@@ -49714,6 +49714,22 @@ class TestModuleLoader(Base):
         with self.assertRaises(FileNotFoundError):
             mod.load_module("no_such_module")
         self.assertNotIn("outside_mod", sys.modules)
+
+
+class TestDecisionsStaleBound(unittest.TestCase):
+    """Work item #449: the staleness bound of the decisions list is 180 s on both sides, and the docs say so."""
+
+    def test_s1_the_daemon_and_plugin_bounds_are_180_seconds(self):
+        self.assertEqual(sb.DECISIONS_STALE_SECONDS, 180)
+        self.assertIn("export const STALE_MS = 180_000", (DECISIONS_PLUGIN / "decisions.mjs").read_text())
+        self.assertIn("export const DECISIONS_STALE_MS = 180_000", (DECISIONS_PLUGIN / "health.mjs").read_text(), "the health view's copy of the bound")
+
+    def test_s3_the_docs_no_longer_say_120_s_for_the_decisions_staleness(self):
+        self.assertNotIn("older than 120 s", (DECISIONS_PLUGIN / "README.md").read_text())
+        lines = (REPO / "docs" / "switchboard.md").read_text().splitlines()
+        stale = [line for line in lines if "120 s" in line and ("stale" in line or "Staleness" in line or "not updating" in line or "older than" in line)]
+        self.assertEqual(stale, [])
+        self.assertGreaterEqual(len([line for line in lines if "180 s" in line and ("stale" in line or "Staleness" in line or "not updating" in line or "older than" in line)]), 4)
 
 
 if __name__ == "__main__":
