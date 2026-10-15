@@ -17918,7 +17918,9 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
     record, record_problem = (impact_review_record(engine.state_dir, "%s#%d" % (repo, number), head) if engine.state_dir is not None and isinstance(head, str) else (None, None))
     if record_problem:
         record = ("hold", None)   # an unreadable ledger is an unknown rating: it holds
-    owner = impact_floor.owner_decide(matrix, paths, [(sev, prob, None) for sev, prob in rated_pairs], unknown, hit, narrow, record)   # advisory (#451): which tier the owner-hold rule puts it in; the labels still follow `decision` until the re-judge slice
+    owner = impact_floor.owner_decide(matrix, paths, [(sev, prob, None) for sev, prob in rated_pairs], unknown, hit, narrow, record)
+    if record_problem:
+        owner = (owner[0], owner[1] + ["the ledger could not be read, so the independent rating is unknown: %s" % _one_line(str(record_problem), 120)])   # advisory (#451): which tier the owner-hold rule puts it in; the labels still follow `decision` until the re-judge slice
     if engine.state_dir is not None and isinstance(head, str):
         review, problem = impact_review_hold(engine.state_dir, "%s#%d" % (repo, number), head)
         if problem:
@@ -18013,7 +18015,9 @@ def read_impact_state(state_dir):
         return empty, "%s is not valid JSON" % IMPACT_STATE_FILE
     if not isinstance(raw, dict):
         return empty, "%s is not an object" % IMPACT_STATE_FILE
-    return {k: raw[k] if isinstance(raw.get(k), dict) else {} for k in ("clears", "applied")}, None
+    found = {k: raw[k] if isinstance(raw.get(k), dict) else {} for k in ("clears", "applied")}
+    found.update({k: raw[k] for k in ("posted", "matrix_error") if isinstance(raw.get(k), dict)})   # #451 slice 3: only when the file has them
+    return found, None
 
 
 def write_impact_state(state_dir, data):
@@ -18234,74 +18238,241 @@ def cmd_impact_hold(args, runner, now):
     return EXIT_OK
 
 
+IMPACT_POSTED_KEEP = 5   # versions of the rule whose posted list is remembered
+IMPACT_LIST_MAX = 40     # pull requests named in a posted list
+
+
+def impact_records(state_dir):
+    """({(pr, head): (impact_action, impact_class)}, problem): the independent impact reviewer's newest record per pull request and head, read once. A ledger
+    that cannot be read gives ({}, why): the rating is then unknown and nothing is released on it."""
+    try:
+        entries, problem = plan_ledger.read_ledger(state_dir)
+    except Exception as err:
+        return {}, "%s: %s" % (type(err).__name__, _one_line(str(err), 100))
+    if problem:
+        return {}, _one_line(str(problem), 120)
+    found = {}
+    for entry in entries:
+        if entry.get("kind") == "review_record" and entry.get("reviewer") == "impact":
+            found[(entry.get("pr"), entry.get("head"))] = (entry.get("impact_action"), entry.get("impact_class"))
+    return found, None
+
+
+def release_impact_hold(engine, repo, number, report, record):
+    """(#451 slice 3) Take the hold off a pull request the owner-hold rule no longer holds: ONLY the labels this daemon added itself, as its own record in
+    impact-hold.json says (the hold label, and the merge label only when the record says it added that one too). A label a person or another tool added, a
+    pull request with no record of ours, a record that is missing or corrupt: nothing is removed. Returns the number of gh calls spent."""
+    with impact_state_lock(engine.state_dir):   # the same lock as the owner's clear and the daemon's write: the three never interleave
+        state, problem = read_impact_state(engine.state_dir)
+        if problem:
+            _impact_state_noted(engine, problem)
+            return 0   # a state we cannot trust removes nothing
+        pr = report["pr"]
+        ours = state["applied"].get(pr)
+        if not isinstance(ours, dict):
+            return 0
+        names = label_names(engine.config)
+        have = {(l.get("name") if isinstance(l, dict) else l) for l in (record.get("labels") or [])}
+        remove = [l for l in ([names["hold-impact"]] + ([names["merge-captain"]] if ours.get("merge_label_added") is True else [])) if l in have]
+        runner = getattr(engine, "gh_runner", None) or subprocess.run
+        if remove:
+            change_issue_labels(engine, runner, repo, number, remove=remove)
+        del state["applied"][pr]
+        write_impact_state(engine.state_dir, state)
+        engine.audit.append(engine.actor, "gate.hold_released", pr, {"head": report["head"], "removed": remove, "reasons": report.get("owner_reasons", [])[:5],
+                                                                      "rule": engine.__dict__.get("impact_rule")})
+        return len(remove)
+
+
+def _impact_cos(engine):
+    discovery = getattr(engine, "discovery", None)
+    agents = getattr(discovery, "agents", None) or {}
+    return next((n for n, o in sorted(agents.items()) if (getattr(o, "fleet", None) or {}).get("role") == "chief-of-staff"), None)
+
+
+def _impact_matrix_episode(engine, now, err):
+    """The matrix file cannot be read (#451 slice 3, PC-4): no label is added or removed (the caller returns), ONE `impact.error` and ONE wake of the Chief of
+    Staff for the episode, kept in impact-hold.json so a restart does not say it again; the episode ends when the file reads (`impact.recovered`)."""
+    try:
+        with impact_state_lock(engine.state_dir):
+            state, problem = read_impact_state(engine.state_dir)
+            if problem:
+                _impact_state_noted(engine, problem)
+            episode = state.get("matrix_error") if isinstance(state.get("matrix_error"), dict) else {}
+            changed = False
+            if not episode.get("noted"):
+                engine.audit.append(engine.actor, "impact.error", "matrix", {"error": _one_line(str(err), 160), "floor": "unreadable"})   # once for the episode (kept in the state file)
+                episode.update(noted=True, since=int(now))
+                changed = True
+            if not episode.get("woken"):
+                cos = _impact_cos(engine)
+                if cos:
+                    add_reminder(engine.state_dir, cos, now, now, "The impact matrix file cannot be read: no hold is added or removed until it reads again, and the "
+                                 "merge gate waits for every pull request it cannot judge (%s)." % _one_line(str(err), 120))
+                    engine.audit.append(engine.actor, "impact.error_wake", cos, {"error": _one_line(str(err), 160)})
+                    episode["woken"] = True
+                    changed = True
+            if changed:
+                state["matrix_error"] = episode
+                write_impact_state(engine.state_dir, state)
+    except Exception as failure:   # the pass never raises: a failed note is tried again next pass
+        sys.stderr.write("%s: impact: %s\n" % (PROG, _one_line(str(failure), 160)))
+
+
+def _impact_matrix_recovered(engine, now):
+    """The matrix file reads again: a standing episode ends (audited) so the next failure is a new one."""
+    try:
+        state, problem = read_impact_state(engine.state_dir)
+        if problem or not state.get("matrix_error"):
+            return
+        with impact_state_lock(engine.state_dir):
+            state, problem = read_impact_state(engine.state_dir)
+            if problem or not state.get("matrix_error"):
+                return
+            since = state["matrix_error"].get("since")
+            state["matrix_error"] = {}
+            write_impact_state(engine.state_dir, state)
+            engine.audit.append(engine.actor, "impact.recovered", "matrix", {"since": since})
+    except Exception as failure:
+        sys.stderr.write("%s: impact: %s\n" % (PROG, _one_line(str(failure), 160)))
+
+
+def _impact_post_list(engine, now, rule, held, released, second):
+    """One audit line and one note to the Chief of Staff for this version of the rule: the pull requests that stay held, those released and those that now
+    ask for a second review. Remembered in impact-hold.json (`posted`) so a restart does not post it again."""
+    try:
+        with impact_state_lock(engine.state_dir):
+            state, problem = read_impact_state(engine.state_dir)
+            posted = state.setdefault("posted", {})
+            if problem or rule in posted:
+                return
+            cos = _impact_cos(engine)
+            text = ("The owner-hold rule (version %s) was applied to the waiting pull requests. Still held for the owner (%d): %s. Released (%d): %s. "
+                    "Second review only (%d): %s." % (rule, len(held), ", ".join(held[:IMPACT_LIST_MAX]) or "none", len(released),
+                                                      ", ".join(released[:IMPACT_LIST_MAX]) or "none", len(second), ", ".join(second[:IMPACT_LIST_MAX]) or "none"))
+            engine.audit.append(engine.actor, "impact.rejudged", "rule:%s" % rule, {"held": held[:IMPACT_LIST_MAX], "released": released[:IMPACT_LIST_MAX],
+                                                                                      "second_review": second[:IMPACT_LIST_MAX]})
+            if cos:
+                add_reminder(engine.state_dir, cos, now, now, text)
+            posted[rule] = int(now)
+            for old in sorted(posted, key=lambda k: posted[k])[:-IMPACT_POSTED_KEEP]:
+                del posted[old]
+            write_impact_state(engine.state_dir, state)
+    except Exception as failure:
+        sys.stderr.write("%s: impact: %s\n" % (PROG, _one_line(str(failure), 160)))
+
+
 def impact_would_hold_pass(engine, now):
-    """The daemon hook (#179 L3, ADVISORY): for the open PRs the ci recorder's list already holds (repos under `plan_gates`), decide the
-    floor once per (PR, head) and audit `gate.would_hold` when it holds. Writes NOTHING to GitHub: the label is slice L4. Reads one
-    `gh pr view` per new head, within IMPACT_PASS_CALLS per pass. Off with `impact_floor.enabled: false` or the global gates kill file.
-    Never raises."""
+    """The daemon hook (#179 L3, #451 slice 3): for the open PRs the ci recorder's list already holds (repos under `plan_gates`), decide the owner-hold
+    rule once per (PR, head, version of the rule, impact review record), audit `gate.would_hold` when it holds, and, when `impact_hold` enforces, WRITE the hold
+    for a pull request that holds and RELEASE (only the labels this daemon added) one that no longer does. One `gh pr view` per judgement, within
+    IMPACT_PASS_CALLS per pass. When the matrix file cannot be read nothing is added or removed (one error and one wake for the episode). Off with
+    `impact_floor.enabled: false` or the global gates kill file. Never raises."""
     cfg = (engine.config.get("impact_floor") or {}) if isinstance(engine.config, dict) else {}
     if cfg.get("enabled") is False or engine.state_dir is None or engine.audit is None or gates_off_path(engine.state_dir).exists():
         return
     state = getattr(engine, "ci_record_state", None)
     if state is None:
         return
+    try:
+        rule = impact_floor.rule_fingerprint()
+    except impact_floor.MatrixError as err:   # fail LOUD and still: no judgement, no label added, none removed
+        _impact_matrix_episode(engine, now, err)
+        return
+    engine.impact_rule = rule
     seen = engine.__dict__.setdefault("impact_seen", {})
     reports = engine.__dict__.setdefault("impact_reports", {})
+    released_now = engine.__dict__.setdefault("impact_released", {}).setdefault(rule, [])
     hold_cfg = (engine.config.get("impact_hold") or {}) if isinstance(engine.config, dict) else {}
     budget = hold_cfg.get("calls_per_pass", cfg.get("calls_per_pass", IMPACT_PASS_CALLS))   # `impact_hold.calls_per_pass` wins when set
-    for key, (_, records) in sorted(state.lists.items()):
-        for record in records:
-            if isinstance(record, dict) and isinstance(record.get("number"), int) and (key, record["number"]) in reports:
-                # a PR already judged at this head: only a NEW independent `hold` can add one (no gh read; the floor is unchanged)
-                earlier = reports[(key, record["number"])]
-                added_hold = (earlier["decision"] != "hold" and earlier["head"] == ((record.get("head") or {}).get("sha"))
-                              and impact_floor.hold_mode(engine.config, key) == "enforce"
-                              and impact_review_hold(engine.state_dir, earlier["pr"], earlier["head"]))
-                if added_hold and added_hold[0]:
-                    added = dict(earlier, decision="hold", reasons=earlier["reasons"] + [added_hold[1] or IMPACT_REVIEW_REASON])
-                    try:
-                        budget -= apply_impact_hold(engine, key, record["number"], added, record)
-                        reports[(key, record["number"])] = added
-                        engine.audit.append(engine.actor, "gate.would_hold", added["pr"], {"head": added["head"], "reasons": added["reasons"],
-                                                                                             "floor_paths": [], "advisory": False, "unknown": None})
-                    except Exception as err:
-                        engine._note("impact.error", added["pr"], {"error": _one_line(str(err), 160), "write": True})
+    records, records_problem = impact_records(engine.state_dir)
+    unjudged, live = 0, set()
+    for key, (_, listed) in sorted(state.lists.items()):
+        for record in listed:
             number = record.get("number") if isinstance(record, dict) else None
             head = ((record.get("head") or {}).get("sha")) if isinstance(record, dict) else None
             if not isinstance(number, int) or isinstance(number, bool) or not head or record.get("draft"):
                 continue
+            pr = "%s#%d" % (key, number)
+            live.add((key, number))
+            enforce = impact_floor.hold_mode(engine.config, key) == "enforce"
+            earlier = reports.get((key, number))
+            if earlier is not None and earlier["head"] == head and earlier.get("rule") == rule and earlier.get("owner_decision") != "hold" and enforce \
+                    and not records_problem and (pr, head) in records and seen.get((key, number)) != (head, rule, records[(pr, head)]):
+                # an impact review record that is new since this head was judged, on a pull request that holds nothing: no gh read (the paths are unchanged).
+                # A `hold` of a top tier, missing or unknown class can only ADD a hold; anything else changes nothing, so it is only noted as seen.
+                newest = records[(pr, head)]
+                if newest[0] == "hold" and impact_floor.class_is_top_tier(impact_floor._matrix_cached(), newest[1]):
+                    added = dict(earlier, decision="hold", owner_decision="hold", reasons=earlier["reasons"] + [IMPACT_REVIEW_REASON])
+                    try:
+                        budget -= apply_impact_hold(engine, key, number, added, record)
+                        reports[(key, number)] = added
+                        seen[(key, number)] = (head, rule, newest)
+                        engine.audit.append(engine.actor, "gate.would_hold", pr, {"head": head, "reasons": added["reasons"], "floor_paths": [], "advisory": False, "unknown": None})
+                    except Exception as err:
+                        engine._note("impact.error", pr, {"error": _one_line(str(err), 160), "write": True})
+                else:
+                    seen[(key, number)] = (head, rule, newest)
+                continue
             try:
                 globs = impact_floor.floor_for(key, engine.config)[0]
             except impact_floor.MatrixError as err:   # fail LOUD: no judgement is made while the matrix file cannot be read (never read as "no floor")
-                engine._note("impact.error", key, {"error": _one_line(str(err), 160), "floor": "unreadable"})
+                _impact_matrix_episode(engine, now, err)
                 return
-            if not globs or seen.get((key, number)) == head or budget <= 0:
+            if not globs:
+                continue
+            signature = (head, rule, "unreadable" if records_problem else records.get((pr, head)))
+            if seen.get((key, number)) == signature:
+                continue
+            if budget <= 0:
+                unjudged += 1
                 continue
             retry = seen.get((key, number, "retry"))
             if retry and now < retry:
+                unjudged += 1
                 continue
             budget -= 1
             try:
                 report = pr_floor_report(engine, key, number)
             except Exception as err:
                 seen[(key, number, "retry")] = now + IMPACT_RETRY_SECONDS
-                engine._note("impact.error", "%s#%d" % (key, number), {"error": _one_line(str(err), 160)})
+                engine._note("impact.error", pr, {"error": _one_line(str(err), 160)})
+                unjudged += 1
                 continue
-            if report["decision"] == "hold":
-                mode = impact_floor.hold_mode(engine.config, key)
+            report["rule"] = rule
+            owner = report.get("owner_decision")
+            if owner == "hold":
                 engine.audit.append(engine.actor, "gate.would_hold", report["pr"],
-                                    {"head": report["head"], "floor_paths": report["floor_paths"][:20], "reasons": report["reasons"],
-                                     "complete": report["complete"], "unknown": report["unknown"], "advisory": mode != "enforce",
-                                     "globs": report["globs"][:20]})
-                if mode == "enforce":
+                                    {"head": report["head"], "floor_paths": report["floor_paths"][:20], "reasons": report.get("owner_reasons", [])[:10],
+                                     "complete": report["complete"], "unknown": report["unknown"], "advisory": not enforce, "globs": report["globs"][:20]})
+                if enforce:
                     try:
-                        budget -= apply_impact_hold(engine, key, number, report, record)
+                        budget -= apply_impact_hold(engine, key, number, dict(report, reasons=report.get("owner_reasons", [])), record)
                     except Exception as err:   # a failed write is retried, never marked done
                         seen[(key, number, "retry")] = now + IMPACT_RETRY_SECONDS
-                        engine._note("impact.error", "%s#%d" % (key, number), {"error": _one_line(str(err), 160), "write": True})
+                        engine._note("impact.error", pr, {"error": _one_line(str(err), 160), "write": True})
+                        unjudged += 1
                         continue
-            seen[(key, number)] = report["head"] or head
+            elif enforce and not records_problem:   # a release is a LOOSENING: only on a decision made from every input, never on a failed read
+                try:
+                    spent = release_impact_hold(engine, key, number, report, record)
+                    budget -= spent
+                    if spent and pr not in released_now:
+                        released_now.append(pr)
+                except Exception as err:
+                    seen[(key, number, "retry")] = now + IMPACT_RETRY_SECONDS
+                    engine._note("impact.error", pr, {"error": _one_line(str(err), 160), "write": True})
+                    unjudged += 1
+                    continue
+            seen[(key, number)] = (report["head"] or head, rule, "unreadable" if records_problem else records.get((pr, report["head"] or head)))
             reports[(key, number)] = report
+    _impact_matrix_recovered(engine, now)   # the file and the floor of every repo were read this pass: a standing episode is over
+    if not unjudged and not records_problem and any(impact_floor.hold_mode(engine.config, key) == "enforce" for key, _ in live):
+        judged = [reports[k] for k in sorted(live) if k in reports and reports[k].get("rule") == rule]
+        if judged:   # every open pull request of the repos under the hold has been judged under this version of the rule
+            held = sorted(r["pr"] for r in judged if r.get("owner_decision") == "hold")
+            second = sorted(r["pr"] for r in judged if r.get("owner_decision") == "second-review")
+            _impact_post_list(engine, now, rule, held, sorted(released_now), second)
 
 
 def cmd_gates_stats(args, runner, now):

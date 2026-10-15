@@ -5,6 +5,7 @@ matrix is docs/review-laws/impact-matrix.json, the single source of truth. L3 is
 no label (that is slice L4)."""
 
 import fnmatch
+import hashlib
 import json
 import re
 import unicodedata
@@ -32,6 +33,15 @@ def _matrix_cached():
         return _MATRIX_CACHE["matrix"]
     except (OSError, ValueError) as err:
         _MATRIX_CACHE.clear()
+        raise MatrixError("the impact matrix file cannot be read (%s: %s)" % (type(err).__name__, err)) from None
+
+
+def rule_fingerprint():
+    """A short fingerprint of the matrix file's bytes, the version of the rule: the daemon judges a pull request again when it changes (#451 slice 3). Raises
+    MatrixError when the file cannot be read (a rule that cannot be read has no version)."""
+    try:
+        return hashlib.sha256(MATRIX_PATH.read_bytes()).hexdigest()[:12]
+    except OSError as err:
         raise MatrixError("the impact matrix file cannot be read (%s: %s)" % (type(err).__name__, err)) from None
 
 

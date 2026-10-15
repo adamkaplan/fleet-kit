@@ -23776,11 +23776,27 @@ class TestImpactFloorPure(unittest.TestCase):
         self.assertEqual(self.f.floor_for("someone/else"), ([], [], []))
 
 
+def top_tier_migrations(test):
+    """(#451 slice 3) The impact hold labels by the OWNER-HOLD rule, which reads the matrix file's top tier paths. These classes' fixtures use a synthetic path
+    (`migrations/**`) as their floor path: for them the matrix the decision loads gains that one path as a top tier path, so the fixtures keep their
+    meaning: a change to a top tier path holds."""
+    real = sb.impact_floor.load_matrix
+
+    def loaded(path=None):
+        matrix = real(path)
+        matrix["owner_hold"]["top_tier_paths"]["authority"] = list(matrix["owner_hold"]["top_tier_paths"]["authority"]) + ["migrations/**"]
+        return matrix
+    test.top_tier_patcher = mock.patch.object(sb.impact_floor, "load_matrix", loaded)
+    test.top_tier_patcher.start()
+    test.addCleanup(test.top_tier_patcher.stop)
+
+
 class TestImpactFloorCommandAndPass(LedgerBase):
     """`impact floor <pr>` and the daemon's advisory `gate.would_hold`: both read, neither writes a label, comment or ledger entry."""
 
     def setUp(self):
         super().setUp()
+        top_tier_migrations(self)
         self.extra_config = dict(FLOOR_CONFIG, plan_gates={"repos": {"acme/app": {"mode": "shadow"}}})
         self.configure()
         self.pr.update({"changedFiles": 2, "files": [{"path": "migrations/0002.sql", "additions": 1, "deletions": 0},
@@ -23872,6 +23888,7 @@ class TestImpactFloorCommandAndPass(LedgerBase):
         self.assertIn("cannot be read", err)
 
     def test_the_floor_report_carries_the_owner_hold_tier_as_advisory_information(self):
+        self.top_tier_patcher.stop()   # this test is about the REAL matrix: a floor path that is not a top tier path asks for a second review
         report = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])
         self.assertEqual(report["decision"], "hold", "the labels still follow the old decision")
         self.assertEqual(report["owner_decision"], "second-review", "a floor path outside the top tier: no owner clear")
@@ -24139,12 +24156,204 @@ class TestImpactClassAndNarrowForm(LedgerBase):
                             "a # line inside a tracked block is content")
 
 
+class TestImpactRejudge(LedgerBase):
+    """#451 slice 3: the daemon's hold labels follow the OWNER-HOLD rule; a hold it applied that no longer holds is taken off (only the labels it added);
+    the list is posted once for each version of the rule; an unreadable matrix file changes nothing and says so once. A fake gh records every write."""
+
+    def setUp(self):
+        super().setUp()
+        self.writes, self.view_reads, self.prs = [], [], {}
+        self.t = 100000.0
+        self.extra_config = dict(FLOOR_CONFIG, plan_gates={"repos": {"acme/app": {"mode": "shadow"}}}, impact_hold={"enabled": True})
+        self.configure()
+        self.names = sb.label_names(sb.load_config())
+        self.cos = mock.patch.object(sb, "_impact_cos", lambda engine: "boss")
+        self.cos.start()
+        self.addCleanup(self.cos.stop)
+
+    def route(self, argv, **kwargs):
+        if argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"]:
+            number = int(argv[3])
+            if "files" in argv[-1]:
+                self.view_reads.append(number)   # the floor's own read (the ci recorder reads the pull request too: not counted)
+            return subprocess.CompletedProcess(argv, 0, json.dumps(dict(self.pr, **self.prs.get(number, {}))), "")
+        if argv[0] == FAKE_GH and "--method" in argv:
+            method = argv[argv.index("--method") + 1]
+            if method == "GET":
+                return subprocess.CompletedProcess(argv, 0, "{}", "")
+            self.writes.append((method, argv[2], json.loads(kwargs["input"]) if kwargs.get("input") else None))
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+        return super().route(argv, **kwargs)
+
+    def files(self, number, path, head=LEDGER_HEAD):
+        self.prs[number] = {"headRefOid": head, "changedFiles": 1, "files": [{"path": path}]}
+
+    def listed(self, number, labels=(), head=LEDGER_HEAD):
+        return {"number": number, "head": {"sha": head}, "body": "PLAN: acme/app#7", "draft": False, "labels": [{"name": l} for l in labels]}
+
+    def seed_applied(self, numbers, merge_label_added=True, head=LEDGER_HEAD):
+        path = self.world.state / "impact-hold.json"
+        path.write_text(json.dumps({"clears": {}, "applied": {"acme/app#%d" % n: {"head": head, "merge_label_added": merge_label_added} for n in numbers}}))
+
+    def passes(self, records, advance=0):
+        self.t += advance
+        if not hasattr(self, "engine"):
+            self.hub = FakeHub({"acme/app": records})
+            self.engine = self.world.new_engine("daemon")
+            self.engine.hub, self.engine.gh_runner = self.hub, self.route
+            self.engine.config, self.engine.state_dir = sb.load_config(), self.world.state
+        else:
+            self.hub.prs["acme/app"] = records
+        sb.ci_record_pass(self.engine, self.t)
+        sb.impact_would_hold_pass(self.engine, self.t)
+
+    def posts(self, number=None):
+        return [w for w in self.writes if w[0] == "POST" and w[1].endswith("/labels") and (number is None or "/issues/%d/" % number in w[1])]
+
+    def removals(self, number=None):
+        return [w for w in self.writes if w[0] == "DELETE" and (number is None or "/issues/%d/" % number in w[1])]
+
+    def events(self, name):
+        return [e for e in self.world.audit() if e["event"] == name]
+
+    def both(self):
+        return [self.names["merge-captain"], self.names["hold-impact"]]
+
+    # -- S1: the labels follow the owner decision
+
+    def test_s1_only_a_pull_request_that_holds_for_the_owner_is_labelled(self):
+        self.files(9, "migrations/0002.sql")   # a floor path that is not a top tier path
+        self.files(10, "shims/gh")             # a top tier path
+        self.passes([self.listed(9), self.listed(10)])
+        self.assertEqual([(w[1], w[2]["labels"]) for w in self.posts()], [("repos/acme/app/issues/10/labels", self.both())])
+
+    # -- S2, S3: the release
+
+    def test_s2_a_hold_that_no_longer_applies_comes_off_and_one_that_still_applies_stays(self):
+        self.files(9, "migrations/0002.sql")
+        self.files(10, "shims/gh")
+        self.seed_applied([9, 10])
+        self.passes([self.listed(9, self.both()), self.listed(10, self.both())])
+        self.assertEqual(sorted(w[1].rsplit("/", 1)[-1] for w in self.removals(9)), sorted(urllib.parse.quote(n, safe="") for n in self.both()))
+        self.assertEqual((self.removals(10), self.posts(10)), ([], []), "the one that still holds keeps both labels and gets none again")
+        (released,) = self.events("gate.hold_released")
+        self.assertEqual((released["subject"], sorted(released["detail"]["removed"])), ("acme/app#9", sorted(self.both())))
+        applied = json.loads((self.world.state / "impact-hold.json").read_text())["applied"]
+        self.assertEqual(sorted(applied), ["acme/app#10"], "the record of the released one is gone")
+
+    def test_s3_a_label_a_person_added_is_never_removed(self):
+        self.files(9, "migrations/0002.sql")
+        self.seed_applied([9], merge_label_added=False)   # the merge label was there before the daemon: only the hold label is ours
+        self.passes([self.listed(9, self.both())])
+        self.assertEqual([w[1].rsplit("/", 1)[-1] for w in self.removals(9)], [urllib.parse.quote(self.names["hold-impact"], safe="")])
+
+    def test_a_pull_request_with_no_record_of_ours_or_a_corrupt_record_loses_nothing(self):
+        self.files(9, "migrations/0002.sql")
+        self.passes([self.listed(9, self.both())])                       # no record: the labels are a person's
+        self.assertEqual(self.removals(), [])
+        (self.world.state / "impact-hold.json").write_text("{not json")
+        del self.engine
+        self.view_reads.clear()
+        self.passes([self.listed(9, self.both())])
+        self.assertEqual(self.removals(), [], "a state file nobody can read removes nothing")
+
+    # -- S4: when it judges again
+
+    def test_s4_a_pull_request_is_judged_again_only_when_its_head_the_rule_or_its_record_changes(self):
+        self.files(9, "migrations/0002.sql")
+        self.passes([self.listed(9)])
+        self.passes([self.listed(9)], advance=400)
+        self.assertEqual(self.view_reads, [9], "unchanged: one read")
+        with mock.patch.object(sb.impact_floor, "rule_fingerprint", lambda: "another-rule"):
+            self.passes([self.listed(9)], advance=400)
+        self.assertEqual(self.view_reads, [9, 9], "the rule changed: judged again")
+
+    # -- S5: the posted list
+
+    def test_s5_the_list_is_posted_once_for_a_version_of_the_rule(self):
+        self.files(9, "migrations/0002.sql")
+        self.files(10, "shims/gh")
+        self.files(11, "plugins/fleet-hooks/a.js")
+        self.seed_applied([9, 10, 11])
+        records = [self.listed(n, self.both()) for n in (9, 10, 11)]
+        self.passes(records)
+        self.passes(records, advance=400)
+        (line,) = self.events("impact.rejudged")
+        self.assertEqual((line["detail"]["held"], line["detail"]["released"]), (["acme/app#10", "acme/app#11"], ["acme/app#9"]))
+        notes = [r for r in sb.read_reminders(self.world.state) if r["to"] == "boss"]
+        self.assertEqual(len(notes), 1)
+        self.assertEqual([n for n in ("acme/app#9", "acme/app#10", "acme/app#11") if n in notes[0]["text"]], ["acme/app#9", "acme/app#10", "acme/app#11"])
+        with mock.patch.object(sb.impact_floor, "rule_fingerprint", lambda: "version-two"):
+            self.passes(records, advance=400)
+        self.assertEqual(len(self.events("impact.rejudged")), 2, "a new version of the rule is posted again")
+
+    # -- S6, S6b: an unreadable matrix file
+
+    def test_s6_an_unreadable_matrix_changes_nothing_and_says_so_once_for_the_episode(self):
+        self.files(9, "migrations/0002.sql")
+        self.files(10, "shims/gh")
+        self.seed_applied([9])
+        broken = mock.patch.object(sb.impact_floor, "rule_fingerprint", side_effect=sb.impact_floor.MatrixError("the impact matrix file cannot be read (OSError: gone)"))
+        wakes = lambda: [r for r in sb.read_reminders(self.world.state) if r["to"] == "boss" and "cannot be read" in r["text"]]
+        with broken:
+            for _ in range(3):
+                self.passes([self.listed(9, self.both()), self.listed(10)], advance=400)
+        self.assertEqual((self.writes, len(self.events("impact.error")), len(wakes())), ([], 1, 1))
+        self.passes([self.listed(9, self.both()), self.listed(10)], advance=400)   # readable again
+        self.assertEqual(len(self.events("impact.recovered")), 1)
+        self.writes.clear()
+        with broken:
+            self.passes([self.listed(9, self.both()), self.listed(10)], advance=400)
+        self.assertEqual((len(self.events("impact.error")), len(wakes())), (2, 2), "a new episode: said again")
+
+    def test_s6b_an_unreadable_matrix_removes_no_label_that_the_rule_would_release(self):
+        self.files(9, "migrations/0002.sql")
+        self.seed_applied([9])
+        with mock.patch.object(sb.impact_floor, "rule_fingerprint", side_effect=sb.impact_floor.MatrixError("gone")):
+            self.passes([self.listed(9, self.both())])
+        self.assertEqual(self.removals(), [])
+
+    def test_a_floor_that_cannot_be_read_in_the_loop_is_the_same_episode(self):
+        self.files(9, "migrations/0002.sql")
+        with mock.patch.object(sb.impact_floor, "floor_for", side_effect=sb.impact_floor.MatrixError("gone")):
+            self.passes([self.listed(9)])
+            self.passes([self.listed(9)], advance=400)
+        self.assertEqual((self.writes, len(self.events("impact.error"))), ([], 1))
+
+    # -- S7: the class of an independent hold record
+
+    def test_s7_an_independent_hold_labels_only_when_its_class_is_top_tier_or_missing(self):
+        for number in (9, 10, 11):
+            self.files(number, "docs/a.md")
+        self.passes([self.listed(n) for n in (9, 10, 11)])
+        self.assertEqual(self.posts(), [])
+        reads = len(self.view_reads)
+        for number, more in ((9, ("--impact-class", "performance")), (10, ("--impact-class", "credentials")), (11, ())):
+            code, out, err = self.run_as("coder", "review", "record", "acme/app#%d" % number, "--reviewer", "impact", "--verdict", "approve", "--impact-action", "hold", *more)
+            self.assertEqual(code, 0, err)
+        self.passes([self.listed(n) for n in (9, 10, 11)], advance=400)
+        self.assertEqual(sorted(w[1] for w in self.posts()), ["repos/acme/app/issues/10/labels", "repos/acme/app/issues/11/labels"])
+        self.assertEqual(len(self.view_reads), reads, "the record needed no new read")
+
+    # -- S8: the owner's clear
+
+    def test_s8_the_owners_clear_is_for_its_head_only_and_the_rule_does_not_override_it(self):
+        self.files(10, "shims/gh")
+        (self.world.state / "impact-hold.json").write_text(json.dumps({"clears": {"acme/app#10": {"head": LEDGER_HEAD, "reason": "a false hold", "by": "own", "at": 1}}, "applied": {}}))
+        self.passes([self.listed(10)])
+        self.assertEqual(self.posts(10), [], "cleared at this head: not labelled again")
+        self.files(10, "shims/gh", head=LEDGER_NEW_HEAD)
+        self.passes([self.listed(10, head=LEDGER_NEW_HEAD)], advance=400)
+        self.assertEqual(len(self.posts(10)), 1, "a new head is held again")
+
+
 class TestImpactHold(LedgerBase):
     """#179 slice L4: the switchboard WRITES the hold (two labels), only when `impact_hold.enabled`, only for repos under `plan_gates`, head-bound
     owner clear, kill switches, idempotent, bounded. A fake gh records every write."""
 
     def setUp(self):
         super().setUp()
+        top_tier_migrations(self)
         self.writes = []
         self.hold_config = {"enabled": True}
         self.floor_pr()
