@@ -13174,6 +13174,7 @@ class TestClearNotice(Base):
         self.body, self.head, self.fail_send = "PLAN: https://github.com/acme-org/widget-api/issues/3#issuecomment-1\n\nthe change\n", self.HEAD, False
         self.labels = [self.names["merge-captain"], self.names["hold-impact"]]
         self.parents = {3: 2, 2: 1, 1: None}
+        self.order = []
         self.engine.intents = types.SimpleNamespace(parent=lambda number, repo=None: self.parents.get(number), repo=self.REPO, header=lambda *a, **k: None, ask_of=lambda number, repo=None: (number, None))
 
     def route(self, argv, **kwargs):
@@ -13181,6 +13182,9 @@ class TestClearNotice(Base):
             raw = {"state": "OPEN", "headRefOid": self.head, "title": "t", "labels": [{"name": n} for n in self.labels], "body": self.body}
             return subprocess.CompletedProcess(argv, 0, json.dumps(raw), "")
         if argv[0] == FAKE_GH and argv[1] == "api" and "--method" in argv:
+            self.order.append(argv[argv.index("--method") + 1] + " " + argv[2].rsplit("/", 1)[-1])
+            if argv[argv.index("--method") + 1] == "PATCH":
+                self.body = json.loads(kwargs["input"])["body"]
             return subprocess.CompletedProcess(argv, 0, "{}", "")
         return self.world.route(argv, **kwargs)
 
@@ -13274,6 +13278,53 @@ class TestClearNotice(Base):
         (line,) = self.told("cos")
         self.assertNotIn(token[12:], line)
         self.assertNotIn("a1B2c3D4e5F6g7H8i9J0", line)
+
+    def test_the_notice_is_last_and_a_send_that_blocks_neither_delays_nor_alters_the_clear(self):
+        self.body = "MERGE: captain\n\nPLAN: https://github.com/acme-org/widget-api/issues/3\n"
+        release = threading.Event()
+        real = self.engine.send
+
+        def slow(sender, recipient, text, **kw):
+            self.order.append("SEND " + recipient)
+            release.wait(1.5)
+            return real(sender, recipient, text, **kw)
+        self.engine.send = slow
+        self.addCleanup(release.set)
+        with mock.patch.object(sb, "NOTIFY_CLEAR_DEADLINE_SECONDS", 0.2):
+            began = time.monotonic()
+            lines = self.clear()
+            elapsed = time.monotonic() - began
+        self.assertLess(elapsed, 1.0, "the clear did not wait for the blocked send")
+        self.assertTrue(self.body.startswith("MERGE: automatic"), "the marker edit is done")
+        self.assertTrue(lines[0].startswith("cleared the impact hold") and any("MERGE: automatic" in l for l in lines))
+        sends = [i for i, step in enumerate(self.order) if step.startswith("SEND")]
+        self.assertTrue(sends and all(any(step.startswith("PATCH") for step in self.order[:i]) for i in sends), "the marker edit happened BEFORE the send was attempted: %s" % self.order)
+        (event,) = self.events("gate.clear_notify_failed")
+        self.assertIn("notice not sent: timed out", event["detail"]["error"])
+        release.set()
+        time.sleep(0.4)
+        self.assertEqual(len(self.events("gate.clear_notify_failed")), 1, "the late thread audits nothing more")
+        self.assertEqual(self.events("gate.clear_notified"), [])
+
+    def test_an_interrupt_or_an_exit_inside_the_send_leaves_the_clear_complete(self):
+        for what in (KeyboardInterrupt, SystemExit):
+            self.setUp()
+            self.body = "MERGE: captain\nrest\n"
+
+            def bad(sender, recipient, text, **kw):
+                raise what()
+            self.engine.send = bad
+            lines = self.clear()
+            self.assertTrue(lines[0].startswith("cleared the impact hold"), what)
+            self.assertTrue(self.body.startswith("MERGE: automatic"), what)
+            self.assertEqual(sb.read_impact_state(self.world.state)[0]["clears"][self.PR]["head"], self.HEAD, what)
+
+    def test_an_interrupt_while_waiting_for_the_notice_is_audited_and_the_clear_stands(self):
+        with mock.patch.object(sb.threading.Thread, "join", side_effect=KeyboardInterrupt()):
+            lines = self.clear()
+        self.assertTrue(lines[0].startswith("cleared the impact hold"))
+        (event,) = self.events("gate.clear_notify_failed")
+        self.assertIn("interrupted (KeyboardInterrupt)", event["detail"]["error"])
 
     def test_s7_the_reason_is_quoted_bounded_on_one_line_with_no_control_character_and_no_token(self):
         token = "ghp_" + "a1B2c3D4e5F6g7H8i9J0" * 2
@@ -13392,6 +13443,30 @@ class TestClearCarryInTheDaemon(Base):
         self.assertEqual(len([a for a in self.world.admissions("cos") if "owner's clear carried" in a["text"]]), 1, "a second pass sends nothing more")
         (event,) = self.events("gate.clear_notified")[-1:]
         self.assertEqual(event["detail"]["kind"], "carry")
+
+    def test_a_send_that_blocks_does_not_delay_or_alter_the_carry(self):
+        self.clear()
+        new = self.merge_main()
+        release = threading.Event()
+        self.addCleanup(release.set)
+        real = self.engine.send
+        self.engine.send = lambda *a, **k: (release.wait(1.5), real(*a, **k))[1]
+        spent, real_notify = [], sb.notify_clear
+
+        def timed(*a, **k):
+            began = time.monotonic()
+            try:
+                return real_notify(*a, **k)
+            finally:
+                spent.append(time.monotonic() - began)
+        with mock.patch.object(sb, "NOTIFY_CLEAR_DEADLINE_SECONDS", 0.2), mock.patch.object(sb, "notify_clear", timed):
+            self.assertEqual(self.hold(new), 0)
+        self.assertEqual(len(spent), 1)
+        self.assertLess(spent[0], 1.0, "the carry waited for the blocked send no longer than the deadline")
+        self.assertEqual(sb.read_impact_state(self.world.state)[0]["carried"][self.PR]["head"], new, "the carry is recorded")
+        self.assertEqual(self.adds(), [], "no hold written")
+        self.assertTrue([e for e in self.events("gate.clear_notify_failed") if "timed out" in e["detail"].get("error", "")])
+        release.set()
 
     def test_a_carry_that_is_not_recorded_for_the_head_sends_no_notice(self):
         self.clear()

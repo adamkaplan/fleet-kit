@@ -18738,8 +18738,8 @@ def clear_lane(engine, repo, number, body):
     return None, None
 
 
-def notify_clear(engine, kind, repo, number, head, reason=None, body=None, previous=None):
-    """#541: tell the Chief of Staff, and the orchestrator whose lane merges the pull request, at once that the owner cleared it (`kind` "clear": his command or his words in the chat, called
+def _notify_clear_body(engine, abandoned, kind, repo, number, head, reason=None, body=None, previous=None):
+    """(the work of `notify_clear`, run on its own thread; `abandoned` is set when the caller gave up waiting: then nothing more is audited) #541: tell the Chief of Staff, and the orchestrator whose lane merges the pull request, at once that the owner cleared it (`kind` "clear": his command or his words in the chat, called
     ONCE from `impact_clear_core`) or that his clear carried to a new head (`kind` "carry": from `previous`, called once from the carry decision). One line. Once per pull request, head and kind (a
     small private file). The caller has already RECORDED the clear; nothing here can undo it: a failure is audited and swallowed. An unknown lane says `lane unknown` and only the Chief of Staff is told:
     nobody is guessed. Returns the audit detail it wrote, or None when nothing was sent."""
@@ -18777,14 +18777,47 @@ def notify_clear(engine, kind, repo, number, head, reason=None, body=None, previ
         detail = {"head": head, "kind": kind, "lane": lane, "lane_from": how, "sent": sent}
         if failed:
             detail["failed"] = failed
-        engine.audit.append(engine.actor, "gate.clear_notified" if sent else "gate.clear_notify_failed", pr, detail)
+        if not abandoned.is_set():
+            engine.audit.append(engine.actor, "gate.clear_notified" if sent else "gate.clear_notify_failed", pr, detail)
         return detail
-    except Exception as err:
+    except BaseException as err:   # on this thread nothing may escape, an exit or an interrupt inside a send included
         try:
-            engine.audit.append(engine.actor, "gate.clear_notify_failed", pr, {"head": head, "kind": kind, "error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
+            if not abandoned.is_set():
+                engine.audit.append(engine.actor, "gate.clear_notify_failed", pr, {"head": head, "kind": kind, "error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
         except Exception:
             pass
         return None
+
+
+NOTIFY_CLEAR_DEADLINE_SECONDS = 2.0   # the most a clear waits for its notice
+
+
+def notify_clear(engine, kind, repo, number, head, reason=None, body=None, previous=None):
+    """#541: the notice of an owner clear (or of a carry), LAST, after everything else of it is done and bounded by a deadline: the work (lane lookup, sends) runs on its own thread and the
+    caller waits at most NOTIFY_CLEAR_DEADLINE_SECONDS. On a timeout, an interrupt or an exception it gives up, audits `gate.clear_notify_failed` once with the reason, and returns None: the clear's
+    result, exit status and output are exactly as without a notice. (A send still running when it gives up is left to finish on its daemon thread; it audits nothing more.)"""
+    pr = "%s#%d" % (repo, number)
+    abandoned, result = threading.Event(), []
+
+    def work():
+        result.append(_notify_clear_body(engine, abandoned, kind, repo, number, head, reason, body, previous))
+    worker = threading.Thread(target=work, name="clear-notice", daemon=True)
+    why = None
+    try:
+        worker.start()
+        worker.join(NOTIFY_CLEAR_DEADLINE_SECONDS)
+        if worker.is_alive():
+            why = "timed out after %gs" % NOTIFY_CLEAR_DEADLINE_SECONDS
+    except BaseException as err:   # an interrupt while waiting: the clear is already complete
+        why = "interrupted (%s)" % type(err).__name__
+    if why is None:
+        return result[0] if result else None
+    abandoned.set()
+    try:
+        engine.audit.append(engine.actor, "gate.clear_notify_failed", pr, {"head": head, "kind": kind, "error": "notice not sent: " + why})
+    except BaseException:
+        pass
+    return None
 
 
 def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, head=None, via=None, verify=None):
@@ -18841,8 +18874,9 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
         if fingerprint is not None:
             detail["fingerprint"] = fingerprint
         engine.audit.append(engine.actor, "gate.hold_cleared", pr, detail)   # inside the lock
-    notify_clear(engine, "clear", repo, number, head_now, reason=reason, body=raw.get("body"))   # AFTER the clear is recorded and its labels removed; never undoes it
-    return ["cleared the impact hold of %s at %s: removed %s; the daemon will not re-add it for this head" % (pr, head_now[:8], ", ".join(remove))] + neutralise_marker(engine, runner, repo, number, head_now, raw)
+    lines = ["cleared the impact hold of %s at %s: removed %s; the daemon will not re-add it for this head" % (pr, head_now[:8], ", ".join(remove))] + neutralise_marker(engine, runner, repo, number, head_now, raw)
+    notify_clear(engine, "clear", repo, number, head_now, reason=reason, body=raw.get("body"))   # LAST: the state, the labels, the marker line and the audit are all done; it can neither delay nor alter them
+    return lines
 
 
 def cmd_impact_clear(args, runner, now):
