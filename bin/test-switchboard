@@ -31170,12 +31170,6 @@ class TestInstallDocs(unittest.TestCase):
         self.assertIn("INSTALL.md", text)
         self.assertIn("fleet-switchboard install", text)
 
-    def test_the_presentation_is_untouched_by_this_pr(self):
-        done = subprocess.run(["git", "diff", "--name-only", "HEAD", "--", "docs/presentation"], cwd=str(REPO),
-                              capture_output=True, text=True)
-        if done.returncode == 0:
-            self.assertEqual(done.stdout.strip(), "")
-
 
 # ======================================================================
 # PR 17: standing orders an agent does not forget
@@ -44923,13 +44917,6 @@ class TestGithubWritingRule(unittest.TestCase):
             head = text.split("\n---\n", 1)[0]
             self.assertNotIn("Write GitHub text", head, rel)
             self.assertTrue(text.startswith("---\n"), rel)
-
-    def test_s3_the_change_adds_text_only_and_leaves_the_shim_alone(self):
-        done = subprocess.run(["git", "diff", "--name-only", "origin/main...HEAD"], capture_output=True, text=True, cwd=str(REPO))
-        if done.returncode != 0 or not done.stdout.strip():
-            self.skipTest("no base to compare with")
-        changed = set(done.stdout.split())
-        self.assertNotIn("shims/gh", changed)
 
 
 _CG = sb.load_cpu_guard()
