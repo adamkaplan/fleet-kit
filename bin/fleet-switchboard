@@ -18446,6 +18446,18 @@ def apply_impact_hold(engine, repo, number, report, record):
         return _apply_impact_hold_locked(engine, repo, number, report, record, carry)
 
 
+def _consume_record(state, pr, clear=None):
+    """Drop the daemon's record of the labels it added to `pr` when an owner's clear (or the revoke of one, or the void of a carry) makes it stale: the clear took those
+    labels off, so whatever is on the pull request afterwards is somebody else's. Called in the SAME locked write as the change. With `clear` given (a revoke, a void), a record
+    that is NEWER than that clear (the daemon re-applied after it) is kept: those labels are the daemon's. With none (a new clear), the record is always consumed."""
+    ours = state["applied"].get(pr)
+    if not isinstance(ours, dict):
+        return
+    if clear is not None and isinstance(ours.get("at"), int) and isinstance(clear.get("at"), (int, float)) and ours["at"] > clear["at"]:
+        return
+    del state["applied"][pr]
+
+
 def _labels_ours(names, state, pr):
     """The labels this daemon added to `pr`, from its own record in impact-hold.json: [] when it has none, or when the owner's clear came after it (the clear took
     them off: whatever is there now is somebody else's). A record written before the list existed (`merge_label_added` only) is read as the hold label plus the
@@ -18481,6 +18493,7 @@ def _apply_impact_hold_locked(engine, repo, number, report, record, carry=None):
                                                                          "why": "only main was merged in: the pull request's own change is the one the owner cleared"})
             return 0
         state.setdefault("carry_void", {})[pr] = {"head": head, "reason": _one_line(carry["reason"] or "", 200)}
+        _consume_record(state, pr, cleared)   # the clear took the daemon's labels off: an older record of them is no longer a claim
         write_impact_state(engine.state_dir, state)
         engine.audit.append(engine.actor, "gate.clear_carry_void", pr, {"head": head, "from": carry["from"], "reason": _one_line(carry["reason"] or "", 200)})
     names = label_names(engine.config)
@@ -18567,6 +18580,7 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
             remove = list(remove)
         head_now = current
         state["clears"][pr] = {"head": head_now, "reason": reason, "by": who, "at": int(engine.now())}
+        _consume_record(state, pr)   # the labels it took off were the daemon's record: consumed with the clear, in this write
         state.get("carried", {}).pop(pr, None)   # a new clear starts from this head: an earlier carry is not part of it
         state.get("carry_void", {}).pop(pr, None)
         if fingerprint is not None:
@@ -18613,6 +18627,8 @@ def cmd_impact_clear(args, runner, now):
                 had = state["clears"].pop(pr, None)
                 carried = state.get("carried", {}).pop(pr, None)
                 state.get("carry_void", {}).pop(pr, None)
+                if had is not None:
+                    _consume_record(state, pr, had)   # an older record of the daemon's labels is stale (a newer one, applied after the clear, is kept)
                 if had is not None or carried is not None:   # nothing to take back: nothing is written
                     write_impact_state(engine.state_dir, state)
                     engine.audit.append(engine.actor, "gate.clear_revoked", pr, {"by": kind[1], "reason": plan_ledger.clip(redact_command_text(reason), 300),

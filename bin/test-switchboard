@@ -26617,6 +26617,59 @@ class TestImpactRejudge(LedgerBase):
         self.passes([self.listed(10)])
         self.assertEqual(self.posts(10), [], "the daemon does not label a carried clear either")
 
+    def revoke(self, number):
+        code, out, err = self.run_as(None, "impact", "clear", "acme/app#%d" % number, "--revoke", "--reason", "taking the clear back: it was a mistake")
+        self.assertEqual(code, 0, err)
+
+    def seed_clear(self, number, clear_at, applied_at=10, legacy=False, applied=True):
+        record = {"head": LEDGER_HEAD, "merge_label_added": True}
+        if not legacy:
+            record.update(added=self.both(), at=applied_at)
+        (self.world.state / "impact-hold.json").write_text(json.dumps({
+            "clears": {"acme/app#%d" % number: {"head": LEDGER_HEAD, "reason": "x", "by": "own", "at": clear_at}},
+            "applied": {"acme/app#%d" % number: record} if applied else {}}))
+
+    def test_a_revoked_clear_leaves_no_stale_record_that_a_release_could_read_as_ours(self):
+        self.files(9, "migrations/0002.sql")          # the rule does not hold it: a release pass would run
+        self.seed_clear(9, clear_at=50)                # the daemon's record (at 10) is older than the clear (at 50)
+        self.revoke(9)
+        state = json.loads((self.world.state / "impact-hold.json").read_text())
+        self.assertEqual((state["clears"], state["applied"]), ({}, {}), "the stale record went with the revoke, in the same write")
+        self.passes([self.listed(9, [self.names["hold-impact"]])])   # a person put the hold label on after the revoke
+        self.assertEqual(self.removals(), [], "a person's label is never stripped on the strength of an old record")
+
+    def test_a_legacy_record_and_a_revoke_release_nothing(self):
+        self.files(9, "migrations/0002.sql")
+        self.seed_clear(9, clear_at=50, legacy=True)
+        self.revoke(9)
+        self.passes([self.listed(9, self.both())])
+        self.assertEqual(self.removals(), [])
+
+    def test_after_a_revoke_the_daemons_own_new_record_releases_only_its_labels(self):
+        self.files(9, "shims/gh")                      # holds again after the revoke
+        self.seed_clear(9, clear_at=50)
+        self.revoke(9)
+        self.passes([self.listed(9)])                  # the daemon re-applies: a new record
+        self.assertEqual(len(self.posts(9)), 1)
+        recorded = json.loads((self.world.state / "impact-hold.json").read_text())["applied"]["acme/app#9"]
+        self.assertEqual(sorted(recorded["added"]), sorted(self.both()))
+        self.files(9, "docs/a.md")                     # and later it stops holding
+        self.writes.clear()
+        with mock.patch.object(sb.impact_floor, "rule_fingerprint", lambda: "version-two"):
+            self.passes([self.listed(9, self.both() + ["bug"])], advance=400)
+        self.assertEqual(sorted(urllib.parse.unquote(w[1].rsplit("/", 1)[-1]) for w in self.removals(9)), sorted(self.both()), "only the daemon's labels, not the person's `bug`")
+
+    def test_the_record_is_consumed_by_a_new_clear_and_kept_when_it_is_newer_than_the_clear(self):
+        state = {"clears": {}, "applied": {"p": {"added": ["x"], "at": 10, "head": "h"}}}
+        sb._consume_record(state, "p", {"at": 5})
+        self.assertIn("p", state["applied"], "applied after the clear: the daemon's")
+        sb._consume_record(state, "p", {"at": 10})
+        self.assertNotIn("p", state["applied"], "not newer than the clear: consumed")
+        state["applied"]["p"] = {"added": ["x"], "at": 99}
+        sb._consume_record(state, "p")
+        self.assertNotIn("p", state["applied"], "a new clear always consumes it")
+        sb._consume_record(state, "gone")
+
     # -- S4: when it judges again
 
     def test_s4_a_pull_request_is_judged_again_only_when_its_head_the_rule_or_its_record_changes(self):
@@ -26951,7 +27004,7 @@ class TestImpactHold(LedgerBase):
         state, problem = sb.read_impact_state(self.world.state)
         self.assertIsNone(problem)
         self.assertEqual(state["clears"]["acme/app#9"]["head"], LEDGER_HEAD)
-        self.assertIn("acme/app#9", state["applied"], "and neither record overwrote the other")
+        self.assertNotIn("acme/app#9", state["applied"], "the daemon's record is consumed with the clear (in the same write): the clear is recorded and no stale claim stays")
         before = len(self.label_writes())
         self.passes(advance=sb.IMPACT_RETRY_SECONDS + 1000)
         self.assertEqual(len(self.label_writes()), before, "a cleared hold is not re-added")
