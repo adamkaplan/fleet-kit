@@ -17545,7 +17545,22 @@ def _ledger_pr(args):
     return repo, number, "%s#%d" % (repo, number)
 
 
-def _ledger_context(args, runner, now, writable, parts=None):
+def gate_floor_fact(engine, state, repo, number, head):
+    """The impact floor read FRESH for this head, for gate G6 (#488): {"decision", "reasons", "cleared", "unreadable"}. The SAME function the
+    daemon uses (`pr_floor_report`), one PR read; the owner's clear counts only for this exact head. Any failure is `unreadable`, never
+    "no hold": G6 does not pass on a floor it could not read."""
+    try:
+        report = pr_floor_report(engine, repo, number)
+        if not head or report.get("head") != head:
+            raise ValueError("the pull request moved while its floor was read (%s, then %s)" % ((head or "?")[:8], (report.get("head") or "?")[:8]))
+        clears, problem = read_impact_state(state)
+        cleared = (clears["clears"].get(report["pr"]) or {}).get("head") == head
+        return {"decision": report["decision"], "reasons": list(report["reasons"]), "cleared": cleared, "unreadable": problem}
+    except Exception as err:   # an unreadable diff, a matrix error, a missing file: all the same answer
+        return {"decision": None, "reasons": [], "cleared": False, "unreadable": _one_line("%s: %s" % (type(err).__name__, err), 150)}
+
+
+def _ledger_context(args, runner, now, writable, parts=None, floor=False):
     """Everything `prove`, `verdict` and `gates` share: the engine, state, PR ref, its picture and its checked plan. `parts` is
     (engine, state, config) when the caller already has them (the daemon's pass); else the engine is built."""
     engine, state, config = parts if parts is not None else build_engine(runner, now, "cli", writable=writable)
@@ -17553,6 +17568,8 @@ def _ledger_context(args, runner, now, writable, parts=None):
     entries, problem = plan_ledger.read_ledger(state)
     facts, body, senders, unreadable = pr_picture(engine, repo, number, state)
     facts = dict(facts or {}, body=body, notice_senders=senders)
+    if floor and facts.get("head"):
+        facts["floor"] = gate_floor_fact(engine, state, repo, number, facts["head"])
     source = plan_source_for(args.plan, entries, pr, body, config.get("intent_repo"))
     plan, plan_problem = None, None
     if source:
@@ -17750,7 +17767,7 @@ def cmd_gates(args, runner, now):
         return cmd_gates_preflight(args, runner, now)
     if args.pr == "stats":
         return cmd_gates_stats(args, runner, now)
-    ctx = _ledger_context(args, runner, now, False)
+    ctx = _ledger_context(args, runner, now, False, floor=True)
     plan = ctx.plan
     report = plan_ledger.evaluate_gates(plan, ctx.entries, ctx.problem, ctx.facts if ctx.facts.get("head") or ctx.facts.get("body") else None, ctx.pr,
                                         now=now())
@@ -18381,7 +18398,7 @@ def cmd_gates_check(args, runner, now):
             def work():
                 try:
                     ns = types.SimpleNamespace(pr=args.pr, plan=args.plan, ask=args.ask, head=None)
-                    ctx = _ledger_context(ns, runner, now, False)
+                    ctx = _ledger_context(ns, runner, now, False, floor=True)
                     box["report"] = plan_ledger.evaluate_gates(ctx.plan, ctx.entries, ctx.problem,
                                                                 ctx.facts if ctx.facts.get("head") or ctx.facts.get("body") else None, ctx.pr,
                                                                 now=now())
