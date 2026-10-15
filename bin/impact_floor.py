@@ -80,10 +80,11 @@ def _build(pattern):
 
 def canonical(path):
     """(the path as the file system would read it, lower-cased, escapes): backslashes become `/`, empty and `.` segments are dropped, `..` removes the
-    segment before it. `escapes` is True when a `..` has nothing to remove (the path leaves the repository). A variant of a path (`Shims/GH`, `shims//gh`,
+    segment before it. `escapes` is True when a `..` has nothing to remove, or the path is absolute, starts with `~` or a drive letter (the path leaves the repository; Windows-only spellings such as a trailing dot are out of scope: the fleet runs on macOS and Linux). A variant of a path (`Shims/GH`, `shims//gh`,
     `shims/./gh`, `shims/x/../gh`, `a/../shims/gh`, `shims\\gh`) names the same file as the plain one, so it must be judged as that file."""
-    parts, escapes = [], False
-    for segment in str(path).replace("\\", "/").split("/"):
+    text = str(path).replace("\\", "/")
+    parts, escapes = [], text.startswith(("/", "~")) or bool(re.match(r"^[A-Za-z]:", text))   # an absolute path, `~` or a drive letter is not a path inside the repository
+    for segment in text.split("/"):
         if segment in ("", "."):
             continue
         if segment == "..":
@@ -109,10 +110,17 @@ def matches(path, patterns):
     return any(_glob_regex(p).fullmatch(lowered) or _glob_regex(p).fullmatch(named) for p in patterns)
 
 
+def matches_named(path, patterns):
+    """Judged ONLY as the file the path names (see `canonical`): for an EXCLUDE list, which can only take a hit away, so a spelling must never be able to
+    move a path into it (`shims/docs/../gh` is `shims/gh`, not under `shims/docs/**`)."""
+    named = canonical(path)[0]
+    return any(_glob_regex(p).fullmatch(named) for p in patterns)
+
+
 def floor_paths(paths, globs, exclude=(), force=()):
     """The paths of a change that trigger the floor: inside a floor glob and not excluded (a `force` path is never excluded). A deletion
     counts like any change (the caller passes deleted paths too; so does the OLD path of a rename); one outside the globs never does."""
-    return sorted({p for p in paths if isinstance(p, str) and (escapes(p) or (matches(p, globs) and (not matches(p, exclude) or matches(p, force))))})
+    return sorted({p for p in paths if isinstance(p, str) and (escapes(p) or (matches(p, globs) and (not matches_named(p, exclude) or matches(p, force))))})
 
 
 def floor_for(repo, config=None):

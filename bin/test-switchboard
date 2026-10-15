@@ -49989,11 +49989,11 @@ class TestOwnerHoldRule(unittest.TestCase):
 
     def test_a_variant_spelling_of_a_top_tier_path_is_that_path_and_a_path_that_leaves_the_repository_holds(self):
         review = sb.load_module("plan_review")
-        for path in ("Shims/GH", "shims//gh", "shims/./gh", "shims/x/../gh", "a/../shims/gh", "shims\\gh", "./shims/gh", "/shims/gh",
+        for path in ("Shims/GH", "shims//gh", "shims/./gh", "shims/x/../gh", "a/../shims/gh", "shims\\gh", "./shims/gh",
                      "agents/../AGENTS/opencode/../opencode/chief-of-staff.md", "BIN/Plan_Ledger.py", "bin//plan_ledger.py", "bin\\plan_ledger.py"):
             self.assertEqual(self.decide([path])[0], "hold", repr(path))
             self.assertEqual(review.path_hits([path], ["shims/**", "agents/**", "bin/plan_ledger.py"]), [path], "review tier: " + repr(path))
-        for path in ("../x", "../../shims/gh", "a/../../x", "shims/../../x"):
+        for path in ("../x", "../../shims/gh", "a/../../x", "shims/../../x", "/etc/x", "/shims/gh", "~/x", "C:/x", "c:\\\\x"):
             decision, reasons = self.decide([path])
             self.assertEqual(decision, "hold", repr(path))
             self.assertTrue(any("outside the repository" in r for r in reasons), reasons)
@@ -50001,6 +50001,16 @@ class TestOwnerHoldRule(unittest.TestCase):
             self.assertEqual(self.floor.floor_paths([path], ["docs/**"], ["docs/x/**"]), [path])
         for path in ("docs/notes.md", "docs/./notes.md", "Docs//Notes.md", "docs/a/../b.md"):
             self.assertEqual(self.decide([path])[0], "none", "a variant of a path outside the top tier stays outside: " + repr(path))
+
+    def test_an_exclude_judges_only_the_named_file_a_force_path_and_the_two_tiers_share_one_normaliser(self):
+        globs, exclude, force = ["shims/**"], ["shims/docs/**"], ["shims/docs/keep.md"]
+        self.assertEqual(self.floor.floor_paths(["shims/docs/../gh"], globs, exclude), ["shims/docs/../gh"], "a spelling never moves a path into an exclude")
+        self.assertEqual(self.floor.floor_paths(["shims/docs/x.md", "Shims//Docs//x.md"], globs, exclude), [], "a real excluded file stays excluded, in any spelling")
+        self.assertEqual(self.floor.floor_paths(["shims/./docs/keep.md", "SHIMS/DOCS/KEEP.MD"], globs, exclude, force), ["SHIMS/DOCS/KEEP.MD", "shims/./docs/keep.md"],
+                         "a force path is never excluded, in any spelling")
+        review = sb.load_module("plan_review")
+        for path in ("Shims/GH", "a/../x", "../x", "shims//./gh", "x\\y", "", "/", "..", "a/b/../../..", "bin\\..\\shims\\gh", "/etc/x", "~/x", "C:/x", "c:\\x", "a//b/./c/../d", "Ünï/../Ünï/x", "x\n/../y"):
+            self.assertEqual(review._canonical(path), self.floor.canonical(path), repr(path))
 
     def home_file(self, name, text):
         tmp = Path(tempfile.mkdtemp(prefix="ohr"))

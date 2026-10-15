@@ -68,10 +68,11 @@ def _norm_path(path):
 
 
 def _canonical(path):
-    """(the path as the file system reads it, lower-cased, escapes): backslashes become `/`, empty and `.` segments go, `..` removes the segment before it;
-    `escapes` when a `..` has nothing to remove. The same rule as impact_floor.canonical: a variant of a held path is that path."""
-    parts, escapes = [], False
-    for segment in str(path).replace("\\", "/").split("/"):
+    """(the path as the file system reads it, lower-cased, escapes). A COPY of `impact_floor.canonical` (this core imports nothing but `re`, so it cannot
+    load it): a test runs both on one corpus and fails when they disagree."""
+    text = str(path).replace("\\", "/")
+    parts, escapes = [], text.startswith(("/", "~")) or bool(re.match(r"^[A-Za-z]:", text))
+    for segment in text.split("/"):
         if segment in ("", "."):
             continue
         if segment == "..":
