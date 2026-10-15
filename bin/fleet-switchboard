@@ -10455,6 +10455,11 @@ def publish_decisions(engine):
         impact_would_hold_pass(engine, now)   # #179 L3: audits gate.would_hold from the diff's floor; ADVISORY, writes nothing to GitHub
     except Exception as err:
         engine._note("impact.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+    try:
+        merged_labels = load_module("merged_labels")   # #559: the merge and hold labels of a merged PR come off (fresh read, fleet labels only)
+        merged_labels.run_pass(types.SimpleNamespace(**{n: globals()[n] for n in merged_labels.NEEDS}), engine, now, IMPACT_PASS_CALLS)
+    except Exception as err:
+        engine._note("merged_labels.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
     apply_notice_effects(engine)
     store = decision_store(engine)
     try:
@@ -11060,7 +11065,7 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
     for record in recent:
         number = _number(record)
         names = {(l.get("name") if isinstance(l, dict) else l) for l in record.get("labels") or []}
-        if number is not None and _is_pr(record) and _label_kind(names, CAPTAIN_MERGE_LABELS[:1] + CAPTAIN_HOLD_LABELS):
+        if number is not None and _is_pr(record) and not _issue_pr_merged(record) and _label_kind(names, CAPTAIN_MERGE_LABELS[:1] + CAPTAIN_HOLD_LABELS):   # #559: a merged PR is the daemon's to clean, never a finding
             closed_holds[number] = sorted(_label_kind(names, CAPTAIN_MERGE_LABELS[:1] + CAPTAIN_HOLD_LABELS))
     comments, cut = hub.read_pages("repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100"
                                    % (repo, since), older=("created_at", since), cap=SWEEP_LIST_PAGES)
@@ -11261,6 +11266,12 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
     return sorted(found)
 
 
+def _issue_pr_merged(record):
+    """True when an issue record (the issues API) of a pull request says it was merged: its `pull_request.merged_at` is set (#559)."""
+    pull = record.get("pull_request") if isinstance(record, dict) else None
+    return isinstance(pull, dict) and bool(pull.get("merged_at"))
+
+
 def sweep_verify(engine, state, kind, ref, now, cfg, regex, budget):
     """Re-check one finding against a fresh read of its issue or PR (and, when comments raised it, a fresh read of its
     last comments), so a cached copy cannot raise it. True: still holds. False: no longer (or never did). None: could not
@@ -11286,7 +11297,7 @@ def sweep_verify(engine, state, kind, ref, now, cfg, regex, budget):
         if not isinstance(data, dict) or "state" not in data:
             return None
         names = {(l.get("name") if isinstance(l, dict) else l) for l in data.get("labels") or []}
-        return _is_pr(data) and data.get("state") != "open" and bool(_label_kind(names, CAPTAIN_MERGE_LABELS[:1] + CAPTAIN_HOLD_LABELS))
+        return _is_pr(data) and data.get("state") != "open" and not _issue_pr_merged(data) and bool(_label_kind(names, CAPTAIN_MERGE_LABELS[:1] + CAPTAIN_HOLD_LABELS))
     if kind == "S8":   # a decision waits for this issue: it still holds when the issue is closed, or is not there at all
         try:
             data = hub._read_one(repo, "issues/%d" % number, now, fresh=True)

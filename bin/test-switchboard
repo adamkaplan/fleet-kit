@@ -56177,6 +56177,134 @@ class TestNewestCiRuns(unittest.TestCase):
         self.assertEqual(json.dumps(self.RERUN), before, "the rollup is not changed")
 
 
+class FakeMergedGh:
+    """`gh` for the merged-label pass: `pr view N` answers from `answers` ((code, stdout, stderr) or an exception); a label DELETE is recorded and succeeds."""
+
+    def __init__(self, answers=None):
+        self.answers, self.reads, self.removed = answers or {}, [], []
+
+    def __call__(self, argv, **kwargs):
+        if argv[1:3] == ["pr", "view"]:
+            self.reads.append((argv[3], argv[argv.index("--repo") + 1]))
+            answer = self.answers[int(argv[3])]
+            if isinstance(answer, Exception):
+                raise answer
+            return subprocess.CompletedProcess(argv, answer[0], answer[1], answer[2])
+        if "--method" in argv and argv[argv.index("--method") + 1] == "DELETE":
+            self.removed.append(urllib.parse.unquote(argv[2].rsplit("/", 1)[1]))
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+        raise AssertionError("the merged-label pass reaches for nothing else: %r" % (argv,))
+
+
+class StubHub:
+    def __init__(self, entries):
+        self.entries = entries
+
+    def pr_event_snapshot(self):
+        return {ref: dict(entry) for ref, entry in self.entries.items()}
+
+
+class TestMergedLabels(Base):
+    """Ask #559: the merge-captain and hold-* labels of a MERGED pull request come off, once, and only those; nothing else is touched."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=(), config={"gh": FAKE_GH, "github_repos": ["acme/api"], "excluded_repos": ["acme/secret"]})
+        self.names = sb.label_names(self.world.config)
+        self.fleet = [self.names["merge-captain"], self.names["hold-security"], self.names["hold-impact"]]
+        self.engine = self.world.new_engine()
+
+    def merged_entry(self, labels=None, state="merged"):
+        return {"state": state, "head": "a" * 40, "labels": sorted(labels if labels is not None else self.fleet + ["bug"]), "at": 1, "via": "event"}
+
+    def view(self, state="MERGED", labels=None):
+        names = labels if labels is not None else self.fleet + ["bug"]
+        return (0, json.dumps({"state": state, "labels": [{"name": n} for n in names], "headRefOid": "a" * 40}), "")
+
+    def go(self, entries, gh):
+        self.engine.hub, self.engine.gh_runner = StubHub(entries), gh
+        merged_labels = sb.load_module("merged_labels")
+        ns = types.SimpleNamespace(**{n: getattr(sb, n) for n in merged_labels.NEEDS})
+        return merged_labels.run_pass(ns, self.engine, self.world.clock.now(), sb.IMPACT_PASS_CALLS)
+
+    def audit(self, event):
+        return [e for e in self.world.audit() if e["event"] == event]
+
+    def test_s1_the_three_fleet_labels_come_off_and_the_other_label_stays(self):
+        gh = FakeMergedGh({7: self.view()})
+        self.go({"acme/api#7": self.merged_entry()}, gh)
+        self.assertEqual(sorted(gh.removed), sorted(self.fleet), "3 labels removed, the bug label is not among them")
+        (line,) = self.audit("merged.labels_removed")
+        self.assertEqual((line["subject"], sorted(line["detail"]["labels"])), ("acme/api#7", sorted(self.fleet)), "1 audit line names the pull request and the 3 labels")
+
+    def test_s2_an_open_or_closed_unmerged_pull_request_loses_nothing(self):
+        for state in ("open", "closed"):
+            gh = FakeMergedGh({8: self.view("OPEN" if state == "open" else "CLOSED")})
+            self.go({"acme/api#8": self.merged_entry(state=state)}, gh)
+            self.assertEqual((gh.reads, gh.removed), ([], []), "an event that does not say merged is not even read: %s" % state)
+
+    def test_s3_an_event_that_says_merged_while_the_fresh_read_says_open_removes_nothing(self):
+        for number, fresh in ((9, "OPEN"), (19, "CLOSED")):
+            gh = FakeMergedGh({number: self.view(fresh)})
+            self.go({"acme/api#%d" % number: self.merged_entry()}, gh)
+            self.assertEqual((len(gh.reads), gh.removed), (1, []))
+        self.assertEqual(len(self.audit("merged.labels_skipped")), 2)
+
+    def test_s4_a_failed_read_removes_nothing_audits_once_and_is_tried_again_later(self):
+        gh = FakeMergedGh({10: (1, "", "gh: HTTP 502")})
+        entries = {"acme/api#10": self.merged_entry()}
+        self.go(entries, gh)
+        self.go(entries, gh)   # inside the back-off: no second read, no second audit
+        self.assertEqual((len(gh.reads), gh.removed, len(self.audit("merged.labels_read_failed"))), (1, [], 1))
+        self.world.tick(sb.load_module("merged_labels").RETRY_SECONDS + 1)
+        gh.answers[10] = self.view()
+        self.go(entries, gh)
+        self.assertEqual(sorted(gh.removed), sorted(self.fleet), "after the back-off the read works and the labels come off")
+        self.assertEqual(len(self.audit("merged.labels_read_failed")), 1, "said once")
+
+    def test_s5_an_excluded_or_unwatched_repository_is_never_read_or_written(self):
+        gh = FakeMergedGh({1: self.view(), 2: self.view()})
+        self.go({"acme/secret#1": self.merged_entry(), "other/repo#2": self.merged_entry()}, gh)
+        self.assertEqual((gh.reads, gh.removed), ([], []), "0 reads and 0 writes in 2 of 2 cases")
+
+    def test_a_merge_event_that_carried_no_fleet_label_costs_no_read(self):
+        gh = FakeMergedGh({11: self.view()})
+        self.go({"acme/api#11": self.merged_entry(labels=["bug", "docs"])}, gh)
+        self.assertEqual((gh.reads, gh.removed), ([], []))
+
+    def test_a_pull_request_is_handled_once_and_a_label_by_another_prefix_is_never_removed(self):
+        other = ["someone-else:merge-captain", "someone-else:hold-impact"]
+        gh = FakeMergedGh({12: self.view(labels=self.fleet + other)})
+        entries = {"acme/api#12": self.merged_entry(labels=self.fleet + other)}
+        self.go(entries, gh)
+        self.go(entries, gh)
+        self.assertEqual((sorted(gh.removed), len(gh.reads)), (sorted(self.fleet), 1), "only this fleet's prefix, and not twice")
+
+    def test_the_reads_are_bounded_by_the_pass_limit(self):
+        entries = {"acme/api#%d" % n: self.merged_entry() for n in range(100, 100 + sb.IMPACT_PASS_CALLS + 4)}
+        gh = FakeMergedGh({n: (0, json.dumps({"state": "OPEN", "labels": []}), "") for n in range(100, 100 + sb.IMPACT_PASS_CALLS + 4)})
+        self.go(entries, gh)
+        self.assertLessEqual(len(gh.reads), sb.IMPACT_PASS_CALLS)
+        self.go(entries, gh)
+        self.assertGreater(len(gh.reads), sb.IMPACT_PASS_CALLS, "the rest are read on the next pass")
+
+    def test_the_daemons_pass_runs_it_and_a_failure_never_stops_the_pass(self):
+        self.engine.hub = StubHub({"acme/api#13": self.merged_entry()})
+        self.engine.gh_runner = FakeMergedGh({13: self.view()})
+        sb.publish_decisions(self.engine)
+        self.assertEqual(sorted(self.engine.gh_runner.removed), sorted(self.fleet), "publish_decisions (the pass) removes them")
+        with mock.patch.object(sb.load_module("merged_labels"), "run_pass", side_effect=RuntimeError("boom")):
+            sb.publish_decisions(self.engine)   # never raises
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "merged_labels.error"])
+
+    def test_s6_the_sweep_stops_reporting_a_merged_pull_request_and_still_reports_a_closed_unmerged_one(self):
+        merged = {"number": 20, "state": "closed", "pull_request": {"merged_at": "2026-10-15T10:00:00Z"}, "labels": [{"name": self.names["merge-captain"]}]}
+        unmerged = {"number": 21, "state": "closed", "pull_request": {"merged_at": None}, "labels": [{"name": self.names["hold-security"]}]}
+        self.assertTrue(sb._issue_pr_merged(merged))
+        self.assertFalse(sb._issue_pr_merged(unmerged))
+        self.assertEqual([n for n, r in ((20, merged), (21, unmerged)) if not sb._issue_pr_merged(r)], [21], "1 finding, the closed unmerged pull request")
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.
