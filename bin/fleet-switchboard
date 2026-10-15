@@ -25573,7 +25573,7 @@ def cmd_orders_copy(args, runner, now):
         sys.stderr.write("%s: orders copy: the source and the target charter must be in the same repository (%s vs %s)\n" % (PROG, source_repo, repo))
         return EXIT_USAGE
     ns = types.SimpleNamespace(engine=engine, **{name: globals()[name] for name in module.NEEDS})
-    return module.run_copy(ns, repo, source, target, caller, role, print, lambda text: sys.stderr.write(text + "\n"))
+    return module.run_copy(ns, repo, source, target, caller, role, print, lambda text: sys.stderr.write(text + "\n"), watched=watched)
 
 
 def orders_write(engine, args, caller, role, repo, charter):

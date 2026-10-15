@@ -19,7 +19,7 @@ SUFFIX_ALLOWANCE = 90   # room for the `(ordered by <name up to 60>, <date>)` th
 SENTINEL_BY, SENTINEL_DATE = "x", "2000-01-01"
 
 NEEDS = ("PROG", "EXIT_OK", "EXIT_ERROR", "EXIT_USAGE", "OrdersError", "IntentError", "NoticeError", "section_orders", "add_order_to_body",
-         "edit_charter_orders", "ORDER_MAX_CHARS", "_charter_body", "_legacy_authority", "record_order_notice", "comment_as", "_one_line", "issue_tag")
+         "edit_charter_orders", "ORDER_MAX_CHARS", "_charter_body", "_legacy_authority", "record_order_notice", "comment_as", "_one_line", "issue_tag", "load_module", "orchestrator_label", "_CHARTER_BLOCK")
 
 
 def insert_bullet(sb, body, bullet):
@@ -45,7 +45,7 @@ def unfit(sb, bullet):
     return None
 
 
-def run_copy(sb, repo, source, target, caller, role, out, err):
+def run_copy(sb, repo, source, target, caller, role, out, err, watched=None):
     """Copy `repo#source`'s orders to `repo#target`. Exit code: 0 every order is there; 1 an order failed to copy (named); 2 refused
     (not the Chief of Staff, or a charter that cannot be used): nothing changed."""
     engine = sb.engine
@@ -59,6 +59,14 @@ def run_copy(sb, repo, source, target, caller, role, out, err):
         return sb.EXIT_USAGE
     if source == target:
         err("%s: orders copy: the source and the target are the same charter; nothing was changed" % sb.PROG)
+        return sb.EXIT_USAGE
+    check = sb.load_module("charter_check")   # the one endpoint check, shared with `move`: both charters are OPEN ISSUES (never pull requests) with the label and the block, in a watched, non-excluded repository
+    try:
+        check.check_repo(sb, repo, watched)
+        check.require_charter(sb, repo, source, "the source")
+        check.require_charter(sb, repo, target, "the target")
+    except check.Refused as problem:
+        err("%s: orders copy: %s; nothing was changed" % (sb.PROG, sb._one_line(str(problem), 300)))
         return sb.EXIT_USAGE
     try:
         source_body = sb._charter_body(reader, repo, source)

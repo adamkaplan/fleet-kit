@@ -32174,9 +32174,13 @@ class TestOrdersCopy(OrdersCase):
 
     def setUp(self):
         super().setUp()
-        self.gh = FakeGH(dict(self.ISSUES, **{"20": {"intent": None}}), {1, 20}, self.world.clock)
+        issues = dict(self.ISSUES, **{"20": {"intent": None}, "21": {"intent": None, "state": "closed"},
+                                      "22": {"intent": None, "pr": True, "labels": [sb.orchestrator_label()]},
+                                      "23": {"intent": None}})
+        self.gh = LaneGH(issues, {1, 20, 21}, self.world.clock)
         self.sources = source_orders()
-        self.gh.bodies = {1: charter_with(self.sources), 20: ORDERS_CHARTER_BODY}
+        self.gh.bodies = {1: charter_with(self.sources), 20: ORDERS_CHARTER_BODY, 21: charter_with(self.sources),
+                          22: charter_with(self.sources), 23: charter_with(self.sources)}
         self.as_agent("chief-of-staff")
 
     def target(self):
@@ -32237,6 +32241,42 @@ class TestOrdersCopy(OrdersCase):
             code, _, err = self.main("orders", "copy", *argv)
             self.assertEqual(code, 2, argv)
         self.assertEqual(self.target(), [])
+
+    def test_an_endpoint_that_is_not_an_open_charter_issue_is_refused_with_0_writes(self):
+        for argv, text in ((("--source", "21", "--charter", "20"), "the source acme/fleet#21 is closed"),
+                           (("--source", "1", "--charter", "21"), "the target acme/fleet#21 is closed"),
+                           (("--source", "22", "--charter", "20"), "the source acme/fleet#22 is a pull request"),
+                           (("--source", "1", "--charter", "22"), "the target acme/fleet#22 is a pull request"),
+                           (("--source", "23", "--charter", "20"), "not a charter"),
+                           (("--source", "1", "--charter", "1"), "same charter"),
+                           (("--source", "1", "--charter", "999"), "cannot read"),
+                           (("--source", "acme/other#1", "--charter", "acme/other#20"), "not a watched repository")):
+            with self.subTest(argv=argv):
+                code, _, err = self.main("orders", "copy", *argv)
+                self.assertEqual(code, 2)
+                self.assertIn(text, err)
+                self.assertEqual(self.gh.body(20), ORDERS_CHARTER_BODY, "0 writes")
+                self.assertEqual(getattr(self.gh, "comments", []), [])
+
+    def test_an_excluded_repository_is_refused_with_0_writes(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": FAKE_REPO, "excluded_repos": [FAKE_REPO]})
+        code, _, err = self.main("orders", "copy", "--source", "1", "--charter", "20")
+        self.assertEqual(code, 2)
+        self.assertIn("excluded", err)
+        self.assertEqual(self.gh.body(20), ORDERS_CHARTER_BODY)
+
+    def test_a_source_that_cannot_be_read_is_refused_with_0_writes(self):
+        real = self.gh.serve
+
+        def serve(argv, kwargs):
+            if argv[2].endswith("/issues/1"):
+                return subprocess.CompletedProcess(argv, 1, "", "gh: HTTP 500\n")
+            return real(argv, kwargs)
+        self.gh.serve = serve
+        code, _, err = self.main("orders", "copy", "--source", "1", "--charter", "20")
+        self.assertEqual(code, 2)
+        self.assertIn("cannot read", err)
+        self.assertEqual(self.gh.body(20), ORDERS_CHARTER_BODY)
 
     def test_the_writer_placeholder_format_is_what_the_insert_relies_on(self):
         module = sb.load_module("orders_copy")

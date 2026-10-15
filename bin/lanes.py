@@ -51,14 +51,16 @@ def check_caller(caller, role):
     return "only the chief-of-staff or the operator moves an ask; %s is %s" % (caller, "a %s" % role if role else "not given a role")
 
 
+def shared(sb):
+    """The one endpoint check (bin/charter_check.py), shared with `orders copy`."""
+    return sb.load_module("charter_check")
+
+
 def read_issue(sb, repo, number):
     try:
-        raw = sb.engine.intents._api("repos/%s/issues/%d" % (repo, number), repo)
-    except sb.IntentError as err:
-        raise MoveRefused("cannot read %s#%d: %s" % (repo, number, sb._one_line(str(err), 160))) from None
-    if not isinstance(raw, dict) or not isinstance(raw.get("id"), int):
-        raise MoveRefused("%s#%d came back without an id" % (repo, number))
-    return raw
+        return shared(sb).read_issue(sb, repo, number)
+    except shared(sb).Refused as problem:
+        raise MoveRefused(str(problem)) from None
 
 
 def parent_of(sb, repo, number):
@@ -74,34 +76,29 @@ def parent_of(sb, repo, number):
 
 
 def has_charter_block(sb, raw):
-    body = raw.get("body") if isinstance(raw.get("body"), str) else ""
-    return bool(sb._CHARTER_BLOCK.search(body))
+    return shared(sb).has_charter_block(sb, raw)
 
 
 def label_names(raw):
-    return [l.get("name") if isinstance(l, dict) else l for l in raw.get("labels") or [] if isinstance(l, (dict, str))]
+    return [l for l in (l.get("name") if isinstance(l, dict) else l for l in raw.get("labels") or [] if isinstance(l, (dict, str)))]
 
 
 def require_open_issue(sb, raw, what, repo, number):
-    """MoveRefused unless `raw` is an OPEN issue that is not a pull request."""
-    if raw.get("pull_request"):
-        raise MoveRefused("%s %s#%d is a pull request, not an issue" % (what, repo, number))
-    if raw.get("state") != "open":
-        raise MoveRefused("%s %s#%d is %s: only an open issue counts%s" % (
-            what, repo, number, raw.get("state") or "in a state that cannot be read", " (a closed charter has no orchestrator)" if what == "the target" else ""))
+    try:
+        shared(sb).require_open_issue(raw, what, repo, number)
+    except shared(sb).Refused as problem:
+        raise MoveRefused(str(problem)) from None
 
 
 def is_charter(sb, raw):
-    """A charter carries the orchestrator label AND the yaml `orchestrator:` block."""
-    return sb.orchestrator_label(sb.engine.config) in label_names(raw) and has_charter_block(sb, raw)
+    return shared(sb).is_charter(sb, raw)
 
 
 def check_repo(sb, repo, watched):
-    """MoveRefused unless `repo` is a watched repository that is not excluded."""
-    if sb.load_module("repo_exclusion").is_excluded(sb.engine.config, repo):
-        raise MoveRefused("repository %s is excluded from the fleet (excluded_repos)" % repo)
-    if repo not in (watched or []):
-        raise MoveRefused("repository %s is not a watched repository" % repo)
+    try:
+        shared(sb).check_repo(sb, repo, watched)
+    except shared(sb).Refused as problem:
+        raise MoveRefused(str(problem)) from None
 
 
 def plan_move(sb, repo, ask, to_charter):
@@ -115,11 +112,10 @@ def plan_move(sb, repo, ask, to_charter):
     if has_charter_block(sb, raw) or sb.orchestrator_label(sb.engine.config) in label_names(raw):
         raise MoveRefused("%s#%d is a charter, not an ask" % (repo, ask))
     try:
-        target = read_issue(sb, repo, to_charter)
-        require_open_issue(sb, target, "the target", repo, to_charter)
-        if not is_charter(sb, target):
-            raise MoveRefused("the target %s#%d is not a charter (it needs the %s label and the yaml orchestrator block)"
-                              % (repo, to_charter, sb.orchestrator_label(sb.engine.config)))
+        try:
+            shared(sb).require_charter(sb, repo, to_charter, "the target")
+        except shared(sb).Refused as problem:
+            raise MoveRefused(str(problem)) from None
         old = parent_of(sb, repo, ask)
         if old is None:
             raise MoveRefused("%s#%d has no parent charter: it is not an ask of any charter" % (repo, ask))
