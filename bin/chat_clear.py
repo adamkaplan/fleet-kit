@@ -168,7 +168,7 @@ SECRET_SHAPES = re.compile(r"(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9
 
 def _clean(text, limit):
     """One line, control characters out, anything shaped like a token or key replaced by `[secret]`, at most `limit` characters (and always writable text)."""
-    text = SECRET_SHAPES.sub("[secret]", " ".join(CONTROL.sub(" ", str(text or "")).split()))
+    text = SECRET_SHAPES.sub("[secret]", " ".join(CONTROL.sub(" ", str(text or "")[:limit + 300]).split()))   # bounded BEFORE the scan; 300 more than is kept, so a token that straddles the cut is still seen whole
     return text[:limit].encode("utf-8", "replace").decode("utf-8")   # a lone surrogate cannot be written: it becomes ?
 
 
@@ -358,24 +358,37 @@ LETTERS = re.compile(r"[^\W\d_]+", re.UNICODE)
 
 ALLOWED_MARKS = frozenset("#.,! ")
 QUESTION_OPENERS = frozenset(("is", "was", "are", "be", "s"))   # "is 366 good to go" asks by word order, with no question mark
+PRONOUNS = frozenset(("it", "you", "i", "we", "they"))          # "366 is it good to go" is a question too
 
 
 def _plain_clearing(text):
-    """True only when the message is a plain clearing sentence: every WORD is in the short allow-list (the number and the marks `#.,!` aside), nothing else but letters,
-    digits and white space appears (no emoji, no `/s`, no apostrophe form such as "isn't" or "isn\u2019t", no dash or colon), and no question opener (`is`, `was`, `are`, `be`) comes
-    BEFORE the number ("is 366 good to go" is a question without a question mark; "366 is good to go" is a statement). Anything else is not plain, whatever a judge
-    would say: the deterministic floor is an allow-list, not a list of hedges."""
-    if any(not (ch.isalnum() or ch.isspace() or ch in ALLOWED_MARKS) for ch in text):
+    """True only when the message is a plain clearing sentence: every WORD is in the short allow-list (the number and the marks `#.,!` aside), nothing else but ASCII digits,
+    letters and white space appears (no emoji, no `/s`, no apostrophe form such as "isn't" or "isn\u2019t", no dash, colon, `?` or non-ASCII digit), and no question
+    opener (`is`, `was`, `are`, `be`) except as the word DIRECTLY after the number and not followed by a pronoun ("366 is good to go" is a statement; "is 366 good to go",
+    "366, is it good to go" and "366 is it good to go" are questions without a question mark). Anything else is not plain, whatever a judge would say: the
+    deterministic floor is an allow-list, not a list of hedges."""
+    if any(not ((ch.isalnum() and (ch.isascii() or not ch.isdigit())) or ch.isspace() or ch in ALLOWED_MARKS) for ch in text):
         return False
     words = LETTERS.findall(text)
     if not all(word.lower() in PLAIN_WORDS for word in words):
         return False
-    first_digit = DIGITS.search(text)
-    before = LETTERS.findall(text[:first_digit.start()]) if first_digit else []
-    return not any(word.lower() in QUESTION_OPENERS for word in before)
+    first = DIGITS.search(text)
+    if first is None:
+        return not any(word.lower() in QUESTION_OPENERS for word in words)
+    before = LETTERS.findall(text[:first.start()])
+    after = LETTERS.findall(text[first.end():])
+    if any(word.lower() in QUESTION_OPENERS for word in before):
+        return False
+    gap = text[first.end():]
+    direct = bool(after) and re.match(r"^\s*" + re.escape(after[0]), gap) is not None   # the first word after the number follows it with nothing but space between
+    for n, word in enumerate(after):
+        if word.lower() in QUESTION_OPENERS and not (n == 0 and direct):
+            return False
+        if word.lower() in QUESTION_OPENERS and n + 1 < len(after) and after[n + 1].lower() in PRONOUNS:
+            return False
+    return True
 
 
-HEDGE = re.compile(r"\?")   # a question mark; everything else the floor refuses is by the allow-list above
 
 
 def screen(text, offers, created, now):
@@ -407,7 +420,7 @@ def screen(text, offers, created, now):
         return {"verdict": "question", "why": "several_numbers", "prs": prs}
     if not _standalone(text, numbers[0]):
         return {"verdict": "question", "why": "unclear_number", "prs": prs}
-    if HEDGE.search(text) or not _plain_clearing(text):
+    if not _plain_clearing(text):
         return {"verdict": "question", "why": "hedged", "prs": prs}
     matches = [pr for pr in prs if int(pr.rsplit("#", 1)[1]) == numbers[0]]
     if not matches:
@@ -464,7 +477,7 @@ def judge(jev, text, offers, min_confidence=HIGH_CONFIDENCE):
     probabilities and an answer below the bar all give `choice` None and `confident` False: they confirm nothing."""
     bar = min_confidence if isinstance(min_confidence, (int, float)) and not isinstance(min_confidence, bool) and min_confidence == min_confidence \
         and min_confidence <= 1 and min_confidence > HIGH_CONFIDENCE else HIGH_CONFIDENCE   # a bad, NaN or lower bar is the floor: the bar can only be raised
-    out = {"choice": None, "confident": False, "probabilities": None, "reason": "", "jev_choice": None, "model": None, "usage": {}, "latency_ms": None}
+    out = {"choice": None, "confident": False, "probabilities": None, "reason": "", "jev_choice": None, "model": None, "usage": {}, "latency_ms": None, "validated": False}
     if jev is None:
         out["reason"] = "no judge is configured"
         return out
@@ -480,24 +493,24 @@ def judge(jev, text, offers, min_confidence=HIGH_CONFIDENCE):
         out["reason"] = "jev gave an unreadable answer"
         return out
     probabilities = answer.get("probabilities")
-    if not (isinstance(probabilities, dict) and all(isinstance(k, str) and isinstance(v, (int, float)) and not isinstance(v, bool) for k, v in probabilities.items())):
-        out["reason"] = "jev gave no probabilities" if not probabilities else "jev gave an unreadable answer"
-        out.update(jev_choice=_clean(answer.get("choice"), 40), model=_clean(result.get("model"), 60), latency_ms=result.get("latency_ms"))
-        return out
-    out.update(jev_choice=answer.get("choice"), probabilities=probabilities, model=result.get("model"), usage=result.get("usage") or {},
-               latency_ms=result.get("latency_ms"))
-    if not isinstance(probabilities, dict) or not probabilities:
-        out["reason"] = "jev gave no probabilities"
-        return out
+    options = questions[JUDGE_ID]["criteria"]
     choice = answer.get("choice")
-    top = probabilities.get(choice, 0.0) if isinstance(choice, str) and choice in questions[JUDGE_ID]["criteria"] else None
-    numbers = [v for v in probabilities.values() if isinstance(v, (int, float)) and not isinstance(v, bool) and v == v]
-    if top is None or isinstance(top, bool) or not isinstance(top, (int, float)) or top != top or top > 1 or len(numbers) != len(probabilities) or top < max(numbers) \
-            or abs(sum(numbers) - 1) > 0.01:
-        out["reason"] = "jev gave an unreadable answer"   # the choice is not an option, or is not the most probable one, or a probability is not a number in 0..1
+    out.update(jev_choice=_clean(choice, 80) if isinstance(choice, str) else None, model=_clean(result.get("model"), 60) if isinstance(result.get("model"), str) else None,
+               latency_ms=result.get("latency_ms") if isinstance(result.get("latency_ms"), (int, float)) and not isinstance(result.get("latency_ms"), bool) else None)
+    if not (isinstance(probabilities, dict) and probabilities and all(isinstance(k, str) and isinstance(v, (int, float)) and not isinstance(v, bool) and v == v and 0 <= v <= 1
+                                                                      for k, v in probabilities.items())):
+        out["reason"] = "jev gave no probabilities" if not probabilities else "jev gave an unreadable answer"
         return out
-    if top < bar or sum(1 for v in numbers if v == top) > 1:
-        out["reason"] = "unsure: %s at %s is below %.2f or tied" % (_clean(choice, 40), top, bar)
+    probabilities = {k: v for k, v in probabilities.items() if k in options}   # only the options that were offered are kept
+    numbers = list(probabilities.values())
+    top = probabilities.get(choice) if isinstance(choice, str) else None
+    if top is None or top < max(numbers) or abs(sum(numbers) - 1) > 0.01:
+        out["reason"] = "jev gave an unreadable answer"   # the choice is not an option, or is not the most probable one, or the probabilities do not add up to 1
+        return out
+    tied = sum(1 for v in numbers if v == top) > 1
+    out.update(probabilities=probabilities, usage=result.get("usage") if isinstance(result.get("usage"), dict) else {}, validated=not tied)
+    if top < bar or tied:
+        out["reason"] = "unsure: %s at %s is below %.2f or tied" % (out["jev_choice"], top, bar)
         return out
     out.update(choice=answer["choice"], confident=True, reason="confident: %s at %.2f" % (answer["choice"], top))
     return out
@@ -544,6 +557,7 @@ def decide(jev, text, offers, created, now, min_confidence=HIGH_CONFIDENCE):
     * the screen found ONE candidate: `clear` only when the judge picks exactly that PR at the high bar; "nothing" at its bar is `none`; every other
       answer (unsure, unreachable, another offer, several, asks) is `ask`.
     `shown` lists the PRs the question puts in front of the owner, for `show()` to move their shown heads."""
+    text = text if isinstance(text, str) else ""
     checked = screen(text, offers, created, now)
     if checked.get("why") == "no_offers":
         return {"action": "none", "pr": None, "why": "no_offers", "screen": checked, "judge": None, "question": None, "shown": []}
@@ -552,7 +566,7 @@ def decide(jev, text, offers, created, now, min_confidence=HIGH_CONFIDENCE):
     verdict = judge(jev, text, offers, min_confidence)
     base = {"pr": None, "screen": checked, "judge": verdict, "question": None, "shown": []}
     probabilities = verdict.get("probabilities") or {}
-    says_nothing = verdict.get("jev_choice") == OPT_NOTHING and probabilities.get(OPT_NOTHING, 0.0) >= NOTHING_CONFIDENCE
+    says_nothing = bool(verdict.get("validated")) and verdict.get("jev_choice") == OPT_NOTHING and probabilities.get(OPT_NOTHING, 0.0) >= NOTHING_CONFIDENCE   # only an ANSWER that passed every check can say "not about clearing"
     if checked["verdict"] == "candidate":
         pr = checked["pr"]
         if verdict["confident"] and verdict["choice"] == pr:
