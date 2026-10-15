@@ -50886,7 +50886,8 @@ class TestTempJanitorResume(Base):
         for n in range(6, 13):
             name = "e%02d.txt" % n
             self.assertEqual((self.temp / name).exists(), name not in judged, name)
-        self.assertIn("7 not judged", " ".join(lines) if len(judged) == 5 else "7 not judged")
+        self.assertEqual(len(judged), 5)
+        self.assertIn("5 judged, 7 not judged", lines)
         self.assertFalse(any(line.startswith("kept e") and "time budget" in line for line in lines), "not judged is never reported as kept for a reason")
 
     def test_s4_each_report_says_judged_and_not_judged_and_the_last_says_the_cycle_is_complete(self):
@@ -50942,6 +50943,71 @@ class TestTempJanitorResume(Base):
             self.run_once()
             self.run_once()
         self.assertEqual(threading.active_count(), before)
+
+    def test_a_cursor_at_the_end_wraps_a_run_with_no_progress_keeps_it_and_a_dry_run_leaves_an_existing_one(self):
+        self.twelve()
+        cursor = self.state / self.jan.CURSOR_FILE
+        cursor.write_text('{"after": "e12.txt"}')
+        self.assertEqual(self.run_once(apply=False)[3][0], "e01.txt", "a cursor at the last name wraps to the first")
+        cursor.write_text('{"after": "zzz-after-everything"}')
+        self.assertEqual(self.run_once(apply=False)[3][0], "e01.txt")
+        self.assertEqual(json.loads(cursor.read_text()), {"after": "zzz-after-everything"}, "a dry run leaves an existing cursor")
+        cursor.write_text('{"after": "e04.txt"}')
+        lines, removed, kept, judged = self.run_once(seconds=-1)
+        self.assertEqual(judged, [], "the budget was spent before any entry")
+        self.assertEqual(json.loads(cursor.read_text()), {"after": "e04.txt"}, "no progress: the cursor stays")
+
+    def test_the_cursor_file_is_not_one_of_the_fleets_records(self):
+        self.twelve()
+        victim = self.entry("zz-victim-name.txt", 20)
+        (self.state / self.jan.CURSOR_FILE).write_text('{"after": "zz-victim-name.txt"}')
+        text, complete = self.jan.named_text(self.state)
+        self.assertNotIn("zz-victim-name.txt", text)
+        self.assertTrue(complete)
+
+    def test_a_corrupt_cursor_a_symlink_or_directory_it_names_and_a_type_change_never_remove_what_was_not_judged(self):
+        outside = self.home / "outside-dir"
+        outside.mkdir()
+        (outside / "precious.txt").write_text("keep me")
+        self.twelve(old_from=6)
+        cursor = self.state / self.jan.CURSOR_FILE
+        cursor.write_text("\x00{not json")
+        lines, removed, kept, judged = self.run_once(seconds=100)
+        for n in range(1, 13):
+            name = "e%02d.txt" % n
+            self.assertEqual((self.temp / name).exists(), not (n >= 6 and name in judged), name)
+        self.assertEqual(sorted(set(judged)), ["e%02d.txt" % n for n in range(1, 13)], "a corrupt cursor judged from the first name")
+        for n in range(6, 13):
+            self.entry("e%02d.txt" % n, 20)
+        (self.temp / "e03.txt").unlink()
+        (self.temp / "e03.txt").symlink_to(outside)   # the cursor will name an entry that is now a link to a directory
+        cursor.write_text('{"after": "e03.txt"}')
+        lines, removed, kept, judged = self.run_once(seconds=100)
+        self.assertNotIn("e03.txt", judged, "the run resumes AFTER the named entry")
+        self.assertTrue((outside / "precious.txt").exists())
+        self.assertTrue((self.temp / "e03.txt").is_symlink())
+        # an entry that changes type between its judging and its removal is not removed
+        self.entry("e20.txt", 20)
+        real_scan = self.jan.scan
+
+        def scan_then_swap(*a, **k):
+            rows = real_scan(*a, **k)
+            os.unlink(str(self.temp / "e20.txt"))
+            (self.temp / "e20.txt").symlink_to(outside)
+            return rows
+        cursor.unlink(missing_ok=True)
+        with mock.patch.object(self.jan, "scan", scan_then_swap):
+            lines, removed, kept, judged = self.run_once(seconds=100)
+        self.assertTrue((outside / "precious.txt").exists(), "a link is never followed")
+        self.assertTrue((self.temp / "e20.txt").is_symlink(), "it changed since the scan: kept")
+        self.assertIn("kept e20.txt: it changed since the scan", lines)
+
+    def test_the_weekly_flag_is_parsed_and_the_command_passes_it_to_the_run(self):
+        parser = sb.build_parser()
+        self.assertTrue(parser.parse_args(["disk", "janitor", "--apply", "--weekly"]).weekly)
+        self.assertFalse(parser.parse_args(["disk", "janitor", "--apply"]).weekly)
+        source = inspect.getsource(sb.cmd_disk_janitor)
+        self.assertIn('weekly=bool(getattr(args, "weekly", False))', source)
 
     def test_a_dry_run_reads_the_cursor_and_never_moves_it_and_the_file_is_private(self):
         self.twelve()

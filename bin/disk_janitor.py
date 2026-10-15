@@ -23,14 +23,14 @@ import stat
 import time
 from pathlib import Path
 
-DEFAULTS = {"enabled": True, "days": 7, "keep": [], "dir": None, "scan_seconds": 60, "weekly_scan_seconds": 600}
+SCAN_SECONDS = 60.0          # the whole scan (config `scan_seconds`): past it the rest are NOT JUDGED, and the next run continues after the last judged name
+DEFAULTS = {"enabled": True, "days": 7, "keep": [], "dir": None, "scan_seconds": SCAN_SECONDS, "weekly_scan_seconds": 600}
 KEEP_MARKER = ".fleet-keep"
 WALK_ENTRIES = 20000          # files one entry may hold and still be judged
 WALK_SECONDS = 5.0            # one entry's walk
 REMOVE_MAX = 500              # removals per call
 STATE_FILE_BYTES = 2000000    # of one state file read (its tail)
 STATE_TOTAL_BYTES = 16000000
-SCAN_SECONDS = 60.0          # the whole scan (config `scan_seconds`): past it the rest are NOT JUDGED, and the next run continues after the last judged name
 CURSOR_FILE = "temp-janitor-cursor.json"   # {"after": <the last name judged>}: a NAME, never a position
 BUDGET_MAX = 86400
 MIN_NAME = 6                  # a basename shorter than this is too common to count as naming something
@@ -105,11 +105,11 @@ def named_text(state_dir):
         names = sorted(os.listdir(str(state_dir)))
     except OSError:
         return "", False
-    if not any(n.endswith(".json") or n.endswith(".jsonl") for n in names):
+    if not any((n.endswith(".json") or n.endswith(".jsonl")) and n != CURSOR_FILE for n in names):
         return "", False   # a state directory with no record at all is the wrong directory, or an empty one: nothing can be said to be unnamed
     for name in names:
-        if not (name.endswith(".json") or name.endswith(".jsonl")):
-            continue
+        if not (name.endswith(".json") or name.endswith(".jsonl")) or name == CURSOR_FILE:
+            continue   # the janitor's own cursor is not a record of the fleet: a name in it must not keep that entry
         path = os.path.join(str(state_dir), name)
         try:
             info = os.lstat(path)
@@ -283,6 +283,8 @@ def write_cursor(state_dir, name):
     try:
         with os.fdopen(fd, "w") as handle:
             handle.write(json.dumps({"after": name}))
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temp, path)
     except BaseException:
         try:
@@ -317,6 +319,7 @@ def scan(temp_dir, state_dir, now, cfg, uid=None, clock=time.monotonic, busy=Non
         rows.append(judge(os.path.join(str(temp_dir), n), text, now, cfg, uid, clock, busy))
     if not complete:
         for row in rows:
+            row["incomplete"] = True
             if row["action"] == "remove":
                 row["action"], row["why"] = "keep", "the fleet's records could not be read in full: nothing is judged"
     return rows
@@ -385,6 +388,8 @@ def run(temp_dir, state_dir, now, cfg, apply, audit, uid=None, clock=time.monoto
 def _coverage(state_dir, rows, apply):
     """The report lines about coverage, and (on an apply run) the cursor moved: how many entries were judged and how many were not, and `cycle complete` when
     the run reached the end of the list. A dry run reads the cursor and never moves it (a preview must not change what the next real run covers)."""
+    if any(r.get("incomplete") for r in rows):   # nothing was really judged: no coverage was made, so the cursor stays where it was
+        return ["nothing was judged: the fleet's records could not be read in full (the cursor did not move)"]
     judged = [r for r in rows if r.get("judged", True)]
     unreached = [r for r in rows if not r.get("judged", True)]
     lines = ["%d judged, %d not judged" % (len(judged), len(unreached))]
@@ -400,7 +405,7 @@ def _coverage(state_dir, rows, apply):
             else:
                 write_cursor(state_dir, after)
         except OSError as err:
-            lines.append("the cursor could not be written (%s): the next run starts where this one did" % err.strerror)
+            lines.append("the cursor could not be written (%s): check that the state directory is writable; the next run starts where this one did" % err.strerror)
     return lines
 
 
