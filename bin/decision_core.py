@@ -353,8 +353,12 @@ BATCH_ROWS_MAX = 40            # rows one batch may carry (the panel draws one l
 BATCH_REF_MAX, BATCH_FINDING_MAX, BATCH_REC_MAX = 100, 200, 120
 BATCH_TITLE_MAX = 120
 BATCH_RAISE_ROWS_MAX = 20      # rows one batch may carry when it is RAISED (a batch already open may hold up to BATCH_ROWS_MAX: it is read, never refused)
-BATCH_ROW_MAX_CHARS = 4000     # the finding and the recommendation of one row as raised: each at most this long, kept in FULL in the issue body
-BATCH_BODY_MAX_CHARS = 65000   # the whole issue body (GitHub's limit is 65536 characters)
+BATCH_FINDING_RAISE_MAX = 4000   # the finding of one row as raised, kept in FULL in the issue body
+BATCH_REC_RAISE_MAX = 2500       # the recommendation of one row as raised: shorter, because the recorded answer quotes it for every row (20 x (2500 + a 240-char choice + a 100-char ref) fits one comment)
+BATCH_BODY_MAX_CHARS = 65000     # the whole issue body (GitHub's limit is 65536 characters)
+BATCH_COMMENT_MAX_CHARS = 65000  # the recorded answer comment (the same platform limit): checked before anything is sent or written
+OUTWARD_ROWS_BUDGET = 3000       # the characters of row text one outward message carries whole; a row that does not fit is sent cut AND marked, with a pointer to the issue
+OUTWARD_CUT_MIN = 100            # a cut row still carries at least this much of each part
 _BATCH_ROW_HEADING = re.compile(r"^###[ \t]+(?:[0-9]+\.[ \t]+)?([^\s|]+)[ \t]*$")
 _ROWS_BLOCK = re.compile(r"^```%s[ \t]*\r?\n(.*?)^```[ \t]*\r?$" % BATCH_FENCE, re.M | re.S)
 _ROW_REF = re.compile(r"^(?:[A-Za-z0-9_.-]+/)?[A-Za-z0-9_.-]+#[0-9]+$")
@@ -902,6 +906,26 @@ def goes_outward(entry, repos, kinds=("issue", "report")):
             and entry.get("repo") in (repos or ()))
 
 
+def outward_rows(entry):
+    """The rows of a batch as said outside: WHOLE while they fit OUTWARD_ROWS_BUDGET characters of text, then a row that does not fit is sent cut and marked
+    (`cut: true`, `see: "row N: see <repo>#<issue>"`), never silently."""
+    where = "%s#%s" % (entry.get("repo"), entry.get("ask"))
+    left, out = OUTWARD_ROWS_BUDGET, []
+    whole = BATCH_BODY_MAX_CHARS
+    for n, r in enumerate(entry["rows"], 1):
+        finding, rec = line_of(r.get("finding"), whole), line_of(r.get("recommendation"), whole)
+        row = {"n": n, "ref": line_of(r.get("ref"), 100), "finding": finding, "recommendation": rec}
+        if len(finding) + len(rec) <= left:
+            left -= len(finding) + len(rec)
+        else:
+            share = max(OUTWARD_CUT_MIN, left // 2)
+            cut = lambda text: text if len(text) <= share else text[:share - 1] + "\u2026"
+            row.update({"finding": cut(finding), "recommendation": cut(rec), "cut": True, "see": "row %d: see %s" % (n, where)})
+            left = max(0, left - 2 * share)
+        out.append(row)
+    return out
+
+
 def outward_payload(entry, floor):
     """What is said about a decision outside, from the list entry: text with anything shaped like a credential taken
     out, and the floor tier the mapping assigns its tier. `rows` (a batch) go as options by id."""
@@ -911,9 +935,7 @@ def outward_payload(entry, floor):
                "repo": entry.get("repo"), "agent": entry.get("agent"), "since": entry.get("since")}
     if entry.get("rows"):
         payload["batch"] = True
-        payload["rows"] = [{"n": n, "ref": line_of(r.get("ref"), 100), "finding": line_of(r.get("finding"), 200),
-                            "recommendation": line_of(r.get("recommendation"), 120)}
-                           for n, r in enumerate(entry["rows"], 1)]
+        payload["rows"] = outward_rows(entry)
         payload["options"] = [{"id": "as_recommended", "label": "As recommended"}]
     return payload
 

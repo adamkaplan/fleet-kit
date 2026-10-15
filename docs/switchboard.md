@@ -1984,7 +1984,7 @@ fleet-switchboard decisions batch --title "Stale issues to close" \
 ```
 
 It creates ONE real GitHub issue in the caller's own repo (its configured repo, never another), labelled `<user>:awaiting-cos`, signed with the caller's name, whose body
-holds one Markdown section per row, in full (nothing is cut for the reader; at most 20 rows, each of the finding and the recommendation at most 4000 characters, the body at most 65000):
+holds one Markdown section per row, in full (nothing is cut for the reader; at most 20 rows, the finding at most 4000 characters and the recommendation at most 2500, the body at most 65000; the recorded answer quotes every recommendation, so the 2500 keeps the worst answer under a comment's limit, and an answer that would still be over it is refused before the note, the comment or a label, with its length):
 
 ````text
 ### 1. acme/web#7

@@ -27387,10 +27387,11 @@ def read_batch_rows(args):
                          % (decision_core.BATCH_RAISE_ROWS_MAX, len(lines)))
     rows = [parse_batch_row(line) for line in lines]   # the FULL text: it is cut only when a list or the panel draws it
     for number, row in enumerate(rows, 1):
-        for part, text in (("finding", row["finding"]), ("recommendation", row["recommendation"])):
-            if len(text) > decision_core.BATCH_ROW_MAX_CHARS:
-                raise BatchError("the %s of row %d is %d characters: each is at most %d; shorten it or split the row, nothing was raised"
-                                 % (part, number, len(text), decision_core.BATCH_ROW_MAX_CHARS))
+        for part, text, cap in (("finding", row["finding"], decision_core.BATCH_FINDING_RAISE_MAX),
+                                ("recommendation", row["recommendation"], decision_core.BATCH_REC_RAISE_MAX)):
+            if len(text) > cap:
+                raise BatchError("the %s of row %d is %d characters: it is at most %d; shorten it or split the row, nothing was raised"
+                                 % (part, number, len(text), cap))
     return rows
 
 
@@ -27492,6 +27493,11 @@ def answer_batch(engine, runner, decision, args, name):
     if args.note:
         lines.append("Note: %s" % _one_line(args.note, 300))
     lines.append("The row issues were not changed by this answer: the orchestrator that raised the batch acts on it.")
+    size = len("\n".join(lines))
+    if size > decision_core.BATCH_COMMENT_MAX_CHARS:   # before ANY side effect (the note, the comment, the labels): refused whole, nothing sent or written
+        raise DecisionError("%s was not answered: the answer comment would be %d characters and a comment holds at most %d (the rows' recommendations are long); "
+                            "nothing was sent or written. Shorten the --row choices or the --note, or answer from the issue itself"
+                            % (ident, size, decision_core.BATCH_COMMENT_MAX_CHARS))
     told = ""
     raised = decision.get("raised_by")
     if raised and name:
