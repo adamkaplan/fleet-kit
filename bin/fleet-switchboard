@@ -18522,7 +18522,7 @@ def owner_terminal_problem(stdin=None, stdout=None, ps=None, start_pid=None, dep
 
 def gates_caller_kind(runner, now):
     """THE ONE human-terminal check: every command that must be run by the owner in person asks this function, and no other code
-    decides who is a person. Today: `verdict --as owner`, `gates mode`, `gates off|on` and `waive` (its chief-of-staff caller is an agent
+    decides who is a person. Today: `verdict --as owner`, `gates mode`, `gates off|on`, `move` (its operator path) and `waive` (its chief-of-staff caller is an agent
     session; its person path asks this function like the rest). Returns (kind, who[, role]).
     "person" (the owner's own terminal: no agent session and no pane, or a session v2 knows is not a fleet
     agent), "agent" (a fleet agent, even one nobody registered) or "unknown" (an uncertain identity: #138 refuses it, never reads
@@ -23523,7 +23523,7 @@ def add_move_parsers(sub):
     move.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
 
 
-def move_caller(engine, args):
+def move_caller(engine, args, runner, now):
     """(name, role) of who runs `move`: its pane's fleet agent, (None, None) at the owner's own terminal (the operator), or an "unidentified" caller that is refused. A mistake guard, not a boundary (docs/switchboard.md). `--from` in the Lab."""
     if args.sender is not None:
         if os.environ.get(LAB_ENV) != "1":
@@ -23532,16 +23532,12 @@ def move_caller(engine, args):
         if found is None:
             raise CallerError("%s is not a fleet agent the switchboard can see" % args.sender)
         return found.name, (found.fleet or {}).get("role")
-    try:
-        fleet = caller_fleet(engine.herdr, engine.v2, os.environ)
-    except IdentityUncertain:
-        raise
-    except CallerError:
-        problem = owner_terminal_problem()   # the one person check: a shell that cannot be established as the owner's own terminal is refused, never read as the operator
-        if problem:
-            return "an unidentified caller (not established as the owner's own terminal: %s)" % _one_line(problem, 120), "unidentified"
-        return None, None   # a plain shell: the operator
-    return fleet["name"], fleet.get("role")
+    kind = gates_caller_kind(runner, now)   # THE ONE human-terminal check (no copy of it here): a shell that cannot be established as the owner's own terminal is "unknown" and refused
+    if kind[0] == "person":
+        return None, None   # the owner at a shell: the operator
+    if kind[0] == "agent":
+        return kind[1], kind[2]
+    return "an unidentified caller (%s)" % _one_line(kind[1], 160), "unidentified"
 
 
 def cmd_move(args, runner, now):
@@ -23549,7 +23545,7 @@ def cmd_move(args, runner, now):
     engine, _, config = build_engine(runner, now, "cli")
     if engine.intents is None:
         raise ConfigError("'intent_repo' is not configured in %s: set it to OWNER/REPO" % config_path())
-    caller, role = move_caller(engine, args)
+    caller, role = move_caller(engine, args, runner, now)
     try:
         watched = watched_repos(config, discovered_fleets(engine.discover(engine.now())))
         repo, ask = resolve_issue(config, args.ask, None, watched)

@@ -29562,6 +29562,7 @@ USE_COMMANDS = {
     "handoff": ["handoff", "--issue", "1", "--brief-file", "-"], "comment": ["comment", "--issue", "1", "--body-file", "-"],
     "remind": ["remind", "other", "1h", "later"], "decisions": ["decisions"], "intent": ["intent", "1"],
     "bootstrap": ["bootstrap"], "notice": ["notice", "pr", "acme/api#7", "--from", "coder"],
+    "move": ["move", "1", "--to", "2", "--from", "coder"],
 }
 
 
