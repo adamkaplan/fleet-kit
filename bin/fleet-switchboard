@@ -241,6 +241,16 @@ def health_ingest_messages(engine, session, page):
         _health_fault(engine, "ingest", err)
 
 
+def health_watched_repos(state_dir):
+    """The repositories whose events the daemon receives: those with a running watch in github-watch.json (read only). [] when it is missing."""
+    try:
+        with open(str(Path(state_dir) / WATCH_FILE), "rb") as handle:
+            body = json.loads(handle.read(1000001).decode("utf-8"))
+        return [w["repo"] for w in body.get("watches", []) if isinstance(w, dict) and w.get("state") == "running" and isinstance(w.get("repo"), str)]
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
 def health_write(engine, state, now):
     """End of every pass (#357, from `finish_pass`, so it runs whatever is configured): the pushes seen in the PR picture, when one exists
     (`state` is the ci recorder's, or None: the engine's own is used), and `health-records.json` (written only when its content changed, or on the heartbeat)."""
@@ -251,7 +261,7 @@ def health_write(engine, state, now):
         state = state if state is not None else getattr(engine, "ci_record_state", None)
         recorder.ingest_prs(getattr(state, "pr_state", None))
         records = load_health_records()
-        body = recorder.body(records.read_tool_file(engine.state_dir))
+        body = recorder.body(records.read_tool_file(engine.state_dir), light=bool((getattr(engine, "config", None) or {}).get("v2_light")), watched=health_watched_repos(engine.state_dir))
         state_write(Path(engine.state_dir) / records.FILE, json.dumps(body, sort_keys=True), _without(body, "written_at"), HEARTBEAT_PR_STATE, nofollow=True)
     except Exception as err:
         _health_fault(engine, "write", err)
@@ -3530,6 +3540,7 @@ class EventFeed:
         self.quiet_end = False        # the last connection ended because the stream was quiet: the next open is not a gap
         self.counts = {"events": 0, "connects": 0, "resyncs": 0, "missed": 0, "errors": 0, "read_errors": 0}
         self.down_reason = None
+        self.on_usage = None          # #530: called with (session, step) for a step's token and cost figures; the event already carries them, nothing is read
 
     # -- the reader thread (reads, filters, remembers; no v2 call, no write)
 
@@ -3606,6 +3617,14 @@ class EventFeed:
             entry = self._entry(session)
             entry["event_at"] = self.now()
             message = data.get("assistantMessageID") if isinstance(data.get("assistantMessageID"), str) and len(data["assistantMessageID"]) <= FEED_ID_MAX else None
+            usage = (data.get("tokens") if isinstance(data.get("tokens"), dict) else data.get("usage")) if kind == "session.step.ended" else None
+            step_id = event.get("id") if isinstance(event.get("id"), str) else ("%s:%s" % (message, event.get("created")) if message else None)
+            if self.on_usage is not None and isinstance(usage, dict) and step_id:
+                step = {"id": step_id, "tokens": usage, "cost": data.get("cost"), "time": {"created": event.get("created")}}
+                try:
+                    self.on_usage(session, step)   # a step's usage from the event itself: it works with v2_light on, which only stops READS of history
+                except Exception:
+                    self.counts["errors"] += 1     # said in the feed's own counters; the recorder's faults are already said by health_ingest_messages
             if message and kind in ("session.text.ended", "session.step.ended"):
                 entry["assistant"] = message   # the id only: an event's text is never kept
             elif kind in ("session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"):
@@ -3708,6 +3727,8 @@ def start_event_feed(engine, config, now):
     if config["v2_events"] != "auto" or getattr(engine.v2, "http", None) is None:
         return None
     engine.feed = EventFeed(engine.v2.http, engine.audit, now)
+    if config.get("v2_light"):   # only then: without it the history reads feed the same usage (under another id), which would count a step twice
+        engine.feed.on_usage = lambda session, step: health_ingest_messages(engine, session, [step])
     engine.feed.start()
     return engine.feed
 

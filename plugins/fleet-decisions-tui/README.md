@@ -77,11 +77,18 @@ Above the Decisions rows, one dense block per workspace that has an orchestrator
 ▁▂▃▅▂▇▄█ q6 s3 d1 c2/3 p2 ctx45%
 ```
 
-- **Line 1:** a state dot and word (`work`, `idle`, `wait` for owner, `dead`, `?` when it cannot be told), `!` when the load alert (#348) is on for it,
-  the name, and the tool calls per minute over 15 minutes as a sparkline (`≈`: approximate, permission evaluations).
+- **Line 1:** a state dot and word, `!` when the load alert (#348) is on for it, the name, and the tool calls per minute over 15 minutes as a sparkline
+  (`≈`: approximate, permission evaluations). State words: `work`, `idle`, `wait` (a decision waits on the owner), `dead`, `?` when it cannot be told.
+  An attached pane is `work` or `idle` from the tool calls when they are recorded, else from the load record (coders busy, or asks moved this hour).
 - **Line 2:** asks moved per hour so far today (UTC; `·` is an hour with no record), then `q` open asks, `s` stalled over 2 h, `d` decisions waiting on it,
-  `c` coders busy/total, `p` pushes this hour, `ctx` context use. A figure whose source is missing, unreadable or too old reads `not recorded`, never 0.
-  A line is cut at 34 characters, so a row with several missing figures shows the first ones.
+  `c` coders busy/total, `p` pushes this hour, `ctx` context use. A figure whose source is missing, unreadable or too old reads `not recorded`.
+  A line is cut at 34 characters, so a row with several missing figures shows the first ones. The Chief of Staff has no load row: its second line
+  says `no load row: not orchestrator` beside its `d` count.
+- **Legend:** four dim lines under the heading name `q s d c p ctx moved` and the state words.
+- **Why a figure is absent:** `tool calls: plugin not installed` (no `tool-rate.json`: the installed `fleet-hooks` copy predates the counter; the kit's
+  own install step, which copies `plugins/fleet-hooks`, puts it in the profile; this block only reads) or `plugin not running` (the file is stale);
+  `ctx` under `v2_light`: usage comes from the `session.step.ended` events the daemon already receives (their token and cost figures; no read of history), and reads `ctx: off: v2_light` only while no event has carried figures; `p 0` for a repository whose forwarder is running (`github-watch.json`) with no push in the
+  hour, `p not recorded` only for one with no running forwarder. `health-records.json` carries these as `sources` and `pushes_watched`.
 - **Sources (all read from the state directory; nothing polled, nothing spawned):** `health-records.json` (bin/health_records.py: tool calls, tokens, context,
   pushes), `load.json` (the load alert's figures and today's hourly series), `pane-health.json` (which agents sit in which workspace, and whether the pane
   is alive) and `decisions.json` (what waits on the person). Hottest = alert, then stalled asks, open asks, recent tool calls.
