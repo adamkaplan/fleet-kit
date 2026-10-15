@@ -255,6 +255,10 @@ class TestHostileInput(Base):
                     ["api", "-X", "POST", "repos/{owner}/{repo}/pulls/7/merge", "--input", "x"]):
             with self.subTest(cmd=cmd):
                 self.refused(*cmd, env={"GH_REPO": CFG_REPO, "FAKE_REPO": CFG_REPO})
+        for cmd in (["api", "-iXPUT", base + "/pulls/7/merge"], ["api", "-i", "-XPUT", base + "/pulls/7/merge"], ["api", "-ifstate=closed", "-X", "PATCH", base + "/pulls/7"],
+                    ["api", "-i", "--silent", "-X", "PUT", base + "/pulls/7/merge"]):
+            with self.subTest(cmd=cmd):
+                self.refused(*cmd)
         self.passed("api", "-X", "PATCH", base + "/pulls/7", "-f", "title=new")
         self.passed("api", "-X", "POST", base + "/pulls/7/reviews", "-f", "event=COMMENT")
         self.passed("api", "-X", "POST", base + "/issues/7/comments", "-f", "body=hello")
@@ -275,12 +279,12 @@ class TestHostileInput(Base):
         self.refused("api", "graphql", "-F", "query=@" + str(self.home / "missing"))
         self.refused("api", "graphql", "--input", str(qfile))
         self.passed("api", "graphql", "-f", "query=query { viewer { login } }")
-        self.passed("api", "graphql", "-f", "query=mutation { addComment(input:{}) {x} }")
+        self.refused("api", "graphql", "-f", "query=mutation { enqueuePullRequest(input:{}) {x} }")
+        self.refused("api", "graphql", "-f", "query=mutation { addComment(input:{}) {x} }")        # every mutation: none can be tied to a repository
 
     def test_aliases_are_refused_and_other_words_pass(self):
         self.refused("shipit", "7", env={"FAKE_ALIASES": "shipit:\tpr merge"})
         self.passed("shipit", "7", env={"FAKE_ALIASES": "other:\tpr view"})
-        self.refused("shipit", "7", env={"FAKE_READ_FAIL": "1"}) if False else None
         done, _ = self.run_gh("workflow", "run", "x.yml")
         self.assertEqual(done.returncode, 7)
 
@@ -350,6 +354,17 @@ class TestHygiene(unittest.TestCase):
         for path in (MODULE, Path(__file__)):
             for number, line in enumerate(path.read_text().splitlines(), 1):
                 self.assertIsNone(pattern.search(line), "%s:%d" % (path.name, number))
+
+    def test_the_switchboard_refuses_a_bad_entry_at_load(self):
+        import importlib.machinery, importlib.util
+        loader = importlib.machinery.SourceFileLoader("sb_hold", str(REPO / "bin" / "fleet-switchboard"))
+        spec = importlib.util.spec_from_loader("sb_hold", loader)
+        sb = importlib.util.module_from_spec(spec)
+        sys.modules["sb_hold"] = sb
+        loader.exec_module(sb)
+        self.assertIn("hold_labels", sb.validate_config({"hold_labels": {CFG_REPO: {"label": LABEL, "message": "m"}}}))
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"hold_labels": {CFG_REPO: {"label": LABEL}}})
 
     def test_the_config_check_accepts_the_shape_and_names_what_is_wrong(self):
         import importlib.util

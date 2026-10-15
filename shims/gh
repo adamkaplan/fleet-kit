@@ -838,13 +838,19 @@ def load_hold():
 
 def hold_probe(args, lookup, gh, write):
     """(refusal text or None, repo or None, number or None): see gh_hold.py. A missing or broken module refuses a WRITE while the config names a hold
-    (fail closed) and is otherwise silent. The label read uses the account the write would use."""
+    (fail closed) and is otherwise silent; that fallback re-reads the config text itself (a missing file means nothing is configured, any other read
+    error counts as naming a hold). Any other unexpected error in the probe lets the command run: `gh_hold.check` itself fails closed for writes. The label read uses the account the write would use."""
     try:
         module = load_hold()
         if module is None:
-            with open(os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config"),
-                                   "fleet-switchboard", "config.json")) as handle:
-                named = "hold_labels" in handle.read()
+            try:
+                with open(os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config"),
+                                       "fleet-switchboard", "config.json")) as handle:
+                    named = "hold_labels" in handle.read()
+            except FileNotFoundError:
+                named = False
+            except Exception:
+                named = True                      # a config that cannot be read is not known to name no hold: a write is refused
             return ("gh: the hold-label check could not be loaded, retry (the fleet shim refuses this write rather than let it through)"
                     if named and write else None), None, None
         env = None

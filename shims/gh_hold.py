@@ -38,9 +38,7 @@ MAX_FILE = 262144
 KNOWN_COMMANDS = {"pr", "issue", "api", "repo", "label", "auth", "config", "alias", "browse", "codespace", "completion", "extension", "ext",
                   "gist", "gpg-key", "help", "release", "run", "search", "secret", "ssh-key", "status", "variable", "workflow", "cache",
                   "org", "attestation", "project", "ruleset", "agent-task", "preview", "licenses", "version", "copilot", "skill"}
-GRAPHQL_GUARDED = re.compile(r"\b(mergePullRequest|closePullRequest|addPullRequestReview|submitPullRequestReview|enablePullRequestAutoMerge|"
-                             r"disablePullRequestAutoMerge|updatePullRequest|removeLabelsFromLabelable|clearLabelsFromLabelable|deleteLabel|"
-                             r"updateLabel)\b", re.I)
+GRAPHQL_GUARDED = re.compile(r"\b(mutation)\b", re.I)   # every mutation: a node id cannot be tied to a repository, so none can be checked
 
 RETRY = ("gh: hold-label check failed, retry (the fleet shim could not read whether this pull request carries a hold label, so it refuses "
          "the write rather than let it through)")
@@ -518,15 +516,21 @@ def parse_api(args):
             elif name in API_VALUE_FLAGS and not eq:
                 i += 1
             continue
-        c = a[1]
-        rest = a[2:]
-        if c == "X":
-            method, i = (rest.lstrip("="), i) if rest else ((args[i] if i < len(args) else ""), i + 1)
-        elif c in ("f", "F"):
-            raw, i = (rest.lstrip("="), i) if rest else ((args[i] if i < len(args) else ""), i + 1)
-            fields.append(split_field(raw, "raw" if c == "f" else "field"))
-        elif c in ("H", "q", "t", "p") and not rest:
-            i += 1
+        letters, j = a[1:], 0
+        while j < len(letters):                       # a cluster as cobra reads it: bool letters, then the first value letter takes the rest or the next word
+            c = letters[j]
+            if c in "XfFHqtp":
+                rest = letters[j + 1:]
+                if rest:
+                    value = rest.lstrip("=") if rest.startswith("=") else rest
+                else:
+                    value, i = (args[i] if i < len(args) else ""), i + 1
+                if c == "X":
+                    method = value
+                elif c in "fF":
+                    fields.append(split_field(value, "raw" if c == "f" else "field"))
+                break
+            j += 1
     return endpoints, (method.upper() if method is not None else None), fields, inp
 
 
