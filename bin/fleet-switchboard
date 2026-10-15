@@ -9087,6 +9087,7 @@ def read_pr_json(engine, repo, number, extra_fields=""):
     config = engine.config
     accounts = getattr(engine, "accounts", None) or GhAccounts(config, engine.gh_runner or subprocess.run, engine.now)
     try:
+        refuse_excluded(config, repo)   # #446
         env = accounts.env_for(repo)
     except AccountError as err:
         raise NoticeError(str(err)) from None
@@ -9116,6 +9117,7 @@ def read_ref_state(engine, repo, number, kind):
         return read_pr_facts(engine, repo, number)["state"]
     accounts = getattr(engine, "accounts", None) or GhAccounts(engine.config, engine.gh_runner or subprocess.run, engine.now)
     try:
+        refuse_excluded(engine.config, repo)   # #446
         env = accounts.env_for(repo)
     except AccountError as err:
         raise NoticeError(str(err)) from None
@@ -15411,6 +15413,17 @@ def _endpoint_of(path):
     return re.sub(r"\d+", "#", bare) or "repo"
 
 
+class RepoExcluded(AccountError):
+    """A read of a repository the config excludes (`excluded_repos`, #446): no process is started. An AccountError, so every caller that already
+    degrades on an account problem (the hub's reads, the intent reader, a notice) degrades the same way."""
+
+
+def refuse_excluded(config, repo):
+    """The one check of the exclusion for a gh read of `repo`: raises RepoExcluded when the config excludes it."""
+    if repo and load_module("repo_exclusion").is_excluded(config, repo):
+        raise RepoExcluded("repository %s is excluded from the fleet's reads (excluded_repos)" % repo)
+
+
 class GhAccounts:
     """Which gh account a repo uses, and its token at the moment of use.
 
@@ -15494,6 +15507,7 @@ class GhAccounts:
           - a 403/429 that says the limit is spent pauses every read of that account until the limit resets (GhRateLimited is raised
             at once, no process is started). No read is exempt: writes do not go through here.
         A runner whose answer has no HTTP header block (a fake, `--paginate`) is passed through as it is."""
+        refuse_excluded(self.config, repo)   # #446: the lowest layer every gh read goes through: nothing is spawned for an excluded repository
         account = self.describe(repo)
         now = self.now()
         with self.lock:

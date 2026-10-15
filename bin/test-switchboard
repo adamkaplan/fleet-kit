@@ -49823,6 +49823,37 @@ class TestExcludedRepos(Base):
         self.assertEqual(caught.exception.reason, "excluded")
         self.assertEqual(calls, [])
 
+    def test_the_choke_point_no_gh_read_spawns_a_process_for_an_excluded_repo_and_other_repos_still_read(self):
+        rig = self.rig([ACME_WEB], baseline=[ACME_API])
+        calls = []
+
+        def counting(argv, **kwargs):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"state": "OPEN", "number": 5}), "")
+        engine, hub, config = rig.world.engine, rig.hub, rig.world.config
+        engine.gh_runner = counting
+        hub.runner = counting
+        accounts = sb.GhAccounts(config, counting, time.time)
+        hub.accounts = accounts
+        reader = sb.IntentReader(GH_BIN, ACME_API, counting, accounts=accounts)
+        for name, call in (
+                ("GhAccounts.read", lambda: accounts.read(counting, "repos/%s/issues/5" % ACME_WEB, ACME_WEB, 5)),
+                ("GhAccounts.read, other case", lambda: accounts.read(counting, "repos/ACME/WEB/issues/5", "ACME/WEB", 5)),
+                ("read_pr_json", lambda: sb.read_pr_json(engine, ACME_WEB, 5)),
+                ("read_ref_state issue", lambda: sb.read_ref_state(engine, ACME_WEB, 5, "issue")),
+                ("read_ref_state pr", lambda: sb.read_ref_state(engine, ACME_WEB, 5, "pr")),
+                ("the hub's gh_api", lambda: hub.gh_api("repos/%s/issues/5/comments" % ACME_WEB)),
+                ("the intent reader", lambda: reader.issue(5, ACME_WEB))):
+            with self.assertRaises((sb.AccountError, sb.NoticeError, sb.GitHubUnavailable, sb.IntentError), msg=name):
+                call()
+            self.assertEqual(calls, [], "%s started a process for an excluded repository" % name)
+        # U1: a repository that is not excluded still reads, through every one of them
+        self.assertEqual(sb.read_ref_state(engine, ACME_API, 5, "issue"), "open")
+        self.assertEqual(sb.read_pr_json(engine, ACME_API, 5)["number"], 5)
+        self.assertEqual(accounts.read(counting, "repos/%s/issues/5" % ACME_API, ACME_API, 5).returncode, 0)
+        hub.gh_api("repos/%s/issues/5/comments" % ACME_API)
+        self.assertEqual(len(calls), 4, calls)
+
     def test_the_intent_repo_itself_being_excluded_is_not_read_either(self):
         calls = []
         reader = sb.IntentReader(GH_BIN, ACME_WEB, lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(argv, 0, "{}", ""))
