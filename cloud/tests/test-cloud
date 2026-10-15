@@ -41,6 +41,7 @@ case "$1 $2" in
     exit 0 ;;
   "timeout 10")
     [ "${CTR_DOWN:-0}" = 1 ] && exit 1
+    [ "${SLOW_PROBE:-0}" = 1 ] && [ "$(grep -c 'systemctl restart containerd' "$TMP_LOG")" = 1 ] && { sleep 1; exit 1; }
     # ctr version: fails while DOWN_UNTIL probes have not yet been made after a restart (DOWN_UNTIL=999: never answers)
     if [ "$(grep -c 'systemctl restart containerd' "$TMP_LOG")" = 1 ]; then
       [ "$(grep -c 'ctr version' "$TMP_LOG")" -le "${DOWN_UNTIL:-0}" ] && exit 1
@@ -202,12 +203,58 @@ PATH="$tmp/cpshim:$PATH" TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/ho
 [ $rc = 1 ] && tail -n 1 "$tmp/err" | grep -q '^config restore FAILED: node needs manual repair' && ! grep -q label "$tmp/log" \
   && ok "fix: restored file differs from the saved copy: loud last line, exit 1, no label" || bad "fix: restore mismatch (rc=$rc)"
 # the restart after a good restore also fails: loud last line, exit 1, config byte-identical to the original
-cp "$fx" "$tmp/config.toml"; rm -f "$mk"
+cp "$fx" "$tmp/config.toml"; rm -f "$mk" "$tmp/config.toml.sysbox-fix.inprogress"  # (a failed restore leaves the flag, by design)
 : > "$tmp/log"
 TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/host" LABEL_CMD="$tmp/label" READY_CMD="$tmp/ready" ONCE=1 RESTART_FAIL_ON="1 2" WAIT=2 POLL=1 sh "$tmp/fix.sh" >"$tmp/out" 2>"$tmp/err"; rc=$?
 [ $rc = 1 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && tail -n 1 "$tmp/err" | grep -q 'NOT healthy after the second restart: node needs manual repair' && ! grep -q label "$tmp/log" \
   && ok "fix: restart after the restore fails: loud last line, config restored, exit 1" || bad "fix: second restart fails (rc=$rc)"
 rm -f "$mk"; cp "$fx" "$tmp/config.toml"
+# --- a killed or stopped run (the in-progress flag, the trap, the recovery at start) ---
+ip="$tmp/config.toml.sysbox-fix.inprogress"
+# (d) normal success: flag removed, no rollback, one restart
+cp "$fx" "$tmp/config.toml"; rm -f "$mk" "$ip"; : > "$tmp/log"
+TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/host" LABEL_CMD="$tmp/label" READY_CMD="$tmp/ready" ONCE=1 WAIT=2 POLL=1 sh "$tmp/fix.sh" >"$tmp/out" 2>"$tmp/err"; rc=$?
+[ $rc = 0 ] && [ ! -e "$ip" ] && [ "$(restarts)" = 1 ] && ! grep -q 'rolling back' "$tmp/err" && grep -q label "$tmp/log" \
+  && ok "fix: success removes the in-progress flag, fires no rollback" || bad "fix: success flag (rc=$rc)"
+# (e) a normal rollback is not repeated by the exit trap: exactly two restarts, one rollback message, flag gone
+cp "$fx" "$tmp/config.toml"; rm -f "$mk" "$ip"; : > "$tmp/log"
+TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/host" LABEL_CMD="$tmp/label" READY_CMD="$tmp/ready" ONCE=1 DOWN_UNTIL=999 WAIT=2 POLL=1 sh "$tmp/fix.sh" >"$tmp/out" 2>"$tmp/err"; rc=$?
+[ $rc = 1 ] && [ "$(restarts)" = 2 ] && [ "$(grep -c 'rolling back' "$tmp/err")" = 1 ] && [ ! -e "$ip" ] && cmp -s "$tmp/orig" "$tmp/config.toml" \
+  && ok "fix: normal rollback is not repeated by the trap (2 restarts, 1 rollback)" || bad "fix: double rollback (rc=$rc restarts=$(restarts))"
+# (a, b) SIGTERM / SIGINT during the first wait: the trap restores byte for byte, restarts, checks, exits non-zero, no label
+for sig in TERM INT; do
+  cp "$fx" "$tmp/config.toml"; rm -f "$mk" "$ip"; : > "$tmp/log"
+  # a non-interactive shell starts background jobs with INT ignored: re-enable it, as a pod's PID 1 has it
+  TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/host" LABEL_CMD="$tmp/label" READY_CMD="$tmp/ready" ONCE=1 DOWN_UNTIL=999 WAIT=30 POLL=1 \
+    sh -c 'trap - INT; exec sh "$0"' "$tmp/fix.sh" >"$tmp/out" 2>"$tmp/err" &
+  pid=$!; i=0
+  while ! grep -q 'ctr version' "$tmp/log" && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  kill -$sig $pid; wait $pid; rc=$?
+  [ $rc != 0 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && [ "$(restarts)" = 2 ] && ! grep -q label "$tmp/log" && [ ! -e "$ip" ] \
+    && [ "$(sed -n 's/^count=//p' "$mk")" = 1 ] && grep -q 'rolling back' "$tmp/err" && [ "$(grep -c 'ctr version' "$tmp/log")" -ge 2 ] \
+    && ok "fix: SIG$sig in the first wait: trap restores byte for byte, restarts, health check, non-zero, no label" || bad "fix: SIG$sig trap (rc=$rc restarts=$(restarts))"
+done
+# (c) simulated SIGKILL: the flag and the edited config are left; the next start recovers and counts one failed attempt
+killed() { cp "$tmp/after_ok" "$tmp/config.toml"; cp "$fx" "$tmp/config.toml.sysbox-fix.bak"; : > "$ip"; }
+killed; rm -f "$mk"
+MAX_ATTEMPTS=1 runfix; rc=$?
+[ $rc = 4 ] && cmp -s "$fx" "$tmp/config.toml" && [ "$(restarts)" = 1 ] && grep -q 'ctr version' "$tmp/log" && [ "$(sed -n 's/^count=//p' "$mk")" = 1 ] && [ ! -e "$ip" ] && ! grep -q label "$tmp/log" \
+  && ok "fix: killed run: start restores, restarts, checks, counts one failed attempt (cap 1 reached: off)" || bad "fix: kill recovery (rc=$rc)"
+killed; printf 'count=1\ntime=x\n' > "$mk"
+runfix; rc=$?
+[ $rc = 4 ] && cmp -s "$fx" "$tmp/config.toml" && [ "$(sed -n 's/^count=//p' "$mk")" = 2 ] && [ "$(restarts)" = 1 ] && ! grep -q label "$tmp/log" \
+  && ok "fix: a second kill reaches the cap: restored, stays off" || bad "fix: second kill (rc=$rc)"
+killed; rm -f "$mk"
+runfix; rc=$?
+[ $rc = 0 ] && [ "$(restarts)" = 2 ] && grep -q label "$tmp/log" && [ ! -e "$ip" ] && ! grep -q 'grpc.v1.cri' "$tmp/config.toml" \
+  && ok "fix: killed run below the cap: recovers, then continues as normal" || bad "fix: recover then continue (rc=$rc)"
+rm -f "$mk" "$ip"
+# (f) the wait is a clock: probes that take 1s each, WAIT=4 POLL=1: ends within WAIT + a probe + POLL (a loop count would take 8s)
+cp "$fx" "$tmp/config.toml"; : > "$tmp/log"; t0=$(date +%s)
+TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/host" LABEL_CMD="$tmp/label" READY_CMD="$tmp/ready" ONCE=1 SLOW_PROBE=1 WAIT=4 POLL=1 sh "$tmp/fix.sh" >/dev/null 2>&1; rc=$?
+el=$(( $(date +%s) - t0 ))
+[ $rc = 1 ] && [ "$el" -le 6 ] && [ "$el" -ge 3 ] && ok "fix: the wait ends by the clock (${el}s for WAIT=4)" || bad "fix: clock (rc=$rc ${el}s)"
+rm -f "$mk" "$ip"; cp "$fx" "$tmp/config.toml"
 # healthy restart (node Ready): one restart, labelled, as before
 printf '#!/bin/sh\nexit 0\n' > "$tmp/ready"; chmod +x "$tmp/ready"
 cp "$fx" "$tmp/config.toml"

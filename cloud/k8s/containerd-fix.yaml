@@ -39,24 +39,37 @@ data:
       if [ -n "${READY_CMD:-}" ]; then $READY_CMD
       else kubectl get node "$NODE_NAME" -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}' | grep -qx True; fi
     }
+    # WAIT is a clock, not a loop count: the deadline is the start time plus WAIT (date +%s), so the
+    # wait ends within WAIT + one probe bound (10s) + POLL however slow the probes are.
     healthy_after_restart() {
-      t=0
-      while [ "$t" -lt "$WAIT" ]; do
+      deadline=$(( $(date +%s) + WAIT ))
+      while [ "$(date +%s)" -lt "$deadline" ]; do
         if $HOST timeout 10 ctr version >/dev/null 2>&1 && node_ready >/dev/null 2>&1; then return 0; fi
-        sleep "$POLL"; t=$((t + POLL))
+        sleep "$POLL"
       done
       return 1
     }
     # Restart containerd and check it is healthy: any failure of either is a failure.
     restart_and_check() { $HOST systemctl restart containerd || return 1; healthy_after_restart; }
     manual_repair() {
+      armed=0   # nothing more the trap could do; the in-progress flag stays so the next start tries again
       echo "config restore FAILED: node needs manual repair: $CFG (saved copy: $CFG.sysbox-fix.bak)" >&2; exit 1
     }
-    # A restart left containerd or the node unhealthy (or the restart itself failed): record the
-    # attempt, restore the saved config byte for byte, restart and check again. Never labels.
+    # CRITICAL SECTION. From just before the config is edited until the health check has passed and the
+    # node is labelled, a file flag on the node beside the config says "in progress" (fail closed:
+    # the flag is removed only on completion or after a verified restore). Two mechanisms use it:
+    #  - the TRAP (TERM, INT, EXIT) covers a run that is stopped but still alive to react: pod deleted
+    #    (SIGTERM), Ctrl-C, or any exit while armed=1. It takes the rollback path below, once.
+    #  - the RECOVERY AT START covers a run that was SIGKILLed (no trap can run): the flag is still
+    #    there when the next pod starts, so that pod rolls back first and counts one failed attempt.
+    INPROG="$CFG.sysbox-fix.inprogress"; armed=0
+    # Roll back: record the failed attempt, restore the saved config byte for byte, restart and check
+    # again. Returns only when all of that succeeded (then clears the flag); otherwise exits 1.
+    # Disarms first, so the trap can never run it a second time. Never labels.
     # "restored" is printed only when the restore, the restart and the health check all succeeded.
-    rollback() {
-      echo "ERROR: containerd restart failed or containerd/node not healthy within ${WAIT}s: rolling back" >&2
+    rollback_core() {
+      armed=0
+      echo "ERROR: $1: rolling back" >&2
       prev=$(sed -n 's/^count=\([0-9][0-9]*\)$/\1/p' "$MARKER" 2>/dev/null | head -n 1)
       case "$prev" in ''|*[!0-9]*) prev=0 ;; esac
       { printf 'count=%s\ntime=%s\n' "$((prev + 1))" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$MARKER.tmp" && mv "$MARKER.tmp" "$MARKER" && sync; } \
@@ -65,9 +78,30 @@ data:
       if ! restart_and_check; then
         echo "config restored but containerd is NOT healthy after the second restart: node needs manual repair: $CFG" >&2; exit 1
       fi
-      echo "ERROR: config restored, containerd healthy again; failed attempt $((prev + 1)) recorded in $MARKER: exiting non-zero" >&2
-      exit 1
+      rm -f "$INPROG"
+      echo "ERROR: config restored, containerd healthy again; failed attempt $((prev + 1)) recorded in $MARKER" >&2
     }
+    rollback() {
+      rollback_core "containerd restart failed or containerd/node not healthy within ${WAIT}s"
+      echo "ERROR: exiting non-zero" >&2; exit 1
+    }
+    # TERM and INT turn into an exit, so every stop goes through the one EXIT handler. The handler
+    # disarms its own traps first (no recursion); a normal exit (armed=0) passes its status through.
+    on_exit() {
+      rc=$?; trap - TERM INT EXIT
+      if [ "$armed" = 1 ]; then
+        rollback_core "run stopped (signal or exit, status $rc) before containerd was proven healthy"
+        echo "ERROR: run did not complete; config rolled back; exiting non-zero; node not labelled" >&2
+        [ "$rc" = 0 ] && rc=1
+      fi
+      exit "$rc"
+    }
+    trap 'exit 143' TERM; trap 'exit 130' INT; trap on_exit EXIT
+    # A previous run was killed mid-way (SIGKILL: no trap ran) and left the flag: roll back first. It
+    # counts as one failed attempt; the cap check in the loop then decides to go on or stay off.
+    if [ -e "$INPROG" ]; then
+      rollback_core "a previous run was killed before it finished (in-progress flag found)"
+    fi
 
     while true; do
       if [ -e "$MARKER" ]; then
@@ -135,6 +169,8 @@ data:
           rm -f "$CFG.tmp"
           echo "sysbox-runc is registered in a form this fix does not move: exiting non-zero" >&2; exit 1
         fi
+        { : > "$INPROG" && sync; } || { echo "cannot write $INPROG: not editing the config" >&2; rm -f "$CFG.tmp"; exit 1; }
+        armed=1
         mv "$CFG.tmp" "$CFG"; sync
         if $HOST containerd config dump >/dev/null 2>&1 \
            && $HOST containerd config dump | grep -q 'runtimes.sysbox-runc' \
@@ -143,11 +179,13 @@ data:
           restart_and_check || rollback
           rm -f "$MARKER"
           $LABEL_CMD >/dev/null
+          armed=0; rm -f "$INPROG"   # complete: healthy and labelled
           bad=0
         else
           bad=$((bad + 1))
           echo "config invalid (try $bad): restoring backup" >&2
           if ! restore_backup || ! cmp -s "$CFG.sysbox-fix.bak" "$CFG"; then manual_repair; fi
+          armed=0; rm -f "$INPROG"
           [ "$bad" -ge "${MAX_BAD:-5}" ] && { echo "giving up: pod exits non-zero" >&2; exit 1; }
           [ "${ONCE:-0}" = 1 ] && exit 1
           sleep 60; continue
@@ -200,6 +238,8 @@ spec:
         app: sysbox-containerd-fix
     spec:
       serviceAccountName: sysbox-containerd-fix
+      # time for the trap's rollback (a restart and a WAIT) after SIGTERM; SIGKILL is covered at the next start
+      terminationGracePeriodSeconds: 180
       hostPID: true
       nodeSelector:
         sysbox-install: "yes"
