@@ -79,6 +79,48 @@ from urllib.parse import quote
 import uuid
 
 
+_MODULE_LOCKS = {}            # one reentrant lock per module name: a load of one module never waits behind the import of another
+_MODULE_LOCKS_GUARD = threading.Lock()   # held only to fetch or make a name's lock, never across an import
+_MODULES_DONE = {}            # name -> the module object whose import FINISHED (sys.modules holds a module while it still runs)
+
+
+def load_module(name):
+    """A helper module of bin/, loaded by path from beside this file: the one loader behind every `load_<module>()` below,
+    so a new module needs no loader of its own (call `load_module("name")`).
+
+    Not by `import`: this file has no .py name, is run through a symlink (~/.local/bin), by the daemon's service
+    unit, by wrappers, and is loaded by tests with SourceFileLoader, and none of those puts its directory on
+    sys.path. The real path of this file (symlinks resolved) is always right. A copy already loaded from the
+    same file is reused, so two loads of this script share one module. The name is a plain module name, never
+    a path: anything else is refused (ValueError), and a name with no file here fails as it always did.
+
+    A module already loaded is returned with no lock at all (this is on the hot path). A first load holds the lock of THAT name only, and
+    checks again once it has it, so concurrent first loads of one module all get the finished module and a failed import (never kept) raises
+    for every caller; the import of one module never delays another."""
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        raise ValueError("not a module name: %r" % (name,))
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), name + ".py")
+    done = _MODULES_DONE.get(name)
+    if done is not None and sys.modules.get(name) is done and os.path.realpath(getattr(done, "__file__", "") or "") == path:
+        return done
+    with _MODULE_LOCKS_GUARD:
+        lock = _MODULE_LOCKS.setdefault(name, threading.RLock())
+    with lock:   # reentrant: a module that loads another while it runs does not wait for itself
+        held = sys.modules.get(name)
+        if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+            return held
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(name, None)
+            raise
+        _MODULES_DONE[name] = module
+        return module
+
+
 def load_decision_core():
     """The pure core of the Decision subsystem, bin/decision_core.py, loaded by path from beside this file.
 
@@ -86,19 +128,7 @@ def load_decision_core():
     unit, by wrappers, and is loaded by tests with SourceFileLoader, and none of those puts its directory on
     sys.path. The real path of this file (symlinks resolved) is always right. A copy already loaded from the
     same file is reused, so two loads of this script share one module."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "decision_core.py")
-    held = sys.modules.get("decision_core")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("decision_core", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["decision_core"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("decision_core", None)
-        raise
-    return module
+    return load_module("decision_core")
 
 
 decision_core = load_decision_core()
@@ -106,138 +136,42 @@ decision_core = load_decision_core()
 
 def load_plan_check():
     """The plan checker, bin/plan_check.py (#135), loaded by path from beside this file, as load_decision_core does."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "plan_check.py")
-    held = sys.modules.get("plan_check")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("plan_check", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["plan_check"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("plan_check", None)
-        raise
-    return module
+    return load_module("plan_check")
 
 
 def load_plan_ledger():
     """The evidence ledger and gates, bin/plan_ledger.py (#107), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "plan_ledger.py")
-    held = sys.modules.get("plan_ledger")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("plan_ledger", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["plan_ledger"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("plan_ledger", None)
-        raise
-    return module
+    return load_module("plan_ledger")
 
 
 def load_report_fold():
     """The report fold's pure core, bin/report_fold.py (#352), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "report_fold.py")
-    held = sys.modules.get("report_fold")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("report_fold", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["report_fold"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("report_fold", None)
-        raise
-    return module
+    return load_module("report_fold")
 
 
 def load_triage_plan_open():
     """The plan-issue-still-open rule, bin/triage_plan_open.py (#384), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "triage_plan_open.py")
-    held = sys.modules.get("triage_plan_open")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("triage_plan_open", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["triage_plan_open"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("triage_plan_open", None)
-        raise
-    return module
+    return load_module("triage_plan_open")
 
 
 def load_pr_events():
     """The webhook-event rule for `pr-state`, bin/pr_events.py (#354), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pr_events.py")
-    held = sys.modules.get("pr_events")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("pr_events", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["pr_events"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("pr_events", None)
-        raise
-    return module
+    return load_module("pr_events")
 
 
 def load_disk_janitor():
     """The temp-directory janitor, bin/disk_janitor.py (#321), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "disk_janitor.py")
-    held = sys.modules.get("disk_janitor")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("disk_janitor", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["disk_janitor"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("disk_janitor", None)
-        raise
-    return module
+    return load_module("disk_janitor")
 
 
 def load_heavy_slots():
     """The CPU slots for heavy commands, bin/heavy_slots.py (#34), loaded by path like the other modules."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "heavy_slots.py")
-    held = sys.modules.get("heavy_slots")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("heavy_slots", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["heavy_slots"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("heavy_slots", None)
-        raise
-    return module
+    return load_module("heavy_slots")
 
 
 def load_cpu_guard():
     """The CPU guard, bin/cpu_guard.py (the P0 CPU order), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cpu_guard.py")
-    held = sys.modules.get("cpu_guard")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("cpu_guard", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["cpu_guard"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("cpu_guard", None)
-        raise
-    return module
+    return load_module("cpu_guard")
 
 
 def load_agent_presence():
@@ -259,19 +193,7 @@ def load_agent_presence():
 
 def load_health_records():
     """The health recorders, bin/health_records.py (#357), loaded by path like disk_janitor."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "health_records.py")
-    held = sys.modules.get("health_records")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("health_records", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["health_records"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("health_records", None)
-        raise
-    return module
+    return load_module("health_records")
 
 
 def health_recorder(engine):
@@ -322,36 +244,12 @@ def health_write(engine, state, now):
 
 def load_reds():
     """`reds`, bin/reds.py (#342), loaded by path like the other modules."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "reds.py")
-    held = sys.modules.get("reds")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("reds", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["reds"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("reds", None)
-        raise
-    return module
+    return load_module("reds")
 
 
 def load_impact_floor():
     """The impact floor and hold table, bin/impact_floor.py (#179, L3), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "impact_floor.py")
-    held = sys.modules.get("impact_floor")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("impact_floor", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["impact_floor"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("impact_floor", None)
-        raise
-    return module
+    return load_module("impact_floor")
 
 
 class _LazyImpactFloor:
@@ -364,19 +262,7 @@ impact_floor = _LazyImpactFloor()
 
 def load_plan_review():
     """The plan review engine's pure core, bin/plan_review.py (#109), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "plan_review.py")
-    held = sys.modules.get("plan_review")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("plan_review", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["plan_review"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("plan_review", None)
-        raise
-    return module
+    return load_module("plan_review")
 
 
 class _LazyPlanReview:
@@ -414,37 +300,13 @@ def load_external_adapter():
     """The generic external adapter, bin/external_adapter.py, loaded by path from beside this file, the way
     load_decision_core loads the core. Called only when an external decision system is switched on and names this
     adapter: while it is off the file is never read or imported."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "external_adapter.py")
-    held = sys.modules.get("external_adapter")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("external_adapter", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["external_adapter"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("external_adapter", None)
-        raise
-    return module
+    return load_module("external_adapter")
 
 
 def load_decision_sync():
     """The sync engine for external decision systems, bin/decision_sync.py, loaded by path like decision_core (it
     imports decision_core, which is already registered)."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "decision_sync.py")
-    held = sys.modules.get("decision_sync")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("decision_sync", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["decision_sync"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("decision_sync", None)
-        raise
-    return module
+    return load_module("decision_sync")
 
 
 decision_sync = load_decision_sync()
@@ -452,19 +314,7 @@ decision_sync = load_decision_sync()
 
 def load_work_sync():
     """The work-item pump, bin/work_sync.py, loaded by path like the others."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "work_sync.py")
-    held = sys.modules.get("work_sync")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("work_sync", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["work_sync"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("work_sync", None)
-        raise
-    return module
+    return load_module("work_sync")
 
 
 work_sync = load_work_sync()
@@ -472,19 +322,7 @@ work_sync = load_work_sync()
 
 def load_agent_calls():
     """The agent-shell call counter, bin/agent_calls.py (#367), loaded by path like the others."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "agent_calls.py")
-    held = sys.modules.get("agent_calls")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("agent_calls", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["agent_calls"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("agent_calls", None)
-        raise
-    return module
+    return load_module("agent_calls")
 
 
 agent_calls = load_agent_calls()
@@ -492,19 +330,7 @@ agent_calls = load_agent_calls()
 
 def load_triage_digest():
     """The stale digest's rules and files, bin/triage_digest.py (#349), loaded by path like the others."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "triage_digest.py")
-    held = sys.modules.get("triage_digest")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("triage_digest", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["triage_digest"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("triage_digest", None)
-        raise
-    return module
+    return load_module("triage_digest")
 
 
 triage_digest = load_triage_digest()
@@ -512,19 +338,7 @@ triage_digest = load_triage_digest()
 
 def load_dead_hint():
     """The DEAD agent's hint, bin/dead_hint.py (#379), loaded by path like the others."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "dead_hint.py")
-    held = sys.modules.get("dead_hint")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("dead_hint", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["dead_hint"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("dead_hint", None)
-        raise
-    return module
+    return load_module("dead_hint")
 
 
 dead_hint = load_dead_hint()
@@ -23117,19 +22931,7 @@ def build_parser():
 
 # ---- the load of each orchestrator and the threshold alert (#348); the logic is in bin/fleet_health.py, this supplies the facts
 def load_fleet_health():
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "fleet_health.py")
-    held = sys.modules.get("fleet_health")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("fleet_health", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["fleet_health"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("fleet_health", None)
-        raise
-    return module
+    return load_module("fleet_health")
 
 
 def validate_load_alert_config(config, source):

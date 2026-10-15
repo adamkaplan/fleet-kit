@@ -49133,6 +49133,115 @@ def main(argv):
     return 0 if ok else 1
 
 
+class TestModuleLoader(Base):
+    """Ask #437 slice 1: one generic loader behind the old `load_<module>()` names."""
+
+    OLD = {
+        "load_decision_core": "decision_core", "load_plan_check": "plan_check", "load_plan_ledger": "plan_ledger",
+        "load_report_fold": "report_fold", "load_triage_plan_open": "triage_plan_open", "load_pr_events": "pr_events",
+        "load_disk_janitor": "disk_janitor", "load_heavy_slots": "heavy_slots", "load_cpu_guard": "cpu_guard",
+        "load_health_records": "health_records", "load_reds": "reds", "load_impact_floor": "impact_floor",
+        "load_plan_review": "plan_review", "load_external_adapter": "external_adapter",
+        "load_decision_sync": "decision_sync", "load_work_sync": "work_sync", "load_agent_calls": "agent_calls",
+        "load_triage_digest": "triage_digest", "load_dead_hint": "dead_hint", "load_fleet_health": "fleet_health",
+    }
+
+    def _copy(self, extra=None):
+        """A copy of the program in a temp bin directory, with the named modules beside it, loaded as a module."""
+        tmp = Path(tempfile.mkdtemp(prefix="ldtest"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        held = dict(sys.modules)
+        self.addCleanup(lambda: (sys.modules.clear(), sys.modules.update(held)))
+        shutil.copy(SWITCHBOARD, tmp / "fleet-switchboard")
+        for module in BIN.glob("*.py"):
+            shutil.copy(module, tmp / module.name)
+        for name, text in (extra or {}).items():
+            (tmp / (name + ".py")).write_text(text)
+        return tmp, _load("ld_" + tmp.name, tmp / "fleet-switchboard")
+
+    def test_s1_each_old_loader_loads_its_old_path_and_caches(self):
+        self.assertEqual(len(self.OLD), 20)
+        for fn, name in self.OLD.items():
+            first = getattr(sb, fn)()
+            self.assertEqual(os.path.realpath(first.__file__), os.path.realpath(str(BIN / (name + ".py"))), fn)
+            self.assertIs(getattr(sb, fn)(), first, fn)
+
+    def test_s2_a_missing_or_broken_module_fails_as_before(self):
+        tmp, mod = self._copy({"broken_one": "def (:\n"})
+        with self.assertRaises(FileNotFoundError):
+            mod.load_module("absent_one")
+        with self.assertRaises(SyntaxError):
+            mod.load_module("broken_one")
+        self.assertNotIn("broken_one", sys.modules)
+
+    def test_s4_a_new_module_loads_with_no_edit_to_the_program(self):
+        tmp, mod = self._copy({"fixture_mod": "VALUE = 7\n"})
+        first = mod.load_module("fixture_mod")
+        self.assertEqual(first.VALUE, 7)
+        self.assertIs(mod.load_module("fixture_mod"), first)
+
+    def test_s9_concurrent_first_loads_all_get_the_finished_module_and_a_failing_one_fails_for_every_thread(self):
+        tmp, mod = self._copy({
+            "slow_mod": "import time\ntime.sleep(0.3)\nREADY = True\n",
+            "failing_mod": "import time\ntime.sleep(0.2)\nraise RuntimeError('boom')\n"})
+        got, errors, barrier = [], [], threading.Barrier(8)
+
+        def worker(name):
+            barrier.wait()
+            try:
+                module = mod.load_module(name)
+                got.append((module, getattr(module, "READY", False)))
+            except RuntimeError as err:
+                errors.append(str(err))
+        threads = [threading.Thread(target=worker, args=("slow_mod",)) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(20)
+        self.assertEqual(len(got), 8)
+        self.assertEqual(len({id(module) for module, _ in got}), 1, "one object for every thread")
+        self.assertTrue(all(ready for _, ready in got), "no thread saw a half-loaded module")
+        barrier, errors = threading.Barrier(8), []
+        threads = [threading.Thread(target=worker, args=("failing_mod",)) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(20)
+        self.assertEqual(errors, ["boom"] * 8, "the failing module raises for every thread")
+        self.assertNotIn("failing_mod", sys.modules)
+
+    def test_s9b_a_slow_import_never_delays_another_module_and_a_module_may_load_another(self):
+        tmp, mod = self._copy({
+            "slow_one": "import threading\nthreading._ld_started.set()\nthreading._ld_gate.wait(20)\nREADY = True\n",
+            "quick_one": "VALUE = 1\n", "fresh_one": "VALUE = 2\n",
+            "b_mod": "VALUE = 'b'\n",
+            "a_mod": "import threading\nB = threading._ld_load('b_mod')\n"})
+        threading._ld_started, threading._ld_gate, threading._ld_load = threading.Event(), threading.Event(), mod.load_module
+        self.addCleanup(lambda: [delattr(threading, n) for n in ("_ld_started", "_ld_gate", "_ld_load") if hasattr(threading, n)])
+        self.addCleanup(threading._ld_gate.set)
+        quick = mod.load_module("quick_one")
+        slow = threading.Thread(target=lambda: mod.load_module("slow_one"))
+        slow.start()
+        self.assertTrue(threading._ld_started.wait(10))
+        self.assertIs(mod.load_module("quick_one"), quick, "an already loaded module needs no lock")
+        self.assertEqual(mod.load_module("fresh_one").VALUE, 2, "a first load of another module does not wait for the slow import")
+        self.assertTrue(slow.is_alive(), "both returned while the slow import was still running")
+        threading._ld_gate.set()
+        slow.join(20)
+        self.assertEqual(mod.load_module("a_mod").B.VALUE, "b", "a module that loads another while it runs")
+
+    def test_s8_a_hostile_name_is_refused(self):
+        tmp, mod = self._copy()
+        (tmp.parent / "outside_mod.py").write_text("VALUE = 1\n")
+        self.addCleanup((tmp.parent / "outside_mod.py").unlink)
+        for name in ("../outside_mod", os.path.join(os.sep, "etc", "hosts"), "a/b", "", None):
+            with self.assertRaises(ValueError, msg=repr(name)):
+                mod.load_module(name)
+        with self.assertRaises(FileNotFoundError):
+            mod.load_module("no_such_module")
+        self.assertNotIn("outside_mod", sys.modules)
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.
