@@ -18293,7 +18293,10 @@ def release_impact_hold(engine, repo, number, report, record):
         rating, rating_problem = impact_review_record(engine.state_dir, pr, report["head"])
         if rating_problem or (rating and rating[0] == "hold" and impact_floor.class_is_top_tier(impact_floor._matrix_cached(), rating[1])):
             return 0   # an independent hold arrived (or cannot be read) since the decision: it stays
-        live = read_pr_json(engine, repo, number).get("labels")   # the labels now, not the list's copy of three minutes ago
+        raw = read_pr_json(engine, repo, number)   # FAILS CLOSED: a failed read raises, nothing is removed and the caller backs off
+        if raw.get("headRefOid") != report["head"]:
+            return 0   # a push since the decision: the next pass judges the new head
+        live = raw.get("labels")   # the labels now, not the list's copy of three minutes ago
         have = {(l.get("name") if isinstance(l, dict) else l) for l in (live if isinstance(live, list) else [])}
         remove = [l for l in ours if l in have]
         runner = getattr(engine, "gh_runner", None) or subprocess.run

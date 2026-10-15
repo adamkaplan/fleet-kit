@@ -24308,6 +24308,57 @@ class TestImpactRejudge(LedgerBase):
         recorded = json.loads((self.world.state / "impact-hold.json").read_text())["applied"]["acme/app#10"]
         self.assertEqual(sorted(recorded["added"]), sorted(self.both()))
 
+    def test_a_failed_write_backs_off_and_is_tried_again_after_the_wait(self):
+        self.files(9, "docs/a.md")
+        self.passes([self.listed(9)])
+        code, out, err = self.run_as("coder", "review", "record", "acme/app#9", "--reviewer", "impact", "--verdict", "approve", "--impact-action", "hold", "--impact-class", "credentials")
+        self.assertEqual(code, 0, err)
+        calls = []
+        boom = lambda *a, **k: calls.append(1) or (_ for _ in ()).throw(RuntimeError("gh is down"))
+        with mock.patch.object(sb, "apply_impact_hold", boom):
+            self.passes([self.listed(9)], advance=10)
+            self.passes([self.listed(9)], advance=10)
+            self.assertEqual(len(calls), 1, "inside the wait: not tried again")
+            self.passes([self.listed(9)], advance=sb.IMPACT_RETRY_SECONDS + 10)
+        self.assertEqual(len(calls), 2, "after the wait: tried again")
+
+    def test_a_release_spends_its_removals_and_its_read_from_the_pass_budget(self):
+        self.extra_config = dict(self.extra_config, impact_hold={"enabled": True, "calls_per_pass": 3})
+        self.configure()
+        self.files(9, "migrations/0002.sql")
+        self.files(10, "migrations/0003.sql")
+        self.seed_applied([9, 10])
+        records = [self.listed(9, self.both()), self.listed(10, self.both())]
+        self.passes(records)
+        self.assertEqual(self.view_reads, [9], "1 read + 3 for the release (2 removals and its read) used the budget: the second waits")
+        self.passes(records, advance=400)
+        self.assertEqual(self.view_reads, [9, 10])
+
+    def test_a_release_decided_a_moment_ago_does_not_outlive_a_hold_that_arrived_since(self):
+        self.files(9, "migrations/0002.sql")
+        self.seed_applied([9])
+        engine = self.world.new_engine("daemon")
+        engine.gh_runner, engine.config, engine.state_dir = self.route, sb.load_config(), self.world.state
+        report = sb.pr_floor_report(engine, "acme/app", 9)
+        self.assertEqual(report["owner_decision"], "second-review")
+        code, out, err = self.run_as("coder", "review", "record", "acme/app#9", "--reviewer", "impact", "--verdict", "approve", "--impact-action", "hold", "--impact-class", "credentials")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sb.release_impact_hold(engine, "acme/app", 9, report, {"labels": [{"name": n} for n in self.both()]}), 0)
+        self.assertEqual(self.removals(), [])
+        self.prs[9]["headRefOid"] = LEDGER_NEW_HEAD   # and a push since the decision releases nothing either
+        self.assertEqual(sb.release_impact_hold(engine, "acme/app", 9, dict(report, head=LEDGER_HEAD), {"labels": []}), 0)
+
+    def test_the_record_of_ours_is_read_strictly(self):
+        names = self.names
+        hold, merge = names["hold-impact"], names["merge-captain"]
+        state = lambda **applied: {"clears": {}, "applied": {"p": applied}}
+        self.assertEqual(sb._labels_ours(names, state(added=["x", hold, "bug"], at=1, head="h"), "p"), [hold], "only the two labels of ours are ever named")
+        self.assertEqual(sb._labels_ours(names, state(added="oops", merge_label_added=True), "p"), [hold, merge], "a corrupt list falls back to the older form")
+        self.assertEqual(sb._labels_ours(names, state(added="oops"), "p"), [hold])
+        self.assertEqual(sb._labels_ours(names, {"clears": {}, "applied": {"p": "x"}}, "p"), [])
+        late = {"clears": {"p": {"at": "soon"}}, "applied": {"p": {"added": [hold], "at": 1}}}
+        self.assertEqual(sb._labels_ours(names, late, "p"), [], "a clear whose time cannot be read counts as after the record")
+
     # -- S4: when it judges again
 
     def test_s4_a_pull_request_is_judged_again_only_when_its_head_the_rule_or_its_record_changes(self):
