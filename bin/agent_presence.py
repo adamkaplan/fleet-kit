@@ -24,6 +24,7 @@ WORKING, BLOCKED, IDLE, UNKNOWN = "working", "blocked", "idle", "unknown"
 STATES = (WORKING, BLOCKED, IDLE, UNKNOWN)
 RECORD_DIR = "headless"          # state-dir/headless/<name>.json, one private record per headless worker
 RECORD_MAX = 8192
+MAX_RECORDS = 200                # files read per scan; more is said, not dropped
 LOCAL = "local"                  # the record kind of a worker on this machine. The record is LOCAL-ONLY: the shared part with the cloud lane is the state rule; a shared record would need docs/cloud-worker-interface.md section 3 amended first
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 LOOPBACK_URL_RE = re.compile(r"^http://(127\.0\.0\.1|\[::1\]):[0-9]{1,5}$")
@@ -115,7 +116,10 @@ def read_record(state, name):
     it never creates the directory."""
     if not valid_name(name):
         return None, "not a worker name"
-    path = Path(state) / RECORD_DIR / (name + ".json")
+    base, why = _checked_dir(state)
+    if base is None:
+        return None, why
+    path = base / (name + ".json")
     try:
         fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
     except FileNotFoundError:
@@ -145,17 +149,40 @@ def load_record(state, name):
     return read_record(state, name)[0]
 
 
-def scan_records(state):
-    """([usable records sorted by worker], [one line per record that is there and unusable]). A missing directory is silent. At most 200 files."""
+def _checked_dir(state):
+    """(path, None) of the headless directory when it is a real directory of this user, (None, why) when it is a symlink or not ours, (None, None) when
+    there is none. Reads only."""
     base = Path(state) / RECORD_DIR
     try:
-        names = sorted(p.stem for p in base.iterdir() if p.suffix == ".json" and valid_name(p.stem))[:200]
+        found = os.lstat(str(base))
     except FileNotFoundError:
-        return [], []
+        return None, None
+    except OSError as err:
+        return None, "the headless record directory cannot be read (%s)" % (err.strerror or err)
+    if stat.S_ISLNK(found.st_mode) or not stat.S_ISDIR(found.st_mode) or found.st_uid != os.getuid():
+        return None, "the headless record directory is not the user's own real directory: no record in it is read"
+    return base, None
+
+
+def scan_records(state):
+    """([usable records sorted by worker], [one line per problem]). A missing directory is silent. A symlinked or foreign directory, a file whose name is
+    not a worker name, a record that is unusable and more than MAX_RECORDS files are each said once: nothing is dropped without a word."""
+    base, why = _checked_dir(state)
+    if base is None:
+        return [], ([why] if why else [])
+    try:
+        files = sorted(p.name for p in base.iterdir() if p.suffix == ".json")
     except OSError as err:
         return [], ["the headless record directory cannot be read (%s)" % (err.strerror or err)]
     records, problems = [], []
-    for name in names:
+    named = [f for f in files if valid_name(f[:-5])]
+    for f in files:
+        if not valid_name(f[:-5]):
+            problems.append("the file %r in the headless record directory is not named for a worker: it is not read" % f[:80])
+    if len(named) > MAX_RECORDS:
+        problems.append("more than %d headless records (%d): the rest are not listed (cap %d)" % (MAX_RECORDS, len(named), MAX_RECORDS))
+    for f in named[:MAX_RECORDS]:
+        name = f[:-5]
         record, why = read_record(state, name)
         if record is not None:
             records.append(record)
@@ -170,9 +197,14 @@ def list_records(state):
 
 
 def remove_record(state, name):
-    """Delete the record (a retired worker keeps none). True when one was there."""
+    """Delete the record (a retired worker keeps none). True when one was there. Never creates the directory."""
+    if not valid_name(name):
+        return False
+    base, _ = _checked_dir(state)
+    if base is None:
+        return False
     try:
-        record_path(state, name).unlink()
+        (base / (name + ".json")).unlink()
         return True
-    except (OSError, ValueError):
+    except OSError:
         return False

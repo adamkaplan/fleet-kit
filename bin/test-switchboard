@@ -11494,6 +11494,28 @@ class TestHeadlessPresence(Base):
         self.assertNotIn("hw", self.discover().agents, "an untrusted record is not a worker")
         self.assertEqual(self.ap.read_record(self.world.state, "nobody"), (None, None))
 
+    def test_the_scan_says_a_cap_a_misnamed_file_and_a_symlinked_directory_and_removing_creates_nothing(self):
+        state = Path(self.world.state)
+        self.assertFalse(self.ap.remove_record(self.world.state, "hw"))
+        self.assertFalse((state / "headless").exists(), "removing a record that is not there makes no directory")
+        sid = self.headless(register=False)
+        for n in range(self.ap.MAX_RECORDS + 3):
+            self.ap.save_record(self.world.state, "w%03d" % n, sid, self.url)
+        (state / "headless" / "Bad Name.json").write_text("{}")
+        records, problems = self.ap.scan_records(self.world.state)
+        self.assertEqual(len(records), self.ap.MAX_RECORDS)
+        self.assertTrue(any("more than %d headless records" % self.ap.MAX_RECORDS in p for p in problems), problems)
+        self.assertTrue(any("Bad Name.json" in p and "not named for a worker" in p for p in problems), problems)
+        real = state / "headless"
+        moved = state / "headless-real"
+        real.rename(moved)
+        os.symlink(str(moved), str(real))
+        records, problems = self.ap.scan_records(self.world.state)
+        self.assertEqual(records, [])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("not the user's own real directory", problems[0])
+        self.assertIsNone(self.ap.load_record(self.world.state, "w000"))
+
     def test_remove_record_deletes_it_once_and_says_so(self):
         sid = self.headless()
         path = Path(self.world.state) / "headless" / "hw.json"
