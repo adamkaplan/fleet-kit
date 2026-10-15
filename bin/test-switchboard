@@ -36628,7 +36628,7 @@ class TestDecisionBaselineStatus(BaselineWorld):
         self.daemon_pass()
         out["the full house"] = self.line()
         self.world.engine.run_pass()
-        self.world.tick(130)
+        self.world.tick(sb.DECISIONS_STALE_SECONDS + 10)
         out["a file the daemon stopped keeping"] = self.line()
         baseline_golden(self, "status-line", out)
 
