@@ -241,6 +241,16 @@ def health_ingest_messages(engine, session, page):
         _health_fault(engine, "ingest", err)
 
 
+def health_watched_repos(state_dir):
+    """The repositories whose events the daemon receives: those with a running watch in github-watch.json (read only). [] when it is missing."""
+    try:
+        with open(str(Path(state_dir) / WATCH_FILE), "rb") as handle:
+            body = json.loads(handle.read(1000001).decode("utf-8"))
+        return [w["repo"] for w in body.get("watches", []) if isinstance(w, dict) and w.get("state") == "running" and isinstance(w.get("repo"), str)]
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
 def health_write(engine, state, now):
     """End of every pass (#357, from `finish_pass`, so it runs whatever is configured): the pushes seen in the PR picture, when one exists
     (`state` is the ci recorder's, or None: the engine's own is used), and `health-records.json` (written only when its content changed, or on the heartbeat)."""
@@ -251,7 +261,7 @@ def health_write(engine, state, now):
         state = state if state is not None else getattr(engine, "ci_record_state", None)
         recorder.ingest_prs(getattr(state, "pr_state", None))
         records = load_health_records()
-        body = recorder.body(records.read_tool_file(engine.state_dir))
+        body = recorder.body(records.read_tool_file(engine.state_dir), light=bool((getattr(engine, "config", None) or {}).get("v2_light")), watched=health_watched_repos(engine.state_dir))
         state_write(Path(engine.state_dir) / records.FILE, json.dumps(body, sort_keys=True), _without(body, "written_at"), HEARTBEAT_PR_STATE, nofollow=True)
     except Exception as err:
         _health_fault(engine, "write", err)

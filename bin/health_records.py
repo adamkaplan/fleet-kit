@@ -8,7 +8,10 @@ It publishes ONE derived file, `health-records.json` (written by the daemon thro
      "tool_calls":  {"<session>": {"per_minute": [15 ints, oldest first], "approx": true}},           # absent key = not recorded
      "usage":       {"<session>": {"hours": {"<hour epoch>": {"tokens": n, "cost": x, "messages": n}},
                                    "context": {"tokens": n, "limit": n|absent, "percent": x|absent, "at": s}, "partial": true}},
-     "pushes":      {"<owner/repo>": {"<hour epoch>": n}}}
+     "pushes":      {"<owner/repo>": {"<hour epoch>": n}},
+     "pushes_watched": ["<owner/repo>", ...],                       # repositories whose events the daemon receives: no push in the hour reads 0
+     "sources":     {"tool_calls": "ok"|"stale"|"missing",            # missing = the fleet-hooks counter is not installed in the agents' profile
+                     "usage": "on"|"off: v2_light"}}                  # v2_light reads no session history, so nothing feeds `usage`
 
 A figure with no source is ABSENT (the reader says "not recorded"): never 0. A source that is missing or older than TOOL_STALE seconds
 (the plugin is not loaded, the daemon's reads fail) gives no `tool_calls` at all. Spend and tokens are `partial`: the daemon's feed reads
@@ -95,6 +98,14 @@ def tool_series(body, now):
                 series[TOOL_WINDOW - 1 - age] = int(count)
         out[name] = series
     return out
+
+
+def tool_state(body, now):
+    """Why the tool-call series is what it is: "ok" (a fresh counter file), "stale" (the plugin left one, but it is old: not running) or
+    "missing" (no readable file: the plugin that counts is not installed in the agents' profile)."""
+    if not isinstance(body, dict):
+        return "missing"
+    return "ok" if _num(body.get("written_at")) and now - body["written_at"] <= TOOL_STALE else "stale"
 
 
 def read_tool_file(state_dir):
@@ -186,12 +197,13 @@ class Recorder:
         hours = self.hours.get(session)
         return max(hours) if hours else (self.context.get(session) or {}).get("at", 0)
 
-    def body(self, tool_body=None):
-        """The derived file's content. Bounded by hours kept, agents kept and FILE_CAP."""
+    def body(self, tool_body=None, light=False, watched=()):
+        """The derived file's content. Bounded by hours kept, agents kept and FILE_CAP. `light`: v2_light is on, so no session history is read and
+        `usage` cannot be fed. `watched`: the repositories whose events the daemon receives (a running forwarder): one with no push reads 0."""
         with self.lock:
-            return self._body(tool_body)
+            return self._body(tool_body, light, watched)
 
-    def _body(self, tool_body=None):
+    def _body(self, tool_body=None, light=False, watched=()):
         now = self.clock()
         oldest = _hour(now) - (HOUR_KEEP - 1) * 3600
         for table in (self.hours, self.pushes):
@@ -216,6 +228,8 @@ class Recorder:
         out = {"version": VERSION, "written_at": int(now),
                "tool_calls": {s: {"per_minute": v, "approx": True} for s, v in series.items()},
                "usage": usage,
+               "sources": {"tool_calls": tool_state(tool_body, now), "usage": "off: v2_light" if light else "on"},
+               "pushes_watched": sorted({n for n in (_name(r) for r in list(watched)[:MAX_AGENTS]) if n}),
                "pushes": {r: {str(h): n for h, n in sorted(v.items())} for r, v in self.pushes.items()}}
         while len(json.dumps(out, sort_keys=True)) > FILE_CAP and any(u["hours"] for u in usage.values()):   # the cap: oldest hours go first
             for u in usage.values():

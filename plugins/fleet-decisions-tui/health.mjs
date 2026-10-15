@@ -24,6 +24,7 @@ export const SPARK_MINUTES = 15
 export const WORKING_MINUTES = 3          // tool calls within this many minutes: the workspace is working
 export const BAR_HOURS = 8                // hours of today drawn on the second line (the most recent ones)
 export const NAME_WIDTH = 9
+export const LEGEND = ["q open  s stalled  d decisions", "c busy/all coders  p pushes/hour", "ctx context use  moved asks/hour", "work idle wait dead  ? unknown"]
 
 export const concernsHealth = (filename) => typeof filename === "string" && WATCHED.includes(filename)
 
@@ -70,6 +71,19 @@ export function toolSeries(records, sessions) {
     row.per_minute.slice(-SPARK_MINUTES).forEach((n, i) => { if (isNum(n) && n >= 0) out[SPARK_MINUTES - row.per_minute.slice(-SPARK_MINUTES).length + i] += n })
   }
   return out
+}
+
+// Why a tool-call series is missing, from the `sources` the recorder writes: the counter file the plugin leaves is absent (the plugin is not
+// installed in the agents' profile), stale (not running), or present without this workspace. null when nothing is known.
+export function toolWhy(records) {
+  const src = obj(obj(records).sources).tool_calls
+  return src === "missing" ? "plugin not installed" : src === "stale" ? "plugin not running" : null
+}
+
+// The usage source's own word ("off: v2_light" when the daemon reads no session history), or null.
+export function usageOff(records) {
+  const src = obj(obj(records).sources).usage
+  return typeof src === "string" && src.startsWith("off") ? clean(src, 30) : null
 }
 
 export function sparkline(series) {
@@ -135,14 +149,21 @@ export function buildBlocks(inputs, now) {
     // is not recorded: the state word is "?".
     const paneState = inputs.pane ? obj(states[lead.name]).state : undefined
     const dead = paneState === "dead"
+    const isCos = lead.role === "chief-of-staff"
     const uncertain = paneState !== "attached" && paneState !== "dead"
     const waiting = listed ? waitingFor.get(lead.name) ?? 0 : null
     const recent = series ? series.slice(-WORKING_MINUTES).reduce((a, b) => a + b, 0) : null
+    // The state word of an attached pane: waiting on the owner (decisions), else working or idle from the tool calls when they are recorded,
+    // else from the load record every workspace has (coders busy, or asks moved this hour). No source at all: "?".
+    const figBusy = isNum(fig.busy) ? fig.busy : null
+    const figMoved = isNum(fig.moved_1h) ? fig.moved_1h : null
     let state = null
     if (dead) state = "dead"
     else if (uncertain) state = null
     else if (waiting) state = "wait"
     else if (recent !== null) state = recent > 0 ? "work" : "idle"
+    else if (figBusy !== null || figMoved !== null) state = (figBusy ?? 0) > 0 || (figMoved ?? 0) > 0 ? "work" : "idle"
+    else if (inputs.decisions) state = "idle"
     const episode = obj(obj(load.episodes)[lead.name])
     const alert = load.alert === true && isNum(episode.sent) && episode.sent > 0
     const stalled = isNum(fig.stalled) ? fig.stalled : null
@@ -150,12 +171,14 @@ export function buildBlocks(inputs, now) {
     const busy = isNum(fig.busy) ? fig.busy : null
     const idle = isNum(fig.idle) ? fig.idle : null
     const pushRow = obj(obj(obj(inputs.records).pushes)[lead.repo])
-    const pushes = lead.repo && isNum(pushRow[String(hour)]) ? pushRow[String(hour)] : null
+    const watched = Array.isArray(obj(inputs.records).pushes_watched) && obj(inputs.records).pushes_watched.includes(lead.repo)
+    // A repository whose events the daemon receives and that had no push this hour is 0; "not recorded" only when it receives none.
+    const pushes = lead.repo && isNum(pushRow[String(hour)]) ? pushRow[String(hour)] : lead.repo && watched ? 0 : null
     const ctx = obj(obj(obj(obj(inputs.records).usage)[lead.session]).context)
     const context = isNum(ctx.percent) ? { percent: ctx.percent } : isNum(ctx[CONTEXT_USED]) ? { used: ctx[CONTEXT_USED] } : null
     blocks.push({
       key: ws, name: lead.name, state, alert, spark: series, bars: movedBars(load, lead.name, now), open, stalled,
-      decisions: isNum(fig.decisions) ? fig.decisions : waiting, busy, total: busy !== null && idle !== null ? busy + idle : null, pushes, context,
+      decisions: isNum(fig.decisions) ? fig.decisions : waiting, busy, total: busy !== null && idle !== null ? busy + idle : null, pushes, context, cos: isCos, toolWhy: series ? null : toolWhy(inputs.records), ctxOff: usageOff(inputs.records),
       heat: (alert ? 1000 : 0) + (stalled ?? 0) * 10 + (open ?? 0) + (series ? series.reduce((a, b) => a + b, 0) / 10 : 0),
     })
   }
@@ -171,15 +194,18 @@ export function blockLines(b, width) {
   const name = clean(b.name, NAME_WIDTH).padEnd(NAME_WIDTH)
   const first = [
     [dot, color], [b.alert ? "!" : " ", "e+b"], [" ", ""], [name, "b"], [" ", ""], [(b.state ?? "?").padEnd(4), color], [" ", ""],
-    b.spark ? [sparkline(b.spark) + "≈", ""] : [NOT_RECORDED, "m"],
+    b.spark ? [sparkline(b.spark) + "≈", ""] : b.toolWhy ? [b.toolWhy === "plugin not installed" ? "no plugin" : "plugin off", "m"] : [NOT_RECORDED, "m"],
   ]
   const piece = (label, value) => (value === null ? [`${label} ${NOT_RECORDED}`, "m"] : [`${label}${value}`, ""])
+  if (b.cos) {
+    return [cut(first, width), cut([piece("d", b.decisions), [" no load row: not orchestrator", "m"]], width)]
+  }
   const second = [
     b.bars ? [bars(b.bars), ""] : [`moved ${NOT_RECORDED}`, "m"],
     piece(" q", b.open), piece(" s", b.stalled), piece(" d", b.decisions),
     b.busy !== null && b.total !== null ? [` c${b.busy}/${b.total}`, ""] : [` coders ${NOT_RECORDED}`, "m"],
     piece(" p", b.pushes),
-    b.context ? [b.context.percent !== undefined ? ` ctx${Math.round(b.context.percent)}%` : ` ctx${kilo(b.context.used)}`, ""] : [` ctx ${NOT_RECORDED}`, "m"],
+    b.context ? [b.context.percent !== undefined ? ` ctx${Math.round(b.context.percent)}%` : ` ctx${kilo(b.context.used)}`, ""] : b.ctxOff ? [" ctx off", "m"] : [` ctx ${NOT_RECORDED}`, "m"],
   ]
   return [cut(first, width), cut(second, width)]
 }
@@ -204,6 +230,11 @@ export function healthRows(inputs, now, width) {
   const blocks = buildBlocks(inputs, now)
   if (blocks.length === 0) return []
   const rows = [{ segs: [["Workspaces", "b"], [" · tool calls ≈", "m"]] }]
+  for (const line of LEGEND) rows.push({ segs: [[line.slice(0, width), "m"]] })
+  const why = blocks.map((b) => b.toolWhy).find(Boolean)
+  if (why) rows.push({ segs: [[`tool calls: ${why}`.slice(0, width), "m"]] })
+  const off = blocks.map((b) => b.ctxOff).find(Boolean)
+  if (off) rows.push({ segs: [[`ctx: ${off}`.slice(0, width), "m"]] })
   for (const block of blocks) for (const segs of blockLines(block, width)) rows.push({ segs })
   rows.push({ segs: [["", ""]] })
   return rows

@@ -102,6 +102,24 @@ class Pushes(unittest.TestCase):
         self.assertEqual(hr.Recorder(lambda: NOW).body()["pushes"], {})
 
 
+class Sources(unittest.TestCase):
+    def test_tool_source_says_why_it_is_empty(self):
+        rec = hr.Recorder(lambda: NOW)
+        self.assertEqual(rec.body(None)["sources"]["tool_calls"], "missing")           # the counter file is not there: plugin not installed
+        self.assertEqual(rec.body({"written_at": NOW - 1000, "sessions": {}})["sources"]["tool_calls"], "stale")
+        self.assertEqual(rec.body({"written_at": NOW, "sessions": {}})["sources"]["tool_calls"], "ok")
+
+    def test_usage_source_is_off_under_v2_light(self):
+        rec = hr.Recorder(lambda: NOW)
+        self.assertEqual(rec.body(None, light=True)["sources"]["usage"], "off: v2_light")
+        self.assertEqual(rec.body(None)["sources"]["usage"], "on")
+
+    def test_watched_repositories_are_listed_without_a_push(self):
+        body = hr.Recorder(lambda: NOW).body(None, watched=["acme/api", "acme/api", "acme/web"])
+        self.assertEqual(body["pushes_watched"], ["acme/api", "acme/web"])
+        self.assertEqual(body["pushes"], {})     # no push: the reader turns a watched repository into 0
+
+
 class Bounds(unittest.TestCase):
     def test_long_run_stays_bounded(self):
         clock = [NOW]
