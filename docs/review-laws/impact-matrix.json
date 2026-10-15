@@ -233,7 +233,13 @@
         "merge",
         "merged",
         "waive",
-        "waiver"
+        "waiver",
+        "grant",
+        "permit",
+        "authorize",
+        "revoke",
+        "deny",
+        "decide"
       ],
       "exempt": {
         "bin/spotlight_guard.py": "holds_files tells whether a folder holds an entry; no authority.",

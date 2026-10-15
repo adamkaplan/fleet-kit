@@ -53803,7 +53803,8 @@ class TestAuthorityModulesGuard(unittest.TestCase):
 
     def test_s1_the_named_modules_are_top_tier_paths_and_every_one_is_also_in_the_floor(self):
         globs, exclude, force = self.floor.floor_for("adamkaplan/fleet-kit")
-        named = ["bin/chat_clear.py", "bin/clear_carry.py", "bin/reassign.py", "bin/launch_testers.py", "bin/plan_review.py", "bin/decision_core.py", "bin/impact_floor.py", "bin/plan_ledger.py"]
+        named = [g for g in self.block["top_tier_paths"]["authority"] if g.startswith("bin/") and g.endswith(".py")]
+        self.assertTrue(len(named) >= 7, "the matrix lists the authority modules of bin/")
         for module in named:
             self.assertIn(module, self.floor.top_tier_hits([module], self.matrix).get("authority", []), module + " is a top tier path")
             self.assertTrue(self.floor.floor_paths([module], globs, exclude, force), module + " is in the floor")
@@ -53834,7 +53835,7 @@ class TestAuthorityModulesGuard(unittest.TestCase):
     def test_s3_the_code_names_no_module_of_the_rule_the_matrix_file_does(self):
         modules = [g for g in self.block["top_tier_paths"]["authority"] if g.startswith("bin/") and g.endswith(".py")] + list(self.block["authority_modules"]["exempt"])
         self.assertTrue(len(modules) >= 12)
-        for code in [BIN / "fleet-switchboard"] + sorted(BIN.glob("*.py")):
+        for code in [BIN / "fleet-switchboard"] + sorted(BIN.glob("*.py")):   # the code; the tests (this file) name modules as fixtures
             text = code.read_text()
             for module in modules:
                 self.assertNotIn('"%s"' % module, text, "%s writes the path %s in code" % (code.name, module))
