@@ -2429,6 +2429,7 @@ class SpotlightFacts:
         self.tracker = None
         self.thread = None
         self.done = None             # results the thread has finished, not yet stepped
+        self.lock = threading.Lock()  # the hand-off of `done`: a result stored while the pass takes the last one is never lost
         self.started = None          # the engine's clock when the last check began
         self.saved = None            # the stable content the file holds
 
@@ -2442,8 +2443,9 @@ class SpotlightFacts:
 
         def work():
             results = sg.check_all(folders, runner)
-            if self.thread is threading.current_thread():
-                self.done = results
+            with self.lock:
+                if self.thread is threading.current_thread():
+                    self.done = results
         self.thread = threading.Thread(target=work, name="spotlight-check", daemon=True)
         self.thread.start()
 
@@ -2463,7 +2465,8 @@ class SpotlightFacts:
             saved = sg.load(engine.state_dir)
             self.tracker = sg.Tracker((saved or {}).get("folders"))
             self.saved = sg.stable(saved) if saved else None
-        results, self.done = self.done, None
+        with self.lock:
+            results, self.done = self.done, None
         facts = self._apply(engine, sg, results) if results else []
         alive = self.thread is not None and self.thread.is_alive()
         if not alive and (self.started is None or engine.now() - self.started >= sg.CHECK_SECONDS):

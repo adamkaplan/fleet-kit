@@ -15,6 +15,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -53,13 +54,18 @@ def validate(raw, source):
     if not isinstance(folders, list) or len(folders) > MAX_FOLDERS or not all(isinstance(f, str) and f.strip() and "\x00" not in f for f in folders):
         raise ValueError("%s: spotlight_guard.folders must be a list of at most %d non-empty path strings" % (source, MAX_FOLDERS))
     for folder in folders:
+        if not (os.path.isabs(folder) or folder == "~" or folder.startswith("~/")):
+            raise ValueError("%s: spotlight_guard.folders must be absolute paths (or start with ~/), got %r" % (source, folder))
         if ".." in Path(folder).parts:
             raise ValueError("%s: spotlight_guard.folders must not hold a parent part (..), got %r" % (source, folder))
 
 
 def settings(raw):
-    """None when the guard is off; else {"folders": [expanded absolute paths]}. The folders come from the configuration only, never from input."""
+    """None when the guard is off; else {"folders": [expanded absolute paths]}. The folders come from the configuration only, never from input.
+    Spotlight is a macOS service: with no configuration at all the guard is off elsewhere (a configured one is honoured)."""
     if raw is False or (isinstance(raw, dict) and raw.get("enabled") is False):
+        return None
+    if raw is None and sys.platform != "darwin":
         return None
     raw = raw if isinstance(raw, dict) else {}
     folders = raw.get("folders")
@@ -90,7 +96,7 @@ def holds_files(folder):
 
 
 def check(folder, runner=None):
-    """(state, count) for one folder. Never raises: a failure is `unknown`."""
+    """(state, count) for one folder. Never raises. FAIL OPEN: a failed or unreadable answer is `unknown`, never excluded and never an alarm."""
     if not holds_files(folder):
         return NOT_CHECKED, None
     try:
@@ -186,29 +192,35 @@ def load(state_dir):
     return raw
 
 
+def _plain(text):
+    """A folder name for a line or a wake: control characters (an escape sequence) are dropped."""
+    return "".join(ch for ch in str(text) if ch.isprintable())
+
+
 def status_lines(cfg, saved, now):
     """One line per guarded folder, from the file the background check wrote (no process): excluded, a WARN naming the folder and the count, not checked or unknown."""
     lines = []
     folders = (saved or {}).get("folders") or {}
     for folder in cfg["folders"]:
         entry = folders.get(folder)
+        shown = _plain(folder)
         if not isinstance(entry, dict):
-            lines.append("%s: not checked yet" % folder)
+            lines.append("%s: not checked yet" % shown)
             continue
         state, count = entry.get("state"), entry.get("count")
         if state == EXCLUDED:
-            lines.append("%s: excluded from Spotlight" % folder)
+            lines.append("%s: excluded from Spotlight" % shown)
         elif state == INDEXED and entry.get("episode") is not None:
-            lines.append("WARN %s: Spotlight is INDEXING it (%s entries); add it back to the Spotlight privacy list" % (folder, count))
+            lines.append("WARN %s: Spotlight is INDEXING it (%s entries); add it back to the Spotlight privacy list" % (shown, count))
         elif state == INDEXED:
-            lines.append("%s: Spotlight shows %s entries (confirming on the next check)" % (folder, count))
+            lines.append("%s: Spotlight shows %s entries (confirming on the next check)" % (shown, count))
         elif state == NOT_CHECKED:
-            lines.append("%s: not checked (missing or empty)" % folder)
+            lines.append("%s: not checked (missing or empty)" % shown)
         else:
-            lines.append("%s: unknown (the check could not be read)" % folder)
+            lines.append("%s: unknown (the check could not be read)" % shown)
     return lines
 
 
 def wake_text(folder, count, prog):
     return ("spotlight: %s is being indexed again (%s entries in the index on two checks in a row). The exclusion was lost: add the folder back under System Settings, "
-            "Spotlight, Search Privacy. `%s status` shows the line." % (folder, count, prog))
+            "Spotlight, Search Privacy. `%s status` shows the line." % (_plain(folder), count, prog))
