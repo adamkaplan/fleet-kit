@@ -253,7 +253,7 @@ def figures(name, info, rows, now, cfg):
     """One orchestrator's figures. `info`: asks [{repo, number, first_seen}] or None (unreadable), busy, idle, messages, decisions."""
     out = {"name": name, "busy": info["busy"], "idle": info["idle"], "messages": info["messages"], "decisions": info["decisions"],
            "open_asks": None, "active_asks": None, "stalled": None, "stalled_asks": [], "oldest_stall_hours": None, "moved_1h": None, "moved_backlog": None,
-           "waiting_owner": None, "waiting_cos": None, "parked": None}
+           "waiting_owner": None, "waiting_cos": None, "parked": None, "charter_moves_1h": None}
     asks = info.get("asks")
     if asks is None:
         return out
@@ -276,6 +276,10 @@ def figures(name, info, rows, now, cfg):
     out["oldest_stall_hours"] = round(max(ages) / 3600.0, 1) if ages else 0.0
     moved = lambda hours: sum(1 for ask in asks if last[(ask["repo"], ask["number"])] is not None and now - last[(ask["repo"], ask["number"])] < hours * 3600)
     out["moved_1h"], out["moved_backlog"] = moved(1), moved(cfg["backlog_hours"])
+    charter = info.get("charter")
+    if isinstance(charter, int) and not isinstance(charter, bool):   # pull requests on issues under its charter, with no open ask on the chain: the lane is moving
+        hits = {row["numbers"][0] for row in rows if now - row["at"] < 3600 and charter in row["numbers"][1:] and _same_repo(info.get("repo"), row.get("repo"))}
+        out["charter_moves_1h"] = len(hits)
     return out
 
 
@@ -290,7 +294,7 @@ def crossing(fig, cfg):
     if full and fig.get("moved_backlog") is not None and fig.get("moved_1h") is not None:
         # all coders busy: only when something is stuck (an ask stalled) or open asks clearly outnumber what moves and nothing moved in the last hour
         active = fig["active_asks"] if fig.get("active_asks") is not None else fig["open_asks"]   # asks waiting on someone or parked are not queued work
-        outnumbered = active >= 2 * fig["moved_backlog"] and active > fig["moved_backlog"] and fig["moved_1h"] == 0
+        outnumbered = active >= 2 * fig["moved_backlog"] and active > fig["moved_backlog"] and fig["moved_1h"] == 0 and not fig.get("charter_moves_1h")
         if fig["stalled"] >= 1 and "stalled" not in reasons:
             reasons.append("busy_stalled"); severity += max(1, fig["stalled"])
         elif outnumbered:
@@ -368,6 +372,23 @@ def decisions_waiting(state_dir):
         if isinstance(item, dict) and not item.get("closed"):
             found[str(item.get("agent"))] = found.get(str(item.get("agent")), 0) + 1
     return found
+
+
+def decision_items(state_dir):
+    """[(repo, issue number)] of the open decisions of decisions.json (the issue of the ask, else the item's own number), or None when it cannot be read.
+    The `agent` field is a metadata guess and is not read here."""
+    try:
+        listed = json.loads((Path(state_dir) / "decisions.json").read_text()).get("decisions")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(listed, list):
+        return None
+    out = []
+    for item in listed:
+        if isinstance(item, dict) and not item.get("closed"):
+            number = item.get("ask") if isinstance(item.get("ask"), int) and not isinstance(item.get("ask"), bool) else item.get("number")
+            out.append((str(item.get("repo") or ""), number if isinstance(number, int) and not isinstance(number, bool) else None))
+    return out
 
 
 def charter_agent(body):
@@ -492,21 +513,25 @@ def _parent_of(ctx, state, budget, repo, number, now, problems):
     return parent, True
 
 
-def expand_rows(ctx, state, budget, rows, asks_by_name, now, problems):
-    """Attribute each movement to the asks on the parent chain of the issues it refers to: a work item whose parent is an ask moves that ask (up to
-    PARENT_LEVELS levels). Returns (rows with the chain's numbers added, the count of movements whose reference could not be resolved)."""
+def expand_rows(ctx, state, budget, rows, asks_by_name, charters, now, problems):
+    """Attribute each movement to the asks (and charters) on the parent chain of the issues it refers to: a work item whose parent is an ask moves
+    that ask, and one whose chain reaches an orchestrator's charter without an ask moves that charter (up to PARENT_LEVELS levels). A row written
+    before references were logged carries only the issues it closed: those are followed the same way. Returns (rows with the chain's numbers added,
+    the count of movements whose reference could not be resolved)."""
     known = {(a["repo"], a["number"]) for lst in asks_by_name.values() for a in lst}
-    is_ask = lambda repo, n: any(_same_repo(r, repo) and k == n for r, k in known)
+    for name, number in (charters or {}).items():
+        known.add(((ctx.orchestrators.get(name) or {}).get("repo"), number))
+    is_stop = lambda repo, n: any(_same_repo(r, repo) and k == n for r, k in known)   # an ask or a charter: the chain ends there
     window = now - max(ctx.cfg.get("stalled_hours", 2.0), ctx.cfg.get("backlog_hours", 4.0)) * 3600   # older movements cannot change a figure
     out, unattributed = [], 0
     for row in rows:
-        refs = row.get("refs") if isinstance(row.get("refs"), list) else []
+        refs = row["refs"] if isinstance(row.get("refs"), list) else list(row["numbers"][1:])   # an old row: its numbers after the pull request are what it closed
         if not refs or row["at"] < window or not row.get("repo"):
             out.append(row)
             continue
         extra, stuck = [], False
         for ref in refs[:MOVES_NUMBERS_MAX]:
-            if not isinstance(ref, int) or is_ask(row["repo"], ref):
+            if not isinstance(ref, int) or is_stop(row["repo"], ref):
                 continue
             cur = ref
             for _ in range(PARENT_LEVELS):
@@ -518,11 +543,48 @@ def expand_rows(ctx, state, budget, rows, asks_by_name, now, problems):
                     break
                 extra.append(parent)
                 cur = parent
-                if is_ask(row["repo"], cur):
+                if is_stop(row["repo"], cur):
                     break
         unattributed += 1 if stuck else 0
         out.append(dict(row, numbers=list(row["numbers"]) + [n for n in extra if n not in row["numbers"]]) if extra else row)
     return out, unattributed
+
+
+def attribute_decisions(ctx, state, budget, asks_by_name, charters, now, problems):
+    """({orchestrator: waiting decisions}, how many could not be attributed, or None when decisions.json cannot be read). A decision belongs to the
+    orchestrator whose open ask or charter is on the parent chain of its issue (up to PARENT_LEVELS levels, the same cached and budgeted reads);
+    one that cannot be resolved belongs to nobody: the `agent` field of the list is never used."""
+    items = decision_items(ctx.state_dir)
+    if items is None:
+        return None, 0
+    owner = {}
+    for name, lst in asks_by_name.items():
+        for ask in lst:
+            owner.setdefault(("ask", ask["number"]), []).append((name, ask["repo"]))
+    for name, number in (charters or {}).items():
+        owner.setdefault(("ask", number), []).append((name, (ctx.orchestrators.get(name) or {}).get("repo")))
+    counts, nobody = {}, 0
+    for repo, number in items:
+        found = None
+        cur = number
+        for level in range(PARENT_LEVELS + 1):
+            if cur is None:
+                break
+            hits = [n for n, r in owner.get(("ask", cur), []) if _same_repo(r, repo)]
+            if hits:
+                found = sorted(hits)[0]
+                break
+            if level == PARENT_LEVELS or not repo:
+                break
+            parent, resolved = _parent_of(ctx, state, budget, repo, cur, now, problems)
+            if not resolved or not parent:
+                break
+            cur = parent
+        if found is None:
+            nobody += 1
+        else:
+            counts[found] = counts.get(found, 0) + 1
+    return counts, nobody
 
 
 def _refresh_asks(ctx, state, now, rows=()):
@@ -553,8 +615,11 @@ def _refresh_asks(ctx, state, now, rows=()):
     for gone in [n for n in cache if n not in ctx.orchestrators]:
         del cache[gone]
     asks_by_name = {n: (cache.get(n) or {}).get("list") or [] for n in ctx.orchestrators}
-    rows, unattributed = expand_rows(ctx, state, budget, list(rows), asks_by_name, now, problems)
+    charter_numbers = state.get("charter_of") or {}
+    rows, unattributed = expand_rows(ctx, state, budget, list(rows), asks_by_name, charter_numbers, now, problems)
     state["unattributed"] = unattributed
+    counts, nobody = attribute_decisions(ctx, state, budget, asks_by_name, charter_numbers, now, problems)
+    state["decision_counts"], state["decisions_unattributed"] = counts, nobody
     state["reads"] = budget.to_state()
     return problems, rows
 
@@ -569,7 +634,7 @@ def tick(ctx):
     problems, rows = _refresh_asks(ctx, state, now, rows)
     if audited is None:
         problems.append("movement: the audit log cannot be read")
-    waiting = decisions_waiting(ctx.state_dir)
+    waiting = state.get("decision_counts")
     if waiting is None:
         problems.append("decisions: decisions.json cannot be read")
     day, hour = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d"), datetime.fromtimestamp(now, timezone.utc).strftime("%H")
@@ -585,7 +650,8 @@ def tick(ctx):
         else:
             unchartered.append(name)
         fig = figures(name, {"asks": asks, "busy": info["busy"], "idle": info["idle"], "messages": info["messages"],
-                             "decisions": None if waiting is None else waiting.get(name, 0)}, rows, now, ctx.cfg)
+                             "decisions": None if waiting is None else waiting.get(name, 0),
+                             "charter": (state.get("charter_of") or {}).get(name), "repo": info.get("repo")}, rows, now, ctx.cfg)
         latest[name] = fig
         old = series.get(name)
         if isinstance(old, dict) and old.get("day") != day and old.get("hours"):   # a new UTC day: the finished day stays replayable for a few days
@@ -594,7 +660,7 @@ def tick(ctx):
             for gone in sorted(history)[:-HISTORY_DAYS]:
                 del history[gone]
         mine = old if isinstance(old, dict) and old.get("day") == day else {"day": day, "hours": {}}
-        mine["hours"][hour] = {k: fig[k] for k in ("open_asks", "active_asks", "waiting_owner", "waiting_cos", "parked", "stalled", "stalled_asks", "moved_1h", "moved_backlog", "busy", "idle", "messages", "decisions", "oldest_stall_hours")}
+        mine["hours"][hour] = {k: fig[k] for k in ("open_asks", "active_asks", "waiting_owner", "waiting_cos", "parked", "stalled", "stalled_asks", "moved_1h", "moved_backlog", "charter_moves_1h", "busy", "idle", "messages", "decisions", "oldest_stall_hours")}
         series[name] = mine
         before = episodes.get(name)
         text, episodes[name] = judge(fig, ctx.cfg, before)
@@ -624,9 +690,11 @@ def status_lines(state_dir, now):
     out = ["load        %d orchestrator(s); alert %s" % (len(latest), "on" if state.get("alert") else "off")]
     for name in sorted(latest):
         f = latest[name]
-        out.append("  %-12s asks %s, stalled %s, waiting on owner %s, parked %s, waiting on cos %s, oldest stall %s h, moved 1h %s; waiting %d msg %s dec; coders %d busy %d idle" % (
+        out.append("  %-12s asks %s, stalled %s, waiting on owner %s, parked %s, waiting on cos %s, oldest stall %s h, moved 1h %s, charter moves 1h %s; waiting %d msg %s dec; coders %d busy %d idle" % (
             name, num(f["open_asks"]), num(f["stalled"]), num(f.get("waiting_owner")), num(f.get("parked")), num(f.get("waiting_cos")),
-            num(f["oldest_stall_hours"]), num(f["moved_1h"]), f["messages"], num(f["decisions"]), f["busy"], f["idle"]))
+            num(f["oldest_stall_hours"]), num(f["moved_1h"]), num(f.get("charter_moves_1h")), f["messages"], num(f["decisions"]), f["busy"], f["idle"]))
+    if state.get("decisions_unattributed"):
+        out.append("  %d decision(s) not attributed (the parent of their issue could not be read, or no orchestrator's charter is on its chain)" % state["decisions_unattributed"])
     if state.get("unattributed"):
         out.append("  %d movement(s) not attributed (a referenced issue's parent could not be read)" % state["unattributed"])
     if state.get("problems"):
