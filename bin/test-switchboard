@@ -11201,7 +11201,7 @@ ROLE_LINE_LIMITS = {"coder": 134, "orchestrator": 180, "chief-of-staff": 162, "c
 # `pr-state`: coder +1 line +140 B, orchestrator +1 line +120 B: the one sentence that sends an agent to the daemon's cache instead of a GitHub polling loop
 # #401 slice 1: the one-sentence GitHub writing rule in its own short section: coder +4 lines +226 B, orchestrator +2 lines +220 B (the wider runtime's file sets each limit)
 # #341: the one never-`git stash` sentence (the files sat at their caps): coder +86 B, orchestrator +60 B, no new line
-ROLE_BYTE_LIMITS = {"coder": 8272, "orchestrator": 11290, "chief-of-staff": 11650, "cos-subagent": 3500}
+ROLE_BYTE_LIMITS = {"coder": 8272, "orchestrator": 11290, "chief-of-staff": 11871, "cos-subagent": 3500}
 WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others
 
 
@@ -32159,6 +32159,20 @@ class TestCommissioningDocs(unittest.TestCase):
         template = section[section.index("A handover note has these six sections"):]
         headings = re.findall(r"^\s+## (.+)$", template, re.M)
         self.assertEqual(headings, list(sb.load_module("lanes").HANDOVER_SECTIONS), "6 of 6 sections, the ones `move` writes")
+
+    LANE_RULE = "Split a lane when an orchestrator holds more asks than it moves, rather than letting them queue."
+
+    def test_s9_the_chief_of_staff_definitions_carry_the_lane_split_rule_once_and_outside_the_permissions(self):
+        for name in ("opencode/chief-of-staff.md", "copilot/chief-of-staff.agent.md"):
+            text = (REPO / "agents" / name).read_text()
+            with self.subTest(file=name):
+                self.assertEqual(text.count(self.LANE_RULE), 1, "the rule sentence appears 1 time")
+                front = text.split("\n---\n", 1)[0]
+                self.assertNotIn("Split a lane", front, "it is prose, never part of the front matter or its permissions")
+                self.assertIn("\"Splitting a project into lanes\"", text, "it points to the fleet-setup section that exists")
+
+    def test_the_section_the_definitions_point_to_exists_in_the_skill(self):
+        self.assertIn("## Splitting a project into lanes", self.SKILL.read_text())
 
     def test_the_chief_of_staff_loads_it_and_never_creates_a_repo(self):
         for path in AGENT_FILES:

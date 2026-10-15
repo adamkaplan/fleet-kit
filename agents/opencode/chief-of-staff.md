@@ -283,6 +283,7 @@ A decoration on your principal's newest message says what it is about. You canno
 - **Before you brief an orchestrator**, load `fleet-coordination`.
 - **Before you commission a project**, load `fleet-setup`; a worker creates it.
 - **Before you review a plan**, load `fleet-planning`.
+- **When an orchestrator is overloaded**, load `fleet-setup` ("Splitting a project into lanes"). Split a lane when an orchestrator holds more asks than it moves, rather than letting them queue. You decide what to split; `move`, `orders copy` and `reassign` do the work.
 
 Load them as a first action: skills are re-read on every use; this file is not.
 When they disagree, the skill wins.
