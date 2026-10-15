@@ -232,3 +232,12 @@ test("the legend names q s d c p ctx and the state words, one line each within t
   const all = legend.join(" ")
   for (const word of ["q open", "s stalled", "d decisions", "c busy", "p pushes", "ctx", "work", "idle", "wait", "dead"]) assert.ok(all.includes(word), word)
 })
+
+test("a counter that has some of a workspace's sessions sums those, and steps cover the rest only when it has none", () => {
+  const pane2 = { ...livePane, agents: { ...livePane.agents, orch1: { role: "coder", workspace: "wA", session: "ses_o1", repo: null } } }
+  const rec = { ...liveRecords, sources: { tool_calls: "ok", usage: "events" }, tool_calls: { ses_o1: { per_minute: new Array(15).fill(2), approx: true } },
+    steps: { ses_o: { per_minute: new Array(15).fill(9), approx: true } } }
+  const orch = buildBlocks({ ...live, pane: pane2, records: rec }, NOW).find((b) => b.name === "orch")
+  assert.equal(orch.sparkKind, "calls")
+  assert.deepEqual(orch.spark, new Array(15).fill(2))
+})

@@ -167,6 +167,8 @@ export function buildBlocks(inputs, now) {
     const lead = members.filter((m) => ROLES.includes(m.role)).sort((a, b) => (a.role === b.role ? a.name.localeCompare(b.name) : a.role === "orchestrator" ? -1 : 1))[0]
     if (!lead) continue
     const sessions = members.map((m) => m.session).filter((s) => typeof s === "string")
+    // The Chief of Staff has no load row: what the owner is owed is its state and what waits on the owner (every open decision for the human tier).
+    const ownerWaiting = listed ? listed.filter((d) => d && !d.closed && d.kind !== "notice" && (d.tier ?? "human") === "human").length : null
     const calls = toolSeries(inputs.records, sessions)
     const series = calls ?? stepSeries(inputs.records, sessions)
     const seriesKind = calls ? "calls" : series ? "steps" : null
@@ -186,7 +188,7 @@ export function buildBlocks(inputs, now) {
     let state = null
     if (dead) state = "dead"
     else if (uncertain) state = null
-    else if (isCos ? listed && listed.some((d) => d && !d.closed && d.kind !== "notice" && (d.tier ?? "human") === "human") : waiting) state = "wait"
+    else if (isCos ? ownerWaiting : waiting) state = "wait"
     else if (recent !== null) state = recent > 0 ? "work" : "idle"
     else if (figBusy !== null || figMoved !== null) state = (figBusy ?? 0) > 0 || (figMoved ?? 0) > 0 ? "work" : "idle"
     else if (inputs.decisions) state = "idle"
@@ -203,8 +205,6 @@ export function buildBlocks(inputs, now) {
     const usageRow = obj(obj(obj(inputs.records).usage)[lead.session])
     const ctx = obj(usageRow.context)
     const context = isNum(ctx.percent) ? { percent: ctx.percent } : isNum(ctx[CONTEXT_USED]) ? { used: ctx[CONTEXT_USED] } : null
-    // The Chief of Staff has no load row: what the owner is owed is its state and what waits on the owner (every open decision for the human tier).
-    const ownerWaiting = listed ? listed.filter((d) => d && !d.closed && d.kind !== "notice" && (d.tier ?? "human") === "human").length : null
     blocks.push({
       key: ws, name: lead.name, state, alert, spark: series, sparkKind: seriesKind, bars: movedBars(load, lead.name, now), open, stalled,
       decisions: isCos ? ownerWaiting : isNum(fig.decisions) ? fig.decisions : waiting, busy, total: busy !== null && idle !== null ? busy + idle : null, pushes, context, cos: isCos, toolWhy: series ? null : toolWhy(inputs.records), ctxOff: usageOff(inputs.records), ctxWhy: context || usageRow.hours ? null : ctxWhy(inputs.records),
