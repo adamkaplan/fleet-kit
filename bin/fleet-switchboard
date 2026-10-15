@@ -17862,7 +17862,12 @@ def cmd_impact_hold(args, runner, now):
     names = label_names(config)
     shown = 0
     for repo in repos:
-        if not impact_floor.floor_for(repo, config)[0]:
+        try:
+            has_floor = impact_floor.floor_for(repo, config)[0]
+        except impact_floor.MatrixError as err:   # the matrix file cannot be read: say so and stop, never read it as "no floor"
+            sys.stderr.write("%s: impact hold: %s\n" % (PROG, _one_line(str(err), 200)))
+            return EXIT_ERROR
+        if not has_floor:
             continue
         try:
             items = read_open_items(engine, runner, repo)[0]
@@ -17925,7 +17930,11 @@ def impact_would_hold_pass(engine, now):
             head = ((record.get("head") or {}).get("sha")) if isinstance(record, dict) else None
             if not isinstance(number, int) or isinstance(number, bool) or not head or record.get("draft"):
                 continue
-            globs = impact_floor.floor_for(key, engine.config)[0]
+            try:
+                globs = impact_floor.floor_for(key, engine.config)[0]
+            except impact_floor.MatrixError as err:   # fail LOUD: no judgement is made while the matrix file cannot be read (never read as "no floor")
+                engine._note("impact.error", key, {"error": _one_line(str(err), 160), "floor": "unreadable"})
+                return
             if not globs or seen.get((key, number)) == head or budget <= 0:
                 continue
             retry = seen.get((key, number, "retry"))

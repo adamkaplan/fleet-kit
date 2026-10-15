@@ -15,7 +15,8 @@ MATRIX_PATH = Path(__file__).resolve().parent.parent / "docs" / "review-laws" / 
 
 class MatrixError(ValueError):
     """The impact matrix file cannot be read or has no usable `owner_hold.floor`. Never swallowed: the floor lived in code and could not fail to load, so a
-    file that cannot be read must stop the decision (the callers treat an exception as `floor unknown`, which holds), never read as "no floor"."""
+    file that cannot be read stops the decision, and the callers (the daemon pass and the `impact hold` command) say so loudly (`impact.error`, one line and
+    a non-zero exit) and make no judgement; they never read it as "no floor"."""
 
 
 _MATRIX_CACHE = {}
