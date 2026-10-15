@@ -107,6 +107,28 @@ runfix; rc=$?
 [ $rc = 0 ] && ! grep -q 'grpc.v1.cri' "$tmp/config.toml" && grep -q "^\[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.sysbox-runc\]" "$tmp/config.toml" \
   && ok "fix: column-0 legacy form still handled" || bad "fix: col-0 form (rc=$rc)"
 
+# a pre-existing duplicate header makes the rewrite refuse: exit 1, config untouched, no restart
+cat > "$tmp/config.toml" <<'T'
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.sysbox-runc]
+  runtime_type = "x"
+[dup]
+[dup]
+T
+cp "$tmp/config.toml" "$tmp/orig"; runfix; rc=$?
+[ $rc = 1 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && [ "$(restarts)" = 0 ] && [ ! -e "$tmp/config.toml.tmp" ] \
+  && ok "fix: duplicate header refused, config unchanged" || bad "fix: duplicate header (rc=$rc)"
+# sysbox-runc registered in a form the fix does not move: exit 1, config untouched, no restart
+cat > "$tmp/config.toml" <<'T'
+[plugins."other.key".containerd.runtimes.sysbox-runc]
+  runtime_type = "x"
+T
+cp "$tmp/config.toml" "$tmp/orig"; runfix; rc=$?
+[ $rc = 1 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && [ "$(restarts)" = 0 ] \
+  && ok "fix: unmovable form refused, config unchanged" || bad "fix: unmovable form (rc=$rc)"
+# the worker's activity reader (stub server, no network)
+nice python3 -m unittest discover -s "$here/worker/tests" -p 'test_*.py' >"$tmp/ut" 2>&1 \
+  && ok "worker activity reader tests" || { bad "worker activity reader tests"; tail -20 "$tmp/ut"; }
+
 # 3. secret scan on a directory
 mkdir "$tmp/clean" "$tmp/dirty"; echo "hello" > "$tmp/clean/a.txt"
 printf 'GH_TOKEN=%s\n' "ghp_$(printf 'a%.0s' $(seq 36))" > "$tmp/dirty/env"
