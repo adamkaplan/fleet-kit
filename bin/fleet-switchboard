@@ -25473,6 +25473,8 @@ def cmd_orders(args, runner, now):
         sys.stderr.write("%s: orders needs list, add or remove (a charter's orders), or --cos (the Chief of Staff's "
                          "own)\n" % PROG)
         return EXIT_USAGE
+    if args.orders_action == "copy":
+        return cmd_orders_copy(args, runner, now)
     if args.orders_action == "list":
         reader = _intent_reader(runner, now)
         fleet, watched = soft_caller(runner, now)
@@ -25501,6 +25503,27 @@ def cmd_orders(args, runner, now):
         sys.stderr.write("%s: %s\n" % (PROG, err))
         return EXIT_USAGE
     return orders_write(engine, args, caller, role, repo, number)
+
+
+def cmd_orders_copy(args, runner, now):
+    """`orders copy --source N --charter M`: the logic is bin/orders_copy.py; this is the caller and the two charters."""
+    module = load_module("orders_copy")
+    engine, _, _ = build_engine(runner, now, "cli")
+    if engine.intents is None:
+        raise ConfigError("'intent_repo' is not configured in %s: set it to OWNER/REPO" % config_path())
+    caller, role, fleet = orders_caller(engine, args)
+    try:
+        watched = watched_repos(engine.config, discovered_fleets(engine.discover(engine.now())))
+        repo, target = _orders_charter(engine.config, args.charter, fleet, watched)
+        source_repo, source = _orders_charter(engine.config, args.source, fleet, watched)
+    except IssueRefError as err:
+        sys.stderr.write("%s: %s\n" % (PROG, err))
+        return EXIT_USAGE
+    if source_repo != repo:
+        sys.stderr.write("%s: orders copy: the source and the target charter must be in the same repository (%s vs %s)\n" % (PROG, source_repo, repo))
+        return EXIT_USAGE
+    ns = types.SimpleNamespace(engine=engine, **{name: globals()[name] for name in module.NEEDS})
+    return module.run_copy(ns, repo, source, target, caller, role, print, lambda text: sys.stderr.write(text + "\n"))
 
 
 def orders_write(engine, args, caller, role, repo, charter):
@@ -25594,6 +25617,10 @@ def add_orders_parsers(sub):
     add.add_argument("text", help="The order, in the owner's words (1 to %d characters, one line)" % ORDER_MAX_CHARS)
     add.add_argument("--by", help="Who ordered it (default: the operating-system user)")
     add.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
+    copy = kinds.add_parser("copy", help="Chief of Staff only: copy every order of a sibling charter to this one, wording and dates unchanged")
+    copy.add_argument("--charter", type=issue_arg, required=True, help="The charter the orders are copied TO: " + CHARTER_HELP)
+    copy.add_argument("--source", type=issue_arg, required=True, help="The charter the orders are copied FROM: " + CHARTER_HELP)
+    copy.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
     remove = kinds.add_parser("remove", help="Chief of Staff only: remove one order the owner revoked")
     remove.add_argument("--charter", type=issue_arg, required=True, help=CHARTER_HELP)
     remove.add_argument("number", type=int, help="The order's number in `orders list`")
