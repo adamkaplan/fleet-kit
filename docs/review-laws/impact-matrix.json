@@ -137,10 +137,12 @@
       "credentials": [
         "shims/gh",
         "shims/git",
-        "cloud/launcher/token_mint.py"
+        "cloud/launcher/token_mint.py",
+        "cloud/launcher/cloud_worker.py"
       ],
       "identity": [
-        "shims/**"
+        "shims/**",
+        "bin/switchboard-trial"
       ],
       "authority": [
         "bin/plan_ledger.py",
@@ -148,7 +150,8 @@
         "docs/review-laws/impact-matrix.json",
         "plugins/fleet-hooks/**",
         "tools/cos-permissions-proof/**",
-        "agents/**"
+        "agents/**",
+        ".github/workflows/**"
       ]
     },
     "floor": {
@@ -173,6 +176,14 @@
           "docs/review-laws/impact-matrix.json"
         ]
       }
-    }
+    },
+    "top_tier_outside_floor": [
+      "agents/**",
+      "cloud/launcher/token_mint.py",
+      "cloud/launcher/cloud_worker.py",
+      ".github/workflows/**",
+      "bin/switchboard-trial"
+    ],
+    "note": "top_tier_outside_floor lists the top tier paths that are deliberately not in the floor globs (the floor excludes agent definitions, which are captain pull requests); a test checks that every other top tier path is inside the floor. bin/fleet-switchboard selects accounts and mints tokens but is not a top tier path (it would hold nearly every change): a change there to credentials or identity must be rated with that class by the independent review."
   }
 }

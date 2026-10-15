@@ -13,12 +13,32 @@ ACTION_HOLD, ACTION_SECOND, ACTION_NONE = "H", "2", "."
 MATRIX_PATH = Path(__file__).resolve().parent.parent / "docs" / "review-laws" / "impact-matrix.json"
 
 
-def default_floors(matrix=None):
-    """The built-in floor per repo, read from the matrix file's `owner_hold.floor` (a proposal the owner confirms): the code names no path."""
+class MatrixError(ValueError):
+    """The impact matrix file cannot be read or has no usable `owner_hold.floor`. Never swallowed: the floor lived in code and could not fail to load, so a
+    file that cannot be read must stop the decision (the callers treat an exception as `floor unknown`, which holds), never read as "no floor"."""
+
+
+_MATRIX_CACHE = {}
+
+
+def _matrix_cached():
+    """The matrix file, re-read only when it changes (the daemon asks per record per pass)."""
     try:
-        floors = ((matrix if matrix is not None else load_matrix()).get("owner_hold") or {}).get("floor") or {}
-    except (OSError, ValueError):
-        return {}
+        stamp = MATRIX_PATH.stat().st_mtime_ns
+        if _MATRIX_CACHE.get("stamp") != stamp:
+            _MATRIX_CACHE.update({"stamp": stamp, "matrix": load_matrix()})
+        return _MATRIX_CACHE["matrix"]
+    except (OSError, ValueError) as err:
+        _MATRIX_CACHE.clear()
+        raise MatrixError("the impact matrix file cannot be read (%s: %s)" % (type(err).__name__, err)) from None
+
+
+def default_floors(matrix=None):
+    """The built-in floor per repo, read from the matrix file's `owner_hold.floor` (a proposal the owner confirms): the code names no path. Raises
+    MatrixError when the file cannot be read or holds no `owner_hold.floor` object."""
+    floors = ((matrix if matrix is not None else _matrix_cached()).get("owner_hold") or {}).get("floor")
+    if not isinstance(floors, dict):
+        raise MatrixError("the impact matrix file has no owner_hold.floor object")
     return {name: entry for name, entry in floors.items() if isinstance(entry, dict)}
 
 
@@ -156,15 +176,21 @@ def decide(floor_hit, rated, unknown=None):
 # ---- who may clear a hold: the owner's own clear is for the top tier only (ask #451). Everything below reads the matrix file's `owner_hold` block.
 
 def owner_hold_rule(matrix):
-    """The `owner_hold` block of the matrix, normalised: (top classes, other classes, {class: globs}). A matrix with no such block has no top tier, which
-    is read as EVERY path and class being top tier (fail closed): the old behaviour."""
-    block = (matrix or {}).get("owner_hold")
+    """The `owner_hold` block of the matrix, normalised: (top classes, other classes, {class: globs}) with class names lower-cased, or None when the block is
+    missing or MALFORMED (not an object, a list that is not a list of strings, no top tier path at all). None is read by `owner_decide` as: every change holds."""
+    block = (matrix or {}).get("owner_hold") if isinstance(matrix, dict) else None
     if not isinstance(block, dict):
         return None
-    top = [c for c in (block.get("top_tier_classes") or []) if isinstance(c, str)]
-    other = [c for c in (block.get("other_classes") or []) if isinstance(c, str) and c not in top]
-    paths = {c: [g for g in (v or []) if isinstance(g, str)] for c, v in (block.get("top_tier_paths") or {}).items() if isinstance(v, (list, tuple))}
-    return top, other, paths
+    top, other, paths = block.get("top_tier_classes"), block.get("other_classes"), block.get("top_tier_paths")
+    if not (isinstance(top, list) and isinstance(other, list) and isinstance(paths, dict) and top and paths):
+        return None
+    if not all(isinstance(c, str) and c.strip() for c in top + other):
+        return None
+    if not all(isinstance(g, list) and all(isinstance(x, str) and x.strip() for x in g) for g in paths.values()) or not any(paths.values()):
+        return None
+    top = [c.strip().lower() for c in top]
+    other = [c.strip().lower() for c in other if c.strip().lower() not in top]
+    return top, other, {c: list(g) for c, g in paths.items()}
 
 
 def top_tier_hits(paths, matrix):
@@ -181,11 +207,12 @@ def top_tier_hits(paths, matrix):
 
 
 def class_is_top_tier(matrix, cls):
-    """True for a top tier class, a missing class and an UNKNOWN class (fail closed); False only for a class the matrix file names as not top tier."""
+    """True for a top tier class, a missing class and an UNKNOWN class (fail closed); False only for a class the matrix file names as not top tier
+    (compared case-insensitively)."""
     rule = owner_hold_rule(matrix)
-    if rule is None or not isinstance(cls, str) or not cls:
+    if rule is None or not isinstance(cls, str) or not cls.strip():
         return True
-    return cls not in rule[1]
+    return cls.strip().lower() not in rule[1]
 
 
 def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=()):
@@ -198,6 +225,8 @@ def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=()):
         medium-band rating asks for a second independent review (the usual checks then decide the merge);
       - "none" otherwise."""
     reasons = []
+    if owner_hold_rule(matrix) is None:   # FAIL CLOSED: no usable rule means every change holds for the owner
+        reasons.append("owner_hold rule missing or malformed in the impact matrix file: every change holds")
     if unknown:
         reasons.append("floor unknown: %s" % unknown)
     for cls, got in sorted(top_tier_hits(paths, matrix).items()):

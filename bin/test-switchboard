@@ -49736,7 +49736,7 @@ class TestOwnerHoldRule(unittest.TestCase):
     """Ask #451, slice 1: the owner's own clear is for credentials, identity and who may do what only. The rule is data in the impact matrix file."""
 
     def setUp(self):
-        self.floor = sb.impact_floor
+        self.floor = sb.load_module("impact_floor")
         self.matrix = self.floor.load_matrix()
 
     def decide(self, paths, impacts=(), unknown=None, matrix=None):
@@ -49748,18 +49748,55 @@ class TestOwnerHoldRule(unittest.TestCase):
     def test_s1_the_decision_code_names_no_path_or_class_and_agrees_with_the_file(self):
         import ast
         tree = ast.parse((BIN / "impact_floor.py").read_text())
-        names = {"owner_hold_rule", "top_tier_hits", "class_is_top_tier", "owner_decide", "default_floors"}
-        constants = set()
-        for node in tree.body:
-            if isinstance(node, ast.FunctionDef) and node.name in names:
-                body = node.body[1:] if (node.body and isinstance(node.body[0], ast.Expr) and isinstance(node.body[0].value, ast.Constant)) else node.body
-                for inner in body:
-                    constants.update(n.value for n in ast.walk(inner) if isinstance(n, ast.Constant) and isinstance(n.value, str))
+        docstrings = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.FunctionDef, ast.ClassDef)) and node.body and isinstance(node.body[0], ast.Expr) \
+                    and isinstance(node.body[0].value, ast.Constant):
+                docstrings.add(id(node.body[0].value))
+        constants = {n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str) and id(n) not in docstrings}
         block = self.matrix["owner_hold"]
         from_file = set(block["top_tier_classes"]) | set(block["other_classes"]) | {g for globs in block["top_tier_paths"].values() for g in globs}
         from_file |= {g for entry in block["floor"].values() for key in ("globs", "exclude", "force") for g in entry.get(key, [])}
         self.assertTrue(from_file)
-        self.assertEqual(sorted(constants & from_file), [], "a path or class of the matrix file is written in the decision code")
+        self.assertEqual(sorted(constants & from_file), [], "a path or class of the matrix file is written in the module's code")
+
+    def test_every_top_tier_path_is_inside_the_floor_or_listed_as_outside_it(self):
+        block = self.matrix["owner_hold"]
+        outside = set(block["top_tier_outside_floor"])
+        globs, exclude, force = self.floor.floor_for("adamkaplan/fleet-kit")
+        for cls, patterns in block["top_tier_paths"].items():
+            for pattern in patterns:
+                sample = pattern.replace("**", "x").replace("*", "x")
+                inside = bool(self.floor.floor_paths([sample], globs, exclude, force))
+                self.assertTrue(inside != (pattern in outside), "%s (%s): inside the floor %s, listed as outside it %s" % (pattern, cls, inside, pattern in outside))
+
+    def test_a_missing_or_malformed_block_holds_every_change_and_a_broken_file_is_never_read_as_no_floor(self):
+        for broken in ({}, {"owner_hold": "x"}, {"owner_hold": {"top_tier_classes": ["credentials"], "other_classes": [], "top_tier_paths": {"credentials": "shims/gh"}}},
+                       {"owner_hold": {"top_tier_classes": ["credentials"], "other_classes": [], "top_tier_paths": {}}}):
+            decision, reasons = self.floor.owner_decide(broken, ["docs/notes.md"], [])
+            self.assertEqual(decision, "hold", broken)
+            self.assertIn("missing or malformed", reasons[0])
+        bad = self.home_file("matrix.json", "{not json")
+        with mock.patch.object(self.floor, "MATRIX_PATH", bad):
+            self.floor._MATRIX_CACHE.clear()
+            with self.assertRaises(self.floor.MatrixError):
+                self.floor.floor_for("adamkaplan/fleet-kit")
+        self.floor._MATRIX_CACHE.clear()
+        self.assertTrue(self.floor.floor_for("adamkaplan/fleet-kit")[0], "the real file reads again")
+
+    def home_file(self, name, text):
+        tmp = Path(tempfile.mkdtemp(prefix="ohr"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = tmp / name
+        path.write_text(text)
+        return path
+
+    def test_a_deleted_path_a_renames_old_path_a_case_variant_and_a_cased_class_are_judged(self):
+        self.assertEqual(self.decide(["docs/new-name.md", "shims/gh"])[0], "hold", "a rename out of a shim arrives as its old path")
+        self.assertEqual(self.decide(["SHIMS/Git"])[0], "hold", "case-insensitive")
+        self.assertEqual(self.decide(["x.py"], [("Critical", "Remote", "AVAILABILITY ")])[0], "second-review", "a class name is compared case-insensitively")
+        self.assertEqual(self.decide(["x.py"], [("Critical", "Remote", "Credentials")])[0], "hold")
+        self.assertEqual(self.decide(["x.py"], [("Marginal", "Remote", "credentials")])[0], "second-review", "a medium-band rating of a top tier class asks for a second review")
 
     def test_s2_a_change_to_the_shims_the_ledger_a_permission_block_or_the_matrix_holds_for_the_owner(self):
         for path in ("shims/gh", "shims/git", "bin/plan_ledger.py", "agents/opencode/chief-of-staff.md", "docs/review-laws/impact-matrix.json"):
@@ -49771,7 +49808,7 @@ class TestOwnerHoldRule(unittest.TestCase):
         paths = ["templates/com.fleet-kit.switchboard.plist", "cloud/launcher/Dockerfile", "docs/switchboard.md"]
         decision, reasons = self.decide(paths)
         self.assertEqual(decision, "second-review", reasons)
-        self.assertFalse(any(reason.startswith(("top tier", "floor unknown", "rating:")) and "second" not in reason for reason in reasons), reasons)
+        self.assertEqual(reasons, ["floor: 1 path(s) outside the top tier ask for a second independent review"])
         for path in paths:
             self.assertNotEqual(self.decide([path])[0], "hold", path)
 
