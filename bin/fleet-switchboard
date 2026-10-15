@@ -623,7 +623,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "temp_janitor", "load_alert"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "temp_janitor", "load_alert", "spotlight_guard"}
 
 
 def config_known_keys():
@@ -700,6 +700,10 @@ def validate_config(raw, source="config"):
         load_cpu_guard().validate(config["cpu_guard"], source)
     except ValueError as err:
         raise ConfigError(str(err))
+    try:
+        load_spotlight_guard().validate(config.get("spotlight_guard"), source)
+    except ValueError as err:
+        raise ConfigError(str(err)) from None
     if not isinstance(config["docker_reaper"], bool):
         raise ConfigError("%s: 'docker_reaper' must be true or false, got %r" % (source, config["docker_reaper"]))
     if config["v2_events"] not in ("auto", "off"):
@@ -2395,6 +2399,102 @@ class DiskFacts:
         return [Fact("disk.low:%d" % int(episode), name, "disk", text, episode, sender="switchboard") for name in chiefs]
 
 
+def load_spotlight_guard():
+    """The Spotlight guard, bin/spotlight_guard.py (#438), loaded by path like the other modules (here and not in the shared loader block, so it adds no line there)."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "spotlight_guard.py")
+    held = sys.modules.get("spotlight_guard")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("spotlight_guard", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["spotlight_guard"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("spotlight_guard", None)
+        raise
+    return module
+
+
+class SpotlightFacts:
+    """The Spotlight guard's fact source (bin/spotlight_guard.py, ask #438). Once an hour a BACKGROUND thread asks `mdfind` (5 s per folder) whether the index holds
+    anything under each guarded folder; a pass only collects what the thread has finished, so it starts no process and a slow tool never delays it. A folder
+    indexed on two checks in a row begins an episode: ONE wake to the Chief of Staff (`spotlight.lost:<folder>:<episode>`, audited `spotlight.lost`); a zero count
+    ends it (`spotlight.recovered`). Writes only `spotlight-guard.json`, and only when an answer changed. Changes no setting."""
+
+    __name__ = "spotlight_facts"
+
+    def __init__(self):
+        self.engine = None
+        self.tracker = None
+        self.thread = None
+        self.done = None             # results the thread has finished, not yet stepped
+        self.started = None          # the engine's clock when the last check began
+        self.saved = None            # the stable content the file holds
+
+    def bind(self, engine):
+        self.engine = engine
+
+    def _start(self, engine, sg, cfg):
+        runner = getattr(engine, "spotlight_runner", None)
+        folders = list(cfg["folders"])
+        self.started = engine.now()
+
+        def work():
+            results = sg.check_all(folders, runner)
+            if self.thread is threading.current_thread():
+                self.done = results
+        self.thread = threading.Thread(target=work, name="spotlight-check", daemon=True)
+        self.thread.start()
+
+    def _chiefs(self, engine):
+        discovery = getattr(engine, "discovery", None)
+        return sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff") if discovery is not None and not discovery.problems else []
+
+    def __call__(self):
+        engine = self.engine
+        if engine is None or engine.state_dir is None:
+            return []
+        sg = load_spotlight_guard()
+        cfg = sg.settings(engine.config.get("spotlight_guard"))
+        if cfg is None:
+            return []
+        if self.tracker is None:
+            saved = sg.load(engine.state_dir)
+            self.tracker = sg.Tracker((saved or {}).get("folders"))
+            self.saved = sg.stable(saved) if saved else None
+        results, self.done = self.done, None
+        facts = self._apply(engine, sg, results) if results else []
+        alive = self.thread is not None and self.thread.is_alive()
+        if not alive and (self.started is None or engine.now() - self.started >= sg.CHECK_SECONDS):
+            self._start(engine, sg, cfg)
+        return facts
+
+    def _apply(self, engine, sg, results):
+        now = engine.now()
+        chiefs = self._chiefs(engine)
+        facts = []
+        for folder, (state, count) in sorted(results.items()):
+            event = self.tracker.step(folder, state, now)
+            if event == "begin" and engine.audit is not None:
+                engine.audit.append(engine.actor, "spotlight.lost", None, {"folder": folder, "count": count})
+            elif event == "end" and engine.audit is not None:
+                engine.audit.append(engine.actor, "spotlight.recovered", None, {"folder": folder})
+            episode = self.tracker.episode.get(folder)
+            if episode is not None and chiefs:
+                text = sg.wake_text(folder, count, PROG)
+                key = "spotlight.lost:%s:%d" % (hashlib.sha256(folder.encode()).hexdigest()[:10], int(episode))
+                facts.extend(Fact(key, name, "spotlight", " ".join(text.split()), episode, sender="switchboard") for name in chiefs)
+        content = sg.body(results, self.tracker, now)
+        if self.saved != sg.stable(content):
+            try:
+                sg.save(engine.state_dir, content)
+                self.saved = sg.stable(content)
+            except OSError as err:
+                engine._note("spotlight.guard_file", None, {"error": _plain("%s: %s" % (type(err).__name__, err), 160)})
+        return facts
+
+
 class CpuFacts:
     """The CPU and memory guard's fact source (bin/cpu_guard.py): ONE `os.getloadavg()` and the kernel's memory counters per pass, no process. When the load over
     the cores stays above the guard for the configured minutes the Chief of Staff is told ONCE for the episode (`cpu.high:<episode>`: the key is stable, so it is
@@ -2852,7 +2952,7 @@ def fact_sources(state_dir):
     the same rule, and stores nothing.
     """
     return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir),
-            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), JobFacts(), PaneFacts(), DiskFacts(), CpuFacts(), DockerReapFacts()]
+            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), JobFacts(), PaneFacts(), DiskFacts(), CpuFacts(), SpotlightFacts(), DockerReapFacts()]
 
 
 # --------------------------------------------------------- observing the fleet
@@ -14267,6 +14367,11 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         if config_ok and disk_guard_settings(config) is not None:
             report["disk"] = disk_status_line(config, state)   # one stat of the volume
         if config_ok:
+            sg = load_spotlight_guard()
+            spot_cfg = sg.settings(config.get("spotlight_guard"))
+            if spot_cfg is not None:
+                report["spotlight"] = sg.status_lines(spot_cfg, sg.load(state), now())   # the file the hourly background check wrote: no process
+        if config_ok:
             cg = load_cpu_guard()
             cpu_cfg = cg.settings(config.get("cpu_guard"))
             if cpu_cfg is not None:
@@ -14472,6 +14577,7 @@ def format_status(report):
     lines.extend("      disk       " + report["disk"] for _ in [0] if report.get("disk"))
     lines.extend("      cpu        " + report["cpu"] for _ in [0] if report.get("cpu"))
     lines.extend("      mem        " + report["mem"] for _ in [0] if report.get("mem"))
+    lines.extend("      spotlight  " + text for text in report.get("spotlight") or [])
     lines.extend("      orphans    " + report["orphans"] for _ in [0] if report.get("orphans"))
     lines.extend("      v2 calls   " + report["v2_calls"] for _ in [0] if report.get("v2_calls"))
     lines.extend("      " + text for text in report.get("github_calls") or [])
