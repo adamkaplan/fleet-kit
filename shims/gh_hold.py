@@ -193,7 +193,7 @@ def parse_flags(rest, spec):
             continue
         if a.startswith("--"):
             name, eq, value = a.partition("=")
-            if name in ("--help",):
+            if a == "--help":
                 out.help = True
             elif name in spec["val_long"]:
                 if not eq:
@@ -214,9 +214,9 @@ def parse_flags(rest, spec):
         letters, j = a[1:], 0
         while j < len(letters):
             c = letters[j]
-            if c == "h":
+            if a == "-h":
                 out.help = True
-                j += 1
+                break
             elif c in spec["bool"]:
                 out.flags.append((spec["bool"][c], None))
                 j += 1
@@ -547,7 +547,8 @@ def read_file_limited(path):
         return None
     try:
         with open(path, "r", errors="replace") as handle:
-            return handle.read(MAX_FILE)
+            text = handle.read(MAX_FILE + 1)
+        return text if len(text) <= MAX_FILE else None     # a file past the limit cannot be scanned whole: refused, never half read
     except (OSError, ValueError):
         return None
 
@@ -579,6 +580,19 @@ def graphql_check(args, endpoints, fields, inp):
             if text is None:
                 return "unreadable"
             texts.append(text)
+            try:
+                decoded = json.loads(text)          # a JSON body can spell a word with escapes: the decoded strings are scanned too
+            except ValueError:
+                decoded = None
+            stack = [decoded]
+            while stack:
+                item = stack.pop()
+                if isinstance(item, str):
+                    texts.append(item)
+                elif isinstance(item, dict):
+                    stack += list(item.values()) + list(item.keys())
+                elif isinstance(item, list):
+                    stack += item
     if unknown:
         return "unreadable"
     found = sorted({m.group(1) for t in texts for m in GRAPHQL_GUARDED.finditer(t)})
@@ -727,7 +741,11 @@ def check(args, ctx):
         if not ctx.write and not is_api:
             return Result()
         if state == "bad":
-            guarded = is_api or (len(words) >= 2 and (first, words[1]) in SPECS) or first not in KNOWN_COMMANDS
+            if is_api:
+                _ep, method, fields, inp = parse_api(args)
+                provably_get = (method == "GET") or (method is None and not fields and not inp)
+                return Result() if provably_get else Result(BAD_CONFIG)
+            guarded = (len(words) >= 2 and (first, words[1]) in SPECS) or first not in KNOWN_COMMANDS
             return Result(BAD_CONFIG) if guarded and ctx.write else Result()
         if is_api:
             return check_api(args, ctx, holds)

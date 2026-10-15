@@ -282,6 +282,24 @@ class TestHostileInput(Base):
         self.refused("api", "graphql", "-f", "query=mutation { enqueuePullRequest(input:{}) {x} }")
         self.refused("api", "graphql", "-f", "query=mutation { addComment(input:{}) {x} }")        # every mutation: none can be tied to a repository
 
+    def test_help_with_a_value_and_hidden_graphql_forms_do_not_bypass(self):
+        self.refused("pr", "merge", "7", "--help=false", "-R", CFG_REPO)
+        self.refused("pr", "merge", "7", "-hx", "-R", CFG_REPO)
+        done, calls = self.run_gh("pr", "merge", "--help")
+        self.assertEqual(done.returncode, 7)
+        escaped = self.home / "q.json"
+        escaped.write_text(json.dumps({"query": "mutation { x }"}).replace("mutation", "\\u006dutation"))
+        self.refused("api", "graphql", "--input", str(escaped))
+        padded = self.home / "big.graphql"
+        padded.write_text("#" * 300000 + "\nmutation { x }")
+        self.refused("api", "graphql", "-F", "query=@" + str(padded))
+
+    def test_a_bad_config_refuses_api_writes_in_any_flag_form(self):
+        self.config(None, raw="{not json")
+        self.refused("api", "-iXPUT", "repos/%s/pulls/7/merge" % CFG_REPO)
+        done, _ = self.run_gh("api", "repos/%s/pulls/7" % CFG_REPO)
+        self.assertEqual(done.returncode, 7)
+
     def test_aliases_are_refused_and_other_words_pass(self):
         self.refused("shipit", "7", env={"FAKE_ALIASES": "shipit:\tpr merge"})
         self.passed("shipit", "7", env={"FAKE_ALIASES": "other:\tpr view"})

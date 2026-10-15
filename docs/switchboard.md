@@ -2405,7 +2405,7 @@ not bypass it: an agent can set it.
 names a repository, the next `gh` call is checked. On a labelled pull request run `gh pr merge <n> -R <owner/repo>`: it exits 1 with the
 configured message and nothing is merged; on an unlabelled one it behaves as before. Removing the config entry switches it off.
 
-**Audit of every `gh` write.** Each write the shim passes on, and each it refuses, leaves one JSON line (`ts`, `verb`, `repo`, `number`,
+**Audit of every `gh` write** (a guardrail: an agent that sets `FLEET_SWITCHBOARD_OWN_GH=1` skips its own audit line). Each write the shim passes on, and each it refuses, leaves one JSON line (`ts`, `verb`, `repo`, `number`,
 `caller`, `outcome` = `passed` or `refused`) in `gh-writes.jsonl` in the directory beside the state directory with `-audit` added
 (`~/.local/state/fleet-switchboard-audit/` by default), so "who merged this pull request" has an answer. A command line, a body, a token or a
 query value is never copied; `repo` and `number` are `null` when the command names neither (a number of the current branch); `passed` means
@@ -2420,7 +2420,7 @@ which pull request it touches, so that nobody mistakes it for a boundary (GitHub
   `gh gist`, `gh ruleset`, `gh codespace`, `gh cache`, `gh extension`, `gh config`, `gh auth`.
 - `gh api` writes that are not one of the shapes above: `repos/o/r/merges`, `git/refs` (a branch delete or move), `pulls/N/update-branch`,
   `pulls/N/requested_reviewers`, comments, `branches/.../protection`, and anything addressed by `repositories/ID` for a path outside the guarded shapes.
-- A `gh api graphql` query (no mutation), and a query the shim reads only up to 256 KiB; a `gh` extension (neither a built-in nor an alias); a repository addressed by a name it had before a rename or transfer (matched by name, not canonical identity).
+- A `gh api graphql` query (no mutation) (a query file larger than 256 KiB is refused, not half read); a `gh` extension (neither a built-in nor an alias); a repository addressed by a name it had before a rename or transfer (matched by name, not canonical identity).
 - A shell or alias that runs the real `gh` by its absolute path, or `git push` of a branch (the `git` shim routes credentials, it does not read holds).
 - The existing review check (`--over-review`) and the plan gates are separate mechanisms, still fail-open as documented, and run after the hold.
 The policy judge never reads the
