@@ -9,8 +9,9 @@ new head the clear carries only if ALL hold, each read IN FULL (anything unreada
 
 * the cleared head is an ancestor of the new head (a merge of main, never a rewritten history);
 * every step from the new head back to the cleared head along first parents is a merge commit of two parents (a commit of the pull request's own is never carried; the main-side commits a merge brings in are not the pull request's);
+* the second parent of each of those merges is on the base branch (a side branch of the author's is never carried: a mode change, which no file list shows, could ride on it);
 * in every one of those merges no file differs from BOTH parents (a conflict resolved by hand, or a file both sides changed, voids the clear);
-* the fingerprint of the new head's own change, against ITS merge base, is identical to the ORIGINAL one stored with the clear (never to an earlier carried head, so carries cannot drift);
+* the fingerprint of the new head's own change (and the base branch it is against), against ITS merge base, is identical to the ORIGINAL one stored with the clear (never to an earlier carried head, so carries cannot drift);
 * the head did not move while this was read.
 
 The same function computes the fingerprint at the clear and at the carry (`own_change_fingerprint`). Python 3.9 standard library only.
@@ -62,7 +63,7 @@ def _sha(value):
 
 
 def pull_head(get, repo, number):
-    """The pull request's head sha now, from a fresh read."""
+    """(head sha, the pull request's answer) from a fresh read."""
     answer = _object(get, "repos/%s/pulls/%d" % (repo, number), "the pull request")
     head = _sha((answer.get("head") or {}).get("sha") if isinstance(answer.get("head"), dict) else None)
     if head is None:
@@ -70,10 +71,19 @@ def pull_head(get, repo, number):
     return head, answer
 
 
+def base_ref_of(pull):
+    ref = (pull.get("base") or {}).get("ref") if isinstance(pull.get("base"), dict) else None
+    if not isinstance(ref, str) or not ref or len(ref) > 200:
+        raise CarryVoid("the pull request's base branch could not be read")
+    return ref
+
+
 def own_change(get, repo, number):
-    """[{"path", "status", "previous", "sha", "patch"}] sorted by path: the files of the pull request's own change against the merge base of its CURRENT head, read in full.
-    Void when the list is cut, when a file's patch is omitted (a binary file or a change too large for GitHub) unless it is a pure rename or copy, whose blob id pins its content."""
+    """([{"path", "status", "previous", "sha", "patch"}] sorted by path, head, base branch): the files of the pull request's own change against the merge base of its CURRENT
+    head, read in full. Void when the list is cut, when a file's patch is omitted (a binary file, a mode-only change, or a change too large for GitHub) unless it is a pure rename or
+    copy, whose blob id pins its content, and when the head moved while the pages were read (the head is read before AND after)."""
     head, pull = pull_head(get, repo, number)
+    base = base_ref_of(pull)
     files = _get_list(get, "repos/%s/pulls/%d/files?per_page=%d" % (repo, number, PAGE), FILE_PAGES, "the changed files", None)
     total = pull.get("changed_files")
     if not isinstance(total, int) or isinstance(total, bool) or total != len(files):
@@ -90,19 +100,22 @@ def own_change(get, repo, number):
             raise CarryVoid("the patch of %s is omitted by GitHub (a binary file or too large to read in full)" % item["filename"][:80])
         previous = item.get("previous_filename") if isinstance(item.get("previous_filename"), str) else None
         out.append({"path": item["filename"], "status": str(status), "previous": previous, "sha": sha, "patch": patch if isinstance(patch, str) else ""})
-    return sorted(out, key=lambda f: (f["path"], f["status"])), head
+    after, after_pull = pull_head(get, repo, number)
+    if after != head or base_ref_of(after_pull) != base:
+        raise CarryVoid("the head or the base branch moved while the changed files were being read")
+    return sorted(out, key=lambda f: (f["path"], f["status"])), head, base
 
 
-def fingerprint_of(files):
-    """`sha256:<hex>` of the canonical form of an own change: path, status, previous path, blob id and patch of every file, in path order."""
-    canonical = json.dumps([[f["path"], f["status"], f["previous"], f["sha"], f["patch"]] for f in files], sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+def fingerprint_of(files, base):
+    """`sha256:<hex>` of the canonical form of an own change: the base branch it is against and, in path order, the path, status, previous path, blob id and patch of every file."""
+    canonical = json.dumps({"base": base, "files": [[f["path"], f["status"], f["previous"], f["sha"], f["patch"]] for f in files]}, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def own_change_fingerprint(get, repo, number):
     """(fingerprint, head, file count): the ONE function the clear and the carry both use. CarryVoid when the change cannot be read in full."""
-    files, head = own_change(get, repo, number)
-    return fingerprint_of(files), head, len(files)
+    files, head, base = own_change(get, repo, number)
+    return fingerprint_of(files, base), head, len(files)
 
 
 def commits_between(get, repo, cleared, new):
@@ -154,6 +167,15 @@ def check_merge(get, repo, merge):
         raise CarryVoid("merge %s changed %s relative to both parents: a conflict was resolved or both sides changed it" % (merge["sha"][:8], ", ".join(both[:3])))
 
 
+def check_main_side(get, repo, base, merge):
+    """Void unless the second parent of the merge is on the base branch (an ancestor of its tip): a merge of main brings in only what main already has, never a side branch the pull
+    request's author made (a mode change, which no file list shows, could ride on one)."""
+    second = merge["parents"][1]
+    answer = _object(get, "repos/%s/compare/%s...%s" % (repo, base, second), "the comparison of main with a merged parent")
+    if answer.get("status") not in ("behind", "identical"):
+        raise CarryVoid("merge %s brings in %s, which is not on %s: only a merge of the base branch is carried" % (merge["sha"][:8], second[:8], base))
+
+
 def merge_chain(commits, cleared, new):
     """The merge commits from `new` back to `cleared` along FIRST parents, newest first. `commits` is everything between the heads (the main-side commits a merge brings in are in
     the list too, and are not the pull request's own). Void when a step on that line is not a merge of two parents (a commit of the pull request's own) or when the line does
@@ -181,13 +203,15 @@ def decide(get, repo, number, cleared_head, cleared_fingerprint, new_head):
             raise CarryVoid("no fingerprint was recorded with the clear")
         if cleared_head == new_head:
             raise CarryVoid("the head did not move")
-        now_head, _ = pull_head(get, repo, number)
+        now_head, pull = pull_head(get, repo, number)
         if now_head != new_head:
             raise CarryVoid("the head moved while it was being read")
+        base = base_ref_of(pull)
         commits = commits_between(get, repo, cleared_head, new_head)
         if not commits:
             raise CarryVoid("no commit lies between the two heads")
         for merge in merge_chain(commits, cleared_head, new_head):
+            check_main_side(get, repo, base, merge)
             check_merge(get, repo, merge)
         fingerprint, head, _ = own_change_fingerprint(get, repo, number)
         verdict["fingerprint"] = fingerprint

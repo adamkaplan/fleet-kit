@@ -18345,7 +18345,7 @@ def cmd_impact_clear(args, runner, now):
         except (ImpactStateBusy, RuntimeError) as err:
             sys.stderr.write("%s: impact clear --revoke: %s; nothing was changed\n" % (PROG, _one_line(str(err), 200)))
             return EXIT_ERROR
-        print("revoked the owner's clear of %s%s: the daemon holds it again at its next pass, and nothing carries" % (pr, " (and its carry)" if carried else "") if had else "%s has no clear to revoke" % pr)
+        print("revoked the owner's clear of %s%s: the daemon holds it again at its next pass, and nothing carries" % (pr, " (and its carry)" if carried else "") if (had or carried) else "%s has no clear to revoke" % pr)
         return EXIT_OK
     try:
         for line in impact_clear_core(engine, runner, repo, number, kind[1], plan_ledger.clip(redact_command_text(reason), 300)):
@@ -18681,7 +18681,7 @@ def gates_carried_note(report, ctx):
     """The gate row of a PR whose owner's clear CARRIED to its current head says so (G6 `carried from <head>`), and the report gains `carried`. Reads the local state file only."""
     try:
         carried = (read_impact_state(ctx.state)[0].get("carried") or {}).get(ctx.pr)
-        if not isinstance(carried, dict) or carried.get("head") != report.get("head"):
+        if not isinstance(carried, dict) or carried.get("head") != report.get("head") or not impact_floor.carry_enabled(ctx.config, ctx.pr.rsplit("#", 1)[0]):
             return
         for row in report["gates"]:
             if row["gate"] == "G6" and row["status"] == "ok":

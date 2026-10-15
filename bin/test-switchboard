@@ -12571,7 +12571,7 @@ class GitHubOverGit:
         if self.fail and self.fail in path:
             raise RuntimeError("HTTP 502 for %s" % path)
         head = self.rev(self.branch)
-        key = (path, head, self.changed_files_override)   # a git repository is immutable by sha: the same question at the same tip has the same answer
+        key = (path, head, self.base, self.changed_files_override)   # a git repository is immutable by sha: the same question at the same tip has the same answer
         self.answers = getattr(self, "answers", {})
         if key not in self.answers:
             self.answers[key] = self._answer(path, head)
@@ -12590,9 +12590,9 @@ class GitHubOverGit:
             return self.page(self.files_between(self.base, head), query)
         if tail.startswith("compare/"):
             a, b = tail[len("compare/"):].split("...")
-            if a == b:
+            if self.rev(a) == self.rev(b):
                 status = "identical"
-            elif self.git("merge-base", "--is-ancestor", a, b, check=False) == "" and subprocess.run(["git", "-C", self.dir, "merge-base", "--is-ancestor", a, b]).returncode == 0:
+            elif subprocess.run(["git", "-C", self.dir, "merge-base", "--is-ancestor", a, b]).returncode == 0:
                 status = "ahead"
             elif subprocess.run(["git", "-C", self.dir, "merge-base", "--is-ancestor", b, a]).returncode == 0:
                 status = "behind"
@@ -12776,6 +12776,36 @@ class TestClearCarry(unittest.TestCase):
         self.assertEqual((verdict["carried"], verdict["reason"]), (False, "no fingerprint was recorded with the clear"))
         self.assertFalse(self.cc.decide(self.api.get, self.REPO, 7, self.cleared, "not-a-hash", new)["carried"])
 
+    def test_a_merge_of_a_side_branch_a_retargeted_base_and_a_head_that_moves_mid_read_all_void(self):
+        g = self.api.git
+        g("checkout", "-q", "-b", "side", self.cleared)
+        self.write("side.txt", "side\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "side")
+        g("checkout", "-q", "feature")
+        g("merge", "-q", "--no-ff", "--no-edit", "side")
+        verdict = self.decide(self.api.rev("feature"))
+        self.assertFalse(verdict["carried"])
+        self.assertIn("not on main", verdict["reason"])
+        g("checkout", "-q", "-B", "feature", self.cleared)
+        self.main_moves("m1.txt")
+        new = self.merge_main()
+        self.assertTrue(self.decide(new)["carried"])
+        g("branch", "release", self.cleared)
+        self.api.base = "release"
+        self.assertFalse(self.decide(new)["carried"], "a retargeted base is a different change")
+        self.api.base = "main"
+        calls = {"n": 0}
+        real = self.cc.pull_head
+
+        def moving(get, repo, number):
+            calls["n"] += 1
+            head, pull = real(get, repo, number)
+            return (head if calls["n"] == 1 else "0" * 40), pull
+        self.cc.pull_head = moving
+        self.addCleanup(setattr, self.cc, "pull_head", real)
+        self.assertFalse(self.decide(new)["carried"])
+
     def test_s6_successive_merges_are_each_compared_with_the_original_and_an_own_change_makes_the_next_void(self):
         g = self.api.git
         carried = []
@@ -12814,7 +12844,7 @@ class TestClearCarry(unittest.TestCase):
         g("mv", "src/x.py", "src/y.py")
         g("commit", "-q", "-m", "rename")
         cleared = self.api.rev("feature")
-        files, _ = self.cc.own_change(self.api.get, self.REPO, 7)
+        files, _, _ = self.cc.own_change(self.api.get, self.REPO, 7)
         self.assertEqual([(f["path"], f["status"], f["previous"]) for f in files], [("src/y.py", "renamed", "src/x.py")])
         fp = self.fingerprint()
         self.main_moves("m1.txt")
@@ -12946,12 +12976,12 @@ class TestClearCarryInTheDaemon(Base):
             self.assertEqual(self.hold(new), 0)
         self.assertEqual((len(self.events("gate.clear_carried")), self.api_gets), (1, gets), "decided once per new head: one audit line and no repeated reads")
         report = {"gates": [{"gate": "G6", "status": "ok", "detail": "not a held PR"}], "head": new}
-        sb.gates_carried_note(report, types.SimpleNamespace(state=self.world.state, pr=self.PR))
+        sb.gates_carried_note(report, types.SimpleNamespace(state=self.world.state, pr=self.PR, config=self.engine.config))
         self.assertIn("carried to this head", report["gates"][0]["detail"])
         self.assertIn(cleared[:8], report["gates"][0]["detail"])
         self.assertEqual(report["carried"]["from"], cleared)
         other = {"gates": [{"gate": "G6", "status": "ok", "detail": "not a held PR"}], "head": "b" * 40}
-        sb.gates_carried_note(other, types.SimpleNamespace(state=self.world.state, pr=self.PR))
+        sb.gates_carried_note(other, types.SimpleNamespace(state=self.world.state, pr=self.PR, config=self.engine.config))
         self.assertEqual(other["gates"][0]["detail"], "not a held PR", "only the carried head says carried")
 
     def test_a_commit_of_its_own_voids_the_clear_the_hold_is_written_and_the_void_is_audited_once_with_the_reason(self):
@@ -12988,6 +13018,18 @@ class TestClearCarryInTheDaemon(Base):
         self.assertFalse(sb.impact_floor.carry_enabled({"impact_hold": {"enabled": False, "carry_clear": True}}, self.REPO), "no carry without an enforced hold")
         with self.assertRaises(sb.ConfigError):
             sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "impact_hold": {"enabled": True, "carry_clear": "yes"}})
+
+    def test_an_unreadable_state_file_is_said_in_the_gate_report_not_swallowed(self):
+        real = sb.read_impact_state
+
+        def broken(*args, **kwargs):
+            raise OSError("disk gone")
+        sb.read_impact_state = broken
+        self.addCleanup(setattr, sb, "read_impact_state", real)
+        report = {"gates": [{"gate": "G6", "status": "ok", "detail": "not a held PR"}], "head": "a" * 40}
+        sb.gates_carried_note(report, types.SimpleNamespace(state=self.world.state, pr=self.PR, config=self.engine.config))
+        self.assertIn("OSError", report["carried_error"])
+        self.assertEqual(report["gates"][0]["detail"], "not a held PR")
 
     def test_u2_the_owner_removes_a_carried_clear_the_pr_is_held_again_and_the_carry_does_not_return(self):
         self.clear()
@@ -13033,7 +13075,7 @@ class TestClearCarryInTheDaemon(Base):
         self.assertIn("gates_carried_note(report, ctx)", ast.get_source_segment(main, fn))
         report = {"gates": [{"gate": "G6", "status": "ok", "detail": "not a held PR"}], "head": "a" * 40}
         (Path(self.world.state) / sb.IMPACT_STATE_FILE).write_text(json.dumps({"clears": {}, "applied": {}, "carried": {self.PR: "not an object"}}))
-        sb.gates_carried_note(report, types.SimpleNamespace(state=self.world.state, pr=self.PR))
+        sb.gates_carried_note(report, types.SimpleNamespace(state=self.world.state, pr=self.PR, config=self.engine.config))
         self.assertEqual(report["gates"][0]["detail"], "not a held PR")
 
     def test_a_new_clear_after_a_carry_starts_again_from_its_own_head(self):
