@@ -261,7 +261,8 @@ def narrow_rule(matrix):
     """(globs, keys, max_files) of the matrix file's `owner_hold.narrow_by_diff` block, or None when it is absent or malformed (then the whole
     top tier path holds, as it did before). The block names the paths whose hold depends on their CONTENT (an agent definition: only its permission
     block counts), the top level front matter keys that make that block, and how many such files one pull request may change before it holds."""
-    block = ((matrix or {}).get("owner_hold") or {}).get("narrow_by_diff") if isinstance(matrix, dict) else None
+    hold = matrix.get("owner_hold") if isinstance(matrix, dict) else None
+    block = hold.get("narrow_by_diff") if isinstance(hold, dict) else None
     if not isinstance(block, dict):
         return None
     globs, keys, limit = block.get("paths"), block.get("keys"), block.get("max_files")
