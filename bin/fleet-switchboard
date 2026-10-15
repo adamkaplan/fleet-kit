@@ -2512,10 +2512,61 @@ def docker_reap(docker, runner, now, apply, audit=None, actor="daemon"):
     return result
 
 
+def _docker_problem(name):
+    """(path, None) for a docker binary the disk tools may run, else (None, one line saying why not). The tools take `--docker` from a person, so the
+    value is NOT trusted to be a docker: its basename must be exactly `docker` and so must the basename of a symlink's target (or Docker Desktop's
+    `com.docker.cli`); it must be a regular executable file owned by this user or root; neither it nor any directory above it may be writable by group
+    or other (a sticky directory such as /tmp excepted); a bare name is resolved from PATH. The path RETURNED is the vetted real path, so the file run is
+    the file checked. Anything else is refused."""
+    if not isinstance(name, str) or not name or "\x00" in name or name.startswith("-"):
+        return None, "is not a usable executable name"
+    path = name if os.sep in name else shutil.which(name)
+    if path is None or not os.path.exists(path):
+        return None, "not installed or not on PATH"
+    if not os.path.isabs(path):
+        return None, "must be an absolute path (or a bare name on PATH)"
+    real = os.path.realpath(path)
+    if os.path.basename(path) != "docker" or os.path.basename(real) not in ("docker", "com.docker.cli"):
+        return None, "is not a docker binary: its name (and the name a link points to) must be exactly `docker`"
+    try:
+        info = os.stat(real)
+        if not stat.S_ISREG(info.st_mode) or not os.access(real, os.X_OK):
+            return None, "is not an executable file"
+        if info.st_uid not in (0, os.getuid()):
+            return None, "belongs to another user: not trusted"
+        if info.st_mode & 0o022:
+            return None, "is writable by group or other: not trusted"
+        here, first = os.path.dirname(real), True
+        while True:
+            at = os.stat(here)
+            mode = at.st_mode
+            if at.st_uid not in (0, os.getuid()):
+                return None, "sits in a directory (%s) that others can change (another user owns it): not trusted; pass the absolute path of a docker kept in a directory only you or root can write" % _plain(here, 80)
+            if not mode & 0o1000:   # a sticky directory (/tmp) lets nobody replace another's file
+                # the file's own directory must be closed to group and other; an ancestor only to OTHER, or to a group when it is not root's (a root-owned
+                # group-writable /Applications or /usr/local, where a standard Docker install lives, is the operating system's own)
+                if (first and mode & 0o022) or mode & 0o002 or (mode & 0o020 and at.st_uid not in (0,)):
+                    return None, "sits in a directory (%s) that others can change: not trusted; pass the absolute path of a docker kept in a directory only you or root can write" % _plain(here, 80)
+            first = False
+            parent = os.path.dirname(here)
+            if parent == here:
+                break
+            here = parent
+    except OSError:
+        return None, "cannot be read"
+    return real, None
+
+
 def _docker_executable(name):
-    if os.sep in name:
-        return name if os.access(name, os.X_OK) else None
-    return shutil.which(name)
+    return _docker_problem(name)[0]
+
+
+def _docker_message(name):
+    """The one refusal line for a `--docker` value that is not a usable docker."""
+    why = _docker_problem(name)[1] or "not usable"
+    if why.startswith("not installed"):
+        return "docker is not installed or not on PATH (%s)" % _plain(name, 160)
+    return "refused: %s %s" % (_plain(name, 120), why)
 
 
 class DockerReapFacts:
@@ -7302,8 +7353,10 @@ def cmd_whoami(args, runner, now):
     if getattr(args, "json", False):
         fleet = caller_fleet(engine.herdr, engine.v2, os.environ)
         repo = fleet.get("repo") if isinstance(fleet.get("repo"), str) else None
-        print(json.dumps({"name": fleet["name"], "repo": repo or _fleet_repo(fleet, config) or config.get("intent_repo") or None},
-                         sort_keys=True))
+        own = repo or _fleet_repo(fleet, config)
+        # `own` is false when the repo is only the config's `intent_repo` default: an agent with no repo of its own (the Chief of Staff) has no account of
+        # its own to keep, so the gh shim may use the account of the repo a command names
+        print(json.dumps({"name": fleet["name"], "repo": own or config.get("intent_repo") or None, "own": bool(own)}, sort_keys=True))
         return EXIT_OK
     if getattr(args, "repo", False):
         fleet = caller_fleet(engine.herdr, engine.v2, os.environ)
@@ -19513,7 +19566,7 @@ def cmd_disk_reap_docker(args, runner, now):
     """`disk reap-docker [--apply]`: list (the default) or remove the expired labelled docker objects."""
     docker = _docker_executable(args.docker)
     if docker is None:
-        sys.stderr.write("%s: disk reap-docker: docker is not installed or not on PATH (%s): nothing was run\n" % (PROG, _plain(args.docker, 160)))
+        sys.stderr.write("%s: disk reap-docker: %s: nothing was run\n" % (PROG, _docker_message(args.docker)))
         return EXIT_USAGE
     apply = bool(args.apply)
     if apply and not load_config().get("docker_reaper", True):
@@ -19537,9 +19590,9 @@ cmd_disk_reap_docker.direct = True
 
 def cmd_disk_prune(args, runner, now):
     """`disk prune [--dry-run]`."""
-    docker = shutil.which(args.docker) if os.sep not in args.docker else (args.docker if os.access(args.docker, os.X_OK) else None)
+    docker = _docker_executable(args.docker)
     if docker is None:
-        sys.stderr.write("%s: disk prune: docker is not installed or not on PATH (%s): nothing was run\n" % (PROG, _plain(args.docker, 160)))
+        sys.stderr.write("%s: disk prune: %s: nothing was run\n" % (PROG, _docker_message(args.docker)))
         return EXIT_USAGE
     commands = [(docker,) + argv[1:] for argv in DISK_PRUNE_COMMANDS]
     if args.dry_run:
@@ -19648,7 +19701,8 @@ def disk_report(args, runner, now, out=print):
     lines.append("docker")
     docker = _docker_executable(args.docker)
     if docker is None:
-        lines.append("  docker: not installed or not on PATH (%s)" % _plain(args.docker, 120))
+        why = _docker_problem(args.docker)[1]
+        lines.append("  docker: %s (%s)" % (why if why.startswith("not installed") else "refused: " + why, _plain(args.docker, 100)))
     else:
         try:
             done = runner([docker, "system", "df"], capture_output=True, text=True, timeout=DOCKER_REAP_TIMEOUT, stdin=subprocess.DEVNULL)
@@ -19870,19 +19924,19 @@ def add_heavy_parsers(sub):
 
 
 def add_disk_parsers(sub):
-    disk = sub.add_parser("disk", help="Disk tools: `disk report` (a bare `disk`) shows what holds the disk, read only; `disk prune` removes old docker build cache and images (never volumes or running containers); `disk reclaim-worktrees` removes the clean, pushed worktrees of retired agents")
+    disk = sub.add_parser("disk", allow_abbrev=False, help="Disk tools: `disk report` (a bare `disk`) shows what holds the disk, read only; `disk prune` removes old docker build cache and images (never volumes or running containers); `disk reclaim-worktrees` removes the clean, pushed worktrees of retired agents")
     disk_sub = disk.add_subparsers(dest="disk_action", required=False)
     disk.add_argument("--docker", default="docker", help="The docker executable the bare `disk` report asks (default: docker on PATH)")
-    report = disk_sub.add_parser("report", help="what holds the disk: free space, docker usage, worktrees per agent, cache sizes, orphan candidates (read only; also a bare `disk`)")
+    report = disk_sub.add_parser("report", allow_abbrev=False, help="what holds the disk: free space, docker usage, worktrees per agent, cache sizes, orphan candidates (read only; also a bare `disk`)")
     report.add_argument("--docker", default=argparse.SUPPRESS, help="The docker executable (default: docker on PATH)")
-    prune = disk_sub.add_parser("prune", help="docker builder prune, docker image prune -a (older than a week) and, on docker 23.0 or newer, docker volume prune -f (anonymous volumes only), and nothing else",
+    prune = disk_sub.add_parser("prune", allow_abbrev=False, help="docker builder prune, docker image prune -a (older than a week) and, on docker 23.0 or newer, docker volume prune -f (anonymous volumes only), and nothing else",
                                 description="Runs exactly `docker builder prune -f --filter until=168h` and `docker image prune -a -f --filter until=168h` and prints what "
                                             "was reclaimed, then (only when the docker server is 23.0 or newer, where it removes ANONYMOUS volumes no container references and nothing named) "
                                             "`docker volume prune -f`, never `-a`. Never a running container, never `system prune`. Refuses without docker. NOTE: "
                                             "`until=168h` is the image's age, not its last use: a locally built image with no registry copy is removed too if no "
                                             "container uses it.")
     prune.add_argument("--dry-run", action="store_true", help="Print the commands and the candidate anonymous volumes and run none of them")
-    reap = disk_sub.add_parser("reap-docker", help="remove EXPIRED docker containers, networks and volumes that carry fleet.owner and fleet.expires labels",
+    reap = disk_sub.add_parser("reap-docker", allow_abbrev=False, help="remove EXPIRED docker containers, networks and volumes that carry fleet.owner and fleet.expires labels",
                                description="Lists (the default) or, with --apply, removes docker containers (`rm -f`), networks and volumes that carry BOTH labels "
                                            "`fleet.owner=<agent>` and `fleet.expires=<epoch seconds>` and whose expiry has passed. Never an unlabelled object, a live "
                                            "one, or a volume a running container mounts; no `system prune`, no sudo. The daemon applies this daily unless the config "
@@ -19890,16 +19944,16 @@ def add_disk_parsers(sub):
     reap.add_argument("--apply", action="store_true", help="Remove them (the default only lists)")
     reap.add_argument("--docker", default=argparse.SUPPRESS, help="The docker executable (default: docker on PATH)")
     prune.add_argument("--docker", default=argparse.SUPPRESS, help="The docker executable (default: docker on PATH)")
-    janitor = disk_sub.add_parser("janitor", help="remove old, unnamed entries of the opencode temp directory (a dry run unless --apply)",
+    janitor = disk_sub.add_parser("janitor", allow_abbrev=False, help="remove old, unnamed entries of the opencode temp directory (a dry run unless --apply)",
                                   description="Lists (the default) or, with --apply, removes the top-level entries of the temp directory whose newest file is older than "
                                               "temp_janitor.days (default 7) and that no state file of the fleet names, no keep glob matches and no .fleet-keep marker "
                                               "protects. Never follows a link, never touches another user's entry. Each removal is one temp.removed audit line.")
     janitor.add_argument("--apply", action="store_true", help="Remove them (the default only lists)")
-    orphans = disk_sub.add_parser("reap-orphans", help="Signal (SIGTERM, then SIGKILL) orphaned test helpers past the grace: parent launchd, an exact allow-list; a dry run unless --apply")
+    orphans = disk_sub.add_parser("reap-orphans", allow_abbrev=False, help="Signal (SIGTERM, then SIGKILL) orphaned test helpers past the grace: parent launchd, an exact allow-list; a dry run unless --apply")
     orphans.add_argument("--apply", action="store_true", help="Do it (default: a dry run)")
-    reclaim = disk_sub.add_parser("reclaim-worktrees", help="Remove the registered worktrees of retired agents when clean and pushed; else keep and say why (a dry run unless --apply)")
+    reclaim = disk_sub.add_parser("reclaim-worktrees", allow_abbrev=False, help="Remove the registered worktrees of retired agents when clean and pushed; else keep and say why (a dry run unless --apply)")
     reclaim.add_argument("--apply", action="store_true", help="Do it (default: a dry run)")
-    register = disk_sub.add_parser("register-worktree", help="Record a linked worktree for an agent (launch records its own)")
+    register = disk_sub.add_parser("register-worktree", allow_abbrev=False, help="Record a linked worktree for an agent (launch records its own)")
     register.add_argument("path", help="The worktree's directory")
     register.add_argument("--agent", required=True, help="The agent it belongs to")
     register.add_argument("--repo", help="OWNER/REPO (optional)")
