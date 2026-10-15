@@ -15981,11 +15981,9 @@ class TestGitStashGuard(Base):
         self.assertEqual(ok.returncode, 0, ok.stderr)
 
     def test_a_check_that_itself_breaks_refuses_stash_words_and_never_blocks_other_commands(self):
-        sys.path.insert(0, str(GIT_SHIM.parent))
-        try:
-            import stash_guard
-        finally:
-            sys.path.remove(str(GIT_SHIM.parent))
+        spec = importlib.util.spec_from_file_location("stash_guard_under_test", str(GIT_SHIM.parent / "stash_guard.py"))
+        stash_guard = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(stash_guard)
         original = stash_guard.judge
         def boom(*a, **k):
             raise RuntimeError("bug")
