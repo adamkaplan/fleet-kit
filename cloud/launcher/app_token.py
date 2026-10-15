@@ -26,20 +26,18 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import token_mint  # noqa: E402
+
 API = "https://api.github.com"
 MAX_TOKEN_SECONDS = 61 * 60
 MAX_BYTES = 1_000_000  # the most of any GitHub answer or vault command output that is read
 EXPECTED_PERMISSIONS = {"contents": "write", "pull_requests": "write", "metadata": "read"}
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
-        return None  # a redirect would re-send Authorization to another host: it is refused, as an HTTP error
-
-
 def open_url(req, timeout=30):
-    """urlopen that never follows a redirect."""
-    return urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout)
+    """The one opener of the cloud programs (token_mint's): it never follows a redirect, so Authorization stays put."""
+    return token_mint.open_no_redirect(req, timeout)
 
 
 def valid_target(t):
@@ -50,7 +48,7 @@ def valid_target(t):
 
 def http_error_text(code):
     if 300 <= code < 400:
-        return "refusing: GitHub answered with a redirect (HTTP %d); redirects are never followed" % code
+        return "refusing: GitHub answered with a redirect (HTTP %d); a redirect is never followed" % code
     return "GitHub refused the request (HTTP %d)" % code
 
 

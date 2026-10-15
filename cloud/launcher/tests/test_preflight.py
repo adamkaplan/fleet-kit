@@ -19,6 +19,11 @@ FULL = ["pull_request", "non_fast_forward", "deletion"]
 class Stub(http.server.BaseHTTPRequestHandler):
     rules = []
     protected = False
+    review_count = 1
+    enforcement = "active"
+    include = ["~DEFAULT_BRANCH"]
+    conditions = "ok"  # "ok" uses include; None answers a ruleset without conditions
+    redirect_code = 302
     redirect = None  # a Location to answer every GET with, as a 302
     fail = None  # a path suffix that answers 500, or "badjson"
     methods = []
@@ -36,7 +41,7 @@ class Stub(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         Stub.methods.append("GET")
         if Stub.redirect:
-            self.send_response(302)
+            self.send_response(Stub.redirect_code)
             self.send_header("Location", Stub.redirect)
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -51,7 +56,16 @@ class Stub(http.server.BaseHTTPRequestHandler):
         if path == "/repos/" + REPO:
             return self.reply(200, {"default_branch": "main"})
         if path == "/repos/%s/rules/branches/main" % REPO:
-            return self.reply(200, [{"type": t} for t in Stub.rules])
+            out = []
+            for x in Stub.rules:
+                r = {"type": x, "ruleset_id": 7, "ruleset_source_type": "Repository", "ruleset_source": REPO}
+                if x == "pull_request":
+                    r["parameters"] = {"required_approving_review_count": Stub.review_count}
+                out.append(r)
+            return self.reply(200, out)
+        if path == "/repos/%s/rulesets/7" % REPO:
+            cond = {"ref_name": {"include": Stub.include, "exclude": []}} if Stub.conditions == "ok" else None
+            return self.reply(200, {"id": 7, "target": "branch", "enforcement": Stub.enforcement, "conditions": cond})
         if path == "/repos/%s/branches/main" % REPO:
             return self.reply(200, {"name": "main", "protected": Stub.protected})
         self.reply(404, {})
@@ -93,6 +107,7 @@ class Preflight(unittest.TestCase):
 
     def setUp(self):
         Stub.rules, Stub.protected, Stub.fail, Stub.methods, Stub.redirect = list(FULL), False, None, [], None
+        Stub.review_count, Stub.enforcement, Stub.include, Stub.conditions = 1, "active", ["~DEFAULT_BRANCH"], "ok"
         Other.seen = []
 
     def run_pf(self, *args, **env):
@@ -123,6 +138,38 @@ class Preflight(unittest.TestCase):
             self.assertIn("missing a " + named, p.stdout)
             self.assertNotIn("preflight ok", p.stdout)
 
+    def test_the_review_count_must_be_at_least_one_unless_there_is_a_merge_queue(self):
+        Stub.review_count = 0
+        p = self.run_pf()
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("required approving reviews", p.stdout)
+        Stub.rules = ["merge_queue", "pull_request", "non_fast_forward", "deletion"]
+        self.assertEqual(self.run_pf().returncode, 0)  # the queue stands in for reviews
+        Stub.rules, Stub.review_count = list(FULL), 2
+        self.assertEqual(self.run_pf().returncode, 0)
+
+    def test_a_ruleset_that_is_not_enforced_or_does_not_cover_the_branch_is_refused(self):
+        for enf in ("evaluate", "disabled"):
+            Stub.enforcement = enf
+            p = self.run_pf()
+            self.assertEqual(p.returncode, 1, enf)
+            self.assertIn("not enforced (enforcement is '%s')" % enf, p.stdout)
+        Stub.enforcement = "active"
+        for inc in (["refs/heads/release/*"], ["refs/heads/dev"], []):
+            Stub.include = inc
+            p = self.run_pf()
+            self.assertEqual(p.returncode, 1, inc)
+            self.assertIn("does not cover the branch", p.stdout)
+        for inc in (["~ALL"], ["refs/heads/main"], ["refs/heads/m*"], ["refs/heads/**"]):
+            Stub.include = inc
+            self.assertEqual(self.run_pf().returncode, 0, inc)
+
+    def test_an_odd_or_unreadable_ruleset_fails_closed_with_exit_2(self):
+        Stub.conditions = None
+        self.assertEqual(self.run_pf().returncode, 2)
+        Stub.conditions, Stub.fail = "ok", "/rulesets/7"
+        self.assertEqual(self.run_pf().returncode, 2)
+
     def test_classic_only_fails_closed_unless_accepted(self):
         Stub.rules, Stub.protected = ["non_fast_forward", "deletion"], True
         p = self.run_pf()
@@ -144,13 +191,19 @@ class Preflight(unittest.TestCase):
             Stub.rules, Stub.protected, Stub.fail = ["non_fast_forward", "deletion"], True, fail
             self.assertEqual(self.run_pf("--accept-classic").returncode, 2, fail)
 
-    def test_a_redirect_is_never_followed_and_sends_nothing_elsewhere(self):
-        Stub.redirect = "http://127.0.0.1:%d/leak" % self.other.server_port
-        p = self.run_pf()
-        self.assertEqual(p.returncode, 2)
-        self.assertIn("redirect", p.stdout)
-        self.assertEqual(Other.seen, [])
-        Stub.redirect = None
+    def test_no_redirect_is_followed_whatever_its_status_or_target(self):
+        for code in (301, 302, 307, 308):
+            for target in ("http://127.0.0.1:%d/leak" % self.other.server_port,  # another host (port)
+                           "http://127.0.0.1:%d/leak" % self.srv.server_port,  # the same host
+                           "/leak"):  # relative
+                Stub.redirect, Stub.redirect_code, Stub.methods = target, code, []
+                p = self.run_pf()
+                self.assertEqual(p.returncode, 2, (code, target))
+                self.assertIn("HTTP %d" % code, p.stdout)
+                self.assertIn("redirect", p.stdout)
+                self.assertNotIn(TOKEN, p.stdout + p.stderr)
+                self.assertEqual(Other.seen, [])
+                self.assertEqual(len(Stub.methods), 1, "only the first request was made")
 
     def test_bad_targets_are_refused(self):
         for bad in ("a/..", "../b", ".", "a/b/c", "a/", "/b", "a/./b"):

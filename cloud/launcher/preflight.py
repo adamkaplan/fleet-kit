@@ -9,8 +9,12 @@ Reads with GET only (https://api.github.com; CW_GITHUB_API_BASE may name a loopb
   /repos/{o}/{r}/branches/{b}          the `protected` flag
 The token comes from app_token.py, or from the command CW_PREFLIGHT_TOKEN_CMD when set (tests).
 
-PASS (exit 0, "preflight ok: <rule names>") only when the branch has a rule of type pull_request or merge_queue (a
-direct push is refused by the rule) AND non_fast_forward (no force-push) AND deletion.
+PASS (exit 0, "preflight ok: <rule names>") only when the branch has, from rulesets that are `active` and cover it,
+a pull_request rule with required_approving_review_count of at least 1 (only the count; dismiss-stale and code-owner
+flags are not required) OR a merge_queue rule (a direct push is refused), AND non_fast_forward (no force-push) AND
+deletion. A ruleset whose enforcement is `evaluate` or `disabled` is "not enforced" and a ruleset whose conditions do
+not cover the branch is refused, each by name (see judge() for how the branch rules answer is used and checked).
+A redirect is never followed (exit 2, the status is named).
 FAIL (exit 1), one line per missing rule, naming it. A branch protected only by classic branch protection also
 fails: a read-only token cannot see its review requirement. --accept-classic is the explicit, owner-approved override,
 and it overrides ONLY that one failure (the pull_request/merge_queue rule missing, on a branch GitHub reports as
@@ -22,6 +26,7 @@ What this CANNOT see: bypass actors (who may skip a rule), and whether a rule is
 identity. The live refusal check (a real push, force-push and delete attempted on a disposable repository, S4) is the
 real proof; this is only the cheap guard before a worker is launched.
 """
+import fnmatch
 import json
 import os
 import re
@@ -79,6 +84,64 @@ def get_token(target):
     return p.stdout.strip()
 
 
+def covers(conditions, branch, default_branch):
+    """True when a ruleset's ref_name conditions cover refs/heads/<branch>; None when they cannot be read."""
+    ref = conditions.get("ref_name") if isinstance(conditions, dict) else None
+    if not isinstance(ref, dict) or not isinstance(ref.get("include"), list) or not isinstance(ref.get("exclude", []), list):
+        return None
+    full = "refs/heads/" + branch
+
+    def hit(pat):
+        if pat == "~ALL":
+            return True
+        if pat == "~DEFAULT_BRANCH":
+            return branch == default_branch
+        return isinstance(pat, str) and fnmatch.fnmatchcase(full, pat.replace("**", "*"))
+    return any(hit(x) for x in ref["include"]) and not any(hit(x) for x in ref.get("exclude", []))
+
+
+def judge(rules, branch, default_branch, fetch):
+    """Keep only the rules of rulesets that are active and cover the branch. Returns (problems, kept rules), or
+    (problems, None) when a ruleset cannot be read.
+
+    The branch rules endpoint returns only rules that apply to the branch. We rely on that and do not trust it alone:
+    every rule must name its ruleset (ruleset_id, ruleset_source_type, ruleset_source), and each ruleset is fetched
+    once (GET only, bounded) to read its `enforcement` (must be `active`: `evaluate` and `disabled` are not enforced)
+    and its `conditions` (must cover the branch). Anything odd fails closed."""
+    problems, kept, verdict = [], [], {}
+    for r in rules:
+        if not isinstance(r, dict) or not isinstance(r.get("type"), str):
+            say("cannot read: a rule has no type")
+            return problems, None
+        rid, st, src = r.get("ruleset_id"), r.get("ruleset_source_type"), r.get("ruleset_source")
+        if isinstance(rid, bool) or not isinstance(rid, int) or st not in ("Repository", "Organization") \
+                or not isinstance(src, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)?", src) \
+                or any(x in (".", "..") for x in src.split("/")):
+            say("cannot read: a %s rule does not name its ruleset" % r["type"][:40])
+            return problems, None
+        key = (st, src, rid)
+        if key not in verdict:
+            path = ("/repos/%s/rulesets/%d" if st == "Repository" else "/orgs/%s/rulesets/%d") % (src, rid)
+            try:
+                rs = fetch(path)
+            except Unreadable as e:
+                say("cannot read: %s" % e)
+                return problems, None
+            enf = rs.get("enforcement") if isinstance(rs, dict) else None
+            cov = covers(rs.get("conditions"), branch, default_branch) if isinstance(rs, dict) else None
+            if enf not in ("active", "evaluate", "disabled") or cov is None or (isinstance(rs, dict) and rs.get("target") != "branch"):
+                say("cannot read: ruleset %d has an unreadable enforcement, target or conditions" % rid)
+                return problems, None
+            if enf != "active":
+                problems.append("ruleset %d is not enforced (enforcement is '%s')" % (rid, enf))
+            elif not cov:
+                problems.append("ruleset %d does not cover the branch" % rid)
+            verdict[key] = enf == "active" and cov
+        if verdict[key]:
+            kept.append(r)
+    return problems, kept
+
+
 def main(argv):
     accept = "--accept-classic" in argv
     argv = [a for a in argv if a != "--accept-classic"]
@@ -118,14 +181,29 @@ def main(argv):
     if len(rules) >= 100:
         say("cannot read: 100 or more rules apply; the answer may be paginated and is not read in full")
         return 2
-    types = {r.get("type") for r in rules if isinstance(r, dict)}
-    missing = [what for alts, what in NEED if not (types & set(alts.split("|")))]
-    if not missing:
+    problems, valid = judge(rules, branch, repo.get("default_branch"), lambda path: get(base, path, token))
+    if valid is None:
+        return 2
+    types = {r.get("type") for r in valid}
+    counts = [(r.get("parameters") or {}).get("required_approving_review_count") for r in valid
+              if r.get("type") == "pull_request"]
+    has_pr = "pull_request" in types
+    reviews_ok = "merge_queue" in types or any(isinstance(c, int) and not isinstance(c, bool) and c >= 1 for c in counts)
+    missing = []
+    if has_pr and not reviews_ok:
+        problems.append("the pull_request rule has no required approving reviews (required_approving_review_count must be "
+                        "at least 1, or use a merge_queue rule)")
+    if not has_pr and "merge_queue" not in types:
+        missing.append(NEED[0][1])
+    missing += [what for alts, what in NEED[1:] if not (types & set(alts.split("|")))]
+    if not missing and not problems:
         say("preflight ok: " + ", ".join(sorted(t for t in types if isinstance(t, str))))
         return 0
     for m in missing:
         say("FAIL on %s: missing %s" % (branch, m))
-    only_review = len(missing) == 1 and missing[0] == NEED[0][1]
+    for m in problems:
+        say("FAIL on %s: %s" % (branch, m))
+    only_review = missing == [NEED[0][1]] and not problems and not has_pr
     if info.get("protected") is True:
         say("classic protection: review requirement not readable with this token; use a ruleset or confirm by hand "
             "and pass --accept-classic")

@@ -62,7 +62,7 @@ The private key travels only through a pipe to `openssl`; only `https://api.gith
 may name a loopback `http` address, for tests).
 
 **`preflight.py OWNER/REPO [--branch NAME] [--accept-classic]`** reads, with GET only, whether the default branch
-refuses direct pushes (a `pull_request` or `merge_queue` rule), force-pushes (`non_fast_forward`) and deletion
+refuses direct pushes (a `pull_request` rule that requires at least one approving review, or a `merge_queue` rule, in an active ruleset that covers the branch; `evaluate` and `disabled` rulesets and rulesets not covering the branch are refused by name), force-pushes (`non_fast_forward`) and deletion
 (`deletion`). Exit 0 prints `preflight ok: <rules>`; exit 1 names each missing rule; exit 2 means the answer could not
 be read. A branch protected only by classic branch protection fails closed (a read-only token cannot see its review
 requirement); `--accept-classic` is the explicit, owner-approved override and prints a warning. It overrides only that one failure (the review requirement on a branch GitHub reports as protected), never an unreadable answer, an unprotected branch, or a missing `non_fast_forward` or `deletion` rule. Redirects are never followed, and `OWNER/REPO` may not contain a `.` or `..` segment. It cannot see bypass

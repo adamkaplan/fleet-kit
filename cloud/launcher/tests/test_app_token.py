@@ -24,6 +24,7 @@ def iso(seconds):
 
 class Stub(http.server.BaseHTTPRequestHandler):
     answer = {}
+    redirect_code = 307
     redirect = None  # a Location to answer with as a 307 (it would re-send the POST and its Authorization)
     pad_to = None  # pad the JSON answer with trailing spaces to exactly this many bytes
     seen = []
@@ -35,7 +36,7 @@ class Stub(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
         Stub.seen.append((self.path, self.headers.get("Authorization", ""), json.loads(body)))
         if Stub.redirect:
-            self.send_response(307)
+            self.send_response(Stub.redirect_code)
             self.send_header("Location", Stub.redirect)
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -224,14 +225,20 @@ class Mint(unittest.TestCase):
         self.assertEqual(p.returncode, 2)
         self.assertIn("CW_VAULT_SUBSCRIPTION", p.stderr)
 
-    def test_a_redirect_is_refused_and_nothing_reaches_the_other_host(self):
-        for code_url in ("http://127.0.0.1:%d/leak" % self.other.server_port,):
-            Stub.redirect = code_url
-            p = self.run_mint()
-            self.assertNotEqual(p.returncode, 0)
-            self.assertEqual(p.stdout, "")
-            self.assertIn("redirect", p.stderr)
-            self.assertEqual(Other.seen, [])
+    def test_no_redirect_is_followed_whatever_its_status_or_target(self):
+        for code in (301, 302, 307, 308):
+            for target in ("http://127.0.0.1:%d/leak" % self.other.server_port,  # another host (port)
+                           "http://127.0.0.1:%d/leak" % self.srv.server_port,  # the same host
+                           "/leak"):  # relative
+                Stub.redirect, Stub.redirect_code, Stub.seen = target, code, []
+                p = self.run_mint()
+                self.assertNotEqual(p.returncode, 0, (code, target))
+                self.assertEqual(p.stdout, "")
+                self.assertIn("HTTP %d" % code, p.stderr)
+                self.assertIn("redirect", p.stderr)
+                self.assertNotIn(TOKEN, p.stderr)
+                self.assertEqual(Other.seen, [])
+                self.assertEqual(len(Stub.seen), 1, "only the first request was made")
 
     def test_bad_usage(self):
         self.assertEqual(self.run_mint("no-slash").returncode, 2)
