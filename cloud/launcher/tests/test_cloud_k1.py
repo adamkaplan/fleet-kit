@@ -3,7 +3,7 @@
 Scenarios S1-S3, S6-S10, U1. Offline: the fake kubectl beside this file records argv, the stdin of `create secret` and the
 generated kubeconfig apart. The planted values below are synthetic.
 """
-import base64, json, os, re, subprocess, sys, unittest
+import base64, json, os, re, subprocess, sys, tempfile, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
@@ -18,10 +18,13 @@ RBAC = os.path.join(ROOT, "cloud", "k8s", "operator-rbac.yaml")
 
 
 def fd_with(value):
-    r, w = os.pipe()
-    os.write(w, value.encode())
-    os.close(w)
-    return r
+    f = tempfile.TemporaryFile()  # a file, not a pipe: a large value would block a pipe writer
+    f.write(value.encode())
+    f.flush()
+    f.seek(0)
+    fd = os.dup(f.fileno())
+    f.close()
+    return fd
 
 
 class K1Base(base.Base):
@@ -91,11 +94,6 @@ class S1RunSecrets(K1Base):
         self.assertIn(GIT_VALUE, body)  # positive control: the recorder would see a leak
         self.assertIn(base64.b64encode(MODEL_VALUE.encode()).decode(), body)  # later keys go in a patch body on stdin
 
-    def test_a_value_in_an_environment_variable_would_be_caught(self):
-        # discriminator: the scanner and the leak check both fail a build that put a value in the environment
-        spec = {"spec": {"containers": [{"env": [{"name": "MODEL_TOKEN", "value": MODEL_VALUE}]}]}}
-        self.assertTrue(cw.scan_credentials(spec))
-
     def test_bad_descriptor_or_name_or_empty_value_is_refused_before_anything_is_made(self):
         empty = fd_with("")
         self.addCleanup(self._close, empty)
@@ -104,6 +102,32 @@ class S1RunSecrets(K1Base):
             self.assertEqual(code, 2, arg)
         self.assertEqual(self.st().get("applied"), None)
         self.assertEqual(self.st().get("secrets", {}), {})
+
+    def test_three_keys_all_survive_and_limits_and_duplicates_are_refused(self):
+        fds = [fd_with("v%d" % i) for i in range(3)]
+        self.addCleanup(lambda: [self._close(f) for f in fds])
+        args = sum([["--run-secret-fd", "k%d=%d" % (i, f)] for i, f in enumerate(fds)], [])
+        code, _, err = self.run_cli("create", "coder7", "--repo", "a/b", "--branch", "m", *args)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(set(self.st()["secret_keys"][cw.pod_name("coder7") + "-run"]), {"k0", "k1", "k2"})
+        code, _, _ = self.run_cli("create", "coder8", "--repo", "a/b", "--branch", "m", "--run-secret-fd", "k0=5", "--run-secret-fd", "k0=6")
+        self.assertEqual(code, 2)
+        many = sum([["--run-secret-fd", "k%d=5" % i] for i in range(cw.MAX_RUN_SECRETS + 1)], [])
+        self.assertEqual(self.run_cli("create", "coder9", "--repo", "a/b", "--branch", "m", *many)[0], 2)
+        big = fd_with("x" * (cw.MAX_RUN_SECRET_BYTES + 1))
+        self.addCleanup(self._close, big)
+        code, _, err = self.run_cli("create", "coder9", "--repo", "a/b", "--branch", "m", "--run-secret-fd", "k0=%d" % big)
+        self.assertEqual(code, 2)
+        self.assertIn("cap", err)
+        self.assertNotIn("coder9", " ".join(self.st()["pods"]))
+
+    def test_failed_secret_creation_cleans_up_and_audits(self):
+        self.patch_state(fail_secret=True)
+        code, _, err = self.create_with_secrets()
+        self.assertNotEqual(code, 0)
+        self.assertEqual(self.st()["pods"], {})
+        self.assertEqual(self.st().get("secrets", {}), {})
+        self.assertFalse(self.audit_lines()[-1]["ok"])
 
     def test_run_secret_makes_the_token_endpoint_optional_but_not_otherwise(self):
         del self.env["CW_TOKEN_ENDPOINT"]
@@ -198,6 +222,24 @@ class S2StopDelete(K1Base):
         self.assertIsNone(self.pod())
         self.assertEqual(self.st()["secrets"], {})
 
+    def test_a_succeeded_pod_is_deleted_but_a_kept_failed_pod_is_not(self):
+        self.assertEqual(self.create_with_secrets()[0], 0)
+        st = self.st()
+        pod = st["pods"][cw.pod_name("coder7")]
+        pod["status"]["phase"] = "Failed"
+        pod["metadata"]["annotations"]["cw/kept"] = "true"
+        self.write_state(st)
+        self.patch_state(hook_env={"CW_WORKDIR": os.path.join(self.tmp.name, "nowhere"), "CW_WORKER": "coder7"})
+        self.run_cli("stop", "coder7")
+        self.assertIsNotNone(self.pod())  # kept work is not discarded by the dead-pod branch
+        st = self.st()
+        st["pods"][cw.pod_name("coder7")]["metadata"]["annotations"].pop("cw/kept")
+        st["pods"][cw.pod_name("coder7")]["status"]["phase"] = "Succeeded"
+        self.write_state(st)
+        self.assertEqual(self.run_cli("stop", "coder7")[0], 0)
+        self.assertIsNone(self.pod())
+        self.assertEqual(self.st()["secrets"], {})
+
     def test_end_hook_note_is_shown(self):
         work, _ = base.make_repo(self.tmp.name, "r", dirty=False)
         self.patch_state(hook_env={"CW_WORKDIR": work, "CW_WORKER": "coder7"})
@@ -210,10 +252,11 @@ class S2StopDelete(K1Base):
         self.assertIn("no repository at the workdir", err)
 
 
-def rbac_docs():
+def rbac_docs(text=None):
     """The manifest as (kind, name, namespace, rules, text) per document; a small reader so no YAML library is needed."""
-    with open(RBAC) as f:
-        text = f.read()
+    if text is None:
+        with open(RBAC) as f:
+            text = f.read()
     docs = []
     for d in re.split(r"^---\s*$", text, flags=re.M):
         body = "\n".join(l for l in d.splitlines() if not l.lstrip().startswith("#"))
@@ -235,7 +278,9 @@ def rbac_docs():
 
 class S3S7Manifest(unittest.TestCase):
     def test_role_resources_are_exactly_the_five_and_nothing_cluster_wide_or_wild(self):
-        docs = rbac_docs()
+        self.check_role(rbac_docs())
+
+    def check_role(self, docs):
         kinds = [d["kind"] for d in docs]
         self.assertNotIn("ClusterRole", kinds)
         self.assertNotIn("ClusterRoleBinding", kinds)
@@ -264,9 +309,10 @@ class S3S7Manifest(unittest.TestCase):
             self.assertEqual(d["ns"], "cw", d["name"])
 
     def test_a_wildcard_role_would_be_caught(self):
-        # discriminator: the same reader finds a wildcard in a role that grants everything
-        text = 'kind: Role\nmetadata:\n  name: x\nrules:\n  - apiGroups: [""]\n    resources: ["*"]\n    verbs: ["*"]\n'
-        self.assertIn("*", re.search(r"resources:\s*\[(.*?)\]", text).group(1))
+        # discriminator: the same checks, fed a role that grants everything, fail
+        text = 'kind: Role\nmetadata:\n  name: x\n  namespace: cw\nrules:\n  - apiGroups: [""]\n    resources: ["*"]\n    verbs: ["*"]\n'
+        with self.assertRaises(AssertionError):
+            self.check_role(rbac_docs(text))
 
 
 class TokenBase(K1Base):

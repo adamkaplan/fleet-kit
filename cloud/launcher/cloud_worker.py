@@ -234,11 +234,15 @@ def ann(pod, key, default=None):
 RUN_SECRET_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 RESERVED_RUN_NAMES = {"server-password"}
 SERVER_UID = 1000  # the image's non-root user
+MAX_RUN_SECRET_BYTES = 1024 * 1024  # a Kubernetes Secret holds about 1 MiB in all
+MAX_RUN_SECRETS = 8
 
 
 def parse_run_secret_fds(items):
     """['NAME=N', ...] -> {NAME: fd}. Checks names and fd numbers only; reads nothing."""
     fds = {}
+    if len(items or []) > MAX_RUN_SECRETS:
+        raise CloudError("too many --run-secret-fd (at most %d)" % MAX_RUN_SECRETS, EXIT_USAGE)
     for item in items or []:
         key, sep, num = item.partition("=")
         if not sep or not RUN_SECRET_NAME.match(key) or key in RESERVED_RUN_NAMES or key in fds or not num.isdigit() or int(num) < 3:
@@ -253,9 +257,11 @@ def read_run_secret_values(fds):
     for key, fd in fds.items():
         try:
             with os.fdopen(os.dup(fd), "r") as f:
-                val = f.read()
+                val = f.read(MAX_RUN_SECRET_BYTES + 1)
         except (OSError, ValueError):
             raise CloudError("run secret %s: descriptor %d is not readable" % (key, fd), EXIT_USAGE)
+        if len(val) > MAX_RUN_SECRET_BYTES:
+            raise CloudError("run secret %s: the value is over the %d byte cap" % (key, MAX_RUN_SECRET_BYTES), EXIT_USAGE)
         if not val.strip():
             raise CloudError("run secret %s: the value is empty" % key, EXIT_USAGE)
         values[key] = val
@@ -506,7 +512,7 @@ class Launcher:
                 return {"worker": worker, "runtime_id": "", "pushed": False, "wip_branch": None}
             info["rid"], info["cost"] = "pod/" + name, self.cost(pod)
             phase = (pod.get("status") or {}).get("phase")
-            if phase in ("Failed", "Succeeded"):
+            if phase in ("Failed", "Succeeded") and ann(pod, "kept") != "true":  # a pod kept for unpushed work is never deleted here
                 # No container is running, so no hook can run and a kept pod would only linger: delete it and its
                 # Secrets, and say so.
                 self.kube.delete(name)
