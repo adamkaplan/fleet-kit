@@ -79,6 +79,48 @@ from urllib.parse import quote
 import uuid
 
 
+_MODULE_LOCKS = {}            # one reentrant lock per module name: a load of one module never waits behind the import of another
+_MODULE_LOCKS_GUARD = threading.Lock()   # held only to fetch or make a name's lock, never across an import
+_MODULES_DONE = {}            # name -> the module object whose import FINISHED (sys.modules holds a module while it still runs)
+
+
+def load_module(name):
+    """A helper module of bin/, loaded by path from beside this file: the one loader behind every `load_<module>()` below,
+    so a new module needs no loader of its own (call `load_module("name")`).
+
+    Not by `import`: this file has no .py name, is run through a symlink (~/.local/bin), by the daemon's service
+    unit, by wrappers, and is loaded by tests with SourceFileLoader, and none of those puts its directory on
+    sys.path. The real path of this file (symlinks resolved) is always right. A copy already loaded from the
+    same file is reused, so two loads of this script share one module. The name is a plain module name, never
+    a path: anything else is refused (ValueError), and a name with no file here fails as it always did.
+
+    A module already loaded is returned with no lock at all (this is on the hot path). A first load holds the lock of THAT name only, and
+    checks again once it has it, so concurrent first loads of one module all get the finished module and a failed import (never kept) raises
+    for every caller; the import of one module never delays another."""
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        raise ValueError("not a module name: %r" % (name,))
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), name + ".py")
+    done = _MODULES_DONE.get(name)
+    if done is not None and sys.modules.get(name) is done and os.path.realpath(getattr(done, "__file__", "") or "") == path:
+        return done
+    with _MODULE_LOCKS_GUARD:
+        lock = _MODULE_LOCKS.setdefault(name, threading.RLock())
+    with lock:   # reentrant: a module that loads another while it runs does not wait for itself
+        held = sys.modules.get(name)
+        if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+            return held
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(name, None)
+            raise
+        _MODULES_DONE[name] = module
+        return module
+
+
 def load_decision_core():
     """The pure core of the Decision subsystem, bin/decision_core.py, loaded by path from beside this file.
 
@@ -86,19 +128,7 @@ def load_decision_core():
     unit, by wrappers, and is loaded by tests with SourceFileLoader, and none of those puts its directory on
     sys.path. The real path of this file (symlinks resolved) is always right. A copy already loaded from the
     same file is reused, so two loads of this script share one module."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "decision_core.py")
-    held = sys.modules.get("decision_core")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("decision_core", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["decision_core"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("decision_core", None)
-        raise
-    return module
+    return load_module("decision_core")
 
 
 decision_core = load_decision_core()
@@ -106,172 +136,69 @@ decision_core = load_decision_core()
 
 def load_plan_check():
     """The plan checker, bin/plan_check.py (#135), loaded by path from beside this file, as load_decision_core does."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "plan_check.py")
-    held = sys.modules.get("plan_check")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("plan_check", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["plan_check"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("plan_check", None)
-        raise
-    return module
+    return load_module("plan_check")
 
 
 def load_plan_ledger():
     """The evidence ledger and gates, bin/plan_ledger.py (#107), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "plan_ledger.py")
-    held = sys.modules.get("plan_ledger")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("plan_ledger", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["plan_ledger"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("plan_ledger", None)
-        raise
-    return module
+    return load_module("plan_ledger")
 
 
 def load_launch_testers():
     """The launch-record testers' pure core, bin/launch_testers.py (#372), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "launch_testers.py")
-    held = sys.modules.get("launch_testers")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("launch_testers", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["launch_testers"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("launch_testers", None)
-        raise
-    return module
+    return load_module("launch_testers")
 
 
 def load_report_fold():
     """The report fold's pure core, bin/report_fold.py (#352), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "report_fold.py")
-    held = sys.modules.get("report_fold")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("report_fold", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["report_fold"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("report_fold", None)
-        raise
-    return module
+    return load_module("report_fold")
 
 
 def load_triage_plan_open():
     """The plan-issue-still-open rule, bin/triage_plan_open.py (#384), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "triage_plan_open.py")
-    held = sys.modules.get("triage_plan_open")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("triage_plan_open", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["triage_plan_open"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("triage_plan_open", None)
-        raise
-    return module
+    return load_module("triage_plan_open")
 
 
 def load_pr_events():
     """The webhook-event rule for `pr-state`, bin/pr_events.py (#354), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pr_events.py")
-    held = sys.modules.get("pr_events")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("pr_events", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["pr_events"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("pr_events", None)
-        raise
-    return module
+    return load_module("pr_events")
 
 
 def load_disk_janitor():
     """The temp-directory janitor, bin/disk_janitor.py (#321), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "disk_janitor.py")
-    held = sys.modules.get("disk_janitor")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("disk_janitor", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["disk_janitor"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("disk_janitor", None)
-        raise
-    return module
+    return load_module("disk_janitor")
 
 
 def load_heavy_slots():
     """The CPU slots for heavy commands, bin/heavy_slots.py (#34), loaded by path like the other modules."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "heavy_slots.py")
-    held = sys.modules.get("heavy_slots")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("heavy_slots", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["heavy_slots"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("heavy_slots", None)
-        raise
-    return module
+    return load_module("heavy_slots")
 
 
 def load_cpu_guard():
     """The CPU guard, bin/cpu_guard.py (the P0 CPU order), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cpu_guard.py")
-    held = sys.modules.get("cpu_guard")
+    return load_module("cpu_guard")
+
+
+def load_agent_presence():
+    """The presence rule for a worker with no terminal, bin/agent_presence.py (#433), loaded by path like cpu_guard."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "agent_presence.py")
+    held = sys.modules.get("agent_presence")
     if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
         return held
-    spec = importlib.util.spec_from_file_location("cpu_guard", path)
+    spec = importlib.util.spec_from_file_location("agent_presence", path)
     module = importlib.util.module_from_spec(spec)
-    sys.modules["cpu_guard"] = module
+    sys.modules["agent_presence"] = module
     try:
         spec.loader.exec_module(module)
     except BaseException:
-        sys.modules.pop("cpu_guard", None)
+        sys.modules.pop("agent_presence", None)
         raise
     return module
 
 
 def load_health_records():
     """The health recorders, bin/health_records.py (#357), loaded by path like disk_janitor."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "health_records.py")
-    held = sys.modules.get("health_records")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("health_records", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["health_records"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("health_records", None)
-        raise
-    return module
+    return load_module("health_records")
 
 
 def health_recorder(engine):
@@ -320,21 +247,14 @@ def health_write(engine, state, now):
         _health_fault(engine, "write", err)
 
 
+def load_reds():
+    """`reds`, bin/reds.py (#342), loaded by path like the other modules."""
+    return load_module("reds")
+
+
 def load_impact_floor():
     """The impact floor and hold table, bin/impact_floor.py (#179, L3), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "impact_floor.py")
-    held = sys.modules.get("impact_floor")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("impact_floor", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["impact_floor"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("impact_floor", None)
-        raise
-    return module
+    return load_module("impact_floor")
 
 
 class _LazyImpactFloor:
@@ -347,19 +267,7 @@ impact_floor = _LazyImpactFloor()
 
 def load_plan_review():
     """The plan review engine's pure core, bin/plan_review.py (#109), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "plan_review.py")
-    held = sys.modules.get("plan_review")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("plan_review", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["plan_review"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("plan_review", None)
-        raise
-    return module
+    return load_module("plan_review")
 
 
 class _LazyPlanReview:
@@ -397,37 +305,13 @@ def load_external_adapter():
     """The generic external adapter, bin/external_adapter.py, loaded by path from beside this file, the way
     load_decision_core loads the core. Called only when an external decision system is switched on and names this
     adapter: while it is off the file is never read or imported."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "external_adapter.py")
-    held = sys.modules.get("external_adapter")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("external_adapter", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["external_adapter"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("external_adapter", None)
-        raise
-    return module
+    return load_module("external_adapter")
 
 
 def load_decision_sync():
     """The sync engine for external decision systems, bin/decision_sync.py, loaded by path like decision_core (it
     imports decision_core, which is already registered)."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "decision_sync.py")
-    held = sys.modules.get("decision_sync")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("decision_sync", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["decision_sync"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("decision_sync", None)
-        raise
-    return module
+    return load_module("decision_sync")
 
 
 decision_sync = load_decision_sync()
@@ -435,19 +319,7 @@ decision_sync = load_decision_sync()
 
 def load_work_sync():
     """The work-item pump, bin/work_sync.py, loaded by path like the others."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "work_sync.py")
-    held = sys.modules.get("work_sync")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("work_sync", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["work_sync"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("work_sync", None)
-        raise
-    return module
+    return load_module("work_sync")
 
 
 work_sync = load_work_sync()
@@ -455,19 +327,7 @@ work_sync = load_work_sync()
 
 def load_agent_calls():
     """The agent-shell call counter, bin/agent_calls.py (#367), loaded by path like the others."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "agent_calls.py")
-    held = sys.modules.get("agent_calls")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("agent_calls", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["agent_calls"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("agent_calls", None)
-        raise
-    return module
+    return load_module("agent_calls")
 
 
 agent_calls = load_agent_calls()
@@ -475,19 +335,7 @@ agent_calls = load_agent_calls()
 
 def load_triage_digest():
     """The stale digest's rules and files, bin/triage_digest.py (#349), loaded by path like the others."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "triage_digest.py")
-    held = sys.modules.get("triage_digest")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("triage_digest", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["triage_digest"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("triage_digest", None)
-        raise
-    return module
+    return load_module("triage_digest")
 
 
 triage_digest = load_triage_digest()
@@ -495,19 +343,7 @@ triage_digest = load_triage_digest()
 
 def load_dead_hint():
     """The DEAD agent's hint, bin/dead_hint.py (#379), loaded by path like the others."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "dead_hint.py")
-    held = sys.modules.get("dead_hint")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("dead_hint", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["dead_hint"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("dead_hint", None)
-        raise
-    return module
+    return load_module("dead_hint")
 
 
 dead_hint = load_dead_hint()
@@ -541,8 +377,9 @@ DEFAULTS = {
     "call_timeout_seconds": 20,
     "send_timeout_seconds": 60,    # `send` as a whole (the sum of its v2 and herdr calls): past it, a clear failure line, never a silent minutes-long wait
     "poll_seconds": 5,
-    "cpu_guard": None,             # load over cores: None = defaults (high_ratio 3 for 5 minutes wakes the Chief of Staff once per episode); false = off; or {"high_ratio": n, "minutes": n}
+    "cpu_guard": None,             # load over cores and swap: None = defaults (high_ratio 3 for 5 minutes, swap_percent 90 for 5 minutes, each wakes the Chief of Staff once per episode); false = off; or {"high_ratio": n, "minutes": n, "swap_percent": n, "swap_minutes": n}
     "disk_guard": None,            # free space of the state directory's volume: None = defaults (min_free_gb 50, hard_free_gb 10); false = off; or {"min_free_gb": n, "hard_free_gb": n}
+    "reds": None,                  # `reds` (#342): {"reference_events": {"owner/repo": ["merge_group", "schedule"]}, "workflow": {"owner/repo": "ci.yml"}}: the events whose runs on the default branch are "main's runs" (default: push), and an optional override of the workflow (default: the one that holds the pull request's artifact)
     "heavy": None,                 # CPU slots for `heavy -- <command>` (full suites, e2e runs): None = 3 slots; or {"slots": n}
     "docker_reaper": True,         # the daily removal of EXPIRED labelled docker containers, networks and volumes (`disk reap-docker`): false is the kill switch
     "v2_events": "auto",           # the daemon's news of sessions: "auto" (the service's event stream, where the HTTP route exists; reads only what an event did not say) or "off" (the old reads)
@@ -622,7 +459,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "temp_janitor", "load_alert"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "temp_janitor", "load_alert", "spotlight_guard", "excluded_repos"}
 
 
 def config_known_keys():
@@ -688,6 +525,10 @@ def validate_config(raw, source="config"):
         envs[key] = dict(env)
     validate_disk_guard(config["disk_guard"], source)
     try:
+        load_reds().settings(config["reds"])
+    except ValueError as err:
+        raise ConfigError("%s: %s" % (source, err)) from None
+    try:
         load_heavy_slots().settings(config["heavy"])
     except Exception as err:
         raise ConfigError("%s: %s" % (source, err)) from None
@@ -695,6 +536,14 @@ def validate_config(raw, source="config"):
         load_cpu_guard().validate(config["cpu_guard"], source)
     except ValueError as err:
         raise ConfigError(str(err))
+    try:
+        load_module("spotlight_guard").validate(config.get("spotlight_guard"), source)
+    except ValueError as err:
+        raise ConfigError(str(err)) from None
+    try:
+        load_module("repo_exclusion").validate(config.get("excluded_repos"), source)
+    except ValueError as err:
+        raise ConfigError(str(err)) from None
     if not isinstance(config["docker_reaper"], bool):
         raise ConfigError("%s: 'docker_reaper' must be true or false, got %r" % (source, config["docker_reaper"]))
     if config["v2_events"] not in ("auto", "off"):
@@ -872,6 +721,11 @@ def validate_external_config(config, source):
                 raise ConfigError("%s.%s' is required when external_decisions is enabled" % (where, key))
         if not repos:
             raise ConfigError("%s.repos' must name at least one repo when external_decisions is enabled" % where)
+    if section["enabled"] and section["mapping_file"] and load_module("repo_exclusion").az_without_subscription(section["mapping_file"]):
+        message = load_module("repo_exclusion").AZ_WARNING
+        if message not in _WARNED_CONFIG:   # once per process
+            _WARNED_CONFIG.add(message)
+            sys.stderr.write("%s: warning: %s\n" % (PROG, message))
     config["external_decisions"] = section
 
 
@@ -1370,6 +1224,7 @@ V2_HTTP_OPERATIONS = {   # operation -> (method, path template, path parameters,
     "session.active": ("GET", "/api/session/active", (), ()),
     "session.create": ("POST", "/api/session", (), ()),
     "session.get": ("GET", "/api/session/{sessionID}", ("sessionID",), ()),
+    "session.remove": ("DELETE", "/api/session/{sessionID}", ("sessionID",), ()),
     "session.list": ("GET", "/api/session", (), ("limit", "order", "search", "parentID", "directory", "project", "subpath", "cursor")),
     "session.message.list": ("GET", "/api/session/{sessionID}/message", ("sessionID",), ("limit", "order", "cursor", "type")),
     "session.inbox.list": ("GET", "/api/session/{sessionID}/inbox", ("sessionID",), ()),
@@ -1432,6 +1287,17 @@ class V2Http:
         except OSError:
             return True   # not ours to signal, so it exists
         return True
+
+    def base_url(self):
+        """`http://host:port` of the service (never the password), or None when the service file cannot be read."""
+        with self._lock:
+            try:
+                if self._info is None:
+                    self._load()
+                host, port, _ = self._info
+                return "http://%s:%d" % (host if ":" not in host else "[%s]" % host, port)
+            except Exception:
+                return None
 
     def _load(self):
         try:
@@ -1894,6 +1760,10 @@ class V2Client:
         """A page of a transcript is never larger than V2_READ_LIMIT_MAX messages, whatever a caller asks."""
         return min(limit, V2_READ_LIMIT_MAX) if isinstance(limit, int) and not isinstance(limit, bool) else limit
 
+    def service_url(self):
+        """Where the service is, `http://127.0.0.1:<port>`, or None (the CLI transport, or no readable service file)."""
+        return self.http.base_url() if self.http is not None and hasattr(self.http, "base_url") else None
+
     def server_info(self):
         return self._call("server.info")
 
@@ -1911,6 +1781,11 @@ class V2Client:
 
     def session_active(self):
         return self._call("session.active")
+
+    def session_remove(self, session_id):
+        """`session.remove`: delete a session (DELETE /api/session/{sessionID}, an empty answer; 404 SessionNotFoundError when it is gone).
+        Used only to undo a launch that failed after it created its session."""
+        return self._call("session.remove", {"sessionID": session_id})
 
     def message_list(self, session_id, limit=None, order=None, type=None, cursor=None):
         if order is not None and order not in self.ORDERS:
@@ -2390,61 +2265,188 @@ class DiskFacts:
         return [Fact("disk.low:%d" % int(episode), name, "disk", text, episode, sender="switchboard") for name in chiefs]
 
 
+class SpotlightFacts:
+    """The Spotlight guard's fact source (bin/spotlight_guard.py, ask #438). Once an hour a BACKGROUND thread asks `mdfind` (5 s per folder) whether the index holds
+    anything under each guarded folder; a pass only collects what the thread has finished, so it starts no process and a slow tool never delays it. A folder
+    indexed on two checks in a row begins an episode: ONE wake to the Chief of Staff (`spotlight.lost:<folder>:<episode>`, audited `spotlight.lost`); a zero count
+    ends it (`spotlight.recovered`). Writes only `spotlight-guard.json`, and only when an answer changed. Changes no setting."""
+
+    __name__ = "spotlight_facts"
+
+    def __init__(self):
+        self.engine = None
+        self.tracker = None
+        self.thread = None
+        self.done = None             # results the thread has finished, not yet stepped
+        self.lock = threading.Lock()  # the hand-off of `done`: a result stored while the pass takes the last one is never lost
+        self.started = None          # the engine's clock when the last check began
+        self.saved = None            # the stable content the file holds
+        self.counts = {}             # the last count seen per folder (the wake text names it)
+
+    def bind(self, engine):
+        self.engine = engine
+
+    def _start(self, engine, sg, cfg):
+        runner = getattr(engine, "spotlight_runner", None)
+        folders = list(cfg["folders"])
+        self.started = engine.now()
+
+        def work():
+            results = sg.check_all(folders, runner)
+            with self.lock:
+                if self.thread is threading.current_thread():
+                    self.done = results
+        self.thread = threading.Thread(target=work, name="spotlight-check", daemon=True)
+        self.thread.start()
+
+    def _chiefs(self, engine):
+        discovery = getattr(engine, "discovery", None)
+        return sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff") if discovery is not None and not discovery.problems else []
+
+    def __call__(self):
+        engine = self.engine
+        if engine is None or engine.state_dir is None:
+            return []
+        sg = load_module("spotlight_guard")
+        cfg = sg.settings(engine.config.get("spotlight_guard"))
+        if cfg is None:
+            return []
+        if self.tracker is None:
+            saved = sg.load(engine.state_dir)
+            self.tracker = sg.Tracker((saved or {}).get("folders"))
+            self.saved = sg.stable(saved) if saved else None
+            self.counts = {f: sg.clean_count(e.get("count")) for f, e in ((saved or {}).get("folders") or {}).items() if isinstance(e, dict)}
+        with self.lock:
+            results, self.done = self.done, None
+        if results:
+            self._apply(engine, sg, results)
+        facts = self._open(engine, sg, cfg["folders"])   # EVERY pass while an episode is open: the delivery layer batches (a fact must still be pending when the batch is ripe) and dedups by the stable key
+        alive = self.thread is not None and self.thread.is_alive()
+        if not alive and (self.started is None or engine.now() - self.started >= sg.CHECK_SECONDS):
+            self._start(engine, sg, cfg)
+        return facts
+
+    def _open(self, engine, sg, folders):
+        """The wake of each open episode, one fact per Chief of Staff, the same key and `created` on every pass."""
+        chiefs = self._chiefs(engine)
+        facts = []
+        for folder, episode in sorted(self.tracker.episode.items()):
+            if episode is None or not chiefs or folder not in folders:   # a folder no longer guarded wakes nobody
+                continue
+            text = sg.wake_text(folder, self.counts.get(folder), PROG)
+            key = "spotlight.lost:%s:%d" % (hashlib.sha256(folder.encode()).hexdigest()[:10], int(episode))
+            facts.extend(Fact(key, name, "spotlight", " ".join(text.split()), episode, sender="switchboard") for name in chiefs)
+        return facts
+
+    def _apply(self, engine, sg, results):
+        now = engine.now()
+        for folder, (state, count) in sorted(results.items()):
+            event = self.tracker.step(folder, state, now)
+            if count is not None:
+                self.counts[folder] = count
+            if event == "begin" and engine.audit is not None:
+                engine.audit.append(engine.actor, "spotlight.lost", None, {"folder": folder, "count": count})
+            elif event == "end" and engine.audit is not None:
+                engine.audit.append(engine.actor, "spotlight.recovered", None, {"folder": folder})
+        content = sg.body(results, self.tracker, now)
+        if self.saved != sg.stable(content):
+            try:
+                sg.save(engine.state_dir, content)
+                self.saved = sg.stable(content)
+            except OSError as err:
+                engine._note("spotlight.guard_file", None, {"error": _plain("%s: %s" % (type(err).__name__, err), 160)})
+
+
 class CpuFacts:
-    """The CPU guard's fact source (bin/cpu_guard.py): ONE `os.getloadavg()` per pass, no process. When the load over the cores stays above the guard for the
-    configured minutes the Chief of Staff is told ONCE for the episode (`cpu.high:<episode>`: the key is stable, so it is delivered once), `cpu.high` is audited
-    with the top process categories from ONE bounded `ps` run when the episode begins (never on another pass), and the episode ends (`cpu.recovered`) below
-    two thirds of the guard. The episode is kept in `cpu-guard.json`, so a restart does not begin a second one."""
+    """The CPU and memory guard's fact source (bin/cpu_guard.py): ONE `os.getloadavg()` and the kernel's memory counters per pass, no process. When the load over
+    the cores stays above the guard for the configured minutes the Chief of Staff is told ONCE for the episode (`cpu.high:<episode>`: the key is stable, so it is
+    delivered once), `cpu.high` is audited, and the wake NAMES THE TOP CONSUMERS by program and by lane (the agent or worktree the process runs in), from ONE
+    bounded `ps` and ONE bounded `lsof` run on a thread when the episode begins (never on another pass). The wake is held until they answer or `WAKE_GRACE_SECONDS`
+    pass; an answer that comes after the wake went out is sent as ONE follow-up note (`cpu.top:<episode>`), and a `ps` that never answers is said once in the
+    wake. The episode ends (`cpu.recovered`) below two thirds of the guard and is kept in `cpu-guard.json`, so a restart does not begin a second one. The same
+    pattern guards memory: swap above `swap_percent` for `swap_minutes` wakes once per episode (`mem.high:<episode>`, `mem-guard.json`)."""
 
     __name__ = "cpu_facts"
 
     def __init__(self):
         self.engine = None
         self.tracker = None
+        self.mem_tracker = None
         self.detail = ""
         self.thread = None
-        self.saved_episode = None   # the episode the file holds (None: closed)
+        self.begin_at = None          # the engine's clock when this process began the episode (None: it was loaded from the file)
+        self.waked_without = False    # the wake went out while the consumers were still being read
+        self.saved_episode = None     # the episode the file holds (None: closed)
+        self.saved_mem = None
 
     def bind(self, engine):
         self.engine = engine
 
+    def _registry(self, engine):
+        try:
+            return {path: entry.get("agent") for path, entry in read_worktrees(engine.state_dir).items() if isinstance(entry, dict)}
+        except Exception:
+            return {}
+
     def _start_ps(self, engine, cg):
-        """ONE bounded `ps` on a thread: a starved machine must never hang the daemon's pass. The result lands in `self.detail` when it is done; the fact
-        keeps its text until delivered, so it carries the categories when they came back in time."""
+        """ONE bounded `ps`, then ONE bounded `lsof` of the top ten processes for their lanes, on a thread: a starved machine must never hang the daemon's pass.
+        The result lands in `self.detail` when it is done, and only while this is still the current thread (a slow one of an earlier episode writes nothing)."""
         runner = getattr(engine, "cpu_ps_runner", None) or subprocess.run
+        registry = self._registry(engine)
 
         def work():
+            text = ""
             try:
                 done = runner(cg.PS_ARGV, capture_output=True, text=True, timeout=cg.PS_SECONDS, stdin=subprocess.DEVNULL)
-                text = cg.detail(cg.categories(done.stdout)) if done.returncode == 0 else ""
+                if done.returncode == 0:
+                    lanes = {}
+                    pids = cg.top_pids(cg.process_rows(done.stdout))
+                    if pids:
+                        try:
+                            looked = runner(cg.lsof_argv(pids), capture_output=True, text=True, timeout=cg.LSOF_SECONDS, stdin=subprocess.DEVNULL)
+                            if looked.returncode in (0, 1):
+                                lanes = {pid: cg.lane_of(cwd, registry) for pid, cwd in cg.parse_lsof(looked.stdout).items()}
+                        except Exception:
+                            lanes = {}
+                    text = cg.detail(cg.consumers(done.stdout, lanes))
             except Exception:
                 text = ""
-            if self.thread is threading.current_thread():   # a slow ps of an earlier episode never overwrites a later one's text
+            if self.thread is threading.current_thread():
                 self.detail = text
         self.thread = threading.Thread(target=work, name="cpu-ps", daemon=True)
         self.thread.start()
+
+    def _chiefs(self, engine):
+        discovery = getattr(engine, "discovery", None)
+        return sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff") if discovery is not None and not discovery.problems else []
 
     def __call__(self):
         engine = self.engine
         if engine is None or engine.state_dir is None:
             return []
         cg = load_cpu_guard()
-        cfg = cg.settings(engine.config.get("cpu_guard"))
+        raw = engine.config.get("cpu_guard")
+        cfg = cg.settings(raw)
         if cfg is None:
             return []
+        chiefs = self._chiefs(engine)
+        facts = self._cpu(engine, cg, cfg, chiefs)
+        facts.extend(self._mem(engine, cg, cg.mem_settings(raw), chiefs))
+        return facts
+
+    def _cpu(self, engine, cg, cfg, chiefs):
         read = cg.reading()
         if not read.ratio_known:   # FAIL OPEN: a load or a core count that cannot be read tells nobody (the status line says so), and never counts as one core
             return []
-        discovery = getattr(engine, "discovery", None)
-        chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff") if discovery is not None and not discovery.problems else []
         if self.tracker is None:
             self.tracker = cg.Episode(cg.load_episode(engine.state_dir))
             self.saved_episode = self.tracker.episode
         load1, load5, cores = read.load1, read.load5, read.cores
         ratio = load5 / cores   # the five-minute average decides: a one-minute spike never wakes the Chief of Staff
-        event = self.tracker.step(ratio, engine.now(), cfg, can_begin=bool(chiefs))
+        now = engine.now()
+        event = self.tracker.step(ratio, now, cfg, can_begin=bool(chiefs))
         if event == "begin":
-            self.detail = ""
+            self.detail, self.begin_at, self.waked_without = "", now, False
             self._start_ps(engine, cg)
             if engine.audit is not None:
                 engine.audit.append(engine.actor, "cpu.high", None, {"load1": round(load1, 1), "load5": round(load5, 1), "cores": cores, "ratio5": round(ratio, 2),
@@ -2453,17 +2455,64 @@ class CpuFacts:
         elif event == "end":
             if engine.audit is not None:
                 engine.audit.append(engine.actor, "cpu.recovered", None, {"load1": round(load1, 1), "load5": round(load5, 1), "cores": cores, "ratio5": round(ratio, 2)})
-            self.detail = ""
-            self.thread = None
+            self.detail, self.thread, self.begin_at = "", None, None
             self._save(engine, cg, None)
         episode = self.tracker.episode
         if self.saved_episode != episode:   # a save that failed is tried again on the next pass
             self._save(engine, cg, episode)
         if episode is None or not chiefs:
             return []
+        alive = self.thread is not None and self.thread.is_alive()
+        if alive and self.begin_at is not None and now - self.begin_at < cg.WAKE_GRACE_SECONDS:
+            return []   # the consumers are being read: the wake waits a few seconds for them
+        if self.detail:
+            consumers = self.detail + "."
+        elif alive:
+            consumers = "Consumers not read within %d s (ps is slow; one follow-up note carries them if it answers)." % cg.WAKE_GRACE_SECONDS
+        elif self.begin_at is not None:
+            consumers = "Consumers could not be read."
+        else:
+            consumers = ""
+        if alive and not self.detail:
+            self.waked_without = True
         text = "cpu high: load %d on %d cores (%.1fx over five minutes; the guard is %gx for %g minutes). %s `%s status` shows the line; heavy work should wait for a slot." % (
-            round(load5), cores, ratio, cfg["high_ratio"], cfg["minutes"], self.detail + "." if self.detail else "", PROG)
-        return [Fact("cpu.high:%d" % int(episode), name, "cpu", " ".join(text.split()), episode, sender="switchboard") for name in chiefs]
+            round(load5), cores, ratio, cfg["high_ratio"], cfg["minutes"], consumers, PROG)
+        facts = [Fact("cpu.high:%d" % int(episode), name, "cpu", " ".join(text.split()), episode, sender="switchboard") for name in chiefs]
+        if self.waked_without and self.detail:   # the answer came after the wake: ONE follow-up note (the same key on every pass, so it is delivered once)
+            note = "cpu consumers (the answer came after the cpu high note): %s." % self.detail
+            facts.extend(Fact("cpu.top:%d" % int(episode), name, "cpu-top", note, episode, sender="switchboard") for name in chiefs)
+        return facts
+
+    def _mem(self, engine, cg, mem_cfg, chiefs):
+        """Swap above the guard for the minutes: ONE wake per episode with the biggest holders (the kernel's counters, no process)."""
+        mem = cg.memory_reading()
+        percent = mem.swap_percent
+        if percent is None:   # FAIL OPEN: unreadable memory tells nobody (the status line says so)
+            return []
+        if self.mem_tracker is None:
+            self.mem_tracker = cg.Episode(cg.load_episode(engine.state_dir, cg.MEM_STATE_FILE))
+            self.saved_mem = self.mem_tracker.episode
+        event = self.mem_tracker.step(percent, engine.now(), mem_cfg, can_begin=bool(chiefs))
+        holders = []
+        if event == "begin":
+            holders = cg.biggest_holders(cg.process_table())
+            self.mem_holders = holders
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "mem.high", None, {"swap_percent": round(percent, 1), "swap_used_mb": int(mem.swap_used / 1e6), "swap_total_mb": int(mem.swap_total / 1e6),
+                                                                      "high_percent": mem_cfg["high_ratio"], "minutes": mem_cfg["minutes"]})
+            self._save_mem(engine, cg, self.mem_tracker.episode)
+        elif event == "end":
+            self.mem_holders = []
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "mem.recovered", None, {"swap_percent": round(percent, 1)})
+            self._save_mem(engine, cg, None)
+        episode = self.mem_tracker.episode
+        if self.saved_mem != episode:
+            self._save_mem(engine, cg, episode)
+        if episode is None or not chiefs:
+            return []
+        text = cg.mem_wake_text(mem, getattr(self, "mem_holders", []), mem_cfg, PROG)
+        return [Fact("mem.high:%d" % int(episode), name, "mem", " ".join(text.split()), episode, sender="switchboard") for name in chiefs]
 
     def _save(self, engine, cg, episode):
         try:
@@ -2471,6 +2520,13 @@ class CpuFacts:
             self.saved_episode = episode
         except OSError as err:
             engine._note("cpu.guard_file", None, {"error": _plain("%s: %s" % (type(err).__name__, err), 160)})
+
+    def _save_mem(self, engine, cg, episode):
+        try:
+            cg.save_episode(engine.state_dir, episode, cg.MEM_STATE_FILE)
+            self.saved_mem = episode
+        except OSError as err:
+            engine._note("mem.guard_file", None, {"error": _plain("%s: %s" % (type(err).__name__, err), 160)})
 
 
 # ---------------------------------------------------------------- the docker reaper (ask #321)
@@ -2587,10 +2643,61 @@ def docker_reap(docker, runner, now, apply, audit=None, actor="daemon"):
     return result
 
 
+def _docker_problem(name):
+    """(path, None) for a docker binary the disk tools may run, else (None, one line saying why not). The tools take `--docker` from a person, so the
+    value is NOT trusted to be a docker: its basename must be exactly `docker` and so must the basename of a symlink's target (or Docker Desktop's
+    `com.docker.cli`); it must be a regular executable file owned by this user or root; neither it nor any directory above it may be writable by group
+    or other (a sticky directory such as /tmp excepted); a bare name is resolved from PATH. The path RETURNED is the vetted real path, so the file run is
+    the file checked. Anything else is refused."""
+    if not isinstance(name, str) or not name or "\x00" in name or name.startswith("-"):
+        return None, "is not a usable executable name"
+    path = name if os.sep in name else shutil.which(name)
+    if path is None or not os.path.exists(path):
+        return None, "not installed or not on PATH"
+    if not os.path.isabs(path):
+        return None, "must be an absolute path (or a bare name on PATH)"
+    real = os.path.realpath(path)
+    if os.path.basename(path) != "docker" or os.path.basename(real) not in ("docker", "com.docker.cli"):
+        return None, "is not a docker binary: its name (and the name a link points to) must be exactly `docker`"
+    try:
+        info = os.stat(real)
+        if not stat.S_ISREG(info.st_mode) or not os.access(real, os.X_OK):
+            return None, "is not an executable file"
+        if info.st_uid not in (0, os.getuid()):
+            return None, "belongs to another user: not trusted"
+        if info.st_mode & 0o022:
+            return None, "is writable by group or other: not trusted"
+        here, first = os.path.dirname(real), True
+        while True:
+            at = os.stat(here)
+            mode = at.st_mode
+            if at.st_uid not in (0, os.getuid()):
+                return None, "sits in a directory (%s) that others can change (another user owns it): not trusted; pass the absolute path of a docker kept in a directory only you or root can write" % _plain(here, 80)
+            if not mode & 0o1000:   # a sticky directory (/tmp) lets nobody replace another's file
+                # the file's own directory must be closed to group and other; an ancestor only to OTHER, or to a group when it is not root's (a root-owned
+                # group-writable /Applications or /usr/local, where a standard Docker install lives, is the operating system's own)
+                if (first and mode & 0o022) or mode & 0o002 or (mode & 0o020 and at.st_uid not in (0,)):
+                    return None, "sits in a directory (%s) that others can change: not trusted; pass the absolute path of a docker kept in a directory only you or root can write" % _plain(here, 80)
+            first = False
+            parent = os.path.dirname(here)
+            if parent == here:
+                break
+            here = parent
+    except OSError:
+        return None, "cannot be read"
+    return real, None
+
+
 def _docker_executable(name):
-    if os.sep in name:
-        return name if os.access(name, os.X_OK) else None
-    return shutil.which(name)
+    return _docker_problem(name)[0]
+
+
+def _docker_message(name):
+    """The one refusal line for a `--docker` value that is not a usable docker."""
+    why = _docker_problem(name)[1] or "not usable"
+    if why.startswith("not installed"):
+        return "docker is not installed or not on PATH (%s)" % _plain(name, 160)
+    return "refused: %s %s" % (_plain(name, 120), why)
 
 
 class DockerReapFacts:
@@ -2758,7 +2865,7 @@ def fact_sources(state_dir):
     the same rule, and stores nothing.
     """
     return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir),
-            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), JobFacts(), PaneFacts(), DiskFacts(), CpuFacts(), DockerReapFacts()]
+            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), JobFacts(), PaneFacts(), DiskFacts(), CpuFacts(), SpotlightFacts(), DockerReapFacts()]
 
 
 # --------------------------------------------------------- observing the fleet
@@ -2907,6 +3014,7 @@ class Observation:
         self.last_human_prompt, self.problem = last_human_prompt, problem
         self.created = None  # PR 17: when v2 says the session began (epoch seconds)
         self.wrong_program = False  # the pane runs something other than the configured v2
+        self.headless = False  # #433: a worker with no terminal: what it does is read from the OpenCode service, never from herdr
         self.conflict = []  # other sessions that claim the same name
 
     def engaged(self, now, window):
@@ -2916,10 +3024,13 @@ class Observation:
         return self.last_human_prompt is not None and now - self.last_human_prompt < window
 
     def to_json(self):
-        return {"name": self.name, "session": self.session_id, "pane": self.pane, "status": self.status,
-                "fleet": self.fleet, "idle_at": iso(self.idle_at), "outcome": self.outcome,
-                "last_human_prompt": iso(self.last_human_prompt), "problem": self.problem,
-                "wrong_program": self.wrong_program, "conflict": self.conflict}
+        out = {"name": self.name, "session": self.session_id, "pane": self.pane, "status": self.status,
+               "fleet": self.fleet, "idle_at": iso(self.idle_at), "outcome": self.outcome,
+               "last_human_prompt": iso(self.last_human_prompt), "problem": self.problem,
+               "wrong_program": self.wrong_program, "conflict": self.conflict}
+        if self.headless:   # present only for a headless worker: a terminal-only fleet's output is what it always was
+            out["headless"] = True
+        return out
 
 
 class Discovery:
@@ -3922,6 +4033,7 @@ class Switchboard:
                 entries = self.herdr.agent_list()
             except HerdrError as err:
                 found.problems.append("herdr unreachable: %s" % err)
+                self._discover_headless(found, now)   # a worker with no terminal does not depend on herdr
                 return found
         found.entries = [entry for entry in entries if isinstance(entry, dict)]
         for entry in sorted(found.entries, key=lambda e: self.reads.stale_first(agent_session(e) or "")):   # the stalest first: the read budget is shared out in turn
@@ -3934,10 +4046,94 @@ class Switchboard:
                 continue
             if observation is not None:
                 found.add(observation)
+        self._discover_headless(found, now)   # AFTER the terminals: a terminal that runs the same session wins (`watch`), and another session claiming a terminal agent's name is a conflict (held)
         return found
+
+    def _discover_headless(self, found, now):
+        """#433: the workers with no terminal. The index is the private records in state-dir/headless/; PRESENCE is proved by the service (the session
+        exists, answers and carries the worker's name in its metadata), never by a record alone. `session.active` is read ONCE for all of them; a
+        service that does not answer makes each one `unknown` with a problem (a delivery is held, never dropped), not dead and not working."""
+        if self.state_dir is None:
+            return
+        try:
+            ap = load_agent_presence()
+            records, bad = ap.scan_records(self.state_dir)
+        except Exception as err:   # never silent: headless workers would vanish from discovery without a word
+            found.problems.append("headless workers could not be read: %s" % _one_line(str(err), 100))
+            return
+        found.problems.extend(bad)   # a record that is there and cannot be used is said, one line each, never a silent loss
+        if not records:
+            return
+        active, down = None, None
+        try:
+            active = self.v2.session_active()
+            if not isinstance(active, dict):   # a list, a string or null cannot be read: unknown, never idle
+                active, down = None, "session.active answered something unreadable"
+        except V2Error as err:
+            down = _one_line(str(err), 100)
+        for record in records:
+            try:
+                observation = self._observe_headless(record, now, active, down)
+            except V2Error as err:
+                observation = self._unknown_headless(record, "the service did not answer: %s" % _one_line(str(err), 100))
+            if observation is not None:
+                found.add(observation)
+
+    def _unknown_headless(self, record, why):
+        name = record["worker"]
+        observation = Observation(name, record["session"], None, "unknown", {"name": name, "headless": True})
+        observation.headless = True
+        observation.problem = "%s: %s" % (name, why)
+        return observation
+
+    def _observe_headless(self, record, now, active, down=None, fresh=False):
+        """An Observation for one headless worker, or None when its session is gone or is not the worker's. State per bin/agent_presence.py."""
+        ap = load_agent_presence()
+        session_id = record["session"]
+        if down is not None:
+            return self._unknown_headless(record, "the service did not answer (%s)" % down)
+        state, why = ap.read_state(self.v2, session_id, active)
+        if state == "missing":
+            return None
+        if state == ap.UNKNOWN:
+            return self._unknown_headless(record, why)
+        try:
+            info = self.reads.session_info(session_id, state, now, fresh)
+        except V2Error as err:
+            if err.reason == "http" and err.status == 404:
+                return None
+            raise
+        fleet = _fleet_meta(info)
+        if not fleet or fleet.get("name") != record["worker"]:
+            return None   # the session does not carry the worker's name: the record is not proof of presence
+        times = info.get("time") if isinstance(info.get("time"), dict) else {}
+        observation = Observation(fleet["name"], session_id, None, STATUS.get(state, "unknown"), fleet, _seconds(times.get("idle")), info.get("outcome"))
+        observation.created = _seconds(times.get("created"))
+        observation.headless = True
+        try:
+            observation.last_human_prompt = self.last_human_prompt(
+                session_id, now, inbox=fleet.get("role") == "chief-of-staff", info=info, fresh=fresh)
+        except V2Error as err:
+            observation.problem = "cannot read %s's transcript: %s" % (observation.name, err)
+        return observation
 
     def reobserve(self, previous, now):
         """The same agent, read again just before a write (invariant 4). (Observation, why-not)."""
+        if previous.headless:
+            try:
+                record = load_agent_presence().load_record(self.state_dir, previous.name) if self.state_dir is not None else None
+                if record is None or record["session"] != previous.session_id:
+                    return None, "%s has no headless record for session %s any more" % (previous.name, previous.session_id)
+                active = self.v2.session_active() or {}
+                fresh = self._observe_headless(record, now, active, None, fresh=True)   # a read before a write is never from memory
+            except V2Error as err:
+                return None, "v2 unreachable: %s" % err
+            if fresh is None or fresh.name != previous.name:
+                return None, "session %s is no longer the fleet agent %s" % (previous.session_id, previous.name)
+            if fresh.problem:
+                return None, fresh.problem
+            fresh.conflict = list(previous.conflict)
+            return fresh, None
         if not previous.pane:
             return None, "%s has no herdr pane to read again" % previous.name
         try:
@@ -5420,8 +5616,8 @@ def launch_agent_problem(config, runner, agent):
             "(primary agents registered: %s). Install its definition, restart the service, and check it with `fleet-switchboard agents verify`" % (agent, known))
 
 
-def launch_problems(name, agent, directory, workspace, issue, charter=None):
-    """Why these launch arguments cannot be used (empty when they can)."""
+def launch_problems(name, agent, directory, workspace, issue, charter=None, headless=False):
+    """Why these launch arguments cannot be used (empty when they can). A headless worker has no terminal, so it needs no workspace."""
     problems = []
     if not NAME_RE.match(name or ""):
         problems.append("name must match %s (lower case, digits, - and _), got %r" % (NAME_RE.pattern, name))
@@ -5431,7 +5627,7 @@ def launch_problems(name, agent, directory, workspace, issue, charter=None):
         problems.append("--agent is required")
     if not directory or not os.path.isabs(directory) or not os.path.isdir(directory):
         problems.append("--dir must be an absolute path of an existing directory, got %r" % directory)
-    if not workspace:
+    if not workspace and not headless:
         problems.append("no target workspace: pass --workspace or run from a herdr pane")
     if issue is not None and not (isinstance(issue, int) and not isinstance(issue, bool) and issue >= 1):
         problems.append("--issue must be an issue number, got %r" % (issue,))
@@ -5573,21 +5769,141 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
         left = close_own_pane(engine, name, pane, "launch failed: %s" % _one_line(str(err), 120)) if pane \
             else "no pane was opened"
         raise LaunchError("%s (session %s was created; %s)" % (_one_line(str(err)), session_id, left)) from err
-    if engine.state_dir is not None:   # a launch into a linked worktree records it, so retire and a done report can reclaim it later
-        try:
-            found = worktree_of_directory(subprocess.run, directory)
-            if found is not None:
-                done = register_worktree(engine.state_dir, found[0], name, repo, found[1], engine.now())
-                if isinstance(done, str):   # already claimed by another agent: never taken over
-                    engine._note("worktree.error", name, {"error": "the worktree %s is already registered to %s: %s does not claim it and will not reclaim it" % (found[0], done, name)})
-                elif done is True:
-                    if engine.audit is not None:
-                        engine.audit.append(engine.actor, "worktree.registered", name, {"path": found[0], "branch": found[1], "repo": repo, "by": "launch"})
-                else:   # it will not be reclaimed later: say so now
-                    engine._note("worktree.error", name, {"error": "the worktree %s could not be recorded in the registry: it will not be reclaimed automatically" % found[0]})
-        except Exception as err:
-            engine._note("worktree.error", name, {"error": _one_line(str(err), 120)})
+    register_launch_worktree(engine, name, directory, repo)
     return {"name": name, "session": session_id, "pane": pane, "tab": opened["tab_id"]}
+
+
+def register_launch_worktree(engine, name, directory, repo):
+    """A launch into a linked worktree records it, so retire and a done report can reclaim it later. Never raises."""
+    if engine.state_dir is None:
+        return
+    try:
+        found = worktree_of_directory(subprocess.run, directory)
+        if found is not None:
+            done = register_worktree(engine.state_dir, found[0], name, repo, found[1], engine.now())
+            if isinstance(done, str):   # already claimed by another agent: never taken over
+                engine._note("worktree.error", name, {"error": "the worktree %s is already registered to %s: %s does not claim it and will not reclaim it" % (found[0], done, name)})
+            elif done is True:
+                if engine.audit is not None:
+                    engine.audit.append(engine.actor, "worktree.registered", name, {"path": found[0], "branch": found[1], "repo": repo, "by": "launch"})
+            else:   # it will not be reclaimed later: say so now
+                engine._note("worktree.error", name, {"error": "the worktree %s could not be recorded in the registry: it will not be reclaimed automatically" % found[0]})
+    except Exception as err:
+        engine._note("worktree.error", name, {"error": _one_line(str(err), 120)})
+
+
+def launch_headless(engine, name, agent, directory, role=None, reports_to=None, issue=None, brief=None, charter=None, repo=None, launched_by=None):
+    """Create a fleet agent with NO terminal (#433): a v2 session in the OpenCode service, a private record (state-dir/headless/<name>.json) and the
+    brief through the API. Nothing is opened in herdr. Presence is proved by the service: the new session must answer and carry the worker's name
+    before the brief is sent. Returns {"name", "session", "pane": None, "tab": None, "headless": True}.
+
+    What differs from a terminal worker, and is said in the docs: its tools run in the SERVICE's environment, not in a pane's. There is no
+    per-worker environment (no GH_TOKEN of its repo's account, no view variables); it is identified by the OPENCODE_SESSION_ID the service sets for
+    its tools, and the gh shim picks its account from the session's stored repo. Only `cmd_launch` calls this, after the lane-name guard, the agent
+    check and the gate probe."""
+    problems = launch_problems(name, agent, directory, None, issue, charter, headless=True)
+    if problems:
+        raise LaunchError("; ".join(problems))
+    if engine.state_dir is None:
+        raise LaunchError("no state directory: a headless worker needs its record")
+    try:
+        with agent_lock(engine.state_dir, name):   # the name check, the session create and the record write are ONE step: two launches of one name cannot both pass
+            taken = engine.discover(engine.now()).agents.get(name)
+            if taken is not None:
+                raise LaunchError("a fleet agent named %s already exists (%s)" % (name, "headless" if taken.headless else "in pane %s" % taken.pane))
+            ap = load_agent_presence()
+            if ap.read_record(engine.state_dir, name)[0] is not None:
+                raise LaunchError("a headless record for %s already exists: `%s retire %s` first, or pick another name" % (name, PROG, name))
+            identity = headless_identity(engine, repo)   # refuses a repo that maps to a named gh account: a headless worker cannot be pinned to it
+            fleet = fleet_record(name, role, reports_to, issue, charter, repo, launched_by)
+            fleet["headless"] = True
+            with engine._external("v2.session.create", name, {"agent": agent, "directory": directory, "fleet": fleet, "headless": True}) as result:
+                session_id = engine.v2.session_create(agent, name, directory, {"fleet": fleet})["id"]
+                result["session"] = session_id
+            try:
+                ap.save_record(engine.state_dir, name, session_id, engine.v2.service_url(), now=engine.now())
+                info = engine.v2.session_get(session_id) or {}
+                if ((_fleet_meta(info) or {}).get("name")) != name:
+                    raise LaunchError("the service does not show the new session as %s: nothing was sent" % name)
+                if brief:
+                    send_brief(engine, name, session_id, brief)
+                if engine.audit is not None:
+                    engine.audit.append(engine.actor, "headless.launched", name, {"session": session_id, "agent": agent, "directory": _one_line(directory, 160), "brief_chars": len(brief or "")})
+            except Exception as err:
+                cleaned = undo_headless_launch(engine, ap, name, session_id)
+                raise LaunchError("%s (%s)" % (_one_line(str(err)), cleaned)) from err
+    except ImpactStateBusy:
+        raise LaunchError("another launch or reattach of %s is running: wait for it" % name) from None
+    register_launch_worktree(engine, name, directory, repo)
+    return {"name": name, "session": session_id, "pane": None, "tab": None, "headless": True, "identity": identity}
+
+
+def headless_identity(engine, repo):
+    """The identity a headless worker will have, as one line; refuses (LaunchError) when it would be the WRONG one.
+
+    A terminal worker is pinned to its repo's gh account by its pane's environment (GH_TOKEN). A headless worker's tools run in the OpenCode service,
+    and nothing durable pins them: `session.create` and `session.prompt` carry no environment, and `PUT /api/session/{id}/environment`, which does
+    set one, is held in the service's memory and is gone after a service restart (measured in a throwaway profile: the variable was set, then empty
+    after `service restart`), at which point the worker would silently act as the service's default account. So a repo that `gh_users` maps to a
+    named account is refused: use a terminal launch. Any other worker acts as the account of the service's environment, and says so."""
+    accounts = getattr(engine, "accounts", None)
+    if repo and accounts is None:   # fail closed: with no account map nothing says which account this repo uses
+        raise LaunchError("cannot tell which gh account %s uses (no account map): a headless worker is refused" % repo)
+    if repo:
+        account = accounts.account_for(repo)
+        if account:
+            raise LaunchError("a headless worker cannot work as the gh account %s that gh_users maps %s to: its tools run in the OpenCode service's environment, "
+                              "which cannot be pinned to an account (a service restart drops any per-session setting), so it would act as the service's own "
+                              "default account. Use a terminal launch (omit --headless)" % (account, repo))
+        problem = launch_account_problem(engine.config, accounts, repo)
+        if problem:
+            raise LaunchError(problem)
+        return "this headless worker acts as the OpenCode service environment's own gh account (gh_users has no entry for %s)" % repo
+    return "this headless worker acts as the OpenCode service environment's own gh account (it has no repo)"
+
+
+def undo_headless_launch(engine, ap, name, session_id):
+    """Best effort after a headless launch failed past `session.create`: stop whatever the brief started, delete the session, then remove the record.
+    Returns one sentence saying exactly what was cleaned and what remains. The record is removed only when the session is gone: a session that is
+    still there keeps its record, so `status` shows it and it is not invisible."""
+    done, left = [], []
+    interrupted = True
+    try:
+        engine.v2.interrupt(session_id)
+    except Exception:
+        interrupted = False   # best effort: the session is about to be deleted; said below if it could not be
+    try:
+        engine.v2.session_remove(session_id)
+        done.append("session %s was deleted" % session_id)
+        gone = True
+    except V2Error as err:
+        gone = err.reason == "http" and err.status == 404   # already gone is as good as deleted
+        (done if gone else left).append("session %s was already gone" % session_id if gone else
+                                         "session %s could NOT be deleted (%s): delete it in the OpenCode service" % (session_id, _one_line(str(err), 80)))
+    except Exception as err:
+        gone = False
+        left.append("session %s could NOT be deleted (%s): delete it in the OpenCode service" % (session_id, _one_line(str(err), 80)))
+    if gone:
+        try:
+            if ap.remove_record(engine.state_dir, name):
+                done.append("its record was removed")
+        except Exception as err:
+            left.append("its record could NOT be removed (%s): `%s retire %s` clears it" % (_one_line(str(err), 80), PROG, name))
+    if not gone and not interrupted:
+        left.append("it could not be interrupted, so what the brief started may still be running")
+    if not gone:
+        try:
+            has_record = ap.read_record(engine.state_dir, name)[0] is not None
+        except Exception:
+            has_record = False
+        left.append("its record was kept so `%s status` shows it: `%s retire %s` stops watching it" % (PROG, PROG, name) if has_record
+                    else "it has no record, so nothing shows it")
+    try:
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "headless.launch_undone", name, {"session": session_id, "cleaned": done, "remains": left})
+    except Exception:
+        pass   # the sentence below is the report; a failing audit sink must not hide it
+    return "launch failed; " + "; ".join(done + left if (done or left) else ["nothing was created"])
 
 
 def resume_agent(engine, name, session_id, workspace, patience=LAUNCH_PATIENCE, sleep=time.sleep, replace=False):
@@ -6207,16 +6523,125 @@ def cmd_reattach_all(args, runner, now, socket_call=None):
     return EXIT_ERROR if failed else EXIT_OK
 
 
+def retire_close_problem(engine, runner, now, discovery, name, seen, force):
+    """(pane, None) when `retire --close` may close `name`'s pane now, else (None, why not). Judged BEFORE the retirement, so a refusal changes nothing.
+    Who: the operator at their own terminal (any agent), the agent's recorded boss, or the Chief of Staff for an agent that reports to it DIRECTLY;
+    never the caller's own pane or session. What: the pane the switchboard has for the agent, read again live, must still hold THAT agent's session
+    (a stored pane id can name another terminal after a herdr restart). A working agent needs --force, which is refused while a registered worktree of
+    the agent holds uncommitted or unpushed work."""
+    kind = gates_caller_kind(runner, now)
+    if kind[0] == "person":
+        who = "the operator"
+    elif kind[0] == "agent":
+        who = kind[1]
+        if who == name:
+            return None, "an agent cannot close its own pane"
+        if seen is None or boss_name(discovery, seen) != who:
+            return None, "%s may not close %s's pane: only the operator, or the agent's own boss (the Chief of Staff for a direct report), may" % (who, name)
+    else:
+        return None, "%s: only the operator or the agent's own boss may close a pane" % kind[1]
+    if seen is None or not seen.pane or not seen.session_id:
+        return None, "%s has no pane and session the switchboard can see: nothing to close" % name
+    pane = seen.pane
+    if os.environ.get("HERDR_PANE_ID") == pane:
+        return None, "pane %s is the one you are in: never closed by you" % pane
+    try:
+        live = engine.herdr.agent_get(pane)
+    except HerdrError as err:
+        return None, "pane %s cannot be read now (%s): nothing was closed" % (pane, _one_line(str(err), 80))
+    if agent_session(live) != seen.session_id:
+        return None, "pane %s no longer holds %s's session: nothing was closed" % (pane, name)
+    if live.get("agent_status") in ("working", "blocked") and not force:
+        return None, "%s is %s: pass --force to close it anyway" % (name, live.get("agent_status"))
+    if force and live.get("agent_status") in ("working", "blocked") and engine.state_dir is not None:
+        for path, entry in sorted(read_worktrees(engine.state_dir).items()):
+            if isinstance(entry, dict) and entry.get("agent") == name:
+                facts = worktree_facts(runner, path)
+                if facts["exists"] and (facts["why"] or facts["dirty"] or facts["pushed"] is False):
+                    return None, "--force refused: %s holds uncommitted or unpushed work in %s" % (name, path)
+    return pane, None
+
+
+def retire_close_pane(engine, runner, now, name, pane, caller, force):
+    """Close `pane` after judging EVERYTHING again from a fresh discovery (the first judgment was before the retirement lock and the worktree reclaim):
+    who may, which pane, its session, its status and the worktree guard. Audited whether it closes or not. (status line, ok)"""
+    detail = {"pane": pane, "by": caller}
+    try:
+        fresh = engine.discover(engine.now())
+        again, why = retire_close_problem(engine, runner, now, fresh, name, fresh.agents.get(name), force)
+        if why:
+            raise HerdrError("refused", why)
+        if again != pane:
+            raise HerdrError("moved", "the agent's pane is now %s, not %s" % (again, pane))
+        with engine._external("herdr.pane.close", name, {"pane": pane, "why": "retire --close"}):
+            engine.herdr.pane_close(pane)
+    except Exception as err:
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "fleetpane.close_failed", name, dict(detail, why=_one_line(str(err), 120)))
+        return "pane %s was not closed (%s): the agent is retired" % (pane, _one_line(str(err), 100)), False
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, "fleetpane.closed", name, detail)
+    return "closed pane %s (the agent's terminal: its memory is released)" % pane, True
+
+
+def headless_record_to_free(state, name):
+    """What `retire` keeps of a headless worker's record ({"session", "url", "created"}), or None when it has none. Reads only."""
+    try:
+        record = load_agent_presence().read_record(state, name)[0]
+    except Exception:
+        return None
+    if record is None:
+        return None
+    return {"session": record["session"], "url": record.get("url"), "created": record.get("created")}
+
+
+def free_headless_record(engine, state, name):
+    """Remove the record of a retired headless worker so the NAME is free to launch again (its details are kept in the retirement for `retire --undo`).
+    One line. The session itself keeps running in the service: only the switchboard stops watching it."""
+    try:
+        with agent_lock(state, name):   # the same per-name lock a launch holds for its check and its record write
+            load_agent_presence().remove_record(state, name)
+    except Exception as err:
+        return "%s: its headless record could NOT be removed (%s): the name stays taken until it is" % (name, _one_line(str(err), 100))
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, "headless.record_freed", name, {"why": "retired"})
+    return "%s: its headless record was removed, so the name is free (`%s retire --undo %s` puts it back)" % (name, PROG, name)
+
+
+def restore_headless_record(engine, state, name, entry):
+    """`retire --undo` of a headless worker: put its record back when the name is still free. (line or None, ok): ok is False only when the record
+    could not be put back (busy, or a write error): the retirement then stays so the undo can be tried again. A name that is taken again is not an
+    error: the old record is simply not restored, and the line says so."""
+    kept = entry.get("headless") if isinstance(entry, dict) else None
+    if not isinstance(kept, dict) or not isinstance(kept.get("session"), str):
+        return None, True
+    ap = load_agent_presence()
+    try:
+        with agent_lock(state, name):   # the per-name lock of a launch: the check and the write are ONE step, judged on a fresh discovery
+            if ap.read_record(state, name)[0] is not None or name in engine.discover(engine.now()).agents:
+                return "%s: a worker named %s exists again, so its old headless record was NOT restored" % (name, name), True
+            ap.save_record(state, name, kept["session"], kept.get("url"), now=kept.get("created"))
+    except ImpactStateBusy:
+        return "%s: a launch of %s is running, so its old headless record was NOT restored" % (name, name), False
+    except Exception as err:
+        return "%s: its headless record could NOT be restored (%s)" % (name, _one_line(str(err), 100)), False
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, "headless.record_restored", name, {"session": kept["session"]})
+    return "%s: its headless record was restored: it is watched again" % name, True
+
+
 def cmd_retire(args, runner, now):
     """`retire <name> [--reason TEXT]` / `retire --undo <name>`: a finished worker is RETIRED: the daemon stops reporting it DEAD or DETACHED, `reattach
-    --all-detached` skips it, and it is shown once in `status` as retired (dropped after RETIRED_SHOW_DAYS). Nothing is deleted and no tab is closed. The
-    caller rule is `reattach`'s: the operator, the Chief of Staff or the agent's own boss; others are refused and audited."""
+    --all-detached` skips it, and it is shown once in `status` as retired (dropped after RETIRED_SHOW_DAYS). Nothing is deleted and no tab is closed, unless
+    `--close` is given: then the agent's terminal PANE is closed too (see `retire_close_problem`). The caller rule is `reattach`'s: the operator, the
+    Chief of Staff or the agent's own boss; others are refused and audited."""
     engine, state, _ = build_engine(runner, now, "cli")
     name = args.name
     if not NAME_RE.match(name or ""):
         raise LaunchError("name the agent: `%s retire <name>`" % PROG)
     discovery = engine.discover(engine.now())
-    who = reattach_caller_problem(engine, runner, now, discovery, name)
+    hint = ((read_retired(state).get(name) or {}).get("session") if args.undo else None)   # a retired headless worker is not discovered: its boss is found from its stored session
+    who = reattach_caller_problem(engine, runner, now, discovery, name, hint)
     if who:
         if engine.audit is not None:
             engine.audit.append(engine.actor, "fleetpane.retire_refused", name, {"why": _one_line(who, 160)})
@@ -6224,15 +6649,30 @@ def cmd_retire(args, runner, now):
     reason = " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", args.reason or "").split())[:200]
     seen = discovery.agents.get(name)
     known = read_pane_health(state)["agents"].get(name) or {}
+    close_pane, close_by, close_note, headless_kept = None, None, None, None
+    if getattr(args, "close", False) and not args.undo and seen is not None and seen.headless:
+        close_note = "headless: it has no terminal, so there is nothing to close"
+    elif getattr(args, "close", False) and not args.undo:
+        close_pane, why = retire_close_problem(engine, runner, now, discovery, name, seen, getattr(args, "force", False))
+        close_by = identify_who(engine, runner, now)
+        if why:
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "fleetpane.close_refused", name, {"pane": seen.pane if seen is not None else None, "by": close_by, "why": _one_line(why, 160)})
+            raise LaunchError("refused: %s (nothing was retired or closed)" % why)
     with agent_lock(state, "files"):
-        who = reattach_caller_problem(engine, runner, now, discovery, name)   # judged again inside the lock: check and write are one step
+        who = reattach_caller_problem(engine, runner, now, discovery, name, hint)   # judged again inside the lock: check and write are one step
         if who:
             raise LaunchError("refused: %s" % who)
         retired = read_retired(state)
         if args.undo:
-            if retired.pop(name, None) is None:
+            entry = retired.get(name)
+            if entry is None:
                 print("%s is not retired" % name)
                 return EXIT_OK
+            restored, restore_ok = restore_headless_record(engine, state, name, entry)   # FIRST: a record that cannot be put back leaves the retirement as it is, to try again
+            if not restore_ok:
+                raise LaunchError("%s: nothing was changed, the retirement stays (try `%s retire --undo %s` again)" % (restored, PROG, name))
+            retired.pop(name, None)
             try:
                 _write_small(state, RETIRED_FILE, retired)
             except OSError as err:
@@ -6247,12 +6687,17 @@ def cmd_retire(args, runner, now):
             if engine.audit is not None:
                 engine.audit.append(engine.actor, "fleetpane.unretired", name, {})
             print("%s is no longer retired: detection watches it again" % name)
+            if restored:
+                print(restored)
             return EXIT_OK
         if seen is None and not known:
             raise LaunchError("%s is not a fleet agent this switchboard has seen (see `%s status`)" % (name, PROG))
         prune_retired(retired, now())
         retired[name] = {"at": int(now()), "by": identify_who(engine, runner, now), "reason": reason or "finished",
                          "session": (seen.session_id if seen else None) or known.get("session"), "auto": False}
+        headless_kept = headless_record_to_free(state, name)
+        if headless_kept is not None:
+            retired[name]["headless"] = headless_kept   # kept here so `retire --undo` can put the record back
         try:
             _write_small(state, RETIRED_FILE, retired)
         except OSError as err:
@@ -6265,7 +6710,15 @@ def cmd_retire(args, runner, now):
         pass
     if engine.audit is not None:
         engine.audit.append(engine.actor, "fleetpane.retired", name, {"auto": False, "reason": retired[name]["reason"], "by": retired[name]["by"]})
-    print("%s is retired: not watched, not reattached by --all-detached; nothing was deleted or closed (`%s retire --undo %s` reverses)" % (name, PROG, name))
+    if headless_kept is not None:
+        print(free_headless_record(engine, state, name))
+    if close_note is not None:
+        print("%s is retired: not watched, not reattached by --all-detached; %s. Its session keeps running in the service until it finishes or is interrupted (`%s retire --undo %s` reverses the retirement)" % (name, close_note, PROG, name))
+    elif close_pane is not None:
+        line, _ = retire_close_pane(engine, runner, now, name, close_pane, close_by, getattr(args, "force", False))
+        print("%s is retired: not watched, not reattached by --all-detached; %s (`%s retire --undo %s` reverses the retirement)" % (name, line, PROG, name))
+    else:
+        print("%s is retired: not watched, not reattached by --all-detached; nothing was deleted or closed (`%s retire --undo %s` reverses)" % (name, PROG, name))
     try:
         for line in reclaim_for_agent(engine, runner, name, True, "retired"):   # its registered worktrees: removed when clean and pushed, else kept with the reason
             print("worktree: " + line)
@@ -6782,6 +7235,9 @@ def add_retire_parsers(sub):
     retire.add_argument("name", help="The agent's fleet name")
     retire.add_argument("--reason", help="Why (one line)")
     retire.add_argument("--undo", action="store_true", help="Watch it again")
+    retire.add_argument("--close", action="store_true", help="Also close the agent's terminal pane (frees its memory): only its boss, the Chief of Staff for a direct report, or the operator; "
+                                                             "the pane is read again and must still hold the agent's own session; never your own pane")
+    retire.add_argument("--force", action="store_true", help="With --close: close a pane that is still working (refused for a worker with unpushed or uncommitted work in a registered worktree)")
 
 
 def add_reattach_parsers(sub):
@@ -7216,8 +7672,10 @@ def cmd_whoami(args, runner, now):
     if getattr(args, "json", False):
         fleet = caller_fleet(engine.herdr, engine.v2, os.environ)
         repo = fleet.get("repo") if isinstance(fleet.get("repo"), str) else None
-        print(json.dumps({"name": fleet["name"], "repo": repo or _fleet_repo(fleet, config) or config.get("intent_repo") or None},
-                         sort_keys=True))
+        own = repo or _fleet_repo(fleet, config)
+        # `own` is false when the repo is only the config's `intent_repo` default: an agent with no repo of its own (the Chief of Staff) has no account of
+        # its own to keep, so the gh shim may use the account of the repo a command names
+        print(json.dumps({"name": fleet["name"], "repo": own or config.get("intent_repo") or None, "own": bool(own)}, sort_keys=True))
         return EXIT_OK
     if getattr(args, "repo", False):
         fleet = caller_fleet(engine.herdr, engine.v2, os.environ)
@@ -7927,7 +8385,7 @@ def prune_report_riders(engine, discovery):
 # ======================================================================
 
 DECISIONS_FILE = "decisions.json"
-DECISIONS_STALE_SECONDS = 120   # a file this old (by mtime, which every pass refreshes) is not current
+DECISIONS_STALE_SECONDS = 180   # a file this old (by mtime, which every pass refreshes) is not current
 DECISION_TITLE_MAX = decision_core.DECISION_TITLE_MAX
 DECISION_REPORT_TITLE_MAX = decision_core.DECISION_REPORT_TITLE_MAX
 DECISION_SOURCES = ("github", "v2", "reports")
@@ -8843,6 +9301,7 @@ def read_pr_json(engine, repo, number, extra_fields=""):
     config = engine.config
     accounts = getattr(engine, "accounts", None) or GhAccounts(config, engine.gh_runner or subprocess.run, engine.now)
     try:
+        refuse_excluded(config, repo)   # #446
         env = accounts.env_for(repo)
     except AccountError as err:
         raise NoticeError(str(err)) from None
@@ -8872,6 +9331,7 @@ def read_ref_state(engine, repo, number, kind):
         return read_pr_facts(engine, repo, number)["state"]
     accounts = getattr(engine, "accounts", None) or GhAccounts(engine.config, engine.gh_runner or subprocess.run, engine.now)
     try:
+        refuse_excluded(engine.config, repo)   # #446
         env = accounts.env_for(repo)
     except AccountError as err:
         raise NoticeError(str(err)) from None
@@ -9720,6 +10180,10 @@ def external_status_line(config, state_dir, now):
     text = "%s; outbox %s; last pull %s" % ("ok" if body.get("state") == "ok" else "down: %s" % body.get("reason"),
                                             body.get("outbox", 0), "%s ago" % format_age(now - pulled) if pulled else "never")
     failures = body.get("permanent_failures") or 0
+    waiting = body.get("settled_waiting")
+    if isinstance(waiting, int) and not isinstance(waiting, bool) and waiting > 0:   # decided outside, answer not here yet: never invisible if it never arrives
+        oldest = body.get("settled_oldest")
+        text += "; settled outside, waiting for its answer: %d%s" % (waiting, " (oldest %s)" % format_age(max(0, now - oldest)) if isinstance(oldest, (int, float)) and not isinstance(oldest, bool) else "")
     return ("external  " + text + ("; %d permanent failure(s)" % failures if failures else "")
             + ("; ALARM: outbox is deep" if body.get("alarm") else ""))
 
@@ -12332,6 +12796,12 @@ def _validate_github(config, source):
             for k, v in users.items()):
         raise ConfigError("%s: 'gh_users' must map \"owner/repo\" or \"owner/*\" to a gh account name, got %r"
                           % (source, users))
+    seen_keys = {}
+    for key, account in users.items():
+        same = GhAccounts.normal_repo(key)
+        if same in seen_keys and seen_keys[same][1].lower() != account.lower():   # GitHub names are not case sensitive: two spellings of one repo may not name two accounts
+            raise ConfigError("%s: 'gh_users' names %r and %r, the same repo, with different accounts (%s, %s)" % (source, seen_keys[same][0], key, seen_keys[same][1], account))
+        seen_keys.setdefault(same, (key, account))
     config["gh_users"] = dict(users)
     poll = config["github_poll_seconds"]
     if not _is_number(poll) or poll < GITHUB_POLL_MIN:
@@ -12885,7 +13355,7 @@ class GitHubHub:
         self.runner, self.spawn, self.now, self.actor = runner, spawn, now, actor
         self.lock = threading.RLock()
         self.queue = {}        # key -> GitHubItem, until delivered
-        self.watches = {repo: Watch(repo) for repo in config["github_repos"]}
+        self.watches = {repo: Watch(repo) for repo in watched_repos(config, {})}   # the baseline less the excluded repositories
         self.accounts = GhAccounts(config, runner, now)  # PR 15: a gh account per repo
         self.lookback = config["github_lookback_hours"] * 3600
         self.backoff_base, self.backoff_max = GITHUB_BACKOFF_BASE, GITHUB_BACKOFF_MAX
@@ -13623,6 +14093,8 @@ class GitHubHub:
         """The repo's account's environment for a child, or None for the default account. Raises
         GitHubUnavailable when gh will not give the account's token (the text names the account only)."""
         try:
+            config = getattr(self, "config", None)
+            refuse_excluded(config if config is not None else getattr(self.accounts, "config", None), repo)   # #446: the forwarder start and every hub read take their environment here
             return self.accounts.env_for(repo)
         except AccountError as err:
             raise GitHubUnavailable(str(err)) from None
@@ -13933,7 +14405,8 @@ def github_status(config, state_dir, fleets=None, now=None):
     is watched by the daemon's last snapshot, the gh account it uses (a name, never a token) and the fleet
     agents in it."""
     repos = watched_repos(config, fleets or {})
-    report = {"repos": repos, "lookback_hours": config["github_lookback_hours"],
+    excluded = sorted(load_module("repo_exclusion").excluded_set(config))
+    report = {"repos": repos, "excluded": excluded, "lookback_hours": config["github_lookback_hours"],
               "events": list(config["github_events"]), "daemon": False, "watches": [], "port": None,
               "poll_seconds": config["github_poll_seconds"]}
     snapshot = {}
@@ -13981,10 +14454,11 @@ def github_status(config, state_dir, fleets=None, now=None):
 
 
 def format_github(report):
-    """Status lines for GitHub; none when no repo is watched."""
+    """Status lines for GitHub; none when no repo is watched and none is excluded."""
+    excluded = ["      github     excluded from watching and reading: %s (excluded_repos)" % ", ".join(report["excluded"])] if report.get("excluded") else []
     if not report["repos"]:
-        return []
-    lines = ["      github     watching %s; catch-up reads reach back %g h, older events are lost"
+        return excluded
+    lines = excluded + ["      github     watching %s; catch-up reads reach back %g h, older events are lost"
              % (", ".join(report["repos"]), report["lookback_hours"])]
     if not report["daemon"]:
         lines.append("        daemon not running: forwarder state is unknown")
@@ -14106,10 +14580,16 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         if config_ok and disk_guard_settings(config) is not None:
             report["disk"] = disk_status_line(config, state)   # one stat of the volume
         if config_ok:
+            sg = load_module("spotlight_guard")
+            spot_cfg = sg.settings(config.get("spotlight_guard"))
+            if spot_cfg is not None:
+                report["spotlight"] = sg.status_lines(spot_cfg, sg.load(state), now())   # the file the hourly background check wrote: no process
+        if config_ok:
             cg = load_cpu_guard()
             cpu_cfg = cg.settings(config.get("cpu_guard"))
             if cpu_cfg is not None:
                 report["cpu"] = cg.status_line(cpu_cfg, cg.reading(), cg.slots_text(config, state))   # a system call (and the optional heavy_slots module): no process
+                report["mem"] = cg.mem_status_line(cg.memory_reading(), cg.biggest_holders(cg.process_table()))   # the kernel's counters and process table: no process
         if config_ok:
             report["orphans"] = orphan_status_line(config)   # one `ps`; None when there is none or the reaper is off
         if config_ok and config.get("v2_light"):
@@ -14232,7 +14712,7 @@ def _agent_line(entry):
     if seen is None:
         return "%-14s (not found)  %s" % (entry["name"], _plan_line(entry))
     return "%-14s %-8s %s  pane %s  your last prompt %s  %s" % (
-        seen["name"], seen["status"], seen["session"], seen["pane"] or "-",
+        seen["name"], seen["status"], seen["session"], seen["pane"] or ("(headless)" if seen.get("headless") else "-"),
         seen["last_human_prompt"] or "not in the window", _plan_line(entry))
 
 
@@ -14309,6 +14789,8 @@ def format_status(report):
     lines.extend(format_decisions_status(report["decisions"]) if "decisions" in report else [])
     lines.extend("      disk       " + report["disk"] for _ in [0] if report.get("disk"))
     lines.extend("      cpu        " + report["cpu"] for _ in [0] if report.get("cpu"))
+    lines.extend("      mem        " + report["mem"] for _ in [0] if report.get("mem"))
+    lines.extend("      spotlight  " + text for text in report.get("spotlight") or [])
     lines.extend("      orphans    " + report["orphans"] for _ in [0] if report.get("orphans"))
     lines.extend("      v2 calls   " + report["v2_calls"] for _ in [0] if report.get("v2_calls"))
     lines.extend("      " + text for text in report.get("github_calls") or [])
@@ -14577,6 +15059,8 @@ def cmd_launch(args, runner, now, socket_call=None):
         return EXIT_OK
     if not args.agent or not args.dir:
         raise LaunchError("--agent and --dir are required (or --resume SESSION for an existing agent)")
+    if getattr(args, "headless", False) and (args.workspace or args.new_workspace):
+        raise LaunchError("--headless opens no terminal, so it takes no --workspace or --new-workspace (`%s watch NAME` opens one later)" % PROG)
     if (args.name or "").startswith(LANE_NAME_PREFIX):
         raise LaunchError("names starting %r are the plan review engine's reviewer lanes: only it launches them" % LANE_NAME_PREFIX)
     repo = launch_repo(args)
@@ -14606,15 +15090,23 @@ def cmd_launch(args, runner, now, socket_call=None):
         launcher = identify_caller(engine.herdr, engine.v2, os.environ)   # #372: who ran this launch, recorded in the session; a plain shell is nobody
     except Exception:
         launcher = None
+    launched_by = launcher if isinstance(launcher, str) and launcher else None
     try:
-        done = launch_agent(engine, args.name, args.agent, args.dir, workspace, args.role, args.reports_to,
-                            None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo,
-                            launched_by=launcher if isinstance(launcher, str) and launcher else None)
+        if getattr(args, "headless", False):
+            done = launch_headless(engine, args.name, args.agent, args.dir, args.role, args.reports_to,
+                                   None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo,
+                                   launched_by=launched_by)
+        else:
+            done = launch_agent(engine, args.name, args.agent, args.dir, workspace, args.role, args.reports_to,
+                                None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo,
+                                launched_by=launched_by)
     except LaunchError as err:
         if created:
             raise LaunchError("%s (workspace %s was created and is left for you to close)" % (err, created)) from err
         raise
     print(json.dumps(done, sort_keys=True))
+    if done.get("identity"):
+        sys.stderr.write("%s: %s\n" % (PROG, done["identity"]))
     boss = args.reports_to
     if boss is None and (brief or getattr(args, "checkpoint", None) or getattr(args, "overdue", None)):
         try:  # a launch with no --reports-to: the launching agent is who an overdue checkpoint should wake (the worker's metadata is unchanged)
@@ -15084,15 +15576,15 @@ def _fleet_repo(fleet, config):
 def watched_repos(config, fleets):
     """The repos to watch now, sorted: the config baseline, every `repo` a live fleet agent names, and the
     repo of every charter it holds. `fleets` maps agent name -> metadata.fleet. Derived on every call, so
-    there is nothing to keep and nothing to lose (R3). The `static-repos` fault reads the baseline only."""
+    there is nothing to keep and nothing to lose (R3). The `static-repos` fault reads the baseline only. The config's `excluded_repos` are taken out of the result,
+    so every consumer of this set (forwarders, sweep, triage) honours them."""
     found = set(config["github_repos"])
-    if fault("static-repos"):
-        return sorted(found)
-    for fleet in fleets.values():
-        repo = _fleet_repo(fleet, config)
-        if repo:
-            found.add(repo)
-    return sorted(found)
+    if not fault("static-repos"):
+        for fleet in fleets.values():
+            repo = _fleet_repo(fleet, config)
+            if repo:
+                found.add(repo)
+    return sorted(load_module("repo_exclusion").without_excluded(config, found))   # #446: an excluded repository is never watched, whatever names it
 
 
 def discovered_fleets(discovery):
@@ -15173,6 +15665,18 @@ def _endpoint_of(path):
     return re.sub(r"\d+", "#", bare) or "repo"
 
 
+class RepoExcluded(AccountError):
+    """A read of a repository the config excludes (`excluded_repos`, #446): no process is started. An AccountError, so every caller that already
+    degrades on an account problem (the hub's reads, the intent reader, a notice) degrades the same way."""
+
+
+def refuse_excluded(config, repo):
+    """The one check of the exclusion for a gh read of `repo`: raises RepoExcluded when the config excludes it. No config at all means no exclusion list, so the
+    read is allowed (a deliberate fail open for a test double built without one: every real hub and GhAccounts carries its config)."""
+    if repo and config is not None and load_module("repo_exclusion").is_excluded(config, repo):
+        raise RepoExcluded("repository %s is excluded from the fleet's reads (excluded_repos)" % repo)
+
+
 class GhAccounts:
     """Which gh account a repo uses, and its token at the moment of use.
 
@@ -15195,13 +15699,27 @@ class GhAccounts:
         self.audit, self.actor = None, "daemon"
         self.conditional = False                 # ask with `-i` and keep the ETag: the daemon turns it on; a one-shot command or a test reads plainly
 
+    @staticmethod
+    def normal_repo(repo):
+        """`owner/name` the way GitHub treats it: whitespace and a trailing `.git` or `/` off, lower case (GitHub names are not case sensitive). None when
+        it is not a string. Used for the repo and for every `gh_users` key, so a different spelling of a mapped repo is still the mapped repo."""
+        if not isinstance(repo, str):
+            return None
+        text = repo.strip().rstrip("/")
+        if text.lower().endswith(".git"):
+            text = text[:-4]
+        return text.lower()
+
     def account_for(self, repo):
         if fault("one-account"):
             return None  # the fault: the default token reads every repo
-        users = self.config.get("gh_users") or {}
-        if repo in users:
-            return users[repo]
-        return users.get("%s/*" % repo.split("/")[0]) if isinstance(repo, str) and "/" in repo else None
+        want = self.normal_repo(repo)
+        if not want:
+            return None
+        users = {self.normal_repo(key): account for key, account in (self.config.get("gh_users") or {}).items() if isinstance(key, str)}
+        if want in users:
+            return users[want]
+        return users.get("%s/*" % want.split("/")[0]) if "/" in want else None
 
     def default_available(self):
         return any(self.environ.get(name) for name in ("GH_TOKEN", "GITHUB_TOKEN"))
@@ -15256,6 +15774,7 @@ class GhAccounts:
           - a 403/429 that says the limit is spent pauses every read of that account until the limit resets (GhRateLimited is raised
             at once, no process is started). No read is exempt: writes do not go through here.
         A runner whose answer has no HTTP header block (a fake, `--paginate`) is passed through as it is."""
+        refuse_excluded(self.config, repo)   # #446: the lowest layer every gh read goes through: nothing is spawned for an excluded repository
         account = self.describe(repo)
         now = self.now()
         with self.lock:
@@ -15495,6 +16014,8 @@ class IssueIntent:
         found = cls(number, data.get("state"), data.get("title") or "", intent, done_when,
                     data.get("updated_at"), bool(_CHARTER_BLOCK.search(body)))
         found.workspace = charter_workspace(body)
+        found.labels = [l.get("name") if isinstance(l, dict) else l for l in (data.get("labels") or []) if isinstance(l.get("name") if isinstance(l, dict) else l, str)]   # #432: the load feed's waiting and parked asks
+        found.parked_until = parked_until(body, found.labels)   # the switchboard's own parser: the load module never copies it
         return found
 
 
@@ -15530,6 +16051,7 @@ class IntentReader:
         self.gh, self.repo, self.runner, self.now = gh, repo, runner, now
         self.timeout, self.ttl = timeout, ttl
         self.accounts = accounts  # PR 15: a GhAccounts; None reads every repo with the default account
+        self.config = None        # the config whose excluded_repos are never read; when None, the config of `accounts` (every reader has one)
         self._cache = {}
         self.live, self.live_ttl = None, INTENT_TTL_LIVE   # live(repo) -> the running forwarder's generation, or None (the hub sets it)
 
@@ -15545,6 +16067,9 @@ class IntentReader:
             raise IntentError("gh", str(err)) from None
 
     def _api(self, path, repo=None):
+        config = self.config if self.config is not None else getattr(self.accounts, "config", None)   # every construction passes `accounts=GhAccounts(config, ...)`
+        if config is not None and load_module("repo_exclusion").is_excluded(config, repo or self.repo):
+            raise IntentError("excluded", "repository %s is excluded from the fleet's reads (excluded_repos)" % (repo or self.repo))   # #446: no read
         argv = [self.gh, "api", path]
         env = self.env_for(repo)
         extra = {"env": env} if env is not None else {}
@@ -15685,8 +16210,10 @@ def intent_reader_for(config, runner=subprocess.run, now=time.time):
     """The IntentReader the config asks for, or None when no `intent_repo` is set."""
     if not config.get("intent_repo"):
         return None
-    return IntentReader(config["gh"], config["intent_repo"], runner, now, config["call_timeout_seconds"],
-                        accounts=GhAccounts(config, runner, now))
+    reader = IntentReader(config["gh"], config["intent_repo"], runner, now, config["call_timeout_seconds"],
+                          accounts=GhAccounts(config, runner, now))
+    reader.config = config
+    return reader
 
 
 # -- composing: one section per ask
@@ -19056,6 +19583,7 @@ def cmd_review_measure(args, runner, now):
         engine, state, config = build_engine(runner, now, "cli", writable=False)
         accounts = getattr(engine, "accounts", None) or GhAccounts(config, runner, now)
         try:
+            refuse_excluded(config, args.repo)   # #446
             env = accounts.env_for(args.repo)
         except AccountError as err:
             raise ReviewError(str(err)) from None
@@ -19464,7 +19992,7 @@ def cmd_disk_reap_docker(args, runner, now):
     """`disk reap-docker [--apply]`: list (the default) or remove the expired labelled docker objects."""
     docker = _docker_executable(args.docker)
     if docker is None:
-        sys.stderr.write("%s: disk reap-docker: docker is not installed or not on PATH (%s): nothing was run\n" % (PROG, _plain(args.docker, 160)))
+        sys.stderr.write("%s: disk reap-docker: %s: nothing was run\n" % (PROG, _docker_message(args.docker)))
         return EXIT_USAGE
     apply = bool(args.apply)
     if apply and not load_config().get("docker_reaper", True):
@@ -19488,9 +20016,9 @@ cmd_disk_reap_docker.direct = True
 
 def cmd_disk_prune(args, runner, now):
     """`disk prune [--dry-run]`."""
-    docker = shutil.which(args.docker) if os.sep not in args.docker else (args.docker if os.access(args.docker, os.X_OK) else None)
+    docker = _docker_executable(args.docker)
     if docker is None:
-        sys.stderr.write("%s: disk prune: docker is not installed or not on PATH (%s): nothing was run\n" % (PROG, _plain(args.docker, 160)))
+        sys.stderr.write("%s: disk prune: %s: nothing was run\n" % (PROG, _docker_message(args.docker)))
         return EXIT_USAGE
     commands = [(docker,) + argv[1:] for argv in DISK_PRUNE_COMMANDS]
     if args.dry_run:
@@ -19599,7 +20127,8 @@ def disk_report(args, runner, now, out=print):
     lines.append("docker")
     docker = _docker_executable(args.docker)
     if docker is None:
-        lines.append("  docker: not installed or not on PATH (%s)" % _plain(args.docker, 120))
+        why = _docker_problem(args.docker)[1]
+        lines.append("  docker: %s (%s)" % (why if why.startswith("not installed") else "refused: " + why, _plain(args.docker, 100)))
     else:
         try:
             done = runner([docker, "system", "df"], capture_output=True, text=True, timeout=DOCKER_REAP_TIMEOUT, stdin=subprocess.DEVNULL)
@@ -19722,6 +20251,66 @@ def cmd_disk(args, runner, now):
 cmd_disk.direct = True   # an operator's command on the machine: no daemon start
 
 
+class _RedsReader:
+    """GET-only reads for `reds` through the repo's own gh account: JSON through the account gate (counted, paused when the limit is spent); the artifact as bytes
+    straight from the runner (not counted by the gate; its size was checked against the artifact list before this is called)."""
+
+    def __init__(self, config, runner, now, repo):
+        self.config, self.runner, self.repo = config, runner, repo
+        self.accounts = GhAccounts(config, runner, now)
+
+    def json(self, path):
+        done = self.accounts.read(self.runner, path, self.repo, self.config["call_timeout_seconds"], stdin=subprocess.DEVNULL)
+        if done.returncode != 0:
+            raise load_reds().RedsError("gh api %s: %s" % (path.split("?")[0], self.accounts.scrub(_one_line(done.stderr or done.stdout or "exit %d" % done.returncode, 120))))
+        try:
+            return json.loads(done.stdout)
+        except ValueError:
+            raise load_reds().RedsError("gh api %s: not JSON" % path.split("?")[0]) from None
+
+    def zip(self, path):
+        refuse_excluded(self.config, self.repo)   # #446: json() refuses first; the zip read does not rely on that
+        env = self.accounts.env_for(self.repo)
+        extra = {"env": env} if env is not None else {}
+        done = self.runner([self.config["gh"], "api", path], capture_output=True, timeout=max(60, self.config["call_timeout_seconds"]), stdin=subprocess.DEVNULL, **extra)
+        if done.returncode != 0:
+            err = done.stderr if isinstance(done.stderr, str) else (done.stderr or b"").decode("utf-8", "replace")
+            raise load_reds().RedsError("gh api %s: %s" % (path.split("?")[0], self.accounts.scrub(_one_line(err, 120)) or "exit %d" % done.returncode))
+        return done.stdout
+
+
+def cmd_reds(args, runner, now):
+    """`reds <owner/repo#N>`: classify a pull request's failing tests (#342): failing on main's latest run, flaky there, or new. Read only."""
+    module = load_reds()
+    match = re.fullmatch(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]{1,9})", args.pr)
+    if match is None:
+        sys.stderr.write("%s: reds: %r is not OWNER/REPO#N\n" % (PROG, _plain(args.pr, 80)))
+        return EXIT_USAGE
+    repo, number = match.group(1), int(match.group(2))
+    config = load_config()
+    events = (module.settings(config.get("reds")).get(repo)) or list(module.DEFAULT_EVENTS)
+    try:
+        cache_dir = ensure_state_dir()
+    except Exception:
+        cache_dir = None   # no cache is only more calls
+    reader = _RedsReader(config, runner, now, repo)
+    return module.run(reader, repo, number, events, cache_dir, now, sys.stdout, module.workflows(config.get("reds")).get(repo))
+
+
+cmd_reds.direct = True   # reads GitHub on its own terms: no daemon start
+
+
+def add_reds_parsers(sub):
+    reds = sub.add_parser("reds", help="Classify a pull request's failing tests: failing on main's latest run, flaky there, or new (read only)",
+                          description="`reds OWNER/REPO#N` reads the `failing-tests` artifact (failing-tests.json v1) of the pull request's run and of main's last runs and "
+                                      "prints which failing names also fail on main's latest run, which are flaky there (2 or more of its last 5 usable runs) and which "
+                                      "are new. Main's runs are the runs of the repo's reference events on the default branch (config reds.reference_events, default push; "
+                                      "a merge_group reference is read by its gh-readonly-queue ref). Main is judged ONLY by main's own runs: the pull request's list "
+                                      "and its `complete` flag are its own claim. A run with no artifact, an expired one or complete=false is UNKNOWN, never passing. "
+                                      "Names match in full, else by a UNIQUE leaf (marked 'matched by name only'). Bounded calls, cached by run id; it writes nothing to GitHub.")
+    reds.add_argument("pr", help="OWNER/REPO#N")
+
+
 def cmd_heavy(args):
     """`heavy [--slots N] [--wait-max S] -- <command...>`: run the command in a CPU slot (ask #34); its exit status is ours."""
     module = load_heavy_slots()
@@ -19762,19 +20351,19 @@ def add_heavy_parsers(sub):
 
 
 def add_disk_parsers(sub):
-    disk = sub.add_parser("disk", help="Disk tools: `disk report` (a bare `disk`) shows what holds the disk, read only; `disk prune` removes old docker build cache and images (never volumes or running containers); `disk reclaim-worktrees` removes the clean, pushed worktrees of retired agents")
+    disk = sub.add_parser("disk", allow_abbrev=False, help="Disk tools: `disk report` (a bare `disk`) shows what holds the disk, read only; `disk prune` removes old docker build cache and images (never volumes or running containers); `disk reclaim-worktrees` removes the clean, pushed worktrees of retired agents")
     disk_sub = disk.add_subparsers(dest="disk_action", required=False)
     disk.add_argument("--docker", default="docker", help="The docker executable the bare `disk` report asks (default: docker on PATH)")
-    report = disk_sub.add_parser("report", help="what holds the disk: free space, docker usage, worktrees per agent, cache sizes, orphan candidates (read only; also a bare `disk`)")
+    report = disk_sub.add_parser("report", allow_abbrev=False, help="what holds the disk: free space, docker usage, worktrees per agent, cache sizes, orphan candidates (read only; also a bare `disk`)")
     report.add_argument("--docker", default=argparse.SUPPRESS, help="The docker executable (default: docker on PATH)")
-    prune = disk_sub.add_parser("prune", help="docker builder prune, docker image prune -a (older than a week) and, on docker 23.0 or newer, docker volume prune -f (anonymous volumes only), and nothing else",
+    prune = disk_sub.add_parser("prune", allow_abbrev=False, help="docker builder prune, docker image prune -a (older than a week) and, on docker 23.0 or newer, docker volume prune -f (anonymous volumes only), and nothing else",
                                 description="Runs exactly `docker builder prune -f --filter until=168h` and `docker image prune -a -f --filter until=168h` and prints what "
                                             "was reclaimed, then (only when the docker server is 23.0 or newer, where it removes ANONYMOUS volumes no container references and nothing named) "
                                             "`docker volume prune -f`, never `-a`. Never a running container, never `system prune`. Refuses without docker. NOTE: "
                                             "`until=168h` is the image's age, not its last use: a locally built image with no registry copy is removed too if no "
                                             "container uses it.")
     prune.add_argument("--dry-run", action="store_true", help="Print the commands and the candidate anonymous volumes and run none of them")
-    reap = disk_sub.add_parser("reap-docker", help="remove EXPIRED docker containers, networks and volumes that carry fleet.owner and fleet.expires labels",
+    reap = disk_sub.add_parser("reap-docker", allow_abbrev=False, help="remove EXPIRED docker containers, networks and volumes that carry fleet.owner and fleet.expires labels",
                                description="Lists (the default) or, with --apply, removes docker containers (`rm -f`), networks and volumes that carry BOTH labels "
                                            "`fleet.owner=<agent>` and `fleet.expires=<epoch seconds>` and whose expiry has passed. Never an unlabelled object, a live "
                                            "one, or a volume a running container mounts; no `system prune`, no sudo. The daemon applies this daily unless the config "
@@ -19782,16 +20371,16 @@ def add_disk_parsers(sub):
     reap.add_argument("--apply", action="store_true", help="Remove them (the default only lists)")
     reap.add_argument("--docker", default=argparse.SUPPRESS, help="The docker executable (default: docker on PATH)")
     prune.add_argument("--docker", default=argparse.SUPPRESS, help="The docker executable (default: docker on PATH)")
-    janitor = disk_sub.add_parser("janitor", help="remove old, unnamed entries of the opencode temp directory (a dry run unless --apply)",
+    janitor = disk_sub.add_parser("janitor", allow_abbrev=False, help="remove old, unnamed entries of the opencode temp directory (a dry run unless --apply)",
                                   description="Lists (the default) or, with --apply, removes the top-level entries of the temp directory whose newest file is older than "
                                               "temp_janitor.days (default 7) and that no state file of the fleet names, no keep glob matches and no .fleet-keep marker "
                                               "protects. Never follows a link, never touches another user's entry. Each removal is one temp.removed audit line.")
     janitor.add_argument("--apply", action="store_true", help="Remove them (the default only lists)")
-    orphans = disk_sub.add_parser("reap-orphans", help="Signal (SIGTERM, then SIGKILL) orphaned test helpers past the grace: parent launchd, an exact allow-list; a dry run unless --apply")
+    orphans = disk_sub.add_parser("reap-orphans", allow_abbrev=False, help="Signal (SIGTERM, then SIGKILL) orphaned test helpers past the grace: parent launchd, an exact allow-list; a dry run unless --apply")
     orphans.add_argument("--apply", action="store_true", help="Do it (default: a dry run)")
-    reclaim = disk_sub.add_parser("reclaim-worktrees", help="Remove the registered worktrees of retired agents when clean and pushed; else keep and say why (a dry run unless --apply)")
+    reclaim = disk_sub.add_parser("reclaim-worktrees", allow_abbrev=False, help="Remove the registered worktrees of retired agents when clean and pushed; else keep and say why (a dry run unless --apply)")
     reclaim.add_argument("--apply", action="store_true", help="Do it (default: a dry run)")
-    register = disk_sub.add_parser("register-worktree", help="Record a linked worktree for an agent (launch records its own)")
+    register = disk_sub.add_parser("register-worktree", allow_abbrev=False, help="Record a linked worktree for an agent (launch records its own)")
     register.add_argument("path", help="The worktree's directory")
     register.add_argument("--agent", required=True, help="The agent it belongs to")
     register.add_argument("--repo", help="OWNER/REPO (optional)")
@@ -22780,6 +23369,8 @@ def build_parser():
     launch.add_argument("--dir", help="The agent's working directory (absolute)")
     launch.add_argument("--resume", metavar="SESSION", help="Open a tab on this existing session of NAME instead "
                                                            "of creating one (a restart that keeps the conversation)")
+    launch.add_argument("--headless", action="store_true", help="Start the worker with NO terminal: a session in the OpenCode service, the brief sent through "
+                        "the API (about 2 MB instead of a terminal's 200 to 400 MB). Its tools run in the service's environment; opt in")
     launch.add_argument("--workspace", help="The herdr workspace for the new tab (default: $HERDR_WORKSPACE_ID)")
     launch.add_argument("--role", help="metadata.fleet.role")
     launch.add_argument("--reports-to", dest="reports_to", help="metadata.fleet.reports_to")
@@ -22823,19 +23414,7 @@ def build_parser():
 
 # ---- the load of each orchestrator and the threshold alert (#348); the logic is in bin/fleet_health.py, this supplies the facts
 def load_fleet_health():
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "fleet_health.py")
-    held = sys.modules.get("fleet_health")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("fleet_health", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["fleet_health"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("fleet_health", None)
-        raise
-    return module
+    return load_module("fleet_health")
 
 
 def validate_load_alert_config(config, source):
@@ -22871,7 +23450,8 @@ def load_tick(engine, discovery):
     def read_asks(charter, repo):
         if engine.intents is None:
             raise RuntimeError("no ask repo is configured")
-        return [{"repo": issue.repo or repo, "number": issue.number} for issue in engine.intents.open_asks(charter, repo)]
+        return [{"repo": issue.repo or repo, "number": issue.number, "labels": list(getattr(issue, "labels", ()) or ()),
+                 "parked_until": getattr(issue, "parked_until", None)} for issue in engine.intents.open_asks(charter, repo)]
 
     def read_charters(repo):
         """The open issues of `repo` that carry the orchestrator label (whatever the owner's prefix) as [(number, body)]: two bounded reads."""
@@ -22886,12 +23466,36 @@ def load_tick(engine, discovery):
                        if isinstance(i, dict) and isinstance(i.get("number"), int) and "pull_request" not in i) if isinstance(found, list) else None
         return out
 
+    def read_parent(repo, number):
+        """The parent issue number of `repo#number` in the same repository (None when it has none): one read."""
+        if engine.intents is None:
+            raise RuntimeError("no ask repo is configured")
+        data = engine.intents._api("repos/%s/issues/%d" % (repo, number), repo)
+        url = data.get("parent_issue_url") if isinstance(data, dict) else None
+        found = re.search(r"/repos/([^/]+/[^/]+)/issues/(\d+)$", url) if isinstance(url, str) else None
+        return int(found.group(2)) if found and found.group(1).lower() == str(repo).lower() else None
+
     def wake(text):
         add_reminder(engine.state_dir, cos, now, now, text)
         if engine.audit is not None:
             engine.audit.append(engine.actor, "load.alert", cos, {"text": _one_line(text, 400)})
 
-    return health.tick(health.Context(now=now, state_dir=engine.state_dir, cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, read_charters=read_charters, cos=cos, wake=wake))
+    meter = {}
+    accounts = getattr(engine.intents, "accounts", None)
+    if accounts is not None:   # the gh accounts' own books: which account a repo uses, whether it is paused (#361), and the reads GitHub really billed (a 304 is free)
+        def snapshot():
+            with accounts.lock:   # GhAccounts.read appends and trims the deque from other threads under this lock
+                return list(accounts.calls)
+
+        def begin_read():
+            return max([call[0] for call in snapshot()] or [0])   # the newest read so far: what happens after it is this read's
+
+        def read_cost(since, repo):
+            account = accounts.describe(repo)   # only this account's reads are charged to it, and a 304 is free
+            return sum(1 for call in snapshot() if call[0] > since and call[1] == account and not call[3])
+        meter = {"account_of": accounts.describe, "paused": lambda repo: accounts.paused.get(accounts.describe(repo), 0) > now,
+                 "begin_read": begin_read, "read_cost": read_cost}
+    return health.tick(health.Context(now=now, state_dir=engine.state_dir, cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, read_charters=read_charters, read_parent=read_parent, cos=cos, wake=wake, **meter))
 
 
 def cmd_load_replay(args, runner, now):
@@ -25309,12 +25913,64 @@ class HarnessReplyDelivery(decision_core.AnswerDelivery):
         return "answered %s" % ident
 
 
+_DECISION_REF = re.compile(r"^(?:([A-Za-z0-9_.-]+)/)?([A-Za-z0-9_.-]+)#([0-9]+)$")
+
+
+def _decision_ref(ident):
+    """(owner or None, repo or None, number) for the issue forms a person types for a decision (`OWNER/REPO#N`, `REPO#N`, `#N`, `N`), else None."""
+    text = (ident or "").strip()
+    bare = re.fullmatch(r"#?([0-9]+)", text)
+    if bare:
+        return None, None, int(bare.group(1))
+    got = _DECISION_REF.match(text)
+    if not got:
+        return None
+    return (got.group(1).lower() if got.group(1) else None), got.group(2).lower(), int(got.group(3))
+
+
+def _decisions_for_ref(decisions, owner, repo, number):
+    """The decisions about issue `number` whose repository matches the spelling: the full name when an owner is given, the short name when only a repo
+    is, any when neither."""
+    found = []
+    for decision in decisions:
+        if decision.get("kind") != "issue" or decision.get("ask") != number:
+            continue   # only an ISSUE decision is named by its issue: a permission or a question that is about the issue has an id of its own
+        full = str(decision.get("repo") or "").lower()
+        short = full.rsplit("/", 1)[-1]
+        if owner and full != "%s/%s" % (owner, repo):
+            continue
+        if not owner and repo and short != repo:
+            continue
+        found.append(decision)
+    return found
+
+
 def decision_by_id(decisions, ident):
+    """The decision an id names. The id the list shows (`fleet-kit#357`, or `#357`) matches exactly, as it always did; the issue forms a person naturally types
+    (`OWNER/REPO#N`, `REPO#N`, `#N`) also find it. A spelling that names more than one decision is refused and lists the candidates, never guessed
+    (DecisionError); None when none matches (see `decision_miss_hint`). Only the spellings are widened: what follows (the tier check, the caller check, the
+    audit) is unchanged."""
     for wanted in (ident, "#" + ident.lstrip("#")):
         for decision in decisions:
             if decision["id"] == wanted:
                 return decision
-    return None
+    ref = _decision_ref(ident)
+    if ref is None:
+        return None
+    found = _decisions_for_ref(decisions, *ref)
+    if len(found) > 1:
+        raise DecisionError("%s names %d decisions: %s. Name one with its owner and repository (OWNER/REPO#%d)" % (
+            ident, len(found), ", ".join(sorted(str(d["id"]) for d in found)), ref[2]))
+    return found[0] if found else None
+
+
+def decision_miss_hint(decisions, ident):
+    """What to add to a "no decision is waiting" error: the ids of the decisions that carry the same number (the right form is one copy away), or ""."""
+    ref = _decision_ref(ident)
+    if ref is None:
+        return ""
+    same = sorted({str(d["id"]) for d in decisions if d.get("kind") == "issue" and d.get("ask") == ref[2]})
+    return " (a decision numbered %d is listed as %s)" % (ref[2], ", ".join(same)) if same else ""
 
 
 def refuse_human_tier(engine, decision, action, name, role):
@@ -25677,7 +26333,7 @@ def cmd_decision_supersede(args, engine, decisions, name, runner, role=None):
         try:
             decision = decision_by_id(decisions, ident)
             if decision is None:
-                raise DecisionError("no decision %s is waiting" % ident)
+                raise DecisionError("no decision %s is waiting%s" % (ident, decision_miss_hint(decisions, ident)))
             refuse_human_tier(engine, decision, "supersede", name, role)
             line = supersede_decision(engine, runner, decision, shown, args.note, name)
             print("%s: %s" % (ident, line))
@@ -25758,7 +26414,7 @@ def cmd_decision_write(args, action, runner, now):
             return code
         decision = decision_by_id(decisions, args.id)
         if decision is None:
-            raise DecisionError("no decision %s is waiting (see `%s decisions --tier all`)" % (args.id, PROG))
+            raise DecisionError("no decision %s is waiting%s (see `%s decisions --tier all`)" % (args.id, decision_miss_hint(decisions, args.id), PROG))
         refuse_human_tier(engine, decision, action, name, role)
         if action == "escalate":
             line = escalate_decision(engine, runner, decision, args.reason, name)

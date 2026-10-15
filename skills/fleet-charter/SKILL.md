@@ -13,6 +13,8 @@ and what herdr says about whether you are alive.
 All charter records live in one repo, written here as `OWNER/REPO`. Use the repo
 your fleet was installed against.
 
+Write GitHub text so a person can read it: short paragraphs, real Markdown lists with one item per line, headings for sections, never an inline "(1) ... (2) ..." chain, and code and commands in code spans or blocks.
+
 Labels are namespaced with your username, so two people sharing a repo do not
 read each other's work as their own. Derive the prefix, do not choose it:
 `whoami` answers it. Every label below carries it, structural ones included.

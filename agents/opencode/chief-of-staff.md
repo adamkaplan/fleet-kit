@@ -28,7 +28,6 @@ permissions:
   - {action: shell, resource: "fleet-switchboard status *", effect: allow}
   - {action: shell, resource: "fleet-switchboard pending *", effect: allow}
   - {action: shell, resource: "fleet-switchboard whoami *", effect: allow}
-  - {action: shell, resource: "fleet-switchboard version *", effect: allow}
   - {action: shell, resource: "fleet-switchboard notice *", effect: allow}
   - {action: shell, resource: "fleet-switchboard decisions *", effect: allow}
   - {action: shell, resource: "fleet-switchboard orders *", effect: allow}
@@ -41,6 +40,7 @@ permissions:
   - {action: shell, resource: "fleet-switchboard reattach *", effect: allow}
   - {action: shell, resource: "fleet-switchboard relaunch *", effect: allow}
   - {action: shell, resource: "fleet-switchboard retire *", effect: allow}
+  - {action: shell, resource: "fleet-switchboard disk *", effect: allow}
   - {action: shell, resource: "fleet-switchboard review measure *", effect: allow}
   - {action: shell, resource: "fleet-switchboard review laws *", effect: allow}
   - {action: shell, resource: "fleet-switchboard impact floor *", effect: allow}
@@ -60,6 +60,7 @@ permissions:
   - {action: shell, resource: "gh pr ready *", effect: allow}
   - {action: shell, resource: "gh pr edit *", effect: allow}
   - {action: shell, resource: "gh pr merge *", effect: allow}
+  - {action: shell, resource: "gh issue create *", effect: allow}
   - {action: shell, resource: "gh issue comment *", effect: allow}
   - {action: shell, resource: "gh issue close *", effect: allow}
   - {action: shell, resource: "gh issue reopen *", effect: allow}
@@ -67,6 +68,7 @@ permissions:
   - {action: shell, resource: "git *", effect: allow}
   - {action: shell, resource: "az * show *", effect: allow}
   - {action: shell, resource: "az * list *", effect: allow}
+  - {action: shell, resource: "az * list-usage *", effect: allow}
   - {action: shell, resource: "az * log *", effect: allow}
   - {action: shell, resource: "az * logs *", effect: allow}
   - {action: shell, resource: "az * status *", effect: allow}
@@ -86,8 +88,6 @@ permissions:
   - {action: shell, resource: "printf *", effect: allow}
   - {action: shell, resource: "date *", effect: allow}
   - {action: shell, resource: "sleep *", effect: allow}
-  - {action: shell, resource: "pwd", effect: allow}
-  - {action: shell, resource: "uptime", effect: allow}
   - {action: shell, resource: "timeout * gh pr view *", effect: allow}
   - {action: shell, resource: "timeout * gh issue view *", effect: allow}
   - {action: shell, resource: "timeout * gh pr list *", effect: allow}
@@ -111,6 +111,7 @@ permissions:
   - {action: shell, resource: "*fleet-switchboard waive *G6*", effect: deny}
   - {action: shell, resource: "*fleet-switchboard waive *G8*", effect: deny}
   - {action: shell, resource: "fleet-switchboard launch *--agent chief-of-staff*", effect: deny}
+  - {action: shell, resource: "fleet-switchboard disk *--docker*", effect: deny}
   - {action: shell, resource: "gh repo edit*", effect: deny}
   - {action: shell, resource: "gh *--admin*", effect: deny}
   - {action: shell, resource: "gh *--auto*", effect: deny}
@@ -187,9 +188,9 @@ permissions:
   - {action: shell, resource: "az *appsettings*", effect: deny}
   - {action: shell, resource: "az *get-access-token*", effect: deny}
   - {action: shell, resource: "az rest*", effect: deny}
-  - {action: shell, resource: "az containerapp*", effect: deny}
+  - {action: shell, resource: "az containerapp exec*", effect: deny}
   - {action: shell, resource: "az *connection-string*", effect: deny}
-  - {action: shell, resource: "az *keys *", effect: deny}
+  - {action: shell, resource: "az *key*", effect: deny}
   - {action: shell, resource: "az *assword*", effect: deny}
   - {action: shell, resource: "az * create *", effect: deny}
   - {action: shell, resource: "az * delete *", effect: deny}

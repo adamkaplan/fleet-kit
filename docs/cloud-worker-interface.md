@@ -20,7 +20,9 @@ One program, `cloud-worker <command>`; every command takes `--json` (one JSON ob
 
 Exit codes: `0` done; `1` the end hook could not push, **the pod is kept** (stop only); `2` bad usage or unknown worker;
 `3` the cloud refused (quota, identity, cap); `4` timed out waiting for the worker; `5` the spend cap is reached
-(create only; **OPEN**: who sets the cap and where); `6` refused: `delete` before the end hook ran without `--force`, or `extend` past `--max-hard`. Every other failure is `1` with a one-line reason on stderr.
+(create only; the cap is `FLEET_CLOUD_SPEND_CAP_USD`, default USD 25 when unset or empty, and an invalid value or an unreadable cost refuses the create); `6` refused: `delete` before the end hook ran without `--force`, or `extend` past `--max-hard`. Every other failure is `1` with a one-line reason on stderr.
+
+The launcher reaches the cluster with an explicit `--context` taken from `FLEET_KUBE_CONTEXT` (and `--kubeconfig` from `FLEET_KUBECONFIG` when set). With no context configured it refuses every command (exit `2`) and makes no call; it never uses the active context. A `create` that is interrupted or fails removes the Secret and pod it made, audits `create.interrupted` or `create.failed`, and names anything that could not be removed.
 A command is idempotent: a repeated `stop` or `delete` of a worker that is gone exits `0`.
 
 ## 2. Worker environment (slices A and B)
