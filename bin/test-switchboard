@@ -49684,7 +49684,7 @@ class TestSourceBudgets(Base):
         self.assertEqual((sb.source_budget_seconds({"source_budgets": {"load_alert": 0}}, "load_alert"),
                           sb.source_budget_seconds({"source_budgets": {"catch_up": 5}}, "catch_up"),
                           sb.source_budget_seconds({}, "catch_up")), (0, 5, sb.SOURCE_BUDGET_DEFAULTS["catch_up"]))
-        self.assertEqual(sb.SOURCE_BUDGET_DEFAULTS["catch_up"], sb.GITHUB_CATCHUP_SECONDS, "the catch-up default is the bound it always had")
+        self.assertEqual(sb.SOURCE_BUDGET_DEFAULTS["catch_up"], 90, "the catch-up default is the bound it always had")
         for bad in ({"load_alert": -1}, {"charters": True}, {"catch_up": "9"}, {"nope": 1}):
             with self.assertRaises(sb.ConfigError) as caught:
                 sb.validate_source_budgets({"source_budgets": bad}, "t")
@@ -49891,6 +49891,59 @@ class TestSourceBudgets(Base):
         source, engine, log = self.orders_source(5)
         source()
         self.assertEqual(sb.source_states(engine)["charters"]["state"], "pending")
+
+    def test_the_parent_read_stops_at_the_budget_and_is_read_later(self):
+        health = sb.load_fleet_health()
+        reads, spent = [], [True]
+        pending = []
+        ctx = health.Context(now=self.T0, state_dir=None, cfg=dict(health.DEFAULTS), orchestrators={}, read_parent=lambda repo, number: reads.append(number) or 7,
+                             time_up=lambda: spent[0], pending=pending)
+        state, problems = {}, []
+        budget = health._Budget(ctx, state, self.T0)
+        self.assertEqual(health._parent_of(ctx, state, budget, "acme/widget", 3, self.T0, problems), (None, False))
+        self.assertEqual((reads, pending), ([], ["parent of acme/widget#3"]))
+        spent[0] = False
+        self.assertEqual(health._parent_of(ctx, state, budget, "acme/widget", 3, self.T0 + 30, problems), (7, True))
+        self.assertEqual(health._parent_of(ctx, state, budget, "acme/widget", 3, self.T0 + 60, problems), (7, True))
+        self.assertEqual(reads, [3], "read once, kept")
+
+    # -- a repo that leaves the watched set, or is excluded, loses its cursor (rev-wake on #504)
+
+    def test_a_repo_that_leaves_while_pending_loses_its_cursor_and_is_not_read(self):
+        rig = self.catch_up_rig(3)
+        rig.hub.catch_up(rig.watch(), rig.world.clock.now())
+        self.assertEqual(len(rig.hub.catching_up()), 1)
+        rig.hub.config = dict(rig.hub.config, github_repos=[])
+        rig.hub.reconcile(rig.world.engine.discover(rig.world.clock.now()))
+        self.assertEqual((rig.hub.catching_up(), rig.hub._cursors), ([], {}))
+        rig.hub.tick()
+        self.assertEqual(sb.source_states(rig.world.engine)["catch_up"], {"state": "done", "pending": []})
+        before = len(rig.gh.api_calls)
+        rig.hub.tick()
+        self.assertEqual(len(rig.gh.api_calls), before, "0 reads of a repo that is not watched")
+
+    def test_a_repo_that_rejoins_starts_a_fresh_window(self):
+        rig = self.catch_up_rig(3)
+        rig.hub.catch_up(rig.watch(), rig.world.clock.now())
+        stale = rig.hub._cursors[GH_REPO]["since_epoch"]
+        rig.hub.config = dict(rig.hub.config, github_repos=[])
+        rig.hub.reconcile(rig.world.engine.discover(rig.world.clock.now()))
+        rig.world.clock.t += 600
+        rig.hub.config = dict(rig.hub.config, github_repos=[GH_REPO])
+        rig.hub.reconcile(rig.world.engine.discover(rig.world.clock.now()))
+        self.assertNotIn(GH_REPO, rig.hub._cursors)
+        rig.hub.catch_up(rig.watch(), rig.world.clock.now())
+        self.assertGreater(rig.hub._cursors.get(GH_REPO, {"since_epoch": 0})["since_epoch"], stale - 1, "a new window, not the old one")
+        self.assertEqual(rig.hub._cursors[GH_REPO]["done"] and len(rig.hub._cursors[GH_REPO]["done"]) <= 2, True, "it began again from its first steps")
+
+    def test_an_excluded_repo_with_a_stale_cursor_is_not_read(self):
+        rig = self.catch_up_rig(3)
+        rig.hub.catch_up(rig.watch(), rig.world.clock.now())
+        self.assertIn(GH_REPO, rig.hub._cursors)
+        rig.hub.config = dict(rig.hub.config, excluded_repos=[GH_REPO])
+        before = len(rig.gh.api_calls)
+        rig.hub.catch_up(rig.watch(), rig.world.clock.now())
+        self.assertEqual((len(rig.gh.api_calls), rig.hub.catching_up()), (before, []), "0 reads of an excluded repo and no 'catching up' for it")
 
     def test_s8_the_budgeted_reads_add_no_thread_and_no_process(self):
         with mock.patch.object(threading.Thread, "start", side_effect=AssertionError("a thread was started")), \

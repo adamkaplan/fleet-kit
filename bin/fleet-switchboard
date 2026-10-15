@@ -12772,7 +12772,6 @@ GITHUB_BODY_LIMIT = 5 * 1024 * 1024
 GITHUB_QUEUE_LIMIT = 2000
 GITHUB_ROUTE_SECONDS = 5       # per pass: the time routing may spend on `gh api` lookups; the rest waits a pass
 GITHUB_ROUTE_READ_TIMEOUT = 8  # seconds for one such lookup
-GITHUB_CATCHUP_SECONDS = 90    # per catch-up: after this the remaining reads are left to the next one
 GITHUB_CATCHUP_STUCK_PASSES = 3   # #494: a catch-up that stopped this many passes in a row is said in `status`, not silently starved
 GITHUB_CATCHUP_ITEMS = 500     # items one catch-up keeps (the newest)
 GITHUB_SUBREAD_TIMEOUT = 10    # seconds for a secondary read (reviews, check suites, workflow runs)
@@ -13755,6 +13754,7 @@ class GitHubHub:
             for repo in joined:
                 self.watches[repo] = Watch(repo)
             gone = [(repo, self.watches.pop(repo)) for repo in left]
+            self.prune_cursors()
         for repo in joined:
             self._audit("github.watch", repo, {"state": "joined"})
         for repo, watch in gone:
@@ -13762,6 +13762,13 @@ class GitHubHub:
                 _terminate(watch.proc)
             watch.proc = watch.secret = None
             self._audit("github.watch", repo, {"state": "left"})
+
+    def prune_cursors(self):
+        """#494: the cursor of an unfinished catch-up belongs to a repo that is watched NOW and not excluded: a repo that left the watched set (or was
+        excluded since) loses it, so it never shows as catching up and never causes a read, and a repo that joins again starts a fresh window. The caller holds the lock."""
+        exclusion = load_module("repo_exclusion")
+        for repo in [r for r in self._cursors if r not in self.watches or exclusion.is_excluded(self.config, r)]:
+            del self._cursors[repo]
 
     def facts(self):
         """Every queued item that has an owner now, as Facts. Expired items are dropped."""
@@ -14268,6 +14275,7 @@ class GitHubHub:
         repo = watch.repo
         with self.lock:
             marker = self.markers.get(repo)
+            self.prune_cursors()   # a stale cursor of a repo no longer watched (or excluded) is never read from
         items, errors, self.last_truncated, self.last_incomplete, self.last_failed_primary = [], [], {}, False, False
         cursor = self._cursors.get(repo)   # #494: the steps an earlier call of this catch-up finished: they are not read again
         fresh_start = marker is None and not fault("catch-up-on-fresh-start")
@@ -14336,6 +14344,7 @@ class GitHubHub:
     def catching_up(self):
         """#494: the repos whose catch-up window is not read whole yet, each with the passes it has taken ([] when every catch-up is done)."""
         with self.lock:
+            self.prune_cursors()   # only repos watched now and not excluded
             return ["%s (%d pass%s)" % (repo, c.get("stops", 0), "" if c.get("stops", 0) == 1 else "es") for repo, c in sorted(self._cursors.items())]
 
     def _tick_watch(self, watch, now):
