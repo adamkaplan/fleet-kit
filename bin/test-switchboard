@@ -24179,6 +24179,10 @@ class TestImpactRejudge(LedgerBase):
             return subprocess.CompletedProcess(argv, 0, json.dumps(dict(self.pr, **self.prs.get(number, {}))), "")
         if argv[0] == FAKE_GH and "--method" in argv:
             method = argv[argv.index("--method") + 1]
+            if method == "GET" and "/issues?state=open" in argv[2]:   # the open list, for the dry run
+                items = [{"number": n, "pull_request": {"url": "x"}, "body": "PLAN: acme/app#7", "labels": [dict(l) for l in self.prs.get(n, {}).get("labels", [])],
+                          "user": {"login": "shared"}} for n in sorted(self.prs)]
+                return subprocess.CompletedProcess(argv, 0, json.dumps(items if "page=1" in argv[2] else []), "")
             if method == "GET":
                 return subprocess.CompletedProcess(argv, 0, "{}", "")
             self.writes.append((method, argv[2], json.loads(kwargs["input"]) if kwargs.get("input") else None))
@@ -24201,10 +24205,12 @@ class TestImpactRejudge(LedgerBase):
             record.update(added=listed, at=at)
         path.write_text(json.dumps({"clears": {}, "applied": {"acme/app#%d" % n: dict(record) for n in numbers}}))
 
-    def passes(self, records, advance=0):
+    def passes(self, records, advance=0, live=None):
         self.t += advance
         for item in records:   # the pull request's labels as the live read sees them
             self.prs.setdefault(item["number"], {})["labels"] = [dict(l) for l in item["labels"]]
+        for number, names in (live or {}).items():   # ... unless somebody changed them since the list was read
+            self.prs.setdefault(number, {})["labels"] = [{"name": n} for n in names]
         if not hasattr(self, "engine"):
             self.hub = FakeHub({"acme/app": records})
             self.engine = self.world.new_engine("daemon")
@@ -24381,6 +24387,55 @@ class TestImpactRejudge(LedgerBase):
         late = {"clears": {"p": {"at": "soon"}}, "applied": {"p": {"added": [hold], "at": 1}}}
         self.assertEqual(sb._labels_ours(names, late, "p"), [], "a clear whose time cannot be read counts as after the record")
 
+    def test_a_label_a_person_added_after_the_list_was_read_is_never_claimed_by_the_record(self):
+        self.files(10, "shims/gh")
+        self.passes([self.listed(10)], live={10: [self.names["merge-captain"]]})   # the list said no labels; by the write the person's merge label is there
+        self.assertEqual([w[2]["labels"] for w in self.posts(10)], [[self.names["hold-impact"]]], "only the missing label is added")
+        recorded = json.loads((self.world.state / "impact-hold.json").read_text())["applied"]["acme/app#10"]
+        self.assertEqual((recorded["added"], recorded["merge_label_added"]), ([self.names["hold-impact"]], False))
+        self.files(10, "docs/a.md")   # the pull request stops holding: the release takes off the daemon's label only
+        self.writes.clear()
+        with mock.patch.object(sb.impact_floor, "rule_fingerprint", lambda: "version-two"):
+            self.passes([self.listed(10, [self.names["hold-impact"], self.names["merge-captain"]])], advance=400,
+                        live={10: [self.names["hold-impact"], self.names["merge-captain"]]})
+        self.assertEqual([w[1].rsplit("/", 1)[-1] for w in self.removals(10)], [urllib.parse.quote(self.names["hold-impact"], safe="")])
+
+    def test_the_dry_run_and_the_daemon_make_the_same_decisions_over_the_same_pull_requests(self):
+        names = self.names
+        self.files(9, "migrations/0002.sql")        # no longer holds, labels are ours: released
+        self.files(10, "shims/gh")                  # holds, no labels: both added
+        self.files(11, "shims/gh")                  # holds, already labelled: nothing
+        self.files(12, "migrations/0004.sql")       # a person's merge label, no record of ours: nothing
+        self.files(13, "shims/gh")                  # holds but the owner cleared this head: nothing
+        self.prs[9]["labels"] = [{"name": n} for n in self.both()]
+        self.prs[11]["labels"] = [{"name": n} for n in self.both()]
+        self.prs[12]["labels"] = [{"name": names["merge-captain"]}]
+        self.prs[13]["labels"] = []
+        path = self.world.state / "impact-hold.json"
+        path.write_text(json.dumps({"clears": {"acme/app#13": {"head": LEDGER_HEAD, "reason": "x", "by": "own", "at": 5}},
+                                    "applied": {"acme/app#9": {"head": LEDGER_HEAD, "merge_label_added": True, "added": self.both(), "at": 1},
+                                                "acme/app#11": {"head": LEDGER_HEAD, "merge_label_added": True, "added": self.both(), "at": 1}}}))
+        code, out, err = self.run_as("coder", "impact", "hold", "--dry-run", "--repo", "acme/app")
+        self.assertEqual(code, 0, err)
+        planned_add, planned_remove = {}, {}
+        for line in out.splitlines():
+            found = re.match(r"acme/app#(\d+)  would (add|remove) (.+?)(?: \(| {2}|$)", line)
+            if found and found.group(2) == "add":
+                planned_add[int(found.group(1))] = sorted(x.strip() for x in found.group(3).split(","))
+            elif found:
+                planned_remove[int(found.group(1))] = sorted(x.strip() for x in found.group(3).split(","))
+        self.assertEqual(self.writes, [], "a dry run writes nothing")
+        self.passes([self.listed(n, [l["name"] for l in self.prs[n].get("labels", [])]) for n in (9, 10, 11, 12, 13)])
+        done_add = {int(re.search(r"/issues/(\d+)/", w[1]).group(1)): sorted(w[2]["labels"]) for w in self.posts()}
+        done_remove = {}
+        for w in self.removals():
+            done_remove.setdefault(int(re.search(r"/issues/(\d+)/", w[1]).group(1)), []).append(urllib.parse.unquote(w[1].rsplit("/", 1)[-1]))
+        done_remove = {k: sorted(v) for k, v in done_remove.items()}
+        self.assertEqual((planned_add, planned_remove), (done_add, done_remove), "the dry run says exactly what the daemon did")
+        self.assertEqual(sorted(done_add), [10])
+        self.assertEqual(sorted(done_remove), [9])
+        self.assertIn("1 PR(s) would have a hold released", out)
+
     # -- S4: when it judges again
 
     def test_s4_a_pull_request_is_judged_again_only_when_its_head_the_rule_or_its_record_changes(self):
@@ -24519,6 +24574,8 @@ class TestImpactHold(LedgerBase):
             self.engine_cached = engine
         elif records is not None:
             self.hub.prs["acme/app"] = records
+        for item in (records or []):   # the pull request's labels as the daemon's own live read sees them (#451 slice 3)
+            self.pr["labels"] = [dict(l) for l in item["labels"]]
         sb.ci_record_pass(self.engine_cached, self.t)
         sb.impact_would_hold_pass(self.engine_cached, self.t)
 

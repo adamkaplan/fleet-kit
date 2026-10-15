@@ -18130,13 +18130,17 @@ def _apply_impact_hold_locked(engine, repo, number, report, record):
     if cleared.get("head") == head:
         return 0
     names = label_names(engine.config)
-    have = {(l.get("name") if isinstance(l, dict) else l) for l in (record.get("labels") or [])}
+    raw = read_pr_json(engine, repo, number)   # the labels NOW, under the lock: the record claims only what this write adds, never a label that was already there
+    live = raw.get("labels")
+    if not isinstance(live, list):
+        raise NoticeError("the pull request's labels cannot be read")
+    have = {(l.get("name") if isinstance(l, dict) else l) for l in live}
     want = [names["merge-captain"], names["hold-impact"]]
     missing = [l for l in want if l not in have]
     if not missing:
-        return 0
+        return 1
     runner = getattr(engine, "gh_runner", None) or subprocess.run
-    spent = 0
+    spent = 1
     ensured = engine.__dict__.setdefault("impact_labels_ensured", set())
     if repo not in ensured:
         ensure_labels(engine, runner, repo)
@@ -18212,16 +18216,34 @@ def cmd_impact_clear(args, runner, now):
     return EXIT_OK
 
 
+def impact_plan(engine, report, labels, state, records, records_problem):
+    """What the daemon would do with one judged pull request, as (what, labels): ("add", the labels it would add), ("held", []) already labelled,
+    ("cleared", []) the owner cleared this head, ("release", the labels it would remove: only those its own record lists and the pull request has now) or
+    ("none", []). The dry run prints this; the daemon's pass makes the same decisions (a test runs both over the same pull requests)."""
+    names = label_names(engine.config)
+    have = set(labels or ())
+    pr = report["pr"]
+    if report.get("owner_decision") == "hold":
+        if (state["clears"].get(pr) or {}).get("head") == report["head"]:
+            return "cleared", []
+        missing = [l for l in (names["merge-captain"], names["hold-impact"]) if l not in have]
+        return ("add", missing) if missing else ("held", [])
+    if records_problem or not isinstance(state["applied"].get(pr), dict):
+        return "none", []
+    return "release", [l for l in _labels_ours(names, state, pr) if l in have]
+
+
 def cmd_impact_hold(args, runner, now):
-    """`impact hold --dry-run [--repo R]`: what the daemon would label right now, over the repos under `plan_gates` (read-only). The
-    labels are only ever written by the daemon, and only when `impact_hold.enabled` is true."""
+    """`impact hold --dry-run [--repo R]`: what the daemon would label and release right now (the SAME decision as its pass: the owner-hold rule), over the repos
+    under `plan_gates` (read-only). The labels are only ever written by the daemon, and only when `impact_hold.enabled` is true."""
     if not args.dry_run:
         sys.stderr.write("%s: impact hold: only --dry-run is available by hand: the daemon writes the labels, when impact_hold.enabled is true\n" % PROG)
         return EXIT_USAGE
     engine, state, config = build_engine(runner, now, "cli", writable=False)
     repos = [args.repo] if args.repo else sorted(((config.get("plan_gates") or {}).get("repos") or {}))
     names = label_names(config)
-    shown = 0
+    shown = released = 0
+    records, records_problem = impact_records(state)
     for repo in repos:
         try:
             has_floor = impact_floor.floor_for(repo, config)[0]
@@ -18243,15 +18265,18 @@ def cmd_impact_hold(args, runner, now):
             except Exception as err:
                 print("%s#%d  unreadable: %s" % (repo, item["number"], _one_line(str(err), 100)))
                 continue
-            if report["decision"] != "hold":
-                continue
-            cleared = (read_impact_state(state)[0]["clears"].get(report["pr"]) or {}).get("head") == report["head"]
-            missing = [l for l in (names["merge-captain"], names["hold-impact"]) if l not in item["labels"]]
-            shown += 1
-            print("%s  %s  %s" % (report["pr"], "cleared by the owner for this head: no label" if cleared else
-                                  ("would add %s" % ", ".join(missing) if missing else "already labelled"), "; ".join(report["reasons"])[:160]))
+            what, labels = impact_plan(engine, report, item["labels"], read_impact_state(state)[0], records, records_problem)
+            reasons = "; ".join(report.get("owner_reasons") or [])[:160]
+            if what in ("add", "held", "cleared"):
+                shown += 1
+                print("%s  %s  %s" % (report["pr"], "cleared by the owner for this head: no label" if what == "cleared" else
+                                      ("would add %s" % ", ".join(labels) if labels else "already labelled"), reasons))
+            elif what == "release" and labels:
+                released += 1
+                print("%s  would remove %s (labels its record says the daemon added; the rule no longer holds it)" % (report["pr"], ", ".join(labels)))
     print("%s: %d PR(s) would be held (a dry run: nothing was written; impact_hold is %s)" % (
         PROG, shown, impact_floor.hold_mode(config, repos[0] if repos else "")))
+    print("%s: %d PR(s) would have a hold released" % (PROG, released))
     return EXIT_OK
 
 
