@@ -49843,8 +49843,11 @@ class TestExcludedRepos(Base):
                 ("read_ref_state issue", lambda: sb.read_ref_state(engine, ACME_WEB, 5, "issue")),
                 ("read_ref_state pr", lambda: sb.read_ref_state(engine, ACME_WEB, 5, "pr")),
                 ("the hub's gh_api", lambda: hub.gh_api("repos/%s/issues/5/comments" % ACME_WEB)),
-                ("the intent reader", lambda: reader.issue(5, ACME_WEB))):
-            with self.assertRaises((sb.AccountError, sb.NoticeError, sb.GitHubUnavailable, sb.IntentError), msg=name):
+                ("the intent reader", lambda: reader.issue(5, ACME_WEB)),
+                ("the hub's child environment (the forwarder start)", lambda: hub.child_env(ACME_WEB)),
+                ("the reds zip read", lambda: sb._RedsReader(config, counting, time.time, ACME_WEB).zip("repos/%s/actions/artifacts/1/zip" % ACME_WEB)),
+                ("the check review measure and reds make (the same function)", lambda: sb.refuse_excluded(config, ACME_WEB))):
+            with self.assertRaises((sb.RepoExcluded, sb.NoticeError, sb.GitHubUnavailable, sb.IntentError), msg=name):
                 call()
             self.assertEqual(calls, [], "%s started a process for an excluded repository" % name)
         # U1: a repository that is not excluded still reads, through every one of them
@@ -49852,7 +49855,7 @@ class TestExcludedRepos(Base):
         self.assertEqual(sb.read_pr_json(engine, ACME_API, 5)["number"], 5)
         self.assertEqual(accounts.read(counting, "repos/%s/issues/5" % ACME_API, ACME_API, 5).returncode, 0)
         hub.gh_api("repos/%s/issues/5/comments" % ACME_API)
-        self.assertEqual(len(calls), 4, calls)
+        self.assertEqual(len(calls), 4, calls)   # (the 4 reads above; the excluded ones started none)
 
     def test_the_intent_repo_itself_being_excluded_is_not_read_either(self):
         calls = []

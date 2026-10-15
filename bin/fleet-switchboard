@@ -13860,6 +13860,7 @@ class GitHubHub:
         """The repo's account's environment for a child, or None for the default account. Raises
         GitHubUnavailable when gh will not give the account's token (the text names the account only)."""
         try:
+            refuse_excluded(self.config, repo)   # #446: the forwarder start and every hub read take their environment here
             return self.accounts.env_for(repo)
         except AccountError as err:
             raise GitHubUnavailable(str(err)) from None
@@ -19291,6 +19292,7 @@ def cmd_review_measure(args, runner, now):
         engine, state, config = build_engine(runner, now, "cli", writable=False)
         accounts = getattr(engine, "accounts", None) or GhAccounts(config, runner, now)
         try:
+            refuse_excluded(config, args.repo)   # #446
             env = accounts.env_for(args.repo)
         except AccountError as err:
             raise ReviewError(str(err)) from None
@@ -19976,6 +19978,7 @@ class _RedsReader:
             raise load_reds().RedsError("gh api %s: not JSON" % path.split("?")[0]) from None
 
     def zip(self, path):
+        refuse_excluded(self.config, self.repo)   # #446: json() refuses first; the zip read does not rely on that
         env = self.accounts.env_for(self.repo)
         extra = {"env": env} if env is not None else {}
         done = self.runner([self.config["gh"], "api", path], capture_output=True, timeout=max(60, self.config["call_timeout_seconds"]), stdin=subprocess.DEVNULL, **extra)
