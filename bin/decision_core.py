@@ -352,6 +352,10 @@ BATCH_FENCE = "decision-rows"
 BATCH_ROWS_MAX = 40            # rows one batch may carry (the panel draws one line or two per row)
 BATCH_REF_MAX, BATCH_FINDING_MAX, BATCH_REC_MAX = 100, 200, 120
 BATCH_TITLE_MAX = 120
+BATCH_RAISE_ROWS_MAX = 20      # rows one batch may carry when it is RAISED (a batch already open may hold up to BATCH_ROWS_MAX: it is read, never refused)
+BATCH_ROW_MAX_CHARS = 4000     # the finding and the recommendation of one row as raised: each at most this long, kept in FULL in the issue body
+BATCH_BODY_MAX_CHARS = 65000   # the whole issue body (GitHub's limit is 65536 characters)
+_BATCH_ROW_HEADING = re.compile(r"^###[ \t]+(?:[0-9]+\.[ \t]+)?([^\s|]+)[ \t]*$")
 _ROWS_BLOCK = re.compile(r"^```%s[ \t]*\r?\n(.*?)^```[ \t]*\r?$" % BATCH_FENCE, re.M | re.S)
 _ROW_REF = re.compile(r"^(?:[A-Za-z0-9_.-]+/)?[A-Za-z0-9_.-]+#[0-9]+$")
 
@@ -366,9 +370,10 @@ def short_ref_of(ref):
     return ref.split("/")[-1] if "/" in ref else ref
 
 
-def parse_batch_row(line):
+def parse_batch_row(line, full=False):
     """One row line `<ref> | <finding> | <recommendation>` as {ref, short, finding, recommendation, text}. Raises
-    BatchError for an empty part, a ref that names no issue, or a fence in the text; a part over its cap is cut."""
+    BatchError for an empty part, a ref that names no issue, or a fence in the text; a part over its cap is cut for DISPLAY,
+    unless `full` (a row being raised: its text is kept whole, the command bounds its length)."""
     parts = [" ".join(part.split()) for part in line.split("|", 2)]
     if len(parts) != 3 or not all(parts):
         raise BatchError("a row is `<repo#N> | <finding> | <recommendation>`, each part not empty: %r" % one_line(line, 80))
@@ -377,7 +382,7 @@ def parse_batch_row(line):
         raise BatchError("a row may not contain a code fence: %r" % one_line(line, 80))
     if len(ref) > BATCH_REF_MAX or not (_ROW_REF.match(ref) or _GITHUB_REF.match(ref)):
         raise BatchError("%r is not an issue: write repo#N, owner/repo#N or the issue's URL" % one_line(ref, 60))
-    return row_of(ref, finding, rec)
+    return row_of(ref, finding, rec, full)
 
 
 def row_repo(ref):
@@ -388,19 +393,68 @@ def row_repo(ref):
     return ref.split("#")[0] if "/" in ref.split("#")[0] else None
 
 
-def row_of(ref, finding, rec):
+def row_of(ref, finding, rec, full=False):
     cut = lambda text, width: text if len(text) <= width else text[:width - 1] + "\u2026"
-    finding, rec = cut(finding, BATCH_FINDING_MAX), cut(rec, BATCH_REC_MAX)
+    if not full:   # the row as the decision list and the panel draw it: cut for display, never in the stored body
+        finding, rec = cut(finding, BATCH_FINDING_MAX), cut(rec, BATCH_REC_MAX)
     short = short_ref_of(ref)
     return {"ref": ref, "short": short, "finding": finding, "recommendation": rec,
             "text": "%s: %s" % (short, short_refs(rec))}
 
 
+def batch_row_sections(rows):
+    """The Markdown of a batch's rows: one section for each, `### N. <issue>` then `**Finding:** ...` and `**Recommendation:** ...` as their own paragraphs, the FULL text, no code
+    block. A row's text is one line (whitespace is collapsed when it is parsed), so it can never start a line: a heading, a fence marker or a row-looking text inside it is
+    mid-line text and cannot split the section."""
+    return "\n\n".join("### %d. %s\n\n**Finding:** %s\n\n**Recommendation:** %s" % (number, row["ref"], row["finding"], row["recommendation"])
+                       for number, row in enumerate(rows, 1))
+
+
+def parse_markdown_rows(body):
+    """The rows of a batch body written as Markdown sections (see batch_row_sections), in order; [] when it has none. Lenient like the fenced reader: a section without a finding and
+    a recommendation, or whose heading names no issue, is skipped; at most BATCH_ROWS_MAX are read. The rows are the same records the fenced format gives (cut for display)."""
+    rows, current, mode = [], None, None
+
+    def close():
+        if current and current["finding"] and current["rec"]:
+            try:
+                rows.append(row_of(current["ref"], " ".join(current["finding"]), " ".join(current["rec"])))
+            except BatchError:
+                pass
+    for line in body.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        heading = _BATCH_ROW_HEADING.match(line)
+        if heading and (_ROW_REF.match(heading.group(1)) or _GITHUB_REF.match(heading.group(1))):
+            close()
+            if len(rows) >= BATCH_ROWS_MAX:
+                return rows
+            current, mode = {"ref": heading.group(1), "finding": [], "rec": []}, None
+            continue
+        if line.startswith("### "):
+            close()
+            current, mode = None, None
+            continue
+        if current is None or line.lstrip().startswith("<!--"):
+            continue
+        text = line.strip()
+        if text.startswith("**Finding:**"):
+            mode, text = "finding", text[len("**Finding:**"):].strip()
+        elif text.startswith("**Recommendation:**"):
+            mode, text = "rec", text[len("**Recommendation:**"):].strip()
+        if mode and text:
+            current[mode].append(" ".join(text.split()))
+    close()
+    return rows
+
+
 def parse_decision_rows(body):
-    """The rows in an issue body's fenced `decision-rows` block, in order; [] for a body with none. Lenient: a line
-    that is not a row is skipped, and at most BATCH_ROWS_MAX rows are read (the daemon never refuses an issue)."""
-    found = _ROWS_BLOCK.search(body) if isinstance(body, str) else None
-    rows = []
+    """The rows of an issue body: its Markdown row sections, or, for a batch already open in the older format, its fenced `decision-rows` block; [] for a body with none.
+    Lenient: a line or section that is not a row is skipped, and at most BATCH_ROWS_MAX rows are read (the daemon never refuses an issue)."""
+    if not isinstance(body, str):
+        return []
+    rows = parse_markdown_rows(body)
+    if rows:
+        return rows
+    found = _ROWS_BLOCK.search(body)
     for line in (found.group(1).splitlines() if found else []):
         if not line.strip():
             continue

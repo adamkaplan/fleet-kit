@@ -529,7 +529,7 @@ fleet metadata), so `--from` is never typed.
 | `fleet-switchboard decisions resolve <id> [--note "..."]` | Chief of Staff, or you in a plain shell (PR 18) | Takes both awaiting labels off the issue. Judged against the Chief of Staff's standing orders |
 | `fleet-switchboard decisions answer <id> allow\|deny` / `answer <id> "<text>"` | Chief of Staff, or you in a plain shell (PR 18) | Replies to an agent's pending permission request or question through v2. Judged against the Chief of Staff's standing orders |
 | `fleet-switchboard decisions answer <batch id> --as-recommended` / `--row N=<choice> ...` `[--note "..."]` | Chief of Staff, or you in a plain shell | Answers a batch (below): the raising orchestrator is sent a note first (if it cannot be delivered, nothing else happens and the batch stays); then one comment on the batch issue records every row's outcome and both awaiting labels come off, so the batch and all its rows leave the list together. Rows not named by `--row` keep their recommendation. Judged like any `answer` |
-| `fleet-switchboard decisions batch --title "<title>" --row "<repo#N> \| <finding> \| <recommendation>" ... [--file F]` | An orchestrator | Raises related findings as ONE decision: one issue in the caller's own repo with the awaiting-cos label and a fenced `decision-rows` block. Prints the issue's decision id. Rows come from `--row`, `--file` (`-` is stdin), or piped stdin |
+| `fleet-switchboard decisions batch --title "<title>" --row "<repo#N> \| <finding> \| <recommendation>" ... [--file F]` | An orchestrator | Raises related findings as ONE decision: one issue in the caller's own repo with the awaiting-cos label and one Markdown section per row (the full finding and recommendation). Prints the issue's decision id. Rows come from `--row`, `--file` (`-` is stdin), or piped stdin |
 | `fleet-switchboard decisions supersede <id> [<id> ...] --by <repo#N \| URL> [--note "..."]` | Chief of Staff, or you in a plain shell | Several open decisions made moot by one issue: an issue decision gets a comment `Superseded by <ref>` and both labels off; a report gets your `send` to its worker naming the issue (which clears it) and its issue's labels off; a permission request or question is refused (use `answer`). One result line per id, `done` or `refused: <why>`; it carries on past a failure and exits non-zero if any failed. Judged like `resolve` |
 | `fleet-switchboard labels ensure [--repo OWNER/REPO]` | Anyone (PR 18) | Creates `<user>:orchestrator`, `<user>:awaiting-cos` and `<user>:awaiting-user` where missing (every watched repo by default), each with the repo's own account; idempotent |
 | `fleet-switchboard orders --cos` | Anyone (PR 18) | Prints the Chief of Staff's own standing orders file and its path. Read-only: you edit the file in an editor |
@@ -1984,14 +1984,23 @@ fleet-switchboard decisions batch --title "Stale issues to close" \
 ```
 
 It creates ONE real GitHub issue in the caller's own repo (its configured repo, never another), labelled `<user>:awaiting-cos`, signed with the caller's name, whose body
-holds a fenced block, one line per row:
+holds one Markdown section per row, in full (nothing is cut for the reader; at most 20 rows, each of the finding and the recommendation at most 4000 characters, the body at most 65000):
 
 ````text
-```decision-rows
-acme/web#7 | stale cache key, fixed in web#12 | close it
-acme/web#9 | duplicate of web#7 | close as duplicate
-```
+### 1. acme/web#7
+
+**Finding:** stale cache key, fixed in web#12
+
+**Recommendation:** close it
+
+### 2. acme/web#9
+
+**Finding:** duplicate of web#7
+
+**Recommendation:** close as duplicate
 ````
+
+A batch already open in the older fenced `decision-rows` format is still read.
 
 A row is `<ref> | <finding> | <recommendation>`: the ref is `repo#N`, `owner/repo#N` or an issue URL, and must name an issue
 of the batch's own repo (anything else is refused, and nothing is created: the batch is public exactly as that repo
