@@ -288,29 +288,53 @@ def narrow_paths(matrix, paths):
 NARROW_TEXT_MAX = 200000   # a definition larger than this is not parsed: it holds
 
 
+_YAML_INDIRECTION = re.compile(r"(?:^|[\s:\[{,-])[&*!]\S")              # an anchor, an alias or a tag (outside quotes): a value can then come from somewhere else
+_YAML_QUOTED = re.compile(r"\"(?:[^\"\\]|\\.)*\"|'[^']*'")
+_YAML_BLOCK_SCALAR = re.compile(r"(?:^|[\s:-])[|>][+\-0-9]*\s*$")     # a block scalar indicator: `#` and blank lines inside it are content
+_LINE_BREAKS = ("\x85", "\u2028", "\u2029")                            # line ends a YAML 1.1 reader honours and `split` does not
+
+
 def permission_block(text, keys):
-    """{key: [normalised lines]} of the top level front matter keys `keys` in `text`, or None when the text has no front matter, is not text, or is too large
-    (unparsable: the caller holds). A key's block is its line and every following line up to the next top level key; comments and blank lines are dropped,
-    line ends and trailing space are normalised. Two versions have the same permission block when these dicts are equal; any other difference is a change."""
-    if not isinstance(text, str) or len(text) > NARROW_TEXT_MAX:
+    """{key: [normalised lines]} of the top level front matter keys `keys` in `text`, or None when it cannot be judged: no front matter, not text, too
+    large, or anything outside the plain subset of YAML that this reader understands (a quoted or merge key or any other column 0 line that is no plain
+    `key:`; an anchor, alias or tag; a repeated tracked key; a block scalar under a tracked key; a front matter closed anywhere but at column 0; a Unicode
+    line break). The caller holds on None. A key's block is its line and every following line up to the next top level key; blank lines and comments at
+    column 0 are dropped, line ends and trailing space are normalised. Two versions have the same permission block when these dicts are equal."""
+    if not isinstance(text, str) or len(text) > NARROW_TEXT_MAX or any(mark in text for mark in _LINE_BREAKS):
         return None
     lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    if not lines or lines[0].strip() != "---":
+    if not lines or lines[0].rstrip() != "---":
         return None
-    end = next((n for n in range(1, len(lines)) if lines[n].strip() == "---"), None)
+    end = next((n for n in range(1, len(lines)) if lines[n].rstrip() == "---"), None)
     if end is None:
         return None
     found, current = {}, None
     for line in lines[1:end]:
-        if not line.strip() or line.lstrip().startswith("#"):
+        if not line.strip():
+            continue
+        if not line.lstrip().startswith("#") and _YAML_INDIRECTION.search(_YAML_QUOTED.sub('""', line)):
+            return None
+        indented = line[0] in " \t"
+        if not indented and line.startswith("#"):
+            continue   # a comment at the start of a line (outside any block)
+        if indented:
+            if current is not None:
+                found[current].append(line.rstrip())   # content of a tracked block, a `#` line inside it too
             continue
         top = re.match(r"([A-Za-z_][\w-]*)\s*:", line)
-        if top and not line[0].isspace():
+        if top:
             current = top.group(1) if top.group(1) in keys else None
             if current is not None:
+                if current in found:
+                    return None   # a repeated tracked key: which one a reader takes is not ours to guess
                 found[current] = [line.rstrip()]
-        elif current is not None:
-            found[current].append(line.rstrip())
+        elif line.startswith("- ") or line.rstrip() == "-":
+            if current is not None:
+                found[current].append(line.rstrip())   # a list item written at the key's own indentation
+        else:
+            return None   # a line that is no plain key (a quoted key, a merge key, a stray line)
+    if any(_YAML_BLOCK_SCALAR.search(line) for block in found.values() for line in block):
+        return None
     return found
 
 

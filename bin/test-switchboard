@@ -24036,6 +24036,16 @@ class TestImpactClassAndNarrowForm(LedgerBase):
         self.pr.pop("baseRefOid")
         self.assertEqual(self.decide()[0], "hold", "an unknown base holds")
 
+    def test_a_definition_missing_at_both_versions_and_a_mixed_change_hold(self):
+        self.files(["agents/ghost.md"])
+        decision, reasons = self.decide()
+        self.assertEqual((decision, " ".join(reasons).count("could not be read")), ("hold", 1))
+        self.files(["agents/x.md", "shims/gh"])
+        self.definition("agents/x.md", self.DEF, self.DEF.replace("Prose about the job.", "Other."))
+        decision, reasons = self.decide()
+        self.assertEqual(decision, "hold", "an unchanged permission block does not lift another top tier path")
+        self.assertIn("shims/gh", " ".join(reasons))
+
     # -- S7: the bound
 
     def test_s7_the_reads_are_none_four_and_none_and_more_than_the_limit_holds(self):
@@ -24085,6 +24095,12 @@ class TestImpactClassAndNarrowForm(LedgerBase):
             with self.subTest(bad), mock.patch.object(sb.impact_floor, "load_matrix", lambda *a, _b=bad, **k: self.matrix_with(**_b)):
                 self.assertEqual(self.decide()[0], "hold")
 
+    def test_every_agent_definition_of_this_repository_is_parsable(self):
+        f = sb.load_impact_floor()
+        keys = f.narrow_rule(f.load_matrix())[1]
+        unparsable = [str(p.relative_to(REPO)) for p in sorted((REPO / "agents").rglob("*.md")) if f.permission_block(p.read_text(), keys) is None]
+        self.assertEqual(unparsable, [], "a definition the reader cannot parse would always hold: the narrow form would help nobody")
+
     def test_the_pure_block_reader(self):
         f = sb.load_impact_floor()
         keys = ["permissions", "mode"]
@@ -24093,6 +24109,17 @@ class TestImpactClassAndNarrowForm(LedgerBase):
         self.assertIsNone(f.permission_block("---\nmode: x\n", keys))
         self.assertIsNone(f.permission_block("---\n---\n" + "x" * 300000, keys))
         self.assertEqual(f.block_state("---\nmode: x\n---\n", "---\r\nmode: x  \r\n---\r\nprose", keys), "unchanged")
+        self.assertIsNone(f.permission_block('---\n"mode": x\n---\n', keys), "a quoted key cannot be judged: it holds")
+        self.assertEqual(f.permission_block("---\npermissions:\n- a\n- b\nother: 1\n---\n", keys), {"permissions": ["permissions:", "- a", "- b"]})
+        for label, text in (("a block scalar under a tracked key", "---\npermissions: |\n  # keep\n  x\n---\n"),
+                            ("an anchor", "---\nx: &m subagent\nmode: *m\n---\n"), ("a tag", "---\nmode: !!str x\n---\n"),
+                            ("a merge key", "---\n<<: *base\nmode: x\n---\n"), ("a repeated tracked key", "---\nmode: a\nmode: b\n---\n"),
+                            ("a closing line that is indented", "---\nmode: x\n  ---\nmode: y\n---\n"), ("a Unicode line break", "---\ndescription: x\u2028mode: y\n---\n")):
+            self.assertIsNone(f.permission_block(text, keys), label)
+        self.assertEqual(f.permission_block("---\ndescription: \"say *\" and 'a!b'\npermissions:\n  - {action: shell, resource: \"gh * view *\", effect: allow}\n---\n", keys),
+                         {"permissions": ["permissions:", '  - {action: shell, resource: "gh * view *", effect: allow}']}, "quoted globs are not indirection")
+        self.assertNotEqual(f.permission_block("---\npermissions:\n  # keep\n  - x\n---\n", keys), f.permission_block("---\npermissions:\n  # kept\n  - x\n---\n", keys),
+                            "a # line inside a tracked block is content")
 
 
 class TestImpactHold(LedgerBase):
