@@ -24,6 +24,7 @@ def iso(seconds):
 
 class Stub(http.server.BaseHTTPRequestHandler):
     answer = {}
+    pad_to = None  # pad the JSON answer with trailing spaces to exactly this many bytes
     seen = []
 
     def log_message(self, *a):
@@ -33,6 +34,8 @@ class Stub(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
         Stub.seen.append((self.path, self.headers.get("Authorization", ""), json.loads(body)))
         out = json.dumps(Stub.answer).encode()
+        if Stub.pad_to:
+            out = out + b" " * (Stub.pad_to - len(out))
         self.send_response(201)
         self.send_header("Content-Length", str(len(out)))
         self.end_headers()
@@ -67,6 +70,7 @@ class Mint(unittest.TestCase):
 
     def setUp(self):
         Stub.seen = []
+        Stub.pad_to = None
         Stub.answer = {"token": TOKEN, "expires_at": iso(3500), "repositories": [{"name": "widget-service", "full_name": REAL}],
                        "permissions": dict(PERMS)}
         if os.path.exists(self.argv_log):
@@ -157,6 +161,26 @@ class Mint(unittest.TestCase):
                 if os.path.isfile(fp) and n not in ("openssl.log", "k.pem"):  # the spy's own log is the fixture
                     with open(fp, errors="replace") as f:
                         self.assertNotIn(PLANTED, f.read())
+
+    def test_the_answer_size_cap_refuses_one_byte_over_and_accepts_the_cap(self):
+        Stub.pad_to = 1_000_000
+        p = self.run_mint()
+        self.assertEqual((p.returncode, p.stdout), (0, TOKEN), p.stderr)  # exactly at the cap is read
+        Stub.pad_to = 1_000_001
+        p = self.run_mint()
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(p.stdout, "")
+        self.assertIn("larger than", p.stderr)
+        self.assertNotIn(TOKEN, p.stderr)
+
+    def test_the_vault_output_size_cap_refuses_an_oversized_output_and_accepts_a_normal_one(self):
+        big = "python3 -c 'print(\"1\" * 1000001)'"
+        for var in ("CW_APP_ID_CMD", "CW_APP_INSTALLATION_CMD", "CW_APP_KEY_CMD"):
+            p = self.run_mint(**{var: big})
+            self.assertNotEqual(p.returncode, 0, var)
+            self.assertEqual(p.stdout, "")
+            self.assertIn("more than", p.stderr)
+        self.assertEqual(self.run_mint().stdout, TOKEN)
 
     def test_non_loopback_base_and_failing_vault_are_refused(self):
         for env in ({"CW_GITHUB_API_BASE": "http://example.com"}, {"CW_GITHUB_API_BASE": "https://127.0.0.1"},
