@@ -145,6 +145,11 @@ def load_plan_ledger():
     return load_module("plan_ledger")
 
 
+def load_launch_testers():
+    """The launch-record testers' pure core, bin/launch_testers.py (#372), loaded by path like plan_check."""
+    return load_module("launch_testers")
+
+
 def load_report_fold():
     """The report fold's pure core, bin/report_fold.py (#352), loaded by path like plan_check."""
     return load_module("report_fold")
@@ -5642,9 +5647,9 @@ def launch_problems(name, agent, directory, workspace, issue, charter=None, head
     return problems
 
 
-def fleet_record(name, role, reports_to, issue, charter=None, repo=None):
+def fleet_record(name, role, reports_to, issue, charter=None, repo=None, launched_by=None):
     fleet = {"name": name, "role": role, "reports_to": reports_to, "issue": None if issue is None else int(issue),
-             "charter": charter, "repo": repo}
+             "charter": charter, "repo": repo, "launched_by": launched_by}   # launched_by (#372): the agent that ran `launch`, as its pane identified it; None from a plain shell
     return {key: value for key, value in fleet.items() if value is not None}
 
 
@@ -5728,7 +5733,7 @@ def view_env(role, repo):
 
 
 def launch_agent(engine, name, agent, directory, workspace, role=None, reports_to=None, issue=None,
-                 brief=None, patience=LAUNCH_PATIENCE, sleep=time.sleep, charter=None, repo=None):
+                 brief=None, patience=LAUNCH_PATIENCE, sleep=time.sleep, charter=None, repo=None, launched_by=None):
     """Create a fleet agent: a v2 session, its own herdr tab, the brief.
 
     Nothing is typed. The tab's program is started by argv through herdr's
@@ -5743,7 +5748,7 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
     taken = engine.discover(engine.now()).agents.get(name)
     if taken is not None:
         raise LaunchError("a fleet agent named %s already runs in pane %s" % (name, taken.pane))
-    fleet = fleet_record(name, role, reports_to, issue, charter, repo)
+    fleet = fleet_record(name, role, reports_to, issue, charter, repo, launched_by)
     env = dict(engine.config["opencode_env"], **engine.config["launch_env"])
     env.update(view_env(role, repo or (engine.config.get("intent_repo") if charter else None)))  # PR 18
     accounts = getattr(engine, "accounts", None)
@@ -5798,7 +5803,7 @@ def register_launch_worktree(engine, name, directory, repo):
         engine._note("worktree.error", name, {"error": _one_line(str(err), 120)})
 
 
-def launch_headless(engine, name, agent, directory, role=None, reports_to=None, issue=None, brief=None, charter=None, repo=None):
+def launch_headless(engine, name, agent, directory, role=None, reports_to=None, issue=None, brief=None, charter=None, repo=None, launched_by=None):
     """Create a fleet agent with NO terminal (#433): a v2 session in the OpenCode service, a private record (state-dir/headless/<name>.json) and the
     brief through the API. Nothing is opened in herdr. Presence is proved by the service: the new session must answer and carry the worker's name
     before the brief is sent. Returns {"name", "session", "pane": None, "tab": None, "headless": True}.
@@ -5821,7 +5826,7 @@ def launch_headless(engine, name, agent, directory, role=None, reports_to=None, 
             if ap.read_record(engine.state_dir, name)[0] is not None:
                 raise LaunchError("a headless record for %s already exists: `%s retire %s` first, or pick another name" % (name, PROG, name))
             identity = headless_identity(engine, repo)   # refuses a repo that maps to a named gh account: a headless worker cannot be pinned to it
-            fleet = fleet_record(name, role, reports_to, issue, charter, repo)
+            fleet = fleet_record(name, role, reports_to, issue, charter, repo, launched_by)
             fleet["headless"] = True
             with engine._external("v2.session.create", name, {"agent": agent, "directory": directory, "fleet": fleet, "headless": True}) as result:
                 session_id = engine.v2.session_create(agent, name, directory, {"fleet": fleet})["id"]
@@ -6143,6 +6148,30 @@ def prune_retired(retired, now):
 
 def read_retired(state_dir):
     return _read_small(state_dir, RETIRED_FILE)
+
+
+class RetiredUnreadable(Exception):
+    """retired.json exists but cannot be read as the {name: record} map it is (#372): for the tester gate that is NOT the same as an empty list."""
+
+
+def read_retired_strict(state_dir):
+    """The retired map, or RetiredUnreadable. A MISSING file is an empty map (nobody retired); anything else that is not a JSON object of objects (corrupt,
+    empty, garbage, a list, a record that is not an object, unreadable) raises. `read_retired` reads all of those as empty, which is right for a display but
+    would let a retired tester record verdicts again: the verdict authority (launch-record testers) uses this one and fails closed."""
+    try:
+        with open(str(Path(state_dir) / RETIRED_FILE), "rb") as handle:
+            raw = handle.read(1000001)
+    except FileNotFoundError:
+        return {}
+    except OSError as err:
+        raise RetiredUnreadable("%s cannot be read: %s" % (RETIRED_FILE, getattr(err, "strerror", None) or type(err).__name__)) from None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeError):
+        raise RetiredUnreadable("%s is not valid JSON" % RETIRED_FILE) from None
+    if not isinstance(data, dict) or len(raw) > 1000000 or not all(isinstance(v, dict) for v in data.values()):
+        raise RetiredUnreadable("%s is not a map of retired agents" % RETIRED_FILE)
+    return data
 
 
 def _prune_last_reports(data):
@@ -12155,6 +12184,23 @@ def triage_summary(state_dir):
     return raw
 
 
+def testers_status(config, agents, fleets, state):
+    """The `status` lines of the resolved testers per repo with their source (#372); [] when there are none or the picture is unreadable."""
+    try:
+        if not (agents.get("ok") and fleets is not None):
+            return []
+        sessions = {entry["observation"]["name"]: entry["observation"].get("session") for entry in (agents.get("list") or []) if entry.get("observation")}
+        repo_of = lambda fleet: _fleet_repo(fleet, config)
+        repos = {repo_of(fleet) for fleet in fleets.values() if isinstance(fleet, dict) and fleet.get("role") == "orchestrator"} - {None}
+        try:
+            retired = read_retired_strict(state)
+        except RetiredUnreadable:
+            return ["      testers    retired file unreadable: launch-record testers disabled"]   # the same fail-closed rule the verdict gate applies
+        return load_launch_testers().status_lines(config.get("plan_evaluators"), fleets, sessions, repos, repo_of, retired)
+    except Exception as err:
+        return ["      tester     unreadable: the resolved testers could not be listed (%s)" % _one_line(type(err).__name__, 40)]
+
+
 def triage_status_lines(triage):
     if not triage:
         return []
@@ -14674,6 +14720,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         fleets = {entry["observation"]["name"]: entry["observation"].get("fleet") or {}
                   for entry in (agents.get("list") or []) if agents.get("ok") and entry.get("observation")}
         report["github"] = github_status(config, state, fleets, now())
+        report["testers"] = testers_status(config, agents, fleets, state)   # #372
     if state_ok:
         report["decisions"] = decisions_summary(state, now)
         report["v2_calls"] = v2_calls_status(state, now())
@@ -14897,6 +14944,7 @@ def format_status(report):
     lines.extend("      " + text for text in report.get("github_calls") or [])
     lines.extend("      v2_light   " + report["v2_light"] for _ in [0] if report.get("v2_light"))
     lines.extend(sweep_status_lines(report.get("sweep")))  # #117
+    lines.extend(report.get("testers") or [])   # #372
     lines.extend(triage_status_lines(report.get("triage")))  # #130
     lines.extend("      " + report["ci_record"] for _ in [0] if report.get("ci_record"))
     lines.extend(report.get("pane_lines") or [])
@@ -15205,12 +15253,19 @@ def cmd_launch(args, runner, now, socket_call=None):
             created = workspace = result["workspace"] = engine.herdr.workspace_create(
                 args.dir, args.new_workspace, focus=False)["workspace_id"]
     try:
+        launcher = identify_caller(engine.herdr, engine.v2, os.environ)   # #372: who ran this launch, recorded in the session; a plain shell is nobody
+    except Exception:
+        launcher = None   # an identity failure records nobody, on purpose: that agent never counts as a launched tester (fail closed)
+    launched_by = launcher if isinstance(launcher, str) and launcher else None
+    try:
         if getattr(args, "headless", False):
             done = launch_headless(engine, args.name, args.agent, args.dir, args.role, args.reports_to,
-                                   None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo)
+                                   None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo,
+                                   launched_by=launched_by)
         else:
             done = launch_agent(engine, args.name, args.agent, args.dir, workspace, args.role, args.reports_to,
-                                None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo)
+                                None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo,
+                                launched_by=launched_by)
     except LaunchError as err:
         if created:
             raise LaunchError("%s (workspace %s was created and is left for you to close)" % (err, created)) from err
@@ -17793,6 +17848,24 @@ def cmd_prove(args, runner, now):
 cmd_prove.ledger = True   # state and GETs only; its own errors are usage errors
 
 
+def launched_testers_for(ctx):
+    """({name: launch record}, {name: session id}, {name: metadata.fleet}) from ONE read of the running agents: the testers the launch record makes testers
+    of this PR's repo (#372), and what the lane rule needs. Never raises: a discovery that fails gives nothing launched (so only the configured list
+    counts, and the lane rule has nobody to apply to); an unreadable retired list counts every launched tester as retired (fail closed)."""
+    try:
+        agents = ctx.engine.discover(ctx.engine.now()).agents
+        fleets = {name: (seen.fleet or {}) for name, seen in agents.items()}
+        sessions = {name: seen.session_id for name, seen in agents.items()}
+    except Exception:
+        return {}, {}, {}
+    try:
+        retired = read_retired_strict(ctx.engine.state_dir) if ctx.engine.state_dir is not None else {}
+    except Exception as err:   # a corrupt retired file could hide a retired tester: no launched tester counts, loudly (audit; `status` says so too)
+        ctx.engine._note("testers.retired_unreadable", None, {"error": _one_line(str(err), 160), "effect": "launch-record testers disabled"})
+        return {}, sessions, fleets
+    return load_launch_testers().launched(fleets, sessions, ctx.repo, lambda fleet: _fleet_repo(fleet, ctx.config), retired), sessions, fleets
+
+
 def cmd_verdict(args, runner, now):
     """`verdict <scenario> --pr <repo#N> --as <evaluator> --result ...`: record the evaluator's verdict for a scenario. Only
     the evaluator the scenario names, only by an agent registered for it (`plan_evaluators`), never by a writer of the PR."""
@@ -17828,8 +17901,15 @@ def cmd_verdict(args, runner, now):
         if not plan_ledger.known_writers(ctx.entries, ctx.pr, senders):
             raise LedgerCommandError("refused: no writer of %s is known to the switchboard (nobody has recorded a proof or sent its "
                                      "`notice pr`): its author must do that first, so the author can be excluded" % ctx.pr)
-        ok, why = plan_ledger.may_record_verdict(named, caller, ctx.config.get("plan_evaluators"),
-                                                 plan_ledger.authors_of(ctx.entries, ctx.pr, senders, ctx.facts.get("author")))
+        allowed, launch, sessions, fleets = ctx.config.get("plan_evaluators"), {}, {}, {}
+        authors = plan_ledger.authors_of(ctx.entries, ctx.pr, senders, ctx.facts.get("author"))
+        if named == "tester":   # #372: the configured list UNION the testers the launch record names for this repo; any trouble reading it is the configured list alone
+            launch, sessions, fleets = launched_testers_for(ctx)
+            allowed = load_launch_testers().evaluators(allowed, launch)
+        ok, why = plan_ledger.may_record_verdict(named, caller, allowed, authors)
+        if ok and named == "tester" and caller in launch:
+            why = load_launch_testers().lane_refusal(caller, launch, authors, sessions, fleets)
+            ok = why is None
     if not ok:
         if ctx.engine.audit is not None:
             ctx.engine.audit.append(ctx.engine.actor, "plan.verdict.refused", ctx.pr,
@@ -17848,9 +17928,10 @@ def cmd_verdict(args, runner, now):
         raise LedgerCommandError("%s" % err) from None
     for entry, one in zip(entries, stored):
         if ctx.engine.audit is not None:
-            ctx.engine.audit.append(ctx.engine.actor, "plan.verdict", ctx.pr,
-                                    {"scenario": entry["scenario"], "result": entry["result"], "seq": one["seq"], "by": entry["by"],
-                                     "chain": one["hash"]})
+            detail = {"scenario": entry["scenario"], "result": entry["result"], "seq": one["seq"], "by": entry["by"], "chain": one["hash"]}
+            if named == "tester" and caller in launch and load_launch_testers().source_of(caller, ctx.config.get("plan_evaluators"), launch) == "launch record":
+                detail["launch_record"] = {k: v for k, v in launch[caller].items() if v is not None}   # #372: the record this verdict relied on
+            ctx.engine.audit.append(ctx.engine.actor, "plan.verdict", ctx.pr, detail)
         print("recorded %s verdict #%d: %s %s at %s (%s), bound to plan %s" % (named, one["seq"], entry["scenario"], args.result,
                                                                              head[:8], ctx.pr, entry["plan_hash"][:19]))
     return EXIT_OK

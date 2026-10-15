@@ -5800,6 +5800,22 @@ class TestLaunch(Base):
         self.assertEqual(session["metadata"]["fleet"]["reports_to"], "platform")
         self.assertEqual(session["messages"][0]["text"], "Do the thing\n")
 
+    def test_a_launch_records_who_ran_it_from_its_pane_and_nobody_from_a_plain_shell(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        for pane, expected in ((self.world.panes["platform"], "platform"), (None, None)):
+            if pane is None:
+                os.environ.pop("HERDR_PANE_ID", None)
+            else:
+                os.environ["HERDR_PANE_ID"] = pane
+            name = "tester-%s" % (expected or "shell")
+            with captured() as (out, err):
+                code = sb.main(["launch", name, "--agent", "coder", "--dir", str(self.work), "--role", "tester", "--reports-to", "platform"],
+                               runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+            self.assertEqual(code, 0, err.getvalue())
+            fleet = self.world.v2.sessions[json.loads(out.getvalue())["session"]]["metadata"]["fleet"]
+            self.assertEqual((fleet["role"], fleet.get("launched_by")), ("tester", expected))
+
     def test_the_cli_without_a_workspace_is_refused(self):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
         os.environ.pop("HERDR_WORKSPACE_ID", None)
@@ -12838,6 +12854,13 @@ class TestHeadlessPresence(Base):
         args = dict(name="hw", agent="coder", directory=str(self.home), role="coder", reports_to="boss", issue=9, brief="Add a health check")
         args.update(overrides)
         return sb.launch_headless(self.engine, **args)
+
+    def test_a_headless_launch_records_who_ran_it_so_a_headless_tester_can_count_for_its_orchestrator(self):
+        done = self.launch_hl(name="hw-tst", role="tester", launched_by="boss")
+        fleet = self.world.v2.sessions[done["session"]]["metadata"]["fleet"]
+        self.assertEqual((fleet["role"], fleet["reports_to"], fleet.get("launched_by")), ("tester", "boss", "boss"))
+        plain = self.launch_hl(name="hw-plain", role="tester")                       # launched from a plain shell: nobody, so it never counts
+        self.assertNotIn("launched_by", self.world.v2.sessions[plain["session"]]["metadata"]["fleet"])
 
     def test_launch_headless_creates_the_session_and_its_record_sends_the_brief_and_opens_no_terminal(self):
         panes_before, calls_before, sessions_before = dict(self.world.herdr.panes), list(self.world.herdr.socket_calls), set(self.world.v2.sessions)
@@ -23524,6 +23547,136 @@ class LedgerBase(Base):
             self.assertEqual(self.prove("coder", sid)[0], 0)
         for who, sid, ev in (("cibot", "S1", "ci"), ("tst", "S2", "tester"), ("rev", "S3", "reviewer"), ("cibot", "U1", "ci")):
             self.assertEqual(self.verdict(who, sid, ev)[0], 0, (who, sid))
+
+
+class TestLaunchTesters(LedgerBase):
+    """#372: a tester launched with --role tester for its orchestrator's repo may record tester verdicts, beside the configured list."""
+
+    def setUp(self):
+        super().setUp()
+        add = self.world.add_agent
+        add("orch", fleet={"role": "orchestrator", "repo": "acme/app", "issue": 7})
+        add("orch-web", fleet={"role": "orchestrator", "repo": "acme/web", "issue": 8})
+        add("ltst", fleet={"role": "tester", "repo": "acme/app", "reports_to": "orch", "issue": 7, "launched_by": "orch"})
+        add("ltst-web", fleet={"role": "tester", "repo": "acme/web", "reports_to": "orch-web", "issue": 8, "launched_by": "orch-web"})
+        add("ltst-nobody", fleet={"role": "tester", "repo": "acme/app", "reports_to": "coder", "issue": 7, "launched_by": "coder"})
+        add("ltst-forged", fleet={"role": "tester", "repo": "acme/app", "reports_to": "orch", "issue": 7, "launched_by": "coder"})   # a coder named the orchestrator as the boss
+        add("ltst-old", fleet={"role": "tester", "repo": "acme/app", "reports_to": "orch", "issue": 7})                              # launched before launched_by existed
+        add("lrev", fleet={"role": "reviewer", "repo": "acme/app", "reports_to": "orch", "issue": 7})
+        self.configure(evaluators={"reviewer": ["rev"], "tester": ["tst"], "owner": ["own"], "ci": ["cibot"]})
+        self.assertEqual(self.prove("coder", "S2")[0], 0)
+
+    def test_launch_records_the_role_with_the_repo_and_the_boss(self):
+        record = sb.fleet_record("ltst", "tester", "orch", 7, None, "acme/app")
+        self.assertEqual((record["role"], record["repo"], record["reports_to"]), ("tester", "acme/app", "orch"))
+
+    def test_a_launched_tester_is_accepted_for_its_repo_and_refused_for_another(self):
+        self.assertEqual(self.verdict("ltst", "S2", "tester")[0], 0)
+        code, _, err = self.verdict("ltst-web", "S2", "tester")      # acme/web's tester on an acme/app PR
+        self.assertEqual(code, 2)
+        self.assertIn("not registered", err)
+        self.assertEqual([e["by"] for e in self.ledger() if e["kind"] == "verdict"], ["ltst"])
+
+    def test_a_tester_whose_boss_is_not_an_orchestrator_of_the_repo_is_refused(self):
+        for who in ("ltst-nobody", "lrev", "ltst-forged", "ltst-old"):    # boss is a coder; role reviewer; launched by a coder; no launched_by
+            code, _, err = self.verdict(who, "S2", "tester")
+            self.assertEqual(code, 2, who)
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "verdict"], [])
+
+    def test_a_tester_that_proved_the_pr_is_refused_as_a_writer(self):
+        self.assertEqual(self.prove("ltst", "S1")[0], 0)
+        code, _, err = self.verdict("ltst", "S2", "tester")
+        self.assertEqual(code, 2)
+        self.assertIn("wrote this PR", err)
+
+    def test_a_launched_tester_is_never_a_reviewer_ci_or_owner(self):
+        for sid, evaluator in (("S3", "reviewer"), ("S1", "ci"), ("S2", "owner")):
+            code, _, err = self.verdict("ltst", sid, evaluator)
+            self.assertNotEqual(code, 0, evaluator)
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "verdict"], [])
+
+    def test_the_configured_tester_still_works_and_the_audit_names_the_record_only_for_a_launched_one(self):
+        self.assertEqual(self.verdict("tst", "S2", "tester")[0], 0)
+        self.assertEqual(self.verdict("ltst", "S2", "tester")[0], 0)
+        events = [e for e in self.world.audit() if e["event"] == "plan.verdict"]
+        configured, launched = [e["detail"] for e in events if e["detail"]["by"] == "tst"][0], [e["detail"] for e in events if e["detail"]["by"] == "ltst"][0]
+        self.assertNotIn("launch_record", configured)
+        self.assertEqual({k: launched["launch_record"][k] for k in ("name", "role", "repo", "reports_to")},
+                         {"name": "ltst", "role": "tester", "repo": "acme/app", "reports_to": "orch"})
+
+    def test_a_retired_tester_stops_counting_and_is_not_listed(self):
+        retired = {"ltst": {"at": 1, "by": "orch", "reason": "done", "session": self.world.sessions["ltst"], "auto": False}}
+        (self.world.state / sb.RETIRED_FILE).write_text(json.dumps(retired))
+        code, _, err = self.verdict("ltst", "S2", "tester")
+        self.assertEqual(code, 2)
+        self.assertIn("not registered", err)
+        retired["ltst"]["session"] = "ses_an_older_launch"   # a relaunch under the same name is a new session: retirement of the old one does not cover it
+        (self.world.state / sb.RETIRED_FILE).write_text(json.dumps(retired))
+        self.assertEqual(self.verdict("ltst", "S2", "tester")[0], 0)
+        retired["ltst"]["session"] = self.world.sessions["ltst"]
+        self.assertEqual(sb.load_launch_testers().launched({"ltst": {"role": "tester", "repo": "acme/app", "reports_to": "orch", "launched_by": "orch"}, "orch": {"role": "orchestrator", "repo": "acme/app"}},
+                                                           {"ltst": self.world.sessions["ltst"]}, "acme/app", lambda f: f.get("repo"), retired), {})
+
+    def test_a_missing_retired_file_means_nobody_is_retired(self):
+        (self.world.state / sb.RETIRED_FILE).unlink(missing_ok=True)
+        self.assertEqual(self.verdict("ltst", "S2", "tester")[0], 0)
+        self.assertEqual(sb.read_retired_strict(self.world.state), {})
+
+    def test_a_corrupt_or_unreadable_retired_file_disables_every_launched_tester_and_says_so(self):
+        path = self.world.state / sb.RETIRED_FILE
+        for label, content in (("corrupt json", b'{"ltst": {"at": 1,'), ("empty bytes", b""), ("garbage", b"\xff\xfe not json \x00"),
+                               ("a list", b"[]"), ("a record that is not an object", b'{"ltst": "retired"}'), ("a bare string", b'"x"')):
+            with self.subTest(content=label):
+                path.write_bytes(content)
+                before = len([e for e in self.world.audit() if e["event"] == "testers.retired_unreadable"])
+                code, _, err = self.verdict("ltst", "S2", "tester")
+                self.assertEqual(code, 2)
+                self.assertIn("not registered", err)
+                self.assertEqual([e for e in self.ledger() if e["kind"] == "verdict"], [], "0 tester verdicts accepted")
+                events = [e for e in self.world.audit() if e["event"] == "testers.retired_unreadable"]
+                self.assertEqual(len(events), before + 1, "a loud audit event")
+                self.assertEqual(events[-1]["detail"]["effect"], "launch-record testers disabled")
+                with self.assertRaises(sb.RetiredUnreadable):
+                    sb.read_retired_strict(self.world.state)
+                fleets = {"orch": {"role": "orchestrator", "repo": "acme/app"}, "ltst": {"role": "tester", "repo": "acme/app", "reports_to": "orch", "launched_by": "orch"}}
+                agents = {"ok": True, "list": [{"observation": {"name": n, "session": "s-" + n}} for n in fleets]}
+                self.assertEqual(sb.testers_status({"plan_evaluators": {}, "intent_repo": "acme/app"}, agents, fleets, self.world.state),
+                                 ["      testers    retired file unreadable: launch-record testers disabled"])
+        self.assertEqual(self.verdict("tst", "S2", "tester")[0], 0, "the configured tester still works")
+        path.unlink()
+
+    def test_an_unreadable_directory_instead_of_a_file_also_fails_closed(self):
+        path = self.world.state / sb.RETIRED_FILE
+        path.mkdir()
+        try:
+            self.assertEqual(self.verdict("ltst", "S2", "tester")[0], 2)
+        finally:
+            path.rmdir()
+
+    def test_status_lists_the_resolved_testers_with_their_source(self):
+        fleets = {"orch": {"role": "orchestrator", "repo": "acme/app"}, "ltst": {"role": "tester", "repo": "acme/app", "reports_to": "orch", "launched_by": "orch"},
+                  "tst": {"role": "tester", "repo": "acme/app", "reports_to": "orch", "launched_by": "orch"}}
+        agents = {"ok": True, "list": [{"observation": {"name": n, "session": "s-" + n}} for n in fleets]}
+        lines = sb.testers_status({"plan_evaluators": {"tester": ["tst"]}, "intent_repo": "acme/app"}, agents, fleets, self.world.state)
+        self.assertEqual(lines, ["      tester     tst: config (any repo)", "      tester     ltst: launch record (acme/app)"])
+        self.assertEqual(sb.testers_status({}, {"ok": False}, {}, self.world.state), [])
+
+    def test_the_pure_rules_and_the_status_lines(self):
+        lt = sb.load_launch_testers()
+        fleets = {"orch": {"role": "orchestrator", "repo": "acme/app"}, "t1": {"role": "tester", "repo": "acme/app", "reports_to": "orch", "launched_by": "orch"},
+                  "t2": {"role": "tester", "repo": "acme/web", "reports_to": "orch", "launched_by": "orch"}}
+        repo_of = lambda f: f.get("repo")
+        self.assertEqual(sorted(lt.launched(fleets, {}, "acme/app", repo_of)), ["t1"])
+        self.assertEqual(lt.evaluators({"tester": ["tst"], "ci": ["bot"]}, {"t1": {}}), {"tester": ["tst", "t1"], "ci": ["bot"]})
+        self.assertEqual(lt.evaluators({"reviewer": ["r"]}, {}), {"reviewer": ["r"]})
+        self.assertIsNone(lt.lane_refusal("t1", {"t1": {}}, {"coder"}, {"t1": "s1", "coder": "s2"}))
+        coders = {"t1": {"role": "tester", "issue": 7}, "c1": {"role": "coder", "issue": 7}, "c2": {"role": "coder", "issue": 9}}
+        self.assertIn("not a different agent from c1", lt.lane_refusal("t1", {"t1": {}}, set(), {"t1": "s1", "c1": "s1"}, coders))
+        self.assertIsNone(lt.lane_refusal("t1", {"t1": {}}, set(), {"t1": "s1", "c2": "s1"}, coders))   # a coder of another work item
+        self.assertIn("session of a writer", lt.lane_refusal("t1", {"t1": {}}, {"coder"}, {"t1": "s1", "coder": "s1"}))
+        self.assertEqual(lt.status_lines({"tester": ["tst"]}, fleets, {}, {"acme/app"}, repo_of),
+                         ["      tester     tst: config (any repo)", "      tester     t1: launch record (acme/app)"])
+        self.assertEqual(lt.source_of("tst", {"tester": ["tst"]}, {"tst": {}}), "config")
 
 
 class TestPlanLedger(LedgerBase):
