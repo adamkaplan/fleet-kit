@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""cloud-worker: launcher, reaper and audit for fleet-kit cloud workers (slice B).
+"""cloud-worker: launcher, reaper and audit for cloud workers (slice B).
 
 Built to docs/cloud-worker-interface.md. Commands: create, stop, extend, delete, status, reap.
-The cloud is reached only through `kubectl` (the binary is FLEET_KUBECTL, so tests fake it). Nothing here
+The cloud is reached only through `kubectl` (the binary is CW_KUBECTL, so tests fake it). Nothing here
 holds a credential: the cluster login is kubectl's own, and a worker's GitHub token is minted inside the pod.
 """
 import argparse
 import datetime as dt
-import pwd
 import hashlib
 import json
 import os
@@ -24,15 +23,15 @@ SHAPES = {"S": {"cpu": "2", "memory": "4Gi", "usd_per_hour": 0.10},
           "M": {"cpu": "4", "memory": "8Gi", "usd_per_hour": 0.20}}  # list-price estimates, not billed figures
 MAX_TOKEN_SECONDS = 3600
 DEFAULT_MAX_HARD = "8h"  # OPEN in the contract: value
-DEFAULT_SPEND_CAP_USD = 25.0  # the prototype's cap; applies when FLEET_CLOUD_SPEND_CAP_USD is unset or empty
-LABEL = "fleet-worker"
+DEFAULT_SPEND_CAP_USD = 25.0  # the prototype's cap; applies when CW_CLOUD_SPEND_CAP_USD is unset or empty
+LABEL = "cw-worker"
 EXIT_DONE, EXIT_HOOK, EXIT_USAGE, EXIT_CLOUD, EXIT_TIMEOUT, EXIT_CAP, EXIT_REFUSED = 0, 1, 2, 3, 4, 5, 6
 
 CREDENTIAL_PATTERNS = [re.compile(p) for p in (
     r"gh[pousr]_[A-Za-z0-9]{20,}", r"github_pat_[A-Za-z0-9_]{20,}", r"sk-[A-Za-z0-9]{20,}", r"AKIA[0-9A-Z]{16}",
     r"-----BEGIN [A-Z ]*PRIVATE KEY", r"Bearer [A-Za-z0-9._-]{20,}", r"(?i)(client_secret|api[_-]?key)\"\s*:\s*\"[^\"]+")]
 SECRET_ENV_NAME = re.compile(r"(?i)(TOKEN|SECRET|PASSWORD|API_?KEY|CREDENTIAL|^PAT$|_PAT$)")
-ALLOWED_ENV_NAMES = {"FLEET_TOKEN_ENDPOINT"}  # a URL, not a token
+ALLOWED_ENV_NAMES = {"CW_TOKEN_ENDPOINT"}  # a URL, not a token
 
 
 class CloudError(Exception):
@@ -56,7 +55,7 @@ def _raise_interrupted(signum, frame):
 
 def spend_cap(env):
     """The cap in USD: the setting, else the default. Zero, negative, non-numeric, nan or inf refuse (fail closed)."""
-    raw = (env.get("FLEET_CLOUD_SPEND_CAP_USD") or "").strip()
+    raw = (env.get("CW_CLOUD_SPEND_CAP_USD") or "").strip()
     if not raw:
         return DEFAULT_SPEND_CAP_USD
     try:
@@ -64,7 +63,7 @@ def spend_cap(env):
     except ValueError:
         cap = float("nan")
     if not math.isfinite(cap) or cap <= 0:
-        raise CloudError("FLEET_CLOUD_SPEND_CAP_USD must be a positive finite number of USD; refusing to create", EXIT_CAP)
+        raise CloudError("CW_CLOUD_SPEND_CAP_USD must be a positive finite number of USD; refusing to create", EXIT_CAP)
     return cap
 
 
@@ -112,14 +111,14 @@ class Kube:
 
     def __init__(self, env):
         self.env = dict(os.environ, **env)
-        self.bin = env.get("FLEET_KUBECTL", "kubectl")
-        self.ns = env.get("FLEET_CLOUD_NAMESPACE", "fleet-workers")
-        self.context = (env.get("FLEET_KUBE_CONTEXT") or "").strip()
-        self.kubeconfig = (env.get("FLEET_KUBECONFIG") or "").strip()
+        self.bin = env.get("CW_KUBECTL", "kubectl")
+        self.ns = env.get("CW_CLOUD_NAMESPACE", "cw")
+        self.context = (env.get("CW_KUBE_CONTEXT") or "").strip()
+        self.kubeconfig = (env.get("CW_KUBECONFIG") or "").strip()
 
     def run(self, args, stdin=None, ok_missing=False, keep_stdout=False):
         if not self.context:  # never fall back to the active context
-            raise CloudError("FLEET_KUBE_CONTEXT is not set; refusing to run kubectl against an unnamed context", EXIT_USAGE)
+            raise CloudError("CW_KUBE_CONTEXT is not set; refusing to run kubectl against an unnamed context", EXIT_USAGE)
         cmd = [self.bin] + (["--kubeconfig", self.kubeconfig] if self.kubeconfig else []) + \
               ["--context", self.context, "-n", self.ns] + args
         try:
@@ -146,7 +145,7 @@ class Kube:
         return json.loads(self.run(["get", "pods", "-l", "app=" + LABEL, "-o", "json"]))["items"]
 
     def annotate(self, name, **kv):
-        self.run(["annotate", "pod", name, "--overwrite"] + ["fleet/%s=%s" % (k.replace("_", "-"), v) for k, v in kv.items()])
+        self.run(["annotate", "pod", name, "--overwrite"] + ["cw/%s=%s" % (k.replace("_", "-"), v) for k, v in kv.items()])
 
     def delete_pod(self, name):
         self.run(["delete", "pod", name, "--ignore-not-found", "--wait=false"])
@@ -163,33 +162,33 @@ class Kube:
 
 
 def ann(pod, key, default=None):
-    return pod["metadata"].get("annotations", {}).get("fleet/" + key, default)
+    return pod["metadata"].get("annotations", {}).get("cw/" + key, default)
 
 
 def render_pod(a, worker, name, now, hard, env):
-    image = a.image or env.get("FLEET_CLOUD_IMAGE")
+    image = a.image or env.get("CW_CLOUD_IMAGE")
     if not image:
-        raise CloudError("no image: pass --image or set FLEET_CLOUD_IMAGE", EXIT_USAGE)
-    endpoint = env.get("FLEET_TOKEN_ENDPOINT")
+        raise CloudError("no image: pass --image or set CW_CLOUD_IMAGE", EXIT_USAGE)
+    endpoint = env.get("CW_TOKEN_ENDPOINT")
     if not endpoint:
-        raise CloudError("no token endpoint: set FLEET_TOKEN_ENDPOINT", EXIT_USAGE)
+        raise CloudError("no token endpoint: set CW_TOKEN_ENDPOINT", EXIT_USAGE)
     shape = SHAPES[a.shape]
-    e = {"FLEET_WORKER": worker, "FLEET_REPO": a.repo, "FLEET_BRANCH": a.branch,
-         "FLEET_IDLE_SECONDS": str(parse_duration(a.idle)), "FLEET_HARD_DEADLINE": iso(hard),
-         "FLEET_TOKEN_ENDPOINT": endpoint, "FLEET_AUDIT_RUNTIME_ID": "pod/" + name}
+    e = {"CW_WORKER": worker, "CW_REPO": a.repo, "CW_BRANCH": a.branch,
+         "CW_IDLE_SECONDS": str(parse_duration(a.idle)), "CW_HARD_DEADLINE": iso(hard),
+         "CW_TOKEN_ENDPOINT": endpoint, "CW_AUDIT_RUNTIME_ID": "pod/" + name}
     return {"apiVersion": "v1", "kind": "Pod", "metadata": {
-        "name": name, "labels": {"app": LABEL, "fleet/worker": worker, "azure.workload.identity/use": "true"},
-        "annotations": {"fleet/worker": worker, "fleet/started": iso(now), "fleet/hard-deadline": iso(hard),
-                        "fleet/idle-seconds": e["FLEET_IDLE_SECONDS"], "fleet/shape": a.shape,
-                        "fleet/max-hard": iso(now + dt.timedelta(seconds=parse_duration(a.max_hard)))}},
-        "spec": {"restartPolicy": "Never", "serviceAccountName": env.get("FLEET_CLOUD_SERVICE_ACCOUNT", "fleet-worker"),
+        "name": name, "labels": {"app": LABEL, "cw/worker": worker},
+        "annotations": {"cw/worker": worker, "cw/started": iso(now), "cw/hard-deadline": iso(hard),
+                        "cw/idle-seconds": e["CW_IDLE_SECONDS"], "cw/shape": a.shape,
+                        "cw/max-hard": iso(now + dt.timedelta(seconds=parse_duration(a.max_hard)))}},
+        "spec": {"restartPolicy": "Never", "serviceAccountName": env.get("CW_CLOUD_SERVICE_ACCOUNT", "cw-worker"),
                   "securityContext": {"runAsNonRoot": True},
                  "containers": [{"name": "worker", "image": image,
                                  "securityContext": {"allowPrivilegeEscalation": False, "capabilities": {"drop": ["ALL"]}}, "env": [{"name": k, "value": v} for k, v in e.items()],
                                  "resources": {"limits": {"cpu": shape["cpu"], "memory": shape["memory"]}},
                                  "readinessProbe": {"httpGet": {"path": "/health", "port": 4096}},
-                                 "volumeMounts": [{"name": "pw", "mountPath": "/run/fleet", "readOnly": True},
-                                                  {"name": "tokens", "mountPath": "/run/fleet-tmp"},
+                                 "volumeMounts": [{"name": "pw", "mountPath": "/run/cw", "readOnly": True},
+                                                  {"name": "tokens", "mountPath": "/run/cw-tmp"},
                                                   {"name": "scratch", "mountPath": "/work"}]}],
                  "volumes": [{"name": "pw", "secret": {"secretName": name + "-pw", "defaultMode": 0o600,
                                                        "items": [{"key": "password", "path": "server-password"}]}},
@@ -200,15 +199,16 @@ def render_pod(a, worker, name, now, hard, env):
 class Launcher:
     def __init__(self, kube, env, clock=None, sleep=time.sleep):
         self.kube, self.env, self.sleep = kube, env, sleep
+        self.actor = "operator"  # a neutral role, never a login, host or person name; the reaper sets "reaper"
         self.clock = clock or (lambda: dt.datetime.now(dt.timezone.utc))
-        self.audit_path = env.get("FLEET_CLOUD_AUDIT") or os.path.join(
-            env.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "fleet-cloud", "audit.jsonl")
+        self.audit_path = env.get("CW_CLOUD_AUDIT") or os.path.join(
+            env.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "cw-cloud", "audit.jsonl")
 
     # -- audit: one line per action, no secret, written before the action returns --
     def audit(self, worker, runtime_id, action, cost, ok, reason=""):
         os.makedirs(os.path.dirname(self.audit_path), exist_ok=True)
         line = {"ts": iso(self.clock()), "worker": worker, "runtime_id": runtime_id, "action": action,
-                "cost_estimate_usd": cost, "ok": ok, "actor": pwd.getpwuid(os.getuid()).pw_name, "reason": reason}
+                "cost_estimate_usd": cost, "ok": ok, "actor": self.actor, "reason": reason}
         try:
             fd = os.open(self.audit_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
             with os.fdopen(fd, "a") as f:  # one short O_APPEND write: atomic enough for one line, the chosen guarantee
@@ -300,9 +300,9 @@ class Launcher:
                 raise err
             except BaseException as e:  # interrupt or an unexpected exception: clean up, audit, say what was cleaned
                 self._abort(worker, name, made, e)
-            domain = self.env.get("FLEET_CLOUD_DOMAIN", "example.internal")
+            domain = self.env.get("CW_CLOUD_DOMAIN", "example.internal")
             return {"worker": worker, "url": "https://worker-%s.%s:4096" % (name, domain),
-                    "auth_ref": "file:/run/fleet/%s.password" % worker, "runtime_id": "pod/" + name,
+                    "auth_ref": "file:/run/cw/%s.password" % worker, "runtime_id": "pod/" + name,
                     "idle_deadline": iso(now + dt.timedelta(seconds=parse_duration(a.idle))), "hard_deadline": iso(hard),
                     "password_fd": a.password_fd}
         old = self._catch_signals()
@@ -371,7 +371,7 @@ class Launcher:
 
     # -- end hook, stop, delete --
     def run_hook(self, name):
-        out = self.kube.exec(name, "fleet-end-hook", keep_stdout=True)
+        out = self.kube.exec(name, "cw-end-hook", keep_stdout=True)
         try:
             res = json.loads(out.strip().splitlines()[-1])
         except (ValueError, IndexError):
@@ -451,7 +451,7 @@ class Launcher:
     def activity(self, name):
         """(busy, last_activity or None) from the worker's own session state; None when unreadable."""
         try:
-            d = json.loads(self.kube.exec(name, "fleet-worker-activity"))
+            d = json.loads(self.kube.exec(name, "cw-worker-activity"))
             return bool(d.get("busy")), (parse_iso(d["last_activity"]) if d.get("last_activity") else None)
         except (CloudError, ValueError, KeyError):
             return None
@@ -477,7 +477,7 @@ class Launcher:
     def hard_deadline(self, pod):
         """The pod's copy, unless the switchboard record (read only, --record-dir) names a later or earlier one."""
         hard = parse_iso(ann(pod, "hard-deadline"))
-        rd = self.env.get("FLEET_CLOUD_RECORD_DIR")
+        rd = self.env.get("CW_CLOUD_RECORD_DIR")
         if rd and NAME_RE.match(ann(pod, "worker", "")):
             try:
                 with open(os.path.join(rd, ann(pod, "worker") + ".json")) as f:
@@ -488,6 +488,7 @@ class Launcher:
 
     def reap(self):
         """One pass: stop every pod past its hard deadline or idle too long. Returns [(worker, reason, exit)]."""
+        self.actor = "reaper"
         out, now = [], self.clock()
         for pod in self.kube.list_pods():
             worker = ann(pod, "worker")
@@ -558,8 +559,8 @@ def main(argv=None, env=None, clock=None, sleep=time.sleep):
         a = build_parser().parse_args(argv)
     except SystemExit as e:
         return EXIT_USAGE if e.code else 0
-    if not (env.get("FLEET_KUBE_CONTEXT") or "").strip():
-        print("cloud-worker: FLEET_KUBE_CONTEXT is not set; refusing to run (the active kubectl context is never used)", file=sys.stderr)
+    if not (env.get("CW_KUBE_CONTEXT") or "").strip():
+        print("cloud-worker: CW_KUBE_CONTEXT is not set; refusing to run (the active kubectl context is never used)", file=sys.stderr)
         return EXIT_USAGE
     L = Launcher(Kube(env), env, clock, sleep)
     try:

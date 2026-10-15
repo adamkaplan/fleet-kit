@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""check-neutral-names: fail when a banned keyword reaches the cloud.
+
+The banned list is NOT in this repository. Put it in a file (one entry per line, matched
+case-insensitively as a regular expression, `case:<regex>` for case-sensitive, `ignore:` lines skipped; blank lines and lines starting with # are ignored) and name it:
+
+    CLOUD_BANNED_WORDS_FILE=/path/to/list cloud/tests/check-neutral-names [--surfaces DIR] [--build-log FILE]
+
+It builds the surfaces from the real code, then scans each one:
+  image/       the image build context (Dockerfile and what it copies), plus --build-log if given
+  manifests/   cloud/k8s/*.yaml and the rendered pod spec
+  labels.txt   pod labels and annotations (keys and values)
+  env.txt      the injected environment variables (names and values)
+  logs/        the audit lines and the launcher's own output
+  sources/     the cloud code and the contract doc
+
+A hit prints `surface/file:line` and never the word. Exit 0: no hits; 1: hits, or a name that
+reaches the cloud lacks the `cw` prefix; 2: the list is unset or unreadable.
+--surfaces DIR scans a prepared tree instead (tests plant a stand-in word there).
+"""
+import argparse, json, os, re, shutil, subprocess, sys, tempfile
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+CLOUD = os.path.join(ROOT, "cloud")
+
+
+def die(msg):
+    print("check-neutral-names: " + msg, file=sys.stderr)
+    sys.exit(2)
+
+
+def load_words():
+    path = os.environ.get("CLOUD_BANNED_WORDS_FILE")
+    if not path:
+        die("CLOUD_BANNED_WORDS_FILE is not set (name the file that holds the banned list)")
+    try:
+        with open(path) as f:
+            words = [w.strip() for w in f if w.strip() and not w.lstrip().startswith("#")]
+    except OSError as e:
+        die("cannot read the banned list file: %s" % e.strerror)
+    if not words:
+        die("the banned list file is empty")
+    return words
+
+
+def put(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(text)
+
+
+def build_surfaces(out, build_log):
+    for sub in ("image", "manifests", "logs", "sources"):
+        os.makedirs(os.path.join(out, sub), exist_ok=True)
+    if os.path.isdir(os.path.join(CLOUD, "worker")):  # the image arrives in a later slice
+        shutil.copytree(os.path.join(CLOUD, "worker"), os.path.join(out, "image", "worker"))
+    if build_log:
+        shutil.copy(build_log, os.path.join(out, "image", "build.log"))
+    k8s = os.path.join(CLOUD, "k8s")
+    for f in sorted(os.listdir(k8s)) if os.path.isdir(k8s) else []:
+        shutil.copy(os.path.join(k8s, f), os.path.join(out, "manifests", f))
+    shutil.copytree(os.path.join(CLOUD, "launcher"), os.path.join(out, "sources", "launcher"),
+                    ignore=shutil.ignore_patterns("__pycache__", "tests"))
+    if os.path.exists(os.path.join(CLOUD, "README.md")):
+        shutil.copy(os.path.join(CLOUD, "README.md"), os.path.join(out, "sources", "README.md"))
+    doc = os.path.join(ROOT, "docs", "cloud-worker-interface.md")
+    if os.path.exists(doc):
+        shutil.copy(doc, os.path.join(out, "sources", "cloud-worker-interface.md"))
+    # the real launcher, against the fake kubectl: pod spec, audit lines, output
+    sys.path.insert(0, os.path.join(CLOUD, "launcher"))
+    import io
+    from contextlib import redirect_stderr, redirect_stdout
+    import cloud_worker as cw
+    work = tempfile.mkdtemp(dir=out)
+    state = os.path.join(work, "kube.json")
+    put(state, json.dumps({"pods": {}}))
+    env = {"CW_KUBECTL": os.path.join(CLOUD, "launcher", "tests", "fake_kubectl"), "FAKE_KUBE_STATE": state,
+           "CW_CLOUD_AUDIT": os.path.join(work, "audit.jsonl"), "CW_CLOUD_IMAGE": "registry.example.internal/cw-worker:1",
+           "CW_TOKEN_ENDPOINT": "https://tokens.example.internal/mint", "CW_CLOUD_DOMAIN": "example.internal", "CW_KUBE_CONTEXT": "acme-cw"}
+    log = []
+    for argv in (["create", "coder7", "--repo", "acme-org/widget-service", "--branch", "main"],
+                 ["extend", "coder7", "--hard", "3h"], ["status", "--json"],
+                 ["create", "coder8", "--repo", "acme-org/widget-service", "--branch", "main", "--shape", "Z"],
+                 ["delete", "coder7", "--force"]):
+        o, e = io.StringIO(), io.StringIO()
+        with redirect_stdout(o), redirect_stderr(e):
+            code = cw.main(argv, env, None, lambda s: None)
+        log.append("$ %s -> %d\n%s%s" % (" ".join(argv), code, o.getvalue(), e.getvalue()))
+    put(os.path.join(out, "logs", "launcher.log"), "".join(log))
+    shutil.copy(env["CW_CLOUD_AUDIT"], os.path.join(out, "logs", "audit.jsonl"))
+    st = json.load(open(state))
+    pod = [p for p in st.get("applied", []) if p["kind"] == "Pod"][0]
+    put(os.path.join(out, "manifests", "pod.json"), json.dumps(pod, indent=1, sort_keys=True) + "\n")
+    c = pod["spec"]["containers"][0]
+    put(os.path.join(out, "labels.txt"), "".join("%s=%s\n" % kv for k in ("labels", "annotations") for kv in sorted(pod["metadata"][k].items())))
+    put(os.path.join(out, "env.txt"), "".join("%s=%s\n" % (v["name"], v["value"]) for v in c["env"]))
+    shutil.rmtree(work)
+    return pod
+
+
+STD = re.compile(r"^(app|azure\.workload\.identity/.*|kubernetes\.io/.*|app\.kubernetes\.io/.*)$")
+
+
+def prefix_misses(pod):
+    """Names that reach the cloud and lack the cw prefix (standard Kubernetes and identity keys are not ours)."""
+    miss = []
+    c = pod["spec"]["containers"][0]
+    miss += ["env " + e["name"] for e in c["env"] if not e["name"].startswith("CW_")]
+    for k in ("labels", "annotations"):
+        miss += ["%s %s" % (k, n) for n in pod["metadata"][k] if not STD.match(n) and not n.startswith("cw/")]
+    miss += ["label value %s" % v for n, v in pod["metadata"]["labels"].items() if n == "app" and not v.startswith("cw-")]
+    base = c["image"].rsplit("/", 1)[-1]
+    if not base.startswith("cw-"):
+        miss.append("image name")
+    if not pod["spec"]["serviceAccountName"].startswith("cw-"):
+        miss.append("service account")
+    for v in c["volumeMounts"]:
+        if not v["mountPath"].startswith(("/run/cw", "/work")):
+            miss.append("mount " + v["mountPath"])
+    return miss
+
+
+def hit_fields(line, pats):
+    """For a JSON line, name the fields (never their values) that hold a hit."""
+    try:
+        obj = json.loads(line)
+    except ValueError:
+        return ""
+    if not isinstance(obj, dict):
+        return ""
+    names = [k for k, v in obj.items() if any(r.search(str(v)) or r.search(str(k)) for r in pats)]
+    return " (fields: %s)" % ", ".join(names) if names else ""
+
+
+def scan(root, words):
+    pats = []
+    for w in words:
+        if w.startswith("ignore:"):
+            continue
+        try:
+            pats.append(re.compile(w[5:]) if w.startswith("case:") else re.compile(w, re.I))
+        except re.error:
+            pats.append(re.compile(re.escape(w), re.I))
+    hits = 0
+    for d, _, files in os.walk(root):
+        for f in sorted(files):
+            p = os.path.join(d, f)
+            try:
+                lines = open(p, errors="replace").read().splitlines()
+            except OSError:
+                continue
+            for i, line in enumerate(lines, 1):
+                if any(r.search(line) for r in pats):
+                    print("%s:%d%s" % (os.path.relpath(p, root), i, hit_fields(line, pats)))
+                    hits += 1
+    return hits
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--surfaces")
+    ap.add_argument("--build-log")
+    a = ap.parse_args()
+    words = load_words()
+    miss = []
+    if a.surfaces:
+        root = a.surfaces
+    else:
+        root = tempfile.mkdtemp(prefix="cw-surfaces-", dir=os.environ.get("CW_CHECK_TMP"))
+        miss = prefix_misses(build_surfaces(root, a.build_log))
+    hits = scan(root, words)
+    for m in miss:
+        print("name without the cw prefix: " + m)
+    if not a.surfaces:
+        shutil.rmtree(root, ignore_errors=True)
+    print("%d hits, %d names without the prefix" % (hits, len(miss)))
+    return 1 if hits or miss else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
