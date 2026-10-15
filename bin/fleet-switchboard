@@ -13860,7 +13860,8 @@ class GitHubHub:
         """The repo's account's environment for a child, or None for the default account. Raises
         GitHubUnavailable when gh will not give the account's token (the text names the account only)."""
         try:
-            refuse_excluded(getattr(self, "config", None) or getattr(self.accounts, "config", None), repo)   # #446: the forwarder start and every hub read take their environment here
+            config = getattr(self, "config", None)
+            refuse_excluded(config if config is not None else getattr(self.accounts, "config", None), repo)   # #446: the forwarder start and every hub read take their environment here
             return self.accounts.env_for(repo)
         except AccountError as err:
             raise GitHubUnavailable(str(err)) from None
@@ -15420,7 +15421,8 @@ class RepoExcluded(AccountError):
 
 
 def refuse_excluded(config, repo):
-    """The one check of the exclusion for a gh read of `repo`: raises RepoExcluded when the config excludes it."""
+    """The one check of the exclusion for a gh read of `repo`: raises RepoExcluded when the config excludes it. No config at all means no exclusion list, so the
+    read is allowed (a deliberate fail open for a test double built without one: every real hub and GhAccounts carries its config)."""
     if repo and config is not None and load_module("repo_exclusion").is_excluded(config, repo):
         raise RepoExcluded("repository %s is excluded from the fleet's reads (excluded_repos)" % repo)
 

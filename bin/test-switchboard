@@ -49857,6 +49857,15 @@ class TestExcludedRepos(Base):
         hub.gh_api("repos/%s/issues/5/comments" % ACME_API)
         self.assertEqual(len(calls), 4, calls)   # (the 4 reads above; the excluded ones started none)
 
+    def test_the_hub_child_environment_takes_the_config_from_its_accounts_and_no_config_at_all_allows(self):
+        config = sb.validate_config({"excluded_repos": [ACME_WEB]})
+        accounts = sb.GhAccounts(config, lambda *a, **k: None, time.time)
+        with self.assertRaises(sb.GitHubUnavailable):
+            sb.GitHubHub.child_env(types.SimpleNamespace(accounts=accounts), ACME_WEB)
+        other = types.SimpleNamespace(accounts=types.SimpleNamespace(env_for=lambda repo: None))
+        self.assertIsNone(sb.GitHubHub.child_env(other, ACME_WEB), "no config anywhere: the check is skipped, on purpose")
+        self.assertIsNone(sb.refuse_excluded(None, ACME_WEB))
+
     def test_the_intent_repo_itself_being_excluded_is_not_read_either(self):
         calls = []
         reader = sb.IntentReader(GH_BIN, ACME_WEB, lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(argv, 0, "{}", ""))
