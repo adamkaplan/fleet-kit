@@ -33,10 +33,18 @@ cat > "$tmp/host" <<'H'
 #!/bin/sh
 echo "$@" >> "$TMP_LOG"
 case "$1 $2" in
-  "containerd config") [ "${DUMP_OK:-1}" = 1 ] || exit 1
-    # DOWN=1: containerd does not answer once it has been restarted once
-    [ "${DOWN:-0}" = 1 ] && [ "$(grep -c 'systemctl restart containerd' "$TMP_LOG")" -ge 1 ] && exit 1
-    cat "$CFG" ;;
+  "containerd config") [ "${DUMP_OK:-1}" = 1 ] || exit 1; cat "$CFG" ;;
+  "systemctl restart")
+    n=$(grep -c 'systemctl restart containerd' "$TMP_LOG")
+    for k in ${RESTART_FAIL_ON:-}; do [ "$k" = "$n" ] && exit 1; done
+    [ "${KILL_BAK:-0}" = 1 ] && [ "$n" = 1 ] && rm -f "$CFG.sysbox-fix.bak"
+    exit 0 ;;
+  "timeout 10")
+    # ctr version: fails while DOWN_UNTIL probes have not yet been made after a restart (DOWN_UNTIL=999: never answers)
+    if [ "$(grep -c 'systemctl restart containerd' "$TMP_LOG")" = 1 ]; then
+      [ "$(grep -c 'ctr version' "$TMP_LOG")" -le "${DOWN_UNTIL:-0}" ] && exit 1
+    fi
+    exit 0 ;;
 esac
 H
 printf '#!/bin/sh
@@ -136,13 +144,13 @@ cp "$tmp/config.toml" "$tmp/orig"; runfix; rc=$?
   && ok "fix: unmovable form refused, config unchanged" || bad "fix: unmovable form (rc=$rc)"
 # after the restart containerd does not answer: backup restored byte for byte, restarted again, exit 1, no label
 cp "$fx" "$tmp/config.toml"; cp "$fx" "$tmp/orig"
-DOWN=1 WAIT=2 POLL=1 runfix; rc=$?
+DOWN_UNTIL=999 WAIT=2 POLL=1 runfix; rc=$?
 [ $rc = 1 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && [ "$(restarts)" = 2 ] && ! grep -q label "$tmp/log" \
   && ok "fix: containerd down after restart: backup restored, restarted again, exit 1" || bad "fix: rollback after restart (rc=$rc)"
 mk="$tmp/config.toml.sysbox-fix.failed"
 [ "$(sed -n 's/^count=//p' "$mk")" = 1 ] && ok "fix: first failure writes the marker with count 1" || bad "fix: marker count 1"
 # second failure: count 2
-DOWN=1 WAIT=2 POLL=1 runfix; rc=$?
+DOWN_UNTIL=999 WAIT=2 POLL=1 runfix; rc=$?
 [ $rc = 1 ] && [ "$(sed -n 's/^count=//p' "$mk")" = 2 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && ok "fix: second failure: count 2, backup restored" || bad "fix: marker count 2 (rc=$rc)"
 # third start: nothing touched, exits (ONCE) with 4, no restart, no label
 runfix; rc=$?
@@ -162,6 +170,35 @@ READY_CMD="$tmp/notready" WAIT=2 POLL=1 runfix; rc=$?
 [ $rc = 1 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && [ "$(restarts)" = 2 ] && ! grep -q label "$tmp/log" \
   && ok "fix: node not Ready after restart: backup restored, exit 1" || bad "fix: not-Ready rollback (rc=$rc)"
 rm -f "$mk"
+# (a) the restart itself returns non-zero: rollback runs, backup restored byte for byte, marker, exit 1, no label
+cp "$fx" "$tmp/config.toml"; rm -f "$mk"
+RESTART_FAIL_ON=1 WAIT=2 POLL=1 runfix; rc=$?
+[ $rc = 1 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && [ "$(sed -n 's/^count=//p' "$mk")" = 1 ] && ! grep -q label "$tmp/log" && [ "$(restarts)" = 2 ] \
+  && ok "fix: restart returns non-zero: rolled back, marker count 1, no label" || bad "fix: failed restart (rc=$rc)"
+# (c) containerd answers late (after 2 polls, within WAIT): passes, labelled once, no marker
+cp "$fx" "$tmp/config.toml"; rm -f "$mk"
+DOWN_UNTIL=2 WAIT=10 POLL=1 runfix; rc=$?
+[ $rc = 0 ] && [ "$(grep -c '^label' "$tmp/log")" = 1 ] && [ "$(restarts)" = 1 ] && [ ! -e "$mk" ] && ! grep -q 'grpc.v1.cri' "$tmp/config.toml" \
+  && ok "fix: containerd answers late within WAIT: kept, labelled once" || bad "fix: late answer (rc=$rc)"
+# M2: the saved copy is gone, so the restore fails: loud last line, exit 1, no label, no 'restored'
+cp "$fx" "$tmp/config.toml"; rm -f "$mk"
+: > "$tmp/log"
+TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/host" LABEL_CMD="$tmp/label" READY_CMD="$tmp/ready" ONCE=1 KILL_BAK=1 DOWN_UNTIL=999 WAIT=2 POLL=1 sh "$tmp/fix.sh" >"$tmp/out" 2>"$tmp/err"; rc=$?
+[ $rc = 1 ] && tail -n 1 "$tmp/err" | grep -q '^config restore FAILED: node needs manual repair' && ! grep -qi 'restored,' "$tmp/err" && ! grep -q label "$tmp/log" \
+  && ok "fix: restore fails (no saved copy): loud last line, exit 1, no label" || bad "fix: failed restore (rc=$rc)"
+# the restored file differs from the saved copy (a truncating cp): detected, same outcome
+mkdir -p "$tmp/cpshim"; printf '#!/bin/sh\nfor a; do last=$a; done\ncase "$last" in *.restore.tmp) head -c 10 "$1" > "$last" ;; *) exec /bin/cp "$@" ;; esac\n' > "$tmp/cpshim/cp"; chmod +x "$tmp/cpshim/cp"
+: > "$tmp/log"; cp "$fx" "$tmp/config.toml"; rm -f "$mk" "$tmp/config.toml.sysbox-fix.bak"
+PATH="$tmp/cpshim:$PATH" TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/host" LABEL_CMD="$tmp/label" READY_CMD="$tmp/ready" ONCE=1 DOWN_UNTIL=999 WAIT=2 POLL=1 sh "$tmp/fix.sh" >"$tmp/out" 2>"$tmp/err"; rc=$?
+[ $rc = 1 ] && tail -n 1 "$tmp/err" | grep -q '^config restore FAILED: node needs manual repair' && ! grep -q label "$tmp/log" \
+  && ok "fix: restored file differs from the saved copy: loud last line, exit 1, no label" || bad "fix: restore mismatch (rc=$rc)"
+# the restart after a good restore also fails: loud last line, exit 1, config byte-identical to the original
+cp "$fx" "$tmp/config.toml"; rm -f "$mk"
+: > "$tmp/log"
+TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/host" LABEL_CMD="$tmp/label" READY_CMD="$tmp/ready" ONCE=1 RESTART_FAIL_ON="1 2" WAIT=2 POLL=1 sh "$tmp/fix.sh" >"$tmp/out" 2>"$tmp/err"; rc=$?
+[ $rc = 1 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && tail -n 1 "$tmp/err" | grep -q 'NOT healthy after the second restart: node needs manual repair' && ! grep -q label "$tmp/log" \
+  && ok "fix: restart after the restore fails: loud last line, config restored, exit 1" || bad "fix: second restart fails (rc=$rc)"
+rm -f "$mk"; cp "$fx" "$tmp/config.toml"
 # healthy restart (node Ready): one restart, labelled, as before
 printf '#!/bin/sh\nexit 0\n' > "$tmp/ready"; chmod +x "$tmp/ready"
 cp "$fx" "$tmp/config.toml"

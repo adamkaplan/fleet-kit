@@ -29,9 +29,12 @@ data:
     # the count survives pod restarts. At MAX_ATTEMPTS the fix stays off: it edits nothing,
     # restarts nothing, labels nothing, and idles. To retry, delete the marker on the node.
     MARKER="$CFG.sysbox-fix.failed"; MAX_ATTEMPTS=${MAX_ATTEMPTS:-2}
-    restore_backup() { cp "$CFG.sysbox-fix.bak" "$CFG.restore.tmp" && mv "$CFG.restore.tmp" "$CFG"; sync; }
+    restore_backup() { cp "$CFG.sysbox-fix.bak" "$CFG.restore.tmp" && mv "$CFG.restore.tmp" "$CFG" && sync; }
 
     # After a restart: containerd must answer and the node must be Ready within WAIT seconds.
+    # "Answers" means `ctr version` succeeds: ctr talks to the running daemon over its socket and
+    # fails when the daemon is dead (`containerd config dump` only prints config computed from
+    # files, so it can succeed with containerd down). Each probe is bounded by `timeout` on the host.
     node_ready() {
       if [ -n "${READY_CMD:-}" ]; then $READY_CMD
       else kubectl get node "$NODE_NAME" -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}' | grep -qx True; fi
@@ -39,10 +42,31 @@ data:
     healthy_after_restart() {
       t=0
       while [ "$t" -lt "$WAIT" ]; do
-        if $HOST containerd config dump >/dev/null 2>&1 && node_ready >/dev/null 2>&1; then return 0; fi
+        if $HOST timeout 10 ctr version >/dev/null 2>&1 && node_ready >/dev/null 2>&1; then return 0; fi
         sleep "$POLL"; t=$((t + POLL))
       done
       return 1
+    }
+    # Restart containerd and check it is healthy: any failure of either is a failure.
+    restart_and_check() { $HOST systemctl restart containerd || return 1; healthy_after_restart; }
+    manual_repair() {
+      echo "config restore FAILED: node needs manual repair: $CFG (saved copy: $CFG.sysbox-fix.bak)" >&2; exit 1
+    }
+    # A restart left containerd or the node unhealthy (or the restart itself failed): record the
+    # attempt, restore the saved config byte for byte, restart and check again. Never labels.
+    # "restored" is printed only when the restore, the restart and the health check all succeeded.
+    rollback() {
+      echo "ERROR: containerd restart failed or containerd/node not healthy within ${WAIT}s: rolling back" >&2
+      prev=$(sed -n 's/^count=\([0-9][0-9]*\)$/\1/p' "$MARKER" 2>/dev/null | head -n 1)
+      case "$prev" in ''|*[!0-9]*) prev=0 ;; esac
+      { printf 'count=%s\ntime=%s\n' "$((prev + 1))" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$MARKER.tmp" && mv "$MARKER.tmp" "$MARKER" && sync; } \
+        || echo "WARNING: could not record the failed attempt in $MARKER" >&2
+      if ! restore_backup || ! cmp -s "$CFG.sysbox-fix.bak" "$CFG"; then manual_repair; fi
+      if ! restart_and_check; then
+        echo "config restored but containerd is NOT healthy after the second restart: node needs manual repair: $CFG" >&2; exit 1
+      fi
+      echo "ERROR: config restored, containerd healthy again; failed attempt $((prev + 1)) recorded in $MARKER: exiting non-zero" >&2
+      exit 1
     }
 
     while true; do
@@ -69,7 +93,10 @@ data:
       HDR="^[[:space:]]*\\[plugins\\.[\"']"
       if grep -Eq "${HDR}$NEW[\"']\\.containerd\\.runtimes\\.sysbox-runc\\]" "$CFG" \
          && ! grep -Eq "${HDR}$OLD[\"']\\.containerd\\.runtimes\\.sysbox-runc" "$CFG"; then
-        echo "sysbox-runc already under $NEW: nothing to do"; $LABEL_CMD >/dev/null
+        echo "sysbox-runc already under $NEW: nothing to do"
+        # label only a node whose containerd answers and which is Ready
+        healthy_after_restart || { echo "sysbox-runc is registered but containerd or the node is not healthy: not labelling" >&2; exit 1; }
+        $LABEL_CMD >/dev/null
       else
         cp "$CFG" "$CFG.sysbox-fix.bak"
         # Table headers may be indented and use either quote style. Rename the key on the
@@ -113,27 +140,14 @@ data:
            && $HOST containerd config dump | grep -q 'runtimes.sysbox-runc' \
            && grep -Eq "${HDR}$NEW[\"']\\.containerd\\.runtimes\\.sysbox-runc\\]" "$CFG"; then
           echo "config valid: restarting containerd"
-          $HOST systemctl restart containerd
-          if ! healthy_after_restart; then
-            echo "ERROR: containerd or the node is not healthy ${WAIT}s after the restart: restoring the saved config" >&2
-            restore_backup
-            prev=$(sed -n 's/^count=\([0-9][0-9]*\)$/\1/p' "$MARKER" 2>/dev/null | head -n 1)
-            case "$prev" in ''|*[!0-9]*) prev=0 ;; esac
-            printf 'count=%s\ntime=%s\n' "$((prev + 1))" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$MARKER.tmp" && mv "$MARKER.tmp" "$MARKER"; sync
-            if $HOST systemctl restart containerd; then
-              echo "ERROR: saved config restored and containerd restarted again; failed attempt $((prev + 1)) recorded in $MARKER: exiting non-zero" >&2
-            else
-              echo "ERROR: saved config restored but the second containerd restart FAILED; failed attempt $((prev + 1)) recorded in $MARKER: exiting non-zero" >&2
-            fi
-            exit 1
-          fi
+          restart_and_check || rollback
           rm -f "$MARKER"
           $LABEL_CMD >/dev/null
           bad=0
         else
           bad=$((bad + 1))
           echo "config invalid (try $bad): restoring backup" >&2
-          restore_backup
+          if ! restore_backup || ! cmp -s "$CFG.sysbox-fix.bak" "$CFG"; then manual_repair; fi
           [ "$bad" -ge "${MAX_BAD:-5}" ] && { echo "giving up: pod exits non-zero" >&2; exit 1; }
           [ "${ONCE:-0}" = 1 ] && exit 1
           sleep 60; continue
