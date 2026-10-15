@@ -389,8 +389,8 @@ def _plain_clearing(text):
     gap = text[first.end():]
     direct = bool(after) and re.match(r"^\s*" + re.escape(after[0]), gap) is not None   # the first word after the number follows it with nothing but space between
     for n, word in enumerate(after):
-        if word.lower() in PARTICIPLES:   # a state of the PR: directly after the number (or after is/also/are) and followed by nothing but thanks: "366 cleared", "366 is approved, thanks"
-            if not ((n == 0 and direct) or (n == 1 and after[0].lower() in ("is", "also", "are"))) or any(w.lower() not in ("now", "thanks", "thank", "you", "please") for w in after[n + 1:]):
+        if word.lower() in PARTICIPLES:   # a state of the PR: directly after the number (or after is/also/are), NOTHING before the number, and followed by nothing but thanks
+            if before or not ((n == 0 and direct) or (n == 1 and after[0].lower() in ("is", "also", "are"))) or any(w.lower() not in ("now", "thanks", "thank", "you", "please") for w in after[n + 1:]):
                 return False
         if word.lower() in QUESTION_OPENERS and not (n == 0 and direct):
             return False
