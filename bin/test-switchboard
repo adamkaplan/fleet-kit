@@ -50917,7 +50917,9 @@ class LaneGH(FakeGH):
     def record(self, number):
         found = super().record(number)
         found["id"] = 1000 + number
-        found["labels"] = [{"name": n} for n in self.issues[number].get("labels", [])]
+        found["labels"] = [{"name": n} for n in self.issues[number].get("labels", []) + ([sb.orchestrator_label()] if number in self.charters else [])]
+        if self.issues[number].get("pr"):
+            found["pull_request"] = {"url": "https://example.test/pull"}
         return found
 
     def serve(self, argv, kwargs):
@@ -50956,12 +50958,14 @@ class LanesCase(IntentCase):
         "5": {"intent": "Another ask", "done_when": "d5", "parent": 1},
         "6": {"intent": "Fourth ask", "done_when": "d6", "parent": 1},
         "7": {"intent": "Done ask", "parent": 1, "state": "closed"},
+        "11": {"intent": None, "state": "closed"}, "12": {"intent": "A pull request", "pr": True},
+        "13": {"intent": "A pull request as an ask", "parent": 10, "pr": True},
     }
 
     def setUp(self):
         super().setUp()
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": FAKE_REPO})
-        self.gh = LaneGH(self.ISSUES, {1, 10}, self.world.clock)
+        self.gh = LaneGH(self.ISSUES, {1, 10, 11}, self.world.clock)
         self.gh.bodies = {}
         self.gh.timeline = {2: [{"event": "cross-referenced", "source": {"issue": {"number": 40, "state": "open", "pull_request": {"url": "https://example.test/pull"}}}},
                                 {"event": "cross-referenced", "source": {"issue": {"number": 41, "state": "closed", "pull_request": {"url": "https://example.test/pull"}}}}]}
@@ -51160,8 +51164,11 @@ class TestMoveAnAsk(LanesCase):
         self.assertEqual(len(refused), 3)
 
     def test_what_cannot_move_is_refused_with_nothing_written(self):
-        for argv, text in ((("2", "--to", "2"), "not a charter"), (("1", "--to", "10"), "is a charter"),
-                           (("3", "--to", "10"), "work item"), (("7", "--to", "10"), "only an open ask moves"),
+        for argv, text in ((("2", "--to", "2"), "cannot be moved to itself"), (("1", "--to", "10"), "is a charter"),
+                           (("2", "--to", "4"), "not a charter"), (("2", "--to", "11"), "closed"), (("2", "--to", "12"), "is a pull request"),
+                           (("13", "--to", "10"), "is a pull request"), (("2", "--to", "999"), "cannot read"),
+                           (("2", "--to", "acme/other#10"), "same repository"), (("acme/other#2", "--to", "acme/other#10"), "not a watched repository"),
+                           (("3", "--to", "10"), "work item"), (("7", "--to", "10"), "only an open issue counts"),
                            (("2", "--to", "1"), None)):
             with self.subTest(argv=argv):
                 code, out, err = self.main("move", *argv)
@@ -51171,6 +51178,26 @@ class TestMoveAnAsk(LanesCase):
                     self.assertEqual(code, 2)
                     self.assertIn(text, err)
                 self.assertEqual(self.gh.writes, [])
+
+    def test_an_excluded_repository_is_refused_with_nothing_written(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": FAKE_REPO,
+                           "excluded_repos": [FAKE_REPO]})
+        code, _, err = self.main("move", "2", "--to", "10")
+        self.assertEqual(code, 2)
+        self.assertIn("excluded", err)
+        self.assertEqual((self.gh.writes, self.parents()), ([], [1]))
+
+    def test_a_target_whose_state_cannot_be_read_is_refused_with_nothing_written(self):
+        real = self.gh.serve
+
+        def serve(argv, kwargs):
+            if argv[2].endswith("/issues/10"):
+                return subprocess.CompletedProcess(argv, 1, "", "gh: HTTP 500\n")
+            return real(argv, kwargs)
+        self.gh.serve = serve
+        code, _, err = self.main("move", "2", "--to", "10")
+        self.assertEqual((code, self.gh.writes), (2, []))
+        self.assertIn("cannot read", err)
 
     def test_the_lab_flag_is_only_for_the_lab(self):
         os.environ.pop(sb.LAB_ENV, None)

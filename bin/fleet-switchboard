@@ -23557,7 +23557,7 @@ def cmd_move(args, runner, now):
         sys.stderr.write("%s: move: the ask and the charter must be in the same repository (%s vs %s)\n" % (PROG, repo, to_repo))
         return EXIT_USAGE
     sb = types.SimpleNamespace(engine=engine, **{name: globals()[name] for name in lanes.NEEDS})
-    return lanes.run_move(sb, repo, ask, charter, caller, role, print, lambda text: sys.stderr.write(text + "\n"))
+    return lanes.run_move(sb, repo, ask, charter, caller, role, print, lambda text: sys.stderr.write(text + "\n"), watched=watched)
 
 
 cmd_move.ensure_on_use = True   # the daemon is alive when it runs

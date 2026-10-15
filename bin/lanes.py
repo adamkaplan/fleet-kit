@@ -24,7 +24,7 @@ WAIT_LABEL = re.compile(r"await|hold|parked|block|wait", re.IGNORECASE)
 # what the command hands in, by name (the switchboard's helpers, classes and constants this module uses)
 NEEDS = ("PROG", "EXIT_OK", "EXIT_ERROR", "EXIT_USAGE", "IntentError", "MessageTooLong", "InterruptRefused", "ReminderError",
          "_CHARTER_BLOCK", "NO_INTENT", "_fleet_repo", "_is_issue_number", "_one_line", "boss_name", "issue_tag", "iso",
-         "read_reminders", "write_reminders", "reminders_lock", "_gh_write")
+         "read_reminders", "write_reminders", "reminders_lock", "_gh_write", "orchestrator_label", "load_module")
 
 
 class MoveRefused(Exception):
@@ -78,26 +78,57 @@ def has_charter_block(sb, raw):
     return bool(sb._CHARTER_BLOCK.search(body))
 
 
-def plan_move(sb, repo, ask, to_charter):
-    """Read what the move needs and refuse what it must not do, before anything is written. Returns the plan dict."""
-    raw = read_issue(sb, repo, ask)
-    if has_charter_block(sb, raw):
-        raise MoveRefused("%s#%d is a charter, not an ask" % (repo, ask))
+def label_names(raw):
+    return [l.get("name") if isinstance(l, dict) else l for l in raw.get("labels") or [] if isinstance(l, (dict, str))]
+
+
+def require_open_issue(sb, raw, what, repo, number):
+    """MoveRefused unless `raw` is an OPEN issue that is not a pull request."""
+    if raw.get("pull_request"):
+        raise MoveRefused("%s %s#%d is a pull request, not an issue" % (what, repo, number))
     if raw.get("state") != "open":
-        raise MoveRefused("%s#%d is %s: only an open ask moves" % (repo, ask, raw.get("state") or "not open"))
+        raise MoveRefused("%s %s#%d is %s: only an open issue counts%s" % (
+            what, repo, number, raw.get("state") or "in a state that cannot be read", " (a closed charter has no orchestrator)" if what == "the target" else ""))
+
+
+def is_charter(sb, raw):
+    """A charter carries the orchestrator label AND the yaml `orchestrator:` block."""
+    return sb.orchestrator_label(sb.engine.config) in label_names(raw) and has_charter_block(sb, raw)
+
+
+def check_repo(sb, repo, watched):
+    """MoveRefused unless `repo` is a watched repository that is not excluded."""
+    if sb.load_module("repo_exclusion").is_excluded(sb.engine.config, repo):
+        raise MoveRefused("repository %s is excluded from the fleet (excluded_repos)" % repo)
+    if repo not in (watched or []):
+        raise MoveRefused("repository %s is not a watched repository" % repo)
+
+
+def plan_move(sb, repo, ask, to_charter):
+    """Read what the move needs and refuse what it must not do, before anything is written. Returns the plan dict.
+    The ask is an open issue (not a pull request, not a charter, not a work item) under a charter; the target is an open issue
+    (not a pull request) that is a charter, and is not the ask itself."""
+    if ask == to_charter:
+        raise MoveRefused("%s#%d cannot be moved to itself" % (repo, ask))
+    raw = read_issue(sb, repo, ask)
+    require_open_issue(sb, raw, "the ask", repo, ask)
+    if has_charter_block(sb, raw) or sb.orchestrator_label(sb.engine.config) in label_names(raw):
+        raise MoveRefused("%s#%d is a charter, not an ask" % (repo, ask))
     try:
+        target = read_issue(sb, repo, to_charter)
+        require_open_issue(sb, target, "the target", repo, to_charter)
+        if not is_charter(sb, target):
+            raise MoveRefused("the target %s#%d is not a charter (it needs the %s label and the yaml orchestrator block)"
+                              % (repo, to_charter, sb.orchestrator_label(sb.engine.config)))
         old = parent_of(sb, repo, ask)
         if old is None:
             raise MoveRefused("%s#%d has no parent charter: it is not an ask of any charter" % (repo, ask))
-        if not has_charter_block(sb, read_issue(sb, repo, old)):
+        if not is_charter(sb, read_issue(sb, repo, old)):
             raise MoveRefused("%s#%d is a work item (its parent #%d is not a charter): move its ask" % (repo, ask, old))
-        if not has_charter_block(sb, read_issue(sb, repo, to_charter)):
-            raise MoveRefused("%s#%d is not a charter (no yaml orchestrator block)" % (repo, to_charter))
     except sb.IntentError as err:
         raise MoveRefused("cannot read the charters: %s" % sb._one_line(str(err), 160)) from None
-    labels = [l.get("name") if isinstance(l, dict) else l for l in raw.get("labels") or []]
     return {"repo": repo, "ask": ask, "id": raw["id"], "old": old, "new": to_charter, "state": raw.get("state"),
-            "title": raw.get("title") or "", "labels": [l for l in labels if isinstance(l, str)]}
+            "title": raw.get("title") or "", "labels": [l for l in label_names(raw) if isinstance(l, str)]}
 
 
 def pull_requests(sb, repo, ask):
@@ -232,7 +263,7 @@ def send_notice(sb, caller, recipient, text, plan):
     return None if outcome.get("sent") else "%s (%s)" % (outcome.get("action"), outcome.get("reason"))
 
 
-def run_move(sb, repo, ask, to_charter, caller, role, out, err):
+def run_move(sb, repo, ask, to_charter, caller, role, out, err, watched=None):
     """Move `repo#ask` to charter `to_charter`. `caller` is the fleet name (None for the operator's plain shell).
     Exit code: 0 done; 1 the caller is refused (audited), the write failed (still under the old charter) or the ask is
     moved and a later step failed (the output says which); 2 the move cannot be made (nothing changed)."""
@@ -245,6 +276,7 @@ def run_move(sb, repo, ask, to_charter, caller, role, out, err):
         err("%s: move: %s; nothing was changed" % (sb.PROG, refusal))
         return sb.EXIT_ERROR
     try:
+        check_repo(sb, repo, watched)
         plan = plan_move(sb, repo, ask, to_charter)
     except MoveRefused as problem:
         err("%s: move: %s; nothing was changed" % (sb.PROG, problem))
