@@ -273,7 +273,7 @@
       "limits": [
         "The guard reads function NAMES (underscore-separated words) and COMPARISONS (==, !=, in, not in) against the role literals, in the .py files of bin/ only.",
         "It cannot see: a role held in a constant or variable and compared by that name; a check written with startswith, endswith, a regular expression, match/case or a dictionary lookup; a literal built at run time; code that is not a .py file in bin/ (bin/fleet-switchboard, scripts, shims, plugins, agents); a value that is PRODUCED by an unlisted module and later read by an authority function (a producer trace is the reviewer's).",
-        "The fallback: the strict review (the rev-wake) looks for exactly these, as R-LAW-12 and the owner-hold rule say, and an exemption must carry a trace of where its values go. When in doubt, LIST."
+        "The fallback: the strict review (the independent reviewer) looks for exactly these, as R-LAW-12 and the owner-hold rule say, and an exemption must carry a trace of where its values go. When in doubt, LIST."
       ]
     },
     "note": "top_tier_outside_floor lists the top tier paths that are deliberately not in the floor globs (the floor excludes agent definitions, which are captain pull requests); a test checks that every other top tier path is inside the floor. bin/fleet-switchboard selects accounts and mints tokens but is not a top tier path (it would hold nearly every change): a change there to credentials or identity must be rated with that class by the independent review."
