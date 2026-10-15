@@ -47,6 +47,7 @@ import urllib.parse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import collections
+import copy
 import errno
 import fcntl
 import getpass
@@ -454,7 +455,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "temp_janitor", "load_alert", "spotlight_guard", "excluded_repos"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "chat_clear", "temp_janitor", "load_alert", "spotlight_guard", "excluded_repos", "source_budgets"}
 
 
 def config_known_keys():
@@ -566,6 +567,7 @@ def validate_config(raw, source="config"):
     validate_external_config(config, source)
     validate_friction_config(config, source)
     validate_load_alert_config(config, source)
+    validate_source_budgets(config, source)   # #494
     validate_worktree_config(config, source)
     validate_orphan_config(config, source)
     validate_order_burst(config, source)
@@ -573,6 +575,9 @@ def validate_config(raw, source="config"):
         load_disk_janitor().validate(config.get("temp_janitor"), source)
     except ValueError as err:
         raise ConfigError(str(err))
+    raw_chat = config.get("chat_clear")
+    if raw_chat is not None and (not isinstance(raw_chat, dict) or set(raw_chat) - {"enabled", "live"} or any(not isinstance(v, bool) for v in raw_chat.values())):
+        raise ConfigError("%s: 'chat_clear' must be {\"enabled\": true|false, \"live\": true|false}, got %r" % (source, raw_chat))   # #457: live is the owner's key
     if config.get("impact_hold") is not None:   # #179 L4: the hold is off unless `enabled` is true
         try:
             impact_floor.validate_hold_config(config["impact_hold"])
@@ -3905,6 +3910,7 @@ class Switchboard:
         self.decision_seeds = {}        # the last derivation's display id -> source seed (memory only; the sync engine's keys)
         self.decision_seen = {}         # PR 14: (session, request id) -> when first seen, for a request with no time of its own
         self.decisions_generation = 0   # PR 14: the generation last written to decisions.json by this process
+        self._early_facts = {}          # #467: {id(source): facts} the early decisions step read this pass, handed to collect_facts
         self.request_keys = None        # PR 18: "<session>:<request id>" of every request pending at the last derivation
         self.gh_runner = None           # PR notices: the runner for `gh pr view` (None: subprocess.run)
         self.stopped_news_errors = set()  # reasons already audited: one line per distinct failure
@@ -3985,6 +3991,7 @@ class Switchboard:
             self._not_fleet[session_id] = now + self.NOT_FLEET_SECONDS
             return None
         self._not_fleet.pop(session_id, None)
+        fleet = load_module("reassign").overlay(self.state_dir, fleet, session_id)   # a reassigned worker's boss (bin/reassign.py): bound to this session
         times = info.get("time") if isinstance(info.get("time"), dict) else {}
         observation = Observation(fleet["name"], session_id, entry.get("pane_id"),
                                   STATUS.get(entry.get("agent_status"), "unknown"), fleet,
@@ -4101,6 +4108,7 @@ class Switchboard:
         fleet = _fleet_meta(info)
         if not fleet or fleet.get("name") != record["worker"]:
             return None   # the session does not carry the worker's name: the record is not proof of presence
+        fleet = load_module("reassign").overlay(self.state_dir, fleet, session_id)   # a reassigned worker's boss (bin/reassign.py): bound to this session
         times = info.get("time") if isinstance(info.get("time"), dict) else {}
         observation = Observation(fleet["name"], session_id, None, STATUS.get(state, "unknown"), fleet, _seconds(times.get("idle")), info.get("outcome"))
         observation.created = _seconds(times.get("created"))
@@ -4180,10 +4188,11 @@ class Switchboard:
     def collect_facts(self):
         """Every fact from every source, first key wins for each recipient. A failing source is audited and skipped."""
         facts, seen, problems = [], set(), []
+        early, self._early_facts = getattr(self, "_early_facts", {}), {}   # #467: a source the early decisions step already read this pass is not read twice
         for source in self.sources:
             name = getattr(source, "__name__", "source")
             try:
-                found = source()
+                found = early[id(source)] if id(source) in early else source()
             except Exception as err:  # one bad source must not stop the others
                 problems.append("%s: %s" % (name, _one_line(str(err))))
                 self._note("source.error", name, {"error": _one_line(str(err))})
@@ -4446,8 +4455,10 @@ class Switchboard:
         report = {"at": iso(now), "sent": [], "held": [], "waiting": [], "converted": [], "errors": [],
                   "badges": [], "toasts": []}
         self.pass_toasts = {}
+        self._early_facts = {}   # #467: facts the early decisions step reads for this pass only; never carried over from an earlier one
         self.reads.begin_pass()
         discovery = self.discover(now)
+        early_decisions(self, discovery)   # #467: the decisions file is written as soon as its own sources are read, BEFORE the heavy fact sources
         for problem in discovery.problems:
             self._note("observe.problem", None, {"problem": problem})
         for observation in list(discovery.agents.values()):
@@ -6419,6 +6430,7 @@ def reattach_caller_problem(engine, runner, now, discovery, name, session=None):
         try:
             known = read_pane_health(engine.state_dir)["agents"].get(name) or {}
             stored = _fleet_meta(engine.v2.session_get(session or known.get("session"))) or {} if (session or known.get("session")) else {}
+            stored = load_module("reassign").overlay(engine.state_dir, stored, session or known.get("session")) if stored else stored   # a reassigned worker's new boss, not the one it was launched with
             boss = resolve_boss(discovery, stored.get("reports_to")) if stored.get("reports_to") else None
         except Exception:
             boss = None
@@ -10293,6 +10305,51 @@ def v2_calls_status(state_dir, now):
         return None
 
 
+EARLY_DECISIONS_AGE = DECISIONS_STALE_SECONDS // 3   # a file this old (or missing) is written before the heavy sources are collected: a third of the staleness bound (60 s of 180 s)
+
+
+def early_decisions(engine, discovery=None):
+    """(#467) At the START of a pass (after `discover`, before the fact sources): when the decisions file is missing or older than EARLY_DECISIONS_AGE, derive
+    the list from its OWN sources and write it now, so a heavy source (the sweep, triage, the load alert, a first catch-up after a restart under load) cannot delay
+    it past the staleness bound. Its own sources include the pending permission requests and questions, which only the worker source reads: that source is
+    run first and its facts are kept for this pass's fact collection (it is read once, not twice). The early step is skipped, writing and touching nothing, when
+    the fleet could not be read (`discovery` has problems: a list built from half a fleet must not look fresh), when the worker source or the derivation
+    raises (`decisions.early_error` is noted), and when a fresh file is there (steady state: the end of the pass publishes exactly as before). What it
+    writes is provisional: the end of the pass derives again and publishes (the sweep may withdraw or add). The file's time changes only through the store's
+    own write, with content derived from reads just made. The in-memory request records it sets are the end-of-pass derivation's too. Never raises.
+    Returns True when it wrote."""
+    state = engine.state_dir
+    if state is None or engine.audit is None or fault("no-decisions-file"):
+        return False
+    if discovery is None or discovery.problems:
+        return False
+    try:
+        try:
+            age = engine.now() - (Path(state) / DECISIONS_FILE).stat().st_mtime
+        except OSError:
+            age = None   # missing or unreadable: write it now
+        if age is not None and age < EARLY_DECISIONS_AGE:
+            return False
+        now = engine.now()
+        worker = next((x for x in engine.sources if isinstance(x, WorkerFacts)), None)
+        if worker is not None:
+            engine._early_facts = {id(worker): worker()}   # the pending requests are filled by this call; collect_facts reuses its facts
+        kept = {name: copy.deepcopy(engine.__dict__[name]) for name in ("notice_obs", "notice_effects") if name in engine.__dict__}
+        try:
+            decisions, errors = derive_decisions(engine, now)
+        finally:   # the derivation advances the notice time accounting: the end of the pass derives again and must see it as it was
+            for name in ("notice_obs", "notice_effects"):
+                if name in kept:
+                    engine.__dict__[name] = kept[name]
+                else:
+                    engine.__dict__.pop(name, None)
+        return bool(decision_store(engine).publish(decisions, errors, now))
+    except Exception as err:   # a pass that cannot read its decision sources writes nothing here; the end of the pass says the same
+        engine._early_facts = {}
+        engine._note("decisions.early_error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+        return False
+
+
 def publish_decisions(engine):
     """The end of a pass: derive the list and hand it to the store (decisions.json when it changed, else a touch, so
     its age says the daemon is alive). Returns True when written."""
@@ -10321,6 +10378,7 @@ def publish_decisions(engine):
         pane_health_pass(engine, now)   # the control plane: detached or dead panes, reads only, wakes the Chief of Staff
     except Exception as err:
         engine._note("fleetpane.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+    chat_clear_pass(engine, decisions, now)   # #457: the owner clears a held PR in his chat; SHADOW unless chat_clear.live; never raises
     try:
         impact_would_hold_pass(engine, now)   # #179 L3: audits gate.would_hold from the diff's floor; ADVISORY, writes nothing to GitHub
     except Exception as err:
@@ -11625,7 +11683,8 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
             found["T8"] = {"quiet_days": round(age_updated, 2)}
         if ask and "T3" not in found and age_updated >= sla["t9_days"]:
             found["T9"] = {"quiet_days": round(age_updated, 2)}
-        if not chain and not item["assignees"] and not named and "T1" not in found and age_updated >= sla["t11_days"]:
+        if not chain and not item["assignees"] and not named and "T1" not in found and number not in ctx["unresolved"] \
+                and age_updated >= sla["t11_days"]:
             found["T11"] = {"quiet_days": round(age_updated, 2)}
         link = (merged or {}).get(number) if number not in ctx["charters"] and number not in ctx["asks"] else None   # a charter or an ask is a long-lived umbrella: a merged part does not finish it
         if link:   # #384: its PR merged and it is still open: that is the finding, not "no owner"; ours when the PR's author is ours
@@ -12721,7 +12780,7 @@ GITHUB_BODY_LIMIT = 5 * 1024 * 1024
 GITHUB_QUEUE_LIMIT = 2000
 GITHUB_ROUTE_SECONDS = 5       # per pass: the time routing may spend on `gh api` lookups; the rest waits a pass
 GITHUB_ROUTE_READ_TIMEOUT = 8  # seconds for one such lookup
-GITHUB_CATCHUP_SECONDS = 90    # per catch-up: after this the remaining reads are left to the next one
+GITHUB_CATCHUP_STUCK_PASSES = 3   # #494: a catch-up that stopped this many passes in a row is said in `status`, not silently starved
 GITHUB_CATCHUP_ITEMS = 500     # items one catch-up keeps (the newest)
 GITHUB_SUBREAD_TIMEOUT = 10    # seconds for a secondary read (reviews, check suites, workflow runs)
 GITHUB_READ_BACKOFF = 600      # a secondary read that failed is not tried again for this long
@@ -13351,6 +13410,7 @@ class GitHubHub:
         self._notices, self._filtered, self._filtered_batch = {}, set(), []   # PR 52
         self._routed_batch, self._conflicts = [], set()
         self.markers, self._markers_dirty, self.last_truncated = self._load_markers(), False, {}
+        self._cursors, self.last_incomplete, self.last_failed_primary = {}, False, False   # #494: per repo, the steps of an unfinished catch-up window
         self.engine = None
         self.intent_verdicts = {}  # intent.edit key -> (wakes the Chief of Staff, why): decided once per edit
         self.intent_edits = {}  # intent.edit key -> the `issues` payload, until delivered (PR 6's item, wired here)
@@ -13532,6 +13592,10 @@ class GitHubHub:
             load_fleet_health().append_moves(self.state_dir, load_fleet_health().move_rows(event, payload, repo, self.now(), closing_numbers))
         except Exception as err:   # the load figure then under-counts movement: say so in the audit, never fail the delivery
             self._audit("load.moves_failed", repo, {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
+        try:   # #470: a closed, relabelled or edited issue, or a changed sub-issue list, makes the cached asks list of this repository stale
+            load_fleet_health().mark_stale(self.state_dir, event, payload, repo, self.now())
+        except Exception as err:
+            self._audit("load.stale_failed", repo, {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
         self.note_pr_event(event, repo, payload)
         self._audit("github.received", repo, {"event": event, "delivery": _header(headers, "X-GitHub-Delivery"),
                                               "keys": [_one_line(item.key, 80) for item in items[:5]], "count": len(items)})   # ids, not bodies: the first few of them
@@ -13698,6 +13762,7 @@ class GitHubHub:
             for repo in joined:
                 self.watches[repo] = Watch(repo)
             gone = [(repo, self.watches.pop(repo)) for repo in left]
+            self.prune_cursors()
         for repo in joined:
             self._audit("github.watch", repo, {"state": "joined"})
         for repo, watch in gone:
@@ -13705,6 +13770,13 @@ class GitHubHub:
                 _terminate(watch.proc)
             watch.proc = watch.secret = None
             self._audit("github.watch", repo, {"state": "left"})
+
+    def prune_cursors(self):
+        """#494: the cursor of an unfinished catch-up belongs to a repo that is watched NOW and not excluded: a repo that left the watched set (or was
+        excluded since) loses it, so it never shows as catching up and never causes a read, and a repo that joins again starts a fresh window. The caller holds the lock."""
+        exclusion = load_module("repo_exclusion")
+        for repo in [r for r in self._cursors if r not in self.watches or exclusion.is_excluded(self.config, r)]:
+            del self._cursors[repo]
 
     def facts(self):
         """Every queued item that has an owner now, as Facts. Expired items are dropped."""
@@ -14107,69 +14179,92 @@ class GitHubHub:
         except ValueError:
             raise GitHubUnavailable("gh api %s answered something that is not JSON" % path.split("?")[0]) from None
 
-    def catch_up_items(self, repo, now, since_epoch=None):
+    def catch_up_items(self, repo, now, since_epoch=None, cursor=None):
         """The items for everything that changed on `repo` since now - look-back (or `since_epoch`, a later
         time, for a poll that asks only for what is new), keyed exactly as the webhooks are. Returns
-        (items, errors): one read failing does not stop the others."""
+        (items, errors): one read failing does not stop the others.
+
+        #494: the reads are steps in a fixed order (comments, issues, pulls, then each pull's reviews and check suites, then the workflow runs).
+        `cursor` (a dict, filled in here) remembers which steps are done: when the time budget of the catch-up is spent, or a primary read fails,
+        the catch-up stops at that step with `self.last_incomplete` set, and a call with the same cursor continues from it: no step is read twice
+        and no step is skipped. A secondary read that fails is best effort (done, as it always was); one the budget stopped is NOT done."""
         since, items, errors, pulls = iso(since_epoch if since_epoch is not None else now - self.lookback), [], [], []
         started, bounded, capped = self.now(), not fault("catch-up-blocks-pass"), []
+        if cursor is None:
+            cursor = {}
+        done = cursor.setdefault("done", set())
+        commented = cursor.setdefault("commented", {})
+        pulls = cursor.setdefault("pulls", [])
+        seconds = source_budget_seconds(self.config, "catch_up")
+        stopped, failed = [], []   # `stopped`: the budget is spent, no later step runs in this call; `failed`: a primary read that did not answer (later steps still run)
 
-        def read(name, path, key=None, older=None):
+        def read(key, name, path, rkey=None, older=None):
+            """The records of one step, or None when the step is done already or could not run now (the budget is spent, or a primary read failed)."""
+            if key in done or stopped:
+                return None
             secondary = name in SECONDARY_READS
             until = self._read_backoff.get((repo, name))
             if bounded and until is not None and self.now() < until:
+                done.add(key)
                 return []  # it was reported when it failed; it is not tried, or reported, again until the backoff ends
-            if bounded and self.now() - started >= GITHUB_CATCHUP_SECONDS:
-                errors.append("%s: left to the next catch-up (this one spent its %ds)" % (name, GITHUB_CATCHUP_SECONDS))
-                return []
+            if bounded and seconds and self.now() - started >= seconds:
+                errors.append("%s: left to the next catch-up (this one spent its %ds)" % (name, seconds))
+                stopped.append(name)
+                return None
             try:
-                records, truncated = self.read_pages(path, key, GITHUB_SUBREAD_TIMEOUT if secondary and bounded else None,
+                records, truncated = self.read_pages(path, rkey, GITHUB_SUBREAD_TIMEOUT if secondary and bounded else None,
                                                      older)
                 if truncated:
                     capped.append(name)
+                done.add(key)
                 return records
             except GitHubUnavailable as err:
                 errors.append("%s: %s" % (name, err))
-                if secondary and bounded:
-                    self._read_backoff[(repo, name)] = self.now() + GITHUB_READ_BACKOFF
-                return []
+                if secondary:
+                    if bounded:
+                        self._read_backoff[(repo, name)] = self.now() + GITHUB_READ_BACKOFF
+                    done.add(key)   # best effort: a secondary read is not read again for a window it missed
+                    return []
+                failed.append(name)   # a primary read that failed: the catch-up goes on from this step next time; the other steps still run
+                return None
 
         def fresh(record, field="updated_at"):
             return isinstance(record.get(field), str) and record[field] >= since
 
         base = "repos/%s/" % repo
-        comments = [c for c in read("comments", base + "issues/comments?since=%s&per_page=%d" % (since, GITHUB_PAGE_SIZE)) if fresh(c)]
-        commented = {}
-        for comment in comments:
+        found = read("comments", "comments", base + "issues/comments?since=%s&per_page=%d" % (since, GITHUB_PAGE_SIZE))
+        for comment in [c for c in found or [] if fresh(c)]:
             number = _url_number(comment.get("issue_url"))
             commented[number] = max(commented.get(number, ""), comment["updated_at"])
             items.append(_comment_item(repo, comment, None, now))
-        for issue in read("issues", base + "issues?state=all&since=%s&per_page=%d" % (since, GITHUB_PAGE_SIZE)):
+        for issue in read("issues", "issues", base + "issues?state=all&since=%s&per_page=%d" % (since, GITHUB_PAGE_SIZE)) or []:
             if _is_pr(issue) or not fresh(issue):
                 continue
             if issue["updated_at"] <= commented.get(_number(issue), ""):
                 continue  # a comment bumped it; the comment is the news
             items.append(_issue_item(repo, issue, now))
-        for pr in read("pulls", base + "pulls?state=all&sort=updated&direction=desc&per_page=%d" % GITHUB_PAGE_SIZE,
-                       older=("updated_at", since)):
-            if fresh(pr):
-                pulls.append(pr)
-                items.append(_pr_item(repo, pr, now))
-                items.append(_pr_conflict(repo, pr, now))
-        for pr in pulls:
+        found = read("pulls", "pulls", base + "pulls?state=all&sort=updated&direction=desc&per_page=%d" % GITHUB_PAGE_SIZE,
+                     older=("updated_at", since))
+        for pr in [x for x in found or [] if fresh(x)]:
+            pulls.append(pr)
+            items.append(_pr_item(repo, pr, now))
+            items.append(_pr_conflict(repo, pr, now))
+        for pr in list(pulls):
             number = _number(pr)
-            for review in read("reviews", base + "pulls/%d/reviews?per_page=100" % number):
+            for review in read(("reviews", number), "reviews", base + "pulls/%d/reviews?per_page=100" % number) or []:
                 if fresh(review, "submitted_at"):
                     items.append(_review_item(repo, review, pr, now))
             sha = (pr.get("head") or {}).get("sha")
-            for suite in read("check suites", base + "commits/%s/check-suites?per_page=100" % sha,
-                              "check_suites") if sha else []:
+            for suite in (read(("checks", number), "check suites", base + "commits/%s/check-suites?per_page=100" % sha,
+                               "check_suites") if sha else []) or []:
                 if fresh(suite):
                     items.append(_check_item(repo, dict(suite, pull_requests=suite.get("pull_requests") or [
                         {"number": number}]), now, "", "check suite"))
-        for run in read("workflow runs", base + "actions/runs?per_page=%d" % GITHUB_PAGE_SIZE, "workflow_runs"):
+        for run in read("runs", "workflow runs", base + "actions/runs?per_page=%d" % GITHUB_PAGE_SIZE, "workflow_runs") or []:
             if fresh(run):
                 items.append(_check_item(repo, run, now, "run-", "workflow %s" % (run.get("name") or "run")))
+        self.last_failed_primary = bool(failed)
+        self.last_incomplete = bool(stopped or failed)   # #494: a step is still to do: the caller keeps the cursor and the marker where they are
         items = [item for item in items if item is not None]
         skipped = 0
         if bounded and len(items) > GITHUB_CATCHUP_ITEMS:
@@ -14188,7 +14283,9 @@ class GitHubHub:
         repo = watch.repo
         with self.lock:
             marker = self.markers.get(repo)
-        items, errors, self.last_truncated = [], [], {}
+            self.prune_cursors()   # a stale cursor of a repo no longer watched (or excluded) is never read from
+        items, errors, self.last_truncated, self.last_incomplete, self.last_failed_primary = [], [], {}, False, False
+        cursor = self._cursors.get(repo)   # #494: the steps an earlier call of this catch-up finished: they are not read again
         fresh_start = marker is None and not fault("catch-up-on-fresh-start")
         if not fresh_start:
             floor, slack = now - self.lookback, (2 * self.config["github_poll_seconds"] if polled else GITHUB_MARKER_SLACK)
@@ -14198,13 +14295,25 @@ class GitHubHub:
                 if marker is not None and marker < floor:
                     self._audit("github.catch_up.skipped", repo, {"marker": iso(marker), "reads_from": iso(floor),
                                                                    "why": "older than the look-back: older events were skipped"})
-            items, errors = self.catch_up_items(repo, now, start)
-        primary_failed = any(e.split(":")[0] not in SECONDARY_READS for e in errors)
-        problem = self.read_awaiting(repo, now)  # PR 14: current state, not events: read on a fresh start too
+            if cursor is None:
+                cursor = self._cursors[repo] = {"since_epoch": start, "until": now, "stops": 0}   # the window is fixed until it is read whole
+            items, errors = self.catch_up_items(repo, now, cursor["since_epoch"], cursor)
+        incomplete = self.last_incomplete
+        primary_failed = self.last_failed_primary   # a primary read that did not answer (a budget stop is not a failure)
+        stopped_by_time = incomplete and not primary_failed
+        problem = None if stopped_by_time else self.read_awaiting(repo, now)  # PR 14: current state, not events: read on a fresh start too (once the window is read: not again on every resume)
         if problem:
             errors.append(problem)
-        if not primary_failed:
-            self._set_marker(repo, now)
+        if cursor is not None and stopped_by_time:   # #494: stopped by the budget part way: the marker stays, the cursor keeps what was read, the rest is read next time
+            cursor["stops"] += 1
+            if cursor["stops"] >= GITHUB_CATCHUP_STUCK_PASSES:
+                errors.append("catch-up not finished after %d passes (the window since %s is still being read)" % (cursor["stops"], iso(cursor["since_epoch"])))
+        elif primary_failed:
+            self._cursors.pop(repo, None)   # a read that did not answer: the window is read again whole from the marker, as it always was
+        else:
+            # the whole window was read: the marker moves over it, never past it (a window read over several calls: to where its first call began, which no step is older than)
+            self._set_marker(repo, cursor["until"] if cursor is not None and cursor["stops"] else now)
+            self._cursors.pop(repo, None)
         self.enqueue(items)
         said = "; ".join(errors) if errors else None
         with self.lock:
@@ -14213,6 +14322,8 @@ class GitHubHub:
             watch.catch_up_error = said
             retry = now + GITHUB_LOOKUP_RETRY
             watch.catchup_at = retry if (primary_failed or problem) and not polled else None  # best-effort reads are not retried
+            if incomplete and not primary_failed:
+                watch.catchup_at = now   # #494: only the time budget stopped it: the next pass goes on at once
         if self.last_truncated:
             self._audit("github.catch_up.truncated", repo, dict(self.last_truncated, marker_advanced=not primary_failed))
         if not polled or changed:  # a quiet poll every minute is not worth an audit line
@@ -14233,7 +14344,16 @@ class GitHubHub:
                     watch.last_error = self.accounts.scrub(_scrub(_one_line(str(err)), watch.secret))
                 self._audit("github.error", watch.repo, {"error": watch.last_error})
         self._save_markers()
+        engine = getattr(self, "engine", None)
+        if engine is not None:
+            set_source_state(engine, "catch_up", self.catching_up())
         self._write_snapshot(now)
+
+    def catching_up(self):
+        """#494: the repos whose catch-up window is not read whole yet, each with the passes it has taken ([] when every catch-up is done)."""
+        with self.lock:
+            self.prune_cursors()   # only repos watched now and not excluded
+            return ["%s (%d pass%s)" % (repo, c.get("stops", 0), "" if c.get("stops", 0) == 1 else "es") for repo, c in sorted(self._cursors.items())]
 
     def _tick_watch(self, watch, now):
         if self.watches.get(watch.repo) is not watch:
@@ -15030,11 +15150,21 @@ def cmd_launch(args, runner, now, socket_call=None):
             if engine.audit is not None:
                 engine.audit.append(engine.actor, "fleetpane.reattach_refused", args.name, {"why": _one_line(who, 160), "via": "launch --resume"})
             raise LaunchError("refused: %s" % who)
+        resume_brief, brief = load_module("resume_brief"), None
+        if args.brief_file is not None:   # read AFTER the repo and caller checks and BEFORE any pane opens: a bad brief opens nothing
+            try:
+                brief = resume_brief.read(read_brief, args.brief_file, sys.stdin)
+            except resume_brief.BriefRefused as err:
+                sys.stderr.write("%s: launch --resume: %s; no pane was opened\n" % (PROG, _one_line(str(err), 300)))
+                return EXIT_USAGE
         try:
             with agent_lock(state, args.name):
                 done = resume_agent(engine, args.name, args.resume, workspace)
         except ImpactStateBusy:
             raise LaunchError("another reattach of %s is running: wait for it" % args.name) from None
+        if brief is not None:   # the pane is proven to run the session: the brief is sent once, and the output says it was
+            ns = types.SimpleNamespace(**{name: globals()[name] for name in resume_brief.NEEDS})
+            return resume_brief.deliver(ns, engine, done, brief, print, lambda text: sys.stderr.write(text + "\n"))
         print(json.dumps(done, sort_keys=True))
         return EXIT_OK
     if not args.agent or not args.dir:
@@ -15044,6 +15174,14 @@ def cmd_launch(args, runner, now, socket_call=None):
     if (args.name or "").startswith(LANE_NAME_PREFIX):
         raise LaunchError("names starting %r are the plan review engine's reviewer lanes: only it launches them" % LANE_NAME_PREFIX)
     repo = launch_repo(args)
+    if not repo and not args.charter:   # #473: no --repo, no issue repo, no charter: the worker would have no repository of its own (and so no account)
+        repo, why = origin_repository(runner, args.dir)
+        if repo:
+            sys.stderr.write("%s: repository: %s (from origin)\n" % (PROG, repo))
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "launch.repo_from_origin", args.name, {"repo": repo})
+        else:
+            sys.stderr.write("%s: no repository recorded (%s): pushes will be refused; pass --repo\n" % (PROG, why))
     problem = launch_agent_problem(engine.config, runner, args.agent)
     if problem:
         raise LaunchError(problem)
@@ -15177,6 +15315,37 @@ def launch_repo(args):
     if named and qualified and named != qualified:
         raise LaunchError("--repo %s and --issue %s#%d name different repos" % (named, qualified, args.issue))
     return named or qualified
+
+
+_ORIGIN_NAME = r"([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]{1,100}?)(?:\.git)?"
+ORIGIN_HTTPS_RE = re.compile(r"https://github\.com/" + _ORIGIN_NAME)
+ORIGIN_SSH_RE = re.compile(r"git@github\.com:" + _ORIGIN_NAME)
+
+
+def origin_repository(runner, directory):
+    """(`owner/name`, None) for the repository the `origin` remote of `directory` names, else (None, why). Read ONCE, by the launcher, never by a shim or
+    at call time (a worker controls its own remote settings): `git config --local --no-includes --get-all remote.origin.url` as an argv, no shell, no network, nothing
+    but the repository's own config. Only `https://github.com/OWNER/NAME[.git]` and `git@github.com:OWNER/NAME[.git]` are accepted, exactly one `origin`
+    url: another host, a path, a `file:` or `ssh://` url, a url with a user or a token in it, an alias, a trailing path or no origin at all gives no
+    repository. The result is lower case. `why` is a fixed phrase: the url itself is NEVER returned, printed or logged."""
+    if not isinstance(directory, str) or not os.path.isabs(directory) or not os.path.isdir(directory):
+        return None, "the working directory is not an existing absolute path"
+    clean = {k: v for k, v in os.environ.items() if not (k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_CEILING_DIRECTORIES") or k.startswith("GIT_CONFIG"))}
+    try:   # the launcher's own environment must not point git at another repository or config: scrubbed
+        done = subprocess.run(["git", "-C", directory, "config", "--local", "--no-includes", "--get-all", "remote.origin.url"], capture_output=True, text=True,
+                              timeout=WORKTREE_GIT_SECONDS, stdin=subprocess.DEVNULL, env=clean)
+    except (OSError, subprocess.SubprocessError):
+        return None, "git could not be run there"
+    urls = [line for line in (done.stdout or "").splitlines() if line.strip()]
+    if done.returncode != 0 or not urls:
+        return None, "the directory has no origin remote"
+    if len(urls) != 1:
+        return None, "origin names more than one url"
+    found = ORIGIN_HTTPS_RE.fullmatch(urls[0]) or ORIGIN_SSH_RE.fullmatch(urls[0])
+    if not found or found.group(2) in (".", "..") or found.group(2).lower().endswith(".git"):
+        return None, "origin is not a plain github.com repository url"
+    repo = ("%s/%s" % found.groups()).lower()
+    return (repo, None) if REPO_RE.match(repo) else (None, "origin is not a plain github.com repository url")
 
 
 def check_charter_workspace(engine, runner, now, charter, repo, label):
@@ -18156,29 +18325,51 @@ def _apply_impact_hold_locked(engine, repo, number, report, record):
     return spent
 
 
-def impact_clear_core(engine, runner, repo, number, who, reason):
+def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, head=None, via=None, verify=None):
     """The owner's clear: record it head-bound (the daemon does not re-add the hold for that head) and remove `hold-impact`, and
-    `merge-captain` too when the switchboard itself added it for this hold. Returns the lines to print."""
+    `merge-captain` too when the switchboard itself added it for this hold. Returns the lines to print.
+
+    `remove` (the chat clear, #457) names the labels to take off instead: the caller has already read the PR and checked that each is an owner-tier hold label or the captain
+    marker; here every one of them is checked again against the owner-tier set, so no other label can ever be removed. `head` is the head the owner was shown: the clear
+    is refused when the PR's head is any other. `verify(raw)` (the chat clear's) is run on the PR this call just read, before anything is written, and raises NoticeError to refuse:
+    the check and the effect use ONE read. `via` is said in the audit line. The head-bound clear state is recorded for any clear, even one that removes no impact label: it only
+    stops the daemon adding its impact hold for that head. Nothing here ever ADDS a label."""
     pr = "%s#%d" % (repo, number)
     if engine.audit is None:   # a clear is a logged act: with no audit sink it is refused, loudly, before anything changes
         raise RuntimeError("no audit sink: an impact clear is refused rather than made unlogged")
     raw = read_pr_json(engine, repo, number)
-    head = raw.get("headRefOid")
-    if not isinstance(head, str) or not head:
+    current = raw.get("headRefOid")
+    if not isinstance(current, str) or not current:
         raise NoticeError("the PR's head is unknown")
+    if head is not None and current != head:
+        raise NoticeError("the PR's head moved since the owner was shown it (%s, not %s): nothing was cleared" % (current[:8], head[:8]))
+    if verify is not None:
+        verify(raw)
     names = label_names(engine.config)
+    if remove is not None:
+        cc = load_module("chat_clear")
+        allowed = {names[key] for key in cc.HOLD_KEYS + (cc.CAPTAIN_KEY,)}
+        if not remove or any(label not in allowed for label in remove):
+            raise RuntimeError("a clear removes owner-tier hold labels and the captain marker only: refused %r" % (sorted(set(remove) - allowed),))
     with impact_state_lock(engine.state_dir):   # the same lock as the daemon's write: the clear and its removal are one step
         state, problem = read_impact_state(engine.state_dir)
         _impact_state_noted(engine, problem)
         ours = state["applied"].get(pr) or {}
-        remove = [names["hold-impact"]]
-        if ours.get("merge_label_added"):
-            remove.append(names["merge-captain"])
-        state["clears"][pr] = {"head": head, "reason": reason, "by": who, "at": int(engine.now())}
+        if remove is None:
+            remove = [names["hold-impact"]]
+            if ours.get("merge_label_added"):
+                remove.append(names["merge-captain"])
+        else:
+            remove = list(remove)
+        head_now = current
+        state["clears"][pr] = {"head": head_now, "reason": reason, "by": who, "at": int(engine.now())}
         write_impact_state(engine.state_dir, state)   # the clear first: a failed removal never leaves a hold the daemon would re-add
         change_issue_labels(engine, runner, repo, number, remove=remove)
-        engine.audit.append(engine.actor, "gate.hold_cleared", pr, {"head": head, "by": who, "reason": reason, "removed": remove})   # inside the lock
-    return ["cleared the impact hold of %s at %s: removed %s; the daemon will not re-add it for this head" % (pr, head[:8], ", ".join(remove))]
+        detail = {"head": head_now, "by": who, "reason": reason, "removed": remove}
+        if via:
+            detail["via"] = via
+        engine.audit.append(engine.actor, "gate.hold_cleared", pr, detail)   # inside the lock
+    return ["cleared the impact hold of %s at %s: removed %s; the daemon will not re-add it for this head" % (pr, head_now[:8], ", ".join(remove))]
 
 
 def cmd_impact_clear(args, runner, now):
@@ -18412,6 +18603,181 @@ def _impact_post_list(engine, now, rule, held, released, second):
             write_impact_state(engine.state_dir, state)
     except Exception as failure:
         sys.stderr.write("%s: impact: %s\n" % (PROG, _one_line(str(failure), 160)))
+
+
+CHAT_CLEAR_NEW_PER_PASS = 3   # the owner's new messages judged in one pass (one Jev call each): the rest wait for the next pass
+
+
+def chat_clear_config(config):
+    """{"enabled", "live"} of the owner's `chat_clear` key. On by default but in SHADOW: `live` is true only when the owner's own config says `"live": true`. This build never sets it."""
+    raw = config.get("chat_clear") if isinstance(config, dict) else None
+    raw = raw if isinstance(raw, dict) else {}
+    return {"enabled": raw.get("enabled") is not False, "live": raw.get("live") is True}
+
+
+CHAT_CLEAR_OFF_FILE = "chat-clear.off"   # the owner's panic stop: its mere presence in the state directory forces SHADOW, checked every pass
+
+
+def chat_clear_live_now(engine):
+    """(live, why): may the hook WRITE on this pass? Only when ALL hold, judged afresh every pass: the config this daemon runs on says `live` (a real true), the kill file
+    `chat-clear.off` is not in the state directory, and the CURRENT config file, read now, is valid and also says `live` and not `enabled: false`. The daemon keeps its last good
+    config when a reload fails, so an invalid or half-edited file would otherwise leave the owner's `live` on: here it means SHADOW at once. `why` is None when live or when
+    shadow is simply the configured mode, else a short reason."""
+    if not chat_clear_config(engine.config)["live"]:
+        return False, None
+    if os.path.lexists(str(Path(engine.state_dir) / CHAT_CLEAR_OFF_FILE)):   # ANY entry, even a dangling symlink, is the panic stop
+        return False, "kill file"
+    try:
+        current = chat_clear_config(load_runnable_config())
+    except Exception as err:   # an invalid, unreadable or missing config file: never live on a file that cannot be read
+        return False, "config invalid: %s" % _one_line(str(err), 120)
+    if not (current["live"] and current["enabled"]):
+        return False, "config says shadow"
+    return True, None
+
+
+def chat_clear_holds(decisions, names):
+    """The holds the owner is shown, read from the SAME decisions the Decisions list is made of: [{"pr", "head", "labels", "summary"}] for every `captain` row that names its head,
+    with the owner-tier labels that row stands for (the captain label, and one `hold-*` label for each hold reason it lists). A reason this build cannot name drops the PR."""
+    holds = []
+    for d in decisions or []:
+        if not isinstance(d, dict) or d.get("kind") != "captain":
+            continue
+        repo, number, head = d.get("repo"), d.get("number"), d.get("head")
+        if not (isinstance(repo, str) and isinstance(number, int) and not isinstance(number, bool) and isinstance(head, str) and head):
+            continue
+        reasons = [h for h in (d.get("holds") or []) if isinstance(h, str)]
+        if any("hold-%s" % h not in names for h in reasons):
+            continue
+        holds.append({"pr": "%s#%d" % (repo, number), "head": head, "labels": [names["merge-captain"]] + [names["hold-%s" % h] for h in reasons],
+                      "summary": d.get("review_evidence") or d.get("headline") or d.get("title") or ""})
+    return holds
+
+
+def chat_clear_pass(engine, decisions, now):
+    """THE daemon hook of #457, called once at the end of a pass with the decisions the Decisions list is made of. Records the offers (the owner-tier holds at the heads shown), and
+    only when there is at least one reads the owner's NEW messages in the Chief of Staff's session (one read, inside v2_light and the call budget), judges each once (one Jev call) and,
+    in LIVE mode only (`chat_clear.live`), clears or asks once. In SHADOW (the default) it logs what it would do and writes nothing to GitHub and sends nothing. Never raises.
+    No command, verb or agent reaches it: only `publish_decisions` calls it, and only the daemon runs that."""
+    try:
+        _chat_clear_pass(engine, decisions, now)
+    except Exception as err:
+        engine._note("chat_clear.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+
+
+def _chat_clear_pass(engine, decisions, now):
+    cfg = chat_clear_config(engine.config)
+    if not cfg["enabled"] or engine.actor != "daemon" or engine.state_dir is None or engine.audit is None or engine.jev is None:
+        return
+    live, why = chat_clear_live_now(engine)
+    cfg = dict(cfg, live=live)
+    mode = "live" if live else ("shadow (%s)" % why if why else "shadow")
+    if engine.__dict__.get("chat_clear_mode") != mode:   # said once per change, loudly: the owner's switch took (or stopped taking) effect
+        previous = engine.__dict__.get("chat_clear_mode")
+        engine.__dict__["chat_clear_mode"] = mode
+        if previous is not None or why:
+            engine.audit.append(engine.actor, "chat_clear.mode", "chat_clear", {"mode": mode, "was": previous, "why": why})
+    cc = load_module("chat_clear")
+    names = label_names(engine.config)
+    holds = chat_clear_holds(decisions, names)
+    refreshed = cc.refresh_offers(engine.state_dir, holds, names, now)
+    if refreshed["added"] or refreshed["dropped"] or refreshed["problem"] or refreshed["damaged"]:
+        engine.audit.append(engine.actor, "chat_clear.offers", "chat_clear", {"added": refreshed["added"][:20], "dropped": refreshed["dropped"][:20],
+                                                                              "problem": refreshed["problem"], "damaged": refreshed["damaged"][:20]})
+    offers = refreshed["offers"]
+    if not offers:
+        return   # nothing is held for the owner: no read of his messages, no Jev call
+    if getattr(engine, "light", False):
+        return   # v2_light: no background read of any session (the same rule as the classifier's reader)
+    discovery = getattr(engine, "discovery", None)
+    cos = next((o for o in (discovery.agents.values() if discovery is not None else []) if (o.fleet or {}).get("role") == "chief-of-staff" and not o.problem and o.session_id), None)
+    if cos is None:
+        return
+    messages = cc.person_messages(newest_prompts(engine, cos.session_id), cc.read_seen(engine.state_dir), now, _created)
+    current_heads = {h["pr"]: h["head"] for h in holds}
+    bar = (engine.config.get("jev") or {}).get("min_confidence", cc.HIGH_CONFIDENCE)
+    for message in messages[:CHAT_CLEAR_NEW_PER_PASS]:
+        cc.mark_seen(engine.state_dir, message["id"], now)   # BEFORE anything is done: one attempt per message, whatever happens
+        offers = cc.read_offers(engine.state_dir)
+        if not offers:
+            engine.audit.append(engine.actor, "chat_clear.dropped", "chat_clear", {"message_id": message["id"], "why": "the offers went away before the message was judged"})
+            return
+        verdict = cc.decide(engine.jev, message["text"], offers, message["created"], now, bar)
+        live_now, _ = chat_clear_live_now(engine)   # AGAIN, right before acting: a kill file or a broken config that appears during this pass stops the very next message
+        _chat_clear_act(engine, cc, dict(cfg, live=live_now), message, verdict, offers, current_heads, now)
+
+
+def _chat_clear_act(engine, cc, cfg, message, verdict, offers, current_heads, now):
+    live, quoted = cfg["live"], cc.quote(message["text"])
+    action, pr, why = verdict["action"], verdict.get("pr"), verdict.get("why")
+    judge = verdict.get("judge") or {}
+    if action == "clear" and not cc.head_matches(offers.get(pr), current_heads.get(pr)):
+        # the head moved since he was shown it (or the offer was never shown): never a clear. The question shows the new head.
+        action, why = "ask", "head_changed"
+        verdict = dict(verdict, question=cc.question_text("head_changed", offers, [pr], current_heads), shown=[pr])
+    detail = {"message_id": message["id"], "quote": quoted, "action": action, "why": why, "pr": pr, "live": live, "would_clear": action == "clear",
+              "probabilities": judge.get("probabilities"), "jev_choice": judge.get("jev_choice"), "model": judge.get("model"), "reason": judge.get("reason"),
+              "screen": (verdict.get("screen") or {}).get("why")}
+    engine.audit.append(engine.actor, "chat_clear.verdict", pr or "chat_clear", detail)
+    if action == "none" or not live:
+        return   # shadow: the verdict is logged and nothing else happens
+    if action == "clear":
+        try:
+            chat_clear_apply(engine, cc, pr, offers[pr], quoted, message["id"], now)
+        except Exception as err:   # the clear failed or was refused at the point of effect: one question, nothing more
+            engine.audit.append(engine.actor, "chat_clear.failed", pr, {"message_id": message["id"], "error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+            verdict = dict(verdict, question=cc.question_text("failed" if not isinstance(err, NoticeError) else "not_held", offers, [pr], current_heads), shown=[pr])
+            action = "ask"
+        else:
+            return
+    if action == "ask":
+        text = "[chat clear] %s\n(your words: \"%s\")" % (verdict["question"], quoted)
+        try:
+            engine.send("switchboard", "chief-of-staff", text)
+        except Exception as err:
+            engine.audit.append(engine.actor, "chat_clear.reply_failed", pr or "chat_clear", {"error": _one_line(str(err), 160)})
+            return
+        for shown in verdict.get("shown") or []:   # the owner was just shown these: their shown head is the one the question named
+            head = current_heads.get(shown)
+            if head:
+                cc.show(engine.state_dir, shown, head, now)
+
+
+def chat_clear_apply(engine, cc, pr, offer, quoted, message_id, now):
+    """THE clear. Called only by the daemon's hook, in LIVE mode, for a message that is the owner's own, names exactly this one PR, was confirmed by Jev at the high bar and is newer
+    than the offer. At the point of effect it READS THE PR AGAIN: it must be open, at exactly the head the owner was shown, with only owner-tier hold labels and the captain marker
+    (any other hold label refuses). It then removes those labels (never any other, never adds one) through the same head-bound core `impact clear` uses, comments with his words,
+    and tells the Chief of Staff."""
+    repo, _, number = pr.rpartition("#")
+    number = int(number)
+    runner = getattr(engine, "gh_runner", None) or subprocess.run
+    names = label_names(engine.config)
+    seen = {}
+
+    def verify(raw):   # run by the core on the SAME read it clears from: open, at the shown head (the core checks), only owner-tier labels
+        if str(raw.get("state") or "").upper() != "OPEN":
+            raise NoticeError("%s is not open any more" % pr)
+        labels = raw.get("labels") or []
+        if raw.get("headRefOid") != offer["head"] or not cc.is_offerable(names, labels):
+            raise NoticeError("%s changed since the owner was shown it: its head or its labels are not what he saw" % pr)
+        seen["remove"] = cc.owner_tier_labels(names, labels)
+
+    raw = read_pr_json(engine, repo, number)
+    verify(raw)   # a cheap refusal before the core's own read; the core verifies again on the read it clears from
+    lines = impact_clear_core(engine, runner, repo, number, "owner (chat)", quoted, remove=seen["remove"], head=offer["head"], via="chat:%s" % message_id, verify=verify)
+    remove = seen["remove"]
+    short = offer["head"][:8]
+    shown_words = quoted.replace("@", "@\u200b").replace("`", "'")   # a public comment: no @mention and no code span can come out of his words
+    body = "The owner cleared this hold in his chat with the Chief of Staff, at head `%s`. His words: \"%s\"\n\nRemoved: %s." % (short, shown_words, ", ".join("`%s`" % l for l in remove))
+    try:
+        comment_as(engine, runner, repo, number, body, "switchboard")
+    except Exception as err:   # the clear is made and audited; a comment that cannot be posted is said, not undone
+        engine.audit.append(engine.actor, "chat_clear.comment_failed", pr, {"error": _one_line(str(err), 160)})
+    try:
+        engine.send("switchboard", "chief-of-staff", "[chat clear] Cleared %s at %s on your words: \"%s\" (removed %s)." % (pr, short, quoted, ", ".join(remove)))
+    except Exception as err:
+        engine.audit.append(engine.actor, "chat_clear.reply_failed", pr, {"error": _one_line(str(err), 160)})
+    return lines
 
 
 def impact_would_hold_pass(engine, now):
@@ -18821,7 +19187,7 @@ def owner_terminal_problem(stdin=None, stdout=None, ps=None, start_pid=None, dep
 
 def gates_caller_kind(runner, now):
     """THE ONE human-terminal check: every command that must be run by the owner in person asks this function, and no other code
-    decides who is a person. Today: `verdict --as owner`, `gates mode`, `gates off|on` and `waive` (its chief-of-staff caller is an agent
+    decides who is a person. Today: `verdict --as owner`, `gates mode`, `gates off|on`, `move` (its operator path) and `waive` (its chief-of-staff caller is an agent
     session; its person path asks this function like the rest). Returns (kind, who[, role]).
     "person" (the owner's own terminal: no agent session and no pane, or a session v2 knows is not a fleet
     agent), "agent" (a fleet agent, even one nobody registered) or "unknown" (an uncertain identity: #138 refuses it, never reads
@@ -20499,7 +20865,7 @@ def cmd_disk_janitor(args, runner, now):
     with worktree_sweep(engine):   # one session.list for every in-use check of this run
         lines, removed, kept = janitor.run(temp, state, now(), cfg, bool(args.apply),
                                            lambda name, detail: engine.audit.append(engine.actor, "temp.removed", _plain(name, 120), detail),
-                                           busy=janitor_busy_function(engine, runner, janitor))
+                                           busy=janitor_busy_function(engine, runner, janitor), weekly=bool(getattr(args, "weekly", False)))
     for line in lines:
         print(_plain(line, 300))
     print("%s: %d %s, %d kept (%s)" % (PROG, removed, "removed" if args.apply else "would be removed (a dry run: add --apply)", kept, _plain(temp, 160)))
@@ -20643,6 +21009,7 @@ def add_disk_parsers(sub):
                                               "temp_janitor.days (default 7) and that no state file of the fleet names, no keep glob matches and no .fleet-keep marker "
                                               "protects. Never follows a link, never touches another user's entry. Each removal is one temp.removed audit line.")
     janitor.add_argument("--apply", action="store_true", help="Remove them (the default only lists)")
+    janitor.add_argument("--weekly", action="store_true", help="The weekly job: scan under the longer budget temp_janitor.weekly_scan_seconds (default 600 s) instead of scan_seconds (60 s)")
     orphans = disk_sub.add_parser("reap-orphans", allow_abbrev=False, help="Signal (SIGTERM, then SIGKILL) orphaned test helpers past the grace: parent launchd, an exact allow-list; a dry run unless --apply")
     orphans.add_argument("--apply", action="store_true", help="Do it (default: a dry run)")
     reclaim = disk_sub.add_parser("reclaim-worktrees", allow_abbrev=False, help="Remove the registered worktrees of retired agents when clean and pushed; else keep and say why (a dry run unless --apply)")
@@ -23684,6 +24051,55 @@ def load_fleet_health():
     return load_module("fleet_health")
 
 
+# ---- #494: a time budget for each heavy reader that had none, so a restart under load cannot hold a pass for minutes. The reader checks the
+# budget BETWEEN calls (no thread, no process), stops at a safe point and finishes over the following passes; 0 means no limit.
+SOURCE_BUDGET_DEFAULTS = {"load_alert": 20, "charters": 15, "catch_up": 90}   # seconds a pass; catch_up's default is the bound it always had
+
+
+def validate_source_budgets(config, source):
+    """`source_budgets`: absent is the defaults; an object of {load_alert, charters, catch_up} seconds (a number, 0 = no limit)."""
+    raw = config.get("source_budgets")
+    if raw is None:
+        return
+    if not isinstance(raw, dict):
+        raise ConfigError("%s: 'source_budgets' must be an object, got %r" % (source, type(raw).__name__))
+    unknown = sorted(set(raw) - set(SOURCE_BUDGET_DEFAULTS))
+    if unknown:
+        raise ConfigError("%s: 'source_budgets' has no key %s (it has %s)" % (source, ", ".join(repr(k) for k in unknown), ", ".join(SOURCE_BUDGET_DEFAULTS)))
+    for key, value in raw.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 3600:
+            raise ConfigError("%s: 'source_budgets.%s' must be a number of seconds from 0 (no limit) to 3600, got %r" % (source, key, value))
+
+
+def source_budget_seconds(config, name):
+    """The seconds a pass may spend in the reader `name` (0: no limit); the default when the key is absent."""
+    raw = (config or {}).get("source_budgets")
+    value = raw.get(name) if isinstance(raw, dict) else None
+    return SOURCE_BUDGET_DEFAULTS[name] if value is None else value
+
+
+def set_source_state(engine, name, pending):
+    """What `name` still has to read (a list of short texts, [] when it is done), kept in memory for the status line of #494 slice 3:
+    {name: {"state": "pending"|"done", "pending": [...]}}. Never raises."""
+    engine.__dict__.setdefault("source_state", {})[name] = {"state": "pending" if pending else "done", "pending": list(pending)[:20]}
+
+
+def source_states(engine):
+    """{source: {"state", "pending"}} of the readers with a time budget, as last set (empty before their first pass)."""
+    return dict(getattr(engine, "source_state", None) or {})
+
+
+class SourceBudget:
+    """The time one reader has in this pass, checked between its calls: `spent()` is True once `seconds` have passed since it was made
+    (never when `seconds` is 0). It stops nothing by itself: the reader asks and stops at a safe point."""
+
+    def __init__(self, seconds, now):
+        self.seconds, self.now, self.started = seconds, now, now()
+
+    def spent(self):
+        return bool(self.seconds) and self.now() - self.started >= self.seconds
+
+
 def validate_load_alert_config(config, source):
     """`load_alert`: absent or null is off (the load figures are still kept and shown)."""
     if "load_alert" not in config:
@@ -23762,7 +24178,12 @@ def load_tick(engine, discovery):
             return sum(1 for call in snapshot() if call[0] > since and call[1] == account and not call[3])
         meter = {"account_of": accounts.describe, "paused": lambda repo: accounts.paused.get(accounts.describe(repo), 0) > now,
                  "begin_read": begin_read, "read_cost": read_cost}
-    return health.tick(health.Context(now=now, state_dir=engine.state_dir, cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, read_charters=read_charters, read_parent=read_parent, cos=cos, wake=wake, **meter))
+    budget = SourceBudget(source_budget_seconds(engine.config, "load_alert"), engine.now)   # #494: the reads stop between calls when this pass's time is spent
+    pending = []
+    sent = health.tick(health.Context(now=now, state_dir=engine.state_dir, cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, read_charters=read_charters, read_parent=read_parent, cos=cos, wake=wake,
+                                      time_up=budget.spent, pending=pending, **meter))
+    set_source_state(engine, "load_alert", pending)
+    return sent
 
 
 def cmd_load_replay(args, runner, now):
@@ -23825,6 +24246,79 @@ def add_load_replay_parsers(sub):
     replay.add_argument("--backlog-hours", type=float, default=None, help="Try another threshold: hours of moved asks in the backlog test")
     replay.add_argument("--from-audit", action="store_true", help="Rebuild the day from the audit log and its archives even when the series holds it (a past day is rebuilt this way when the series does not)")
     replay.add_argument("--json", action="store_true")
+
+
+# ---------------------------------------------------------------- `move`: an ask from one charter to another (#347)
+# The logic is bin/lanes.py; this is registration and the caller's identity only.
+
+def add_move_parsers(sub):
+    move = sub.add_parser("move", help="Move an ask to another orchestrator's charter, with a handover (Chief of Staff or operator)")
+    move.add_argument("ask", type=issue_arg, help="The ask: N or OWNER/REPO#N")
+    move.add_argument("--to", dest="to_charter", type=issue_arg, required=True, help="The charter it moves to: N or OWNER/REPO#N, in the ask's repo")
+    move.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
+
+
+def move_caller(engine, args, runner, now):
+    """(name, role) of who runs `move`: its pane's fleet agent, (None, None) at the owner's own terminal (the operator), or an "unidentified" caller that is refused. A mistake guard, not a boundary (docs/switchboard.md). `--from` in the Lab."""
+    if args.sender is not None:
+        if os.environ.get(LAB_ENV) != "1":
+            raise CallerError("--from is only for the Lab (%s=1); an agent is identified by its pane" % LAB_ENV)
+        found = engine.discover(engine.now()).agents.get(args.sender)
+        if found is None:
+            raise CallerError("%s is not a fleet agent the switchboard can see" % args.sender)
+        return found.name, (found.fleet or {}).get("role")
+    kind = gates_caller_kind(runner, now)   # THE ONE human-terminal check (no copy of it here): a shell that cannot be established as the owner's own terminal is "unknown" and refused
+    if kind[0] == "person":
+        return None, None   # the owner at a shell: the operator
+    if kind[0] == "agent":
+        return kind[1], kind[2]
+    return "an unidentified caller (%s)" % _one_line(kind[1], 160), "unidentified"
+
+
+def cmd_move(args, runner, now):
+    lanes = load_module("lanes")
+    engine, _, config = build_engine(runner, now, "cli")
+    if engine.intents is None:
+        raise ConfigError("'intent_repo' is not configured in %s: set it to OWNER/REPO" % config_path())
+    caller, role = move_caller(engine, args, runner, now)
+    try:
+        watched = watched_repos(config, discovered_fleets(engine.discover(engine.now())))
+        repo, ask = resolve_issue(config, args.ask, None, watched)
+        to_repo, charter = resolve_issue(config, args.to_charter, None, watched)
+    except IssueRefError as err:
+        sys.stderr.write("%s: %s\n" % (PROG, err))
+        return EXIT_USAGE
+    if repo is None or to_repo != repo:
+        sys.stderr.write("%s: move: the ask and the charter must be in the same repository (%s vs %s)\n" % (PROG, repo, to_repo))
+        return EXIT_USAGE
+    sb = types.SimpleNamespace(engine=engine, **{name: globals()[name] for name in lanes.NEEDS})
+    return lanes.run_move(sb, repo, ask, charter, caller, role, print, lambda text: sys.stderr.write(text + "\n"), watched=watched)
+
+
+cmd_move.ensure_on_use = True   # the daemon is alive when it runs
+
+
+# ---------------------------------------------------------------- `reassign`: a running worker to another orchestrator (#347)
+# The logic is bin/reassign.py; this is registration and the caller's identity only.
+
+def add_reassign_parsers(sub):
+    reassign = sub.add_parser("reassign", help="Hand a running worker to another orchestrator, with its current boss's consent (Chief of Staff or operator); --undo restores its own boss")
+    reassign.add_argument("worker", help="The worker's fleet name")
+    reassign.add_argument("--to", dest="to_boss", help="The orchestrator that becomes its boss")
+    reassign.add_argument("--consent-from", dest="consent", help="The worker's CURRENT boss, whose consent is recorded with this command")
+    reassign.add_argument("--undo", action="store_true", help="Remove the override: the worker reports to the boss it was launched with again")
+    reassign.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
+
+
+def cmd_reassign(args, runner, now):
+    module = load_module("reassign")
+    engine, _, _ = build_engine(runner, now, "cli")
+    caller, role = move_caller(engine, args, runner, now)
+    sb = types.SimpleNamespace(engine=engine, **{name: globals()[name] for name in module.NEEDS})
+    return module.run_reassign(sb, args.worker, args.to_boss, args.consent, args.undo, caller, role, print, lambda text: sys.stderr.write(text + "\n"))
+
+
+cmd_reassign.ensure_on_use = True   # the daemon is alive when it runs
 
 
 # ---------------------------------------------------------------- the front door: self-registering commands
@@ -25601,6 +26095,7 @@ class OrdersFacts:
 
     def __init__(self):
         self.engine = None
+        self.cursor = None   # #494: the name of the first agent not read yet when a pass ran out of its time; None between cycles
 
     def bind(self, engine):
         self.engine = engine
@@ -25611,7 +26106,17 @@ class OrdersFacts:
         if engine is None or discovery is None:
             return []
         facts = []
-        for observation in sorted(discovery.agents.values(), key=lambda o: o.name):
+        budget = SourceBudget(source_budget_seconds(engine.config, "charters"), engine.now)
+        agents = sorted(discovery.agents.values(), key=lambda o: o.name)
+        if self.cursor is not None:   # a cycle that ran out of time continues with the agents it did not reach; the others were read in it already
+            agents = [o for o in agents if o.name >= self.cursor]
+        self.cursor, reached = None, 0
+        for index, observation in enumerate(agents):
+            if reached and budget.spent():   # at least one agent a pass, so a budget smaller than one read cannot starve the rest
+                self.cursor = observation.name
+                set_source_state(engine, "charters", [o.name for o in agents[index:]])
+                return facts
+            reached += 1
             if (observation.fleet or {}).get("role") == "chief-of-staff":  # PR 18: found by role, not by charter
                 if not observation.conflict and not observation.problem:
                     found = self.cos_fact(observation)
@@ -25636,6 +26141,7 @@ class OrdersFacts:
             facts.append(Fact(key, observation.name, ORDERS_KIND, "\n".join(orders),
                               max(observation.created or 0.0, when or 0.0), issue=charter, batch=False,
                               orders=True, repo=repo))
+        set_source_state(engine, "charters", [])
         return facts
 
     def cos_fact(self, observation):
@@ -25787,6 +26293,8 @@ def cmd_orders(args, runner, now):
         sys.stderr.write("%s: orders needs list, add or remove (a charter's orders), or --cos (the Chief of Staff's "
                          "own)\n" % PROG)
         return EXIT_USAGE
+    if args.orders_action == "copy":
+        return cmd_orders_copy(args, runner, now)
     if args.orders_action == "list":
         reader = _intent_reader(runner, now)
         fleet, watched = soft_caller(runner, now)
@@ -25815,6 +26323,27 @@ def cmd_orders(args, runner, now):
         sys.stderr.write("%s: %s\n" % (PROG, err))
         return EXIT_USAGE
     return orders_write(engine, args, caller, role, repo, number)
+
+
+def cmd_orders_copy(args, runner, now):
+    """`orders copy --source N --charter M`: the logic is bin/orders_copy.py; this is the caller and the two charters."""
+    module = load_module("orders_copy")
+    engine, _, _ = build_engine(runner, now, "cli")
+    if engine.intents is None:
+        raise ConfigError("'intent_repo' is not configured in %s: set it to OWNER/REPO" % config_path())
+    caller, role, fleet = orders_caller(engine, args)
+    try:
+        watched = watched_repos(engine.config, discovered_fleets(engine.discover(engine.now())))
+        repo, target = _orders_charter(engine.config, args.charter, fleet, watched)
+        source_repo, source = _orders_charter(engine.config, args.source, fleet, watched)
+    except IssueRefError as err:
+        sys.stderr.write("%s: %s\n" % (PROG, err))
+        return EXIT_USAGE
+    if source_repo != repo:
+        sys.stderr.write("%s: orders copy: the source and the target charter must be in the same repository (%s vs %s)\n" % (PROG, source_repo, repo))
+        return EXIT_USAGE
+    ns = types.SimpleNamespace(engine=engine, **{name: globals()[name] for name in module.NEEDS})
+    return module.run_copy(ns, repo, source, target, caller, role, print, lambda text: sys.stderr.write(text + "\n"), watched=watched)
 
 
 def orders_write(engine, args, caller, role, repo, charter):
@@ -25908,6 +26437,10 @@ def add_orders_parsers(sub):
     add.add_argument("text", help="The order, in the owner's words (1 to %d characters, one line)" % ORDER_MAX_CHARS)
     add.add_argument("--by", help="Who ordered it (default: the operating-system user)")
     add.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
+    copy = kinds.add_parser("copy", help="Chief of Staff only: copy every order of a sibling charter to this one, wording and dates unchanged")
+    copy.add_argument("--charter", type=issue_arg, required=True, help="The charter the orders are copied TO: " + CHARTER_HELP)
+    copy.add_argument("--source", type=issue_arg, required=True, help="The charter the orders are copied FROM: " + CHARTER_HELP)
+    copy.add_argument("--from", dest="sender", help="Lab only: the caller's fleet name")
     remove = kinds.add_parser("remove", help="Chief of Staff only: remove one order the owner revoked")
     remove.add_argument("--charter", type=issue_arg, required=True, help=CHARTER_HELP)
     remove.add_argument("number", type=int, help="The order's number in `orders list`")
@@ -26278,11 +26811,39 @@ def _issue_target(engine, decision):
     return (repo or (watched[0] if len(watched) == 1 else None)), decision["ask"]
 
 
+class DecisionReadError(DecisionError):
+    """A decision command could not read what it needs from GitHub: nothing was changed (exit 1, not a usage error)."""
+
+
+def escalate_notice(engine, runner, decision, reason, name):
+    """(#487) `decisions escalate` on a PR notice. A notice is information: it waits on no one, so it never answers "already yours". The pull request is read
+    NOW (one `gh pr view`, through its repository's account): when it carries the merge hold at its current head it is escalated exactly as the listed hold
+    would be (the file can trail a label by a few minutes); when it does not, the command says it is only a notice and that nothing was escalated; when it
+    cannot be read it says so and changes nothing."""
+    ident, repo, number = decision["id"], decision.get("repo"), decision.get("number")
+    if not str(ident).startswith("pr:") or not repo or isinstance(number, bool) or not isinstance(number, int):
+        raise DecisionError("%s is a notice: information only, so nothing was escalated (it ends by itself)" % ident)
+    try:
+        facts = pr_facts_from(read_pr_json(engine, repo, number))
+    except Exception as err:   # an unreadable pull request is not a pull request that holds nothing
+        raise DecisionReadError("%s: the pull request %s#%d could not be read (%s): nothing was changed" % (
+            ident, repo, number, _one_line(str(err), 120))) from None
+    if facts.get("state") != "open":
+        raise DecisionError("%s: the pull request is %s, so there is nothing to escalate (a notice ends then)" % (ident, facts.get("state") or "not open"))
+    if not facts.get("captain") or not facts.get("head"):
+        raise DecisionError("%s is a PR notice: information only, so nothing was escalated. It becomes a decision when the pull request carries the merge hold "
+                            "(%s, or `MERGE: captain` first in its body)" % (ident, label_names(engine.config)["merge-captain"]))
+    held = {"id": ident, "kind": "captain", "tier": "cos", "repo": repo, "number": number, "head": facts["head"]}
+    return escalate_decision(engine, runner, held, reason, name)
+
+
 def escalate_decision(engine, runner, decision, reason, name):
     """Move a decision to you. An issue (or the issue a report is about): your label on, the Chief of Staff's off. A
     permission request or question: marked yours at once, in escalated-requests.json (disposable; the pass reads it)
     and in the audit log. Returns one line saying what was done."""
     kind, ident = decision["kind"], decision["id"]
+    if kind == "notice":
+        return escalate_notice(engine, runner, decision, reason, name)   # #487: never "already yours" for information that waits on no one
     if decision.get("tier") == "human":
         return "%s is already yours: nothing changed" % ident
     if kind in ("issue", "report"):
@@ -26697,6 +27258,9 @@ def cmd_decision_write(args, action, runner, now):
                                 "question" % args.id)
         else:
             line = answer_decision(engine, decision, args.value, args.note, name)
+    except DecisionReadError as err:
+        sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 400)))
+        return EXIT_ERROR
     except (DecisionError, CallerError) as err:
         sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 400)))
         return EXIT_USAGE

@@ -35,6 +35,9 @@ permissions:
   - {action: shell, resource: "fleet-switchboard waive *", effect: allow}
   - {action: shell, resource: "fleet-switchboard plan *", effect: allow}
   - {action: shell, resource: "fleet-switchboard labels *", effect: allow}
+  - {action: shell, resource: "fleet-switchboard triage *", effect: allow}
+  - {action: shell, resource: "fleet-switchboard move *", effect: allow}
+  - {action: shell, resource: "fleet-switchboard reassign *", effect: allow}
   - {action: shell, resource: "fleet-switchboard handoff *", effect: allow}
   - {action: shell, resource: "fleet-switchboard launch *", effect: allow}
   - {action: shell, resource: "fleet-switchboard reattach *", effect: allow}

@@ -29,6 +29,10 @@ HISTORY_DAYS = 3                 # finished days of the hourly series kept for t
 READ_BUDGET_DEFAULT = 30         # GitHub reads an hour for each gh account (the key load_alert.read_budget); a 304 is free
 READ_BUDGET_MAX = 60             # a hard ceiling: a key above it is a configuration error
 ASKS_FRESH_SECONDS = 3600        # a cached list of asks is re-read at most this often
+STALE_MARK_FILE = "asks-stale.json"
+STALE_MARKS_MAX = 200            # repositories kept in the stale marks (a delivery names the repository of the daemon's own watch list)
+STALE_REREAD_SECONDS = 300       # a repository's asks list marked stale is re-read at most this often
+STALE_ISSUE_ACTIONS = ("closed", "reopened", "labeled", "unlabeled", "edited", "deleted", "transferred")
 RETRY_SECONDS = 300              # after a failed read the same source is not tried again for this long
 ASKS_STALE_SECONDS = 3 * 3600    # a list older than this is not believed: the figure is not recorded
 DEFAULTS = {"enabled": False, "stalled_hours": 2.0, "stalled_asks": 2, "backlog_hours": 4.0, "read_budget": READ_BUDGET_DEFAULT}
@@ -102,6 +106,41 @@ def move_rows(event, payload, repo, now, closing=lambda text: []):
     refs = [n for n in list(closing(pr.get("body"))) + references(pr.get("body"), head.get("ref"), repo) if n != number]
     refs = list(dict.fromkeys(refs))[:MOVES_NUMBERS_MAX - 1]
     return [{"at": now, "repo": repo, "numbers": [number] + refs, "refs": refs, "kind": kind}]
+
+
+def mark_stale(state_dir, event, payload, repo, now):
+    """Mark `repo`'s cached asks list stale when a delivery says an issue was closed, reopened, labelled, unlabelled, edited, deleted or transferred, or
+    that a sub-issue list changed: the next pass re-reads it (the hourly re-read stays as the fallback). Returns True when a mark was written."""
+    if not isinstance(payload, dict) or not isinstance(repo, str) or not repo:
+        return False
+    if not (event == "sub_issues" or (event == "issues" and payload.get("action") in STALE_ISSUE_ACTIONS)):
+        return False
+    with _moves_lock(state_dir):
+        path = Path(state_dir) / STALE_MARK_FILE
+        try:
+            marks = json.loads(path.read_text())
+        except (OSError, ValueError):
+            marks = {}
+        marks = {k: v for k, v in (marks.items() if isinstance(marks, dict) else []) if isinstance(v, (int, float)) and not isinstance(v, bool)}
+        marks[repo.lower()] = now
+        while len(marks) > STALE_MARKS_MAX:
+            marks.pop(min(marks, key=marks.get))
+        temp = path.with_name(path.name + ".tmp")
+        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            json.dump(marks, handle, sort_keys=True)
+        os.replace(str(temp), str(path))
+    return True
+
+
+def stale_since(state_dir, repo):
+    """When a delivery last marked `repo`'s asks list stale, or None (a missing or unreadable file marks nothing)."""
+    try:
+        marks = json.loads((Path(state_dir) / STALE_MARK_FILE).read_text())
+    except (OSError, ValueError):
+        return None
+    value = marks.get(str(repo or "").lower()) if isinstance(marks, dict) else None
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
 @contextmanager
@@ -445,6 +484,18 @@ class _Budget:
         return self.rows
 
 
+def _time_up(ctx, what):
+    """#494: True when this pass's time budget for the load alert's reads is spent (`ctx.time_up()`, checked between reads; 0 = no limit); what
+    was left is noted in `ctx.pending` and the read is made in a later pass (every list kept is read again only when it is old, oldest first)."""
+    check = getattr(ctx, "time_up", None)
+    if check is None or not check():
+        return False
+    pending = getattr(ctx, "pending", None)
+    if isinstance(pending, list) and len(pending) < 50:
+        pending.append(what)
+    return True
+
+
 def _resolve_charters(ctx, state, now, budget):
     """{orchestrator: charter number or None} and problems. The charter is the open issue whose yaml block says `orchestrator: <its name>`
     (one `ctx.read_charters(repo) -> [(number, body)]` per repo, cached an hour; it costs up to 3 reads and needs 2 left in the account's budget), else
@@ -458,6 +509,8 @@ def _resolve_charters(ctx, state, now, budget):
                 problems.append(entry["error"])   # still failing: said every pass, read again only after the retry wait
             continue
         if getattr(ctx, "read_charters", None) is None or budget.paused(repo, problems) or budget.left(budget.account(repo)) < 2:
+            continue
+        if _time_up(ctx, "charters of %s" % repo):
             continue
         try:
             found = budget.metered(repo, 2, lambda: ctx.read_charters(repo))
@@ -499,6 +552,8 @@ def _parent_of(ctx, state, budget, repo, number, now, problems):
     if now - failed.get(key, -1e9) < RETRY_SECONDS or getattr(ctx, "read_parent", None) is None:
         return None, False
     if budget.paused(repo, problems) or budget.left(budget.account(repo)) < 1:
+        return None, False
+    if _time_up(ctx, "parent of %s" % key):
         return None, False
     try:
         parent = budget.metered(repo, 1, lambda: ctx.read_parent(repo, number))
@@ -598,11 +653,15 @@ def _refresh_asks(ctx, state, now, rows=()):
     for name in sorted(ctx.orchestrators, key=lambda n: cache.get(n, {}).get("at", 0)):
         info = dict(ctx.orchestrators[name], charter=charters.get(name))
         entry = cache.get(name) or {}
-        if (entry.get("at") and now - entry["at"] < ASKS_FRESH_SECONDS) or now - entry.get("tried", -1e9) < RETRY_SECONDS:
+        marked = stale_since(ctx.state_dir, info.get("repo"))
+        stale = entry.get("at") and marked is not None and marked > entry["at"] and now - entry["at"] >= STALE_REREAD_SECONDS   # an event said it changed: not the hourly wait
+        if (entry.get("at") and now - entry["at"] < ASKS_FRESH_SECONDS and not stale) or now - entry.get("tried", -1e9) < RETRY_SECONDS:
             if entry.get("error") and now - entry.get("tried", -1e9) < RETRY_SECONDS:
                 problems.append(entry["error"])
             continue
         if not info.get("charter") or budget.paused(info.get("repo"), problems) or budget.left(budget.account(info.get("repo"))) < 1:
+            continue
+        if _time_up(ctx, "asks of %s" % name):
             continue
         try:
             found = budget.metered(info.get("repo"), 1, lambda: ctx.read_asks(info["charter"], info.get("repo")))
