@@ -53976,7 +53976,7 @@ class TestCatchingUpStatus(StatusCase):
         self.assertEqual(written, [True, False, False, False, False, True], "no heartbeat inside two minutes: 2 writes for 6 passes")
         self.world.tick(sb.CATCHING_UP_REWRITE_SECONDS + 1)
         self.assertTrue(self.pending(load=["asks of o1", "asks of o2"]), "an unchanged pending state is rewritten after two minutes: its age says the daemon is alive")
-        self.assertFalse(self.pending() and False)
+        self.assertTrue(self.pending(), "the first empty state after a pending one is written (status must not keep showing the old record)")
         self.assertFalse(self.pending(), "nothing pending and already empty: nothing is written")
 
     def test_s3_a_record_the_daemon_has_stopped_updating_is_not_shown(self):
@@ -53984,6 +53984,31 @@ class TestCatchingUpStatus(StatusCase):
         now = self.world.clock.now()
         self.assertEqual(len(sb.catching_up_lines(self.world.state, now + 60)), 1)
         self.assertEqual(sb.catching_up_lines(self.world.state, now + 11 * 60), [])
+
+    def test_a_stale_non_empty_file_is_emptied_by_the_first_pass_that_finds_nothing_pending(self):
+        self.path.write_text(json.dumps({"at": sb.iso(self.world.clock.now()), "sources": {"load_alert": ["x"]}}))
+        self.assertTrue(self.pending(), "a record from a daemon that died: the first pass with nothing pending replaces it")
+        self.assertEqual(json.loads(self.path.read_text())["sources"], {})
+        self.assertEqual(self.lines(), [])
+
+    def test_more_than_three_waiting_are_cut_and_a_hostile_source_name_is_a_plain_short_line(self):
+        self.pending(load=["a1", "a2", "a3", "a4", "a5"])
+        (line,) = self.lines()
+        self.assertIn("load alert (5: a1, a2, a3, ...)", line)
+        self.path.write_text(json.dumps({"at": sb.iso(self.world.clock.now()), "sources": {"\x1b[31mevil\x1b]0;x\x07" + "n" * 80: ["w"]}}))
+        (line,) = self.lines()
+        self.assertNotIn("\x1b", line)
+        self.assertNotIn("\x07", line)
+        self.assertLess(len(line), 90)
+
+    def test_a_future_record_a_huge_file_and_deep_nesting_say_nothing(self):
+        now = self.world.clock.now()
+        self.path.write_text(json.dumps({"at": sb.iso(now + 3600), "sources": {"load_alert": ["x"]}}))
+        self.assertEqual(self.lines(), [], "a record dated in the future is not shown for ever")
+        self.path.write_text(json.dumps({"at": sb.iso(now), "sources": {"load_alert": ["x" * 100] * 2000}}))
+        self.assertEqual(self.lines(), [])
+        self.path.write_text("[" * 100000)
+        self.assertEqual((self.status()[0], self.lines()), (0, []))
 
     def test_s5_the_file_is_private_and_names_only_sources_and_counts(self):
         self.pending(load=["asks of o1"], repos=["acme/api (2 passes)"])
@@ -54049,6 +54074,21 @@ class TestEarlyDecisionsWrite(DecisionsBase):
         report = sb.decisions_report(self.world.state, self.world.clock.now())
         self.assertTrue(report["stale"], "the staleness verdict is the file's age, whatever the flag says")
         self.assertIn("not updating", report["message"])
+
+    def test_a_pass_writes_the_catching_up_file_and_a_failure_of_that_write_does_not_stop_the_pass(self):
+        self.ask_the_boss("Which database?")
+        engine = self.world.engine
+        sb.set_source_state(engine, "catch_up", ["acme/api (2 passes)"])
+        engine.run_pass()
+        written = json.loads((self.world.state / sb.CATCHING_UP_FILE).read_text())
+        self.assertEqual(written["sources"], {"catch_up": ["acme/api (2 passes)"]}, "the pass wrote what is pending")
+        self.assertEqual([d["title"] for d in self.file()["decisions"]], ["Which database?"])
+        sb.set_source_state(engine, "catch_up", ["acme/web (1 pass)"])
+        self.world.tick(5)
+        with mock.patch.object(sb, "write_catching_up", side_effect=OSError("disk full")):
+            engine.run_pass()
+        self.assertTrue(self.path.exists(), "the pass went on and published the decisions")
+        self.assertTrue([e for e in self.world.audit() if "catching-up" in json.dumps(e)], "the failure was recorded")
 
     def test_a_change_of_the_flag_alone_is_a_write_and_the_same_flag_is_only_a_touch(self):
         store = sb.decision_store(self.world.engine)
