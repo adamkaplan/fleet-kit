@@ -52682,13 +52682,16 @@ class TestEarlyDecisionsWrite(DecisionsBase):
         self.heavy(steps=3, step_seconds=20)
         self.world.engine.run_pass()
         self.assertIs(self.seen_file_at_first_step.get("provisional"), True, "the early write says it is provisional")
-        self.assertNotIn("provisional", self.file(), "the end of the pass published the final list")
+        final = self.file()
+        self.assertNotIn("provisional", final, "the end of the pass published the final list")
         state = self.world.state
-        during = dict(self.seen_file_at_first_step)
-        self.path.write_text(json.dumps(during))
+        def put(body):
+            self.path.write_text(json.dumps(body))
+            os.utime(str(self.path), (self.world.clock.now(), self.world.clock.now()))   # the file is current on the fake clock
+        put(dict(self.seen_file_at_first_step))
         text = " ".join(sb.format_decisions_status(sb.decisions_summary(state, self.world.clock.now)))
         self.assertEqual(text.count("provisional"), 1)
-        self.path.write_text(json.dumps(self.file()))
+        put(final)
         self.assertEqual(" ".join(sb.format_decisions_status(sb.decisions_summary(state, self.world.clock.now))).count("provisional"), 0)
 
     def test_the_provisional_flag_never_makes_an_old_list_look_fresh(self):
@@ -52824,7 +52827,7 @@ class TestEarlyDecisionsWrite(DecisionsBase):
         self.assertEqual(self.path.read_text(), '{"an": "older daemon version"}')
         engine.discover = real
         self.assertTrue(sb.early_decisions(engine, real(self.world.clock.now())), "a stale file of another shape is replaced, not a crash")
-        self.assertEqual(sorted(self.file()), ["daemon_pid", "decisions", "errors", "generation", "written_at"])
+        self.assertEqual(sorted(self.file()), ["daemon_pid", "decisions", "errors", "generation", "provisional", "written_at"])   # the early write is provisional (#467 slice 3)
 
     def test_the_threshold_is_a_third_of_the_staleness_bound_and_a_file_just_under_it_is_left_alone(self):
         self.assertEqual(sb.EARLY_DECISIONS_AGE, sb.DECISIONS_STALE_SECONDS // 3)
