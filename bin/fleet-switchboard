@@ -25606,8 +25606,8 @@ def _decisions_for_ref(decisions, owner, repo, number):
     is, any when neither."""
     found = []
     for decision in decisions:
-        if decision.get("ask") != number:
-            continue
+        if decision.get("kind") != "issue" or decision.get("ask") != number:
+            continue   # only an ISSUE decision is named by its issue: a permission or a question that is about the issue has an id of its own
         full = str(decision.get("repo") or "").lower()
         short = full.rsplit("/", 1)[-1]
         if owner and full != "%s/%s" % (owner, repo):
@@ -25642,7 +25642,7 @@ def decision_miss_hint(decisions, ident):
     ref = _decision_ref(ident)
     if ref is None:
         return ""
-    same = sorted({str(d["id"]) for d in decisions if d.get("ask") == ref[2]})
+    same = sorted({str(d["id"]) for d in decisions if d.get("kind") == "issue" and d.get("ask") == ref[2]})
     return " (a decision numbered %d is listed as %s)" % (ref[2], ", ".join(same)) if same else ""
 
 
