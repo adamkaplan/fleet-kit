@@ -10457,7 +10457,8 @@ def publish_decisions(engine):
         engine._note("impact.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
     try:
         merged_labels = load_module("merged_labels")   # #559: the merge and hold labels of a merged PR come off (fresh read, fleet labels only)
-        merged_labels.run_pass(types.SimpleNamespace(**{n: globals()[n] for n in merged_labels.NEEDS}), engine, now, IMPACT_PASS_CALLS)
+        merged_labels.run_pass(types.SimpleNamespace(**{n: globals()[n] for n in merged_labels.NEEDS}), engine, now,
+                               ((engine.config.get("impact_hold") or {}).get("calls_per_pass") or IMPACT_PASS_CALLS))   # its own cap of gh reads, the impact hold's setting
     except Exception as err:
         engine._note("merged_labels.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
     apply_notice_effects(engine)
@@ -10852,7 +10853,7 @@ SWEEP_KINDS = {"S6a": "first-line marker without the merge-captain label (our PR
                "S5": "cos-tier decision aged (and not already in the owner's tier)",
                "S7": "decisions that wait for each other (a cycle): none of them can be done first",
                "S8": "a decision waits for an issue that is closed or missing",
-               "S9": "a merge or hold label left on a merged or closed PR"}
+               "S9": "a merge or hold label left on a closed, unmerged PR"}
 SWEEP_WAIT_VERBS = ("held for", "hold for", "waiting on", "waits on", "awaiting", "blocked on", "pending", "needs")
 
 
@@ -11249,7 +11250,7 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
                 and now - since >= cfg["aged_cos_hours"] * 3600
                 and not (sweep_ref_keys(d, home, repos_known) & human_keys)):   # already the owner's: not stale for cos
             found.add(("S5", d.get("id") or ref_text(*(ref or ("?", 0)))))
-    for repo, picture in state.repos.items():   # S9: a merge or hold label left on a merged or closed PR (read-only: nothing is removed)
+    for repo, picture in state.repos.items():   # S9: a merge or hold label left on a closed, unmerged PR (read-only: nothing is removed; a merged one is the daemon's to clean, #559)
         for number in sorted(picture.get("closed_holds") or {}):
             found.add(("S9", ref_text(repo, number)))
     for group in decision_core.find_cycles(decisions):   # S7: one finding per cycle, named by its first member
@@ -11289,7 +11290,7 @@ def sweep_verify(engine, state, kind, ref, now, cfg, regex, budget):
     if budget[0] < (2 if comments_raised else 1):
         return None
     budget[0] -= 1
-    if kind == "S9":   # still a PR, no longer open, and still carrying a merge or hold label
+    if kind == "S9":   # still a PR, no longer open, not merged, and still carrying a merge or hold label
         try:
             data = hub._read_one(repo, "issues/%d" % number, now, fresh=True)
         except GitHubUnavailable:

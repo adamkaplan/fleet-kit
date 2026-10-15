@@ -9,7 +9,7 @@ existing label write path, and writes ONE audit line (`merged.labels_removed`: t
 It fails closed: an event that says merged while the fresh read says open or closed (stale, forged or raced), a failed read, a repository the
 switchboard does not watch or excludes, or a pull request whose event carried no fleet label, removes nothing (and a repository that is not
 watched, or excluded, is never read). A failed read is audited once per pull request and tried again after a back-off. The reads are bounded
-by the pass limit of the impact hold (`calls`), each removal being one write. It lowers no guard: the pull request has already merged.
+by its own per-pass cap (`calls`: the impact hold's `calls_per_pass`, default `IMPACT_PASS_CALLS`; a budget of its own, spent after the impact hold's), each removal being one write. A merge whose event was missed (the daemon was down: the hub's events are memory only) is not cleaned, and the sweep no longer reports it. It lowers no guard: the pull request has already merged.
 
 The logic is here; `bin/fleet-switchboard` calls `run_pass` from the daemon's pass with a namespace `sb` of its own helpers (`NEEDS`).
 """
@@ -96,5 +96,7 @@ def run_pass(sb, engine, now, calls):
 
 def _done(memory, ref, now):
     memory["done"][ref] = now
+    memory["retry"].pop(ref, None)
+    memory["said"].discard(ref)
     while len(memory["done"]) > DONE_MAX:
         memory["done"].pop(min(memory["done"], key=memory["done"].get))

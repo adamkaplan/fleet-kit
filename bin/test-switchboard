@@ -22952,6 +22952,29 @@ class TestCaptainSweepFindings(TestSweep):
         self.sweep()
         self.assertEqual([f for f in self.found() if f[0] == "S9"], [])
 
+    def test_s9_a_merged_pr_is_no_finding_and_a_closed_unmerged_one_still_is(self):
+        captain = self.USER.replace("awaiting-user", "merge-captain")
+        hold = self.USER.replace("awaiting-user", "hold-impact")
+        merged = sweep_issue(90, "x", [captain, hold], pr=True)
+        merged["pull_request"] = {"url": "x", "merged_at": "2026-10-15T10:00:00Z"}   # the issues API says it was merged (#559)
+        unmerged = sweep_issue(91, "x", [hold], pr=True)
+        unmerged["pull_request"] = {"url": "x", "merged_at": None}                   # closed, never merged
+        self.hub.closed_records = {90: merged, 91: unmerged}
+        self.hub.closed = {90, 91}
+        self.sweep()
+        self.sweep()
+        self.assertEqual([f for f in self.found() if f[0] == "S9"], [("S9", "acme/api#91")], "1 finding: the closed unmerged pull request")
+
+    def test_s9_a_fresh_read_that_shows_the_pr_merged_drops_the_finding(self):
+        hold = self.USER.replace("awaiting-user", "hold-impact")
+        self.hub.closed_records = {92: sweep_issue(92, "x", [hold], pr=True)}   # the list copy does not say merged
+        self.hub.closed = {92}
+        merged = sweep_issue(92, "x", [hold], pr=True)
+        merged["pull_request"] = {"url": "x", "merged_at": "2026-10-15T10:00:00Z"}
+        self.hub.live = {92: merged}                                            # the fresh read does
+        self.sweep()
+        self.assertEqual([f for f in self.found() if f[0] == "S9"], [], "sweep_verify no longer holds for a merged pull request")
+
     def test_s6a_a_pr_opened_within_15_minutes_gets_the_label_first(self):
         fresh, early, later = (sb.iso(self.world.clock.now() - m * 60) for m in (4, 20, 120))
         self.hub.open = {50: sweep_issue(50, "MERGE: captain\nx", pr=True, author="bot", created=fresh),    # the 02:03-vs-02:07 shape
@@ -56288,6 +56311,30 @@ class TestMergedLabels(Base):
         self.go(entries, gh)
         self.assertGreater(len(gh.reads), sb.IMPACT_PASS_CALLS, "the rest are read on the next pass")
 
+    def test_a_failed_label_write_is_not_marked_done_audits_no_removal_and_is_retried(self):
+        gh = FakeMergedGh({30: self.view()})
+        entries = {"acme/api#30": self.merged_entry()}
+        with mock.patch.object(sb, "change_issue_labels", side_effect=sb.IntentError("gh", "HTTP 502")):
+            self.go(entries, gh)
+        self.assertEqual((self.audit("merged.labels_removed"), [e["event"] for e in self.world.audit() if e["event"] == "merged_labels.error"]), ([], ["merged_labels.error"]))
+        self.go(entries, gh)   # inside the back-off: nothing yet
+        self.assertEqual(gh.removed, [])
+        self.world.tick(sb.load_module("merged_labels").RETRY_SECONDS + 1)
+        self.go(entries, gh)
+        self.assertEqual(sorted(gh.removed), sorted(self.fleet), "retried after the back-off")
+        self.assertEqual(len(self.audit("merged.labels_removed")), 1)
+
+    def test_a_read_that_raises_is_audited_once_and_a_merged_pr_with_no_fleet_label_left_is_done(self):
+        gh = FakeMergedGh({31: RuntimeError("socket closed"), 32: self.view(labels=["bug"])})
+        entries = {"acme/api#31": self.merged_entry(), "acme/api#32": self.merged_entry()}
+        self.go(entries, gh)
+        self.assertEqual([e["subject"] for e in self.audit("merged.labels_read_failed")], ["acme/api#31"])
+        self.assertEqual(gh.removed, [], "nothing to remove on #32: its labels were taken off already")
+        self.assertEqual(len(self.audit("merged.labels_removed")), 0)
+        reads = len(gh.reads)
+        self.go(entries, gh)
+        self.assertEqual(len(gh.reads), reads, "#32 is done: not read again; #31 waits for its back-off")
+
     def test_the_daemons_pass_runs_it_and_a_failure_never_stops_the_pass(self):
         self.engine.hub = StubHub({"acme/api#13": self.merged_entry()})
         self.engine.gh_runner = FakeMergedGh({13: self.view()})
@@ -56297,12 +56344,12 @@ class TestMergedLabels(Base):
             sb.publish_decisions(self.engine)   # never raises
         self.assertTrue([e for e in self.world.audit() if e["event"] == "merged_labels.error"])
 
-    def test_s6_the_sweep_stops_reporting_a_merged_pull_request_and_still_reports_a_closed_unmerged_one(self):
-        merged = {"number": 20, "state": "closed", "pull_request": {"merged_at": "2026-10-15T10:00:00Z"}, "labels": [{"name": self.names["merge-captain"]}]}
-        unmerged = {"number": 21, "state": "closed", "pull_request": {"merged_at": None}, "labels": [{"name": self.names["hold-security"]}]}
-        self.assertTrue(sb._issue_pr_merged(merged))
-        self.assertFalse(sb._issue_pr_merged(unmerged))
-        self.assertEqual([n for n, r in ((20, merged), (21, unmerged)) if not sb._issue_pr_merged(r)], [21], "1 finding, the closed unmerged pull request")
+    def test_s6_the_sweep_side_is_driven_through_the_sweep_in_TestSweep(self):
+        """S6 is exercised through `sweep_read_repo` and `sweep_verify` by TestSweep.test_s9_a_merged_pr_is_no_finding_and_a_closed_unmerged_one_still_is
+        and test_s9_a_fresh_read_that_shows_the_pr_merged_drops_the_finding; here only the helper both paths share is pinned."""
+        self.assertTrue(sb._issue_pr_merged({"pull_request": {"merged_at": "2026-10-15T10:00:00Z"}}))
+        for record in ({"pull_request": {"merged_at": None}}, {"pull_request": {}}, {}, None, {"pull_request": "x"}):
+            self.assertFalse(sb._issue_pr_merged(record), record)
 
 
 if __name__ == "__main__":
