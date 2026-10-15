@@ -65,7 +65,7 @@ may name a loopback `http` address, for tests).
 refuses direct pushes (a `pull_request` or `merge_queue` rule), force-pushes (`non_fast_forward`) and deletion
 (`deletion`). Exit 0 prints `preflight ok: <rules>`; exit 1 names each missing rule; exit 2 means the answer could not
 be read. A branch protected only by classic branch protection fails closed (a read-only token cannot see its review
-requirement); `--accept-classic` is the explicit, owner-approved override and prints a warning. It cannot see bypass
+requirement); `--accept-classic` is the explicit, owner-approved override and prints a warning. It overrides only that one failure (the review requirement on a branch GitHub reports as protected), never an unreadable answer, an unprotected branch, or a missing `non_fast_forward` or `deletion` rule. Redirects are never followed, and `OWNER/REPO` may not contain a `.` or `..` segment. It cannot see bypass
 actors: the live refusal check on a disposable repository is the real proof.
 
 Settings (environment): `CW_APP_ID_CMD`, `CW_APP_KEY_CMD`, `CW_APP_INSTALLATION_CMD` (each a command printing the

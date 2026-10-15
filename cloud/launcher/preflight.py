@@ -12,7 +12,10 @@ The token comes from app_token.py, or from the command CW_PREFLIGHT_TOKEN_CMD wh
 PASS (exit 0, "preflight ok: <rule names>") only when the branch has a rule of type pull_request or merge_queue (a
 direct push is refused by the rule) AND non_fast_forward (no force-push) AND deletion.
 FAIL (exit 1), one line per missing rule, naming it. A branch protected only by classic branch protection also
-fails: a read-only token cannot see its review requirement. --accept-classic is the explicit, owner-approved override.
+fails: a read-only token cannot see its review requirement. --accept-classic is the explicit, owner-approved override,
+and it overrides ONLY that one failure (the pull_request/merge_queue rule missing, on a branch GitHub reports as
+protected). It never turns an unreadable answer (exit 2), an unprotected branch, or a missing non_fast_forward or
+deletion rule into a pass.
 Exit 2: the answer could not be read (HTTP error, bad JSON). Silence never passes.
 
 What this CANNOT see: bypass actors (who may skip a rule), and whether a rule is in force for this token's own
@@ -49,13 +52,13 @@ def get(base, path, token):
                                  headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
                                           "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "cw-preflight"})
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with app_token.open_url(req) as r:
             raw = r.read(app_token.MAX_BYTES + 1)
         if len(raw) > app_token.MAX_BYTES:
             raise Unreadable("the answer to GET %s is larger than %d bytes" % (path, app_token.MAX_BYTES))
         return json.loads(raw)
     except urllib.error.HTTPError as e:
-        raise Unreadable("GitHub refused GET %s (HTTP %d)" % (path, e.code))
+        raise Unreadable("GET %s: %s" % (path, app_token.http_error_text(e.code)))
     except (OSError, ValueError):
         raise Unreadable("GET %s failed or its answer was not JSON" % path)
 
@@ -87,8 +90,9 @@ def main(argv):
             return 2
         branch = argv[i + 1]
         del argv[i:i + 2]
-    if len(argv) != 1 or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", argv[0]) \
-            or (branch is not None and not re.fullmatch(r"[A-Za-z0-9_./-]+", branch)):
+    if len(argv) != 1 or not app_token.valid_target(argv[0]) \
+            or (branch is not None and (not re.fullmatch(r"[A-Za-z0-9_./-]+", branch)
+                                  or ".." in branch.split("/"))):
         say("usage: preflight.py OWNER/REPO [--branch NAME] [--accept-classic]")
         return 2
     target = argv[0]
@@ -121,10 +125,11 @@ def main(argv):
         return 0
     for m in missing:
         say("FAIL on %s: missing %s" % (branch, m))
+    only_review = len(missing) == 1 and missing[0] == NEED[0][1]
     if info.get("protected") is True:
         say("classic protection: review requirement not readable with this token; use a ruleset or confirm by hand "
             "and pass --accept-classic")
-        if accept:
+        if accept and only_review:
             say("WARNING: --accept-classic: NOT verified, owner-approved override of classic protection on %s" % branch)
             return 0
     return 1

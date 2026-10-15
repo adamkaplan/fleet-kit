@@ -19,6 +19,7 @@ FULL = ["pull_request", "non_fast_forward", "deletion"]
 class Stub(http.server.BaseHTTPRequestHandler):
     rules = []
     protected = False
+    redirect = None  # a Location to answer every GET with, as a 302
     fail = None  # a path suffix that answers 500, or "badjson"
     methods = []
 
@@ -34,6 +35,12 @@ class Stub(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         Stub.methods.append("GET")
+        if Stub.redirect:
+            self.send_response(302)
+            self.send_header("Location", Stub.redirect)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         path = urlparse(self.path).path
         if Stub.fail == "badjson":
             return self.reply(200, b"<html>")
@@ -56,19 +63,37 @@ class Stub(http.server.BaseHTTPRequestHandler):
     do_PUT = do_PATCH = do_DELETE = do_POST
 
 
+class Other(http.server.BaseHTTPRequestHandler):
+    seen = []  # any request that reached the second port
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        Other.seen.append((self.path, self.headers.get("Authorization")))
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+
+
 class Preflight(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.srv = http.server.HTTPServer(("127.0.0.1", 0), Stub)
         threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
         cls.base = "http://127.0.0.1:%d" % cls.srv.server_port
+        cls.other = http.server.HTTPServer(("127.0.0.1", 0), Other)
+        threading.Thread(target=cls.other.serve_forever, daemon=True).start()
 
     @classmethod
     def tearDownClass(cls):
         cls.srv.shutdown()
+        cls.other.shutdown()
 
     def setUp(self):
-        Stub.rules, Stub.protected, Stub.fail, Stub.methods = list(FULL), False, None, []
+        Stub.rules, Stub.protected, Stub.fail, Stub.methods, Stub.redirect = list(FULL), False, None, [], None
+        Other.seen = []
 
     def run_pf(self, *args, **env):
         e = dict(os.environ, CW_GITHUB_API_BASE=self.base, CW_PREFLIGHT_TOKEN_CMD="echo " + TOKEN)
@@ -99,7 +124,7 @@ class Preflight(unittest.TestCase):
             self.assertNotIn("preflight ok", p.stdout)
 
     def test_classic_only_fails_closed_unless_accepted(self):
-        Stub.rules, Stub.protected = [], True
+        Stub.rules, Stub.protected = ["non_fast_forward", "deletion"], True
         p = self.run_pf()
         self.assertEqual(p.returncode, 1)
         self.assertIn("classic protection: review requirement not readable with this token", p.stdout)
@@ -108,9 +133,31 @@ class Preflight(unittest.TestCase):
         self.assertEqual(q.returncode, 0)
         self.assertIn("WARNING: --accept-classic", q.stdout)
 
-    def test_accept_classic_does_not_rescue_an_unprotected_branch(self):
-        Stub.rules, Stub.protected = [], False
-        self.assertEqual(self.run_pf("--accept-classic").returncode, 1)
+    def test_accept_classic_overrides_only_the_review_requirement(self):
+        for rules, protected in (([], False), (["non_fast_forward", "deletion"], False), ([], True),
+                                 (["pull_request", "deletion"], True), (["pull_request", "non_fast_forward"], True)):
+            Stub.rules, Stub.protected = rules, protected
+            p = self.run_pf("--accept-classic")
+            self.assertEqual(p.returncode, 1, (rules, protected))
+            self.assertNotIn("WARNING", p.stdout)
+        for fail in ("/branches/main", "/rules/branches/main", "badjson"):
+            Stub.rules, Stub.protected, Stub.fail = ["non_fast_forward", "deletion"], True, fail
+            self.assertEqual(self.run_pf("--accept-classic").returncode, 2, fail)
+
+    def test_a_redirect_is_never_followed_and_sends_nothing_elsewhere(self):
+        Stub.redirect = "http://127.0.0.1:%d/leak" % self.other.server_port
+        p = self.run_pf()
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("redirect", p.stdout)
+        self.assertEqual(Other.seen, [])
+        Stub.redirect = None
+
+    def test_bad_targets_are_refused(self):
+        for bad in ("a/..", "../b", ".", "a/b/c", "a/", "/b", "a/./b"):
+            p = subprocess.run([sys.executable, PREFLIGHT, bad], capture_output=True, text=True,
+                               env=dict(os.environ, CW_PREFLIGHT_TOKEN_CMD="echo " + TOKEN))
+            self.assertEqual(p.returncode, 2, bad)
+        self.assertEqual(self.run_pf("--branch", "a/../b").returncode, 2)
 
     def test_unreadable_answers_exit_2(self):
         for fail in ("badjson", "/rules/branches/main", "/branches/main", "widget-service"):

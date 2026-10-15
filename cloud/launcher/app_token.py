@@ -32,6 +32,28 @@ MAX_BYTES = 1_000_000  # the most of any GitHub answer or vault command output t
 EXPECTED_PERMISSIONS = {"contents": "write", "pull_requests": "write", "metadata": "read"}
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None  # a redirect would re-send Authorization to another host: it is refused, as an HTTP error
+
+
+def open_url(req, timeout=30):
+    """urlopen that never follows a redirect."""
+    return urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout)
+
+
+def valid_target(t):
+    """OWNER/REPO: two segments of [A-Za-z0-9_.-], neither '.' nor '..'."""
+    parts = t.split("/")
+    return len(parts) == 2 and all(re.fullmatch(r"[A-Za-z0-9_.-]+", x) and x not in (".", "..") for x in parts)
+
+
+def http_error_text(code):
+    if 300 <= code < 400:
+        return "refusing: GitHub answered with a redirect (HTTP %d); redirects are never followed" % code
+    return "GitHub refused the request (HTTP %d)" % code
+
+
 def die(msg, code=1):
     print("app-token: " + msg, file=sys.stderr)
     sys.exit(code)
@@ -132,13 +154,13 @@ def mint(target):
                                           "Content-Type": "application/json", "X-GitHub-Api-Version": "2022-11-28",
                                           "User-Agent": "cw-app-token"})
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with open_url(req) as r:
             raw = r.read(MAX_BYTES + 1)
         if len(raw) > MAX_BYTES:
             die("the GitHub answer is larger than %d bytes" % MAX_BYTES)
         ans = json.loads(raw)
     except urllib.error.HTTPError as e:
-        die("GitHub refused the request (HTTP %d)" % e.code)
+        die(http_error_text(e.code))
     except (OSError, ValueError):
         die("the GitHub request failed or its answer was not JSON")
     token = ans.get("token") if isinstance(ans, dict) else None
@@ -161,7 +183,7 @@ def mint(target):
 
 
 def main(argv):
-    if len(argv) != 1 or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", argv[0]):
+    if len(argv) != 1 or not valid_target(argv[0]):
         die("usage: app_token.py OWNER/REPO", 2)
     sys.stdout.write(mint(argv[0]))
     sys.stdout.flush()
