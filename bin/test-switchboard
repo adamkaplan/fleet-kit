@@ -29303,6 +29303,38 @@ class TestCommissioningDocs(unittest.TestCase):
             self.assertIn(phrase, text, phrase)
         self.assertEqual(len(re.findall(r"^## STEP \d", text, re.M)), 4)
 
+    def lanes_section(self):
+        text = self.SKILL.read_text()
+        start = text.index("## Splitting a project into lanes")
+        return text[start:]
+
+    def test_s5_the_lanes_section_has_each_element_the_ask_names(self):
+        section = self.lanes_section()
+        elements = ("### Lane step 1 \u2014 The workspace and the orchestrator", "### Lane step 2 \u2014 The charter",
+                    "### Lane step 3 \u2014 The labels", "### Lane step 4 \u2014 The standing orders, copied",
+                    "### Lane step 5 \u2014 Coders finishing under their old boss")
+        self.assertEqual(sum(1 for e in elements if e in section), 5, "5 of 5 named elements")
+        self.assertEqual(len(re.findall(r"^## Splitting a project into lanes$", self.SKILL.read_text(), re.M)), 1)
+        self.assertEqual(len(re.findall(r"^## STEP \d", self.SKILL.read_text(), re.M)), 4, "the four commissioning steps are unchanged")
+
+    def test_s14_the_orders_step_copies_word_for_word_and_grants_nothing(self):
+        section = self.lanes_section()
+        step = section[section.index("### Lane step 4"):section.index("### Lane step 5")]
+        self.assertIn("fleet-switchboard orders copy --source <old charter> --charter <new charter>", step, "the copy step names the source")
+        self.assertIn("word for word", step)
+        self.assertIn("never add one the sibling does not hold", step.replace("\n         ", " "))
+        for pattern in (r"\bgrant", r"\bauthori[sz]", r"\bmay (merge|approve|deploy|decide)", r"\bpermission", r"\bis allowed to"):
+            self.assertIsNone(re.search(pattern, section, re.I), "0 sentences grant an authority: %s" % pattern)
+
+    def test_s18_the_checkpoint_form_is_what_launch_parses_and_the_handover_template_has_six_sections(self):
+        section = self.lanes_section()
+        lines = [l.strip() for l in section.splitlines() if l.strip().startswith("CHECKPOINT:")]
+        self.assertEqual(len(lines), 1, "1 checkpoint example")
+        self.assertEqual(sb.parse_checkpoint(lines[0]), (1800, 3600), "the launch parser accepts it")
+        template = section[section.index("A handover note has these six sections"):]
+        headings = re.findall(r"^\s+## (.+)$", template, re.M)
+        self.assertEqual(headings, list(sb.load_module("lanes").HANDOVER_SECTIONS), "6 of 6 sections, the ones `move` writes")
+
     def test_the_chief_of_staff_loads_it_and_never_creates_a_repo(self):
         for path in AGENT_FILES:
             if role_of(path) != "chief-of-staff":
