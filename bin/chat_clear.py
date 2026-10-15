@@ -162,8 +162,14 @@ def write_offers(state_dir, offers):
         raise
 
 
+SECRET_SHAPES = re.compile(r"(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|sk-[A-Za-z0-9_-]{16,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{12,}"
+                           r"|(?i:bearer)\s+[A-Za-z0-9._~+/=-]{16,}|\b[A-Fa-f0-9]{40,}\b|\b[A-Za-z0-9+/]{40,}={0,2}(?![A-Za-z0-9+/=]))")
+
+
 def _clean(text, limit):
-    return " ".join(CONTROL.sub(" ", str(text or "")).split())[:limit].encode("utf-8", "replace").decode("utf-8")   # a lone surrogate cannot be written: it becomes ?
+    """One line, control characters out, anything shaped like a token or key replaced by `[secret]`, at most `limit` characters (and always writable text)."""
+    text = SECRET_SHAPES.sub("[secret]", " ".join(CONTROL.sub(" ", str(text or "")).split()))
+    return text[:limit].encode("utf-8", "replace").decode("utf-8")   # a lone surrogate cannot be written: it becomes ?
 
 
 def _quarantine(state_dir, now):
@@ -345,6 +351,18 @@ def timing_problem(offer, created, now):
     return None
 
 
+PLAIN_WORDS = frozenset(("a also ahead approve approved are be clear cleared fine go goes going good i is it lgtm let looks merge merged ok okay pr please ready release released s "
+                         "ship shipped thank thanks the through to was you now for with then").split())
+LETTERS = re.compile(r"[^\W\d_]+", re.UNICODE)
+
+
+def _plain_clearing(text):
+    """True only when every WORD of the message (the number and punctuation aside) is in a short allow-list of plain clearing words: "366 is good to go", "389 also good
+    to go", "ok to merge #366, thanks". Anything else (a negation, a condition, an exception, a time, an apostrophe form such as "isn't" or "isn\u2019t", a word nobody
+    listed) is not a plain clearing sentence, whatever a judge would say: the deterministic floor is an allow-list, not a list of hedges."""
+    return all(word.lower() in PLAIN_WORDS for word in LETTERS.findall(text))
+
+
 HEDGE = re.compile(r"\?|\b(?:not|no|never|don'?t|doesn'?t|isn'?t|aren'?t|won'?t|can'?t|cannot|wait|hold|stop|once|after|until|unless|if|when|before|but|maybe|probably|should|would|could)\b|n't\b", re.IGNORECASE)
 
 
@@ -360,8 +378,9 @@ def screen(text, offers, created, now):
     * `unclear_number`: its one number sits inside a word or a decimal (`abc366`, `3.66`);
     * `not_offered`: the number is not one of the offers;
     * `ambiguous_number`: more than one offer has that number (the same number in two repositories);
-    * `hedged`: the message asks, negates or conditions ("is 366 good to go?", "366 is not good to go", "366 is good to go once CI passes"): a clear is
-      never inferred from words like that, whatever a judge would say. The list is deliberately broad: a missed clear is one more sentence from the owner;
+    * `hedged`: the message is not a plain clearing sentence: it asks, negates, conditions or says anything outside a short allow-list of clearing words
+      ("is 366 good to go?", "366 is not good to go", "366 isn\u2019t good to go", "366 is good to go once CI passes", "366 is good to go except the docs"): a clear is never
+      inferred from words like that, whatever a judge would say. A missed clear is one more sentence from the owner;
     * `no_time`, `before_offer`, `expired`: see `timing_problem` (`created` is the message's time, `now` the clock)."""
     text = text if isinstance(text, str) else ""
     prs = sorted(offers or {})
@@ -376,7 +395,7 @@ def screen(text, offers, created, now):
         return {"verdict": "question", "why": "several_numbers", "prs": prs}
     if not _standalone(text, numbers[0]):
         return {"verdict": "question", "why": "unclear_number", "prs": prs}
-    if HEDGE.search(text):
+    if HEDGE.search(text) or not _plain_clearing(text):
         return {"verdict": "question", "why": "hedged", "prs": prs}
     matches = [pr for pr in prs if int(pr.rsplit("#", 1)[1]) == numbers[0]]
     if not matches:
@@ -431,7 +450,8 @@ def judge_request(text, offers):
 def judge(jev, text, offers, min_confidence=HIGH_CONFIDENCE):
     """One Jev call. {"choice", "confident", "probabilities", "reason", "jev_choice", ...}; NEVER raises. No judge, an unreachable or erring one, an answer with no
     probabilities and an answer below the bar all give `choice` None and `confident` False: they confirm nothing."""
-    bar = max(float(min_confidence), HIGH_CONFIDENCE)
+    bar = min_confidence if isinstance(min_confidence, (int, float)) and not isinstance(min_confidence, bool) and min_confidence == min_confidence \
+        and min_confidence <= 1 and min_confidence > HIGH_CONFIDENCE else HIGH_CONFIDENCE   # a bad, NaN or lower bar is the floor: the bar can only be raised
     out = {"choice": None, "confident": False, "probabilities": None, "reason": "", "jev_choice": None, "model": None, "usage": {}, "latency_ms": None}
     if jev is None:
         out["reason"] = "no judge is configured"
@@ -441,7 +461,7 @@ def judge(jev, text, offers, min_confidence=HIGH_CONFIDENCE):
         result = jev.decide(state, questions)
         answer = result["answers"][JUDGE_ID]
     except Exception as err:   # JevError (unreachable, timeout, bad answer, ...): its reason is the only thing kept, never its text
-        out["reason"] = "jev %s" % getattr(err, "reason", type(err).__name__)
+        out["reason"] = "jev %s" % re.sub(r"[^a-z_ ]", "", str(getattr(err, "reason", type(err).__name__)).lower())[:40]
         out["latency_ms"] = getattr(err, "latency_ms", None)
         return out
     if not isinstance(answer, dict):
@@ -453,9 +473,14 @@ def judge(jev, text, offers, min_confidence=HIGH_CONFIDENCE):
     if not isinstance(probabilities, dict) or not probabilities:
         out["reason"] = "jev gave no probabilities"
         return out
-    top = probabilities.get(answer.get("choice"), 0.0) if isinstance(answer.get("choice"), str) else 0.0
-    if not isinstance(top, (int, float)) or top < bar:
-        out["reason"] = "unsure: %s at %s is below %.2f" % (answer.get("choice"), top, bar)
+    choice = answer.get("choice")
+    top = probabilities.get(choice, 0.0) if isinstance(choice, str) and choice in questions[JUDGE_ID]["criteria"] else None
+    numbers = [v for v in probabilities.values() if isinstance(v, (int, float)) and not isinstance(v, bool) and v == v]
+    if top is None or isinstance(top, bool) or not isinstance(top, (int, float)) or top != top or top > 1 or len(numbers) != len(probabilities) or top < max(numbers):
+        out["reason"] = "jev gave an unreadable answer"   # the choice is not an option, or is not the most probable one, or a probability is not a number in 0..1
+        return out
+    if top < bar or sum(1 for v in numbers if v == top) > 1:
+        out["reason"] = "unsure: %s at %s is below %.2f or tied" % (_clean(choice, 40), top, bar)
         return out
     out.update(choice=answer["choice"], confident=True, reason="confident: %s at %.2f" % (answer["choice"], top))
     return out
@@ -464,7 +489,7 @@ def judge(jev, text, offers, min_confidence=HIGH_CONFIDENCE):
 QUESTION_OFFERS_MAX = 10
 REASONS = {"no_number": "your message names no pull request number", "several_numbers": "your message names more than one pull request",
            "not_offered": "that number is not one of the held pull requests", "ambiguous_number": "that number is held in more than one repository",
-           "hedged": "your message asks, negates or sets a condition",
+           "hedged": "your message is not a plain clearing sentence (it asks, negates, sets a condition or says something else)",
            "too_long": "your message is too long to read a pull request number from", "unclear_number": "the number in your message sits inside a word",
            "no_time": "the time of your message or of the offer could not be read", "before_offer": "your message was written before you were shown that pull request",
            "expired": "that offer is old and must be shown to you again first", "jev": "I could not be sure you meant to clear it"}
@@ -490,7 +515,7 @@ def question_text(why, offers, prs=None, current_heads=None):
     return "\n".join(lines)
 
 
-CLEARISH = re.compile(r"\b(?:good to go|ok(?:ay)? to (?:go|merge|ship)|go(?:es)? ahead|cleared?|clearing|approved?|approving|lgtm|ship it|merge it|release[ds]?|unhold|let it (?:go|through)|fine to (?:go|merge)|ready to (?:go|merge|ship))\b", re.IGNORECASE)
+CLEARISH = re.compile(r"\b(?:good to go|ok(?:ay)? to (?:go|merge|ship)|go(?:es)? ahead|clear(?:ed|ing)?|approved?|approving|lgtm|ship(?:ped)?|merge(?:d)?|release[ds]?|unhold|let it (?:go|through)|fine to (?:go|merge)|ready to (?:go|merge|ship))\b", re.IGNORECASE)
 
 
 def decide(jev, text, offers, created, now, min_confidence=HIGH_CONFIDENCE):

@@ -11514,7 +11514,7 @@ class TestChatClearOffers(unittest.TestCase):
         self.assertEqual(len(got["offers"]), self.cc.OFFERS_MAX)
         self.assertTrue(got["capped"])
         self.assertIn("acme/widget#7", got["offers"], "an offer that already existed is kept before a new one is taken")
-        long = self.cc.refresh_offers(self.state, [self.hold(1, ["u:hold-impact"], summary="x\x1b[31m" + "y" * 500 + "\n")], self.NAMES, 1006)["offers"]["acme/widget#1"]["summary"]
+        long = self.cc.refresh_offers(self.state, [self.hold(1, ["u:hold-impact"], summary="x\x1b[31m" + "ab " * 200 + "\n")], self.NAMES, 1006)["offers"]["acme/widget#1"]["summary"]
         self.assertEqual(len(long), self.cc.SUMMARY_MAX)
         self.assertNotIn("\x1b", long)
 
@@ -11748,8 +11748,65 @@ class TestChatClearJudge(unittest.TestCase):
         self.assertEqual((got["action"], got["why"]), ("ask", "too_long"))
         self.assertEqual(self.decide("366 is good to go", jev)["action"], "clear", "the same message, in time, clears")
 
+    def test_the_floor_is_an_allow_list_curly_apostrophes_exceptions_and_times_are_never_a_plain_clearing_sentence(self):
+        jev = _StubJev({self.P366: 0.99})
+        for text in ("366 isn\u2019t good to go", "366 isn't good to go", "366 don\u2019t clear", "366 won\u2019t be ready, but good to go", "366 is good to go except the docs",
+                     "366 is not yet good to go", "366 is good to go only after review", "366 is good to go without the tests", "366 is pending, good to go later",
+                     "366 is good to go tomorrow", "366 first then good to go", "366 is almost good to go", "366 is good to go soon", "366 is good to go while CI runs",
+                     "366 is still good to go", "366 good to go lol", "please do not clear 366 good to go", "366 is good to go \u2014 wait", "366 is good to go\nand 5 more words"):
+            got = self.decide(text, jev)
+            self.assertEqual((got["action"], got["why"]), ("ask", "hedged" if "\n" not in text else "several_numbers"), text)
+        self.assertEqual(self.decide("nope, 366", jev)["action"], "none", "a refusal with no clearing words in it is not about clearing: nothing is asked, nothing cleared")
+        for text in ("366 is good to go", "366 is good to go.", "#366 is good to go", "366 good to go", "ok to merge 366, thanks", "366 looks good, go ahead", "Please ship 366", "366 is cleared"):
+            self.assertEqual(self.decide(text, jev)["action"], "clear", text)
+
+    def test_a_bad_nan_boolean_or_lower_bar_is_the_floor_and_the_bar_can_only_be_raised(self):
+        for bar in (None, "x", [], float("nan"), True, 2, -1, 0, 0.1, 0.9, float("inf")):
+            jev = _StubJev({self.P366: 0.85, "asks": 0.15})
+            self.assertEqual(self.decide("366 is good to go", jev, min_confidence=bar)["action"], "ask", repr(bar))
+            self.assertEqual(self.decide("366 is good to go", _StubJev({self.P366: 0.95, "asks": 0.05}), min_confidence=bar)["action"], "clear", repr(bar))
+        self.assertEqual(self.decide("366 is good to go", _StubJev({self.P366: 0.95, "asks": 0.05}), min_confidence=0.97)["action"], "ask")
+
+    def test_an_answer_whose_choice_is_not_an_option_not_the_most_probable_tied_or_not_numbers_confirms_nothing(self):
+        for junk in ({"type": "choice", "choice": "acme/widget#999", "probabilities": {"acme/widget#999": 0.99}},
+                     {"type": "choice", "choice": self.P366, "probabilities": {self.P366: 0.95, self.P389: 0.97}},
+                     {"type": "choice", "choice": self.P366, "probabilities": {self.P366: 0.95, self.P389: 0.95}},
+                     {"type": "choice", "choice": self.P366, "probabilities": {self.P366: True}},
+                     {"type": "choice", "choice": self.P366, "probabilities": {self.P366: 1.5}},
+                     {"type": "choice", "choice": self.P366, "probabilities": {self.P366: 0.95, "x": "y"}},
+                     {"type": "choice", "choice": self.P366, "probabilities": {self.P366: float("nan")}},
+                     {"type": "choice", "choice": ["list"], "probabilities": {self.P366: 0.95}}, {"type": "choice", "choice": None, "probabilities": {}}):
+            got = self.decide("366 is good to go", _StubJev(junk=junk))
+            self.assertEqual((got["action"], got["why"]), ("ask", "jev"), junk)
+            self.assertFalse(got["judge"]["confident"], junk)
+
+    def test_every_reason_screen_can_give_has_a_sentence_and_nothing_that_looks_like_a_secret_reaches_the_judge_or_the_question(self):
+        reasons = set()
+        offers = dict(self.offers)
+        twice = {self.P366: self.offers[self.P366], "acme/other#366": dict(self.offers[self.P366])}
+        for text, o, created, now in (("x", offers, 1001, 1002), ("366 and 389", offers, 1001, 1002), ("500 good to go", offers, 1001, 1002), ("abc366 good to go", offers, 1001, 1002),
+                                      ("366 is not good", offers, 1001, 1002), ("9" * self.cc.TEXT_MAX, offers, 1001, 1002), ("366 good to go", twice, 1001, 1002),
+                                      ("366 good to go", offers, 1000, 1002), ("366 good to go", offers, 1001, 1000 + self.cc.OFFER_TTL + 5), ("366 good to go", offers, None, 1002)):
+            reasons.add(self.cc.screen(text, o, created, now)["why"])
+        reasons.discard(None)
+        self.assertEqual(reasons - set(self.cc.REASONS), set(), "a reason without a sentence would reach the owner as a raw code")
+        token = "ghp_" + "A1b2C3d4" * 4
+        secret_offers = {self.P366: dict(self.offers[self.P366], summary="touches %s and Bearer abcdefghijklmnop0123456789 and %s" % (token, "f" * 40))}
+        jev = _StubJev({self.P366: 0.99})
+        got = self.decide("366 is good to go", jev, offers=secret_offers)
+        self.assertEqual(got["action"], "clear")
+        self.assertNotIn(token, json.dumps(jev.calls) + json.dumps(got["judge"]))
+        self.assertNotIn("f" * 40, json.dumps(jev.calls))
+        self.assertIn("[secret]", json.dumps(jev.calls))
+        asked = self.decide("366 is good to go once %s" % token, _StubJev({self.P366: 0.99}), offers=secret_offers)
+        self.assertEqual(asked["action"], "ask")
+        self.assertNotIn(token, asked["question"])
+        self.assertNotIn("abcdefghijklmnop0123456789", asked["question"])
+
     def test_all_impacts_cleared_asks_once_and_names_all_three_holds(self):
-        got = self.decide("all impacts cleared", _StubJev({"several": 0.95}))
+        jev = _StubJev({"several": 0.95})
+        got = self.decide("all impacts cleared", jev)
+        self.assertEqual(len(jev.calls), 1, "one judge call, one question")
         self.assertEqual((got["action"], got["why"]), ("ask", "no_number"))
         for pr in (self.P366, self.P389, self.P400):
             self.assertIn(pr, got["question"])
@@ -11760,7 +11817,7 @@ class TestChatClearJudge(unittest.TestCase):
         class Down(Exception):
             reason = "unreachable"
         for jev, fragment in ((_StubJev(error=Down("secret-token-in-text")), "jev unreachable"), (_StubJev({self.P366: 0.60, self.P389: 0.40}), "unsure"),
-                              (_StubJev(junk={"type": "choice", "choice": "x"}), "no probabilities"), (_StubJev(junk="junk"), "jev"), (None, "no judge")):
+                              (_StubJev(junk={"type": "choice", "choice": "x"}), "no probabilities"), (_StubJev(junk="junk"), "unreadable"), (None, "no judge")):
             got = self.decide("366 is good to go", jev)
             self.assertEqual((got["action"], got["why"]), ("ask", "jev"), fragment)
             self.assertIn(fragment, got["judge"]["reason"])
