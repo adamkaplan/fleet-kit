@@ -50906,6 +50906,214 @@ class TestDecisionIdForms(WriteWorld):
         self.assertEqual(self.gh.names(API, 5), ["me:awaiting-cos"])
 
 
+class LaneGH(FakeGH):
+    """The fake GitHub for `move`: issue ids, the one sub-issue write (`replace_parent`), timelines and pulls."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.writes, self.fail_write, self.timeline, self.pulls = [], False, {}, {}
+
+    def record(self, number):
+        found = super().record(number)
+        found["id"] = 1000 + number
+        found["labels"] = [{"name": n} for n in self.issues[number].get("labels", [])]
+        return found
+
+    def serve(self, argv, kwargs):
+        path = argv[2] if len(argv) > 2 else ""
+        write = re.match(r"^%s(\d+)/sub_issues$" % re.escape(self.api), path)
+        if write and "--method" in argv:
+            self.calls.append(argv)
+            body = json.loads(kwargs["input"])
+            self.writes.append((int(write.group(1)), body))
+            if self.fail_write:
+                return subprocess.CompletedProcess(argv, 1, "", "gh: Validation Failed (HTTP 422)\n")
+            child = int(body["sub_issue_id"]) - 1000
+            if body.get("replace_parent") is not True:
+                return subprocess.CompletedProcess(argv, 1, "", "gh: already has a parent (HTTP 422)\n")
+            self.issues[child]["parent"] = int(write.group(1))
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self.record(int(write.group(1)))), "")
+        line = re.match(r"^%s(\d+)/timeline\?per_page=100$" % re.escape(self.api), path)
+        if line:
+            self.calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self.timeline.get(int(line.group(1)), [])), "")
+        pull = re.match(r"^repos/%s/pulls/(\d+)$" % re.escape(self.repo), path)
+        if pull:
+            self.calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self.pulls[int(pull.group(1))]), "")
+        return super().serve(argv, kwargs)
+
+
+class LanesCase(IntentCase):
+    """Charter 1 (orch-a) holds asks 2, 4, 5, 6; charter 10 belongs to orch-b. Ask 2 has a worker, a pull request and reminders."""
+
+    ISSUES = {
+        "1": {"intent": None}, "10": {"intent": None},
+        "2": {"intent": "Fix the agents", "done_when": "both answer", "parent": 1, "labels": ["me:awaiting-cos"]},
+        "3": {"intent": "Fix the second one", "parent": 2},
+        "4": {"intent": "Second ask", "done_when": "d4", "parent": 1},
+        "5": {"intent": "Another ask", "done_when": "d5", "parent": 1},
+        "6": {"intent": "Fourth ask", "done_when": "d6", "parent": 1},
+        "7": {"intent": "Done ask", "parent": 1, "state": "closed"},
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": FAKE_REPO})
+        self.gh = LaneGH(self.ISSUES, {1, 10}, self.world.clock)
+        self.gh.bodies = {}
+        self.gh.timeline = {2: [{"event": "cross-referenced", "source": {"issue": {"number": 40, "state": "open", "pull_request": {"url": "https://example.test/pull"}}}},
+                                {"event": "cross-referenced", "source": {"issue": {"number": 41, "state": "closed", "pull_request": {"url": "https://example.test/pull"}}}}]}
+        self.gh.pulls = {40: {"head": {"sha": "a" * 40, "ref": "switchboard/widget-fix"}, "title": "Fix widget"}}
+        self.world.add_agent("chief-of-staff", fleet={"role": "chief-of-staff"})
+        self.world.add_agent("orch-a", fleet={"role": "orchestrator", "charter": 1})
+        self.world.add_agent("orch-b", fleet={"role": "orchestrator", "charter": 10})
+        self.world.add_agent("worker", fleet={"role": "coder", "issue": 3, "reports_to": "orch-a"})
+        for when, text in ((100, "check CI on the widget"), (200, "ping the reviewer")):
+            sb.add_reminder(self.world.state, "orch-a", EPOCH + when, EPOCH, text, 2, "orch-a", FAKE_REPO)
+        sb.add_reminder(self.world.state, "orch-a", EPOCH + 300, EPOCH, "another ask's reminder", 4, "orch-a", FAKE_REPO)
+
+    def main(self, *argv):
+        def route(argv, **kwargs):
+            return self.gh(argv, **kwargs) if argv[0] == FAKE_GH else self.world.route(argv, **kwargs)
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=route, now=self.world.clock.now, wait=lambda sock, s: False,
+                           socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def as_agent(self, name):
+        os.environ["HERDR_PANE_ID"] = self.world.panes[name]
+
+    def parents(self, number=2):
+        return [n for n in self.gh.issues if n in (1, 10) and self.gh.issues[number].get("parent") == n]
+
+
+class TestMoveAnAsk(LanesCase):
+    def setUp(self):
+        super().setUp()
+        self.as_agent("chief-of-staff")
+        self.before = self.gh.body(2)
+
+    def test_s1_the_ask_changes_parent_and_nothing_else(self):
+        code, out, err = self.main("move", "2", "--to", "10")
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(self.parents(), [10], "1 parent link, on charter 10")
+        self.assertEqual(self.gh.writes, [(10, {"sub_issue_id": 1002, "replace_parent": True})], "one write, the parent link")
+        self.assertEqual(getattr(self.gh, "patches", []), [], "0 edits to the ask's body")
+        self.assertEqual(self.gh.body(2), self.before)
+        self.assertEqual(self.gh.issues[2]["intent"], "Fix the agents")
+        self.assertIn("moved ask #2 from charter #1 to charter #10", out)
+
+    def test_s2_routing_follows_and_each_orchestrator_gets_one_notice(self):
+        self.world.engine.intents = None
+        reader = sb.IntentReader(FAKE_GH, FAKE_REPO, self.gh, self.world.clock.now, 5)
+        self.assertEqual(reader.parent(2), 1)
+        code, out, err = self.main("move", "2", "--to", "10")
+        self.assertEqual(code, 0, err)
+        reader.invalidate(2)   # what the sub-issue webhook does in the daemon
+        self.assertEqual(reader.parent(2), 10)
+        self.assertEqual((len(self.world.admissions("orch-a")), len(self.world.admissions("orch-b"))), (1, 1))
+        self.assertEqual(self.world.admissions("worker"), [])
+
+    def test_s17_the_handover_note_has_six_sections_and_is_sent_once(self):
+        self.main("move", "2", "--to", "10")
+        (note,) = [a["text"] for a in self.world.admissions("orch-b")]
+        for heading in ("State", "Pull requests and heads", "Branches", "Workers", "Waits", "Reminders"):
+            self.assertIn("## %s" % heading, note)
+        self.assertIn("#40 at %s" % ("a" * 40), note)
+        self.assertNotIn("#41", note, "a closed pull request is not handed over")
+        self.assertIn("switchboard/widget-fix", note)
+        self.assertIn("worker (reports to orch-a)", note)
+        self.assertIn("label: me:awaiting-cos", note)
+
+    def test_s12_workers_keep_their_boss_and_the_old_notice_names_them(self):
+        self.main("move", "2", "--to", "10")
+        sid = self.world.sessions["worker"]
+        fleet = self.world.v2.sessions[sid]["metadata"]["fleet"] if "metadata" in self.world.v2.sessions[sid] else None
+        if fleet is not None:
+            self.assertEqual(fleet["reports_to"], "orch-a")
+        (notice,) = [a["text"] for a in self.world.admissions("orch-a")]
+        self.assertIn("worker", notice)
+        self.assertIn("boss is unchanged", notice)
+
+    def test_s15_the_remaining_asks_of_the_old_charter_are_listed(self):
+        code, out, _ = self.main("move", "2", "--to", "10")
+        self.assertIn("charter #1 still holds 3 open ask(s)", out)
+        for number in (4, 5, 6):
+            self.assertIn("  #%d  " % number, out)
+        self.assertNotIn("  #2  ", out)
+        self.assertNotIn("  #7  ", out, "a closed ask is not listed")
+
+    def test_s16_the_old_orchestrators_reminders_on_the_ask_are_carried(self):
+        code, out, _ = self.main("move", "2", "--to", "10")
+        self.assertIn("reminders: 2 carried", out)
+        held = {(r["issue"], r["to"]) for r in sb.read_reminders(self.world.state)}
+        self.assertEqual(held, {(2, "orch-b"), (4, "orch-a")}, "0 on the old orchestrator for the moved ask; another ask's reminder stays")
+
+    def test_s16_without_a_new_orchestrator_they_are_cancelled(self):
+        self.world.engine = None
+        sid = self.world.sessions.pop("orch-b")
+        self.world.v2.sessions[sid]["metadata"]["fleet"]["role"] = "coder"
+        code, out, _ = self.main("move", "2", "--to", "10")
+        self.assertIn("reminders: 2 cancelled", out)
+        self.assertIn("no orchestrator is running charter #10", out)
+        self.assertEqual([r["issue"] for r in sb.read_reminders(self.world.state)], [4])
+
+    def test_s3_a_refused_write_leaves_the_ask_under_its_charter_and_names_the_step(self):
+        self.gh.fail_write = True
+        code, out, err = self.main("move", "2", "--to", "10")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.parents(), [1], "never 0 parent links")
+        self.assertIn("step 're-parent'", err)
+        self.assertEqual(self.world.admissions("orch-a") + self.world.admissions("orch-b"), [])
+        self.assertEqual(len(sb.read_reminders(self.world.state)), 3, "nothing else was done")
+
+    def test_s3_a_failure_after_the_move_says_the_ask_is_moved_and_which_steps_failed(self):
+        with mock.patch.object(sb.Switchboard, "send", side_effect=RuntimeError("herdr is down")):
+            code, out, err = self.main("move", "2", "--to", "10")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.parents(), [10])
+        self.assertIn("the ask is moved, but these steps failed", err)
+        self.assertIn("handover note to orch-b", err)
+        self.assertIn("charter #1 still holds 3", out, "the remaining list is still given")
+
+    def test_the_operator_in_a_plain_shell_may_move(self):
+        os.environ.pop("HERDR_PANE_ID", None)
+        code, out, err = self.main("move", "2", "--to", "10")
+        self.assertEqual((code, self.parents()), (0, [10]), err)
+
+    def test_s11_anyone_else_is_refused_audited_and_nothing_changes(self):
+        for who in ("orch-a", "orch-b", "worker"):
+            with self.subTest(who=who):
+                self.as_agent(who)
+                code, _, err = self.main("move", "2", "--to", "10")
+                self.assertEqual(code, 1)
+                self.assertIn("only the chief-of-staff or the operator", err)
+                self.assertEqual((self.gh.writes, self.parents()), ([], [1]))
+        refused = [e for e in self.world.audit() if e["event"] == "lanes.move.refused"]
+        self.assertEqual(len(refused), 3)
+
+    def test_what_cannot_move_is_refused_with_nothing_written(self):
+        for argv, text in ((("2", "--to", "2"), "not a charter"), (("1", "--to", "10"), "is a charter"),
+                           (("3", "--to", "10"), "work item"), (("7", "--to", "10"), "only an open ask moves"),
+                           (("2", "--to", "1"), None)):
+            with self.subTest(argv=argv):
+                code, out, err = self.main("move", *argv)
+                if text is None:
+                    self.assertEqual((code, "nothing to do" in out), (0, True))
+                else:
+                    self.assertEqual(code, 2)
+                    self.assertIn(text, err)
+                self.assertEqual(self.gh.writes, [])
+
+    def test_the_lab_flag_is_only_for_the_lab(self):
+        os.environ.pop(sb.LAB_ENV, None)
+        code, _, err = self.main("move", "2", "--to", "10", "--from", "chief-of-staff")
+        self.assertEqual(code, 1)
+        self.assertIn("only for the Lab", err)
+        self.assertEqual(self.gh.writes, [])
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.
