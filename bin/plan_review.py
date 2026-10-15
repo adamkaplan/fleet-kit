@@ -11,6 +11,7 @@ these entries alone; nothing an agent says decides it.
 """
 
 import re
+import unicodedata
 
 TIERS = ("light", "normal", "full")
 LANES = {
@@ -67,8 +68,14 @@ def _norm_path(path):
     return path[1:] if path.startswith("/") else path
 
 
+def _folds(text):
+    """A COPY of `impact_floor.folds`: the NFC and the NFD form of the casefold (a parity test keeps them equal)."""
+    text = str(text)
+    return {unicodedata.normalize(form, unicodedata.normalize(form, text).casefold()) for form in ("NFC", "NFD")}
+
+
 def _canonical(path):
-    """(the path as the file system reads it, lower-cased, escapes). A COPY of `impact_floor.canonical` (this core imports nothing but `re`, so it cannot
+    """(the path as the file system reads it, folded, escapes). A COPY of `impact_floor.canonical` (this core imports no project module, so it cannot
     load it): a test runs both on one corpus and fails when they disagree."""
     text = str(path).replace("\\", "/")
     parts, escapes = [], text.startswith(("/", "~")) or bool(re.match(r"^[A-Za-z]:", text))
@@ -82,18 +89,19 @@ def _canonical(path):
                 escapes = True
             continue
         parts.append(segment)
-    return "/".join(parts).lower(), escapes
+    return unicodedata.normalize("NFD", "/".join(parts)).casefold(), escapes
 
 
 def path_hits(paths, held_globs):
-    """The paths that match any held-path glob (`**` across directories, `*` within a name), case-insensitively and as the file the path names (`Shims//gh`,
-    `shims/./gh`, `shims\\gh` and `a/../shims/gh` are `shims/gh`); a path that leaves the repository is a hit (when in doubt, hold). Deterministic."""
-    compiled = [_glob_regex(str(g).lower()) for g in held_globs or ()]
+    """The paths that match any held-path glob (`**` across directories, `*` within a name), case- and normalisation-insensitively and as the file the path
+    names (`Shims//gh`, `shims/./gh`, `shims\\gh`, `a/../shims/gh` and a long-s `\u017fhims/gh` are `shims/gh`); a path that leaves the repository is a hit
+    (when in doubt, hold). Deterministic."""
+    compiled = [_glob_regex(form) for g in held_globs or () for form in _folds(g)]
     hits = set()
     for p in paths or ():
         named, escapes = _canonical(p)
-        raw = _norm_path(p).lower()
-        if escapes or any(c.fullmatch(raw) or c.fullmatch(named) for c in compiled):
+        texts = _folds(_norm_path(p)) | _folds(named) | _folds(p)
+        if escapes or any(c.fullmatch(text) for c in compiled for text in texts):
             hits.add(str(p))
     return sorted(hits)
 

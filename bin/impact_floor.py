@@ -7,6 +7,7 @@ no label (that is slice L4)."""
 import fnmatch
 import json
 import re
+import unicodedata
 from pathlib import Path
 
 ACTION_HOLD, ACTION_SECOND, ACTION_NONE = "H", "2", "."
@@ -43,8 +44,17 @@ def default_floors(matrix=None):
     return {name: entry for name, entry in floors.items() if isinstance(entry, dict)}
 
 
+def folds(text):
+    """The case- and normalisation-folded spellings of `text`: the NFC and the NFD form of its casefold. A case-insensitive, normalisation-insensitive file
+    system (APFS) reads `SHIMS/gh`, `\u017fhims/gh` (a long s) and a decomposed accent as one file, and `str.lower()` misses most of them. BOTH forms are tried
+    (when in doubt, hold: a fold that makes an unrelated path hit only adds a hold)."""
+    text = str(text)
+    return {unicodedata.normalize(form, unicodedata.normalize(form, text).casefold()) for form in ("NFC", "NFD")}
+
+
 def _glob_regex(pattern):
-    return _compiled(pattern.lower())
+    """The compiled regexes of a glob, one per folded form of it."""
+    return [_compiled(form) for form in folds(pattern)]
 
 
 _CACHE = {}
@@ -94,7 +104,7 @@ def canonical(path):
                 escapes = True
             continue
         parts.append(segment)
-    return "/".join(parts).lower(), escapes
+    return unicodedata.normalize("NFD", "/".join(parts)).casefold(), escapes
 
 
 def escapes(path):
@@ -103,18 +113,17 @@ def escapes(path):
 
 
 def matches(path, patterns):
-    """Case-insensitive, and judged as the file the path names (see `canonical`): the fleet runs on case-insensitive checkouts where `SHIMS/x` and `shims/x`
-    are one file. A variant can only ADD a hit: the raw lower-cased spelling and the canonical one are both tried (a false hold costs little)."""
-    lowered = path.lower()
-    named = canonical(path)[0]
-    return any(_glob_regex(p).fullmatch(lowered) or _glob_regex(p).fullmatch(named) for p in patterns)
+    """Judged as the file the path names (see `canonical`), case- and normalisation-insensitively (see `folds`): a variant can only ADD a hit, so the raw
+    spelling and the canonical one are both tried, each in both folded forms (a false hold costs little)."""
+    texts = folds(path) | folds(canonical(path)[0])
+    return any(regex.fullmatch(text) for p in patterns for regex in _glob_regex(p) for text in texts)
 
 
 def matches_named(path, patterns):
     """Judged ONLY as the file the path names (see `canonical`): for an EXCLUDE list, which can only take a hit away, so a spelling must never be able to
     move a path into it (`shims/docs/../gh` is `shims/gh`, not under `shims/docs/**`)."""
-    named = canonical(path)[0]
-    return any(_glob_regex(p).fullmatch(named) for p in patterns)
+    texts = folds(canonical(path)[0])
+    return any(regex.fullmatch(text) for p in patterns for regex in _glob_regex(p) for text in texts)
 
 
 def floor_paths(paths, globs, exclude=(), force=()):

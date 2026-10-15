@@ -46994,7 +46994,7 @@ class TestPlanReviewCore(unittest.TestCase):
         tree = ast.parse((BIN / "plan_review.py").read_text())
         imported = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
         imported |= {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
-        self.assertEqual(imported, {"re"}, "no file, network, clock or GitHub access in the pure core")
+        self.assertEqual(imported, {"re", "unicodedata"}, "no file, network, clock or GitHub access in the pure core (unicodedata is a table lookup)")
 
     def test_an_ask_epic_or_cos_ask_is_always_full_and_a_request_only_raises(self):
         for kind in ("ask", "epic", "cos_ask"):
@@ -50009,8 +50009,18 @@ class TestOwnerHoldRule(unittest.TestCase):
         self.assertEqual(self.floor.floor_paths(["shims/./docs/keep.md", "SHIMS/DOCS/KEEP.MD"], globs, exclude, force), ["SHIMS/DOCS/KEEP.MD", "shims/./docs/keep.md"],
                          "a force path is never excluded, in any spelling")
         review = sb.load_module("plan_review")
-        for path in ("Shims/GH", "a/../x", "../x", "shims//./gh", "x\\y", "", "/", "..", "a/b/../../..", "bin\\..\\shims\\gh", "/etc/x", "~/x", "C:/x", "c:\\x", "a//b/./c/../d", "Ünï/../Ünï/x", "x\n/../y"):
+        for path in ("Shims/GH", "a/../x", "../x", "shims//./gh", "x\\y", "", "/", "..", "a/b/../../..", "bin\\..\\shims\\gh", "/etc/x", "~/x", "C:/x", "c:\\x", "a//b/./c/../d", "Ünï/../Ünï/x", "x\n/../y", "\u017fhims/gh", "\u212aeep/x", "ﬁle", "e\u0301", "\u00e9", "STRASSE/ß", "İ/i̇"):
             self.assertEqual(review._canonical(path), self.floor.canonical(path), repr(path))
+
+    def test_a_unicode_fold_of_a_top_tier_path_is_that_path_on_a_case_and_normalisation_insensitive_file_system(self):
+        review = sb.load_module("plan_review")
+        for path in ("\u017fhims/gh", "\u017fHIMS/Gh", ".github/wor\u212aflows/ci.yml", "agents/opencode/chi\u0065\u0301f.md", "BIN/PLAN_LEDGER.PY"):
+            self.assertEqual(self.decide([path])[0], "hold", repr(path))
+            self.assertEqual(review.path_hits([path], ["shims/**", ".github/workflows/**", "agents/**", "bin/plan_ledger.py"]), [path], "review tier: " + repr(path))
+        self.assertTrue(self.floor.matches("e\u0301.txt", ["\u00e9.txt"]), "a decomposed accent is the composed one, in a glob too")
+        self.assertTrue(self.floor.matches("\u00e9.txt", ["e\u0301.txt"]))
+        self.assertEqual(self.floor.folds("\ufb01"), {"fi"}, "a ligature folds to its letters")
+        self.assertEqual(self.decide(["docs/\u017fhims.md"])[0], "none", "a fold of a name that matches no top tier glob stays outside")
 
     def home_file(self, name, text):
         tmp = Path(tempfile.mkdtemp(prefix="ohr"))
