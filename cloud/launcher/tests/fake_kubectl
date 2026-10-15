@@ -8,6 +8,11 @@ if os.environ.get("FAKE_KUBE_CALLS"):
     with open(os.environ["FAKE_KUBE_CALLS"], "a") as f:
         f.write(json.dumps(args) + "\n")
 if args[0] == "--kubeconfig":
+    if os.environ.get("FAKE_KUBE_CFGDUMP"):  # what the launcher generated, as kubectl would read it
+        with open(os.environ["FAKE_KUBE_CFGDUMP"], "a") as f:
+            f.write(json.dumps({"path": args[1], "mode": os.stat(args[1]).st_mode & 0o777,
+                                "dirmode": os.stat(os.path.dirname(args[1])).st_mode & 0o777,
+                                "config": open(args[1]).read()}) + "\n")
     args = args[2:]
 assert args[0] == "--context", "no explicit --context"
 assert args[2] == "-n"
@@ -31,6 +36,32 @@ if cmd == "apply":
         obj["status"] = {"phase": "Pending" if st.get("never_ready") else "Running",
                          "conditions": [] if st.get("never_ready") else [{"type": "Ready", "status": "True"}]}
         st.setdefault("pods", {})[obj["metadata"]["name"]] = obj
+    save()
+elif cmd == "create" and args[1:3] == ["secret", "generic"]:
+    if st.get("fail_secret"):
+        print("Error from server (Forbidden): secrets is forbidden", file=sys.stderr); sys.exit(1)
+    data = {}
+    for a in args[4:]:  # --from-file=KEY=PATH: PATH must be /dev/stdin (a value is never a file name); keep sizes and keys only
+        key, fpath = a[len("--from-file="):].split("=", 1)
+        assert fpath == "/dev/stdin", "a run secret must come from stdin"
+        body = sys.stdin.read()
+        with open(path + ".stdin", "a") as f:  # stdin of 'create secret' is recorded apart from argv
+            f.write(body + "\n")
+        data[key] = len(body)
+    st.setdefault("secrets", {})[args[3]] = 1
+    st.setdefault("secret_keys", {})[args[3]] = data
+    save()
+elif cmd == "patch" and args[1] == "secret":
+    assert "--patch-file=/dev/stdin" in args, "a patch must come from stdin"
+    body = sys.stdin.read()
+    with open(path + ".stdin", "a") as f:
+        f.write(body + "\n")
+    import base64
+    for k, v in json.loads(body)["data"].items():
+        st["secret_keys"][args[2]][k] = len(base64.b64decode(v))
+    save()
+elif cmd == "label" and args[1] == "secret":
+    st.setdefault("secret_labels", {})[args[2]] = dict(kv.split("=", 1) for kv in args[3:])
     save()
 elif cmd == "get" and args[1] == "pod":
     if args[2] not in st.get("pods", {}): missing('pods "%s"' % args[2])

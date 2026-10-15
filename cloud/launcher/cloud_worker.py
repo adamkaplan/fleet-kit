@@ -3,9 +3,13 @@
 
 Built to docs/cloud-worker-interface.md. Commands: create, stop, extend, delete, status, reap.
 The cloud is reached only through `kubectl` (the binary is CW_KUBECTL, so tests fake it). Nothing here
-holds a credential: the cluster login is kubectl's own, and a worker's GitHub token is minted inside the pod.
+holds a credential. Two ways to log in, never mixed: kubectl's own explicit context (CW_KUBE_CONTEXT, CW_KUBECONFIG), or
+the namespace service account's token FILE (CW_CLOUD_SERVER, CW_CLOUD_TOKEN_FILE, optional CW_CLOUD_CA_FILE), for which a
+minimal 0600 kubeconfig holding only the file's path is generated in a private temp dir and removed at exit. A per-run
+secret value is read once from an inherited descriptor and goes to kubectl's stdin only.
 """
 import argparse
+import base64
 import datetime as dt
 import pwd
 import hashlib
@@ -14,9 +18,11 @@ import os
 import re
 import math
 import secrets
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")  # the switchboard's agent name rule
@@ -52,6 +58,11 @@ EXIT_INTERRUPTED = 130
 
 def _raise_interrupted(signum, frame):
     raise Interrupted("signal %d" % signum)
+
+
+def token_mode(env):
+    """True when either service-account setting is present: the token-file login is then the only one (S8, S10)."""
+    return bool((env.get("CW_CLOUD_SERVER") or "").strip() or (env.get("CW_CLOUD_TOKEN_FILE") or "").strip())
 
 
 def spend_cap(env):
@@ -116,6 +127,45 @@ class Kube:
         self.ns = env.get("CW_CLOUD_NAMESPACE", "cw")
         self.context = (env.get("CW_KUBE_CONTEXT") or "").strip()
         self.kubeconfig = (env.get("CW_KUBECONFIG") or "").strip()
+        self.dir = None
+        if token_mode(env):
+            self._generate_kubeconfig(env)
+
+    def _generate_kubeconfig(self, env):
+        """The service-account mode: a generated kubeconfig whose only credential is a tokenFile path. Nothing is made
+        and no call is possible until the token file is readable and non-empty (S10): no other credential is tried."""
+        if self.kubeconfig or self.context:
+            raise CloudError("CW_CLOUD_TOKEN_FILE and CW_KUBECONFIG/CW_KUBE_CONTEXT are two different logins; set one kind only", EXIT_USAGE)
+        token_file, server = (env.get("CW_CLOUD_TOKEN_FILE") or "").strip(), (env.get("CW_CLOUD_SERVER") or "").strip()
+        try:
+            with open(token_file) as f:
+                usable = bool(f.read(65536).strip())
+        except OSError:
+            usable = False
+        if not usable:
+            raise CloudError("token unavailable: the token file is missing, empty or unreadable", EXIT_CLOUD)
+        if not server:
+            raise CloudError("no server: set CW_CLOUD_SERVER", EXIT_USAGE)
+        cluster = {"server": server}
+        ca = (env.get("CW_CLOUD_CA_FILE") or "").strip()
+        if ca:
+            cluster["certificate-authority"] = os.path.abspath(ca)  # a path, never inline data
+        # JSON is valid YAML. Only the path is written, never a token value; kubectl reads the file itself.
+        self.dir = tempfile.mkdtemp(prefix="cw-kube-")  # 0700
+        self.kubeconfig = os.path.join(self.dir, "config")
+        self.context = "cw"
+        cfg = {"apiVersion": "v1", "kind": "Config", "current-context": "cw",
+               "clusters": [{"name": "cw", "cluster": cluster}],
+               "users": [{"name": "cw", "user": {"tokenFile": os.path.abspath(token_file)}}],
+               "contexts": [{"name": "cw", "context": {"cluster": "cw", "user": "cw"}}]}
+        fd = os.open(self.kubeconfig, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(cfg, f)
+        self.env["KUBECONFIG"] = os.devnull  # no default kubeconfig can add a login
+
+    def close(self):
+        if self.dir:
+            shutil.rmtree(self.dir, ignore_errors=True)
 
     def run(self, args, stdin=None, ok_missing=False, keep_stdout=False):
         if not self.context:  # never fall back to the active context
@@ -154,9 +204,24 @@ class Kube:
     def delete_secret(self, name):
         self.run(["delete", "secret", name + "-pw", "--ignore-not-found"])
 
+    def delete_run_secret(self, name):
+        self.run(["delete", "secret", name + "-run", "--ignore-not-found"])
+
     def delete(self, name):
         self.delete_pod(name)
         self.delete_secret(name)
+        self.delete_run_secret(name)
+
+    def create_run_secret(self, name, pod, values):
+        """One Secret per run. Each value goes to kubectl's stdin (--from-file=KEY=/dev/stdin, or a patch file on stdin
+        for the keys after the first), never into an argument."""
+        items = sorted(values.items())
+        key, val = items[0]
+        self.run(["create", "secret", "generic", name + "-run", "--from-file=%s=/dev/stdin" % key], stdin=val)
+        for key, val in items[1:]:
+            body = json.dumps({"data": {key: base64.b64encode(val.encode()).decode()}})
+            self.run(["patch", "secret", name + "-run", "--type=merge", "--patch-file=/dev/stdin"], stdin=body)
+        self.run(["label", "secret", name + "-run", "cw/pod=" + pod])
 
     def exec(self, name, *cmd, keep_stdout=False):
         return self.run(["exec", name, "--"] + list(cmd), keep_stdout=keep_stdout)
@@ -166,35 +231,79 @@ def ann(pod, key, default=None):
     return pod["metadata"].get("annotations", {}).get("cw/" + key, default)
 
 
-def render_pod(a, worker, name, now, hard, env):
+RUN_SECRET_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+RESERVED_RUN_NAMES = {"server-password"}
+SERVER_UID = 1000  # the image's non-root user
+
+
+def parse_run_secret_fds(items):
+    """['NAME=N', ...] -> {NAME: fd}. Checks names and fd numbers only; reads nothing."""
+    fds = {}
+    for item in items or []:
+        key, sep, num = item.partition("=")
+        if not sep or not RUN_SECRET_NAME.match(key) or key in RESERVED_RUN_NAMES or key in fds or not num.isdigit() or int(num) < 3:
+            raise CloudError("bad --run-secret-fd (use NAME=N; NAME is a unique lowercase name, N an inherited descriptor >= 3)", EXIT_USAGE)
+        fds[key] = int(num)
+    return fds
+
+
+def read_run_secret_values(fds):
+    """Read each value once from its inherited descriptor. An unreadable or empty value is refused before anything is made."""
+    values = {}
+    for key, fd in fds.items():
+        try:
+            with os.fdopen(os.dup(fd), "r") as f:
+                val = f.read()
+        except (OSError, ValueError):
+            raise CloudError("run secret %s: descriptor %d is not readable" % (key, fd), EXIT_USAGE)
+        if not val.strip():
+            raise CloudError("run secret %s: the value is empty" % key, EXIT_USAGE)
+        values[key] = val
+    return values
+
+
+def render_pod(a, worker, name, now, hard, env, run_names=()):
     image = a.image or env.get("CW_CLOUD_IMAGE")
     if not image:
         raise CloudError("no image: pass --image or set CW_CLOUD_IMAGE", EXIT_USAGE)
     endpoint = env.get("CW_TOKEN_ENDPOINT")
-    if not endpoint:
+    if not endpoint and not run_names:  # git access then comes from a per-run secret instead
         raise CloudError("no token endpoint: set CW_TOKEN_ENDPOINT", EXIT_USAGE)
     shape = SHAPES[a.shape]
     e = {"CW_WORKER": worker, "CW_REPO": a.repo, "CW_BRANCH": a.branch,
          "CW_IDLE_SECONDS": str(parse_duration(a.idle)), "CW_HARD_DEADLINE": iso(hard),
-         "CW_TOKEN_ENDPOINT": endpoint, "CW_AUDIT_RUNTIME_ID": "pod/" + name}
-    return {"apiVersion": "v1", "kind": "Pod", "metadata": {
+         "CW_AUDIT_RUNTIME_ID": "pod/" + name}
+    if endpoint:
+        e["CW_TOKEN_ENDPOINT"] = endpoint
+    pw_volume = {"name": "pw", "secret": {"secretName": name + "-pw", "defaultMode": 0o600,
+                                          "items": [{"key": "password", "path": "server-password"}]}}
+    if run_names:  # one read-only mount at /run/cw holding the password file and each run secret (0400)
+        pw_volume = {"name": "pw", "projected": {"defaultMode": 0o600, "sources": [
+            {"secret": {"name": name + "-pw", "items": [{"key": "password", "path": "server-password", "mode": 0o600}]}},
+            {"secret": {"name": name + "-run", "items": [{"key": k, "path": k, "mode": 0o400} for k in run_names]}}]}}
+    pod = {"apiVersion": "v1", "kind": "Pod", "metadata": {
         "name": name, "labels": {"app": LABEL, "cw/worker": worker, "azure.workload.identity/use": "true"},
         "annotations": {"cw/worker": worker, "cw/started": iso(now), "cw/hard-deadline": iso(hard),
                         "cw/idle-seconds": e["CW_IDLE_SECONDS"], "cw/shape": a.shape,
                         "cw/max-hard": iso(now + dt.timedelta(seconds=parse_duration(a.max_hard)))}},
         "spec": {"restartPolicy": "Never", "serviceAccountName": env.get("CW_CLOUD_SERVICE_ACCOUNT", "cw-worker"),
-                  "securityContext": {"runAsNonRoot": True},
+                  "automountServiceAccountToken": False,
+                  "securityContext": {"runAsNonRoot": True, "runAsUser": SERVER_UID, "runAsGroup": SERVER_UID,
+                                      "fsGroup": SERVER_UID, "seccompProfile": {"type": "RuntimeDefault"}},
                  "containers": [{"name": "worker", "image": image,
                                  "securityContext": {"allowPrivilegeEscalation": False, "capabilities": {"drop": ["ALL"]}}, "env": [{"name": k, "value": v} for k, v in e.items()],
                                  "resources": {"limits": {"cpu": shape["cpu"], "memory": shape["memory"]}},
-                                 "readinessProbe": {"httpGet": {"path": "/health", "port": 4096}},
+                                 "readinessProbe": {"tcpSocket": {"port": 4096}},
                                  "volumeMounts": [{"name": "pw", "mountPath": "/run/cw", "readOnly": True},
                                                   {"name": "tokens", "mountPath": "/run/cw-tmp"},
                                                   {"name": "scratch", "mountPath": "/work"}]}],
-                 "volumes": [{"name": "pw", "secret": {"secretName": name + "-pw", "defaultMode": 0o600,
-                                                       "items": [{"key": "password", "path": "server-password"}]}},
+                 "volumes": [pw_volume,
                              {"name": "tokens", "emptyDir": {"medium": "Memory"}},
                              {"name": "scratch", "emptyDir": {}}]}}
+    pull = getattr(a, "pull_secret", None)
+    if pull:
+        pod["spec"]["imagePullSecrets"] = [{"name": pull}]
+    return pod
 
 
 class Launcher:
@@ -260,7 +369,7 @@ class Launcher:
     # -- create --
     def create(self, a):
         worker, name = a.worker, pod_name(a.worker)
-        made = {"secret": False, "pod": False}  # set before the call that may create it: an interrupt may land after
+        made = {"secret": False, "run": False, "pod": False}  # set before the call that may create it: an interrupt may land after
 
         def go(info):
             info["rid"] = "pod/" + name
@@ -274,7 +383,8 @@ class Launcher:
             if hard > max_hard:
                 raise CloudError("--hard is past --max-hard", EXIT_REFUSED)
             self.check_cap(a.shape, int((hard - now).total_seconds()))
-            spec = render_pod(a, worker, name, now, hard, self.env)
+            run_values = read_run_secret_values(parse_run_secret_fds(a.run_secret_fd))  # before anything is made
+            spec = render_pod(a, worker, name, now, hard, self.env, sorted(run_values))
             hits = scan_credentials(spec)
             if hits:
                 raise CloudError("refusing a pod spec with a stored credential: %s" % ", ".join(hits), EXIT_USAGE)
@@ -286,6 +396,9 @@ class Launcher:
                 made["secret"] = True
                 self.kube.apply({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": name + "-pw", "labels": {"app": LABEL}},
                                  "type": "Opaque", "stringData": {"password": password}})
+                if run_values:
+                    made["run"] = True
+                    self.kube.create_run_secret(name, name, run_values)
                 made["pod"] = True
                 self.kube.apply(spec)
                 self._wait_ready(name, a.wait)
@@ -307,7 +420,7 @@ class Launcher:
                     "password_fd": a.password_fd}
         old = self._catch_signals()
         try:
-            return self._audited(worker, "create", go)
+            return self._audited(worker, "create", go, ("run-secrets=" + ",".join(sorted(parse_run_secret_fds(a.run_secret_fd)))) if a.run_secret_fd else "")
         finally:
             self._restore_signals(old)
 
@@ -332,7 +445,8 @@ class Launcher:
             pass
         left = []
         try:
-            for kind, fn, label in (("pod", self.kube.delete_pod, "pod/" + name), ("secret", self.kube.delete_secret, "secret/%s-pw" % name)):
+            for kind, fn, label in (("pod", self.kube.delete_pod, "pod/" + name), ("secret", self.kube.delete_secret, "secret/%s-pw" % name),
+                                  ("run", self.kube.delete_run_secret, "secret/%s-run" % name)):
                 if made[kind]:
                     try:
                         fn(name)
@@ -347,7 +461,7 @@ class Launcher:
     def _abort(self, worker, name, made, exc):
         interrupted = isinstance(exc, (Interrupted, KeyboardInterrupt))
         left = self._cleanup(name, made)
-        cleaned = [l for k, l in (("pod", "pod/" + name), ("secret", "secret/%s-pw" % name)) if made[k] and l not in left]
+        cleaned = [l for k, l in (("pod", "pod/" + name), ("secret", "secret/%s-pw" % name), ("run", "secret/%s-run" % name)) if made[k] and l not in left]
         reason = "%s; cleaned: %s" % ("interrupted" if interrupted else "failed: %s" % str(exc)[:200], ", ".join(cleaned) or "nothing")
         if left:
             reason += "; REMAINS: %s" % ", ".join(left)
@@ -391,6 +505,14 @@ class Launcher:
             if not pod:
                 return {"worker": worker, "runtime_id": "", "pushed": False, "wip_branch": None}
             info["rid"], info["cost"] = "pod/" + name, self.cost(pod)
+            phase = (pod.get("status") or {}).get("phase")
+            if phase in ("Failed", "Succeeded"):
+                # No container is running, so no hook can run and a kept pod would only linger: delete it and its
+                # Secrets, and say so.
+                self.kube.delete(name)
+                print("cloud-worker: pod was %s; end hook not run; deleted" % phase, file=sys.stderr)
+                return {"worker": worker, "runtime_id": "pod/" + name, "pushed": False, "wip_branch": None,
+                        "skipped": [], "note": "pod was %s; end hook not run" % phase}
             try:
                 res = self.run_hook(name)
             except CloudError as e:
@@ -398,9 +520,19 @@ class Launcher:
             if res.get("error"):
                 self.kube.annotate(name, kept="true")  # the pod is kept: the commit is not safe yet
                 raise CloudError("end hook could not push, pod kept: %s" % res["error"], EXIT_HOOK)
-            self.kube.annotate(name, hook_ran="true")
-            self.kube.delete(name)
-            skipped = [re.sub(r"[^\x20-\x7e]", "?", str(x))[:200] for x in (res.get("skipped") or [])][:50]
+            try:
+                self.kube.annotate(name, hook_ran="true")
+            finally:
+                self.kube.delete(name)  # the hook succeeded: whatever happens next, the pod and its Secrets go
+            skipped, note = [], ""
+            try:
+                raw = res.get("skipped")
+                skipped = [re.sub(r"[^\x20-\x7e]", "?", str(x))[:200] for x in raw][:50] if isinstance(raw, list) else []
+                note = re.sub(r"[^\x20-\x7e]", "?", str(res.get("note") or ""))[:300]
+            except Exception:  # output handling never undoes the stop
+                pass
+            if note:
+                print("cloud-worker: end hook: %s; nothing to push" % note, file=sys.stderr)
             if skipped:  # these files were not pushed and went with the pod: say so, loudly
                 print("cloud-worker: WARNING: not saved (secret-looking names): %s" % ", ".join(skipped), file=sys.stderr)
             return {"worker": worker, "runtime_id": "pod/" + name, "pushed": bool(res.get("pushed")),
@@ -536,6 +668,9 @@ def build_parser():
     c.add_argument("--shape", default="S")
     c.add_argument("--image")
     c.add_argument("--wait", type=int, default=300)
+    c.add_argument("--pull-secret", help="name of an existing image-pull Secret (pull-only) for imagePullSecrets")
+    c.add_argument("--run-secret-fd", action="append", default=[], metavar="NAME=N",
+                   help="repeatable; the value is read from inherited descriptor N and piped to kubectl's stdin into the run's one Secret, mounted read-only at /run/cw/NAME (0400), deleted with the pod")
     c.add_argument("--password-fd", type=int, help="a file descriptor the caller holds; the password is written there once")
     s = cmd("stop")
     s.add_argument("--reason", default="")
@@ -558,11 +693,13 @@ def main(argv=None, env=None, clock=None, sleep=time.sleep):
         a = build_parser().parse_args(argv)
     except SystemExit as e:
         return EXIT_USAGE if e.code else 0
-    if not (env.get("CW_KUBE_CONTEXT") or "").strip():
+    if not token_mode(env) and not (env.get("CW_KUBE_CONTEXT") or "").strip():
         print("cloud-worker: CW_KUBE_CONTEXT is not set; refusing to run (the active kubectl context is never used)", file=sys.stderr)
         return EXIT_USAGE
-    L = Launcher(Kube(env), env, clock, sleep)
+    kube = None
     try:
+        kube = Kube(env)
+        L = Launcher(kube, env, clock, sleep)
         if a.cmd == "reap":
             while True:
                 res = L.reap()
@@ -579,6 +716,9 @@ def main(argv=None, env=None, clock=None, sleep=time.sleep):
     except (Interrupted, KeyboardInterrupt):
         print("cloud-worker: interrupted", file=sys.stderr)
         return EXIT_INTERRUPTED
+    finally:
+        if kube:
+            kube.close()
 
 
 if __name__ == "__main__":
