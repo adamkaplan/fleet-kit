@@ -51443,8 +51443,8 @@ class TestReassign(IntentCase):
         cases = ((("reassign", "worker", "--to", "orch-b"), "needs --to"),
                  (("reassign", "worker", "--to", "orch-b", "--consent-from", "orch-b"), "CURRENT boss"),
                  (("reassign", "worker", "--to", "orch-b", "--consent-from", "chief-of-staff"), "CURRENT boss"),
-                 (("reassign", "worker", "--to", "coder-x", "--consent-from", "orch-a"), "not a live orchestrator"),
-                 (("reassign", "worker", "--to", "nobody", "--consent-from", "orch-a"), "not a live orchestrator"),
+                 (("reassign", "worker", "--to", "coder-x", "--consent-from", "orch-a"), "the target coder-x is not an orchestrator"),
+                 (("reassign", "worker", "--to", "nobody", "--consent-from", "orch-a"), "the target nobody is not in the current discovery"),
                  (("reassign", "worker", "--to", "orch-a", "--consent-from", "orch-a"), "already reports"),
                  (("reassign", "nobody", "--to", "orch-b", "--consent-from", "orch-a"), "not a fleet agent"),
                  (("reassign", "orch-a", "--to", "orch-b", "--consent-from", "chief-of-staff"), "not a worker"))
@@ -51462,7 +51462,7 @@ class TestReassign(IntentCase):
         self.world.v2.sessions[sid]["metadata"]["fleet"]["role"] = "coder"
         code, _, err = self.reassign()
         self.assertEqual(code, 2)
-        self.assertIn("not a live orchestrator", err)
+        self.assertIn("the consenting boss orch-a is not an orchestrator", err)
         self.assertFalse(self.record().exists())
 
     def test_s20_only_the_chief_of_staff_or_the_operator_and_a_refusal_is_audited(self):
@@ -51622,6 +51622,61 @@ class TestReassign(IntentCase):
             got[who] = sb.reattach_caller_problem(engine, self.world.route, self.world.clock.now, discovery, "worker", sid)
         self.assertIsNone(got["orch-b"])
         self.assertIn("may not reattach", got["orch-a"])
+
+    def test_a_retired_or_excluded_orchestrator_is_refused_as_the_target_and_as_the_consenting_boss(self):
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {"orch-b": {"at": int(self.world.clock.now()), "by": "x", "reason": "done", "session": "s", "auto": False}})
+        code, _, err = self.reassign()
+        self.assertEqual(code, 2)
+        self.assertIn("the target orch-b is retired", err)
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {"orch-a": {"at": int(self.world.clock.now()), "by": "x", "reason": "done", "session": "s", "auto": False}})
+        code, _, err = self.reassign()
+        self.assertEqual(code, 2)
+        self.assertIn("the consenting boss orch-a is retired", err)
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {})
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": FAKE_REPO, "excluded_repos": [FAKE_REPO]})
+        code, _, err = self.reassign()
+        self.assertEqual(code, 2)
+        self.assertIn("excluded or unknown", err)
+        self.assertFalse(self.record().exists(), "0 writes")
+
+    def arm_launch_reminders(self):
+        """What `launch` arms for a worker with a checkpoint: a reminder for the worker, and the overdue one for its boss."""
+        epoch = self.world.clock.now()
+        sb.add_reminder(self.world.state, "worker", epoch + 1800, epoch, "checkpoint due: report now, one line", 3, "orch-a", FAKE_REPO,
+                        condition={"while_running": "worker"})
+        sb.add_reminder(self.world.state, "orch-a", epoch + 3600, epoch, "worker has not reported since launch: overdue checkpoint", 3, "worker", FAKE_REPO,
+                        condition={"unless_report_from": "worker", "since": epoch})
+
+    def overdue_texts(self, name):
+        return [t for t in (a["text"] for a in self.world.admissions(name)) if "overdue checkpoint" in t]
+
+    def test_the_overdue_reminder_follows_the_override_and_undo_points_it_back(self):
+        self.arm_launch_reminders()
+        code, out, err = self.reassign()
+        self.assertEqual(code, 0, err)
+        self.assertIn("1 overdue reminder(s) of worker now go to orch-b", out)
+        self.world.tick(3700)
+        self.world.engine.run_pass()
+        self.assertEqual((len(self.overdue_texts("orch-b")), len(self.overdue_texts("orch-a"))), (1, 0), "only the new boss is woken")
+        self.arm_launch_reminders()   # a second launch of the same arming, to test the undo direction
+        sb.remove_reminders(self.world.state, {r["id"] for r in sb.read_reminders(self.world.state) if r["to"] == "orch-a"})
+        epoch = self.world.clock.now()
+        sb.add_reminder(self.world.state, "orch-b", epoch + 3600, epoch, "worker has not reported since launch: overdue checkpoint", 3, "worker", FAKE_REPO,
+                        condition={"unless_report_from": "worker", "since": epoch})
+        code, out, err = self.main("reassign", "worker", "--undo")
+        self.assertEqual(code, 0, err)
+        self.assertIn("overdue reminder(s) of worker now go to orch-a", out)
+        self.world.tick(3700)
+        self.world.engine.run_pass()
+        self.assertEqual(len(self.overdue_texts("orch-a")), 1, "after --undo only the old boss is woken")
+        self.assertEqual(len(self.overdue_texts("orch-b")), 1, "and the new boss is not woken a second time")
+
+    def test_a_reminder_file_that_cannot_be_used_is_said_and_the_override_stands(self):
+        with mock.patch.object(sb, "read_reminders", side_effect=sb.ReminderError("reminders.json is damaged")):
+            code, out, err = self.reassign()
+        self.assertEqual(code, 1)
+        self.assertIn("overdue reminder was not pointed at orch-b", err)
+        self.assertEqual(self.boss(), "orch-b")
 
     def test_the_command_is_registered_and_starts_the_daemon(self):
         self.assertIn("reassign", sb.build_parser().commands)

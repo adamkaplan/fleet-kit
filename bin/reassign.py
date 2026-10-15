@@ -31,7 +31,8 @@ MAX_AGE_DAYS = 30
 OPERATOR = "operator"
 _NAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")   # herdr's own pattern for an agent name
 
-NEEDS = ("PROG", "EXIT_OK", "EXIT_ERROR", "EXIT_USAGE", "boss_name", "iso", "_one_line", "read_retired")
+NEEDS = ("PROG", "EXIT_OK", "EXIT_ERROR", "EXIT_USAGE", "boss_name", "iso", "_one_line", "read_retired", "load_module", "watched_repos",
+         "discovered_fleets", "_fleet_repo", "read_reminders", "write_reminders", "reminders_lock", "ReminderError")
 
 _cache = {}   # path -> ((mtime_ns, size), overrides): one small file read again only when it changes
 
@@ -157,9 +158,42 @@ def check_caller(caller, role):
     return "only the chief-of-staff or the operator reassigns a worker; %s is %s" % (caller, "a %s" % role if role else "not given a role")
 
 
-def live_orchestrator(discovery, name):
+def orchestrator_problem(sb, discovery, name, retired, watched):
+    """Why `name` is not a LIVE orchestrator of a watched, non-excluded repository, or None: in the current discovery, an orchestrator, not retired,
+    reachable (no problem reading it), and its repository watched and not excluded."""
     seen = discovery.agents.get(name) if isinstance(name, str) else None
-    return seen is not None and (seen.fleet or {}).get("role") == "orchestrator" and not seen.problem
+    if seen is None:
+        return "is not in the current discovery"
+    if (seen.fleet or {}).get("role") != "orchestrator":
+        return "is not an orchestrator"
+    if name in retired:
+        return "is retired"
+    if seen.problem:
+        return "cannot be reached (%s)" % sb._one_line(seen.problem, 80)
+    repo = sb._fleet_repo(seen.fleet, sb.engine.config)
+    if repo is None or sb.load_module("repo_exclusion").is_excluded(sb.engine.config, repo):
+        return "works in a repository that is excluded or unknown"
+    if repo not in watched:
+        return "works in %s, which is not a watched repository" % repo
+    return None
+
+
+def retarget_reminders(sb, worker, frm, to):
+    """The reminders armed at launch for `worker`'s boss (the overdue checkpoint: condition `unless_report_from` the worker, addressed to the
+    boss) are pointed at `to`. Returns the number moved. ReminderError/OSError when the file cannot be used (the caller says so)."""
+    state = sb.engine.state_dir
+    if state is None:
+        return 0
+    moved = 0
+    with sb.reminders_lock(state):
+        items = sb.read_reminders(state)
+        for item in items:
+            if item.get("to") == frm and (item.get("condition") or {}).get("unless_report_from") == worker:
+                item["to"] = to
+                moved += 1
+        if moved:
+            sb.write_reminders(state, items)
+    return moved
 
 
 def tell(sb, caller, recipient, text):
@@ -207,10 +241,14 @@ def run_reassign(sb, worker, to, consent, undo, caller, role, out, err):
         return refuse("a reassign needs --to <orchestrator> and --consent-from <the worker's current boss>")
     if consent != current:
         return refuse("consent must come from the worker's CURRENT boss, %s; %s was named" % (current or "nobody (the worker reports to nobody)", consent))
-    if not live_orchestrator(discovery, current):
-        return refuse("the current boss %s is not a live orchestrator: its consent cannot be taken" % current)
-    if not live_orchestrator(discovery, to):
-        return refuse("%s is not a live orchestrator: a worker is only handed to one" % to)
+    retired = sb.read_retired(state)
+    watched = sb.watched_repos(engine.config, sb.discovered_fleets(discovery))
+    problem = orchestrator_problem(sb, discovery, current, retired, watched)
+    if problem:
+        return refuse("the consenting boss %s %s: its consent cannot be taken" % (current, problem))
+    problem = orchestrator_problem(sb, discovery, to, retired, watched)
+    if problem:
+        return refuse("the target %s %s: a worker is only handed to a live orchestrator of a watched repository" % (to, problem))
     if to == current:
         return refuse("%s already reports to %s" % (worker, to))
     now = engine.now()
@@ -234,8 +272,10 @@ def run_reassign(sb, worker, to, consent, undo, caller, role, out, err):
         err("%s: reassign failed: the override could not be written (%s); nothing was changed" % (sb.PROG, sb._one_line(str(problem), 160)))
         return sb.EXIT_ERROR
     out("%s now reports to %s (was %s; consent from %s, ordered by %s)" % (worker, to, current, consent, caller or OPERATOR))
-    return notify(sb, caller, worker, current, to, out, err,
+    failed = retarget_note(sb, worker, current, to, out, err)
+    code = notify(sb, caller, worker, current, to, out, err,
                   "%s was reassigned from %s to %s by %s, with %s's consent. Finish the work under your new boss and report to %s." % (worker, current, to, caller or OPERATOR, current, to))
+    return sb.EXIT_ERROR if failed else code
 
 
 def undo_override(sb, discovery, seen, worker, current, caller, state, audit, refuse, out, err):
@@ -255,8 +295,21 @@ def undo_override(sb, discovery, seen, worker, current, caller, state, audit, re
         return sb.EXIT_ERROR
     restored = held["original"] or None
     out("%s's override is removed: it reports to its own boss again (%s)" % (worker, restored or "nobody"))
-    return notify(sb, caller, worker, held["boss"], restored, out, err,
+    failed = retarget_note(sb, worker, held["boss"], restored, out, err) if restored else False
+    code = notify(sb, caller, worker, held["boss"], restored, out, err,
                   "%s's reassignment was undone by %s: it reports to %s again." % (worker, caller or OPERATOR, restored or "nobody"))
+    return sb.EXIT_ERROR if failed else code
+
+
+def retarget_note(sb, worker, frm, to, out, err):
+    """Point the worker's overdue reminder at its new boss. True when that failed (the override stands; the output says so)."""
+    try:
+        moved = retarget_reminders(sb, worker, frm, to)
+    except (sb.ReminderError, OSError) as problem:
+        err("%s: the change stands, but the worker's overdue reminder was not pointed at %s (%s): the old boss may still be woken by it" % (sb.PROG, to, sb._one_line(str(problem), 120)))
+        return True
+    out("reminders: %d overdue reminder(s) of %s now go to %s" % (moved, worker, to))
+    return False
 
 
 def notify(sb, caller, worker, old, new, out, err, text):
