@@ -21583,7 +21583,7 @@ class TestTriageAncestors(Base):
         self.world.add_agent("coder", fleet={"role": "coder", "issue": 81, "repo": "acme/api"})   # an agent works on 81 (no T1), as in the T11 test above
         self.engine.discover(self.world.clock.now())
         self.world.tick(sb.TRIAGE_TTL + 5)
-        self.add(80, created=5, updated=3, parent=999, labels=["kind"], body="Next: go")      # middle parent not read; 999's parent is a charter
+        self.add(80, created=5, updated=3, parent=999, labels=["kind"], body="Next: go")      # middle parent 999 was not read (a capped list)
         self.add(81, created=5, updated=3, labels=["kind"], body="Next: go")                  # chain read completely, no charter
         self.add(82, created=5, updated=3, parent=1, labels=["kind"], body="Next: go")        # chain reaches a charter
         self.go()
