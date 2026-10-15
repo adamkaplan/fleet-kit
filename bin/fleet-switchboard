@@ -18542,9 +18542,12 @@ def apply_impact_hold(engine, repo, number, report, record):
     with impact_state_lock(engine.state_dir):   # the clear check, the label write and the record are ONE step against an owner clear
         spent = _apply_impact_hold_locked(engine, repo, number, report, record, carry)
     if carry is not None and carry.get("carried"):   # told once the carry is RECORDED, outside the lock (a send is slow)
-        recorded = read_impact_state(engine.state_dir)[0].get("carried", {}).get("%s#%d" % (repo, number)) or {}
-        if recorded.get("head") == report["head"]:
-            notify_clear(engine, "carry", repo, number, report["head"], previous=carry["from"], body=(record or {}).get("body"))
+        try:
+            recorded = read_impact_state(engine.state_dir)[0].get("carried", {}).get("%s#%d" % (repo, number)) or {}
+            if recorded.get("head") == report["head"]:
+                notify_clear(engine, "carry", repo, number, report["head"], previous=carry["from"], body=(record or {}).get("body"))
+        except Exception as err:   # the carry is recorded: nothing here may fail the pass
+            engine._note("gate.clear_notify_failed", "%s#%d" % (repo, number), {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
     return spent
 
 
@@ -18745,19 +18748,21 @@ def notify_clear(engine, kind, repo, number, head, reason=None, body=None, previ
         if engine.state_dir is None or engine.audit is None:
             return None
         key = "%s@%s:%s" % (pr, head, kind)
-        seen = _read_small(engine.state_dir, CLEAR_NOTIFIED_FILE)
-        if key in seen:
-            return None
-        seen[key] = {"at": int(engine.now())}
-        if len(seen) > CLEAR_NOTIFIED_MAX:
-            for old in sorted(seen, key=lambda k: seen[k].get("at", 0))[:len(seen) - CLEAR_NOTIFIED_MAX]:
-                del seen[old]
-        _write_small(engine.state_dir, CLEAR_NOTIFIED_FILE, seen)   # before the send: at most once, even when the send fails
+        with impact_state_lock(engine.state_dir):   # the command and the daemon are two processes: the check and the mark are one step (the send is outside it)
+            seen = _read_small(engine.state_dir, CLEAR_NOTIFIED_FILE)
+            if key in seen:
+                return None
+            seen[key] = {"at": int(engine.now())}
+            if len(seen) > CLEAR_NOTIFIED_MAX:
+                for old in sorted(seen, key=lambda k: seen[k].get("at", 0))[:len(seen) - CLEAR_NOTIFIED_MAX]:
+                    del seen[old]
+            _write_small(engine.state_dir, CLEAR_NOTIFIED_FILE, seen)   # before the send: at most once, even when the send fails
         lane, how = clear_lane(engine, repo, number, body)
         if kind == "carry":
             line = "owner's clear carried %s from %s to %s; %s" % (pr, (previous or "?")[:8], head[:8], "%s merges it" % lane if lane else "lane unknown")
         else:
-            words = " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", redact_command_text(reason or "")).split())
+            flat = re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", re.sub(r"[\n\r\t]", " ", reason or ""))   # line breaks become spaces, other control characters vanish BEFORE the redaction: a token cannot hide behind one
+            words = " ".join(redact_command_text(flat).split())
             line = "owner cleared %s at %s: \"%s\"; %s" % (pr, head[:8], plan_ledger.clip(words, 300), "%s merges it" % lane if lane else "lane unknown")
         sent, failed = [], []
         for name in ["chief-of-staff"] + ([lane] if lane else []):
