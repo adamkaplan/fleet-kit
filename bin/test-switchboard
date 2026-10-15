@@ -2433,7 +2433,7 @@ class TestFacts(Base):
     def test_the_registration_point_lists_the_lab_source(self):
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "disk_facts", "cpu_facts", "docker_reap_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts"])
 
 
 # ---------------------------------------------------------------- observing
@@ -9603,7 +9603,7 @@ class TestFrictionWake(FrictionBase):
         self.assertNotIn("friction_wake", sb.DEFAULTS)
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "disk_facts", "cpu_facts", "docker_reap_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts"])
         self.assertNotIn("friction_wake", sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}))
         self.assertEqual(sb.FRICTION_DEFAULTS, {"enabled": False, "hour": 9, "to": "cos", "cos_to": "improver", "text": None})
         self.make("off")
@@ -49363,6 +49363,261 @@ def main(argv):
     ok = result.wasSuccessful() and result.testsRun > 0
     print("RESULT: %s" % ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
+
+
+class TestSpotlightGuard(Base):
+    """Ask #438: an hourly background check that the code and temp folders are still kept out of Spotlight; read-only, no process in a normal pass."""
+
+    def setUp(self):
+        super().setUp()
+        self.dirs = []
+        for name in ("code", "tmp"):
+            folder = self.home / name
+            folder.mkdir()
+            (folder / "a.txt").write_text("x")
+            self.dirs.append(str(folder))
+        self.world = World(self, agents=("coder",), config={})
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.engine = self.world.engine
+        self.engine.config["spotlight_guard"] = {"folders": list(self.dirs)}
+        self.engine.discover(self.world.clock.now())
+        self.sg = sb.load_module("spotlight_guard")
+        self.counts = {}
+        self.calls = []
+        self.fail = [None]
+        self.block = [None]
+
+        def runner(argv, **kwargs):
+            self.calls.append(list(argv))
+            if self.block[0] is not None:
+                self.block[0].wait(30)
+            if self.fail[0] is not None:
+                if isinstance(self.fail[0], str):
+                    return subprocess.CompletedProcess(argv, 0, self.fail[0], "")
+                raise self.fail[0]
+            return subprocess.CompletedProcess(argv, 0, "2026-01-01 locale noise\n%d\n" % self.counts.get(argv[2], 0), "locale noise")
+        self.engine.spotlight_runner = runner
+
+    def source(self):
+        return next(s for s in self.engine.sources if isinstance(s, sb.SpotlightFacts))
+
+    def wakes(self):
+        found, problems = self.engine.collect_facts()
+        self.assertEqual(problems, [])
+        return [f for f in found if f.kind == "spotlight"]
+
+    def round(self, **counts):
+        """One hourly check, finished and applied. Counts by folder index (code=0, tmp=1)."""
+        self.counts = {self.dirs[int(k[1:])]: v for k, v in counts.items()}
+        self.world.tick(3601)
+        self.wakes()                                   # the pass starts the check
+        thread = self.source().thread
+        if thread is not None:
+            thread.join(10)
+        return self.wakes()                            # the next pass collects what it found
+
+    def lines(self):
+        cfg = self.sg.settings(self.engine.config.get("spotlight_guard"))
+        return self.sg.status_lines(cfg, self.sg.load(self.world.state), self.world.clock.now())
+
+    def test_s1_zero_counts_show_both_folders_as_excluded(self):
+        self.round(f0=0, f1=0)
+        lines = self.lines()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(all("excluded from Spotlight" in line for line in lines), lines)
+        self.assertFalse(any("WARN" in line for line in lines))
+
+    def test_s2_a_nonzero_count_on_two_checks_in_a_row_warns_naming_folder_and_count(self):
+        self.round(f0=120, f1=0)
+        self.round(f0=120, f1=0)
+        warns = [line for line in self.lines() if "WARN" in line]
+        self.assertEqual(len(warns), 1)
+        self.assertIn(self.dirs[0], warns[0])
+        self.assertIn("120", warns[0])
+        self.assertNotIn(self.dirs[1], warns[0])
+
+    def test_s3_one_nonzero_count_then_zero_sends_no_wake_and_no_warning(self):
+        self.assertEqual(self.round(f0=120, f1=0), [])
+        self.assertEqual(self.round(f0=0, f1=0), [])
+        self.assertFalse(any("WARN" in line for line in self.lines()))
+        self.assertEqual([e for e in self.world.audit() if e["event"] == "spotlight.lost"], [])
+
+    def test_s4_one_wake_per_episode(self):
+        keys = set()
+        for counts in [120] * 5 + [0] * 2 + [90] * 3:
+            for fact in self.round(f0=counts, f1=0):
+                keys.add(fact.key)
+        self.assertEqual(len(keys), 2, keys)
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "spotlight.lost"]), 2)
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "spotlight.recovered"]), 1)
+
+    def real_pass_round(self, **counts):
+        """One hourly check through the engine's REAL pass (fact collection, batching, delivery); returns the reports of the two passes."""
+        self.counts = {self.dirs[int(k[1:])]: v for k, v in counts.items()}
+        self.world.tick(3601)
+        first = self.engine.run_pass()
+        self.source().thread.join(10)
+        return [first, self.engine.run_pass()]
+
+    def spotlight_sends(self):
+        return [a for a in self.world.admissions("cos") if any(str(k).startswith("spotlight.lost:") for k in a["keys"])]
+
+    def test_the_real_batching_path_delivers_the_wake_once_after_the_wait(self):
+        self.real_pass_round(f0=120, f1=0)
+        self.real_pass_round(f0=120, f1=0)                  # the second nonzero check begins the episode: the fact is pending, batching waits
+        self.assertEqual(self.spotlight_sends(), [])
+        self.world.tick(30)
+        self.assertIn("cos", self.engine.run_pass()["waiting"], "the fact is still pending 30 s on: it is held by the 90 s wait")
+        self.world.tick(70)
+        report = self.engine.run_pass()
+        self.assertEqual(len(self.spotlight_sends()), 1, report)
+        for _ in range(5):
+            self.world.tick(30)
+            self.engine.run_pass()
+        self.assertEqual(len(self.spotlight_sends()), 1, "delivered once: the stable key is deduplicated on every later pass")
+
+    def test_a_restart_between_the_alarm_and_its_delivery_still_delivers_once(self):
+        self.real_pass_round(f0=120, f1=0)
+        self.real_pass_round(f0=120, f1=0)
+        self.assertEqual(self.spotlight_sends(), [])
+        index = next(i for i, source in enumerate(self.engine.sources) if isinstance(source, sb.SpotlightFacts))
+        fresh = sb.SpotlightFacts()
+        fresh.bind(self.engine)
+        fresh.started = self.world.clock.now()              # a restart has just run its check: nothing new to find
+        self.engine.sources[index] = fresh
+        self.world.tick(100)
+        self.engine.run_pass()
+        self.assertEqual(len(self.spotlight_sends()), 1, "the open episode was restored from the file and its fact is pending again")
+        self.world.tick(30)
+        self.engine.run_pass()
+        self.assertEqual(len(self.spotlight_sends()), 1)
+
+    def test_a_damaged_state_file_never_reaches_a_wake_or_a_line_nor_breaks_the_pass(self):
+        folder = self.dirs[0]
+        Path(self.world.state, "spotlight-guard.json").write_text(json.dumps({"folders": {
+            folder: {"state": "indexed", "count": "\x1b[31mevil", "streak": 2, "episode": 1.0},
+            self.dirs[1]: {"state": "indexed", "count": 5, "streak": 2, "episode": float("inf")},
+            "/not/guarded": {"state": "indexed", "count": 5, "streak": 2, "episode": 1.0}}, "checked_at": 1.0}))
+        fresh = sb.SpotlightFacts()
+        fresh.bind(self.engine)
+        facts = fresh()
+        self.assertEqual(len(facts), 1, "only the guarded folder with a sane episode wakes; an unguarded folder and an infinite episode wake nobody")
+        self.assertNotIn("\x1b", facts[0].summary)
+        self.assertIn("some entries", facts[0].summary)
+        cfg = self.sg.settings(self.engine.config.get("spotlight_guard"))
+        lines = self.sg.status_lines(cfg, self.sg.load(self.world.state), 1.0)
+        self.assertFalse(any("\x1b" in line for line in lines), lines)
+
+    def test_s5_a_normal_pass_starts_nothing_and_a_slow_tool_never_delays_it(self):
+        gate = threading.Event()
+        self.block[0] = gate
+        self.addCleanup(gate.set)
+        started = time.monotonic()
+        self.world.tick(1)
+        self.wakes()                                   # the first pass starts the check on a thread and returns at once
+        for _ in range(10):
+            self.world.tick(60)
+            self.wakes()
+        self.assertLess(time.monotonic() - started, 5, "ten passes beside a tool that blocks for 30 s")
+        self.assertTrue(self.source().thread.is_alive(), "the tool is still blocked: the passes did not wait for it")
+        for _ in range(100):
+            if self.calls:
+                break
+            time.sleep(0.05)
+        self.assertEqual(len(self.calls), 1, "only the first folder has been asked: the passes started no process of their own")
+        gate.set()
+        self.source().thread.join(10)
+
+    def test_a_restart_restores_an_open_episode_and_no_second_wake_begins(self):
+        self.round(f0=120, f1=0)
+        self.round(f0=120, f1=0)
+        fresh = sb.SpotlightFacts()
+        fresh.bind(self.engine)
+        fresh.done = self.sg.check_all(self.dirs, self.engine.spotlight_runner)
+        facts = fresh()
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "spotlight.lost"]), 1, "the episode was restored from the file")
+        self.assertEqual(len({f.key for f in facts}), 1)
+
+    def test_no_chief_of_staff_means_no_wake_but_the_warning_shows(self):
+        self.engine.discovery.agents.pop("cos", None)
+        self.assertEqual(self.round(f0=120, f1=0), [])
+        self.assertEqual(self.round(f0=120, f1=0), [])
+        self.assertTrue(any("WARN" in line for line in self.lines()))
+
+    def test_a_guard_that_is_off_makes_no_fact_and_starts_nothing(self):
+        self.engine.config["spotlight_guard"] = False
+        self.world.tick(3601)
+        self.assertEqual(self.wakes(), [])
+        self.assertEqual(self.calls, [])
+
+    def test_a_failing_tool_exit_is_unknown(self):
+        self.engine.spotlight_runner = lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "0\n", "")
+        self.round()
+        self.assertTrue(all("unknown" in line for line in self.lines()), self.lines())
+
+    def test_a_bad_spotlight_guard_value_is_a_config_error_at_load(self):
+        for bad in ({"folders": ["/work/../etc"]}, {"folders": ["relative/dir"]}, {"enabled": "yes"}, 5):
+            self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "spotlight_guard": bad})
+            with self.assertRaises(sb.ConfigError) as caught:
+                sb.load_config()
+            self.assertIn("spotlight_guard", str(caught.exception))
+
+    def test_a_control_character_in_a_folder_name_never_reaches_a_line(self):
+        cfg = {"folders": ["/work/a\x1b[31mb"]}
+        self.assertNotIn("\x1b", self.sg.status_lines(cfg, None, 0)[0])
+        self.assertNotIn("\x1b", self.sg.wake_text("/work/a\x1b[31mb", 3, "fleet-switchboard"))
+
+    def test_s6_a_missing_or_empty_folder_is_not_checked(self):
+        empty = self.home / "empty"
+        empty.mkdir()
+        self.engine.config["spotlight_guard"] = {"folders": [str(self.home / "nope"), str(empty)]}
+        self.round()
+        lines = self.lines()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(all("not checked" in line for line in lines), lines)
+        self.assertFalse(any("excluded" in line for line in lines))
+        self.assertEqual(self.calls, [], "nothing to ask about")
+
+    def test_s7_a_missing_tool_a_timeout_and_odd_output_are_unknown(self):
+        for failure in (FileNotFoundError("mdfind"), subprocess.TimeoutExpired("mdfind", 5), "a count of zero, honestly\n"):
+            self.fail[0] = failure
+            self.assertEqual(self.round(), [])
+            self.assertEqual(self.round(), [])
+            lines = self.lines()
+            self.assertTrue(all("unknown" in line for line in lines), (failure, lines))
+            self.assertFalse(any("WARN" in line or "excluded" in line for line in lines))
+
+    def test_s8_it_changes_no_setting_and_writes_only_its_own_file(self):
+        before = {d: sorted(os.listdir(d)) for d in self.dirs}
+        for _ in range(3):
+            self.round(f0=0, f1=0)
+        self.assertEqual({d: sorted(os.listdir(d)) for d in self.dirs}, before)
+        self.assertIn("spotlight-guard.json", os.listdir(self.world.state))
+        self.assertEqual([n for n in os.listdir(self.world.state) if n.endswith(".tmp")], [], "no leftover temp file")
+        self.assertTrue(self.calls and all(call[0] == "mdfind" and "-count" in call and call[1] == "-onlyin" for call in self.calls), self.calls)
+
+    def test_s8b_the_file_is_rewritten_only_when_an_answer_changed(self):
+        self.round(f0=0, f1=0)
+        path = Path(self.world.state) / "spotlight-guard.json"
+        os.utime(path, (1, 1))
+        self.round(f0=0, f1=0)
+        self.assertEqual(path.stat().st_mtime, 1)
+        self.round(f0=7, f1=0)
+        self.assertNotEqual(path.stat().st_mtime, 1)
+
+    def test_s9_a_bad_folder_list_is_refused_naming_the_key(self):
+        for bad in ({"folders": ["/work/../etc"]}, {"folders": "not a list"}, {"folders": ["relative/dir"]}):
+            with self.assertRaises(ValueError) as caught:
+                self.sg.validate(bad, "config")
+            self.assertIn("spotlight_guard.folders", str(caught.exception))
+        self.sg.validate({"folders": ["/work/code"], "enabled": True}, "config")
+        self.sg.validate(False, "config")
+
+    def test_the_count_is_the_last_whole_number_line_of_stdout_only(self):
+        self.assertEqual(self.sg.parse_count("noise\n0\n"), 0)
+        self.assertEqual(self.sg.parse_count("57\n"), 57)
+        for odd in ("", "abc\n", "12 files\n", "1\n2x\n"):
+            self.assertIsNone(self.sg.parse_count(odd), odd)
 
 
 class TestModuleLoader(Base):
