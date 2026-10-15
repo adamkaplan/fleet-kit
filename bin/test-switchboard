@@ -11545,7 +11545,7 @@ class TestChatClearOffers(unittest.TestCase):
         self.assertEqual(len(got["offers"]), self.cc.OFFERS_MAX)
         self.assertTrue(got["capped"])
         self.assertIn("acme/widget#7", got["offers"], "an offer that already existed is kept before a new one is taken")
-        long = self.cc.refresh_offers(self.state, [self.hold(1, ["u:hold-impact"], summary="x\x1b[31m" + "y" * 500 + "\n")], self.NAMES, 1006)["offers"]["acme/widget#1"]["summary"]
+        long = self.cc.refresh_offers(self.state, [self.hold(1, ["u:hold-impact"], summary="x\x1b[31m" + "ab " * 200 + "\n")], self.NAMES, 1006)["offers"]["acme/widget#1"]["summary"]
         self.assertEqual(len(long), self.cc.SUMMARY_MAX)
         self.assertNotIn("\x1b", long)
 
@@ -11709,6 +11709,255 @@ class TestChatClearOffers(unittest.TestCase):
             self.assertNotIn(word, source, "slice 1 reaches nothing: no process, no network, no GitHub write")
         main = (Path(sb.__file__).parent / "fleet-switchboard").read_text()
         self.assertNotIn("chat_clear", main, "no command or hook calls it yet in this slice (slice 3 adds the one hook and changes this test)")
+
+
+class _StubJev:
+    """A judge that answers from a table: {option: probability} for the options the question offers (the rest 0); counts its calls."""
+
+    def __init__(self, picks=None, error=None, junk=None):
+        self.picks, self.error, self.junk, self.calls = picks or {}, error, junk, []
+
+    def decide(self, state, questions):
+        self.calls.append((state, questions))
+        if self.error is not None:
+            raise self.error
+        criteria = questions["clears"]["criteria"]
+        if self.junk is not None:
+            return {"model": "m", "answers": {"clears": self.junk}, "usage": {}, "latency_ms": 1}
+        probabilities = {option: self.picks.get(option, 0.0) for option in criteria}
+        probabilities.setdefault("nothing", 0.0)
+        total = sum(probabilities.values()) or 1.0
+        probabilities = {k: v / total for k, v in probabilities.items()}
+        top = max(probabilities, key=lambda k: probabilities[k])
+        return {"model": "m", "answers": {"clears": {"type": "choice", "choice": top, "probabilities": probabilities}}, "usage": {}, "latency_ms": 7}
+
+
+class TestChatClearJudge(unittest.TestCase):
+    """#457 slice 2: the judge's one question and the decision. Fixtures only; nothing is cleared by this slice."""
+
+    P366, P389, P400 = "acme/widget#366", "acme/widget#389", "acme/widget#400"
+
+    def setUp(self):
+        self.cc = sb.load_module("chat_clear")
+        self.offers = {pr: {"head": "%08x" % (n * 4097) + "0" * 32, "shown": True, "shown_at": 1000, "labels": ["u:hold-impact"], "summary": "touches the gate %d" % n}
+                       for pr, n in ((self.P366, 366), (self.P389, 389), (self.P400, 400))}
+
+    def decide(self, text, jev, offers=None, created=1001, now=1002, **kw):
+        return self.cc.decide(jev, text, self.offers if offers is None else offers, created, now, **kw)
+
+    def test_a_confident_judge_that_picks_the_one_candidate_clears_and_one_call_is_made_with_the_offers(self):
+        jev = _StubJev({self.P366: 0.97, "several": 0.01, "asks": 0.01, "nothing": 0.01})
+        got = self.decide("366 is good to go", jev)
+        self.assertEqual((got["action"], got["pr"], got["why"]), ("clear", self.P366, "confirmed"))
+        self.assertEqual(len(jev.calls), 1)
+        state, questions = jev.calls[0]
+        self.assertEqual(state["message"], "366 is good to go")
+        self.assertEqual([h["pr"] for h in state["held"]], [self.P366, self.P389, self.P400])
+        self.assertEqual(list(questions["clears"]["criteria"]), [self.P366, self.P389, self.P400, "several", "asks", "nothing"])
+
+    def test_the_judge_never_widens_a_wrong_pr_a_number_less_message_or_a_hedge_is_a_question_whatever_it_says(self):
+        for text, why in (("the launchd one is good to go", "no_number"), ("366 is not good to go", "hedged"), ("is 366 good to go?", "hedged"),
+                          ("366 is good to go once CI passes", "hedged"), ("366 and 389 are good to go", "several_numbers"), ("500 is good to go", "not_offered")):
+            jev = _StubJev({self.P366: 0.99})   # a judge that would clear 366 at 0.99
+            got = self.decide(text, jev)
+            self.assertEqual((got["action"], got["why"]), ("ask", why), text)
+            self.assertEqual(len(jev.calls), 1, text)
+        jev = _StubJev({self.P389: 0.99})
+        got = self.decide("366 is good to go", jev)
+        self.assertEqual((got["action"], got["why"]), ("ask", "jev"), "the judge picks ANOTHER offer: not a confirmation")
+        for choice in ("several", "asks"):
+            got = self.decide("366 is good to go", _StubJev({choice: 0.99}))
+            self.assertEqual(got["action"], "ask", choice)
+
+    def test_a_message_from_before_the_offer_a_cut_message_and_an_old_offer_are_asked_about_never_cleared(self):
+        jev = _StubJev({self.P366: 0.99})
+        for kw, why in ((dict(created=1000), "before_offer"), (dict(created=999), "before_offer"), (dict(now=1000 + self.cc.OFFER_TTL + 1), "expired"), (dict(created=None), "no_time")):
+            got = self.decide("366 is good to go", jev, **kw)
+            self.assertEqual((got["action"], got["why"]), ("ask", why), kw)
+            self.assertIn("Nothing was cleared", got["question"])
+        got = self.decide("366 is good to go" + " " * self.cc.TEXT_MAX, jev)
+        self.assertEqual((got["action"], got["why"]), ("ask", "too_long"))
+        self.assertEqual(self.decide("366 is good to go", jev)["action"], "clear", "the same message, in time, clears")
+
+    def test_the_floor_is_an_allow_list_curly_apostrophes_exceptions_and_times_are_never_a_plain_clearing_sentence(self):
+        jev = _StubJev({self.P366: 0.99})
+        for text in ("366 isn\u2019t good to go", "366 isn't good to go", "366 don\u2019t clear", "366 won\u2019t be ready, but good to go", "366 is good to go except the docs",
+                     "366 is not yet good to go", "366 is good to go only after review", "366 is good to go without the tests", "366 is pending, good to go later",
+                     "366 is good to go tomorrow", "366 first then good to go", "366 is almost good to go", "366 is good to go soon", "366 is good to go while CI runs",
+                     "366 is still good to go", "366 good to go lol", "please do not clear 366 good to go", "366 is good to go \u2014 wait", "366 is good to go\nand 5 more words"):
+            got = self.decide(text, jev)
+            self.assertEqual((got["action"], got["why"]), ("ask", "hedged" if "\n" not in text else "several_numbers"), text)
+        self.assertEqual(self.decide("nope, 366", jev)["action"], "none", "a refusal with no clearing words in it is not about clearing: nothing is asked, nothing cleared")
+        for text in ("366 is good to go", "366 is good to go.", "#366 is good to go", "366 good to go", "ok to merge 366, thanks", "366 looks good, go ahead", "Please ship 366", "366 is cleared"):
+            self.assertEqual(self.decide(text, jev)["action"], "clear", text)
+
+    def test_a_report_about_the_past_is_not_a_grant_only_a_present_state_or_an_instruction_clears(self):
+        jev = _StubJev({self.P366: 0.99})
+        past = ("366 was merged", "366 was good to go", "366 shipped", "366 released", "366 merged", "366 cleared yesterday", "366 was cleared", "366 were cleared", "366 has been cleared",
+                "366 had been approved", "366 already cleared", "366 got merged", "366 is done", "366 went out", "366 was good, go ahead", "cleared 366", "approved 366",
+                "last 366 good to go", "earlier 366 is good to go", "366 good to go yesterday", "366 is already good to go", "366 has been good to go", "366 was approved",
+                "I cleared 366", "I approved 366", "we shipped 366", "366 was released", "366 released yesterday", "366 would be good to go", "366 had good to go",
+                "366. I cleared it", "366 I cleared it", "366 you approved it", "366 I approved", "366 you cleared it", "366 cleared it", "366 approved it", "please cleared 366",
+                "366 good to go cleared", "366 also cleared it", "366 is cleared it", "366 cleared, I think", "366 is approved by you", "thanks for the 366 approved", "thank you for 366 cleared", "you 366 approved", "thanks 366 cleared", "for 366 cleared", "then 366 cleared", "now 366 approved", "ok 366 cleared", "lgtm 366 approved", "a pr 366 approved", "ok 366 is approved, thanks", "366 thanks for the release", "366 thank you for the merge", "366 thanks for the approve", "366 good to go, thanks for the clear", "366 thanks ship", "366 thank you merge")
+        for text in past:
+            got = self.decide(text, jev)
+            self.assertNotEqual(got["action"], "clear", text)
+            if self.cc.CLEARISH.search(text):
+                self.assertEqual((got["action"], got["why"]), ("ask", "hedged"), text)
+        for text in ("366 is cleared", "366 cleared", "clear 366", "366 is approved", "366 approved", "approve 366", "ship 366", "release 366", "merge 366", "366 is good to go",
+                     "366 also good to go", "#366 is cleared.", "366 cleared, thanks", "366 is approved, thank you", "ok to merge 366, thanks", "ship 366, thank you", "please clear 366 thanks", "366 also approved", "ok to merge 366", "go ahead ship 366", "please clear 366"):
+            self.assertEqual(self.decide(text, jev)["action"], "clear", text)
+        for word in ("i", "was", "were", "had", "has", "have", "been", "got", "already", "merged", "shipped", "released", "done", "went", "yesterday", "earlier", "last"):
+            self.assertNotIn(word, self.cc.PLAIN_WORDS, word)
+
+    def test_a_bad_nan_boolean_or_lower_bar_is_the_floor_and_the_bar_can_only_be_raised(self):
+        for bar in (None, "x", [], float("nan"), True, 2, -1, 0, 0.1, 0.9, float("inf")):
+            jev = _StubJev({self.P366: 0.85, "asks": 0.15})
+            self.assertEqual(self.decide("366 is good to go", jev, min_confidence=bar)["action"], "ask", repr(bar))
+            self.assertEqual(self.decide("366 is good to go", _StubJev({self.P366: 0.95, "asks": 0.05}), min_confidence=bar)["action"], "clear", repr(bar))
+        self.assertEqual(self.decide("366 is good to go", _StubJev({self.P366: 0.95, "asks": 0.05}), min_confidence=0.97)["action"], "ask")
+
+    def test_an_answer_whose_choice_is_not_an_option_not_the_most_probable_tied_or_not_numbers_confirms_nothing(self):
+        for junk in ({"type": "choice", "choice": "acme/widget#999", "probabilities": {"acme/widget#999": 0.99}},
+                     {"type": "choice", "choice": self.P366, "probabilities": {self.P366: 0.95, self.P389: 0.97}},
+                     {"type": "choice", "choice": self.P366, "probabilities": {self.P366: 0.95, self.P389: 0.95}},
+                     {"type": "choice", "choice": self.P366, "probabilities": {self.P366: True}},
+                     {"type": "choice", "choice": self.P366, "probabilities": {self.P366: 1.5}},
+                     {"type": "choice", "choice": self.P366, "probabilities": {self.P366: 0.95, "x": "y"}},
+                     {"type": "choice", "choice": self.P366, "probabilities": {self.P366: float("nan")}},
+                     {"type": "choice", "choice": ["list"], "probabilities": {self.P366: 0.95}}, {"type": "choice", "choice": None, "probabilities": {}}):
+            got = self.decide("366 is good to go", _StubJev(junk=junk))
+            self.assertEqual((got["action"], got["why"]), ("ask", "jev"), junk)
+            self.assertFalse(got["judge"]["confident"], junk)
+
+    def test_every_reason_screen_can_give_has_a_sentence_and_nothing_that_looks_like_a_secret_reaches_the_judge_or_the_question(self):
+        reasons = set()
+        offers = dict(self.offers)
+        twice = {self.P366: self.offers[self.P366], "acme/other#366": dict(self.offers[self.P366])}
+        for text, o, created, now in (("x", offers, 1001, 1002), ("366 and 389", offers, 1001, 1002), ("500 good to go", offers, 1001, 1002), ("abc366 good to go", offers, 1001, 1002),
+                                      ("366 is not good", offers, 1001, 1002), ("9" * self.cc.TEXT_MAX, offers, 1001, 1002), ("366 good to go", twice, 1001, 1002),
+                                      ("366 good to go", offers, 1000, 1002), ("366 good to go", offers, 1001, 1000 + self.cc.OFFER_TTL + 5), ("366 good to go", offers, None, 1002)):
+            reasons.add(self.cc.screen(text, o, created, now)["why"])
+        reasons.discard(None)
+        self.assertEqual(reasons - set(self.cc.REASONS), set(), "a reason without a sentence would reach the owner as a raw code")
+        token = "ghp_" + "A1b2C3d4" * 4
+        secret_offers = {self.P366: dict(self.offers[self.P366], summary="touches %s and Bearer abcdefghijklmnop0123456789 and %s" % (token, "f" * 40))}
+        jev = _StubJev({self.P366: 0.99})
+        got = self.decide("366 is good to go", jev, offers=secret_offers)
+        self.assertEqual(got["action"], "clear")
+        self.assertNotIn(token, json.dumps(jev.calls) + json.dumps(got["judge"]))
+        self.assertNotIn("f" * 40, json.dumps(jev.calls))
+        self.assertIn("[secret]", json.dumps(jev.calls))
+        stub = _StubJev({self.P366: 0.99})
+        asked = self.decide("366 is good to go once %s" % token, stub, offers=secret_offers)
+        self.assertEqual(asked["action"], "ask")
+        self.assertEqual(len(stub.calls), 1, "the judge is still asked, and what it is sent holds no secret")
+        sent = stub.calls[0][0]["message"]
+        self.assertIn("[secret]", sent)
+        self.assertNotIn(token, json.dumps(stub.calls))
+        self.assertNotIn(token, asked["question"])
+        self.assertNotIn("abcdefghijklmnop0123456789", asked["question"])
+        shapes = ("github_pat_" + "a1B2c3D4" * 3, "sk-" + "a1B2c3D4" * 3, "xoxb-" + "1234567890" * 2, "AKIA" + "ABCDEFGH0123", "gho_" + "A1b2C3d4" * 3, "G" * 20 + "H" * 20 + "+/==",
+                  "f" * 40, "Bearer " + "x" * 20)
+        for shape in shapes:
+            self.assertEqual(self.cc._clean("see %s here" % shape, 200), "see [secret] here", shape)
+        for near in ("a" * 39 + " b", "ghp_short", "sk-short", "AKIA123", "a-normal-path/with/words and-numbers-12345"):
+            self.assertEqual(self.cc._clean(near, 200), near, "a near miss is kept: %s" % near)
+
+    def test_a_question_without_a_mark_a_symbol_and_a_sum_over_one_never_reach_a_clear(self):
+        jev = _StubJev({self.P366: 0.99})
+        for text in ("is 366 good to go", "was 366 approved", "is 366 ok to merge", "are 366 and ... good to go", "be 366 good to go", "366 good to go \u274c", "366 good to go /s",
+                     "366 good to go :)", "366 good to go - maybe", "366 good to go (not really)", "366 good to go; wait", "366 \U0001F44D good to go", "366 is good to go\u2026"):
+            got = self.decide(text, jev)
+            self.assertEqual(got["action"], "ask", text)
+            self.assertIn(got["why"], ("hedged", "no_number"), text)
+        for text in ("366, is it good to go", "366 was it ok to merge", "366 is it good to go", "ok to merge 366 is it", "366 good to go, are you ok", "366 good to go be ok",
+                     "366 good to go \uff15", "366 \u0663 good to go"):
+            got = self.decide(text, jev)
+            self.assertEqual((got["action"], got["why"]), ("ask", "hedged"), text)
+        for text in ("366 is good to go", "366 is good to go!", "ok to merge #366, thanks.", "Ship 366 now", "366 is approved", "366 good to go"):
+            self.assertEqual(self.decide(text, jev)["action"], "clear", text)
+        self.assertEqual(self.decide(None, jev)["action"], "none", "a non-string message is read as empty: no clearing words, nothing")
+        # a judge answer that is not validated can never say "not about clearing": the owner is still asked
+        for junk in ({"type": "choice", "choice": "nothing", "probabilities": {"nothing": 5}}, {"type": "choice", "choice": "nothing", "probabilities": {"nothing": 0.9, "asks": 0.9}},
+                     {"type": "choice", "choice": "nothing", "probabilities": {"nothing": 0.5, "asks": 0.5}}, {"type": "choice", "choice": "nothing", "probabilities": {"nothing": 0.9, "asks": 0.2, "x": -0.1}}):
+            got = self.decide("all good to go", _StubJev(junk=junk))
+            self.assertEqual(got["action"], "ask", junk)
+            self.assertIs(got["judge"]["validated"], False, "an answer that failed a check can never say 'not about clearing'")
+        got = self.decide("all good to go", _StubJev({"nothing": 0.9, "asks": 0.1}))
+        self.assertEqual(got["action"], "none", "a validated answer that says nothing stays quiet")
+        under = self.decide("366 is good to go", _StubJev(junk={"type": "choice", "choice": self.P366, "probabilities": {self.P366: 0.95}}))
+        self.assertEqual((under["action"], under["why"]), ("ask", "jev"), "probabilities that add up to 0.95 are not an answer")
+        extra = self.decide("366 is good to go", _StubJev(junk={"type": "choice", "choice": self.P366, "probabilities": {self.P366: 0.95, "asks": 0.05, "bogus": 0.0}}))
+        self.assertEqual(extra["action"], "clear")
+        self.assertNotIn("bogus", extra["judge"]["probabilities"], "only offered options are kept")
+        for junk in ({"type": "choice", "choice": self.P366, "probabilities": {self.P366: 0.95, self.P389: 0.9}},
+                     {"type": "choice", "choice": "nothing", "probabilities": ["x"]}, {"type": "choice", "choice": "nothing", "probabilities": {"nothing": "y"}},
+                     {"type": "choice", "choice": "nothing", "probabilities": {"nothing": 0.9, 5: 0.1}}, {"type": "choice", "choice": 5, "probabilities": {"nothing": 1.0}}):
+            for text in ("366 is good to go", "all good to go, thanks"):
+                got = self.decide(text, _StubJev(junk=junk))   # the decision never raises on a malformed answer
+                self.assertEqual(got["action"], "ask", (text, junk))
+
+    def test_all_impacts_cleared_asks_once_and_names_all_three_holds(self):
+        jev = _StubJev({"several": 0.95})
+        got = self.decide("all impacts cleared", jev)
+        self.assertEqual(len(jev.calls), 1, "one judge call, one question")
+        self.assertEqual((got["action"], got["why"]), ("ask", "no_number"))
+        for pr in (self.P366, self.P389, self.P400):
+            self.assertIn(pr, got["question"])
+        self.assertEqual(got["shown"], [self.P366, self.P389, self.P400])
+        self.assertEqual(got["question"].count("Nothing was cleared"), 1)
+
+    def test_an_unreachable_unsure_or_unreadable_judge_confirms_nothing_and_asks(self):
+        class Down(Exception):
+            reason = "unreachable"
+        for jev, fragment in ((_StubJev(error=Down("secret-token-in-text")), "jev unreachable"), (_StubJev({self.P366: 0.60, self.P389: 0.40}), "unsure"),
+                              (_StubJev(junk={"type": "choice", "choice": "x"}), "no probabilities"), (_StubJev(junk="junk"), "unreadable"), (None, "no judge")):
+            got = self.decide("366 is good to go", jev)
+            self.assertEqual((got["action"], got["why"]), ("ask", "jev"), fragment)
+            self.assertIn(fragment, got["judge"]["reason"])
+            self.assertFalse(got["judge"]["confident"])
+            self.assertNotIn("secret-token", json.dumps(got["judge"]), "an error's text is never kept")
+        self.assertEqual(self.decide("366 is good to go", _StubJev({self.P366: 0.89, "asks": 0.11}))["action"], "ask", "0.89 is below the bar")
+        self.assertEqual(self.decide("366 is good to go", _StubJev({self.P366: 0.95, "asks": 0.05}), min_confidence=0.99)["action"], "ask", "a higher configured bar raises it")
+        self.assertEqual(self.decide("366 is good to go", _StubJev({self.P366: 0.91, "asks": 0.09}), min_confidence=0.1)["action"], "clear", "a lower configured bar never lowers it below 0.9... and 0.91 passes")
+        self.assertEqual(self.decide("366 is good to go", _StubJev({self.P366: 0.85, "asks": 0.15}), min_confidence=0.1)["action"], "ask")
+
+    def test_chat_that_is_not_about_clearing_costs_no_judge_call_and_no_question_and_nothing_held_means_nothing(self):
+        jev = _StubJev({self.P366: 0.99})
+        for text in ("what is the weather", "thanks, 366 looks interesting", ""):
+            got = self.decide(text, jev)
+            self.assertEqual((got["action"], got["question"]), ("none", None), text)
+        self.assertEqual(jev.calls, [], "no clearing words: the judge was not called")
+        got = self.decide("366 is good to go", jev, offers={})
+        self.assertEqual((got["action"], got["why"]), ("none", "no_offers"))
+        self.assertEqual(jev.calls, [])
+        got = self.decide("all good to go, thanks", _StubJev({"nothing": 0.9}))
+        self.assertEqual((got["action"], got["why"]), ("none", "not about clearing"), "the judge says it is not about clearing: the owner is not asked")
+        got = self.decide("366 is good to go", _StubJev({"nothing": 0.95}))
+        self.assertEqual(got["action"], "none")
+
+    def test_the_question_names_the_new_head_cleans_control_characters_and_is_bounded(self):
+        offers = {"acme/widget#%d" % n: {"head": "a" * 40, "summary": "s\x1b[31m%d\n" % n} for n in range(30)}
+        text = self.cc.question_text("hedged", offers)
+        self.assertNotIn("\x1b", text)
+        self.assertEqual(text.count("\n- "), self.cc.QUESTION_OFFERS_MAX)
+        self.assertIn("and 20 more", text)
+        one = self.cc.question_text("jev", offers, ["acme/widget#3"], {"acme/widget#3": "b" * 40})
+        self.assertIn("it has a new head, bbbbbbbb, since you were shown this one", one)
+        self.assertIn("`3 is good to go`", one)
+
+    def test_the_real_replay_judge_reads_todays_three_messages_and_the_state_names_no_secret(self):
+        rules = [{"contains": "all impacts cleared", "choice": {"several": 0.95, "asks": 0.05}},
+                 {"contains": "389 also", "choice": {self.P389: 0.96, "nothing": 0.04}},
+                 {"contains": "366 is good", "choice": {self.P366: 0.97, "asks": 0.03}}]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "replay.json"
+            path.write_text(json.dumps({"rules": rules}))
+            jev = sb.ReplayJev(str(path), "m")
+            got = {text: self.decide(text, jev) for text in ("366 is good to go", "389 also good to go", "all impacts cleared")}
+        self.assertEqual([(g["action"], g["pr"]) for g in got.values()], [("clear", self.P366), ("clear", self.P389), ("ask", None)])
+        self.assertEqual(got["all impacts cleared"]["judge"]["jev_choice"], "several")
 
 
 class TestHeadlessPresence(Base):
@@ -51594,6 +51843,167 @@ class TestTempJanitorResume(Base):
         stamp = os.stat(str(self.state / self.jan.CURSOR_FILE)).st_mtime_ns
         self.jan.write_cursor(self.state, self.cursor())
         self.assertEqual(os.stat(str(self.state / self.jan.CURSOR_FILE)).st_mtime_ns, stamp, "written only when it changes")
+
+
+class TestEarlyDecisionsWrite(DecisionsBase):
+    """Ask #467, slice 1: the decisions file is written as soon as its own sources are read, before the heavy fact sources."""
+
+    def setUp(self):
+        super().setUp()
+        self.path = self.world.state / sb.DECISIONS_FILE
+        self.seen = []
+
+    def heavy(self, steps, step_seconds):
+        """A fact source that takes `steps` x `step_seconds` of simulated time, looking at the decisions file after each step."""
+        def source():
+            for _ in range(steps):
+                self.world.tick(step_seconds)
+                self.seen.append((self.world.clock.now(), self.path.stat().st_mtime if self.path.exists() else None))
+                if len(self.seen) == 1 and self.path.exists():
+                    self.seen_file_at_first_step = json.loads(self.path.read_text())
+            return []
+        source.__name__ = "heavy_source"
+        self.world.engine.sources.append(source)
+        return source
+
+    def test_the_early_derivation_leaves_the_notice_time_accounting_as_it_was(self):
+        engine = self.world.engine
+        engine.notice_obs = {"last": 5.0}
+        engine.notice_effects = {"drop": set(), "unreadable": {}, "observed": {}}
+        real = sb.derive_decisions
+
+        def touching(eng, now):
+            eng.notice_obs["last"] = now
+            eng.notice_effects["observed"]["acme/api#7"] = 99
+            return real(eng, now)
+        with mock.patch.object(sb, "derive_decisions", touching):
+            self.assertTrue(sb.early_decisions(engine, types.SimpleNamespace(problems=[])))
+        self.assertEqual((engine.notice_obs, engine.notice_effects["observed"]), ({"last": 5.0}, {}))
+
+    def test_s1_a_first_pass_with_slow_reads_has_written_the_file_by_120_seconds(self):
+        self.ask_the_boss("Which database?")
+        started = self.world.clock.now()
+        self.heavy(steps=6, step_seconds=20)
+        self.world.engine.run_pass()
+        at, mtime = self.seen[5]
+        self.assertEqual(at - started, 120)
+        self.assertIsNotNone(mtime, "the file existed at 120 simulated seconds")
+        self.assertLessEqual(at - mtime, 120)
+        self.assertEqual([d["title"] for d in self.file()["decisions"]], ["Which database?"])
+
+    def test_s2_the_first_write_is_within_60_seconds_of_the_start_and_the_pass_writes_again_at_its_end(self):
+        self.ask_the_boss("Which database?")
+        started = self.world.clock.now()
+        self.heavy(steps=60, step_seconds=10)
+        self.world.engine.run_pass()
+        written = sorted({mtime for _, mtime in self.seen if mtime is not None})
+        self.assertLessEqual(self.seen[0][1] - started, 60, "the first write")
+        self.assertEqual(self.seen[0][1], self.seen[-1][1], "nothing was written while the heavy source ran (this slice bounds the age to the threshold plus the heavy time: the budgets of the next slice keep that under the bound)")
+        self.assertEqual(len(written), 1)
+        self.assertGreater(self.path.stat().st_mtime, written[0], "and the end of the pass wrote (touched) it again")
+        self.assertEqual(self.path.stat().st_mtime, self.world.clock.now())
+
+    def test_s3_a_pass_that_cannot_read_its_decision_sources_writes_and_touches_nothing(self):
+        touched = []
+        real = os.utime
+        self.heavy(steps=3, step_seconds=60)
+        with mock.patch.object(sb, "derive_decisions", side_effect=OSError("cannot read")), \
+                mock.patch.object(os, "utime", lambda path, *a, **k: (touched.append(str(path)), real(path, *a, **k))[1]):
+            self.world.engine.run_pass()
+        self.assertFalse(self.path.exists())
+        self.assertEqual([p for p in touched if "decisions" in p], [], "no call set the time of the decisions file")
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "decisions.early_error"], "the early step said so")
+
+    def test_a_fresh_file_is_left_to_the_end_of_the_pass_exactly_as_before(self):
+        self.ask_the_boss("Which database?")
+        self.world.engine.run_pass()
+        mtime = self.path.stat().st_mtime
+        calls = []
+        real = sb.derive_decisions
+        with mock.patch.object(sb, "derive_decisions", lambda *a, **k: (calls.append(1), real(*a, **k))[1]):
+            self.world.tick(10)
+            self.world.engine.run_pass()
+        self.assertEqual(len(calls), 1, "steady state derives once per pass, at the end, as before")
+        self.assertGreater(self.path.stat().st_mtime, mtime)
+
+    def test_the_early_file_carries_the_pending_permission_requests_and_the_worker_source_is_read_once(self):
+        self.world.v2.start_turn(self.world.sessions["coder"], "fleet task", fleet=True, lasts=86400)
+        self.world.herdr.panes[self.world.panes["coder"]]["status"] = "blocked"
+        self.world.v2.ask_permission(self.world.sessions["coder"])
+        worker = next(src for src in self.world.engine.sources if isinstance(src, sb.WorkerFacts))
+        calls = []
+        real = type(worker).__call__
+        with mock.patch.object(type(worker), "__call__", lambda self_: (calls.append(1), real(self_))[1]):
+            self.heavy(steps=3, step_seconds=60)
+            self.world.engine.run_pass()
+        early = self.seen_file_at_first_step
+        self.assertTrue([d for d in early["decisions"] if d["kind"] == "permission"], "the early file already lists the pending request")
+        self.assertEqual(len(calls), 1, "the worker source was read once in the pass, not twice")
+        self.assertTrue([d for d in self.file()["decisions"] if d["kind"] == "permission"])
+
+    def test_a_worker_source_that_raises_in_the_early_step_writes_nothing_and_is_read_again_by_the_pass(self):
+        self.path.write_text('{"an": "older daemon version"}')
+        old = self.world.clock.now() - 1000
+        os.utime(str(self.path), (old, old))
+        worker = next(src for src in self.world.engine.sources if isinstance(src, sb.WorkerFacts))
+        calls = []
+
+        def flaky(self_):
+            calls.append(1)
+            if len(calls) == 1:
+                raise OSError("herdr went away")
+            return []
+        discovery = self.world.engine.discover(self.world.clock.now())
+        with mock.patch.object(type(worker), "__call__", flaky):
+            self.assertFalse(sb.early_decisions(self.world.engine, discovery))
+            self.assertEqual(self.path.read_text(), '{"an": "older daemon version"}', "nothing was written or touched")
+            self.assertEqual(self.world.engine._early_facts, {}, "nothing is kept for the pass")
+            self.world.engine.collect_facts()
+        self.assertEqual(len(calls), 2, "the pass read the worker source itself")
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "decisions.early_error"])
+
+    def test_early_facts_never_carry_over_into_a_later_pass(self):
+        self.world.engine._early_facts = {id(object()): ["stale"]}
+        self.world.engine.run_pass()
+        self.assertEqual(self.world.engine._early_facts, {})
+
+    def test_a_pass_that_could_not_read_the_fleet_writes_nothing_early_and_an_old_shape_file_is_replaced(self):
+        self.path.write_text('{"an": "older daemon version"}')
+        old = self.world.clock.now() - 1000
+        os.utime(str(self.path), (old, old))
+        engine = self.world.engine
+        real = engine.discover
+        engine.discover = lambda now: (lambda d: (d.problems.append("herdr could not be read") or d))(real(now))
+        self.assertFalse(sb.early_decisions(engine, engine.discover(self.world.clock.now())), "half a fleet is never published as fresh")
+        self.assertEqual(self.path.read_text(), '{"an": "older daemon version"}')
+        engine.discover = real
+        self.assertTrue(sb.early_decisions(engine, real(self.world.clock.now())), "a stale file of another shape is replaced, not a crash")
+        self.assertEqual(sorted(self.file()), ["daemon_pid", "decisions", "errors", "generation", "written_at"])
+
+    def test_the_threshold_is_a_third_of_the_staleness_bound_and_a_file_just_under_it_is_left_alone(self):
+        self.assertEqual(sb.EARLY_DECISIONS_AGE, sb.DECISIONS_STALE_SECONDS // 3)
+        self.world.engine.run_pass()
+        discovery = self.world.engine.discover(self.world.clock.now())
+        for age, expected in ((sb.EARLY_DECISIONS_AGE - 1, False), (sb.EARLY_DECISIONS_AGE, True)):
+            stamp = self.world.clock.now() - age
+            os.utime(str(self.path), (stamp, stamp))
+            sb.early_decisions(self.world.engine, discovery)
+            self.assertEqual(self.path.stat().st_mtime != stamp, expected, "at %d s the file is %s" % (age, "refreshed" if expected else "left alone"))
+
+    def test_a_missing_or_stale_file_is_written_before_the_fact_sources_run(self):
+        self.ask_the_boss("Which database?")
+        order = []
+        real_collect = self.world.engine.collect_facts
+        self.world.engine.collect_facts = lambda: (order.append(("collect", self.path.exists())), real_collect())[1]
+        self.world.engine.run_pass()
+        self.assertEqual(order[0], ("collect", True), "the file existed when the fact sources were collected")
+        order.clear()
+        self.world.tick(sb.EARLY_DECISIONS_AGE + 30)
+        before = self.path.stat().st_mtime
+        stale = []
+        self.world.engine.collect_facts = lambda: (stale.append(self.path.stat().st_mtime), real_collect())[1]
+        self.world.engine.run_pass()
+        self.assertGreater(stale[0], before, "a stale file was rewritten before the sources were collected")
 
 
 if __name__ == "__main__":
