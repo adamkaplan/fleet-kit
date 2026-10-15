@@ -8521,7 +8521,7 @@ def decision_repos(engine):
     return watched_repos(engine.config, discovered_fleets(engine.discovery))
 
 
-# ---- a batch: related findings raised as ONE decision (one issue, one `decision-rows` block in its body)
+# ---- a batch: related findings raised as ONE decision (one issue, one Markdown section per row in its body)
 
 BATCH_FENCE = decision_core.BATCH_FENCE
 BATCH_ROWS_MAX = decision_core.BATCH_ROWS_MAX            # rows one batch may carry (the panel draws one line or two per row)
@@ -8558,11 +8558,11 @@ def batch_headline(title, count):
 
 
 def batch_body(name, rows):
-    lines = "\n".join("%s | %s | %s" % (r["ref"], r["finding"], r["recommendation"]) for r in rows)
-    return ("Related findings raised as ONE decision (%d rows) by %s. Each row is `<issue> | <finding> | <recommendation>`; "
-            "one answer (`as recommended`, or per-row changes) answers every row. Nothing here changes the row "
-            "issues: the raising orchestrator acts on the answer.\n\n```%s\n%s\n```\n\n%s"
-            % (len(rows), name, BATCH_FENCE, lines, fleet_mark(name)))
+    """The issue body of a batch: a short introduction, then one Markdown section for each row in FULL (see decision_core.batch_row_sections), then the fleet's mark."""
+    return ("Related findings raised as ONE decision (%d rows) by %s. Each section below is one row: the issue, the finding and the recommendation, "
+            "in full. One answer (`as recommended`, or per-row changes) answers every row. Nothing here changes the row "
+            "issues: the raising orchestrator acts on the answer.\n\n%s\n\n%s"
+            % (len(rows), name, decision_core.batch_row_sections(rows), fleet_mark(name)))
 
 
 def decisions_from_github(engine, now):
@@ -27394,15 +27394,22 @@ def read_batch_rows(args):
     lines.extend(line for line in more if line.strip())
     if not lines:
         raise BatchError("a batch needs rows: --row \"<repo#N> | <finding> | <recommendation>\" (repeat it), or --file")
-    if len(lines) > BATCH_ROWS_MAX:
+    if len(lines) > decision_core.BATCH_RAISE_ROWS_MAX:
         raise BatchError("a batch is at most %d rows (this one is %d): raise the rest as a second batch"
-                         % (BATCH_ROWS_MAX, len(lines)))
-    return [parse_batch_row(line) for line in lines]
+                         % (decision_core.BATCH_RAISE_ROWS_MAX, len(lines)))
+    rows = [parse_batch_row(line) for line in lines]   # the FULL text: it is cut only when a list or the panel draws it
+    for number, row in enumerate(rows, 1):
+        for part, text, cap in (("finding", row["finding"], decision_core.BATCH_FINDING_RAISE_MAX),
+                                ("recommendation", row["recommendation"], decision_core.BATCH_REC_RAISE_MAX)):
+            if len(text) > cap:
+                raise BatchError("the %s of row %d is %d characters: it is at most %d; shorten it or split the row, nothing was raised"
+                                 % (part, number, len(text), cap))
+    return rows
 
 
 def cmd_decision_batch(args, runner, now):
     """`decisions batch`: an orchestrator raises related findings as ONE issue in ITS OWN repo, labelled for the
-    Chief of Staff, with the rows in a fenced `decision-rows` block. Creates nothing anywhere else."""
+    Chief of Staff, with the rows as Markdown sections. Creates nothing anywhere else."""
     try:
         engine, _, config = build_engine(runner, now, "cli")
         name, role, fleet = orders_caller(engine, args)
@@ -27422,10 +27429,14 @@ def cmd_decision_batch(args, runner, now):
                 raise BatchError("row %r names an issue outside %s: a batch holds only issues of its own repo, so a "
                                  "finding about a private repo can never land in a public one's batch. Raise it from "
                                  "that repo's orchestrator" % (_one_line(row["ref"], 60), repo))
+        body = batch_body(name, rows)
+        if len(body) > decision_core.BATCH_BODY_MAX_CHARS:
+            raise BatchError("the batch is %d characters: the issue body is at most %d (GitHub's limit is 65536); raise the rest as a second batch, nothing was raised"
+                             % (len(body), decision_core.BATCH_BODY_MAX_CHARS))
         subject = "issue:%s" % repo
         with engine._external("decisions.batch", subject, {"repo": repo, "rows": len(rows), "by": name}):
             done = _gh_write(engine, runner, repo, "repos/%s/issues" % repo, "POST",
-                             {"title": title, "body": batch_body(name, rows),
+                             {"title": title, "body": body,
                               "labels": [awaiting_cos_label(config)]})
         try:
             made = json.loads(done.stdout or "")
@@ -27473,6 +27484,19 @@ def batch_answer_rows(decision, args):
     return out
 
 
+def batch_answer_lines(outcomes, note):
+    """The lines of the comment that records a batch answer (the one place its format is built, so a test measures what is posted)."""
+    changed = sum(1 for _, _, c in outcomes if c)
+    lines = ["Answer to this batch (%d rows): %s." % (len(outcomes), "as recommended" if not changed else
+                                                      "%d row%s changed, the rest as recommended"
+                                                      % (changed, "" if changed == 1 else "s"))]
+    lines += ["%d. %s: %s" % (n, row["ref"], text) for n, (row, text, _) in enumerate(outcomes, 1)]
+    if note:
+        lines.append("Note: %s" % _one_line(note, 300))
+    lines.append("The row issues were not changed by this answer: the orchestrator that raised the batch acts on it.")
+    return lines
+
+
 def answer_batch(engine, runner, decision, args, name):
     """First the note to the orchestrator that raised the batch; only once it is delivered, ONE comment on the batch
     issue recording every row's outcome, then both awaiting labels off it, so the batch and all its rows leave the
@@ -27487,13 +27511,12 @@ def answer_batch(engine, runner, decision, args, name):
     repo, number = target
     outcomes = batch_answer_rows(decision, args)
     changed = sum(1 for _, _, c in outcomes if c)
-    lines = ["Answer to this batch (%d rows): %s." % (len(outcomes), "as recommended" if not changed else
-                                                      "%d row%s changed, the rest as recommended"
-                                                      % (changed, "" if changed == 1 else "s"))]
-    lines += ["%d. %s: %s" % (n, row["ref"], text) for n, (row, text, _) in enumerate(outcomes, 1)]
-    if args.note:
-        lines.append("Note: %s" % _one_line(args.note, 300))
-    lines.append("The row issues were not changed by this answer: the orchestrator that raised the batch acts on it.")
+    lines = batch_answer_lines(outcomes, args.note)
+    size = len("\n".join(lines))
+    if size > decision_core.BATCH_COMMENT_MAX_CHARS:   # before ANY side effect (the note, the comment, the labels): refused whole, nothing sent or written
+        raise DecisionError("%s was not answered: the answer comment would be %d characters and a comment holds at most %d (the rows' recommendations are long); "
+                            "nothing was sent or written. Shorten the --row choices or the --note, or answer from the issue itself"
+                            % (ident, size, decision_core.BATCH_COMMENT_MAX_CHARS))
     told = ""
     raised = decision.get("raised_by")
     if raised and name:

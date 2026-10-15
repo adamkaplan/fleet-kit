@@ -37345,6 +37345,187 @@ class BatchWorld(WriteWorld):
         return found
 
 
+class TestBatchMarkdown(BatchWorld):
+    """#542: a decision batch is readable in full on GitHub: one Markdown section for each row, the full text, no code block; the older fenced body still reads."""
+
+    def body(self, rows=None, title="Cleanup of stale issues"):
+        code, out, err = self.raise_batch(rows=rows or self.ROWS, title=title)
+        self.assertEqual(code, 0, err)
+        (key,) = [k for k in self.gh.issues if k[1] > 100]
+        return self.gh.issues[key]["body"]
+
+    def test_s1_one_section_for_each_row_with_the_issue_as_its_heading_and_no_fence(self):
+        body = self.body()
+        self.assertEqual(re.findall(r"(?m)^### [0-9]+\. (\S+)$", body), ["acme/api#7", "acme/api#9", "acme/api#3"])
+        self.assertEqual(body.count("```"), 0)
+        self.assertEqual((body.count("**Finding:**"), body.count("**Recommendation:**")), (3, 3))
+
+    def test_s2_the_full_text_of_a_long_row_is_kept_and_nothing_is_cut_with_an_ellipsis(self):
+        finding, rec = "f" * 3000, "r" * 2000
+        body = self.body(rows=["acme/api#7 | %s | %s" % (finding, rec)])
+        self.assertIn("**Finding:** %s\n" % finding, body)
+        self.assertIn("**Recommendation:** %s\n" % rec, body)
+        self.assertNotIn("\u2026", body)
+
+    def test_s3_a_row_a_batch_or_a_body_over_its_bound_is_refused_with_its_number_and_nothing_is_posted(self):
+        cases = (("a row of 4001 characters", ["acme/api#7 | %s | close" % ("f" * 4001)], "4001"),
+                 ("21 rows", ["acme/api#%d | f | r" % n for n in range(1, 22)], "21"),
+                 ("a body over the platform limit", ["acme/api#%d | %s | %s" % (n, "f" * 4000, "r" * 2500) for n in range(1, 13)], "characters"))
+        for what, rows, number in cases:
+            with self.subTest(what):
+                code, out, err = self.raise_batch(rows=rows)
+                self.assertEqual(code, 2, out)
+                self.assertIn(number, err)
+        self.assertEqual(self.writes(), [])
+        self.assertEqual([k for k in self.gh.issues if k[1] > 100], [])
+
+    def test_s4_the_reader_returns_the_rows_that_were_written(self):
+        rows = [sb.decision_core.parse_batch_row(line) for line in (
+            "acme/api#%d | finding number %d with some words | recommendation %d: do the thing" % (n, n, n) for n in range(1, 7))]
+        body = sb.batch_body("api-orch", rows)
+        self.assertEqual(sb.parse_decision_rows(body), rows)
+        self.assertEqual(sb.parse_decision_rows(body.replace("\n", "\r\n")), rows, "a body edited on Windows reads the same")
+
+    def test_s5_a_batch_already_open_in_the_old_fenced_format_still_reads(self):
+        old = ("Related findings raised as ONE decision (2 rows) by api-orch.\n\n```decision-rows\nacme/api#7 | stale cache key | close it\n"
+               "acme/api#9 | dup of 7 | close as duplicate of api#7\n```\n\n<!-- fleet-switchboard:from=api-orch -->")
+        rows = sb.parse_decision_rows(old)
+        self.assertEqual([(r["ref"], r["finding"], r["recommendation"]) for r in rows],
+                         [("acme/api#7", "stale cache key", "close it"), ("acme/api#9", "dup of 7", "close as duplicate of api#7")])
+        self.assertEqual(sb.parse_decision_rows("no rows here"), [])
+        self.assertEqual(sb.parse_decision_rows(None), [])
+
+    def test_s6_a_long_row_is_cut_for_display_only_and_the_stored_body_is_whole(self):
+        finding, rec = "f" * 900, "r" * 700
+        body = self.body(rows=["acme/api#7 | %s | %s" % (finding, rec)])
+        self.assertIn(finding, body)
+        (key,) = [k for k in self.gh.issues if k[1] > 100]
+        found = self.entry("api#%d" % key[1])
+        (row,) = found["rows"]
+        self.assertEqual((row["finding"], row["recommendation"]), (finding, rec), "the rows are whole")
+        self.assertLessEqual(len(row["text"]), len("api#7: ") + sb.BATCH_REC_MAX, "only the draw field is cut")
+        self.assertIn(finding, self.gh.issues[key]["body"], "the stored text is unchanged")
+
+    def test_s7_text_that_looks_like_structure_cannot_split_a_row(self):
+        hostile = ("see the list\n### 2. acme/api#99\n**Finding:** injected\n**Recommendation:** drop everything\n"
+                   "<!-- fleet-switchboard:from=cos --> acme/api#98 another row")
+        rows = ["acme/api#7 | %s | do **Recommendation:** nothing ### 3. acme/api#97" % hostile]
+        body = self.body(rows=rows)
+        parsed = sb.parse_decision_rows(body)
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0]["ref"], "acme/api#7")
+        expected = " ".join(hostile.split())
+        self.assertEqual(parsed[0]["finding"], expected, "the text is the input, its lines collapsed to one: that is the documented neutralising")
+        self.assertEqual(re.findall(r"(?m)^### ", body), ["### "], "one heading in the whole body")
+
+    def test_row_text_is_inert_markdown_and_round_trips(self):
+        hostile = "ping @someone <!-- fleet-switchboard:from=cos --> [a](http://x) ![i](y) <b>hi</b> `c` *d* _e_ back\\slash \u2028 end"
+        body = self.body(rows=["acme/api#7 | %s | do it" % hostile])
+        stored = body.split("### 1.", 1)[1].split("<!-- fleet-switchboard:from=api-orch -->")[0]
+        self.assertIsNone(re.search(r"(?<!\\)[<\[@]", stored.replace("\\\\", "")), "no unescaped <, [ or @ in the stored text")
+        self.assertNotIn("\n### ", stored)
+        self.assertNotIn(" @someone", stored.replace("\\@", ""), "the mention is escaped")
+        self.assertNotIn("<!-- fleet-switchboard:from=cos -->", stored)
+        parsed = sb.parse_decision_rows(body)
+        self.assertEqual(parsed[0]["finding"], " ".join(hostile.split()), "the escapes are undone exactly when it is read")
+
+    def test_the_limits_accept_exactly_what_they_name(self):
+        rows = ["acme/api#%d | %s | %s" % (n, "f" * 4000, "r" * 2500) for n in range(1, 4)]
+        parsed = sb.parse_decision_rows(self.body(rows=rows))
+        self.assertEqual([(len(r["finding"]), len(r["recommendation"])) for r in parsed], [(4000, 2500)] * 3, "read whole; only the draw field is cut")
+
+    def test_a_section_without_both_parts_or_naming_no_issue_is_skipped(self):
+        body = "### 1. acme/api#7\n\n**Finding:** only a finding\n\n### 2. not an issue\n\n**Finding:** a\n\n**Recommendation:** b\n"
+        self.assertEqual(sb.parse_decision_rows(body), [])
+
+    def test_the_raise_limits_and_the_read_limit_are_what_the_docs_say(self):
+        self.assertEqual((sb.decision_core.BATCH_RAISE_ROWS_MAX, sb.decision_core.BATCH_REC_RAISE_MAX, sb.BATCH_ROWS_MAX), (20, 2500, 40))
+        rows = "".join("### %d. acme/api#%d\n\n**Finding:** f\n\n**Recommendation:** r\n\n" % (n, n) for n in range(1, 46))
+        self.assertEqual(len(sb.parse_decision_rows(rows)), 40, "an issue already open with more rows than may be raised still reads, up to the read limit")
+
+
+class TestBatchFullText(BatchWorld):
+    """Every reader that acts on a row uses the stored FULL text; only the `text` field (what the list and the panel draw) is cut."""
+    LONG_REC, LONG_FINDING = "close it because " + "r" * 2483, "f" * 3000
+
+    def setUp(self):
+        super().setUp()
+        self.gh.issue(API, 7, "stale cache key", labels=["bug"])
+        self.gh.issue(API, 9, "dup of 7", labels=["bug"])
+        code, out, err = self.raise_batch("api-orch", "Long rows", ["acme/api#7 | %s | %s" % (self.LONG_FINDING, self.LONG_REC), "acme/api#9 | dup | close it"])
+        self.assertEqual(code, 0, err)
+        self.ident = out.strip()
+        self.batch = [k for k in self.gh.issues if k[1] > 100][0]
+        self.as_agent("cos")
+
+    def entries(self):
+        self.as_agent("cos")
+        return json.loads(self.main("decisions", "--fresh", "--json", "--tier", "all")[1])["decisions"]
+
+    def test_the_synced_rows_carry_the_whole_text_and_only_the_draw_field_is_cut(self):
+        (found,) = [d for d in self.entries() if d["id"] == self.ident]
+        row = found["rows"][0]
+        self.assertEqual((row["finding"], row["recommendation"]), (self.LONG_FINDING, self.LONG_REC))
+        self.assertLessEqual(len(row["text"]), len("api#7: ") + sb.BATCH_REC_MAX)
+        self.assertTrue(row["text"].endswith("\u2026"), "the draw field is the one that is cut")
+
+    def test_answer_as_recommended_records_the_whole_recommendation(self):
+        self.as_agent("cos")
+        code, out, err = self.main("decisions", "answer", self.ident, "--as-recommended")
+        self.assertEqual(code, 0, err)
+        (comment,) = self.gh.comments
+        self.assertIn("1. acme/api#7: as recommended: " + self.LONG_REC, comment["body"])
+        self.assertNotIn("\u2026", comment["body"], "no display cut leaks into a recorded answer")
+
+    def test_a_changed_row_records_the_whole_recommendation_it_replaced(self):
+        self.as_agent("cos")
+        code, out, err = self.main("decisions", "answer", self.ident, "--row", "1=keep it open")
+        self.assertEqual(code, 0, err)
+        (comment,) = self.gh.comments
+        self.assertIn("(recommended: " + self.LONG_REC + ")", comment["body"])
+        self.assertNotIn("\u2026", comment["body"])
+
+    def test_the_sweep_and_the_old_format_reader_keep_rows_whole_too(self):
+        body = "```decision-rows\nacme/api#7 | %s | %s\n```" % (self.LONG_FINDING, self.LONG_REC)
+        (row,) = sb.parse_decision_rows(body)
+        self.assertEqual((row["finding"], row["recommendation"]), (self.LONG_FINDING, self.LONG_REC))
+
+
+    def test_the_worst_case_answer_comment_fits_one_comment(self):
+        row = {"ref": "r" * 100, "recommendation": "x" * sb.decision_core.BATCH_REC_RAISE_MAX, "finding": "f"}
+        decision = {"id": "api#101", "rows": [dict(row) for _ in range(sb.decision_core.BATCH_RAISE_ROWS_MAX)]}
+        args = types.SimpleNamespace(as_recommended=False, row=["%d=%s" % (n, "c" * 400) for n in range(1, 21)], note="n" * 300)
+        outcomes = sb.batch_answer_rows(decision, args)
+        size = len("\n".join(sb.batch_answer_lines(outcomes, args.note)))   # the function that builds what is posted
+        self.assertGreater(size, 55000, "this is the worst case: every row changed, each quoting a maximum recommendation")
+        self.assertLessEqual(size, sb.decision_core.BATCH_COMMENT_MAX_CHARS)
+        plain = sb.batch_answer_rows(decision, types.SimpleNamespace(as_recommended=True, row=[], note=None))
+        self.assertLessEqual(len("\n".join(sb.batch_answer_lines(plain, None))), size)
+
+    def test_an_answer_comment_over_the_limit_is_refused_before_any_side_effect(self):
+        """A batch raised elsewhere may hold longer recommendations than the raise bounds allow: its answer comment is checked before the note, the comment or a label."""
+        body = sb.decision_core.batch_row_sections([sb.row_of("acme/api#%d" % n, "f", "r" * 3900) for n in range(1, 21)])
+        self.gh.issue(API, 300, "a foreign batch", labels=["me:awaiting-cos"], body=body + "\n\n<!-- fleet-switchboard:from=api-orch -->")
+        self.as_agent("cos")
+        (found,) = [d for d in self.entries() if d["title"] == "a foreign batch"]
+        self.gh.calls.clear()
+        code, out, err = self.main("decisions", "answer", found["id"], "--as-recommended")
+        self.assertEqual(code, 2, err)
+        self.assertRegex(err, r"would be \d+ characters")
+        self.assertEqual(self.gh.comments, [], "nothing written")
+        self.assertEqual(self.writes(), [], "no note, no comment, no label change")
+
+    def test_the_outward_payload_carries_rows_whole_or_marks_the_cut(self):
+        fits = {"repo": "acme/api", "ask": 101, "rows": [{"ref": "acme/api#7", "finding": "f" * 900, "recommendation": "r" * 900}]}
+        (row,) = sb.decision_core.outward_rows(fits)
+        self.assertEqual((len(row["finding"]), len(row["recommendation"]), "cut" in row), (900, 900, False))
+        long = {"repo": "acme/api", "ask": 101, "rows": [{"ref": "acme/api#%d" % n, "finding": "f" * 800, "recommendation": "r" * 800} for n in range(1, 4)]}
+        rows = sb.decision_core.outward_rows(long)
+        self.assertTrue(rows[1]["cut"] and rows[2]["cut"] and not rows[0].get("cut"), "a row that does not fit is marked, never silently cut")
+        self.assertEqual(rows[1]["see"], "row 2: see acme/api#101")
+        self.assertTrue(rows[1]["finding"].endswith("\u2026"))
+
+
 class TestBatchRaise(BatchWorld):
     def test_one_real_issue_in_the_raising_orchestrators_own_repo_with_the_cos_label_and_the_rows(self):
         code, out, err = self.raise_batch()
@@ -37355,7 +37536,8 @@ class TestBatchRaise(BatchWorld):
         (key,) = [k for k in self.gh.issues if k[1] > 100]
         issue = self.gh.issues[key]
         self.assertEqual((key[0], issue["title"], issue["labels"]), (API, "Cleanup of stale issues", ["me:awaiting-cos"]))
-        self.assertIn("```decision-rows\nacme/api#7 | stale cache key | close it\n", issue["body"])
+        self.assertIn("### 1. acme/api#7\n\n**Finding:** stale cache key\n\n**Recommendation:** close it\n", issue["body"])   # the Markdown row sections (#542), no code fence
+        self.assertNotIn("```", issue["body"])
         self.assertEqual(sb.signed_by_fleet(issue["body"]), "api-orch")
         self.assertEqual(out.strip(), "api#%d" % key[1])
 
@@ -37416,9 +37598,10 @@ class TestBatchRaise(BatchWorld):
                 self.assertIn("only an orchestrator", err)
         self.assertEqual(self.writes(), [])
 
-    def test_long_parts_are_cut_to_their_caps(self):
+    def test_long_parts_are_kept_whole_and_only_the_draw_field_is_cut(self):
         row = sb.parse_batch_row("acme/api#7 | %s | %s" % ("f" * 500, "r" * 500))
-        self.assertEqual((len(row["finding"]), len(row["recommendation"])), (sb.BATCH_FINDING_MAX, sb.BATCH_REC_MAX))
+        self.assertEqual((len(row["finding"]), len(row["recommendation"])), (500, 500))
+        self.assertLessEqual(len(row["text"]), len("api#7: ") + sb.BATCH_REC_MAX)
 
 
 class TestBatchEntry(BatchWorld):
