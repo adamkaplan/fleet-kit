@@ -352,7 +352,7 @@ def timing_problem(offer, created, now):
 
 
 PLAIN_WORDS = frozenset(("a also ahead approve approved are be clear cleared fine go goes going good is it lgtm looks merge ok okay pr please ready release "
-                         "s ship thank thanks the through to you now for with then").split())
+                         "s ship thank thanks the through to you now then").split())
 # Past-tense and report words are NOT in the list (was, were, had, has, been, got, already, merged, shipped, released, done, went, yesterday, earlier, last ...): a message
 # about the past is a report, not a grant. `cleared` and `approved` are the owner's own grant words ("366 cleared", "366 is approved"), so they are allowed ONLY as a
 # state AFTER the number and followed by nothing but thanks: "cleared 366" and "approved 366" read as a report of what was done, and are refused.
@@ -379,6 +379,10 @@ def _plain_clearing(text):
     words = LETTERS.findall(text)
     if not all(word.lower() in PLAIN_WORDS for word in words):
         return False
+    lowered = [word.lower() for word in words]
+    thanks_at = next((n for n, word in enumerate(lowered) if word in ("thanks", "thank")), None)
+    if thanks_at is not None and any(word not in ("you", "thanks", "thank", "please", "now") for word in lowered[thanks_at + 1:]):
+        return False   # thanks ends a message ("ok to merge 366, thanks"); "366 thanks for the release" thanks for something already done
     first = DIGITS.search(text)
     if first is None:
         return not any(word.lower() in QUESTION_OPENERS for word in words)
