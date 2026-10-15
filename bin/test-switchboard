@@ -51135,6 +51135,14 @@ class TestMoveAnAsk(LanesCase):
         self.assertEqual((self.gh.writes, self.parents()), ([], [1]))
         self.assertEqual(len([e for e in self.world.audit() if e["event"] == "lanes.move.refused"]), 1)
 
+    def test_an_uncertain_identity_is_refused_audited_and_nothing_is_written(self):
+        with mock.patch.object(sb, "caller_fleet", side_effect=sb.IdentityUncertain("two panes claim this session")):
+            code, _, err = self.main("move", "2", "--to", "10")
+        self.assertEqual(code, 1)
+        self.assertIn("unidentified caller", err)
+        self.assertEqual((self.gh.writes, self.parents()), ([], [1]))
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "lanes.move.refused"]), 1)
+
     def test_the_operator_in_a_plain_shell_may_move(self):
         os.environ.pop("HERDR_PANE_ID", None)
         code, out, err = self.main("move", "2", "--to", "10")
