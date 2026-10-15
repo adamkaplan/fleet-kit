@@ -9786,19 +9786,22 @@ class LocalStore(decision_core.DecisionStore):
     def read(self, now):
         return decisions_report(self.engine.state_dir, now)
 
-    def publish(self, decisions, errors, now):
+    def publish(self, decisions, errors, now, provisional=False):
         """Write decisions.json when the list changed (or the file is missing or unreadable), atomically, mode
-        0600; otherwise touch it, so its age says the daemon is alive. Returns True when written."""
+        0600; otherwise touch it, so its age says the daemon is alive. Returns True when written. `provisional` (#467 slice 3: the early write of a pass that is
+        still reading) is kept in the file until the end of the pass publishes the final list: a change of that flag alone is a write."""
         engine = self.engine
         path = engine.state_dir / DECISIONS_FILE
         current = read_decisions_file(path)
-        if current is not None and current["decisions"] == decisions and current["errors"] == errors:
+        if current is not None and current["decisions"] == decisions and current["errors"] == errors and (current.get("provisional") is True) == bool(provisional):
             os.utime(str(path), (now, now))
             return False
         known = current.get("generation") if current is not None else None
         engine.decisions_generation = max(engine.decisions_generation, known if isinstance(known, int) else 0) + 1
         body = {"generation": engine.decisions_generation, "written_at": iso(now), "daemon_pid": os.getpid(),
                 "decisions": decisions, "errors": errors}
+        if provisional:
+            body["provisional"] = True
         temp = path.with_name("%s.%d.tmp" % (DECISIONS_FILE, os.getpid()))
         fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
@@ -10340,7 +10343,7 @@ def early_decisions(engine, discovery=None):
                     engine.__dict__[name] = kept[name]
                 else:
                     engine.__dict__.pop(name, None)
-        return bool(decision_store(engine).publish(decisions, errors, now))
+        return bool(decision_store(engine).publish(decisions, errors, now, provisional=True))   # provisional: the end of this pass publishes the final list
     except Exception as err:   # a pass that cannot read its decision sources writes nothing here; the end of the pass says the same
         engine._early_facts = {}
         engine._note("decisions.early_error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
@@ -10399,7 +10402,7 @@ def decisions_report(state_dir, now):
     `stale-as-fresh` fault an old file still counts as current."""
     path = Path(state_dir) / DECISIONS_FILE
     report = {"stale": True, "message": None, "age_seconds": None, "written_at": None, "generation": None,
-              "decisions": [], "errors": []}
+              "decisions": [], "errors": [], "provisional": False}
     try:
         age = now - path.stat().st_mtime
     except OSError:
@@ -10410,7 +10413,7 @@ def decisions_report(state_dir, now):
         report["message"] = "the daemon is not updating this list: %s cannot be read" % path
         return report
     report.update(decisions=body["decisions"], errors=body["errors"], written_at=body.get("written_at"),
-                  generation=body.get("generation"), age_seconds=max(0, int(age)))
+                  generation=body.get("generation"), age_seconds=max(0, int(age)), provisional=body.get("provisional") is True)
     if age > DECISIONS_STALE_SECONDS and not fault("stale-as-fresh"):
         report["message"] = "the daemon is not updating this list: %s was last written %s ago" % (
             DECISIONS_FILE, format_age(age))
@@ -10601,7 +10604,7 @@ def decisions_summary(state_dir, now):
             by_repo[decision["repo"]] = by_repo.get(decision["repo"], 0) + 1
     return {"count": len(listed), "stale": report["stale"], "message": report["message"],
             "age_seconds": report["age_seconds"], "errors": len(report["errors"]), "by_repo": by_repo,
-            "by_tier": by_tier, "cos_over_an_hour": over_cos}
+            "by_tier": by_tier, "cos_over_an_hour": over_cos, "provisional": report.get("provisional", False)}
 
 
 def format_decisions_status(summary):
@@ -10619,6 +10622,7 @@ def format_decisions_status(summary):
         line += "; also open: %s" % ", ".join(
             "%d with the Chief of Staff (%d over 1h)" % (count, summary.get("cos_over_an_hour", 0)) if tier == "cos"
             else "%d with an orchestrator" % count for tier, count in sorted(elsewhere.items()))
+    line += "; provisional: the pass that wrote it is still reading" if summary.get("provisional") else ""
     return [line + ("; %d source(s) could not be read" % summary["errors"] if summary["errors"] else "")]
 
 
@@ -10641,6 +10645,65 @@ def collect_source_toasts(engine):
             found[agent] = (reason, title, body)
     found.update(engine.pass_toasts)
     return found
+
+
+# ---- #467 slice 3: what is still catching up after a start, for `status` (which runs in another process)
+
+CATCHING_UP_FILE = "catching-up.json"
+CATCHING_UP_REWRITE_SECONDS = 120    # an unchanged pending state is rewritten this often, so its age says the daemon is alive
+CATCHING_UP_SHOW_SECONDS = 600       # `status` shows a record at most this old: a daemon that stopped updating it says nothing
+CATCHING_UP_LABELS = {"load_alert": "load alert", "charters": "charter orders", "catch_up": "catch-up"}
+
+
+def write_catching_up(engine):
+    """The pending state of the budgeted readers (`source_states`) as a small file: only what is still pending, names and counts (0600), rewritten only when it
+    changes or is older than CATCHING_UP_REWRITE_SECONDS. An idle pass with nothing pending writes nothing (the file, if there is one, is made empty once)."""
+    if engine.state_dir is None:
+        return False
+    pending = {name: info["pending"] for name, info in sorted(source_states(engine).items()) if info.get("state") == "pending"}
+    now = engine.now()
+    last = engine.__dict__.get("_catching_up_written")
+    if last is not None and last[0] == pending and (now - last[1] < CATCHING_UP_REWRITE_SECONDS or not pending):
+        return False
+    path = Path(engine.state_dir) / CATCHING_UP_FILE
+    if last is None and not pending and not path.exists():
+        engine._catching_up_written = (pending, now)
+        return False
+    temp = path.with_name("%s.%d.tmp" % (CATCHING_UP_FILE, os.getpid()))
+    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump({"at": iso(now), "sources": pending}, handle, sort_keys=True)
+            handle.write("\n")
+        os.replace(str(temp), str(path))
+    except BaseException:
+        try:
+            os.unlink(str(temp))
+        except OSError:
+            pass
+        raise
+    engine._catching_up_written = (pending, now)
+    return True
+
+
+def catching_up_lines(state_dir, now):
+    """For `status`: ONE line naming the sources still catching up, or [] (nothing pending, no file, a file that cannot be read, or a record the daemon has
+    stopped updating). Never raises."""
+    try:
+        body = json.loads((Path(state_dir) / CATCHING_UP_FILE).read_text())
+        sources = body["sources"]
+        written = datetime.strptime(body["at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+        if not isinstance(sources, dict) or now - written > CATCHING_UP_SHOW_SECONDS:
+            return []
+        parts = []
+        for name in sorted(sources):
+            waiting = [str(w) for w in sources[name] if isinstance(w, str)] if isinstance(sources[name], list) else []
+            if waiting:
+                label = CATCHING_UP_LABELS.get(name, str(name)[:30])
+                parts.append("%s (%d: %s%s)" % (label, len(waiting), ", ".join(_one_line(w, 40) for w in waiting[:3]), ", ..." if len(waiting) > 3 else ""))
+        return ["      catching up  %s" % "; ".join(parts)] if parts else []
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
 
 
 def finish_pass(engine, discovery, report):
@@ -10666,6 +10729,10 @@ def finish_pass(engine, discovery, report):
         publish_decisions(engine)
     except Exception as err:
         engine._failed("decisions", "decisions", err, report)
+    try:
+        write_catching_up(engine)
+    except Exception as err:
+        engine._failed("catching-up", "catching-up", err, report)
     try:
         health_write(engine, None, engine.now())   # #357: not tied to the GitHub ci recorder, which returns early on a fleet with no plan_gates
     except Exception as err:
@@ -14700,6 +14767,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         report["triage"] = triage_summary(state)  # #130
         report["ci_record"] = ci_record_status_line(state, now())
         report["pane_lines"] = pane_health_status_lines(state, now())
+        report["catching_up"] = catching_up_lines(state, now())
         report["v2_link"] = v2_link_status_line(state, now())
         if config_ok:
             report["friction"] = friction_status_line(config, state)
@@ -14884,6 +14952,7 @@ def format_status(report):
         lines.append("      agents     %s" % agents["error"])
     lines.extend(format_github(report["github"]) if "github" in report else [])
     lines.extend(format_decisions_status(report["decisions"]) if "decisions" in report else [])
+    lines.extend(report.get("catching_up") or [])   # #467 slice 3
     lines.extend("      disk       " + report["disk"] for _ in [0] if report.get("disk"))
     lines.extend("      cpu        " + report["cpu"] for _ in [0] if report.get("cpu"))
     lines.extend("      mem        " + report["mem"] for _ in [0] if report.get("mem"))

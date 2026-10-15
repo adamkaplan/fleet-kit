@@ -52596,6 +52596,66 @@ class TestTempJanitorResume(Base):
         self.assertEqual(os.stat(str(self.state / self.jan.CURSOR_FILE)).st_mtime_ns, stamp, "written only when it changes")
 
 
+class TestCatchingUpStatus(StatusCase):
+    """#467 slice 3: the daemon records which budgeted readers are still pending (a small file, only when it changes) and `status` says so in one line."""
+
+    def setUp(self):
+        super().setUp()
+        self.engine = types.SimpleNamespace(state_dir=self.world.state, now=self.world.clock.now)
+        self.path = self.world.state / sb.CATCHING_UP_FILE
+
+    def pending(self, load=(), repos=(), orders=()):
+        sb.set_source_state(self.engine, "load_alert", list(load))
+        sb.set_source_state(self.engine, "catch_up", list(repos))
+        sb.set_source_state(self.engine, "charters", list(orders))
+        return sb.write_catching_up(self.engine)
+
+    def lines(self):
+        return [l for l in self.status()[1].splitlines() if "catching up" in l]
+
+    def test_s1_one_line_names_the_sources_still_pending_and_nothing_when_they_are_done(self):
+        self.pending(load=["asks of o1", "asks of o2"], repos=["acme/api (3 passes)"])
+        (line,) = self.lines()
+        self.assertIn("load alert (2: asks of o1, asks of o2)", line)
+        self.assertIn("catch-up (1: acme/api (3 passes))", line)
+        self.assertNotIn("charter orders", line)
+        self.pending()
+        self.assertEqual(self.lines(), [])
+
+    def test_s2_the_file_is_rewritten_only_when_it_changes_or_is_old(self):
+        written = [self.pending(load=["asks of o1"])]
+        for _ in range(4):
+            self.world.tick(10)
+            written.append(self.pending(load=["asks of o1"]))
+        self.world.tick(10)
+        written.append(self.pending(load=["asks of o1", "asks of o2"]))
+        self.assertEqual(written, [True, False, False, False, False, True], "no heartbeat inside two minutes: 2 writes for 6 passes")
+        self.world.tick(sb.CATCHING_UP_REWRITE_SECONDS + 1)
+        self.assertTrue(self.pending(load=["asks of o1", "asks of o2"]), "an unchanged pending state is rewritten after two minutes: its age says the daemon is alive")
+        self.assertFalse(self.pending() and False)
+        self.assertFalse(self.pending(), "nothing pending and already empty: nothing is written")
+
+    def test_s3_a_record_the_daemon_has_stopped_updating_is_not_shown(self):
+        self.pending(load=["asks of o1"])
+        now = self.world.clock.now()
+        self.assertEqual(len(sb.catching_up_lines(self.world.state, now + 60)), 1)
+        self.assertEqual(sb.catching_up_lines(self.world.state, now + 11 * 60), [])
+
+    def test_s5_the_file_is_private_and_names_only_sources_and_counts(self):
+        self.pending(load=["asks of o1"], repos=["acme/api (2 passes)"])
+        self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
+        body = json.loads(self.path.read_text())
+        self.assertEqual(sorted(body), ["at", "sources"])
+        self.assertEqual(sorted(body["sources"]), ["catch_up", "load_alert"])
+        self.assertNotIn(str(self.world.state), self.path.read_text())
+
+    def test_s6_a_missing_or_unreadable_file_says_nothing_and_status_does_not_fail(self):
+        self.assertEqual((self.status()[0], self.lines()), (0, []))
+        for text in ("{not json", "[]", '{"at": "x", "sources": {}}', '{"sources": "no"}', json.dumps({"at": sb.iso(self.world.clock.now()), "sources": {"load_alert": "no"}})):
+            self.path.write_text(text)
+            self.assertEqual((self.status()[0], self.lines()), (0, []), text)
+
+
 class TestEarlyDecisionsWrite(DecisionsBase):
     """Ask #467, slice 1: the decisions file is written as soon as its own sources are read, before the heavy fact sources."""
 
@@ -52616,6 +52676,41 @@ class TestEarlyDecisionsWrite(DecisionsBase):
         source.__name__ = "heavy_source"
         self.world.engine.sources.append(source)
         return source
+
+    def test_s4_the_early_list_is_provisional_until_the_end_of_the_pass_publishes_the_final_one(self):
+        self.ask_the_boss("Which database?")
+        self.heavy(steps=3, step_seconds=20)
+        self.world.engine.run_pass()
+        self.assertIs(self.seen_file_at_first_step.get("provisional"), True, "the early write says it is provisional")
+        self.assertNotIn("provisional", self.file(), "the end of the pass published the final list")
+        state = self.world.state
+        during = dict(self.seen_file_at_first_step)
+        self.path.write_text(json.dumps(during))
+        text = " ".join(sb.format_decisions_status(sb.decisions_summary(state, self.world.clock.now)))
+        self.assertEqual(text.count("provisional"), 1)
+        self.path.write_text(json.dumps(self.file()))
+        self.assertEqual(" ".join(sb.format_decisions_status(sb.decisions_summary(state, self.world.clock.now))).count("provisional"), 0)
+
+    def test_the_provisional_flag_never_makes_an_old_list_look_fresh(self):
+        self.ask_the_boss("Which database?")
+        self.heavy(steps=1, step_seconds=20)
+        self.world.engine.run_pass()
+        provisional = dict(self.seen_file_at_first_step)
+        self.path.write_text(json.dumps(provisional))
+        old = self.world.clock.now() - sb.DECISIONS_STALE_SECONDS - 60
+        os.utime(str(self.path), (old, old))
+        report = sb.decisions_report(self.world.state, self.world.clock.now())
+        self.assertTrue(report["stale"], "the staleness verdict is the file's age, whatever the flag says")
+        self.assertIn("not updating", report["message"])
+
+    def test_a_change_of_the_flag_alone_is_a_write_and_the_same_flag_is_only_a_touch(self):
+        store = sb.decision_store(self.world.engine)
+        now = self.world.clock.now()
+        self.assertTrue(store.publish([], [], now, provisional=True))
+        self.assertFalse(store.publish([], [], now + 1, provisional=True))
+        self.assertTrue(store.publish([], [], now + 2))
+        self.assertNotIn("provisional", self.file())
+        self.assertFalse(store.publish([], [], now + 3))
 
     def test_the_early_derivation_leaves_the_notice_time_accounting_as_it_was(self):
         engine = self.world.engine
