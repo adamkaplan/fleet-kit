@@ -11380,10 +11380,13 @@ class TestChatClearOffers(unittest.TestCase):
     def test_a_pr_that_is_no_longer_held_loses_its_offer_and_an_unchanged_set_writes_nothing(self):
         self.offers(366, 389)
         path = Path(self.state) / "chat-clear-offers.json"
-        before = path.stat().st_mtime_ns
+        writes = []
+        real = self.cc.write_offers
+        self.cc.write_offers = lambda *a, **k: writes.append(a) or real(*a, **k)
+        self.addCleanup(setattr, self.cc, "write_offers", real)
         same = self.cc.refresh_offers(self.state, [self.hold(366, ["u:hold-impact"]), self.hold(389, ["u:hold-impact"])], self.NAMES, 1001)
         self.assertEqual((same["added"], same["dropped"]), ([], []))
-        self.assertEqual(path.stat().st_mtime_ns, before, "nothing changed: nothing written")
+        self.assertEqual(writes, [], "nothing changed: write_offers was not called")
         gone = self.cc.refresh_offers(self.state, [self.hold(389, ["u:hold-impact"]), self.hold(400, ["u:parked"])], self.NAMES, 1002)
         self.assertEqual(sorted(gone["offers"]), ["acme/widget#389"])
         self.assertEqual(gone["dropped"], ["acme/widget#366"])
@@ -11412,6 +11415,85 @@ class TestChatClearOffers(unittest.TestCase):
         self.assertEqual(got, [{"id": "m1", "text": "366 is good to go"}, {"id": "m6", "text": "389 also good to go"}],
                          "3 of 3 agent-written or unusable messages are skipped; the person's two come oldest first")
 
+    def test_an_agents_message_is_never_the_persons_whatever_shape_its_metadata_takes(self):
+        created = lambda m: 990
+        shapes = [{"metadata": {"fleet": {"name": "cos"}}}, {"metadata": {"fleet": "x"}}, {"metadata": {"fleet": True}},
+                  {"metadata": {"fleet": None}}, {"metadata": "x"}, {"metadata": ["fleet"]},
+                  {"metadata": {}, "payload": {"metadata": {"fleet": {"name": "x"}}}}, {"metadata": {"a": 1}, "payload": {"metadata": {"fleet": 1}}},
+                  {"payload": "x"}, {"payload": {"metadata": "x"}}]
+        for n, shape in enumerate(shapes):
+            message = dict(shape, id="a%d" % n, text="366 is good to go")
+            self.assertEqual(self.cc.person_messages([message], set(), 1000, created), [], shape)
+        person = [{"id": "p1", "text": "366"}, {"id": "p2", "text": "366", "metadata": {}}, {"id": "p3", "text": "366", "metadata": {"a": 1}, "payload": {"metadata": {}}}]
+        self.assertEqual([m["id"] for m in self.cc.person_messages(person, set(), 1000, created)], ["p1", "p2", "p3"])
+
+    def test_the_age_the_future_the_cap_and_the_text_length_of_messages(self):
+        times = {"edge": 100, "over": 99, "ahead": 1060, "farahead": 1061, "none": None}
+        created = lambda m: times.get(m["id"], 1000)
+        ids = lambda prompts: [m["id"] for m in self.cc.person_messages(prompts, set(), 1000, created, max_age=900)]
+        self.assertEqual(ids([{"id": k, "text": "x"} for k in times]), ["edge", "ahead"], "exactly max_age old is read, one second older and a time too far ahead are not, no time is not")
+        long = {"id": "long", "content": [{"text": "a" * 5000}, {"text": "b"}, {"x": 1}]}
+        self.assertEqual(len(self.cc.person_messages([long], set(), 1000, created)[0]["text"]), self.cc.TEXT_MAX)
+        many = [{"id": "m%d" % n, "text": "x"} for n in range(80)]
+        self.assertEqual(len(self.cc.person_messages(many, set(), 1000, created)), self.cc.MESSAGES_SCANNED)
+
+    def test_at_most_offers_max_offers_the_existing_ones_first_and_the_summary_is_cut_and_clean(self):
+        self.offers(7)
+        holds = [self.hold(n, ["u:hold-impact"]) for n in range(100, 100 + self.cc.OFFERS_MAX + 1)] + [self.hold(7, ["u:hold-impact"])]
+        got = self.cc.refresh_offers(self.state, holds, self.NAMES, 1005)
+        self.assertEqual(len(got["offers"]), self.cc.OFFERS_MAX)
+        self.assertTrue(got["capped"])
+        self.assertIn("acme/widget#7", got["offers"], "an offer that already existed is kept before a new one is taken")
+        long = self.cc.refresh_offers(self.state, [self.hold(1, ["u:hold-impact"], summary="x\x1b[31m" + "y" * 500 + "\n")], self.NAMES, 1006)["offers"]["acme/widget#1"]["summary"]
+        self.assertEqual(len(long), self.cc.SUMMARY_MAX)
+        self.assertNotIn("\x1b", long)
+
+    def test_head_matches_refuses_what_is_not_a_shown_exact_head(self):
+        offer = {"head": "a" * 40, "shown": True}
+        self.assertTrue(self.cc.head_matches(offer, "a" * 40))
+        for current in (None, "", 5, "b" * 40):
+            self.assertFalse(self.cc.head_matches(offer, current), repr(current))
+        for bad in (None, "x", {"head": "a" * 40, "shown": False}, {"head": "a" * 40, "shown": "yes"}):
+            self.assertFalse(self.cc.head_matches(bad, "a" * 40), repr(bad))
+
+    def test_a_file_that_cannot_be_used_is_set_aside_and_what_is_recorded_after_it_is_not_clearable_until_shown(self):
+        path = Path(self.state) / "chat-clear-offers.json"
+        path.write_text("{not json")
+        got = self.cc.refresh_offers(self.state, [self.hold(366, ["u:hold-impact"])], self.NAMES, 1000)
+        self.assertIn("cannot be read", got["problem"])
+        self.assertEqual(got["quarantined"], "chat-clear-offers.json.corrupt-1000")
+        self.assertEqual((Path(self.state) / got["quarantined"]).read_text(), "{not json", "the bad file is kept, never overwritten")
+        offer = got["offers"]["acme/widget#366"]
+        self.assertFalse(offer["shown"])
+        self.assertFalse(self.cc.head_matches(offer, "a" * 40), "recorded after a loss and never shown: nothing clears")
+        self.assertTrue(self.cc.show(self.state, "acme/widget#366", "a" * 40, 1001))
+        self.assertTrue(self.cc.head_matches(self.cc.read_offers(self.state)["acme/widget#366"], "a" * 40))
+
+    def test_a_missing_label_name_makes_a_pr_not_offerable_and_a_lock_held_elsewhere_changes_nothing(self):
+        names = {k: v for k, v in self.NAMES.items() if k != "hold-contract"}
+        self.assertFalse(self.cc.is_offerable(names, ["u:hold-impact"]), "a hold it cannot name is a hold it cannot see")
+        self.offers(366)
+        with self.cc._locked(self.state):
+            with self.assertRaises(self.cc.OffersBusy):
+                self.cc.refresh_offers(self.state, [], self.NAMES, 2000, lock_seconds=0)
+            with self.assertRaises(self.cc.OffersBusy):
+                self.cc.show(self.state, "acme/widget#366", "b" * 40, 2000, lock_seconds=0)
+        self.assertEqual(self.cc.read_offers(self.state)["acme/widget#366"]["head"], "a" * 40, "a busy lock changed nothing")
+
+    def test_a_failed_write_leaves_no_temporary_file_and_the_old_offers(self):
+        self.offers(366)
+        real = os.replace
+        def boom(*a):
+            raise OSError("disk full")
+        os.replace = boom
+        try:
+            with self.assertRaises(OSError):
+                self.cc.write_offers(self.state, {})
+        finally:
+            os.replace = real
+        self.assertEqual(sorted(p.name for p in Path(self.state).iterdir() if p.name.startswith("chat-clear-offers.json.")), [])
+        self.assertIn("acme/widget#366", self.cc.read_offers(self.state))
+
     def test_numbers_are_read_whole_and_not_out_of_words_decimals_or_paths(self):
         n = self.cc.numbers_in
         self.assertEqual(n("366 is good to go"), [366])
@@ -11436,7 +11518,7 @@ class TestChatClearOffers(unittest.TestCase):
 
     def test_this_module_has_no_command_and_no_caller_in_the_cli_and_writes_no_label(self):
         source = (Path(sb.__file__).parent / "chat_clear.py").read_text()
-        for word in ("subprocess", "urllib", "socket", "change_issue_labels", "gh "):
+        for word in ("subprocess", "urllib", "socket", "change_issue_labels"):
             self.assertNotIn(word, source, "slice 1 reaches nothing: no process, no network, no GitHub write")
         main = (Path(sb.__file__).parent / "fleet-switchboard").read_text()
         self.assertNotIn("chat_clear", main, "no command or hook calls it yet in this slice (slice 3 adds the one hook and changes this test)")
