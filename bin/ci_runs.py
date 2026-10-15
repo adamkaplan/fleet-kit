@@ -2,15 +2,17 @@
 
 gh's `statusCheckRollup` lists EVERY run at a pull request's head, so a red run that was re-run green stays in the list beside its green
 re-run. Reading "any entry failed" made such a head look failing for ever (in `pr-state`, the gate's checks row and the notices). `newest`
-keeps, for each check, only its newest run; every reader of the rollup goes through it.
+keeps, for each check, only the run that decides; every reader of the rollup goes through it.
 
 - A check is identified by its workflow and its name (a status context: its context, no workflow): two workflows that each have a check
   named `test` are two checks, and a red one is never hidden by the other's green.
-- The newest run is the one with the latest completion time (the start time while it has not completed: gh gives an unfinished run the
-  zero date as its completion time). An entry with no time is OLDER than one with a time, except a run that has not completed: with no
-  time it is taken as the newest (a missing time never lets an older green hide a pending run).
-- It never makes a verdict greener by guessing: entries that tie for newest are ALL kept (so any failing one still fails), an entry that
-  names no check is its own check, and an entry that cannot be read is kept as it is.
+- A check with ANY unfinished run is PENDING, whatever older completed runs say: the unfinished run (the newest started, if several) is
+  the one kept. So an older run that finishes after a newer one started can never hide the newer, still running one.
+- Among COMPLETED runs, the newest STARTED decides (the completion time stands in for a run with no start time): an older attempt that
+  finishes late, even red, does not override a newer run that started after it. Runs that tie on start are ordered by completion (the one
+  completing later); runs that still tie are ALL kept, so any failing one fails.
+- An entry with no time at all is older than one with a time. An entry that names no check is its own check. Nothing is ever read greener
+  by guessing.
 """
 
 from datetime import datetime, timezone
@@ -29,15 +31,25 @@ def _time(text):
     return None if moment.year <= _ZERO_YEAR else moment.timestamp()
 
 
-def _rank(entry):
-    """How new this run is: its completion time, else its start time; a run that has not completed and has no time at all is the newest
-    (cautious); a completed run with no time is older than any with a time."""
-    stamp = _time(entry.get("completedAt"))
+def _unfinished(entry):
+    """True for a run that has not completed: its status says so, or it is a status context still pending or expected."""
+    if entry.get("status") not in (None, "COMPLETED"):
+        return True
+    return str(entry.get("conclusion") or entry.get("state") or "").upper() in ("PENDING", "EXPECTED") and not entry.get("conclusion")
+
+
+def _started(entry):
+    """When the run started (the completion time stands in when it has no start time), or -inf for an entry with no time at all."""
+    stamp = _time(entry.get("startedAt"))
     if stamp is None:
-        stamp = _time(entry.get("startedAt"))
-    if stamp is not None:
-        return stamp
-    return float("inf") if entry.get("status") not in (None, "COMPLETED") else float("-inf")
+        stamp = _time(entry.get("completedAt"))
+    return float("-inf") if stamp is None else stamp
+
+
+def _rank(entry):
+    """The order of two COMPLETED runs of one check: newest started first, then the one completing later."""
+    completed = _time(entry.get("completedAt"))
+    return (_started(entry), float("-inf") if completed is None else completed)
 
 
 def _identity(entry, position):
@@ -49,8 +61,8 @@ def _identity(entry, position):
 
 
 def newest(rollup):
-    """`rollup` (gh's statusCheckRollup) with only the newest run of each check, in the original order. Anything that is not a list gives []; an
-    entry that is not a dict is dropped (as every reader of the rollup already skipped it)."""
+    """`rollup` (gh's statusCheckRollup) with only the run that decides for each check, in the original order. Anything that is not a list
+    gives []; an entry that is not a dict is dropped (as every reader of the rollup already skipped it)."""
     if not isinstance(rollup, list):
         return []
     groups = {}
@@ -59,6 +71,8 @@ def newest(rollup):
             groups.setdefault(_identity(entry, position), []).append((position, entry))
     keep = set()
     for runs in groups.values():
-        best = max(_rank(entry) for _, entry in runs)
-        keep.update(position for position, entry in runs if _rank(entry) == best)   # a tie keeps every tied run
+        pool = [(position, entry) for position, entry in runs if _unfinished(entry)] or runs   # any unfinished run makes the check pending
+        key = (lambda item: (_started(item[1]),)) if pool is not runs else (lambda item: _rank(item[1]))
+        best = max(key(item) for item in pool)
+        keep.update(position for position, entry in pool if key((position, entry)) == best)   # a tie keeps every tied run
     return [entry for position, entry in enumerate(rollup) if position in keep]
