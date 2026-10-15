@@ -18606,6 +18606,60 @@ def clear_fingerprint(engine, runner, repo, number, head):
     return fingerprint, None
 
 
+def marker_edit(body):
+    """(new body, line before, line after) when the body's FIRST non-empty line says `MERGE: captain` (the very rule `pr_marker` reads), with ONLY that marker changed to
+    `MERGE: automatic` and every other byte of the body (the rest of the line and its ending included) as it was. None when the first line is anything else."""
+    if pr_marker(body) != "captain":
+        return None
+    lines = body.splitlines(keepends=True)
+    index = next(i for i, line in enumerate(lines) if line.strip())
+    line = lines[index]
+    at = line.index("MERGE: captain")
+    edited = line[:at] + "MERGE: automatic" + line[at + len("MERGE: captain"):]
+    lines[index] = edited
+    return "".join(lines), line.rstrip("\r\n"), edited.rstrip("\r\n")
+
+
+def neutralise_marker(engine, runner, repo, number, head, first=None):
+    """#522: the owner's clear lifts the whole hold, so the body's first line `MERGE: captain` becomes `MERGE: automatic` (the gate reads it while no merge label says otherwise).
+    The ONE place it is done, called by `impact_clear_core` (the owner's command and his words in the chat both end there; a carry of a clear never does). The body is read fresh
+    for `head` only (`first` is the clear's own read of that moment, or None to read one), read again right before the write and written only when it is the same, then read back. Best effort (GitHub has no conditional body write, so an edit landing between the last read and the write is not detected). Never raises: a failure is audited and a line says the marker remains,
+    for the owner's clear has already stood. Returns the lines to print."""
+    pr = "%s#%d" % (repo, number)
+    remains = "marker line remains: the first line of the body of %s still says MERGE: captain; edit it by hand"
+
+    def failed(why):
+        try:
+            engine.audit.append(engine.actor, "gate.clear_marker_failed", pr, {"head": head, "why": _one_line(str(why), 200)})
+        except Exception:   # an audit trouble never undoes or fails the clear
+            pass
+        return [remains % pr + " (%s)" % _one_line(str(why), 120)]
+
+    try:
+        first = first if first is not None else read_pr_json(engine, repo, number)
+        if first.get("headRefOid") != head:
+            return []   # not the head the owner cleared: nothing here is his clear's
+        edit = marker_edit(first.get("body"))
+        if edit is None:
+            return []
+        new_body, before, after = edit
+        before_text, after_text = (re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", t) for t in (before, after))   # the author's text: never a control character into the terminal or the log
+        again = read_pr_json(engine, repo, number)
+        if again.get("body") != first.get("body") or again.get("headRefOid") != head:
+            return failed("the body or the head changed while it was being edited: nothing was written")
+        _gh_write(engine, runner, repo, "repos/%s/pulls/%d" % (repo, number), "PATCH", {"body": new_body})
+        if read_pr_json(engine, repo, number).get("body") != new_body:
+            return failed("the body read back is not the one written")
+        said = ["changed the first line of the body of %s from %s to %s" % (pr, _one_line(before_text, 80), _one_line(after_text, 80))]
+        try:
+            engine.audit.append(engine.actor, "gate.clear_marker", pr, {"head": head, "before": _one_line(before_text, 200), "after": _one_line(after_text, 200)})
+        except Exception:   # the body is already changed and the clear stands: say what is true
+            said.append("the audit line of that change could not be written")
+        return said
+    except Exception as err:   # NoticeError, IntentError, anything: the clear stands
+        return failed(err)
+
+
 def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, head=None, via=None, verify=None):
     """The owner's clear: record it head-bound (the daemon does not re-add the hold for that head) and remove `hold-impact`, and
     `merge-captain` too when the switchboard itself added it for this hold. Returns the lines to print.
@@ -18659,7 +18713,7 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
         if fingerprint is not None:
             detail["fingerprint"] = fingerprint
         engine.audit.append(engine.actor, "gate.hold_cleared", pr, detail)   # inside the lock
-    return ["cleared the impact hold of %s at %s: removed %s; the daemon will not re-add it for this head" % (pr, head_now[:8], ", ".join(remove))]
+    return ["cleared the impact hold of %s at %s: removed %s; the daemon will not re-add it for this head" % (pr, head_now[:8], ", ".join(remove))] + neutralise_marker(engine, runner, repo, number, head_now, raw)
 
 
 def cmd_impact_clear(args, runner, now):
