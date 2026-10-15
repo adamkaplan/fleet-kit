@@ -28490,8 +28490,11 @@ class TestLaunchRepoFromOrigin(TwoRepoCase):
             return real(argv, *a, **k)
 
         work = self.work("https://github.com/acme/web.git")
-        with mock.patch.object(subprocess, "run", spy):
+        other = self.work("https://github.com/acme/api.git", name="elsewhere")
+        env = {"GIT_DIR": str(other / ".git"), "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "remote.origin.url", "GIT_CONFIG_VALUE_0": "https://github.com/acme/api.git"}
+        with mock.patch.object(subprocess, "run", spy), mock.patch.dict(os.environ, env):
             code, out, err = self.launch(work)
+        self.assertEqual(self.recorded(out), ACME_WEB, "the launcher's own GIT_DIR and GIT_CONFIG_* never point the read at another repository")
         self.assertEqual(code, 0, err)
         origin_reads = [c for c in calls if "remote.origin.url" in c]
         self.assertEqual(origin_reads, [["git", "-C", str(work), "config", "--local", "--no-includes", "--get-all", "remote.origin.url"]], "one read, argv, local config only, no includes")

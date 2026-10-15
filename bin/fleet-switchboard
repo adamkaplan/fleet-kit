@@ -15200,8 +15200,11 @@ def origin_repository(runner, directory):
     repository. The result is lower case. `why` is a fixed phrase: the url itself is NEVER returned, printed or logged."""
     if not isinstance(directory, str) or not os.path.isabs(directory) or not os.path.isdir(directory):
         return None, "the working directory is not an existing absolute path"
-    done = _git(runner, directory, "config", "--local", "--no-includes", "--get-all", "remote.origin.url")
-    if done.returncode == 255:
+    clean = {k: v for k, v in os.environ.items() if not (k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_CEILING_DIRECTORIES") or k.startswith("GIT_CONFIG"))}
+    try:   # the launcher's own environment must not point git at another repository or config: scrubbed
+        done = subprocess.run(["git", "-C", directory, "config", "--local", "--no-includes", "--get-all", "remote.origin.url"], capture_output=True, text=True,
+                              timeout=WORKTREE_GIT_SECONDS, stdin=subprocess.DEVNULL, env=clean)
+    except (OSError, subprocess.SubprocessError):
         return None, "git could not be run there"
     urls = [line for line in (done.stdout or "").splitlines() if line.strip()]
     if done.returncode != 0 or not urls:
