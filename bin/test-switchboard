@@ -24119,6 +24119,8 @@ class TestImpactClassAndNarrowForm(LedgerBase):
                             ("a flow collection left open", "---\npermissions: {a: 1,\nmode: x}\n---\n"),
                             ("a double quoted scalar left open", '---\ndescription: "x\nmode: y\n---\n'),
                             ("a folded block scalar", "---\npermissions: >\n  x\n---\n"),
+                            ("a comment hiding a closer in a flow collection", "---\ndescription: [a # ]\npermissions: [b]\nmode: subagent\nz: q]\n---\n"),
+                            ("a comment hiding a closer in a flow mapping", "---\ndescription: {a: 1 # }\nmode: x\nz: q}\n---\n"),
                             ("a complex key opening a quote", '---\ndescription:\n  ? "x\nmode: subagent\n  y"\n---\n'),
                             ("a directive", "---\n%YAML 1.2\nmode: x\n---\n"), ("a document end marker", "---\nmode: x\n...\n---\n"),
                             ("a surplus closer", "---\npermissions: {a: 1}}\n---\n"), ("junk after a quoted value", '---\nmode: "x" y\n---\n'),
@@ -24132,6 +24134,7 @@ class TestImpactClassAndNarrowForm(LedgerBase):
         self.assertEqual(f.permission_block("---\npermissions:\n  - {action: read, resource: 'it''s', effect: allow}\n---\n", keys)["permissions"][1].count("it''s"), 1)
         self.assertEqual(f.permission_block('---\ndescription: "say \\"x\\" # not a comment"  # a comment\nmode: "x\\""\n---\n', keys), {"mode": ['mode: "x\\""']},
                          "an escaped quote and a # inside quotes are read as they are")
+        self.assertEqual(f.permission_block("---\ndescription: [a, b] # closed, then a comment\nmode: x\n---\n", keys), {"mode": ["mode: x"]})
         self.assertNotEqual(f.permission_block("---\npermissions:\n  # keep\n  - x\n---\n", keys), f.permission_block("---\npermissions:\n  # kept\n  - x\n---\n", keys),
                             "a # line inside a tracked block is content")
 

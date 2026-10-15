@@ -319,6 +319,8 @@ def _flow_closed(value):
                     quote = None
         elif char in "\"'" and previous in ":,[{":
             quote = char
+        elif char == "#" and index and value[index - 1] in " \t":
+            return False   # a comment before the collection closed: what follows it (a closer too) is comment text, so the collection is still open
         elif char in "[{":
             depth += 1
         elif char in "]}":
