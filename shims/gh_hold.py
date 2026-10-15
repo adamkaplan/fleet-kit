@@ -19,6 +19,7 @@ package and runs through a symlink).
 
 Only the standard library. Names of repositories, labels and agents are configuration: nothing here knows one.
 """
+import fcntl
 import json
 import os
 import re
@@ -37,7 +38,7 @@ MAX_FILE = 262144
 # the top-level gh commands that are not an alias: an alias cannot shadow one
 KNOWN_COMMANDS = {"pr", "issue", "api", "repo", "label", "auth", "config", "alias", "browse", "codespace", "completion", "extension", "ext",
                   "gist", "gpg-key", "help", "release", "run", "search", "secret", "ssh-key", "status", "variable", "workflow", "cache",
-                  "org", "attestation", "project", "ruleset", "agent-task", "preview", "licenses", "version", "copilot", "skill"}
+                  "org", "attestation", "project", "ruleset"}
 GRAPHQL_GUARDED = re.compile(r"\b(mutation)\b", re.I)   # every mutation: a node id cannot be tied to a repository, so none can be checked
 
 RETRY = ("gh: hold-label check failed, retry (the fleet shim could not read whether this pull request carries a hold label, so it refuses "
@@ -724,7 +725,8 @@ def alias_check(first, ctx):
     if raw is None:
         return Result(RETRY)
     for line in raw.splitlines():
-        if line.split(":", 1)[0].strip() == first:
+        parts = re.split(r"[:\s]", line.strip(), 1)      # `name:<TAB>expansion` or `name<TAB>expansion`
+        if parts and parts[0] == first:
             return Result("gh: %s is an alias, and an alias cannot be checked against a hold label: run the full command instead" % clean(first)[:40])
     return Result()
 
@@ -738,7 +740,8 @@ def check(args, ctx):
         words = command_words(args)
         first = words[0] if words else ""
         is_api = first == "api"
-        if not ctx.write and not is_api:
+        alias_word = first and first not in KNOWN_COMMANDS
+        if not ctx.write and not is_api and not alias_word:
             return Result()
         if state == "bad":
             if is_api:
@@ -751,7 +754,7 @@ def check(args, ctx):
             return check_api(args, ctx, holds)
         if first in ("pr", "issue", "label"):
             return check_pr_issue(args, ctx, holds)
-        if first and first not in KNOWN_COMMANDS and ctx.write:
+        if alias_word:                                  # whatever `is_write` says: `gh <alias> view` may expand to a merge
             return alias_check(first, ctx)
         return Result()
     except Exception:
@@ -817,11 +820,16 @@ def write_audit(args, name, outcome, repo=None, number=None):
         folder = state.rstrip(os.sep) + "-audit"      # beside the state directory, not in it: the state directory holds only what the daemon reads
         os.makedirs(folder, mode=0o700, exist_ok=True)
         path = os.path.join(folder, AUDIT_FILE)
-        if os.path.exists(path) and os.path.getsize(path) >= AUDIT_LIMIT:
-            os.replace(path, path + ".1")
-        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-        with os.fdopen(fd, "a") as out:
-            out.write(line + "\n")
+        lock = os.open(os.path.join(folder, ".lock"), os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if os.path.exists(path) and os.path.getsize(path) >= AUDIT_LIMIT:
+                os.replace(path, path + ".1")
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            with os.fdopen(fd, "a") as out:
+                out.write(line + "\n")
+        finally:
+            os.close(lock)
         return True
     except Exception:
         return False

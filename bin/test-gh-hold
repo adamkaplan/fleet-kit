@@ -302,6 +302,8 @@ class TestHostileInput(Base):
 
     def test_aliases_are_refused_and_other_words_pass(self):
         self.refused("shipit", "7", env={"FAKE_ALIASES": "shipit:\tpr merge"})
+        self.refused("mm", "view", env={"FAKE_ALIASES": "mm\tpr merge $1"})            # no colon, and a second word that looks like a read
+        self.refused("mm", "list", env={"FAKE_ALIASES": "mm:\tpr merge $1"})
         self.passed("shipit", "7", env={"FAKE_ALIASES": "other:\tpr view"})
         done, _ = self.run_gh("workflow", "run", "x.yml")
         self.assertEqual(done.returncode, 7)

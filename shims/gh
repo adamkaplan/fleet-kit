@@ -836,10 +836,13 @@ def load_hold():
     return HOLD_MODULE[0]
 
 
+RETRY_HOLD = "gh: hold-label check failed, retry (the fleet shim hit an unexpected error and refuses this write rather than let it through)"
+
+
 def hold_probe(args, lookup, gh, write):
     """(refusal text or None, repo or None, number or None): see gh_hold.py. A missing or broken module refuses a WRITE while the config names a hold
     (fail closed) and is otherwise silent; that fallback re-reads the config text itself (a missing file means nothing is configured, any other read
-    error counts as naming a hold). Any other unexpected error in the probe lets the command run: `gh_hold.check` itself fails closed for writes. The label read uses the account the write would use."""
+    error counts as naming a hold). Any other unexpected error in the probe refuses a write and lets a read run. The label read uses the account the write would use."""
     try:
         module = load_hold()
         if module is None:
@@ -861,7 +864,8 @@ def hold_probe(args, lookup, gh, write):
         got = module.check(args, module.Ctx(gh, env, lambda: lookup.identity().get("name"), write))
         return got.refusal, got.repo, got.number
     except Exception:
-        return None, None, None   # no config to read (or no way to tell): nothing configured, nothing to enforce
+        # an unexpected error in this glue (the check itself never raises): a WRITE is refused, a read runs
+        return (RETRY_HOLD if write else None), None, None
 
 
 def audit_write(args, lookup, outcome, write, repo=None, number=None):
