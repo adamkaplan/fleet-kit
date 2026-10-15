@@ -82,7 +82,7 @@ worktree, that is a scope question — see below.
 **Uncommitted work reads as an agent that did nothing.** Commit as you go, on a
 task branch, with messages that match the repository's existing style.
 
-Then open a PR and put its link on your assignment issue. Its body names the plan issue: `Closes #N` if it finishes it, else `Part of #N`.
+Then open a PR and put its link on your assignment issue. Its body names the plan issue: `Closes #N` if it finishes it, else `Part of #N`. Never `git stash` (one stack for every worktree): commit to a scratch branch instead.
 
 ## Report honestly
 

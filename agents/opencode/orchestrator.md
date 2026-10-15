@@ -126,7 +126,7 @@ switchboard message: act on it, then remove your `awaiting-cos` label.
   Copilot CLI and opencode v1 take `--agent`; the opencode v2 TUI does not, and
   a wrong launch silently gives the default agent. `fleet-doctor` names the
   route for this machine; the recipe and the recovery are in the
-  `fleet-coordination` skill. Confirm the agent on screen before the first prompt.
+  `fleet-coordination` skill. Confirm the agent on screen before the first prompt. Tell coders: never `git stash`; commit to a scratch branch.
 - **Verify the coder actually started on the assigned task.** A created process
   or an accepted prompt is not evidence of execution; `working` is not progress.
 - **Never steal a coder's task.** Diagnose the failure and send a bounded fix
