@@ -22952,6 +22952,29 @@ class TestCaptainSweepFindings(TestSweep):
         self.sweep()
         self.assertEqual([f for f in self.found() if f[0] == "S9"], [])
 
+    def test_s9_a_merged_pr_is_no_finding_and_a_closed_unmerged_one_still_is(self):
+        captain = self.USER.replace("awaiting-user", "merge-captain")
+        hold = self.USER.replace("awaiting-user", "hold-impact")
+        merged = sweep_issue(90, "x", [captain, hold], pr=True)
+        merged["pull_request"] = {"url": "x", "merged_at": "2026-10-15T10:00:00Z"}   # the issues API says it was merged (#559)
+        unmerged = sweep_issue(91, "x", [hold], pr=True)
+        unmerged["pull_request"] = {"url": "x", "merged_at": None}                   # closed, never merged
+        self.hub.closed_records = {90: merged, 91: unmerged}
+        self.hub.closed = {90, 91}
+        self.sweep()
+        self.sweep()
+        self.assertEqual([f for f in self.found() if f[0] == "S9"], [("S9", "acme/api#91")], "1 finding: the closed unmerged pull request")
+
+    def test_s9_a_fresh_read_that_shows_the_pr_merged_drops_the_finding(self):
+        hold = self.USER.replace("awaiting-user", "hold-impact")
+        self.hub.closed_records = {92: sweep_issue(92, "x", [hold], pr=True)}   # the list copy does not say merged
+        self.hub.closed = {92}
+        merged = sweep_issue(92, "x", [hold], pr=True)
+        merged["pull_request"] = {"url": "x", "merged_at": "2026-10-15T10:00:00Z"}
+        self.hub.live = {92: merged}                                            # the fresh read does
+        self.sweep()
+        self.assertEqual([f for f in self.found() if f[0] == "S9"], [], "sweep_verify no longer holds for a merged pull request")
+
     def test_s6a_a_pr_opened_within_15_minutes_gets_the_label_first(self):
         fresh, early, later = (sb.iso(self.world.clock.now() - m * 60) for m in (4, 20, 120))
         self.hub.open = {50: sweep_issue(50, "MERGE: captain\nx", pr=True, author="bot", created=fresh),    # the 02:03-vs-02:07 shape
@@ -56175,6 +56198,158 @@ class TestNewestCiRuns(unittest.TestCase):
         before = json.dumps(self.RERUN)
         ci_runs.newest(self.RERUN)
         self.assertEqual(json.dumps(self.RERUN), before, "the rollup is not changed")
+
+
+class FakeMergedGh:
+    """`gh` for the merged-label pass: `pr view N` answers from `answers` ((code, stdout, stderr) or an exception); a label DELETE is recorded and succeeds."""
+
+    def __init__(self, answers=None):
+        self.answers, self.reads, self.removed = answers or {}, [], []
+
+    def __call__(self, argv, **kwargs):
+        if argv[1:3] == ["pr", "view"]:
+            self.reads.append((argv[3], argv[argv.index("--repo") + 1]))
+            answer = self.answers[int(argv[3])]
+            if isinstance(answer, Exception):
+                raise answer
+            return subprocess.CompletedProcess(argv, answer[0], answer[1], answer[2])
+        if "--method" in argv and argv[argv.index("--method") + 1] == "DELETE":
+            self.removed.append(urllib.parse.unquote(argv[2].rsplit("/", 1)[1]))
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+        raise AssertionError("the merged-label pass reaches for nothing else: %r" % (argv,))
+
+
+class StubHub:
+    def __init__(self, entries):
+        self.entries = entries
+
+    def pr_event_snapshot(self):
+        return {ref: dict(entry) for ref, entry in self.entries.items()}
+
+
+class TestMergedLabels(Base):
+    """Ask #559: the merge-captain and hold-* labels of a MERGED pull request come off, once, and only those; nothing else is touched."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=(), config={"gh": FAKE_GH, "github_repos": ["acme/api"], "excluded_repos": ["acme/secret"]})
+        self.names = sb.label_names(self.world.config)
+        self.fleet = [self.names["merge-captain"], self.names["hold-security"], self.names["hold-impact"]]
+        self.engine = self.world.new_engine()
+
+    def merged_entry(self, labels=None, state="merged"):
+        return {"state": state, "head": "a" * 40, "labels": sorted(labels if labels is not None else self.fleet + ["bug"]), "at": 1, "via": "event"}
+
+    def view(self, state="MERGED", labels=None):
+        names = labels if labels is not None else self.fleet + ["bug"]
+        return (0, json.dumps({"state": state, "labels": [{"name": n} for n in names], "headRefOid": "a" * 40}), "")
+
+    def go(self, entries, gh):
+        self.engine.hub, self.engine.gh_runner = StubHub(entries), gh
+        merged_labels = sb.load_module("merged_labels")
+        ns = types.SimpleNamespace(**{n: getattr(sb, n) for n in merged_labels.NEEDS})
+        return merged_labels.run_pass(ns, self.engine, self.world.clock.now(), sb.IMPACT_PASS_CALLS)
+
+    def audit(self, event):
+        return [e for e in self.world.audit() if e["event"] == event]
+
+    def test_s1_the_three_fleet_labels_come_off_and_the_other_label_stays(self):
+        gh = FakeMergedGh({7: self.view()})
+        self.go({"acme/api#7": self.merged_entry()}, gh)
+        self.assertEqual(sorted(gh.removed), sorted(self.fleet), "3 labels removed, the bug label is not among them")
+        (line,) = self.audit("merged.labels_removed")
+        self.assertEqual((line["subject"], sorted(line["detail"]["labels"])), ("acme/api#7", sorted(self.fleet)), "1 audit line names the pull request and the 3 labels")
+
+    def test_s2_an_open_or_closed_unmerged_pull_request_loses_nothing(self):
+        for state in ("open", "closed"):
+            gh = FakeMergedGh({8: self.view("OPEN" if state == "open" else "CLOSED")})
+            self.go({"acme/api#8": self.merged_entry(state=state)}, gh)
+            self.assertEqual((gh.reads, gh.removed), ([], []), "an event that does not say merged is not even read: %s" % state)
+
+    def test_s3_an_event_that_says_merged_while_the_fresh_read_says_open_removes_nothing(self):
+        for number, fresh in ((9, "OPEN"), (19, "CLOSED")):
+            gh = FakeMergedGh({number: self.view(fresh)})
+            self.go({"acme/api#%d" % number: self.merged_entry()}, gh)
+            self.assertEqual((len(gh.reads), gh.removed), (1, []))
+        self.assertEqual(len(self.audit("merged.labels_skipped")), 2)
+
+    def test_s4_a_failed_read_removes_nothing_audits_once_and_is_tried_again_later(self):
+        gh = FakeMergedGh({10: (1, "", "gh: HTTP 502")})
+        entries = {"acme/api#10": self.merged_entry()}
+        self.go(entries, gh)
+        self.go(entries, gh)   # inside the back-off: no second read, no second audit
+        self.assertEqual((len(gh.reads), gh.removed, len(self.audit("merged.labels_read_failed"))), (1, [], 1))
+        self.world.tick(sb.load_module("merged_labels").RETRY_SECONDS + 1)
+        gh.answers[10] = self.view()
+        self.go(entries, gh)
+        self.assertEqual(sorted(gh.removed), sorted(self.fleet), "after the back-off the read works and the labels come off")
+        self.assertEqual(len(self.audit("merged.labels_read_failed")), 1, "said once")
+
+    def test_s5_an_excluded_or_unwatched_repository_is_never_read_or_written(self):
+        gh = FakeMergedGh({1: self.view(), 2: self.view()})
+        self.go({"acme/secret#1": self.merged_entry(), "other/repo#2": self.merged_entry()}, gh)
+        self.assertEqual((gh.reads, gh.removed), ([], []), "0 reads and 0 writes in 2 of 2 cases")
+
+    def test_a_merge_event_that_carried_no_fleet_label_costs_no_read(self):
+        gh = FakeMergedGh({11: self.view()})
+        self.go({"acme/api#11": self.merged_entry(labels=["bug", "docs"])}, gh)
+        self.assertEqual((gh.reads, gh.removed), ([], []))
+
+    def test_a_pull_request_is_handled_once_and_a_label_by_another_prefix_is_never_removed(self):
+        other = ["someone-else:merge-captain", "someone-else:hold-impact"]
+        gh = FakeMergedGh({12: self.view(labels=self.fleet + other)})
+        entries = {"acme/api#12": self.merged_entry(labels=self.fleet + other)}
+        self.go(entries, gh)
+        self.go(entries, gh)
+        self.assertEqual((sorted(gh.removed), len(gh.reads)), (sorted(self.fleet), 1), "only this fleet's prefix, and not twice")
+
+    def test_the_reads_are_bounded_by_the_pass_limit(self):
+        entries = {"acme/api#%d" % n: self.merged_entry() for n in range(100, 100 + sb.IMPACT_PASS_CALLS + 4)}
+        gh = FakeMergedGh({n: (0, json.dumps({"state": "OPEN", "labels": []}), "") for n in range(100, 100 + sb.IMPACT_PASS_CALLS + 4)})
+        self.go(entries, gh)
+        self.assertLessEqual(len(gh.reads), sb.IMPACT_PASS_CALLS)
+        self.go(entries, gh)
+        self.assertGreater(len(gh.reads), sb.IMPACT_PASS_CALLS, "the rest are read on the next pass")
+
+    def test_a_failed_label_write_is_not_marked_done_audits_no_removal_and_is_retried(self):
+        gh = FakeMergedGh({30: self.view()})
+        entries = {"acme/api#30": self.merged_entry()}
+        with mock.patch.object(sb, "change_issue_labels", side_effect=sb.IntentError("gh", "HTTP 502")):
+            self.go(entries, gh)
+        self.assertEqual((self.audit("merged.labels_removed"), [e["event"] for e in self.world.audit() if e["event"] == "merged_labels.error"]), ([], ["merged_labels.error"]))
+        self.go(entries, gh)   # inside the back-off: nothing yet
+        self.assertEqual(gh.removed, [])
+        self.world.tick(sb.load_module("merged_labels").RETRY_SECONDS + 1)
+        self.go(entries, gh)
+        self.assertEqual(sorted(gh.removed), sorted(self.fleet), "retried after the back-off")
+        self.assertEqual(len(self.audit("merged.labels_removed")), 1)
+
+    def test_a_read_that_raises_is_audited_once_and_a_merged_pr_with_no_fleet_label_left_is_done(self):
+        gh = FakeMergedGh({31: RuntimeError("socket closed"), 32: self.view(labels=["bug"])})
+        entries = {"acme/api#31": self.merged_entry(), "acme/api#32": self.merged_entry()}
+        self.go(entries, gh)
+        self.assertEqual([e["subject"] for e in self.audit("merged.labels_read_failed")], ["acme/api#31"])
+        self.assertEqual(gh.removed, [], "nothing to remove on #32: its labels were taken off already")
+        self.assertEqual(len(self.audit("merged.labels_removed")), 0)
+        reads = len(gh.reads)
+        self.go(entries, gh)
+        self.assertEqual(len(gh.reads), reads, "#32 is done: not read again; #31 waits for its back-off")
+
+    def test_the_daemons_pass_runs_it_and_a_failure_never_stops_the_pass(self):
+        self.engine.hub = StubHub({"acme/api#13": self.merged_entry()})
+        self.engine.gh_runner = FakeMergedGh({13: self.view()})
+        sb.publish_decisions(self.engine)
+        self.assertEqual(sorted(self.engine.gh_runner.removed), sorted(self.fleet), "publish_decisions (the pass) removes them")
+        with mock.patch.object(sb.load_module("merged_labels"), "run_pass", side_effect=RuntimeError("boom")):
+            sb.publish_decisions(self.engine)   # never raises
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "merged_labels.error"])
+
+    def test_s6_the_sweep_side_is_driven_through_the_sweep_in_TestSweep(self):
+        """S6 is exercised through `sweep_read_repo` and `sweep_verify` by TestSweep.test_s9_a_merged_pr_is_no_finding_and_a_closed_unmerged_one_still_is
+        and test_s9_a_fresh_read_that_shows_the_pr_merged_drops_the_finding; here only the helper both paths share is pinned."""
+        self.assertTrue(sb._issue_pr_merged({"pull_request": {"merged_at": "2026-10-15T10:00:00Z"}}))
+        for record in ({"pull_request": {"merged_at": None}}, {"pull_request": {}}, {}, None, {"pull_request": "x"}):
+            self.assertFalse(sb._issue_pr_merged(record), record)
 
 
 if __name__ == "__main__":
