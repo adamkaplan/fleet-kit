@@ -357,6 +357,9 @@ PLAIN_WORDS = frozenset(("a also ahead approve approved are be clear cleared fin
 # about the past is a report, not a grant. `cleared` and `approved` are the owner's own grant words ("366 cleared", "366 is approved"), so they are allowed ONLY as a
 # state AFTER the number and followed by nothing but thanks: "cleared 366" and "approved 366" read as a report of what was done, and are refused.
 PARTICIPLES = frozenset(("cleared", "approved"))
+# What may come BEFORE the number: only the imperative way in ("ok to merge 366", "please clear 366", "go ahead ship 366"). Thanks, pronouns and "for the" before it read as a thank-you for
+# something already done, which is a report.
+BEFORE_WORDS = frozenset(("please ok okay to merge ship clear approve release go ahead lgtm a pr then now").split())
 LETTERS = re.compile(r"[^\W\d_]+", re.UNICODE)
 
 
@@ -381,7 +384,7 @@ def _plain_clearing(text):
         return not any(word.lower() in QUESTION_OPENERS for word in words)
     before = LETTERS.findall(text[:first.start()])
     after = LETTERS.findall(text[first.end():])
-    if any(word.lower() in QUESTION_OPENERS or word.lower() in PARTICIPLES for word in before):
+    if any(word.lower() not in BEFORE_WORDS for word in before):
         return False
     gap = text[first.end():]
     direct = bool(after) and re.match(r"^\s*" + re.escape(after[0]), gap) is not None   # the first word after the number follows it with nothing but space between
@@ -394,8 +397,6 @@ def _plain_clearing(text):
         if word.lower() in QUESTION_OPENERS and n + 1 < len(after) and after[n + 1].lower() in PRONOUNS:
             return False
     return True
-
-
 
 
 def screen(text, offers, created, now):

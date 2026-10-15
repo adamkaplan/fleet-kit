@@ -11767,7 +11767,7 @@ class TestChatClearJudge(unittest.TestCase):
                 "last 366 good to go", "earlier 366 is good to go", "366 good to go yesterday", "366 is already good to go", "366 has been good to go", "366 was approved",
                 "I cleared 366", "I approved 366", "we shipped 366", "366 was released", "366 released yesterday", "366 would be good to go", "366 had good to go",
                 "366. I cleared it", "366 I cleared it", "366 you approved it", "366 I approved", "366 you cleared it", "366 cleared it", "366 approved it", "please cleared 366",
-                "366 good to go cleared", "366 also cleared it", "366 is cleared it", "366 cleared, I think", "366 is approved by you")
+                "366 good to go cleared", "366 also cleared it", "366 is cleared it", "366 cleared, I think", "366 is approved by you", "thanks for the 366 approved", "thank you for 366 cleared", "you 366 approved", "thanks 366 cleared", "for 366 cleared")
         for text in past:
             got = self.decide(text, jev)
             self.assertNotEqual(got["action"], "clear", text)
