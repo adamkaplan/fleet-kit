@@ -231,6 +231,65 @@ class Hooks(unittest.TestCase):
         self.assertEqual(body["pushes_watched"], ["acme/api", "acme/web"])
         self.assertEqual(body["pushes"], {})     # no push: the reader turns a watched repository into 0
 
+    def test_health_watched_repos_keeps_only_running_watches_and_survives_bad_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(self.sb.health_watched_repos(d), [])                       # no file
+            path = os.path.join(d, "github-watch.json")
+            with open(path, "w") as fh:
+                json.dump({"watches": [{"repo": "acme/api", "state": "running"}, {"repo": "acme/web", "state": "backoff"}, {"state": "running"}, "x"]}, fh)
+            self.assertEqual(self.sb.health_watched_repos(d), ["acme/api"])
+            with open(path, "w") as fh:
+                fh.write("not json")
+            self.assertEqual(self.sb.health_watched_repos(d), [])                       # malformed
+            with open(path, "w") as fh:
+                fh.write("[]")
+            self.assertEqual(self.sb.health_watched_repos(d), [])                       # not an object
+
+    def test_health_write_carries_v2_light_and_the_watched_repositories(self):
+        class State:
+            pr_state = {}
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "github-watch.json"), "w") as fh:
+                json.dump({"watches": [{"repo": "acme/api", "state": "running"}]}, fh)
+            engine = self.engine(d)
+            engine.config = {"v2_light": True}
+            self.sb.health_write(engine, State, NOW)
+            with open(os.path.join(d, hr.FILE)) as fh:
+                body = json.load(fh)
+            self.assertEqual(body["sources"], {"tool_calls": "missing", "usage": "off: v2_light"})
+            self.assertEqual(body["pushes_watched"], ["acme/api"])
+            self.assertEqual(body["pushes"], {})
+
+    def test_the_feed_records_usage_only_under_v2_light(self):
+        class Http:
+            pass
+        class V2:
+            http = Http()
+        class Engine:
+            v2 = V2()
+            audit = None
+        started = self.sb.EventFeed.start
+        self.sb.EventFeed.start = lambda feed: None     # no thread, no connection
+        try:
+            for light in (True, False):
+                feed = self.sb.start_event_feed(Engine(), {"v2_events": "auto", "v2_light": light}, time.time)
+                self.assertEqual(feed.on_usage is not None, light)
+        finally:
+            self.sb.EventFeed.start = started
+
+    def test_usage_may_come_as_usage_and_a_failing_callback_does_not_stop_the_feed(self):
+        feed = self.sb.EventFeed(None)
+        def boom(session, step):
+            raise RuntimeError("x")
+        feed.on_usage = boom
+        feed.handle("data: " + json.dumps({"id": "e1", "type": "session.step.ended", "data": {"sessionID": "ses_a", "usage": {"input": 1}}}))
+        self.assertEqual(feed.counts["errors"], 1)
+        got = []
+        feed.on_usage = lambda session, step: got.append(step)
+        feed.handle("data: " + json.dumps({"id": "e2", "type": "session.step.ended", "data": {"sessionID": "ses_a", "usage": {"input": 1}}}))
+        feed.handle("data: " + json.dumps({"type": "session.step.ended", "data": {"sessionID": "ses_a", "tokens": {"input": 1}}}))   # no id of any kind: nothing handed over
+        self.assertEqual([g["id"] for g in got], ["e2"])
+
     def test_the_end_of_every_pass_writes_the_file_with_no_plan_gates_configured(self):
         """The ci recorder returns early on a fleet with no `plan_gates`; the records must not depend on it."""
         class Engine:

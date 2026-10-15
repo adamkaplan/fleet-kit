@@ -3618,13 +3618,13 @@ class EventFeed:
             entry["event_at"] = self.now()
             message = data.get("assistantMessageID") if isinstance(data.get("assistantMessageID"), str) and len(data["assistantMessageID"]) <= FEED_ID_MAX else None
             usage = (data.get("tokens") if isinstance(data.get("tokens"), dict) else data.get("usage")) if kind == "session.step.ended" else None
-            if self.on_usage is not None and isinstance(usage, dict):
-                step = {"id": event.get("id") if isinstance(event.get("id"), str) else "%s:%s" % (message, event.get("created")),
-                        "tokens": usage, "cost": data.get("cost"), "time": {"created": event.get("created")}}
+            step_id = event.get("id") if isinstance(event.get("id"), str) else ("%s:%s" % (message, event.get("created")) if message else None)
+            if self.on_usage is not None and isinstance(usage, dict) and step_id:
+                step = {"id": step_id, "tokens": usage, "cost": data.get("cost"), "time": {"created": event.get("created")}}
                 try:
                     self.on_usage(session, step)   # a step's usage from the event itself: it works with v2_light on, which only stops READS of history
                 except Exception:
-                    pass
+                    self.counts["errors"] += 1     # said in the feed's own counters; the recorder's faults are already said by health_ingest_messages
             if message and kind in ("session.text.ended", "session.step.ended"):
                 entry["assistant"] = message   # the id only: an event's text is never kept
             elif kind in ("session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"):
@@ -3727,7 +3727,8 @@ def start_event_feed(engine, config, now):
     if config["v2_events"] != "auto" or getattr(engine.v2, "http", None) is None:
         return None
     engine.feed = EventFeed(engine.v2.http, engine.audit, now)
-    engine.feed.on_usage = lambda session, step: health_ingest_messages(engine, session, [step])
+    if config.get("v2_light"):   # only then: without it the history reads feed the same usage (under another id), which would count a step twice
+        engine.feed.on_usage = lambda session, step: health_ingest_messages(engine, session, [step])
     engine.feed.start()
     return engine.feed
 
