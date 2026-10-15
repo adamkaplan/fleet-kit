@@ -15194,13 +15194,13 @@ ORIGIN_SSH_RE = re.compile(r"git@github\.com:" + _ORIGIN_NAME)
 
 def origin_repository(runner, directory):
     """(`owner/name`, None) for the repository the `origin` remote of `directory` names, else (None, why). Read ONCE, by the launcher, never by a shim or
-    at call time (a worker controls its own remote settings): `git config --local --get-all remote.origin.url` as an argv, no shell, no network, nothing
+    at call time (a worker controls its own remote settings): `git config --local --no-includes --get-all remote.origin.url` as an argv, no shell, no network, nothing
     but the repository's own config. Only `https://github.com/OWNER/NAME[.git]` and `git@github.com:OWNER/NAME[.git]` are accepted, exactly one `origin`
     url: another host, a path, a `file:` or `ssh://` url, a url with a user or a token in it, an alias, a trailing path or no origin at all gives no
     repository. The result is lower case. `why` is a fixed phrase: the url itself is NEVER returned, printed or logged."""
     if not isinstance(directory, str) or not os.path.isabs(directory) or not os.path.isdir(directory):
         return None, "the working directory is not an existing absolute path"
-    done = _git(runner, directory, "config", "--local", "--get-all", "remote.origin.url")
+    done = _git(runner, directory, "config", "--local", "--no-includes", "--get-all", "remote.origin.url")
     if done.returncode == 255:
         return None, "git could not be run there"
     urls = [line for line in (done.stdout or "").splitlines() if line.strip()]
