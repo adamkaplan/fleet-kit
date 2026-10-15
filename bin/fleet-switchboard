@@ -18250,6 +18250,27 @@ def chat_clear_config(config):
     return {"enabled": raw.get("enabled") is not False, "live": raw.get("live") is True}
 
 
+CHAT_CLEAR_OFF_FILE = "chat-clear.off"   # the owner's panic stop: its mere presence in the state directory forces SHADOW, checked every pass
+
+
+def chat_clear_live_now(engine):
+    """(live, why): may the hook WRITE on this pass? Only when ALL hold, judged afresh every pass: the config this daemon runs on says `live` (a real true), the kill file
+    `chat-clear.off` is not in the state directory, and the CURRENT config file, read now, is valid and also says `live` and not `enabled: false`. The daemon keeps its last good
+    config when a reload fails, so an invalid or half-edited file would otherwise leave the owner's `live` on: here it means SHADOW at once. `why` is None when live or when
+    shadow is simply the configured mode, else a short reason."""
+    if not chat_clear_config(engine.config)["live"]:
+        return False, None
+    if (Path(engine.state_dir) / CHAT_CLEAR_OFF_FILE).exists():
+        return False, "kill file"
+    try:
+        current = chat_clear_config((getattr(engine, "config_reader", None) or load_runnable_config)())
+    except Exception:   # an invalid, unreadable or missing config file: never live on a file that cannot be read
+        return False, "config invalid"
+    if not (current["live"] and current["enabled"]):
+        return False, "config says shadow"
+    return True, None
+
+
 def chat_clear_holds(decisions, names):
     """The holds the owner is shown, read from the SAME decisions the Decisions list is made of: [{"pr", "head", "labels", "summary"}] for every `captain` row that names its head,
     with the owner-tier labels that row stands for (the captain label, and one `hold-*` label for each hold reason it lists). A reason this build cannot name drops the PR."""
@@ -18283,6 +18304,14 @@ def _chat_clear_pass(engine, decisions, now):
     cfg = chat_clear_config(engine.config)
     if not cfg["enabled"] or engine.actor != "daemon" or engine.state_dir is None or engine.audit is None or engine.jev is None:
         return
+    live, why = chat_clear_live_now(engine)
+    cfg = dict(cfg, live=live)
+    mode = "live" if live else ("shadow (%s)" % why if why else "shadow")
+    if engine.__dict__.get("chat_clear_mode") != mode:   # said once per change, loudly: the owner's switch took (or stopped taking) effect
+        previous = engine.__dict__.get("chat_clear_mode")
+        engine.__dict__["chat_clear_mode"] = mode
+        if previous is not None or why:
+            engine.audit.append(engine.actor, "chat_clear.mode", "chat_clear", {"mode": mode, "was": previous, "why": why})
     cc = load_module("chat_clear")
     names = label_names(engine.config)
     holds = chat_clear_holds(decisions, names)

@@ -11978,8 +11978,9 @@ class TestChatClearHook(Base):
     def build(self, live=None, extra=None):
         chat = {"live": self.live if live is None else live}
         self.writes.clear()
-        for stale in Path(sb.ensure_state_dir(None)).glob("chat-clear-*"):
+        for stale in Path(sb.ensure_state_dir(None)).glob("chat-clear*"):
             stale.unlink()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "chat_clear": chat})   # the owner's file: the hook reads it afresh every pass
         impact = Path(sb.ensure_state_dir(None)) / sb.IMPACT_STATE_FILE
         if impact.exists():
             impact.unlink()
@@ -12351,6 +12352,58 @@ class TestChatClearHook(Base):
         self.hook()
         self.assertTrue(seen and all(token == "tok-app" for token in seen), "every point-of-effect read runs as the repo's own account: %r" % seen)
         self.assertEqual(len(seen), 2, "one pre-read and the core's own read, nothing from memory")
+
+    def live_verdicts(self):
+        return [e["detail"]["live"] for e in self.events("chat_clear.verdict")]
+
+    def test_live_is_confirmed_by_the_current_config_file_every_pass_and_an_invalid_file_or_the_kill_file_means_shadow_at_once(self):
+        self.live = True
+        valid = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH}
+        cases = ((dict(valid, chat_clear={"live": True}), True), (dict(valid, chat_clear={"live": False}), False), (dict(valid), False), (dict(valid, chat_clear={"live": "true"}), False),
+                 (dict(valid, chat_clear={"live": 1}), False), (dict(valid, chat_clear=None), False), (dict(valid, chat_clear={"live": True, "enabled": False}), False),
+                 ("{not json", False), (dict(valid, chat_clear={"live": True, "other": 1}), False), (dict(valid, github_poll_seconds=-5, chat_clear={"live": True}), False))
+        for file, live in cases:
+            self.build()                       # this daemon runs on a config that says live
+            self.write_config(file)            # ... and the file on disk now says something else
+            self.hook()
+            self.say("9 is good to go")
+            self.hook()
+            (verdict,) = self.events("chat_clear.verdict")[-1:]
+            self.assertEqual(verdict["detail"]["live"], live, file)
+            self.assertEqual(bool(self.label_deletes()), live, "labels are removed only while the current file confirms live: %r" % (file,))
+            self.assertEqual(bool(self.cos_texts() or self.writes), live)
+
+    def test_a_config_that_becomes_invalid_while_live_is_shadow_in_the_next_pass_and_says_so_once_and_the_kill_file_is_the_panic_stop(self):
+        self.live = True
+        self.build()
+        self.hook()
+        self.assertEqual([e["detail"]["mode"] for e in self.events("chat_clear.mode")], [], "live from the first pass: nothing to announce")
+        self.write_config("{broken")
+        self.hook()
+        self.hook()
+        modes = self.events("chat_clear.mode")
+        self.assertEqual([m["detail"]["mode"] for m in modes], ["shadow (config invalid)"], "said ONCE, loudly")
+        self.say("9 is good to go")
+        self.hook()
+        self.assertEqual((self.writes, self.live_verdicts()), ([], [False]))
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "chat_clear": {"live": True}})
+        self.say("9 also good to go")
+        self.hook()
+        self.assertEqual(self.live_verdicts(), [False, True], "a valid file that says live puts it back")
+        self.assertEqual(self.events("chat_clear.mode")[-1]["detail"]["mode"], "live")
+        # the kill file
+        self.build()
+        self.hook()
+        (Path(self.world.state) / sb.CHAT_CLEAR_OFF_FILE).write_text("")
+        self.say("9 is good to go")
+        self.hook()
+        self.assertEqual((self.writes, self.live_verdicts()[-1:]), ([], [False]), "the kill file forces shadow")
+        self.assertEqual(self.events("chat_clear.mode")[-1]["detail"]["mode"], "shadow (kill file)")
+        (Path(self.world.state) / sb.CHAT_CLEAR_OFF_FILE).unlink()
+        self.say("9 is also good to go")
+        self.hook()
+        self.assertEqual(self.live_verdicts()[-1:], [True], "removed: back to the config's value")
+        self.assertEqual(bool(self.label_deletes()), True)
 
     def test_the_hook_fails_quietly_and_never_clears_on_trouble(self):
         self.live = True
