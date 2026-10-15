@@ -20219,6 +20219,62 @@ class TestIdentityCheck(ReportBase):
         self.assertTrue(self.shim().is_write(["auth", "git-credential", "get"]))
         self.assertFalse(self.shim().is_write(["auth", "status"]))
 
+    def test_the_credential_route_of_a_caller_with_no_repository_of_its_own_is_refused_whatever_the_verb_and_names_the_fix(self):
+        """#473 S5: git push, fetch, pull and clone all reach the shim as `gh auth git-credential <action>` (TestGitShim S1 proves the routing). A caller whose repo is only the
+        configured default (`own` false) used to get the DEFAULT repository's account there, and pushed as the wrong account."""
+        users = {"acme-ops/default": "acct-ops", "acme-other/*": "acct-other"}
+        tokens = {"acct-ops": "tok-ops", "acct-other": "tok-other"}
+        for verb in ("push", "fetch", "pull", "clone"):
+            for action in ("get", "store", "erase"):
+                with self.subTest(verb=verb, action=action):
+                    done, seen = self.run_gh_shim("acme-ops/default", users, tokens, args=("auth", "git-credential", action), own=False)
+                    self.assertEqual(done.returncode, 1, (verb, action))
+                    self.assertIn("has no repository of its own", done.stderr)
+                    self.assertIn("launch", done.stderr)
+                    self.assertIn("--repo", done.stderr)
+                    self.assertIn("never used", done.stderr)
+                    self.assertIsNone(seen, "the real gh never ran: no credential was given to anything")
+                    self.assertNotIn("tok-ops", done.stdout + done.stderr)
+        done, seen = self.run_gh_shim("acme-ops/default", users, tokens, args=("auth", "git-credential", "get"), own=True)
+        self.assertEqual((done.returncode, seen["token"]), (0, "tok-ops"), "a caller whose repo IS its own is served as before")
+        done, seen = self.run_gh_shim("acme-ops/default", users, tokens, args=("auth", "git-credential", "get"))
+        self.assertEqual((done.returncode, seen["token"]), (0, "tok-ops"), "a switchboard that does not say `own` (an older one) is served as before")
+
+    def test_everything_else_about_account_choice_is_unchanged_for_a_caller_with_no_repository_of_its_own(self):
+        """#473 S6/PC-3: only the credential route changes. The Chief of Staff's named-repo commands, reads and writes without a name, and a caller with its own repo."""
+        users = {"acme-ops/*": "acct-ops", "acme/*": "acct-personal"}
+        tokens = {"acct-ops": "tok-ops", "acct-personal": "tok-personal"}
+        for args, expected in ((("issue", "view", "5", "-R", "acme/api"), "tok-personal"), (("issue", "comment", "5", "-R", "acme/api", "--body", "x"), "tok-personal"),
+                               (("issue", "list"), "tok-ops"), (("pr", "merge", "5", "-R", "acme/api"), "tok-ops"), (("auth", "status"), "tok-ops")):
+            with self.subTest(args=args):
+                done, seen = self.run_gh_shim("acme-ops/default", users, tokens, args=args, own=False)
+                self.assertEqual((done.returncode, seen["token"]), (0, expected), done.stderr)
+        done, seen = self.run_gh_shim("acme-ops/default", users, tokens, args=("auth", "git-credential", "get"), who_repo_exit=2)
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("account lookup failed", done.stderr, "a failed lookup keeps its own refusal")
+        done, seen = self.run_gh_shim("acme-other/thing", users, tokens, args=("auth", "git-credential", "get"), own=True)
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("no GitHub account is mapped for", done.stderr, "an unmapped repository keeps its own refusal")
+
+    def test_no_shim_reads_a_directorys_remote_when_it_decides_who_a_caller_is(self):
+        """#473 S7/PC-1: the repository is derived once by the launcher. A fake `git` on the PATH records every call: across the shim runs it is started only by the git shim's
+        own exec of the real git, never by the gh shim, and no call asks for a remote or a config value."""
+        home = Path(self.home)
+        bindir = home / "shimbin"
+        bindir.mkdir(exist_ok=True)
+        glog = home / "git-calls.log"
+        (bindir / "git").write_text("#!/bin/sh\necho \"$@\" >> %s\nexit 0\n" % glog)
+        (bindir / "git").chmod(0o755)
+        users = {"acme-ops/default": "acct-ops"}
+        for args, own in ((("auth", "git-credential", "get"), False), (("auth", "git-credential", "get"), True), (("auth", "git-credential", "store"), False),
+                          (("issue", "list"), False), (("pr", "view", "5", "-R", "acme-ops/other"), False)):
+            self.run_gh_shim("acme-ops/default", users, {"acct-ops": "tok-ops"}, args=args, own=own)
+        self.assertFalse(glog.exists(), "the gh shim never ran git, so it read no remote in 5 calls")
+        for path in (SHIM, GIT_SHIM):
+            source = path.read_text()
+            for word in ("remote.origin", "get-url", "config --get", "\"config\"", "ls-remote"):
+                self.assertNotIn(word, source.replace("`remote update|show|prune`", "").replace("ls-remote, ", ""), "%s asks git for %s" % (path.name, word))
+
     def test_git_credential_for_a_repository_with_no_mapped_account_or_no_identity_is_refused_never_the_inherited_token(self):
         users = {"acme-ops/service": "acct-ops"}
         cred = ("auth", "git-credential", "get")
@@ -28314,6 +28370,117 @@ class TestLaunchIntoARepo(TwoRepoCase):
         code, _, err = self.launch("--repo", "other/tool")
         self.assertEqual(code, 0, err)
         self.assertNotIn("GH_TOKEN", self.opened()[0]["root"]["env"])
+
+
+class TestLaunchRepoFromOrigin(TwoRepoCase):
+    """#473 slice 1: a launch with no --repo reads the working directory's origin ONCE, in the launcher, and records the repository; nothing else does."""
+
+    SECRET = "ghp_SECRETtoken0123456789"
+
+    def work(self, *urls, init=True, name="checkout"):
+        work = self.home / name
+        work.mkdir(exist_ok=True)
+        if init:
+            subprocess.run(["git", "init", "-q", str(work)], check=True, capture_output=True)
+            for url in urls:
+                subprocess.run(["git", "-C", str(work), "config", "--local", "--add", "remote.origin.url", url], check=True, capture_output=True)
+        return work
+
+    def launch(self, work, *extra, name="web-new"):
+        return self.main("launch", name, "--agent", "coder", "--dir", str(work), "--workspace", "w1", "--role", "coder", *extra)
+
+    def recorded(self, out):
+        return self.world.v2.sessions[json.loads(out)["session"]]["metadata"]["fleet"].get("repo")
+
+    def test_s1_an_origin_on_github_is_recorded_lower_case_and_the_output_names_it_in_every_accepted_form(self):
+        for n, url in enumerate(("https://github.com/ACME/Web.git", "https://github.com/acme/web", "git@github.com:Acme/Web.git", "git@github.com:acme/web")):
+            with self.subTest(url=url):
+                code, out, err = self.launch(self.work(url, name="co%d" % n), name="web-%d" % n)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.recorded(out), ACME_WEB)
+                self.assertIn("repository: acme/web (from origin)", err)
+                self.assertNotIn("github.com", err, "the url is never printed, only owner/name")
+        events = [e for e in self.world.audit() if e["event"] == "launch.repo_from_origin"]
+        self.assertEqual([e["detail"] for e in events], [{"repo": ACME_WEB}] * 4)
+        self.assertEqual(self.opened_env("web-0")["GH_TOKEN"], FAKE_TOKENS["acme-ci"], "the recorded repository is the account the worker is pinned to")
+
+    def opened_env(self, name):
+        return [p for m, p in self.world.herdr.socket_calls if m == "layout.apply"][int(name.rsplit("-", 1)[1])]["root"]["env"]
+
+    def test_s2_no_origin_a_path_another_host_and_every_odd_form_record_no_repository_and_say_what_it_means(self):
+        bad = {"no origin": None, "a local path": "/srv/git/web.git", "a relative path": "../web.git", "a file url": "file:///srv/git/web.git",
+               "another host": "https://gitlab.com/acme/web.git", "a look-alike host": "https://github.com.evil.example/acme/web.git",
+               "http": "http://github.com/acme/web.git", "an ssh url": "ssh://git@github.com/acme/web.git", "another ssh user": "other@github.com:acme/web.git",
+               "a trailing slash": "https://github.com/acme/web/", "a path below": "https://github.com/acme/web/tree/main", "a query": "https://github.com/acme/web.git?x=1",
+               "dot dot": "https://github.com/acme/..", "a double suffix": "https://github.com/acme/web.git.git", "no name": "https://github.com/acme/",
+               "an alias": "gh:acme/web", "a space": "https://github.com/acme/we b.git", "a newline in it": "https://github.com/acme/web.git\nx"}
+        for n, (label, url) in enumerate(bad.items()):
+            with self.subTest(label):
+                work = self.work(*( [url] if url else [] ), name="bad%d" % n)
+                code, out, err = self.launch(work, name="bad-%d" % n)
+                self.assertEqual(code, 0, err)
+                self.assertIsNone(self.recorded(out), label)
+                self.assertIn("no repository recorded (", err)
+                self.assertIn("pushes will be refused; pass --repo", err)
+                if url:
+                    self.assertNotIn(url.split("\n")[0], err, "the url is never printed")
+        work = self.work(init=False, name="notgit")
+        code, out, err = self.launch(work, name="not-git")
+        self.assertEqual((code, self.recorded(out)), (0, None))
+        self.assertIn("no repository recorded (the directory has no origin remote)", err)
+        two = self.work("https://github.com/acme/web.git", "https://github.com/acme/api.git", name="two")
+        code, out, err = self.launch(two, name="two-urls")
+        self.assertIsNone(self.recorded(out))
+        self.assertIn("origin names more than one url", err)
+
+    def test_s3_an_origin_with_a_user_or_token_in_it_records_nothing_and_leaks_nowhere(self):
+        for n, url in enumerate(("https://%s@github.com/acme/web.git" % self.SECRET, "https://x-access-token:%s@github.com/acme/web.git" % self.SECRET, "https://user:pw@github.com/acme/web.git")):
+            work = self.work(url, name="cred%d" % n)
+            code, out, err = self.launch(work, name="cred-%d" % n)
+            self.assertEqual(code, 0, err)
+            self.assertIsNone(self.recorded(out))
+            audit = (self.world.state / "audit.jsonl").read_text()
+            record = json.dumps(self.world.v2.sessions[json.loads(out)["session"]]["metadata"])
+            for secret in (self.SECRET, "pw@"):
+                for text in (out, err, audit, record):
+                    self.assertNotIn(secret, text)
+
+    def test_s4_an_explicit_repo_wins_and_an_issue_that_names_one_is_never_overridden_and_a_charter_derives_nothing(self):
+        work = self.work("https://github.com/acme/api.git")
+        code, out, err = self.launch(work, "--repo", ACME_WEB)
+        self.assertEqual((code, self.recorded(out)), (0, ACME_WEB), err)
+        self.assertNotIn("from origin", err)
+        code, out, err = self.launch(work, "--issue", "acme/web#2", name="web-two")
+        self.assertEqual((code, self.recorded(out)), (0, ACME_WEB), err)
+        self.assertNotIn("from origin", err)
+        self.assertEqual([e for e in self.world.audit() if e["event"] == "launch.repo_from_origin"], [])
+        code, out, err = self.launch(work, "--charter", "1", name="chartered")
+        self.assertNotIn("from origin", err, "a charter has its own repo: nothing is read from the directory")
+        self.assertNotIn("no repository recorded", err)
+
+    def test_a_headless_launch_into_a_mapped_origin_is_refused_like_any_mapped_repo(self):
+        work = self.work("https://github.com/acme/web.git")
+        code, out, err = self.main("launch", "hl", "--agent", "coder", "--dir", str(work), "--role", "coder", "--headless")
+        self.assertEqual(code, 1)
+        self.assertIn("a headless worker cannot work as the gh account acme-ci", err)
+        self.assertIn("repository: acme/web (from origin)", err)
+
+    def test_the_directory_is_read_once_by_the_launcher_with_one_argv_and_no_network(self):
+        calls = []
+        real = subprocess.run
+
+        def spy(argv, *a, **k):
+            if argv and argv[0] == "git":
+                calls.append(list(argv))
+            return real(argv, *a, **k)
+
+        work = self.work("https://github.com/acme/web.git")
+        with mock.patch.object(subprocess, "run", spy):
+            code, out, err = self.launch(work)
+        self.assertEqual(code, 0, err)
+        origin_reads = [c for c in calls if "remote.origin.url" in c]
+        self.assertEqual(origin_reads, [["git", "-C", str(work), "config", "--local", "--get-all", "remote.origin.url"]], "one read, argv, local config only")
+        self.assertEqual([c for c in calls if c[3:4] in (["fetch"], ["ls-remote"], ["remote"])], [])
 
 
 class TestLaunchSetsCheckpointReminders(TwoRepoCase):
