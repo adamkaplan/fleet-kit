@@ -24545,6 +24545,16 @@ def validate_load_alert_config(config, source):
         raise ConfigError(str(err)) from None
 
 
+def coder_finished(obs, retired, last_reports):
+    """True for a coder that is on the books but done: on the retired list (the same name and session, as the pane check reads it), or whose
+    last report was a final `done` or `failed` (a later `working` report replaces it, so a coder given new work counts again)."""
+    name = obs.name
+    entry = retired.get(name)
+    if isinstance(entry, dict) and entry.get("session") in (None, obs.session_id):
+        return True
+    return (last_reports.get(name) or {}).get("state") in ("done", "failed")
+
+
 def load_tick(engine, discovery):
     """The end of a pass: the load figures per orchestrator, and the alert to the Chief of Staff when a threshold is crossed. Reads no v2 and
     makes at most a bounded number of GitHub reads an hour; a source it cannot read means no wake. Returns what was sent."""
@@ -24553,12 +24563,14 @@ def load_tick(engine, discovery):
     health, now = load_fleet_health(), engine.now()
     cfg = engine.config.get("load_alert") or dict(health.DEFAULTS)
     reminders = read_reminders(engine.state_dir)
+    retired, last_reports = read_retired(engine.state_dir), _read_small(engine.state_dir, LAST_REPORT_FILE)
     orchestrators = {}
     for name, seen in sorted(discovery.agents.items()):
         fleet = seen.fleet or {}
         if fleet.get("role") != "orchestrator":
             continue
-        coders = [o for o in discovery.agents.values() if (o.fleet or {}).get("reports_to") == name and (o.fleet or {}).get("role") == "coder"]
+        coders = [o for o in discovery.agents.values() if (o.fleet or {}).get("reports_to") == name and (o.fleet or {}).get("role") == "coder"
+                  and not coder_finished(o, retired, last_reports)]   # a retired coder, or one that made its final report, is on the books but not a coder of this workspace
         orchestrators[name] = {"charter": fleet.get("charter") if _is_issue_number(fleet.get("charter")) else None,   # a fallback: the charter is found by the yaml that names the agent
                                "repo": _fleet_repo(fleet, engine.config) or (engine.intents.repo if engine.intents is not None else None),
                                "busy": sum(1 for c in coders if c.status == "working"), "idle": sum(1 for c in coders if c.status == "idle"),
