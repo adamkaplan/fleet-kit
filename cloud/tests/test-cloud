@@ -139,12 +139,29 @@ cp "$fx" "$tmp/config.toml"; cp "$fx" "$tmp/orig"
 DOWN=1 WAIT=2 POLL=1 runfix; rc=$?
 [ $rc = 1 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && [ "$(restarts)" = 2 ] && ! grep -q label "$tmp/log" \
   && ok "fix: containerd down after restart: backup restored, restarted again, exit 1" || bad "fix: rollback after restart (rc=$rc)"
+mk="$tmp/config.toml.sysbox-fix.failed"
+[ "$(sed -n 's/^count=//p' "$mk")" = 1 ] && ok "fix: first failure writes the marker with count 1" || bad "fix: marker count 1"
+# second failure: count 2
+DOWN=1 WAIT=2 POLL=1 runfix; rc=$?
+[ $rc = 1 ] && [ "$(sed -n 's/^count=//p' "$mk")" = 2 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && ok "fix: second failure: count 2, backup restored" || bad "fix: marker count 2 (rc=$rc)"
+# third start: nothing touched, exits (ONCE) with 4, no restart, no label
+runfix; rc=$?
+[ $rc = 4 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && [ "$(restarts)" = 0 ] && ! grep -q label "$tmp/log" \
+  && ok "fix: at the cap: no edit, no restart, no label, idles" || bad "fix: cap (rc=$rc)"
+# a corrupt marker counts as the cap
+echo garbage > "$mk"; runfix; rc=$?
+[ $rc = 4 ] && [ "$(restarts)" = 0 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && ok "fix: corrupt marker fails closed" || bad "fix: corrupt marker (rc=$rc)"
+# below the cap, a healthy restart succeeds and removes the marker
+printf 'count=1\ntime=x\n' > "$mk"; runfix; rc=$?
+[ $rc = 0 ] && [ ! -e "$mk" ] && [ "$(restarts)" = 1 ] && ok "fix: success removes the marker" || bad "fix: marker removal (rc=$rc)"
+rm -f "$mk"; cp "$fx" "$tmp/config.toml"
 # containerd answers but the node is not Ready: same rollback
 printf '#!/bin/sh\nexit 1\n' > "$tmp/notready"; chmod +x "$tmp/notready"
 cp "$fx" "$tmp/config.toml"
 READY_CMD="$tmp/notready" WAIT=2 POLL=1 runfix; rc=$?
 [ $rc = 1 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && [ "$(restarts)" = 2 ] && ! grep -q label "$tmp/log" \
   && ok "fix: node not Ready after restart: backup restored, exit 1" || bad "fix: not-Ready rollback (rc=$rc)"
+rm -f "$mk"
 # healthy restart (node Ready): one restart, labelled, as before
 printf '#!/bin/sh\nexit 0\n' > "$tmp/ready"; chmod +x "$tmp/ready"
 cp "$fx" "$tmp/config.toml"

@@ -25,6 +25,11 @@ data:
     OLD="io.containerd.grpc.v1.cri"
     bad=0
     WAIT=${WAIT:-60}; POLL=${POLL:-2}
+    # A failed restart (rolled back) is recorded in a marker on the node, beside the config, so
+    # the count survives pod restarts. At MAX_ATTEMPTS the fix stays off: it edits nothing,
+    # restarts nothing, labels nothing, and idles. To retry, delete the marker on the node.
+    MARKER="$CFG.sysbox-fix.failed"; MAX_ATTEMPTS=${MAX_ATTEMPTS:-2}
+    restore_backup() { cp "$CFG.sysbox-fix.bak" "$CFG.restore.tmp" && mv "$CFG.restore.tmp" "$CFG"; sync; }
 
     # After a restart: containerd must answer and the node must be Ready within WAIT seconds.
     node_ready() {
@@ -41,6 +46,15 @@ data:
     }
 
     while true; do
+      if [ -e "$MARKER" ]; then
+        n=$(sed -n 's/^count=\([0-9][0-9]*\)$/\1/p' "$MARKER" 2>/dev/null | head -n 1)
+        case "$n" in ''|*[!0-9]*) n=$MAX_ATTEMPTS ;; esac   # unreadable marker: fail closed
+        if [ "$n" -ge "$MAX_ATTEMPTS" ]; then
+          echo "sysbox fix disabled on this node after $n failed attempts; remove $MARKER on the node to retry" >&2
+          [ "${ONCE:-0}" = 1 ] && exit 4
+          while true; do sleep 3600; done
+        fi
+      fi
       if [ ! -f "$CFG" ] || ! grep -q 'runtimes[."'"'"']*sysbox-runc' "$CFG"; then
         echo "waiting for the Sysbox installer to register sysbox-runc"
         [ "${ONCE:-0}" = 1 ] && exit 3
@@ -102,17 +116,24 @@ data:
           $HOST systemctl restart containerd
           if ! healthy_after_restart; then
             echo "ERROR: containerd or the node is not healthy ${WAIT}s after the restart: restoring the saved config" >&2
-            cp "$CFG.sysbox-fix.bak" "$CFG"; sync
-            $HOST systemctl restart containerd || true
-            echo "ERROR: saved config restored and containerd restarted again: exiting non-zero" >&2
+            restore_backup
+            prev=$(sed -n 's/^count=\([0-9][0-9]*\)$/\1/p' "$MARKER" 2>/dev/null | head -n 1)
+            case "$prev" in ''|*[!0-9]*) prev=0 ;; esac
+            printf 'count=%s\ntime=%s\n' "$((prev + 1))" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$MARKER.tmp" && mv "$MARKER.tmp" "$MARKER"; sync
+            if $HOST systemctl restart containerd; then
+              echo "ERROR: saved config restored and containerd restarted again; failed attempt $((prev + 1)) recorded in $MARKER: exiting non-zero" >&2
+            else
+              echo "ERROR: saved config restored but the second containerd restart FAILED; failed attempt $((prev + 1)) recorded in $MARKER: exiting non-zero" >&2
+            fi
             exit 1
           fi
+          rm -f "$MARKER"
           $LABEL_CMD >/dev/null
           bad=0
         else
           bad=$((bad + 1))
           echo "config invalid (try $bad): restoring backup" >&2
-          cp "$CFG.sysbox-fix.bak" "$CFG"
+          restore_backup
           [ "$bad" -ge "${MAX_BAD:-5}" ] && { echo "giving up: pod exits non-zero" >&2; exit 1; }
           [ "${ONCE:-0}" = 1 ] && exit 1
           sleep 60; continue
