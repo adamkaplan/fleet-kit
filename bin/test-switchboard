@@ -48633,7 +48633,7 @@ class TestLoadAlert(Base):
         self.assertEqual(len(row["numbers"]), self.health.MOVES_NUMBERS_MAX)
 
     def test_unreadable_decisions_and_a_torn_audit_tail_are_not_zero_and_not_fatal(self):
-        self.assertIsNone(self.health.decisions_waiting(str(self.state_dir)))
+        self.assertIsNone(self.health.decision_items(str(self.state_dir)))
         (self.state_dir / "audit.jsonl").write_text("x" * 100 + "\n")
         with mock.patch.object(self.health, "AUDIT_TAIL_BYTES", 40):
             self.assertEqual(self.health.audit_moves(str(self.state_dir), 0), [])
@@ -49304,13 +49304,47 @@ class TestLoadAlert(Base):
         lines = self.health.status_lines(str(self.state_dir), self.T0)
         self.assertEqual(len([l for l in lines if "1 decision(s) not attributed" in l]), 1)
 
+    def test_a_notice_or_a_held_pr_is_information_and_a_real_wait_without_an_ask_is_not_attributed(self):
+        tick, reads = self.decisions_world([{"kind": "notice", "ask": None, "number": 10, "repo": "r"}, {"kind": "captain", "ask": None, "number": 20, "repo": "r"},
+                                            {"kind": "permission", "ask": None, "repo": "r"}, {"kind": "question", "ask": 0}, {"ask": 10, "repo": "r"}], {})
+        tick()
+        got = self.latest()
+        self.assertEqual((got["a"]["decisions"], got["b"]["decisions"], reads), (1, 0, []))               # the own number is not a fallback
+        lines = self.health.status_lines(str(self.state_dir), self.T0)
+        self.assertEqual([l.strip().split(" (")[0] for l in lines if "PR notices and holds" in l], ["PR notices and holds 2"])
+        self.assertEqual([l.strip().split(" (")[0] for l in lines if "not attributed" in l], ["2 decision(s) not attributed"])
+        self.assertEqual(self.health.decision_items(str(self.state_dir)), ([("r", None), ("", None), ("r", 10)], 2))
+
+    def test_a_malformed_decisions_file_counts_nothing_and_breaks_nothing(self):
+        for text in ["not json", "[]", '{"decisions": 5}', '{"decisions": [1, "x", null, {"ask": true, "repo": 7}, {"ask": -3}, {"ask": 1.5}]}']:
+            shutil.rmtree(str(self.state_dir)); self.state_dir.mkdir(mode=0o700)
+            tick, reads = self.decisions_world([], {})
+            (self.state_dir / "decisions.json").write_text(text)
+            tick()
+            self.assertEqual((self.latest()["a"]["decisions"], reads), (None if text in ("not json", "[]", '{"decisions": 5}') else 0, []), text)
+
+    def test_the_decision_items_are_capped_and_a_bad_repository_is_not_read(self):
+        many = [{"ask": 10, "repo": "r"} for _ in range(self.health.DECISIONS_MAX + 50)]
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": many}))
+        items, notices = self.health.decision_items(str(self.state_dir))
+        self.assertEqual((len(items), notices), (self.health.DECISIONS_MAX, 0))
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [{"ask": 5, "repo": "../x y"}, {"ask": 6, "repo": "acme/api"}]}))
+        self.assertEqual(self.health.decision_items(str(self.state_dir))[0], [("", 5), ("acme/api", 6)])
+
+    def test_the_decision_chain_stops_at_the_depth_cap(self):
+        deep = {600: 601, 601: 602, 602: 603, 603: 10}                                                   # 600 is four parents below ask 10
+        tick, reads = self.decisions_world([{"ask": 600, "repo": "r"}], deep)
+        tick()
+        got = self.latest()
+        self.assertEqual((got["a"]["decisions"], reads, self.health.PARENT_LEVELS), (0, [600, 601, 602], 3))
+
     def test_decision_chains_are_read_once_and_count_in_the_account_budget(self):
         tick, reads = self.decisions_world([{"agent": "a", "ask": 500, "repo": "r"}, {"agent": "a", "ask": 501, "repo": "r"}], {500: 10, 501: 10})
         for k in range(3):
             tick(self.T0 + k * 600)
         self.assertEqual(sorted(reads), [500, 501])
         state = json.loads((self.state_dir / "load.json").read_text())
-        self.assertEqual(len([r for r in state["reads"] if True]) >= 2, True)
+        self.assertEqual(len(state["reads"]), 4)                                                        # two asks lists (a, b) and the two parents, none repeated over three passes
         self.assertEqual(state["parents"], {"r#500": 10, "r#501": 10})
 
     def test_an_idle_pass_rewrites_nothing(self):
