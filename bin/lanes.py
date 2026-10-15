@@ -79,10 +79,6 @@ def has_charter_block(sb, raw):
     return shared(sb).has_charter_block(sb, raw)
 
 
-def label_names(raw):
-    return [l for l in (l.get("name") if isinstance(l, dict) else l for l in raw.get("labels") or [] if isinstance(l, (dict, str)))]
-
-
 def require_open_issue(sb, raw, what, repo, number):
     try:
         shared(sb).require_open_issue(raw, what, repo, number)
@@ -109,7 +105,7 @@ def plan_move(sb, repo, ask, to_charter):
         raise MoveRefused("%s#%d cannot be moved to itself" % (repo, ask))
     raw = read_issue(sb, repo, ask)
     require_open_issue(sb, raw, "the ask", repo, ask)
-    if has_charter_block(sb, raw) or sb.orchestrator_label(sb.engine.config) in label_names(raw):
+    if has_charter_block(sb, raw) or sb.orchestrator_label(sb.engine.config) in shared(sb).label_names(raw):
         raise MoveRefused("%s#%d is a charter, not an ask" % (repo, ask))
     try:
         try:
@@ -124,7 +120,7 @@ def plan_move(sb, repo, ask, to_charter):
     except sb.IntentError as err:
         raise MoveRefused("cannot read the charters: %s" % sb._one_line(str(err), 160)) from None
     return {"repo": repo, "ask": ask, "id": raw["id"], "old": old, "new": to_charter, "state": raw.get("state"),
-            "title": raw.get("title") or "", "labels": [l for l in label_names(raw) if isinstance(l, str)]}
+            "title": raw.get("title") or "", "labels": [l for l in shared(sb).label_names(raw) if isinstance(l, str)]}
 
 
 def pull_requests(sb, repo, ask):
