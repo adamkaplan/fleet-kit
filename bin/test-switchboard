@@ -2433,7 +2433,7 @@ class TestFacts(Base):
     def test_the_registration_point_lists_the_lab_source(self):
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "disk_facts", "cpu_facts", "docker_reap_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts"])
 
 
 # ---------------------------------------------------------------- observing
@@ -9603,7 +9603,7 @@ class TestFrictionWake(FrictionBase):
         self.assertNotIn("friction_wake", sb.DEFAULTS)
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "disk_facts", "cpu_facts", "docker_reap_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts"])
         self.assertNotIn("friction_wake", sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}))
         self.assertEqual(sb.FRICTION_DEFAULTS, {"enabled": False, "hour": 9, "to": "cos", "cos_to": "improver", "text": None})
         self.make("off")
@@ -11206,7 +11206,7 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
     def test_the_job_runs_and_what_is_outside_it_is_denied(self):
         _, rules = self.rules()
         for command in ("fleet-switchboard decisions list --tier all", "sleep 20",
-                        "gh issue view 5 --json body -q .body", "gh api repos/o/r/issues/comments/1 --jq .body", "grep foo", "cut -c1-100", "jq length",
+                        "gh issue view 5 --json body -q .body", "gh issue create --title x --body y", "fleet-switchboard disk", "fleet-switchboard disk janitor --apply", "fleet-switchboard disk reap-docker --apply", "fleet-switchboard disk prune", "gh api repos/o/r/issues/comments/1 --jq .body", "grep foo", "cut -c1-100", "jq length",
                         "gh pr merge 5 --squash", "gh issue close 5", "gh pr comment 5 --body ok", "az webapp show -n a -g g", "az group list",
                         "fleet-switchboard handoff --issue 5 --brief-file -", "fleet-switchboard launch v --agent orchestrator",
                         "fleet-switchboard reattach coder-a --issue 5", "fleet-switchboard relaunch coder-a --issue 5",
@@ -11220,14 +11220,45 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
                         'fleet-switchboard report done --issue 5 "$(cat %s/x)"' % self.TEMP):
             self.assertEqual(self.evaluate(rules, "shell", command), "allow", command)
         for command in ("make build", "git push", "git -C /home/a/Code/widget push", "git commit -m x", "git fetch", "git pull", "git -c core.pager=sh log",
-                        "git status; git push", "rm -rf x", "az keyvault secret show --name x", "az account get-access-token", "az containerapp show -n a -g g",
-                        "az containerapp env show -n e -g g", "az vm delete -n x", "cat /home/a/.ssh/id_rsa", "gh pr merge 5 --admin", "gh pr merge 5 --auto",
+                        "git status; git push", "rm -rf x", "az keyvault secret show --name x", "az account get-access-token",
+                        "az vm delete -n x", "cat /home/a/.ssh/id_rsa", "gh pr merge 5 --admin", "gh pr merge 5 --auto",
                         "gh pr review 5 --approve", "gh repo delete o/r", "curl https://example.com", "timeout 5 rm -rf x", "fleet-switchboard decisions batch --title x",
                         "gh api repos/o/r/issues -fa=b", "gh api repos/o/r/issues --raw-field a=b", "gh api repos/o/r/issues -Fa=@f", "git credential fill", "gh auth status -t", "gh auth status --show-token", "az acr credential show -n r", "az webapp config appsettings list -n a -g g", "fleet-switchboard gates mode acme/app enforce", "fleet-switchboard gates mode acme/app ENFORCE", "fleet-switchboard gates on",
-                        "timeout 30 fleet-switchboard gates mode acme/app enforce", "timeout 5 fleet-switchboard gates on", "timeout 5 az keyvault secret show --name x", "timeout 30 az acr credential show -n r", "timeout 30 az webapp config appsettings list -n a -g g", "timeout 30 az storage account keys list -n s", "timeout 30 az containerapp show -n a -g g", "timeout 5 gh api repos/o/r/issues -X POST", "timeout 5 git ls-remote ext::sh",
+                        "timeout 30 fleet-switchboard gates mode acme/app enforce", "timeout 5 fleet-switchboard gates on", "timeout 5 az keyvault secret show --name x", "timeout 30 az acr credential show -n r", "timeout 30 az webapp config appsettings list -n a -g g", "timeout 30 az storage account keys list -n s", "timeout 5 gh api repos/o/r/issues -X POST", "timeout 5 git ls-remote ext::sh",
                         "fleet-switchboard waive acme/app#5 --gates G6 --reason x", "timeout 5 fleet-switchboard waive acme/app#5 --gates G6 --reason x",
                         "timeout 90 fleet-switchboard decisions list --tier all", "herdr agent prompt a1 hi", "herdr pane send p1 ls", "herdr pane keys p1 Enter", "herdr pane close p1"):
             self.assertEqual(self.evaluate(rules, "shell", command), "deny", command)
+
+    AZ_READS = ("az vm list-usage --location eastus", "az containerapp revision list -n a -g g", "az containerapp show -n a -g g", "az containerapp env show -n e -g g",
+                "az vm list -g g", "az vmss list -g g", "az group list", "az webapp show -n a -g g", "az account show", "az containerapp list -g g")
+    AZ_SECRETS = ("az keyvault secret show --name x", "az keyvault secret list --vault-name v", "az account get-access-token", "az ad app credential list --id x",
+                  "az ad sp credential reset --id x", "az storage account keys list -n s", "az cosmosdb keys list -n c -g g", "az cosmosdb list-keys -n c -g g",
+                  "az webapp config connection-string list -n a -g g", "az webapp config appsettings list -n a -g g", "az containerapp secret list -n a -g g",
+                  "az containerapp secret show -n a -g g --secret-name s", "az functionapp keys list -n f -g g", "az sql db show-connection-string -n d",
+                  "az containerapp exec -n a -g g", "az containerapp up -n a", "az containerapp delete -n a -g g", "az containerapp update -n a -g g", "az vm start -n v -g g",
+                  "az rest --method get --url https://x", "az acr credential show -n r")
+
+    AZ_MORE_SECRETS = ("az signalr key list -n s -g g", "az eventgrid topic key list -n t -g g", "az search admin-key show --service-name s -g g",
+                       "az search query-key list --service-name s -g g", "az webapp deployment list-publishing-profiles -n a -g g",
+                       "az functionapp deployment list-publishing-credentials -n f -g g", "az keyvault list", "az vm delete -n list -g g")
+    TIMEOUT_WRITES = ("timeout 5 gh secret set X --body view", "timeout 5 gh repo delete o/r view", "timeout 5 gh api repos/o/r/issues -X POST -f t=view",
+                      "timeout 5 gh workflow run ci.yml --ref view", "timeout 5 gh pr merge 5 --body view")
+
+    def test_az_reads_are_allowed_generally_and_every_secret_reading_or_writing_verb_stays_denied(self):
+        for path in self.PATHS:
+            with self.subTest(file=path.name):
+                _, rules = self.parse(path)
+                for command in self.AZ_READS + ("gh issue create --title x --body y", "fleet-switchboard disk", "fleet-switchboard disk janitor --apply",
+                                                "timeout 30 gh pr view 5", "timeout 30 gh issue list --repo acme/api"):
+                    self.assertEqual(self.evaluate(rules, "shell", command), "allow", command)
+                for command in self.TIMEOUT_WRITES + ("fleet-switchboard disk prune --docker /bin/sh", "fleet-switchboard disk prune --docker=/bin/sh", "fleet-switchboard disk --docker /tmp/x report",
+                                                      "fleet-switchboard disk reap-docker --apply --docker /tmp/x/docker", "fleet-switchboard disk report --docker=/bin/sh"):
+                    self.assertEqual(self.evaluate(rules, "shell", command), "deny", command)
+                for command in ("fleet-switchboard disk prune", "fleet-switchboard disk prune --dry-run", "fleet-switchboard disk report"):
+                    self.assertEqual(self.evaluate(rules, "shell", command), "allow", command)
+                for command in self.AZ_SECRETS + self.AZ_MORE_SECRETS:
+                    self.assertEqual(self.evaluate(rules, "shell", command), "deny", command)
+                    self.assertEqual(self.evaluate(rules, "shell", "timeout 30 " + command), "deny", "timeout 30 " + command)
 
     READ_ONLY_ADDED = ("fleet-switchboard review measure --since 7", "fleet-switchboard review laws acme/api#5", "fleet-switchboard impact floor acme/api#5 --json",
                        "fleet-switchboard impact hold --dry-run", "fleet-switchboard pr-explain acme/api#5 --check", "fleet-switchboard agents verify")
@@ -19561,7 +19592,7 @@ class TestIdentityCheck(ReportBase):
         self.assertEqual((shim.my_name(), shim.account_env("/usr/bin/gh")), ("agent", None))
 
     def run_gh_shim(self, repo, users, token_for=None, who_repo_exit=0, inherited="inherited-personal-token", args=(),
-                    wedge=False, seconds=None, extra_env=None):
+                    wedge=False, seconds=None, extra_env=None, own=None):
         """The real shim in a subprocess with a fake gh and a fake switchboard. The fake gh logs which GH_TOKEN it ran with
         (in a test file only); `gh auth token --user NAME` answers from `token_for`. Returns (done, log)."""
         home = Path(self.home)
@@ -19584,9 +19615,9 @@ class TestIdentityCheck(ReportBase):
         else:
             (bindir / "sb").write_text(
                 "#!/bin/sh\nif [ \"$1\" = whoami ] && [ \"$2\" = --json ]; then [ %d -ne 0 ] && exit %d; "
-                "echo '{\"name\": \"api\", \"repo\": %s}'; exit 0; fi\n"
+                "echo '{\"name\": \"api\", \"repo\": %s%s}'; exit 0; fi\n"
                 "[ \"$1\" = whoami ] && echo api && exit 0\nexit 2\n"
-                % (who_repo_exit, who_repo_exit, json.dumps(repo) if repo else "null"))
+                % (who_repo_exit, who_repo_exit, json.dumps(repo) if repo else "null", "" if own is None else ", \"own\": %s" % ("true" if own else "false")))
         (bindir / "sb").chmod(0o755)
         config = home / "xdg-config" / "fleet-switchboard"
         config.mkdir(parents=True, exist_ok=True)
@@ -19604,6 +19635,74 @@ class TestIdentityCheck(ReportBase):
                               env=environ, timeout=60)
         self.shim_seconds = time.monotonic() - started
         return done, (json.loads(log.read_text()) if log.exists() else None)
+
+    def test_a_caller_with_no_repo_of_its_own_acts_as_the_account_of_the_repo_an_issue_or_pr_command_names_and_nothing_else_picks_one(self):
+        users = {"acme/*": "acct-personal", "other-org/*": "acct-other"}
+        tokens = {"acct-personal": "tok-personal", "acct-other": "tok-other"}
+        cases = (
+            (("issue", "list", "-R", "acme/api"), "tok-personal"), (("pr", "view", "5", "--repo", "other-org/svc"), "tok-other"),
+            (("issue", "create", "--repo=acme/api", "--title", "t"), "tok-personal"), (("issue", "comment", "https://github.com/other-org/svc/issues/4", "--body", "x"), "tok-other"),
+            (("pr", "ready", "https://github.com/acme/api/pull/9"), "tok-personal"), (("pr", "edit", "5", "-R", "other-org/svc", "--add-label", "x"), "tok-other"),
+            (("issue", "close", "3", "-Racme/api"), "tok-personal"))
+        for args, expected in cases:
+            with self.subTest(args=args):
+                done, seen = self.run_gh_shim(None, users, tokens, args=args)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(seen["token"], expected)
+        for args in (("pr", "merge", "5", "-R", "acme/api"), ("repo", "view", "acme/api"), ("secret", "set", "X", "-R", "acme/api"),
+                     ("workflow", "run", "ci.yml", "-R", "acme/api"), ("run", "rerun", "7", "-R", "acme/api"), ("api", "repos/acme/api/issues"),
+                     ("issue", "list", "-R", "unmapped/repo")):
+            with self.subTest(no_pick=args):     # only issue and pr commands (never merge) pick an account by what they name; the rest keep the inherited token
+                done, seen = self.run_gh_shim(None, users, tokens, args=args)
+                self.assertTrue(seen is None or seen["token"] == "inherited-personal-token", (args, seen))
+        done, seen = self.run_gh_shim("acme/api", users, tokens, args=("issue", "list", "-R", "other-org/svc"))
+        self.assertEqual(seen["token"], "tok-personal", "a caller WITH a repo keeps its own account: what it names never overrides it")
+        # what a body, a title or a second flag says never picks the account: a repo is taken only from the real flag or the target URL
+        for args in (("issue", "comment", "5", "--body", "https://github.com/other-org/svc/issues/1"), ("issue", "comment", "5", "--body", "-Rother-org/svc"),
+                     ("issue", "create", "--title", "https://github.com/other-org/svc/pull/1"), ("issue", "comment", "5", "-R", "acme/api", "-R", "other-org/svc", "--body", "x"),
+                     ("issue", "create", "-t", "-R", "--body", "other-org/svc")):
+            with self.subTest(steer=args):
+                done, seen = self.run_gh_shim(None, users, tokens, args=args)
+                self.assertTrue(seen is None or seen["token"] == "inherited-personal-token", (args, seen))
+        shim = self.shim()
+        self.assertEqual(shim.explicit_repo(["issue", "comment", "5", "--body", "x", "-R", "acme/api"]), "acme/api")
+        self.assertEqual(shim.explicit_repo(["pr", "view", "https://github.com/other-org/svc/pull/3"]), "other-org/svc")
+        self.assertIsNone(shim.explicit_repo(["issue", "comment", "5", "--body", "https://github.com/other-org/svc/issues/1"]))
+        # fail closed like a failed lookup: the account's token cannot be had, so an issue write is refused instead of run as the wrong account
+        done, seen = self.run_gh_shim(None, users, {"acct-personal": "tok-personal"}, args=("issue", "comment", "3", "-R", "other-org/svc", "--body", "x"))
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("account lookup failed, retry", done.stderr)
+        self.assertIsNone(seen)
+        done, seen = self.run_gh_shim(None, users, {"acct-personal": "tok-personal"}, args=("issue", "list", "-R", "other-org/svc"))
+        self.assertEqual((done.returncode, seen["token"]), (0, "inherited-personal-token"), "a read still falls through")
+
+    def test_the_chief_of_staff_whose_whoami_gives_only_the_default_intent_repo_still_acts_as_the_account_of_the_repo_a_command_names(self):
+        """The real shape: cos has no repo of its own, and `whoami --json` falls back to the config's `intent_repo` (own: false). Before, the shim
+        used that default repo's account for everything, so the named-repo branch never ran for cos."""
+        users = {"acme-ops/*": "acct-ops", "acme/*": "acct-personal"}
+        tokens = {"acct-ops": "tok-ops", "acct-personal": "tok-personal"}
+        for args, expected in ((("issue", "view", "5", "-R", "acme/api"), "tok-personal"), (("pr", "view", "5", "--repo", "acme-ops/svc"), "tok-ops"),
+                               (("issue", "comment", "5", "-R", "acme/api", "--body", "x"), "tok-personal"),
+                               (("issue", "list"), "tok-ops"),                                   # nothing named: the default repo's account, as before
+                               (("pr", "merge", "5", "-R", "acme/api"), "tok-ops"),               # a merge never switches: the default's account
+                               (("repo", "view", "acme/api"), "tok-ops")):                        # nor does anything but issue and pr
+            with self.subTest(args=args):
+                done, seen = self.run_gh_shim("acme-ops/default", users, tokens, args=args, own=False)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(seen["token"], expected)
+        done, seen = self.run_gh_shim("acme-ops/default", users, tokens, args=("issue", "view", "5", "-R", "acme/api"), own=True)
+        self.assertEqual(seen["token"], "tok-ops", "a caller whose repo IS its own keeps its account")
+
+    def test_whoami_json_says_whether_the_repo_is_the_callers_own_or_only_the_default(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "intent_repo": "acme-ops/default"})
+        self.world.add_agent("boss", fleet={"role": "chief-of-staff"})
+        os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]
+        code, out, err = self.call("whoami", "--json")
+        self.assertEqual((code, json.loads(out)), (0, {"name": "boss", "repo": "acme-ops/default", "own": False}), err)
+        self.world.add_agent("worker", fleet={"role": "coder", "repo": "acme/api"})
+        os.environ["HERDR_PANE_ID"] = self.world.panes["worker"]
+        code, out, err = self.call("whoami", "--json")
+        self.assertEqual((code, json.loads(out)), (0, {"name": "worker", "repo": "acme/api", "own": True}), err)
 
     def test_the_reviewer_shape_an_inherited_wrong_account_token_is_replaced_by_the_callers_repo_account(self):
         users = {"acme-ops/service": "acct-ops", "acme-ops/*": "acct-ops-other", "acme/*": "acct-personal"}
@@ -19699,7 +19798,7 @@ class TestIdentityCheck(ReportBase):
         shim = self.shim()
         calls, execs = [], []
 
-        def blip(gh, lookup=None, strict=False):
+        def blip(gh, lookup=None, strict=False, args=None):
             calls.append(strict)
             if strict and calls.count(True) == 1:      # the first STRICT lookup fails; the gate probe's non-strict one does not count
                 raise shim.AccountLookupFailed("identity")
@@ -19761,7 +19860,7 @@ class TestIdentityCheck(ReportBase):
         code, out, err = self.call("whoami", "--repo")
         self.assertEqual((code, out.strip()), (0, "acme-ops/service"))
         code, out, err = self.call("whoami", "--json")
-        self.assertEqual((code, json.loads(out)), (0, {"name": "ops", "repo": "acme-ops/service"}))
+        self.assertEqual((code, json.loads(out)), (0, {"name": "ops", "repo": "acme-ops/service", "own": True}))
         code, out, err = self.call("whoami")
         self.assertEqual((code, out.strip()), (0, "ops"))
         os.environ["HERDR_PANE_ID"] = self.world.panes["coder"]                      # a pane of ANOTHER agent changes nothing
@@ -31070,12 +31169,6 @@ class TestInstallDocs(unittest.TestCase):
         self.assertIn("thin wrapper for an isolated experiment", text)
         self.assertIn("INSTALL.md", text)
         self.assertIn("fleet-switchboard install", text)
-
-    def test_the_presentation_is_untouched_by_this_pr(self):
-        done = subprocess.run(["git", "diff", "--name-only", "HEAD", "--", "docs/presentation"], cwd=str(REPO),
-                              capture_output=True, text=True)
-        if done.returncode == 0:
-            self.assertEqual(done.stdout.strip(), "")
 
 
 # ======================================================================
@@ -44201,6 +44294,89 @@ class TestDockerReaper(Base):
         stamp = json.loads((self.world.state / sb.DOCKER_REAP_FILE).read_text())["at"]
         self.assertEqual(stamp + sb.DOCKER_REAP_INTERVAL, self.NOW + sb.DOCKER_REAP_RETRY)
 
+    def test_the_docker_option_runs_only_a_docker_binary_it_can_trust_in_every_disk_command(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        os.chmod(str(self.home), 0o755)
+        for target in ("/bin/sh", "/bin/ls", "/usr/bin/env"):
+            for argv in (["disk", "prune", "--dry-run", "--docker", target], ["disk", "reap-docker", "--docker", target], ["disk", "report", "--docker", target],
+                         ["disk", "prune", "--dry-run", "--docker=" + target], ["disk", "--docker", target, "report"]):
+                with self.subTest(argv=argv):
+                    err, calls = io.StringIO(), []
+                    with mock.patch.object(sys, "stderr", err), mock.patch.object(sys, "stdout", io.StringIO()) as out, \
+                            mock.patch.object(subprocess, "run", side_effect=AssertionError("ran an executable that is not docker")):
+                        code = sb.main(argv, runner=lambda a, **k: calls.append(a) or subprocess.CompletedProcess(a, 0, "", ""), now=self.world.clock.now)
+                    self.assertIn("refused", err.getvalue() + out.getvalue())
+                    self.assertFalse([c for c in calls if c and os.path.basename(str(c[0])) in ("sh", "ls", "env")], "nothing was run")
+                    if argv[1] != "report" and argv[1] != "--docker":
+                        self.assertEqual(code, sb.EXIT_USAGE)
+        for abbreviated in ("--dock", "--doc", "--do"):                                          # an abbreviation of the option is not accepted
+            err = io.StringIO()
+            try:
+                with mock.patch.object(sys, "stderr", err), mock.patch.object(sys, "stdout", io.StringIO()), \
+                        mock.patch.object(subprocess, "run", side_effect=AssertionError("ran an executable")):
+                    code = sb.main(["disk", "prune", abbreviated, "/bin/sh"], runner=FakePruneDocker(), now=self.world.clock.now)
+            except SystemExit as stop:
+                code = stop.code
+            self.assertNotEqual(code, 0, abbreviated)
+            self.assertIn("unrecognized arguments", err.getvalue(), abbreviated)
+        good = self.home / "docker"
+        good.write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(str(good), 0o755)
+        good = str(good)
+        self.assertEqual(sb._docker_problem(good), (os.path.realpath(good), None))
+        dest = self.home / "real"
+        dest.mkdir()
+        (dest / "docker").write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(str(dest / "docker"), 0o755)
+        sub = self.home / "viaLink"
+        sub.mkdir()
+        os.symlink(str(dest / "docker"), str(sub / "docker"))
+        self.assertEqual(sb._docker_problem(str(sub / "docker")), (os.path.realpath(str(dest / "docker")), None), "a link named docker to a file named docker is fine")
+        other = self.home / "tool"
+        other.write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(str(other), 0o755)
+        bad = self.home / "sub" / "docker"
+        bad.parent.mkdir()
+        os.symlink(str(other), str(bad))
+        self.assertIn("not a docker binary", sb._docker_problem(str(bad))[1])        # a link named docker that points at another tool
+        loose = self.home / "loose" / "docker"
+        loose.parent.mkdir()
+        loose.write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(str(loose), 0o775)
+        self.assertIn("writable by group or other", sb._docker_problem(str(loose))[1])
+        open_dir = self.home / "open" / "docker"
+        open_dir.parent.mkdir()
+        open_dir.write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(str(open_dir), 0o755)
+        os.chmod(str(open_dir.parent), 0o777)
+        self.assertIn("others can change", sb._docker_problem(str(open_dir))[1])
+        os.chmod(str(open_dir.parent), 0o1777)
+        self.assertEqual(sb._docker_problem(str(open_dir))[1], None, "a sticky directory is fine")
+        # a standard install sits under a root-owned, group-writable ancestor (/Applications): fine; a group-writable ancestor of another owner is not
+        real_stat, ancestor = os.stat, os.path.realpath(str(self.home.parent))
+
+        def fake_stat(path, *a, **k):
+            info = real_stat(path, *a, **k)
+            if os.path.realpath(str(path)) == ancestor:
+                return types.SimpleNamespace(st_mode=0o40775, st_uid=owner[0])
+            return info
+
+        owner = [0]
+        with mock.patch.object(sb.os, "stat", fake_stat):
+            self.assertEqual(sb._docker_problem(good)[1], None, "a root-owned group-writable ancestor is the operating system's own")
+            owner[0] = os.getuid() + 1
+            self.assertIn("others can change", sb._docker_problem(good)[1])
+        plain = self.home / "plain" / "docker"
+        plain.parent.mkdir()
+        plain.write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(str(plain), 0o644)
+        self.assertIn("not an executable file", sb._docker_problem(str(plain))[1])
+        self.assertIn("not installed", sb._docker_problem("/nonexistent/docker")[1])
+        self.assertIn("not a usable", sb._docker_problem("--help")[1])
+        self.assertIn("not a docker binary", sb._docker_problem("/bin/sh")[1])
+        for p in (str(self.home / "open"), str(self.home / "loose")):
+            os.chmod(p, 0o755)
+
     def test_without_docker_it_refuses_and_runs_nothing(self):
         docker = self.world_docker()
         with captured() as (out, err):
@@ -44343,6 +44519,56 @@ class TestComposeTrap(Base):
 
     def test_the_helper_never_uses_sudo(self):
         self.assertNotIn("sudo", (REPO / "tools" / "fleet-compose-trap.sh").read_text().replace("Never uses sudo.", ""))
+
+
+class TestDaemonPriority(Base):
+    """P0 CPU item C: the daemon's LaunchAgent asks for the Interactive process class, with no root; ensure's own start is unchanged."""
+
+    def template(self):
+        import plistlib
+        return plistlib.loads((REPO / "templates" / "com.fleet-kit.switchboard.plist").read_bytes())
+
+    def test_s1_the_template_asks_for_the_interactive_class_and_nothing_that_needs_root(self):
+        plist = self.template()
+        self.assertEqual(plist["ProcessType"], "Interactive")
+        for key in ("UserName", "GroupName", "Nice", "SessionCreate"):
+            self.assertNotIn(key, plist)
+        self.assertEqual(plist["Label"], "com.fleet-kit.switchboard")
+        self.assertEqual(plist["ProgramArguments"][-2:], ["run", "--standby"])
+
+    def test_s2_what_install_writes_parses_and_says_the_same(self):
+        import plistlib
+        values = sb.service_values(REPO, sb.service_path_dirs(REPO, []))
+        written = plistlib.loads(sb.render_service("launchd", values, REPO).encode())
+        self.assertEqual(written["ProcessType"], "Interactive")
+        self.assertEqual(written["ProgramArguments"][-2:], ["run", "--standby"])
+        self.assertEqual(written["ProgramArguments"][0], values["__PYTHON__"])
+        self.assertIsNone(re.search(r"__[A-Z_]+__", json.dumps(written)), "every placeholder is filled")
+
+    def test_s3_ensures_own_start_is_unchanged(self):
+        seen = []
+        shell = {"PATH": "/usr/bin", "HERDR_PANE_ID": "w1:p1", "FLEET_SWITCHBOARD_ROLE": "coder", "HERDR_SOCKET_PATH": "/s"}
+        with mock.patch.dict(os.environ, shell, clear=True):
+            sb.spawn_daemon(self.world_state(), spawn=lambda argv, **kw: seen.append((argv, kw)))
+        argv, kw = seen[0]
+        self.assertEqual(argv[-1], "run")
+        self.assertTrue(kw["start_new_session"])
+        self.assertEqual(kw["cwd"], str(self.world_state()))
+        self.assertNotIn("HERDR_PANE_ID", kw["env"])
+        self.assertNotIn("FLEET_SWITCHBOARD_ROLE", kw["env"])
+        self.assertFalse({"launchctl", "taskpolicy", "nice", "sudo"} & {os.path.basename(a) for a in argv}, "no wrapper around the start, by name or by path")
+
+    def world_state(self):
+        path = self.home / "state"
+        path.mkdir(exist_ok=True)
+        return path
+
+    def test_s4_the_docs_say_how_to_opt_in_check_and_go_back(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        section = text[text.index("### The daemon's priority under load"):]
+        section = section[:section.index("\n### ", 10)] if "\n### " in section[10:] else section
+        for needle in ("ProcessType", "Interactive", "opt-in", "launchctl print", "no sudo", "fleet-switchboard install", "--uninstall"):
+            self.assertIn(needle, section)
 
 
 class TestCpuGuard(Base):
@@ -44691,13 +44917,6 @@ class TestGithubWritingRule(unittest.TestCase):
             head = text.split("\n---\n", 1)[0]
             self.assertNotIn("Write GitHub text", head, rel)
             self.assertTrue(text.startswith("---\n"), rel)
-
-    def test_s3_the_change_adds_text_only_and_leaves_the_shim_alone(self):
-        done = subprocess.run(["git", "diff", "--name-only", "origin/main...HEAD"], capture_output=True, text=True, cwd=str(REPO))
-        if done.returncode != 0 or not done.stdout.strip():
-            self.skipTest("no base to compare with")
-        changed = set(done.stdout.split())
-        self.assertNotIn("shims/gh", changed)
 
 
 _CG = sb.load_cpu_guard()
@@ -49131,6 +49350,261 @@ def main(argv):
     ok = result.wasSuccessful() and result.testsRun > 0
     print("RESULT: %s" % ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
+
+
+class TestSpotlightGuard(Base):
+    """Ask #438: an hourly background check that the code and temp folders are still kept out of Spotlight; read-only, no process in a normal pass."""
+
+    def setUp(self):
+        super().setUp()
+        self.dirs = []
+        for name in ("code", "tmp"):
+            folder = self.home / name
+            folder.mkdir()
+            (folder / "a.txt").write_text("x")
+            self.dirs.append(str(folder))
+        self.world = World(self, agents=("coder",), config={})
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.engine = self.world.engine
+        self.engine.config["spotlight_guard"] = {"folders": list(self.dirs)}
+        self.engine.discover(self.world.clock.now())
+        self.sg = sb.load_module("spotlight_guard")
+        self.counts = {}
+        self.calls = []
+        self.fail = [None]
+        self.block = [None]
+
+        def runner(argv, **kwargs):
+            self.calls.append(list(argv))
+            if self.block[0] is not None:
+                self.block[0].wait(30)
+            if self.fail[0] is not None:
+                if isinstance(self.fail[0], str):
+                    return subprocess.CompletedProcess(argv, 0, self.fail[0], "")
+                raise self.fail[0]
+            return subprocess.CompletedProcess(argv, 0, "2026-01-01 locale noise\n%d\n" % self.counts.get(argv[2], 0), "locale noise")
+        self.engine.spotlight_runner = runner
+
+    def source(self):
+        return next(s for s in self.engine.sources if isinstance(s, sb.SpotlightFacts))
+
+    def wakes(self):
+        found, problems = self.engine.collect_facts()
+        self.assertEqual(problems, [])
+        return [f for f in found if f.kind == "spotlight"]
+
+    def round(self, **counts):
+        """One hourly check, finished and applied. Counts by folder index (code=0, tmp=1)."""
+        self.counts = {self.dirs[int(k[1:])]: v for k, v in counts.items()}
+        self.world.tick(3601)
+        self.wakes()                                   # the pass starts the check
+        thread = self.source().thread
+        if thread is not None:
+            thread.join(10)
+        return self.wakes()                            # the next pass collects what it found
+
+    def lines(self):
+        cfg = self.sg.settings(self.engine.config.get("spotlight_guard"))
+        return self.sg.status_lines(cfg, self.sg.load(self.world.state), self.world.clock.now())
+
+    def test_s1_zero_counts_show_both_folders_as_excluded(self):
+        self.round(f0=0, f1=0)
+        lines = self.lines()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(all("excluded from Spotlight" in line for line in lines), lines)
+        self.assertFalse(any("WARN" in line for line in lines))
+
+    def test_s2_a_nonzero_count_on_two_checks_in_a_row_warns_naming_folder_and_count(self):
+        self.round(f0=120, f1=0)
+        self.round(f0=120, f1=0)
+        warns = [line for line in self.lines() if "WARN" in line]
+        self.assertEqual(len(warns), 1)
+        self.assertIn(self.dirs[0], warns[0])
+        self.assertIn("120", warns[0])
+        self.assertNotIn(self.dirs[1], warns[0])
+
+    def test_s3_one_nonzero_count_then_zero_sends_no_wake_and_no_warning(self):
+        self.assertEqual(self.round(f0=120, f1=0), [])
+        self.assertEqual(self.round(f0=0, f1=0), [])
+        self.assertFalse(any("WARN" in line for line in self.lines()))
+        self.assertEqual([e for e in self.world.audit() if e["event"] == "spotlight.lost"], [])
+
+    def test_s4_one_wake_per_episode(self):
+        keys = set()
+        for counts in [120] * 5 + [0] * 2 + [90] * 3:
+            for fact in self.round(f0=counts, f1=0):
+                keys.add(fact.key)
+        self.assertEqual(len(keys), 2, keys)
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "spotlight.lost"]), 2)
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "spotlight.recovered"]), 1)
+
+    def real_pass_round(self, **counts):
+        """One hourly check through the engine's REAL pass (fact collection, batching, delivery); returns the reports of the two passes."""
+        self.counts = {self.dirs[int(k[1:])]: v for k, v in counts.items()}
+        self.world.tick(3601)
+        first = self.engine.run_pass()
+        self.source().thread.join(10)
+        return [first, self.engine.run_pass()]
+
+    def spotlight_sends(self):
+        return [a for a in self.world.admissions("cos") if any(str(k).startswith("spotlight.lost:") for k in a["keys"])]
+
+    def test_the_real_batching_path_delivers_the_wake_once_after_the_wait(self):
+        self.real_pass_round(f0=120, f1=0)
+        self.real_pass_round(f0=120, f1=0)                  # the second nonzero check begins the episode: the fact is pending, batching waits
+        self.assertEqual(self.spotlight_sends(), [])
+        self.world.tick(30)
+        self.assertIn("cos", self.engine.run_pass()["waiting"], "the fact is still pending 30 s on: it is held by the 90 s wait")
+        self.world.tick(70)
+        report = self.engine.run_pass()
+        self.assertEqual(len(self.spotlight_sends()), 1, report)
+        for _ in range(5):
+            self.world.tick(30)
+            self.engine.run_pass()
+        self.assertEqual(len(self.spotlight_sends()), 1, "delivered once: the stable key is deduplicated on every later pass")
+
+    def test_a_restart_between_the_alarm_and_its_delivery_still_delivers_once(self):
+        self.real_pass_round(f0=120, f1=0)
+        self.real_pass_round(f0=120, f1=0)
+        self.assertEqual(self.spotlight_sends(), [])
+        index = next(i for i, source in enumerate(self.engine.sources) if isinstance(source, sb.SpotlightFacts))
+        fresh = sb.SpotlightFacts()
+        fresh.bind(self.engine)
+        fresh.started = self.world.clock.now()              # a restart has just run its check: nothing new to find
+        self.engine.sources[index] = fresh
+        self.world.tick(100)
+        self.engine.run_pass()
+        self.assertEqual(len(self.spotlight_sends()), 1, "the open episode was restored from the file and its fact is pending again")
+        self.world.tick(30)
+        self.engine.run_pass()
+        self.assertEqual(len(self.spotlight_sends()), 1)
+
+    def test_a_damaged_state_file_never_reaches_a_wake_or_a_line_nor_breaks_the_pass(self):
+        folder = self.dirs[0]
+        Path(self.world.state, "spotlight-guard.json").write_text(json.dumps({"folders": {
+            folder: {"state": "indexed", "count": "\x1b[31mevil", "streak": 2, "episode": 1.0},
+            self.dirs[1]: {"state": "indexed", "count": 5, "streak": 2, "episode": float("inf")},
+            "/not/guarded": {"state": "indexed", "count": 5, "streak": 2, "episode": 1.0}}, "checked_at": 1.0}))
+        fresh = sb.SpotlightFacts()
+        fresh.bind(self.engine)
+        facts = fresh()
+        self.assertEqual(len(facts), 1, "only the guarded folder with a sane episode wakes; an unguarded folder and an infinite episode wake nobody")
+        self.assertNotIn("\x1b", facts[0].summary)
+        self.assertIn("some entries", facts[0].summary)
+        cfg = self.sg.settings(self.engine.config.get("spotlight_guard"))
+        lines = self.sg.status_lines(cfg, self.sg.load(self.world.state), 1.0)
+        self.assertFalse(any("\x1b" in line for line in lines), lines)
+
+    def test_s5_a_normal_pass_starts_nothing_and_a_slow_tool_never_delays_it(self):
+        gate = threading.Event()
+        self.block[0] = gate
+        self.addCleanup(gate.set)
+        started = time.monotonic()
+        self.world.tick(1)
+        self.wakes()                                   # the first pass starts the check on a thread and returns at once
+        for _ in range(10):
+            self.world.tick(60)
+            self.wakes()
+        self.assertLess(time.monotonic() - started, 5, "ten passes beside a tool that blocks for 30 s")
+        self.assertTrue(self.source().thread.is_alive(), "the tool is still blocked: the passes did not wait for it")
+        for _ in range(100):
+            if self.calls:
+                break
+            time.sleep(0.05)
+        self.assertEqual(len(self.calls), 1, "only the first folder has been asked: the passes started no process of their own")
+        gate.set()
+        self.source().thread.join(10)
+
+    def test_a_restart_restores_an_open_episode_and_no_second_wake_begins(self):
+        self.round(f0=120, f1=0)
+        self.round(f0=120, f1=0)
+        fresh = sb.SpotlightFacts()
+        fresh.bind(self.engine)
+        fresh.done = self.sg.check_all(self.dirs, self.engine.spotlight_runner)
+        facts = fresh()
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "spotlight.lost"]), 1, "the episode was restored from the file")
+        self.assertEqual(len({f.key for f in facts}), 1)
+
+    def test_no_chief_of_staff_means_no_wake_but_the_warning_shows(self):
+        self.engine.discovery.agents.pop("cos", None)
+        self.assertEqual(self.round(f0=120, f1=0), [])
+        self.assertEqual(self.round(f0=120, f1=0), [])
+        self.assertTrue(any("WARN" in line for line in self.lines()))
+
+    def test_a_guard_that_is_off_makes_no_fact_and_starts_nothing(self):
+        self.engine.config["spotlight_guard"] = False
+        self.world.tick(3601)
+        self.assertEqual(self.wakes(), [])
+        self.assertEqual(self.calls, [])
+
+    def test_a_failing_tool_exit_is_unknown(self):
+        self.engine.spotlight_runner = lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "0\n", "")
+        self.round()
+        self.assertTrue(all("unknown" in line for line in self.lines()), self.lines())
+
+    def test_a_bad_spotlight_guard_value_is_a_config_error_at_load(self):
+        for bad in ({"folders": ["/work/../etc"]}, {"folders": ["relative/dir"]}, {"enabled": "yes"}, 5):
+            self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "spotlight_guard": bad})
+            with self.assertRaises(sb.ConfigError) as caught:
+                sb.load_config()
+            self.assertIn("spotlight_guard", str(caught.exception))
+
+    def test_a_control_character_in_a_folder_name_never_reaches_a_line(self):
+        cfg = {"folders": ["/work/a\x1b[31mb"]}
+        self.assertNotIn("\x1b", self.sg.status_lines(cfg, None, 0)[0])
+        self.assertNotIn("\x1b", self.sg.wake_text("/work/a\x1b[31mb", 3, "fleet-switchboard"))
+
+    def test_s6_a_missing_or_empty_folder_is_not_checked(self):
+        empty = self.home / "empty"
+        empty.mkdir()
+        self.engine.config["spotlight_guard"] = {"folders": [str(self.home / "nope"), str(empty)]}
+        self.round()
+        lines = self.lines()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(all("not checked" in line for line in lines), lines)
+        self.assertFalse(any("excluded" in line for line in lines))
+        self.assertEqual(self.calls, [], "nothing to ask about")
+
+    def test_s7_a_missing_tool_a_timeout_and_odd_output_are_unknown(self):
+        for failure in (FileNotFoundError("mdfind"), subprocess.TimeoutExpired("mdfind", 5), "a count of zero, honestly\n"):
+            self.fail[0] = failure
+            self.assertEqual(self.round(), [])
+            self.assertEqual(self.round(), [])
+            lines = self.lines()
+            self.assertTrue(all("unknown" in line for line in lines), (failure, lines))
+            self.assertFalse(any("WARN" in line or "excluded" in line for line in lines))
+
+    def test_s8_it_changes_no_setting_and_writes_only_its_own_file(self):
+        before = {d: sorted(os.listdir(d)) for d in self.dirs}
+        for _ in range(3):
+            self.round(f0=0, f1=0)
+        self.assertEqual({d: sorted(os.listdir(d)) for d in self.dirs}, before)
+        self.assertIn("spotlight-guard.json", os.listdir(self.world.state))
+        self.assertEqual([n for n in os.listdir(self.world.state) if n.endswith(".tmp")], [], "no leftover temp file")
+        self.assertTrue(self.calls and all(call[0] == "mdfind" and "-count" in call and call[1] == "-onlyin" for call in self.calls), self.calls)
+
+    def test_s8b_the_file_is_rewritten_only_when_an_answer_changed(self):
+        self.round(f0=0, f1=0)
+        path = Path(self.world.state) / "spotlight-guard.json"
+        os.utime(path, (1, 1))
+        self.round(f0=0, f1=0)
+        self.assertEqual(path.stat().st_mtime, 1)
+        self.round(f0=7, f1=0)
+        self.assertNotEqual(path.stat().st_mtime, 1)
+
+    def test_s9_a_bad_folder_list_is_refused_naming_the_key(self):
+        for bad in ({"folders": ["/work/../etc"]}, {"folders": "not a list"}, {"folders": ["relative/dir"]}):
+            with self.assertRaises(ValueError) as caught:
+                self.sg.validate(bad, "config")
+            self.assertIn("spotlight_guard.folders", str(caught.exception))
+        self.sg.validate({"folders": ["/work/code"], "enabled": True}, "config")
+        self.sg.validate(False, "config")
+
+    def test_the_count_is_the_last_whole_number_line_of_stdout_only(self):
+        self.assertEqual(self.sg.parse_count("noise\n0\n"), 0)
+        self.assertEqual(self.sg.parse_count("57\n"), 57)
+        for odd in ("", "abc\n", "12 files\n", "1\n2x\n"):
+            self.assertIsNone(self.sg.parse_count(odd), odd)
 
 
 class TestModuleLoader(Base):
