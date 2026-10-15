@@ -11821,11 +11821,10 @@ class TestChatClearJudge(unittest.TestCase):
             got = self.decide(text, jev)
             self.assertEqual(got["action"], "ask", text)
             self.assertIn(got["why"], ("hedged", "no_number"), text)
-        for text in ("366, is it good to go", "366 was it ok to merge", "366 is it good to go", "ok to merge 366 is it", "366 good to go, are you sure", "366 good to go be sure",
+        for text in ("366, is it good to go", "366 was it ok to merge", "366 is it good to go", "ok to merge 366 is it", "366 good to go, are you ok", "366 good to go be ok",
                      "366 good to go \uff15", "366 \u0663 good to go"):
             got = self.decide(text, jev)
-            self.assertEqual((got["action"], got["why"]), ("ask", "hedged" if "\uff15" not in text and "\u0663" not in text else got["why"]), text)
-            self.assertNotEqual(got["why"], "confirmed", text)
+            self.assertEqual((got["action"], got["why"]), ("ask", "hedged"), text)
         for text in ("366 is good to go", "366 is good to go!", "ok to merge #366, thanks.", "Ship 366 now", "366 was approved", "366 good to go"):
             self.assertEqual(self.decide(text, jev)["action"], "clear", text)
         self.assertEqual(self.decide(None, jev)["action"], "none", "a non-string message is read as empty: no clearing words, nothing")
@@ -11834,13 +11833,14 @@ class TestChatClearJudge(unittest.TestCase):
                      {"type": "choice", "choice": "nothing", "probabilities": {"nothing": 0.5, "asks": 0.5}}, {"type": "choice", "choice": "nothing", "probabilities": {"nothing": 0.9, "asks": 0.2, "x": -0.1}}):
             got = self.decide("all good to go", _StubJev(junk=junk))
             self.assertEqual(got["action"], "ask", junk)
+            self.assertIs(got["judge"]["validated"], False, "an answer that failed a check can never say 'not about clearing'")
         got = self.decide("all good to go", _StubJev({"nothing": 0.9, "asks": 0.1}))
         self.assertEqual(got["action"], "none", "a validated answer that says nothing stays quiet")
         under = self.decide("366 is good to go", _StubJev(junk={"type": "choice", "choice": self.P366, "probabilities": {self.P366: 0.95}}))
         self.assertEqual((under["action"], under["why"]), ("ask", "jev"), "probabilities that add up to 0.95 are not an answer")
-        stub = _StubJev({self.P366: 0.95, "asks": 0.05})
-        kept = self.decide("366 is good to go", stub)
-        self.assertTrue(set(kept["judge"]["probabilities"]) <= set(stub.calls[0][1]["clears"]["criteria"]), "only offered options are kept")
+        extra = self.decide("366 is good to go", _StubJev(junk={"type": "choice", "choice": self.P366, "probabilities": {self.P366: 0.95, "asks": 0.05, "bogus": 0.0}}))
+        self.assertEqual(extra["action"], "clear")
+        self.assertNotIn("bogus", extra["judge"]["probabilities"], "only offered options are kept")
         for junk in ({"type": "choice", "choice": self.P366, "probabilities": {self.P366: 0.95, self.P389: 0.9}},
                      {"type": "choice", "choice": "nothing", "probabilities": ["x"]}, {"type": "choice", "choice": "nothing", "probabilities": {"nothing": "y"}},
                      {"type": "choice", "choice": "nothing", "probabilities": {"nothing": 0.9, 5: 0.1}}, {"type": "choice", "choice": 5, "probabilities": {"nothing": 1.0}}):
