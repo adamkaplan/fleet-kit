@@ -11,7 +11,7 @@ Where a law here builds on a standard it says which, and states only what is par
 A law has three parts, each running until the next blank line: the rule; **Why:** the real failure it comes from, as issue or pull request
 numbers in this repository; and **Check:** one line per check, written `<kind>: <what is asserted>`, where the kind is `test` (a test
 in the repository), `gate` (a merge or plan gate), `reviewer` (a review agent's finding) or `note only` (a judgement, never a block). The
-kinds are this file's own; the `diff`, `search` and `test` hints of `REVIEW_LAWS.md` apply to its rules. A law with no failure behind it,
+kinds are this file's own. A law with no failure behind it,
 or no check, does not belong here. An **environment** is a place fleet-kit's work runs: a person's workstation, a cloud worker, CI.
 
 ## FK-LAW-1 Enforce where the action takes effect
@@ -27,7 +27,7 @@ later; the gate now reads the floor itself, at the exact head. #323: a cloud wor
 whatever lived only in them was not there.
 
 **Check:**
-- gate: G6 reads the impact floor for the exact head and does not wait for a label (#489).
+- gate: G6 reads the impact floor for the exact head and does not wait for a label (`TestGateFloorFresh`, #489).
 - reviewer: architecture asks where a new guard takes effect.
 
 ## FK-LAW-2 Every guard names its environments
@@ -55,7 +55,7 @@ account on its first push. #450: no standing credentials, tokens minted per use.
 cluster context, because the active one moves when work happens in another cluster.
 
 **Check:**
-- test: a worker with no recorded repository is refused, and the default account is never used (#473).
+- test: a launch with no account mapped for its owner and no default is refused, naming the missing entry (`TestLaunchIntoARepo.test_an_unmapped_owner_with_no_default_is_refused_naming_the_missing_entry`, #473).
 - reviewer: security checks the scope of every credential a change adds.
 
 ## FK-LAW-4 Fail closed
@@ -69,7 +69,7 @@ Narrows R-CODE-2, which lets a guard fail open or closed on purpose: in fleet-ki
 environment after a restart made one agent speak as another; an identity that cannot be told apart is refused.
 
 **Check:**
-- test: the gate holds when the impact floor cannot be read (#489).
+- test: the gate does not pass when the impact floor cannot be read (`TestGateFloorFresh.test_an_unreadable_floor_does_not_pass`, #489).
 - reviewer: security and architecture look for a guard whose unreadable input passes.
 
 ## FK-LAW-5 One source of truth per rule
@@ -84,7 +84,7 @@ lived in a first line of a description, where it had to be parsed; it moved to l
 fixed transition window, never as a second source for good. #462: the owner-hold rule became data read by one decision function.
 
 **Check:**
-- test: the owner-hold rule is data with a single decision function (#462).
+- test: the decision code names no path or class and agrees with the data file (`TestOwnerHoldRule.test_s1_the_decision_code_names_no_path_or_class_and_agrees_with_the_file`, #462).
 - reviewer: architecture asks where else a rule is written.
 
 ## FK-LAW-6 A check never reads the change it judges from the change
@@ -108,6 +108,7 @@ decides it, and the daemon re-judges waiting pull requests against it.
 
 **Check:**
 - gate: the owner-hold floor (the path floor of R-LAW-13) holds a change to a top-tier path for the owner, with the file named.
+- note only: that the agent a guard constrains never lowers it is judged by the reviewing side; no gate asserts it today.
 
 ## FK-LAW-8 Say what was not done
 
@@ -120,4 +121,4 @@ Builds on R-CODE-1 (say it failed); the particular part here is naming what is l
 CI followed. The fix (#513) delivers it or fails and says the pane is open without it.
 
 **Check:**
-- test: a resume whose brief cannot be sent exits 1 and says the pane is open without the brief (#513).
+- test: a resume whose brief cannot be sent exits 1 and says the pane is open without the brief (`TestLaunch.test_s3_a_failed_send_exits_1_and_says_the_pane_is_open_without_the_brief`, #513).
