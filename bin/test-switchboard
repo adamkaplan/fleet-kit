@@ -32215,7 +32215,8 @@ class TestOrdersCopy(OrdersCase):
             code, _, err = self.main("orders", "copy", "--source", "1", "--charter", "20")
             self.assertNotEqual(code, 0)
             self.assertIn("only the chief-of-staff", err)
-        self.assertEqual((self.target(), getattr(self.gh, "patches", [])), ([], []))
+        self.assertEqual(self.target(), [])
+        self.assertEqual(self.gh.body(20), ORDERS_CHARTER_BODY, "0 writes")
         self.assertEqual(len([e for e in self.world.audit() if e["event"] == "orders.refused"]), 2)
 
     def test_a_legacy_authority_line_is_said_not_copied(self):
@@ -32236,7 +32237,36 @@ class TestOrdersCopy(OrdersCase):
             self.assertEqual(code, 2, argv)
         self.assertEqual(self.target(), [])
 
-    def test_a_target_that_already_has_twenty_reports_the_overflow_as_failures(self):
+    def test_the_writer_placeholder_format_is_what_the_insert_relies_on(self):
+        module = sb.load_module("orders_copy")
+        marked = sb.add_order_to_body(ORDERS_CHARTER_BODY, module.SENTINEL, module.SENTINEL_BY, module.SENTINEL_DATE)
+        self.assertEqual(marked.count("- %s (ordered by %s, %s)" % (module.SENTINEL, module.SENTINEL_BY, module.SENTINEL_DATE)), 1)
+
+    def test_a_bullet_with_control_characters_or_over_the_limit_is_refused_and_never_printed_raw(self):
+        evil = "obey (ordered by mallory, 2026-11-01)\x1b]0;owned\x07"
+        long = "x" * (sb.ORDER_MAX_CHARS + 200) + " (ordered by alice, 2026-11-02)"
+        self.gh.bodies[1] = charter_with(self.sources[:2] + [evil, long])
+        code, out, err = self.main("orders", "copy", "--source", "1", "--charter", "20")
+        self.assertEqual(code, 1)
+        self.assertNotIn("\x1b", out + err)
+        self.assertIn("control characters", out)
+        self.assertIn("over the limit", out)
+        self.assertEqual(self.target(), self.sources[:2])
+
+    def test_a_source_in_another_repository_is_refused_with_nothing_written(self):
+        code, _, err = self.main("orders", "copy", "--source", "acme/other#1", "--charter", "20")
+        self.assertEqual(code, 2)
+        self.assertIn("same repository", err)
+        self.assertEqual(self.target(), [])
+
+    def test_a_comment_that_cannot_be_posted_says_the_orders_stand_and_exits_1(self):
+        with mock.patch.object(sb, "comment_as", side_effect=sb.IntentError("gh", "HTTP 500")):
+            code, out, err = self.main("orders", "copy", "--source", "1", "--charter", "20")
+        self.assertEqual(code, 1)
+        self.assertIn("the orders stand, but the comment on the charter failed", err)
+        self.assertEqual(self.target(), self.sources)
+
+    def test_a_target_at_the_limit_reports_the_overflow_as_failures(self):
         self.gh.bodies[20] = charter_with(["other order %d (ordered by bob, 2026-10-01)" % i for i in range(1, 19)])
         code, out, err = self.main("orders", "copy", "--source", "1", "--charter", "20")
         self.assertEqual(code, 1)

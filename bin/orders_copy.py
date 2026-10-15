@@ -11,11 +11,15 @@ the source charter is changed. The legacy one-line `Standing authority:` is not 
 The logic is here; `bin/fleet-switchboard` registers the subcommand and hands this module a namespace `sb` of its own helpers (`NEEDS`).
 """
 
+import re
+
 SENTINEL = "orders-copy-sentinel-7f3a91"
+CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+SUFFIX_ALLOWANCE = 90   # room for the `(ordered by <name up to 60>, <date>)` the writer adds beyond ORDER_MAX_CHARS of text
 SENTINEL_BY, SENTINEL_DATE = "x", "2000-01-01"
 
 NEEDS = ("PROG", "EXIT_OK", "EXIT_ERROR", "EXIT_USAGE", "OrdersError", "IntentError", "NoticeError", "section_orders", "add_order_to_body",
-         "edit_charter_orders", "_charter_body", "_legacy_authority", "record_order_notice", "comment_as", "_one_line", "issue_tag")
+         "edit_charter_orders", "ORDER_MAX_CHARS", "_charter_body", "_legacy_authority", "record_order_notice", "comment_as", "_one_line", "issue_tag")
 
 
 def insert_bullet(sb, body, bullet):
@@ -24,6 +28,21 @@ def insert_bullet(sb, body, bullet):
     marked = sb.add_order_to_body(body, SENTINEL, SENTINEL_BY, SENTINEL_DATE)
     line = "- %s (ordered by %s, %s)" % (SENTINEL, SENTINEL_BY, SENTINEL_DATE)
     return marked.replace(line, "- " + bullet, 1)
+
+
+def shown(sb, bullet):
+    """An order's text as one safe line for output: it came from an issue body (outside text), so control characters never reach a terminal."""
+    return sb._one_line(CONTROL.sub(" ", bullet), 300)
+
+
+def unfit(sb, bullet):
+    """Why this bullet is not copied, or None. The writer limits what `orders add` takes; a bullet read from outside text gets the same limits
+    and no control characters, and is refused, never reworded."""
+    if CONTROL.search(bullet):
+        return "it contains control characters"
+    if len(bullet) > sb.ORDER_MAX_CHARS + SUFFIX_ALLOWANCE:
+        return "it is %d characters, over the limit of an order" % len(bullet)
+    return None
 
 
 def run_copy(sb, repo, source, target, caller, role, out, err):
@@ -59,20 +78,25 @@ def run_copy(sb, repo, source, target, caller, role, out, err):
         if held.get(bullet, 0) > 0:
             held[bullet] -= 1
             skipped += 1
-            out("order %d/%d already on #%d: %s" % (number, len(orders), target, bullet))
+            out("order %d/%d already on #%d: %s" % (number, len(orders), target, shown(sb, bullet)))
+            continue
+        why = unfit(sb, bullet)
+        if why:
+            failed.append(number)
+            out("order %d/%d FAILED: %s (not copied: %s)" % (number, len(orders), shown(sb, bullet), why))
             continue
         before = sb.section_orders(sb._charter_body(reader, repo, target) if copied or failed else target_body).count(bullet)
-        detail = {"caller": caller, "source": source, "number": number, "text": bullet}
+        detail = {"caller": caller, "source": source, "number": number, "text": shown(sb, bullet)}
         try:
             sb.edit_charter_orders(engine, repo, target, "orders.copy", detail,
                                    lambda body, b=bullet: insert_bullet(sb, body, b),
                                    lambda body, b=bullet, n=before: sb.section_orders(body).count(b) > n)
         except (sb.OrdersError, sb.IntentError) as problem:
             failed.append(number)
-            out("order %d/%d FAILED: %s (%s)" % (number, len(orders), bullet, sb._one_line(str(problem), 200)))
+            out("order %d/%d FAILED: %s (%s)" % (number, len(orders), shown(sb, bullet), sb._one_line(str(problem), 200)))
             continue
         copied += 1
-        out("order %d/%d copied to #%d: %s" % (number, len(orders), target, bullet))
+        out("order %d/%d copied to #%d: %s" % (number, len(orders), target, shown(sb, bullet)))
         notify(sb, engine, repo, target, caller, bullet)
     out("orders copy %s#%d -> #%d: %d copied, %d already there, %d failed (of %d)" % (repo, source, target, copied, skipped, len(failed), len(orders)))
     if copied:
@@ -94,6 +118,6 @@ def notify(sb, engine, repo, target, caller, bullet):
     """The owner's heads-up for a copied order, as for an added one (a burst groups in the panel). Best effort: the order stands either way."""
     try:
         if engine.state_dir is not None:
-            sb.record_order_notice(engine.state_dir, repo, target, "add", bullet, caller, None, engine.now())
+            sb.record_order_notice(engine.state_dir, repo, target, "add", shown(sb, bullet), caller, None, engine.now())
     except (OSError, sb.NoticeError):
         pass
