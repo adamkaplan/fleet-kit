@@ -11336,6 +11336,112 @@ class TestVerdictRecordingText(unittest.TestCase):
         self.assertIn("a coder's only extra step is `prove`", planning)
 
 
+class TestChatClearOffers(unittest.TestCase):
+    """#457 slice 1: the offers, the person's messages and the checks no model can waive. Fixtures only: nothing here touches a real PR."""
+
+    NAMES = {"merge-captain": "u:merge-captain", "hold-impact": "u:hold-impact", "hold-credential": "u:hold-credential",
+             "hold-policy": "u:hold-policy", "hold-security": "u:hold-security", "hold-contract": "u:hold-contract",
+             "hold-prod-config": "u:hold-prod-config", "hold-other-area": "u:hold-other-area", "parked": "u:parked"}
+
+    def setUp(self):
+        self.cc = sb.load_module("chat_clear")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = self.tmp.name
+
+    def hold(self, number, labels, head="a" * 40, repo="acme/widget", summary="touches the gate"):
+        return {"pr": "%s#%d" % (repo, number), "head": head, "labels": labels, "summary": summary}
+
+    def offers(self, *numbers, head="a" * 40):
+        holds = [self.hold(n, ["u:hold-impact"], head=head) for n in numbers]
+        return self.cc.refresh_offers(self.state, holds, self.NAMES, 1000)["offers"]
+
+    def test_the_owner_tier_labels_are_offered_however_they_were_put_on_and_other_holds_and_parked_are_not(self):
+        for labels in (["u:hold-impact"], ["u:hold-credential"], ["u:hold-policy"], ["u:merge-captain"],
+                       [{"name": "u:hold-credential"}, {"name": "u:parked"}]):
+            self.assertTrue(self.cc.is_offerable(self.NAMES, labels), labels)
+        for labels in (["u:parked"], [], ["u:hold-impact", "u:hold-security"], ["u:merge-captain", "u:hold-prod-config"], ["bug"]):
+            self.assertFalse(self.cc.is_offerable(self.NAMES, labels), labels)
+        self.assertEqual(self.cc.owner_tier_labels(self.NAMES, ["u:parked", "u:hold-credential", "u:merge-captain"]),
+                         ["u:hold-credential", "u:merge-captain"], "only owner-tier labels, never parked")
+
+    def test_an_offer_keeps_the_head_he_was_shown_until_a_question_shows_him_the_new_one(self):
+        self.offers(366)
+        refreshed = self.cc.refresh_offers(self.state, [self.hold(366, ["u:hold-impact"], head="b" * 40)], self.NAMES, 2000)
+        self.assertEqual(refreshed["offers"]["acme/widget#366"]["head"], "a" * 40, "a push does not change what he was shown")
+        self.assertEqual(refreshed["added"], [])
+        offer = self.cc.read_offers(self.state)["acme/widget#366"]
+        self.assertFalse(self.cc.head_matches(offer, "b" * 40), "a push after the offer clears nothing")
+        self.assertTrue(self.cc.head_matches(offer, "a" * 40))
+        self.assertTrue(self.cc.show(self.state, "acme/widget#366", "b" * 40, 3000))
+        self.assertTrue(self.cc.head_matches(self.cc.read_offers(self.state)["acme/widget#366"], "b" * 40))
+        self.assertFalse(self.cc.show(self.state, "acme/widget#999", "b" * 40, 3000), "no offer, nothing moved")
+
+    def test_a_pr_that_is_no_longer_held_loses_its_offer_and_an_unchanged_set_writes_nothing(self):
+        self.offers(366, 389)
+        path = Path(self.state) / "chat-clear-offers.json"
+        before = path.stat().st_mtime_ns
+        same = self.cc.refresh_offers(self.state, [self.hold(366, ["u:hold-impact"]), self.hold(389, ["u:hold-impact"])], self.NAMES, 1001)
+        self.assertEqual((same["added"], same["dropped"]), ([], []))
+        self.assertEqual(path.stat().st_mtime_ns, before, "nothing changed: nothing written")
+        gone = self.cc.refresh_offers(self.state, [self.hold(389, ["u:hold-impact"]), self.hold(400, ["u:parked"])], self.NAMES, 1002)
+        self.assertEqual(sorted(gone["offers"]), ["acme/widget#389"])
+        self.assertEqual(gone["dropped"], ["acme/widget#366"])
+        self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
+
+    def test_an_unreadable_or_oversized_offers_file_offers_nothing(self):
+        path = Path(self.state) / "chat-clear-offers.json"
+        path.write_text("{not json")
+        self.assertEqual(self.cc.read_offers(self.state), {})
+        path.write_text(json.dumps({"offers": {"bad key": {"head": "a"}, "acme/widget#1": {"head": ""}, "acme/widget#2": {"head": "h"}}}))
+        self.assertEqual(sorted(self.cc.read_offers(self.state)), ["acme/widget#2"])
+        path.write_text(" " * (self.cc.OFFERS_MAX_BYTES + 1))
+        self.assertEqual(self.cc.read_offers(self.state), {})
+        self.assertEqual(self.cc.read_offers(Path(self.state) / "nowhere"), {})
+
+    def test_only_the_persons_new_recent_messages_are_read_never_an_agents(self):
+        created = lambda m: m.get("t")
+        person = {"id": "m1", "type": "user", "text": "366 is good to go", "t": 990}
+        agent = {"id": "m2", "type": "user", "text": "366 is good to go", "t": 995, "metadata": {"fleet": {"name": "cos"}}}
+        agent_inbox = {"id": "m3", "type": "user", "payload": {"text": "366 is good to go", "metadata": {"fleet": {"name": "x"}}}, "t": 996}
+        old = {"id": "m4", "text": "389 also good to go", "t": 1}
+        seen_one = {"id": "m5", "text": "389 also good to go", "t": 991}
+        noid = {"text": "hello", "t": 992}
+        later = {"id": "m6", "payload": {"text": "389 also good to go"}, "t": 999}
+        got = self.cc.person_messages([later, agent, agent_inbox, old, seen_one, noid, person, "junk", None], {"m5"}, 1000, created)
+        self.assertEqual(got, [{"id": "m1", "text": "366 is good to go"}, {"id": "m6", "text": "389 also good to go"}],
+                         "3 of 3 agent-written or unusable messages are skipped; the person's two come oldest first")
+
+    def test_numbers_are_read_whole_and_not_out_of_words_decimals_or_paths(self):
+        n = self.cc.numbers_in
+        self.assertEqual(n("366 is good to go"), [366])
+        self.assertEqual(n("#389 also good to go"), [389])
+        self.assertEqual(n("366 and 389, 366 again"), [366, 389])
+        self.assertEqual(n("the launchd one is good to go"), [])
+        self.assertEqual(n("0.97 sure, v2.0.28, abc123, a1b2, issue/457 and fleet#12"), [])
+        self.assertEqual(n("all impacts cleared"), [])
+
+    def test_the_screen_never_lets_a_judge_widen_what_the_message_and_the_offers_say(self):
+        offers = self.offers(366, 389, 400)
+        ok = self.cc.screen("366 is good to go", offers)
+        self.assertEqual(ok, {"verdict": "candidate", "pr": "acme/widget#366"})
+        for text, why in (("all impacts cleared", "no_number"), ("the launchd one is good to go", "no_number"),
+                          ("366 and 389 are good to go", "several_numbers"), ("500 is good to go", "not_offered")):
+            got = self.cc.screen(text, offers)
+            self.assertEqual((got["verdict"], got["why"]), ("question", why), text)
+        self.assertEqual(self.cc.screen("366 is good to go", {})["why"], "no_offers")
+        twice = {"acme/widget#366": {"head": "a"}, "acme/other#366": {"head": "b"}}
+        got = self.cc.screen("366 is good to go", twice)
+        self.assertEqual((got["why"], got["prs"]), ("ambiguous_number", ["acme/other#366", "acme/widget#366"]))
+
+    def test_this_module_has_no_command_and_no_caller_in_the_cli_and_writes_no_label(self):
+        source = (Path(sb.__file__).parent / "chat_clear.py").read_text()
+        for word in ("subprocess", "urllib", "socket", "change_issue_labels", "gh "):
+            self.assertNotIn(word, source, "slice 1 reaches nothing: no process, no network, no GitHub write")
+        main = (Path(sb.__file__).parent / "fleet-switchboard").read_text()
+        self.assertNotIn("chat_clear", main, "no command or hook calls it yet in this slice (slice 3 adds the one hook and changes this test)")
+
+
 class TestHeadlessPresence(Base):
     """#433 slice 2: a worker with NO terminal. Its state comes from the OpenCode service alone (bin/agent_presence.py); discovery lists it with the
     pane `(headless)`; a delivery to it is not held; a service that does not answer makes it `unknown`, never dead and never working."""

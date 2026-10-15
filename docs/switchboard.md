@@ -4252,6 +4252,16 @@ recovered by hand; the pass starts from an empty state, the hold is still writte
 before anything changes; `impact clear` says one line (`locked by another process ... try again`) when the lock wait runs out. The lock is held over the label calls on purpose (bounded by the gh call timeout); `impact_hold.calls_per_pass` (default: the floor pass's, 6) bounds the reads and writes of one pass. The clear reason has control characters stripped. Like every label while agents share one
 GitHub account, the hold is a **guardrail, not a boundary**: whoever can edit labels can remove it, and a removal with no `impact clear` is re-added the next time the daemon restarts and judges that head again.
 
+### Clearing a hold by saying so in the chat (#457, in slices)
+
+The owner will clear a held PR by writing so to the Chief of Staff ("366 is good to go") instead of running `impact clear`. This is built in four slices and is **not live**: slice 1 (`bin/chat_clear.py`) only records the offers and applies the checks, and nothing calls it yet.
+
+- **Offers.** Every open PR held by an owner-tier label (the impact, credential or policy hold label, or the captain marker) is an offer at the head the owner was last shown (`chat-clear-offers.json`, private). A PR that also carries another hold label (security, contract, prod-config, other-area) is never offered, and neither is one with only a `parked` label.
+- **The owner's own words.** Only a user message in the Chief of Staff's session with no fleet metadata counts. A message an agent wrote never does.
+- **Checks no model can waive.** The message must write the PR's number, exactly one number, and it must be an offer. Anything else is a question to the owner, never a clear. A later slice adds the judge, which can only confirm or veto.
+- **A push after the offer clears nothing.** The offer keeps the head he was shown until a question shows him the new one.
+
+
 **`verdict --all` and `gates stats`.** `fleet-switchboard verdict --all --pr <repo#N> --as reviewer|tester|ci|owner --result pass|fail --evidence TEXT` records the
 verdict for **every** per-PR scenario of the PR's plan that names that evaluator, in one command, **all or none** (one write under the ledger lock), and it **requires `--head <sha>`**, the head you judged, which must be the PR's current head (a batch is never stamped with whatever the head is now) (the same checks as a single verdict, once:
 the registered evaluator, never an author of the PR, the owner's own terminal for `owner`; it never records for another evaluator's scenarios, takes no scenario id, and
