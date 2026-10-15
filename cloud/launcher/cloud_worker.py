@@ -7,6 +7,7 @@ holds a credential: the cluster login is kubectl's own, and a worker's GitHub to
 """
 import argparse
 import datetime as dt
+import pwd
 import hashlib
 import json
 import os
@@ -177,7 +178,7 @@ def render_pod(a, worker, name, now, hard, env):
          "CW_IDLE_SECONDS": str(parse_duration(a.idle)), "CW_HARD_DEADLINE": iso(hard),
          "CW_TOKEN_ENDPOINT": endpoint, "CW_AUDIT_RUNTIME_ID": "pod/" + name}
     return {"apiVersion": "v1", "kind": "Pod", "metadata": {
-        "name": name, "labels": {"app": LABEL, "cw/worker": worker},
+        "name": name, "labels": {"app": LABEL, "cw/worker": worker, "azure.workload.identity/use": "true"},
         "annotations": {"cw/worker": worker, "cw/started": iso(now), "cw/hard-deadline": iso(hard),
                         "cw/idle-seconds": e["CW_IDLE_SECONDS"], "cw/shape": a.shape,
                         "cw/max-hard": iso(now + dt.timedelta(seconds=parse_duration(a.max_hard)))}},
@@ -199,7 +200,6 @@ def render_pod(a, worker, name, now, hard, env):
 class Launcher:
     def __init__(self, kube, env, clock=None, sleep=time.sleep):
         self.kube, self.env, self.sleep = kube, env, sleep
-        self.actor = "operator"  # a neutral role, never a login, host or person name; the reaper sets "reaper"
         self.clock = clock or (lambda: dt.datetime.now(dt.timezone.utc))
         self.audit_path = env.get("CW_CLOUD_AUDIT") or os.path.join(
             env.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "cw-cloud", "audit.jsonl")
@@ -208,7 +208,7 @@ class Launcher:
     def audit(self, worker, runtime_id, action, cost, ok, reason=""):
         os.makedirs(os.path.dirname(self.audit_path), exist_ok=True)
         line = {"ts": iso(self.clock()), "worker": worker, "runtime_id": runtime_id, "action": action,
-                "cost_estimate_usd": cost, "ok": ok, "actor": self.actor, "reason": reason}
+                "cost_estimate_usd": cost, "ok": ok, "actor": pwd.getpwuid(os.getuid()).pw_name, "reason": reason}
         try:
             fd = os.open(self.audit_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
             with os.fdopen(fd, "a") as f:  # one short O_APPEND write: atomic enough for one line, the chosen guarantee
@@ -488,7 +488,6 @@ class Launcher:
 
     def reap(self):
         """One pass: stop every pod past its hard deadline or idle too long. Returns [(worker, reason, exit)]."""
-        self.actor = "reaper"
         out, now = [], self.clock()
         for pod in self.kube.list_pods():
             worker = ann(pod, "worker")

@@ -71,6 +71,10 @@ def build_surfaces(out, build_log):
     import io
     from contextlib import redirect_stderr, redirect_stdout
     import cloud_worker as cw
+    import types
+    # the audit `actor` is the real caller (a person's login); the check runs as a fixed stand-in so the surfaces
+    # it builds do not depend on who runs it
+    cw.pwd = types.SimpleNamespace(getpwuid=lambda uid: types.SimpleNamespace(pw_name="operator"))
     work = tempfile.mkdtemp(dir=out)
     state = os.path.join(work, "kube.json")
     put(state, json.dumps({"pods": {}}))

@@ -69,7 +69,7 @@ One line per `create`, `stop`, `extend` and `delete`, appended before the action
 ```
 
 `cost_estimate_usd` is the list-price estimate of the pod so far (zero on create; elapsed hours times the shape's rate
-on the others). It is an estimate, not a billed figure. A failed action still writes its line with `"ok": false`. `actor` is a neutral role (`operator`, or `reaper` for the reaper), never a login, host or person name and never an argument; `reason` carries `--reason` (for `stop`, `extend` and `delete --force`).
+on the others). It is an estimate, not a billed figure. A failed action still writes its line with `"ok": false`. `actor` is taken from the session, never from an argument; `reason` carries `--reason` (for `stop`, `extend` and `delete --force`).
 
 ## 5. End hook (slices A and B)
 

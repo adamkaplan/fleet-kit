@@ -229,9 +229,10 @@ class S3NoStoredCredential(Base):
         self.assertEqual(spec["spec"]["containers"][0]["volumeMounts"][0]["mountPath"], "/run/cw")
         self.assertNotIn("password", json.dumps(env).lower())
 
-    def test_audit_actor_is_a_neutral_role(self):
+    def test_audit_actor_is_the_real_caller(self):
+        import pwd
         self.create("coder7")
-        self.assertEqual({x["actor"] for x in self.audit_lines()}, {"operator"})
+        self.assertEqual({x["actor"] for x in self.audit_lines()}, {pwd.getpwuid(os.getuid()).pw_name})
 
     def test_password_is_never_in_output_or_audit(self):
         r, w = os.pipe()

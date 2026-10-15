@@ -42,7 +42,21 @@ def files():
                 yield os.path.relpath(os.path.join(d, f), ROOT), os.path.join(d, f)
 
 
+# Platform and third-party keys the launcher sets: never renamed, never in the table above.
+PLATFORM_KEYS = ["azure.workload.identity/use"]
+
+
 class S5Names(base.Base):
+    def test_platform_keys_are_not_renamed_and_are_on_the_pod(self):
+        self.create("coder7")
+        pod = [p for p in self.st()["applied"] if p["kind"] == "Pod"][0]
+        keys = set(pod["metadata"]["labels"]) | set(pod["metadata"]["annotations"])
+        for k in PLATFORM_KEYS:
+            self.assertIn(k, keys)
+            self.assertNotIn(k, NAMES)
+            self.assertNotIn(k, NAMES.values())
+        self.assertEqual(pod["metadata"]["labels"]["azure.workload.identity/use"], "true")
+
     def test_no_old_name_remains(self):
         bad = []
         for rel, p in files():
@@ -63,7 +77,7 @@ class S5Names(base.Base):
         pod = [p for p in self.st()["applied"] if p["kind"] == "Pod"][0]
         c = pod["spec"]["containers"][0]
         emitted = {e["name"] for e in c["env"]}
-        emitted |= set(pod["metadata"]["labels"]) - {"app"} | set(pod["metadata"]["annotations"])
+        emitted |= (set(pod["metadata"]["labels"]) - {"app"} - set(PLATFORM_KEYS)) | set(pod["metadata"]["annotations"])
         emitted.add(pod["metadata"]["labels"]["app"])
         emitted.add(pod["spec"]["serviceAccountName"])
         calls = [json.loads(x) for x in open(self.env["FAKE_KUBE_CALLS"])]
@@ -101,8 +115,6 @@ class S6Reaper(base.Base):
         self.assertIn("stray", self.st()["pods"])
         listing = [json.loads(x) for x in open(self.env["FAKE_KUBE_CALLS"])]
         self.assertTrue(any("-l" in c and "app=cw-worker" in c for c in listing))
-        by = {x["action"]: x["actor"] for x in self.audit_lines()}
-        self.assertEqual((by["create"], by["stop"]), ("operator", "reaper"))
 
     def clean(self):
         return base.make_repo(self.tmp.name, "clean", dirty=False)[0]
