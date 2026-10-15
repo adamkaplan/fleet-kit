@@ -48877,6 +48877,36 @@ class TestModuleLoader(Base):
         self.assertEqual(first.VALUE, 7)
         self.assertIs(mod.load_module("fixture_mod"), first)
 
+    def test_s9_concurrent_first_loads_all_get_the_finished_module_and_a_failing_one_fails_for_every_thread(self):
+        tmp, mod = self._copy({
+            "slow_mod": "import time\ntime.sleep(0.3)\nREADY = True\n",
+            "failing_mod": "import time\ntime.sleep(0.2)\nraise RuntimeError('boom')\n"})
+        got, errors, barrier = [], [], threading.Barrier(8)
+
+        def worker(name):
+            barrier.wait()
+            try:
+                module = mod.load_module(name)
+                got.append((module, getattr(module, "READY", False)))
+            except RuntimeError as err:
+                errors.append(str(err))
+        threads = [threading.Thread(target=worker, args=("slow_mod",)) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(20)
+        self.assertEqual(len(got), 8)
+        self.assertEqual(len({id(module) for module, _ in got}), 1, "one object for every thread")
+        self.assertTrue(all(ready for _, ready in got), "no thread saw a half-loaded module")
+        barrier, errors = threading.Barrier(8), []
+        threads = [threading.Thread(target=worker, args=("failing_mod",)) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(20)
+        self.assertEqual(errors, ["boom"] * 8, "the failing module raises for every thread")
+        self.assertNotIn("failing_mod", sys.modules)
+
     def test_s8_a_hostile_name_is_refused(self):
         tmp, mod = self._copy()
         (tmp.parent / "outside_mod.py").write_text("VALUE = 1\n")
