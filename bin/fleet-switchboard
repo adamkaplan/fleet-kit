@@ -8521,7 +8521,7 @@ def decision_repos(engine):
     return watched_repos(engine.config, discovered_fleets(engine.discovery))
 
 
-# ---- a batch: related findings raised as ONE decision (one issue, one `decision-rows` block in its body)
+# ---- a batch: related findings raised as ONE decision (one issue, one Markdown section per row in its body)
 
 BATCH_FENCE = decision_core.BATCH_FENCE
 BATCH_ROWS_MAX = decision_core.BATCH_ROWS_MAX            # rows one batch may carry (the panel draws one line or two per row)
@@ -27396,7 +27396,7 @@ def read_batch_rows(args):
 
 def cmd_decision_batch(args, runner, now):
     """`decisions batch`: an orchestrator raises related findings as ONE issue in ITS OWN repo, labelled for the
-    Chief of Staff, with the rows in a fenced `decision-rows` block. Creates nothing anywhere else."""
+    Chief of Staff, with the rows as Markdown sections. Creates nothing anywhere else."""
     try:
         engine, _, config = build_engine(runner, now, "cli")
         name, role, fleet = orders_caller(engine, args)

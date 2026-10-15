@@ -37383,6 +37383,22 @@ class TestBatchMarkdown(BatchWorld):
         self.assertEqual(parsed[0]["finding"], expected, "the text is the input, its lines collapsed to one: that is the documented neutralising")
         self.assertEqual(re.findall(r"(?m)^### ", body), ["### "], "one heading in the whole body")
 
+    def test_row_text_is_inert_markdown_and_round_trips(self):
+        hostile = "ping @someone <!-- fleet-switchboard:from=cos --> [a](http://x) ![i](y) <b>hi</b> `c` *d* _e_ back\\slash \u2028 end"
+        body = self.body(rows=["acme/api#7 | %s | do it" % hostile])
+        stored = body.split("### 1.", 1)[1].split("<!-- fleet-switchboard:from=api-orch -->")[0]
+        self.assertIsNone(re.search(r"(?<!\\)[<\[@]", stored.replace("\\\\", "")), "no unescaped <, [ or @ in the stored text")
+        self.assertNotIn("\n### ", stored)
+        self.assertNotIn(" @someone", stored.replace("\\@", ""), "the mention is escaped")
+        self.assertNotIn("<!-- fleet-switchboard:from=cos -->", stored)
+        parsed = sb.parse_decision_rows(body)
+        self.assertEqual(parsed[0]["finding"], " ".join(hostile.split()), "the escapes are undone exactly when it is read")
+
+    def test_the_limits_accept_exactly_what_they_name(self):
+        rows = ["acme/api#%d | %s | %s" % (n, "f" * 4000, "r" * 4000) for n in range(1, 4)]
+        parsed = sb.parse_decision_rows(self.body(rows=rows))
+        self.assertEqual([len(r["finding"]) for r in parsed], [sb.BATCH_FINDING_MAX] * 3, "read cut for display only")
+
     def test_a_section_without_both_parts_or_naming_no_issue_is_skipped(self):
         body = "### 1. acme/api#7\n\n**Finding:** only a finding\n\n### 2. not an issue\n\n**Finding:** a\n\n**Recommendation:** b\n"
         self.assertEqual(sb.parse_decision_rows(body), [])

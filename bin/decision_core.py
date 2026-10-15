@@ -402,11 +402,25 @@ def row_of(ref, finding, rec, full=False):
             "text": "%s: %s" % (short, short_refs(rec))}
 
 
+_MD_ACTIVE = re.compile(r"([\\<>@\[\]`*_])")
+_MD_ESCAPED = re.compile(r"\\([\\<>@\[\]`*_])")
+
+
+def md_escape(text):
+    """Row text made inert as Markdown: each active character is backslash-escaped (no mention, link, image, HTML or comment, and no look-alike of the signer mark), and
+    md_unescape gives the exact text back."""
+    return _MD_ACTIVE.sub(r"\\\1", text)
+
+
+def md_unescape(text):
+    return _MD_ESCAPED.sub(r"\1", text)
+
+
 def batch_row_sections(rows):
     """The Markdown of a batch's rows: one section for each, `### N. <issue>` then `**Finding:** ...` and `**Recommendation:** ...` as their own paragraphs, the FULL text, no code
     block. A row's text is one line (whitespace is collapsed when it is parsed), so it can never start a line: a heading, a fence marker or a row-looking text inside it is
     mid-line text and cannot split the section."""
-    return "\n\n".join("### %d. %s\n\n**Finding:** %s\n\n**Recommendation:** %s" % (number, row["ref"], row["finding"], row["recommendation"])
+    return "\n\n".join("### %d. %s\n\n**Finding:** %s\n\n**Recommendation:** %s" % (number, row["ref"], md_escape(row["finding"]), md_escape(row["recommendation"]))
                        for number, row in enumerate(rows, 1))
 
 
@@ -418,7 +432,7 @@ def parse_markdown_rows(body):
     def close():
         if current and current["finding"] and current["rec"]:
             try:
-                rows.append(row_of(current["ref"], " ".join(current["finding"]), " ".join(current["rec"])))
+                rows.append(row_of(current["ref"], md_unescape(" ".join(current["finding"])), md_unescape(" ".join(current["rec"]))))
             except BatchError:
                 pass
     for line in body.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
