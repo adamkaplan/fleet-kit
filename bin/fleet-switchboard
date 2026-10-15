@@ -27472,6 +27472,19 @@ def batch_answer_rows(decision, args):
     return out
 
 
+def batch_answer_lines(outcomes, note):
+    """The lines of the comment that records a batch answer (the one place its format is built, so a test measures what is posted)."""
+    changed = sum(1 for _, _, c in outcomes if c)
+    lines = ["Answer to this batch (%d rows): %s." % (len(outcomes), "as recommended" if not changed else
+                                                      "%d row%s changed, the rest as recommended"
+                                                      % (changed, "" if changed == 1 else "s"))]
+    lines += ["%d. %s: %s" % (n, row["ref"], text) for n, (row, text, _) in enumerate(outcomes, 1)]
+    if note:
+        lines.append("Note: %s" % _one_line(note, 300))
+    lines.append("The row issues were not changed by this answer: the orchestrator that raised the batch acts on it.")
+    return lines
+
+
 def answer_batch(engine, runner, decision, args, name):
     """First the note to the orchestrator that raised the batch; only once it is delivered, ONE comment on the batch
     issue recording every row's outcome, then both awaiting labels off it, so the batch and all its rows leave the
@@ -27486,13 +27499,7 @@ def answer_batch(engine, runner, decision, args, name):
     repo, number = target
     outcomes = batch_answer_rows(decision, args)
     changed = sum(1 for _, _, c in outcomes if c)
-    lines = ["Answer to this batch (%d rows): %s." % (len(outcomes), "as recommended" if not changed else
-                                                      "%d row%s changed, the rest as recommended"
-                                                      % (changed, "" if changed == 1 else "s"))]
-    lines += ["%d. %s: %s" % (n, row["ref"], text) for n, (row, text, _) in enumerate(outcomes, 1)]
-    if args.note:
-        lines.append("Note: %s" % _one_line(args.note, 300))
-    lines.append("The row issues were not changed by this answer: the orchestrator that raised the batch acts on it.")
+    lines = batch_answer_lines(outcomes, args.note)
     size = len("\n".join(lines))
     if size > decision_core.BATCH_COMMENT_MAX_CHARS:   # before ANY side effect (the note, the comment, the labels): refused whole, nothing sent or written
         raise DecisionError("%s was not answered: the answer comment would be %d characters and a comment holds at most %d (the rows' recommendations are long); "

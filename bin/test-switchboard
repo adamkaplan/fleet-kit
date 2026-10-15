@@ -37461,9 +37461,11 @@ class TestBatchFullText(BatchWorld):
         decision = {"id": "api#101", "rows": [dict(row) for _ in range(sb.decision_core.BATCH_RAISE_ROWS_MAX)]}
         args = types.SimpleNamespace(as_recommended=False, row=["%d=%s" % (n, "c" * 400) for n in range(1, 21)], note="n" * 300)
         outcomes = sb.batch_answer_rows(decision, args)
-        lines = ["Answer to this batch (20 rows): 20 rows changed, the rest as recommended."] + ["%d. %s: %s" % (n, r["ref"], t) for n, (r, t, _) in enumerate(outcomes, 1)]
-        lines += ["Note: " + "n" * 300, "The row issues were not changed by this answer: the orchestrator that raised the batch acts on it."]
-        self.assertLessEqual(len("\n".join(lines)), sb.decision_core.BATCH_COMMENT_MAX_CHARS)
+        size = len("\n".join(sb.batch_answer_lines(outcomes, args.note)))   # the function that builds what is posted
+        self.assertGreater(size, 55000, "this is the worst case: every row changed, each quoting a maximum recommendation")
+        self.assertLessEqual(size, sb.decision_core.BATCH_COMMENT_MAX_CHARS)
+        plain = sb.batch_answer_rows(decision, types.SimpleNamespace(as_recommended=True, row=[], note=None))
+        self.assertLessEqual(len("\n".join(sb.batch_answer_lines(plain, None))), size)
 
     def test_an_answer_comment_over_the_limit_is_refused_before_any_side_effect(self):
         """A batch raised elsewhere may hold longer recommendations than the raise bounds allow: its answer comment is checked before the note, the comment or a label."""
