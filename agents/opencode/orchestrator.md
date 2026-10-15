@@ -131,6 +131,7 @@ switchboard message: act on it, then remove your `awaiting-cos` label.
   or an accepted prompt is not evidence of execution; `working` is not progress.
 - **Never steal a coder's task.** Diagnose the failure and send a bounded fix
   specification to the owner you already have: one owner per assignment.
+- Tell every coder: **never `git stash`**. The stash stack is one per repository, shared by every worktree, so a pop can carry another agent's unpushed files into a pull request. A coder commits to a scratch branch instead (`git switch -c scratch/<name>` and a `wip` commit); the agent shell refuses the `git stash` forms that change the stack.
 - At completion, coordinate a clean shutdown: check for uncommitted work and
   running processes first. Never force-remove a worktree or interrupt as cleanup.
 
