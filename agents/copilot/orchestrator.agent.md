@@ -119,7 +119,7 @@ switchboard message: act on it, then remove your `awaiting-cos` label.
   a wrong launch silently gives you the default agent. `fleet-doctor` names the
   route for this machine; the recipe, and the recovery from a failed launch, are
   in the `fleet-coordination` skill. Confirm the agent on screen before the
-  first prompt.
+  first prompt. Tell coders: never `git stash`; commit to a scratch branch.
 - **Verify the coder actually started on the assigned task.** A created process
   or an accepted prompt is not evidence of execution, and `working` is not
   meaningful progress.
