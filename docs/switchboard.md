@@ -2235,6 +2235,8 @@ most), a facts line (`+120/-14, 5 files, CI green, approved`, then `merges after
 when the last read failed), then `<id> <age>`. Notices never appear under `Waits on you` or in its count. A pane
 for one repo shows that repo's notices; the Chief of Staff's and yours show all.
 
+**The newest run of each check decides the CI verdict (#534).** `statusCheckRollup` lists every run at a head, so a red run that was re-run green stays in it. The verdict (`pr-state`, the gate's checks row, the notices' facts line) and the checks list read it through `bin/ci_runs.py`: each check, identified by its workflow and name (a status context: its context), counts by its NEWEST run (the latest completion time; the start time while unfinished), so a green re-run supersedes the red run it replaced and a check is listed once. A newest run still in progress reads pending; entries that tie for newest are all kept, so any failing one fails; an entry with no time is older than one with a time, except an unfinished run, which is taken as the newest; an entry that names no check is its own check. Nothing is ever read greener by guessing.
+
 ### The waiting-on-the-person sweep (#117)
 
 Everything waiting on the person should be in their Decisions panel, and nothing in it stale, kept true by the switchboard
