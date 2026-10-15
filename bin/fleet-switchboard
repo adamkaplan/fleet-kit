@@ -23523,7 +23523,7 @@ def add_move_parsers(sub):
 
 
 def move_caller(engine, args):
-    """(name, role) of who runs `move`: its pane's fleet agent, or (None, None) in a plain shell (the operator). `--from` in the Lab."""
+    """(name, role) of who runs `move`: its pane's fleet agent, (None, None) at the owner's own terminal (the operator), or an "unidentified" caller that is refused. A mistake guard, not a boundary (docs/switchboard.md). `--from` in the Lab."""
     if args.sender is not None:
         if os.environ.get(LAB_ENV) != "1":
             raise CallerError("--from is only for the Lab (%s=1); an agent is identified by its pane" % LAB_ENV)
@@ -23536,6 +23536,9 @@ def move_caller(engine, args):
     except IdentityUncertain:
         raise
     except CallerError:
+        problem = owner_terminal_problem()   # the one person check: a shell that cannot be established as the owner's own terminal is refused, never read as the operator
+        if problem:
+            return "an unidentified caller (not established as the owner's own terminal: %s)" % _one_line(problem, 120), "unidentified"
         return None, None   # a plain shell: the operator
     return fleet["name"], fleet.get("role")
 

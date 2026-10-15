@@ -46,6 +46,8 @@ def check_caller(caller, role):
     """Only the Chief of Staff or the operator (a plain shell: `caller` is None) moves an ask. The refusal text, or None."""
     if caller is None or role == "chief-of-staff":
         return None
+    if role == "unidentified":
+        return "only the chief-of-staff or the operator moves an ask; this is %s" % caller
     return "only the chief-of-staff or the operator moves an ask; %s is %s" % (caller, "a %s" % role if role else "not given a role")
 
 
@@ -174,17 +176,17 @@ def handover_note(sb, plan, caller, workers, prs, tag):
     lines = ["Handover: ask %s moved from charter #%d to your charter #%d by %s." % (tag, plan["old"], plan["new"], caller),
              "Its Intent, Done when, comments and plan are unchanged: read them on the issue.", ""]
     lines.append("## %s" % HANDOVER_SECTIONS[0])
-    lines.append("%s is %s: %s" % (tag, plan["state"], plan["title"] or "(no title)"))
+    lines.append("%s is %s: %s" % (tag, plan["state"], clean(sb, plan["title"]) or "(no title)"))
     lines.append("## %s" % HANDOVER_SECTIONS[1])
     if isinstance(prs, str):
         lines.append("- %s" % prs)
     elif prs:
-        lines.extend("- #%d at %s: %s" % (n, sha, title) for n, sha, _, title in prs)
+        lines.extend("- #%d at %s: %s" % (n, clean(sb, sha, 40), clean(sb, title)) for n, sha, _, title in prs)
     else:
         lines.append("- none open")
     lines.append("## %s" % HANDOVER_SECTIONS[2])
     refs = [ref for _, _, ref, _ in prs] if not isinstance(prs, str) else []
-    lines.extend("- %s" % ref for ref in refs) if refs else lines.append("- none known")
+    lines.extend("- %s" % clean(sb, ref) for ref in refs) if refs else lines.append("- none known")
     lines.append("## %s" % HANDOVER_SECTIONS[3])
     if workers:
         lines.append("Still finishing under their old boss (not re-bossed):")
@@ -192,10 +194,15 @@ def handover_note(sb, plan, caller, workers, prs, tag):
     else:
         lines.append("- none running")
     lines.append("## %s" % HANDOVER_SECTIONS[4])
-    lines.extend("- label: %s" % w for w in waits) if waits else lines.append("- none recorded")
+    lines.extend("- label: %s" % clean(sb, w, 60) for w in waits) if waits else lines.append("- none recorded")
     lines.append("## %s" % HANDOVER_SECTIONS[5])
     lines.append("{reminders}")
     return "\n".join(lines)
+
+
+def clean(sb, text, limit=120):
+    """Text that came from GitHub, as one short line (no control characters) before it goes into a message."""
+    return sb._one_line(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(text)), limit)
 
 
 def reminders_section(sb, verb, held):
@@ -227,8 +234,8 @@ def send_notice(sb, caller, recipient, text, plan):
 
 def run_move(sb, repo, ask, to_charter, caller, role, out, err):
     """Move `repo#ask` to charter `to_charter`. `caller` is the fleet name (None for the operator's plain shell).
-    Exit code: 0 done; 2 refused (nothing changed); 1 the write failed (still under the old charter) or the ask is
-    moved and a later step failed (the output says which)."""
+    Exit code: 0 done; 1 the caller is refused (audited), the write failed (still under the old charter) or the ask is
+    moved and a later step failed (the output says which); 2 the move cannot be made (nothing changed)."""
     engine = sb.engine
     subject = "issue:%s#%d" % (repo, ask)
     refusal = check_caller(caller, role)
@@ -254,7 +261,15 @@ def run_move(sb, repo, ask, to_charter, caller, role, out, err):
     tag = sb.issue_tag(repo, ask, engine.repos_in_play())
     who = caller or OPERATOR
     failed = []
-    # step 1, the one write: a refusal leaves the ask under its old charter.
+    # step 1, the one write: a refusal leaves the ask under its old charter. The old parent is read again first: if someone moved
+    # the ask since the plan was read, nothing is written and the handover never names the wrong charter.
+    try:
+        if parent_of(sb, repo, ask) != old:
+            err("%s: move: %s was moved by someone else while this was being prepared; nothing was changed. Run it again" % (sb.PROG, tag))
+            return sb.EXIT_ERROR
+    except sb.IntentError as problem:
+        err("%s: move failed at step 'check' (the parent could not be read: %s); nothing was changed" % (sb.PROG, sb._one_line(str(problem), 160)))
+        return sb.EXIT_ERROR
     try:
         with engine._external("lanes.move", subject, {"caller": who, "repo": repo, "ask": ask, "from": old, "to": new}):
             sb._gh_write(engine, engine.intents.runner, repo, "repos/%s/issues/%d/sub_issues" % (repo, new), "POST",
@@ -281,6 +296,9 @@ def run_move(sb, repo, ask, to_charter, caller, role, out, err):
     try:
         verb, held = move_reminders(sb, repo, ask, old_owner, new_owner)
         out("reminders: %d %s%s" % (len(held), verb, " (%s)" % ", ".join(r["id"] for r in held) if held else ""))
+        if verb == "cancelled":
+            for r in held:
+                out("  cancelled, to recreate: %s at %s: %s" % (r["id"], sb.iso(r["at"]), clean(sb, r.get("text") or "", 200)))
     except (sb.ReminderError, OSError) as problem:
         failed.append("reminders (%s)" % sb._one_line(str(problem), 120))
     reminder_text = ("%d reminder(s) of yours on it were %s." % (len(held), verb)) if held else "You held no reminders on it."
