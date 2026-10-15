@@ -1,0 +1,166 @@
+# Repairs the containerd registration of Sysbox on nodes whose containerd is 2.x.
+# The stock Sysbox installer writes the sysbox-runc stanza under the legacy plugin key
+# io.containerd.grpc.v1.cri, which containerd 2.x ignores; it reads
+# io.containerd.cri.v1.runtime. This DaemonSet moves the stanza, validates the result,
+# restarts containerd only if it changed something, and does nothing on a node that is
+# already right. It runs only on nodes labelled sysbox-install=yes, waits for the stock
+# installer to write its stanza, and on success labels the node sysbox-runtime=running
+# (which the RuntimeClass schedules on). It is idempotent: safe to run again.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sysbox-containerd-fix
+  namespace: kube-system
+data:
+  fix.sh: |
+    #!/bin/sh
+    # Test hooks: CFG (config path), HOST (command prefix that runs on the node), LABEL_CMD,
+    # ONCE=1 (one pass, then exit), MAX_BAD (invalid-config tries before exiting non-zero).
+    set -eu
+    CFG=${CFG:-/host/etc/containerd/config.toml}
+    HOST=${HOST:-nsenter -t 1 -m -u -i -n -p --}
+    LABEL_CMD=${LABEL_CMD:-kubectl label node $NODE_NAME sysbox-runtime=running --overwrite}
+    NEW="io.containerd.cri.v1.runtime"
+    OLD="io.containerd.grpc.v1.cri"
+    bad=0
+
+    while true; do
+      if [ ! -f "$CFG" ] || ! grep -q 'runtimes[."'"'"']*sysbox-runc' "$CFG"; then
+        echo "waiting for the Sysbox installer to register sysbox-runc"
+        [ "${ONCE:-0}" = 1 ] && exit 3
+        sleep 15; continue
+      fi
+      HDR="^[[:space:]]*\\[plugins\\.[\"']"
+      if grep -Eq "${HDR}$NEW[\"']\\.containerd\\.runtimes\\.sysbox-runc\\]" "$CFG" \
+         && ! grep -Eq "${HDR}$OLD[\"']\\.containerd\\.runtimes\\.sysbox-runc" "$CFG"; then
+        echo "sysbox-runc already under $NEW: nothing to do"; $LABEL_CMD >/dev/null
+      else
+        cp "$CFG" "$CFG.sysbox-fix.bak"
+        # Table headers may be indented and use either quote style. Rename the key on the
+        # sysbox-runc tables (and .options) only; then drop the legacy parent headers
+        # ([plugins.OLD], .containerd, .containerd.runtimes) that are left with no keys and no
+        # child tables. A renamed table whose new name already exists is dropped.
+        awk -v OLD="$OLD" -v NEW="$NEW" '
+          function norm(l) { sub(/^[ \t]*\[/, "", l); sub(/\].*$/, "", l); gsub(/\047/, "\"", l); return l }
+          BEGIN { s = 0 }
+          { line[NR] = $0
+            if ($0 ~ /^[ \t]*\[[^[]/) { s++; hn[s] = norm($0) } 
+            sec[NR] = s }
+          END {
+            P = "plugins.\"" OLD "\""; Q = "plugins.\"" NEW "\""
+            R = P ".containerd.runtimes.sysbox-runc"
+            for (i = 1; i <= s; i++) { n = hn[i]
+              if (n == R || index(n, R ".") == 1) ren[i] = 1; else seen[n] = 1 }
+            for (i = 1; i <= s; i++) { if (ren[i]) {
+              nn = Q substr(hn[i], length(P) + 1)
+              if (nn in seen) drop[i] = 1; else { seen[nn] = 1; fin[i] = nn } } else fin[i] = hn[i] }
+            for (n = 1; n <= NR; n++) if (sec[n] > 0 && line[n] !~ /^[ \t]*(#.*)?$/ && line[n] !~ /^[ \t]*\[/) body[sec[n]] = 1
+            split(P ".containerd.runtimes|" P ".containerd|" P, par, "|")
+            for (k = 1; k <= 3; k++) for (i = 1; i <= s; i++) if (!drop[i] && hn[i] == par[k] && !ren[i] && !body[i]) {
+              kids = 0
+              for (j = 1; j <= s; j++) if (j != i && !drop[j] && index(fin[j], par[k] ".") == 1) kids = 1
+              if (!kids) drop[i] = 1 }
+            for (n = 1; n <= NR; n++) { i = sec[n]
+              if (i > 0 && drop[i]) continue
+              l = line[n]
+              if (i > 0 && ren[i] && l ~ /^[ \t]*\[/) { p = index(l, OLD); l = substr(l, 1, p - 1) NEW substr(l, p + length(OLD)) }
+              print l } }' "$CFG" > "$CFG.tmp"
+        if sed -n -E 's/^[[:space:]]*\[([^[].*)\].*$/\1/p' "$CFG.tmp" | tr "'" '"' | sort | uniq -d | grep -q .; then
+          echo "the rewrite would duplicate a table header: exiting non-zero" >&2; rm -f "$CFG.tmp"; exit 1
+        fi
+        if cmp -s "$CFG" "$CFG.tmp"; then
+          rm -f "$CFG.tmp"
+          echo "sysbox-runc is registered in a form this fix does not move: exiting non-zero" >&2; exit 1
+        fi
+        mv "$CFG.tmp" "$CFG"; sync
+        if $HOST containerd config dump >/dev/null 2>&1 \
+           && $HOST containerd config dump | grep -q 'runtimes.sysbox-runc' \
+           && grep -Eq "${HDR}$NEW[\"']\\.containerd\\.runtimes\\.sysbox-runc\\]" "$CFG"; then
+          echo "config valid: restarting containerd"
+          $HOST systemctl restart containerd
+          $LABEL_CMD >/dev/null
+          bad=0
+        else
+          bad=$((bad + 1))
+          echo "config invalid (try $bad): restoring backup" >&2
+          cp "$CFG.sysbox-fix.bak" "$CFG"
+          [ "$bad" -ge "${MAX_BAD:-5}" ] && { echo "giving up: pod exits non-zero" >&2; exit 1; }
+          [ "${ONCE:-0}" = 1 ] && exit 1
+          sleep 60; continue
+        fi
+      fi
+      [ "${ONCE:-0}" = 1 ] && exit 0
+      sleep 300
+    done
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sysbox-containerd-fix
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sysbox-containerd-fix
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sysbox-containerd-fix
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sysbox-containerd-fix
+subjects:
+  - kind: ServiceAccount
+    name: sysbox-containerd-fix
+    namespace: kube-system
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: sysbox-containerd-fix
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: sysbox-containerd-fix
+  template:
+    metadata:
+      labels:
+        app: sysbox-containerd-fix
+    spec:
+      serviceAccountName: sysbox-containerd-fix
+      hostPID: true
+      nodeSelector:
+        sysbox-install: "yes"
+      containers:
+        - name: fix
+          # a small image with sh, sed, nsenter (util-linux) and kubectl
+          image: alpine/k8s:1.33.4
+          command: ["/bin/sh", "/scripts/fix.sh"]
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+            - name: host-etc-containerd
+              mountPath: /host/etc/containerd
+      volumes:
+        - name: scripts
+          configMap:
+            name: sysbox-containerd-fix
+        - name: host-etc-containerd
+          hostPath:
+            path: /etc/containerd
+            type: Directory
