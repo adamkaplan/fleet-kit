@@ -82,9 +82,13 @@ Above the Decisions rows, one dense block per workspace that has an orchestrator
   An attached pane is `work` or `idle` from the tool calls when they are recorded, else from the load record (coders busy, or asks moved this hour).
 - **Line 2:** asks moved per hour so far today (UTC; `·` is an hour with no record), then `q` open asks, `s` stalled over 2 h, `d` decisions waiting on it,
   `c` coders busy/total, `p` pushes this hour, `ctx` context use. A figure whose source is missing, unreadable or too old reads `not recorded`.
-  A line is cut at 34 characters, so a row with several missing figures shows the first ones. The Chief of Staff has no load row: its second line
-  says `no load row: not orchestrator` beside its `d` count.
+  A line is cut at 34 characters, so a row with several missing figures shows the first ones. The Chief of Staff has no load row: its row carries its state word
+  (`wait` while anything waits on the owner) and `dN waiting on you`, the open owner-tier decisions.
 - **Legend:** four dim lines under the heading name `q s d c p ctx moved` and the state words.
+- **Activity series:** tool calls from the `fleet-hooks` counter where it has the workspace's sessions (`≈`), else steps ended per minute from the step
+  events the daemon already receives (`≈steps`: no plugin, no restart of any session). With neither the row says why: `restart for counter` (the counter
+  runs, but those sessions started before it was installed). `ctx no step seen yet` means the usage source is on but that session has not ended a step
+  since the daemon started. `cN/M` counts a workspace's coders without the retired and those that made their final `done`/`failed` report.
 - **Why a figure is absent:** `tool calls: plugin not installed` (no `tool-rate.json`: the installed `fleet-hooks` copy predates the counter; the kit's
   own install step, which copies `plugins/fleet-hooks`, puts it in the profile; this block only reads) or `plugin not running` (the file is stale);
   `ctx` under `v2_light`: usage comes from the `session.step.ended` events the daemon already receives (their token and cost figures; no read of history), and reads `ctx: off: v2_light` only while no event has carried figures; `p 0` for a repository whose forwarder is running (`github-watch.json`) with no push in the

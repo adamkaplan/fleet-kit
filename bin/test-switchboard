@@ -54220,6 +54220,26 @@ class TestSpotlightGuard(Base):
             self.assertIsNone(self.sg.parse_count(odd), odd)
 
 
+class TestCoderBooks(Base):
+    """#549: a coder finished (retired, or its final report made) is on the books but not counted among a workspace's coders."""
+
+    def obs(self, name, session="ses_1"):
+        return sb.Observation(name, session, "w1:p1", "idle", {"name": name, "role": "coder", "reports_to": "orch"})
+
+    def test_retired_and_finished_coders_are_not_counted(self):
+        retired = {"gone": {"session": "ses_1", "at": 1}, "reused": {"session": "ses_old", "at": 1}, "anysession": {"at": 1}}
+        last = {"done1": {"state": "done"}, "failed1": {"state": "failed"}, "busy1": {"state": "working"}, "quiet": {"send_to": {"orch": 5}}}
+        finished = lambda name, session="ses_1": sb.coder_finished(self.obs(name, session), retired, last)
+        self.assertTrue(finished("gone"))
+        self.assertTrue(finished("anysession"))
+        self.assertFalse(finished("reused"))      # the name is taken again by a new session
+        self.assertTrue(finished("done1"))
+        self.assertTrue(finished("failed1"))
+        self.assertFalse(finished("busy1"))
+        self.assertFalse(finished("quiet"))
+        self.assertFalse(finished("nobody"))
+
+
 class TestModuleLoader(Base):
     """Ask #437 slice 1: one generic loader behind the old `load_<module>()` names."""
 
