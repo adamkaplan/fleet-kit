@@ -1,0 +1,154 @@
+"""Presence for a worker that has no terminal (a headless local worker now, a cloud worker later): ONE rule, ask #433.
+
+A headless worker is a session in an OpenCode service. herdr knows nothing about it, so what it is doing comes from the service alone. The rule below
+was measured in a spike (a throwaway profile on the live version, never on the live service):
+
+* the session id is in `session.active` (an entry `{"type": "running"}`): the worker is working;
+* it is in `session.active` AND `session.permission.list` or `session.form.list` is not empty: it is BLOCKED. `session.active` still says `running`
+  while a worker waits for an answer, so blocked is derived, never read from `active` alone;
+* it is not in `session.active`: it is idle (its newest message is an `idle` one, or it has none yet);
+* the service does not answer: UNKNOWN. Never dead, never working: silence is not a state.
+
+This module reads nothing itself except through the client it is given, writes only its own records, and holds no password (the shared-password
+service client of the switchboard is the one that reaches the service). It is loaded by path (`load_agent_presence` in bin/fleet-switchboard).
+Python 3.9 standard library only.
+"""
+import json
+import os
+import re
+import stat
+import time
+from pathlib import Path
+
+WORKING, BLOCKED, IDLE, UNKNOWN = "working", "blocked", "idle", "unknown"
+STATES = (WORKING, BLOCKED, IDLE, UNKNOWN)
+RECORD_DIR = "headless"          # state-dir/headless/<name>.json, one private record per headless worker
+RECORD_MAX = 8192
+LOCAL = "local"                  # the record kind of a worker on this machine (the cloud lane's records say `cloud`)
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+LOOPBACK_URL_RE = re.compile(r"^http://(127\.0\.0\.1|\[::1\]):[0-9]{1,5}$")
+
+
+def state_of(active_entry, permissions, forms, last_message, reachable):
+    """`working`, `blocked`, `idle` or `unknown` for one session, exactly per the rule above.
+
+    `active_entry` is the session's entry in `session.active` (or None when it is not there), `permissions` and `forms` the lists the service gave
+    (None or empty for none), `last_message` the session's newest message (a dict with a `type`) or None, `reachable` False when the service did not
+    answer. A turn that is queued but has not started (the newest message is a user message) is working, not idle: something is about to run."""
+    if not reachable:
+        return UNKNOWN
+    if active_entry:
+        return BLOCKED if (permissions or forms) else WORKING
+    kind = last_message.get("type") if isinstance(last_message, dict) else None
+    if kind in (None, "idle"):
+        return IDLE
+    return WORKING if kind == "user" else IDLE
+
+
+def read_state(v2, session_id, active=None, last_message=None):
+    """(state, why) for `session_id`, read through `v2` (a client with `session_active`, `permission_list`, `form_list`). `active` is the dict
+    `session.active` returned this pass (one call serves every session); None reads it here. A V2 error other than 404 is `unknown`; a 404 is
+    `("missing", ...)`: the session is gone, which is not a state of a worker."""
+    try:
+        if active is None:
+            active = v2.session_active() or {}
+        entry = active.get(session_id) if isinstance(active, dict) else None
+        permissions = forms = None
+        if entry:   # the lists matter only while it runs: an idle session cannot be waiting for an answer
+            permissions, forms = v2.permission_list(session_id), v2.form_list(session_id)
+        return state_of(entry, permissions, forms, last_message, True), None
+    except Exception as err:   # the client raises its own error type; this module does not import it
+        if getattr(err, "reason", None) == "http" and getattr(err, "status", None) == 404:
+            return "missing", "the session no longer exists"
+        return UNKNOWN, "the service did not answer (%s)" % str(err)[:80]
+
+
+# ---------------------------------------------------------------- the record of a headless worker
+
+def record_dir(state):
+    path = Path(state) / RECORD_DIR
+    if not path.is_dir():
+        path.mkdir(parents=True, mode=0o700, exist_ok=True)
+    found = os.lstat(str(path))
+    if stat.S_ISLNK(found.st_mode) or found.st_uid != os.getuid():
+        raise ValueError("the headless directory is not the user's own")
+    os.chmod(str(path), 0o700)
+    return path
+
+
+def valid_name(name):
+    return isinstance(name, str) and bool(NAME_RE.match(name))
+
+
+def record_path(state, name):
+    if not valid_name(name):
+        raise ValueError("not a worker name: %r" % (name,))
+    return record_dir(state) / (name + ".json")
+
+
+def save_record(state, name, session, url, now=None):
+    """Write the record of a headless worker (atomic, 0600): the cloud lane's field names, `kind` local. The url is where the service was when it was
+    launched (informational for a local worker: discovery asks the live service file)."""
+    if not isinstance(session, str) or not session.startswith("ses_") or len(session) > 128:
+        raise ValueError("not a session id")
+    if not isinstance(url, str) or not LOOPBACK_URL_RE.match(url):
+        raise ValueError("a local worker's url is plain http to a loopback address")
+    path = record_path(state, name)
+    body = {"worker": name, "url": url, "session": session, "kind": LOCAL, "created": int(now if now is not None else time.time())}
+    temp = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))
+    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(body, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.rename(str(temp), str(path))
+    except BaseException:
+        try:
+            os.unlink(str(temp))
+        except OSError:
+            pass
+        raise
+    return body
+
+
+def load_record(state, name):
+    """The record of `name`, or None when there is none or it is not a usable local record (never raises for a bad file)."""
+    try:
+        path = record_path(state, name)
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as handle:
+            found = os.fstat(handle.fileno())
+            if not stat.S_ISREG(found.st_mode) or found.st_uid != os.getuid() or found.st_mode & 0o077:
+                return None
+            raw = handle.read(RECORD_MAX + 1)
+        if len(raw) > RECORD_MAX:
+            return None
+        record = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, UnicodeError):
+        return None
+    if not isinstance(record, dict) or record.get("kind") != LOCAL or record.get("worker") != name:
+        return None
+    if not isinstance(record.get("session"), str) or not record["session"].startswith("ses_"):
+        return None
+    return record
+
+
+def list_records(state):
+    """Every usable local record, sorted by worker name ([] when the directory does not exist). Reads at most 200 files."""
+    base = Path(state) / RECORD_DIR
+    try:
+        names = sorted(p.stem for p in base.iterdir() if p.suffix == ".json" and valid_name(p.stem))[:200]
+    except OSError:
+        return []
+    return [r for r in (load_record(state, n) for n in names) if r is not None]
+
+
+def remove_record(state, name):
+    """Delete the record (a retired worker keeps none). True when one was there."""
+    try:
+        record_path(state, name).unlink()
+        return True
+    except (OSError, ValueError):
+        return False
