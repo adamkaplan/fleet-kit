@@ -11522,8 +11522,9 @@ class TestHeadlessPresence(Base):
         return sb.launch_headless(self.engine, **args)
 
     def test_launch_headless_creates_the_session_and_its_record_sends_the_brief_and_opens_no_terminal(self):
-        panes_before, calls_before = dict(self.world.herdr.panes), list(self.world.herdr.socket_calls)
+        panes_before, calls_before, sessions_before = dict(self.world.herdr.panes), list(self.world.herdr.socket_calls), set(self.world.v2.sessions)
         done = self.launch_hl()
+        self.assertEqual(set(self.world.v2.sessions) - sessions_before, {done["session"]}, "exactly one new session")
         self.assertEqual((done["name"], done["pane"], done["tab"], done["headless"]), ("hw", None, None, True))
         session = self.world.v2.sessions[done["session"]]
         self.assertEqual(session["metadata"]["fleet"], {"name": "hw", "role": "coder", "reports_to": "boss", "issue": 9, "headless": True})
@@ -11563,11 +11564,18 @@ class TestHeadlessPresence(Base):
         with self.assertRaises(sb.LaunchError) as raised:
             self.launch_hl(name="termworker")
         self.assertIn("in pane", str(raised.exception))
-        for bad in (dict(name="Bad Name"), dict(directory="relative/dir"), dict(agent=""), dict(name="switchboard")):
-            with self.assertRaises(sb.LaunchError, msg=bad):
+        for bad, fragment in ((dict(name="Bad Name"), "name must match"), (dict(directory="relative/dir"), "--dir must be an absolute path"),
+                              (dict(agent=""), "--agent is required"), (dict(name="switchboard"), "is reserved")):
+            with self.assertRaises(sb.LaunchError, msg=bad) as raised:
                 self.launch_hl(**dict(bad, name=bad.get("name", "other")))
+            self.assertIn(fragment, str(raised.exception), bad)
         self.assertEqual(sorted(p.stem for p in (Path(self.world.state) / "headless").glob("*.json")), ["hw"], "a refused launch writes no record")
-        with mock.patch.object(sb, "send_brief", side_effect=sb.V2Error("exit", None, "boom")):
+        real_prompt = sb.V2Client.prompt
+
+        def rejecting(self_, session_id, text, metadata=None, delivery=None, resume=None):
+            raise sb.V2Error("exit", None, "the service refused the prompt")
+
+        with mock.patch.object(sb.V2Client, "prompt", rejecting):
             with self.assertRaises(sb.LaunchError) as raised:
                 self.launch_hl(name="halfway")
         text = str(raised.exception)
@@ -11578,6 +11586,34 @@ class TestHeadlessPresence(Base):
         code, out, err = self.run_cli("launch", "again", "--agent", "coder", "--dir", str(self.home), "--headless", "--workspace", "w1")
         self.assertNotEqual(code, 0)
         self.assertIn("--headless opens no terminal", err)
+
+    def test_a_session_the_service_does_not_show_under_the_name_removes_the_record_and_two_launches_of_one_name_cannot_both_pass(self):
+        real_get = sb.V2Client.session_get
+        with mock.patch.object(sb.V2Client, "session_get", lambda self_, sid: dict(real_get(self_, sid), metadata={"fleet": {"name": "someone-else"}})):
+            with self.assertRaises(sb.LaunchError) as raised:
+                self.launch_hl(name="mismatch")
+        self.assertIn("does not show the new session as mismatch", str(raised.exception))
+        self.assertIn("the record was removed", str(raised.exception))
+        self.assertIsNone(self.ap.load_record(self.world.state, "mismatch"))
+        with sb.agent_lock(self.world.state, "busy", seconds=1):          # another launch of this name is in its locked step
+            with mock.patch.object(sb, "AGENT_LOCK_SECONDS", 0.2), self.assertRaises(sb.LaunchError) as raised:
+                inner = sb.agent_lock(self.world.state, "busy", seconds=0.2)
+                with mock.patch.object(sb, "agent_lock", lambda state, name: inner):
+                    self.launch_hl(name="busy")
+        self.assertIn("another launch or reattach of busy is running", str(raised.exception))
+        self.assertIsNone(self.ap.load_record(self.world.state, "busy"))
+
+    def test_the_service_url_is_read_from_a_private_service_file_and_never_includes_the_password(self):
+        service = self.home / "service" / "service.json"
+        service.parent.mkdir(mode=0o700)
+        service.write_text(json.dumps({"url": "http://127.0.0.1:49374", "password": "s3cret-value", "pid": os.getpid()}))
+        service.chmod(0o600)
+        http = sb.V2Http(service, 5)
+        self.assertEqual(http.base_url(), "http://127.0.0.1:49374")
+        self.assertNotIn("s3cret", http.base_url())
+        service.chmod(0o644)
+        self.assertIsNone(sb.V2Http(service, 5).base_url(), "a service file others can read is not trusted: no url")
+        self.assertIsNone(sb.V2Http(self.home / "nowhere.json", 5).base_url())
 
     def test_the_headless_service_url_is_recorded_when_the_service_file_is_readable_and_never_a_password(self):
         with mock.patch.object(sb.V2Client, "service_url", lambda self_: "http://127.0.0.1:49374"):

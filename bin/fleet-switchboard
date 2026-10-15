@@ -5813,40 +5813,48 @@ def launch_headless(engine, name, agent, directory, role=None, reports_to=None, 
 
     What differs from a terminal worker, and is said in the docs: its tools run in the SERVICE's environment, not in a pane's. There is no
     per-worker environment (no GH_TOKEN of its repo's account, no view variables); it is identified by the OPENCODE_SESSION_ID the service sets for
-    its tools, and the gh shim picks its account from the session's stored repo."""
+    its tools, and the gh shim picks its account from the session's stored repo. Only `cmd_launch` calls this, after the lane-name guard, the agent
+    check and the gate probe."""
     problems = launch_problems(name, agent, directory, None, issue, charter, headless=True)
     if problems:
         raise LaunchError("; ".join(problems))
     if engine.state_dir is None:
         raise LaunchError("no state directory: a headless worker needs its record")
-    taken = engine.discover(engine.now()).agents.get(name)
-    if taken is not None:
-        raise LaunchError("a fleet agent named %s already exists (%s)" % (name, "headless" if taken.headless else "in pane %s" % taken.pane))
-    ap = load_agent_presence()
-    if ap.read_record(engine.state_dir, name)[0] is not None:
-        raise LaunchError("a headless record for %s already exists: `%s retire %s` first, or pick another name" % (name, PROG, name))
-    accounts = getattr(engine, "accounts", None)
-    if repo and accounts is not None:
-        problem = launch_account_problem(engine.config, accounts, repo)
-        if problem:
-            raise LaunchError(problem)
-    fleet = fleet_record(name, role, reports_to, issue, charter, repo)
-    fleet["headless"] = True
-    with engine._external("v2.session.create", name, {"agent": agent, "directory": directory, "fleet": fleet, "headless": True}) as result:
-        session_id = engine.v2.session_create(agent, name, directory, {"fleet": fleet})["id"]
-        result["session"] = session_id
     try:
-        ap.save_record(engine.state_dir, name, session_id, engine.v2.service_url(), now=engine.now())
-        info = engine.v2.session_get(session_id) or {}
-        if ((_fleet_meta(info) or {}).get("name")) != name:
-            raise LaunchError("the service does not show the new session as %s: nothing was sent" % name)
-        if brief:
-            send_brief(engine, name, session_id, brief)
-    except Exception as err:
-        raise LaunchError("%s (session %s was created and its record kept, so `%s status` shows it: send it its brief with `%s send`, or `%s retire %s`)" % (
-            _one_line(str(err)), session_id, PROG, PROG, PROG, name)) from err
-    if engine.audit is not None:
-        engine.audit.append(engine.actor, "headless.launched", name, {"session": session_id, "agent": agent, "directory": _one_line(directory, 160), "brief_chars": len(brief or "")})
+        with agent_lock(engine.state_dir, name):   # the name check, the session create and the record write are ONE step: two launches of one name cannot both pass
+            taken = engine.discover(engine.now()).agents.get(name)
+            if taken is not None:
+                raise LaunchError("a fleet agent named %s already exists (%s)" % (name, "headless" if taken.headless else "in pane %s" % taken.pane))
+            ap = load_agent_presence()
+            if ap.read_record(engine.state_dir, name)[0] is not None:
+                raise LaunchError("a headless record for %s already exists: `%s retire %s` first, or pick another name" % (name, PROG, name))
+            accounts = getattr(engine, "accounts", None)
+            if repo and accounts is not None:
+                problem = launch_account_problem(engine.config, accounts, repo)
+                if problem:
+                    raise LaunchError(problem)
+            fleet = fleet_record(name, role, reports_to, issue, charter, repo)
+            fleet["headless"] = True
+            with engine._external("v2.session.create", name, {"agent": agent, "directory": directory, "fleet": fleet, "headless": True}) as result:
+                session_id = engine.v2.session_create(agent, name, directory, {"fleet": fleet})["id"]
+                result["session"] = session_id
+            try:
+                ap.save_record(engine.state_dir, name, session_id, engine.v2.service_url(), now=engine.now())
+                info = engine.v2.session_get(session_id) or {}
+                if ((_fleet_meta(info) or {}).get("name")) != name:
+                    ap.remove_record(engine.state_dir, name)
+                    raise LaunchError("the service does not show the new session as %s: nothing was sent and the record was removed (session %s was created)" % (name, session_id))
+                if brief:
+                    send_brief(engine, name, session_id, brief)
+            except LaunchError:
+                raise   # the name mismatch above: already said, and its record removed
+            except Exception as err:
+                raise LaunchError("%s (session %s was created and its record kept, so `%s status` shows it: send it its brief with `%s send`, or `%s retire %s`)" % (
+                    _one_line(str(err)), session_id, PROG, PROG, PROG, name)) from err
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "headless.launched", name, {"session": session_id, "agent": agent, "directory": _one_line(directory, 160), "brief_chars": len(brief or "")})
+    except ImpactStateBusy:
+        raise LaunchError("another launch or reattach of %s is running: wait for it" % name) from None
     register_launch_worktree(engine, name, directory, repo)
     return {"name": name, "session": session_id, "pane": None, "tab": None, "headless": True}
 
@@ -6599,7 +6607,7 @@ def cmd_retire(args, runner, now):
     if engine.audit is not None:
         engine.audit.append(engine.actor, "fleetpane.retired", name, {"auto": False, "reason": retired[name]["reason"], "by": retired[name]["by"]})
     if close_note is not None:
-        print("%s is retired: not watched, not reattached by --all-detached; %s (`%s retire --undo %s` reverses the retirement)" % (name, close_note, PROG, name))
+        print("%s is retired: not watched, not reattached by --all-detached; %s. Its session keeps running in the service until it finishes or is interrupted (`%s retire --undo %s` reverses the retirement)" % (name, close_note, PROG, name))
     elif close_pane is not None:
         line, _ = retire_close_pane(engine, runner, now, name, close_pane, close_by, getattr(args, "force", False))
         print("%s is retired: not watched, not reattached by --all-detached; %s (`%s retire --undo %s` reverses the retirement)" % (name, line, PROG, name))
