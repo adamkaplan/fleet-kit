@@ -12804,6 +12804,12 @@ def _validate_github(config, source):
             for k, v in users.items()):
         raise ConfigError("%s: 'gh_users' must map \"owner/repo\" or \"owner/*\" to a gh account name, got %r"
                           % (source, users))
+    seen_keys = {}
+    for key, account in users.items():
+        same = GhAccounts.normal_repo(key)
+        if same in seen_keys and seen_keys[same][1].lower() != account.lower():   # GitHub names are not case sensitive: two spellings of one repo may not name two accounts
+            raise ConfigError("%s: 'gh_users' names %r and %r, the same repo, with different accounts (%s, %s)" % (source, seen_keys[same][0], key, seen_keys[same][1], account))
+        seen_keys.setdefault(same, (key, account))
     config["gh_users"] = dict(users)
     poll = config["github_poll_seconds"]
     if not _is_number(poll) or poll < GITHUB_POLL_MIN:

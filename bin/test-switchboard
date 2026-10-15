@@ -11676,6 +11676,10 @@ class TestHeadlessPresence(Base):
         done = self.launch_hl(name="free", repo="Other-Org/Thing")   # an unmapped repo still launches, whatever its case
         self.assertIn("gh_users has no entry for Other-Org/Thing", done["identity"])
         self.assertIn("it has no repo", self.launch_hl(name="norepo")["identity"], "no repo: nothing to map, so it acts as the service's own account, and says so")
+        with self.assertRaises(sb.ConfigError) as raised:   # two spellings of one repo may not name two accounts: refused when the config loads
+            sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh_users": {"Acme/Widget": "acct-ops", "acme/widget": "acct-two"}})
+        sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh_users": {"Acme/Widget": "acct-ops", "acme/widget": "ACCT-OPS"}})   # the same account twice is fine
+        self.assertIn("the same repo, with different accounts", str(raised.exception))
         accounts = self.engine.accounts
         self.assertEqual([accounts.account_for(r) for r in ("ACME/Widget", "acme/widget.git", "x/y", None, 5)], ["acct-ops", "acct-ops", None, None, None])
 
