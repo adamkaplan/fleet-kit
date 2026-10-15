@@ -11760,6 +11760,23 @@ class TestChatClearJudge(unittest.TestCase):
         for text in ("366 is good to go", "366 is good to go.", "#366 is good to go", "366 good to go", "ok to merge 366, thanks", "366 looks good, go ahead", "Please ship 366", "366 is cleared"):
             self.assertEqual(self.decide(text, jev)["action"], "clear", text)
 
+    def test_a_report_about_the_past_is_not_a_grant_only_a_present_state_or_an_instruction_clears(self):
+        jev = _StubJev({self.P366: 0.99})
+        past = ("366 was merged", "366 was good to go", "366 shipped", "366 released", "366 merged", "366 cleared yesterday", "366 was cleared", "366 were cleared", "366 has been cleared",
+                "366 had been approved", "366 already cleared", "366 got merged", "366 is done", "366 went out", "366 was good, go ahead", "cleared 366", "approved 366",
+                "last 366 good to go", "earlier 366 is good to go", "366 good to go yesterday", "366 is already good to go", "366 has been good to go", "366 was approved",
+                "I cleared 366", "I approved 366", "we shipped 366", "366 was released", "366 released yesterday", "366 would be good to go", "366 had good to go")
+        for text in past:
+            got = self.decide(text, jev)
+            self.assertNotEqual(got["action"], "clear", text)
+            if self.cc.CLEARISH.search(text):
+                self.assertEqual((got["action"], got["why"]), ("ask", "hedged"), text)
+        for text in ("366 is cleared", "366 cleared", "clear 366", "366 is approved", "366 approved", "approve 366", "ship 366", "release 366", "merge 366", "366 is good to go",
+                     "366 also good to go", "#366 is cleared.", "ok to merge 366", "go ahead ship 366", "please clear 366"):
+            self.assertEqual(self.decide(text, jev)["action"], "clear", text)
+        for word in ("was", "were", "had", "has", "have", "been", "got", "already", "merged", "shipped", "released", "done", "went", "yesterday", "earlier", "last"):
+            self.assertNotIn(word, self.cc.PLAIN_WORDS, word)
+
     def test_a_bad_nan_boolean_or_lower_bar_is_the_floor_and_the_bar_can_only_be_raised(self):
         for bar in (None, "x", [], float("nan"), True, 2, -1, 0, 0.1, 0.9, float("inf")):
             jev = _StubJev({self.P366: 0.85, "asks": 0.15})
@@ -11825,7 +11842,7 @@ class TestChatClearJudge(unittest.TestCase):
                      "366 good to go \uff15", "366 \u0663 good to go"):
             got = self.decide(text, jev)
             self.assertEqual((got["action"], got["why"]), ("ask", "hedged"), text)
-        for text in ("366 is good to go", "366 is good to go!", "ok to merge #366, thanks.", "Ship 366 now", "366 was approved", "366 good to go"):
+        for text in ("366 is good to go", "366 is good to go!", "ok to merge #366, thanks.", "Ship 366 now", "366 is approved", "366 good to go"):
             self.assertEqual(self.decide(text, jev)["action"], "clear", text)
         self.assertEqual(self.decide(None, jev)["action"], "none", "a non-string message is read as empty: no clearing words, nothing")
         # a judge answer that is not validated can never say "not about clearing": the owner is still asked

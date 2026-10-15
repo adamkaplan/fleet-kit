@@ -351,8 +351,12 @@ def timing_problem(offer, created, now):
     return None
 
 
-PLAIN_WORDS = frozenset(("a also ahead approve approved are be clear cleared fine go goes going good i is it lgtm looks merge merged ok okay pr please ready release released s "
-                         "ship shipped thank thanks the through to was you now for with then").split())
+PLAIN_WORDS = frozenset(("a also ahead approve approved are be clear cleared fine go goes going good i is it lgtm looks merge ok okay pr please ready release "
+                         "s ship thank thanks the through to you now for with then").split())
+# Past-tense and report words are NOT in the list (was, were, had, has, been, got, already, merged, shipped, released, done, went, yesterday, earlier, last ...): a message
+# about the past is a report, not a grant. `cleared` and `approved` are the owner's own grant words ("366 cleared", "366 is approved"), so they are allowed ONLY as a
+# state AFTER the number: "cleared 366" and "approved 366" read as a report of what was done, and are refused.
+PARTICIPLES = frozenset(("cleared", "approved"))
 LETTERS = re.compile(r"[^\W\d_]+", re.UNICODE)
 
 
@@ -362,7 +366,7 @@ PRONOUNS = frozenset(("it", "you", "i", "we", "they"))          # "366 is it goo
 
 
 def _plain_clearing(text):
-    """True only when the message is a plain clearing sentence: every WORD is in the short allow-list (the number and the marks `#.,!` aside), nothing else but ASCII digits,
+    """True only when the message is a plain, PRESENT-TENSE clearing sentence: every WORD is in the short allow-list (the number and the marks `#.,!` aside), nothing else but ASCII digits,
     letters and white space appears (no emoji, no `/s`, no apostrophe form such as "isn't" or "isn\u2019t", no dash, colon, `?` or non-ASCII digit), and no question
     opener (`is`, `was`, `are`, `be`) except as the word DIRECTLY after the number and not followed by a pronoun ("366 is good to go" is a statement; "is 366 good to go",
     "366, is it good to go" and "366 is it good to go" are questions without a question mark). Anything else is not plain, whatever a judge would say: the
@@ -377,7 +381,7 @@ def _plain_clearing(text):
         return not any(word.lower() in QUESTION_OPENERS for word in words)
     before = LETTERS.findall(text[:first.start()])
     after = LETTERS.findall(text[first.end():])
-    if any(word.lower() in QUESTION_OPENERS for word in before):
+    if any(word.lower() in QUESTION_OPENERS or word.lower() in PARTICIPLES for word in before):
         return False
     gap = text[first.end():]
     direct = bool(after) and re.match(r"^\s*" + re.escape(after[0]), gap) is not None   # the first word after the number follows it with nothing but space between
