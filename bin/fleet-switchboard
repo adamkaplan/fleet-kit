@@ -15146,11 +15146,21 @@ def cmd_launch(args, runner, now, socket_call=None):
             if engine.audit is not None:
                 engine.audit.append(engine.actor, "fleetpane.reattach_refused", args.name, {"why": _one_line(who, 160), "via": "launch --resume"})
             raise LaunchError("refused: %s" % who)
+        resume_brief, brief = load_module("resume_brief"), None
+        if args.brief_file is not None:   # read AFTER the repo and caller checks and BEFORE any pane opens: a bad brief opens nothing
+            try:
+                brief = resume_brief.read(read_brief, args.brief_file, sys.stdin)
+            except resume_brief.BriefRefused as err:
+                sys.stderr.write("%s: launch --resume: %s; no pane was opened\n" % (PROG, _one_line(str(err), 300)))
+                return EXIT_USAGE
         try:
             with agent_lock(state, args.name):
                 done = resume_agent(engine, args.name, args.resume, workspace)
         except ImpactStateBusy:
             raise LaunchError("another reattach of %s is running: wait for it" % args.name) from None
+        if brief is not None:   # the pane is proven to run the session: the brief is sent once, and the output says it was
+            ns = types.SimpleNamespace(**{name: globals()[name] for name in resume_brief.NEEDS})
+            return resume_brief.deliver(ns, engine, done, brief, print, lambda text: sys.stderr.write(text + "\n"))
         print(json.dumps(done, sort_keys=True))
         return EXIT_OK
     if not args.agent or not args.dir:

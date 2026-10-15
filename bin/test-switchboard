@@ -5655,6 +5655,88 @@ class TestLaunch(Base):
         self.assertNotEqual(code, 0)
         self.assertIn("--agent and --dir", err.getvalue())
 
+    def cli_resume(self, session, *extra, stdin=None):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        with captured() as (out, err), mock.patch.object(sb.sys, "stdin", io.StringIO(stdin or "")):
+            code = sb.main(["launch", "platform", "--resume", session] + list(extra), runner=self.world.route,
+                           now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def briefs(self, session):
+        return [m for m in self.world.v2.sessions[session]["messages"] if m["type"] == "user"]
+
+    def brief_file(self, text, name="brief.md"):
+        path = self.home / name
+        path.write_text(text)
+        return str(path)
+
+    def test_s1_a_resume_with_a_brief_file_delivers_it_once_and_says_so(self):
+        session = self.gone()
+        code, out, err = self.cli_resume(session, "--brief-file", self.brief_file("Answer the new checkpoint\n"))
+        self.assertEqual(code, 0, err)
+        self.assertEqual([(m["text"], m["metadata"]) for m in self.briefs(session)],
+                         [("Answer the new checkpoint\n", {"fleet": {"from": "switchboard", "brief": True}})], "1 message to that agent")
+        self.assertEqual(json.loads(out)["brief"], "sent")
+        self.assertEqual(len(re.findall(r"\bsent\b", out + err)), 1, "the output says it was sent once")
+        self.assertIn("delivered to platform", err)
+
+    def test_s2_a_brief_on_standard_input_is_delivered_the_same_way(self):
+        session = self.gone()
+        code, out, err = self.cli_resume(session, "--brief-file", "-", stdin="From stdin\n")
+        self.assertEqual(code, 0, err)
+        self.assertEqual([m["text"] for m in self.briefs(session)], ["From stdin\n"])
+
+    def test_s3_a_failed_send_exits_1_and_says_the_pane_is_open_without_the_brief(self):
+        session = self.gone()
+        with mock.patch.object(sb, "send_brief", side_effect=sb.V2Error("http", "the service went away")):
+            code, out, err = self.cli_resume(session, "--brief-file", self.brief_file("Do it\n"))
+        self.assertEqual(code, 1)
+        self.assertEqual(err.count("without the brief"), 1)
+        self.assertIn("service went away", err)
+        self.assertEqual(json.loads(out)["brief"], "not sent")
+        self.assertEqual(self.world.herdr.closed, [], "the pane is not closed")
+        self.assertEqual(self.briefs(session), [])
+
+    def test_s4_an_empty_unreadable_or_oversize_brief_is_refused_before_any_pane_opens(self):
+        session = self.gone()
+        calls = len(self.world.herdr.socket_calls)
+        cases = (self.brief_file("  \n", "empty.md"), str(self.home / "nope.md"),
+                 self.brief_file("x" * (sb.load_module("resume_brief").BRIEF_MAX_CHARS + 1), "big.md"))
+        for path in cases:
+            with self.subTest(path=path):
+                code, _, err = self.cli_resume(session, "--brief-file", path)
+                self.assertEqual(code, 2)
+                self.assertIn("no pane was opened", err)
+        self.assertEqual(len(self.world.herdr.socket_calls), calls, "0 panes opened")
+        self.assertEqual(self.briefs(session), [])
+
+    def test_s5_a_different_repo_is_refused_first_and_no_message_is_sent(self):
+        session = self.gone()
+        self.world.v2.sessions[session]["metadata"]["fleet"]["repo"] = "acme/api"
+        code, _, err = self.cli_resume(session, "--repo", "acme/web", "--brief-file", self.brief_file("Do it\n"))
+        self.assertEqual(code, 1)
+        self.assertIn("differs from the session's stored repo", err)
+        self.assertEqual(self.briefs(session), [])
+
+    def test_s6_a_resume_without_a_brief_sends_nothing_and_prints_as_before(self):
+        session = self.gone()
+        code, out, err = self.cli_resume(session)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.briefs(session), [])
+        self.assertNotIn("brief", json.loads(out))
+        self.assertEqual(err, "")
+
+    def test_s7_the_audit_holds_the_length_of_the_brief_and_never_its_text(self):
+        session = self.gone()
+        secret = "very private words in a brief"
+        self.cli_resume(session, "--brief-file", self.brief_file(secret + "\n"))
+        entries = [json.loads(l) for l in self.world.audit_path.read_text().splitlines()]
+        sends = [e for e in entries if e["event"] == "v2.session.prompt" and e.get("phase") == "intent"]
+        self.assertEqual(len(sends), 1)
+        self.assertEqual((sends[0]["subject"], sends[0]["detail"]["brief_chars"]), ("platform", len(secret) + 1))
+        self.assertNotIn(secret, self.world.audit_path.read_text())
+
     def listing_runner(self, agents):
         """The world's runner, with `opencode api GET /api/agent` answering `agents` ({name: mode}); None: the service is not reachable."""
         def route(argv, **kwargs):
