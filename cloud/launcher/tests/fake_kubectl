@@ -36,7 +36,11 @@ elif cmd == "get" and args[1] == "pod":
     if args[2] not in st.get("pods", {}): missing('pods "%s"' % args[2])
     print(json.dumps(st["pods"][args[2]]))
 elif cmd == "get" and args[1] == "pods":
-    print(json.dumps({"items": list(st.get("pods", {}).values())}))
+    items = list(st.get("pods", {}).values())
+    if "-l" in args:  # honour a label selector `key=value`
+        k, v = args[args.index("-l") + 1].split("=", 1)
+        items = [p for p in items if p["metadata"].get("labels", {}).get(k) == v]
+    print(json.dumps({"items": items}))
 elif cmd == "annotate":
     pod = st["pods"][args[2]]
     for kv in args[4:]:
@@ -48,9 +52,9 @@ elif cmd == "delete":
     save()
 elif cmd == "exec":
     name, tool = args[1], args[3]
-    if tool == "fleet-worker-activity":
+    if tool == "cw-worker-activity":
         print(json.dumps(st["activity"][name]))
-    elif tool == "fleet-end-hook":
+    elif tool == "cw-end-hook":
         env = dict(os.environ, **st["hook_env"])
         p = subprocess.run([sys.executable, os.path.join(HERE, "..", "end_hook.py")], env=env, capture_output=True, text=True)
         sys.stdout.write(p.stdout)

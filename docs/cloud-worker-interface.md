@@ -20,34 +20,34 @@ One program, `cloud-worker <command>`; every command takes `--json` (one JSON ob
 
 Exit codes: `0` done; `1` the end hook could not push, **the pod is kept** (stop only); `2` bad usage or unknown worker;
 `3` the cloud refused (quota, identity, cap); `4` timed out waiting for the worker; `5` the spend cap is reached
-(create only; the cap is `FLEET_CLOUD_SPEND_CAP_USD`, default USD 25 when unset or empty, and an invalid value or an unreadable cost refuses the create); `6` refused: `delete` before the end hook ran without `--force`, or `extend` past `--max-hard`. Every other failure is `1` with a one-line reason on stderr.
+(create only; the cap is `CW_CLOUD_SPEND_CAP_USD`, default USD 25 when unset or empty, and an invalid value or an unreadable cost refuses the create); `6` refused: `delete` before the end hook ran without `--force`, or `extend` past `--max-hard`. Every other failure is `1` with a one-line reason on stderr.
 
-The launcher reaches the cluster with an explicit `--context` taken from `FLEET_KUBE_CONTEXT` (and `--kubeconfig` from `FLEET_KUBECONFIG` when set). With no context configured it refuses every command (exit `2`) and makes no call; it never uses the active context. A `create` that is interrupted or fails removes the Secret and pod it made, audits `create.interrupted` or `create.failed`, and names anything that could not be removed.
+The launcher reaches the cluster with an explicit `--context` taken from `CW_KUBE_CONTEXT` (and `--kubeconfig` from `CW_KUBECONFIG` when set). With no context configured it refuses every command (exit `2`) and makes no call; it never uses the active context. A `create` that is interrupted or fails removes the Secret and pod it made, audits `create.interrupted` or `create.failed`, and names anything that could not be removed.
 A command is idempotent: a repeated `stop` or `delete` of a worker that is gone exits `0`.
 
 ## 2. Worker environment (slices A and B)
 
 Injected at start, as environment variables (all non-secret):
-`FLEET_WORKER` (name), `FLEET_REPO`, `FLEET_BRANCH`, `FLEET_IDLE_SECONDS`, `FLEET_HARD_DEADLINE` (ISO UTC),
-`FLEET_TOKEN_ENDPOINT` (the URL where the worker mints a short-lived GitHub token, authenticated by the pod's federated
-identity), `FLEET_AUDIT_RUNTIME_ID`. The per-worker server password is the one value injected as a file
-(`/run/fleet/server-password`, mode 0600, from a cluster secret scoped to the pod), never as an environment variable.
+`CW_WORKER` (name), `CW_REPO`, `CW_BRANCH`, `CW_IDLE_SECONDS`, `CW_HARD_DEADLINE` (ISO UTC),
+`CW_TOKEN_ENDPOINT` (the URL where the worker mints a short-lived GitHub token, authenticated by the pod's federated
+identity), `CW_AUDIT_RUNTIME_ID`. The per-worker server password is the one value injected as a file
+(`/run/cw/server-password`, mode 0600, from a cluster secret scoped to the pod), never as an environment variable.
 
 **Never stored**, in the image, an environment variable, a file on the pod's disk beyond the password above, or a log:
 a personal access token, a cloud key or client secret, a registry password, a model API key. Tokens are minted at start
-and on demand from `FLEET_TOKEN_ENDPOINT`, live at most 60 minutes, and are held in memory or a tmpfs. Slice A ships a
+and on demand from `CW_TOKEN_ENDPOINT`, live at most 60 minutes, and are held in memory or a tmpfs. Slice A ships a
 scan that fails the image build when any stored credential, host key or build user is found.
 
 ## 3. Endpoint record and the switchboard mapping (slices B and C)
 
-Owned by the switchboard (slice C), in its state directory, mode 0600 (a JSON file per worker, path built only from the validated worker name). Slice B never touches the file: `create`, `extend`, `stop` and `delete` print their result and C applies it to the record. The record's deadlines are the source of truth; the pod's `FLEET_HARD_DEADLINE` is its start-time copy and the reaper re-reads the record.
+Owned by the switchboard (slice C), in its state directory, mode 0600 (a JSON file per worker, path built only from the validated worker name). Slice B never touches the file: `create`, `extend`, `stop` and `delete` print their result and C applies it to the record. The record's deadlines are the source of truth; the pod's `CW_HARD_DEADLINE` is its start-time copy and the reaper re-reads the record.
 
 ```json
 {"worker": "coder7", "url": "https://worker-coder7.example.internal:4096", "auth_ref": "file:<state>/cloud/coder7.password",
  "runtime_id": "pod/coder7-7f9c", "idle_deadline": "2026-10-14T12:10:00Z", "hard_deadline": "2026-10-14T14:00:00Z"}
 ```
 
-`auth_ref` names where the switchboard host keeps its own copy of the password (a file path the switchboard chooses itself under its state directory; whatever the launcher prints for it is ignored; it is never taken from caller input, mode 0600: it protects only against other local users); the record never holds it. The pod's copy (`/run/fleet/server-password`) is a separate file on the pod side. `create` returns the password once, on a file descriptor named in its output, for C to store. C creates the record from `create`'s output and removes it after `stop` or `delete`.
+`auth_ref` names where the switchboard host keeps its own copy of the password (a file path the switchboard chooses itself under its state directory; whatever the launcher prints for it is ignored; it is never taken from caller input, mode 0600: it protects only against other local users); the record never holds it. The pod's copy (`/run/cw/server-password`) is a separate file on the pod side. `create` returns the password once, on a file descriptor named in its output, for C to store. C creates the record from `create`'s output and removes it after `stop` or `delete`.
 
 | Switchboard verb | On a cloud worker |
 |---|---|
@@ -82,10 +82,10 @@ A clean tree whose HEAD is already pushed pushes nothing and reports `pushed: fa
 
 ## 6. Idle and hard limit
 
-- **Idle** = no tool call and no model activity (a running session or step) for `FLEET_IDLE_SECONDS`. Inbound
+- **Idle** = no tool call and no model activity (a running session or step) for `CW_IDLE_SECONDS`. Inbound
   requests, health checks and event-stream reads do **not** count as activity: a worker that is only being watched is idle.
   A worker mid-task (a long build, a waiting model call) is not idle. The reaper reads this from the worker's own session state.
-- **Hard limit** = `FLEET_HARD_DEADLINE`, absolute. At the deadline the end hook runs and the pod is stopped,
+- **Hard limit** = `CW_HARD_DEADLINE`, absolute. At the deadline the end hook runs and the pod is stopped,
   whatever the activity. `extend` is the only way to move it; the reaper re-reads the record at each pass.
 - Both stops are checked at least every minute and take effect within 3 minutes of the limit (plan scenarios S2, S3).
 - **OPEN**: how a worker asks for its own extension (a command inside the pod, or only an operator).
