@@ -13028,7 +13028,7 @@ class TestClearMarker(Base):
         lines = self.clear()
         self.assertEqual(self.body, "MERGE: automatic\r\n\r\nPLAN: x\nMERGE: captain (quoted later)\n\ttail  \n")
         self.assertEqual(len(self.writes), 1)
-        self.assertTrue(any("MERGE: captain to MERGE: automatic" in l or "from MERGE: captain to MERGE: automatic" in l for l in lines), lines)
+        self.assertIn("changed the first line of the body of %s from MERGE: captain to MERGE: automatic" % self.PR, lines)
         self.assertNotIn(self.names["hold-impact"], self.labels)
 
     def test_s2_the_chat_clear_goes_through_the_same_shared_function(self):
@@ -13095,7 +13095,7 @@ class TestClearMarker(Base):
         self.assertEqual(sb.neutralise_marker(self.engine, self.route, self.REPO, 7, "c" * 40), [], "a head the owner did not clear is not touched")
         self.assertEqual(self.writes, [])
 
-    def test_a_failing_audit_after_the_write_never_fails_the_clear(self):
+    def test_a_failing_audit_after_the_write_never_fails_the_clear_and_says_what_is_true(self):
         real = self.engine.audit.append
 
         def append(actor, event, *rest, **kw):
@@ -13104,14 +13104,53 @@ class TestClearMarker(Base):
             return real(actor, event, *rest, **kw)
         self.engine.audit.append = append
         lines = self.clear()
-        self.assertTrue(any("marker line remains" in l for l in lines))
+        self.assertTrue(self.body.startswith("MERGE: automatic"))
+        self.assertNotIn(self.names["hold-impact"], self.labels)
+        self.assertEqual(self.events("gate.clear_marker"), [])
+        self.assertFalse(any("marker line remains" in l for l in lines), lines)
+        self.assertTrue(any("audit line of that change could not be written" in l for l in lines), lines)
+
+    def test_the_text_of_the_line_is_printed_as_one_line_without_control_characters(self):
+        self.body = "MERGE: captain\x1b[31m red\x07 bell\nrest\n"
+        lines = self.clear()
+        self.assertFalse(any(re.search(r"[\x00-\x08\x0b-\x1f\x7f]", l) for l in lines), lines)
+        self.assertTrue(self.body.startswith("MERGE: automatic\x1b[31m red"), "the body keeps its bytes: only the printed text is cleaned")
+
+    def test_a_head_that_moves_between_the_two_reads_and_a_write_that_does_not_stick_are_both_said(self):
+        real = sb.read_pr_json
+        count = {"n": 0}
+
+        def moving(*a, **k):
+            count["n"] += 1
+            raw = real(*a, **k)
+            if count["n"] == 2:
+                raw = dict(raw, headRefOid="d" * 40)
+            return raw
+        sb.read_pr_json = moving
+        self.addCleanup(setattr, sb, "read_pr_json", real)
+        lines = self.clear()
+        self.assertTrue(any("marker line remains" in l for l in lines), lines)
+        self.assertEqual(self.writes, [])
+        sb.read_pr_json = real
+        self.setUp()
+        route = self.route
+
+        def drops(argv, **kwargs):
+            if argv[1] == "api" and "PATCH" in argv:
+                return subprocess.CompletedProcess(argv, 0, "{}", "")   # said fine, never stored
+            return route(argv, **kwargs)
+        self.engine.gh_runner = drops
+        lines = sb.impact_clear_core(self.engine, drops, self.REPO, 7, "owner", "a false hold: it is a fixture")
+        self.assertTrue(any("marker line remains" in l and "read back" in l for l in lines), lines)
+        self.assertEqual(self.body, self.BODY)
 
     def test_the_marker_edit_is_pure_and_follows_the_gates_own_reading(self):
         for body in ("MERGE: captain", "  MERGE: captain: pending\nx", "\n\nMERGE: captain\r\nMERGE: captain\r\n"):
             new, before, after = sb.marker_edit(body)
             self.assertEqual(sb.pr_marker(new), "automatic", body)
             self.assertEqual(len(new.splitlines()), len(body.splitlines()))
-            self.assertEqual(sum(1 for a, b in zip(new, body) if a != b) > 0, True)
+            self.assertEqual(after, before.replace("MERGE: captain", "MERGE: automatic"))
+            self.assertEqual(new.replace("MERGE: automatic", "MERGE: captain", 1), body)
         self.assertIsNone(sb.marker_edit(None))
         self.assertFalse(sb.pr_marker_state([], sb.marker_edit("MERGE: captain\n")[0], now=0)["captain"])
 

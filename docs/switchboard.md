@@ -4343,7 +4343,7 @@ The merge gate reads a pull request as held from its merge label, and, with no m
 
 - **Only that line.** Every other byte of the body stays, a later line quoting the marker included. A body whose first line is anything else is not written.
 - **Only his clear, only that head.** The body is read fresh for the head he cleared (any other head: nothing), read again just before the write and written only if it is the same, then read back. A carry of a clear to a new head (#510) never touches the body, and the line stays neutral.
-- **Said and logged.** `gate.clear_marker` holds the head and the line before and after.
+- **Said and logged.** `gate.clear_marker` holds the head and the line before and after (the author's text with control characters replaced, in the output too). The write is best effort: GitHub has no conditional body write, so an edit landing between the last read and the write is not detected (the read-back says if the body is not what was written).
 - **A failure never undoes the clear.** If the body cannot be read, written, or changed meanwhile, the output says `marker line remains: ... edit it by hand` and `gate.clear_marker_failed` says why.
 
 ### Clearing a hold by saying so in the chat (#457)
