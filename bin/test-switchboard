@@ -29323,7 +29323,7 @@ class TestCommissioningDocs(unittest.TestCase):
         self.assertIn("fleet-switchboard orders copy --source <old charter> --charter <new charter>", step, "the copy step names the source")
         self.assertIn("word for word", step)
         self.assertIn("never add one the sibling does not hold", step.replace("\n         ", " "))
-        for pattern in (r"\bgrant", r"\bauthori[sz]", r"\bmay (merge|approve|deploy|decide)", r"\bpermission", r"\bis allowed to"):
+        for pattern in (r"\bgrant", r"\bauthori[sz]", r"\bmay (merge|approve|deploy|decide)", r"\bis allowed to", r"\byou (may|can) (approve|merge|deploy|decide)"):   # "permissions allow" is a limit on the Chief of Staff, not a grant to anyone
             self.assertIsNone(re.search(pattern, section, re.I), "0 sentences grant an authority: %s" % pattern)
 
     def test_s18_the_checkpoint_form_is_what_launch_parses_and_the_handover_template_has_six_sections(self):
