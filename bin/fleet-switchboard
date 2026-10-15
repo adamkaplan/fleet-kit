@@ -455,7 +455,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "temp_janitor", "load_alert", "spotlight_guard", "excluded_repos"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "temp_janitor", "load_alert", "spotlight_guard", "excluded_repos", "source_budgets"}
 
 
 def config_known_keys():
@@ -567,6 +567,7 @@ def validate_config(raw, source="config"):
     validate_external_config(config, source)
     validate_friction_config(config, source)
     validate_load_alert_config(config, source)
+    validate_source_budgets(config, source)   # #494
     validate_worktree_config(config, source)
     validate_orphan_config(config, source)
     validate_order_burst(config, source)
@@ -12774,7 +12775,7 @@ GITHUB_BODY_LIMIT = 5 * 1024 * 1024
 GITHUB_QUEUE_LIMIT = 2000
 GITHUB_ROUTE_SECONDS = 5       # per pass: the time routing may spend on `gh api` lookups; the rest waits a pass
 GITHUB_ROUTE_READ_TIMEOUT = 8  # seconds for one such lookup
-GITHUB_CATCHUP_SECONDS = 90    # per catch-up: after this the remaining reads are left to the next one
+GITHUB_CATCHUP_STUCK_PASSES = 3   # #494: a catch-up that stopped this many passes in a row is said in `status`, not silently starved
 GITHUB_CATCHUP_ITEMS = 500     # items one catch-up keeps (the newest)
 GITHUB_SUBREAD_TIMEOUT = 10    # seconds for a secondary read (reviews, check suites, workflow runs)
 GITHUB_READ_BACKOFF = 600      # a secondary read that failed is not tried again for this long
@@ -13404,6 +13405,7 @@ class GitHubHub:
         self._notices, self._filtered, self._filtered_batch = {}, set(), []   # PR 52
         self._routed_batch, self._conflicts = [], set()
         self.markers, self._markers_dirty, self.last_truncated = self._load_markers(), False, {}
+        self._cursors, self.last_incomplete, self.last_failed_primary = {}, False, False   # #494: per repo, the steps of an unfinished catch-up window
         self.engine = None
         self.intent_verdicts = {}  # intent.edit key -> (wakes the Chief of Staff, why): decided once per edit
         self.intent_edits = {}  # intent.edit key -> the `issues` payload, until delivered (PR 6's item, wired here)
@@ -13755,6 +13757,7 @@ class GitHubHub:
             for repo in joined:
                 self.watches[repo] = Watch(repo)
             gone = [(repo, self.watches.pop(repo)) for repo in left]
+            self.prune_cursors()
         for repo in joined:
             self._audit("github.watch", repo, {"state": "joined"})
         for repo, watch in gone:
@@ -13762,6 +13765,13 @@ class GitHubHub:
                 _terminate(watch.proc)
             watch.proc = watch.secret = None
             self._audit("github.watch", repo, {"state": "left"})
+
+    def prune_cursors(self):
+        """#494: the cursor of an unfinished catch-up belongs to a repo that is watched NOW and not excluded: a repo that left the watched set (or was
+        excluded since) loses it, so it never shows as catching up and never causes a read, and a repo that joins again starts a fresh window. The caller holds the lock."""
+        exclusion = load_module("repo_exclusion")
+        for repo in [r for r in self._cursors if r not in self.watches or exclusion.is_excluded(self.config, r)]:
+            del self._cursors[repo]
 
     def facts(self):
         """Every queued item that has an owner now, as Facts. Expired items are dropped."""
@@ -14164,69 +14174,92 @@ class GitHubHub:
         except ValueError:
             raise GitHubUnavailable("gh api %s answered something that is not JSON" % path.split("?")[0]) from None
 
-    def catch_up_items(self, repo, now, since_epoch=None):
+    def catch_up_items(self, repo, now, since_epoch=None, cursor=None):
         """The items for everything that changed on `repo` since now - look-back (or `since_epoch`, a later
         time, for a poll that asks only for what is new), keyed exactly as the webhooks are. Returns
-        (items, errors): one read failing does not stop the others."""
+        (items, errors): one read failing does not stop the others.
+
+        #494: the reads are steps in a fixed order (comments, issues, pulls, then each pull's reviews and check suites, then the workflow runs).
+        `cursor` (a dict, filled in here) remembers which steps are done: when the time budget of the catch-up is spent, or a primary read fails,
+        the catch-up stops at that step with `self.last_incomplete` set, and a call with the same cursor continues from it: no step is read twice
+        and no step is skipped. A secondary read that fails is best effort (done, as it always was); one the budget stopped is NOT done."""
         since, items, errors, pulls = iso(since_epoch if since_epoch is not None else now - self.lookback), [], [], []
         started, bounded, capped = self.now(), not fault("catch-up-blocks-pass"), []
+        if cursor is None:
+            cursor = {}
+        done = cursor.setdefault("done", set())
+        commented = cursor.setdefault("commented", {})
+        pulls = cursor.setdefault("pulls", [])
+        seconds = source_budget_seconds(self.config, "catch_up")
+        stopped, failed = [], []   # `stopped`: the budget is spent, no later step runs in this call; `failed`: a primary read that did not answer (later steps still run)
 
-        def read(name, path, key=None, older=None):
+        def read(key, name, path, rkey=None, older=None):
+            """The records of one step, or None when the step is done already or could not run now (the budget is spent, or a primary read failed)."""
+            if key in done or stopped:
+                return None
             secondary = name in SECONDARY_READS
             until = self._read_backoff.get((repo, name))
             if bounded and until is not None and self.now() < until:
+                done.add(key)
                 return []  # it was reported when it failed; it is not tried, or reported, again until the backoff ends
-            if bounded and self.now() - started >= GITHUB_CATCHUP_SECONDS:
-                errors.append("%s: left to the next catch-up (this one spent its %ds)" % (name, GITHUB_CATCHUP_SECONDS))
-                return []
+            if bounded and seconds and self.now() - started >= seconds:
+                errors.append("%s: left to the next catch-up (this one spent its %ds)" % (name, seconds))
+                stopped.append(name)
+                return None
             try:
-                records, truncated = self.read_pages(path, key, GITHUB_SUBREAD_TIMEOUT if secondary and bounded else None,
+                records, truncated = self.read_pages(path, rkey, GITHUB_SUBREAD_TIMEOUT if secondary and bounded else None,
                                                      older)
                 if truncated:
                     capped.append(name)
+                done.add(key)
                 return records
             except GitHubUnavailable as err:
                 errors.append("%s: %s" % (name, err))
-                if secondary and bounded:
-                    self._read_backoff[(repo, name)] = self.now() + GITHUB_READ_BACKOFF
-                return []
+                if secondary:
+                    if bounded:
+                        self._read_backoff[(repo, name)] = self.now() + GITHUB_READ_BACKOFF
+                    done.add(key)   # best effort: a secondary read is not read again for a window it missed
+                    return []
+                failed.append(name)   # a primary read that failed: the catch-up goes on from this step next time; the other steps still run
+                return None
 
         def fresh(record, field="updated_at"):
             return isinstance(record.get(field), str) and record[field] >= since
 
         base = "repos/%s/" % repo
-        comments = [c for c in read("comments", base + "issues/comments?since=%s&per_page=%d" % (since, GITHUB_PAGE_SIZE)) if fresh(c)]
-        commented = {}
-        for comment in comments:
+        found = read("comments", "comments", base + "issues/comments?since=%s&per_page=%d" % (since, GITHUB_PAGE_SIZE))
+        for comment in [c for c in found or [] if fresh(c)]:
             number = _url_number(comment.get("issue_url"))
             commented[number] = max(commented.get(number, ""), comment["updated_at"])
             items.append(_comment_item(repo, comment, None, now))
-        for issue in read("issues", base + "issues?state=all&since=%s&per_page=%d" % (since, GITHUB_PAGE_SIZE)):
+        for issue in read("issues", "issues", base + "issues?state=all&since=%s&per_page=%d" % (since, GITHUB_PAGE_SIZE)) or []:
             if _is_pr(issue) or not fresh(issue):
                 continue
             if issue["updated_at"] <= commented.get(_number(issue), ""):
                 continue  # a comment bumped it; the comment is the news
             items.append(_issue_item(repo, issue, now))
-        for pr in read("pulls", base + "pulls?state=all&sort=updated&direction=desc&per_page=%d" % GITHUB_PAGE_SIZE,
-                       older=("updated_at", since)):
-            if fresh(pr):
-                pulls.append(pr)
-                items.append(_pr_item(repo, pr, now))
-                items.append(_pr_conflict(repo, pr, now))
-        for pr in pulls:
+        found = read("pulls", "pulls", base + "pulls?state=all&sort=updated&direction=desc&per_page=%d" % GITHUB_PAGE_SIZE,
+                     older=("updated_at", since))
+        for pr in [x for x in found or [] if fresh(x)]:
+            pulls.append(pr)
+            items.append(_pr_item(repo, pr, now))
+            items.append(_pr_conflict(repo, pr, now))
+        for pr in list(pulls):
             number = _number(pr)
-            for review in read("reviews", base + "pulls/%d/reviews?per_page=100" % number):
+            for review in read(("reviews", number), "reviews", base + "pulls/%d/reviews?per_page=100" % number) or []:
                 if fresh(review, "submitted_at"):
                     items.append(_review_item(repo, review, pr, now))
             sha = (pr.get("head") or {}).get("sha")
-            for suite in read("check suites", base + "commits/%s/check-suites?per_page=100" % sha,
-                              "check_suites") if sha else []:
+            for suite in (read(("checks", number), "check suites", base + "commits/%s/check-suites?per_page=100" % sha,
+                               "check_suites") if sha else []) or []:
                 if fresh(suite):
                     items.append(_check_item(repo, dict(suite, pull_requests=suite.get("pull_requests") or [
                         {"number": number}]), now, "", "check suite"))
-        for run in read("workflow runs", base + "actions/runs?per_page=%d" % GITHUB_PAGE_SIZE, "workflow_runs"):
+        for run in read("runs", "workflow runs", base + "actions/runs?per_page=%d" % GITHUB_PAGE_SIZE, "workflow_runs") or []:
             if fresh(run):
                 items.append(_check_item(repo, run, now, "run-", "workflow %s" % (run.get("name") or "run")))
+        self.last_failed_primary = bool(failed)
+        self.last_incomplete = bool(stopped or failed)   # #494: a step is still to do: the caller keeps the cursor and the marker where they are
         items = [item for item in items if item is not None]
         skipped = 0
         if bounded and len(items) > GITHUB_CATCHUP_ITEMS:
@@ -14245,7 +14278,9 @@ class GitHubHub:
         repo = watch.repo
         with self.lock:
             marker = self.markers.get(repo)
-        items, errors, self.last_truncated = [], [], {}
+            self.prune_cursors()   # a stale cursor of a repo no longer watched (or excluded) is never read from
+        items, errors, self.last_truncated, self.last_incomplete, self.last_failed_primary = [], [], {}, False, False
+        cursor = self._cursors.get(repo)   # #494: the steps an earlier call of this catch-up finished: they are not read again
         fresh_start = marker is None and not fault("catch-up-on-fresh-start")
         if not fresh_start:
             floor, slack = now - self.lookback, (2 * self.config["github_poll_seconds"] if polled else GITHUB_MARKER_SLACK)
@@ -14255,13 +14290,25 @@ class GitHubHub:
                 if marker is not None and marker < floor:
                     self._audit("github.catch_up.skipped", repo, {"marker": iso(marker), "reads_from": iso(floor),
                                                                    "why": "older than the look-back: older events were skipped"})
-            items, errors = self.catch_up_items(repo, now, start)
-        primary_failed = any(e.split(":")[0] not in SECONDARY_READS for e in errors)
-        problem = self.read_awaiting(repo, now)  # PR 14: current state, not events: read on a fresh start too
+            if cursor is None:
+                cursor = self._cursors[repo] = {"since_epoch": start, "until": now, "stops": 0}   # the window is fixed until it is read whole
+            items, errors = self.catch_up_items(repo, now, cursor["since_epoch"], cursor)
+        incomplete = self.last_incomplete
+        primary_failed = self.last_failed_primary   # a primary read that did not answer (a budget stop is not a failure)
+        stopped_by_time = incomplete and not primary_failed
+        problem = None if stopped_by_time else self.read_awaiting(repo, now)  # PR 14: current state, not events: read on a fresh start too (once the window is read: not again on every resume)
         if problem:
             errors.append(problem)
-        if not primary_failed:
-            self._set_marker(repo, now)
+        if cursor is not None and stopped_by_time:   # #494: stopped by the budget part way: the marker stays, the cursor keeps what was read, the rest is read next time
+            cursor["stops"] += 1
+            if cursor["stops"] >= GITHUB_CATCHUP_STUCK_PASSES:
+                errors.append("catch-up not finished after %d passes (the window since %s is still being read)" % (cursor["stops"], iso(cursor["since_epoch"])))
+        elif primary_failed:
+            self._cursors.pop(repo, None)   # a read that did not answer: the window is read again whole from the marker, as it always was
+        else:
+            # the whole window was read: the marker moves over it, never past it (a window read over several calls: to where its first call began, which no step is older than)
+            self._set_marker(repo, cursor["until"] if cursor is not None and cursor["stops"] else now)
+            self._cursors.pop(repo, None)
         self.enqueue(items)
         said = "; ".join(errors) if errors else None
         with self.lock:
@@ -14270,6 +14317,8 @@ class GitHubHub:
             watch.catch_up_error = said
             retry = now + GITHUB_LOOKUP_RETRY
             watch.catchup_at = retry if (primary_failed or problem) and not polled else None  # best-effort reads are not retried
+            if incomplete and not primary_failed:
+                watch.catchup_at = now   # #494: only the time budget stopped it: the next pass goes on at once
         if self.last_truncated:
             self._audit("github.catch_up.truncated", repo, dict(self.last_truncated, marker_advanced=not primary_failed))
         if not polled or changed:  # a quiet poll every minute is not worth an audit line
@@ -14290,7 +14339,16 @@ class GitHubHub:
                     watch.last_error = self.accounts.scrub(_scrub(_one_line(str(err)), watch.secret))
                 self._audit("github.error", watch.repo, {"error": watch.last_error})
         self._save_markers()
+        engine = getattr(self, "engine", None)
+        if engine is not None:
+            set_source_state(engine, "catch_up", self.catching_up())
         self._write_snapshot(now)
+
+    def catching_up(self):
+        """#494: the repos whose catch-up window is not read whole yet, each with the passes it has taken ([] when every catch-up is done)."""
+        with self.lock:
+            self.prune_cursors()   # only repos watched now and not excluded
+            return ["%s (%d pass%s)" % (repo, c.get("stops", 0), "" if c.get("stops", 0) == 1 else "es") for repo, c in sorted(self._cursors.items())]
 
     def _tick_watch(self, watch, now):
         if self.watches.get(watch.repo) is not watch:
@@ -23423,6 +23481,55 @@ def load_fleet_health():
     return load_module("fleet_health")
 
 
+# ---- #494: a time budget for each heavy reader that had none, so a restart under load cannot hold a pass for minutes. The reader checks the
+# budget BETWEEN calls (no thread, no process), stops at a safe point and finishes over the following passes; 0 means no limit.
+SOURCE_BUDGET_DEFAULTS = {"load_alert": 20, "charters": 15, "catch_up": 90}   # seconds a pass; catch_up's default is the bound it always had
+
+
+def validate_source_budgets(config, source):
+    """`source_budgets`: absent is the defaults; an object of {load_alert, charters, catch_up} seconds (a number, 0 = no limit)."""
+    raw = config.get("source_budgets")
+    if raw is None:
+        return
+    if not isinstance(raw, dict):
+        raise ConfigError("%s: 'source_budgets' must be an object, got %r" % (source, type(raw).__name__))
+    unknown = sorted(set(raw) - set(SOURCE_BUDGET_DEFAULTS))
+    if unknown:
+        raise ConfigError("%s: 'source_budgets' has no key %s (it has %s)" % (source, ", ".join(repr(k) for k in unknown), ", ".join(SOURCE_BUDGET_DEFAULTS)))
+    for key, value in raw.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 3600:
+            raise ConfigError("%s: 'source_budgets.%s' must be a number of seconds from 0 (no limit) to 3600, got %r" % (source, key, value))
+
+
+def source_budget_seconds(config, name):
+    """The seconds a pass may spend in the reader `name` (0: no limit); the default when the key is absent."""
+    raw = (config or {}).get("source_budgets")
+    value = raw.get(name) if isinstance(raw, dict) else None
+    return SOURCE_BUDGET_DEFAULTS[name] if value is None else value
+
+
+def set_source_state(engine, name, pending):
+    """What `name` still has to read (a list of short texts, [] when it is done), kept in memory for the status line of #494 slice 3:
+    {name: {"state": "pending"|"done", "pending": [...]}}. Never raises."""
+    engine.__dict__.setdefault("source_state", {})[name] = {"state": "pending" if pending else "done", "pending": list(pending)[:20]}
+
+
+def source_states(engine):
+    """{source: {"state", "pending"}} of the readers with a time budget, as last set (empty before their first pass)."""
+    return dict(getattr(engine, "source_state", None) or {})
+
+
+class SourceBudget:
+    """The time one reader has in this pass, checked between its calls: `spent()` is True once `seconds` have passed since it was made
+    (never when `seconds` is 0). It stops nothing by itself: the reader asks and stops at a safe point."""
+
+    def __init__(self, seconds, now):
+        self.seconds, self.now, self.started = seconds, now, now()
+
+    def spent(self):
+        return bool(self.seconds) and self.now() - self.started >= self.seconds
+
+
 def validate_load_alert_config(config, source):
     """`load_alert`: absent or null is off (the load figures are still kept and shown)."""
     if "load_alert" not in config:
@@ -23501,7 +23608,12 @@ def load_tick(engine, discovery):
             return sum(1 for call in snapshot() if call[0] > since and call[1] == account and not call[3])
         meter = {"account_of": accounts.describe, "paused": lambda repo: accounts.paused.get(accounts.describe(repo), 0) > now,
                  "begin_read": begin_read, "read_cost": read_cost}
-    return health.tick(health.Context(now=now, state_dir=engine.state_dir, cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, read_charters=read_charters, read_parent=read_parent, cos=cos, wake=wake, **meter))
+    budget = SourceBudget(source_budget_seconds(engine.config, "load_alert"), engine.now)   # #494: the reads stop between calls when this pass's time is spent
+    pending = []
+    sent = health.tick(health.Context(now=now, state_dir=engine.state_dir, cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, read_charters=read_charters, read_parent=read_parent, cos=cos, wake=wake,
+                                      time_up=budget.spent, pending=pending, **meter))
+    set_source_state(engine, "load_alert", pending)
+    return sent
 
 
 def cmd_load_replay(args, runner, now):
@@ -25413,6 +25525,7 @@ class OrdersFacts:
 
     def __init__(self):
         self.engine = None
+        self.cursor = None   # #494: the name of the first agent not read yet when a pass ran out of its time; None between cycles
 
     def bind(self, engine):
         self.engine = engine
@@ -25423,7 +25536,17 @@ class OrdersFacts:
         if engine is None or discovery is None:
             return []
         facts = []
-        for observation in sorted(discovery.agents.values(), key=lambda o: o.name):
+        budget = SourceBudget(source_budget_seconds(engine.config, "charters"), engine.now)
+        agents = sorted(discovery.agents.values(), key=lambda o: o.name)
+        if self.cursor is not None:   # a cycle that ran out of time continues with the agents it did not reach; the others were read in it already
+            agents = [o for o in agents if o.name >= self.cursor]
+        self.cursor, reached = None, 0
+        for index, observation in enumerate(agents):
+            if reached and budget.spent():   # at least one agent a pass, so a budget smaller than one read cannot starve the rest
+                self.cursor = observation.name
+                set_source_state(engine, "charters", [o.name for o in agents[index:]])
+                return facts
+            reached += 1
             if (observation.fleet or {}).get("role") == "chief-of-staff":  # PR 18: found by role, not by charter
                 if not observation.conflict and not observation.problem:
                     found = self.cos_fact(observation)
@@ -25448,6 +25571,7 @@ class OrdersFacts:
             facts.append(Fact(key, observation.name, ORDERS_KIND, "\n".join(orders),
                               max(observation.created or 0.0, when or 0.0), issue=charter, batch=False,
                               orders=True, repo=repo))
+        set_source_state(engine, "charters", [])
         return facts
 
     def cos_fact(self, observation):

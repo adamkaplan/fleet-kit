@@ -1622,8 +1622,8 @@ Changed:
   does not fit stays queued and is routed on the next pass; the same pass then took 5 s and 5 calls.
 - Items that belong to nobody are audited as one `github.unrouted` line per repo per pass, with a count and the
   first 20 keys, not one line each. `github.catch_up` likewise names at most 20 keys and gives the count.
-- One catch-up keeps the newest 500 items (`GITHUB_CATCHUP_ITEMS`) and says so, and stops reading after 90 s
-  (`GITHUB_CATCHUP_SECONDS`), leaving the rest to the next one.
+- One catch-up keeps the newest 500 items (`GITHUB_CATCHUP_ITEMS`) and says so, and stops reading after its time budget
+  (`source_budgets.catch_up`, 90 s by default), leaving the rest to the next one.
 - A secondary read (reviews, check suites, workflow runs) has a 10 s timeout and, once it fails, is not tried
   again for 10 minutes; it is reported when it fails, not every pass, and the catch-up that includes it is
   retried when the backoff ends, not every minute.
@@ -4583,6 +4583,16 @@ On a machine kept busy far past its cores the daemon can be starved: at a load o
 To run the daemon under launchd with the Interactive class, run `fleet-switchboard install`: it writes `~/Library/LaunchAgents/com.fleet-kit.switchboard.plist` from `templates/com.fleet-kit.switchboard.plist` (a user agent: no `UserName`, no `Nice`) and loads it. A daemon `ensure` already started keeps the lock; the agent's `--standby` waits and takes over when that daemon goes away. To check what class the agent has, run `launchctl print gui/$(id -u)/com.fleet-kit.switchboard` and read its `spawn type` line (the Interactive class shows there). To go back, `fleet-switchboard install --uninstall` unloads and removes the agent, and `ensure` starts the daemon again as before. There is no sudo anywhere in this.
 
 What was measured (a fixed 0.55-second CPU task on a 14-core machine, run with 28 busy processes, a load average of 104): the default class took 1.6 s, and the **Background** class (`taskpolicy -b`, what the template asked for until this change) did not finish in 60 s. The Interactive class itself could not be measured without installing the agent, which was not done on the live machine; it is at least the default class.
+
+### Time budgets for the heavy readers (`source_budgets`, #494)
+
+After a restart under load three readers could hold a pass for minutes: the load alert's reads (the charters and the asks of each orchestrator, and the parents of the issues a movement names), the charter orders read (one per agent), and the GitHub catch-up (a repository's window, read in steps). Each now has a time budget in a pass, in seconds, in `source_budgets` (`{"load_alert": 20, "charters": 15, "catch_up": 90}` are the defaults; 0 means no limit; the catch-up default is the bound it always had). The reader checks it **between calls**: no thread and no process is added, and a read that has started is never cut short. When the budget is spent it stops at a safe point and goes on in the next pass:
+
+- the load alert reads the oldest list first and keeps what it read, so the next pass reads only what is still old: nothing is read twice;
+- the charter orders reader remembers the first agent it did not reach and continues from there (at least one agent every pass, so a budget smaller than one read cannot starve anyone);
+- the catch-up keeps a cursor per repository: the steps of the window it finished (comments, issues, pulls, then each pull's reviews and check suites, then workflow runs) are not read again, and the read marker moves over the window only when every step has been read. A step the budget stopped is read later, not dropped (before, a secondary read the budget stopped was lost). A repository whose catch-up has stopped three passes in a row is said in `status` (a repository that leaves the watched set or is excluded loses its cursor, and one that joins again starts a fresh window) (`catch-up not finished after 3 passes`), not silently starved.
+
+Each of the three keeps a state in memory, `pending` with what remains or `done` (`source_states(engine)`), for the "catching up" line of the next slice. The sweep and triage keep their own pass limits (`sweep` and `triage`).
 
 ### The CPU guard: the `cpu` line and a once-per-episode alarm
 

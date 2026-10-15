@@ -484,6 +484,18 @@ class _Budget:
         return self.rows
 
 
+def _time_up(ctx, what):
+    """#494: True when this pass's time budget for the load alert's reads is spent (`ctx.time_up()`, checked between reads; 0 = no limit); what
+    was left is noted in `ctx.pending` and the read is made in a later pass (every list kept is read again only when it is old, oldest first)."""
+    check = getattr(ctx, "time_up", None)
+    if check is None or not check():
+        return False
+    pending = getattr(ctx, "pending", None)
+    if isinstance(pending, list) and len(pending) < 50:
+        pending.append(what)
+    return True
+
+
 def _resolve_charters(ctx, state, now, budget):
     """{orchestrator: charter number or None} and problems. The charter is the open issue whose yaml block says `orchestrator: <its name>`
     (one `ctx.read_charters(repo) -> [(number, body)]` per repo, cached an hour; it costs up to 3 reads and needs 2 left in the account's budget), else
@@ -497,6 +509,8 @@ def _resolve_charters(ctx, state, now, budget):
                 problems.append(entry["error"])   # still failing: said every pass, read again only after the retry wait
             continue
         if getattr(ctx, "read_charters", None) is None or budget.paused(repo, problems) or budget.left(budget.account(repo)) < 2:
+            continue
+        if _time_up(ctx, "charters of %s" % repo):
             continue
         try:
             found = budget.metered(repo, 2, lambda: ctx.read_charters(repo))
@@ -538,6 +552,8 @@ def _parent_of(ctx, state, budget, repo, number, now, problems):
     if now - failed.get(key, -1e9) < RETRY_SECONDS or getattr(ctx, "read_parent", None) is None:
         return None, False
     if budget.paused(repo, problems) or budget.left(budget.account(repo)) < 1:
+        return None, False
+    if _time_up(ctx, "parent of %s" % key):
         return None, False
     try:
         parent = budget.metered(repo, 1, lambda: ctx.read_parent(repo, number))
@@ -644,6 +660,8 @@ def _refresh_asks(ctx, state, now, rows=()):
                 problems.append(entry["error"])
             continue
         if not info.get("charter") or budget.paused(info.get("repo"), problems) or budget.left(budget.account(info.get("repo"))) < 1:
+            continue
+        if _time_up(ctx, "asks of %s" % name):
             continue
         try:
             found = budget.metered(info.get("repo"), 1, lambda: ctx.read_asks(info["charter"], info.get("repo")))

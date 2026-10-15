@@ -49672,6 +49672,289 @@ class TestEventFeedReads(unittest.TestCase):
             self.assertIn("events: DOWN: old reads", sb.v2_calls_status(tmp, 1000.0))
 
 
+class TestSourceBudgets(Base):
+    """#494 (slice 2 of #467): the load alert's reads, the charter orders reads and the GitHub catch-up each have a time budget in a pass,
+    stop between calls and finish over the following passes: no read twice, no finding lost, no event window dropped."""
+
+    # -- S1: the key
+
+    def test_s1_the_key_has_defaults_zero_means_no_limit_and_a_bad_value_names_the_key(self):
+        sb.validate_source_budgets({}, "t")
+        sb.validate_source_budgets({"source_budgets": {"load_alert": 0, "catch_up": 5}}, "t")
+        self.assertEqual((sb.source_budget_seconds({"source_budgets": {"load_alert": 0}}, "load_alert"),
+                          sb.source_budget_seconds({"source_budgets": {"catch_up": 5}}, "catch_up"),
+                          sb.source_budget_seconds({}, "catch_up")), (0, 5, sb.SOURCE_BUDGET_DEFAULTS["catch_up"]))
+        self.assertEqual(sb.SOURCE_BUDGET_DEFAULTS["catch_up"], 90, "the catch-up default is the bound it always had")
+        for bad in ({"load_alert": -1}, {"charters": True}, {"catch_up": "9"}, {"nope": 1}):
+            with self.assertRaises(sb.ConfigError) as caught:
+                sb.validate_source_budgets({"source_budgets": bad}, "t")
+            self.assertEqual(str(caught.exception).count("source_budgets"), 1, bad)
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_source_budgets({"source_budgets": [1]}, "t")
+        self.assertIn("source_budgets", sb.config_known_keys())
+
+    def test_the_budget_is_never_spent_at_zero_and_is_spent_after_its_seconds(self):
+        clock = [100.0]
+        free, five = sb.SourceBudget(0, lambda: clock[0]), sb.SourceBudget(5, lambda: clock[0])
+        clock[0] += 10_000
+        self.assertEqual((free.spent(), five.spent()), (False, True))
+
+    # -- S2: the load alert
+
+    T0 = 1_800_000_000.0
+
+    def load_run(self, seconds, directory):
+        health = sb.load_fleet_health()
+        clock, reads = [self.T0], []
+        orchestrators = {"o%d" % n: {"charter": n, "repo": "acme/r%d" % n, "busy": 0, "idle": 1, "messages": 0} for n in range(1, 5)}
+
+        def read_asks(charter, repo):
+            reads.append(("asks", repo))
+            clock[0] += 2
+            return [{"repo": repo, "number": 100 * charter}]
+
+        def read_charters(repo):
+            reads.append(("charters", repo))
+            clock[0] += 2
+            return []
+        passes, pending = 0, []
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        while passes < 10:
+            passes += 1
+            budget = sb.SourceBudget(seconds, lambda: clock[0])
+            pending = []
+            ctx = health.Context(now=self.T0 + 30 * passes, state_dir=str(directory), cfg=dict(health.DEFAULTS, enabled=True), orchestrators=orchestrators,
+                                 read_asks=read_asks, read_charters=read_charters, cos="cos", wake=lambda text: None, time_up=budget.spent, pending=pending)
+            health.tick(ctx)
+            if not pending:
+                break
+        lists = {n: [(a["repo"], a["number"]) for a in e["list"]] for n, e in json.loads((directory / "load.json").read_text())["asks"].items()}
+        return reads, passes, lists
+
+    def test_s2_the_load_alert_reads_once_each_over_passes_and_finds_what_an_unbudgeted_run_finds(self):
+        base = self.state_dir.parent / "budget-load"
+        free_reads, free_passes, free_lists = self.load_run(0, base / "free")
+        reads, passes, lists = self.load_run(5, base / "budgeted")
+        self.assertEqual((len(free_reads), free_passes), (8, 1))
+        self.assertEqual((len(reads), len(set(reads)), passes), (8, 8, 3), "8 distinct reads over 3 passes, none twice")
+        self.assertEqual(lists, free_lists, "the budgeted run finds what the unbudgeted run finds")
+        self.assertEqual(sorted(reads), sorted(free_reads))
+
+    # -- S3: the charter orders
+
+    class OrdersEngine:
+        def __init__(self, test, names, seconds):
+            self.clock, self.reads, self.notes = [1000.0], [], []
+            self.config = {"source_budgets": {"charters": seconds}}
+            self.discovery = types.SimpleNamespace(agents={n: types.SimpleNamespace(
+                name=n, fleet={"role": "coder", "charter": 1, "repo": "acme/r"}, conflict=False, problem=None, session_id="ses_" + n, created=1.0)
+                for n in names})
+            self.reads_obj = types.SimpleNamespace(compaction_page=lambda session, limit, now: [])
+
+        reads_attr = None
+        now = lambda self: self.clock[0]
+
+        def charter_repo(self, observation):
+            return "acme/r"
+
+        def charter_orders(self, observation, charter):
+            self.reads.append(observation.name)
+            self.clock[0] += 2
+            return ["approve deploys here"]
+
+        @property
+        def reads_(self):
+            return self.reads_obj
+
+        def _note(self, *args, **kwargs):
+            self.notes.append(args)
+
+    def orders_source(self, seconds):
+        engine = self.OrdersEngine(self, ["a%d" % n for n in range(1, 7)], seconds)
+        engine.__dict__["reads"], engine.__dict__["read_log"] = engine.reads_obj, engine.reads
+        # `reads` is the log the test counts; the source reads `engine.reads.compaction_page`, so give the log object that method too
+        class Log(list):
+            compaction_page = staticmethod(lambda session, limit, now: [])
+        log = Log()
+        engine.reads = log
+        source = sb.OrdersFacts()
+        source.engine = engine
+        return source, engine, log
+
+    def test_s3_every_agent_is_told_its_orders_once_and_no_read_repeats(self):
+        source, engine, log = self.orders_source(5)
+        told, passes = [], 0
+        while passes < 10:
+            passes += 1
+            told += [f.recipient for f in source()]
+            if sb.source_states(engine)["charters"]["state"] == "done":
+                break
+        self.assertEqual((sorted(told), passes, len(log), len(set(log))), (["a1", "a2", "a3", "a4", "a5", "a6"], 2, 6, 6))
+        free_source, free_engine, free_log = self.orders_source(0)
+        self.assertEqual(sorted(f.recipient for f in free_source()), sorted(told))
+        self.assertEqual(sb.source_states(free_engine)["charters"]["state"], "done")
+
+    def test_a_budget_smaller_than_one_read_still_makes_progress(self):
+        source, engine, log = self.orders_source(1)
+        for _ in range(8):
+            source()
+        self.assertEqual(sorted(set(log)), ["a1", "a2", "a3", "a4", "a5", "a6"], "one agent a pass at least: nobody is starved")
+
+    # -- S4 to S7: the catch-up
+
+    def catch_up_rig(self, seconds):
+        rig = GithubRig(self, config={"sweep": False, "triage": False, "source_budgets": {"catch_up": seconds}})
+        rig.world.clock.t += 7200
+        rig.gh.issue(12, parent=1)
+        rig.pump(15)                                   # the first read of a fresh repo sets its marker
+        rig.world.clock.t += 60
+        rig.gh.comment(12, "while away", 5001, forward=False)
+        rig.gh.pull(30)
+        self.reads = []
+        real = rig.hub.read_pages
+
+        def slow(path, *args, **kwargs):
+            self.reads.append(path)
+            rig.world.clock.t += 2
+            return real(path, *args, **kwargs)
+        rig.hub.read_pages = slow
+        return rig
+
+    def run_catch_up(self, rig):
+        calls = 0
+        while calls < 20:
+            calls += 1
+            rig.hub.catch_up(rig.watch(), rig.world.clock.now())
+            if GH_REPO not in rig.hub._cursors:
+                break
+        return calls
+
+    def test_s4_a_budgeted_catch_up_reads_each_step_once_and_finds_what_an_unbudgeted_one_finds(self):
+        free = self.catch_up_rig(0)
+        before = free.hub.markers[GH_REPO]
+        self.assertEqual(self.run_catch_up(free), 1)
+        every, found = list(self.reads), free.keys()
+        self.assertGreaterEqual(len(every), 5)
+        rig = self.catch_up_rig(3)
+        calls = self.run_catch_up(rig)
+        self.assertGreater(calls, 1)
+        self.assertEqual((len(self.reads), len(set(self.reads))), (len(every), len(set(every))), "the same reads, none twice")
+        self.assertEqual(rig.keys(), found)
+
+    def test_s5_a_stopped_catch_up_keeps_its_marker_and_reads_the_unread_part_later(self):
+        rig = self.catch_up_rig(3)
+        marker = rig.hub.markers[GH_REPO]
+        at = rig.world.clock.now()
+        rig.hub.catch_up(rig.watch(), at)
+        self.assertIn(GH_REPO, rig.hub._cursors)
+        self.assertEqual(rig.hub.markers[GH_REPO], marker, "the marker did not move over a window that was not read")
+        first = len(self.reads)
+        self.assertEqual(rig.watch().catchup_at, at, "only the budget stopped it: it goes on at the next pass")
+        self.run_catch_up(rig)
+        self.assertGreater(len(self.reads), first)
+        self.assertGreater(rig.hub.markers[GH_REPO], marker)
+        self.assertIn("github.comment:5001", rig.keys(), "the event of the unread part arrived")
+        self.assertEqual(len(self.reads), len(set(self.reads)))
+
+    def test_s5b_a_secondary_read_the_budget_stopped_is_read_later_not_dropped(self):
+        rig = self.catch_up_rig(5)
+        rig.gh.runs.append({"id": 9001, "name": "ci", "status": "completed", "conclusion": "success", "updated_at": rig.gh.stamp(),
+                            "head_sha": "sha30", "pull_requests": [{"number": 30}], "event": "push"})
+        marker = rig.hub.markers[GH_REPO]
+        rig.hub.catch_up(rig.watch(), rig.world.clock.now())
+        runs = lambda: [r for r in self.reads if r.startswith("repos/%s/actions/runs" % GH_REPO)]
+        self.assertEqual(runs(), [], "the budget stopped it before the last step")
+        self.assertEqual(rig.hub.markers[GH_REPO], marker, "a stopped secondary step does not let the marker over its window")
+        self.run_catch_up(rig)
+        self.assertEqual(len(runs()), 1, "the step the budget stopped is read later, once")
+        self.assertGreater(rig.hub.markers[GH_REPO], marker)
+
+    def test_s6_a_repo_that_keeps_stopping_is_said_not_starved(self):
+        rig = self.catch_up_rig(1)
+        for _ in range(sb.GITHUB_CATCHUP_STUCK_PASSES):
+            rig.hub.catch_up(rig.watch(), rig.world.clock.now())
+        self.assertIn("not finished after 3 passes", rig.watch().catch_up_error)
+        self.assertEqual(rig.hub.catching_up(), ["%s (3 passes)" % GH_REPO])
+        self.assertIn("not finished after 3 passes", " ".join(sb.format_github(sb.github_status(rig.world.config, rig.world.state)) + [rig.watch().catch_up_error]))
+        self.run_catch_up(rig)
+        self.assertEqual((rig.hub.catching_up(), rig.watch().catch_up_error), ([], None))
+
+    def test_s7_each_source_says_pending_while_it_stops_and_done_after(self):
+        rig = self.catch_up_rig(3)
+        rig.hub.catch_up(rig.watch(), rig.world.clock.now())
+        rig.hub.tick()
+        self.assertEqual(sb.source_states(rig.world.engine)["catch_up"]["state"], "pending")
+        self.assertIn(GH_REPO, sb.source_states(rig.world.engine)["catch_up"]["pending"][0])
+        self.run_catch_up(rig)
+        rig.hub.tick()
+        self.assertEqual(sb.source_states(rig.world.engine)["catch_up"], {"state": "done", "pending": []})
+        source, engine, log = self.orders_source(5)
+        source()
+        self.assertEqual(sb.source_states(engine)["charters"]["state"], "pending")
+
+    def test_the_parent_read_stops_at_the_budget_and_is_read_later(self):
+        health = sb.load_fleet_health()
+        reads, spent = [], [True]
+        pending = []
+        ctx = health.Context(now=self.T0, state_dir=None, cfg=dict(health.DEFAULTS), orchestrators={}, read_parent=lambda repo, number: reads.append(number) or 7,
+                             time_up=lambda: spent[0], pending=pending)
+        state, problems = {}, []
+        budget = health._Budget(ctx, state, self.T0)
+        self.assertEqual(health._parent_of(ctx, state, budget, "acme/widget", 3, self.T0, problems), (None, False))
+        self.assertEqual((reads, pending), ([], ["parent of acme/widget#3"]))
+        spent[0] = False
+        self.assertEqual(health._parent_of(ctx, state, budget, "acme/widget", 3, self.T0 + 30, problems), (7, True))
+        self.assertEqual(health._parent_of(ctx, state, budget, "acme/widget", 3, self.T0 + 60, problems), (7, True))
+        self.assertEqual(reads, [3], "read once, kept")
+
+    # -- a repo that leaves the watched set, or is excluded, loses its cursor (rev-wake on #504)
+
+    def test_a_repo_that_leaves_while_pending_loses_its_cursor_and_is_not_read(self):
+        rig = self.catch_up_rig(3)
+        rig.hub.catch_up(rig.watch(), rig.world.clock.now())
+        self.assertEqual(len(rig.hub.catching_up()), 1)
+        rig.hub.config = dict(rig.hub.config, github_repos=[])
+        rig.hub.reconcile(rig.world.engine.discover(rig.world.clock.now()))
+        self.assertEqual((rig.hub.catching_up(), rig.hub._cursors), ([], {}))
+        rig.hub.tick()
+        self.assertEqual(sb.source_states(rig.world.engine)["catch_up"], {"state": "done", "pending": []})
+        before = len(rig.gh.api_calls)
+        rig.hub.tick()
+        self.assertEqual(len(rig.gh.api_calls), before, "0 reads of a repo that is not watched")
+
+    def test_a_repo_that_rejoins_starts_a_fresh_window(self):
+        rig = self.catch_up_rig(3)
+        rig.hub.catch_up(rig.watch(), rig.world.clock.now())
+        stale = rig.hub._cursors[GH_REPO]["since_epoch"]
+        rig.hub.config = dict(rig.hub.config, github_repos=[])
+        rig.hub.reconcile(rig.world.engine.discover(rig.world.clock.now()))
+        rig.world.clock.t += 600
+        rig.hub.config = dict(rig.hub.config, github_repos=[GH_REPO])
+        rig.hub.reconcile(rig.world.engine.discover(rig.world.clock.now()))
+        self.assertNotIn(GH_REPO, rig.hub._cursors)
+        rig.hub.catch_up(rig.watch(), rig.world.clock.now())
+        self.assertGreater(rig.hub._cursors.get(GH_REPO, {"since_epoch": 0})["since_epoch"], stale - 1, "a new window, not the old one")
+        self.assertEqual(rig.hub._cursors[GH_REPO]["done"] and len(rig.hub._cursors[GH_REPO]["done"]) <= 2, True, "it began again from its first steps")
+
+    def test_an_excluded_repo_with_a_stale_cursor_is_not_read(self):
+        rig = self.catch_up_rig(3)
+        rig.hub.catch_up(rig.watch(), rig.world.clock.now())
+        self.assertIn(GH_REPO, rig.hub._cursors)
+        rig.hub.config = dict(rig.hub.config, excluded_repos=[GH_REPO])
+        before = len(rig.gh.api_calls)
+        rig.hub.catch_up(rig.watch(), rig.world.clock.now())
+        self.assertEqual((len(rig.gh.api_calls), rig.hub.catching_up()), (before, []), "0 reads of an excluded repo and no 'catching up' for it")
+
+    def test_s8_the_budgeted_reads_add_no_thread_and_no_process(self):
+        with mock.patch.object(threading.Thread, "start", side_effect=AssertionError("a thread was started")), \
+                mock.patch.object(subprocess, "Popen", side_effect=AssertionError("a process was started")):
+            rig = self.catch_up_rig(3)
+            self.run_catch_up(rig)
+            source, engine, log = self.orders_source(5)
+            source()
+            source()
+
+
 class TestLoadAlert(Base):
     """#348: the load figures per orchestrator, the hourly series, the `status` lines and the once-per-episode alert to the Chief of Staff."""
     T0 = _dt.datetime(2026, 10, 14, 10, 0, tzinfo=_dt.timezone.utc).timestamp()
