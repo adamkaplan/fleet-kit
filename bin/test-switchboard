@@ -11798,10 +11798,37 @@ class TestChatClearJudge(unittest.TestCase):
         self.assertNotIn(token, json.dumps(jev.calls) + json.dumps(got["judge"]))
         self.assertNotIn("f" * 40, json.dumps(jev.calls))
         self.assertIn("[secret]", json.dumps(jev.calls))
-        asked = self.decide("366 is good to go once %s" % token, _StubJev({self.P366: 0.99}), offers=secret_offers)
+        stub = _StubJev({self.P366: 0.99})
+        asked = self.decide("366 is good to go once %s" % token, stub, offers=secret_offers)
         self.assertEqual(asked["action"], "ask")
+        self.assertEqual(len(stub.calls), 1, "the judge is still asked, and what it is sent holds no secret")
+        sent = stub.calls[0][0]["message"]
+        self.assertIn("[secret]", sent)
+        self.assertNotIn(token, json.dumps(stub.calls))
         self.assertNotIn(token, asked["question"])
         self.assertNotIn("abcdefghijklmnop0123456789", asked["question"])
+        shapes = ("github_pat_" + "a1B2c3D4" * 3, "sk-" + "a1B2c3D4" * 3, "xoxb-" + "1234567890" * 2, "AKIA" + "ABCDEFGH0123", "gho_" + "A1b2C3d4" * 3, "G" * 20 + "H" * 20 + "+/==",
+                  "f" * 40, "Bearer " + "x" * 20)
+        for shape in shapes:
+            self.assertEqual(self.cc._clean("see %s here" % shape, 200), "see [secret] here", shape)
+        for near in ("a" * 39 + " b", "ghp_short", "sk-short", "AKIA123", "a-normal-path/with/words and-numbers-12345"):
+            self.assertEqual(self.cc._clean(near, 200), near, "a near miss is kept: %s" % near)
+
+    def test_a_question_without_a_mark_a_symbol_and_a_sum_over_one_never_reach_a_clear(self):
+        jev = _StubJev({self.P366: 0.99})
+        for text in ("is 366 good to go", "was 366 approved", "is 366 ok to merge", "are 366 and ... good to go", "be 366 good to go", "366 good to go \u274c", "366 good to go /s",
+                     "366 good to go :)", "366 good to go - maybe", "366 good to go (not really)", "366 good to go; wait", "366 \U0001F44D good to go", "366 is good to go\u2026"):
+            got = self.decide(text, jev)
+            self.assertEqual(got["action"], "ask", text)
+            self.assertIn(got["why"], ("hedged", "no_number"), text)
+        for text in ("366 is good to go", "366 is good to go!", "ok to merge #366, thanks.", "Ship 366 now"):
+            self.assertEqual(self.decide(text, jev)["action"], "clear", text)
+        for junk in ({"type": "choice", "choice": self.P366, "probabilities": {self.P366: 0.95, self.P389: 0.9}},
+                     {"type": "choice", "choice": "nothing", "probabilities": ["x"]}, {"type": "choice", "choice": "nothing", "probabilities": {"nothing": "y"}},
+                     {"type": "choice", "choice": "nothing", "probabilities": {"nothing": 0.9, 5: 0.1}}, {"type": "choice", "choice": 5, "probabilities": {"nothing": 1.0}}):
+            for text in ("366 is good to go", "all good to go, thanks"):
+                got = self.decide(text, _StubJev(junk=junk))   # the decision never raises on a malformed answer
+                self.assertEqual(got["action"], "ask", (text, junk))
 
     def test_all_impacts_cleared_asks_once_and_names_all_three_holds(self):
         jev = _StubJev({"several": 0.95})

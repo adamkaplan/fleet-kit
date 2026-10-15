@@ -351,19 +351,31 @@ def timing_problem(offer, created, now):
     return None
 
 
-PLAIN_WORDS = frozenset(("a also ahead approve approved are be clear cleared fine go goes going good i is it lgtm let looks merge merged ok okay pr please ready release released s "
+PLAIN_WORDS = frozenset(("a also ahead approve approved are be clear cleared fine go goes going good i is it lgtm looks merge merged ok okay pr please ready release released s "
                          "ship shipped thank thanks the through to was you now for with then").split())
 LETTERS = re.compile(r"[^\W\d_]+", re.UNICODE)
 
 
+ALLOWED_MARKS = frozenset("#.,! ")
+QUESTION_OPENERS = frozenset(("is", "was", "are", "be", "s"))   # "is 366 good to go" asks by word order, with no question mark
+
+
 def _plain_clearing(text):
-    """True only when every WORD of the message (the number and punctuation aside) is in a short allow-list of plain clearing words: "366 is good to go", "389 also good
-    to go", "ok to merge #366, thanks". Anything else (a negation, a condition, an exception, a time, an apostrophe form such as "isn't" or "isn\u2019t", a word nobody
-    listed) is not a plain clearing sentence, whatever a judge would say: the deterministic floor is an allow-list, not a list of hedges."""
-    return all(word.lower() in PLAIN_WORDS for word in LETTERS.findall(text))
+    """True only when the message is a plain clearing sentence: every WORD is in the short allow-list (the number and the marks `#.,!` aside), nothing else but letters,
+    digits and white space appears (no emoji, no `/s`, no apostrophe form such as "isn't" or "isn\u2019t", no dash or colon), and no question opener (`is`, `was`, `are`, `be`) comes
+    BEFORE the number ("is 366 good to go" is a question without a question mark; "366 is good to go" is a statement). Anything else is not plain, whatever a judge
+    would say: the deterministic floor is an allow-list, not a list of hedges."""
+    if any(not (ch.isalnum() or ch.isspace() or ch in ALLOWED_MARKS) for ch in text):
+        return False
+    words = LETTERS.findall(text)
+    if not all(word.lower() in PLAIN_WORDS for word in words):
+        return False
+    first_digit = DIGITS.search(text)
+    before = LETTERS.findall(text[:first_digit.start()]) if first_digit else []
+    return not any(word.lower() in QUESTION_OPENERS for word in before)
 
 
-HEDGE = re.compile(r"\?|\b(?:not|no|never|don'?t|doesn'?t|isn'?t|aren'?t|won'?t|can'?t|cannot|wait|hold|stop|once|after|until|unless|if|when|before|but|maybe|probably|should|would|could)\b|n't\b", re.IGNORECASE)
+HEDGE = re.compile(r"\?")   # a question mark; everything else the floor refuses is by the allow-list above
 
 
 def screen(text, offers, created, now):
@@ -437,7 +449,7 @@ def judge_request(text, offers):
     """(state, questions) for one judge call: the message and the offers (PR, short head, one-line summary), and the options."""
     shown = [(pr, offers[pr]) for pr in sorted(offers)[:JUDGE_OFFERS_MAX]]
     state = {"message": _clean(text, JUDGE_TEXT_MAX),
-             "held": [{"pr": pr, "head": str(offer.get("head", ""))[:8], "summary": _clean(offer.get("summary"), SUMMARY_MAX)} for pr, offer in shown]}
+             "held": [{"pr": pr, "head": _clean(str(offer.get("head", ""))[:8], 8), "summary": _clean(offer.get("summary"), SUMMARY_MAX)} for pr, offer in shown]}
     criteria = {}
     for pr, offer in shown:
         criteria[pr] = "The message clears %s (%s) and no other held pull request: the owner says it may go." % (pr, _clean(offer.get("summary"), SUMMARY_MAX) or "no summary")
@@ -468,6 +480,10 @@ def judge(jev, text, offers, min_confidence=HIGH_CONFIDENCE):
         out["reason"] = "jev gave an unreadable answer"
         return out
     probabilities = answer.get("probabilities")
+    if not (isinstance(probabilities, dict) and all(isinstance(k, str) and isinstance(v, (int, float)) and not isinstance(v, bool) for k, v in probabilities.items())):
+        out["reason"] = "jev gave no probabilities" if not probabilities else "jev gave an unreadable answer"
+        out.update(jev_choice=_clean(answer.get("choice"), 40), model=_clean(result.get("model"), 60), latency_ms=result.get("latency_ms"))
+        return out
     out.update(jev_choice=answer.get("choice"), probabilities=probabilities, model=result.get("model"), usage=result.get("usage") or {},
                latency_ms=result.get("latency_ms"))
     if not isinstance(probabilities, dict) or not probabilities:
@@ -476,7 +492,8 @@ def judge(jev, text, offers, min_confidence=HIGH_CONFIDENCE):
     choice = answer.get("choice")
     top = probabilities.get(choice, 0.0) if isinstance(choice, str) and choice in questions[JUDGE_ID]["criteria"] else None
     numbers = [v for v in probabilities.values() if isinstance(v, (int, float)) and not isinstance(v, bool) and v == v]
-    if top is None or isinstance(top, bool) or not isinstance(top, (int, float)) or top != top or top > 1 or len(numbers) != len(probabilities) or top < max(numbers):
+    if top is None or isinstance(top, bool) or not isinstance(top, (int, float)) or top != top or top > 1 or len(numbers) != len(probabilities) or top < max(numbers) \
+            or abs(sum(numbers) - 1) > 0.01:
         out["reason"] = "jev gave an unreadable answer"   # the choice is not an option, or is not the most probable one, or a probability is not a number in 0..1
         return out
     if top < bar or sum(1 for v in numbers if v == top) > 1:
@@ -504,10 +521,10 @@ def question_text(why, offers, prs=None, current_heads=None):
         lines.append("Held for you now:")
     for pr in names:
         offer = offers.get(pr) or {}
-        line = "- %s at %s: %s" % (pr, str(offer.get("head", ""))[:8], _clean(offer.get("summary"), SUMMARY_MAX) or "no summary")
+        line = "- %s at %s: %s" % (pr, _clean(str(offer.get("head", ""))[:8], 8), _clean(offer.get("summary"), SUMMARY_MAX) or "no summary")
         now = (current_heads or {}).get(pr)
         if isinstance(now, str) and now and now != offer.get("head"):
-            line += " (it has a new head, %s, since you were shown this one)" % now[:8]
+            line += " (it has a new head, %s, since you were shown this one)" % _clean(now[:8], 8)
         lines.append(line)
     if len(offers) > len(names) and not prs:
         lines.append("... and %d more." % (len(offers) - len(names)))
