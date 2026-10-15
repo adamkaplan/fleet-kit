@@ -536,7 +536,7 @@ REASONS = {"no_number": "your message names no pull request number", "several_nu
            "no_time": "the time of your message or of the offer could not be read", "before_offer": "your message was written before you were shown that pull request",
            "expired": "that offer is old and must be shown to you again first", "jev": "I could not be sure you meant to clear it",
            "head_changed": "that pull request has a new head since you were shown it", "not_held": "that pull request is no longer held for you or its labels changed",
-           "failed": "the clear could not be completed"}
+           "failed": "the clear did not finish cleanly: look at the pull request's labels before you rely on it"}
 
 
 def question_text(why, offers, prs=None, current_heads=None):

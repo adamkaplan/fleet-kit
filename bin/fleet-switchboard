@@ -18120,13 +18120,15 @@ def _apply_impact_hold_locked(engine, repo, number, report, record):
     return spent
 
 
-def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, head=None, via=None):
+def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, head=None, via=None, verify=None):
     """The owner's clear: record it head-bound (the daemon does not re-add the hold for that head) and remove `hold-impact`, and
     `merge-captain` too when the switchboard itself added it for this hold. Returns the lines to print.
 
     `remove` (the chat clear, #457) names the labels to take off instead: the caller has already read the PR and checked that each is an owner-tier hold label or the captain
     marker; here every one of them is checked again against the owner-tier set, so no other label can ever be removed. `head` is the head the owner was shown: the clear
-    is refused when the PR's head is any other. `via` is said in the audit line. Nothing here ever ADDS a label."""
+    is refused when the PR's head is any other. `verify(raw)` (the chat clear's) is run on the PR this call just read, before anything is written, and raises NoticeError to refuse:
+    the check and the effect use ONE read. `via` is said in the audit line. The head-bound clear state is recorded for any clear, even one that removes no impact label: it only
+    stops the daemon adding its impact hold for that head. Nothing here ever ADDS a label."""
     pr = "%s#%d" % (repo, number)
     if engine.audit is None:   # a clear is a logged act: with no audit sink it is refused, loudly, before anything changes
         raise RuntimeError("no audit sink: an impact clear is refused rather than made unlogged")
@@ -18136,6 +18138,8 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
         raise NoticeError("the PR's head is unknown")
     if head is not None and current != head:
         raise NoticeError("the PR's head moved since the owner was shown it (%s, not %s): nothing was cleared" % (current[:8], head[:8]))
+    if verify is not None:
+        verify(raw)
     names = label_names(engine.config)
     if remove is not None:
         cc = load_module("chat_clear")
@@ -18289,6 +18293,8 @@ def _chat_clear_pass(engine, decisions, now):
     offers = refreshed["offers"]
     if not offers:
         return   # nothing is held for the owner: no read of his messages, no Jev call
+    if getattr(engine, "light", False):
+        return   # v2_light: no background read of any session (the same rule as the classifier's reader)
     discovery = getattr(engine, "discovery", None)
     cos = next((o for o in (discovery.agents.values() if discovery is not None else []) if (o.fleet or {}).get("role") == "chief-of-staff" and not o.problem and o.session_id), None)
     if cos is None:
@@ -18300,6 +18306,7 @@ def _chat_clear_pass(engine, decisions, now):
         cc.mark_seen(engine.state_dir, message["id"], now)   # BEFORE anything is done: one attempt per message, whatever happens
         offers = cc.read_offers(engine.state_dir)
         if not offers:
+            engine.audit.append(engine.actor, "chat_clear.dropped", "chat_clear", {"message_id": message["id"], "why": "the offers went away before the message was judged"})
             return
         verdict = cc.decide(engine.jev, message["text"], offers, message["created"], now, bar)
         _chat_clear_act(engine, cc, cfg, message, verdict, offers, current_heads, now)
@@ -18349,18 +18356,24 @@ def chat_clear_apply(engine, cc, pr, offer, quoted, message_id, now):
     repo, _, number = pr.rpartition("#")
     number = int(number)
     runner = getattr(engine, "gh_runner", None) or subprocess.run
-    raw = read_pr_json(engine, repo, number)
     names = label_names(engine.config)
-    if str(raw.get("state") or "").upper() != "OPEN":
-        raise NoticeError("%s is not open any more" % pr)
-    labels = raw.get("labels") or []
-    if raw.get("headRefOid") != offer["head"] or not cc.is_offerable(names, labels):
-        raise NoticeError("%s changed since the owner was shown it: its head or its labels are not what he saw" % pr)
-    remove = cc.owner_tier_labels(names, labels)
-    engine_who = "owner (chat)"
-    lines = impact_clear_core(engine, runner, repo, number, engine_who, quoted, remove=remove, head=offer["head"], via="chat:%s" % message_id)
+    seen = {}
+
+    def verify(raw):   # run by the core on the SAME read it clears from: open, at the shown head (the core checks), only owner-tier labels
+        if str(raw.get("state") or "").upper() != "OPEN":
+            raise NoticeError("%s is not open any more" % pr)
+        labels = raw.get("labels") or []
+        if raw.get("headRefOid") != offer["head"] or not cc.is_offerable(names, labels):
+            raise NoticeError("%s changed since the owner was shown it: its head or its labels are not what he saw" % pr)
+        seen["remove"] = cc.owner_tier_labels(names, labels)
+
+    raw = read_pr_json(engine, repo, number)
+    verify(raw)   # a cheap refusal before the core's own read; the core verifies again on the read it clears from
+    lines = impact_clear_core(engine, runner, repo, number, "owner (chat)", quoted, remove=seen["remove"], head=offer["head"], via="chat:%s" % message_id, verify=verify)
+    remove = seen["remove"]
     short = offer["head"][:8]
-    body = "The owner cleared this hold in his chat with the Chief of Staff, at head `%s`. His words: \"%s\"\n\nRemoved: %s." % (short, quoted, ", ".join("`%s`" % l for l in remove))
+    shown_words = quoted.replace("@", "@\u200b").replace("`", "'")   # a public comment: no @mention and no code span can come out of his words
+    body = "The owner cleared this hold in his chat with the Chief of Staff, at head `%s`. His words: \"%s\"\n\nRemoved: %s." % (short, shown_words, ", ".join("`%s`" % l for l in remove))
     try:
         comment_as(engine, runner, repo, number, body, "switchboard")
     except Exception as err:   # the clear is made and audited; a comment that cannot be posted is said, not undone
