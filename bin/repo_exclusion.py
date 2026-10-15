@@ -14,14 +14,14 @@ import re
 KEY = "excluded_repos"
 MAX_ENTRIES = 200
 MAPPING_MAX = 65536       # bytes of the mapping file read for the warning
-REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")   # matched with fullmatch: a trailing newline is not a repository name
 
 
 def validate(raw, source):
     """Raises ValueError naming the key: absent or null is the empty list; else a list of at most 200 "owner/name" strings, each once (case-insensitively)."""
     if raw is None:
         return
-    if not isinstance(raw, list) or len(raw) > MAX_ENTRIES or not all(isinstance(r, str) and REPO_RE.match(r) for r in raw):
+    if not isinstance(raw, list) or len(raw) > MAX_ENTRIES or not all(isinstance(r, str) and REPO_RE.fullmatch(r) for r in raw):
         raise ValueError("%s: '%s' must be a list of at most %d \"owner/name\" repository names, got %r" % (source, KEY, MAX_ENTRIES, raw))
     if len({r.lower() for r in raw}) != len(raw):
         raise ValueError("%s: '%s' names a repository twice" % (source, KEY))

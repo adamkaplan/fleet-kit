@@ -49755,9 +49755,9 @@ class TestExcludedRepos(Base):
                                            "cos": {"role": "chief-of-staff"}})
         rig.pump(10)
         out = rig.world.engine.send("web-coder", "cos", "a question for you")
-        self.assertNotEqual(out.get("action"), "refused", out)
         out2 = rig.world.engine.send("cos", "web-coder", "the answer")
-        self.assertNotEqual(out2.get("action"), "refused", out2)
+        self.assertEqual((out["sent"], out["action"]), (True, "wake"), out)
+        self.assertEqual((out2["sent"], out2["action"]), (True, "wake"), out2)
         self.assertEqual(sorted(rig.hub.watches), [], "and the repository is still not watched")
 
     def test_s4_a_bad_list_is_refused_naming_the_key_and_a_cased_entry_excludes(self):
@@ -49767,6 +49767,10 @@ class TestExcludedRepos(Base):
             self.assertIn("excluded_repos", str(caught.exception))
         config = sb.validate_config({"github_repos": ["acme/web"], "excluded_repos": ["ACME/Web"]})
         self.assertEqual(sb.watched_repos(config, {}), [])
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"excluded_repos": ["acme/web\n"]})   # a trailing newline is not a repository name
+        both = sb.validate_config({"excluded_repos": ["acme/web"], "spotlight_guard": False})
+        self.assertEqual((both["excluded_repos"], both["spotlight_guard"]), (["acme/web"], False), "both opt-in keys are known together")
 
     def write_mapping(self, key_source):
         path = self.home / "mapping.json"
