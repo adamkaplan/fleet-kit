@@ -47,6 +47,7 @@ import urllib.parse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import collections
+import copy
 import errno
 import fcntl
 import getpass
@@ -3905,6 +3906,7 @@ class Switchboard:
         self.decision_seeds = {}        # the last derivation's display id -> source seed (memory only; the sync engine's keys)
         self.decision_seen = {}         # PR 14: (session, request id) -> when first seen, for a request with no time of its own
         self.decisions_generation = 0   # PR 14: the generation last written to decisions.json by this process
+        self._early_facts = {}          # #467: {id(source): facts} the early decisions step read this pass, handed to collect_facts
         self.request_keys = None        # PR 18: "<session>:<request id>" of every request pending at the last derivation
         self.gh_runner = None           # PR notices: the runner for `gh pr view` (None: subprocess.run)
         self.stopped_news_errors = set()  # reasons already audited: one line per distinct failure
@@ -4180,10 +4182,11 @@ class Switchboard:
     def collect_facts(self):
         """Every fact from every source, first key wins for each recipient. A failing source is audited and skipped."""
         facts, seen, problems = [], set(), []
+        early, self._early_facts = getattr(self, "_early_facts", {}), {}   # #467: a source the early decisions step already read this pass is not read twice
         for source in self.sources:
             name = getattr(source, "__name__", "source")
             try:
-                found = source()
+                found = early[id(source)] if id(source) in early else source()
             except Exception as err:  # one bad source must not stop the others
                 problems.append("%s: %s" % (name, _one_line(str(err))))
                 self._note("source.error", name, {"error": _one_line(str(err))})
@@ -4446,8 +4449,10 @@ class Switchboard:
         report = {"at": iso(now), "sent": [], "held": [], "waiting": [], "converted": [], "errors": [],
                   "badges": [], "toasts": []}
         self.pass_toasts = {}
+        self._early_facts = {}   # #467: facts the early decisions step reads for this pass only; never carried over from an earlier one
         self.reads.begin_pass()
         discovery = self.discover(now)
+        early_decisions(self, discovery)   # #467: the decisions file is written as soon as its own sources are read, BEFORE the heavy fact sources
         for problem in discovery.problems:
             self._note("observe.problem", None, {"problem": problem})
         for observation in list(discovery.agents.values()):
@@ -10291,6 +10296,51 @@ def v2_calls_status(state_dir, now):
         return text
     except (OSError, ValueError, KeyError, TypeError, AttributeError):   # a record of any other shape is no record
         return None
+
+
+EARLY_DECISIONS_AGE = DECISIONS_STALE_SECONDS // 3   # a file this old (or missing) is written before the heavy sources are collected: a third of the staleness bound (60 s of 180 s)
+
+
+def early_decisions(engine, discovery=None):
+    """(#467) At the START of a pass (after `discover`, before the fact sources): when the decisions file is missing or older than EARLY_DECISIONS_AGE, derive
+    the list from its OWN sources and write it now, so a heavy source (the sweep, triage, the load alert, a first catch-up after a restart under load) cannot delay
+    it past the staleness bound. Its own sources include the pending permission requests and questions, which only the worker source reads: that source is
+    run first and its facts are kept for this pass's fact collection (it is read once, not twice). The early step is skipped, writing and touching nothing, when
+    the fleet could not be read (`discovery` has problems: a list built from half a fleet must not look fresh), when the worker source or the derivation
+    raises (`decisions.early_error` is noted), and when a fresh file is there (steady state: the end of the pass publishes exactly as before). What it
+    writes is provisional: the end of the pass derives again and publishes (the sweep may withdraw or add). The file's time changes only through the store's
+    own write, with content derived from reads just made. The in-memory request records it sets are the end-of-pass derivation's too. Never raises.
+    Returns True when it wrote."""
+    state = engine.state_dir
+    if state is None or engine.audit is None or fault("no-decisions-file"):
+        return False
+    if discovery is None or discovery.problems:
+        return False
+    try:
+        try:
+            age = engine.now() - (Path(state) / DECISIONS_FILE).stat().st_mtime
+        except OSError:
+            age = None   # missing or unreadable: write it now
+        if age is not None and age < EARLY_DECISIONS_AGE:
+            return False
+        now = engine.now()
+        worker = next((x for x in engine.sources if isinstance(x, WorkerFacts)), None)
+        if worker is not None:
+            engine._early_facts = {id(worker): worker()}   # the pending requests are filled by this call; collect_facts reuses its facts
+        kept = {name: copy.deepcopy(engine.__dict__[name]) for name in ("notice_obs", "notice_effects") if name in engine.__dict__}
+        try:
+            decisions, errors = derive_decisions(engine, now)
+        finally:   # the derivation advances the notice time accounting: the end of the pass derives again and must see it as it was
+            for name in ("notice_obs", "notice_effects"):
+                if name in kept:
+                    engine.__dict__[name] = kept[name]
+                else:
+                    engine.__dict__.pop(name, None)
+        return bool(decision_store(engine).publish(decisions, errors, now))
+    except Exception as err:   # a pass that cannot read its decision sources writes nothing here; the end of the pass says the same
+        engine._early_facts = {}
+        engine._note("decisions.early_error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+        return False
 
 
 def publish_decisions(engine):
