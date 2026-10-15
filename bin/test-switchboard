@@ -11479,6 +11479,21 @@ class TestHeadlessPresence(Base):
         self.assertIsNone(self.ap.load_record(self.world.state, "hw"))
         self.assertEqual(self.ap.list_records(self.world.state), [])
 
+    def test_an_unusable_record_is_said_in_discovery_one_line_each_and_reading_never_creates_the_directory(self):
+        state = Path(self.world.state)
+        self.assertEqual(self.discover().problems, [], "no directory, no records: silent")
+        self.assertFalse((state / "headless").exists(), "a read creates nothing")
+        sid = self.headless()
+        (state / "headless" / "hw.json").chmod(0o644)
+        (state / "headless" / "bad.json").write_text("{not json")
+        (state / "headless" / "bad.json").chmod(0o600)
+        problems = self.discover().problems
+        self.assertEqual(len([p for p in problems if "headless record" in p]), 2, problems)
+        self.assertTrue(any("hw" in p and "not private" in p for p in problems), problems)
+        self.assertTrue(any("bad" in p and "not readable JSON" in p for p in problems), problems)
+        self.assertNotIn("hw", self.discover().agents, "an untrusted record is not a worker")
+        self.assertEqual(self.ap.read_record(self.world.state, "nobody"), (None, None))
+
     def test_remove_record_deletes_it_once_and_says_so(self):
         sid = self.headless()
         path = Path(self.world.state) / "headless" / "hw.json"

@@ -110,36 +110,63 @@ def save_record(state, name, session, url, now=None):
     return body
 
 
-def load_record(state, name):
-    """The record of `name`, or None when there is none or it is not a usable local record (never raises for a bad file)."""
+def read_record(state, name):
+    """(record, None) for a usable local record, (None, why) for a file that is there and cannot be used, (None, None) when there is none. Reads only:
+    it never creates the directory."""
+    if not valid_name(name):
+        return None, "not a worker name"
+    path = Path(state) / RECORD_DIR / (name + ".json")
     try:
-        path = record_path(state, name)
         fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None, None
+    except OSError as err:
+        return None, "cannot be opened (%s)" % (err.strerror or err)
+    try:
         with os.fdopen(fd, "rb") as handle:
             found = os.fstat(handle.fileno())
             if not stat.S_ISREG(found.st_mode) or found.st_uid != os.getuid() or found.st_mode & 0o077:
-                return None
+                return None, "is not private to this user (mode 0600, ours, a regular file)"
             raw = handle.read(RECORD_MAX + 1)
         if len(raw) > RECORD_MAX:
-            return None
+            return None, "is too large"
         record = json.loads(raw.decode("utf-8"))
     except (OSError, ValueError, UnicodeError):
-        return None
+        return None, "is not readable JSON"
     if not isinstance(record, dict) or record.get("kind") != LOCAL or record.get("worker") != name:
-        return None
+        return None, "is not a local record of this worker"
     if not isinstance(record.get("session"), str) or not record["session"].startswith("ses_"):
-        return None
-    return record
+        return None, "names no session"
+    return record, None
 
 
-def list_records(state):
-    """Every usable local record, sorted by worker name ([] when the directory does not exist). Reads at most 200 files."""
+def load_record(state, name):
+    """The record of `name`, or None when there is none or it is not usable (never raises for a bad file)."""
+    return read_record(state, name)[0]
+
+
+def scan_records(state):
+    """([usable records sorted by worker], [one line per record that is there and unusable]). A missing directory is silent. At most 200 files."""
     base = Path(state) / RECORD_DIR
     try:
         names = sorted(p.stem for p in base.iterdir() if p.suffix == ".json" and valid_name(p.stem))[:200]
-    except OSError:
-        return []
-    return [r for r in (load_record(state, n) for n in names) if r is not None]
+    except FileNotFoundError:
+        return [], []
+    except OSError as err:
+        return [], ["the headless record directory cannot be read (%s)" % (err.strerror or err)]
+    records, problems = [], []
+    for name in names:
+        record, why = read_record(state, name)
+        if record is not None:
+            records.append(record)
+        elif why:
+            problems.append("the headless record of %s %s: it is not listed" % (name, why))
+    return records, problems
+
+
+def list_records(state):
+    """Every usable local record, sorted by worker name ([] when there is none)."""
+    return scan_records(state)[0]
 
 
 def remove_record(state, name):

@@ -4058,10 +4058,11 @@ class Switchboard:
             return
         try:
             ap = load_agent_presence()
-            records = ap.list_records(self.state_dir)
+            records, bad = ap.scan_records(self.state_dir)
         except Exception as err:   # never silent: headless workers would vanish from discovery without a word
             found.problems.append("headless workers could not be read: %s" % _one_line(str(err), 100))
             return
+        found.problems.extend(bad)   # a record that is there and cannot be used is said, one line each, never a silent loss
         if not records:
             return
         active, down = None, None
