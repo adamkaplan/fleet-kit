@@ -9135,9 +9135,7 @@ def _plain(text, limit=300):
 def pr_checks_of(rollup, limit=30):
     """[{"name", "conclusion"}] of the checks of a statusCheckRollup, as lower-case words (`success`, `failure`, `in_progress`...), at most `limit`."""
     found = []
-    for check in rollup if isinstance(rollup, list) else []:
-        if not isinstance(check, dict):
-            continue
+    for check in load_module("ci_runs").newest(rollup):   # each check once, by its newest run (#534)
         name = check.get("name") or check.get("context") or check.get("workflowName")
         word = check.get("conclusion") or check.get("state") or check.get("status") or ""
         if isinstance(name, str) and isinstance(word, str):
@@ -9153,9 +9151,7 @@ def pr_ci_of(rollup):
         return "none"
     failing = ("FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR")
     pending = False
-    for check in rollup:
-        if not isinstance(check, dict):
-            continue
+    for check in load_module("ci_runs").newest(rollup):   # the NEWEST run of each check decides: a green re-run supersedes the red run it replaced (#534)
         verdict = str(check.get("conclusion") or check.get("state") or "").upper()
         if verdict in failing:
             return "failing"
@@ -18295,7 +18291,7 @@ def agent_block_states(engine, repo, matrix, paths, base, head):
 def pr_floor_report(engine, repo, number, rated_pairs=()):
     """Read one PR's files and decide: {"pr", "head", "floor_paths", "complete", "rated", "decision", "reasons", "globs"}. Reads only (one
     `gh pr view`). `rated_pairs` is the independent rating's (severity, probability) list, an input that can only ADD a hold."""
-    raw = read_pr_json(engine, repo, number, "files,baseRefOid")
+    raw = read_pr_json(engine, repo, number, "files,baseRefOid,isDraft")
     files = [f for f in (raw.get("files") if isinstance(raw.get("files"), list) else []) if isinstance(f, dict)]
     globs, exclude, force = impact_floor.floor_for(repo, engine.config)
     paths, renamed = [], []
@@ -18322,7 +18318,9 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
     record, record_problem = (impact_review_record(engine.state_dir, "%s#%d" % (repo, number), head) if engine.state_dir is not None and isinstance(head, str) else (None, None))
     if record_problem:
         record = ("hold", None)   # an unreadable ledger is an unknown rating: it holds
-    owner = impact_floor.owner_decide(matrix, paths, [(sev, prob, None) for sev, prob in rated_pairs], unknown, hit, narrow, record)   # advisory (#451): which tier the owner-hold rule puts it in; the labels still follow `decision` until the re-judge slice
+    owner = impact_floor.owner_decide(matrix, paths, [(sev, prob, None) for sev, prob in rated_pairs], unknown, hit, narrow, record)
+    if record_problem:
+        owner = (owner[0], owner[1] + ["the ledger could not be read, so the independent rating is unknown: %s" % _one_line(str(record_problem), 120)])   # advisory (#451): which tier the owner-hold rule puts it in; the labels still follow `decision` until the re-judge slice
     if engine.state_dir is not None and isinstance(head, str):
         review, problem = impact_review_hold(engine.state_dir, "%s#%d" % (repo, number), head)
         if problem:
@@ -18335,7 +18333,7 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
             decision = "hold"
     return {"pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude,
             "floor_paths": hit, "files_read": len(files), "complete": complete, "unknown": unknown, "rated": [list(r) for r in rated],
-            "decision": decision, "reasons": reasons, "owner_decision": owner[0], "owner_reasons": owner[1]}
+            "decision": decision, "reasons": reasons, "owner_decision": owner[0], "owner_reasons": owner[1], "draft": raw.get("isDraft") is True}
 
 
 def cmd_impact(args, runner, now):
@@ -18417,11 +18415,11 @@ def read_impact_state(state_dir):
         return empty, "%s is not valid JSON" % IMPACT_STATE_FILE
     if not isinstance(raw, dict):
         return empty, "%s is not an object" % IMPACT_STATE_FILE
-    state = {k: raw[k] if isinstance(raw.get(k), dict) else {} for k in ("clears", "applied")}
-    for extra in ("carried", "carry_void"):   # written only by the carry (#510): a state file that never carried reads exactly as it always did
+    found = {k: raw[k] if isinstance(raw.get(k), dict) else {} for k in ("clears", "applied")}
+    for extra in ("posted", "matrix_error", "carried", "carry_void"):   # only when the file has them: a state file that never had them reads exactly as it always did
         if isinstance(raw.get(extra), dict):
-            state[extra] = raw[extra]
-    return state, None
+            found[extra] = raw[extra]   # posted, matrix_error: slice 3 (#451); carried, carry_void: the carry (#510)
+    return found, None
 
 
 def write_impact_state(state_dir, data):
@@ -18545,6 +18543,34 @@ def apply_impact_hold(engine, repo, number, report, record):
         return _apply_impact_hold_locked(engine, repo, number, report, record, carry)
 
 
+def _consume_record(state, pr, clear=None):
+    """Drop the daemon's record of the labels it added to `pr` when an owner's clear (or the revoke of one, or the void of a carry) makes it stale: the clear took those
+    labels off, so whatever is on the pull request afterwards is somebody else's. Called in the SAME locked write as the change. With `clear` given (a revoke, a void), a record
+    that is NEWER than that clear (the daemon re-applied after it) is kept: those labels are the daemon's. With none (a new clear), the record is always consumed."""
+    ours = state["applied"].get(pr)
+    if not isinstance(ours, dict):
+        return
+    if clear is not None and isinstance(ours.get("at"), int) and isinstance(clear.get("at"), (int, float)) and ours["at"] > clear["at"]:
+        return
+    del state["applied"][pr]
+
+
+def _labels_ours(names, state, pr):
+    """The labels this daemon added to `pr`, from its own record in impact-hold.json: [] when it has none, or when the owner's clear came after it (the clear took
+    them off: whatever is there now is somebody else's). A record written before the list existed (`merge_label_added` only) is read as the hold label plus the
+    merge label when it says it added that one: the hold label is the fleet's own."""
+    ours = state["applied"].get(pr)
+    if not isinstance(ours, dict):
+        return []
+    clear = state["clears"].get(pr)
+    if isinstance(clear, dict) and not (isinstance(ours.get("at"), int) and isinstance(clear.get("at"), (int, float)) and clear["at"] < ours["at"]):
+        return []
+    listed = ours.get("added")
+    if isinstance(listed, list):
+        return [l for l in listed if l in (names["hold-impact"], names["merge-captain"])]
+    return [names["hold-impact"]] + ([names["merge-captain"]] if ours.get("merge_label_added") is True else [])
+
+
 def _apply_impact_hold_locked(engine, repo, number, report, record, carry=None):
     pr, head = report["pr"], report["head"]
     state, problem = read_impact_state(engine.state_dir)
@@ -18564,16 +18590,21 @@ def _apply_impact_hold_locked(engine, repo, number, report, record, carry=None):
                                                                          "why": "only main was merged in: the pull request's own change is the one the owner cleared"})
             return 0
         state.setdefault("carry_void", {})[pr] = {"head": head, "reason": _one_line(carry["reason"] or "", 200)}
+        _consume_record(state, pr, cleared)   # the clear took the daemon's labels off: an older record of them is no longer a claim
         write_impact_state(engine.state_dir, state)
         engine.audit.append(engine.actor, "gate.clear_carry_void", pr, {"head": head, "from": carry["from"], "reason": _one_line(carry["reason"] or "", 200)})
     names = label_names(engine.config)
-    have = {(l.get("name") if isinstance(l, dict) else l) for l in (record.get("labels") or [])}
+    raw = read_pr_json(engine, repo, number)   # the labels NOW, under the lock: the record claims only what this write adds, never a label that was already there
+    live = raw.get("labels")
+    if not isinstance(live, list):
+        raise NoticeError("the pull request's labels cannot be read")
+    have = {(l.get("name") if isinstance(l, dict) else l) for l in live}
     want = [names["merge-captain"], names["hold-impact"]]
     missing = [l for l in want if l not in have]
     if not missing:
-        return 0
+        return 1
     runner = getattr(engine, "gh_runner", None) or subprocess.run
-    spent = 0
+    spent = 1
     ensured = engine.__dict__.setdefault("impact_labels_ensured", set())
     if repo not in ensured:
         ensure_labels(engine, runner, repo)
@@ -18581,7 +18612,8 @@ def _apply_impact_hold_locked(engine, repo, number, report, record, carry=None):
         spent += len(LABEL_SPECS)
     change_issue_labels(engine, runner, repo, number, add=missing)
     spent += 1
-    state["applied"][pr] = {"head": head, "merge_label_added": names["merge-captain"] in missing}
+    added = sorted(set(_labels_ours(names, state, pr)) | set(missing))   # a re-apply MERGES into what an earlier apply added: it never forgets one
+    state["applied"][pr] = {"head": head, "merge_label_added": names["merge-captain"] in added, "added": added, "at": int(engine.now())}
     write_impact_state(engine.state_dir, state)
     engine.audit.append(engine.actor, "gate.hold_applied", pr, {"head": head, "labels": missing, "reasons": report["reasons"],
                                                                  "floor_paths": report["floor_paths"][:20], "globs": report["globs"][:20]})
@@ -18699,6 +18731,7 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
             remove = list(remove)
         head_now = current
         state["clears"][pr] = {"head": head_now, "reason": reason, "by": who, "at": int(engine.now())}
+        _consume_record(state, pr)   # the labels it took off were the daemon's record: consumed with the clear, in this write
         state.get("carried", {}).pop(pr, None)   # a new clear starts from this head: an earlier carry is not part of it
         state.get("carry_void", {}).pop(pr, None)
         if fingerprint is not None:
@@ -18745,6 +18778,8 @@ def cmd_impact_clear(args, runner, now):
                 had = state["clears"].pop(pr, None)
                 carried = state.get("carried", {}).pop(pr, None)
                 state.get("carry_void", {}).pop(pr, None)
+                if had is not None:
+                    _consume_record(state, pr, had)   # an older record of the daemon's labels is stale (a newer one, applied after the clear, is kept)
                 if had is not None or carried is not None:   # nothing to take back: nothing is written
                     write_impact_state(engine.state_dir, state)
                     engine.audit.append(engine.actor, "gate.clear_revoked", pr, {"by": kind[1], "reason": plan_ledger.clip(redact_command_text(reason), 300),
@@ -18769,16 +18804,37 @@ def cmd_impact_clear(args, runner, now):
     return EXIT_OK
 
 
+def impact_plan(engine, report, labels, state, records, records_problem):
+    """What the daemon would do with one judged pull request, as (what, labels): ("add", the labels it would add), ("held", []) already labelled,
+    ("cleared", []) the owner cleared this head, ("release", the labels it would remove: only those its own record lists and the pull request has now) or
+    ("none", []). The dry run prints this; the daemon's pass makes the same decisions (a test runs both over the same pull requests)."""
+    names = label_names(engine.config)
+    have = set(labels or ())
+    pr = report["pr"]
+    if report.get("draft"):
+        return "none", []   # the daemon judges no draft pull request
+    if report.get("owner_decision") == "hold":
+        carried = (state.get("carried", {}).get(pr) or {}).get("head") == report["head"] and impact_floor.carry_enabled(engine.config, report["pr"].rpartition("#")[0])
+        if (state["clears"].get(pr) or {}).get("head") == report["head"] or carried:   # the owner's clear, or a clear carried over a pure merge of main (#510)
+            return "cleared", []
+        missing = [l for l in (names["merge-captain"], names["hold-impact"]) if l not in have]
+        return ("add", missing) if missing else ("held", [])
+    if records_problem or not isinstance(state["applied"].get(pr), dict):
+        return "none", []
+    return "release", [l for l in _labels_ours(names, state, pr) if l in have]
+
+
 def cmd_impact_hold(args, runner, now):
-    """`impact hold --dry-run [--repo R]`: what the daemon would label right now, over the repos under `plan_gates` (read-only). The
-    labels are only ever written by the daemon, and only when `impact_hold.enabled` is true."""
+    """`impact hold --dry-run [--repo R]`: what the daemon would label and release right now (the SAME decision as its pass: the owner-hold rule), over the repos
+    under `plan_gates` (read-only). The labels are only ever written by the daemon, and only when `impact_hold.enabled` is true."""
     if not args.dry_run:
         sys.stderr.write("%s: impact hold: only --dry-run is available by hand: the daemon writes the labels, when impact_hold.enabled is true\n" % PROG)
         return EXIT_USAGE
     engine, state, config = build_engine(runner, now, "cli", writable=False)
     repos = [args.repo] if args.repo else sorted(((config.get("plan_gates") or {}).get("repos") or {}))
     names = label_names(config)
-    shown = 0
+    shown = released = 0
+    records, records_problem = impact_records(state)
     for repo in repos:
         try:
             has_floor = impact_floor.floor_for(repo, config)[0]
@@ -18800,18 +18856,151 @@ def cmd_impact_hold(args, runner, now):
             except Exception as err:
                 print("%s#%d  unreadable: %s" % (repo, item["number"], _one_line(str(err), 100)))
                 continue
-            if report["decision"] != "hold":
-                continue
-            cleared_state = read_impact_state(state)[0]
-            cleared = (cleared_state["clears"].get(report["pr"]) or {}).get("head") == report["head"] or \
-                ((cleared_state.get("carried", {}).get(report["pr"]) or {}).get("head") == report["head"] and impact_floor.carry_enabled(config, repo))
-            missing = [l for l in (names["merge-captain"], names["hold-impact"]) if l not in item["labels"]]
-            shown += 1
-            print("%s  %s  %s" % (report["pr"], "cleared by the owner for this head: no label" if cleared else
-                                  ("would add %s" % ", ".join(missing) if missing else "already labelled"), "; ".join(report["reasons"])[:160]))
+            what, labels = impact_plan(engine, report, item["labels"], read_impact_state(state)[0], records, records_problem)
+            reasons = "; ".join(report.get("owner_reasons") or [])[:160]
+            if what in ("add", "held", "cleared"):
+                shown += 1
+                print("%s  %s  %s" % (report["pr"], "cleared by the owner for this head: no label" if what == "cleared" else
+                                      ("would add %s" % ", ".join(labels) if labels else "already labelled"), reasons))
+            elif what == "release" and labels:
+                released += 1
+                print("%s  would remove %s (labels its record says the daemon added; the rule no longer holds it)" % (report["pr"], ", ".join(labels)))
     print("%s: %d PR(s) would be held (a dry run: nothing was written; impact_hold is %s)" % (
         PROG, shown, impact_floor.hold_mode(config, repos[0] if repos else "")))
+    print("%s: %d PR(s) would have a hold released" % (PROG, released))
     return EXIT_OK
+
+
+IMPACT_POSTED_KEEP = 5   # versions of the rule whose posted list is remembered
+IMPACT_LIST_MAX = 40     # pull requests named in a posted list
+
+
+def impact_records(state_dir):
+    """({(pr, head): (impact_action, impact_class)}, problem): the independent impact reviewer's newest record per pull request and head, read once. A ledger
+    that cannot be read gives ({}, why): the rating is then unknown and nothing is released on it."""
+    try:
+        entries, problem = plan_ledger.read_ledger(state_dir)
+    except Exception as err:
+        return {}, "%s: %s" % (type(err).__name__, _one_line(str(err), 100))
+    if problem:
+        return {}, _one_line(str(problem), 120)
+    found = {}
+    for entry in entries:
+        if entry.get("kind") == "review_record" and entry.get("reviewer") == "impact":
+            found[(entry.get("pr"), entry.get("head"))] = (entry.get("impact_action"), entry.get("impact_class"))
+    return found, None
+
+
+def release_impact_hold(engine, repo, number, report, record):
+    """(#451 slice 3) Take the hold off a pull request the owner-hold rule no longer holds: ONLY the labels this daemon added itself, as its own record in
+    impact-hold.json lists them (and only when the owner's clear did not come after that record). A label a person or another tool added, a pull request with no
+    record of ours, a record that is missing or corrupt: nothing is removed. Everything is re-checked under the lock (the live labels, the impact review record,
+    the clear): a decision made a moment ago never outlives a change of mind. Returns the number of gh calls spent."""
+    with impact_state_lock(engine.state_dir):   # the same lock as the owner's clear and the daemon's write: the three never interleave
+        state, problem = read_impact_state(engine.state_dir)
+        if problem:
+            _impact_state_noted(engine, problem)
+            return 0   # a state we cannot trust removes nothing
+        pr = report["pr"]
+        names = label_names(engine.config)
+        if not isinstance(state["applied"].get(pr), dict):
+            return 0
+        ours = _labels_ours(names, state, pr)
+        rating, rating_problem = impact_review_record(engine.state_dir, pr, report["head"])
+        if rating_problem or (rating and rating[0] == "hold" and impact_floor.class_is_top_tier(impact_floor._matrix_cached(), rating[1])):
+            return 0   # an independent hold arrived (or cannot be read) since the decision: it stays
+        raw = read_pr_json(engine, repo, number)   # FAILS CLOSED: a failed read raises, nothing is removed and the caller backs off
+        if raw.get("headRefOid") != report["head"]:
+            return 0   # a push since the decision: the next pass judges the new head
+        live = raw.get("labels")   # the labels now, not the list's copy of three minutes ago
+        have = {(l.get("name") if isinstance(l, dict) else l) for l in (live if isinstance(live, list) else [])}
+        remove = [l for l in ours if l in have]
+        runner = getattr(engine, "gh_runner", None) or subprocess.run
+        if remove:
+            change_issue_labels(engine, runner, repo, number, remove=remove)
+        del state["applied"][pr]
+        write_impact_state(engine.state_dir, state)
+        engine.audit.append(engine.actor, "gate.hold_released", pr, {"head": report["head"], "removed": remove, "reasons": report.get("owner_reasons", [])[:5],
+                                                                      "rule": engine.__dict__.get("impact_rule")})
+        return len(remove)
+
+
+def _impact_cos(engine):
+    discovery = getattr(engine, "discovery", None)
+    agents = getattr(discovery, "agents", None) or {}
+    return next((n for n, o in sorted(agents.items()) if (getattr(o, "fleet", None) or {}).get("role") == "chief-of-staff"), None)
+
+
+def _impact_matrix_episode(engine, now, err):
+    """The matrix file cannot be read (#451 slice 3, PC-4): no label is added or removed (the caller returns), ONE `impact.error` and ONE wake of the Chief of
+    Staff for the episode, kept in impact-hold.json so a restart does not say it again; the episode ends when the file reads (`impact.recovered`)."""
+    try:
+        with impact_state_lock(engine.state_dir):
+            state, problem = read_impact_state(engine.state_dir)
+            if problem:
+                _impact_state_noted(engine, problem)
+            episode = state.get("matrix_error") if isinstance(state.get("matrix_error"), dict) else {}
+            changed = False
+            if not episode.get("noted"):
+                engine.audit.append(engine.actor, "impact.error", "matrix", {"error": _one_line(str(err), 160), "floor": "unreadable"})   # once for the episode (kept in the state file)
+                episode.update(noted=True, since=int(now))
+                changed = True
+            if not episode.get("woken"):
+                cos = _impact_cos(engine)
+                if cos:
+                    add_reminder(engine.state_dir, cos, now, now, "The impact matrix file cannot be read: no hold is added or removed until it reads again, and the "
+                                 "merge gate waits for every pull request it cannot judge (%s)." % _one_line(str(err), 120))
+                    engine.audit.append(engine.actor, "impact.error_wake", cos, {"error": _one_line(str(err), 160)})
+                    episode["woken"] = True
+                    changed = True
+            if changed:
+                state["matrix_error"] = episode
+                write_impact_state(engine.state_dir, state)
+    except Exception as failure:   # the pass never raises: a failed note is tried again next pass
+        sys.stderr.write("%s: impact: %s\n" % (PROG, _one_line(str(failure), 160)))
+
+
+def _impact_matrix_recovered(engine, now):
+    """The matrix file reads again: a standing episode ends (audited) so the next failure is a new one."""
+    try:
+        state, problem = read_impact_state(engine.state_dir)
+        if problem or not state.get("matrix_error"):
+            return
+        with impact_state_lock(engine.state_dir):
+            state, problem = read_impact_state(engine.state_dir)
+            if problem or not state.get("matrix_error"):
+                return
+            since = state["matrix_error"].get("since")
+            state["matrix_error"] = {}
+            write_impact_state(engine.state_dir, state)
+            engine.audit.append(engine.actor, "impact.recovered", "matrix", {"since": since})
+    except Exception as failure:
+        sys.stderr.write("%s: impact: %s\n" % (PROG, _one_line(str(failure), 160)))
+
+
+def _impact_post_list(engine, now, rule, held, released, second):
+    """One audit line and one note to the Chief of Staff for this version of the rule: the pull requests that stay held, those released and those that now
+    ask for a second review. Remembered in impact-hold.json (`posted`) so a restart does not post it again."""
+    try:
+        with impact_state_lock(engine.state_dir):
+            state, problem = read_impact_state(engine.state_dir)
+            posted = state.setdefault("posted", {})
+            if problem or rule in posted:
+                return
+            cos = _impact_cos(engine)
+            text = ("The owner-hold rule (version %s) was applied to the waiting pull requests. Still held for the owner (%d): %s. Released (%d): %s. "
+                    "Second review only (%d): %s." % (rule, len(held), ", ".join(held[:IMPACT_LIST_MAX]) or "none", len(released),
+                                                      ", ".join(released[:IMPACT_LIST_MAX]) or "none", len(second), ", ".join(second[:IMPACT_LIST_MAX]) or "none"))
+            engine.audit.append(engine.actor, "impact.rejudged", "rule:%s" % rule, {"held": held[:IMPACT_LIST_MAX], "released": released[:IMPACT_LIST_MAX],
+                                                                                      "second_review": second[:IMPACT_LIST_MAX]})
+            if cos:
+                add_reminder(engine.state_dir, cos, now, now, text)
+            posted[rule] = int(now)
+            for old in sorted(posted, key=lambda k: posted[k])[:-IMPACT_POSTED_KEEP]:
+                del posted[old]
+            write_impact_state(engine.state_dir, state)
+    except Exception as failure:
+        sys.stderr.write("%s: impact: %s\n" % (PROG, _one_line(str(failure), 160)))
 
 
 CHAT_CLEAR_NEW_PER_PASS = 3   # the owner's new messages judged in one pass (one Jev call each): the rest wait for the next pass
@@ -18990,73 +19179,118 @@ def chat_clear_apply(engine, cc, pr, offer, quoted, message_id, now):
 
 
 def impact_would_hold_pass(engine, now):
-    """The daemon hook (#179 L3, ADVISORY): for the open PRs the ci recorder's list already holds (repos under `plan_gates`), decide the
-    floor once per (PR, head) and audit `gate.would_hold` when it holds. Writes NOTHING to GitHub: the label is slice L4. Reads one
-    `gh pr view` per new head, within IMPACT_PASS_CALLS per pass. Off with `impact_floor.enabled: false` or the global gates kill file.
-    Never raises."""
+    """The daemon hook (#179 L3, #451 slice 3): for the open PRs the ci recorder's list already holds (repos under `plan_gates`), decide the owner-hold
+    rule once per (PR, head, version of the rule, impact review record), audit `gate.would_hold` when it holds, and, when `impact_hold` enforces, WRITE the hold
+    for a pull request that holds and RELEASE (only the labels this daemon added) one that no longer does. One `gh pr view` per judgement, within
+    IMPACT_PASS_CALLS per pass. When the matrix file cannot be read nothing is added or removed (one error and one wake for the episode). Off with
+    `impact_floor.enabled: false` or the global gates kill file. Never raises."""
     cfg = (engine.config.get("impact_floor") or {}) if isinstance(engine.config, dict) else {}
     if cfg.get("enabled") is False or engine.state_dir is None or engine.audit is None or gates_off_path(engine.state_dir).exists():
         return
     state = getattr(engine, "ci_record_state", None)
     if state is None:
         return
+    try:
+        rule = impact_floor.rule_fingerprint()
+    except impact_floor.MatrixError as err:   # fail LOUD and still: no judgement, no label added, none removed
+        _impact_matrix_episode(engine, now, err)
+        return
+    engine.impact_rule = rule
     seen = engine.__dict__.setdefault("impact_seen", {})
     reports = engine.__dict__.setdefault("impact_reports", {})
+    released_now = engine.__dict__.setdefault("impact_released", {}).setdefault(rule, [])
     hold_cfg = (engine.config.get("impact_hold") or {}) if isinstance(engine.config, dict) else {}
     budget = hold_cfg.get("calls_per_pass", cfg.get("calls_per_pass", IMPACT_PASS_CALLS))   # `impact_hold.calls_per_pass` wins when set
-    for key, (_, records) in sorted(state.lists.items()):
-        for record in records:
-            if isinstance(record, dict) and isinstance(record.get("number"), int) and (key, record["number"]) in reports:
-                # a PR already judged at this head: only a NEW independent `hold` can add one (no gh read; the floor is unchanged)
-                earlier = reports[(key, record["number"])]
-                added_hold = (earlier["decision"] != "hold" and earlier["head"] == ((record.get("head") or {}).get("sha"))
-                              and impact_floor.hold_mode(engine.config, key) == "enforce"
-                              and impact_review_hold(engine.state_dir, earlier["pr"], earlier["head"]))
-                if added_hold and added_hold[0]:
-                    added = dict(earlier, decision="hold", reasons=earlier["reasons"] + [added_hold[1] or IMPACT_REVIEW_REASON])
-                    try:
-                        budget -= apply_impact_hold(engine, key, record["number"], added, record)
-                        reports[(key, record["number"])] = added
-                        engine.audit.append(engine.actor, "gate.would_hold", added["pr"], {"head": added["head"], "reasons": added["reasons"],
-                                                                                             "floor_paths": [], "advisory": False, "unknown": None})
-                    except Exception as err:
-                        engine._note("impact.error", added["pr"], {"error": _one_line(str(err), 160), "write": True})
+    records, records_problem = impact_records(engine.state_dir)
+    unjudged, live = 0, set()
+    for key, (_, listed) in sorted(state.lists.items()):
+        for record in listed:
             number = record.get("number") if isinstance(record, dict) else None
             head = ((record.get("head") or {}).get("sha")) if isinstance(record, dict) else None
             if not isinstance(number, int) or isinstance(number, bool) or not head or record.get("draft"):
                 continue
+            pr = "%s#%d" % (key, number)
+            live.add((key, number))
+            enforce = impact_floor.hold_mode(engine.config, key) == "enforce"
+            earlier = reports.get((key, number))
+            backoff = seen.get((key, number, "retry"))
+            if earlier is not None and earlier["head"] == head and earlier.get("rule") == rule and earlier.get("owner_decision") != "hold" and enforce \
+                    and not (backoff and now < backoff) and not records_problem and (pr, head) in records and seen.get((key, number)) != (head, rule, records[(pr, head)]):
+                # an impact review record that is new since this head was judged, on a pull request that holds nothing: no gh read (the paths are unchanged).
+                # A `hold` of a top tier, missing or unknown class can only ADD a hold; anything else changes nothing, so it is only noted as seen.
+                newest = records[(pr, head)]
+                if newest[0] == "hold" and impact_floor.class_is_top_tier(impact_floor._matrix_cached(), newest[1]):
+                    added = dict(earlier, decision="hold", owner_decision="hold", reasons=earlier["reasons"] + [IMPACT_REVIEW_REASON])
+                    try:
+                        budget -= apply_impact_hold(engine, key, number, added, record)
+                        reports[(key, number)] = added
+                        seen[(key, number)] = (head, rule, newest)
+                        engine.audit.append(engine.actor, "gate.would_hold", pr, {"head": head, "reasons": added["reasons"], "floor_paths": [], "advisory": False, "unknown": None})
+                    except Exception as err:
+                        seen[(key, number, "retry")] = now + IMPACT_RETRY_SECONDS
+                        engine._note("impact.error", pr, {"error": _one_line(str(err), 160), "write": True})
+                else:
+                    seen[(key, number)] = (head, rule, newest)
+                continue
             try:
                 globs = impact_floor.floor_for(key, engine.config)[0]
             except impact_floor.MatrixError as err:   # fail LOUD: no judgement is made while the matrix file cannot be read (never read as "no floor")
-                engine._note("impact.error", key, {"error": _one_line(str(err), 160), "floor": "unreadable"})
+                _impact_matrix_episode(engine, now, err)
                 return
-            if not globs or seen.get((key, number)) == head or budget <= 0:
+            if not globs:
+                continue
+            signature = (head, rule, "unreadable" if records_problem else records.get((pr, head)))
+            if seen.get((key, number)) == signature:
+                continue
+            if budget <= 0:
+                unjudged += 1
                 continue
             retry = seen.get((key, number, "retry"))
             if retry and now < retry:
+                unjudged += 1
                 continue
             budget -= 1
             try:
                 report = pr_floor_report(engine, key, number)
             except Exception as err:
                 seen[(key, number, "retry")] = now + IMPACT_RETRY_SECONDS
-                engine._note("impact.error", "%s#%d" % (key, number), {"error": _one_line(str(err), 160)})
+                engine._note("impact.error", pr, {"error": _one_line(str(err), 160)})
+                unjudged += 1
                 continue
-            if report["decision"] == "hold":
-                mode = impact_floor.hold_mode(engine.config, key)
+            report["rule"] = rule
+            owner = report.get("owner_decision")
+            if owner == "hold":
                 engine.audit.append(engine.actor, "gate.would_hold", report["pr"],
-                                    {"head": report["head"], "floor_paths": report["floor_paths"][:20], "reasons": report["reasons"],
-                                     "complete": report["complete"], "unknown": report["unknown"], "advisory": mode != "enforce",
-                                     "globs": report["globs"][:20]})
-                if mode == "enforce":
+                                    {"head": report["head"], "floor_paths": report["floor_paths"][:20], "reasons": report.get("owner_reasons", [])[:10],
+                                     "complete": report["complete"], "unknown": report["unknown"], "advisory": not enforce, "globs": report["globs"][:20]})
+                if enforce:
                     try:
-                        budget -= apply_impact_hold(engine, key, number, report, record)
+                        budget -= apply_impact_hold(engine, key, number, dict(report, reasons=report.get("owner_reasons", [])), record)
                     except Exception as err:   # a failed write is retried, never marked done
                         seen[(key, number, "retry")] = now + IMPACT_RETRY_SECONDS
-                        engine._note("impact.error", "%s#%d" % (key, number), {"error": _one_line(str(err), 160), "write": True})
+                        engine._note("impact.error", pr, {"error": _one_line(str(err), 160), "write": True})
+                        unjudged += 1
                         continue
-            seen[(key, number)] = report["head"] or head
+            elif enforce and not records_problem:   # a release is a LOOSENING: only on a decision made from every input, never on a failed read
+                try:
+                    removed = release_impact_hold(engine, key, number, report, record)
+                    budget -= removed + 1   # each removal is a write, and the release read the labels
+                    if removed and pr not in released_now:
+                        released_now.append(pr)
+                except Exception as err:
+                    seen[(key, number, "retry")] = now + IMPACT_RETRY_SECONDS
+                    engine._note("impact.error", pr, {"error": _one_line(str(err), 160), "write": True})
+                    unjudged += 1
+                    continue
+            seen[(key, number)] = (report["head"] or head, rule, "unreadable" if records_problem else records.get((pr, report["head"] or head)))
             reports[(key, number)] = report
+    _impact_matrix_recovered(engine, now)   # the file and the floor of every repo were read this pass: a standing episode is over
+    if not unjudged and not records_problem and any(impact_floor.hold_mode(engine.config, key) == "enforce" for key, _ in live):
+        judged = [reports[k] for k in sorted(live) if k in reports and reports[k].get("rule") == rule]
+        if judged:   # every open pull request of the repos under the hold has been judged under this version of the rule
+            held = sorted(r["pr"] for r in judged if r.get("owner_decision") == "hold")
+            second = sorted(r["pr"] for r in judged if r.get("owner_decision") == "second-review")
+            _impact_post_list(engine, now, rule, held, sorted(released_now), second)
 
 
 def cmd_gates_stats(args, runner, now):
