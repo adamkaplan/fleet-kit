@@ -49649,6 +49649,25 @@ class TestLoadAlert(Base):
         got = self.wait_world({1: {"labels": ["me:awaiting-cos"]}})
         self.assertEqual((got["stalled"], got["waiting_cos"], got["waiting_owner"]), (0, 1, 0))
 
+    def test_an_ask_awaiting_a_live_event_is_waiting_live_not_stalled(self):
+        got = self.wait_world({1: {"labels": ["me:awaiting-live"]}})
+        self.assertEqual((got["stalled"], got["waiting_live"], got["waiting_owner"], got["waiting_cos"], got["parked"]), (0, 1, 0, 0, 0))
+        self.assertIn("stalled 0, waiting on owner 0, parked 0, waiting on cos 0, waiting live 1", [l for l in self.health.status_lines(str(self.state_dir), self.T0) if l.strip().startswith("o ")][0])
+
+    def test_awaiting_live_ranks_below_owner_and_cos_and_above_parked(self):
+        future = self.T0 + 9 * self.DAY
+        got = self.wait_world({1: {"labels": ["me:awaiting-live", "me:awaiting-user"]}, 2: {"labels": ["me:awaiting-live", "me:awaiting-cos"]},
+                               3: {"labels": ["me:awaiting-live", "me:parked"], "parked_until": future}, 4: {"labels": ["awaiting-live"]}})
+        self.assertEqual((got["waiting_owner"], got["waiting_cos"], got["waiting_live"], got["parked"], got["stalled"]), (1, 1, 2, 0, 0))
+
+    def test_asks_waiting_live_never_wake_the_chief_of_staff_but_a_plain_stall_beside_them_does(self):
+        self.wait_world({1: {"labels": ["me:awaiting-live"]}, 2: {"labels": ["me:awaiting-live"]}, 3: {"labels": ["me:awaiting-live"]}}, enabled=True)
+        self.assertEqual(self.woken, [])
+        shutil.rmtree(str(self.state_dir)); self.state_dir.mkdir(mode=0o700)
+        got = self.wait_world({1: {"labels": ["me:awaiting-live"]}, 2: {"labels": []}, 3: {"labels": []}, 4: {"labels": ["me:awaiting-live"]}}, enabled=True)
+        self.assertEqual((got["stalled"], got["waiting_live"], len(self.woken)), (2, 2, 1))
+        self.assertIn("2 with no real movement", self.woken[0] if isinstance(self.woken[0], str) else str(self.woken[0]))
+
     def test_a_parked_ask_with_a_future_date_is_parked_and_one_whose_date_passed_is_stalled_again(self):
         got = self.wait_world({1: {"labels": ["me:parked"], "parked_until": self.T0 + 10 * self.DAY}})
         self.assertEqual((got["stalled"], got["parked"]), (0, 1))
