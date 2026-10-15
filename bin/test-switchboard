@@ -48830,6 +48830,62 @@ def main(argv):
     return 0 if ok else 1
 
 
+class TestModuleLoader(Base):
+    """Ask #437 slice 1: one generic loader behind the old `load_<module>()` names."""
+
+    OLD = {
+        "load_decision_core": "decision_core", "load_plan_check": "plan_check", "load_plan_ledger": "plan_ledger",
+        "load_report_fold": "report_fold", "load_triage_plan_open": "triage_plan_open", "load_pr_events": "pr_events",
+        "load_disk_janitor": "disk_janitor", "load_heavy_slots": "heavy_slots", "load_cpu_guard": "cpu_guard",
+        "load_health_records": "health_records", "load_reds": "reds", "load_impact_floor": "impact_floor",
+        "load_plan_review": "plan_review", "load_external_adapter": "external_adapter",
+        "load_decision_sync": "decision_sync", "load_work_sync": "work_sync", "load_agent_calls": "agent_calls",
+        "load_triage_digest": "triage_digest", "load_dead_hint": "dead_hint", "load_fleet_health": "fleet_health",
+    }
+
+    def _copy(self, extra=None):
+        """A copy of the program in a temp bin directory, with the named modules beside it, loaded as a module."""
+        tmp = Path(tempfile.mkdtemp(prefix="ldtest"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        shutil.copy(SWITCHBOARD, tmp / "fleet-switchboard")
+        for module in BIN.glob("*.py"):
+            shutil.copy(module, tmp / module.name)
+        for name, text in (extra or {}).items():
+            (tmp / (name + ".py")).write_text(text)
+        return tmp, _load("ld_" + tmp.name, tmp / "fleet-switchboard")
+
+    def test_s1_each_old_loader_loads_its_old_path_and_caches(self):
+        self.assertEqual(len(self.OLD), 20)
+        for fn, name in self.OLD.items():
+            first = getattr(sb, fn)()
+            self.assertEqual(os.path.realpath(first.__file__), os.path.realpath(str(BIN / (name + ".py"))), fn)
+            self.assertIs(getattr(sb, fn)(), first, fn)
+
+    def test_s2_a_missing_or_broken_module_fails_as_before(self):
+        tmp, mod = self._copy({"broken_one": "def (:\n"})
+        with self.assertRaises(FileNotFoundError):
+            mod.load_module("absent_one")
+        with self.assertRaises(SyntaxError):
+            mod.load_module("broken_one")
+        self.assertNotIn("broken_one", sys.modules)
+
+    def test_s4_a_new_module_loads_with_no_edit_to_the_program(self):
+        tmp, mod = self._copy({"fixture_mod": "VALUE = 7\n"})
+        self.assertEqual((tmp / "fleet-switchboard").read_bytes(), Path(SWITCHBOARD).read_bytes())
+        first = mod.load_module("fixture_mod")
+        self.assertEqual(first.VALUE, 7)
+        self.assertIs(mod.load_module("fixture_mod"), first)
+
+    def test_s8_a_hostile_name_is_refused(self):
+        tmp, mod = self._copy()
+        (tmp.parent / "outside_mod.py").write_text("VALUE = 1\n")
+        self.addCleanup((tmp.parent / "outside_mod.py").unlink)
+        for name in ("../outside_mod", os.path.join(os.sep, "etc", "hosts"), "no_such_module", "a/b", "", None):
+            with self.assertRaises((ValueError, FileNotFoundError), msg=repr(name)):
+                mod.load_module(name)
+        self.assertNotIn("outside_mod", sys.modules)
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.
