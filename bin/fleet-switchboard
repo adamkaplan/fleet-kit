@@ -9135,9 +9135,7 @@ def _plain(text, limit=300):
 def pr_checks_of(rollup, limit=30):
     """[{"name", "conclusion"}] of the checks of a statusCheckRollup, as lower-case words (`success`, `failure`, `in_progress`...), at most `limit`."""
     found = []
-    for check in rollup if isinstance(rollup, list) else []:
-        if not isinstance(check, dict):
-            continue
+    for check in load_module("ci_runs").newest(rollup):   # each check once, by its newest run (#534)
         name = check.get("name") or check.get("context") or check.get("workflowName")
         word = check.get("conclusion") or check.get("state") or check.get("status") or ""
         if isinstance(name, str) and isinstance(word, str):
@@ -9153,9 +9151,7 @@ def pr_ci_of(rollup):
         return "none"
     failing = ("FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR")
     pending = False
-    for check in rollup:
-        if not isinstance(check, dict):
-            continue
+    for check in load_module("ci_runs").newest(rollup):   # the NEWEST run of each check decides: a green re-run supersedes the red run it replaced (#534)
         verdict = str(check.get("conclusion") or check.get("state") or "").upper()
         if verdict in failing:
             return "failing"

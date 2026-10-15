@@ -55095,6 +55095,97 @@ class TestEarlyDecisionsWrite(DecisionsBase):
         self.assertGreater(stale[0], before, "a stale file was rewritten before the sources were collected")
 
 
+def ci_run(workflow, name, conclusion, completed=None, started=None, status="COMPLETED"):
+    """One entry of gh's statusCheckRollup, as `gh pr view --json statusCheckRollup` writes a check run."""
+    entry = {"workflowName": workflow, "name": name, "status": status, "conclusion": conclusion,
+             "startedAt": started or completed or "2026-10-15T15:00:00Z", "completedAt": completed or "0001-01-01T00:00:00Z"}
+    return entry
+
+
+class TestNewestCiRuns(unittest.TestCase):
+    """Ask #534: the NEWEST run of each check decides the CI verdict, in pr_ci_of and pr_checks_of alike."""
+
+    RERUN = [ci_run("ci", "test (macos)", "FAILURE", "2026-10-15T15:53:00Z"),
+             ci_run("ci", "test (macos)", "SUCCESS", "2026-10-15T16:16:00Z"),
+             ci_run("ci", "test (ubuntu)", "SUCCESS", "2026-10-15T15:50:00Z"),
+             ci_run("ci", "test (ubuntu)", "SUCCESS", "2026-10-15T16:10:00Z")]
+
+    def test_s1_a_green_rerun_supersedes_the_red_run_it_replaced(self):
+        self.assertEqual(sb.pr_ci_of(self.RERUN), "green")
+        self.assertEqual(sb.pr_ci_of(list(reversed(self.RERUN))), "green", "the order of the list does not matter")
+
+    def test_s2_a_failed_run_newer_than_a_successful_one_is_failing(self):
+        rollup = [ci_run("ci", "test", "SUCCESS", "2026-10-15T15:00:00Z"), ci_run("ci", "test", "FAILURE", "2026-10-15T16:00:00Z")]
+        self.assertEqual(sb.pr_ci_of(rollup), "failing")
+        self.assertEqual(sb.pr_ci_of(list(reversed(rollup))), "failing")
+
+    def test_s3_a_newest_run_in_progress_is_pending_over_an_older_green(self):
+        running = ci_run("ci", "test", "", None, "2026-10-15T16:30:00Z", status="IN_PROGRESS")
+        self.assertEqual(sb.pr_ci_of([ci_run("ci", "test", "SUCCESS", "2026-10-15T16:00:00Z"), running]), "pending")
+        untimed = {"workflowName": "ci", "name": "test", "status": "IN_PROGRESS", "conclusion": ""}
+        self.assertEqual(sb.pr_ci_of([ci_run("ci", "test", "SUCCESS", "2026-10-15T16:00:00Z"), untimed]), "pending", "a run with no time at all that is unfinished is never hidden")
+
+    def test_s4_the_checks_list_shows_each_check_once_with_its_newest_conclusion(self):
+        listed = sb.pr_checks_of(self.RERUN)
+        self.assertEqual(listed, [{"name": "test (macos)", "conclusion": "success"}, {"name": "test (ubuntu)", "conclusion": "success"}])
+        self.assertEqual(len(sb.pr_checks_of(self.RERUN + [ci_run("ci", "lint", "SUCCESS", "2026-10-15T16:00:00Z")])), 3, "3 entries for 3 checks")
+
+    def test_s5_an_untimed_or_unreadable_entry_never_makes_the_verdict_green(self):
+        untimed = [{"workflowName": "ci", "name": "test", "status": "COMPLETED", "conclusion": "FAILURE"},
+                   {"workflowName": "ci", "name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"}]
+        self.assertEqual(sb.pr_ci_of(untimed), "failing", "entries tied for newest are all kept: a failing one still fails")
+        self.assertNotEqual(sb.pr_ci_of(untimed + [{"workflowName": "ci", "name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS"}]), "green")
+        unreadable = [ci_run("ci", "test", "SUCCESS", "2026-10-15T16:00:00Z"), {"name": "lint", "completedAt": "not a time"}, "junk", None]
+        self.assertEqual(sb.pr_ci_of(unreadable), "pending", "an entry with no readable conclusion keeps the old cautious reading")
+        self.assertEqual(sb.pr_ci_of([{"conclusion": "FAILURE"}, {"conclusion": "SUCCESS"}]), "failing", "entries that name no check are each their own check")
+
+    def test_s6_two_workflows_with_a_check_of_the_same_name_are_separate_checks(self):
+        rollup = [ci_run("build", "test", "FAILURE", "2026-10-15T15:00:00Z"), ci_run("lint", "test", "SUCCESS", "2026-10-15T16:00:00Z")]
+        self.assertEqual(sb.pr_ci_of(rollup), "failing", "a red check is not hidden by the other workflow's green")
+        self.assertEqual(len(sb.pr_checks_of(rollup)), 2)
+
+    def test_an_older_run_that_finishes_after_a_newer_one_started_does_not_hide_the_running_one(self):
+        older = ci_run("ci", "test", "SUCCESS", "2026-10-15T10:30:00Z", "2026-10-15T10:00:00Z")   # started 10:00, finished 10:30
+        newer = ci_run("ci", "test", "", None, "2026-10-15T10:20:00Z", status="IN_PROGRESS")        # started 10:20, still running
+        for rollup in ([older, newer], [newer, older]):
+            self.assertEqual(sb.pr_ci_of(rollup), "pending")
+            self.assertEqual(sb.pr_checks_of(rollup), [{"name": "test", "conclusion": "in_progress"}], "listed once, as running")
+
+    def test_any_unfinished_run_of_a_check_makes_it_pending_even_under_a_newer_completed_one(self):
+        stuck = ci_run("ci", "test", "", None, "2026-10-15T09:00:00Z", status="IN_PROGRESS")
+        newer = ci_run("ci", "test", "SUCCESS", "2026-10-15T10:30:00Z", "2026-10-15T10:00:00Z")
+        self.assertEqual(sb.pr_ci_of([stuck, newer]), "pending")
+
+    def test_the_newest_started_completed_run_decides_even_when_an_older_attempt_finishes_later_red(self):
+        newer_green = ci_run("ci", "test", "SUCCESS", "2026-10-15T10:25:00Z", "2026-10-15T10:20:00Z")
+        older_red = ci_run("ci", "test", "FAILURE", "2026-10-15T10:40:00Z", "2026-10-15T10:00:00Z")   # an old attempt that failed late
+        self.assertEqual(sb.pr_ci_of([older_red, newer_green]), "green", "the run that started later decides")
+        self.assertEqual(sb.pr_ci_of([newer_green, older_red]), "green")
+        newer_red = ci_run("ci", "test", "FAILURE", "2026-10-15T10:25:00Z", "2026-10-15T10:20:00Z")
+        older_green = ci_run("ci", "test", "SUCCESS", "2026-10-15T10:40:00Z", "2026-10-15T10:00:00Z")
+        self.assertEqual(sb.pr_ci_of([older_green, newer_red]), "failing")
+
+    def test_runs_that_started_together_are_ordered_by_completion_and_a_full_tie_keeps_both(self):
+        red_late = ci_run("ci", "test", "FAILURE", "2026-10-15T10:40:00Z", "2026-10-15T10:00:00Z")
+        green_early = ci_run("ci", "test", "SUCCESS", "2026-10-15T10:30:00Z", "2026-10-15T10:00:00Z")
+        self.assertEqual(sb.pr_ci_of([green_early, red_late]), "failing", "the one completing later decides")
+        same = ci_run("ci", "test", "SUCCESS", "2026-10-15T10:40:00Z", "2026-10-15T10:00:00Z")
+        self.assertEqual(sb.pr_ci_of([same, dict(red_late)]), "failing", "a full tie keeps both: failure beats success")
+
+    def test_status_contexts_without_a_workflow_keep_working(self):
+        contexts = [{"context": "ci/legacy", "state": "FAILURE"}, {"context": "ci/other", "state": "SUCCESS"}]
+        self.assertEqual(sb.pr_ci_of(contexts), "failing")
+        self.assertEqual(sb.pr_ci_of([{"context": "ci/legacy", "state": "SUCCESS"}, {"context": "ci/other", "state": "SUCCESS"}]), "green")
+        self.assertEqual(sb.pr_checks_of(contexts), [{"name": "ci/legacy", "conclusion": "failure"}, {"name": "ci/other", "conclusion": "success"}])
+
+    def test_the_helper_is_pure_and_handles_what_is_not_a_list(self):
+        ci_runs = sb.load_module("ci_runs")
+        self.assertEqual((ci_runs.newest(None), ci_runs.newest("x"), ci_runs.newest([])), ([], [], []))
+        before = json.dumps(self.RERUN)
+        ci_runs.newest(self.RERUN)
+        self.assertEqual(json.dumps(self.RERUN), before, "the rollup is not changed")
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.
