@@ -361,23 +361,15 @@ def _write_state(state_dir, data):
     os.replace(str(temp), str(path))
 
 
-def decisions_waiting(state_dir):
-    """{agent: open decisions} from decisions.json, or None when it cannot be read."""
-    try:
-        listed = json.loads((Path(state_dir) / "decisions.json").read_text()).get("decisions")
-    except (OSError, ValueError, AttributeError):
-        return None
-    if not isinstance(listed, list):
-        return None
-    found = {}
-    for item in listed:
-        if isinstance(item, dict) and not item.get("closed"):
-            found[str(item.get("agent"))] = found.get(str(item.get("agent")), 0) + 1
-    return found
+PR_KINDS = ("notice", "captain")   # the entries of decisions.json that are information about a pull request, not a wait
+DECISIONS_MAX = 1000             # entries of decisions.json looked at in one pass (the rest are ignored)
+_REPO_SHAPE = re.compile(r"[A-Za-z0-9_.-]{1,100}(/[A-Za-z0-9_.-]{1,100})?\Z")
 
 
 def decision_items(state_dir):
-    """[(repo, issue number)] of the open decisions of decisions.json (the issue of the ask, else the item's own number), or None when it cannot be read.
+    """([(repo, issue of the ask)], PR notices and holds) of the open entries of decisions.json, or None when it cannot be read.
+    A PR heads-up (kind `notice`) or a held pull request (kind `captain`) waits on no orchestrator and is only counted; any other entry waits, and one with no usable ask (a permission request, a question with no issue) is returned with no issue so that it belongs to nobody.
+    At most DECISIONS_MAX entries are read, and a repository that is not shaped like `owner/name` is dropped (the chain is then not read).
     The `agent` field is a metadata guess and is not read here."""
     try:
         listed = json.loads((Path(state_dir) / "decisions.json").read_text()).get("decisions")
@@ -385,12 +377,18 @@ def decision_items(state_dir):
         return None
     if not isinstance(listed, list):
         return None
-    out = []
-    for item in listed:
-        if isinstance(item, dict) and not item.get("closed"):
-            number = item.get("ask") if isinstance(item.get("ask"), int) and not isinstance(item.get("ask"), bool) else item.get("number")
-            out.append((str(item.get("repo") or ""), number if isinstance(number, int) and not isinstance(number, bool) else None))
-    return out
+    out, notices = [], 0
+    for item in listed[:DECISIONS_MAX]:
+        if not isinstance(item, dict) or item.get("closed"):
+            continue
+        if item.get("kind") in PR_KINDS:
+            notices += 1   # a heads-up or a held pull request: information, it waits on no orchestrator
+            continue
+        ask = item.get("ask")
+        repo = item.get("repo")
+        usable = isinstance(ask, int) and not isinstance(ask, bool) and ask > 0
+        out.append((repo if isinstance(repo, str) and _REPO_SHAPE.match(repo) else "", ask if usable else None))   # no usable ask: a real wait that belongs to nobody
+    return out, notices
 
 
 def charter_agent(body):
@@ -553,12 +551,13 @@ def expand_rows(ctx, state, budget, rows, asks_by_name, charters, now, problems)
 
 
 def attribute_decisions(ctx, state, budget, asks_by_name, charters, now, problems):
-    """({orchestrator: waiting decisions}, how many could not be attributed, or None when decisions.json cannot be read). A decision belongs to the
+    """({orchestrator: waiting decisions}, how many could not be attributed, PR notices and holds, or None when decisions.json cannot be read). A decision belongs to the
     orchestrator whose open ask or charter is on the parent chain of its issue (up to PARENT_LEVELS levels, the same cached and budgeted reads);
     one that cannot be resolved belongs to nobody: the `agent` field of the list is never used."""
-    items = decision_items(ctx.state_dir)
-    if items is None:
-        return None, 0
+    read = decision_items(ctx.state_dir)
+    if read is None:
+        return None, 0, 0
+    items, notices = read
     owner = {}
     for name, lst in asks_by_name.items():
         for ask in lst:
@@ -586,7 +585,7 @@ def attribute_decisions(ctx, state, budget, asks_by_name, charters, now, problem
             nobody += 1
         else:
             counts[found] = counts.get(found, 0) + 1
-    return counts, nobody
+    return counts, nobody, notices
 
 
 def _refresh_asks(ctx, state, now, rows=()):
@@ -620,8 +619,8 @@ def _refresh_asks(ctx, state, now, rows=()):
     charter_numbers = state.get("charter_of") or {}
     rows, unattributed = expand_rows(ctx, state, budget, list(rows), asks_by_name, charter_numbers, now, problems)
     state["unattributed"] = unattributed
-    counts, nobody = attribute_decisions(ctx, state, budget, asks_by_name, charter_numbers, now, problems)
-    state["decision_counts"], state["decisions_unattributed"] = counts, nobody
+    counts, nobody, notices = attribute_decisions(ctx, state, budget, asks_by_name, charter_numbers, now, problems)
+    state["decision_counts"], state["decisions_unattributed"], state["pr_notices"] = counts, nobody, notices
     state["reads"] = budget.to_state()
     return problems, rows
 
@@ -697,6 +696,8 @@ def status_lines(state_dir, now):
             num(f["oldest_stall_hours"]), num(f["moved_1h"]), num(f.get("charter_moves_1h")), f["messages"], num(f["decisions"]), f["busy"], f["idle"]))
     if state.get("decisions_unattributed"):
         out.append("  %d decision(s) not attributed (the parent of their issue could not be read, or no orchestrator's charter is on its chain)" % state["decisions_unattributed"])
+    if state.get("pr_notices"):
+        out.append("  PR notices and holds %d (heads-ups and held pull requests: information, never counted as waiting)" % state["pr_notices"])
     if state.get("unattributed"):
         out.append("  %d movement(s) not attributed (a referenced issue's parent could not be read)" % state["unattributed"])
     if state.get("problems"):

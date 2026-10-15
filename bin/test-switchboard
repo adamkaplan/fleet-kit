@@ -48633,7 +48633,7 @@ class TestLoadAlert(Base):
         self.assertEqual(len(row["numbers"]), self.health.MOVES_NUMBERS_MAX)
 
     def test_unreadable_decisions_and_a_torn_audit_tail_are_not_zero_and_not_fatal(self):
-        self.assertIsNone(self.health.decisions_waiting(str(self.state_dir)))
+        self.assertIsNone(self.health.decision_items(str(self.state_dir)))
         (self.state_dir / "audit.jsonl").write_text("x" * 100 + "\n")
         with mock.patch.object(self.health, "AUDIT_TAIL_BYTES", 40):
             self.assertEqual(self.health.audit_moves(str(self.state_dir), 0), [])
@@ -49323,13 +49323,47 @@ class TestLoadAlert(Base):
         lines = self.health.status_lines(str(self.state_dir), self.T0)
         self.assertEqual(len([l for l in lines if "1 decision(s) not attributed" in l]), 1)
 
+    def test_a_notice_or_a_held_pr_is_information_and_a_real_wait_without_an_ask_is_not_attributed(self):
+        tick, reads = self.decisions_world([{"kind": "notice", "ask": None, "number": 10, "repo": "r"}, {"kind": "captain", "ask": None, "number": 20, "repo": "r"},
+                                            {"kind": "permission", "ask": None, "repo": "r"}, {"kind": "question", "ask": 0}, {"ask": 10, "repo": "r"}], {})
+        tick()
+        got = self.latest()
+        self.assertEqual((got["a"]["decisions"], got["b"]["decisions"], reads), (1, 0, []))               # the own number is not a fallback
+        lines = self.health.status_lines(str(self.state_dir), self.T0)
+        self.assertEqual([l.strip().split(" (")[0] for l in lines if "PR notices and holds" in l], ["PR notices and holds 2"])
+        self.assertEqual([l.strip().split(" (")[0] for l in lines if "not attributed" in l], ["2 decision(s) not attributed"])
+        self.assertEqual(self.health.decision_items(str(self.state_dir)), ([("r", None), ("", None), ("r", 10)], 2))
+
+    def test_a_malformed_decisions_file_counts_nothing_and_breaks_nothing(self):
+        for text in ["not json", "[]", '{"decisions": 5}', '{"decisions": [1, "x", null, {"ask": true, "repo": 7}, {"ask": -3}, {"ask": 1.5}]}']:
+            shutil.rmtree(str(self.state_dir)); self.state_dir.mkdir(mode=0o700)
+            tick, reads = self.decisions_world([], {})
+            (self.state_dir / "decisions.json").write_text(text)
+            tick()
+            self.assertEqual((self.latest()["a"]["decisions"], reads), (None if text in ("not json", "[]", '{"decisions": 5}') else 0, []), text)
+
+    def test_the_decision_items_are_capped_and_a_bad_repository_is_not_read(self):
+        many = [{"ask": 10, "repo": "r"} for _ in range(self.health.DECISIONS_MAX + 50)]
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": many}))
+        items, notices = self.health.decision_items(str(self.state_dir))
+        self.assertEqual((len(items), notices), (self.health.DECISIONS_MAX, 0))
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [{"ask": 5, "repo": "../x y"}, {"ask": 6, "repo": "acme/api"}]}))
+        self.assertEqual(self.health.decision_items(str(self.state_dir))[0], [("", 5), ("acme/api", 6)])
+
+    def test_the_decision_chain_stops_at_the_depth_cap(self):
+        deep = {600: 601, 601: 602, 602: 603, 603: 10}                                                   # 600 is four parents below ask 10
+        tick, reads = self.decisions_world([{"ask": 600, "repo": "r"}], deep)
+        tick()
+        got = self.latest()
+        self.assertEqual((got["a"]["decisions"], reads, self.health.PARENT_LEVELS), (0, [600, 601, 602], 3))
+
     def test_decision_chains_are_read_once_and_count_in_the_account_budget(self):
         tick, reads = self.decisions_world([{"agent": "a", "ask": 500, "repo": "r"}, {"agent": "a", "ask": 501, "repo": "r"}], {500: 10, 501: 10})
         for k in range(3):
             tick(self.T0 + k * 600)
         self.assertEqual(sorted(reads), [500, 501])
         state = json.loads((self.state_dir / "load.json").read_text())
-        self.assertEqual(len([r for r in state["reads"] if True]) >= 2, True)
+        self.assertEqual(len(state["reads"]), 4)                                                        # two asks lists (a, b) and the two parents, none repeated over three passes
         self.assertEqual(state["parents"], {"r#500": 10, "r#501": 10})
 
     def test_an_idle_pass_rewrites_nothing(self):
@@ -49914,6 +49948,56 @@ class TestDecisionsStaleBound(unittest.TestCase):
         stale = [line for line in lines if "120 s" in line and ("stale" in line or "Staleness" in line or "not updating" in line or "older than" in line)]
         self.assertEqual(stale, [])
         self.assertGreaterEqual(len([line for line in lines if "180 s" in line and ("stale" in line or "Staleness" in line or "not updating" in line or "older than" in line)]), 4)
+
+
+class TestDecisionIdForms(WriteWorld):
+    """Ask #463: a decision is found by the natural forms of its id, and a miss names the right one."""
+
+    def setUp(self):
+        super().setUp()
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        self.gh.issue(WEB, 2, "Other repo", labels=["me:awaiting-cos"])
+        for number in (5, 6, 7, 9):
+            self.gh.issue(API, number, "Issue %d" % number, labels=["me:awaiting-cos"])
+        self.as_agent("cos")
+
+    def test_s1_every_natural_spelling_of_the_id_finds_the_one_decision(self):
+        for number, spelling in ((5, "acme/api#5"), (6, "api#6"), (7, "#7")):
+            with self.subTest(spelling=spelling):
+                code, out, err = self.main("decisions", "escalate", spelling)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.gh.names(API, number), ["me:awaiting-user"], "the one the spelling names, and only it")
+        self.assertEqual(self.gh.names(API, 9), ["me:awaiting-cos"])
+
+    def test_s2_a_miss_lists_the_ids_that_carry_the_same_number(self):
+        code, out, err = self.main("decisions", "resolve", "widget-api#9")
+        self.assertEqual(code, 2)
+        self.assertEqual((err + out).count("api#9"), 2, "once as the name that missed, once as the id it should have been: %s" % (err + out))
+        self.assertIn("a decision numbered 9 is listed as api#9", err + out)
+
+    def test_s3_a_number_in_two_repositories_is_refused_and_both_are_listed(self):
+        before = (self.gh.names(API, 2), self.gh.names(WEB, 2))
+        code, out, err = self.main("decisions", "escalate", "#2")
+        self.assertEqual(code, 2)
+        self.assertIn("api#2", err)
+        self.assertIn("web#2", err)
+        self.assertEqual((self.gh.names(API, 2), self.gh.names(WEB, 2)), before, "nothing was escalated")
+
+    def test_s4_the_owner_and_repository_form_picks_one_of_two(self):
+        code, out, err = self.main("decisions", "escalate", "acme/web#2")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.gh.names(WEB, 2), ["me:awaiting-user"])
+        self.assertEqual(self.gh.names(API, 2), ["me:awaiting-cos"], "the other is unchanged")
+
+    def test_the_listed_id_still_works_and_the_role_check_is_unchanged_for_the_new_spellings(self):
+        self.assertEqual(self.id_of("Which database?"), "api#2")
+        self.assertEqual(self.main("decisions", "escalate", "api#2")[0], 0)
+        self.assertEqual(self.gh.names(API, 2), ["me:awaiting-user"])
+        self.as_agent("api-orch")
+        code, out, err = self.main("decisions", "escalate", "acme/api#5")
+        self.assertEqual(code, 2)
+        self.assertIn("only the Chief of Staff", err)
+        self.assertEqual(self.gh.names(API, 5), ["me:awaiting-cos"])
 
 
 if __name__ == "__main__":
