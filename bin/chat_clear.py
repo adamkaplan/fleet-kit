@@ -345,6 +345,9 @@ def timing_problem(offer, created, now):
     return None
 
 
+HEDGE = re.compile(r"\?|\b(?:not|no|never|don'?t|doesn'?t|isn'?t|aren'?t|won'?t|can'?t|cannot|wait|hold|stop|once|after|until|unless|if|when|before|but|maybe|probably|should|would|could)\b|n't\b", re.IGNORECASE)
+
+
 def screen(text, offers, created, now):
     """The checks no model can waive. Returns {"verdict": "candidate", "pr"} when the message names exactly ONE number, that number stands alone, exactly one
     offer has it and the message came AFTER the owner was shown that offer, else {"verdict": "question", "why": <code>, "prs": [...]} (the owner is asked,
@@ -357,6 +360,8 @@ def screen(text, offers, created, now):
     * `unclear_number`: its one number sits inside a word or a decimal (`abc366`, `3.66`);
     * `not_offered`: the number is not one of the offers;
     * `ambiguous_number`: more than one offer has that number (the same number in two repositories);
+    * `hedged`: the message asks, negates or conditions ("is 366 good to go?", "366 is not good to go", "366 is good to go once CI passes"): a clear is
+      never inferred from words like that, whatever a judge would say. The list is deliberately broad: a missed clear is one more sentence from the owner;
     * `no_time`, `before_offer`, `expired`: see `timing_problem` (`created` is the message's time, `now` the clock)."""
     text = text if isinstance(text, str) else ""
     prs = sorted(offers or {})
@@ -371,6 +376,8 @@ def screen(text, offers, created, now):
         return {"verdict": "question", "why": "several_numbers", "prs": prs}
     if not _standalone(text, numbers[0]):
         return {"verdict": "question", "why": "unclear_number", "prs": prs}
+    if HEDGE.search(text):
+        return {"verdict": "question", "why": "hedged", "prs": prs}
     matches = [pr for pr in prs if int(pr.rsplit("#", 1)[1]) == numbers[0]]
     if not matches:
         return {"verdict": "question", "why": "not_offered", "prs": prs}
@@ -387,3 +394,133 @@ def head_matches(offer, current_head):
     that was recorded after the offers were lost and has not been shown (`shown: false`)."""
     return isinstance(offer, dict) and offer.get("shown") is True and isinstance(current_head, str) and bool(current_head) \
         and offer.get("head") == current_head
+
+
+# ----------------------------------------------------------------------------- slice 2: the judge's question and the decision
+#
+# Jev answers ONE choice question with a probability for every option. It can only CONFIRM what the deterministic checks already found (the message
+# names exactly one offered PR, unhedged) or VETO it; it never adds a PR the checks did not name. Anything else (unsure, unreachable, a different
+# offer, "several") is a question to the owner, asked once. Nothing here clears anything: slice 3 acts on `decide`'s "clear".
+
+JUDGE_ID = "clears"
+OPT_SEVERAL, OPT_ASKS, OPT_NOTHING = "several", "asks", "nothing"
+HIGH_CONFIDENCE = 0.9          # the bar for a clear: the config's min_confidence may only raise it
+NOTHING_CONFIDENCE = 0.5       # "this message is not about clearing" needs this much before the owner is NOT asked
+JUDGE_TEXT_MAX = 1000
+JUDGE_OFFERS_MAX = 40
+JUDGE_INSTRUCTIONS = (
+    "The owner of a software fleet holds some pull requests until he says they may go. He has just sent a message to his assistant. "
+    "Does this message clear exactly one of the held pull requests listed below, clear several of them, ask something about them, "
+    "or say nothing about clearing a held pull request?")
+
+
+def judge_request(text, offers):
+    """(state, questions) for one judge call: the message and the offers (PR, short head, one-line summary), and the options."""
+    shown = [(pr, offers[pr]) for pr in sorted(offers)[:JUDGE_OFFERS_MAX]]
+    state = {"message": _clean(text, JUDGE_TEXT_MAX),
+             "held": [{"pr": pr, "head": str(offer.get("head", ""))[:8], "summary": _clean(offer.get("summary"), SUMMARY_MAX)} for pr, offer in shown]}
+    criteria = {}
+    for pr, offer in shown:
+        criteria[pr] = "The message clears %s (%s) and no other held pull request: the owner says it may go." % (pr, _clean(offer.get("summary"), SUMMARY_MAX) or "no summary")
+    criteria[OPT_SEVERAL] = "The message clears more than one held pull request, or all of them, or does not say which."
+    criteria[OPT_ASKS] = "The message asks a question about a held pull request, or sets a condition, or says it is NOT ready."
+    criteria[OPT_NOTHING] = "The message says nothing about clearing a held pull request."
+    return state, {JUDGE_ID: {"type": "choice", "instructions": JUDGE_INSTRUCTIONS, "criteria": criteria}}
+
+
+def judge(jev, text, offers, min_confidence=HIGH_CONFIDENCE):
+    """One Jev call. {"choice", "confident", "probabilities", "reason", "jev_choice", ...}; NEVER raises. No judge, an unreachable or erring one, an answer with no
+    probabilities and an answer below the bar all give `choice` None and `confident` False: they confirm nothing."""
+    bar = max(float(min_confidence), HIGH_CONFIDENCE)
+    out = {"choice": None, "confident": False, "probabilities": None, "reason": "", "jev_choice": None, "model": None, "usage": {}, "latency_ms": None}
+    if jev is None:
+        out["reason"] = "no judge is configured"
+        return out
+    state, questions = judge_request(text, offers)
+    try:
+        result = jev.decide(state, questions)
+        answer = result["answers"][JUDGE_ID]
+    except Exception as err:   # JevError (unreachable, timeout, bad answer, ...): its reason is the only thing kept, never its text
+        out["reason"] = "jev %s" % getattr(err, "reason", type(err).__name__)
+        out["latency_ms"] = getattr(err, "latency_ms", None)
+        return out
+    if not isinstance(answer, dict):
+        out["reason"] = "jev gave an unreadable answer"
+        return out
+    probabilities = answer.get("probabilities")
+    out.update(jev_choice=answer.get("choice"), probabilities=probabilities, model=result.get("model"), usage=result.get("usage") or {},
+               latency_ms=result.get("latency_ms"))
+    if not isinstance(probabilities, dict) or not probabilities:
+        out["reason"] = "jev gave no probabilities"
+        return out
+    top = probabilities.get(answer.get("choice"), 0.0) if isinstance(answer.get("choice"), str) else 0.0
+    if not isinstance(top, (int, float)) or top < bar:
+        out["reason"] = "unsure: %s at %s is below %.2f" % (answer.get("choice"), top, bar)
+        return out
+    out.update(choice=answer["choice"], confident=True, reason="confident: %s at %.2f" % (answer["choice"], top))
+    return out
+
+
+QUESTION_OFFERS_MAX = 10
+REASONS = {"no_number": "your message names no pull request number", "several_numbers": "your message names more than one pull request",
+           "not_offered": "that number is not one of the held pull requests", "ambiguous_number": "that number is held in more than one repository",
+           "hedged": "your message asks, negates or sets a condition",
+           "too_long": "your message is too long to read a pull request number from", "unclear_number": "the number in your message sits inside a word",
+           "no_time": "the time of your message or of the offer could not be read", "before_offer": "your message was written before you were shown that pull request",
+           "expired": "that offer is old and must be shown to you again first", "jev": "I could not be sure you meant to clear it"}
+
+
+def question_text(why, offers, prs=None, current_heads=None):
+    """The ONE question the owner is asked: why nothing was cleared, what is held for him (PR, short head, summary) and how to clear one. Control characters
+    are out of every line. `current_heads` {pr: head} adds the PR's new head where it differs from the one he was shown (a push since)."""
+    names = sorted(prs if prs else offers)[:QUESTION_OFFERS_MAX]
+    lines = ["Nothing was cleared: %s." % REASONS.get(why, why)]
+    if names:
+        lines.append("Held for you now:")
+    for pr in names:
+        offer = offers.get(pr) or {}
+        line = "- %s at %s: %s" % (pr, str(offer.get("head", ""))[:8], _clean(offer.get("summary"), SUMMARY_MAX) or "no summary")
+        now = (current_heads or {}).get(pr)
+        if isinstance(now, str) and now and now != offer.get("head"):
+            line += " (it has a new head, %s, since you were shown this one)" % now[:8]
+        lines.append(line)
+    if len(offers) > len(names) and not prs:
+        lines.append("... and %d more." % (len(offers) - len(names)))
+    lines.append("To clear one, say its number, for example: `%s is good to go`." % (names[0].rsplit("#", 1)[1] if names else "366"))
+    return "\n".join(lines)
+
+
+CLEARISH = re.compile(r"\b(?:good to go|ok(?:ay)? to (?:go|merge|ship)|go(?:es)? ahead|cleared?|clearing|approved?|approving|lgtm|ship it|merge it|release[ds]?|unhold|let it (?:go|through)|fine to (?:go|merge)|ready to (?:go|merge|ship))\b", re.IGNORECASE)
+
+
+def decide(jev, text, offers, created, now, min_confidence=HIGH_CONFIDENCE):
+    """What to do about the owner's message. {"action": "clear" | "ask" | "none", "pr", "why", "screen", "judge", "question", "shown"}.
+
+    * no offers, or a message with no clearing words (`good to go`, `cleared`, `approved`, `ship it`, ...): `none`; the judge is not called;
+    * the screen refuses (no number, several, not offered, ambiguous, hedged, too long, a message from before the offer, an old offer): the judge is asked only whether the message is about clearing at all:
+      "nothing" at NOTHING_CONFIDENCE means `none` (the owner is not bothered), anything else is `ask`. A judge's high-confidence "clears it" changes nothing here;
+    * the screen found ONE candidate: `clear` only when the judge picks exactly that PR at the high bar; "nothing" at its bar is `none`; every other
+      answer (unsure, unreachable, another offer, several, asks) is `ask`.
+    `shown` lists the PRs the question puts in front of the owner, for `show()` to move their shown heads."""
+    checked = screen(text, offers, created, now)
+    if checked.get("why") == "no_offers":
+        return {"action": "none", "pr": None, "why": "no_offers", "screen": checked, "judge": None, "question": None, "shown": []}
+    if not CLEARISH.search(text or ""):   # chat that has no clearing words in it is not asked about and costs no judge call
+        return {"action": "none", "pr": None, "why": "no clearing words", "screen": checked, "judge": None, "question": None, "shown": []}
+    verdict = judge(jev, text, offers, min_confidence)
+    base = {"pr": None, "screen": checked, "judge": verdict, "question": None, "shown": []}
+    probabilities = verdict.get("probabilities") or {}
+    says_nothing = verdict.get("jev_choice") == OPT_NOTHING and probabilities.get(OPT_NOTHING, 0.0) >= NOTHING_CONFIDENCE
+    if checked["verdict"] == "candidate":
+        pr = checked["pr"]
+        if verdict["confident"] and verdict["choice"] == pr:
+            return dict(base, action="clear", pr=pr, why="confirmed")
+        if verdict["confident"] and verdict["choice"] == OPT_NOTHING:
+            return dict(base, action="none", why="not about clearing")
+        why = "jev"
+        prs = [pr]
+    else:
+        if says_nothing:
+            return dict(base, action="none", why="not about clearing")
+        why, prs = checked["why"], checked.get("prs") or None
+    return dict(base, action="ask", why=why, question=question_text(why, offers, prs), shown=sorted(prs or offers)[:QUESTION_OFFERS_MAX])
