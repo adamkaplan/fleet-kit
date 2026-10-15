@@ -79,7 +79,9 @@ from urllib.parse import quote
 import uuid
 
 
-_MODULE_LOAD_LOCK = threading.RLock()   # reentrant: a module that loads another while it runs does not wait for itself
+_MODULE_LOCKS = {}            # one reentrant lock per module name: a load of one module never waits behind the import of another
+_MODULE_LOCKS_GUARD = threading.Lock()   # held only to fetch or make a name's lock, never across an import
+_MODULES_DONE = {}            # name -> the module object whose import FINISHED (sys.modules holds a module while it still runs)
 
 
 def load_module(name):
@@ -90,12 +92,20 @@ def load_module(name):
     unit, by wrappers, and is loaded by tests with SourceFileLoader, and none of those puts its directory on
     sys.path. The real path of this file (symlinks resolved) is always right. A copy already loaded from the
     same file is reused, so two loads of this script share one module. The name is a plain module name, never
-    a path: anything else is refused (ValueError), and a name with no file here fails as it always did. One lock covers a load, so concurrent first loads of a module all get the finished module (a
-    failed load is not kept: every caller sees the error)."""
+    a path: anything else is refused (ValueError), and a name with no file here fails as it always did.
+
+    A module already loaded is returned with no lock at all (this is on the hot path). A first load holds the lock of THAT name only, and
+    checks again once it has it, so concurrent first loads of one module all get the finished module and a failed import (never kept) raises
+    for every caller; the import of one module never delays another."""
     if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
         raise ValueError("not a module name: %r" % (name,))
     path = os.path.join(os.path.dirname(os.path.realpath(__file__)), name + ".py")
-    with _MODULE_LOAD_LOCK:   # a module is in sys.modules while it runs: a second thread must wait for the first, never get it half loaded
+    done = _MODULES_DONE.get(name)
+    if done is not None and sys.modules.get(name) is done and os.path.realpath(getattr(done, "__file__", "") or "") == path:
+        return done
+    with _MODULE_LOCKS_GUARD:
+        lock = _MODULE_LOCKS.setdefault(name, threading.RLock())
+    with lock:   # reentrant: a module that loads another while it runs does not wait for itself
         held = sys.modules.get(name)
         if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
             return held
@@ -107,6 +117,7 @@ def load_module(name):
         except BaseException:
             sys.modules.pop(name, None)
             raise
+        _MODULES_DONE[name] = module
         return module
 
 

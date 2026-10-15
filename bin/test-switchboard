@@ -48907,6 +48907,26 @@ class TestModuleLoader(Base):
         self.assertEqual(errors, ["boom"] * 8, "the failing module raises for every thread")
         self.assertNotIn("failing_mod", sys.modules)
 
+    def test_s9b_a_slow_import_never_delays_another_module_and_a_module_may_load_another(self):
+        tmp, mod = self._copy({
+            "slow_one": "import threading\nthreading._ld_started.set()\nthreading._ld_gate.wait(20)\nREADY = True\n",
+            "quick_one": "VALUE = 1\n", "fresh_one": "VALUE = 2\n",
+            "b_mod": "VALUE = 'b'\n",
+            "a_mod": "import threading\nB = threading._ld_load('b_mod')\n"})
+        threading._ld_started, threading._ld_gate, threading._ld_load = threading.Event(), threading.Event(), mod.load_module
+        self.addCleanup(lambda: [delattr(threading, n) for n in ("_ld_started", "_ld_gate", "_ld_load") if hasattr(threading, n)])
+        self.addCleanup(threading._ld_gate.set)
+        quick = mod.load_module("quick_one")
+        slow = threading.Thread(target=lambda: mod.load_module("slow_one"))
+        slow.start()
+        self.assertTrue(threading._ld_started.wait(10))
+        self.assertIs(mod.load_module("quick_one"), quick, "an already loaded module needs no lock")
+        self.assertEqual(mod.load_module("fresh_one").VALUE, 2, "a first load of another module does not wait for the slow import")
+        self.assertTrue(slow.is_alive(), "both returned while the slow import was still running")
+        threading._ld_gate.set()
+        slow.join(20)
+        self.assertEqual(mod.load_module("a_mod").B.VALUE, "b", "a module that loads another while it runs")
+
     def test_s8_a_hostile_name_is_refused(self):
         tmp, mod = self._copy()
         (tmp.parent / "outside_mod.py").write_text("VALUE = 1\n")
