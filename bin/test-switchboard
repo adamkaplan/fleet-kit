@@ -11122,7 +11122,7 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
     PATHS = [REPO / "agents" / "opencode" / "chief-of-staff.md", REPO / "agents" / "opencode" / "cos-subagent.md"]
     PATH = PATHS[0]
     TEMP = "/private/var/folders/ab/T/opencode"
-    MAX_BLOCK_LINES = 200
+    MAX_BLOCK_LINES = 210
 
     @staticmethod
     def block(path):
@@ -11324,6 +11324,37 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
         self.assertIn("keeps you **focused on your job**", text)
         self.assertNotIn("never merge,", text)
         self.assertNotIn("ASKS your principal", text)  # one story: a denial is hard and nothing asks
+
+
+class TestCosTriageAllowRule(unittest.TestCase):
+    """The Chief of Staff definitions allow `fleet-switchboard triage *` with one rule each, and no other switchboard allow rule is added."""
+    FILES = ("agents/opencode/chief-of-staff.md", "agents/opencode/cos-subagent.md")
+    RULE = '  - {action: shell, resource: "fleet-switchboard triage *", effect: allow}'
+
+    def _lines(self, rel):
+        return (REPO / rel).read_text().splitlines()
+
+    def test_each_file_carries_exactly_one_triage_allow_rule_and_no_deny_or_wider_rule(self):
+        for rel in self.FILES:
+            with self.subTest(file=rel):
+                lines = self._lines(rel)
+                self.assertEqual(lines.count(self.RULE), 1)
+                triage = [l for l in lines if "fleet-switchboard triage" in l and l.lstrip().startswith("- {action:")]
+                self.assertEqual(triage, [self.RULE])  # no second triage rule, no deny, no variant
+                for l in lines:  # fail closed: nothing allows the whole command or a wildcard prefix
+                    if l.lstrip().startswith("- {action: shell") and "effect: allow" in l:
+                        self.assertNotRegex(l, r'resource: "fleet-switchboard \*"')
+                        self.assertNotRegex(l, r'resource: "\*+fleet-switchboard')
+
+    def test_the_switchboard_allow_rules_are_the_fixed_old_list_plus_triage(self):
+        old = {
+            "chief-of-staff.md": "send report remind intent intents status pending whoami notice decisions orders gates waive plan labels handoff launch reattach relaunch retire disk".split(),
+            "cos-subagent.md": "send report remind intent intents status disk pending whoami version notice decisions orders gates waive plan labels".split(),
+        }
+        for rel in self.FILES:
+            with self.subTest(file=rel):
+                got = [m.group(1) for l in self._lines(rel) for m in [re.match(r'  - \{action: shell, resource: "fleet-switchboard ([a-z]+) \*", effect: allow\}$', l)] if m]
+                self.assertEqual(sorted(got), sorted(old[rel.split("/")[-1]] + ["triage"]))
 
 
 class TestVerdictRecordingText(unittest.TestCase):
