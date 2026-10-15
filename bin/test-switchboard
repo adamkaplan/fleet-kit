@@ -23377,6 +23377,24 @@ class TestImpactFloorCommandAndPass(LedgerBase):
         sb.impact_would_hold_pass(engine, t + 400)
         self.assertEqual(len([e for e in self.world.audit() if e["event"] == "gate.would_hold"]), 2, "a new head is judged again")
 
+    def test_an_unreadable_matrix_file_is_said_loudly_by_the_pass_and_the_command_never_read_as_no_floor(self):
+        mod = sb.load_module("impact_floor")
+        broken = mock.patch.object(mod, "floor_for", side_effect=mod.MatrixError("the impact matrix file cannot be read (OSError: gone)"))
+        hub = FakeHub({"acme/app": [{"number": 9, "head": {"sha": LEDGER_HEAD}, "body": "PLAN: acme/app#7", "draft": False}]})
+        engine = self.world.new_engine("daemon")
+        engine.hub, engine.gh_runner = hub, self.route
+        engine.config, engine.state_dir = sb.load_config(), self.world.state
+        sb.ci_record_pass(engine, 100000.0)
+        with broken:
+            sb.impact_would_hold_pass(engine, 100000.0)
+            code, out, err = self.run_as("coder", "impact", "hold", "--dry-run")
+        self.assertEqual([e for e in self.world.audit() if e["event"] == "gate.would_hold"], [], "no judgement is made")
+        errors = [e for e in self.world.audit() if e["event"] == "impact.error"]
+        self.assertEqual([e["detail"].get("floor") for e in errors], ["unreadable"], "the pass says so, loudly")
+        self.assertEqual(code, sb.EXIT_ERROR)
+        self.assertEqual(len([line for line in err.splitlines() if line.strip()]), 1, err)
+        self.assertIn("cannot be read", err)
+
     def test_the_pass_is_off_when_disabled_or_killed_and_unlisted_repos_are_not_read(self):
         for edit in ("disabled", "killed"):
             with self.subTest(edit=edit):
