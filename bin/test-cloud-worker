@@ -9,6 +9,7 @@ for slice B's `cloud-worker`. Scenarios S1-S3 of the plan on #371 (U1, local beh
 import base64
 import contextlib
 import importlib.machinery
+import importlib.util
 import io
 import json
 import os
@@ -25,7 +26,10 @@ from unittest import mock
 os.environ.setdefault("FLEET_SWITCHBOARD_UNDER_TEST", "1")
 BIN = Path(__file__).resolve().parent
 loader = importlib.machinery.SourceFileLoader("cw_fleet_switchboard", str(BIN / "fleet-switchboard"))
-sb = loader.load_module()
+spec = importlib.util.spec_from_loader("cw_fleet_switchboard", loader)
+sb = importlib.util.module_from_spec(spec)
+sys.modules["cw_fleet_switchboard"] = sb   # what the removed load_module() did before executing
+loader.exec_module(sb)
 
 PASSWORD = "pw-" + "x" * 20
 
