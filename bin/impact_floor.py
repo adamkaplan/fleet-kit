@@ -257,6 +257,173 @@ def top_tier_hits(paths, matrix):
     return hits
 
 
+def narrow_rule(matrix):
+    """(globs, keys, max_files) of the matrix file's `owner_hold.narrow_by_diff` block, or None when it is absent or malformed (then the whole
+    top tier path holds, as it did before). The block names the paths whose hold depends on their CONTENT (an agent definition: only its permission
+    block counts), the top level front matter keys that make that block, and how many such files one pull request may change before it holds."""
+    hold = matrix.get("owner_hold") if isinstance(matrix, dict) else None
+    block = hold.get("narrow_by_diff") if isinstance(hold, dict) else None
+    if not isinstance(block, dict):
+        return None
+    globs, keys, limit = block.get("paths"), block.get("keys"), block.get("max_files")
+    if not (isinstance(globs, list) and globs and all(isinstance(g, str) and g.strip() for g in globs)):
+        return None
+    if not (isinstance(keys, list) and keys and all(isinstance(k, str) and re.fullmatch(r"[A-Za-z_][\w-]*", k) for k in keys)):
+        return None
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 50:
+        return None
+    return list(globs), list(keys), limit
+
+
+def narrow_paths(matrix, paths):
+    """([paths], limit): the changed paths the matrix file's `narrow_by_diff` block judges by content (a path another top tier glob also names stays a plain
+    top tier path), sorted, and the most such files one pull request may change before it holds unread. ([], None) when there is no usable block."""
+    rule, top = narrow_rule(matrix), owner_hold_rule(matrix)
+    if rule is None or top is None:
+        return [], None
+    globs, _keys, limit = rule
+    elsewhere = [g for named in top[2].values() for g in named if g not in globs]
+    return sorted({p for p in paths if isinstance(p, str) and matches(p, globs) and not matches(p, elsewhere)}), limit
+
+
+NARROW_TEXT_MAX = 200000   # a definition larger than this is not parsed: it holds
+
+
+_YAML_INDIRECTION = re.compile(r"(?:^|[\s:\[{,-])[&*!]\S")              # an anchor, an alias or a tag (outside quotes): a value can then come from somewhere else
+_YAML_QUOTED = re.compile(r"\"(?:[^\"\\]|\\.)*\"|'[^']*'")
+_YAML_BLOCK_SCALAR = re.compile(r"(?:^|[\s:-])[|>][+\-0-9]*\s*$")     # a block scalar indicator: `#` and blank lines inside it are content
+_LINE_BREAKS = ("\x85", "\u2028", "\u2029")                            # line ends a YAML 1.1 reader honours and `split` does not
+
+
+_DOUBLE_QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"')
+_SINGLE_QUOTED = re.compile(r"'(?:[^']|'')*'")
+_KEY_LINE = re.compile(r"([A-Za-z_][\w./*-]*)[ \t]*:(?:[ \t]+(.*))?$")
+
+
+def _after_comment(rest):
+    """True when `rest` (what follows a value on its line) is empty or a comment."""
+    return not rest.strip() or (rest[:1] in " \t" and rest.strip().startswith("#"))
+
+
+def _flow_closed(value):
+    """True when the flow collection that `value` starts with (`[` or `{`) closes on this line and only a comment follows. A quote opens only where a value can start."""
+    depth, quote, previous, index = 0, None, "", 0
+    while index < len(value):
+        char = value[index]
+        if quote:
+            if quote == '"' and char == "\\":
+                index += 1
+            elif char == quote:
+                if quote == "'" and value[index + 1:index + 2] == "'":
+                    index += 1
+                else:
+                    quote = None
+        elif char in "\"'" and previous in ":,[{":
+            quote = char
+        elif char == "#" and index and value[index - 1] in " \t":
+            return False   # a comment before the collection closed: what follows it (a closer too) is comment text, so the collection is still open
+        elif char in "[{":
+            depth += 1
+        elif char in "]}":
+            depth -= 1
+            if depth == 0:
+                return _after_comment(value[index + 1:])
+            if depth < 0:
+                return False
+        if not quote and not char.isspace():
+            previous = char
+        index += 1
+    return False
+
+
+def _value_ok(value):
+    """True for a value this reader understands: empty, one quoted scalar closed on the line, a flow collection closed on the line, or a plain scalar (no
+    indicator at its start, no `: ` inside). Everything else (a block scalar, an anchor, a tag, a directive, a complex key, a scalar left open) is refused."""
+    value = value.strip()
+    if not value:
+        return True
+    if value[0] == '"':
+        found = _DOUBLE_QUOTED.match(value)
+        return bool(found) and _after_comment(value[found.end():])
+    if value[0] == "'":
+        found = _SINGLE_QUOTED.match(value)
+        return bool(found) and _after_comment(value[found.end():])
+    if value[0] in "[{":
+        return _flow_closed(value)
+    if value[0] in "|>&*!%@`?:#,]}" or (value[0] == "-" and value[1:2] in ("", " ", "\t")):
+        return False
+    plain = re.split(r"[ \t]#", value, 1)[0]
+    return ": " not in plain and not plain.rstrip().endswith(":")
+
+
+def _line_ok(line):
+    """True when one front matter line has a shape this reader understands: a comment, a `key: value`, a `- value` or a `- key: value`, each with a value
+    that `_value_ok` accepts. A positive list on purpose: whatever is not on it cannot be judged line by line, and the caller holds."""
+    body = line.strip()
+    if body.startswith("#"):
+        return True
+    if body == "-" or body.startswith("- ") or body.startswith("-\t"):
+        body = body[1:].strip()
+        if not body:
+            return True
+        if body == "-" or body.startswith("- "):
+            return False   # a nested sequence on one line
+    found = _KEY_LINE.match(body)
+    return _value_ok(found.group(2) or "") if found else _value_ok(body)
+
+
+def permission_block(text, keys):
+    """{key: [normalised lines]} of the top level front matter keys `keys` in `text`, or None when it cannot be judged: no front matter, not text, too
+    large, or anything outside the plain subset of YAML that this reader understands (a quoted or merge key or any other column 0 line that is no plain
+    `key:`; an anchor, alias or tag; a repeated tracked key; a block scalar under a tracked key; a front matter closed anywhere but at column 0; any line whose shape is not on the positive list of `_line_ok` (a quoted scalar or flow collection that does not close on its own line, a complex key, a directive, a plain scalar spread over lines, ...); a Unicode
+    line break). The caller holds on None. A key's block is its line and every following line up to the next top level key; blank lines and comments at
+    column 0 are dropped, line ends and trailing space are normalised. Two versions have the same permission block when these dicts are equal."""
+    if not isinstance(text, str) or len(text) > NARROW_TEXT_MAX or any(mark in text for mark in _LINE_BREAKS):
+        return None
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if not lines or lines[0].rstrip() != "---":
+        return None
+    end = next((n for n in range(1, len(lines)) if lines[n].rstrip() == "---"), None)
+    if end is None:
+        return None
+    found, current = {}, None
+    for line in lines[1:end]:
+        if not line.strip():
+            continue
+        if not line.lstrip().startswith("#") and (_YAML_INDIRECTION.search(_YAML_QUOTED.sub('""', line)) or not _line_ok(line)):
+            return None
+        indented = line[0] in " \t"
+        if not indented and line.startswith("#"):
+            continue   # a comment at the start of a line (outside any block)
+        if indented:
+            if current is not None:
+                found[current].append(line.rstrip())   # content of a tracked block, a `#` line inside it too
+            continue
+        top = re.match(r"([A-Za-z_][\w-]*)\s*:", line)
+        if top:
+            current = top.group(1) if top.group(1) in keys else None
+            if current is not None:
+                if current in found:
+                    return None   # a repeated tracked key: which one a reader takes is not ours to guess
+                found[current] = [line.rstrip()]
+        elif line.startswith("- ") or line.rstrip() == "-":
+            if current is not None:
+                found[current].append(line.rstrip())   # a list item written at the key's own indentation
+        else:
+            return None   # a line that is no plain key (a quoted key, a merge key, a stray line)
+    if any(_YAML_BLOCK_SCALAR.search(line) for block in found.values() for line in block):
+        return None
+    return found
+
+
+def block_state(old, new, keys):
+    """"unchanged" or "changed" for two versions of a definition, "unreadable" when either has no parsable front matter."""
+    before, after = permission_block(old, keys), permission_block(new, keys)
+    if before is None or after is None:
+        return "unreadable"
+    return "unchanged" if before == after else "changed"
+
+
 def class_is_top_tier(matrix, cls):
     """True for a top tier class, a missing class and an UNKNOWN class (fail closed); False only for a class the matrix file names as not top tier
     (compared case-insensitively)."""
@@ -266,7 +433,7 @@ def class_is_top_tier(matrix, cls):
     return cls.strip().lower() not in rule[1]
 
 
-def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=()):
+def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=(), narrow=None, record=None):
     """The decision under the owner-hold rule. `paths`: every changed path (a deletion and a rename's old path too); `impacts`: [(severity, probability, class)]
     from the independent rating (class may be None); `floor_hit`: the paths that hit the old floor (floor_paths). Returns (decision, reasons):
 
@@ -274,7 +441,12 @@ def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=()):
         level and its class is top tier, missing or unknown;
       - "second-review": no hold, but a floor path outside the top tier, a hold-level rating of a class the matrix file names as not top tier, or a
         medium-band rating asks for a second independent review (the usual checks then decide the merge);
-      - "none" otherwise."""
+      - "none" otherwise.
+
+    `narrow` ({path: "unchanged"|"changed"|"added"|"removed"|"unreadable"}, from the caller's content reads) judges the paths the matrix file's
+    `narrow_by_diff` block names: only a changed permission block holds; an added, removed or unreadable one holds; a path with no entry is unread and
+    holds; more such paths than the block allows hold without being read. `record` ((action, class) of the independent impact reviewer's record for
+    this head, or None): a hold action of a top tier, missing or unknown class holds, of a class the matrix file names as not top tier asks for a second review."""
     reasons = []
     if owner_hold_rule(matrix) is None:   # FAIL CLOSED: no usable rule means every change holds for the owner
         reasons.append("owner_hold rule missing or malformed in the impact matrix file: every change holds")
@@ -283,8 +455,27 @@ def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=()):
     lost = sorted({p for p in paths if isinstance(p, str) and escapes(p)})
     if lost:   # a path that leaves the repository cannot be judged as a file of it: hold
         reasons.append("path outside the repository or not normalisable: %s" % ", ".join(repr(p)[:60] for p in lost[:3]))
-    for cls, got in sorted(top_tier_hits(paths, matrix).items()):
+    hits = top_tier_hits(paths, matrix)
+    prose = []   # narrow paths whose permission block did not change: no hold from the path
+    narrowed, limit = narrow_paths(matrix, paths)
+    if narrowed:
+        if len(narrowed) > limit:
+            reasons.append("more than %d definitions with a narrow rule changed (%d): not read, held" % (limit, len(narrowed)))
+        else:
+            for path in narrowed:
+                for cls in list(hits):
+                    hits[cls] = [x for x in hits[cls] if x != path]
+                state = (narrow or {}).get(path)
+                if state == "unchanged":
+                    prose.append(path)
+                else:
+                    why = {"changed": "permission block changed", "added": "added", "removed": "removed", "unreadable": "its permission block could not be read"}.get(state, "its permission block was not read")
+                    reasons.append("top tier path (permissions): %s (%s)" % (path, why))
+            hits = {cls: got for cls, got in hits.items() if got}
+    for cls, got in sorted(hits.items()):
         reasons.append("top tier path (%s): %s" % (cls, ", ".join(got[:5]) + (" ..." if len(got) > 5 else "")))
+    if record is not None and record[0] == "hold" and class_is_top_tier(matrix, record[1]):
+        reasons.append("independent impact review says hold, class %s" % (record[1] or "missing"))
     rated = []
     for severity, probability, cls in impacts:
         for _s, _p, level, action in rate(matrix, [(severity, probability)]):
@@ -295,6 +486,10 @@ def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=()):
     if reasons:
         return "hold", reasons
     softer = []
+    if prose:
+        softer.append("definition change without a permission block change (%s): a second independent review" % ", ".join(prose[:3]))
+    if record is not None and record[0] == "hold":   # only a class the matrix file names as not top tier reaches here
+        softer.append("independent impact review says hold, class %s: a second independent review" % record[1])
     if floor_hit:
         softer.append("floor: %d path(s) outside the top tier ask for a second independent review" % len(floor_hit))
     softer.extend("rating: %s / %s (%s), class %s, asks for a second independent review" % (s, p, level, cls) for s, p, level, action, cls in rated

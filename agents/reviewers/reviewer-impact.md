@@ -75,12 +75,18 @@ List every impact of the change, each as `<what changes> | <severity> | <probabi
 you never hold anything yourself: the switchboard decides what a hold does, and a deterministic floor of paths holds whatever you rate. If there is no impact,
 say `impact-action: none` and no impacts.
 
+When the action is `hold`, also name the class of the impact that drives it in the block's class line, one lower-case word: `credentials`, `identity` or `authority`
+(the top tier: only the owner's own clear lifts such a hold) or `availability`, `data`, `performance`, `correctness`, `compatibility`, `privacy` or `cost` (a second
+independent review and the usual checks decide). If your hold-level impacts are in several classes, name a top tier one. Leave the class line out when you are
+not sure of the class: a hold with no class is read as top tier. The switchboard keeps the class with your record for that exact head.
+
 ## Verdict block
 
 ```
 verdict: approve | request-changes | comment | incomplete
 head: <the commit judged>
 impact-action: hold | second-review | none
+impact-class: <class of the hold; omit unless the action is hold>
 findings:
 - <rule id> | block | <file:line> | <why it matters, one sentence> | <what would resolve it>
 - <rule id> | note | <file:line> | <why> | <what would resolve it>

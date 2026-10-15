@@ -24613,6 +24613,248 @@ class TestImpactFloorCommandAndPass(LedgerBase):
         (self.world.state / "plan-gates.off").unlink(missing_ok=True)
 
 
+class TestImpactClassAndNarrowForm(LedgerBase):
+    """#451 slice 2: the class in the impact reviewer's record, and an agent definition that holds only when its permission block changes. Synthetic
+    names; the route answers the contents reads and counts them."""
+
+    BASE = "c" * 40
+    DEF = '---\ndescription: a helper\nmode: subagent\npermissions:\n  - {action: read, resource: "*", effect: allow}\n---\nProse about the job.\n'
+
+    def setUp(self):
+        super().setUp()
+        self.extra_config = dict(FLOOR_CONFIG, plan_gates={"repos": {"acme/app": {"mode": "shadow"}}})
+        self.configure()
+        self.pr = dict(self.pr, baseRefOid=self.BASE)
+        self.reads, self.contents = [], {}
+        self.files(["docs/a.md"])
+
+    def route(self, argv, **kwargs):
+        if argv[0] == FAKE_GH and argv[1] == "api" and "/contents/" in argv[2]:
+            self.reads.append(argv[2])
+            match = re.search(r"/contents/([^?]+)\?ref=([0-9a-f]+)", argv[2])
+            text = self.contents.get((match.group(1), match.group(2)))
+            if text == "BROKEN":
+                return subprocess.CompletedProcess(argv, 1, "", "gh: HTTP 502")
+            if text is None:
+                return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"content": base64.b64encode(text.encode()).decode(), "encoding": "base64"}), "")
+        return super().route(argv, **kwargs)
+
+    def files(self, paths):
+        self.pr.update({"changedFiles": len(paths), "files": [{"path": p, "additions": 1, "deletions": 0} for p in paths]})
+
+    def definition(self, path, before, after):
+        self.contents[(path, self.BASE)], self.contents[(path, LEDGER_HEAD)] = before, after
+
+    def decide(self):
+        code, out, err = self.run_as("coder", "impact", "floor", self.PR, "--json")
+        self.assertEqual(code, 0, err)
+        report = json.loads(out)
+        return report["owner_decision"], report["owner_reasons"]
+
+    def record_impact(self, action, *more):
+        code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve", "--impact-action", action, *more)
+        return code, out, err
+
+    # -- S1: the record
+
+    def test_s1_the_record_keeps_its_class_refuses_a_bad_one_and_may_have_none(self):
+        self.assertEqual(self.record_impact("hold", "--impact-class", "credentials")[0], 0)
+        code, out, err = self.record_impact("hold", "--impact-class", "two words")
+        self.assertEqual(code, 2)
+        self.assertEqual(err.count("impact-class"), 1)
+        self.assertEqual(self.record_impact("hold")[0], 0)
+        code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "code", "--verdict", "approve", "--impact-class", "data")
+        self.assertEqual(code, 2)
+        self.assertIn("belongs to the impact reviewer", err)
+        stored = [e.get("impact_class") for e in self.ledger() if e["kind"] == "review_record"]
+        self.assertEqual(stored, ["credentials", None])
+        self.assertEqual(self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve", "--impact-action", "hold",
+                                     "--block", "/nonexistent")[0], 2)
+
+    def test_the_block_form_carries_the_class_line(self):
+        block = "verdict: approve\nhead: %s\nimpact-action: hold\nimpact-class: Data\nfindings:\n" % LEDGER_HEAD
+        fields, problem = sb.parse_review_block(block)
+        self.assertEqual((problem, fields["impact_class"]), (None, "data"))
+        fields, problem = sb.parse_review_block(block.replace("Data", "two words"))
+        self.assertIn("impact-class", problem)
+
+    # -- S2: the decision by class
+
+    def test_s2_a_hold_record_holds_for_the_owner_unless_its_class_is_not_top_tier(self):
+        outcome = {}
+        for label, more in (("credentials", ("--impact-class", "credentials")), ("performance", ("--impact-class", "performance")),
+                            ("unknown", ("--impact-class", "gizmo")), ("missing", ())):
+            self.assertEqual(self.record_impact("hold", *more)[0], 0)
+            outcome[label] = self.decide()
+        self.assertEqual({k: v[0] for k, v in outcome.items()},
+                         {"credentials": "hold", "performance": "second-review", "unknown": "hold", "missing": "hold"})
+        self.assertEqual(outcome["performance"][1][0].count("class performance"), 1)
+        self.assertFalse([r for r in outcome["performance"][1] if "top tier" in r and "hold" in r.split(":")[0]])
+
+    def test_a_non_hold_record_and_an_unreadable_ledger(self):
+        self.assertEqual(self.record_impact("second-review")[0], 0)
+        self.assertEqual(self.decide()[0], "none")
+        (self.world.state / "plan-ledger.jsonl").write_text("{not json\n")
+        self.assertEqual(self.decide()[0], "hold", "an unreadable ledger is an unknown rating: it holds")
+
+    # -- S3: the prompt
+
+    def test_s3_the_prompt_asks_for_the_class_and_names_every_class_of_the_matrix_file(self):
+        text = (REPO / "agents" / "reviewers" / "reviewer-impact.md").read_text()
+        rule = sb.load_impact_floor().owner_hold_rule(sb.load_impact_floor().load_matrix())
+        classes = rule[0] + rule[1]
+        self.assertEqual(len(classes), 10)
+        self.assertEqual(text.count("impact-class"), 1)
+        self.assertEqual([c for c in classes if "`%s`" % c not in text], [])
+
+    # -- S4 to S6: the agent definitions
+
+    def test_s4_only_a_change_to_the_permission_block_holds(self):
+        path = "agents/x.md"
+        self.files([path])
+        tail = self.DEF.split("---\n", 2)[2]
+        cases = {
+            "prose": (self.DEF.replace("Prose about the job.", "Other prose.").replace("a helper", "a better helper"), "second-review"),
+            "allow rule": (self.DEF.replace("allow}\n", "allow}\n  - {action: shell, resource: \"ls *\", effect: allow}\n"), "hold"),
+            "mode": (self.DEF.replace("subagent", "primary"), "hold"),
+            "unreadable after": ("no front matter here\n" + tail, "hold"),
+        }
+        for label, (after, want) in cases.items():
+            with self.subTest(label):
+                self.definition(path, self.DEF, after)
+                got = self.decide()
+                self.assertEqual(got[0], want, got)
+        self.assertEqual(self.decide_prose_reason(), 1)
+        with self.subTest("unreadable before"):
+            self.definition(path, "no front matter\n", self.DEF)
+            self.assertEqual(self.decide()[0], "hold")
+
+    def decide_prose_reason(self):
+        self.definition("agents/x.md", self.DEF, self.DEF.replace("Prose about the job.", "Other."))
+        decision, reasons = self.decide()
+        return len([r for r in reasons if "without a permission block change" in r]) if decision == "second-review" else -1
+
+    def test_s5_an_added_or_removed_definition_holds(self):
+        self.files(["agents/new.md"])
+        self.contents[("agents/new.md", LEDGER_HEAD)] = self.DEF
+        self.assertEqual((self.decide()[0], self.decide()[1][0].count("added")), ("hold", 1))
+        self.files(["agents/old.md"])
+        self.contents[("agents/old.md", self.BASE)] = self.DEF
+        self.assertEqual((self.decide()[0], self.decide()[1][0].count("removed")), ("hold", 1))
+
+    def test_s6_a_content_read_that_fails_holds_and_says_it_could_not_be_read(self):
+        self.files(["agents/x.md"])
+        self.definition("agents/x.md", self.DEF, "BROKEN")
+        decision, reasons = self.decide()
+        self.assertEqual(decision, "hold")
+        self.assertEqual(" ".join(reasons).count("could not be read"), 1)
+        self.pr.pop("baseRefOid")
+        self.assertEqual(self.decide()[0], "hold", "an unknown base holds")
+
+    def test_a_definition_missing_at_both_versions_and_a_mixed_change_hold(self):
+        self.files(["agents/ghost.md"])
+        decision, reasons = self.decide()
+        self.assertEqual((decision, " ".join(reasons).count("could not be read")), ("hold", 1))
+        self.files(["agents/x.md", "shims/gh"])
+        self.definition("agents/x.md", self.DEF, self.DEF.replace("Prose about the job.", "Other."))
+        decision, reasons = self.decide()
+        self.assertEqual(decision, "hold", "an unchanged permission block does not lift another top tier path")
+        self.assertIn("shims/gh", " ".join(reasons))
+
+    # -- S7: the bound
+
+    def test_s7_the_reads_are_none_four_and_none_and_more_than_the_limit_holds(self):
+        self.files(["docs/a.md"])
+        self.decide()
+        self.assertEqual(len(self.reads), 0)
+        for name in ("agents/a.md", "agents/b.md"):
+            self.definition(name, self.DEF, self.DEF)
+        self.files(["agents/a.md", "agents/b.md"])
+        self.reads.clear()
+        self.assertEqual(self.decide()[0], "second-review")
+        self.assertEqual(len(self.reads), 4)
+        names = ["agents/f%d.md" % n for n in range(9)]
+        self.files(names)
+        self.reads.clear()
+        decision, reasons = self.decide()
+        self.assertEqual((decision, len(self.reads)), ("hold", 0))
+        self.assertIn("more than 8", " ".join(reasons))
+
+    # -- S8 and S9: the rule is data
+
+    def matrix_with(self, **narrow):
+        matrix = json.loads(json.dumps(sb.load_impact_floor().load_matrix()))
+        matrix["owner_hold"]["narrow_by_diff"].update(narrow)
+        return matrix
+
+    def test_s8_the_narrow_paths_come_from_the_matrix_file(self):
+        self.files(["agents/x.md"])
+        self.definition("agents/x.md", self.DEF, self.DEF.replace("Prose about the job.", "Other."))
+        self.assertEqual(self.decide()[0], "second-review")
+        with mock.patch.object(sb.impact_floor, "load_matrix", lambda *a, **k: self.matrix_with(paths=["skills/**"])):
+            self.assertEqual(self.decide()[0], "hold", "no longer a narrow path: the whole top tier path holds")
+
+    def test_s9_the_front_matter_keys_come_from_the_matrix_file_and_the_code_has_none(self):
+        self.files(["agents/x.md"])
+        self.definition("agents/x.md", self.DEF, self.DEF.replace("a helper", "a better helper"))
+        self.assertEqual(self.decide()[0], "second-review")
+        with mock.patch.object(sb.impact_floor, "load_matrix", lambda *a, **k: self.matrix_with(keys=["description"])):
+            self.assertEqual(self.decide()[0], "hold", "description is the block now")
+        source = (REPO / "bin" / "impact_floor.py").read_text()
+        self.assertEqual(re.findall(r"agents/|[\"'](?:permissions|permission|mode|tools)[\"']", source), [])
+
+    def test_a_malformed_narrow_block_is_no_narrow_rule_and_the_whole_path_holds(self):
+        self.files(["agents/x.md"])
+        self.definition("agents/x.md", self.DEF, self.DEF.replace("Prose about the job.", "Other."))
+        for bad in ({"max_files": 0}, {"keys": []}, {"paths": "agents/**"}):
+            with self.subTest(bad), mock.patch.object(sb.impact_floor, "load_matrix", lambda *a, _b=bad, **k: self.matrix_with(**_b)):
+                self.assertEqual(self.decide()[0], "hold")
+
+    def test_every_agent_definition_of_this_repository_is_parsable(self):
+        f = sb.load_impact_floor()
+        keys = f.narrow_rule(f.load_matrix())[1]
+        unparsable = [str(p.relative_to(REPO)) for p in sorted((REPO / "agents").rglob("*.md")) if f.permission_block(p.read_text(), keys) is None]
+        self.assertEqual(unparsable, [], "a definition the reader cannot parse would always hold: the narrow form would help nobody")
+
+    def test_the_pure_block_reader(self):
+        f = sb.load_impact_floor()
+        keys = ["permissions", "mode"]
+        self.assertEqual(f.permission_block("---\nmode: x\n# c\npermissions:\n  - a\n\nother: 1\n---\n", keys), {"mode": ["mode: x"], "permissions": ["permissions:", "  - a"]})
+        self.assertIsNone(f.permission_block("mode: x\n", keys))
+        self.assertIsNone(f.permission_block("---\nmode: x\n", keys))
+        self.assertIsNone(f.permission_block("---\n---\n" + "x" * 300000, keys))
+        self.assertEqual(f.block_state("---\nmode: x\n---\n", "---\r\nmode: x  \r\n---\r\nprose", keys), "unchanged")
+        self.assertIsNone(f.permission_block('---\n"mode": x\n---\n', keys), "a quoted key cannot be judged: it holds")
+        self.assertEqual(f.permission_block("---\npermissions:\n- a\n- b\nother: 1\n---\n", keys), {"permissions": ["permissions:", "- a", "- b"]})
+        for label, text in (("a block scalar under a tracked key", "---\npermissions: |\n  # keep\n  x\n---\n"),
+                            ("an anchor", "---\nx: &m subagent\nmode: *m\n---\n"), ("a tag", "---\nmode: !!str x\n---\n"),
+                            ("a merge key", "---\n<<: *base\nmode: x\n---\n"), ("a repeated tracked key", "---\nmode: a\nmode: b\n---\n"),
+                            ("a closing line that is indented", "---\nmode: x\n  ---\nmode: y\n---\n"),
+                            ("a quoted scalar left open across lines", "---\ndescription: 'x\nmode: subagent\nother: y'\n---\n"),
+                            ("a flow collection left open", "---\npermissions: {a: 1,\nmode: x}\n---\n"),
+                            ("a double quoted scalar left open", '---\ndescription: "x\nmode: y\n---\n'),
+                            ("a folded block scalar", "---\npermissions: >\n  x\n---\n"),
+                            ("a comment hiding a closer in a flow collection", "---\ndescription: [a # ]\npermissions: [b]\nmode: subagent\nz: q]\n---\n"),
+                            ("a comment hiding a closer in a flow mapping", "---\ndescription: {a: 1 # }\nmode: x\nz: q}\n---\n"),
+                            ("a complex key opening a quote", '---\ndescription:\n  ? "x\nmode: subagent\n  y"\n---\n'),
+                            ("a directive", "---\n%YAML 1.2\nmode: x\n---\n"), ("a document end marker", "---\nmode: x\n...\n---\n"),
+                            ("a surplus closer", "---\npermissions: {a: 1}}\n---\n"), ("junk after a quoted value", '---\nmode: "x" y\n---\n'),
+                            ("a plain value with a colon and a space", "---\ndescription: a: b\n---\n"), ("a nested sequence on one line", "---\npermissions:\n  - - a\n---\n"),
+                            ("a Unicode line break", "---\ndescription: x\u2028mode: y\n---\n")):
+            self.assertIsNone(f.permission_block(text, keys), label)
+        self.assertEqual(f.permission_block("---\ndescription: \"say *\"\nnote: a!b\npermissions:\n  - {action: shell, resource: \"gh * view *\", effect: allow}\n---\n", keys),
+                         {"permissions": ["permissions:", '  - {action: shell, resource: "gh * view *", effect: allow}']}, "quoted globs are not indirection")
+        self.assertEqual(f.permission_block("---\ndescription: the Chief of Staff's helper, it's fine\nmode: x # a comment with ' in it\n---\n", keys), {"mode": ["mode: x # a comment with ' in it"]},
+                         "an apostrophe inside a plain scalar or a comment is not a quote")
+        self.assertEqual(f.permission_block("---\npermissions:\n  - {action: read, resource: 'it''s', effect: allow}\n---\n", keys)["permissions"][1].count("it''s"), 1)
+        self.assertEqual(f.permission_block('---\ndescription: "say \\"x\\" # not a comment"  # a comment\nmode: "x\\""\n---\n', keys), {"mode": ['mode: "x\\""']},
+                         "an escaped quote and a # inside quotes are read as they are")
+        self.assertEqual(f.permission_block("---\ndescription: [a, b] # closed, then a comment\nmode: x\n---\n", keys), {"mode": ["mode: x"]})
+        self.assertNotEqual(f.permission_block("---\npermissions:\n  # keep\n  - x\n---\n", keys), f.permission_block("---\npermissions:\n  # kept\n  - x\n---\n", keys),
+                            "a # line inside a tracked block is content")
+
+
 class TestImpactHold(LedgerBase):
     """#179 slice L4: the switchboard WRITES the hold (two labels), only when `impact_hold.enabled`, only for repos under `plan_gates`, head-bound
     owner clear, kill switches, idempotent, bounded. A fake gh records every write."""
