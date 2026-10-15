@@ -11679,8 +11679,6 @@ class TestSelfRegisteringCli(unittest.TestCase):
         "status": ("cmd_status", ("args", "runner", "now")), "poke": ("cmd_poke", ("args",)), "policy-report": ("cmd_policy_report", ("args", "runner", "now")),
         "agents": ("cmd_agents", ("args", "runner", "now")), "job": ("cmd_job", ("args", "runner", "now", "spawn")), "review-laws": ("cmd_review_laws", ("args", "runner", "now")), "review": ("cmd_review", ("args", "runner", "now")), "pr-explain": ("cmd_pr_explain", ("args", "runner", "now")), "disk": ("cmd_disk", ("args", "runner", "now")), "pr-state": ("cmd_pr_state", ("args", "runner", "now")),
         "reattach": ("cmd_reattach", ("args", "runner", "now", "socket_call")),
-        "heavy": ("cmd_heavy", ("args",)),
-        "reds": ("cmd_reds", ("args", "runner", "now")),
         "retire": ("cmd_retire", ("args", "runner", "now")),
         "impact": ("cmd_impact", ("args", "runner", "now")), "judge-tool": ("cmd_judge_tool", ("args", "runner", "now")),
         "ensure": ("cmd_ensure", ("args", "spawn")), "install": ("cmd_install", ("args", "runner", "now", "spawn")), "key": ("cmd_key", ("args", "runner", "now")),
@@ -11820,10 +11818,18 @@ class TestSelfRegisteringCli(unittest.TestCase):
             git("merge", "--no-edit", "two")
             self.assertTrue((target / "alpha-cmd.json").exists() and (target / "beta-cmd.json").exists())
 
-    def test_the_old_dispatch_table_covers_every_command_but_version(self):
+    def test_the_old_dispatch_table_is_still_registered_and_every_registered_command_has_a_handler(self):
+        """OLD is the table of the ORIGINAL commands and never grows: a new command adds no row here. What must hold for every command, old or new, is
+        derived: it is registered, and `resolve_command` finds its `cmd_<action>` function."""
         parser, choices = self.commands()
-        self.assertEqual(sorted(set(choices) - {"version"}), sorted(set(self.OLD) - {"plan"} | {"plan"}))
+        self.assertTrue(set(self.OLD) <= set(choices), "an original command is gone: %s" % sorted(set(self.OLD) - set(choices)))
         self.assertEqual(parser.commands, frozenset(choices))
+        for action in sorted(set(choices) - {"version"}):
+            with self.subTest(action=action):
+                handler = sb.resolve_command(action, parser.commands)
+                self.assertTrue(callable(handler), "%s has no cmd_ function" % action)
+                required = [n for n, p in inspect.signature(handler).parameters.items() if p.default is p.empty and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)]
+                self.assertTrue(set(required) <= set(sb.COMMAND_ARGUMENTS), "%s asks for %s, which a command is never given" % (action, sorted(set(required) - set(sb.COMMAND_ARGUMENTS))))
 
     def run_dispatch(self, action, **namespace):
         """dispatch() for `action` with every function replaced by a recorder that keeps the real signature: (return value, calls, ensure calls)."""
@@ -11873,14 +11879,49 @@ class TestSelfRegisteringCli(unittest.TestCase):
         self.assertEqual((code, calls, ensured), (0, [], []))
         self.assertIn(sb.VERSION, out.getvalue())
 
+    @staticmethod
+    def declared_groups():
+        """{group: set(actions)} read from the SOURCE: every module-level `cmd_x.<group> = True` of bin/fleet-switchboard, for a command the parser
+        registers. This is what each command says beside itself: the expected sets are DERIVED from it, never kept as a list in a test."""
+        declared = {"direct": set(), "ledger": set(), "ensure_on_use": set()}
+        registered = TestSelfRegisteringCli.commands()[0].commands
+        tree = ast.parse(SWITCHBOARD.read_text())
+        plain = {id(node) for node in tree.body}
+        for node in ast.walk(tree):    # a declaration written any other way would be invisible to the scan AND to the views: refuse it
+            if isinstance(node, ast.Assign) and any(isinstance(x, ast.Attribute) and x.attr in declared and isinstance(x.value, ast.Name)
+                                                    and x.value.id.startswith("cmd_") for x in node.targets):
+                if id(node) not in plain or not (isinstance(node.value, ast.Constant) and node.value.value is True):
+                    raise AssertionError("line %d declares a command's dispatch group in a form the guard cannot read: write `cmd_x.<group> = True` at module level" % node.lineno)
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Attribute) \
+                    and isinstance(node.targets[0].value, ast.Name) and node.targets[0].attr in declared \
+                    and isinstance(node.value, ast.Constant) and node.value.value is True and node.targets[0].value.id.startswith("cmd_"):
+                action = node.targets[0].value.id[4:].replace("_", "-")
+                if action in registered:
+                    declared[node.targets[0].attr].add(action)
+        return declared
+
+    def group_problems(self):
+        """One line per group whose effective set differs from what the commands declare, naming the commands."""
+        declared, problems = self.declared_groups(), []
+        for name, effective, key in (("DIRECT_ACTIONS", sb.DIRECT_ACTIONS, "direct"), ("LEDGER_ACTIONS", sb.LEDGER_ACTIONS, "ledger"),
+                                     ("ENSURE_ON_USE_COMMANDS", sb.ENSURE_ON_USE_COMMANDS, "ensure_on_use")):
+            if set(effective) != declared[key]:
+                problems.append("%s differs from what the commands declare: missing %s, extra %s" % (name, sorted(declared[key] - set(effective)), sorted(set(effective) - declared[key])))
+        return problems
+
     def test_the_error_mapping_and_the_special_groups_are_what_they_were(self):
-        # the groups are VIEWS of the `direct`, `ledger` and `ensure_on_use` attributes each command sets next to its own definition: every command that
-        # was in a shared list is still in its group, and the only additions are commands that already said `direct` themselves
+        # The effective groups (the module's views) must equal what the commands DECLARE (read from the source), exactly: a command whose declared
+        # group differs from its effective one fails loudly. And the pure-move guarantee stays: every original member is still in its group.
+        self.assertEqual(self.group_problems(), [])
+        with mock.patch.object(sb, "LEDGER_ACTIONS", frozenset(set(sb.LEDGER_ACTIONS) - {"gates"})):       # the guard fails loudly and names the command
+            self.assertEqual(self.group_problems(), ["LEDGER_ACTIONS differs from what the commands declare: missing ['gates'], extra []"])
+        with mock.patch.object(sb, "DIRECT_ACTIONS", frozenset(set(sb.DIRECT_ACTIONS) | {"send"})):
+            self.assertEqual(self.group_problems(), ["DIRECT_ACTIONS differs from what the commands declare: missing [], extra ['send']"])
         self.assertTrue(set(self.OLD_DIRECT) <= set(sb.DIRECT_ACTIONS))
-        # these already said `cmd_x.direct = True` before this change, so they already ran direct: the views only make that visible
-        self.assertEqual(set(sb.DIRECT_ACTIONS) - set(self.OLD_DIRECT), {"disk", "heavy", "load-replay", "pr-state", "reds", "triage"})
-        self.assertEqual(sorted(sb.LEDGER_ACTIONS), sorted(self.OLD_LEDGER))
-        self.assertEqual(sorted(sb.ENSURE_ON_USE_COMMANDS), sorted(self.OLD_ENSURE_ON_USE))
+        self.assertTrue(set(self.OLD_LEDGER) <= set(sb.LEDGER_ACTIONS))
+        self.assertTrue(set(self.OLD_ENSURE_ON_USE) <= set(sb.ENSURE_ON_USE_COMMANDS))
+        self.assertNotIn("judge-tool", sb.ENSURE_ON_USE_COMMANDS, "judge-tool runs inside v2 on every tool call: it never starts the daemon")
         known = self.commands()[0].commands
 
         def raising(error):
@@ -48310,7 +48351,7 @@ class TestLoadAlert(Base):
     def test_each_orchestrator_has_the_five_figures_from_the_records(self):
         self.asks = {1: [10, 11, 12], 2: [20], 3: [30, 31]}
         orchestrators = {"orch-a": self.orch(busy=2, idle=1, messages=1, charter=1), "orch-b": self.orch(idle=1, charter=2), "orch-c": self.orch(busy=1, charter=3)}
-        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [{"agent": "orch-a"}, {"agent": "orch-a"}, {"agent": "orch-b", "closed": True}]}))
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [{"agent": "x", "ask": 10, "repo": "acme/widget"}, {"agent": "x", "ask": 11, "repo": "acme/widget"}, {"agent": "orch-b", "ask": 20, "repo": "acme/widget", "closed": True}]}))   # owned by the ask's chain, not by the agent field)
         self.tick(self.T0, orchestrators)                      # first sight of every ask
         self.move(self.T0 + 3 * 3600 - 60, 10)                 # ask 10 moved 1 minute ago; 20 and 30 moved 3 h ago
         self.move(self.T0 + 3 * 3600 - 60, 12)
@@ -49010,6 +49051,180 @@ class TestLoadAlert(Base):
         sb.load_tick(engine, discovery)
         parents = json.loads((self.state_dir / "load.json").read_text())["parents"]
         self.assertEqual(parents, {"acme/widget#200": 100, "acme/widget#201": 0})          # a parent in another repository is no parent here
+
+    DAY = 86400.0
+
+    def wait_world(self, asks, **cfg):
+        """One orchestrator whose asks are `asks` (number -> {labels, parked_until}); a first pass, then one 3 hours later with nothing moved."""
+        self.waits = asks
+        orch = {"o": {"charter": 1, "repo": "r", "busy": 0, "idle": 1, "messages": 0}}
+        def run(at):
+            def read_asks(charter, repo):
+                return [dict({"repo": "r", "number": n}, **self.waits[n]) for n in sorted(self.waits)]
+            return self.health.tick(self.health.Context(now=at, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS, **cfg), orchestrators=orch,
+                                                        read_asks=read_asks, cos="cos", wake=self.woken.append))
+        run(self.T0)
+        run(self.T0 + 3 * 3600)
+        return self.latest()["o"]
+
+    def test_an_ask_awaiting_the_owner_is_waiting_not_stalled(self):
+        got = self.wait_world({1: {"labels": ["me:awaiting-user"]}})
+        self.assertEqual((got["stalled"], got["waiting_owner"], got["waiting_cos"], got["parked"]), (0, 1, 0, 0))
+
+    def test_an_ask_awaiting_the_chief_of_staff_is_counted_apart(self):
+        got = self.wait_world({1: {"labels": ["me:awaiting-cos"]}})
+        self.assertEqual((got["stalled"], got["waiting_cos"], got["waiting_owner"]), (0, 1, 0))
+
+    def test_a_parked_ask_with_a_future_date_is_parked_and_one_whose_date_passed_is_stalled_again(self):
+        got = self.wait_world({1: {"labels": ["me:parked"], "parked_until": self.T0 + 10 * self.DAY}})
+        self.assertEqual((got["stalled"], got["parked"]), (0, 1))
+        shutil.rmtree(str(self.state_dir)); self.state_dir.mkdir(mode=0o700)
+        got = self.wait_world({1: {"labels": ["me:parked"], "parked_until": self.T0 + 3600}})   # the date passes within the 3 hours
+        self.assertEqual((got["stalled"], got["parked"]), (1, 0))
+
+    def test_a_parked_label_without_a_valid_future_date_is_not_parked(self):
+        for case in ({"labels": ["me:parked"]}, {"labels": ["me:parked"], "parked_until": None},
+                     {"labels": ["me:parked"], "parked_until": self.T0 + 5000 * self.DAY}):   # no date / a date beyond the bound
+            shutil.rmtree(str(self.state_dir)); self.state_dir.mkdir(mode=0o700)
+            got = self.wait_world({1: case})
+            self.assertEqual((got["stalled"], got["parked"]), (1, 0), case)
+
+    def test_the_real_parser_gives_none_for_a_missing_malformed_or_impossible_date_and_the_labels_flow_from_the_asks_list(self):
+        labels = ["me:parked"]
+        body = lambda line: "## Intent\nx\n\n" + line + "\n"
+        for line in ("", "Parked until: soon", "Parked until: 2026-02-30", "Parked until: 2026-10-20\nParked until: 2026-10-21"):
+            self.assertIsNone(sb.parked_until(body(line), labels), line)
+        self.assertEqual(sb.parked_until(body("Parked until: 2026-10-20"), labels), _dt.datetime(2026, 10, 21, tzinfo=_dt.timezone.utc).timestamp())
+        issue = sb.IssueIntent.from_api({"number": 5, "state": "open", "title": "t", "body": body("Parked until: 2026-10-20"), "labels": [{"name": "me:parked"}, {"name": "x"}]})
+        self.assertEqual((issue.labels, issue.parked_until), (["me:parked", "x"], _dt.datetime(2026, 10, 21, tzinfo=_dt.timezone.utc).timestamp()))
+        self.assertEqual(self.health.PARKED_MAX_DAYS, sb.PARKED_MAX_DAYS)
+
+    def test_a_mixed_fleet_shows_the_split_in_status_and_only_the_plain_stall_counts(self):
+        got = self.wait_world({1: {"labels": []}, 2: {"labels": ["me:awaiting-user"]}, 3: {"labels": ["me:awaiting-cos"]},
+                               4: {"labels": ["me:parked"], "parked_until": self.T0 + 9 * self.DAY}, 5: {"labels": []}})
+        self.assertEqual((got["open_asks"], got["stalled"], got["waiting_owner"], got["waiting_cos"], got["parked"]), (5, 2, 1, 1, 1))
+        self.health.append_moves(str(self.state_dir), [{"at": self.T0 + 3 * 3600 - 10, "repo": "r", "numbers": [5], "refs": [5], "kind": "push"}])
+        got = self.wait_world({1: {"labels": []}, 2: {"labels": ["me:awaiting-user"]}, 3: {"labels": ["me:awaiting-cos"]},
+                               4: {"labels": ["me:parked"], "parked_until": self.T0 + 9 * self.DAY}, 5: {"labels": []}})
+        self.assertEqual((got["stalled"], got["stalled_asks"]), (1, [1]))
+        row = [l for l in self.health.status_lines(str(self.state_dir), self.T0) if l.strip().startswith("o ")][0]
+        self.assertIn("stalled 1, waiting on owner 1, parked 1, waiting on cos 1", row)
+
+    def test_wait_labels_take_precedence_owner_then_cos_then_parked_and_the_bare_label_counts(self):
+        future = self.T0 + 9 * self.DAY
+        got = self.wait_world({1: {"labels": ["me:awaiting-cos", "me:awaiting-user", "me:parked"], "parked_until": future},   # all three: the owner wins
+                               2: {"labels": ["me:awaiting-cos", "me:parked"], "parked_until": future},                       # cos beats parked
+                               3: {"labels": ["awaiting-user"]},                                                                # a bare, unprefixed label
+                               4: {"labels": ["me:parked"], "parked_until": future},
+                               5: {"labels": ["unrelated:label"]}})
+        self.assertEqual((got["waiting_owner"], got["waiting_cos"], got["parked"], got["stalled"]), (2, 1, 1, 1))
+
+    def test_asks_waiting_or_parked_do_not_make_the_busy_coders_rule_fire(self):
+        def fig(**kw):
+            base = {"name": "o", "open_asks": 6, "active_asks": 6, "stalled": 0, "stalled_asks": [], "moved_1h": 0, "moved_backlog": 1, "busy": 2, "idle": 0,
+                    "messages": 0, "decisions": 0}
+            return dict(base, **kw)
+        cfg = dict(self.health.DEFAULTS)
+        self.assertIn("at least twice", self.health.judge(fig(), cfg, None)[0])                       # 6 active asks, 1 moved, nothing in the last hour: fires
+        self.assertIsNone(self.health.judge(fig(active_asks=1, waiting_owner=3, waiting_cos=1, parked=1), cfg, None)[0])   # 5 of the 6 only wait or are parked: 1 active, no wake
+        # the same through a real pass: 6 asks, 5 waiting or parked, coders full, nothing moved
+        got = self.wait_world({1: {"labels": ["me:awaiting-user"]}, 2: {"labels": ["me:awaiting-user"]}, 3: {"labels": ["me:awaiting-cos"]},
+                               4: {"labels": ["me:parked"], "parked_until": self.T0 + 9 * self.DAY}, 5: {"labels": ["me:parked"], "parked_until": self.T0 + 9 * self.DAY},
+                               6: {"labels": []}}, enabled=True)
+        self.assertEqual((got["open_asks"], got["active_asks"]), (6, 1))
+
+    def test_waiting_asks_never_wake_the_chief_of_staff_but_plain_stalls_do(self):
+        self.wait_world({1: {"labels": ["me:awaiting-user"]}, 2: {"labels": ["me:awaiting-user"]}}, enabled=True)
+        for hours in (4, 5, 6):
+            self.health.tick(self.health.Context(now=self.T0 + hours * 3600, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS, enabled=True),
+                                                 orchestrators={"o": {"charter": 1, "repo": "r", "busy": 0, "idle": 1, "messages": 0}},
+                                                 read_asks=lambda c, r: [dict({"repo": "r", "number": n}, **self.waits[n]) for n in sorted(self.waits)], cos="cos", wake=self.woken.append))
+        self.assertEqual(self.woken, [])
+        shutil.rmtree(str(self.state_dir)); self.state_dir.mkdir(mode=0o700)
+        self.wait_world({1: {"labels": []}, 2: {"labels": []}}, enabled=True)
+        self.assertEqual(len(self.woken), 1)
+
+    def decisions_world(self, decisions, parents, orchestrators=None, asks=None, charters=None, tick_at=None, **extra):
+        """Passes of orchestrators with charters (`charters`: name -> number) and asks, over a decisions.json of `decisions` and issue parents `parents`."""
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": decisions}))
+        reads = []
+        def read_parent(repo, number):
+            reads.append(number)
+            if number not in parents:
+                raise RuntimeError("gh is down")
+            return parents[number]
+        orch = orchestrators or {"a": {"charter": 1, "repo": "r", "busy": 0, "idle": 1, "messages": 0}, "b": {"charter": 2, "repo": "r", "busy": 0, "idle": 1, "messages": 0}}
+        asks = asks or {1: [10], 2: [20]}
+        def read_asks(charter, repo):
+            return [{"repo": "r", "number": n} for n in asks[charter]]
+        def tick(at=None, **kw):
+            ctx = self.health.Context(now=at or self.T0, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS, **kw.pop("cfg", {})), orchestrators=orch,
+                                      read_asks=read_asks, read_parent=read_parent, cos="cos", wake=self.woken.append, **dict(extra, **kw))
+            return self.health.tick(ctx)
+        return tick, reads
+
+    def test_an_old_format_row_is_followed_through_the_issues_it_closed(self):
+        tick, reads = self.chain_world({200: 100})
+        tick(self.T0)
+        late = self.T0 + 3 * 3600
+        tick(late, [{"at": late - 60, "repo": "r", "numbers": [900, 200], "kind": "push"}])     # written before refs existed: the pull request and what it closed
+        self.assertEqual((self.latest()["o"]["moved_1h"], reads), (1, [200]))
+
+    def test_a_pull_request_under_the_charter_with_no_ask_is_charter_movement_and_credits_no_ask(self):
+        tick, reads = self.chain_world({300: 1})                       # issue 300's parent is the charter 1 itself
+        tick(self.T0)
+        late = self.T0 + 3 * 3600
+        tick(late, [self.move_row(late - 60, [300])])
+        got = self.latest()["o"]
+        self.assertEqual((got["charter_moves_1h"], got["moved_1h"], got["stalled"]), (1, 0, 1))
+        lines = self.health.status_lines(str(self.state_dir), late)
+        self.assertIn("charter moves 1h 1", [l for l in lines if l.strip().startswith("o ")][0])
+
+    def test_charter_movement_keeps_the_busy_coders_rule_quiet(self):
+        orch = {"o": {"charter": 1, "repo": "r", "busy": 2, "idle": 0, "messages": 0}}
+        self.asks = {1: [10, 11, 12]}
+        def tick(at, rows=()):
+            if rows:
+                self.health.append_moves(str(self.state_dir), list(rows))
+            return self.health.tick(self.health.Context(now=at, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS, enabled=True), orchestrators=orch,
+                                                        read_asks=lambda c, r: [{"repo": "r", "number": n} for n in self.asks[c]],
+                                                        read_parent=lambda repo, n: 1, cos="cos", wake=self.woken.append))
+        tick(self.T0, [{"at": self.T0 - 60, "repo": "r", "numbers": [900, 300], "refs": [300], "kind": "push"}])   # the lane is moving: no wake for outnumbered asks
+        tick(self.T0 + 600)
+        self.assertEqual(self.woken, [])
+        shutil.rmtree(str(self.state_dir)); self.state_dir.mkdir(mode=0o700)
+        tick(self.T0)                                                                                      # nothing moved at all: the same fixture fires
+        self.assertEqual(len(self.woken), 1)
+
+    def test_a_decision_belongs_to_the_charter_on_its_chain_not_to_its_agent_field(self):
+        tick, reads = self.decisions_world([{"agent": "b", "ask": 500, "repo": "r"}], {500: 10, 10: 1})   # 500 -> ask 10 of orchestrator a; the field says b
+        tick()
+        got = self.latest()
+        self.assertEqual((got["a"]["decisions"], got["b"]["decisions"]), (1, 0))
+
+    def test_every_decision_is_attributed_to_the_charter_that_holds_it_even_with_no_agent(self):
+        tick, reads = self.decisions_world([{"agent": None, "ask": 10, "repo": "r"}, {"agent": "a", "ask": 20, "repo": "r"}, {"agent": None, "ask": 600, "repo": "r"}],
+                                           {600: 2})
+        tick()
+        got = self.latest()
+        self.assertEqual((got["a"]["decisions"], got["b"]["decisions"]), (1, 2))                         # 10 -> a's ask; 20 -> b's ask; 600 -> charter 2 (b)
+
+    def test_a_decision_whose_chain_cannot_be_resolved_belongs_to_nobody_and_status_says_so(self):
+        tick, reads = self.decisions_world([{"agent": "a", "ask": 700, "repo": "r"}], {})              # the parent read fails
+        tick()
+        got = self.latest()
+        self.assertEqual((got["a"]["decisions"], got["b"]["decisions"]), (0, 0))                        # the agent field is not used as a fallback
+        lines = self.health.status_lines(str(self.state_dir), self.T0)
+        self.assertEqual(len([l for l in lines if "1 decision(s) not attributed" in l]), 1)
+
+    def test_decision_chains_are_read_once_and_count_in_the_account_budget(self):
+        tick, reads = self.decisions_world([{"agent": "a", "ask": 500, "repo": "r"}, {"agent": "a", "ask": 501, "repo": "r"}], {500: 10, 501: 10})
+        for k in range(3):
+            tick(self.T0 + k * 600)
+        self.assertEqual(sorted(reads), [500, 501])
+        state = json.loads((self.state_dir / "load.json").read_text())
+        self.assertEqual(len([r for r in state["reads"] if True]) >= 2, True)
+        self.assertEqual(state["parents"], {"r#500": 10, "r#501": 10})
 
     def test_an_idle_pass_rewrites_nothing(self):
         self.asks = {1: [1]}
