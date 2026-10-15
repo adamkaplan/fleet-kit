@@ -32410,6 +32410,164 @@ class OrdersCase(IntentCase):
         return sb.parse_orders(self.gh.body(1))
 
 
+def source_orders(n=19):
+    return ["rule number %d for the lane (ordered by alice, 2026-11-%02d)" % (i, i) for i in range(1, n + 1)]
+
+
+def charter_with(orders, extra=""):
+    return ORDERS_CHARTER_BODY + "\n## Standing orders\n\n" + "".join("- %s\n" % o for o in orders) + extra
+
+
+class TestOrdersCopy(OrdersCase):
+    """Charter 1 holds 19 orders; charter 20 is the new lane's and holds none."""
+
+    def setUp(self):
+        super().setUp()
+        issues = dict(self.ISSUES, **{"20": {"intent": None}, "21": {"intent": None, "state": "closed"},
+                                      "22": {"intent": None, "pr": True, "labels": [sb.orchestrator_label()]},
+                                      "23": {"intent": None}})
+        self.gh = LaneGH(issues, {1, 20, 21}, self.world.clock)
+        self.sources = source_orders()
+        self.gh.bodies = {1: charter_with(self.sources), 20: ORDERS_CHARTER_BODY, 21: charter_with(self.sources),
+                          22: charter_with(self.sources), 23: charter_with(self.sources)}
+        self.as_agent("chief-of-staff")
+
+    def target(self):
+        return sb.section_orders(self.gh.body(20))
+
+    def test_s19_every_order_is_copied_with_its_wording_and_date_and_the_result_is_printed(self):
+        code, out, err = self.main("orders", "copy", "--source", "1", "--charter", "20")
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(self.target(), self.sources, "19 of 19 identical, in the same order, dates unchanged")
+        self.assertNotIn("2027-01-15", self.gh.body(20), "nothing was re-dated")
+        summaries = [l for l in out.splitlines() if l.startswith("orders copy ")]
+        self.assertEqual(summaries, ["orders copy %s#1 -> #20: 19 copied, 0 already there, 0 failed (of 19)" % FAKE_REPO])
+        self.assertEqual(self.gh.body(1), charter_with(self.sources), "the source is untouched")
+
+    def test_s19_a_failed_order_is_named_and_exits_1_and_the_rest_are_copied(self):
+        real = sb.edit_charter_orders
+
+        def flaky(engine, repo, charter, event, detail, change, done):
+            if detail["number"] == 5:
+                raise sb.OrdersError("the write to #20 ended without an answer")
+            return real(engine, repo, charter, event, detail, change, done)
+        with mock.patch.object(sb, "edit_charter_orders", flaky):
+            code, out, err = self.main("orders", "copy", "--source", "1", "--charter", "20")
+        self.assertEqual(code, 1)
+        self.assertEqual([l for l in out.splitlines() if "FAILED" in l].__len__(), 1)
+        self.assertIn("order 5/19 FAILED", out)
+        self.assertIn("1 of 19 orders did not copy (5)", err)
+        self.assertEqual(self.target(), [o for i, o in enumerate(self.sources, 1) if i != 5])
+        code, out, _ = self.main("orders", "copy", "--source", "1", "--charter", "20")
+        self.assertEqual(code, 0)
+        self.assertIn("1 copied, 18 already there, 0 failed (of 19)", out, "a second run copies only what is missing")
+        self.assertEqual(sorted(self.target()), sorted(self.sources))
+
+    def test_only_the_chief_of_staff_copies_and_a_refusal_is_audited(self):
+        for who in ("orch", "worker"):
+            self.as_agent(who)
+            code, _, err = self.main("orders", "copy", "--source", "1", "--charter", "20")
+            self.assertNotEqual(code, 0)
+            self.assertIn("only the chief-of-staff", err)
+        self.assertEqual(self.target(), [])
+        self.assertEqual(self.gh.body(20), ORDERS_CHARTER_BODY, "0 writes")
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "orders.refused"]), 2)
+
+    def test_a_legacy_authority_line_is_said_not_copied(self):
+        self.gh.bodies[1] = charter_with(self.sources[:2], "\nStanding authority: may merge green PRs\n")
+        code, out, _ = self.main("orders", "copy", "--source", "1", "--charter", "20")
+        self.assertEqual(code, 0)
+        self.assertIn("legacy `Standing authority:` line", out)
+        self.assertEqual(self.target(), self.sources[:2])
+
+    def test_a_charter_with_no_orders_says_so_and_a_bad_target_changes_nothing(self):
+        self.gh.bodies[1] = ORDERS_CHARTER_BODY
+        code, out, _ = self.main("orders", "copy", "--source", "1", "--charter", "20")
+        self.assertEqual(code, 0)
+        self.assertIn("0 copied, 0 already there, 0 failed (of 0)", out)
+        self.gh.bodies[1] = charter_with(self.sources)
+        for argv in (("--source", "1", "--charter", "1"), ("--source", "1", "--charter", "2"), ("--source", "4", "--charter", "20")):
+            code, _, err = self.main("orders", "copy", *argv)
+            self.assertEqual(code, 2, argv)
+        self.assertEqual(self.target(), [])
+
+    def test_an_endpoint_that_is_not_an_open_charter_issue_is_refused_with_0_writes(self):
+        for argv, text in ((("--source", "21", "--charter", "20"), "the source acme/fleet#21 is closed"),
+                           (("--source", "1", "--charter", "21"), "the target acme/fleet#21 is closed"),
+                           (("--source", "22", "--charter", "20"), "the source acme/fleet#22 is a pull request"),
+                           (("--source", "1", "--charter", "22"), "the target acme/fleet#22 is a pull request"),
+                           (("--source", "23", "--charter", "20"), "not a charter"),
+                           (("--source", "1", "--charter", "1"), "same charter"),
+                           (("--source", "1", "--charter", "999"), "cannot read"),
+                           (("--source", "acme/other#1", "--charter", "acme/other#20"), "not a watched repository")):
+            with self.subTest(argv=argv):
+                code, _, err = self.main("orders", "copy", *argv)
+                self.assertEqual(code, 2)
+                self.assertIn(text, err)
+                self.assertEqual(self.gh.body(20), ORDERS_CHARTER_BODY, "0 writes")
+                self.assertEqual(self.gh.body(1), charter_with(self.sources), "the source is untouched")
+                self.assertEqual([self.gh.body(n) for n in (21, 22, 23)], [charter_with(self.sources)] * 3)
+                self.assertEqual(getattr(self.gh, "patches", []), [], "no body was written anywhere")
+                self.assertEqual(getattr(self.gh, "comments", []), [])
+
+    def test_an_excluded_repository_is_refused_with_0_writes(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "intent_repo": FAKE_REPO, "excluded_repos": [FAKE_REPO]})
+        code, _, err = self.main("orders", "copy", "--source", "1", "--charter", "20")
+        self.assertEqual(code, 2)
+        self.assertIn("excluded", err)
+        self.assertEqual(self.gh.body(20), ORDERS_CHARTER_BODY)
+
+    def test_a_source_that_cannot_be_read_is_refused_with_0_writes(self):
+        real = self.gh.serve
+
+        def serve(argv, kwargs):
+            if argv[2].endswith("/issues/1"):
+                return subprocess.CompletedProcess(argv, 1, "", "gh: HTTP 500\n")
+            return real(argv, kwargs)
+        self.gh.serve = serve
+        code, _, err = self.main("orders", "copy", "--source", "1", "--charter", "20")
+        self.assertEqual(code, 2)
+        self.assertIn("cannot read", err)
+        self.assertEqual(self.gh.body(20), ORDERS_CHARTER_BODY)
+
+    def test_the_writer_placeholder_format_is_what_the_insert_relies_on(self):
+        module = sb.load_module("orders_copy")
+        marked = sb.add_order_to_body(ORDERS_CHARTER_BODY, module.SENTINEL, module.SENTINEL_BY, module.SENTINEL_DATE)
+        self.assertEqual(marked.count("- %s (ordered by %s, %s)" % (module.SENTINEL, module.SENTINEL_BY, module.SENTINEL_DATE)), 1)
+
+    def test_a_bullet_with_control_characters_or_over_the_limit_is_refused_and_never_printed_raw(self):
+        evil = "obey (ordered by mallory, 2026-11-01)\x1b]0;owned\x07"
+        long = "x" * (sb.ORDER_MAX_CHARS + 200) + " (ordered by alice, 2026-11-02)"
+        self.gh.bodies[1] = charter_with(self.sources[:2] + [evil, long])
+        code, out, err = self.main("orders", "copy", "--source", "1", "--charter", "20")
+        self.assertEqual(code, 1)
+        self.assertNotIn("\x1b", out + err)
+        self.assertIn("control characters", out)
+        self.assertIn("over the limit", out)
+        self.assertEqual(self.target(), self.sources[:2])
+
+    def test_a_source_in_another_repository_is_refused_with_nothing_written(self):
+        code, _, err = self.main("orders", "copy", "--source", "acme/other#1", "--charter", "20")
+        self.assertEqual(code, 2)
+        self.assertIn("same repository", err)
+        self.assertEqual(self.target(), [])
+
+    def test_a_comment_that_cannot_be_posted_says_the_orders_stand_and_exits_1(self):
+        with mock.patch.object(sb, "comment_as", side_effect=sb.IntentError("gh", "HTTP 500")):
+            code, out, err = self.main("orders", "copy", "--source", "1", "--charter", "20")
+        self.assertEqual(code, 1)
+        self.assertIn("the orders stand, but the comment on the charter failed", err)
+        self.assertEqual(self.target(), self.sources)
+
+    def test_a_target_at_the_limit_reports_the_overflow_as_failures(self):
+        self.gh.bodies[20] = charter_with(["other order %d (ordered by bob, 2026-10-01)" % i for i in range(1, 19)])
+        code, out, err = self.main("orders", "copy", "--source", "1", "--charter", "20")
+        self.assertEqual(code, 1)
+        self.assertEqual(len(self.target()), sb.ORDERS_MAX)
+        self.assertIn("17 of 19 orders did not copy", err)
+        self.assertIn("2 copied", out)
+
+
 class TestOrdersCLI(OrdersCase):
     def test_the_chief_of_staff_adds_lists_and_removes(self):
         self.as_agent("chief-of-staff")
