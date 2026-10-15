@@ -142,7 +142,7 @@ are the owner's one file, `standing-orders.md` beside the switchboard config
 
 A lane is one orchestrator and its charter. Use this when one orchestrator holds more
 asks than it moves (several orchestrators on one repo): the project stays one repo, but
-the asks are shared out. You decide what to split; this section is only how. The
+the asks are shared out. Split a lane under the owner's standing order that lets you commission new orchestrators without asking, then tell the person after, citing that order (`orders --cos` or `orders list --charter <n>` shows it); with no such standing order, propose the split first and act only after the person agrees (quote their agreement). This section is only how. The
 person's words are never changed on the way, and the new lane starts with what the old
 one knew.
 
@@ -154,8 +154,9 @@ exact command, and do not claim the step is done before you have seen its output
 ### Lane step 1 — The workspace and the orchestrator
 
 ```
-CHECK:   The person agreed to the split, quoted. The repo is already watched
-         (STEP 4 above), and its account is already set (STEP 1).
+CHECK:   Which case of the rule above holds: the standing order, read and cited, or the
+         person's agreement, quoted. The repo is already watched (STEP 4 above), and its
+         account is already set (STEP 1).
 DO:      Launch the new orchestrator into its OWN workspace on the same repo, with a
          brief on stdin:
            fleet-switchboard launch <name> --agent orchestrator --role orchestrator \
