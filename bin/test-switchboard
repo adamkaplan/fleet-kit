@@ -11609,27 +11609,34 @@ class TestChatClearOffers(unittest.TestCase):
         got = sc("366 is good to go", twice)
         self.assertEqual((got["why"], got["prs"]), ("ambiguous_number", ["acme/other#366", "acme/widget#366"]))
 
-    def test_screen_cuts_the_text_once_so_a_huge_run_or_a_second_number_past_the_cap_changes_nothing_and_raises_nothing(self):
+    def test_a_message_that_reaches_the_text_cap_is_a_question_whatever_it_says_and_odd_text_is_no_number(self):
         offers = self.offers(366)
-        got = self.cc.screen("9" * 5000 + " is good to go", offers, 1001, 1002)
-        self.assertEqual((got["verdict"], got["why"]), ("question", "not_offered"), "a 5000-digit run: a question, no exception")
-        far = "366 is good to go" + " " * (self.cc.TEXT_MAX + 10) + "389"
-        self.assertEqual(self.cc.screen(far, offers, 1001, 1002)["verdict"], "candidate", "the same text is cut for the count and for the standalone check")
+        for text in ("9" * 5000 + " is good to go", "366 is good to go" + " " * self.cc.TEXT_MAX + "389", "366 is good to go" + " " * (self.cc.TEXT_MAX - len("366 is good to go"))):
+            self.assertEqual(self.cc.screen(text, offers, 1001, 1002)["why"], "too_long", len(text))
+        under = "366 is good to go" + " " * (self.cc.TEXT_MAX - len("366 is good to go") - 1)
+        self.assertEqual(len(under), self.cc.TEXT_MAX - 1)
+        self.assertEqual(self.cc.screen(under, offers, 1001, 1002)["verdict"], "candidate", "one under the cap is read whole")
+        self.assertEqual(self.cc.screen("9" * (self.cc.TEXT_MAX - 1), offers, 1001, 1002)["why"], "not_offered", "a long digit run under the cap is one number, never an error")
         self.assertEqual(self.cc.screen(None, offers, 1001, 1002)["why"], "no_number")
         self.assertEqual(self.cc.screen(5, offers, 1001, 1002)["why"], "no_number")
 
     def test_a_key_with_a_trailing_newline_is_no_pr_and_entries_past_the_cap_come_back_not_shown(self):
         path = Path(self.state) / "chat-clear-offers.json"
         path.write_text(json.dumps({"offers": {"acme/widget#1\n": self.entry(), "acme/widget#2": self.entry()}}))
-        self.assertEqual(sorted(self.cc.read_offers(self.state)), ["acme/widget#2"])
-        many = {"acme/widget#%d" % n: self.entry() for n in range(1, self.cc.OFFERS_MAX + 3)}
+        loaded, problem, damaged = self.cc._load(self.state)
+        self.assertEqual(sorted(loaded), ["acme/widget#2"])
+        self.assertEqual(damaged, {"acme/widget#1\n"}, "the key with the newline is said, not lost")
+        extra = self.cc.OFFERS_MAX + 2
+        many = {"acme/widget#%d" % n: self.entry() for n in range(1, extra + 1)}
         path.write_text(json.dumps({"offers": many}))
         loaded, problem, damaged = self.cc._load(self.state)
-        self.assertEqual((len(loaded), len(damaged)), (self.cc.OFFERS_MAX, 2), "the 2 past the cap are said, not silently lost")
-        holds = [self.hold(n, ["u:hold-impact"]) for n in range(1, self.cc.OFFERS_MAX + 3)]
-        got = self.cc.refresh_offers(self.state, holds, self.NAMES, 9000)
-        self.assertEqual(len(got["offers"]), self.cc.OFFERS_MAX)
-        self.assertTrue(got["capped"])
+        self.assertEqual(sorted(loaded), sorted("acme/widget#%d" % n for n in range(1, self.cc.OFFERS_MAX + 1)), "the first OFFERS_MAX in file order are kept")
+        self.assertEqual(damaged, {"acme/widget#%d" % n for n in range(self.cc.OFFERS_MAX + 1, extra + 1)}, "the 2 past the cap are said, not silently lost")
+        first = "acme/widget#%d" % (self.cc.OFFERS_MAX + 1)
+        got = self.cc.refresh_offers(self.state, [self.hold(self.cc.OFFERS_MAX + 1, ["u:hold-impact"])], self.NAMES, 9000)
+        self.assertEqual(list(got["offers"]), [first])
+        self.assertIs(got["offers"][first]["shown"], False, "a PR that was past the cap and is held alone is recorded as NOT shown")
+        self.assertEqual(got["damaged"], sorted(damaged))
 
     def test_a_message_counts_only_if_it_was_written_after_the_offer_was_shown_and_an_offer_expires(self):
         offers = self.offers(366)   # shown_at 1000

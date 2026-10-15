@@ -353,14 +353,17 @@ def screen(text, offers, created, now):
     * `no_offers`: nothing is held for the owner;
     * `no_number`: the message names no number (the number is required, whatever a judge would say);
     * `several_numbers`: it has more than one DISTINCT run of digits, however they are joined (`366-367`, `366/367`, `366, 389`): one message clears one PR;
+    * `too_long`: the text is TEXT_MAX characters or more (it may have been cut inside a number);
     * `unclear_number`: its one number sits inside a word or a decimal (`abc366`, `3.66`);
     * `not_offered`: the number is not one of the offers;
     * `ambiguous_number`: more than one offer has that number (the same number in two repositories);
     * `no_time`, `before_offer`, `expired`: see `timing_problem` (`created` is the message's time, `now` the clock)."""
-    text = (text or "")[:TEXT_MAX] if isinstance(text, str) else ""   # ONE cut for every scan below: the digits counted and the digits judged are the same text
+    text = text if isinstance(text, str) else ""
     prs = sorted(offers or {})
     if not prs:
         return {"verdict": "question", "why": "no_offers", "prs": []}
+    if len(text) >= TEXT_MAX:   # `person_messages` cuts at TEXT_MAX, so a message that reaches it may have been cut inside a number: a clearing sentence is never that long
+        return {"verdict": "question", "why": "too_long", "prs": prs}
     numbers = numbers_in(text)
     if not numbers:
         return {"verdict": "question", "why": "no_number", "prs": prs}
