@@ -11500,16 +11500,25 @@ class TestChatClearOffers(unittest.TestCase):
                                                   {"pr": "acme/widget#5", "head": 7, "labels": ["u:hold-impact"]}, {"head": "a"}], self.NAMES, 1010)
         self.assertEqual((got["offers"], got["dropped"]), ({}, ["acme/widget#366"]))
         path = Path(self.state) / "chat-clear-offers.json"
+        asides = set()
         for body in (" " * (self.cc.OFFERS_MAX_BYTES + 1), json.dumps([1]), json.dumps({"offers": 5})):
             path.write_text(body)
             got = self.cc.refresh_offers(self.state, [], self.NAMES, 1011)
             self.assertTrue(got["problem"] and got["quarantined"], body[:10])
+            self.assertTrue(got["quarantined"].startswith("chat-clear-offers.json.corrupt-1011"))
+            asides.add(got["quarantined"])
             self.assertFalse(path.exists(), "the unusable file was set aside, not rewritten in place")
+        self.assertEqual(len(asides), 3, "three unusable files, three distinct aside names")
 
     def test_a_non_ascii_summary_is_kept_whole(self):
         got = self.cc.refresh_offers(self.state, [self.hold(1, ["u:hold-impact"], summary="caf\u00e9 \u2014 gate")], self.NAMES, 1)
         self.assertEqual(got["offers"]["acme/widget#1"]["summary"], "caf\u00e9 \u2014 gate")
         self.assertEqual(self.cc.read_offers(self.state)["acme/widget#1"]["summary"], "caf\u00e9 \u2014 gate")
+        self.assertIn("caf\u00e9".encode("utf-8"), (Path(self.state) / "chat-clear-offers.json").read_bytes(), "written as UTF-8, not escaped")
+        lone = self.cc.refresh_offers(self.state, [self.hold(2, ["u:hold-impact"], summary="bad \ud800 text")], self.NAMES, 2)
+        self.assertEqual(lone["offers"]["acme/widget#2"]["summary"], "bad ? text", "a lone surrogate never stops a refresh")
+        twice = self.cc.refresh_offers(self.state, [self.hold(3, ["u:hold-impact"], head="a" * 40), self.hold(3, ["u:hold-impact"], head="b" * 40)], self.NAMES, 3)
+        self.assertEqual((twice["added"], twice["offers"]["acme/widget#3"]["head"]), (["acme/widget#3"], "a" * 40), "a PR twice in one read is offered once")
 
     def test_numbers_are_read_whole_and_not_out_of_words_decimals_or_paths(self):
         n = self.cc.numbers_in

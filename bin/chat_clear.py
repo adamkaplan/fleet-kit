@@ -102,7 +102,7 @@ def _load(state_dir):
     try:
         if path.stat().st_size > OFFERS_MAX_BYTES:
             return {}, "the offers file is larger than %d bytes" % OFFERS_MAX_BYTES
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}, None
     except (OSError, ValueError) as err:
@@ -131,7 +131,7 @@ def write_offers(state_dir, offers):
     directory = Path(state_dir)
     fd, tmp = tempfile.mkstemp(prefix=OFFERS_FILE + ".", dir=str(directory))
     try:
-        with os.fdopen(fd, "w") as handle:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump({"offers": offers}, handle, sort_keys=True, ensure_ascii=False)
             handle.flush()
             os.fsync(handle.fileno())
@@ -151,7 +151,7 @@ def write_offers(state_dir, offers):
 
 
 def _clean(text, limit):
-    return " ".join(CONTROL.sub(" ", str(text or "")).split())[:limit]
+    return " ".join(CONTROL.sub(" ", str(text or "")).split())[:limit].encode("utf-8", "replace").decode("utf-8")   # a lone surrogate cannot be written: it becomes ?
 
 
 def _quarantine(state_dir, now):
@@ -189,6 +189,8 @@ def refresh_offers(state_dir, holds, names, now, lock_seconds=LOCK_SECONDS):
         usable.sort(key=lambda hold: hold["pr"] not in before)   # an offer that exists is kept before a new one is taken
         for hold in usable:
             pr = hold["pr"]
+            if pr in after:
+                continue   # the same PR twice in one read: the first is kept
             if len(after) >= OFFERS_MAX:
                 capped = True
                 break
