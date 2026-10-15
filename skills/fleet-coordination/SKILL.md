@@ -330,6 +330,8 @@ If the head moved, the approval did not move with it.
 
 A reviewer or tester records the verdict as the last step of the review or test run it already does, in ONE command: `fleet-switchboard verdict --all --pr <repo#N> --as reviewer|tester --result pass|fail --head <full head sha> --evidence "<review url or what you ran>"`. (`--all` is coming; until it is merged, use the per-scenario form: `fleet-switchboard verdict <scenario> --pr <repo#N> --as reviewer|tester --result pass|fail --head <full head sha> --evidence "<what you ran>"`, once per scenario you are named for.) Say it only when it is true: an approval or a run at head H. A push voids it: re-record after the delta review. Never record a verdict on a PR you wrote (the switchboard refuses it, and it would be grading your own work).
 
+A tester records verdicts only and never runs `prove`: a proof makes it an author of the PR, and its verdicts are then refused.
+
 A `[switchboard] standing orders` note is the owner's standing instruction for the
 charter (kept in the charter issue's `## Standing orders` section, one bullet per
 order): act on it without asking again, within its words. It covers nothing it
