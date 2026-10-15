@@ -6139,6 +6139,30 @@ def read_retired(state_dir):
     return _read_small(state_dir, RETIRED_FILE)
 
 
+class RetiredUnreadable(Exception):
+    """retired.json exists but cannot be read as the {name: record} map it is (#372): for the tester gate that is NOT the same as an empty list."""
+
+
+def read_retired_strict(state_dir):
+    """The retired map, or RetiredUnreadable. A MISSING file is an empty map (nobody retired); anything else that is not a JSON object of objects (corrupt,
+    empty, garbage, a list, a record that is not an object, unreadable) raises. `read_retired` reads all of those as empty, which is right for a display but
+    would let a retired tester record verdicts again: the verdict authority (launch-record testers) uses this one and fails closed."""
+    try:
+        with open(str(Path(state_dir) / RETIRED_FILE), "rb") as handle:
+            raw = handle.read(1000001)
+    except FileNotFoundError:
+        return {}
+    except OSError as err:
+        raise RetiredUnreadable("%s cannot be read: %s" % (RETIRED_FILE, getattr(err, "strerror", None) or type(err).__name__)) from None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeError):
+        raise RetiredUnreadable("%s is not valid JSON" % RETIRED_FILE) from None
+    if not isinstance(data, dict) or len(raw) > 1000000 or not all(isinstance(v, dict) for v in data.values()):
+        raise RetiredUnreadable("%s is not a map of retired agents" % RETIRED_FILE)
+    return data
+
+
 def _prune_last_reports(data):
     """Bounded: the 500 entries with the oldest last sign of life go."""
     if len(data) > 500:
@@ -12109,9 +12133,13 @@ def testers_status(config, agents, fleets, state):
         sessions = {entry["observation"]["name"]: entry["observation"].get("session") for entry in (agents.get("list") or []) if entry.get("observation")}
         repo_of = lambda fleet: _fleet_repo(fleet, config)
         repos = {repo_of(fleet) for fleet in fleets.values() if isinstance(fleet, dict) and fleet.get("role") == "orchestrator"} - {None}
-        return load_launch_testers().status_lines(config.get("plan_evaluators"), fleets, sessions, repos, repo_of, read_retired(state))
-    except Exception:
-        return ["      tester     unreadable: the resolved testers could not be listed"]
+        try:
+            retired = read_retired_strict(state)
+        except RetiredUnreadable:
+            return ["      testers    retired file unreadable: launch-record testers disabled"]   # the same fail-closed rule the verdict gate applies
+        return load_launch_testers().status_lines(config.get("plan_evaluators"), fleets, sessions, repos, repo_of, retired)
+    except Exception as err:
+        return ["      tester     unreadable: the resolved testers could not be listed (%s)" % _one_line(type(err).__name__, 40)]
 
 
 def triage_status_lines(triage):
@@ -15089,7 +15117,7 @@ def cmd_launch(args, runner, now, socket_call=None):
     try:
         launcher = identify_caller(engine.herdr, engine.v2, os.environ)   # #372: who ran this launch, recorded in the session; a plain shell is nobody
     except Exception:
-        launcher = None
+        launcher = None   # an identity failure records nobody, on purpose: that agent never counts as a launched tester (fail closed)
     launched_by = launcher if isinstance(launcher, str) and launcher else None
     try:
         if getattr(args, "headless", False):
@@ -17662,8 +17690,9 @@ def launched_testers_for(ctx):
     except Exception:
         return {}, {}, {}
     try:
-        retired = read_retired(ctx.engine.state_dir) if ctx.engine.state_dir is not None else {}
-    except Exception:
+        retired = read_retired_strict(ctx.engine.state_dir) if ctx.engine.state_dir is not None else {}
+    except Exception as err:   # a corrupt retired file could hide a retired tester: no launched tester counts, loudly (audit; `status` says so too)
+        ctx.engine._note("testers.retired_unreadable", None, {"error": _one_line(str(err), 160), "effect": "launch-record testers disabled"})
         return {}, sessions, fleets
     return load_launch_testers().launched(fleets, sessions, ctx.repo, lambda fleet: _fleet_repo(fleet, ctx.config), retired), sessions, fleets
 

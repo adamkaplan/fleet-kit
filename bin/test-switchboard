@@ -22084,11 +22084,41 @@ class TestLaunchTesters(LedgerBase):
         self.assertEqual(sb.load_launch_testers().launched({"ltst": {"role": "tester", "repo": "acme/app", "reports_to": "orch", "launched_by": "orch"}, "orch": {"role": "orchestrator", "repo": "acme/app"}},
                                                            {"ltst": self.world.sessions["ltst"]}, "acme/app", lambda f: f.get("repo"), retired), {})
 
-    def test_an_unreadable_retired_list_counts_no_launched_tester_and_the_configured_one_still_works(self):
-        with mock.patch.object(sb, "read_retired", side_effect=OSError("unreadable")):
-            code, _, err = self.verdict("ltst", "S2", "tester")
-            self.assertEqual(code, 2)
-            self.assertEqual(self.verdict("tst", "S2", "tester")[0], 0)
+    def test_a_missing_retired_file_means_nobody_is_retired(self):
+        (self.world.state / sb.RETIRED_FILE).unlink(missing_ok=True)
+        self.assertEqual(self.verdict("ltst", "S2", "tester")[0], 0)
+        self.assertEqual(sb.read_retired_strict(self.world.state), {})
+
+    def test_a_corrupt_or_unreadable_retired_file_disables_every_launched_tester_and_says_so(self):
+        path = self.world.state / sb.RETIRED_FILE
+        for label, content in (("corrupt json", b'{"ltst": {"at": 1,'), ("empty bytes", b""), ("garbage", b"\xff\xfe not json \x00"),
+                               ("a list", b"[]"), ("a record that is not an object", b'{"ltst": "retired"}'), ("a bare string", b'"x"')):
+            with self.subTest(content=label):
+                path.write_bytes(content)
+                before = len([e for e in self.world.audit() if e["event"] == "testers.retired_unreadable"])
+                code, _, err = self.verdict("ltst", "S2", "tester")
+                self.assertEqual(code, 2)
+                self.assertIn("not registered", err)
+                self.assertEqual([e for e in self.ledger() if e["kind"] == "verdict"], [], "0 tester verdicts accepted")
+                events = [e for e in self.world.audit() if e["event"] == "testers.retired_unreadable"]
+                self.assertEqual(len(events), before + 1, "a loud audit event")
+                self.assertEqual(events[-1]["detail"]["effect"], "launch-record testers disabled")
+                with self.assertRaises(sb.RetiredUnreadable):
+                    sb.read_retired_strict(self.world.state)
+                fleets = {"orch": {"role": "orchestrator", "repo": "acme/app"}, "ltst": {"role": "tester", "repo": "acme/app", "reports_to": "orch", "launched_by": "orch"}}
+                agents = {"ok": True, "list": [{"observation": {"name": n, "session": "s-" + n}} for n in fleets]}
+                self.assertEqual(sb.testers_status({"plan_evaluators": {}, "intent_repo": "acme/app"}, agents, fleets, self.world.state),
+                                 ["      testers    retired file unreadable: launch-record testers disabled"])
+        self.assertEqual(self.verdict("tst", "S2", "tester")[0], 0, "the configured tester still works")
+        path.unlink()
+
+    def test_an_unreadable_directory_instead_of_a_file_also_fails_closed(self):
+        path = self.world.state / sb.RETIRED_FILE
+        path.mkdir()
+        try:
+            self.assertEqual(self.verdict("ltst", "S2", "tester")[0], 2)
+        finally:
+            path.rmdir()
 
     def test_status_lists_the_resolved_testers_with_their_source(self):
         fleets = {"orch": {"role": "orchestrator", "repo": "acme/app"}, "ltst": {"role": "tester", "repo": "acme/app", "reports_to": "orch", "launched_by": "orch"},

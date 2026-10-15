@@ -4100,7 +4100,7 @@ repo and no other, and a coder cannot mint one by naming an orchestrator as its 
 identity (the session-based guard of #138, which a determined local agent can spoof), and the boundary that matters is who may run `launch`. A tester is
 refused when it is a writer of the PR, runs in the session of a writer, or is the same agent as a coder launched on its work item. Each verdict a launched
 tester records is audited with the launch record it relied on (`launch_record` in `plan.verdict`), and `status` lists the resolved testers with their
-source (`config` or `launch record`). If the running agents or the retired list cannot be read, no launched tester counts (only the configured list does).
+source (`config` or `launch record`). If the running agents or the retired list cannot be read, no launched tester counts (only the configured list does): a missing `retired.json` means nobody is retired, but a corrupt, empty or non-map one disables every launched tester, audited as `testers.retired_unreadable` and said in `status` ("retired file unreadable: launch-record testers disabled").
 The rules are `bin/launch_testers.py`.
 
 **`gates`** prints one line per gate G0a to G8 with its status (`ok`, `missing`, `waiting`, `untracked`, `n/a`), who decides
