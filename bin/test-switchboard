@@ -53793,12 +53793,36 @@ class TestAuthorityModulesGuard(unittest.TestCase):
                 found["bin/" + path.name] = names
         return found
 
+    @staticmethod
+    def role_checks(directory, literals):
+        """{module path (bin/NAME.py): [the literal compared]} for every module of `directory` with a COMPARISON (==, !=, in, not in) against one of the role literals (the code, not a docstring):
+        the second rule, independent of function names."""
+        import ast
+        wanted, found = set(literals), {}
+
+        def strings(node):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                yield node.value
+            elif isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+                for item in node.elts:
+                    yield from strings(item)
+        for path in sorted(Path(directory).glob("*.py")):
+            hits = set()
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node, ast.Compare):
+                    for side in [node.left] + list(node.comparators):
+                        hits |= wanted & set(strings(side))
+            if hits:
+                found["bin/" + path.name] = sorted(hits)
+        return found
+
     def unlisted(self, directory, block=None):
-        """The modules of `directory` with authority vocabulary that are in no top tier path (as a path or a glob) and in no exemption."""
+        """The modules of `directory` that, by a function name with a word of the vocabulary OR by a comparison against a role literal, decide who may act, and are in no top tier path (as a
+        path or a glob) and in no exemption."""
         block = block or self.block
         listed = {g for globs in block["top_tier_paths"].values() for g in globs}
         exempt = set(block["authority_modules"]["exempt"])
-        found = self.authority_functions(directory, block["authority_modules"]["vocabulary"])
+        found = set(self.authority_functions(directory, block["authority_modules"]["vocabulary"])) | set(self.role_checks(directory, block["authority_modules"]["role_literals"]))
         return sorted(m for m in found if not self.floor.matches(m, sorted(listed)) and m not in exempt)
 
     def test_s1_the_named_modules_are_top_tier_paths_and_every_one_is_also_in_the_floor(self):
@@ -53824,6 +53848,29 @@ class TestAuthorityModulesGuard(unittest.TestCase):
             listed = json.loads(json.dumps(self.block))
             listed["top_tier_paths"]["authority"].append("bin/new_gate.py")
             self.assertEqual(self.unlisted(tmp, listed), [], "listed")
+
+    def test_a_renamed_function_cannot_hide_a_role_check_and_a_docstring_or_an_assignment_is_not_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "quiet_name.py").write_text('def run(kind):\n    return kind[1] == "chief-of-staff"\n')
+            (Path(tmp) / "tuple_form.py").write_text('def run(role):\n    return role in ("orchestrator", "x")\n')
+            (Path(tmp) / "not_a_check.py").write_text('"""the chief-of-staff and the operator"""\nNAME = "chief-of-staff"\ndef run(x):\n    return {"role": "operator"}\n')
+            self.assertEqual(self.unlisted(tmp), ["bin/quiet_name.py", "bin/tuple_form.py"])
+            exempted = json.loads(json.dumps(self.block))
+            exempted["authority_modules"]["exempt"].update({"bin/quiet_name.py": "a reason", "bin/tuple_form.py": "a reason"})
+            self.assertEqual(self.unlisted(tmp, exempted), [])
+            wider = json.loads(json.dumps(self.block))
+            wider["authority_modules"]["role_literals"].append("x")
+            self.assertEqual(self.unlisted(tmp, wider), ["bin/quiet_name.py", "bin/tuple_form.py"])
+
+    def test_a_caller_check_name_is_in_the_vocabulary_and_the_modules_that_gate_a_caller_are_listed(self):
+        words = set(self.block["authority_modules"]["vocabulary"])
+        self.assertTrue({"caller", "refuse", "refusal", "role", "chief", "operator"} <= words)
+        found = set(self.authority_functions(BIN, sorted(words))) | set(self.role_checks(BIN, self.block["authority_modules"]["role_literals"]))
+        listed = {g for globs in self.block["top_tier_paths"].values() for g in globs}
+        self.assertTrue(found, "the guard finds the authority modules of bin/")
+        for module in found:
+            self.assertTrue(module in listed or module in self.block["authority_modules"]["exempt"], module)
+        self.assertGreaterEqual(len(found & listed), 10, "the modules the guard finds that are listed")
 
     def test_every_exemption_names_a_real_module_with_a_reason_and_is_not_also_listed(self):
         listed = {g for globs in self.block["top_tier_paths"].values() for g in globs}

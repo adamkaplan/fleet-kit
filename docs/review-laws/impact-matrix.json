@@ -153,6 +153,10 @@
         "bin/launch_testers.py",
         "bin/plan_review.py",
         "bin/decision_core.py",
+        "bin/lanes.py",
+        "bin/orders_copy.py",
+        "bin/charter_check.py",
+        "bin/cloud_worker.py",
         "docs/review-laws/impact-matrix.json",
         "plugins/fleet-hooks/**",
         "tools/cos-permissions-proof/**",
@@ -188,6 +192,10 @@
           "bin/launch_testers.py",
           "bin/plan_review.py",
           "bin/decision_core.py",
+          "bin/lanes.py",
+          "bin/orders_copy.py",
+          "bin/charter_check.py",
+          "bin/cloud_worker.py",
           "docs/review-laws/impact-matrix.json"
         ],
         "exclude": [
@@ -210,7 +218,7 @@
       "bin/switchboard-trial"
     ],
     "authority_modules": {
-      "meaning": "Every module in bin/ that defines a function whose name has a word of `vocabulary` (names split at underscores) decides who may clear, hold, release, carry, consent to, record a verdict for or merge something, so it must be a top tier path above or be named in `exempt` with the reason it is not. A test reads this block and fails, naming the module, when a module is neither. The vocabulary is data: adding a word here widens the guard with no code change.",
+      "meaning": "Every module in bin/ that defines a function whose name has a word of `vocabulary` (names split at underscores) decides who may clear, hold, release, carry, consent to, record a verdict for or merge something, so it must be a top tier path above or be named in `exempt` with the reason it is not. A test reads this block and fails, naming the module, when a module is neither. The vocabulary is data: adding a word here widens the guard with no code change. A SECOND rule does not look at names: a module with a comparison (==, !=, in, not in) against one of the `role_literals` (the role names the fleet checks a caller by) decides who may act, so it must be listed or exempted too; a renamed function cannot hide it. When in doubt, LIST: an exemption needs a reason a reviewer can verify.",
       "vocabulary": [
         "clear",
         "clearing",
@@ -239,16 +247,28 @@
         "authorize",
         "revoke",
         "deny",
-        "decide"
+        "decide",
+        "caller",
+        "role",
+        "refuse",
+        "refused",
+        "refusal",
+        "chief",
+        "operator",
+        "person",
+        "only"
       ],
       "exempt": {
         "bin/spotlight_guard.py": "holds_files tells whether a folder holds an entry; no authority.",
         "bin/triage_digest.py": "gate is a rate limit on digests (warm-up and interval); no authority.",
         "bin/triage_plan_open.py": "merged_links reads which links a text names; it decides nothing about who may merge.",
-        "bin/charter_check.py": "decides which issue is a charter and which repository may be touched by a move or an order copy; the Chief-of-Staff-only rule lives in the commands that use it. It decides no clear, hold or merge.",
-        "bin/lanes.py": "moves an ask between charters; the caller rule is in the command. No clear, hold or merge.",
-        "bin/orders_copy.py": "copies standing orders between charters; the caller rule is in the command. No clear, hold or merge."
-      }
+        "bin/external_adapter.py": "`_role` only labels who answered an event from a rule file, for the record; it allows or refuses nothing."
+      },
+      "role_literals": [
+        "chief-of-staff",
+        "operator",
+        "orchestrator"
+      ]
     },
     "note": "top_tier_outside_floor lists the top tier paths that are deliberately not in the floor globs (the floor excludes agent definitions, which are captain pull requests); a test checks that every other top tier path is inside the floor. bin/fleet-switchboard selects accounts and mints tokens but is not a top tier path (it would hold nearly every change): a change there to credentials or identity must be rated with that class by the independent review."
   }
