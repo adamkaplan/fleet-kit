@@ -4094,6 +4094,18 @@ names, for example `{"reviewer": ["reviewer-1"], "tester": ["tester-1"]}`. An ev
 for, which keeps a fresh install from accepting verdicts nobody was trusted to give. The **writers** of a PR are the author GitHub reports for it, anyone who recorded a proof for it, and the sender of its `notice pr`; a verdict is refused until at least one writer is known, so a writer that declared nothing cannot be its own evaluator; an author's verdict is refused when recorded, and ignored by `gates` if it is
 in the file anyway. The caller's identity is the session-based one, a guard against mistakes: it does not stop an agent that sets another agent's session variable. `verdict` requires `--evidence` like `prove`, and `--head` must be the PR's head. A scenario that still names the old personal evaluator spelling is judged by `owner`.
 
+**Testers from the launch record (#372).** The `tester` list is the configured one PLUS every running agent whose launch record (`launch --role tester`, kept
+in its session's fleet metadata) says: role `tester`, the PR's repo, a boss whose own record is `orchestrator` for that same repo, and **launched by that
+boss** (`launched_by`: `launch` records the agent that ran it, as its pane identified it; a launch from a plain shell, or from before this record existed,
+does not count: use the configured list); a retired tester does not count. So a tester launched by a repo's orchestrator may record tester verdicts for that
+repo and no other, and a coder cannot mint one by naming an orchestrator as its boss. This widens who can record a verdict, and only for `tester`:
+`reviewer`, `ci` and `owner` never come from a launch record. **It is a guardrail, not a boundary:** the record is written at launch from the caller's pane
+identity (the session-based guard of #138, which a determined local agent can spoof), and the boundary that matters is who may run `launch`. A tester is
+refused when it is a writer of the PR, runs in the session of a writer, or is the same agent as a coder launched on its work item. Each verdict a launched
+tester records is audited with the launch record it relied on (`launch_record` in `plan.verdict`), and `status` lists the resolved testers with their
+source (`config` or `launch record`). If the running agents or the retired list cannot be read, no launched tester counts (only the configured list does): a missing `retired.json` means nobody is retired, but a corrupt, empty or non-map one disables every launched tester, audited as `testers.retired_unreadable` and said in `status` ("retired file unreadable: launch-record testers disabled").
+The rules are `bin/launch_testers.py`.
+
 **`gates`** prints one line per gate G0a to G8 with its status (`ok`, `missing`, `waiting`, `untracked`, `n/a`), who decides
 it, and what is missing, and exits 0 when every gate it tracks and that applies to a PR is satisfied, 1 when something is
 missing, 2 when it cannot run. Tracked now: **G0a** (the plan passes `plan check`), **G1** (every per-PR scenario has a passing
@@ -4315,6 +4327,17 @@ allocates a pseudo-terminal and detaches the process that holds it (a double for
 nothing in the process can tell it from the owner's shell. (2) **A harness that is not on the list.** Ancestors are matched against `opencode`, `fleet-opencode`
 and `copilot`; an agent harness under another name is not seen, and a renamed copy of one is not either. Both are the same limit as the session variables: an agent
 that is determined to pass as the owner can, and only something it cannot reach (a separate account, a hardware confirmation, a GitHub required check) would stop it.
+
+### An owner's clear carries over a pure merge of main (#510)
+
+An owner clear is bound to one head. When main moves, a pull request that conflicts or must be current merges main into its branch: a new head, and the clear no longer applied, though the pull request's OWN change was exactly what the owner cleared. With `"impact_hold": {"enabled": true, "carry_clear": true}` (**off by default**; anything but a real `true` is off) the clear now carries to that head, and to nothing else.
+
+- **What the clear stores.** Next to the head, a fingerprint (`sha256`) of the pull request's own change: its changed files with their blob ids and patch text, against the merge base of that head (`bin/clear_carry.py`, the one function `own_change_fingerprint`, used at the clear and at the carry). A clear made while the switch is off, or one whose change could not be read in full, has none and never carries.
+- **When it carries (the daemon's judgement, before the hold is written).** ALL must hold, each read in full from GitHub: the cleared head is an ancestor of the new head; every step from the new head back to the cleared head along first parents is a merge of two parents (a commit of the pull request's own is never carried); the second parent of each merge is on the pull request's BASE branch (a merge of a side branch is never carried: GitHub shows no file mode, so a mode change could ride on one); no file in those merges differs from BOTH parents (a conflict resolved by hand, or a file both sides changed, voids it); the fingerprint of the new head's own change against ITS merge base is identical to the ORIGINAL one (the base branch name is part of it, so a retargeted pull request is a different change; never to an earlier carried head, so carries cannot drift); the head and the base did not move while it was read.
+- **Everything else voids it, as today.** A commit of its own, an edited, added or removed file, a resolved conflict, a rewritten history (force-push, rebase), a head that does not contain the cleared one, a truncated file list, a patch GitHub omits (a binary file or a change too large; a pure rename is pinned by its blob id), or any read error: the hold is written and the audit line `gate.clear_carry_void` says why, once per head.
+- **What you see.** A carry is one audit line per new head, `gate.clear_carried` (both heads and the fingerprint), and the gate row of the PR says `the owner's clear of <head> carried to this head`. `impact hold --dry-run` counts it as cleared. A carry changes no label.
+- **Taking it back.** `fleet-switchboard impact clear OWNER/REPO#N --revoke --reason ...` (the owner's own terminal only) removes the clear and any carry of it: the daemon holds the PR again at its next pass and nothing carries. A fresh clear starts again from its own head.
+- **Limits.** A merge of main that changes how the pull request's own lines BEHAVE without changing them (a semantic interaction) still carries: the owner sees the carry and can revoke it. A file both sides changed cleanly voids the carry (conservative). The carry is judged at the new head only: a clear recorded as carried stops counting when the owner switches `carry_clear` off.
 
 ### Clearing a hold by saying so in the chat (#457)
 

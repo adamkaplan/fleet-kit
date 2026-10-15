@@ -164,6 +164,8 @@ bug in the engine; a hotfix to the engine proceeds under a cos waiver or with th
 For a hotfix, cos may waive G0 to G5 for one PR. **G6 (held PR) and G8 (production) are never waivable by an agent**: the
 command refuses them.
 
+G6 reads the impact floor itself, fresh for the exact head, with the same function the daemon uses (`gates` and `gates-check` spend one extra pull request read): a pull request on a floor path waits from the moment it is ready, before any label. The owner's clear counts only for that head; a floor that cannot be read makes G6 wait ("could not be read"), never pass; a hold label still waits.
+
 `fleet-switchboard waive <repo#N> --gates G0a,G1,... --reason "<text>"`:
 
 - only an agent whose fleet role is chief-of-staff (identity as for `verdict`: a mistake-guard, not a boundary);

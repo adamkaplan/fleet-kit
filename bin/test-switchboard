@@ -5800,6 +5800,22 @@ class TestLaunch(Base):
         self.assertEqual(session["metadata"]["fleet"]["reports_to"], "platform")
         self.assertEqual(session["messages"][0]["text"], "Do the thing\n")
 
+    def test_a_launch_records_who_ran_it_from_its_pane_and_nobody_from_a_plain_shell(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        for pane, expected in ((self.world.panes["platform"], "platform"), (None, None)):
+            if pane is None:
+                os.environ.pop("HERDR_PANE_ID", None)
+            else:
+                os.environ["HERDR_PANE_ID"] = pane
+            name = "tester-%s" % (expected or "shell")
+            with captured() as (out, err):
+                code = sb.main(["launch", name, "--agent", "coder", "--dir", str(self.work), "--role", "tester", "--reports-to", "platform"],
+                               runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+            self.assertEqual(code, 0, err.getvalue())
+            fleet = self.world.v2.sessions[json.loads(out.getvalue())["session"]]["metadata"]["fleet"]
+            self.assertEqual((fleet["role"], fleet.get("launched_by")), ("tester", expected))
+
     def test_the_cli_without_a_workspace_is_refused(self):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
         os.environ.pop("HERDR_WORKSPACE_ID", None)
@@ -12598,6 +12614,579 @@ class TestChatClearHook(Base):
         self.assertNotIn("via", cleared["detail"])
 
 
+class GitHubOverGit:
+    """The slice of GitHub's REST answers the carry reads, produced from a REAL git repository (so a merge, a conflict, a rebase, a binary file and a rename are the real thing):
+    pulls/N, pulls/N/files, compare/A...B and commits/SHA, with GitHub's shapes (a patch starts at the first hunk and is absent for a binary file, files are paged by 100)."""
+
+    def __init__(self, repo_dir, branch="feature", base="main", number=7):
+        self.dir, self.branch, self.base, self.number = str(repo_dir), branch, base, number
+        self.calls, self.fail, self.changed_files_override = [], None, None
+
+    def git(self, *args, check=True):
+        done = subprocess.run(["git", "-C", self.dir] + list(args), capture_output=True, text=True)
+        if check and done.returncode != 0:
+            raise RuntimeError("git %s: %s" % (" ".join(args), done.stderr.strip()))
+        return done.stdout
+
+    def rev(self, ref):
+        return self.git("rev-parse", ref).strip()
+
+    def files_between(self, a, b):
+        key = (self.rev(a), self.rev(b))
+        self.cache = getattr(self, "cache", {})
+        if key not in self.cache:
+            self.cache[key] = self._files_between(a, b)
+        return self.cache[key]
+
+    def _files_between(self, a, b):
+        merge_base = self.git("merge-base", a, b).strip()
+        names = [line.split("\t") for line in self.git("diff", "-M", "--name-status", merge_base, b).splitlines()]
+        patches = [section for section in ("\n" + self.git("diff", "-M", merge_base, b)).split("\ndiff --git ")[1:]]
+        tree_b = {line.split("\t")[1]: line.split()[2] for line in self.git("ls-tree", "-r", b).splitlines()}
+        tree_base = {line.split("\t")[1]: line.split()[2] for line in self.git("ls-tree", "-r", merge_base).splitlines()}
+        out = []
+        for parts, section in zip(names, patches):
+            code, paths = parts[0], parts[1:]
+            path, previous = paths[-1], (paths[0] if code.startswith("R") else None)
+            status = {"A": "added", "M": "modified", "D": "removed", "R": "renamed"}[code[0]]
+            patch = section[section.index("\n@@") + 1:].rstrip("\n") if "\n@@" in section else None
+            changes = sum(1 for l in (patch or "").splitlines() if l[:1] in "+-" and not l.startswith(("+++", "---")))
+            blob = tree_base[path] if status == "removed" else tree_b[path]
+            item = {"filename": path, "status": status, "sha": blob, "changes": changes}
+            if previous:
+                item["previous_filename"] = previous
+            if patch is not None:
+                item["patch"] = patch
+            out.append(item)
+        return out
+
+    def page(self, items, query):
+        number = int(query.get("page", ["1"])[0])
+        return items[(number - 1) * 100:number * 100]
+
+    def get(self, path):
+        self.calls.append(path)
+        if self.fail and self.fail in path:
+            raise RuntimeError("HTTP 502 for %s" % path)
+        head = self.rev(self.branch)
+        key = (path, head, self.base, self.changed_files_override)   # a git repository is immutable by sha: the same question at the same tip has the same answer
+        self.answers = getattr(self, "answers", {})
+        if key not in self.answers:
+            self.answers[key] = self._answer(path, head)
+        return self.answers[key]
+
+    def _answer(self, path, head):
+        route, _, query = path.partition("?")
+        query = dict(q.split("=", 1) for q in query.split("&") if q)
+        query = {k: [v] for k, v in query.items()}
+        parts = route.split("/")                      # repos / owner / repo / ...
+        tail = "/".join(parts[3:])
+        if tail == "pulls/%d" % self.number:
+            files = self.files_between(self.base, head)
+            return {"head": {"sha": head}, "base": {"ref": self.base}, "changed_files": self.changed_files_override if self.changed_files_override is not None else len(files)}
+        if tail == "pulls/%d/files" % self.number:
+            return self.page(self.files_between(self.base, head), query)
+        if tail.startswith("compare/"):
+            a, b = tail[len("compare/"):].split("...")
+            if self.rev(a) == self.rev(b):
+                status = "identical"
+            elif subprocess.run(["git", "-C", self.dir, "merge-base", "--is-ancestor", a, b]).returncode == 0:
+                status = "ahead"
+            elif subprocess.run(["git", "-C", self.dir, "merge-base", "--is-ancestor", b, a]).returncode == 0:
+                status = "behind"
+            else:
+                status = "diverged"
+            commits = []
+            for line in self.git("rev-list", "--parents", "--reverse", "%s..%s" % (a, b)).splitlines():
+                sha, *parents = line.split()
+                commits.append({"sha": sha, "parents": [{"sha": p} for p in parents]})
+            return {"status": status, "total_commits": len(commits), "commits": self.page(commits, query), "files": self.page(self.files_between(a, b), query)}
+        if tail.startswith("commits/"):
+            sha = tail[len("commits/"):]
+            parents = self.git("rev-list", "--parents", "-n", "1", sha).split()[1:]
+            files = []
+            if parents:
+                for line in self.git("diff", "--name-status", parents[0], sha).splitlines():
+                    code, path = line.split("\t")[0], line.split("\t")[-1]
+                    files.append({"filename": path, "status": {"A": "added", "M": "modified", "D": "removed"}.get(code[0], "modified"), "sha": self.rev("%s:%s" % (sha if code[0] != "D" else parents[0], path))})
+            return {"sha": sha, "parents": [{"sha": p} for p in parents], "files": self.page(files, query)}
+        raise RuntimeError("the fake GitHub has no answer for %s" % path)
+
+
+def build_carry_repo(directory):
+    """A real git repository (neutral names): `main` with a few files and a `feature` branch whose own change is a.txt edited and c.txt added. Returns the GitHubOverGit over it."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    api = GitHubOverGit(directory)
+    g = api.git
+
+    def write(path, text):
+        target = directory / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+
+    g("init", "-q", "-b", "main")
+    g("config", "user.email", "dev@example.test")
+    g("config", "user.name", "Dev")
+    g("config", "commit.gpgsign", "false")
+    write("README.md", "widget api\n")
+    write("a.txt", "one\ntwo\nthree\nfour\nfive\nsix\nseven\n")
+    write("src/x.py", "def x():\n    return 1\n")
+    g("add", "-A")
+    g("commit", "-q", "-m", "base")
+    g("checkout", "-q", "-b", "feature")
+    write("a.txt", "one\nTWO\nthree\nfour\nfive\nsix\nseven\n")
+    write("c.txt", "new file\n")
+    g("add", "-A")
+    g("commit", "-q", "-m", "the change")
+    return api
+
+
+class TestClearCarry(unittest.TestCase):
+    """#510: an owner clear carries over a pure merge of main and over nothing else. Every case runs on a REAL git repository (neutral names)."""
+
+    REPO = "acme-org/widget-api"
+
+    def setUp(self):
+        self.cc = sb.load_module("clear_carry")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name) / "repo"
+        self.api = build_carry_repo(self.dir)
+        self.cleared = self.api.rev("feature")
+        self.fp = self.fingerprint()
+
+    def write(self, path, text, binary=False):
+        target = self.dir / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        (target.write_bytes if binary else target.write_text)(text)
+
+    def fingerprint(self):
+        fingerprint, head, files = self.cc.own_change_fingerprint(self.api.get, self.REPO, 7)
+        self.assertEqual(head, self.api.rev("feature"))
+        return fingerprint
+
+    def main_moves(self, *names, edit=None):
+        g = self.api.git
+        g("checkout", "-q", "main")
+        for name in names:
+            self.write(name, "from main %s\n" % name)
+        if edit:
+            self.write(*edit)
+        g("add", "-A")
+        g("commit", "-q", "-m", "main moves")
+        g("checkout", "-q", "feature")
+
+    def merge_main(self):
+        self.api.git("merge", "-q", "--no-edit", "main")
+        return self.api.rev("feature")
+
+    def decide(self, new):
+        return self.cc.decide(self.api.get, self.REPO, 7, self.cleared, self.fp, new)
+
+    def test_s1_a_pure_merge_of_main_carries_the_clear_and_the_fingerprint_is_the_original(self):
+        self.main_moves("m1.txt", "m2.txt", "m3.txt")
+        new = self.merge_main()
+        verdict = self.decide(new)
+        self.assertEqual((verdict["carried"], verdict["reason"], verdict["fingerprint"], verdict["from"], verdict["to"]), (True, None, self.fp, self.cleared, new))
+
+    def test_s2_a_commit_of_its_own_an_edited_line_an_added_or_a_removed_file_void_the_clear(self):
+        g = self.api.git
+        for label, change in (("a commit of its own", lambda: (self.write("d.txt", "d\n"), g("add", "-A"), g("commit", "-q", "-m", "own"))),
+                              ("an edited line", lambda: (self.write("a.txt", "one\nTWO!\nthree\nfour\nfive\nsix\nseven\n"), g("commit", "-q", "-am", "edit"))),
+                              ("an added file", lambda: (self.write("e.txt", "e\n"), g("add", "-A"), g("commit", "-q", "-m", "add"))),
+                              ("a removed file", lambda: (g("rm", "-q", "c.txt"), g("commit", "-q", "-m", "remove")))):
+            with self.subTest(label):
+                g("checkout", "-q", "-B", "feature", self.cleared)
+                self.main_moves("m_%s.txt" % label.replace(" ", "_"))
+                self.merge_main()
+                change()
+                verdict = self.decide(self.api.rev("feature"))
+                self.assertFalse(verdict["carried"], label)
+                self.assertIn("commit of the pull request's own", verdict["reason"])
+        # an "evil merge": main merged, and the merge commit itself edits or adds a file
+        for label, edit in (("edits a cleared file", lambda: self.write("c.txt", "changed in the merge\n")), ("adds a file", lambda: self.write("d.txt", "sneaked in\n"))):
+            with self.subTest(label):
+                g("checkout", "-q", "-B", "feature", self.cleared)
+                self.main_moves("n_%s.txt" % label.replace(" ", "_"))
+                g("merge", "-q", "--no-commit", "--no-ff", "main")
+                edit()
+                g("add", "-A")
+                g("commit", "-q", "-m", "merge main (and more)")
+                verdict = self.decide(self.api.rev("feature"))
+                self.assertFalse(verdict["carried"], label)
+                self.assertIn("relative to both parents", verdict["reason"])
+
+    def test_s3_a_conflict_resolved_by_hand_voids_the_clear_even_though_the_file_list_is_the_same(self):
+        g = self.api.git
+        self.main_moves(edit=("a.txt", "one\nTWO from main\nthree\nfour\nfive\nsix\nseven\n"))
+        done = subprocess.run(["git", "-C", str(self.dir), "merge", "--no-edit", "main"], capture_output=True, text=True)
+        self.assertNotEqual(done.returncode, 0, "the merge conflicts in a.txt")
+        self.write("a.txt", "one\nTWO resolved by hand\nthree\nfour\nfive\nsix\nseven\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "merge main, conflict resolved")
+        verdict = self.decide(self.api.rev("feature"))
+        self.assertFalse(verdict["carried"])
+        self.assertIn("a.txt", verdict["reason"])
+        self.assertIn("relative to both parents", verdict["reason"])
+        same_files = self.cc.own_change(self.api.get, self.REPO, 7)[0]
+        self.assertEqual(sorted(f["path"] for f in same_files), ["a.txt", "c.txt"], "the same two files: only the content check catches it")
+
+    def test_s4_a_rewritten_history_with_the_same_final_diff_is_void(self):
+        g = self.api.git
+        self.main_moves("m1.txt")
+        g("rebase", "-q", "main")
+        new = self.api.rev("feature")
+        self.assertNotEqual(new, self.cleared)
+        self.assertEqual(self.fingerprint(), self.fp, "the rebased pull request has exactly the same own change")
+        verdict = self.decide(new)
+        self.assertFalse(verdict["carried"])
+        self.assertIn("rewritten history", verdict["reason"])
+
+    def test_s5_a_cut_file_list_an_omitted_patch_and_a_read_error_void_the_clear_and_name_what_could_not_be_read(self):
+        self.main_moves("m1.txt")
+        new = self.merge_main()
+        self.api.changed_files_override = 5
+        verdict = self.decide(new)
+        self.assertFalse(verdict["carried"])
+        self.assertIn("cut: GitHub lists 2 of 5 files", verdict["reason"])
+        self.api.changed_files_override = None
+        self.api.fail = "/compare/"
+        verdict = self.decide(new)
+        self.assertFalse(verdict["carried"])
+        self.assertIn("could not be read", verdict["reason"])
+        self.api.fail = None
+        g = self.api.git
+        g("checkout", "-q", "-B", "feature", self.cleared)
+        self.write("blob.dat", bytes(range(256)) * 4, binary=True)
+        g("add", "-A")
+        g("commit", "-q", "-m", "binary")
+        with self.assertRaises(self.cc.CarryVoid) as raised:
+            self.cc.own_change_fingerprint(self.api.get, self.REPO, 7)
+        self.assertIn("patch of blob.dat is omitted", str(raised.exception))
+        binary_cleared = self.api.rev("feature")
+        self.main_moves("m2.txt")
+        merged = self.merge_main()
+        verdict = self.cc.decide(self.api.get, self.REPO, 7, binary_cleared, "sha256:" + "0" * 64, merged)
+        self.assertFalse(verdict["carried"])
+        self.assertIn("omitted", verdict["reason"])
+        verdict = self.cc.decide(self.api.get, self.REPO, 7, self.cleared, None, new)
+        self.assertEqual((verdict["carried"], verdict["reason"]), (False, "no fingerprint was recorded with the clear"))
+        self.assertFalse(self.cc.decide(self.api.get, self.REPO, 7, self.cleared, "not-a-hash", new)["carried"])
+
+    def test_a_merge_of_a_side_branch_a_retargeted_base_and_a_head_that_moves_mid_read_all_void(self):
+        g = self.api.git
+        g("checkout", "-q", "-b", "side", self.cleared)
+        self.write("side.txt", "side\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "side")
+        g("checkout", "-q", "feature")
+        g("merge", "-q", "--no-ff", "--no-edit", "side")
+        verdict = self.decide(self.api.rev("feature"))
+        self.assertFalse(verdict["carried"])
+        self.assertIn("not on main", verdict["reason"])
+        g("checkout", "-q", "-B", "feature", self.cleared)
+        self.main_moves("m1.txt")
+        new = self.merge_main()
+        self.assertTrue(self.decide(new)["carried"])
+        g("branch", "release", self.cleared)
+        self.api.base = "release"
+        self.assertFalse(self.decide(new)["carried"], "a retargeted base is a different change")
+        self.api.base = "main"
+        calls = {"n": 0}
+        real = self.cc.pull_head
+
+        def moving(get, repo, number):
+            calls["n"] += 1
+            head, pull = real(get, repo, number)
+            return (head if calls["n"] == 1 else "0" * 40), pull
+        self.cc.pull_head = moving
+        self.addCleanup(setattr, self.cc, "pull_head", real)
+        self.assertFalse(self.decide(new)["carried"])
+
+    def test_s6_successive_merges_are_each_compared_with_the_original_and_an_own_change_makes_the_next_void(self):
+        g = self.api.git
+        carried = []
+        for n in (1, 2, 3):
+            self.main_moves("m%d.txt" % n)
+            carried.append(self.decide(self.merge_main())["carried"])   # each decided when it is the current head, against the ORIGINAL cleared head and fingerprint
+        self.assertEqual(carried, [True, True, True], "three merges, three carries")
+        self.write("a.txt", "one\nTWO\nthree\nfour\nfive\nsix\nSEVEN\n")
+        g("commit", "-q", "-am", "own change after the second merge")
+        self.main_moves("m4.txt")
+        fourth = self.merge_main()
+        verdict = self.decide(fourth)
+        self.assertFalse(verdict["carried"], "a change of its own after a carry makes every later head void")
+
+    def test_a_pure_merge_whose_own_change_is_not_the_one_cleared_is_void_at_the_last_check_and_each_merge_is_compared_with_the_original(self):
+        g = self.api.git
+        self.main_moves("m1.txt")
+        new = self.merge_main()
+        wrong = "sha256:" + "1" * 64
+        verdict = self.cc.decide(self.api.get, self.REPO, 7, self.cleared, wrong, new)
+        self.assertFalse(verdict["carried"], "the merge chain and the merges are clean: only the fingerprint comparison can refuse this")
+        self.assertIn("is not the one the owner cleared", verdict["reason"])
+        self.assertEqual(verdict["fingerprint"], self.fp, "the verdict carries the fingerprint it computed, for the audit")
+        # drift: a pure merge whose own change differs from the ORIGINAL but equals the PREVIOUS head's is still void
+        self.assertTrue(self.cc.decide(self.api.get, self.REPO, 7, self.cleared, self.fp, new)["carried"])
+        previous_fp = self.fingerprint()
+        self.assertEqual(previous_fp, self.fp)
+        drifted = "sha256:" + "2" * 64            # what a build comparing with an earlier carried head would hold after a small change slipped in
+        self.main_moves("m2.txt")
+        second = self.merge_main()
+        self.assertFalse(self.cc.decide(self.api.get, self.REPO, 7, self.cleared, drifted, second)["carried"])
+
+    def test_a_pure_rename_and_a_renamed_and_edited_file_carry_over_a_merge_and_an_edit_after_the_clear_does_not(self):
+        g = self.api.git
+        g("checkout", "-q", "-B", "feature", "main")
+        g("mv", "src/x.py", "src/y.py")
+        g("commit", "-q", "-m", "rename")
+        cleared = self.api.rev("feature")
+        files, _, _ = self.cc.own_change(self.api.get, self.REPO, 7)
+        self.assertEqual([(f["path"], f["status"], f["previous"]) for f in files], [("src/y.py", "renamed", "src/x.py")])
+        fp = self.fingerprint()
+        self.main_moves("m1.txt")
+        new = self.merge_main()
+        self.assertTrue(self.cc.decide(self.api.get, self.REPO, 7, cleared, fp, new)["carried"], "a pure rename's blob id pins its content")
+        # a rename that is also edited carries too (its patch is present and pinned); an edit AFTER the clear does not
+        g("checkout", "-q", "-B", "feature", "main")
+        g("mv", "src/x.py", "src/z.py")
+        self.write("src/z.py", "def x():\n    return 2\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "rename and edit")
+        edited = self.api.rev("feature")
+        edited_fp = self.fingerprint()
+        self.main_moves("m2.txt")
+        merged = self.merge_main()
+        self.assertTrue(self.cc.decide(self.api.get, self.REPO, 7, edited, edited_fp, merged)["carried"])
+        self.write("src/z.py", "def x():\n    return 3\n")
+        g("commit", "-q", "-am", "edit after the clear")
+        self.main_moves("m3.txt")
+        verdict = self.cc.decide(self.api.get, self.REPO, 7, edited, edited_fp, self.merge_main())
+        self.assertFalse(verdict["carried"])
+        self.assertIn("commit of the pull request's own", verdict["reason"])
+
+    def test_s8_there_is_one_fingerprint_function_and_the_carry_code_holds_no_path_or_class_literal(self):
+        import ast
+        main = Path(sb.__file__).read_text()
+        module = Path(sb.__file__).parent / "clear_carry.py"
+        text = module.read_text()
+        defs = [n.name for src in (main, text) for n in ast.walk(ast.parse(src)) if isinstance(n, ast.FunctionDef) and "fingerprint" in n.name]
+        self.assertEqual(sorted(defs), ["clear_fingerprint", "fingerprint_of", "own_change_fingerprint"], "one computation (fingerprint_of), one entry point (own_change_fingerprint) and the clear's wrapper")
+        calls = [n for n in ast.walk(ast.parse(main)) if isinstance(n, ast.Call) and getattr(n.func, "attr", None) == "own_change_fingerprint"]
+        self.assertEqual(len(calls), 1, "the clear's wrapper is the only caller in the switchboard; the carry's decide calls the same function inside the module")
+        imports = sorted(a.name for n in ast.walk(ast.parse(text)) if isinstance(n, ast.Import) for a in n.names)
+        self.assertEqual(imports, ["hashlib", "json"], "the carry imports no floor, glob or class code: it decides from GitHub's answers alone")
+
+
+class TestClearCarryInTheDaemon(Base):
+    """#510: the clear stores the fingerprint, the daemon's hold skips a head the clear carries to (only with `impact_hold.carry_clear`), audits it once, shows it in the gate row and
+    the owner can revoke it. A real git repository stands behind a fake GitHub; a fake gh records every write."""
+
+    REPO, PR = "acme-org/widget-api", "acme-org/widget-api#7"
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.api = build_carry_repo(Path(self.tmp.name) / "repo")
+        self.writes, self.api_gets = [], 0
+        self.labels = []
+        self.build(carry=True)
+
+    def build(self, carry):
+        impact = {"enabled": True, "carry_clear": carry} if carry is not None else {"enabled": True}
+        self.world = World(self, agents=("cos",), config={"gh": FAKE_GH, "impact_hold": impact})
+        self.engine = self.world.new_engine("daemon")
+        self.engine.gh_runner, self.engine.state_dir = self.route, self.world.state
+        self.names = sb.label_names(self.engine.config)
+        state = Path(self.world.state) / sb.IMPACT_STATE_FILE
+        if state.exists():
+            state.unlink()
+
+    def route(self, argv, **kwargs):
+        if argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"]:
+            raw = {"state": "OPEN", "headRefOid": self.api.rev("feature"), "title": "t", "labels": [{"name": n} for n in self.labels]}
+            return subprocess.CompletedProcess(argv, 0, json.dumps(raw), "")
+        if argv[0] == FAKE_GH and argv[1] == "api" and "--method" in argv:
+            method = argv[argv.index("--method") + 1]
+            if method == "GET" and "/labels/" in argv[2]:
+                return subprocess.CompletedProcess(argv, 0, "{}", "")           # a label that already exists
+            if method == "GET":
+                self.api_gets += 1
+                try:
+                    return subprocess.CompletedProcess(argv, 0, json.dumps(self.api.get(argv[2])), "")
+                except RuntimeError as err:
+                    return subprocess.CompletedProcess(argv, 1, "", str(err))
+            self.writes.append((method, argv[2], json.loads(kwargs["input"]) if kwargs.get("input") else None))
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+        return self.world.route(argv, **kwargs)
+
+    def events(self, name):
+        return [e for e in self.world.audit() if e["event"] == name]
+
+    def adds(self):
+        return [w for w in self.writes if w[0] == "POST" and w[1].endswith("/labels")]
+
+    def clear(self):
+        self.labels = [self.names["merge-captain"], self.names["hold-impact"]]
+        sb.impact_clear_core(self.engine, self.route, self.REPO, 7, "owner", "a false hold: it is a fixture")
+        self.labels = []
+        return self.api.rev("feature")
+
+    def merge_main(self, name="m1.txt"):
+        g = self.api.git
+        g("checkout", "-q", "main")
+        (Path(self.api.dir) / name).write_text("from main\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "main moves")
+        g("checkout", "-q", "feature")
+        g("merge", "-q", "--no-edit", "main")
+        return self.api.rev("feature")
+
+    def hold(self, head, labels=()):
+        report = {"pr": self.PR, "head": head, "reasons": ["a floor path"], "floor_paths": ["x"], "globs": ["x"]}
+        return sb.apply_impact_hold(self.engine, self.REPO, 7, report, {"labels": [{"name": l} for l in labels]})
+
+    def test_the_clear_stores_the_fingerprint_with_the_head_only_when_the_switch_is_on(self):
+        cleared = self.clear()
+        entry = sb.read_impact_state(self.world.state)[0]["clears"][self.PR]
+        self.assertEqual(entry["head"], cleared)
+        self.assertTrue(entry["fingerprint"].startswith("sha256:"))
+        (event,) = self.events("gate.hold_cleared")
+        self.assertEqual(event["detail"]["fingerprint"], entry["fingerprint"])
+        self.build(carry=None)   # the default: off
+        gets = self.api_gets
+        self.clear()
+        self.assertNotIn("fingerprint", sb.read_impact_state(self.world.state)[0]["clears"][self.PR])
+        self.assertEqual(self.api_gets, gets, "off: the clear reads nothing new from GitHub")
+
+    def test_s1_s7_a_pure_merge_of_main_carries_no_hold_is_written_it_is_audited_once_and_the_gate_row_says_carried(self):
+        cleared = self.clear()
+        new = self.merge_main()
+        self.assertEqual(self.hold(new), 0)
+        self.assertEqual(self.adds(), [], "no hold written for the carried head")
+        (carried,) = self.events("gate.clear_carried")
+        fingerprint = sb.read_impact_state(self.world.state)[0]["clears"][self.PR]["fingerprint"]
+        self.assertEqual((carried["detail"]["head"], carried["detail"]["from"], carried["detail"]["fingerprint"]), (new, cleared, fingerprint))
+        gets = self.api_gets
+        for _ in range(3):
+            self.assertEqual(self.hold(new), 0)
+        self.assertEqual((len(self.events("gate.clear_carried")), self.api_gets), (1, gets), "decided once per new head: one audit line and no repeated reads")
+        report = {"gates": [{"gate": "G6", "status": "ok", "detail": "not a held PR"}], "head": new}
+        sb.gates_carried_note(report, types.SimpleNamespace(state=self.world.state, pr=self.PR, config=self.engine.config))
+        self.assertIn("carried to this head", report["gates"][0]["detail"])
+        self.assertIn(cleared[:8], report["gates"][0]["detail"])
+        self.assertEqual(report["carried"]["from"], cleared)
+        other = {"gates": [{"gate": "G6", "status": "ok", "detail": "not a held PR"}], "head": "b" * 40}
+        sb.gates_carried_note(other, types.SimpleNamespace(state=self.world.state, pr=self.PR, config=self.engine.config))
+        self.assertEqual(other["gates"][0]["detail"], "not a held PR", "only the carried head says carried")
+
+    def test_a_commit_of_its_own_voids_the_clear_the_hold_is_written_and_the_void_is_audited_once_with_the_reason(self):
+        self.clear()
+        g = self.api.git
+        (Path(self.api.dir) / "d.txt").write_text("own\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "own commit")
+        new = self.api.rev("feature")
+        self.assertGreater(self.hold(new), 0)
+        self.assertEqual(len(self.adds()), 1, "held as today")
+        (void,) = self.events("gate.clear_carry_void")
+        self.assertIn("commit of the pull request's own", void["detail"]["reason"])
+        gets = self.api_gets
+        self.hold(new, labels=[self.names["merge-captain"], self.names["hold-impact"]])
+        self.assertEqual((len(self.events("gate.clear_carry_void")), self.api_gets), (1, gets), "once per head")
+        self.assertEqual(sb.read_impact_state(self.world.state)[0].get("carried", {}), {})
+
+    def test_s9_off_by_default_the_merge_of_main_is_held_as_today_and_a_clear_without_a_fingerprint_never_carries(self):
+        self.build(carry=None)
+        self.clear()
+        new = self.merge_main()
+        self.assertGreater(self.hold(new), 0)
+        self.assertEqual((len(self.adds()), self.events("gate.clear_carried"), self.events("gate.clear_carry_void")), (1, [], []))
+        self.build(carry=True)
+        self.writes.clear()
+        entry = {"head": "c" * 40, "reason": "an old clear with no fingerprint", "by": "owner", "at": 1}
+        sb.write_impact_state(self.world.state, {"clears": {self.PR: entry}, "applied": {}})
+        self.assertGreater(self.hold(self.api.rev("feature")), 0)
+        (void,) = self.events("gate.clear_carry_void")[-1:]
+        self.assertEqual(void["detail"]["reason"], "no fingerprint was recorded with the clear")
+        for value in ("true", 1, None):
+            self.assertFalse(sb.impact_floor.carry_enabled({"impact_hold": {"enabled": True, "carry_clear": value}}, self.REPO), repr(value))
+        self.assertFalse(sb.impact_floor.carry_enabled({"impact_hold": {"enabled": False, "carry_clear": True}}, self.REPO), "no carry without an enforced hold")
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "impact_hold": {"enabled": True, "carry_clear": "yes"}})
+
+    def test_an_unreadable_state_file_is_said_in_the_gate_report_not_swallowed(self):
+        real = sb.read_impact_state
+
+        def broken(*args, **kwargs):
+            raise OSError("disk gone")
+        sb.read_impact_state = broken
+        self.addCleanup(setattr, sb, "read_impact_state", real)
+        report = {"gates": [{"gate": "G6", "status": "ok", "detail": "not a held PR"}], "head": "a" * 40}
+        sb.gates_carried_note(report, types.SimpleNamespace(state=self.world.state, pr=self.PR, config=self.engine.config))
+        self.assertIn("OSError", report["carried_error"])
+        self.assertEqual(report["gates"][0]["detail"], "not a held PR")
+
+    def test_u2_the_owner_removes_a_carried_clear_the_pr_is_held_again_and_the_carry_does_not_return(self):
+        self.clear()
+        new = self.merge_main()
+        self.assertEqual(self.hold(new), 0)
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "impact_hold": {"enabled": True, "carry_clear": True}})
+        with mock.patch.object(sb, "gates_caller_kind", return_value=("person", "owner")):
+            code = sb.cmd_impact_clear(types.SimpleNamespace(pr=self.PR, reason="take the clear back, it was a mistake", revoke=True), self.route, self.world.clock.now)
+        self.assertEqual(code, 0)
+        state = sb.read_impact_state(self.world.state)[0]
+        self.assertEqual((state["clears"], state.get("carried", {})), ({}, {}))
+        (revoked,) = self.events("gate.clear_revoked")
+        self.assertEqual(revoked["detail"]["carried_head"], new)
+        self.assertGreater(self.hold(new), 0, "held again at the next pass")
+        self.assertEqual(len(self.adds()), 1)
+        self.assertEqual(len(self.events("gate.clear_carried")), 1, "and it does not carry again for that head")
+        with mock.patch.object(sb, "gates_caller_kind", return_value=("agent", "cos", "chief-of-staff")):
+            code = sb.cmd_impact_clear(types.SimpleNamespace(pr=self.PR, reason="an agent may not take it back", revoke=True), self.route, self.world.clock.now)
+        self.assertNotEqual(code, 0)
+
+    def test_a_recorded_carry_stops_counting_when_the_owner_switches_the_carry_off_and_a_state_file_that_never_carried_reads_as_before(self):
+        self.clear()
+        new = self.merge_main()
+        self.assertEqual(self.hold(new), 0)
+        self.assertEqual(sb.read_impact_state(self.world.state)[0]["carried"][self.PR]["head"], new)
+        self.build(carry=None)   # the owner turns the switch off (same state directory, state file kept)
+        sb.write_impact_state(self.world.state, {"clears": {self.PR: {"head": "c" * 40, "reason": "x" * 12, "by": "owner", "at": 1}}, "applied": {},
+                                                 "carried": {self.PR: {"head": new, "from": "c" * 40, "fingerprint": "sha256:" + "0" * 64, "at": 2}}})
+        self.assertGreater(self.hold(new), 0, "a carry on file does not count once the switch is off")
+        plain = Path(self.world.state) / sb.IMPACT_STATE_FILE
+        plain.write_text(json.dumps({"clears": {self.PR: {"head": "d" * 40}}, "applied": {}}))
+        self.assertEqual(sb.read_impact_state(self.world.state)[0], {"clears": {self.PR: {"head": "d" * 40}}, "applied": {}}, "no carried or carry_void key appears out of nowhere")
+        with mock.patch.object(sb, "gates_caller_kind", return_value=("person", "owner")):
+            self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "impact_hold": {"enabled": True}})
+            before = plain.read_text()
+            code = sb.cmd_impact_clear(types.SimpleNamespace(pr="acme-org/other#9", reason="there is nothing to take back here", revoke=True), self.route, self.world.clock.now)
+        self.assertEqual((code, plain.read_text()), (0, before), "a revoke with nothing to take back writes nothing")
+
+    def test_the_gates_command_calls_the_carried_note_and_a_state_error_is_said_not_swallowed(self):
+        import ast
+        main = Path(sb.__file__).read_text()
+        fn = next(n for n in ast.walk(ast.parse(main)) if isinstance(n, ast.FunctionDef) and n.name == "cmd_gates")
+        self.assertIn("gates_carried_note(report, ctx)", ast.get_source_segment(main, fn))
+        report = {"gates": [{"gate": "G6", "status": "ok", "detail": "not a held PR"}], "head": "a" * 40}
+        (Path(self.world.state) / sb.IMPACT_STATE_FILE).write_text(json.dumps({"clears": {}, "applied": {}, "carried": {self.PR: "not an object"}}))
+        sb.gates_carried_note(report, types.SimpleNamespace(state=self.world.state, pr=self.PR, config=self.engine.config))
+        self.assertEqual(report["gates"][0]["detail"], "not a held PR")
+
+    def test_a_new_clear_after_a_carry_starts_again_from_its_own_head(self):
+        self.clear()
+        carried = self.merge_main()
+        self.hold(carried)
+        again = self.clear()
+        self.assertEqual(again, carried)
+        entry = sb.read_impact_state(self.world.state)[0]
+        self.assertEqual(entry["clears"][self.PR]["head"], carried)
+        self.assertEqual(entry.get("carried", {}), {}, "the earlier carry is not part of the new clear")
+
+
 class TestHeadlessPresence(Base):
     """#433 slice 2: a worker with NO terminal. Its state comes from the OpenCode service alone (bin/agent_presence.py); discovery lists it with the
     pane `(headless)`; a delivery to it is not held; a service that does not answer makes it `unknown`, never dead and never working."""
@@ -12838,6 +13427,13 @@ class TestHeadlessPresence(Base):
         args = dict(name="hw", agent="coder", directory=str(self.home), role="coder", reports_to="boss", issue=9, brief="Add a health check")
         args.update(overrides)
         return sb.launch_headless(self.engine, **args)
+
+    def test_a_headless_launch_records_who_ran_it_so_a_headless_tester_can_count_for_its_orchestrator(self):
+        done = self.launch_hl(name="hw-tst", role="tester", launched_by="boss")
+        fleet = self.world.v2.sessions[done["session"]]["metadata"]["fleet"]
+        self.assertEqual((fleet["role"], fleet["reports_to"], fleet.get("launched_by")), ("tester", "boss", "boss"))
+        plain = self.launch_hl(name="hw-plain", role="tester")                       # launched from a plain shell: nobody, so it never counts
+        self.assertNotIn("launched_by", self.world.v2.sessions[plain["session"]]["metadata"]["fleet"])
 
     def test_launch_headless_creates_the_session_and_its_record_sends_the_brief_and_opens_no_terminal(self):
         panes_before, calls_before, sessions_before = dict(self.world.herdr.panes), list(self.world.herdr.socket_calls), set(self.world.v2.sessions)
@@ -23526,6 +24122,136 @@ class LedgerBase(Base):
             self.assertEqual(self.verdict(who, sid, ev)[0], 0, (who, sid))
 
 
+class TestLaunchTesters(LedgerBase):
+    """#372: a tester launched with --role tester for its orchestrator's repo may record tester verdicts, beside the configured list."""
+
+    def setUp(self):
+        super().setUp()
+        add = self.world.add_agent
+        add("orch", fleet={"role": "orchestrator", "repo": "acme/app", "issue": 7})
+        add("orch-web", fleet={"role": "orchestrator", "repo": "acme/web", "issue": 8})
+        add("ltst", fleet={"role": "tester", "repo": "acme/app", "reports_to": "orch", "issue": 7, "launched_by": "orch"})
+        add("ltst-web", fleet={"role": "tester", "repo": "acme/web", "reports_to": "orch-web", "issue": 8, "launched_by": "orch-web"})
+        add("ltst-nobody", fleet={"role": "tester", "repo": "acme/app", "reports_to": "coder", "issue": 7, "launched_by": "coder"})
+        add("ltst-forged", fleet={"role": "tester", "repo": "acme/app", "reports_to": "orch", "issue": 7, "launched_by": "coder"})   # a coder named the orchestrator as the boss
+        add("ltst-old", fleet={"role": "tester", "repo": "acme/app", "reports_to": "orch", "issue": 7})                              # launched before launched_by existed
+        add("lrev", fleet={"role": "reviewer", "repo": "acme/app", "reports_to": "orch", "issue": 7})
+        self.configure(evaluators={"reviewer": ["rev"], "tester": ["tst"], "owner": ["own"], "ci": ["cibot"]})
+        self.assertEqual(self.prove("coder", "S2")[0], 0)
+
+    def test_launch_records_the_role_with_the_repo_and_the_boss(self):
+        record = sb.fleet_record("ltst", "tester", "orch", 7, None, "acme/app")
+        self.assertEqual((record["role"], record["repo"], record["reports_to"]), ("tester", "acme/app", "orch"))
+
+    def test_a_launched_tester_is_accepted_for_its_repo_and_refused_for_another(self):
+        self.assertEqual(self.verdict("ltst", "S2", "tester")[0], 0)
+        code, _, err = self.verdict("ltst-web", "S2", "tester")      # acme/web's tester on an acme/app PR
+        self.assertEqual(code, 2)
+        self.assertIn("not registered", err)
+        self.assertEqual([e["by"] for e in self.ledger() if e["kind"] == "verdict"], ["ltst"])
+
+    def test_a_tester_whose_boss_is_not_an_orchestrator_of_the_repo_is_refused(self):
+        for who in ("ltst-nobody", "lrev", "ltst-forged", "ltst-old"):    # boss is a coder; role reviewer; launched by a coder; no launched_by
+            code, _, err = self.verdict(who, "S2", "tester")
+            self.assertEqual(code, 2, who)
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "verdict"], [])
+
+    def test_a_tester_that_proved_the_pr_is_refused_as_a_writer(self):
+        self.assertEqual(self.prove("ltst", "S1")[0], 0)
+        code, _, err = self.verdict("ltst", "S2", "tester")
+        self.assertEqual(code, 2)
+        self.assertIn("wrote this PR", err)
+
+    def test_a_launched_tester_is_never_a_reviewer_ci_or_owner(self):
+        for sid, evaluator in (("S3", "reviewer"), ("S1", "ci"), ("S2", "owner")):
+            code, _, err = self.verdict("ltst", sid, evaluator)
+            self.assertNotEqual(code, 0, evaluator)
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "verdict"], [])
+
+    def test_the_configured_tester_still_works_and_the_audit_names_the_record_only_for_a_launched_one(self):
+        self.assertEqual(self.verdict("tst", "S2", "tester")[0], 0)
+        self.assertEqual(self.verdict("ltst", "S2", "tester")[0], 0)
+        events = [e for e in self.world.audit() if e["event"] == "plan.verdict"]
+        configured, launched = [e["detail"] for e in events if e["detail"]["by"] == "tst"][0], [e["detail"] for e in events if e["detail"]["by"] == "ltst"][0]
+        self.assertNotIn("launch_record", configured)
+        self.assertEqual({k: launched["launch_record"][k] for k in ("name", "role", "repo", "reports_to")},
+                         {"name": "ltst", "role": "tester", "repo": "acme/app", "reports_to": "orch"})
+
+    def test_a_retired_tester_stops_counting_and_is_not_listed(self):
+        retired = {"ltst": {"at": 1, "by": "orch", "reason": "done", "session": self.world.sessions["ltst"], "auto": False}}
+        (self.world.state / sb.RETIRED_FILE).write_text(json.dumps(retired))
+        code, _, err = self.verdict("ltst", "S2", "tester")
+        self.assertEqual(code, 2)
+        self.assertIn("not registered", err)
+        retired["ltst"]["session"] = "ses_an_older_launch"   # a relaunch under the same name is a new session: retirement of the old one does not cover it
+        (self.world.state / sb.RETIRED_FILE).write_text(json.dumps(retired))
+        self.assertEqual(self.verdict("ltst", "S2", "tester")[0], 0)
+        retired["ltst"]["session"] = self.world.sessions["ltst"]
+        self.assertEqual(sb.load_launch_testers().launched({"ltst": {"role": "tester", "repo": "acme/app", "reports_to": "orch", "launched_by": "orch"}, "orch": {"role": "orchestrator", "repo": "acme/app"}},
+                                                           {"ltst": self.world.sessions["ltst"]}, "acme/app", lambda f: f.get("repo"), retired), {})
+
+    def test_a_missing_retired_file_means_nobody_is_retired(self):
+        (self.world.state / sb.RETIRED_FILE).unlink(missing_ok=True)
+        self.assertEqual(self.verdict("ltst", "S2", "tester")[0], 0)
+        self.assertEqual(sb.read_retired_strict(self.world.state), {})
+
+    def test_a_corrupt_or_unreadable_retired_file_disables_every_launched_tester_and_says_so(self):
+        path = self.world.state / sb.RETIRED_FILE
+        for label, content in (("corrupt json", b'{"ltst": {"at": 1,'), ("empty bytes", b""), ("garbage", b"\xff\xfe not json \x00"),
+                               ("a list", b"[]"), ("a record that is not an object", b'{"ltst": "retired"}'), ("a bare string", b'"x"')):
+            with self.subTest(content=label):
+                path.write_bytes(content)
+                before = len([e for e in self.world.audit() if e["event"] == "testers.retired_unreadable"])
+                code, _, err = self.verdict("ltst", "S2", "tester")
+                self.assertEqual(code, 2)
+                self.assertIn("not registered", err)
+                self.assertEqual([e for e in self.ledger() if e["kind"] == "verdict"], [], "0 tester verdicts accepted")
+                events = [e for e in self.world.audit() if e["event"] == "testers.retired_unreadable"]
+                self.assertEqual(len(events), before + 1, "a loud audit event")
+                self.assertEqual(events[-1]["detail"]["effect"], "launch-record testers disabled")
+                with self.assertRaises(sb.RetiredUnreadable):
+                    sb.read_retired_strict(self.world.state)
+                fleets = {"orch": {"role": "orchestrator", "repo": "acme/app"}, "ltst": {"role": "tester", "repo": "acme/app", "reports_to": "orch", "launched_by": "orch"}}
+                agents = {"ok": True, "list": [{"observation": {"name": n, "session": "s-" + n}} for n in fleets]}
+                self.assertEqual(sb.testers_status({"plan_evaluators": {}, "intent_repo": "acme/app"}, agents, fleets, self.world.state),
+                                 ["      testers    retired file unreadable: launch-record testers disabled"])
+        self.assertEqual(self.verdict("tst", "S2", "tester")[0], 0, "the configured tester still works")
+        path.unlink()
+
+    def test_an_unreadable_directory_instead_of_a_file_also_fails_closed(self):
+        path = self.world.state / sb.RETIRED_FILE
+        path.mkdir()
+        try:
+            self.assertEqual(self.verdict("ltst", "S2", "tester")[0], 2)
+        finally:
+            path.rmdir()
+
+    def test_status_lists_the_resolved_testers_with_their_source(self):
+        fleets = {"orch": {"role": "orchestrator", "repo": "acme/app"}, "ltst": {"role": "tester", "repo": "acme/app", "reports_to": "orch", "launched_by": "orch"},
+                  "tst": {"role": "tester", "repo": "acme/app", "reports_to": "orch", "launched_by": "orch"}}
+        agents = {"ok": True, "list": [{"observation": {"name": n, "session": "s-" + n}} for n in fleets]}
+        lines = sb.testers_status({"plan_evaluators": {"tester": ["tst"]}, "intent_repo": "acme/app"}, agents, fleets, self.world.state)
+        self.assertEqual(lines, ["      tester     tst: config (any repo)", "      tester     ltst: launch record (acme/app)"])
+        self.assertEqual(sb.testers_status({}, {"ok": False}, {}, self.world.state), [])
+
+    def test_the_pure_rules_and_the_status_lines(self):
+        lt = sb.load_launch_testers()
+        fleets = {"orch": {"role": "orchestrator", "repo": "acme/app"}, "t1": {"role": "tester", "repo": "acme/app", "reports_to": "orch", "launched_by": "orch"},
+                  "t2": {"role": "tester", "repo": "acme/web", "reports_to": "orch", "launched_by": "orch"}}
+        repo_of = lambda f: f.get("repo")
+        self.assertEqual(sorted(lt.launched(fleets, {}, "acme/app", repo_of)), ["t1"])
+        self.assertEqual(lt.evaluators({"tester": ["tst"], "ci": ["bot"]}, {"t1": {}}), {"tester": ["tst", "t1"], "ci": ["bot"]})
+        self.assertEqual(lt.evaluators({"reviewer": ["r"]}, {}), {"reviewer": ["r"]})
+        self.assertIsNone(lt.lane_refusal("t1", {"t1": {}}, {"coder"}, {"t1": "s1", "coder": "s2"}))
+        coders = {"t1": {"role": "tester", "issue": 7}, "c1": {"role": "coder", "issue": 7}, "c2": {"role": "coder", "issue": 9}}
+        self.assertIn("not a different agent from c1", lt.lane_refusal("t1", {"t1": {}}, set(), {"t1": "s1", "c1": "s1"}, coders))
+        self.assertIsNone(lt.lane_refusal("t1", {"t1": {}}, set(), {"t1": "s1", "c2": "s1"}, coders))   # a coder of another work item
+        self.assertIn("session of a writer", lt.lane_refusal("t1", {"t1": {}}, {"coder"}, {"t1": "s1", "coder": "s1"}))
+        self.assertEqual(lt.status_lines({"tester": ["tst"]}, fleets, {}, {"acme/app"}, repo_of),
+                         ["      tester     tst: config (any repo)", "      tester     t1: launch record (acme/app)"])
+        self.assertEqual(lt.source_of("tst", {"tester": ["tst"]}, {"tst": {}}), "config")
+
+
 class TestPlanLedger(LedgerBase):
     # -- prove
 
@@ -25261,6 +25987,99 @@ class TestImpactFloorCommandAndPass(LedgerBase):
         (self.world.state / "plan-gates.off").unlink(missing_ok=True)
 
 
+class TestGateFloorFresh(LedgerBase):
+    """#488: gate G6 reads the impact floor itself at the exact head, so a PR that touches a floor path is held from the moment it is
+    ready, before the daemon has labelled it. Synthetic names; the route counts every `pr view`."""
+
+    def setUp(self):
+        super().setUp()
+        self.extra_config = dict(FLOOR_CONFIG, plan_gates={"repos": {"acme/app": {"mode": "shadow"}}})
+        self.configure()
+        self.reads = 0
+        self.pr.update({"changedFiles": 1, "files": [{"path": "shims/gh"}]})   # a top tier path of the matrix file: the owner-hold rule holds it
+
+    def route(self, argv, **kwargs):
+        if argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"]:
+            self.reads += 1
+        return super().route(argv, **kwargs)
+
+    def g6(self):
+        code, report, err = self.gates()
+        self.assertIsNotNone(report, err)
+        return self.row(report, "G6")
+
+    def clear(self, head):
+        sb.write_impact_state(self.world.state, {"clears": {self.PR: {"head": head, "reason": "a false hold", "by": "own", "at": 1}}, "applied": {}})
+
+    def test_a_floor_path_waits_with_no_label_and_names_the_path(self):                                      # S1
+        self.assertEqual(self.pr["labels"], [])
+        row = self.g6()
+        self.assertEqual(row["status"], "waiting")
+        self.assertIn("shims/gh", " ".join(row["missing"]))
+
+    def test_the_owners_clear_passes_for_that_head_only(self):                                              # S2
+        self.clear(LEDGER_HEAD)
+        self.assertEqual(self.g6()["status"], "ok")
+        self.pr["headRefOid"] = LEDGER_NEW_HEAD
+        self.assertEqual(self.g6()["status"], "waiting")
+
+    def test_an_unreadable_floor_does_not_pass(self):                                                      # S3
+        self.pr["files"] = "not a list"
+        self.pr["changedFiles"] = "many"
+        with mock.patch.object(sb, "pr_floor_report", side_effect=sb.NoticeError("gh: network unreachable")):
+            row = self.g6()
+        self.assertEqual(row["status"], "waiting")
+        self.assertEqual(" ".join(row["missing"]).count("could not be read"), 1)
+
+    def test_a_matrix_error_does_not_pass(self):                                                           # S3b
+        with mock.patch.object(sb.impact_floor, "load_matrix", side_effect=ValueError("matrix is broken")):
+            row = self.g6()
+        self.assertEqual(row["status"], "waiting")
+        self.assertIn("could not be read", " ".join(row["missing"]))
+
+    def test_a_corrupt_impact_state_does_not_pass(self):
+        (self.world.state / "impact-hold.json").write_text("{not json")
+        self.assertEqual(self.g6()["status"], "waiting")
+
+    def test_a_head_that_moved_during_the_read_does_not_pass(self):
+        real = sb.pr_floor_report
+        with mock.patch.object(sb, "pr_floor_report", lambda *a, **k: dict(real(*a, **k), head=LEDGER_NEW_HEAD)):
+            self.assertIn("could not be read", " ".join(self.g6()["missing"]))
+
+    def test_the_gate_and_the_daemon_decide_alike_for_six_fixtures(self):                                  # S4
+        fixtures = [["shims/gh"], ["docs/a.md"], ["src/a.py"], ["bin/plan_ledger.py", "docs/b.md"], ["plugins/fleet-hooks/a.js"], ["docs/c.md", "src/d.py"]]
+        for paths in fixtures:
+            with self.subTest(paths=paths):
+                self.pr.update({"changedFiles": len(paths), "files": [{"path": p} for p in paths]})
+                engine = self.world.new_engine("cli")
+                engine.config, engine.state_dir, engine.gh_runner = sb.load_config(), self.world.state, self.route
+                daemon = sb.pr_floor_report(engine, "acme/app", 9)["owner_decision"]   # the decision the daemon's labels follow
+                fact = sb.gate_floor_fact(engine, self.world.state, "acme/app", 9, LEDGER_HEAD)
+                self.assertEqual(fact["decision"], daemon)
+                self.assertEqual(self.g6()["status"], "waiting" if daemon == "hold" else "ok")
+        import re as _re
+        code = (Path(__file__).resolve().parent / "plan_ledger.py").read_text()
+        self.assertGreater(len(code), 1000)
+        self.assertEqual(len(_re.findall(r"migrations|api/routes|shims/", code)), 0)
+
+    def test_a_hold_label_still_waits_when_the_floor_would_not_hold(self):                                 # S5
+        self.pr.update({"changedFiles": 1, "files": [{"path": "src/a.py"}], "labels": [{"name": "tester:merge-captain"}]})
+        self.assertEqual(self.g6()["status"], "waiting")
+
+    def test_a_docs_only_pr_passes_with_one_read_for_the_floor(self):                                      # S6
+        self.pr.update({"changedFiles": 1, "files": [{"path": "docs/a.md"}]})
+        code, report, err = self.gates()
+        self.assertEqual(self.row(report, "G6")["status"], "ok")
+        floor_reads = self.reads
+        self.reads = 0
+        self.gates()
+        self.assertEqual(self.reads, floor_reads)
+        self.assertEqual(self.reads - 1, 1, "one read for the picture, one for the floor")
+
+    def test_a_waiver_cannot_lift_it(self):
+        self.assertIn("G6", sb.plan_ledger.NEVER_WAIVABLE)
+
+
 class TestImpactClassAndNarrowForm(LedgerBase):
     """#451 slice 2: the class in the impact reviewer's record, and an agent definition that holds only when its permission block changes. Synthetic
     names; the route answers the contents reads and counts them."""
@@ -25784,6 +26603,19 @@ class TestImpactRejudge(LedgerBase):
         self.assertEqual(sorted(done_add), [10])
         self.assertEqual(sorted(done_remove), [9])
         self.assertIn("1 PR(s) would have a hold released", out)
+
+    def test_a_clear_carried_over_a_pure_merge_of_main_is_cleared_for_the_dry_run_and_the_daemon_alike(self):
+        self.extra_config = dict(self.extra_config, impact_hold={"enabled": True, "carry_clear": True})
+        self.configure()
+        self.files(10, "shims/gh")
+        (self.world.state / "impact-hold.json").write_text(json.dumps({
+            "clears": {"acme/app#10": {"head": LEDGER_NEW_HEAD, "reason": "x", "by": "own", "at": 5}},
+            "carried": {"acme/app#10": {"head": LEDGER_HEAD, "from": LEDGER_NEW_HEAD, "fingerprint": "f", "at": 6}}, "applied": {}}))
+        code, out, err = self.run_as("coder", "impact", "hold", "--dry-run", "--repo", "acme/app")
+        self.assertEqual(code, 0, err)
+        self.assertIn("acme/app#10  cleared by the owner for this head: no label", out)
+        self.passes([self.listed(10)])
+        self.assertEqual(self.posts(10), [], "the daemon does not label a carried clear either")
 
     # -- S4: when it judges again
 
