@@ -281,6 +281,15 @@ class TestCloudWorkerEndpoint(Base):
         self.assertEqual(code, 1)
         self.assertFalse((self.state / "cloud" / "coder7.json").exists())
 
+    def test_cloud_with_headless_is_refused_with_no_side_effect(self):
+        before = len(self.remote.requests)
+        code, out, err = self.main("launch", "coder7", "--cloud", "--headless", "--agent", "coder", "--repo", "acme-org/widget-service", "--branch", "main")
+        self.assertEqual(code, 1)
+        self.assertIn("--cloud and --headless do not combine", err)
+        self.assertEqual(len(err.strip().splitlines()), 1)
+        self.assertFalse((self.state / "cloud" / "coder7.json").exists())
+        self.assertEqual(len(self.remote.requests), before)
+
     def test_with_no_cloud_workers_status_has_no_cloud_key(self):
         code, out, err = self.main("status", "--json")
         self.assertNotIn("cloud", json.loads(out))

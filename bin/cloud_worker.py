@@ -323,6 +323,8 @@ def cmd_launch(args, runner, now):
         raise LaunchError("the name %r is reserved" % name)
     if args.resume:
         raise LaunchError("--cloud and --resume do not combine: a cloud worker is re-reached through its record")
+    if getattr(args, "headless", False):
+        raise LaunchError("--cloud and --headless do not combine: a cloud worker has its own endpoint, a headless one runs in the local service")
     if not args.agent:
         raise LaunchError("--agent is required")
     repo = H["launch_repo"](args)

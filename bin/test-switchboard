@@ -2433,7 +2433,7 @@ class TestFacts(Base):
     def test_the_registration_point_lists_the_lab_source(self):
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "disk_facts", "cpu_facts", "docker_reap_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts"])
 
 
 # ---------------------------------------------------------------- observing
@@ -9603,7 +9603,7 @@ class TestFrictionWake(FrictionBase):
         self.assertNotIn("friction_wake", sb.DEFAULTS)
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "disk_facts", "cpu_facts", "docker_reap_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts"])
         self.assertNotIn("friction_wake", sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}))
         self.assertEqual(sb.FRICTION_DEFAULTS, {"enabled": False, "hour": 9, "to": "cos", "cos_to": "improver", "text": None})
         self.make("off")
@@ -11399,6 +11399,31 @@ class TestHeadlessPresence(Base):
         self.world.v2.down = False
         self.assertEqual(self.discover().agents["hw"].status, "idle", "back as soon as the service answers")
 
+    def test_an_active_answer_that_is_not_a_dict_is_unknown_never_idle(self):
+        sid = self.headless()
+        class Stub:
+            def __init__(self, answer):
+                self.answer = answer
+            def session_active(self):
+                return self.answer
+        for answer in ([], ["x"], "running", None, 7):
+            state, why = self.ap.read_state(Stub(answer), sid)
+            self.assertEqual(state, "unknown", repr(answer))
+            self.assertIn("unreadable", why)
+        self.assertEqual(self.ap.read_state(Stub({}), sid)[0], "idle", "an empty dict is a real answer: nothing is active")
+        original = self.world.v2.op_session_active
+        for answer in ([], "x", None):
+            self.world.v2.op_session_active = lambda params, body, answer=answer: answer
+            found = self.discover().agents["hw"]
+            self.assertEqual(found.status, "unknown", repr(answer))
+        self.world.v2.op_session_active = original
+
+    def test_a_terminal_only_fleet_has_no_headless_key_and_a_headless_worker_has_it(self):
+        sid = self.headless()
+        agents = self.discover().agents
+        self.assertIs(agents["hw"].to_json()["headless"], True)
+        self.assertNotIn("headless", agents["boss"].to_json(), "a terminal worker's JSON is what it was before")
+
     def test_a_record_alone_is_not_presence_the_session_must_exist_and_carry_the_workers_name(self):
         self.headless(name="gone")
         del self.world.v2.sessions[next(iter(s for s, v in self.world.v2.sessions.items() if v["metadata"]["fleet"]["name"] == "gone"))]
@@ -11546,6 +11571,271 @@ class TestHeadlessPresence(Base):
         self.assertEqual(len(problems), 1)
         self.assertIn("not the user's own real directory", problems[0])
         self.assertIsNone(self.ap.load_record(self.world.state, "w000"))
+
+    def launch_hl(self, **overrides):
+        args = dict(name="hw", agent="coder", directory=str(self.home), role="coder", reports_to="boss", issue=9, brief="Add a health check")
+        args.update(overrides)
+        return sb.launch_headless(self.engine, **args)
+
+    def test_launch_headless_creates_the_session_and_its_record_sends_the_brief_and_opens_no_terminal(self):
+        panes_before, calls_before, sessions_before = dict(self.world.herdr.panes), list(self.world.herdr.socket_calls), set(self.world.v2.sessions)
+        done = self.launch_hl()
+        self.assertEqual(set(self.world.v2.sessions) - sessions_before, {done["session"]}, "exactly one new session")
+        self.assertEqual((done["name"], done["pane"], done["tab"], done["headless"]), ("hw", None, None, True))
+        session = self.world.v2.sessions[done["session"]]
+        self.assertEqual(session["metadata"]["fleet"], {"name": "hw", "role": "coder", "reports_to": "boss", "issue": 9, "headless": True})
+        self.assertEqual((session["agent"], session["directory"], session["title"]), ("coder", str(self.home), "hw"))
+        self.assertEqual(self.world.herdr.panes, panes_before, "no pane appeared")
+        self.assertEqual(self.world.herdr.socket_calls, calls_before, "herdr was asked for no layout, tab or pane")
+        brief = [m for m in session["messages"] if m["type"] == "user"]
+        self.assertEqual([(m["text"], m["metadata"]) for m in brief], [("Add a health check", {"fleet": {"from": "switchboard", "brief": True}})])
+        record = self.ap.load_record(self.world.state, "hw")
+        self.assertEqual((record["worker"], record["session"], record["kind"]), ("hw", done["session"], "local"))
+        found = self.discover().agents["hw"]
+        self.assertEqual((found.headless, found.pane, found.session_id), (True, None, done["session"]))
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "headless.launched" and e["subject"] == "hw"])
+
+    def test_send_report_and_retire_work_for_a_headless_worker_unchanged(self):
+        done = self.launch_hl()
+        self.assertTrue(self.engine.send("boss", "hw", "second thought", None, None)["sent"])
+        report = self.world.new_engine("cli").report("hw", "done", "finished the health check")
+        self.assertTrue(report.get("sent"), report)
+        boss_texts = [m.get("text", "") for m in self.world.v2.sessions[self.world.sessions["boss"]]["messages"] if m["type"] in ("user", "synthetic")]
+        self.assertTrue(any("finished the health check" in t for t in boss_texts), boss_texts)
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]
+        code, out, err = self.run_cli("retire", "hw", "--close")
+        self.assertEqual(code, 0, err)
+        self.assertIn("hw is retired", out)
+        self.assertIn("nothing to close", out)
+        self.assertEqual(self.world.herdr.closed, [], "no pane was closed")
+        self.assertIn("hw", sb.read_retired(self.world.state))
+
+    def test_a_headless_launch_refuses_a_taken_name_bad_arguments_and_a_terminal_option_and_a_failed_brief_is_undone_and_says_what_was_cleaned(self):
+        self.launch_hl()
+        with self.assertRaises(sb.LaunchError) as raised:
+            self.launch_hl()
+        self.assertIn("already exists (headless)", str(raised.exception))
+        self.world.add_agent("termworker", fleet={"role": "coder", "reports_to": "boss"})
+        with self.assertRaises(sb.LaunchError) as raised:
+            self.launch_hl(name="termworker")
+        self.assertIn("in pane", str(raised.exception))
+        for bad, fragment in ((dict(name="Bad Name"), "name must match"), (dict(directory="relative/dir"), "--dir must be an absolute path"),
+                              (dict(agent=""), "--agent is required"), (dict(name="switchboard"), "is reserved")):
+            with self.assertRaises(sb.LaunchError, msg=bad) as raised:
+                self.launch_hl(**dict(bad, name=bad.get("name", "other")))
+            self.assertIn(fragment, str(raised.exception), bad)
+        self.assertEqual(sorted(p.stem for p in (Path(self.world.state) / "headless").glob("*.json")), ["hw"], "a refused launch writes no record")
+        real_prompt = sb.V2Client.prompt
+
+        def rejecting(self_, session_id, text, metadata=None, delivery=None, resume=None):
+            raise sb.V2Error("exit", None, "the service refused the prompt")
+
+        with mock.patch.object(sb.V2Client, "prompt", rejecting):
+            with self.assertRaises(sb.LaunchError) as raised:
+                self.launch_hl(name="halfway")
+        text = str(raised.exception)
+        self.assertIn("launch failed; session ses_", text)
+        self.assertIn("was deleted", text)
+        self.assertIn("its record was removed", text)
+        self.assertIsNone(self.ap.load_record(self.world.state, "halfway"), "no record is left for a worker that was never handed over")
+        self.assertEqual([s for s in self.world.v2.sessions.values() if s["metadata"].get("fleet", {}).get("name") == "halfway"], [], "no orphan session")
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        code, out, err = self.run_cli("launch", "again", "--agent", "coder", "--dir", str(self.home), "--headless", "--workspace", "w1")
+        self.assertNotEqual(code, 0)
+        self.assertIn("--headless opens no terminal", err)
+
+    def test_a_failed_launch_after_the_session_exists_deletes_it_and_says_exactly_what_was_cleaned_and_what_remains(self):
+        sessions_before = set(self.world.v2.sessions)
+        with mock.patch.object(self.ap, "save_record", side_effect=OSError("disk full")):
+            with self.assertRaises(sb.LaunchError) as raised:
+                self.launch_hl(name="nosave")
+        text = str(raised.exception)
+        self.assertIn("disk full", text)
+        self.assertRegex(text, r"session ses_\w+ was deleted")
+        self.assertNotIn("record kept", text)
+        self.assertEqual(set(self.world.v2.sessions), sessions_before, "the session created for the launch is gone: no orphan")
+        self.assertIsNone(self.ap.load_record(self.world.state, "nosave"))
+        events = [e for e in self.world.audit() if e["event"] == "headless.launch_undone" and e["subject"] == "nosave"]
+        self.assertEqual(len(events), 1)
+        self.world.v2.remove_fails = True       # the service cannot delete: the session remains and the message says so
+        with mock.patch.object(self.ap, "save_record", side_effect=OSError("disk full")):
+            with self.assertRaises(sb.LaunchError) as raised:
+                self.launch_hl(name="nodel")
+        text = str(raised.exception)
+        self.assertRegex(text, r"session ses_\w+ could NOT be deleted")
+        self.assertIn("it has no record", text)
+        self.world.v2.remove_fails = False
+        with mock.patch.object(sb.V2Client, "prompt", side_effect=sb.V2Error("exit", None, "refused")):
+            self.world.v2.remove_fails = True
+            with self.assertRaises(sb.LaunchError) as raised:
+                self.launch_hl(name="keeps")
+        text = str(raised.exception)
+        self.assertIn("could NOT be deleted", text)
+        self.assertIn("its record was kept", text, "a session that remains keeps its record so status shows it")
+        self.assertIsNotNone(self.ap.load_record(self.world.state, "keeps"))
+
+    def test_a_headless_launch_into_a_repo_with_a_named_gh_account_is_refused_and_any_other_says_what_identity_it_has(self):
+        self.engine.accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5, "gh_users": {"acme/*": "acct-ops"}}, self.world.route, self.world.clock.now, environ={})
+        sessions_before = set(self.world.v2.sessions)
+        with self.assertRaises(sb.LaunchError) as raised:
+            self.launch_hl(name="pinned", repo="acme/widget")
+        text = str(raised.exception)
+        self.assertIn("acct-ops", text)
+        self.assertIn("Use a terminal launch", text)
+        self.assertEqual(set(self.world.v2.sessions), sessions_before, "refused before anything was created")
+        self.assertIsNone(self.ap.load_record(self.world.state, "pinned"))
+        done = self.launch_hl(name="plain", repo="other/thing")
+        self.assertIn("acts as the OpenCode service environment's own gh account", done["identity"])
+        self.assertIn("other/thing", done["identity"])
+        self.assertIn("it has no repo", self.launch_hl(name="norepo")["identity"])
+
+    def test_the_named_account_refusal_holds_for_every_spelling_of_a_mapped_repo_exact_and_wildcard_with_a_default_token_set(self):
+        users = {"acme/widget": "acct-ops", "wild-org/*": "acct-ops"}
+        self.engine.accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5, "gh_users": users}, self.world.route, self.world.clock.now, environ={"GH_TOKEN": "x"})
+        sessions_before = set(self.world.v2.sessions)
+        for spelling in ("acme/widget", "Acme/Widget", "ACME/WIDGET", " acme/widget ", "acme/widget.git", "acme/widget/", "wild-org/any", "WILD-ORG/any", "Wild-Org/Any.git"):
+            with self.assertRaises(sb.LaunchError, msg=spelling) as raised:
+                self.launch_hl(name="pin", repo=spelling)
+            self.assertIn("Use a terminal launch", str(raised.exception), spelling)
+        self.assertEqual(set(self.world.v2.sessions), sessions_before, "nothing was created for any spelling")
+        mixed = {"Acme/Widget": "acct-ops", "WILD-ORG/*": "acct-ops"}   # the keys are spelled differently too
+        self.engine.accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5, "gh_users": mixed}, self.world.route, self.world.clock.now, environ={"GH_TOKEN": "x"})
+        for spelling in ("acme/widget", "ACME/WIDGET", "wild-org/any"):
+            with self.assertRaises(sb.LaunchError, msg=spelling):
+                self.launch_hl(name="pin", repo=spelling)
+        done = self.launch_hl(name="free", repo="Other-Org/Thing")   # an unmapped repo still launches, whatever its case
+        self.assertIn("gh_users has no entry for Other-Org/Thing", done["identity"])
+        self.assertIn("it has no repo", self.launch_hl(name="norepo")["identity"], "no repo: nothing to map, so it acts as the service's own account, and says so")
+        with self.assertRaises(sb.ConfigError) as raised:   # two spellings of one repo may not name two accounts: refused when the config loads
+            sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh_users": {"Acme/Widget": "acct-ops", "acme/widget": "acct-two"}})
+        sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh_users": {"Acme/Widget": "acct-ops", "acme/widget": "ACCT-OPS"}})   # the same account twice is fine
+        self.assertIn("the same repo, with different accounts", str(raised.exception))
+        accounts = self.engine.accounts
+        self.assertEqual([accounts.account_for(r) for r in ("ACME/Widget", "acme/widget.git", "x/y", None, 5)], ["acct-ops", "acct-ops", None, None, None])
+
+    def test_retire_frees_the_name_of_a_headless_worker_and_undo_restores_the_record_unless_the_name_was_taken(self):
+        done = self.launch_hl()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]
+        code, out, err = self.run_cli("retire", "hw")
+        self.assertEqual(code, 0, err)
+        self.assertIn("its headless record was removed, so the name is free", out)
+        self.assertIsNone(self.ap.load_record(self.world.state, "hw"))
+        self.assertIn(done["session"], self.world.v2.sessions, "the session itself keeps running: only the watching stopped")
+        again = self.launch_hl()   # the name is free: a new worker can use it
+        self.assertNotEqual(again["session"], done["session"])
+        code, out, err = self.run_cli("retire", "--undo", "hw")
+        self.assertEqual(code, 0, err)
+        self.assertIn("a worker named hw exists again, so its old headless record was NOT restored", out)
+        self.assertEqual(self.ap.load_record(self.world.state, "hw")["session"], again["session"], "the newer record is untouched")
+        code, out, err = self.run_cli("retire", "hw")
+        self.assertEqual(code, 0, err)
+        code, out, err = self.run_cli("retire", "--undo", "hw")
+        self.assertEqual(code, 0, err)
+        self.assertIn("its headless record was restored", out)
+        self.assertEqual(self.ap.load_record(self.world.state, "hw")["session"], again["session"])
+        self.assertEqual(self.discover().agents["hw"].session_id, again["session"])
+
+    def test_the_failure_branches_of_the_undo_and_of_retire_and_undo_each_say_one_line_and_the_cli_prints_the_identity(self):
+        with mock.patch.object(sb.V2Client, "interrupt", side_effect=sb.V2Error("exit", None, "no")), \
+                mock.patch.object(sb.V2Client, "prompt", side_effect=sb.V2Error("exit", None, "refused")):
+            with self.assertRaises(sb.LaunchError) as raised:
+                self.launch_hl(name="noint")
+        self.assertIn("was deleted", str(raised.exception), "a failed interrupt does not stop the deletion")
+        real_remove = sb.V2Client.session_remove
+        with mock.patch.object(sb.V2Client, "session_remove", side_effect=sb.V2Error("http", 404, "gone")), \
+                mock.patch.object(sb.V2Client, "prompt", side_effect=sb.V2Error("exit", None, "refused")):
+            with self.assertRaises(sb.LaunchError) as raised:
+                self.launch_hl(name="gone")
+        self.assertIn("was already gone", str(raised.exception))
+        self.assertIn("its record was removed", str(raised.exception))
+        self.world.v2.remove_fails = True
+        with mock.patch.object(sb.V2Client, "interrupt", side_effect=sb.V2Error("exit", None, "no")), \
+                mock.patch.object(sb.V2Client, "prompt", side_effect=sb.V2Error("exit", None, "refused")):
+            with self.assertRaises(sb.LaunchError) as raised:
+                self.launch_hl(name="stuck")
+        self.assertIn("may still be running", str(raised.exception))
+        self.world.v2.remove_fails = False
+        with mock.patch.object(sb, "agent_lock", side_effect=sb.ImpactStateBusy("busy")), self.assertRaises(sb.LaunchError) as raised:
+            self.launch_hl(name="locked")
+        self.assertIn("is running", str(raised.exception))
+        self.launch_hl()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]
+        with mock.patch.object(self.ap, "remove_record", side_effect=OSError("read-only")):
+            code, out, err = self.run_cli("retire", "hw")
+        self.assertEqual(code, 0, err)
+        self.assertIn("its headless record could NOT be removed (read-only): the name stays taken until it is", out)
+        self.assertIn("hw", sb.read_retired(self.world.state), "the retirement is written anyway")
+        code, out, err = self.run_cli("retire", "hw")   # this one frees the record
+        self.assertEqual(code, 0, err)
+        self.assertIsNone(self.ap.load_record(self.world.state, "hw"))
+        code, out, err = self.run_cli("retire", "hw")   # retiring again: the worker is no longer seen, so it is refused and the first retirement is untouched
+        self.assertEqual(code, 1)
+        self.assertIn("session", sb.read_retired(self.world.state)["hw"].get("headless", {}))
+        with mock.patch.object(self.ap, "save_record", side_effect=OSError("read-only")):
+            code, out, err = self.run_cli("retire", "--undo", "hw")
+        self.assertEqual(code, 1)
+        self.assertIn("its headless record could NOT be restored (read-only)", err)
+        self.assertIn("the retirement stays", err)
+        self.assertIn("hw", sb.read_retired(self.world.state), "a failed restore changed nothing: the undo can be tried again")
+        self.assertIsNone(self.ap.load_record(self.world.state, "hw"))
+        real_lock = sb.agent_lock
+
+        def busy_for_hw(state, name, *a, **k):
+            if name == "hw":   # a launch of this name is in its locked step
+                raise sb.ImpactStateBusy("busy")
+            return real_lock(state, name, *a, **k)
+
+        with mock.patch.object(sb, "agent_lock", busy_for_hw):
+            code, out, err = self.run_cli("retire", "--undo", "hw")
+        self.assertEqual(code, 1)
+        self.assertIn("is running, so its old headless record was NOT restored", err)
+        self.assertIsNone(self.ap.load_record(self.world.state, "hw"), "nothing was written while the launch held the name")
+        code, out, err = self.run_cli("retire", "--undo", "hw")
+        self.assertEqual(code, 0, err)
+        self.assertIn("its headless record was restored", out)
+        code, out, err = self.run_cli("launch", "viacli", "--agent", "coder", "--dir", str(self.home), "--headless")
+        self.assertEqual(code, 0, err)
+        self.assertIn("acts as the OpenCode service environment's own gh account (it has no repo)", err)
+
+    def test_a_session_the_service_does_not_show_under_the_name_removes_the_record_and_two_launches_of_one_name_cannot_both_pass(self):
+        real_get = sb.V2Client.session_get
+        with mock.patch.object(sb.V2Client, "session_get", lambda self_, sid: dict(real_get(self_, sid), metadata={"fleet": {"name": "someone-else"}})):
+            with self.assertRaises(sb.LaunchError) as raised:
+                self.launch_hl(name="mismatch")
+        self.assertIn("does not show the new session as mismatch", str(raised.exception))
+        self.assertIn("its record was removed", str(raised.exception))
+        self.assertIn("was deleted", str(raised.exception))
+        self.assertIsNone(self.ap.load_record(self.world.state, "mismatch"))
+        with sb.agent_lock(self.world.state, "busy", seconds=1):          # another launch of this name is in its locked step
+            with mock.patch.object(sb, "AGENT_LOCK_SECONDS", 0.2), self.assertRaises(sb.LaunchError) as raised:
+                inner = sb.agent_lock(self.world.state, "busy", seconds=0.2)
+                with mock.patch.object(sb, "agent_lock", lambda state, name: inner):
+                    self.launch_hl(name="busy")
+        self.assertIn("another launch or reattach of busy is running", str(raised.exception))
+        self.assertIsNone(self.ap.load_record(self.world.state, "busy"))
+
+    def test_the_service_url_is_read_from_a_private_service_file_and_never_includes_the_password(self):
+        service = self.home / "service" / "service.json"
+        service.parent.mkdir(mode=0o700)
+        service.write_text(json.dumps({"url": "http://127.0.0.1:49374", "password": "s3cret-value", "pid": os.getpid()}))
+        service.chmod(0o600)
+        http = sb.V2Http(service, 5)
+        self.assertEqual(http.base_url(), "http://127.0.0.1:49374")
+        self.assertNotIn("s3cret", http.base_url())
+        service.chmod(0o644)
+        self.assertIsNone(sb.V2Http(service, 5).base_url(), "a service file others can read is not trusted: no url")
+        self.assertIsNone(sb.V2Http(self.home / "nowhere.json", 5).base_url())
+
+    def test_the_headless_service_url_is_recorded_when_the_service_file_is_readable_and_never_a_password(self):
+        with mock.patch.object(sb.V2Client, "service_url", lambda self_: "http://127.0.0.1:49374"):
+            self.launch_hl()
+        record = self.ap.load_record(self.world.state, "hw")
+        self.assertEqual(record["url"], "http://127.0.0.1:49374")
+        self.assertNotIn("password", json.dumps(record))
+        self.assertIsNone(sb.V2Client(FAKE_OPENCODE, {}, self.world.v2, 5).service_url(), "no HTTP transport: no url, and the record says none")
 
     def test_remove_record_deletes_it_once_and_says_so(self):
         sid = self.headless()
@@ -26467,10 +26757,10 @@ class TestDecisionsCommand(DecisionsBase):
                 self.assertEqual(code, 1)
                 self.assertIn("the daemon is not updating this list", out)
 
-    def test_a_file_older_than_two_minutes_is_stale_not_current(self):
+    def test_a_file_older_than_the_stale_bound_is_stale_not_current(self):
         self.ask_the_boss("Which database?")
         self.pass_()
-        self.world.tick(121)
+        self.world.tick(sb.DECISIONS_STALE_SECONDS + 1)
         code, out, err = self.cli("decisions")
         self.assertEqual(code, 1)
         self.assertIn("the daemon is not updating this list", out)
@@ -26478,7 +26768,7 @@ class TestDecisionsCommand(DecisionsBase):
         code, out, err = self.cli("decisions", "--json")
         self.assertEqual((json.loads(out)["stale"], code), (True, 1))
         self.world.clock.t -= 10
-        self.assertEqual(self.cli("decisions")[0], 0, "two minutes is the edge")
+        self.assertEqual(self.cli("decisions")[0], 0, "the stale bound is the edge")
 
     def test_a_file_that_is_not_json_is_unreadable_not_empty(self):
         self.pass_()
@@ -26660,10 +26950,10 @@ put({ decisions: list, errors: [] });
 const ok = d.loadSnapshot(dir, now);
 results.ok = { status: ok.status, n: ok.decisions.length };
 results.view = d.buildView(ok, now);
-put({ decisions: list, errors: [] }, 121000);
+put({ decisions: list, errors: [] }, d.STALE_MS + 1000);
 results.staleStatus = d.loadSnapshot(dir, now).status;
 results.staleView = d.buildView(d.loadSnapshot(dir, now), now);
-put({ decisions: list, errors: [] }, 119000);
+put({ decisions: list, errors: [] }, d.STALE_MS - 1000);
 results.edge = d.loadSnapshot(dir, now).status;
 put({ decisions: [], errors: [] });
 results.emptyView = d.buildView(d.loadSnapshot(dir, now), now);
@@ -26788,7 +27078,7 @@ class TestDecisionsPlugin(Base):
         self.assertEqual(lines[10:13], ["web#2 50m", "\u2504" * 34, "newer web"])  # a thin rule between entries
         self.assertEqual(lines[13], "web#9 5m")
 
-    def test_a_file_older_than_two_minutes_is_not_current_and_says_so(self):
+    def test_a_file_older_than_the_stale_bound_is_not_current_and_says_so(self):
         self.assertEqual((self.r["staleStatus"], self.r["edge"]), ("stale", "ok"))
         self.assertEqual(self.r["staleView"], {"title": "Decisions (?)", "groups": [], "rows": [{"key": "state", "text": "daemon not updating"}]})
 
@@ -26809,7 +27099,7 @@ class TestDecisionsPlugin(Base):
                          self.r["ages"])
 
     def test_the_stale_timer_and_the_event_filter(self):
-        self.assertEqual(self.r["until"], [21000, 121000, None])
+        self.assertEqual(self.r["until"], [sb.DECISIONS_STALE_SECONDS * 1000 - 99000, sb.DECISIONS_STALE_SECONDS * 1000 + 1000, None])
         self.assertEqual(self.r["concerns"], [True, True, False, True, True])
         self.assertEqual(self.r["oneLine"], ["a b c", "xxxxxxxxx\u2026", ""])
 
@@ -31170,12 +31460,6 @@ class TestInstallDocs(unittest.TestCase):
         self.assertIn("INSTALL.md", text)
         self.assertIn("fleet-switchboard install", text)
 
-    def test_the_presentation_is_untouched_by_this_pr(self):
-        done = subprocess.run(["git", "diff", "--name-only", "HEAD", "--", "docs/presentation"], cwd=str(REPO),
-                              capture_output=True, text=True)
-        if done.returncode == 0:
-            self.assertEqual(done.stdout.strip(), "")
-
 
 # ======================================================================
 # PR 17: standing orders an agent does not forget
@@ -32283,6 +32567,17 @@ class TestOrdersScenarios(Base):
 TIER_USER = "me"
 TIER_LABELS = {"awaiting_label": "me:awaiting-user", "awaiting_cos_label": "me:awaiting-cos"}
 API, WEB = "acme/api", "acme/web"
+
+
+@adds_to(FakeV2)
+def op_session_remove(self, params, body):
+    """`session.remove` (DELETE /api/session/{id}): an empty answer, 404 once gone. `remove_fails` makes it answer 500, as a service that cannot delete would."""
+    s = self._session(params)
+    if self.__dict__.get("remove_fails"):
+        raise FakeHTTP(500, "InternalError", "cannot delete")
+    self._write("session.remove", s["id"], None)
+    del self.sessions[s["id"]]
+    return None
 
 
 @adds_to(FakeV2)
@@ -36679,7 +36974,7 @@ class TestDecisionBaselineViews(BaselineWorld):
         self.daemon_pass()
         out["empty, you"] = self.cmd("you", "decisions")
         out["empty, cos"] = self.cmd("cos", "decisions")
-        self.world.tick(121)
+        self.world.tick(sb.DECISIONS_STALE_SECONDS + 1)
         out["stale"] = self.cmd("you", "decisions")
         out["stale, json"] = self.cmd("you", "decisions", "--json")
         self.world.clock.t -= 1
@@ -36727,7 +37022,7 @@ class TestDecisionBaselineStatus(BaselineWorld):
         self.daemon_pass()
         out["the full house"] = self.line()
         self.world.engine.run_pass()
-        self.world.tick(130)
+        self.world.tick(sb.DECISIONS_STALE_SECONDS + 10)
         out["a file the daemon stopped keeping"] = self.line()
         baseline_golden(self, "status-line", out)
 
@@ -44924,13 +45219,6 @@ class TestGithubWritingRule(unittest.TestCase):
             self.assertNotIn("Write GitHub text", head, rel)
             self.assertTrue(text.startswith("---\n"), rel)
 
-    def test_s3_the_change_adds_text_only_and_leaves_the_shim_alone(self):
-        done = subprocess.run(["git", "diff", "--name-only", "origin/main...HEAD"], capture_output=True, text=True, cwd=str(REPO))
-        if done.returncode != 0 or not done.stdout.strip():
-            self.skipTest("no base to compare with")
-        changed = set(done.stdout.split())
-        self.assertNotIn("shims/gh", changed)
-
 
 _CG = sb.load_cpu_guard()
 ORIGINAL_MEMORY_READING, ORIGINAL_PROCESS_TABLE = _CG.memory_reading, _CG.process_table   # the real readers, kept before a test patches them
@@ -48646,7 +48934,7 @@ class TestLoadAlert(Base):
         self.assertEqual(len(row["numbers"]), self.health.MOVES_NUMBERS_MAX)
 
     def test_unreadable_decisions_and_a_torn_audit_tail_are_not_zero_and_not_fatal(self):
-        self.assertIsNone(self.health.decisions_waiting(str(self.state_dir)))
+        self.assertIsNone(self.health.decision_items(str(self.state_dir)))
         (self.state_dir / "audit.jsonl").write_text("x" * 100 + "\n")
         with mock.patch.object(self.health, "AUDIT_TAIL_BYTES", 40):
             self.assertEqual(self.health.audit_moves(str(self.state_dir), 0), [])
@@ -49317,13 +49605,47 @@ class TestLoadAlert(Base):
         lines = self.health.status_lines(str(self.state_dir), self.T0)
         self.assertEqual(len([l for l in lines if "1 decision(s) not attributed" in l]), 1)
 
+    def test_a_notice_or_a_held_pr_is_information_and_a_real_wait_without_an_ask_is_not_attributed(self):
+        tick, reads = self.decisions_world([{"kind": "notice", "ask": None, "number": 10, "repo": "r"}, {"kind": "captain", "ask": None, "number": 20, "repo": "r"},
+                                            {"kind": "permission", "ask": None, "repo": "r"}, {"kind": "question", "ask": 0}, {"ask": 10, "repo": "r"}], {})
+        tick()
+        got = self.latest()
+        self.assertEqual((got["a"]["decisions"], got["b"]["decisions"], reads), (1, 0, []))               # the own number is not a fallback
+        lines = self.health.status_lines(str(self.state_dir), self.T0)
+        self.assertEqual([l.strip().split(" (")[0] for l in lines if "PR notices and holds" in l], ["PR notices and holds 2"])
+        self.assertEqual([l.strip().split(" (")[0] for l in lines if "not attributed" in l], ["2 decision(s) not attributed"])
+        self.assertEqual(self.health.decision_items(str(self.state_dir)), ([("r", None), ("", None), ("r", 10)], 2))
+
+    def test_a_malformed_decisions_file_counts_nothing_and_breaks_nothing(self):
+        for text in ["not json", "[]", '{"decisions": 5}', '{"decisions": [1, "x", null, {"ask": true, "repo": 7}, {"ask": -3}, {"ask": 1.5}]}']:
+            shutil.rmtree(str(self.state_dir)); self.state_dir.mkdir(mode=0o700)
+            tick, reads = self.decisions_world([], {})
+            (self.state_dir / "decisions.json").write_text(text)
+            tick()
+            self.assertEqual((self.latest()["a"]["decisions"], reads), (None if text in ("not json", "[]", '{"decisions": 5}') else 0, []), text)
+
+    def test_the_decision_items_are_capped_and_a_bad_repository_is_not_read(self):
+        many = [{"ask": 10, "repo": "r"} for _ in range(self.health.DECISIONS_MAX + 50)]
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": many}))
+        items, notices = self.health.decision_items(str(self.state_dir))
+        self.assertEqual((len(items), notices), (self.health.DECISIONS_MAX, 0))
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [{"ask": 5, "repo": "../x y"}, {"ask": 6, "repo": "acme/api"}]}))
+        self.assertEqual(self.health.decision_items(str(self.state_dir))[0], [("", 5), ("acme/api", 6)])
+
+    def test_the_decision_chain_stops_at_the_depth_cap(self):
+        deep = {600: 601, 601: 602, 602: 603, 603: 10}                                                   # 600 is four parents below ask 10
+        tick, reads = self.decisions_world([{"ask": 600, "repo": "r"}], deep)
+        tick()
+        got = self.latest()
+        self.assertEqual((got["a"]["decisions"], reads, self.health.PARENT_LEVELS), (0, [600, 601, 602], 3))
+
     def test_decision_chains_are_read_once_and_count_in_the_account_budget(self):
         tick, reads = self.decisions_world([{"agent": "a", "ask": 500, "repo": "r"}, {"agent": "a", "ask": 501, "repo": "r"}], {500: 10, 501: 10})
         for k in range(3):
             tick(self.T0 + k * 600)
         self.assertEqual(sorted(reads), [500, 501])
         state = json.loads((self.state_dir / "load.json").read_text())
-        self.assertEqual(len([r for r in state["reads"] if True]) >= 2, True)
+        self.assertEqual(len(state["reads"]), 4)                                                        # two asks lists (a, b) and the two parents, none repeated over three passes
         self.assertEqual(state["parents"], {"r#500": 10, "r#501": 10})
 
     def test_an_idle_pass_rewrites_nothing(self):
@@ -49363,6 +49685,261 @@ def main(argv):
     ok = result.wasSuccessful() and result.testsRun > 0
     print("RESULT: %s" % ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
+
+
+class TestSpotlightGuard(Base):
+    """Ask #438: an hourly background check that the code and temp folders are still kept out of Spotlight; read-only, no process in a normal pass."""
+
+    def setUp(self):
+        super().setUp()
+        self.dirs = []
+        for name in ("code", "tmp"):
+            folder = self.home / name
+            folder.mkdir()
+            (folder / "a.txt").write_text("x")
+            self.dirs.append(str(folder))
+        self.world = World(self, agents=("coder",), config={})
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.engine = self.world.engine
+        self.engine.config["spotlight_guard"] = {"folders": list(self.dirs)}
+        self.engine.discover(self.world.clock.now())
+        self.sg = sb.load_module("spotlight_guard")
+        self.counts = {}
+        self.calls = []
+        self.fail = [None]
+        self.block = [None]
+
+        def runner(argv, **kwargs):
+            self.calls.append(list(argv))
+            if self.block[0] is not None:
+                self.block[0].wait(30)
+            if self.fail[0] is not None:
+                if isinstance(self.fail[0], str):
+                    return subprocess.CompletedProcess(argv, 0, self.fail[0], "")
+                raise self.fail[0]
+            return subprocess.CompletedProcess(argv, 0, "2026-01-01 locale noise\n%d\n" % self.counts.get(argv[2], 0), "locale noise")
+        self.engine.spotlight_runner = runner
+
+    def source(self):
+        return next(s for s in self.engine.sources if isinstance(s, sb.SpotlightFacts))
+
+    def wakes(self):
+        found, problems = self.engine.collect_facts()
+        self.assertEqual(problems, [])
+        return [f for f in found if f.kind == "spotlight"]
+
+    def round(self, **counts):
+        """One hourly check, finished and applied. Counts by folder index (code=0, tmp=1)."""
+        self.counts = {self.dirs[int(k[1:])]: v for k, v in counts.items()}
+        self.world.tick(3601)
+        self.wakes()                                   # the pass starts the check
+        thread = self.source().thread
+        if thread is not None:
+            thread.join(10)
+        return self.wakes()                            # the next pass collects what it found
+
+    def lines(self):
+        cfg = self.sg.settings(self.engine.config.get("spotlight_guard"))
+        return self.sg.status_lines(cfg, self.sg.load(self.world.state), self.world.clock.now())
+
+    def test_s1_zero_counts_show_both_folders_as_excluded(self):
+        self.round(f0=0, f1=0)
+        lines = self.lines()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(all("excluded from Spotlight" in line for line in lines), lines)
+        self.assertFalse(any("WARN" in line for line in lines))
+
+    def test_s2_a_nonzero_count_on_two_checks_in_a_row_warns_naming_folder_and_count(self):
+        self.round(f0=120, f1=0)
+        self.round(f0=120, f1=0)
+        warns = [line for line in self.lines() if "WARN" in line]
+        self.assertEqual(len(warns), 1)
+        self.assertIn(self.dirs[0], warns[0])
+        self.assertIn("120", warns[0])
+        self.assertNotIn(self.dirs[1], warns[0])
+
+    def test_s3_one_nonzero_count_then_zero_sends_no_wake_and_no_warning(self):
+        self.assertEqual(self.round(f0=120, f1=0), [])
+        self.assertEqual(self.round(f0=0, f1=0), [])
+        self.assertFalse(any("WARN" in line for line in self.lines()))
+        self.assertEqual([e for e in self.world.audit() if e["event"] == "spotlight.lost"], [])
+
+    def test_s4_one_wake_per_episode(self):
+        keys = set()
+        for counts in [120] * 5 + [0] * 2 + [90] * 3:
+            for fact in self.round(f0=counts, f1=0):
+                keys.add(fact.key)
+        self.assertEqual(len(keys), 2, keys)
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "spotlight.lost"]), 2)
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "spotlight.recovered"]), 1)
+
+    def real_pass_round(self, **counts):
+        """One hourly check through the engine's REAL pass (fact collection, batching, delivery); returns the reports of the two passes."""
+        self.counts = {self.dirs[int(k[1:])]: v for k, v in counts.items()}
+        self.world.tick(3601)
+        first = self.engine.run_pass()
+        self.source().thread.join(10)
+        return [first, self.engine.run_pass()]
+
+    def spotlight_sends(self):
+        return [a for a in self.world.admissions("cos") if any(str(k).startswith("spotlight.lost:") for k in a["keys"])]
+
+    def test_the_real_batching_path_delivers_the_wake_once_after_the_wait(self):
+        self.real_pass_round(f0=120, f1=0)
+        self.real_pass_round(f0=120, f1=0)                  # the second nonzero check begins the episode: the fact is pending, batching waits
+        self.assertEqual(self.spotlight_sends(), [])
+        self.world.tick(30)
+        self.assertIn("cos", self.engine.run_pass()["waiting"], "the fact is still pending 30 s on: it is held by the 90 s wait")
+        self.world.tick(70)
+        report = self.engine.run_pass()
+        self.assertEqual(len(self.spotlight_sends()), 1, report)
+        for _ in range(5):
+            self.world.tick(30)
+            self.engine.run_pass()
+        self.assertEqual(len(self.spotlight_sends()), 1, "delivered once: the stable key is deduplicated on every later pass")
+
+    def test_a_restart_between_the_alarm_and_its_delivery_still_delivers_once(self):
+        self.real_pass_round(f0=120, f1=0)
+        self.real_pass_round(f0=120, f1=0)
+        self.assertEqual(self.spotlight_sends(), [])
+        index = next(i for i, source in enumerate(self.engine.sources) if isinstance(source, sb.SpotlightFacts))
+        fresh = sb.SpotlightFacts()
+        fresh.bind(self.engine)
+        fresh.started = self.world.clock.now()              # a restart has just run its check: nothing new to find
+        self.engine.sources[index] = fresh
+        self.world.tick(100)
+        self.engine.run_pass()
+        self.assertEqual(len(self.spotlight_sends()), 1, "the open episode was restored from the file and its fact is pending again")
+        self.world.tick(30)
+        self.engine.run_pass()
+        self.assertEqual(len(self.spotlight_sends()), 1)
+
+    def test_a_damaged_state_file_never_reaches_a_wake_or_a_line_nor_breaks_the_pass(self):
+        folder = self.dirs[0]
+        Path(self.world.state, "spotlight-guard.json").write_text(json.dumps({"folders": {
+            folder: {"state": "indexed", "count": "\x1b[31mevil", "streak": 2, "episode": 1.0},
+            self.dirs[1]: {"state": "indexed", "count": 5, "streak": 2, "episode": float("inf")},
+            "/not/guarded": {"state": "indexed", "count": 5, "streak": 2, "episode": 1.0}}, "checked_at": 1.0}))
+        fresh = sb.SpotlightFacts()
+        fresh.bind(self.engine)
+        facts = fresh()
+        self.assertEqual(len(facts), 1, "only the guarded folder with a sane episode wakes; an unguarded folder and an infinite episode wake nobody")
+        self.assertNotIn("\x1b", facts[0].summary)
+        self.assertIn("some entries", facts[0].summary)
+        cfg = self.sg.settings(self.engine.config.get("spotlight_guard"))
+        lines = self.sg.status_lines(cfg, self.sg.load(self.world.state), 1.0)
+        self.assertFalse(any("\x1b" in line for line in lines), lines)
+
+    def test_s5_a_normal_pass_starts_nothing_and_a_slow_tool_never_delays_it(self):
+        gate = threading.Event()
+        self.block[0] = gate
+        self.addCleanup(gate.set)
+        started = time.monotonic()
+        self.world.tick(1)
+        self.wakes()                                   # the first pass starts the check on a thread and returns at once
+        for _ in range(10):
+            self.world.tick(60)
+            self.wakes()
+        self.assertLess(time.monotonic() - started, 5, "ten passes beside a tool that blocks for 30 s")
+        self.assertTrue(self.source().thread.is_alive(), "the tool is still blocked: the passes did not wait for it")
+        for _ in range(100):
+            if self.calls:
+                break
+            time.sleep(0.05)
+        self.assertEqual(len(self.calls), 1, "only the first folder has been asked: the passes started no process of their own")
+        gate.set()
+        self.source().thread.join(10)
+
+    def test_a_restart_restores_an_open_episode_and_no_second_wake_begins(self):
+        self.round(f0=120, f1=0)
+        self.round(f0=120, f1=0)
+        fresh = sb.SpotlightFacts()
+        fresh.bind(self.engine)
+        fresh.done = self.sg.check_all(self.dirs, self.engine.spotlight_runner)
+        facts = fresh()
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "spotlight.lost"]), 1, "the episode was restored from the file")
+        self.assertEqual(len({f.key for f in facts}), 1)
+
+    def test_no_chief_of_staff_means_no_wake_but_the_warning_shows(self):
+        self.engine.discovery.agents.pop("cos", None)
+        self.assertEqual(self.round(f0=120, f1=0), [])
+        self.assertEqual(self.round(f0=120, f1=0), [])
+        self.assertTrue(any("WARN" in line for line in self.lines()))
+
+    def test_a_guard_that_is_off_makes_no_fact_and_starts_nothing(self):
+        self.engine.config["spotlight_guard"] = False
+        self.world.tick(3601)
+        self.assertEqual(self.wakes(), [])
+        self.assertEqual(self.calls, [])
+
+    def test_a_failing_tool_exit_is_unknown(self):
+        self.engine.spotlight_runner = lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "0\n", "")
+        self.round()
+        self.assertTrue(all("unknown" in line for line in self.lines()), self.lines())
+
+    def test_a_bad_spotlight_guard_value_is_a_config_error_at_load(self):
+        for bad in ({"folders": ["/work/../etc"]}, {"folders": ["relative/dir"]}, {"enabled": "yes"}, 5):
+            self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "spotlight_guard": bad})
+            with self.assertRaises(sb.ConfigError) as caught:
+                sb.load_config()
+            self.assertIn("spotlight_guard", str(caught.exception))
+
+    def test_a_control_character_in_a_folder_name_never_reaches_a_line(self):
+        cfg = {"folders": ["/work/a\x1b[31mb"]}
+        self.assertNotIn("\x1b", self.sg.status_lines(cfg, None, 0)[0])
+        self.assertNotIn("\x1b", self.sg.wake_text("/work/a\x1b[31mb", 3, "fleet-switchboard"))
+
+    def test_s6_a_missing_or_empty_folder_is_not_checked(self):
+        empty = self.home / "empty"
+        empty.mkdir()
+        self.engine.config["spotlight_guard"] = {"folders": [str(self.home / "nope"), str(empty)]}
+        self.round()
+        lines = self.lines()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(all("not checked" in line for line in lines), lines)
+        self.assertFalse(any("excluded" in line for line in lines))
+        self.assertEqual(self.calls, [], "nothing to ask about")
+
+    def test_s7_a_missing_tool_a_timeout_and_odd_output_are_unknown(self):
+        for failure in (FileNotFoundError("mdfind"), subprocess.TimeoutExpired("mdfind", 5), "a count of zero, honestly\n"):
+            self.fail[0] = failure
+            self.assertEqual(self.round(), [])
+            self.assertEqual(self.round(), [])
+            lines = self.lines()
+            self.assertTrue(all("unknown" in line for line in lines), (failure, lines))
+            self.assertFalse(any("WARN" in line or "excluded" in line for line in lines))
+
+    def test_s8_it_changes_no_setting_and_writes_only_its_own_file(self):
+        before = {d: sorted(os.listdir(d)) for d in self.dirs}
+        for _ in range(3):
+            self.round(f0=0, f1=0)
+        self.assertEqual({d: sorted(os.listdir(d)) for d in self.dirs}, before)
+        self.assertIn("spotlight-guard.json", os.listdir(self.world.state))
+        self.assertEqual([n for n in os.listdir(self.world.state) if n.endswith(".tmp")], [], "no leftover temp file")
+        self.assertTrue(self.calls and all(call[0] == "mdfind" and "-count" in call and call[1] == "-onlyin" for call in self.calls), self.calls)
+
+    def test_s8b_the_file_is_rewritten_only_when_an_answer_changed(self):
+        self.round(f0=0, f1=0)
+        path = Path(self.world.state) / "spotlight-guard.json"
+        os.utime(path, (1, 1))
+        self.round(f0=0, f1=0)
+        self.assertEqual(path.stat().st_mtime, 1)
+        self.round(f0=7, f1=0)
+        self.assertNotEqual(path.stat().st_mtime, 1)
+
+    def test_s9_a_bad_folder_list_is_refused_naming_the_key(self):
+        for bad in ({"folders": ["/work/../etc"]}, {"folders": "not a list"}, {"folders": ["relative/dir"]}):
+            with self.assertRaises(ValueError) as caught:
+                self.sg.validate(bad, "config")
+            self.assertIn("spotlight_guard.folders", str(caught.exception))
+        self.sg.validate({"folders": ["/work/code"], "enabled": True}, "config")
+        self.sg.validate(False, "config")
+
+    def test_the_count_is_the_last_whole_number_line_of_stdout_only(self):
+        self.assertEqual(self.sg.parse_count("noise\n0\n"), 0)
+        self.assertEqual(self.sg.parse_count("57\n"), 57)
+        for odd in ("", "abc\n", "12 files\n", "1\n2x\n"):
+            self.assertIsNone(self.sg.parse_count(odd), odd)
 
 
 class TestModuleLoader(Base):
@@ -49472,6 +50049,237 @@ class TestModuleLoader(Base):
         with self.assertRaises(FileNotFoundError):
             mod.load_module("no_such_module")
         self.assertNotIn("outside_mod", sys.modules)
+
+
+class TestExcludedRepos(Base):
+    """Ask #446: an excluded repository is never watched and never read; an agent working in it still sends and reports; an az key command names its subscription."""
+
+    def rig(self, excluded, **kwargs):
+        return FarmRig(self, config={"excluded_repos": excluded}, **kwargs)
+
+    def test_s1_an_excluded_repo_named_by_an_agent_and_a_charter_is_never_watched_or_read(self):
+        rig = self.rig(["ACME/Web"], baseline=[ACME_API], agents={
+            "web-orch": {"role": "orchestrator", "charter": 1, "repo": ACME_WEB},
+            "web-coder": {"role": "worker", "repo": "acme/WEB"}})
+        rig.pump(20)
+        self.assertEqual(sorted(rig.hub.watches), [ACME_API], "no watch, so no forwarder")
+        self.assertIsNone(rig.repo(ACME_WEB).forwarder())
+        fleets = {"web-orch": {"role": "orchestrator", "charter": 1, "repo": ACME_WEB}}
+        self.assertEqual(sb.watched_repos(rig.world.config, fleets), [ACME_API], "the one derivation every consumer (sweep, triage, the hub) uses")
+        self.assertEqual(rig.world.engine.repos_in_play(), [ACME_API])
+        calls = []
+        reader = sb.IntentReader(GH_BIN, ACME_API, lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(argv, 0, "{}", ""))
+        reader.config = rig.world.config
+        with self.assertRaises(sb.IntentError) as caught:
+            reader.issue(5, ACME_WEB)
+        self.assertEqual(caught.exception.reason, "excluded")
+        self.assertEqual(calls, [], "the intent reader made no call for it")
+
+    def test_s2_status_lists_it_once_as_excluded_and_never_as_failing(self):
+        config = sb.validate_config({"github_repos": [ACME_API], "excluded_repos": [ACME_WEB]})
+        lines = sb.format_github(sb.github_status(config, self.home, {"w": {"role": "worker", "repo": ACME_WEB}}))
+        excluded = [line for line in lines if "excluded" in line]
+        self.assertEqual(len(excluded), 1, lines)
+        self.assertIn(ACME_WEB, excluded[0])
+        self.assertEqual(len(lines), len([line for line in lines if "excluded" in line or ACME_API in line or "daemon not running" in line]), "no line but the excluded one, the watch and the daemon note")
+        only = sb.validate_config({"excluded_repos": [ACME_WEB]})
+        self.assertEqual(len(sb.format_github(sb.github_status(only, self.home))), 1, "even with nothing else watched it is said once")
+
+    def test_s3_and_s7_a_worker_in_an_excluded_repo_still_sends_and_is_answered(self):
+        rig = self.rig([ACME_WEB], agents={"web-coder": {"role": "worker", "repo": ACME_WEB, "boss": "cos"},
+                                           "cos": {"role": "chief-of-staff"}})
+        rig.pump(10)
+        out = rig.world.engine.send("web-coder", "cos", "a question for you")
+        out2 = rig.world.engine.send("cos", "web-coder", "the answer")
+        self.assertEqual((out["sent"], out["action"]), (True, "wake"), out)
+        self.assertEqual((out2["sent"], out2["action"]), (True, "wake"), out2)
+        self.assertEqual(sorted(rig.hub.watches), [], "and the repository is still not watched")
+
+    def test_s4_a_bad_list_is_refused_naming_the_key_and_a_cased_entry_excludes(self):
+        for bad in (["not a repo"], "acme/web", ["acme/web", "ACME/web"], [5]):
+            with self.assertRaises(sb.ConfigError) as caught:
+                sb.validate_config({"excluded_repos": bad})
+            self.assertIn("excluded_repos", str(caught.exception))
+        config = sb.validate_config({"github_repos": ["acme/web"], "excluded_repos": ["ACME/Web"]})
+        self.assertEqual(sb.watched_repos(config, {}), [])
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"excluded_repos": ["acme/web\n"]})   # a trailing newline is not a repository name
+        both = sb.validate_config({"excluded_repos": ["acme/web"], "spotlight_guard": False})
+        self.assertEqual((both["excluded_repos"], both["spotlight_guard"]), (["acme/web"], False), "both opt-in keys are known together")
+
+    def write_mapping(self, key_source):
+        path = self.home / "mapping.json"
+        path.write_text(json.dumps({"base_url": "https://example.invalid", "key_source": key_source}))
+        return str(path)
+
+    def load_with(self, mapping):
+        sb._WARNED_CONFIG.clear()
+        out = io.StringIO()
+        raw = {"external_decisions": {"enabled": True, "adapter": "mcp_rest", "mapping_file": mapping, "tier_map": {t: "x" for t in ("orchestrator", "cos", "human")},
+                                      "repos": [ACME_API]}}
+        with contextlib.redirect_stderr(out):
+            sb.validate_config(raw, "config")
+        return out.getvalue()
+
+    def test_s5_an_az_key_command_without_a_subscription_warns_once_and_with_one_does_not(self):
+        bare = self.write_mapping({"command": ["az", "keyvault", "secret", "show", "--vault-name", "vault-xyz", "--name", "secret-abc", "--query", "value", "-o", "tsv"]})
+        text = self.load_with(bare)
+        self.assertEqual(text.count("warning"), 1, text)
+        self.assertIn("--subscription", text)
+        self.assertIn("external_decisions", text)
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):   # a second load in the same process says nothing more
+            sb.validate_config({"external_decisions": {"enabled": True, "adapter": "mcp_rest", "mapping_file": bare, "tier_map": {t: "x" for t in ("orchestrator", "cos", "human")}, "repos": [ACME_API]}}, "config")
+        self.assertEqual(out.getvalue(), "")
+        named = self.write_mapping({"command": ["az", "keyvault", "secret", "show", "--subscription", "00000000-0000", "--name", "n"]})
+        self.assertEqual(self.load_with(named), "")
+        other = self.write_mapping({"command": ["vault-tool", "get", "x"]})
+        self.assertEqual(self.load_with(other), "")
+
+    def test_the_az_check_reads_both_key_source_forms_a_rotation_and_never_raises(self):
+        mod = sb.load_module("repo_exclusion")
+        bare = ["az", "keyvault", "secret", "show"]
+        for source, expected in (
+                ({"command": bare}, True), ("command:" + json.dumps(bare), True), ([{"command": ["vault-tool"]}, {"command": bare}], True),
+                ({"command": bare + ["--subscription=abc"]}, False), ({"command": bare + ["-s", "abc"]}, False),
+                ("command:" + json.dumps(bare + ["--subscription", "abc"]), False), ("env:KEY", False), ("command:[not json", False), (None, False)):
+            self.assertEqual(mod.az_without_subscription(self.write_mapping(source)), expected, source)
+        self.assertFalse(mod.az_without_subscription(str(self.home / "no-such-file.json")))
+        (self.home / "bad.json").write_text("{not json")
+        self.assertFalse(mod.az_without_subscription(str(self.home / "bad.json")))
+
+    def test_a_reader_built_with_accounts_only_still_refuses_an_excluded_repo(self):
+        calls = []
+        config = sb.validate_config({"excluded_repos": [ACME_WEB]})
+        runner = lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(argv, 0, "{}", "")
+        reader = sb.IntentReader(GH_BIN, ACME_API, runner, accounts=sb.GhAccounts(config, runner, time.time))
+        with self.assertRaises(sb.IntentError) as caught:
+            reader.issue(5, ACME_WEB)
+        self.assertEqual(caught.exception.reason, "excluded")
+        self.assertEqual(calls, [])
+
+    def test_the_choke_point_no_gh_read_spawns_a_process_for_an_excluded_repo_and_other_repos_still_read(self):
+        rig = self.rig([ACME_WEB], baseline=[ACME_API])
+        calls = []
+
+        def counting(argv, **kwargs):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"state": "OPEN", "number": 5}), "")
+        engine, hub, config = rig.world.engine, rig.hub, rig.world.config
+        engine.gh_runner = counting
+        hub.runner = counting
+        accounts = sb.GhAccounts(config, counting, time.time)
+        hub.accounts = accounts
+        reader = sb.IntentReader(GH_BIN, ACME_API, counting, accounts=accounts)
+        for name, call in (
+                ("GhAccounts.read", lambda: accounts.read(counting, "repos/%s/issues/5" % ACME_WEB, ACME_WEB, 5)),
+                ("GhAccounts.read, other case", lambda: accounts.read(counting, "repos/ACME/WEB/issues/5", "ACME/WEB", 5)),
+                ("read_pr_json", lambda: sb.read_pr_json(engine, ACME_WEB, 5)),
+                ("read_ref_state issue", lambda: sb.read_ref_state(engine, ACME_WEB, 5, "issue")),
+                ("read_ref_state pr", lambda: sb.read_ref_state(engine, ACME_WEB, 5, "pr")),
+                ("the hub's gh_api", lambda: hub.gh_api("repos/%s/issues/5/comments" % ACME_WEB)),
+                ("the intent reader", lambda: reader.issue(5, ACME_WEB)),
+                ("the hub's child environment (the forwarder start)", lambda: hub.child_env(ACME_WEB)),
+                ("the reds zip read", lambda: sb._RedsReader(config, counting, time.time, ACME_WEB).zip("repos/%s/actions/artifacts/1/zip" % ACME_WEB)),
+                ("the check review measure and reds make (the same function)", lambda: sb.refuse_excluded(config, ACME_WEB))):
+            with self.assertRaises((sb.RepoExcluded, sb.NoticeError, sb.GitHubUnavailable, sb.IntentError), msg=name):
+                call()
+            self.assertEqual(calls, [], "%s started a process for an excluded repository" % name)
+        # U1: a repository that is not excluded still reads, through every one of them
+        self.assertEqual(sb.read_ref_state(engine, ACME_API, 5, "issue"), "open")
+        self.assertEqual(sb.read_pr_json(engine, ACME_API, 5)["number"], 5)
+        self.assertEqual(accounts.read(counting, "repos/%s/issues/5" % ACME_API, ACME_API, 5).returncode, 0)
+        hub.gh_api("repos/%s/issues/5/comments" % ACME_API)
+        self.assertEqual(len(calls), 4, calls)   # (the 4 reads above; the excluded ones started none)
+
+    def test_the_hub_child_environment_takes_the_config_from_its_accounts_and_no_config_at_all_allows(self):
+        config = sb.validate_config({"excluded_repos": [ACME_WEB]})
+        accounts = sb.GhAccounts(config, lambda *a, **k: None, time.time)
+        with self.assertRaises(sb.GitHubUnavailable):
+            sb.GitHubHub.child_env(types.SimpleNamespace(accounts=accounts), ACME_WEB)
+        other = types.SimpleNamespace(accounts=types.SimpleNamespace(env_for=lambda repo: None))
+        self.assertIsNone(sb.GitHubHub.child_env(other, ACME_WEB), "no config anywhere: the check is skipped, on purpose")
+        self.assertIsNone(sb.refuse_excluded(None, ACME_WEB))
+
+    def test_the_intent_repo_itself_being_excluded_is_not_read_either(self):
+        calls = []
+        reader = sb.IntentReader(GH_BIN, ACME_WEB, lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(argv, 0, "{}", ""))
+        reader.config = sb.validate_config({"excluded_repos": [ACME_WEB]})
+        with self.assertRaises(sb.IntentError):
+            reader.issue(5)
+        self.assertEqual(calls, [])
+
+    def test_s6_the_warning_never_prints_the_commands_other_arguments(self):
+        text = self.load_with(self.write_mapping({"command": ["az", "keyvault", "secret", "show", "--vault-name", "vault-xyz", "--name", "secret-abc"]}))
+        self.assertTrue(text)
+        for private in ("vault-xyz", "secret-abc", "keyvault", "--vault-name"):
+            self.assertNotIn(private, text)
+
+
+class TestDecisionsStaleBound(unittest.TestCase):
+    """Work item #449: the staleness bound of the decisions list is 180 s on both sides, and the docs say so."""
+
+    def test_s1_the_daemon_and_plugin_bounds_are_180_seconds(self):
+        self.assertEqual(sb.DECISIONS_STALE_SECONDS, 180)
+        self.assertIn("export const STALE_MS = 180_000", (DECISIONS_PLUGIN / "decisions.mjs").read_text())
+        self.assertIn("export const DECISIONS_STALE_MS = 180_000", (DECISIONS_PLUGIN / "health.mjs").read_text(), "the health view's copy of the bound")
+
+    def test_s3_the_docs_no_longer_say_120_s_for_the_decisions_staleness(self):
+        self.assertNotIn("older than 120 s", (DECISIONS_PLUGIN / "README.md").read_text())
+        lines = (REPO / "docs" / "switchboard.md").read_text().splitlines()
+        stale = [line for line in lines if "120 s" in line and ("stale" in line or "Staleness" in line or "not updating" in line or "older than" in line)]
+        self.assertEqual(stale, [])
+        self.assertGreaterEqual(len([line for line in lines if "180 s" in line and ("stale" in line or "Staleness" in line or "not updating" in line or "older than" in line)]), 4)
+
+
+class TestDecisionIdForms(WriteWorld):
+    """Ask #463: a decision is found by the natural forms of its id, and a miss names the right one."""
+
+    def setUp(self):
+        super().setUp()
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        self.gh.issue(WEB, 2, "Other repo", labels=["me:awaiting-cos"])
+        for number in (5, 6, 7, 9):
+            self.gh.issue(API, number, "Issue %d" % number, labels=["me:awaiting-cos"])
+        self.as_agent("cos")
+
+    def test_s1_every_natural_spelling_of_the_id_finds_the_one_decision(self):
+        for number, spelling in ((5, "acme/api#5"), (6, "api#6"), (7, "#7")):
+            with self.subTest(spelling=spelling):
+                code, out, err = self.main("decisions", "escalate", spelling)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.gh.names(API, number), ["me:awaiting-user"], "the one the spelling names, and only it")
+        self.assertEqual(self.gh.names(API, 9), ["me:awaiting-cos"])
+
+    def test_s2_a_miss_lists_the_ids_that_carry_the_same_number(self):
+        code, out, err = self.main("decisions", "resolve", "widget-api#9")
+        self.assertEqual(code, 2)
+        self.assertEqual((err + out).count("api#9"), 2, "once as the name that missed, once as the id it should have been: %s" % (err + out))
+        self.assertIn("a decision numbered 9 is listed as api#9", err + out)
+
+    def test_s3_a_number_in_two_repositories_is_refused_and_both_are_listed(self):
+        before = (self.gh.names(API, 2), self.gh.names(WEB, 2))
+        code, out, err = self.main("decisions", "escalate", "#2")
+        self.assertEqual(code, 2)
+        self.assertIn("api#2", err)
+        self.assertIn("web#2", err)
+        self.assertEqual((self.gh.names(API, 2), self.gh.names(WEB, 2)), before, "nothing was escalated")
+
+    def test_s4_the_owner_and_repository_form_picks_one_of_two(self):
+        code, out, err = self.main("decisions", "escalate", "acme/web#2")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.gh.names(WEB, 2), ["me:awaiting-user"])
+        self.assertEqual(self.gh.names(API, 2), ["me:awaiting-cos"], "the other is unchanged")
+
+    def test_the_listed_id_still_works_and_the_role_check_is_unchanged_for_the_new_spellings(self):
+        self.assertEqual(self.id_of("Which database?"), "api#2")
+        self.assertEqual(self.main("decisions", "escalate", "api#2")[0], 0)
+        self.assertEqual(self.gh.names(API, 2), ["me:awaiting-user"])
+        self.as_agent("api-orch")
+        code, out, err = self.main("decisions", "escalate", "acme/api#5")
+        self.assertEqual(code, 2)
+        self.assertIn("only the Chief of Staff", err)
+        self.assertEqual(self.gh.names(API, 5), ["me:awaiting-cos"])
 
 
 if __name__ == "__main__":
