@@ -40,6 +40,7 @@ case "$1 $2" in
     [ "${KILL_BAK:-0}" = 1 ] && [ "$n" = 1 ] && rm -f "$CFG.sysbox-fix.bak"
     exit 0 ;;
   "timeout 10")
+    [ "${CTR_DOWN:-0}" = 1 ] && exit 1
     # ctr version: fails while DOWN_UNTIL probes have not yet been made after a restart (DOWN_UNTIL=999: never answers)
     if [ "$(grep -c 'systemctl restart containerd' "$TMP_LOG")" = 1 ]; then
       [ "$(grep -c 'ctr version' "$TMP_LOG")" -le "${DOWN_UNTIL:-0}" ] && exit 1
@@ -170,6 +171,14 @@ READY_CMD="$tmp/notready" WAIT=2 POLL=1 runfix; rc=$?
 [ $rc = 1 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && [ "$(restarts)" = 2 ] && ! grep -q label "$tmp/log" \
   && ok "fix: node not Ready after restart: backup restored, exit 1" || bad "fix: not-Ready rollback (rc=$rc)"
 rm -f "$mk"
+# already-correct config but containerd dead, or the node not Ready: not labelled, no restart, config unchanged, exit 1
+cp "$fx" "$tmp/config.toml"; runfix >/dev/null 2>&1; rm -f "$mk"; cp "$tmp/config.toml" "$tmp/after_ok"
+CTR_DOWN=1 WAIT=2 POLL=1 runfix; rc=$?
+[ $rc = 1 ] && cmp -s "$tmp/after_ok" "$tmp/config.toml" && ! grep -q '^label' "$tmp/log" && [ "$(restarts)" = 0 ] \
+  && ok "fix: already right but containerd not answering: not labelled, exit 1" || bad "fix: no-op, containerd dead (rc=$rc)"
+READY_CMD="$tmp/notready" WAIT=2 POLL=1 runfix; rc=$?
+[ $rc = 1 ] && cmp -s "$tmp/after_ok" "$tmp/config.toml" && ! grep -q '^label' "$tmp/log" && [ "$(restarts)" = 0 ] \
+  && ok "fix: already right but node not Ready: not labelled, exit 1" || bad "fix: no-op, node not Ready (rc=$rc)"
 # (a) the restart itself returns non-zero: rollback runs, backup restored byte for byte, marker, exit 1, no label
 cp "$fx" "$tmp/config.toml"; rm -f "$mk"
 RESTART_FAIL_ON=1 WAIT=2 POLL=1 runfix; rc=$?
