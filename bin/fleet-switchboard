@@ -17871,6 +17871,7 @@ def cmd_gates(args, runner, now):
                                         now=now())
     report["plan_problem"] = ctx.plan_problem
     report["pr_unreadable"] = ctx.unreadable
+    gates_carried_note(report, ctx)
     plan_ledger.enforced_view(report, enforced_gates_of(ctx))
     first = next((e.get("plan_ref") for e in ctx.entries if e.get("pr") == ctx.pr and e.get("plan_ref")), None)
     report["plan_source"] = ctx.source
@@ -18035,7 +18036,7 @@ IMPACT_PASS_CALLS = 6        # `gh pr view` calls the daemon pass may spend per 
 IMPACT_RETRY_SECONDS = 300   # a PR whose floor could not be read is retried after this
 
 
-IMPACT_STATE_FILE = "impact-hold.json"   # {"clears": {pr: {head, reason, by, at}}, "applied": {pr: {head, merge_label_added}}}
+IMPACT_STATE_FILE = "impact-hold.json"   # {"clears": {pr: {head, reason, by, at[, fingerprint]}}, "applied": {pr: {head, merge_label_added}}, "carried": {pr: {head, from, fingerprint, at}}, "carry_void": {pr: {head, reason}}}
 
 
 IMPACT_STATE_MAX_BYTES = 1000000
@@ -18063,7 +18064,11 @@ def read_impact_state(state_dir):
         return empty, "%s is not valid JSON" % IMPACT_STATE_FILE
     if not isinstance(raw, dict):
         return empty, "%s is not an object" % IMPACT_STATE_FILE
-    return {k: raw[k] if isinstance(raw.get(k), dict) else {} for k in ("clears", "applied")}, None
+    state = {k: raw[k] if isinstance(raw.get(k), dict) else {} for k in ("clears", "applied")}
+    for extra in ("carried", "carry_void"):   # written only by the carry (#510): a state file that never carried reads exactly as it always did
+        if isinstance(raw.get(extra), dict):
+            state[extra] = raw[extra]
+    return state, None
 
 
 def write_impact_state(state_dir, data):
@@ -18145,20 +18150,64 @@ def _impact_state_noted(engine, problem):
         raise RuntimeError("the corrupt %s could not be set aside (%s): nothing was written" % (IMPACT_STATE_FILE, failed))
 
 
+def impact_carry_get(engine, runner, repo):
+    """The `get(path)` the carry reads GitHub through: `gh api` GET with the repo's own account, parsed. Raises on any failure (the carry then voids)."""
+    def get(path):
+        done = _gh_write(engine, runner, repo, path, "GET")
+        return json.loads(done.stdout or "null")
+    return get
+
+
+def impact_carry_decision(engine, repo, number, head):
+    """None when no carry is to be tried (the switch is off, no clear with a fingerprint exists for this PR, or this head was already decided), else the verdict of
+    `clear_carry.decide` for the NEW head `head`. Reads GitHub, so it is called WITHOUT the impact-state lock. Never raises."""
+    try:
+        if not impact_floor.carry_enabled(engine.config, repo):
+            return None
+        pr = "%s#%d" % (repo, number)
+        state, _ = read_impact_state(engine.state_dir)
+        cleared = state["clears"].get(pr) or {}
+        if not cleared.get("head") or cleared.get("head") == head:
+            return None
+        if (state.get("carried", {}).get(pr) or {}).get("head") == head or (state.get("carry_void", {}).get(pr) or {}).get("head") == head:
+            return None   # decided once per new head: no repeated reads and no repeated audit lines
+        runner = getattr(engine, "gh_runner", None) or subprocess.run
+        return load_module("clear_carry").decide(impact_carry_get(engine, runner, repo), repo, number, cleared["head"], cleared.get("fingerprint"), head)
+    except Exception as err:
+        engine._note("impact.carry_error", "%s#%d" % (repo, number), {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
+        return None
+
+
 def apply_impact_hold(engine, repo, number, report, record):
     """Write the hold: add `<user>:merge-captain` and `<user>:hold-impact` to the PR, only those missing, never remove anything. Skipped
-    when the owner cleared THIS head. Returns the number of gh calls spent. The labels are ensured once per repo per process."""
+    when the owner cleared THIS head, or when his clear of an earlier head CARRIES to this one (a pure merge of main, `impact_hold.carry_clear`, off by default: see
+    bin/clear_carry.py). Returns the number of gh calls spent. The labels are ensured once per repo per process."""
+    carry = impact_carry_decision(engine, repo, number, report["head"])   # reads GitHub: before, and outside, the lock
     with impact_state_lock(engine.state_dir):   # the clear check, the label write and the record are ONE step against an owner clear
-        return _apply_impact_hold_locked(engine, repo, number, report, record)
+        return _apply_impact_hold_locked(engine, repo, number, report, record, carry)
 
 
-def _apply_impact_hold_locked(engine, repo, number, report, record):
+def _apply_impact_hold_locked(engine, repo, number, report, record, carry=None):
     pr, head = report["pr"], report["head"]
     state, problem = read_impact_state(engine.state_dir)
     _impact_state_noted(engine, problem)   # fails toward hold: a state file nobody can read hides no hold, and the owner can clear again
     cleared = state["clears"].get(pr) or {}
     if cleared.get("head") == head:
         return 0
+    carried_before = state.get("carried", {}).get(pr) or {}
+    if carried_before.get("head") == head and cleared.get("head") == carried_before.get("from"):
+        return 0   # carried already for this head
+    if carry is not None and cleared.get("head") == carry["from"]:
+        if carry["carried"]:
+            state.setdefault("carried", {})[pr] = {"head": head, "from": carry["from"], "fingerprint": carry["fingerprint"], "at": int(engine.now())}
+            state.setdefault("carry_void", {}).pop(pr, None)
+            write_impact_state(engine.state_dir, state)
+            engine.audit.append(engine.actor, "gate.clear_carried", pr, {"head": head, "from": carry["from"], "fingerprint": carry["fingerprint"],
+                                                                         "why": "only main was merged in: the pull request's own change is the one the owner cleared"})
+            return 0
+        state.setdefault("carry_void", {})[pr] = {"head": head, "reason": _one_line(carry["reason"] or "", 200)}
+        write_impact_state(engine.state_dir, state)
+        engine.audit.append(engine.actor, "gate.clear_carry_void", pr, {"head": head, "from": carry["from"], "reason": _one_line(carry["reason"] or "", 200)})
     names = label_names(engine.config)
     have = {(l.get("name") if isinstance(l, dict) else l) for l in (record.get("labels") or [])}
     want = [names["merge-captain"], names["hold-impact"]]
@@ -18181,6 +18230,24 @@ def _apply_impact_hold_locked(engine, repo, number, report, record):
     return spent
 
 
+def clear_fingerprint(engine, runner, repo, number, head):
+    """(fingerprint, problem): the fingerprint of the pull request's own change at `head`, stored WITH a clear so a later pure merge of main can carry it (bin/clear_carry.py).
+    Only when `impact_hold.carry_clear` is on (the default is off: a clear then records nothing new). The ONE function `clear_carry.own_change_fingerprint` computes it, here and at the
+    carry. A change that cannot be read in full, or a head that moved while it was read, records NO fingerprint (so nothing carries) and never stops the clear."""
+    if not impact_floor.carry_enabled(engine.config, repo):
+        return None, None
+    cc = load_module("clear_carry")
+    try:
+        fingerprint, fp_head, _ = cc.own_change_fingerprint(impact_carry_get(engine, runner, repo), repo, number)
+    except cc.CarryVoid as err:
+        return None, _one_line(str(err), 200)
+    except Exception as err:
+        return None, _one_line("%s: %s" % (type(err).__name__, err), 200)
+    if fp_head != head:
+        return None, "the head moved while its change was being read"
+    return fingerprint, None
+
+
 def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, head=None, via=None, verify=None):
     """The owner's clear: record it head-bound (the daemon does not re-add the hold for that head) and remove `hold-impact`, and
     `merge-captain` too when the switchboard itself added it for this hold. Returns the lines to print.
@@ -18201,6 +18268,7 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
         raise NoticeError("the PR's head moved since the owner was shown it (%s, not %s): nothing was cleared" % (current[:8], head[:8]))
     if verify is not None:
         verify(raw)
+    fingerprint, fingerprint_problem = clear_fingerprint(engine, runner, repo, number, current)
     names = label_names(engine.config)
     if remove is not None:
         cc = load_module("chat_clear")
@@ -18219,11 +18287,19 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
             remove = list(remove)
         head_now = current
         state["clears"][pr] = {"head": head_now, "reason": reason, "by": who, "at": int(engine.now())}
+        state.get("carried", {}).pop(pr, None)   # a new clear starts from this head: an earlier carry is not part of it
+        state.get("carry_void", {}).pop(pr, None)
+        if fingerprint is not None:
+            state["clears"][pr]["fingerprint"] = fingerprint
+        elif fingerprint_problem:
+            state["clears"][pr]["fingerprint_problem"] = fingerprint_problem
         write_impact_state(engine.state_dir, state)   # the clear first: a failed removal never leaves a hold the daemon would re-add
         change_issue_labels(engine, runner, repo, number, remove=remove)
         detail = {"head": head_now, "by": who, "reason": reason, "removed": remove}
         if via:
             detail["via"] = via
+        if fingerprint is not None:
+            detail["fingerprint"] = fingerprint
         engine.audit.append(engine.actor, "gate.hold_cleared", pr, detail)   # inside the lock
     return ["cleared the impact hold of %s at %s: removed %s; the daemon will not re-add it for this head" % (pr, head_now[:8], ", ".join(remove))]
 
@@ -18248,6 +18324,23 @@ def cmd_impact_clear(args, runner, now):
     if len(reason) < 10:
         sys.stderr.write("%s: impact clear: --reason needs at least 10 characters: say why the hold is false\n" % PROG)
         return EXIT_USAGE
+    if getattr(args, "revoke", False):   # the owner takes back a clear (and any carry of it): the daemon holds the PR again at its next pass
+        try:
+            with impact_state_lock(engine.state_dir):
+                state, problem = read_impact_state(engine.state_dir)
+                _impact_state_noted(engine, problem)
+                pr = "%s#%d" % (repo, number)
+                had = state["clears"].pop(pr, None)
+                carried = state.get("carried", {}).pop(pr, None)
+                state.get("carry_void", {}).pop(pr, None)
+                write_impact_state(engine.state_dir, state)
+                engine.audit.append(engine.actor, "gate.clear_revoked", pr, {"by": kind[1], "reason": plan_ledger.clip(redact_command_text(reason), 300),
+                                                                              "cleared_head": (had or {}).get("head"), "carried_head": (carried or {}).get("head")})
+        except (ImpactStateBusy, RuntimeError) as err:
+            sys.stderr.write("%s: impact clear --revoke: %s; nothing was changed\n" % (PROG, _one_line(str(err), 200)))
+            return EXIT_ERROR
+        print("revoked the owner's clear of %s%s: the daemon holds it again at its next pass, and nothing carries" % (pr, " (and its carry)" if carried else "") if had else "%s has no clear to revoke" % pr)
+        return EXIT_OK
     try:
         for line in impact_clear_core(engine, runner, repo, number, kind[1], plan_ledger.clip(redact_command_text(reason), 300)):
             print(line)
@@ -18291,7 +18384,9 @@ def cmd_impact_hold(args, runner, now):
                 continue
             if report["decision"] != "hold":
                 continue
-            cleared = (read_impact_state(state)[0]["clears"].get(report["pr"]) or {}).get("head") == report["head"]
+            cleared_state = read_impact_state(state)[0]
+            cleared = (cleared_state["clears"].get(report["pr"]) or {}).get("head") == report["head"] or \
+                (cleared_state.get("carried", {}).get(report["pr"]) or {}).get("head") == report["head"]
             missing = [l for l in (names["merge-captain"], names["hold-impact"]) if l not in item["labels"]]
             shown += 1
             print("%s  %s  %s" % (report["pr"], "cleared by the owner for this head: no label" if cleared else
@@ -18574,6 +18669,21 @@ def cmd_gates_stats(args, runner, now):
         print("  mean: %.1f agent record(s), %.1f min first record to merge" % (
             sum(r["manual_records"] for r in got["prs"]) / len(got["prs"]), sum(r["minutes_to_merge"] for r in got["prs"]) / len(got["prs"])))
     return EXIT_OK
+
+
+def gates_carried_note(report, ctx):
+    """The gate row of a PR whose owner's clear CARRIED to its current head says so (G6 `carried from <head>`), and the report gains `carried`. Reads the local state file only."""
+    try:
+        carried = (read_impact_state(ctx.state)[0].get("carried") or {}).get(ctx.pr)
+        if not isinstance(carried, dict) or carried.get("head") != report.get("head"):
+            return
+        for row in report["gates"]:
+            if row["gate"] == "G6" and row["status"] == "ok":
+                row["detail"] = "not a held PR: the owner's clear of %s carried to this head (only main was merged in; own change %s)" % (
+                    str(carried.get("from"))[:8], str(carried.get("fingerprint"))[:19])
+        report["carried"] = {"from": carried.get("from"), "head": carried.get("head"), "fingerprint": carried.get("fingerprint")}
+    except Exception:
+        pass
 
 
 def enforced_gates_of(ctx):
@@ -20132,6 +20242,7 @@ def add_impact_parsers(sub):
     clear = impact_sub.add_parser("clear", help="The owner's own terminal only: clear a false impact hold for this head, with a reason")
     clear.add_argument("pr", help="The pull request: owner/repo#N or its URL")
     clear.add_argument("--reason", required=True, help="Why the hold is false (at least 10 characters), logged")
+    clear.add_argument("--revoke", action="store_true", help="Take the clear back (and any carry of it): the PR is held again at the daemon's next pass")
 
 
 # ---------------------------------------------------------------- `disk prune`: reclaim old docker build cache and images, and nothing else
