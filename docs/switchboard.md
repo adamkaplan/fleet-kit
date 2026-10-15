@@ -1425,7 +1425,7 @@ is unchanged.
 | Config key | Default | What |
 |---|---|---|
 | `github_repos` | `[]` | The baseline of watched repos; the derived set adds to it |
-| `excluded_repos` | `[]` | Repositories the switchboard never watches and never reads, whatever an agent's metadata or a charter says (matched case-insensitively, `owner/name`; a bad list is refused at load). It is applied where the watched set is derived, so forwarders, the sweep and triage never see them, and the intent reader makes no call for them. `status` says each one is excluded, once. Agents working in an excluded repository still launch, send, report and retire |
+| `excluded_repos` | `[]` | Repositories the switchboard never watches and never reads, whatever an agent's metadata or a charter says (matched case-insensitively, `owner/name`; a bad list is refused at load). It is applied where the watched set is derived, so forwarders, the sweep and triage never see them, and every intent reader (they all carry the config) makes no call for them. A command a person runs against a named repository (`reds`, an intent edit) is that person's own act and is not refused. `status` says each one is excluded, once. Agents working in an excluded repository still launch, send, report and retire |
 | `gh_users` | `{}` | `"owner/repo"` or `"owner/*"` to a `gh` account name |
 | `github_poll_seconds` | `60` | How often a repo with no forwarder is read; at least 15 |
 

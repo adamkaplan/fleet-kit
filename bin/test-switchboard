@@ -49504,7 +49504,7 @@ class TestExcludedRepos(Base):
         excluded = [line for line in lines if "excluded" in line]
         self.assertEqual(len(excluded), 1, lines)
         self.assertIn(ACME_WEB, excluded[0])
-        self.assertFalse(any(word in line for line in lines for word in ("failed", "failure", "unreadable", "flapping")), lines)
+        self.assertEqual(len(lines), len([line for line in lines if "excluded" in line or ACME_API in line or "daemon not running" in line]), "no line but the excluded one, the watch and the daemon note")
         only = sb.validate_config({"excluded_repos": [ACME_WEB]})
         self.assertEqual(len(sb.format_github(sb.github_status(only, self.home))), 1, "even with nothing else watched it is said once")
 
@@ -49554,6 +49554,36 @@ class TestExcludedRepos(Base):
         self.assertEqual(self.load_with(named), "")
         other = self.write_mapping({"command": ["vault-tool", "get", "x"]})
         self.assertEqual(self.load_with(other), "")
+
+    def test_the_az_check_reads_both_key_source_forms_a_rotation_and_never_raises(self):
+        mod = sb.load_module("repo_exclusion")
+        bare = ["az", "keyvault", "secret", "show"]
+        for source, expected in (
+                ({"command": bare}, True), ("command:" + json.dumps(bare), True), ([{"command": ["vault-tool"]}, {"command": bare}], True),
+                ({"command": bare + ["--subscription=abc"]}, False), ({"command": bare + ["-s", "abc"]}, False),
+                ("command:" + json.dumps(bare + ["--subscription", "abc"]), False), ("env:KEY", False), ("command:[not json", False), (None, False)):
+            self.assertEqual(mod.az_without_subscription(self.write_mapping(source)), expected, source)
+        self.assertFalse(mod.az_without_subscription(str(self.home / "no-such-file.json")))
+        (self.home / "bad.json").write_text("{not json")
+        self.assertFalse(mod.az_without_subscription(str(self.home / "bad.json")))
+
+    def test_a_reader_built_with_accounts_only_still_refuses_an_excluded_repo(self):
+        calls = []
+        config = sb.validate_config({"excluded_repos": [ACME_WEB]})
+        runner = lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(argv, 0, "{}", "")
+        reader = sb.IntentReader(GH_BIN, ACME_API, runner, accounts=sb.GhAccounts(config, runner, time.time))
+        with self.assertRaises(sb.IntentError) as caught:
+            reader.issue(5, ACME_WEB)
+        self.assertEqual(caught.exception.reason, "excluded")
+        self.assertEqual(calls, [])
+
+    def test_the_intent_repo_itself_being_excluded_is_not_read_either(self):
+        calls = []
+        reader = sb.IntentReader(GH_BIN, ACME_WEB, lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(argv, 0, "{}", ""))
+        reader.config = sb.validate_config({"excluded_repos": [ACME_WEB]})
+        with self.assertRaises(sb.IntentError):
+            reader.issue(5)
+        self.assertEqual(calls, [])
 
     def test_s6_the_warning_never_prints_the_commands_other_arguments(self):
         text = self.load_with(self.write_mapping({"command": ["az", "keyvault", "secret", "show", "--vault-name", "vault-xyz", "--name", "secret-abc"]}))

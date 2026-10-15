@@ -44,17 +44,26 @@ def without_excluded(config, repos):
 
 
 def _commands(mapping):
-    """The argv of every command key source in a mapping: `key_source` is one source or a list of them; a source is {"command": [argv...]} or "command:[...]"."""
+    """The argv of every command key source in a mapping: `key_source` is one source or a list of them (a rotation); a source is {"command": [argv...]}
+    or the string form `command:[...]` (a JSON list), the two forms `external_adapter.parse_key_source` accepts."""
     sources = mapping.get("key_source") if isinstance(mapping, dict) else None
     sources = sources if isinstance(sources, list) else [sources]
     for source in sources:
-        command = source.get("command") if isinstance(source, dict) else None
+        command = None
+        if isinstance(source, dict):
+            command = source.get("command")
+        elif isinstance(source, str) and source.startswith("command:"):
+            try:
+                command = json.loads(source[len("command:"):])
+            except ValueError:
+                command = None
         if isinstance(command, list) and command and all(isinstance(a, str) for a in command):
             yield command
 
 
 def az_without_subscription(mapping_path):
-    """True when the mapping file's key command starts with `az` and has no `--subscription` option. Never raises: an unreadable or odd file says False."""
+    """True when the mapping file's key command starts with `az` and has no `--subscription` option (`--subscription=<id>` and `-s` count). Never raises: an
+    unreadable or odd file, or one over the size cap (read truncated, so not valid JSON), says False."""
     try:
         with open(mapping_path) as handle:
             mapping = json.loads(handle.read(MAPPING_MAX))

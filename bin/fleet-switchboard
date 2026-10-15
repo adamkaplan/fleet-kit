@@ -15668,7 +15668,7 @@ class IntentReader:
         self.gh, self.repo, self.runner, self.now = gh, repo, runner, now
         self.timeout, self.ttl = timeout, ttl
         self.accounts = accounts  # PR 15: a GhAccounts; None reads every repo with the default account
-        self.config = None        # set by intent_reader_for: the config's excluded_repos are never read
+        self.config = None        # the config whose excluded_repos are never read; when None, the config of `accounts` (every reader has one)
         self._cache = {}
         self.live, self.live_ttl = None, INTENT_TTL_LIVE   # live(repo) -> the running forwarder's generation, or None (the hub sets it)
 
@@ -15684,7 +15684,8 @@ class IntentReader:
             raise IntentError("gh", str(err)) from None
 
     def _api(self, path, repo=None):
-        if self.config is not None and load_module("repo_exclusion").is_excluded(self.config, repo or self.repo):
+        config = self.config if self.config is not None else getattr(self.accounts, "config", None)   # every construction passes `accounts=GhAccounts(config, ...)`
+        if config is not None and load_module("repo_exclusion").is_excluded(config, repo or self.repo):
             raise IntentError("excluded", "repository %s is excluded from the fleet's reads (excluded_repos)" % (repo or self.repo))   # #446: no read
         argv = [self.gh, "api", path]
         env = self.env_for(repo)
