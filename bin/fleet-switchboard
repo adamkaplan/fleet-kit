@@ -26242,11 +26242,39 @@ def _issue_target(engine, decision):
     return (repo or (watched[0] if len(watched) == 1 else None)), decision["ask"]
 
 
+class DecisionReadError(DecisionError):
+    """A decision command could not read what it needs from GitHub: nothing was changed (exit 1, not a usage error)."""
+
+
+def escalate_notice(engine, runner, decision, reason, name):
+    """(#487) `decisions escalate` on a PR notice. A notice is information: it waits on no one, so it never answers "already yours". The pull request is read
+    NOW (one `gh pr view`, through its repository's account): when it carries the merge hold at its current head it is escalated exactly as the listed hold
+    would be (the file can trail a label by a few minutes); when it does not, the command says it is only a notice and that nothing was escalated; when it
+    cannot be read it says so and changes nothing."""
+    ident, repo, number = decision["id"], decision.get("repo"), decision.get("number")
+    if not str(ident).startswith("pr:") or not repo or isinstance(number, bool) or not isinstance(number, int):
+        raise DecisionError("%s is a notice: information only, so nothing was escalated (it ends by itself)" % ident)
+    try:
+        facts = pr_facts_from(read_pr_json(engine, repo, number))
+    except Exception as err:   # an unreadable pull request is not a pull request that holds nothing
+        raise DecisionReadError("%s: the pull request %s#%d could not be read (%s): nothing was changed" % (
+            ident, repo, number, _one_line(str(err), 120))) from None
+    if facts.get("state") != "open":
+        raise DecisionError("%s: the pull request is %s, so there is nothing to escalate (a notice ends then)" % (ident, facts.get("state") or "not open"))
+    if not facts.get("captain") or not facts.get("head"):
+        raise DecisionError("%s is a PR notice: information only, so nothing was escalated. It becomes a decision when the pull request carries the merge hold "
+                            "(%s, or `MERGE: captain` first in its body)" % (ident, label_names(engine.config)["merge-captain"]))
+    held = {"id": ident, "kind": "captain", "tier": "cos", "repo": repo, "number": number, "head": facts["head"]}
+    return escalate_decision(engine, runner, held, reason, name)
+
+
 def escalate_decision(engine, runner, decision, reason, name):
     """Move a decision to you. An issue (or the issue a report is about): your label on, the Chief of Staff's off. A
     permission request or question: marked yours at once, in escalated-requests.json (disposable; the pass reads it)
     and in the audit log. Returns one line saying what was done."""
     kind, ident = decision["kind"], decision["id"]
+    if kind == "notice":
+        return escalate_notice(engine, runner, decision, reason, name)   # #487: never "already yours" for information that waits on no one
     if decision.get("tier") == "human":
         return "%s is already yours: nothing changed" % ident
     if kind in ("issue", "report"):
@@ -26661,6 +26689,9 @@ def cmd_decision_write(args, action, runner, now):
                                 "question" % args.id)
         else:
             line = answer_decision(engine, decision, args.value, args.note, name)
+    except DecisionReadError as err:
+        sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 400)))
+        return EXIT_ERROR
     except (DecisionError, CallerError) as err:
         sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 400)))
         return EXIT_USAGE
