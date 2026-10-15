@@ -135,6 +135,15 @@ def load_decision_core():
 decision_core = load_decision_core()
 
 
+def run_cloud(function, *arguments):
+    """`cloud_worker.<function>(*arguments)`; a CloudError reads as a LaunchError (a one-line failure, exit 1)."""
+    module = load_module("cloud_worker").bind(globals())
+    try:
+        return getattr(module, function)(*arguments)
+    except module.CloudError as err:
+        raise LaunchError(str(err)) from None
+
+
 def load_plan_check():
     """The plan checker, bin/plan_check.py (#135), loaded by path from beside this file, as load_decision_core does."""
     return load_module("plan_check")
@@ -143,6 +152,11 @@ def load_plan_check():
 def load_plan_ledger():
     """The evidence ledger and gates, bin/plan_ledger.py (#107), loaded by path like plan_check."""
     return load_module("plan_ledger")
+
+
+def load_launch_testers():
+    """The launch-record testers' pure core, bin/launch_testers.py (#372), loaded by path like plan_check."""
+    return load_module("launch_testers")
 
 
 def load_report_fold():
@@ -455,7 +469,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "temp_janitor", "load_alert", "spotlight_guard", "excluded_repos", "source_budgets"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "chat_clear", "temp_janitor", "load_alert", "spotlight_guard", "excluded_repos", "source_budgets"}
 
 
 def config_known_keys():
@@ -575,6 +589,9 @@ def validate_config(raw, source="config"):
         load_disk_janitor().validate(config.get("temp_janitor"), source)
     except ValueError as err:
         raise ConfigError(str(err))
+    raw_chat = config.get("chat_clear")
+    if raw_chat is not None and (not isinstance(raw_chat, dict) or set(raw_chat) - {"enabled", "live"} or any(not isinstance(v, bool) for v in raw_chat.values())):
+        raise ConfigError("%s: 'chat_clear' must be {\"enabled\": true|false, \"live\": true|false}, got %r" % (source, raw_chat))   # #457: live is the owner's key
     if config.get("impact_hold") is not None:   # #179 L4: the hold is off unless `enabled` is true
         try:
             impact_floor.validate_hold_config(config["impact_hold"])
@@ -5639,9 +5656,9 @@ def launch_problems(name, agent, directory, workspace, issue, charter=None, head
     return problems
 
 
-def fleet_record(name, role, reports_to, issue, charter=None, repo=None):
+def fleet_record(name, role, reports_to, issue, charter=None, repo=None, launched_by=None):
     fleet = {"name": name, "role": role, "reports_to": reports_to, "issue": None if issue is None else int(issue),
-             "charter": charter, "repo": repo}
+             "charter": charter, "repo": repo, "launched_by": launched_by}   # launched_by (#372): the agent that ran `launch`, as its pane identified it; None from a plain shell
     return {key: value for key, value in fleet.items() if value is not None}
 
 
@@ -5725,7 +5742,7 @@ def view_env(role, repo):
 
 
 def launch_agent(engine, name, agent, directory, workspace, role=None, reports_to=None, issue=None,
-                 brief=None, patience=LAUNCH_PATIENCE, sleep=time.sleep, charter=None, repo=None):
+                 brief=None, patience=LAUNCH_PATIENCE, sleep=time.sleep, charter=None, repo=None, launched_by=None):
     """Create a fleet agent: a v2 session, its own herdr tab, the brief.
 
     Nothing is typed. The tab's program is started by argv through herdr's
@@ -5740,7 +5757,7 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
     taken = engine.discover(engine.now()).agents.get(name)
     if taken is not None:
         raise LaunchError("a fleet agent named %s already runs in pane %s" % (name, taken.pane))
-    fleet = fleet_record(name, role, reports_to, issue, charter, repo)
+    fleet = fleet_record(name, role, reports_to, issue, charter, repo, launched_by)
     env = dict(engine.config["opencode_env"], **engine.config["launch_env"])
     env.update(view_env(role, repo or (engine.config.get("intent_repo") if charter else None)))  # PR 18
     accounts = getattr(engine, "accounts", None)
@@ -5795,7 +5812,7 @@ def register_launch_worktree(engine, name, directory, repo):
         engine._note("worktree.error", name, {"error": _one_line(str(err), 120)})
 
 
-def launch_headless(engine, name, agent, directory, role=None, reports_to=None, issue=None, brief=None, charter=None, repo=None):
+def launch_headless(engine, name, agent, directory, role=None, reports_to=None, issue=None, brief=None, charter=None, repo=None, launched_by=None):
     """Create a fleet agent with NO terminal (#433): a v2 session in the OpenCode service, a private record (state-dir/headless/<name>.json) and the
     brief through the API. Nothing is opened in herdr. Presence is proved by the service: the new session must answer and carry the worker's name
     before the brief is sent. Returns {"name", "session", "pane": None, "tab": None, "headless": True}.
@@ -5818,7 +5835,7 @@ def launch_headless(engine, name, agent, directory, role=None, reports_to=None, 
             if ap.read_record(engine.state_dir, name)[0] is not None:
                 raise LaunchError("a headless record for %s already exists: `%s retire %s` first, or pick another name" % (name, PROG, name))
             identity = headless_identity(engine, repo)   # refuses a repo that maps to a named gh account: a headless worker cannot be pinned to it
-            fleet = fleet_record(name, role, reports_to, issue, charter, repo)
+            fleet = fleet_record(name, role, reports_to, issue, charter, repo, launched_by)
             fleet["headless"] = True
             with engine._external("v2.session.create", name, {"agent": agent, "directory": directory, "fleet": fleet, "headless": True}) as result:
                 session_id = engine.v2.session_create(agent, name, directory, {"fleet": fleet})["id"]
@@ -6140,6 +6157,30 @@ def prune_retired(retired, now):
 
 def read_retired(state_dir):
     return _read_small(state_dir, RETIRED_FILE)
+
+
+class RetiredUnreadable(Exception):
+    """retired.json exists but cannot be read as the {name: record} map it is (#372): for the tester gate that is NOT the same as an empty list."""
+
+
+def read_retired_strict(state_dir):
+    """The retired map, or RetiredUnreadable. A MISSING file is an empty map (nobody retired); anything else that is not a JSON object of objects (corrupt,
+    empty, garbage, a list, a record that is not an object, unreadable) raises. `read_retired` reads all of those as empty, which is right for a display but
+    would let a retired tester record verdicts again: the verdict authority (launch-record testers) uses this one and fails closed."""
+    try:
+        with open(str(Path(state_dir) / RETIRED_FILE), "rb") as handle:
+            raw = handle.read(1000001)
+    except FileNotFoundError:
+        return {}
+    except OSError as err:
+        raise RetiredUnreadable("%s cannot be read: %s" % (RETIRED_FILE, getattr(err, "strerror", None) or type(err).__name__)) from None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeError):
+        raise RetiredUnreadable("%s is not valid JSON" % RETIRED_FILE) from None
+    if not isinstance(data, dict) or len(raw) > 1000000 or not all(isinstance(v, dict) for v in data.values()):
+        raise RetiredUnreadable("%s is not a map of retired agents" % RETIRED_FILE)
+    return data
 
 
 def _prune_last_reports(data):
@@ -6639,6 +6680,9 @@ def cmd_retire(args, runner, now):
     --all-detached` skips it, and it is shown once in `status` as retired (dropped after RETIRED_SHOW_DAYS). Nothing is deleted and no tab is closed, unless
     `--close` is given: then the agent's terminal PANE is closed too (see `retire_close_problem`). The caller rule is `reattach`'s: the operator, the
     Chief of Staff or the agent's own boss; others are refused and audited."""
+    remote = run_cloud("route", args.name)   # a cloud worker has an endpoint record (#371)
+    if remote is not None:
+        return run_cloud("cmd_retire", args, runner, now, remote)
     engine, state, _ = build_engine(runner, now, "cli")
     name = args.name
     if not NAME_RE.match(name or ""):
@@ -7242,6 +7286,16 @@ def add_retire_parsers(sub):
     retire.add_argument("--close", action="store_true", help="Also close the agent's terminal pane (frees its memory): only its boss, the Chief of Staff for a direct report, or the operator; "
                                                              "the pane is read again and must still hold the agent's own session; never your own pane")
     retire.add_argument("--force", action="store_true", help="With --close: close a pane that is still working (refused for a worker with unpushed or uncommitted work in a registered worktree)")
+
+
+def add_read_parsers(sub):
+    read = sub.add_parser("read", help="The newest messages of an agent's session, oldest first (a cloud worker is read on its own endpoint)")
+    read.add_argument("name", help="The agent's fleet name")
+    read.add_argument("--limit", type=int, default=20, help="How many messages (default 20, at most 200)")
+
+
+def cmd_read(args, runner, now):
+    return run_cloud("cmd_read", args, runner, now)
 
 
 def add_reattach_parsers(sub):
@@ -10378,6 +10432,7 @@ def publish_decisions(engine):
         pane_health_pass(engine, now)   # the control plane: detached or dead panes, reads only, wakes the Chief of Staff
     except Exception as err:
         engine._note("fleetpane.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+    chat_clear_pass(engine, decisions, now)   # #457: the owner clears a held PR in his chat; SHADOW unless chat_clear.live; never raises
     try:
         impact_would_hold_pass(engine, now)   # #179 L3: audits gate.would_hold from the diff's floor; ADVISORY, writes nothing to GitHub
     except Exception as err:
@@ -12216,6 +12271,23 @@ def triage_summary(state_dir):
         return None
     raw["cost"] = triage_digest.cost_read(str(state_dir))   # #349: None means no figure was recorded
     return raw
+
+
+def testers_status(config, agents, fleets, state):
+    """The `status` lines of the resolved testers per repo with their source (#372); [] when there are none or the picture is unreadable."""
+    try:
+        if not (agents.get("ok") and fleets is not None):
+            return []
+        sessions = {entry["observation"]["name"]: entry["observation"].get("session") for entry in (agents.get("list") or []) if entry.get("observation")}
+        repo_of = lambda fleet: _fleet_repo(fleet, config)
+        repos = {repo_of(fleet) for fleet in fleets.values() if isinstance(fleet, dict) and fleet.get("role") == "orchestrator"} - {None}
+        try:
+            retired = read_retired_strict(state)
+        except RetiredUnreadable:
+            return ["      testers    retired file unreadable: launch-record testers disabled"]   # the same fail-closed rule the verdict gate applies
+        return load_launch_testers().status_lines(config.get("plan_evaluators"), fleets, sessions, repos, repo_of, retired)
+    except Exception as err:
+        return ["      tester     unreadable: the resolved testers could not be listed (%s)" % _one_line(type(err).__name__, 40)]
 
 
 def triage_status_lines(triage):
@@ -14737,6 +14809,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         fleets = {entry["observation"]["name"]: entry["observation"].get("fleet") or {}
                   for entry in (agents.get("list") or []) if agents.get("ok") and entry.get("observation")}
         report["github"] = github_status(config, state, fleets, now())
+        report["testers"] = testers_status(config, agents, fleets, state)   # #372
     if state_ok:
         report["decisions"] = decisions_summary(state, now)
         report["v2_calls"] = v2_calls_status(state, now())
@@ -14962,6 +15035,7 @@ def format_status(report):
     lines.extend("      " + text for text in report.get("github_calls") or [])
     lines.extend("      v2_light   " + report["v2_light"] for _ in [0] if report.get("v2_light"))
     lines.extend(sweep_status_lines(report.get("sweep")))  # #117
+    lines.extend(report.get("testers") or [])   # #372
     lines.extend(triage_status_lines(report.get("triage")))  # #130
     lines.extend("      " + report["ci_record"] for _ in [0] if report.get("ci_record"))
     lines.extend(report.get("pane_lines") or [])
@@ -14983,10 +15057,18 @@ def format_status(report):
 
 def cmd_status(args, runner=subprocess.run, now=time.time):
     report = collect_status(runner, now)
+    try:
+        cloud_lines, cloud_rows = load_module("cloud_worker").bind(globals()).status_extra(runner)   # cloud workers (#371): nothing when there are none
+    except Exception as err:   # the module missing or broken must not take `status` down for a local-only fleet
+        cloud_lines, cloud_rows = ["      cloud workers: unavailable (%s)" % _one_line(str(err), 100)], []
+    if cloud_rows:
+        report["cloud"] = cloud_rows
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
         print(format_status(report))
+        if cloud_lines:
+            print("\n".join(cloud_lines))
     return EXIT_OK if report["ok"] else EXIT_ERROR
 
 
@@ -15201,6 +15283,8 @@ def read_brief(path, stdin):
 
 
 def cmd_launch(args, runner, now, socket_call=None):
+    if getattr(args, "cloud", False):   # a worker in the cloud (#371): its own module; nothing below runs
+        return run_cloud("cmd_launch", args, runner, now)
     workspace = args.workspace or os.environ.get("HERDR_WORKSPACE_ID")
     engine, state, _ = build_engine(runner, now, "cli", socket_call=socket_call)
     if args.resume:
@@ -15239,6 +15323,14 @@ def cmd_launch(args, runner, now, socket_call=None):
     if (args.name or "").startswith(LANE_NAME_PREFIX):
         raise LaunchError("names starting %r are the plan review engine's reviewer lanes: only it launches them" % LANE_NAME_PREFIX)
     repo = launch_repo(args)
+    if not repo and not args.charter:   # #473: no --repo, no issue repo, no charter: the worker would have no repository of its own (and so no account)
+        repo, why = origin_repository(runner, args.dir)
+        if repo:
+            sys.stderr.write("%s: repository: %s (from origin)\n" % (PROG, repo))
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "launch.repo_from_origin", args.name, {"repo": repo})
+        else:
+            sys.stderr.write("%s: no repository recorded (%s): pushes will be refused; pass --repo\n" % (PROG, why))
     problem = launch_agent_problem(engine.config, runner, args.agent)
     if problem:
         raise LaunchError(problem)
@@ -15262,12 +15354,19 @@ def cmd_launch(args, runner, now, socket_call=None):
             created = workspace = result["workspace"] = engine.herdr.workspace_create(
                 args.dir, args.new_workspace, focus=False)["workspace_id"]
     try:
+        launcher = identify_caller(engine.herdr, engine.v2, os.environ)   # #372: who ran this launch, recorded in the session; a plain shell is nobody
+    except Exception:
+        launcher = None   # an identity failure records nobody, on purpose: that agent never counts as a launched tester (fail closed)
+    launched_by = launcher if isinstance(launcher, str) and launcher else None
+    try:
         if getattr(args, "headless", False):
             done = launch_headless(engine, args.name, args.agent, args.dir, args.role, args.reports_to,
-                                   None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo)
+                                   None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo,
+                                   launched_by=launched_by)
         else:
             done = launch_agent(engine, args.name, args.agent, args.dir, workspace, args.role, args.reports_to,
-                                None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo)
+                                None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo,
+                                launched_by=launched_by)
     except LaunchError as err:
         if created:
             raise LaunchError("%s (workspace %s was created and is left for you to close)" % (err, created)) from err
@@ -15374,6 +15473,37 @@ def launch_repo(args):
     return named or qualified
 
 
+_ORIGIN_NAME = r"([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]{1,100}?)(?:\.git)?"
+ORIGIN_HTTPS_RE = re.compile(r"https://github\.com/" + _ORIGIN_NAME)
+ORIGIN_SSH_RE = re.compile(r"git@github\.com:" + _ORIGIN_NAME)
+
+
+def origin_repository(runner, directory):
+    """(`owner/name`, None) for the repository the `origin` remote of `directory` names, else (None, why). Read ONCE, by the launcher, never by a shim or
+    at call time (a worker controls its own remote settings): `git config --local --no-includes --get-all remote.origin.url` as an argv, no shell, no network, nothing
+    but the repository's own config. Only `https://github.com/OWNER/NAME[.git]` and `git@github.com:OWNER/NAME[.git]` are accepted, exactly one `origin`
+    url: another host, a path, a `file:` or `ssh://` url, a url with a user or a token in it, an alias, a trailing path or no origin at all gives no
+    repository. The result is lower case. `why` is a fixed phrase: the url itself is NEVER returned, printed or logged."""
+    if not isinstance(directory, str) or not os.path.isabs(directory) or not os.path.isdir(directory):
+        return None, "the working directory is not an existing absolute path"
+    clean = {k: v for k, v in os.environ.items() if not (k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_CEILING_DIRECTORIES") or k.startswith("GIT_CONFIG"))}
+    try:   # the launcher's own environment must not point git at another repository or config: scrubbed
+        done = subprocess.run(["git", "-C", directory, "config", "--local", "--no-includes", "--get-all", "remote.origin.url"], capture_output=True, text=True,
+                              timeout=WORKTREE_GIT_SECONDS, stdin=subprocess.DEVNULL, env=clean)
+    except (OSError, subprocess.SubprocessError):
+        return None, "git could not be run there"
+    urls = [line for line in (done.stdout or "").splitlines() if line.strip()]
+    if done.returncode != 0 or not urls:
+        return None, "the directory has no origin remote"
+    if len(urls) != 1:
+        return None, "origin names more than one url"
+    found = ORIGIN_HTTPS_RE.fullmatch(urls[0]) or ORIGIN_SSH_RE.fullmatch(urls[0])
+    if not found or found.group(2) in (".", "..") or found.group(2).lower().endswith(".git"):
+        return None, "origin is not a plain github.com repository url"
+    repo = ("%s/%s" % found.groups()).lower()
+    return (repo, None) if REPO_RE.match(repo) else (None, "origin is not a plain github.com repository url")
+
+
 def check_charter_workspace(engine, runner, now, charter, repo, label):
     """Refuse a new workspace whose label is not the one the charter names (an exact match). A charter with no
     `workspace:` line, or no charter, is no objection. A charter that cannot be read is: the label is the one
@@ -15446,6 +15576,9 @@ cmd_send.ensure_on_use = True   # the daemon is alive when it runs
 
 
 def _cmd_send(args, runner, now):
+    remote = run_cloud("route", args.name)   # a cloud worker has an endpoint record (#371)
+    if remote is not None:
+        return run_cloud("cmd_send", args, runner, now, remote)
     engine, _, config = build_engine(runner, now, "cli")
     refusal = intent_refusal(config, args.issue)
     if refusal:
@@ -17819,6 +17952,24 @@ def cmd_prove(args, runner, now):
 cmd_prove.ledger = True   # state and GETs only; its own errors are usage errors
 
 
+def launched_testers_for(ctx):
+    """({name: launch record}, {name: session id}, {name: metadata.fleet}) from ONE read of the running agents: the testers the launch record makes testers
+    of this PR's repo (#372), and what the lane rule needs. Never raises: a discovery that fails gives nothing launched (so only the configured list
+    counts, and the lane rule has nobody to apply to); an unreadable retired list counts every launched tester as retired (fail closed)."""
+    try:
+        agents = ctx.engine.discover(ctx.engine.now()).agents
+        fleets = {name: (seen.fleet or {}) for name, seen in agents.items()}
+        sessions = {name: seen.session_id for name, seen in agents.items()}
+    except Exception:
+        return {}, {}, {}
+    try:
+        retired = read_retired_strict(ctx.engine.state_dir) if ctx.engine.state_dir is not None else {}
+    except Exception as err:   # a corrupt retired file could hide a retired tester: no launched tester counts, loudly (audit; `status` says so too)
+        ctx.engine._note("testers.retired_unreadable", None, {"error": _one_line(str(err), 160), "effect": "launch-record testers disabled"})
+        return {}, sessions, fleets
+    return load_launch_testers().launched(fleets, sessions, ctx.repo, lambda fleet: _fleet_repo(fleet, ctx.config), retired), sessions, fleets
+
+
 def cmd_verdict(args, runner, now):
     """`verdict <scenario> --pr <repo#N> --as <evaluator> --result ...`: record the evaluator's verdict for a scenario. Only
     the evaluator the scenario names, only by an agent registered for it (`plan_evaluators`), never by a writer of the PR."""
@@ -17854,8 +18005,15 @@ def cmd_verdict(args, runner, now):
         if not plan_ledger.known_writers(ctx.entries, ctx.pr, senders):
             raise LedgerCommandError("refused: no writer of %s is known to the switchboard (nobody has recorded a proof or sent its "
                                      "`notice pr`): its author must do that first, so the author can be excluded" % ctx.pr)
-        ok, why = plan_ledger.may_record_verdict(named, caller, ctx.config.get("plan_evaluators"),
-                                                 plan_ledger.authors_of(ctx.entries, ctx.pr, senders, ctx.facts.get("author")))
+        allowed, launch, sessions, fleets = ctx.config.get("plan_evaluators"), {}, {}, {}
+        authors = plan_ledger.authors_of(ctx.entries, ctx.pr, senders, ctx.facts.get("author"))
+        if named == "tester":   # #372: the configured list UNION the testers the launch record names for this repo; any trouble reading it is the configured list alone
+            launch, sessions, fleets = launched_testers_for(ctx)
+            allowed = load_launch_testers().evaluators(allowed, launch)
+        ok, why = plan_ledger.may_record_verdict(named, caller, allowed, authors)
+        if ok and named == "tester" and caller in launch:
+            why = load_launch_testers().lane_refusal(caller, launch, authors, sessions, fleets)
+            ok = why is None
     if not ok:
         if ctx.engine.audit is not None:
             ctx.engine.audit.append(ctx.engine.actor, "plan.verdict.refused", ctx.pr,
@@ -17874,9 +18032,10 @@ def cmd_verdict(args, runner, now):
         raise LedgerCommandError("%s" % err) from None
     for entry, one in zip(entries, stored):
         if ctx.engine.audit is not None:
-            ctx.engine.audit.append(ctx.engine.actor, "plan.verdict", ctx.pr,
-                                    {"scenario": entry["scenario"], "result": entry["result"], "seq": one["seq"], "by": entry["by"],
-                                     "chain": one["hash"]})
+            detail = {"scenario": entry["scenario"], "result": entry["result"], "seq": one["seq"], "by": entry["by"], "chain": one["hash"]}
+            if named == "tester" and caller in launch and load_launch_testers().source_of(caller, ctx.config.get("plan_evaluators"), launch) == "launch record":
+                detail["launch_record"] = {k: v for k, v in launch[caller].items() if v is not None}   # #372: the record this verdict relied on
+            ctx.engine.audit.append(ctx.engine.actor, "plan.verdict", ctx.pr, detail)
         print("recorded %s verdict #%d: %s %s at %s (%s), bound to plan %s" % (named, one["seq"], entry["scenario"], args.result,
                                                                              head[:8], ctx.pr, entry["plan_hash"][:19]))
     return EXIT_OK
@@ -18019,10 +18178,74 @@ def impact_review_hold(state_dir, pr, head):
     return bool(latest and latest.get("impact_action") == "hold"), None
 
 
+def impact_review_record(state_dir, pr, head):
+    """((action, class), problem): the independent impact reviewer's newest record for EXACTLY this head as (impact_action, impact_class) (None when there is
+    none), and what is wrong when the ledger cannot be read (the rating is then unknown: the owner decision reads it as a hold)."""
+    try:
+        entries, problem = plan_ledger.read_ledger(state_dir)
+    except Exception as err:
+        return None, "%s: %s" % (type(err).__name__, _one_line(str(err), 100))
+    if problem:
+        return None, _one_line(str(problem), 120)
+    latest = None
+    for entry in entries:
+        if entry.get("kind") == "review_record" and entry.get("pr") == pr and entry.get("head") == head and entry.get("reviewer") == "impact":
+            latest = entry
+    return ((latest.get("impact_action"), latest.get("impact_class")) if latest else None), None
+
+
+def _file_text_at(engine, repo, path, ref):
+    """The text of `path` at `ref`: the string, "" is a real empty file, or None when the path does not exist there (a 404). Raises IntentError for any
+    other failure (the caller says unreadable and holds)."""
+    reader = getattr(engine, "intents", None)
+    if reader is None:
+        raise IntentError("gh", "no GitHub reader")
+    try:
+        data = reader._api("repos/%s/contents/%s?ref=%s" % (repo, urllib.parse.quote(path, safe="/"), ref), repo)
+    except IntentError as err:
+        if err.reason == "not_found":
+            return None
+        raise
+    if not isinstance(data, dict) or data.get("type") not in (None, "file") or data.get("encoding") != "base64" or not isinstance(data.get("content"), str):
+        raise IntentError("gh", "%s is not a readable file at %s" % (path, str(ref)[:8]))
+    try:
+        return base64.b64decode(data["content"]).decode("utf-8")
+    except (ValueError, UnicodeError):
+        raise IntentError("gh", "%s is not text at %s" % (path, str(ref)[:8])) from None
+
+
+def agent_block_states(engine, repo, matrix, paths, base, head):
+    """#451 slice 2: {path: "unchanged"|"changed"|"added"|"removed"|"unreadable"} for the changed paths the matrix file judges by content (an agent
+    definition: only its permission block counts). Two reads for each (its base and its head) and none when there is no such path or more than the matrix
+    file allows (the decision holds those unread). A read that fails is "unreadable", never "unchanged"."""
+    narrowed, limit = impact_floor.narrow_paths(matrix, paths)
+    if not narrowed or len(narrowed) > limit:
+        return {}
+    keys = impact_floor.narrow_rule(matrix)[1]
+    states = {}
+    for path in narrowed:
+        try:
+            if not base or not head:
+                raise IntentError("gh", "the base or head commit is unknown")
+            before, after = _file_text_at(engine, repo, path, base), _file_text_at(engine, repo, path, head)
+        except IntentError:
+            states[path] = "unreadable"
+            continue
+        if before is None and after is None:
+            states[path] = "unreadable"
+        elif before is None:
+            states[path] = "added"
+        elif after is None:
+            states[path] = "removed"
+        else:
+            states[path] = impact_floor.block_state(before, after, keys)
+    return states
+
+
 def pr_floor_report(engine, repo, number, rated_pairs=()):
     """Read one PR's files and decide: {"pr", "head", "floor_paths", "complete", "rated", "decision", "reasons", "globs"}. Reads only (one
     `gh pr view`). `rated_pairs` is the independent rating's (severity, probability) list, an input that can only ADD a hold."""
-    raw = read_pr_json(engine, repo, number, "files")
+    raw = read_pr_json(engine, repo, number, "files,baseRefOid")
     files = [f for f in (raw.get("files") if isinstance(raw.get("files"), list) else []) if isinstance(f, dict)]
     globs, exclude, force = impact_floor.floor_for(repo, engine.config)
     paths, renamed = [], []
@@ -18045,6 +18268,11 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
     rated = impact_floor.rate(matrix, list(rated_pairs))
     decision, reasons = impact_floor.decide(hit, rated, unknown)
     head = raw.get("headRefOid")
+    narrow = agent_block_states(engine, repo, matrix, paths, raw.get("baseRefOid"), head)
+    record, record_problem = (impact_review_record(engine.state_dir, "%s#%d" % (repo, number), head) if engine.state_dir is not None and isinstance(head, str) else (None, None))
+    if record_problem:
+        record = ("hold", None)   # an unreadable ledger is an unknown rating: it holds
+    owner = impact_floor.owner_decide(matrix, paths, [(sev, prob, None) for sev, prob in rated_pairs], unknown, hit, narrow, record)   # advisory (#451): which tier the owner-hold rule puts it in; the labels still follow `decision` until the re-judge slice
     if engine.state_dir is not None and isinstance(head, str):
         review, problem = impact_review_hold(engine.state_dir, "%s#%d" % (repo, number), head)
         if problem:
@@ -18057,7 +18285,7 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
             decision = "hold"
     return {"pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude,
             "floor_paths": hit, "files_read": len(files), "complete": complete, "unknown": unknown, "rated": [list(r) for r in rated],
-            "decision": decision, "reasons": reasons}
+            "decision": decision, "reasons": reasons, "owner_decision": owner[0], "owner_reasons": owner[1]}
 
 
 def cmd_impact(args, runner, now):
@@ -18257,29 +18485,51 @@ def _apply_impact_hold_locked(engine, repo, number, report, record):
     return spent
 
 
-def impact_clear_core(engine, runner, repo, number, who, reason):
+def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, head=None, via=None, verify=None):
     """The owner's clear: record it head-bound (the daemon does not re-add the hold for that head) and remove `hold-impact`, and
-    `merge-captain` too when the switchboard itself added it for this hold. Returns the lines to print."""
+    `merge-captain` too when the switchboard itself added it for this hold. Returns the lines to print.
+
+    `remove` (the chat clear, #457) names the labels to take off instead: the caller has already read the PR and checked that each is an owner-tier hold label or the captain
+    marker; here every one of them is checked again against the owner-tier set, so no other label can ever be removed. `head` is the head the owner was shown: the clear
+    is refused when the PR's head is any other. `verify(raw)` (the chat clear's) is run on the PR this call just read, before anything is written, and raises NoticeError to refuse:
+    the check and the effect use ONE read. `via` is said in the audit line. The head-bound clear state is recorded for any clear, even one that removes no impact label: it only
+    stops the daemon adding its impact hold for that head. Nothing here ever ADDS a label."""
     pr = "%s#%d" % (repo, number)
     if engine.audit is None:   # a clear is a logged act: with no audit sink it is refused, loudly, before anything changes
         raise RuntimeError("no audit sink: an impact clear is refused rather than made unlogged")
     raw = read_pr_json(engine, repo, number)
-    head = raw.get("headRefOid")
-    if not isinstance(head, str) or not head:
+    current = raw.get("headRefOid")
+    if not isinstance(current, str) or not current:
         raise NoticeError("the PR's head is unknown")
+    if head is not None and current != head:
+        raise NoticeError("the PR's head moved since the owner was shown it (%s, not %s): nothing was cleared" % (current[:8], head[:8]))
+    if verify is not None:
+        verify(raw)
     names = label_names(engine.config)
+    if remove is not None:
+        cc = load_module("chat_clear")
+        allowed = {names[key] for key in cc.HOLD_KEYS + (cc.CAPTAIN_KEY,)}
+        if not remove or any(label not in allowed for label in remove):
+            raise RuntimeError("a clear removes owner-tier hold labels and the captain marker only: refused %r" % (sorted(set(remove) - allowed),))
     with impact_state_lock(engine.state_dir):   # the same lock as the daemon's write: the clear and its removal are one step
         state, problem = read_impact_state(engine.state_dir)
         _impact_state_noted(engine, problem)
         ours = state["applied"].get(pr) or {}
-        remove = [names["hold-impact"]]
-        if ours.get("merge_label_added"):
-            remove.append(names["merge-captain"])
-        state["clears"][pr] = {"head": head, "reason": reason, "by": who, "at": int(engine.now())}
+        if remove is None:
+            remove = [names["hold-impact"]]
+            if ours.get("merge_label_added"):
+                remove.append(names["merge-captain"])
+        else:
+            remove = list(remove)
+        head_now = current
+        state["clears"][pr] = {"head": head_now, "reason": reason, "by": who, "at": int(engine.now())}
         write_impact_state(engine.state_dir, state)   # the clear first: a failed removal never leaves a hold the daemon would re-add
         change_issue_labels(engine, runner, repo, number, remove=remove)
-        engine.audit.append(engine.actor, "gate.hold_cleared", pr, {"head": head, "by": who, "reason": reason, "removed": remove})   # inside the lock
-    return ["cleared the impact hold of %s at %s: removed %s; the daemon will not re-add it for this head" % (pr, head[:8], ", ".join(remove))]
+        detail = {"head": head_now, "by": who, "reason": reason, "removed": remove}
+        if via:
+            detail["via"] = via
+        engine.audit.append(engine.actor, "gate.hold_cleared", pr, detail)   # inside the lock
+    return ["cleared the impact hold of %s at %s: removed %s; the daemon will not re-add it for this head" % (pr, head_now[:8], ", ".join(remove))]
 
 
 def cmd_impact_clear(args, runner, now):
@@ -18328,7 +18578,12 @@ def cmd_impact_hold(args, runner, now):
     names = label_names(config)
     shown = 0
     for repo in repos:
-        if not impact_floor.floor_for(repo, config)[0]:
+        try:
+            has_floor = impact_floor.floor_for(repo, config)[0]
+        except impact_floor.MatrixError as err:   # the matrix file cannot be read: say so and stop, never read it as "no floor"
+            sys.stderr.write("%s: impact hold: %s\n" % (PROG, _one_line(str(err), 200)))
+            return EXIT_ERROR
+        if not has_floor:
             continue
         try:
             items = read_open_items(engine, runner, repo)[0]
@@ -18353,6 +18608,181 @@ def cmd_impact_hold(args, runner, now):
     print("%s: %d PR(s) would be held (a dry run: nothing was written; impact_hold is %s)" % (
         PROG, shown, impact_floor.hold_mode(config, repos[0] if repos else "")))
     return EXIT_OK
+
+
+CHAT_CLEAR_NEW_PER_PASS = 3   # the owner's new messages judged in one pass (one Jev call each): the rest wait for the next pass
+
+
+def chat_clear_config(config):
+    """{"enabled", "live"} of the owner's `chat_clear` key. On by default but in SHADOW: `live` is true only when the owner's own config says `"live": true`. This build never sets it."""
+    raw = config.get("chat_clear") if isinstance(config, dict) else None
+    raw = raw if isinstance(raw, dict) else {}
+    return {"enabled": raw.get("enabled") is not False, "live": raw.get("live") is True}
+
+
+CHAT_CLEAR_OFF_FILE = "chat-clear.off"   # the owner's panic stop: its mere presence in the state directory forces SHADOW, checked every pass
+
+
+def chat_clear_live_now(engine):
+    """(live, why): may the hook WRITE on this pass? Only when ALL hold, judged afresh every pass: the config this daemon runs on says `live` (a real true), the kill file
+    `chat-clear.off` is not in the state directory, and the CURRENT config file, read now, is valid and also says `live` and not `enabled: false`. The daemon keeps its last good
+    config when a reload fails, so an invalid or half-edited file would otherwise leave the owner's `live` on: here it means SHADOW at once. `why` is None when live or when
+    shadow is simply the configured mode, else a short reason."""
+    if not chat_clear_config(engine.config)["live"]:
+        return False, None
+    if os.path.lexists(str(Path(engine.state_dir) / CHAT_CLEAR_OFF_FILE)):   # ANY entry, even a dangling symlink, is the panic stop
+        return False, "kill file"
+    try:
+        current = chat_clear_config(load_runnable_config())
+    except Exception as err:   # an invalid, unreadable or missing config file: never live on a file that cannot be read
+        return False, "config invalid: %s" % _one_line(str(err), 120)
+    if not (current["live"] and current["enabled"]):
+        return False, "config says shadow"
+    return True, None
+
+
+def chat_clear_holds(decisions, names):
+    """The holds the owner is shown, read from the SAME decisions the Decisions list is made of: [{"pr", "head", "labels", "summary"}] for every `captain` row that names its head,
+    with the owner-tier labels that row stands for (the captain label, and one `hold-*` label for each hold reason it lists). A reason this build cannot name drops the PR."""
+    holds = []
+    for d in decisions or []:
+        if not isinstance(d, dict) or d.get("kind") != "captain":
+            continue
+        repo, number, head = d.get("repo"), d.get("number"), d.get("head")
+        if not (isinstance(repo, str) and isinstance(number, int) and not isinstance(number, bool) and isinstance(head, str) and head):
+            continue
+        reasons = [h for h in (d.get("holds") or []) if isinstance(h, str)]
+        if any("hold-%s" % h not in names for h in reasons):
+            continue
+        holds.append({"pr": "%s#%d" % (repo, number), "head": head, "labels": [names["merge-captain"]] + [names["hold-%s" % h] for h in reasons],
+                      "summary": d.get("review_evidence") or d.get("headline") or d.get("title") or ""})
+    return holds
+
+
+def chat_clear_pass(engine, decisions, now):
+    """THE daemon hook of #457, called once at the end of a pass with the decisions the Decisions list is made of. Records the offers (the owner-tier holds at the heads shown), and
+    only when there is at least one reads the owner's NEW messages in the Chief of Staff's session (one read, inside v2_light and the call budget), judges each once (one Jev call) and,
+    in LIVE mode only (`chat_clear.live`), clears or asks once. In SHADOW (the default) it logs what it would do and writes nothing to GitHub and sends nothing. Never raises.
+    No command, verb or agent reaches it: only `publish_decisions` calls it, and only the daemon runs that."""
+    try:
+        _chat_clear_pass(engine, decisions, now)
+    except Exception as err:
+        engine._note("chat_clear.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+
+
+def _chat_clear_pass(engine, decisions, now):
+    cfg = chat_clear_config(engine.config)
+    if not cfg["enabled"] or engine.actor != "daemon" or engine.state_dir is None or engine.audit is None or engine.jev is None:
+        return
+    live, why = chat_clear_live_now(engine)
+    cfg = dict(cfg, live=live)
+    mode = "live" if live else ("shadow (%s)" % why if why else "shadow")
+    if engine.__dict__.get("chat_clear_mode") != mode:   # said once per change, loudly: the owner's switch took (or stopped taking) effect
+        previous = engine.__dict__.get("chat_clear_mode")
+        engine.__dict__["chat_clear_mode"] = mode
+        if previous is not None or why:
+            engine.audit.append(engine.actor, "chat_clear.mode", "chat_clear", {"mode": mode, "was": previous, "why": why})
+    cc = load_module("chat_clear")
+    names = label_names(engine.config)
+    holds = chat_clear_holds(decisions, names)
+    refreshed = cc.refresh_offers(engine.state_dir, holds, names, now)
+    if refreshed["added"] or refreshed["dropped"] or refreshed["problem"] or refreshed["damaged"]:
+        engine.audit.append(engine.actor, "chat_clear.offers", "chat_clear", {"added": refreshed["added"][:20], "dropped": refreshed["dropped"][:20],
+                                                                              "problem": refreshed["problem"], "damaged": refreshed["damaged"][:20]})
+    offers = refreshed["offers"]
+    if not offers:
+        return   # nothing is held for the owner: no read of his messages, no Jev call
+    if getattr(engine, "light", False):
+        return   # v2_light: no background read of any session (the same rule as the classifier's reader)
+    discovery = getattr(engine, "discovery", None)
+    cos = next((o for o in (discovery.agents.values() if discovery is not None else []) if (o.fleet or {}).get("role") == "chief-of-staff" and not o.problem and o.session_id), None)
+    if cos is None:
+        return
+    messages = cc.person_messages(newest_prompts(engine, cos.session_id), cc.read_seen(engine.state_dir), now, _created)
+    current_heads = {h["pr"]: h["head"] for h in holds}
+    bar = (engine.config.get("jev") or {}).get("min_confidence", cc.HIGH_CONFIDENCE)
+    for message in messages[:CHAT_CLEAR_NEW_PER_PASS]:
+        cc.mark_seen(engine.state_dir, message["id"], now)   # BEFORE anything is done: one attempt per message, whatever happens
+        offers = cc.read_offers(engine.state_dir)
+        if not offers:
+            engine.audit.append(engine.actor, "chat_clear.dropped", "chat_clear", {"message_id": message["id"], "why": "the offers went away before the message was judged"})
+            return
+        verdict = cc.decide(engine.jev, message["text"], offers, message["created"], now, bar)
+        live_now, _ = chat_clear_live_now(engine)   # AGAIN, right before acting: a kill file or a broken config that appears during this pass stops the very next message
+        _chat_clear_act(engine, cc, dict(cfg, live=live_now), message, verdict, offers, current_heads, now)
+
+
+def _chat_clear_act(engine, cc, cfg, message, verdict, offers, current_heads, now):
+    live, quoted = cfg["live"], cc.quote(message["text"])
+    action, pr, why = verdict["action"], verdict.get("pr"), verdict.get("why")
+    judge = verdict.get("judge") or {}
+    if action == "clear" and not cc.head_matches(offers.get(pr), current_heads.get(pr)):
+        # the head moved since he was shown it (or the offer was never shown): never a clear. The question shows the new head.
+        action, why = "ask", "head_changed"
+        verdict = dict(verdict, question=cc.question_text("head_changed", offers, [pr], current_heads), shown=[pr])
+    detail = {"message_id": message["id"], "quote": quoted, "action": action, "why": why, "pr": pr, "live": live, "would_clear": action == "clear",
+              "probabilities": judge.get("probabilities"), "jev_choice": judge.get("jev_choice"), "model": judge.get("model"), "reason": judge.get("reason"),
+              "screen": (verdict.get("screen") or {}).get("why")}
+    engine.audit.append(engine.actor, "chat_clear.verdict", pr or "chat_clear", detail)
+    if action == "none" or not live:
+        return   # shadow: the verdict is logged and nothing else happens
+    if action == "clear":
+        try:
+            chat_clear_apply(engine, cc, pr, offers[pr], quoted, message["id"], now)
+        except Exception as err:   # the clear failed or was refused at the point of effect: one question, nothing more
+            engine.audit.append(engine.actor, "chat_clear.failed", pr, {"message_id": message["id"], "error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+            verdict = dict(verdict, question=cc.question_text("failed" if not isinstance(err, NoticeError) else "not_held", offers, [pr], current_heads), shown=[pr])
+            action = "ask"
+        else:
+            return
+    if action == "ask":
+        text = "[chat clear] %s\n(your words: \"%s\")" % (verdict["question"], quoted)
+        try:
+            engine.send("switchboard", "chief-of-staff", text)
+        except Exception as err:
+            engine.audit.append(engine.actor, "chat_clear.reply_failed", pr or "chat_clear", {"error": _one_line(str(err), 160)})
+            return
+        for shown in verdict.get("shown") or []:   # the owner was just shown these: their shown head is the one the question named
+            head = current_heads.get(shown)
+            if head:
+                cc.show(engine.state_dir, shown, head, now)
+
+
+def chat_clear_apply(engine, cc, pr, offer, quoted, message_id, now):
+    """THE clear. Called only by the daemon's hook, in LIVE mode, for a message that is the owner's own, names exactly this one PR, was confirmed by Jev at the high bar and is newer
+    than the offer. At the point of effect it READS THE PR AGAIN: it must be open, at exactly the head the owner was shown, with only owner-tier hold labels and the captain marker
+    (any other hold label refuses). It then removes those labels (never any other, never adds one) through the same head-bound core `impact clear` uses, comments with his words,
+    and tells the Chief of Staff."""
+    repo, _, number = pr.rpartition("#")
+    number = int(number)
+    runner = getattr(engine, "gh_runner", None) or subprocess.run
+    names = label_names(engine.config)
+    seen = {}
+
+    def verify(raw):   # run by the core on the SAME read it clears from: open, at the shown head (the core checks), only owner-tier labels
+        if str(raw.get("state") or "").upper() != "OPEN":
+            raise NoticeError("%s is not open any more" % pr)
+        labels = raw.get("labels") or []
+        if raw.get("headRefOid") != offer["head"] or not cc.is_offerable(names, labels):
+            raise NoticeError("%s changed since the owner was shown it: its head or its labels are not what he saw" % pr)
+        seen["remove"] = cc.owner_tier_labels(names, labels)
+
+    raw = read_pr_json(engine, repo, number)
+    verify(raw)   # a cheap refusal before the core's own read; the core verifies again on the read it clears from
+    lines = impact_clear_core(engine, runner, repo, number, "owner (chat)", quoted, remove=seen["remove"], head=offer["head"], via="chat:%s" % message_id, verify=verify)
+    remove = seen["remove"]
+    short = offer["head"][:8]
+    shown_words = quoted.replace("@", "@\u200b").replace("`", "'")   # a public comment: no @mention and no code span can come out of his words
+    body = "The owner cleared this hold in his chat with the Chief of Staff, at head `%s`. His words: \"%s\"\n\nRemoved: %s." % (short, shown_words, ", ".join("`%s`" % l for l in remove))
+    try:
+        comment_as(engine, runner, repo, number, body, "switchboard")
+    except Exception as err:   # the clear is made and audited; a comment that cannot be posted is said, not undone
+        engine.audit.append(engine.actor, "chat_clear.comment_failed", pr, {"error": _one_line(str(err), 160)})
+    try:
+        engine.send("switchboard", "chief-of-staff", "[chat clear] Cleared %s at %s on your words: \"%s\" (removed %s)." % (pr, short, quoted, ", ".join(remove)))
+    except Exception as err:
+        engine.audit.append(engine.actor, "chat_clear.reply_failed", pr, {"error": _one_line(str(err), 160)})
+    return lines
 
 
 def impact_would_hold_pass(engine, now):
@@ -18391,7 +18821,11 @@ def impact_would_hold_pass(engine, now):
             head = ((record.get("head") or {}).get("sha")) if isinstance(record, dict) else None
             if not isinstance(number, int) or isinstance(number, bool) or not head or record.get("draft"):
                 continue
-            globs = impact_floor.floor_for(key, engine.config)[0]
+            try:
+                globs = impact_floor.floor_for(key, engine.config)[0]
+            except impact_floor.MatrixError as err:   # fail LOUD: no judgement is made while the matrix file cannot be read (never read as "no floor")
+                engine._note("impact.error", key, {"error": _one_line(str(err), 160), "floor": "unreadable"})
+                return
             if not globs or seen.get((key, number)) == head or budget <= 0:
                 continue
             retry = seen.get((key, number, "retry"))
@@ -19504,7 +19938,7 @@ def parse_review_block(text):
     if not isinstance(text, str) or not text.strip():
         return None, "no verdict block"
     lines = [l.strip() for l in text.splitlines()]
-    fields = {"verdict": None, "head": None, "impact_action": None, "blocks": 0, "notes": 0, "findings": 0}
+    fields = {"verdict": None, "head": None, "impact_action": None, "impact_class": None, "blocks": 0, "notes": 0, "findings": 0}
     started = False
     for line in lines:
         if line.startswith("verdict:") and not started:
@@ -19513,6 +19947,8 @@ def parse_review_block(text):
             fields["head"] = line.split(":", 1)[1].strip()
         elif started and line.startswith("impact-action:"):
             fields["impact_action"] = line.split(":", 1)[1].strip()
+        elif started and line.startswith("impact-class:"):
+            fields["impact_class"] = line.split(":", 1)[1].strip().lower()
         elif started and line.startswith("- "):
             parts = [p.strip() for p in line[2:].split("|")]
             if len(parts) >= 2 and parts[1] in ("block", "note"):
@@ -19532,7 +19968,12 @@ def parse_review_block(text):
         return None, "the block has no `head: <sha>` line: say which commit was judged"
     if fields["impact_action"] not in (None, "hold", "second-review", "none"):
         return None, "`impact-action:` must be hold, second-review or none"
+    if fields["impact_class"] is not None and not IMPACT_CLASS_RE.fullmatch(fields["impact_class"]):
+        return None, "`impact-class:` must be one lower-case word naming the class of the impact (see the matrix file's classes)"
     return fields, None
+
+
+IMPACT_CLASS_RE = re.compile(r"[a-z][a-z-]{0,31}")
 
 
 def cmd_review(args, runner, now):
@@ -19579,6 +20020,7 @@ def cmd_review(args, runner, now):
                 raise ReviewError("refused: %s" % why)
             args.verdict, args.head, args.blocks, args.notes, args.impact_action = (fields["verdict"], fields["head"], fields["blocks"],
                                                                                     fields["notes"], fields["impact_action"])
+            args.impact_class = args.impact_class or fields["impact_class"]
         if args.verdict not in plan_ledger.REVIEW_VERDICTS:
             raise ReviewError("--verdict must be one of %s (or give --block with the reviewer's returned text)" % ", ".join(plan_ledger.REVIEW_VERDICTS))
         for name in ("blocks", "notes"):
@@ -19590,6 +20032,11 @@ def cmd_review(args, runner, now):
             raise ReviewError("request-changes needs at least 1 blocking finding (a finding that cites no rule never blocks)")
         if args.impact_action and args.reviewer != "impact":
             raise ReviewError("--impact-action belongs to the impact reviewer")
+        impact_class = (getattr(args, "impact_class", None) or "").strip().lower() or None
+        if impact_class is not None and args.reviewer != "impact":
+            raise ReviewError("--impact-class belongs to the impact reviewer")
+        if impact_class is not None and not IMPACT_CLASS_RE.fullmatch(impact_class):
+            raise ReviewError("impact-class must be one lower-case word naming the class of the impact (see the matrix file's classes), got %r" % impact_class[:40])
         if not head or not re.fullmatch(r"[0-9a-f]{40}", head):
             raise ReviewError("the PR head is unknown: nothing was recorded")
         given = args.head or head
@@ -19604,6 +20051,8 @@ def cmd_review(args, runner, now):
                  "summary": plan_ledger.clip(redact_command_text(args.summary or ""), 200)}
         if args.impact_action:
             entry["impact_action"] = args.impact_action
+        if impact_class:
+            entry["impact_class"] = impact_class   # #451 slice 2: the class of the impact that drives the action; a missing one holds for the owner
         stored = plan_ledger.append_entry(state, entry, now())
         if engine.audit is not None:
             engine.audit.append(engine.actor, "review.record", ref, {"reviewer": args.reviewer, "verdict": args.verdict, "head": head[:12],
@@ -19778,6 +20227,7 @@ def add_review_parsers(sub):
     record.add_argument("--notes", type=int, default=0, help="Notes and proposals")
     record.add_argument("--impact-action", dest="impact_action", choices=("hold", "second-review", "none"),
                         help="The impact reviewer's action from the matrix")
+    record.add_argument("--impact-class", dest="impact_class", help="The class of the impact that drives the action (a class of the matrix file's owner_hold block)")
     record.add_argument("--summary", help="One line (at most 200 characters)")
     measure = rsub.add_parser("measure", help="Read-only: per merged PR, time to green CI, review rounds, findings, escaped defects; baseline and after medians")
     measure.add_argument("repo", help="owner/repo")
@@ -23530,6 +23980,11 @@ def build_parser():
     launch.add_argument("--overdue", metavar="WHEN", help="Wake --reports-to at this time if the worker has not "
                         "reported since the launch (60m, or an ISO time with a zone)")
     launch.add_argument("--brief-file", dest="brief_file", help="The first prompt: a file, or - for stdin")
+    launch.add_argument("--cloud", action="store_true", help="Run the worker in the cloud (needs --repo and --branch; --dir is its path in the pod)")
+    launch.add_argument("--branch", help="With --cloud: the branch the worker starts on")
+    launch.add_argument("--idle", help="With --cloud: stop after this long idle (default 10m)")
+    launch.add_argument("--hard", help="With --cloud: stop after this long whatever it does (default 2h)")
+    launch.add_argument("--shape", help="With --cloud: the pod shape, S or M")
     pending = sub.add_parser("pending", help="What is pending for an agent, and why it waits or is held")
     pending.add_argument("name", help="The agent's fleet name")
     pending.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead")

@@ -116,5 +116,87 @@
         "action": "2"
       }
     }
+  },
+  "owner_hold": {
+    "meaning": "Which holds need the owner's own clear. Only a change to credentials, identity or who may do what holds for the owner; every other floor path or rating asks for a second independent review and the usual checks decide the merge. The code reads this block and has no path or class list of its own.",
+    "top_tier_classes": [
+      "credentials",
+      "identity",
+      "authority"
+    ],
+    "other_classes": [
+      "availability",
+      "data",
+      "performance",
+      "correctness",
+      "compatibility",
+      "privacy",
+      "cost"
+    ],
+    "top_tier_paths": {
+      "credentials": [
+        "shims/gh",
+        "shims/git",
+        "cloud/launcher/token_mint.py",
+        "cloud/launcher/cloud_worker.py"
+      ],
+      "identity": [
+        "shims/**",
+        "bin/switchboard-trial"
+      ],
+      "authority": [
+        "bin/plan_ledger.py",
+        "bin/impact_floor.py",
+        "docs/review-laws/impact-matrix.json",
+        "plugins/fleet-hooks/**",
+        "tools/cos-permissions-proof/**",
+        "agents/**",
+        ".github/workflows/**"
+      ]
+    },
+    "narrow_by_diff": {
+      "meaning": "Paths whose hold depends on their CONTENT: an agent definition holds for the owner only when its permission block changes between the base and the head of the pull request (the top level front matter keys named here); an added, removed or unreadable definition holds, and so does a pull request that changes more than max_files of them. The code has no path or key of its own.",
+      "paths": [
+        "agents/**"
+      ],
+      "keys": [
+        "permissions",
+        "permission",
+        "mode",
+        "tools"
+      ],
+      "max_files": 8
+    },
+    "floor": {
+      "adamkaplan/fleet-kit": {
+        "globs": [
+          "shims/**",
+          "plugins/fleet-hooks/**",
+          "templates/**",
+          "tools/cos-permissions-proof/**",
+          "bin/plan_ledger.py",
+          "bin/impact_floor.py",
+          "docs/review-laws/impact-matrix.json"
+        ],
+        "exclude": [
+          "agents/**",
+          "skills/**",
+          "docs/**",
+          "AGENTS.md"
+        ],
+        "force": [
+          "bin/impact_floor.py",
+          "docs/review-laws/impact-matrix.json"
+        ]
+      }
+    },
+    "top_tier_outside_floor": [
+      "agents/**",
+      "cloud/launcher/token_mint.py",
+      "cloud/launcher/cloud_worker.py",
+      ".github/workflows/**",
+      "bin/switchboard-trial"
+    ],
+    "note": "top_tier_outside_floor lists the top tier paths that are deliberately not in the floor globs (the floor excludes agent definitions, which are captain pull requests); a test checks that every other top tier path is inside the floor. bin/fleet-switchboard selects accounts and mints tokens but is not a top tier path (it would hold nearly every change): a change there to credentials or identity must be rated with that class by the independent review."
   }
 }

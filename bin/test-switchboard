@@ -5800,6 +5800,22 @@ class TestLaunch(Base):
         self.assertEqual(session["metadata"]["fleet"]["reports_to"], "platform")
         self.assertEqual(session["messages"][0]["text"], "Do the thing\n")
 
+    def test_a_launch_records_who_ran_it_from_its_pane_and_nobody_from_a_plain_shell(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        for pane, expected in ((self.world.panes["platform"], "platform"), (None, None)):
+            if pane is None:
+                os.environ.pop("HERDR_PANE_ID", None)
+            else:
+                os.environ["HERDR_PANE_ID"] = pane
+            name = "tester-%s" % (expected or "shell")
+            with captured() as (out, err):
+                code = sb.main(["launch", name, "--agent", "coder", "--dir", str(self.work), "--role", "tester", "--reports-to", "platform"],
+                               runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+            self.assertEqual(code, 0, err.getvalue())
+            fleet = self.world.v2.sessions[json.loads(out.getvalue())["session"]]["metadata"]["fleet"]
+            self.assertEqual((fleet["role"], fleet.get("launched_by")), ("tester", expected))
+
     def test_the_cli_without_a_workspace_is_refused(self):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
         os.environ.pop("HERDR_WORKSPACE_ID", None)
@@ -11428,7 +11444,7 @@ class TestCosTriageAllowRule(unittest.TestCase):
                         self.assertNotRegex(l, r'resource: "fleet-switchboard \*"')
                         self.assertNotRegex(l, r'resource: "\*+fleet-switchboard')
 
-    def test_the_switchboard_allow_rules_are_the_fixed_old_list_plus_triage(self):
+    def test_the_switchboard_allow_rules_are_the_fixed_old_list_plus_triage_move_reassign(self):
         old = {
             "chief-of-staff.md": "send report remind intent intents status pending whoami notice decisions orders gates waive plan labels handoff launch reattach relaunch retire disk".split(),
             "cos-subagent.md": "send report remind intent intents status disk pending whoami version notice decisions orders gates waive plan labels".split(),
@@ -11436,7 +11452,7 @@ class TestCosTriageAllowRule(unittest.TestCase):
         for rel in self.FILES:
             with self.subTest(file=rel):
                 got = [m.group(1) for l in self._lines(rel) for m in [re.match(r'  - \{action: shell, resource: "fleet-switchboard ([a-z]+) \*", effect: allow\}$', l)] if m]
-                self.assertEqual(sorted(got), sorted(old[rel.split("/")[-1]] + ["triage"]))
+                self.assertEqual(sorted(got), sorted(old[rel.split("/")[-1]] + ["triage", "move", "reassign"]))
 
 
 class TestVerdictRecordingText(unittest.TestCase):
@@ -11789,8 +11805,10 @@ class TestChatClearOffers(unittest.TestCase):
         source = (Path(sb.__file__).parent / "chat_clear.py").read_text()
         for word in ("subprocess", "urllib", "socket", "change_issue_labels"):
             self.assertNotIn(word, source, "slice 1 reaches nothing: no process, no network, no GitHub write")
+        import ast
         main = (Path(sb.__file__).parent / "fleet-switchboard").read_text()
-        self.assertNotIn("chat_clear", main, "no command or hook calls it yet in this slice (slice 3 adds the one hook and changes this test)")
+        for fn in [n for n in ast.walk(ast.parse(main)) if isinstance(n, ast.FunctionDef) and n.name.startswith("cmd_")]:
+            self.assertNotIn("chat_clear", ast.get_source_segment(main, fn), "%s: no command reaches the chat clear (slice 3's hook is the daemon's alone; TestChatClearHook S7 counts the call sites)" % fn.name)
 
 
 class _StubJev:
@@ -12042,6 +12060,560 @@ class TestChatClearJudge(unittest.TestCase):
         self.assertEqual(got["all impacts cleared"]["judge"]["jev_choice"], "several")
 
 
+class TestChatClearHook(Base):
+    """#457 slice 3: the daemon hook that records the offers, reads the owner's NEW messages in the Chief of Staff's session, judges each once and (only when `chat_clear.live`) clears.
+    Fixtures only: a fake gh records every call, the decisions are written by hand, and nothing real is touched."""
+
+    PR, REPO, NUMBER = "acme/app#9", "acme/app", 9
+    H1, H2 = "a" * 40, "b" * 40
+
+    def setUp(self):
+        super().setUp()
+        self.writes, self.reads, self.t0 = [], 0, None
+        self.live = False
+        self.build()
+
+    def build(self, live=None, extra=None):
+        chat = {"live": self.live if live is None else live}
+        self.writes.clear()
+        for stale in Path(sb.ensure_state_dir(None)).glob("chat-clear*"):
+            stale.unlink()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "chat_clear": chat})   # the owner's file: the hook reads it afresh every pass
+        impact = Path(sb.ensure_state_dir(None)) / sb.IMPACT_STATE_FILE
+        if impact.exists():
+            impact.unlink()
+        self.world = World(self, agents=("cos", "coder"), config=dict({"gh": FAKE_GH, "jev": {"replay": "/fake/replay.json"}, "chat_clear": chat}, **(extra or {})))
+        self.world.v2.sessions[self.world.sessions["cos"]]["metadata"]["fleet"]["role"] = "chief-of-staff"
+        self.engine = self.world.new_engine("daemon")
+        self.engine.gh_runner, self.engine.state_dir = self.route, self.world.state
+        self.names = sb.label_names(self.engine.config)
+        self.jev = self.engine.jev = FakeJev(self.picks(self.PR, 0.97))
+        self.pr = {"state": "OPEN", "headRefOid": self.H1, "title": "t", "labels": [{"name": self.names["merge-captain"]}, {"name": self.names["hold-impact"]}]}
+        self.engine.discover(self.world.clock.now())
+
+    def picks(self, option, top=0.97):
+        def answer(state, questions):
+            criteria = list(questions["clears"]["criteria"])
+            rest = [o for o in criteria if o != option]
+            probabilities = {option: top}
+            probabilities.update({o: (1 - top) / len(rest) for o in rest})
+            return {"clears": {"type": "choice", "choice": option, "probabilities": probabilities}}
+        return answer
+
+    def route(self, argv, **kwargs):
+        if argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"]:
+            self.reads += 1
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self.pr), "")
+        if argv[0] == FAKE_GH and "--method" in argv:
+            method = argv[argv.index("--method") + 1]
+            if method == "GET":
+                return subprocess.CompletedProcess(argv, 0, "{}", "")
+            self.writes.append((method, argv[2], json.loads(kwargs["input"]) if kwargs.get("input") else None))
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+        return self.world.route(argv, **kwargs)
+
+    def decisions(self, head=None, holds=("impact",), number=None, repo=None, kind="captain"):
+        return [{"kind": kind, "repo": repo or self.REPO, "number": number or self.NUMBER, "head": head or self.H1, "holds": list(holds),
+                 "headline": "#9 changes the migrations", "review_evidence": "reviewed at aaaaaaaa by rev"}]
+
+    def hook(self, decisions=None):
+        self.engine.discover(self.world.clock.now())
+        sb.chat_clear_pass(self.engine, self.decisions() if decisions is None else decisions, self.world.clock.now())
+
+    def say(self, text, lasts=0, **kw):
+        self.world.tick(5)
+        self.world.v2.start_turn(self.world.sessions["cos"], text, fleet=False, lasts=lasts, **kw)
+
+    def shown_then_say(self, text, decisions=None):
+        self.hook(decisions)            # the offer is recorded (shown) first
+        self.say(text)
+        self.hook(decisions)
+
+    def events(self, name):
+        return [e for e in self.world.audit() if e["event"] == name]
+
+    def label_deletes(self):
+        return sorted(w[1].rsplit("/", 1)[1].replace("%3A", ":") for w in self.writes if w[0] == "DELETE")
+
+    def comments(self):
+        return [w for w in self.writes if w[1].endswith("/comments")]
+
+    def cos_texts(self):
+        return [a["text"] for a in self.world.admissions("cos") if "chat clear" in a["text"]]
+
+    def test_s1_live_a_confirmed_clear_is_made_at_the_shown_head_and_quotes_his_words_in_the_comment_the_audit_and_the_reply(self):
+        self.live = True
+        self.build()
+        self.shown_then_say("9 is good to go")
+        self.assertEqual(self.label_deletes(), sorted([self.names["hold-impact"], self.names["merge-captain"]]))
+        self.assertEqual([w for w in self.writes if w[0] == "POST" and w[1].endswith("/labels")], [], "a clear never ADDS a label")
+        (comment,) = self.comments()
+        self.assertIn("9 is good to go", comment[2]["body"])
+        self.assertIn("`%s`" % self.H1[:8], comment[2]["body"])
+        (cleared,) = self.events("gate.hold_cleared")
+        self.assertEqual((cleared["detail"]["head"], cleared["detail"]["reason"], cleared["detail"]["by"]), (self.H1, "9 is good to go", "owner (chat)"))
+        self.assertTrue(cleared["detail"]["via"].startswith("chat:"))
+        (verdict,) = [e for e in self.events("chat_clear.verdict") if e["detail"]["action"] == "clear"]
+        self.assertEqual((verdict["detail"]["quote"], verdict["detail"]["live"], verdict["detail"]["would_clear"]), ("9 is good to go", True, True))
+        self.assertTrue(any("Cleared acme/app#9" in t and "9 is good to go" in t for t in self.cos_texts()), self.cos_texts())
+        self.assertEqual(sb.read_impact_state(self.world.state)[0]["clears"][self.PR]["head"], self.H1, "the head-bound state stops the daemon re-adding it")
+
+    def test_s2_the_default_is_shadow_the_verdict_is_logged_with_probabilities_and_nothing_is_written_or_sent(self):
+        self.shown_then_say("9 is good to go")
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.cos_texts(), [])
+        self.assertEqual(self.events("gate.hold_cleared"), [])
+        (verdict,) = self.events("chat_clear.verdict")
+        detail = verdict["detail"]
+        self.assertEqual((detail["live"], detail["would_clear"], detail["action"], detail["quote"]), (False, True, "clear", "9 is good to go"))
+        self.assertGreaterEqual(detail["probabilities"][self.PR], 0.9)
+        self.assertEqual(sb.chat_clear_config({}), {"enabled": True, "live": False})
+        for value in ("yes", 1, None, "true", [True]):
+            self.assertEqual(sb.chat_clear_config({"chat_clear": {"live": value}}), {"enabled": True, "live": False}, "only a real true is live: %r" % (value,))
+        self.assertEqual(sb.chat_clear_config({"chat_clear": {"live": True}}), {"enabled": True, "live": True})
+        self.assertEqual(sb.chat_clear_config({"chat_clear": {"enabled": False, "live": True}}), {"enabled": False, "live": True})
+        for bad in ({"live": "true"}, {"live": 1}, {"other": True}, [True], "live"):
+            with self.assertRaises(sb.ConfigError, msg=bad):
+                sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "chat_clear": bad})
+        self.assertEqual(sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "chat_clear": {"live": True}})["chat_clear"], {"live": True})
+
+    def test_s12_in_shadow_an_unsure_message_is_logged_once_and_nothing_is_sent(self):
+        self.jev.rule = self.picks(self.PR, 0.6)
+        self.hook()
+        self.say("9 is good to go")
+        for _ in range(3):
+            self.hook()
+            self.world.tick(5)
+        (verdict,) = self.events("chat_clear.verdict")
+        self.assertEqual((verdict["detail"]["action"], verdict["detail"]["live"], verdict["detail"]["why"]), ("ask", False, "jev"))
+        self.assertIn("unsure", verdict["detail"]["reason"])
+        self.assertEqual((self.writes, self.cos_texts()), ([], []))
+        self.assertEqual(len(self.jev.calls), 1)
+
+    def test_s3_the_same_words_from_an_agent_or_with_fleet_metadata_are_never_read_and_cost_no_call(self):
+        self.live = True
+        self.build()
+        self.hook()
+        self.world.tick(5)
+        self.world.v2.start_turn(self.world.sessions["cos"], "9 is good to go", fleet=True, lasts=0)
+        self.hook()
+        self.assertEqual((self.jev.calls, self.writes, self.events("chat_clear.verdict")), ([], [], []))
+        cc = sb.load_module("chat_clear")
+        for message in ({"id": "a1", "type": "assistant", "text": "9 is good to go", "time": {"created": 1}}, {"id": "a2", "type": "user", "content": [{"type": "tool_result", "text": "9 is good to go"}]},
+                        {"id": "a3", "type": "synthetic", "text": "9 is good to go"}, {"id": "a4", "role": "assistant", "type": "user", "text": "9 is good to go"}):
+            self.assertEqual(cc.person_messages([message], set(), 100, lambda m: 99), [], message)
+
+    def test_s4_unsure_several_hedged_unreachable_and_another_pr_write_nothing_and_ask_once_per_message(self):
+        self.live = True
+        for text, rule, fragment in (("all impacts cleared", self.picks("several", 0.95), "names no pull request number"), ("9 is good to go once CI passes", self.picks(self.PR, 0.99), "not a plain clearing sentence"),
+                                     ("9 is good to go", self.picks(self.PR, 0.6), "could not be sure"), ("9 is good to go", None, "could not be sure"),
+                                     ("9 is good to go", self.picks("acme/app#10", 0.99), "could not be sure")):
+            with self.subTest(text=text, fragment=fragment):
+                self.build()
+                verdicts_before = len(self.events("chat_clear.verdict"))
+                self.jev.rule = rule
+                decisions = self.decisions() + self.decisions(number=10)
+                self.shown_then_say(text, decisions)
+                self.assertEqual(self.writes, [])
+                (asked,) = self.cos_texts()
+                self.assertIn(fragment, asked)
+                self.assertIn("acme/app#9", asked)
+                for _ in range(3):
+                    self.world.tick(5)
+                    self.hook(decisions)
+                self.assertEqual(len(self.cos_texts()), 1, "one question per message, however many passes")
+                self.assertEqual(len(self.events("chat_clear.verdict")) - verdicts_before, 1)
+
+    def test_s5_a_push_after_the_offer_clears_nothing_and_the_question_shows_the_new_head(self):
+        self.live = True
+        self.build()
+        self.hook()
+        self.say("9 is good to go")
+        self.pr["headRefOid"] = self.H2   # the push
+        self.hook(self.decisions(head=self.H2))
+        self.assertEqual(self.writes, [])
+        (asked,) = self.cos_texts()
+        self.assertIn("new head since you were shown it", asked)
+        self.assertIn(self.H2[:8], asked)
+        (verdict,) = self.events("chat_clear.verdict")
+        self.assertEqual((verdict["detail"]["action"], verdict["detail"]["why"]), ("ask", "head_changed"))
+        self.assertEqual(sb.load_module("chat_clear").read_offers(self.world.state)[self.PR]["head"], self.H2, "the question put the new head in front of him")
+        self.say("9 also good to go")
+        self.hook(self.decisions(head=self.H2))
+        self.assertEqual(self.label_deletes(), sorted([self.names["hold-impact"], self.names["merge-captain"]]), "after he was shown the new head, his next words clear it")
+        self.assertEqual(sb.read_impact_state(self.world.state)[0]["clears"][self.PR]["head"], self.H2, "the state is bound to the head he was shown and GitHub confirmed")
+
+    def test_s5b_a_head_that_moves_between_the_decision_and_the_effect_is_refused_at_the_point_of_effect(self):
+        self.live = True
+        self.build()
+        self.hook()
+        self.say("9 is good to go")
+        self.pr["headRefOid"] = self.H2   # GitHub's head moved after the daemon's picture was made
+        self.hook()
+        self.assertEqual(self.label_deletes(), [])
+        self.assertEqual(len(self.events("chat_clear.failed")), 1)
+        (asked,) = self.cos_texts()
+        self.assertIn("no longer held for you or its labels changed", asked)
+        self.assertEqual(sb.read_impact_state(self.world.state)[0]["clears"], {})
+
+    def test_s6_only_owner_tier_hold_labels_and_the_captain_marker_are_removed_and_another_hold_is_never_offered_or_touched(self):
+        self.live = True
+        self.build()
+        self.pr["labels"] = [{"name": self.names["hold-credential"]}, {"name": self.names["parked"]}, {"name": "bug"}]
+        self.shown_then_say("9 is good to go", self.decisions(holds=("credential",)))
+        self.assertEqual(self.label_deletes(), [self.names["hold-credential"]], "the credential hold goes; parked, bug and the rest stay")
+        self.build()
+        self.pr["labels"] = [{"name": self.names["hold-impact"]}, {"name": self.names["hold-security"]}, {"name": self.names["merge-captain"]}]
+        self.shown_then_say("9 is good to go", self.decisions(holds=("impact", "security")))
+        self.assertEqual(self.writes, [], "a PR that also has another hold label is never offered, so never touched")
+        self.assertEqual(self.jev.calls, [], "and with nothing offered nothing is judged")
+        self.build()
+        self.pr["labels"] = [{"name": self.names["parked"]}]
+        self.shown_then_say("9 is good to go", self.decisions(holds=()))   # a row with no owner-tier label
+        self.assertEqual(self.writes, [], "his words name it, but at the point of effect it carries no owner-tier label: refused, nothing removed")
+        self.assertEqual(len(self.events("chat_clear.failed")), 1)
+
+    def test_s7_nothing_but_the_daemons_publish_calls_the_hook_and_no_command_takes_text_as_the_owners_word(self):
+        import ast
+        tree = ast.parse((Path(sb.__file__)).read_text())
+        callers = {}
+        for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+            for call in [c for c in ast.walk(fn) if isinstance(c, ast.Call)]:
+                name = call.func.id if isinstance(call.func, ast.Name) else None
+                if name in ("chat_clear_pass", "_chat_clear_act", "chat_clear_apply", "_chat_clear_pass"):
+                    callers.setdefault(name, set()).add(fn.name)
+        self.assertEqual(callers, {"chat_clear_pass": {"publish_decisions"}, "_chat_clear_pass": {"chat_clear_pass"}, "_chat_clear_act": {"_chat_clear_pass"}, "chat_clear_apply": {"_chat_clear_act"}})
+        self.assertFalse([n for n in callers if any(f.startswith("cmd_") for f in callers[n])], "no command calls the chat clear")
+        self.live = True
+        self.build(live=True)
+        self.hook()
+        self.say("9 is good to go")
+        cli = self.world.new_engine("cli")   # a command's engine with everything else the daemon's has: only the actor differs
+        cli.gh_runner, cli.jev, cli.state_dir, cli.discovery = self.route, self.jev, self.world.state, self.engine.discovery
+        cli.audit = self.engine.audit
+        self.assertEqual(cli.actor, "cli")
+        sb.chat_clear_pass(cli, self.decisions(), self.world.clock.now())
+        self.assertEqual((self.writes, self.jev.calls), ([], []), "only the daemon's engine runs it")
+        sb.chat_clear_pass(self.engine, self.decisions(), self.world.clock.now())
+        self.assertEqual(len(self.jev.calls), 1, "the same state with the daemon's actor does run")
+
+    def test_s8_the_quote_is_one_line_at_most_300_characters_with_no_control_characters_and_no_secret(self):
+        self.live = True
+        self.build()
+        self.hook()
+        self.say("9 is good to go" + " ok" * 200)   # a plain sentence that passes the floor and is far over the quote limit
+        self.hook()
+        (comment,) = self.comments()
+        (cleared,) = self.events("gate.hold_cleared")
+        (verdict,) = self.events("chat_clear.verdict")
+        self.assertEqual(verdict["detail"]["action"], "clear", "the long plain sentence passed the floor")
+        for text in (cleared["detail"]["reason"], verdict["detail"]["quote"]):
+            self.assertLessEqual(len(text), 300)
+            self.assertTrue(text.startswith("9 is good to go ok ok"))
+            self.assertNotIn("\n", text)
+        # a message that is refused still has its words quoted, with control characters and secret-like strings taken out, in the log and in the reply
+        self.build()
+        token = "ghp_" + "A1b2C3d4" * 4
+        self.hook()
+        self.say("9 is good to go %s \x1b[31m\n\t once CI passes" % token)   # the secret sits inside the first 300 characters
+        self.hook()
+        self.assertEqual(self.writes, [])
+        (refused,) = self.events("chat_clear.verdict")[-1:]
+        self.assertEqual(refused["detail"]["action"], "ask")
+        self.assertIn("[secret]", refused["detail"]["quote"])
+        self.assertNotIn(token, refused["detail"]["quote"])
+        for text in (json.dumps(self.events("chat_clear.verdict")), "\n".join(self.cos_texts())):
+            self.assertNotIn(token, text)
+            self.assertNotIn("\x1b", text)
+        self.assertIn("[secret]", "\n".join(self.cos_texts()))
+        # an @mention or a code span in his words never renders in the public comment
+        self.build()
+        self.hook()
+        self.say("9 is good to go @someone `x`")
+        self.hook()
+        self.assertEqual(self.comments(), [], "the floor refuses the @ and the backtick: nothing is cleared or commented")
+        cc = sb.load_module("chat_clear")
+        self.assertEqual(cc.quote("a @b `c`"), "a @b `c`")
+        self.build(live=True)
+        self.hook()
+        sb.chat_clear_apply(self.engine, cc, self.PR, sb.load_module("chat_clear").read_offers(self.world.state)[self.PR], "ok @someone `x`", "m1", self.world.clock.now())
+        (comment,) = self.comments()
+        self.assertNotIn("@someone", comment[2]["body"])
+        self.assertNotIn("`x`", comment[2]["body"])
+
+    def test_s9_with_nothing_held_nothing_is_read_or_asked_and_each_message_is_judged_once_across_passes_and_restarts(self):
+        self.live = True
+        self.build()
+        self.say("9 is good to go")
+        self.hook(decisions=[])
+        self.assertEqual((self.jev.calls, self.events("chat_clear.verdict")), ([], []), "no offer: his messages are not even read")
+        self.world.v2.sessions[self.world.sessions["cos"]]["messages"].clear()
+        self.hook()
+        self.say("all impacts cleared")
+        for _ in range(4):
+            self.hook()
+        self.assertEqual(len(self.jev.calls), 1, "ONE Jev call for the one new message, however many passes")
+        self.engine = self.world.new_engine("daemon")   # a restart: the handled messages are remembered on disk
+        self.engine.gh_runner, self.engine.jev, self.engine.state_dir = self.route, self.jev, self.world.state
+        self.hook()
+        self.assertEqual(len(self.jev.calls), 1, "and not again after a restart")
+        self.assertEqual(len(self.cos_texts()), 1)
+        for n in range(5):
+            self.say("is 9 good to go %d" % n)
+        self.hook()
+        self.assertEqual(len(self.jev.calls), 1 + sb.CHAT_CLEAR_NEW_PER_PASS, "exactly the cap of new messages is judged in one pass")
+
+    def test_s10_a_clear_stays_for_its_head_and_the_daemon_judges_a_new_head_again(self):
+        self.live = True
+        self.build()
+        self.shown_then_say("9 is good to go")
+        state = sb.read_impact_state(self.world.state)[0]
+        self.assertEqual(state["clears"][self.PR]["head"], self.H1)
+        report = {"pr": self.PR, "head": self.H1, "reasons": ["x"], "floor_paths": [], "globs": []}
+        self.assertEqual(sb.apply_impact_hold(self.engine, self.REPO, 9, report, {"labels": []}), 0, "the same head: the daemon does not re-add the hold")
+        self.assertEqual([w for w in self.writes if w[0] == "POST"], [w for w in self.writes if w[1].endswith("/comments")])
+        self.assertGreater(sb.apply_impact_hold(self.engine, self.REPO, 9, dict(report, head=self.H2), {"labels": []}), 0, "a new head is judged and held again")
+
+    def test_s11_the_core_removes_only_owner_tier_labels_and_refuses_anything_else_or_a_moved_head(self):
+        self.build(live=True)
+        with self.assertRaises(RuntimeError):
+            sb.impact_clear_core(self.engine, self.route, self.REPO, 9, "owner (chat)", "x" * 12, remove=[self.names["parked"]])
+        with self.assertRaises(RuntimeError):
+            sb.impact_clear_core(self.engine, self.route, self.REPO, 9, "owner (chat)", "x" * 12, remove=[self.names["hold-impact"], "bug"])
+        with self.assertRaises(RuntimeError):
+            sb.impact_clear_core(self.engine, self.route, self.REPO, 9, "owner (chat)", "x" * 12, remove=[])
+        with self.assertRaises(sb.NoticeError):
+            sb.impact_clear_core(self.engine, self.route, self.REPO, 9, "owner (chat)", "x" * 12, remove=[self.names["hold-impact"]], head=self.H2)
+        self.assertEqual(self.writes, [])
+        self.assertEqual(sb.read_impact_state(self.world.state)[0]["clears"], {}, "a refused clear leaves no state")
+        for label in ("hold-impact", "hold-credential", "hold-policy", "merge-captain"):
+            self.writes.clear()
+            sb.impact_clear_core(self.engine, self.route, self.REPO, 9, "owner (chat)", "x" * 12, remove=[self.names[label]], head=self.H1)
+            self.assertEqual(self.label_deletes(), [self.names[label]])
+
+    def test_a_hold_label_added_or_a_close_between_the_two_reads_is_refused_by_the_core_on_the_read_it_clears_from(self):
+        self.live = True
+        for change in ({"labels": lambda names: [{"name": names["hold-impact"]}, {"name": names["hold-security"]}]}, {"state": lambda names: "CLOSED"}):
+            self.build()
+            self.hook()
+            self.say("9 is good to go")
+            reads = {"n": 0}
+            real = self.route
+
+            def second_read_differs(argv, **kwargs):
+                if argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"]:
+                    reads["n"] += 1
+                    if reads["n"] == 2:
+                        changed = dict(self.pr, **{k: f(self.names) for k, f in change.items()})
+                        return subprocess.CompletedProcess(argv, 0, json.dumps(changed), "")
+                return real(argv, **kwargs)
+
+            self.engine.gh_runner = second_read_differs
+            self.hook()
+            self.assertEqual(self.writes, [], change)
+            self.assertEqual(reads["n"], 2, "the pre-read and the core's own read")
+            self.assertEqual(sb.read_impact_state(self.world.state)[0]["clears"], {}, "no clear state for a refused clear")
+            (failed,) = self.events("chat_clear.failed")[-1:]
+            self.assertIn("changed since the owner was shown it" if "labels" in change else "is not open any more", failed["detail"]["error"], change)
+            self.assertIn("no longer held for you", "\n".join(self.cos_texts()), change)
+
+    def test_a_failed_point_of_effect_read_refuses_and_the_read_goes_through_the_repos_own_account_for_the_current_head(self):
+        self.live = True
+        self.build()
+        self.hook()
+        self.say("9 is good to go")
+        real = self.route
+
+        def failing(argv, **kwargs):
+            if argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"]:
+                return subprocess.CompletedProcess(argv, 1, "", "HTTP 502")
+            return real(argv, **kwargs)
+
+        self.engine.gh_runner = failing
+        self.hook()
+        self.assertEqual(self.writes, [])
+        self.assertEqual(sb.read_impact_state(self.world.state)[0]["clears"], {})
+        self.assertEqual(len(self.events("chat_clear.failed")), 1, "a read that fails refuses the clear: one question, no write")
+        seen = []
+        self.build(live=True)
+        self.engine.accounts = sb.GhAccounts({"gh": FAKE_GH, "call_timeout_seconds": 5, "gh_users": {"acme/*": "acct-app"}}, lambda argv, **k: subprocess.CompletedProcess(argv, 0, "tok-app\n", ""), self.world.clock.now, environ={})
+        real = self.route
+
+        def watching(argv, **kwargs):
+            if argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"]:
+                seen.append(kwargs.get("env", {}).get("GH_TOKEN"))
+            return real(argv, **kwargs)
+
+        self.engine.gh_runner = watching
+        self.hook()
+        self.say("9 is good to go")
+        self.hook()
+        self.assertTrue(seen and all(token == "tok-app" for token in seen), "every point-of-effect read runs as the repo's own account: %r" % seen)
+        self.assertEqual(len(seen), 2, "one pre-read and the core's own read, nothing from memory")
+
+    def live_verdicts(self):
+        return [e["detail"]["live"] for e in self.events("chat_clear.verdict")]
+
+    def test_live_is_confirmed_by_the_current_config_file_every_pass_and_an_invalid_file_or_the_kill_file_means_shadow_at_once(self):
+        self.live = True
+        valid = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH}
+        cases = ((dict(valid, chat_clear={"live": True}), True), (dict(valid, chat_clear={"live": False}), False), (dict(valid), False), (dict(valid, chat_clear={"live": "true"}), False),
+                 (dict(valid, chat_clear={"live": 1}), False), (dict(valid, chat_clear=None), False), (dict(valid, chat_clear={"live": True, "enabled": False}), False),
+                 ("{not json", False), (dict(valid, chat_clear={"live": True, "other": 1}), False), (dict(valid, github_poll_seconds=-5, chat_clear={"live": True}), False))
+        for file, live in cases:
+            self.build()                       # this daemon runs on a config that says live
+            self.write_config(file)            # ... and the file on disk now says something else
+            self.hook()
+            self.say("9 is good to go")
+            self.hook()
+            (verdict,) = self.events("chat_clear.verdict")[-1:]
+            self.assertEqual(verdict["detail"]["live"], live, file)
+            self.assertEqual(bool(self.label_deletes()), live, "labels are removed only while the current file confirms live: %r" % (file,))
+            self.assertEqual(bool(self.cos_texts() or self.writes), live)
+
+    def test_a_config_that_becomes_invalid_while_live_is_shadow_in_the_next_pass_and_says_so_once_and_the_kill_file_is_the_panic_stop(self):
+        self.live = True
+        self.build()
+        self.hook()
+        self.assertEqual([e["detail"]["mode"] for e in self.events("chat_clear.mode")], [], "live from the first pass: nothing to announce")
+        self.write_config("{broken")
+        self.hook()
+        self.hook()
+        modes = self.events("chat_clear.mode")
+        self.assertEqual([m["detail"]["mode"][:23] for m in modes], ["shadow (config invalid: "[:23]], "said ONCE, loudly")
+        self.assertIn("config invalid: ", modes[0]["detail"]["mode"])
+        self.assertTrue(modes[0]["detail"]["why"].startswith("config invalid: "), "and the reason is said, so the owner knows what to fix")
+        self.say("9 is good to go")
+        self.hook()
+        self.assertEqual((self.writes, self.live_verdicts()), ([], [False]))
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "chat_clear": {"live": True}})
+        self.say("9 also good to go")
+        self.hook()
+        self.assertEqual(self.live_verdicts(), [False, True], "a valid file that says live puts it back")
+        self.assertEqual(self.events("chat_clear.mode")[-1]["detail"]["mode"], "live")
+        # the kill file
+        self.build()
+        self.hook()
+        (Path(self.world.state) / sb.CHAT_CLEAR_OFF_FILE).write_text("")
+        self.say("9 is good to go")
+        self.hook()
+        self.assertEqual((self.writes, self.live_verdicts()[-1:]), ([], [False]), "the kill file forces shadow")
+        self.assertEqual(self.events("chat_clear.mode")[-1]["detail"]["mode"], "shadow (kill file)")
+        (Path(self.world.state) / sb.CHAT_CLEAR_OFF_FILE).unlink()
+        os.symlink("/nonexistent/chat-clear-target", str(Path(self.world.state) / sb.CHAT_CLEAR_OFF_FILE))   # a DANGLING symlink is still the panic stop
+        self.say("9 also good to go")
+        self.hook()
+        self.assertEqual(self.live_verdicts()[-1:], [False], "a dangling symlink kill file reads as present")
+        self.assertEqual(self.events("chat_clear.mode")[-1]["detail"]["mode"], "shadow (kill file)")
+        (Path(self.world.state) / sb.CHAT_CLEAR_OFF_FILE).unlink()
+        self.say("9 is also good to go")
+        self.hook()
+        self.assertEqual(self.live_verdicts()[-1:], [True], "removed: back to the config's value")
+        self.assertEqual(bool(self.label_deletes()), True)
+
+    def test_a_kill_file_or_a_broken_config_that_appears_between_two_messages_of_one_pass_stops_the_second_one(self):
+        self.live = True
+        self.build()
+        self.hook()
+        self.say("all impacts cleared")
+        self.world.tick(1)
+        self.world.v2.start_turn(self.world.sessions["cos"], "9 is good to go", fleet=False, lasts=0)
+        order = []
+        real_act = sb._chat_clear_act
+
+        def spy(engine, cc_, cfg, message, verdict, offers, heads, now):
+            order.append((message["text"], cfg["live"]))
+            if len(order) == 1:
+                (Path(self.world.state) / sb.CHAT_CLEAR_OFF_FILE).write_text("")   # the stop is hit after the first message was handled
+            return real_act(engine, cc_, cfg, message, verdict, offers, heads, now)
+
+        with mock.patch.object(sb, "_chat_clear_act", spy):
+            self.hook()
+        self.assertEqual([live for _, live in order], [True, False], "the second message of the same pass is judged shadow: %r" % order)
+        self.assertEqual(self.label_deletes(), [], "nothing was cleared by the second message")
+        self.build()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "chat_clear": {"live": True}})
+        Path(self.config_file).unlink()
+        self.hook()
+        self.say("9 is good to go")
+        self.hook()
+        self.assertEqual((self.writes, self.live_verdicts()[-1:]), ([], [False]), "a config file that is gone is not live")
+
+    def test_the_hook_fails_quietly_and_never_clears_on_trouble(self):
+        self.live = True
+        self.build()
+        self.hook()
+        self.say("9 is good to go")
+        with mock.patch.object(sb.load_module("chat_clear"), "decide", side_effect=RuntimeError("boom")):
+            self.hook()
+        self.assertEqual(self.writes, [])
+        self.assertEqual(len(self.events("chat_clear.error")), 1, "an exception in the pass is audited and swallowed, never raised")
+        self.build(live=True)
+        self.hook()
+        self.say("9 is good to go")
+        with mock.patch.object(self.engine, "send", side_effect=RuntimeError("down")):
+            self.hook()
+        self.assertEqual(self.label_deletes(), sorted([self.names["hold-impact"], self.names["merge-captain"]]), "the clear is made; a reply that cannot be sent is audited")
+        self.assertEqual(len(self.events("chat_clear.reply_failed")), 1)
+        self.build(live=True)
+        self.hook()
+        self.say("9 is good to go")
+        cleared_before = len(self.events("gate.hold_cleared"))
+        with mock.patch.object(sb, "comment_as", side_effect=RuntimeError("no comment")):
+            self.hook()
+        self.assertEqual(len(self.events("chat_clear.comment_failed")), 1)
+        self.assertEqual(len(self.events("gate.hold_cleared")) - cleared_before, 1, "the clear stands; only the comment failed")
+
+    def test_enabled_false_and_v2_light_read_nothing_and_judge_nothing(self):
+        self.live = True
+        self.build(extra={"chat_clear": {"live": True, "enabled": False}})
+        self.hook()
+        self.say("9 is good to go")
+        self.hook()
+        self.assertEqual((self.jev.calls, self.writes, self.events("chat_clear.offers")), ([], [], []))
+        self.build(live=True)
+        self.hook()
+        self.say("9 is good to go")
+        self.engine.light = True
+        self.hook()
+        self.assertEqual((self.jev.calls, self.writes), ([], []), "v2_light: no background read of his session")
+        self.engine.light = False
+        self.hook()
+        self.assertEqual(len(self.jev.calls), 1, "the message was not lost: it is read when the light mode ends")
+        for bad in ({"enabled": "no"}, {"enabled": 0, "live": False}):
+            with self.assertRaises(sb.ConfigError, msg=bad):
+                sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "chat_clear": bad})
+
+    def test_the_seen_file_is_private_bounded_and_empty_when_damaged(self):
+        cc = sb.load_module("chat_clear")
+        state = self.world.state
+        path = Path(state) / cc.SEEN_FILE
+        self.assertEqual(cc.read_seen(state), {})
+        cc.mark_seen(state, "m1", 100)
+        self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
+        self.assertEqual(cc.read_seen(state), {"m1": 100})
+        for body in ("{not json", json.dumps([1]), json.dumps({"seen": 5}), " " * (cc.SEEN_MAX_BYTES + 1)):
+            path.write_text(body)
+            self.assertEqual(cc.read_seen(state), {}, body[:12])
+        path.write_text(json.dumps({"seen": {"ok": 5, "bool": True, "str": "x", "": 1, "x" * 300: 2, "neg": None}}))
+        self.assertEqual(cc.read_seen(state), {"ok": 5}, "a bad entry is dropped on its own")
+        for n in range(cc.SEEN_MAX + 20):
+            cc.mark_seen(state, "id%d" % n, 1000 + n)
+        kept = cc.read_seen(state)
+        self.assertEqual(len(kept), cc.SEEN_MAX)
+        self.assertIn("id%d" % (cc.SEEN_MAX + 19), kept)
+        self.assertNotIn("id0", kept, "the oldest go first")
+        self.assertEqual(sorted(p.name for p in Path(state).iterdir() if p.name.startswith(cc.SEEN_FILE + ".")), [], "no temporary file is left")
+
+    def test_u1_the_existing_clear_without_the_new_arguments_is_what_it_was(self):
+        self.build(live=True)
+        lines = sb.impact_clear_core(self.engine, self.route, self.REPO, 9, "the owner", "a false hold: the file is a fixture")
+        self.assertEqual(self.label_deletes(), [self.names["hold-impact"]], "no state says the switchboard added merge-captain: only hold-impact goes")
+        self.assertIn("cleared the impact hold of acme/app#9", lines[0])
+        (cleared,) = self.events("gate.hold_cleared")
+        self.assertNotIn("via", cleared["detail"])
+
+
 class TestHeadlessPresence(Base):
     """#433 slice 2: a worker with NO terminal. Its state comes from the OpenCode service alone (bin/agent_presence.py); discovery lists it with the
     pane `(headless)`; a delivery to it is not held; a service that does not answer makes it `unknown`, never dead and never working."""
@@ -12282,6 +12854,13 @@ class TestHeadlessPresence(Base):
         args = dict(name="hw", agent="coder", directory=str(self.home), role="coder", reports_to="boss", issue=9, brief="Add a health check")
         args.update(overrides)
         return sb.launch_headless(self.engine, **args)
+
+    def test_a_headless_launch_records_who_ran_it_so_a_headless_tester_can_count_for_its_orchestrator(self):
+        done = self.launch_hl(name="hw-tst", role="tester", launched_by="boss")
+        fleet = self.world.v2.sessions[done["session"]]["metadata"]["fleet"]
+        self.assertEqual((fleet["role"], fleet["reports_to"], fleet.get("launched_by")), ("tester", "boss", "boss"))
+        plain = self.launch_hl(name="hw-plain", role="tester")                       # launched from a plain shell: nobody, so it never counts
+        self.assertNotIn("launched_by", self.world.v2.sessions[plain["session"]]["metadata"]["fleet"])
 
     def test_launch_headless_creates_the_session_and_its_record_sends_the_brief_and_opens_no_terminal(self):
         panes_before, calls_before, sessions_before = dict(self.world.herdr.panes), list(self.world.herdr.socket_calls), set(self.world.v2.sessions)
@@ -20925,6 +21504,81 @@ class TestIdentityCheck(ReportBase):
         self.assertTrue(self.shim().is_write(["auth", "git-credential", "get"]))
         self.assertFalse(self.shim().is_write(["auth", "status"]))
 
+    def test_the_credential_route_of_a_caller_with_no_repository_of_its_own_is_refused_whatever_the_verb_and_names_the_fix(self):
+        """#473 S5: git push, fetch, pull and clone all reach the shim as `gh auth git-credential <action>` (TestGitShim S1 proves the routing). A caller whose repo is only the
+        configured default (`own` false) used to get the DEFAULT repository's account there, and pushed as the wrong account."""
+        users = {"acme-ops/default": "acct-ops", "acme-other/*": "acct-other"}
+        tokens = {"acct-ops": "tok-ops", "acct-other": "tok-other"}
+        for action in ("get", "store", "erase"):   # every verb gives the helper these same calls: TestGitShim S1 proves push, fetch, pull and clone are routed to it
+            with self.subTest(action=action):
+                done, seen = self.run_gh_shim("acme-ops/default", users, tokens, args=("auth", "git-credential", action), own=False)
+                self.assertEqual(done.returncode, 1, action)
+                self.assertIn("has no repository of its own", done.stderr)
+                self.assertIn("launch", done.stderr)
+                self.assertIn("--repo", done.stderr)
+                self.assertIn("never used", done.stderr)
+                self.assertIsNone(seen, "the real gh never ran: no credential was given to anything")
+                self.assertNotIn("tok-ops", done.stdout + done.stderr)
+        done, seen = self.run_gh_shim("acme-ops/default", users, tokens, args=("auth", "git-credential", "get"), own=True)
+        self.assertEqual((done.returncode, seen["token"]), (0, "tok-ops"), "a caller whose repo IS its own is served as before")
+        done, seen = self.run_gh_shim("acme-ops/default", users, tokens, args=("auth", "git-credential", "get"))
+        self.assertEqual((done.returncode, seen["token"]), (0, "tok-ops"), "a switchboard that does not say `own` (an older one) is served as before")
+
+    def test_everything_else_about_account_choice_is_unchanged_for_a_caller_with_no_repository_of_its_own(self):
+        """#473 S6/PC-3: only the credential route changes. The Chief of Staff's named-repo commands, reads and writes without a name, and a caller with its own repo."""
+        users = {"acme-ops/*": "acct-ops", "acme/*": "acct-personal"}
+        tokens = {"acct-ops": "tok-ops", "acct-personal": "tok-personal"}
+        for args, expected in ((("issue", "view", "5", "-R", "acme/api"), "tok-personal"), (("issue", "comment", "5", "-R", "acme/api", "--body", "x"), "tok-personal"),
+                               (("issue", "list"), "tok-ops"), (("pr", "merge", "5", "-R", "acme/api"), "tok-ops"), (("auth", "status"), "tok-ops")):
+            with self.subTest(args=args):
+                done, seen = self.run_gh_shim("acme-ops/default", users, tokens, args=args, own=False)
+                self.assertEqual((done.returncode, seen["token"]), (0, expected), done.stderr)
+        done, seen = self.run_gh_shim("acme-ops/default", users, tokens, args=("auth", "git-credential", "get"), who_repo_exit=2)
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("no GitHub account is mapped for this shell (it has no repository identity)", done.stderr,
+                      "`whoami --json` failing while the plain `whoami` answers is an older switchboard: no repository identity, the refusal it always had")
+        self.assertNotIn("has no repository of its own", done.stderr, "the new text is only for a SUCCESSFUL lookup that says own: false")
+        done, seen = self.run_gh_shim("acme-ops/default", users, tokens, args=("auth", "git-credential", "get"), wedge=True, seconds=0.3, own=False)
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("account lookup failed", done.stderr, "a lookup that FAILS (no answer in time) keeps its own older refusal, never the new text")
+        self.assertNotIn("has no repository of its own", done.stderr)
+        self.assertIsNone(seen)
+        done, seen = self.run_gh_shim("acme-other/thing", users, tokens, args=("auth", "git-credential", "get"), own=True)
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("no GitHub account is mapped for", done.stderr, "an unmapped repository keeps its own refusal")
+
+    def test_no_shim_reads_a_directorys_remote_when_it_decides_who_a_caller_is(self):
+        """#473 S7/PC-1: the repository is derived once by the launcher. A fake `git` on the PATH records every call: across the shim runs it is started only by the git shim's
+        own exec of the real git, never by the gh shim, and no call asks for a remote or a config value."""
+        home = Path(self.home)
+        bindir = home / "shimbin"
+        bindir.mkdir(exist_ok=True)
+        glog = home / "git-calls.log"
+        (bindir / "git").write_text("#!/bin/sh\necho \"$@\" >> %s\nexit 0\n" % glog)
+        (bindir / "git").chmod(0o755)
+        subprocess.run([str(bindir / "git"), "probe"], check=True)
+        self.assertEqual(glog.read_text(), "probe\n", "the fake git logs what it is asked")
+        glog.unlink()
+        users = {"acme-ops/default": "acct-ops"}
+        for args, own in ((("auth", "git-credential", "get"), False), (("auth", "git-credential", "get"), True), (("auth", "git-credential", "store"), False),
+                          (("issue", "list"), False), (("pr", "view", "5", "-R", "acme-ops/other"), False)):
+            self.run_gh_shim("acme-ops/default", users, {"acct-ops": "tok-ops"}, args=args, own=own)
+        self.assertFalse(glog.exists(), "the gh shim never ran git, so it read no remote in 5 calls")
+        for path in (SHIM, GIT_SHIM):
+            source = path.read_text()
+            for word in ("remote.origin", "get-url", "--get-all"):
+                self.assertNotIn(word, source, "%s asks git for %s" % (path.name, word))
+        fake = self.home / "realbin"
+        fake.mkdir(exist_ok=True)
+        (fake / "git").write_text("#!/bin/sh\necho \"$@\" >> %s\nexit 0\n" % glog)
+        (fake / "git").chmod(0o755)
+        env = {"PATH": "%s:%s:%s" % (GIT_SHIM.parent, fake, SAFE_PATH), "HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / "xdg-config")}
+        for args in (("push", "origin", "b"), ("fetch",), ("pull",), ("clone", "https://github.com/acme/api.git", "x"), ("push",)):
+            subprocess.run([sys.executable, str(GIT_SHIM)] + list(args), env=env, capture_output=True, text=True, timeout=60)
+        calls = glog.read_text().splitlines()
+        self.assertEqual(len(calls), 5, "the git shim started the real git once per call and nothing more")
+        self.assertEqual([c for c in calls if "config" in c.split() or "remote.origin" in c or "get-url" in c], [], "and none of them read a remote or a config value")
+
     def test_git_credential_for_a_repository_with_no_mapped_account_or_no_identity_is_refused_never_the_inherited_token(self):
         users = {"acme-ops/service": "acct-ops"}
         cred = ("auth", "git-credential", "get")
@@ -22895,6 +23549,136 @@ class LedgerBase(Base):
             self.assertEqual(self.verdict(who, sid, ev)[0], 0, (who, sid))
 
 
+class TestLaunchTesters(LedgerBase):
+    """#372: a tester launched with --role tester for its orchestrator's repo may record tester verdicts, beside the configured list."""
+
+    def setUp(self):
+        super().setUp()
+        add = self.world.add_agent
+        add("orch", fleet={"role": "orchestrator", "repo": "acme/app", "issue": 7})
+        add("orch-web", fleet={"role": "orchestrator", "repo": "acme/web", "issue": 8})
+        add("ltst", fleet={"role": "tester", "repo": "acme/app", "reports_to": "orch", "issue": 7, "launched_by": "orch"})
+        add("ltst-web", fleet={"role": "tester", "repo": "acme/web", "reports_to": "orch-web", "issue": 8, "launched_by": "orch-web"})
+        add("ltst-nobody", fleet={"role": "tester", "repo": "acme/app", "reports_to": "coder", "issue": 7, "launched_by": "coder"})
+        add("ltst-forged", fleet={"role": "tester", "repo": "acme/app", "reports_to": "orch", "issue": 7, "launched_by": "coder"})   # a coder named the orchestrator as the boss
+        add("ltst-old", fleet={"role": "tester", "repo": "acme/app", "reports_to": "orch", "issue": 7})                              # launched before launched_by existed
+        add("lrev", fleet={"role": "reviewer", "repo": "acme/app", "reports_to": "orch", "issue": 7})
+        self.configure(evaluators={"reviewer": ["rev"], "tester": ["tst"], "owner": ["own"], "ci": ["cibot"]})
+        self.assertEqual(self.prove("coder", "S2")[0], 0)
+
+    def test_launch_records_the_role_with_the_repo_and_the_boss(self):
+        record = sb.fleet_record("ltst", "tester", "orch", 7, None, "acme/app")
+        self.assertEqual((record["role"], record["repo"], record["reports_to"]), ("tester", "acme/app", "orch"))
+
+    def test_a_launched_tester_is_accepted_for_its_repo_and_refused_for_another(self):
+        self.assertEqual(self.verdict("ltst", "S2", "tester")[0], 0)
+        code, _, err = self.verdict("ltst-web", "S2", "tester")      # acme/web's tester on an acme/app PR
+        self.assertEqual(code, 2)
+        self.assertIn("not registered", err)
+        self.assertEqual([e["by"] for e in self.ledger() if e["kind"] == "verdict"], ["ltst"])
+
+    def test_a_tester_whose_boss_is_not_an_orchestrator_of_the_repo_is_refused(self):
+        for who in ("ltst-nobody", "lrev", "ltst-forged", "ltst-old"):    # boss is a coder; role reviewer; launched by a coder; no launched_by
+            code, _, err = self.verdict(who, "S2", "tester")
+            self.assertEqual(code, 2, who)
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "verdict"], [])
+
+    def test_a_tester_that_proved_the_pr_is_refused_as_a_writer(self):
+        self.assertEqual(self.prove("ltst", "S1")[0], 0)
+        code, _, err = self.verdict("ltst", "S2", "tester")
+        self.assertEqual(code, 2)
+        self.assertIn("wrote this PR", err)
+
+    def test_a_launched_tester_is_never_a_reviewer_ci_or_owner(self):
+        for sid, evaluator in (("S3", "reviewer"), ("S1", "ci"), ("S2", "owner")):
+            code, _, err = self.verdict("ltst", sid, evaluator)
+            self.assertNotEqual(code, 0, evaluator)
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "verdict"], [])
+
+    def test_the_configured_tester_still_works_and_the_audit_names_the_record_only_for_a_launched_one(self):
+        self.assertEqual(self.verdict("tst", "S2", "tester")[0], 0)
+        self.assertEqual(self.verdict("ltst", "S2", "tester")[0], 0)
+        events = [e for e in self.world.audit() if e["event"] == "plan.verdict"]
+        configured, launched = [e["detail"] for e in events if e["detail"]["by"] == "tst"][0], [e["detail"] for e in events if e["detail"]["by"] == "ltst"][0]
+        self.assertNotIn("launch_record", configured)
+        self.assertEqual({k: launched["launch_record"][k] for k in ("name", "role", "repo", "reports_to")},
+                         {"name": "ltst", "role": "tester", "repo": "acme/app", "reports_to": "orch"})
+
+    def test_a_retired_tester_stops_counting_and_is_not_listed(self):
+        retired = {"ltst": {"at": 1, "by": "orch", "reason": "done", "session": self.world.sessions["ltst"], "auto": False}}
+        (self.world.state / sb.RETIRED_FILE).write_text(json.dumps(retired))
+        code, _, err = self.verdict("ltst", "S2", "tester")
+        self.assertEqual(code, 2)
+        self.assertIn("not registered", err)
+        retired["ltst"]["session"] = "ses_an_older_launch"   # a relaunch under the same name is a new session: retirement of the old one does not cover it
+        (self.world.state / sb.RETIRED_FILE).write_text(json.dumps(retired))
+        self.assertEqual(self.verdict("ltst", "S2", "tester")[0], 0)
+        retired["ltst"]["session"] = self.world.sessions["ltst"]
+        self.assertEqual(sb.load_launch_testers().launched({"ltst": {"role": "tester", "repo": "acme/app", "reports_to": "orch", "launched_by": "orch"}, "orch": {"role": "orchestrator", "repo": "acme/app"}},
+                                                           {"ltst": self.world.sessions["ltst"]}, "acme/app", lambda f: f.get("repo"), retired), {})
+
+    def test_a_missing_retired_file_means_nobody_is_retired(self):
+        (self.world.state / sb.RETIRED_FILE).unlink(missing_ok=True)
+        self.assertEqual(self.verdict("ltst", "S2", "tester")[0], 0)
+        self.assertEqual(sb.read_retired_strict(self.world.state), {})
+
+    def test_a_corrupt_or_unreadable_retired_file_disables_every_launched_tester_and_says_so(self):
+        path = self.world.state / sb.RETIRED_FILE
+        for label, content in (("corrupt json", b'{"ltst": {"at": 1,'), ("empty bytes", b""), ("garbage", b"\xff\xfe not json \x00"),
+                               ("a list", b"[]"), ("a record that is not an object", b'{"ltst": "retired"}'), ("a bare string", b'"x"')):
+            with self.subTest(content=label):
+                path.write_bytes(content)
+                before = len([e for e in self.world.audit() if e["event"] == "testers.retired_unreadable"])
+                code, _, err = self.verdict("ltst", "S2", "tester")
+                self.assertEqual(code, 2)
+                self.assertIn("not registered", err)
+                self.assertEqual([e for e in self.ledger() if e["kind"] == "verdict"], [], "0 tester verdicts accepted")
+                events = [e for e in self.world.audit() if e["event"] == "testers.retired_unreadable"]
+                self.assertEqual(len(events), before + 1, "a loud audit event")
+                self.assertEqual(events[-1]["detail"]["effect"], "launch-record testers disabled")
+                with self.assertRaises(sb.RetiredUnreadable):
+                    sb.read_retired_strict(self.world.state)
+                fleets = {"orch": {"role": "orchestrator", "repo": "acme/app"}, "ltst": {"role": "tester", "repo": "acme/app", "reports_to": "orch", "launched_by": "orch"}}
+                agents = {"ok": True, "list": [{"observation": {"name": n, "session": "s-" + n}} for n in fleets]}
+                self.assertEqual(sb.testers_status({"plan_evaluators": {}, "intent_repo": "acme/app"}, agents, fleets, self.world.state),
+                                 ["      testers    retired file unreadable: launch-record testers disabled"])
+        self.assertEqual(self.verdict("tst", "S2", "tester")[0], 0, "the configured tester still works")
+        path.unlink()
+
+    def test_an_unreadable_directory_instead_of_a_file_also_fails_closed(self):
+        path = self.world.state / sb.RETIRED_FILE
+        path.mkdir()
+        try:
+            self.assertEqual(self.verdict("ltst", "S2", "tester")[0], 2)
+        finally:
+            path.rmdir()
+
+    def test_status_lists_the_resolved_testers_with_their_source(self):
+        fleets = {"orch": {"role": "orchestrator", "repo": "acme/app"}, "ltst": {"role": "tester", "repo": "acme/app", "reports_to": "orch", "launched_by": "orch"},
+                  "tst": {"role": "tester", "repo": "acme/app", "reports_to": "orch", "launched_by": "orch"}}
+        agents = {"ok": True, "list": [{"observation": {"name": n, "session": "s-" + n}} for n in fleets]}
+        lines = sb.testers_status({"plan_evaluators": {"tester": ["tst"]}, "intent_repo": "acme/app"}, agents, fleets, self.world.state)
+        self.assertEqual(lines, ["      tester     tst: config (any repo)", "      tester     ltst: launch record (acme/app)"])
+        self.assertEqual(sb.testers_status({}, {"ok": False}, {}, self.world.state), [])
+
+    def test_the_pure_rules_and_the_status_lines(self):
+        lt = sb.load_launch_testers()
+        fleets = {"orch": {"role": "orchestrator", "repo": "acme/app"}, "t1": {"role": "tester", "repo": "acme/app", "reports_to": "orch", "launched_by": "orch"},
+                  "t2": {"role": "tester", "repo": "acme/web", "reports_to": "orch", "launched_by": "orch"}}
+        repo_of = lambda f: f.get("repo")
+        self.assertEqual(sorted(lt.launched(fleets, {}, "acme/app", repo_of)), ["t1"])
+        self.assertEqual(lt.evaluators({"tester": ["tst"], "ci": ["bot"]}, {"t1": {}}), {"tester": ["tst", "t1"], "ci": ["bot"]})
+        self.assertEqual(lt.evaluators({"reviewer": ["r"]}, {}), {"reviewer": ["r"]})
+        self.assertIsNone(lt.lane_refusal("t1", {"t1": {}}, {"coder"}, {"t1": "s1", "coder": "s2"}))
+        coders = {"t1": {"role": "tester", "issue": 7}, "c1": {"role": "coder", "issue": 7}, "c2": {"role": "coder", "issue": 9}}
+        self.assertIn("not a different agent from c1", lt.lane_refusal("t1", {"t1": {}}, set(), {"t1": "s1", "c1": "s1"}, coders))
+        self.assertIsNone(lt.lane_refusal("t1", {"t1": {}}, set(), {"t1": "s1", "c2": "s1"}, coders))   # a coder of another work item
+        self.assertIn("session of a writer", lt.lane_refusal("t1", {"t1": {}}, {"coder"}, {"t1": "s1", "coder": "s1"}))
+        self.assertEqual(lt.status_lines({"tester": ["tst"]}, fleets, {}, {"acme/app"}, repo_of),
+                         ["      tester     tst: config (any repo)", "      tester     t1: launch record (acme/app)"])
+        self.assertEqual(lt.source_of("tst", {"tester": ["tst"]}, {"tst": {}}), "config")
+
+
 class TestPlanLedger(LedgerBase):
     # -- prove
 
@@ -24569,6 +25353,33 @@ class TestImpactFloorCommandAndPass(LedgerBase):
         sb.impact_would_hold_pass(engine, t + 400)
         self.assertEqual(len([e for e in self.world.audit() if e["event"] == "gate.would_hold"]), 2, "a new head is judged again")
 
+    def test_an_unreadable_matrix_file_is_said_loudly_by_the_pass_and_the_command_never_read_as_no_floor(self):
+        mod = sb.load_module("impact_floor")
+        broken = mock.patch.object(mod, "floor_for", side_effect=mod.MatrixError("the impact matrix file cannot be read (OSError: gone)"))
+        hub = FakeHub({"acme/app": [{"number": 9, "head": {"sha": LEDGER_HEAD}, "body": "PLAN: acme/app#7", "draft": False}]})
+        engine = self.world.new_engine("daemon")
+        engine.hub, engine.gh_runner = hub, self.route
+        engine.config, engine.state_dir = sb.load_config(), self.world.state
+        sb.ci_record_pass(engine, 100000.0)
+        with broken:
+            sb.impact_would_hold_pass(engine, 100000.0)
+            code, out, err = self.run_as("coder", "impact", "hold", "--dry-run")
+        self.assertEqual([e for e in self.world.audit() if e["event"] == "gate.would_hold"], [], "no judgement is made")
+        errors = [e for e in self.world.audit() if e["event"] == "impact.error"]
+        self.assertEqual([e["detail"].get("floor") for e in errors], ["unreadable"], "the pass says so, loudly")
+        self.assertEqual(code, sb.EXIT_ERROR)
+        self.assertEqual(len([line for line in err.splitlines() if line.strip()]), 1, err)
+        self.assertIn("cannot be read", err)
+
+    def test_the_floor_report_carries_the_owner_hold_tier_as_advisory_information(self):
+        report = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])
+        self.assertEqual(report["decision"], "hold", "the labels still follow the old decision")
+        self.assertEqual(report["owner_decision"], "second-review", "a floor path outside the top tier: no owner clear")
+        self.pr.update({"changedFiles": 1, "files": [{"path": "shims/gh", "additions": 1, "deletions": 0}]})
+        report = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])
+        self.assertEqual(report["owner_decision"], "hold")
+        self.assertTrue(any("shims/gh" in reason for reason in report["owner_reasons"]), report["owner_reasons"])
+
     def test_the_pass_is_off_when_disabled_or_killed_and_unlisted_repos_are_not_read(self):
         for edit in ("disabled", "killed"):
             with self.subTest(edit=edit):
@@ -24584,6 +25395,248 @@ class TestImpactFloorCommandAndPass(LedgerBase):
                 sb.impact_would_hold_pass(engine, 100000.0)
                 self.assertEqual([e for e in self.world.audit() if e["event"] == "gate.would_hold"], [])
         (self.world.state / "plan-gates.off").unlink(missing_ok=True)
+
+
+class TestImpactClassAndNarrowForm(LedgerBase):
+    """#451 slice 2: the class in the impact reviewer's record, and an agent definition that holds only when its permission block changes. Synthetic
+    names; the route answers the contents reads and counts them."""
+
+    BASE = "c" * 40
+    DEF = '---\ndescription: a helper\nmode: subagent\npermissions:\n  - {action: read, resource: "*", effect: allow}\n---\nProse about the job.\n'
+
+    def setUp(self):
+        super().setUp()
+        self.extra_config = dict(FLOOR_CONFIG, plan_gates={"repos": {"acme/app": {"mode": "shadow"}}})
+        self.configure()
+        self.pr = dict(self.pr, baseRefOid=self.BASE)
+        self.reads, self.contents = [], {}
+        self.files(["docs/a.md"])
+
+    def route(self, argv, **kwargs):
+        if argv[0] == FAKE_GH and argv[1] == "api" and "/contents/" in argv[2]:
+            self.reads.append(argv[2])
+            match = re.search(r"/contents/([^?]+)\?ref=([0-9a-f]+)", argv[2])
+            text = self.contents.get((match.group(1), match.group(2)))
+            if text == "BROKEN":
+                return subprocess.CompletedProcess(argv, 1, "", "gh: HTTP 502")
+            if text is None:
+                return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"content": base64.b64encode(text.encode()).decode(), "encoding": "base64"}), "")
+        return super().route(argv, **kwargs)
+
+    def files(self, paths):
+        self.pr.update({"changedFiles": len(paths), "files": [{"path": p, "additions": 1, "deletions": 0} for p in paths]})
+
+    def definition(self, path, before, after):
+        self.contents[(path, self.BASE)], self.contents[(path, LEDGER_HEAD)] = before, after
+
+    def decide(self):
+        code, out, err = self.run_as("coder", "impact", "floor", self.PR, "--json")
+        self.assertEqual(code, 0, err)
+        report = json.loads(out)
+        return report["owner_decision"], report["owner_reasons"]
+
+    def record_impact(self, action, *more):
+        code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve", "--impact-action", action, *more)
+        return code, out, err
+
+    # -- S1: the record
+
+    def test_s1_the_record_keeps_its_class_refuses_a_bad_one_and_may_have_none(self):
+        self.assertEqual(self.record_impact("hold", "--impact-class", "credentials")[0], 0)
+        code, out, err = self.record_impact("hold", "--impact-class", "two words")
+        self.assertEqual(code, 2)
+        self.assertEqual(err.count("impact-class"), 1)
+        self.assertEqual(self.record_impact("hold")[0], 0)
+        code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "code", "--verdict", "approve", "--impact-class", "data")
+        self.assertEqual(code, 2)
+        self.assertIn("belongs to the impact reviewer", err)
+        stored = [e.get("impact_class") for e in self.ledger() if e["kind"] == "review_record"]
+        self.assertEqual(stored, ["credentials", None])
+        self.assertEqual(self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve", "--impact-action", "hold",
+                                     "--block", "/nonexistent")[0], 2)
+
+    def test_the_block_form_carries_the_class_line(self):
+        block = "verdict: approve\nhead: %s\nimpact-action: hold\nimpact-class: Data\nfindings:\n" % LEDGER_HEAD
+        fields, problem = sb.parse_review_block(block)
+        self.assertEqual((problem, fields["impact_class"]), (None, "data"))
+        fields, problem = sb.parse_review_block(block.replace("Data", "two words"))
+        self.assertIn("impact-class", problem)
+
+    # -- S2: the decision by class
+
+    def test_s2_a_hold_record_holds_for_the_owner_unless_its_class_is_not_top_tier(self):
+        outcome = {}
+        for label, more in (("credentials", ("--impact-class", "credentials")), ("performance", ("--impact-class", "performance")),
+                            ("unknown", ("--impact-class", "gizmo")), ("missing", ())):
+            self.assertEqual(self.record_impact("hold", *more)[0], 0)
+            outcome[label] = self.decide()
+        self.assertEqual({k: v[0] for k, v in outcome.items()},
+                         {"credentials": "hold", "performance": "second-review", "unknown": "hold", "missing": "hold"})
+        self.assertEqual(outcome["performance"][1][0].count("class performance"), 1)
+        self.assertFalse([r for r in outcome["performance"][1] if "top tier" in r and "hold" in r.split(":")[0]])
+
+    def test_a_non_hold_record_and_an_unreadable_ledger(self):
+        self.assertEqual(self.record_impact("second-review")[0], 0)
+        self.assertEqual(self.decide()[0], "none")
+        (self.world.state / "plan-ledger.jsonl").write_text("{not json\n")
+        self.assertEqual(self.decide()[0], "hold", "an unreadable ledger is an unknown rating: it holds")
+
+    # -- S3: the prompt
+
+    def test_s3_the_prompt_asks_for_the_class_and_names_every_class_of_the_matrix_file(self):
+        text = (REPO / "agents" / "reviewers" / "reviewer-impact.md").read_text()
+        rule = sb.load_impact_floor().owner_hold_rule(sb.load_impact_floor().load_matrix())
+        classes = rule[0] + rule[1]
+        self.assertEqual(len(classes), 10)
+        self.assertEqual(text.count("impact-class"), 1)
+        self.assertEqual([c for c in classes if "`%s`" % c not in text], [])
+
+    # -- S4 to S6: the agent definitions
+
+    def test_s4_only_a_change_to_the_permission_block_holds(self):
+        path = "agents/x.md"
+        self.files([path])
+        tail = self.DEF.split("---\n", 2)[2]
+        cases = {
+            "prose": (self.DEF.replace("Prose about the job.", "Other prose.").replace("a helper", "a better helper"), "second-review"),
+            "allow rule": (self.DEF.replace("allow}\n", "allow}\n  - {action: shell, resource: \"ls *\", effect: allow}\n"), "hold"),
+            "mode": (self.DEF.replace("subagent", "primary"), "hold"),
+            "unreadable after": ("no front matter here\n" + tail, "hold"),
+        }
+        for label, (after, want) in cases.items():
+            with self.subTest(label):
+                self.definition(path, self.DEF, after)
+                got = self.decide()
+                self.assertEqual(got[0], want, got)
+        self.assertEqual(self.decide_prose_reason(), 1)
+        with self.subTest("unreadable before"):
+            self.definition(path, "no front matter\n", self.DEF)
+            self.assertEqual(self.decide()[0], "hold")
+
+    def decide_prose_reason(self):
+        self.definition("agents/x.md", self.DEF, self.DEF.replace("Prose about the job.", "Other."))
+        decision, reasons = self.decide()
+        return len([r for r in reasons if "without a permission block change" in r]) if decision == "second-review" else -1
+
+    def test_s5_an_added_or_removed_definition_holds(self):
+        self.files(["agents/new.md"])
+        self.contents[("agents/new.md", LEDGER_HEAD)] = self.DEF
+        self.assertEqual((self.decide()[0], self.decide()[1][0].count("added")), ("hold", 1))
+        self.files(["agents/old.md"])
+        self.contents[("agents/old.md", self.BASE)] = self.DEF
+        self.assertEqual((self.decide()[0], self.decide()[1][0].count("removed")), ("hold", 1))
+
+    def test_s6_a_content_read_that_fails_holds_and_says_it_could_not_be_read(self):
+        self.files(["agents/x.md"])
+        self.definition("agents/x.md", self.DEF, "BROKEN")
+        decision, reasons = self.decide()
+        self.assertEqual(decision, "hold")
+        self.assertEqual(" ".join(reasons).count("could not be read"), 1)
+        self.pr.pop("baseRefOid")
+        self.assertEqual(self.decide()[0], "hold", "an unknown base holds")
+
+    def test_a_definition_missing_at_both_versions_and_a_mixed_change_hold(self):
+        self.files(["agents/ghost.md"])
+        decision, reasons = self.decide()
+        self.assertEqual((decision, " ".join(reasons).count("could not be read")), ("hold", 1))
+        self.files(["agents/x.md", "shims/gh"])
+        self.definition("agents/x.md", self.DEF, self.DEF.replace("Prose about the job.", "Other."))
+        decision, reasons = self.decide()
+        self.assertEqual(decision, "hold", "an unchanged permission block does not lift another top tier path")
+        self.assertIn("shims/gh", " ".join(reasons))
+
+    # -- S7: the bound
+
+    def test_s7_the_reads_are_none_four_and_none_and_more_than_the_limit_holds(self):
+        self.files(["docs/a.md"])
+        self.decide()
+        self.assertEqual(len(self.reads), 0)
+        for name in ("agents/a.md", "agents/b.md"):
+            self.definition(name, self.DEF, self.DEF)
+        self.files(["agents/a.md", "agents/b.md"])
+        self.reads.clear()
+        self.assertEqual(self.decide()[0], "second-review")
+        self.assertEqual(len(self.reads), 4)
+        names = ["agents/f%d.md" % n for n in range(9)]
+        self.files(names)
+        self.reads.clear()
+        decision, reasons = self.decide()
+        self.assertEqual((decision, len(self.reads)), ("hold", 0))
+        self.assertIn("more than 8", " ".join(reasons))
+
+    # -- S8 and S9: the rule is data
+
+    def matrix_with(self, **narrow):
+        matrix = json.loads(json.dumps(sb.load_impact_floor().load_matrix()))
+        matrix["owner_hold"]["narrow_by_diff"].update(narrow)
+        return matrix
+
+    def test_s8_the_narrow_paths_come_from_the_matrix_file(self):
+        self.files(["agents/x.md"])
+        self.definition("agents/x.md", self.DEF, self.DEF.replace("Prose about the job.", "Other."))
+        self.assertEqual(self.decide()[0], "second-review")
+        with mock.patch.object(sb.impact_floor, "load_matrix", lambda *a, **k: self.matrix_with(paths=["skills/**"])):
+            self.assertEqual(self.decide()[0], "hold", "no longer a narrow path: the whole top tier path holds")
+
+    def test_s9_the_front_matter_keys_come_from_the_matrix_file_and_the_code_has_none(self):
+        self.files(["agents/x.md"])
+        self.definition("agents/x.md", self.DEF, self.DEF.replace("a helper", "a better helper"))
+        self.assertEqual(self.decide()[0], "second-review")
+        with mock.patch.object(sb.impact_floor, "load_matrix", lambda *a, **k: self.matrix_with(keys=["description"])):
+            self.assertEqual(self.decide()[0], "hold", "description is the block now")
+        source = (REPO / "bin" / "impact_floor.py").read_text()
+        self.assertEqual(re.findall(r"agents/|[\"'](?:permissions|permission|mode|tools)[\"']", source), [])
+
+    def test_a_malformed_narrow_block_is_no_narrow_rule_and_the_whole_path_holds(self):
+        self.files(["agents/x.md"])
+        self.definition("agents/x.md", self.DEF, self.DEF.replace("Prose about the job.", "Other."))
+        for bad in ({"max_files": 0}, {"keys": []}, {"paths": "agents/**"}):
+            with self.subTest(bad), mock.patch.object(sb.impact_floor, "load_matrix", lambda *a, _b=bad, **k: self.matrix_with(**_b)):
+                self.assertEqual(self.decide()[0], "hold")
+
+    def test_every_agent_definition_of_this_repository_is_parsable(self):
+        f = sb.load_impact_floor()
+        keys = f.narrow_rule(f.load_matrix())[1]
+        unparsable = [str(p.relative_to(REPO)) for p in sorted((REPO / "agents").rglob("*.md")) if f.permission_block(p.read_text(), keys) is None]
+        self.assertEqual(unparsable, [], "a definition the reader cannot parse would always hold: the narrow form would help nobody")
+
+    def test_the_pure_block_reader(self):
+        f = sb.load_impact_floor()
+        keys = ["permissions", "mode"]
+        self.assertEqual(f.permission_block("---\nmode: x\n# c\npermissions:\n  - a\n\nother: 1\n---\n", keys), {"mode": ["mode: x"], "permissions": ["permissions:", "  - a"]})
+        self.assertIsNone(f.permission_block("mode: x\n", keys))
+        self.assertIsNone(f.permission_block("---\nmode: x\n", keys))
+        self.assertIsNone(f.permission_block("---\n---\n" + "x" * 300000, keys))
+        self.assertEqual(f.block_state("---\nmode: x\n---\n", "---\r\nmode: x  \r\n---\r\nprose", keys), "unchanged")
+        self.assertIsNone(f.permission_block('---\n"mode": x\n---\n', keys), "a quoted key cannot be judged: it holds")
+        self.assertEqual(f.permission_block("---\npermissions:\n- a\n- b\nother: 1\n---\n", keys), {"permissions": ["permissions:", "- a", "- b"]})
+        for label, text in (("a block scalar under a tracked key", "---\npermissions: |\n  # keep\n  x\n---\n"),
+                            ("an anchor", "---\nx: &m subagent\nmode: *m\n---\n"), ("a tag", "---\nmode: !!str x\n---\n"),
+                            ("a merge key", "---\n<<: *base\nmode: x\n---\n"), ("a repeated tracked key", "---\nmode: a\nmode: b\n---\n"),
+                            ("a closing line that is indented", "---\nmode: x\n  ---\nmode: y\n---\n"),
+                            ("a quoted scalar left open across lines", "---\ndescription: 'x\nmode: subagent\nother: y'\n---\n"),
+                            ("a flow collection left open", "---\npermissions: {a: 1,\nmode: x}\n---\n"),
+                            ("a double quoted scalar left open", '---\ndescription: "x\nmode: y\n---\n'),
+                            ("a folded block scalar", "---\npermissions: >\n  x\n---\n"),
+                            ("a comment hiding a closer in a flow collection", "---\ndescription: [a # ]\npermissions: [b]\nmode: subagent\nz: q]\n---\n"),
+                            ("a comment hiding a closer in a flow mapping", "---\ndescription: {a: 1 # }\nmode: x\nz: q}\n---\n"),
+                            ("a complex key opening a quote", '---\ndescription:\n  ? "x\nmode: subagent\n  y"\n---\n'),
+                            ("a directive", "---\n%YAML 1.2\nmode: x\n---\n"), ("a document end marker", "---\nmode: x\n...\n---\n"),
+                            ("a surplus closer", "---\npermissions: {a: 1}}\n---\n"), ("junk after a quoted value", '---\nmode: "x" y\n---\n'),
+                            ("a plain value with a colon and a space", "---\ndescription: a: b\n---\n"), ("a nested sequence on one line", "---\npermissions:\n  - - a\n---\n"),
+                            ("a Unicode line break", "---\ndescription: x\u2028mode: y\n---\n")):
+            self.assertIsNone(f.permission_block(text, keys), label)
+        self.assertEqual(f.permission_block("---\ndescription: \"say *\"\nnote: a!b\npermissions:\n  - {action: shell, resource: \"gh * view *\", effect: allow}\n---\n", keys),
+                         {"permissions": ["permissions:", '  - {action: shell, resource: "gh * view *", effect: allow}']}, "quoted globs are not indirection")
+        self.assertEqual(f.permission_block("---\ndescription: the Chief of Staff's helper, it's fine\nmode: x # a comment with ' in it\n---\n", keys), {"mode": ["mode: x # a comment with ' in it"]},
+                         "an apostrophe inside a plain scalar or a comment is not a quote")
+        self.assertEqual(f.permission_block("---\npermissions:\n  - {action: read, resource: 'it''s', effect: allow}\n---\n", keys)["permissions"][1].count("it''s"), 1)
+        self.assertEqual(f.permission_block('---\ndescription: "say \\"x\\" # not a comment"  # a comment\nmode: "x\\""\n---\n', keys), {"mode": ['mode: "x\\""']},
+                         "an escaped quote and a # inside quotes are read as they are")
+        self.assertEqual(f.permission_block("---\ndescription: [a, b] # closed, then a comment\nmode: x\n---\n", keys), {"mode": ["mode: x"]})
+        self.assertNotEqual(f.permission_block("---\npermissions:\n  # keep\n  - x\n---\n", keys), f.permission_block("---\npermissions:\n  # kept\n  - x\n---\n", keys),
+                            "a # line inside a tracked block is content")
 
 
 class TestImpactHold(LedgerBase):
@@ -29030,6 +30083,123 @@ class TestLaunchIntoARepo(TwoRepoCase):
         code, _, err = self.launch("--repo", "other/tool")
         self.assertEqual(code, 0, err)
         self.assertNotIn("GH_TOKEN", self.opened()[0]["root"]["env"])
+
+
+class TestLaunchRepoFromOrigin(TwoRepoCase):
+    """#473 slice 1: a launch with no --repo reads the working directory's origin ONCE, in the launcher, and records the repository; nothing else does."""
+
+    SECRET = "ghp_SECRETtoken0123456789"
+
+    def work(self, *urls, init=True, name="checkout"):
+        work = self.home / name
+        work.mkdir(exist_ok=True)
+        if init:
+            subprocess.run(["git", "init", "-q", str(work)], check=True, capture_output=True)
+            for url in urls:
+                subprocess.run(["git", "-C", str(work), "config", "--local", "--add", "remote.origin.url", url], check=True, capture_output=True)
+        return work
+
+    def launch(self, work, *extra, name="web-new"):
+        return self.main("launch", name, "--agent", "coder", "--dir", str(work), "--workspace", "w1", "--role", "coder", *extra)
+
+    def recorded(self, out):
+        return self.world.v2.sessions[json.loads(out)["session"]]["metadata"]["fleet"].get("repo")
+
+    def test_s1_an_origin_on_github_is_recorded_lower_case_and_the_output_names_it_in_every_accepted_form(self):
+        for n, url in enumerate(("https://github.com/ACME/Web.git", "https://github.com/acme/web", "git@github.com:Acme/Web.git", "git@github.com:acme/web")):
+            with self.subTest(url=url):
+                code, out, err = self.launch(self.work(url, name="co%d" % n), name="web-%d" % n)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.recorded(out), ACME_WEB)
+                self.assertIn("repository: acme/web (from origin)", err)
+                self.assertNotIn("github.com", err, "the url is never printed, only owner/name")
+        events = [e for e in self.world.audit() if e["event"] == "launch.repo_from_origin"]
+        self.assertEqual([e["detail"] for e in events], [{"repo": ACME_WEB}] * 4)
+        first = [p for m, p in self.world.herdr.socket_calls if m == "layout.apply"][0]
+        self.assertEqual(first["root"]["env"]["GH_TOKEN"], FAKE_TOKENS["acme-ci"], "the recorded repository is the account the worker is pinned to")
+
+    def test_s2_no_origin_a_path_another_host_and_every_odd_form_record_no_repository_and_say_what_it_means(self):
+        bad = {"no origin": None, "a local path": "/srv/git/web.git", "a relative path": "../web.git", "a file url": "file:///srv/git/web.git",
+               "another host": "https://gitlab.com/acme/web.git", "a look-alike host": "https://github.com.evil.example/acme/web.git",
+               "http": "http://github.com/acme/web.git", "an ssh url": "ssh://git@github.com/acme/web.git", "another ssh user": "other@github.com:acme/web.git",
+               "a trailing slash": "https://github.com/acme/web/", "a path below": "https://github.com/acme/web/tree/main", "a query": "https://github.com/acme/web.git?x=1",
+               "dot dot": "https://github.com/acme/..", "a double suffix": "https://github.com/acme/web.git.git", "no name": "https://github.com/acme/",
+               "an alias": "gh:acme/web", "a space": "https://github.com/acme/we b.git", "a newline in it": "https://github.com/acme/web.git\nx"}
+        for n, (label, url) in enumerate(bad.items()):
+            with self.subTest(label):
+                work = self.work(*( [url] if url else [] ), name="bad%d" % n)
+                code, out, err = self.launch(work, name="bad-%d" % n)
+                self.assertEqual(code, 0, err)
+                self.assertIsNone(self.recorded(out), label)
+                self.assertIn("no repository recorded (", err)
+                self.assertIn("pushes will be refused; pass --repo", err)
+                if url:
+                    self.assertNotIn(url.split("\n")[0], err, "the url is never printed")
+        work = self.work(init=False, name="notgit")
+        code, out, err = self.launch(work, name="not-git")
+        self.assertEqual((code, self.recorded(out)), (0, None))
+        self.assertIn("no repository recorded (the directory has no origin remote)", err)
+        two = self.work("https://github.com/acme/web.git", "https://github.com/acme/api.git", name="two")
+        code, out, err = self.launch(two, name="two-urls")
+        self.assertIsNone(self.recorded(out))
+        self.assertIn("origin names more than one url", err)
+
+    def test_s3_an_origin_with_a_user_or_token_in_it_records_nothing_and_leaks_nowhere(self):
+        for n, url in enumerate(("https://%s@github.com/acme/web.git" % self.SECRET, "https://x-access-token:%s@github.com/acme/web.git" % self.SECRET, "https://user:pw@github.com/acme/web.git")):
+            work = self.work(url, name="cred%d" % n)
+            code, out, err = self.launch(work, name="cred-%d" % n)
+            self.assertEqual(code, 0, err)
+            self.assertIsNone(self.recorded(out))
+            audit = (self.world.state / "audit.jsonl").read_text()
+            record = json.dumps(self.world.v2.sessions[json.loads(out)["session"]]["metadata"])
+            for secret in (self.SECRET, "pw@"):
+                for text in (out, err, audit, record):
+                    self.assertNotIn(secret, text)
+
+    def test_s4_an_explicit_repo_wins_and_an_issue_that_names_one_is_never_overridden_and_a_charter_derives_nothing(self):
+        work = self.work("https://github.com/acme/api.git")
+        code, out, err = self.launch(work, "--repo", ACME_WEB)
+        self.assertEqual((code, self.recorded(out)), (0, ACME_WEB), err)
+        self.assertNotIn("from origin", err)
+        code, out, err = self.launch(work, "--issue", "acme/web#2", name="web-two")
+        self.assertEqual((code, self.recorded(out)), (0, ACME_WEB), err)
+        self.assertNotIn("from origin", err)
+        self.assertEqual([e for e in self.world.audit() if e["event"] == "launch.repo_from_origin"], [])
+        reads = []
+        real = subprocess.run
+        with mock.patch.object(subprocess, "run", lambda argv, *a, **k: (reads.append(list(argv)), real(argv, *a, **k))[1]):
+            code, out, err = self.launch(work, "--charter", "1", name="chartered")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("from origin", err, "a charter has its own repo: nothing is read from the directory")
+        self.assertNotIn("no repository recorded", err)
+        self.assertEqual([r for r in reads if "remote.origin.url" in r], [], "no origin read for a charter")
+
+    def test_a_headless_launch_into_a_mapped_origin_is_refused_like_any_mapped_repo(self):
+        work = self.work("https://github.com/acme/web.git")
+        code, out, err = self.main("launch", "hl", "--agent", "coder", "--dir", str(work), "--role", "coder", "--headless")
+        self.assertEqual(code, 1)
+        self.assertIn("a headless worker cannot work as the gh account acme-ci", err)
+        self.assertIn("repository: acme/web (from origin)", err)
+
+    def test_the_directory_is_read_once_by_the_launcher_with_one_argv_and_no_network(self):
+        calls = []
+        real = subprocess.run
+
+        def spy(argv, *a, **k):
+            if argv and argv[0] == "git":
+                calls.append(list(argv))
+            return real(argv, *a, **k)
+
+        work = self.work("https://github.com/acme/web.git")
+        other = self.work("https://github.com/acme/api.git", name="elsewhere")
+        env = {"GIT_DIR": str(other / ".git"), "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "remote.origin.url", "GIT_CONFIG_VALUE_0": "https://github.com/acme/api.git"}
+        with mock.patch.object(subprocess, "run", spy), mock.patch.dict(os.environ, env):
+            code, out, err = self.launch(work)
+        self.assertEqual(self.recorded(out), ACME_WEB, "the launcher's own GIT_DIR and GIT_CONFIG_* never point the read at another repository")
+        self.assertEqual(code, 0, err)
+        origin_reads = [c for c in calls if "remote.origin.url" in c]
+        self.assertEqual(origin_reads, [["git", "-C", str(work), "config", "--local", "--no-includes", "--get-all", "remote.origin.url"]], "one read, argv, local config only, no includes")
+        self.assertEqual([c for c in calls if c[3:4] in (["fetch"], ["ls-remote"], ["remote"])], [])
 
 
 class TestLaunchSetsCheckpointReminders(TwoRepoCase):
@@ -48404,7 +49574,7 @@ class TestPlanReviewCore(unittest.TestCase):
         tree = ast.parse((BIN / "plan_review.py").read_text())
         imported = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
         imported |= {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
-        self.assertEqual(imported, {"re"}, "no file, network, clock or GitHub access in the pure core")
+        self.assertEqual(imported, {"re", "unicodedata"}, "no file, network, clock or GitHub access in the pure core (unicodedata is a table lookup)")
 
     def test_an_ask_epic_or_cos_ask_is_always_full_and_a_request_only_raises(self):
         for kind in ("ask", "epic", "cos_ask"):
@@ -51743,6 +52913,179 @@ class TestDecisionsStaleBound(unittest.TestCase):
         stale = [line for line in lines if "120 s" in line and ("stale" in line or "Staleness" in line or "not updating" in line or "older than" in line)]
         self.assertEqual(stale, [])
         self.assertGreaterEqual(len([line for line in lines if "180 s" in line and ("stale" in line or "Staleness" in line or "not updating" in line or "older than" in line)]), 4)
+
+
+class TestOwnerHoldRule(unittest.TestCase):
+    """Ask #451, slice 1: the owner's own clear is for credentials, identity and who may do what only. The rule is data in the impact matrix file."""
+
+    def setUp(self):
+        self.floor = sb.load_module("impact_floor")
+        self.matrix = self.floor.load_matrix()
+
+    def decide(self, paths, impacts=(), unknown=None, matrix=None):
+        matrix = matrix or self.matrix
+        globs, exclude, force = self.floor.floor_for("adamkaplan/fleet-kit")
+        hit = self.floor.floor_paths(paths, globs, exclude, force)
+        return self.floor.owner_decide(matrix, paths, list(impacts), unknown, hit)
+
+    def test_s1_the_decision_code_names_no_path_or_class_and_agrees_with_the_file(self):
+        import ast
+        tree = ast.parse((BIN / "impact_floor.py").read_text())
+        docstrings = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.FunctionDef, ast.ClassDef)) and node.body and isinstance(node.body[0], ast.Expr) \
+                    and isinstance(node.body[0].value, ast.Constant):
+                docstrings.add(id(node.body[0].value))
+        constants = {n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str) and id(n) not in docstrings}
+        block = self.matrix["owner_hold"]
+        from_file = set(block["top_tier_classes"]) | set(block["other_classes"]) | {g for globs in block["top_tier_paths"].values() for g in globs}
+        from_file |= {g for entry in block["floor"].values() for key in ("globs", "exclude", "force") for g in entry.get(key, [])}
+        self.assertTrue(from_file)
+        self.assertEqual(sorted(constants & from_file), [], "a path or class of the matrix file is written in the module's code")
+
+    def test_every_top_tier_path_is_inside_the_floor_or_listed_as_outside_it(self):
+        block = self.matrix["owner_hold"]
+        outside = set(block["top_tier_outside_floor"])
+        globs, exclude, force = self.floor.floor_for("adamkaplan/fleet-kit")
+        for cls, patterns in block["top_tier_paths"].items():
+            for pattern in patterns:
+                sample = pattern.replace("**", "x").replace("*", "x")
+                inside = bool(self.floor.floor_paths([sample], globs, exclude, force))
+                self.assertTrue(inside != (pattern in outside), "%s (%s): inside the floor %s, listed as outside it %s" % (pattern, cls, inside, pattern in outside))
+
+    def test_a_missing_or_malformed_block_holds_every_change_and_a_broken_file_is_never_read_as_no_floor(self):
+        for broken in ({}, {"owner_hold": "x"}, {"owner_hold": {"top_tier_classes": ["credentials"], "other_classes": [], "top_tier_paths": {"credentials": "shims/gh"}}},
+                       {"owner_hold": {"top_tier_classes": ["credentials"], "other_classes": [], "top_tier_paths": {}}}):
+            decision, reasons = self.floor.owner_decide(broken, ["docs/notes.md"], [])
+            self.assertEqual(decision, "hold", broken)
+            self.assertIn("missing or malformed", reasons[0])
+        bad = self.home_file("matrix.json", "{not json")
+        with mock.patch.object(self.floor, "MATRIX_PATH", bad):
+            self.floor._MATRIX_CACHE.clear()
+            with self.assertRaises(self.floor.MatrixError):
+                self.floor.floor_for("adamkaplan/fleet-kit")
+        self.floor._MATRIX_CACHE.clear()
+        self.assertTrue(self.floor.floor_for("adamkaplan/fleet-kit")[0], "the real file reads again")
+
+    def test_an_odd_character_in_a_path_never_escapes_a_glob_and_a_suffix_never_makes_an_exact_file_match(self):
+        for path in ("shims/a\nb", "shims/a\tb", "shims/a\x00b", "shims/a b ", "shims/" + "x" * 5000, "agents/x\nz.md", "agents/opencode/\x00x.md",
+                     "plugins/fleet-hooks/a\nb", "SHIMS/A\nB"):
+            self.assertEqual(self.decide([path])[0], "hold", repr(path[:40]))
+            self.assertTrue(self.floor.matches(path, ["shims/**", "agents/**", "plugins/fleet-hooks/**"]), repr(path[:40]))
+        for path in ("bin/plan_ledger.py\nx", "bin/plan_ledger.py\n", "bin/plan_ledger.py ", "bin/plan_ledger.pyx"):
+            self.assertEqual(self.decide([path])[0], "none", "an exact file with a suffix is a different file: %r" % path)
+        self.assertEqual(self.decide(["bin/plan_ledger.py"])[0], "hold")
+        review = sb.load_module("plan_review")
+        self.assertEqual(review.path_hits(["shims/a\nb", "docs/x.md"], ["shims/**"]), ["shims/a\nb"], "the held-path glob of the review tier has the same rule")
+
+    def test_a_variant_spelling_of_a_top_tier_path_is_that_path_and_a_path_that_leaves_the_repository_holds(self):
+        review = sb.load_module("plan_review")
+        for path in ("Shims/GH", "shims//gh", "shims/./gh", "shims/x/../gh", "a/../shims/gh", "shims\\gh", "./shims/gh",
+                     "agents/../AGENTS/opencode/../opencode/chief-of-staff.md", "BIN/Plan_Ledger.py", "bin//plan_ledger.py", "bin\\plan_ledger.py"):
+            self.assertEqual(self.decide([path])[0], "hold", repr(path))
+            self.assertEqual(review.path_hits([path], ["shims/**", "agents/**", "bin/plan_ledger.py"]), [path], "review tier: " + repr(path))
+        for path in ("../x", "../../shims/gh", "a/../../x", "shims/../../x", "/etc/x", "/shims/gh", "~/x", "C:/x", "c:\\\\x"):
+            decision, reasons = self.decide([path])
+            self.assertEqual(decision, "hold", repr(path))
+            self.assertTrue(any("outside the repository" in r for r in reasons), reasons)
+            self.assertEqual(review.path_hits([path], ["docs/**"]), [path], "a path that cannot be read inside the repository is held by the review tier too")
+            self.assertEqual(self.floor.floor_paths([path], ["docs/**"], ["docs/x/**"]), [path])
+        for path in ("docs/notes.md", "docs/./notes.md", "Docs//Notes.md", "docs/a/../b.md"):
+            self.assertEqual(self.decide([path])[0], "none", "a variant of a path outside the top tier stays outside: " + repr(path))
+
+    def test_an_exclude_judges_only_the_named_file_a_force_path_and_the_two_tiers_share_one_normaliser(self):
+        globs, exclude, force = ["shims/**"], ["shims/docs/**"], ["shims/docs/keep.md"]
+        self.assertEqual(self.floor.floor_paths(["shims/docs/../gh"], globs, exclude), ["shims/docs/../gh"], "a spelling never moves a path into an exclude")
+        self.assertEqual(self.floor.floor_paths(["shims/docs/x.md", "Shims//Docs//x.md"], globs, exclude), [], "a real excluded file stays excluded, in any spelling")
+        self.assertEqual(self.floor.floor_paths(["shims/./docs/keep.md", "SHIMS/DOCS/KEEP.MD"], globs, exclude, force), ["SHIMS/DOCS/KEEP.MD", "shims/./docs/keep.md"],
+                         "a force path is never excluded, in any spelling")
+        review = sb.load_module("plan_review")
+        for path in ("Shims/GH", "a/../x", "../x", "shims//./gh", "x\\y", "", "/", "..", "a/b/../../..", "bin\\..\\shims\\gh", "/etc/x", "~/x", "C:/x", "c:\\x", "a//b/./c/../d", "Ünï/../Ünï/x", "x\n/../y", "\u017fhims/gh", "\u212aeep/x", "ﬁle", "e\u0301", "\u00e9", "STRASSE/ß", "İ/i̇"):
+            self.assertEqual(review._canonical(path), self.floor.canonical(path), repr(path))
+            self.assertEqual(review._folds(path), self.floor.folds(path), "the fold copies agree: " + repr(path))
+
+    def test_a_unicode_fold_of_a_top_tier_path_is_that_path_on_a_case_and_normalisation_insensitive_file_system(self):
+        review = sb.load_module("plan_review")
+        for path in ("\u017fhims/gh", "\u017fHIMS/Gh", ".github/wor\u212aflows/ci.yml", "agents/opencode/chi\u0065\u0301f.md", "BIN/PLAN_LEDGER.PY"):
+            self.assertEqual(self.decide([path])[0], "hold", repr(path))
+            self.assertEqual(review.path_hits([path], ["shims/**", ".github/workflows/**", "agents/**", "bin/plan_ledger.py"]), [path], "review tier: " + repr(path))
+        self.assertTrue(self.floor.matches("e\u0301.txt", ["\u00e9.txt"]), "a decomposed accent is the composed one, in a glob too")
+        self.assertTrue(self.floor.matches("\u00e9.txt", ["e\u0301.txt"]))
+        self.assertEqual(self.floor.folds("\ufb01"), {"fi", "\ufb01"}, "a ligature folds to its letters, and its lower-case spelling is kept too")
+        self.assertEqual(self.decide(["docs/\u017fhims.md"])[0], "none", "a fold of a name that matches no top tier glob stays outside")
+
+    def test_the_fold_is_a_superset_of_the_old_lower_case_match(self):
+        self.assertTrue(self.floor.matches("shims/\u00df", ["shims/?"]), "casefold turns a sharp s into ss, but the lower-case spelling is still tried")
+        self.assertIn("\u00df", self.floor.folds("\u00df"))
+        for text in ("SHIMS/Gh", "Agents/X.md", "\u00c9COLE"):
+            self.assertTrue({text.lower()} <= self.floor.folds(text), text)
+
+    def home_file(self, name, text):
+        tmp = Path(tempfile.mkdtemp(prefix="ohr"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = tmp / name
+        path.write_text(text)
+        return path
+
+    def test_a_deleted_path_a_renames_old_path_a_case_variant_and_a_cased_class_are_judged(self):
+        self.assertEqual(self.decide(["docs/new-name.md", "shims/gh"])[0], "hold", "a rename out of a shim arrives as its old path")
+        self.assertEqual(self.decide(["SHIMS/Git"])[0], "hold", "case-insensitive")
+        self.assertEqual(self.decide(["x.py"], [("Critical", "Remote", "AVAILABILITY ")])[0], "second-review", "a class name is compared case-insensitively")
+        self.assertEqual(self.decide(["x.py"], [("Critical", "Remote", "Credentials")])[0], "hold")
+        self.assertEqual(self.decide(["x.py"], [("Marginal", "Remote", "credentials")])[0], "second-review", "a medium-band rating of a top tier class asks for a second review")
+
+    def test_s2_a_change_to_the_shims_the_ledger_a_permission_block_or_the_matrix_holds_for_the_owner(self):
+        for path in ("shims/gh", "shims/git", "bin/plan_ledger.py", "agents/opencode/chief-of-staff.md", "docs/review-laws/impact-matrix.json"):
+            decision, reasons = self.decide([path, "docs/notes.md"])
+            self.assertEqual(decision, "hold", path)
+            self.assertTrue(any(path in reason for reason in reasons), (path, reasons))
+
+    def test_s3_the_launchd_template_the_cloud_image_and_a_docs_file_do_not_hold_for_the_owner(self):
+        paths = ["templates/com.fleet-kit.switchboard.plist", "cloud/launcher/Dockerfile", "docs/switchboard.md"]
+        decision, reasons = self.decide(paths)
+        self.assertEqual(decision, "second-review", reasons)
+        self.assertEqual(reasons, ["floor: 1 path(s) outside the top tier ask for a second independent review"])
+        for path in paths:
+            self.assertNotEqual(self.decide([path])[0], "hold", path)
+
+    def test_s4_only_a_top_tier_or_unknown_class_at_a_hold_level_holds(self):
+        self.assertEqual(self.decide(["x.py"], [("Critical", "Remote", "credentials")])[0], "hold")
+        self.assertEqual(self.decide(["x.py"], [("Critical", "Remote", "a-class-nobody-named")])[0], "hold")
+        decision, reasons = self.decide(["x.py"], [("Critical", "Remote", "availability")])
+        self.assertEqual(decision, "second-review", reasons)
+
+    def test_s5_a_rating_with_no_class_is_top_tier(self):
+        self.assertEqual(self.decide(["x.py"], [("Critical", "Remote", None)])[0], "hold")
+        self.assertEqual(self.decide(["x.py"], [("Negligible", "Improbable", None)])[0], "none", "a low rating asks for nothing, class or not")
+
+    def test_s6_a_diff_that_cannot_be_read_in_full_holds(self):
+        decision, reasons = self.decide([], unknown="the file list was cut off")
+        self.assertEqual(decision, "hold")
+        self.assertIn("floor unknown", reasons[0])
+
+    def test_s7_this_slices_own_files_hold_for_the_owner(self):
+        decision, reasons = self.decide(["bin/impact_floor.py", "docs/review-laws/impact-matrix.json", "bin/test-switchboard"])
+        self.assertEqual(decision, "hold")
+        joined = " ".join(reasons)
+        self.assertIn("bin/impact_floor.py", joined)
+        self.assertIn("docs/review-laws/impact-matrix.json", joined)
+
+    def test_s11_a_change_to_the_files_list_changes_the_decision_with_no_code_change(self):
+        before = self.decide(["tools/new-gate.sh"])
+        edited = json.loads(json.dumps(self.matrix))
+        edited["owner_hold"]["top_tier_paths"]["authority"].append("tools/new-gate.sh")
+        after = self.decide(["tools/new-gate.sh"], matrix=edited)
+        self.assertEqual((before[0], after[0]), ("none", "hold"))
+        edited["owner_hold"]["other_classes"].append("a-class-nobody-named")
+        self.assertEqual(self.decide(["x.py"], [("Critical", "Remote", "a-class-nobody-named")], matrix=edited)[0], "second-review")
+
+    def test_a_matrix_with_no_owner_hold_block_changes_nothing_for_the_old_floor_and_the_old_floor_is_read_from_the_file(self):
+        globs, exclude, force = self.floor.floor_for("adamkaplan/fleet-kit")
+        self.assertIn("shims/**", globs)
+        self.assertIn("bin/impact_floor.py", force)
+        self.assertEqual(self.floor.floor_for("someone/else"), ([], [], []))
+        self.assertIsNone(self.floor.owner_hold_rule({}))
+        self.assertTrue(self.floor.class_is_top_tier({}, "availability"), "no block: everything is top tier (fail closed)")
 
 
 class TestDecisionIdForms(WriteWorld):

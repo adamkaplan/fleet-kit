@@ -11,6 +11,7 @@ these entries alone; nothing an agent says decides it.
 """
 
 import re
+import unicodedata
 
 TIERS = ("light", "normal", "full")
 LANES = {
@@ -55,7 +56,7 @@ def _glob_regex(glob):
             out, i = out + "[^/]", i + 1
         else:
             out, i = out + re.escape(glob[i]), i + 1
-    return re.compile("^" + out + "$")
+    return re.compile(out, re.DOTALL)   # matched with fullmatch: a newline in a path never escapes a glob
 
 
 def _norm_path(path):
@@ -67,10 +68,42 @@ def _norm_path(path):
     return path[1:] if path.startswith("/") else path
 
 
+def _folds(text):
+    """A COPY of `impact_floor.folds`: the NFC and the NFD form of the casefold and of the lower-case (a parity test keeps them equal)."""
+    text = str(text)
+    return frozenset(unicodedata.normalize(form, getattr(unicodedata.normalize(form, text), method)()) for form in ("NFC", "NFD") for method in ("casefold", "lower"))
+
+
+def _canonical(path):
+    """(the path as the file system reads it, folded, escapes). A COPY of `impact_floor.canonical` (this core imports no project module, so it cannot
+    load it): a test runs both on one corpus and fails when they disagree."""
+    text = str(path).replace("\\", "/")
+    parts, escapes = [], text.startswith(("/", "~")) or bool(re.match(r"^[A-Za-z]:", text))
+    for segment in text.split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == "..":
+            if parts:
+                parts.pop()
+            else:
+                escapes = True
+            continue
+        parts.append(segment)
+    return unicodedata.normalize("NFD", "/".join(parts)).casefold(), escapes
+
+
 def path_hits(paths, held_globs):
-    """The paths that match any held-path glob (`**` across directories, `*` within a name). Deterministic."""
-    compiled = [_glob_regex(g) for g in held_globs or ()]
-    return sorted({str(p) for p in paths or () if any(c.match(_norm_path(p)) for c in compiled)})
+    """The paths that match any held-path glob (`**` across directories, `*` within a name), case- and normalisation-insensitively and as the file the path
+    names (`Shims//gh`, `shims/./gh`, `shims\\gh`, `a/../shims/gh` and a long-s `\u017fhims/gh` are `shims/gh`); a path that leaves the repository is a hit
+    (when in doubt, hold). Deterministic."""
+    compiled = [_glob_regex(form) for g in held_globs or () for form in _folds(g)]
+    hits = set()
+    for p in paths or ():
+        named, escapes = _canonical(p)
+        texts = _folds(_norm_path(p)) | _folds(named) | _folds(p)
+        if escapes or any(c.fullmatch(text) for c in compiled for text in texts):
+            hits.add(str(p))
+    return sorted(hits)
 
 
 def lanes_for_tier(tier, held_area=False):
