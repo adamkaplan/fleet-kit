@@ -1,6 +1,6 @@
 ---
 name: fleet-setup
-description: How the Chief of Staff commissions a new project — its own GitHub repo, herdr workspace and orchestrator — as a decision the person makes, then a worker's job, then a check that the switchboard watches it. Use when your principal asks for a new project, a new repo, or an orchestrator for a repo that has none. Not for adding work to a project that already has an orchestrator.
+description: How the Chief of Staff commissions a new project — its own GitHub repo, herdr workspace and orchestrator — as a decision the person makes, then a worker's job, then a check that the switchboard watches it. Use when your principal asks for a new project, a new repo, or an orchestrator for a repo that has none. Also how to split an overloaded orchestrator's work into a second lane on the same repo. Not for adding work to a project that already has an orchestrator with room for it.
 ---
 
 # Commissioning a project
@@ -135,3 +135,111 @@ project commissioned. When a repo that already exists joins, run
 `fleet-switchboard labels ensure --repo <owner>/<repo>` yourself. Your standing orders
 are the owner's one file, `standing-orders.md` beside the switchboard config
 (`fleet-switchboard orders --cos`): with none, say once that nothing is answered for them.
+
+---
+
+## Splitting a project into lanes
+
+A lane is one orchestrator and its charter. Use this when one orchestrator holds more
+asks than it moves (several orchestrators on one repo): the project stays one repo, but
+the asks are shared out. You decide what to split; this section is only how. The
+person's words are never changed on the way, and the new lane starts with what the old
+one knew.
+
+Two commands below, `fleet-switchboard orders copy` and `fleet-switchboard move`, are
+run by the operator (the person at a shell), or by you once your permission list allows
+them. Until it does, they are the operator's: ask the person to run them, give them the
+exact command, and do not claim the step is done before you have seen its output.
+
+### Lane step 1 — The workspace and the orchestrator
+
+```
+CHECK:   The person agreed to the split, quoted. The repo is already watched
+         (STEP 4 above), and its account is already set (STEP 1).
+DO:      Launch the new orchestrator into its OWN workspace on the same repo, with a
+         brief on stdin:
+           fleet-switchboard launch <name> --agent orchestrator --role orchestrator \
+             --dir <checkout> --new-workspace "<label>" --repo <owner>/<repo> \
+             --reports-to chief-of-staff --brief-file -
+         The checkpoint line of the brief is machine-readable, in exactly this form
+         (`launch` reads it and sets both reminders):
+           CHECKPOINT: Report at 30 minutes (kind working, one line); overdue at 60.
+VERIFY:  The launch prints a session and a pane, and says it set the checkpoint reminders.
+PROVES:  A second orchestrator, in its own workspace, working as the repo's account.
+```
+
+### Lane step 2 — The charter
+
+```
+CHECK:   The new orchestrator's brief asks it to open its own charter (the
+         fleet-charter skill) in the same repo.
+DO:      The charter's `workspace:` line is the new workspace's label, exactly, and
+         its name differs from the old lane's. Its own `## Standing orders` section
+         stays empty until step 4.
+VERIFY:  The charter issue exists and `fleet-switchboard status` lists the new
+         orchestrator with its charter number.
+PROVES:  The new lane has somewhere for asks to live.
+```
+
+### Lane step 3 — The labels
+
+```
+CHECK:   `fleet-switchboard labels ensure --repo <owner>/<repo>` (it only adds what is
+         missing, so it is safe to run again).
+DO:      Put the orchestrator label on the new charter. Every ask keeps the labels it
+         has.
+VERIFY:  The new charter carries <user>:orchestrator.
+PROVES:  The switchboard can tell the new charter from an ask.
+```
+
+### Lane step 4 — The standing orders, copied
+
+```
+CHECK:   Read the sibling charter's orders: fleet-switchboard orders list --charter <old charter>
+DO:      Run this (the operator's command, or yours once your permissions allow it).
+         It copies them word for word from the sibling, with their original dates:
+           fleet-switchboard orders copy --source <old charter> --charter <new charter>
+         The command carries each order exactly as the person gave it and prints what it
+         did, one line per order and one summary line. Never retype, shorten or reword an
+         order, and never add one the sibling does not hold: the new lane has the
+         person's existing words and nothing more. An order that fails is named; run
+         the command again and it copies only what is missing.
+VERIFY:  The summary line says how many copied and how many failed (none failed), and
+         `orders list --charter <new charter>` matches the sibling's list.
+PROVES:  The new lane works under the same standing orders as the old one.
+```
+
+### Lane step 5 — Coders finishing under their old boss
+
+```
+CHECK:   fleet-switchboard status: which coders work on the asks that will move.
+DO:      Leave them. A coder that is working keeps its recorded boss: it finishes
+         under the orchestrator that launched it, reports to it, and is retired by it.
+         Only new work launched after the move reports to the new orchestrator.
+VERIFY:  After the move, `fleet-switchboard status` shows each of those coders still
+         reporting to the old orchestrator.
+PROVES:  Nothing a worker was told, or owes, changed under it.
+```
+
+### Lane step 6 — Move the asks, with their handover
+
+```
+CHECK:   The asks to move are named, each open, each under the old charter.
+DO:      One command per ask (the operator's command, or yours once your permissions
+         allow it):
+           fleet-switchboard move <ask> --to <new charter>
+         It re-parents the ask (never its text), carries the old orchestrator's
+         reminders on it to the new one, sends the new orchestrator a handover note and
+         the old one a notice naming the coders still finishing, and prints the asks the
+         old charter still holds. Read that list: an ask nobody named is still there.
+         A handover note has these six sections, and the move writes them for you:
+           ## State
+           ## Pull requests and heads
+           ## Branches
+           ## Workers
+           ## Waits
+           ## Reminders
+VERIFY:  The new orchestrator's own list of asks (`fleet-switchboard intents`) shows it.
+PROVES:  The ask is under the new lane and nothing about it was lost.
+```
+
