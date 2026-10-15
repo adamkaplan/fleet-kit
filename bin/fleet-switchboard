@@ -18263,9 +18263,9 @@ def chat_clear_live_now(engine):
     if (Path(engine.state_dir) / CHAT_CLEAR_OFF_FILE).exists():
         return False, "kill file"
     try:
-        current = chat_clear_config((getattr(engine, "config_reader", None) or load_runnable_config)())
-    except Exception:   # an invalid, unreadable or missing config file: never live on a file that cannot be read
-        return False, "config invalid"
+        current = chat_clear_config(load_runnable_config())
+    except Exception as err:   # an invalid, unreadable or missing config file: never live on a file that cannot be read
+        return False, "config invalid: %s" % _one_line(str(err), 120)
     if not (current["live"] and current["enabled"]):
         return False, "config says shadow"
     return True, None
@@ -18338,7 +18338,8 @@ def _chat_clear_pass(engine, decisions, now):
             engine.audit.append(engine.actor, "chat_clear.dropped", "chat_clear", {"message_id": message["id"], "why": "the offers went away before the message was judged"})
             return
         verdict = cc.decide(engine.jev, message["text"], offers, message["created"], now, bar)
-        _chat_clear_act(engine, cc, cfg, message, verdict, offers, current_heads, now)
+        live_now, _ = chat_clear_live_now(engine)   # AGAIN, right before acting: a kill file or a broken config that appears during this pass stops the very next message
+        _chat_clear_act(engine, cc, dict(cfg, live=live_now), message, verdict, offers, current_heads, now)
 
 
 def _chat_clear_act(engine, cc, cfg, message, verdict, offers, current_heads, now):

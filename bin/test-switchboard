@@ -12382,7 +12382,9 @@ class TestChatClearHook(Base):
         self.hook()
         self.hook()
         modes = self.events("chat_clear.mode")
-        self.assertEqual([m["detail"]["mode"] for m in modes], ["shadow (config invalid)"], "said ONCE, loudly")
+        self.assertEqual([m["detail"]["mode"][:23] for m in modes], ["shadow (config invalid: "[:23]], "said ONCE, loudly")
+        self.assertIn("config invalid: ", modes[0]["detail"]["mode"])
+        self.assertTrue(modes[0]["detail"]["why"].startswith("config invalid: "), "and the reason is said, so the owner knows what to fix")
         self.say("9 is good to go")
         self.hook()
         self.assertEqual((self.writes, self.live_verdicts()), ([], [False]))
@@ -12404,6 +12406,34 @@ class TestChatClearHook(Base):
         self.hook()
         self.assertEqual(self.live_verdicts()[-1:], [True], "removed: back to the config's value")
         self.assertEqual(bool(self.label_deletes()), True)
+
+    def test_a_kill_file_or_a_broken_config_that_appears_between_two_messages_of_one_pass_stops_the_second_one(self):
+        self.live = True
+        self.build()
+        self.hook()
+        self.say("all impacts cleared")
+        self.world.tick(1)
+        self.world.v2.start_turn(self.world.sessions["cos"], "9 is good to go", fleet=False, lasts=0)
+        order = []
+        real_act = sb._chat_clear_act
+
+        def spy(engine, cc_, cfg, message, verdict, offers, heads, now):
+            order.append((message["text"], cfg["live"]))
+            if len(order) == 1:
+                (Path(self.world.state) / sb.CHAT_CLEAR_OFF_FILE).write_text("")   # the stop is hit after the first message was handled
+            return real_act(engine, cc_, cfg, message, verdict, offers, heads, now)
+
+        with mock.patch.object(sb, "_chat_clear_act", spy):
+            self.hook()
+        self.assertEqual([live for _, live in order], [True, False], "the second message of the same pass is judged shadow: %r" % order)
+        self.assertEqual(self.label_deletes(), [], "nothing was cleared by the second message")
+        self.build()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "chat_clear": {"live": True}})
+        Path(self.config_file).unlink()
+        self.hook()
+        self.say("9 is good to go")
+        self.hook()
+        self.assertEqual((self.writes, self.live_verdicts()[-1:]), ([], [False]), "a config file that is gone is not live")
 
     def test_the_hook_fails_quietly_and_never_clears_on_trouble(self):
         self.live = True
