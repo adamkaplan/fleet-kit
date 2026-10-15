@@ -24569,6 +24569,33 @@ class TestImpactFloorCommandAndPass(LedgerBase):
         sb.impact_would_hold_pass(engine, t + 400)
         self.assertEqual(len([e for e in self.world.audit() if e["event"] == "gate.would_hold"]), 2, "a new head is judged again")
 
+    def test_an_unreadable_matrix_file_is_said_loudly_by_the_pass_and_the_command_never_read_as_no_floor(self):
+        mod = sb.load_module("impact_floor")
+        broken = mock.patch.object(mod, "floor_for", side_effect=mod.MatrixError("the impact matrix file cannot be read (OSError: gone)"))
+        hub = FakeHub({"acme/app": [{"number": 9, "head": {"sha": LEDGER_HEAD}, "body": "PLAN: acme/app#7", "draft": False}]})
+        engine = self.world.new_engine("daemon")
+        engine.hub, engine.gh_runner = hub, self.route
+        engine.config, engine.state_dir = sb.load_config(), self.world.state
+        sb.ci_record_pass(engine, 100000.0)
+        with broken:
+            sb.impact_would_hold_pass(engine, 100000.0)
+            code, out, err = self.run_as("coder", "impact", "hold", "--dry-run")
+        self.assertEqual([e for e in self.world.audit() if e["event"] == "gate.would_hold"], [], "no judgement is made")
+        errors = [e for e in self.world.audit() if e["event"] == "impact.error"]
+        self.assertEqual([e["detail"].get("floor") for e in errors], ["unreadable"], "the pass says so, loudly")
+        self.assertEqual(code, sb.EXIT_ERROR)
+        self.assertEqual(len([line for line in err.splitlines() if line.strip()]), 1, err)
+        self.assertIn("cannot be read", err)
+
+    def test_the_floor_report_carries_the_owner_hold_tier_as_advisory_information(self):
+        report = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])
+        self.assertEqual(report["decision"], "hold", "the labels still follow the old decision")
+        self.assertEqual(report["owner_decision"], "second-review", "a floor path outside the top tier: no owner clear")
+        self.pr.update({"changedFiles": 1, "files": [{"path": "shims/gh", "additions": 1, "deletions": 0}]})
+        report = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])
+        self.assertEqual(report["owner_decision"], "hold")
+        self.assertTrue(any("shims/gh" in reason for reason in report["owner_reasons"]), report["owner_reasons"])
+
     def test_the_pass_is_off_when_disabled_or_killed_and_unlisted_repos_are_not_read(self):
         for edit in ("disabled", "killed"):
             with self.subTest(edit=edit):
@@ -48404,7 +48431,7 @@ class TestPlanReviewCore(unittest.TestCase):
         tree = ast.parse((BIN / "plan_review.py").read_text())
         imported = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
         imported |= {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
-        self.assertEqual(imported, {"re"}, "no file, network, clock or GitHub access in the pure core")
+        self.assertEqual(imported, {"re", "unicodedata"}, "no file, network, clock or GitHub access in the pure core (unicodedata is a table lookup)")
 
     def test_an_ask_epic_or_cos_ask_is_always_full_and_a_request_only_raises(self):
         for kind in ("ask", "epic", "cos_ask"):
@@ -51743,6 +51770,179 @@ class TestDecisionsStaleBound(unittest.TestCase):
         stale = [line for line in lines if "120 s" in line and ("stale" in line or "Staleness" in line or "not updating" in line or "older than" in line)]
         self.assertEqual(stale, [])
         self.assertGreaterEqual(len([line for line in lines if "180 s" in line and ("stale" in line or "Staleness" in line or "not updating" in line or "older than" in line)]), 4)
+
+
+class TestOwnerHoldRule(unittest.TestCase):
+    """Ask #451, slice 1: the owner's own clear is for credentials, identity and who may do what only. The rule is data in the impact matrix file."""
+
+    def setUp(self):
+        self.floor = sb.load_module("impact_floor")
+        self.matrix = self.floor.load_matrix()
+
+    def decide(self, paths, impacts=(), unknown=None, matrix=None):
+        matrix = matrix or self.matrix
+        globs, exclude, force = self.floor.floor_for("adamkaplan/fleet-kit")
+        hit = self.floor.floor_paths(paths, globs, exclude, force)
+        return self.floor.owner_decide(matrix, paths, list(impacts), unknown, hit)
+
+    def test_s1_the_decision_code_names_no_path_or_class_and_agrees_with_the_file(self):
+        import ast
+        tree = ast.parse((BIN / "impact_floor.py").read_text())
+        docstrings = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.FunctionDef, ast.ClassDef)) and node.body and isinstance(node.body[0], ast.Expr) \
+                    and isinstance(node.body[0].value, ast.Constant):
+                docstrings.add(id(node.body[0].value))
+        constants = {n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str) and id(n) not in docstrings}
+        block = self.matrix["owner_hold"]
+        from_file = set(block["top_tier_classes"]) | set(block["other_classes"]) | {g for globs in block["top_tier_paths"].values() for g in globs}
+        from_file |= {g for entry in block["floor"].values() for key in ("globs", "exclude", "force") for g in entry.get(key, [])}
+        self.assertTrue(from_file)
+        self.assertEqual(sorted(constants & from_file), [], "a path or class of the matrix file is written in the module's code")
+
+    def test_every_top_tier_path_is_inside_the_floor_or_listed_as_outside_it(self):
+        block = self.matrix["owner_hold"]
+        outside = set(block["top_tier_outside_floor"])
+        globs, exclude, force = self.floor.floor_for("adamkaplan/fleet-kit")
+        for cls, patterns in block["top_tier_paths"].items():
+            for pattern in patterns:
+                sample = pattern.replace("**", "x").replace("*", "x")
+                inside = bool(self.floor.floor_paths([sample], globs, exclude, force))
+                self.assertTrue(inside != (pattern in outside), "%s (%s): inside the floor %s, listed as outside it %s" % (pattern, cls, inside, pattern in outside))
+
+    def test_a_missing_or_malformed_block_holds_every_change_and_a_broken_file_is_never_read_as_no_floor(self):
+        for broken in ({}, {"owner_hold": "x"}, {"owner_hold": {"top_tier_classes": ["credentials"], "other_classes": [], "top_tier_paths": {"credentials": "shims/gh"}}},
+                       {"owner_hold": {"top_tier_classes": ["credentials"], "other_classes": [], "top_tier_paths": {}}}):
+            decision, reasons = self.floor.owner_decide(broken, ["docs/notes.md"], [])
+            self.assertEqual(decision, "hold", broken)
+            self.assertIn("missing or malformed", reasons[0])
+        bad = self.home_file("matrix.json", "{not json")
+        with mock.patch.object(self.floor, "MATRIX_PATH", bad):
+            self.floor._MATRIX_CACHE.clear()
+            with self.assertRaises(self.floor.MatrixError):
+                self.floor.floor_for("adamkaplan/fleet-kit")
+        self.floor._MATRIX_CACHE.clear()
+        self.assertTrue(self.floor.floor_for("adamkaplan/fleet-kit")[0], "the real file reads again")
+
+    def test_an_odd_character_in_a_path_never_escapes_a_glob_and_a_suffix_never_makes_an_exact_file_match(self):
+        for path in ("shims/a\nb", "shims/a\tb", "shims/a\x00b", "shims/a b ", "shims/" + "x" * 5000, "agents/x\nz.md", "agents/opencode/\x00x.md",
+                     "plugins/fleet-hooks/a\nb", "SHIMS/A\nB"):
+            self.assertEqual(self.decide([path])[0], "hold", repr(path[:40]))
+            self.assertTrue(self.floor.matches(path, ["shims/**", "agents/**", "plugins/fleet-hooks/**"]), repr(path[:40]))
+        for path in ("bin/plan_ledger.py\nx", "bin/plan_ledger.py\n", "bin/plan_ledger.py ", "bin/plan_ledger.pyx"):
+            self.assertEqual(self.decide([path])[0], "none", "an exact file with a suffix is a different file: %r" % path)
+        self.assertEqual(self.decide(["bin/plan_ledger.py"])[0], "hold")
+        review = sb.load_module("plan_review")
+        self.assertEqual(review.path_hits(["shims/a\nb", "docs/x.md"], ["shims/**"]), ["shims/a\nb"], "the held-path glob of the review tier has the same rule")
+
+    def test_a_variant_spelling_of_a_top_tier_path_is_that_path_and_a_path_that_leaves_the_repository_holds(self):
+        review = sb.load_module("plan_review")
+        for path in ("Shims/GH", "shims//gh", "shims/./gh", "shims/x/../gh", "a/../shims/gh", "shims\\gh", "./shims/gh",
+                     "agents/../AGENTS/opencode/../opencode/chief-of-staff.md", "BIN/Plan_Ledger.py", "bin//plan_ledger.py", "bin\\plan_ledger.py"):
+            self.assertEqual(self.decide([path])[0], "hold", repr(path))
+            self.assertEqual(review.path_hits([path], ["shims/**", "agents/**", "bin/plan_ledger.py"]), [path], "review tier: " + repr(path))
+        for path in ("../x", "../../shims/gh", "a/../../x", "shims/../../x", "/etc/x", "/shims/gh", "~/x", "C:/x", "c:\\\\x"):
+            decision, reasons = self.decide([path])
+            self.assertEqual(decision, "hold", repr(path))
+            self.assertTrue(any("outside the repository" in r for r in reasons), reasons)
+            self.assertEqual(review.path_hits([path], ["docs/**"]), [path], "a path that cannot be read inside the repository is held by the review tier too")
+            self.assertEqual(self.floor.floor_paths([path], ["docs/**"], ["docs/x/**"]), [path])
+        for path in ("docs/notes.md", "docs/./notes.md", "Docs//Notes.md", "docs/a/../b.md"):
+            self.assertEqual(self.decide([path])[0], "none", "a variant of a path outside the top tier stays outside: " + repr(path))
+
+    def test_an_exclude_judges_only_the_named_file_a_force_path_and_the_two_tiers_share_one_normaliser(self):
+        globs, exclude, force = ["shims/**"], ["shims/docs/**"], ["shims/docs/keep.md"]
+        self.assertEqual(self.floor.floor_paths(["shims/docs/../gh"], globs, exclude), ["shims/docs/../gh"], "a spelling never moves a path into an exclude")
+        self.assertEqual(self.floor.floor_paths(["shims/docs/x.md", "Shims//Docs//x.md"], globs, exclude), [], "a real excluded file stays excluded, in any spelling")
+        self.assertEqual(self.floor.floor_paths(["shims/./docs/keep.md", "SHIMS/DOCS/KEEP.MD"], globs, exclude, force), ["SHIMS/DOCS/KEEP.MD", "shims/./docs/keep.md"],
+                         "a force path is never excluded, in any spelling")
+        review = sb.load_module("plan_review")
+        for path in ("Shims/GH", "a/../x", "../x", "shims//./gh", "x\\y", "", "/", "..", "a/b/../../..", "bin\\..\\shims\\gh", "/etc/x", "~/x", "C:/x", "c:\\x", "a//b/./c/../d", "Ünï/../Ünï/x", "x\n/../y", "\u017fhims/gh", "\u212aeep/x", "ﬁle", "e\u0301", "\u00e9", "STRASSE/ß", "İ/i̇"):
+            self.assertEqual(review._canonical(path), self.floor.canonical(path), repr(path))
+            self.assertEqual(review._folds(path), self.floor.folds(path), "the fold copies agree: " + repr(path))
+
+    def test_a_unicode_fold_of_a_top_tier_path_is_that_path_on_a_case_and_normalisation_insensitive_file_system(self):
+        review = sb.load_module("plan_review")
+        for path in ("\u017fhims/gh", "\u017fHIMS/Gh", ".github/wor\u212aflows/ci.yml", "agents/opencode/chi\u0065\u0301f.md", "BIN/PLAN_LEDGER.PY"):
+            self.assertEqual(self.decide([path])[0], "hold", repr(path))
+            self.assertEqual(review.path_hits([path], ["shims/**", ".github/workflows/**", "agents/**", "bin/plan_ledger.py"]), [path], "review tier: " + repr(path))
+        self.assertTrue(self.floor.matches("e\u0301.txt", ["\u00e9.txt"]), "a decomposed accent is the composed one, in a glob too")
+        self.assertTrue(self.floor.matches("\u00e9.txt", ["e\u0301.txt"]))
+        self.assertEqual(self.floor.folds("\ufb01"), {"fi", "\ufb01"}, "a ligature folds to its letters, and its lower-case spelling is kept too")
+        self.assertEqual(self.decide(["docs/\u017fhims.md"])[0], "none", "a fold of a name that matches no top tier glob stays outside")
+
+    def test_the_fold_is_a_superset_of_the_old_lower_case_match(self):
+        self.assertTrue(self.floor.matches("shims/\u00df", ["shims/?"]), "casefold turns a sharp s into ss, but the lower-case spelling is still tried")
+        self.assertIn("\u00df", self.floor.folds("\u00df"))
+        for text in ("SHIMS/Gh", "Agents/X.md", "\u00c9COLE"):
+            self.assertTrue({text.lower()} <= self.floor.folds(text), text)
+
+    def home_file(self, name, text):
+        tmp = Path(tempfile.mkdtemp(prefix="ohr"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = tmp / name
+        path.write_text(text)
+        return path
+
+    def test_a_deleted_path_a_renames_old_path_a_case_variant_and_a_cased_class_are_judged(self):
+        self.assertEqual(self.decide(["docs/new-name.md", "shims/gh"])[0], "hold", "a rename out of a shim arrives as its old path")
+        self.assertEqual(self.decide(["SHIMS/Git"])[0], "hold", "case-insensitive")
+        self.assertEqual(self.decide(["x.py"], [("Critical", "Remote", "AVAILABILITY ")])[0], "second-review", "a class name is compared case-insensitively")
+        self.assertEqual(self.decide(["x.py"], [("Critical", "Remote", "Credentials")])[0], "hold")
+        self.assertEqual(self.decide(["x.py"], [("Marginal", "Remote", "credentials")])[0], "second-review", "a medium-band rating of a top tier class asks for a second review")
+
+    def test_s2_a_change_to_the_shims_the_ledger_a_permission_block_or_the_matrix_holds_for_the_owner(self):
+        for path in ("shims/gh", "shims/git", "bin/plan_ledger.py", "agents/opencode/chief-of-staff.md", "docs/review-laws/impact-matrix.json"):
+            decision, reasons = self.decide([path, "docs/notes.md"])
+            self.assertEqual(decision, "hold", path)
+            self.assertTrue(any(path in reason for reason in reasons), (path, reasons))
+
+    def test_s3_the_launchd_template_the_cloud_image_and_a_docs_file_do_not_hold_for_the_owner(self):
+        paths = ["templates/com.fleet-kit.switchboard.plist", "cloud/launcher/Dockerfile", "docs/switchboard.md"]
+        decision, reasons = self.decide(paths)
+        self.assertEqual(decision, "second-review", reasons)
+        self.assertEqual(reasons, ["floor: 1 path(s) outside the top tier ask for a second independent review"])
+        for path in paths:
+            self.assertNotEqual(self.decide([path])[0], "hold", path)
+
+    def test_s4_only_a_top_tier_or_unknown_class_at_a_hold_level_holds(self):
+        self.assertEqual(self.decide(["x.py"], [("Critical", "Remote", "credentials")])[0], "hold")
+        self.assertEqual(self.decide(["x.py"], [("Critical", "Remote", "a-class-nobody-named")])[0], "hold")
+        decision, reasons = self.decide(["x.py"], [("Critical", "Remote", "availability")])
+        self.assertEqual(decision, "second-review", reasons)
+
+    def test_s5_a_rating_with_no_class_is_top_tier(self):
+        self.assertEqual(self.decide(["x.py"], [("Critical", "Remote", None)])[0], "hold")
+        self.assertEqual(self.decide(["x.py"], [("Negligible", "Improbable", None)])[0], "none", "a low rating asks for nothing, class or not")
+
+    def test_s6_a_diff_that_cannot_be_read_in_full_holds(self):
+        decision, reasons = self.decide([], unknown="the file list was cut off")
+        self.assertEqual(decision, "hold")
+        self.assertIn("floor unknown", reasons[0])
+
+    def test_s7_this_slices_own_files_hold_for_the_owner(self):
+        decision, reasons = self.decide(["bin/impact_floor.py", "docs/review-laws/impact-matrix.json", "bin/test-switchboard"])
+        self.assertEqual(decision, "hold")
+        joined = " ".join(reasons)
+        self.assertIn("bin/impact_floor.py", joined)
+        self.assertIn("docs/review-laws/impact-matrix.json", joined)
+
+    def test_s11_a_change_to_the_files_list_changes_the_decision_with_no_code_change(self):
+        before = self.decide(["tools/new-gate.sh"])
+        edited = json.loads(json.dumps(self.matrix))
+        edited["owner_hold"]["top_tier_paths"]["authority"].append("tools/new-gate.sh")
+        after = self.decide(["tools/new-gate.sh"], matrix=edited)
+        self.assertEqual((before[0], after[0]), ("none", "hold"))
+        edited["owner_hold"]["other_classes"].append("a-class-nobody-named")
+        self.assertEqual(self.decide(["x.py"], [("Critical", "Remote", "a-class-nobody-named")], matrix=edited)[0], "second-review")
+
+    def test_a_matrix_with_no_owner_hold_block_changes_nothing_for_the_old_floor_and_the_old_floor_is_read_from_the_file(self):
+        globs, exclude, force = self.floor.floor_for("adamkaplan/fleet-kit")
+        self.assertIn("shims/**", globs)
+        self.assertIn("bin/impact_floor.py", force)
+        self.assertEqual(self.floor.floor_for("someone/else"), ([], [], []))
+        self.assertIsNone(self.floor.owner_hold_rule({}))
+        self.assertTrue(self.floor.class_is_top_tier({}, "availability"), "no block: everything is top tier (fail closed)")
 
 
 class TestDecisionIdForms(WriteWorld):

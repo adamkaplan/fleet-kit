@@ -7,26 +7,62 @@ no label (that is slice L4)."""
 import fnmatch
 import json
 import re
+import unicodedata
 from pathlib import Path
 
-# The floor globs per repo, a proposal the owner confirms: the gh shim (signing and gates), the policy hook, the service units, the
-# permissions generator and the ledger format. fleet-kit has no migrations directory and no declared public API files, so none are named.
-# Excluded: definitions and docs are already captain PRs, and including them would hold nearly every PR.
-DEFAULT_FLOORS = {
-    "adamkaplan/fleet-kit": {
-        "globs": ["shims/**", "plugins/fleet-hooks/**", "templates/**", "tools/cos-permissions-proof/**", "bin/plan_ledger.py",
-                  "bin/impact_floor.py", "docs/review-laws/impact-matrix.json"],
-        "exclude": ["agents/**", "skills/**", "docs/**", "AGENTS.md"],
-        # the logic and the table that decide holds are never excluded with the docs: changing them must hold
-        "force": ["bin/impact_floor.py", "docs/review-laws/impact-matrix.json"],
-    },
-}
 ACTION_HOLD, ACTION_SECOND, ACTION_NONE = "H", "2", "."
 MATRIX_PATH = Path(__file__).resolve().parent.parent / "docs" / "review-laws" / "impact-matrix.json"
 
 
+class MatrixError(ValueError):
+    """The impact matrix file cannot be read or has no usable `owner_hold.floor`. Never swallowed: the floor lived in code and could not fail to load, so a
+    file that cannot be read stops the decision, and the callers (the daemon pass and the `impact hold` command) say so loudly (`impact.error`, one line and
+    a non-zero exit) and make no judgement; they never read it as "no floor"."""
+
+
+_MATRIX_CACHE = {}
+
+
+def _matrix_cached():
+    """The matrix file, re-read only when it changes (the daemon asks per record per pass)."""
+    try:
+        stamp = MATRIX_PATH.stat().st_mtime_ns
+        if _MATRIX_CACHE.get("stamp") != stamp:
+            _MATRIX_CACHE.update({"stamp": stamp, "matrix": load_matrix()})
+        return _MATRIX_CACHE["matrix"]
+    except (OSError, ValueError) as err:
+        _MATRIX_CACHE.clear()
+        raise MatrixError("the impact matrix file cannot be read (%s: %s)" % (type(err).__name__, err)) from None
+
+
+def default_floors(matrix=None):
+    """The built-in floor per repo, read from the matrix file's `owner_hold.floor` (a proposal the owner confirms): the code names no path. Raises
+    MatrixError when the file cannot be read or holds no `owner_hold.floor` object."""
+    floors = ((matrix if matrix is not None else _matrix_cached()).get("owner_hold") or {}).get("floor")
+    if not isinstance(floors, dict):
+        raise MatrixError("the impact matrix file has no owner_hold.floor object")
+    return {name: entry for name, entry in floors.items() if isinstance(entry, dict)}
+
+
+_FOLDS = {}
+
+
+def folds(text):
+    """The case- and normalisation-folded spellings of `text`: the NFC and the NFD form of its casefold AND of its lower-case (so this is a superset of what
+    `str.lower()` alone gave). A case-insensitive, normalisation-insensitive file system (APFS) reads `SHIMS/gh`, `\u017fhims/gh` (a long s) and a decomposed
+    accent as one file, and `str.lower()` misses most of them. ALL forms are tried (when in doubt, hold: a fold that makes an unrelated path hit only adds a hold)."""
+    text = str(text)
+    got = _FOLDS.get(text)
+    if got is None:
+        got = frozenset(unicodedata.normalize(form, getattr(unicodedata.normalize(form, text), method)()) for form in ("NFC", "NFD") for method in ("casefold", "lower"))
+        if len(_FOLDS) < 20000:
+            _FOLDS[text] = got
+    return got
+
+
 def _glob_regex(pattern):
-    return _compiled(pattern.lower())
+    """The compiled regexes of a glob, one per folded form of it."""
+    return [_compiled(form) for form in folds(pattern)]
 
 
 _CACHE = {}
@@ -57,19 +93,51 @@ def _build(pattern):
         else:
             out.append(re.escape(pattern[i]))
             i += 1
-    return re.compile("^" + "".join(out) + "$")
+    return re.compile("".join(out), re.DOTALL)   # DOTALL and fullmatch (below): a newline, a tab or a NUL in a path never escapes a glob, and a trailing newline never makes an exact file match
+
+
+def canonical(path):
+    """(the path as the file system would read it, lower-cased, escapes): backslashes become `/`, empty and `.` segments are dropped, `..` removes the
+    segment before it. `escapes` is True when a `..` has nothing to remove, or the path is absolute, starts with `~` or a drive letter (the path leaves the repository; Windows-only spellings such as a trailing dot are out of scope: the fleet runs on macOS and Linux). A variant of a path (`Shims/GH`, `shims//gh`,
+    `shims/./gh`, `shims/x/../gh`, `a/../shims/gh`, `shims\\gh`) names the same file as the plain one, so it must be judged as that file."""
+    text = str(path).replace("\\", "/")
+    parts, escapes = [], text.startswith(("/", "~")) or bool(re.match(r"^[A-Za-z]:", text))   # an absolute path, `~` or a drive letter is not a path inside the repository
+    for segment in text.split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == "..":
+            if parts:
+                parts.pop()
+            else:
+                escapes = True
+            continue
+        parts.append(segment)
+    return unicodedata.normalize("NFD", "/".join(parts)).casefold(), escapes
+
+
+def escapes(path):
+    """True when the path cannot be read as a path inside the repository: it is HELD (when in doubt, hold)."""
+    return canonical(path)[1]
 
 
 def matches(path, patterns):
-    """Case-insensitive: the fleet runs on case-insensitive checkouts where `SHIMS/x` and `shims/x` are one file (a false hold costs little)."""
-    lowered = path.lower()
-    return any(_glob_regex(p).match(lowered) for p in patterns)
+    """Judged as the file the path names (see `canonical`), case- and normalisation-insensitively (see `folds`): a variant can only ADD a hit, so the raw
+    spelling and the canonical one are both tried, each in both folded forms (a false hold costs little)."""
+    texts = folds(path) | folds(canonical(path)[0])
+    return any(regex.fullmatch(text) for p in patterns for regex in _glob_regex(p) for text in texts)
+
+
+def matches_named(path, patterns):
+    """Judged ONLY as the file the path names (see `canonical`): for an EXCLUDE list, which can only take a hit away, so a spelling must never be able to
+    move a path into it (`shims/docs/../gh` is `shims/gh`, not under `shims/docs/**`)."""
+    texts = folds(canonical(path)[0])
+    return any(regex.fullmatch(text) for p in patterns for regex in _glob_regex(p) for text in texts)
 
 
 def floor_paths(paths, globs, exclude=(), force=()):
     """The paths of a change that trigger the floor: inside a floor glob and not excluded (a `force` path is never excluded). A deletion
     counts like any change (the caller passes deleted paths too; so does the OLD path of a rename); one outside the globs never does."""
-    return sorted({p for p in paths if isinstance(p, str) and matches(p, globs) and (not matches(p, exclude) or matches(p, force))})
+    return sorted({p for p in paths if isinstance(p, str) and (escapes(p) or (matches(p, globs) and (not matches_named(p, exclude) or matches(p, force))))})
 
 
 def floor_for(repo, config=None):
@@ -78,9 +146,9 @@ def floor_for(repo, config=None):
     for name, entry in (((config or {}).get("impact_floor") or {}).get("repos") or {}).items():
         if name.lower() == wanted and isinstance(entry, dict):
             return list(entry.get("globs") or []), list(entry.get("exclude") or []), list(entry.get("force") or [])
-    for name, entry in DEFAULT_FLOORS.items():
+    for name, entry in default_floors().items():
         if name.lower() == wanted:
-            return list(entry["globs"]), list(entry["exclude"]), list(entry.get("force") or [])
+            return list(entry.get("globs") or []), list(entry.get("exclude") or []), list(entry.get("force") or [])
     return [], [], []
 
 
@@ -153,6 +221,86 @@ def decide(floor_hit, rated, unknown=None):
         return "hold", reasons
     if any(action == ACTION_SECOND for _, _, _, action in rated):
         return "second-review", ["rating: a medium-band impact asks for a second independent review"]
+    return "none", []
+
+
+# ---- who may clear a hold: the owner's own clear is for the top tier only (ask #451). Everything below reads the matrix file's `owner_hold` block.
+
+def owner_hold_rule(matrix):
+    """The `owner_hold` block of the matrix, normalised: (top classes, other classes, {class: globs}) with class names lower-cased, or None when the block is
+    missing or MALFORMED (not an object, a list that is not a list of strings, no top tier path at all). None is read by `owner_decide` as: every change holds."""
+    block = (matrix or {}).get("owner_hold") if isinstance(matrix, dict) else None
+    if not isinstance(block, dict):
+        return None
+    top, other, paths = block.get("top_tier_classes"), block.get("other_classes"), block.get("top_tier_paths")
+    if not (isinstance(top, list) and isinstance(other, list) and isinstance(paths, dict) and top and paths):
+        return None
+    if not all(isinstance(c, str) and c.strip() for c in top + other):
+        return None
+    if not all(isinstance(g, list) and all(isinstance(x, str) and x.strip() for x in g) for g in paths.values()) or not any(paths.values()):
+        return None
+    top = [c.strip().lower() for c in top]
+    other = [c.strip().lower() for c in other if c.strip().lower() not in top]
+    return top, other, {c: list(g) for c, g in paths.items()}
+
+
+def top_tier_hits(paths, matrix):
+    """{class: [paths]} of the changed paths that match a top tier glob of the matrix file (a path may be named under more than one class)."""
+    rule = owner_hold_rule(matrix)
+    if rule is None:
+        return {}
+    hits = {}
+    for cls, globs in rule[2].items():
+        got = sorted({p for p in paths if isinstance(p, str) and matches(p, globs)})
+        if got:
+            hits[cls] = got
+    return hits
+
+
+def class_is_top_tier(matrix, cls):
+    """True for a top tier class, a missing class and an UNKNOWN class (fail closed); False only for a class the matrix file names as not top tier
+    (compared case-insensitively)."""
+    rule = owner_hold_rule(matrix)
+    if rule is None or not isinstance(cls, str) or not cls.strip():
+        return True
+    return cls.strip().lower() not in rule[1]
+
+
+def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=()):
+    """The decision under the owner-hold rule. `paths`: every changed path (a deletion and a rename's old path too); `impacts`: [(severity, probability, class)]
+    from the independent rating (class may be None); `floor_hit`: the paths that hit the old floor (floor_paths). Returns (decision, reasons):
+
+      - "hold" (for the owner): the diff cannot be read in full; or a changed path is a top tier path of the matrix file; or a rated impact is at a hold
+        level and its class is top tier, missing or unknown;
+      - "second-review": no hold, but a floor path outside the top tier, a hold-level rating of a class the matrix file names as not top tier, or a
+        medium-band rating asks for a second independent review (the usual checks then decide the merge);
+      - "none" otherwise."""
+    reasons = []
+    if owner_hold_rule(matrix) is None:   # FAIL CLOSED: no usable rule means every change holds for the owner
+        reasons.append("owner_hold rule missing or malformed in the impact matrix file: every change holds")
+    if unknown:
+        reasons.append("floor unknown: %s" % unknown)
+    lost = sorted({p for p in paths if isinstance(p, str) and escapes(p)})
+    if lost:   # a path that leaves the repository cannot be judged as a file of it: hold
+        reasons.append("path outside the repository or not normalisable: %s" % ", ".join(repr(p)[:60] for p in lost[:3]))
+    for cls, got in sorted(top_tier_hits(paths, matrix).items()):
+        reasons.append("top tier path (%s): %s" % (cls, ", ".join(got[:5]) + (" ..." if len(got) > 5 else "")))
+    rated = []
+    for severity, probability, cls in impacts:
+        for _s, _p, level, action in rate(matrix, [(severity, probability)]):
+            rated.append((severity, probability, level, action, cls))
+    for severity, probability, level, action, cls in rated:
+        if action == ACTION_HOLD and class_is_top_tier(matrix, cls):
+            reasons.append("rating: %s / %s is %s (hold), class %s" % (severity, probability, level, cls or "missing"))
+    if reasons:
+        return "hold", reasons
+    softer = []
+    if floor_hit:
+        softer.append("floor: %d path(s) outside the top tier ask for a second independent review" % len(floor_hit))
+    softer.extend("rating: %s / %s (%s), class %s, asks for a second independent review" % (s, p, level, cls) for s, p, level, action, cls in rated
+                  if action in (ACTION_HOLD, ACTION_SECOND))
+    if softer:
+        return "second-review", softer
     return "none", []
 
 
