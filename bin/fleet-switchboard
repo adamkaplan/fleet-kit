@@ -3540,6 +3540,7 @@ class EventFeed:
         self.quiet_end = False        # the last connection ended because the stream was quiet: the next open is not a gap
         self.counts = {"events": 0, "connects": 0, "resyncs": 0, "missed": 0, "errors": 0, "read_errors": 0}
         self.down_reason = None
+        self.on_usage = None          # #530: called with (session, step) for a step's token and cost figures; the event already carries them, nothing is read
 
     # -- the reader thread (reads, filters, remembers; no v2 call, no write)
 
@@ -3616,6 +3617,14 @@ class EventFeed:
             entry = self._entry(session)
             entry["event_at"] = self.now()
             message = data.get("assistantMessageID") if isinstance(data.get("assistantMessageID"), str) and len(data["assistantMessageID"]) <= FEED_ID_MAX else None
+            usage = (data.get("tokens") if isinstance(data.get("tokens"), dict) else data.get("usage")) if kind == "session.step.ended" else None
+            if self.on_usage is not None and isinstance(usage, dict):
+                step = {"id": event.get("id") if isinstance(event.get("id"), str) else "%s:%s" % (message, event.get("created")),
+                        "tokens": usage, "cost": data.get("cost"), "time": {"created": event.get("created")}}
+                try:
+                    self.on_usage(session, step)   # a step's usage from the event itself: it works with v2_light on, which only stops READS of history
+                except Exception:
+                    pass
             if message and kind in ("session.text.ended", "session.step.ended"):
                 entry["assistant"] = message   # the id only: an event's text is never kept
             elif kind in ("session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"):
@@ -3718,6 +3727,7 @@ def start_event_feed(engine, config, now):
     if config["v2_events"] != "auto" or getattr(engine.v2, "http", None) is None:
         return None
     engine.feed = EventFeed(engine.v2.http, engine.audit, now)
+    engine.feed.on_usage = lambda session, step: health_ingest_messages(engine, session, [step])
     engine.feed.start()
     return engine.feed
 

@@ -109,15 +109,14 @@ class Sources(unittest.TestCase):
         self.assertEqual(rec.body({"written_at": NOW - 1000, "sessions": {}})["sources"]["tool_calls"], "stale")
         self.assertEqual(rec.body({"written_at": NOW, "sessions": {}})["sources"]["tool_calls"], "ok")
 
-    def test_usage_source_is_off_under_v2_light(self):
+    def test_usage_source_is_off_under_v2_light_until_an_event_carries_figures(self):
         rec = hr.Recorder(lambda: NOW)
         self.assertEqual(rec.body(None, light=True)["sources"]["usage"], "off: v2_light")
         self.assertEqual(rec.body(None)["sources"]["usage"], "on")
-
-    def test_watched_repositories_are_listed_without_a_push(self):
-        body = hr.Recorder(lambda: NOW).body(None, watched=["acme/api", "acme/api", "acme/web"])
-        self.assertEqual(body["pushes_watched"], ["acme/api", "acme/web"])
-        self.assertEqual(body["pushes"], {})     # no push: the reader turns a watched repository into 0
+        rec.ingest_message("ses_a", {"id": "evt_1", "tokens": {"input": 100, "output": 20}, "cost": 0.01, "time": {"created": NOW * 1000}})
+        body = rec.body(None, light=True)
+        self.assertEqual(body["sources"]["usage"], "events")
+        self.assertEqual(body["usage"]["ses_a"]["context"]["tokens"], 120)
 
 
 class Bounds(unittest.TestCase):
@@ -216,6 +215,21 @@ class Hooks(unittest.TestCase):
             self.assertEqual(engine.v2.calls, [])      # no OpenCode request
             self.assertEqual(engine.notes, [])
             self.assertEqual(oct(os.stat(os.path.join(d, hr.FILE)).st_mode & 0o777), "0o600")
+
+    def test_the_feed_hands_a_step_ended_events_usage_over_with_v2_light_on(self):
+        feed = self.sb.EventFeed(None)
+        got = []
+        feed.on_usage = lambda session, step: got.append((session, step))
+        feed.handle("data: " + json.dumps({"id": "evt_1", "type": "session.step.ended", "created": 5, "data": {"sessionID": "ses_a", "assistantMessageID": "m1", "tokens": {"input": 3, "output": 4}, "cost": 0.5}}))
+        feed.handle("data: " + json.dumps({"id": "evt_2", "type": "session.step.ended", "data": {"sessionID": "ses_a", "assistantMessageID": "m1"}}))   # no figures: nothing handed over
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0][0], "ses_a")
+        self.assertEqual(got[0][1]["tokens"], {"input": 3, "output": 4})
+
+    def test_watched_repositories_are_listed_without_a_push(self):
+        body = hr.Recorder(lambda: NOW).body(None, watched=["acme/api", "acme/api", "acme/web"])
+        self.assertEqual(body["pushes_watched"], ["acme/api", "acme/web"])
+        self.assertEqual(body["pushes"], {})     # no push: the reader turns a watched repository into 0
 
     def test_the_end_of_every_pass_writes_the_file_with_no_plan_gates_configured(self):
         """The ci recorder returns early on a fleet with no `plan_gates`; the records must not depend on it."""

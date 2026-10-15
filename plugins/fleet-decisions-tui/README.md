@@ -87,8 +87,7 @@ Above the Decisions rows, one dense block per workspace that has an orchestrator
 - **Legend:** four dim lines under the heading name `q s d c p ctx moved` and the state words.
 - **Why a figure is absent:** `tool calls: plugin not installed` (no `tool-rate.json`: the installed `fleet-hooks` copy predates the counter; the kit's
   own install step, which copies `plugins/fleet-hooks`, puts it in the profile; this block only reads) or `plugin not running` (the file is stale);
-  `ctx: off: v2_light` (usage is fed from session messages, which `v2_light` stops reading; the other source that could feed it is the plugin
-  counting message usage events itself, not built here); `p 0` for a repository whose forwarder is running (`github-watch.json`) with no push in the
+  `ctx` under `v2_light`: usage comes from the `session.step.ended` events the daemon already receives (their token and cost figures; no read of history), and reads `ctx: off: v2_light` only while no event has carried figures; `p 0` for a repository whose forwarder is running (`github-watch.json`) with no push in the
   hour, `p not recorded` only for one with no running forwarder. `health-records.json` carries these as `sources` and `pushes_watched`.
 - **Sources (all read from the state directory; nothing polled, nothing spawned):** `health-records.json` (bin/health_records.py: tool calls, tokens, context,
   pushes), `load.json` (the load alert's figures and today's hourly series), `pane-health.json` (which agents sit in which workspace, and whether the pane

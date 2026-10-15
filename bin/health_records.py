@@ -11,7 +11,8 @@ It publishes ONE derived file, `health-records.json` (written by the daemon thro
      "pushes":      {"<owner/repo>": {"<hour epoch>": n}},
      "pushes_watched": ["<owner/repo>", ...],                       # repositories whose events the daemon receives: no push in the hour reads 0
      "sources":     {"tool_calls": "ok"|"stale"|"missing",            # missing = the fleet-hooks counter is not installed in the agents' profile
-                     "usage": "on"|"off: v2_light"}}                  # v2_light reads no session history, so nothing feeds `usage`
+                     "usage": "on"|"events"|"off: v2_light"}}         # under v2_light usage comes from the step.ended events the daemon already receives
+                                                                  # ("events" once one carried figures); "off: v2_light" while none has
 
 A figure with no source is ABSENT (the reader says "not recorded"): never 0. A source that is missing or older than TOOL_STALE seconds
 (the plugin is not loaded, the daemon's reads fail) gives no `tool_calls` at all. Spend and tokens are `partial`: the daemon's feed reads
@@ -228,7 +229,7 @@ class Recorder:
         out = {"version": VERSION, "written_at": int(now),
                "tool_calls": {s: {"per_minute": v, "approx": True} for s, v in series.items()},
                "usage": usage,
-               "sources": {"tool_calls": tool_state(tool_body, now), "usage": "off: v2_light" if light else "on"},
+               "sources": {"tool_calls": tool_state(tool_body, now), "usage": ("events" if self.hours else "off: v2_light") if light else "on"},
                "pushes_watched": sorted({n for n in (_name(r) for r in list(watched)[:MAX_AGENTS]) if n}),
                "pushes": {r: {str(h): n for h, n in sorted(v.items())} for r, v in self.pushes.items()}}
         while len(json.dumps(out, sort_keys=True)) > FILE_CAP and any(u["hours"] for u in usage.values()):   # the cap: oldest hours go first
