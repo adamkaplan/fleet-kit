@@ -122,7 +122,7 @@ def _load(state_dir):
         return {}, "the offers file is not an object of offers", set()
     good, damaged = {}, set()
     for key, offer in offers.items():
-        if not (isinstance(key, str) and re.match(r"^[^/#\s]+/[^/#\s]+#[0-9]{1,9}$", key)):
+        if not (isinstance(key, str) and re.fullmatch(r"[^/#\s]+/[^/#\s]+#[0-9]{1,9}", key)):
             damaged.add(str(key)[:200])   # a key that is no PR: said, never silently lost
             continue
         if _valid_offer(offer) and len(good) < OFFERS_MAX:
@@ -357,6 +357,7 @@ def screen(text, offers, created, now):
     * `not_offered`: the number is not one of the offers;
     * `ambiguous_number`: more than one offer has that number (the same number in two repositories);
     * `no_time`, `before_offer`, `expired`: see `timing_problem` (`created` is the message's time, `now` the clock)."""
+    text = (text or "")[:TEXT_MAX] if isinstance(text, str) else ""   # ONE cut for every scan below: the digits counted and the digits judged are the same text
     prs = sorted(offers or {})
     if not prs:
         return {"verdict": "question", "why": "no_offers", "prs": []}

@@ -11609,6 +11609,28 @@ class TestChatClearOffers(unittest.TestCase):
         got = sc("366 is good to go", twice)
         self.assertEqual((got["why"], got["prs"]), ("ambiguous_number", ["acme/other#366", "acme/widget#366"]))
 
+    def test_screen_cuts_the_text_once_so_a_huge_run_or_a_second_number_past_the_cap_changes_nothing_and_raises_nothing(self):
+        offers = self.offers(366)
+        got = self.cc.screen("9" * 5000 + " is good to go", offers, 1001, 1002)
+        self.assertEqual((got["verdict"], got["why"]), ("question", "not_offered"), "a 5000-digit run: a question, no exception")
+        far = "366 is good to go" + " " * (self.cc.TEXT_MAX + 10) + "389"
+        self.assertEqual(self.cc.screen(far, offers, 1001, 1002)["verdict"], "candidate", "the same text is cut for the count and for the standalone check")
+        self.assertEqual(self.cc.screen(None, offers, 1001, 1002)["why"], "no_number")
+        self.assertEqual(self.cc.screen(5, offers, 1001, 1002)["why"], "no_number")
+
+    def test_a_key_with_a_trailing_newline_is_no_pr_and_entries_past_the_cap_come_back_not_shown(self):
+        path = Path(self.state) / "chat-clear-offers.json"
+        path.write_text(json.dumps({"offers": {"acme/widget#1\n": self.entry(), "acme/widget#2": self.entry()}}))
+        self.assertEqual(sorted(self.cc.read_offers(self.state)), ["acme/widget#2"])
+        many = {"acme/widget#%d" % n: self.entry() for n in range(1, self.cc.OFFERS_MAX + 3)}
+        path.write_text(json.dumps({"offers": many}))
+        loaded, problem, damaged = self.cc._load(self.state)
+        self.assertEqual((len(loaded), len(damaged)), (self.cc.OFFERS_MAX, 2), "the 2 past the cap are said, not silently lost")
+        holds = [self.hold(n, ["u:hold-impact"]) for n in range(1, self.cc.OFFERS_MAX + 3)]
+        got = self.cc.refresh_offers(self.state, holds, self.NAMES, 9000)
+        self.assertEqual(len(got["offers"]), self.cc.OFFERS_MAX)
+        self.assertTrue(got["capped"])
+
     def test_a_message_counts_only_if_it_was_written_after_the_offer_was_shown_and_an_offer_expires(self):
         offers = self.offers(366)   # shown_at 1000
         sc = lambda created, now: self.cc.screen("366 is good to go", offers, created, now)
