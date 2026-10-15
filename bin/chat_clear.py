@@ -37,7 +37,8 @@ SUMMARY_MAX = 200
 LOCK_FILE = "chat-clear-offers.lock"
 LOCK_SECONDS = 5
 CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
-PR_NUMBER = re.compile(r"(?<![\w.#/-])#?(\d{1,6})(?![\w]|\.\d)")
+DIGITS = re.compile(r"\d+")
+OFFER_TTL = 7 * 86400          # seconds: an offer older than this is not clearable (the owner is shown it again first)
 
 
 def _label_names(labels):
@@ -96,28 +97,38 @@ class _locked:
         return False
 
 
+def _valid_offer(offer):
+    """True only for a whole, well-typed offer: a head, `shown` exactly a boolean, `shown_at` a whole number, `labels` a list of strings and `summary` a
+    string. A damaged entry is never repaired or defaulted (above all not to `shown`): it is dropped."""
+    return (isinstance(offer, dict) and isinstance(offer.get("head"), str) and bool(offer["head"]) and isinstance(offer.get("shown"), bool)
+            and isinstance(offer.get("shown_at"), int) and not isinstance(offer["shown_at"], bool) and offer["shown_at"] >= 0
+            and isinstance(offer.get("labels"), list) and all(isinstance(l, str) for l in offer["labels"]) and isinstance(offer.get("summary"), str))
+
+
 def _load(state_dir):
-    """(offers, problem). `problem` is None for a good file or no file, else a short reason: an unreadable, oversized or malformed file offers nothing."""
+    """(offers, problem, damaged). `problem` is None for a good file or no file, else a short reason: an unreadable, oversized or malformed file offers
+    nothing. `damaged` is the set of keys whose entry was dropped one by one (a bad entry neither invalidates nor validates the others)."""
     path = Path(state_dir) / OFFERS_FILE
     try:
         if path.stat().st_size > OFFERS_MAX_BYTES:
-            return {}, "the offers file is larger than %d bytes" % OFFERS_MAX_BYTES
+            return {}, "the offers file is larger than %d bytes" % OFFERS_MAX_BYTES, set()
         data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return {}, None
+        return {}, None, set()
     except (OSError, ValueError) as err:
-        return {}, "the offers file cannot be read (%s)" % type(err).__name__
+        return {}, "the offers file cannot be read (%s)" % type(err).__name__, set()
     offers = data.get("offers") if isinstance(data, dict) else None
     if not isinstance(offers, dict):
-        return {}, "the offers file is not an object of offers"
-    good = {}
+        return {}, "the offers file is not an object of offers", set()
+    good, damaged = {}, set()
     for key, offer in offers.items():
-        if len(good) >= OFFERS_MAX:
-            break
-        if isinstance(key, str) and re.match(r"^[^/#\s]+/[^/#\s]+#\d{1,9}$", key) and isinstance(offer, dict) \
-                and isinstance(offer.get("head"), str) and offer["head"]:
+        if not (isinstance(key, str) and re.match(r"^[^/#\s]+/[^/#\s]+#\d{1,9}$", key)):
+            continue
+        if _valid_offer(offer) and len(good) < OFFERS_MAX:
             good[key] = offer
-    return good, None
+        elif not _valid_offer(offer):
+            damaged.add(key)
+    return good, None, damaged
 
 
 def read_offers(state_dir):
@@ -175,10 +186,11 @@ def refresh_offers(state_dir, holds, names, now, lock_seconds=LOCK_SECONDS):
     * a file that cannot be used is set aside (`.corrupt-<time>`), and what is recorded afterwards is `shown: false`: the owner's memory of what he
       was shown is lost, so nothing recorded from it can be cleared until `show()` has put it in front of him;
     * at most OFFERS_MAX offers: the ones already there come first and `capped` says some held PR was left out.
-    Returns {"offers", "added", "dropped", "problem", "quarantined", "capped"}; the file is written only when something changed.
+    Returns {"offers", "added", "dropped", "problem", "quarantined", "capped", "damaged"} (`damaged`: entries dropped one by one; a PR whose entry was damaged is
+    recorded again as `shown: false`); the file is written only when something changed.
     Raises OffersBusy when the lock wait runs out."""
     with _locked(state_dir, lock_seconds):
-        before, problem = _load(state_dir)
+        before, problem, damaged = _load(state_dir)
         quarantined = _quarantine(state_dir, now) if problem else None
         after, added, capped = {}, [], False
         usable = []
@@ -198,14 +210,16 @@ def refresh_offers(state_dir, holds, names, now, lock_seconds=LOCK_SECONDS):
             summary = _clean(hold.get("summary"), SUMMARY_MAX)
             kept = before.get(pr)
             if kept is None:
-                after[pr] = {"head": hold["head"], "shown": not problem, "shown_at": int(now), "labels": labels, "summary": summary}
+                lost = bool(problem) or pr in damaged   # a lost file or a damaged entry: what he was shown is not known
+                after[pr] = {"head": hold["head"], "shown": not lost, "shown_at": int(now), "labels": labels, "summary": summary}
                 added.append(pr)
             else:
                 after[pr] = dict(kept, labels=labels, summary=summary or kept.get("summary", ""))
         dropped = sorted(set(before) - set(after))
         if after != before:
             write_offers(state_dir, after)
-    return {"offers": after, "added": added, "dropped": dropped, "problem": problem, "quarantined": quarantined, "capped": capped}
+    return {"offers": after, "added": added, "dropped": dropped, "problem": problem, "quarantined": quarantined, "capped": capped,
+            "damaged": sorted(damaged)}
 
 
 def show(state_dir, pr, head, now, lock_seconds=LOCK_SECONDS):
@@ -237,27 +251,47 @@ def _is_agents(message):
     return False
 
 
-def _text(message):
-    text = message.get("text")
-    if isinstance(text, str):
-        return text
+def persons_text(message):
+    """The text of a message that is provably a person's PROMPT, else None. Fails CLOSED. All of these must hold: it is not an agent's (`_is_agents`); its `role` and
+    its `type`, whichever it has, are exactly `user` (not assistant, system, synthetic, a tool result or a compaction summary) and it has at least one; its
+    text is a `text` string, a pending inbox item's `payload.text`, or `content` parts that are ALL of type `text` (any other part, a tool call or result, a
+    file, a summary, makes it not a prompt); and `text` and `content`, when both are given, say the same."""
+    if not isinstance(message, dict) or _is_agents(message):
+        return None
+    kinds = [message[k] for k in ("role", "type") if k in message]
+    if not kinds or any(kind != "user" for kind in kinds):
+        return None
+    given = message.get("text")
+    parts = message.get("content")
+    joined = None
+    if "content" in message:
+        if not isinstance(parts, list) or not parts or not all(isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str) for p in parts):
+            return None
+        joined = "\n".join(p["text"] for p in parts)
+    if isinstance(given, str):
+        if joined is not None and joined != given:
+            return None
+        return given
+    if given is not None:
+        return None
+    if joined is not None:
+        return joined
     payload = message.get("payload")
     if isinstance(payload, dict) and isinstance(payload.get("text"), str):
         return payload["text"]
-    parts = message.get("content")
-    if isinstance(parts, list):
-        return "\n".join(p.get("text", "") for p in parts if isinstance(p, dict) and isinstance(p.get("text"), str))
-    return ""
+    return None
 
 
 def person_messages(prompts, seen, now, created_of, max_age=MESSAGE_MAX_AGE):
     """The person's own NEW messages out of `prompts` (a Chief of Staff session's user messages, as the engine read them), oldest first, as
-    [{"id", "text"}]. A message with fleet metadata (or metadata that cannot be read as none) is an agent's and is never returned, whatever it says; one
-    without an id, already in `seen`, with no readable time, older than `max_age` seconds or dated more than MESSAGE_SKEW seconds ahead is skipped. At most
-    MESSAGES_SCANNED prompts are looked at and TEXT_MAX characters of each kept. `created_of(message)` gives the epoch seconds of a message."""
+    [{"id", "text", "created"}]. Only what `persons_text` accepts is returned: a message with fleet metadata, any other role or type, or a part that is not plain
+    text is never the owner's, whatever it says. One without an id, already in `seen`, with no readable time, older than `max_age` seconds or dated more than
+    MESSAGE_SKEW seconds ahead is skipped. At most MESSAGES_SCANNED prompts are looked at and TEXT_MAX characters of each kept.
+    `created_of(message)` gives the epoch seconds of a message."""
     out = []
     for message in list(prompts or [])[:MESSAGES_SCANNED]:
-        if not isinstance(message, dict) or _is_agents(message):
+        text = persons_text(message)
+        if text is None:
             continue
         message_id = message.get("id")
         created = created_of(message)
@@ -265,29 +299,62 @@ def person_messages(prompts, seen, now, created_of, max_age=MESSAGE_MAX_AGE):
             continue   # no readable time, or not a number: skipped, never an error
         if not isinstance(message_id, str) or message_id in seen or now - created > max_age or created - now > MESSAGE_SKEW:
             continue
-        out.append((created, {"id": message_id, "text": _text(message)[:TEXT_MAX]}))
+        out.append((created, {"id": message_id, "text": text[:TEXT_MAX], "created": created}))
     return [item for _, item in sorted(out, key=lambda row: row[0])]
 
 
 def numbers_in(text):
-    """The PR numbers written in `text`, in order, once each: `366`, `#366`; not part of a longer word, a decimal or a path."""
+    """Every number written in `text`, in order, once each: EVERY run of digits, whatever is around it (`366-367`, `366/367`, `366, 389`, `366..389`, `366+367`,
+    `366&367`, `366 and 389` are two numbers; so is `0.97`, which fails toward asking). One message names one pull request."""
     seen = []
-    for found in PR_NUMBER.finditer(text or ""):
-        number = int(found.group(1))
+    for found in DIGITS.finditer(text or ""):
+        number = int(found.group(0))
         if number not in seen:
             seen.append(number)
     return seen
 
 
-def screen(text, offers):
-    """The checks no model can waive. Returns {"verdict": "candidate", "pr"} when the message names exactly ONE number and exactly one offer
-    has it, else {"verdict": "question", "why": <code>, "prs": [...]} (the owner is asked, nothing is cleared):
+def _standalone(text, number):
+    """True when every run of digits that spells `number` stands alone: not inside a word (`abc366`, `366abc`) or a decimal or dotted number (`3.66`, `v366.1`)."""
+    for found in DIGITS.finditer(text or ""):
+        if int(found.group(0)) != number:
+            continue
+        before = text[found.start() - 1] if found.start() else " "
+        after = text[found.end()] if found.end() < len(text) else " "
+        after2 = text[found.end() + 1] if found.end() + 1 < len(text) else " "
+        if before.isalnum() or before == "_" or after.isalnum() or after == "_" or (before == "." and text[found.start() - 2:found.start() - 1].isdigit()) \
+                or (after == "." and after2.isdigit()):
+            return False
+    return True
+
+
+def timing_problem(offer, created, now):
+    """None when the message may clear this offer, else why not: `no_time` (the message's time is not known), `before_offer` (it was written before the
+    owner was shown the offer, or at the same second: only a message AFTER the showing counts) or `expired` (the offer is older than OFFER_TTL)."""
+    if isinstance(created, bool) or not isinstance(created, (int, float)) or created != created or not isinstance(now, (int, float)):
+        return "no_time"
+    shown_at = (offer or {}).get("shown_at")
+    if not isinstance(shown_at, int) or isinstance(shown_at, bool):
+        return "no_time"
+    if created <= shown_at:
+        return "before_offer"
+    if now - shown_at > OFFER_TTL:
+        return "expired"
+    return None
+
+
+def screen(text, offers, created, now):
+    """The checks no model can waive. Returns {"verdict": "candidate", "pr"} when the message names exactly ONE number, that number stands alone, exactly one
+    offer has it and the message came AFTER the owner was shown that offer, else {"verdict": "question", "why": <code>, "prs": [...]} (the owner is asked,
+    nothing is cleared):
 
     * `no_offers`: nothing is held for the owner;
-    * `no_number`: the message names no PR number (the number is required, whatever a judge would say);
-    * `several_numbers`: it names more than one number: one message clears one PR;
+    * `no_number`: the message names no number (the number is required, whatever a judge would say);
+    * `several_numbers`: it has more than one DISTINCT run of digits, however they are joined (`366-367`, `366/367`, `366, 389`): one message clears one PR;
+    * `unclear_number`: its one number sits inside a word or a decimal (`abc366`, `3.66`);
     * `not_offered`: the number is not one of the offers;
-    * `ambiguous_number`: more than one offer has that number (the same number in two repositories)."""
+    * `ambiguous_number`: more than one offer has that number (the same number in two repositories);
+    * `no_time`, `before_offer`, `expired`: see `timing_problem` (`created` is the message's time, `now` the clock)."""
     prs = sorted(offers or {})
     if not prs:
         return {"verdict": "question", "why": "no_offers", "prs": []}
@@ -296,11 +363,16 @@ def screen(text, offers):
         return {"verdict": "question", "why": "no_number", "prs": prs}
     if len(numbers) > 1:
         return {"verdict": "question", "why": "several_numbers", "prs": prs}
+    if not _standalone(text, numbers[0]):
+        return {"verdict": "question", "why": "unclear_number", "prs": prs}
     matches = [pr for pr in prs if int(pr.rsplit("#", 1)[1]) == numbers[0]]
     if not matches:
         return {"verdict": "question", "why": "not_offered", "prs": prs}
     if len(matches) > 1:
         return {"verdict": "question", "why": "ambiguous_number", "prs": matches}
+    problem = timing_problem(offers[matches[0]], created, now)
+    if problem:
+        return {"verdict": "question", "why": problem, "prs": matches}
     return {"verdict": "candidate", "pr": matches[0]}
 
 
