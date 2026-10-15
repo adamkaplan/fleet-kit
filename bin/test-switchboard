@@ -15895,28 +15895,43 @@ class TestGitStashGuard(Base):
         evil = execdir / "git-zz"
         evil.write_text("#!/bin/sh\nexec %s stash push\n" % self.real)
         evil.chmod(0o755)
-        for globals_, env in ((["-c", "help.autocorrect=immediate"], {}), (["-c", "help.autocorrect=prompt"], {}), (["-c", "help.autocorrect=5"], {}), (["-c", "help.autocorrect=1"], {}),
-                              ([], {"GIT_EXEC_PATH": str(execdir)}), (["--exec-path=%s" % execdir], {})):
-            for verb in ("stsh", "stahs", "zz", "STASH"):
-                with self.subTest(globals=globals_, env=env, verb=verb):
-                    done = self.run_shim(*globals_, verb, env=env)
+        for value in ("-1", "-5", "1", "5", "20", "immediate", "prompt", "true", "yes", "on", "bogus", ""):
+            for verb in ("stsh", "stahs", "stas", "zz", "STASH"):
+                with self.subTest(value=value, verb=verb):
+                    done = self.run_shim("-c", "help.autocorrect=" + value, verb, "pop")
                     self.assertEqual(done.returncode, 1, done.stderr)
                     self.assertIn("scratch branch", done.stderr)
+        for verb in ("stsh", "stas"):
+            for globals_, env in (([], {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "help.autocorrect", "GIT_CONFIG_VALUE_0": "-1"}), ([], {"GIT_CONFIG_PARAMETERS": "'help.autocorrect=immediate'"}),
+                                  (["--config-env", "help.autocorrect=AC"], {"AC": "-1"}), (["--config-env=help.autocorrect=AC"], {"AC": "1"}), ([], {"GIT_EXEC_PATH": str(execdir)}),
+                                  (["--exec-path=%s" % execdir], {}), (["-c", "alias.s=stash", "-c", "help.autocorrect=-1"], {})):
+                with self.subTest(verb=verb, globals=globals_, env=env):
+                    done = self.run_shim(*globals_, verb, "pop", env=env)
+                    self.assertEqual(done.returncode, 1, done.stderr)
+                    self.assertIn("scratch branch", done.stderr)
+        self.assertEqual(self.run_shim("-c", "alias.s=stash", "-c", "help.autocorrect=-1", "s", "pop").returncode, 1)
         self.assertEqual(self.stashed(), "")
-        self.run_real("config", "help.autocorrect", "immediate")
-        done = self.run_shim("stsh")
-        self.assertEqual(done.returncode, 1)
+        self.assertEqual((self.repo / "f").read_text(), "two\n")
+        for value in ("-1", "-5", "immediate", "1"):   # from a config file git reads (the repository's own, and the global one)
+            for where in (("config", "--local"), ("config", "--global")):
+                self.run_real(*where, "help.autocorrect", value)
+                with self.subTest(value=value, where=where):
+                    self.assertEqual(self.run_shim("stsh", "pop").returncode, 1)
+                    self.assertEqual(self.run_shim("stas").returncode, 1)
+                    self.assertEqual(self.run_shim("status", "--porcelain").returncode, 0, "a known command still runs with autocorrect on")
+                    self.assertEqual(self.run_shim("log", "--oneline", "-1").returncode, 0)
+                self.run_real(*where, "--unset", "help.autocorrect")
         self.assertEqual(self.stashed(), "")
-        self.assertEqual(self.run_shim("status", "--porcelain").returncode, 0, "a known command still runs with autocorrect on")
-        self.assertEqual(self.run_shim("log", "--oneline", "-1").returncode, 0)
+        self.assertEqual((self.repo / "f").read_text(), "two\n")
 
     def test_an_unknown_verb_without_autocorrect_or_a_moved_exec_path_is_left_to_git(self):
         for args in (("frobnicate",), ("stsh",)):
             done = self.run_shim(*args)
             real = self.run_real(*args)
             self.assertEqual((done.returncode, done.stdout, done.stderr), (real.returncode, real.stdout, real.stderr))
-        self.run_real("config", "help.autocorrect", "never")
-        self.assertEqual(self.run_shim("stsh").returncode, self.run_real("stsh").returncode)
+        for value in ("0", "false", "no", "off", "never", "show"):   # git's own off words: the verb is git's to reject (or, for show, to suggest)
+            done, real = self.run_shim("-c", "help.autocorrect=" + value, "stsh"), self.run_real("-c", "help.autocorrect=" + value, "stsh")
+            self.assertEqual((done.returncode, done.stdout, done.stderr), (real.returncode, real.stdout, real.stderr), value)
 
     def test_s2_list_show_and_every_other_command_are_byte_identical_to_the_real_git(self):
         self.dirty_and_stash_one()

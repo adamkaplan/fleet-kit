@@ -11,7 +11,7 @@ What is resolved before the verb is judged, because git itself resolves it:
 - an ALIAS, from `-c alias.x=...`, `--config-env`, the environment (`GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`) or any config file, is looked up by asking
   the real git (`config --get-all alias.<verb>`, same global options), and followed, with a depth limit and loop detection that refuse. A shell alias (`!...`)
   that names stash is refused; one that runs `git ...` reaches this shim again through PATH only when git's exec path holds no `git` of its own (git puts that directory first on PATH for shell aliases), so an obfuscated shell alias can get past;
-- a verb git does not know, when `help.autocorrect` would run a near miss, is refused (it could become `stash`); a verb git does not know, when the caller moved
+- a verb git does not know, when `help.autocorrect` is set to anything but 0/false/no/off/never/show (a negative number runs the near miss at once), is refused (it could become `stash`); a verb git does not know, when the caller moved
   the exec path (`GIT_EXEC_PATH`, `--exec-path=`), is refused (a `git-<verb>` there could be anything).
 A lookup the real git cannot answer cleanly (it times out or cannot start) refuses; a lookup that exits with an error other than "not set" is taken as no alias
 (git would fail on the same broken configuration).
@@ -35,7 +35,7 @@ VALUE_OPTIONS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super
 READ_ONLY = {"list", "show"}
 MAX_ALIAS_DEPTH = 10
 LOOKUP_SECONDS = 10
-AUTOCORRECT_ON = {"immediate", "prompt", "true", "yes", "on"}
+AUTOCORRECT_OFF = {"0", "false", "no", "off", "never", "show"}
 # Git's builtin commands: these can never be an alias and never run an external `git-<verb>`, so a verb in this set needs no lookup.
 BUILTINS = set("""add am annotate apply archive bisect blame branch bundle cat-file check-attr check-ignore check-mailmap check-ref-format checkout checkout-index cherry
 cherry-pick clean clone column commit commit-graph commit-tree config count-objects credential describe diff diff-files diff-index diff-tree difftool fast-export
@@ -99,9 +99,12 @@ def aliases(git, globals_, verb):
 
 
 def autocorrect_active(git, globals_):
+    """True when help.autocorrect is set to anything but git's off words (0, false, no, off, never, show): immediate, prompt, a positive or NEGATIVE number (negative =
+    run at once), an empty or unknown value. Unset is off. Fail closed: only a value known to be off, or no value at all, counts as off."""
     status, out = real(git, globals_, "config", "--get", "help.autocorrect")
-    value = out.strip().lower() if status == 0 else ""
-    return value in AUTOCORRECT_ON or (value.isdigit() and int(value) > 0)
+    if status != 0:
+        return False
+    return out.strip().lower() not in AUTOCORRECT_OFF
 
 
 def known_commands(git, globals_):
