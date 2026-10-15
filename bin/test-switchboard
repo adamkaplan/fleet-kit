@@ -48916,6 +48916,47 @@ class TestSpotlightGuard(Base):
         self.assertEqual(len([e for e in self.world.audit() if e["event"] == "spotlight.lost"]), 2)
         self.assertEqual(len([e for e in self.world.audit() if e["event"] == "spotlight.recovered"]), 1)
 
+    def real_pass_round(self, **counts):
+        """One hourly check through the engine's REAL pass (fact collection, batching, delivery); returns the reports of the two passes."""
+        self.counts = {self.dirs[int(k[1:])]: v for k, v in counts.items()}
+        self.world.tick(3601)
+        first = self.engine.run_pass()
+        self.source().thread.join(10)
+        return [first, self.engine.run_pass()]
+
+    def spotlight_sends(self):
+        return [a for a in self.world.admissions("cos") if any(str(k).startswith("spotlight.lost:") for k in a["keys"])]
+
+    def test_the_real_batching_path_delivers_the_wake_once_after_the_wait(self):
+        self.real_pass_round(f0=120, f1=0)
+        self.real_pass_round(f0=120, f1=0)                  # the second nonzero check begins the episode: the fact is pending, batching waits
+        self.assertEqual(self.spotlight_sends(), [])
+        self.world.tick(30)
+        self.assertIn("cos", self.engine.run_pass()["waiting"], "the fact is still pending 30 s on: it is held by the 90 s wait")
+        self.world.tick(70)
+        report = self.engine.run_pass()
+        self.assertEqual(len(self.spotlight_sends()), 1, report)
+        for _ in range(5):
+            self.world.tick(30)
+            self.engine.run_pass()
+        self.assertEqual(len(self.spotlight_sends()), 1, "delivered once: the stable key is deduplicated on every later pass")
+
+    def test_a_restart_between_the_alarm_and_its_delivery_still_delivers_once(self):
+        self.real_pass_round(f0=120, f1=0)
+        self.real_pass_round(f0=120, f1=0)
+        self.assertEqual(self.spotlight_sends(), [])
+        index = next(i for i, source in enumerate(self.engine.sources) if isinstance(source, sb.SpotlightFacts))
+        fresh = sb.SpotlightFacts()
+        fresh.bind(self.engine)
+        fresh.started = self.world.clock.now()              # a restart has just run its check: nothing new to find
+        self.engine.sources[index] = fresh
+        self.world.tick(100)
+        self.engine.run_pass()
+        self.assertEqual(len(self.spotlight_sends()), 1, "the open episode was restored from the file and its fact is pending again")
+        self.world.tick(30)
+        self.engine.run_pass()
+        self.assertEqual(len(self.spotlight_sends()), 1)
+
     def test_s5_a_normal_pass_starts_nothing_and_a_slow_tool_never_delays_it(self):
         gate = threading.Event()
         self.block[0] = gate

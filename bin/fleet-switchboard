@@ -2432,6 +2432,7 @@ class SpotlightFacts:
         self.lock = threading.Lock()  # the hand-off of `done`: a result stored while the pass takes the last one is never lost
         self.started = None          # the engine's clock when the last check began
         self.saved = None            # the stable content the file holds
+        self.counts = {}             # the last count seen per folder (the wake text names it)
 
     def bind(self, engine):
         self.engine = engine
@@ -2465,29 +2466,39 @@ class SpotlightFacts:
             saved = sg.load(engine.state_dir)
             self.tracker = sg.Tracker((saved or {}).get("folders"))
             self.saved = sg.stable(saved) if saved else None
+            self.counts = {f: e.get("count") for f, e in ((saved or {}).get("folders") or {}).items() if isinstance(e, dict)}
         with self.lock:
             results, self.done = self.done, None
-        facts = self._apply(engine, sg, results) if results else []
+        if results:
+            self._apply(engine, sg, results)
+        facts = self._open(engine, sg)   # EVERY pass while an episode is open: the delivery layer batches (a fact must still be pending when the batch is ripe) and dedups by the stable key
         alive = self.thread is not None and self.thread.is_alive()
         if not alive and (self.started is None or engine.now() - self.started >= sg.CHECK_SECONDS):
             self._start(engine, sg, cfg)
         return facts
 
-    def _apply(self, engine, sg, results):
-        now = engine.now()
+    def _open(self, engine, sg):
+        """The wake of each open episode, one fact per Chief of Staff, the same key and `created` on every pass."""
         chiefs = self._chiefs(engine)
         facts = []
+        for folder, episode in sorted(self.tracker.episode.items()):
+            if episode is None or not chiefs:
+                continue
+            text = sg.wake_text(folder, self.counts.get(folder), PROG)
+            key = "spotlight.lost:%s:%d" % (hashlib.sha256(folder.encode()).hexdigest()[:10], int(episode))
+            facts.extend(Fact(key, name, "spotlight", " ".join(text.split()), episode, sender="switchboard") for name in chiefs)
+        return facts
+
+    def _apply(self, engine, sg, results):
+        now = engine.now()
         for folder, (state, count) in sorted(results.items()):
             event = self.tracker.step(folder, state, now)
+            if count is not None:
+                self.counts[folder] = count
             if event == "begin" and engine.audit is not None:
                 engine.audit.append(engine.actor, "spotlight.lost", None, {"folder": folder, "count": count})
             elif event == "end" and engine.audit is not None:
                 engine.audit.append(engine.actor, "spotlight.recovered", None, {"folder": folder})
-            episode = self.tracker.episode.get(folder)
-            if episode is not None and chiefs:
-                text = sg.wake_text(folder, count, PROG)
-                key = "spotlight.lost:%s:%d" % (hashlib.sha256(folder.encode()).hexdigest()[:10], int(episode))
-                facts.extend(Fact(key, name, "spotlight", " ".join(text.split()), episode, sender="switchboard") for name in chiefs)
         content = sg.body(results, self.tracker, now)
         if self.saved != sg.stable(content):
             try:
@@ -2495,7 +2506,6 @@ class SpotlightFacts:
                 self.saved = sg.stable(content)
             except OSError as err:
                 engine._note("spotlight.guard_file", None, {"error": _plain("%s: %s" % (type(err).__name__, err), 160)})
-        return facts
 
 
 class CpuFacts:
