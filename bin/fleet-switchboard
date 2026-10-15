@@ -240,6 +240,23 @@ def load_cpu_guard():
     return module
 
 
+def load_agent_presence():
+    """The presence rule for a worker with no terminal, bin/agent_presence.py (#433), loaded by path like cpu_guard."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "agent_presence.py")
+    held = sys.modules.get("agent_presence")
+    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+        return held
+    spec = importlib.util.spec_from_file_location("agent_presence", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["agent_presence"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("agent_presence", None)
+        raise
+    return module
+
+
 def load_health_records():
     """The health recorders, bin/health_records.py (#357), loaded by path like disk_janitor."""
     path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "health_records.py")
@@ -3001,6 +3018,7 @@ class Observation:
         self.last_human_prompt, self.problem = last_human_prompt, problem
         self.created = None  # PR 17: when v2 says the session began (epoch seconds)
         self.wrong_program = False  # the pane runs something other than the configured v2
+        self.headless = False  # #433: a worker with no terminal: what it does is read from the OpenCode service, never from herdr
         self.conflict = []  # other sessions that claim the same name
 
     def engaged(self, now, window):
@@ -3010,7 +3028,7 @@ class Observation:
         return self.last_human_prompt is not None and now - self.last_human_prompt < window
 
     def to_json(self):
-        return {"name": self.name, "session": self.session_id, "pane": self.pane, "status": self.status,
+        return {"name": self.name, "session": self.session_id, "pane": self.pane, "headless": self.headless, "status": self.status,
                 "fleet": self.fleet, "idle_at": iso(self.idle_at), "outcome": self.outcome,
                 "last_human_prompt": iso(self.last_human_prompt), "problem": self.problem,
                 "wrong_program": self.wrong_program, "conflict": self.conflict}
@@ -4016,6 +4034,7 @@ class Switchboard:
                 entries = self.herdr.agent_list()
             except HerdrError as err:
                 found.problems.append("herdr unreachable: %s" % err)
+                self._discover_headless(found, now)   # a worker with no terminal does not depend on herdr
                 return found
         found.entries = [entry for entry in entries if isinstance(entry, dict)]
         for entry in sorted(found.entries, key=lambda e: self.reads.stale_first(agent_session(e) or "")):   # the stalest first: the read budget is shared out in turn
@@ -4028,10 +4047,92 @@ class Switchboard:
                 continue
             if observation is not None:
                 found.add(observation)
+        self._discover_headless(found, now)   # AFTER the terminals: a terminal that runs the same session wins (`watch`), and another session claiming a terminal agent's name is a conflict (held)
         return found
+
+    def _discover_headless(self, found, now):
+        """#433: the workers with no terminal. The index is the private records in state-dir/headless/; PRESENCE is proved by the service (the session
+        exists, answers and carries the worker's name in its metadata), never by a record alone. `session.active` is read ONCE for all of them; a
+        service that does not answer makes each one `unknown` with a problem (a delivery is held, never dropped), not dead and not working."""
+        if self.state_dir is None:
+            return
+        try:
+            ap = load_agent_presence()
+            records, bad = ap.scan_records(self.state_dir)
+        except Exception as err:   # never silent: headless workers would vanish from discovery without a word
+            found.problems.append("headless workers could not be read: %s" % _one_line(str(err), 100))
+            return
+        found.problems.extend(bad)   # a record that is there and cannot be used is said, one line each, never a silent loss
+        if not records:
+            return
+        active, down = None, None
+        try:
+            active = self.v2.session_active() or {}
+        except V2Error as err:
+            down = _one_line(str(err), 100)
+        for record in records:
+            try:
+                observation = self._observe_headless(record, now, active, down)
+            except V2Error as err:
+                observation = self._unknown_headless(record, "the service did not answer: %s" % _one_line(str(err), 100))
+            if observation is not None:
+                found.add(observation)
+
+    def _unknown_headless(self, record, why):
+        name = record["worker"]
+        observation = Observation(name, record["session"], None, "unknown", {"name": name, "headless": True})
+        observation.headless = True
+        observation.problem = "%s: %s" % (name, why)
+        return observation
+
+    def _observe_headless(self, record, now, active, down=None, fresh=False):
+        """An Observation for one headless worker, or None when its session is gone or is not the worker's. State per bin/agent_presence.py."""
+        ap = load_agent_presence()
+        session_id = record["session"]
+        if down is not None:
+            return self._unknown_headless(record, "the service did not answer (%s)" % down)
+        state, why = ap.read_state(self.v2, session_id, active)
+        if state == "missing":
+            return None
+        if state == ap.UNKNOWN:
+            return self._unknown_headless(record, why)
+        try:
+            info = self.reads.session_info(session_id, state, now, fresh)
+        except V2Error as err:
+            if err.reason == "http" and err.status == 404:
+                return None
+            raise
+        fleet = _fleet_meta(info)
+        if not fleet or fleet.get("name") != record["worker"]:
+            return None   # the session does not carry the worker's name: the record is not proof of presence
+        times = info.get("time") if isinstance(info.get("time"), dict) else {}
+        observation = Observation(fleet["name"], session_id, None, STATUS.get(state, "unknown"), fleet, _seconds(times.get("idle")), info.get("outcome"))
+        observation.created = _seconds(times.get("created"))
+        observation.headless = True
+        try:
+            observation.last_human_prompt = self.last_human_prompt(
+                session_id, now, inbox=fleet.get("role") == "chief-of-staff", info=info, fresh=fresh)
+        except V2Error as err:
+            observation.problem = "cannot read %s's transcript: %s" % (observation.name, err)
+        return observation
 
     def reobserve(self, previous, now):
         """The same agent, read again just before a write (invariant 4). (Observation, why-not)."""
+        if previous.headless:
+            try:
+                record = load_agent_presence().load_record(self.state_dir, previous.name) if self.state_dir is not None else None
+                if record is None or record["session"] != previous.session_id:
+                    return None, "%s has no headless record for session %s any more" % (previous.name, previous.session_id)
+                active = self.v2.session_active() or {}
+                fresh = self._observe_headless(record, now, active, None, fresh=True)   # a read before a write is never from memory
+            except V2Error as err:
+                return None, "v2 unreachable: %s" % err
+            if fresh is None or fresh.name != previous.name:
+                return None, "session %s is no longer the fleet agent %s" % (previous.session_id, previous.name)
+            if fresh.problem:
+                return None, fresh.problem
+            fresh.conflict = list(previous.conflict)
+            return fresh, None
         if not previous.pane:
             return None, "%s has no herdr pane to read again" % previous.name
         try:
@@ -14394,7 +14495,7 @@ def _agent_line(entry):
     if seen is None:
         return "%-14s (not found)  %s" % (entry["name"], _plan_line(entry))
     return "%-14s %-8s %s  pane %s  your last prompt %s  %s" % (
-        seen["name"], seen["status"], seen["session"], seen["pane"] or "-",
+        seen["name"], seen["status"], seen["session"], seen["pane"] or ("(headless)" if seen.get("headless") else "-"),
         seen["last_human_prompt"] or "not in the window", _plan_line(entry))
 
 
