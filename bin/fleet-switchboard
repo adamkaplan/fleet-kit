@@ -17824,10 +17824,74 @@ def impact_review_hold(state_dir, pr, head):
     return bool(latest and latest.get("impact_action") == "hold"), None
 
 
+def impact_review_record(state_dir, pr, head):
+    """((action, class), problem): the independent impact reviewer's newest record for EXACTLY this head as (impact_action, impact_class) (None when there is
+    none), and what is wrong when the ledger cannot be read (the rating is then unknown: the owner decision reads it as a hold)."""
+    try:
+        entries, problem = plan_ledger.read_ledger(state_dir)
+    except Exception as err:
+        return None, "%s: %s" % (type(err).__name__, _one_line(str(err), 100))
+    if problem:
+        return None, _one_line(str(problem), 120)
+    latest = None
+    for entry in entries:
+        if entry.get("kind") == "review_record" and entry.get("pr") == pr and entry.get("head") == head and entry.get("reviewer") == "impact":
+            latest = entry
+    return ((latest.get("impact_action"), latest.get("impact_class")) if latest else None), None
+
+
+def _file_text_at(engine, repo, path, ref):
+    """The text of `path` at `ref`: the string, "" is a real empty file, or None when the path does not exist there (a 404). Raises IntentError for any
+    other failure (the caller says unreadable and holds)."""
+    reader = getattr(engine, "intents", None)
+    if reader is None:
+        raise IntentError("gh", "no GitHub reader")
+    try:
+        data = reader._api("repos/%s/contents/%s?ref=%s" % (repo, urllib.parse.quote(path, safe="/"), ref), repo)
+    except IntentError as err:
+        if err.reason == "not_found":
+            return None
+        raise
+    if not isinstance(data, dict) or data.get("type") not in (None, "file") or data.get("encoding") != "base64" or not isinstance(data.get("content"), str):
+        raise IntentError("gh", "%s is not a readable file at %s" % (path, str(ref)[:8]))
+    try:
+        return base64.b64decode(data["content"]).decode("utf-8")
+    except (ValueError, UnicodeError):
+        raise IntentError("gh", "%s is not text at %s" % (path, str(ref)[:8])) from None
+
+
+def agent_block_states(engine, repo, matrix, paths, base, head):
+    """#451 slice 2: {path: "unchanged"|"changed"|"added"|"removed"|"unreadable"} for the changed paths the matrix file judges by content (an agent
+    definition: only its permission block counts). Two reads for each (its base and its head) and none when there is no such path or more than the matrix
+    file allows (the decision holds those unread). A read that fails is "unreadable", never "unchanged"."""
+    narrowed, limit = impact_floor.narrow_paths(matrix, paths)
+    if not narrowed or len(narrowed) > limit:
+        return {}
+    keys = impact_floor.narrow_rule(matrix)[1]
+    states = {}
+    for path in narrowed:
+        try:
+            if not base or not head:
+                raise IntentError("gh", "the base or head commit is unknown")
+            before, after = _file_text_at(engine, repo, path, base), _file_text_at(engine, repo, path, head)
+        except IntentError:
+            states[path] = "unreadable"
+            continue
+        if before is None and after is None:
+            states[path] = "unreadable"
+        elif before is None:
+            states[path] = "added"
+        elif after is None:
+            states[path] = "removed"
+        else:
+            states[path] = impact_floor.block_state(before, after, keys)
+    return states
+
+
 def pr_floor_report(engine, repo, number, rated_pairs=()):
     """Read one PR's files and decide: {"pr", "head", "floor_paths", "complete", "rated", "decision", "reasons", "globs"}. Reads only (one
     `gh pr view`). `rated_pairs` is the independent rating's (severity, probability) list, an input that can only ADD a hold."""
-    raw = read_pr_json(engine, repo, number, "files")
+    raw = read_pr_json(engine, repo, number, "files,baseRefOid")
     files = [f for f in (raw.get("files") if isinstance(raw.get("files"), list) else []) if isinstance(f, dict)]
     globs, exclude, force = impact_floor.floor_for(repo, engine.config)
     paths, renamed = [], []
@@ -17849,7 +17913,12 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
     matrix = impact_floor.load_matrix()
     rated = impact_floor.rate(matrix, list(rated_pairs))
     decision, reasons = impact_floor.decide(hit, rated, unknown)
-    owner = impact_floor.owner_decide(matrix, paths, [(sev, prob, None) for sev, prob in rated_pairs], unknown, hit)   # advisory (#451): which tier the owner-hold rule puts it in; the labels still follow `decision` until the re-judge slice
+    head = raw.get("headRefOid")
+    narrow = agent_block_states(engine, repo, matrix, paths, raw.get("baseRefOid"), head)
+    record, record_problem = (impact_review_record(engine.state_dir, "%s#%d" % (repo, number), head) if engine.state_dir is not None and isinstance(head, str) else (None, None))
+    if record_problem:
+        record = ("hold", None)   # an unreadable ledger is an unknown rating: it holds
+    owner = impact_floor.owner_decide(matrix, paths, [(sev, prob, None) for sev, prob in rated_pairs], unknown, hit, narrow, record)   # advisory (#451): which tier the owner-hold rule puts it in; the labels still follow `decision` until the re-judge slice
     head = raw.get("headRefOid")
     if engine.state_dir is not None and isinstance(head, str):
         review, problem = impact_review_hold(engine.state_dir, "%s#%d" % (repo, number), head)
@@ -19319,7 +19388,7 @@ def parse_review_block(text):
     if not isinstance(text, str) or not text.strip():
         return None, "no verdict block"
     lines = [l.strip() for l in text.splitlines()]
-    fields = {"verdict": None, "head": None, "impact_action": None, "blocks": 0, "notes": 0, "findings": 0}
+    fields = {"verdict": None, "head": None, "impact_action": None, "impact_class": None, "blocks": 0, "notes": 0, "findings": 0}
     started = False
     for line in lines:
         if line.startswith("verdict:") and not started:
@@ -19328,6 +19397,8 @@ def parse_review_block(text):
             fields["head"] = line.split(":", 1)[1].strip()
         elif started and line.startswith("impact-action:"):
             fields["impact_action"] = line.split(":", 1)[1].strip()
+        elif started and line.startswith("impact-class:"):
+            fields["impact_class"] = line.split(":", 1)[1].strip().lower()
         elif started and line.startswith("- "):
             parts = [p.strip() for p in line[2:].split("|")]
             if len(parts) >= 2 and parts[1] in ("block", "note"):
@@ -19347,7 +19418,12 @@ def parse_review_block(text):
         return None, "the block has no `head: <sha>` line: say which commit was judged"
     if fields["impact_action"] not in (None, "hold", "second-review", "none"):
         return None, "`impact-action:` must be hold, second-review or none"
+    if fields["impact_class"] is not None and not IMPACT_CLASS_RE.fullmatch(fields["impact_class"]):
+        return None, "`impact-class:` must be one lower-case word naming the class of the impact (see the matrix file's classes)"
     return fields, None
+
+
+IMPACT_CLASS_RE = re.compile(r"[a-z][a-z-]{0,31}")
 
 
 def cmd_review(args, runner, now):
@@ -19394,6 +19470,7 @@ def cmd_review(args, runner, now):
                 raise ReviewError("refused: %s" % why)
             args.verdict, args.head, args.blocks, args.notes, args.impact_action = (fields["verdict"], fields["head"], fields["blocks"],
                                                                                     fields["notes"], fields["impact_action"])
+            args.impact_class = args.impact_class or fields["impact_class"]
         if args.verdict not in plan_ledger.REVIEW_VERDICTS:
             raise ReviewError("--verdict must be one of %s (or give --block with the reviewer's returned text)" % ", ".join(plan_ledger.REVIEW_VERDICTS))
         for name in ("blocks", "notes"):
@@ -19405,6 +19482,11 @@ def cmd_review(args, runner, now):
             raise ReviewError("request-changes needs at least 1 blocking finding (a finding that cites no rule never blocks)")
         if args.impact_action and args.reviewer != "impact":
             raise ReviewError("--impact-action belongs to the impact reviewer")
+        impact_class = (getattr(args, "impact_class", None) or "").strip().lower() or None
+        if impact_class is not None and args.reviewer != "impact":
+            raise ReviewError("--impact-class belongs to the impact reviewer")
+        if impact_class is not None and not IMPACT_CLASS_RE.fullmatch(impact_class):
+            raise ReviewError("impact-class must be one lower-case word naming the class of the impact (see the matrix file's classes), got %r" % impact_class[:40])
         if not head or not re.fullmatch(r"[0-9a-f]{40}", head):
             raise ReviewError("the PR head is unknown: nothing was recorded")
         given = args.head or head
@@ -19419,6 +19501,8 @@ def cmd_review(args, runner, now):
                  "summary": plan_ledger.clip(redact_command_text(args.summary or ""), 200)}
         if args.impact_action:
             entry["impact_action"] = args.impact_action
+        if impact_class:
+            entry["impact_class"] = impact_class   # #451 slice 2: the class of the impact that drives the action; a missing one holds for the owner
         stored = plan_ledger.append_entry(state, entry, now())
         if engine.audit is not None:
             engine.audit.append(engine.actor, "review.record", ref, {"reviewer": args.reviewer, "verdict": args.verdict, "head": head[:12],
@@ -19593,6 +19677,7 @@ def add_review_parsers(sub):
     record.add_argument("--notes", type=int, default=0, help="Notes and proposals")
     record.add_argument("--impact-action", dest="impact_action", choices=("hold", "second-review", "none"),
                         help="The impact reviewer's action from the matrix")
+    record.add_argument("--impact-class", dest="impact_class", help="The class of the impact that drives the action (a class of the matrix file's owner_hold block)")
     record.add_argument("--summary", help="One line (at most 200 characters)")
     measure = rsub.add_parser("measure", help="Read-only: per merged PR, time to green CI, review rounds, findings, escaped defects; baseline and after medians")
     measure.add_argument("repo", help="owner/repo")

@@ -257,6 +257,71 @@ def top_tier_hits(paths, matrix):
     return hits
 
 
+def narrow_rule(matrix):
+    """(globs, keys, max_files) of the matrix file's `owner_hold.narrow_by_diff` block, or None when it is absent or malformed (then the whole
+    top tier path holds, as it did before). The block names the paths whose hold depends on their CONTENT (an agent definition: only its permission
+    block counts), the top level front matter keys that make that block, and how many such files one pull request may change before it holds."""
+    block = ((matrix or {}).get("owner_hold") or {}).get("narrow_by_diff") if isinstance(matrix, dict) else None
+    if not isinstance(block, dict):
+        return None
+    globs, keys, limit = block.get("paths"), block.get("keys"), block.get("max_files")
+    if not (isinstance(globs, list) and globs and all(isinstance(g, str) and g.strip() for g in globs)):
+        return None
+    if not (isinstance(keys, list) and keys and all(isinstance(k, str) and re.fullmatch(r"[A-Za-z_][\w-]*", k) for k in keys)):
+        return None
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 50:
+        return None
+    return list(globs), list(keys), limit
+
+
+def narrow_paths(matrix, paths):
+    """([paths], limit): the changed paths the matrix file's `narrow_by_diff` block judges by content (a path another top tier glob also names stays a plain
+    top tier path), sorted, and the most such files one pull request may change before it holds unread. ([], None) when there is no usable block."""
+    rule, top = narrow_rule(matrix), owner_hold_rule(matrix)
+    if rule is None or top is None:
+        return [], None
+    globs, _keys, limit = rule
+    elsewhere = [g for named in top[2].values() for g in named if g not in globs]
+    return sorted({p for p in paths if isinstance(p, str) and matches(p, globs) and not matches(p, elsewhere)}), limit
+
+
+NARROW_TEXT_MAX = 200000   # a definition larger than this is not parsed: it holds
+
+
+def permission_block(text, keys):
+    """{key: [normalised lines]} of the top level front matter keys `keys` in `text`, or None when the text has no front matter, is not text, or is too large
+    (unparsable: the caller holds). A key's block is its line and every following line up to the next top level key; comments and blank lines are dropped,
+    line ends and trailing space are normalised. Two versions have the same permission block when these dicts are equal; any other difference is a change."""
+    if not isinstance(text, str) or len(text) > NARROW_TEXT_MAX:
+        return None
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if not lines or lines[0].strip() != "---":
+        return None
+    end = next((n for n in range(1, len(lines)) if lines[n].strip() == "---"), None)
+    if end is None:
+        return None
+    found, current = {}, None
+    for line in lines[1:end]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        top = re.match(r"([A-Za-z_][\w-]*)\s*:", line)
+        if top and not line[0].isspace():
+            current = top.group(1) if top.group(1) in keys else None
+            if current is not None:
+                found[current] = [line.rstrip()]
+        elif current is not None:
+            found[current].append(line.rstrip())
+    return found
+
+
+def block_state(old, new, keys):
+    """"unchanged" or "changed" for two versions of a definition, "unreadable" when either has no parsable front matter."""
+    before, after = permission_block(old, keys), permission_block(new, keys)
+    if before is None or after is None:
+        return "unreadable"
+    return "unchanged" if before == after else "changed"
+
+
 def class_is_top_tier(matrix, cls):
     """True for a top tier class, a missing class and an UNKNOWN class (fail closed); False only for a class the matrix file names as not top tier
     (compared case-insensitively)."""
@@ -266,7 +331,7 @@ def class_is_top_tier(matrix, cls):
     return cls.strip().lower() not in rule[1]
 
 
-def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=()):
+def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=(), narrow=None, record=None):
     """The decision under the owner-hold rule. `paths`: every changed path (a deletion and a rename's old path too); `impacts`: [(severity, probability, class)]
     from the independent rating (class may be None); `floor_hit`: the paths that hit the old floor (floor_paths). Returns (decision, reasons):
 
@@ -274,7 +339,12 @@ def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=()):
         level and its class is top tier, missing or unknown;
       - "second-review": no hold, but a floor path outside the top tier, a hold-level rating of a class the matrix file names as not top tier, or a
         medium-band rating asks for a second independent review (the usual checks then decide the merge);
-      - "none" otherwise."""
+      - "none" otherwise.
+
+    `narrow` ({path: "unchanged"|"changed"|"added"|"removed"|"unreadable"}, from the caller's content reads) judges the paths the matrix file's
+    `narrow_by_diff` block names: only a changed permission block holds; an added, removed or unreadable one holds; a path with no entry is unread and
+    holds; more such paths than the block allows hold without being read. `record` ((action, class) of the independent impact reviewer's record for
+    this head, or None): a hold action of a top tier, missing or unknown class holds, of a class the matrix file names as not top tier asks for a second review."""
     reasons = []
     if owner_hold_rule(matrix) is None:   # FAIL CLOSED: no usable rule means every change holds for the owner
         reasons.append("owner_hold rule missing or malformed in the impact matrix file: every change holds")
@@ -283,8 +353,27 @@ def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=()):
     lost = sorted({p for p in paths if isinstance(p, str) and escapes(p)})
     if lost:   # a path that leaves the repository cannot be judged as a file of it: hold
         reasons.append("path outside the repository or not normalisable: %s" % ", ".join(repr(p)[:60] for p in lost[:3]))
-    for cls, got in sorted(top_tier_hits(paths, matrix).items()):
+    hits = top_tier_hits(paths, matrix)
+    prose = []   # narrow paths whose permission block did not change: no hold from the path
+    narrowed, limit = narrow_paths(matrix, paths)
+    if narrowed:
+        if len(narrowed) > limit:
+            reasons.append("more than %d definitions with a narrow rule changed (%d): not read, held" % (limit, len(narrowed)))
+        else:
+            for path in narrowed:
+                for cls in list(hits):
+                    hits[cls] = [x for x in hits[cls] if x != path]
+                state = (narrow or {}).get(path)
+                if state == "unchanged":
+                    prose.append(path)
+                else:
+                    why = {"changed": "permission block changed", "added": "added", "removed": "removed", "unreadable": "its permission block could not be read"}.get(state, "its permission block was not read")
+                    reasons.append("top tier path (permissions): %s (%s)" % (path, why))
+            hits = {cls: got for cls, got in hits.items() if got}
+    for cls, got in sorted(hits.items()):
         reasons.append("top tier path (%s): %s" % (cls, ", ".join(got[:5]) + (" ..." if len(got) > 5 else "")))
+    if record is not None and record[0] == "hold" and class_is_top_tier(matrix, record[1]):
+        reasons.append("independent impact review says hold, class %s" % (record[1] or "missing"))
     rated = []
     for severity, probability, cls in impacts:
         for _s, _p, level, action in rate(matrix, [(severity, probability)]):
@@ -295,6 +384,10 @@ def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=()):
     if reasons:
         return "hold", reasons
     softer = []
+    if prose:
+        softer.append("definition change without a permission block change (%s): a second independent review" % ", ".join(prose[:3]))
+    if record is not None and record[0] == "hold":   # only a class the matrix file names as not top tier reaches here
+        softer.append("independent impact review says hold, class %s: a second independent review" % record[1])
     if floor_hit:
         softer.append("floor: %d path(s) outside the top tier ask for a second independent review" % len(floor_hit))
     softer.extend("rating: %s / %s (%s), class %s, asks for a second independent review" % (s, p, level, cls) for s, p, level, action, cls in rated

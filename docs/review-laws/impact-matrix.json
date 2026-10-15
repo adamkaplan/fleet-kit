@@ -154,6 +154,19 @@
         ".github/workflows/**"
       ]
     },
+    "narrow_by_diff": {
+      "meaning": "Paths whose hold depends on their CONTENT: an agent definition holds for the owner only when its permission block changes between the base and the head of the pull request (the top level front matter keys named here); an added, removed or unreadable definition holds, and so does a pull request that changes more than max_files of them. The code has no path or key of its own.",
+      "paths": [
+        "agents/**"
+      ],
+      "keys": [
+        "permissions",
+        "permission",
+        "mode",
+        "tools"
+      ],
+      "max_files": 8
+    },
     "floor": {
       "adamkaplan/fleet-kit": {
         "globs": [
