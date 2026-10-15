@@ -51191,6 +51191,32 @@ class TestEarlyDecisionsWrite(DecisionsBase):
         self.assertEqual(len(calls), 1, "the worker source was read once in the pass, not twice")
         self.assertTrue([d for d in self.file()["decisions"] if d["kind"] == "permission"])
 
+    def test_a_worker_source_that_raises_in_the_early_step_writes_nothing_and_is_read_again_by_the_pass(self):
+        self.path.write_text('{"an": "older daemon version"}')
+        old = self.world.clock.now() - 1000
+        os.utime(str(self.path), (old, old))
+        worker = next(src for src in self.world.engine.sources if isinstance(src, sb.WorkerFacts))
+        calls = []
+
+        def flaky(self_):
+            calls.append(1)
+            if len(calls) == 1:
+                raise OSError("herdr went away")
+            return []
+        discovery = self.world.engine.discover(self.world.clock.now())
+        with mock.patch.object(type(worker), "__call__", flaky):
+            self.assertFalse(sb.early_decisions(self.world.engine, discovery))
+            self.assertEqual(self.path.read_text(), '{"an": "older daemon version"}', "nothing was written or touched")
+            self.assertEqual(self.world.engine._early_facts, {}, "nothing is kept for the pass")
+            self.world.engine.collect_facts()
+        self.assertEqual(len(calls), 2, "the pass read the worker source itself")
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "decisions.early_error"])
+
+    def test_early_facts_never_carry_over_into_a_later_pass(self):
+        self.world.engine._early_facts = {id(object()): ["stale"]}
+        self.world.engine.run_pass()
+        self.assertEqual(self.world.engine._early_facts, {})
+
     def test_a_pass_that_could_not_read_the_fleet_writes_nothing_early_and_an_old_shape_file_is_replaced(self):
         self.path.write_text('{"an": "older daemon version"}')
         old = self.world.clock.now() - 1000
