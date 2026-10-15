@@ -33,13 +33,17 @@ cat > "$tmp/host" <<'H'
 #!/bin/sh
 echo "$@" >> "$TMP_LOG"
 case "$1 $2" in
-  "containerd config") [ "${DUMP_OK:-1}" = 1 ] && cat "$CFG" || exit 1 ;;
+  "containerd config") [ "${DUMP_OK:-1}" = 1 ] || exit 1
+    # DOWN=1: containerd does not answer once it has been restarted once
+    [ "${DOWN:-0}" = 1 ] && [ "$(grep -c 'systemctl restart containerd' "$TMP_LOG")" -ge 1 ] && exit 1
+    cat "$CFG" ;;
 esac
 H
 printf '#!/bin/sh
 echo label >> "$TMP_LOG"
 ' > "$tmp/label"; chmod +x "$tmp/host" "$tmp/label"
-runfix() { : > "$tmp/log"; TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/host" LABEL_CMD="$tmp/label" ONCE=1 sh "$tmp/fix.sh" >/dev/null 2>&1; }
+printf '#!/bin/sh\nexit 0\n' > "$tmp/ready"; chmod +x "$tmp/ready"
+runfix() { : > "$tmp/log"; READY_CMD="${READY_CMD:-$tmp/ready}" TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/host" LABEL_CMD="$tmp/label" ONCE=1 sh "$tmp/fix.sh" >/dev/null 2>&1; }
 restarts() { grep -c 'systemctl restart containerd' "$tmp/log" || true; }
 
 runfix; rc=$?
@@ -51,6 +55,7 @@ runfix; rc=$?
   && ok "fix: already right is a no-op, no restart" || bad "fix: not idempotent (rc=$rc)"
 # invalid config: backup restored, exit non-zero
 cat > "$tmp/config.toml" <<'T'
+version = 3
 [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.sysbox-runc]
   runtime_type = "x"
 T
@@ -80,6 +85,7 @@ cp "$tmp/config.toml" "$tmp/after2"; runfix; rc=$?
 [ $rc = 0 ] && cmp -s "$tmp/after2" "$tmp/config.toml" && [ "$(restarts)" = 0 ] && ok "fix: installer form: second run changes nothing" || bad "fix: installer form second run"
 # a legacy parent that still holds another table or a key is kept
 cat > "$tmp/config.toml" <<'T'
+version = 3
   [plugins."io.containerd.grpc.v1.cri"]
     x = 1
   [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.sysbox-runc]
@@ -98,6 +104,7 @@ DUMP_OK=0 runfix; rc=$?
   && ok "fix: installer form, invalid result: backup restored" || bad "fix: installer form invalid (rc=$rc)"
 # the earlier col-0 form, single quotes on the new key
 cat > "$tmp/config.toml" <<'T'
+version = 3
 [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc]
 runtime_type = 'io.containerd.runc.v2'
 [plugins.'io.containerd.grpc.v1.cri'.containerd.runtimes.sysbox-runc]
@@ -109,6 +116,7 @@ runfix; rc=$?
 
 # a pre-existing duplicate header makes the rewrite refuse: exit 1, config untouched, no restart
 cat > "$tmp/config.toml" <<'T'
+version = 3
 [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.sysbox-runc]
   runtime_type = "x"
 [dup]
@@ -119,15 +127,63 @@ cp "$tmp/config.toml" "$tmp/orig"; runfix; rc=$?
   && ok "fix: duplicate header refused, config unchanged" || bad "fix: duplicate header (rc=$rc)"
 # sysbox-runc registered in a form the fix does not move: exit 1, config untouched, no restart
 cat > "$tmp/config.toml" <<'T'
+version = 3
 [plugins."other.key".containerd.runtimes.sysbox-runc]
   runtime_type = "x"
 T
 cp "$tmp/config.toml" "$tmp/orig"; runfix; rc=$?
 [ $rc = 1 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && [ "$(restarts)" = 0 ] \
   && ok "fix: unmovable form refused, config unchanged" || bad "fix: unmovable form (rc=$rc)"
+# after the restart containerd does not answer: backup restored byte for byte, restarted again, exit 1, no label
+cp "$fx" "$tmp/config.toml"; cp "$fx" "$tmp/orig"
+DOWN=1 WAIT=2 POLL=1 runfix; rc=$?
+[ $rc = 1 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && [ "$(restarts)" = 2 ] && ! grep -q label "$tmp/log" \
+  && ok "fix: containerd down after restart: backup restored, restarted again, exit 1" || bad "fix: rollback after restart (rc=$rc)"
+# containerd answers but the node is not Ready: same rollback
+printf '#!/bin/sh\nexit 1\n' > "$tmp/notready"; chmod +x "$tmp/notready"
+cp "$fx" "$tmp/config.toml"
+READY_CMD="$tmp/notready" WAIT=2 POLL=1 runfix; rc=$?
+[ $rc = 1 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && [ "$(restarts)" = 2 ] && ! grep -q label "$tmp/log" \
+  && ok "fix: node not Ready after restart: backup restored, exit 1" || bad "fix: not-Ready rollback (rc=$rc)"
+# healthy restart (node Ready): one restart, labelled, as before
+printf '#!/bin/sh\nexit 0\n' > "$tmp/ready"; chmod +x "$tmp/ready"
+cp "$fx" "$tmp/config.toml"
+READY_CMD="$tmp/ready" WAIT=2 POLL=1 runfix; rc=$?
+[ $rc = 0 ] && ! grep -q 'grpc.v1.cri' "$tmp/config.toml" && [ "$(restarts)" = 1 ] && grep -q label "$tmp/log" \
+  && ok "fix: healthy restart: kept, one restart, labelled" || bad "fix: healthy restart (rc=$rc)"
+# containerd config version 1 (declared, or legacy key only with no version): refused, node untouched
+for v in declared bare; do
+  if [ $v = declared ]; then printf 'version = 1\n[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.sysbox-runc]\n  runtime_type = "x"\n' > "$tmp/config.toml"
+  else printf '[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.sysbox-runc]\n  runtime_type = "x"\n' > "$tmp/config.toml"; fi
+  cp "$tmp/config.toml" "$tmp/orig"; rm -f "$tmp/config.toml.sysbox-fix.bak"
+  runfix; rc=$?
+  [ $rc = 1 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && [ ! -e "$tmp/config.toml.sysbox-fix.bak" ] && [ "$(restarts)" = 0 ] && ! grep -q label "$tmp/log" \
+    && ok "fix: version 1 config ($v) refused, node untouched" || bad "fix: v1 guard $v (rc=$rc)"
+done
 # the worker's activity reader (stub server, no network)
 nice python3 -m unittest discover -s "$here/worker/tests" -p 'test_*.py' >"$tmp/ut" 2>&1 \
   && ok "worker activity reader tests" || { bad "worker activity reader tests"; tail -20 "$tmp/ut"; }
+
+# 2b. no floating image tag: every image reference in cloud/ has an exact tag or a digest
+pins=$(python3 - "$here" <<'P'
+import re, sys, pathlib
+root = pathlib.Path(sys.argv[1]); bad = []
+refs = []
+for f in list(root.glob("k8s/*.yaml")) + list(root.glob("**/Dockerfile*")):
+    for n, line in enumerate(f.read_text().splitlines(), 1):
+        m = re.match(r"\s*FROM\s+(?:--\S+\s+)?(\S+)", line) if "Dockerfile" in f.name else re.match(r"\s*-?\s*image:\s*(\S+)", line)
+        if m: refs.append((f, n, m.group(1)))
+for f, n, ref in refs:
+    if ref.lower() == "scratch" or ref.startswith("$"): continue
+    if "@sha256:" in ref: continue
+    tag = ref.rsplit("/", 1)[-1].partition(":")[2]
+    if not tag or tag == "latest": bad.append(f"{f.name}:{n}: {ref}")
+print(len(refs)); [print(b) for b in bad]
+P
+)
+nrefs=$(echo "$pins" | head -1)
+[ "${nrefs:-0}" -ge 2 ] && [ "$(echo "$pins" | wc -l | tr -d ' ')" = 1 ] \
+  && ok "images pinned: $nrefs references, none floating" || { bad "floating or missing image tag"; echo "$pins" | tail -n +2; }
 
 # 3. secret scan on a directory
 mkdir "$tmp/clean" "$tmp/dirty"; echo "hello" > "$tmp/clean/a.txt"

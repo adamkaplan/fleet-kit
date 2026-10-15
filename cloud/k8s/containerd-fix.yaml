@@ -14,7 +14,8 @@ metadata:
 data:
   fix.sh: |
     #!/bin/sh
-    # Test hooks: CFG (config path), HOST (command prefix that runs on the node), LABEL_CMD,
+    # Test hooks: CFG (config path), HOST (command prefix that runs on the node), LABEL_CMD, READY_CMD,
+    # WAIT and POLL (seconds: how long and how often to check health after a restart),
     # ONCE=1 (one pass, then exit), MAX_BAD (invalid-config tries before exiting non-zero).
     set -eu
     CFG=${CFG:-/host/etc/containerd/config.toml}
@@ -23,12 +24,33 @@ data:
     NEW="io.containerd.cri.v1.runtime"
     OLD="io.containerd.grpc.v1.cri"
     bad=0
+    WAIT=${WAIT:-60}; POLL=${POLL:-2}
+
+    # After a restart: containerd must answer and the node must be Ready within WAIT seconds.
+    node_ready() {
+      if [ -n "${READY_CMD:-}" ]; then $READY_CMD
+      else kubectl get node "$NODE_NAME" -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}' | grep -qx True; fi
+    }
+    healthy_after_restart() {
+      t=0
+      while [ "$t" -lt "$WAIT" ]; do
+        if $HOST containerd config dump >/dev/null 2>&1 && node_ready >/dev/null 2>&1; then return 0; fi
+        sleep "$POLL"; t=$((t + POLL))
+      done
+      return 1
+    }
 
     while true; do
       if [ ! -f "$CFG" ] || ! grep -q 'runtimes[."'"'"']*sysbox-runc' "$CFG"; then
         echo "waiting for the Sysbox installer to register sysbox-runc"
         [ "${ONCE:-0}" = 1 ] && exit 3
         sleep 15; continue
+      fi
+      # containerd config version: this fix only knows the v2/v3 plugin keys. Refuse a v1 file
+      # (declared, or no version line and only the legacy key) before touching anything.
+      if grep -Eq '^[[:space:]]*version[[:space:]]*=[[:space:]]*1[[:space:]]*(#.*)?$' "$CFG" \
+         || { ! grep -Eq '^[[:space:]]*version[[:space:]]*=' "$CFG" && ! grep -q "$NEW" "$CFG"; }; then
+        echo "containerd config is version 1: this fix handles version 2 and 3 only; node untouched" >&2; exit 1
       fi
       HDR="^[[:space:]]*\\[plugins\\.[\"']"
       if grep -Eq "${HDR}$NEW[\"']\\.containerd\\.runtimes\\.sysbox-runc\\]" "$CFG" \
@@ -78,6 +100,13 @@ data:
            && grep -Eq "${HDR}$NEW[\"']\\.containerd\\.runtimes\\.sysbox-runc\\]" "$CFG"; then
           echo "config valid: restarting containerd"
           $HOST systemctl restart containerd
+          if ! healthy_after_restart; then
+            echo "ERROR: containerd or the node is not healthy ${WAIT}s after the restart: restoring the saved config" >&2
+            cp "$CFG.sysbox-fix.bak" "$CFG"; sync
+            $HOST systemctl restart containerd || true
+            echo "ERROR: saved config restored and containerd restarted again: exiting non-zero" >&2
+            exit 1
+          fi
           $LABEL_CMD >/dev/null
           bad=0
         else

@@ -1,7 +1,9 @@
 # Cloud worker image.
 # Nested Docker needs the Sysbox runtime. Runs as a non-root user. No secret is
 # built in: the launcher supplies every credential at start (see cloud/README.md).
-FROM ubuntu:24.04
+# Base pinned by the index digest of ubuntu:24.04 (read from the registry); bump both together.
+# apt packages below are deliberately unversioned: they follow the base's security updates.
+FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
 ARG OPENCODE_VERSION=2.0.28
 ARG OPENCODE_SHA256=15cc878cfc7462fe477238538df27ae3fbd03c1ea7631615cacf0977f5b629c6
 ENV DEBIAN_FRONTEND=noninteractive
