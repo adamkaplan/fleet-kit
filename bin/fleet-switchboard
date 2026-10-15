@@ -17891,7 +17891,7 @@ def agent_block_states(engine, repo, matrix, paths, base, head):
 def pr_floor_report(engine, repo, number, rated_pairs=()):
     """Read one PR's files and decide: {"pr", "head", "floor_paths", "complete", "rated", "decision", "reasons", "globs"}. Reads only (one
     `gh pr view`). `rated_pairs` is the independent rating's (severity, probability) list, an input that can only ADD a hold."""
-    raw = read_pr_json(engine, repo, number, "files,baseRefOid")
+    raw = read_pr_json(engine, repo, number, "files,baseRefOid,isDraft")
     files = [f for f in (raw.get("files") if isinstance(raw.get("files"), list) else []) if isinstance(f, dict)]
     globs, exclude, force = impact_floor.floor_for(repo, engine.config)
     paths, renamed = [], []
@@ -17933,7 +17933,7 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
             decision = "hold"
     return {"pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude,
             "floor_paths": hit, "files_read": len(files), "complete": complete, "unknown": unknown, "rated": [list(r) for r in rated],
-            "decision": decision, "reasons": reasons, "owner_decision": owner[0], "owner_reasons": owner[1]}
+            "decision": decision, "reasons": reasons, "owner_decision": owner[0], "owner_reasons": owner[1], "draft": raw.get("isDraft") is True}
 
 
 def cmd_impact(args, runner, now):
@@ -18223,6 +18223,8 @@ def impact_plan(engine, report, labels, state, records, records_problem):
     names = label_names(engine.config)
     have = set(labels or ())
     pr = report["pr"]
+    if report.get("draft"):
+        return "none", []   # the daemon judges no draft pull request
     if report.get("owner_decision") == "hold":
         if (state["clears"].get(pr) or {}).get("head") == report["head"]:
             return "cleared", []

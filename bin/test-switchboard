@@ -24192,8 +24192,8 @@ class TestImpactRejudge(LedgerBase):
     def files(self, number, path, head=LEDGER_HEAD):
         self.prs[number] = {"headRefOid": head, "changedFiles": 1, "files": [{"path": path}]}
 
-    def listed(self, number, labels=(), head=LEDGER_HEAD):
-        return {"number": number, "head": {"sha": head}, "body": "PLAN: acme/app#7", "draft": False, "labels": [{"name": l} for l in labels]}
+    def listed(self, number, labels=(), head=LEDGER_HEAD, draft=False):
+        return {"number": number, "head": {"sha": head}, "body": "PLAN: acme/app#7", "draft": draft, "labels": [{"name": l} for l in labels]}
 
     def seed_applied(self, numbers, merge_label_added=True, head=LEDGER_HEAD, legacy=False, added=None, at=1):
         """impact-hold.json as the daemon wrote it: the labels it added are listed (`added`); `legacy` is the older record with `merge_label_added` only."""
@@ -24407,6 +24407,8 @@ class TestImpactRejudge(LedgerBase):
         self.files(11, "shims/gh")                  # holds, already labelled: nothing
         self.files(12, "migrations/0004.sql")       # a person's merge label, no record of ours: nothing
         self.files(13, "shims/gh")                  # holds but the owner cleared this head: nothing
+        self.files(14, "shims/gh")                  # holds but it is a draft: the daemon never judges a draft, so neither does the dry run
+        self.prs[14]["isDraft"] = True
         self.prs[9]["labels"] = [{"name": n} for n in self.both()]
         self.prs[11]["labels"] = [{"name": n} for n in self.both()]
         self.prs[12]["labels"] = [{"name": names["merge-captain"]}]
@@ -24425,7 +24427,7 @@ class TestImpactRejudge(LedgerBase):
             elif found:
                 planned_remove[int(found.group(1))] = sorted(x.strip() for x in found.group(3).split(","))
         self.assertEqual(self.writes, [], "a dry run writes nothing")
-        self.passes([self.listed(n, [l["name"] for l in self.prs[n].get("labels", [])]) for n in (9, 10, 11, 12, 13)])
+        self.passes([self.listed(n, [l["name"] for l in self.prs[n].get("labels", [])], draft=n == 14) for n in (9, 10, 11, 12, 13, 14)])
         done_add = {int(re.search(r"/issues/(\d+)/", w[1]).group(1)): sorted(w[2]["labels"]) for w in self.posts()}
         done_remove = {}
         for w in self.removals():
