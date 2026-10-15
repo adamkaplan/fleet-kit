@@ -11580,7 +11580,7 @@ class TestHeadlessPresence(Base):
         self.assertEqual(self.world.herdr.closed, [], "no pane was closed")
         self.assertIn("hw", sb.read_retired(self.world.state))
 
-    def test_a_headless_launch_refuses_a_taken_name_bad_arguments_and_a_terminal_option_and_a_failed_brief_leaves_a_record_it_names(self):
+    def test_a_headless_launch_refuses_a_taken_name_bad_arguments_and_a_terminal_option_and_a_failed_brief_is_undone_and_says_what_was_cleaned(self):
         self.launch_hl()
         with self.assertRaises(sb.LaunchError) as raised:
             self.launch_hl()
@@ -11604,13 +11604,83 @@ class TestHeadlessPresence(Base):
             with self.assertRaises(sb.LaunchError) as raised:
                 self.launch_hl(name="halfway")
         text = str(raised.exception)
-        self.assertIn("was created and its record kept", text)
-        self.assertIn("retire halfway", text)
-        self.assertIsNotNone(self.ap.load_record(self.world.state, "halfway"))
+        self.assertIn("launch failed; session ses_", text)
+        self.assertIn("was deleted", text)
+        self.assertIn("its record was removed", text)
+        self.assertIsNone(self.ap.load_record(self.world.state, "halfway"), "no record is left for a worker that was never handed over")
+        self.assertEqual([s for s in self.world.v2.sessions.values() if s["metadata"].get("fleet", {}).get("name") == "halfway"], [], "no orphan session")
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
         code, out, err = self.run_cli("launch", "again", "--agent", "coder", "--dir", str(self.home), "--headless", "--workspace", "w1")
         self.assertNotEqual(code, 0)
         self.assertIn("--headless opens no terminal", err)
+
+    def test_a_failed_launch_after_the_session_exists_deletes_it_and_says_exactly_what_was_cleaned_and_what_remains(self):
+        sessions_before = set(self.world.v2.sessions)
+        with mock.patch.object(self.ap, "save_record", side_effect=OSError("disk full")):
+            with self.assertRaises(sb.LaunchError) as raised:
+                self.launch_hl(name="nosave")
+        text = str(raised.exception)
+        self.assertIn("disk full", text)
+        self.assertRegex(text, r"session ses_\w+ was deleted")
+        self.assertNotIn("record kept", text)
+        self.assertEqual(set(self.world.v2.sessions), sessions_before, "the session created for the launch is gone: no orphan")
+        self.assertIsNone(self.ap.load_record(self.world.state, "nosave"))
+        events = [e for e in self.world.audit() if e["event"] == "headless.launch_undone" and e["subject"] == "nosave"]
+        self.assertEqual(len(events), 1)
+        self.world.v2.remove_fails = True       # the service cannot delete: the session remains and the message says so
+        with mock.patch.object(self.ap, "save_record", side_effect=OSError("disk full")):
+            with self.assertRaises(sb.LaunchError) as raised:
+                self.launch_hl(name="nodel")
+        text = str(raised.exception)
+        self.assertRegex(text, r"session ses_\w+ could NOT be deleted")
+        self.assertIn("it has no record", text)
+        self.world.v2.remove_fails = False
+        with mock.patch.object(sb.V2Client, "prompt", side_effect=sb.V2Error("exit", None, "refused")):
+            self.world.v2.remove_fails = True
+            with self.assertRaises(sb.LaunchError) as raised:
+                self.launch_hl(name="keeps")
+        text = str(raised.exception)
+        self.assertIn("could NOT be deleted", text)
+        self.assertIn("its record was kept", text, "a session that remains keeps its record so status shows it")
+        self.assertIsNotNone(self.ap.load_record(self.world.state, "keeps"))
+
+    def test_a_headless_launch_into_a_repo_with_a_named_gh_account_is_refused_and_any_other_says_what_identity_it_has(self):
+        self.engine.accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5, "gh_users": {"acme/*": "acct-ops"}}, self.world.route, self.world.clock.now, environ={})
+        sessions_before = set(self.world.v2.sessions)
+        with self.assertRaises(sb.LaunchError) as raised:
+            self.launch_hl(name="pinned", repo="acme/widget")
+        text = str(raised.exception)
+        self.assertIn("acct-ops", text)
+        self.assertIn("Use a terminal launch", text)
+        self.assertEqual(set(self.world.v2.sessions), sessions_before, "refused before anything was created")
+        self.assertIsNone(self.ap.load_record(self.world.state, "pinned"))
+        done = self.launch_hl(name="plain", repo="other/thing")
+        self.assertIn("acts as the OpenCode service environment's own gh account", done["identity"])
+        self.assertIn("other/thing", done["identity"])
+        self.assertIn("it has no repo", self.launch_hl(name="norepo")["identity"])
+
+    def test_retire_frees_the_name_of_a_headless_worker_and_undo_restores_the_record_unless_the_name_was_taken(self):
+        done = self.launch_hl()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]
+        code, out, err = self.run_cli("retire", "hw")
+        self.assertEqual(code, 0, err)
+        self.assertIn("its headless record was removed, so the name is free", out)
+        self.assertIsNone(self.ap.load_record(self.world.state, "hw"))
+        self.assertIn(done["session"], self.world.v2.sessions, "the session itself keeps running: only the watching stopped")
+        again = self.launch_hl()   # the name is free: a new worker can use it
+        self.assertNotEqual(again["session"], done["session"])
+        code, out, err = self.run_cli("retire", "--undo", "hw")
+        self.assertEqual(code, 0, err)
+        self.assertIn("a worker named hw exists again, so its old headless record was NOT restored", out)
+        self.assertEqual(self.ap.load_record(self.world.state, "hw")["session"], again["session"], "the newer record is untouched")
+        code, out, err = self.run_cli("retire", "hw")
+        self.assertEqual(code, 0, err)
+        code, out, err = self.run_cli("retire", "--undo", "hw")
+        self.assertEqual(code, 0, err)
+        self.assertIn("its headless record was restored", out)
+        self.assertEqual(self.ap.load_record(self.world.state, "hw")["session"], again["session"])
+        self.assertEqual(self.discover().agents["hw"].session_id, again["session"])
 
     def test_a_session_the_service_does_not_show_under_the_name_removes_the_record_and_two_launches_of_one_name_cannot_both_pass(self):
         real_get = sb.V2Client.session_get
@@ -11618,7 +11688,8 @@ class TestHeadlessPresence(Base):
             with self.assertRaises(sb.LaunchError) as raised:
                 self.launch_hl(name="mismatch")
         self.assertIn("does not show the new session as mismatch", str(raised.exception))
-        self.assertIn("the record was removed", str(raised.exception))
+        self.assertIn("its record was removed", str(raised.exception))
+        self.assertIn("was deleted", str(raised.exception))
         self.assertIsNone(self.ap.load_record(self.world.state, "mismatch"))
         with sb.agent_lock(self.world.state, "busy", seconds=1):          # another launch of this name is in its locked step
             with mock.patch.object(sb, "AGENT_LOCK_SECONDS", 0.2), self.assertRaises(sb.LaunchError) as raised:
@@ -32316,6 +32387,17 @@ class TestOrdersScenarios(Base):
 TIER_USER = "me"
 TIER_LABELS = {"awaiting_label": "me:awaiting-user", "awaiting_cos_label": "me:awaiting-cos"}
 API, WEB = "acme/api", "acme/web"
+
+
+@adds_to(FakeV2)
+def op_session_remove(self, params, body):
+    """`session.remove` (DELETE /api/session/{id}): an empty answer, 404 once gone. `remove_fails` makes it answer 500, as a service that cannot delete would."""
+    s = self._session(params)
+    if self.__dict__.get("remove_fails"):
+        raise FakeHTTP(500, "InternalError", "cannot delete")
+    self._write("session.remove", s["id"], None)
+    del self.sessions[s["id"]]
+    return None
 
 
 @adds_to(FakeV2)
