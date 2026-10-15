@@ -454,7 +454,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "temp_janitor", "load_alert", "spotlight_guard"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "temp_janitor", "load_alert", "spotlight_guard", "excluded_repos"}
 
 
 def config_known_keys():
@@ -533,6 +533,10 @@ def validate_config(raw, source="config"):
         raise ConfigError(str(err))
     try:
         load_module("spotlight_guard").validate(config.get("spotlight_guard"), source)
+    except ValueError as err:
+        raise ConfigError(str(err)) from None
+    try:
+        load_module("repo_exclusion").validate(config.get("excluded_repos"), source)
     except ValueError as err:
         raise ConfigError(str(err)) from None
     if not isinstance(config["docker_reaper"], bool):
@@ -712,6 +716,11 @@ def validate_external_config(config, source):
                 raise ConfigError("%s.%s' is required when external_decisions is enabled" % (where, key))
         if not repos:
             raise ConfigError("%s.repos' must name at least one repo when external_decisions is enabled" % where)
+    if section["enabled"] and section["mapping_file"] and load_module("repo_exclusion").az_without_subscription(section["mapping_file"]):
+        message = load_module("repo_exclusion").AZ_WARNING
+        if message not in _WARNED_CONFIG:   # once per process
+            _WARNED_CONFIG.add(message)
+            sys.stderr.write("%s: warning: %s\n" % (PROG, message))
     config["external_decisions"] = section
 
 
@@ -9078,6 +9087,7 @@ def read_pr_json(engine, repo, number, extra_fields=""):
     config = engine.config
     accounts = getattr(engine, "accounts", None) or GhAccounts(config, engine.gh_runner or subprocess.run, engine.now)
     try:
+        refuse_excluded(config, repo)   # #446
         env = accounts.env_for(repo)
     except AccountError as err:
         raise NoticeError(str(err)) from None
@@ -9107,6 +9117,7 @@ def read_ref_state(engine, repo, number, kind):
         return read_pr_facts(engine, repo, number)["state"]
     accounts = getattr(engine, "accounts", None) or GhAccounts(engine.config, engine.gh_runner or subprocess.run, engine.now)
     try:
+        refuse_excluded(engine.config, repo)   # #446
         env = accounts.env_for(repo)
     except AccountError as err:
         raise NoticeError(str(err)) from None
@@ -13111,7 +13122,7 @@ class GitHubHub:
         self.runner, self.spawn, self.now, self.actor = runner, spawn, now, actor
         self.lock = threading.RLock()
         self.queue = {}        # key -> GitHubItem, until delivered
-        self.watches = {repo: Watch(repo) for repo in config["github_repos"]}
+        self.watches = {repo: Watch(repo) for repo in watched_repos(config, {})}   # the baseline less the excluded repositories
         self.accounts = GhAccounts(config, runner, now)  # PR 15: a gh account per repo
         self.lookback = config["github_lookback_hours"] * 3600
         self.backoff_base, self.backoff_max = GITHUB_BACKOFF_BASE, GITHUB_BACKOFF_MAX
@@ -13849,6 +13860,8 @@ class GitHubHub:
         """The repo's account's environment for a child, or None for the default account. Raises
         GitHubUnavailable when gh will not give the account's token (the text names the account only)."""
         try:
+            config = getattr(self, "config", None)
+            refuse_excluded(config if config is not None else getattr(self.accounts, "config", None), repo)   # #446: the forwarder start and every hub read take their environment here
             return self.accounts.env_for(repo)
         except AccountError as err:
             raise GitHubUnavailable(str(err)) from None
@@ -14159,7 +14172,8 @@ def github_status(config, state_dir, fleets=None, now=None):
     is watched by the daemon's last snapshot, the gh account it uses (a name, never a token) and the fleet
     agents in it."""
     repos = watched_repos(config, fleets or {})
-    report = {"repos": repos, "lookback_hours": config["github_lookback_hours"],
+    excluded = sorted(load_module("repo_exclusion").excluded_set(config))
+    report = {"repos": repos, "excluded": excluded, "lookback_hours": config["github_lookback_hours"],
               "events": list(config["github_events"]), "daemon": False, "watches": [], "port": None,
               "poll_seconds": config["github_poll_seconds"]}
     snapshot = {}
@@ -14207,10 +14221,11 @@ def github_status(config, state_dir, fleets=None, now=None):
 
 
 def format_github(report):
-    """Status lines for GitHub; none when no repo is watched."""
+    """Status lines for GitHub; none when no repo is watched and none is excluded."""
+    excluded = ["      github     excluded from watching and reading: %s (excluded_repos)" % ", ".join(report["excluded"])] if report.get("excluded") else []
     if not report["repos"]:
-        return []
-    lines = ["      github     watching %s; catch-up reads reach back %g h, older events are lost"
+        return excluded
+    lines = excluded + ["      github     watching %s; catch-up reads reach back %g h, older events are lost"
              % (", ".join(report["repos"]), report["lookback_hours"])]
     if not report["daemon"]:
         lines.append("        daemon not running: forwarder state is unknown")
@@ -15311,15 +15326,15 @@ def _fleet_repo(fleet, config):
 def watched_repos(config, fleets):
     """The repos to watch now, sorted: the config baseline, every `repo` a live fleet agent names, and the
     repo of every charter it holds. `fleets` maps agent name -> metadata.fleet. Derived on every call, so
-    there is nothing to keep and nothing to lose (R3). The `static-repos` fault reads the baseline only."""
+    there is nothing to keep and nothing to lose (R3). The `static-repos` fault reads the baseline only. The config's `excluded_repos` are taken out of the result,
+    so every consumer of this set (forwarders, sweep, triage) honours them."""
     found = set(config["github_repos"])
-    if fault("static-repos"):
-        return sorted(found)
-    for fleet in fleets.values():
-        repo = _fleet_repo(fleet, config)
-        if repo:
-            found.add(repo)
-    return sorted(found)
+    if not fault("static-repos"):
+        for fleet in fleets.values():
+            repo = _fleet_repo(fleet, config)
+            if repo:
+                found.add(repo)
+    return sorted(load_module("repo_exclusion").without_excluded(config, found))   # #446: an excluded repository is never watched, whatever names it
 
 
 def discovered_fleets(discovery):
@@ -15398,6 +15413,18 @@ def _endpoint_of(path):
     """A path as the counter groups it: no repo, no query, numbers as `#` (`repos/o/r/issues/12/parent` -> `issues/#/parent`)."""
     bare = re.sub(r"^repos/[^/]+/[^/]+/?", "", path.split("?")[0])
     return re.sub(r"\d+", "#", bare) or "repo"
+
+
+class RepoExcluded(AccountError):
+    """A read of a repository the config excludes (`excluded_repos`, #446): no process is started. An AccountError, so every caller that already
+    degrades on an account problem (the hub's reads, the intent reader, a notice) degrades the same way."""
+
+
+def refuse_excluded(config, repo):
+    """The one check of the exclusion for a gh read of `repo`: raises RepoExcluded when the config excludes it. No config at all means no exclusion list, so the
+    read is allowed (a deliberate fail open for a test double built without one: every real hub and GhAccounts carries its config)."""
+    if repo and config is not None and load_module("repo_exclusion").is_excluded(config, repo):
+        raise RepoExcluded("repository %s is excluded from the fleet's reads (excluded_repos)" % repo)
 
 
 class GhAccounts:
@@ -15483,6 +15510,7 @@ class GhAccounts:
           - a 403/429 that says the limit is spent pauses every read of that account until the limit resets (GhRateLimited is raised
             at once, no process is started). No read is exempt: writes do not go through here.
         A runner whose answer has no HTTP header block (a fake, `--paginate`) is passed through as it is."""
+        refuse_excluded(self.config, repo)   # #446: the lowest layer every gh read goes through: nothing is spawned for an excluded repository
         account = self.describe(repo)
         now = self.now()
         with self.lock:
@@ -15759,6 +15787,7 @@ class IntentReader:
         self.gh, self.repo, self.runner, self.now = gh, repo, runner, now
         self.timeout, self.ttl = timeout, ttl
         self.accounts = accounts  # PR 15: a GhAccounts; None reads every repo with the default account
+        self.config = None        # the config whose excluded_repos are never read; when None, the config of `accounts` (every reader has one)
         self._cache = {}
         self.live, self.live_ttl = None, INTENT_TTL_LIVE   # live(repo) -> the running forwarder's generation, or None (the hub sets it)
 
@@ -15774,6 +15803,9 @@ class IntentReader:
             raise IntentError("gh", str(err)) from None
 
     def _api(self, path, repo=None):
+        config = self.config if self.config is not None else getattr(self.accounts, "config", None)   # every construction passes `accounts=GhAccounts(config, ...)`
+        if config is not None and load_module("repo_exclusion").is_excluded(config, repo or self.repo):
+            raise IntentError("excluded", "repository %s is excluded from the fleet's reads (excluded_repos)" % (repo or self.repo))   # #446: no read
         argv = [self.gh, "api", path]
         env = self.env_for(repo)
         extra = {"env": env} if env is not None else {}
@@ -15914,8 +15946,10 @@ def intent_reader_for(config, runner=subprocess.run, now=time.time):
     """The IntentReader the config asks for, or None when no `intent_repo` is set."""
     if not config.get("intent_repo"):
         return None
-    return IntentReader(config["gh"], config["intent_repo"], runner, now, config["call_timeout_seconds"],
-                        accounts=GhAccounts(config, runner, now))
+    reader = IntentReader(config["gh"], config["intent_repo"], runner, now, config["call_timeout_seconds"],
+                          accounts=GhAccounts(config, runner, now))
+    reader.config = config
+    return reader
 
 
 # -- composing: one section per ask
@@ -19269,6 +19303,7 @@ def cmd_review_measure(args, runner, now):
         engine, state, config = build_engine(runner, now, "cli", writable=False)
         accounts = getattr(engine, "accounts", None) or GhAccounts(config, runner, now)
         try:
+            refuse_excluded(config, args.repo)   # #446
             env = accounts.env_for(args.repo)
         except AccountError as err:
             raise ReviewError(str(err)) from None
@@ -19954,6 +19989,7 @@ class _RedsReader:
             raise load_reds().RedsError("gh api %s: not JSON" % path.split("?")[0]) from None
 
     def zip(self, path):
+        refuse_excluded(self.config, self.repo)   # #446: json() refuses first; the zip read does not rely on that
         env = self.accounts.env_for(self.repo)
         extra = {"env": env} if env is not None else {}
         done = self.runner([self.config["gh"], "api", path], capture_output=True, timeout=max(60, self.config["call_timeout_seconds"]), stdin=subprocess.DEVNULL, **extra)
