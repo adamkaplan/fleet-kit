@@ -454,7 +454,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "temp_janitor", "load_alert", "spotlight_guard"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "temp_janitor", "load_alert", "spotlight_guard", "excluded_repos"}
 
 
 def config_known_keys():
@@ -533,6 +533,10 @@ def validate_config(raw, source="config"):
         raise ConfigError(str(err))
     try:
         load_module("spotlight_guard").validate(config.get("spotlight_guard"), source)
+    except ValueError as err:
+        raise ConfigError(str(err)) from None
+    try:
+        load_module("repo_exclusion").validate(config.get("excluded_repos"), source)
     except ValueError as err:
         raise ConfigError(str(err)) from None
     if not isinstance(config["docker_reaper"], bool):
@@ -712,6 +716,11 @@ def validate_external_config(config, source):
                 raise ConfigError("%s.%s' is required when external_decisions is enabled" % (where, key))
         if not repos:
             raise ConfigError("%s.repos' must name at least one repo when external_decisions is enabled" % where)
+    if section["enabled"] and section["mapping_file"] and load_module("repo_exclusion").az_without_subscription(section["mapping_file"]):
+        message = load_module("repo_exclusion").AZ_WARNING
+        if message not in _WARNED_CONFIG:   # once per process
+            _WARNED_CONFIG.add(message)
+            sys.stderr.write("%s: warning: %s\n" % (PROG, message))
     config["external_decisions"] = section
 
 
@@ -1210,6 +1219,7 @@ V2_HTTP_OPERATIONS = {   # operation -> (method, path template, path parameters,
     "session.active": ("GET", "/api/session/active", (), ()),
     "session.create": ("POST", "/api/session", (), ()),
     "session.get": ("GET", "/api/session/{sessionID}", ("sessionID",), ()),
+    "session.remove": ("DELETE", "/api/session/{sessionID}", ("sessionID",), ()),
     "session.list": ("GET", "/api/session", (), ("limit", "order", "search", "parentID", "directory", "project", "subpath", "cursor")),
     "session.message.list": ("GET", "/api/session/{sessionID}/message", ("sessionID",), ("limit", "order", "cursor", "type")),
     "session.inbox.list": ("GET", "/api/session/{sessionID}/inbox", ("sessionID",), ()),
@@ -1272,6 +1282,17 @@ class V2Http:
         except OSError:
             return True   # not ours to signal, so it exists
         return True
+
+    def base_url(self):
+        """`http://host:port` of the service (never the password), or None when the service file cannot be read."""
+        with self._lock:
+            try:
+                if self._info is None:
+                    self._load()
+                host, port, _ = self._info
+                return "http://%s:%d" % (host if ":" not in host else "[%s]" % host, port)
+            except Exception:
+                return None
 
     def _load(self):
         try:
@@ -1734,6 +1755,10 @@ class V2Client:
         """A page of a transcript is never larger than V2_READ_LIMIT_MAX messages, whatever a caller asks."""
         return min(limit, V2_READ_LIMIT_MAX) if isinstance(limit, int) and not isinstance(limit, bool) else limit
 
+    def service_url(self):
+        """Where the service is, `http://127.0.0.1:<port>`, or None (the CLI transport, or no readable service file)."""
+        return self.http.base_url() if self.http is not None and hasattr(self.http, "base_url") else None
+
     def server_info(self):
         return self._call("server.info")
 
@@ -1751,6 +1776,11 @@ class V2Client:
 
     def session_active(self):
         return self._call("session.active")
+
+    def session_remove(self, session_id):
+        """`session.remove`: delete a session (DELETE /api/session/{sessionID}, an empty answer; 404 SessionNotFoundError when it is gone).
+        Used only to undo a launch that failed after it created its session."""
+        return self._call("session.remove", {"sessionID": session_id})
 
     def message_list(self, session_id, limit=None, order=None, type=None, cursor=None):
         if order is not None and order not in self.ORDERS:
@@ -2989,10 +3019,13 @@ class Observation:
         return self.last_human_prompt is not None and now - self.last_human_prompt < window
 
     def to_json(self):
-        return {"name": self.name, "session": self.session_id, "pane": self.pane, "headless": self.headless, "status": self.status,
-                "fleet": self.fleet, "idle_at": iso(self.idle_at), "outcome": self.outcome,
-                "last_human_prompt": iso(self.last_human_prompt), "problem": self.problem,
-                "wrong_program": self.wrong_program, "conflict": self.conflict}
+        out = {"name": self.name, "session": self.session_id, "pane": self.pane, "status": self.status,
+               "fleet": self.fleet, "idle_at": iso(self.idle_at), "outcome": self.outcome,
+               "last_human_prompt": iso(self.last_human_prompt), "problem": self.problem,
+               "wrong_program": self.wrong_program, "conflict": self.conflict}
+        if self.headless:   # present only for a headless worker: a terminal-only fleet's output is what it always was
+            out["headless"] = True
+        return out
 
 
 class Discovery:
@@ -4028,7 +4061,9 @@ class Switchboard:
             return
         active, down = None, None
         try:
-            active = self.v2.session_active() or {}
+            active = self.v2.session_active()
+            if not isinstance(active, dict):   # a list, a string or null cannot be read: unknown, never idle
+                active, down = None, "session.active answered something unreadable"
         except V2Error as err:
             down = _one_line(str(err), 100)
         for record in records:
@@ -5576,8 +5611,8 @@ def launch_agent_problem(config, runner, agent):
             "(primary agents registered: %s). Install its definition, restart the service, and check it with `fleet-switchboard agents verify`" % (agent, known))
 
 
-def launch_problems(name, agent, directory, workspace, issue, charter=None):
-    """Why these launch arguments cannot be used (empty when they can)."""
+def launch_problems(name, agent, directory, workspace, issue, charter=None, headless=False):
+    """Why these launch arguments cannot be used (empty when they can). A headless worker has no terminal, so it needs no workspace."""
     problems = []
     if not NAME_RE.match(name or ""):
         problems.append("name must match %s (lower case, digits, - and _), got %r" % (NAME_RE.pattern, name))
@@ -5587,7 +5622,7 @@ def launch_problems(name, agent, directory, workspace, issue, charter=None):
         problems.append("--agent is required")
     if not directory or not os.path.isabs(directory) or not os.path.isdir(directory):
         problems.append("--dir must be an absolute path of an existing directory, got %r" % directory)
-    if not workspace:
+    if not workspace and not headless:
         problems.append("no target workspace: pass --workspace or run from a herdr pane")
     if issue is not None and not (isinstance(issue, int) and not isinstance(issue, bool) and issue >= 1):
         problems.append("--issue must be an issue number, got %r" % (issue,))
@@ -5729,21 +5764,141 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
         left = close_own_pane(engine, name, pane, "launch failed: %s" % _one_line(str(err), 120)) if pane \
             else "no pane was opened"
         raise LaunchError("%s (session %s was created; %s)" % (_one_line(str(err)), session_id, left)) from err
-    if engine.state_dir is not None:   # a launch into a linked worktree records it, so retire and a done report can reclaim it later
-        try:
-            found = worktree_of_directory(subprocess.run, directory)
-            if found is not None:
-                done = register_worktree(engine.state_dir, found[0], name, repo, found[1], engine.now())
-                if isinstance(done, str):   # already claimed by another agent: never taken over
-                    engine._note("worktree.error", name, {"error": "the worktree %s is already registered to %s: %s does not claim it and will not reclaim it" % (found[0], done, name)})
-                elif done is True:
-                    if engine.audit is not None:
-                        engine.audit.append(engine.actor, "worktree.registered", name, {"path": found[0], "branch": found[1], "repo": repo, "by": "launch"})
-                else:   # it will not be reclaimed later: say so now
-                    engine._note("worktree.error", name, {"error": "the worktree %s could not be recorded in the registry: it will not be reclaimed automatically" % found[0]})
-        except Exception as err:
-            engine._note("worktree.error", name, {"error": _one_line(str(err), 120)})
+    register_launch_worktree(engine, name, directory, repo)
     return {"name": name, "session": session_id, "pane": pane, "tab": opened["tab_id"]}
+
+
+def register_launch_worktree(engine, name, directory, repo):
+    """A launch into a linked worktree records it, so retire and a done report can reclaim it later. Never raises."""
+    if engine.state_dir is None:
+        return
+    try:
+        found = worktree_of_directory(subprocess.run, directory)
+        if found is not None:
+            done = register_worktree(engine.state_dir, found[0], name, repo, found[1], engine.now())
+            if isinstance(done, str):   # already claimed by another agent: never taken over
+                engine._note("worktree.error", name, {"error": "the worktree %s is already registered to %s: %s does not claim it and will not reclaim it" % (found[0], done, name)})
+            elif done is True:
+                if engine.audit is not None:
+                    engine.audit.append(engine.actor, "worktree.registered", name, {"path": found[0], "branch": found[1], "repo": repo, "by": "launch"})
+            else:   # it will not be reclaimed later: say so now
+                engine._note("worktree.error", name, {"error": "the worktree %s could not be recorded in the registry: it will not be reclaimed automatically" % found[0]})
+    except Exception as err:
+        engine._note("worktree.error", name, {"error": _one_line(str(err), 120)})
+
+
+def launch_headless(engine, name, agent, directory, role=None, reports_to=None, issue=None, brief=None, charter=None, repo=None):
+    """Create a fleet agent with NO terminal (#433): a v2 session in the OpenCode service, a private record (state-dir/headless/<name>.json) and the
+    brief through the API. Nothing is opened in herdr. Presence is proved by the service: the new session must answer and carry the worker's name
+    before the brief is sent. Returns {"name", "session", "pane": None, "tab": None, "headless": True}.
+
+    What differs from a terminal worker, and is said in the docs: its tools run in the SERVICE's environment, not in a pane's. There is no
+    per-worker environment (no GH_TOKEN of its repo's account, no view variables); it is identified by the OPENCODE_SESSION_ID the service sets for
+    its tools, and the gh shim picks its account from the session's stored repo. Only `cmd_launch` calls this, after the lane-name guard, the agent
+    check and the gate probe."""
+    problems = launch_problems(name, agent, directory, None, issue, charter, headless=True)
+    if problems:
+        raise LaunchError("; ".join(problems))
+    if engine.state_dir is None:
+        raise LaunchError("no state directory: a headless worker needs its record")
+    try:
+        with agent_lock(engine.state_dir, name):   # the name check, the session create and the record write are ONE step: two launches of one name cannot both pass
+            taken = engine.discover(engine.now()).agents.get(name)
+            if taken is not None:
+                raise LaunchError("a fleet agent named %s already exists (%s)" % (name, "headless" if taken.headless else "in pane %s" % taken.pane))
+            ap = load_agent_presence()
+            if ap.read_record(engine.state_dir, name)[0] is not None:
+                raise LaunchError("a headless record for %s already exists: `%s retire %s` first, or pick another name" % (name, PROG, name))
+            identity = headless_identity(engine, repo)   # refuses a repo that maps to a named gh account: a headless worker cannot be pinned to it
+            fleet = fleet_record(name, role, reports_to, issue, charter, repo)
+            fleet["headless"] = True
+            with engine._external("v2.session.create", name, {"agent": agent, "directory": directory, "fleet": fleet, "headless": True}) as result:
+                session_id = engine.v2.session_create(agent, name, directory, {"fleet": fleet})["id"]
+                result["session"] = session_id
+            try:
+                ap.save_record(engine.state_dir, name, session_id, engine.v2.service_url(), now=engine.now())
+                info = engine.v2.session_get(session_id) or {}
+                if ((_fleet_meta(info) or {}).get("name")) != name:
+                    raise LaunchError("the service does not show the new session as %s: nothing was sent" % name)
+                if brief:
+                    send_brief(engine, name, session_id, brief)
+                if engine.audit is not None:
+                    engine.audit.append(engine.actor, "headless.launched", name, {"session": session_id, "agent": agent, "directory": _one_line(directory, 160), "brief_chars": len(brief or "")})
+            except Exception as err:
+                cleaned = undo_headless_launch(engine, ap, name, session_id)
+                raise LaunchError("%s (%s)" % (_one_line(str(err)), cleaned)) from err
+    except ImpactStateBusy:
+        raise LaunchError("another launch or reattach of %s is running: wait for it" % name) from None
+    register_launch_worktree(engine, name, directory, repo)
+    return {"name": name, "session": session_id, "pane": None, "tab": None, "headless": True, "identity": identity}
+
+
+def headless_identity(engine, repo):
+    """The identity a headless worker will have, as one line; refuses (LaunchError) when it would be the WRONG one.
+
+    A terminal worker is pinned to its repo's gh account by its pane's environment (GH_TOKEN). A headless worker's tools run in the OpenCode service,
+    and nothing durable pins them: `session.create` and `session.prompt` carry no environment, and `PUT /api/session/{id}/environment`, which does
+    set one, is held in the service's memory and is gone after a service restart (measured in a throwaway profile: the variable was set, then empty
+    after `service restart`), at which point the worker would silently act as the service's default account. So a repo that `gh_users` maps to a
+    named account is refused: use a terminal launch. Any other worker acts as the account of the service's environment, and says so."""
+    accounts = getattr(engine, "accounts", None)
+    if repo and accounts is None:   # fail closed: with no account map nothing says which account this repo uses
+        raise LaunchError("cannot tell which gh account %s uses (no account map): a headless worker is refused" % repo)
+    if repo:
+        account = accounts.account_for(repo)
+        if account:
+            raise LaunchError("a headless worker cannot work as the gh account %s that gh_users maps %s to: its tools run in the OpenCode service's environment, "
+                              "which cannot be pinned to an account (a service restart drops any per-session setting), so it would act as the service's own "
+                              "default account. Use a terminal launch (omit --headless)" % (account, repo))
+        problem = launch_account_problem(engine.config, accounts, repo)
+        if problem:
+            raise LaunchError(problem)
+        return "this headless worker acts as the OpenCode service environment's own gh account (gh_users has no entry for %s)" % repo
+    return "this headless worker acts as the OpenCode service environment's own gh account (it has no repo)"
+
+
+def undo_headless_launch(engine, ap, name, session_id):
+    """Best effort after a headless launch failed past `session.create`: stop whatever the brief started, delete the session, then remove the record.
+    Returns one sentence saying exactly what was cleaned and what remains. The record is removed only when the session is gone: a session that is
+    still there keeps its record, so `status` shows it and it is not invisible."""
+    done, left = [], []
+    interrupted = True
+    try:
+        engine.v2.interrupt(session_id)
+    except Exception:
+        interrupted = False   # best effort: the session is about to be deleted; said below if it could not be
+    try:
+        engine.v2.session_remove(session_id)
+        done.append("session %s was deleted" % session_id)
+        gone = True
+    except V2Error as err:
+        gone = err.reason == "http" and err.status == 404   # already gone is as good as deleted
+        (done if gone else left).append("session %s was already gone" % session_id if gone else
+                                         "session %s could NOT be deleted (%s): delete it in the OpenCode service" % (session_id, _one_line(str(err), 80)))
+    except Exception as err:
+        gone = False
+        left.append("session %s could NOT be deleted (%s): delete it in the OpenCode service" % (session_id, _one_line(str(err), 80)))
+    if gone:
+        try:
+            if ap.remove_record(engine.state_dir, name):
+                done.append("its record was removed")
+        except Exception as err:
+            left.append("its record could NOT be removed (%s): `%s retire %s` clears it" % (_one_line(str(err), 80), PROG, name))
+    if not gone and not interrupted:
+        left.append("it could not be interrupted, so what the brief started may still be running")
+    if not gone:
+        try:
+            has_record = ap.read_record(engine.state_dir, name)[0] is not None
+        except Exception:
+            has_record = False
+        left.append("its record was kept so `%s status` shows it: `%s retire %s` stops watching it" % (PROG, PROG, name) if has_record
+                    else "it has no record, so nothing shows it")
+    try:
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "headless.launch_undone", name, {"session": session_id, "cleaned": done, "remains": left})
+    except Exception:
+        pass   # the sentence below is the report; a failing audit sink must not hide it
+    return "launch failed; " + "; ".join(done + left if (done or left) else ["nothing was created"])
 
 
 def resume_agent(engine, name, session_id, workspace, patience=LAUNCH_PATIENCE, sleep=time.sleep, replace=False):
@@ -6424,6 +6579,52 @@ def retire_close_pane(engine, runner, now, name, pane, caller, force):
     return "closed pane %s (the agent's terminal: its memory is released)" % pane, True
 
 
+def headless_record_to_free(state, name):
+    """What `retire` keeps of a headless worker's record ({"session", "url", "created"}), or None when it has none. Reads only."""
+    try:
+        record = load_agent_presence().read_record(state, name)[0]
+    except Exception:
+        return None
+    if record is None:
+        return None
+    return {"session": record["session"], "url": record.get("url"), "created": record.get("created")}
+
+
+def free_headless_record(engine, state, name):
+    """Remove the record of a retired headless worker so the NAME is free to launch again (its details are kept in the retirement for `retire --undo`).
+    One line. The session itself keeps running in the service: only the switchboard stops watching it."""
+    try:
+        with agent_lock(state, name):   # the same per-name lock a launch holds for its check and its record write
+            load_agent_presence().remove_record(state, name)
+    except Exception as err:
+        return "%s: its headless record could NOT be removed (%s): the name stays taken until it is" % (name, _one_line(str(err), 100))
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, "headless.record_freed", name, {"why": "retired"})
+    return "%s: its headless record was removed, so the name is free (`%s retire --undo %s` puts it back)" % (name, PROG, name)
+
+
+def restore_headless_record(engine, state, name, entry):
+    """`retire --undo` of a headless worker: put its record back when the name is still free. (line or None, ok): ok is False only when the record
+    could not be put back (busy, or a write error): the retirement then stays so the undo can be tried again. A name that is taken again is not an
+    error: the old record is simply not restored, and the line says so."""
+    kept = entry.get("headless") if isinstance(entry, dict) else None
+    if not isinstance(kept, dict) or not isinstance(kept.get("session"), str):
+        return None, True
+    ap = load_agent_presence()
+    try:
+        with agent_lock(state, name):   # the per-name lock of a launch: the check and the write are ONE step, judged on a fresh discovery
+            if ap.read_record(state, name)[0] is not None or name in engine.discover(engine.now()).agents:
+                return "%s: a worker named %s exists again, so its old headless record was NOT restored" % (name, name), True
+            ap.save_record(state, name, kept["session"], kept.get("url"), now=kept.get("created"))
+    except ImpactStateBusy:
+        return "%s: a launch of %s is running, so its old headless record was NOT restored" % (name, name), False
+    except Exception as err:
+        return "%s: its headless record could NOT be restored (%s)" % (name, _one_line(str(err), 100)), False
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, "headless.record_restored", name, {"session": kept["session"]})
+    return "%s: its headless record was restored: it is watched again" % name, True
+
+
 def cmd_retire(args, runner, now):
     """`retire <name> [--reason TEXT]` / `retire --undo <name>`: a finished worker is RETIRED: the daemon stops reporting it DEAD or DETACHED, `reattach
     --all-detached` skips it, and it is shown once in `status` as retired (dropped after RETIRED_SHOW_DAYS). Nothing is deleted and no tab is closed, unless
@@ -6434,7 +6635,8 @@ def cmd_retire(args, runner, now):
     if not NAME_RE.match(name or ""):
         raise LaunchError("name the agent: `%s retire <name>`" % PROG)
     discovery = engine.discover(engine.now())
-    who = reattach_caller_problem(engine, runner, now, discovery, name)
+    hint = ((read_retired(state).get(name) or {}).get("session") if args.undo else None)   # a retired headless worker is not discovered: its boss is found from its stored session
+    who = reattach_caller_problem(engine, runner, now, discovery, name, hint)
     if who:
         if engine.audit is not None:
             engine.audit.append(engine.actor, "fleetpane.retire_refused", name, {"why": _one_line(who, 160)})
@@ -6442,8 +6644,10 @@ def cmd_retire(args, runner, now):
     reason = " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", args.reason or "").split())[:200]
     seen = discovery.agents.get(name)
     known = read_pane_health(state)["agents"].get(name) or {}
-    close_pane, close_by = None, None
-    if getattr(args, "close", False) and not args.undo:
+    close_pane, close_by, close_note, headless_kept = None, None, None, None
+    if getattr(args, "close", False) and not args.undo and seen is not None and seen.headless:
+        close_note = "headless: it has no terminal, so there is nothing to close"
+    elif getattr(args, "close", False) and not args.undo:
         close_pane, why = retire_close_problem(engine, runner, now, discovery, name, seen, getattr(args, "force", False))
         close_by = identify_who(engine, runner, now)
         if why:
@@ -6451,14 +6655,19 @@ def cmd_retire(args, runner, now):
                 engine.audit.append(engine.actor, "fleetpane.close_refused", name, {"pane": seen.pane if seen is not None else None, "by": close_by, "why": _one_line(why, 160)})
             raise LaunchError("refused: %s (nothing was retired or closed)" % why)
     with agent_lock(state, "files"):
-        who = reattach_caller_problem(engine, runner, now, discovery, name)   # judged again inside the lock: check and write are one step
+        who = reattach_caller_problem(engine, runner, now, discovery, name, hint)   # judged again inside the lock: check and write are one step
         if who:
             raise LaunchError("refused: %s" % who)
         retired = read_retired(state)
         if args.undo:
-            if retired.pop(name, None) is None:
+            entry = retired.get(name)
+            if entry is None:
                 print("%s is not retired" % name)
                 return EXIT_OK
+            restored, restore_ok = restore_headless_record(engine, state, name, entry)   # FIRST: a record that cannot be put back leaves the retirement as it is, to try again
+            if not restore_ok:
+                raise LaunchError("%s: nothing was changed, the retirement stays (try `%s retire --undo %s` again)" % (restored, PROG, name))
+            retired.pop(name, None)
             try:
                 _write_small(state, RETIRED_FILE, retired)
             except OSError as err:
@@ -6473,12 +6682,17 @@ def cmd_retire(args, runner, now):
             if engine.audit is not None:
                 engine.audit.append(engine.actor, "fleetpane.unretired", name, {})
             print("%s is no longer retired: detection watches it again" % name)
+            if restored:
+                print(restored)
             return EXIT_OK
         if seen is None and not known:
             raise LaunchError("%s is not a fleet agent this switchboard has seen (see `%s status`)" % (name, PROG))
         prune_retired(retired, now())
         retired[name] = {"at": int(now()), "by": identify_who(engine, runner, now), "reason": reason or "finished",
                          "session": (seen.session_id if seen else None) or known.get("session"), "auto": False}
+        headless_kept = headless_record_to_free(state, name)
+        if headless_kept is not None:
+            retired[name]["headless"] = headless_kept   # kept here so `retire --undo` can put the record back
         try:
             _write_small(state, RETIRED_FILE, retired)
         except OSError as err:
@@ -6491,7 +6705,11 @@ def cmd_retire(args, runner, now):
         pass
     if engine.audit is not None:
         engine.audit.append(engine.actor, "fleetpane.retired", name, {"auto": False, "reason": retired[name]["reason"], "by": retired[name]["by"]})
-    if close_pane is not None:
+    if headless_kept is not None:
+        print(free_headless_record(engine, state, name))
+    if close_note is not None:
+        print("%s is retired: not watched, not reattached by --all-detached; %s. Its session keeps running in the service until it finishes or is interrupted (`%s retire --undo %s` reverses the retirement)" % (name, close_note, PROG, name))
+    elif close_pane is not None:
         line, _ = retire_close_pane(engine, runner, now, name, close_pane, close_by, getattr(args, "force", False))
         print("%s is retired: not watched, not reattached by --all-detached; %s (`%s retire --undo %s` reverses the retirement)" % (name, line, PROG, name))
     else:
@@ -9078,6 +9296,7 @@ def read_pr_json(engine, repo, number, extra_fields=""):
     config = engine.config
     accounts = getattr(engine, "accounts", None) or GhAccounts(config, engine.gh_runner or subprocess.run, engine.now)
     try:
+        refuse_excluded(config, repo)   # #446
         env = accounts.env_for(repo)
     except AccountError as err:
         raise NoticeError(str(err)) from None
@@ -9107,6 +9326,7 @@ def read_ref_state(engine, repo, number, kind):
         return read_pr_facts(engine, repo, number)["state"]
     accounts = getattr(engine, "accounts", None) or GhAccounts(engine.config, engine.gh_runner or subprocess.run, engine.now)
     try:
+        refuse_excluded(engine.config, repo)   # #446
         env = accounts.env_for(repo)
     except AccountError as err:
         raise NoticeError(str(err)) from None
@@ -12558,6 +12778,12 @@ def _validate_github(config, source):
             for k, v in users.items()):
         raise ConfigError("%s: 'gh_users' must map \"owner/repo\" or \"owner/*\" to a gh account name, got %r"
                           % (source, users))
+    seen_keys = {}
+    for key, account in users.items():
+        same = GhAccounts.normal_repo(key)
+        if same in seen_keys and seen_keys[same][1].lower() != account.lower():   # GitHub names are not case sensitive: two spellings of one repo may not name two accounts
+            raise ConfigError("%s: 'gh_users' names %r and %r, the same repo, with different accounts (%s, %s)" % (source, seen_keys[same][0], key, seen_keys[same][1], account))
+        seen_keys.setdefault(same, (key, account))
     config["gh_users"] = dict(users)
     poll = config["github_poll_seconds"]
     if not _is_number(poll) or poll < GITHUB_POLL_MIN:
@@ -13111,7 +13337,7 @@ class GitHubHub:
         self.runner, self.spawn, self.now, self.actor = runner, spawn, now, actor
         self.lock = threading.RLock()
         self.queue = {}        # key -> GitHubItem, until delivered
-        self.watches = {repo: Watch(repo) for repo in config["github_repos"]}
+        self.watches = {repo: Watch(repo) for repo in watched_repos(config, {})}   # the baseline less the excluded repositories
         self.accounts = GhAccounts(config, runner, now)  # PR 15: a gh account per repo
         self.lookback = config["github_lookback_hours"] * 3600
         self.backoff_base, self.backoff_max = GITHUB_BACKOFF_BASE, GITHUB_BACKOFF_MAX
@@ -13306,6 +13532,10 @@ class GitHubHub:
             load_fleet_health().append_moves(self.state_dir, load_fleet_health().move_rows(event, payload, repo, self.now(), closing_numbers))
         except Exception as err:   # the load figure then under-counts movement: say so in the audit, never fail the delivery
             self._audit("load.moves_failed", repo, {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
+        try:   # #470: a closed, relabelled or edited issue, or a changed sub-issue list, makes the cached asks list of this repository stale
+            load_fleet_health().mark_stale(self.state_dir, event, payload, repo, self.now())
+        except Exception as err:
+            self._audit("load.stale_failed", repo, {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
         self.note_pr_event(event, repo, payload)
         self._audit("github.received", repo, {"event": event, "delivery": _header(headers, "X-GitHub-Delivery"),
                                               "keys": [_one_line(item.key, 80) for item in items[:5]], "count": len(items)})   # ids, not bodies: the first few of them
@@ -13849,6 +14079,8 @@ class GitHubHub:
         """The repo's account's environment for a child, or None for the default account. Raises
         GitHubUnavailable when gh will not give the account's token (the text names the account only)."""
         try:
+            config = getattr(self, "config", None)
+            refuse_excluded(config if config is not None else getattr(self.accounts, "config", None), repo)   # #446: the forwarder start and every hub read take their environment here
             return self.accounts.env_for(repo)
         except AccountError as err:
             raise GitHubUnavailable(str(err)) from None
@@ -14159,7 +14391,8 @@ def github_status(config, state_dir, fleets=None, now=None):
     is watched by the daemon's last snapshot, the gh account it uses (a name, never a token) and the fleet
     agents in it."""
     repos = watched_repos(config, fleets or {})
-    report = {"repos": repos, "lookback_hours": config["github_lookback_hours"],
+    excluded = sorted(load_module("repo_exclusion").excluded_set(config))
+    report = {"repos": repos, "excluded": excluded, "lookback_hours": config["github_lookback_hours"],
               "events": list(config["github_events"]), "daemon": False, "watches": [], "port": None,
               "poll_seconds": config["github_poll_seconds"]}
     snapshot = {}
@@ -14207,10 +14440,11 @@ def github_status(config, state_dir, fleets=None, now=None):
 
 
 def format_github(report):
-    """Status lines for GitHub; none when no repo is watched."""
+    """Status lines for GitHub; none when no repo is watched and none is excluded."""
+    excluded = ["      github     excluded from watching and reading: %s (excluded_repos)" % ", ".join(report["excluded"])] if report.get("excluded") else []
     if not report["repos"]:
-        return []
-    lines = ["      github     watching %s; catch-up reads reach back %g h, older events are lost"
+        return excluded
+    lines = excluded + ["      github     watching %s; catch-up reads reach back %g h, older events are lost"
              % (", ".join(report["repos"]), report["lookback_hours"])]
     if not report["daemon"]:
         lines.append("        daemon not running: forwarder state is unknown")
@@ -14809,6 +15043,8 @@ def cmd_launch(args, runner, now, socket_call=None):
         return EXIT_OK
     if not args.agent or not args.dir:
         raise LaunchError("--agent and --dir are required (or --resume SESSION for an existing agent)")
+    if getattr(args, "headless", False) and (args.workspace or args.new_workspace):
+        raise LaunchError("--headless opens no terminal, so it takes no --workspace or --new-workspace (`%s watch NAME` opens one later)" % PROG)
     if (args.name or "").startswith(LANE_NAME_PREFIX):
         raise LaunchError("names starting %r are the plan review engine's reviewer lanes: only it launches them" % LANE_NAME_PREFIX)
     repo = launch_repo(args)
@@ -14835,13 +15071,19 @@ def cmd_launch(args, runner, now, socket_call=None):
             created = workspace = result["workspace"] = engine.herdr.workspace_create(
                 args.dir, args.new_workspace, focus=False)["workspace_id"]
     try:
-        done = launch_agent(engine, args.name, args.agent, args.dir, workspace, args.role, args.reports_to,
-                            None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo)
+        if getattr(args, "headless", False):
+            done = launch_headless(engine, args.name, args.agent, args.dir, args.role, args.reports_to,
+                                   None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo)
+        else:
+            done = launch_agent(engine, args.name, args.agent, args.dir, workspace, args.role, args.reports_to,
+                                None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo)
     except LaunchError as err:
         if created:
             raise LaunchError("%s (workspace %s was created and is left for you to close)" % (err, created)) from err
         raise
     print(json.dumps(done, sort_keys=True))
+    if done.get("identity"):
+        sys.stderr.write("%s: %s\n" % (PROG, done["identity"]))
     boss = args.reports_to
     if boss is None and (brief or getattr(args, "checkpoint", None) or getattr(args, "overdue", None)):
         try:  # a launch with no --reports-to: the launching agent is who an overdue checkpoint should wake (the worker's metadata is unchanged)
@@ -15311,15 +15553,15 @@ def _fleet_repo(fleet, config):
 def watched_repos(config, fleets):
     """The repos to watch now, sorted: the config baseline, every `repo` a live fleet agent names, and the
     repo of every charter it holds. `fleets` maps agent name -> metadata.fleet. Derived on every call, so
-    there is nothing to keep and nothing to lose (R3). The `static-repos` fault reads the baseline only."""
+    there is nothing to keep and nothing to lose (R3). The `static-repos` fault reads the baseline only. The config's `excluded_repos` are taken out of the result,
+    so every consumer of this set (forwarders, sweep, triage) honours them."""
     found = set(config["github_repos"])
-    if fault("static-repos"):
-        return sorted(found)
-    for fleet in fleets.values():
-        repo = _fleet_repo(fleet, config)
-        if repo:
-            found.add(repo)
-    return sorted(found)
+    if not fault("static-repos"):
+        for fleet in fleets.values():
+            repo = _fleet_repo(fleet, config)
+            if repo:
+                found.add(repo)
+    return sorted(load_module("repo_exclusion").without_excluded(config, found))   # #446: an excluded repository is never watched, whatever names it
 
 
 def discovered_fleets(discovery):
@@ -15400,6 +15642,18 @@ def _endpoint_of(path):
     return re.sub(r"\d+", "#", bare) or "repo"
 
 
+class RepoExcluded(AccountError):
+    """A read of a repository the config excludes (`excluded_repos`, #446): no process is started. An AccountError, so every caller that already
+    degrades on an account problem (the hub's reads, the intent reader, a notice) degrades the same way."""
+
+
+def refuse_excluded(config, repo):
+    """The one check of the exclusion for a gh read of `repo`: raises RepoExcluded when the config excludes it. No config at all means no exclusion list, so the
+    read is allowed (a deliberate fail open for a test double built without one: every real hub and GhAccounts carries its config)."""
+    if repo and config is not None and load_module("repo_exclusion").is_excluded(config, repo):
+        raise RepoExcluded("repository %s is excluded from the fleet's reads (excluded_repos)" % repo)
+
+
 class GhAccounts:
     """Which gh account a repo uses, and its token at the moment of use.
 
@@ -15422,13 +15676,27 @@ class GhAccounts:
         self.audit, self.actor = None, "daemon"
         self.conditional = False                 # ask with `-i` and keep the ETag: the daemon turns it on; a one-shot command or a test reads plainly
 
+    @staticmethod
+    def normal_repo(repo):
+        """`owner/name` the way GitHub treats it: whitespace and a trailing `.git` or `/` off, lower case (GitHub names are not case sensitive). None when
+        it is not a string. Used for the repo and for every `gh_users` key, so a different spelling of a mapped repo is still the mapped repo."""
+        if not isinstance(repo, str):
+            return None
+        text = repo.strip().rstrip("/")
+        if text.lower().endswith(".git"):
+            text = text[:-4]
+        return text.lower()
+
     def account_for(self, repo):
         if fault("one-account"):
             return None  # the fault: the default token reads every repo
-        users = self.config.get("gh_users") or {}
-        if repo in users:
-            return users[repo]
-        return users.get("%s/*" % repo.split("/")[0]) if isinstance(repo, str) and "/" in repo else None
+        want = self.normal_repo(repo)
+        if not want:
+            return None
+        users = {self.normal_repo(key): account for key, account in (self.config.get("gh_users") or {}).items() if isinstance(key, str)}
+        if want in users:
+            return users[want]
+        return users.get("%s/*" % want.split("/")[0]) if "/" in want else None
 
     def default_available(self):
         return any(self.environ.get(name) for name in ("GH_TOKEN", "GITHUB_TOKEN"))
@@ -15483,6 +15751,7 @@ class GhAccounts:
           - a 403/429 that says the limit is spent pauses every read of that account until the limit resets (GhRateLimited is raised
             at once, no process is started). No read is exempt: writes do not go through here.
         A runner whose answer has no HTTP header block (a fake, `--paginate`) is passed through as it is."""
+        refuse_excluded(self.config, repo)   # #446: the lowest layer every gh read goes through: nothing is spawned for an excluded repository
         account = self.describe(repo)
         now = self.now()
         with self.lock:
@@ -15759,6 +16028,7 @@ class IntentReader:
         self.gh, self.repo, self.runner, self.now = gh, repo, runner, now
         self.timeout, self.ttl = timeout, ttl
         self.accounts = accounts  # PR 15: a GhAccounts; None reads every repo with the default account
+        self.config = None        # the config whose excluded_repos are never read; when None, the config of `accounts` (every reader has one)
         self._cache = {}
         self.live, self.live_ttl = None, INTENT_TTL_LIVE   # live(repo) -> the running forwarder's generation, or None (the hub sets it)
 
@@ -15774,6 +16044,9 @@ class IntentReader:
             raise IntentError("gh", str(err)) from None
 
     def _api(self, path, repo=None):
+        config = self.config if self.config is not None else getattr(self.accounts, "config", None)   # every construction passes `accounts=GhAccounts(config, ...)`
+        if config is not None and load_module("repo_exclusion").is_excluded(config, repo or self.repo):
+            raise IntentError("excluded", "repository %s is excluded from the fleet's reads (excluded_repos)" % (repo or self.repo))   # #446: no read
         argv = [self.gh, "api", path]
         env = self.env_for(repo)
         extra = {"env": env} if env is not None else {}
@@ -15914,8 +16187,10 @@ def intent_reader_for(config, runner=subprocess.run, now=time.time):
     """The IntentReader the config asks for, or None when no `intent_repo` is set."""
     if not config.get("intent_repo"):
         return None
-    return IntentReader(config["gh"], config["intent_repo"], runner, now, config["call_timeout_seconds"],
-                        accounts=GhAccounts(config, runner, now))
+    reader = IntentReader(config["gh"], config["intent_repo"], runner, now, config["call_timeout_seconds"],
+                          accounts=GhAccounts(config, runner, now))
+    reader.config = config
+    return reader
 
 
 # -- composing: one section per ask
@@ -19260,6 +19535,7 @@ def cmd_review_measure(args, runner, now):
         engine, state, config = build_engine(runner, now, "cli", writable=False)
         accounts = getattr(engine, "accounts", None) or GhAccounts(config, runner, now)
         try:
+            refuse_excluded(config, args.repo)   # #446
             env = accounts.env_for(args.repo)
         except AccountError as err:
             raise ReviewError(str(err)) from None
@@ -19908,7 +20184,7 @@ def cmd_disk_janitor(args, runner, now):
     with worktree_sweep(engine):   # one session.list for every in-use check of this run
         lines, removed, kept = janitor.run(temp, state, now(), cfg, bool(args.apply),
                                            lambda name, detail: engine.audit.append(engine.actor, "temp.removed", _plain(name, 120), detail),
-                                           busy=janitor_busy_function(engine, runner, janitor))
+                                           busy=janitor_busy_function(engine, runner, janitor), weekly=bool(getattr(args, "weekly", False)))
     for line in lines:
         print(_plain(line, 300))
     print("%s: %d %s, %d kept (%s)" % (PROG, removed, "removed" if args.apply else "would be removed (a dry run: add --apply)", kept, _plain(temp, 160)))
@@ -19945,6 +20221,7 @@ class _RedsReader:
             raise load_reds().RedsError("gh api %s: not JSON" % path.split("?")[0]) from None
 
     def zip(self, path):
+        refuse_excluded(self.config, self.repo)   # #446: json() refuses first; the zip read does not rely on that
         env = self.accounts.env_for(self.repo)
         extra = {"env": env} if env is not None else {}
         done = self.runner([self.config["gh"], "api", path], capture_output=True, timeout=max(60, self.config["call_timeout_seconds"]), stdin=subprocess.DEVNULL, **extra)
@@ -20051,6 +20328,7 @@ def add_disk_parsers(sub):
                                               "temp_janitor.days (default 7) and that no state file of the fleet names, no keep glob matches and no .fleet-keep marker "
                                               "protects. Never follows a link, never touches another user's entry. Each removal is one temp.removed audit line.")
     janitor.add_argument("--apply", action="store_true", help="Remove them (the default only lists)")
+    janitor.add_argument("--weekly", action="store_true", help="The weekly job: scan under the longer budget temp_janitor.weekly_scan_seconds (default 600 s) instead of scan_seconds (60 s)")
     orphans = disk_sub.add_parser("reap-orphans", allow_abbrev=False, help="Signal (SIGTERM, then SIGKILL) orphaned test helpers past the grace: parent launchd, an exact allow-list; a dry run unless --apply")
     orphans.add_argument("--apply", action="store_true", help="Do it (default: a dry run)")
     reclaim = disk_sub.add_parser("reclaim-worktrees", allow_abbrev=False, help="Remove the registered worktrees of retired agents when clean and pushed; else keep and say why (a dry run unless --apply)")
@@ -23044,6 +23322,8 @@ def build_parser():
     launch.add_argument("--dir", help="The agent's working directory (absolute)")
     launch.add_argument("--resume", metavar="SESSION", help="Open a tab on this existing session of NAME instead "
                                                            "of creating one (a restart that keeps the conversation)")
+    launch.add_argument("--headless", action="store_true", help="Start the worker with NO terminal: a session in the OpenCode service, the brief sent through "
+                        "the API (about 2 MB instead of a terminal's 200 to 400 MB). Its tools run in the service's environment; opt in")
     launch.add_argument("--workspace", help="The herdr workspace for the new tab (default: $HERDR_WORKSPACE_ID)")
     launch.add_argument("--role", help="metadata.fleet.role")
     launch.add_argument("--reports-to", dest="reports_to", help="metadata.fleet.reports_to")
@@ -25586,12 +25866,64 @@ class HarnessReplyDelivery(decision_core.AnswerDelivery):
         return "answered %s" % ident
 
 
+_DECISION_REF = re.compile(r"^(?:([A-Za-z0-9_.-]+)/)?([A-Za-z0-9_.-]+)#([0-9]+)$")
+
+
+def _decision_ref(ident):
+    """(owner or None, repo or None, number) for the issue forms a person types for a decision (`OWNER/REPO#N`, `REPO#N`, `#N`, `N`), else None."""
+    text = (ident or "").strip()
+    bare = re.fullmatch(r"#?([0-9]+)", text)
+    if bare:
+        return None, None, int(bare.group(1))
+    got = _DECISION_REF.match(text)
+    if not got:
+        return None
+    return (got.group(1).lower() if got.group(1) else None), got.group(2).lower(), int(got.group(3))
+
+
+def _decisions_for_ref(decisions, owner, repo, number):
+    """The decisions about issue `number` whose repository matches the spelling: the full name when an owner is given, the short name when only a repo
+    is, any when neither."""
+    found = []
+    for decision in decisions:
+        if decision.get("kind") != "issue" or decision.get("ask") != number:
+            continue   # only an ISSUE decision is named by its issue: a permission or a question that is about the issue has an id of its own
+        full = str(decision.get("repo") or "").lower()
+        short = full.rsplit("/", 1)[-1]
+        if owner and full != "%s/%s" % (owner, repo):
+            continue
+        if not owner and repo and short != repo:
+            continue
+        found.append(decision)
+    return found
+
+
 def decision_by_id(decisions, ident):
+    """The decision an id names. The id the list shows (`fleet-kit#357`, or `#357`) matches exactly, as it always did; the issue forms a person naturally types
+    (`OWNER/REPO#N`, `REPO#N`, `#N`) also find it. A spelling that names more than one decision is refused and lists the candidates, never guessed
+    (DecisionError); None when none matches (see `decision_miss_hint`). Only the spellings are widened: what follows (the tier check, the caller check, the
+    audit) is unchanged."""
     for wanted in (ident, "#" + ident.lstrip("#")):
         for decision in decisions:
             if decision["id"] == wanted:
                 return decision
-    return None
+    ref = _decision_ref(ident)
+    if ref is None:
+        return None
+    found = _decisions_for_ref(decisions, *ref)
+    if len(found) > 1:
+        raise DecisionError("%s names %d decisions: %s. Name one with its owner and repository (OWNER/REPO#%d)" % (
+            ident, len(found), ", ".join(sorted(str(d["id"]) for d in found)), ref[2]))
+    return found[0] if found else None
+
+
+def decision_miss_hint(decisions, ident):
+    """What to add to a "no decision is waiting" error: the ids of the decisions that carry the same number (the right form is one copy away), or ""."""
+    ref = _decision_ref(ident)
+    if ref is None:
+        return ""
+    same = sorted({str(d["id"]) for d in decisions if d.get("kind") == "issue" and d.get("ask") == ref[2]})
+    return " (a decision numbered %d is listed as %s)" % (ref[2], ", ".join(same)) if same else ""
 
 
 def refuse_human_tier(engine, decision, action, name, role):
@@ -25954,7 +26286,7 @@ def cmd_decision_supersede(args, engine, decisions, name, runner, role=None):
         try:
             decision = decision_by_id(decisions, ident)
             if decision is None:
-                raise DecisionError("no decision %s is waiting" % ident)
+                raise DecisionError("no decision %s is waiting%s" % (ident, decision_miss_hint(decisions, ident)))
             refuse_human_tier(engine, decision, "supersede", name, role)
             line = supersede_decision(engine, runner, decision, shown, args.note, name)
             print("%s: %s" % (ident, line))
@@ -26035,7 +26367,7 @@ def cmd_decision_write(args, action, runner, now):
             return code
         decision = decision_by_id(decisions, args.id)
         if decision is None:
-            raise DecisionError("no decision %s is waiting (see `%s decisions --tier all`)" % (args.id, PROG))
+            raise DecisionError("no decision %s is waiting%s (see `%s decisions --tier all`)" % (args.id, decision_miss_hint(decisions, args.id), PROG))
         refuse_human_tier(engine, decision, action, name, role)
         if action == "escalate":
             line = escalate_decision(engine, runner, decision, args.reason, name)

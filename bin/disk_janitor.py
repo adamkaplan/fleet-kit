@@ -14,21 +14,25 @@ A symlink is removed as a link and never followed; a directory is removed withou
 outside the temp directory. A dry run (the default) removes nothing. What is NOT seen: a path written only in a GitHub issue or in an agent's
 own memory: use the keep-list or a `.fleet-keep` marker for that."""
 
+import bisect
 import fnmatch
+import json
 import os
 import shutil
 import stat
 import time
 from pathlib import Path
 
-DEFAULTS = {"enabled": True, "days": 7, "keep": [], "dir": None}
+SCAN_SECONDS = 60.0          # the whole scan (config `scan_seconds`): past it the rest are NOT JUDGED, and the next run continues after the last judged name
+DEFAULTS = {"enabled": True, "days": 7, "keep": [], "dir": None, "scan_seconds": SCAN_SECONDS, "weekly_scan_seconds": 600}
 KEEP_MARKER = ".fleet-keep"
 WALK_ENTRIES = 20000          # files one entry may hold and still be judged
 WALK_SECONDS = 5.0            # one entry's walk
 REMOVE_MAX = 500              # removals per call
 STATE_FILE_BYTES = 2000000    # of one state file read (its tail)
 STATE_TOTAL_BYTES = 16000000
-SCAN_SECONDS = 60.0          # the whole scan: past it the remaining entries are kept
+CURSOR_FILE = "temp-janitor-cursor.json"   # {"after": <the last name judged>}: a NAME, never a position
+BUDGET_MAX = 86400
 MIN_NAME = 6                  # a basename shorter than this is too common to count as naming something
 
 
@@ -47,7 +51,11 @@ def validate(raw, source="config"):
     if raw is None:
         return
     if not isinstance(raw, dict) or set(raw) - set(DEFAULTS):
-        raise ValueError("%s: 'temp_janitor' must be an object with only enabled, days, keep and dir, got %r" % (source, raw))
+        raise ValueError("%s: 'temp_janitor' must be an object with only enabled, days, keep, dir, scan_seconds and weekly_scan_seconds, got %r" % (source, raw))
+    for key in ("scan_seconds", "weekly_scan_seconds"):
+        value = raw.get(key, DEFAULTS[key])
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 1 <= value <= BUDGET_MAX:
+            raise ValueError("%s: temp_janitor.%s must be a number of seconds from 1 to %d, got %r" % (source, key, BUDGET_MAX, value))
     if "enabled" in raw and not isinstance(raw["enabled"], bool):
         raise ValueError("%s: temp_janitor.enabled must be true or false" % source)
     days = raw.get("days", DEFAULTS["days"])
@@ -97,11 +105,11 @@ def named_text(state_dir):
         names = sorted(os.listdir(str(state_dir)))
     except OSError:
         return "", False
-    if not any(n.endswith(".json") or n.endswith(".jsonl") for n in names):
+    if not any((n.endswith(".json") or n.endswith(".jsonl")) and n != CURSOR_FILE for n in names):
         return "", False   # a state directory with no record at all is the wrong directory, or an empty one: nothing can be said to be unnamed
     for name in names:
-        if not (name.endswith(".json") or name.endswith(".jsonl")):
-            continue
+        if not (name.endswith(".json") or name.endswith(".jsonl")) or name == CURSOR_FILE:
+            continue   # the janitor's own cursor is not a record of the fleet: a name in it must not keep that entry
         path = os.path.join(str(state_dir), name)
         try:
             info = os.lstat(path)
@@ -252,21 +260,66 @@ def judge(path, text, now, cfg, uid=None, clock=time.monotonic, busy=None):
     return row
 
 
-def scan(temp_dir, state_dir, now, cfg, uid=None, clock=time.monotonic, busy=None):
-    """[judge rows] for each top-level entry, sorted by name; every entry is kept when the fleet's records could not be read in full. Reads only."""
+def read_cursor(state_dir):
+    """The name the last budget stop ended after, or None. A missing, empty, unreadable or corrupt file is None (start at the first name), never an error."""
+    try:
+        with open(os.path.join(str(state_dir), CURSOR_FILE)) as handle:
+            after = json.loads(handle.read(4096)).get("after")
+        return after if isinstance(after, str) and after and "\x00" not in after else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def write_cursor(state_dir, name):
+    """Record `name` (or clear the cursor with None): mode 0600, atomic, written only when it changes. Returns True when it wrote. Raises OSError."""
+    path = os.path.join(str(state_dir), CURSOR_FILE)
+    if read_cursor(state_dir) == name and (name is not None or not os.path.exists(path)):
+        return False
+    if name is None:
+        os.unlink(path)
+        return True
+    temp = "%s.%d.tmp" % (path, os.getpid())
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(json.dumps({"after": name}))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
+    return True
+
+
+def scan(temp_dir, state_dir, now, cfg, uid=None, clock=time.monotonic, busy=None, budget=None):
+    """[judge rows] for the top-level entries from the cursor on, in name order; every entry is kept when the fleet's records could not be read in full. Reads only.
+    The scan starts at the first name AFTER the cursor (the last name an earlier budget stop judged; the first name when there is none or it is past the end).
+    Past the time budget (`budget`, else the config's `scan_seconds`, else SCAN_SECONDS) the entries not reached are rows with `judged` False: never removed,
+    reported as not judged, and the next run starts after the last judged one."""
     text, complete = named_text(state_dir)
     try:
         names = sorted(os.listdir(str(temp_dir)))
     except OSError:
         return []
-    budget, rows = clock() + SCAN_SECONDS, []
-    for n in names:
-        if clock() > budget:
-            rows.append({"name": n, "path": os.path.join(str(temp_dir), n), "action": "keep", "why": "the scan's time budget was spent: kept", "size": 0, "age_days": 0, "ident": None})
+    after = read_cursor(state_dir)
+    start = bisect.bisect_right(names, after) if after else 0
+    if start >= len(names):
+        start = 0
+    seconds = budget if budget is not None else (cfg or {}).get("scan_seconds") or SCAN_SECONDS
+    limit, rows = clock() + seconds, []
+    for n in names[start:]:
+        if clock() > limit:
+            rows.append({"name": n, "path": os.path.join(str(temp_dir), n), "action": "keep", "why": "not judged: the scan's time budget was spent", "size": 0,
+                         "age_days": 0, "ident": None, "judged": False})
             continue
         rows.append(judge(os.path.join(str(temp_dir), n), text, now, cfg, uid, clock, busy))
     if not complete:
         for row in rows:
+            row["incomplete"] = True
             if row["action"] == "remove":
                 row["action"], row["why"] = "keep", "the fleet's records could not be read in full: nothing is judged"
     return rows
@@ -284,7 +337,7 @@ def remove_entry(path):
         os.unlink(path)
 
 
-def run(temp_dir, state_dir, now, cfg, apply, audit, uid=None, clock=time.monotonic, busy=None):
+def run(temp_dir, state_dir, now, cfg, apply, audit, uid=None, clock=time.monotonic, busy=None, weekly=False):
     """Returns (lines, removed, kept). `audit(name, detail)` is called once for each removal that happened; if it raises, removing STOPS and the line says so.
     Right before each removal the entry is judged again from the records as they are then, and removed only if it is still eligible and is the same
     entry (device, inode and newest modification time)."""
@@ -292,10 +345,12 @@ def run(temp_dir, state_dir, now, cfg, apply, audit, uid=None, clock=time.monoto
     ok, why = safe_dir(temp_dir)
     if not ok:
         return ["refused: %s" % why], 0, 0
-    rows = scan(temp_dir, state_dir, now, cfg, uid, clock, busy)
+    budget = (cfg or {}).get("weekly_scan_seconds" if weekly else "scan_seconds") or None
+    rows = scan(temp_dir, state_dir, now, cfg, uid, clock, busy, budget)
     for row in rows:
         if row["action"] != "remove":
-            kept += 1
+            if row.get("judged", True):
+                kept += 1
             continue
         if removed >= REMOVE_MAX:
             lines.append("only %d entries handled per call: run it again for the rest" % REMOVE_MAX)
@@ -324,6 +379,35 @@ def run(temp_dir, state_dir, now, cfg, apply, audit, uid=None, clock=time.monoto
             lines.append("STOPPED: %s was removed but its audit line could not be written (%s)" % (row["name"], err))
             return lines, removed, kept
     for row in rows:
-        if row["action"] == "keep" and not row["why"].startswith("newer than"):
+        if row["action"] == "keep" and row.get("judged", True) and not row["why"].startswith("newer than"):
             lines.append("kept %s: %s" % (row["name"], row["why"]))
+    lines.extend(_coverage(state_dir, rows, apply))
     return lines, removed, kept
+
+
+def _coverage(state_dir, rows, apply):
+    """The report lines about coverage, and (on an apply run) the cursor moved: how many entries were judged and how many were not, and `cycle complete` when
+    the run reached the end of the list. A dry run reads the cursor and never moves it (a preview must not change what the next real run covers)."""
+    if any(r.get("incomplete") for r in rows):   # nothing was really judged: no coverage was made, so the cursor stays where it was
+        return ["nothing was judged: the fleet's records could not be read in full (the cursor did not move)"]
+    judged = [r for r in rows if r.get("judged", True)]
+    unreached = [r for r in rows if not r.get("judged", True)]
+    lines = ["%d judged, %d not judged" % (len(judged), len(unreached))]
+    after = judged[-1]["name"] if unreached and judged else None
+    if unreached:
+        lines.append("the time budget was spent: the next run continues after %s" % (_safe_name(after) if after else "the same place"))
+    elif rows:
+        lines.append("cycle complete")
+    if apply:
+        try:
+            if unreached and not judged:
+                pass   # no progress this run: the cursor stays where it was
+            else:
+                write_cursor(state_dir, after)
+        except OSError as err:
+            lines.append("the cursor could not be written (%s): check that the state directory is writable; the next run starts where this one did" % err.strerror)
+    return lines
+
+
+def _safe_name(name):
+    return "".join(ch if ch.isprintable() else "?" for ch in str(name))[:120]

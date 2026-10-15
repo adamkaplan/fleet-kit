@@ -29,6 +29,10 @@ HISTORY_DAYS = 3                 # finished days of the hourly series kept for t
 READ_BUDGET_DEFAULT = 30         # GitHub reads an hour for each gh account (the key load_alert.read_budget); a 304 is free
 READ_BUDGET_MAX = 60             # a hard ceiling: a key above it is a configuration error
 ASKS_FRESH_SECONDS = 3600        # a cached list of asks is re-read at most this often
+STALE_MARK_FILE = "asks-stale.json"
+STALE_MARKS_MAX = 200            # repositories kept in the stale marks (a delivery names the repository of the daemon's own watch list)
+STALE_REREAD_SECONDS = 300       # a repository's asks list marked stale is re-read at most this often
+STALE_ISSUE_ACTIONS = ("closed", "reopened", "labeled", "unlabeled", "edited", "deleted", "transferred")
 RETRY_SECONDS = 300              # after a failed read the same source is not tried again for this long
 ASKS_STALE_SECONDS = 3 * 3600    # a list older than this is not believed: the figure is not recorded
 DEFAULTS = {"enabled": False, "stalled_hours": 2.0, "stalled_asks": 2, "backlog_hours": 4.0, "read_budget": READ_BUDGET_DEFAULT}
@@ -102,6 +106,41 @@ def move_rows(event, payload, repo, now, closing=lambda text: []):
     refs = [n for n in list(closing(pr.get("body"))) + references(pr.get("body"), head.get("ref"), repo) if n != number]
     refs = list(dict.fromkeys(refs))[:MOVES_NUMBERS_MAX - 1]
     return [{"at": now, "repo": repo, "numbers": [number] + refs, "refs": refs, "kind": kind}]
+
+
+def mark_stale(state_dir, event, payload, repo, now):
+    """Mark `repo`'s cached asks list stale when a delivery says an issue was closed, reopened, labelled, unlabelled, edited, deleted or transferred, or
+    that a sub-issue list changed: the next pass re-reads it (the hourly re-read stays as the fallback). Returns True when a mark was written."""
+    if not isinstance(payload, dict) or not isinstance(repo, str) or not repo:
+        return False
+    if not (event == "sub_issues" or (event == "issues" and payload.get("action") in STALE_ISSUE_ACTIONS)):
+        return False
+    with _moves_lock(state_dir):
+        path = Path(state_dir) / STALE_MARK_FILE
+        try:
+            marks = json.loads(path.read_text())
+        except (OSError, ValueError):
+            marks = {}
+        marks = {k: v for k, v in (marks.items() if isinstance(marks, dict) else []) if isinstance(v, (int, float)) and not isinstance(v, bool)}
+        marks[repo.lower()] = now
+        while len(marks) > STALE_MARKS_MAX:
+            marks.pop(min(marks, key=marks.get))
+        temp = path.with_name(path.name + ".tmp")
+        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            json.dump(marks, handle, sort_keys=True)
+        os.replace(str(temp), str(path))
+    return True
+
+
+def stale_since(state_dir, repo):
+    """When a delivery last marked `repo`'s asks list stale, or None (a missing or unreadable file marks nothing)."""
+    try:
+        marks = json.loads((Path(state_dir) / STALE_MARK_FILE).read_text())
+    except (OSError, ValueError):
+        return None
+    value = marks.get(str(repo or "").lower()) if isinstance(marks, dict) else None
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
 @contextmanager
@@ -230,19 +269,21 @@ def last_moves(asks, rows):
     return found
 
 
-WAIT_LABELS = ("awaiting-user", "awaiting-cos", "parked")   # matched by suffix, whatever the owner's prefix
+WAIT_LABELS = ("awaiting-user", "awaiting-cos", "awaiting-live", "parked")   # matched by suffix, whatever the owner's prefix
 PARKED_MAX_DAYS = 366            # a park reaches at most this far ahead (the same bound as the switchboard's parked_until users)
 
 
 def ask_wait(ask, now):
-    """What an ask is waiting on, by its labels: "owner" (awaiting-user), "cos" (awaiting-cos), "parked" (a parked label and a valid future date: the
-    call site parsed the `Parked until:` line with the switchboard's own parser) or None. awaiting wins over parked, and the owner over the Chief of Staff."""
+    """What an ask is waiting on, by its labels: "owner" (awaiting-user), "cos" (awaiting-cos), "live" (awaiting-live: it waits on a live event), "parked" (a parked label and a valid future date: the
+    call site parsed the `Parked until:` line with the switchboard's own parser) or None. awaiting-user wins over awaiting-cos, awaiting-cos over awaiting-live, and all three over parked."""
     labels = [str(l) for l in (ask.get("labels") or [])]
     has = lambda name: any(l == name or l.endswith(":" + name) for l in labels)
     if has("awaiting-user"):
         return "owner"
     if has("awaiting-cos"):
         return "cos"
+    if has("awaiting-live"):
+        return "live"
     until = ask.get("parked_until")
     if has("parked") and isinstance(until, (int, float)) and not isinstance(until, bool) and now < until <= now + PARKED_MAX_DAYS * 86400.0:
         return "parked"
@@ -253,13 +294,13 @@ def figures(name, info, rows, now, cfg):
     """One orchestrator's figures. `info`: asks [{repo, number, first_seen}] or None (unreadable), busy, idle, messages, decisions."""
     out = {"name": name, "busy": info["busy"], "idle": info["idle"], "messages": info["messages"], "decisions": info["decisions"],
            "open_asks": None, "active_asks": None, "stalled": None, "stalled_asks": [], "oldest_stall_hours": None, "moved_1h": None, "moved_backlog": None,
-           "waiting_owner": None, "waiting_cos": None, "parked": None, "charter_moves_1h": None}
+           "waiting_owner": None, "waiting_cos": None, "waiting_live": None, "parked": None, "charter_moves_1h": None}
     asks = info.get("asks")
     if asks is None:
         return out
     last = last_moves(asks, rows)
     out["open_asks"] = len(asks)
-    ages, stalled, waits = [], [], {"owner": 0, "cos": 0, "parked": 0}
+    ages, stalled, waits = [], [], {"owner": 0, "cos": 0, "live": 0, "parked": 0}
     for ask in asks:
         wait = ask_wait(ask, now)
         if wait:
@@ -271,7 +312,7 @@ def figures(name, info, rows, now, cfg):
         if now - at >= cfg["stalled_hours"] * 3600:
             stalled.append(ask["number"])
     out["stalled"], out["stalled_asks"] = len(stalled), sorted(stalled)
-    out["waiting_owner"], out["waiting_cos"], out["parked"] = waits["owner"], waits["cos"], waits["parked"]
+    out["waiting_owner"], out["waiting_cos"], out["waiting_live"], out["parked"] = waits["owner"], waits["cos"], waits["live"], waits["parked"]
     out["active_asks"] = len(asks) - sum(waits.values())
     out["oldest_stall_hours"] = round(max(ages) / 3600.0, 1) if ages else 0.0
     moved = lambda hours: sum(1 for ask in asks if last[(ask["repo"], ask["number"])] is not None and now - last[(ask["repo"], ask["number"])] < hours * 3600)
@@ -359,23 +400,15 @@ def _write_state(state_dir, data):
     os.replace(str(temp), str(path))
 
 
-def decisions_waiting(state_dir):
-    """{agent: open decisions} from decisions.json, or None when it cannot be read."""
-    try:
-        listed = json.loads((Path(state_dir) / "decisions.json").read_text()).get("decisions")
-    except (OSError, ValueError, AttributeError):
-        return None
-    if not isinstance(listed, list):
-        return None
-    found = {}
-    for item in listed:
-        if isinstance(item, dict) and not item.get("closed"):
-            found[str(item.get("agent"))] = found.get(str(item.get("agent")), 0) + 1
-    return found
+PR_KINDS = ("notice", "captain")   # the entries of decisions.json that are information about a pull request, not a wait
+DECISIONS_MAX = 1000             # entries of decisions.json looked at in one pass (the rest are ignored)
+_REPO_SHAPE = re.compile(r"[A-Za-z0-9_.-]{1,100}(/[A-Za-z0-9_.-]{1,100})?\Z")
 
 
 def decision_items(state_dir):
-    """[(repo, issue number)] of the open decisions of decisions.json (the issue of the ask, else the item's own number), or None when it cannot be read.
+    """([(repo, issue of the ask)], PR notices and holds) of the open entries of decisions.json, or None when it cannot be read.
+    A PR heads-up (kind `notice`) or a held pull request (kind `captain`) waits on no orchestrator and is only counted; any other entry waits, and one with no usable ask (a permission request, a question with no issue) is returned with no issue so that it belongs to nobody.
+    At most DECISIONS_MAX entries are read, and a repository that is not shaped like `owner/name` is dropped (the chain is then not read).
     The `agent` field is a metadata guess and is not read here."""
     try:
         listed = json.loads((Path(state_dir) / "decisions.json").read_text()).get("decisions")
@@ -383,12 +416,18 @@ def decision_items(state_dir):
         return None
     if not isinstance(listed, list):
         return None
-    out = []
-    for item in listed:
-        if isinstance(item, dict) and not item.get("closed"):
-            number = item.get("ask") if isinstance(item.get("ask"), int) and not isinstance(item.get("ask"), bool) else item.get("number")
-            out.append((str(item.get("repo") or ""), number if isinstance(number, int) and not isinstance(number, bool) else None))
-    return out
+    out, notices = [], 0
+    for item in listed[:DECISIONS_MAX]:
+        if not isinstance(item, dict) or item.get("closed"):
+            continue
+        if item.get("kind") in PR_KINDS:
+            notices += 1   # a heads-up or a held pull request: information, it waits on no orchestrator
+            continue
+        ask = item.get("ask")
+        repo = item.get("repo")
+        usable = isinstance(ask, int) and not isinstance(ask, bool) and ask > 0
+        out.append((repo if isinstance(repo, str) and _REPO_SHAPE.match(repo) else "", ask if usable else None))   # no usable ask: a real wait that belongs to nobody
+    return out, notices
 
 
 def charter_agent(body):
@@ -551,12 +590,13 @@ def expand_rows(ctx, state, budget, rows, asks_by_name, charters, now, problems)
 
 
 def attribute_decisions(ctx, state, budget, asks_by_name, charters, now, problems):
-    """({orchestrator: waiting decisions}, how many could not be attributed, or None when decisions.json cannot be read). A decision belongs to the
+    """({orchestrator: waiting decisions}, how many could not be attributed, PR notices and holds, or None when decisions.json cannot be read). A decision belongs to the
     orchestrator whose open ask or charter is on the parent chain of its issue (up to PARENT_LEVELS levels, the same cached and budgeted reads);
     one that cannot be resolved belongs to nobody: the `agent` field of the list is never used."""
-    items = decision_items(ctx.state_dir)
-    if items is None:
-        return None, 0
+    read = decision_items(ctx.state_dir)
+    if read is None:
+        return None, 0, 0
+    items, notices = read
     owner = {}
     for name, lst in asks_by_name.items():
         for ask in lst:
@@ -584,7 +624,7 @@ def attribute_decisions(ctx, state, budget, asks_by_name, charters, now, problem
             nobody += 1
         else:
             counts[found] = counts.get(found, 0) + 1
-    return counts, nobody
+    return counts, nobody, notices
 
 
 def _refresh_asks(ctx, state, now, rows=()):
@@ -597,7 +637,9 @@ def _refresh_asks(ctx, state, now, rows=()):
     for name in sorted(ctx.orchestrators, key=lambda n: cache.get(n, {}).get("at", 0)):
         info = dict(ctx.orchestrators[name], charter=charters.get(name))
         entry = cache.get(name) or {}
-        if (entry.get("at") and now - entry["at"] < ASKS_FRESH_SECONDS) or now - entry.get("tried", -1e9) < RETRY_SECONDS:
+        marked = stale_since(ctx.state_dir, info.get("repo"))
+        stale = entry.get("at") and marked is not None and marked > entry["at"] and now - entry["at"] >= STALE_REREAD_SECONDS   # an event said it changed: not the hourly wait
+        if (entry.get("at") and now - entry["at"] < ASKS_FRESH_SECONDS and not stale) or now - entry.get("tried", -1e9) < RETRY_SECONDS:
             if entry.get("error") and now - entry.get("tried", -1e9) < RETRY_SECONDS:
                 problems.append(entry["error"])
             continue
@@ -618,8 +660,8 @@ def _refresh_asks(ctx, state, now, rows=()):
     charter_numbers = state.get("charter_of") or {}
     rows, unattributed = expand_rows(ctx, state, budget, list(rows), asks_by_name, charter_numbers, now, problems)
     state["unattributed"] = unattributed
-    counts, nobody = attribute_decisions(ctx, state, budget, asks_by_name, charter_numbers, now, problems)
-    state["decision_counts"], state["decisions_unattributed"] = counts, nobody
+    counts, nobody, notices = attribute_decisions(ctx, state, budget, asks_by_name, charter_numbers, now, problems)
+    state["decision_counts"], state["decisions_unattributed"], state["pr_notices"] = counts, nobody, notices
     state["reads"] = budget.to_state()
     return problems, rows
 
@@ -660,7 +702,7 @@ def tick(ctx):
             for gone in sorted(history)[:-HISTORY_DAYS]:
                 del history[gone]
         mine = old if isinstance(old, dict) and old.get("day") == day else {"day": day, "hours": {}}
-        mine["hours"][hour] = {k: fig[k] for k in ("open_asks", "active_asks", "waiting_owner", "waiting_cos", "parked", "stalled", "stalled_asks", "moved_1h", "moved_backlog", "charter_moves_1h", "busy", "idle", "messages", "decisions", "oldest_stall_hours")}
+        mine["hours"][hour] = {k: fig[k] for k in ("open_asks", "active_asks", "waiting_owner", "waiting_cos", "waiting_live", "parked", "stalled", "stalled_asks", "moved_1h", "moved_backlog", "charter_moves_1h", "busy", "idle", "messages", "decisions", "oldest_stall_hours")}
         series[name] = mine
         before = episodes.get(name)
         text, episodes[name] = judge(fig, ctx.cfg, before)
@@ -690,11 +732,13 @@ def status_lines(state_dir, now):
     out = ["load        %d orchestrator(s); alert %s" % (len(latest), "on" if state.get("alert") else "off")]
     for name in sorted(latest):
         f = latest[name]
-        out.append("  %-12s asks %s, stalled %s, waiting on owner %s, parked %s, waiting on cos %s, oldest stall %s h, moved 1h %s, charter moves 1h %s; waiting %d msg %s dec; coders %d busy %d idle" % (
-            name, num(f["open_asks"]), num(f["stalled"]), num(f.get("waiting_owner")), num(f.get("parked")), num(f.get("waiting_cos")),
+        out.append("  %-12s asks %s, stalled %s, waiting on owner %s, parked %s, waiting on cos %s, waiting live %s, oldest stall %s h, moved 1h %s, charter moves 1h %s; waiting %d msg %s dec; coders %d busy %d idle" % (
+            name, num(f["open_asks"]), num(f["stalled"]), num(f.get("waiting_owner")), num(f.get("parked")), num(f.get("waiting_cos")), num(f.get("waiting_live")),
             num(f["oldest_stall_hours"]), num(f["moved_1h"]), num(f.get("charter_moves_1h")), f["messages"], num(f["decisions"]), f["busy"], f["idle"]))
     if state.get("decisions_unattributed"):
         out.append("  %d decision(s) not attributed (the parent of their issue could not be read, or no orchestrator's charter is on its chain)" % state["decisions_unattributed"])
+    if state.get("pr_notices"):
+        out.append("  PR notices and holds %d (heads-ups and held pull requests: information, never counted as waiting)" % state["pr_notices"])
     if state.get("unattributed"):
         out.append("  %d movement(s) not attributed (a referenced issue's parent could not be read)" % state["unattributed"])
     if state.get("problems"):
