@@ -106,7 +106,7 @@ test("loadInputs: files are read from the state directory, a stale or oversize f
 
 test("the rows start with a heading, add 2 lines per workspace, and are empty when no workspace has an orchestrator", () => {
   const rows = healthRows(full, NOW, 34)
-  assert.equal(rows.length, 1 + 2 * 6 + 1)
+  assert.equal(rows.length, 1 + 4 + 2 * 6 + 1) // heading, four legend lines, two lines a workspace, a spacer
   assert.equal(text(rows[0].segs).startsWith("Workspaces"), true)
   assert.deepEqual(healthRows({ records: null, load: null, pane: null, decisions: null }, NOW, 34), [])
 })
@@ -150,4 +150,56 @@ test("hottest first is by heat, not by name", () => {
 test("a missing pane file draws the state as not recorded, not dead", () => {
   const blocks = buildBlocks({ ...full, pane: null }, NOW)
   assert.equal(blocks.length, 0) // with no pane file no workspace is known: nothing is drawn, nothing is called dead
+})
+
+// The real shape of the live files: pane-health.json has `agents` and `states`; the records carry `sources`; no tool-rate.json, v2_light on.
+const livePane = { agents: { orch: { role: "orchestrator", workspace: "wA", session: "ses_o", repo: "acme/api", pane: "wA:p2", seen: 1 },
+  cos: { role: "chief-of-staff", workspace: "wV", session: "ses_c", repo: null, pane: "wV:p2", seen: 1 } },
+  states: { orch: { state: "attached", why: "the pane runs opencode", at: 1 }, cos: { state: "attached" } }, missing: {}, at: 1 }
+const liveRecords = { version: 1, written_at: NOW / 1000, tool_calls: {}, usage: {}, pushes: {}, pushes_watched: ["acme/api"],
+  sources: { tool_calls: "missing", usage: "off: v2_light" } }
+const liveLoad = { alert: false, latest: { orch: { open_asks: 1, stalled: 0, busy: 2, idle: 1, decisions: 0, moved_1h: 0 } }, episodes: {}, series: {} }
+const live = { records: liveRecords, load: liveLoad, pane: livePane, decisions: { decisions: [] } }
+
+test("live shape: the state word comes from the load record when no tool calls are recorded", () => {
+  const by = Object.fromEntries(buildBlocks(live, NOW).map((b) => [b.name, b.state]))
+  assert.equal(by.orch, "work") // two coders busy
+  assert.equal(by.cos, "idle") // attached, nothing waiting, no busy coders
+  const idle = buildBlocks({ ...live, load: { ...liveLoad, latest: { orch: { open_asks: 1, busy: 0, idle: 3, moved_1h: 0 } } } }, NOW).find((b) => b.name === "orch")
+  assert.equal(idle.state, "idle")
+})
+
+test("live shape: a missing counter says plugin not installed, v2_light says off, a watched repository reads 0", () => {
+  const rows = healthRows(live, NOW, 34).map((r) => text(r.segs))
+  assert.ok(rows.includes("tool calls: plugin not installed"), rows.join("|"))
+  assert.ok(rows.includes("ctx: off: v2_light"))
+  const orch = buildBlocks(live, NOW).find((b) => b.name === "orch")
+  assert.equal(orch.pushes, 0)
+  const [l1, l2] = blockLines(orch, 120).map(text)
+  assert.match(l1, /no plugin/)
+  assert.match(l2, / p0 ctx off/)
+  assert.equal(l1.includes(NOT_RECORDED) || l2.includes("p " + NOT_RECORDED), false)
+  const unwatched = buildBlocks({ ...live, records: { ...liveRecords, pushes_watched: [] } }, NOW).find((b) => b.name === "orch")
+  assert.equal(unwatched.pushes, null) // no events received: not recorded
+  assert.match(text(blockLines(unwatched, 120)[1]), /p not recorded/)
+})
+
+test("live shape: a stale counter says plugin not running", () => {
+  const rows = healthRows({ ...live, records: { ...liveRecords, sources: { tool_calls: "stale", usage: "on" } } }, NOW, 34).map((r) => text(r.segs))
+  assert.ok(rows.includes("tool calls: plugin not running"))
+})
+
+test("the Chief of Staff has no load row and says so, within the width", () => {
+  const cos = buildBlocks(live, NOW).find((b) => b.name === "cos")
+  const [, l2] = blockLines(cos, 34).map(text)
+  assert.equal(l2, "d0 no load row: not orchestrator")
+  assert.ok(l2.length <= 34)
+})
+
+test("the legend names q s d c p ctx and the state words, one line each within the width", () => {
+  const rows = healthRows(live, NOW, 34).map((r) => text(r.segs))
+  const legend = rows.slice(1, 5)
+  for (const line of legend) assert.ok(line.length <= 34, line)
+  const all = legend.join(" ")
+  for (const word of ["q open", "s stalled", "d decisions", "c busy", "p pushes", "ctx", "work", "idle", "wait", "dead"]) assert.ok(all.includes(word), word)
 })

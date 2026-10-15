@@ -43,10 +43,10 @@ class Base(unittest.TestCase):
         d = self.tmp.name
         self.state = os.path.join(d, "kube.json")
         self.write_state({"pods": {}})
-        self.env = {"FLEET_KUBECTL": os.path.join(HERE, "fake_kubectl"), "FAKE_KUBE_STATE": self.state,
-                    "FLEET_CLOUD_AUDIT": os.path.join(d, "audit.jsonl"), "FLEET_CLOUD_IMAGE": "registry.example.internal/worker:1",
-                    "FLEET_TOKEN_ENDPOINT": "https://tokens.example.internal/mint", "FLEET_CLOUD_DOMAIN": "example.internal",
-                    "FLEET_KUBE_CONTEXT": "acme-fleet", "FAKE_KUBE_CALLS": os.path.join(d, "calls.jsonl")}
+        self.env = {"CW_KUBECTL": os.path.join(HERE, "fake_kubectl"), "FAKE_KUBE_STATE": self.state,
+                    "CW_CLOUD_AUDIT": os.path.join(d, "audit.jsonl"), "CW_CLOUD_IMAGE": "registry.example.internal/worker:1",
+                    "CW_TOKEN_ENDPOINT": "https://tokens.example.internal/mint", "CW_CLOUD_DOMAIN": "example.internal",
+                    "CW_KUBE_CONTEXT": "acme-cw", "FAKE_KUBE_CALLS": os.path.join(d, "calls.jsonl")}
         self.clock = Clock()
 
     def write_state(self, st):
@@ -82,7 +82,7 @@ class Base(unittest.TestCase):
         self.patch_state(activity=act)
 
     def audit_lines(self):
-        with open(self.env["FLEET_CLOUD_AUDIT"]) as f:
+        with open(self.env["CW_CLOUD_AUDIT"]) as f:
             return [json.loads(x) for x in f]
 
 
@@ -90,7 +90,7 @@ class S1Idle(Base):
     def test_idle_worker_stopped_active_kept(self):
         self.create("idle1")
         self.create("busy1")
-        self.patch_state(hook_env={"FLEET_WORKDIR": self.clean_repo(), "FLEET_WORKER": "x"})
+        self.patch_state(hook_env={"CW_WORKDIR": self.clean_repo(), "CW_WORKER": "x"})
         for w in ("idle1", "busy1"):
             self.set_activity(w, False, self.clock())
         self.clock.advance(minutes=9)
@@ -103,7 +103,7 @@ class S1Idle(Base):
 
     def test_mid_task_worker_is_not_idle(self):
         self.create()
-        self.patch_state(hook_env={"FLEET_WORKDIR": self.clean_repo(), "FLEET_WORKER": "x"})
+        self.patch_state(hook_env={"CW_WORKDIR": self.clean_repo(), "CW_WORKER": "x"})
         self.set_activity("coder7", True, T0)  # a long build: busy, however old the last activity
         self.clock.advance(minutes=30)
         self.assertEqual(self.reap_pass(), [])
@@ -112,7 +112,7 @@ class S1Idle(Base):
     def test_inbound_traffic_alone_is_not_activity(self):
         # The reaper reads only the worker's session state, never request counts: a watched-but-idle worker is stopped.
         self.create()
-        self.patch_state(hook_env={"FLEET_WORKDIR": self.clean_repo(), "FLEET_WORKER": "x"})
+        self.patch_state(hook_env={"CW_WORKDIR": self.clean_repo(), "CW_WORKER": "x"})
         self.set_activity("coder7", False, T0)
         self.clock.advance(minutes=12)
         self.assertEqual([r[:2] for r in self.reap_pass()], [("coder7", "idle")])
@@ -157,7 +157,7 @@ def make_repo(base, name, dirty):
 
 class S2Hard(Base):
     def stub_hook(self):
-        self.patch_state(hook_env={"FLEET_WORKDIR": make_repo(self.tmp.name, "r", False)[0], "FLEET_WORKER": "x"})
+        self.patch_state(hook_env={"CW_WORKDIR": make_repo(self.tmp.name, "r", False)[0], "CW_WORKER": "x"})
 
     def reap(self):
         return cw.Launcher(cw.Kube(self.env), self.env, self.clock).reap()
@@ -197,7 +197,7 @@ class S2Hard(Base):
         os.makedirs(rd)
         with open(os.path.join(rd, "coder7.json"), "w") as f:
             json.dump({"hard_deadline": "2026-10-14T12:30:00Z"}, f)
-        self.env["FLEET_CLOUD_RECORD_DIR"] = rd
+        self.env["CW_CLOUD_RECORD_DIR"] = rd
         self.clock.advance(minutes=31)
         self.assertEqual([r[:2] for r in self.reap()], [("coder7", "hard limit")])
 
@@ -220,14 +220,19 @@ class S3NoStoredCredential(Base):
         spec = [o for o in applied if o["kind"] == "Pod"][0]
         self.assertEqual(cw.scan_credentials(spec), [])
         env = {e["name"]: e["value"] for e in spec["spec"]["containers"][0]["env"]}
-        self.assertEqual(env["FLEET_TOKEN_ENDPOINT"], "https://tokens.example.internal/mint")
-        self.assertEqual(sorted(env), sorted(["FLEET_WORKER", "FLEET_REPO", "FLEET_BRANCH", "FLEET_IDLE_SECONDS",
-                                              "FLEET_HARD_DEADLINE", "FLEET_TOKEN_ENDPOINT", "FLEET_AUDIT_RUNTIME_ID"]))
+        self.assertEqual(env["CW_TOKEN_ENDPOINT"], "https://tokens.example.internal/mint")
+        self.assertEqual(sorted(env), sorted(["CW_WORKER", "CW_REPO", "CW_BRANCH", "CW_IDLE_SECONDS",
+                                              "CW_HARD_DEADLINE", "CW_TOKEN_ENDPOINT", "CW_AUDIT_RUNTIME_ID"]))
         # the password is a secret-backed file, 0600, not an environment variable
         vol = [v for v in spec["spec"]["volumes"] if v["name"] == "pw"][0]
         self.assertEqual(vol["secret"]["defaultMode"], 0o600)
-        self.assertEqual(spec["spec"]["containers"][0]["volumeMounts"][0]["mountPath"], "/run/fleet")
+        self.assertEqual(spec["spec"]["containers"][0]["volumeMounts"][0]["mountPath"], "/run/cw")
         self.assertNotIn("password", json.dumps(env).lower())
+
+    def test_audit_actor_is_the_real_caller(self):
+        import pwd
+        self.create("coder7")
+        self.assertEqual({x["actor"] for x in self.audit_lines()}, {pwd.getpwuid(os.getuid()).pw_name})
 
     def test_password_is_never_in_output_or_audit(self):
         r, w = os.pipe()
@@ -243,14 +248,14 @@ class S3NoStoredCredential(Base):
     def test_a_pat_in_the_spec_is_found_and_create_refuses(self):
         spec = {"spec": {"containers": [{"env": [{"name": "GH_TOKEN", "value": "x"}]}]}}
         self.assertEqual(cw.scan_credentials(spec), ["env:GH_TOKEN"])
-        spec = {"spec": {"containers": [{"env": [{"name": "FLEET_REPO", "value": "ghp_" + "a" * 36}]}]}}
+        spec = {"spec": {"containers": [{"env": [{"name": "CW_REPO", "value": "ghp_" + "a" * 36}]}]}}
         self.assertTrue(cw.scan_credentials(spec))
         code, _, err = self.run_cli("create", "coder7", "--repo", "ghp_" + "a" * 36 + "/x", "--branch", "main")
         self.assertEqual(code, 2, err)
         self.assertEqual(self.st().get("applied"), None)
 
     def test_missing_token_endpoint_refused(self):
-        del self.env["FLEET_TOKEN_ENDPOINT"]
+        del self.env["CW_TOKEN_ENDPOINT"]
         code, _, _ = self.run_cli("create", "coder7", "--repo", "a/b", "--branch", "m")
         self.assertEqual(code, 2)
 
@@ -304,7 +309,7 @@ class S3NoStoredCredential(Base):
 
 class S4Audit(Base):
     def test_four_actions_four_lines_and_failures(self):
-        self.patch_state(hook_env={"FLEET_WORKDIR": make_repo(self.tmp.name, "r", False)[0], "FLEET_WORKER": "x"})
+        self.patch_state(hook_env={"CW_WORKDIR": make_repo(self.tmp.name, "r", False)[0], "CW_WORKER": "x"})
         self.create("coder7")
         self.clock.advance(hours=1)
         self.assertEqual(self.run_cli("extend", "coder7", "--hard", "+30m", "--reason", "more time")[0], 0)
@@ -320,10 +325,10 @@ class S4Audit(Base):
         self.assertEqual(lines[0]["cost_estimate_usd"], 0.0)
         self.assertGreater(lines[2]["cost_estimate_usd"], 0)
         self.assertEqual(lines[1]["reason"], "more time")
-        self.assertEqual(oct(os.stat(self.env["FLEET_CLOUD_AUDIT"]).st_mode & 0o777), "0o600")
+        self.assertEqual(oct(os.stat(self.env["CW_CLOUD_AUDIT"]).st_mode & 0o777), "0o600")
 
     def test_failed_actions_write_a_line_with_ok_false(self):
-        before = lambda: len(self.audit_lines()) if os.path.exists(self.env["FLEET_CLOUD_AUDIT"]) else 0
+        before = lambda: len(self.audit_lines()) if os.path.exists(self.env["CW_CLOUD_AUDIT"]) else 0
         self.patch_state(fail_apply=True)
         self.assertEqual(self.run_cli("create", "coder7", "--repo", "a/b", "--branch", "m")[0], 3)
         self.assertEqual(before(), 1)
@@ -340,7 +345,7 @@ class S4Audit(Base):
         self.assertFalse(self.audit_lines()[-1]["ok"])
 
     def test_spend_cap_exit_5(self):
-        self.env["FLEET_CLOUD_SPEND_CAP_USD"] = "0.25"
+        self.env["CW_CLOUD_SPEND_CAP_USD"] = "0.25"
         self.create("coder7")
         self.clock.advance(hours=1)
         self.assertEqual(self.run_cli("create", "coder8", "--repo", "a/b", "--branch", "m")[0], 5)
@@ -369,7 +374,7 @@ class S4Audit(Base):
 class S5EndHook(Base):
     def test_unpushed_work_goes_to_wip_branch_before_delete(self):
         work, origin = make_repo(self.tmp.name, "r", dirty=True)
-        self.patch_state(hook_env={"FLEET_WORKDIR": work, "FLEET_WORKER": "coder7"})
+        self.patch_state(hook_env={"CW_WORKDIR": work, "CW_WORKER": "coder7"})
         self.create("coder7")
         code, out, err = self.run_cli("stop", "coder7", "--reason", "operator")
         self.assertEqual(code, 0, err)
@@ -385,7 +390,7 @@ class S5EndHook(Base):
         # the reaper's two stops run the hook through stop(); a drain notice is the operator's `stop` with a reason
         for reason in ("hard limit", "idle", "node drain"):
             work, origin = make_repo(self.tmp.name, "r-" + reason.replace(" ", ""), dirty=True)
-            self.patch_state(hook_env={"FLEET_WORKDIR": work, "FLEET_WORKER": "coder7"})
+            self.patch_state(hook_env={"CW_WORKDIR": work, "CW_WORKER": "coder7"})
             self.create("coder7")
             code, out, _ = self.run_cli("stop", "coder7", "--reason", reason)
             self.assertEqual(code, 0)
@@ -395,14 +400,14 @@ class S5EndHook(Base):
     def test_push_failure_keeps_the_pod_and_exits_1(self):
         work, origin = make_repo(self.tmp.name, "r", dirty=True)
         subprocess.run(["git", "-C", work, "remote", "set-url", "origin", os.path.join(self.tmp.name, "gone.git")], check=True)
-        self.patch_state(hook_env={"FLEET_WORKDIR": work, "FLEET_WORKER": "coder7"})
+        self.patch_state(hook_env={"CW_WORKDIR": work, "CW_WORKER": "coder7"})
         self.create("coder7")
         code, _, err = self.run_cli("stop", "coder7")
         self.assertEqual(code, 1)
         self.assertIn("pod kept", err)
         self.assertNotIn("kubectl exec", err)  # the hook's own reason reaches the operator
         self.assertIsNotNone(self.pod())
-        self.assertEqual(self.pod()["metadata"]["annotations"]["fleet/kept"], "true")
+        self.assertEqual(self.pod()["metadata"]["annotations"]["cw/kept"], "true")
         self.assertFalse(self.audit_lines()[-1]["ok"])
         # delete is refused until the hook has run, then allowed with --force
         self.assertEqual(self.run_cli("delete", "coder7")[0], 6)
@@ -412,7 +417,7 @@ class S5EndHook(Base):
 
     def test_clean_pushed_tree_pushes_nothing(self):
         work, _ = make_repo(self.tmp.name, "r", dirty=False)
-        self.patch_state(hook_env={"FLEET_WORKDIR": work, "FLEET_WORKER": "coder7"})
+        self.patch_state(hook_env={"CW_WORKDIR": work, "CW_WORKER": "coder7"})
         self.create("coder7")
         code, out, _ = self.run_cli("stop", "coder7")
         self.assertEqual((code, json.loads(out)["pushed"]), (0, False))
@@ -436,7 +441,7 @@ class S5EndHook(Base):
 
     def test_stop_says_which_files_were_not_saved(self):
         work, _ = make_repo(self.tmp.name, "r", dirty=True)
-        self.patch_state(hook_env={"FLEET_WORKDIR": work, "FLEET_WORKER": "coder7"})
+        self.patch_state(hook_env={"CW_WORKDIR": work, "CW_WORKER": "coder7"})
         self.create("coder7")
         code, out, err = self.run_cli("stop", "coder7")
         self.assertEqual((code, json.loads(out)["skipped"]), (0, [".env"]))
@@ -449,7 +454,7 @@ class S5EndHook(Base):
     def test_reaper_keeps_a_pod_whose_push_failed(self):
         work, _ = make_repo(self.tmp.name, "r", dirty=True)
         subprocess.run(["git", "-C", work, "remote", "set-url", "origin", os.path.join(self.tmp.name, "gone.git")], check=True)
-        self.patch_state(hook_env={"FLEET_WORKDIR": work, "FLEET_WORKER": "coder7"})
+        self.patch_state(hook_env={"CW_WORKDIR": work, "CW_WORKER": "coder7"})
         self.create("coder7", "--hard", "1h")
         self.set_activity("coder7", True, T0)
         self.clock.advance(hours=2)
@@ -467,8 +472,8 @@ class S6Context(Base):
             return [json.loads(x) for x in f]
 
     def test_every_call_carries_the_configured_context_and_kubeconfig(self):
-        self.env["FLEET_KUBECONFIG"] = "/home/user/.kube/fleet-config"
-        self.patch_state(hook_env={"FLEET_WORKDIR": make_repo(self.tmp.name, "r", False)[0], "FLEET_WORKER": "x"})
+        self.env["CW_KUBECONFIG"] = "/home/user/.kube/cw-config"
+        self.patch_state(hook_env={"CW_WORKDIR": make_repo(self.tmp.name, "r", False)[0], "CW_WORKER": "x"})
         self.create("coder7")
         self.set_activity("coder7", False, self.clock())
         self.run_cli("status")
@@ -482,25 +487,25 @@ class S6Context(Base):
         verbs = {c[c.index("-n") + 2] for c in calls}
         self.assertTrue({"apply", "get", "annotate", "delete", "exec"} <= verbs, verbs)
         for c in calls:
-            self.assertEqual(c[:4], ["--kubeconfig", "/home/user/.kube/fleet-config", "--context", "acme-fleet"], c)
+            self.assertEqual(c[:4], ["--kubeconfig", "/home/user/.kube/cw-config", "--context", "acme-cw"], c)
 
     def test_context_without_kubeconfig_has_no_kubeconfig_flag(self):
         self.create("coder7")
         for c in self.calls():
-            self.assertEqual(c[:2], ["--context", "acme-fleet"])
+            self.assertEqual(c[:2], ["--context", "acme-cw"])
             self.assertNotIn("--kubeconfig", c)
 
     def test_unset_or_empty_context_refuses_every_command_and_calls_nothing(self):
         for value in (None, "", "  "):
             if value is None:
-                self.env.pop("FLEET_KUBE_CONTEXT")
+                self.env.pop("CW_KUBE_CONTEXT")
             else:
-                self.env["FLEET_KUBE_CONTEXT"] = value
+                self.env["CW_KUBE_CONTEXT"] = value
             for argv in (("create", "coder7", "--repo", "a/b", "--branch", "m"), ("stop", "coder7"), ("extend", "coder7", "--hard", "+1h"),
                          ("delete", "coder7"), ("status",), ("reap",)):
                 code, out, err = self.run_cli(*argv)
                 self.assertEqual(code, 2, argv)
-                self.assertIn("FLEET_KUBE_CONTEXT", err)
+                self.assertIn("CW_KUBE_CONTEXT", err)
         self.assertEqual(self.calls(), [])
 
 
@@ -609,25 +614,25 @@ class S8Cap(Base):
         return self.run_cli("create", "coder7", "--repo", "a/b", "--branch", "m")
 
     def refused(self, value):
-        self.env["FLEET_CLOUD_SPEND_CAP_USD"] = value
+        self.env["CW_CLOUD_SPEND_CAP_USD"] = value
         code, _, err = self.create_code()
         self.assertEqual(code, 5, value)
-        self.assertIn("FLEET_CLOUD_SPEND_CAP_USD", err)
+        self.assertIn("CW_CLOUD_SPEND_CAP_USD", err)
         self.assertEqual(self.st()["pods"], {})
         self.assertEqual(self.st().get("applied", []), [])
 
     def test_unset_and_empty_default_to_25(self):
         for value in (None, "", " "):
             if value is None:
-                self.env.pop("FLEET_CLOUD_SPEND_CAP_USD", None)
+                self.env.pop("CW_CLOUD_SPEND_CAP_USD", None)
             else:
-                self.env["FLEET_CLOUD_SPEND_CAP_USD"] = value
+                self.env["CW_CLOUD_SPEND_CAP_USD"] = value
             self.assertEqual(cw.spend_cap(self.env), 25.0)
         self.assertEqual(self.create_code()[0], 0)  # a normal launch is under 25
         self.run_cli("delete", "coder7", "--force")
 
     def test_unset_cap_refuses_a_launch_estimated_above_25(self):
-        self.env.pop("FLEET_CLOUD_SPEND_CAP_USD", None)
+        self.env.pop("CW_CLOUD_SPEND_CAP_USD", None)
         real = cw.Launcher.estimate
         cw.Launcher.estimate = lambda self_, shape, seconds: 25.01
         self.addCleanup(setattr, cw.Launcher, "estimate", real)
@@ -644,7 +649,7 @@ class S8Cap(Base):
             self.refused(v)
 
     def test_explicit_cap_is_honoured(self):
-        self.env["FLEET_CLOUD_SPEND_CAP_USD"] = "100"
+        self.env["CW_CLOUD_SPEND_CAP_USD"] = "100"
         self.assertEqual(self.create_code()[0], 0)
 
     def test_unreadable_cost_is_refused(self):
@@ -662,7 +667,7 @@ class S8Cap(Base):
     def test_unreadable_running_pod_cost_is_refused(self):
         self.create("coder8")
         pod = self.pod("coder8")
-        pod["metadata"]["annotations"]["fleet/started"] = "garbage"
+        pod["metadata"]["annotations"]["cw/started"] = "garbage"
         self.patch_state(pods={cw.pod_name("coder8"): pod})
         self.assertEqual(self.create_code()[0], 5)
 
@@ -670,8 +675,8 @@ class S8Cap(Base):
 class U1Scope(unittest.TestCase):
     def test_only_new_paths_under_cloud_launcher_and_bin(self):
         root = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=HERE, capture_output=True, text=True).stdout.strip()
-        if not os.environ.get("FLEET_CHECK_SCOPE"):
-            self.skipTest("set FLEET_CHECK_SCOPE=1 to check the PR's scope against origin/main (a review-time check, not a permanent test)")
+        if not os.environ.get("CW_CHECK_SCOPE"):
+            self.skipTest("set CW_CHECK_SCOPE=1 to check the PR's scope against origin/main (a review-time check, not a permanent test)")
         base = subprocess.run(["git", "merge-base", "HEAD", "origin/main"], cwd=root, capture_output=True, text=True)
         if base.returncode != 0:
             self.skipTest("no origin/main to diff against")

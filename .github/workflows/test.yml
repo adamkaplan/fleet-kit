@@ -89,6 +89,12 @@ jobs:
           bin/test-cloud-worker 2>&1 | tee "$RUNNER_TEMP/out.txt"
           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
 
+      - name: bin/test-cloud-neutral-names
+        if: ${{ !cancelled() }}
+        run: |
+          bin/test-cloud-neutral-names 2>&1 | tee "$RUNNER_TEMP/out.txt"
+          grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
+
       - name: node --test plugins/fleet-decisions-tui/health.test.mjs
         if: ${{ !cancelled() }}
         run: node --test plugins/fleet-decisions-tui/health.test.mjs
