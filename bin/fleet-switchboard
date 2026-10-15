@@ -25586,12 +25586,64 @@ class HarnessReplyDelivery(decision_core.AnswerDelivery):
         return "answered %s" % ident
 
 
+_DECISION_REF = re.compile(r"^(?:([A-Za-z0-9_.-]+)/)?([A-Za-z0-9_.-]+)#([0-9]+)$")
+
+
+def _decision_ref(ident):
+    """(owner or None, repo or None, number) for the issue forms a person types for a decision (`OWNER/REPO#N`, `REPO#N`, `#N`, `N`), else None."""
+    text = (ident or "").strip()
+    bare = re.fullmatch(r"#?([0-9]+)", text)
+    if bare:
+        return None, None, int(bare.group(1))
+    got = _DECISION_REF.match(text)
+    if not got:
+        return None
+    return (got.group(1).lower() if got.group(1) else None), got.group(2).lower(), int(got.group(3))
+
+
+def _decisions_for_ref(decisions, owner, repo, number):
+    """The decisions about issue `number` whose repository matches the spelling: the full name when an owner is given, the short name when only a repo
+    is, any when neither."""
+    found = []
+    for decision in decisions:
+        if decision.get("ask") != number:
+            continue
+        full = str(decision.get("repo") or "").lower()
+        short = full.rsplit("/", 1)[-1]
+        if owner and full != "%s/%s" % (owner, repo):
+            continue
+        if not owner and repo and short != repo:
+            continue
+        found.append(decision)
+    return found
+
+
 def decision_by_id(decisions, ident):
+    """The decision an id names. The id the list shows (`fleet-kit#357`, or `#357`) matches exactly, as it always did; the issue forms a person naturally types
+    (`OWNER/REPO#N`, `REPO#N`, `#N`) also find it. A spelling that names more than one decision is refused and lists the candidates, never guessed
+    (DecisionError); None when none matches (see `decision_miss_hint`). Only the spellings are widened: what follows (the tier check, the caller check, the
+    audit) is unchanged."""
     for wanted in (ident, "#" + ident.lstrip("#")):
         for decision in decisions:
             if decision["id"] == wanted:
                 return decision
-    return None
+    ref = _decision_ref(ident)
+    if ref is None:
+        return None
+    found = _decisions_for_ref(decisions, *ref)
+    if len(found) > 1:
+        raise DecisionError("%s names %d decisions: %s. Name one with its owner and repository (OWNER/REPO#%d)" % (
+            ident, len(found), ", ".join(sorted(str(d["id"]) for d in found)), ref[2]))
+    return found[0] if found else None
+
+
+def decision_miss_hint(decisions, ident):
+    """What to add to a "no decision is waiting" error: the ids of the decisions that carry the same number (the right form is one copy away), or ""."""
+    ref = _decision_ref(ident)
+    if ref is None:
+        return ""
+    same = sorted({str(d["id"]) for d in decisions if d.get("ask") == ref[2]})
+    return " (a decision numbered %d is listed as %s)" % (ref[2], ", ".join(same)) if same else ""
 
 
 def refuse_human_tier(engine, decision, action, name, role):
@@ -25954,7 +26006,7 @@ def cmd_decision_supersede(args, engine, decisions, name, runner, role=None):
         try:
             decision = decision_by_id(decisions, ident)
             if decision is None:
-                raise DecisionError("no decision %s is waiting" % ident)
+                raise DecisionError("no decision %s is waiting%s" % (ident, decision_miss_hint(decisions, ident)))
             refuse_human_tier(engine, decision, "supersede", name, role)
             line = supersede_decision(engine, runner, decision, shown, args.note, name)
             print("%s: %s" % (ident, line))
@@ -26035,7 +26087,7 @@ def cmd_decision_write(args, action, runner, now):
             return code
         decision = decision_by_id(decisions, args.id)
         if decision is None:
-            raise DecisionError("no decision %s is waiting (see `%s decisions --tier all`)" % (args.id, PROG))
+            raise DecisionError("no decision %s is waiting%s (see `%s decisions --tier all`)" % (args.id, decision_miss_hint(decisions, args.id), PROG))
         refuse_human_tier(engine, decision, action, name, role)
         if action == "escalate":
             line = escalate_decision(engine, runner, decision, args.reason, name)

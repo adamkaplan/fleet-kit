@@ -1956,6 +1956,8 @@ the one the command just saw.
 | `decisions resolve <id> [--note "one line"]` | Both awaiting labels off the issue (a missing one is not an error). The Chief of Staff answers the worker with `send`, which already resolves a report decision; this removes the labels. A permission request or question is refused: use `answer` | Yes |
 | `decisions answer <id> allow\|deny [--note "..."]` / `decisions answer <id> "<text>"` | Replies to an agent's pending permission request (`allow` is `once`, `deny` is `reject`, `--note` is the reason) or question (the text fills the form's one visible field: a string, a yes or no, or a number; a form of several fields is refused and says so) through v2 | Yes |
 
+**The id of a decision.** A write command (`escalate`, `resolve`, `answer`, `supersede`) takes the id the list shows (`fleet-kit#357`) or any natural form of the issue: `OWNER/REPO#357`, `REPO#357` or `#357`. A form that names more than one decision (the same number in two watched repositories) is refused and lists the candidates; name one with its owner and repository. When nothing matches, the error lists the ids of the decisions that carry the same number, so the right form is one copy away. Only the spelling is widened: the role and tier checks and the audit are as before.
+
 "Judged" means what it means for every shell command: the policy judge reads the
 command before it runs, against the Chief of Staff's orders (below). The skip
 list of PR 11 (a plain `send`, `intent`, ... is the agents' own channel, not

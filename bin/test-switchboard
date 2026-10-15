@@ -49732,6 +49732,56 @@ class TestDecisionsStaleBound(unittest.TestCase):
         self.assertGreaterEqual(len([line for line in lines if "180 s" in line and ("stale" in line or "Staleness" in line or "not updating" in line or "older than" in line)]), 4)
 
 
+class TestDecisionIdForms(WriteWorld):
+    """Ask #463: a decision is found by the natural forms of its id, and a miss names the right one."""
+
+    def setUp(self):
+        super().setUp()
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        self.gh.issue(WEB, 2, "Other repo", labels=["me:awaiting-cos"])
+        for number in (5, 6, 7, 9):
+            self.gh.issue(API, number, "Issue %d" % number, labels=["me:awaiting-cos"])
+        self.as_agent("cos")
+
+    def test_s1_every_natural_spelling_of_the_id_finds_the_one_decision(self):
+        for number, spelling in ((5, "acme/api#5"), (6, "api#6"), (7, "#7")):
+            with self.subTest(spelling=spelling):
+                code, out, err = self.main("decisions", "escalate", spelling)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.gh.names(API, number), ["me:awaiting-user"], "the one the spelling names, and only it")
+        self.assertEqual(self.gh.names(API, 9), ["me:awaiting-cos"])
+
+    def test_s2_a_miss_lists_the_ids_that_carry_the_same_number(self):
+        code, out, err = self.main("decisions", "resolve", "widget-api#9")
+        self.assertEqual(code, 2)
+        self.assertEqual((err + out).count("api#9"), 2, "once as the name that missed, once as the id it should have been: %s" % (err + out))
+        self.assertIn("a decision numbered 9 is listed as api#9", err + out)
+
+    def test_s3_a_number_in_two_repositories_is_refused_and_both_are_listed(self):
+        before = (self.gh.names(API, 2), self.gh.names(WEB, 2))
+        code, out, err = self.main("decisions", "escalate", "#2")
+        self.assertEqual(code, 2)
+        self.assertIn("api#2", err)
+        self.assertIn("web#2", err)
+        self.assertEqual((self.gh.names(API, 2), self.gh.names(WEB, 2)), before, "nothing was escalated")
+
+    def test_s4_the_owner_and_repository_form_picks_one_of_two(self):
+        code, out, err = self.main("decisions", "escalate", "acme/web#2")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.gh.names(WEB, 2), ["me:awaiting-user"])
+        self.assertEqual(self.gh.names(API, 2), ["me:awaiting-cos"], "the other is unchanged")
+
+    def test_the_listed_id_still_works_and_the_role_check_is_unchanged_for_the_new_spellings(self):
+        self.assertEqual(self.id_of("Which database?"), "api#2")
+        self.assertEqual(self.main("decisions", "escalate", "api#2")[0], 0)
+        self.assertEqual(self.gh.names(API, 2), ["me:awaiting-user"])
+        self.as_agent("api-orch")
+        code, out, err = self.main("decisions", "escalate", "acme/api#5")
+        self.assertEqual(code, 2)
+        self.assertIn("only the Chief of Staff", err)
+        self.assertEqual(self.gh.names(API, 5), ["me:awaiting-cos"])
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.
