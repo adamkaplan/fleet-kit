@@ -15829,7 +15829,7 @@ class TestGitStashGuard(Base):
         other = self.home / "elsewhere"
         other.mkdir()
         for globals_ in (["-C", str(self.repo)], ["-c", "user.name=x"], ["--no-pager"], ["-p"], ["-P"], ["--git-dir", str(self.repo / ".git")], ["--git-dir=%s" % (self.repo / ".git")],
-                         ["--work-tree", str(self.repo)], ["-C", str(self.repo), "-c", "a.b=c", "--no-pager", "--bare"][:5], ["--exec-path=/nonexistent"], ["--namespace", "n"],
+                         ["--work-tree", str(self.repo)], ["-C", str(self.repo), "-c", "a.b=c", "--no-pager"], ["--bare"], ["--exec-path=/nonexistent"], ["--namespace", "n"],
                          ["--config-env", "a.b=HOME"], ["--config-env=a.b=HOME"], ["--literal-pathspecs"], ["--no-replace-objects"]):
             with self.subTest(globals=globals_):
                 done = self.run_shim(*globals_, "stash", "push", cwd=other if "-C" in globals_ else None)
@@ -15924,7 +15924,7 @@ class TestGitStashGuard(Base):
         self.run_real("config", "alias.st", "status -s")
         for args in (("stash", "list"), ("stash", "show"), ("stash", "show", "-p"), ("stash", "show", "stash@{0}"), ("stash", "list", "--oneline"), ("stash", "-h"),
                      ("status",), ("log", "--oneline"), ("diff",), ("st",), ("-C", str(self.repo), "stash", "list"), ("-c", "x.y=z", "stash", "show"), ("--no-pager", "stash", "list"),
-                     ("branch", "--list"), ("stash",)[:0] or ("rev-parse", "HEAD"), ("--version",), ("config", "alias.st")):
+                     ("branch", "--list"), ("rev-parse", "HEAD"), ("--version",), ("config", "alias.st")):
             with self.subTest(args=args):
                 a, b = self.run_shim(*args), self.run_real(*args)
                 self.assertEqual((a.returncode, a.stdout, a.stderr), (b.returncode, b.stdout, b.stderr))

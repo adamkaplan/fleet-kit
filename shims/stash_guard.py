@@ -10,7 +10,7 @@ What is resolved before the verb is judged, because git itself resolves it:
 - global options (`-C dir`, `-c k=v`, `--git-dir x`, `--no-pager`, ...) are skipped;
 - an ALIAS, from `-c alias.x=...`, `--config-env`, the environment (`GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`) or any config file, is looked up by asking
   the real git (`config --get-all alias.<verb>`, same global options), and followed, with a depth limit and loop detection that refuse. A shell alias (`!...`)
-  that names stash is refused; one that runs `git ...` reaches this shim again through PATH;
+  that names stash is refused; one that runs `git ...` reaches this shim again through PATH only when git's exec path holds no `git` of its own (git puts that directory first on PATH for shell aliases), so an obfuscated shell alias can get past;
 - a verb git does not know, when `help.autocorrect` would run a near miss, is refused (it could become `stash`); a verb git does not know, when the caller moved
   the exec path (`GIT_EXEC_PATH`, `--exec-path=`), is refused (a `git-<verb>` there could be anything).
 A lookup the real git cannot answer cleanly (it times out or cannot start) refuses; a lookup that exits with an error other than "not set" is taken as no alias
@@ -161,6 +161,6 @@ def refusal(args, git):
         return judge(list(args), git)
     except Unsure:
         verb_at, _, _ = parse(list(args))
-        return UNSURE % (args[verb_at] if verb_at is not None else "?")
+        return UNSURE % re.sub(r"[^\x20-\x7e]", "?", args[verb_at] if verb_at is not None else "?")
     except Exception:
         return MESSAGE if any("stash" in a.lower() for a in args) else None
