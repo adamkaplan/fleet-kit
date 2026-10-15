@@ -100,7 +100,10 @@ def load_holds():
     """("none", {}) when no hold is configured (no file, no key, empty), ("bad", {}) when the file or the key cannot be read, else ("ok", {repo: entry})."""
     try:
         with open(config_path()) as handle:
-            raw = json.load(handle)
+            text = handle.read(MAX_FILE * 4 + 1)
+        if len(text) > MAX_FILE * 4:
+            return "bad", {}
+        raw = json.loads(text)
     except FileNotFoundError:
         return "none", {}
     except (OSError, ValueError):
@@ -554,7 +557,7 @@ def read_file_limited(path):
         return None
 
 
-def graphql_check(args, endpoints, fields, inp):
+def graphql_check(args, fields):
     """Refusal text when a graphql call may carry one of the guarded mutations (a mutation names a node id, not a repository, so it cannot be tied to a
     labelled pull request: refused while any hold is configured), else None. Reads the query from the call itself; an unreadable one is refused."""
     texts, unknown = [], False
@@ -649,7 +652,7 @@ def check_api(args, ctx, holds):
         return Result()
     for ep in endpoints:
         if (clean_endpoint(ep) or [""])[0].lower() == "graphql":
-            found = graphql_check(args, endpoints, fields, inp)
+            found = graphql_check(args, fields)
             if found == "unreadable":
                 return Result("gh: a graphql query that cannot be read cannot be checked against a hold label: refused (pass the query inline with -f query=...)")
             if found:
@@ -770,7 +773,6 @@ def write_audit(args, name, outcome, repo=None, number=None):
             os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state"), "fleet-switchboard")
         if not os.path.isdir(state):
             return False
-        words, endpoints, method = [], [], None
         words = command_words(args)
         if words[:1] == ["api"]:
             words = ["api"]

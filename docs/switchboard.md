@@ -2424,6 +2424,10 @@ which pull request it touches, so that nobody mistakes it for a boundary (GitHub
   `pulls/N/requested_reviewers`, comments, `branches/.../protection`, and anything addressed by `repositories/ID` for a path outside the guarded shapes.
 - A `gh api graphql` query (no mutation) (a query file larger than 256 KiB is refused, not half read); a `gh` extension (neither a built-in nor an alias); a repository addressed by a name it had before a rename or transfer (matched by name, not canonical identity).
 - A shell or alias that runs the real `gh` by its absolute path, or `git push` of a branch (the `git` shim routes credentials, it does not read holds).
+- A caller that redirects the shim's own inputs: `XDG_CONFIG_HOME` or `HOME` (the config it reads), `FLEET_SWITCHBOARD_STATE` and `XDG_STATE_HOME` (where the audit goes),
+  `FLEET_REAL_GH`, `PATH`, and `FLEET_SHIM_HOLD_SECONDS`. Every shim setting is read from the caller's environment, as the account binding already is: the hold is a
+  guardrail for honest agents, never a boundary against a hostile one. Also the window between the label read and the real command (a label or a branch retarget in
+  between is not bound).
 - The existing review check (`--over-review`) and the plan gates are separate mechanisms, still fail-open as documented, and run after the hold.
 The policy judge never reads the
 pane variable: it judges the plugin's own `sessionID`, and `plugins/fleet-hooks` does the same. `status` lists the agent each live

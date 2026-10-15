@@ -350,6 +350,22 @@ class TestAudit(Base):
         self.run_gh("api", "-X", "PUT", "repos/acme-org/other-repo/pulls/12/merge")
         self.assertEqual([(r["verb"], r["repo"], r["number"]) for r in self.audit()], [("api PUT", "acme-org/other-repo", 12)])
 
+    def test_the_log_is_rotated_at_one_mebibyte(self):
+        self.audit_dir.mkdir(exist_ok=True)
+        (self.audit_dir / "gh-writes.jsonl").write_text("x" * 1048576)
+        self.passed("pr", "comment", "3", "-R", "acme-org/other-repo", "-b", "hi")
+        self.assertEqual(len((self.audit_dir / "gh-writes.jsonl.1").read_text()), 1048576)
+        self.assertEqual(len(self.audit()), 1)
+
+    def test_skips_and_other_refusals(self):
+        self.passed("pr", "comment", "3", "-R", "acme-org/other-repo", "-b", "hi", env={"FLEET_SWITCHBOARD_OWN_GH": "1"})
+        self.assertEqual(self.audit(), [])                                                     # the switchboard's own call is not audited
+        self.run_gh("auth", "git-credential", "get")
+        self.assertEqual(self.audit(), [])                                                     # nor a git credential call
+        self.config({"acme-org/widget-api": {"label": LABEL, "message": MESSAGE}})
+        self.refused("pr", "merge", "7", "--surprise-flag", "x", "-R", CFG_REPO)               # a refusal other than the label one
+        self.assertEqual([r["outcome"] for r in self.audit()], ["refused"])
+
     def test_s12_no_command_line_value_is_audited_and_an_unwritable_audit_changes_nothing(self):
         token, text = "ghp_" + "a1b2c3d4e5f6" * 3, "free text that must stay out"
         self.run_gh("api", "-X", "POST", "repos/acme-org/other-repo/issues/3/comments", "-f", "body=%s %s" % (token, text), "-H", "Authorization: token " + token,
