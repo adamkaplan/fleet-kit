@@ -15174,6 +15174,14 @@ def cmd_launch(args, runner, now, socket_call=None):
     if (args.name or "").startswith(LANE_NAME_PREFIX):
         raise LaunchError("names starting %r are the plan review engine's reviewer lanes: only it launches them" % LANE_NAME_PREFIX)
     repo = launch_repo(args)
+    if not repo and not args.charter:   # #473: no --repo, no issue repo, no charter: the worker would have no repository of its own (and so no account)
+        repo, why = origin_repository(runner, args.dir)
+        if repo:
+            sys.stderr.write("%s: repository: %s (from origin)\n" % (PROG, repo))
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "launch.repo_from_origin", args.name, {"repo": repo})
+        else:
+            sys.stderr.write("%s: no repository recorded (%s): pushes will be refused; pass --repo\n" % (PROG, why))
     problem = launch_agent_problem(engine.config, runner, args.agent)
     if problem:
         raise LaunchError(problem)
@@ -15307,6 +15315,37 @@ def launch_repo(args):
     if named and qualified and named != qualified:
         raise LaunchError("--repo %s and --issue %s#%d name different repos" % (named, qualified, args.issue))
     return named or qualified
+
+
+_ORIGIN_NAME = r"([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]{1,100}?)(?:\.git)?"
+ORIGIN_HTTPS_RE = re.compile(r"https://github\.com/" + _ORIGIN_NAME)
+ORIGIN_SSH_RE = re.compile(r"git@github\.com:" + _ORIGIN_NAME)
+
+
+def origin_repository(runner, directory):
+    """(`owner/name`, None) for the repository the `origin` remote of `directory` names, else (None, why). Read ONCE, by the launcher, never by a shim or
+    at call time (a worker controls its own remote settings): `git config --local --no-includes --get-all remote.origin.url` as an argv, no shell, no network, nothing
+    but the repository's own config. Only `https://github.com/OWNER/NAME[.git]` and `git@github.com:OWNER/NAME[.git]` are accepted, exactly one `origin`
+    url: another host, a path, a `file:` or `ssh://` url, a url with a user or a token in it, an alias, a trailing path or no origin at all gives no
+    repository. The result is lower case. `why` is a fixed phrase: the url itself is NEVER returned, printed or logged."""
+    if not isinstance(directory, str) or not os.path.isabs(directory) or not os.path.isdir(directory):
+        return None, "the working directory is not an existing absolute path"
+    clean = {k: v for k, v in os.environ.items() if not (k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_CEILING_DIRECTORIES") or k.startswith("GIT_CONFIG"))}
+    try:   # the launcher's own environment must not point git at another repository or config: scrubbed
+        done = subprocess.run(["git", "-C", directory, "config", "--local", "--no-includes", "--get-all", "remote.origin.url"], capture_output=True, text=True,
+                              timeout=WORKTREE_GIT_SECONDS, stdin=subprocess.DEVNULL, env=clean)
+    except (OSError, subprocess.SubprocessError):
+        return None, "git could not be run there"
+    urls = [line for line in (done.stdout or "").splitlines() if line.strip()]
+    if done.returncode != 0 or not urls:
+        return None, "the directory has no origin remote"
+    if len(urls) != 1:
+        return None, "origin names more than one url"
+    found = ORIGIN_HTTPS_RE.fullmatch(urls[0]) or ORIGIN_SSH_RE.fullmatch(urls[0])
+    if not found or found.group(2) in (".", "..") or found.group(2).lower().endswith(".git"):
+        return None, "origin is not a plain github.com repository url"
+    repo = ("%s/%s" % found.groups()).lower()
+    return (repo, None) if REPO_RE.match(repo) else (None, "origin is not a plain github.com repository url")
 
 
 def check_charter_workspace(engine, runner, now, charter, repo, label):
