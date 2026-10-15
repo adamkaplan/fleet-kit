@@ -11413,7 +11413,7 @@ class TestChatClearOffers(unittest.TestCase):
         later = {"id": "m6", "payload": {"text": "389 also good to go"}, "t": 999}
         got = self.cc.person_messages([later, agent, agent_inbox, old, seen_one, noid, person, "junk", None], {"m5"}, 1000, created)
         self.assertEqual(got, [{"id": "m1", "text": "366 is good to go"}, {"id": "m6", "text": "389 also good to go"}],
-                         "3 of 3 agent-written or unusable messages are skipped; the person's two come oldest first")
+                         "the 7 agent-written, old, seen, id-less or junk inputs are skipped; the person's two come oldest first")
 
     def test_an_agents_message_is_never_the_persons_whatever_shape_its_metadata_takes(self):
         created = lambda m: 990
@@ -11428,10 +11428,10 @@ class TestChatClearOffers(unittest.TestCase):
         self.assertEqual([m["id"] for m in self.cc.person_messages(person, set(), 1000, created)], ["p1", "p2", "p3"])
 
     def test_the_age_the_future_the_cap_and_the_text_length_of_messages(self):
-        times = {"edge": 100, "over": 99, "ahead": 1060, "farahead": 1061, "none": None}
+        times = {"edge": 100, "over": 99, "ahead": 1060, "farahead": 1061, "none": None, "str": "100", "nan": float("nan"), "bool": True}
         created = lambda m: times.get(m["id"], 1000)
         ids = lambda prompts: [m["id"] for m in self.cc.person_messages(prompts, set(), 1000, created, max_age=900)]
-        self.assertEqual(ids([{"id": k, "text": "x"} for k in times]), ["edge", "ahead"], "exactly max_age old is read, one second older and a time too far ahead are not, no time is not")
+        self.assertEqual(ids([{"id": k, "text": "x"} for k in times]), ["edge", "ahead"], "exactly max_age old is read, one second older and a time too far ahead are not, no time or a non-number is not")
         long = {"id": "long", "content": [{"text": "a" * 5000}, {"text": "b"}, {"x": 1}]}
         self.assertEqual(len(self.cc.person_messages([long], set(), 1000, created)[0]["text"]), self.cc.TEXT_MAX)
         many = [{"id": "m%d" % n, "text": "x"} for n in range(80)]
@@ -11493,6 +11493,23 @@ class TestChatClearOffers(unittest.TestCase):
             os.replace = real
         self.assertEqual(sorted(p.name for p in Path(self.state).iterdir() if p.name.startswith("chat-clear-offers.json.")), [])
         self.assertIn("acme/widget#366", self.cc.read_offers(self.state))
+
+    def test_a_hold_that_gains_another_hold_label_loses_its_offer_and_a_malformed_hold_is_skipped(self):
+        self.offers(366)
+        got = self.cc.refresh_offers(self.state, [self.hold(366, ["u:hold-impact", "u:hold-security"]), {"pr": None, "head": "a", "labels": ["u:hold-impact"]},
+                                                  {"pr": "acme/widget#5", "head": 7, "labels": ["u:hold-impact"]}, {"head": "a"}], self.NAMES, 1010)
+        self.assertEqual((got["offers"], got["dropped"]), ({}, ["acme/widget#366"]))
+        path = Path(self.state) / "chat-clear-offers.json"
+        for body in (" " * (self.cc.OFFERS_MAX_BYTES + 1), json.dumps([1]), json.dumps({"offers": 5})):
+            path.write_text(body)
+            got = self.cc.refresh_offers(self.state, [], self.NAMES, 1011)
+            self.assertTrue(got["problem"] and got["quarantined"], body[:10])
+            self.assertFalse(path.exists(), "the unusable file was set aside, not rewritten in place")
+
+    def test_a_non_ascii_summary_is_kept_whole(self):
+        got = self.cc.refresh_offers(self.state, [self.hold(1, ["u:hold-impact"], summary="caf\u00e9 \u2014 gate")], self.NAMES, 1)
+        self.assertEqual(got["offers"]["acme/widget#1"]["summary"], "caf\u00e9 \u2014 gate")
+        self.assertEqual(self.cc.read_offers(self.state)["acme/widget#1"]["summary"], "caf\u00e9 \u2014 gate")
 
     def test_numbers_are_read_whole_and_not_out_of_words_decimals_or_paths(self):
         n = self.cc.numbers_in

@@ -2,7 +2,9 @@
 
 This slice decides nothing and changes nothing on GitHub. It holds the three things the later slices stand on:
 
-* the OFFERS: every open PR held for the owner, each at the head the owner was last shown. A hold is "owner-tier" when the PR carries the
+* the OFFERS: every open PR held for the owner, each at the head the owner was last shown. `refresh_offers` IS the showing: the later hook calls it with the
+  heads of the same read that builds the owner's Decisions list, so a head recorded there is a head he can see; after a lost file nothing recorded is
+  `shown` until `show()` has put it in front of him. A hold is "owner-tier" when the PR carries the
   impact, credential or policy hold label or the captain marker label, however it was applied. A PR that also carries any OTHER hold label
   (security, contract, prod-config, other-area) is never offered: clearing it would lift only part of what holds it;
 * the PERSON'S messages: a user message in the Chief of Staff's session WITHOUT fleet metadata, never one an agent wrote, new since the last
@@ -130,11 +132,16 @@ def write_offers(state_dir, offers):
     fd, tmp = tempfile.mkstemp(prefix=OFFERS_FILE + ".", dir=str(directory))
     try:
         with os.fdopen(fd, "w") as handle:
-            json.dump({"offers": offers}, handle, sort_keys=True)
+            json.dump({"offers": offers}, handle, sort_keys=True, ensure_ascii=False)
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(tmp, 0o600)
         os.replace(tmp, str(directory / OFFERS_FILE))
+        dir_fd = os.open(str(directory), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)   # the rename itself survives a crash
+        finally:
+            os.close(dir_fd)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -252,7 +259,9 @@ def person_messages(prompts, seen, now, created_of, max_age=MESSAGE_MAX_AGE):
             continue
         message_id = message.get("id")
         created = created_of(message)
-        if not isinstance(message_id, str) or message_id in seen or created is None or now - created > max_age or created - now > MESSAGE_SKEW:
+        if isinstance(created, bool) or not isinstance(created, (int, float)) or created != created:
+            continue   # no readable time, or not a number: skipped, never an error
+        if not isinstance(message_id, str) or message_id in seen or now - created > max_age or created - now > MESSAGE_SKEW:
             continue
         out.append((created, {"id": message_id, "text": _text(message)[:TEXT_MAX]}))
     return [item for _, item in sorted(out, key=lambda row: row[0])]
@@ -296,5 +305,5 @@ def screen(text, offers):
 def head_matches(offer, current_head):
     """True only when the head the owner was shown is the PR's head now. A push after the offer clears nothing, and neither does an offer
     that was recorded after the offers were lost and has not been shown (`shown: false`)."""
-    return isinstance(offer, dict) and offer.get("shown", True) is True and isinstance(current_head, str) and bool(current_head) \
+    return isinstance(offer, dict) and offer.get("shown") is True and isinstance(current_head, str) and bool(current_head) \
         and offer.get("head") == current_head
