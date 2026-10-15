@@ -13302,7 +13302,8 @@ class TestClearNotice(Base):
         (event,) = self.events("gate.clear_notify_failed")
         self.assertIn("notice not sent: timed out", event["detail"]["error"])
         release.set()
-        time.sleep(0.4)
+        for late in [t for t in threading.enumerate() if t.name == "clear-notice"]:
+            late.join(5)   # the late thread has finished: whatever it would have audited is already there
         self.assertEqual(len(self.events("gate.clear_notify_failed")), 1, "the late thread audits nothing more")
         self.assertEqual(self.events("gate.clear_notified"), [])
 
