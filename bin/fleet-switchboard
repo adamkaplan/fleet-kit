@@ -4037,7 +4037,6 @@ class Switchboard:
                 self._discover_headless(found, now)   # a worker with no terminal does not depend on herdr
                 return found
         found.entries = [entry for entry in entries if isinstance(entry, dict)]
-        self._discover_headless(found, now)
         for entry in sorted(found.entries, key=lambda e: self.reads.stale_first(agent_session(e) or "")):   # the stalest first: the read budget is shared out in turn
             try:
                 observation = self._observe_entry(entry, now)
@@ -4047,10 +4046,8 @@ class Switchboard:
                 found.problems.append("v2 unreachable: %s" % err)
                 continue
             if observation is not None:
-                held = found.agents.get(observation.name)
-                if held is not None and held.headless and held.session_id == observation.session_id:
-                    del found.agents[observation.name]   # a terminal now runs the session (`watch`): herdr's picture of it wins
                 found.add(observation)
+        self._discover_headless(found, now)   # AFTER the terminals: a terminal that runs the same session wins (`watch`), and another session claiming a terminal agent's name is a conflict (held)
         return found
 
     def _discover_headless(self, found, now):
@@ -4062,7 +4059,8 @@ class Switchboard:
         try:
             ap = load_agent_presence()
             records = ap.list_records(self.state_dir)
-        except Exception:
+        except Exception as err:   # never silent: headless workers would vanish from discovery without a word
+            found.problems.append("headless workers could not be read: %s" % _one_line(str(err), 100))
             return
         if not records:
             return

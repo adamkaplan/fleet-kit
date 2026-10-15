@@ -6,7 +6,7 @@ was measured in a spike (a throwaway profile on the live version, never on the l
 * the session id is in `session.active` (an entry `{"type": "running"}`): the worker is working;
 * it is in `session.active` AND `session.permission.list` or `session.form.list` is not empty: it is BLOCKED. `session.active` still says `running`
   while a worker waits for an answer, so blocked is derived, never read from `active` alone;
-* it is not in `session.active`: it is idle (its newest message is an `idle` one, or it has none yet);
+* it is not in `session.active`: it is idle (a prompt queued a moment before the service starts its turn is seen as idle until the next read);
 * the service does not answer: UNKNOWN. Never dead, never working: silence is not a state.
 
 This module reads nothing itself except through the client it is given, writes only its own records, and holds no password (the shared-password
@@ -24,7 +24,7 @@ WORKING, BLOCKED, IDLE, UNKNOWN = "working", "blocked", "idle", "unknown"
 STATES = (WORKING, BLOCKED, IDLE, UNKNOWN)
 RECORD_DIR = "headless"          # state-dir/headless/<name>.json, one private record per headless worker
 RECORD_MAX = 8192
-LOCAL = "local"                  # the record kind of a worker on this machine (the cloud lane's records say `cloud`)
+LOCAL = "local"                  # the record kind of a worker on this machine. The record is LOCAL-ONLY: the shared part with the cloud lane is the state rule; a shared record would need docs/cloud-worker-interface.md section 3 amended first
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 LOOPBACK_URL_RE = re.compile(r"^http://(127\.0\.0\.1|\[::1\]):[0-9]{1,5}$")
 
@@ -33,16 +33,13 @@ def state_of(active_entry, permissions, forms, last_message, reachable):
     """`working`, `blocked`, `idle` or `unknown` for one session, exactly per the rule above.
 
     `active_entry` is the session's entry in `session.active` (or None when it is not there), `permissions` and `forms` the lists the service gave
-    (None or empty for none), `last_message` the session's newest message (a dict with a `type`) or None, `reachable` False when the service did not
-    answer. A turn that is queued but has not started (the newest message is a user message) is working, not idle: something is about to run."""
+    (None or empty for none), `last_message` the session's newest message (kept for a later refinement: it does not change the state today) and
+    `reachable` False when the service did not answer."""
     if not reachable:
         return UNKNOWN
     if active_entry:
         return BLOCKED if (permissions or forms) else WORKING
-    kind = last_message.get("type") if isinstance(last_message, dict) else None
-    if kind in (None, "idle"):
-        return IDLE
-    return WORKING if kind == "user" else IDLE
+    return IDLE
 
 
 def read_state(v2, session_id, active=None, last_message=None):
@@ -87,8 +84,8 @@ def record_path(state, name):
 
 
 def save_record(state, name, session, url, now=None):
-    """Write the record of a headless worker (atomic, 0600): the cloud lane's field names, `kind` local. The url is where the service was when it was
-    launched (informational for a local worker: discovery asks the live service file)."""
+    """Write the record of a headless worker (atomic, 0600): `worker`, `url`, `session`, `kind` local, `created`. The url is where the service was when
+    it was launched: informational only, NEVER used to send a request (discovery goes through the switchboard's own service client)."""
     if not isinstance(session, str) or not session.startswith("ses_") or len(session) > 128:
         raise ValueError("not a session id")
     if not isinstance(url, str) or not LOOPBACK_URL_RE.match(url):
