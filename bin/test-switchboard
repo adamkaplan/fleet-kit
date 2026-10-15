@@ -53075,7 +53075,7 @@ class TestLoadAlert(Base):
         self.assertEqual(render("orch-a").replace("orch-a", "N"), render("orch-b").replace("orch-b", "N"))
 
     def test_the_coder_count_leaves_out_retired_and_finished_coders(self):
-        """#549: fleet-cloud read c0/6 with six coders on its books and none busy: only live coders are counted."""
+        """#549: a workspace read c0/6 with six coders on its books and none busy: only live coders are counted."""
         (self.state_dir / "retired.json").write_text(json.dumps({"c-retired": {"at": self.T0, "session": "s"}}))
         (self.state_dir / "last-reports.json").write_text(json.dumps({"c-done": {"state": "done", "at": self.T0}, "c-failed": {"state": "failed", "at": self.T0}}))
         engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.T0, audit=None, actor="daemon", intents=None,

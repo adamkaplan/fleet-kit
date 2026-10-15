@@ -205,9 +205,13 @@ test("the Chief of Staff row carries its state word and the decisions waiting on
 
 test("steps stand in for tool calls: a workspace the counter does not cover shows the step series, else says restart for counter", () => {
   const withCounter = { ...liveRecords, sources: { tool_calls: "ok", usage: "events" }, tool_calls: { ses_other: { per_minute: new Array(15).fill(1), approx: true } } }
-  const bare = buildBlocks({ ...live, records: withCounter }, NOW).find((b) => b.name === "orch")
-  assert.equal(bare.spark, null) // the counter runs, but this session predates it: not a flat line
-  assert.match(text(blockLines(bare, 120)[0]), /restart for counter/)
+  const quiet = { ...live, records: withCounter, load: { ...liveLoad, latest: { orch: { busy: 0, idle: 3, moved_1h: 0 } } } }
+  const bare = buildBlocks(quiet, NOW).find((b) => b.name === "orch")
+  assert.equal(bare.spark, null) // the counter runs, but has no row: not a flat line
+  assert.match(text(blockLines(bare, 120)[0]), /no calls in 15 min/) // a quiet workspace (its row was pruned) is not told to restart
+  assert.doesNotMatch(text(blockLines(bare, 120)[0]), /restart/)
+  const working = { ...live, records: withCounter, load: { ...liveLoad, latest: { orch: { busy: 2, idle: 0 } } } }
+  assert.match(text(blockLines(buildBlocks(working, NOW).find((b) => b.name === "orch"), 120)[0]), /restart for counter/) // working by another source, no counter row, no step
   const steps = { ...withCounter, steps: { ses_o: { per_minute: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 0, 4], approx: true } } }
   const got = buildBlocks({ ...live, records: steps }, NOW).find((b) => b.name === "orch")
   assert.equal(got.sparkKind, "steps")

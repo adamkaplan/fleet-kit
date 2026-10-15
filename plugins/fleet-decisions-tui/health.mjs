@@ -93,9 +93,11 @@ export function stepSeries(records, sessions) {
 // Why a tool-call series is missing, from the `sources` the recorder writes: the counter file the plugin leaves is absent (the plugin is not
 // installed in the agents' profile), stale (not running), or present without this workspace. null when nothing is known.
 // A counter that is fresh but has no row for this workspace's sessions says they started before it was installed: "restart for counter".
-export function toolWhy(records) {
+// The counter prunes a session's row when it has no call in its window, so a fresh counter with no row is an idle session, not an old one: "restart for counter"
+// only when another source (a busy coder in the load record) shows the workspace working and no step was seen either; else "no calls in 15 min".
+export function toolWhy(records, activeElsewhere = false) {
   const src = obj(obj(records).sources).tool_calls
-  return src === "missing" ? "plugin not installed" : src === "stale" ? "plugin not running" : src === "ok" ? "restart for counter" : null
+  return src === "missing" ? "plugin not installed" : src === "stale" ? "plugin not running" : src === "ok" ? (activeElsewhere ? "restart for counter" : "no calls in 15 min") : null
 }
 
 // Why a workspace has no context figure when the usage source is on: its session has not ended a step since the daemon started (the records are memory), else null.
@@ -207,7 +209,7 @@ export function buildBlocks(inputs, now) {
     const context = isNum(ctx.percent) ? { percent: ctx.percent } : isNum(ctx[CONTEXT_USED]) ? { used: ctx[CONTEXT_USED] } : null
     blocks.push({
       key: ws, name: lead.name, state, alert, spark: series, sparkKind: seriesKind, bars: movedBars(load, lead.name, now), open, stalled,
-      decisions: isCos ? ownerWaiting : isNum(fig.decisions) ? fig.decisions : waiting, busy, total: busy !== null && idle !== null ? busy + idle : null, pushes, context, cos: isCos, toolWhy: series ? null : toolWhy(inputs.records), ctxOff: usageOff(inputs.records), ctxWhy: context || usageRow.hours ? null : ctxWhy(inputs.records),
+      decisions: isCos ? ownerWaiting : isNum(fig.decisions) ? fig.decisions : waiting, busy, total: busy !== null && idle !== null ? busy + idle : null, pushes, context, cos: isCos, toolWhy: series ? null : toolWhy(inputs.records, (figBusy ?? 0) > 0), ctxOff: usageOff(inputs.records), ctxWhy: context || usageRow.hours ? null : ctxWhy(inputs.records),
       heat: (alert ? 1000 : 0) + (stalled ?? 0) * 10 + (open ?? 0) + (series ? series.reduce((a, b) => a + b, 0) / 10 : 0),
     })
   }
@@ -223,7 +225,7 @@ export function blockLines(b, width) {
   const name = clean(b.name, NAME_WIDTH).padEnd(NAME_WIDTH)
   const first = [
     [dot, color], [b.alert ? "!" : " ", "e+b"], [" ", ""], [name, "b"], [" ", ""], [(b.state ?? "?").padEnd(4), color], [" ", ""],
-    b.spark ? [sparkline(b.spark) + (b.sparkKind === "steps" ? "≈steps" : "≈"), ""] : b.toolWhy ? [b.toolWhy === "plugin not installed" ? "no plugin" : b.toolWhy === "restart for counter" ? b.toolWhy : "plugin off", "m"] : [NOT_RECORDED, "m"],
+    b.spark ? [sparkline(b.spark) + (b.sparkKind === "steps" ? "≈steps" : "≈"), ""] : b.toolWhy ? [b.toolWhy === "plugin not installed" ? "no plugin" : b.toolWhy === "restart for counter" || b.toolWhy === "no calls in 15 min" ? b.toolWhy : "plugin off", "m"] : [NOT_RECORDED, "m"],
   ]
   const piece = (label, value) => (value === null ? [`${label} ${NOT_RECORDED}`, "m"] : [`${label}${value}`, ""])
   if (b.cos) {
