@@ -26,11 +26,12 @@ MOVES_ROWS_MAX = 20000
 ARCHIVE_READ_BYTES = 64 << 20    # per audit archive read by the replay
 AUDIT_TAIL_BYTES = 8 << 20
 HISTORY_DAYS = 3                 # finished days of the hourly series kept for the replay
-READ_BUDGET = 10                 # GitHub reads of asks lists in any hour, for the whole fleet
+READ_BUDGET_DEFAULT = 30         # GitHub reads an hour for each gh account (the key load_alert.read_budget); a 304 is free
+READ_BUDGET_MAX = 60             # a hard ceiling: a key above it is a configuration error
 ASKS_FRESH_SECONDS = 3600        # a cached list of asks is re-read at most this often
 RETRY_SECONDS = 300              # after a failed read the same source is not tried again for this long
 ASKS_STALE_SECONDS = 3 * 3600    # a list older than this is not believed: the figure is not recorded
-DEFAULTS = {"enabled": False, "stalled_hours": 2.0, "stalled_asks": 2, "backlog_hours": 4.0}
+DEFAULTS = {"enabled": False, "stalled_hours": 2.0, "stalled_asks": 2, "backlog_hours": 4.0, "read_budget": READ_BUDGET_DEFAULT}
 _REF = re.compile(r"report on (?:([\w.-]+)/)?([\w.-]*)#(\d+)")
 
 
@@ -46,6 +47,9 @@ def validate(raw, where):
         value = section[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 168:
             raise ValueError("%s.%s must be a number of hours above 0 and at most 168, got %r" % (where, key, value))
+    budget = section["read_budget"]
+    if isinstance(budget, bool) or not isinstance(budget, int) or not 1 <= budget <= READ_BUDGET_MAX:
+        raise ValueError("%s.read_budget must be a whole number of GitHub reads an hour for each account, from 1 to %d, got %r" % (where, READ_BUDGET_MAX, budget))
     count = section["stalled_asks"]
     if isinstance(count, bool) or not isinstance(count, int) or count < 1:
         raise ValueError("%s.stalled_asks must be a whole number of 1 or more, got %r" % (where, count))
@@ -53,6 +57,29 @@ def validate(raw, where):
 
 
 # ---- movement records
+
+_REF_PLAIN = re.compile(r"(?<![\w/&])#(\d{1,7})\b")
+_REF_URL = re.compile(r"/issues/(\d{1,7})\b")
+_REF_BRANCH = re.compile(r"(?:^|[/_-])(\d{2,7})(?=$|[/_-])")
+PARENT_LEVELS = 3                # how far up the parent chain a referenced issue is followed
+PARENTS_KEEP = 3000              # resolved parents kept (a parent never changes)
+
+
+def references(text, branch=None, repo=None):
+    """Every issue number a pull request body (and its branch name) refers to: `Closes #N`, `Part of #N`, `Refs #N`, a plain `#N` or an issues URL
+    of the same repository. `owner/other#N` of another repository is not this repository's issue. Order kept, no repeats."""
+    found = []
+    body = text if isinstance(text, str) else ""
+    for match in re.finditer(r"([\w.-]+/[\w.-]+)#(\d{1,7})\b", body):   # a number in another repository is never ours
+        if repo and match.group(1).lower() != str(repo).lower():
+            body = body.replace(match.group(0), " ")
+    for pattern, source in ((_REF_PLAIN, body), (_REF_URL, body), (_REF_BRANCH, branch if isinstance(branch, str) else "")):
+        for match in pattern.finditer(source):
+            n = int(match.group(1))
+            if n not in found:
+                found.append(n)
+    return found
+
 
 def move_rows(event, payload, repo, now, closing=lambda text: []):
     """[(repo, numbers, kind)] a webhook delivery says about real movement: a push (a pull request synchronised), a pull request opened or
@@ -71,8 +98,10 @@ def move_rows(event, payload, repo, now, closing=lambda text: []):
         kind = "pr_merged"
     else:
         return []
-    numbers = ([number] + [n for n in closing(pr.get("body")) if n != number])[:MOVES_NUMBERS_MAX]
-    return [{"at": now, "repo": repo, "numbers": numbers, "kind": kind}]
+    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+    refs = [n for n in list(closing(pr.get("body"))) + references(pr.get("body"), head.get("ref"), repo) if n != number]
+    refs = list(dict.fromkeys(refs))[:MOVES_NUMBERS_MAX - 1]
+    return [{"at": now, "repo": repo, "numbers": [number] + refs, "refs": refs, "kind": kind}]
 
 
 @contextmanager
@@ -201,26 +230,56 @@ def last_moves(asks, rows):
     return found
 
 
+WAIT_LABELS = ("awaiting-user", "awaiting-cos", "parked")   # matched by suffix, whatever the owner's prefix
+PARKED_MAX_DAYS = 366            # a park reaches at most this far ahead (the same bound as the switchboard's parked_until users)
+
+
+def ask_wait(ask, now):
+    """What an ask is waiting on, by its labels: "owner" (awaiting-user), "cos" (awaiting-cos), "parked" (a parked label and a valid future date: the
+    call site parsed the `Parked until:` line with the switchboard's own parser) or None. awaiting wins over parked, and the owner over the Chief of Staff."""
+    labels = [str(l) for l in (ask.get("labels") or [])]
+    has = lambda name: any(l == name or l.endswith(":" + name) for l in labels)
+    if has("awaiting-user"):
+        return "owner"
+    if has("awaiting-cos"):
+        return "cos"
+    until = ask.get("parked_until")
+    if has("parked") and isinstance(until, (int, float)) and not isinstance(until, bool) and now < until <= now + PARKED_MAX_DAYS * 86400.0:
+        return "parked"
+    return None
+
+
 def figures(name, info, rows, now, cfg):
     """One orchestrator's figures. `info`: asks [{repo, number, first_seen}] or None (unreadable), busy, idle, messages, decisions."""
     out = {"name": name, "busy": info["busy"], "idle": info["idle"], "messages": info["messages"], "decisions": info["decisions"],
-           "open_asks": None, "stalled": None, "stalled_asks": [], "oldest_stall_hours": None, "moved_1h": None, "moved_backlog": None}
+           "open_asks": None, "active_asks": None, "stalled": None, "stalled_asks": [], "oldest_stall_hours": None, "moved_1h": None, "moved_backlog": None,
+           "waiting_owner": None, "waiting_cos": None, "parked": None, "charter_moves_1h": None}
     asks = info.get("asks")
     if asks is None:
         return out
     last = last_moves(asks, rows)
     out["open_asks"] = len(asks)
-    ages, stalled = [], []
+    ages, stalled, waits = [], [], {"owner": 0, "cos": 0, "parked": 0}
     for ask in asks:
+        wait = ask_wait(ask, now)
+        if wait:
+            waits[wait] += 1   # waiting on someone or deliberately parked: counted by itself, never as stalled
+            continue
         at = last[(ask["repo"], ask["number"])]
         at = max(at, ask["first_seen"]) if at is not None else ask["first_seen"]   # never seen to move: unmoved since it was first seen
         ages.append(now - at)
         if now - at >= cfg["stalled_hours"] * 3600:
             stalled.append(ask["number"])
     out["stalled"], out["stalled_asks"] = len(stalled), sorted(stalled)
+    out["waiting_owner"], out["waiting_cos"], out["parked"] = waits["owner"], waits["cos"], waits["parked"]
+    out["active_asks"] = len(asks) - sum(waits.values())
     out["oldest_stall_hours"] = round(max(ages) / 3600.0, 1) if ages else 0.0
     moved = lambda hours: sum(1 for ask in asks if last[(ask["repo"], ask["number"])] is not None and now - last[(ask["repo"], ask["number"])] < hours * 3600)
     out["moved_1h"], out["moved_backlog"] = moved(1), moved(cfg["backlog_hours"])
+    charter = info.get("charter")
+    if isinstance(charter, int) and not isinstance(charter, bool):   # pull requests on issues under its charter, with no open ask on the chain: the lane is moving
+        hits = {row["numbers"][0] for row in rows if now - row["at"] < 3600 and charter in row["numbers"][1:] and _same_repo(info.get("repo"), row.get("repo"))}
+        out["charter_moves_1h"] = len(hits)
     return out
 
 
@@ -232,8 +291,14 @@ def crossing(fig, cfg):
     if fig["stalled"] >= cfg["stalled_asks"]:
         reasons.append("stalled"); severity += fig["stalled"]
     full = fig["busy"] is not None and fig["idle"] is not None and fig["busy"] > 0 and fig["idle"] == 0
-    if full and fig.get("moved_backlog") is not None and fig["open_asks"] > fig["moved_backlog"]:
-        reasons.append("backlog"); severity += fig["open_asks"] - fig["moved_backlog"]
+    if full and fig.get("moved_backlog") is not None and fig.get("moved_1h") is not None:
+        # all coders busy: only when something is stuck (an ask stalled) or open asks clearly outnumber what moves and nothing moved in the last hour
+        active = fig["active_asks"] if fig.get("active_asks") is not None else fig["open_asks"]   # asks waiting on someone or parked are not queued work
+        outnumbered = active >= 2 * fig["moved_backlog"] and active > fig["moved_backlog"] and fig["moved_1h"] == 0 and not fig.get("charter_moves_1h")
+        if fig["stalled"] >= 1 and "stalled" not in reasons:
+            reasons.append("busy_stalled"); severity += max(1, fig["stalled"])
+        elif outnumbered:
+            reasons.append("outnumbered"); severity += max(1, active - fig["moved_backlog"])
     return severity, reasons
 
 
@@ -247,8 +312,10 @@ def wake_text(fig, reasons, cfg):
     actions = []
     if "stalled" in reasons:
         actions.append("move the stalled asks (%s) to another lane" % (asks or "named above"))
-    if "backlog" in reasons:
-        actions.append("split a lane or add coders (all are busy and asks queue faster than they move)")
+    if "busy_stalled" in reasons:
+        actions.append("split a lane or add coders: all coders are busy and an ask is stalled (%s)" % (asks or "named above"))
+    if "outnumbered" in reasons:
+        actions.append("split a lane or add coders: all coders are busy, open asks are at least twice those moved in %g h and none moved in the last hour" % cfg["backlog_hours"])
     return text + " Recommended: " + "; or ".join(actions) + "."
 
 
@@ -307,29 +374,93 @@ def decisions_waiting(state_dir):
     return found
 
 
+def decision_items(state_dir):
+    """[(repo, issue number)] of the open decisions of decisions.json (the issue of the ask, else the item's own number), or None when it cannot be read.
+    The `agent` field is a metadata guess and is not read here."""
+    try:
+        listed = json.loads((Path(state_dir) / "decisions.json").read_text()).get("decisions")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(listed, list):
+        return None
+    out = []
+    for item in listed:
+        if isinstance(item, dict) and not item.get("closed"):
+            number = item.get("ask") if isinstance(item.get("ask"), int) and not isinstance(item.get("ask"), bool) else item.get("number")
+            out.append((str(item.get("repo") or ""), number if isinstance(number, int) and not isinstance(number, bool) else None))
+    return out
+
+
 def charter_agent(body):
     """The agent a charter issue names: the `orchestrator: <name>` line of its yaml block, or None."""
     found = re.search(r"^orchestrator:[ \t]*([A-Za-z0-9][A-Za-z0-9._-]*)[ \t]*(?:#[^\r\n]*)?\r?$", body if isinstance(body, str) else "", re.M)   # a trailing comment and a CRLF line end are fine
     return found.group(1) if found else None
 
 
-def _resolve_charters(ctx, state, now, reads):
+class _Budget:
+    """The reads of the last hour, counted for each gh account (the repositories one account reads share its count). `ctx` may supply
+    `account_of(repo)`, `paused(repo)` and `begin_read()` / `read_cost(token, repo)` (the reads GitHub really billed: a 304 is free); without them every
+    repository is one account, nothing is paused and a read costs what the caller says."""
+
+    def __init__(self, ctx, state, now):
+        self.ctx, self.now = ctx, now
+        self.limit = (ctx.cfg or {}).get("read_budget", READ_BUDGET_DEFAULT)
+        kept = []
+        for row in state.get("reads", []):
+            if isinstance(row, (int, float)) and not isinstance(row, bool):
+                row = [row, "default"]   # a row written before the budget was per account
+            if isinstance(row, list) and len(row) == 2 and isinstance(row[0], (int, float)) and now - row[0] < 3600:
+                kept.append([row[0], str(row[1])])
+        self.rows, self.paused_said = kept, set()
+
+    def account(self, repo):
+        of = getattr(self.ctx, "account_of", None)
+        return str(of(repo)) if of else "default"
+
+    def left(self, account):
+        return self.limit - sum(1 for _, a in self.rows if a == account)
+
+    def paused(self, repo, problems):
+        """True when the account of `repo` is paused by the rate limit: no read is tried and nothing is counted; said once per account."""
+        check = getattr(self.ctx, "paused", None)
+        if not check or not check(repo):
+            return False
+        account = self.account(repo)
+        if account not in self.paused_said:
+            self.paused_said.add(account)
+            problems.append("account %s is paused by the rate limit: its reads wait" % account)
+        return True
+
+    def metered(self, repo, default_cost, call):
+        """`call()` and charge what it cost, even when it fails (a failed read was still made)."""
+        begin, cost_of = getattr(self.ctx, "begin_read", None), getattr(self.ctx, "read_cost", None)
+        token = begin() if begin and cost_of else None
+        try:
+            return call()
+        finally:
+            cost = cost_of(token, repo) if begin and cost_of else default_cost
+            self.rows.extend([self.now, self.account(repo)] for _ in range(cost))
+
+    def to_state(self):
+        return self.rows
+
+
+def _resolve_charters(ctx, state, now, budget):
     """{orchestrator: charter number or None} and problems. The charter is the open issue whose yaml block says `orchestrator: <its name>`
-    (one `ctx.read_charters(repo) -> [(number, body)]` per repo, cached an hour and counted in the read budget as 2), else the `charter` of its
-    fleet metadata, unless that issue's own yaml names another agent; an `issue` number of its metadata is never used (it may be another orchestrator's)."""
+    (one `ctx.read_charters(repo) -> [(number, body)]` per repo, cached an hour; it costs up to 3 reads and needs 2 left in the account's budget), else
+    the `charter` of its fleet metadata, unless that issue's own yaml names another agent; an `issue` number of its metadata is never used."""
     cache, problems, out = state.setdefault("charters", {}), [], {}
-    repos = sorted({info.get("repo") for info in ctx.orchestrators.values() if info.get("repo")})
+    repos = sorted({info.get("repo") for info in ctx.orchestrators.values() if info.get("repo")}, key=lambda r: (cache.get(r) or {}).get("at", 0))
     for repo in repos:
         entry = cache.get(repo) or {}
         if (entry.get("at") and now - entry["at"] < ASKS_FRESH_SECONDS) or now - entry.get("tried", -1e9) < RETRY_SECONDS:
             if entry.get("error") and now - entry.get("tried", -1e9) < RETRY_SECONDS:
                 problems.append(entry["error"])   # still failing: said every pass, read again only after the retry wait
             continue
-        if getattr(ctx, "read_charters", None) is None or len(reads) + 2 > READ_BUDGET:
+        if getattr(ctx, "read_charters", None) is None or budget.paused(repo, problems) or budget.left(budget.account(repo)) < 2:
             continue
-        reads.extend([now, now])
         try:
-            found = ctx.read_charters(repo)
+            found = budget.metered(repo, 2, lambda: ctx.read_charters(repo))
         except Exception as err:
             text = "%s: charters not readable (%s)" % (repo, str(err).splitlines()[0][:60] if str(err) else type(err).__name__)
             problems.append(text)
@@ -350,10 +481,117 @@ def _resolve_charters(ctx, state, now, reads):
     return out, problems
 
 
-def _refresh_asks(ctx, state, now):
-    """Re-read at most READ_BUDGET asks lists an hour (the oldest first); a failed read keeps the cached list and is told."""
-    cache, reads, problems = state.setdefault("asks", {}), [t for t in state.get("reads", []) if now - t < 3600], []
-    charters, more = _resolve_charters(ctx, state, now, reads)
+def _wait_fields(ask):
+    """The few label facts kept with a cached ask: only the labels that matter and the parsed park date."""
+    labels = [l for l in (ask.get("labels") or []) if isinstance(l, str) and any(l == w or l.endswith(":" + w) for w in WAIT_LABELS)][:6]
+    out = {"labels": labels} if labels else {}
+    if isinstance(ask.get("parked_until"), (int, float)) and not isinstance(ask.get("parked_until"), bool):
+        out["parked_until"] = ask["parked_until"]
+    return out
+
+
+def _parent_of(ctx, state, budget, repo, number, now, problems):
+    """(parent number or None, resolved): a parent never changes, so one read per number is kept for good (a failure is retried after RETRY_SECONDS).
+    Unresolved when it cannot be read or the account's budget is spent or paused: nothing is guessed."""
+    parents, failed, key = state.setdefault("parents", {}), state.setdefault("parents_failed", {}), "%s#%d" % (repo, number)
+    if key in parents:
+        return (parents[key] or None), True
+    if now - failed.get(key, -1e9) < RETRY_SECONDS or getattr(ctx, "read_parent", None) is None:
+        return None, False
+    if budget.paused(repo, problems) or budget.left(budget.account(repo)) < 1:
+        return None, False
+    try:
+        parent = budget.metered(repo, 1, lambda: ctx.read_parent(repo, number))
+    except Exception:
+        failed[key] = now
+        while len(failed) > PARENTS_KEEP:
+            failed.pop(next(iter(failed)))
+        return None, False
+    parents[key] = parent or 0
+    while len(parents) > PARENTS_KEEP:
+        parents.pop(next(iter(parents)))   # the oldest: it is only read again
+    return parent, True
+
+
+def expand_rows(ctx, state, budget, rows, asks_by_name, charters, now, problems):
+    """Attribute each movement to the asks (and charters) on the parent chain of the issues it refers to: a work item whose parent is an ask moves
+    that ask, and one whose chain reaches an orchestrator's charter without an ask moves that charter (up to PARENT_LEVELS levels). A row written
+    before references were logged carries only the issues it closed: those are followed the same way. Returns (rows with the chain's numbers added,
+    the count of movements whose reference could not be resolved)."""
+    known = {(a["repo"], a["number"]) for lst in asks_by_name.values() for a in lst}
+    for name, number in (charters or {}).items():
+        known.add(((ctx.orchestrators.get(name) or {}).get("repo"), number))
+    is_stop = lambda repo, n: any(_same_repo(r, repo) and k == n for r, k in known)   # an ask or a charter: the chain ends there
+    window = now - max(ctx.cfg.get("stalled_hours", 2.0), ctx.cfg.get("backlog_hours", 4.0)) * 3600   # older movements cannot change a figure
+    out, unattributed = [], 0
+    for row in rows:
+        refs = row["refs"] if isinstance(row.get("refs"), list) else list(row["numbers"][1:])   # an old row: its numbers after the pull request are what it closed
+        if not refs or row["at"] < window or not row.get("repo"):
+            out.append(row)
+            continue
+        extra, stuck = [], False
+        for ref in refs[:MOVES_NUMBERS_MAX]:
+            if not isinstance(ref, int) or is_stop(row["repo"], ref):
+                continue
+            cur = ref
+            for _ in range(PARENT_LEVELS):
+                parent, resolved = _parent_of(ctx, state, budget, row["repo"], cur, now, problems)
+                if not resolved:
+                    stuck = True
+                    break
+                if not parent:
+                    break
+                extra.append(parent)
+                cur = parent
+                if is_stop(row["repo"], cur):
+                    break
+        unattributed += 1 if stuck else 0
+        out.append(dict(row, numbers=list(row["numbers"]) + [n for n in extra if n not in row["numbers"]]) if extra else row)
+    return out, unattributed
+
+
+def attribute_decisions(ctx, state, budget, asks_by_name, charters, now, problems):
+    """({orchestrator: waiting decisions}, how many could not be attributed, or None when decisions.json cannot be read). A decision belongs to the
+    orchestrator whose open ask or charter is on the parent chain of its issue (up to PARENT_LEVELS levels, the same cached and budgeted reads);
+    one that cannot be resolved belongs to nobody: the `agent` field of the list is never used."""
+    items = decision_items(ctx.state_dir)
+    if items is None:
+        return None, 0
+    owner = {}
+    for name, lst in asks_by_name.items():
+        for ask in lst:
+            owner.setdefault(("ask", ask["number"]), []).append((name, ask["repo"]))
+    for name, number in (charters or {}).items():
+        owner.setdefault(("ask", number), []).append((name, (ctx.orchestrators.get(name) or {}).get("repo")))
+    counts, nobody = {}, 0
+    for repo, number in items:
+        found = None
+        cur = number
+        for level in range(PARENT_LEVELS + 1):
+            if cur is None:
+                break
+            hits = [n for n, r in owner.get(("ask", cur), []) if _same_repo(r, repo)]
+            if hits:
+                found = sorted(hits)[0]
+                break
+            if level == PARENT_LEVELS or not repo:
+                break
+            parent, resolved = _parent_of(ctx, state, budget, repo, cur, now, problems)
+            if not resolved or not parent:
+                break
+            cur = parent
+        if found is None:
+            nobody += 1
+        else:
+            counts[found] = counts.get(found, 0) + 1
+    return counts, nobody
+
+
+def _refresh_asks(ctx, state, now, rows=()):
+    """Re-read each asks list at most hourly, the oldest first, within each account's read budget; a failed read keeps the cached list and is told."""
+    cache, problems = state.setdefault("asks", {}), []
+    budget = _Budget(ctx, state, now)
+    charters, more = _resolve_charters(ctx, state, now, budget)
     problems.extend(more)
     state["charter_of"] = {n: c for n, c in charters.items() if c is not None}
     for name in sorted(ctx.orchestrators, key=lambda n: cache.get(n, {}).get("at", 0)):
@@ -363,35 +601,40 @@ def _refresh_asks(ctx, state, now):
             if entry.get("error") and now - entry.get("tried", -1e9) < RETRY_SECONDS:
                 problems.append(entry["error"])
             continue
-        if not info.get("charter") or len(reads) >= READ_BUDGET:
+        if not info.get("charter") or budget.paused(info.get("repo"), problems) or budget.left(budget.account(info.get("repo"))) < 1:
             continue
-        reads.append(now)
         try:
-            found = ctx.read_asks(info["charter"], info.get("repo"))
+            found = budget.metered(info.get("repo"), 1, lambda: ctx.read_asks(info["charter"], info.get("repo")))
         except Exception as err:   # an unreadable source is told, not guessed
             text = "%s: asks not readable (%s)" % (name, str(err).splitlines()[0][:80] if str(err) else type(err).__name__)
             problems.append(text)
             cache[name] = dict(entry, tried=now, error=text)
             continue
         seen = {(a["repo"], a["number"]): a["first_seen"] for a in entry.get("list", [])}
-        cache[name] = {"at": now, "list": [{"repo": a["repo"], "number": a["number"], "first_seen": seen.get((a["repo"], a["number"]), now)} for a in found]}
+        cache[name] = {"at": now, "list": [dict({"repo": a["repo"], "number": a["number"], "first_seen": seen.get((a["repo"], a["number"]), now)}, **_wait_fields(a)) for a in found]}
     for gone in [n for n in cache if n not in ctx.orchestrators]:
         del cache[gone]
-    state["reads"] = reads
-    return problems
+    asks_by_name = {n: (cache.get(n) or {}).get("list") or [] for n in ctx.orchestrators}
+    charter_numbers = state.get("charter_of") or {}
+    rows, unattributed = expand_rows(ctx, state, budget, list(rows), asks_by_name, charter_numbers, now, problems)
+    state["unattributed"] = unattributed
+    counts, nobody = attribute_decisions(ctx, state, budget, asks_by_name, charter_numbers, now, problems)
+    state["decision_counts"], state["decisions_unattributed"] = counts, nobody
+    state["reads"] = budget.to_state()
+    return problems, rows
 
 
 def tick(ctx):
     """One pass. Returns the list of (orchestrator, wake text) sent. Never raises for a source it cannot read."""
     now, state = ctx.now, _read_state(ctx.state_dir)
     before_state = json.loads(json.dumps(state))
-    problems = _refresh_asks(ctx, state, now)
     rows = read_moves(ctx.state_dir, now - 24 * 3600)
     audited = audit_moves(ctx.state_dir, now - 24 * 3600)
+    rows += audited or []
+    problems, rows = _refresh_asks(ctx, state, now, rows)
     if audited is None:
         problems.append("movement: the audit log cannot be read")
-    rows += audited or []
-    waiting = decisions_waiting(ctx.state_dir)
+    waiting = state.get("decision_counts")
     if waiting is None:
         problems.append("decisions: decisions.json cannot be read")
     day, hour = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d"), datetime.fromtimestamp(now, timezone.utc).strftime("%H")
@@ -407,7 +650,8 @@ def tick(ctx):
         else:
             unchartered.append(name)
         fig = figures(name, {"asks": asks, "busy": info["busy"], "idle": info["idle"], "messages": info["messages"],
-                             "decisions": None if waiting is None else waiting.get(name, 0)}, rows, now, ctx.cfg)
+                             "decisions": None if waiting is None else waiting.get(name, 0),
+                             "charter": (state.get("charter_of") or {}).get(name), "repo": info.get("repo")}, rows, now, ctx.cfg)
         latest[name] = fig
         old = series.get(name)
         if isinstance(old, dict) and old.get("day") != day and old.get("hours"):   # a new UTC day: the finished day stays replayable for a few days
@@ -416,7 +660,7 @@ def tick(ctx):
             for gone in sorted(history)[:-HISTORY_DAYS]:
                 del history[gone]
         mine = old if isinstance(old, dict) and old.get("day") == day else {"day": day, "hours": {}}
-        mine["hours"][hour] = {k: fig[k] for k in ("open_asks", "stalled", "stalled_asks", "moved_1h", "moved_backlog", "busy", "idle", "messages", "decisions", "oldest_stall_hours")}
+        mine["hours"][hour] = {k: fig[k] for k in ("open_asks", "active_asks", "waiting_owner", "waiting_cos", "parked", "stalled", "stalled_asks", "moved_1h", "moved_backlog", "charter_moves_1h", "busy", "idle", "messages", "decisions", "oldest_stall_hours")}
         series[name] = mine
         before = episodes.get(name)
         text, episodes[name] = judge(fig, ctx.cfg, before)
@@ -446,9 +690,13 @@ def status_lines(state_dir, now):
     out = ["load        %d orchestrator(s); alert %s" % (len(latest), "on" if state.get("alert") else "off")]
     for name in sorted(latest):
         f = latest[name]
-        out.append("  %-12s asks %s, stalled %s (oldest %s h), moved 1h %s; waiting %d msg %s dec; coders %d busy %d idle" % (
-            name, num(f["open_asks"]), num(f["stalled"]), num(f["oldest_stall_hours"]), num(f["moved_1h"]),
-            f["messages"], num(f["decisions"]), f["busy"], f["idle"]))
+        out.append("  %-12s asks %s, stalled %s, waiting on owner %s, parked %s, waiting on cos %s, oldest stall %s h, moved 1h %s, charter moves 1h %s; waiting %d msg %s dec; coders %d busy %d idle" % (
+            name, num(f["open_asks"]), num(f["stalled"]), num(f.get("waiting_owner")), num(f.get("parked")), num(f.get("waiting_cos")),
+            num(f["oldest_stall_hours"]), num(f["moved_1h"]), num(f.get("charter_moves_1h")), f["messages"], num(f["decisions"]), f["busy"], f["idle"]))
+    if state.get("decisions_unattributed"):
+        out.append("  %d decision(s) not attributed (the parent of their issue could not be read, or no orchestrator's charter is on its chain)" % state["decisions_unattributed"])
+    if state.get("unattributed"):
+        out.append("  %d movement(s) not attributed (a referenced issue's parent could not be read)" % state["unattributed"])
     if state.get("problems"):
         out.append("  unreadable: %s" % "; ".join(state["problems"][:3]))
     return out

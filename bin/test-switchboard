@@ -202,6 +202,14 @@ class Base(unittest.TestCase):
         bound.start()
         self.addCleanup(bound.stop)
         sb._VERSIONS.clear()
+        # No test reads the real machine's load or memory: the cpu and memory guards run in every engine pass, and a loaded CI runner would wake the Chief of
+        # Staff in an unrelated test. A test of the guards patches its own figures over these.
+        guard = sb.load_cpu_guard()
+        for target, name, value in ((os, "getloadavg", lambda: (0.1, 0.1, 0.1)), (guard, "memory_reading", lambda: guard.Memory(0, 10 * 10 ** 9, 5 * 10 ** 9)),
+                                    (guard, "process_table", lambda *a, **k: {})):
+            calm = mock.patch.object(target, name, value)
+            calm.start()
+            self.addCleanup(calm.stop)
         (self.home / "cos-definition.md").write_text(COS_ALLOWING)
         for name in (sb.LAB_ENV, sb.FAULT_ENV, "HERDR_PANE_ID", "OPENCODE_SESSION_ID"):
             os.environ.pop(name, None)
@@ -5231,6 +5239,165 @@ class TestLaunch(Base):
         self.assertFalse(any(wt.exists() for wt in wts))
         self.assertFalse(engine._wt_sweep, "the sweep cache is dropped afterwards")
 
+    def close_world(self, status="idle"):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.worker()
+        self.world.add_agent("stranger", fleet={"role": "coder", "reports_to": "someone-else"})
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.world.herdr.panes[self.world.panes["worker"]]["status"] = status
+        self.health()
+        self.world.herdr.closed.clear()
+
+    def close_audit(self, event=None):
+        rows = [e for e in self.world.audit() if e["event"].startswith("fleetpane.close")]
+        return [e for e in rows if event is None or e["event"] == event]
+
+    def test_retire_close_retires_and_closes_the_idle_workers_pane_when_its_boss_asks(self):
+        self.close_world()
+        pane = self.world.panes["worker"]
+        self.as_("boss")
+        code, out, err = self.run_cli("retire", "worker", "--close")
+        self.assertEqual(code, 0, err)
+        self.assertIn("closed pane %s" % pane, out)
+        self.assertEqual(self.world.herdr.closed, [pane], "exactly one pane close, for that pane")
+        self.assertIn("worker", sb.read_retired(self.world.state))
+        (row,) = self.close_audit("fleetpane.closed")
+        self.assertEqual((row["subject"], row["detail"]["pane"]), ("worker", pane))
+        self.assertNotIn("command", json.dumps(row))
+
+    def test_retire_close_refuses_a_pane_that_no_longer_holds_the_agents_session_and_closes_nothing(self):
+        self.close_world()
+        other = self.world.add_agent("newcomer", fleet={"role": "coder"})
+        stale = self.world.panes["worker"]
+        self.health()
+        # a herdr restart renumbered the panes: the id the switchboard had for `worker` now holds another session
+        discovery = self.engine.discover(self.world.clock.now())
+        self.world.herdr.panes[stale]["session"] = other
+        self.as_("boss")
+        with mock.patch.object(sb.Switchboard, "discover", return_value=discovery):
+            code, out, err = self.run_cli("retire", "worker", "--close")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.world.herdr.closed, [])
+        self.assertEqual(err.count("no longer holds worker's session"), 1, err)
+        self.assertNotIn("worker", sb.read_retired(self.world.state), "a refused close retires nothing")
+        (row,) = self.close_audit("fleetpane.close_refused")
+        self.assertEqual((row["subject"], row["detail"]["pane"]), ("worker", stale))
+        self.assertIn("no longer holds", row["detail"]["why"])
+
+    def test_retire_close_never_closes_the_callers_own_pane_or_its_own_agent(self):
+        self.close_world()
+        engine = self.world.new_engine("cli")
+        discovery = engine.discover(self.world.clock.now())
+        worker = discovery.agents["worker"]
+        with mock.patch.object(sb, "gates_caller_kind", return_value=("agent", "worker", "coder")):       # an agent naming ITSELF
+            pane, why = sb.retire_close_problem(engine, subprocess.run, self.world.clock.now, discovery, "worker", worker, False)
+        self.assertEqual((pane, why), (None, "an agent cannot close its own pane"))
+        with mock.patch.object(sb, "gates_caller_kind", return_value=("person", "the operator")), mock.patch.dict(os.environ, {"HERDR_PANE_ID": worker.pane}):
+            pane, why = sb.retire_close_problem(engine, subprocess.run, self.world.clock.now, discovery, "worker", worker, False)
+        self.assertEqual(pane, None)
+        self.assertIn("the one you are in", why)
+        self.as_("worker")
+        code, out, err = self.run_cli("retire", "worker", "--close")
+        self.assertEqual((code, self.world.herdr.closed), (1, []))
+        self.world.add_agent("boss2", fleet={"role": "orchestrator"})
+        self.world.add_agent("kid", fleet={"role": "coder", "reports_to": "boss2"})
+        self.world.herdr.panes[self.world.panes["kid"]]["status"] = "idle"
+        self.health()
+        os.environ["HERDR_PANE_ID"] = self.world.panes["kid"]
+        os.environ[sb.SESSION_ENV] = self.world.sessions["boss2"]       # a caller that is boss2 but sits in kid's pane
+        code, out, err = self.run_cli("retire", "kid", "--close")
+        os.environ.pop(sb.SESSION_ENV, None)
+        self.assertEqual((code, self.world.herdr.closed), (1, []))
+        self.assertIn("the one you are in", err)
+        self.assertEqual(len(self.close_audit("fleetpane.close_refused")), 1)
+
+    def test_a_blocked_agent_needs_force_and_the_close_judges_everything_again_just_before_closing(self):
+        self.close_world(status="blocked")
+        self.as_("boss")
+        code, out, err = self.run_cli("retire", "worker", "--close")
+        self.assertEqual((code, self.world.herdr.closed), (1, []))
+        self.assertIn("is blocked: pass --force", err)
+        self.assertEqual(len(self.close_audit("fleetpane.close_refused")), 1)
+        self.world.herdr.panes[self.world.panes["worker"]]["status"] = "idle"
+        real = sb.retire_close_problem
+        calls = []
+
+        def second_look_finds_it_working(engine, runner, now, discovery, name, seen, force):
+            calls.append(1)
+            if len(calls) == 2:                                           # the agent resumed work after the first judgment
+                self.world.herdr.panes[self.world.panes["worker"]]["status"] = "working"
+            return real(engine, runner, now, discovery, name, seen, force)
+
+        with mock.patch.object(sb, "retire_close_problem", second_look_finds_it_working):
+            code, out, err = self.run_cli("retire", "worker", "--close")
+        self.assertEqual(len(calls), 2, "judged before the retirement and again just before the close")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.world.herdr.closed, [], "it was working at the second look: not closed")
+        self.assertIn("was not closed", out)
+        self.assertIn("worker", sb.read_retired(self.world.state))
+        self.assertEqual(len(self.close_audit("fleetpane.close_failed")), 1)
+
+    def test_retire_close_is_refused_for_a_stranger_audited_and_allowed_for_the_boss_cos_for_a_direct_report_and_the_operator(self):
+        self.close_world()
+        self.world.add_agent("boss3", fleet={"role": "orchestrator", "reports_to": "cos"})
+        self.world.add_agent("direct", fleet={"role": "coder", "reports_to": "cos"})
+        self.world.add_agent("deep", fleet={"role": "coder", "reports_to": "boss3"})
+        for n in ("direct", "deep"):
+            self.world.herdr.panes[self.world.panes[n]]["status"] = "idle"
+        self.health()
+        self.world.herdr.closed.clear()
+        self.as_("stranger")
+        code, out, err = self.run_cli("retire", "worker", "--close")
+        self.assertEqual((code, self.world.herdr.closed), (1, []))
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "fleetpane.retire_refused"], "a stranger is refused by the retire caller rule, audited")
+        self.as_("cos")
+        code, out, err = self.run_cli("retire", "deep", "--close")               # cos is not deep's boss: a retire is allowed, a close is not
+        self.assertEqual((code, self.world.herdr.closed), (1, []), err)
+        self.assertIn("may not close deep's pane", err)
+        self.assertEqual(len(self.close_audit("fleetpane.close_refused")), 1)
+        code, out, err = self.run_cli("retire", "direct", "--close")             # cos IS its boss
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.world.herdr.closed, [self.world.panes["direct"]])
+        self.as_("boss3")
+        self.assertEqual(self.run_cli("retire", "deep", "--close")[0], 0)
+        os.environ.pop("HERDR_PANE_ID", None)
+        self.assertEqual(self.run_cli("retire", "worker", "--close")[0], 0, "the operator may close any")
+        self.assertEqual(len(self.close_audit("fleetpane.closed")), 3)
+
+    def test_a_working_agent_needs_force_and_force_is_refused_with_unpushed_work(self):
+        self.close_world(status="working")
+        self.make_repo()
+        wt = self.add_worktree("w-busy-close", unpushed=True)
+        sb.register_worktree(self.world.state, str(wt), "worker", None, "w-busy-close", 1)
+        self.as_("boss")
+        code, out, err = self.run_cli("retire", "worker", "--close")
+        self.assertEqual((code, self.world.herdr.closed), (1, []))
+        self.assertIn("pass --force", err)
+        code, out, err = self.run_cli("retire", "worker", "--close", "--force")
+        self.assertEqual((code, self.world.herdr.closed), (1, []), "unpushed work: --force refused")
+        self.assertIn("unpushed", err)
+        self.assertEqual(len(self.close_audit("fleetpane.close_refused")), 2)
+        clean = self.add_worktree("w-clean-close")
+        sb._write_small(self.world.state, sb.WORKTREES_FILE, {str(clean): {"agent": "worker", "repo": None, "branch": "w-clean-close", "created": 1}})
+        code, out, err = self.run_cli("retire", "worker", "--close", "--force")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.world.herdr.closed, [self.world.panes["worker"]])
+
+    def test_retire_without_close_closes_nothing_and_a_close_that_fails_is_audited_and_the_agent_stays_retired(self):
+        self.close_world()
+        self.as_("boss")
+        self.assertEqual(self.run_cli("retire", "worker")[0], 0)
+        self.assertEqual(self.world.herdr.closed, [])
+        self.assertEqual(self.close_audit(), [])
+        self.run_cli("retire", "--undo", "worker")
+        with mock.patch.object(sb.HerdrClient, "pane_close", side_effect=sb.HerdrError("exit", "pane busy")):
+            code, out, err = self.run_cli("retire", "worker", "--close")
+        self.assertEqual(code, 0, err)
+        self.assertIn("was not closed", out)
+        self.assertIn("worker", sb.read_retired(self.world.state))
+        (row,) = self.close_audit("fleetpane.close_failed")
+        self.assertEqual(row["detail"]["pane"], self.world.panes["worker"])
+
     def test_the_worktree_reclaim_config_is_validated(self):
         base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
         sb.validate_config(dict(base, worktree_reclaim={"enabled": True, "on_done": False}))
@@ -5413,7 +5580,8 @@ class TestLaunch(Base):
                 for node in ast.walk(function):
                     if isinstance(node, ast.Attribute) and node.attr == "pane_close":
                         callers.add(function.name)
-        self.assertEqual(callers, {"close_own_pane"})
+        # two closers, each narrow: the pane a launch opened itself, and `retire --close` (re-reads the pane, matches the agent's session, boss only)
+        self.assertEqual(callers, {"close_own_pane", "retire_close_pane"})
         for function in ast.walk(tree):
             if isinstance(function, ast.FunctionDef) and function.name == "launch_agent":
                 calls = [n.func.id for n in ast.walk(function) if isinstance(n, ast.Call)
@@ -11038,7 +11206,7 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
     def test_the_job_runs_and_what_is_outside_it_is_denied(self):
         _, rules = self.rules()
         for command in ("fleet-switchboard decisions list --tier all", "sleep 20",
-                        "gh issue view 5 --json body -q .body", "gh api repos/o/r/issues/comments/1 --jq .body", "grep foo", "cut -c1-100", "jq length",
+                        "gh issue view 5 --json body -q .body", "gh issue create --title x --body y", "fleet-switchboard disk", "fleet-switchboard disk janitor --apply", "fleet-switchboard disk reap-docker --apply", "fleet-switchboard disk prune", "gh api repos/o/r/issues/comments/1 --jq .body", "grep foo", "cut -c1-100", "jq length",
                         "gh pr merge 5 --squash", "gh issue close 5", "gh pr comment 5 --body ok", "az webapp show -n a -g g", "az group list",
                         "fleet-switchboard handoff --issue 5 --brief-file -", "fleet-switchboard launch v --agent orchestrator",
                         "fleet-switchboard reattach coder-a --issue 5", "fleet-switchboard relaunch coder-a --issue 5",
@@ -11052,14 +11220,45 @@ class TestChiefOfStaffNativePermissions(unittest.TestCase):
                         'fleet-switchboard report done --issue 5 "$(cat %s/x)"' % self.TEMP):
             self.assertEqual(self.evaluate(rules, "shell", command), "allow", command)
         for command in ("make build", "git push", "git -C /home/a/Code/widget push", "git commit -m x", "git fetch", "git pull", "git -c core.pager=sh log",
-                        "git status; git push", "rm -rf x", "az keyvault secret show --name x", "az account get-access-token", "az containerapp show -n a -g g",
-                        "az containerapp env show -n e -g g", "az vm delete -n x", "cat /home/a/.ssh/id_rsa", "gh pr merge 5 --admin", "gh pr merge 5 --auto",
+                        "git status; git push", "rm -rf x", "az keyvault secret show --name x", "az account get-access-token",
+                        "az vm delete -n x", "cat /home/a/.ssh/id_rsa", "gh pr merge 5 --admin", "gh pr merge 5 --auto",
                         "gh pr review 5 --approve", "gh repo delete o/r", "curl https://example.com", "timeout 5 rm -rf x", "fleet-switchboard decisions batch --title x",
                         "gh api repos/o/r/issues -fa=b", "gh api repos/o/r/issues --raw-field a=b", "gh api repos/o/r/issues -Fa=@f", "git credential fill", "gh auth status -t", "gh auth status --show-token", "az acr credential show -n r", "az webapp config appsettings list -n a -g g", "fleet-switchboard gates mode acme/app enforce", "fleet-switchboard gates mode acme/app ENFORCE", "fleet-switchboard gates on",
-                        "timeout 30 fleet-switchboard gates mode acme/app enforce", "timeout 5 fleet-switchboard gates on", "timeout 5 az keyvault secret show --name x", "timeout 30 az acr credential show -n r", "timeout 30 az webapp config appsettings list -n a -g g", "timeout 30 az storage account keys list -n s", "timeout 30 az containerapp show -n a -g g", "timeout 5 gh api repos/o/r/issues -X POST", "timeout 5 git ls-remote ext::sh",
+                        "timeout 30 fleet-switchboard gates mode acme/app enforce", "timeout 5 fleet-switchboard gates on", "timeout 5 az keyvault secret show --name x", "timeout 30 az acr credential show -n r", "timeout 30 az webapp config appsettings list -n a -g g", "timeout 30 az storage account keys list -n s", "timeout 5 gh api repos/o/r/issues -X POST", "timeout 5 git ls-remote ext::sh",
                         "fleet-switchboard waive acme/app#5 --gates G6 --reason x", "timeout 5 fleet-switchboard waive acme/app#5 --gates G6 --reason x",
                         "timeout 90 fleet-switchboard decisions list --tier all", "herdr agent prompt a1 hi", "herdr pane send p1 ls", "herdr pane keys p1 Enter", "herdr pane close p1"):
             self.assertEqual(self.evaluate(rules, "shell", command), "deny", command)
+
+    AZ_READS = ("az vm list-usage --location eastus", "az containerapp revision list -n a -g g", "az containerapp show -n a -g g", "az containerapp env show -n e -g g",
+                "az vm list -g g", "az vmss list -g g", "az group list", "az webapp show -n a -g g", "az account show", "az containerapp list -g g")
+    AZ_SECRETS = ("az keyvault secret show --name x", "az keyvault secret list --vault-name v", "az account get-access-token", "az ad app credential list --id x",
+                  "az ad sp credential reset --id x", "az storage account keys list -n s", "az cosmosdb keys list -n c -g g", "az cosmosdb list-keys -n c -g g",
+                  "az webapp config connection-string list -n a -g g", "az webapp config appsettings list -n a -g g", "az containerapp secret list -n a -g g",
+                  "az containerapp secret show -n a -g g --secret-name s", "az functionapp keys list -n f -g g", "az sql db show-connection-string -n d",
+                  "az containerapp exec -n a -g g", "az containerapp up -n a", "az containerapp delete -n a -g g", "az containerapp update -n a -g g", "az vm start -n v -g g",
+                  "az rest --method get --url https://x", "az acr credential show -n r")
+
+    AZ_MORE_SECRETS = ("az signalr key list -n s -g g", "az eventgrid topic key list -n t -g g", "az search admin-key show --service-name s -g g",
+                       "az search query-key list --service-name s -g g", "az webapp deployment list-publishing-profiles -n a -g g",
+                       "az functionapp deployment list-publishing-credentials -n f -g g", "az keyvault list", "az vm delete -n list -g g")
+    TIMEOUT_WRITES = ("timeout 5 gh secret set X --body view", "timeout 5 gh repo delete o/r view", "timeout 5 gh api repos/o/r/issues -X POST -f t=view",
+                      "timeout 5 gh workflow run ci.yml --ref view", "timeout 5 gh pr merge 5 --body view")
+
+    def test_az_reads_are_allowed_generally_and_every_secret_reading_or_writing_verb_stays_denied(self):
+        for path in self.PATHS:
+            with self.subTest(file=path.name):
+                _, rules = self.parse(path)
+                for command in self.AZ_READS + ("gh issue create --title x --body y", "fleet-switchboard disk", "fleet-switchboard disk janitor --apply",
+                                                "timeout 30 gh pr view 5", "timeout 30 gh issue list --repo acme/api"):
+                    self.assertEqual(self.evaluate(rules, "shell", command), "allow", command)
+                for command in self.TIMEOUT_WRITES + ("fleet-switchboard disk prune --docker /bin/sh", "fleet-switchboard disk prune --docker=/bin/sh", "fleet-switchboard disk --docker /tmp/x report",
+                                                      "fleet-switchboard disk reap-docker --apply --docker /tmp/x/docker", "fleet-switchboard disk report --docker=/bin/sh"):
+                    self.assertEqual(self.evaluate(rules, "shell", command), "deny", command)
+                for command in ("fleet-switchboard disk prune", "fleet-switchboard disk prune --dry-run", "fleet-switchboard disk report"):
+                    self.assertEqual(self.evaluate(rules, "shell", command), "allow", command)
+                for command in self.AZ_SECRETS + self.AZ_MORE_SECRETS:
+                    self.assertEqual(self.evaluate(rules, "shell", command), "deny", command)
+                    self.assertEqual(self.evaluate(rules, "shell", "timeout 30 " + command), "deny", "timeout 30 " + command)
 
     READ_ONLY_ADDED = ("fleet-switchboard review measure --since 7", "fleet-switchboard review laws acme/api#5", "fleet-switchboard impact floor acme/api#5 --json",
                        "fleet-switchboard impact hold --dry-run", "fleet-switchboard pr-explain acme/api#5 --check", "fleet-switchboard agents verify")
@@ -11137,6 +11336,227 @@ class TestVerdictRecordingText(unittest.TestCase):
         self.assertIn("a coder's only extra step is `prove`", planning)
 
 
+class TestHeadlessPresence(Base):
+    """#433 slice 2: a worker with NO terminal. Its state comes from the OpenCode service alone (bin/agent_presence.py); discovery lists it with the
+    pane `(headless)`; a delivery to it is not held; a service that does not answer makes it `unknown`, never dead and never working."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("boss",))
+        self.ap = sb.load_agent_presence()
+        self.engine = self.world.new_engine("cli")
+        self.url = "http://127.0.0.1:49374"
+
+    def headless(self, name="hw", role="coder", reports_to="boss", register=True, fleet_name=None):
+        sid = self.world.v2.create_session({"fleet": {"name": fleet_name or name, "role": role, "reports_to": reports_to, "headless": True}})
+        if register:
+            self.ap.save_record(self.world.state, name, sid, self.url, now=self.world.clock.now())
+        return sid
+
+    def discover(self):
+        return self.engine.discover(self.world.clock.now())
+
+    def run_cli(self, *argv):
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_state_of_is_the_rule_the_spike_measured(self):
+        s, a = self.ap.state_of, {"type": "running"}
+        idle_msg, user_msg = {"type": "idle"}, {"type": "user"}
+        self.assertEqual(s(a, [], [], None, True), "working")
+        self.assertEqual(s(a, [{"id": "per_1"}], [], None, True), "blocked", "a pending permission, while active, is blocked")
+        self.assertEqual(s(a, None, [{"id": "frm_1"}], None, True), "blocked", "a pending form, while active, is blocked")
+        self.assertEqual(s(None, [{"id": "per_1"}], [{"id": "frm_1"}], idle_msg, True), "idle", "lists alone never make a session blocked: it must be active")
+        self.assertEqual(s(None, None, None, None, True), "idle", "a session with no message yet is idle")
+        self.assertEqual(s(None, None, None, idle_msg, True), "idle")
+        self.assertEqual(s(None, None, None, user_msg, True), "idle", "a prompt queued a moment before the turn starts is seen as idle until the next read")
+        self.assertEqual(s(a, [{"id": "x"}], [{"id": "y"}], idle_msg, False), "unknown", "an unreachable service is unknown, whatever else was passed")
+        self.assertEqual(s(None, None, None, None, False), "unknown")
+
+    def test_a_headless_worker_is_discovered_with_its_state_from_the_service_and_never_as_not_found(self):
+        sid = self.headless()
+        found = self.discover().agents["hw"]
+        self.assertEqual((found.headless, found.pane, found.status, found.session_id), (True, None, "idle", sid))
+        self.assertIsNone(found.problem)
+        self.world.v2.start_turn(sid, "work", False, lasts=600)
+        self.assertEqual(self.discover().agents["hw"].status, "working")
+        self.world.v2.__dict__.setdefault("asks", {})[sid] = [{"id": "per_1", "action": "shell", "resources": ["echo x"]}]
+        self.assertEqual(self.discover().agents["hw"].status, "blocked")
+        self.world.v2.__dict__["asks"][sid] = []
+        self.world.v2.__dict__.setdefault("forms", {})[sid] = [{"id": "frm_1", "title": "Questions", "fields": []}]
+        self.assertEqual(self.discover().agents["hw"].status, "blocked")
+        self.world.v2.__dict__["forms"][sid] = []
+        self.world.tick(1200)
+        self.assertEqual(self.discover().agents["hw"].status, "idle")
+
+    def test_an_unreachable_service_makes_it_unknown_with_a_problem_never_dead_never_working_and_it_is_not_dropped(self):
+        sid = self.headless()
+        self.world.v2.down = True
+        found = self.discover().agents["hw"]
+        self.assertEqual((found.status, found.headless, found.session_id), ("unknown", True, sid))
+        self.assertIn("did not answer", found.problem)
+        self.world.v2.down = False
+        self.assertEqual(self.discover().agents["hw"].status, "idle", "back as soon as the service answers")
+
+    def test_a_record_alone_is_not_presence_the_session_must_exist_and_carry_the_workers_name(self):
+        self.headless(name="gone")
+        del self.world.v2.sessions[next(iter(s for s, v in self.world.v2.sessions.items() if v["metadata"]["fleet"]["name"] == "gone"))]
+        self.headless(name="other", fleet_name="someone-else")                      # a record pointing at another agent's session
+        found = self.discover().agents
+        self.assertNotIn("gone", found)
+        self.assertNotIn("other", found)
+
+    def test_a_terminal_that_runs_the_session_wins_over_the_headless_picture_of_it(self):
+        self.world.add_agent("hw", fleet={"role": "coder", "reports_to": "boss"})
+        sid = self.world.sessions["hw"]
+        self.ap.save_record(self.world.state, "hw", sid, self.url)
+        self.world.herdr.panes[self.world.panes["hw"]]["program"] = FAKE_OPENCODE + " -s " + sid
+        found = self.discover().agents["hw"]
+        self.assertEqual((found.headless, found.pane), (False, self.world.panes["hw"]))
+
+    def test_a_delivery_to_a_headless_worker_is_not_held_and_reads_it_again_first_and_an_outage_holds_it_without_dropping_it(self):
+        sid = self.headless()
+        texts = lambda: [m.get("text", "") for m in self.world.v2.sessions[sid]["messages"] if m["type"] in ("user", "synthetic")]
+        reads = []
+        real = sb.Switchboard.reobserve
+        with mock.patch.object(sb.Switchboard, "reobserve", lambda self_, previous, now: reads.append(previous.headless) or real(self_, previous, now)):
+            outcome = self.engine.send("boss", "hw", "please start", None, None)
+        self.assertTrue(outcome["sent"], outcome)
+        self.assertEqual(reads, [True], "the headless worker was read again just before the write")
+        self.assertTrue(any("please start" in t for t in texts()), texts())
+        before = len(texts())
+        self.world.v2.down = True
+        held = self.engine.send("boss", "hw", "again", None, None)
+        self.assertFalse(held["sent"])
+        self.assertEqual(held["action"], "hold", held)
+        self.assertIn("cannot reach the OpenCode service", held["reason"])
+        self.world.v2.down = False
+        self.assertEqual(len(texts()), before, "nothing reached the session during the outage")
+        self.assertTrue(self.engine.send("boss", "hw", "again", None, None)["sent"], "the same send goes through once the service is back")
+        self.assertTrue(any("again" in t for t in texts()))
+
+    def test_herdr_down_still_discovers_the_headless_worker_and_a_404_or_a_changed_record_is_not_a_worker(self):
+        sid = self.headless()
+        self.world.herdr.down = True
+        found = self.discover()
+        self.assertEqual(found.agents["hw"].status, "idle")
+        self.assertTrue(any("herdr unreachable" in p for p in found.problems))
+        self.world.herdr.down = False
+        before = self.discover().agents["hw"]
+        other = self.headless(name="hw2", register=False)
+        self.ap.save_record(self.world.state, "hw", other, self.url)               # the record now names another session
+        self.assertIsNone(self.engine.reobserve(before, self.world.clock.now())[0], "a changed record is refused")
+        self.ap.save_record(self.world.state, "hw", sid, self.url)
+        fresh, why = self.engine.reobserve(before, self.world.clock.now())
+        self.assertEqual((fresh.name, fresh.headless, why), ("hw", True, None))
+        self.world.v2.down = True
+        self.assertIsNone(self.engine.reobserve(before, self.world.clock.now())[0], "an unreachable service is never a delivery")
+        self.world.v2.down = False
+        del self.world.v2.sessions[sid]
+        self.assertNotIn("hw", self.discover().agents, "a session the service no longer has is not a worker")
+
+    def test_a_record_that_names_a_terminal_agent_with_another_session_is_a_conflict_not_a_takeover(self):
+        self.world.add_agent("t1", fleet={"role": "coder", "reports_to": "boss"})
+        imposter = self.world.v2.create_session({"fleet": {"name": "t1", "role": "coder", "reports_to": "boss"}})
+        self.ap.save_record(self.world.state, "t1", imposter, self.url)
+        found = self.discover().agents["t1"]
+        self.assertFalse(found.headless, "the terminal's own session keeps the name")
+        self.assertEqual(found.session_id, self.world.sessions["t1"])
+        self.assertEqual(found.conflict, [imposter], "the other session is a conflict, and a conflict is never delivered to")
+
+    def test_a_headless_worker_that_finishes_or_blocks_wakes_its_boss_like_any_worker(self):
+        sid = self.headless()
+        self.world.v2.start_turn(sid, "work", False, lasts=30)
+        self.discover()
+        self.world.tick(60)
+        self.discover()
+        facts, _ = self.engine.collect_facts()
+        idle = [f for f in facts if f.kind in (sb.WORKER_IDLE, "worker.stopped") and f.recipient == "boss"]     # a bare idle is a rider; a stop the triage finds is a wake
+        self.assertEqual(len(idle), 1, [(f.kind, f.recipient) for f in facts])
+        self.assertIn("hw", idle[0].summary)
+        self.world.v2.start_turn(sid, "more", False, lasts=600)
+        self.world.v2.__dict__.setdefault("asks", {})[sid] = [{"id": "per_9", "action": "shell", "resources": ["echo hi"], "save": ["echo *"]}]
+        self.discover()
+        facts, _ = self.engine.collect_facts()
+        blocked = [f for f in facts if f.kind == sb.WORKER_BLOCKED and f.recipient == "boss"]
+        self.assertEqual(len(blocked), 1, [(f.kind, f.recipient) for f in facts])
+
+    def test_status_lists_it_with_the_pane_headless(self):
+        self.headless()
+        line = sb._agent_line({"name": "hw", "observation": self.discover().agents["hw"].to_json(), "plan": None})
+        self.assertIn("(headless)", line)
+        self.assertIn("idle", line)
+
+    def test_the_record_is_private_and_only_a_loopback_local_worker_is_accepted(self):
+        sid = self.headless(register=False)
+        body = self.ap.save_record(self.world.state, "hw", sid, self.url, now=5)
+        self.assertEqual((body["kind"], body["worker"], body["session"], body["url"]), ("local", "hw", sid, self.url))
+        path = Path(self.world.state) / "headless" / "hw.json"
+        self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
+        self.assertEqual(oct((Path(self.world.state) / "headless").stat().st_mode & 0o777), "0o700")
+        for bad in ("https://example.test:443", "http://example.test:80", "http://127.0.0.1", "http://127.0.0.1:49374/x", "ftp://127.0.0.1:1"):
+            with self.assertRaises(ValueError, msg=bad):
+                self.ap.save_record(self.world.state, "hw", sid, bad)
+        with self.assertRaises(ValueError):
+            self.ap.save_record(self.world.state, "../escape", sid, self.url)
+        with self.assertRaises(ValueError):
+            self.ap.save_record(self.world.state, "hw", "not-a-session", self.url)
+        path.chmod(0o644)
+        self.assertIsNone(self.ap.load_record(self.world.state, "hw"), "a record anyone can write is not trusted")
+        path.chmod(0o600)
+        self.assertEqual(self.ap.load_record(self.world.state, "hw")["session"], sid)
+        path.write_text("{not json")
+        self.assertIsNone(self.ap.load_record(self.world.state, "hw"))
+        self.assertEqual(self.ap.list_records(self.world.state), [])
+
+    def test_an_unusable_record_is_said_in_discovery_one_line_each_and_reading_never_creates_the_directory(self):
+        state = Path(self.world.state)
+        self.assertEqual(self.discover().problems, [], "no directory, no records: silent")
+        self.assertFalse((state / "headless").exists(), "a read creates nothing")
+        sid = self.headless()
+        (state / "headless" / "hw.json").chmod(0o644)
+        (state / "headless" / "bad.json").write_text("{not json")
+        (state / "headless" / "bad.json").chmod(0o600)
+        problems = self.discover().problems
+        self.assertEqual(len([p for p in problems if "headless record" in p]), 2, problems)
+        self.assertTrue(any("hw" in p and "not private" in p for p in problems), problems)
+        self.assertTrue(any("bad" in p and "not readable JSON" in p for p in problems), problems)
+        self.assertNotIn("hw", self.discover().agents, "an untrusted record is not a worker")
+        self.assertEqual(self.ap.read_record(self.world.state, "nobody"), (None, None))
+
+    def test_the_scan_says_a_cap_a_misnamed_file_and_a_symlinked_directory_and_removing_creates_nothing(self):
+        state = Path(self.world.state)
+        self.assertFalse(self.ap.remove_record(self.world.state, "hw"))
+        self.assertFalse((state / "headless").exists(), "removing a record that is not there makes no directory")
+        sid = self.headless(register=False)
+        for n in range(self.ap.MAX_RECORDS + 3):
+            self.ap.save_record(self.world.state, "w%03d" % n, sid, self.url)
+        (state / "headless" / "Bad Name.json").write_text("{}")
+        records, problems = self.ap.scan_records(self.world.state)
+        self.assertEqual(len(records), self.ap.MAX_RECORDS)
+        self.assertTrue(any("more than %d headless records" % self.ap.MAX_RECORDS in p for p in problems), problems)
+        self.assertTrue(any("Bad Name.json" in p and "not named for a worker" in p for p in problems), problems)
+        real = state / "headless"
+        moved = state / "headless-real"
+        real.rename(moved)
+        os.symlink(str(moved), str(real))
+        records, problems = self.ap.scan_records(self.world.state)
+        self.assertEqual(records, [])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("not the user's own real directory", problems[0])
+        self.assertIsNone(self.ap.load_record(self.world.state, "w000"))
+
+    def test_remove_record_deletes_it_once_and_says_so(self):
+        sid = self.headless()
+        path = Path(self.world.state) / "headless" / "hw.json"
+        self.assertTrue(path.exists())
+        self.assertTrue(self.ap.remove_record(self.world.state, "hw"))
+        self.assertFalse(path.exists())
+        self.assertFalse(self.ap.remove_record(self.world.state, "hw"))
+        self.assertFalse(self.ap.remove_record(self.world.state, "../x"))
+
+
 class TestSelfRegisteringCli(unittest.TestCase):
     """The front door (#179 follow-up): commands register and dispatch BY NAME, so a new command edits no shared list. What must not change: the set of
     subcommands and each one's help, the function each runs and what it is given, the daemon start, the error mapping; and a hostile name never runs
@@ -11158,9 +11578,6 @@ class TestSelfRegisteringCli(unittest.TestCase):
         "status": ("cmd_status", ("args", "runner", "now")), "poke": ("cmd_poke", ("args",)), "policy-report": ("cmd_policy_report", ("args", "runner", "now")),
         "agents": ("cmd_agents", ("args", "runner", "now")), "job": ("cmd_job", ("args", "runner", "now", "spawn")), "review-laws": ("cmd_review_laws", ("args", "runner", "now")), "review": ("cmd_review", ("args", "runner", "now")), "pr-explain": ("cmd_pr_explain", ("args", "runner", "now")), "disk": ("cmd_disk", ("args", "runner", "now")), "pr-state": ("cmd_pr_state", ("args", "runner", "now")),
         "reattach": ("cmd_reattach", ("args", "runner", "now", "socket_call")),
-        "heavy": ("cmd_heavy", ("args",)),
-        "read": ("cmd_read", ("args", "runner", "now")),
-        "reds": ("cmd_reds", ("args", "runner", "now")),
         "retire": ("cmd_retire", ("args", "runner", "now")),
         "impact": ("cmd_impact", ("args", "runner", "now")), "judge-tool": ("cmd_judge_tool", ("args", "runner", "now")),
         "ensure": ("cmd_ensure", ("args", "spawn")), "install": ("cmd_install", ("args", "runner", "now", "spawn")), "key": ("cmd_key", ("args", "runner", "now")),
@@ -11300,10 +11717,18 @@ class TestSelfRegisteringCli(unittest.TestCase):
             git("merge", "--no-edit", "two")
             self.assertTrue((target / "alpha-cmd.json").exists() and (target / "beta-cmd.json").exists())
 
-    def test_the_old_dispatch_table_covers_every_command_but_version(self):
+    def test_the_old_dispatch_table_is_still_registered_and_every_registered_command_has_a_handler(self):
+        """OLD is the table of the ORIGINAL commands and never grows: a new command adds no row here. What must hold for every command, old or new, is
+        derived: it is registered, and `resolve_command` finds its `cmd_<action>` function."""
         parser, choices = self.commands()
-        self.assertEqual(sorted(set(choices) - {"version"}), sorted(set(self.OLD) - {"plan"} | {"plan"}))
+        self.assertTrue(set(self.OLD) <= set(choices), "an original command is gone: %s" % sorted(set(self.OLD) - set(choices)))
         self.assertEqual(parser.commands, frozenset(choices))
+        for action in sorted(set(choices) - {"version"}):
+            with self.subTest(action=action):
+                handler = sb.resolve_command(action, parser.commands)
+                self.assertTrue(callable(handler), "%s has no cmd_ function" % action)
+                required = [n for n, p in inspect.signature(handler).parameters.items() if p.default is p.empty and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)]
+                self.assertTrue(set(required) <= set(sb.COMMAND_ARGUMENTS), "%s asks for %s, which a command is never given" % (action, sorted(set(required) - set(sb.COMMAND_ARGUMENTS))))
 
     def run_dispatch(self, action, **namespace):
         """dispatch() for `action` with every function replaced by a recorder that keeps the real signature: (return value, calls, ensure calls)."""
@@ -11353,14 +11778,49 @@ class TestSelfRegisteringCli(unittest.TestCase):
         self.assertEqual((code, calls, ensured), (0, [], []))
         self.assertIn(sb.VERSION, out.getvalue())
 
+    @staticmethod
+    def declared_groups():
+        """{group: set(actions)} read from the SOURCE: every module-level `cmd_x.<group> = True` of bin/fleet-switchboard, for a command the parser
+        registers. This is what each command says beside itself: the expected sets are DERIVED from it, never kept as a list in a test."""
+        declared = {"direct": set(), "ledger": set(), "ensure_on_use": set()}
+        registered = TestSelfRegisteringCli.commands()[0].commands
+        tree = ast.parse(SWITCHBOARD.read_text())
+        plain = {id(node) for node in tree.body}
+        for node in ast.walk(tree):    # a declaration written any other way would be invisible to the scan AND to the views: refuse it
+            if isinstance(node, ast.Assign) and any(isinstance(x, ast.Attribute) and x.attr in declared and isinstance(x.value, ast.Name)
+                                                    and x.value.id.startswith("cmd_") for x in node.targets):
+                if id(node) not in plain or not (isinstance(node.value, ast.Constant) and node.value.value is True):
+                    raise AssertionError("line %d declares a command's dispatch group in a form the guard cannot read: write `cmd_x.<group> = True` at module level" % node.lineno)
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Attribute) \
+                    and isinstance(node.targets[0].value, ast.Name) and node.targets[0].attr in declared \
+                    and isinstance(node.value, ast.Constant) and node.value.value is True and node.targets[0].value.id.startswith("cmd_"):
+                action = node.targets[0].value.id[4:].replace("_", "-")
+                if action in registered:
+                    declared[node.targets[0].attr].add(action)
+        return declared
+
+    def group_problems(self):
+        """One line per group whose effective set differs from what the commands declare, naming the commands."""
+        declared, problems = self.declared_groups(), []
+        for name, effective, key in (("DIRECT_ACTIONS", sb.DIRECT_ACTIONS, "direct"), ("LEDGER_ACTIONS", sb.LEDGER_ACTIONS, "ledger"),
+                                     ("ENSURE_ON_USE_COMMANDS", sb.ENSURE_ON_USE_COMMANDS, "ensure_on_use")):
+            if set(effective) != declared[key]:
+                problems.append("%s differs from what the commands declare: missing %s, extra %s" % (name, sorted(declared[key] - set(effective)), sorted(set(effective) - declared[key])))
+        return problems
+
     def test_the_error_mapping_and_the_special_groups_are_what_they_were(self):
-        # the groups are VIEWS of the `direct`, `ledger` and `ensure_on_use` attributes each command sets next to its own definition: every command that
-        # was in a shared list is still in its group, and the only additions are commands that already said `direct` themselves
+        # The effective groups (the module's views) must equal what the commands DECLARE (read from the source), exactly: a command whose declared
+        # group differs from its effective one fails loudly. And the pure-move guarantee stays: every original member is still in its group.
+        self.assertEqual(self.group_problems(), [])
+        with mock.patch.object(sb, "LEDGER_ACTIONS", frozenset(set(sb.LEDGER_ACTIONS) - {"gates"})):       # the guard fails loudly and names the command
+            self.assertEqual(self.group_problems(), ["LEDGER_ACTIONS differs from what the commands declare: missing ['gates'], extra []"])
+        with mock.patch.object(sb, "DIRECT_ACTIONS", frozenset(set(sb.DIRECT_ACTIONS) | {"send"})):
+            self.assertEqual(self.group_problems(), ["DIRECT_ACTIONS differs from what the commands declare: missing [], extra ['send']"])
         self.assertTrue(set(self.OLD_DIRECT) <= set(sb.DIRECT_ACTIONS))
-        # these already said `cmd_x.direct = True` before this change, so they already ran direct: the views only make that visible
-        self.assertEqual(set(sb.DIRECT_ACTIONS) - set(self.OLD_DIRECT), {"disk", "heavy", "load-replay", "pr-state", "reds", "triage"})
-        self.assertEqual(sorted(sb.LEDGER_ACTIONS), sorted(self.OLD_LEDGER))
-        self.assertEqual(sorted(sb.ENSURE_ON_USE_COMMANDS), sorted(self.OLD_ENSURE_ON_USE))
+        self.assertTrue(set(self.OLD_LEDGER) <= set(sb.LEDGER_ACTIONS))
+        self.assertTrue(set(self.OLD_ENSURE_ON_USE) <= set(sb.ENSURE_ON_USE_COMMANDS))
+        self.assertNotIn("judge-tool", sb.ENSURE_ON_USE_COMMANDS, "judge-tool runs inside v2 on every tool call: it never starts the daemon")
         known = self.commands()[0].commands
 
         def raising(error):
@@ -19132,7 +19592,7 @@ class TestIdentityCheck(ReportBase):
         self.assertEqual((shim.my_name(), shim.account_env("/usr/bin/gh")), ("agent", None))
 
     def run_gh_shim(self, repo, users, token_for=None, who_repo_exit=0, inherited="inherited-personal-token", args=(),
-                    wedge=False, seconds=None, extra_env=None):
+                    wedge=False, seconds=None, extra_env=None, own=None):
         """The real shim in a subprocess with a fake gh and a fake switchboard. The fake gh logs which GH_TOKEN it ran with
         (in a test file only); `gh auth token --user NAME` answers from `token_for`. Returns (done, log)."""
         home = Path(self.home)
@@ -19155,9 +19615,9 @@ class TestIdentityCheck(ReportBase):
         else:
             (bindir / "sb").write_text(
                 "#!/bin/sh\nif [ \"$1\" = whoami ] && [ \"$2\" = --json ]; then [ %d -ne 0 ] && exit %d; "
-                "echo '{\"name\": \"api\", \"repo\": %s}'; exit 0; fi\n"
+                "echo '{\"name\": \"api\", \"repo\": %s%s}'; exit 0; fi\n"
                 "[ \"$1\" = whoami ] && echo api && exit 0\nexit 2\n"
-                % (who_repo_exit, who_repo_exit, json.dumps(repo) if repo else "null"))
+                % (who_repo_exit, who_repo_exit, json.dumps(repo) if repo else "null", "" if own is None else ", \"own\": %s" % ("true" if own else "false")))
         (bindir / "sb").chmod(0o755)
         config = home / "xdg-config" / "fleet-switchboard"
         config.mkdir(parents=True, exist_ok=True)
@@ -19175,6 +19635,74 @@ class TestIdentityCheck(ReportBase):
                               env=environ, timeout=60)
         self.shim_seconds = time.monotonic() - started
         return done, (json.loads(log.read_text()) if log.exists() else None)
+
+    def test_a_caller_with_no_repo_of_its_own_acts_as_the_account_of_the_repo_an_issue_or_pr_command_names_and_nothing_else_picks_one(self):
+        users = {"acme/*": "acct-personal", "other-org/*": "acct-other"}
+        tokens = {"acct-personal": "tok-personal", "acct-other": "tok-other"}
+        cases = (
+            (("issue", "list", "-R", "acme/api"), "tok-personal"), (("pr", "view", "5", "--repo", "other-org/svc"), "tok-other"),
+            (("issue", "create", "--repo=acme/api", "--title", "t"), "tok-personal"), (("issue", "comment", "https://github.com/other-org/svc/issues/4", "--body", "x"), "tok-other"),
+            (("pr", "ready", "https://github.com/acme/api/pull/9"), "tok-personal"), (("pr", "edit", "5", "-R", "other-org/svc", "--add-label", "x"), "tok-other"),
+            (("issue", "close", "3", "-Racme/api"), "tok-personal"))
+        for args, expected in cases:
+            with self.subTest(args=args):
+                done, seen = self.run_gh_shim(None, users, tokens, args=args)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(seen["token"], expected)
+        for args in (("pr", "merge", "5", "-R", "acme/api"), ("repo", "view", "acme/api"), ("secret", "set", "X", "-R", "acme/api"),
+                     ("workflow", "run", "ci.yml", "-R", "acme/api"), ("run", "rerun", "7", "-R", "acme/api"), ("api", "repos/acme/api/issues"),
+                     ("issue", "list", "-R", "unmapped/repo")):
+            with self.subTest(no_pick=args):     # only issue and pr commands (never merge) pick an account by what they name; the rest keep the inherited token
+                done, seen = self.run_gh_shim(None, users, tokens, args=args)
+                self.assertTrue(seen is None or seen["token"] == "inherited-personal-token", (args, seen))
+        done, seen = self.run_gh_shim("acme/api", users, tokens, args=("issue", "list", "-R", "other-org/svc"))
+        self.assertEqual(seen["token"], "tok-personal", "a caller WITH a repo keeps its own account: what it names never overrides it")
+        # what a body, a title or a second flag says never picks the account: a repo is taken only from the real flag or the target URL
+        for args in (("issue", "comment", "5", "--body", "https://github.com/other-org/svc/issues/1"), ("issue", "comment", "5", "--body", "-Rother-org/svc"),
+                     ("issue", "create", "--title", "https://github.com/other-org/svc/pull/1"), ("issue", "comment", "5", "-R", "acme/api", "-R", "other-org/svc", "--body", "x"),
+                     ("issue", "create", "-t", "-R", "--body", "other-org/svc")):
+            with self.subTest(steer=args):
+                done, seen = self.run_gh_shim(None, users, tokens, args=args)
+                self.assertTrue(seen is None or seen["token"] == "inherited-personal-token", (args, seen))
+        shim = self.shim()
+        self.assertEqual(shim.explicit_repo(["issue", "comment", "5", "--body", "x", "-R", "acme/api"]), "acme/api")
+        self.assertEqual(shim.explicit_repo(["pr", "view", "https://github.com/other-org/svc/pull/3"]), "other-org/svc")
+        self.assertIsNone(shim.explicit_repo(["issue", "comment", "5", "--body", "https://github.com/other-org/svc/issues/1"]))
+        # fail closed like a failed lookup: the account's token cannot be had, so an issue write is refused instead of run as the wrong account
+        done, seen = self.run_gh_shim(None, users, {"acct-personal": "tok-personal"}, args=("issue", "comment", "3", "-R", "other-org/svc", "--body", "x"))
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("account lookup failed, retry", done.stderr)
+        self.assertIsNone(seen)
+        done, seen = self.run_gh_shim(None, users, {"acct-personal": "tok-personal"}, args=("issue", "list", "-R", "other-org/svc"))
+        self.assertEqual((done.returncode, seen["token"]), (0, "inherited-personal-token"), "a read still falls through")
+
+    def test_the_chief_of_staff_whose_whoami_gives_only_the_default_intent_repo_still_acts_as_the_account_of_the_repo_a_command_names(self):
+        """The real shape: cos has no repo of its own, and `whoami --json` falls back to the config's `intent_repo` (own: false). Before, the shim
+        used that default repo's account for everything, so the named-repo branch never ran for cos."""
+        users = {"acme-ops/*": "acct-ops", "acme/*": "acct-personal"}
+        tokens = {"acct-ops": "tok-ops", "acct-personal": "tok-personal"}
+        for args, expected in ((("issue", "view", "5", "-R", "acme/api"), "tok-personal"), (("pr", "view", "5", "--repo", "acme-ops/svc"), "tok-ops"),
+                               (("issue", "comment", "5", "-R", "acme/api", "--body", "x"), "tok-personal"),
+                               (("issue", "list"), "tok-ops"),                                   # nothing named: the default repo's account, as before
+                               (("pr", "merge", "5", "-R", "acme/api"), "tok-ops"),               # a merge never switches: the default's account
+                               (("repo", "view", "acme/api"), "tok-ops")):                        # nor does anything but issue and pr
+            with self.subTest(args=args):
+                done, seen = self.run_gh_shim("acme-ops/default", users, tokens, args=args, own=False)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(seen["token"], expected)
+        done, seen = self.run_gh_shim("acme-ops/default", users, tokens, args=("issue", "view", "5", "-R", "acme/api"), own=True)
+        self.assertEqual(seen["token"], "tok-ops", "a caller whose repo IS its own keeps its account")
+
+    def test_whoami_json_says_whether_the_repo_is_the_callers_own_or_only_the_default(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "intent_repo": "acme-ops/default"})
+        self.world.add_agent("boss", fleet={"role": "chief-of-staff"})
+        os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]
+        code, out, err = self.call("whoami", "--json")
+        self.assertEqual((code, json.loads(out)), (0, {"name": "boss", "repo": "acme-ops/default", "own": False}), err)
+        self.world.add_agent("worker", fleet={"role": "coder", "repo": "acme/api"})
+        os.environ["HERDR_PANE_ID"] = self.world.panes["worker"]
+        code, out, err = self.call("whoami", "--json")
+        self.assertEqual((code, json.loads(out)), (0, {"name": "worker", "repo": "acme/api", "own": True}), err)
 
     def test_the_reviewer_shape_an_inherited_wrong_account_token_is_replaced_by_the_callers_repo_account(self):
         users = {"acme-ops/service": "acct-ops", "acme-ops/*": "acct-ops-other", "acme/*": "acct-personal"}
@@ -19270,7 +19798,7 @@ class TestIdentityCheck(ReportBase):
         shim = self.shim()
         calls, execs = [], []
 
-        def blip(gh, lookup=None, strict=False):
+        def blip(gh, lookup=None, strict=False, args=None):
             calls.append(strict)
             if strict and calls.count(True) == 1:      # the first STRICT lookup fails; the gate probe's non-strict one does not count
                 raise shim.AccountLookupFailed("identity")
@@ -19332,7 +19860,7 @@ class TestIdentityCheck(ReportBase):
         code, out, err = self.call("whoami", "--repo")
         self.assertEqual((code, out.strip()), (0, "acme-ops/service"))
         code, out, err = self.call("whoami", "--json")
-        self.assertEqual((code, json.loads(out)), (0, {"name": "ops", "repo": "acme-ops/service"}))
+        self.assertEqual((code, json.loads(out)), (0, {"name": "ops", "repo": "acme-ops/service", "own": True}))
         code, out, err = self.call("whoami")
         self.assertEqual((code, out.strip()), (0, "ops"))
         os.environ["HERDR_PANE_ID"] = self.world.panes["coder"]                      # a pane of ANOTHER agent changes nothing
@@ -39570,6 +40098,274 @@ class TestPermanentRefusals(ExternalWorld):
         self.assertEqual(self.fake.items[self.ext_of("issue")]["state"], "open")
 
 
+class AlreadyDecidedRefusal(Exception):
+    """What the real adapter raises for a 409 "already decided": a permanent refusal that says it is settled outside."""
+
+    permanent = True
+    settled_outside = True
+
+
+class TestSettledOutside(ExternalWorld):
+    """Ask #53: an "already decided (or closed)" reply to a revise or withdraw is the other side's answer, not a failure."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake = PickyExternal()
+        self.pulls = 0
+        real = self.fake.pull_changes
+
+        def counting(cursor):
+            self.pulls += 1
+            return real(cursor)
+        self.fake.pull_changes = counting
+
+    def links(self):
+        return json.loads((self.world.state / "external-links.json").read_text())["links"]
+
+    def count_line(self):
+        return self.cmd("you", "status")["out"]
+
+    def open_decision(self):
+        self.turn_on()
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        self.run_pass()
+        return self.ext_of("issue")
+
+    def test_s1_a_withdraw_answered_already_decided_is_settled_outside_and_counts_for_nothing(self):
+        self.open_decision()
+        self.fake.refuse["withdraw"] = AlreadyDecidedRefusal("409: already decided")
+        self.assertEqual(self.cmd("you", "decisions", "resolve", "api#2")["code"], 0)
+        for _ in range(3):
+            self.run_pass(120)
+        self.assertEqual(len([c for c in self.fake.calls if c[0] == "withdraw"]), 1, "not tried again")
+        self.assertEqual(len(self.audit_events("external.settled_outside")), 1)
+        self.assertEqual(self.audit_events("external.permanent_failure"), [])
+        self.assertNotIn("permanent failure", self.count_line())
+
+    def test_s2_a_revise_answered_already_decided_or_closed_is_the_same(self):
+        ext = self.open_decision()
+        self.fake.refuse["revise"] = AlreadyDecidedRefusal("409: already decided or closed")
+        self.gh.issues[(API, 2)]["title"] = "Which database should it use?"
+        for _ in range(3):
+            self.run_pass(120)
+        (event,) = self.audit_events("external.settled_outside")
+        self.assertEqual((event["detail"]["op"], event["detail"]["dropped_ops"]), ("revise", 1))
+        self.assertEqual(self.audit_events("external.permanent_failure"), [])
+        self.assertNotIn("permanent failure", self.count_line())
+        (link,) = self.links().values()
+        self.assertTrue(link["decided_outside"])
+        self.assertNotIn("last_error", link)
+
+    def test_s3_nothing_more_is_queued_for_a_settled_link_and_the_answer_is_pulled_and_applied(self):
+        ext = self.open_decision()
+        self.fake.refuse["revise"] = AlreadyDecidedRefusal("409: already decided")
+        self.gh.issues[(API, 2)]["title"] = "Which database should it use?"
+        self.run_pass(120)
+        revises = len([c for c in self.fake.calls if c[0] == "revise"])
+        self.assertEqual(revises, 1)
+        pulls = self.pulls
+        self.gh.issues[(API, 2)]["title"] = "Which database should the service use?"   # changes again: still no operation for it
+        self.fake.refuse.clear()
+        for _ in range(3):
+            self.run_pass(120)
+        self.assertEqual(len([c for c in self.fake.calls if c[0] in ("revise", "withdraw", "status")]), revises)
+        self.assertEqual(json.loads((self.world.state / "external-outbox.json").read_text())["ops"], [])
+        self.assertGreater(self.pulls, pulls, "the answer is looked for")
+        self.event(ext, kind="answered", by="human")
+        self.run_pass(120)
+        self.assertEqual(len(self.audit_events("external.answered")), 1, "the answer that was decided outside is applied here")
+
+    def test_s3_the_settle_pulls_on_the_same_cycle(self):
+        self.turn_on(poll_seconds=600)   # a long poll: only the settle itself can make the pull happen now
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        self.run_pass()
+        ext = self.ext_of("issue")
+        self.fake.refuse["revise"] = AlreadyDecidedRefusal("409: already decided")
+        self.event(ext, kind="answered", by="human")
+        self.gh.issues[(API, 2)]["title"] = "Which database should it use?"
+        self.run_pass(1)   # one cycle: the flush settles, and the pull of that same cycle takes the answer
+        self.assertEqual(len(self.audit_events("external.settled_outside")), 1)
+        self.assertEqual(len(self.audit_events("external.answered")), 1)
+
+    def test_s4_a_real_permanent_error_still_counts(self):
+        self.turn_on()
+        self.fake.refuse["raise"] = PermanentRefusal("400: invalid request")
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        for _ in range(3):
+            self.run_pass(120)
+        self.assertEqual(len(self.audit_events("external.permanent_failure")), 1)
+        self.assertEqual(self.audit_events("external.settled_outside"), [])
+        self.assertIn("1 permanent failure(s)", self.count_line())
+
+    def test_s6_other_permanent_refusals_are_counted_and_none_is_settled(self):
+        for name in ("invalid request", "unknown item", "refused credential"):
+            with self.subTest(name=name):
+                self.setUp()
+                self.turn_on()
+                self.fake.refuse["raise"] = PermanentRefusal("4xx: %s" % name)
+                self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+                self.run_pass(120)
+                self.assertEqual((len(self.audit_events("external.permanent_failure")), len(self.audit_events("external.settled_outside"))), (1, 0))
+
+    def test_s5_a_failure_is_cleared_when_its_link_closes_and_a_failed_raise_with_no_link_stays(self):
+        ext = self.open_decision()
+        self.fake.refuse["revise"] = PermanentRefusal("400: invalid request")
+        self.gh.issues[(API, 2)]["title"] = "Which database should it use?"
+        self.run_pass(120)
+        self.assertIn("1 permanent failure(s)", self.count_line())
+        self.fake.refuse.clear()
+        self.event(ext, kind="answered", by="human")
+        self.run_pass(120)
+        self.assertNotIn("permanent failure", self.count_line(), "its link closed: the old failure is not a failure to show")
+        self.fake.refuse["raise"] = PermanentRefusal("400: invalid request")
+        self.gh.issue(API, 3, "Another one?", labels=["me:awaiting-cos"])
+        self.run_pass(120)
+        self.run_pass(120)
+        self.assertIn("1 permanent failure(s)", self.count_line(), "a failed raise has no link and still counts")
+
+    def test_s5_a_settled_failure_entry_of_the_same_decision_is_cleared(self):
+        ext = self.open_decision()
+        self.fake.refuse["revise"] = PermanentRefusal("400: invalid request")
+        self.gh.issues[(API, 2)]["title"] = "Which database should it use?"
+        self.run_pass(120)
+        self.assertIn("1 permanent failure(s)", self.count_line())
+        self.fake.refuse["withdraw"] = AlreadyDecidedRefusal("409: already decided")
+        self.fake.refuse.pop("revise")
+        self.assertEqual(self.cmd("you", "decisions", "resolve", "api#2")["code"], 0)
+        self.run_pass(120)
+        self.run_pass(120)
+        self.assertNotIn("permanent failure", self.count_line())
+
+    def test_the_settled_flag_lives_in_the_link_file_and_survives_a_restart(self):
+        ext = self.open_decision()
+        self.fake.refuse["revise"] = AlreadyDecidedRefusal("409: already decided")
+        self.gh.issues[(API, 2)]["title"] = "Which database should it use?"
+        self.run_pass(120)
+        (link,) = self.links().values()
+        self.assertTrue(link["decided_outside"], "written to external-links.json")
+        self.world.engine.external_sync = None            # the daemon restarted: the link table is read again
+        revises = len([c for c in self.fake.calls if c[0] == "revise"])
+        self.fake.refuse.clear()
+        self.gh.issues[(API, 2)]["title"] = "Which database should the service use?"
+        for _ in range(3):
+            self.run_pass(120)
+        self.assertEqual(len([c for c in self.fake.calls if c[0] == "revise"]), revises, "still settled after the restart: nothing is revised")
+        self.event(ext, kind="answered", by="human")
+        self.run_pass(120)
+        self.assertEqual(len(self.audit_events("external.answered")), 1)
+
+    def test_an_old_link_file_without_the_flag_keeps_todays_behaviour_and_a_corrupt_one_is_rebuilt(self):
+        ext = self.open_decision()
+        path = self.world.state / "external-links.json"
+        body = json.loads(path.read_text())
+        for link in body["links"].values():
+            link.pop("decided_outside", None)
+        path.write_text(json.dumps(body))
+        self.world.engine.external_sync = None
+        self.gh.issues[(API, 2)]["title"] = "Which database should it use?"
+        self.run_pass(120)
+        self.run_pass(120)
+        self.assertEqual(self.fake.items[ext]["revisions"], [1, 2], "no flag: the revise goes as it always did")
+        path.write_text("{not json")
+        self.world.engine.external_sync = None
+        self.run_pass(120)
+        self.run_pass(120)
+        self.assertEqual(len(self.fake.items), 1, "a corrupt file is rebuilt by lookup, never trusted")
+
+    def test_the_settle_sends_nothing_new_and_pulls_once_per_cycle(self):
+        self.turn_on(poll_seconds=600)
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        self.run_pass()
+        self.fake.refuse["revise"] = AlreadyDecidedRefusal("409: already decided")
+        self.gh.issues[(API, 2)]["title"] = "Which database should it use?"
+        sent = len(self.fake.calls)
+        pulls = self.pulls
+        self.run_pass(1)
+        self.assertEqual(len(self.fake.calls) - sent, 1, "only the revise that was refused: the settle itself sends nothing")
+        self.assertEqual(self.pulls - pulls, 1, "one pull on that cycle, not a loop")
+        self.run_pass(1)
+        self.assertEqual(self.pulls - pulls, 1, "and the long poll applies again after it")
+
+    def test_a_damaged_flag_value_is_never_a_settle_only_the_boolean_true_is(self):
+        ext = self.open_decision()
+        path = self.world.state / "external-links.json"
+        for bad in ("false", "no", 0, 1, [], [1], {}, "true", "yes", None):
+            with self.subTest(bad=bad):
+                body = json.loads(path.read_text())
+                for link in body["links"].values():
+                    link["decided_outside"] = bad
+                    link["decided_outside_at"] = 5
+                path.write_text(json.dumps(body))
+                self.world.engine.external_sync = None
+                revises = len([c for c in self.fake.calls if c[0] == "revise"])
+                self.gh.issues[(API, 2)]["title"] = "Which database should it use %s?" % json.dumps(bad)
+                self.run_pass(120)
+                self.run_pass(120)
+                self.assertGreater(len([c for c in self.fake.calls if c[0] == "revise"]), revises, "not settled: its revise went out")
+                (link,) = self.links().values()
+                self.assertNotIn("decided_outside", link, "normalised away when the file is loaded")
+                self.assertNotIn("settled outside", self.count_line())
+
+    def test_a_settled_link_waiting_for_its_answer_stays_visible_in_status_with_its_age(self):
+        ext = self.open_decision()
+        self.fake.refuse["revise"] = AlreadyDecidedRefusal("409: already decided")
+        self.gh.issues[(API, 2)]["title"] = "Which database should it use?"
+        self.run_pass(120)
+        self.run_pass(300)
+        self.assertRegex(self.count_line(), r"settled outside, waiting for its answer: 1 \(oldest \d+[ms]\)")
+        self.assertNotIn("permanent failure", self.count_line())
+        self.fake.refuse.clear()
+        self.event(ext, kind="answered", by="human")
+        self.run_pass(120)
+        self.assertNotIn("settled outside", self.count_line(), "the answer was applied: nothing is waiting")
+
+    def test_a_settled_link_that_closes_by_withdrawal_stops_being_counted(self):
+        self.open_decision()
+        self.fake.refuse["revise"] = AlreadyDecidedRefusal("409: already decided")
+        self.gh.issues[(API, 2)]["title"] = "Which database should it use?"
+        self.run_pass(120)
+        self.assertIn("settled outside, waiting for its answer: 1", self.count_line())
+        self.assertEqual(self.cmd("you", "decisions", "resolve", "api#2")["code"], 0)
+        self.run_pass(120)
+        self.run_pass(120)
+        self.assertNotIn("waiting for its answer", self.count_line(), "it closed here: not waiting any more")
+
+    def test_s7_what_is_pushed_for_other_decisions_is_unchanged_after_a_settle(self):
+        self.open_decision()
+        self.fake.refuse["revise"] = AlreadyDecidedRefusal("409: already decided")
+        self.gh.issues[(API, 2)]["title"] = "Which database should it use?"
+        self.run_pass(120)
+        self.fake.refuse.clear()
+        self.gh.issue(API, 3, "Another decision?", labels=["me:awaiting-cos"])
+        self.run_pass(120)
+        self.assertEqual(len([c for c in self.fake.calls if c[0] == "raise"]), 2, "the new decision is raised once, as before")
+
+    def test_an_already_decided_reply_to_a_raise_has_no_link_to_settle_so_it_stays_a_permanent_refusal_tried_once(self):
+        self.turn_on()
+        self.fake.refuse["raise"] = AlreadyDecidedRefusal("409: already decided: Bearer abc123secret")
+        self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
+        for _ in range(3):
+            self.run_pass(120)
+        self.assertEqual(len([c for c in self.fake.calls if c[0] == "raise"]), 1, "not looped")
+        self.assertEqual(self.audit_events("external.settled_outside"), [])
+        (event,) = self.audit_events("external.permanent_failure")
+        self.assertNotIn("abc123secret", json.dumps(event), "outside text is redacted")
+
+    def test_the_settled_audit_reason_is_redacted(self):
+        ext = self.open_decision()
+        self.fake.refuse["revise"] = AlreadyDecidedRefusal("409: already decided: Bearer abc123secret")
+        self.gh.issues[(API, 2)]["title"] = "Which database should it use?"
+        self.run_pass(120)
+        (event,) = self.audit_events("external.settled_outside")
+        self.assertNotIn("abc123secret", json.dumps(event))
+
+    def test_the_real_adapter_error_says_it_is_settled_outside_and_only_that_one(self):
+        self.assertTrue(EA.AlreadyDecided.settled_outside)
+        self.assertFalse(EA.AdapterError.settled_outside)
+        for cls in (EA.Conflict, EA.InvalidRequest, EA.NotFound, EA.CredentialError, EA.DisabledError, EA.Unsupported, EA.MappingError):
+            self.assertFalse(getattr(cls, "settled_outside", False), cls.__name__)
+
+
 LINK_HARNESS = r"""
 import * as d from "%(url)s";
 const now = Date.parse("2026-03-04T12:00:00Z");
@@ -42870,12 +43666,18 @@ class FakeActions:
         self.fail_paths = set()
         self.next_id = 100
 
-    def pr_run(self, names, complete=True, artifact=True):
-        return self.add_run("pull_request", "feature", names, complete, "2027-01-15T08:00:00Z", artifact, sha="b" * 40)
+    WORKFLOWS = {"A": (11, ".github/workflows/a-ci.yml"), "B": (22, ".github/workflows/b-style.yml")}
 
-    def add_run(self, event, branch, names, complete=True, created="2027-01-15T07:00:00Z", artifact=True, sha=None, expired=False, raw=None):
+    def pr_run(self, names, complete=True, artifact=True, workflow="A", created="2027-01-15T08:00:00Z", **more):
+        return self.add_run("pull_request", "feature", names, complete, created, artifact, sha="b" * 40, workflow=workflow, **more)
+
+    def add_run(self, event, branch, names, complete=True, created="2027-01-15T07:00:00Z", artifact=True, sha=None, expired=False, raw=None, workflow="A", no_workflow_id=False):
         self.next_id += 1
-        run = {"id": self.next_id, "event": event, "head_branch": branch, "head_sha": sha or ("%07d" % self.next_id) + "c" * 33, "created_at": created, "status": "completed"}
+        wid, path = self.WORKFLOWS[workflow]
+        run = {"id": self.next_id, "event": event, "head_branch": branch, "head_sha": sha or ("%07d" % self.next_id) + "c" * 33, "created_at": created, "status": "completed",
+               "workflow_id": wid, "name": "Workflow " + workflow, "path": path}
+        if no_workflow_id:
+            del run["workflow_id"]
         self.runs.setdefault(event, []).append(run)
         if artifact:
             self.zips[self.next_id + 5000] = raw if raw is not None else _artifact_zip(names, complete, self.next_id)
@@ -42896,7 +43698,15 @@ class FakeActions:
         if path == base + "pulls/12":
             return done(json.dumps(self.pull))
         query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+        found = re.fullmatch(re.escape(base) + r"actions/workflows/([^/?]+)/runs", urllib.parse.urlparse(path).path)
+        if found:   # one workflow's own runs, by id or by file name
+            which = urllib.parse.unquote(found.group(1))
+            event = query["event"][0]
+            runs = [r for r in self.runs.get(event, []) if (getattr(self, "leak_foreign", False) or str(r.get("workflow_id")) == which or r["path"].endswith("/" + which)) and ("branch" not in query or r["head_branch"] == query["branch"][0])]
+            return done(json.dumps({"workflow_runs": sorted(runs, key=lambda r: r["created_at"], reverse=True)[:int(query.get("per_page", ["30"])[0])]}))
         if path.startswith(base + "actions/runs?"):
+            if "head_sha" not in query:
+                raise AssertionError("reds must not list the repo's runs by event alone: that was the defect (%r)" % path)
             event = query["event"][0]
             runs = [r for r in self.runs.get(event, []) if ("head_sha" not in query or r["head_sha"] == query["head_sha"][0]) and ("branch" not in query or r["head_branch"] == query["branch"][0])]
             return done(json.dumps({"workflow_runs": sorted(runs, key=lambda r: r["created_at"], reverse=True)[:int(query.get("per_page", ["30"])[0])]}))
@@ -42941,9 +43751,9 @@ class TestReds(Base):
                 raise sb.load_reds().RedsError(done.stderr)
             return done.stdout
 
-    def run_reds(self, events=("push",), cache=True):
+    def run_reds(self, events=("push",), cache=True, workflow=None):
         out = io.StringIO()
-        code = self.hs.run(self.Reader(self.fake, FakeActions.REPO), FakeActions.REPO, 12, list(events), self.state if cache else None, self.now, out)
+        code = self.hs.run(self.Reader(self.fake, FakeActions.REPO), FakeActions.REPO, 12, list(events), self.state if cache else None, self.now, out, workflow)
         return code, out.getvalue()
 
     def main_runs(self, histories, event="push", branch="main"):
@@ -42961,7 +43771,7 @@ class TestReds(Base):
         self.assertIn("also failing on main (1):\n    t/a.test::a (1 of 5 main runs)", out)
         self.assertIn("flaky on main (1):\n    t/b.test::b (2 of 5 main runs)", out)
         self.assertIn("new (1):\n    t/c.test::c", out)
-        self.assertRegex(out, r"main's latest run: push [0-9c]{7} \d+m ago \(reference events: push\)")
+        self.assertRegex(out, r"main's latest run: push [0-9c]{7} \d+m ago \(workflow Workflow A; reference events: push\)")
 
     def test_s2_one_failure_in_five_is_not_flaky_two_is(self):
         self.fake.pr_run(["x::once", "y::twice"])
@@ -42979,7 +43789,7 @@ class TestReds(Base):
         self.fake.add_run("push", "main", ["f::flaky-one"], created=self.created(250), expired=True)
         code, out = self.run_reds()
         self.assertEqual(code, 0, out)
-        self.assertIn("main runs: 5 listed, 2 usable, 3 unknown", out)
+        self.assertIn("main runs: 5 listed (workflow Workflow A), 2 usable, 3 unknown", out)
         self.assertIn("flaky on main", out)
         self.assertNotIn("flaky-one (2 of 5", out)
         self.assertIn("(2 of 2 main runs)", out)
@@ -43042,7 +43852,7 @@ class TestReds(Base):
         self.fake.add_run("schedule", "main", ["b::u"], created=self.created(70))
         self.fake.add_run("schedule", "feature", ["b::u"], created=self.created(1))
         code, out = self.run_reds(events=("merge_group", "schedule"))
-        self.assertIn("main runs: 2 listed, 2 usable, 0 unknown", out)
+        self.assertIn("main runs: 2 listed (workflow Workflow A), 2 usable, 0 unknown", out)
         self.assertRegex(out, r"main's latest run: merge_group [0-9c]{7} ")
         self.assertIn("also failing on main (1):\n    a::t", out)
         code, out = self.run_reds(events=("push",))
@@ -43063,13 +43873,13 @@ class TestReds(Base):
         self.main_runs([["a::t"], []])
         code, out = self.run_reds()
         self.assertIn("its list is INCOMPLETE", out)
-        self.assertIn("main runs: 2 listed, 2 usable, 0 unknown", out)
+        self.assertIn("main runs: 2 listed (workflow Workflow A), 2 usable, 0 unknown", out)
         self.assertIn("also failing on main (1)", out)
 
     def test_u1_a_failed_read_says_so_classifies_nothing_and_exits_1(self):
         self.fake.pr_run(["a::t"])
         self.main_runs([["a::t"]])
-        for bad in ("pulls/12", "actions/runs?head_sha", "actions/runs?event=push", "actions/artifacts?name"):
+        for bad in ("pulls/12", "actions/runs?head_sha", "actions/workflows/11/runs", "actions/artifacts?name"):
             fake = self.fake
             fake.fail_paths = {bad}
             code, out = self.run_reds(cache=False)
@@ -43082,12 +43892,14 @@ class TestReds(Base):
         self.fake.pr_run(["a::t"], artifact=False)
         code, out = self.run_reds()
         self.assertEqual(code, 3, "unknown, not classified")
-        self.assertIn("no usable failing-tests artifact (no artifact): unknown, nothing was classified", out)
+        self.assertIn("no failing-tests artifact on the pull request's run", out)
+        shutil.rmtree(str(self.state / "reds-cache"), ignore_errors=True)   # the fakes reuse run ids
         broken = FakeActions()
         broken.add_run("pull_request", "feature", [], created=self.created(1), sha="b" * 40, raw=b"not a zip")
         self.fake = broken
         code, out = self.run_reds()
         self.assertIn("unknown, nothing was classified", out)
+        shutil.rmtree(str(self.state / "reds-cache"), ignore_errors=True)
         empty = FakeActions()
         self.fake = empty
         code, out = self.run_reds()
@@ -43142,7 +43954,138 @@ class TestReds(Base):
         self.assertEqual(code, 0, out)
         self.assertIn("1 older complete run(s) only", out)
         self.assertIn("new (2):\n    a::t (1 of 1 main runs)\n    b::u\n", out)
-        self.assertIn("main runs: 3 listed, 1 usable, 2 unknown", out)
+        self.assertIn("main runs: 3 listed (workflow Workflow A), 1 usable, 2 unknown", out)
+
+    # -- the workflow of the artifact (fix to #342: main's runs are the runs of the workflow that holds the pull request's artifact)
+
+    def test_s1_only_the_artifact_workflow_s_main_runs_are_listed_and_another_workflow_is_never_unknown(self):
+        self.fake.pr_run(["a::t", "b::u"])
+        for position in range(5):
+            self.fake.add_run("push", "main", ["a::t"] if position % 2 == 0 else [], created=self.created(10 + position * 60), workflow="A")
+            self.fake.add_run("push", "main", [], created=self.created(5 + position * 60), workflow="B", artifact=False)
+        code, out = self.run_reds()
+        self.assertEqual(code, 0, out)
+        self.assertIn("main runs: 5 listed (workflow Workflow A), 5 usable, 0 unknown", out)
+        self.assertIn("workflow Workflow A; reference events: push", out)
+        listed = [c for c in self.fake.calls if "actions/workflows/" in c]
+        self.assertEqual(len(listed), 1)
+        self.assertIn("workflows/11/runs", listed[0])
+
+    def test_s1b_a_missing_artifact_of_the_chosen_workflow_is_unknown_and_another_workflow_never_is(self):
+        self.fake.pr_run(["a::t"])
+        self.fake.add_run("push", "main", ["a::t"], created=self.created(10), workflow="A")
+        self.fake.add_run("push", "main", [], created=self.created(20), workflow="A", artifact=False)       # A without its artifact: unknown, as before
+        self.fake.add_run("push", "main", [], created=self.created(5), workflow="B", artifact=False)        # B: never listed
+        code, out = self.run_reds()
+        self.assertIn("main runs: 2 listed (workflow Workflow A), 1 usable, 1 unknown", out)
+
+    def test_s2_the_newest_pull_request_run_that_holds_the_artifact_is_the_pull_request_s_run_and_the_workflow_is_named(self):
+        self.fake.pr_run([], artifact=False, workflow="B", created="2027-01-15T09:00:00Z")   # the newest run, another workflow, no artifact
+        self.fake.pr_run(["a::t"], workflow="A", created="2027-01-15T08:00:00Z")
+        self.fake.add_run("push", "main", ["a::t"], created=self.created(10), workflow="A")
+        code, out = self.run_reds()
+        self.assertEqual(code, 0, out)
+        self.assertIn("1 failing in the pull request's run of workflow Workflow A", out)
+        self.assertIn("also failing on main (1)", out)
+        self.assertNotIn("workflows hold a failing-tests artifact", out)
+
+    def test_s2b_when_two_workflows_hold_an_artifact_it_says_so_in_one_line_and_names_the_one_used(self):
+        self.fake.pr_run(["a::t"], workflow="B", created="2027-01-15T09:00:00Z")
+        self.fake.pr_run(["a::t"], workflow="A", created="2027-01-15T08:00:00Z")
+        self.fake.add_run("push", "main", ["a::t"], created=self.created(10), workflow="B")
+        code, out = self.run_reds()
+        self.assertEqual(len([l for l in out.splitlines() if "workflows hold a failing-tests artifact" in l]), 1)
+        self.assertIn("2 workflows hold a failing-tests artifact on this pull request (Workflow A, Workflow B): the newest run's workflow, Workflow B, was used", out)
+        self.assertIn("(workflow Workflow B;", out)
+
+    def test_s3_a_pull_request_none_of_whose_runs_holds_an_artifact_cannot_be_classified_and_main_is_not_listed(self):
+        self.fake.pr_run([], artifact=False, workflow="A")
+        self.fake.pr_run([], artifact=False, workflow="B", created="2027-01-15T07:30:00Z")
+        self.fake.add_run("push", "main", ["a::t"], created=self.created(10), workflow="A")
+        code, out = self.run_reds()
+        self.assertEqual(code, 3, out)
+        self.assertEqual(len([l for l in out.splitlines() if l.startswith("no failing-tests artifact on the pull request's run")]), 1)
+        self.assertFalse([c for c in self.fake.calls if "actions/workflows/" in c], "no main run of any workflow was listed")
+
+    def test_s4_the_messages_name_the_workflow_and_say_how_many_of_its_runs_were_looked_at(self):
+        self.fake.pr_run(["a::t"])
+        for position in range(5):
+            self.fake.add_run("push", "main", [], created=self.created(10 + position * 60), workflow="A", artifact=False)
+        code, out = self.run_reds()
+        self.assertEqual(code, 3, out)
+        self.assertEqual(len([l for l in out.splitlines() if l == "no failing-tests artifact in the newest 5 runs of workflow Workflow A"]), 1)
+        self.assertIn("main runs: 5 listed (workflow Workflow A), 0 usable, 5 unknown", out)
+
+    def test_s5_the_call_counts_with_two_reference_events_stay_within_14_cold_and_4_warm(self):
+        self.fake.pr_run(["a::t"])
+        for position in range(3):
+            self.fake.add_run("merge_group", "gh-readonly-queue/main/pr-%d-abc" % position, ["a::t"], created=self.created(10 + position * 60), workflow="A")
+        for position in range(2):
+            self.fake.add_run("schedule", "main", ["a::t"], created=self.created(40 + position * 60), workflow="A")
+            self.fake.add_run("schedule", "main", [], created=self.created(41 + position * 60), workflow="B", artifact=False)
+        self.run_reds(events=("merge_group", "schedule"))
+        self.assertLessEqual(len(self.fake.calls), 14, self.fake.calls)
+        cold = len(self.fake.calls)
+        del self.fake.calls[:]
+        self.run_reds(events=("merge_group", "schedule"))
+        self.assertLessEqual(len(self.fake.calls), 4, self.fake.calls)
+        self.assertTrue(all(len(a) == 3 for a in self.fake.argvs), "plain GETs only")
+
+    def test_s6_the_workflow_override_picks_the_pull_request_s_run_of_that_file_and_lists_its_runs(self):
+        self.fake.pr_run(["a::t"], workflow="B", created="2027-01-15T09:00:00Z")     # newer, with an artifact, but not the configured one
+        self.fake.pr_run(["a::t"], workflow="A", created="2027-01-15T08:00:00Z")
+        self.fake.add_run("push", "main", ["a::t"], created=self.created(10), workflow="A")
+        self.fake.add_run("push", "main", ["a::t"], created=self.created(5), workflow="B")
+        code, out = self.run_reds(workflow="a-ci.yml")
+        self.assertEqual(code, 0, out)
+        self.assertIn("in the pull request's run of workflow Workflow A", out)
+        self.assertIn("main runs: 1 listed (workflow Workflow A)", out)
+        listed = [c for c in self.fake.calls if "actions/workflows/" in c]
+        self.assertIn("workflows/a-ci.yml/runs", listed[0])
+        code, out = self.run_reds(workflow="nothing.yml")
+        self.assertEqual(code, 3)
+        self.assertIn("no completed run of workflow nothing.yml", out)
+
+    def test_s6_the_override_setting_is_strict_a_file_name_only(self):
+        self.assertEqual(self.hs.workflows({"workflow": {"acme/widget": "ci.yml"}}), {"acme/widget": "ci.yml"})
+        for bad in ("../ci.yml", ".github/workflows/ci.yml", "https://x/ci.yml", "ci", "ci.yml?x=1", "", 5, None, "ci.yml\n"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.hs.workflows({"workflow": {"acme/widget": bad}})
+        for bad in ({"workflow": []}, {"workflow": {"nope": "ci.yml"}}):
+            with self.assertRaises(ValueError):
+                self.hs.workflows(bad)
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "reds": {"workflow": {"acme/widget": "../x.yml"}}})
+
+    def test_a_run_with_no_workflow_id_says_workflow_unknown_and_never_lists_by_event_alone(self):
+        self.fake.pr_run(["a::t"], no_workflow_id=True)
+        self.fake.add_run("push", "main", ["a::t"], created=self.created(10), workflow="A")
+        code, out = self.run_reds()
+        self.assertEqual(code, 3, out)
+        self.assertIn("names no workflow (workflow unknown): cannot classify", out)
+        self.assertFalse([c for c in self.fake.calls if "actions/workflows/" in c or ("actions/runs?" in c and "head_sha" not in c)])
+
+    def test_a_non_positive_workflow_id_is_unknown_and_a_foreign_workflow_run_in_a_listing_is_skipped(self):
+        for bad in (0, -3, True):
+            with self.subTest(bad=bad):
+                self.fake = FakeActions()
+                shutil.rmtree(str(self.state / "reds-cache"), ignore_errors=True)
+                self.fake.pr_run(["a::t"])
+                self.fake.runs["pull_request"][-1]["workflow_id"] = bad
+                code, out = self.run_reds()
+                self.assertEqual(code, 3, out)
+                self.assertIn("workflow unknown", out)
+        shutil.rmtree(str(self.state / "reds-cache"), ignore_errors=True)
+        self.fake = FakeActions()
+        self.fake.pr_run(["a::t"])
+        own = self.fake.add_run("push", "main", ["a::t"], created=self.created(10), workflow="A")
+        foreign = self.fake.add_run("push", "main", ["a::t"], created=self.created(5), workflow="A")
+        for run in self.fake.runs["push"]:
+            if run["id"] == foreign:
+                run["workflow_id"] = 22   # a listing that hands back another workflow's run: skipped, defensively
+        self.fake.leak_foreign = True
+        code, out = self.run_reds()
+        self.assertIn("main runs: 1 listed (workflow Workflow A), 1 usable, 0 unknown", out)
 
     def test_the_real_command_reads_through_the_real_reader_with_the_configured_events_and_exits_1_on_a_failed_read(self):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": "gh", "reds": {"reference_events": {"acme/widget": ["merge_group", "schedule"]}}})
@@ -43153,8 +44096,8 @@ class TestReds(Base):
         with captured() as (out, err):
             code = sb.main(["reds", "acme/widget#12"], runner=self.fake, now=self.now)
         self.assertEqual(code, 0, out.getvalue() + err.getvalue())
-        self.assertIn("main runs: 2 listed, 2 usable, 0 unknown", out.getvalue())
-        self.assertIn("(reference events: merge_group, schedule)", out.getvalue())
+        self.assertIn("main runs: 2 listed (workflow Workflow A), 2 usable, 0 unknown", out.getvalue())
+        self.assertIn("reference events: merge_group, schedule)", out.getvalue())
         self.assertTrue(any("event=merge_group" in c for c in self.fake.calls) and not any("event=push" in c for c in self.fake.calls))
         self.fake.fail_paths = {"actions/artifacts?name"}
         shutil.rmtree(str(sb.state_dir_path() / "reds-cache"), ignore_errors=True)
@@ -43169,7 +44112,7 @@ class TestReds(Base):
         run = self.fake.add_run("push", "main", ["a::t"], created=self.created(10))
         self.fake.artifacts[run]["size_in_bytes"] = self.hs.ZIP_MAX + 1
         code, out = self.run_reds()
-        self.assertIn("main runs: 1 listed, 0 usable, 1 unknown; run %d: artifact too large" % run, out)
+        self.assertIn("main runs: 1 listed (workflow Workflow A), 0 usable, 1 unknown; run %d: artifact too large" % run, out)
         self.assertFalse([c for c in self.fake.calls if c.endswith("/zip") and str(self.fake.artifacts[run]["id"]) in c], "never downloaded")
         del self.fake.artifacts[run]["size_in_bytes"]
         shutil.rmtree(str(self.state / "reds-cache"))
@@ -43357,6 +44300,89 @@ class TestDockerReaper(Base):
         stamp = json.loads((self.world.state / sb.DOCKER_REAP_FILE).read_text())["at"]
         self.assertEqual(stamp + sb.DOCKER_REAP_INTERVAL, self.NOW + sb.DOCKER_REAP_RETRY)
 
+    def test_the_docker_option_runs_only_a_docker_binary_it_can_trust_in_every_disk_command(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        os.chmod(str(self.home), 0o755)
+        for target in ("/bin/sh", "/bin/ls", "/usr/bin/env"):
+            for argv in (["disk", "prune", "--dry-run", "--docker", target], ["disk", "reap-docker", "--docker", target], ["disk", "report", "--docker", target],
+                         ["disk", "prune", "--dry-run", "--docker=" + target], ["disk", "--docker", target, "report"]):
+                with self.subTest(argv=argv):
+                    err, calls = io.StringIO(), []
+                    with mock.patch.object(sys, "stderr", err), mock.patch.object(sys, "stdout", io.StringIO()) as out, \
+                            mock.patch.object(subprocess, "run", side_effect=AssertionError("ran an executable that is not docker")):
+                        code = sb.main(argv, runner=lambda a, **k: calls.append(a) or subprocess.CompletedProcess(a, 0, "", ""), now=self.world.clock.now)
+                    self.assertIn("refused", err.getvalue() + out.getvalue())
+                    self.assertFalse([c for c in calls if c and os.path.basename(str(c[0])) in ("sh", "ls", "env")], "nothing was run")
+                    if argv[1] != "report" and argv[1] != "--docker":
+                        self.assertEqual(code, sb.EXIT_USAGE)
+        for abbreviated in ("--dock", "--doc", "--do"):                                          # an abbreviation of the option is not accepted
+            err = io.StringIO()
+            try:
+                with mock.patch.object(sys, "stderr", err), mock.patch.object(sys, "stdout", io.StringIO()), \
+                        mock.patch.object(subprocess, "run", side_effect=AssertionError("ran an executable")):
+                    code = sb.main(["disk", "prune", abbreviated, "/bin/sh"], runner=FakePruneDocker(), now=self.world.clock.now)
+            except SystemExit as stop:
+                code = stop.code
+            self.assertNotEqual(code, 0, abbreviated)
+            self.assertIn("unrecognized arguments", err.getvalue(), abbreviated)
+        good = self.home / "docker"
+        good.write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(str(good), 0o755)
+        good = str(good)
+        self.assertEqual(sb._docker_problem(good), (os.path.realpath(good), None))
+        dest = self.home / "real"
+        dest.mkdir()
+        (dest / "docker").write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(str(dest / "docker"), 0o755)
+        sub = self.home / "viaLink"
+        sub.mkdir()
+        os.symlink(str(dest / "docker"), str(sub / "docker"))
+        self.assertEqual(sb._docker_problem(str(sub / "docker")), (os.path.realpath(str(dest / "docker")), None), "a link named docker to a file named docker is fine")
+        other = self.home / "tool"
+        other.write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(str(other), 0o755)
+        bad = self.home / "sub" / "docker"
+        bad.parent.mkdir()
+        os.symlink(str(other), str(bad))
+        self.assertIn("not a docker binary", sb._docker_problem(str(bad))[1])        # a link named docker that points at another tool
+        loose = self.home / "loose" / "docker"
+        loose.parent.mkdir()
+        loose.write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(str(loose), 0o775)
+        self.assertIn("writable by group or other", sb._docker_problem(str(loose))[1])
+        open_dir = self.home / "open" / "docker"
+        open_dir.parent.mkdir()
+        open_dir.write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(str(open_dir), 0o755)
+        os.chmod(str(open_dir.parent), 0o777)
+        self.assertIn("others can change", sb._docker_problem(str(open_dir))[1])
+        os.chmod(str(open_dir.parent), 0o1777)
+        self.assertEqual(sb._docker_problem(str(open_dir))[1], None, "a sticky directory is fine")
+        # a standard install sits under a root-owned, group-writable ancestor (/Applications): fine; a group-writable ancestor of another owner is not
+        real_stat, ancestor = os.stat, os.path.realpath(str(self.home.parent))
+
+        def fake_stat(path, *a, **k):
+            info = real_stat(path, *a, **k)
+            if os.path.realpath(str(path)) == ancestor:
+                return types.SimpleNamespace(st_mode=0o40775, st_uid=owner[0])
+            return info
+
+        owner = [0]
+        with mock.patch.object(sb.os, "stat", fake_stat):
+            self.assertEqual(sb._docker_problem(good)[1], None, "a root-owned group-writable ancestor is the operating system's own")
+            owner[0] = os.getuid() + 1
+            self.assertIn("others can change", sb._docker_problem(good)[1])
+        plain = self.home / "plain" / "docker"
+        plain.parent.mkdir()
+        plain.write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(str(plain), 0o644)
+        self.assertIn("not an executable file", sb._docker_problem(str(plain))[1])
+        self.assertIn("not installed", sb._docker_problem("/nonexistent/docker")[1])
+        self.assertIn("not a usable", sb._docker_problem("--help")[1])
+        self.assertIn("not a docker binary", sb._docker_problem("/bin/sh")[1])
+        for p in (str(self.home / "open"), str(self.home / "loose")):
+            os.chmod(p, 0o755)
+
     def test_without_docker_it_refuses_and_runs_nothing(self):
         docker = self.world_docker()
         with captured() as (out, err):
@@ -43499,6 +44525,56 @@ class TestComposeTrap(Base):
 
     def test_the_helper_never_uses_sudo(self):
         self.assertNotIn("sudo", (REPO / "tools" / "fleet-compose-trap.sh").read_text().replace("Never uses sudo.", ""))
+
+
+class TestDaemonPriority(Base):
+    """P0 CPU item C: the daemon's LaunchAgent asks for the Interactive process class, with no root; ensure's own start is unchanged."""
+
+    def template(self):
+        import plistlib
+        return plistlib.loads((REPO / "templates" / "com.fleet-kit.switchboard.plist").read_bytes())
+
+    def test_s1_the_template_asks_for_the_interactive_class_and_nothing_that_needs_root(self):
+        plist = self.template()
+        self.assertEqual(plist["ProcessType"], "Interactive")
+        for key in ("UserName", "GroupName", "Nice", "SessionCreate"):
+            self.assertNotIn(key, plist)
+        self.assertEqual(plist["Label"], "com.fleet-kit.switchboard")
+        self.assertEqual(plist["ProgramArguments"][-2:], ["run", "--standby"])
+
+    def test_s2_what_install_writes_parses_and_says_the_same(self):
+        import plistlib
+        values = sb.service_values(REPO, sb.service_path_dirs(REPO, []))
+        written = plistlib.loads(sb.render_service("launchd", values, REPO).encode())
+        self.assertEqual(written["ProcessType"], "Interactive")
+        self.assertEqual(written["ProgramArguments"][-2:], ["run", "--standby"])
+        self.assertEqual(written["ProgramArguments"][0], values["__PYTHON__"])
+        self.assertIsNone(re.search(r"__[A-Z_]+__", json.dumps(written)), "every placeholder is filled")
+
+    def test_s3_ensures_own_start_is_unchanged(self):
+        seen = []
+        shell = {"PATH": "/usr/bin", "HERDR_PANE_ID": "w1:p1", "FLEET_SWITCHBOARD_ROLE": "coder", "HERDR_SOCKET_PATH": "/s"}
+        with mock.patch.dict(os.environ, shell, clear=True):
+            sb.spawn_daemon(self.world_state(), spawn=lambda argv, **kw: seen.append((argv, kw)))
+        argv, kw = seen[0]
+        self.assertEqual(argv[-1], "run")
+        self.assertTrue(kw["start_new_session"])
+        self.assertEqual(kw["cwd"], str(self.world_state()))
+        self.assertNotIn("HERDR_PANE_ID", kw["env"])
+        self.assertNotIn("FLEET_SWITCHBOARD_ROLE", kw["env"])
+        self.assertFalse({"launchctl", "taskpolicy", "nice", "sudo"} & {os.path.basename(a) for a in argv}, "no wrapper around the start, by name or by path")
+
+    def world_state(self):
+        path = self.home / "state"
+        path.mkdir(exist_ok=True)
+        return path
+
+    def test_s4_the_docs_say_how_to_opt_in_check_and_go_back(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        section = text[text.index("### The daemon's priority under load"):]
+        section = section[:section.index("\n### ", 10)] if "\n### " in section[10:] else section
+        for needle in ("ProcessType", "Interactive", "opt-in", "launchctl print", "no sudo", "fleet-switchboard install", "--uninstall"):
+            self.assertIn(needle, section)
 
 
 class TestCpuGuard(Base):
@@ -43854,6 +44930,263 @@ class TestGithubWritingRule(unittest.TestCase):
             self.skipTest("no base to compare with")
         changed = set(done.stdout.split())
         self.assertNotIn("shims/gh", changed)
+
+
+_CG = sb.load_cpu_guard()
+ORIGINAL_MEMORY_READING, ORIGINAL_PROCESS_TABLE = _CG.memory_reading, _CG.process_table   # the real readers, kept before a test patches them
+
+
+class TestCpuConsumersAndMemory(Base):
+    """Ask #420: the cpu alarm names its consumers by program and lane (a late answer is one follow-up note), and a mem line and alarm that read the kernel's
+    counters and process table without starting a process."""
+
+    PS3 = ("  101  60.0 /usr/local/bin/node --token=SECRET123\n  102  25.0 /Applications/Docker.app/Contents/MacOS/com.docker.backend\n"
+           "  103  12.0 /usr/bin/python3\n  104   2.0 /bin/zsh\n  garbage\n")
+    GB = 10 ** 9
+
+    def setUp(self):
+        super().setUp()
+        self.load = [86.0]
+        self.world = World(self, agents=("coder",), config={})
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.engine = self.world.engine
+        self.engine.discover(self.world.clock.now())
+        self.cg = sb.load_cpu_guard()
+        self.mem = [self.cg.Memory(1 * self.GB, 10 * self.GB, 3 * self.GB)]
+        self.table = [{"opencode": (62, 18000 * 10 ** 6), "node": (3, 900 * 10 ** 6)}]
+        self.calls = []
+        self.ps_text = [self.PS3]
+        self.lsof_text = ["p101\nfcwd\nn/work/acme.wt/sb-one/src\np102\nfcwd\nn/elsewhere/x\np103\nfcwd\nn/work/acme.wt/sb-two\n"]
+        self.block = [None]
+        self.ps_error = [None]
+        for target, name, value in ((os, "getloadavg", lambda: (self.load[0],) * 3), (os, "cpu_count", lambda: 14)):
+            patcher = mock.patch.object(target, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for name, value in (("memory_reading", lambda: self.mem[0]), ("process_table", lambda *a, **k: self.table[0])):
+            patcher = mock.patch.object(self.cg, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        def runner(argv, **kwargs):
+            self.calls.append(list(argv))
+            if self.block[0] is not None:
+                self.block[0].wait(30)
+            if self.ps_error[0] is not None:
+                raise self.ps_error[0]
+            text = self.lsof_text[0] if argv[0] == "lsof" else self.ps_text[0]
+            return subprocess.CompletedProcess(argv, 0, text, "")
+        self.engine.cpu_ps_runner = runner
+        sb.register_worktree(self.world.state, "/work/acme.wt/sb-one", "coder-live", None, "b1", 1)
+
+    def facts(self, kinds=("cpu", "cpu-top", "mem"), engine=None):
+        found, problems = (engine or self.engine).collect_facts()
+        self.assertEqual(problems, [])
+        return [f for f in found if f.kind in kinds]
+
+    def audits(self, name):
+        return [e for e in self.world.audit() if e["event"] == name]
+
+    def run_for(self, minutes, step=30, kinds=("cpu", "cpu-top", "mem")):
+        last = []
+        for _ in range(int(minutes * 60 / step)):
+            self.world.tick(step)
+            if self.block[0] is None:
+                self.settle()   # the consumers thread has finished before the next pass: no race with the clock
+            last = self.facts(kinds)
+        return last
+
+    def settle(self):
+        for source in self.engine.sources:
+            if isinstance(source, sb.CpuFacts) and source.thread is not None:
+                source.thread.join(10)
+
+    def test_s1_the_wake_names_the_top_programs_and_their_lanes_and_copies_no_command_line(self):
+        self.run_for(6, kinds=("cpu",))
+        self.settle()
+        (fact,) = self.run_for(0.5, kinds=("cpu",))
+        self.assertIn("top: node 60% (coder-live)", fact.summary)
+        self.assertIn("com.docker.backend 25%", fact.summary)
+        self.assertIn("python3 12% (sb-two)", fact.summary, "a worktree no agent is registered for is named by its directory")
+        self.assertNotIn("SECRET123", fact.summary)
+        self.assertNotIn("--token", fact.summary)
+        self.assertEqual([c[0] for c in self.calls], ["ps", "lsof"], "one ps and one lsof for the whole episode")
+        self.assertEqual(self.calls[1][-1], "101,102,103,104")
+
+    def test_s2_a_late_answer_is_one_follow_up_note_and_the_wake_says_it_is_coming(self):
+        gate = threading.Event()
+        self.block[0] = gate
+        self.run_for(6, kinds=("cpu",))
+        (wake,) = self.run_for(0.5, kinds=("cpu",))
+        self.assertIn("Consumers not read within", wake.summary)
+        self.assertNotIn("top:", wake.summary)
+        self.assertEqual(self.run_for(0.5, kinds=("cpu-top",)), [])
+        gate.set()
+        self.settle()
+        notes = self.run_for(1, kinds=("cpu-top",))
+        self.assertEqual(len({f.key for f in notes}), 1)
+        self.assertIn("top: node 60% (coder-live)", notes[0].summary)
+        keys = {f.key for _ in range(6) for f in self.run_for(0.5, kinds=("cpu-top",))}
+        self.assertEqual(keys, {notes[0].key}, "the same key on every later pass: delivered once, never a second note")
+
+    def test_s3_a_ps_that_never_answers_or_fails_is_said_once_and_sends_no_follow_up(self):
+        gate = threading.Event()
+        self.block[0] = gate
+        self.run_for(6, kinds=("cpu",))
+        wakes = {(f.key, f.summary) for _ in range(3) for f in self.run_for(0.5, kinds=("cpu",))}
+        self.assertEqual(len({k for k, _ in wakes}), 1)
+        self.assertTrue(all("not read within" in text for _, text in wakes))
+        self.assertEqual(self.run_for(2, kinds=("cpu-top",)), [], "nothing came, so there is no follow-up")
+        gate.set()
+        self.settle()
+
+    def test_a_ps_that_fails_says_the_consumers_could_not_be_read(self):
+        self.ps_error[0] = OSError("no ps")
+        self.run_for(6, kinds=("cpu",))
+        self.settle()
+        (fact,) = self.run_for(0.5, kinds=("cpu",))
+        self.assertIn("Consumers could not be read.", fact.summary)
+        self.assertEqual(self.run_for(1, kinds=("cpu-top",)), [])
+
+    def test_a_failing_lsof_still_names_the_programs_without_lanes(self):
+        self.lsof_text[0] = ""
+        self.run_for(6, kinds=("cpu",))
+        self.settle()
+        (fact,) = self.run_for(0.5, kinds=("cpu",))
+        self.assertIn("top: node 60%", fact.summary)
+        self.assertNotIn("(coder-live)", fact.summary)
+
+    def test_s4_the_mem_line_shows_swap_free_and_the_biggest_holders_and_starts_no_process(self):
+        self.mem[0] = self.cg.Memory(int(9.1 * self.GB), int(10.2 * self.GB), int(0.9 * self.GB))
+        expected = "swap 9.1 of 10.2 GB (89%), free 0.9 GB; opencode 62 procs 18000 MB, node 3 procs 900 MB"
+        with mock.patch.object(subprocess, "run", side_effect=AssertionError("a process was started")), \
+                mock.patch.object(subprocess, "Popen", side_effect=AssertionError("a process was started")):
+            self.assertEqual(self.cg.mem_status_line(self.cg.memory_reading(), self.cg.biggest_holders(self.cg.process_table())), expected)
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.assertIn("mem        " + expected, sb.format_status(sb.collect_status(self.world.route, self.world.clock.now)))
+
+    def test_s5_swap_above_the_guard_for_the_minutes_wakes_once_and_recovers_below_it(self):
+        self.mem[0] = self.cg.Memory(int(9.5 * self.GB), 10 * self.GB, 1 * self.GB)
+        self.load[0] = 5.0
+        self.assertEqual(self.run_for(4, kinds=("mem",)), [], "4 minutes: not yet")
+        keys = {f.key for f in self.run_for(1.5, kinds=("mem",))}
+        self.assertEqual(len(keys), 1)
+        (fact,) = self.run_for(0.5, kinds=("mem",))
+        self.assertIn("memory high: swap 9.5 of 10.0 GB (95%; above 90% for 5 minutes)", fact.summary)
+        self.assertIn("opencode 62 procs 18000 MB", fact.summary)
+        self.assertEqual(len({f.key for _ in range(10) for f in self.run_for(0.5, kinds=("mem",))}), 1, "while it stays high: no second wake")
+        self.assertEqual(len(self.audits("mem.high")), 1)
+        self.mem[0] = self.cg.Memory(5 * self.GB, 10 * self.GB, 4 * self.GB)
+        self.assertEqual(self.run_for(1, kinds=("mem",)), [])
+        self.assertEqual(len(self.audits("mem.recovered")), 1)
+
+    def test_a_restart_does_not_begin_a_second_memory_episode(self):
+        self.mem[0] = self.cg.Memory(int(9.5 * self.GB), 10 * self.GB, 1 * self.GB)
+        self.load[0] = 5.0
+        self.run_for(6, kinds=("mem",))
+        (first,) = self.run_for(0.5, kinds=("mem",))
+        restarted = self.world.new_engine("daemon")
+        restarted.discover(self.world.clock.now())
+        for _ in range(4):
+            self.world.tick(30)
+            facts = self.facts(("mem",), engine=restarted)
+        self.assertEqual([f.key for f in facts], [first.key])
+        self.assertEqual(len(self.audits("mem.high")), 1)
+        self.assertEqual(oct((self.world.state / self.cg.MEM_STATE_FILE).stat().st_mode & 0o777), "0o600")
+
+    def test_s6_an_unreadable_memory_figure_says_so_and_is_never_a_zero(self):
+        self.mem[0] = self.cg.Memory(problem="vm.swapusage cannot be read")
+        self.assertEqual(self.cg.mem_status_line(self.mem[0]), "unreadable: vm.swapusage cannot be read")
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        text = sb.format_status(sb.collect_status(self.world.route, self.world.clock.now))
+        self.assertIn("mem        unreadable: vm.swapusage cannot be read", text)
+        self.assertNotIn("0.0 GB", self.cg.mem_status_line(self.mem[0]))
+        self.load[0] = 5.0
+        self.assertEqual(self.run_for(10, kinds=("mem",)), [], "an unreadable figure wakes nobody")
+        self.assertEqual(self.cg.mem_status_line(self.cg.Memory(1 * self.GB, 10 * self.GB, None)), "swap 1.0 of 10.0 GB (10%), free memory unreadable")
+        self.assertEqual(self.cg.mem_status_line(self.cg.Memory(0, 0, 2 * self.GB)), "no swap, free 2.0 GB")
+
+    def test_s7_a_normal_pass_starts_no_process(self):
+        self.load[0] = 5.0
+        with mock.patch.object(subprocess, "run", side_effect=AssertionError("a process was started")), \
+                mock.patch.object(subprocess, "Popen", side_effect=AssertionError("a process was started")):
+            self.assertEqual(self.run_for(10), [])
+        self.assertEqual(self.calls, [])
+
+    def test_s8_nothing_of_a_command_line_reaches_the_wake_or_the_follow_up(self):
+        self.ps_text[0] = "  101  60.0 /x/tool --password=hunter2 --token=SECRET123\n  102 10.0 /y/runner secret=abc\n"
+        self.run_for(6)
+        self.settle()
+        texts = " ".join(f.summary for f in self.run_for(1))
+        self.assertIn("tool 60%", texts)
+        for needle in ("hunter2", "SECRET123", "secret=abc", "--password"):
+            self.assertNotIn(needle, texts)
+
+    def test_the_lane_is_the_owning_agent_then_the_worktree_name_then_nothing(self):
+        registry = {"/work/acme.wt/sb-one": "coder-live", "/work/acme.wt/sb-one/deep": "inner-agent"}
+        self.assertEqual(self.cg.lane_of("/work/acme.wt/sb-one/src", registry), "coder-live")
+        self.assertEqual(self.cg.lane_of("/work/acme.wt/sb-one/deep/x", registry), "inner-agent", "the longest registered path wins")
+        self.assertEqual(self.cg.lane_of("/work/acme.wt/sb-two/a", registry), "sb-two")
+        self.assertIsNone(self.cg.lane_of("/home/user/notes", registry))
+        self.assertEqual(self.cg.lane_of("/work/acme.wt/x", {"/work/acme.wt/x": "bad\x1b[2Jname"}), "bad??2Jname")
+
+    def test_the_swap_settings_are_validated_and_false_turns_the_memory_guard_off(self):
+        for ok in ({"swap_percent": 95}, {"swap_minutes": 10}, {"swap_percent": 80, "swap_minutes": 2, "high_ratio": 4}):
+            sb.validate_config(dict({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}, cpu_guard=ok), "t")
+        for bad in ({"swap_percent": 5}, {"swap_percent": 101}, {"swap_percent": "90"}, {"swap_minutes": 0}, {"swap_minutes": 500}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(sb.ConfigError):
+                    sb.validate_config(dict({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}, cpu_guard=bad), "t")
+        self.assertEqual(self.cg.mem_settings(None), {"high_ratio": 90, "minutes": 5, "rearm_ratio": 80})
+        self.assertEqual(self.cg.mem_settings({"swap_percent": 95, "swap_minutes": 2})["minutes"], 2)
+        self.assertIsNone(self.cg.mem_settings(False))
+        self.mem[0] = self.cg.Memory(int(9.9 * self.GB), 10 * self.GB, 1 * self.GB)
+        self.engine.config["cpu_guard"] = False
+        self.assertEqual(self.run_for(10), [])
+
+    def test_the_parsers_and_the_linux_readers_are_tested_directly(self):
+        self.assertEqual(self.cg.parse_lsof("p7\nfcwd\nn/a/b\np8\nfcwd\nn/c\nn/ignored-second\nxjunk\n"), {7: "/a/b", 8: "/c"})
+        self.assertEqual(self.cg.parse_lsof(""), {})
+        rows = self.cg.process_rows("  12  3.5 /bin/a\n 7.0 /bin/b c\n bad line\n  9  nan /x\n  8 -1 /y\n")
+        self.assertEqual([(p, c) for p, c, _ in rows], [(12, 3.5), (None, 7.0)], "a non-finite or negative pcpu and a malformed line are dropped")
+        self.assertEqual(self.cg.top_pids([(1, 5.0, "a"), (None, 9.0, "b"), (2, 7.0, "c"), (3, 1.0, "d")], limit=2), [2, 1])
+        meminfo = "MemTotal: 1000 kB\nMemAvailable:    2048 kB\nSwapTotal:   10240 kB\nSwapFree:     4096 kB\n"
+        real = sb.load_cpu_guard()
+        with mock.patch.object(real.sys, "platform", "linux"), mock.patch("builtins.open", mock.mock_open(read_data=meminfo)):
+            got = ORIGINAL_MEMORY_READING()
+        self.assertEqual((got.swap_used, got.swap_total, got.free, got.problem), (6144 * 1024, 10240 * 1024, 2048 * 1024, None))
+        with mock.patch.object(real.sys, "platform", "linux"), mock.patch("builtins.open", mock.mock_open(read_data="MemTotal: 1 kB\n")):
+            self.assertIn("no swap figures", ORIGINAL_MEMORY_READING().problem)
+        with mock.patch.object(real.sys, "platform", "plan9"):
+            self.assertIn("no memory counters", ORIGINAL_MEMORY_READING().problem)
+        with mock.patch.object(real.sys, "platform", "linux"), mock.patch("builtins.open", side_effect=OSError("denied")):
+            self.assertEqual(ORIGINAL_MEMORY_READING().problem, "OSError: denied")
+        with mock.patch.object(real.sys, "platform", "plan9"):
+            self.assertIsNone(ORIGINAL_PROCESS_TABLE())
+
+    def test_the_real_counters_and_process_table_start_no_process(self):
+        if sys.platform not in ("darwin",) and not sys.platform.startswith("linux"):
+            self.skipTest("no kernel counters on this platform")
+        with mock.patch.object(subprocess, "run", side_effect=AssertionError("a process was started")), \
+                mock.patch.object(subprocess, "Popen", side_effect=AssertionError("a process was started")):
+            mem = ORIGINAL_MEMORY_READING()
+            table = ORIGINAL_PROCESS_TABLE()
+        self.assertIsNone(mem.problem, "the kernel's counters could not be read here")
+        self.assertTrue(mem.swap_total >= 0 and mem.swap_used <= max(mem.swap_total, mem.swap_used))
+        self.assertTrue(table and all(count >= 1 and resident >= 0 for count, resident in table.values()))
+        self.assertLessEqual(len(table), self.cg.PROGRAMS_MAX)
+
+    def test_the_process_table_walk_stops_at_its_deadline(self):
+        if sys.platform != "darwin" and not sys.platform.startswith("linux"):
+            self.skipTest("no kernel counters on this platform")
+        ticks = iter(range(0, 10 ** 6, 10))
+        table = ORIGINAL_PROCESS_TABLE(limit_seconds=5, clock=lambda: next(ticks))   # the clock jumps past the deadline at once
+        self.assertLessEqual(sum(count for count, _ in (table or {}).values()), 1)
+
+    def test_the_process_table_ranking_and_a_missing_table_are_handled(self):
+        self.assertEqual(self.cg.biggest_holders(None), [])
+        self.assertEqual(self.cg.biggest_holders({}), [])
+        self.assertEqual(self.cg.biggest_holders({"a": (1, 5 * 10 ** 6), "b": (2, 9 * 10 ** 6)}), [("b", 2, 9), ("a", 1, 5)])
 
 
 class TestDiskGuard(Base):
@@ -47118,7 +48451,7 @@ class TestLoadAlert(Base):
     def test_each_orchestrator_has_the_five_figures_from_the_records(self):
         self.asks = {1: [10, 11, 12], 2: [20], 3: [30, 31]}
         orchestrators = {"orch-a": self.orch(busy=2, idle=1, messages=1, charter=1), "orch-b": self.orch(idle=1, charter=2), "orch-c": self.orch(busy=1, charter=3)}
-        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [{"agent": "orch-a"}, {"agent": "orch-a"}, {"agent": "orch-b", "closed": True}]}))
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [{"agent": "x", "ask": 10, "repo": "acme/widget"}, {"agent": "x", "ask": 11, "repo": "acme/widget"}, {"agent": "orch-b", "ask": 20, "repo": "acme/widget", "closed": True}]}))   # owned by the ask's chain, not by the agent field)
         self.tick(self.T0, orchestrators)                      # first sight of every ask
         self.move(self.T0 + 3 * 3600 - 60, 10)                 # ask 10 moved 1 minute ago; 20 and 30 moved 3 h ago
         self.move(self.T0 + 3 * 3600 - 60, 12)
@@ -47238,7 +48571,7 @@ class TestLoadAlert(Base):
         many = {"o%d" % n: self.orch(charter=n) for n in range(1, 41)}
         self.tick(self.T0, many)
         self.tick(self.T0 + 1800, many)
-        self.assertLessEqual(len(self.reads), 10)
+        self.assertLessEqual(len(self.reads), 30)   # the default budget: 30 reads an hour for the account (#348 amendment of PC-1)
         # an unreadable source: the cache goes stale, the asks are not believed, nobody is woken, and status says so once
         self.fail_reads = True
         self.woken.clear()
@@ -47458,10 +48791,142 @@ class TestLoadAlert(Base):
         state = json.loads((self.state_dir / "load.json").read_text())
         now = self.T0 + 2 * self.health.ASKS_FRESH_SECONDS + 10
         state["charters"] = {}
-        state["reads"] = [now - 60] * (self.health.READ_BUDGET - 1)
+        state["reads"] = [[now - 60, "default"]] * (self.health.READ_BUDGET_DEFAULT - 1)
         (self.state_dir / "load.json").write_text(json.dumps(state))
         self.health.tick(self.charters_ctx(now, calls, orch))
         self.assertEqual(len(calls), 2)                       # refused: no third call
+
+    def budget_ctx(self, at, orchestrators, asks_log, charters_log=None, **extra):
+        def read_asks(charter, repo):
+            asks_log.append((at, repo, charter))
+            return []
+        kw = dict(extra)
+        if charters_log is not None:
+            kw["read_charters"] = lambda repo: charters_log.append((at, repo)) or []
+        cfg = dict(self.health.DEFAULTS, **kw.pop("cfg", {}))
+        return self.health.Context(now=at, state_dir=str(self.state_dir), cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, cos="cos",
+                                   wake=self.woken.append, **kw)
+
+    def many(self, count, repo="r", first=1, charter=True):
+        return {"o%d" % n: {"charter": n if charter else None, "repo": repo, "busy": 0, "idle": 1, "messages": 0} for n in range(first, first + count)}
+
+    def test_the_read_budget_key_defaults_to_30_allows_60_and_refuses_the_rest(self):
+        self.assertEqual(self.health.validate(None, "x")["read_budget"], 30)
+        self.assertEqual(self.health.validate({"read_budget": 60}, "x")["read_budget"], 60)
+        for bad in (61, 0, "many", True, 2.5):
+            with self.assertRaises(ValueError, msg=repr(bad)) as raised:
+                self.health.validate({"read_budget": bad}, "x")
+            self.assertIn("read_budget", str(raised.exception))
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"load_alert": {"read_budget": 61}})
+
+    def test_a_full_cycle_of_ten_orchestrators_on_five_repos_fits_one_hour_within_the_budget(self):
+        orch = {}
+        for r in range(5):
+            orch.update(self.many(2, repo="repo%d" % r, first=1 + 2 * r))
+        asks, charters = [], []
+        for k in range(12):                                   # a pass every 5 minutes for an hour
+            self.health.tick(self.budget_ctx(self.T0 + k * 300, orch, asks, charters))
+        state = json.loads((self.state_dir / "load.json").read_text())
+        self.assertEqual((len(asks), len(charters)), (10, 5))   # every source read once in the hour
+        self.assertEqual(len(state["reads"]), 20)   # 5 x 2 + 10, well within 30
+        self.assertTrue(all(state["asks"][n]["at"] >= self.T0 for n in orch))
+
+    def test_a_hundred_orchestrators_stop_at_the_budget_and_the_oldest_are_read_first_next_hour(self):
+        orch = self.many(100)
+        first, second = [], []
+        self.health.tick(self.budget_ctx(self.T0, orch, first, []))
+        self.health.tick(self.budget_ctx(self.T0 + 600, orch, first, []))
+        self.assertEqual(len(first), 28)                      # 30 reads: 2 for the charters, 28 asks lists
+        self.health.tick(self.budget_ctx(self.T0 + 3700, orch, second, []))
+        self.assertEqual(len(second), 28)
+        self.assertEqual({c for _, _, c in first} & {c for _, _, c in second}, set())   # the ones never read come first
+
+    def test_a_paused_account_is_skipped_not_counted_and_named_while_another_is_read(self):
+        orch = dict(self.many(5, repo="work/r1"), **self.many(5, repo="own/r2", first=6))
+        asks, charters = [], []
+        ctx = self.budget_ctx(self.T0, orch, asks, charters, account_of=lambda repo: "work" if repo.startswith("work/") else "default",
+                              paused=lambda repo: repo.startswith("work/"))
+        self.health.tick(ctx)
+        self.assertEqual({repo for _, repo, _ in asks}, {"own/r2"})
+        self.assertEqual([repo for _, repo in charters], ["own/r2"])
+        state = json.loads((self.state_dir / "load.json").read_text())
+        self.assertEqual({a for _, a in state["reads"]}, {"default"})
+        self.assertEqual(len(state["reads"]), 7)             # 2 for the charters and 5 asks lists, none for the paused account
+        self.assertEqual([p for p in state["problems"] if "paused" in p], ["account work is paused by the rate limit: its reads wait"])
+        self.assertTrue(any("paused" in l for l in self.health.status_lines(str(self.state_dir), self.T0)))
+
+    def test_reads_answered_304_are_free_and_not_counted(self):
+        orch = self.many(40)
+        asks = []
+        ctx = self.budget_ctx(self.T0, orch, asks, begin_read=lambda: 0, read_cost=lambda token, repo: 0)   # every read answered 304
+        self.health.tick(ctx)
+        self.assertEqual(len(asks), 40)                       # past the 30 budget: none was billed
+        self.assertEqual(json.loads((self.state_dir / "load.json").read_text())["reads"], [])
+
+    def test_each_account_has_its_own_count_and_neither_starves_the_other(self):
+        orch = dict(self.many(40, repo="a/r"), **self.many(40, repo="b/r", first=41))
+        asks = []
+        ctx = self.budget_ctx(self.T0, orch, asks, account_of=lambda repo: repo.split("/")[0])
+        self.health.tick(ctx)
+        self.assertEqual((len([1 for _, repo, _ in asks if repo == "a/r"]), len([1 for _, repo, _ in asks if repo == "b/r"])), (30, 30))
+        self.assertEqual(len(json.loads((self.state_dir / "load.json").read_text())["reads"]), 60)
+
+    def test_old_bare_number_rows_count_for_the_default_account_and_junk_rows_are_dropped(self):
+        orch = self.many(40)
+        (self.state_dir / "load.json").write_text(json.dumps({"reads": [self.T0 - 60] * 25 + [["x"], "junk", [self.T0 - 60, "default", 1], [self.T0 - 99999, "default"]]}))
+        asks = []
+        self.health.tick(self.budget_ctx(self.T0, orch, asks))
+        self.assertEqual(len(asks), 5)                        # 30 - 25 old rows left; the junk and the expired row count for nothing
+
+    def test_a_read_that_fails_is_still_charged(self):
+        def failing(charter, repo):
+            raise RuntimeError("gh is down")
+        ctx = self.health.Context(now=self.T0, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS), orchestrators=self.many(3),
+                                  read_asks=failing, cos="cos", wake=self.woken.append)
+        self.health.tick(ctx)
+        self.assertEqual(len(json.loads((self.state_dir / "load.json").read_text())["reads"]), 3)
+
+    def test_the_billing_snapshot_is_taken_under_the_accounts_lock_and_only_for_the_account(self):
+        calls = collections.deque()
+        lock = threading.Lock()
+        accounts = types.SimpleNamespace(calls=calls, lock=lock, paused={}, describe=lambda repo: repo.split("/")[0])
+        held = []
+        class Spy(collections.deque):
+            def __iter__(inner):
+                held.append(lock.locked())
+                return super().__iter__()
+        spy = Spy()
+        accounts.calls = spy
+        def _api(path, repo):
+            spy.append((self.T0 + len(spy) + 1, "a", "x", False))
+            spy.append((self.T0 + len(spy) + 1, "b", "x", False))   # another account's read at the same moment
+            return []
+        seen = lambda name, fleet: types.SimpleNamespace(name=name, fleet=fleet, status="idle")
+        intents = types.SimpleNamespace(repo="a/r", _api=_api, accounts=accounts, open_asks=lambda c, r: [])
+        engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.T0, audit=None, actor="daemon", intents=intents,
+                                       config={"load_alert": self.health.validate(None, "x")})
+        sb.load_tick(engine, types.SimpleNamespace(agents={"o": seen("o", {"role": "orchestrator", "charter": 1, "repo": "a/r"})}))
+        self.assertTrue(held and all(held))                    # every iteration of the shared deque happened with the lock held
+        reads = json.loads((self.state_dir / "load.json").read_text())["reads"]
+        self.assertEqual({a for _, a in reads}, {"a"})         # the other account's concurrent read is not charged
+
+    def test_the_daemon_counts_what_github_billed_and_not_the_304s_nor_a_paused_account(self):
+        calls = collections.deque()
+        accounts = types.SimpleNamespace(calls=calls, lock=threading.Lock(), paused={"work": self.T0 + 600}, describe=lambda repo: "work" if repo.startswith("w/") else "default")
+        def _api(path, repo):
+            calls.append((self.T0 + len(calls) + 1, accounts.describe(repo), "x", "etag" in path))   # a path containing 'etag' stands for a 304
+            return []
+        seen = lambda name, fleet: types.SimpleNamespace(name=name, fleet=fleet, status="idle")
+        intents = types.SimpleNamespace(repo="own/r", _api=_api, accounts=accounts, open_asks=lambda c, r: _api("asks-etag", r) or [])
+        engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.T0, audit=None, actor="daemon", intents=intents,
+                                       config={"load_alert": self.health.validate(None, "x")})
+        discovery = types.SimpleNamespace(agents={"a": seen("a", {"role": "orchestrator", "charter": 1, "repo": "own/r"}),
+                                                  "w": seen("w", {"role": "orchestrator", "charter": 2, "repo": "w/r"})})
+        sb.load_tick(engine, discovery)
+        state = json.loads((self.state_dir / "load.json").read_text())
+        self.assertEqual([a for _, a in state["reads"]], ["default"])   # only the labels read (no label found: 1 call) is billed; the 304 asks read and the paused account's are not
+        self.assertTrue(any("account work is paused" in p for p in state["problems"]))
 
     def test_many_orchestrators_with_no_charter_are_named_with_a_count(self):
         orch = {"o%d" % n: {"charter": None, "repo": None, "busy": 0, "idle": 0, "messages": 0} for n in range(9)}
@@ -47561,6 +49026,306 @@ class TestLoadAlert(Base):
         self.assertEqual(self.latest()["a"]["open_asks"], 1)
         self.assertTrue(any("charters not readable" in p for p in json.loads((self.state_dir / "load.json").read_text())["problems"]))
 
+    def test_the_busy_coders_rule_is_quiet_while_things_move_and_loud_when_stuck_or_outnumbered(self):
+        def fig(**kw):
+            base = {"name": "o", "open_asks": 2, "stalled": 0, "stalled_asks": [], "moved_1h": 1, "moved_backlog": 1, "busy": 2, "idle": 0, "messages": 0, "decisions": 0}
+            return dict(base, **kw)
+        cfg = dict(self.health.DEFAULTS)
+        self.assertEqual(self.health.judge(fig(), cfg, None)[0], None)                         # busy, 0 stalled, 1 moved: no wake
+        self.assertEqual(self.health.judge(fig(open_asks=9, moved_backlog=5, moved_1h=2), cfg, None)[0], None)   # outnumbered but moving
+        text = self.health.judge(fig(open_asks=3, moved_backlog=0, moved_1h=0), cfg, None)[0]  # 3 asks, 0 moved in 4 h, coders full
+        self.assertIn("at least twice those moved in 4 h and none moved in the last hour", text)
+        text = self.health.judge(fig(stalled=1, stalled_asks=[7], moved_1h=3, moved_backlog=3, open_asks=4), cfg, None)[0]   # one ask stalled, coders full
+        self.assertIn("an ask is stalled (#7)", text)
+        self.assertEqual(self.health.judge(fig(open_asks=3, moved_backlog=0, moved_1h=0, idle=1), cfg, None)[0], None)   # idle coders: no
+        self.assertEqual(self.health.judge(fig(stalled=1, stalled_asks=[7], idle=1), cfg, None)[0], None)                # one stalled but not full: below the 2-ask rule
+
+    def test_references_in_a_body_and_branch_count_not_only_closes(self):
+        ref = lambda body, branch=None: self.health.references(body, branch, "acme/widget")
+        self.assertEqual(ref("Part of #12"), [12])
+        self.assertEqual(ref("Refs #13, see also #14"), [13, 14])
+        self.assertEqual(ref("PLAN: https://github.com/acme/widget/issues/348#issuecomment-1"), [348])
+        self.assertEqual(ref("fixes other/repo#99 and #5"), [5])                  # another repository's number is not ours
+        self.assertEqual(ref("", "feature/4022-load-fix"), [4022])
+        self.assertEqual(ref("&#39; is not an issue"), [])
+        row = self.health.move_rows("pull_request", {"action": "synchronize", "pull_request": {"number": 4303, "body": "Part of #4022", "head": {"ref": "x/3115-y"}}},
+                                    "acme/widget", 5, sb.closing_numbers)[0]
+        self.assertEqual((row["numbers"], row["refs"]), ([4303, 4022, 3115], [4022, 3115]))
+
+    def chain_world(self, parents, asks_numbers=(100,), **extra):
+        """A pass whose asks are `asks_numbers` of repo r, with `parents` {number: parent or None} as the issue parents on GitHub."""
+        reads = []
+        def read_parent(repo, number):
+            reads.append(number)
+            if number not in parents:
+                raise RuntimeError("gh is down")
+            return parents[number]
+        orch = {"o": {"charter": 1, "repo": "r", "busy": 0, "idle": 1, "messages": 0}}
+        self.asks = {1: list(asks_numbers)}
+        def tick(at, rows=(), **kw):
+            if rows:
+                self.health.append_moves(str(self.state_dir), list(rows))
+            def read_asks(charter, repo):
+                return [{"repo": "r", "number": n} for n in self.asks[charter]]
+            ctx = self.health.Context(now=at, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS, **kw.pop("cfg", {})), orchestrators=orch,
+                                      read_asks=read_asks, read_parent=read_parent, cos="cos", wake=self.woken.append, **dict(extra, **kw))
+            return self.health.tick(ctx)
+        return tick, reads
+
+    def move_row(self, at, refs, number=900):
+        return {"at": at, "repo": "r", "numbers": [number] + list(refs), "refs": list(refs), "kind": "push"}
+
+    def test_a_pull_request_naming_a_work_item_moves_the_ask_above_it(self):
+        tick, reads = self.chain_world({200: 100})
+        tick(self.T0)
+        late = self.T0 + 3 * 3600
+        tick(late, [self.move_row(late - 60, [200])])
+        got = self.latest()["o"]
+        self.assertEqual((got["stalled"], got["moved_1h"], reads), (0, 1, [200]))        # the ask 100 moved through its work item 200; one parent read
+
+    def test_a_chain_of_three_levels_reaches_the_ask_and_a_fourth_is_never_read(self):
+        tick, reads = self.chain_world({203: 202, 202: 201, 201: 100, 100: 50})
+        tick(self.T0)
+        late = self.T0 + 3 * 3600
+        tick(late, [self.move_row(late - 60, [203])])
+        self.assertEqual((self.latest()["o"]["moved_1h"], reads), (1, [203, 202, 201]))   # 3 reads reach the ask at the top; no read for the ask's own parent
+        tick2, reads2 = self.chain_world({205: 204, 204: 203, 203: 202, 202: 100}, asks_numbers=(100,))
+        shutil.rmtree(str(self.state_dir)); self.state_dir.mkdir(mode=0o700)
+        tick2(self.T0)
+        tick2(late, [self.move_row(late - 60, [205])])
+        self.assertEqual((self.latest()["o"]["stalled"], reads2), (1, [205, 204, 203]))   # the ask is 4 levels up: not reached, and no 4th read
+
+    def test_a_resolved_parent_is_never_read_again(self):
+        tick, reads = self.chain_world({200: 100})
+        tick(self.T0)
+        late = self.T0 + 3 * 3600
+        tick(late, [self.move_row(late - 60, [200])])
+        tick(late + 600, [self.move_row(late + 300, [200])])
+        tick(late + 3 * 3600, [self.move_row(late + 3 * 3600 - 30, [200])])
+        self.assertEqual(reads, [200])
+        self.assertEqual(json.loads((self.state_dir / "load.json").read_text())["parents"], {"r#200": 100})
+
+    def test_an_unreadable_parent_is_not_guessed_and_status_counts_the_unattributed(self):
+        tick, reads = self.chain_world({})                 # every parent read fails
+        tick(self.T0)
+        late = self.T0 + 3 * 3600
+        tick(late, [self.move_row(late - 60, [300]), self.move_row(late - 30, [301], number=901)])
+        got = self.latest()["o"]
+        self.assertEqual((got["stalled"], got["moved_1h"]), (1, 0))                      # the ask did not get the credit
+        lines = self.health.status_lines(str(self.state_dir), late)
+        self.assertEqual([l.strip() for l in lines if "not attributed" in l], ["2 movement(s) not attributed (a referenced issue's parent could not be read)"])
+        tick(late + 60, [])
+        self.assertEqual(len(reads), 2)                                                  # a failed read waits RETRY_SECONDS
+
+    def test_parent_reads_use_the_account_budget_and_a_spent_budget_leaves_them_unattributed(self):
+        tick, reads = self.chain_world({n: 100 for n in range(200, 240)})
+        tick(self.T0)
+        late = self.T0 + 3 * 3600
+        tick(late, [self.move_row(late - 60 + n % 3, [200 + n], number=900 + n) for n in range(40)], cfg={"read_budget": 5})
+        state = json.loads((self.state_dir / "load.json").read_text())
+        self.assertLessEqual(len(state["reads"]), 5)                                      # the same count as the asks and charters reads
+        self.assertLess(len(reads), 5)
+        self.assertGreater(state["unattributed"], 0)
+
+    def test_parent_reads_answered_304_are_free(self):
+        tick, reads = self.chain_world({n: 100 for n in range(200, 210)}, begin_read=lambda: 0, read_cost=lambda token, repo: 0)
+        tick(self.T0)
+        late = self.T0 + 3 * 3600
+        tick(late, [self.move_row(late - 60, [200 + n], number=900 + n) for n in range(10)], cfg={"read_budget": 2})
+        self.assertEqual(len(reads), 10)
+        self.assertEqual(json.loads((self.state_dir / "load.json").read_text())["reads"], [])
+
+    def test_the_daemon_reads_a_parent_from_the_issue_and_ignores_another_repository(self):
+        seen = lambda name, fleet: types.SimpleNamespace(name=name, fleet=fleet, status="idle")
+        paths = []
+        def _api(path, repo):
+            paths.append(path)
+            return {"parent_issue_url": "https://api.github.com/repos/acme/widget/issues/100"} if path.endswith("/issues/200") else (
+                {"parent_issue_url": "https://api.github.com/repos/other/place/issues/7"} if path.endswith("/issues/201") else [])
+        intents = types.SimpleNamespace(repo="acme/widget", _api=_api, open_asks=lambda c, r: [types.SimpleNamespace(repo="acme/widget", number=100)])
+        engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.T0, audit=None, actor="daemon", intents=intents,
+                                       config={"load_alert": self.health.validate(None, "x")})
+        discovery = types.SimpleNamespace(agents={"o": seen("o", {"role": "orchestrator", "charter": 1, "repo": "acme/widget"})})
+        sb.load_tick(engine, discovery)
+        self.health.append_moves(str(self.state_dir), [{"at": self.T0, "repo": "acme/widget", "numbers": [900, 200, 201], "refs": [200, 201], "kind": "push"}])
+        sb.load_tick(engine, discovery)
+        parents = json.loads((self.state_dir / "load.json").read_text())["parents"]
+        self.assertEqual(parents, {"acme/widget#200": 100, "acme/widget#201": 0})          # a parent in another repository is no parent here
+
+    DAY = 86400.0
+
+    def wait_world(self, asks, **cfg):
+        """One orchestrator whose asks are `asks` (number -> {labels, parked_until}); a first pass, then one 3 hours later with nothing moved."""
+        self.waits = asks
+        orch = {"o": {"charter": 1, "repo": "r", "busy": 0, "idle": 1, "messages": 0}}
+        def run(at):
+            def read_asks(charter, repo):
+                return [dict({"repo": "r", "number": n}, **self.waits[n]) for n in sorted(self.waits)]
+            return self.health.tick(self.health.Context(now=at, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS, **cfg), orchestrators=orch,
+                                                        read_asks=read_asks, cos="cos", wake=self.woken.append))
+        run(self.T0)
+        run(self.T0 + 3 * 3600)
+        return self.latest()["o"]
+
+    def test_an_ask_awaiting_the_owner_is_waiting_not_stalled(self):
+        got = self.wait_world({1: {"labels": ["me:awaiting-user"]}})
+        self.assertEqual((got["stalled"], got["waiting_owner"], got["waiting_cos"], got["parked"]), (0, 1, 0, 0))
+
+    def test_an_ask_awaiting_the_chief_of_staff_is_counted_apart(self):
+        got = self.wait_world({1: {"labels": ["me:awaiting-cos"]}})
+        self.assertEqual((got["stalled"], got["waiting_cos"], got["waiting_owner"]), (0, 1, 0))
+
+    def test_a_parked_ask_with_a_future_date_is_parked_and_one_whose_date_passed_is_stalled_again(self):
+        got = self.wait_world({1: {"labels": ["me:parked"], "parked_until": self.T0 + 10 * self.DAY}})
+        self.assertEqual((got["stalled"], got["parked"]), (0, 1))
+        shutil.rmtree(str(self.state_dir)); self.state_dir.mkdir(mode=0o700)
+        got = self.wait_world({1: {"labels": ["me:parked"], "parked_until": self.T0 + 3600}})   # the date passes within the 3 hours
+        self.assertEqual((got["stalled"], got["parked"]), (1, 0))
+
+    def test_a_parked_label_without_a_valid_future_date_is_not_parked(self):
+        for case in ({"labels": ["me:parked"]}, {"labels": ["me:parked"], "parked_until": None},
+                     {"labels": ["me:parked"], "parked_until": self.T0 + 5000 * self.DAY}):   # no date / a date beyond the bound
+            shutil.rmtree(str(self.state_dir)); self.state_dir.mkdir(mode=0o700)
+            got = self.wait_world({1: case})
+            self.assertEqual((got["stalled"], got["parked"]), (1, 0), case)
+
+    def test_the_real_parser_gives_none_for_a_missing_malformed_or_impossible_date_and_the_labels_flow_from_the_asks_list(self):
+        labels = ["me:parked"]
+        body = lambda line: "## Intent\nx\n\n" + line + "\n"
+        for line in ("", "Parked until: soon", "Parked until: 2026-02-30", "Parked until: 2026-10-20\nParked until: 2026-10-21"):
+            self.assertIsNone(sb.parked_until(body(line), labels), line)
+        self.assertEqual(sb.parked_until(body("Parked until: 2026-10-20"), labels), _dt.datetime(2026, 10, 21, tzinfo=_dt.timezone.utc).timestamp())
+        issue = sb.IssueIntent.from_api({"number": 5, "state": "open", "title": "t", "body": body("Parked until: 2026-10-20"), "labels": [{"name": "me:parked"}, {"name": "x"}]})
+        self.assertEqual((issue.labels, issue.parked_until), (["me:parked", "x"], _dt.datetime(2026, 10, 21, tzinfo=_dt.timezone.utc).timestamp()))
+        self.assertEqual(self.health.PARKED_MAX_DAYS, sb.PARKED_MAX_DAYS)
+
+    def test_a_mixed_fleet_shows_the_split_in_status_and_only_the_plain_stall_counts(self):
+        got = self.wait_world({1: {"labels": []}, 2: {"labels": ["me:awaiting-user"]}, 3: {"labels": ["me:awaiting-cos"]},
+                               4: {"labels": ["me:parked"], "parked_until": self.T0 + 9 * self.DAY}, 5: {"labels": []}})
+        self.assertEqual((got["open_asks"], got["stalled"], got["waiting_owner"], got["waiting_cos"], got["parked"]), (5, 2, 1, 1, 1))
+        self.health.append_moves(str(self.state_dir), [{"at": self.T0 + 3 * 3600 - 10, "repo": "r", "numbers": [5], "refs": [5], "kind": "push"}])
+        got = self.wait_world({1: {"labels": []}, 2: {"labels": ["me:awaiting-user"]}, 3: {"labels": ["me:awaiting-cos"]},
+                               4: {"labels": ["me:parked"], "parked_until": self.T0 + 9 * self.DAY}, 5: {"labels": []}})
+        self.assertEqual((got["stalled"], got["stalled_asks"]), (1, [1]))
+        row = [l for l in self.health.status_lines(str(self.state_dir), self.T0) if l.strip().startswith("o ")][0]
+        self.assertIn("stalled 1, waiting on owner 1, parked 1, waiting on cos 1", row)
+
+    def test_wait_labels_take_precedence_owner_then_cos_then_parked_and_the_bare_label_counts(self):
+        future = self.T0 + 9 * self.DAY
+        got = self.wait_world({1: {"labels": ["me:awaiting-cos", "me:awaiting-user", "me:parked"], "parked_until": future},   # all three: the owner wins
+                               2: {"labels": ["me:awaiting-cos", "me:parked"], "parked_until": future},                       # cos beats parked
+                               3: {"labels": ["awaiting-user"]},                                                                # a bare, unprefixed label
+                               4: {"labels": ["me:parked"], "parked_until": future},
+                               5: {"labels": ["unrelated:label"]}})
+        self.assertEqual((got["waiting_owner"], got["waiting_cos"], got["parked"], got["stalled"]), (2, 1, 1, 1))
+
+    def test_asks_waiting_or_parked_do_not_make_the_busy_coders_rule_fire(self):
+        def fig(**kw):
+            base = {"name": "o", "open_asks": 6, "active_asks": 6, "stalled": 0, "stalled_asks": [], "moved_1h": 0, "moved_backlog": 1, "busy": 2, "idle": 0,
+                    "messages": 0, "decisions": 0}
+            return dict(base, **kw)
+        cfg = dict(self.health.DEFAULTS)
+        self.assertIn("at least twice", self.health.judge(fig(), cfg, None)[0])                       # 6 active asks, 1 moved, nothing in the last hour: fires
+        self.assertIsNone(self.health.judge(fig(active_asks=1, waiting_owner=3, waiting_cos=1, parked=1), cfg, None)[0])   # 5 of the 6 only wait or are parked: 1 active, no wake
+        # the same through a real pass: 6 asks, 5 waiting or parked, coders full, nothing moved
+        got = self.wait_world({1: {"labels": ["me:awaiting-user"]}, 2: {"labels": ["me:awaiting-user"]}, 3: {"labels": ["me:awaiting-cos"]},
+                               4: {"labels": ["me:parked"], "parked_until": self.T0 + 9 * self.DAY}, 5: {"labels": ["me:parked"], "parked_until": self.T0 + 9 * self.DAY},
+                               6: {"labels": []}}, enabled=True)
+        self.assertEqual((got["open_asks"], got["active_asks"]), (6, 1))
+
+    def test_waiting_asks_never_wake_the_chief_of_staff_but_plain_stalls_do(self):
+        self.wait_world({1: {"labels": ["me:awaiting-user"]}, 2: {"labels": ["me:awaiting-user"]}}, enabled=True)
+        for hours in (4, 5, 6):
+            self.health.tick(self.health.Context(now=self.T0 + hours * 3600, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS, enabled=True),
+                                                 orchestrators={"o": {"charter": 1, "repo": "r", "busy": 0, "idle": 1, "messages": 0}},
+                                                 read_asks=lambda c, r: [dict({"repo": "r", "number": n}, **self.waits[n]) for n in sorted(self.waits)], cos="cos", wake=self.woken.append))
+        self.assertEqual(self.woken, [])
+        shutil.rmtree(str(self.state_dir)); self.state_dir.mkdir(mode=0o700)
+        self.wait_world({1: {"labels": []}, 2: {"labels": []}}, enabled=True)
+        self.assertEqual(len(self.woken), 1)
+
+    def decisions_world(self, decisions, parents, orchestrators=None, asks=None, charters=None, tick_at=None, **extra):
+        """Passes of orchestrators with charters (`charters`: name -> number) and asks, over a decisions.json of `decisions` and issue parents `parents`."""
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": decisions}))
+        reads = []
+        def read_parent(repo, number):
+            reads.append(number)
+            if number not in parents:
+                raise RuntimeError("gh is down")
+            return parents[number]
+        orch = orchestrators or {"a": {"charter": 1, "repo": "r", "busy": 0, "idle": 1, "messages": 0}, "b": {"charter": 2, "repo": "r", "busy": 0, "idle": 1, "messages": 0}}
+        asks = asks or {1: [10], 2: [20]}
+        def read_asks(charter, repo):
+            return [{"repo": "r", "number": n} for n in asks[charter]]
+        def tick(at=None, **kw):
+            ctx = self.health.Context(now=at or self.T0, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS, **kw.pop("cfg", {})), orchestrators=orch,
+                                      read_asks=read_asks, read_parent=read_parent, cos="cos", wake=self.woken.append, **dict(extra, **kw))
+            return self.health.tick(ctx)
+        return tick, reads
+
+    def test_an_old_format_row_is_followed_through_the_issues_it_closed(self):
+        tick, reads = self.chain_world({200: 100})
+        tick(self.T0)
+        late = self.T0 + 3 * 3600
+        tick(late, [{"at": late - 60, "repo": "r", "numbers": [900, 200], "kind": "push"}])     # written before refs existed: the pull request and what it closed
+        self.assertEqual((self.latest()["o"]["moved_1h"], reads), (1, [200]))
+
+    def test_a_pull_request_under_the_charter_with_no_ask_is_charter_movement_and_credits_no_ask(self):
+        tick, reads = self.chain_world({300: 1})                       # issue 300's parent is the charter 1 itself
+        tick(self.T0)
+        late = self.T0 + 3 * 3600
+        tick(late, [self.move_row(late - 60, [300])])
+        got = self.latest()["o"]
+        self.assertEqual((got["charter_moves_1h"], got["moved_1h"], got["stalled"]), (1, 0, 1))
+        lines = self.health.status_lines(str(self.state_dir), late)
+        self.assertIn("charter moves 1h 1", [l for l in lines if l.strip().startswith("o ")][0])
+
+    def test_charter_movement_keeps_the_busy_coders_rule_quiet(self):
+        orch = {"o": {"charter": 1, "repo": "r", "busy": 2, "idle": 0, "messages": 0}}
+        self.asks = {1: [10, 11, 12]}
+        def tick(at, rows=()):
+            if rows:
+                self.health.append_moves(str(self.state_dir), list(rows))
+            return self.health.tick(self.health.Context(now=at, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS, enabled=True), orchestrators=orch,
+                                                        read_asks=lambda c, r: [{"repo": "r", "number": n} for n in self.asks[c]],
+                                                        read_parent=lambda repo, n: 1, cos="cos", wake=self.woken.append))
+        tick(self.T0, [{"at": self.T0 - 60, "repo": "r", "numbers": [900, 300], "refs": [300], "kind": "push"}])   # the lane is moving: no wake for outnumbered asks
+        tick(self.T0 + 600)
+        self.assertEqual(self.woken, [])
+        shutil.rmtree(str(self.state_dir)); self.state_dir.mkdir(mode=0o700)
+        tick(self.T0)                                                                                      # nothing moved at all: the same fixture fires
+        self.assertEqual(len(self.woken), 1)
+
+    def test_a_decision_belongs_to_the_charter_on_its_chain_not_to_its_agent_field(self):
+        tick, reads = self.decisions_world([{"agent": "b", "ask": 500, "repo": "r"}], {500: 10, 10: 1})   # 500 -> ask 10 of orchestrator a; the field says b
+        tick()
+        got = self.latest()
+        self.assertEqual((got["a"]["decisions"], got["b"]["decisions"]), (1, 0))
+
+    def test_every_decision_is_attributed_to_the_charter_that_holds_it_even_with_no_agent(self):
+        tick, reads = self.decisions_world([{"agent": None, "ask": 10, "repo": "r"}, {"agent": "a", "ask": 20, "repo": "r"}, {"agent": None, "ask": 600, "repo": "r"}],
+                                           {600: 2})
+        tick()
+        got = self.latest()
+        self.assertEqual((got["a"]["decisions"], got["b"]["decisions"]), (1, 2))                         # 10 -> a's ask; 20 -> b's ask; 600 -> charter 2 (b)
+
+    def test_a_decision_whose_chain_cannot_be_resolved_belongs_to_nobody_and_status_says_so(self):
+        tick, reads = self.decisions_world([{"agent": "a", "ask": 700, "repo": "r"}], {})              # the parent read fails
+        tick()
+        got = self.latest()
+        self.assertEqual((got["a"]["decisions"], got["b"]["decisions"]), (0, 0))                        # the agent field is not used as a fallback
+        lines = self.health.status_lines(str(self.state_dir), self.T0)
+        self.assertEqual(len([l for l in lines if "1 decision(s) not attributed" in l]), 1)
+
+    def test_decision_chains_are_read_once_and_count_in_the_account_budget(self):
+        tick, reads = self.decisions_world([{"agent": "a", "ask": 500, "repo": "r"}, {"agent": "a", "ask": 501, "repo": "r"}], {500: 10, 501: 10})
+        for k in range(3):
+            tick(self.T0 + k * 600)
+        self.assertEqual(sorted(reads), [500, 501])
+        state = json.loads((self.state_dir / "load.json").read_text())
+        self.assertEqual(len([r for r in state["reads"] if True]) >= 2, True)
+        self.assertEqual(state["parents"], {"r#500": 10, "r#501": 10})
+
     def test_an_idle_pass_rewrites_nothing(self):
         self.asks = {1: [1]}
         self.tick(self.T0, {"o": self.orch(busy=1, charter=1)})
@@ -47598,6 +49363,115 @@ def main(argv):
     ok = result.wasSuccessful() and result.testsRun > 0
     print("RESULT: %s" % ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
+
+
+class TestModuleLoader(Base):
+    """Ask #437 slice 1: one generic loader behind the old `load_<module>()` names."""
+
+    OLD = {
+        "load_decision_core": "decision_core", "load_plan_check": "plan_check", "load_plan_ledger": "plan_ledger",
+        "load_report_fold": "report_fold", "load_triage_plan_open": "triage_plan_open", "load_pr_events": "pr_events",
+        "load_disk_janitor": "disk_janitor", "load_heavy_slots": "heavy_slots", "load_cpu_guard": "cpu_guard",
+        "load_health_records": "health_records", "load_reds": "reds", "load_impact_floor": "impact_floor",
+        "load_plan_review": "plan_review", "load_external_adapter": "external_adapter",
+        "load_decision_sync": "decision_sync", "load_work_sync": "work_sync", "load_agent_calls": "agent_calls",
+        "load_triage_digest": "triage_digest", "load_dead_hint": "dead_hint", "load_fleet_health": "fleet_health",
+    }
+
+    def _copy(self, extra=None):
+        """A copy of the program in a temp bin directory, with the named modules beside it, loaded as a module."""
+        tmp = Path(tempfile.mkdtemp(prefix="ldtest"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        held = dict(sys.modules)
+        self.addCleanup(lambda: (sys.modules.clear(), sys.modules.update(held)))
+        shutil.copy(SWITCHBOARD, tmp / "fleet-switchboard")
+        for module in BIN.glob("*.py"):
+            shutil.copy(module, tmp / module.name)
+        for name, text in (extra or {}).items():
+            (tmp / (name + ".py")).write_text(text)
+        return tmp, _load("ld_" + tmp.name, tmp / "fleet-switchboard")
+
+    def test_s1_each_old_loader_loads_its_old_path_and_caches(self):
+        self.assertEqual(len(self.OLD), 20)
+        for fn, name in self.OLD.items():
+            first = getattr(sb, fn)()
+            self.assertEqual(os.path.realpath(first.__file__), os.path.realpath(str(BIN / (name + ".py"))), fn)
+            self.assertIs(getattr(sb, fn)(), first, fn)
+
+    def test_s2_a_missing_or_broken_module_fails_as_before(self):
+        tmp, mod = self._copy({"broken_one": "def (:\n"})
+        with self.assertRaises(FileNotFoundError):
+            mod.load_module("absent_one")
+        with self.assertRaises(SyntaxError):
+            mod.load_module("broken_one")
+        self.assertNotIn("broken_one", sys.modules)
+
+    def test_s4_a_new_module_loads_with_no_edit_to_the_program(self):
+        tmp, mod = self._copy({"fixture_mod": "VALUE = 7\n"})
+        first = mod.load_module("fixture_mod")
+        self.assertEqual(first.VALUE, 7)
+        self.assertIs(mod.load_module("fixture_mod"), first)
+
+    def test_s9_concurrent_first_loads_all_get_the_finished_module_and_a_failing_one_fails_for_every_thread(self):
+        tmp, mod = self._copy({
+            "slow_mod": "import time\ntime.sleep(0.3)\nREADY = True\n",
+            "failing_mod": "import time\ntime.sleep(0.2)\nraise RuntimeError('boom')\n"})
+        got, errors, barrier = [], [], threading.Barrier(8)
+
+        def worker(name):
+            barrier.wait()
+            try:
+                module = mod.load_module(name)
+                got.append((module, getattr(module, "READY", False)))
+            except RuntimeError as err:
+                errors.append(str(err))
+        threads = [threading.Thread(target=worker, args=("slow_mod",)) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(20)
+        self.assertEqual(len(got), 8)
+        self.assertEqual(len({id(module) for module, _ in got}), 1, "one object for every thread")
+        self.assertTrue(all(ready for _, ready in got), "no thread saw a half-loaded module")
+        barrier, errors = threading.Barrier(8), []
+        threads = [threading.Thread(target=worker, args=("failing_mod",)) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(20)
+        self.assertEqual(errors, ["boom"] * 8, "the failing module raises for every thread")
+        self.assertNotIn("failing_mod", sys.modules)
+
+    def test_s9b_a_slow_import_never_delays_another_module_and_a_module_may_load_another(self):
+        tmp, mod = self._copy({
+            "slow_one": "import threading\nthreading._ld_started.set()\nthreading._ld_gate.wait(20)\nREADY = True\n",
+            "quick_one": "VALUE = 1\n", "fresh_one": "VALUE = 2\n",
+            "b_mod": "VALUE = 'b'\n",
+            "a_mod": "import threading\nB = threading._ld_load('b_mod')\n"})
+        threading._ld_started, threading._ld_gate, threading._ld_load = threading.Event(), threading.Event(), mod.load_module
+        self.addCleanup(lambda: [delattr(threading, n) for n in ("_ld_started", "_ld_gate", "_ld_load") if hasattr(threading, n)])
+        self.addCleanup(threading._ld_gate.set)
+        quick = mod.load_module("quick_one")
+        slow = threading.Thread(target=lambda: mod.load_module("slow_one"))
+        slow.start()
+        self.assertTrue(threading._ld_started.wait(10))
+        self.assertIs(mod.load_module("quick_one"), quick, "an already loaded module needs no lock")
+        self.assertEqual(mod.load_module("fresh_one").VALUE, 2, "a first load of another module does not wait for the slow import")
+        self.assertTrue(slow.is_alive(), "both returned while the slow import was still running")
+        threading._ld_gate.set()
+        slow.join(20)
+        self.assertEqual(mod.load_module("a_mod").B.VALUE, "b", "a module that loads another while it runs")
+
+    def test_s8_a_hostile_name_is_refused(self):
+        tmp, mod = self._copy()
+        (tmp.parent / "outside_mod.py").write_text("VALUE = 1\n")
+        self.addCleanup((tmp.parent / "outside_mod.py").unlink)
+        for name in ("../outside_mod", os.path.join(os.sep, "etc", "hosts"), "a/b", "", None):
+            with self.assertRaises(ValueError, msg=repr(name)):
+                mod.load_module(name)
+        with self.assertRaises(FileNotFoundError):
+            mod.load_module("no_such_module")
+        self.assertNotIn("outside_mod", sys.modules)
 
 
 if __name__ == "__main__":

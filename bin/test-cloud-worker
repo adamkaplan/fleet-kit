@@ -226,8 +226,8 @@ class TestCloudWorkerEndpoint(Base):
         other = FakeRemote(PASSWORD)
         self.addCleanup(other.close)
         self.assertEqual(self.launch()[0], 0)
-        record = sb.cloud().load_record(self.state, "coder7")
-        v2 = sb.cloud().remote_v2(self.state, record)
+        record = sb.load_module("cloud_worker").bind(vars(sb)).load_record(self.state, "coder7")
+        v2 = sb.load_module("cloud_worker").bind(vars(sb)).remote_v2(self.state, record)
         v2.message_list("ses_remote1", limit=1)
         named = [r for r in self.remote.requests if r[1].startswith("/api/session/ses_remote1/message")]
         self.assertEqual(len(named), 1)
@@ -243,15 +243,15 @@ class TestCloudWorkerEndpoint(Base):
         record = {"worker": "coder7", "url": "http://127.0.0.1:9", "runtime_id": "pod/x"}   # nothing listens there
         (self.state).mkdir(parents=True, exist_ok=True)
         os.chmod(str(self.state), 0o700)
-        sb.cloud()._write_private(sb.cloud().password_path(self.state, "coder7"), PASSWORD + "\n")
-        v2 = sb.cloud().remote_v2(self.state, record, timeout=2)
+        sb.load_module("cloud_worker").bind(vars(sb))._write_private(sb.load_module("cloud_worker").bind(vars(sb)).password_path(self.state, "coder7"), PASSWORD + "\n")
+        v2 = sb.load_module("cloud_worker").bind(vars(sb)).remote_v2(self.state, record, timeout=2)
         with self.assertRaises(sb.V2Error) as caught:
             v2.session_get("ses_x")
         self.assertEqual(caught.exception.reason, "unavailable")
         self.assertIn("no local fallback", str(caught.exception))
 
     def test_a_pods_escape_sequences_are_not_printed(self):
-        line = sb.cloud().message_line({"type": "as\x1b[31m", "text": "a\x9b2Jb\x07"})
+        line = sb.load_module("cloud_worker").bind(vars(sb)).message_line({"type": "as\x1b[31m", "text": "a\x9b2Jb\x07"})
         self.assertNotRegex(line, r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
     def test_retire_by_an_agent_that_is_not_the_boss_is_refused(self):
@@ -286,7 +286,7 @@ class TestCloudWorkerEndpoint(Base):
         self.assertNotIn("cloud", json.loads(out))
 
     def test_endpoint_rules(self):
-        problem = sb.cloud().endpoint_problem
+        problem = sb.load_module("cloud_worker").bind(vars(sb)).endpoint_problem
         self.assertIsNone(problem("https://worker-coder7.example.internal:4096"))
         self.assertIsNone(problem("http://127.0.0.1:4096"))
         for bad in ("http://worker.example.internal:4096", "https://user:pw@host.example:1", "https://host.example/path",

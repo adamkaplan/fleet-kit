@@ -79,6 +79,48 @@ from urllib.parse import quote
 import uuid
 
 
+_MODULE_LOCKS = {}            # one reentrant lock per module name: a load of one module never waits behind the import of another
+_MODULE_LOCKS_GUARD = threading.Lock()   # held only to fetch or make a name's lock, never across an import
+_MODULES_DONE = {}            # name -> the module object whose import FINISHED (sys.modules holds a module while it still runs)
+
+
+def load_module(name):
+    """A helper module of bin/, loaded by path from beside this file: the one loader behind every `load_<module>()` below,
+    so a new module needs no loader of its own (call `load_module("name")`).
+
+    Not by `import`: this file has no .py name, is run through a symlink (~/.local/bin), by the daemon's service
+    unit, by wrappers, and is loaded by tests with SourceFileLoader, and none of those puts its directory on
+    sys.path. The real path of this file (symlinks resolved) is always right. A copy already loaded from the
+    same file is reused, so two loads of this script share one module. The name is a plain module name, never
+    a path: anything else is refused (ValueError), and a name with no file here fails as it always did.
+
+    A module already loaded is returned with no lock at all (this is on the hot path). A first load holds the lock of THAT name only, and
+    checks again once it has it, so concurrent first loads of one module all get the finished module and a failed import (never kept) raises
+    for every caller; the import of one module never delays another."""
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        raise ValueError("not a module name: %r" % (name,))
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), name + ".py")
+    done = _MODULES_DONE.get(name)
+    if done is not None and sys.modules.get(name) is done and os.path.realpath(getattr(done, "__file__", "") or "") == path:
+        return done
+    with _MODULE_LOCKS_GUARD:
+        lock = _MODULE_LOCKS.setdefault(name, threading.RLock())
+    with lock:   # reentrant: a module that loads another while it runs does not wait for itself
+        held = sys.modules.get(name)
+        if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+            return held
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(name, None)
+            raise
+        _MODULES_DONE[name] = module
+        return module
+
+
 def load_decision_core():
     """The pure core of the Decision subsystem, bin/decision_core.py, loaded by path from beside this file.
 
@@ -86,40 +128,15 @@ def load_decision_core():
     unit, by wrappers, and is loaded by tests with SourceFileLoader, and none of those puts its directory on
     sys.path. The real path of this file (symlinks resolved) is always right. A copy already loaded from the
     same file is reused, so two loads of this script share one module."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "decision_core.py")
-    held = sys.modules.get("decision_core")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("decision_core", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["decision_core"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("decision_core", None)
-        raise
-    return module
+    return load_module("decision_core")
 
 
 decision_core = load_decision_core()
 
 
-def cloud():
-    """The remote-worker module, bin/cloud_worker.py (#371), loaded by path like decision_core and bound to this script's names. All of its logic
-    lives there; the hooks of launch, send, retire and status only call it through `run_cloud`."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cloud_worker.py")
-    held = sys.modules.get("cloud_worker")
-    if held is None or os.path.realpath(getattr(held, "__file__", "") or "") != path:
-        spec = importlib.util.spec_from_file_location("cloud_worker", path)
-        held = importlib.util.module_from_spec(spec)
-        sys.modules["cloud_worker"] = held
-        spec.loader.exec_module(held)
-    return held.bind(globals())
-
-
 def run_cloud(function, *arguments):
     """`cloud_worker.<function>(*arguments)`; a CloudError reads as a LaunchError (a one-line failure, exit 1)."""
-    module = cloud()
+    module = load_module("cloud_worker").bind(globals())
     try:
         return getattr(module, function)(*arguments)
     except module.CloudError as err:
@@ -128,155 +145,64 @@ def run_cloud(function, *arguments):
 
 def load_plan_check():
     """The plan checker, bin/plan_check.py (#135), loaded by path from beside this file, as load_decision_core does."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "plan_check.py")
-    held = sys.modules.get("plan_check")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("plan_check", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["plan_check"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("plan_check", None)
-        raise
-    return module
+    return load_module("plan_check")
 
 
 def load_plan_ledger():
     """The evidence ledger and gates, bin/plan_ledger.py (#107), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "plan_ledger.py")
-    held = sys.modules.get("plan_ledger")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("plan_ledger", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["plan_ledger"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("plan_ledger", None)
-        raise
-    return module
+    return load_module("plan_ledger")
 
 
 def load_report_fold():
     """The report fold's pure core, bin/report_fold.py (#352), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "report_fold.py")
-    held = sys.modules.get("report_fold")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("report_fold", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["report_fold"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("report_fold", None)
-        raise
-    return module
+    return load_module("report_fold")
 
 
 def load_triage_plan_open():
     """The plan-issue-still-open rule, bin/triage_plan_open.py (#384), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "triage_plan_open.py")
-    held = sys.modules.get("triage_plan_open")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("triage_plan_open", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["triage_plan_open"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("triage_plan_open", None)
-        raise
-    return module
+    return load_module("triage_plan_open")
 
 
 def load_pr_events():
     """The webhook-event rule for `pr-state`, bin/pr_events.py (#354), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pr_events.py")
-    held = sys.modules.get("pr_events")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("pr_events", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["pr_events"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("pr_events", None)
-        raise
-    return module
+    return load_module("pr_events")
 
 
 def load_disk_janitor():
     """The temp-directory janitor, bin/disk_janitor.py (#321), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "disk_janitor.py")
-    held = sys.modules.get("disk_janitor")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("disk_janitor", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["disk_janitor"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("disk_janitor", None)
-        raise
-    return module
+    return load_module("disk_janitor")
 
 
 def load_heavy_slots():
     """The CPU slots for heavy commands, bin/heavy_slots.py (#34), loaded by path like the other modules."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "heavy_slots.py")
-    held = sys.modules.get("heavy_slots")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("heavy_slots", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["heavy_slots"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("heavy_slots", None)
-        raise
-    return module
+    return load_module("heavy_slots")
 
 
 def load_cpu_guard():
     """The CPU guard, bin/cpu_guard.py (the P0 CPU order), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cpu_guard.py")
-    held = sys.modules.get("cpu_guard")
+    return load_module("cpu_guard")
+
+
+def load_agent_presence():
+    """The presence rule for a worker with no terminal, bin/agent_presence.py (#433), loaded by path like cpu_guard."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "agent_presence.py")
+    held = sys.modules.get("agent_presence")
     if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
         return held
-    spec = importlib.util.spec_from_file_location("cpu_guard", path)
+    spec = importlib.util.spec_from_file_location("agent_presence", path)
     module = importlib.util.module_from_spec(spec)
-    sys.modules["cpu_guard"] = module
+    sys.modules["agent_presence"] = module
     try:
         spec.loader.exec_module(module)
     except BaseException:
-        sys.modules.pop("cpu_guard", None)
+        sys.modules.pop("agent_presence", None)
         raise
     return module
 
 
 def load_health_records():
     """The health recorders, bin/health_records.py (#357), loaded by path like disk_janitor."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "health_records.py")
-    held = sys.modules.get("health_records")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("health_records", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["health_records"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("health_records", None)
-        raise
-    return module
+    return load_module("health_records")
 
 
 def health_recorder(engine):
@@ -327,36 +253,12 @@ def health_write(engine, state, now):
 
 def load_reds():
     """`reds`, bin/reds.py (#342), loaded by path like the other modules."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "reds.py")
-    held = sys.modules.get("reds")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("reds", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["reds"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("reds", None)
-        raise
-    return module
+    return load_module("reds")
 
 
 def load_impact_floor():
     """The impact floor and hold table, bin/impact_floor.py (#179, L3), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "impact_floor.py")
-    held = sys.modules.get("impact_floor")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("impact_floor", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["impact_floor"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("impact_floor", None)
-        raise
-    return module
+    return load_module("impact_floor")
 
 
 class _LazyImpactFloor:
@@ -369,19 +271,7 @@ impact_floor = _LazyImpactFloor()
 
 def load_plan_review():
     """The plan review engine's pure core, bin/plan_review.py (#109), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "plan_review.py")
-    held = sys.modules.get("plan_review")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("plan_review", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["plan_review"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("plan_review", None)
-        raise
-    return module
+    return load_module("plan_review")
 
 
 class _LazyPlanReview:
@@ -419,37 +309,13 @@ def load_external_adapter():
     """The generic external adapter, bin/external_adapter.py, loaded by path from beside this file, the way
     load_decision_core loads the core. Called only when an external decision system is switched on and names this
     adapter: while it is off the file is never read or imported."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "external_adapter.py")
-    held = sys.modules.get("external_adapter")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("external_adapter", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["external_adapter"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("external_adapter", None)
-        raise
-    return module
+    return load_module("external_adapter")
 
 
 def load_decision_sync():
     """The sync engine for external decision systems, bin/decision_sync.py, loaded by path like decision_core (it
     imports decision_core, which is already registered)."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "decision_sync.py")
-    held = sys.modules.get("decision_sync")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("decision_sync", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["decision_sync"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("decision_sync", None)
-        raise
-    return module
+    return load_module("decision_sync")
 
 
 decision_sync = load_decision_sync()
@@ -457,19 +323,7 @@ decision_sync = load_decision_sync()
 
 def load_work_sync():
     """The work-item pump, bin/work_sync.py, loaded by path like the others."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "work_sync.py")
-    held = sys.modules.get("work_sync")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("work_sync", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["work_sync"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("work_sync", None)
-        raise
-    return module
+    return load_module("work_sync")
 
 
 work_sync = load_work_sync()
@@ -477,19 +331,7 @@ work_sync = load_work_sync()
 
 def load_agent_calls():
     """The agent-shell call counter, bin/agent_calls.py (#367), loaded by path like the others."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "agent_calls.py")
-    held = sys.modules.get("agent_calls")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("agent_calls", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["agent_calls"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("agent_calls", None)
-        raise
-    return module
+    return load_module("agent_calls")
 
 
 agent_calls = load_agent_calls()
@@ -497,19 +339,7 @@ agent_calls = load_agent_calls()
 
 def load_triage_digest():
     """The stale digest's rules and files, bin/triage_digest.py (#349), loaded by path like the others."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "triage_digest.py")
-    held = sys.modules.get("triage_digest")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("triage_digest", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["triage_digest"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("triage_digest", None)
-        raise
-    return module
+    return load_module("triage_digest")
 
 
 triage_digest = load_triage_digest()
@@ -517,19 +347,7 @@ triage_digest = load_triage_digest()
 
 def load_dead_hint():
     """The DEAD agent's hint, bin/dead_hint.py (#379), loaded by path like the others."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "dead_hint.py")
-    held = sys.modules.get("dead_hint")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("dead_hint", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["dead_hint"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("dead_hint", None)
-        raise
-    return module
+    return load_module("dead_hint")
 
 
 dead_hint = load_dead_hint()
@@ -563,9 +381,9 @@ DEFAULTS = {
     "call_timeout_seconds": 20,
     "send_timeout_seconds": 60,    # `send` as a whole (the sum of its v2 and herdr calls): past it, a clear failure line, never a silent minutes-long wait
     "poll_seconds": 5,
-    "cpu_guard": None,             # load over cores: None = defaults (high_ratio 3 for 5 minutes wakes the Chief of Staff once per episode); false = off; or {"high_ratio": n, "minutes": n}
+    "cpu_guard": None,             # load over cores and swap: None = defaults (high_ratio 3 for 5 minutes, swap_percent 90 for 5 minutes, each wakes the Chief of Staff once per episode); false = off; or {"high_ratio": n, "minutes": n, "swap_percent": n, "swap_minutes": n}
     "disk_guard": None,            # free space of the state directory's volume: None = defaults (min_free_gb 50, hard_free_gb 10); false = off; or {"min_free_gb": n, "hard_free_gb": n}
-    "reds": None,                  # `reds` (#342): {"reference_events": {"owner/repo": ["merge_group", "schedule"]}}: the events whose runs on the default branch are "main's runs" (default: push)
+    "reds": None,                  # `reds` (#342): {"reference_events": {"owner/repo": ["merge_group", "schedule"]}, "workflow": {"owner/repo": "ci.yml"}}: the events whose runs on the default branch are "main's runs" (default: push), and an optional override of the workflow (default: the one that holds the pull request's artifact)
     "heavy": None,                 # CPU slots for `heavy -- <command>` (full suites, e2e runs): None = 3 slots; or {"slots": n}
     "docker_reaper": True,         # the daily removal of EXPIRED labelled docker containers, networks and volumes (`disk reap-docker`): false is the kill switch
     "v2_events": "auto",           # the daemon's news of sessions: "auto" (the service's event stream, where the HTTP route exists; reads only what an event did not say) or "off" (the old reads)
@@ -2418,60 +2236,95 @@ class DiskFacts:
 
 
 class CpuFacts:
-    """The CPU guard's fact source (bin/cpu_guard.py): ONE `os.getloadavg()` per pass, no process. When the load over the cores stays above the guard for the
-    configured minutes the Chief of Staff is told ONCE for the episode (`cpu.high:<episode>`: the key is stable, so it is delivered once), `cpu.high` is audited
-    with the top process categories from ONE bounded `ps` run when the episode begins (never on another pass), and the episode ends (`cpu.recovered`) below
-    two thirds of the guard. The episode is kept in `cpu-guard.json`, so a restart does not begin a second one."""
+    """The CPU and memory guard's fact source (bin/cpu_guard.py): ONE `os.getloadavg()` and the kernel's memory counters per pass, no process. When the load over
+    the cores stays above the guard for the configured minutes the Chief of Staff is told ONCE for the episode (`cpu.high:<episode>`: the key is stable, so it is
+    delivered once), `cpu.high` is audited, and the wake NAMES THE TOP CONSUMERS by program and by lane (the agent or worktree the process runs in), from ONE
+    bounded `ps` and ONE bounded `lsof` run on a thread when the episode begins (never on another pass). The wake is held until they answer or `WAKE_GRACE_SECONDS`
+    pass; an answer that comes after the wake went out is sent as ONE follow-up note (`cpu.top:<episode>`), and a `ps` that never answers is said once in the
+    wake. The episode ends (`cpu.recovered`) below two thirds of the guard and is kept in `cpu-guard.json`, so a restart does not begin a second one. The same
+    pattern guards memory: swap above `swap_percent` for `swap_minutes` wakes once per episode (`mem.high:<episode>`, `mem-guard.json`)."""
 
     __name__ = "cpu_facts"
 
     def __init__(self):
         self.engine = None
         self.tracker = None
+        self.mem_tracker = None
         self.detail = ""
         self.thread = None
-        self.saved_episode = None   # the episode the file holds (None: closed)
+        self.begin_at = None          # the engine's clock when this process began the episode (None: it was loaded from the file)
+        self.waked_without = False    # the wake went out while the consumers were still being read
+        self.saved_episode = None     # the episode the file holds (None: closed)
+        self.saved_mem = None
 
     def bind(self, engine):
         self.engine = engine
 
+    def _registry(self, engine):
+        try:
+            return {path: entry.get("agent") for path, entry in read_worktrees(engine.state_dir).items() if isinstance(entry, dict)}
+        except Exception:
+            return {}
+
     def _start_ps(self, engine, cg):
-        """ONE bounded `ps` on a thread: a starved machine must never hang the daemon's pass. The result lands in `self.detail` when it is done; the fact
-        keeps its text until delivered, so it carries the categories when they came back in time."""
+        """ONE bounded `ps`, then ONE bounded `lsof` of the top ten processes for their lanes, on a thread: a starved machine must never hang the daemon's pass.
+        The result lands in `self.detail` when it is done, and only while this is still the current thread (a slow one of an earlier episode writes nothing)."""
         runner = getattr(engine, "cpu_ps_runner", None) or subprocess.run
+        registry = self._registry(engine)
 
         def work():
+            text = ""
             try:
                 done = runner(cg.PS_ARGV, capture_output=True, text=True, timeout=cg.PS_SECONDS, stdin=subprocess.DEVNULL)
-                text = cg.detail(cg.categories(done.stdout)) if done.returncode == 0 else ""
+                if done.returncode == 0:
+                    lanes = {}
+                    pids = cg.top_pids(cg.process_rows(done.stdout))
+                    if pids:
+                        try:
+                            looked = runner(cg.lsof_argv(pids), capture_output=True, text=True, timeout=cg.LSOF_SECONDS, stdin=subprocess.DEVNULL)
+                            if looked.returncode in (0, 1):
+                                lanes = {pid: cg.lane_of(cwd, registry) for pid, cwd in cg.parse_lsof(looked.stdout).items()}
+                        except Exception:
+                            lanes = {}
+                    text = cg.detail(cg.consumers(done.stdout, lanes))
             except Exception:
                 text = ""
-            if self.thread is threading.current_thread():   # a slow ps of an earlier episode never overwrites a later one's text
+            if self.thread is threading.current_thread():
                 self.detail = text
         self.thread = threading.Thread(target=work, name="cpu-ps", daemon=True)
         self.thread.start()
+
+    def _chiefs(self, engine):
+        discovery = getattr(engine, "discovery", None)
+        return sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff") if discovery is not None and not discovery.problems else []
 
     def __call__(self):
         engine = self.engine
         if engine is None or engine.state_dir is None:
             return []
         cg = load_cpu_guard()
-        cfg = cg.settings(engine.config.get("cpu_guard"))
+        raw = engine.config.get("cpu_guard")
+        cfg = cg.settings(raw)
         if cfg is None:
             return []
+        chiefs = self._chiefs(engine)
+        facts = self._cpu(engine, cg, cfg, chiefs)
+        facts.extend(self._mem(engine, cg, cg.mem_settings(raw), chiefs))
+        return facts
+
+    def _cpu(self, engine, cg, cfg, chiefs):
         read = cg.reading()
         if not read.ratio_known:   # FAIL OPEN: a load or a core count that cannot be read tells nobody (the status line says so), and never counts as one core
             return []
-        discovery = getattr(engine, "discovery", None)
-        chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff") if discovery is not None and not discovery.problems else []
         if self.tracker is None:
             self.tracker = cg.Episode(cg.load_episode(engine.state_dir))
             self.saved_episode = self.tracker.episode
         load1, load5, cores = read.load1, read.load5, read.cores
         ratio = load5 / cores   # the five-minute average decides: a one-minute spike never wakes the Chief of Staff
-        event = self.tracker.step(ratio, engine.now(), cfg, can_begin=bool(chiefs))
+        now = engine.now()
+        event = self.tracker.step(ratio, now, cfg, can_begin=bool(chiefs))
         if event == "begin":
-            self.detail = ""
+            self.detail, self.begin_at, self.waked_without = "", now, False
             self._start_ps(engine, cg)
             if engine.audit is not None:
                 engine.audit.append(engine.actor, "cpu.high", None, {"load1": round(load1, 1), "load5": round(load5, 1), "cores": cores, "ratio5": round(ratio, 2),
@@ -2480,17 +2333,64 @@ class CpuFacts:
         elif event == "end":
             if engine.audit is not None:
                 engine.audit.append(engine.actor, "cpu.recovered", None, {"load1": round(load1, 1), "load5": round(load5, 1), "cores": cores, "ratio5": round(ratio, 2)})
-            self.detail = ""
-            self.thread = None
+            self.detail, self.thread, self.begin_at = "", None, None
             self._save(engine, cg, None)
         episode = self.tracker.episode
         if self.saved_episode != episode:   # a save that failed is tried again on the next pass
             self._save(engine, cg, episode)
         if episode is None or not chiefs:
             return []
+        alive = self.thread is not None and self.thread.is_alive()
+        if alive and self.begin_at is not None and now - self.begin_at < cg.WAKE_GRACE_SECONDS:
+            return []   # the consumers are being read: the wake waits a few seconds for them
+        if self.detail:
+            consumers = self.detail + "."
+        elif alive:
+            consumers = "Consumers not read within %d s (ps is slow; one follow-up note carries them if it answers)." % cg.WAKE_GRACE_SECONDS
+        elif self.begin_at is not None:
+            consumers = "Consumers could not be read."
+        else:
+            consumers = ""
+        if alive and not self.detail:
+            self.waked_without = True
         text = "cpu high: load %d on %d cores (%.1fx over five minutes; the guard is %gx for %g minutes). %s `%s status` shows the line; heavy work should wait for a slot." % (
-            round(load5), cores, ratio, cfg["high_ratio"], cfg["minutes"], self.detail + "." if self.detail else "", PROG)
-        return [Fact("cpu.high:%d" % int(episode), name, "cpu", " ".join(text.split()), episode, sender="switchboard") for name in chiefs]
+            round(load5), cores, ratio, cfg["high_ratio"], cfg["minutes"], consumers, PROG)
+        facts = [Fact("cpu.high:%d" % int(episode), name, "cpu", " ".join(text.split()), episode, sender="switchboard") for name in chiefs]
+        if self.waked_without and self.detail:   # the answer came after the wake: ONE follow-up note (the same key on every pass, so it is delivered once)
+            note = "cpu consumers (the answer came after the cpu high note): %s." % self.detail
+            facts.extend(Fact("cpu.top:%d" % int(episode), name, "cpu-top", note, episode, sender="switchboard") for name in chiefs)
+        return facts
+
+    def _mem(self, engine, cg, mem_cfg, chiefs):
+        """Swap above the guard for the minutes: ONE wake per episode with the biggest holders (the kernel's counters, no process)."""
+        mem = cg.memory_reading()
+        percent = mem.swap_percent
+        if percent is None:   # FAIL OPEN: unreadable memory tells nobody (the status line says so)
+            return []
+        if self.mem_tracker is None:
+            self.mem_tracker = cg.Episode(cg.load_episode(engine.state_dir, cg.MEM_STATE_FILE))
+            self.saved_mem = self.mem_tracker.episode
+        event = self.mem_tracker.step(percent, engine.now(), mem_cfg, can_begin=bool(chiefs))
+        holders = []
+        if event == "begin":
+            holders = cg.biggest_holders(cg.process_table())
+            self.mem_holders = holders
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "mem.high", None, {"swap_percent": round(percent, 1), "swap_used_mb": int(mem.swap_used / 1e6), "swap_total_mb": int(mem.swap_total / 1e6),
+                                                                      "high_percent": mem_cfg["high_ratio"], "minutes": mem_cfg["minutes"]})
+            self._save_mem(engine, cg, self.mem_tracker.episode)
+        elif event == "end":
+            self.mem_holders = []
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "mem.recovered", None, {"swap_percent": round(percent, 1)})
+            self._save_mem(engine, cg, None)
+        episode = self.mem_tracker.episode
+        if self.saved_mem != episode:
+            self._save_mem(engine, cg, episode)
+        if episode is None or not chiefs:
+            return []
+        text = cg.mem_wake_text(mem, getattr(self, "mem_holders", []), mem_cfg, PROG)
+        return [Fact("mem.high:%d" % int(episode), name, "mem", " ".join(text.split()), episode, sender="switchboard") for name in chiefs]
 
     def _save(self, engine, cg, episode):
         try:
@@ -2498,6 +2398,13 @@ class CpuFacts:
             self.saved_episode = episode
         except OSError as err:
             engine._note("cpu.guard_file", None, {"error": _plain("%s: %s" % (type(err).__name__, err), 160)})
+
+    def _save_mem(self, engine, cg, episode):
+        try:
+            cg.save_episode(engine.state_dir, episode, cg.MEM_STATE_FILE)
+            self.saved_mem = episode
+        except OSError as err:
+            engine._note("mem.guard_file", None, {"error": _plain("%s: %s" % (type(err).__name__, err), 160)})
 
 
 # ---------------------------------------------------------------- the docker reaper (ask #321)
@@ -2614,10 +2521,61 @@ def docker_reap(docker, runner, now, apply, audit=None, actor="daemon"):
     return result
 
 
+def _docker_problem(name):
+    """(path, None) for a docker binary the disk tools may run, else (None, one line saying why not). The tools take `--docker` from a person, so the
+    value is NOT trusted to be a docker: its basename must be exactly `docker` and so must the basename of a symlink's target (or Docker Desktop's
+    `com.docker.cli`); it must be a regular executable file owned by this user or root; neither it nor any directory above it may be writable by group
+    or other (a sticky directory such as /tmp excepted); a bare name is resolved from PATH. The path RETURNED is the vetted real path, so the file run is
+    the file checked. Anything else is refused."""
+    if not isinstance(name, str) or not name or "\x00" in name or name.startswith("-"):
+        return None, "is not a usable executable name"
+    path = name if os.sep in name else shutil.which(name)
+    if path is None or not os.path.exists(path):
+        return None, "not installed or not on PATH"
+    if not os.path.isabs(path):
+        return None, "must be an absolute path (or a bare name on PATH)"
+    real = os.path.realpath(path)
+    if os.path.basename(path) != "docker" or os.path.basename(real) not in ("docker", "com.docker.cli"):
+        return None, "is not a docker binary: its name (and the name a link points to) must be exactly `docker`"
+    try:
+        info = os.stat(real)
+        if not stat.S_ISREG(info.st_mode) or not os.access(real, os.X_OK):
+            return None, "is not an executable file"
+        if info.st_uid not in (0, os.getuid()):
+            return None, "belongs to another user: not trusted"
+        if info.st_mode & 0o022:
+            return None, "is writable by group or other: not trusted"
+        here, first = os.path.dirname(real), True
+        while True:
+            at = os.stat(here)
+            mode = at.st_mode
+            if at.st_uid not in (0, os.getuid()):
+                return None, "sits in a directory (%s) that others can change (another user owns it): not trusted; pass the absolute path of a docker kept in a directory only you or root can write" % _plain(here, 80)
+            if not mode & 0o1000:   # a sticky directory (/tmp) lets nobody replace another's file
+                # the file's own directory must be closed to group and other; an ancestor only to OTHER, or to a group when it is not root's (a root-owned
+                # group-writable /Applications or /usr/local, where a standard Docker install lives, is the operating system's own)
+                if (first and mode & 0o022) or mode & 0o002 or (mode & 0o020 and at.st_uid not in (0,)):
+                    return None, "sits in a directory (%s) that others can change: not trusted; pass the absolute path of a docker kept in a directory only you or root can write" % _plain(here, 80)
+            first = False
+            parent = os.path.dirname(here)
+            if parent == here:
+                break
+            here = parent
+    except OSError:
+        return None, "cannot be read"
+    return real, None
+
+
 def _docker_executable(name):
-    if os.sep in name:
-        return name if os.access(name, os.X_OK) else None
-    return shutil.which(name)
+    return _docker_problem(name)[0]
+
+
+def _docker_message(name):
+    """The one refusal line for a `--docker` value that is not a usable docker."""
+    why = _docker_problem(name)[1] or "not usable"
+    if why.startswith("not installed"):
+        return "docker is not installed or not on PATH (%s)" % _plain(name, 160)
+    return "refused: %s %s" % (_plain(name, 120), why)
 
 
 class DockerReapFacts:
@@ -2934,6 +2892,7 @@ class Observation:
         self.last_human_prompt, self.problem = last_human_prompt, problem
         self.created = None  # PR 17: when v2 says the session began (epoch seconds)
         self.wrong_program = False  # the pane runs something other than the configured v2
+        self.headless = False  # #433: a worker with no terminal: what it does is read from the OpenCode service, never from herdr
         self.conflict = []  # other sessions that claim the same name
 
     def engaged(self, now, window):
@@ -2943,7 +2902,7 @@ class Observation:
         return self.last_human_prompt is not None and now - self.last_human_prompt < window
 
     def to_json(self):
-        return {"name": self.name, "session": self.session_id, "pane": self.pane, "status": self.status,
+        return {"name": self.name, "session": self.session_id, "pane": self.pane, "headless": self.headless, "status": self.status,
                 "fleet": self.fleet, "idle_at": iso(self.idle_at), "outcome": self.outcome,
                 "last_human_prompt": iso(self.last_human_prompt), "problem": self.problem,
                 "wrong_program": self.wrong_program, "conflict": self.conflict}
@@ -3949,6 +3908,7 @@ class Switchboard:
                 entries = self.herdr.agent_list()
             except HerdrError as err:
                 found.problems.append("herdr unreachable: %s" % err)
+                self._discover_headless(found, now)   # a worker with no terminal does not depend on herdr
                 return found
         found.entries = [entry for entry in entries if isinstance(entry, dict)]
         for entry in sorted(found.entries, key=lambda e: self.reads.stale_first(agent_session(e) or "")):   # the stalest first: the read budget is shared out in turn
@@ -3961,10 +3921,92 @@ class Switchboard:
                 continue
             if observation is not None:
                 found.add(observation)
+        self._discover_headless(found, now)   # AFTER the terminals: a terminal that runs the same session wins (`watch`), and another session claiming a terminal agent's name is a conflict (held)
         return found
+
+    def _discover_headless(self, found, now):
+        """#433: the workers with no terminal. The index is the private records in state-dir/headless/; PRESENCE is proved by the service (the session
+        exists, answers and carries the worker's name in its metadata), never by a record alone. `session.active` is read ONCE for all of them; a
+        service that does not answer makes each one `unknown` with a problem (a delivery is held, never dropped), not dead and not working."""
+        if self.state_dir is None:
+            return
+        try:
+            ap = load_agent_presence()
+            records, bad = ap.scan_records(self.state_dir)
+        except Exception as err:   # never silent: headless workers would vanish from discovery without a word
+            found.problems.append("headless workers could not be read: %s" % _one_line(str(err), 100))
+            return
+        found.problems.extend(bad)   # a record that is there and cannot be used is said, one line each, never a silent loss
+        if not records:
+            return
+        active, down = None, None
+        try:
+            active = self.v2.session_active() or {}
+        except V2Error as err:
+            down = _one_line(str(err), 100)
+        for record in records:
+            try:
+                observation = self._observe_headless(record, now, active, down)
+            except V2Error as err:
+                observation = self._unknown_headless(record, "the service did not answer: %s" % _one_line(str(err), 100))
+            if observation is not None:
+                found.add(observation)
+
+    def _unknown_headless(self, record, why):
+        name = record["worker"]
+        observation = Observation(name, record["session"], None, "unknown", {"name": name, "headless": True})
+        observation.headless = True
+        observation.problem = "%s: %s" % (name, why)
+        return observation
+
+    def _observe_headless(self, record, now, active, down=None, fresh=False):
+        """An Observation for one headless worker, or None when its session is gone or is not the worker's. State per bin/agent_presence.py."""
+        ap = load_agent_presence()
+        session_id = record["session"]
+        if down is not None:
+            return self._unknown_headless(record, "the service did not answer (%s)" % down)
+        state, why = ap.read_state(self.v2, session_id, active)
+        if state == "missing":
+            return None
+        if state == ap.UNKNOWN:
+            return self._unknown_headless(record, why)
+        try:
+            info = self.reads.session_info(session_id, state, now, fresh)
+        except V2Error as err:
+            if err.reason == "http" and err.status == 404:
+                return None
+            raise
+        fleet = _fleet_meta(info)
+        if not fleet or fleet.get("name") != record["worker"]:
+            return None   # the session does not carry the worker's name: the record is not proof of presence
+        times = info.get("time") if isinstance(info.get("time"), dict) else {}
+        observation = Observation(fleet["name"], session_id, None, STATUS.get(state, "unknown"), fleet, _seconds(times.get("idle")), info.get("outcome"))
+        observation.created = _seconds(times.get("created"))
+        observation.headless = True
+        try:
+            observation.last_human_prompt = self.last_human_prompt(
+                session_id, now, inbox=fleet.get("role") == "chief-of-staff", info=info, fresh=fresh)
+        except V2Error as err:
+            observation.problem = "cannot read %s's transcript: %s" % (observation.name, err)
+        return observation
 
     def reobserve(self, previous, now):
         """The same agent, read again just before a write (invariant 4). (Observation, why-not)."""
+        if previous.headless:
+            try:
+                record = load_agent_presence().load_record(self.state_dir, previous.name) if self.state_dir is not None else None
+                if record is None or record["session"] != previous.session_id:
+                    return None, "%s has no headless record for session %s any more" % (previous.name, previous.session_id)
+                active = self.v2.session_active() or {}
+                fresh = self._observe_headless(record, now, active, None, fresh=True)   # a read before a write is never from memory
+            except V2Error as err:
+                return None, "v2 unreachable: %s" % err
+            if fresh is None or fresh.name != previous.name:
+                return None, "session %s is no longer the fleet agent %s" % (previous.session_id, previous.name)
+            if fresh.problem:
+                return None, fresh.problem
+            fresh.conflict = list(previous.conflict)
+            return fresh, None
         if not previous.pane:
             return None, "%s has no herdr pane to read again" % previous.name
         try:
@@ -6234,10 +6276,72 @@ def cmd_reattach_all(args, runner, now, socket_call=None):
     return EXIT_ERROR if failed else EXIT_OK
 
 
+def retire_close_problem(engine, runner, now, discovery, name, seen, force):
+    """(pane, None) when `retire --close` may close `name`'s pane now, else (None, why not). Judged BEFORE the retirement, so a refusal changes nothing.
+    Who: the operator at their own terminal (any agent), the agent's recorded boss, or the Chief of Staff for an agent that reports to it DIRECTLY;
+    never the caller's own pane or session. What: the pane the switchboard has for the agent, read again live, must still hold THAT agent's session
+    (a stored pane id can name another terminal after a herdr restart). A working agent needs --force, which is refused while a registered worktree of
+    the agent holds uncommitted or unpushed work."""
+    kind = gates_caller_kind(runner, now)
+    if kind[0] == "person":
+        who = "the operator"
+    elif kind[0] == "agent":
+        who = kind[1]
+        if who == name:
+            return None, "an agent cannot close its own pane"
+        if seen is None or boss_name(discovery, seen) != who:
+            return None, "%s may not close %s's pane: only the operator, or the agent's own boss (the Chief of Staff for a direct report), may" % (who, name)
+    else:
+        return None, "%s: only the operator or the agent's own boss may close a pane" % kind[1]
+    if seen is None or not seen.pane or not seen.session_id:
+        return None, "%s has no pane and session the switchboard can see: nothing to close" % name
+    pane = seen.pane
+    if os.environ.get("HERDR_PANE_ID") == pane:
+        return None, "pane %s is the one you are in: never closed by you" % pane
+    try:
+        live = engine.herdr.agent_get(pane)
+    except HerdrError as err:
+        return None, "pane %s cannot be read now (%s): nothing was closed" % (pane, _one_line(str(err), 80))
+    if agent_session(live) != seen.session_id:
+        return None, "pane %s no longer holds %s's session: nothing was closed" % (pane, name)
+    if live.get("agent_status") in ("working", "blocked") and not force:
+        return None, "%s is %s: pass --force to close it anyway" % (name, live.get("agent_status"))
+    if force and live.get("agent_status") in ("working", "blocked") and engine.state_dir is not None:
+        for path, entry in sorted(read_worktrees(engine.state_dir).items()):
+            if isinstance(entry, dict) and entry.get("agent") == name:
+                facts = worktree_facts(runner, path)
+                if facts["exists"] and (facts["why"] or facts["dirty"] or facts["pushed"] is False):
+                    return None, "--force refused: %s holds uncommitted or unpushed work in %s" % (name, path)
+    return pane, None
+
+
+def retire_close_pane(engine, runner, now, name, pane, caller, force):
+    """Close `pane` after judging EVERYTHING again from a fresh discovery (the first judgment was before the retirement lock and the worktree reclaim):
+    who may, which pane, its session, its status and the worktree guard. Audited whether it closes or not. (status line, ok)"""
+    detail = {"pane": pane, "by": caller}
+    try:
+        fresh = engine.discover(engine.now())
+        again, why = retire_close_problem(engine, runner, now, fresh, name, fresh.agents.get(name), force)
+        if why:
+            raise HerdrError("refused", why)
+        if again != pane:
+            raise HerdrError("moved", "the agent's pane is now %s, not %s" % (again, pane))
+        with engine._external("herdr.pane.close", name, {"pane": pane, "why": "retire --close"}):
+            engine.herdr.pane_close(pane)
+    except Exception as err:
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "fleetpane.close_failed", name, dict(detail, why=_one_line(str(err), 120)))
+        return "pane %s was not closed (%s): the agent is retired" % (pane, _one_line(str(err), 100)), False
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, "fleetpane.closed", name, detail)
+    return "closed pane %s (the agent's terminal: its memory is released)" % pane, True
+
+
 def cmd_retire(args, runner, now):
     """`retire <name> [--reason TEXT]` / `retire --undo <name>`: a finished worker is RETIRED: the daemon stops reporting it DEAD or DETACHED, `reattach
-    --all-detached` skips it, and it is shown once in `status` as retired (dropped after RETIRED_SHOW_DAYS). Nothing is deleted and no tab is closed. The
-    caller rule is `reattach`'s: the operator, the Chief of Staff or the agent's own boss; others are refused and audited."""
+    --all-detached` skips it, and it is shown once in `status` as retired (dropped after RETIRED_SHOW_DAYS). Nothing is deleted and no tab is closed, unless
+    `--close` is given: then the agent's terminal PANE is closed too (see `retire_close_problem`). The caller rule is `reattach`'s: the operator, the
+    Chief of Staff or the agent's own boss; others are refused and audited."""
     remote = run_cloud("route", args.name)   # a cloud worker has an endpoint record (#371)
     if remote is not None:
         return run_cloud("cmd_retire", args, runner, now, remote)
@@ -6254,6 +6358,14 @@ def cmd_retire(args, runner, now):
     reason = " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", args.reason or "").split())[:200]
     seen = discovery.agents.get(name)
     known = read_pane_health(state)["agents"].get(name) or {}
+    close_pane, close_by = None, None
+    if getattr(args, "close", False) and not args.undo:
+        close_pane, why = retire_close_problem(engine, runner, now, discovery, name, seen, getattr(args, "force", False))
+        close_by = identify_who(engine, runner, now)
+        if why:
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "fleetpane.close_refused", name, {"pane": seen.pane if seen is not None else None, "by": close_by, "why": _one_line(why, 160)})
+            raise LaunchError("refused: %s (nothing was retired or closed)" % why)
     with agent_lock(state, "files"):
         who = reattach_caller_problem(engine, runner, now, discovery, name)   # judged again inside the lock: check and write are one step
         if who:
@@ -6295,7 +6407,11 @@ def cmd_retire(args, runner, now):
         pass
     if engine.audit is not None:
         engine.audit.append(engine.actor, "fleetpane.retired", name, {"auto": False, "reason": retired[name]["reason"], "by": retired[name]["by"]})
-    print("%s is retired: not watched, not reattached by --all-detached; nothing was deleted or closed (`%s retire --undo %s` reverses)" % (name, PROG, name))
+    if close_pane is not None:
+        line, _ = retire_close_pane(engine, runner, now, name, close_pane, close_by, getattr(args, "force", False))
+        print("%s is retired: not watched, not reattached by --all-detached; %s (`%s retire --undo %s` reverses the retirement)" % (name, line, PROG, name))
+    else:
+        print("%s is retired: not watched, not reattached by --all-detached; nothing was deleted or closed (`%s retire --undo %s` reverses)" % (name, PROG, name))
     try:
         for line in reclaim_for_agent(engine, runner, name, True, "retired"):   # its registered worktrees: removed when clean and pushed, else kept with the reason
             print("worktree: " + line)
@@ -6812,6 +6928,9 @@ def add_retire_parsers(sub):
     retire.add_argument("name", help="The agent's fleet name")
     retire.add_argument("--reason", help="Why (one line)")
     retire.add_argument("--undo", action="store_true", help="Watch it again")
+    retire.add_argument("--close", action="store_true", help="Also close the agent's terminal pane (frees its memory): only its boss, the Chief of Staff for a direct report, or the operator; "
+                                                             "the pane is read again and must still hold the agent's own session; never your own pane")
+    retire.add_argument("--force", action="store_true", help="With --close: close a pane that is still working (refused for a worker with unpushed or uncommitted work in a registered worktree)")
 
 
 def add_read_parsers(sub):
@@ -7256,8 +7375,10 @@ def cmd_whoami(args, runner, now):
     if getattr(args, "json", False):
         fleet = caller_fleet(engine.herdr, engine.v2, os.environ)
         repo = fleet.get("repo") if isinstance(fleet.get("repo"), str) else None
-        print(json.dumps({"name": fleet["name"], "repo": repo or _fleet_repo(fleet, config) or config.get("intent_repo") or None},
-                         sort_keys=True))
+        own = repo or _fleet_repo(fleet, config)
+        # `own` is false when the repo is only the config's `intent_repo` default: an agent with no repo of its own (the Chief of Staff) has no account of
+        # its own to keep, so the gh shim may use the account of the repo a command names
+        print(json.dumps({"name": fleet["name"], "repo": own or config.get("intent_repo") or None, "own": bool(own)}, sort_keys=True))
         return EXIT_OK
     if getattr(args, "repo", False):
         fleet = caller_fleet(engine.herdr, engine.v2, os.environ)
@@ -9760,6 +9881,10 @@ def external_status_line(config, state_dir, now):
     text = "%s; outbox %s; last pull %s" % ("ok" if body.get("state") == "ok" else "down: %s" % body.get("reason"),
                                             body.get("outbox", 0), "%s ago" % format_age(now - pulled) if pulled else "never")
     failures = body.get("permanent_failures") or 0
+    waiting = body.get("settled_waiting")
+    if isinstance(waiting, int) and not isinstance(waiting, bool) and waiting > 0:   # decided outside, answer not here yet: never invisible if it never arrives
+        oldest = body.get("settled_oldest")
+        text += "; settled outside, waiting for its answer: %d%s" % (waiting, " (oldest %s)" % format_age(max(0, now - oldest)) if isinstance(oldest, (int, float)) and not isinstance(oldest, bool) else "")
     return ("external  " + text + ("; %d permanent failure(s)" % failures if failures else "")
             + ("; ALARM: outbox is deep" if body.get("alarm") else ""))
 
@@ -14136,6 +14261,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
             cpu_cfg = cg.settings(config.get("cpu_guard"))
             if cpu_cfg is not None:
                 report["cpu"] = cg.status_line(cpu_cfg, cg.reading(), cg.slots_text(config, state))   # a system call (and the optional heavy_slots module): no process
+                report["mem"] = cg.mem_status_line(cg.memory_reading(), cg.biggest_holders(cg.process_table()))   # the kernel's counters and process table: no process
         if config_ok:
             report["orphans"] = orphan_status_line(config)   # one `ps`; None when there is none or the reaper is off
         if config_ok and config.get("v2_light"):
@@ -14258,7 +14384,7 @@ def _agent_line(entry):
     if seen is None:
         return "%-14s (not found)  %s" % (entry["name"], _plan_line(entry))
     return "%-14s %-8s %s  pane %s  your last prompt %s  %s" % (
-        seen["name"], seen["status"], seen["session"], seen["pane"] or "-",
+        seen["name"], seen["status"], seen["session"], seen["pane"] or ("(headless)" if seen.get("headless") else "-"),
         seen["last_human_prompt"] or "not in the window", _plan_line(entry))
 
 
@@ -14335,6 +14461,7 @@ def format_status(report):
     lines.extend(format_decisions_status(report["decisions"]) if "decisions" in report else [])
     lines.extend("      disk       " + report["disk"] for _ in [0] if report.get("disk"))
     lines.extend("      cpu        " + report["cpu"] for _ in [0] if report.get("cpu"))
+    lines.extend("      mem        " + report["mem"] for _ in [0] if report.get("mem"))
     lines.extend("      orphans    " + report["orphans"] for _ in [0] if report.get("orphans"))
     lines.extend("      v2 calls   " + report["v2_calls"] for _ in [0] if report.get("v2_calls"))
     lines.extend("      " + text for text in report.get("github_calls") or [])
@@ -14362,7 +14489,7 @@ def format_status(report):
 def cmd_status(args, runner=subprocess.run, now=time.time):
     report = collect_status(runner, now)
     try:
-        cloud_lines, cloud_rows = cloud().status_extra(runner)   # cloud workers (#371): nothing when there are none
+        cloud_lines, cloud_rows = load_module("cloud_worker").bind(globals()).status_extra(runner)   # cloud workers (#371): nothing when there are none
     except Exception as err:   # the module missing or broken must not take `status` down for a local-only fleet
         cloud_lines, cloud_rows = ["      cloud workers: unavailable (%s)" % _one_line(str(err), 100)], []
     if cloud_rows:
@@ -15528,6 +15655,8 @@ class IssueIntent:
         found = cls(number, data.get("state"), data.get("title") or "", intent, done_when,
                     data.get("updated_at"), bool(_CHARTER_BLOCK.search(body)))
         found.workspace = charter_workspace(body)
+        found.labels = [l.get("name") if isinstance(l, dict) else l for l in (data.get("labels") or []) if isinstance(l.get("name") if isinstance(l, dict) else l, str)]   # #432: the load feed's waiting and parked asks
+        found.parked_until = parked_until(body, found.labels)   # the switchboard's own parser: the load module never copies it
         return found
 
 
@@ -19472,7 +19601,7 @@ def cmd_disk_reap_docker(args, runner, now):
     """`disk reap-docker [--apply]`: list (the default) or remove the expired labelled docker objects."""
     docker = _docker_executable(args.docker)
     if docker is None:
-        sys.stderr.write("%s: disk reap-docker: docker is not installed or not on PATH (%s): nothing was run\n" % (PROG, _plain(args.docker, 160)))
+        sys.stderr.write("%s: disk reap-docker: %s: nothing was run\n" % (PROG, _docker_message(args.docker)))
         return EXIT_USAGE
     apply = bool(args.apply)
     if apply and not load_config().get("docker_reaper", True):
@@ -19496,9 +19625,9 @@ cmd_disk_reap_docker.direct = True
 
 def cmd_disk_prune(args, runner, now):
     """`disk prune [--dry-run]`."""
-    docker = shutil.which(args.docker) if os.sep not in args.docker else (args.docker if os.access(args.docker, os.X_OK) else None)
+    docker = _docker_executable(args.docker)
     if docker is None:
-        sys.stderr.write("%s: disk prune: docker is not installed or not on PATH (%s): nothing was run\n" % (PROG, _plain(args.docker, 160)))
+        sys.stderr.write("%s: disk prune: %s: nothing was run\n" % (PROG, _docker_message(args.docker)))
         return EXIT_USAGE
     commands = [(docker,) + argv[1:] for argv in DISK_PRUNE_COMMANDS]
     if args.dry_run:
@@ -19607,7 +19736,8 @@ def disk_report(args, runner, now, out=print):
     lines.append("docker")
     docker = _docker_executable(args.docker)
     if docker is None:
-        lines.append("  docker: not installed or not on PATH (%s)" % _plain(args.docker, 120))
+        why = _docker_problem(args.docker)[1]
+        lines.append("  docker: %s (%s)" % (why if why.startswith("not installed") else "refused: " + why, _plain(args.docker, 100)))
     else:
         try:
             done = runner([docker, "system", "df"], capture_output=True, text=True, timeout=DOCKER_REAP_TIMEOUT, stdin=subprocess.DEVNULL)
@@ -19772,7 +19902,7 @@ def cmd_reds(args, runner, now):
     except Exception:
         cache_dir = None   # no cache is only more calls
     reader = _RedsReader(config, runner, now, repo)
-    return module.run(reader, repo, number, events, cache_dir, now, sys.stdout)
+    return module.run(reader, repo, number, events, cache_dir, now, sys.stdout, module.workflows(config.get("reds")).get(repo))
 
 
 cmd_reds.direct = True   # reads GitHub on its own terms: no daemon start
@@ -19829,19 +19959,19 @@ def add_heavy_parsers(sub):
 
 
 def add_disk_parsers(sub):
-    disk = sub.add_parser("disk", help="Disk tools: `disk report` (a bare `disk`) shows what holds the disk, read only; `disk prune` removes old docker build cache and images (never volumes or running containers); `disk reclaim-worktrees` removes the clean, pushed worktrees of retired agents")
+    disk = sub.add_parser("disk", allow_abbrev=False, help="Disk tools: `disk report` (a bare `disk`) shows what holds the disk, read only; `disk prune` removes old docker build cache and images (never volumes or running containers); `disk reclaim-worktrees` removes the clean, pushed worktrees of retired agents")
     disk_sub = disk.add_subparsers(dest="disk_action", required=False)
     disk.add_argument("--docker", default="docker", help="The docker executable the bare `disk` report asks (default: docker on PATH)")
-    report = disk_sub.add_parser("report", help="what holds the disk: free space, docker usage, worktrees per agent, cache sizes, orphan candidates (read only; also a bare `disk`)")
+    report = disk_sub.add_parser("report", allow_abbrev=False, help="what holds the disk: free space, docker usage, worktrees per agent, cache sizes, orphan candidates (read only; also a bare `disk`)")
     report.add_argument("--docker", default=argparse.SUPPRESS, help="The docker executable (default: docker on PATH)")
-    prune = disk_sub.add_parser("prune", help="docker builder prune, docker image prune -a (older than a week) and, on docker 23.0 or newer, docker volume prune -f (anonymous volumes only), and nothing else",
+    prune = disk_sub.add_parser("prune", allow_abbrev=False, help="docker builder prune, docker image prune -a (older than a week) and, on docker 23.0 or newer, docker volume prune -f (anonymous volumes only), and nothing else",
                                 description="Runs exactly `docker builder prune -f --filter until=168h` and `docker image prune -a -f --filter until=168h` and prints what "
                                             "was reclaimed, then (only when the docker server is 23.0 or newer, where it removes ANONYMOUS volumes no container references and nothing named) "
                                             "`docker volume prune -f`, never `-a`. Never a running container, never `system prune`. Refuses without docker. NOTE: "
                                             "`until=168h` is the image's age, not its last use: a locally built image with no registry copy is removed too if no "
                                             "container uses it.")
     prune.add_argument("--dry-run", action="store_true", help="Print the commands and the candidate anonymous volumes and run none of them")
-    reap = disk_sub.add_parser("reap-docker", help="remove EXPIRED docker containers, networks and volumes that carry fleet.owner and fleet.expires labels",
+    reap = disk_sub.add_parser("reap-docker", allow_abbrev=False, help="remove EXPIRED docker containers, networks and volumes that carry fleet.owner and fleet.expires labels",
                                description="Lists (the default) or, with --apply, removes docker containers (`rm -f`), networks and volumes that carry BOTH labels "
                                            "`fleet.owner=<agent>` and `fleet.expires=<epoch seconds>` and whose expiry has passed. Never an unlabelled object, a live "
                                            "one, or a volume a running container mounts; no `system prune`, no sudo. The daemon applies this daily unless the config "
@@ -19849,16 +19979,16 @@ def add_disk_parsers(sub):
     reap.add_argument("--apply", action="store_true", help="Remove them (the default only lists)")
     reap.add_argument("--docker", default=argparse.SUPPRESS, help="The docker executable (default: docker on PATH)")
     prune.add_argument("--docker", default=argparse.SUPPRESS, help="The docker executable (default: docker on PATH)")
-    janitor = disk_sub.add_parser("janitor", help="remove old, unnamed entries of the opencode temp directory (a dry run unless --apply)",
+    janitor = disk_sub.add_parser("janitor", allow_abbrev=False, help="remove old, unnamed entries of the opencode temp directory (a dry run unless --apply)",
                                   description="Lists (the default) or, with --apply, removes the top-level entries of the temp directory whose newest file is older than "
                                               "temp_janitor.days (default 7) and that no state file of the fleet names, no keep glob matches and no .fleet-keep marker "
                                               "protects. Never follows a link, never touches another user's entry. Each removal is one temp.removed audit line.")
     janitor.add_argument("--apply", action="store_true", help="Remove them (the default only lists)")
-    orphans = disk_sub.add_parser("reap-orphans", help="Signal (SIGTERM, then SIGKILL) orphaned test helpers past the grace: parent launchd, an exact allow-list; a dry run unless --apply")
+    orphans = disk_sub.add_parser("reap-orphans", allow_abbrev=False, help="Signal (SIGTERM, then SIGKILL) orphaned test helpers past the grace: parent launchd, an exact allow-list; a dry run unless --apply")
     orphans.add_argument("--apply", action="store_true", help="Do it (default: a dry run)")
-    reclaim = disk_sub.add_parser("reclaim-worktrees", help="Remove the registered worktrees of retired agents when clean and pushed; else keep and say why (a dry run unless --apply)")
+    reclaim = disk_sub.add_parser("reclaim-worktrees", allow_abbrev=False, help="Remove the registered worktrees of retired agents when clean and pushed; else keep and say why (a dry run unless --apply)")
     reclaim.add_argument("--apply", action="store_true", help="Do it (default: a dry run)")
-    register = disk_sub.add_parser("register-worktree", help="Record a linked worktree for an agent (launch records its own)")
+    register = disk_sub.add_parser("register-worktree", allow_abbrev=False, help="Record a linked worktree for an agent (launch records its own)")
     register.add_argument("path", help="The worktree's directory")
     register.add_argument("--agent", required=True, help="The agent it belongs to")
     register.add_argument("--repo", help="OWNER/REPO (optional)")
@@ -22895,19 +23025,7 @@ def build_parser():
 
 # ---- the load of each orchestrator and the threshold alert (#348); the logic is in bin/fleet_health.py, this supplies the facts
 def load_fleet_health():
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "fleet_health.py")
-    held = sys.modules.get("fleet_health")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("fleet_health", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["fleet_health"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("fleet_health", None)
-        raise
-    return module
+    return load_module("fleet_health")
 
 
 def validate_load_alert_config(config, source):
@@ -22943,7 +23061,8 @@ def load_tick(engine, discovery):
     def read_asks(charter, repo):
         if engine.intents is None:
             raise RuntimeError("no ask repo is configured")
-        return [{"repo": issue.repo or repo, "number": issue.number} for issue in engine.intents.open_asks(charter, repo)]
+        return [{"repo": issue.repo or repo, "number": issue.number, "labels": list(getattr(issue, "labels", ()) or ()),
+                 "parked_until": getattr(issue, "parked_until", None)} for issue in engine.intents.open_asks(charter, repo)]
 
     def read_charters(repo):
         """The open issues of `repo` that carry the orchestrator label (whatever the owner's prefix) as [(number, body)]: two bounded reads."""
@@ -22958,12 +23077,36 @@ def load_tick(engine, discovery):
                        if isinstance(i, dict) and isinstance(i.get("number"), int) and "pull_request" not in i) if isinstance(found, list) else None
         return out
 
+    def read_parent(repo, number):
+        """The parent issue number of `repo#number` in the same repository (None when it has none): one read."""
+        if engine.intents is None:
+            raise RuntimeError("no ask repo is configured")
+        data = engine.intents._api("repos/%s/issues/%d" % (repo, number), repo)
+        url = data.get("parent_issue_url") if isinstance(data, dict) else None
+        found = re.search(r"/repos/([^/]+/[^/]+)/issues/(\d+)$", url) if isinstance(url, str) else None
+        return int(found.group(2)) if found and found.group(1).lower() == str(repo).lower() else None
+
     def wake(text):
         add_reminder(engine.state_dir, cos, now, now, text)
         if engine.audit is not None:
             engine.audit.append(engine.actor, "load.alert", cos, {"text": _one_line(text, 400)})
 
-    return health.tick(health.Context(now=now, state_dir=engine.state_dir, cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, read_charters=read_charters, cos=cos, wake=wake))
+    meter = {}
+    accounts = getattr(engine.intents, "accounts", None)
+    if accounts is not None:   # the gh accounts' own books: which account a repo uses, whether it is paused (#361), and the reads GitHub really billed (a 304 is free)
+        def snapshot():
+            with accounts.lock:   # GhAccounts.read appends and trims the deque from other threads under this lock
+                return list(accounts.calls)
+
+        def begin_read():
+            return max([call[0] for call in snapshot()] or [0])   # the newest read so far: what happens after it is this read's
+
+        def read_cost(since, repo):
+            account = accounts.describe(repo)   # only this account's reads are charged to it, and a 304 is free
+            return sum(1 for call in snapshot() if call[0] > since and call[1] == account and not call[3])
+        meter = {"account_of": accounts.describe, "paused": lambda repo: accounts.paused.get(accounts.describe(repo), 0) > now,
+                 "begin_read": begin_read, "read_cost": read_cost}
+    return health.tick(health.Context(now=now, state_dir=engine.state_dir, cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, read_charters=read_charters, read_parent=read_parent, cos=cos, wake=wake, **meter))
 
 
 def cmd_load_replay(args, runner, now):
