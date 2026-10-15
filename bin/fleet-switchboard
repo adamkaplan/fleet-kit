@@ -79,6 +79,48 @@ from urllib.parse import quote
 import uuid
 
 
+_MODULE_LOCKS = {}            # one reentrant lock per module name: a load of one module never waits behind the import of another
+_MODULE_LOCKS_GUARD = threading.Lock()   # held only to fetch or make a name's lock, never across an import
+_MODULES_DONE = {}            # name -> the module object whose import FINISHED (sys.modules holds a module while it still runs)
+
+
+def load_module(name):
+    """A helper module of bin/, loaded by path from beside this file: the one loader behind every `load_<module>()` below,
+    so a new module needs no loader of its own (call `load_module("name")`).
+
+    Not by `import`: this file has no .py name, is run through a symlink (~/.local/bin), by the daemon's service
+    unit, by wrappers, and is loaded by tests with SourceFileLoader, and none of those puts its directory on
+    sys.path. The real path of this file (symlinks resolved) is always right. A copy already loaded from the
+    same file is reused, so two loads of this script share one module. The name is a plain module name, never
+    a path: anything else is refused (ValueError), and a name with no file here fails as it always did.
+
+    A module already loaded is returned with no lock at all (this is on the hot path). A first load holds the lock of THAT name only, and
+    checks again once it has it, so concurrent first loads of one module all get the finished module and a failed import (never kept) raises
+    for every caller; the import of one module never delays another."""
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        raise ValueError("not a module name: %r" % (name,))
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), name + ".py")
+    done = _MODULES_DONE.get(name)
+    if done is not None and sys.modules.get(name) is done and os.path.realpath(getattr(done, "__file__", "") or "") == path:
+        return done
+    with _MODULE_LOCKS_GUARD:
+        lock = _MODULE_LOCKS.setdefault(name, threading.RLock())
+    with lock:   # reentrant: a module that loads another while it runs does not wait for itself
+        held = sys.modules.get(name)
+        if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
+            return held
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(name, None)
+            raise
+        _MODULES_DONE[name] = module
+        return module
+
+
 def load_decision_core():
     """The pure core of the Decision subsystem, bin/decision_core.py, loaded by path from beside this file.
 
@@ -86,19 +128,7 @@ def load_decision_core():
     unit, by wrappers, and is loaded by tests with SourceFileLoader, and none of those puts its directory on
     sys.path. The real path of this file (symlinks resolved) is always right. A copy already loaded from the
     same file is reused, so two loads of this script share one module."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "decision_core.py")
-    held = sys.modules.get("decision_core")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("decision_core", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["decision_core"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("decision_core", None)
-        raise
-    return module
+    return load_module("decision_core")
 
 
 decision_core = load_decision_core()
@@ -106,155 +136,64 @@ decision_core = load_decision_core()
 
 def load_plan_check():
     """The plan checker, bin/plan_check.py (#135), loaded by path from beside this file, as load_decision_core does."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "plan_check.py")
-    held = sys.modules.get("plan_check")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("plan_check", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["plan_check"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("plan_check", None)
-        raise
-    return module
+    return load_module("plan_check")
 
 
 def load_plan_ledger():
     """The evidence ledger and gates, bin/plan_ledger.py (#107), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "plan_ledger.py")
-    held = sys.modules.get("plan_ledger")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("plan_ledger", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["plan_ledger"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("plan_ledger", None)
-        raise
-    return module
+    return load_module("plan_ledger")
 
 
 def load_report_fold():
     """The report fold's pure core, bin/report_fold.py (#352), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "report_fold.py")
-    held = sys.modules.get("report_fold")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("report_fold", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["report_fold"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("report_fold", None)
-        raise
-    return module
+    return load_module("report_fold")
 
 
 def load_triage_plan_open():
     """The plan-issue-still-open rule, bin/triage_plan_open.py (#384), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "triage_plan_open.py")
-    held = sys.modules.get("triage_plan_open")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("triage_plan_open", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["triage_plan_open"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("triage_plan_open", None)
-        raise
-    return module
+    return load_module("triage_plan_open")
 
 
 def load_pr_events():
     """The webhook-event rule for `pr-state`, bin/pr_events.py (#354), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pr_events.py")
-    held = sys.modules.get("pr_events")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("pr_events", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["pr_events"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("pr_events", None)
-        raise
-    return module
+    return load_module("pr_events")
 
 
 def load_disk_janitor():
     """The temp-directory janitor, bin/disk_janitor.py (#321), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "disk_janitor.py")
-    held = sys.modules.get("disk_janitor")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("disk_janitor", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["disk_janitor"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("disk_janitor", None)
-        raise
-    return module
+    return load_module("disk_janitor")
 
 
 def load_heavy_slots():
     """The CPU slots for heavy commands, bin/heavy_slots.py (#34), loaded by path like the other modules."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "heavy_slots.py")
-    held = sys.modules.get("heavy_slots")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("heavy_slots", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["heavy_slots"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("heavy_slots", None)
-        raise
-    return module
+    return load_module("heavy_slots")
 
 
 def load_cpu_guard():
     """The CPU guard, bin/cpu_guard.py (the P0 CPU order), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cpu_guard.py")
-    held = sys.modules.get("cpu_guard")
+    return load_module("cpu_guard")
+
+
+def load_agent_presence():
+    """The presence rule for a worker with no terminal, bin/agent_presence.py (#433), loaded by path like cpu_guard."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "agent_presence.py")
+    held = sys.modules.get("agent_presence")
     if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
         return held
-    spec = importlib.util.spec_from_file_location("cpu_guard", path)
+    spec = importlib.util.spec_from_file_location("agent_presence", path)
     module = importlib.util.module_from_spec(spec)
-    sys.modules["cpu_guard"] = module
+    sys.modules["agent_presence"] = module
     try:
         spec.loader.exec_module(module)
     except BaseException:
-        sys.modules.pop("cpu_guard", None)
+        sys.modules.pop("agent_presence", None)
         raise
     return module
 
 
 def load_health_records():
     """The health recorders, bin/health_records.py (#357), loaded by path like disk_janitor."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "health_records.py")
-    held = sys.modules.get("health_records")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("health_records", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["health_records"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("health_records", None)
-        raise
-    return module
+    return load_module("health_records")
 
 
 def health_recorder(engine):
@@ -305,36 +244,12 @@ def health_write(engine, state, now):
 
 def load_reds():
     """`reds`, bin/reds.py (#342), loaded by path like the other modules."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "reds.py")
-    held = sys.modules.get("reds")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("reds", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["reds"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("reds", None)
-        raise
-    return module
+    return load_module("reds")
 
 
 def load_impact_floor():
     """The impact floor and hold table, bin/impact_floor.py (#179, L3), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "impact_floor.py")
-    held = sys.modules.get("impact_floor")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("impact_floor", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["impact_floor"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("impact_floor", None)
-        raise
-    return module
+    return load_module("impact_floor")
 
 
 class _LazyImpactFloor:
@@ -347,19 +262,7 @@ impact_floor = _LazyImpactFloor()
 
 def load_plan_review():
     """The plan review engine's pure core, bin/plan_review.py (#109), loaded by path like plan_check."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "plan_review.py")
-    held = sys.modules.get("plan_review")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("plan_review", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["plan_review"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("plan_review", None)
-        raise
-    return module
+    return load_module("plan_review")
 
 
 class _LazyPlanReview:
@@ -397,37 +300,13 @@ def load_external_adapter():
     """The generic external adapter, bin/external_adapter.py, loaded by path from beside this file, the way
     load_decision_core loads the core. Called only when an external decision system is switched on and names this
     adapter: while it is off the file is never read or imported."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "external_adapter.py")
-    held = sys.modules.get("external_adapter")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("external_adapter", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["external_adapter"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("external_adapter", None)
-        raise
-    return module
+    return load_module("external_adapter")
 
 
 def load_decision_sync():
     """The sync engine for external decision systems, bin/decision_sync.py, loaded by path like decision_core (it
     imports decision_core, which is already registered)."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "decision_sync.py")
-    held = sys.modules.get("decision_sync")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("decision_sync", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["decision_sync"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("decision_sync", None)
-        raise
-    return module
+    return load_module("decision_sync")
 
 
 decision_sync = load_decision_sync()
@@ -435,19 +314,7 @@ decision_sync = load_decision_sync()
 
 def load_work_sync():
     """The work-item pump, bin/work_sync.py, loaded by path like the others."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "work_sync.py")
-    held = sys.modules.get("work_sync")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("work_sync", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["work_sync"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("work_sync", None)
-        raise
-    return module
+    return load_module("work_sync")
 
 
 work_sync = load_work_sync()
@@ -455,19 +322,7 @@ work_sync = load_work_sync()
 
 def load_agent_calls():
     """The agent-shell call counter, bin/agent_calls.py (#367), loaded by path like the others."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "agent_calls.py")
-    held = sys.modules.get("agent_calls")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("agent_calls", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["agent_calls"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("agent_calls", None)
-        raise
-    return module
+    return load_module("agent_calls")
 
 
 agent_calls = load_agent_calls()
@@ -475,19 +330,7 @@ agent_calls = load_agent_calls()
 
 def load_triage_digest():
     """The stale digest's rules and files, bin/triage_digest.py (#349), loaded by path like the others."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "triage_digest.py")
-    held = sys.modules.get("triage_digest")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("triage_digest", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["triage_digest"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("triage_digest", None)
-        raise
-    return module
+    return load_module("triage_digest")
 
 
 triage_digest = load_triage_digest()
@@ -495,19 +338,7 @@ triage_digest = load_triage_digest()
 
 def load_dead_hint():
     """The DEAD agent's hint, bin/dead_hint.py (#379), loaded by path like the others."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "dead_hint.py")
-    held = sys.modules.get("dead_hint")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("dead_hint", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["dead_hint"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("dead_hint", None)
-        raise
-    return module
+    return load_module("dead_hint")
 
 
 dead_hint = load_dead_hint()
@@ -701,7 +532,7 @@ def validate_config(raw, source="config"):
     except ValueError as err:
         raise ConfigError(str(err))
     try:
-        load_spotlight_guard().validate(config.get("spotlight_guard"), source)
+        load_module("spotlight_guard").validate(config.get("spotlight_guard"), source)
     except ValueError as err:
         raise ConfigError(str(err)) from None
     if not isinstance(config["docker_reaper"], bool):
@@ -2399,23 +2230,6 @@ class DiskFacts:
         return [Fact("disk.low:%d" % int(episode), name, "disk", text, episode, sender="switchboard") for name in chiefs]
 
 
-def load_spotlight_guard():
-    """The Spotlight guard, bin/spotlight_guard.py (#438), loaded by path like the other modules (here and not in the shared loader block, so it adds no line there)."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "spotlight_guard.py")
-    held = sys.modules.get("spotlight_guard")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("spotlight_guard", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["spotlight_guard"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("spotlight_guard", None)
-        raise
-    return module
-
-
 class SpotlightFacts:
     """The Spotlight guard's fact source (bin/spotlight_guard.py, ask #438). Once an hour a BACKGROUND thread asks `mdfind` (5 s per folder) whether the index holds
     anything under each guarded folder; a pass only collects what the thread has finished, so it starts no process and a slow tool never delays it. A folder
@@ -2458,7 +2272,7 @@ class SpotlightFacts:
         engine = self.engine
         if engine is None or engine.state_dir is None:
             return []
-        sg = load_spotlight_guard()
+        sg = load_module("spotlight_guard")
         cfg = sg.settings(engine.config.get("spotlight_guard"))
         if cfg is None:
             return []
@@ -3114,6 +2928,7 @@ class Observation:
         self.last_human_prompt, self.problem = last_human_prompt, problem
         self.created = None  # PR 17: when v2 says the session began (epoch seconds)
         self.wrong_program = False  # the pane runs something other than the configured v2
+        self.headless = False  # #433: a worker with no terminal: what it does is read from the OpenCode service, never from herdr
         self.conflict = []  # other sessions that claim the same name
 
     def engaged(self, now, window):
@@ -3123,7 +2938,7 @@ class Observation:
         return self.last_human_prompt is not None and now - self.last_human_prompt < window
 
     def to_json(self):
-        return {"name": self.name, "session": self.session_id, "pane": self.pane, "status": self.status,
+        return {"name": self.name, "session": self.session_id, "pane": self.pane, "headless": self.headless, "status": self.status,
                 "fleet": self.fleet, "idle_at": iso(self.idle_at), "outcome": self.outcome,
                 "last_human_prompt": iso(self.last_human_prompt), "problem": self.problem,
                 "wrong_program": self.wrong_program, "conflict": self.conflict}
@@ -4129,6 +3944,7 @@ class Switchboard:
                 entries = self.herdr.agent_list()
             except HerdrError as err:
                 found.problems.append("herdr unreachable: %s" % err)
+                self._discover_headless(found, now)   # a worker with no terminal does not depend on herdr
                 return found
         found.entries = [entry for entry in entries if isinstance(entry, dict)]
         for entry in sorted(found.entries, key=lambda e: self.reads.stale_first(agent_session(e) or "")):   # the stalest first: the read budget is shared out in turn
@@ -4141,10 +3957,92 @@ class Switchboard:
                 continue
             if observation is not None:
                 found.add(observation)
+        self._discover_headless(found, now)   # AFTER the terminals: a terminal that runs the same session wins (`watch`), and another session claiming a terminal agent's name is a conflict (held)
         return found
+
+    def _discover_headless(self, found, now):
+        """#433: the workers with no terminal. The index is the private records in state-dir/headless/; PRESENCE is proved by the service (the session
+        exists, answers and carries the worker's name in its metadata), never by a record alone. `session.active` is read ONCE for all of them; a
+        service that does not answer makes each one `unknown` with a problem (a delivery is held, never dropped), not dead and not working."""
+        if self.state_dir is None:
+            return
+        try:
+            ap = load_agent_presence()
+            records, bad = ap.scan_records(self.state_dir)
+        except Exception as err:   # never silent: headless workers would vanish from discovery without a word
+            found.problems.append("headless workers could not be read: %s" % _one_line(str(err), 100))
+            return
+        found.problems.extend(bad)   # a record that is there and cannot be used is said, one line each, never a silent loss
+        if not records:
+            return
+        active, down = None, None
+        try:
+            active = self.v2.session_active() or {}
+        except V2Error as err:
+            down = _one_line(str(err), 100)
+        for record in records:
+            try:
+                observation = self._observe_headless(record, now, active, down)
+            except V2Error as err:
+                observation = self._unknown_headless(record, "the service did not answer: %s" % _one_line(str(err), 100))
+            if observation is not None:
+                found.add(observation)
+
+    def _unknown_headless(self, record, why):
+        name = record["worker"]
+        observation = Observation(name, record["session"], None, "unknown", {"name": name, "headless": True})
+        observation.headless = True
+        observation.problem = "%s: %s" % (name, why)
+        return observation
+
+    def _observe_headless(self, record, now, active, down=None, fresh=False):
+        """An Observation for one headless worker, or None when its session is gone or is not the worker's. State per bin/agent_presence.py."""
+        ap = load_agent_presence()
+        session_id = record["session"]
+        if down is not None:
+            return self._unknown_headless(record, "the service did not answer (%s)" % down)
+        state, why = ap.read_state(self.v2, session_id, active)
+        if state == "missing":
+            return None
+        if state == ap.UNKNOWN:
+            return self._unknown_headless(record, why)
+        try:
+            info = self.reads.session_info(session_id, state, now, fresh)
+        except V2Error as err:
+            if err.reason == "http" and err.status == 404:
+                return None
+            raise
+        fleet = _fleet_meta(info)
+        if not fleet or fleet.get("name") != record["worker"]:
+            return None   # the session does not carry the worker's name: the record is not proof of presence
+        times = info.get("time") if isinstance(info.get("time"), dict) else {}
+        observation = Observation(fleet["name"], session_id, None, STATUS.get(state, "unknown"), fleet, _seconds(times.get("idle")), info.get("outcome"))
+        observation.created = _seconds(times.get("created"))
+        observation.headless = True
+        try:
+            observation.last_human_prompt = self.last_human_prompt(
+                session_id, now, inbox=fleet.get("role") == "chief-of-staff", info=info, fresh=fresh)
+        except V2Error as err:
+            observation.problem = "cannot read %s's transcript: %s" % (observation.name, err)
+        return observation
 
     def reobserve(self, previous, now):
         """The same agent, read again just before a write (invariant 4). (Observation, why-not)."""
+        if previous.headless:
+            try:
+                record = load_agent_presence().load_record(self.state_dir, previous.name) if self.state_dir is not None else None
+                if record is None or record["session"] != previous.session_id:
+                    return None, "%s has no headless record for session %s any more" % (previous.name, previous.session_id)
+                active = self.v2.session_active() or {}
+                fresh = self._observe_headless(record, now, active, None, fresh=True)   # a read before a write is never from memory
+            except V2Error as err:
+                return None, "v2 unreachable: %s" % err
+            if fresh is None or fresh.name != previous.name:
+                return None, "session %s is no longer the fleet agent %s" % (previous.session_id, previous.name)
+            if fresh.problem:
+                return None, fresh.problem
+            fresh.conflict = list(previous.conflict)
+            return fresh, None
         if not previous.pane:
             return None, "%s has no herdr pane to read again" % previous.name
         try:
@@ -14380,7 +14278,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         if config_ok and disk_guard_settings(config) is not None:
             report["disk"] = disk_status_line(config, state)   # one stat of the volume
         if config_ok:
-            sg = load_spotlight_guard()
+            sg = load_module("spotlight_guard")
             spot_cfg = sg.settings(config.get("spotlight_guard"))
             if spot_cfg is not None:
                 report["spotlight"] = sg.status_lines(spot_cfg, sg.load(state), now())   # the file the hourly background check wrote: no process
@@ -14512,7 +14410,7 @@ def _agent_line(entry):
     if seen is None:
         return "%-14s (not found)  %s" % (entry["name"], _plan_line(entry))
     return "%-14s %-8s %s  pane %s  your last prompt %s  %s" % (
-        seen["name"], seen["status"], seen["session"], seen["pane"] or "-",
+        seen["name"], seen["status"], seen["session"], seen["pane"] or ("(headless)" if seen.get("headless") else "-"),
         seen["last_human_prompt"] or "not in the window", _plan_line(entry))
 
 
@@ -23135,19 +23033,7 @@ def build_parser():
 
 # ---- the load of each orchestrator and the threshold alert (#348); the logic is in bin/fleet_health.py, this supplies the facts
 def load_fleet_health():
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "fleet_health.py")
-    held = sys.modules.get("fleet_health")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("fleet_health", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["fleet_health"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("fleet_health", None)
-        raise
-    return module
+    return load_module("fleet_health")
 
 
 def validate_load_alert_config(config, source):

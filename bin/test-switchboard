@@ -11305,6 +11305,227 @@ class TestVerdictRecordingText(unittest.TestCase):
         self.assertIn("a coder's only extra step is `prove`", planning)
 
 
+class TestHeadlessPresence(Base):
+    """#433 slice 2: a worker with NO terminal. Its state comes from the OpenCode service alone (bin/agent_presence.py); discovery lists it with the
+    pane `(headless)`; a delivery to it is not held; a service that does not answer makes it `unknown`, never dead and never working."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("boss",))
+        self.ap = sb.load_agent_presence()
+        self.engine = self.world.new_engine("cli")
+        self.url = "http://127.0.0.1:49374"
+
+    def headless(self, name="hw", role="coder", reports_to="boss", register=True, fleet_name=None):
+        sid = self.world.v2.create_session({"fleet": {"name": fleet_name or name, "role": role, "reports_to": reports_to, "headless": True}})
+        if register:
+            self.ap.save_record(self.world.state, name, sid, self.url, now=self.world.clock.now())
+        return sid
+
+    def discover(self):
+        return self.engine.discover(self.world.clock.now())
+
+    def run_cli(self, *argv):
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_state_of_is_the_rule_the_spike_measured(self):
+        s, a = self.ap.state_of, {"type": "running"}
+        idle_msg, user_msg = {"type": "idle"}, {"type": "user"}
+        self.assertEqual(s(a, [], [], None, True), "working")
+        self.assertEqual(s(a, [{"id": "per_1"}], [], None, True), "blocked", "a pending permission, while active, is blocked")
+        self.assertEqual(s(a, None, [{"id": "frm_1"}], None, True), "blocked", "a pending form, while active, is blocked")
+        self.assertEqual(s(None, [{"id": "per_1"}], [{"id": "frm_1"}], idle_msg, True), "idle", "lists alone never make a session blocked: it must be active")
+        self.assertEqual(s(None, None, None, None, True), "idle", "a session with no message yet is idle")
+        self.assertEqual(s(None, None, None, idle_msg, True), "idle")
+        self.assertEqual(s(None, None, None, user_msg, True), "idle", "a prompt queued a moment before the turn starts is seen as idle until the next read")
+        self.assertEqual(s(a, [{"id": "x"}], [{"id": "y"}], idle_msg, False), "unknown", "an unreachable service is unknown, whatever else was passed")
+        self.assertEqual(s(None, None, None, None, False), "unknown")
+
+    def test_a_headless_worker_is_discovered_with_its_state_from_the_service_and_never_as_not_found(self):
+        sid = self.headless()
+        found = self.discover().agents["hw"]
+        self.assertEqual((found.headless, found.pane, found.status, found.session_id), (True, None, "idle", sid))
+        self.assertIsNone(found.problem)
+        self.world.v2.start_turn(sid, "work", False, lasts=600)
+        self.assertEqual(self.discover().agents["hw"].status, "working")
+        self.world.v2.__dict__.setdefault("asks", {})[sid] = [{"id": "per_1", "action": "shell", "resources": ["echo x"]}]
+        self.assertEqual(self.discover().agents["hw"].status, "blocked")
+        self.world.v2.__dict__["asks"][sid] = []
+        self.world.v2.__dict__.setdefault("forms", {})[sid] = [{"id": "frm_1", "title": "Questions", "fields": []}]
+        self.assertEqual(self.discover().agents["hw"].status, "blocked")
+        self.world.v2.__dict__["forms"][sid] = []
+        self.world.tick(1200)
+        self.assertEqual(self.discover().agents["hw"].status, "idle")
+
+    def test_an_unreachable_service_makes_it_unknown_with_a_problem_never_dead_never_working_and_it_is_not_dropped(self):
+        sid = self.headless()
+        self.world.v2.down = True
+        found = self.discover().agents["hw"]
+        self.assertEqual((found.status, found.headless, found.session_id), ("unknown", True, sid))
+        self.assertIn("did not answer", found.problem)
+        self.world.v2.down = False
+        self.assertEqual(self.discover().agents["hw"].status, "idle", "back as soon as the service answers")
+
+    def test_a_record_alone_is_not_presence_the_session_must_exist_and_carry_the_workers_name(self):
+        self.headless(name="gone")
+        del self.world.v2.sessions[next(iter(s for s, v in self.world.v2.sessions.items() if v["metadata"]["fleet"]["name"] == "gone"))]
+        self.headless(name="other", fleet_name="someone-else")                      # a record pointing at another agent's session
+        found = self.discover().agents
+        self.assertNotIn("gone", found)
+        self.assertNotIn("other", found)
+
+    def test_a_terminal_that_runs_the_session_wins_over_the_headless_picture_of_it(self):
+        self.world.add_agent("hw", fleet={"role": "coder", "reports_to": "boss"})
+        sid = self.world.sessions["hw"]
+        self.ap.save_record(self.world.state, "hw", sid, self.url)
+        self.world.herdr.panes[self.world.panes["hw"]]["program"] = FAKE_OPENCODE + " -s " + sid
+        found = self.discover().agents["hw"]
+        self.assertEqual((found.headless, found.pane), (False, self.world.panes["hw"]))
+
+    def test_a_delivery_to_a_headless_worker_is_not_held_and_reads_it_again_first_and_an_outage_holds_it_without_dropping_it(self):
+        sid = self.headless()
+        texts = lambda: [m.get("text", "") for m in self.world.v2.sessions[sid]["messages"] if m["type"] in ("user", "synthetic")]
+        reads = []
+        real = sb.Switchboard.reobserve
+        with mock.patch.object(sb.Switchboard, "reobserve", lambda self_, previous, now: reads.append(previous.headless) or real(self_, previous, now)):
+            outcome = self.engine.send("boss", "hw", "please start", None, None)
+        self.assertTrue(outcome["sent"], outcome)
+        self.assertEqual(reads, [True], "the headless worker was read again just before the write")
+        self.assertTrue(any("please start" in t for t in texts()), texts())
+        before = len(texts())
+        self.world.v2.down = True
+        held = self.engine.send("boss", "hw", "again", None, None)
+        self.assertFalse(held["sent"])
+        self.assertEqual(held["action"], "hold", held)
+        self.assertIn("cannot reach the OpenCode service", held["reason"])
+        self.world.v2.down = False
+        self.assertEqual(len(texts()), before, "nothing reached the session during the outage")
+        self.assertTrue(self.engine.send("boss", "hw", "again", None, None)["sent"], "the same send goes through once the service is back")
+        self.assertTrue(any("again" in t for t in texts()))
+
+    def test_herdr_down_still_discovers_the_headless_worker_and_a_404_or_a_changed_record_is_not_a_worker(self):
+        sid = self.headless()
+        self.world.herdr.down = True
+        found = self.discover()
+        self.assertEqual(found.agents["hw"].status, "idle")
+        self.assertTrue(any("herdr unreachable" in p for p in found.problems))
+        self.world.herdr.down = False
+        before = self.discover().agents["hw"]
+        other = self.headless(name="hw2", register=False)
+        self.ap.save_record(self.world.state, "hw", other, self.url)               # the record now names another session
+        self.assertIsNone(self.engine.reobserve(before, self.world.clock.now())[0], "a changed record is refused")
+        self.ap.save_record(self.world.state, "hw", sid, self.url)
+        fresh, why = self.engine.reobserve(before, self.world.clock.now())
+        self.assertEqual((fresh.name, fresh.headless, why), ("hw", True, None))
+        self.world.v2.down = True
+        self.assertIsNone(self.engine.reobserve(before, self.world.clock.now())[0], "an unreachable service is never a delivery")
+        self.world.v2.down = False
+        del self.world.v2.sessions[sid]
+        self.assertNotIn("hw", self.discover().agents, "a session the service no longer has is not a worker")
+
+    def test_a_record_that_names_a_terminal_agent_with_another_session_is_a_conflict_not_a_takeover(self):
+        self.world.add_agent("t1", fleet={"role": "coder", "reports_to": "boss"})
+        imposter = self.world.v2.create_session({"fleet": {"name": "t1", "role": "coder", "reports_to": "boss"}})
+        self.ap.save_record(self.world.state, "t1", imposter, self.url)
+        found = self.discover().agents["t1"]
+        self.assertFalse(found.headless, "the terminal's own session keeps the name")
+        self.assertEqual(found.session_id, self.world.sessions["t1"])
+        self.assertEqual(found.conflict, [imposter], "the other session is a conflict, and a conflict is never delivered to")
+
+    def test_a_headless_worker_that_finishes_or_blocks_wakes_its_boss_like_any_worker(self):
+        sid = self.headless()
+        self.world.v2.start_turn(sid, "work", False, lasts=30)
+        self.discover()
+        self.world.tick(60)
+        self.discover()
+        facts, _ = self.engine.collect_facts()
+        idle = [f for f in facts if f.kind in (sb.WORKER_IDLE, "worker.stopped") and f.recipient == "boss"]     # a bare idle is a rider; a stop the triage finds is a wake
+        self.assertEqual(len(idle), 1, [(f.kind, f.recipient) for f in facts])
+        self.assertIn("hw", idle[0].summary)
+        self.world.v2.start_turn(sid, "more", False, lasts=600)
+        self.world.v2.__dict__.setdefault("asks", {})[sid] = [{"id": "per_9", "action": "shell", "resources": ["echo hi"], "save": ["echo *"]}]
+        self.discover()
+        facts, _ = self.engine.collect_facts()
+        blocked = [f for f in facts if f.kind == sb.WORKER_BLOCKED and f.recipient == "boss"]
+        self.assertEqual(len(blocked), 1, [(f.kind, f.recipient) for f in facts])
+
+    def test_status_lists_it_with_the_pane_headless(self):
+        self.headless()
+        line = sb._agent_line({"name": "hw", "observation": self.discover().agents["hw"].to_json(), "plan": None})
+        self.assertIn("(headless)", line)
+        self.assertIn("idle", line)
+
+    def test_the_record_is_private_and_only_a_loopback_local_worker_is_accepted(self):
+        sid = self.headless(register=False)
+        body = self.ap.save_record(self.world.state, "hw", sid, self.url, now=5)
+        self.assertEqual((body["kind"], body["worker"], body["session"], body["url"]), ("local", "hw", sid, self.url))
+        path = Path(self.world.state) / "headless" / "hw.json"
+        self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
+        self.assertEqual(oct((Path(self.world.state) / "headless").stat().st_mode & 0o777), "0o700")
+        for bad in ("https://example.test:443", "http://example.test:80", "http://127.0.0.1", "http://127.0.0.1:49374/x", "ftp://127.0.0.1:1"):
+            with self.assertRaises(ValueError, msg=bad):
+                self.ap.save_record(self.world.state, "hw", sid, bad)
+        with self.assertRaises(ValueError):
+            self.ap.save_record(self.world.state, "../escape", sid, self.url)
+        with self.assertRaises(ValueError):
+            self.ap.save_record(self.world.state, "hw", "not-a-session", self.url)
+        path.chmod(0o644)
+        self.assertIsNone(self.ap.load_record(self.world.state, "hw"), "a record anyone can write is not trusted")
+        path.chmod(0o600)
+        self.assertEqual(self.ap.load_record(self.world.state, "hw")["session"], sid)
+        path.write_text("{not json")
+        self.assertIsNone(self.ap.load_record(self.world.state, "hw"))
+        self.assertEqual(self.ap.list_records(self.world.state), [])
+
+    def test_an_unusable_record_is_said_in_discovery_one_line_each_and_reading_never_creates_the_directory(self):
+        state = Path(self.world.state)
+        self.assertEqual(self.discover().problems, [], "no directory, no records: silent")
+        self.assertFalse((state / "headless").exists(), "a read creates nothing")
+        sid = self.headless()
+        (state / "headless" / "hw.json").chmod(0o644)
+        (state / "headless" / "bad.json").write_text("{not json")
+        (state / "headless" / "bad.json").chmod(0o600)
+        problems = self.discover().problems
+        self.assertEqual(len([p for p in problems if "headless record" in p]), 2, problems)
+        self.assertTrue(any("hw" in p and "not private" in p for p in problems), problems)
+        self.assertTrue(any("bad" in p and "not readable JSON" in p for p in problems), problems)
+        self.assertNotIn("hw", self.discover().agents, "an untrusted record is not a worker")
+        self.assertEqual(self.ap.read_record(self.world.state, "nobody"), (None, None))
+
+    def test_the_scan_says_a_cap_a_misnamed_file_and_a_symlinked_directory_and_removing_creates_nothing(self):
+        state = Path(self.world.state)
+        self.assertFalse(self.ap.remove_record(self.world.state, "hw"))
+        self.assertFalse((state / "headless").exists(), "removing a record that is not there makes no directory")
+        sid = self.headless(register=False)
+        for n in range(self.ap.MAX_RECORDS + 3):
+            self.ap.save_record(self.world.state, "w%03d" % n, sid, self.url)
+        (state / "headless" / "Bad Name.json").write_text("{}")
+        records, problems = self.ap.scan_records(self.world.state)
+        self.assertEqual(len(records), self.ap.MAX_RECORDS)
+        self.assertTrue(any("more than %d headless records" % self.ap.MAX_RECORDS in p for p in problems), problems)
+        self.assertTrue(any("Bad Name.json" in p and "not named for a worker" in p for p in problems), problems)
+        real = state / "headless"
+        moved = state / "headless-real"
+        real.rename(moved)
+        os.symlink(str(moved), str(real))
+        records, problems = self.ap.scan_records(self.world.state)
+        self.assertEqual(records, [])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("not the user's own real directory", problems[0])
+        self.assertIsNone(self.ap.load_record(self.world.state, "w000"))
+
+    def test_remove_record_deletes_it_once_and_says_so(self):
+        sid = self.headless()
+        path = Path(self.world.state) / "headless" / "hw.json"
+        self.assertTrue(path.exists())
+        self.assertTrue(self.ap.remove_record(self.world.state, "hw"))
+        self.assertFalse(path.exists())
+        self.assertFalse(self.ap.remove_record(self.world.state, "hw"))
+        self.assertFalse(self.ap.remove_record(self.world.state, "../x"))
+
+
 class TestSelfRegisteringCli(unittest.TestCase):
     """The front door (#179 follow-up): commands register and dispatch BY NAME, so a new command edits no shared list. What must not change: the set of
     subcommands and each one's help, the function each runs and what it is given, the daemon start, the error mapping; and a hostile name never runs
@@ -47998,7 +48219,7 @@ class TestLoadAlert(Base):
     def test_each_orchestrator_has_the_five_figures_from_the_records(self):
         self.asks = {1: [10, 11, 12], 2: [20], 3: [30, 31]}
         orchestrators = {"orch-a": self.orch(busy=2, idle=1, messages=1, charter=1), "orch-b": self.orch(idle=1, charter=2), "orch-c": self.orch(busy=1, charter=3)}
-        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [{"agent": "orch-a"}, {"agent": "orch-a"}, {"agent": "orch-b", "closed": True}]}))
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [{"agent": "x", "ask": 10, "repo": "acme/widget"}, {"agent": "x", "ask": 11, "repo": "acme/widget"}, {"agent": "orch-b", "ask": 20, "repo": "acme/widget", "closed": True}]}))   # owned by the ask's chain, not by the agent field)
         self.tick(self.T0, orchestrators)                      # first sight of every ask
         self.move(self.T0 + 3 * 3600 - 60, 10)                 # ask 10 moved 1 minute ago; 20 and 30 moved 3 h ago
         self.move(self.T0 + 3 * 3600 - 60, 12)
@@ -48791,6 +49012,88 @@ class TestLoadAlert(Base):
         self.wait_world({1: {"labels": []}, 2: {"labels": []}}, enabled=True)
         self.assertEqual(len(self.woken), 1)
 
+    def decisions_world(self, decisions, parents, orchestrators=None, asks=None, charters=None, tick_at=None, **extra):
+        """Passes of orchestrators with charters (`charters`: name -> number) and asks, over a decisions.json of `decisions` and issue parents `parents`."""
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": decisions}))
+        reads = []
+        def read_parent(repo, number):
+            reads.append(number)
+            if number not in parents:
+                raise RuntimeError("gh is down")
+            return parents[number]
+        orch = orchestrators or {"a": {"charter": 1, "repo": "r", "busy": 0, "idle": 1, "messages": 0}, "b": {"charter": 2, "repo": "r", "busy": 0, "idle": 1, "messages": 0}}
+        asks = asks or {1: [10], 2: [20]}
+        def read_asks(charter, repo):
+            return [{"repo": "r", "number": n} for n in asks[charter]]
+        def tick(at=None, **kw):
+            ctx = self.health.Context(now=at or self.T0, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS, **kw.pop("cfg", {})), orchestrators=orch,
+                                      read_asks=read_asks, read_parent=read_parent, cos="cos", wake=self.woken.append, **dict(extra, **kw))
+            return self.health.tick(ctx)
+        return tick, reads
+
+    def test_an_old_format_row_is_followed_through_the_issues_it_closed(self):
+        tick, reads = self.chain_world({200: 100})
+        tick(self.T0)
+        late = self.T0 + 3 * 3600
+        tick(late, [{"at": late - 60, "repo": "r", "numbers": [900, 200], "kind": "push"}])     # written before refs existed: the pull request and what it closed
+        self.assertEqual((self.latest()["o"]["moved_1h"], reads), (1, [200]))
+
+    def test_a_pull_request_under_the_charter_with_no_ask_is_charter_movement_and_credits_no_ask(self):
+        tick, reads = self.chain_world({300: 1})                       # issue 300's parent is the charter 1 itself
+        tick(self.T0)
+        late = self.T0 + 3 * 3600
+        tick(late, [self.move_row(late - 60, [300])])
+        got = self.latest()["o"]
+        self.assertEqual((got["charter_moves_1h"], got["moved_1h"], got["stalled"]), (1, 0, 1))
+        lines = self.health.status_lines(str(self.state_dir), late)
+        self.assertIn("charter moves 1h 1", [l for l in lines if l.strip().startswith("o ")][0])
+
+    def test_charter_movement_keeps_the_busy_coders_rule_quiet(self):
+        orch = {"o": {"charter": 1, "repo": "r", "busy": 2, "idle": 0, "messages": 0}}
+        self.asks = {1: [10, 11, 12]}
+        def tick(at, rows=()):
+            if rows:
+                self.health.append_moves(str(self.state_dir), list(rows))
+            return self.health.tick(self.health.Context(now=at, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS, enabled=True), orchestrators=orch,
+                                                        read_asks=lambda c, r: [{"repo": "r", "number": n} for n in self.asks[c]],
+                                                        read_parent=lambda repo, n: 1, cos="cos", wake=self.woken.append))
+        tick(self.T0, [{"at": self.T0 - 60, "repo": "r", "numbers": [900, 300], "refs": [300], "kind": "push"}])   # the lane is moving: no wake for outnumbered asks
+        tick(self.T0 + 600)
+        self.assertEqual(self.woken, [])
+        shutil.rmtree(str(self.state_dir)); self.state_dir.mkdir(mode=0o700)
+        tick(self.T0)                                                                                      # nothing moved at all: the same fixture fires
+        self.assertEqual(len(self.woken), 1)
+
+    def test_a_decision_belongs_to_the_charter_on_its_chain_not_to_its_agent_field(self):
+        tick, reads = self.decisions_world([{"agent": "b", "ask": 500, "repo": "r"}], {500: 10, 10: 1})   # 500 -> ask 10 of orchestrator a; the field says b
+        tick()
+        got = self.latest()
+        self.assertEqual((got["a"]["decisions"], got["b"]["decisions"]), (1, 0))
+
+    def test_every_decision_is_attributed_to_the_charter_that_holds_it_even_with_no_agent(self):
+        tick, reads = self.decisions_world([{"agent": None, "ask": 10, "repo": "r"}, {"agent": "a", "ask": 20, "repo": "r"}, {"agent": None, "ask": 600, "repo": "r"}],
+                                           {600: 2})
+        tick()
+        got = self.latest()
+        self.assertEqual((got["a"]["decisions"], got["b"]["decisions"]), (1, 2))                         # 10 -> a's ask; 20 -> b's ask; 600 -> charter 2 (b)
+
+    def test_a_decision_whose_chain_cannot_be_resolved_belongs_to_nobody_and_status_says_so(self):
+        tick, reads = self.decisions_world([{"agent": "a", "ask": 700, "repo": "r"}], {})              # the parent read fails
+        tick()
+        got = self.latest()
+        self.assertEqual((got["a"]["decisions"], got["b"]["decisions"]), (0, 0))                        # the agent field is not used as a fallback
+        lines = self.health.status_lines(str(self.state_dir), self.T0)
+        self.assertEqual(len([l for l in lines if "1 decision(s) not attributed" in l]), 1)
+
+    def test_decision_chains_are_read_once_and_count_in_the_account_budget(self):
+        tick, reads = self.decisions_world([{"agent": "a", "ask": 500, "repo": "r"}, {"agent": "a", "ask": 501, "repo": "r"}], {500: 10, 501: 10})
+        for k in range(3):
+            tick(self.T0 + k * 600)
+        self.assertEqual(sorted(reads), [500, 501])
+        state = json.loads((self.state_dir / "load.json").read_text())
+        self.assertEqual(len([r for r in state["reads"] if True]) >= 2, True)
+        self.assertEqual(state["parents"], {"r#500": 10, "r#501": 10})
+
     def test_an_idle_pass_rewrites_nothing(self):
         self.asks = {1: [1]}
         self.tick(self.T0, {"o": self.orch(busy=1, charter=1)})
@@ -48846,7 +49149,7 @@ class TestSpotlightGuard(Base):
         self.engine = self.world.engine
         self.engine.config["spotlight_guard"] = {"folders": list(self.dirs)}
         self.engine.discover(self.world.clock.now())
-        self.sg = sb.load_spotlight_guard()
+        self.sg = sb.load_module("spotlight_guard")
         self.counts = {}
         self.calls = []
         self.fail = [None]
@@ -49083,6 +49386,115 @@ class TestSpotlightGuard(Base):
         self.assertEqual(self.sg.parse_count("57\n"), 57)
         for odd in ("", "abc\n", "12 files\n", "1\n2x\n"):
             self.assertIsNone(self.sg.parse_count(odd), odd)
+
+
+class TestModuleLoader(Base):
+    """Ask #437 slice 1: one generic loader behind the old `load_<module>()` names."""
+
+    OLD = {
+        "load_decision_core": "decision_core", "load_plan_check": "plan_check", "load_plan_ledger": "plan_ledger",
+        "load_report_fold": "report_fold", "load_triage_plan_open": "triage_plan_open", "load_pr_events": "pr_events",
+        "load_disk_janitor": "disk_janitor", "load_heavy_slots": "heavy_slots", "load_cpu_guard": "cpu_guard",
+        "load_health_records": "health_records", "load_reds": "reds", "load_impact_floor": "impact_floor",
+        "load_plan_review": "plan_review", "load_external_adapter": "external_adapter",
+        "load_decision_sync": "decision_sync", "load_work_sync": "work_sync", "load_agent_calls": "agent_calls",
+        "load_triage_digest": "triage_digest", "load_dead_hint": "dead_hint", "load_fleet_health": "fleet_health",
+    }
+
+    def _copy(self, extra=None):
+        """A copy of the program in a temp bin directory, with the named modules beside it, loaded as a module."""
+        tmp = Path(tempfile.mkdtemp(prefix="ldtest"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        held = dict(sys.modules)
+        self.addCleanup(lambda: (sys.modules.clear(), sys.modules.update(held)))
+        shutil.copy(SWITCHBOARD, tmp / "fleet-switchboard")
+        for module in BIN.glob("*.py"):
+            shutil.copy(module, tmp / module.name)
+        for name, text in (extra or {}).items():
+            (tmp / (name + ".py")).write_text(text)
+        return tmp, _load("ld_" + tmp.name, tmp / "fleet-switchboard")
+
+    def test_s1_each_old_loader_loads_its_old_path_and_caches(self):
+        self.assertEqual(len(self.OLD), 20)
+        for fn, name in self.OLD.items():
+            first = getattr(sb, fn)()
+            self.assertEqual(os.path.realpath(first.__file__), os.path.realpath(str(BIN / (name + ".py"))), fn)
+            self.assertIs(getattr(sb, fn)(), first, fn)
+
+    def test_s2_a_missing_or_broken_module_fails_as_before(self):
+        tmp, mod = self._copy({"broken_one": "def (:\n"})
+        with self.assertRaises(FileNotFoundError):
+            mod.load_module("absent_one")
+        with self.assertRaises(SyntaxError):
+            mod.load_module("broken_one")
+        self.assertNotIn("broken_one", sys.modules)
+
+    def test_s4_a_new_module_loads_with_no_edit_to_the_program(self):
+        tmp, mod = self._copy({"fixture_mod": "VALUE = 7\n"})
+        first = mod.load_module("fixture_mod")
+        self.assertEqual(first.VALUE, 7)
+        self.assertIs(mod.load_module("fixture_mod"), first)
+
+    def test_s9_concurrent_first_loads_all_get_the_finished_module_and_a_failing_one_fails_for_every_thread(self):
+        tmp, mod = self._copy({
+            "slow_mod": "import time\ntime.sleep(0.3)\nREADY = True\n",
+            "failing_mod": "import time\ntime.sleep(0.2)\nraise RuntimeError('boom')\n"})
+        got, errors, barrier = [], [], threading.Barrier(8)
+
+        def worker(name):
+            barrier.wait()
+            try:
+                module = mod.load_module(name)
+                got.append((module, getattr(module, "READY", False)))
+            except RuntimeError as err:
+                errors.append(str(err))
+        threads = [threading.Thread(target=worker, args=("slow_mod",)) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(20)
+        self.assertEqual(len(got), 8)
+        self.assertEqual(len({id(module) for module, _ in got}), 1, "one object for every thread")
+        self.assertTrue(all(ready for _, ready in got), "no thread saw a half-loaded module")
+        barrier, errors = threading.Barrier(8), []
+        threads = [threading.Thread(target=worker, args=("failing_mod",)) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(20)
+        self.assertEqual(errors, ["boom"] * 8, "the failing module raises for every thread")
+        self.assertNotIn("failing_mod", sys.modules)
+
+    def test_s9b_a_slow_import_never_delays_another_module_and_a_module_may_load_another(self):
+        tmp, mod = self._copy({
+            "slow_one": "import threading\nthreading._ld_started.set()\nthreading._ld_gate.wait(20)\nREADY = True\n",
+            "quick_one": "VALUE = 1\n", "fresh_one": "VALUE = 2\n",
+            "b_mod": "VALUE = 'b'\n",
+            "a_mod": "import threading\nB = threading._ld_load('b_mod')\n"})
+        threading._ld_started, threading._ld_gate, threading._ld_load = threading.Event(), threading.Event(), mod.load_module
+        self.addCleanup(lambda: [delattr(threading, n) for n in ("_ld_started", "_ld_gate", "_ld_load") if hasattr(threading, n)])
+        self.addCleanup(threading._ld_gate.set)
+        quick = mod.load_module("quick_one")
+        slow = threading.Thread(target=lambda: mod.load_module("slow_one"))
+        slow.start()
+        self.assertTrue(threading._ld_started.wait(10))
+        self.assertIs(mod.load_module("quick_one"), quick, "an already loaded module needs no lock")
+        self.assertEqual(mod.load_module("fresh_one").VALUE, 2, "a first load of another module does not wait for the slow import")
+        self.assertTrue(slow.is_alive(), "both returned while the slow import was still running")
+        threading._ld_gate.set()
+        slow.join(20)
+        self.assertEqual(mod.load_module("a_mod").B.VALUE, "b", "a module that loads another while it runs")
+
+    def test_s8_a_hostile_name_is_refused(self):
+        tmp, mod = self._copy()
+        (tmp.parent / "outside_mod.py").write_text("VALUE = 1\n")
+        self.addCleanup((tmp.parent / "outside_mod.py").unlink)
+        for name in ("../outside_mod", os.path.join(os.sep, "etc", "hosts"), "a/b", "", None):
+            with self.assertRaises(ValueError, msg=repr(name)):
+                mod.load_module(name)
+        with self.assertRaises(FileNotFoundError):
+            mod.load_module("no_such_module")
+        self.assertNotIn("outside_mod", sys.modules)
 
 
 if __name__ == "__main__":
