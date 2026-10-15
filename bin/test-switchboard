@@ -5655,6 +5655,88 @@ class TestLaunch(Base):
         self.assertNotEqual(code, 0)
         self.assertIn("--agent and --dir", err.getvalue())
 
+    def cli_resume(self, session, *extra, stdin=None):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        with captured() as (out, err), mock.patch.object(sb.sys, "stdin", io.StringIO(stdin or "")):
+            code = sb.main(["launch", "platform", "--resume", session] + list(extra), runner=self.world.route,
+                           now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def briefs(self, session):
+        return [m for m in self.world.v2.sessions[session]["messages"] if m["type"] == "user"]
+
+    def brief_file(self, text, name="brief.md"):
+        path = self.home / name
+        path.write_text(text)
+        return str(path)
+
+    def test_s1_a_resume_with_a_brief_file_delivers_it_once_and_says_so(self):
+        session = self.gone()
+        code, out, err = self.cli_resume(session, "--brief-file", self.brief_file("Answer the new checkpoint\n"))
+        self.assertEqual(code, 0, err)
+        self.assertEqual([(m["text"], m["metadata"]) for m in self.briefs(session)],
+                         [("Answer the new checkpoint\n", {"fleet": {"from": "switchboard", "brief": True}})], "1 message to that agent")
+        self.assertEqual(json.loads(out)["brief"], "sent")
+        self.assertEqual(len(re.findall(r"\bsent\b", out + err)), 1, "the output says it was sent once")
+        self.assertIn("delivered to platform", err)
+
+    def test_s2_a_brief_on_standard_input_is_delivered_the_same_way(self):
+        session = self.gone()
+        code, out, err = self.cli_resume(session, "--brief-file", "-", stdin="From stdin\n")
+        self.assertEqual(code, 0, err)
+        self.assertEqual([m["text"] for m in self.briefs(session)], ["From stdin\n"])
+
+    def test_s3_a_failed_send_exits_1_and_says_the_pane_is_open_without_the_brief(self):
+        session = self.gone()
+        with mock.patch.object(sb, "send_brief", side_effect=sb.V2Error("http", "the service went away")):
+            code, out, err = self.cli_resume(session, "--brief-file", self.brief_file("Do it\n"))
+        self.assertEqual(code, 1)
+        self.assertEqual(err.count("without the brief"), 1)
+        self.assertIn("service went away", err)
+        self.assertEqual(json.loads(out)["brief"], "not sent")
+        self.assertEqual(self.world.herdr.closed, [], "the pane is not closed")
+        self.assertEqual(self.briefs(session), [])
+
+    def test_s4_an_empty_unreadable_or_oversize_brief_is_refused_before_any_pane_opens(self):
+        session = self.gone()
+        calls = len(self.world.herdr.socket_calls)
+        cases = (self.brief_file("  \n", "empty.md"), str(self.home / "nope.md"),
+                 self.brief_file("x" * (sb.load_module("resume_brief").BRIEF_MAX_CHARS + 1), "big.md"))
+        for path in cases:
+            with self.subTest(path=path):
+                code, _, err = self.cli_resume(session, "--brief-file", path)
+                self.assertEqual(code, 2)
+                self.assertIn("no pane was opened", err)
+        self.assertEqual(len(self.world.herdr.socket_calls), calls, "0 panes opened")
+        self.assertEqual(self.briefs(session), [])
+
+    def test_s5_a_different_repo_is_refused_first_and_no_message_is_sent(self):
+        session = self.gone()
+        self.world.v2.sessions[session]["metadata"]["fleet"]["repo"] = "acme/api"
+        code, _, err = self.cli_resume(session, "--repo", "acme/web", "--brief-file", self.brief_file("Do it\n"))
+        self.assertEqual(code, 1)
+        self.assertIn("differs from the session's stored repo", err)
+        self.assertEqual(self.briefs(session), [])
+
+    def test_s6_a_resume_without_a_brief_sends_nothing_and_prints_as_before(self):
+        session = self.gone()
+        code, out, err = self.cli_resume(session)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.briefs(session), [])
+        self.assertNotIn("brief", json.loads(out))
+        self.assertEqual(err, "")
+
+    def test_s7_the_audit_holds_the_length_of_the_brief_and_never_its_text(self):
+        session = self.gone()
+        secret = "very private words in a brief"
+        self.cli_resume(session, "--brief-file", self.brief_file(secret + "\n"))
+        entries = [json.loads(l) for l in self.world.audit_path.read_text().splitlines()]
+        sends = [e for e in entries if e["event"] == "v2.session.prompt" and e.get("phase") == "intent"]
+        self.assertEqual(len(sends), 1)
+        self.assertEqual((sends[0]["subject"], sends[0]["detail"]["brief_chars"]), ("platform", len(secret) + 1))
+        self.assertNotIn(secret, self.world.audit_path.read_text())
+
     def listing_runner(self, agents):
         """The world's runner, with `opencode api GET /api/agent` answering `agents` ({name: mode}); None: the service is not reachable."""
         def route(argv, **kwargs):
@@ -5717,6 +5799,22 @@ class TestLaunch(Base):
         session = self.world.v2.sessions[done["session"]]
         self.assertEqual(session["metadata"]["fleet"]["reports_to"], "platform")
         self.assertEqual(session["messages"][0]["text"], "Do the thing\n")
+
+    def test_a_launch_records_who_ran_it_from_its_pane_and_nobody_from_a_plain_shell(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        for pane, expected in ((self.world.panes["platform"], "platform"), (None, None)):
+            if pane is None:
+                os.environ.pop("HERDR_PANE_ID", None)
+            else:
+                os.environ["HERDR_PANE_ID"] = pane
+            name = "tester-%s" % (expected or "shell")
+            with captured() as (out, err):
+                code = sb.main(["launch", name, "--agent", "coder", "--dir", str(self.work), "--role", "tester", "--reports-to", "platform"],
+                               runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+            self.assertEqual(code, 0, err.getvalue())
+            fleet = self.world.v2.sessions[json.loads(out.getvalue())["session"]]["metadata"]["fleet"]
+            self.assertEqual((fleet["role"], fleet.get("launched_by")), ("tester", expected))
 
     def test_the_cli_without_a_workspace_is_refused(self):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
@@ -11346,7 +11444,7 @@ class TestCosTriageAllowRule(unittest.TestCase):
                         self.assertNotRegex(l, r'resource: "fleet-switchboard \*"')
                         self.assertNotRegex(l, r'resource: "\*+fleet-switchboard')
 
-    def test_the_switchboard_allow_rules_are_the_fixed_old_list_plus_triage(self):
+    def test_the_switchboard_allow_rules_are_the_fixed_old_list_plus_triage_move_reassign(self):
         old = {
             "chief-of-staff.md": "send report remind intent intents status pending whoami notice decisions orders gates waive plan labels handoff launch reattach relaunch retire disk".split(),
             "cos-subagent.md": "send report remind intent intents status disk pending whoami version notice decisions orders gates waive plan labels".split(),
@@ -11354,7 +11452,7 @@ class TestCosTriageAllowRule(unittest.TestCase):
         for rel in self.FILES:
             with self.subTest(file=rel):
                 got = [m.group(1) for l in self._lines(rel) for m in [re.match(r'  - \{action: shell, resource: "fleet-switchboard ([a-z]+) \*", effect: allow\}$', l)] if m]
-                self.assertEqual(sorted(got), sorted(old[rel.split("/")[-1]] + ["triage"]))
+                self.assertEqual(sorted(got), sorted(old[rel.split("/")[-1]] + ["triage", "move", "reassign"]))
 
 
 class TestVerdictRecordingText(unittest.TestCase):
@@ -13480,6 +13578,13 @@ class TestHeadlessPresence(Base):
         args = dict(name="hw", agent="coder", directory=str(self.home), role="coder", reports_to="boss", issue=9, brief="Add a health check")
         args.update(overrides)
         return sb.launch_headless(self.engine, **args)
+
+    def test_a_headless_launch_records_who_ran_it_so_a_headless_tester_can_count_for_its_orchestrator(self):
+        done = self.launch_hl(name="hw-tst", role="tester", launched_by="boss")
+        fleet = self.world.v2.sessions[done["session"]]["metadata"]["fleet"]
+        self.assertEqual((fleet["role"], fleet["reports_to"], fleet.get("launched_by")), ("tester", "boss", "boss"))
+        plain = self.launch_hl(name="hw-plain", role="tester")                       # launched from a plain shell: nobody, so it never counts
+        self.assertNotIn("launched_by", self.world.v2.sessions[plain["session"]]["metadata"]["fleet"])
 
     def test_launch_headless_creates_the_session_and_its_record_sends_the_brief_and_opens_no_terminal(self):
         panes_before, calls_before, sessions_before = dict(self.world.herdr.panes), list(self.world.herdr.socket_calls), set(self.world.v2.sessions)
@@ -22123,6 +22228,81 @@ class TestIdentityCheck(ReportBase):
         self.assertTrue(self.shim().is_write(["auth", "git-credential", "get"]))
         self.assertFalse(self.shim().is_write(["auth", "status"]))
 
+    def test_the_credential_route_of_a_caller_with_no_repository_of_its_own_is_refused_whatever_the_verb_and_names_the_fix(self):
+        """#473 S5: git push, fetch, pull and clone all reach the shim as `gh auth git-credential <action>` (TestGitShim S1 proves the routing). A caller whose repo is only the
+        configured default (`own` false) used to get the DEFAULT repository's account there, and pushed as the wrong account."""
+        users = {"acme-ops/default": "acct-ops", "acme-other/*": "acct-other"}
+        tokens = {"acct-ops": "tok-ops", "acct-other": "tok-other"}
+        for action in ("get", "store", "erase"):   # every verb gives the helper these same calls: TestGitShim S1 proves push, fetch, pull and clone are routed to it
+            with self.subTest(action=action):
+                done, seen = self.run_gh_shim("acme-ops/default", users, tokens, args=("auth", "git-credential", action), own=False)
+                self.assertEqual(done.returncode, 1, action)
+                self.assertIn("has no repository of its own", done.stderr)
+                self.assertIn("launch", done.stderr)
+                self.assertIn("--repo", done.stderr)
+                self.assertIn("never used", done.stderr)
+                self.assertIsNone(seen, "the real gh never ran: no credential was given to anything")
+                self.assertNotIn("tok-ops", done.stdout + done.stderr)
+        done, seen = self.run_gh_shim("acme-ops/default", users, tokens, args=("auth", "git-credential", "get"), own=True)
+        self.assertEqual((done.returncode, seen["token"]), (0, "tok-ops"), "a caller whose repo IS its own is served as before")
+        done, seen = self.run_gh_shim("acme-ops/default", users, tokens, args=("auth", "git-credential", "get"))
+        self.assertEqual((done.returncode, seen["token"]), (0, "tok-ops"), "a switchboard that does not say `own` (an older one) is served as before")
+
+    def test_everything_else_about_account_choice_is_unchanged_for_a_caller_with_no_repository_of_its_own(self):
+        """#473 S6/PC-3: only the credential route changes. The Chief of Staff's named-repo commands, reads and writes without a name, and a caller with its own repo."""
+        users = {"acme-ops/*": "acct-ops", "acme/*": "acct-personal"}
+        tokens = {"acct-ops": "tok-ops", "acct-personal": "tok-personal"}
+        for args, expected in ((("issue", "view", "5", "-R", "acme/api"), "tok-personal"), (("issue", "comment", "5", "-R", "acme/api", "--body", "x"), "tok-personal"),
+                               (("issue", "list"), "tok-ops"), (("pr", "merge", "5", "-R", "acme/api"), "tok-ops"), (("auth", "status"), "tok-ops")):
+            with self.subTest(args=args):
+                done, seen = self.run_gh_shim("acme-ops/default", users, tokens, args=args, own=False)
+                self.assertEqual((done.returncode, seen["token"]), (0, expected), done.stderr)
+        done, seen = self.run_gh_shim("acme-ops/default", users, tokens, args=("auth", "git-credential", "get"), who_repo_exit=2)
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("no GitHub account is mapped for this shell (it has no repository identity)", done.stderr,
+                      "`whoami --json` failing while the plain `whoami` answers is an older switchboard: no repository identity, the refusal it always had")
+        self.assertNotIn("has no repository of its own", done.stderr, "the new text is only for a SUCCESSFUL lookup that says own: false")
+        done, seen = self.run_gh_shim("acme-ops/default", users, tokens, args=("auth", "git-credential", "get"), wedge=True, seconds=0.3, own=False)
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("account lookup failed", done.stderr, "a lookup that FAILS (no answer in time) keeps its own older refusal, never the new text")
+        self.assertNotIn("has no repository of its own", done.stderr)
+        self.assertIsNone(seen)
+        done, seen = self.run_gh_shim("acme-other/thing", users, tokens, args=("auth", "git-credential", "get"), own=True)
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("no GitHub account is mapped for", done.stderr, "an unmapped repository keeps its own refusal")
+
+    def test_no_shim_reads_a_directorys_remote_when_it_decides_who_a_caller_is(self):
+        """#473 S7/PC-1: the repository is derived once by the launcher. A fake `git` on the PATH records every call: across the shim runs it is started only by the git shim's
+        own exec of the real git, never by the gh shim, and no call asks for a remote or a config value."""
+        home = Path(self.home)
+        bindir = home / "shimbin"
+        bindir.mkdir(exist_ok=True)
+        glog = home / "git-calls.log"
+        (bindir / "git").write_text("#!/bin/sh\necho \"$@\" >> %s\nexit 0\n" % glog)
+        (bindir / "git").chmod(0o755)
+        subprocess.run([str(bindir / "git"), "probe"], check=True)
+        self.assertEqual(glog.read_text(), "probe\n", "the fake git logs what it is asked")
+        glog.unlink()
+        users = {"acme-ops/default": "acct-ops"}
+        for args, own in ((("auth", "git-credential", "get"), False), (("auth", "git-credential", "get"), True), (("auth", "git-credential", "store"), False),
+                          (("issue", "list"), False), (("pr", "view", "5", "-R", "acme-ops/other"), False)):
+            self.run_gh_shim("acme-ops/default", users, {"acct-ops": "tok-ops"}, args=args, own=own)
+        self.assertFalse(glog.exists(), "the gh shim never ran git, so it read no remote in 5 calls")
+        for path in (SHIM, GIT_SHIM):
+            source = path.read_text()
+            for word in ("remote.origin", "get-url", "--get-all"):
+                self.assertNotIn(word, source, "%s asks git for %s" % (path.name, word))
+        fake = self.home / "realbin"
+        fake.mkdir(exist_ok=True)
+        (fake / "git").write_text("#!/bin/sh\necho \"$@\" >> %s\nexit 0\n" % glog)
+        (fake / "git").chmod(0o755)
+        env = {"PATH": "%s:%s:%s" % (GIT_SHIM.parent, fake, SAFE_PATH), "HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / "xdg-config")}
+        for args in (("push", "origin", "b"), ("fetch",), ("pull",), ("clone", "https://github.com/acme/api.git", "x"), ("push",)):
+            subprocess.run([sys.executable, str(GIT_SHIM)] + list(args), env=env, capture_output=True, text=True, timeout=60)
+        calls = glog.read_text().splitlines()
+        self.assertEqual(len(calls), 5, "the git shim started the real git once per call and nothing more")
+        self.assertEqual([c for c in calls if "config" in c.split() or "remote.origin" in c or "get-url" in c], [], "and none of them read a remote or a config value")
+
     def test_git_credential_for_a_repository_with_no_mapped_account_or_no_identity_is_refused_never_the_inherited_token(self):
         users = {"acme-ops/service": "acct-ops"}
         cred = ("auth", "git-credential", "get")
@@ -22858,6 +23038,16 @@ class TestTriageAncestors(Base):
         self.child(60, 999)
         self.go()
         self.assertEqual(self.only("T1"), [])
+
+    def test_s4b_t11_never_fires_for_an_unresolved_chain_but_still_for_a_fully_read_orphan(self):
+        self.world.add_agent("coder", fleet={"role": "coder", "issue": 81, "repo": "acme/api"})   # an agent works on 81 (no T1), as in the T11 test above
+        self.engine.discover(self.world.clock.now())
+        self.world.tick(sb.TRIAGE_TTL + 5)
+        self.add(80, created=5, updated=3, parent=999, labels=["kind"], body="Next: go")      # middle parent 999 was not read (a capped list)
+        self.add(81, created=5, updated=3, labels=["kind"], body="Next: go")                  # chain read completely, no charter
+        self.add(82, created=5, updated=3, parent=1, labels=["kind"], body="Next: go")        # chain reaches a charter
+        self.go()
+        self.assertEqual(self.only("T11"), ["acme/api#81"])
 
     def test_s5_a_muted_item_stays_muted_across_a_restart_of_the_memory(self):
         self.add(70, created=5, updated=0.2, labels=["kind"], body="Next: go")
@@ -24081,6 +24271,136 @@ class LedgerBase(Base):
             self.assertEqual(self.prove("coder", sid)[0], 0)
         for who, sid, ev in (("cibot", "S1", "ci"), ("tst", "S2", "tester"), ("rev", "S3", "reviewer"), ("cibot", "U1", "ci")):
             self.assertEqual(self.verdict(who, sid, ev)[0], 0, (who, sid))
+
+
+class TestLaunchTesters(LedgerBase):
+    """#372: a tester launched with --role tester for its orchestrator's repo may record tester verdicts, beside the configured list."""
+
+    def setUp(self):
+        super().setUp()
+        add = self.world.add_agent
+        add("orch", fleet={"role": "orchestrator", "repo": "acme/app", "issue": 7})
+        add("orch-web", fleet={"role": "orchestrator", "repo": "acme/web", "issue": 8})
+        add("ltst", fleet={"role": "tester", "repo": "acme/app", "reports_to": "orch", "issue": 7, "launched_by": "orch"})
+        add("ltst-web", fleet={"role": "tester", "repo": "acme/web", "reports_to": "orch-web", "issue": 8, "launched_by": "orch-web"})
+        add("ltst-nobody", fleet={"role": "tester", "repo": "acme/app", "reports_to": "coder", "issue": 7, "launched_by": "coder"})
+        add("ltst-forged", fleet={"role": "tester", "repo": "acme/app", "reports_to": "orch", "issue": 7, "launched_by": "coder"})   # a coder named the orchestrator as the boss
+        add("ltst-old", fleet={"role": "tester", "repo": "acme/app", "reports_to": "orch", "issue": 7})                              # launched before launched_by existed
+        add("lrev", fleet={"role": "reviewer", "repo": "acme/app", "reports_to": "orch", "issue": 7})
+        self.configure(evaluators={"reviewer": ["rev"], "tester": ["tst"], "owner": ["own"], "ci": ["cibot"]})
+        self.assertEqual(self.prove("coder", "S2")[0], 0)
+
+    def test_launch_records_the_role_with_the_repo_and_the_boss(self):
+        record = sb.fleet_record("ltst", "tester", "orch", 7, None, "acme/app")
+        self.assertEqual((record["role"], record["repo"], record["reports_to"]), ("tester", "acme/app", "orch"))
+
+    def test_a_launched_tester_is_accepted_for_its_repo_and_refused_for_another(self):
+        self.assertEqual(self.verdict("ltst", "S2", "tester")[0], 0)
+        code, _, err = self.verdict("ltst-web", "S2", "tester")      # acme/web's tester on an acme/app PR
+        self.assertEqual(code, 2)
+        self.assertIn("not registered", err)
+        self.assertEqual([e["by"] for e in self.ledger() if e["kind"] == "verdict"], ["ltst"])
+
+    def test_a_tester_whose_boss_is_not_an_orchestrator_of_the_repo_is_refused(self):
+        for who in ("ltst-nobody", "lrev", "ltst-forged", "ltst-old"):    # boss is a coder; role reviewer; launched by a coder; no launched_by
+            code, _, err = self.verdict(who, "S2", "tester")
+            self.assertEqual(code, 2, who)
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "verdict"], [])
+
+    def test_a_tester_that_proved_the_pr_is_refused_as_a_writer(self):
+        self.assertEqual(self.prove("ltst", "S1")[0], 0)
+        code, _, err = self.verdict("ltst", "S2", "tester")
+        self.assertEqual(code, 2)
+        self.assertIn("wrote this PR", err)
+
+    def test_a_launched_tester_is_never_a_reviewer_ci_or_owner(self):
+        for sid, evaluator in (("S3", "reviewer"), ("S1", "ci"), ("S2", "owner")):
+            code, _, err = self.verdict("ltst", sid, evaluator)
+            self.assertNotEqual(code, 0, evaluator)
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "verdict"], [])
+
+    def test_the_configured_tester_still_works_and_the_audit_names_the_record_only_for_a_launched_one(self):
+        self.assertEqual(self.verdict("tst", "S2", "tester")[0], 0)
+        self.assertEqual(self.verdict("ltst", "S2", "tester")[0], 0)
+        events = [e for e in self.world.audit() if e["event"] == "plan.verdict"]
+        configured, launched = [e["detail"] for e in events if e["detail"]["by"] == "tst"][0], [e["detail"] for e in events if e["detail"]["by"] == "ltst"][0]
+        self.assertNotIn("launch_record", configured)
+        self.assertEqual({k: launched["launch_record"][k] for k in ("name", "role", "repo", "reports_to")},
+                         {"name": "ltst", "role": "tester", "repo": "acme/app", "reports_to": "orch"})
+
+    def test_a_retired_tester_stops_counting_and_is_not_listed(self):
+        retired = {"ltst": {"at": 1, "by": "orch", "reason": "done", "session": self.world.sessions["ltst"], "auto": False}}
+        (self.world.state / sb.RETIRED_FILE).write_text(json.dumps(retired))
+        code, _, err = self.verdict("ltst", "S2", "tester")
+        self.assertEqual(code, 2)
+        self.assertIn("not registered", err)
+        retired["ltst"]["session"] = "ses_an_older_launch"   # a relaunch under the same name is a new session: retirement of the old one does not cover it
+        (self.world.state / sb.RETIRED_FILE).write_text(json.dumps(retired))
+        self.assertEqual(self.verdict("ltst", "S2", "tester")[0], 0)
+        retired["ltst"]["session"] = self.world.sessions["ltst"]
+        self.assertEqual(sb.load_launch_testers().launched({"ltst": {"role": "tester", "repo": "acme/app", "reports_to": "orch", "launched_by": "orch"}, "orch": {"role": "orchestrator", "repo": "acme/app"}},
+                                                           {"ltst": self.world.sessions["ltst"]}, "acme/app", lambda f: f.get("repo"), retired), {})
+
+    def test_a_missing_retired_file_means_nobody_is_retired(self):
+        (self.world.state / sb.RETIRED_FILE).unlink(missing_ok=True)
+        self.assertEqual(self.verdict("ltst", "S2", "tester")[0], 0)
+        self.assertEqual(sb.read_retired_strict(self.world.state), {})
+
+    def test_a_corrupt_or_unreadable_retired_file_disables_every_launched_tester_and_says_so(self):
+        path = self.world.state / sb.RETIRED_FILE
+        for label, content in (("corrupt json", b'{"ltst": {"at": 1,'), ("empty bytes", b""), ("garbage", b"\xff\xfe not json \x00"),
+                               ("a list", b"[]"), ("a record that is not an object", b'{"ltst": "retired"}'), ("a bare string", b'"x"')):
+            with self.subTest(content=label):
+                path.write_bytes(content)
+                before = len([e for e in self.world.audit() if e["event"] == "testers.retired_unreadable"])
+                code, _, err = self.verdict("ltst", "S2", "tester")
+                self.assertEqual(code, 2)
+                self.assertIn("not registered", err)
+                self.assertEqual([e for e in self.ledger() if e["kind"] == "verdict"], [], "0 tester verdicts accepted")
+                events = [e for e in self.world.audit() if e["event"] == "testers.retired_unreadable"]
+                self.assertEqual(len(events), before + 1, "a loud audit event")
+                self.assertEqual(events[-1]["detail"]["effect"], "launch-record testers disabled")
+                with self.assertRaises(sb.RetiredUnreadable):
+                    sb.read_retired_strict(self.world.state)
+                fleets = {"orch": {"role": "orchestrator", "repo": "acme/app"}, "ltst": {"role": "tester", "repo": "acme/app", "reports_to": "orch", "launched_by": "orch"}}
+                agents = {"ok": True, "list": [{"observation": {"name": n, "session": "s-" + n}} for n in fleets]}
+                self.assertEqual(sb.testers_status({"plan_evaluators": {}, "intent_repo": "acme/app"}, agents, fleets, self.world.state),
+                                 ["      testers    retired file unreadable: launch-record testers disabled"])
+        self.assertEqual(self.verdict("tst", "S2", "tester")[0], 0, "the configured tester still works")
+        path.unlink()
+
+    def test_an_unreadable_directory_instead_of_a_file_also_fails_closed(self):
+        path = self.world.state / sb.RETIRED_FILE
+        path.mkdir()
+        try:
+            self.assertEqual(self.verdict("ltst", "S2", "tester")[0], 2)
+        finally:
+            path.rmdir()
+
+    def test_status_lists_the_resolved_testers_with_their_source(self):
+        fleets = {"orch": {"role": "orchestrator", "repo": "acme/app"}, "ltst": {"role": "tester", "repo": "acme/app", "reports_to": "orch", "launched_by": "orch"},
+                  "tst": {"role": "tester", "repo": "acme/app", "reports_to": "orch", "launched_by": "orch"}}
+        agents = {"ok": True, "list": [{"observation": {"name": n, "session": "s-" + n}} for n in fleets]}
+        lines = sb.testers_status({"plan_evaluators": {"tester": ["tst"]}, "intent_repo": "acme/app"}, agents, fleets, self.world.state)
+        self.assertEqual(lines, ["      tester     tst: config (any repo)", "      tester     ltst: launch record (acme/app)"])
+        self.assertEqual(sb.testers_status({}, {"ok": False}, {}, self.world.state), [])
+
+    def test_the_pure_rules_and_the_status_lines(self):
+        lt = sb.load_launch_testers()
+        fleets = {"orch": {"role": "orchestrator", "repo": "acme/app"}, "t1": {"role": "tester", "repo": "acme/app", "reports_to": "orch", "launched_by": "orch"},
+                  "t2": {"role": "tester", "repo": "acme/web", "reports_to": "orch", "launched_by": "orch"}}
+        repo_of = lambda f: f.get("repo")
+        self.assertEqual(sorted(lt.launched(fleets, {}, "acme/app", repo_of)), ["t1"])
+        self.assertEqual(lt.evaluators({"tester": ["tst"], "ci": ["bot"]}, {"t1": {}}), {"tester": ["tst", "t1"], "ci": ["bot"]})
+        self.assertEqual(lt.evaluators({"reviewer": ["r"]}, {}), {"reviewer": ["r"]})
+        self.assertIsNone(lt.lane_refusal("t1", {"t1": {}}, {"coder"}, {"t1": "s1", "coder": "s2"}))
+        coders = {"t1": {"role": "tester", "issue": 7}, "c1": {"role": "coder", "issue": 7}, "c2": {"role": "coder", "issue": 9}}
+        self.assertIn("not a different agent from c1", lt.lane_refusal("t1", {"t1": {}}, set(), {"t1": "s1", "c1": "s1"}, coders))
+        self.assertIsNone(lt.lane_refusal("t1", {"t1": {}}, set(), {"t1": "s1", "c2": "s1"}, coders))   # a coder of another work item
+        self.assertIn("session of a writer", lt.lane_refusal("t1", {"t1": {}}, {"coder"}, {"t1": "s1", "coder": "s1"}))
+        self.assertEqual(lt.status_lines({"tester": ["tst"]}, fleets, {}, {"acme/app"}, repo_of),
+                         ["      tester     tst: config (any repo)", "      tester     t1: launch record (acme/app)"])
+        self.assertEqual(lt.source_of("tst", {"tester": ["tst"]}, {"tst": {}}), "config")
 
 
 class TestPlanLedger(LedgerBase):
@@ -25757,6 +26077,33 @@ class TestImpactFloorCommandAndPass(LedgerBase):
         sb.impact_would_hold_pass(engine, t + 400)
         self.assertEqual(len([e for e in self.world.audit() if e["event"] == "gate.would_hold"]), 2, "a new head is judged again")
 
+    def test_an_unreadable_matrix_file_is_said_loudly_by_the_pass_and_the_command_never_read_as_no_floor(self):
+        mod = sb.load_module("impact_floor")
+        broken = mock.patch.object(mod, "floor_for", side_effect=mod.MatrixError("the impact matrix file cannot be read (OSError: gone)"))
+        hub = FakeHub({"acme/app": [{"number": 9, "head": {"sha": LEDGER_HEAD}, "body": "PLAN: acme/app#7", "draft": False}]})
+        engine = self.world.new_engine("daemon")
+        engine.hub, engine.gh_runner = hub, self.route
+        engine.config, engine.state_dir = sb.load_config(), self.world.state
+        sb.ci_record_pass(engine, 100000.0)
+        with broken:
+            sb.impact_would_hold_pass(engine, 100000.0)
+            code, out, err = self.run_as("coder", "impact", "hold", "--dry-run")
+        self.assertEqual([e for e in self.world.audit() if e["event"] == "gate.would_hold"], [], "no judgement is made")
+        errors = [e for e in self.world.audit() if e["event"] == "impact.error"]
+        self.assertEqual([e["detail"].get("floor") for e in errors], ["unreadable"], "the pass says so, loudly")
+        self.assertEqual(code, sb.EXIT_ERROR)
+        self.assertEqual(len([line for line in err.splitlines() if line.strip()]), 1, err)
+        self.assertIn("cannot be read", err)
+
+    def test_the_floor_report_carries_the_owner_hold_tier_as_advisory_information(self):
+        report = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])
+        self.assertEqual(report["decision"], "hold", "the labels still follow the old decision")
+        self.assertEqual(report["owner_decision"], "second-review", "a floor path outside the top tier: no owner clear")
+        self.pr.update({"changedFiles": 1, "files": [{"path": "shims/gh", "additions": 1, "deletions": 0}]})
+        report = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])
+        self.assertEqual(report["owner_decision"], "hold")
+        self.assertTrue(any("shims/gh" in reason for reason in report["owner_reasons"]), report["owner_reasons"])
+
     def test_the_pass_is_off_when_disabled_or_killed_and_unlisted_repos_are_not_read(self):
         for edit in ("disabled", "killed"):
             with self.subTest(edit=edit):
@@ -25772,6 +26119,341 @@ class TestImpactFloorCommandAndPass(LedgerBase):
                 sb.impact_would_hold_pass(engine, 100000.0)
                 self.assertEqual([e for e in self.world.audit() if e["event"] == "gate.would_hold"], [])
         (self.world.state / "plan-gates.off").unlink(missing_ok=True)
+
+
+class TestGateFloorFresh(LedgerBase):
+    """#488: gate G6 reads the impact floor itself at the exact head, so a PR that touches a floor path is held from the moment it is
+    ready, before the daemon has labelled it. Synthetic names; the route counts every `pr view`."""
+
+    def setUp(self):
+        super().setUp()
+        self.extra_config = dict(FLOOR_CONFIG, plan_gates={"repos": {"acme/app": {"mode": "shadow"}}})
+        self.configure()
+        self.reads = 0
+        self.pr.update({"changedFiles": 1, "files": [{"path": "shims/gh"}]})   # a top tier path of the matrix file: the owner-hold rule holds it
+
+    def route(self, argv, **kwargs):
+        if argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"]:
+            self.reads += 1
+        return super().route(argv, **kwargs)
+
+    def g6(self):
+        code, report, err = self.gates()
+        self.assertIsNotNone(report, err)
+        return self.row(report, "G6")
+
+    def clear(self, head):
+        sb.write_impact_state(self.world.state, {"clears": {self.PR: {"head": head, "reason": "a false hold", "by": "own", "at": 1}}, "applied": {}})
+
+    def test_a_floor_path_waits_with_no_label_and_names_the_path(self):                                      # S1
+        self.assertEqual(self.pr["labels"], [])
+        row = self.g6()
+        self.assertEqual(row["status"], "waiting")
+        self.assertIn("shims/gh", " ".join(row["missing"]))
+
+    def test_the_owners_clear_passes_for_that_head_only(self):                                              # S2
+        self.clear(LEDGER_HEAD)
+        self.assertEqual(self.g6()["status"], "ok")
+        self.pr["headRefOid"] = LEDGER_NEW_HEAD
+        self.assertEqual(self.g6()["status"], "waiting")
+
+    def test_an_unreadable_floor_does_not_pass(self):                                                      # S3
+        self.pr["files"] = "not a list"
+        self.pr["changedFiles"] = "many"
+        with mock.patch.object(sb, "pr_floor_report", side_effect=sb.NoticeError("gh: network unreachable")):
+            row = self.g6()
+        self.assertEqual(row["status"], "waiting")
+        self.assertEqual(" ".join(row["missing"]).count("could not be read"), 1)
+
+    def test_a_matrix_error_does_not_pass(self):                                                           # S3b
+        with mock.patch.object(sb.impact_floor, "load_matrix", side_effect=ValueError("matrix is broken")):
+            row = self.g6()
+        self.assertEqual(row["status"], "waiting")
+        self.assertIn("could not be read", " ".join(row["missing"]))
+
+    def test_a_corrupt_impact_state_does_not_pass(self):
+        (self.world.state / "impact-hold.json").write_text("{not json")
+        self.assertEqual(self.g6()["status"], "waiting")
+
+    def test_a_head_that_moved_during_the_read_does_not_pass(self):
+        real = sb.pr_floor_report
+        with mock.patch.object(sb, "pr_floor_report", lambda *a, **k: dict(real(*a, **k), head=LEDGER_NEW_HEAD)):
+            self.assertIn("could not be read", " ".join(self.g6()["missing"]))
+
+    def test_the_gate_and_the_daemon_decide_alike_for_six_fixtures(self):                                  # S4
+        fixtures = [["shims/gh"], ["docs/a.md"], ["src/a.py"], ["bin/plan_ledger.py", "docs/b.md"], ["plugins/fleet-hooks/a.js"], ["docs/c.md", "src/d.py"]]
+        for paths in fixtures:
+            with self.subTest(paths=paths):
+                self.pr.update({"changedFiles": len(paths), "files": [{"path": p} for p in paths]})
+                engine = self.world.new_engine("cli")
+                engine.config, engine.state_dir, engine.gh_runner = sb.load_config(), self.world.state, self.route
+                daemon = sb.pr_floor_report(engine, "acme/app", 9)["owner_decision"]   # the decision the daemon's labels follow
+                fact = sb.gate_floor_fact(engine, self.world.state, "acme/app", 9, LEDGER_HEAD)
+                self.assertEqual(fact["decision"], daemon)
+                self.assertEqual(self.g6()["status"], "waiting" if daemon == "hold" else "ok")
+        import re as _re
+        code = (Path(__file__).resolve().parent / "plan_ledger.py").read_text()
+        self.assertGreater(len(code), 1000)
+        self.assertEqual(len(_re.findall(r"migrations|api/routes|shims/", code)), 0)
+
+    def test_a_hold_label_still_waits_when_the_floor_would_not_hold(self):                                 # S5
+        self.pr.update({"changedFiles": 1, "files": [{"path": "src/a.py"}], "labels": [{"name": "tester:merge-captain"}]})
+        self.assertEqual(self.g6()["status"], "waiting")
+
+    def test_a_docs_only_pr_passes_with_one_read_for_the_floor(self):                                      # S6
+        self.pr.update({"changedFiles": 1, "files": [{"path": "docs/a.md"}]})
+        code, report, err = self.gates()
+        self.assertEqual(self.row(report, "G6")["status"], "ok")
+        floor_reads = self.reads
+        self.reads = 0
+        self.gates()
+        self.assertEqual(self.reads, floor_reads)
+        self.assertEqual(self.reads - 1, 1, "one read for the picture, one for the floor")
+
+    def test_a_waiver_cannot_lift_it(self):
+        self.assertIn("G6", sb.plan_ledger.NEVER_WAIVABLE)
+
+
+class TestImpactClassAndNarrowForm(LedgerBase):
+    """#451 slice 2: the class in the impact reviewer's record, and an agent definition that holds only when its permission block changes. Synthetic
+    names; the route answers the contents reads and counts them."""
+
+    BASE = "c" * 40
+    DEF = '---\ndescription: a helper\nmode: subagent\npermissions:\n  - {action: read, resource: "*", effect: allow}\n---\nProse about the job.\n'
+
+    def setUp(self):
+        super().setUp()
+        self.extra_config = dict(FLOOR_CONFIG, plan_gates={"repos": {"acme/app": {"mode": "shadow"}}})
+        self.configure()
+        self.pr = dict(self.pr, baseRefOid=self.BASE)
+        self.reads, self.contents = [], {}
+        self.files(["docs/a.md"])
+
+    def route(self, argv, **kwargs):
+        if argv[0] == FAKE_GH and argv[1] == "api" and "/contents/" in argv[2]:
+            self.reads.append(argv[2])
+            match = re.search(r"/contents/([^?]+)\?ref=([0-9a-f]+)", argv[2])
+            text = self.contents.get((match.group(1), match.group(2)))
+            if text == "BROKEN":
+                return subprocess.CompletedProcess(argv, 1, "", "gh: HTTP 502")
+            if text is None:
+                return subprocess.CompletedProcess(argv, 1, "", "gh: Not Found (HTTP 404)")
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"content": base64.b64encode(text.encode()).decode(), "encoding": "base64"}), "")
+        return super().route(argv, **kwargs)
+
+    def files(self, paths):
+        self.pr.update({"changedFiles": len(paths), "files": [{"path": p, "additions": 1, "deletions": 0} for p in paths]})
+
+    def definition(self, path, before, after):
+        self.contents[(path, self.BASE)], self.contents[(path, LEDGER_HEAD)] = before, after
+
+    def decide(self):
+        code, out, err = self.run_as("coder", "impact", "floor", self.PR, "--json")
+        self.assertEqual(code, 0, err)
+        report = json.loads(out)
+        return report["owner_decision"], report["owner_reasons"]
+
+    def record_impact(self, action, *more):
+        code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve", "--impact-action", action, *more)
+        return code, out, err
+
+    # -- S1: the record
+
+    def test_s1_the_record_keeps_its_class_refuses_a_bad_one_and_may_have_none(self):
+        self.assertEqual(self.record_impact("hold", "--impact-class", "credentials")[0], 0)
+        code, out, err = self.record_impact("hold", "--impact-class", "two words")
+        self.assertEqual(code, 2)
+        self.assertEqual(err.count("impact-class"), 1)
+        self.assertEqual(self.record_impact("hold")[0], 0)
+        code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "code", "--verdict", "approve", "--impact-class", "data")
+        self.assertEqual(code, 2)
+        self.assertIn("belongs to the impact reviewer", err)
+        stored = [e.get("impact_class") for e in self.ledger() if e["kind"] == "review_record"]
+        self.assertEqual(stored, ["credentials", None])
+        self.assertEqual(self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve", "--impact-action", "hold",
+                                     "--block", "/nonexistent")[0], 2)
+
+    def test_the_block_form_carries_the_class_line(self):
+        block = "verdict: approve\nhead: %s\nimpact-action: hold\nimpact-class: Data\nfindings:\n" % LEDGER_HEAD
+        fields, problem = sb.parse_review_block(block)
+        self.assertEqual((problem, fields["impact_class"]), (None, "data"))
+        fields, problem = sb.parse_review_block(block.replace("Data", "two words"))
+        self.assertIn("impact-class", problem)
+
+    # -- S2: the decision by class
+
+    def test_s2_a_hold_record_holds_for_the_owner_unless_its_class_is_not_top_tier(self):
+        outcome = {}
+        for label, more in (("credentials", ("--impact-class", "credentials")), ("performance", ("--impact-class", "performance")),
+                            ("unknown", ("--impact-class", "gizmo")), ("missing", ())):
+            self.assertEqual(self.record_impact("hold", *more)[0], 0)
+            outcome[label] = self.decide()
+        self.assertEqual({k: v[0] for k, v in outcome.items()},
+                         {"credentials": "hold", "performance": "second-review", "unknown": "hold", "missing": "hold"})
+        self.assertEqual(outcome["performance"][1][0].count("class performance"), 1)
+        self.assertFalse([r for r in outcome["performance"][1] if "top tier" in r and "hold" in r.split(":")[0]])
+
+    def test_a_non_hold_record_and_an_unreadable_ledger(self):
+        self.assertEqual(self.record_impact("second-review")[0], 0)
+        self.assertEqual(self.decide()[0], "none")
+        (self.world.state / "plan-ledger.jsonl").write_text("{not json\n")
+        self.assertEqual(self.decide()[0], "hold", "an unreadable ledger is an unknown rating: it holds")
+
+    # -- S3: the prompt
+
+    def test_s3_the_prompt_asks_for_the_class_and_names_every_class_of_the_matrix_file(self):
+        text = (REPO / "agents" / "reviewers" / "reviewer-impact.md").read_text()
+        rule = sb.load_impact_floor().owner_hold_rule(sb.load_impact_floor().load_matrix())
+        classes = rule[0] + rule[1]
+        self.assertEqual(len(classes), 10)
+        self.assertEqual(text.count("impact-class"), 1)
+        self.assertEqual([c for c in classes if "`%s`" % c not in text], [])
+
+    # -- S4 to S6: the agent definitions
+
+    def test_s4_only_a_change_to_the_permission_block_holds(self):
+        path = "agents/x.md"
+        self.files([path])
+        tail = self.DEF.split("---\n", 2)[2]
+        cases = {
+            "prose": (self.DEF.replace("Prose about the job.", "Other prose.").replace("a helper", "a better helper"), "second-review"),
+            "allow rule": (self.DEF.replace("allow}\n", "allow}\n  - {action: shell, resource: \"ls *\", effect: allow}\n"), "hold"),
+            "mode": (self.DEF.replace("subagent", "primary"), "hold"),
+            "unreadable after": ("no front matter here\n" + tail, "hold"),
+        }
+        for label, (after, want) in cases.items():
+            with self.subTest(label):
+                self.definition(path, self.DEF, after)
+                got = self.decide()
+                self.assertEqual(got[0], want, got)
+        self.assertEqual(self.decide_prose_reason(), 1)
+        with self.subTest("unreadable before"):
+            self.definition(path, "no front matter\n", self.DEF)
+            self.assertEqual(self.decide()[0], "hold")
+
+    def decide_prose_reason(self):
+        self.definition("agents/x.md", self.DEF, self.DEF.replace("Prose about the job.", "Other."))
+        decision, reasons = self.decide()
+        return len([r for r in reasons if "without a permission block change" in r]) if decision == "second-review" else -1
+
+    def test_s5_an_added_or_removed_definition_holds(self):
+        self.files(["agents/new.md"])
+        self.contents[("agents/new.md", LEDGER_HEAD)] = self.DEF
+        self.assertEqual((self.decide()[0], self.decide()[1][0].count("added")), ("hold", 1))
+        self.files(["agents/old.md"])
+        self.contents[("agents/old.md", self.BASE)] = self.DEF
+        self.assertEqual((self.decide()[0], self.decide()[1][0].count("removed")), ("hold", 1))
+
+    def test_s6_a_content_read_that_fails_holds_and_says_it_could_not_be_read(self):
+        self.files(["agents/x.md"])
+        self.definition("agents/x.md", self.DEF, "BROKEN")
+        decision, reasons = self.decide()
+        self.assertEqual(decision, "hold")
+        self.assertEqual(" ".join(reasons).count("could not be read"), 1)
+        self.pr.pop("baseRefOid")
+        self.assertEqual(self.decide()[0], "hold", "an unknown base holds")
+
+    def test_a_definition_missing_at_both_versions_and_a_mixed_change_hold(self):
+        self.files(["agents/ghost.md"])
+        decision, reasons = self.decide()
+        self.assertEqual((decision, " ".join(reasons).count("could not be read")), ("hold", 1))
+        self.files(["agents/x.md", "shims/gh"])
+        self.definition("agents/x.md", self.DEF, self.DEF.replace("Prose about the job.", "Other."))
+        decision, reasons = self.decide()
+        self.assertEqual(decision, "hold", "an unchanged permission block does not lift another top tier path")
+        self.assertIn("shims/gh", " ".join(reasons))
+
+    # -- S7: the bound
+
+    def test_s7_the_reads_are_none_four_and_none_and_more_than_the_limit_holds(self):
+        self.files(["docs/a.md"])
+        self.decide()
+        self.assertEqual(len(self.reads), 0)
+        for name in ("agents/a.md", "agents/b.md"):
+            self.definition(name, self.DEF, self.DEF)
+        self.files(["agents/a.md", "agents/b.md"])
+        self.reads.clear()
+        self.assertEqual(self.decide()[0], "second-review")
+        self.assertEqual(len(self.reads), 4)
+        names = ["agents/f%d.md" % n for n in range(9)]
+        self.files(names)
+        self.reads.clear()
+        decision, reasons = self.decide()
+        self.assertEqual((decision, len(self.reads)), ("hold", 0))
+        self.assertIn("more than 8", " ".join(reasons))
+
+    # -- S8 and S9: the rule is data
+
+    def matrix_with(self, **narrow):
+        matrix = json.loads(json.dumps(sb.load_impact_floor().load_matrix()))
+        matrix["owner_hold"]["narrow_by_diff"].update(narrow)
+        return matrix
+
+    def test_s8_the_narrow_paths_come_from_the_matrix_file(self):
+        self.files(["agents/x.md"])
+        self.definition("agents/x.md", self.DEF, self.DEF.replace("Prose about the job.", "Other."))
+        self.assertEqual(self.decide()[0], "second-review")
+        with mock.patch.object(sb.impact_floor, "load_matrix", lambda *a, **k: self.matrix_with(paths=["skills/**"])):
+            self.assertEqual(self.decide()[0], "hold", "no longer a narrow path: the whole top tier path holds")
+
+    def test_s9_the_front_matter_keys_come_from_the_matrix_file_and_the_code_has_none(self):
+        self.files(["agents/x.md"])
+        self.definition("agents/x.md", self.DEF, self.DEF.replace("a helper", "a better helper"))
+        self.assertEqual(self.decide()[0], "second-review")
+        with mock.patch.object(sb.impact_floor, "load_matrix", lambda *a, **k: self.matrix_with(keys=["description"])):
+            self.assertEqual(self.decide()[0], "hold", "description is the block now")
+        source = (REPO / "bin" / "impact_floor.py").read_text()
+        self.assertEqual(re.findall(r"agents/|[\"'](?:permissions|permission|mode|tools)[\"']", source), [])
+
+    def test_a_malformed_narrow_block_is_no_narrow_rule_and_the_whole_path_holds(self):
+        self.files(["agents/x.md"])
+        self.definition("agents/x.md", self.DEF, self.DEF.replace("Prose about the job.", "Other."))
+        for bad in ({"max_files": 0}, {"keys": []}, {"paths": "agents/**"}):
+            with self.subTest(bad), mock.patch.object(sb.impact_floor, "load_matrix", lambda *a, _b=bad, **k: self.matrix_with(**_b)):
+                self.assertEqual(self.decide()[0], "hold")
+
+    def test_every_agent_definition_of_this_repository_is_parsable(self):
+        f = sb.load_impact_floor()
+        keys = f.narrow_rule(f.load_matrix())[1]
+        unparsable = [str(p.relative_to(REPO)) for p in sorted((REPO / "agents").rglob("*.md")) if f.permission_block(p.read_text(), keys) is None]
+        self.assertEqual(unparsable, [], "a definition the reader cannot parse would always hold: the narrow form would help nobody")
+
+    def test_the_pure_block_reader(self):
+        f = sb.load_impact_floor()
+        keys = ["permissions", "mode"]
+        self.assertEqual(f.permission_block("---\nmode: x\n# c\npermissions:\n  - a\n\nother: 1\n---\n", keys), {"mode": ["mode: x"], "permissions": ["permissions:", "  - a"]})
+        self.assertIsNone(f.permission_block("mode: x\n", keys))
+        self.assertIsNone(f.permission_block("---\nmode: x\n", keys))
+        self.assertIsNone(f.permission_block("---\n---\n" + "x" * 300000, keys))
+        self.assertEqual(f.block_state("---\nmode: x\n---\n", "---\r\nmode: x  \r\n---\r\nprose", keys), "unchanged")
+        self.assertIsNone(f.permission_block('---\n"mode": x\n---\n', keys), "a quoted key cannot be judged: it holds")
+        self.assertEqual(f.permission_block("---\npermissions:\n- a\n- b\nother: 1\n---\n", keys), {"permissions": ["permissions:", "- a", "- b"]})
+        for label, text in (("a block scalar under a tracked key", "---\npermissions: |\n  # keep\n  x\n---\n"),
+                            ("an anchor", "---\nx: &m subagent\nmode: *m\n---\n"), ("a tag", "---\nmode: !!str x\n---\n"),
+                            ("a merge key", "---\n<<: *base\nmode: x\n---\n"), ("a repeated tracked key", "---\nmode: a\nmode: b\n---\n"),
+                            ("a closing line that is indented", "---\nmode: x\n  ---\nmode: y\n---\n"),
+                            ("a quoted scalar left open across lines", "---\ndescription: 'x\nmode: subagent\nother: y'\n---\n"),
+                            ("a flow collection left open", "---\npermissions: {a: 1,\nmode: x}\n---\n"),
+                            ("a double quoted scalar left open", '---\ndescription: "x\nmode: y\n---\n'),
+                            ("a folded block scalar", "---\npermissions: >\n  x\n---\n"),
+                            ("a comment hiding a closer in a flow collection", "---\ndescription: [a # ]\npermissions: [b]\nmode: subagent\nz: q]\n---\n"),
+                            ("a comment hiding a closer in a flow mapping", "---\ndescription: {a: 1 # }\nmode: x\nz: q}\n---\n"),
+                            ("a complex key opening a quote", '---\ndescription:\n  ? "x\nmode: subagent\n  y"\n---\n'),
+                            ("a directive", "---\n%YAML 1.2\nmode: x\n---\n"), ("a document end marker", "---\nmode: x\n...\n---\n"),
+                            ("a surplus closer", "---\npermissions: {a: 1}}\n---\n"), ("junk after a quoted value", '---\nmode: "x" y\n---\n'),
+                            ("a plain value with a colon and a space", "---\ndescription: a: b\n---\n"), ("a nested sequence on one line", "---\npermissions:\n  - - a\n---\n"),
+                            ("a Unicode line break", "---\ndescription: x\u2028mode: y\n---\n")):
+            self.assertIsNone(f.permission_block(text, keys), label)
+        self.assertEqual(f.permission_block("---\ndescription: \"say *\"\nnote: a!b\npermissions:\n  - {action: shell, resource: \"gh * view *\", effect: allow}\n---\n", keys),
+                         {"permissions": ["permissions:", '  - {action: shell, resource: "gh * view *", effect: allow}']}, "quoted globs are not indirection")
+        self.assertEqual(f.permission_block("---\ndescription: the Chief of Staff's helper, it's fine\nmode: x # a comment with ' in it\n---\n", keys), {"mode": ["mode: x # a comment with ' in it"]},
+                         "an apostrophe inside a plain scalar or a comment is not a quote")
+        self.assertEqual(f.permission_block("---\npermissions:\n  - {action: read, resource: 'it''s', effect: allow}\n---\n", keys)["permissions"][1].count("it''s"), 1)
+        self.assertEqual(f.permission_block('---\ndescription: "say \\"x\\" # not a comment"  # a comment\nmode: "x\\""\n---\n', keys), {"mode": ['mode: "x\\""']},
+                         "an escaped quote and a # inside quotes are read as they are")
+        self.assertEqual(f.permission_block("---\ndescription: [a, b] # closed, then a comment\nmode: x\n---\n", keys), {"mode": ["mode: x"]})
+        self.assertNotEqual(f.permission_block("---\npermissions:\n  # keep\n  - x\n---\n", keys), f.permission_block("---\npermissions:\n  # kept\n  - x\n---\n", keys),
+                            "a # line inside a tracked block is content")
 
 
 class TestImpactHold(LedgerBase):
@@ -30218,6 +30900,123 @@ class TestLaunchIntoARepo(TwoRepoCase):
         code, _, err = self.launch("--repo", "other/tool")
         self.assertEqual(code, 0, err)
         self.assertNotIn("GH_TOKEN", self.opened()[0]["root"]["env"])
+
+
+class TestLaunchRepoFromOrigin(TwoRepoCase):
+    """#473 slice 1: a launch with no --repo reads the working directory's origin ONCE, in the launcher, and records the repository; nothing else does."""
+
+    SECRET = "ghp_SECRETtoken0123456789"
+
+    def work(self, *urls, init=True, name="checkout"):
+        work = self.home / name
+        work.mkdir(exist_ok=True)
+        if init:
+            subprocess.run(["git", "init", "-q", str(work)], check=True, capture_output=True)
+            for url in urls:
+                subprocess.run(["git", "-C", str(work), "config", "--local", "--add", "remote.origin.url", url], check=True, capture_output=True)
+        return work
+
+    def launch(self, work, *extra, name="web-new"):
+        return self.main("launch", name, "--agent", "coder", "--dir", str(work), "--workspace", "w1", "--role", "coder", *extra)
+
+    def recorded(self, out):
+        return self.world.v2.sessions[json.loads(out)["session"]]["metadata"]["fleet"].get("repo")
+
+    def test_s1_an_origin_on_github_is_recorded_lower_case_and_the_output_names_it_in_every_accepted_form(self):
+        for n, url in enumerate(("https://github.com/ACME/Web.git", "https://github.com/acme/web", "git@github.com:Acme/Web.git", "git@github.com:acme/web")):
+            with self.subTest(url=url):
+                code, out, err = self.launch(self.work(url, name="co%d" % n), name="web-%d" % n)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.recorded(out), ACME_WEB)
+                self.assertIn("repository: acme/web (from origin)", err)
+                self.assertNotIn("github.com", err, "the url is never printed, only owner/name")
+        events = [e for e in self.world.audit() if e["event"] == "launch.repo_from_origin"]
+        self.assertEqual([e["detail"] for e in events], [{"repo": ACME_WEB}] * 4)
+        first = [p for m, p in self.world.herdr.socket_calls if m == "layout.apply"][0]
+        self.assertEqual(first["root"]["env"]["GH_TOKEN"], FAKE_TOKENS["acme-ci"], "the recorded repository is the account the worker is pinned to")
+
+    def test_s2_no_origin_a_path_another_host_and_every_odd_form_record_no_repository_and_say_what_it_means(self):
+        bad = {"no origin": None, "a local path": "/srv/git/web.git", "a relative path": "../web.git", "a file url": "file:///srv/git/web.git",
+               "another host": "https://gitlab.com/acme/web.git", "a look-alike host": "https://github.com.evil.example/acme/web.git",
+               "http": "http://github.com/acme/web.git", "an ssh url": "ssh://git@github.com/acme/web.git", "another ssh user": "other@github.com:acme/web.git",
+               "a trailing slash": "https://github.com/acme/web/", "a path below": "https://github.com/acme/web/tree/main", "a query": "https://github.com/acme/web.git?x=1",
+               "dot dot": "https://github.com/acme/..", "a double suffix": "https://github.com/acme/web.git.git", "no name": "https://github.com/acme/",
+               "an alias": "gh:acme/web", "a space": "https://github.com/acme/we b.git", "a newline in it": "https://github.com/acme/web.git\nx"}
+        for n, (label, url) in enumerate(bad.items()):
+            with self.subTest(label):
+                work = self.work(*( [url] if url else [] ), name="bad%d" % n)
+                code, out, err = self.launch(work, name="bad-%d" % n)
+                self.assertEqual(code, 0, err)
+                self.assertIsNone(self.recorded(out), label)
+                self.assertIn("no repository recorded (", err)
+                self.assertIn("pushes will be refused; pass --repo", err)
+                if url:
+                    self.assertNotIn(url.split("\n")[0], err, "the url is never printed")
+        work = self.work(init=False, name="notgit")
+        code, out, err = self.launch(work, name="not-git")
+        self.assertEqual((code, self.recorded(out)), (0, None))
+        self.assertIn("no repository recorded (the directory has no origin remote)", err)
+        two = self.work("https://github.com/acme/web.git", "https://github.com/acme/api.git", name="two")
+        code, out, err = self.launch(two, name="two-urls")
+        self.assertIsNone(self.recorded(out))
+        self.assertIn("origin names more than one url", err)
+
+    def test_s3_an_origin_with_a_user_or_token_in_it_records_nothing_and_leaks_nowhere(self):
+        for n, url in enumerate(("https://%s@github.com/acme/web.git" % self.SECRET, "https://x-access-token:%s@github.com/acme/web.git" % self.SECRET, "https://user:pw@github.com/acme/web.git")):
+            work = self.work(url, name="cred%d" % n)
+            code, out, err = self.launch(work, name="cred-%d" % n)
+            self.assertEqual(code, 0, err)
+            self.assertIsNone(self.recorded(out))
+            audit = (self.world.state / "audit.jsonl").read_text()
+            record = json.dumps(self.world.v2.sessions[json.loads(out)["session"]]["metadata"])
+            for secret in (self.SECRET, "pw@"):
+                for text in (out, err, audit, record):
+                    self.assertNotIn(secret, text)
+
+    def test_s4_an_explicit_repo_wins_and_an_issue_that_names_one_is_never_overridden_and_a_charter_derives_nothing(self):
+        work = self.work("https://github.com/acme/api.git")
+        code, out, err = self.launch(work, "--repo", ACME_WEB)
+        self.assertEqual((code, self.recorded(out)), (0, ACME_WEB), err)
+        self.assertNotIn("from origin", err)
+        code, out, err = self.launch(work, "--issue", "acme/web#2", name="web-two")
+        self.assertEqual((code, self.recorded(out)), (0, ACME_WEB), err)
+        self.assertNotIn("from origin", err)
+        self.assertEqual([e for e in self.world.audit() if e["event"] == "launch.repo_from_origin"], [])
+        reads = []
+        real = subprocess.run
+        with mock.patch.object(subprocess, "run", lambda argv, *a, **k: (reads.append(list(argv)), real(argv, *a, **k))[1]):
+            code, out, err = self.launch(work, "--charter", "1", name="chartered")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("from origin", err, "a charter has its own repo: nothing is read from the directory")
+        self.assertNotIn("no repository recorded", err)
+        self.assertEqual([r for r in reads if "remote.origin.url" in r], [], "no origin read for a charter")
+
+    def test_a_headless_launch_into_a_mapped_origin_is_refused_like_any_mapped_repo(self):
+        work = self.work("https://github.com/acme/web.git")
+        code, out, err = self.main("launch", "hl", "--agent", "coder", "--dir", str(work), "--role", "coder", "--headless")
+        self.assertEqual(code, 1)
+        self.assertIn("a headless worker cannot work as the gh account acme-ci", err)
+        self.assertIn("repository: acme/web (from origin)", err)
+
+    def test_the_directory_is_read_once_by_the_launcher_with_one_argv_and_no_network(self):
+        calls = []
+        real = subprocess.run
+
+        def spy(argv, *a, **k):
+            if argv and argv[0] == "git":
+                calls.append(list(argv))
+            return real(argv, *a, **k)
+
+        work = self.work("https://github.com/acme/web.git")
+        other = self.work("https://github.com/acme/api.git", name="elsewhere")
+        env = {"GIT_DIR": str(other / ".git"), "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "remote.origin.url", "GIT_CONFIG_VALUE_0": "https://github.com/acme/api.git"}
+        with mock.patch.object(subprocess, "run", spy), mock.patch.dict(os.environ, env):
+            code, out, err = self.launch(work)
+        self.assertEqual(self.recorded(out), ACME_WEB, "the launcher's own GIT_DIR and GIT_CONFIG_* never point the read at another repository")
+        self.assertEqual(code, 0, err)
+        origin_reads = [c for c in calls if "remote.origin.url" in c]
+        self.assertEqual(origin_reads, [["git", "-C", str(work), "config", "--local", "--no-includes", "--get-all", "remote.origin.url"]], "one read, argv, local config only, no includes")
+        self.assertEqual([c for c in calls if c[3:4] in (["fetch"], ["ls-remote"], ["remote"])], [])
 
 
 class TestLaunchSetsCheckpointReminders(TwoRepoCase):
@@ -38962,6 +39761,73 @@ class TestCosAnswersOnlyItsOwnTier(BaselineWorld):
         self.assertIn("already yours", again["out"])
 
 
+class TestEscalateANotice(BaselineWorld):
+    """#487: `decisions escalate` on a PR notice never says "already yours": it says it is information, reads the pull request now, and escalates a hold
+    the decisions file has not seen yet."""
+
+    def setUp(self):
+        super().setUp()
+        self.hold = {"name": sb.label_names(self.world.config)["merge-captain"]}
+        self.prs[7] = pr_view_json()
+        got = self.cmd("api-coder", "notice", "pr", "acme/api#7", "look")
+        self.assertEqual(got["code"], 0, got)
+        self.who("cos")
+        _, decisions, _ = sb.fresh_engine_decisions(self.route, self.world.clock.now)   # the notice is listed
+        (found,) = [d for d in decisions if d.get("number") == 7]
+        self.assertEqual(found["kind"], "notice", found)
+        self.pid, self.notice = found["id"], found
+
+    def marks(self):
+        return sorted(sb.read_escalated(self.world.state))
+
+    def test_s1_a_notice_of_a_pull_request_without_a_hold_is_refused_as_information(self):
+        got = self.cmd("cos", "decisions", "escalate", self.pid)
+        self.assertEqual(got["code"], 2, got)
+        self.assertEqual(got["err"].count("notice"), 1, got["err"])
+        self.assertIn("nothing was escalated", got["err"])
+        self.assertNotIn("already yours", got["out"] + got["err"])
+        self.assertEqual((self.marks(), self.writes()), ([], []))
+
+    def test_s2_a_hold_the_file_has_not_seen_is_escalated_for_the_current_head(self):
+        self.prs[7] = pr_view_json(labels=[self.hold], headRefOid=HEAD_A, body="")
+        got = self.cmd("cos", "decisions", "escalate", self.pid, "--reason", "the owner decides")
+        self.assertEqual(got["code"], 0, got)
+        self.assertEqual(self.marks(), ["captain:acme/api#7@%s" % HEAD_A])
+        self.assertIn("escalated", got["out"])
+        self.assertTrue(self.audit_events("decisions.escalate"), "the escalation is audited")
+
+    def test_s3_a_pull_request_that_cannot_be_read_changes_nothing_and_says_so(self):
+        self.prs[7] = None
+        got = self.cmd("cos", "decisions", "escalate", self.pid)
+        self.assertEqual(got["code"], 1, got)
+        self.assertIn("could not be read", got["err"])
+        self.assertNotIn("already yours", got["out"] + got["err"])
+        self.assertEqual((self.marks(), self.writes()), ([], []))
+
+    def test_s4_what_is_already_the_owners_still_says_so_and_changes_nothing(self):
+        self.gh.issue(API, 2, "Yours already", labels=["me:awaiting-user"])
+        self.prs[7] = pr_view_json(labels=[self.hold], headRefOid=HEAD_A, body="")
+        self.assertEqual(self.cmd("cos", "decisions", "escalate", self.pid)["code"], 0)
+        marks, writes = self.marks(), self.writes()
+        self.world.tick(sb.PR_FACTS_TTL + 1)
+        for ident in ("api#2", self.pid):
+            got = self.cmd("cos", "decisions", "escalate", ident)
+            self.assertEqual(got["code"], 0, (ident, got))
+            self.assertIn("already yours", got["out"], ident)
+        self.assertEqual((self.marks(), self.writes()), (marks, writes))
+
+    def test_a_merged_pull_request_and_an_order_notice_are_refused_too(self):
+        self.prs[7] = pr_view_json(state="MERGED", labels=[self.hold], headRefOid=HEAD_A)   # (the command's own derivation no longer lists it: the entry is the one it listed before)
+        self.world.engine.gh_runner = self.route
+        with self.assertRaises(sb.DecisionError) as merged:
+            sb.escalate_decision(self.world.engine, self.route, self.notice, None, "cos")
+        self.assertIn("nothing to escalate", str(merged.exception))
+        order = {"id": "order:1", "kind": "notice", "tier": "human", "repo": "acme/api", "number": 1}
+        with self.assertRaises(sb.DecisionError) as caught:
+            sb.escalate_decision(self.world.engine, None, order, None, "cos")
+        self.assertIn("information only", str(caught.exception))
+
+
 class TestDecisionBaselineWrites(BaselineWorld):
     """escalate, resolve, answer, supersede and batch: what each prints and what it does to the fake gh and fake v2."""
 
@@ -45917,13 +46783,20 @@ class TestHeavySlots(Base):
     def test_s1_four_callers_of_three_slots_queue_and_the_fourth_runs_when_one_frees(self):
         procs = {tag: self.start(*self.waiter(tag), name="who-%s" % tag) for tag in "abcd"[:3]}
         self.assertTrue(self.until(lambda: len(self.started()) == 3))
+        # the three locks are really held now (the kernel's own answer, not a file): the fourth cannot take one, whatever the machine's speed
+        self.assertTrue(self.until(lambda: len(self.hs.holders(self.state(), 3)) == 3), "3 of 3 slots held before the fourth starts")
         fourth = self.start(*self.waiter("d"), name="who-d")
-        err = ""
-        end = time.time() + 90
-        while "waiting for a slot" not in err and time.time() < end:   # the wrapper says so once it is queued (its start-up time varies with the machine)
-            if select.select([fourth.stderr], [], [], 0.2)[0]:
-                err += os.read(fourth.stderr.fileno(), 4096).decode()
-        self.assertIn("waiting for a slot", err, "the fourth wrapper (exit %r) said nothing; started: %s" % (fourth.poll(), self.started()))
+        lines, queued = [], threading.Event()
+
+        def pump():   # event driven: the wrapper's stderr is read as it arrives, so no poll interval or start-up time decides anything
+            for line in fourth.stderr:
+                lines.append(line)
+                if "waiting for a slot" in line:
+                    queued.set()
+        reader = threading.Thread(target=pump, daemon=True)
+        reader.start()
+        self.assertTrue(queued.wait(90), "the fourth wrapper (exit %r) never said it was waiting; holders: %s; started: %s" % (
+            fourth.poll(), self.hs.holders(self.state(), 3), self.started()))
         self.assertEqual(len(self.started()), 3, "at most 3 run at once")
         (self.home / "release.a").write_text("")
         self.assertTrue(self.until(lambda: "started.d" in self.started()), "the fourth runs once a slot is free")
@@ -45931,7 +46804,8 @@ class TestHeavySlots(Base):
             (self.home / ("release." + tag)).write_text("")
         for proc in list(procs.values()) + [fourth]:
             proc.wait(timeout=90)
-        err += fourth.stderr.read()
+        reader.join(timeout=90)
+        err = "".join(lines)
         self.assertIn("heavy: waiting for a slot (3 of 3 busy", err)
         self.assertRegex(err, r"who-[abc] sh")
 
@@ -49517,7 +50391,7 @@ class TestPlanReviewCore(unittest.TestCase):
         tree = ast.parse((BIN / "plan_review.py").read_text())
         imported = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
         imported |= {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
-        self.assertEqual(imported, {"re"}, "no file, network, clock or GitHub access in the pure core")
+        self.assertEqual(imported, {"re", "unicodedata"}, "no file, network, clock or GitHub access in the pure core (unicodedata is a table lookup)")
 
     def test_an_ask_epic_or_cos_ask_is_always_full_and_a_request_only_raises(self):
         for kind in ("ask", "epic", "cos_ask"):
@@ -52856,6 +53730,179 @@ class TestDecisionsStaleBound(unittest.TestCase):
         stale = [line for line in lines if "120 s" in line and ("stale" in line or "Staleness" in line or "not updating" in line or "older than" in line)]
         self.assertEqual(stale, [])
         self.assertGreaterEqual(len([line for line in lines if "180 s" in line and ("stale" in line or "Staleness" in line or "not updating" in line or "older than" in line)]), 4)
+
+
+class TestOwnerHoldRule(unittest.TestCase):
+    """Ask #451, slice 1: the owner's own clear is for credentials, identity and who may do what only. The rule is data in the impact matrix file."""
+
+    def setUp(self):
+        self.floor = sb.load_module("impact_floor")
+        self.matrix = self.floor.load_matrix()
+
+    def decide(self, paths, impacts=(), unknown=None, matrix=None):
+        matrix = matrix or self.matrix
+        globs, exclude, force = self.floor.floor_for("adamkaplan/fleet-kit")
+        hit = self.floor.floor_paths(paths, globs, exclude, force)
+        return self.floor.owner_decide(matrix, paths, list(impacts), unknown, hit)
+
+    def test_s1_the_decision_code_names_no_path_or_class_and_agrees_with_the_file(self):
+        import ast
+        tree = ast.parse((BIN / "impact_floor.py").read_text())
+        docstrings = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.FunctionDef, ast.ClassDef)) and node.body and isinstance(node.body[0], ast.Expr) \
+                    and isinstance(node.body[0].value, ast.Constant):
+                docstrings.add(id(node.body[0].value))
+        constants = {n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str) and id(n) not in docstrings}
+        block = self.matrix["owner_hold"]
+        from_file = set(block["top_tier_classes"]) | set(block["other_classes"]) | {g for globs in block["top_tier_paths"].values() for g in globs}
+        from_file |= {g for entry in block["floor"].values() for key in ("globs", "exclude", "force") for g in entry.get(key, [])}
+        self.assertTrue(from_file)
+        self.assertEqual(sorted(constants & from_file), [], "a path or class of the matrix file is written in the module's code")
+
+    def test_every_top_tier_path_is_inside_the_floor_or_listed_as_outside_it(self):
+        block = self.matrix["owner_hold"]
+        outside = set(block["top_tier_outside_floor"])
+        globs, exclude, force = self.floor.floor_for("adamkaplan/fleet-kit")
+        for cls, patterns in block["top_tier_paths"].items():
+            for pattern in patterns:
+                sample = pattern.replace("**", "x").replace("*", "x")
+                inside = bool(self.floor.floor_paths([sample], globs, exclude, force))
+                self.assertTrue(inside != (pattern in outside), "%s (%s): inside the floor %s, listed as outside it %s" % (pattern, cls, inside, pattern in outside))
+
+    def test_a_missing_or_malformed_block_holds_every_change_and_a_broken_file_is_never_read_as_no_floor(self):
+        for broken in ({}, {"owner_hold": "x"}, {"owner_hold": {"top_tier_classes": ["credentials"], "other_classes": [], "top_tier_paths": {"credentials": "shims/gh"}}},
+                       {"owner_hold": {"top_tier_classes": ["credentials"], "other_classes": [], "top_tier_paths": {}}}):
+            decision, reasons = self.floor.owner_decide(broken, ["docs/notes.md"], [])
+            self.assertEqual(decision, "hold", broken)
+            self.assertIn("missing or malformed", reasons[0])
+        bad = self.home_file("matrix.json", "{not json")
+        with mock.patch.object(self.floor, "MATRIX_PATH", bad):
+            self.floor._MATRIX_CACHE.clear()
+            with self.assertRaises(self.floor.MatrixError):
+                self.floor.floor_for("adamkaplan/fleet-kit")
+        self.floor._MATRIX_CACHE.clear()
+        self.assertTrue(self.floor.floor_for("adamkaplan/fleet-kit")[0], "the real file reads again")
+
+    def test_an_odd_character_in_a_path_never_escapes_a_glob_and_a_suffix_never_makes_an_exact_file_match(self):
+        for path in ("shims/a\nb", "shims/a\tb", "shims/a\x00b", "shims/a b ", "shims/" + "x" * 5000, "agents/x\nz.md", "agents/opencode/\x00x.md",
+                     "plugins/fleet-hooks/a\nb", "SHIMS/A\nB"):
+            self.assertEqual(self.decide([path])[0], "hold", repr(path[:40]))
+            self.assertTrue(self.floor.matches(path, ["shims/**", "agents/**", "plugins/fleet-hooks/**"]), repr(path[:40]))
+        for path in ("bin/plan_ledger.py\nx", "bin/plan_ledger.py\n", "bin/plan_ledger.py ", "bin/plan_ledger.pyx"):
+            self.assertEqual(self.decide([path])[0], "none", "an exact file with a suffix is a different file: %r" % path)
+        self.assertEqual(self.decide(["bin/plan_ledger.py"])[0], "hold")
+        review = sb.load_module("plan_review")
+        self.assertEqual(review.path_hits(["shims/a\nb", "docs/x.md"], ["shims/**"]), ["shims/a\nb"], "the held-path glob of the review tier has the same rule")
+
+    def test_a_variant_spelling_of_a_top_tier_path_is_that_path_and_a_path_that_leaves_the_repository_holds(self):
+        review = sb.load_module("plan_review")
+        for path in ("Shims/GH", "shims//gh", "shims/./gh", "shims/x/../gh", "a/../shims/gh", "shims\\gh", "./shims/gh",
+                     "agents/../AGENTS/opencode/../opencode/chief-of-staff.md", "BIN/Plan_Ledger.py", "bin//plan_ledger.py", "bin\\plan_ledger.py"):
+            self.assertEqual(self.decide([path])[0], "hold", repr(path))
+            self.assertEqual(review.path_hits([path], ["shims/**", "agents/**", "bin/plan_ledger.py"]), [path], "review tier: " + repr(path))
+        for path in ("../x", "../../shims/gh", "a/../../x", "shims/../../x", "/etc/x", "/shims/gh", "~/x", "C:/x", "c:\\\\x"):
+            decision, reasons = self.decide([path])
+            self.assertEqual(decision, "hold", repr(path))
+            self.assertTrue(any("outside the repository" in r for r in reasons), reasons)
+            self.assertEqual(review.path_hits([path], ["docs/**"]), [path], "a path that cannot be read inside the repository is held by the review tier too")
+            self.assertEqual(self.floor.floor_paths([path], ["docs/**"], ["docs/x/**"]), [path])
+        for path in ("docs/notes.md", "docs/./notes.md", "Docs//Notes.md", "docs/a/../b.md"):
+            self.assertEqual(self.decide([path])[0], "none", "a variant of a path outside the top tier stays outside: " + repr(path))
+
+    def test_an_exclude_judges_only_the_named_file_a_force_path_and_the_two_tiers_share_one_normaliser(self):
+        globs, exclude, force = ["shims/**"], ["shims/docs/**"], ["shims/docs/keep.md"]
+        self.assertEqual(self.floor.floor_paths(["shims/docs/../gh"], globs, exclude), ["shims/docs/../gh"], "a spelling never moves a path into an exclude")
+        self.assertEqual(self.floor.floor_paths(["shims/docs/x.md", "Shims//Docs//x.md"], globs, exclude), [], "a real excluded file stays excluded, in any spelling")
+        self.assertEqual(self.floor.floor_paths(["shims/./docs/keep.md", "SHIMS/DOCS/KEEP.MD"], globs, exclude, force), ["SHIMS/DOCS/KEEP.MD", "shims/./docs/keep.md"],
+                         "a force path is never excluded, in any spelling")
+        review = sb.load_module("plan_review")
+        for path in ("Shims/GH", "a/../x", "../x", "shims//./gh", "x\\y", "", "/", "..", "a/b/../../..", "bin\\..\\shims\\gh", "/etc/x", "~/x", "C:/x", "c:\\x", "a//b/./c/../d", "Ünï/../Ünï/x", "x\n/../y", "\u017fhims/gh", "\u212aeep/x", "ﬁle", "e\u0301", "\u00e9", "STRASSE/ß", "İ/i̇"):
+            self.assertEqual(review._canonical(path), self.floor.canonical(path), repr(path))
+            self.assertEqual(review._folds(path), self.floor.folds(path), "the fold copies agree: " + repr(path))
+
+    def test_a_unicode_fold_of_a_top_tier_path_is_that_path_on_a_case_and_normalisation_insensitive_file_system(self):
+        review = sb.load_module("plan_review")
+        for path in ("\u017fhims/gh", "\u017fHIMS/Gh", ".github/wor\u212aflows/ci.yml", "agents/opencode/chi\u0065\u0301f.md", "BIN/PLAN_LEDGER.PY"):
+            self.assertEqual(self.decide([path])[0], "hold", repr(path))
+            self.assertEqual(review.path_hits([path], ["shims/**", ".github/workflows/**", "agents/**", "bin/plan_ledger.py"]), [path], "review tier: " + repr(path))
+        self.assertTrue(self.floor.matches("e\u0301.txt", ["\u00e9.txt"]), "a decomposed accent is the composed one, in a glob too")
+        self.assertTrue(self.floor.matches("\u00e9.txt", ["e\u0301.txt"]))
+        self.assertEqual(self.floor.folds("\ufb01"), {"fi", "\ufb01"}, "a ligature folds to its letters, and its lower-case spelling is kept too")
+        self.assertEqual(self.decide(["docs/\u017fhims.md"])[0], "none", "a fold of a name that matches no top tier glob stays outside")
+
+    def test_the_fold_is_a_superset_of_the_old_lower_case_match(self):
+        self.assertTrue(self.floor.matches("shims/\u00df", ["shims/?"]), "casefold turns a sharp s into ss, but the lower-case spelling is still tried")
+        self.assertIn("\u00df", self.floor.folds("\u00df"))
+        for text in ("SHIMS/Gh", "Agents/X.md", "\u00c9COLE"):
+            self.assertTrue({text.lower()} <= self.floor.folds(text), text)
+
+    def home_file(self, name, text):
+        tmp = Path(tempfile.mkdtemp(prefix="ohr"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = tmp / name
+        path.write_text(text)
+        return path
+
+    def test_a_deleted_path_a_renames_old_path_a_case_variant_and_a_cased_class_are_judged(self):
+        self.assertEqual(self.decide(["docs/new-name.md", "shims/gh"])[0], "hold", "a rename out of a shim arrives as its old path")
+        self.assertEqual(self.decide(["SHIMS/Git"])[0], "hold", "case-insensitive")
+        self.assertEqual(self.decide(["x.py"], [("Critical", "Remote", "AVAILABILITY ")])[0], "second-review", "a class name is compared case-insensitively")
+        self.assertEqual(self.decide(["x.py"], [("Critical", "Remote", "Credentials")])[0], "hold")
+        self.assertEqual(self.decide(["x.py"], [("Marginal", "Remote", "credentials")])[0], "second-review", "a medium-band rating of a top tier class asks for a second review")
+
+    def test_s2_a_change_to_the_shims_the_ledger_a_permission_block_or_the_matrix_holds_for_the_owner(self):
+        for path in ("shims/gh", "shims/git", "bin/plan_ledger.py", "agents/opencode/chief-of-staff.md", "docs/review-laws/impact-matrix.json"):
+            decision, reasons = self.decide([path, "docs/notes.md"])
+            self.assertEqual(decision, "hold", path)
+            self.assertTrue(any(path in reason for reason in reasons), (path, reasons))
+
+    def test_s3_the_launchd_template_the_cloud_image_and_a_docs_file_do_not_hold_for_the_owner(self):
+        paths = ["templates/com.fleet-kit.switchboard.plist", "cloud/launcher/Dockerfile", "docs/switchboard.md"]
+        decision, reasons = self.decide(paths)
+        self.assertEqual(decision, "second-review", reasons)
+        self.assertEqual(reasons, ["floor: 1 path(s) outside the top tier ask for a second independent review"])
+        for path in paths:
+            self.assertNotEqual(self.decide([path])[0], "hold", path)
+
+    def test_s4_only_a_top_tier_or_unknown_class_at_a_hold_level_holds(self):
+        self.assertEqual(self.decide(["x.py"], [("Critical", "Remote", "credentials")])[0], "hold")
+        self.assertEqual(self.decide(["x.py"], [("Critical", "Remote", "a-class-nobody-named")])[0], "hold")
+        decision, reasons = self.decide(["x.py"], [("Critical", "Remote", "availability")])
+        self.assertEqual(decision, "second-review", reasons)
+
+    def test_s5_a_rating_with_no_class_is_top_tier(self):
+        self.assertEqual(self.decide(["x.py"], [("Critical", "Remote", None)])[0], "hold")
+        self.assertEqual(self.decide(["x.py"], [("Negligible", "Improbable", None)])[0], "none", "a low rating asks for nothing, class or not")
+
+    def test_s6_a_diff_that_cannot_be_read_in_full_holds(self):
+        decision, reasons = self.decide([], unknown="the file list was cut off")
+        self.assertEqual(decision, "hold")
+        self.assertIn("floor unknown", reasons[0])
+
+    def test_s7_this_slices_own_files_hold_for_the_owner(self):
+        decision, reasons = self.decide(["bin/impact_floor.py", "docs/review-laws/impact-matrix.json", "bin/test-switchboard"])
+        self.assertEqual(decision, "hold")
+        joined = " ".join(reasons)
+        self.assertIn("bin/impact_floor.py", joined)
+        self.assertIn("docs/review-laws/impact-matrix.json", joined)
+
+    def test_s11_a_change_to_the_files_list_changes_the_decision_with_no_code_change(self):
+        before = self.decide(["tools/new-gate.sh"])
+        edited = json.loads(json.dumps(self.matrix))
+        edited["owner_hold"]["top_tier_paths"]["authority"].append("tools/new-gate.sh")
+        after = self.decide(["tools/new-gate.sh"], matrix=edited)
+        self.assertEqual((before[0], after[0]), ("none", "hold"))
+        edited["owner_hold"]["other_classes"].append("a-class-nobody-named")
+        self.assertEqual(self.decide(["x.py"], [("Critical", "Remote", "a-class-nobody-named")], matrix=edited)[0], "second-review")
+
+    def test_a_matrix_with_no_owner_hold_block_changes_nothing_for_the_old_floor_and_the_old_floor_is_read_from_the_file(self):
+        globs, exclude, force = self.floor.floor_for("adamkaplan/fleet-kit")
+        self.assertIn("shims/**", globs)
+        self.assertIn("bin/impact_floor.py", force)
+        self.assertEqual(self.floor.floor_for("someone/else"), ([], [], []))
+        self.assertIsNone(self.floor.owner_hold_rule({}))
+        self.assertTrue(self.floor.class_is_top_tier({}, "availability"), "no block: everything is top tier (fail closed)")
 
 
 class TestDecisionIdForms(WriteWorld):

@@ -38,6 +38,8 @@ permissions:
   - {action: shell, resource: "fleet-switchboard plan *", effect: allow}
   - {action: shell, resource: "fleet-switchboard labels *", effect: allow}
   - {action: shell, resource: "fleet-switchboard triage *", effect: allow}
+  - {action: shell, resource: "fleet-switchboard move *", effect: allow}
+  - {action: shell, resource: "fleet-switchboard reassign *", effect: allow}
   - {action: shell, resource: "gh * view *", effect: allow}
   - {action: shell, resource: "gh * list *", effect: allow}
   - {action: shell, resource: "gh * status *", effect: allow}
