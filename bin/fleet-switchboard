@@ -18150,10 +18150,15 @@ def _impact_state_noted(engine, problem):
         raise RuntimeError("the corrupt %s could not be set aside (%s): nothing was written" % (IMPACT_STATE_FILE, failed))
 
 
+CARRY_ANSWER_MAX = 8 * 1024 * 1024   # bytes of one GitHub answer the carry will parse; more voids the carry
+
+
 def impact_carry_get(engine, runner, repo):
     """The `get(path)` the carry reads GitHub through: `gh api` GET with the repo's own account, parsed. Raises on any failure (the carry then voids)."""
     def get(path):
         done = _gh_write(engine, runner, repo, path, "GET")
+        if len(done.stdout or "") > CARRY_ANSWER_MAX:
+            raise ValueError("GitHub's answer is over %d bytes" % CARRY_ANSWER_MAX)
         return json.loads(done.stdout or "null")
     return get
 
@@ -18195,8 +18200,8 @@ def _apply_impact_hold_locked(engine, repo, number, report, record, carry=None):
     if cleared.get("head") == head:
         return 0
     carried_before = state.get("carried", {}).get(pr) or {}
-    if carried_before.get("head") == head and cleared.get("head") == carried_before.get("from"):
-        return 0   # carried already for this head
+    if carried_before.get("head") == head and cleared.get("head") == carried_before.get("from") and impact_floor.carry_enabled(engine.config, repo):
+        return 0   # carried already for this head (and the owner has not switched the carry off since)
     if carry is not None and cleared.get("head") == carry["from"]:
         if carry["carried"]:
             state.setdefault("carried", {})[pr] = {"head": head, "from": carry["from"], "fingerprint": carry["fingerprint"], "at": int(engine.now())}
@@ -18333,8 +18338,9 @@ def cmd_impact_clear(args, runner, now):
                 had = state["clears"].pop(pr, None)
                 carried = state.get("carried", {}).pop(pr, None)
                 state.get("carry_void", {}).pop(pr, None)
-                write_impact_state(engine.state_dir, state)
-                engine.audit.append(engine.actor, "gate.clear_revoked", pr, {"by": kind[1], "reason": plan_ledger.clip(redact_command_text(reason), 300),
+                if had is not None or carried is not None:   # nothing to take back: nothing is written
+                    write_impact_state(engine.state_dir, state)
+                    engine.audit.append(engine.actor, "gate.clear_revoked", pr, {"by": kind[1], "reason": plan_ledger.clip(redact_command_text(reason), 300),
                                                                               "cleared_head": (had or {}).get("head"), "carried_head": (carried or {}).get("head")})
         except (ImpactStateBusy, RuntimeError) as err:
             sys.stderr.write("%s: impact clear --revoke: %s; nothing was changed\n" % (PROG, _one_line(str(err), 200)))
@@ -18386,7 +18392,7 @@ def cmd_impact_hold(args, runner, now):
                 continue
             cleared_state = read_impact_state(state)[0]
             cleared = (cleared_state["clears"].get(report["pr"]) or {}).get("head") == report["head"] or \
-                (cleared_state.get("carried", {}).get(report["pr"]) or {}).get("head") == report["head"]
+                ((cleared_state.get("carried", {}).get(report["pr"]) or {}).get("head") == report["head"] and impact_floor.carry_enabled(config, repo))
             missing = [l for l in (names["merge-captain"], names["hold-impact"]) if l not in item["labels"]]
             shown += 1
             print("%s  %s  %s" % (report["pr"], "cleared by the owner for this head: no label" if cleared else
@@ -18682,8 +18688,8 @@ def gates_carried_note(report, ctx):
                 row["detail"] = "not a held PR: the owner's clear of %s carried to this head (only main was merged in; own change %s)" % (
                     str(carried.get("from"))[:8], str(carried.get("fingerprint"))[:19])
         report["carried"] = {"from": carried.get("from"), "head": carried.get("head"), "fingerprint": carried.get("fingerprint")}
-    except Exception:
-        pass
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as err:   # the row then omits "carried": said, never silent
+        report["carried_error"] = _one_line("%s: %s" % (type(err).__name__, err), 160)
 
 
 def enforced_gates_of(ctx):

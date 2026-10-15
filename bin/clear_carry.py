@@ -106,7 +106,7 @@ def own_change_fingerprint(get, repo, number):
 
 
 def commits_between(get, repo, cleared, new):
-    """The commits from `cleared` to `new` as [{"sha", "parents"}], and True when `cleared` is an ancestor of `new`. Void unless every commit is listed."""
+    """The commits from `cleared` to `new` as [{"sha", "parents"}] (the main-side commits a merge brings in included). Void unless `cleared` is an ancestor of `new` and every commit is listed."""
     path = "repos/%s/compare/%s...%s?per_page=%d" % (repo, cleared, new, PAGE)
     first = _object(get, "%s&page=1" % path, "the comparison of the two heads")
     status, total = first.get("status"), first.get("total_commits")

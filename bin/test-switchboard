@@ -12790,7 +12790,25 @@ class TestClearCarry(unittest.TestCase):
         verdict = self.decide(fourth)
         self.assertFalse(verdict["carried"], "a change of its own after a carry makes every later head void")
 
-    def test_a_pure_rename_carries_and_a_renamed_file_that_is_also_edited_does_not_after_an_edit(self):
+    def test_a_pure_merge_whose_own_change_is_not_the_one_cleared_is_void_at_the_last_check_and_each_merge_is_compared_with_the_original(self):
+        g = self.api.git
+        self.main_moves("m1.txt")
+        new = self.merge_main()
+        wrong = "sha256:" + "1" * 64
+        verdict = self.cc.decide(self.api.get, self.REPO, 7, self.cleared, wrong, new)
+        self.assertFalse(verdict["carried"], "the merge chain and the merges are clean: only the fingerprint comparison can refuse this")
+        self.assertIn("is not the one the owner cleared", verdict["reason"])
+        self.assertEqual(verdict["fingerprint"], self.fp, "the verdict carries the fingerprint it computed, for the audit")
+        # drift: a pure merge whose own change differs from the ORIGINAL but equals the PREVIOUS head's is still void
+        self.assertTrue(self.cc.decide(self.api.get, self.REPO, 7, self.cleared, self.fp, new)["carried"])
+        previous_fp = self.fingerprint()
+        self.assertEqual(previous_fp, self.fp)
+        drifted = "sha256:" + "2" * 64            # what a build comparing with an earlier carried head would hold after a small change slipped in
+        self.main_moves("m2.txt")
+        second = self.merge_main()
+        self.assertFalse(self.cc.decide(self.api.get, self.REPO, 7, self.cleared, drifted, second)["carried"])
+
+    def test_a_pure_rename_and_a_renamed_and_edited_file_carry_over_a_merge_and_an_edit_after_the_clear_does_not(self):
         g = self.api.git
         g("checkout", "-q", "-B", "feature", "main")
         g("mv", "src/x.py", "src/y.py")
@@ -12802,6 +12820,23 @@ class TestClearCarry(unittest.TestCase):
         self.main_moves("m1.txt")
         new = self.merge_main()
         self.assertTrue(self.cc.decide(self.api.get, self.REPO, 7, cleared, fp, new)["carried"], "a pure rename's blob id pins its content")
+        # a rename that is also edited carries too (its patch is present and pinned); an edit AFTER the clear does not
+        g("checkout", "-q", "-B", "feature", "main")
+        g("mv", "src/x.py", "src/z.py")
+        self.write("src/z.py", "def x():\n    return 2\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "rename and edit")
+        edited = self.api.rev("feature")
+        edited_fp = self.fingerprint()
+        self.main_moves("m2.txt")
+        merged = self.merge_main()
+        self.assertTrue(self.cc.decide(self.api.get, self.REPO, 7, edited, edited_fp, merged)["carried"])
+        self.write("src/z.py", "def x():\n    return 3\n")
+        g("commit", "-q", "-am", "edit after the clear")
+        self.main_moves("m3.txt")
+        verdict = self.cc.decide(self.api.get, self.REPO, 7, edited, edited_fp, self.merge_main())
+        self.assertFalse(verdict["carried"])
+        self.assertIn("commit of the pull request's own", verdict["reason"])
 
     def test_s8_there_is_one_fingerprint_function_and_the_carry_code_holds_no_path_or_class_literal(self):
         import ast
@@ -12812,8 +12847,8 @@ class TestClearCarry(unittest.TestCase):
         self.assertEqual(sorted(defs), ["clear_fingerprint", "fingerprint_of", "own_change_fingerprint"], "one computation (fingerprint_of), one entry point (own_change_fingerprint) and the clear's wrapper")
         calls = [n for n in ast.walk(ast.parse(main)) if isinstance(n, ast.Call) and getattr(n.func, "attr", None) == "own_change_fingerprint"]
         self.assertEqual(len(calls), 1, "the clear's wrapper is the only caller in the switchboard; the carry's decide calls the same function inside the module")
-        for literal in ("migrations/", "docs/", ".sql", "hold-impact", "merge-captain", "floor_for", "fnmatch", "glob"):
-            self.assertNotIn(literal, text, "the carry holds no path or class literal: %s" % literal)
+        imports = sorted(a.name for n in ast.walk(ast.parse(text)) if isinstance(n, ast.Import) for a in n.names)
+        self.assertEqual(imports, ["hashlib", "json"], "the carry imports no floor, glob or class code: it decides from GitHub's answers alone")
 
 
 class TestClearCarryInTheDaemon(Base):
@@ -12972,6 +13007,34 @@ class TestClearCarryInTheDaemon(Base):
         with mock.patch.object(sb, "gates_caller_kind", return_value=("agent", "cos", "chief-of-staff")):
             code = sb.cmd_impact_clear(types.SimpleNamespace(pr=self.PR, reason="an agent may not take it back", revoke=True), self.route, self.world.clock.now)
         self.assertNotEqual(code, 0)
+
+    def test_a_recorded_carry_stops_counting_when_the_owner_switches_the_carry_off_and_a_state_file_that_never_carried_reads_as_before(self):
+        self.clear()
+        new = self.merge_main()
+        self.assertEqual(self.hold(new), 0)
+        self.assertEqual(sb.read_impact_state(self.world.state)[0]["carried"][self.PR]["head"], new)
+        self.build(carry=None)   # the owner turns the switch off (same state directory, state file kept)
+        sb.write_impact_state(self.world.state, {"clears": {self.PR: {"head": "c" * 40, "reason": "x" * 12, "by": "owner", "at": 1}}, "applied": {},
+                                                 "carried": {self.PR: {"head": new, "from": "c" * 40, "fingerprint": "sha256:" + "0" * 64, "at": 2}}})
+        self.assertGreater(self.hold(new), 0, "a carry on file does not count once the switch is off")
+        plain = Path(self.world.state) / sb.IMPACT_STATE_FILE
+        plain.write_text(json.dumps({"clears": {self.PR: {"head": "d" * 40}}, "applied": {}}))
+        self.assertEqual(sb.read_impact_state(self.world.state)[0], {"clears": {self.PR: {"head": "d" * 40}}, "applied": {}}, "no carried or carry_void key appears out of nowhere")
+        with mock.patch.object(sb, "gates_caller_kind", return_value=("person", "owner")):
+            self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "impact_hold": {"enabled": True}})
+            before = plain.read_text()
+            code = sb.cmd_impact_clear(types.SimpleNamespace(pr="acme-org/other#9", reason="there is nothing to take back here", revoke=True), self.route, self.world.clock.now)
+        self.assertEqual((code, plain.read_text()), (0, before), "a revoke with nothing to take back writes nothing")
+
+    def test_the_gates_command_calls_the_carried_note_and_a_state_error_is_said_not_swallowed(self):
+        import ast
+        main = Path(sb.__file__).read_text()
+        fn = next(n for n in ast.walk(ast.parse(main)) if isinstance(n, ast.FunctionDef) and n.name == "cmd_gates")
+        self.assertIn("gates_carried_note(report, ctx)", ast.get_source_segment(main, fn))
+        report = {"gates": [{"gate": "G6", "status": "ok", "detail": "not a held PR"}], "head": "a" * 40}
+        (Path(self.world.state) / sb.IMPACT_STATE_FILE).write_text(json.dumps({"clears": {}, "applied": {}, "carried": {self.PR: "not an object"}}))
+        sb.gates_carried_note(report, types.SimpleNamespace(state=self.world.state, pr=self.PR))
+        self.assertEqual(report["gates"][0]["detail"], "not a held PR")
 
     def test_a_new_clear_after_a_carry_starts_again_from_its_own_head(self):
         self.clear()
