@@ -6861,6 +6861,19 @@ class TestGithubReceive(Base):
         self.assertEqual(len(failed), 1)
         self.assertIn("disk full", failed[0]["detail"]["error"])
 
+    def test_a_closed_issue_delivery_marks_the_repository_stale_and_a_comment_does_not(self):
+        health = sb.load_fleet_health()
+        self.assertEqual(self.post()[0], 202)                                              # a comment
+        self.assertIsNone(health.stale_since(str(self.rig.world.state), GH_REPO))
+        self.assertEqual(self.post("issues", {"action": "closed", "issue": self.gh.issues[12], "repository": {"full_name": GH_REPO}})[0], 202)
+        self.assertIsNotNone(health.stale_since(str(self.rig.world.state), GH_REPO))
+        self.assertEqual(stat.S_IMODE((self.rig.world.state / health.STALE_MARK_FILE).stat().st_mode), 0o600)
+
+    def test_a_stale_mark_that_cannot_be_written_is_audited_and_the_delivery_still_succeeds(self):
+        with mock.patch.object(sb.load_fleet_health(), "mark_stale", side_effect=OSError("disk full")):
+            self.assertEqual(self.post("issues", {"action": "closed", "issue": self.gh.issues[12], "repository": {"full_name": GH_REPO}})[0], 202)
+        self.assertEqual(len([e for e in self.rig.world.audit() if e["event"] == "load.stale_failed"]), 1)
+
     def test_a_signed_event_is_accepted_and_queued_by_its_object_id(self):
         self.assertEqual(self.post()[0], 202)
         self.assertEqual(self.rig.keys(), ["github.comment:5001"])
@@ -49971,6 +49984,81 @@ class TestLoadAlert(Base):
         run(self.T0)
         run(self.T0 + 3 * 3600)
         return self.latest()["o"]
+
+    def stale_world(self, repo="acme/widget"):
+        """One orchestrator over `repo`; the asks it lists are `self.listed`, and `self.read_count` counts the reads of the list."""
+        self.listed, self.read_count = [1, 2], [0]
+        orch = {"o": {"charter": 1, "repo": repo, "busy": 0, "idle": 1, "messages": 0}}
+        def read_asks(charter, r):
+            self.read_count[0] += 1
+            return [{"repo": repo, "number": n} for n in self.listed]
+        def tick(at, **cfg):
+            return self.health.tick(self.health.Context(now=at, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS, **cfg), orchestrators=orch,
+                                                        read_asks=read_asks, cos="cos", wake=self.woken.append))
+        return tick
+
+    def test_a_closed_reopened_or_labelled_issue_makes_the_list_stale_and_it_is_read_again_within_minutes(self):
+        for action in ("closed", "reopened", "labeled", "unlabeled", "edited", "deleted", "transferred"):
+            shutil.rmtree(str(self.state_dir)); self.state_dir.mkdir(mode=0o700)
+            tick = self.stale_world()
+            tick(self.T0)
+            self.listed = [1]                                                       # ask 2 was closed
+            self.assertTrue(self.health.mark_stale(str(self.state_dir), "issues", {"action": action}, "acme/widget", self.T0 + 400), action)
+            tick(self.T0 + 600)                                                     # 10 minutes after the last read: well inside the hour
+            self.assertEqual((self.read_count[0], self.latest()["o"]["open_asks"]), (2, 1), action)
+
+    def test_a_sub_issue_event_marks_stale_and_other_events_do_not(self):
+        d = str(self.state_dir)
+        self.assertTrue(self.health.mark_stale(d, "sub_issues", {"action": "sub_issue_added"}, "acme/widget", 5))
+        for event, payload in (("issues", {"action": "opened"}), ("issues", {"action": "assigned"}), ("issue_comment", {"action": "created"}), ("push", {}), ("issues", "x")):
+            self.assertFalse(self.health.mark_stale(d, event, payload, "acme/widget", 6), (event, payload))
+        self.assertEqual(self.health.stale_since(d, "acme/widget"), 5)
+
+    def test_a_stale_list_is_read_at_most_once_every_five_minutes(self):
+        tick = self.stale_world()
+        tick(self.T0)
+        self.health.mark_stale(str(self.state_dir), "issues", {"action": "closed"}, "acme/widget", self.T0 + 10)
+        tick(self.T0 + 120)                                                         # 2 minutes after the last read: not yet
+        self.assertEqual(self.read_count[0], 1)
+        tick(self.T0 + 300)
+        self.assertEqual(self.read_count[0], 2)
+        self.health.mark_stale(str(self.state_dir), "issues", {"action": "closed"}, "acme/widget", self.T0 + 310)
+        tick(self.T0 + 400)                                                         # a new mark, but the read was 100 s ago
+        self.assertEqual(self.read_count[0], 2)
+        tick(self.T0 + 600)
+        self.assertEqual(self.read_count[0], 3)
+        tick(self.T0 + 700)                                                         # no new mark: back to the hourly wait
+        self.assertEqual(self.read_count[0], 3)
+
+    def test_a_stale_read_stays_inside_the_account_budget(self):
+        tick = self.stale_world()
+        tick(self.T0, read_budget=2)                                                # the charters read is not wired: only the asks read is spent
+        state = json.loads((self.state_dir / "load.json").read_text())
+        state["reads"] = [[self.T0 + 1, "default"], [self.T0 + 2, "default"]]       # the account has spent its two reads this hour
+        (self.state_dir / "load.json").write_text(json.dumps(state))
+        self.health.mark_stale(str(self.state_dir), "issues", {"action": "closed"}, "acme/widget", self.T0 + 10)
+        tick(self.T0 + 400, read_budget=2)
+        self.assertEqual(self.read_count[0], 1)                                     # no read: the budget is spent, the old list stays
+        tick(self.T0 + 3700, read_budget=2)                                         # the hour's reads have aged out
+        self.assertEqual(self.read_count[0], 2)
+
+    def test_an_event_for_another_repository_leaves_the_list_alone(self):
+        tick = self.stale_world()
+        tick(self.T0)
+        self.health.mark_stale(str(self.state_dir), "issues", {"action": "closed"}, "acme/other", self.T0 + 10)
+        tick(self.T0 + 900)
+        self.assertEqual(self.read_count[0], 1)
+
+    def test_the_hourly_reread_is_still_the_fallback_and_a_garbled_mark_file_is_harmless(self):
+        tick = self.stale_world()
+        tick(self.T0)
+        (self.state_dir / self.health.STALE_MARK_FILE).write_text("not json")
+        tick(self.T0 + 900)
+        self.assertEqual(self.read_count[0], 1)
+        tick(self.T0 + 3600)
+        self.assertEqual(self.read_count[0], 2)
+        self.health.mark_stale(str(self.state_dir), "issues", {"action": "closed"}, "acme/widget", self.T0 + 3700)   # over a garbled file: rewritten
+        self.assertEqual(self.health.stale_since(str(self.state_dir), "acme/widget"), self.T0 + 3700)
 
     def test_an_ask_awaiting_the_owner_is_waiting_not_stalled(self):
         got = self.wait_world({1: {"labels": ["me:awaiting-user"]}})

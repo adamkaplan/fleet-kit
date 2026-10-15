@@ -13532,6 +13532,10 @@ class GitHubHub:
             load_fleet_health().append_moves(self.state_dir, load_fleet_health().move_rows(event, payload, repo, self.now(), closing_numbers))
         except Exception as err:   # the load figure then under-counts movement: say so in the audit, never fail the delivery
             self._audit("load.moves_failed", repo, {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
+        try:   # #470: a closed, relabelled or edited issue, or a changed sub-issue list, makes the cached asks list of this repository stale
+            load_fleet_health().mark_stale(self.state_dir, event, payload, repo, self.now())
+        except Exception as err:
+            self._audit("load.stale_failed", repo, {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
         self.note_pr_event(event, repo, payload)
         self._audit("github.received", repo, {"event": event, "delivery": _header(headers, "X-GitHub-Delivery"),
                                               "keys": [_one_line(item.key, 80) for item in items[:5]], "count": len(items)})   # ids, not bodies: the first few of them
