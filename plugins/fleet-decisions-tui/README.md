@@ -21,7 +21,7 @@ one line, then its whole title word-wrapped to 34 characters on the lines below.
   blocks OSC 52 gets the toast with the link). Still no process, no network.
 - It reads `decisions.json`, which the switchboard daemon rewrites when the list
   changes and touches on every pass. It never derives anything itself.
-- An empty list shows a row `none`. A file that is missing, unreadable, older than 120 s,
+- An empty list shows a row `none`. A file that is missing, unreadable, older than 180 s,
   or a plugin that cannot tell where the state directory is shows `daemon not updating`. The
   section is never absent.
 - It watches the **directory** of the file (the daemon replaces it by rename) with

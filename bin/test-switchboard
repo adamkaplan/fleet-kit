@@ -36580,11 +36580,11 @@ class TestDecisionBaselineViews(BaselineWorld):
         self.daemon_pass()
         out["empty, you"] = self.cmd("you", "decisions")
         out["empty, cos"] = self.cmd("cos", "decisions")
-        self.world.tick(121)
+        self.world.tick(sb.DECISIONS_STALE_SECONDS + 1)
         out["stale"] = self.cmd("you", "decisions")
         out["stale, json"] = self.cmd("you", "decisions", "--json")
         self.world.clock.t -= 1
-        out["the stale bound is the edge"] = self.cmd("you", "decisions")
+        out["two minutes is the edge"] = self.cmd("you", "decisions")
         (self.world.state / sb.DECISIONS_FILE).write_text("{not json")
         out["not json"] = self.cmd("you", "decisions")
         for value in out.values():
@@ -49248,8 +49248,10 @@ class TestDecisionsStaleBound(unittest.TestCase):
     def test_s1_the_daemon_and_plugin_bounds_are_180_seconds(self):
         self.assertEqual(sb.DECISIONS_STALE_SECONDS, 180)
         self.assertIn("export const STALE_MS = 180_000", (DECISIONS_PLUGIN / "decisions.mjs").read_text())
+        self.assertIn("export const DECISIONS_STALE_MS = 180_000", (DECISIONS_PLUGIN / "health.mjs").read_text(), "the health view's copy of the bound")
 
     def test_s3_the_docs_no_longer_say_120_s_for_the_decisions_staleness(self):
+        self.assertNotIn("older than 120 s", (DECISIONS_PLUGIN / "README.md").read_text())
         lines = (REPO / "docs" / "switchboard.md").read_text().splitlines()
         stale = [line for line in lines if "120 s" in line and ("stale" in line or "Staleness" in line or "not updating" in line or "older than" in line)]
         self.assertEqual(stale, [])
