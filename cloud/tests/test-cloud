@@ -41,7 +41,7 @@ case "$1 $2" in
     exit 0 ;;
   "timeout 10")
     [ "${CTR_DOWN:-0}" = 1 ] && exit 1
-    [ "${SLOW_PROBE:-0}" = 1 ] && [ "$(grep -c 'systemctl restart containerd' "$TMP_LOG")" = 1 ] && { sleep 1; exit 1; }
+    [ "${SLOW_PROBE:-0}" -gt 0 ] && [ "$(grep -c 'systemctl restart containerd' "$TMP_LOG")" = 1 ] && { sleep "$SLOW_PROBE"; exit 1; }
     # ctr version: fails while DOWN_UNTIL probes have not yet been made after a restart (DOWN_UNTIL=999: never answers)
     if [ "$(grep -c 'systemctl restart containerd' "$TMP_LOG")" = 1 ]; then
       [ "$(grep -c 'ctr version' "$TMP_LOG")" -le "${DOWN_UNTIL:-0}" ] && exit 1
@@ -228,7 +228,8 @@ for sig in TERM INT; do
   TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/host" LABEL_CMD="$tmp/label" READY_CMD="$tmp/ready" ONCE=1 DOWN_UNTIL=999 WAIT=30 POLL=1 \
     sh -c 'trap - INT; exec sh "$0"' "$tmp/fix.sh" >"$tmp/out" 2>"$tmp/err" &
   pid=$!; i=0
-  while ! grep -q 'ctr version' "$tmp/log" && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  while ! grep -q 'ctr version' "$tmp/log" && [ $i -lt 200 ]; do sleep 0.1; i=$((i + 1)); done
+  [ $i -lt 200 ] || { bad "fix: SIG$sig test: the first probe never started"; kill -9 $pid; }
   kill -$sig $pid; wait $pid; rc=$?
   [ $rc != 0 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && [ "$(restarts)" = 2 ] && ! grep -q label "$tmp/log" && [ ! -e "$ip" ] \
     && [ "$(sed -n 's/^count=//p' "$mk")" = 1 ] && grep -q 'rolling back' "$tmp/err" && [ "$(grep -c 'ctr version' "$tmp/log")" -ge 2 ] \
@@ -249,11 +250,12 @@ runfix; rc=$?
 [ $rc = 0 ] && [ "$(restarts)" = 2 ] && grep -q label "$tmp/log" && [ ! -e "$ip" ] && ! grep -q 'grpc.v1.cri' "$tmp/config.toml" \
   && ok "fix: killed run below the cap: recovers, then continues as normal" || bad "fix: recover then continue (rc=$rc)"
 rm -f "$mk" "$ip"
-# (f) the wait is a clock: probes that take 1s each, WAIT=4 POLL=1: ends within WAIT + a probe + POLL (a loop count would take 8s)
+# (f) the wait is a clock: probes that take 2s each, WAIT=4 POLL=1: the script ends in about 5s (bound WAIT + probe + POLL = 7s); a loop count would take 12s.
+# The test bound is deliberately coarse (under 10s) so a loaded machine or whole-second rounding cannot fail it, yet the loop-count version still does.
 cp "$fx" "$tmp/config.toml"; : > "$tmp/log"; t0=$(date +%s)
-TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/host" LABEL_CMD="$tmp/label" READY_CMD="$tmp/ready" ONCE=1 SLOW_PROBE=1 WAIT=4 POLL=1 sh "$tmp/fix.sh" >/dev/null 2>&1; rc=$?
+TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/host" LABEL_CMD="$tmp/label" READY_CMD="$tmp/ready" ONCE=1 SLOW_PROBE=2 WAIT=4 POLL=1 sh "$tmp/fix.sh" >/dev/null 2>&1; rc=$?
 el=$(( $(date +%s) - t0 ))
-[ $rc = 1 ] && [ "$el" -le 6 ] && [ "$el" -ge 3 ] && ok "fix: the wait ends by the clock (${el}s for WAIT=4)" || bad "fix: clock (rc=$rc ${el}s)"
+[ $rc = 1 ] && [ "$el" -lt 10 ] && [ "$el" -ge 3 ] && ok "fix: the wait ends by the clock (${el}s for WAIT=4)" || bad "fix: clock (rc=$rc ${el}s)"
 rm -f "$mk" "$ip"; cp "$fx" "$tmp/config.toml"
 # healthy restart (node Ready): one restart, labelled, as before
 printf '#!/bin/sh\nexit 0\n' > "$tmp/ready"; chmod +x "$tmp/ready"
