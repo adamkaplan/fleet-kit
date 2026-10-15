@@ -53350,6 +53350,21 @@ class TestLoadAlert(Base):
             return self.woken[0] + "\n" + "\n".join(self.health.status_lines(str(self.state_dir), 0))
         self.assertEqual(render("orch-a").replace("orch-a", "N"), render("orch-b").replace("orch-b", "N"))
 
+    def test_the_coder_count_leaves_out_retired_and_finished_coders(self):
+        """#549: a workspace read c0/6 with six coders on its books and none busy: only live coders are counted."""
+        (self.state_dir / "retired.json").write_text(json.dumps({"c-retired": {"at": self.T0, "session": "s"}}))
+        (self.state_dir / "last-reports.json").write_text(json.dumps({"c-done": {"state": "done", "at": self.T0}, "c-failed": {"state": "failed", "at": self.T0}}))
+        engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.T0, audit=None, actor="daemon", intents=None,
+                                       config={"load_alert": self.health.validate({"enabled": True}, "x")})
+        coder = lambda name, status: types.SimpleNamespace(name=name, session_id="s", fleet={"role": "coder", "reports_to": "orch"}, status=status)
+        discovery = types.SimpleNamespace(agents={
+            "orch": types.SimpleNamespace(name="orch", session_id="o", fleet={"role": "orchestrator", "charter": 1, "repo": "acme/widget"}, status="idle"),
+            "c-live": coder("c-live", "working"), "c-idle": coder("c-idle", "idle"), "c-retired": coder("c-retired", "idle"),
+            "c-done": coder("c-done", "idle"), "c-failed": coder("c-failed", "idle")})
+        sb.load_tick(engine, discovery)
+        fig = self.latest()["orch"]
+        self.assertEqual((fig["busy"], fig["idle"]), (1, 1))
+
     def test_the_daemon_tick_without_an_ask_repo_wakes_nobody_and_says_so(self):
         self.asks = {1: [1, 2]}
         engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.T0, audit=None, actor="daemon", intents=None,
@@ -54494,6 +54509,26 @@ class TestSpotlightGuard(Base):
         self.assertEqual(self.sg.parse_count("57\n"), 57)
         for odd in ("", "abc\n", "12 files\n", "1\n2x\n"):
             self.assertIsNone(self.sg.parse_count(odd), odd)
+
+
+class TestCoderBooks(Base):
+    """#549: a coder finished (retired, or its final report made) is on the books but not counted among a workspace's coders."""
+
+    def obs(self, name, session="ses_1"):
+        return sb.Observation(name, session, "w1:p1", "idle", {"name": name, "role": "coder", "reports_to": "orch"})
+
+    def test_retired_and_finished_coders_are_not_counted(self):
+        retired = {"gone": {"session": "ses_1", "at": 1}, "reused": {"session": "ses_old", "at": 1}, "anysession": {"at": 1}}
+        last = {"done1": {"state": "done"}, "failed1": {"state": "failed"}, "busy1": {"state": "working"}, "quiet": {"send_to": {"orch": 5}}}
+        finished = lambda name, session="ses_1": sb.coder_finished(self.obs(name, session), retired, last)
+        self.assertTrue(finished("gone"))
+        self.assertTrue(finished("anysession"))
+        self.assertFalse(finished("reused"))      # the name is taken again by a new session
+        self.assertTrue(finished("done1"))
+        self.assertTrue(finished("failed1"))
+        self.assertFalse(finished("busy1"))
+        self.assertFalse(finished("quiet"))
+        self.assertFalse(finished("nobody"))
 
 
 class TestModuleLoader(Base):
