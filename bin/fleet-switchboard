@@ -1219,6 +1219,7 @@ V2_HTTP_OPERATIONS = {   # operation -> (method, path template, path parameters,
     "session.active": ("GET", "/api/session/active", (), ()),
     "session.create": ("POST", "/api/session", (), ()),
     "session.get": ("GET", "/api/session/{sessionID}", ("sessionID",), ()),
+    "session.remove": ("DELETE", "/api/session/{sessionID}", ("sessionID",), ()),
     "session.list": ("GET", "/api/session", (), ("limit", "order", "search", "parentID", "directory", "project", "subpath", "cursor")),
     "session.message.list": ("GET", "/api/session/{sessionID}/message", ("sessionID",), ("limit", "order", "cursor", "type")),
     "session.inbox.list": ("GET", "/api/session/{sessionID}/inbox", ("sessionID",), ()),
@@ -1281,6 +1282,17 @@ class V2Http:
         except OSError:
             return True   # not ours to signal, so it exists
         return True
+
+    def base_url(self):
+        """`http://host:port` of the service (never the password), or None when the service file cannot be read."""
+        with self._lock:
+            try:
+                if self._info is None:
+                    self._load()
+                host, port, _ = self._info
+                return "http://%s:%d" % (host if ":" not in host else "[%s]" % host, port)
+            except Exception:
+                return None
 
     def _load(self):
         try:
@@ -1743,6 +1755,10 @@ class V2Client:
         """A page of a transcript is never larger than V2_READ_LIMIT_MAX messages, whatever a caller asks."""
         return min(limit, V2_READ_LIMIT_MAX) if isinstance(limit, int) and not isinstance(limit, bool) else limit
 
+    def service_url(self):
+        """Where the service is, `http://127.0.0.1:<port>`, or None (the CLI transport, or no readable service file)."""
+        return self.http.base_url() if self.http is not None and hasattr(self.http, "base_url") else None
+
     def server_info(self):
         return self._call("server.info")
 
@@ -1760,6 +1776,11 @@ class V2Client:
 
     def session_active(self):
         return self._call("session.active")
+
+    def session_remove(self, session_id):
+        """`session.remove`: delete a session (DELETE /api/session/{sessionID}, an empty answer; 404 SessionNotFoundError when it is gone).
+        Used only to undo a launch that failed after it created its session."""
+        return self._call("session.remove", {"sessionID": session_id})
 
     def message_list(self, session_id, limit=None, order=None, type=None, cursor=None):
         if order is not None and order not in self.ORDERS:
@@ -2998,10 +3019,13 @@ class Observation:
         return self.last_human_prompt is not None and now - self.last_human_prompt < window
 
     def to_json(self):
-        return {"name": self.name, "session": self.session_id, "pane": self.pane, "headless": self.headless, "status": self.status,
-                "fleet": self.fleet, "idle_at": iso(self.idle_at), "outcome": self.outcome,
-                "last_human_prompt": iso(self.last_human_prompt), "problem": self.problem,
-                "wrong_program": self.wrong_program, "conflict": self.conflict}
+        out = {"name": self.name, "session": self.session_id, "pane": self.pane, "status": self.status,
+               "fleet": self.fleet, "idle_at": iso(self.idle_at), "outcome": self.outcome,
+               "last_human_prompt": iso(self.last_human_prompt), "problem": self.problem,
+               "wrong_program": self.wrong_program, "conflict": self.conflict}
+        if self.headless:   # present only for a headless worker: a terminal-only fleet's output is what it always was
+            out["headless"] = True
+        return out
 
 
 class Discovery:
@@ -4037,7 +4061,9 @@ class Switchboard:
             return
         active, down = None, None
         try:
-            active = self.v2.session_active() or {}
+            active = self.v2.session_active()
+            if not isinstance(active, dict):   # a list, a string or null cannot be read: unknown, never idle
+                active, down = None, "session.active answered something unreadable"
         except V2Error as err:
             down = _one_line(str(err), 100)
         for record in records:
@@ -5585,8 +5611,8 @@ def launch_agent_problem(config, runner, agent):
             "(primary agents registered: %s). Install its definition, restart the service, and check it with `fleet-switchboard agents verify`" % (agent, known))
 
 
-def launch_problems(name, agent, directory, workspace, issue, charter=None):
-    """Why these launch arguments cannot be used (empty when they can)."""
+def launch_problems(name, agent, directory, workspace, issue, charter=None, headless=False):
+    """Why these launch arguments cannot be used (empty when they can). A headless worker has no terminal, so it needs no workspace."""
     problems = []
     if not NAME_RE.match(name or ""):
         problems.append("name must match %s (lower case, digits, - and _), got %r" % (NAME_RE.pattern, name))
@@ -5596,7 +5622,7 @@ def launch_problems(name, agent, directory, workspace, issue, charter=None):
         problems.append("--agent is required")
     if not directory or not os.path.isabs(directory) or not os.path.isdir(directory):
         problems.append("--dir must be an absolute path of an existing directory, got %r" % directory)
-    if not workspace:
+    if not workspace and not headless:
         problems.append("no target workspace: pass --workspace or run from a herdr pane")
     if issue is not None and not (isinstance(issue, int) and not isinstance(issue, bool) and issue >= 1):
         problems.append("--issue must be an issue number, got %r" % (issue,))
@@ -5738,21 +5764,141 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
         left = close_own_pane(engine, name, pane, "launch failed: %s" % _one_line(str(err), 120)) if pane \
             else "no pane was opened"
         raise LaunchError("%s (session %s was created; %s)" % (_one_line(str(err)), session_id, left)) from err
-    if engine.state_dir is not None:   # a launch into a linked worktree records it, so retire and a done report can reclaim it later
-        try:
-            found = worktree_of_directory(subprocess.run, directory)
-            if found is not None:
-                done = register_worktree(engine.state_dir, found[0], name, repo, found[1], engine.now())
-                if isinstance(done, str):   # already claimed by another agent: never taken over
-                    engine._note("worktree.error", name, {"error": "the worktree %s is already registered to %s: %s does not claim it and will not reclaim it" % (found[0], done, name)})
-                elif done is True:
-                    if engine.audit is not None:
-                        engine.audit.append(engine.actor, "worktree.registered", name, {"path": found[0], "branch": found[1], "repo": repo, "by": "launch"})
-                else:   # it will not be reclaimed later: say so now
-                    engine._note("worktree.error", name, {"error": "the worktree %s could not be recorded in the registry: it will not be reclaimed automatically" % found[0]})
-        except Exception as err:
-            engine._note("worktree.error", name, {"error": _one_line(str(err), 120)})
+    register_launch_worktree(engine, name, directory, repo)
     return {"name": name, "session": session_id, "pane": pane, "tab": opened["tab_id"]}
+
+
+def register_launch_worktree(engine, name, directory, repo):
+    """A launch into a linked worktree records it, so retire and a done report can reclaim it later. Never raises."""
+    if engine.state_dir is None:
+        return
+    try:
+        found = worktree_of_directory(subprocess.run, directory)
+        if found is not None:
+            done = register_worktree(engine.state_dir, found[0], name, repo, found[1], engine.now())
+            if isinstance(done, str):   # already claimed by another agent: never taken over
+                engine._note("worktree.error", name, {"error": "the worktree %s is already registered to %s: %s does not claim it and will not reclaim it" % (found[0], done, name)})
+            elif done is True:
+                if engine.audit is not None:
+                    engine.audit.append(engine.actor, "worktree.registered", name, {"path": found[0], "branch": found[1], "repo": repo, "by": "launch"})
+            else:   # it will not be reclaimed later: say so now
+                engine._note("worktree.error", name, {"error": "the worktree %s could not be recorded in the registry: it will not be reclaimed automatically" % found[0]})
+    except Exception as err:
+        engine._note("worktree.error", name, {"error": _one_line(str(err), 120)})
+
+
+def launch_headless(engine, name, agent, directory, role=None, reports_to=None, issue=None, brief=None, charter=None, repo=None):
+    """Create a fleet agent with NO terminal (#433): a v2 session in the OpenCode service, a private record (state-dir/headless/<name>.json) and the
+    brief through the API. Nothing is opened in herdr. Presence is proved by the service: the new session must answer and carry the worker's name
+    before the brief is sent. Returns {"name", "session", "pane": None, "tab": None, "headless": True}.
+
+    What differs from a terminal worker, and is said in the docs: its tools run in the SERVICE's environment, not in a pane's. There is no
+    per-worker environment (no GH_TOKEN of its repo's account, no view variables); it is identified by the OPENCODE_SESSION_ID the service sets for
+    its tools, and the gh shim picks its account from the session's stored repo. Only `cmd_launch` calls this, after the lane-name guard, the agent
+    check and the gate probe."""
+    problems = launch_problems(name, agent, directory, None, issue, charter, headless=True)
+    if problems:
+        raise LaunchError("; ".join(problems))
+    if engine.state_dir is None:
+        raise LaunchError("no state directory: a headless worker needs its record")
+    try:
+        with agent_lock(engine.state_dir, name):   # the name check, the session create and the record write are ONE step: two launches of one name cannot both pass
+            taken = engine.discover(engine.now()).agents.get(name)
+            if taken is not None:
+                raise LaunchError("a fleet agent named %s already exists (%s)" % (name, "headless" if taken.headless else "in pane %s" % taken.pane))
+            ap = load_agent_presence()
+            if ap.read_record(engine.state_dir, name)[0] is not None:
+                raise LaunchError("a headless record for %s already exists: `%s retire %s` first, or pick another name" % (name, PROG, name))
+            identity = headless_identity(engine, repo)   # refuses a repo that maps to a named gh account: a headless worker cannot be pinned to it
+            fleet = fleet_record(name, role, reports_to, issue, charter, repo)
+            fleet["headless"] = True
+            with engine._external("v2.session.create", name, {"agent": agent, "directory": directory, "fleet": fleet, "headless": True}) as result:
+                session_id = engine.v2.session_create(agent, name, directory, {"fleet": fleet})["id"]
+                result["session"] = session_id
+            try:
+                ap.save_record(engine.state_dir, name, session_id, engine.v2.service_url(), now=engine.now())
+                info = engine.v2.session_get(session_id) or {}
+                if ((_fleet_meta(info) or {}).get("name")) != name:
+                    raise LaunchError("the service does not show the new session as %s: nothing was sent" % name)
+                if brief:
+                    send_brief(engine, name, session_id, brief)
+                if engine.audit is not None:
+                    engine.audit.append(engine.actor, "headless.launched", name, {"session": session_id, "agent": agent, "directory": _one_line(directory, 160), "brief_chars": len(brief or "")})
+            except Exception as err:
+                cleaned = undo_headless_launch(engine, ap, name, session_id)
+                raise LaunchError("%s (%s)" % (_one_line(str(err)), cleaned)) from err
+    except ImpactStateBusy:
+        raise LaunchError("another launch or reattach of %s is running: wait for it" % name) from None
+    register_launch_worktree(engine, name, directory, repo)
+    return {"name": name, "session": session_id, "pane": None, "tab": None, "headless": True, "identity": identity}
+
+
+def headless_identity(engine, repo):
+    """The identity a headless worker will have, as one line; refuses (LaunchError) when it would be the WRONG one.
+
+    A terminal worker is pinned to its repo's gh account by its pane's environment (GH_TOKEN). A headless worker's tools run in the OpenCode service,
+    and nothing durable pins them: `session.create` and `session.prompt` carry no environment, and `PUT /api/session/{id}/environment`, which does
+    set one, is held in the service's memory and is gone after a service restart (measured in a throwaway profile: the variable was set, then empty
+    after `service restart`), at which point the worker would silently act as the service's default account. So a repo that `gh_users` maps to a
+    named account is refused: use a terminal launch. Any other worker acts as the account of the service's environment, and says so."""
+    accounts = getattr(engine, "accounts", None)
+    if repo and accounts is None:   # fail closed: with no account map nothing says which account this repo uses
+        raise LaunchError("cannot tell which gh account %s uses (no account map): a headless worker is refused" % repo)
+    if repo:
+        account = accounts.account_for(repo)
+        if account:
+            raise LaunchError("a headless worker cannot work as the gh account %s that gh_users maps %s to: its tools run in the OpenCode service's environment, "
+                              "which cannot be pinned to an account (a service restart drops any per-session setting), so it would act as the service's own "
+                              "default account. Use a terminal launch (omit --headless)" % (account, repo))
+        problem = launch_account_problem(engine.config, accounts, repo)
+        if problem:
+            raise LaunchError(problem)
+        return "this headless worker acts as the OpenCode service environment's own gh account (gh_users has no entry for %s)" % repo
+    return "this headless worker acts as the OpenCode service environment's own gh account (it has no repo)"
+
+
+def undo_headless_launch(engine, ap, name, session_id):
+    """Best effort after a headless launch failed past `session.create`: stop whatever the brief started, delete the session, then remove the record.
+    Returns one sentence saying exactly what was cleaned and what remains. The record is removed only when the session is gone: a session that is
+    still there keeps its record, so `status` shows it and it is not invisible."""
+    done, left = [], []
+    interrupted = True
+    try:
+        engine.v2.interrupt(session_id)
+    except Exception:
+        interrupted = False   # best effort: the session is about to be deleted; said below if it could not be
+    try:
+        engine.v2.session_remove(session_id)
+        done.append("session %s was deleted" % session_id)
+        gone = True
+    except V2Error as err:
+        gone = err.reason == "http" and err.status == 404   # already gone is as good as deleted
+        (done if gone else left).append("session %s was already gone" % session_id if gone else
+                                         "session %s could NOT be deleted (%s): delete it in the OpenCode service" % (session_id, _one_line(str(err), 80)))
+    except Exception as err:
+        gone = False
+        left.append("session %s could NOT be deleted (%s): delete it in the OpenCode service" % (session_id, _one_line(str(err), 80)))
+    if gone:
+        try:
+            if ap.remove_record(engine.state_dir, name):
+                done.append("its record was removed")
+        except Exception as err:
+            left.append("its record could NOT be removed (%s): `%s retire %s` clears it" % (_one_line(str(err), 80), PROG, name))
+    if not gone and not interrupted:
+        left.append("it could not be interrupted, so what the brief started may still be running")
+    if not gone:
+        try:
+            has_record = ap.read_record(engine.state_dir, name)[0] is not None
+        except Exception:
+            has_record = False
+        left.append("its record was kept so `%s status` shows it: `%s retire %s` stops watching it" % (PROG, PROG, name) if has_record
+                    else "it has no record, so nothing shows it")
+    try:
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "headless.launch_undone", name, {"session": session_id, "cleaned": done, "remains": left})
+    except Exception:
+        pass   # the sentence below is the report; a failing audit sink must not hide it
+    return "launch failed; " + "; ".join(done + left if (done or left) else ["nothing was created"])
 
 
 def resume_agent(engine, name, session_id, workspace, patience=LAUNCH_PATIENCE, sleep=time.sleep, replace=False):
@@ -6433,6 +6579,52 @@ def retire_close_pane(engine, runner, now, name, pane, caller, force):
     return "closed pane %s (the agent's terminal: its memory is released)" % pane, True
 
 
+def headless_record_to_free(state, name):
+    """What `retire` keeps of a headless worker's record ({"session", "url", "created"}), or None when it has none. Reads only."""
+    try:
+        record = load_agent_presence().read_record(state, name)[0]
+    except Exception:
+        return None
+    if record is None:
+        return None
+    return {"session": record["session"], "url": record.get("url"), "created": record.get("created")}
+
+
+def free_headless_record(engine, state, name):
+    """Remove the record of a retired headless worker so the NAME is free to launch again (its details are kept in the retirement for `retire --undo`).
+    One line. The session itself keeps running in the service: only the switchboard stops watching it."""
+    try:
+        with agent_lock(state, name):   # the same per-name lock a launch holds for its check and its record write
+            load_agent_presence().remove_record(state, name)
+    except Exception as err:
+        return "%s: its headless record could NOT be removed (%s): the name stays taken until it is" % (name, _one_line(str(err), 100))
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, "headless.record_freed", name, {"why": "retired"})
+    return "%s: its headless record was removed, so the name is free (`%s retire --undo %s` puts it back)" % (name, PROG, name)
+
+
+def restore_headless_record(engine, state, name, entry):
+    """`retire --undo` of a headless worker: put its record back when the name is still free. (line or None, ok): ok is False only when the record
+    could not be put back (busy, or a write error): the retirement then stays so the undo can be tried again. A name that is taken again is not an
+    error: the old record is simply not restored, and the line says so."""
+    kept = entry.get("headless") if isinstance(entry, dict) else None
+    if not isinstance(kept, dict) or not isinstance(kept.get("session"), str):
+        return None, True
+    ap = load_agent_presence()
+    try:
+        with agent_lock(state, name):   # the per-name lock of a launch: the check and the write are ONE step, judged on a fresh discovery
+            if ap.read_record(state, name)[0] is not None or name in engine.discover(engine.now()).agents:
+                return "%s: a worker named %s exists again, so its old headless record was NOT restored" % (name, name), True
+            ap.save_record(state, name, kept["session"], kept.get("url"), now=kept.get("created"))
+    except ImpactStateBusy:
+        return "%s: a launch of %s is running, so its old headless record was NOT restored" % (name, name), False
+    except Exception as err:
+        return "%s: its headless record could NOT be restored (%s)" % (name, _one_line(str(err), 100)), False
+    if engine.audit is not None:
+        engine.audit.append(engine.actor, "headless.record_restored", name, {"session": kept["session"]})
+    return "%s: its headless record was restored: it is watched again" % name, True
+
+
 def cmd_retire(args, runner, now):
     """`retire <name> [--reason TEXT]` / `retire --undo <name>`: a finished worker is RETIRED: the daemon stops reporting it DEAD or DETACHED, `reattach
     --all-detached` skips it, and it is shown once in `status` as retired (dropped after RETIRED_SHOW_DAYS). Nothing is deleted and no tab is closed, unless
@@ -6443,7 +6635,8 @@ def cmd_retire(args, runner, now):
     if not NAME_RE.match(name or ""):
         raise LaunchError("name the agent: `%s retire <name>`" % PROG)
     discovery = engine.discover(engine.now())
-    who = reattach_caller_problem(engine, runner, now, discovery, name)
+    hint = ((read_retired(state).get(name) or {}).get("session") if args.undo else None)   # a retired headless worker is not discovered: its boss is found from its stored session
+    who = reattach_caller_problem(engine, runner, now, discovery, name, hint)
     if who:
         if engine.audit is not None:
             engine.audit.append(engine.actor, "fleetpane.retire_refused", name, {"why": _one_line(who, 160)})
@@ -6451,8 +6644,10 @@ def cmd_retire(args, runner, now):
     reason = " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", args.reason or "").split())[:200]
     seen = discovery.agents.get(name)
     known = read_pane_health(state)["agents"].get(name) or {}
-    close_pane, close_by = None, None
-    if getattr(args, "close", False) and not args.undo:
+    close_pane, close_by, close_note, headless_kept = None, None, None, None
+    if getattr(args, "close", False) and not args.undo and seen is not None and seen.headless:
+        close_note = "headless: it has no terminal, so there is nothing to close"
+    elif getattr(args, "close", False) and not args.undo:
         close_pane, why = retire_close_problem(engine, runner, now, discovery, name, seen, getattr(args, "force", False))
         close_by = identify_who(engine, runner, now)
         if why:
@@ -6460,14 +6655,19 @@ def cmd_retire(args, runner, now):
                 engine.audit.append(engine.actor, "fleetpane.close_refused", name, {"pane": seen.pane if seen is not None else None, "by": close_by, "why": _one_line(why, 160)})
             raise LaunchError("refused: %s (nothing was retired or closed)" % why)
     with agent_lock(state, "files"):
-        who = reattach_caller_problem(engine, runner, now, discovery, name)   # judged again inside the lock: check and write are one step
+        who = reattach_caller_problem(engine, runner, now, discovery, name, hint)   # judged again inside the lock: check and write are one step
         if who:
             raise LaunchError("refused: %s" % who)
         retired = read_retired(state)
         if args.undo:
-            if retired.pop(name, None) is None:
+            entry = retired.get(name)
+            if entry is None:
                 print("%s is not retired" % name)
                 return EXIT_OK
+            restored, restore_ok = restore_headless_record(engine, state, name, entry)   # FIRST: a record that cannot be put back leaves the retirement as it is, to try again
+            if not restore_ok:
+                raise LaunchError("%s: nothing was changed, the retirement stays (try `%s retire --undo %s` again)" % (restored, PROG, name))
+            retired.pop(name, None)
             try:
                 _write_small(state, RETIRED_FILE, retired)
             except OSError as err:
@@ -6482,12 +6682,17 @@ def cmd_retire(args, runner, now):
             if engine.audit is not None:
                 engine.audit.append(engine.actor, "fleetpane.unretired", name, {})
             print("%s is no longer retired: detection watches it again" % name)
+            if restored:
+                print(restored)
             return EXIT_OK
         if seen is None and not known:
             raise LaunchError("%s is not a fleet agent this switchboard has seen (see `%s status`)" % (name, PROG))
         prune_retired(retired, now())
         retired[name] = {"at": int(now()), "by": identify_who(engine, runner, now), "reason": reason or "finished",
                          "session": (seen.session_id if seen else None) or known.get("session"), "auto": False}
+        headless_kept = headless_record_to_free(state, name)
+        if headless_kept is not None:
+            retired[name]["headless"] = headless_kept   # kept here so `retire --undo` can put the record back
         try:
             _write_small(state, RETIRED_FILE, retired)
         except OSError as err:
@@ -6500,7 +6705,11 @@ def cmd_retire(args, runner, now):
         pass
     if engine.audit is not None:
         engine.audit.append(engine.actor, "fleetpane.retired", name, {"auto": False, "reason": retired[name]["reason"], "by": retired[name]["by"]})
-    if close_pane is not None:
+    if headless_kept is not None:
+        print(free_headless_record(engine, state, name))
+    if close_note is not None:
+        print("%s is retired: not watched, not reattached by --all-detached; %s. Its session keeps running in the service until it finishes or is interrupted (`%s retire --undo %s` reverses the retirement)" % (name, close_note, PROG, name))
+    elif close_pane is not None:
         line, _ = retire_close_pane(engine, runner, now, name, close_pane, close_by, getattr(args, "force", False))
         print("%s is retired: not watched, not reattached by --all-detached; %s (`%s retire --undo %s` reverses the retirement)" % (name, line, PROG, name))
     else:
@@ -12569,6 +12778,12 @@ def _validate_github(config, source):
             for k, v in users.items()):
         raise ConfigError("%s: 'gh_users' must map \"owner/repo\" or \"owner/*\" to a gh account name, got %r"
                           % (source, users))
+    seen_keys = {}
+    for key, account in users.items():
+        same = GhAccounts.normal_repo(key)
+        if same in seen_keys and seen_keys[same][1].lower() != account.lower():   # GitHub names are not case sensitive: two spellings of one repo may not name two accounts
+            raise ConfigError("%s: 'gh_users' names %r and %r, the same repo, with different accounts (%s, %s)" % (source, seen_keys[same][0], key, seen_keys[same][1], account))
+        seen_keys.setdefault(same, (key, account))
     config["gh_users"] = dict(users)
     poll = config["github_poll_seconds"]
     if not _is_number(poll) or poll < GITHUB_POLL_MIN:
@@ -14824,6 +15039,8 @@ def cmd_launch(args, runner, now, socket_call=None):
         return EXIT_OK
     if not args.agent or not args.dir:
         raise LaunchError("--agent and --dir are required (or --resume SESSION for an existing agent)")
+    if getattr(args, "headless", False) and (args.workspace or args.new_workspace):
+        raise LaunchError("--headless opens no terminal, so it takes no --workspace or --new-workspace (`%s watch NAME` opens one later)" % PROG)
     if (args.name or "").startswith(LANE_NAME_PREFIX):
         raise LaunchError("names starting %r are the plan review engine's reviewer lanes: only it launches them" % LANE_NAME_PREFIX)
     repo = launch_repo(args)
@@ -14850,13 +15067,19 @@ def cmd_launch(args, runner, now, socket_call=None):
             created = workspace = result["workspace"] = engine.herdr.workspace_create(
                 args.dir, args.new_workspace, focus=False)["workspace_id"]
     try:
-        done = launch_agent(engine, args.name, args.agent, args.dir, workspace, args.role, args.reports_to,
-                            None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo)
+        if getattr(args, "headless", False):
+            done = launch_headless(engine, args.name, args.agent, args.dir, args.role, args.reports_to,
+                                   None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo)
+        else:
+            done = launch_agent(engine, args.name, args.agent, args.dir, workspace, args.role, args.reports_to,
+                                None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo)
     except LaunchError as err:
         if created:
             raise LaunchError("%s (workspace %s was created and is left for you to close)" % (err, created)) from err
         raise
     print(json.dumps(done, sort_keys=True))
+    if done.get("identity"):
+        sys.stderr.write("%s: %s\n" % (PROG, done["identity"]))
     boss = args.reports_to
     if boss is None and (brief or getattr(args, "checkpoint", None) or getattr(args, "overdue", None)):
         try:  # a launch with no --reports-to: the launching agent is who an overdue checkpoint should wake (the worker's metadata is unchanged)
@@ -15449,13 +15672,27 @@ class GhAccounts:
         self.audit, self.actor = None, "daemon"
         self.conditional = False                 # ask with `-i` and keep the ETag: the daemon turns it on; a one-shot command or a test reads plainly
 
+    @staticmethod
+    def normal_repo(repo):
+        """`owner/name` the way GitHub treats it: whitespace and a trailing `.git` or `/` off, lower case (GitHub names are not case sensitive). None when
+        it is not a string. Used for the repo and for every `gh_users` key, so a different spelling of a mapped repo is still the mapped repo."""
+        if not isinstance(repo, str):
+            return None
+        text = repo.strip().rstrip("/")
+        if text.lower().endswith(".git"):
+            text = text[:-4]
+        return text.lower()
+
     def account_for(self, repo):
         if fault("one-account"):
             return None  # the fault: the default token reads every repo
-        users = self.config.get("gh_users") or {}
-        if repo in users:
-            return users[repo]
-        return users.get("%s/*" % repo.split("/")[0]) if isinstance(repo, str) and "/" in repo else None
+        want = self.normal_repo(repo)
+        if not want:
+            return None
+        users = {self.normal_repo(key): account for key, account in (self.config.get("gh_users") or {}).items() if isinstance(key, str)}
+        if want in users:
+            return users[want]
+        return users.get("%s/*" % want.split("/")[0]) if "/" in want else None
 
     def default_available(self):
         return any(self.environ.get(name) for name in ("GH_TOKEN", "GITHUB_TOKEN"))
@@ -23080,6 +23317,8 @@ def build_parser():
     launch.add_argument("--dir", help="The agent's working directory (absolute)")
     launch.add_argument("--resume", metavar="SESSION", help="Open a tab on this existing session of NAME instead "
                                                            "of creating one (a restart that keeps the conversation)")
+    launch.add_argument("--headless", action="store_true", help="Start the worker with NO terminal: a session in the OpenCode service, the brief sent through "
+                        "the API (about 2 MB instead of a terminal's 200 to 400 MB). Its tools run in the service's environment; opt in")
     launch.add_argument("--workspace", help="The herdr workspace for the new tab (default: $HERDR_WORKSPACE_ID)")
     launch.add_argument("--role", help="metadata.fleet.role")
     launch.add_argument("--reports-to", dest="reports_to", help="metadata.fleet.reports_to")
