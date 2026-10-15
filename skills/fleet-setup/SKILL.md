@@ -146,6 +146,11 @@ the asks are shared out. You decide what to split; this section is only how. The
 person's words are never changed on the way, and the new lane starts with what the old
 one knew.
 
+Two commands below, `fleet-switchboard orders copy` and `fleet-switchboard move`, are
+run by the operator (the person at a shell), or by you once your permission list allows
+them. Until it does, they are the operator's: ask the person to run them, give them the
+exact command, and do not claim the step is done before you have seen its output.
+
 ### Lane step 1 — The workspace and the orchestrator
 
 ```
@@ -191,7 +196,8 @@ PROVES:  The switchboard can tell the new charter from an ask.
 
 ```
 CHECK:   Read the sibling charter's orders: fleet-switchboard orders list --charter <old charter>
-DO:      Copy them word for word from the sibling, with their original dates:
+DO:      Run this (the operator's command, or yours once your permissions allow it).
+         It copies them word for word from the sibling, with their original dates:
            fleet-switchboard orders copy --source <old charter> --charter <new charter>
          The command carries each order exactly as the person gave it and prints what it
          did, one line per order and one summary line. Never retype, shorten or reword an
@@ -219,7 +225,8 @@ PROVES:  Nothing a worker was told, or owes, changed under it.
 
 ```
 CHECK:   The asks to move are named, each open, each under the old charter.
-DO:      One command per ask:
+DO:      One command per ask (the operator's command, or yours once your permissions
+         allow it):
            fleet-switchboard move <ask> --to <new charter>
          It re-parents the ask (never its text), carries the old orchestrator's
          reminders on it to the new one, sends the new orchestrator a handover note and
