@@ -20184,7 +20184,7 @@ def cmd_disk_janitor(args, runner, now):
     with worktree_sweep(engine):   # one session.list for every in-use check of this run
         lines, removed, kept = janitor.run(temp, state, now(), cfg, bool(args.apply),
                                            lambda name, detail: engine.audit.append(engine.actor, "temp.removed", _plain(name, 120), detail),
-                                           busy=janitor_busy_function(engine, runner, janitor))
+                                           busy=janitor_busy_function(engine, runner, janitor), weekly=bool(getattr(args, "weekly", False)))
     for line in lines:
         print(_plain(line, 300))
     print("%s: %d %s, %d kept (%s)" % (PROG, removed, "removed" if args.apply else "would be removed (a dry run: add --apply)", kept, _plain(temp, 160)))
@@ -20328,6 +20328,7 @@ def add_disk_parsers(sub):
                                               "temp_janitor.days (default 7) and that no state file of the fleet names, no keep glob matches and no .fleet-keep marker "
                                               "protects. Never follows a link, never touches another user's entry. Each removal is one temp.removed audit line.")
     janitor.add_argument("--apply", action="store_true", help="Remove them (the default only lists)")
+    janitor.add_argument("--weekly", action="store_true", help="The weekly job: scan under the longer budget temp_janitor.weekly_scan_seconds (default 600 s) instead of scan_seconds (60 s)")
     orphans = disk_sub.add_parser("reap-orphans", allow_abbrev=False, help="Signal (SIGTERM, then SIGKILL) orphaned test helpers past the grace: parent launchd, an exact allow-list; a dry run unless --apply")
     orphans.add_argument("--apply", action="store_true", help="Do it (default: a dry run)")
     reclaim = disk_sub.add_parser("reclaim-worktrees", allow_abbrev=False, help="Remove the registered worktrees of retired agents when clean and pushed; else keep and say why (a dry run unless --apply)")
