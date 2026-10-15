@@ -28574,7 +28574,7 @@ class TestDecisionsFile(DecisionsBase):
         self.pass_()
         body = self.file()
         self.assertEqual(sorted(body), ["daemon_pid", "decisions", "errors", "generation", "written_at"])
-        self.assertEqual((body["generation"], body["daemon_pid"], body["errors"]), (2, os.getpid(), []))   # 1: the early (provisional) write of a first pass; 2: the final list (#467 slice 3)
+        self.assertEqual((body["generation"], body["daemon_pid"], body["errors"]), (1, os.getpid(), []))   # the final list keeps the early list's generation: only the provisional flag changed (#467 slice 3)
         self.assertEqual(body["written_at"], sb.iso(self.world.clock.now()))
         self.assertEqual([d["title"] for d in body["decisions"]], ["Which database?"])
 
@@ -28603,7 +28603,7 @@ class TestDecisionsFile(DecisionsBase):
         self.pass_()
         self.ask_the_boss("Which database?")
         self.pass_()
-        self.assertEqual(self.file()["generation"], 3)   # the first pass wrote twice (the provisional early list, then the final one: #467 slice 3)
+        self.assertEqual(self.file()["generation"], 2)
 
     def test_the_file_is_replaced_by_rename_so_a_reader_never_sees_half_of_it(self):
         self.ask_the_boss("Which database?")

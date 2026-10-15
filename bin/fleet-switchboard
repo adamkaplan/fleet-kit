@@ -9851,7 +9851,8 @@ class LocalStore(decision_core.DecisionStore):
             os.utime(str(path), (now, now))
             return False
         known = current.get("generation") if current is not None else None
-        engine.decisions_generation = max(engine.decisions_generation, known if isinstance(known, int) else 0) + 1
+        same = current is not None and current["decisions"] == decisions and current["errors"] == errors   # only the provisional flag changes: the list is the same generation
+        engine.decisions_generation = max(engine.decisions_generation, known if isinstance(known, int) else 0) + (0 if same and isinstance(known, int) else 1)
         body = {"generation": engine.decisions_generation, "written_at": iso(now), "daemon_pid": os.getpid(),
                 "decisions": decisions, "errors": errors}
         if provisional:
@@ -10457,7 +10458,7 @@ def decisions_report(state_dir, now):
     `stale-as-fresh` fault an old file still counts as current."""
     path = Path(state_dir) / DECISIONS_FILE
     report = {"stale": True, "message": None, "age_seconds": None, "written_at": None, "generation": None,
-              "decisions": [], "errors": [], "provisional": False}
+              "decisions": [], "errors": []}
     try:
         age = now - path.stat().st_mtime
     except OSError:
@@ -10468,7 +10469,9 @@ def decisions_report(state_dir, now):
         report["message"] = "the daemon is not updating this list: %s cannot be read" % path
         return report
     report.update(decisions=body["decisions"], errors=body["errors"], written_at=body.get("written_at"),
-                  generation=body.get("generation"), age_seconds=max(0, int(age)), provisional=body.get("provisional") is True)
+                  generation=body.get("generation"), age_seconds=max(0, int(age)))
+    if body.get("provisional") is True:
+        report["provisional"] = True   # only when it is: the shape of the report is otherwise what it always was
     if age > DECISIONS_STALE_SECONDS and not fault("stale-as-fresh"):
         report["message"] = "the daemon is not updating this list: %s was last written %s ago" % (
             DECISIONS_FILE, format_age(age))
@@ -10659,7 +10662,7 @@ def decisions_summary(state_dir, now):
             by_repo[decision["repo"]] = by_repo.get(decision["repo"], 0) + 1
     return {"count": len(listed), "stale": report["stale"], "message": report["message"],
             "age_seconds": report["age_seconds"], "errors": len(report["errors"]), "by_repo": by_repo,
-            "by_tier": by_tier, "cos_over_an_hour": over_cos, "provisional": report.get("provisional", False)}
+            "by_tier": by_tier, "cos_over_an_hour": over_cos, **({"provisional": True} if report.get("provisional") else {})}
 
 
 def format_decisions_status(summary):
