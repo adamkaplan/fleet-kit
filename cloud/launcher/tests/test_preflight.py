@@ -7,7 +7,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PREFLIGHT = os.path.join(os.path.dirname(HERE), "preflight.py")
@@ -23,6 +23,13 @@ class Stub(http.server.BaseHTTPRequestHandler):
     enforcement = "active"
     include = ["~DEFAULT_BRANCH"]
     conditions = "ok"  # "ok" uses include; None answers a ruleset without conditions
+    exclude = []
+    target = "branch"
+    default = "main"
+    rule_ids = {}  # rule type -> ruleset id (default 7)
+    extra = {}  # ruleset id -> its answer, for a second ruleset
+    org = False  # answer ruleset 7's rules as Organization-sourced
+    no_id = False  # answer rules without a ruleset_id
     redirect_code = 302
     redirect = None  # a Location to answer every GET with, as a 302
     fail = None  # a path suffix that answers 500, or "badjson"
@@ -46,7 +53,7 @@ class Stub(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        path = urlparse(self.path).path
+        path = unquote(urlparse(self.path).path)
         if Stub.fail == "badjson":
             return self.reply(200, b"<html>")
         if Stub.fail == "huge":
@@ -54,20 +61,27 @@ class Stub(http.server.BaseHTTPRequestHandler):
         if Stub.fail and path.endswith(Stub.fail):
             return self.reply(500, {})
         if path == "/repos/" + REPO:
-            return self.reply(200, {"default_branch": "main"})
-        if path == "/repos/%s/rules/branches/main" % REPO:
+            return self.reply(200, {"default_branch": Stub.default})
+        if path.startswith("/repos/%s/rules/branches/" % REPO):
             out = []
             for x in Stub.rules:
-                r = {"type": x, "ruleset_id": 7, "ruleset_source_type": "Repository", "ruleset_source": REPO}
+                r = {"type": x, "ruleset_id": Stub.rule_ids.get(x, 7), "ruleset_source_type": "Repository", "ruleset_source": REPO}
+                if Stub.org:
+                    r.update(ruleset_source_type="Organization", ruleset_source="acme-org")
+                if Stub.no_id:
+                    del r["ruleset_id"]
                 if x == "pull_request":
                     r["parameters"] = {"required_approving_review_count": Stub.review_count}
                 out.append(r)
             return self.reply(200, out)
-        if path == "/repos/%s/rulesets/7" % REPO:
-            cond = {"ref_name": {"include": Stub.include, "exclude": []}} if Stub.conditions == "ok" else None
-            return self.reply(200, {"id": 7, "target": "branch", "enforcement": Stub.enforcement, "conditions": cond})
-        if path == "/repos/%s/branches/main" % REPO:
-            return self.reply(200, {"name": "main", "protected": Stub.protected})
+        if path in ("/repos/%s/rulesets/7" % REPO, "/orgs/acme-org/rulesets/7"):
+            cond = {"ref_name": {"include": Stub.include, "exclude": Stub.exclude}} if Stub.conditions == "ok" else None
+            return self.reply(200, {"id": 7, "target": Stub.target, "enforcement": Stub.enforcement, "conditions": cond})
+        for rid, body in Stub.extra.items():
+            if path == "/repos/%s/rulesets/%d" % (REPO, rid):
+                return self.reply(200, body)
+        if path.startswith("/repos/%s/branches/" % REPO):
+            return self.reply(200, {"name": "x", "protected": Stub.protected})
         self.reply(404, {})
 
     def do_POST(self):
@@ -108,6 +122,7 @@ class Preflight(unittest.TestCase):
     def setUp(self):
         Stub.rules, Stub.protected, Stub.fail, Stub.methods, Stub.redirect = list(FULL), False, None, [], None
         Stub.review_count, Stub.enforcement, Stub.include, Stub.conditions = 1, "active", ["~DEFAULT_BRANCH"], "ok"
+        Stub.exclude, Stub.target, Stub.default, Stub.rule_ids, Stub.extra, Stub.org, Stub.no_id = [], "branch", "main", {}, {}, False, False
         Other.seen = []
 
     def run_pf(self, *args, **env):
@@ -163,6 +178,71 @@ class Preflight(unittest.TestCase):
         for inc in (["~ALL"], ["refs/heads/main"], ["refs/heads/m*"], ["refs/heads/**"]):
             Stub.include = inc
             self.assertEqual(self.run_pf().returncode, 0, inc)
+
+    def covers_exit(self, include, branch, exclude=()):
+        Stub.include, Stub.exclude, Stub.default = include, list(exclude), branch
+        return self.run_pf()
+
+    def test_github_glob_semantics_star_stops_at_slash_and_double_star_crosses(self):
+        cases = [(["refs/heads/release/*"], "release/1", 0), (["refs/heads/release/*/x"], "release/a/b", 1),
+                 (["refs/heads/release/*/x"], "release/a/x", 0), (["refs/heads/*"], "a/b", 1), (["refs/heads/*"], "ab", 0),
+                 (["refs/heads/**"], "a/b", 0), (["**"], "a/b", 0), (["*"], "a/b", 1), (["refs/heads/release/**"], "release/a/b", 0),
+                 (["refs/heads/rel?ase/1"], "release/1", 0), (["refs/heads/rel?ase/1"], "rel/ase/1", 1),
+                 (["refs/heads/a.c"], "abc", 1), (["~ALL"], "a/b", 0)]
+        for include, branch, code in cases:
+            self.assertEqual(self.covers_exit(include, branch).returncode, code, (include, branch))
+
+    def test_a_pattern_not_understood_is_not_covering_and_is_named(self):
+        for pat in ("refs/heads/[ab]*", "~SOMETHING", "~", ""):
+            p = self.covers_exit([pat], "main")
+            self.assertEqual(p.returncode, 1, pat)
+            self.assertIn("does not cover the branch", p.stdout)
+        p = self.covers_exit(["refs/heads/[ab]*"], "main")
+        self.assertIn("a pattern was not understood", p.stdout)
+
+    def test_an_exclude_removes_coverage_and_an_unknown_exclude_removes_it_too(self):
+        self.assertEqual(self.covers_exit(["~ALL"], "main", ["refs/heads/main"]).returncode, 1)
+        self.assertEqual(self.covers_exit(["~ALL"], "main", ["refs/heads/other"]).returncode, 0)
+        p = self.covers_exit(["~ALL"], "main", ["refs/heads/[m]ain"])
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("not understood", p.stdout)
+
+    def test_default_branch_tilde_only_covers_the_default_branch(self):
+        Stub.include, Stub.default = ["~DEFAULT_BRANCH"], "main"
+        self.assertEqual(self.run_pf("--branch", "release/1").returncode, 1)
+        Stub.default = "release/1"
+        self.assertEqual(self.run_pf().returncode, 0)
+
+    def test_a_rule_without_a_ruleset_id_fails_closed(self):
+        Stub.no_id = True
+        p = self.run_pf()
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("does not name its ruleset", p.stdout)
+
+    def test_an_organization_ruleset_is_read_from_the_org_path(self):
+        Stub.org = True
+        self.assertEqual(self.run_pf().returncode, 0)
+        Stub.fail = "/rulesets/7"  # a token that cannot read the organization's ruleset fails closed
+        self.assertEqual(self.run_pf().returncode, 2)
+
+    def test_a_ruleset_that_is_not_a_branch_ruleset_fails_closed(self):
+        Stub.target = "push"
+        self.assertEqual(self.run_pf().returncode, 2)
+
+    def test_an_unknown_enforcement_value_fails_closed(self):
+        Stub.enforcement = "bogus"
+        self.assertEqual(self.run_pf().returncode, 2)
+
+    def test_two_rulesets_each_judged_and_only_enforced_ones_count(self):
+        Stub.rule_ids = {"deletion": 8}
+        Stub.extra = {8: {"id": 8, "target": "branch", "enforcement": "disabled",
+                          "conditions": {"ref_name": {"include": ["~ALL"], "exclude": []}}}}
+        p = self.run_pf()
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("ruleset 8 is not enforced", p.stdout)
+        self.assertIn("missing a deletion rule", p.stdout)
+        Stub.extra[8]["enforcement"] = "active"
+        self.assertEqual(self.run_pf().returncode, 0)
 
     def test_an_odd_or_unreadable_ruleset_fails_closed_with_exit_2(self):
         Stub.conditions = None

@@ -26,7 +26,6 @@ What this CANNOT see: bypass actors (who may skip a rule), and whether a rule is
 identity. The live refusal check (a real push, force-push and delete attempted on a disposable repository, S4) is the
 real proof; this is only the cheap guard before a worker is launched.
 """
-import fnmatch
 import json
 import os
 import re
@@ -84,20 +83,46 @@ def get_token(target):
     return p.stdout.strip()
 
 
+def _glob(pat):
+    """GitHub's ref pattern as an anchored regex: ** crosses '/', * does not, ? is one non-'/' character, all else
+    literal. None for a pattern we do not understand (character classes, odd tildes, not text)."""
+    if not isinstance(pat, str) or not pat or "[" in pat or "]" in pat or pat.startswith("~"):
+        return None
+    out, i = [], 0
+    while i < len(pat):
+        if pat.startswith("**", i):
+            out.append(".*")
+            i += 2
+            continue
+        c = pat[i]
+        out.append("[^/]*" if c == "*" else "[^/]" if c == "?" else re.escape(c))
+        i += 1
+    return re.compile("".join(out) + r"\Z")
+
+
 def covers(conditions, branch, default_branch):
-    """True when a ruleset's ref_name conditions cover refs/heads/<branch>; None when they cannot be read."""
+    """(covered, odd): covered is True when a ruleset's ref_name conditions cover refs/heads/<branch>, None when they
+    cannot be read; odd names a pattern we did not understand. FAIL CLOSED: an include pattern we do not understand
+    covers nothing, and an exclude pattern we do not understand excludes the branch."""
     ref = conditions.get("ref_name") if isinstance(conditions, dict) else None
     if not isinstance(ref, dict) or not isinstance(ref.get("include"), list) or not isinstance(ref.get("exclude", []), list):
-        return None
+        return None, None
     full = "refs/heads/" + branch
+    odd = []
 
-    def hit(pat):
+    def hit(pat, excluding):
         if pat == "~ALL":
             return True
         if pat == "~DEFAULT_BRANCH":
             return branch == default_branch
-        return isinstance(pat, str) and fnmatch.fnmatchcase(full, pat.replace("**", "*"))
-    return any(hit(x) for x in ref["include"]) and not any(hit(x) for x in ref.get("exclude", []))
+        rx = _glob(pat)
+        if rx is None:
+            odd.append(str(pat)[:40])
+            return excluding  # an unknown include matches nothing; an unknown exclude matches everything
+        return bool(rx.match(full))
+    inc = any([hit(x, False) for x in ref["include"]])
+    exc = any([hit(x, True) for x in ref.get("exclude", [])])
+    return (inc and not exc), odd
 
 
 def judge(rules, branch, default_branch, fetch):
@@ -128,14 +153,15 @@ def judge(rules, branch, default_branch, fetch):
                 say("cannot read: %s" % e)
                 return problems, None
             enf = rs.get("enforcement") if isinstance(rs, dict) else None
-            cov = covers(rs.get("conditions"), branch, default_branch) if isinstance(rs, dict) else None
+            cov, odd = covers(rs.get("conditions"), branch, default_branch) if isinstance(rs, dict) else (None, None)
             if enf not in ("active", "evaluate", "disabled") or cov is None or (isinstance(rs, dict) and rs.get("target") != "branch"):
                 say("cannot read: ruleset %d has an unreadable enforcement, target or conditions" % rid)
                 return problems, None
             if enf != "active":
                 problems.append("ruleset %d is not enforced (enforcement is '%s')" % (rid, enf))
             elif not cov:
-                problems.append("ruleset %d does not cover the branch" % rid)
+                problems.append("ruleset %d does not cover the branch%s" % (
+                    rid, " (a pattern was not understood: %s)" % ", ".join(odd) if odd else ""))
             verdict[key] = enf == "active" and cov
         if verdict[key]:
             kept.append(r)
