@@ -951,12 +951,13 @@ class DecisionStore(abc.ABC):
 
     @abc.abstractmethod
     def read(self, now):
-        """What the projection says now: {stale, message, age_seconds, written_at, generation, decisions, errors}."""
+        """What the projection says now: {stale, message, age_seconds, written_at, generation, decisions, errors, provisional}."""
 
     @abc.abstractmethod
-    def publish(self, decisions, errors, now):
+    def publish(self, decisions, errors, now, provisional=False):
         """Make `decisions` and `errors` the projection when they changed (otherwise only say it is alive).
-        Returns True when it was written."""
+        Returns True when it was written. `provisional` (the early list of a pass that is still reading) is kept with the projection until the end of the pass
+        publishes the final one; a change of that flag alone is a write, and `read` says it (`provisional`)."""
 
     @abc.abstractmethod
     def escalated(self):
