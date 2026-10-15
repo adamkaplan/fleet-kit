@@ -116,5 +116,63 @@
         "action": "2"
       }
     }
+  },
+  "owner_hold": {
+    "meaning": "Which holds need the owner's own clear. Only a change to credentials, identity or who may do what holds for the owner; every other floor path or rating asks for a second independent review and the usual checks decide the merge. The code reads this block and has no path or class list of its own.",
+    "top_tier_classes": [
+      "credentials",
+      "identity",
+      "authority"
+    ],
+    "other_classes": [
+      "availability",
+      "data",
+      "performance",
+      "correctness",
+      "compatibility",
+      "privacy",
+      "cost"
+    ],
+    "top_tier_paths": {
+      "credentials": [
+        "shims/gh",
+        "shims/git",
+        "cloud/launcher/token_mint.py"
+      ],
+      "identity": [
+        "shims/**"
+      ],
+      "authority": [
+        "bin/plan_ledger.py",
+        "bin/impact_floor.py",
+        "docs/review-laws/impact-matrix.json",
+        "plugins/fleet-hooks/**",
+        "tools/cos-permissions-proof/**",
+        "agents/**"
+      ]
+    },
+    "floor": {
+      "adamkaplan/fleet-kit": {
+        "globs": [
+          "shims/**",
+          "plugins/fleet-hooks/**",
+          "templates/**",
+          "tools/cos-permissions-proof/**",
+          "bin/plan_ledger.py",
+          "bin/impact_floor.py",
+          "docs/review-laws/impact-matrix.json"
+        ],
+        "exclude": [
+          "agents/**",
+          "skills/**",
+          "docs/**",
+          "AGENTS.md"
+        ],
+        "force": [
+          "bin/impact_floor.py",
+          "docs/review-laws/impact-matrix.json"
+        ]
+      }
+    }
   }
 }

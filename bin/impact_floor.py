@@ -9,20 +9,17 @@ import json
 import re
 from pathlib import Path
 
-# The floor globs per repo, a proposal the owner confirms: the gh shim (signing and gates), the policy hook, the service units, the
-# permissions generator and the ledger format. fleet-kit has no migrations directory and no declared public API files, so none are named.
-# Excluded: definitions and docs are already captain PRs, and including them would hold nearly every PR.
-DEFAULT_FLOORS = {
-    "adamkaplan/fleet-kit": {
-        "globs": ["shims/**", "plugins/fleet-hooks/**", "templates/**", "tools/cos-permissions-proof/**", "bin/plan_ledger.py",
-                  "bin/impact_floor.py", "docs/review-laws/impact-matrix.json"],
-        "exclude": ["agents/**", "skills/**", "docs/**", "AGENTS.md"],
-        # the logic and the table that decide holds are never excluded with the docs: changing them must hold
-        "force": ["bin/impact_floor.py", "docs/review-laws/impact-matrix.json"],
-    },
-}
 ACTION_HOLD, ACTION_SECOND, ACTION_NONE = "H", "2", "."
 MATRIX_PATH = Path(__file__).resolve().parent.parent / "docs" / "review-laws" / "impact-matrix.json"
+
+
+def default_floors(matrix=None):
+    """The built-in floor per repo, read from the matrix file's `owner_hold.floor` (a proposal the owner confirms): the code names no path."""
+    try:
+        floors = ((matrix if matrix is not None else load_matrix()).get("owner_hold") or {}).get("floor") or {}
+    except (OSError, ValueError):
+        return {}
+    return {name: entry for name, entry in floors.items() if isinstance(entry, dict)}
 
 
 def _glob_regex(pattern):
@@ -78,9 +75,9 @@ def floor_for(repo, config=None):
     for name, entry in (((config or {}).get("impact_floor") or {}).get("repos") or {}).items():
         if name.lower() == wanted and isinstance(entry, dict):
             return list(entry.get("globs") or []), list(entry.get("exclude") or []), list(entry.get("force") or [])
-    for name, entry in DEFAULT_FLOORS.items():
+    for name, entry in default_floors().items():
         if name.lower() == wanted:
-            return list(entry["globs"]), list(entry["exclude"]), list(entry.get("force") or [])
+            return list(entry.get("globs") or []), list(entry.get("exclude") or []), list(entry.get("force") or [])
     return [], [], []
 
 
@@ -153,6 +150,74 @@ def decide(floor_hit, rated, unknown=None):
         return "hold", reasons
     if any(action == ACTION_SECOND for _, _, _, action in rated):
         return "second-review", ["rating: a medium-band impact asks for a second independent review"]
+    return "none", []
+
+
+# ---- who may clear a hold: the owner's own clear is for the top tier only (ask #451). Everything below reads the matrix file's `owner_hold` block.
+
+def owner_hold_rule(matrix):
+    """The `owner_hold` block of the matrix, normalised: (top classes, other classes, {class: globs}). A matrix with no such block has no top tier, which
+    is read as EVERY path and class being top tier (fail closed): the old behaviour."""
+    block = (matrix or {}).get("owner_hold")
+    if not isinstance(block, dict):
+        return None
+    top = [c for c in (block.get("top_tier_classes") or []) if isinstance(c, str)]
+    other = [c for c in (block.get("other_classes") or []) if isinstance(c, str) and c not in top]
+    paths = {c: [g for g in (v or []) if isinstance(g, str)] for c, v in (block.get("top_tier_paths") or {}).items() if isinstance(v, (list, tuple))}
+    return top, other, paths
+
+
+def top_tier_hits(paths, matrix):
+    """{class: [paths]} of the changed paths that match a top tier glob of the matrix file (a path may be named under more than one class)."""
+    rule = owner_hold_rule(matrix)
+    if rule is None:
+        return {}
+    hits = {}
+    for cls, globs in rule[2].items():
+        got = sorted({p for p in paths if isinstance(p, str) and matches(p, globs)})
+        if got:
+            hits[cls] = got
+    return hits
+
+
+def class_is_top_tier(matrix, cls):
+    """True for a top tier class, a missing class and an UNKNOWN class (fail closed); False only for a class the matrix file names as not top tier."""
+    rule = owner_hold_rule(matrix)
+    if rule is None or not isinstance(cls, str) or not cls:
+        return True
+    return cls not in rule[1]
+
+
+def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=()):
+    """The decision under the owner-hold rule. `paths`: every changed path (a deletion and a rename's old path too); `impacts`: [(severity, probability, class)]
+    from the independent rating (class may be None); `floor_hit`: the paths that hit the old floor (floor_paths). Returns (decision, reasons):
+
+      - "hold" (for the owner): the diff cannot be read in full; or a changed path is a top tier path of the matrix file; or a rated impact is at a hold
+        level and its class is top tier, missing or unknown;
+      - "second-review": no hold, but a floor path outside the top tier, a hold-level rating of a class the matrix file names as not top tier, or a
+        medium-band rating asks for a second independent review (the usual checks then decide the merge);
+      - "none" otherwise."""
+    reasons = []
+    if unknown:
+        reasons.append("floor unknown: %s" % unknown)
+    for cls, got in sorted(top_tier_hits(paths, matrix).items()):
+        reasons.append("top tier path (%s): %s" % (cls, ", ".join(got[:5]) + (" ..." if len(got) > 5 else "")))
+    rated = []
+    for severity, probability, cls in impacts:
+        for _s, _p, level, action in rate(matrix, [(severity, probability)]):
+            rated.append((severity, probability, level, action, cls))
+    for severity, probability, level, action, cls in rated:
+        if action == ACTION_HOLD and class_is_top_tier(matrix, cls):
+            reasons.append("rating: %s / %s is %s (hold), class %s" % (severity, probability, level, cls or "missing"))
+    if reasons:
+        return "hold", reasons
+    softer = []
+    if floor_hit:
+        softer.append("floor: %d path(s) outside the top tier ask for a second independent review" % len(floor_hit))
+    softer.extend("rating: %s / %s (%s), class %s, asks for a second independent review" % (s, p, level, cls) for s, p, level, action, cls in rated
+                  if action in (ACTION_HOLD, ACTION_SECOND))
+    if softer:
+        return "second-review", softer
     return "none", []
 
 

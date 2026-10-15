@@ -49732,6 +49732,89 @@ class TestDecisionsStaleBound(unittest.TestCase):
         self.assertGreaterEqual(len([line for line in lines if "180 s" in line and ("stale" in line or "Staleness" in line or "not updating" in line or "older than" in line)]), 4)
 
 
+class TestOwnerHoldRule(unittest.TestCase):
+    """Ask #451, slice 1: the owner's own clear is for credentials, identity and who may do what only. The rule is data in the impact matrix file."""
+
+    def setUp(self):
+        self.floor = sb.impact_floor
+        self.matrix = self.floor.load_matrix()
+
+    def decide(self, paths, impacts=(), unknown=None, matrix=None):
+        matrix = matrix or self.matrix
+        globs, exclude, force = self.floor.floor_for("adamkaplan/fleet-kit")
+        hit = self.floor.floor_paths(paths, globs, exclude, force)
+        return self.floor.owner_decide(matrix, paths, list(impacts), unknown, hit)
+
+    def test_s1_the_decision_code_names_no_path_or_class_and_agrees_with_the_file(self):
+        import ast
+        tree = ast.parse((BIN / "impact_floor.py").read_text())
+        names = {"owner_hold_rule", "top_tier_hits", "class_is_top_tier", "owner_decide", "default_floors"}
+        constants = set()
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name in names:
+                body = node.body[1:] if (node.body and isinstance(node.body[0], ast.Expr) and isinstance(node.body[0].value, ast.Constant)) else node.body
+                for inner in body:
+                    constants.update(n.value for n in ast.walk(inner) if isinstance(n, ast.Constant) and isinstance(n.value, str))
+        block = self.matrix["owner_hold"]
+        from_file = set(block["top_tier_classes"]) | set(block["other_classes"]) | {g for globs in block["top_tier_paths"].values() for g in globs}
+        from_file |= {g for entry in block["floor"].values() for key in ("globs", "exclude", "force") for g in entry.get(key, [])}
+        self.assertTrue(from_file)
+        self.assertEqual(sorted(constants & from_file), [], "a path or class of the matrix file is written in the decision code")
+
+    def test_s2_a_change_to_the_shims_the_ledger_a_permission_block_or_the_matrix_holds_for_the_owner(self):
+        for path in ("shims/gh", "shims/git", "bin/plan_ledger.py", "agents/opencode/chief-of-staff.md", "docs/review-laws/impact-matrix.json"):
+            decision, reasons = self.decide([path, "docs/notes.md"])
+            self.assertEqual(decision, "hold", path)
+            self.assertTrue(any(path in reason for reason in reasons), (path, reasons))
+
+    def test_s3_the_launchd_template_the_cloud_image_and_a_docs_file_do_not_hold_for_the_owner(self):
+        paths = ["templates/com.fleet-kit.switchboard.plist", "cloud/launcher/Dockerfile", "docs/switchboard.md"]
+        decision, reasons = self.decide(paths)
+        self.assertEqual(decision, "second-review", reasons)
+        self.assertFalse(any(reason.startswith(("top tier", "floor unknown", "rating:")) and "second" not in reason for reason in reasons), reasons)
+        for path in paths:
+            self.assertNotEqual(self.decide([path])[0], "hold", path)
+
+    def test_s4_only_a_top_tier_or_unknown_class_at_a_hold_level_holds(self):
+        self.assertEqual(self.decide(["x.py"], [("Critical", "Remote", "credentials")])[0], "hold")
+        self.assertEqual(self.decide(["x.py"], [("Critical", "Remote", "a-class-nobody-named")])[0], "hold")
+        decision, reasons = self.decide(["x.py"], [("Critical", "Remote", "availability")])
+        self.assertEqual(decision, "second-review", reasons)
+
+    def test_s5_a_rating_with_no_class_is_top_tier(self):
+        self.assertEqual(self.decide(["x.py"], [("Critical", "Remote", None)])[0], "hold")
+        self.assertEqual(self.decide(["x.py"], [("Negligible", "Improbable", None)])[0], "none", "a low rating asks for nothing, class or not")
+
+    def test_s6_a_diff_that_cannot_be_read_in_full_holds(self):
+        decision, reasons = self.decide([], unknown="the file list was cut off")
+        self.assertEqual(decision, "hold")
+        self.assertIn("floor unknown", reasons[0])
+
+    def test_s7_this_slices_own_files_hold_for_the_owner(self):
+        decision, reasons = self.decide(["bin/impact_floor.py", "docs/review-laws/impact-matrix.json", "bin/test-switchboard"])
+        self.assertEqual(decision, "hold")
+        joined = " ".join(reasons)
+        self.assertIn("bin/impact_floor.py", joined)
+        self.assertIn("docs/review-laws/impact-matrix.json", joined)
+
+    def test_s11_a_change_to_the_files_list_changes_the_decision_with_no_code_change(self):
+        before = self.decide(["tools/new-gate.sh"])
+        edited = json.loads(json.dumps(self.matrix))
+        edited["owner_hold"]["top_tier_paths"]["authority"].append("tools/new-gate.sh")
+        after = self.decide(["tools/new-gate.sh"], matrix=edited)
+        self.assertEqual((before[0], after[0]), ("none", "hold"))
+        edited["owner_hold"]["other_classes"].append("a-class-nobody-named")
+        self.assertEqual(self.decide(["x.py"], [("Critical", "Remote", "a-class-nobody-named")], matrix=edited)[0], "second-review")
+
+    def test_a_matrix_with_no_owner_hold_block_changes_nothing_for_the_old_floor_and_the_old_floor_is_read_from_the_file(self):
+        globs, exclude, force = self.floor.floor_for("adamkaplan/fleet-kit")
+        self.assertIn("shims/**", globs)
+        self.assertIn("bin/impact_floor.py", force)
+        self.assertEqual(self.floor.floor_for("someone/else"), ([], [], []))
+        self.assertIsNone(self.floor.owner_hold_rule({}))
+        self.assertTrue(self.floor.class_is_top_tier({}, "availability"), "no block: everything is top tier (fail closed)")
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.
