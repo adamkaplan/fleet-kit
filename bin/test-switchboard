@@ -51109,6 +51109,87 @@ class TestTempJanitorResume(Base):
         self.assertEqual(os.stat(str(self.state / self.jan.CURSOR_FILE)).st_mtime_ns, stamp, "written only when it changes")
 
 
+class TestEarlyDecisionsWrite(DecisionsBase):
+    """Ask #467, slice 1: the decisions file is written as soon as its own sources are read, before the heavy fact sources."""
+
+    def setUp(self):
+        super().setUp()
+        self.path = self.world.state / sb.DECISIONS_FILE
+        self.seen = []
+
+    def heavy(self, steps, step_seconds):
+        """A fact source that takes `steps` x `step_seconds` of simulated time, looking at the decisions file after each step."""
+        def source():
+            for _ in range(steps):
+                self.world.tick(step_seconds)
+                self.seen.append((self.world.clock.now(), self.path.stat().st_mtime if self.path.exists() else None))
+            return []
+        source.__name__ = "heavy_source"
+        self.world.engine.sources.append(source)
+        return source
+
+    def test_s1_a_first_pass_with_slow_reads_has_written_the_file_by_120_seconds(self):
+        self.ask_the_boss("Which database?")
+        started = self.world.clock.now()
+        self.heavy(steps=6, step_seconds=20)
+        self.world.engine.run_pass()
+        at, mtime = self.seen[5]
+        self.assertEqual(at - started, 120)
+        self.assertIsNotNone(mtime, "the file existed at 120 simulated seconds")
+        self.assertLessEqual(at - mtime, 120)
+        self.assertEqual([d["title"] for d in self.file()["decisions"]], ["Which database?"])
+
+    def test_s2_the_first_write_is_within_60_seconds_of_the_start_and_the_pass_writes_again_at_its_end(self):
+        self.ask_the_boss("Which database?")
+        started = self.world.clock.now()
+        self.heavy(steps=60, step_seconds=10)
+        self.world.engine.run_pass()
+        written = sorted({mtime for _, mtime in self.seen if mtime is not None})
+        self.assertLessEqual(self.seen[0][1] - started, 60, "the first write")
+        self.assertEqual(self.seen[0][1], self.seen[-1][1], "nothing was written while the heavy source ran")
+        self.assertEqual(len(written), 1)
+        self.assertGreater(self.path.stat().st_mtime, written[0], "and the end of the pass wrote (touched) it again")
+        self.assertEqual(self.path.stat().st_mtime, self.world.clock.now())
+
+    def test_s3_a_pass_that_cannot_read_its_decision_sources_writes_and_touches_nothing(self):
+        touched = []
+        real = os.utime
+        self.heavy(steps=3, step_seconds=60)
+        with mock.patch.object(sb, "derive_decisions", side_effect=OSError("cannot read")), \
+                mock.patch.object(os, "utime", lambda path, *a, **k: (touched.append(str(path)), real(path, *a, **k))[1]):
+            self.world.engine.run_pass()
+        self.assertFalse(self.path.exists())
+        self.assertEqual([p for p in touched if "decisions" in p], [], "no call set the time of the decisions file")
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "decisions.early_error"], "the early step said so")
+
+    def test_a_fresh_file_is_left_to_the_end_of_the_pass_exactly_as_before(self):
+        self.ask_the_boss("Which database?")
+        self.world.engine.run_pass()
+        mtime = self.path.stat().st_mtime
+        calls = []
+        real = sb.derive_decisions
+        with mock.patch.object(sb, "derive_decisions", lambda *a, **k: (calls.append(1), real(*a, **k))[1]):
+            self.world.tick(10)
+            self.world.engine.run_pass()
+        self.assertEqual(len(calls), 1, "steady state derives once per pass, at the end, as before")
+        self.assertGreater(self.path.stat().st_mtime, mtime)
+
+    def test_a_missing_or_stale_file_is_written_before_the_fact_sources_run(self):
+        self.ask_the_boss("Which database?")
+        order = []
+        real_collect = self.world.engine.collect_facts
+        self.world.engine.collect_facts = lambda: (order.append(("collect", self.path.exists())), real_collect())[1]
+        self.world.engine.run_pass()
+        self.assertEqual(order[0], ("collect", True), "the file existed when the fact sources were collected")
+        order.clear()
+        self.world.tick(sb.EARLY_DECISIONS_AGE + 30)
+        before = self.path.stat().st_mtime
+        stale = []
+        self.world.engine.collect_facts = lambda: (stale.append(self.path.stat().st_mtime), real_collect())[1]
+        self.world.engine.run_pass()
+        self.assertGreater(stale[0], before, "a stale file was rewritten before the sources were collected")
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.

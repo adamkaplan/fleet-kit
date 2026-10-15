@@ -4448,6 +4448,7 @@ class Switchboard:
         self.pass_toasts = {}
         self.reads.begin_pass()
         discovery = self.discover(now)
+        early_decisions(self)   # #467: the decisions file is written as soon as its own sources are read, BEFORE the heavy fact sources
         for problem in discovery.problems:
             self._note("observe.problem", None, {"problem": problem})
         for observation in list(discovery.agents.values()):
@@ -10291,6 +10292,33 @@ def v2_calls_status(state_dir, now):
         return text
     except (OSError, ValueError, KeyError, TypeError, AttributeError):   # a record of any other shape is no record
         return None
+
+
+EARLY_DECISIONS_AGE = 60   # seconds: a file this old (or missing) is written before the heavy sources are collected; a fresher one is left to the end of the pass
+
+
+def early_decisions(engine):
+    """(#467) At the START of a pass (after `discover`, before the fact sources): when the decisions file is missing or older than EARLY_DECISIONS_AGE, derive
+    the list from its OWN sources and write it now, so a heavy source (the sweep, triage, the load alert, a first catch-up after a restart under load) can never delay
+    it past the staleness bound. Nothing else changes: the end of the pass still derives and publishes as before (the sweep may withdraw or add), and a pass that
+    finds a fresh file (steady state) does nothing here. The file's time changes only through the store's own write, with content derived from reads just made:
+    a pass that cannot read its decision sources writes and touches nothing (the derivation raises and is noted). Never raises. Returns True when it wrote."""
+    state = engine.state_dir
+    if state is None or engine.audit is None or fault("no-decisions-file"):
+        return False
+    try:
+        try:
+            age = engine.now() - (Path(state) / DECISIONS_FILE).stat().st_mtime
+        except OSError:
+            age = None   # missing or unreadable: write it now
+        if age is not None and age < EARLY_DECISIONS_AGE:
+            return False
+        now = engine.now()
+        decisions, errors = derive_decisions(engine, now)
+        return bool(decision_store(engine).publish(decisions, errors, now))
+    except Exception as err:   # a pass that cannot read its decision sources writes nothing here; the end of the pass says the same
+        engine._note("decisions.early_error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+        return False
 
 
 def publish_decisions(engine):
