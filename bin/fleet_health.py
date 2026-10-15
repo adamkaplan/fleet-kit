@@ -359,13 +359,14 @@ def _write_state(state_dir, data):
     os.replace(str(temp), str(path))
 
 
+PR_KINDS = ("notice", "captain")   # the entries of decisions.json that are information about a pull request, not a wait
 DECISIONS_MAX = 1000             # entries of decisions.json looked at in one pass (the rest are ignored)
 _REPO_SHAPE = re.compile(r"[A-Za-z0-9_.-]{1,100}(/[A-Za-z0-9_.-]{1,100})?\Z")
 
 
 def decision_items(state_dir):
     """([(repo, issue of the ask)], PR notices and holds) of the open entries of decisions.json, or None when it cannot be read.
-    Only an entry with an ask waits on an orchestrator; one without (a PR heads-up, a held PR) has no issue chain and is only counted.
+    A PR heads-up (kind `notice`) or a held pull request (kind `captain`) waits on no orchestrator and is only counted; any other entry waits, and one with no usable ask (a permission request, a question with no issue) is returned with no issue so that it belongs to nobody.
     At most DECISIONS_MAX entries are read, and a repository that is not shaped like `owner/name` is dropped (the chain is then not read).
     The `agent` field is a metadata guess and is not read here."""
     try:
@@ -378,12 +379,13 @@ def decision_items(state_dir):
     for item in listed[:DECISIONS_MAX]:
         if not isinstance(item, dict) or item.get("closed"):
             continue
+        if item.get("kind") in PR_KINDS:
+            notices += 1   # a heads-up or a held pull request: information, it waits on no orchestrator
+            continue
         ask = item.get("ask")
-        if isinstance(ask, int) and not isinstance(ask, bool) and ask > 0:
-            repo = item.get("repo")
-            out.append((repo if isinstance(repo, str) and _REPO_SHAPE.match(repo) else "", ask))
-        else:
-            notices += 1
+        repo = item.get("repo")
+        usable = isinstance(ask, int) and not isinstance(ask, bool) and ask > 0
+        out.append((repo if isinstance(repo, str) and _REPO_SHAPE.match(repo) else "", ask if usable else None))   # no usable ask: a real wait that belongs to nobody
     return out, notices
 
 

@@ -49304,15 +49304,16 @@ class TestLoadAlert(Base):
         lines = self.health.status_lines(str(self.state_dir), self.T0)
         self.assertEqual(len([l for l in lines if "1 decision(s) not attributed" in l]), 1)
 
-    def test_a_row_without_an_ask_is_a_pr_notice_or_hold_and_never_waiting(self):
-        tick, reads = self.decisions_world([{"kind": "notice", "ask": None, "number": 10, "repo": "r"}, {"kind": "pr", "number": 20, "repo": "r"},
-                                            {"ask": 10, "repo": "r"}], {})
+    def test_a_notice_or_a_held_pr_is_information_and_a_real_wait_without_an_ask_is_not_attributed(self):
+        tick, reads = self.decisions_world([{"kind": "notice", "ask": None, "number": 10, "repo": "r"}, {"kind": "captain", "ask": None, "number": 20, "repo": "r"},
+                                            {"kind": "permission", "ask": None, "repo": "r"}, {"kind": "question", "ask": 0}, {"ask": 10, "repo": "r"}], {})
         tick()
         got = self.latest()
         self.assertEqual((got["a"]["decisions"], got["b"]["decisions"], reads), (1, 0, []))               # the own number is not a fallback
         lines = self.health.status_lines(str(self.state_dir), self.T0)
         self.assertEqual([l.strip().split(" (")[0] for l in lines if "PR notices and holds" in l], ["PR notices and holds 2"])
-        self.assertEqual([l for l in lines if "not attributed" in l], [])
+        self.assertEqual([l.strip().split(" (")[0] for l in lines if "not attributed" in l], ["2 decision(s) not attributed"])
+        self.assertEqual(self.health.decision_items(str(self.state_dir)), ([("r", None), ("", None), ("r", 10)], 2))
 
     def test_a_malformed_decisions_file_counts_nothing_and_breaks_nothing(self):
         for text in ["not json", "[]", '{"decisions": 5}', '{"decisions": [1, "x", null, {"ask": true, "repo": 7}, {"ask": -3}, {"ask": 1.5}]}']:
