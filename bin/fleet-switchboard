@@ -5852,11 +5852,11 @@ def launch_headless(engine, name, agent, directory, role=None, reports_to=None, 
                     raise LaunchError("the service does not show the new session as %s: nothing was sent" % name)
                 if brief:
                     send_brief(engine, name, session_id, brief)
+                if engine.audit is not None:
+                    engine.audit.append(engine.actor, "headless.launched", name, {"session": session_id, "agent": agent, "directory": _one_line(directory, 160), "brief_chars": len(brief or "")})
             except Exception as err:
                 cleaned = undo_headless_launch(engine, ap, name, session_id)
                 raise LaunchError("%s (%s)" % (_one_line(str(err)), cleaned)) from err
-            if engine.audit is not None:
-                engine.audit.append(engine.actor, "headless.launched", name, {"session": session_id, "agent": agent, "directory": _one_line(directory, 160), "brief_chars": len(brief or "")})
     except ImpactStateBusy:
         raise LaunchError("another launch or reattach of %s is running: wait for it" % name) from None
     register_launch_worktree(engine, name, directory, repo)
@@ -5872,7 +5872,9 @@ def headless_identity(engine, repo):
     after `service restart`), at which point the worker would silently act as the service's default account. So a repo that `gh_users` maps to a
     named account is refused: use a terminal launch. Any other worker acts as the account of the service's environment, and says so."""
     accounts = getattr(engine, "accounts", None)
-    if repo and accounts is not None:
+    if repo and accounts is None:   # fail closed: with no account map nothing says which account this repo uses
+        raise LaunchError("cannot tell which gh account %s uses (no account map): a headless worker is refused" % repo)
+    if repo:
         account = accounts.account_for(repo)
         if account:
             raise LaunchError("a headless worker cannot work as the gh account %s that gh_users maps %s to: its tools run in the OpenCode service's environment, "
@@ -5890,10 +5892,11 @@ def undo_headless_launch(engine, ap, name, session_id):
     Returns one sentence saying exactly what was cleaned and what remains. The record is removed only when the session is gone: a session that is
     still there keeps its record, so `status` shows it and it is not invisible."""
     done, left = [], []
+    interrupted = True
     try:
         engine.v2.interrupt(session_id)
     except Exception:
-        pass   # best effort: the session is about to be deleted
+        interrupted = False   # best effort: the session is about to be deleted; said below if it could not be
     try:
         engine.v2.session_remove(session_id)
         done.append("session %s was deleted" % session_id)
@@ -5911,15 +5914,20 @@ def undo_headless_launch(engine, ap, name, session_id):
                 done.append("its record was removed")
         except Exception as err:
             left.append("its record could NOT be removed (%s): `%s retire %s` clears it" % (_one_line(str(err), 80), PROG, name))
-    else:
+    if not gone and not interrupted:
+        left.append("it could not be interrupted, so what the brief started may still be running")
+    if not gone:
         try:
             has_record = ap.read_record(engine.state_dir, name)[0] is not None
         except Exception:
             has_record = False
         left.append("its record was kept so `%s status` shows it: `%s retire %s` stops watching it" % (PROG, PROG, name) if has_record
                     else "it has no record, so nothing shows it")
-    if engine.audit is not None:
-        engine.audit.append(engine.actor, "headless.launch_undone", name, {"session": session_id, "cleaned": done, "remains": left})
+    try:
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "headless.launch_undone", name, {"session": session_id, "cleaned": done, "remains": left})
+    except Exception:
+        pass   # the sentence below is the report; a failing audit sink must not hide it
     return "launch failed; " + "; ".join(done + left if (done or left) else ["nothing was created"])
 
 
@@ -6616,7 +6624,8 @@ def free_headless_record(engine, state, name):
     """Remove the record of a retired headless worker so the NAME is free to launch again (its details are kept in the retirement for `retire --undo`).
     One line. The session itself keeps running in the service: only the switchboard stops watching it."""
     try:
-        load_agent_presence().remove_record(state, name)
+        with agent_lock(state, name):   # the same per-name lock a launch holds for its check and its record write
+            load_agent_presence().remove_record(state, name)
     except Exception as err:
         return "%s: its headless record could NOT be removed (%s): the name stays taken until it is" % (name, _one_line(str(err), 100))
     if engine.audit is not None:
@@ -6624,21 +6633,26 @@ def free_headless_record(engine, state, name):
     return "%s: its headless record was removed, so the name is free (`%s retire --undo %s` puts it back)" % (name, PROG, name)
 
 
-def restore_headless_record(engine, state, name, entry, discovery):
-    """`retire --undo` of a headless worker: put its record back when the name is still free. One line, or None when it was not headless."""
+def restore_headless_record(engine, state, name, entry):
+    """`retire --undo` of a headless worker: put its record back when the name is still free. (line or None, ok): ok is False only when the record
+    could not be put back (busy, or a write error): the retirement then stays so the undo can be tried again. A name that is taken again is not an
+    error: the old record is simply not restored, and the line says so."""
     kept = entry.get("headless") if isinstance(entry, dict) else None
     if not isinstance(kept, dict) or not isinstance(kept.get("session"), str):
-        return None
+        return None, True
     ap = load_agent_presence()
-    if ap.read_record(state, name)[0] is not None or name in discovery.agents:
-        return "%s: a worker named %s exists again, so its old headless record was NOT restored" % (name, name)
     try:
-        ap.save_record(state, name, kept["session"], kept.get("url"), now=kept.get("created"))
+        with agent_lock(state, name):   # the per-name lock of a launch: the check and the write are ONE step, judged on a fresh discovery
+            if ap.read_record(state, name)[0] is not None or name in engine.discover(engine.now()).agents:
+                return "%s: a worker named %s exists again, so its old headless record was NOT restored" % (name, name), True
+            ap.save_record(state, name, kept["session"], kept.get("url"), now=kept.get("created"))
+    except ImpactStateBusy:
+        return "%s: a launch of %s is running, so its old headless record was NOT restored" % (name, name), False
     except Exception as err:
-        return "%s: its headless record could NOT be restored (%s)" % (name, _one_line(str(err), 100))
+        return "%s: its headless record could NOT be restored (%s)" % (name, _one_line(str(err), 100)), False
     if engine.audit is not None:
         engine.audit.append(engine.actor, "headless.record_restored", name, {"session": kept["session"]})
-    return "%s: its headless record was restored: it is watched again" % name
+    return "%s: its headless record was restored: it is watched again" % name, True
 
 
 def cmd_retire(args, runner, now):
@@ -6676,10 +6690,14 @@ def cmd_retire(args, runner, now):
             raise LaunchError("refused: %s" % who)
         retired = read_retired(state)
         if args.undo:
-            entry = retired.pop(name, None)
+            entry = retired.get(name)
             if entry is None:
                 print("%s is not retired" % name)
                 return EXIT_OK
+            restored, restore_ok = restore_headless_record(engine, state, name, entry)   # FIRST: a record that cannot be put back leaves the retirement as it is, to try again
+            if not restore_ok:
+                raise LaunchError("%s: nothing was changed, the retirement stays (try `%s retire --undo %s` again)" % (restored, PROG, name))
+            retired.pop(name, None)
             try:
                 _write_small(state, RETIRED_FILE, retired)
             except OSError as err:
@@ -6694,7 +6712,6 @@ def cmd_retire(args, runner, now):
             if engine.audit is not None:
                 engine.audit.append(engine.actor, "fleetpane.unretired", name, {})
             print("%s is no longer retired: detection watches it again" % name)
-            restored = restore_headless_record(engine, state, name, entry, discovery)
             if restored:
                 print(restored)
             return EXIT_OK
