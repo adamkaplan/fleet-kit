@@ -500,16 +500,16 @@ def owner_decide(matrix, paths, impacts, unknown=None, floor_hit=(), narrow=None
 
 
 def validate_hold_config(raw):
-    """Raise ValueError naming the key when `impact_hold` is not {enabled?, dry_run?, calls_per_pass?, repos: {owner/repo: {enabled}}}.
+    """Raise ValueError naming the key when `impact_hold` is not {enabled?, dry_run?, calls_per_pass?, carry_clear?, repos: {owner/repo: {enabled}}}.
     The hold is OFF unless `enabled` is true (the one line a person flips)."""
     if raw is None:
         return
     if not isinstance(raw, dict):
         raise ValueError("'impact_hold' must be an object")
-    unknown = sorted(set(raw) - {"enabled", "dry_run", "calls_per_pass", "repos"})
+    unknown = sorted(set(raw) - {"enabled", "dry_run", "calls_per_pass", "repos", "carry_clear"})
     if unknown:
         raise ValueError("'impact_hold' has key(s) this tool does not read: %s" % ", ".join(unknown))
-    for key in ("enabled", "dry_run"):
+    for key in ("enabled", "dry_run", "carry_clear"):
         if key in raw and not isinstance(raw[key], bool):
             raise ValueError("'impact_hold.%s' must be true or false" % key)
     calls = raw.get("calls_per_pass", 1)
@@ -521,6 +521,13 @@ def validate_hold_config(raw):
     for name, entry in repos.items():
         if not isinstance(entry, dict) or set(entry) - {"enabled"} or not isinstance(entry.get("enabled", True), bool):
             raise ValueError("'impact_hold.repos.%s' must be {\"enabled\": true|false}" % name)
+
+
+def carry_enabled(config, repo):
+    """True only when the owner turned `impact_hold.carry_clear` on (the default is OFF) and the hold itself is enforced for `repo`: an owner's clear then carries over a pure merge
+    of main (see bin/clear_carry.py). Anything else, a string or 1 included, is off."""
+    section = (config or {}).get("impact_hold") or {}
+    return section.get("carry_clear") is True and hold_mode(config, repo) == "enforce"
 
 
 def hold_mode(config, repo):
