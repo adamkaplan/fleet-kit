@@ -454,7 +454,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "temp_janitor", "load_alert"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "temp_janitor", "load_alert", "excluded_repos"}
 
 
 def config_known_keys():
@@ -531,6 +531,10 @@ def validate_config(raw, source="config"):
         load_cpu_guard().validate(config["cpu_guard"], source)
     except ValueError as err:
         raise ConfigError(str(err))
+    try:
+        load_module("repo_exclusion").validate(config.get("excluded_repos"), source)
+    except ValueError as err:
+        raise ConfigError(str(err)) from None
     if not isinstance(config["docker_reaper"], bool):
         raise ConfigError("%s: 'docker_reaper' must be true or false, got %r" % (source, config["docker_reaper"]))
     if config["v2_events"] not in ("auto", "off"):
@@ -708,6 +712,11 @@ def validate_external_config(config, source):
                 raise ConfigError("%s.%s' is required when external_decisions is enabled" % (where, key))
         if not repos:
             raise ConfigError("%s.repos' must name at least one repo when external_decisions is enabled" % where)
+    if section["enabled"] and section["mapping_file"] and load_module("repo_exclusion").az_without_subscription(section["mapping_file"]):
+        message = load_module("repo_exclusion").AZ_WARNING
+        if message not in _WARNED_CONFIG:   # once per process
+            _WARNED_CONFIG.add(message)
+            sys.stderr.write("%s: warning: %s\n" % (PROG, message))
     config["external_decisions"] = section
 
 
@@ -13015,7 +13024,7 @@ class GitHubHub:
         self.runner, self.spawn, self.now, self.actor = runner, spawn, now, actor
         self.lock = threading.RLock()
         self.queue = {}        # key -> GitHubItem, until delivered
-        self.watches = {repo: Watch(repo) for repo in config["github_repos"]}
+        self.watches = {repo: Watch(repo) for repo in watched_repos(config, {})}   # the baseline less the excluded repositories
         self.accounts = GhAccounts(config, runner, now)  # PR 15: a gh account per repo
         self.lookback = config["github_lookback_hours"] * 3600
         self.backoff_base, self.backoff_max = GITHUB_BACKOFF_BASE, GITHUB_BACKOFF_MAX
@@ -14063,7 +14072,8 @@ def github_status(config, state_dir, fleets=None, now=None):
     is watched by the daemon's last snapshot, the gh account it uses (a name, never a token) and the fleet
     agents in it."""
     repos = watched_repos(config, fleets or {})
-    report = {"repos": repos, "lookback_hours": config["github_lookback_hours"],
+    excluded = sorted(load_module("repo_exclusion").excluded_set(config))
+    report = {"repos": repos, "excluded": excluded, "lookback_hours": config["github_lookback_hours"],
               "events": list(config["github_events"]), "daemon": False, "watches": [], "port": None,
               "poll_seconds": config["github_poll_seconds"]}
     snapshot = {}
@@ -14111,10 +14121,11 @@ def github_status(config, state_dir, fleets=None, now=None):
 
 
 def format_github(report):
-    """Status lines for GitHub; none when no repo is watched."""
+    """Status lines for GitHub; none when no repo is watched and none is excluded."""
+    excluded = ["      github     excluded from watching and reading: %s (excluded_repos)" % ", ".join(report["excluded"])] if report.get("excluded") else []
     if not report["repos"]:
-        return []
-    lines = ["      github     watching %s; catch-up reads reach back %g h, older events are lost"
+        return excluded
+    lines = excluded + ["      github     watching %s; catch-up reads reach back %g h, older events are lost"
              % (", ".join(report["repos"]), report["lookback_hours"])]
     if not report["daemon"]:
         lines.append("        daemon not running: forwarder state is unknown")
@@ -15209,15 +15220,15 @@ def _fleet_repo(fleet, config):
 def watched_repos(config, fleets):
     """The repos to watch now, sorted: the config baseline, every `repo` a live fleet agent names, and the
     repo of every charter it holds. `fleets` maps agent name -> metadata.fleet. Derived on every call, so
-    there is nothing to keep and nothing to lose (R3). The `static-repos` fault reads the baseline only."""
+    there is nothing to keep and nothing to lose (R3). The `static-repos` fault reads the baseline only. The config's `excluded_repos` are taken out of the result,
+    so every consumer of this set (forwarders, sweep, triage) honours them."""
     found = set(config["github_repos"])
-    if fault("static-repos"):
-        return sorted(found)
-    for fleet in fleets.values():
-        repo = _fleet_repo(fleet, config)
-        if repo:
-            found.add(repo)
-    return sorted(found)
+    if not fault("static-repos"):
+        for fleet in fleets.values():
+            repo = _fleet_repo(fleet, config)
+            if repo:
+                found.add(repo)
+    return sorted(load_module("repo_exclusion").without_excluded(config, found))   # #446: an excluded repository is never watched, whatever names it
 
 
 def discovered_fleets(discovery):
@@ -15657,6 +15668,7 @@ class IntentReader:
         self.gh, self.repo, self.runner, self.now = gh, repo, runner, now
         self.timeout, self.ttl = timeout, ttl
         self.accounts = accounts  # PR 15: a GhAccounts; None reads every repo with the default account
+        self.config = None        # set by intent_reader_for: the config's excluded_repos are never read
         self._cache = {}
         self.live, self.live_ttl = None, INTENT_TTL_LIVE   # live(repo) -> the running forwarder's generation, or None (the hub sets it)
 
@@ -15672,6 +15684,8 @@ class IntentReader:
             raise IntentError("gh", str(err)) from None
 
     def _api(self, path, repo=None):
+        if self.config is not None and load_module("repo_exclusion").is_excluded(self.config, repo or self.repo):
+            raise IntentError("excluded", "repository %s is excluded from the fleet's reads (excluded_repos)" % (repo or self.repo))   # #446: no read
         argv = [self.gh, "api", path]
         env = self.env_for(repo)
         extra = {"env": env} if env is not None else {}
@@ -15812,8 +15826,10 @@ def intent_reader_for(config, runner=subprocess.run, now=time.time):
     """The IntentReader the config asks for, or None when no `intent_repo` is set."""
     if not config.get("intent_repo"):
         return None
-    return IntentReader(config["gh"], config["intent_repo"], runner, now, config["call_timeout_seconds"],
-                        accounts=GhAccounts(config, runner, now))
+    reader = IntentReader(config["gh"], config["intent_repo"], runner, now, config["call_timeout_seconds"],
+                          accounts=GhAccounts(config, runner, now))
+    reader.config = config
+    return reader
 
 
 # -- composing: one section per ask

@@ -49474,6 +49474,94 @@ class TestModuleLoader(Base):
         self.assertNotIn("outside_mod", sys.modules)
 
 
+class TestExcludedRepos(Base):
+    """Ask #446: an excluded repository is never watched and never read; an agent working in it still sends and reports; an az key command names its subscription."""
+
+    def rig(self, excluded, **kwargs):
+        return FarmRig(self, config={"excluded_repos": excluded}, **kwargs)
+
+    def test_s1_an_excluded_repo_named_by_an_agent_and_a_charter_is_never_watched_or_read(self):
+        rig = self.rig(["ACME/Web"], baseline=[ACME_API], agents={
+            "web-orch": {"role": "orchestrator", "charter": 1, "repo": ACME_WEB},
+            "web-coder": {"role": "worker", "repo": "acme/WEB"}})
+        rig.pump(20)
+        self.assertEqual(sorted(rig.hub.watches), [ACME_API], "no watch, so no forwarder")
+        self.assertIsNone(rig.repo(ACME_WEB).forwarder())
+        fleets = {"web-orch": {"role": "orchestrator", "charter": 1, "repo": ACME_WEB}}
+        self.assertEqual(sb.watched_repos(rig.world.config, fleets), [ACME_API], "the one derivation every consumer (sweep, triage, the hub) uses")
+        self.assertEqual(rig.world.engine.repos_in_play(), [ACME_API])
+        calls = []
+        reader = sb.IntentReader(GH_BIN, ACME_API, lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(argv, 0, "{}", ""))
+        reader.config = rig.world.config
+        with self.assertRaises(sb.IntentError) as caught:
+            reader.issue(5, ACME_WEB)
+        self.assertEqual(caught.exception.reason, "excluded")
+        self.assertEqual(calls, [], "the intent reader made no call for it")
+
+    def test_s2_status_lists_it_once_as_excluded_and_never_as_failing(self):
+        config = sb.validate_config({"github_repos": [ACME_API], "excluded_repos": [ACME_WEB]})
+        lines = sb.format_github(sb.github_status(config, self.home, {"w": {"role": "worker", "repo": ACME_WEB}}))
+        excluded = [line for line in lines if "excluded" in line]
+        self.assertEqual(len(excluded), 1, lines)
+        self.assertIn(ACME_WEB, excluded[0])
+        self.assertFalse(any(word in line for line in lines for word in ("failed", "failure", "unreadable", "flapping")), lines)
+        only = sb.validate_config({"excluded_repos": [ACME_WEB]})
+        self.assertEqual(len(sb.format_github(sb.github_status(only, self.home))), 1, "even with nothing else watched it is said once")
+
+    def test_s3_and_s7_a_worker_in_an_excluded_repo_still_sends_and_is_answered(self):
+        rig = self.rig([ACME_WEB], agents={"web-coder": {"role": "worker", "repo": ACME_WEB, "boss": "cos"},
+                                           "cos": {"role": "chief-of-staff"}})
+        rig.pump(10)
+        out = rig.world.engine.send("web-coder", "cos", "a question for you")
+        self.assertNotEqual(out.get("action"), "refused", out)
+        out2 = rig.world.engine.send("cos", "web-coder", "the answer")
+        self.assertNotEqual(out2.get("action"), "refused", out2)
+        self.assertEqual(sorted(rig.hub.watches), [], "and the repository is still not watched")
+
+    def test_s4_a_bad_list_is_refused_naming_the_key_and_a_cased_entry_excludes(self):
+        for bad in (["not a repo"], "acme/web", ["acme/web", "ACME/web"], [5]):
+            with self.assertRaises(sb.ConfigError) as caught:
+                sb.validate_config({"excluded_repos": bad})
+            self.assertIn("excluded_repos", str(caught.exception))
+        config = sb.validate_config({"github_repos": ["acme/web"], "excluded_repos": ["ACME/Web"]})
+        self.assertEqual(sb.watched_repos(config, {}), [])
+
+    def write_mapping(self, key_source):
+        path = self.home / "mapping.json"
+        path.write_text(json.dumps({"base_url": "https://example.invalid", "key_source": key_source}))
+        return str(path)
+
+    def load_with(self, mapping):
+        sb._WARNED_CONFIG.clear()
+        out = io.StringIO()
+        raw = {"external_decisions": {"enabled": True, "adapter": "mcp_rest", "mapping_file": mapping, "tier_map": {t: "x" for t in ("orchestrator", "cos", "human")},
+                                      "repos": [ACME_API]}}
+        with contextlib.redirect_stderr(out):
+            sb.validate_config(raw, "config")
+        return out.getvalue()
+
+    def test_s5_an_az_key_command_without_a_subscription_warns_once_and_with_one_does_not(self):
+        bare = self.write_mapping({"command": ["az", "keyvault", "secret", "show", "--vault-name", "vault-xyz", "--name", "secret-abc", "--query", "value", "-o", "tsv"]})
+        text = self.load_with(bare)
+        self.assertEqual(text.count("warning"), 1, text)
+        self.assertIn("--subscription", text)
+        self.assertIn("external_decisions", text)
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):   # a second load in the same process says nothing more
+            sb.validate_config({"external_decisions": {"enabled": True, "adapter": "mcp_rest", "mapping_file": bare, "tier_map": {t: "x" for t in ("orchestrator", "cos", "human")}, "repos": [ACME_API]}}, "config")
+        self.assertEqual(out.getvalue(), "")
+        named = self.write_mapping({"command": ["az", "keyvault", "secret", "show", "--subscription", "00000000-0000", "--name", "n"]})
+        self.assertEqual(self.load_with(named), "")
+        other = self.write_mapping({"command": ["vault-tool", "get", "x"]})
+        self.assertEqual(self.load_with(other), "")
+
+    def test_s6_the_warning_never_prints_the_commands_other_arguments(self):
+        text = self.load_with(self.write_mapping({"command": ["az", "keyvault", "secret", "show", "--vault-name", "vault-xyz", "--name", "secret-abc"]}))
+        self.assertTrue(text)
+        for private in ("vault-xyz", "secret-abc", "keyvault", "--vault-name"):
+            self.assertNotIn(private, text)
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.
