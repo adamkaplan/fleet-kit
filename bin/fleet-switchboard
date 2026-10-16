@@ -18551,14 +18551,29 @@ def cmd_impact_floor(args, runner, now):
                 raise ValueError("--rating SEVERITY/PROBABILITY: severity is one of %s, probability one of %s (got %s/%s)" % (
                     ", ".join(matrix["severities"]), ", ".join(matrix["probabilities"] + matrix["not_rated"]), severity, probability))
         report = pr_floor_report(engine, repo, number, pairs)
+    except impact_floor.MatrixError as err:   # the rule file cannot be read: it is HELD ON PURPOSE (never read as "no floor"), said in words and in json; nothing was judged and nothing is written
+        why = _one_line(str(err), 200)
+        if args.json:
+            print(json.dumps({"pr": "%s#%d" % (repo, number), "head": None, "decision": "hold", "owner_decision": "hold", "reasons": [], "owner_reasons": ["held on purpose: the rule file cannot be read: %s" % why],
+                              "unknown": "the rule file cannot be read", "floor_paths": [], "globs": []}, sort_keys=True))
+        else:
+            print("impact floor for %s: HELD ON PURPOSE (advisory: nothing is written)" % ("%s#%d" % (repo, number)))
+            print("  held on purpose: the rule file cannot be read, so nothing was judged and no change may be read as not held: %s" % why)
+        return EXIT_OK
     except (NoticeError, ValueError) as err:
         sys.stderr.write("%s: impact floor: %s\n" % (PROG, _one_line(str(err), 300)))
         return EXIT_USAGE
     if args.json:
-        print(json.dumps(report, sort_keys=True))
+        print(json.dumps(report, sort_keys=True))   # the report as the daemon's pass reads it: `owner_decision` and `owner_reasons` next to the path-floor fields
     else:
-        print("impact floor for %s at %s: %s (advisory: nothing is written)" % (
-            report["pr"], (report["head"] or "unknown head")[:8], report["decision"].upper().replace("-", " ")))
+        owner = report.get("owner_decision")
+        words = {"hold": "HOLD for the owner", "second-review": "not held for the owner: a second independent review", "none": "not held"}.get(owner, "HELD ON PURPOSE (unknown decision %r)" % (owner,))
+        print("impact floor for %s at %s: %s (advisory: nothing is written)" % (report["pr"], (report["head"] or "unknown head")[:8], words))
+        for reason in report.get("owner_reasons") or []:
+            print("  %s: %s" % ("why" if owner == "hold" else "because", reason))
+        if owner == "none" and not report.get("owner_reasons"):
+            print("  because: no changed path is a top tier path of the matrix, and no independent review or rating holds it")
+        print("  path floor (older advisory, not the owner's rule): %s" % report["decision"].upper().replace("-", " "))
         for reason in report["reasons"]:
             print("  %s" % reason)
         for path in report["floor_paths"]:
