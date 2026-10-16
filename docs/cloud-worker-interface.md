@@ -30,8 +30,8 @@ Settings that decide which repositories a worker may serve (read from the enviro
 
 | Setting | Meaning |
 |---|---|
-| `CW_ALLOWED_REPOS` | comma-separated `OWNER/NAME` allow-list, exact and case-insensitive, no wildcard; unset, empty or a malformed entry refuses every repository |
-| `CW_TOOLING_REPO` | `OWNER/NAME` of the tooling's own repository: refused even when listed; unset adds no extra check, malformed refuses |
+| `CW_ALLOWED_REPOS` | comma-separated `OWNER/NAME` allow-list, exact and case-insensitive, no wildcard; unset, empty or a malformed entry refuses every repository; read from the environment of whoever runs the launcher or driver (the operator exports it), so a mistake-guard for the operator, not a boundary: the stops are the token's one-repository scope and the repository's rules; spellings only (a renamed repository is not matched); an entry ending in `.git` is malformed |
+| `CW_TOOLING_REPO` | `OWNER/NAME` of the tooling's own repository: refused even when listed; unset adds no extra check, malformed (including a trailing `.git`) refuses; same environment and spelling-only caveats as above |
 
 The guards of the cloud worker against the Mac agent and CI are in `docs/cloud-guard-parity.md`.
 

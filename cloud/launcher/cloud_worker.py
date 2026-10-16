@@ -148,9 +148,9 @@ _NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
 
 
 def _repo_key(text):
-    """OWNER/NAME lower-cased, or None when it is not exactly that shape (no wildcard, space, dot segment or extra slash)."""
+    """OWNER/NAME lower-cased, or None when it is not exactly that shape (no wildcard, space, newline, dot segment, trailing .git or extra slash). It compares spellings: a renamed or transferred repository is not matched."""
     owner, sep, name = (text or "").partition("/")
-    if not sep or not _OWNER_RE.match(owner) or not _NAME_RE.match(name) or set(name) == {"."}:
+    if not sep or not _OWNER_RE.fullmatch(owner) or not _NAME_RE.fullmatch(name) or set(name) == {"."} or name.lower().endswith(".git"):
         return None
     return (owner + "/" + name).lower()
 

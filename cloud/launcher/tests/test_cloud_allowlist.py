@@ -76,6 +76,26 @@ class S8Launcher(Allow):
         self.env["CW_TOOLING_REPO"] = "not a repo"
         self.refused("acme-org/widget-service")
 
+    def test_a_trailing_dot_git_is_malformed_in_the_tooling_setting_and_in_the_list(self):
+        self.env["CW_TOOLING_REPO"] = "acme-org/tooling.git"
+        self.refused("acme-org/widget-service")
+        self.env["CW_TOOLING_REPO"] = TOOLING
+        self.env["CW_ALLOWED_REPOS"] = LIST + ",acme-org/widget-web.git"
+        self.assertIn("not OWNER/NAME", self.refused("acme-org/widget-service"))
+
+    def test_a_trailing_newline_is_not_accepted_anywhere(self):
+        for repo in ("acme-org/widget-service\n", "acme-org\n/widget-service"):
+            self.refused(repo)
+        self.assertIsNone(cw._repo_key("acme-org/widget-service\n"))
+        self.assertIsNone(cw._repo_key("acme-org\n/widget-service"))
+        self.env["CW_TOOLING_REPO"] = "acme-org/tool\ning"
+        self.refused("acme-org/widget-service")
+        self.assertFalse(run_task.REPO_RE.fullmatch("acme-org/widget-service\n"))
+
+    def test_a_renamed_repository_is_not_matched_spellings_only(self):
+        self.env["CW_ALLOWED_REPOS"] = "acme-org/old-name"
+        self.assertIn("not on the cloud allow-list", self.refused("acme-org/new-name"))
+
     def test_tooling_unset_adds_no_extra_check(self):
         del self.env["CW_TOOLING_REPO"]
         self.assertEqual(self.create_for("acme-org/widget-api")[0], 0)

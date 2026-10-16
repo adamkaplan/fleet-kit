@@ -403,5 +403,8 @@ planted "a blank cell" "${row}s/| covered |\$/|  |/"
 planted "a row with no status" "${row}s/| covered |\$/| done |/"
 planted "a GAP with no owner" "${row}s/| covered |\$/| GAP (item: #1) |/"
 planted "an unknown law id" "${row}s/FK-LAW-1,/FK-LAW-99,/"
+planted "'covered, mostly'" "${row}s/| covered |\$/| covered, mostly |/"
+planted "a GAP whose item is -" "${row}s/| covered |\$/| GAP (owner: x; item: -) |/"
+planted "a law id not in the list" "${row}s/FK-LAW-1,/FK-LAW-9,/"
 printf '# empty\n' > "$tmp/e.md"; "$chk" "$tmp/e.md" >/dev/null 2>&1; [ $? = 1 ] && ok "parity table: no rows exits 1" || bad "parity table: no rows"
 [ $fail = 0 ] && echo "RESULT: PASS" || { echo "RESULT: FAIL"; exit 1; }
