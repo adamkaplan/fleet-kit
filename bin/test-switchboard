@@ -26818,6 +26818,50 @@ class TestImpactFloorOwnerDecision(LedgerBase):
             self.assertEqual((shown["owner_decision"], shown["owner_reasons"]), (report["owner_decision"], report["owner_reasons"]), globs)
             self.assertEqual(what in ("add", "held", "cleared"), shown["owner_decision"] == "hold", (globs, what))
 
+    def renamed(self, source=None):
+        item = {"path": "docs/neutral.md", "additions": 0, "deletions": 0, "changeType": "RENAMED"}
+        if source:
+            item["previous_filename"] = source
+        self.pr.update({"changedFiles": 1, "files": [item]})
+
+    def daemon_agrees(self, shown):
+        engine = self.world.new_engine("daemon")
+        engine.gh_runner = self.route
+        engine.config, engine.state_dir = sb.load_config(), self.world.state
+        report = sb.pr_floor_report(engine, "acme/app", 9)
+        what, _ = sb.impact_plan(engine, report, [], sb.read_impact_state(self.world.state)[0], {}, None)
+        self.assertEqual((shown["owner_decision"], shown["owner_reasons"]), (report["owner_decision"], report["owner_reasons"]))
+        self.assertEqual(what in ("add", "held", "cleared"), shown["owner_decision"] == "hold")
+
+    def test_a_rename_out_of_a_top_tier_path_with_its_source_known_is_a_hold_naming_the_source_and_its_class(self):
+        for globs in (True, False):
+            self.extra_config = dict(FLOOR_CONFIG, plan_gates={"repos": {"acme/app": {"mode": "shadow"}}}) if globs else {"plan_gates": {"repos": {"acme/app": {"mode": "shadow"}}}}
+            self.configure()
+            self.renamed(source="shims/gh")
+            out = self.floor()
+            self.assertIn("HOLD for the owner, 1 file read", out.split("\n")[0], globs)
+            self.assertIn("top tier path (credentials): shims/gh", out)
+            self.daemon_agrees(json.loads(self.floor("--json")))
+
+    def test_a_rename_whose_source_path_is_not_listed_never_reads_as_not_held_in_a_repo_with_no_floor_globs(self):
+        self.extra_config = {"plan_gates": {"repos": {"acme/app": {"mode": "shadow"}}}}
+        self.configure()
+        self.renamed()
+        out = self.floor()
+        self.assertIn("CANNOT TELL: 1 renamed or copied file(s) with no source path (the daemon's decision for the paths it saw: not held)", out)
+        self.assertIn("this is not a verdict of \"not held\"", out)
+        self.assertNotIn("not held, ", out.split("\n")[0])
+        shown = json.loads(self.floor("--json"))
+        self.assertEqual((shown["owner_decision"], shown["renamed_no_source"]), ("none", ["docs/neutral.md"]), "the daemon reads it as none: said, not changed here")
+        self.daemon_agrees(shown)
+
+    def test_a_rename_whose_source_path_is_not_listed_is_held_in_a_repo_with_floor_globs_as_the_daemon_holds_it(self):
+        self.renamed()   # the repo of this class has floor globs
+        out = self.floor()
+        self.assertIn("HOLD for the owner, 1 file read", out.split("\n")[0])
+        self.assertIn("renamed or copied file(s) with no known source path", out)
+        self.daemon_agrees(json.loads(self.floor("--json")))
+
     def test_s4_a_rule_file_that_cannot_be_read_is_held_on_purpose_with_the_reason_and_nothing_is_written(self):
         self.files("docs/switchboard.md")
 
