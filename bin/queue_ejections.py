@@ -243,7 +243,12 @@ def watched(sb, engine, repo):
 def read_ledger(sb, engine):
     """{"woke": {"<repo>#<run>": {...}}}: what was handled. A damaged file reads as empty."""
     data = sb._read_small(engine.state_dir, STATE_FILE).get("woke")
-    return {k: v for k, v in (data or {}).items() if isinstance(k, str) and isinstance(v, dict) and isinstance(v.get("ts"), (int, float))}
+    found = {}
+    for key, value in (data or {}).items():
+        if isinstance(key, str) and isinstance(value, dict) and isinstance(value.get("ts"), (int, float)) and not isinstance(value.get("pr"), bool) and isinstance(value.get("pr"), int):
+            names = value.get("names")
+            found[key] = dict(value, names=[safe(n) for n in names[:MAX_NAMES] if isinstance(n, str)] if isinstance(names, list) else [])   # the file is data too: never trusted as written
+    return found
 
 
 def write_ledger(sb, engine, woke, now):
@@ -344,12 +349,25 @@ def run_pass(sb, engine, now, calls):
         memory["built"].pop(entry["key"], None)
         engine.audit.append(engine.actor, "queue_ejection.woke", "%s#%d" % (entry["repo"], entry["pr"]),
                             {"run": entry["run"], "to": entry["owner"], "kind": entry["kind"], "names": len(entry["names"])})
-    if woke != before:
-        try:
-            write_ledger(sb, engine, woke, now)
-        except OSError as err:   # without the file a restart may wake once more: said, not fatal
-            engine._note("queue_ejection.error", None, {"error": "%s not written: %s" % (STATE_FILE, sb._one_line(str(err), 100))})
+        before = _save(sb, engine, woke, before, now)   # at once: a crash after a send must not wake it again
+    _save(sb, engine, woke, before, now)
+    for table in ("retry", "attempts", "built", "recheck"):   # what is done, or past its time, is forgotten: the memory does not grow with the days
+        for key in [k for k, v in memory[table].items() if k in woke or (table in ("retry", "recheck") and now >= v)]:
+            memory[table].pop(key, None)
+    memory["said"] -= set(woke)
     return spent
+
+
+def _save(sb, engine, woke, before, now):
+    """Write the ledger when it changed; returns the new 'before'. A failed write is said, not fatal (a restart may then wake once more)."""
+    if woke == before:
+        return before
+    try:
+        write_ledger(sb, engine, woke, now)
+    except OSError as err:
+        engine._note("queue_ejection.error", None, {"error": "%s not written: %s" % (STATE_FILE, sb._one_line(str(err), 100))})
+        return before
+    return {k: dict(v) for k, v in woke.items()}
 
 
 def _reader(sb, engine, runner, now, repo):

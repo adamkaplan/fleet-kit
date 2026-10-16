@@ -57335,7 +57335,7 @@ class FakeQueueGh:
 
     def __init__(self):
         self.runs, self.pulls, self.zips, self.jobs, self.calls, self.artifact_name = {}, {}, {}, {}, [], "failing-tests"
-        self.fail = set()
+        self.fail, self.graphql_fault = set(), None
 
     def add(self, repo, run_id, pr, now, conclusion="failure", status="completed", name="ci", age=60, created_age=None, names=None, complete=True, raw=None, jobs=()):
         stamp = lambda ago: sb.iso(now - ago)
@@ -57359,6 +57359,10 @@ class FakeQueueGh:
             fields = dict(a.split("=", 1) for a in argv if "=" in a and not a.startswith("query="))
             repo, pr = "%s/%s" % (fields["owner"], fields["name"]), int(fields["number"])
             self.calls.append("graphql %s#%d" % (repo, pr))
+            if self.graphql_fault == "exit":
+                return done("", 1, "gh: HTTP 502")
+            if self.graphql_fault == "malformed":
+                return done('{"data": {"repository": null}}')
             state, queued = self.pulls[(repo, pr)]
             return done(json.dumps({"data": {"repository": {"pullRequest": {"state": state, "mergeQueueEntry": {"id": "Q"} if queued else None}}}}))
         path = argv[-1]
@@ -57436,9 +57440,11 @@ class TestQueueEjections(Base):
         self.gh.pulls[(self.REPO, 23)] = ("OPEN", True)                           # still holds a queue entry
         self.add(5, 24, names=["x"])
         self.gh.pulls[(self.REPO, 24)] = ("MERGED", False)
+        self.add(8, 26, names=["x"])
+        self.gh.pulls[(self.REPO, 26)] = ("CLOSED", False)
         self.add(6, 25, conclusion=None, status="in_progress")                    # a run still going
         self.go()
-        self.assertEqual(self.sent, [], "0 messages in 5 of 5 cases")
+        self.assertEqual(self.sent, [], "0 messages in 6 of 6 cases")
 
     def test_a_failed_run_whose_pull_request_was_re_enqueued_is_looked_at_again_later(self):
         self.add(4, 23, names=["x"])
@@ -57450,6 +57456,38 @@ class TestQueueEjections(Base):
         self.world.tick(self.module.RECHECK_SECONDS + 1)
         self.go()
         self.assertEqual(len(self.sent), 1, "ejected after all: woken")
+
+    def test_a_pull_request_read_that_fails_wakes_nobody_is_said_once_and_is_retried_after_the_back_off(self):
+        self.add(9, 27, names=["x"])
+        for fault in ("exit", "malformed"):
+            self.gh.graphql_fault = fault
+            self.go()
+            self.go()
+            self.assertEqual((self.sent, self.gh.count(self.REPO, "graphql")), ([], 1 if fault == "exit" else 2), fault)
+            self.world.tick(self.module.RETRY_SECONDS + 1)
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "queue_ejection.read_failed"]), 1, "said once")
+        self.gh.graphql_fault = None
+        self.go()
+        self.assertEqual(len(self.sent), 1, "after the back-off the read works")
+
+    def test_a_ledger_that_cannot_be_written_is_said_and_the_wake_still_went(self):
+        self.add(10, 28, names=["x"])
+        with mock.patch.object(sb, "_write_small", side_effect=OSError("disk full")):
+            self.go()
+        self.assertEqual(len(self.sent), 1)
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "queue_ejection.error"])
+
+    def test_a_tampered_ledger_name_is_made_safe_before_it_can_reach_a_line(self):
+        sb._write_small(self.engine.state_dir, self.module.STATE_FILE, {"woke": {"%s#1" % self.REPO: {"pr": 1, "repo": self.REPO, "ts": self.world.clock.now(), "woke": True, "kind": "tests", "names": ["@all /deploy ghp_" + "Ab1" * 10]}}})
+        ledger = self.module.read_ledger(types.SimpleNamespace(_read_small=sb._read_small), self.engine)
+        (entry,) = ledger.values()
+        self.assertEqual([("@" in n, n.startswith("/"), "ghp_" in n) for n in entry["names"]], [(False, False, False)])
+
+    def test_the_memory_does_not_keep_what_is_done(self):
+        self.add(11, 29, names=["x"])
+        self.go()
+        memory = self.engine.queue_ejections
+        self.assertEqual([len(memory[t]) for t in ("retry", "attempts", "built", "recheck")], [0, 0, 0, 0])
 
     def test_a_failure_older_than_the_window_is_history_and_wakes_nobody(self):
         self.add(7, 31, names=["x"], age=self.module.WAKE_WINDOW + 60)
