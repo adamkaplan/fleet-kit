@@ -38594,6 +38594,55 @@ class TestBatchAnswer(BatchWorld):
         self.assertNotEqual(code, 0, "answered: nothing is waiting")
         self.assertEqual(len(self.gh.comments), 1)
 
+    def test_a_note_that_went_before_the_comment_failed_is_not_sent_again_when_the_answer_is_run_again(self):
+        notes = lambda: len([a for a in self.world.admissions("api-orch") if "is answered" in str(a)])
+        with mock.patch.object(sb.IssueDelivery, "deliver", side_effect=sb.DecisionError("gh is down")):
+            code, out, err = self.answer("--as-recommended")
+        self.assertNotEqual(code, 0, out)
+        self.assertEqual((notes(), self.gh.comments), (1, []), "the note went, the comment did not")
+        code, out, err = self.answer("--as-recommended")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(notes(), 1, "the re-run sends no second note")
+        self.assertIn("already told api-orch", out)
+        self.assertEqual(len(self.gh.comments), 1)
+        self.assertEqual(self.gh.names(*self.batch), [])
+
+    def failing_comment(self):
+        return mock.patch.object(sb.IssueDelivery, "deliver", side_effect=sb.DecisionError("gh is down"))
+
+    def notes(self):
+        return len([a for a in self.world.admissions("api-orch") if "is answered" in str(a)])
+
+    def test_a_later_answer_with_the_same_text_after_a_fully_recorded_one_sends_its_own_note(self):
+        self.assertEqual(self.answer("--as-recommended")[0], 0)
+        self.assertEqual((self.notes(), sb.read_batch_notes(self.state_dir)), (1, {}), "fully recorded: the key is forgotten")
+        self.gh.issues[self.batch]["labels"] += ["me:awaiting-cos"]   # the batch is open again
+        code, out, err = self.answer("--as-recommended")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.notes(), 2, "a new answer, the same text: its own note")
+
+    def test_two_different_answers_with_the_same_counts_each_send_a_note(self):
+        with self.failing_comment():
+            self.answer("--row", "1=keep it")
+        self.assertEqual(self.notes(), 1)
+        with self.failing_comment():
+            self.answer("--row", "1=close it now")
+        self.assertEqual(self.notes(), 2, "1 row changed both times, but not the same answer")
+        self.assertEqual(len(sb.read_batch_notes(self.state_dir)), 2)
+
+    def test_the_pending_note_is_kept_on_disk_between_the_note_and_the_comment(self):
+        with self.failing_comment():
+            self.answer("--as-recommended")
+        (key,) = sb.read_batch_notes(self.state_dir)
+        self.assertTrue(key.startswith("acme/api#%d:" % self.batch[1]))
+        self.assertEqual(self.answer("--as-recommended")[0], 0)
+        self.assertEqual(self.notes(), 1)
+
+    def test_the_notes_file_stays_bounded(self):
+        for n in range(sb.BATCH_NOTES_KEEP + 20):
+            sb.mark_batch_note(self.state_dir, "k%d" % n, 1000 + n)
+        self.assertEqual(len(sb.read_batch_notes(self.state_dir)), sb.BATCH_NOTES_KEEP)
+
     def test_bad_answers_are_refused_and_write_nothing(self):
         for argv, why in ((("--row", "4=x"), "does not exist"), (("--row", "0=x"), "does not exist"),
                           (("--row", "1=a", "--row", "1=b"), "twice"), (("--row", "x"), "not a row answer"),
