@@ -25022,7 +25022,7 @@ class TestG1UnwrittenClaim(LedgerBase):
         self.assertEqual(row["detail"].count("S2"), 1)
         self.assertRegex(row["detail"], r"epic-claimed, proven after the merge at the integration head: S2, S4")
 
-    def test_the_same_plan_before_the_change_read_as_missing_without_the_unwritten_rule(self):
+    def test_a_tester_scenario_whose_proof_is_not_a_measure_stays_claimed(self):
         row = self.g1(self.plan(s2_proof="live"))
         self.assertEqual(row["status"], "missing", "a tester scenario whose proof is not a measure is claimed as before")
         self.assertTrue(any(m.startswith("S2") for m in row["missing"]), row)
@@ -25048,6 +25048,17 @@ class TestG1UnwrittenClaim(LedgerBase):
         self.assertIn("0 of 2 claimed scenarios proven", row["detail"], "S1 and S2 are claimed, S3 (tester + measure, unwritten) is not")
         self.assertEqual(sorted(m.split(":")[0] for m in row["missing"]), ["S1", "S2"])
         self.assertIn("integration head: S3", row["detail"])
+
+    def test_a_plan_whose_only_scenarios_are_unwritten_tester_measures_never_passes_vacuously(self):
+        pl = sb.load_module("plan_ledger")
+        plan = {"result": "pass", "defects": [], "plan_hash": "sha256:" + "0" * 64, "text": "", "scenarios_parsed": [
+            {"id": "S1", "evaluator": "tester", "proof": "measure"}, {"id": "S2", "evaluator": "tester", "proof": "measure"}]}
+        row = next(r for r in pl.evaluate_gates(plan, [], None, {"head": LEDGER_HEAD}, self.PR)["gates"] if r["gate"] == "G1")
+        self.assertEqual(row["status"], "missing", "no scenario is claimed per PR: G1 still asks for the reasoned statement")
+        self.assertIn("no scenario is claimed per PR", " ".join(row["missing"]))
+        plan["text"] = "per-pr scenarios: none because every scenario is the tester's live check after the merge"
+        row = next(r for r in pl.evaluate_gates(plan, [], None, {"head": LEDGER_HEAD}, self.PR)["gates"] if r["gate"] == "G1")
+        self.assertEqual(row["status"], "n/a")
 
     def test_claim_of_reads_only_what_is_written(self):
         pl = sb.load_module("plan_ledger")
