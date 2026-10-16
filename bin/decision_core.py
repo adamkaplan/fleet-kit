@@ -770,6 +770,12 @@ def captain_entry(notice, facts, escalated, evidence):
     return entry
 
 
+def pr_key(repo, number):
+    """The ONE fold of a pull request's identity (`owner/repo` is case-insensitive on GitHub): every source of a pull request's decision row and the merge of the sources by pull request use this key,
+    so a notice recorded as `Acme-Org/Widget` and a list that names `acme-org/widget` are one pull request."""
+    return (str(repo or "").strip().lower(), int(number))
+
+
 def labels_entry(repo, number, tag, record, escalated, default_repo=None):
     """#641: a held pull request as a decision row on its hold labels ALONE (no recorded notice): kind `captain`, the SAME id a notice would give it (`pr:<tag>#N`, so one row once a
     notice is recorded), tier `cos` until the Chief of Staff escalated it for this head. `record` is the pull request as the daemon's open-pull-request list read it (number, title, head
