@@ -57923,6 +57923,48 @@ class TestSkillsSync(unittest.TestCase):
         self.assertFalse(sb.install_skills(self.dest, self.kit))
         self.assertTrue(sb.skills_status_line([self.dest], self.kit)[0])
 
+    def run_cmd(self, action):
+        home = self.tmp / "home"
+        env = {"HOME": str(home), "XDG_DATA_HOME": str(self.tmp / "data")}
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, env), mock.patch.object(sb, "KIT_ROOT", self.kit), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = sb.cmd_skills(types.SimpleNamespace(skills_action=action), None, None)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_command_exit_codes_and_no_folder(self):
+        code, _, err = self.run_cmd("sync")
+        self.assertEqual(code, 1)
+        self.assertIn("no installed skills folder", err)
+        code, out, _ = self.run_cmd("check")
+        self.assertEqual(code, 0)
+        self.assertIn("no installed skills folder", out)
+
+    def test_command_check_fails_and_sync_clears_it(self):
+        target = self.tmp / "data" / sb.PROG / "skills"
+        shutil.copytree(str(self.dest), str(target))
+        (target / "fleet-b" / "SKILL.md").write_text("old\n")
+        code, out, _ = self.run_cmd("check")
+        self.assertEqual((code, "fleet-b" in out, "skills sync" in out), (1, True, True))
+        self.assertEqual(self.run_cmd("sync")[0], 0)
+        self.assertEqual(self.run_cmd("check")[0], 0)
+
+    def test_two_backups_in_one_second_do_not_collide(self):
+        with mock.patch.object(sb.time, "strftime", return_value="20260101000000"):
+            for text in ("one\n", "two\n"):
+                self.skill("fleet-b").write_text(text)
+                sb.sync_skills(self.dest, self.kit)
+        got = sorted(b.read_text() for b in (self.dest / "fleet-b").glob("SKILL.md.bak-*"))
+        self.assertEqual(got, ["one\n", "two\n"])
+
+    def test_a_failed_write_leaves_no_temporary_file(self):
+        self.skill("fleet-b").write_text("old\n")
+        with mock.patch.object(sb.os, "replace", side_effect=OSError("boom")):
+            with self.assertRaises(OSError):
+                sb.sync_skills(self.dest, self.kit)
+        self.assertEqual([p.name for p in (self.dest / "fleet-b").iterdir() if p.name.startswith(".")], [])
+        self.assertEqual(self.skill("fleet-b").read_text(), "old\n")
+
     def test_locations_name_both_folders(self):
         home, data = self.tmp / "home", self.tmp / "data"
         (data / "skills").mkdir(parents=True)

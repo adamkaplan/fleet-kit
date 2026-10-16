@@ -25921,14 +25921,14 @@ def cmd_skills(args, runner, now):
     """`skills check` (read only) and `skills sync` (the kit's skills into every installed folder that exists)."""
     locations = skill_locations()
     if args.skills_action == "check":
-        ok, text = skills_status_line(locations)
+        ok, text = skills_status_line(locations, KIT_ROOT)
         print(text)
         return EXIT_OK if ok else EXIT_ERROR
     if not locations:
         sys.stderr.write("%s: skills: no installed skills folder found; run `%s install`\n" % (PROG, PROG))
         return EXIT_ERROR
     for location in locations:
-        changed = sync_skills(location)
+        changed = sync_skills(location, KIT_ROOT)
         print("%s: %s" % (location, "%d file(s) replaced (old ones kept as SKILL.md.bak-*)" % len(changed) if changed else "already in sync"))
     return EXIT_OK
 
