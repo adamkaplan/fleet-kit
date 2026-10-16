@@ -11930,6 +11930,11 @@ def triage_charter_descendants(items, charters):
     return below, unresolved
 
 
+def triage_awaits_live(item):
+    """True when an open issue carries a label ending in `:awaiting-live`: it waits on a live event, so T9 and T12 stay quiet (#574)."""
+    return any(str(l).endswith(":awaiting-live") for l in item["labels"])
+
+
 def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs, window_ok=True, captain_skip=False, merged=None, pending=None):
     """{rule: evidence} for one OPEN item (a pure function: the list copy and the fresh copy go through it alike), and
     whether the item is ours. `comments` is None when the comment unit is not read (T3 and T7 are then not judged).
@@ -11959,7 +11964,7 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
             found["T3"] = {"quiet_days": round(age_updated, 2), "ask": ask}
         if ask and any("blocked" in str(l).lower() for l in item["labels"]) and age_updated >= sla["t8_days"]:
             found["T8"] = {"quiet_days": round(age_updated, 2)}
-        if ask and "T3" not in found and age_updated >= sla["t9_days"]:
+        if ask and "T3" not in found and not triage_awaits_live(item) and age_updated >= sla["t9_days"]:
             found["T9"] = {"quiet_days": round(age_updated, 2)}
         if not chain and not item["assignees"] and not named and "T1" not in found and number not in ctx["unresolved"] \
                 and age_updated >= sla["t11_days"]:
@@ -11968,7 +11973,7 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
         if link:   # #384: its PR merged and it is still open: that is the finding, not "no owner"; ours when the PR's author is ours
             found.pop("T1", None)
             found.pop("T11", None)
-            if not (item["open_sub"] or item["pending_text"] or number in (pending or ())):   # #410: not truly done: an open sub-issue, pending work in its text or a proof not passed
+            if not (item["open_sub"] or item["pending_text"] or number in (pending or ()) or triage_awaits_live(item)):   # #410: not truly done: an open sub-issue, pending work in its text or a proof not passed
                 found["T12"] = load_triage_plan_open().evidence(link, max(0.0, now - (parse_iso(link["merged_at"]) or now)) / day)
                 ours = ours or link["by"] in ours_logins
     elif not item["draft"] and comments is not None and ours and not captain_skip:

@@ -21913,6 +21913,28 @@ class TestTriage(Base):
         self.go()
         self.assertEqual((self.only("T8"), self.only("T9")), (["acme/api#80"], ["acme/api#81"]))
 
+    def test_awaiting_live_label_silences_t3_t9_and_t12_and_only_that_label(self):
+        self.charter()
+        self.add(90, created=9, updated=4, parent=1, labels=["kind", "bot:awaiting-live"])    # an ask quiet 4d, waiting on a live event
+        self.add(91, created=9, updated=4, parent=1, labels=["kind"])                         # the same ask without the label
+        self.add(92, created=20, updated=4, assignees=["bot"], labels=["kind", "bot:awaiting-live"])
+        self.add(93, created=20, updated=4, assignees=["bot"], labels=["kind"], body="Next: go")
+        self.add(94, created=20, updated=4, assignees=["bot"], labels=["kind", "bot:awaiting-live"], body="Next: go")
+        self.merged_pr(250, "Part of #93. Part of #94.")
+        self.go()
+        self.assertEqual(self.only("T3"), ["acme/api#91"])                  # T3 skips any awaiting label (pinned)
+        self.assertNotIn(("T3", "acme/api#90"), self.found())
+        self.assertNotIn(("T3", "acme/api#92"), self.found())
+        self.assertEqual(self.only("T9"), [])                               # #90 is skipped; #91 is T3, which takes precedence
+        self.assertEqual(self.only("T12"), ["acme/api#93"])                 # #94 waits on a live event
+
+    def test_t9_fires_for_a_silent_ask_with_a_next_step_only_without_the_awaiting_live_label(self):
+        self.charter()
+        self.add(95, created=9, updated=4, parent=1, labels=["kind", "bot:awaiting-live"], body="Next: x")
+        self.add(96, created=9, updated=4, parent=1, labels=["kind"], body="Next: x")
+        self.go()
+        self.assertEqual(self.only("T9"), ["acme/api#96"])
+
     def test_t1_an_explicit_owner_line_in_the_body_is_an_owner(self):
         self.charter()
         for n, body in ((300, "Owner: the platform orchestrator"), (301, "- **Owner:** ops\nmore"), (302, "owned by ops-lead"),
