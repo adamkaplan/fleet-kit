@@ -9,7 +9,7 @@ Part of the cloud-worker prototype (plan scenarios S10 and S12). Two pieces:
 This image takes everything it needs from the environment at start and stores nothing. The launcher, run secrets,
 service account and driver are later pull requests; this one is only the image, the scan and the node fix.
 
-Cloud workers serve the organisation's repositories only; no fleet-kit task, test or demo runs in a cloud worker.
+Cloud workers serve the organisation's repositories only; no task, test or demo of the tooling that runs the workers runs in a cloud worker.
 
 ## What is in the image
 
