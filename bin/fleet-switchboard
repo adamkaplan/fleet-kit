@@ -47,6 +47,7 @@ import urllib.parse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import collections
+import ast
 import copy
 import errno
 import fcntl
@@ -479,11 +480,110 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "chat_clear", "temp_janitor", "load_alert", "spotlight_guard", "excluded_repos", "source_budgets", "hold_labels"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "chat_clear", "temp_janitor", "load_alert", "source_budgets", "hold_labels"}
+
+
+CONFIG_DECLARATION_TEXT = re.compile(rb'^[ \t]*CONFIG_KEY[ \t]*(?::[^=\n]*)?=[ \t]*[\'"]([^\'"\n]*)[\'"]', re.M)   # only the fallback for a file that does not parse
+CONFIG_KEY_FORM = re.compile(r"[a-z][a-z0-9_]*")
+CONFIG_READ_BYTES = 1000000
+CONFIG_MUST_DECLARE = {"excluded_repos": "repo_exclusion", "spotlight_guard": "spotlight_guard"}   # keys that MUST be declared by their module: a missing, truncated or unmatched declaration refuses the whole configuration (an unvalidated `excluded_repos` would exclude nothing)
+CONFIG_DECLARATIONS_DIR = None   # None = the bin directory beside this program; only a test points it elsewhere (never configuration or input)
+_DECLARED_CACHE = {}
+
+
+def _declared_listing(directory):
+    """[(module name, path, mtime, size)] of the `*.py` files directly in `directory` (no recursion, regular files, plain module names)."""
+    out = []
+    for entry in sorted(os.scandir(directory), key=lambda e: e.name):
+        stem = entry.name[:-3]
+        if entry.name.endswith(".py") and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", stem) and entry.is_file(follow_symlinks=False):   # a symlink is never read
+            info = entry.stat()
+            out.append((stem, entry.path, info.st_mtime_ns, info.st_size))
+    return out
+
+
+def _declared_key(data):
+    """The key a module's source declares with a top-level `CONFIG_KEY = "<key>"` (read with `ast`, so quotes, spacing and indentation of the line do not matter;
+    an annotation is allowed), or None. A file that does not parse falls back to the text of the line, so a broken declaring module is still SEEN (and then refused
+    when it is loaded), never silently skipped."""
+    try:
+        declared = None
+        for node in ast.parse(data).body:   # the LAST top-level assignment is the one the module ends up holding
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
+            if any(isinstance(t, ast.Name) and t.id == "CONFIG_KEY" for t in targets):
+                value = getattr(node, "value", None)
+                declared = value.value if isinstance(value, ast.Constant) and isinstance(value.value, str) else ""
+        return declared
+    except (SyntaxError, ValueError, RecursionError):
+        found = CONFIG_DECLARATION_TEXT.search(data)
+        return found.group(1).decode("utf-8", "replace") if found else None
+
+
+def config_declarations():
+    """{key: module name} for the modules of the bin directory that declare a configuration key with a `CONFIG_KEY = "<key>"` line (and then
+    `CONFIG_DEFAULT` and `validate(value, source)`): a new module with a key needs no line in the shared key set or the validation chain.
+    Reads only the `*.py` files directly in the bin directory beside this program; a key declared twice, or one the shared defaults own, is a ConfigError."""
+    directory = CONFIG_DECLARATIONS_DIR or os.path.dirname(os.path.realpath(__file__))
+    try:
+        listing = _declared_listing(directory)
+    except OSError as err:
+        raise ConfigError("the module directory %s cannot be read (%s): no configuration is loaded" % (directory, err.strerror or err)) from None
+    cached = _DECLARED_CACHE.get(directory)
+    if cached is not None and cached[0] == listing:
+        return _meets_floor(dict(cached[1]))
+    shared = set(DEFAULTS) | set(PR7_CONFIG_KEYS) | TOP_LEVEL_EXTRA_KEYS
+    found = {}
+    for name, path, _, _ in listing:
+        try:
+            with open(path, "rb") as handle:
+                declared = _declared_key(handle.read(CONFIG_READ_BYTES))
+        except OSError as err:
+            raise ConfigError("config module %s.py cannot be read (%s): no configuration is loaded" % (name, err.strerror or err)) from None
+        if declared is None:
+            continue
+        key = declared
+        if not CONFIG_KEY_FORM.fullmatch(key):
+            raise ConfigError("config module %s.py declares an invalid configuration key %r (lowercase letters, digits and underscores): no configuration is loaded" % (name, _one_line(key, 40)))
+        if key in shared:
+            raise ConfigError("config key %r is declared by %s.py and is also owned by the shared defaults" % (key, name))
+        if key in found:
+            raise ConfigError("config key %r is declared by two modules: %s.py and %s.py" % (key, found[key], name))
+        found[key] = name
+    _DECLARED_CACHE[directory] = (listing, dict(found))
+    return _meets_floor(found)
+
+
+def _meets_floor(found):
+    """`found` once every key of CONFIG_MUST_DECLARE is declared by its module (checked on every call, cached or not)."""
+    for key, name in sorted(CONFIG_MUST_DECLARE.items()):
+        if found.get(key) != name:
+            raise ConfigError("config key %r must be declared by %s.py, and it is not (the module is missing, its CONFIG_KEY line is missing or damaged, or it names another key): "
+                              "no configuration is loaded" % (key, name))
+    return found
+
+
+def _declared_module(name, key):
+    """The module that declares a key, loaded by the generic loader (a test's directory: by path). A module that fails to load, whose own `CONFIG_KEY` is not the
+    key the scan read, or that has no `validate`, fails the WHOLE configuration naming its file: a daemon never runs on a partial configuration."""
+    try:
+        if CONFIG_DECLARATIONS_DIR is None:
+            return load_module(name)
+        spec = importlib.util.spec_from_file_location("declared_" + name, os.path.join(CONFIG_DECLARATIONS_DIR, name + ".py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception as err:
+        raise ConfigError("config module %s.py declares a configuration key but cannot be loaded (%s: %s): no configuration is loaded"
+                          % (name, type(err).__name__, _one_line(str(err), 160))) from None
+    if getattr(module, "CONFIG_KEY", None) != key:
+        raise ConfigError("config module %s.py declares the key %r in its text but its CONFIG_KEY is %r: no configuration is loaded"
+                          % (name, key, getattr(module, "CONFIG_KEY", None)))
+    if not callable(getattr(module, "validate", None)):
+        raise ConfigError("config module %s.py declares the key %r but has no validate(value, source): no configuration is loaded" % (name, key))
+    return module
 
 
 def config_known_keys():
-    return sorted(set(DEFAULTS) | set(PR7_CONFIG_KEYS) | TOP_LEVEL_EXTRA_KEYS)
+    return sorted(set(DEFAULTS) | set(PR7_CONFIG_KEYS) | TOP_LEVEL_EXTRA_KEYS | set(config_declarations()))
 
 
 def warn_unknown_config(message, section="", names=(), known=()):
@@ -511,7 +611,8 @@ def validate_config(raw, source="config"):
     """Defaults overlaid with `raw`, fully checked. Raises ConfigError."""
     if not isinstance(raw, dict):
         raise ConfigError("%s must be a JSON object" % source)
-    unknown = sorted(set(raw) - set(DEFAULTS) - set(PR7_CONFIG_KEYS) - TOP_LEVEL_EXTRA_KEYS)
+    declared = config_declarations()
+    unknown = sorted(set(raw) - set(DEFAULTS) - set(PR7_CONFIG_KEYS) - TOP_LEVEL_EXTRA_KEYS - set(declared))
     if unknown:
         warn_unknown_config(
             "%s contains key(s) this tool does not read: %s" % (source, ", ".join(unknown)), '', unknown, config_known_keys())
@@ -556,14 +657,17 @@ def validate_config(raw, source="config"):
         load_cpu_guard().validate(config["cpu_guard"], source)
     except ValueError as err:
         raise ConfigError(str(err))
-    try:
-        load_module("spotlight_guard").validate(config.get("spotlight_guard"), source)
-    except ValueError as err:
-        raise ConfigError(str(err)) from None
-    try:
-        load_module("repo_exclusion").validate(config.get("excluded_repos"), source)
-    except ValueError as err:
-        raise ConfigError(str(err)) from None
+    for key, name in sorted(declared.items(), key=lambda item: item[1]):   # the modules that declare their own key: its default, then its validator
+        module = _declared_module(name, key)
+        default = getattr(module, "CONFIG_DEFAULT", None)
+        if key not in raw and default is not None:
+            config[key] = copy.deepcopy(default)
+        try:
+            module.validate(config.get(key), source)
+        except ValueError as err:
+            raise ConfigError(str(err)) from None
+        except Exception as err:   # a validator that fails any other way is a broken module, not a bad value: still the whole configuration, naming the file
+            raise ConfigError("config module %s.py: its validator failed (%s: %s): no configuration is loaded" % (name, type(err).__name__, _one_line(str(err), 160))) from None
     if not isinstance(config["docker_reaper"], bool):
         raise ConfigError("%s: 'docker_reaper' must be true or false, got %r" % (source, config["docker_reaper"]))
     if config["v2_events"] not in ("auto", "off"):
@@ -2836,6 +2940,7 @@ class Fact:
             raise FactError("fact repo must be OWNER/REPO, got %r" % (repo,))
         self.repo = repo  # PR 15: the repo `issue` is in; None means the recipient's own
         self.orders = orders  # PR 17: the charter's standing orders: a note on its own, at once, never a wake
+        self.supersedes = ()  # #583: the creation times of this sender's earlier messages on this issue that the recipient has not seen yet (set by `send`; never stored)
 
     @classmethod
     def from_json(cls, obj):
@@ -3183,8 +3288,36 @@ def steers_into_turn(config, observation, carried, discovery=None):
             and any(fact.kind == "send" and fact.sender and fact.sender == boss_name(discovery, observation) for fact in carried))
 
 
-def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None):
-    """One message for `facts`, oldest first. Returns (text, the facts it carries).
+def clock_utc(epoch):
+    """HH:MMZ (UTC) of an epoch: the time a message was sent or delivered, as the header shows it."""
+    try:
+        return time.strftime("%H:%MZ", time.gmtime(epoch))
+    except (OverflowError, ValueError, OSError, TypeError):
+        return "??:??Z"   # a time that is not a time never stops a message
+
+
+def superseded_by(facts):
+    """{key of an older undelivered `send`: the newer `send` that replaces it}: the same sender, about the same issue (repo and number), to the same
+    recipient. Never across senders or issues, and a send with no issue is never superseded. The older text is KEPT (the caller marks it, never drops it)."""
+    newest = {}
+    for fact in facts:
+        if fact.kind == "send" and fact.sender and fact.issue:
+            group = (fact.recipient, fact.sender, fact.repo, fact.issue)
+            if group not in newest or (fact.created, fact.key) > (newest[group].created, newest[group].key):
+                newest[group] = fact
+    found = {}
+    for fact in facts:
+        if fact.kind == "send" and fact.sender and fact.issue:
+            top = newest[(fact.recipient, fact.sender, fact.repo, fact.issue)]
+            if top is not fact:
+                found[fact.key] = top
+    return found
+
+
+def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, delivered=None):
+    """One message for `facts`, oldest first. Returns (text, the facts it carries). With `delivered` (epoch) the header says when the
+    message was sent (the carried facts' creation) and when it is delivered; a send that a NEWER one from the same sender about the
+    same issue replaces (`superseded_by`) stays in the message, marked, so no key is left out of what is acknowledged.
 
     The first line names the count and the first item; each item follows in
     full. Items that do not fit under `cap` stay pending: the message ends with
@@ -3198,15 +3331,31 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None):
     if facts[0].orders:  # PR 17: the orders note, whole: up to twenty orders of 300 characters
         return orders_note(recipient, facts[0], repos), facts[:1]
 
+    replaced = {}
+
     def item(fact):
         where = " (issue %s)" % issue_tag(fact.repo, fact.issue, repos) if fact.issue else ""
         body = fact.summary.strip().replace("\n", "\n  ")
-        return "- %s from %s%s: %s" % (fact.kind, fact.sender or "the fleet", where, body)
+        mark = ""
+        if fact.key in replaced:
+            mark = " [superseded by the newer message from %s sent %s]" % (fact.sender, clock_utc(replaced[fact.key].created))
+        return "- %s from %s%s%s: %s" % (fact.kind, fact.sender or "the fleet", where, mark, body)
 
     def render(count):
         lead = next((fact for fact in facts if not fact.rider), facts[0])
-        head = "[switchboard] %d for %s: %s" % (count, recipient, _one_line(lead.summary, 200))
         taken = facts[:count]
+        replaced.clear()
+        replaced.update(superseded_by(taken))
+        when = ""
+        if delivered is not None:
+            first, last = clock_utc(min(f.created for f in taken)), clock_utc(max(f.created for f in taken))
+            when = " (sent %s, delivered %s)" % (first if first == last else "%s-%s" % (first, last), clock_utc(delivered))
+        waiting = sorted({t for f in taken for t in f.supersedes})
+        if waiting:   # the earlier messages stay where they are, unchanged: this says only that the newer one replaces them
+            names = sorted({f.sender for f in taken if f.supersedes and f.sender})
+            when = (when[:-1] + "; " if when else " (") + "supersedes %d earlier message%s from %s on this issue, still waiting: sent %s)" % (
+                len(waiting), "" if len(waiting) == 1 else "s", ", ".join(names) or "the same sender", ", ".join(clock_utc(t) for t in waiting[:5]))
+        head = "[switchboard] %d for %s%s: %s" % (count, recipient, when, _one_line(lead.summary, 200))
         idle = [fact for fact in taken if fact.kind == WORKER_IDLE and fact.rider and getattr(fact, "clean", False)]
         shown = [fact for fact in taken if fact not in idle] if len(idle) < len(taken) else taken
         if shown is taken:
@@ -4391,11 +4540,11 @@ class Switchboard:
             observation = fresh
         repos = self.repos_in_play()
         text, carried = compose(plan.recipient, plan.pending, section=section_resolver(self, observation),
-                                repos=repos)
+                                repos=repos, delivered=self.now())
         sent = next((fact for fact in carried if fact.kind == "send"), None)
         if sent is not None and "\n[cut at %d characters]" % MESSAGE_CAP in text[-40:]:  # never cut silently
             whole, _ = compose(plan.recipient, plan.pending[:1], cap=10 ** 9, section=section_resolver(self, observation),
-                               repos=repos)
+                               repos=repos, delivered=self.now())
             allowed = max(0, len(sent.summary) - (len(whole) - MESSAGE_CAP))
             raise MessageTooLong("message is %d characters and would be cut at the delivery cap of %d once its header and "
                                  "ask sections are added; the allowed text for this message is %d characters: nothing was "
@@ -4429,7 +4578,7 @@ class Switchboard:
         try:
             with self._external("v2.synthetic", plan.recipient, detail) as result:
                 record = self.v2.synthetic(observation.session_id, text,
-                                           {"fleet": {"keys": keys, "from": "switchboard"}},
+                                           {"fleet": dict({"keys": keys, "from": "switchboard"}, **self._send_meta(carried))},
                                            resume, delivery, message_id, description)
                 if fault("crash-after-send"):
                     raise SimulatedCrash("crash-after-send: %s was admitted; stopping before the audit result"
@@ -4452,6 +4601,36 @@ class Switchboard:
         self._acknowledge(keys)
         return {"sent": True, "action": plan.action, "message_id": message_id, "keys": keys,
                 "left": len(plan.pending) - len(keys)}
+
+    @staticmethod
+    def _send_meta(carried):
+        """#583: the ask a delivered `send` is about, in the message's metadata, so a LATER send can tell which waiting messages are about the same issue."""
+        sends = [f for f in carried if f.kind == "send"]
+        one = sends[0] if sends else None
+        if one is None or not one.sender or not one.issue:
+            return {}
+        if any((f.sender, f.repo, f.issue) != (one.sender, one.repo, one.issue) for f in carried):
+            return {}   # a message that also carries another issue's (or sender's) facts is about none of them alone: a later send never names it
+        return {"sender": one.sender, "issue": one.issue, "repo": one.repo} if one.repo else {"sender": one.sender, "issue": one.issue}
+
+    def waiting_earlier(self, discovery, recipient, sender, repo, issue, now):
+        """#583: when the recipient has not yet taken earlier messages from `sender` on this issue (they wait in its v2 inbox), their times. Read only: nothing is
+        cancelled or changed. Where the inbox cannot be read (v2_light, a failed read, an older message that did not say its issue) it is (): sent as before."""
+        try:
+            target = discovery.agents.get(recipient)
+            if self.light or target is None or not target.session_id or not sender or not issue:
+                return ()
+            found = []
+            for item in self.reads.inbox(target.session_id, now, fresh=True) or []:
+                meta = _fleet_meta(item) or {}
+                if meta.get("from") == "switchboard" and meta.get("sender") == sender and meta.get("issue") == issue \
+                        and meta.get("repo") == (repo or None) and all(key.startswith("send:") for key in _fleet_keys(item)):
+                    when = _created(item)
+                    if when is not None and 946684800 <= when <= now + 86400:   # an inbox item's time is untrusted: only a plausible one (2000 to tomorrow) is shown
+                        found.append(when)
+            return tuple(sorted(found))
+        except Exception:
+            return ()   # fail toward showing everything: no marking
 
     def convert_lapsed_notes(self, observation, now):
         """A note still in v2's inbox once you have not prompted for the
@@ -4671,6 +4850,7 @@ class Switchboard:
         fact = Fact("send:%s:%s" % (sender, uuid.uuid4().hex[:16]), recipient, "send", text, now,
                     issue=None if issue is None else int(issue), batch=False, sender=sender,
                     repo=repo or issue_repo(issue))
+        fact.supersedes = self.waiting_earlier(discovery, recipient, sender, fact.repo, fact.issue, now)
         outcome = self.send_fact(fact, discovery, now, interrupt=interrupt)
         if outcome.get("sent") and sender != recipient and sender in discovery.agents and self.state_dir is not None:
             # Beside `report`'s record: both count as being in touch with that boss. #352: only a send that woke the boss is one a report folds
@@ -7718,9 +7898,9 @@ def handoff_ask(engine, caller, issue, brief, name=None, directory=None, workspa
 
 
 def cmd_handoff(args, runner, now, socket_call=None):
-    workspace = args.workspace or os.environ.get("HERDR_WORKSPACE_ID")
     brief = read_brief(args.brief_file, sys.stdin)
     engine, _, _ = build_engine(runner, now, "cli", socket_call=socket_call)
+    workspace = caller_workspace(engine, args.workspace)
     caller = identify_caller(engine.herdr, engine.v2, os.environ)
     try:
         repo, number = resolve_for_sender(engine, engine.config, args.issue, caller)
@@ -7798,7 +7978,7 @@ def add_foreground_parsers(sub):
                          help="The brief (Done so far, Next steps, Watch out for): a file, or - for stdin")
     handoff.add_argument("--name", help="The subagent's fleet name (default: cos-<issue>)")
     handoff.add_argument("--dir", help="The subagent's working directory (default: here)")
-    handoff.add_argument("--workspace", help="The herdr workspace for its tab (default: $HERDR_WORKSPACE_ID)")
+    handoff.add_argument("--workspace", help="The herdr workspace for its tab (default: the workspace of this session, else $HERDR_WORKSPACE_ID)")
 
 
 # ======================================================================
@@ -10477,6 +10657,12 @@ def publish_decisions(engine):
                                ((engine.config.get("impact_hold") or {}).get("calls_per_pass") or IMPACT_PASS_CALLS))   # its own cap of gh reads, the impact hold's setting
     except Exception as err:
         engine._note("merged_labels.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+    try:
+        ejections = load_module("queue_ejections")   # #584: a pull request ejected from the merge queue wakes its orchestrator with the failing tests
+        ejections.run_pass(types.SimpleNamespace(**{n: globals()[n] for n in ejections.NEEDS}), engine, now,
+                           ((engine.config.get("impact_hold") or {}).get("calls_per_pass") or IMPACT_PASS_CALLS))
+    except Exception as err:
+        engine._note("queue_ejection.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
     apply_notice_effects(engine)
     store = decision_store(engine)
     try:
@@ -11709,6 +11895,8 @@ class TriageState:
         self.verified = {}       # (rule, ref) -> when a fresh read last gave an answer (true or false): the age of "unchecked"
         self.first_seen = {}     # (rule, ref) -> when a pass first saw it as a candidate (the age of one never checked)
         self.enriched = {}       # (rule, ref) -> evidence the fresh read added
+        self.live = {}           # #576: (repo, number) -> {"token": the issue's updated time, "info": the label's age facts or None, "at"}: one timeline read each
+        self.reasons = {}        # (rule, ref) -> the worded reason of a finding that carries one (`awaiting-live expired`)
         self.logged, self.facts, self.current = set(), {}, {}
         self.started, self.day, self.day_counts = 0, None, {}
         self.summarised = None
@@ -11826,7 +12014,13 @@ def triage_charter_descendants(items, charters):
     return below, unresolved
 
 
-def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs, window_ok=True, captain_skip=False, merged=None, pending=None):
+def triage_awaits_live(item):
+    """True when an open issue carries a label ending in `:awaiting-live`: it waits on a live event, so T9 and T12 stay quiet (#574),
+    until the label is older than `awaiting_live_days` with no comment since (#576)."""
+    return bool(load_module("awaiting_live").label_names(item["labels"]))
+
+
+def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs, window_ok=True, captain_skip=False, merged=None, pending=None, live=None, live_days=None):
     """{rule: evidence} for one OPEN item (a pure function: the list copy and the fresh copy go through it alike), and
     whether the item is ours. `comments` is None when the comment unit is not read (T3 and T7 are then not judged).
     Evidence holds only labels' names, ages in days and owner logins."""
@@ -11855,8 +12049,15 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
             found["T3"] = {"quiet_days": round(age_updated, 2), "ask": ask}
         if ask and any("blocked" in str(l).lower() for l in item["labels"]) and age_updated >= sla["t8_days"]:
             found["T8"] = {"quiet_days": round(age_updated, 2)}
-        if ask and "T3" not in found and age_updated >= sla["t9_days"]:
+        if ask and "T3" not in found and not triage_awaits_live(item) and age_updated >= sla["t9_days"]:
             found["T9"] = {"quiet_days": round(age_updated, 2)}
+        if triage_awaits_live(item):   # #576: the exemption is capped: an old label with no comment since comes back, an unreadable age stays visible
+            module = load_module("awaiting_live")
+            reason = module.judge(live, now, live_days or module.CONFIG_DEFAULT)
+            if reason:
+                found["T9"] = {"quiet_days": round(age_updated, 2), "reason": reason}
+                if live is not None:
+                    found["T9"]["label_days"] = round((now - live["set"]) / day, 2)
         if not chain and not item["assignees"] and not named and "T1" not in found and number not in ctx["unresolved"] \
                 and age_updated >= sla["t11_days"]:
             found["T11"] = {"quiet_days": round(age_updated, 2)}
@@ -11864,7 +12065,7 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
         if link:   # #384: its PR merged and it is still open: that is the finding, not "no owner"; ours when the PR's author is ours
             found.pop("T1", None)
             found.pop("T11", None)
-            if not (item["open_sub"] or item["pending_text"] or number in (pending or ())):   # #410: not truly done: an open sub-issue, pending work in its text or a proof not passed
+            if not (item["open_sub"] or item["pending_text"] or number in (pending or ()) or triage_awaits_live(item)):   # #410: not truly done: an open sub-issue, pending work in its text or a proof not passed
                 found["T12"] = load_triage_plan_open().evidence(link, max(0.0, now - (parse_iso(link["merged_at"]) or now)) / day)
                 ours = ours or link["by"] in ours_logins
     elif not item["draft"] and comments is not None and ours and not captain_skip:
@@ -11929,6 +12130,38 @@ def triage_refresh(engine, state, repos, units, now, budget, reserve=1, seconds=
                 state.unreadable[repo] = (reason, now)
 
 
+def triage_read_live(engine, state, repos, now, budget, reserve=1, seconds=TRIAGE_PASS_SECONDS):
+    """#576: the age of each `:awaiting-live` label, from the issue's timeline: ONE bounded read (a single page) per labelled open issue, kept in
+    `state.live` while the issue's updated time is the one it was read at (a re-added label or a new comment moves it), so an unchanged issue is not read
+    again. Each read is charged to the pass's call budget (less the reserve for fresh checks), the least recently read first. A failed or cut read is kept as
+    unknown and tried again after TRIAGE_TTL: never read as fresh. Reads nothing when no issue carries the label."""
+    hub, module = getattr(engine, "hub", None), load_module("awaiting_live")
+    if hub is None:
+        return
+    todo = []
+    for repo in repos:
+        unit = state.units.get((repo, "issues"))
+        for record in (unit["data"] if unit else []):
+            item = triage_norm(record)
+            if item is None or item["pr"] or item["state"] != "open" or not module.label_names(item["labels"]):
+                continue
+            held = state.live.get((repo, item["number"]))
+            if held is None or held["token"] != item["updated"] or (held["info"] is None and now - held["at"] >= TRIAGE_TTL):
+                todo.append(((held or {"at": 0})["at"], repo, item))
+    for _, repo, item in sorted(todo, key=lambda t: t[:2] + (t[2]["number"],)):
+        if budget[0] - reserve < 1 or engine.now() - state.started >= seconds:
+            break
+        budget[0] -= 1
+        info = None
+        try:
+            events, cut = hub.read_pages("repos/%s/issues/%d/timeline?per_page=100" % (repo, item["number"]), cap=1)
+            if not cut:   # a page that is not the whole timeline cannot tell the latest label event or the last comment
+                info = module.read(events, module.label_names(item["labels"]), parse_iso)
+        except GitHubUnavailable:
+            pass
+        state.live[(repo, item["number"])] = {"token": item["updated"], "info": info, "at": now}
+
+
 def triage_findings(engine, state, repos, decisions, cfg, now, errors):
     """(candidates [(rule, ref, evidence)], unchecked {repo: [units missing]}, truncated repos). Reads nothing."""
     discovery = getattr(engine, "discovery", None)
@@ -11940,6 +12173,7 @@ def triage_findings(engine, state, repos, decisions, cfg, now, errors):
     except (NoticeError, OSError, TypeError):
         pass
     out, unchecked, truncated = [], {}, []
+    live_days = load_module("awaiting_live").days_of(engine.config)
     captain_listed = {sweep_ref_of(d, engine.config.get("intent_repo")) for d in decisions if d.get("kind") == "captain"}
     for repo in repos:
         issues_unit = state.units.get((repo, "issues"))
@@ -11970,8 +12204,10 @@ def triage_findings(engine, state, repos, decisions, cfg, now, errors):
             comments = triage_comment_facts(by_number.get(number, [])) if comments_unit is not None else None
             # a `MERGE: captain` PR already in the decision list is T6's; while the list is incomplete a captain PR waits
             captain_skip = item["captain"] and ((repo, number) in captain_listed or bool(errors))
+            live = state.live.get((repo, number)) if triage_awaits_live(item) else None
             found, ours = triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs.get(repo, set()),
-                                       captain_skip=captain_skip, merged=links, pending=pending)
+                                       captain_skip=captain_skip, merged=links, pending=pending,
+                                       live=live["info"] if live else None, live_days=live_days)
             if not found:
                 continue
             ref = "%s#%d" % (repo, number)
@@ -12069,8 +12305,10 @@ def triage_verify(engine, state, rule, ref, cfg, now, budget, evidence=None):
         notice_prs = {n["number"] for n in read_pr_notices(engine.state_dir) if n["repo"] == repo}
     except (NoticeError, OSError, TypeError):
         pass
+    live = state.live.get((repo, number)) if triage_awaits_live(item) else None   # #576: the age read this or an earlier pass; none read is "unknown", still a finding
     found, ours = triage_rules(item, comments, ctx, triage_sla(cfg, repo), now, triage_our_logins(engine, cfg),
-                               (cfg.get("required_labels") or {}).get(repo) or [], notice_prs)
+                               (cfg.get("required_labels") or {}).get(repo) or [], notice_prs,
+                               live=live["info"] if live else None, live_days=load_module("awaiting_live").days_of(engine.config))
     return (rule in found) if (ours and rule != "OO") else (rule == "OO" and bool(found))
 
 
@@ -12139,6 +12377,7 @@ def triage_pass(engine, decisions, now, errors=()):
     seconds = cfg.get("pass_seconds", TRIAGE_PASS_SECONDS)
     units = ["issues", "comments", "merged"] + ["closed:" + l for l in sorted(triage_awaiting_labels(engine))]
     triage_refresh(engine, state, repos, units, now, budget, max(1, budget[0] // 3), seconds)  # a third kept for fresh checks
+    triage_read_live(engine, state, repos, now, budget, max(1, cfg.get("calls_per_pass", TRIAGE_CALLS_PER_PASS) // 3), seconds)
     candidates, unchecked_units, truncated = triage_findings(engine, state, repos, decisions, cfg, now, errors)
     findings, unchecked, unchecked_other, oldest = [], 0, 0, 0.0
 
@@ -12179,6 +12418,8 @@ def triage_pass(engine, decisions, now, errors=()):
     day = int(now // 86400)
     counts, other_owner = {}, 0
     for rule, ref, evidence in findings:
+        if isinstance(evidence, dict) and evidence.get("reason"):
+            state.reasons[(rule, ref)] = evidence["reason"]
         if rule == "OO":
             other_owner += 1   # a flag, never counted as one of our findings
         else:
@@ -12273,7 +12514,7 @@ def triage_queue_fact(state, due, now, cfg, other_owner=0, invalid=()):
         state.facts["triage:parked:%s" % hashlib.sha256(summary.encode()).hexdigest()[:10]] = (summary, now)
         return summary
     summary = "triage: %d finding%s: %s%s. %s. Resolve, route or escalate each; the triage changes nothing on GitHub." % (
-        len(due), "" if len(due) == 1 else "s", ", ".join("%s %s" % (ref, rule) for rule, ref in shown),
+        len(due), "" if len(due) == 1 else "s", ", ".join("%s %s%s" % (ref, rule, " (%s)" % state.reasons[(rule, ref)] if (rule, ref) in state.reasons else "") for rule, ref in shown),
         " (+%d more)" % (len(due) - len(shown)) if len(due) > len(shown) else "",
         "; ".join("%s = %s" % (k, TRIAGE_KINDS[k]) for k in kinds))
     if other_owner:
@@ -15189,6 +15430,8 @@ def warn_pane_disagrees(herdr, v2, environ, own, name):
         return
     if not theirs or theirs == own:
         return
+    if _agent_label(v2, theirs) == name:
+        return   # the pane's agent is THIS fleet agent under an older or newer session (a restart, a move): the inherited variable is stale, not another agent's
     _WARNED_PANES.add((pane, own))
     where = ""
     try:
@@ -15202,6 +15445,33 @@ def warn_pane_disagrees(herdr, v2, environ, own, name):
                      "identity is taken from the session, not from the pane; fix the environment (HERDR_PANE_ID, "
                      "FLEET_SWITCHBOARD_ROLE, FLEET_SWITCHBOARD_REPO and the token travel together)\n"
                      % (PROG, pane, theirs, _agent_label(v2, theirs), own, name, where))
+
+
+def caller_workspace(engine, explicit, environ=None):
+    """The herdr workspace a launch or handoff goes to when --workspace is not given: the workspace of the CALLER'S OWN session (OPENCODE_SESSION_ID, found
+    in herdr's agent list), never an inherited HERDR_WORKSPACE_ID that may belong to another session. An explicit --workspace wins. When the two
+    disagree, the caller's own is used and stderr says which one was used and which was left. When the caller's own workspace cannot be found
+    (a plain shell, a session herdr does not show), the variable is used as before: never a refusal."""
+    if explicit:
+        return explicit
+    environ = os.environ if environ is None else environ
+    inherited = environ.get("HERDR_WORKSPACE_ID")
+    own = environ.get(SESSION_ENV)
+    mine = None
+    if own:
+        try:
+            for entry in engine.herdr.agent_list():
+                if agent_session(entry) == own and isinstance(entry.get("pane_id"), str):
+                    mine = entry.get("workspace_id") if isinstance(entry.get("workspace_id"), str) else engine.herdr.pane_get(entry["pane_id"]).get("workspace_id")
+                    break
+        except (HerdrError, V2Error, AttributeError, TypeError):
+            mine = None
+    if not isinstance(mine, str) or not mine:
+        return inherited
+    if inherited and inherited != mine:
+        sys.stderr.write("%s: workspace: using %s, the workspace of this session; HERDR_WORKSPACE_ID=%s belongs to another session and was not used "
+                         "(pass --workspace to choose)\n" % (PROG, mine, inherited))
+    return mine
 
 
 def no_pane_error(how):
@@ -15341,8 +15611,9 @@ def read_brief(path, stdin):
 def cmd_launch(args, runner, now, socket_call=None):
     if getattr(args, "cloud", False):   # a worker in the cloud (#371): its own module; nothing below runs
         return run_cloud("cmd_launch", args, runner, now)
-    workspace = args.workspace or os.environ.get("HERDR_WORKSPACE_ID")
     engine, state, _ = build_engine(runner, now, "cli", socket_call=socket_call)
+    workspace = args.workspace if (args.workspace or getattr(args, "new_workspace", None) or getattr(args, "headless", False)) \
+        else caller_workspace(engine, None)   # a workspace made now, or none at all, needs no look at the caller's own
     if args.resume:
         given = getattr(args, "repo", None)
         if given:
@@ -18360,7 +18631,7 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
         if review:
             decision = "hold"
     return {"pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude,
-            "floor_paths": hit, "files_read": len(files), "complete": complete, "unknown": unknown, "rated": [list(r) for r in rated],
+            "floor_paths": hit, "files_read": len(files), "files_total": total, "renamed_no_source": renamed[:20], "complete": complete, "unknown": unknown, "rated": [list(r) for r in rated],
             "decision": decision, "reasons": reasons, "owner_decision": owner[0], "owner_reasons": owner[1], "draft": raw.get("isDraft") is True}
 
 
@@ -18392,14 +18663,45 @@ def cmd_impact_floor(args, runner, now):
                 raise ValueError("--rating SEVERITY/PROBABILITY: severity is one of %s, probability one of %s (got %s/%s)" % (
                     ", ".join(matrix["severities"]), ", ".join(matrix["probabilities"] + matrix["not_rated"]), severity, probability))
         report = pr_floor_report(engine, repo, number, pairs)
+    except impact_floor.MatrixError as err:   # the rule file cannot be read: it is HELD ON PURPOSE (never read as "no floor"), said in words and in json; nothing was judged and nothing is written
+        why = _one_line(str(err), 200)
+        if args.json:
+            print(json.dumps({"pr": "%s#%d" % (repo, number), "head": None, "decision": "hold", "owner_decision": "hold", "reasons": [], "owner_reasons": ["held on purpose: the rule file cannot be read: %s" % why],
+                              "unknown": "the rule file cannot be read", "floor_paths": [], "globs": []}, sort_keys=True))
+        else:
+            print("impact floor for %s: HELD ON PURPOSE (advisory: nothing is written)" % ("%s#%d" % (repo, number)))
+            print("  held on purpose: the rule file cannot be read, so nothing was judged and no change may be read as not held: %s" % why)
+        return EXIT_OK
     except (NoticeError, ValueError) as err:
         sys.stderr.write("%s: impact floor: %s\n" % (PROG, _one_line(str(err), 300)))
         return EXIT_USAGE
     if args.json:
-        print(json.dumps(report, sort_keys=True))
+        print(json.dumps(report, sort_keys=True))   # the report as the daemon's pass reads it: `owner_decision` and `owner_reasons` next to the path-floor fields
     else:
-        print("impact floor for %s at %s: %s (advisory: nothing is written)" % (
-            report["pr"], (report["head"] or "unknown head")[:8], report["decision"].upper().replace("-", " ")))
+        owner = report.get("owner_decision")
+        words = {"hold": "HOLD for the owner", "second-review": "not held for the owner: a second independent review", "none": "not held"}.get(owner, "HELD ON PURPOSE (unknown decision %r)" % (owner,))
+        read, total = report.get("files_read"), report.get("files_total")
+        counted = "%s file%s read" % (read, "" if read == 1 else "s") if isinstance(read, int) else "files read unknown"
+        cut = report.get("complete") is False
+        blind = report.get("renamed_no_source") or []   # renamed or copied files whose source path the list does not carry: a top tier path could be the source
+        stamp = "(advisory: nothing is written)"
+        if cut and owner != "hold":   # the daemon's own answer for a list it could not read in full is printed as it is, and said to be no verdict: a cut list never reads as "not held"
+            print("impact floor for %s at %s: CANNOT TELL: only %s of %s files were read (the daemon's decision for the files it read: %s) %s" % (
+                report["pr"], (report["head"] or "unknown head")[:8], read, total, words, stamp))
+        elif blind and owner != "hold":
+            print("impact floor for %s at %s: CANNOT TELL: %d renamed or copied file(s) with no source path (the daemon's decision for the paths it saw: %s), %s %s" % (
+                report["pr"], (report["head"] or "unknown head")[:8], len(blind), words, counted, stamp))
+        else:
+            print("impact floor for %s at %s: %s, %s %s" % (report["pr"], (report["head"] or "unknown head")[:8], words, counted, stamp))
+        for reason in report.get("owner_reasons") or []:
+            print("  %s: %s" % ("why" if owner == "hold" else "because", reason))
+        if owner == "none" and not report.get("owner_reasons") and not cut and not blind:
+            print("  because: no changed path is a top tier path of the matrix, and no independent review or rating holds it")
+        if cut and owner != "hold":
+            print("  incomplete: GitHub gave %s of %s changed files, so a path outside those may be a top tier path; this is not a verdict of \"not held\"" % (read, total))
+        if blind and owner != "hold":
+            print("  rename: the source path of %s was not seen, and it may have been a top tier path; this is not a verdict of \"not held\"" % ", ".join(blind[:3]))
+        print("  path floor (older advisory, not the owner's rule): %s" % report["decision"].upper().replace("-", " "))
         for reason in report["reasons"]:
             print("  %s" % reason)
         for path in report["floor_paths"]:
@@ -18733,37 +19035,101 @@ CLEAR_NOTIFIED_MAX = 400
 _PLAN_ISSUE_RE = re.compile(r"github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(?:issues|pull)/([0-9]+)")
 
 
+_PLAN_REF_SHORT = re.compile(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)$")
+
+
+def _plan_issue_of(ref, repo):
+    """The issue number a plan reference names in `repo` (`owner/repo#N` or a github issue or pull URL, a comment fragment allowed), or None (another repository, anything else)."""
+    ref = (ref or "").strip()
+    short = _PLAN_REF_SHORT.match(ref)
+    if short:
+        return int(short.group(2)) if short.group(1) == repo else None
+    link = _PLAN_ISSUE_RE.search(ref) if ref.startswith("https://github.com/") else None
+    return int(link.group(2)) if link and link.group(1) == repo else None
+
+
+def _lane_of_issue(engine, repo, issue, orchestrators):
+    """("one", name) | ("many", [names], charter) | None: the running orchestrator of the charter that holds `issue` AS IT IS NOW. Each parent is read fresh (a moved ask counts under its current charter), at most 3
+    hops; the nearest number in the chain that a running orchestrator owns (its `issue` or `charter`) decides; two or more on that number are NEVER picked between."""
+    reader = getattr(engine, "intents", None)
+    if reader is None or not orchestrators:
+        return None
+    chain, current = [issue], issue
+    try:
+        for _ in range(3):
+            if hasattr(reader, "invalidate"):
+                reader.invalidate(current, repo)
+            current = reader.parent(current, repo)
+            if current is None:
+                break
+            chain.append(current)
+    except IntentError:
+        pass   # the chain so far is all that can be told
+    default_repo = engine.config.get("intent_repo") if len(getattr(engine, "watches", ()) or ()) > 1 else None
+    for number in chain:
+        owners = []
+        for name, agent in sorted(orchestrators.items()):
+            fleet = agent.fleet or {}
+            theirs = fleet.get("repo") if isinstance(fleet.get("repo"), str) else default_repo
+            if repo and theirs and theirs != repo:
+                continue
+            owned = set()
+            for field in ("issue", "charter"):
+                value = fleet.get(field)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    owned.add(value)
+                elif isinstance(value, str) and value.strip().lstrip("#").isdigit():
+                    owned.add(int(value.strip().lstrip("#")))
+            if number in owned:
+                owners.append(name)
+        if len(owners) == 1:
+            return ("one", owners[0])
+        if len(owners) > 1:
+            return ("many", owners, number)
+    return None
+
+
 def clear_lane(engine, repo, number, body):
-    """(lane, how): the orchestrator that merges the pull request, or (None, None) when it cannot be told (never a guess). In order: the agent that recorded the pull request's notice (or, when
-    that is a worker, its boss; or the boss the notice recorded), then the `PLAN:` link of the body up to the charter that owns the ask. Only a running orchestrator counts."""
+    """(lane, how, extra): the orchestrator that merges the pull request; (None, None, extra) when it cannot be told: never a guess. Two sources, each only when resolvable:
+    (1) the PLAN of the pull request, taken through `authoritative_plan` (the function the gates use: the PR body's PLAN line, else the first ledger entry's plan) and only when it PASSES the plan
+    check at this moment, up to the charter that holds it as it is now (parents read fresh) and that charter's ONE running orchestrator; (2) the agent that recorded the pull request's notice (its boss
+    when it is a worker). When both resolve and AGREE the lane is told; when they DISAGREE neither is (`extra["unclear"]` = [plan lane, notice lane]); when one resolves it is used; none is unknown.
+    A charter with two or more running orchestrators is never picked between (`extra["candidates"]`); one nobody runs counts as no plan lane."""
     discovery = engine.discover(engine.now())
     agents = discovery.agents
-    item = next((i for i in read_pr_notices(engine.state_dir) if i["repo"] == repo and i["number"] == number), None) if engine.state_dir is not None else None
-    if item:
-        for name in notice_senders(item)[::-1] + ([item["boss"]] if isinstance(item.get("boss"), str) else []):
-            agent = agents.get(name)
-            if agent is None:
-                continue
-            lane = name if _is_orchestrator(agent) else boss_name(discovery, agent)
-            if lane in agents and _is_orchestrator(agents[lane]):
-                return lane, "the notice"
-    found = PLAN_LINE_RE.search(body or "")
-    link = _PLAN_ISSUE_RE.search(found.group(1)) if found else None
-    reader = getattr(engine, "intents", None)
-    if link and link.group(1) == repo and reader is not None:
-        chain, current = [int(link.group(2))], int(link.group(2))
+    orchestrators = {name: agent for name, agent in agents.items() if _is_orchestrator(agent)}
+    pr = "%s#%d" % (repo, number)
+    extra, plan_lane = {}, None
+    if engine.state_dir is not None:
         try:
-            for _ in range(3):
-                current = reader.parent(current, repo)
-                if current is None:
-                    break
-                chain.append(current)
-        except IntentError:
-            pass   # the chain so far is all that can be told
-        owner = pick_owner(agents, chain, repo, engine.config.get("intent_repo") if len(getattr(engine, "watches", ()) or ()) > 1 else None)
-        if owner and _is_orchestrator(agents[owner]):
-            return owner, "the PLAN link"
-    return None, None
+            entries = plan_ledger.read_ledger(engine.state_dir)[0]
+            source, _where = authoritative_plan(entries, pr, body)
+            issue = _plan_issue_of(source, repo) if source else None
+            if issue is not None and checked_plan(engine.config, source, None, getattr(engine, "gh_runner", None) or subprocess.run, engine.now).get("result") == "pass":
+                decided = _lane_of_issue(engine, repo, issue, orchestrators)
+                if decided and decided[0] == "one":
+                    plan_lane = decided[1]
+                elif decided and decided[0] == "many":
+                    extra["candidates"], extra["charter"] = decided[1], decided[2]
+                    return None, None, extra
+        except Exception:   # an unreadable ledger or plan is no plan lane: the notice decides
+            plan_lane = None
+    notice_lane = None
+    item = next((i for i in read_pr_notices(engine.state_dir) if i["repo"] == repo and i["number"] == number), None) if engine.state_dir is not None else None
+    for name in (notice_senders(item)[::-1] + ([item["boss"]] if isinstance(item.get("boss"), str) else [])) if item else []:
+        agent = agents.get(name)
+        if agent is None:
+            continue
+        boss = name if _is_orchestrator(agent) else boss_name(discovery, agent)
+        if boss in orchestrators:
+            notice_lane = boss
+            break
+    if plan_lane and notice_lane and plan_lane != notice_lane:
+        extra["unclear"] = [plan_lane, notice_lane]
+        return None, None, extra
+    if plan_lane:
+        return plan_lane, "the pull request's plan" + (" and the notice" if notice_lane else ""), extra
+    return notice_lane, "the notice" if notice_lane else None, extra
 
 
 def _notify_clear_body(engine, abandoned, kind, repo, number, head, reason=None, body=None, previous=None):
@@ -18785,13 +19151,14 @@ def _notify_clear_body(engine, abandoned, kind, repo, number, head, reason=None,
                 for old in sorted(seen, key=lambda k: seen[k].get("at", 0))[:len(seen) - CLEAR_NOTIFIED_MAX]:
                     del seen[old]
             _write_small(engine.state_dir, CLEAR_NOTIFIED_FILE, seen)   # before the send: at most once, even when the send fails
-        lane, how = clear_lane(engine, repo, number, body)
+        lane, how, extra = clear_lane(engine, repo, number, body)
+        unknown = ("lane unclear: plan lane %s, notice by %s" % tuple(extra["unclear"]) if extra.get("unclear") else "lane unknown") + (": charter #%s has %d orchestrators: %s" % (extra.get("charter"), len(extra["candidates"]), ", ".join(extra["candidates"])) if extra.get("candidates") else "")
         if kind == "carry":
-            line = "owner's clear carried %s from %s to %s; %s" % (pr, (previous or "?")[:8], head[:8], "%s merges it" % lane if lane else "lane unknown")
+            line = "owner's clear carried %s from %s to %s; %s" % (pr, (previous or "?")[:8], head[:8], "%s merges it" % lane if lane else unknown)
         else:
             flat = re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", re.sub(r"[\n\r\t]", " ", reason or ""))   # line breaks become spaces, other control characters vanish BEFORE the redaction: a token cannot hide behind one
             words = " ".join(redact_command_text(flat).split())
-            line = "owner cleared %s at %s: \"%s\"; %s" % (pr, head[:8], plan_ledger.clip(words, 300), "%s merges it" % lane if lane else "lane unknown")
+            line = "owner cleared %s at %s: \"%s\"; %s" % (pr, head[:8], plan_ledger.clip(words, 300), "%s merges it" % lane if lane else unknown)
         sent, failed = [], []
         for name in ["chief-of-staff"] + ([lane] if lane else []):
             try:
@@ -18803,6 +19170,10 @@ def _notify_clear_body(engine, abandoned, kind, repo, number, head, reason=None,
             except Exception as err:   # a send that fails never undoes the clear
                 failed.append("%s: %s" % (name, _one_line(str(err), 100)))
         detail = {"head": head, "kind": kind, "lane": lane, "lane_from": how, "sent": sent}
+        if extra.get("candidates"):
+            detail["candidates"] = extra["candidates"]
+        if extra.get("unclear"):
+            detail["lane_unclear"] = extra["unclear"]   # the plan's lane and the notice sender's lane differ: neither is told to merge
         if failed:
             detail["failed"] = failed
         if not abandoned.is_set():
@@ -21482,6 +21853,28 @@ class _RedsReader:
             err = done.stderr if isinstance(done.stderr, str) else (done.stderr or b"").decode("utf-8", "replace")
             raise load_reds().RedsError("gh api %s: %s" % (path.split("?")[0], self.accounts.scrub(_one_line(err, 120)) or "exit %d" % done.returncode))
         return done.stdout
+
+    PULL_STATE_QUERY = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){state mergeQueueEntry{id}}}}"
+
+    def pull_state(self, number):
+        """{"state": "OPEN"|"MERGED"|"CLOSED", "queued": bool} of one pull request (#584): ONE GraphQL read, a query with fixed text (the number is a typed variable).
+        gh's `pr view` has no merge queue field. Raises RedsError when it cannot be read."""
+        refuse_excluded(self.config, self.repo)
+        owner, _, name = self.repo.partition("/")
+        env = self.accounts.env_for(self.repo)
+        extra = {"env": env} if env is not None else {}
+        argv = [self.config["gh"], "api", "graphql", "-f", "query=" + self.PULL_STATE_QUERY, "-f", "owner=" + owner, "-f", "name=" + name, "-F", "number=%d" % number]
+        done = self.runner(argv, capture_output=True, text=True, timeout=self.config["call_timeout_seconds"], stdin=subprocess.DEVNULL, **extra)
+        if done.returncode != 0:
+            raise load_reds().RedsError("gh api graphql: %s" % (self.accounts.scrub(_one_line(done.stderr or done.stdout or "", 120)) or "exit %d" % done.returncode))
+        try:
+            pull = json.loads(done.stdout)["data"]["repository"]["pullRequest"]
+            state = pull["state"]
+        except (ValueError, KeyError, TypeError):
+            raise load_reds().RedsError("gh api graphql: no pull request in the answer") from None
+        if state not in ("OPEN", "MERGED", "CLOSED"):
+            raise load_reds().RedsError("gh api graphql: unknown pull request state")
+        return {"state": state, "queued": bool(pull.get("mergeQueueEntry"))}
 
 
 def cmd_reds(args, runner, now):
@@ -24577,7 +24970,7 @@ def build_parser():
                                                            "of creating one (a restart that keeps the conversation)")
     launch.add_argument("--headless", action="store_true", help="Start the worker with NO terminal: a session in the OpenCode service, the brief sent through "
                         "the API (about 2 MB instead of a terminal's 200 to 400 MB). Its tools run in the service's environment; opt in")
-    launch.add_argument("--workspace", help="The herdr workspace for the new tab (default: $HERDR_WORKSPACE_ID)")
+    launch.add_argument("--workspace", help="The herdr workspace for the new tab (default: the workspace of this session, else $HERDR_WORKSPACE_ID)")
     launch.add_argument("--role", help="metadata.fleet.role")
     launch.add_argument("--reports-to", dest="reports_to", help="metadata.fleet.reports_to")
     launch.add_argument("--issue", type=issue_arg, help="metadata.fleet.issue (owner/repo#N also sets --repo)")

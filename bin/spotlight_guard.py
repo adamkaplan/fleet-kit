@@ -40,6 +40,10 @@ def default_folders():
     return folders
 
 
+CONFIG_KEY = "spotlight_guard"   # the module declares its own configuration key (bin/fleet-switchboard config_declarations)
+CONFIG_DEFAULT = None            # None: no default is added to the configuration (absent = the defaults in settings())
+
+
 def validate(raw, source):
     """`spotlight_guard`: absent or null = the defaults; false = off; else {"folders": [absolute or ~ paths without a parent part], "enabled": bool}.
     Raises ValueError with a message naming the key."""
