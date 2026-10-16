@@ -536,7 +536,7 @@ class Driver(base.Base):
         winner = [o for c, o in results if c == 0][0]
         self.assertIn("per-run secret %s-run cleaned" % self.name, winner)
         calls = self.calls()
-        hooks = [c for c in calls if c[0] == "--context" and c[4] == "exec"]
+        hooks = [c for c in calls if c[0] == "--context" and c[4] == "exec" and "cw-end-hook" in c]   # the run record's read-only git rev-parse is not a hook
         self.assertEqual(len(hooks), 1, "the end hook ran more than once")
         self.assertEqual(self.st().get("secrets", {}), {})
         self.assertEqual(self.st()["pods"], {})
