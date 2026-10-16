@@ -31,6 +31,26 @@ The launcher mounts per-run files read-only under `/run/cw` (`CW_RUN_DIR`). The 
 A file that is absent is skipped (a pod started without per-run secrets). A file that is present but unreadable or empty
 refuses the start with one line naming it; there is no fallback to another source. The tmpfs is `CW_TMP_DIR` (default `/run/cw-tmp`).
 
+## The worker's rules in the pod (a convenience, not the guard)
+
+A cloud worker holds the same rules a local agent has. The entrypoint writes an OpenCode config (on tmpfs, no secret in it)
+that defines a `worker` agent (`worker.md`, with the STOP rules in prose) and denies, for the shell tool and for every agent, six
+kinds of command: merging a pull request (`gh pr merge`, the API merge call, the GraphQL merge mutations), force-pushing
+(`--force`, `-f`, `--force-with-lease`, `+ref`), pushing to the default branch, writing issues, writing labels, and
+repository settings calls (`gh repo edit/delete/archive`, `gh api` with PATCH/PUT/DELETE, branch protection, rulesets,
+webhooks, secrets). The `gh` and `git` wrappers first on the worker's PATH (installed with the token file) refuse the same
+six with exit status 3 and one line, `refused: <what>: the repository's rules are the guard; this wrapper is only a
+convenience`; the line names a fixed phrase and never an argument value. Everything else passes unchanged (the `gh` wrapper
+still reads the token file at call time).
+
+What this is NOT: the guard. Both layers are defence in depth and can be bypassed: calling the real binary by its path,
+another HTTP client or a script skips the wrapper, and a pattern is only text matching. The guard is the repository's own
+rules (branch protection or a ruleset that forbids merge by the worker, pushes to the default branch and force-pushes) and
+the token's scope (the preflight, #545). Known limits: the `permission.bash` block was checked to load and convert in a local OpenCode 2.0.28 server (it becomes `shell` deny rules), but that server did not list the `worker` agent in isolation, so the agent definition is not proven to register or to be the default (no `default_agent` is set); the global deny block applies to every agent either way. the config's patterns name `main` and `master` only (the wrapper
+also reads `CW_DEFAULT_BRANCH`, space or comma separated, and `origin/HEAD`), `git push` from a checkout of the default
+branch is refused by the wrapper only, and the config's patterns can over-refuse (a branch named `fix-main-menu`). A
+missing guard file refuses the start. Tests: `cloud/worker/tests/test_guard.py`.
+
 ## The operator driver
 
 ```sh

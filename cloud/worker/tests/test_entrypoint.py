@@ -3,6 +3,7 @@ mounted files, hands the server password over, and never prints a secret. Offlin
 stub server, no Docker. The planted values are synthetic."""
 import json
 import os
+import shutil
 import socket
 import stat
 import subprocess
@@ -39,6 +40,10 @@ class Entrypoint(unittest.TestCase):
         self.run_dir, self.tmpfs, self.home, self.bin = [os.path.join(self.d, x) for x in ("run", "tmpfs", "home", "bin")]
         for x in (self.run_dir, self.tmpfs, self.home, self.bin):
             os.mkdir(x)
+        self.share = os.path.join(self.d, "share")   # what the image's COPY lays down under /usr/local/share/cw
+        os.mkdir(self.share)
+        for src, name in (("guard.sh", "guard.sh"), ("opencode-worker.json", "opencode-worker.json"), ("agents/worker.md", "worker.md")):
+            shutil.copy(os.path.join(CLOUD, "worker", src), os.path.join(self.share, name))
         self.put("model-auth", MODEL)
         self.put("git-token", GIT)
         self.put("server-password", PASSWORD)
@@ -57,7 +62,7 @@ class Entrypoint(unittest.TestCase):
 
     def env(self, **extra):
         return dict({"PATH": self.bin + ":/usr/bin:/bin", "HOME": self.home, "WORKER_DOCKER": "0", "CW_RUN_DIR": self.run_dir,
-                     "CW_TMP_DIR": self.tmpfs, "GIT_CONFIG_NOSYSTEM": "1"}, **extra)
+                     "CW_TMP_DIR": self.tmpfs, "CW_SHARE_DIR": self.share, "GIT_CONFIG_NOSYSTEM": "1"}, **extra)
 
     def start(self, *cmd, **extra):
         return subprocess.run(["sh", ENTRYPOINT] + list(cmd or ["true"]), env=self.env(**extra), capture_output=True, text=True, timeout=60)
@@ -120,10 +125,10 @@ class Entrypoint(unittest.TestCase):
     def test_s4_the_model_config_names_the_default_model_and_cw_model_overrides_it(self):
         conf = os.path.join(self.tmpfs, "config", "opencode", "opencode.json")
         self.assertEqual(self.start().returncode, 0)
-        self.assertEqual(json.loads(read(conf)), {"model": "github-copilot/claude-sonnet-5.5"})
+        self.assertEqual(json.loads(read(conf))["model"], "github-copilot/claude-sonnet-5.5")
         self.assertEqual(stat.S_IMODE(os.stat(conf).st_mode), 0o600)
         self.assertEqual(self.start(CW_MODEL="acme/other-model").returncode, 0)
-        self.assertEqual(json.loads(read(conf)), {"model": "acme/other-model"})
+        self.assertEqual(json.loads(read(conf))["model"], "acme/other-model")   # (the file also carries the worker agent: see test_guard.py)
 
     def test_s4_no_secret_is_in_the_environment_of_the_command_or_in_any_file_but_its_own(self):
         r = self.start("env")
