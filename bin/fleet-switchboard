@@ -13289,6 +13289,11 @@ def awaiting_cos_label(config):
     return config.get("awaiting_cos_label") or "%s:awaiting-cos" % getpass.getuser()
 
 
+def awaiting_live_label(config):
+    """The label that marks an issue as waiting on a live event, `<user>:awaiting-live` (the same `<user>:` namespace as the other awaiting labels)."""
+    return "%s:awaiting-live" % getpass.getuser()
+
+
 def orchestrator_label(config=None):
     """PR 18: the label that marks a charter, `<user>:orchestrator` (skills/fleet-charter)."""
     return "%s:orchestrator" % getpass.getuser()
@@ -14347,8 +14352,8 @@ class GitHubHub:
                 self.closed_issues["%s#%d" % (plan_ledger.normal_repo(repo), number)] = {"labels": names, "at": self.now()}
                 while len(self.closed_issues) > PR_STATE_MAX:
                     self.closed_issues.pop(min(self.closed_issues, key=lambda r: self.closed_issues[r]["at"]))
-        except Exception:
-            pass
+        except Exception as err:   # said, never silent: the issue's awaiting labels would stay on
+            self._audit("github.rejected", repo, {"reason": "issues closed event not kept: %s" % _one_line(str(err))})
 
     def closed_issue_snapshot(self):
         """A copy of the closed-issue events the hub holds, for the pass that cleans their labels."""

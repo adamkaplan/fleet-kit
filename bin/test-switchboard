@@ -21381,6 +21381,8 @@ class TestSweep(Base):
         closed_but_labelled = dict(self.human(30), closed=True)
         kept = self.sweep([closed_but_labelled, self.human(31), self.human(32, "captain")])
         self.assertEqual([d["ask"] for d in kept], [], "a closed issue is no decision: withdrawn like the others (the list never holds one now)")
+        self.assertIn(("acme/api", "issues/30"), self.hub.single, "it is read like any other, and found closed")
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "sweep.withdrawn"]), 3, "each of the 3 is withdrawn and audited")
 
     def test_s4_a_decision_whose_issue_is_closed_is_withdrawn_and_audited_once(self):
         self.hub.closed = {30}
@@ -30353,6 +30355,13 @@ class TestDecisionsFromGitHub(Base):
         self.gh.send("issues", {"action": "unlabeled", "issue": dict(issue), "label": {"name": DECISION_LABEL}})
         self.assertEqual(self.derive()[0], [])
         self.assertEqual(len(self.gh.api_calls), calls)
+
+    def test_the_catch_up_read_asks_for_open_issues_only(self):
+        self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
+        self.rig.pump(15)
+        reads = [p for p in self.gh.api_calls if "awaiting-user" in p]
+        self.assertTrue([p for p in reads if "state=open" in p], reads)
+        self.assertFalse([p for p in reads if "state=all" in p], reads)   # #570: it used to ask for state=all for the person's label
 
     def test_a_closed_issue_that_keeps_the_persons_label_is_not_listed_at_all(self):   # #570: it used to stay listed, marked closed
         issue = self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
@@ -57028,6 +57037,43 @@ class TestClosedIssueLabels(Base):
         self.world.tick(sb.load_module("closed_labels").RETRY_SECONDS + 1)
         self.go(entries, {13: self.issue()}, gh)
         self.assertEqual((sorted(gh.removed), len(self.told())), (sorted(self.awaiting), 1))
+
+    def test_an_issue_closed_reopened_and_closed_again_is_cleaned_on_the_second_close(self):
+        gh = FakeMergedGh()
+        entries = {"acme/api#16": self.entry()}
+        self.go(entries, {16: self.issue("open")}, gh)   # the first pass finds it reopened: nothing removed, marked handled
+        self.assertEqual(gh.removed, [])
+        self.world.tick(60)
+        entries["acme/api#16"] = dict(self.entry(), at=self.world.clock.now())   # the hub records a NEWER closed event
+        self.go(entries, {16: self.issue("closed")}, gh)
+        self.assertEqual(sorted(gh.removed), sorted(self.awaiting), "the second close is handled afresh")
+
+    def test_the_passs_cap_bounds_the_reads_and_the_rest_wait_for_the_next_pass(self):
+        gh = FakeMergedGh()
+        entries = {"acme/api#%d" % n: self.entry() for n in (21, 22)}
+        reads = {21: self.issue("open"), 22: self.issue("open")}
+        self.engine.hub, self.engine.gh_runner = StubIssueHub(entries, reads), gh
+        closed_labels = sb.load_module("closed_labels")
+        ns = types.SimpleNamespace(**{n: getattr(sb, n) for n in closed_labels.NEEDS})
+        closed_labels.run_pass(ns, self.engine, self.world.clock.now(), 1)
+        self.assertEqual(len(self.engine.hub.read_log), 1, "calls=1: one read")
+        closed_labels.run_pass(ns, self.engine, self.world.clock.now(), 1)
+        self.assertEqual(len(self.engine.hub.read_log), 2, "the other waits for the next pass")
+
+    def test_the_live_label_name_is_pinned_to_the_fleet_prefix(self):
+        with mock.patch.object(sb.getpass, "getuser", return_value="osuser"):
+            self.assertEqual(sb.awaiting_live_label({}), "osuser:awaiting-live")
+
+    def test_a_real_issues_closed_event_through_the_hub_reaches_the_snapshot(self):
+        rig = GithubRig(self, config={"awaiting_label": DECISION_LABEL})
+        issue = rig.gh.issue(7, title="Pick one", labels=[DECISION_LABEL, "bug"], age=0)
+        rig.pump(15)
+        issue["state"] = "closed"
+        rig.gh.send("issues", {"action": "closed", "issue": dict(issue)})
+        self.assertEqual([ref.rpartition("#")[2] for ref in rig.hub.closed_issue_snapshot()], ["7"], "exactly the issue that closed")
+        (entry,) = rig.hub.closed_issue_snapshot().values()
+        self.assertEqual(entry["labels"], sorted([DECISION_LABEL, "bug"]))
+        self.assertEqual(rig.hub.awaiting_listing()[0], [], "and the issue is no longer kept for the list")
 
     def test_the_hub_keeps_a_closed_event_in_memory_and_the_daemons_pass_runs_the_cleaning(self):
         self.engine.hub = StubIssueHub({}, {})

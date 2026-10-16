@@ -21,12 +21,12 @@ calls `run_pass` from the daemon's pass with a namespace `sb` of its own helpers
 RETRY_SECONDS = 300
 DONE_MAX = 500
 
-NEEDS = ("awaiting_label", "awaiting_cos_label", "getpass", "change_issue_labels", "load_module", "_one_line", "subprocess")
+NEEDS = ("awaiting_label", "awaiting_cos_label", "awaiting_live_label", "change_issue_labels", "load_module", "_one_line", "subprocess")
 
 
 def awaiting_names(sb, config):
     """The exact awaiting label names of this fleet's prefix that may be removed."""
-    return {sb.awaiting_label(config), sb.awaiting_cos_label(config), "%s:awaiting-live" % sb.getpass.getuser()}
+    return {sb.awaiting_label(config), sb.awaiting_cos_label(config), sb.awaiting_live_label(config)}
 
 
 def run_pass(sb, engine, now, calls):
@@ -38,9 +38,16 @@ def run_pass(sb, engine, now, calls):
     memory = engine.__dict__.setdefault("closed_labels", {"done": {}, "retry": {}, "said": set()})
     ours = awaiting_names(sb, engine.config)
     spent = 0
-    for ref, entry in sorted(hub.closed_issue_snapshot().items()):
-        if ref in memory["done"] or not isinstance(entry, dict):
+    snapshot = hub.closed_issue_snapshot()
+    for table in ("retry",):
+        for ref in [r for r in memory[table] if r not in snapshot]:
+            memory[table].pop(ref, None)   # no longer held by the hub: its retry state goes too
+    memory["said"] &= set(snapshot)
+    for ref, entry in sorted(snapshot.items()):
+        if not isinstance(entry, dict):
             continue
+        if ref in memory["done"] and entry.get("at", 0) <= memory["done"][ref]:
+            continue   # handled since this closed event; a NEWER event (closed again after a reopen) is handled afresh
         repo, _, number = ref.rpartition("#")
         if not number.isdigit() or not repo:
             continue
