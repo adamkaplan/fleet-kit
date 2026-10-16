@@ -25734,7 +25734,7 @@ class TestWaive(LedgerBase):
         self.assertEqual(self.row(report, "G6")["status"], "waiting")               # the owner's hold stands
         self.assertEqual(self.row(report, "G1")["status"], "waived")
         code, payload, _ = self.check()
-        self.assertEqual([f["gate"] for f in payload["failed"]], ["G6"])             # still failing (reported: a repo lists G6 to enforce it)
+        self.assertEqual([f["gate"] for f in payload["failed"]], ["G6", "G6b"])      # still failing (reported: a repo lists G6 to enforce it)
         self.assertEqual(self.run_as("coder", "gates-check", self.PR, "--for", "merge")[0], 0)   # G6 is not in this repo's enforced list
 
     def test_a_short_reason_is_refused(self):
