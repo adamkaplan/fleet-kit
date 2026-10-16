@@ -34,6 +34,9 @@ AUTH:       <the authority already granted, explicitly>
 CHECKPOINT: <a UTC time or an agreed event, with an overdue time>
 ```
 
+A brief for a credential, permission or privileged-script change links `docs/adversarial-checklist.md`.
+The pull request body answers each item of it in one line.
+
 `ASK` carries the Intent and Done when of the ask this assignment serves
 (`fleet-switchboard intent <issue>` prints them), so a coder who never sees the
 charter still knows what the work is for. `GOAL` and `DONE` narrow the ask to this
