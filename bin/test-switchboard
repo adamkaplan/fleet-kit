@@ -28653,6 +28653,174 @@ class TestImpactHold(LedgerBase):
         self.assertIn("hold-impact", [k for k, _, _ in sb.LABEL_SPECS])
 
 
+    # ---- #661: the Chief of Staff's clear under the owner's standing order
+
+    ORDER_TEXT = "The Chief of Staff may clear held pull requests whose review confirms no change to credentials, identity or permissions, and tell the owner after."
+
+    def delegate(self, orders=(17,), charter=40, config=True):
+        if config:
+            self.extra_config["delegated_clear"] = {"orders": list(orders), "charter": charter}
+        self.configure()
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"}) if "cos" not in self.world.sessions else None
+        orders_of_charter = ["order one"] + ["order %d" % n for n in range(2, 17)] + [self.ORDER_TEXT]
+        for target, value in (("fetch_orders", lambda reader, charter, repo: orders_of_charter), ("_intent_reader", lambda runner, now: object())):
+            patcher = mock.patch.object(sb, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def files_of_pr(self, *paths, patch="@@ -1 +1 @@\n-a\n+b"):
+        listing = [{"filename": p, "patch": patch} for p in paths]
+        patcher = mock.patch.object(sb, "impact_carry_get", lambda engine, runner, repo: (lambda path: listing if "page=1" in path else []))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def under(self, who="cos", order=17, reason="the review confirms nothing touches credentials nor identity"):
+        return self.run_as(who, "impact", "clear", self.PR, "--under-order", str(order), "--reason", reason)
+
+    def test_s1_the_chief_of_staff_clears_under_a_listed_order_and_it_is_recorded_as_her_act_under_that_order(self):
+        self.delegate()
+        self.floor_pr(path="migrations/0002.sql")   # an authority path (the fixture's top tier path), no credentials, no identity
+        self.files_of_pr("migrations/0002.sql")
+        self.passes()
+        code, out, err = self.under()
+        self.assertEqual(code, 0, err)
+        deletes = sorted(w[1].rsplit("/", 1)[1] for w in self.writes if w[0] == "DELETE")
+        self.assertTrue(deletes, "the same labels are removed")
+        (cleared,) = self.events("gate.hold_cleared")
+        detail = cleared["detail"]
+        self.assertEqual((detail["by"], detail["under_order"], detail["head"], detail["via"]), ("cos", 17, LEDGER_HEAD, "order:17"))
+        self.assertIn("may clear held pull requests", detail["order"])
+        self.assertIn("nothing touches credentials", detail["reason"])
+        self.assertNotEqual(detail["by"], "owner")
+
+    def test_s2_only_the_chief_of_staff_may_use_the_option_and_the_owners_plain_clear_is_unchanged(self):
+        self.delegate()
+        self.files_of_pr("migrations/0002.sql")
+        self.passes()
+        self.world.add_agent("orch", fleet={"role": "orchestrator"})
+        for who in ("orch", "coder"):
+            code, out, err = self.under(who)
+            self.assertEqual(code, 2, who)
+            self.assertIn("only the Chief of Staff", err)
+        self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [])
+        self.assertEqual(self.run_as(None, "impact", "clear", self.PR, "--reason", "a false hold: the file is a fixture")[0], 0, "the operator's plain clear works as before")
+        code, out, err = self.under(None)
+        self.assertEqual(code, 2)
+        self.assertIn("for the Chief of Staff", err, "the owner needs no order")
+
+    def test_s3_a_credentials_path_an_identity_path_and_a_credentials_review_class_are_refused_and_named(self):
+        self.delegate()
+        for label, paths, review in (("credentials path", ("shims/gh",), None), ("identity path", ("bin/switchboard-trial",), None), ("review class", ("migrations/0002.sql",), ("hold", "credentials"))):
+            self.writes.clear()
+            self.floor_pr(path=paths[0])
+            self.files_of_pr(*paths)
+            self.passes()
+            with mock.patch.object(sb, "impact_review_record", lambda state, pr, head: (review, None)):
+                code, out, err = self.under()
+            self.assertEqual(code, 2, label)
+            self.assertIn("stays the owner's own clear", err, label)
+            self.assertIn(paths[0] if review is None else "credentials", err, label)
+            self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [], label)
+
+    def test_an_independent_review_class_that_is_authority_is_refused_even_when_the_paths_are_only_authority(self):
+        self.delegate()
+        self.files_of_pr("migrations/0002.sql")
+        self.passes()
+        for review in (("hold", "authority"), ("hold", "identity"), ("hold", None)):
+            with mock.patch.object(sb, "impact_review_record", lambda state, pr, head: (review, None)):
+                code, out, err = self.under()
+            self.assertEqual(code, 2, review)
+            self.assertIn("independent review", err, review)
+        self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [])
+
+    def test_s4_a_change_to_the_clear_code_is_refused_whatever_the_paths(self):
+        self.delegate()
+        patch_of = lambda name: "@@ -10,3 +10,3 @@ def %s(args, runner, now):\n-    old\n+    new" % name
+        for label, paths, patch in (("the clear command", ("bin/fleet-switchboard",), patch_of("cmd_impact_clear")), ("the chat clear module", ("bin/chat_clear.py",), "@@ -1 +1 @@\n-a\n+b"),
+                                    ("this check", ("bin/delegated_clear.py",), "@@ -1 +1 @@\n-a\n+b"), ("the notice in the daemon file", ("bin/fleet-switchboard",), "@@ -5 +5 @@\n-    notify_clear(x)\n+    pass")):
+            self.floor_pr(path="migrations/0002.sql")
+            self.files_of_pr(*paths, patch=patch)
+            self.passes()
+            code, out, err = self.under()
+            self.assertEqual(code, 2, label)
+            self.assertIn("clear code", err, label)
+        self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [])
+        self.files_of_pr("bin/fleet-switchboard", patch="@@ -1 +1 @@ def some_other_function():\n-a\n+b")   # the daemon file changed elsewhere: not clear code
+        code, out, err = self.under()
+        self.assertEqual(code, 0, err)
+
+    def test_s5_only_the_listed_order_is_accepted_and_a_missing_order_is_refused(self):
+        self.delegate(orders=(17, 99))
+        self.files_of_pr("migrations/0002.sql")
+        self.passes()
+        for order, fragment in ((9, "not listed"), (99, "does not exist")):
+            code, out, err = self.under(order=order)
+            self.assertEqual(code, 2, order)
+            self.assertIn(fragment, err, order)
+        self.assertEqual(self.under(order=17)[0], 0)
+
+    def test_s6_not_enabled_in_three_shapes_is_refused(self):
+        for label, value in (("no key", None), ("empty list", {"orders": [], "charter": 40}), ("false", False)):
+            self.setUp()
+            if value is not None:
+                self.extra_config["delegated_clear"] = value
+            self.delegate(config=False)
+            self.files_of_pr("migrations/0002.sql")
+            self.passes()
+            code, out, err = self.under()
+            self.assertEqual(code, 2, label)
+            self.assertIn("not enabled", err, label)
+            self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [], label)
+        module = sb.load_module("delegated_clear")
+        for malformed in ("yes", {"orders": "17", "charter": 40}, {"orders": [17]}, {"orders": [True], "charter": 40}, {"orders": [17], "charter": 0}, 5):
+            self.assertIsNone(module.settings({"delegated_clear": malformed}), malformed)
+            if malformed != 5:
+                with self.assertRaises(ValueError):
+                    module.validate(malformed, "config")
+
+    def test_s7_the_clear_is_bound_to_the_head_and_the_chief_of_staff_can_revoke_under_the_order(self):
+        self.delegate()
+        self.files_of_pr("migrations/0002.sql")
+        self.passes()
+        self.assertEqual(self.under()[0], 0)
+        before = len(self.label_writes())
+        self.floor_pr(head=LEDGER_NEW_HEAD)
+        self.passes(records=[self.listed(head=LEDGER_NEW_HEAD)], advance=8000)
+        self.assertEqual(len(self.label_writes()), before + 1, "held again at the new head")
+        code, out, err = self.run_as("cos", "impact", "clear", self.PR, "--under-order", "17", "--revoke", "--reason", "taking the clear back: it was a mistake")
+        self.assertEqual(code, 0, err)
+        revoked = self.events("gate.clear_revoked")
+        self.assertTrue(revoked and revoked[-1]["detail"]["under_order"] == 17)
+
+    def test_s8_an_unreadable_decision_or_rule_or_file_list_is_refused_and_nothing_is_lifted(self):
+        self.delegate()
+        self.floor_pr(path="migrations/0002.sql")
+        self.passes()
+        self.files_of_pr("migrations/0002.sql")
+        broken = lambda path=None: (_ for _ in ()).throw(sb.impact_floor.MatrixError("the matrix file is not valid JSON"))
+        with mock.patch.object(sb.impact_floor, "load_matrix", broken):
+            code, out, err = self.under()
+        self.assertEqual(code, 2)
+        self.assertIn("cannot be read", err)
+        with mock.patch.object(sb, "impact_carry_get", lambda engine, runner, repo: (lambda path: (_ for _ in ()).throw(RuntimeError("HTTP 502")))):
+            code, out, err = self.under()
+        self.assertEqual(code, 2)
+        self.assertIn("cannot be read", err)
+        self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [])
+
+    def test_s9_the_same_clear_notice_goes_out_naming_the_chief_of_staff_and_the_order(self):
+        self.delegate()
+        self.world.add_agent("orch-a", fleet={"role": "orchestrator", "repo": "acme/app", "issue": 7})
+        self.files_of_pr("migrations/0002.sql")
+        self.passes()
+        sb.record_pr_notice(self.world.state, "acme/app", 9, "orch-a", "ready", self.world.clock.now())
+        self.assertEqual(self.under()[0], 0)
+        (event,) = self.events("gate.clear_notified")
+        self.assertIn("chief-of-staff", event["detail"]["sent"])
+        texts = [a["text"] for name in ("cos", "orch-a") for a in self.world.admissions(name) if "standing order 17" in a["text"]]
+        self.assertTrue(texts and all("cos cleared acme/app#9" in t for t in texts), texts)
+
+
 class TestCiRecordPass(LedgerBase):
     """The daemon pass of the ci recorder: open PRs under a plan, in repos listed in `plan_gates`, get their `ci` verdict when the
     checks at the CURRENT head are green. Records only; never refuses; GETs only."""
