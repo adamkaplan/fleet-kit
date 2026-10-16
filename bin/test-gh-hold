@@ -518,6 +518,21 @@ class TestShimsUseIt(Base):
                 self.assertNotIn("TOKEN=", done.stdout)
                 self.assertIn("no GitHub account is mapped", done.stderr)
 
+    def test_a_shim_without_its_matcher_refuses_a_credential_and_a_write_and_never_runs_gh(self):
+        lone = self.home / "lone"
+        lone.mkdir()
+        shutil.copy(str(SHIM), str(lone / "gh"))                   # the shim alone: repo_match.py is not beside it
+        for args in (("auth", "git-credential", "get"), ("issue", "comment", "7", "--body", "x")):
+            with self.subTest(args=args):
+                self.config(None, json.dumps({"gh_users": {"acme-org/*": "acme-bot"}}))
+                self.sb.write_text("#!/bin/sh\nif [ \"$1\" = whoami ] && [ \"$2\" = --json ]; then echo '{\"name\": \"worker\", \"repo\": \"acme-org/widget-api\"}'; exit 0; fi\nexit 2\n")
+                environ = {"PATH": "%s:%s" % (self.token_gh, SAFE_PATH), "HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / ".config"),
+                           "FLEET_SWITCHBOARD_STATE": str(self.state), "FLEET_SWITCHBOARD_BIN": str(self.sb), "FLEET_SHIM_LOOKUP_SECONDS": "10",
+                           "FLEET_REAL_GH": str(self.token_gh / "gh"), "GH_TOKEN": "inherited"}
+                done = subprocess.run([sys.executable, str(lone / "gh"), *args], capture_output=True, text=True, env=environ, timeout=60)
+                self.assertEqual(done.returncode, 1, done.stderr)
+                self.assertNotIn("TOKEN=", done.stdout)
+
     def test_the_git_shim_has_no_matcher_of_its_own_and_still_routes_credentials_to_the_gh_shim(self):
         self.assertNotIn("users.get", (REPO / "shims" / "git").read_text())
         done = self.credential("Acme-Org/Other.git", {"acme-org/*": "acme-bot"}, args=("auth", "git-credential", "get"))
