@@ -28662,6 +28662,10 @@ class TestImpactHold(LedgerBase):
             self.extra_config["delegated_clear"] = {"orders": list(orders), "charter": charter}
         self.configure()
         self.world.add_agent("cos", fleet={"role": "chief-of-staff"}) if "cos" not in self.world.sessions else None
+        self.review = (("none", None), None)   # an independent review is recorded at this head (no hold, no class); a test overrides it
+        patcher = mock.patch.object(sb, "impact_review_record", lambda state, pr, head: self.review)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         orders_of_charter = ["order one"] + ["order %d" % n for n in range(2, 17)] + [self.ORDER_TEXT]
         for target, value in (("fetch_orders", lambda reader, charter, repo: orders_of_charter), ("_intent_reader", lambda runner, now: object())):
             patcher = mock.patch.object(sb, target, value)
@@ -28670,7 +28674,7 @@ class TestImpactHold(LedgerBase):
 
     def files_of_pr(self, *paths, patch="@@ -1 +1 @@\n-a\n+b"):
         listing = [{"filename": p, "patch": patch} for p in paths]
-        patcher = mock.patch.object(sb, "impact_carry_get", lambda engine, runner, repo: (lambda path: listing if "page=1" in path else []))
+        patcher = mock.patch.object(sb, "impact_carry_get", lambda engine, runner, repo: (lambda path: (listing if "page=1" in path else []) if "/files" in path else {"head": {"sha": self.pr["headRefOid"]}}))
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -28704,6 +28708,9 @@ class TestImpactHold(LedgerBase):
             self.assertIn("only the Chief of Staff", err)
         self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [])
         self.assertEqual(self.run_as(None, "impact", "clear", self.PR, "--reason", "a false hold: the file is a fixture")[0], 0, "the operator's plain clear works as before")
+        (plain,) = self.events("gate.hold_cleared")
+        self.assertNotIn("under_order", plain["detail"])
+        self.assertNotIn("order", plain["detail"])
         code, out, err = self.under(None)
         self.assertEqual(code, 2)
         self.assertIn("for the Chief of Staff", err, "the owner needs no order")
@@ -28715,8 +28722,8 @@ class TestImpactHold(LedgerBase):
             self.floor_pr(path=paths[0])
             self.files_of_pr(*paths)
             self.passes()
-            with mock.patch.object(sb, "impact_review_record", lambda state, pr, head: (review, None)):
-                code, out, err = self.under()
+            self.review = (review or ("none", None), None)
+            code, out, err = self.under()
             self.assertEqual(code, 2, label)
             self.assertIn("stays the owner's own clear", err, label)
             self.assertIn(paths[0] if review is None else "credentials", err, label)
@@ -28727,10 +28734,14 @@ class TestImpactHold(LedgerBase):
         self.files_of_pr("migrations/0002.sql")
         self.passes()
         for review in (("hold", "authority"), ("hold", "identity"), ("hold", None)):
-            with mock.patch.object(sb, "impact_review_record", lambda state, pr, head: (review, None)):
-                code, out, err = self.under()
+            self.review = (review, None)
+            code, out, err = self.under()
             self.assertEqual(code, 2, review)
             self.assertIn("independent review", err, review)
+        self.review = (None, None)   # no review recorded at this head: unknown is refused
+        code, out, err = self.under()
+        self.assertEqual(code, 2)
+        self.assertIn("no independent review is recorded", err)
         self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [])
 
     def test_s4_a_change_to_the_clear_code_is_refused_whatever_the_paths(self):
@@ -28761,7 +28772,7 @@ class TestImpactHold(LedgerBase):
 
     def test_s6_not_enabled_in_three_shapes_is_refused(self):
         for label, value in (("no key", None), ("empty list", {"orders": [], "charter": 40}), ("false", False)):
-            self.setUp()
+            self.extra_config.pop("delegated_clear", None)
             if value is not None:
                 self.extra_config["delegated_clear"] = value
             self.delegate(config=False)
@@ -28777,6 +28788,62 @@ class TestImpactHold(LedgerBase):
             if malformed != 5:
                 with self.assertRaises(ValueError):
                     module.validate(malformed, "config")
+
+    def test_a_head_that_moves_between_the_decision_and_the_file_list_is_refused(self):
+        self.delegate()
+        self.floor_pr(path="migrations/0002.sql")
+        self.passes()
+        listing = [{"filename": "migrations/0002.sql", "patch": "@@ -1 +1 @@\n-a\n+b"}]
+        patcher = mock.patch.object(sb, "impact_carry_get", lambda engine, runner, repo: (lambda path: (listing if "page=1" in path else []) if "/files" in path else {"head": {"sha": "d" * 40}}))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        code, out, err = self.under()
+        self.assertEqual(code, 2)
+        self.assertIn("head moved while it was being checked", err)
+        self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [])
+
+    def test_a_rename_out_of_a_clear_code_path_is_refused_by_its_source_name(self):
+        self.delegate()
+        self.floor_pr(path="migrations/0002.sql")
+        listing = [{"filename": "docs/neutral.py", "previous_filename": "bin/chat_clear.py", "patch": "@@ -1 +1 @@\n-a\n+b"}]
+        patcher = mock.patch.object(sb, "impact_carry_get", lambda engine, runner, repo: (lambda path: (listing if "page=1" in path else []) if "/files" in path else {"head": {"sha": LEDGER_HEAD}}))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.passes()
+        code, out, err = self.under()
+        self.assertEqual(code, 2)
+        self.assertIn("clear code", err)
+
+    def test_every_function_the_delegated_clear_decision_calls_is_listed_as_clear_code_in_the_matrix(self):
+        import ast
+        tree = ast.parse((BIN / "fleet-switchboard").read_text())
+        defs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+        roots = ("delegated_clear_checks", "delegated_clear_pr_checks", "pr_floor_report")
+        called = set(roots)
+        for root in roots:
+            called |= {c.func.id for c in ast.walk(defs[root]) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id in defs}
+        listed = set(sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]["clear_code_symbols"])
+        self.assertEqual(sorted(called - listed - {"_one_line"}), [], "a function the decision calls is not named as clear code in the matrix")
+
+    def test_the_refusals_table_of_the_pure_module(self):
+        module = sb.load_module("delegated_clear")
+        rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
+        good = {"owner_decision": "hold", "complete": True, "unknown": None, "renamed_no_source": [], "top_tier_hits": {"authority": ["x"]}, "review_action": "none", "review_class": None, "changed_paths": ["x"]}
+        files = [{"filename": "x", "patch": "@@ -1 +1 @@\n-a\n+b"}]
+        self.assertEqual(module.refusals(rule, good, files), [])
+        cases = (("complete false", dict(good, complete=False)), ("unknown", dict(good, unknown="3 of 9 files")), ("renamed", dict(good, renamed_no_source=["a"])),
+                 ("unreadable decision", dict(good, owner_decision=None)), ("credentials upper case", dict(good, top_tier_hits={"Credentials": ["shims/gh"]})),
+                 ("review class mixed case", dict(good, review_class="Identity")), ("no review", dict(good, review_action=None)))
+        for label, report in cases:
+            self.assertTrue(module.refusals(rule, report, files), label)
+        self.assertTrue(module.refusals(rule, good, None), "no file list")
+        self.assertTrue(module.refusals(rule, good, [{"filename": "bin/fleet-switchboard"}]), "a patch of the daemon file that is not available")
+        self.assertTrue(module.refusals(dict(rule, clear_code_paths="x"), good, files), "a malformed rule")
+        self.assertTrue(module.refusals(None, good, files))
+        self.assertFalse(module.caller_is_chief(("agent", "x", "orchestrator")))
+        self.assertFalse(module.caller_is_chief(("person", "me")))
+        self.assertFalse(module.caller_is_chief(("agent", "x")))
+        self.assertTrue(module.caller_is_chief(("agent", "x", "chief-of-staff")))
 
     def test_s7_the_clear_is_bound_to_the_head_and_the_chief_of_staff_can_revoke_under_the_order(self):
         self.delegate()

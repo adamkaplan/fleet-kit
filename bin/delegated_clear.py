@@ -77,12 +77,14 @@ def refusals(rule, report, files):
     for cls in sorted(hits):
         if cls.lower() in {c.lower() for c in rule["never_path_classes"]}:
             reasons.append("it changes a %s path (%s): that stays the owner's own clear" % (cls, ", ".join(hits[cls][:3])))
+    if report.get("review_action") is None:
+        reasons.append("no independent review is recorded at this head: unknown is refused")
     review = report.get("review_class")
     if review is None and report.get("review_action") == "hold":
         reasons.append("the independent review holds it with no class named: unknown is refused")
     if isinstance(review, str) and review.lower() in {c.lower() for c in rule["top_tier_review_classes"]}:
         reasons.append("the independent review's class is %s, a top tier class: that stays the owner's own clear" % review)
-    changed = {f.get("filename") for f in files or [] if isinstance(f, dict)} | set(report.get("changed_paths") or [])
+    changed = {f.get("filename") for f in files or [] if isinstance(f, dict)} | {f.get("previous_filename") for f in files or [] if isinstance(f, dict)} | set(report.get("changed_paths") or [])
     for path in sorted(p for p in changed if isinstance(p, str)):
         if path in rule["clear_code_paths"]:
             reasons.append("it changes the clear code (%s): a change to the clear is the owner's own" % path)
@@ -90,7 +92,7 @@ def refusals(rule, report, files):
         reasons.append("the patches of the changed files cannot be read, so a change to the clear code cannot be ruled out")
     else:
         for item in files:
-            if not isinstance(item, dict) or item.get("filename") not in rule["clear_code_symbol_files"]:
+            if not isinstance(item, dict) or not ({item.get("filename"), item.get("previous_filename")} & set(rule["clear_code_symbol_files"])):
                 continue
             if not isinstance(item.get("patch"), str):
                 reasons.append("the patch of %s is not available, so a change to the clear code cannot be ruled out" % item.get("filename"))

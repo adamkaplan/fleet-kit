@@ -316,7 +316,18 @@
         "apply_impact_hold",
         "_apply_impact_hold_locked",
         "gates_caller_kind",
-        "delegated_clear_checks"
+        "delegated_clear_checks",
+        "delegated_clear_pr_checks",
+        "pr_floor_report",
+        "impact_review_record",
+        "impact_review_hold",
+        "fetch_orders",
+        "_intent_reader",
+        "impact_carry_get",
+        "load_module",
+        "read_pr_json",
+        "agent_block_states",
+        "redact_command_text"
       ]
     }
   }

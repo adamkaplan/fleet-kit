@@ -19668,6 +19668,13 @@ def delegated_clear_pr_checks(engine, runner, repo, number):
             files = None   # more than 3000 files: not read in full
     except Exception:
         files = None
+    if files is not None:   # the file list and the decision must be of ONE head: the head read again after the files must still be the one the decision read
+        try:
+            after = (get("repos/%s/pulls/%d" % (repo, number)).get("head") or {}).get("sha")
+        except Exception:
+            after = None
+        if after != report.get("head"):
+            return None, "the pull request's head moved while it was being checked (%s, then %s): nothing was cleared" % (str(report.get("head"))[:8], str(after)[:8])
     reasons = load_module("delegated_clear").refusals(rule, report, files)
     if reasons:
         return None, "; ".join(reasons)
