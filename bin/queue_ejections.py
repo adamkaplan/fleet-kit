@@ -45,7 +45,7 @@ LINE_MAX = 3600
 LEDGER_MAX = 500
 LEDGER_KEEP = 86400
 ZIP_MAX = 2 * 1024 * 1024
-NEEDS = ("_RedsReader", "GitHubItem", "PROG", "_read_small", "_write_small", "_one_line", "load_module", "subprocess")
+NEEDS = ("_RedsReader", "GitHubItem", "PROG", "_read_small", "_write_small", "_one_line", "load_module", "subprocess", "chiefs_of_staff")
 
 BRANCH = re.compile(r"gh-readonly-queue/[^\s]+/pr-(\d{1,9})-[0-9a-f]{7,40}")
 ISO = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
@@ -272,8 +272,7 @@ def run_pass(sb, engine, now, calls):
         memory.setdefault(name, empty)
     discovery = getattr(engine, "discovery", None)   # the pass's own discovery: no second look at every pane
     if hub is None or not hasattr(hub, "route_of"):
-        _say_skips(engine, memory, {"no_hub": 1})
-        return 0
+        return 0   # no GitHub hub in this process: the check is not in play (nothing to skip), so it says nothing
     if discovery is None or discovery.problems:
         _say_skips(engine, memory, {"discovery": len(discovery.problems) if discovery is not None else 1})
         return 0
@@ -341,7 +340,7 @@ def run_pass(sb, engine, now, calls):
                 continue
             unowned = not owner
             if unowned:   # nobody owns it: the Chief of Staff (found by its metadata role) is told instead, once per failed run
-                chiefs = sorted(n for n, o in discovery.agents.items() if (getattr(o, "fleet", None) or {}).get("role") == "chief-of-staff")
+                chiefs = sb.chiefs_of_staff(discovery)
                 if not chiefs:
                     memory["retry"][key] = now + RETRY_SECONDS
                     _skip(skips, memory, key, "no_chief")

@@ -59155,11 +59155,11 @@ class TestQueueEjections(Base):
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(self.skipped(), [{"budget": 2, "reason": "budget"}])
 
-    def test_a_pass_with_no_hub_says_so_and_a_candidate_in_its_back_off_is_counted(self):
+    def test_a_candidate_in_its_back_off_is_counted_and_a_process_with_no_hub_says_nothing(self):
         self.add(1440, 540, names=["t"])
         hub, self.engine.hub = self.engine.hub, None
         self.go()
-        self.assertEqual(self.skipped(), [{"no_hub": 1, "reason": "no_hub"}])
+        self.assertEqual(self.skipped(), [], "no GitHub hub: the check is not in play")
         self.engine.hub = hub
         self.gh.graphql_fault = "exit"
         self.go()

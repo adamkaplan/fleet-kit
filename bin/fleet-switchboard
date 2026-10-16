@@ -7626,6 +7626,13 @@ def validate_foreground_config(config, source):
         raise ConfigError("%s: 'classifier_mode' \"act\" needs a 'jev' object: there is no decision model to ask" % source)
 
 
+def chiefs_of_staff(discovery):
+    """The names of the Chief of Staff agents in a discovery, by the fleet metadata role (never by a name in configuration); none when discovery has problems."""
+    if discovery is None or discovery.problems:
+        return []
+    return sorted(n for n, o in discovery.agents.items() if (getattr(o, "fleet", None) or {}).get("role") == "chief-of-staff")
+
+
 def chief_busy(engine):
     """True when the newest look found a chief-of-staff-role agent working: the daemon then polls fast."""
     found = getattr(engine, "discovery", None)
