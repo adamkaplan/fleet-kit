@@ -48553,6 +48553,20 @@ class TestHeavyWatchdog(unittest.TestCase):
         dog.signal(signal.SIGKILL, live)
         self.assertEqual(sorted({target for target, _n in sent}), [4242, 5000], "the orphan that holds the lock goes; the one-look prober does not")
 
+    def test_s15_a_holder_seen_at_two_looks_with_a_gap_between_is_not_stopped(self):
+        sent = BoundedList()
+        record = lambda target, number: sent.append((target, number))
+        rows = [(4242, 1, 4242, 10, "c"), (5000, 1, 5000, 10, "a waiting wrapper")]
+        holders = iter([{5000}, set(), {5000}, set()])   # there at the 1st and 3rd look, not in between: never two in a row
+        dog = self.hs.Watchdog(4242, ["x"], 16384, 0, self.out, 0.0, read_table=lambda: rows, killpg=record, kill=record, me=(9001, 9002, 9003),
+                               lock_path="/state/heavy-slot-0.lock", lsof=lambda path: next(holders))
+        dog.sample()
+        dog.sample()
+        dog.sample()
+        dog.signal(signal.SIGKILL, dog.look())
+        self.assertEqual(sorted(set(target for target, _n in sent)), [4242])
+        self.assertLessEqual(len(dog.candidates), 1)
+
     def test_s15_two_concurrent_runs_never_signal_each_others_lock_holders(self):
         sent_a, sent_b = BoundedList(), BoundedList()
         rows = [(4242, 1, 4242, 10, "a"), (4343, 1, 4343, 10, "b"), (5000, 1, 5000, 10, "holds a's lock"), (6000, 1, 6000, 10, "holds b's lock")]

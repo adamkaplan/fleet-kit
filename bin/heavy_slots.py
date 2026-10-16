@@ -275,12 +275,12 @@ class Watchdog:
         alive = {key for key in self.seen if key[0] in at and _start(at[key[0]]) == key[1]}
         if self.pid in at and (self.pid, _start(at[self.pid])) not in self.seen:
             alive.add((self.pid, _start(at[self.pid])))
+        holding = set()
         for pid in self.lock_holders():   # the slot lock's descriptor is inherited by every descendant, a double fork that left the tree included
-            key = (pid, _start(at[pid])) if pid in at else None
-            if key is not None and key[0] not in self.me[:2]:
-                if key in self.candidates:   # seen at a second look: not a process that only opened the lock file for an instant (holders())
-                    alive.add(key)
-                self.candidates.add(key)
+            if pid in at and pid not in self.me[:2]:
+                holding.add((pid, _start(at[pid])))
+        alive |= holding & self.candidates   # held at two looks IN A ROW: not a process that only opened the lock file for an instant (a waiting wrapper, holders())
+        self.candidates = holding            # the next look compares with this one only; it never grows beyond one look's holders
         own = at.get(self.pid)
         if own is not None and own[2] not in (0, 1, self.me[2]):
             self.group = own[2]
