@@ -273,7 +273,7 @@ class Preflight(unittest.TestCase):
         self.assertIn("organization ruleset 9: not readable with this token, not counted", p.stdout)
         self.assertIn("preflight ok: deletion, non_fast_forward, pull_request", p.stdout)
 
-    def test_S3_the_shipped_file_is_empty_and_an_org_only_repo_fails_with_the_pointer(self):
+    def test_S1_the_shipped_file_is_empty_and_an_org_only_repo_fails_with_the_pointer(self):
         with open(os.path.join(os.path.dirname(PREFLIGHT), "repo-approvals.json")) as f:
             self.assertEqual(json.load(f), {})
         self.org_only()
@@ -282,14 +282,14 @@ class Preflight(unittest.TestCase):
         self.assertIn("not readable with this token, not counted", p.stdout)
         self.assertIn("an owner approval entry is needed", p.stdout)
 
-    def test_S3_a_valid_entry_passes_loudly_and_matches_the_lowercased_name(self):
+    def test_S1_a_valid_entry_passes_loudly_and_matches_the_lowercased_name(self):
         self.org_only()
         self.approvals({self.KEY: self.ENTRY})
         p = self.run_pf()
         self.assertEqual(p.returncode, 0, p.stdout)
         self.assertIn(self.LOUD, p.stdout)
 
-    def test_S4_absent_malformed_incomplete_or_other_repo_fails_safe(self):
+    def test_S2_absent_malformed_incomplete_or_other_repo_fails_safe(self):
         self.org_only()
         os.remove(os.path.join(self.copy, "repo-approvals.json"))
         self.assertEqual(self.run_pf().returncode, 2)  # absent
@@ -308,13 +308,13 @@ class Preflight(unittest.TestCase):
         self.approvals({hashlib.sha256(b"acme-org/other").hexdigest(): self.ENTRY, REPO: self.ENTRY})
         self.assertEqual(self.run_pf().returncode, 1)
 
-    def test_S5_the_loud_line_is_printed_on_every_run(self):
+    def test_S3_the_loud_line_is_printed_on_every_run(self):
         self.org_only()
         self.approvals({self.KEY: self.ENTRY})
         for _ in range(3):
             self.assertIn(self.LOUD, self.run_pf().stdout)
 
-    def test_S6_an_approval_rescues_no_visible_missing_rule_and_no_other_problem(self):
+    def test_S4_an_approval_rescues_no_visible_missing_rule_and_no_other_problem(self):
         self.approvals({self.KEY: self.ENTRY})
         Stub.rules = ["pull_request", "deletion"]  # non_fast_forward visibly missing, no unreadable rule carries it
         Stub.org_types, Stub.org_code = ["deletion"], 403
@@ -328,7 +328,7 @@ class Preflight(unittest.TestCase):
         Stub.org_types = []
         self.assertEqual(self.run_pf().returncode, 1)
 
-    def test_S7_no_override_path_an_environment_setting_a_flag_or_a_file_elsewhere_is_ignored(self):
+    def test_S5_no_override_path_an_environment_setting_a_flag_or_a_file_elsewhere_is_ignored(self):
         self.org_only()
         outside = os.path.join(self.dir, "elsewhere.json")
         with open(outside, "w") as f:
@@ -342,7 +342,7 @@ class Preflight(unittest.TestCase):
         with open(PREFLIGHT) as f:
             self.assertNotIn("CW_REPO_APPROVALS", f.read())
 
-    def test_only_a_403_on_an_org_ruleset_is_not_readable(self):
+    def test_S4_only_a_403_on_an_org_ruleset_is_not_readable(self):
         self.approvals({self.KEY: self.ENTRY})
         for code in (404, 500, "drop"):
             self.org_only(code)
