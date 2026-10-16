@@ -11813,6 +11813,8 @@ class TriageState:
         self.verified = {}       # (rule, ref) -> when a fresh read last gave an answer (true or false): the age of "unchecked"
         self.first_seen = {}     # (rule, ref) -> when a pass first saw it as a candidate (the age of one never checked)
         self.enriched = {}       # (rule, ref) -> evidence the fresh read added
+        self.live = {}           # #576: (repo, number) -> {"token": the issue's updated time, "info": the label's age facts or None, "at"}: one timeline read each
+        self.reasons = {}        # (rule, ref) -> the worded reason of a finding that carries one (`awaiting-live expired`)
         self.logged, self.facts, self.current = set(), {}, {}
         self.started, self.day, self.day_counts = 0, None, {}
         self.summarised = None
@@ -11931,11 +11933,12 @@ def triage_charter_descendants(items, charters):
 
 
 def triage_awaits_live(item):
-    """True when an open issue carries a label ending in `:awaiting-live`: it waits on a live event, so T9 and T12 stay quiet (#574)."""
-    return any(str(l).endswith(":awaiting-live") for l in item["labels"])
+    """True when an open issue carries a label ending in `:awaiting-live`: it waits on a live event, so T9 and T12 stay quiet (#574),
+    until the label is older than `awaiting_live_days` with no comment since (#576)."""
+    return bool(load_module("awaiting_live").label_names(item["labels"]))
 
 
-def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs, window_ok=True, captain_skip=False, merged=None, pending=None):
+def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs, window_ok=True, captain_skip=False, merged=None, pending=None, live=None, live_days=None):
     """{rule: evidence} for one OPEN item (a pure function: the list copy and the fresh copy go through it alike), and
     whether the item is ours. `comments` is None when the comment unit is not read (T3 and T7 are then not judged).
     Evidence holds only labels' names, ages in days and owner logins."""
@@ -11966,6 +11969,13 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
             found["T8"] = {"quiet_days": round(age_updated, 2)}
         if ask and "T3" not in found and not triage_awaits_live(item) and age_updated >= sla["t9_days"]:
             found["T9"] = {"quiet_days": round(age_updated, 2)}
+        if triage_awaits_live(item):   # #576: the exemption is capped: an old label with no comment since comes back, an unreadable age stays visible
+            module = load_module("awaiting_live")
+            reason = module.judge(live, now, live_days or module.CONFIG_DEFAULT)
+            if reason:
+                found["T9"] = {"quiet_days": round(age_updated, 2), "reason": reason}
+                if live is not None:
+                    found["T9"]["label_days"] = round((now - live["set"]) / day, 2)
         if not chain and not item["assignees"] and not named and "T1" not in found and number not in ctx["unresolved"] \
                 and age_updated >= sla["t11_days"]:
             found["T11"] = {"quiet_days": round(age_updated, 2)}
@@ -12038,6 +12048,38 @@ def triage_refresh(engine, state, repos, units, now, budget, reserve=1, seconds=
                 state.unreadable[repo] = (reason, now)
 
 
+def triage_read_live(engine, state, repos, now, budget, reserve=1, seconds=TRIAGE_PASS_SECONDS):
+    """#576: the age of each `:awaiting-live` label, from the issue's timeline: ONE bounded read (a single page) per labelled open issue, kept in
+    `state.live` while the issue's updated time is the one it was read at (a re-added label or a new comment moves it), so an unchanged issue is not read
+    again. Each read is charged to the pass's call budget (less the reserve for fresh checks), the least recently read first. A failed or cut read is kept as
+    unknown and tried again after TRIAGE_TTL: never read as fresh. Reads nothing when no issue carries the label."""
+    hub, module = getattr(engine, "hub", None), load_module("awaiting_live")
+    if hub is None:
+        return
+    todo = []
+    for repo in repos:
+        unit = state.units.get((repo, "issues"))
+        for record in (unit["data"] if unit else []):
+            item = triage_norm(record)
+            if item is None or item["pr"] or item["state"] != "open" or not module.label_names(item["labels"]):
+                continue
+            held = state.live.get((repo, item["number"]))
+            if held is None or held["token"] != item["updated"] or (held["info"] is None and now - held["at"] >= TRIAGE_TTL):
+                todo.append(((held or {"at": 0})["at"], repo, item))
+    for _, repo, item in sorted(todo, key=lambda t: t[:2] + (t[2]["number"],)):
+        if budget[0] - reserve < 1 or engine.now() - state.started >= seconds:
+            break
+        budget[0] -= 1
+        info = None
+        try:
+            events, cut = hub.read_pages("repos/%s/issues/%d/timeline?per_page=100" % (repo, item["number"]), cap=1)
+            if not cut:   # a page that is not the whole timeline cannot tell the latest label event or the last comment
+                info = module.read(events, module.label_names(item["labels"]), parse_iso)
+        except GitHubUnavailable:
+            pass
+        state.live[(repo, item["number"])] = {"token": item["updated"], "info": info, "at": now}
+
+
 def triage_findings(engine, state, repos, decisions, cfg, now, errors):
     """(candidates [(rule, ref, evidence)], unchecked {repo: [units missing]}, truncated repos). Reads nothing."""
     discovery = getattr(engine, "discovery", None)
@@ -12049,6 +12091,7 @@ def triage_findings(engine, state, repos, decisions, cfg, now, errors):
     except (NoticeError, OSError, TypeError):
         pass
     out, unchecked, truncated = [], {}, []
+    live_days = load_module("awaiting_live").days_of(engine.config)
     captain_listed = {sweep_ref_of(d, engine.config.get("intent_repo")) for d in decisions if d.get("kind") == "captain"}
     for repo in repos:
         issues_unit = state.units.get((repo, "issues"))
@@ -12079,8 +12122,10 @@ def triage_findings(engine, state, repos, decisions, cfg, now, errors):
             comments = triage_comment_facts(by_number.get(number, [])) if comments_unit is not None else None
             # a `MERGE: captain` PR already in the decision list is T6's; while the list is incomplete a captain PR waits
             captain_skip = item["captain"] and ((repo, number) in captain_listed or bool(errors))
+            live = state.live.get((repo, number)) if triage_awaits_live(item) else None
             found, ours = triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs.get(repo, set()),
-                                       captain_skip=captain_skip, merged=links, pending=pending)
+                                       captain_skip=captain_skip, merged=links, pending=pending,
+                                       live=live["info"] if live else None, live_days=live_days)
             if not found:
                 continue
             ref = "%s#%d" % (repo, number)
@@ -12178,8 +12223,10 @@ def triage_verify(engine, state, rule, ref, cfg, now, budget, evidence=None):
         notice_prs = {n["number"] for n in read_pr_notices(engine.state_dir) if n["repo"] == repo}
     except (NoticeError, OSError, TypeError):
         pass
+    live = state.live.get((repo, number)) if triage_awaits_live(item) else None   # #576: the age read this or an earlier pass; none read is "unknown", still a finding
     found, ours = triage_rules(item, comments, ctx, triage_sla(cfg, repo), now, triage_our_logins(engine, cfg),
-                               (cfg.get("required_labels") or {}).get(repo) or [], notice_prs)
+                               (cfg.get("required_labels") or {}).get(repo) or [], notice_prs,
+                               live=live["info"] if live else None, live_days=load_module("awaiting_live").days_of(engine.config))
     return (rule in found) if (ours and rule != "OO") else (rule == "OO" and bool(found))
 
 
@@ -12248,6 +12295,7 @@ def triage_pass(engine, decisions, now, errors=()):
     seconds = cfg.get("pass_seconds", TRIAGE_PASS_SECONDS)
     units = ["issues", "comments", "merged"] + ["closed:" + l for l in sorted(triage_awaiting_labels(engine))]
     triage_refresh(engine, state, repos, units, now, budget, max(1, budget[0] // 3), seconds)  # a third kept for fresh checks
+    triage_read_live(engine, state, repos, now, budget, max(1, cfg.get("calls_per_pass", TRIAGE_CALLS_PER_PASS) // 3), seconds)
     candidates, unchecked_units, truncated = triage_findings(engine, state, repos, decisions, cfg, now, errors)
     findings, unchecked, unchecked_other, oldest = [], 0, 0, 0.0
 
@@ -12288,6 +12336,8 @@ def triage_pass(engine, decisions, now, errors=()):
     day = int(now // 86400)
     counts, other_owner = {}, 0
     for rule, ref, evidence in findings:
+        if isinstance(evidence, dict) and evidence.get("reason"):
+            state.reasons[(rule, ref)] = evidence["reason"]
         if rule == "OO":
             other_owner += 1   # a flag, never counted as one of our findings
         else:
@@ -12382,7 +12432,7 @@ def triage_queue_fact(state, due, now, cfg, other_owner=0, invalid=()):
         state.facts["triage:parked:%s" % hashlib.sha256(summary.encode()).hexdigest()[:10]] = (summary, now)
         return summary
     summary = "triage: %d finding%s: %s%s. %s. Resolve, route or escalate each; the triage changes nothing on GitHub." % (
-        len(due), "" if len(due) == 1 else "s", ", ".join("%s %s" % (ref, rule) for rule, ref in shown),
+        len(due), "" if len(due) == 1 else "s", ", ".join("%s %s%s" % (ref, rule, " (%s)" % state.reasons[(rule, ref)] if (rule, ref) in state.reasons else "") for rule, ref in shown),
         " (+%d more)" % (len(due) - len(shown)) if len(due) > len(shown) else "",
         "; ".join("%s = %s" % (k, TRIAGE_KINDS[k]) for k in kinds))
     if other_owner:
