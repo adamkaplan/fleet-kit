@@ -13905,6 +13905,19 @@ class TestHeadlessPresence(Base):
         self.assertEqual((rows["hw"]["observation"]["session"], rows["hw"]["observation"]["status"]), (sid, "idle"))
         self.assertTrue(rows["hw"]["observation"]["headless"])
 
+    def test_the_status_command_writes_nothing_in_the_state_directory(self):
+        self.headless()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        state = Path(self.world.state)
+        snapshot = lambda: {str(p.relative_to(state)): p.stat().st_mtime_ns for p in state.rglob("*") if p.is_file()}
+        sb.collect_status(self.world.route, self.world.clock.now)         # a first status creates the lock files every command makes (the same with no headless worker at all)
+        before = snapshot()
+        report = sb.collect_status(self.world.route, self.world.clock.now)
+        self.assertIn("hw", [row["name"] for row in report["agents"]["list"]], "the worker is listed (the premise of the check)")
+        after = snapshot()
+        self.assertEqual(sorted(set(after) - set(before)), [], "0 files created")
+        self.assertEqual(sorted(k for k in before if after.get(k) != before[k]), [], "0 files changed")
+
     def test_a_worker_launched_during_a_pass_is_never_reported_lost_by_that_pass(self):
         """The daemon discovers, THEN the fact sources run; a launch that lands between the two wrote its record after discovery looked."""
         self.world.add_agent("cos", fleet={"role": "chief-of-staff"})    # a lost report with no remembered boss goes to the Chiefs of Staff
