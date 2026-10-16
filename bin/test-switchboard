@@ -38452,6 +38452,41 @@ class TestHeadlessRestartNotice(Base):
         self.pid[0] = 200
         self.assertEqual([r for r, _ in self.notices()], ["boss"], "only the headless worker, never termworker")
 
+    def test_a_restart_that_happens_during_an_outage_is_told_once_and_an_outage_with_the_same_process_is_not_a_restart(self):
+        self.worker("w1")
+        self.notices()                                                    # pid 100 recorded
+        self.pid[0] = None                                                # the service is down: nothing is compared
+        self.assertEqual(self.notices(), [])
+        self.pid[0] = 200                                                 # it came back as a NEW process
+        first = self.notices()
+        self.assertEqual(first, [("boss", "w1")], "exactly one notice for the restart that happened while it was down")
+        self.assertEqual(len({f.key for f in self.engine.collect_facts()[0] if f.kind == "headless.restarted"}), 1)
+        self.pid[0] = None
+        self.assertEqual(self.notices(), first, "the same single notice while it is down again; no second one")
+        self.pid[0] = 200
+        self.assertEqual(len({f.key for f in self.engine.collect_facts()[0] if f.kind == "headless.restarted"}), 1, "the same restart, the same key")
+
+    def test_the_notice_says_what_is_known_and_does_not_claim_the_session_was_resumed(self):
+        self.worker("w1")
+        self.notices()
+        self.pid[0] = 200
+        self.engine.discover(self.world.clock.now())
+        text = [f.summary for f in self.engine.collect_facts()[0] if f.kind == "headless.restarted"][0]
+        self.assertIn("restarted", text)
+        self.assertIn("poke", text)
+        self.assertNotIn("resumed", text)
+
+    def test_a_problem_in_discovery_holds_back_every_lost_report_and_it_comes_when_the_problem_is_gone(self):
+        sid = self.worker("w1")
+        self.notices("headless.lost")
+        del self.world.v2.sessions[sid]
+        bad = Path(self.world.state) / "headless" / "bad.json"
+        bad.write_text("{not json")
+        bad.chmod(0o600)
+        self.assertEqual(self.notices("headless.lost"), [], "a pass with a problem may only be missing a read: nothing is called lost")
+        bad.unlink()
+        self.assertEqual([r for r, _ in self.notices("headless.lost")], ["boss"])
+
     def test_a_worker_launched_after_the_restart_is_not_told_it_was_hit(self):
         self.worker("w1")
         self.notices()

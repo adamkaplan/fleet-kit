@@ -6684,9 +6684,9 @@ class HeadlessRestartFacts:
                 if boss is None or observation.conflict or created.get(name, 0) > (service.get("at") or 0):   # a worker launched after the restart was not hit by it
                     continue
                 facts.append(Fact("headless.restarted:%s:%s" % (service["pid"], observation.session_id), boss, "headless.restarted",
-                                  "The OpenCode service restarted (process %s replaced %s). %s has no terminal: the service resumed its session itself, so nothing needs "
-                                  "relaunching, but anything it was doing in the turn was interrupted: check on it with `%s status`." % (
-                                      service["pid"], service["from"], name, PROG),
+                                  "The OpenCode service restarted (process %s replaced %s), seen at %s. %s has no terminal: if it was working, its turn may have been interrupted "
+                                  "and the session may need a poke: check it with `%s status`." % (
+                                      service["pid"], service["from"], iso(service.get("at") or engine.now()), name, PROG),
                                   float(service.get("at") or engine.now()), issue=_issue_of(observation.fleet), sender="switchboard"))
         if discovery.problems:   # the service (or herdr) did not answer cleanly: a missing worker may only be unread, so nothing is called lost
             return facts
