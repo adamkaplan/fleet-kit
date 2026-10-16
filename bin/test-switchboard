@@ -57056,9 +57056,34 @@ class TestClosedIssueLabels(Base):
         closed_labels = sb.load_module("closed_labels")
         ns = types.SimpleNamespace(**{n: getattr(sb, n) for n in closed_labels.NEEDS})
         closed_labels.run_pass(ns, self.engine, self.world.clock.now(), 1)
-        self.assertEqual(len(self.engine.hub.read_log), 1, "calls=1: one read")
+        self.assertEqual([n for _, n, _ in self.engine.hub.read_log], [21], "calls=1: one read, of the first issue")
         closed_labels.run_pass(ns, self.engine, self.world.clock.now(), 1)
-        self.assertEqual(len(self.engine.hub.read_log), 2, "the other waits for the next pass")
+        self.assertEqual([n for _, n, _ in self.engine.hub.read_log], [21, 22], "the other waits for the next pass: a different issue, not the same twice")
+
+    def test_retry_and_said_state_of_a_ref_the_hub_no_longer_holds_is_dropped(self):
+        gh = FakeMergedGh()
+        entries = {"acme/api#23": self.entry()}
+        self.go(entries, {23: sb.GitHubUnavailable("HTTP 502")}, gh)
+        memory = self.engine.__dict__["closed_labels"]
+        self.assertEqual((sorted(memory["retry"]), sorted(memory["said"])), (["acme/api#23"], ["acme/api#23"]))
+        self.go({}, {}, gh)   # the hub evicted it
+        self.assertEqual((memory["retry"], memory["said"]), ({}, set()), "pruned with the ref")
+
+    def test_a_closed_event_the_hub_cannot_keep_is_audited_and_the_snapshot_is_unchanged(self):
+        class BrokenLock:
+            def __enter__(self):
+                raise RuntimeError("lock broken")
+
+            def __exit__(self, *exc):
+                return False
+        said = []
+        hub = sb.GitHubHub.__new__(sb.GitHubHub)
+        hub.lock, hub.closed_issues, hub.now = BrokenLock(), {}, self.world.clock.now
+        hub._audit = lambda event, subject, detail: said.append((event, subject, detail))
+        hub.note_closed_issue("acme/api", {"number": 24, "labels": [{"name": self.awaiting[0]}]})
+        self.assertEqual(hub.closed_issues, {}, "nothing was kept")
+        self.assertEqual([(e, s) for e, s, _ in said], [("github.rejected", "acme/api")])
+        self.assertIn("issues closed event not kept", said[0][2]["reason"])
 
     def test_the_live_label_name_is_pinned_to_the_fleet_prefix(self):
         with mock.patch.object(sb.getpass, "getuser", return_value="osuser"):

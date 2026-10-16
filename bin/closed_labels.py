@@ -39,9 +39,8 @@ def run_pass(sb, engine, now, calls):
     ours = awaiting_names(sb, engine.config)
     spent = 0
     snapshot = hub.closed_issue_snapshot()
-    for table in ("retry",):
-        for ref in [r for r in memory[table] if r not in snapshot]:
-            memory[table].pop(ref, None)   # no longer held by the hub: its retry state goes too
+    for ref in [r for r in memory["retry"] if r not in snapshot]:
+        memory["retry"].pop(ref, None)   # no longer held by the hub: its retry state goes too
     memory["said"] &= set(snapshot)
     for ref, entry in sorted(snapshot.items()):
         if not isinstance(entry, dict):

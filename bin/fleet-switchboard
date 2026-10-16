@@ -13289,8 +13289,9 @@ def awaiting_cos_label(config):
     return config.get("awaiting_cos_label") or "%s:awaiting-cos" % getpass.getuser()
 
 
-def awaiting_live_label(config):
-    """The label that marks an issue as waiting on a live event, `<user>:awaiting-live` (the same `<user>:` namespace as the other awaiting labels)."""
+def awaiting_live_label(config=None):
+    """The label that marks an issue as waiting on a live event, `<user>:awaiting-live` (the same `<user>:` namespace as the other awaiting labels; `config` is
+    accepted for the shape of its siblings: this one has no override)."""
     return "%s:awaiting-live" % getpass.getuser()
 
 
