@@ -697,7 +697,7 @@ def build_entries(items, ids, home, known_title, tier_flat=False, known_parent=N
         lines.setdefault(folded[id(item)], []).append("%s: %s" % (item["agent"], line_of(item["title"], FOLDED_LINE_MAX)))
     decisions = []
     for item in items:
-        if id(item) in folded:
+        if id(item) in folded or (item["kind"] == "issue" and item.get("closed")):   # a closed issue is never listed (#570)
             continue
         ident, tier = ids[id(item)], item["tier"]
         if item["kind"] == "report" and item["ask"] and key(item["repo"], item["ask"]) in yours:
@@ -719,9 +719,6 @@ def build_entries(items, ids, home, known_title, tier_flat=False, known_parent=N
         if item["kind"] == "issue" and key(item["repo"], item["ask"]) in reporters:
             extra["reported_by"] = sorted(set(reporters[key(item["repo"], item["ask"])]))
             extra["reported_lines"] = lines[key(item["repo"], item["ask"])][-FOLDED_LINES_KEPT:]  # none is lost
-        if item["kind"] == "issue" and item.get("closed"):
-            extra["closed"] = True   # the issue is closed but still carries the person's label: it still waits, and cos tidies the label
-            headline = suffixed_headline(headline, " (closed)")
         if item.get("considered"):
             extra["considered"] = item["considered"]
         if item.get("request"):

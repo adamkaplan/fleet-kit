@@ -2263,7 +2263,7 @@ fact lists), `realarm_hours` (6, the debounce per item), `person_names` (["the o
 | S1a / S1b | an open issue with a `## Decision required` section and no awaiting label / an awaiting label and no such section |
 | S2 | an open PR whose body or last 5 comments say it is held for, waits on or needs the person (`held for`, `hold for`, `waiting on`, `waits on`, `awaiting`, `blocked on`, `pending`, `needs <name>`, `<name> to review|approve|decide|merge|answer`, `for <name>'s review`; whole phrases, any case; `person_names` may hold a handle such as `@login`) and which is not a captain PR (no `merge-captain` label and, inside the transition window, no first line `MERGE: captain`; see #133) |
 | S3 | the same phrases in one of an item's last 5 comments (of the last 7 days), or in a report's text, where no human-tier decision names that issue or PR |
-| S4 | a decision (issue or captain; a report is left, its question may outlive a closed ask) whose issue or PR is closed or merged (EXCEPT an issue that is closed but still carries the person's awaiting label: it stays listed, marked `(closed)`, see below): **withdrawn** from the list when enabled (an external link follows the existing withdraw path), audited once as `sweep.withdrawn` (shadow: `sweep.finding` with `applied: false`) |
+| S4 | a decision (issue or captain; a report is left, its question may outlive a closed ask) whose issue or PR is closed or merged (an issue that is closed is never listed at all since #570: see below): **withdrawn** from the list when enabled (an external link follows the existing withdraw path), audited once as `sweep.withdrawn` (shadow: `sweep.finding` with `applied: false`) |
 | S5 | a cos-tier decision older than `aged_cos_hours` that is NOT already in the owner's tier: an entry whose issue or PR also has a human-tier decision (a duplicate, or the escalation of the same ref, however the repo or the `pr:` id is spelled: case, `pr:owner/repo#N` or `pr:repo#N`) is not stale for cos and is not raised |
 
 **Precision.** A finding is raised only after a fresh single read of its issue or PR (and a fresh read of its last comments when comments raised it) bears it out, so a cached 15-minute list cannot raise it; one that does not hold is audited as `sweep.dismissed`, one that cannot be checked now (no call budget, a failed read) is neither raised nor audited that pass, and a verified finding is trusted for 15 minutes. Only S3 waits for the decision list (a missing human-tier decision is the one thing that raises it falsely): it is deferred for a repo whose awaiting issues are unread or unreadable, or for every repo while the reports or requests source fails, as in the first passes after a restart. S1 reads only labels and bodies and S5 only the cos-tier decisions listed, so neither waits. A deferral lasts at most 30 minutes (`SWEEP_DEFER_SECONDS`); after that S3 runs on the fresh check alone and is marked overdue. `status` shows each deferral (repo, reason, since) and the number of findings not checked this pass, and `fleet-doctor` warns on an overdue deferral. A decision section is a line that STARTS with `## Decision required` (level 2, any case, CRLF included), followed by the end of the line or any suffix that does not continue the word (`## Decision required (re-verified 2026-10-09)`, `: pick`, `- x`). `## Resolved (was: Decision required)`, deeper headings, inline mentions, code and quotes are not. A batch's row sections (or the older `decision-rows` block) stand for the section of a labelled batch (S1b) but never makes an unlabelled issue an S1a finding, so a resolved batch is not reported.
@@ -4487,21 +4487,22 @@ Parked items, follow-ups: a park reaches at most 366 days ahead (`9999-12-31` is
 a parked ASK can still raise T9 (an ask idle for 3 days); whether parking should exempt T9 too is a decision for the Chief of Staff and is not made here.
 
 
-## A closed issue that still carries your label stays in your tier (#117)
+## A closed issue never shows in your panel, and its awaiting labels come off (#570)
 
-An ISSUE closed as won't-do (another crew's, say) that still carries the person's `awaiting-user` label is still a question
-for them, so it is no longer dropped: the decision list keeps it in the human tier, marked `closed: true` with `(closed)` after its
-headline, and a report about it (a Chief of Staff escalation) folds into that row (`reported_by`) rather than standing alone as a
-cos row with no human row. It leaves when the label is removed. The catch-up read asks for that label with `state=all`
-(the Chief of Staff's label still only open issues); a webhook for a closed issue keeps it listed too.
+An ISSUE that closes leaves the decision list at once, whatever label it still carries: the list never holds a closed issue or a closed pull
+request, and it is never shown "marked closed" (#117 had kept it listed so a question closed as won't-do would not vanish unseen; the owner does not
+want it). The catch-up read asks for open issues only, a webhook for a closed issue forgets it, and a report that named it goes with it.
 
-What does not change: a closed or merged PR or captain decision is still withdrawn (S4), a closed issue that carries only the Chief
-of Staff's label is still forgotten, and the triage's **T10** (closed but still labelled awaiting) remains the hygiene finding that
-asks for the close-out. What the owner sees in the window: an issue the fleet closed and forgot to unlabel appears in the panel as
-`<title> (closed)` from the next pass until the label is removed. T10 comes after the 10 minute grace that follows the close
-(`TRIAGE_T10_GRACE`) plus up to 15 minutes for the cached closed-issue list, so the owner can see such a row for roughly 10 to 25
-minutes before T10 exists as a finding (a close by one of OUR logins, `closed_by` in the issue record, gets no grace: our agents unlabel in the same sweep, so a label still set is their miss and T10 is a finding at once; a closer the record does not name keeps the grace), and T10 wakes the Chief of Staff only when `triage.enabled` is true (in shadow it is audited
-only). The panel is read-only: nothing is written to GitHub.
+So that an unanswered question is not lost silently, the daemon cleans up after the close (`bin/closed_labels.py`, built like the merged pull request
+labels of #559). From the verified `issues` closed events the hub keeps (memory only), for an issue that carried one of the fleet's awaiting labels
+(`<prefix>:awaiting-user`, `awaiting-cos`, `awaiting-live`): it reads the issue FRESH and, only when GitHub says it is closed and is not a pull request,
+removes just those labels (exact names; `parked`, the hold labels and every other label stay) with the repo's own account, writes one
+`closed.labels_removed` audit line, and sends the Chief of Staff ONE line per issue (the issue and the labels removed; reopen it if it was closed by
+mistake). An event that says closed while the fresh read says open (a reopened issue, a stale or forged event), a failed read (audited once as
+`closed.labels_read_failed`, retried after five minutes), and a repository that is not watched or is excluded (never read) remove nothing. An event
+that carried no awaiting label costs no read. The reads and writes stay within the same per-pass cap as the merged-label pass. A close whose event was
+missed (the daemon was down) is not cleaned; the sweep's withdrawal (S4) and the triage's **T10** (closed but still labelled awaiting) remain the hygiene
+findings for it, and the owner sees nothing either way.
 
 ### The Chief of Staff and git: every read, no write
 

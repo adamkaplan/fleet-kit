@@ -10581,6 +10581,12 @@ def publish_decisions(engine):
                                ((engine.config.get("impact_hold") or {}).get("calls_per_pass") or IMPACT_PASS_CALLS))   # its own cap of gh reads, the impact hold's setting
     except Exception as err:
         engine._note("merged_labels.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+    try:
+        closed_labels = load_module("closed_labels")   # #570: a closed issue's awaiting labels come off (fresh read, fleet prefix only, one line to the Chief of Staff)
+        closed_labels.run_pass(types.SimpleNamespace(**{n: globals()[n] for n in closed_labels.NEEDS}), engine, now,
+                               ((engine.config.get("impact_hold") or {}).get("calls_per_pass") or IMPACT_PASS_CALLS))
+    except Exception as err:
+        engine._note("closed_labels.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
     apply_notice_effects(engine)
     store = decision_store(engine)
     try:
@@ -11258,8 +11264,6 @@ def sweep_withdraw(engine, state, decisions, home, now, cfg, budget):
     candidates = {}
     for d in decisions:
         ref = sweep_ref_of(d, home)
-        if d.get("closed"):
-            continue   # a closed issue that still carries the person's label: listed on purpose (marked closed), not stale
         if d.get("kind") in ("issue", "captain") and ref and ref[0]:  # a report's question may outlive its closed ask
             candidates.setdefault(ref, []).append(d)
     if hub is not None:
@@ -13709,6 +13713,7 @@ class GitHubHub:
         self.engine = None
         self.intent_verdicts = {}  # intent.edit key -> (wakes the Chief of Staff, why): decided once per edit
         self.intent_edits = {}  # intent.edit key -> the `issues` payload, until delivered (PR 6's item, wired here)
+        self.closed_issues = {}  # #570: "owner/repo#N" -> {"labels", "at"} of the last verified issues-closed event (memory only; bin/closed_labels.py cleans their awaiting labels)
         self.pr_events = {}     # #354: "owner/repo#N" -> the `pr-state` entry the last verified pull_request event made (memory only; the pass folds it in)
         self.awaiting = {}      # PR 14: (repo, number) -> {"title", "since", "parent"} of an open issue with the label
         self.awaiting_read = {}  # PR 14: repo -> None (read fine) or the error of the last labelled read; absent: never
@@ -14279,9 +14284,8 @@ class GitHubHub:
         """One issue as a webhook payload or a read shows it: listed when it is open and carries a label,
         forgotten otherwise. `since` is kept from the first time it was seen listed; a `labeled` event says
         when (the issue's `updated_at`), and a read can only say when the issue last changed. PR 18: the tier
-        is `human` with your label (an issue with both was escalated), `cos` with the Chief of Staff's only. A CLOSED issue that
-        still carries your label stays listed, marked `closed` (a decision can outlive the issue: it was closed as won't-do and
-        the person's question is still unanswered); it leaves when the label is removed. A closed cos-tier issue is forgotten."""
+        is `human` with your label (an issue with both was escalated), `cos` with the Chief of Staff's only. A CLOSED issue is
+        forgotten whatever label it carries (#570): it never shows in the list; the daemon takes its awaiting labels off (bin/closed_labels.py)."""
         number = _number(issue)
         if number is None or _is_pr(issue) or not isinstance(issue.get("labels"), list):
             return
@@ -14290,7 +14294,7 @@ class GitHubHub:
         tier = decision_core.issue_tier(names, awaiting_label(self.config), awaiting_cos_label(self.config))
         with self.lock:
             closed = issue.get("state", "open") == "closed"
-            if tier is not None and (issue.get("state", "open") == "open" or (closed and tier == "human")):
+            if tier is not None and not closed:   # #570: a closed issue is never kept, whatever label it carries
                 known = self.awaiting.get(key)
                 stamp = parse_iso(issue.get("updated_at"))
                 since = known["since"] if known else (stamp if stamp is not None else when or self.now())
@@ -14328,6 +14332,28 @@ class GitHubHub:
         issue = payload.get("issue") if event in ("issues", "issue_comment") else None
         if isinstance(issue, dict):
             self.note_awaiting_issue(repo, issue)
+            if event == "issues" and payload.get("action") == "closed":
+                self.note_closed_issue(repo, issue)
+
+    def note_closed_issue(self, repo, issue):
+        """#570: a verified `issues` closed event for an issue (not a pull request): keep its ref and labels, in memory, for the pass that takes its awaiting labels off
+        (bin/closed_labels.py). No read. Never raises."""
+        try:
+            number = _number(issue)
+            if number is None or _is_pr(issue) or not isinstance(issue.get("labels"), list):
+                return
+            names = sorted({_one_line(str(l.get("name") if isinstance(l, dict) else l), 60) for l in issue["labels"][:30]})
+            with self.lock:
+                self.closed_issues["%s#%d" % (plan_ledger.normal_repo(repo), number)] = {"labels": names, "at": self.now()}
+                while len(self.closed_issues) > PR_STATE_MAX:
+                    self.closed_issues.pop(min(self.closed_issues, key=lambda r: self.closed_issues[r]["at"]))
+        except Exception:
+            pass
+
+    def closed_issue_snapshot(self):
+        """A copy of the closed-issue events the hub holds, for the pass that cleans their labels."""
+        with self.lock:
+            return {ref: dict(entry) for ref, entry in self.closed_issues.items()}
 
     def read_awaiting(self, repo, now=None):
         """The catch-up's read of the open issues with either label: authoritative for `repo`, so an issue that
@@ -14339,7 +14365,7 @@ class GitHubHub:
             # your label is read with the closed issues too (a closed issue that still carries it still waits on you); the
             # Chief of Staff's label only open ones
             path = "repos/%s/issues?labels=%s&state=%s&per_page=100" % (repo, quote(label, safe=""),
-                                                                       "all" if name == "awaiting-user" else "open")
+                                                                       "open")   # #570: a closed issue is never listed
             try:
                 records, truncated = self.read_pages(path)
             except GitHubUnavailable as err:
