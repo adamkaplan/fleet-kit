@@ -23,6 +23,9 @@ Exit codes: `0` done; `1` the end hook could not push, **the pod is kept** (stop
 (create only; the cap is `CW_CLOUD_SPEND_CAP_USD`, default USD 25 when unset or empty, and an invalid value or an unreadable cost refuses the create); `6` refused: `delete` before the end hook ran without `--force`, or `extend` past `--max-hard`. Every other failure is `1` with a one-line reason on stderr.
 
 The launcher reaches the cluster with an explicit `--context` taken from `CW_KUBE_CONTEXT` (and `--kubeconfig` from `CW_KUBECONFIG` when set). With no context configured it refuses every command (exit `2`) and makes no call; it never uses the active context. A `create` that is interrupted or fails removes the Secret and pod it made, audits `create.interrupted` or `create.failed`, and names anything that could not be removed.
+Instead of a context the launcher can log in as the namespace service account: set `CW_CLOUD_SERVER` and `CW_CLOUD_TOKEN_FILE` (and optionally `CW_CLOUD_CA_FILE`, a path). It then generates a minimal `0600` kubeconfig in a private temporary directory, removed at exit, whose only credential is the token file's path (never a token value, never `--token`), and every call uses it. The two logins are never mixed: with both a context or kubeconfig and the token settings it refuses (exit `2`). A missing, empty or unreadable token file exits `3` with `token unavailable` and makes no call; no other credential is tried. The account is `cw-operator` in `cloud/k8s/operator-rbac.yaml`: namespaced to the workers namespace, only pods, their logs, exec and port-forward, and secrets, with no wildcard and nothing cluster-wide.
+
+`create` may also take `--pull-secret NAME` (an existing image-pull Secret, referenced by `imagePullSecrets`) and, repeated, `--run-secret-fd NAME=N`: each value is read once from the inherited descriptor `N` and sent to `kubectl` on stdin into one per-run Secret `<pod>-run`, mounted read-only at `/run/cw/NAME` (mode `0400`), never an argument, environment variable or spec field. That Secret is deleted at `stop` (when the pod is deleted), at `delete`, and when a `create` fails or is interrupted; it is kept when `stop` keeps the pod because the end hook could not push. A pod that is already `Failed` or `Succeeded` is deleted by `stop` with its Secrets (no hook can run, so its unpushed work is discarded, and stderr says so); a pod kept for a failed push (`cw/kept`) is never deleted this way. At most 8 run secrets, each at most 1 MiB, else exit `2`. With a run secret supplied, `CW_TOKEN_ENDPOINT` is optional.
 A command is idempotent: a repeated `stop` or `delete` of a worker that is gone exits `0`.
 
 ## 2. Worker environment (slices A and B)
@@ -31,7 +34,7 @@ Injected at start, as environment variables (all non-secret):
 `CW_WORKER` (name), `CW_REPO`, `CW_BRANCH`, `CW_IDLE_SECONDS`, `CW_HARD_DEADLINE` (ISO UTC),
 `CW_TOKEN_ENDPOINT` (the URL where the worker mints a short-lived GitHub token, authenticated by the pod's federated
 identity), `CW_AUDIT_RUNTIME_ID`. The per-worker server password is the one value injected as a file
-(`/run/cw/server-password`, mode 0600, from a cluster secret scoped to the pod), never as an environment variable.
+(`/run/cw/server-password`, mode 0600, from a cluster secret scoped to the pod), never as an environment variable; per-run secrets from `--run-secret-fd` are further files under `/run/cw`.
 
 **Never stored**, in the image, an environment variable, a file on the pod's disk beyond the password above, or a log:
 a personal access token, a cloud key or client secret, a registry password, a model API key. Tokens are minted at start
