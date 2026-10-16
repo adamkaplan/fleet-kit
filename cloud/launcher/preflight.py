@@ -51,9 +51,10 @@ NEED = (("pull_request|merge_queue", "a pull_request or merge_queue rule (direct
 
 
 class Unreadable(Exception):
-    def __init__(self, msg, status=None):
+    def __init__(self, msg, status=None, limited=False):
         super().__init__(msg)
         self.status = status  # the HTTP status of a refused read, else None
+        self.limited = limited  # the refusal shows signs of a rate limit (never printed, only used to refuse)
 
 
 def say(msg):
@@ -71,9 +72,22 @@ def get(base, path, token):
             raise Unreadable("the answer to GET %s is larger than %d bytes" % (path, app_token.MAX_BYTES))
         return json.loads(raw)
     except urllib.error.HTTPError as e:
-        raise Unreadable("GET %s: %s" % (path, app_token.http_error_text(e.code)), e.code)
+        raise Unreadable("GET %s: %s" % (path, app_token.http_error_text(e.code)), e.code, _rate_limited(e))
     except (OSError, ValueError):
         raise Unreadable("GET %s failed or its answer was not JSON" % path)
+
+
+def _rate_limited(e):
+    """True when a refused read shows a rate limit: a Retry-After header, X-RateLimit-Remaining 0, or a rate-limit
+    message in the (bounded) body. Read here and exposed to the caller as a flag; nothing of it is printed."""
+    try:
+        h = e.headers
+        if h is not None and (h.get("Retry-After") is not None or str(h.get("X-RateLimit-Remaining", "")).strip() == "0"):
+            return True
+        body = e.read(4096).decode("utf-8", "replace").lower()
+        return "rate limit" in body
+    except Exception:
+        return True  # cannot tell: refuse
 
 
 def get_token(target):
@@ -143,7 +157,7 @@ def judge(rules, branch, default_branch, fetch, unreadable=None):
     once (GET only, bounded) to read its `enforcement` (must be `active`: `evaluate` and `disabled` are not enforced)
     and its `conditions` (must cover the branch). Anything odd fails closed.
 
-    The one exception: an ORGANIZATION ruleset whose read is refused (HTTP 403 only; an App token can never read
+    The one exception: an ORGANIZATION ruleset whose read is refused (a plain HTTP 403, without a sign of a rate limit; an App token can never read
     them) is not counted. Its id goes into `unreadable` (a dict id -> its rules) and the rules it carries are not kept."""
     problems, kept, verdict = [], [], {}
     unreadable = {} if unreadable is None else unreadable
@@ -163,7 +177,7 @@ def judge(rules, branch, default_branch, fetch, unreadable=None):
             try:
                 rs = fetch(path)
             except Unreadable as e:
-                if st != "Organization" or e.status != 403:
+                if st != "Organization" or e.status != 403 or e.limited:
                     say("cannot read: %s" % e)
                     return problems, None
                 say("organization ruleset %d: not readable with this token, not counted" % rid)
@@ -206,10 +220,19 @@ def evaluate(valid):
 
 
 def _field(v):
-    return isinstance(v, str) and v.strip() != "" and len(v) <= 300 and not re.search(r"[\x00-\x1f\x7f]", v)
+    return isinstance(v, str) and v.strip() != "" and len(v) <= 300 and not re.search("[\\x00-\\x1f\\x7f-\\x9f\\u2028\\u2029\\u202a-\\u202e\\u2066-\\u2069]", v)
 
 
-APPROVALS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "repo-approvals.json")
+APPROVALS = os.path.join(os.path.dirname(os.path.realpath(__file__)), "repo-approvals.json")
+
+
+def _no_duplicates(pairs):
+    d = {}
+    for k, v in pairs:
+        if k in d:
+            raise ValueError("duplicate key")
+        d[k] = v
+    return d
 
 
 def approval(target):
@@ -222,10 +245,10 @@ def approval(target):
             raw = f.read(65537)
         if len(raw) > 65536:
             raise Unreadable("the approvals file is larger than 65536 bytes")
-        data = json.loads(raw)
+        data = json.loads(raw, object_pairs_hook=_no_duplicates)
     except Unreadable:
         raise
-    except (OSError, ValueError):
+    except Exception:  # OSError, ValueError (a duplicate key too), RecursionError
         raise Unreadable("the approvals file could not be read or is not JSON")
     if not isinstance(data, dict):
         raise Unreadable("the approvals file is not a JSON object")

@@ -37,6 +37,7 @@ class Stub(http.server.BaseHTTPRequestHandler):
     fail_code = 500
     fail = None  # a path suffix that answers 500, or "badjson"
     methods = []
+    org_hint = None  # retry | remaining | body: rate-limit signs on the /orgs/ answer
     org_code = None  # status (or "drop") answered for any /orgs/ GET
     org_extra = []  # extra organization-sourced rules (ruleset 9) on top of the repository's own
     org_types = []  # rule types sourced from unreadable-able organization ruleset 9
@@ -64,6 +65,17 @@ class Stub(http.server.BaseHTTPRequestHandler):
             if Stub.org_code == "drop":
                 self.close_connection = True
                 self.connection.close()
+                return
+            if Stub.org_hint:
+                out = b'{"message": "You have exceeded a secondary rate limit"}' if Stub.org_hint == "body" else b"{}"
+                self.send_response(Stub.org_code)
+                if Stub.org_hint == "retry":
+                    self.send_header("Retry-After", "60")
+                if Stub.org_hint == "remaining":
+                    self.send_header("X-RateLimit-Remaining", "0")
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
                 return
             return self.reply(Stub.org_code, {})
         if Stub.fail == "badjson":
@@ -139,7 +151,7 @@ class Preflight(unittest.TestCase):
         Stub.rules, Stub.protected, Stub.fail, Stub.methods, Stub.redirect = list(FULL), False, None, [], None
         Stub.review_count, Stub.enforcement, Stub.include, Stub.conditions = 1, "active", ["~DEFAULT_BRANCH"], "ok"
         Stub.exclude, Stub.target, Stub.default, Stub.rule_ids, Stub.extra, Stub.org, Stub.no_id = [], "branch", "main", {}, {}, False, False
-        Stub.org_code, Stub.org_types, Stub.fail_code, Stub.org_extra = None, [], 500, []
+        Stub.org_code, Stub.org_types, Stub.fail_code, Stub.org_extra, Stub.org_hint = None, [], 500, [], None
         Other.seen = []
         self.dir = tempfile.mkdtemp()
         # a private copy of the program: its repo-approvals.json is the only approvals file there is
@@ -307,6 +319,65 @@ class Preflight(unittest.TestCase):
         # an entry for another repository (or the unhashed name) is ignored: an ordinary failure, exit 1
         self.approvals({hashlib.sha256(b"acme-org/other").hexdigest(): self.ENTRY, REPO: self.ENTRY})
         self.assertEqual(self.run_pf().returncode, 1)
+
+    def test_duplicate_keys_are_refused_in_every_shape(self):
+        self.org_only()
+        e = json.dumps(self.ENTRY)
+        bad = json.dumps(dict(self.ENTRY, reason=""))
+        other = json.dumps(dict(self.ENTRY, approved_by="someone-else"))
+        for name, raw in (
+                ("repo hash twice", '{"%s": %s, "%s": %s}' % (self.KEY, e, self.KEY, other)),
+                ("field twice", '{"%s": {"approved_by": "a", "approved_by": "b", "approved_at": "2026-10-16", '
+                                '"reason": "r", "pr": "1"}}' % self.KEY),
+                ("malformed first, valid last", '{"%s": %s, "%s": %s}' % (self.KEY, bad, self.KEY, e))):
+            self.approvals(raw, raw=True)
+            p = self.run_pf()
+            self.assertEqual(p.returncode, 2, name)
+            self.assertNotIn("NOT VERIFIED", p.stdout)
+
+    def test_a_deeply_nested_file_is_unreadable_not_a_traceback(self):
+        self.org_only()
+        self.approvals("[" * 65000, raw=True)
+        p = self.run_pf()
+        self.assertEqual(p.returncode, 2)
+        self.assertNotIn("Traceback", p.stderr)
+
+    def test_control_and_bidi_characters_in_a_field_refuse_the_entry(self):
+        self.org_only()
+        for ch in ("\x00", "\x1b", "\x7f", "\x85", "\x9b", "\u2028", "\u2029", "\u202a", "\u202e", "\u2066", "\u2069"):
+            for field in ("reason", "approved_by"):
+                self.approvals({self.KEY: dict(self.ENTRY, **{field: "ab" + ch + "cd"})})
+                p = self.run_pf()
+                self.assertEqual(p.returncode, 2, (field, ch))
+                self.assertNotIn(ch, p.stdout)
+
+    def test_a_symlink_to_the_program_reads_the_checkouts_file_not_one_beside_the_link(self):
+        self.org_only()
+        self.approvals({})  # the checkout's own file grants nothing
+        other = os.path.join(self.dir, "elsewhere")
+        os.makedirs(other)
+        with open(os.path.join(other, "repo-approvals.json"), "w") as f:
+            json.dump({self.KEY: self.ENTRY}, f)  # a grant beside the link
+        link = os.path.join(other, "preflight.py")
+        os.symlink(self.prog, link)
+        self.prog = link
+        p = self.run_pf()
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertNotIn("NOT VERIFIED", p.stdout)
+
+    def test_a_403_with_a_sign_of_a_rate_limit_is_refused_a_plain_one_is_not_counted(self):
+        self.approvals({self.KEY: self.ENTRY})
+        for hint in ("retry", "remaining", "body"):
+            self.org_only(403)
+            Stub.org_hint = hint
+            p = self.run_pf()
+            self.assertEqual(p.returncode, 2, (hint, p.stdout))
+            self.assertNotIn("not counted", p.stdout)
+            self.assertNotIn("60", p.stdout)
+        Stub.org_hint = None
+        p = self.run_pf()
+        self.assertEqual(p.returncode, 0, p.stdout)
+        self.assertIn("not counted", p.stdout)
 
     def test_S3_the_loud_line_is_printed_on_every_run(self):
         self.org_only()

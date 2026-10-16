@@ -91,10 +91,12 @@ ruleset is refused with HTTP 403, that ruleset is not counted and the output say
 `organization ruleset <id>: not readable with this token, not counted`. The repository passes on the rules the
 preflight can verify. If it fails only because those rules are not counted (exit 1: `protection comes from an
 organization ruleset this token cannot read; an owner approval entry is needed`), it is enabled by one entry in
-`cloud/launcher/repo-approvals.json`, which ships as `{}` (nothing is enabled). The file is read from the program's own
-checkout: there is no setting, flag or other path for it, and an approval can arrive only through a pull request that
+`cloud/launcher/repo-approvals.json`, which ships as `{}` (nothing is enabled). The launcher and the preflight run from
+the operator's main checkout, so a changed copy in a worker's branch is not the one that counts. The file is read from the
+real location of the program (a symlink to it is followed, and a file beside the link is ignored): there is no setting, flag or other path for it, and an approval can arrive only through a pull request that
 changes that file, which needs the owner's clear. To add one, compute the key (the repository is public, so only a hash
-of the lowercased `owner/name` is stored):
+of the lowercased `owner/name` is stored; the hash is not a secret: it avoids listing names in clear but discloses that a
+named repository is approved):
 
 ```sh
 python3 -c 'import hashlib;print(hashlib.sha256(b"owner/name".lower()).hexdigest())'
@@ -104,7 +106,7 @@ python3 -c 'import hashlib;print(hashlib.sha256(b"owner/name".lower()).hexdigest
 {"<that hash>": {"approved_by": "<the owner's login>", "approved_at": "2026-10-16", "reason": "<one neutral line>", "pr": "<the number of the pull request that adds this entry>"}}
 ```
 
-All four fields must be non-empty one-line strings. The file is read only when the sole reason for failing is the
+All four fields must be non-empty one-line strings (no control or bidirectional characters); a repeated key, at any level, makes the file unreadable (exit 2). The file is read only when the sole reason for failing is the
 unreadable organization rulesets (everything missing would be supplied by the rules they carry). A matching entry passes
 with a line on every run: `preflight ok: protection NOT VERIFIED (organization ruleset <id> unreadable); owner-approved
 by <who> on <date> (pr #<n>): <reason>`. A file or matching entry that cannot be read exits 2; an entry for another
