@@ -1443,7 +1443,8 @@ class V2Http:
             except Exception:
                 return None
 
-    def _load(self):
+    def _read_file(self):
+        """(host, port, password, pid) of the service file, read with every safety check. Raises V2Unreachable."""
         try:
             parent = os.lstat(str(self.file.parent))
             if parent.st_uid != os.getuid() or parent.st_mode & 0o022 or stat.S_ISLNK(parent.st_mode):
@@ -1466,6 +1467,19 @@ class V2Http:
             host, port = url.hostname, url.port
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             raise V2Unreachable("no usable service file") from None
+        return host, port, password, pid
+
+    def service_identity(self):
+        """The service's process id from a FRESH read of its private service file (a restart changes it), or None when the file cannot be read or names a
+        process that is gone. Nothing is cached and the password is never returned."""
+        try:
+            pid = self._read_file()[3]
+        except V2Unreachable:
+            return None
+        return pid if isinstance(pid, int) and not isinstance(pid, bool) and self.alive(pid) else None
+
+    def _load(self):
+        host, port, password, pid = self._read_file()
         if isinstance(pid, int) and not self.alive(pid):
             raise V2Unreachable("the service file names a process that is gone")
         token = base64.b64encode(("opencode:" + password).encode("utf-8")).decode("ascii")
@@ -1903,6 +1917,10 @@ class V2Client:
     def _limit(limit):
         """A page of a transcript is never larger than V2_READ_LIMIT_MAX messages, whatever a caller asks."""
         return min(limit, V2_READ_LIMIT_MAX) if isinstance(limit, int) and not isinstance(limit, bool) else limit
+
+    def service_identity(self):
+        """The service's process id (changes when it restarts), or None (the CLI transport, no readable service file, or the process is gone)."""
+        return self.http.service_identity() if self.http is not None and hasattr(self.http, "service_identity") else None
 
     def service_url(self):
         """Where the service is, `http://127.0.0.1:<port>`, or None (the CLI transport, or no readable service file)."""
@@ -3010,7 +3028,7 @@ def fact_sources(state_dir):
     the same rule, and stores nothing.
     """
     return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir),
-            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), JobFacts(), PaneFacts(), DiskFacts(), CpuFacts(), SpotlightFacts(), DockerReapFacts()]
+            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), JobFacts(), PaneFacts(), HeadlessRestartFacts(), DiskFacts(), CpuFacts(), SpotlightFacts(), DockerReapFacts()]
 
 
 # --------------------------------------------------------- observing the fleet
@@ -3185,6 +3203,7 @@ class Discovery:
         self.agents = {}
         self.problems = []
         self.entries = []  # herdr's agent list as read, so render can compare tokens
+        self.headless_records = None   # the headless records THIS look scanned (None: it did not look): the fact sources judge only against these
 
     def add(self, observation):
         known = self.agents.get(observation.name)
@@ -4103,6 +4122,7 @@ class Switchboard:
                  state_dir=None):
         self.config, self.v2, self.herdr, self.audit = config, v2, herdr, audit
         self.state_dir = Path(state_dir) if state_dir is not None else None  # PR 14: where decisions.json goes
+        self.headless_state = None   # #433: a READ-ONLY state directory for the headless records, for a caller (`status`) that must not get a state_dir (which writes)
         if getattr(v2, "on_event", False) is None:   # a real client: its breaker's `v2.backoff` / `v2.resume` go to the audit, once per episode
             v2.on_event = lambda name, detail: self._note(name, "v2", detail)
         self.hub = None  # the GitHub hub, when this process has one (PR 14: its awaiting-user issues)
@@ -4255,15 +4275,17 @@ class Switchboard:
         """#433: the workers with no terminal. The index is the private records in state-dir/headless/; PRESENCE is proved by the service (the session
         exists, answers and carries the worker's name in its metadata), never by a record alone. `session.active` is read ONCE for all of them; a
         service that does not answer makes each one `unknown` with a problem (a delivery is held, never dropped), not dead and not working."""
-        if self.state_dir is None:
+        root = self.state_dir if self.state_dir is not None else self.headless_state
+        if root is None:
             return
         try:
             ap = load_agent_presence()
-            records, bad = ap.scan_records(self.state_dir)
+            records, bad = ap.scan_records(root)
         except Exception as err:   # never silent: headless workers would vanish from discovery without a word
             found.problems.append("headless workers could not be read: %s" % _one_line(str(err), 100))
             return
         found.problems.extend(bad)   # a record that is there and cannot be used is said, one line each, never a silent loss
+        found.headless_records = records   # what this look saw: a launch that lands after it is judged by the NEXT look, never called lost by this one
         if not records:
             return
         active, down = None, None
@@ -4308,7 +4330,7 @@ class Switchboard:
         fleet = _fleet_meta(info)
         if not fleet or fleet.get("name") != record["worker"]:
             return None   # the session does not carry the worker's name: the record is not proof of presence
-        fleet = load_module("reassign").overlay(self.state_dir, fleet, session_id)   # a reassigned worker's boss (bin/reassign.py): bound to this session
+        fleet = load_module("reassign").overlay(self.state_dir if self.state_dir is not None else self.headless_state, fleet, session_id)   # a reassigned worker's boss (bin/reassign.py): bound to this session
         times = info.get("time") if isinstance(info.get("time"), dict) else {}
         observation = Observation(fleet["name"], session_id, None, STATUS.get(state, "unknown"), fleet, _seconds(times.get("idle")), info.get("outcome"))
         observation.created = _seconds(times.get("created"))
@@ -6605,6 +6627,84 @@ class PaneFacts:
                     out.append(Fact("pane:%s:%s:%s" % (name, info["state"], info.get("session")), chief, "pane", summary,
                                     float(info.get("at") or 0), sender="switchboard"))
         return out
+
+
+HEADLESS_SERVICE_FILE = "headless-service.json"   # {"service": {"pid", "from", "at"}, "bosses": {worker: boss}}: what the restart notice remembers
+
+
+class HeadlessRestartFacts:
+    """#433 slice 4: a worker with no terminal is never silently lost. (1) When the OpenCode service restarts (its process id, read fresh from the
+    private service file, differs from the one seen before) each headless worker's boss is told once, naming the worker: the service has resumed
+    the session itself, so nothing needs relaunching, but a boss that waited on it should know. The key holds the new process id, so a restart
+    is delivered once and a pass is the same pass again. A service that does not answer is NOT a restart (the id is only compared when it is read),
+    and the first id ever seen is recorded without a notice. (2) A headless worker whose session no longer exists is reported to the boss it
+    last had (remembered here), or to every Chief of Staff when none is known. Terminal workers are not touched."""
+
+    __name__ = "headless_restart_facts"
+
+    def __init__(self):
+        self.engine = None
+
+    def bind(self, engine):
+        self.engine = engine
+
+    def __call__(self):
+        engine = self.engine
+        discovery = getattr(engine, "discovery", None) if engine else None
+        if engine is None or discovery is None or engine.state_dir is None:
+            return []
+        state = engine.state_dir
+        records = discovery.headless_records   # the records this pass's discovery scanned, never a second scan: a launch that landed after discovery is not "lost"
+        unread = discovery.problems   # every problem of the look (records, the service, herdr), not only unreadable records: on any of them a remembered boss is kept, never pruned
+        if records is None:
+            return []
+        remembered = _read_small(state, HEADLESS_SERVICE_FILE)
+        service, bosses = dict(remembered.get("service") or {}), dict(remembered.get("bosses") or {})
+        pid = engine.v2.service_identity()
+        changed = False
+        if pid is not None and service.get("pid") != pid:
+            service = {"pid": pid, "from": service.get("pid"), "at": engine.now()}
+            changed = True
+        headless = {o.name: o for o in discovery.agents.values() if o.headless}
+        created = {r["worker"]: r.get("created") or 0 for r in records}
+        for name, observation in headless.items():
+            boss = boss_name(discovery, observation)
+            if boss is not None and bosses.get(name) != boss:
+                bosses[name] = boss
+                changed = True
+        for gone in [n for n in bosses if n not in created] if not unread else []:   # a worker with no record any more (retired) is forgotten: the file does not grow for ever
+            del bosses[gone]
+            changed = True
+        if changed:
+            try:
+                _write_small(state, HEADLESS_SERVICE_FILE, {"service": service, "bosses": bosses})
+            except OSError as err:
+                engine._note("source.error", "headless_restart_facts", {"error": _one_line(str(err))})
+        facts = []
+        if service.get("from") is not None and isinstance(service.get("pid"), int):
+            for name, observation in sorted(headless.items()):
+                boss = boss_name(discovery, observation)
+                if boss is None or observation.conflict or created.get(name, 0) > (service.get("at") or 0):   # a worker launched after the restart was not hit by it
+                    continue
+                facts.append(Fact("headless.restarted:%s:%s" % (service["pid"], observation.session_id), boss, "headless.restarted",
+                                  "The OpenCode service restarted (process %s replaced %s), seen at %s. %s has no terminal: if it was working, its turn may have been interrupted "
+                                  "and the session may need a poke: check it with `%s status`." % (
+                                      service["pid"], service["from"], iso(service.get("at") or engine.now()), name, PROG),
+                                  float(service.get("at") or engine.now()), issue=_issue_of(observation.fleet), sender="switchboard"))
+        if discovery.problems:   # the service (or herdr) did not answer cleanly: a missing worker may only be unread, so nothing is called lost
+            return facts
+        chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff")
+        for record in records:
+            name = record["worker"]
+            if name in headless or name in discovery.agents:
+                continue
+            to = [bosses[name]] if bosses.get(name) in discovery.agents else chiefs
+            for recipient in to:
+                facts.append(Fact("headless.lost:%s" % record["session"], recipient, "headless.lost",
+                                  "%s has no terminal and its session %s no longer exists in the OpenCode service (or is not the worker's). Its record is still here: "
+                                  "`%s retire %s` if it is finished, otherwise relaunch it." % (name, record["session"], PROG, name),
+                                  float(record.get("created") or engine.now()), sender="switchboard"))
+        return facts
 
 
 def pane_health_status_lines(state_dir, now=None):
@@ -15332,6 +15432,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         if v2_ok and herdr_ok and state_ok and faults_ok:
             engine = Switchboard(config, v2, herdr, None, fact_sources(state), now,
                                  intents=intent_reader_for(config, runner, now))
+            engine.headless_state = Path(state)   # read-only: the headless records are listed, and `status` still writes nothing
             agents_ok, overview = _check(lambda: fleet_overview(engine, entries))
             agents = overview if agents_ok else {"ok": False, "error": overview}
     else:
@@ -22173,7 +22274,8 @@ def cmd_heavy(args):
     except Exception as err:   # a state directory that cannot be made or is refused: the command still runs, without a slot (heavy never fails someone else's command)
         sys.stderr.write("heavy: no slot (%s): running without one\n" % _one_line(str(err), 160))
         state = None
-    return module.run(command, state, args.slots or configured, module.DEFAULT_WAIT_MAX if args.wait_max is None else args.wait_max, args.name)
+    return module.run(command, state, args.slots or configured, module.DEFAULT_WAIT_MAX if args.wait_max is None else args.wait_max, args.name,
+                      short=bool(getattr(args, "short", False)))
 
 
 cmd_heavy.direct = True   # the wrapper of someone else's command: no daemon start, no error mapping
@@ -22181,11 +22283,12 @@ cmd_heavy.direct = True   # the wrapper of someone else's command: no daemon sta
 
 def add_heavy_parsers(sub):
     heavy = sub.add_parser("heavy", help="Run a heavy command (a full test suite, a browser or e2e run) in one of a few CPU slots, at background priority",
-                           description="`heavy [--slots N] [--wait-max SECONDS] [--name WHO] -- <command...>`: waits for a free slot (default 3, config `heavy.slots`; one line "
-                                       "every 30 s says who holds them), then runs the command as `taskpolicy -b <command>` (else `nice -n 10`) with its stdin, stdout, "
+                           description="`heavy [--slots N] [--wait-max SECONDS] [--short] [--name WHO] -- <command...>`: waits for a free slot in arrival order (default 3, config `heavy.slots`; one line "
+                                       "every 30 s says your place and who holds them), then runs the command as `taskpolicy -b <command>` (else `nice -n 10`) with its stdin, stdout, "
                                        "exit status and signals passed through. After --wait-max seconds (default 1800) it exits 75 and does not run the command.")
     heavy.add_argument("--slots", type=int, help="How many commands may run at once (default: config heavy.slots, else 3)")
     heavy.add_argument("--wait-max", type=int, dest="wait_max", help="Give up after this many seconds without a slot: exit 75 (default 1800)")
+    heavy.add_argument("--short", action="store_true", help="The command is short: when the ordinary slots are busy it may use the one express slot, and the wrapper stops it after 120 seconds (exit 124)")
     heavy.add_argument("--name", help="Who the slot is held for (default: FLEET_HEAVY_NAME, the OpenCode session id, the user)")
     heavy.add_argument("command", nargs=argparse.REMAINDER, help="-- <command...>")
 

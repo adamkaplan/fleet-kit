@@ -2433,7 +2433,7 @@ class TestFacts(Base):
     def test_the_registration_point_lists_the_lab_source(self):
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts"])
 
 
 # ---------------------------------------------------------------- observing
@@ -9714,7 +9714,7 @@ class TestFrictionWake(FrictionBase):
         self.assertNotIn("friction_wake", sb.DEFAULTS)
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts"])
         self.assertNotIn("friction_wake", sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}))
         self.assertEqual(sb.FRICTION_DEFAULTS, {"enabled": False, "hour": 9, "to": "cos", "cos_to": "improver", "text": None})
         self.make("off")
@@ -13895,6 +13895,90 @@ class TestHeadlessPresence(Base):
         facts, _ = self.engine.collect_facts()
         blocked = [f for f in facts if f.kind == sb.WORKER_BLOCKED and f.recipient == "boss"]
         self.assertEqual(len(blocked), 1, [(f.kind, f.recipient) for f in facts])
+
+    def test_the_status_command_lists_a_headless_worker_it_reads_the_records_from_the_state_directory(self):
+        sid = self.headless()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        report = sb.collect_status(self.world.route, self.world.clock.now)
+        rows = {row["name"]: row for row in report["agents"]["list"]}
+        self.assertIn("hw", rows, "status never listed a worker with no terminal: it built its engine with no state directory")
+        self.assertEqual((rows["hw"]["observation"]["session"], rows["hw"]["observation"]["status"]), (sid, "idle"))
+        self.assertTrue(rows["hw"]["observation"]["headless"])
+
+    def test_a_discovery_that_did_not_scan_the_records_judges_nothing_lost(self):
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        sid = self.headless()
+        engine = self.world.new_engine("cli")
+        engine.discover(self.world.clock.now())
+        del self.world.v2.sessions[sid]
+        engine.discovery.headless_records = None                          # this look did not scan (or the scan failed)
+        self.assertEqual([f for f in engine.collect_facts()[0] if f.kind in ("headless.lost", "headless.restarted")], [])
+        engine.discover(self.world.clock.now())                           # the next look scans, sees the record, finds the session gone
+        self.assertEqual(len([f for f in engine.collect_facts()[0] if f.kind == "headless.lost"]), 1)
+
+    def test_the_status_command_writes_nothing_in_the_state_directory(self):
+        self.headless()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        state, writes = str(self.world.state), []
+        real = {"replace": os.replace, "rename": os.rename, "open": os.open, "builtin": open}
+        def note(path):
+            if str(path).startswith(state) and not str(path).endswith(".lock"):
+                writes.append(str(path))
+        def replace(src, dst, *a, **k):
+            note(dst); return real["replace"](src, dst, *a, **k)
+        def rename(src, dst, *a, **k):
+            note(dst); return real["rename"](src, dst, *a, **k)
+        def os_open(path, flags, *a, **k):
+            if flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND):
+                note(path)
+            return real["open"](path, flags, *a, **k)
+        def builtin_open(file, mode="r", *a, **k):
+            if isinstance(file, (str, os.PathLike)) and any(c in str(mode) for c in "wax+"):
+                note(file)
+            return real["builtin"](file, mode, *a, **k)
+        with mock.patch.object(os, "replace", replace), mock.patch.object(os, "rename", rename), \
+                mock.patch.object(os, "open", os_open), mock.patch("builtins.open", builtin_open):
+            report = sb.collect_status(self.world.route, self.world.clock.now)
+        self.assertIn("hw", [row["name"] for row in report["agents"]["list"]], "the worker is listed (the premise of the check)")
+        self.assertEqual(writes, [], "status wrote nothing in the state directory (lock files excepted: every command makes them)")
+
+    def test_a_status_engine_given_a_real_state_directory_would_write_so_the_check_above_bites(self):
+        """The mutation the writes test must catch: the same status engine with `state_dir` set records the remembered bosses."""
+        self.headless()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        real, wrote = sb.Switchboard.__init__, []
+        def with_state_dir(engine, config, v2, herdr, audit, sources=(), now=None, actor="daemon", intents=None, state_dir=None):
+            real(engine, config, v2, herdr, audit, sources, now, actor, intents, state_dir=self.world.state)
+        original_write = sb._write_small
+        with mock.patch.object(sb.Switchboard, "__init__", with_state_dir), \
+                mock.patch.object(sb, "_write_small", lambda state, name, data: wrote.append(name) or original_write(state, name, data)):
+            sb.collect_status(self.world.route, self.world.clock.now)
+        self.assertIn(sb.HEADLESS_SERVICE_FILE, wrote, "with a state directory the engine writes: this is what the status engine must never be given")
+
+    def test_a_reassigned_boss_is_shown_for_a_headless_worker_in_status_and_in_the_daemon_and_a_terminal_workers_row_is_unchanged(self):
+        sid = self.headless()
+        terminal = self.world.add_agent("termworker", fleet={"role": "coder", "reports_to": "boss"})
+        reassign = sb.load_module("reassign")
+        reassign.write_overrides(self.world.state, {
+            "hw": {"boss": "boss2", "was": "boss", "original": "boss", "session": sid, "by": "operator", "at": self.world.clock.now()},
+            "termworker": {"boss": "boss2", "was": "boss", "original": "boss", "session": self.world.sessions["termworker"], "by": "operator", "at": self.world.clock.now()}})
+        daemon = self.world.new_engine("cli").discover(self.world.clock.now()).agents
+        self.assertEqual((daemon["hw"].fleet["reports_to"], daemon["termworker"].fleet["reports_to"]), ("boss2", "boss2"), "the daemon follows the reassignment for both")
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        rows = {row["name"]: row["observation"] for row in sb.collect_status(self.world.route, self.world.clock.now)["agents"]["list"] if row.get("observation")}
+        self.assertEqual(rows["hw"]["fleet"]["reports_to"], "boss2", "status shows the headless worker's reassigned boss")
+        self.assertEqual(rows["termworker"]["fleet"]["reports_to"], "boss", "a terminal worker's status row is exactly as before (the status engine has no state directory)")
+
+    def test_a_worker_launched_during_a_pass_is_never_reported_lost_by_that_pass(self):
+        """The daemon discovers, THEN the fact sources run; a launch that lands between the two wrote its record after discovery looked."""
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})    # a lost report with no remembered boss goes to the Chiefs of Staff
+        engine = self.world.new_engine("cli")
+        engine.discover(self.world.clock.now())                           # the pass's discovery: no headless record yet
+        sid = self.headless()                                             # the launch lands now: the session AND its record
+        facts = [f for f in engine.collect_facts()[0] if f.kind == "headless.lost"]
+        self.assertEqual(facts, [], "a record discovery never saw is not a lost session")
+        self.assertEqual(self.discover().agents["hw"].session_id, sid)   # the next pass finds it
+        self.assertEqual([f for f in engine.collect_facts()[0] if f.kind == "headless.lost"], [])
 
     def test_status_lists_it_with_the_pane_headless(self):
         self.headless()
@@ -38364,6 +38448,246 @@ class TestAnswerARequest(WriteWorld):
                                     "-d", '{"answer":{"db":"x"}}'])
 
 
+class TestHeadlessAnswerPath(WriteWorld):
+    """#433 slice 4 (S1, S2, S3, S7): a worker with NO terminal that needs an answer reaches its boss and is answered through the switchboard."""
+
+    def setUp(self):
+        super().setUp()
+        self.ap = sb.load_agent_presence()
+        self.sid = self.world.v2.create_session({"fleet": {"name": "hw", "role": "coder", "reports_to": "api-orch", "headless": True}}, directory=str(self.home))
+        self.ap.save_record(self.world.state, "hw", self.sid, None, now=self.world.clock.now())
+        self.world.v2.start_turn(self.sid, "work", False, lasts=86400)
+
+    def facts(self):
+        self.world.engine.discover(self.world.clock.now())
+        return [f for f in self.world.engine.collect_facts()[0] if f.kind == sb.WORKER_BLOCKED]
+
+    def test_a_permission_and_then_a_question_each_wake_the_boss_and_are_answered_through_decisions_to_the_right_request(self):
+        permission = self.world.v2.ask_permission(self.sid, resources=["ls"], timed=True)
+        first = self.facts()
+        self.assertEqual([(f.recipient, "permission" in f.summary, "hw" in f.summary) for f in first], [("api-orch", True, True)])
+        form = self.world.v2.ask_form(self.sid)
+        both = self.facts()
+        self.assertEqual(sorted(f.recipient for f in both), ["api-orch", "api-orch"])
+        self.assertEqual(len([f for f in both if "question" in f.summary]), 1)
+        self.as_agent("cos")
+        code, out, err = self.main("decisions", "answer", self.id_of("shell ls"), "allow")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.world.v2.permission_replies, [{"session": self.sid, "request": permission["id"], "decision": "once", "message": None}])
+        code, out, err = self.main("decisions", "answer", self.id_of("Which database?"), "db1")
+        self.assertEqual(code, 0, err)
+        self.assertEqual([(r["session"], r["form"]) for r in self.world.v2.form_replies], [(self.sid, form["id"])])
+        self.assertEqual(len(self.audit_events("decisions.answer")), 4, "two intents and two results")
+        self.assertEqual(self.facts(), [], "nothing is pending any more")
+
+    def test_a_blocked_headless_worker_stays_blocked_and_is_never_read_as_working_for_30_passes(self):
+        self.world.v2.ask_permission(self.sid, timed=True)
+        states = []
+        for _ in range(30):
+            self.world.tick(60)
+            states.append(self.world.engine.discover(self.world.clock.now()).agents["hw"].status)
+        self.assertEqual(states, ["blocked"] * 30)
+
+    def test_an_answer_from_someone_who_may_not_answer_or_for_a_request_that_is_not_pending_delivers_nothing(self):
+        self.world.v2.ask_permission(self.sid, resources=["ls"], timed=True)
+        ident = self.id_of("shell ls")
+        self.as_agent("api-orch")
+        code, out, err = self.main("decisions", "answer", ident, "allow")
+        self.assertEqual(code, 2)
+        self.as_agent("cos")
+        self.world.v2.answer_permissions(self.sid)                       # answered elsewhere: the request is gone
+        code, out, err = self.main("decisions", "answer", ident, "allow")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(getattr(self.world.v2, "permission_replies", []), [], "no reply reached the service")
+
+
+class TestHeadlessRestartNotice(Base):
+    """#433 slice 4 (S4, S5, S6, U1): a restart of the OpenCode service, or a session that is gone, is told to the worker's boss; never silent."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("boss", "boss2", "termworker"))
+        self.ap = sb.load_agent_presence()
+        self.engine = self.world.new_engine("cli")
+        self.pid = [100]
+        patch = mock.patch.object(sb.V2Client, "service_identity", lambda client: self.pid[0])
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def worker(self, name, boss="boss"):
+        sid = self.world.v2.create_session({"fleet": {"name": name, "role": "coder", "reports_to": boss, "headless": True}}, directory=str(self.home))
+        self.ap.save_record(self.world.state, name, sid, None, now=self.world.clock.now() - 1000)
+        return sid
+
+    def notices(self, kind="headless.restarted"):
+        self.engine.discover(self.world.clock.now())
+        return sorted((f.recipient, f.summary.split(" has no terminal")[0].split(". ")[-1]) for f in self.engine.collect_facts()[0] if f.kind == kind)
+
+    def test_a_restart_tells_each_workers_boss_once_and_a_second_pass_tells_nobody_new(self):
+        self.worker("w1"); self.worker("w2", "boss2"); self.worker("w3")
+        self.assertEqual(self.notices(), [], "the first process id ever seen is recorded, not announced")
+        self.world.tick(60)
+        self.pid[0] = 200
+        first = self.notices()
+        self.assertEqual(first, [("boss", "w1"), ("boss", "w3"), ("boss2", "w2")])
+        self.assertEqual(self.notices(), first, "the same facts again: the delivery key makes them once")
+        keys = {f.key for f in self.engine.collect_facts()[0] if f.kind == "headless.restarted"}
+        self.assertEqual(len(keys), 3)
+        self.assertEqual(sorted(a for a in self.engine.discover(self.world.clock.now()).agents if a.startswith("w")), ["w1", "w2", "w3"], "none is missing from discovery")
+        self.pid[0] = 300
+        self.assertEqual(len({f.key for f in self.engine.collect_facts()[0] if f.kind == "headless.restarted"} - keys), 3, "a second restart is a new notice")
+
+    def test_an_outage_is_not_a_restart_and_a_terminal_worker_gets_no_notice(self):
+        self.worker("w1")
+        self.notices()
+        self.pid[0] = None                                               # the service file is unreadable: unknown, not a new process
+        self.world.v2.down = True
+        found = self.engine.discover(self.world.clock.now()).agents["w1"]
+        self.assertEqual(found.status, "unknown")
+        self.assertEqual(self.notices(), [])
+        self.world.v2.down = False
+        self.pid[0] = 100                                                # back with the same identity
+        self.assertEqual(self.notices(), [])
+        self.pid[0] = 200
+        self.assertEqual([r for r, _ in self.notices()], ["boss"], "only the headless worker, never termworker")
+
+    def test_a_restart_that_happens_during_an_outage_is_told_once_and_an_outage_with_the_same_process_is_not_a_restart(self):
+        self.worker("w1")
+        self.notices()                                                    # pid 100 recorded
+        self.pid[0] = None                                                # the service is down: nothing is compared
+        self.assertEqual(self.notices(), [])
+        self.pid[0] = 200                                                 # it came back as a NEW process
+        first = self.notices()
+        self.assertEqual(first, [("boss", "w1")], "exactly one notice for the restart that happened while it was down")
+        self.assertEqual(len({f.key for f in self.engine.collect_facts()[0] if f.kind == "headless.restarted"}), 1)
+        self.pid[0] = None
+        self.assertEqual(self.notices(), first, "the same single notice while it is down again; no second one")
+        self.pid[0] = 200
+        self.assertEqual(len({f.key for f in self.engine.collect_facts()[0] if f.kind == "headless.restarted"}), 1, "the same restart, the same key")
+
+    def test_the_notice_says_what_is_known_and_does_not_claim_the_session_was_resumed(self):
+        self.worker("w1")
+        self.notices()
+        self.pid[0] = 200
+        self.engine.discover(self.world.clock.now())
+        text = [f.summary for f in self.engine.collect_facts()[0] if f.kind == "headless.restarted"][0]
+        self.assertIn("restarted", text)
+        self.assertIn("poke", text)
+        self.assertNotIn("resumed", text)
+
+    def test_a_problem_in_discovery_holds_back_every_lost_report_and_it_comes_when_the_problem_is_gone(self):
+        sid = self.worker("w1")
+        self.notices("headless.lost")
+        del self.world.v2.sessions[sid]
+        bad = Path(self.world.state) / "headless" / "bad.json"
+        bad.write_text("{not json")
+        bad.chmod(0o600)
+        self.assertEqual(self.notices("headless.lost"), [], "a pass with a problem may only be missing a read: nothing is called lost")
+        bad.unlink()
+        self.assertEqual([r for r, _ in self.notices("headless.lost")], ["boss"])
+
+    def test_a_worker_launched_after_the_restart_is_not_told_it_was_hit(self):
+        self.worker("w1")
+        self.notices()
+        self.pid[0] = 200
+        self.notices()
+        self.world.tick(600)
+        sid = self.world.v2.create_session({"fleet": {"name": "late", "role": "coder", "reports_to": "boss", "headless": True}}, directory=str(self.home))
+        self.ap.save_record(self.world.state, "late", sid, None, now=self.world.clock.now())
+        self.assertEqual([n for _, n in self.notices()], ["w1"])
+
+    def test_a_session_that_is_gone_is_reported_to_its_boss_and_not_listed_as_working(self):
+        sid = self.worker("w1")
+        self.world.v2.sessions[sid]["turn"] = None
+        self.notices("headless.lost")                                    # the boss is remembered while the worker is seen
+        del self.world.v2.sessions[sid]
+        self.pid[0] = 200
+        found = self.engine.discover(self.world.clock.now())
+        self.assertNotIn("w1", found.agents)
+        lost = [f for f in self.engine.collect_facts()[0] if f.kind == "headless.lost"]
+        self.assertEqual([(f.recipient, "no longer exists" in f.summary, "w1" in f.summary) for f in lost], [("boss", True, True)])
+
+    def test_a_lost_worker_with_no_remembered_boss_goes_to_the_chiefs_of_staff_once_and_a_forgotten_boss_is_pruned(self):
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        sid = self.worker("w1")
+        del self.world.v2.sessions[sid]                                   # gone before any pass ever saw it: no boss is remembered
+        lost = [f for f in (self.engine.discover(self.world.clock.now()) and self.engine.collect_facts()[0]) if f.kind == "headless.lost"]
+        self.assertEqual([f.recipient for f in lost], ["cos"])
+        self.assertEqual(len({f.key for f in lost}), 1, "one key per session: delivered once")
+        other = self.worker("w2")
+        self.notices()
+        remembered = json.loads((Path(self.world.state) / sb.HEADLESS_SERVICE_FILE).read_text())
+        self.assertEqual(remembered["bosses"], {"w2": "boss"})
+        self.ap.remove_record(self.world.state, "w2")                    # retired: its record goes, and so does the remembered boss
+        self.notices()
+        self.assertEqual(json.loads((Path(self.world.state) / sb.HEADLESS_SERVICE_FILE).read_text())["bosses"], {})
+
+    def test_a_state_file_that_cannot_be_written_is_said_and_the_restart_notice_still_goes_out(self):
+        self.worker("w1")
+        self.notices()
+        self.pid[0] = 200
+        with mock.patch.object(sb, "_write_small", side_effect=OSError("disk full")):
+            self.engine.discover(self.world.clock.now())
+            facts = [f for f in self.engine.collect_facts()[0] if f.kind == "headless.restarted"]
+        self.assertEqual(len(facts), 1)
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "source.error" and "headless_restart_facts" in str(e)])
+
+    def test_a_service_that_does_not_answer_never_makes_a_worker_lost(self):
+        self.worker("w1")
+        self.notices("headless.lost")
+        self.world.v2.down = True
+        self.assertEqual(self.notices("headless.lost"), [])
+
+
+class TestServiceIdentity(unittest.TestCase):
+    """#433 slice 4: the REAL fresh read of the service's process id (`V2Http.service_identity`), over a temp service file."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.dir), True)
+        self.dir.chmod(0o700)
+        self.file = self.dir / "service.json"
+        self.alive = {111: True, 222: True}
+        self.http = sb.V2Http(self.file, 5, alive=lambda pid: self.alive.get(pid, False))
+
+    def write(self, pid, mode=0o600, password="s3cret-value"):
+        body = {"url": "http://127.0.0.1:49374", "password": password}
+        if pid is not None:
+            body["pid"] = pid
+        self.file.write_text(json.dumps(body))
+        self.file.chmod(mode)
+
+    def test_a_changed_pid_is_seen_on_the_next_call_and_nothing_is_cached(self):
+        self.write(111)
+        self.assertEqual(self.http.service_identity(), 111)
+        self.http.base_url()                                              # a cached connection record exists now
+        self.write(222)
+        self.assertEqual(self.http.service_identity(), 222, "a fresh read, not the cached one")
+
+    def test_a_missing_unsafe_dead_or_odd_pid_gives_none_and_the_password_is_never_returned(self):
+        self.assertIsNone(self.http.service_identity(), "no file")
+        self.write(111, mode=0o644)
+        self.assertIsNone(self.http.service_identity(), "a file others can read is not trusted")
+        self.write(333)
+        self.assertIsNone(self.http.service_identity(), "a pid that is gone")
+        self.write(True)
+        self.assertIsNone(self.http.service_identity(), "a bool is not a pid")
+        self.write(None)
+        self.assertIsNone(self.http.service_identity(), "no pid in the file")
+        self.write(111)
+        self.assertNotIn("s3cret", repr(self.http.service_identity()))
+        self.dir.chmod(0o777)
+        self.assertIsNone(self.http.service_identity(), "a directory others can write is not trusted")
+        self.dir.chmod(0o700)
+
+    def test_load_still_connects_with_the_same_checks(self):
+        self.write(111)
+        self.assertEqual(self.http.base_url(), "http://127.0.0.1:49374")
+        self.write(333)
+        self.http._info = None
+        self.assertIsNone(self.http.base_url(), "a service file naming a dead process is still refused")
+
+
 class TestEscalateARequestOrAReport(WriteWorld):
     def setUp(self):
         super().setUp()
@@ -49339,6 +49663,330 @@ class TestHeavyWatchdog(unittest.TestCase):
         self.assertLessEqual(logic.out.tell(), BoundedOut.LIMIT)
 
 
+class TestHeavyFifo(unittest.TestCase):
+    """Heavy slots in arrival order and the express slot (ask #620). The order file, the lock files and the process table are real or injected, the clock never
+    moves on its own, the command is a fake, and every list is bounded; no test waits on a real slot."""
+
+    def setUp(self):
+        self.hs = sb.load_heavy_slots()
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.dir), True)
+        self.out, self.takes, self.started, self.clock_calls = BoundedOut(), BoundedList(), BoundedList(), BoundedList()
+        self.now = [1000.0]
+        self.alive = {1001, 1002, 1003, 1004, 1005}
+
+    def seed(self, pids):
+        (self.dir / "heavy-queue.json").write_text(json.dumps({"entries": [{"pid": pid, "start": "t", "name": "w%d" % pid, "short": False} for pid in pids]}))
+
+    def entries(self):
+        return [entry["pid"] for entry in json.loads((self.dir / "heavy-queue.json").read_text())["entries"]]
+
+    def run_as(self, pid, take=None, step=10.0, wait_max=15, short=False, report="100000", on_child=None, environ_extra=None, watchdog=None, held=None):
+        """One caller's run(): `pid` is its place in the line, `take(state, slots)` the ordinary slots (default: all busy)."""
+        test = self
+
+        def clock():
+            test.clock_calls.append(1)
+            test.now[0] += step
+            return test.now[0]
+
+        def ordinary(state, slots):
+            test.takes.append(pid)
+            return take(state, slots) if take else (None, None)
+
+        class FakeChild:
+            pid = 4242
+
+            def __init__(child, argv, **kwargs):
+                test.started.append(pid)
+
+            def wait(child):
+                return on_child() if on_child else 0
+        environ = {"PATH": os.environ["PATH"], "FLEET_HEAVY_REPORT_SECONDS": report}
+        environ.update(environ_extra or {})
+        slot_records = [{"slot": i, "name": "who-%s" % c, "pid": 10 + i, "command": "sh", "since": 1} for i, c in enumerate("abc")]
+        with mock.patch.object(self.hs, "_take", ordinary), mock.patch.object(self.hs, "holders", lambda state, slots=3: slot_records), \
+                mock.patch.object(self.hs.subprocess, "Popen", FakeChild):
+            return self.hs.run(["sh", "-c", "true"], str(self.dir), 3, wait_max, "w%d" % pid, environ=environ, out=self.out, clock=clock, sleep=lambda s: None,
+                               short=short, watchdog=watchdog, line={"pid": pid, "alive": lambda p, st: p in self.alive, "start_of": lambda p: "t", "held": (lambda: held or set())})
+
+    def free(self):
+        fd = os.open(os.devnull, os.O_RDWR)
+        return lambda state, slots: (fd, 0)
+
+    def test_s1_slots_go_to_the_callers_in_the_order_they_arrived(self):
+        self.seed([1001, 1002, 1003, 1004])
+        self.assertEqual(self.run_as(1004, self.free()), 75, "D arrived last: it never gets a slot while A B C wait")
+        self.assertEqual(list(self.takes), [], "and it did not even try one")
+        self.assertEqual(self.entries(), [1001, 1002, 1003], "it left the line when it gave up; the others kept their places")
+        order = []
+        for pid in (1001, 1002, 1003):
+            self.assertEqual(self.run_as(pid, self.free()), 0)
+            order.append(self.started[-1])
+        self.assertEqual(order, [1001, 1002, 1003])
+        self.assertEqual(self.entries(), [], "each left the line when it took its slot")
+        self.assertEqual(self.run_as(1004, self.free()), 0)
+
+    def test_s2_a_new_caller_polling_at_the_instant_a_slot_frees_does_not_take_it_from_an_earlier_waiter(self):
+        self.seed([1001])
+        self.assertEqual(self.run_as(1002, self.free(), wait_max=5), 75)
+        self.assertEqual(list(self.started), [])
+        self.assertEqual(self.entries(), [1001], "it also left the line when it gave up")
+        self.assertEqual(self.run_as(1001, self.free()), 0)
+
+    def test_s3_a_waiter_at_the_head_that_died_does_not_block_the_one_behind_it(self):
+        self.seed([1001, 1002])
+        self.alive.discard(1001)
+        self.assertEqual(self.run_as(1002, self.free()), 0)
+        self.assertEqual(list(self.takes), [1002], "it took the slot at its first look, with no wait for the wait limit")
+        self.assertEqual(list(self.started), [1002])
+
+    def test_s4_a_short_command_runs_in_the_express_slot_when_the_ordinary_ones_are_busy_and_a_second_waits_for_it_only(self):
+        second = {}
+
+        def while_first_runs():
+            second["status"] = self.run_as(1002, short=True, wait_max=15)
+            return 0
+        self.assertEqual(self.run_as(1001, short=True, on_child=while_first_runs), 0)
+        self.assertEqual(second["status"], 75, "the express slot was held: the second one waited and gave up")
+        self.assertEqual(list(self.started), [1001])
+
+    def test_s5_a_short_command_past_120_seconds_is_stopped_with_124_and_frees_the_express_slot(self):
+        stopped = threading.Event()
+        signals = BoundedList()
+
+        def record(target, number):
+            signals.append((target, number))
+            stopped.set()
+        rows = [(4242, 1, os.getpgrp(), 10, "c")]
+        dog = {"read_table": lambda: [] if stopped.is_set() else rows, "pause": lambda seconds: stopped.wait(0.001), "killpg": record, "kill": record, "every": 0.001,
+               "grace": 0.001, "sweep_pause": lambda s: None, "me": (9001, 9002, 9003), "lsof": lambda path: set()}
+        code = self.run_as(1001, short=True, step=60.0, on_child=lambda: (stopped.wait(30), -9)[1], watchdog=dog)
+        self.assertEqual(code, 124)
+        self.assertIn("time ceiling of 120 s", self.out.getvalue())
+        fd = self.hs._take_express(str(self.dir))
+        self.assertIsNotNone(fd, "the express slot is free again")
+        os.close(fd)
+
+    def test_s6_the_waiting_line_says_the_place_in_the_order_and_names_the_holders(self):
+        self.seed([1001, 1002, 1003])
+        self.assertEqual(self.run_as(1003, report="5"), 75)
+        text = self.out.getvalue()
+        self.assertEqual(text.count("place 3 in line (2 ahead)"), 1, text)
+        for name in ("who-a", "who-b", "who-c"):
+            self.assertIn(name, text)
+
+    def test_s7_a_corrupt_order_file_and_one_that_cannot_be_used_fall_back_to_the_present_behaviour_and_say_so_once(self):
+        for label in ("corrupt", "unusable"):
+            with self.subTest(label):
+                self.out = BoundedOut()
+                self.takes, self.started = BoundedList(), BoundedList()
+                for name in ("heavy-queue.json", "heavy-queue.lock"):
+                    target = self.dir / name
+                    if target.is_dir():
+                        shutil.rmtree(str(target))
+                    elif target.exists():
+                        target.unlink()
+                if label == "corrupt":
+                    (self.dir / "heavy-queue.json").write_text("{not json")
+                else:
+                    (self.dir / "heavy-queue.lock").mkdir()
+                attempts = BoundedList()
+
+                def take(state, slots):
+                    attempts.append(1)
+                    return self.free()(state, slots) if len(attempts) >= 2 else (None, None)
+                self.assertEqual(self.run_as(1002, take), 0)
+                self.assertEqual(self.out.getvalue().count("no waiting order"), 1, self.out.getvalue())
+                self.assertEqual(len(attempts), 2)
+
+    def test_s8_the_defaults_and_the_exit_status_of_giving_up_are_as_before(self):
+        self.assertEqual((self.hs.DEFAULT_SLOTS, self.hs.DEFAULT_WAIT_MAX, self.hs.EXIT_TEMPFAIL), (3, 1800, 75))
+        self.assertEqual(self.hs.settings(None), 3)
+        self.assertEqual(self.run_as(1001, wait_max=15), 75, "nobody waiting, no slot: gives up as before")
+        self.assertIs(inspect.signature(self.hs.run).parameters["short"].default, False)
+
+    def test_s10_entries_of_processes_that_are_gone_are_dropped_and_the_live_one_keeps_its_place(self):
+        self.seed([1001, 1002, 1003])
+        self.alive -= {1001, 1003}
+        line = self.hs.Line(str(self.dir), "w", pid=1002, alive=lambda p, st: p in self.alive, start_of=lambda p: "t")
+        self.assertEqual(line.place(), 1)
+        self.assertEqual(self.entries(), [1002])
+
+    def test_s11_the_express_slot_has_its_own_lock_file_and_the_ordinary_ones_are_untouched(self):
+        seen = {}
+
+        def while_running():
+            def locked(path):
+                fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return False
+                except OSError:
+                    return True
+                finally:
+                    os.close(fd)
+            seen["express"] = locked(str(self.dir / "heavy-slot-express.lock"))
+            seen["ordinary"] = [locked(str(self.dir / ("heavy-slot-%d.lock" % i))) for i in range(3)]
+            return 0
+        self.assertEqual(self.run_as(1001, short=True, on_child=while_running), 0)
+        self.assertEqual(seen, {"express": True, "ordinary": [False, False, False]})
+
+    def test_a_dead_waiters_pid_reused_by_another_process_is_not_that_waiter(self):
+        """The real `_alive` with a mocked start-time reader: the pid exists (this process) but its start time is not the one the entry recorded."""
+        with mock.patch.object(self.hs, "_process_start", lambda pid: "Tue Jan  2 00:00:00 2024"):
+            self.assertFalse(self.hs._alive(os.getpid(), "Mon Jan  1 00:00:00 2024"), "another process now has the pid")
+            self.assertTrue(self.hs._alive(os.getpid(), "Tue Jan  2 00:00:00 2024"), "the same process")
+            self.assertTrue(self.hs._alive(os.getpid(), ""), "an entry with no recorded start time is judged by the pid alone")
+        gone = subprocess.Popen(["true"])
+        gone.wait()
+        self.assertFalse(self.hs._alive(gone.pid, ""), "a pid that is gone is not alive")
+
+    def test_a_short_write_never_leaves_a_half_written_order_file_or_a_temporary_file(self):
+        line = self.hs.Line(str(self.dir), "w", pid=1001, alive=lambda p, st: True, start_of=lambda p: "t")
+        line.place()
+        before = (self.dir / "heavy-queue.json").read_text()
+        with mock.patch.object(self.hs.os, "fsync", side_effect=OSError(5, "disk")):
+            with self.assertRaises(self.hs.QueueUnusable):
+                self.hs.Line(str(self.dir), "w", pid=1002, alive=lambda p, st: True, start_of=lambda p: "t").place()
+        self.assertEqual((self.dir / "heavy-queue.json").read_text(), before, "the file is as it was")
+        self.assertEqual([p.name for p in self.dir.iterdir() if p.name.endswith(".tmp")], [], "no temporary file is left")
+
+
+    def test_a_caller_that_fell_back_after_joining_leaves_no_entry_behind(self):
+        real = self.hs.Line.place
+        calls = []
+
+        def once_then_fail(line):
+            calls.append(1)
+            if len(calls) > 1:
+                raise self.hs.QueueUnusable("the order file is corrupt")
+            return real(line)
+        with mock.patch.object(self.hs.Line, "place", once_then_fail):
+            self.assertEqual(self.run_as(1001, wait_max=25), 75)
+        self.assertEqual(self.entries(), [], "it joined, then fell back, and is not in the line any more")
+
+    def test_a_caller_that_is_not_short_never_uses_the_express_slot(self):
+        self.assertEqual(self.run_as(1001, short=False, wait_max=15), 75)
+        self.assertEqual(list(self.started), [])
+        self.assertFalse((self.dir / "heavy-slot-express.lock").exists(), "the express slot was not even opened")
+
+    def test_the_short_flag_of_the_command_reaches_the_wrapper(self):
+        seen = {}
+        args = types.SimpleNamespace(command=["--", "true"], slots=None, wait_max=None, name=None, short=True)
+        with mock.patch.object(sb.load_heavy_slots(), "run", lambda *a, **k: seen.update(k) or 0), mock.patch.object(sb, "ensure_state_dir", lambda: str(self.dir)), \
+                mock.patch.object(sb, "config_path", lambda: self.dir / "no-config"):
+            self.assertEqual(sb.cmd_heavy(args), 0)
+        self.assertIs(seen.get("short"), True)
+
+    def test_an_oversize_file_a_bad_entry_and_a_lock_that_stays_held_are_unusable_not_trusted(self):
+        make = lambda: self.hs.Line(str(self.dir), "w", pid=1001, alive=lambda p, st: True, start_of=lambda p: "t", lock_tries=2, lock_pause=0.001)
+        (self.dir / "heavy-queue.json").write_text(" " * (self.hs.QUEUE_BYTES + 10))
+        with self.assertRaises(self.hs.QueueUnusable):
+            make().place()
+        (self.dir / "heavy-queue.json").write_text(json.dumps({"entries": [{"pid": "x", "start": 1}]}))
+        with self.assertRaises(self.hs.QueueUnusable):
+            make().place()
+        (self.dir / "heavy-queue.json").write_text(json.dumps({"entries": [{"pid": 1, "start": "t"}] * (self.hs.QUEUE_MAX + 1)}))
+        with self.assertRaises(self.hs.QueueUnusable):
+            make().place()
+        (self.dir / "heavy-queue.json").unlink()
+        holder = os.open(str(self.dir / "heavy-queue.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, holder)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        with self.assertRaises(self.hs.QueueUnusable):
+            make().place()
+
+
+    def test_a_ticket_whose_owner_holds_a_slot_is_dropped_so_a_ghost_never_blocks_the_line(self):
+        self.seed([1001, 1002])
+        line = self.hs.Line(str(self.dir), "w", pid=1002, alive=lambda p, st: True, start_of=lambda p: "t", held=lambda: {1001})
+        self.assertEqual(line.place(), 1, "1001 holds a slot: its ticket is not a place in the line")
+        self.assertEqual(self.entries(), [1002])
+
+    def test_a_caller_whose_ticket_could_not_be_removed_says_so_and_the_waiter_behind_it_still_gets_the_next_slot(self):
+        self.seed([1001, 1002])
+        attempts = []
+        with mock.patch.object(self.hs.Line, "leave", lambda line: attempts.append(1) and False):
+            self.assertEqual(self.run_as(1001, self.free()), 0)
+        self.assertGreaterEqual(len(attempts), 2, "it tried to leave again before saying so")
+        self.assertEqual(self.out.getvalue().count("could not leave the waiting order"), 1, self.out.getvalue())
+        self.assertEqual(self.entries(), [1001, 1002], "the ghost is still in the file")
+        self.out, self.takes, self.started = BoundedOut(), BoundedList(), BoundedList()
+        self.assertEqual(self.run_as(1002, self.free(), held={1001}), 0, "the waiter behind the ghost still takes the next free slot")
+        self.assertEqual(list(self.started), [1002])
+
+    def test_the_slot_record_names_the_wrapper_and_held_by_lists_it_with_the_express_holder(self):
+        fd = os.open(str(self.dir / "heavy-slot-1.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.hs._record(fd, "w", 4242, "sh", 1000.0)
+        express = self.hs._take_express(str(self.dir))
+        self.addCleanup(os.close, express)
+        self.hs._record(express, "w", 4343, "sh", 1000.0)
+        self.assertEqual(self.hs.held_by(str(self.dir), 3), {4242, 4343, os.getpid()})
+        self.assertFalse((self.dir / "heavy-slot-0.lock").exists(), "looking creates no lock file")
+
+    def test_a_process_that_died_and_was_not_reaped_is_gone(self):
+        with mock.patch.object(self.hs, "_is_zombie", lambda pid: True), mock.patch.object(self.hs, "_process_start", lambda pid: "t"):
+            self.assertFalse(self.hs._alive(os.getpid(), "t"))
+        with mock.patch.object(self.hs, "_is_zombie", lambda pid: False), mock.patch.object(self.hs, "_process_start", lambda pid: "t"):
+            self.assertTrue(self.hs._alive(os.getpid(), "t"))
+        done = subprocess.Popen(["true"])
+        while subprocess.run(["ps", "-o", "stat=", "-p", str(done.pid)], capture_output=True, text=True).stdout.strip()[:1] not in ("Z", ""):
+            time.sleep(0.01)   # (bounded by the test timeout: a process that exits at once)
+        if subprocess.run(["ps", "-o", "stat=", "-p", str(done.pid)], capture_output=True, text=True).stdout.strip().startswith("Z"):
+            self.assertFalse(self.hs._alive(done.pid, ""), "a real zombie")
+        done.wait()
+
+    def test_the_temporary_files_of_processes_that_are_gone_are_swept_when_the_order_is_rewritten(self):
+        gone = subprocess.Popen(["true"])
+        gone.wait()
+        stale = self.dir / ("heavy-queue.json.%d.tmp" % gone.pid)
+        mine = self.dir / ("heavy-queue.json.%d.tmp" % os.getpid())
+        other = self.dir / "unrelated.tmp"
+        for path in (stale, other):
+            path.write_text("x")
+        self.hs.Line(str(self.dir), "w", pid=1001, alive=lambda p, st: True, start_of=lambda p: "t", held=lambda: set()).place()
+        self.assertFalse(stale.exists(), "the dead process's temporary file is gone")
+        self.assertTrue(other.exists(), "nothing else is touched")
+        self.assertFalse(mine.exists(), "and its own was renamed into place")
+
+
+    def test_odd_file_names_in_the_state_directory_are_left_alone_and_never_stop_the_wrapper(self):
+        gone = subprocess.Popen(["true"])
+        gone.wait()
+        live = os.getppid()
+        stray = ["heavy-queue.json.%s.tmp" % ("9" * 23), "heavy-queue.json.\u00b23.tmp", "heavy-queue.json.0.tmp", "heavy-queue.json.1.tmp", "heavy-queue.json.-1.tmp",
+                 "heavy-queue.json..tmp", "heavy-queue.json.%d.tmp.bak" % gone.pid, "heavy-queue.json.\u0663.tmp", "heavy-queue.json.%d.tmp" % (2 ** 22 + 1)]
+        for name in stray:
+            (self.dir / name).write_text("x")
+        (self.dir / ("heavy-queue.json.%d.tmp" % live)).write_text("x")           # a live process's: not deleted
+        (self.dir / ("heavy-queue.json.%d.tmp" % gone.pid)).write_text("x")       # a dead process's: deleted
+        folder = self.dir / ("heavy-queue.json.%d.tmp" % (gone.pid + 1 if gone.pid < 2 ** 22 - 2 else 2))
+        folder.mkdir()                                                            # a directory with such a name: left alone
+        target = self.dir / "target.txt"
+        target.write_text("keep")
+        link = self.dir / ("heavy-queue.json.%d.tmp" % (gone.pid + 2 if gone.pid < 2 ** 22 - 3 else 3))
+        os.symlink(str(target), str(link))                                        # a symlink: never followed, left alone
+        notes = BoundedList()
+        self.hs.Line(str(self.dir), "w", pid=1001, alive=lambda p, st: True, start_of=lambda p: "t", held=lambda: set(), note=notes.append).place()
+        for name in stray:
+            self.assertTrue((self.dir / name).exists(), "left alone: %r" % name)
+        self.assertTrue((self.dir / ("heavy-queue.json.%d.tmp" % live)).exists())
+        self.assertFalse((self.dir / ("heavy-queue.json.%d.tmp" % gone.pid)).exists())
+        self.assertTrue(folder.is_dir() and link.is_symlink() and target.read_text() == "keep")
+        self.assertEqual(list(notes), [], "none of it was an error")
+
+    def test_a_sweep_that_raises_never_stops_the_command_and_says_so_once(self):
+        with mock.patch.object(self.hs.os, "listdir", side_effect=RuntimeError("boom")):
+            self.assertEqual(self.run_as(1001, self.free()), 0)
+        self.assertEqual(list(self.started), [1001], "the command still ran")
+        self.assertEqual(self.out.getvalue().count("queue sweep failed: RuntimeError"), 1, self.out.getvalue())
+
+    def test_the_numbers_read_from_files_and_ps_are_ascii_digits_only(self):
+        self.assertNotIn("isdigit", inspect.getsource(self.hs), "str.isdigit() accepts a superscript: int() then raises")
+
 class TestHeavySlots(Base):
     """`fleet-switchboard heavy` (ask #34): a flock slot semaphore in the state directory; the COMMAND holds the lock; the queue, the kill, the exit status, taskpolicy
     or nice, the holder list, the wait limit and the no-shell guarantee are each run for real with small commands."""
@@ -59113,6 +59761,24 @@ def _zip_with(member, data):
     with zipfile.ZipFile(stream, "w") as archive:
         archive.writestr(member, data)
     return stream.getvalue()
+
+
+class TestScratchFileRule(unittest.TestCase):
+    """Ask #653: the coordination skill tells coders to keep scratch files in a private mktemp -d directory."""
+
+    RULE = 'Write scratch files (PR bodies, message bodies, notes) under a private directory made with mktemp -d, never under a fixed name in the shared temp folder: another agent may write the same name, and a body file is published as it stands.'
+
+    def test_s1_the_skill_carries_the_scratch_rule_exactly_once(self):
+        text = (REPO / "skills/fleet-coordination/SKILL.md").read_text()
+        self.assertEqual(text.count(self.RULE), 1)
+
+    def test_s2_it_is_never_inside_a_code_fence(self):
+        inside = False
+        for line in (REPO / "skills/fleet-coordination/SKILL.md").read_text().splitlines():
+            if line.strip().startswith("```"):
+                inside = not inside
+            elif inside:
+                self.assertNotIn("mktemp -d", line)
 
 
 if __name__ == "__main__":
