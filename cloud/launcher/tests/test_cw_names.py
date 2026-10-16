@@ -28,6 +28,7 @@ NAMES = {
     P + "-end-hook": "cw-end-hook", P + "-worker-activity": "cw-worker-activity", P + "-token-mint": "cw-token-mint",
 }
 NEW = set(NAMES.values())
+STANDARD_TOOLS = {"cat", "git", "head", "ls", "sh"}   # the image's own tools, run by the record and the report read (not names this project coined)
 OLD = re.compile(P, re.I)
 
 
@@ -84,7 +85,7 @@ class S5Names(base.Base):
         emitted |= {a[a.index("-n") + 1] for a in calls}
         emitted |= {a[a.index("--") + 1] for a in calls if "exec" in a and "--" in a}
         emitted |= {a.split("=", 1)[0] for a in sum(calls, []) if a.startswith("cw/")}
-        self.assertEqual(sorted(emitted - NEW), [])
+        self.assertEqual(sorted(emitted - NEW - STANDARD_TOOLS), [])
         self.assertTrue({"CW_WORKER", "cw/worker", "cw-worker", "cw", "cw-end-hook"} <= emitted, emitted)
 
     def test_exec_names_are_installed_by_the_image(self):

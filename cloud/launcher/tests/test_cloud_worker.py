@@ -395,7 +395,7 @@ class S5EndHook(Base):
             code, out, _ = self.run_cli("stop", "coder7", "--reason", reason)
             self.assertEqual(code, 0)
             self.assertEqual(json.loads(out)["wip_branch"], "coder7/wip")
-            self.assertEqual(self.audit_lines()[-1]["reason"], reason)
+            self.assertTrue(self.audit_lines()[-1]["reason"].startswith(reason + "; run record "), self.audit_lines()[-1]["reason"])   # every stop records (#638)
 
     def test_push_failure_keeps_the_pod_and_exits_1(self):
         work, origin = make_repo(self.tmp.name, "r", dirty=True)
