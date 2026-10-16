@@ -40256,6 +40256,96 @@ class TestCaptainDecisionFromLabels(TestCaptainPrs):
         self.assertEqual(self.only()["kind"], "notice")
 
 
+class TestHeldRowsFromLabels(DecisionsBase):
+    """#641: an open pull request that carries the fleet's hold labels is a decision row on those labels alone, one row per pull request, read from the open-pull-request list the daemon already holds."""
+
+    REPO = "acme/api"
+
+    def setUp(self):
+        super().setUp()
+        self.gh = FakeGhPr({7: (0, captain_pr(reviews=[("reviewer", "APPROVED", HEAD_A)]), ""), 30: (0, captain_pr(reviews=[("reviewer", "APPROVED", HEAD_A)]), "")})
+        self.engine = self.world.engine
+        self.engine.config["plan_gates"] = {"repos": {"acme/api": {"mode": "shadow"}}}   # the daemon reads this repository's open pull requests
+        self.engine.ci_record_state = sb.CiRecordState()
+        self.reads = []
+        self.engine.gh_runner = lambda argv, **kw: (self.reads.append(argv), self.gh(argv, **kw))[1]
+
+    def pr(self, number, *labels, head=HEAD_A, state="open", merged=False, title="Add the widget", repo=None):
+        record = {"number": number, "title": title, "state": state, "head": {"sha": head}, "created_at": sb.iso(self.world.clock.now() - 3600),
+                  "labels": [{"name": "tester:%s" % l} for l in labels], "draft": False}
+        if merged:
+            record["merged_at"] = sb.iso(self.world.clock.now() - 60)
+        return record
+
+    def lists(self, *records, repo=None, cut=False):
+        self.engine.ci_record_state.lists[(repo or self.REPO).lower()] = (self.world.clock.now(), list(records))
+
+    def rows(self):
+        return [d for d in self.listed() if d.get("number") in range(7, 400) and d.get("kind") in ("captain", "notice")]
+
+    def test_s1_a_held_pr_with_no_notice_is_one_row_with_its_head_its_holds_and_no_notice_recorded(self):
+        self.lists(self.pr(9, "merge-captain", "hold-security", "hold-contract"))
+        (row,) = [d for d in self.rows() if d["number"] == 9]
+        self.assertEqual((row["id"], row["kind"], row["tier"], row["head"], row["holds"], row["agent"]), ("pr:api#9", "captain", "cos", HEAD_A, ["contract", "security"], None))
+        self.assertEqual(row["note"].count("no notice recorded"), 1)
+        self.assertEqual(row["url"], "https://github.com/acme/api/pull/9")
+
+    def test_s2_a_pr_with_a_notice_and_labels_is_still_one_row_and_keeps_its_notice(self):
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "platform", "ready", self.world.clock.now())
+        self.lists(self.pr(7, "merge-captain", "hold-security"))
+        self.gh.answers[7] = (0, captain_pr(labels=[{"name": "tester:merge-captain"}, {"name": "tester:hold-security"}], reviews=[("reviewer", "APPROVED", HEAD_A)]), "")
+        rows = [d for d in self.rows() if d["number"] == 7]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["agent"], "platform", "the notice's sender")
+
+    def test_s3_a_merged_a_closed_and_an_unlabelled_pr_are_no_row(self):
+        self.lists(self.pr(10, "merge-captain", "hold-security", merged=True), self.pr(11, "hold-security", state="closed"), self.pr(12))
+        self.assertEqual([d for d in self.rows() if d["number"] in (10, 11, 12)], [])
+
+    def test_s4_a_failed_or_cut_read_keeps_the_rows_already_shown(self):
+        self.lists(self.pr(20, "merge-captain"), self.pr(21, "hold-contract"))
+        self.assertEqual(sorted(d["number"] for d in self.rows() if d["number"] in (20, 21)), [20, 21])
+        # the list is read again and is CUT (200 records, the held ones beyond it): the rows stay
+        self.lists(*[self.pr(100 + n) for n in range(sb.LABEL_HOLD_LIST_CUT)])
+        self.assertEqual(sorted(d["number"] for d in self.rows() if d["number"] in (20, 21)), [20, 21])
+        # a complete list without them (they were merged or unlabelled) drops them
+        self.lists(self.pr(100))
+        self.assertEqual([d for d in self.rows() if d["number"] in (20, 21)], [])
+
+    def test_s5_a_labels_only_row_is_cos_then_human_when_escalated_and_its_id_is_the_notices_id(self):
+        self.lists(self.pr(30, "merge-captain", "hold-security"))
+        (row,) = [d for d in self.rows() if d["number"] == 30]
+        self.assertEqual((row["tier"], row["id"]), ("cos", "pr:api#30"))
+        sb.record_pr_notice(self.world.state, self.REPO, 30, "platform", "", self.world.clock.now())
+        self.gh.answers[30] = (0, captain_pr(labels=[{"name": "tester:merge-captain"}], reviews=[("reviewer", "APPROVED", HEAD_A)]), "")
+        self.world.tick(sb.PR_FACTS_TTL + 1)
+        (again,) = [d for d in self.rows() if d["number"] == 30]
+        self.assertEqual(again["id"], "pr:api#30", "the same id with a notice: one row, not two")
+
+    def test_s6_an_excluded_and_an_unwatched_repository_add_no_row_and_no_read_is_made(self):
+        self.engine.config["excluded_repos"] = ["acme/secret"]
+        self.lists(self.pr(40, "merge-captain"), repo="acme/secret")
+        self.lists(self.pr(41, "merge-captain"), repo="elsewhere/unwatched")
+        before = len(self.reads)
+        self.assertEqual([d for d in self.rows() if d["number"] in (40, 41)], [])
+        self.assertEqual(len(self.reads), before, "no gh read is made for them")
+
+    def test_u2_the_rows_cost_no_read_of_their_own(self):
+        self.lists(*[self.pr(200 + n, "merge-captain") for n in range(20)])
+        before = len(self.reads)
+        rows = [d for d in self.rows() if 200 <= d["number"] < 220]
+        self.assertEqual(len(rows), 20)
+        self.assertEqual(len(self.reads), before, "20 held pull requests, 0 reads of their own")
+
+    def test_a_pr_with_only_a_merge_automatic_label_is_not_held(self):
+        self.lists(self.pr(50, "merge-automatic"))
+        self.assertEqual([d for d in self.rows() if d["number"] == 50], [])
+
+    def test_no_list_no_rows_and_a_command_engine_adds_none(self):
+        self.engine.__dict__.pop("ci_record_state", None)
+        self.assertEqual([d for d in self.rows() if d["number"] >= 8], [])
+
+
 class TestPrExplainer(DecisionsBase):
     """#179 slice L6: the explainer block (a before and after why part on every PR; for a captain PR the infographic first), printed by a read-only
     command and put in a description ONCE. The Mermaid check is against the SUBSET this command writes, not Mermaid's own parser."""
