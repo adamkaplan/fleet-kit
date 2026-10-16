@@ -2691,7 +2691,7 @@ class TestDeliver(Base):
         self.assertEqual((admitted["resume"], admitted["delivery"]), (True, "queue"))
         self.assertEqual(admitted["id"], sb.derive_message_id(sid, ["lab.fact:1", "lab.fact:2"]))
         self.assertEqual(admitted["from"], "switchboard")
-        self.assertTrue(admitted["text"].startswith("[switchboard] 2 for platform: First"))
+        self.assertRegex(admitted["text"].splitlines()[0], r"^\[switchboard\] 2 for platform \(sent \d\d:\d\dZ(-\d\d:\d\dZ)?, delivered \d\d:\d\dZ\): First")
         intent, result = [e for e in self.world.audit() if e["event"] == "v2.synthetic"]
         self.assertEqual((intent["phase"], result["phase"], result["ok"]), ("intent", "result", True))
         self.assertEqual(intent["detail"]["message_id"], admitted["id"])
@@ -57144,7 +57144,7 @@ class TestAgentCredentialsDoc(unittest.TestCase):
 # #583: a message says when it was sent and delivered; a newer send replaces older waiting ones (marked, kept); the pane warning is
 # only for a real mismatch; a launch goes to the caller's own workspace.
 # ======================================================================
-def _utc(hour, minute, second=0):
+def _clock_at(hour, minute, second=0):
     return calendar.timegm((2027, 1, 15, hour, minute, second))
 
 
@@ -57154,18 +57154,18 @@ class TestMessageTimes(unittest.TestCase):
                 for n, (created, sender, issue, repo) in enumerate(rows)]
 
     def test_s1_the_header_says_when_it_was_sent_and_when_it_is_delivered(self):
-        text, _ = sb.compose("platform", [fact("a", _utc(14, 2, 10), summary="First")], delivered=_utc(14, 5, 30))
+        text, _ = sb.compose("platform", [fact("a", _clock_at(14, 2, 10), summary="First")], delivered=_clock_at(14, 5, 30))
         self.assertIn("sent 14:02Z, delivered 14:05Z", text.splitlines()[0])
 
     def test_a_batch_header_gives_the_range_and_no_delivery_time_means_none_in_the_header(self):
-        text, _ = sb.compose("platform", [fact("a", _utc(14, 0)), fact("b", _utc(14, 4))], delivered=_utc(14, 5))
+        text, _ = sb.compose("platform", [fact("a", _clock_at(14, 0)), fact("b", _clock_at(14, 4))], delivered=_clock_at(14, 5))
         self.assertIn("sent 14:00Z-14:04Z, delivered 14:05Z", text.splitlines()[0])
-        plain, _ = sb.compose("platform", [fact("a", _utc(14, 0))])
+        plain, _ = sb.compose("platform", [fact("a", _clock_at(14, 0))])
         self.assertEqual(plain.splitlines()[0], "[switchboard] 1 for platform: s a")
 
     def test_s2_a_newer_send_from_the_same_sender_about_the_same_issue_marks_the_older_one_and_keeps_both(self):
-        facts = self.sends((_utc(14, 0), "coder", 7, "acme/api"), (_utc(14, 4), "coder", 7, "acme/api"))
-        text, carried = sb.compose("platform", facts, delivered=_utc(14, 5))
+        facts = self.sends((_clock_at(14, 0), "coder", 7, "acme/api"), (_clock_at(14, 4), "coder", 7, "acme/api"))
+        text, carried = sb.compose("platform", facts, delivered=_clock_at(14, 5))
         lines = [l for l in text.splitlines() if l.startswith("- send from")]
         self.assertEqual(len(lines), 2)
         self.assertIn("superseded", lines[0])
@@ -57175,25 +57175,25 @@ class TestMessageTimes(unittest.TestCase):
         self.assertEqual([f.key for f in carried], ["k0", "k1"], "both keys are carried, so both are acknowledged")
 
     def test_s3_another_sender_or_another_issue_or_repo_is_never_superseded(self):
-        for rows in (((_utc(14, 0), "coder", 7, "acme/api"), (_utc(14, 4), "other", 7, "acme/api")),
-                     ((_utc(14, 0), "coder", 7, "acme/api"), (_utc(14, 4), "coder", 8, "acme/api")),
-                     ((_utc(14, 0), "coder", 7, "acme/api"), (_utc(14, 4), "coder", 7, "acme/web")),
-                     ((_utc(14, 0), "coder", None, None), (_utc(14, 4), "coder", None, None))):
+        for rows in (((_clock_at(14, 0), "coder", 7, "acme/api"), (_clock_at(14, 4), "other", 7, "acme/api")),
+                     ((_clock_at(14, 0), "coder", 7, "acme/api"), (_clock_at(14, 4), "coder", 8, "acme/api")),
+                     ((_clock_at(14, 0), "coder", 7, "acme/api"), (_clock_at(14, 4), "coder", 7, "acme/web")),
+                     ((_clock_at(14, 0), "coder", None, None), (_clock_at(14, 4), "coder", None, None))):
             with self.subTest(rows=rows):
-                text, carried = sb.compose("platform", self.sends(*rows), delivered=_utc(14, 5))
+                text, carried = sb.compose("platform", self.sends(*rows), delivered=_clock_at(14, 5))
                 self.assertEqual(text.count("superseded"), 0)
                 self.assertEqual(len(carried), 2)
 
     def test_s5_only_the_pending_facts_are_looked_at_so_a_delivered_message_is_never_marked(self):
-        text, carried = sb.compose("platform", self.sends((_utc(14, 4), "coder", 7, "acme/api")), delivered=_utc(14, 5))   # the older one was delivered: not pending
+        text, carried = sb.compose("platform", self.sends((_clock_at(14, 4), "coder", 7, "acme/api")), delivered=_clock_at(14, 5))   # the older one was delivered: not pending
         self.assertEqual((text.count("- send from"), text.count("superseded")), (1, 0))
 
     def test_no_message_is_lost_n_in_is_n_out_with_every_text_and_key_visible(self):   # the no-loss property of the marker
-        rows = [(_utc(14, n), sender, issue, repo) for n, (sender, issue, repo) in enumerate(
+        rows = [(_clock_at(14, n), sender, issue, repo) for n, (sender, issue, repo) in enumerate(
             [("coder", 7, "acme/api"), ("coder", 7, "acme/api"), ("other", 7, "acme/api"), ("coder", 8, "acme/api"), ("coder", 7, "acme/api"),
              ("other", 7, "acme/api"), ("coder", None, None), ("coder", 7, "acme/web")])]
         facts = self.sends(*rows)
-        text, carried = sb.compose("platform", facts, delivered=_utc(14, 30))
+        text, carried = sb.compose("platform", facts, delivered=_clock_at(14, 30))
         self.assertEqual([f.key for f in carried], [f.key for f in facts])
         self.assertEqual(text.count("- send from"), len(facts))
         for number in range(len(facts)):
@@ -57201,8 +57201,8 @@ class TestMessageTimes(unittest.TestCase):
         self.assertEqual(text.count("superseded"), 3, "k0 and k1 (by k4) and k2 (by k5) only")
 
     def test_three_sends_mark_the_two_older_ones_only(self):
-        text, _ = sb.compose("platform", self.sends((_utc(14, 0), "coder", 7, "acme/api"), (_utc(14, 2), "coder", 7, "acme/api"),
-                                                    (_utc(14, 4), "coder", 7, "acme/api")), delivered=_utc(14, 5))
+        text, _ = sb.compose("platform", self.sends((_clock_at(14, 0), "coder", 7, "acme/api"), (_clock_at(14, 2), "coder", 7, "acme/api"),
+                                                    (_clock_at(14, 4), "coder", 7, "acme/api")), delivered=_clock_at(14, 5))
         self.assertEqual([("superseded" in l) for l in text.splitlines() if l.startswith("- send from")], [True, True, False])
 
 
