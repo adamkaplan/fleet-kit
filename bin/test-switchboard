@@ -26771,6 +26771,53 @@ class TestImpactFloorOwnerDecision(LedgerBase):
             self.assertEqual(what in ("add", "held", "cleared"), shown["owner_decision"] == "hold", "the daemon's plan %s agrees with the command's %s for %s" % (what, shown["owner_decision"], paths))
             self.assertEqual(shown["owner_decision"], {"shims/gh": "hold", ".github/workflows/ci.yml": "hold", "api/routes/users.py": "second-review", "agents/opencode/coder.md": "second-review"}.get(paths[0], "none"), paths)
 
+    def cut(self, *paths, total=3000):
+        self.pr.update({"changedFiles": total, "files": [{"path": p, "additions": 1, "deletions": 0} for p in paths]})
+
+    def test_a_complete_list_says_how_many_files_were_read_in_the_headline(self):
+        self.files("docs/switchboard.md", "docs/plan-template.md")
+        out = self.floor()
+        self.assertIn("not held, 2 files read (advisory: nothing is written)", out)
+        self.assertNotIn("CANNOT TELL", out)
+
+    def test_a_cut_list_in_a_repo_with_no_floor_globs_never_reads_as_not_held(self):
+        self.extra_config = {"plan_gates": {"repos": {"acme/app": {"mode": "shadow"}}}}   # no impact_floor globs for the repo
+        self.configure()
+        self.cut(*["docs/f%d.md" % n for n in range(100)])
+        out = self.floor()
+        self.assertIn("CANNOT TELL: only 100 of 3000 files were read", out)
+        self.assertIn("(the daemon's decision for the files it read: not held)", out, "the daemon's own answer, printed as it is")
+        self.assertIn("this is not a verdict of \"not held\"", out)
+        self.assertNotIn("not held, ", out.split("\n")[0])
+        shown = json.loads(self.floor("--json"))
+        self.assertEqual((shown["owner_decision"], shown["complete"], shown["files_read"], shown["files_total"]), ("none", False, 100, 3000))
+
+    def test_a_cut_list_with_a_top_tier_path_among_the_files_read_is_a_hold(self):
+        self.cut("shims/gh", *["docs/f%d.md" % n for n in range(99)])
+        out = self.floor()
+        self.assertIn("HOLD for the owner, 100 files read", out.split("\n")[0])
+        self.assertNotIn("CANNOT TELL", out)
+
+    def test_a_cut_list_in_a_repo_with_floor_globs_is_held_on_purpose_as_the_daemon_holds_it(self):
+        self.cut(*["docs/f%d.md" % n for n in range(100)])   # the repo of this class has floor globs
+        out = self.floor()
+        self.assertIn("HOLD for the owner, 100 files read", out.split("\n")[0])
+        self.assertIn("floor unknown: GitHub listed 100 of 3000", out)
+
+    def test_the_cut_list_fixtures_equal_what_the_daemon_decides_too(self):
+        for globs in (True, False):
+            self.extra_config = dict(FLOOR_CONFIG, plan_gates={"repos": {"acme/app": {"mode": "shadow"}}}) if globs else {"plan_gates": {"repos": {"acme/app": {"mode": "shadow"}}}}
+            self.configure()
+            self.cut("docs/a.md", *["docs/f%d.md" % n for n in range(99)])
+            shown = json.loads(self.floor("--json"))
+            engine = self.world.new_engine("daemon")
+            engine.gh_runner = self.route
+            engine.config, engine.state_dir = sb.load_config(), self.world.state
+            report = sb.pr_floor_report(engine, "acme/app", 9)
+            what, _ = sb.impact_plan(engine, report, [], sb.read_impact_state(self.world.state)[0], {}, None)
+            self.assertEqual((shown["owner_decision"], shown["owner_reasons"]), (report["owner_decision"], report["owner_reasons"]), globs)
+            self.assertEqual(what in ("add", "held", "cleared"), shown["owner_decision"] == "hold", (globs, what))
+
     def test_s4_a_rule_file_that_cannot_be_read_is_held_on_purpose_with_the_reason_and_nothing_is_written(self):
         self.files("docs/switchboard.md")
 
@@ -26823,7 +26870,7 @@ class TestImpactFloorCommandAndPass(LedgerBase):
         self.assertEqual(self.ledger(), [])
         self.assertEqual([e for e in self.world.audit() if e["event"].startswith(("gate.", "plan."))], [])
         code, out, err = self.run_as("coder", "impact", "floor", self.PR)
-        self.assertIn("HOLD for the owner (advisory: nothing is written)", out)   # #553: the headline is the owner decision (was "HOLD (advisory...")
+        self.assertIn("HOLD for the owner, 2 files read (advisory: nothing is written)", out)   # #553: the headline is the owner decision and the files read (was "HOLD (advisory...")
 
     def test_a_huge_change_outside_the_floor_does_not_hold_and_a_rating_can_add_one(self):
         self.pr.update({"changedFiles": 1, "files": [{"path": "src/app.py", "additions": 100000, "deletions": 100000}]})

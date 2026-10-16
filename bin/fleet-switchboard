@@ -18519,7 +18519,7 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
         if review:
             decision = "hold"
     return {"pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude,
-            "floor_paths": hit, "files_read": len(files), "complete": complete, "unknown": unknown, "rated": [list(r) for r in rated],
+            "floor_paths": hit, "files_read": len(files), "files_total": total, "complete": complete, "unknown": unknown, "rated": [list(r) for r in rated],
             "decision": decision, "reasons": reasons, "owner_decision": owner[0], "owner_reasons": owner[1], "draft": raw.get("isDraft") is True}
 
 
@@ -18568,11 +18568,20 @@ def cmd_impact_floor(args, runner, now):
     else:
         owner = report.get("owner_decision")
         words = {"hold": "HOLD for the owner", "second-review": "not held for the owner: a second independent review", "none": "not held"}.get(owner, "HELD ON PURPOSE (unknown decision %r)" % (owner,))
-        print("impact floor for %s at %s: %s (advisory: nothing is written)" % (report["pr"], (report["head"] or "unknown head")[:8], words))
+        read, total = report.get("files_read"), report.get("files_total")
+        counted = "%s file%s read" % (read, "" if read == 1 else "s") if isinstance(read, int) else "files read unknown"
+        cut = report.get("complete") is False
+        if cut and owner != "hold":   # the daemon's own answer for a list it could not read in full is printed as it is, and said to be no verdict: a cut list never reads as "not held"
+            print("impact floor for %s at %s: CANNOT TELL: only %s of %s files were read (the daemon's decision for the files it read: %s) (advisory: nothing is written)" % (
+                report["pr"], (report["head"] or "unknown head")[:8], read, total, words))
+        else:
+            print("impact floor for %s at %s: %s, %s (advisory: nothing is written)" % (report["pr"], (report["head"] or "unknown head")[:8], words, counted))
         for reason in report.get("owner_reasons") or []:
             print("  %s: %s" % ("why" if owner == "hold" else "because", reason))
-        if owner == "none" and not report.get("owner_reasons"):
+        if owner == "none" and not report.get("owner_reasons") and not cut:
             print("  because: no changed path is a top tier path of the matrix, and no independent review or rating holds it")
+        if cut and owner != "hold":
+            print("  incomplete: GitHub gave %s of %s changed files, so a path outside those may be a top tier path; this is not a verdict of \"not held\"" % (read, total))
         print("  path floor (older advisory, not the owner's rule): %s" % report["decision"].upper().replace("-", " "))
         for reason in report["reasons"]:
             print("  %s" % reason)
