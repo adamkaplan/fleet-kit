@@ -957,7 +957,10 @@ class TestStopAndStatus(Base):
         cloud = self.state / "cloud"
         self.main("status")   # makes the private state directory
         os.makedirs(str(cloud), mode=0o700, exist_ok=True)
-        (cloud / "coder7.launching").write_text(str(os.getpid()))   # another command of this user is launching that name right now
+        import fcntl
+        held = open(str(cloud / "coder7.launching"), "w")   # another live command of this user is launching that name right now: it holds the lock
+        self.addCleanup(held.close)
+        fcntl.flock(held, fcntl.LOCK_EX)
         code, out, err = self.launch()
         self.assertEqual(code, 1)
         self.assertIn("being launched", err)
@@ -968,15 +971,14 @@ class TestStopAndStatus(Base):
         self.assertEqual(code, 1)
         self.assertIn("being launched", err)
 
-    def test_a_reservation_of_a_dead_command_does_not_hold_the_name(self):
-        cloud = self.state / "cloud"
+    def test_a_leftover_reservation_file_that_nobody_holds_does_not_hold_the_name(self):
         self.main("status")   # makes the private state directory
+        cloud = self.state / "cloud"
         os.makedirs(str(cloud), mode=0o700, exist_ok=True)
-        dead = subprocess.Popen([sys.executable, "-c", "pass"])
-        dead.wait()
-        (cloud / "coder7.launching").write_text(str(dead.pid))
+        (cloud / "coder7.launching").write_text("")   # empty, or from a killed command: nothing holds its lock
         self.assertEqual(self.launch()[0], 0)
-        self.assertFalse((cloud / "coder7.launching").exists())
+        self.assertEqual(self.launch()[0], 1)   # the second is refused for the record, and the reservation was released
+        self.assertFalse(sb.load_module("cloud_worker").bind(sb.__dict__)._reserved("coder7"))
 
     def test_status_mints_no_token_for_a_worker_past_its_hard_deadline(self):
         self.assertEqual(self.launch()[0], 0)

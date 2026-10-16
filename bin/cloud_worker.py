@@ -14,6 +14,7 @@ before a byte is sent.
 import base64
 import contextlib
 import datetime
+import fcntl
 import http.client
 import importlib.util
 import json
@@ -192,45 +193,41 @@ def list_records(state):
 
 
 def _reserved(name):
-    """True when another live command of this user is launching `name` right now (a `NAME.launching` file with its pid; a dead pid's is stale)."""
+    """True when another live command is launching `name` right now: its `NAME.launching` file is flock-ed. A leftover file nobody holds (a command
+    that was killed: the kernel released its lock) means nothing."""
     path = H["state_dir_path"]() / CLOUD_DIR / (name + ".launching")
     try:
-        pid = int(path.read_text().strip())
-        os.kill(pid, 0)
-    except (OSError, ValueError):
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
         return False
-    return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        return False
+    except OSError:
+        return True   # held by a live command
+    finally:
+        os.close(fd)
 
 
 @contextlib.contextmanager
 def reservation(state, name):
-    """Holds the name for the length of a `launch --cloud`: O_EXCL, so two launches of one name (or a local launch meanwhile, see
-    refuse_local_launch) cannot both pass the checks and then both create."""
+    """Holds the name for the length of a `launch --cloud` with an flock on `cloud/NAME.launching`, so two launches of one name (or a local launch
+    meanwhile, see refuse_local_launch) cannot both pass the checks and then both create. A lock dies with its process, so a killed command never
+    holds a name, and the file is never read or unlinked (nothing to race on). A refusal here is intended: the name is taken."""
     path = cloud_dir(state) / (name + ".launching")
-    for _ in range(2):
-        try:
-            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            break
-        except FileExistsError:
-            if _reserved(name):
-                raise CloudError("%s is being launched by another command right now; nothing was created" % name) from None
-            try:
-                path.unlink()   # a dead command's reservation
-            except OSError:
-                pass
-    else:
-        raise CloudError("%s is being launched by another command right now; nothing was created" % name)
     try:
-        os.write(fd, str(os.getpid()).encode())
-    finally:
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as err:
+        raise CloudError("the launch reservation of %s cannot be made (%s); nothing was created" % (name, err.strerror or err)) from None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
         os.close(fd)
+        raise CloudError("%s is being launched by another command right now; nothing was created" % name) from None
     try:
         yield
     finally:
-        try:
-            path.unlink()
-        except OSError:
-            pass
+        os.close(fd)   # releases the lock
 
 
 def refuse_local_launch(name):
