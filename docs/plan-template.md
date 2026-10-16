@@ -56,6 +56,8 @@ scenarios:
 
 Optional keys: `claim`, `slice`, `phase`. Anything else is rejected.
 
+**A scenario the tester can only prove after the merge is not claimed by a slice pull request (#579).** With NO `claim` written, a scenario whose evaluator is the tester and whose proof is a `measure` is read by G1 as `claim: epic`: a slice pull request is not asked to prove it, and G1 lists it as `epic-claimed, proven after the merge at the integration head`. Write `claim: pr` to have a pull request claim it anyway; `claim: epic` stays epic. Every other scenario with no claim is `pr`, as before. The plan's own text decides: the plan hash is unchanged (the canonical text has always read an unwritten claim as `pr`; only G1's reading changes), and `plan check` still requires the scenario's id, text, pass and discriminates.
+
 **Owner evaluators are rare.** Name `owner` as an evaluator only where the owner's own eyes are the test (how an infographic looks, an access grant), and give such a scenario `claim: epic` so it is proven once at the epic's integrated head; a routine pull request never waits on the owner. Give each slice's pull request its own light plan (its per-PR scenarios, `claim: pr`, evaluators `ci`, `tester` or `reviewer`), linked by a `PLAN:` first line in the PR body.
 
 ### What `plan check` enforces
