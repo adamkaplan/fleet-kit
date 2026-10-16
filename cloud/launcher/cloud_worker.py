@@ -289,8 +289,24 @@ class Kube:
             raise CloudError("kubectl %s: %s" % (args[0], self.scrub(last)))
         return p.stdout  # a caller that renders it passes it through scrub() first
 
+    @staticmethod
+    def _exists(e, what):
+        """kubectl said AlreadyExists: the object is another caller's, this call made nothing."""
+        if "AlreadyExists" in str(e):
+            return CloudError("%s already exists" % what, EXIT_EXISTS)
+        return e
+
     def apply(self, obj):
-        self.run(["apply", "-f", "-"], stdin=json.dumps(obj))
+        """Make ONE object, exclusively (`kubectl create`, atomic: of two callers exactly one succeeds; `apply` would
+        replace the other's). The name is kept for the callers that patch it."""
+        try:
+            self.run(["create", "-f", "-"], stdin=json.dumps(obj))
+        except CloudError as e:
+            raise self._exists(e, "%s %s" % (obj["kind"], obj["metadata"]["name"])) from None
+
+    def get_secret(self, full_name):
+        out = self.run(["get", "secret", full_name, "-o", "json"], ok_missing=True)
+        return json.loads(out) if out else None
 
     def get_pod(self, name):
         out = self.run(["get", "pod", name, "-o", "json"], ok_missing=True)
@@ -333,11 +349,21 @@ class Kube:
         for the keys after the first), never into an argument."""
         items = sorted(values.items())
         key, val = items[0]
-        self.run(["create", "secret", "generic", name + "-run", "--from-file=%s=/dev/stdin" % key], stdin=val)
-        for key, val in items[1:]:
-            body = json.dumps({"data": {key: base64.b64encode(val.encode()).decode()}})
-            self.run(["patch", "secret", name + "-run", "--type=merge", "--patch-file=/dev/stdin"], stdin=body)
-        self.run(["label", "secret", name + "-run", "cw/pod=" + pod] + (["cw/run-id=" + run_id] if run_id else []))
+        try:
+            self.run(["create", "secret", "generic", name + "-run", "--from-file=%s=/dev/stdin" % key], stdin=val)
+        except CloudError as e:
+            raise self._exists(e, "Secret " + name + "-run") from None
+        try:   # the Secret exists and is ours (the create is exclusive): it must never be left without its label
+            for key, val in items[1:]:
+                body = json.dumps({"data": {key: base64.b64encode(val.encode()).decode()}})
+                self.run(["patch", "secret", name + "-run", "--type=merge", "--patch-file=/dev/stdin"], stdin=body)
+            self.run(["label", "secret", name + "-run", "cw/pod=" + pod] + (["cw/run-id=" + run_id] if run_id else []))
+        except BaseException:
+            try:
+                self.delete_run_secret(name)
+            except CloudError:
+                pass   # the launcher's cleanup finds it unlabelled and says it REMAINS
+            raise
 
     def exec(self, name, *cmd, keep_stdout=False):
         return self.run(["exec", name, "--"] + list(cmd), keep_stdout=keep_stdout)
@@ -432,6 +458,7 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
 class Launcher:
     def __init__(self, kube, env, clock=None, sleep=time.sleep):
         self.kube, self.env, self.sleep = kube, env, sleep
+        self.run_id, self.foreign = None, []
         self.clock = clock or (lambda: dt.datetime.now(dt.timezone.utc))
         self.audit_path = env.get("CW_CLOUD_AUDIT") or os.path.join(
             env.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "cw-cloud", "audit.jsonl")
@@ -493,6 +520,7 @@ class Launcher:
     # -- create --
     def create(self, a):
         worker, name = a.worker, pod_name(a.worker)
+        self.run_id, self.foreign = getattr(a, "run_id", None), []   # what this call proved is another's is never deleted
         made = {"secret": False, "run": False, "pod": False}  # set before the call that may create it: an interrupt may land after
 
         def go(info):
@@ -517,16 +545,13 @@ class Launcher:
                 raise CloudError("worker %s already exists" % worker, EXIT_EXISTS)
             password = secrets.token_urlsafe(32)
             self.kube.add_secrets(password)
-            # Single operator assumed: the check above and the applies below are not one atomic step.
+            # The check above is not atomic with the creates below; each create is (AlreadyExists fails exactly one of two callers).
             try:
-                made["secret"] = True
-                self.kube.apply({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": name + "-pw", "labels": dict({"app": LABEL}, **({"cw/run-id": a.run_id} if getattr(a, "run_id", None) else {}))},
+                self._make(made, "secret", self.kube.apply, {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": name + "-pw", "labels": dict({"app": LABEL}, **({"cw/run-id": a.run_id} if getattr(a, "run_id", None) else {}))},
                                  "type": "Opaque", "stringData": {"password": password}})
                 if run_values:
-                    made["run"] = True
-                    self.kube.create_run_secret(name, name, run_values, *([a.run_id] if getattr(a, "run_id", None) else []))
-                made["pod"] = True
-                self.kube.apply(spec)
+                    self._make(made, "run", self.kube.create_run_secret, name, name, run_values, *([a.run_id] if getattr(a, "run_id", None) else []))
+                self._make(made, "pod", self.kube.apply, spec)
                 self._wait_ready(name, a.wait)
                 if a.password_fd is not None:
                     with os.fdopen(os.dup(a.password_fd), "w") as f:
@@ -566,6 +591,29 @@ class Launcher:
         for s, h in old.items():
             signal.signal(s, h)
 
+    def _make(self, made, kind, fn, *args):
+        """The flag is set BEFORE the call (an interrupt may land after the object exists); AlreadyExists means it is not
+        ours, so the flag is taken back and nothing of it is ever deleted by this call."""
+        made[kind] = True
+        try:
+            fn(*args)
+        except CloudError as e:
+            if e.code == EXIT_EXISTS:
+                made[kind] = False
+            raise
+
+    def _mine(self, kind, name):
+        """True: carries this call's run id; False: another's (leave whole); None: not there; raises CloudError: unreadable."""
+        if not self.run_id:
+            return True   # a caller that sent no --run-id gets the plain behaviour
+        if kind == "pod":
+            obj, where = self.kube.get_pod(name), "annotations"
+        else:
+            obj, where = self.kube.get_secret(name + ("-pw" if kind == "secret" else "-run")), "labels"
+        if not obj:
+            return None
+        return ((obj.get("metadata") or {}).get(where) or {}).get("cw/run-id") == self.run_id
+
     def _cleanup(self, name, made):
         """Delete what create made, each on its own so one failure does not skip the other. Returns what REMAINS."""
         old = {}
@@ -579,7 +627,12 @@ class Launcher:
                                   ("run", self.kube.delete_run_secret, "secret/%s-run" % name)):
                 if made[kind]:
                     try:
-                        fn(name)
+                        mine = self._mine(kind, name)
+                        if mine is False:
+                            self.foreign.append(label)
+                            print("cloud-worker: %s is not this call's (its run id does not match); left whole" % label, file=sys.stderr)
+                        elif mine:
+                            fn(name)
                     except CloudError:
                         left.append(label)
         finally:
@@ -597,6 +650,8 @@ class Launcher:
         if not made["run"]:
             return ""
         label = "secret/%s-run" % name
+        if label in self.foreign:
+            return "create failed; per-run secret %s-run is not this call's and was left whole" % name
         if label in left:
             return "create failed; per-run secret %s-run REMAINS: delete it with: %s" % (name, self.kube.delete_command("secret", name + "-run"))
         return "create failed; per-run secret %s-run cleaned" % name
@@ -604,7 +659,7 @@ class Launcher:
     def _abort(self, worker, name, made, exc):
         interrupted = isinstance(exc, (Interrupted, KeyboardInterrupt))
         left = self._cleanup(name, made)
-        cleaned = [l for k, l in (("pod", "pod/" + name), ("secret", "secret/%s-pw" % name), ("run", "secret/%s-run" % name)) if made[k] and l not in left]
+        cleaned = [l for k, l in (("pod", "pod/" + name), ("secret", "secret/%s-pw" % name), ("run", "secret/%s-run" % name)) if made[k] and l not in left and l not in self.foreign]
         reason = "%s; cleaned: %s" % ("interrupted" if interrupted else "failed: %s" % str(exc)[:200], ", ".join(cleaned) or "nothing")
         if left:
             reason += "; REMAINS: %s; delete each with: %s" % (", ".join(left), "; ".join(self._delete_cmd(l) for l in left))
