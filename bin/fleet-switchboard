@@ -12407,8 +12407,8 @@ def triage_refresh_ownerless(engine, state, cfg, now, budget, seconds):
             state.units[(repo, "ownerless")] = {"at": now, "data": records, "truncated": cut, "total": total, "error": None}
         except GitHubUnavailable as err:
             budget[0] -= 1
-            if (repo, "ownerless") in state.units:
-                state.units[(repo, "ownerless")].update(error=_one_line(str(err), 160))
+            if (repo, "ownerless") in state.units:   # it was read before: a failed refresh keeps the old copy and tries again after the usual wait
+                state.units[(repo, "ownerless")].update(at=now, error=_one_line(str(err), 160))
             else:
                 state.units[(repo, "ownerless")] = {"at": now - TRIAGE_TTL + 60, "data": [], "truncated": False, "total": None, "error": _one_line(str(err), 160), "empty": True}
 

@@ -23616,7 +23616,6 @@ class TestOwnerlessSummary(Base):
         self.assertIn("read 250 of 250 open item(s)", self.lines("cos")[0])
         self.hub.open[self.TEAM] = {}
         self.hub.open_total[self.TEAM] = 731
-        self.world.admitted.clear() if hasattr(self.world, "admitted") else None
         for n in range(20, 751):
             self.add(n, created=10, author="alice")
         self.engine.state_dir.joinpath(sb.OWNERLESS_FILE).unlink()
@@ -23638,7 +23637,6 @@ class TestOwnerlessSummary(Base):
     def test_s5_the_orchestrators_of_the_repository_and_the_chief_of_staff_get_it_and_a_repository_with_none_only_the_chief(self):
         self.add(1, created=10, author="alice")
         self.add(2, repo="acme/api", created=10, author="alice")
-        self.world.agents_removed = None
         self.go()
         self.assertEqual((len(self.lines("orch-web-1")), len(self.lines("orch-web-2"))), (1, 1))
         self.assertEqual(len(self.lines("cos")), 2, "one line per repository")
@@ -23659,6 +23657,82 @@ class TestOwnerlessSummary(Base):
         text = "\n".join(sb.triage_status_lines(dict(sb.TRIAGE_DEFAULTS, **{"enabled": True, "counts": {}, "total": 0, "at": "2026-01-01T00:00:00Z"}, **info)))
         self.assertIn("not checked for acme/web: 12 call budget, 6 failed read, 3 not read yet (15 of them other-owner flags); oldest unchecked for 6 hour(s)", text)
         self.assertIn("21 finding(s) not checked this pass", text, "the older line is unchanged")
+
+    def test_the_line_goes_out_again_after_a_day_and_not_just_under_one(self):
+        self.add(1, created=10, author="alice")
+        self.go(2)
+        self.assertEqual(len(self.lines("cos")), 1)
+        state = sb.triage_state(self.engine)
+        self.world.tick(86400 - 4 * 3600)
+        state.units.pop((self.TEAM, "ownerless"), None)
+        sb.triage_pass(self.engine, [], self.world.clock.now(), ())
+        self.assertEqual(len(self.lines("cos")), 1, "just under a day: nothing")
+        self.world.tick(5 * 3600)
+        state.units.pop((self.TEAM, "ownerless"), None)
+        sb.triage_pass(self.engine, [], self.world.clock.now(), ())
+        self.assertEqual(len(self.lines("cos")), 2, "a day later: the next line")
+
+    def test_a_repository_with_no_orchestrator_tells_only_the_chief_of_staff(self):
+        self.engine.config["triage"]["ownerless"]["repos"] = [self.TEAM, "acme/solo"]
+        self.engine.config["triage"]["repos"] = ["acme/api", self.TEAM, "acme/solo"]
+        self.hub.open["acme/solo"] = {}
+        self.add(1, repo="acme/solo", created=10, author="alice")
+        self.go()
+        (line,) = self.lines("cos")
+        self.assertIn("ownerless in acme/solo", line)
+        for name in ("orch-web-1", "orch-web-2", "orch-api"):
+            self.assertEqual(self.lines(name), [], name)
+
+    def test_a_failed_count_on_a_cut_list_says_an_unknown_number_and_an_unreadable_repository_keeps_the_old_copy(self):
+        for n in range(20, 170):
+            self.add(n, created=10, author="alice")
+        self.engine.config["triage"]["ownerless"]["limit"] = 100
+        self.hub.open_issues_count = lambda repo: (_ for _ in ()).throw(sb.GitHubUnavailable("HTTP 502"))
+        self.go(1)
+        self.assertIn("read 100 of an unknown number open item(s)", self.lines("cos")[0])
+        self.hub.unreadable.add(self.TEAM)
+        state = sb.triage_state(self.engine)
+        before = len(self.lines("cos"))
+        state.units[(self.TEAM, "ownerless")]["at"] = 0
+        self.go(2)
+        self.assertEqual(len(self.lines("cos")), before, "an unreadable repository keeps the old copy and adds no line")
+        self.assertEqual(len(state.units[(self.TEAM, "ownerless")]["data"]), 100)
+        self.assertTrue(state.units[(self.TEAM, "ownerless")]["error"])
+
+    def test_a_send_that_fails_is_audited_and_the_day_is_not_retried(self):
+        self.add(1, created=10, author="alice")
+        real = self.engine.send
+
+        def broken(sender, recipient, text, **kw):
+            raise RuntimeError("herdr is down")
+        self.engine.send = broken
+        self.go(3)
+        failed = [e for e in self.world.audit() if e["event"] == "triage.ownerless_send_failed"]
+        self.assertTrue(failed)
+        self.engine.send = real
+        self.go(3)
+        self.assertEqual(self.lines("cos"), [], "the mark was written before the send: no second try the same day")
+
+    def test_the_pass_itself_says_why_findings_were_not_checked_per_repository(self):
+        for n in range(20, 40):
+            self.add(n, created=5, author="bot")   # ours, no assignee: T1 candidates that need a fresh read each
+        self.engine.config["triage"]["calls_per_pass"] = 6
+        self.hub.live[self.TEAM] = {}
+        self.go(1)
+        why = sb.triage_state(self.engine).current.get("unchecked_why") or {}
+        self.assertIn(self.TEAM, why)
+        reasons = why[self.TEAM]["reasons"]
+        self.assertTrue(set(reasons) <= {"call budget", "failed read", "not read yet"} and reasons, reasons)
+        self.assertGreater(why[self.TEAM]["oldest_seconds"], -1)
+
+    def test_t1_fires_and_stays_silent_in_the_same_cases_has_owner_decides(self):
+        module = sb.load_module("triage_ownerless")
+        now = self.world.clock.now()
+        items = {n: sb.triage_norm(tri_issue(now, n, created=5, author="alice", assignees=["bob"] if n == 31 else (), body="Owner: carol" if n == 32 else "")) for n in (30, 31, 32)}
+        ctx = {"chain": set(), "owned": set(), "unresolved": set(), "charters": set(), "asks": set()}
+        for number, item in items.items():
+            found, _ours = sb.triage_rules(item, [], ctx, sb.triage_sla(self.engine.config["triage"], self.TEAM), now, ["bot"], [], set())
+            self.assertEqual("T1" in found, not module.has_owner(item, ctx), number)
 
     def test_the_default_is_off_and_a_bad_setting_is_refused(self):
         self.engine.config["triage"]["ownerless"] = None
