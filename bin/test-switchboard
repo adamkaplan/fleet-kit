@@ -29231,6 +29231,39 @@ class TestPlanCheckRules(unittest.TestCase):
         self.assertIn("uncovered-clause", self.codes(self.edit("id: S2", "id: U2")))  # a U scenario does not cover a clause
         self.assertIn("no-done-when", self.codes(GOOD_PLAN, ""))
 
+    def test_a_refused_evaluator_names_the_evaluators_that_fit_the_proof(self):
+        for proof, evaluator, fitting in (("test", "reviewer", "ci"), ("live", "ci", "tester or owner"),
+                                          ("measure", "ci", "tester or owner"), ("screenshot", "ci", "reviewer or owner")):
+            with self.subTest(proof=proof):
+                text = self.edit("proof: live", "proof: %s" % proof).replace("evaluator: tester", "evaluator: %s" % evaluator, 1)
+                got = self.check(text)
+                self.assertEqual(got["result"], "fail")
+                messages = [d["message"] for d in got["defects"] if d["code"] == "evaluator-mismatch"]
+                self.assertEqual(len(messages), 1)
+                self.assertTrue(messages[0].endswith("the evaluator that fits proof %s is %s" % (proof, fitting)), messages[0])
+
+    def test_the_no_done_when_message_names_the_intent_heading(self):
+        got = self.check(GOOD_PLAN, "")
+        messages = [d["message"] for d in got["defects"] if d["code"] == "no-done-when"]
+        self.assertEqual(got["result"], "fail")
+        self.assertEqual(len(messages), 1)
+        self.assertIn("## Intent", messages[0])
+        self.assertIn("Done when:", messages[0])
+
+    def test_the_skills_carry_the_paper_cut_lines(self):
+        skills = REPO / "skills"
+        coordination = (skills / "fleet-coordination" / "SKILL.md").read_text()
+        block = coordination.split("a push voids proofs):\n\n```text\n", 1)[1].split("```", 1)[0].strip("\n").splitlines()
+        self.assertEqual(len(block), 2)
+        self.assertIn("test_the_role_files_do_not_grow", block[0])
+        self.assertIn("TestHygiene", block[1])
+        planning = (skills / "fleet-planning" / "SKILL.md").read_text()
+        self.assertEqual(planning.count("`## Intent` before `Done when:`"), 1)
+        review = (skills / "fleet-review" / "SKILL.md").read_text()
+        lines = [l for l in review.splitlines() if l.startswith("In a repository with no review laws installed, the ORCHESTRATOR")]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("independent review", review.split(lines[0], 1)[1].split("\n\n", 1)[0])
+
     def test_a_plan_that_opts_in_needs_a_size_in_agent_time_and_one_that_does_not_is_left_alone(self):
         self.assertEqual(self.codes(GOOD_PLAN), [], "a plan written before the rule has no plan-format line and is not flagged")
         self.assertEqual(self.codes("plan-format: 1\n" + GOOD_PLAN), [])

@@ -9,6 +9,9 @@ Make the change work first. Then, in a repository that has review laws (`REVIEW_
 reviewer subagents on your pull request **before you offer it**: `reviewer-code`, `reviewer-architecture`, `reviewer-security`, `reviewer-impact` and `reviewer-test`. Invoke each with the Task
 tool and the pull request reference (`owner/repo#N`); they can run side by side.
 
+In a repository with no review laws installed, the ORCHESTRATOR runs the independent review of your pull request: do not run the five reviewers yourself.
+That means it reads the change against the repository's own standards and records its verdict at the head, as the independent reviewer would.
+
 Two things decide whether the panel can judge at all:
 
 - **Run it from a checkout at the pull request's head.** A subagent reads the working tree of the session that launched it, not the pull request: from another branch it cannot see the files the change touches and answers `verdict: incomplete`. Switch your session to a worktree at the head (and check `git rev-parse HEAD` equals the head you record) before you invoke the reviewers.
