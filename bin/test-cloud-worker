@@ -14,8 +14,10 @@ import io
 import json
 import os
 import stat
+import signal
 import subprocess
 import sys
+import time
 import tempfile
 import threading
 import unittest
@@ -63,6 +65,8 @@ class FakeRemote:
                 expected = "Basic " + base64.b64encode(("opencode:" + outer.password).encode()).decode()
                 if auth != expected:
                     return self._answer(401, {"error": "unauthorized"})
+                if self.command == "GET" and self.path == "/api/info":
+                    return self._answer(200, {"data": {"version": "test"}})
                 if self.command == "POST" and self.path == "/api/session":
                     return self._answer(200, {"data": {"id": "ses_remote1"}})
                 if self.command == "POST" and self.path.endswith("/prompt"):
@@ -91,6 +95,20 @@ argv = sys.argv[1:]
 log = os.environ["STUB_DIR"] + "/calls.log"
 open(log, "a").write(json.dumps(argv) + "\\n")
 command, worker = argv[0], argv[1]
+import hashlib
+tf = os.environ.get("CW_CLOUD_TOKEN_FILE")
+login = {"command": command, "argv": argv, "env": dict(os.environ), "token_ok": bool(tf) and hashlib.sha256(open(tf).read().encode()).hexdigest() == os.environ.get("STUB_TOKEN_SHA"),
+         "token_mode": oct(os.stat(tf).st_mode & 0o777) if tf else None}
+open(os.environ["STUB_DIR"] + "/login.log", "a").write(json.dumps(login) + "\\n")
+if command == "create":
+    for item in argv:
+        if "=" in item and item.split("=")[0] in ("model-auth", "git-token"):
+            fd = int(item.split("=")[1])
+            open(os.environ["STUB_DIR"] + "/received-" + item.split("=")[0], "w").write(os.read(fd, 100000).decode())
+    if os.environ.get("STUB_CREATE_FAIL"):
+        every = [open(os.environ["STUB_DIR"] + "/received-" + n).read() for n in ("model-auth", "git-token")] + [open(tf).read()]
+        sys.stderr.write(" | ".join(every) + "\\n")
+        sys.exit(3)
 if command == "create":
     fd = int(argv[argv.index("--password-fd") + 1])
     os.write(fd, (os.environ["STUB_PASSWORD"] + "\\n").encode())
@@ -108,6 +126,77 @@ elif command == "status":
 """
 
 
+KUBECTL = """#!%(python)s
+import hashlib, json, os, socket, sys, threading
+args = sys.argv[1:]
+d = os.environ["STUB_DIR"]
+kc = args[args.index("--kubeconfig") + 1]
+entry = {"args": args, "kubeconfig_is_dev_fd": kc.startswith("/dev/fd/")}
+if "token" in args and "create" in args:
+    entry["admin_ok"] = hashlib.sha256(open(kc).read().encode()).hexdigest() == os.environ["STUB_ADMIN_SHA"]
+    entry["env_has_token"] = os.environ.get("KUBECONFIG")
+    open(d + "/kubectl.log", "a").write(json.dumps(entry) + "\\n")
+    sys.stdout.write(open(d + "/mint_token").read())
+    sys.exit(0)
+cfg = json.load(open(kc))
+tf = cfg["users"][0]["user"]["tokenFile"]
+entry["token_ok"] = hashlib.sha256(open(tf).read().encode()).hexdigest() == os.environ["STUB_TOKEN_SHA"]
+entry["config_text_has_token"] = open(tf).read() in open(kc).read()
+entry["env"] = dict(os.environ)
+open(d + "/kubectl.log", "a").write(json.dumps(entry) + "\\n")
+if "port-forward" in args:
+    if os.path.exists(d + "/pf_die"):
+        sys.stderr.write("error: " + open(tf).read() + " unauthorized\\n")
+        sys.exit(1)
+    open(d + "/pf.pid", "a").write(str(os.getpid()) + "\\n")
+    if os.path.exists(d + "/pf_hang"):
+        import time
+        time.sleep(600)
+    local = int(args[args.index("port-forward") + 2].split(":")[0])
+    target = int(os.environ["STUB_URL"].rsplit(":", 1)[1])
+    srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", local)); srv.listen(8)
+    def pipe(a, b):
+        try:
+            while True:
+                data = a.recv(65536)
+                if not data:
+                    break
+                b.sendall(data)
+        except OSError:
+            pass
+        finally:
+            for x in (a, b):
+                try:
+                    x.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+    while True:
+        c, _ = srv.accept()
+        u = socket.create_connection(("127.0.0.1", target))
+        threading.Thread(target=pipe, args=(c, u), daemon=True).start()
+        threading.Thread(target=pipe, args=(u, c), daemon=True).start()
+"""
+
+AZ = """#!/bin/sh
+[ -e "$STUB_DIR/vault_down" ] && { echo "vault unreachable" >&2; exit 1; }
+cat "$STUB_DIR/admin_kubeconfig"
+"""
+
+
+def make_jwt(lifetime, issued=None):
+    import time as _t
+    issued = int(_t.time()) if issued is None else issued
+    part = lambda obj: base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip("=")
+    return part({"alg": "none"}) + "." + part({"iat": issued, "exp": issued + lifetime}) + "." + "c2lnbmF0dXJl" * 3
+
+
+CLUSTER_TOKEN = make_jwt(1200)
+ADMIN_KUBECONFIG = "apiVersion: v1\nclusters: []\nusers:\n- name: admin\n  user: {token: ADMINSECRET-q8w7e6r5t4y3}\n"
+MODEL_ENTRY = {"type": "oauth", "refresh": "ghu_ModelRefreshSecret0123456789", "access": "gho_ModelAccessSecret9876543210", "expires": 0}
+GIT_TOKEN = "ghs_GitInstallationTokenAbCdEf0123456789"
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(dir=str(BIN.parent))   # under the worktree, never the shared /tmp
@@ -123,13 +212,32 @@ class Base(unittest.TestCase):
         fake_opencode.chmod(0o755)
         self.remote = FakeRemote(PASSWORD)
         self.addCleanup(self.remote.close)
+        import hashlib
+        for name, body in (("kubectl", KUBECTL % {"python": sys.executable}), ("az", AZ)):
+            (self.stub_dir / name).write_text(body)
+            (self.stub_dir / name).chmod(0o755)
+        (self.stub_dir / "mint_token").write_text(CLUSTER_TOKEN)
+        (self.stub_dir / "admin_kubeconfig").write_text(ADMIN_KUBECONFIG)
+        (self.stub_dir / "git_token").write_text(GIT_TOKEN + "\n")
+        (self.home / "auth.json").write_text(json.dumps({"github-copilot": MODEL_ENTRY, "other": {"key": "must-not-travel"}}))
+        (self.home / "tmp").mkdir()
+        self.root = self.home / "tmp" / ("fleet-cw-%d" % os.getuid())
+        tmpdir = mock.patch.object(tempfile, "tempdir", str(self.home / "tmp"))
+        tmpdir.start()
+        self.addCleanup(tmpdir.stop)
         patcher = mock.patch.dict(os.environ, {
             "HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / "cfg"), "XDG_STATE_HOME": str(self.home / "state"),
-            "PATH": "/usr/bin:/bin", "FLEET_CLOUD_WORKER_BIN": str(self.stub), "STUB_DIR": str(self.stub_dir),
-            "STUB_PASSWORD": PASSWORD, "STUB_URL": self.remote.url, "STUB_STOP_EXIT": "0"})
+            "PATH": "%s:/usr/bin:/bin" % self.stub_dir, "FLEET_CLOUD_WORKER_BIN": str(self.stub), "STUB_DIR": str(self.stub_dir),
+            "STUB_PASSWORD": PASSWORD, "STUB_URL": self.remote.url, "STUB_STOP_EXIT": "0",
+            "CW_ALLOWED_REPOS": "acme-org/widget-service", "CW_CLOUD_SERVER": "https://cluster.example.internal:6443",
+            "CW_KUBECTL": str(self.stub_dir / "kubectl"), "CW_VAULT_SUBSCRIPTION": "sub-example", "CW_VAULT_NAME": "vault-example",
+            "CW_GIT_TOKEN_CMD": "cat %s" % (self.stub_dir / "git_token"), "CW_MODEL_AUTH_FILE": str(self.home / "auth.json"),
+            "STUB_TOKEN_SHA": hashlib.sha256(CLUSTER_TOKEN.encode()).hexdigest(),
+            "STUB_ADMIN_SHA": hashlib.sha256(ADMIN_KUBECONFIG.encode()).hexdigest(), "TMPDIR": str(self.home / "tmp"),
+            "CW_TUNNEL_TIMEOUT": "10"})
         patcher.start()
         self.addCleanup(patcher.stop)
-        for name in ("HERDR_PANE_ID", "OPENCODE_SESSION_ID"):
+        for name in ("HERDR_PANE_ID", "OPENCODE_SESSION_ID", "CW_KUBE_CONTEXT", "CW_TOOLING_REPO", "CW_CLUSTER_TOKEN_CMD"):
             os.environ.pop(name, None)
         config = self.home / "cfg" / "fleet-switchboard" / "config.json"
         config.parent.mkdir(parents=True)
@@ -152,6 +260,24 @@ class Base(unittest.TestCase):
     def stub_calls(self):
         log = self.stub_dir / "calls.log"
         return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+
+    def jsonl(self, name):
+        path = self.stub_dir / name
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def leftovers(self):
+        return sorted(str(p) for p in self.root.rglob("*")) if self.root.exists() else []
+
+    def pf_alive(self):
+        alive = []
+        path = self.stub_dir / "pf.pid"
+        for pid in (path.read_text().split() if path.exists() else []):
+            try:
+                os.kill(int(pid), 0)
+                alive.append(pid)
+            except ProcessLookupError:
+                pass
+        return alive
 
     def launch(self, name="coder7"):
         brief = self.home / "brief.txt"
@@ -314,6 +440,284 @@ class TestCloudWorkerEndpoint(Base):
         self.assertEqual(code, 1)
         self.assertEqual(len(self.remote.requests), before)   # nothing was sent: the password file was not trusted
         self.assertNotIn(PASSWORD, err)
+
+
+class TestWiring(Base):
+    """#640: per-run secrets by descriptor, a cluster token per use, a tunnel per command, the allow-list, and nothing kept."""
+
+    PLANTED = [GIT_TOKEN, CLUSTER_TOKEN, PASSWORD, MODEL_ENTRY["refresh"], MODEL_ENTRY["access"], "ADMINSECRET-q8w7e6r5t4y3"]
+
+    def forms(self):
+        out = []
+        for value in self.PLANTED:
+            out += [value, base64.b64encode(value.encode()).decode(), value.encode().hex(), value[: len(value) // 2], value[8:20]]
+        return out
+
+    def assertNoSecret(self, *texts, where=""):
+        for text in texts:
+            for value in self.forms():
+                if len(value) >= 8:
+                    self.assertNotIn(value, text, where)
+
+    def assertNothingKept(self):
+        self.assertEqual(self.leftovers(), [])
+        self.assertEqual(self.pf_alive(), [])
+
+    def test_s1_launch_passes_both_secrets_by_descriptor_and_nowhere_else(self):
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads((self.stub_dir / "received-model-auth").read_text()), {"github-copilot": MODEL_ENTRY})   # only that entry travels
+        self.assertEqual((self.stub_dir / "received-git-token").read_text().strip(), GIT_TOKEN)
+        for entry in self.jsonl("login.log"):
+            self.assertTrue(entry["token_ok"], entry["command"])
+            self.assertEqual(entry["token_mode"], "0o600")
+            env = {k: v for k, v in entry["env"].items() if k != "STUB_PASSWORD"}   # the stub's own configuration, not a value the switchboard passed
+            self.assertNoSecret(json.dumps(entry["argv"]), json.dumps(env))           # no argument, no environment of the launcher
+        for entry in self.jsonl("kubectl.log"):
+            env = {k: v for k, v in entry.get("env", {}).items() if k != "STUB_PASSWORD"}
+            self.assertNoSecret(json.dumps(entry["args"]), json.dumps(env))
+            self.assertFalse(entry.get("config_text_has_token"))                          # the kubeconfig holds a path only
+        self.assertEqual(len(list((self.state / "cloud").glob("*.json"))), 1)
+        self.assertNoSecret(out, err)
+        for where, text in self.everything_written().items():
+            self.assertNoSecret(text, where=where)
+        self.assertNothingKept()
+        self.assertIn("create", [c[0] for c in self.stub_calls()])
+        self.assertTrue(any("model-auth=" in a for a in self.stub_calls()[0]))
+
+    def test_s2_send_read_and_status_each_open_and_close_their_own_tunnel(self):
+        self.assertEqual(self.launch()[0], 0)
+        for argv in (("send", "coder7", "hi"), ("read", "coder7"), ("status",)):
+            before = len([e for e in self.jsonl("kubectl.log") if "port-forward" in e["args"]])
+            code, out, err = self.main(*argv)
+            self.assertEqual(code, 0 if argv[0] != "status" else code, err)
+            after = [e for e in self.jsonl("kubectl.log") if "port-forward" in e["args"]]
+            self.assertEqual(len(after), before + 1, argv)
+            self.assertEqual(self.pf_alive(), [], argv)
+            self.assertNothingKept()
+        self.assertIn("answers", self.main("status")[1])
+
+    def test_s3_retire_normal_and_a_failing_end_hook(self):
+        self.assertEqual(self.launch()[0], 0)
+        with mock.patch.dict(os.environ, {"STUB_STOP_EXIT": "1"}):
+            code, out, err = self.main("retire", "coder7")
+        self.assertEqual(code, 1)
+        self.assertIn("pod kept", out)
+        self.assertTrue((self.state / "cloud" / "coder7.json").exists())
+        self.assertNothingKept()
+        code, out, err = self.main("retire", "coder7")
+        self.assertEqual(code, 0, err)
+        self.assertEqual([p.name for p in (self.state / "cloud").iterdir()], [])
+        self.assertNothingKept()
+        self.assertNoSecret(out, err)
+
+    def test_s4_each_operation_mints_its_own_token_and_keeps_none(self):
+        self.assertEqual(self.launch()[0], 0)
+        self.assertEqual(self.main("read", "coder7")[0], 0)
+        self.assertEqual(self.main("retire", "coder7")[0], 0)
+        mints = [e for e in self.jsonl("kubectl.log") if "token" in e["args"]]
+        self.assertEqual(len(mints), 3)
+        for entry in mints:
+            self.assertTrue(entry["admin_ok"])
+            self.assertTrue(entry["kubeconfig_is_dev_fd"])      # the administrator credential reached kubectl on a pipe, not a file
+            self.assertIn("--duration=20m", entry["args"])
+        self.assertNothingKept()
+
+    def test_s4_a_token_that_lives_over_an_hour_is_refused(self):
+        (self.stub_dir / "mint_token").write_text(make_jwt(7200))
+        code, out, err = self.launch()
+        self.assertEqual(code, 2)
+        self.assertEqual(self.stub_calls(), [])
+        self.assertEqual([e for e in self.jsonl("kubectl.log") if "port-forward" in e["args"]], [])
+        self.assertNothingKept()
+        with mock.patch.dict(os.environ, {"CW_CLUSTER_TOKEN_DURATION": "2h"}):
+            self.assertEqual(self.launch()[0], 2)
+
+    def test_s4_a_custom_token_command_is_used_and_a_plain_token_is_trusted(self):
+        with mock.patch.dict(os.environ, {"CW_CLUSTER_TOKEN_CMD": "cat %s" % (self.stub_dir / "mint_token")}):
+            self.assertEqual(self.launch()[0], 0)
+        self.assertEqual([e for e in self.jsonl("kubectl.log") if "token" in e["args"]], [])   # no mint: the command answered
+
+    def test_s5_an_unreachable_vault_is_a_refusal_with_no_cluster_call_and_no_fallback(self):
+        (self.stub_dir / "vault_down").write_text("")
+        for extra in ({}, {"CW_KUBE_CONTEXT": "some-context"}):
+            with mock.patch.dict(os.environ, extra):
+                code, out, err = self.launch()
+            self.assertEqual(code, 2)
+            self.assertIn("vault pre-check", err)
+            self.assertEqual(self.stub_calls(), [])
+            self.assertEqual(self.jsonl("kubectl.log"), [])
+        (self.stub_dir / "vault_down").unlink()
+        with mock.patch.dict(os.environ, {"CW_VAULT_NAME": ""}):
+            code, out, err = self.launch()
+        self.assertEqual(code, 2)
+        self.assertIn("vault pre-check", err)
+        self.assertEqual(self.jsonl("kubectl.log"), [])
+        self.assertNothingKept()
+
+    def test_s5_retire_and_read_with_the_vault_down_make_no_call_and_keep_the_record(self):
+        self.assertEqual(self.launch()[0], 0)
+        calls, kube = len(self.stub_calls()), len(self.jsonl("kubectl.log"))
+        (self.stub_dir / "vault_down").write_text("")
+        for argv in (("retire", "coder7"), ("read", "coder7"), ("send", "coder7", "x")):
+            code, out, err = self.main(*argv)
+            self.assertEqual(code, 2, argv)
+            self.assertIn("vault pre-check", err)
+        self.assertEqual((len(self.stub_calls()), len(self.jsonl("kubectl.log"))), (calls, kube))
+        self.assertTrue((self.state / "cloud" / "coder7.json").exists())
+
+    def test_s6_only_a_listed_repository_and_never_the_tooling_one(self):
+        for env in ({"CW_ALLOWED_REPOS": "acme-org/other"}, {"CW_ALLOWED_REPOS": ""}, {"CW_ALLOWED_REPOS": "acme-org/widget-service", "CW_TOOLING_REPO": "acme-org/widget-service"},
+                    {"CW_ALLOWED_REPOS": "acme-org/*"}):
+            with mock.patch.dict(os.environ, env):
+                code, out, err = self.launch()
+            self.assertEqual(code, 2, env)
+            self.assertEqual(self.stub_calls(), [])
+            self.assertEqual(self.jsonl("kubectl.log"), [])
+            self.assertFalse((self.stub_dir / "received-git-token").exists())
+        self.assertEqual(self.leftovers(), [])
+
+    def test_u2_failures_never_echo_a_planted_secret(self):
+        with mock.patch.dict(os.environ, {"STUB_CREATE_FAIL": "1"}):
+            code, out, err = self.launch()
+        self.assertEqual(code, 1)
+        self.assertIn("not created", err)
+        self.assertNoSecret(out, err)
+        for where, text in self.everything_written().items():
+            self.assertNoSecret(text, where=where)
+        self.assertEqual(self.launch()[0], 0)
+        (self.stub_dir / "pf_die").write_text("")
+        for argv in (("send", "coder7", "hi"), ("read", "coder7")):
+            code, out, err = self.main(*argv)
+            self.assertNotEqual(code, 0)
+            self.assertIn("did not open", err)
+            self.assertNoSecret(out, err)
+        self.assertNothingKept()
+
+    def test_u2_a_launch_that_dies_at_the_tunnel_stops_the_pod_and_says_nothing_secret(self):
+        (self.stub_dir / "pf_die").write_text("")
+        code, out, err = self.launch()
+        self.assertEqual(code, 1)
+        self.assertIn("stop", [c[0] for c in self.stub_calls()])
+        self.assertFalse((self.state / "cloud" / "coder7.json").exists())
+        self.assertNoSecret(out, err)
+        self.assertNothingKept()
+
+    def test_u3_the_token_directory_is_gone_after_every_ending(self):
+        self.assertEqual(self.launch()[0], 0)
+        with mock.patch.object(sb, "gates_caller_kind", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.main("send", "coder7", "hi")
+        self.assertNothingKept()
+        with mock.patch.dict(os.environ, {"STUB_STOP_EXIT": "1"}):
+            self.main("retire", "coder7")
+        self.assertNothingKept()
+
+    def _signalled(self, signum):
+        self.assertEqual(self.launch()[0], 0)
+        (self.stub_dir / "pf_hang").write_text("")
+        before = len((self.stub_dir / "pf.pid").read_text().split())
+        env = dict(os.environ, FLEET_SWITCHBOARD_UNDER_TEST="1")
+        child = subprocess.Popen([sys.executable, str(BIN / "fleet-switchboard"), "read", "coder7"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        deadline = time.time() + 60
+        while time.time() < deadline and len((self.stub_dir / "pf.pid").read_text().split()) == before and child.poll() is None:
+            time.sleep(0.1)
+        self.assertTrue(self.root.exists() and any(self.root.iterdir()), "the command is not yet at its tunnel")
+        child.send_signal(signum)
+        out, err = child.communicate(timeout=60)
+        self.assertNotEqual(child.returncode, 0)
+        self.assertEqual(self.leftovers(), [])
+        self.assertEqual(self.pf_alive(), [])
+        self.assertNoSecret(out, err)
+
+    def test_u3_sigint_ends_clean(self):
+        self._signalled(signal.SIGINT)
+
+    def test_u3_sigterm_ends_clean(self):
+        self._signalled(signal.SIGTERM)
+
+    def test_u3_a_killed_command_leaves_a_directory_that_the_next_command_sweeps(self):
+        self.assertEqual(self.launch()[0], 0)
+        self.root.mkdir(mode=0o700, exist_ok=True)
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        stale = self.root / ("cmd-%d-abcd1234" % dead.pid)
+        stale.mkdir(mode=0o700)
+        (stale / "token").write_text(CLUSTER_TOKEN)
+        alive = self.root / ("cmd-%d-live0001" % os.getpid())   # a running command's own directory stays
+        alive.mkdir(mode=0o700)
+        other = self.root / "not-ours"
+        other.mkdir(mode=0o700)
+        code, out, err = self.main("read", "coder7")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(stale.exists())
+        self.assertTrue(alive.exists() and other.exists())
+        self.assertEqual(err.count("leftover cluster-token directory"), 1)
+        self.assertNoSecret(out, err)
+
+    def test_u3_an_old_directory_of_a_reused_pid_is_swept_by_age(self):
+        self.root.mkdir(mode=0o700, exist_ok=True)
+        old = self.root / ("cmd-%d-oldone01" % os.getpid())
+        old.mkdir(mode=0o700)
+        ancient = time.time() - 7200
+        os.utime(str(old), (ancient, ancient))
+        self.assertEqual(self.launch()[0], 0)
+        self.assertFalse(old.exists())
+
+    def test_g_a_link_a_wrong_mode_or_an_existing_file_is_refused(self):
+        elsewhere = self.home / "elsewhere"
+        elsewhere.mkdir()
+        os.symlink(str(elsewhere), str(self.root))
+        code, out, err = self.launch()
+        self.assertEqual(code, 2)
+        self.assertEqual(list(elsewhere.iterdir()), [])
+        self.assertEqual(self.stub_calls(), [])
+        os.unlink(str(self.root))
+        self.root.mkdir(mode=0o700)
+        os.chmod(str(self.root), 0o755)
+        code, out, err = self.launch()
+        self.assertEqual(code, 2)
+        self.assertEqual(self.stub_calls(), [])
+        os.chmod(str(self.root), 0o700)
+        real_open = os.open
+        def exists(path, flags, *args, **kwargs):
+            if str(path).endswith("/token"):
+                raise FileExistsError(17, "File exists")
+            return real_open(path, flags, *args, **kwargs)
+        with mock.patch("os.open", exists):
+            code, out, err = self.launch()
+        self.assertEqual(code, 2)
+        self.assertEqual(self.leftovers(), [])
+        self.assertEqual(self.stub_calls(), [])
+
+    def test_g_a_full_disk_leaves_no_partial_token(self):
+        with mock.patch("os.fdopen", side_effect=OSError(28, "No space left on device")):
+            code, out, err = self.launch()
+        self.assertEqual(code, 2)
+        self.assertEqual(self.leftovers(), [])
+        self.assertEqual(self.stub_calls(), [])
+
+    def test_g_two_commands_at_once_have_their_own_directories(self):
+        module = sb.load_module("cloud_worker").bind(vars(sb))
+        with module.Cluster() as first, module.Cluster() as second:
+            self.assertNotEqual(first.dir, second.dir)
+            self.assertTrue(os.path.exists(first.token_file) and os.path.exists(second.token_file))
+            self.assertEqual(oct(os.stat(first.dir).st_mode & 0o777), "0o700")
+        self.assertEqual(self.leftovers(), [])
+
+    def test_g_kubectl_killed_mid_use_is_an_error_not_a_hang(self):
+        self.assertEqual(self.launch()[0], 0)
+        (self.stub_dir / "pf_die").write_text("")
+        code, out, err = self.main("read", "coder7")
+        self.assertEqual(code, 1)
+        self.assertNothingKept()
+
+    def test_the_old_driver_environment_is_not_inherited_by_the_launcher(self):
+        with mock.patch.dict(os.environ, {"CW_KUBE_CONTEXT": "x", "CW_KUBECONFIG": "/nonexistent", "CW_CLUSTER_TOKEN_CMD": ""}):
+            self.assertEqual(self.launch()[0], 0)
+        for entry in self.jsonl("login.log"):
+            self.assertNotIn("CW_KUBE_CONTEXT", entry["env"])
+            self.assertNotIn("CW_KUBECONFIG", entry["env"])
 
 
 if __name__ == "__main__":
