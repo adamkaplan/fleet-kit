@@ -3203,6 +3203,7 @@ class Discovery:
         self.agents = {}
         self.problems = []
         self.entries = []  # herdr's agent list as read, so render can compare tokens
+        self.headless_records = None   # the headless records THIS look scanned (None: it did not look): the fact sources judge only against these
 
     def add(self, observation):
         known = self.agents.get(observation.name)
@@ -4121,6 +4122,7 @@ class Switchboard:
                  state_dir=None):
         self.config, self.v2, self.herdr, self.audit = config, v2, herdr, audit
         self.state_dir = Path(state_dir) if state_dir is not None else None  # PR 14: where decisions.json goes
+        self.headless_state = None   # #433: a READ-ONLY state directory for the headless records, for a caller (`status`) that must not get a state_dir (which writes)
         if getattr(v2, "on_event", False) is None:   # a real client: its breaker's `v2.backoff` / `v2.resume` go to the audit, once per episode
             v2.on_event = lambda name, detail: self._note(name, "v2", detail)
         self.hub = None  # the GitHub hub, when this process has one (PR 14: its awaiting-user issues)
@@ -4273,15 +4275,17 @@ class Switchboard:
         """#433: the workers with no terminal. The index is the private records in state-dir/headless/; PRESENCE is proved by the service (the session
         exists, answers and carries the worker's name in its metadata), never by a record alone. `session.active` is read ONCE for all of them; a
         service that does not answer makes each one `unknown` with a problem (a delivery is held, never dropped), not dead and not working."""
-        if self.state_dir is None:
+        root = self.state_dir if self.state_dir is not None else self.headless_state
+        if root is None:
             return
         try:
             ap = load_agent_presence()
-            records, bad = ap.scan_records(self.state_dir)
+            records, bad = ap.scan_records(root)
         except Exception as err:   # never silent: headless workers would vanish from discovery without a word
             found.problems.append("headless workers could not be read: %s" % _one_line(str(err), 100))
             return
         found.problems.extend(bad)   # a record that is there and cannot be used is said, one line each, never a silent loss
+        found.headless_records = records   # what this look saw: a launch that lands after it is judged by the NEXT look, never called lost by this one
         if not records:
             return
         active, down = None, None
@@ -4326,7 +4330,7 @@ class Switchboard:
         fleet = _fleet_meta(info)
         if not fleet or fleet.get("name") != record["worker"]:
             return None   # the session does not carry the worker's name: the record is not proof of presence
-        fleet = load_module("reassign").overlay(self.state_dir, fleet, session_id)   # a reassigned worker's boss (bin/reassign.py): bound to this session
+        fleet = load_module("reassign").overlay(self.state_dir if self.state_dir is not None else self.headless_state, fleet, session_id)   # a reassigned worker's boss (bin/reassign.py): bound to this session
         times = info.get("time") if isinstance(info.get("time"), dict) else {}
         observation = Observation(fleet["name"], session_id, None, STATUS.get(state, "unknown"), fleet, _seconds(times.get("idle")), info.get("outcome"))
         observation.created = _seconds(times.get("created"))
@@ -6650,10 +6654,9 @@ class HeadlessRestartFacts:
         if engine is None or discovery is None or engine.state_dir is None:
             return []
         state = engine.state_dir
-        try:
-            records, unread = load_agent_presence().scan_records(state)
-        except Exception as err:
-            engine._note("source.error", "headless_restart_facts", {"error": "the headless records could not be read: %s" % _one_line(str(err), 100)})
+        records = discovery.headless_records   # the records this pass's discovery scanned, never a second scan: a launch that landed after discovery is not "lost"
+        unread = discovery.problems   # every problem of the look (records, the service, herdr), not only unreadable records: on any of them a remembered boss is kept, never pruned
+        if records is None:
             return []
         remembered = _read_small(state, HEADLESS_SERVICE_FILE)
         service, bosses = dict(remembered.get("service") or {}), dict(remembered.get("bosses") or {})
@@ -15429,6 +15432,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         if v2_ok and herdr_ok and state_ok and faults_ok:
             engine = Switchboard(config, v2, herdr, None, fact_sources(state), now,
                                  intents=intent_reader_for(config, runner, now))
+            engine.headless_state = Path(state)   # read-only: the headless records are listed, and `status` still writes nothing
             agents_ok, overview = _check(lambda: fleet_overview(engine, entries))
             agents = overview if agents_ok else {"ok": False, "error": overview}
     else:
