@@ -12,13 +12,22 @@ from a private file the switchboard itself wrote, and is never logged, printed, 
 before a byte is sent.
 """
 import base64
+import contextlib
 import http.client
+import importlib.util
 import json
 import os
 import re
+import shlex
+import shutil
+import signal
+import socket
 import stat
 import subprocess
 import sys
+import tempfile
+import threading
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -268,25 +277,101 @@ def launcher_argv():
     return [os.environ.get(LAUNCHER_ENV) or DEFAULT_LAUNCHER]
 
 
-def run_launcher(runner, command, worker, options=(), timeout=LAUNCH_SECONDS, password_fd=None):
+def run_launcher(runner, command, worker, options=(), timeout=LAUNCH_SECONDS, password_fd=None, cluster=None, secrets=()):
     """Run `cloud-worker <command> <worker> <options> --json`. Returns (exit code, parsed JSON or None, one-line stderr). A launcher that is missing
-    or too slow is a CloudError with a plain reason."""
+    or too slow is a CloudError with a plain reason. `cluster` (a Cluster) gives the launcher its login: a token FILE in the cluster's private
+    directory, never a value in an argument or the environment. `secrets` [(name, value)] go to the launcher as per-run secrets through
+    inherited pipes (`--run-secret-fd NAME=N`): a value is never in an argument, the environment or a file. `runner` is kept for the callers'
+    signature; the launcher is started here so that an interrupt reaches IT (it cleans up what it made) before the interrupt goes on."""
     argv = launcher_argv() + [command, worker] + list(options) + ["--json"]
-    kwargs = {"capture_output": True, "text": True, "timeout": timeout, "stdin": subprocess.DEVNULL}
-    if password_fd is not None:
-        argv += ["--password-fd", str(password_fd)]
-        kwargs["pass_fds"] = (password_fd,)
+    pass_fds, feeds = [], []
     try:
-        result = runner(argv, **kwargs)
+        if password_fd is not None:
+            argv += ["--password-fd", str(password_fd)]
+            pass_fds.append(password_fd)
+        for name, value in secrets:
+            read_end, write_end = os.pipe()
+            argv += ["--run-secret-fd", "%s=%d" % (name, read_end)]
+            pass_fds.append(read_end)
+            feeds.append((read_end, write_end, value))
+        env = cluster.env() if cluster is not None else None
+        try:
+            child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                     pass_fds=tuple(pass_fds), env=env, start_new_session=True)
+        except OSError as err:
+            raise CloudError("cannot run the launcher %s: %s" % (argv[0], err.strerror or err)) from None
+    except BaseException:
+        for read_end, write_end, _ in feeds:
+            _close_quietly(read_end, write_end)
+        raise
+    for read_end, write_end, value in feeds:
+        _close_quietly(read_end)
+        threading.Thread(target=_feed, args=(write_end, value), daemon=True).start()
+    try:
+        out, err = child.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        _kill_group(child)
+        child.communicate()
         raise CloudError("the launcher did not finish %s within %s s" % (command, timeout)) from None
-    except OSError as err:
-        raise CloudError("cannot run the launcher %s: %s" % (argv[0], err.strerror or err)) from None
+    except BaseException:
+        old = _ignore_signals()
+        try:
+            child.send_signal(signal.SIGINT)   # the launcher removes what it made, and says so
+            child.communicate(timeout=180)
+        except BaseException:
+            _kill_group(child)
+        finally:
+            _restore_signals(old)
+        raise
     try:
-        body = json.loads(result.stdout) if (result.stdout or "").strip() else None
+        body = json.loads(out) if (out or "").strip() else None
     except ValueError:
         body = None
-    return result.returncode, body if isinstance(body, dict) else None, _one(result.stderr or "")
+    clean = cluster.clean if cluster is not None else (lambda text, limit=300: _scrub_lib()(text, (), limit))
+    return child.returncode, body if isinstance(body, dict) else None, _one(clean(err or "", 2000))
+
+
+def _close_quietly(*fds):
+    for fd in fds:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _feed(fd, value):
+    try:
+        data = value.encode()
+        while data:
+            data = data[os.write(fd, data):]
+    except OSError:
+        pass
+    finally:
+        _close_quietly(fd)
+
+
+def _kill_group(child):
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(child.pid, sig)
+        except (OSError, ProcessLookupError):
+            pass
+        try:
+            child.wait(5)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def _ignore_signals():
+    if threading.current_thread() is not threading.main_thread():
+        return {}
+    return {s: signal.signal(s, signal.SIG_IGN) for s in (signal.SIGINT, signal.SIGTERM)}
+
+
+def _restore_signals(old):
+    for sig, handler in old.items():
+        signal.signal(sig, handler)
 
 
 def _reason(code, note):
