@@ -803,23 +803,58 @@ class TestSignalsAndOrphans(Base):
                 os.kill(int(orphan), signal.SIGKILL)
 
 
+LAUNCHER_REFERENCE = r'''_OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
+_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
+
+
+def _repo_key(text):
+    """OWNER/NAME lower-cased, or None when it is not exactly that shape (no wildcard, space, newline, dot segment, trailing .git or extra slash). It compares spellings: a renamed or transferred repository is not matched."""
+    owner, sep, name = (text or "").partition("/")
+    if not sep or not _OWNER_RE.fullmatch(owner) or not _NAME_RE.fullmatch(name) or set(name) == {"."} or name.lower().endswith(".git"):
+        return None
+    return (owner + "/" + name).lower()
+
+
+def check_repo_allowed(repo, env):
+    """The one allow-list check (the launcher's create and the driver both call it). Raises CloudError(EXIT_USAGE) before anything is
+    made. CW_ALLOWED_REPOS: comma-separated OWNER/NAME, exact and case-insensitive; unset, empty or any malformed entry refuses.
+    CW_TOOLING_REPO: the tooling's own repository, refused even when listed; unset adds no check, malformed refuses."""
+    raw = (env.get("CW_ALLOWED_REPOS") or "").strip()
+    if not raw:
+        raise CloudError("refused: %s is not on the cloud allow-list (CW_ALLOWED_REPOS is unset or empty)" % scrub(repo, (), 120), EXIT_USAGE)
+    allowed = [_repo_key(x.strip()) for x in raw.split(",")]
+    if None in allowed:
+        raise CloudError("refused: CW_ALLOWED_REPOS has an entry that is not OWNER/NAME; nothing was created", EXIT_USAGE)
+    tooling = (env.get("CW_TOOLING_REPO") or "").strip()
+    tkey = _repo_key(tooling) if tooling else None
+    if tooling and tkey is None:
+        raise CloudError("refused: CW_TOOLING_REPO is not OWNER/NAME; nothing was created", EXIT_USAGE)
+    key = _repo_key(repo)
+    if key is None or key not in allowed or key == tkey:
+        raise CloudError("refused: %s is not on the cloud allow-list" % scrub(repo, (), 120), EXIT_USAGE)
+'''
+
+
 class TestSameAllowList(unittest.TestCase):
     """#640 review M2: this program's check and the launcher's `check_repo_allowed` give the SAME answer for the same inputs."""
 
     @staticmethod
-    def launcher_function():
-        path = BIN.parent / "cloud" / "launcher" / "cloud_worker.py"
-        source = path.read_text() if path.exists() else ""
-        if "def check_repo_allowed" not in source:   # not in the base yet (#659): the branch that adds it is read instead
-            shown = subprocess.run(["git", "show", "origin/cloud/g-s4:cloud/launcher/cloud_worker.py"], cwd=str(BIN.parent), stdout=subprocess.PIPE,
-                                   stderr=subprocess.DEVNULL, text=True)
-            source = shown.stdout if shown.returncode == 0 else ""
-        if "def check_repo_allowed" not in source:
-            return None
+    def references():
+        """The launcher's check, as modules: the copy kept below (a verbatim copy of #659's functions, so this test never depends on git state or on
+        whether #659 is in the base yet), and the launcher in the tree once it has `check_repo_allowed` (then a drift of the tree fails here too)."""
+        found = []
+        scaffold = ("import re\nEXIT_USAGE = 2\nclass CloudError(Exception):\n    def __init__(self, message, code=1):\n        super().__init__(message)\n"
+                    "def scrub(text, known, limit):\n    return str(text)[:limit]\n")
         module = importlib.util.module_from_spec(importlib.util.spec_from_loader("cw_launcher_ref", loader=None))
-        sys.modules["cw_launcher_ref"] = module
-        exec(compile(source, "cloud_worker.py", "exec"), module.__dict__)
-        return module
+        exec(compile(scaffold + LAUNCHER_REFERENCE, "launcher-reference", "exec"), module.__dict__)
+        found.append(module)
+        path = BIN.parent / "cloud" / "launcher" / "cloud_worker.py"
+        if path.exists() and "def check_repo_allowed" in path.read_text():
+            spec = importlib.util.spec_from_file_location("cw_launcher_tree", str(path))
+            tree = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(tree)
+            found.append(tree)
+        return found
 
     CASES = [
         ("acme-org/widget-service", "acme-org/widget-service", None), ("acme-org/Widget-Service", "acme-org/widget-service", None),
@@ -845,21 +880,20 @@ class TestSameAllowList(unittest.TestCase):
     ]
 
     def test_both_functions_answer_alike_over_the_same_inputs(self):
-        ref = self.launcher_function()
-        if ref is None:
-            self.skipTest("the launcher's check_repo_allowed is not available (neither in the tree nor on origin/cloud/g-s4)")
         mine = sb.load_module("cloud_worker").bind(sb.__dict__)
         self.assertGreaterEqual(len(self.CASES), 40)
-        for repo, allowed, tooling in self.CASES:
-            env = {k: v for k, v in (("CW_ALLOWED_REPOS", allowed), ("CW_TOOLING_REPO", tooling)) if v is not None}
-            answers = []
-            for function in (lambda: ref.check_repo_allowed(repo, env), lambda: mine.check_allowed(repo, env)):
-                try:
-                    function()
-                    answers.append("allowed")
-                except (ref.CloudError, mine.CloudError):
-                    answers.append("refused")
-            self.assertEqual(answers[0], answers[1], "drift for %r %r %r: launcher %s, here %s" % (repo, allowed, tooling, answers[0], answers[1]))
+        for ref in self.references():
+            for repo, allowed, tooling in self.CASES:
+                with self.subTest(repo=repo, allowed=allowed, tooling=tooling):
+                    env = {k: v for k, v in (("CW_ALLOWED_REPOS", allowed), ("CW_TOOLING_REPO", tooling)) if v is not None}
+                    answers = []
+                    for function in (lambda: ref.check_repo_allowed(repo, env), lambda: mine.check_allowed(repo, env)):
+                        try:
+                            function()
+                            answers.append("allowed")
+                        except (ref.CloudError, mine.CloudError):
+                            answers.append("refused")
+                    self.assertEqual(answers[0], answers[1], "drift: launcher %s, here %s" % (answers[0], answers[1]))
 
 
 class TestNameCollision(Base):
@@ -886,7 +920,9 @@ class TestNameCollision(Base):
     def test_the_cloud_record_is_the_only_route_so_the_other_kind_cannot_be_made(self):
         self.assertEqual(self.launch()[0], 0)
         self.assertEqual(sb.load_module("cloud_worker").bind(sb.__dict__).route("coder7")["worker"], "coder7")
-        self.assertEqual(self.launch()[0], 1)   # and a second cloud worker of that name is refused too
+        code, out, err = self.launch()   # and a second cloud worker of that name is refused too
+        self.assertEqual(code, 1)
+        self.assertIn("already exists", err)
 
 
 class TestStopAndStatus(Base):
@@ -901,8 +937,46 @@ class TestStopAndStatus(Base):
         run_id = create[create.index("--run-id") + 1]
         self.assertRegex(run_id, r"^[0-9a-f]{32}$")
         self.assertEqual(stop[stop.index("--run-id") + 1], run_id)
-        audit = [l for l in (self.state / "audit.log").read_text().splitlines() if "cloud.stopped" in l] if (self.state / "audit.log").exists() else []
-        self.assertTrue(all(run_id not in l for l in audit))   # the line names a short id, not the nonce itself
+        logs = [p for p in self.state.rglob("*") if p.is_file() and p.suffix != ".password"]
+        audit = [l for p in logs for l in p.read_text(errors="replace").splitlines() if "cloud.stopped" in l]
+        self.assertTrue(audit, "no cloud.stopped audit line")
+        self.assertTrue(all(run_id not in l and "run-id" in l for l in audit))   # the line names a short id, not the nonce itself
+
+    def test_a_launcher_whose_stop_takes_no_run_id_is_stopped_by_name_and_the_audit_says_so(self):
+        text = self.stub.read_text().replace('elif command == "stop":', 'elif command == "stop":\n    if "--run-id" in argv:\n        sys.stderr.write("error: unrecognized arguments: --run-id\\n")\n        sys.exit(2)')
+        self.stub.write_text(text)
+        (self.stub_dir / "pf_die").write_text("")
+        self.assertEqual(self.launch()[0], 1)
+        stops = [c for c in self.stub_calls() if c[0] == "stop"]
+        self.assertEqual(len(stops), 2)
+        self.assertNotIn("--run-id", stops[1])
+        logs = [p for p in self.state.rglob("*") if p.is_file() and p.suffix != ".password"]
+        self.assertTrue(any("stopped_by" in l and "name" in l for p in logs for l in p.read_text(errors="replace").splitlines() if "cloud.stopped" in l))
+
+    def test_a_second_launch_of_a_name_that_is_being_launched_is_refused(self):
+        cloud = self.state / "cloud"
+        self.main("status")   # makes the private state directory
+        os.makedirs(str(cloud), mode=0o700, exist_ok=True)
+        (cloud / "coder7.launching").write_text(str(os.getpid()))   # another command of this user is launching that name right now
+        code, out, err = self.launch()
+        self.assertEqual(code, 1)
+        self.assertIn("being launched", err)
+        self.assertEqual(self.stub_calls(), [])
+        brief = self.home / "b.txt"
+        brief.write_text("x\n")
+        code, out, err = self.main("launch", "coder7", "--agent", "coder", "--dir", str(self.home), "--workspace", "w1", "--brief-file", str(brief))
+        self.assertEqual(code, 1)
+        self.assertIn("being launched", err)
+
+    def test_a_reservation_of_a_dead_command_does_not_hold_the_name(self):
+        cloud = self.state / "cloud"
+        self.main("status")   # makes the private state directory
+        os.makedirs(str(cloud), mode=0o700, exist_ok=True)
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        (cloud / "coder7.launching").write_text(str(dead.pid))
+        self.assertEqual(self.launch()[0], 0)
+        self.assertFalse((cloud / "coder7.launching").exists())
 
     def test_status_mints_no_token_for_a_worker_past_its_hard_deadline(self):
         self.assertEqual(self.launch()[0], 0)

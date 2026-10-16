@@ -72,6 +72,7 @@ The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below 
   No token is cached or kept between commands. Nothing else (no other context or credential) is ever tried.
   A mint happens once per command; `status` mints one only when a cloud worker needs a probe (none for a broken record or a worker
   past its hard deadline), so a poller of `status` causes one vault read and one mint per call.
+- `CW_CLUSTER_TOKEN_CMD` and `CW_CLUSTER_ADMIN_CMD` run through `sh -c` from the caller's environment, like `TMPDIR`: they are guardrails of the operator's own account, not a boundary against an agent that can set the environment.
 - **A missing vault is a refusal.** When the vault is unreachable or the credential unreadable, the command exits 2 with a
   message naming the vault pre-check (the operator runs the platform team's firewall check first) and makes no cluster call.
 - **`launch --cloud`** checks the allow-list, mints the token, reads the model entry and the git token, and hands both to

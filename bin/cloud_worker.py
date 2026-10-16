@@ -191,9 +191,53 @@ def list_records(state):
     return found
 
 
+def _reserved(name):
+    """True when another live command of this user is launching `name` right now (a `NAME.launching` file with its pid; a dead pid's is stale)."""
+    path = H["state_dir_path"]() / CLOUD_DIR / (name + ".launching")
+    try:
+        pid = int(path.read_text().strip())
+        os.kill(pid, 0)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+@contextlib.contextmanager
+def reservation(state, name):
+    """Holds the name for the length of a `launch --cloud`: O_EXCL, so two launches of one name (or a local launch meanwhile, see
+    refuse_local_launch) cannot both pass the checks and then both create."""
+    path = cloud_dir(state) / (name + ".launching")
+    for _ in range(2):
+        try:
+            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            break
+        except FileExistsError:
+            if _reserved(name):
+                raise CloudError("%s is being launched by another command right now; nothing was created" % name) from None
+            try:
+                path.unlink()   # a dead command's reservation
+            except OSError:
+                pass
+    else:
+        raise CloudError("%s is being launched by another command right now; nothing was created" % name)
+    try:
+        os.write(fd, str(os.getpid()).encode())
+    finally:
+        os.close(fd)
+    try:
+        yield
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
 def refuse_local_launch(name):
     """Called first by a LOCAL `launch`: a name that has a cloud record is refused, because `route` would send every later send/read/retire for
     the new local agent into the pod. No cluster or herdr call: the record is a file. A broken record also refuses (it still holds the name)."""
+    if valid_name(name or "") and _reserved(name):
+        raise CloudError("a cloud worker named %s is being launched right now: a local agent cannot take its name; nothing was launched" % name)
     if valid_name(name or "") and (H["state_dir_path"]() / CLOUD_DIR / (name + ".json")).exists():
         raise CloudError("a cloud worker named %s exists: a local agent cannot take its name (send, read and retire by name would reach the "
                          "pod); `%s retire %s` ends it first; nothing was launched" % (name, H["PROG"], name))
@@ -457,7 +501,7 @@ def _repo_key(text):
 
 def check_allowed(repo, env=None):
     """The allow-list. A COPY of the launcher's `check_repo_allowed` (cloud/launcher/cloud_worker.py, #659) with the same behaviour, so the two
-    entry points accept the same repositories from the same variable (tests/test_same_allow_list runs both over the same inputs).
+    entry points accept the same repositories from the same variable (TestSameAllowList in bin/test-cloud-worker runs both over the same inputs).
     TODO(follow-up once #659 is in the base): replace this copy by a call to `_lib().check_repo_allowed(repo, env)`.
     CW_ALLOWED_REPOS: comma-separated OWNER/NAME, exact, ASCII case-insensitive; unset, empty or ANY malformed entry refuses the whole list.
     CW_TOOLING_REPO: refused even when listed; unset adds no check, a malformed value refuses. Runs before anything is created."""
@@ -620,7 +664,11 @@ def stop_recorded_tunnels(directory):
         if pid <= 1 or not started or _ps(pid, "lstart") != started or not command or "kubectl" not in command \
                 or "port-forward" not in command or config not in command:
             continue
+        gone = False
         for sig in (signal.SIGTERM, signal.SIGKILL):
+            if _ps(pid, "lstart") != started:   # re-verified right before each signal
+                gone = True
+                break
             try:
                 if os.getpgid(pid) == pid:
                     os.killpg(pid, sig)
@@ -629,9 +677,8 @@ def stop_recorded_tunnels(directory):
             except OSError:
                 break
             time.sleep(0.2)
-            if _ps(pid, "lstart") != started:
-                break
-        stopped += 1
+        gone = gone or _ps(pid, "lstart") != started
+        stopped += 1 if gone else 0
     return stopped
 
 
@@ -723,6 +770,8 @@ class Cluster:
         return False
 
     def _on_signal(self, signum, frame):
+        for sig in HANDLED_SIGNALS:   # a second signal must not interrupt the cleanup
+            signal.signal(sig, signal.SIG_IGN)
         for child in list(self.tunnels):   # stop the tunnels now, whatever the stack is doing; the `finally` blocks then remove the files
             _kill_group(child)
         raise KeyboardInterrupt
@@ -776,7 +825,9 @@ def tunnel(cluster, record):
         # the pid and start time go in the command's private directory: if this command is killed outright (SIGKILL), the NEXT command stops
         # the orphaned port-forward (only while the pid still has this start time and is a port-forward of this directory)
         started = _ps(child.pid, "lstart")
-        if started:
+        if not started:
+            sys.stderr.write("%s: warning: the tunnel could not be recorded; if this command is killed outright it may leave the tunnel running\n" % H["PROG"])
+        else:
             fd = os.open(os.path.join(cluster.dir, "tunnel-%d.pid" % port), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "w") as note:
                 note.write("%d %s" % (child.pid, started))
@@ -848,6 +899,13 @@ def git_token(repo, cluster):
 
 @refusals
 def cmd_launch(args, runner, now):
+    """`launch --cloud`: the name is reserved (O_EXCL) from before the local-agent and record checks until the launch ends, so no second command can pass
+    the same checks in between."""
+    with contextlib.ExitStack() as stack:
+        return _launch(args, runner, now, lambda state: stack.enter_context(reservation(state, args.name)))
+
+
+def _launch(args, runner, now, reserve):
     """`launch NAME --cloud --repo OWNER/REPO --branch B --agent A`: the allow-list first, then (with a cluster token minted for this command) the
     model entry and a one-hour git token go to the launcher as per-run secrets, the pod is created, and the session and the brief are sent through
     a tunnel that exists only for those calls."""
@@ -871,6 +929,7 @@ def cmd_launch(args, runner, now):
         raise LaunchError("--branch is not a branch name: %r" % branch)
     check_allowed(repo)   # before anything is read, minted or created
     engine, state, _ = H["build_engine"](runner, now, "cli")
+    reserve(state)
     local = engine.discover(engine.now()).agents.get(name)
     if local is not None:   # `route` prefers a cloud record: every later send/read/retire for the local agent would go INTO the pod
         raise LaunchError("a local fleet agent named %s exists: a cloud worker cannot take its name (send, read and retire by name would reach "
