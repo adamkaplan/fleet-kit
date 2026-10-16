@@ -48358,7 +48358,7 @@ class TestHeavyWatchdog(unittest.TestCase):
             test.table_reads.append(1)
             if len(test.table_reads) > rounds:
                 test.exited.set()   # the bound: a watchdog that never decides ends the test, which then fails its assertions
-            return rows_for(len(test.table_reads))
+            return [] if test.exited.is_set() else rows_for(len(test.table_reads))   # what was stopped is gone from the table
 
         def record(number, sig):
             self.signals.append((number, sig))
@@ -48367,7 +48367,7 @@ class TestHeavyWatchdog(unittest.TestCase):
 
         environ = {"PATH": os.environ["PATH"], "FLEET_HEAVY": "off"}
         environ.update(environ_extra or {})
-        dog = {"read_table": read_table, "pause": lambda seconds: self.stopping.wait(0.001), "killpg": record, "kill": record, "every": 0.001, "grace": grace}
+        dog = {"read_table": read_table, "pause": lambda seconds: self.stopping.wait(0.001), "killpg": record, "kill": record, "every": 0.001, "grace": grace, "sweep_pause": lambda seconds: None}
         with mock.patch.object(self.hs.subprocess, "Popen", FakeChild):
             return self.hs.run(["sh", "-c", "sleep 1000"], None, 3, 1, "who", environ=environ, out=self.out, clock=clock, sleep=lambda s: None, watchdog=dog)
 
@@ -48451,6 +48451,88 @@ class TestHeavyWatchdog(unittest.TestCase):
         rows = lambda n: [(4242, 1, os.getpgrp(), 20000 * 1024), (4243, 4242, os.getpgrp(), 1), (777, 1, 777, 30000 * 1024), (778, 1, os.getpgrp(), 1)]
         self.assertEqual(self.run_watched(rows), 137)
         self.assertEqual({p for p, _s in self.signals}, {4242, 4243})
+
+    PROBE = (
+        "import os,sys,time,signal\n"
+        "mode,d=sys.argv[1],sys.argv[2]\n"
+        "def note(n): open(os.path.join(d,n),'w').write(str(os.getpid()))\n"
+        "def grow():\n"
+        "    x=bytearray(120*1024*1024)\n"
+        "    for i in range(0,len(x),4096): x[i]=1\n"
+        "    time.sleep(60)\n"
+        "if os.fork()==0:\n"
+        "    if mode=='orphan':\n"
+        "        if os.fork()==0:\n"
+        "            note('b'); time.sleep(1.0); grow(); os._exit(0)\n"
+        "        time.sleep(0.5); os._exit(0)\n"
+        "    if mode=='ignore': signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "    if mode=='setsid': os.setsid()\n"
+        "    note('b'); time.sleep(0.5); grow(); os._exit(0)\n"
+        "time.sleep(60)\n")
+
+    def real_probe(self, mode):
+        """Real small processes: a 120 MB child under a 60 MB ceiling. Returns (status, output, pid of the child); the child is always killed at the end of the test."""
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(directory), True)
+        probe = directory / "probe.py"
+        probe.write_text(self.PROBE)
+
+        def reap():
+            for name in ("b",):
+                try:
+                    os.kill(int((directory / name).read_text()), signal.SIGKILL)
+                except (OSError, ValueError):
+                    pass
+        self.addCleanup(reap)
+        out = io.StringIO()
+        status = self.hs.run(["python3", str(probe), mode, str(directory)], None, 3, 1, "who", out=out, watchdog={"every": 0.1, "grace": 1, "sweep_every": 0.2},
+                             environ={"PATH": os.environ["PATH"], "FLEET_HEAVY": "off", "FLEET_HEAVY_MEM_MB": "60", "FLEET_HEAVY_MAX_SECONDS": "40"})
+        try:
+            pid = int((directory / "b").read_text())
+        except (OSError, ValueError):
+            self.fail("the child never started: %s" % out.getvalue())
+        return status, out.getvalue(), pid
+
+    def dead_within(self, pid, seconds=5):
+        end = time.time() + seconds
+        while time.time() < end:
+            state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+            if not state or state.startswith("Z"):
+                return True
+            time.sleep(0.1)
+        return False
+
+    def test_s11_a_double_forked_orphan_that_grows_is_stopped_too(self):
+        status, text, pid = self.real_probe("orphan")
+        self.assertEqual(status, 137, text)
+        self.assertTrue(self.dead_within(pid), "the orphan %d is still alive: %s" % (pid, text))
+
+    def test_s12_a_child_that_ignores_the_polite_stop_is_killed_by_the_forced_stop_and_sweep(self):
+        status, text, pid = self.real_probe("ignore")
+        self.assertEqual(status, 137, text)
+        self.assertTrue(self.dead_within(pid), "the child %d is still alive: %s" % (pid, text))
+
+    def test_s13_a_child_that_started_its_own_session_is_stopped_too(self):
+        status, text, pid = self.real_probe("setsid")
+        self.assertEqual(status, 137, text)
+        self.assertTrue(self.dead_within(pid), "the session leader %d is still alive: %s" % (pid, text))
+
+    def test_s14_a_reused_pid_the_wrapper_its_parent_and_its_group_are_never_signalled(self):
+        sent = BoundedList()
+        record = lambda target, number: sent.append((target, number))
+        first = [(4242, 1, 4242, 10, "t0"), (4300, 4242, 4242, 10, "A")]
+        tables = iter([first, [(4300, 1, 4300, 10, "B")]])   # the second: pid 4300 now belongs to another process (different start time)
+        dog = self.hs.Watchdog(4242, ["x"], 16384, 0, self.out, 0.0, read_table=lambda: next(tables), killpg=record, kill=record, me=(9001, 9002, 9003))
+        self.assertEqual(dog.sample()[0], None)
+        live = dog.look()
+        self.assertEqual(live, set(), "the process that now holds 4300 is not the one that was seen")
+        dog.signal(signal.SIGKILL, live)
+        self.assertEqual(list(sent), [], "nothing signalled for a pid with another start time")
+        # the wrapper (9001), its parent (9002) and its group (9003) as members of the tree or of the command's group
+        rows = [(4242, 1, 9003, 10, "t0"), (9001, 4242, 9003, 10, "w"), (9002, 9001, 9003, 10, "p"), (4300, 4242, 9003, 10, "A")]
+        dog = self.hs.Watchdog(4242, ["x"], 16384, 0, self.out, 0.0, read_table=lambda: rows, killpg=record, kill=record, me=(9001, 9002, 9003))
+        dog.signal(signal.SIGKILL, dog.look())
+        self.assertEqual(sorted(target for target, _n in sent), [4242, 4300], "never 9001, 9002, nor the group 9003")
 
     def test_s6_a_run_whose_parent_is_gone_exits_with_143(self):
         parents = iter([500, 500, 1])

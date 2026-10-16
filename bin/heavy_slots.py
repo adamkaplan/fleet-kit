@@ -45,6 +45,8 @@ DEFAULT_MEM_MB = 16384
 DEFAULT_MAX_SECONDS = 7200
 WATCH_SECONDS = 5       # how often the watchdog looks
 KILL_GRACE_SECONDS = 10  # between the polite stop and the forced one
+SWEEP_ROUNDS = 5        # forced-stop rounds that look again for what is left
+SWEEP_SECONDS = 0.3     # between them
 EXIT_TIME = 124
 EXIT_MEMORY = 137
 FORWARDED = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
@@ -186,47 +188,61 @@ def ceilings(environ):
 
 
 def read_process_table():
-    """[(pid, ppid, pgid, rss_kb)] from `ps`; raises OSError when it cannot be read."""
+    """[(pid, ppid, pgid, rss_kb, start)] from `ps`; `start` is the process's start time as text, so a pid that was reused is told from the process it was. Raises
+    OSError when the table cannot be read."""
     try:
-        done = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid=,rss="], capture_output=True, text=True, timeout=20)
+        done = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid=,rss=,lstart="], capture_output=True, text=True, timeout=20)
     except (subprocess.SubprocessError, OSError) as err:
         raise OSError("ps failed: %s" % err)
     rows = []
     for line in done.stdout.splitlines():
         parts = line.split()
-        if len(parts) == 4 and all(part.isdigit() for part in parts):
-            rows.append(tuple(int(part) for part in parts))
+        if len(parts) >= 5 and all(part.isdigit() for part in parts[:4]):
+            rows.append(tuple(int(part) for part in parts[:4]) + (" ".join(parts[4:]),))
     if done.returncode != 0 or not rows:
         raise OSError("ps gave no process table")
     return rows
 
 
-def family(rows, root):
-    """The pids of `root` and everything below it by parent links, with their summed RSS in KB: (set of pids, kb)."""
+def _start(row):
+    return row[4] if len(row) > 4 else ""
+
+
+def tree(rows, roots):
+    """The pids of `roots` and everything below them by parent links."""
     kids = {}
-    for pid, ppid, _pgid, _rss in rows:
-        kids.setdefault(ppid, []).append(pid)
-    found, todo = set(), [root]
+    for row in rows:
+        kids.setdefault(row[1], []).append(row[0])
+    found, todo = set(), list(roots)
     while todo:
         pid = todo.pop()
         if pid not in found:
             found.add(pid)
             todo.extend(kids.get(pid, ()))
-    return found, sum(rss for pid, _p, _g, rss in rows if pid in found)
+    return found
 
 
 class Watchdog:
-    """Stops the command the wrapper started when its process tree passes a memory ceiling or it runs past a time ceiling: SIGTERM, then SIGKILL after a grace.
-    Only what the wrapper started is signalled: the command's own process group when it has one, else the command and its descendants one pid at a time;
-    never another process. A process table that cannot be read stops nothing (one note); the time ceiling needs no table."""
+    """Stops the command the wrapper started when its process tree passes a memory ceiling or it runs past a time ceiling: SIGTERM, a grace, then SIGKILL, then a
+    sweep that repeats until nothing of the run is alive (or says who is).
+
+    Every process seen in the command's tree is remembered by (pid, start time) at each sample, so a double-forked orphan, a child that ignores the polite stop and a
+    child that started its own session are still found and stopped, and a pid that was reused by another process never is. Only those remembered processes (and the
+    command's own process group when it has one) are signalled; never the wrapper, its parent, its own group, pid 1 or any other process. A process table that cannot
+    be read stops nothing beyond the command itself (one note); the time ceiling needs no table."""
 
     def __init__(self, pid, command, mem_mb, max_seconds, out, started, read_table=read_process_table, clock=time.time, pause=None, killpg=os.killpg,
-                 kill=os.kill, every=WATCH_SECONDS, grace=KILL_GRACE_SECONDS):
+                 kill=os.kill, every=WATCH_SECONDS, grace=KILL_GRACE_SECONDS, rounds=SWEEP_ROUNDS, sweep_every=SWEEP_SECONDS, sweep_pause=time.sleep, me=None):
         self.pid, self.command, self.mem_mb, self.max_seconds, self.out, self.started = pid, command, mem_mb, max_seconds, out, started
         self.read_table, self.clock, self.killpg, self.kill, self.every, self.grace = read_table, clock, killpg, kill, every, grace
+        self.rounds, self.sweep_every, self.sweep_pause = rounds, sweep_every, sweep_pause
+        self.me = me if me is not None else (os.getpid(), os.getppid(), os.getpgrp())   # never signalled: this wrapper, its caller, its group
         self.stop_event = threading.Event()
         self.pause = pause or (lambda seconds: self.stop_event.wait(seconds))
-        self.peak_kb, self.reason, self.noted = 0, None, False
+        self.peak_kb, self.reason, self.noted, self.survivors = 0, None, False, []
+        self.pgids = {}      # pid -> process group, as last seen
+        self.seen = set()    # (pid, start time) of every process seen in the command's tree
+        self.group = None    # the command's own process group, when it is not the wrapper's
         self.thread = threading.Thread(target=self.watch, daemon=True)
 
     def start(self):
@@ -236,51 +252,77 @@ class Watchdog:
     def finish(self):
         self.stop_event.set()
         if self.thread.is_alive():
-            self.thread.join(timeout=self.grace + 5)
+            self.thread.join(timeout=self.grace + self.rounds * (self.sweep_every + 1) + 10)
 
     def exit_status(self):
         return {"memory": EXIT_MEMORY, "time": EXIT_TIME}.get(self.reason)
 
-    def targets(self, rows):
-        """(pgid or None, pids): where the stop goes. Never this wrapper's own group. With no table at hand (the memory ceiling is off) it is read now, for the stop."""
-        if rows is None:
-            try:
-                rows = self.read_table()
-            except OSError:
-                return None, [self.pid]
-        pids, _kb = family(rows, self.pid)
-        pgid = next((g for p, _pp, g, _r in rows if p == self.pid), None)
-        return (pgid if pgid not in (None, os.getpgrp()) else None), sorted(pids)
+    def remember(self, rows):
+        """Add what is below the command (or below anything remembered that is still alive) to the remembered set; returns the live remembered (pid, start) keys."""
+        at = {row[0]: row for row in rows}
+        alive = {key for key in self.seen if key[0] in at and _start(at[key[0]]) == key[1]}
+        if self.pid in at and (self.pid, _start(at[self.pid])) not in self.seen:
+            alive.add((self.pid, _start(at[self.pid])))
+        own = at.get(self.pid)
+        if own is not None and own[2] not in (0, 1, self.me[2]):
+            self.group = own[2]
+            alive |= {(row[0], _start(row)) for row in rows if row[2] == self.group}
+        for pid in tree(rows, [key[0] for key in alive]):
+            alive.add((pid, _start(at[pid])))
+        alive = {key for key in alive if key[0] not in self.me[:2] and key[0] > 1}
+        self.seen |= alive
+        self.pgids.update({row[0]: row[2] for row in rows})
+        return alive
 
     def sample(self):
-        """One look; returns "memory", "time" or None."""
-        rows = None
-        if self.mem_mb:
-            try:
-                rows = self.read_table()
-                self.peak_kb = max(self.peak_kb, family(rows, self.pid)[1])
-            except OSError as err:
-                rows = None
-                if not self.noted:
-                    self.noted = True
-                    self.out.write("heavy: cannot read the process table (%s): the memory ceiling is not enforced\n" % err)
+        """One look; returns ("memory" | "time" | None, live keys)."""
+        live = set()
+        try:
+            rows = self.read_table()
+            live = self.remember(rows)
+            at = {row[0]: row for row in rows}
+            self.peak_kb = max(self.peak_kb, sum(at[pid][3] for pid, _s in live))
+        except OSError as err:
+            if not self.noted:
+                self.noted = True
+                self.out.write("heavy: cannot read the process table (%s): only the command itself can be stopped, and the memory ceiling is not enforced\n" % err)
         if self.mem_mb and self.peak_kb // 1024 > self.mem_mb:
-            return "memory", rows
+            return "memory", live
         if self.max_seconds and self.clock() - self.started > self.max_seconds:
-            return "time", rows
-        return None, rows
+            return "time", live
+        return None, live
 
     def watch(self):
         while not self.stop_event.is_set() and not self.pause(self.every):
-            reason, rows = self.sample()
+            reason, live = self.sample()
             if reason:
                 self.reason = reason
                 self.say(reason)
-                self.signal(signal.SIGTERM, rows)
-                self.stop_event.wait(self.grace)   # the grace ends the moment the command is gone
-                if not self.stop_event.is_set():   # the command went with the polite stop: no forced one
-                    self.signal(signal.SIGKILL, None, before=rows)   # a fresh look: a child forked since is in it, a pid that is gone is not signalled
+                self.signal(signal.SIGTERM, live, fallback=True)   # no table: at least the command itself
+                self.stop_event.wait(self.grace)   # the grace ends the moment the command is gone; its children may not have gone with it
+                self.sweep()
                 return
+
+    def sweep(self):
+        """Kill what is left of the run, round after round, looking again each time (a child forked since is found; a process that is gone is not signalled)."""
+        live = set()
+        for _ in range(self.rounds):
+            live = self.look()
+            if not live:
+                return
+            self.signal(signal.SIGKILL, live)
+            self.sweep_pause(self.sweep_every)
+        live = self.look()
+        if live:
+            self.survivors = sorted(pid for pid, _s in live)
+            self.out.write("heavy: survivors after the stop: %s\n" % ", ".join(str(pid) for pid in self.survivors))
+            self.out.flush()
+
+    def look(self):
+        try:
+            return self.remember(self.read_table())
+        except OSError:
+            return set()   # nothing can be judged: nothing more is signalled
 
     def say(self, reason):
         text = _plain(" ".join(self.command), 120)
@@ -292,27 +334,21 @@ class Watchdog:
                            % (text, self.max_seconds, self.peak_kb // 1024))
         self.out.flush()
 
-    def signal(self, number, rows, before=None):
-        pgid, pids = self.targets(rows)
-        if before is not None and rows is None:   # the earlier tree's pids that are still there, with the same parent and group, are kept (an orphaned child)
+    def signal(self, number, live, fallback=False):
+        """Send `number` to each live remembered process, and to the command's own group when it has one. The wrapper, its parent and its group are refused here."""
+        grouped = self.group is not None and self.group not in (0, 1, self.me[2]) and any(pid == self.pid for pid, _s in live)   # the group only while the command that led it is there: a gone leader's group id may be another's
+        if grouped:
             try:
-                now = {(p, pp, g) for p, pp, g, _r in self.read_table()}
-                old = {(p, pp, g) for p, pp, g, _r in before}
-                kept = {p for p, pp, g in now & old if p in family(before, self.pid)[0]}
-                pids = sorted(set(pids) | kept)
+                self.killpg(self.group, number)
             except OSError:
                 pass
-        try:
-            if pgid is not None:
-                self.killpg(pgid, number)
-                return
-            for pid in pids:
-                try:
-                    self.kill(pid, number)
-                except OSError:
-                    pass
-        except OSError:
-            pass
+        for pid in sorted({pid for pid, _s in live} or ({self.pid} if fallback else set())):
+            if pid in self.me[:2] or pid <= 1 or (grouped and self.pgids.get(pid) == self.group):   # a group member has had the group's signal
+                continue
+            try:
+                self.kill(pid, number)
+            except OSError:
+                pass
 
 
 def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name=None, environ=None, out=None, clock=time.time, sleep=time.sleep,
