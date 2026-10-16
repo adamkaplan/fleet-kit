@@ -18893,10 +18893,31 @@ _PLAN_ISSUE_RE = re.compile(r"github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(?:i
 
 
 def clear_lane(engine, repo, number, body):
-    """(lane, how): the orchestrator that merges the pull request, or (None, None) when it cannot be told (never a guess). In order: the agent that recorded the pull request's notice (or, when
-    that is a worker, its boss; or the boss the notice recorded), then the `PLAN:` link of the body up to the charter that owns the ask. Only a running orchestrator counts."""
+    """(lane, how): the orchestrator that merges the pull request, or (None, None) when it cannot be told (never a guess). In order: (1) the `PLAN:` link of the body, in this repository, up to the charter
+    that holds the issue it names AS IT IS NOW (each parent is read fresh, so an ask that was moved counts under its current charter), and that charter's RUNNING orchestrator; (2) only then the agent that
+    recorded the pull request's notice (its boss when it is a worker, or the boss the notice recorded). Only a running orchestrator counts; a link into another repository or to a charter nobody runs goes on
+    to the next rule."""
     discovery = engine.discover(engine.now())
     agents = discovery.agents
+    orchestrators = {name: agent for name, agent in agents.items() if _is_orchestrator(agent)}
+    found = PLAN_LINE_RE.search(body or "")
+    link = _PLAN_ISSUE_RE.search(found.group(1)) if found else None
+    reader = getattr(engine, "intents", None)
+    if link and link.group(1) == repo and reader is not None and orchestrators:
+        chain, current = [int(link.group(2))], int(link.group(2))
+        try:
+            for _ in range(3):
+                if hasattr(reader, "invalidate"):
+                    reader.invalidate(current, repo)   # the parent TODAY, not an older cached one (a moved ask)
+                current = reader.parent(current, repo)
+                if current is None:
+                    break
+                chain.append(current)
+        except IntentError:
+            pass   # the chain so far is all that can be told
+        owner = pick_owner(orchestrators, chain, repo, engine.config.get("intent_repo") if len(getattr(engine, "watches", ()) or ()) > 1 else None)
+        if owner:
+            return owner, "the PLAN link"
     item = next((i for i in read_pr_notices(engine.state_dir) if i["repo"] == repo and i["number"] == number), None) if engine.state_dir is not None else None
     if item:
         for name in notice_senders(item)[::-1] + ([item["boss"]] if isinstance(item.get("boss"), str) else []):
@@ -18904,24 +18925,8 @@ def clear_lane(engine, repo, number, body):
             if agent is None:
                 continue
             lane = name if _is_orchestrator(agent) else boss_name(discovery, agent)
-            if lane in agents and _is_orchestrator(agents[lane]):
+            if lane in orchestrators:
                 return lane, "the notice"
-    found = PLAN_LINE_RE.search(body or "")
-    link = _PLAN_ISSUE_RE.search(found.group(1)) if found else None
-    reader = getattr(engine, "intents", None)
-    if link and link.group(1) == repo and reader is not None:
-        chain, current = [int(link.group(2))], int(link.group(2))
-        try:
-            for _ in range(3):
-                current = reader.parent(current, repo)
-                if current is None:
-                    break
-                chain.append(current)
-        except IntentError:
-            pass   # the chain so far is all that can be told
-        owner = pick_owner(agents, chain, repo, engine.config.get("intent_repo") if len(getattr(engine, "watches", ()) or ()) > 1 else None)
-        if owner and _is_orchestrator(agents[owner]):
-            return owner, "the PLAN link"
     return None, None
 
 
