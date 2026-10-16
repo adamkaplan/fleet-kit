@@ -14210,7 +14210,7 @@ class TestHeadlessPresence(Base):
         self.engine.v2.session_get = down
         with self.assertRaises(sb.LaunchError) as raised:
             self.launch_hl(name="down", repo="acme-org/widget-api")
-        self.assertIn("session lookup failed", str(raised.exception))
+        self.assertIn("was deleted", str(raised.exception))
         self.engine.v2.session_get = real_get
         self.assertEqual(set(self.world.v2.sessions) - before, set())
 
