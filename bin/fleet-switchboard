@@ -19701,7 +19701,9 @@ def delegated_clear_map(engine, runner, repo, item, base_sha, rule):
         head = module.decode_blob(_gh_json(engine, runner, repo, "repos/%s/git/blobs/%s" % (repo, item["sha"])))
         if base is None or head is None or not isinstance(item.get("patch"), str):
             return None
-        return module.closure_refusals(base, head, item["patch"], list(rule["closure_roots"]), set(rule["clear_entry_points"]))
+        if item["filename"] == rule["daemon_file"]:
+            return module.closure_refusals(base, head, item["patch"], list(rule["closure_roots"]), set(rule["clear_entry_points"]))
+        return module.closure_refusals(base, head, item["patch"], list((rule.get("module_roots") or {}).get(item["filename"]) or []), set(), True)   # any other module the clear loads: its import-time code and the functions the clear runs
     except Exception:
         return None
 
@@ -19737,12 +19739,15 @@ def delegated_clear_pr_checks(engine, runner, repo, number):
         try:
             pull = get("repos/%s/pulls/%d" % (repo, number))
             after, base_sha = (pull.get("head") or {}).get("sha"), (pull.get("base") or {}).get("sha")
+            if after == report.get("head") and base_sha and any(f.get("status") == "modified" for f in files):   # the files' patches are against the MERGE-BASE, not the base branch's tip: read the blobs at that commit
+                compared = get("repos/%s/compare/%s...%s?per_page=1" % (repo, base_sha, after))
+                base_sha = ((compared or {}).get("merge_base_commit") or {}).get("sha")
         except Exception:
             after = None
         if after != report.get("head"):
             return None, "the pull request's head moved while it was being checked (%s, then %s): nothing was cleared" % (str(report.get("head"))[:8], str(after)[:8])
         for item in files:   # a changed file of the daemon's own: each changed LINE is mapped to its definition by the ast of the file it belongs to
-            if isinstance(item.get("filename"), str) and impact_floor.matches(item["filename"], (rule or {}).get("closure_files") or []) and item.get("status") == "modified":
+            if isinstance(item.get("filename"), str) and impact_floor.matches(item["filename"], (rule or {}).get("closure_files") or []) and not impact_floor.matches(item["filename"], (rule or {}).get("clear_code_paths") or []) and item.get("status") == "modified":
                 closure[item["filename"]] = delegated_clear_map(engine, runner, repo, item, base_sha, rule)
     reasons = module.refusals(rule, report, files, impact_floor.matches, closure)
     if reasons:

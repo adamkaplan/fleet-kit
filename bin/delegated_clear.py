@@ -167,13 +167,16 @@ def closure(tree, roots):
         if name in seen or name not in defs:
             continue
         seen.add(name)
-        for x in ast.walk(defs[name]):
-            if isinstance(x, ast.Name):
-                refs.add(x.id)
-                if x.id in defs:
-                    todo.append(x.id)
-                elif x.id in binds:
-                    globals_.add(x.id)
+        nodes = [defs[name]]
+        while nodes:   # a binding the closure reads is walked too (its whole right-hand side, to a fixed point): `load = lambda: load_module("x")` and `thing = _Lazy()` lead to what they call
+            for x in ast.walk(nodes.pop()):
+                if isinstance(x, ast.Name):
+                    refs.add(x.id)
+                    if x.id in defs:
+                        todo.append(x.id)
+                    elif x.id in binds and x.id not in globals_:
+                        globals_.add(x.id)
+                        nodes.extend(binds[x.id])
     return seen, globals_, refs
 
 
@@ -203,7 +206,7 @@ def changed_lines(patch):
     return old, new
 
 
-def closure_refusals(base_src, head_src, patch, roots, entry_points):
+def closure_refusals(base_src, head_src, patch, roots, entry_points, module_level=False):
     """[reasons] a change to the daemon file touches the clear closure. `base_src` and `head_src` are the file before and after, `patch` the diff of it, `roots` the clear command's entry points and
     `entry_points` the names a NEW caller of is refused. The closure is computed on BOTH files and united (a pull request that ADDS a call into it counts). The changed lines are mapped to the
     top-level definition they are in by the ast of the file they belong to (removed lines against the base, added lines against the head). Refused: a closure definition changed; a module-level
@@ -235,7 +238,9 @@ def closure_refusals(base_src, head_src, patch, roots, entry_points):
                     elif used:
                         reasons.append("it changes %s, which refers to a clear entry point (%s)" % (owner.name, ", ".join(sorted(used)[:3])))
                 elif isinstance(owner, BIND_KINDS + (ast.Import, ast.ImportFrom)):
-                    if names & (in_globals | in_defs | in_refs):
+                    if module_level:
+                        reasons.append("it changes import-time code of a module the clear loads (%s line %d): refused" % (side, number))
+                    elif names & (in_globals | in_defs | in_refs):
                         reasons.append("it changes the module-level binding of %s, which the clear reads" % ", ".join(sorted(names & (in_globals | in_defs | in_refs))[:3]))
                     elif len(owners) > 1:
                         reasons.append("a changed line (%s line %d) holds more than one top-level statement: refused" % (side, number))
