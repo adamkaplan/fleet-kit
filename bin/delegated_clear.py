@@ -251,6 +251,6 @@ def decode_blob(answer):
     if not isinstance(answer, dict) or answer.get("encoding") != "base64" or not isinstance(answer.get("content"), str):
         return None
     try:
-        return base64.b64decode(answer["content"], validate=True).decode("utf-8")
+        return base64.b64decode("".join(answer["content"].split()), validate=True).decode("utf-8")
     except (ValueError, UnicodeError):
         return None

@@ -29078,6 +29078,10 @@ class TestImpactHold(LedgerBase):
         module = sb.load_module("delegated_clear")
         text = base64.b64encode(b"def a():\n    return 1\n").decode()
         self.assertEqual(module.decode_blob({"encoding": "base64", "content": text}), "def a():\n    return 1\n")
+        wrapped = base64.b64encode(("def a():\n    return 1\n" * 20).encode()).decode()
+        wrapped = "\n".join(wrapped[i:i + 60] for i in range(0, len(wrapped), 60)) + "\n"
+        self.assertGreater(wrapped.count("\n"), 2)
+        self.assertEqual(module.decode_blob({"encoding": "base64", "content": wrapped}), "def a():\n    return 1\n" * 20, "the API wraps base64 every 60 characters")
         for bad in (None, {}, {"encoding": "utf-8", "content": "x"}, {"encoding": "base64", "content": "!!!"}, {"encoding": "base64", "content": base64.b64encode(b"\xff\xfe").decode()}):
             self.assertIsNone(module.decode_blob(bad), bad)
         rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
