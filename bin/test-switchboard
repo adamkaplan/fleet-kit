@@ -27732,6 +27732,8 @@ class TestImpactClassAndNarrowForm(LedgerBase):
         self.assertIn("belongs to the impact reviewer", err)
         stored = [e.get("impact_class") for e in self.ledger() if e["kind"] == "review_record"]
         self.assertEqual(stored, ["credentials", None])
+        self.assertEqual(self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve", "--impact-action", "hold",
+                                     "--block", "/nonexistent")[0], 2)
 
     def test_a_hold_with_no_class_is_refused_and_nothing_is_recorded(self):
         for more in ((), ("--impact-class", "")):
@@ -27742,8 +27744,6 @@ class TestImpactClassAndNarrowForm(LedgerBase):
         self.assertEqual(self.record_impact("none")[0], 0)
         self.assertEqual(self.record_impact("hold", "--impact-class", "data")[0], 0)
         self.assertEqual(len([e for e in self.ledger() if e["kind"] == "review_record"]), 2)
-        self.assertEqual(self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve", "--impact-action", "hold",
-                                     "--block", "/nonexistent")[0], 2)
 
     def test_the_block_form_carries_the_class_line(self):
         block = "verdict: approve\nhead: %s\nimpact-action: hold\nimpact-class: Data\nfindings:\n" % LEDGER_HEAD
