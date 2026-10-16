@@ -4,6 +4,7 @@ import json
 import os
 import signal
 import sys
+import time
 import unittest
 import urllib.parse
 
@@ -125,6 +126,10 @@ class Record(td.Driver):
         open(blocker, "w").close()
         p, out = self.run_driver(CW_RUN_RECORD_DIR=os.path.join(blocker, "x"))
         self.assertEqual(p.returncode, 0, out)
+        self.assertEqual(self.st()["pods"], {})
+        self.assertNotIn("run record:", out)
+        self.assertEqual(os.listdir(self.tmp.name).count("blocker"), 1)
+        self.assertTrue(os.path.isfile(blocker))
         self.assert_clean(out)
 
     def test_s5_an_interrupt_still_writes_the_record(self):
@@ -321,14 +326,14 @@ class Record(td.Driver):
     def test_prune_removes_only_old_per_run_directories_of_this_tool(self):
         root = self.records
         os.makedirs(root, mode=0o700)
-        old = time_ago = __import__("time").time() - 40 * 86400
+        old = time.time() - 40 * 86400
 
         def make(name, files=("run.json",), age=40):
             p = os.path.join(root, name)
             os.mkdir(p)
             for f in files:
                 open(os.path.join(p, f), "w").write("{}")
-            t = __import__("time").time() - age * 86400
+            t = time.time() - age * 86400
             os.utime(p, (t, t))
             return p
         old_run = make("coder7-20260101T000000Z-abc123", ("run.json", "tally.json", "transcript.jsonl"))
@@ -414,7 +419,10 @@ class Record(td.Driver):
 
     def test_the_driver_brief_tells_the_worker_where_to_write_its_report(self):
         p, out = self.run_driver()
-        self.assertIn("/home/worker/report", self.read(self.stub_log))
+        log = self.read(self.stub_log)
+        prompt = log[log.index("prompt "):]   # the brief is multi-line: everything the stub logged from the prompt on
+        self.assertTrue(prompt.startswith("prompt " + td.BRIEF), prompt)
+        self.assertIn("/home/worker/report", prompt)
 
 
 if __name__ == "__main__":
