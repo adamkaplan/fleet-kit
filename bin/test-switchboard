@@ -48175,6 +48175,122 @@ class TestTempJanitor(Base):
             self.assertIn(phrase, text)
 
 
+class TestHeavyQueueLogic(unittest.TestCase):
+    """The queueing logic of `heavy_slots.run`, in one process: the lock attempt, the holder list, the clock, the sleep and the command's start are all injected, so no race
+    between real processes decides anything (TestHeavySlots keeps the real-process integration check)."""
+
+    def setUp(self):
+        self.hs = sb.load_heavy_slots()
+        self.out, self.attempts, self.sleeps, self.started, self.now = io.StringIO(), [], [], [], [1000.0]
+        self.fd = os.open(os.devnull, os.O_RDWR)
+        self.addCleanup(lambda: os.close(self.fd) if self.fd is not None else None)
+        self.held = [{"slot": i, "name": "who-%s" % c, "pid": 10 + i, "command": "sh", "since": 1} for i, c in enumerate("abc")]
+
+    def patched(self, take, step):
+        def clock():
+            self.now[0] += step
+            return self.now[0]
+
+        def sleep(seconds):
+            self.sleeps.append(seconds)
+
+        class FakeChild:
+            pid = 4242
+
+            def __init__(child, argv, **kwargs):
+                self.started.append(argv)
+
+            def wait(child):
+                return 0
+
+        for patcher in (mock.patch.object(self.hs, "_take", take), mock.patch.object(self.hs, "holders", lambda state, slots=3: self.held),
+                        mock.patch.object(self.hs.subprocess, "Popen", FakeChild)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return clock, sleep
+
+    def run_heavy(self, take, step, wait_max=1800, report="25"):
+        clock, sleep = self.patched(take, step)
+        environ = {"PATH": os.environ["PATH"], "FLEET_HEAVY_REPORT_SECONDS": report}
+        return self.hs.run(["sh", "-c", "true"], "/state", 3, wait_max, "who-d", environ=environ, out=self.out, clock=clock, sleep=sleep)
+
+    def test_s1_a_busy_queue_waits_says_so_once_and_takes_the_freed_slot(self):
+        def take(state, slots):
+            self.attempts.append(1)
+            return (None, None) if len(self.attempts) <= 5 else (self.fd, 0)
+        code = self.run_heavy(take, 10.0)
+        self.fd = None   # run closed it
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.attempts), 6)
+        self.assertEqual(len(self.started), 1, "the command ran once")
+        self.assertEqual(self.out.getvalue().count("waiting for a slot (3 of 3 busy"), 1, self.out.getvalue())
+        self.assertEqual(len(self.sleeps), 5, "it slept (through the fake) once for each busy attempt")
+
+    def test_s2_past_the_wait_limit_it_gives_up_and_does_not_run_the_command(self):
+        code = self.run_heavy(lambda state, slots: (None, None), 100.0, wait_max=250)
+        self.assertEqual(code, 75)
+        self.assertIn("no slot after", self.out.getvalue())
+        self.assertEqual(self.started, [])
+
+    def scripted(self, nows):
+        """A clock that reads 1000.0 first (when the wait starts), then each of `nows` (seconds since the start) for the clock reads of the wait, then the last again."""
+        values = iter([1000.0] + [1000.0 + n for n in nows])
+        last = [1000.0]
+
+        def clock():
+            last[0] = next(values, last[0])
+            return last[0]
+        return clock
+
+    def at(self, limit, elapsed, free_after=None):
+        """run() with a wait limit of `limit` seconds, whose first check of the clock says `elapsed` seconds have passed; a slot comes free on the attempt numbered `free_after`."""
+        attempts = []
+
+        def take(state, slots):
+            attempts.append(1)
+            return (self.fd, 0) if free_after is not None and len(attempts) >= free_after else (None, None)
+        self.patched(take, 1.0)
+        environ = {"PATH": os.environ["PATH"], "FLEET_HEAVY_REPORT_SECONDS": "100000"}
+        code = self.hs.run(["sh", "-c", "true"], "/state", 3, limit, "who-d", environ=environ, out=self.out, clock=self.scripted([elapsed]), sleep=lambda seconds: None)
+        if free_after is not None:
+            self.fd = None
+        return code, len(attempts)
+
+    def test_the_wait_limit_is_pinned_at_its_boundary_for_the_stated_and_the_default_limit(self):
+        for limit in (250, self.hs.DEFAULT_WAIT_MAX):
+            for elapsed, rule in ((limit - 1, "one second before the limit it still waits and takes the slot that frees"),
+                                  (limit, "at exactly the limit it gives up (the rule is `elapsed >= limit`)"),
+                                  (limit + 1, "past the limit it gives up")):
+                with self.subTest(limit=limit, elapsed=elapsed, rule=rule):
+                    self.out, self.started = io.StringIO(), []
+                    self.fd = os.open(os.devnull, os.O_RDWR)
+                    code, attempts = self.at(limit, elapsed, free_after=2)
+                    if elapsed < limit:
+                        self.assertEqual((code, attempts, len(self.started)), (0, 2, 1), rule)
+                        self.assertNotIn("no slot after", self.out.getvalue())
+                    else:
+                        self.assertEqual((code, attempts, self.started), (75, 1, []), rule)
+                        self.assertIn("no slot after %d s (3 of 3 busy" % elapsed, self.out.getvalue())
+                    for patcher_stop in (os.close,):
+                        if self.fd is not None:
+                            patcher_stop(self.fd)
+                            self.fd = None
+
+    def test_s3_a_state_that_cannot_be_used_runs_the_command_without_a_slot_and_says_so(self):
+        def take(state, slots):
+            raise OSError(13, "Permission denied")
+        code = self.run_heavy(take, 1.0)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.started), 1)
+        self.assertIn("heavy: no slot (Permission denied): running without one", self.out.getvalue())
+
+    def test_s7_these_queue_tests_start_no_process_and_do_not_sleep(self):
+        source = "".join(inspect.getsource(getattr(self, name)) for name in (
+            "test_s1_a_busy_queue_waits_says_so_once_and_takes_the_freed_slot", "test_s2_past_the_wait_limit_it_gives_up_and_does_not_run_the_command",
+            "test_s3_a_state_that_cannot_be_used_runs_the_command_without_a_slot_and_says_so")) + inspect.getsource(self.patched) + inspect.getsource(self.run_heavy)
+        self.assertEqual((source.count("time" + ".sleep"), source.count("subprocess" + ".Popen(")), (0, 0))
+
+
 class TestHeavySlots(Base):
     """`fleet-switchboard heavy` (ask #34): a flock slot semaphore in the state directory; the COMMAND holds the lock; the queue, the kill, the exit status, taskpolicy
     or nice, the holder list, the wait limit and the no-shell guarantee are each run for real with small commands."""
@@ -48224,6 +48340,27 @@ class TestHeavySlots(Base):
         script = 'touch "%s/started.%s"; while [ ! -e "%s/release.%s" ]; do sleep 0.05; done' % (self.home, tag, self.home, tag)
         return ["sh", "-c", script]
 
+    HOLD_CEILING_SECONDS = 300   # the integration test's preconditions: a bound that costs nothing when they hold, on the slowest runner
+
+    def drain(self, proc):
+        """What a wrapper has written to its stderr so far, without waiting for more."""
+        got = b""
+        while proc.stderr is not None and select.select([proc.stderr], [], [], 0)[0]:
+            chunk = os.read(proc.stderr.fileno(), 65536)
+            if not chunk:
+                break
+            got += chunk
+        return got.decode("utf-8", "replace")
+
+    def why(self, wrappers):
+        """The message of a failed precondition: who holds a slot, which commands started, and for each wrapper its exit status (or still running) and its stderr, so a
+        slow runner and a wrapper that ran its command WITHOUT a slot (`heavy: no slot (...)`) can be told apart."""
+        lines = ["holders: %s" % self.hs.holders(self.dir / "fleet-switchboard", 3), "started: %s" % self.started()]   # the path as it is: never made here, so a refused one is shown as it is
+        for tag, proc in wrappers.items():
+            code = proc.poll()
+            lines.append("wrapper %s (pid %d): %s; stderr: %r" % (tag, proc.pid, "exit %d" % code if code is not None else "still running", self.drain(proc)))
+        return "\n".join(lines)
+
     def until(self, test, seconds=90):
         end = time.time() + seconds
         while time.time() < end:
@@ -48236,10 +48373,13 @@ class TestHeavySlots(Base):
         return sorted(p.name for p in self.home.glob("started.*"))
 
     def test_s1_four_callers_of_three_slots_queue_and_the_fourth_runs_when_one_frees(self):
+        """The integration check with real processes (the queue logic itself is tested deterministically in TestHeavyQueueLogic)."""
         procs = {tag: self.start(*self.waiter(tag), name="who-%s" % tag) for tag in "abcd"[:3]}
-        self.assertTrue(self.until(lambda: len(self.started()) == 3))
+        ok = self.until(lambda: len(self.started()) == 3, self.HOLD_CEILING_SECONDS)
+        self.assertTrue(ok, "3 commands started\n" + (self.why(procs) if not ok else ""))
         # the three locks are really held now (the kernel's own answer, not a file): the fourth cannot take one, whatever the machine's speed
-        self.assertTrue(self.until(lambda: len(self.hs.holders(self.state(), 3)) == 3), "3 of 3 slots held before the fourth starts")
+        ok = self.until(lambda: len(self.hs.holders(self.state(), 3)) == 3, self.HOLD_CEILING_SECONDS)
+        self.assertTrue(ok, "3 of 3 slots held before the fourth starts\n" + (self.why(procs) if not ok else ""))
         fourth = self.start(*self.waiter("d"), name="who-d")
         lines, queued = [], threading.Event()
 
@@ -48250,7 +48390,7 @@ class TestHeavySlots(Base):
                     queued.set()
         reader = threading.Thread(target=pump, daemon=True)
         reader.start()
-        self.assertTrue(queued.wait(90), "the fourth wrapper (exit %r) never said it was waiting; holders: %s; started: %s" % (
+        self.assertTrue(queued.wait(self.HOLD_CEILING_SECONDS), "the fourth wrapper (exit %r) never said it was waiting; holders: %s; started: %s" % (
             fourth.poll(), self.hs.holders(self.state(), 3), self.started()))
         self.assertEqual(len(self.started()), 3, "at most 3 run at once")
         (self.home / "release.a").write_text("")
@@ -48263,6 +48403,22 @@ class TestHeavySlots(Base):
         err = "".join(lines)
         self.assertIn("heavy: waiting for a slot (3 of 3 busy", err)
         self.assertRegex(err, r"who-[abc] sh")
+
+    def test_the_diagnosis_of_a_failed_precondition_shows_a_wrapper_that_ran_without_a_slot(self):
+        """A wrapper whose state directory is refused runs its command with NO slot (`heavy: no slot (...)`): the command starts, no slot is held."""
+        (self.dir / "fleet-switchboard").write_text("a file where the state directory should be")
+        proc = self.start("sh", "-c", 'touch "%s/started.z"' % self.home, name="who-z")
+        self.assertEqual(proc.wait(timeout=self.HOLD_CEILING_SECONDS), 0)
+        message = self.why({"z": proc}).replace(str(self.dir), "<dir>")
+        self.assertEqual(message.count("heavy: no slot"), 1, message)
+        self.assertEqual(message.count("exit 0"), 1, message)
+        self.assertEqual(message.count("holders: []"), 1, message)
+        self.assertEqual(message.count("started: ['started.z']"), 1, message)
+
+    def test_the_ceiling_of_the_integration_preconditions_is_300_seconds(self):
+        self.assertEqual(self.HOLD_CEILING_SECONDS, 300)
+        source = inspect.getsource(self.test_s1_four_callers_of_three_slots_queue_and_the_fourth_runs_when_one_frees)
+        self.assertEqual(source.count("self.HOLD_CEILING_SECONDS"), 3, "both preconditions and the queued wait use it")
 
     def test_s2_a_holder_killed_with_its_whole_group_frees_its_slot_by_itself(self):
         holder = self.start(*self.waiter("h"), slots=1, name="doomed")
