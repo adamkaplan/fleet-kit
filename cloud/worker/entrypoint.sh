@@ -39,6 +39,9 @@ if usable model-auth; then
 fi
 
 # the default model and the worker agent: the pod has no OpenCode config, so write one (no secret in it) on tmpfs and point the server at it
+case "${CW_MODEL:-}" in
+  *[!A-Za-z0-9._/:-]*) echo "worker: CW_MODEL has a character outside [A-Za-z0-9._/:-]; refusing to start" >&2; exit 1 ;;
+esac
 cfgdir="$TMP/config"
 ( umask 077; mkdir -p "$cfgdir/opencode"
   printf '{"model": "%s",\n' "${CW_MODEL:-github-copilot/claude-sonnet-5.5}" > "$cfgdir/opencode/opencode.json"
@@ -66,6 +69,7 @@ tr -d '\r\n' < "${CW_RUN_DIR:-/run/cw}/git-token"
 printf '\n'
 H
   chmod 755 "$bin/git-credential-cw"
+  # No git-token means no wrappers: the OpenCode deny rules are then the only pod-side layer.
   # The pod-side refusal of merge, force-push, push to the default branch, issue/label writes and settings calls. It is a
   # convenience and NOT the guard: calling the real binary by its path skips it. The guard is the repository's own rules
   # and the token's scope. Installed with the wrappers; a missing guard file refuses the start (no wrapper without it).

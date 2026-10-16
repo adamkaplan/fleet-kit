@@ -8,12 +8,14 @@
 # repository's own rules (branch protection or a ruleset: no merge, no push to the default branch, no force-push) and the
 # token's scope (preflight, #545). Do not rely on this file for either.
 #
+# Fail mode: an internal failure of the guard itself stops the command (the wrappers run `guard || exit $?`); an option the parser cannot
+# read is let through (fail open), and the default-branch set degrades to main and master when origin/HEAD is unreadable. A pod
+# started without a git-token gets no wrappers at all: then the OpenCode deny rules are the only pod-side layer.
 # Env: CW_REAL_GIT (the real git, used to read the current branch), CW_DEFAULT_BRANCH (extra default branch names,
 # space or comma separated). `main` and `master` and the branch origin/HEAD points to are always treated as default.
 tool=${1:-}; [ $# -gt 0 ] && shift
 tail_msg="the repository's rules are the guard; this wrapper is only a convenience"
 refuse() { echo "refused: $1: $tail_msg" >&2; exit 3; }
-lower() { printf '%s' "$1" | tr 'A-Z' 'a-z'; }
 real_git="${CW_REAL_GIT:-git}"
 
 defaults() {
@@ -79,22 +81,29 @@ do_git() {
 api_check() {   # gh api ...: $@ are the words after `api`
   method=""; path=""; body=0; take=""
   for a in "$@"; do
-    if [ -n "$take" ]; then method=$a; take=""; continue; fi
+    case "$take" in
+      method) method=$a; take=""; continue ;;
+      skip) take=""; continue ;;
+      field) body=1; take=""; continue ;;
+    esac
     case "$a" in
-      -X|--method) take=1 ;;
+      -X|--method) take=method ;;
       -X?*) method=${a#-X} ;;
       --method=*) method=${a#--method=} ;;
-      -f|-F|--field|--raw-field|--input|-f?*|-F?*|--field=*|--raw-field=*|--input=*) body=1 ;;
+      -H|--header|-q|--jq|-t|--template|--hostname|--cache|-p|--preview) take=skip ;;
+      -f|-F|--field|--raw-field|--input) take=field ;;
+      -f?*|-F?*|--field=*|--raw-field=*|--input=*) body=1 ;;
       -*) ;;
       *) [ -z "$path" ] && path=$a ;;
     esac
   done
   case "$*" in *mergePullRequest*|*enablePullRequestAutoMerge*) refuse "merging a pull request" ;; esac
+  case "$*" in *mutation*) refuse "writing through GraphQL (merges, refs, issues, labels, settings)" ;; esac
   m=$(printf '%s' "$method" | tr 'a-z' 'A-Z')
   [ -z "$m" ] && { [ "$body" = 1 ] && m=POST || m=GET; }
   p=$(printf '%s' "$path" | sed 's|^/||; s|?.*||')
   case "$p" in
-    repos/*/pulls/*/merge) refuse "merging a pull request" ;;
+    repos/*/pulls/*/merge|repos/*/merges) refuse "merging a pull request" ;;
   esac
   [ "$m" = GET ] && return 0
   case "$p" in

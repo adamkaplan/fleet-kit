@@ -78,7 +78,9 @@ class Guard(unittest.TestCase):
         # stand-ins that say what they ran: the real binaries are never reached by a refused command
         for tool in ("gh", "git"):
             with open(os.path.join(cls.realbin, tool), "w") as f:
-                f.write('#!/bin/sh\necho "real %s ran: $*"\n[ "$1" = symbolic-ref ] && echo main\nexit 0\n' % tool)
+                f.write('#!/bin/sh\n'
+                        'if [ "$1" = symbolic-ref ]; then\n  case "$*" in *origin/HEAD*) echo "${STANDIN_ORIGIN:-origin/main}" ;; *) echo "${STANDIN_BRANCH:-feature-x}" ;; esac\n  exit 0\nfi\n'
+                        'echo "real %s ran: $*"\nexit 0\n' % tool)
             os.chmod(os.path.join(cls.realbin, tool), 0o755)
         cls.env = {"PATH": cls.realbin + ":/usr/bin:/bin", "HOME": cls.home, "WORKER_DOCKER": "0", "CW_RUN_DIR": cls.run_dir,
                    "CW_TMP_DIR": cls.tmpfs, "CW_SHARE_DIR": cls.share, "CW_DEFAULT_BRANCH": "trunk", "GIT_CONFIG_NOSYSTEM": "1"}
@@ -87,8 +89,8 @@ class Guard(unittest.TestCase):
         cls.bin = os.path.join(cls.tmpfs, "bin")
         cls.conf = json.loads(read(os.path.join(cls.tmpfs, "config", "opencode", "opencode.json")))
 
-    def call(self, cmd):
-        env = dict(self.env, PATH=self.bin + ":" + self.env["PATH"])
+    def call(self, cmd, **extra):
+        env = dict(self.env, PATH=self.bin + ":" + self.env["PATH"], **extra)
         return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=30)
 
     # -- S3: the wrapper --
@@ -109,12 +111,44 @@ class Guard(unittest.TestCase):
                 self.assertEqual(r.returncode, 0, r.stderr)
                 self.assertEqual(r.stdout.splitlines()[-1].split(" ran: ")[1], " ".join(cmd[1:]))
 
-    def test_s3_a_push_from_the_default_branch_with_no_refspec_is_refused_and_from_a_feature_branch_is_not(self):
-        # the stand-in git answers `symbolic-ref` with "main": the current branch is the default one
+    def test_s3_a_push_with_no_refspec_follows_the_current_branch(self):
         for cmd in (["git", "push"], ["git", "push", "origin"], ["git", "push", "origin", "HEAD"]):
             with self.subTest(cmd=" ".join(cmd)):
-                self.assertEqual(self.call(cmd).returncode, 3)
-        self.assertEqual(self.call(["git", "push", "origin", "feature-x"]).returncode, 0)
+                self.assertEqual(self.call(cmd, STANDIN_BRANCH="main").returncode, 3)
+                self.assertEqual(self.call(cmd, STANDIN_BRANCH="trunk").returncode, 3)   # CW_DEFAULT_BRANCH
+                self.assertEqual(self.call(cmd, STANDIN_BRANCH="feature-x").returncode, 0)
+        # the branch origin/HEAD names is a default branch too
+        self.assertEqual(self.call(["git", "push"], STANDIN_BRANCH="develop", STANDIN_ORIGIN="origin/develop").returncode, 3)
+        self.assertEqual(self.call(["git", "push", "origin", "develop"], STANDIN_ORIGIN="origin/develop").returncode, 3)
+        self.assertEqual(self.call(["git", "push", "origin", "develop"]).returncode, 0)
+
+    def test_s3_more_forms_are_refused_and_value_taking_options_do_not_hide_the_path(self):
+        more = [
+            ["gh", "pr", "edit", "3", "--add-label", "x"], ["gh", "pr", "edit", "3", "--remove-label=x"],
+            ["gh", "api", "graphql", "-f", "query=mutation { mergePullRequest(input: {}) { clientMutationId } }"],
+            ["gh", "api", "graphql", "-f", "query=mutation { updateRef(input: {}) { clientMutationId } }"],
+            ["git", "push", "--all", "origin"], ["git", "push", "--mirror"], ["git", "push", "-fu", "origin", "feature-x"],
+            ["gh", "api", "-X", "POST", "-H", "Accept: application/vnd.github+json", "repos/%s/issues" % REPO, "-f", "title=t"],
+            ["gh", "api", "--jq", ".id", "-X", "POST", "repos/%s/labels" % REPO],
+            ["gh", "api", "-f", "name=web", "repos/%s/hooks" % REPO],
+            ["gh", "api", "--input", "b.json", "-X", "PUT", "repos/%s/pulls/12/merge" % REPO],
+            ["gh", "api", "-X", "POST", "repos/%s/merges" % REPO],
+            ["gh", "-R", REPO, "pr", "merge", "3"],
+        ]
+        for cmd in more:
+            with self.subTest(cmd=" ".join(cmd[:5])):
+                r = self.call(cmd)
+                self.assertEqual(r.returncode, 3, r.stderr)
+                self.assertEqual(len(r.stderr.splitlines()), 1)
+        for cmd in (["gh", "api", "-H", "Accept: x", "repos/%s/pulls/12" % REPO], ["git", "push", "origin", "feature/maintenance"]):
+            self.assertEqual(self.call(cmd).returncode, 0, cmd)   # the wrapper does not over-refuse a read or a branch named like main
+
+    def test_s3_an_unsafe_cw_model_refuses_the_start(self):
+        r = subprocess.run(["sh", ENTRYPOINT, "echo", "started"], env=dict(self.env, CW_TMP_DIR=self.tmpfs + "-3", CW_MODEL='a","permission":"allow'),
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("started", r.stdout)
+        self.assertFalse(os.path.exists(self.tmpfs + "-3"))
 
     def test_u1_the_refusal_line_never_contains_an_argument_value(self):
         for cmd in (["gh", "issue", "comment", "3", "--body", SECRET], ["git", "push", "--force", "origin", SECRET],
