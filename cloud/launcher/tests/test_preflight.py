@@ -1,5 +1,7 @@
 """Offline tests for cloud/launcher/preflight.py (S1, U2): a loopback stub for the GitHub API; no network."""
+import hashlib
 import http.server
+import shutil
 import json
 import os
 import subprocess
@@ -140,9 +142,16 @@ class Preflight(unittest.TestCase):
         Stub.org_code, Stub.org_types, Stub.fail_code, Stub.org_extra = None, [], 500, []
         Other.seen = []
         self.dir = tempfile.mkdtemp()
+        # a private copy of the program: its repo-approvals.json is the only approvals file there is
+        self.copy = os.path.join(self.dir, "launcher")
+        os.makedirs(self.copy)
+        for n in ("preflight.py", "app_token.py", "token_mint.py", "repo-approvals.json"):
+            shutil.copy(os.path.join(os.path.dirname(PREFLIGHT), n), self.copy)
+        self.prog = os.path.join(self.copy, "preflight.py")
 
     def approvals(self, content, raw=False):
-        path = os.path.join(self.dir, "approvals.json")
+        """Write the private copy's repo-approvals.json; returns its path."""
+        path = os.path.join(self.copy, "repo-approvals.json")
         with open(path, "w") as f:
             f.write(content if raw else json.dumps(content))
         return path
@@ -150,7 +159,7 @@ class Preflight(unittest.TestCase):
     def run_pf(self, *args, **env):
         e = dict(os.environ, CW_GITHUB_API_BASE=self.base, CW_PREFLIGHT_TOKEN_CMD="echo " + TOKEN)
         e.update(env)
-        return subprocess.run([sys.executable, PREFLIGHT, REPO, *args], env=e, capture_output=True, text=True, timeout=60)
+        return subprocess.run([sys.executable, self.prog, REPO, *args], env=e, capture_output=True, text=True, timeout=60)
 
     def test_fully_protected_passes_and_only_reads(self):
         p = self.run_pf()
@@ -251,10 +260,12 @@ class Preflight(unittest.TestCase):
         Stub.org_types = types or list(FULL)
         Stub.org_code = code
 
-    ENTRY = {"approved_by": "the owner", "approved_at": "2026-10-16", "reason": "protected by the org ruleset"}
+    KEY = hashlib.sha256(REPO.lower().encode()).hexdigest()
+    ENTRY = {"approved_by": "the-owner", "approved_at": "2026-10-16", "reason": "protected by the org ruleset", "pr": "12"}
+    LOUD = ("preflight ok: protection NOT VERIFIED (organization ruleset 9 unreadable); owner-approved by "
+            "the-owner on 2026-10-16 (pr #12): protected by the org ruleset")
 
     def test_a_403_on_an_org_ruleset_is_not_counted_and_the_repo_own_rules_can_pass(self):
-        Stub.rules = list(FULL)
         Stub.org_extra = ["deletion"]  # an unreadable organization ruleset on top of the repository's own three
         Stub.org_code = 403
         p = self.run_pf()
@@ -262,62 +273,88 @@ class Preflight(unittest.TestCase):
         self.assertIn("organization ruleset 9: not readable with this token, not counted", p.stdout)
         self.assertIn("preflight ok: deletion, non_fast_forward, pull_request", p.stdout)
 
-    def test_only_unreadable_org_rules_fail_with_the_approvals_pointer(self):
+    def test_S3_the_shipped_file_is_empty_and_an_org_only_repo_fails_with_the_pointer(self):
+        with open(os.path.join(os.path.dirname(PREFLIGHT), "repo-approvals.json")) as f:
+            self.assertEqual(json.load(f), {})
         self.org_only()
         p = self.run_pf()
         self.assertEqual(p.returncode, 1, p.stdout)
         self.assertIn("not readable with this token, not counted", p.stdout)
-        self.assertIn("an owner approval entry is needed: see CW_REPO_APPROVALS", p.stdout)
-        self.assertEqual(self.run_pf(CW_REPO_APPROVALS=self.approvals({"acme-org/other": self.ENTRY})).returncode, 1)
+        self.assertIn("an owner approval entry is needed", p.stdout)
 
-    def test_a_valid_approval_passes_loudly_every_run(self):
+    def test_S3_a_valid_entry_passes_loudly_and_matches_the_lowercased_name(self):
         self.org_only()
-        f = self.approvals({REPO.upper(): self.ENTRY})
-        for _ in range(2):
-            p = self.run_pf(CW_REPO_APPROVALS=f)
-            self.assertEqual(p.returncode, 0, p.stdout)
-            self.assertIn("preflight ok: protection NOT VERIFIED (organization ruleset 9 unreadable); owner-approved by "
-                          "the owner on 2026-10-16: protected by the org ruleset", p.stdout)
+        self.approvals({self.KEY: self.ENTRY})
+        p = self.run_pf()
+        self.assertEqual(p.returncode, 0, p.stdout)
+        self.assertIn(self.LOUD, p.stdout)
 
-    def test_a_bad_approvals_file_or_entry_exits_2(self):
+    def test_S4_absent_malformed_incomplete_or_other_repo_fails_safe(self):
         self.org_only()
-        for bad in ({"approved_by": "x", "approved_at": "d"}, {**self.ENTRY, "reason": " "}, {**self.ENTRY, "approved_by": 5}, "x"):
-            self.assertEqual(self.run_pf(CW_REPO_APPROVALS=self.approvals({REPO: bad})).returncode, 2, bad)
-        self.assertEqual(self.run_pf(CW_REPO_APPROVALS=self.approvals("{not json", raw=True)).returncode, 2)
-        self.assertEqual(self.run_pf(CW_REPO_APPROVALS=self.approvals("[]", raw=True)).returncode, 2)
-        self.assertEqual(self.run_pf(CW_REPO_APPROVALS=os.path.join(self.dir, "none.json")).returncode, 2)
-        self.assertEqual(self.run_pf(CW_REPO_APPROVALS=self.dir).returncode, 2)
+        os.remove(os.path.join(self.copy, "repo-approvals.json"))
+        self.assertEqual(self.run_pf().returncode, 2)  # absent
+        for raw in ("{not json", "[]", ""):
+            self.approvals(raw, raw=True)
+            self.assertEqual(self.run_pf().returncode, 2, raw)
+        for field in self.ENTRY:  # each field missing or empty
+            for bad in (None, " ", 5):
+                e = dict(self.ENTRY)
+                e.pop(field) if bad is None else e.update({field: bad})
+                self.approvals({self.KEY: e})
+                self.assertEqual(self.run_pf().returncode, 2, (field, bad))
+        self.approvals({self.KEY: "x"})
+        self.assertEqual(self.run_pf().returncode, 2)
+        # an entry for another repository (or the unhashed name) is ignored: an ordinary failure, exit 1
+        self.approvals({hashlib.sha256(b"acme-org/other").hexdigest(): self.ENTRY, REPO: self.ENTRY})
+        self.assertEqual(self.run_pf().returncode, 1)
 
-    def test_the_approvals_file_is_not_read_when_it_is_not_the_reason(self):
-        Stub.rules = ["pull_request", "deletion"]  # non_fast_forward is visibly missing and no unreadable rule carries it
-        Stub.org_types = ["deletion"]
-        Stub.org_code = 403
-        f = self.approvals({REPO: self.ENTRY})
-        self.assertEqual(self.run_pf(CW_REPO_APPROVALS=f).returncode, 1)
-        self.assertEqual(self.run_pf(CW_REPO_APPROVALS=os.path.join(self.dir, "none")).returncode, 1)  # not even read
-        Stub.rules, Stub.org_types = [], []
-        self.assertEqual(self.run_pf(CW_REPO_APPROVALS=f).returncode, 1)  # an unprotected repo
+    def test_S5_the_loud_line_is_printed_on_every_run(self):
+        self.org_only()
+        self.approvals({self.KEY: self.ENTRY})
+        for _ in range(3):
+            self.assertIn(self.LOUD, self.run_pf().stdout)
 
-    def test_an_approval_does_not_rescue_a_readable_ruleset_without_a_rule_or_with_a_problem(self):
-        Stub.rules, Stub.enforcement = ["pull_request", "deletion"], "evaluate"
-        Stub.org_types, Stub.org_code = ["pull_request"], 403
-        self.assertEqual(self.run_pf(CW_REPO_APPROVALS=self.approvals({REPO: self.ENTRY})).returncode, 1)
+    def test_S6_an_approval_rescues_no_visible_missing_rule_and_no_other_problem(self):
+        self.approvals({self.KEY: self.ENTRY})
+        Stub.rules = ["pull_request", "deletion"]  # non_fast_forward visibly missing, no unreadable rule carries it
+        Stub.org_types, Stub.org_code = ["deletion"], 403
+        self.assertEqual(self.run_pf().returncode, 1)
+        Stub.rules, Stub.org_types = [], []  # an unprotected repository
+        self.assertEqual(self.run_pf().returncode, 1)
+        Stub.rules, Stub.enforcement = ["pull_request", "deletion"], "evaluate"  # a readable ruleset not enforced
+        Stub.org_types = ["non_fast_forward"]
+        self.assertEqual(self.run_pf().returncode, 1)
+        Stub.rules, Stub.enforcement = ["non_fast_forward", "deletion"], "active"  # no review rule anywhere
+        Stub.org_types = []
+        self.assertEqual(self.run_pf().returncode, 1)
+
+    def test_S7_no_override_path_an_environment_setting_a_flag_or_a_file_elsewhere_is_ignored(self):
+        self.org_only()
+        outside = os.path.join(self.dir, "elsewhere.json")
+        with open(outside, "w") as f:
+            json.dump({self.KEY: self.ENTRY, REPO: self.ENTRY}, f)
+        for env in ({"CW_REPO_APPROVALS": outside}, {"CW_REPO_APPROVALS": "1"}, {"CW_APPROVALS": outside}):
+            p = self.run_pf(**env)
+            self.assertEqual(p.returncode, 1, p.stdout)
+            self.assertNotIn("NOT VERIFIED", p.stdout)
+        for flag in ("--approve", "--approvals=" + outside, "--accept-org"):
+            self.assertEqual(self.run_pf(flag).returncode, 2)  # not an option: usage, exit 2
+        with open(PREFLIGHT) as f:
+            self.assertNotIn("CW_REPO_APPROVALS", f.read())
 
     def test_only_a_403_on_an_org_ruleset_is_not_readable(self):
+        self.approvals({self.KEY: self.ENTRY})
         for code in (404, 500, "drop"):
             self.org_only(code)
-            p = self.run_pf(CW_REPO_APPROVALS=self.approvals({REPO: self.ENTRY}))
+            p = self.run_pf()
             self.assertEqual(p.returncode, 2, (code, p.stdout))
             self.assertNotIn("not counted", p.stdout)
-        Stub.org_code = None
-        Stub.org_types = []
-        Stub.org = False
+        Stub.org_code, Stub.org_types, Stub.org = None, [], False
         Stub.fail = "/rulesets/7"
         self.assertEqual(self.run_pf().returncode, 2)
 
     def test_a_403_on_the_repository_own_ruleset_or_rules_endpoint_exits_2(self):
-        Stub.fail = "/rulesets/7"
-        Stub.fail_code = 403
+        Stub.fail, Stub.fail_code = "/rulesets/7", 403
         self.assertEqual(self.run_pf().returncode, 2)
         Stub.fail = "/rules/branches/main"
         self.assertEqual(self.run_pf().returncode, 2)

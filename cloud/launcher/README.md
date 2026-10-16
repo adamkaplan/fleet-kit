@@ -90,21 +90,32 @@ organization `Administration` permission at write; this project does not grant i
 ruleset is refused with HTTP 403, that ruleset is not counted and the output says so, one line each:
 `organization ruleset <id>: not readable with this token, not counted`. The repository passes on the rules the
 preflight can verify. If it fails only because those rules are not counted (exit 1: `protection comes from an
-organization ruleset this token cannot read; an owner approval entry is needed: see CW_REPO_APPROVALS`), the owner can
-enable it with one entry, set once per repository, in the JSON file named by `CW_REPO_APPROVALS` (default: none; the
-program never writes it):
+organization ruleset this token cannot read; an owner approval entry is needed`), it is enabled by one entry in
+`cloud/launcher/repo-approvals.json`, which ships as `{}` (nothing is enabled). The file is read from the program's own
+checkout: there is no setting, flag or other path for it, and an approval can arrive only through a pull request that
+changes that file, which needs the owner's clear. To add one, compute the key (the repository is public, so only a hash
+of the lowercased `owner/name` is stored):
 
-```json
-{"acme-org/widget-service": {"approved_by": "the owner", "approved_at": "2026-10-16", "reason": "protected by the organization ruleset"}}
+```sh
+python3 -c 'import hashlib;print(hashlib.sha256(b"owner/name".lower()).hexdigest())'
 ```
 
-The file is read only in that one case. The key is the exact `OWNER/NAME` (case-insensitive, no wildcards); an entry for
-another repository is ignored; the three fields must be non-empty one-line strings. A matching entry passes with a line on
-every run: `preflight ok: protection NOT VERIFIED (organization ruleset <id> unreadable); owner-approved by <who> on
-<date>: <reason>`. A file or matching entry that cannot be read exits 2. The approval never covers a rule the preflight can
-see is missing, an unprotected repository, or a readable ruleset that is not enforced. Any other failed read (404, 500, a
-dropped connection, odd JSON, too large) of any ruleset, and a 403 on a repository's own ruleset, still exits 2.
+```json
+{"<that hash>": {"approved_by": "<the owner's login>", "approved_at": "2026-10-16", "reason": "<one neutral line>", "pr": "<the number of the pull request that adds this entry>"}}
+```
+
+All four fields must be non-empty one-line strings. The file is read only when the sole reason for failing is the
+unreadable organization rulesets (everything missing would be supplied by the rules they carry). A matching entry passes
+with a line on every run: `preflight ok: protection NOT VERIFIED (organization ruleset <id> unreadable); owner-approved
+by <who> on <date> (pr #<n>): <reason>`. A file or matching entry that cannot be read exits 2; an entry for another
+repository is ignored. The approval never covers a rule the preflight can see is missing, an unprotected repository, or
+a readable ruleset that is not enforced. Any other failed read (404, 500, a dropped connection, odd JSON, too large) of
+any ruleset, and a 403 on a repository's own ruleset, still exits 2.
+
+Residual: an agent that runs as the owner's operating-system user can edit any local file, including this installed
+program. The approvals file is no weaker than the code itself; the repository's review gate and the owner's clear are
+what protect both.
 
 Settings (environment): `CW_APP_ID_CMD`, `CW_APP_KEY_CMD`, `CW_APP_INSTALLATION_CMD` (each a command printing the
 value; otherwise read from the vault), `CW_VAULT_SUBSCRIPTION` and `CW_VAULT_NAME` (no defaults), `CW_OPENSSL`,
-`CW_REPO_APPROVALS` (path of the approvals file, default none), `CW_GITHUB_API_BASE` (tests), `CW_PREFLIGHT_TOKEN_CMD` (tests: replaces the mint in the preflight).
+`CW_GITHUB_API_BASE` (tests), `CW_PREFLIGHT_TOKEN_CMD` (tests: replaces the mint in the preflight).

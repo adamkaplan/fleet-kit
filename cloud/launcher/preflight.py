@@ -11,7 +11,7 @@ The token comes from app_token.py, or from the command CW_PREFLIGHT_TOKEN_CMD wh
 
 An ORGANIZATION ruleset the token cannot read (HTTP 403 on its GET: an App token never can) is not counted, one line
 each. If everything that is then missing would be supplied by the rules such rulesets carry, the repository fails
-(exit 1) unless the owner approval entry for it exists in the file named by CW_REPO_APPROVALS (see approval()): then it
+(exit 1) unless the owner approval entry for it exists in repo-approvals.json beside this program (see approval()): then it
 passes with a loud "NOT VERIFIED" line on every run. Any other failed read (404, 500, a dropped connection, odd JSON,
 too large; a 403 on a repository's own ruleset) is exit 2.
 
@@ -32,6 +32,7 @@ What this CANNOT see: bypass actors (who may skip a rule), and whether a rule is
 identity. The live refusal check (a real push, force-push and delete attempted on a disposable repository, S4) is the
 real proof; this is only the cheap guard before a worker is launched.
 """
+import hashlib
 import json
 import os
 import re
@@ -208,15 +209,16 @@ def _field(v):
     return isinstance(v, str) and v.strip() != "" and len(v) <= 300 and not re.search(r"[\x00-\x1f\x7f]", v)
 
 
+APPROVALS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "repo-approvals.json")
+
+
 def approval(target):
-    """The owner approval entry for target from the file named by CW_REPO_APPROVALS: (who, date, reason), None when
-    there is none (no file named, or no entry for this repository), or raises Unreadable (fail closed) when the file
-    or the matching entry cannot be read."""
-    path = os.environ.get("CW_REPO_APPROVALS")
-    if not path:
-        return None
+    """The owner approval entry for target from repo-approvals.json beside this program (no setting, no flag: an approval
+    arrives only through a reviewed pull request that changes that file). Keys are the sha256 hex of the lowercased
+    OWNER/NAME. Returns (who, date, pr, reason), None when there is no entry for this repository, or raises Unreadable
+    (fail closed) when the file or the matching entry cannot be read."""
     try:
-        with open(path, "rb") as f:
+        with open(APPROVALS, "rb") as f:
             raw = f.read(65537)
         if len(raw) > 65536:
             raise Unreadable("the approvals file is larger than 65536 bytes")
@@ -227,14 +229,14 @@ def approval(target):
         raise Unreadable("the approvals file could not be read or is not JSON")
     if not isinstance(data, dict):
         raise Unreadable("the approvals file is not a JSON object")
-    hits = [v for k, v in data.items() if isinstance(k, str) and k.lower() == target.lower()]
-    if not hits:
+    key = hashlib.sha256(target.lower().encode()).hexdigest()
+    if key not in data:
         return None
-    e = hits[0]
-    if len(hits) != 1 or not isinstance(e, dict) or not all(_field(e.get(k)) for k in ("approved_by", "approved_at", "reason")):
-        raise Unreadable("the approval entry for this repository is malformed (approved_by, approved_at and reason must "
-                         "be non-empty one-line strings, once)")
-    return e["approved_by"].strip(), e["approved_at"].strip(), e["reason"].strip()
+    e = data[key]
+    if not isinstance(e, dict) or not all(_field(e.get(k)) for k in ("approved_by", "approved_at", "reason", "pr")):
+        raise Unreadable("the approval entry for this repository is malformed (approved_by, approved_at, reason and pr "
+                         "must be non-empty one-line strings)")
+    return e["approved_by"].strip(), e["approved_at"].strip(), e["pr"].strip().lstrip("#"), e["reason"].strip()
 
 
 def main(argv):
@@ -297,10 +299,10 @@ def main(argv):
                 say("cannot read: %s" % e)
                 return 2
             if ok:
-                say("preflight ok: protection NOT VERIFIED (organization ruleset %s unreadable); owner-approved by %s on %s: %s" % ((ids,) + ok))
+                say("preflight ok: protection NOT VERIFIED (organization ruleset %s unreadable); owner-approved by %s on %s (pr #%s): %s" % ((ids,) + ok))
                 return 0
             say("FAIL on %s: protection comes from an organization ruleset this token cannot read; an owner approval entry "
-                "is needed: see CW_REPO_APPROVALS" % branch)
+                "is needed: see cloud/launcher/README.md (an entry in repo-approvals.json)" % branch)
             return 1
     for m in missing:
         say("FAIL on %s: missing %s" % (branch, m))
