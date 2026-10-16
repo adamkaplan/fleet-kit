@@ -58,7 +58,7 @@ One extra GitHub account (`agent-bot`), added to each repository as a collaborat
 | Cost | One extra account, no money for public repositories. A seat on private organisation repositories. A one-time setup per repository (invite and accept). It fits the existing `gh_users` map as a new account name, so no shim code changes |
 | What breaks | Little. A Write collaborator cannot change settings, rulesets, branch protection or collaborators, which is the intent, and everything else agents do (push, pull request, label, comment) is allowed. Anything that relied on admin power breaks and moves to the owner. Pull requests now show a different author, which is useful: the owner can approve what an agent wrote |
 | Rotation | The machine user's token has its own expiry (fine-grained, up to a year; a fine-grained token reaches only repositories its owner account owns or an organisation grants, so for repositories under another personal account a classic token with `repo` may be the only form, which is broader and must be weighed first) or a classic token with no expiry, which the owner should avoid. Rotating means one new token and one `gh auth login` in the keyring; revoking the user's access is one step per repository, or deleting the account |
-| Who merges | The owner's own login approves and merges, or clears holds. The machine user's pull requests can be approved by the owner without the self-approval problem, so the ruleset's review rule keeps working. The machine user itself does not hold bypass |
+| Who merges | The owner's own login merges, clears holds and can approve what the machine user wrote. A Write-role user can still approve other people's pull requests and can merge any pull request the ruleset allows. What stops it is only the ruleset's required checks and required approvals: with 0 required approvals an agent's approval changes nothing for GitHub. The independent review in this fleet is a fleet gate (the switchboard's), not a GitHub rule. So Option B satisfies "cannot merge around the ruleset" only partly: the agent cannot bypass the ruleset, but it can merge through it. The machine user does not hold bypass |
 
 ### Option C: the App installation token for local agents too
 
@@ -77,7 +77,7 @@ Recommended option: Option B (a separate machine user with write, not admin).
 
 Why:
 
-- It is the only option that needs no code change and still separates the agent's identity from the owner's, so the review rule keeps working and the audit trail says which actor did what.
+- It is the only option that needs no code change and still separates the agent's identity from the owner's, so the owner can approve an agent's pull requests, and the audit trail says which actor did what.
 - It meets the intent with GitHub enforcing the limit, by role, rather than a shim that tries to guess.
 - It fits the existing account map (`gh_users`): the machine user is one more account name.
 - Option C is a better end state, with an hour of lifetime and no manual rotation, but it needs a top-tier shim change first. Take it as the follow-up once B is in place. Option A leaves agents acting under the owner's name and a manual token per repository.
@@ -85,7 +85,7 @@ Why:
 Who merges with which credential after the change:
 
 - Agents push branches, open pull requests, add labels and comments with the machine user's token.
-- The owner's own login approves, merges and clears holds, and is the only credential that can change settings, rulesets, branch protection or collaborators.
+- The owner's own login approves, merges and clears holds. Agents can still merge through the ruleset: only its required checks and approvals stop them, and the independent review is a fleet gate, not a GitHub rule. The owner's login is the only credential that can change settings, rulesets, branch protection or collaborators.
 - Repositories on another account are not part of this change.
 
 ## Migration
@@ -115,10 +115,18 @@ Rollback returns to today's behaviour, including admin reach for agents, so reco
 These are the only credential-creating or credential-changing steps. No command here belongs in a script an agent runs.
 
 1. Create the account for the agent (once), with an email the owner controls, and turn on two-factor authentication.
-2. In that account's settings, create a fine-grained token limited to the chosen repositories, with the three permissions above and an expiry of no more than a year. Store it only in the keyring, never in a file, an issue or a message.
+2. Create the token or tokens, one per resource owner. A fine-grained token is scoped to ONE resource owner (the account or organisation that owns the repositories), so the coverage is:
+
+   | Repository (neutral) | Owner | Token that can cover it |
+   |----------------------|-------|-------------------------|
+   | `acme-org/widget-api`, `acme-org/widget-web` | an organisation | A fine-grained token with the organisation as resource owner (the machine user is a member or outside collaborator, and the organisation allows it): one token for all of them |
+   | `owner-user/notes` | the owner's personal account | A fine-grained token cannot be issued for another person's personal account. Use a classic token of the machine user with the `repo` scope. It is broader on paper, but the Write role caps what it can do (no settings, rulesets or collaborators), so weigh that and record it |
+   | `other-user/widget-lib` (the other account) | a different personal account | Out of reach for the owner's tokens and untouched by this work (read-only, as today). No step below applies to it |
+
+   Give each token the three permissions above, an expiry of no more than a year, and store it only in the keyring, never in a file, an issue or a message.
 3. In each repository's settings, add the account as a collaborator with the Write role. Never Maintain or Admin.
-4. Check each ruleset: the review rule is on, and the machine user is not in a bypass list.
+4. Check each ruleset: its required checks (and any required approvals) are what you want agents held to, because a Write-role user can approve and merge through it, and the machine user is not in a bypass list.
 5. Run `gh auth login` for the machine user in the owner's own terminal.
-6. Edit the account map and remove the inherited broad token from the agents' shells.
+6. Edit the account map (one entry per owner or repository, matching the token above) and remove the inherited broad token from the agents' shells.
 7. Put the token's expiry date in a calendar. At expiry, repeat step 2 and step 5.
 8. Leave repositories on the other account alone.
