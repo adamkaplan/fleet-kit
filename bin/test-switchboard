@@ -13896,6 +13896,26 @@ class TestHeadlessPresence(Base):
         blocked = [f for f in facts if f.kind == sb.WORKER_BLOCKED and f.recipient == "boss"]
         self.assertEqual(len(blocked), 1, [(f.kind, f.recipient) for f in facts])
 
+    def test_the_status_command_lists_a_headless_worker_it_reads_the_records_from_the_state_directory(self):
+        sid = self.headless()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        report = sb.collect_status(self.world.route, self.world.clock.now)
+        rows = {row["name"]: row for row in report["agents"]["list"]}
+        self.assertIn("hw", rows, "status never listed a worker with no terminal: it built its engine with no state directory")
+        self.assertEqual((rows["hw"]["observation"]["session"], rows["hw"]["observation"]["status"]), (sid, "idle"))
+        self.assertTrue(rows["hw"]["observation"]["headless"])
+
+    def test_a_worker_launched_during_a_pass_is_never_reported_lost_by_that_pass(self):
+        """The daemon discovers, THEN the fact sources run; a launch that lands between the two wrote its record after discovery looked."""
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})    # a lost report with no remembered boss goes to the Chiefs of Staff
+        engine = self.world.new_engine("cli")
+        engine.discover(self.world.clock.now())                           # the pass's discovery: no headless record yet
+        sid = self.headless()                                             # the launch lands now: the session AND its record
+        facts = [f for f in engine.collect_facts()[0] if f.kind == "headless.lost"]
+        self.assertEqual(facts, [], "a record discovery never saw is not a lost session")
+        self.assertEqual(self.discover().agents["hw"].session_id, sid)   # the next pass finds it
+        self.assertEqual([f for f in engine.collect_facts()[0] if f.kind == "headless.lost"], [])
+
     def test_status_lists_it_with_the_pane_headless(self):
         self.headless()
         line = sb._agent_line({"name": "hw", "observation": self.discover().agents["hw"].to_json(), "plan": None})
