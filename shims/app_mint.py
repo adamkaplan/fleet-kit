@@ -13,7 +13,7 @@ Configuration (the switchboard config, all neutral names):
 
 Rules that never bend: fail CLOSED (any doubt is a refusal, and a failed mint never falls back to the stored login); the key, the signed JWT and the token are never
 printed, never put in an argument or in a child's environment (the key reaches openssl through an inherited pipe; the token reaches the real gh as a private
-`hosts.yml` the caller removes after the call); a token whose permissions go beyond the configured set (Administration above all) is refused; FleetKit's own repository
+`hosts.yml` the caller removes after the call); a token whose permissions go beyond the configured set (Administration above all) is refused; this kit's own repository
 (any repository named `fleet-kit`) can never be mapped; repositories are matched with the shared matcher (repo_match.py beside this file).
 Standard library only, plus the system openssl at a fixed absolute path (never looked up on PATH); loaded by path, never imported as a package.
 """
@@ -41,7 +41,7 @@ LIFETIME_CAP = 3600           # a token is never trusted for longer than an hour
 HTTP_SECONDS = 10.0
 KEY_COMMAND_SECONDS = 15.0
 KEY_MAX_BYTES = 16384
-OWN_REPO_NAME = "fleet-kit"   # FleetKit's own repository stays with local workers: never mappable, under any owner
+OWN_REPO_NAME = "fleet-kit"   # this kit's own repository stays with local workers: never mappable, under any owner
 TOKEN_RE = re.compile(r"[A-Za-z0-9_]{8,255}")
 PERMISSION_RE = re.compile(r"[a-z][a-z_]{0,63}")
 TOKEN_ENV_NAMES = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
@@ -86,7 +86,7 @@ def check_permissions(perms, what):
 
 def load_config(raw):
     """A Config for the parsed switchboard config `raw`, or None when no repository is mapped (the feature is off). Raises ConfigError for anything off:
-    an unreadable entry, FleetKit's own repository, a wildcard, a missing or doubled key source, a permission that is not allowed."""
+    an unreadable entry, this kit's own repository, a wildcard, a missing or doubled key source, a permission that is not allowed."""
     if not isinstance(raw, dict) or "app_installations" not in raw:
         return None
     mapped = raw["app_installations"]
@@ -101,7 +101,7 @@ def load_config(raw):
         if repo is None:
             raise ConfigError("app_installations: %r is not an exact owner/name repository" % str(name)[:60])
         if repo.split("/")[1] == OWN_REPO_NAME:
-            raise ConfigError("app_installations: %s is FleetKit's own repository and can never be mapped" % repo)
+            raise ConfigError("app_installations: %s is this kit's own repository and can never be mapped" % repo)
         if repo in table:
             raise ConfigError("app_installations names %s twice" % repo)
         if not isinstance(entry, dict):
