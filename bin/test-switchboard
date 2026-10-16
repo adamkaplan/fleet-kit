@@ -55028,6 +55028,140 @@ class TestDecisionsStaleBound(unittest.TestCase):
         self.assertGreaterEqual(len([line for line in lines if "180 s" in line and ("stale" in line or "Staleness" in line or "not updating" in line or "older than" in line)]), 4)
 
 
+class TestAuthorityModulesGuard(unittest.TestCase):
+    """Ask #532, slice 1: the code that decides who may clear, hold or merge lives in modules the owner-hold rule lists, and a module that does and is neither listed nor
+    exempted BY NAME fails this guard. The vocabulary, the listing and the exemptions are all DATA in the matrix file; this test has no module name of its own."""
+
+    def setUp(self):
+        self.floor = sb.load_module("impact_floor")
+        self.matrix = self.floor.load_matrix()
+        self.block = self.matrix["owner_hold"]
+
+    @staticmethod
+    def authority_functions(directory, vocabulary):
+        """{module path relative to the repository (bin/NAME.py): [function names]} for every module of `directory` that defines a function whose name has a word of the vocabulary."""
+        import ast
+        words, found = set(vocabulary), {}
+        for path in sorted(Path(directory).glob("*.py")):
+            tree = ast.parse(path.read_text())
+            names = sorted({n.name for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and words & set(n.name.strip("_").split("_"))})
+            if names:
+                found["bin/" + path.name] = names
+        return found
+
+    @staticmethod
+    def role_checks(directory, literals):
+        """{module path (bin/NAME.py): [the literal compared]} for every module of `directory` with a COMPARISON (==, !=, in, not in) against one of the role literals (the code, not a docstring):
+        the second rule, independent of function names."""
+        import ast
+        wanted, found = set(literals), {}
+
+        def strings(node):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                yield node.value
+            elif isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+                for item in node.elts:
+                    yield from strings(item)
+        for path in sorted(Path(directory).glob("*.py")):
+            hits = set()
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node, ast.Compare):
+                    for side in [node.left] + list(node.comparators):
+                        hits |= wanted & set(strings(side))
+            if hits:
+                found["bin/" + path.name] = sorted(hits)
+        return found
+
+    def unlisted(self, directory, block=None):
+        """The modules of `directory` that, by a function name with a word of the vocabulary OR by a comparison against a role literal, decide who may act, and are in no top tier path (as a
+        path or a glob) and in no exemption."""
+        block = block or self.block
+        listed = {g for globs in block["top_tier_paths"].values() for g in globs}
+        exempt = set(block["authority_modules"]["exempt"])
+        found = set(self.authority_functions(directory, block["authority_modules"]["vocabulary"])) | set(self.role_checks(directory, block["authority_modules"]["role_literals"]))
+        return sorted(m for m in found if not self.floor.matches(m, sorted(listed)) and m not in exempt)
+
+    def test_s1_the_named_modules_are_top_tier_paths_and_every_one_is_also_in_the_floor(self):
+        globs, exclude, force = self.floor.floor_for("adamkaplan/fleet-kit")
+        named = [g for g in self.block["top_tier_paths"]["authority"] if g.startswith("bin/") and g.endswith(".py")]
+        self.assertTrue(len(named) >= 7, "the matrix lists the authority modules of bin/")
+        for module in named:
+            self.assertIn(module, self.floor.top_tier_hits([module], self.matrix).get("authority", []), module + " is a top tier path")
+            self.assertTrue(self.floor.floor_paths([module], globs, exclude, force), module + " is in the floor")
+            self.assertEqual(self.floor.owner_decide(self.matrix, [module], [], None, self.floor.floor_paths([module], globs, exclude, force))[0], "hold", module)
+
+    def test_the_real_bin_directory_has_no_unlisted_unexempted_authority_module(self):
+        self.assertEqual(self.unlisted(BIN), [], "a module with authority code is neither a top tier path nor exempted by name in the matrix")
+
+    def test_s2_a_new_module_with_a_clear_decision_that_is_not_listed_fails_and_is_named(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "new_gate.py").write_text("def may_clear_hold(pr):\n    return True\n")
+            (Path(tmp) / "harmless.py").write_text("def format_line(x):\n    return x\n")
+            self.assertEqual(self.unlisted(tmp), ["bin/new_gate.py"])
+            exempted = json.loads(json.dumps(self.block))
+            exempted["authority_modules"]["exempt"]["bin/new_gate.py"] = "a reason"
+            self.assertEqual(self.unlisted(tmp, exempted), [], "exempted by name")
+            listed = json.loads(json.dumps(self.block))
+            listed["top_tier_paths"]["authority"].append("bin/new_gate.py")
+            self.assertEqual(self.unlisted(tmp, listed), [], "listed")
+
+    def test_a_renamed_function_cannot_hide_a_role_check_and_a_docstring_or_an_assignment_is_not_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "quiet_name.py").write_text('def run(kind):\n    return kind[1] == "chief-of-staff"\n')
+            (Path(tmp) / "tuple_form.py").write_text('def run(role):\n    return role in ("orchestrator", "x")\n')
+            (Path(tmp) / "not_a_check.py").write_text('"""the chief-of-staff and the operator"""\nNAME = "chief-of-staff"\ndef run(x):\n    return {"role": "operator"}\n')
+            self.assertEqual(self.unlisted(tmp), ["bin/quiet_name.py", "bin/tuple_form.py"])
+            exempted = json.loads(json.dumps(self.block))
+            exempted["authority_modules"]["exempt"].update({"bin/quiet_name.py": "a reason", "bin/tuple_form.py": "a reason"})
+            self.assertEqual(self.unlisted(tmp, exempted), [])
+            wider = json.loads(json.dumps(self.block))
+            wider["authority_modules"]["role_literals"].append("x")
+            self.assertEqual(self.unlisted(tmp, wider), ["bin/quiet_name.py", "bin/tuple_form.py"])
+
+    def test_a_caller_check_name_is_in_the_vocabulary_and_the_modules_that_gate_a_caller_are_listed(self):
+        words = set(self.block["authority_modules"]["vocabulary"])
+        self.assertTrue({"caller", "refuse", "refusal", "role", "chief", "operator"} <= words)
+        found = set(self.authority_functions(BIN, sorted(words))) | set(self.role_checks(BIN, self.block["authority_modules"]["role_literals"]))
+        listed = {g for globs in self.block["top_tier_paths"].values() for g in globs}
+        self.assertTrue(found, "the guard finds the authority modules of bin/")
+        for module in found:
+            self.assertTrue(module in listed or module in self.block["authority_modules"]["exempt"], module)
+        self.assertGreaterEqual(len(found & listed), 10, "the modules the guard finds that are listed")
+
+    def test_every_exemption_carries_a_trace_of_where_its_values_go_and_the_limits_are_stated(self):
+        exempt = self.block["authority_modules"]["exempt"]
+        self.assertTrue(exempt)
+        for module, reason in exempt.items():
+            self.assertIn("Trace:", reason, module + ": an exemption says where its values go (no value of it feeds an authority function)")
+        limits = self.block["authority_modules"]["limits"]
+        self.assertTrue(isinstance(limits, list) and len(limits) >= 3 and all(isinstance(x, str) and len(x) > 40 for x in limits))
+        self.assertIn("cannot see", " ".join(limits))
+
+    def test_the_external_adapter_that_feeds_answered_by_is_listed_not_exempted(self):
+        listed = {g for globs in self.block["top_tier_paths"].values() for g in globs}
+        self.assertNotIn("bin/external_adapter.py", self.block["authority_modules"]["exempt"])
+        self.assertIn("bin/external_adapter.py", listed)
+
+    def test_every_exemption_names_a_real_module_with_a_reason_and_is_not_also_listed(self):
+        listed = {g for globs in self.block["top_tier_paths"].values() for g in globs}
+        for module, reason in self.block["authority_modules"]["exempt"].items():
+            self.assertTrue((BIN.parent / module).is_file(), module + " does not exist")
+            self.assertTrue(isinstance(reason, str) and len(reason) >= 20, module + " needs a reason")
+            self.assertNotIn(module, listed, module + " is both exempted and listed")
+
+    def test_s3_the_code_names_no_module_of_the_rule_the_matrix_file_does(self):
+        modules = [g for g in self.block["top_tier_paths"]["authority"] if g.startswith("bin/") and g.endswith(".py")] + list(self.block["authority_modules"]["exempt"])
+        self.assertTrue(len(modules) >= 12)
+        for code in [BIN / "fleet-switchboard"] + sorted(BIN.glob("*.py")):   # the code; the tests (this file) name modules as fixtures
+            text = code.read_text()
+            for module in modules:
+                self.assertNotIn('"%s"' % module, text, "%s writes the path %s in code" % (code.name, module))
+
+    def test_the_vocabulary_is_a_usable_list_of_words(self):
+        words = self.block["authority_modules"]["vocabulary"]
+        self.assertTrue(words and all(isinstance(w, str) and re.fullmatch(r"[a-z]+", w) for w in words))
+
+
 class TestOwnerHoldRule(unittest.TestCase):
     """Ask #451, slice 1: the owner's own clear is for credentials, identity and who may do what only. The rule is data in the impact matrix file."""
 
