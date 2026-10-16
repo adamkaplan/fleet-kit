@@ -22373,6 +22373,42 @@ class TestTriage(Base):
         self.go()
         self.assertEqual(self.only("T7"), ["acme/api#330", "acme/api#331", "acme/api#332"])
 
+    def verdict_prs(self, cases, start):
+        """One PR of ours per (state, body) case, each with a formal review from the author's own account ("bot")."""
+        for n, (state, body) in enumerate(cases, start):
+            self.add(n, created=0.4, pr=True)
+            self.describe_pr(n, reviews=[("bot", state, TRI_HEAD_A, body)])
+        self.go()
+        return ["acme/api#%d" % n for n in range(start, start + len(cases))]
+
+    def test_t7_a_verdict_review_from_the_authors_account_counts_approve_or_changes_requested(self):
+        self.charter()
+        self.verdict_prs([("COMMENTED", "Review of %s: APPROVE" % TRI_HEAD_A), ("COMMENTED", "Review of %s: CHANGES REQUESTED\nx" % TRI_HEAD_A)], 340)
+        self.assertEqual(self.only("T7"), [])
+
+    def test_t7_a_review_that_does_not_name_this_head_or_start_with_the_phrase_is_not_counted(self):
+        self.charter()
+        refs = self.verdict_prs([("COMMENTED", "Review of %s: APPROVE" % TRI_HEAD_B), ("COMMENTED", "looks fine"),
+                                 ("COMMENTED", ""), ("COMMENTED", "see: Review of %s: APPROVE" % TRI_HEAD_A),
+                                 ("PENDING", "Review of %s: APPROVE" % TRI_HEAD_A), ("DISMISSED", "Review of %s: APPROVE" % TRI_HEAD_A),
+                                 ("COMMENTED", "Review of %s: LGTM" % TRI_HEAD_A)], 350)
+        self.assertEqual(self.only("T7"), refs)
+
+    def test_t7_the_sha_is_a_whole_token_of_at_least_seven_characters_of_the_head(self):
+        self.charter()
+        refs = self.verdict_prs([("COMMENTED", "Review of %s: APPROVE" % TRI_HEAD_A[:7]), ("COMMENTED", "Review of %s: APPROVE" % TRI_HEAD_A[:6]),
+                                 ("COMMENTED", "Review of %s: APPROVE" % TRI_HEAD_B[:7]), ("COMMENTED", "Review of %sc: APPROVE" % TRI_HEAD_A[:7])], 360)
+        self.assertEqual(self.only("T7"), refs[1:])
+
+    def test_a_verdict_review_from_the_authors_account_is_not_a_review_for_the_gates_the_hold_or_the_captain_evidence(self):
+        data = captain_pr(head=TRI_HEAD_A, reviews=[("bot", "COMMENTED", TRI_HEAD_A, "Review of %s: APPROVE" % TRI_HEAD_A)], author="bot")
+        data = json.loads(data) if isinstance(data, str) else data
+        facts = sb.pr_facts_from(data)
+        self.assertTrue(facts["verdict_review"])
+        self.assertEqual(sb.pr_reviews_at(data["reviews"], TRI_HEAD_A, "bot"), [])
+        self.assertEqual(facts["reviews"], [])
+        self.assertEqual(sb.captain_evidence(facts, set()), None if facts["signed"] is None else [])
+
     def test_t10_waits_ten_minutes_after_the_close(self):
         self.charter()
         fresh = dict(tri_issue(self.now, 101, created=9, labels=[self.USER, "kind"], state="closed"), closed_at=sb.iso(self.now - 240))
@@ -40558,7 +40594,8 @@ HEAD_A, HEAD_B = "a" * 40, "b" * 40
 def captain_pr(body="MERGE: captain\n\nland it", head=HEAD_A, reviews=None, author="coder-bot", state="OPEN", comments=(), **more):
     """pr_view_json for a PR with a body, an author, a head and reviews [(login, state, commit oid)]."""
     fields = {"body": body, "headRefOid": head, "author": {"login": author}, "reviews": [
-        {"author": {"login": who}, "state": st, "commit": {"oid": oid}} for who, st, oid in (reviews or [])]}
+        dict({"author": {"login": r[0]}, "state": r[1], "commit": {"oid": r[2]}}, **({"body": r[3]} if len(r) > 3 else {}))
+        for r in (reviews or [])]}
     fields["comments"] = [{"author": {"login": author}, "body": text + (
         "\n<!-- fleet-switchboard:from=%s -->" % who if who else "")} for who, text in comments]
     fields.update(more)
@@ -59790,7 +59827,10 @@ class FakeQueueGh:
 
 class EjectionHub:
     def __init__(self, owner="orch"):
-        self.owner, self.routed = owner, []
+        self.owner, self.routed, self.notified = owner, [], {}
+
+    def notice_names(self, repo, number):
+        return self.notified.get((repo, number), [])
 
     def route_of(self, item, agents, now):
         self.routed.append(item.numbers)
@@ -60058,12 +60098,162 @@ class TestQueueEjections(Base):
         self.assertIn("unreadable", self.sent[0][1])
         self.assertEqual(len([e for e in self.world.audit() if e["event"] == "queue_ejection.read_failed"]), 1)
 
-    def test_a_pull_request_nobody_owns_is_said_once_and_not_read_again(self):
+    def chief(self, *names):
+        """Discovery that holds Chief of Staff agents, found by their metadata role (the name carries nothing)."""
+        self.engine.discovery.agents = {n: types.SimpleNamespace(fleet={"role": "chief-of-staff"}) for n in names}
+        self.engine.discovery.agents["worker"] = types.SimpleNamespace(fleet={"role": "coder"})
+
+    def skipped(self):
+        return [e["detail"] for e in self.world.audit() if e["event"] == "queue_ejection.skipped"]
+
+    def test_s5_a_pull_request_nobody_owns_wakes_the_chief_of_staff_once_with_facts_and_no_names(self):
         self.engine.hub.owner = None
-        self.add(1401, 501, names=["t"])
+        self.chief("boss")
+        self.add(1401, 501, names=["tests/t.py::boom", "tests/t.py::bang"])
         self.go()
         self.go()
-        self.assertEqual((self.sent, len([e for e in self.world.audit() if e["event"] == "queue_ejection.unrouted"]), self.gh.count(self.REPO, "/zip")), ([], 1, 0))
+        self.engine.__dict__.pop("queue_ejections")   # a restart
+        self.go()
+        (to, line), = self.sent
+        self.assertEqual(to, "boss")
+        for needle in ("%s#501" % self.REPO, "1401", "2 failing tests", "Kind: tests", "No orchestrator owns", "https://github.com/%s/actions/runs/1401" % self.REPO):
+            self.assertIn(needle, line)
+        self.assertEqual([n for n in ("boom", "bang", "tests/t.py") if n in line], [], "no name from the artifact reaches the Chief of Staff")
+        self.assertEqual([e["event"] for e in self.world.audit() if e["event"].startswith("queue_ejection.") and e["event"] != "queue_ejection.skipped"], ["queue_ejection.unowned_woke"])
+
+    def test_s6_an_owned_pull_request_wakes_only_its_owner_and_the_chief_line_holds_no_outsider_text(self):
+        self.chief("boss")
+        self.add(1402, 502, names=["t"])
+        self.go()
+        self.assertEqual([to for to, _ in self.sent], ["orch"])
+        self.assertIn('"t"', self.sent[0][1], "the owner still gets the names")
+        self.engine.hub.owner = None
+        self.world.tick(self.module.LIST_SECONDS + 1)
+        self.add(1403, 503, names=["@all /deploy https://x.example/p ghp_" + "Ab1" * 10])
+        self.go()
+        to, line = self.sent[1]
+        self.assertEqual(to, "boss")
+        self.assertEqual([t for t in ("@", "://x.example", "/deploy", "deploy", "ghp_", "Ab1") if t in line], [])
+        self.assertEqual(len(self.sent), 2)
+
+    def test_s8_a_pull_request_whose_named_orchestrator_is_not_running_says_so_and_never_that_nobody_owns_it(self):
+        self.engine.hub.owner = None
+        self.engine.hub.notified[(self.REPO, 560)] = ["orch-x", "boss"]
+        self.chief("boss")
+        self.add(1460, 560, names=["t"])
+        self.go()
+        (to, line), = self.sent
+        self.assertEqual(to, "boss")
+        self.assertIn("orch-x is not running", line)
+        self.assertNotIn("No orchestrator owns", line)
+
+    def test_s9_with_two_chiefs_of_staff_the_first_by_name_is_told_once(self):
+        self.engine.hub.owner = None
+        self.engine.discovery.agents = {n: types.SimpleNamespace(fleet={"role": "chief-of-staff"}) for n in ("zeta", "alpha")}
+        self.add(1470, 570, names=["t"])
+        self.go()
+        self.go()
+        self.assertEqual([to for to, _ in self.sent], ["alpha"])
+
+    def test_s10_one_pull_request_whose_runs_keep_failing_is_announced_once_an_hour_with_the_count(self):
+        self.engine.hub.owner = None
+        self.chief("boss")
+        self.add(1480, 580, names=["t"], age=300)
+        self.go()
+        self.add(1481, 580, names=["t"], age=200)
+        self.add(1482, 580, names=["t"], age=100)
+        self.add(1483, 581, names=["t"], age=90)
+        self.world.tick(self.module.LIST_SECONDS + 1)
+        self.go()
+        self.assertEqual([("#580" in l, "#581" in l) for _, l in self.sent], [(True, False), (False, True)], "the 2nd pull request is not held back; the 2 later runs of the 1st are not announced")
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "queue_ejection.suppressed"]), 1, "the newest run of a pull request decides: 1 suppressed")
+        self.world.tick(self.module.UNOWNED_HOURLY + 10)
+        self.add(1484, 580, names=["t"], age=30)
+        self.go()
+        self.assertIn("1 earlier failed run", self.sent[-1][1])
+        self.assertIn("#580", self.sent[-1][1])
+
+    def test_s7_an_unowned_pull_request_with_no_chief_is_said_and_woken_once_one_exists(self):
+        self.engine.hub.owner = None
+        self.add(1404, 504, names=["t"])
+        self.go()
+        self.assertEqual((self.sent, self.skipped()), ([], [{"no_chief": 1, "reason": "no_chief"}]))
+        self.chief("boss")
+        self.world.tick(self.module.RETRY_SECONDS + 1)
+        self.go()
+        self.assertEqual([to for to, _ in self.sent], ["boss"])
+
+    def test_s1_a_pass_that_returns_early_says_why(self):
+        self.add(1405, 505, names=["t"])
+        self.engine.discovery.problems = ["herdr unreachable", "v2 unreachable"]
+        self.assertEqual(self.go(), 0)
+        self.assertEqual((self.skipped(), self.gh.calls, self.sent), ([{"discovery": 2, "reason": "discovery"}], [], []))
+        self.engine.discovery = None
+        self.go()
+        self.assertEqual(self.skipped()[-1], {"discovery": 1, "reason": "discovery"})
+
+    def test_s2_a_budget_that_fits_one_candidate_says_how_many_wait(self):
+        for n in range(3):
+            self.add(1410 + n, 510 + n, names=["t"], age=100 - n)
+        self.go(calls=2 + 3)   # the 2 lists, and one candidate's 3 reads
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.skipped(), [{"budget": 2, "reason": "budget"}])
+
+    def test_a_candidate_in_its_back_off_is_counted_and_a_process_with_no_hub_says_nothing(self):
+        self.add(1440, 540, names=["t"])
+        hub, self.engine.hub = self.engine.hub, None
+        self.go()
+        self.assertEqual(self.skipped(), [], "no GitHub hub: the check is not in play")
+        self.engine.hub = hub
+        self.gh.graphql_fault = "exit"
+        self.go()
+        self.gh.graphql_fault = None
+        self.go()   # inside the back-off
+        self.assertEqual(self.skipped()[-1], {"retry": 1, "reason": "retry"})
+
+    def test_what_is_remembered_about_a_run_that_never_wakes_is_forgotten(self):
+        self.add(1450, 550, names=["t"])
+        self.gh.pulls[(self.REPO, 550)] = ("OPEN", True)
+        self.go()
+        memory = self.engine.queue_ejections
+        self.assertEqual((len(memory["first"]), len(memory["held"])), (1, 1))
+        self.world.tick(self.module.WAKE_WINDOW + self.module.LIST_SECONDS + 100)   # the run is history now
+        self.go()
+        self.assertEqual((len(memory["first"]), len(memory["held"])), (0, 0))
+
+    def test_s3_a_skip_is_said_once_until_it_changes(self):
+        self.add(1420, 520, names=["t"])
+        self.gh.pulls[(self.REPO, 520)] = ("OPEN", True)
+        for _ in range(3):
+            self.go()
+        self.assertEqual(self.skipped(), [{"queued": 1, "reason": "queued"}], "1 line in 3 passes")
+        self.add(1421, 521, names=["t"])
+        self.gh.pulls[(self.REPO, 521)] = ("OPEN", True)
+        self.world.tick(self.module.LIST_SECONDS + 1)
+        self.go()
+        self.go()
+        self.assertEqual(self.skipped()[-1], {"queued": 2, "reason": "queued"})
+        self.assertEqual(len(self.skipped()), 2)
+
+    def test_s4_the_line_that_settles_a_run_says_how_late_it_was_first_seen_and_why(self):
+        self.chief("boss")
+        self.engine.hub.owner = None
+        self.add(1430, 530, names=["t"], age=1200)
+        self.gh.pulls[(self.REPO, 530)] = ("OPEN", True)
+        self.go()
+        self.gh.pulls[(self.REPO, 530)] = ("OPEN", False)
+        self.world.tick(self.module.RECHECK_SECONDS + 1)
+        self.go()
+        (line,) = [e for e in self.world.audit() if e["event"] == "queue_ejection.unowned_woke"]
+        detail = line["detail"]
+        self.assertTrue(1200 <= detail["seen_after"] <= 1260, detail)
+        self.assertEqual((detail["why"], detail["held"]), ("first_list", {"queued": 1}))
+        self.engine.hub.owner = "orch"
+        self.add(1431, 531, names=["t"], age=1300)
+        self.world.tick(self.module.LIST_SECONDS + 1)
+        self.go()
+        (late,) = [e for e in self.world.audit() if e["event"] == "queue_ejection.woke"]
+        self.assertEqual(late["detail"]["why"], "list_interval")
 
     def test_the_daemons_pass_runs_it_and_a_failure_never_stops_the_pass(self):
         self.add(1501, 601, names=["t"])
