@@ -10,7 +10,7 @@ In scope: the organisation's repositories where the existing GitHub App ("the Ap
 
 Out of scope and unchanged: The fleet-kit repository itself, and any repository the App is not installed on. Their local agents keep today's login, with the repository ruleset as the server-side guard. No second App and no machine user is created for them.
 
-Cloud workers serve the organisation's repositories only; no fleet-kit task, test or demo runs in a cloud worker.
+Cloud workers serve the organisation's repositories only; no task, test or demo of the tooling that runs the workers runs in a cloud worker.
 
 Names below are neutral (`acme-org/widget-api`, `acme-bot`, used only to describe the rejected Option B). No token, key, account or keyring entry of a real installation appears in this file, and a test (`TestAgentCredentialsDoc` in `bin/test-switchboard`) scans it for token-like strings.
 
