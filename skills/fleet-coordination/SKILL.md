@@ -360,3 +360,5 @@ report the switchboard retires it by itself; retire is for the cases it cannot t
 ## Heavy runs
 
 Full suites and browser/e2e runs go through `fleet-switchboard heavy -- <cmd>`: it waits for one of a few CPU slots and runs the command at background priority, so many agents do not starve the machine.
+
+A mutation or fault-injection run goes through the heavy wrapper (`fleet-switchboard heavy -- ...`) with a time limit and a hard stop of its whole process group, and never runs in the background without one.
