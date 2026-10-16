@@ -36,6 +36,18 @@ Accepted scope of the role: `cw-operator` can get and list every secret in the w
 
 Everything that renders `kubectl` output (errors, the end hook's text, audit reasons) passes through one `scrub()`: this run's secret values and any 8+ character piece of one, token-shaped strings and long base64/hex runs are removed, then the text is cut. A failed `create`, `stop` or `delete` that leaves a per-run Secret says so once (audit and stderr) with its name and the exact `kubectl ... delete secret NAME` command, never a value.
 
+## The run record and the report (slice 3)
+`run-task` keeps what a worker did after its pod is gone. Before the stop deletes the pod and its Secrets (normal end, failure
+and interrupt alike) it writes `$CW_RUN_RECORD_DIR/<run id>/` (default: `runs/` beside the audit file; directory 0700, files 0600):
+`transcript.jsonl` (the session's messages, read through the existing port-forward, each line through the one scrub, at most 5 MiB,
+cut with a `TRANSCRIPT CUT` marker line; `CW_RECORD_MAX_BYTES` lowers it), `tally.json` (tool calls by tool name, turns; no content) and
+`run.json` (worker, repository, start, end, exit reason, head sha when known; `transcript: unavailable` plus a reason when the server could
+not be read). A failing record never holds the stop back and a failing stop never deletes it; the stop's audit reason names the directory once.
+
+The worker writes its final report as ONE line to `/home/worker/report` (the driver adds this to the brief). `cloud-worker report NAME`
+returns it through `kubectl exec ... head`: scrubbed, one line, at most 2000 characters, audited, with no switchboard command inside the
+pod. It exits 3 (`no report yet`) when the file is missing or empty.
+
 ## Create is interrupt-safe
 Ctrl-C, SIGTERM or any exception inside `create` deletes the per-run Secret and the pod it made and writes a
 `create.interrupted` (or `create.failed`) audit line naming what was cleaned. If a delete fails, stderr and the audit line

@@ -33,6 +33,8 @@ MAX_TOKEN_SECONDS = 3600
 DEFAULT_MAX_HARD = "8h"  # OPEN in the contract: value
 DEFAULT_SPEND_CAP_USD = 25.0  # the prototype's cap; applies when CW_CLOUD_SPEND_CAP_USD is unset or empty
 LABEL = "cw-worker"
+REPORT_PATH = "/home/worker/report"  # the worker's final one-line report, written here inside the pod (the image's workdir)
+REPORT_MAX = 2000
 EXIT_DONE, EXIT_HOOK, EXIT_USAGE, EXIT_CLOUD, EXIT_TIMEOUT, EXIT_CAP, EXIT_REFUSED = 0, 1, 2, 3, 4, 5, 6
 
 CREDENTIAL_PATTERNS = [re.compile(p) for p in (
@@ -677,6 +679,26 @@ class Launcher:
                     "wip_branch": res.get("wip_branch"), "skipped": skipped}
         return self._audited(worker, "stop", go, reason)
 
+    def report(self, a):
+        """The worker's one-line report: the content of REPORT_PATH read with `kubectl exec head`, so nothing of the
+        switchboard has to be inside the pod. Scrubbed, one line, at most REPORT_MAX characters."""
+        worker, name = a.worker, pod_name(a.worker)
+
+        def go(info):
+            pod = self._need(worker)
+            if not pod:
+                raise CloudError("unknown worker %s" % worker, EXIT_USAGE)
+            info["rid"], info["cost"] = "pod/" + name, self.cost(pod)
+            try:
+                raw = self.kube.exec(name, "head", "-c", "%d" % (REPORT_MAX * 4), REPORT_PATH, keep_stdout=True)
+            except CloudError:
+                raise CloudError("no report yet: %s is missing or unreadable in %s" % (REPORT_PATH, worker))
+            line = self.kube.scrub(" ".join(raw.split()), limit=REPORT_MAX)
+            if not line:
+                raise CloudError("no report yet: %s is empty in %s" % (REPORT_PATH, worker))
+            return {"worker": worker, "runtime_id": "pod/" + name, "report": line}
+        return self._audited(worker, "report", go)
+
     def delete(self, a):
         worker, name = a.worker, pod_name(a.worker)
 
@@ -820,6 +842,7 @@ def build_parser():
     d.add_argument("--force", action="store_true")
     d.add_argument("--reason", default="")
     cmd("status")
+    cmd("report")
     r = cmd("reap", worker=False)
     r.add_argument("--loop", type=int, help="seconds between passes (default: one pass)")
     return p
@@ -846,7 +869,7 @@ def main(argv=None, env=None, clock=None, sleep=time.sleep):
                     return EXIT_HOOK if any(c for _, _, c in res) else 0
                 sleep(min(a.loop, 60))  # never slower than the contract's once a minute
         result = getattr(L, a.cmd)(a)
-        print(json.dumps(result, sort_keys=True))
+        print(result["report"] if a.cmd == "report" and not a.json else json.dumps(result, sort_keys=True))
         return 0
     except CloudError as e:
         print("cloud-worker: %s" % (kube.scrub(e, 1500) if kube else scrub(e, (), 1500)), file=sys.stderr)

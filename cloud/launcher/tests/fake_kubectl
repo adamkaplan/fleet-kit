@@ -108,6 +108,13 @@ elif cmd == "exec":
     name, tool = args[1], args[3]
     if tool == "cw-worker-activity":
         print(json.dumps(st["activity"][name]))
+    elif tool == "head":   # the report file of the pod: st["report"][pod]
+        if name not in st.get("report", {}):
+            print("head: cannot open: No such file", file=sys.stderr); sys.exit(1)
+        sys.stdout.write(st["report"][name])
+    elif tool == "git":
+        if st.get("head_sha"): print(st["head_sha"])
+        else: sys.exit(1)
     elif tool == "cw-end-hook" and st.get("hook_result"):  # a canned end hook answer
         print(json.dumps(st["hook_result"]))
         if st["hook_result"].get("error"): sys.exit(1)

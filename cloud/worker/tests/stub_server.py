@@ -47,6 +47,12 @@ class H(http.server.BaseHTTPRequestHandler):
             old, new = {"id": "ses_0", "time": {"created": 1700000000000, "updated": 1700000100000}}, {"id": "ses_1", "time": {"created": 1700000000000, "updated": 1700000500000}}
             return self.send(200, {"data": [] if MODE == "no-sessions" else [old, new], "cursor": {}} if MODE != "bad-list" else {"oops": 1})
         if self.path == "/api/session/ses_1/message":
+            polls["m"] = polls.get("m", 0) + 1
+            if MODE == "messages-down" and polls["m"] > 1:
+                return self.send(500)   # the first read (the poll that sees the session finish) works; the transcript read after it fails
+        if self.path == "/api/session/ses_1/message" and os.environ.get("STUB_MESSAGES"):
+            return self.send(200, {"data": json.load(open(os.environ["STUB_MESSAGES"]))})   # a canned transcript
+        if self.path == "/api/session/ses_1/message":
             return self.send(200, {"data": [{"type": "user", "text": "x"}, {"type": "assistant", "time": {"created": 1, "completed": 2}}]})
         self.send(404)
 
