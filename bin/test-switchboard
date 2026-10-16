@@ -39818,6 +39818,18 @@ class TestHeldTop(DecisionsBase):
         held = sb.plan_ledger.evaluate_gates(None, [], None, {"head": "a" * 40, "captain": True, "held_check": lambda: ["no table"]}, "acme/api#1")
         self.assertEqual(next(r for r in held["gates"] if r["gate"] == "G6b")["missing"], ["no table"])
 
+    def test_a_hold_label_alone_or_a_floor_hold_makes_the_gate_judge_and_a_missing_check_fails_closed(self):
+        facts = {"head": "a" * 40, "captain": False, "holds": ["security"], "held_check": lambda: ["no table"]}
+        row = lambda f: next(r for r in sb.plan_ledger.evaluate_gates(None, [], None, f, "acme/api#1")["gates"] if r["gate"] == "G6b")
+        self.assertEqual(row(facts)["status"], "missing")
+        floor = {"head": "a" * 40, "captain": False, "floor": {"decision": "hold", "cleared": False, "reasons": []}, "held_check": lambda: []}
+        self.assertEqual(row(floor)["status"], "ok")
+        self.assertEqual(row({"head": "a" * 40, "captain": True})["status"], "missing")
+
+    def test_a_hash_line_inside_a_fence_does_not_end_the_top(self):
+        example = "## Example\n\nA command:\n\n```text\n# a comment line\n```\n\nIt prints one card.\n\n"
+        self.assertEqual(self.defects(self.OPEN + self.WHY + self.TABLE + example + self.QS), [])
+
     def test_the_three_files_name_the_parts_in_order_and_put_mermaid_below(self):                           # S9
         for rel in ("skills/fleet-explainer/SKILL.md", ".github/pull_request_template.md", "skills/fleet-coordination/SKILL.md"):
             text = (REPO / rel).read_text()

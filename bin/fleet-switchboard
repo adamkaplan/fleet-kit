@@ -21219,7 +21219,14 @@ def held_top_end(rest):
     first = next((i for i, l in enumerate(rest) if l.strip() in HELD_PARTS), None)
     if first is None:
         return len(rest)
-    return next((i for i in range(first + 1, len(rest)) if (rest[i].startswith("#") and rest[i].strip() not in HELD_PARTS) or rest[i].strip() == EXPLAINER_BEGIN), len(rest))
+    fenced = set()   # a `#` line inside a code fence is not a heading
+    inside = False
+    for i, l in enumerate(rest):
+        if l.lstrip().startswith("```"):
+            inside = not inside
+        elif inside:
+            fenced.add(i)
+    return next((i for i in range(first + 1, len(rest)) if i not in fenced and (rest[i].startswith("#") and rest[i].strip() not in HELD_PARTS) or rest[i].strip() == EXPLAINER_BEGIN), len(rest))
 
 
 def held_defects(body):
