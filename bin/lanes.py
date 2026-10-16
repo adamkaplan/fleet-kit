@@ -31,8 +31,14 @@ class MoveRefused(Exception):
     """The move cannot be made, and nothing was written."""
 
 
-def charter_orchestrators(sb, discovery, repo, charter):
-    """The names of the live orchestrators whose charter is `charter` in `repo`, sorted."""
+def charter_orchestrators(sb, discovery, repo, charter, body=None):
+    """The names of the live orchestrators of `charter` in `repo`, sorted. The orchestrator the charter issue's own block names
+    (`orchestrator: <name>`, read now, the rule the load pass uses) wins when it is a live orchestrator; the `charter` field of
+    an orchestrator's session metadata is the fallback."""
+    named = sb.load_module("fleet_health").charter_agent(body)
+    agent = discovery.agents.get(named) if named else None
+    if agent is not None and (agent.fleet or {}).get("role") == "orchestrator":
+        return [agent.name]
     found = []
     for agent in discovery.agents.values():
         fleet = agent.fleet or {}
@@ -40,6 +46,22 @@ def charter_orchestrators(sb, discovery, repo, charter):
                 and sb._fleet_repo(fleet, sb.engine.config) == repo:
             found.append(agent.name)
     return sorted(found)
+
+
+def charter_body(sb, repo, number):
+    """The charter issue's body, read now (never cached), or None when it cannot be read: the metadata then decides."""
+    try:
+        return read_issue(sb, repo, number).get("body")
+    except (MoveRefused, sb.IntentError):
+        return None
+
+
+def audit_notice(sb, subject, role, recipient, outcome, reason=None):
+    """One audit line for one notice: who, the outcome (sent, skipped or failed) and why; never the text."""
+    audit = sb.engine.audit
+    if audit is not None:
+        audit.append(sb.engine.actor, "lanes.move.notice", subject,
+                     {"role": role, "recipient": recipient, "outcome": outcome, "reason": reason})
 
 
 def check_caller(caller, role):
@@ -278,7 +300,8 @@ def run_move(sb, repo, ask, to_charter, caller, role, out, err, watched=None):
         out("ask %s#%d is already under charter #%d: nothing to do" % (repo, ask, new))
         return sb.EXIT_OK
     discovery = engine.discover(engine.now())
-    old_names, new_names = charter_orchestrators(sb, discovery, repo, old), charter_orchestrators(sb, discovery, repo, new)
+    old_names = charter_orchestrators(sb, discovery, repo, old, charter_body(sb, repo, old))
+    new_names = charter_orchestrators(sb, discovery, repo, new, charter_body(sb, repo, new))
     old_owner, new_owner = (old_names[0] if old_names else None), (new_names[0] if new_names else None)
     workers = ask_workers(sb, discovery, repo, ask)
     prs = pull_requests(sb, repo, ask)
@@ -330,14 +353,20 @@ def run_move(sb, repo, ask, to_charter, caller, role, out, err, watched=None):
     note = handover_note(sb, plan, who, workers, prs, tag).replace("{reminders}", reminders_section(sb, verb, held))
     for owner, text, label, charter in ((new_owner, note, "handover note", new),
                                         (old_owner, old_notice(plan, who, new_owner, workers, reminder_text, tag), "notice", old)):
+        role = "new orchestrator" if charter == new else "old orchestrator"
         if owner is None:
-            out("%s: no orchestrator is running charter #%d, so no one was told" % (label, charter))
+            reason = "no orchestrator is running charter #%d" % charter
+            out("%s: %s, so no one was told" % (label, reason))
+            audit_notice(sb, subject, role, None, "skipped", reason)
+            failed.append("%s (%s)" % (label, reason))
             continue
         why = send_notice(sb, caller, owner, text, plan)
         if why:
             failed.append("%s to %s (%s)" % (label, owner, why))
+            audit_notice(sb, subject, role, owner, "failed", why)
         else:
             out("%s: sent to %s" % (label, owner))
+            audit_notice(sb, subject, role, owner, "sent")
     # step 5, what the old charter still holds.
     try:
         remaining = [a for a in engine.intents.open_asks(old, repo) if a.number != ask]
