@@ -55974,6 +55974,70 @@ class TestAuthorityModulesGuard(unittest.TestCase):
         self.assertTrue(words and all(isinstance(w, str) and re.fullmatch(r"[a-z]+", w) for w in words))
 
 
+class TestOwnerClearModule(unittest.TestCase):
+    """Ask #532, slice 3: the code that decides who may clear, hold or release lives in bin/impact_hold.py (listed in the matrix), not in the daemon file. The names come from the
+    module's own MOVED tuple and the paths from the matrix: this test has no list of its own."""
+
+    def setUp(self):
+        self.floor = sb.load_module("impact_floor")
+        self.matrix = self.floor.load_matrix()
+        self.module = sb.load_module("impact_hold")
+        self.daemon = BIN / "fleet-switchboard"
+
+    @staticmethod
+    def defined(source):
+        import ast
+        return {n.name for n in ast.parse(source).body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+    def test_the_moved_functions_are_defined_in_the_module_and_found_in_the_daemon_under_their_old_names(self):
+        self.assertGreaterEqual(len(self.module.MOVED), 8)
+        self.assertEqual(self.defined(Path(self.module.__file__).read_text()) & set(self.module.MOVED), set(self.module.MOVED))
+        for name in self.module.MOVED:
+            self.assertTrue(callable(getattr(sb, name)), name)
+            self.assertIs(getattr(sb, name).__globals__, vars(sb), name + " runs in the daemon's own globals, as before the move")
+
+    def test_s5_s7_none_of_the_moved_functions_is_defined_in_the_daemon_file_and_one_registration_names_the_module(self):
+        source = self.daemon.read_text()
+        self.assertEqual(self.defined(source) & set(self.module.MOVED), set())
+        self.assertEqual(source.count('load_module("impact_hold").bind('), 1)
+
+    def test_s7_a_moved_function_copied_back_into_the_daemon_is_named(self):
+        name = self.module.MOVED[0]
+        copied = self.daemon.read_text() + "\n\ndef %s(*args):\n    return None\n" % name
+        self.assertEqual(sorted(self.defined(copied) & set(self.module.MOVED)), [name])
+
+    def test_s3_no_code_outside_the_matrix_names_a_top_tier_path_as_a_literal(self):
+        import ast
+        listed = {g for globs in self.matrix["owner_hold"]["top_tier_paths"].values() for g in globs}
+        files = sorted(BIN.glob("*.py")) + [self.daemon]
+        hits = []
+        for path in files:
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in listed:
+                    hits.append("%s: %s" % (path.name, node.value))
+        self.assertEqual(hits, [])
+
+    def test_s6_a_change_to_the_module_holds_for_the_owner_and_naming_it_a_change_to_another_daemon_function_does_not(self):
+        globs, exclude, force = self.floor.floor_for("adamkaplan/fleet-kit")
+        floor_hit = lambda paths: self.floor.floor_paths(paths, globs, exclude, force)
+        moved = self.floor.owner_decide(self.matrix, ["bin/impact_hold.py"], [], None, floor_hit(["bin/impact_hold.py"]))
+        other = self.floor.owner_decide(self.matrix, ["bin/fleet-switchboard"], [], None, floor_hit(["bin/fleet-switchboard"]))
+        self.assertEqual(moved[0], "hold")
+        self.assertTrue(any("bin/impact_hold.py" in r for r in moved[1]), moved)
+        self.assertNotEqual(other[0], "hold", other)
+
+    def test_s8_without_the_module_the_daemon_refuses_loudly_and_names_it(self):
+        import shutil
+        with tempfile.TemporaryDirectory() as tmp:
+            for path in list(BIN.glob("*.py")) + [self.daemon]:
+                if path.name != "impact_hold.py":
+                    shutil.copy(path, Path(tmp) / path.name)
+            done = subprocess.run([sys.executable, str(Path(tmp) / "fleet-switchboard"), "impact", "clear", "acme/api#1", "--reason", "x"], capture_output=True, text=True, timeout=60,
+                                  env=dict(os.environ, FLEET_SWITCHBOARD_STATE_DIR=tmp))
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn("impact_hold", done.stderr)
+
+
 class TestOwnerHoldRule(unittest.TestCase):
     """Ask #451, slice 1: the owner's own clear is for credentials, identity and who may do what only. The rule is data in the impact matrix file."""
 
