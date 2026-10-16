@@ -19,33 +19,41 @@ Answer each item in the PR body, in one line: a test name that drives it, or "no
 - Is each wait bounded by a clock, not a loop count?
 - Can the failure path itself restart something expensive or dangerous in a loop (a restart loop, a crash loop, a retry storm)?
 
-**4. Every value that is a secret, and every form it can take**
+**4. Every run that can repeat or overlap**
+- What happens when the run is replayed, runs twice, or overlaps another run? Is the second one a no-op?
+- Is the shared state (a file, a lock, a marker, a cluster object) safe when two runs touch it at once?
+
+**5. Every required input that can be missing**
+- What happens when a required file, token or setting is missing or unreadable? Does the change refuse?
+- Does it ever fall back to another credential when the intended one is missing? (It must not.)
+
+**6. Every value that is a secret, and every form it can take**
 - Where can the value appear: arguments, environment, files, logs, audit lines, exception text, command output, error messages echoed by another tool, the output of a `get` or `describe`?
 - Which encodings can it appear in: base64 (standard, url-safe, padded or not, at each alignment), hex, percent-encoding, JSON escaping, a substring, a short value?
 - Is there ONE scrub function every output passes through, and does the test plant a value of several lengths in every encoding?
 
-**5. Every network call with a credential**
+**7. Every network call with a credential**
 - Can it follow a redirect? To another host? To plain http? (It must not.)
 - Which host does the credential go to? Is that host fixed in code, not taken from the response?
 - What is the maximum size and time of an answer, and what happens at one over?
 
-**6. Every parse of data you do not control**
+**8. Every parse of data you do not control**
 - Wrong type, missing key, extra key, a list where an object is expected, a huge value, a number as a string, pagination, an empty page?
 - Every pattern or glob you interpret: does it behave as the real system does (for example whether `*` crosses `/`), and does an unknown pattern fail closed?
 - A name or path from outside: dot segments, empty segments, odd characters?
 
-**7. Permissions and scope**
+**9. Permissions and scope**
 - Is the permission list compared as a whole (equality), not "contains"? What does one extra entry do?
 - Is any rule "namespace-wide" or "all repositories" where one name would do? If it must be wide, is that stated in the PR and the README?
 - Is the guard enforced where the action takes effect (the server, the token, the cluster policy), with any local wrapper only a convenience?
 
-**8. What the change does NOT touch**
+**10. What the change does NOT touch**
 - Names and labels that belong to a platform or a third party (do not rename them); the real caller's identity in an audit line; settings that were explicit before (an explicit context): pinned by a test?
 - A mechanical check: apply a rename table in reverse and diff against the base; list every residual.
 
-**9. Evidence that is not a unit test**
+**11. Evidence that is not a unit test**
 - RULE: a privileged script is run live on a throwaway system (a forced failure, a forced hang and a kill) BEFORE its strict review, and the PR says which head's bytes ran.
 - A label or marker another system sets (an installer, a controller): is it ever treated as proof of health? (It must not be.)
 
-**10. What was not done**
+**12. What was not done**
 - Say plainly what was not run (a path, a platform, a live check) and why.
