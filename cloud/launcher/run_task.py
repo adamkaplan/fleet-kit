@@ -29,6 +29,7 @@ import http.client
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -69,9 +70,12 @@ class Driver:
         self.pf = None
         self.tmp = None
         self.password = ""
+        self.nonce = secrets.token_hex(8)   # chosen before anything is made; the launcher records it on what it creates
+        self.refused = False   # the launcher found the worker already there: it is another run's, never ours to touch
 
     # -- output: every line passes through the launcher's scrub --
-    def say(self, text, stream=sys.stderr, prefix="run-task: "):
+    def say(self, text, stream=None, prefix="run-task: "):
+        stream = stream or sys.stderr
         for line in (str(text).splitlines() or [""]):
             print(prefix + self.kube.scrub(line, limit=2000), file=stream)
 
@@ -165,7 +169,7 @@ class Driver:
         feeds = [(pipes[0][0], pipes[0][1], model), (pipes[1][0], pipes[1][1], token)]
         args = ["create", self.a.worker, "--repo", self.a.repo, "--branch", self.a.branch,
                 "--run-secret-fd", "model-auth=%d" % pipes[0][0], "--run-secret-fd", "git-token=%d" % pipes[1][0],
-                "--password-fd", str(pw_w)]
+                "--password-fd", str(pw_w), "--run-id", self.nonce]
         if self.a.pull_secret:
             args += ["--pull-secret", self.a.pull_secret]
         if self.a.image:
@@ -186,6 +190,9 @@ class Driver:
         self.relay(err)
         if rc == 0:
             self.created = True
+        if rc == cw.EXIT_EXISTS:   # another run made the worker first: this run made nothing and must change nothing
+            self.refused = True
+            raise cw.CloudError("worker %s already exists (another run created it first); refusing, nothing was changed" % self.a.worker, cw.EXIT_REFUSED)
         if rc != 0:
             self.killed = rc < 0
             raise cw.CloudError("create failed (exit %d)" % rc, cw.EXIT_CLOUD)
@@ -316,17 +323,43 @@ class Driver:
         except cw.CloudError:
             self.say("per-run secret %s REMAINS: delete it with: %s" % (run, self.kube.delete_command("secret", run)))
 
-    def _pod_exists(self):
+    def _owner(self):
+        """Whose is the worker named for this run? Read back from the cluster: the pod's cw/run-id annotation (or, when
+        there is no pod, the per-run Secret's cw/run-id label) must equal this run's nonce. Returns (verdict, has_pod):
+        'ours', 'theirs' (present, no match: leave it whole), 'none' (nothing there) or 'unknown' (could not be read)."""
         try:
-            return bool(self.kube.get_pod(self.name))
-        except cw.CloudError:
-            return True   # unknown: assume it is there and try to remove it
+            pod = self.kube.get_pod(self.name)
+            if pod:
+                got = ((pod.get("metadata") or {}).get("annotations") or {}).get("cw/run-id")
+                return ("ours" if got == self.nonce else "theirs"), True
+            sec = self.kube.get_run_secret(self.name)
+            if sec:
+                got = ((sec.get("metadata") or {}).get("labels") or {}).get("cw/run-id")
+                if got is None:   # a Secret with credentials and no run id (a crash before it was labelled): never guessed
+                    return "unknown", False
+                return ("ours" if got == self.nonce else "theirs"), False
+            return "none", False
+        except (cw.CloudError, ValueError, AttributeError, TypeError):
+            return "unknown", False
 
     def cleanup(self):
         self._shield()
         self.kill_pf()
-        if self.create_started and not self.created and not self.note_seen and not self.killed and self._pod_exists():
-            self.created = True   # the launcher finished just as the signal came
+        if self.refused:
+            self.say("worker %s belongs to another run; left whole (no end hook, no Secret touched)" % self.name)
+        elif self.create_started and not self.created and not self.note_seen:
+            # the launcher did not say what became of its work (cut off, killed, or finished just as the signal came):
+            # touch only what the cluster proves is this run's
+            verdict, has_pod = self._owner()
+            if verdict == "ours" and has_pod:
+                self.created = True
+            elif verdict == "ours":
+                self.secret_line(everything=True)
+            elif verdict == "theirs":
+                self.say("worker %s is not this run's (its run id does not match); left whole" % self.name)
+            elif verdict == "unknown":
+                self.say("per-run secret %s-run REMAINS (ownership could not be read, nothing was touched): if this run made it, delete it with: %s"
+                         % (self.name, self.kube.delete_command("secret", self.name + "-run")))
         if self.created and not self.stopped:
             self.say("ending early; stopping the worker so no per-run secret is left")
             try:
@@ -337,9 +370,7 @@ class Driver:
         if self.stop_failed:
             self.say("the worker is kept (its end hook could not push, see above); delete it only after the work is saved: %s"
                      % self.kube.delete_command("pod", self.name))
-        if self.create_started and not self.created and not self.note_seen and (self.killed or self._pod_exists()):
-            self.secret_line(everything=True)   # the launcher died or was cut off before it could say
-        elif self.created:
+        if self.created:
             self.secret_line()
         if self.tmp:
             shutil.rmtree(self.tmp, ignore_errors=True)

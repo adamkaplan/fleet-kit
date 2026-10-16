@@ -28,7 +28,7 @@ The launcher mounts per-run files read-only under `/run/cw` (`CW_RUN_DIR`). The 
 
 - `server-password`: read into `OPENCODE_SERVER_PASSWORD` for the server it starts (OpenCode reads the password only from its environment).
 - `model-auth`: the model provider's access entry (JSON), copied with mode 600 to `<tmpfs>/data/opencode/auth.json` (`XDG_DATA_HOME`), so the server refreshes its short-lived token in the copy and never in the Secret. A model config naming `CW_MODEL` (default `github-copilot/claude-sonnet-5.5`) is written beside it (`XDG_CONFIG_HOME`); it holds no secret.
-- `git-token`: never copied. A git credential helper (`git config --global`, so every process of the worker user sees it, including a fresh-environment `kubectl exec` such as the end hook) and a `gh` wrapper read the file at call time. The helper answers only for `https://github.com`; the token is never in git config, argv or the environment.
+- `git-token`: never copied. A git credential helper (`git config --global`, so every process of the worker user sees it, including a fresh-environment `kubectl exec` such as the end hook) and a `gh` wrapper read the file at call time. The helper answers only for `https://github.com`; the token is never in git config, argv or the environment. The directory is the path baked in when the files were generated (a caller's `CW_RUN_DIR` changes nothing), and at every call an unreadable or empty token file makes both fail with one line and a non-zero exit (never an empty password, never a `gh` with an empty token). The `gh` wrapper passes every subcommand: the guard is the token's own permissions (a per-run, one-repository App token), not the wrapper. The server password is in the server's environment, so every process the agent starts can read it; that is accepted by design.
 
 A file that is absent is skipped (a pod started without per-run secrets). A file that is present but unreadable or empty
 refuses the start with one line naming it; there is no fallback to another source. The tmpfs is `CW_TMP_DIR` (default `/run/cw-tmp`).
@@ -54,7 +54,11 @@ waits for idle, then stops the worker (the end hook pushes the work; the pod and
   variable of a child, a log or a file; the only file is a private temporary directory (`CW_TMPDIR`) holding the
   port-forward's own log, removed at exit. The server password comes back on a pipe and stays in memory.
 - A missing or unreadable input (auth file, entry, token command, brief) refuses before anything is created. A second run
-  with a worker name that exists refuses and changes nothing.
+  with a worker name that exists refuses and changes nothing. So does a run that LOSES a race for the name (another run made
+  the worker while this one minted its token): the launcher exits with its own code (7, "already exists") and the driver
+  returns without an end hook and without deleting anything. The driver acts on a worker only when it can prove it is
+  its own: a nonce it chose before the create is set (`--run-id`) on the pod and Secrets as `cw/run-id` and read back;
+  no match, or no answer, leaves it whole. The launcher makes the password Secret, the per-run Secret and the pod with `kubectl create` (exclusive: of two simultaneous creates exactly one wins, the other exits 7 having made nothing), and its own cleanup deletes only objects that carry its `--run-id`. A per-run Secret with no run id (a crash before it was labelled) is never guessed at: it is reported with the exact delete command (and says the delete command when ownership could not be read).
 - A kill with SIGKILL cannot be cleaned by the driver: the launcher's `delete` or the reaper removes what remains.
 
 Tests: `bin/test-cloud-launcher` (driver, fake kubectl), `cloud/tests/test-cloud` (entrypoint, stub server).
