@@ -3290,7 +3290,10 @@ def steers_into_turn(config, observation, carried, discovery=None):
 
 def clock_utc(epoch):
     """HH:MMZ (UTC) of an epoch: the time a message was sent or delivered, as the header shows it."""
-    return time.strftime("%H:%MZ", time.gmtime(epoch))
+    try:
+        return time.strftime("%H:%MZ", time.gmtime(epoch))
+    except (OverflowError, ValueError, OSError, TypeError):
+        return "??:??Z"   # a time that is not a time never stops a message
 
 
 def superseded_by(facts):
@@ -4620,7 +4623,7 @@ class Switchboard:
                 if meta.get("from") == "switchboard" and meta.get("sender") == sender and meta.get("issue") == issue \
                         and meta.get("repo") == (repo or None) and all(key.startswith("send:") for key in _fleet_keys(item)):
                     when = _created(item)
-                    if when is not None:
+                    if when is not None and 946684800 <= when <= now + 86400:   # an inbox item's time is untrusted: only a plausible one (2000 to tomorrow) is shown
                         found.append(when)
             return tuple(sorted(found))
         except Exception:
@@ -7972,7 +7975,7 @@ def add_foreground_parsers(sub):
                          help="The brief (Done so far, Next steps, Watch out for): a file, or - for stdin")
     handoff.add_argument("--name", help="The subagent's fleet name (default: cos-<issue>)")
     handoff.add_argument("--dir", help="The subagent's working directory (default: here)")
-    handoff.add_argument("--workspace", help="The herdr workspace for its tab (default: $HERDR_WORKSPACE_ID)")
+    handoff.add_argument("--workspace", help="The herdr workspace for its tab (default: the workspace of this session, else $HERDR_WORKSPACE_ID)")
 
 
 # ======================================================================
@@ -24836,7 +24839,7 @@ def build_parser():
                                                            "of creating one (a restart that keeps the conversation)")
     launch.add_argument("--headless", action="store_true", help="Start the worker with NO terminal: a session in the OpenCode service, the brief sent through "
                         "the API (about 2 MB instead of a terminal's 200 to 400 MB). Its tools run in the service's environment; opt in")
-    launch.add_argument("--workspace", help="The herdr workspace for the new tab (default: $HERDR_WORKSPACE_ID)")
+    launch.add_argument("--workspace", help="The herdr workspace for the new tab (default: the workspace of this session, else $HERDR_WORKSPACE_ID)")
     launch.add_argument("--role", help="metadata.fleet.role")
     launch.add_argument("--reports-to", dest="reports_to", help="metadata.fleet.reports_to")
     launch.add_argument("--issue", type=issue_arg, help="metadata.fleet.issue (owner/repo#N also sets --repo)")
