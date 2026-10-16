@@ -34,6 +34,13 @@ AUTH:       <the authority already granted, explicitly>
 CHECKPOINT: <a UTC time or an agreed event, with an overdue time>
 ```
 
+Before the coder's first push, it runs both focused (a push voids proofs):
+
+```text
+bin/test-switchboard -k test_the_role_files_do_not_grow   # the role-file byte cap
+bin/test-switchboard -k TestHygiene                       # shebang, stdlib-only, executable bits
+```
+
 `ASK` carries the Intent and Done when of the ask this assignment serves
 (`fleet-switchboard intent <issue>` prints them), so a coder who never sees the
 charter still knows what the work is for. `GOAL` and `DONE` narrow the ask to this
