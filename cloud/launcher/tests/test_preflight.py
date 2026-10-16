@@ -342,6 +342,12 @@ class Preflight(unittest.TestCase):
         with open(PREFLIGHT) as f:
             self.assertNotIn("CW_REPO_APPROVALS", f.read())
 
+    def test_S6_the_approvals_file_is_a_top_tier_credentials_path_in_the_impact_matrix(self):
+        matrix = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(HERE))), "docs", "review-laws", "impact-matrix.json")
+        with open(matrix) as f:
+            paths = json.load(f)["owner_hold"]["top_tier_paths"]["credentials"]
+        self.assertEqual(paths.count("cloud/launcher/repo-approvals.json"), 1)
+
     def test_S4_only_a_403_on_an_org_ruleset_is_not_readable(self):
         self.approvals({self.KEY: self.ENTRY})
         for code in (404, 500, "drop"):
