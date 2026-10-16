@@ -13919,15 +13919,55 @@ class TestHeadlessPresence(Base):
     def test_the_status_command_writes_nothing_in_the_state_directory(self):
         self.headless()
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
-        state = Path(self.world.state)
-        snapshot = lambda: {str(p.relative_to(state)): p.stat().st_mtime_ns for p in state.rglob("*") if p.is_file()}
-        sb.collect_status(self.world.route, self.world.clock.now)         # a first status creates the lock files every command makes (the same with no headless worker at all)
-        before = snapshot()
-        report = sb.collect_status(self.world.route, self.world.clock.now)
+        state, writes = str(self.world.state), []
+        real = {"replace": os.replace, "rename": os.rename, "open": os.open, "builtin": open}
+        def note(path):
+            if str(path).startswith(state) and not str(path).endswith(".lock"):
+                writes.append(str(path))
+        def replace(src, dst, *a, **k):
+            note(dst); return real["replace"](src, dst, *a, **k)
+        def rename(src, dst, *a, **k):
+            note(dst); return real["rename"](src, dst, *a, **k)
+        def os_open(path, flags, *a, **k):
+            if flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND):
+                note(path)
+            return real["open"](path, flags, *a, **k)
+        def builtin_open(file, mode="r", *a, **k):
+            if isinstance(file, (str, os.PathLike)) and any(c in str(mode) for c in "wax+"):
+                note(file)
+            return real["builtin"](file, mode, *a, **k)
+        with mock.patch.object(os, "replace", replace), mock.patch.object(os, "rename", rename), \
+                mock.patch.object(os, "open", os_open), mock.patch("builtins.open", builtin_open):
+            report = sb.collect_status(self.world.route, self.world.clock.now)
         self.assertIn("hw", [row["name"] for row in report["agents"]["list"]], "the worker is listed (the premise of the check)")
-        after = snapshot()
-        self.assertEqual(sorted(set(after) - set(before)), [], "0 files created")
-        self.assertEqual(sorted(k for k in before if after.get(k) != before[k]), [], "0 files changed")
+        self.assertEqual(writes, [], "status wrote nothing in the state directory (lock files excepted: every command makes them)")
+
+    def test_a_status_engine_given_a_real_state_directory_would_write_so_the_check_above_bites(self):
+        """The mutation the writes test must catch: the same status engine with `state_dir` set records the remembered bosses."""
+        self.headless()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        real, wrote = sb.Switchboard.__init__, []
+        def with_state_dir(engine, config, v2, herdr, audit, sources=(), now=None, actor="daemon", intents=None, state_dir=None):
+            real(engine, config, v2, herdr, audit, sources, now, actor, intents, state_dir=self.world.state)
+        original_write = sb._write_small
+        with mock.patch.object(sb.Switchboard, "__init__", with_state_dir), \
+                mock.patch.object(sb, "_write_small", lambda state, name, data: wrote.append(name) or original_write(state, name, data)):
+            sb.collect_status(self.world.route, self.world.clock.now)
+        self.assertIn(sb.HEADLESS_SERVICE_FILE, wrote, "with a state directory the engine writes: this is what the status engine must never be given")
+
+    def test_a_reassigned_boss_is_shown_for_a_headless_worker_in_status_and_in_the_daemon_and_a_terminal_workers_row_is_unchanged(self):
+        sid = self.headless()
+        terminal = self.world.add_agent("termworker", fleet={"role": "coder", "reports_to": "boss"})
+        reassign = sb.load_module("reassign")
+        reassign.write_overrides(self.world.state, {
+            "hw": {"boss": "boss2", "was": "boss", "original": "boss", "session": sid, "by": "operator", "at": self.world.clock.now()},
+            "termworker": {"boss": "boss2", "was": "boss", "original": "boss", "session": self.world.sessions["termworker"], "by": "operator", "at": self.world.clock.now()}})
+        daemon = self.world.new_engine("cli").discover(self.world.clock.now()).agents
+        self.assertEqual((daemon["hw"].fleet["reports_to"], daemon["termworker"].fleet["reports_to"]), ("boss2", "boss2"), "the daemon follows the reassignment for both")
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        rows = {row["name"]: row["observation"] for row in sb.collect_status(self.world.route, self.world.clock.now)["agents"]["list"] if row.get("observation")}
+        self.assertEqual(rows["hw"]["fleet"]["reports_to"], "boss2", "status shows the headless worker's reassigned boss")
+        self.assertEqual(rows["termworker"]["fleet"]["reports_to"], "boss", "a terminal worker's status row is exactly as before (the status engine has no state directory)")
 
     def test_a_worker_launched_during_a_pass_is_never_reported_lost_by_that_pass(self):
         """The daemon discovers, THEN the fact sources run; a launch that lands between the two wrote its record after discovery looked."""

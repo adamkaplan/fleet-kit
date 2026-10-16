@@ -4211,7 +4211,7 @@ class Switchboard:
             self._not_fleet[session_id] = now + self.NOT_FLEET_SECONDS
             return None
         self._not_fleet.pop(session_id, None)
-        fleet = load_module("reassign").overlay(self.state_dir if self.state_dir is not None else self.headless_state, fleet, session_id)   # a reassigned worker's boss (bin/reassign.py): bound to this session
+        fleet = load_module("reassign").overlay(self.state_dir, fleet, session_id)   # a reassigned worker's boss (bin/reassign.py): bound to this session
         times = info.get("time") if isinstance(info.get("time"), dict) else {}
         observation = Observation(fleet["name"], session_id, entry.get("pane_id"),
                                   STATUS.get(entry.get("agent_status"), "unknown"), fleet,
@@ -4330,7 +4330,7 @@ class Switchboard:
         fleet = _fleet_meta(info)
         if not fleet or fleet.get("name") != record["worker"]:
             return None   # the session does not carry the worker's name: the record is not proof of presence
-        fleet = load_module("reassign").overlay(self.state_dir, fleet, session_id)   # a reassigned worker's boss (bin/reassign.py): bound to this session
+        fleet = load_module("reassign").overlay(self.state_dir if self.state_dir is not None else self.headless_state, fleet, session_id)   # a reassigned worker's boss (bin/reassign.py): bound to this session
         times = info.get("time") if isinstance(info.get("time"), dict) else {}
         observation = Observation(fleet["name"], session_id, None, STATUS.get(state, "unknown"), fleet, _seconds(times.get("idle")), info.get("outcome"))
         observation.created = _seconds(times.get("created"))
