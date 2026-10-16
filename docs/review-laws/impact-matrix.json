@@ -138,7 +138,10 @@
         "shims/gh",
         "shims/git",
         "cloud/launcher/token_mint.py",
-        "cloud/launcher/cloud_worker.py"
+        "cloud/launcher/cloud_worker.py",
+        "cloud/launcher/app_token.py",
+        "cloud/launcher/preflight.py",
+        "cloud/worker/entrypoint.sh"
       ],
       "identity": [
         "shims/**",
@@ -200,7 +203,10 @@
           "bin/cloud_worker.py",
           "bin/external_adapter.py",
           "bin/delegated_clear.py",
-          "docs/review-laws/impact-matrix.json"
+          "docs/review-laws/impact-matrix.json",
+          "cloud/launcher/app_token.py",
+          "cloud/launcher/preflight.py",
+          "cloud/worker/entrypoint.sh"
         ],
         "exclude": [
           "agents/**",
@@ -280,7 +286,7 @@
     },
     "note": "top_tier_outside_floor lists the top tier paths that are deliberately not in the floor globs (the floor excludes agent definitions, which are captain pull requests); a test checks that every other top tier path is inside the floor. bin/fleet-switchboard selects accounts and mints tokens but is not a top tier path (it would hold nearly every change): a change there to credentials or identity must be rated with that class by the independent review.",
     "delegated_clear": {
-      "meaning": "What the Chief of Staff's clear under the owner's standing order may NEVER lift (bin/delegated_clear.py reads this block and holds no path or class of its own): a pull request whose top tier path hits include a class of `never_path_classes`, whose independent review's class is one of `top_tier_review_classes`, or that changes the clear code (`clear_code_paths`, and in the files of `clear_code_symbol_files` any of `clear_code_symbols`) stays the owner's own clear. The clear code that still lives inside the daemon file is found by its function names, until it moves to a module of its own.",
+      "meaning": "What the Chief of Staff's clear under the owner's standing order may NEVER lift (bin/delegated_clear.py reads this block and holds no path or class of its own): a pull request whose top tier path hits include a class of `never_path_classes`, whose independent review's class is one of `top_tier_review_classes`, or that changes ANY file of `clear_code_paths` (every file that holds or defines something the clear depends on, the daemon file included: a pull request that touches the daemon file stays the owner's own clear). Functions are NOT inferred from hunks.",
       "never_path_classes": [
         "credentials",
         "identity"
@@ -291,43 +297,24 @@
         "authority"
       ],
       "clear_code_paths": [
+        "bin/fleet-switchboard",
+        "bin/delegated_clear.py",
         "bin/chat_clear.py",
         "bin/clear_carry.py",
-        "bin/delegated_clear.py",
         "bin/impact_hold.py",
         "bin/impact_floor.py",
-        "docs/review-laws/impact-matrix.json"
-      ],
-      "clear_code_symbol_files": [
-        "bin/fleet-switchboard"
-      ],
-      "clear_code_symbols": [
-        "cmd_impact_clear",
-        "impact_clear_core",
-        "clear_fingerprint",
-        "notify_clear",
-        "_notify_clear_body",
-        "clear_lane",
-        "neutralise_marker",
-        "marker_edit",
-        "chat_clear_apply",
-        "chat_clear_pass",
-        "impact_carry_decision",
-        "apply_impact_hold",
-        "_apply_impact_hold_locked",
-        "gates_caller_kind",
-        "delegated_clear_checks",
-        "delegated_clear_pr_checks",
-        "pr_floor_report",
-        "impact_review_record",
-        "impact_review_hold",
-        "fetch_orders",
-        "_intent_reader",
-        "impact_carry_get",
-        "load_module",
-        "read_pr_json",
-        "agent_block_states",
-        "redact_command_text"
+        "bin/plan_ledger.py",
+        "bin/plan_check.py",
+        "bin/decision_core.py",
+        "bin/repo_exclusion.py",
+        "bin/reassign.py",
+        "bin/launch_testers.py",
+        "docs/review-laws/impact-matrix.json",
+        "bin/cpu_guard.py",
+        "bin/disk_janitor.py",
+        "bin/fleet_health.py",
+        "bin/heavy_slots.py",
+        "bin/reds.py"
       ]
     }
   }

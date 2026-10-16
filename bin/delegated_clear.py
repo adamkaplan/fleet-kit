@@ -4,10 +4,12 @@ The owner's own `impact clear` lifts an impact hold at the pull request's head. 
 ordinary held pull requests and tell him after. This module is the CHECK of that delegated clear (the command and its audit are in `bin/fleet-switchboard`); it decides nothing else.
 It is OFF unless the configuration (`delegated_clear`) names the order numbers that delegate a clear and the charter that holds them. It refuses: any caller but the Chief of Staff, an
 order that is not listed or does not exist, a pull request whose owner-hold decision names a path of a class the matrix lists as never delegated (credentials, identity), one whose
-independent review's class is a top tier class (credentials, identity or authority), one that changes the clear code, and anything it cannot read.
+independent review's class is a top tier class (credentials, identity or authority), one that changes ANY file of the clear code or of what it depends on (the daemon file included),
+and anything it cannot read.
 
 Pure: plain values in, a list of reasons out (empty means allowed). The classes and the clear code are DATA in the matrix file (`owner_hold.delegated_clear`): this module holds no path or class.
 """
+import hashlib
 import re
 
 CONFIG_KEY = "delegated_clear"   # the module declares its own configuration key (bin/fleet-switchboard config_declarations)
@@ -15,27 +17,38 @@ CONFIG_DEFAULT = None            # None: no default is added; absent = off
 MAX_ORDERS = 20
 
 
+def order_hash(text):
+    """The hash the configuration binds an order to: sha256 of the order's text (the bullet as `orders list --json` shows it), so an edit, an insertion or a removal above it revokes the delegation."""
+    return hashlib.sha256(str(text).strip().encode("utf-8")).hexdigest()
+
+
+def _entry_ok(entry):
+    return (isinstance(entry, dict) and set(entry) == {"number", "sha256"} and isinstance(entry["number"], int) and not isinstance(entry["number"], bool) and entry["number"] >= 1
+            and isinstance(entry["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) is not None)
+
+
 def validate(raw, source):
-    """`delegated_clear`: absent, null or false = off; else {"orders": [1-based order numbers], "charter": the charter issue number that holds them}. Raises ValueError naming the key."""
+    """`delegated_clear`: absent, null or false = off; else {"orders": [{"number": N, "sha256": "<hash of the order's text>"}, ...], "charter": the charter issue number that holds them}. An empty
+    list is off. Raises ValueError naming the key."""
     if raw is None or raw is False:
         return
     if not isinstance(raw, dict) or set(raw) - {"orders", "charter"}:
         raise ValueError("%s: 'delegated_clear' must be false or an object with only orders and charter, got %r" % (source, raw))
     orders, charter = raw.get("orders"), raw.get("charter")
-    if not (isinstance(orders, list) and len(orders) <= MAX_ORDERS and all(isinstance(n, int) and not isinstance(n, bool) and n >= 1 for n in orders)):
-        raise ValueError("%s: delegated_clear.orders must be a list of order numbers (1 or more; an empty list is off)" % source)
+    if not (isinstance(orders, list) and len(orders) <= MAX_ORDERS and all(_entry_ok(e) for e in orders)):
+        raise ValueError("%s: delegated_clear.orders must be a list of {\"number\": N, \"sha256\": <64 hex of the order's text>} (an empty list is off)" % source)
     if not (isinstance(charter, int) and not isinstance(charter, bool) and charter >= 1):
         raise ValueError("%s: delegated_clear.charter must be the charter's issue number" % source)
 
 
 def settings(config):
-    """(orders, charter) when the delegated clear is configured and well formed, else None: not enabled (absent, empty, malformed, false: all off)."""
+    """({number: sha256}, charter) when the delegated clear is configured and well formed, else None: not enabled (absent, empty, malformed, false: all off)."""
     raw = (config or {}).get(CONFIG_KEY) if isinstance(config, dict) else None
     try:
         validate(raw, "config")
     except ValueError:
         return None
-    return (list(raw["orders"]), raw["charter"]) if isinstance(raw, dict) and raw["orders"] else None
+    return ({e["number"]: e["sha256"] for e in raw["orders"]}, raw["charter"]) if isinstance(raw, dict) and raw["orders"] else None
 
 
 def caller_is_chief(kind):
@@ -50,22 +63,13 @@ def order_text(orders, number):
     return None
 
 
-def _symbol_changes(patch, symbols):
-    """The clear-code symbols a diff mentions in a hunk header (the function around the change) or in a changed line."""
-    found = set()
-    for line in str(patch or "").splitlines():
-        if line.startswith("@@") or line[:1] in "+-":
-            found |= {s for s in symbols if re.search(r"\b%s\b" % re.escape(s), line)}
-    return sorted(found)
-
-
 def refusals(rule, report, files):
     """[reasons] a delegated clear is refused for this pull request; [] when none. `rule` is the matrix's `owner_hold.delegated_clear` block; `report` is the owner-hold report the
     daemon uses (`pr_floor_report`: its decision, its top tier path hits by class, the independent review's class, whether the file list is complete); `files` is the pull request's
     changed files with their patches ([{"filename", "patch"}]) or None when they could not be read."""
     if not isinstance(rule, dict) or not isinstance(report, dict):
         return ["the delegated-clear rule or the owner-hold decision cannot be read"]
-    for key in ("never_path_classes", "top_tier_review_classes", "clear_code_paths", "clear_code_symbols", "clear_code_symbol_files"):
+    for key in ("never_path_classes", "top_tier_review_classes", "clear_code_paths"):
         if not isinstance(rule.get(key), list) or not all(isinstance(x, str) for x in rule[key]):
             return ["the delegated-clear rule is malformed (%s)" % key]
     if report.get("owner_decision") not in ("hold", "second-review", "none"):
@@ -87,17 +91,7 @@ def refusals(rule, report, files):
     changed = {f.get("filename") for f in files or [] if isinstance(f, dict)} | {f.get("previous_filename") for f in files or [] if isinstance(f, dict)} | set(report.get("changed_paths") or [])
     for path in sorted(p for p in changed if isinstance(p, str)):
         if path in rule["clear_code_paths"]:
-            reasons.append("it changes the clear code (%s): a change to the clear is the owner's own" % path)
+            reasons.append("it changes a file that holds the clear code or what it depends on (%s): that stays the owner's own clear" % path)
     if files is None:
-        reasons.append("the patches of the changed files cannot be read, so a change to the clear code cannot be ruled out")
-    else:
-        for item in files:
-            if not isinstance(item, dict) or not ({item.get("filename"), item.get("previous_filename")} & set(rule["clear_code_symbol_files"])):
-                continue
-            if not isinstance(item.get("patch"), str):
-                reasons.append("the patch of %s is not available, so a change to the clear code cannot be ruled out" % item.get("filename"))
-                continue
-            found = _symbol_changes(item["patch"], rule["clear_code_symbols"])
-            if found:
-                reasons.append("it changes the clear code in %s (%s): a change to the clear is the owner's own" % (item["filename"], ", ".join(found[:4])))
+        reasons.append("the changed files cannot be read, so a change to the clear code cannot be ruled out")
     return reasons

@@ -19644,7 +19644,9 @@ def delegated_clear_checks(engine, runner, now, kind, number):
         return None, "the charter's orders cannot be read (%s): refused" % _one_line(str(err), 120)
     if text is None:
         return None, "order %d does not exist on charter #%d" % (number, charter)
-    return {"number": number, "text": text}, None
+    if module.order_hash(text) != orders[number]:   # the order numbers are POSITIONS: the text bound in the configuration must still be the text at that number
+        return None, "the text of order %d is no longer the one the configuration is bound to (an order was edited, inserted or removed): the owner re-binds it" % number
+    return {"number": number, "text": re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", text)}, None
 
 
 def delegated_clear_pr_checks(engine, runner, repo, number):
