@@ -39857,6 +39857,20 @@ class TestHeldTop(DecisionsBase):
         found = self.defects(self.OPEN + self.WHY + self.TABLE + "## Example\n\nIt works.\n\n" + self.QS)
         self.assertEqual((self.named(found, "Example"), len(found)), (1, 1), found)
 
+    def test_a_pathological_64kb_body_is_judged_quickly_and_a_longer_one_is_not_read(self):
+        for unit in ("<", "<pre ", "```", "<pre class=", "`", "<!--"):
+            body = self.OPEN + unit * (64000 // len(unit))
+            started = time.monotonic()
+            found = self.defects(body)
+            self.assertLess(time.monotonic() - started, 0.5, "64 KB of %r" % unit)   # a generous bound: it takes milliseconds
+            self.assertTrue(found)
+        self.assertIn("longer than", self.defects(self.OPEN + self.TOP + "x" * 70001)[0])
+
+    def test_underscore_only_cells_fail(self):
+        table = ("## What changes for you\n\n| Before | After |\n|---|---|\n| ___ | You get one card. |\n| You open a list. | It opens itself. |\n\n")
+        found = self.defects(self.OPEN + self.WHY + table + self.EXAMPLE + self.QS)
+        self.assertEqual((self.named(found, "table"), len(found)), (1, 1), found)
+
     def test_a_body_the_check_cannot_read_fails(self):
         with mock.patch.object(sb, "_held_defects", side_effect=RuntimeError("boom")):
             found = sb.held_defects(self.OPEN + self.TOP)

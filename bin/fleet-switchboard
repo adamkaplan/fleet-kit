@@ -21203,7 +21203,23 @@ def pr_is_held(labels, body, now=None):
 
 
 _HELD_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
-_HELD_PRE_MERMAID_RE = re.compile(r"<pre\b[^>]*\bclass\s*=\s*[\"']?[^\"'>]*\bmermaid\b", re.I)
+HELD_BODY_MAX = 70000   # a longer body is not read (GitHub's own cap is 65536)
+_HELD_PLACEHOLDER_RE = re.compile(r"<[^<>]*>")   # linear: the class stops at the next `<`
+_HELD_CLASS_MERMAID_RE = re.compile(r"\bclass\s*=\s*[\"']?[^\"'>]*\bmermaid\b", re.I)
+
+
+def _held_pre_mermaid(line):
+    """True when `line` opens a `<pre class=...mermaid...>`: a bounded scan (each `<pre` looks at most 200 characters ahead), so it is linear."""
+    low = line.lower()
+    at = low.find("<pre")
+    while at >= 0:
+        tag = line[at:at + 200]
+        end = tag.find(">")
+        tag = tag[:end] if end >= 0 else tag
+        if "mermaid" in tag.lower() and _HELD_CLASS_MERMAID_RE.search(tag):
+            return True
+        at = low.find("<pre", at + 4)
+    return False
 
 
 def held_scan(lines):
@@ -21231,7 +21247,7 @@ def held_scan(lines):
             if line.strip() == EXPLAINER_BEGIN:
                 clean.append(line)
                 continue
-        if _HELD_PRE_MERMAID_RE.search(line):
+        if _held_pre_mermaid(line):
             mermaid.append(i)
         out, rest = "", line
         while rest:
@@ -21264,6 +21280,8 @@ def held_top_end(rest):
 def held_defects(body):
     """The ONE check of a held PR's top (see `_held_defects`); anything it cannot read is a defect, never a pass."""
     try:
+        if len(body or "") > HELD_BODY_MAX:
+            return ["the held PR's top is unreadable: the body is longer than %d characters" % HELD_BODY_MAX]
         return _held_defects(body)
     except Exception as err:   # a body it cannot parse fails: unreadable, never ok
         return ["the held PR's top is unreadable (%s)" % _one_line("%s: %s" % (type(err).__name__, err), 100)]
@@ -21293,7 +21311,7 @@ def _held_defects(body):
         return top[start:stop]
 
     def words(text):
-        return len(re.findall(r"\w", text))
+        return len(re.findall(r"[^\W_]", text))   # underscores are not word characters here
 
     problems = []
     if HELD_WHY not in pos:
@@ -21301,7 +21319,7 @@ def _held_defects(body):
     else:
         text = " ".join(l.strip() for l in section(HELD_WHY) if l.strip() and not l.strip().startswith("!["))
         sentences = [x for x in re.split(r"(?<=[.!?])\s+", text) if x.strip()]
-        if words(text) < 3 or re.search(r"<[^>]*>", text):
+        if words(text) < 3 or _HELD_PLACEHOLDER_RE.search(text):
             problems.append("`%s` is empty or still has a <placeholder>" % HELD_WHY)
         elif len(sentences) > 3:
             problems.append("`%s` has %d sentences: it is one to three" % (HELD_WHY, len(sentences)))
@@ -21315,13 +21333,13 @@ def _held_defects(body):
             problems.append("`%s`: the table needs a Before and an After column (a header row, a separator row, then the rows)" % HELD_TABLE)
         elif not 2 <= len(data) <= 4:
             problems.append("`%s`: the table has %d rows, it is 2 to 4" % (HELD_TABLE, len(data)))
-        elif any(len(r) != 2 or any(words(c) < 3 or re.search(r"<[^>]*>", c) for c in r) for r in data):
+        elif any(len(r) != 2 or any(words(c) < 3 or _HELD_PLACEHOLDER_RE.search(c) for c in r) for r in data):
             problems.append("`%s`: every table cell is a plain sentence (at least 3 word characters, no <placeholder>)" % HELD_TABLE)
     if HELD_EXAMPLE not in pos:
         problems.append("the held PR needs an `%s` section: one concrete case in a few lines" % HELD_EXAMPLE)
     else:
         text = " ".join(l.strip() for l in section(HELD_EXAMPLE) if l.strip() and not l.strip().startswith("!["))
-        if len(text) < 20 or re.search(r"<[^>]*>", text):
+        if len(text) < 20 or _HELD_PLACEHOLDER_RE.search(text):
             problems.append("`%s` is empty, too short (20 characters) or still has a <placeholder>" % HELD_EXAMPLE)
     if any(at <= m < at + top_end for m in mermaid_all):
         problems.append("the top part shows a Mermaid diagram: it goes below, in the technical section")
