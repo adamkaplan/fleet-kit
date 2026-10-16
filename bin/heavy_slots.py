@@ -204,6 +204,17 @@ def read_process_table():
     return rows
 
 
+def read_lock_holders(path):
+    """The pids that have `path` open, from `lsof -t` (same user only); raises OSError when lsof is missing, fails or is too slow (no holder is then known)."""
+    try:
+        done = subprocess.run(["lsof", "-a", "-u", str(os.getuid()), "-t", "--", str(path)], capture_output=True, text=True, timeout=10)
+    except (subprocess.SubprocessError, OSError) as err:
+        raise OSError("lsof failed: %s" % err)
+    if done.returncode not in (0, 1):   # 1: nothing has it open
+        raise OSError("lsof exited %d" % done.returncode)
+    return {int(word) for word in done.stdout.split() if word.isdigit()}
+
+
 def _start(row):
     return row[4] if len(row) > 4 else ""
 
@@ -232,10 +243,11 @@ class Watchdog:
     be read stops nothing beyond the command itself (one note); the time ceiling needs no table."""
 
     def __init__(self, pid, command, mem_mb, max_seconds, out, started, read_table=read_process_table, clock=time.time, pause=None, killpg=os.killpg,
-                 kill=os.kill, every=WATCH_SECONDS, grace=KILL_GRACE_SECONDS, rounds=SWEEP_ROUNDS, sweep_every=SWEEP_SECONDS, sweep_pause=time.sleep, me=None):
+                 kill=os.kill, every=WATCH_SECONDS, grace=KILL_GRACE_SECONDS, rounds=SWEEP_ROUNDS, sweep_every=SWEEP_SECONDS, sweep_pause=time.sleep, me=None, lock_path=None, lsof=read_lock_holders):
         self.pid, self.command, self.mem_mb, self.max_seconds, self.out, self.started = pid, command, mem_mb, max_seconds, out, started
         self.read_table, self.clock, self.killpg, self.kill, self.every, self.grace = read_table, clock, killpg, kill, every, grace
         self.rounds, self.sweep_every, self.sweep_pause = rounds, sweep_every, sweep_pause
+        self.lock_path, self.lsof, self.lock_noted, self.candidates = lock_path, lsof, False, set()
         self.me = me if me is not None else (os.getpid(), os.getppid(), os.getpgrp())   # never signalled: this wrapper, its caller, its group
         self.stop_event = threading.Event()
         self.pause = pause or (lambda seconds: self.stop_event.wait(seconds))
@@ -263,6 +275,12 @@ class Watchdog:
         alive = {key for key in self.seen if key[0] in at and _start(at[key[0]]) == key[1]}
         if self.pid in at and (self.pid, _start(at[self.pid])) not in self.seen:
             alive.add((self.pid, _start(at[self.pid])))
+        for pid in self.lock_holders():   # the slot lock's descriptor is inherited by every descendant, a double fork that left the tree included
+            key = (pid, _start(at[pid])) if pid in at else None
+            if key is not None and key[0] not in self.me[:2]:
+                if key in self.candidates:   # seen at a second look: not a process that only opened the lock file for an instant (holders())
+                    alive.add(key)
+                self.candidates.add(key)
         own = at.get(self.pid)
         if own is not None and own[2] not in (0, 1, self.me[2]):
             self.group = own[2]
@@ -273,6 +291,17 @@ class Watchdog:
         self.seen |= alive
         self.pgids.update({row[0]: row[2] for row in rows})
         return alive
+
+    def lock_holders(self):
+        if self.lock_path is None:
+            return set()
+        try:
+            return self.lsof(self.lock_path)
+        except OSError as err:
+            if not self.lock_noted:
+                self.lock_noted = True
+                self.out.write("heavy: cannot list who holds the slot lock (%s): a process that left the command's tree is not found\n" % err)
+            return set()
 
     def sample(self):
         """One look; returns ("memory" | "time" | None, live keys)."""
@@ -318,7 +347,8 @@ class Watchdog:
         live = self.look()
         if live:
             self.survivors = sorted(pid for pid, _s in live)
-            self.out.write("heavy: survivors after the stop: %s\n" % ", ".join(str(pid) for pid in self.survivors))
+            self.out.write("heavy: survivors after the stop: %s (a process that left the tree and closed the slot lock cannot be found)\n"
+                           % ", ".join(str(pid) for pid in self.survivors))
             self.out.flush()
 
     def look(self):
@@ -429,7 +459,8 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
             except OSError:
                 pass
         mem_mb, max_seconds = ceilings(environ)
-        dog = Watchdog(child["p"].pid, command, mem_mb, max_seconds, out, clock(), clock=clock, **(watchdog or {}))
+        lock = slot_path(state_dir, index) if fd is not None else None
+        dog = Watchdog(child["p"].pid, command, mem_mb, max_seconds, out, clock(), clock=clock, **dict({"lock_path": lock}, **(watchdog or {})))
         dog.start()
         try:
             while True:

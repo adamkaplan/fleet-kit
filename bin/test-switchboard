@@ -48480,6 +48480,10 @@ class TestHeavyWatchdog(unittest.TestCase):
         "    for i in range(0,len(x),4096): x[i]=1\n"
         "    time.sleep(60)\n"
         "if os.fork()==0:\n"
+        "    if mode=='early':\n"
+        "        if os.fork()==0:\n"
+        "            note('b'); time.sleep(2.0); grow(); os._exit(0)\n"
+        "        os._exit(0)\n"
         "    if mode=='orphan':\n"
         "        if os.fork()==0:\n"
         "            note('b'); time.sleep(4.0); grow(); os._exit(0)\n"
@@ -48489,7 +48493,7 @@ class TestHeavyWatchdog(unittest.TestCase):
         "    note('b'); time.sleep(0.5); grow(); os._exit(0)\n"
         "time.sleep(60)\n")
 
-    def real_probe(self, mode):
+    def real_probe(self, mode, slot=False):
         """Real small processes: a 120 MB child under a 60 MB ceiling. Returns (status, output, pid of the child); the child is always killed at the end of the test."""
         directory = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, str(directory), True)
@@ -48504,8 +48508,11 @@ class TestHeavyWatchdog(unittest.TestCase):
                     pass
         self.addCleanup(reap)
         out = io.StringIO()
-        status = self.hs.run(["python3", str(probe), mode, str(directory)], None, 3, 1, "who", out=out, watchdog={"every": 0.1, "grace": 1, "sweep_every": 0.2},
-                             environ={"PATH": os.environ["PATH"], "FLEET_HEAVY": "off", "FLEET_HEAVY_MEM_MB": "60", "FLEET_HEAVY_MAX_SECONDS": "40"})
+        environ = {"PATH": os.environ["PATH"], "FLEET_HEAVY_MEM_MB": "60", "FLEET_HEAVY_MAX_SECONDS": "40"}
+        if not slot:
+            environ["FLEET_HEAVY"] = "off"
+        status = self.hs.run(["python3", str(probe), mode, str(directory)], str(directory) if slot else None, 3, 1, "who", out=out, environ=environ,
+                             watchdog={"every": 0.1, "grace": 1, "sweep_every": 0.2})
         try:
             pid = int((directory / "b").read_text())
         except (OSError, ValueError):
@@ -48525,6 +48532,57 @@ class TestHeavyWatchdog(unittest.TestCase):
         status, text, pid = self.real_probe("orphan")
         self.assertEqual(status, 137, text)
         self.assertTrue(self.dead_within(pid), "the orphan %d is still alive: %s" % (pid, text))
+
+    def test_s15_a_double_fork_whose_parent_exits_at_once_is_found_by_the_slot_lock_it_holds(self):
+        if not shutil.which("lsof"):
+            self.skipTest("lsof is not installed here")
+        status, text, pid = self.real_probe("early", slot=True)
+        self.assertEqual(status, 137, text)
+        self.assertTrue(self.dead_within(pid), "the grandchild %d is still alive: %s" % (pid, text))
+
+    def test_s15_a_process_that_only_touched_the_lock_file_once_is_never_stopped_and_a_holder_seen_twice_is(self):
+        sent = BoundedList()
+        record = lambda target, number: sent.append((target, number))
+        rows = [(4242, 1, 4242, 10, "c"), (5000, 1, 5000, 10, "orphan"), (5001, 1, 5001, 10, "prober")]
+        holders = iter([{5000, 5001}, {5000}, {5000}])   # 5001 had the file open at one look only
+        dog = self.hs.Watchdog(4242, ["x"], 16384, 0, self.out, 0.0, read_table=lambda: rows, killpg=record, kill=record, me=(9001, 9002, 9003),
+                               lock_path="/state/heavy-slot-0.lock", lsof=lambda path: next(holders))
+        dog.sample()
+        dog.sample()
+        live = dog.look()
+        dog.signal(signal.SIGKILL, live)
+        self.assertEqual(sorted({target for target, _n in sent}), [4242, 5000], "the orphan that holds the lock goes; the one-look prober does not")
+
+    def test_s15_two_concurrent_runs_never_signal_each_others_lock_holders(self):
+        sent_a, sent_b = BoundedList(), BoundedList()
+        rows = [(4242, 1, 4242, 10, "a"), (4343, 1, 4343, 10, "b"), (5000, 1, 5000, 10, "holds a's lock"), (6000, 1, 6000, 10, "holds b's lock")]
+        who = {"/state/heavy-slot-0.lock": {5000}, "/state/heavy-slot-1.lock": {6000}}
+        make = lambda pid, lock, sent: self.hs.Watchdog(pid, ["x"], 16384, 0, self.out, 0.0, read_table=lambda: rows, me=(9001, 9002, 9003), lock_path=lock,
+                                                        lsof=lambda path: who[path], killpg=lambda t, n: sent.append(t), kill=lambda t, n: sent.append(t))
+        a, b = make(4242, "/state/heavy-slot-0.lock", sent_a), make(4343, "/state/heavy-slot-1.lock", sent_b)
+        for dog in (a, b):
+            dog.sample()
+            dog.signal(signal.SIGKILL, dog.look())
+        self.assertEqual(sorted(set(sent_a)), [4242, 5000])
+        self.assertEqual(sorted(set(sent_b)), [4343, 6000])
+
+    def test_the_lock_holder_list_is_for_the_same_user_only(self):
+        self.assertIn("os.getuid()", inspect.getsource(self.hs.read_lock_holders))
+
+    def test_s15_a_lsof_that_cannot_run_changes_nothing_and_is_said_once(self):
+        def broken(path):
+            raise OSError("lsof missing")
+        dog = self.hs.Watchdog(4242, ["x"], 16384, 0, self.out, 0.0, read_table=lambda: [(4242, 1, 4242, 10, "c")], killpg=lambda *a: None, kill=lambda *a: None,
+                               me=(9001, 9002, 9003), lock_path="/state/x.lock", lsof=broken)
+        for _ in range(3):
+            dog.sample()
+        self.assertEqual(self.out.getvalue().count("cannot list who holds the slot lock"), 1, self.out.getvalue())
+
+    def test_the_documents_do_not_claim_that_every_orphan_is_stopped_and_name_the_hole(self):
+        text = (Path(__file__).resolve().parent.parent / "docs" / "switchboard.md").read_text()
+        self.assertNotIn("an orphan, a child that ignores", text)
+        self.assertIn("closes the slot lock", text)
+        self.assertIn("FLEET_HEAVY=off", text.split("A runaway is stopped (#598)")[1].split("\n\n")[0], "the no-lock case is named")
 
     def test_s12_a_child_that_ignores_the_polite_stop_is_killed_by_the_forced_stop_and_sweep(self):
         status, text, pid = self.real_probe("ignore")
