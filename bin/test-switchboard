@@ -2691,7 +2691,7 @@ class TestDeliver(Base):
         self.assertEqual((admitted["resume"], admitted["delivery"]), (True, "queue"))
         self.assertEqual(admitted["id"], sb.derive_message_id(sid, ["lab.fact:1", "lab.fact:2"]))
         self.assertEqual(admitted["from"], "switchboard")
-        self.assertTrue(admitted["text"].startswith("[switchboard] 2 for platform: First"))
+        self.assertRegex(admitted["text"].splitlines()[0], r"^\[switchboard\] 2 for platform \(sent \d\d:\d\dZ(-\d\d:\d\dZ)?, delivered \d\d:\d\dZ\): First")
         intent, result = [e for e in self.world.audit() if e["event"] == "v2.synthetic"]
         self.assertEqual((intent["phase"], result["phase"], result["ok"]), ("intent", "result", True))
         self.assertEqual(intent["detail"]["message_id"], admitted["id"])
@@ -13175,6 +13175,11 @@ class TestClearNotice(Base):
         self.labels = [self.names["merge-captain"], self.names["hold-impact"]]
         self.parents = {3: 2, 2: 1, 1: None}
         self.order = []
+        self.plan_result = "pass"
+        real_checked = sb.checked_plan
+        sb.checked_plan = lambda *a, **k: {"result": self.plan_result, "defects": [], "scenarios_parsed": []}   # the plan check at this moment (the gates' own function is patched: no GitHub here)
+        self.addCleanup(setattr, sb, "checked_plan", real_checked)
+        self.record_plan("%s#3" % self.REPO)   # the plan the LEDGER records for this pull request (written by `prove`, not by the PR body)
         self.engine.intents = types.SimpleNamespace(parent=lambda number, repo=None: self.parents.get(number), repo=self.REPO, header=lambda *a, **k: None, ask_of=lambda number, repo=None: (number, None))
 
     def route(self, argv, **kwargs):
@@ -13210,15 +13215,115 @@ class TestClearNotice(Base):
         self.assertEqual((self.told("cos"), self.told("orch-a")), ([line], [line]))
         self.assertEqual(self.told("orch-b"), [])
         (event,) = self.events("gate.clear_notified")
-        self.assertEqual((event["detail"]["lane"], event["detail"]["lane_from"], sorted(event["detail"]["sent"])), ("orch-a", "the notice", ["chief-of-staff", "orch-a"]))
+        self.assertEqual((event["detail"]["lane"], event["detail"]["lane_from"], sorted(event["detail"]["sent"])), ("orch-a", "the pull request's plan and the notice", ["chief-of-staff", "orch-a"]))
+
+    def no_ledger_plan(self):
+        for name in ("plan-ledger.jsonl", "plan-ledger.head"):
+            (Path(self.world.state) / name).unlink()
+
+    def record_plan(self, ref):
+        sb.plan_ledger.append_entry(self.world.state, {"kind": "proof", "pr": self.PR, "scenario": "S1", "plan_ref": ref, "result": "pass", "by": "coder", "head": self.HEAD}, self.world.clock.now())
+
+    def lane_event(self):
+        (event,) = self.events("gate.clear_notified")
+        return event["detail"]["lane"], event["detail"]["lane_from"], sorted(event["detail"]["sent"])
+
+    def test_s1_a_plan_lane_and_a_notice_lane_that_agree_tell_that_lane(self):
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now())   # the worker's boss is orch-a, the plan sits under charter 1 (orch-a)
+        self.clear()
+        self.assertEqual(self.lane_event(), ("orch-a", "the pull request's plan and the notice", ["chief-of-staff", "orch-a"]))
+
+    def test_a_plan_lane_and_a_notice_lane_that_disagree_are_unclear_and_only_the_chief_of_staff_is_told(self):
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "orch-b", "ready", self.world.clock.now())   # orchestrator B recorded the notice; the plan sits under A's charter
+        self.clear()
+        (line,) = self.told("cos")
+        self.assertIn("lane unclear: plan lane orch-a, notice by orch-b", line)
+        self.assertNotIn("merges it", line)
+        self.assertEqual((self.told("orch-a"), self.told("orch-b")), ([], []), "neither lane is told to merge")
+        (event,) = self.events("gate.clear_notified")
+        self.assertEqual((event["detail"]["lane"], event["detail"]["lane_unclear"], event["detail"]["sent"]), (None, ["orch-a", "orch-b"], ["chief-of-staff"]))
+        self.clear()
+        self.assertEqual(len(self.events("gate.clear_notified")), 1, "audited once")
+
+    def test_s2_a_moved_ask_counts_under_the_charter_it_has_now(self):
+        cache, live = {2: 1}, {3: 2, 2: 50, 1: None, 50: None}   # the cache still says charter 1 for ask 2; today it is charter 50
+        self.engine.intents = types.SimpleNamespace(parent=lambda number, repo=None: cache[number] if number in cache else live.get(number), invalidate=lambda number, repo=None: cache.pop(number, None),
+                                                    repo=self.REPO, header=lambda *a, **k: None, ask_of=lambda number, repo=None: (number, None))
+        self.clear()
+        self.assertEqual(self.lane_event()[:2], ("orch-b", "the pull request's plan"))
+        self.assertEqual(self.told("orch-a"), [])
+
+    def test_s3_a_plan_in_another_repository_is_not_used_and_the_notice_sender_decides(self):
+        self.body = "no plan line here\n"
+        self.no_ledger_plan()
+        self.record_plan("other-org/widget-web#3")
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now(), boss="orch-a")
+        self.clear()
+        self.assertEqual(self.lane_event()[:2], ("orch-a", "the notice"))
+
+    def test_s4_a_charter_nobody_runs_falls_to_the_notice_sender_and_no_orchestrator_is_guessed(self):
+        self.parents = {3: 2, 2: 99, 99: None}   # charter 99 has no running orchestrator
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "orch-b", "ready", self.world.clock.now())
+        self.clear()
+        self.assertEqual(self.lane_event(), ("orch-b", "the notice", ["chief-of-staff", "orch-b"]))
+        self.assertEqual(self.told("orch-a"), [], "not the repository's other orchestrator")
+
+    def test_s5_with_no_plan_the_notice_senders_boss_is_the_lane_as_before(self):
+        self.body = "no plan link here\n"
+        self.no_ledger_plan()
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now())
+        self.clear()
+        self.assertEqual(self.lane_event()[:2], ("orch-a", "the notice"))
+
+    def test_s6_with_no_plan_and_no_notice_the_line_says_lane_unknown_and_only_the_chief_of_staff_is_told(self):
+        self.body = "no plan link here\n"
+        self.no_ledger_plan()
+        self.clear()
+        (line,) = self.told("cos")
+        self.assertIn("lane unknown", line)
+        self.assertEqual((self.told("orch-a"), self.told("orch-b")), ([], []))
+        self.assertEqual(self.lane_event(), (None, None, ["chief-of-staff"]))
+
+    def test_with_only_a_ledger_plan_and_no_body_link_the_ledgers_first_plan_decides(self):
+        self.body = "no plan line in the body\n"
+        self.clear()
+        self.assertEqual(self.lane_event()[:2], ("orch-a", "the pull request's plan"))
+
+    def test_a_plan_that_does_not_pass_the_plan_check_is_ignored_and_the_notice_decides(self):
+        self.plan_result = "fail"
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "orch-b", "ready", self.world.clock.now())
+        self.clear()
+        self.assertEqual(self.lane_event()[:2], ("orch-b", "the notice"), "an invalid plan names no lane: no disagreement either")
+        self.head = "c" * 40
+        self.no_ledger_plan()
+        self.body = "no plan line\n"
+        self.plan_result = "fail"
+        self.clear()
+        self.assertEqual([e["detail"]["lane"] for e in self.events("gate.clear_notified")][-1], "orch-b")
+
+    def test_two_orchestrators_on_one_charter_are_never_picked_between_and_the_line_names_them(self):
+        self.world.add_agent("orch-a2", fleet={"role": "orchestrator", "charter": 1, "repo": self.REPO})
+        self.clear()
+        (line,) = self.told("cos")
+        self.assertIn("lane unknown: charter #1 has 2 orchestrators: orch-a, orch-a2", line)
+        self.assertEqual((self.told("orch-a"), self.told("orch-a2"), self.told("orch-b")), ([], [], []))
+        (event,) = self.events("gate.clear_notified")
+        self.assertEqual((event["detail"]["lane"], event["detail"]["candidates"], event["detail"]["sent"]), (None, ["orch-a", "orch-a2"], ["chief-of-staff"]))
+
+    def test_a_worker_that_owns_the_work_item_is_never_taken_for_the_lane(self):
+        self.parents = {3: 2, 2: 99, 99: None}   # the plan's own chain reaches a worker's issue (3) but no running orchestrator
+        self.clear()
+        self.assertEqual(self.lane_event(), (None, None, ["chief-of-staff"]))
+        self.assertEqual(self.told("worker"), [])
 
     def test_the_lane_follows_the_plan_link_up_to_the_charter_when_there_is_no_notice(self):
         self.clear()
         self.assertEqual(len(self.told("orch-a")), 1, "ask 2 sits under charter 1")
         self.assertEqual(self.told("orch-b"), [])
-        self.assertEqual(self.events("gate.clear_notified")[0]["detail"]["lane_from"], "the PLAN link")
+        self.assertEqual(self.events("gate.clear_notified")[0]["detail"]["lane_from"], "the pull request's plan")
 
     def test_s8_a_lane_that_cannot_be_found_says_lane_unknown_to_the_chief_of_staff_only_and_nobody_is_guessed(self):
+        self.no_ledger_plan()
         self.body = "no plan here\n"
         self.clear()
         (line,) = self.told("cos")
@@ -26721,6 +26826,180 @@ def top_tier_migrations(test):
     test.addCleanup(test.top_tier_patcher.stop)
 
 
+class TestImpactFloorOwnerDecision(LedgerBase):
+    """#553: `impact floor` says what the daemon decides under the owner-hold rule (read from the same report), so a pull request the daemon holds never reads NONE. The REAL matrix file."""
+
+    def setUp(self):
+        super().setUp()
+        self.extra_config = dict(FLOOR_CONFIG, plan_gates={"repos": {"acme/app": {"mode": "shadow"}}})
+        self.configure()
+
+    def files(self, *paths):
+        self.pr.update({"changedFiles": len(paths), "files": [{"path": p, "additions": 1, "deletions": 0} for p in paths]})
+
+    def floor(self, *extra):
+        code, out, err = self.run_as("coder", "impact", "floor", self.PR, *extra)
+        self.assertEqual(code, 0, err)
+        return out
+
+    def test_s1_a_credential_module_outside_the_old_globs_reads_hold_and_names_the_path_and_its_class(self):
+        self.files("shims/gh")
+        out = self.floor()
+        self.assertEqual(out.count("HOLD for the owner"), 1, out)
+        self.assertIn("top tier path (credentials): shims/gh", out)
+        self.assertIn("path floor (older advisory, not the owner's rule): NONE", out, "the old decision is still shown, labelled")
+
+    def test_s2_an_agent_definition_prose_edit_says_not_held_and_gives_the_reason(self):
+        self.files("agents/opencode/coder.md")
+        with mock.patch.object(sb, "agent_block_states", return_value={"agents/opencode/coder.md": "unchanged"}):
+            out = self.floor()
+        self.assertEqual(out.count("not held for the owner"), 1, out)
+        self.assertIn("because: definition change without a permission block change", out)
+        self.assertNotIn("HOLD for the owner", out)
+        self.files("docs/switchboard.md")
+        out = self.floor()
+        self.assertIn("not held", out)
+        self.assertIn("because: no changed path is a top tier path", out)
+
+    def test_s3_the_json_equals_what_the_daemon_decides_for_five_fixtures(self):
+        fixtures = (["shims/gh"], [".github/workflows/ci.yml"], ["api/routes/users.py"], ["agents/opencode/coder.md"], ["docs/switchboard.md"])
+        for paths in fixtures:
+            self.files(*paths)
+            with mock.patch.object(sb, "agent_block_states", return_value={p: "unchanged" for p in paths}):
+                shown = json.loads(self.floor("--json"))
+                engine = self.world.new_engine("daemon")
+                engine.gh_runner = self.route
+                engine.config, engine.state_dir = sb.load_config(), self.world.state
+                report = sb.pr_floor_report(engine, "acme/app", 9)
+                what, _ = sb.impact_plan(engine, report, [], sb.read_impact_state(self.world.state)[0], {}, None)
+            self.assertEqual((shown["owner_decision"], shown["owner_reasons"]), (report["owner_decision"], report["owner_reasons"]), paths)
+            self.assertEqual(what in ("add", "held", "cleared"), shown["owner_decision"] == "hold", "the daemon's plan %s agrees with the command's %s for %s" % (what, shown["owner_decision"], paths))
+            self.assertEqual(shown["owner_decision"], {"shims/gh": "hold", ".github/workflows/ci.yml": "hold", "api/routes/users.py": "second-review", "agents/opencode/coder.md": "second-review"}.get(paths[0], "none"), paths)
+
+    def cut(self, *paths, total=3000):
+        self.pr.update({"changedFiles": total, "files": [{"path": p, "additions": 1, "deletions": 0} for p in paths]})
+
+    def test_a_complete_list_says_how_many_files_were_read_in_the_headline(self):
+        self.files("docs/switchboard.md", "docs/plan-template.md")
+        out = self.floor()
+        self.assertIn("not held, 2 files read (advisory: nothing is written)", out)
+        self.assertNotIn("CANNOT TELL", out)
+
+    def test_a_cut_list_in_a_repo_with_no_floor_globs_never_reads_as_not_held(self):
+        self.extra_config = {"plan_gates": {"repos": {"acme/app": {"mode": "shadow"}}}}   # no impact_floor globs for the repo
+        self.configure()
+        self.cut(*["docs/f%d.md" % n for n in range(100)])
+        out = self.floor()
+        self.assertIn("CANNOT TELL: only 100 of 3000 files were read", out)
+        self.assertIn("(the daemon's decision for the files it read: not held)", out, "the daemon's own answer, printed as it is")
+        self.assertIn("this is not a verdict of \"not held\"", out)
+        self.assertNotIn("not held, ", out.split("\n")[0])
+        shown = json.loads(self.floor("--json"))
+        self.assertEqual((shown["owner_decision"], shown["complete"], shown["files_read"], shown["files_total"]), ("none", False, 100, 3000))
+
+    def test_a_cut_list_with_a_top_tier_path_among_the_files_read_is_a_hold(self):
+        self.cut("shims/gh", *["docs/f%d.md" % n for n in range(99)])
+        out = self.floor()
+        self.assertIn("HOLD for the owner, 100 files read", out.split("\n")[0])
+        self.assertNotIn("CANNOT TELL", out)
+
+    def test_a_cut_list_in_a_repo_with_floor_globs_is_held_on_purpose_as_the_daemon_holds_it(self):
+        self.cut(*["docs/f%d.md" % n for n in range(100)])   # the repo of this class has floor globs
+        out = self.floor()
+        self.assertIn("HOLD for the owner, 100 files read", out.split("\n")[0])
+        self.assertIn("floor unknown: GitHub listed 100 of 3000", out)
+
+    def test_the_cut_list_fixtures_equal_what_the_daemon_decides_too(self):
+        for globs in (True, False):
+            self.extra_config = dict(FLOOR_CONFIG, plan_gates={"repos": {"acme/app": {"mode": "shadow"}}}) if globs else {"plan_gates": {"repos": {"acme/app": {"mode": "shadow"}}}}
+            self.configure()
+            self.cut("docs/a.md", *["docs/f%d.md" % n for n in range(99)])
+            shown = json.loads(self.floor("--json"))
+            engine = self.world.new_engine("daemon")
+            engine.gh_runner = self.route
+            engine.config, engine.state_dir = sb.load_config(), self.world.state
+            report = sb.pr_floor_report(engine, "acme/app", 9)
+            what, _ = sb.impact_plan(engine, report, [], sb.read_impact_state(self.world.state)[0], {}, None)
+            self.assertEqual((shown["owner_decision"], shown["owner_reasons"]), (report["owner_decision"], report["owner_reasons"]), globs)
+            self.assertEqual(what in ("add", "held", "cleared"), shown["owner_decision"] == "hold", (globs, what))
+
+    def renamed(self, source=None):
+        item = {"path": "docs/neutral.md", "additions": 0, "deletions": 0, "changeType": "RENAMED"}
+        if source:
+            item["previous_filename"] = source
+        self.pr.update({"changedFiles": 1, "files": [item]})
+
+    def daemon_agrees(self, shown):
+        engine = self.world.new_engine("daemon")
+        engine.gh_runner = self.route
+        engine.config, engine.state_dir = sb.load_config(), self.world.state
+        report = sb.pr_floor_report(engine, "acme/app", 9)
+        what, _ = sb.impact_plan(engine, report, [], sb.read_impact_state(self.world.state)[0], {}, None)
+        self.assertEqual((shown["owner_decision"], shown["owner_reasons"]), (report["owner_decision"], report["owner_reasons"]))
+        self.assertEqual(what in ("add", "held", "cleared"), shown["owner_decision"] == "hold")
+
+    def test_a_rename_out_of_a_top_tier_path_with_its_source_known_is_a_hold_naming_the_source_and_its_class(self):
+        for globs in (True, False):
+            self.extra_config = dict(FLOOR_CONFIG, plan_gates={"repos": {"acme/app": {"mode": "shadow"}}}) if globs else {"plan_gates": {"repos": {"acme/app": {"mode": "shadow"}}}}
+            self.configure()
+            self.renamed(source="shims/gh")
+            out = self.floor()
+            self.assertIn("HOLD for the owner, 1 file read", out.split("\n")[0], globs)
+            self.assertIn("top tier path (credentials): shims/gh", out)
+            self.daemon_agrees(json.loads(self.floor("--json")))
+
+    def test_a_rename_whose_source_path_is_not_listed_never_reads_as_not_held_in_a_repo_with_no_floor_globs(self):
+        self.extra_config = {"plan_gates": {"repos": {"acme/app": {"mode": "shadow"}}}}
+        self.configure()
+        self.renamed()
+        out = self.floor()
+        self.assertIn("CANNOT TELL: 1 renamed or copied file(s) with no source path (the daemon's decision for the paths it saw: not held)", out)
+        self.assertIn("this is not a verdict of \"not held\"", out)
+        self.assertNotIn("not held, ", out.split("\n")[0])
+        shown = json.loads(self.floor("--json"))
+        self.assertEqual((shown["owner_decision"], shown["renamed_no_source"]), ("none", ["docs/neutral.md"]), "the daemon reads it as none: said, not changed here")
+        self.daemon_agrees(shown)
+
+    def test_a_rename_whose_source_path_is_not_listed_is_held_in_a_repo_with_floor_globs_as_the_daemon_holds_it(self):
+        self.renamed()   # the repo of this class has floor globs
+        out = self.floor()
+        self.assertIn("HOLD for the owner, 1 file read", out.split("\n")[0])
+        self.assertIn("renamed or copied file(s) with no known source path", out)
+        self.daemon_agrees(json.loads(self.floor("--json")))
+
+    def test_s4_a_rule_file_that_cannot_be_read_is_held_on_purpose_with_the_reason_and_nothing_is_written(self):
+        self.files("docs/switchboard.md")
+
+        def broken(path=None):
+            raise sb.impact_floor.MatrixError("the matrix file is not valid JSON")
+        with mock.patch.object(sb.impact_floor, "load_matrix", broken):
+            out = self.floor()
+            shown = json.loads(self.floor("--json"))
+        self.assertEqual(out.count("held on purpose"), 1, out)
+        self.assertIn("not valid JSON", out)
+        self.assertEqual((shown["owner_decision"], shown["decision"]), ("hold", "hold"))
+        self.assertIn("held on purpose", shown["owner_reasons"][0])
+        self.assertEqual(self.ledger(), [])
+        self.assertEqual([e for e in self.world.audit() if e["event"].startswith(("gate.", "plan.", "impact."))], [])
+
+    def test_s5_the_old_json_fields_are_still_there_next_to_the_owner_decision(self):
+        self.files("shims/gh")
+        shown = json.loads(self.floor("--json"))
+        for field in ("decision", "reasons", "floor_paths", "globs"):
+            self.assertIn(field, shown)
+        for field in ("owner_decision", "owner_reasons"):
+            self.assertIn(field, shown)
+
+    def test_s6_the_command_reads_the_reports_owner_decision_and_holds_no_path_or_class_of_the_rule(self):
+        import inspect
+        source = inspect.getsource(sb.cmd_impact_floor)
+        block = sb.impact_floor.load_matrix()["owner_hold"]
+        literals = list(block["top_tier_classes"]) + [g for globs in block["top_tier_paths"].values() for g in globs]
+        self.assertEqual([x for x in literals if '"%s"' % x in source or "'%s'" % x in source], [], "a path or class of the rule is written in the command")
+        self.assertIn('report.get("owner_decision")', source)
+        self.assertNotIn("owner_decide(", source, "no second copy of the rule")
+
+
 class TestImpactFloorCommandAndPass(LedgerBase):
     """`impact floor <pr>` and the daemon's advisory `gate.would_hold`: both read, neither writes a label, comment or ledger entry."""
 
@@ -26740,7 +27019,7 @@ class TestImpactFloorCommandAndPass(LedgerBase):
         self.assertEqual(self.ledger(), [])
         self.assertEqual([e for e in self.world.audit() if e["event"].startswith(("gate.", "plan."))], [])
         code, out, err = self.run_as("coder", "impact", "floor", self.PR)
-        self.assertIn("HOLD (advisory: nothing is written)", out)
+        self.assertIn("HOLD for the owner, 2 files read (advisory: nothing is written)", out)   # #553: the headline is the owner decision and the files read (was "HOLD (advisory...")
 
     def test_a_huge_change_outside_the_floor_does_not_hold_and_a_rating_can_add_one(self):
         self.pr.update({"changedFiles": 1, "files": [{"path": "src/app.py", "additions": 100000, "deletions": 100000}]})
@@ -57311,6 +57590,16 @@ class TestAgentCredentialsDoc(unittest.TestCase):
             self.assertIn(name, self.sections)
             self.assertRegex(self.sections[name], r"(?m)^\d+\. ", name)
 
+    def test_scope_and_cloud_rule_stated_once_each(self):
+        rule = "Cloud workers serve the organisation's repositories only; no fleet-kit task, test or demo runs in a cloud worker."
+        self.assertEqual(self.text.count(rule), 1)
+        with open(str(REPO / "cloud" / "README.md"), encoding="utf-8") as handle:
+            self.assertEqual(handle.read().count(rule), 1)
+        self.assertIn("Recommended option: Option C", self.text)
+        self.assertIn("No second App and no machine user is created for them", self.text)
+        for opt in ("Option A", "Option B"):
+            self.assertRegex(self.text, r"(?m)^### %s:.*\(rejected\)" % opt)
+
     def test_agents_create_no_credential(self):
         low = self.text.lower()
         self.assertIn("agents run none of them", low)
@@ -57327,6 +57616,228 @@ class TestAgentCredentialsDoc(unittest.TestCase):
         self.assertEqual(len(samples), len(CRED_TOKEN_PATTERNS))
         for pattern, sample in zip(CRED_TOKEN_PATTERNS, samples):
             self.assertIsNotNone(re.search(pattern, sample), pattern)
+
+
+# ======================================================================
+# #583: a message says when it was sent and delivered; a newer send replaces older waiting ones (marked, kept); the pane warning is
+# only for a real mismatch; a launch goes to the caller's own workspace.
+# ======================================================================
+def _clock_at(hour, minute, second=0):
+    return calendar.timegm((2027, 1, 15, hour, minute, second))
+
+
+class TestMessageTimes(unittest.TestCase):
+    def sends(self, *rows):
+        return [fact("k%d" % n, created, kind="send", sender=sender, issue=issue, repo=repo, summary="text %d" % n)
+                for n, (created, sender, issue, repo) in enumerate(rows)]
+
+    def test_s1_the_header_says_when_it_was_sent_and_when_it_is_delivered(self):
+        text, _ = sb.compose("platform", [fact("a", _clock_at(14, 2, 10), summary="First")], delivered=_clock_at(14, 5, 30))
+        self.assertIn("sent 14:02Z, delivered 14:05Z", text.splitlines()[0])
+
+    def test_a_batch_header_gives_the_range_and_no_delivery_time_means_none_in_the_header(self):
+        text, _ = sb.compose("platform", [fact("a", _clock_at(14, 0)), fact("b", _clock_at(14, 4))], delivered=_clock_at(14, 5))
+        self.assertIn("sent 14:00Z-14:04Z, delivered 14:05Z", text.splitlines()[0])
+        plain, _ = sb.compose("platform", [fact("a", _clock_at(14, 0))])
+        self.assertEqual(plain.splitlines()[0], "[switchboard] 1 for platform: s a")
+
+    def test_s2_a_newer_send_from_the_same_sender_about_the_same_issue_marks_the_older_one_and_keeps_both(self):
+        facts = self.sends((_clock_at(14, 0), "coder", 7, "acme/api"), (_clock_at(14, 4), "coder", 7, "acme/api"))
+        text, carried = sb.compose("platform", facts, delivered=_clock_at(14, 5))
+        lines = [l for l in text.splitlines() if l.startswith("- send from")]
+        self.assertEqual(len(lines), 2)
+        self.assertIn("superseded", lines[0])
+        self.assertIn("text 0", lines[0])
+        self.assertNotIn("superseded", lines[1])
+        self.assertIn("text 1", lines[1])
+        self.assertEqual([f.key for f in carried], ["k0", "k1"], "both keys are carried, so both are acknowledged")
+
+    def test_s3_another_sender_or_another_issue_or_repo_is_never_superseded(self):
+        for rows in (((_clock_at(14, 0), "coder", 7, "acme/api"), (_clock_at(14, 4), "other", 7, "acme/api")),
+                     ((_clock_at(14, 0), "coder", 7, "acme/api"), (_clock_at(14, 4), "coder", 8, "acme/api")),
+                     ((_clock_at(14, 0), "coder", 7, "acme/api"), (_clock_at(14, 4), "coder", 7, "acme/web")),
+                     ((_clock_at(14, 0), "coder", None, None), (_clock_at(14, 4), "coder", None, None))):
+            with self.subTest(rows=rows):
+                text, carried = sb.compose("platform", self.sends(*rows), delivered=_clock_at(14, 5))
+                self.assertEqual(text.count("superseded"), 0)
+                self.assertEqual(len(carried), 2)
+
+    def test_s5_only_the_pending_facts_are_looked_at_so_a_delivered_message_is_never_marked(self):
+        text, carried = sb.compose("platform", self.sends((_clock_at(14, 4), "coder", 7, "acme/api")), delivered=_clock_at(14, 5))   # the older one was delivered: not pending
+        self.assertEqual((text.count("- send from"), text.count("superseded")), (1, 0))
+
+    def test_no_message_is_lost_n_in_is_n_out_with_every_text_and_key_visible(self):   # the no-loss property of the marker
+        rows = [(_clock_at(14, n), sender, issue, repo) for n, (sender, issue, repo) in enumerate(
+            [("coder", 7, "acme/api"), ("coder", 7, "acme/api"), ("other", 7, "acme/api"), ("coder", 8, "acme/api"), ("coder", 7, "acme/api"),
+             ("other", 7, "acme/api"), ("coder", None, None), ("coder", 7, "acme/web")])]
+        facts = self.sends(*rows)
+        text, carried = sb.compose("platform", facts, delivered=_clock_at(14, 30))
+        self.assertEqual([f.key for f in carried], [f.key for f in facts])
+        self.assertEqual(text.count("- send from"), len(facts))
+        for number in range(len(facts)):
+            self.assertIn("text %d" % number, text)
+        self.assertEqual(text.count("superseded"), 3, "k0 and k1 (by k4) and k2 (by k5) only")
+
+    def test_three_sends_mark_the_two_older_ones_only(self):
+        text, _ = sb.compose("platform", self.sends((_clock_at(14, 0), "coder", 7, "acme/api"), (_clock_at(14, 2), "coder", 7, "acme/api"),
+                                                    (_clock_at(14, 4), "coder", 7, "acme/api")), delivered=_clock_at(14, 5))
+        self.assertEqual([("superseded" in l) for l in text.splitlines() if l.startswith("- send from")], [True, True, False])
+
+
+class TestMessageTimesDelivery(Base):
+    """The REAL send path: a recipient that has not yet taken an earlier message from the same sender on the same issue."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("platform", "coder", "other"), config={"v2_cache_seconds": 0})
+        self.world.you("platform")   # a person is typing: the sends are notes, which wait in the inbox until taken
+
+    def send(self, text, issue=7, sender="coder", repo=None):
+        return self.world.engine.send(sender, "platform", text, issue, repo)
+
+    def waiting(self):
+        return [m["text"] for m in self.world.admissions("platform")]
+
+    def test_s4_the_newer_send_says_it_supersedes_the_waiting_one_and_both_are_delivered(self):
+        self.assertTrue(self.send("first text")["sent"])
+        self.world.tick(70)
+        self.assertTrue(self.send("second text")["sent"])
+        first, second = self.waiting()
+        self.assertNotIn("supersedes", first.splitlines()[0])
+        head = second.splitlines()[0]
+        self.assertIn("supersedes 1 earlier message from coder on this issue, still waiting: sent", head)
+        self.assertIn("second text", second)
+        self.assertIn("first text", first, "the older message was delivered as it was and stays")
+        self.assertEqual(len(self.world.admissions("platform")), 2, "N in, N out: nothing cancelled or removed")
+
+    def test_s3_another_sender_or_issue_is_never_marked(self):
+        self.send("one")
+        self.world.tick(5)
+        self.send("two", issue=8)                      # another issue
+        self.send("three", issue=7, sender="other")    # another sender
+        self.world.tick(5)
+        self.assertEqual(sum("supersedes" in text.splitlines()[0] for text in self.waiting()), 0)
+
+    def test_s5_an_older_message_the_recipient_already_took_is_not_waiting_so_nothing_is_marked(self):
+        self.send("first")
+        self.world.v2.sessions[self.world.sessions["platform"]]["inbox"].clear()   # the recipient took it
+        self.world.tick(70)
+        self.send("second")
+        self.assertNotIn("supersedes", self.waiting()[-1].splitlines()[0])
+
+    def test_an_unreadable_inbox_sends_as_before_with_no_marking(self):
+        self.send("first")
+        self.world.engine.reads.inbox = lambda *a, **k: (_ for _ in ()).throw(sb.V2Error("unavailable", "down"))
+        self.send("second")
+        self.assertEqual(len(self.world.admissions("platform")), 2)
+        self.assertNotIn("supersedes", self.waiting()[-1].splitlines()[0])
+
+    def test_under_v2_light_nothing_is_read_and_nothing_is_marked(self):
+        world = World(self, agents=("platform", "coder"), config={"v2_light": True, "v2_cache_seconds": 900})
+        world.you("platform")
+        world.engine.send("coder", "platform", "first", 7)
+        world.engine.send("coder", "platform", "second", 7)
+        self.assertEqual([("supersedes" in m["text"].splitlines()[0]) for m in world.admissions("platform")], [False, False])
+
+    def test_the_metadata_of_a_send_names_its_issue_sender_and_repo(self):
+        self.send("first", repo="acme/api")
+        (record,) = self.world.v2.sessions[self.world.sessions["platform"]]["inbox"]
+        fleet = record["metadata"]["fleet"]
+        self.assertEqual((fleet["sender"], fleet["issue"], fleet["repo"]), ("coder", 7, "acme/api"))
+
+    def test_a_waiting_message_carrying_sends_for_two_issues_is_never_named_by_a_later_send_about_one_of_them(self):
+        engine = self.world.engine
+        discovery = engine.discover(engine.now())
+        first = sb.Fact("send:coder:a1", "platform", "send", "text for A", engine.now(), issue=7, batch=False, sender="coder", repo=None)
+        second = sb.Fact("send:coder:b1", "platform", "send", "text for B", engine.now(), issue=8, batch=False, sender="coder", repo=None)
+        self.assertTrue(engine.send_fact(first, discovery, engine.now(), carried=[second])["sent"])   # ONE waiting message, two issues
+        self.world.tick(70)
+        self.assertTrue(self.send("newer text for A", issue=7)["sent"])
+        mixed, newer = self.waiting()
+        self.assertIn("text for A", mixed)
+        self.assertIn("text for B", mixed, "the other issue's send is fully shown and untouched")
+        self.assertNotIn("superseded", mixed)
+        self.assertNotIn("supersedes", newer.splitlines()[0], "the waiting message is not only about issue 7, so it is not named")
+        self.assertEqual(sb.Switchboard._send_meta([first, second]), {})
+        self.assertEqual(sb.Switchboard._send_meta([first]), {"sender": "coder", "issue": 7})
+
+    def test_s4_a_forged_or_absurd_time_in_the_inbox_never_stops_or_lies_in_a_send(self):   # security finding: gmtime(1e30) raised inside compose
+        self.send("first")
+        item = self.world.v2.sessions[self.world.sessions["platform"]]["inbox"][0]
+        item["time"] = {"created": 1e33}
+        self.world.tick(5)
+        self.assertTrue(self.send("second")["sent"])
+        self.assertNotIn("supersedes", self.waiting()[-1].splitlines()[0], "an implausible time is not shown")
+        self.assertEqual(sb.clock_utc(1e30), "??:??Z")
+
+
+class TestPaneWarningRule(unittest.TestCase):
+    class Herdr:
+        def __init__(self, pane_session):
+            self.pane_session = pane_session
+
+        def agent_get(self, pane):
+            return {"agent_session": self.pane_session}
+
+        def agent_list(self):
+            return []
+
+    class V2:
+        def __init__(self, names):
+            self.names = names
+
+        def session_get(self, session):
+            return {"metadata": {"fleet": {"name": self.names[session]}}} if self.names.get(session) else {"metadata": {}}
+
+    def warn(self, pane_session, names):
+        sb._WARNED_PANES.clear()
+        with captured() as (_, err):
+            sb.warn_pane_disagrees(self.Herdr(pane_session), self.V2(names), {"HERDR_PANE_ID": "w1:p1"}, "ses_own", "coder")
+        return err.getvalue()
+
+    def test_s6_the_same_fleet_agent_under_another_session_is_silent(self):
+        self.assertEqual(self.warn("ses_old", {"ses_old": "coder", "ses_own": "coder"}), "")
+
+    def test_s6_a_different_fleet_agent_or_no_fleet_agent_still_warns_once(self):
+        self.assertIn("belongs to session ses_old (other)", self.warn("ses_old", {"ses_old": "other", "ses_own": "coder"}))
+        self.assertIn("belongs to session ses_old (not a fleet agent)", self.warn("ses_old", {"ses_own": "coder"}))
+
+
+class TestCallerWorkspace(unittest.TestCase):
+    class Herdr:
+        def __init__(self, agents):
+            self.agents = agents
+
+        def agent_list(self):
+            if self.agents is None:
+                raise sb.HerdrError("unavailable", "down")
+            return self.agents
+
+    def engine(self, agents):
+        return types.SimpleNamespace(herdr=self.Herdr(agents))
+
+    own = [{"agent_session": "ses_own", "pane_id": "wW:p1", "workspace_id": "wW"}]
+
+    def go(self, agents, explicit, **environ):
+        with captured() as (_, err):
+            return sb.caller_workspace(self.engine(agents), explicit, environ), err.getvalue()
+
+    def test_s7_a_disagreeing_inherited_workspace_is_not_used_and_both_are_named(self):
+        got, err = self.go(self.own, None, OPENCODE_SESSION_ID="ses_own", HERDR_WORKSPACE_ID="wD")
+        self.assertEqual(got, "wW")
+        self.assertIn("wW", err)
+        self.assertIn("wD", err)
+
+    def test_s8_an_explicit_workspace_wins_and_an_unresolvable_caller_keeps_the_variable(self):
+        self.assertEqual(self.go(self.own, "wX", OPENCODE_SESSION_ID="ses_own", HERDR_WORKSPACE_ID="wD"), ("wX", ""))
+        self.assertEqual(self.go(self.own, None, HERDR_WORKSPACE_ID="wD"), ("wD", ""))                            # a plain shell
+        self.assertEqual(self.go([], None, OPENCODE_SESSION_ID="ses_own", HERDR_WORKSPACE_ID="wD"), ("wD", ""))   # herdr does not show the session
+        self.assertEqual(self.go(None, None, OPENCODE_SESSION_ID="ses_own", HERDR_WORKSPACE_ID="wD"), ("wD", ""))  # herdr unreadable
+
+    def test_u3_when_they_agree_nothing_is_said(self):
+        self.assertEqual(self.go(self.own, None, OPENCODE_SESSION_ID="ses_own", HERDR_WORKSPACE_ID="wW"), ("wW", ""))
+        self.assertEqual(self.go(self.own, None, OPENCODE_SESSION_ID="ses_own"), ("wW", ""))
+
 
 
 class FakeQueueGh:
@@ -57361,6 +57872,8 @@ class FakeQueueGh:
             self.calls.append("graphql %s#%d" % (repo, pr))
             if self.graphql_fault == "exit":
                 return done("", 1, "gh: HTTP 502")
+            if self.graphql_fault == "weird":
+                return done('{"data": {"repository": {"pullRequest": {"state": "WEIRD", "mergeQueueEntry": null}}}}')
             if self.graphql_fault == "malformed":
                 return done('{"data": {"repository": null}}')
             state, queued = self.pulls[(repo, pr)]
@@ -57459,11 +57972,11 @@ class TestQueueEjections(Base):
 
     def test_a_pull_request_read_that_fails_wakes_nobody_is_said_once_and_is_retried_after_the_back_off(self):
         self.add(9, 27, names=["x"])
-        for fault in ("exit", "malformed"):
+        for fault in ("exit", "malformed", "weird"):
             self.gh.graphql_fault = fault
             self.go()
             self.go()
-            self.assertEqual((self.sent, self.gh.count(self.REPO, "graphql")), ([], 1 if fault == "exit" else 2), fault)
+            self.assertEqual((self.sent, self.gh.count(self.REPO, "graphql")), ([], {"exit": 1, "malformed": 2, "weird": 3}[fault]), fault)
             self.world.tick(self.module.RETRY_SECONDS + 1)
         self.assertEqual(len([e for e in self.world.audit() if e["event"] == "queue_ejection.read_failed"]), 1, "said once")
         self.gh.graphql_fault = None
@@ -57620,6 +58133,7 @@ class TestQueueEjections(Base):
         spent = self.go(calls=6)
         self.assertLessEqual(spent, 6)
         self.assertLessEqual(len(self.gh.calls), 6)
+        self.assertGreaterEqual(len(self.sent), 1, "a pass that reads nothing would pass the bound")
 
     def test_s9_the_workflow_and_artifact_names_come_from_the_configuration_and_default_to_ci_and_failing_tests(self):
         self.add(1201, 301, name="build", names=["t"])
