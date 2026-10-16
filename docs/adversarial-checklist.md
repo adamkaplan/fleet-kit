@@ -1,6 +1,6 @@
 # Adversarial checklist
 
-This is the checklist for work that handles credentials, permissions or a privileged script. The coder designs against it and answers each item in one line in the pull request body. The strict reviewer walks every item over the whole diff, in one message, so the failure paths are found together and not one review round at a time.
+This is the checklist for work that handles credentials, permissions or a privileged script. The coder designs against it and answers each item in one line in the pull request body. The strict reviewer (the independent reviewer of the pull request, not the coder's own panel) walks every item over the whole diff, in one message, so the failure paths are found together and not one review round at a time.
 
 Answer each item in the PR body, in one line: a test name that drives it, or "not applicable because ...". A reviewer reads the answers, not the code, first.
 
@@ -53,6 +53,7 @@ Answer each item in the PR body, in one line: a test name that drives it, or "no
 
 **11. Evidence that is not a unit test**
 - RULE: a privileged script is run live on a throwaway system (a forced failure, a forced hang and a kill) BEFORE its strict review, and the PR says which head's bytes ran.
+- The orchestrator provides the throwaway system, or authorises it in the brief. A coder's STOP ("never deploy, never touch credentials") is lifted only for that disposable system and only by the brief. With none, the PR says so.
 - A label or marker another system sets (an installer, a controller): is it ever treated as proof of health? (It must not be.)
 
 **12. What was not done**
