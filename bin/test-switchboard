@@ -14258,6 +14258,25 @@ class TestHeadlessPresence(Base):
         self.assertEqual(self.world.herdr.panes, panes, "no terminal was opened")
         self.assertEqual(len([e for e in self.world.audit() if e["event"] == "headless.watch_refused"]), 3, "the terminal and the unknown name (twice) are audited; the retired one is said without a record")
 
+    def test_watch_is_refused_for_a_caller_who_is_not_the_boss_and_while_another_watch_holds_the_lock(self):
+        self.headless()
+        self.world.add_agent("other", fleet={"role": "coder", "reports_to": "boss"})
+        panes = dict(self.world.herdr.panes)
+        self.watch_cli("hw")                                                         # sets the environment; then the caller is a peer, not the boss
+        os.environ["HERDR_PANE_ID"] = self.world.panes["other"]
+        self.world.herdr.panes.clear(); self.world.herdr.panes.update(panes)
+        code, out, err = self.run_cli("watch", "hw")
+        self.assertEqual(code, 1)
+        self.assertIn("may not reattach hw", err)
+        self.assertEqual(self.world.herdr.panes, panes, "no terminal was opened")
+        os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]
+        with sb.agent_lock(self.world.state, "hw", seconds=1), mock.patch.object(sb, "AGENT_LOCK_SECONDS", 0.2):
+            inner = sb.agent_lock(self.world.state, "hw", seconds=0.2)
+            with mock.patch.object(sb, "agent_lock", lambda state, name: inner):
+                code, out, err = self.run_cli("watch", "hw")
+        self.assertEqual(code, 1)
+        self.assertIn("another watch or reattach of hw is running", err)
+
     def test_watch_without_a_workspace_or_with_a_terminal_that_cannot_open_fails_with_the_reason_and_leaves_the_worker_untouched(self):
         sid = self.headless()
         record_before = (Path(self.world.state) / "headless" / "hw.json").read_bytes()

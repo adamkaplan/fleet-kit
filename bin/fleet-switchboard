@@ -7546,6 +7546,9 @@ def cmd_watch(args, runner, now, socket_call=None):
     try:
         with agent_lock(state, name):
             discovery = engine.discover(engine.now())   # read again under the lock: a terminal opened a moment ago is seen
+            who = reattach_caller_problem(engine, runner, now, discovery, name)   # and the caller rule with it: check and act are one step
+            if who:
+                raise LaunchError("refused: %s" % who)
             why = watch_problem(engine, state, name, discovery)
             if why:
                 if engine.audit is not None:
