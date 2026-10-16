@@ -221,24 +221,28 @@ def closure_refusals(base_src, head_src, patch, roots, entry_points):
     for side, tree, numbers in (("base", base, lines[0]), ("head", head, lines[1])):
         spans = [(_span(n), n) for n in tree.body]
         for number, text in sorted(numbers.items()):
-            owner = next((n for (a, b), n in spans if a <= number <= b), None)
-            if owner is None:
+            owners = [n for (a, b), n in spans if a <= number <= b]
+            if not owners:
                 if text.strip() and not text.strip().startswith("#"):
                     reasons.append("a changed line (%s line %d) is in no top-level definition and is not a comment: it cannot be mapped" % (side, number))
                 continue
-            names = _bound_names(owner)
-            if isinstance(owner, DEF_KINDS):
-                if owner.name in in_defs:
-                    reasons.append("it changes %s, part of the clear (%s file)" % (owner.name, side))
-                elif side == "head" and entry_points & {x.id for x in ast.walk(owner) if isinstance(x, ast.Name)}:
-                    reasons.append("it changes %s, which refers to a clear entry point (%s)" % (owner.name, ", ".join(sorted(entry_points & {x.id for x in ast.walk(owner) if isinstance(x, ast.Name)})[:3])))
-            elif isinstance(owner, BIND_KINDS + (ast.Import, ast.ImportFrom)):
-                if names & (in_globals | in_defs | in_refs):
-                    reasons.append("it changes the module-level binding of %s, which the clear reads" % ", ".join(sorted(names & (in_globals | in_defs | in_refs))[:3]))
-            elif isinstance(owner, ast.Expr) and isinstance(getattr(owner, "value", None), ast.Constant):
-                continue
-            else:
-                reasons.append("it changes a module-level statement (%s line %d) that is not a definition or a binding: refused" % (side, number))
+            for owner in owners:
+                names = _bound_names(owner)
+                if isinstance(owner, DEF_KINDS):
+                    used = entry_points & {x.id for x in ast.walk(owner) if isinstance(x, ast.Name)}
+                    if owner.name in in_defs:
+                        reasons.append("it changes %s, part of the clear (%s file)" % (owner.name, side))
+                    elif used:
+                        reasons.append("it changes %s, which refers to a clear entry point (%s)" % (owner.name, ", ".join(sorted(used)[:3])))
+                elif isinstance(owner, BIND_KINDS + (ast.Import, ast.ImportFrom)):
+                    if names & (in_globals | in_defs | in_refs):
+                        reasons.append("it changes the module-level binding of %s, which the clear reads" % ", ".join(sorted(names & (in_globals | in_defs | in_refs))[:3]))
+                    elif len(owners) > 1:
+                        reasons.append("a changed line (%s line %d) holds more than one top-level statement: refused" % (side, number))
+                elif isinstance(owner, ast.Expr) and isinstance(getattr(owner, "value", None), ast.Constant):
+                    continue
+                else:
+                    reasons.append("it changes a module-level statement (%s line %d) that is not a definition or a binding: refused" % (side, number))
     return sorted(set(reasons))
 
 
@@ -247,6 +251,6 @@ def decode_blob(answer):
     if not isinstance(answer, dict) or answer.get("encoding") != "base64" or not isinstance(answer.get("content"), str):
         return None
     try:
-        return base64.b64decode(answer["content"]).decode("utf-8")
+        return base64.b64decode(answer["content"], validate=True).decode("utf-8")
     except (ValueError, UnicodeError):
         return None

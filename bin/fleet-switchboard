@@ -19690,12 +19690,13 @@ def delegated_clear_checks(engine, runner, now, kind, number):
 
 def delegated_clear_map(engine, runner, repo, item, base_sha, rule):
     """[reasons] for ONE changed file of the daemon's own (`closure_refusals` over its text before and after and its patch), or None when it cannot be read or mapped. The text comes from the
-    git blobs API (the contents API refuses a file this large): the head's blob id is the file's own `sha`, the base's is found in the directory listing of the base commit. #661."""
+    git blobs API (the contents API refuses a file this large): the head's blob id is the file's own `sha`, the base's is the file's own `sha` at the base commit. #661."""
     try:
         module = load_module("delegated_clear")
-        directory, name = item["filename"].rsplit("/", 1)
-        listing = _gh_json(engine, runner, repo, "repos/%s/contents/%s?ref=%s" % (repo, directory, base_sha))
-        base_blob = next(e["sha"] for e in listing if isinstance(e, dict) and e.get("name") == name and e.get("type") == "file")
+        entry = _gh_json(engine, runner, repo, "repos/%s/contents/%s?ref=%s" % (repo, item["filename"], base_sha))
+        base_blob = entry["sha"] if isinstance(entry, dict) and entry.get("type") == "file" else None
+        if not isinstance(base_blob, str):
+            return None
         base = module.decode_blob(_gh_json(engine, runner, repo, "repos/%s/git/blobs/%s" % (repo, base_blob)))
         head = module.decode_blob(_gh_json(engine, runner, repo, "repos/%s/git/blobs/%s" % (repo, item["sha"])))
         if base is None or head is None or not isinstance(item.get("patch"), str):

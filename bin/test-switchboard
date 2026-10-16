@@ -28891,7 +28891,7 @@ class TestImpactHold(LedgerBase):
         self.assertEqual(code, 2)
         self.assertIn("cannot be mapped", err, "unmappable is refused")
         self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [])
-        self.files_of_pr("bin/fleet-switchboard", "bin/decision_core.py", "bin/plan_ledger.py", mapped=[])   # an authority-module edit, the daemon file changed outside the closure
+        self.files_of_pr("bin/fleet-switchboard", "bin/decision_core.py", "bin/triage_digest.py", mapped=[])   # an authority-module edit, the daemon file changed outside the closure
         self.assertEqual(self.under()[0], 0, "an edit that is not the clear may be cleared")
 
     def test_s5_only_the_listed_order_is_accepted_and_a_missing_order_is_refused(self):
@@ -28985,7 +28985,7 @@ class TestImpactHold(LedgerBase):
         good = {"owner_decision": "hold", "complete": True, "unknown": None, "renamed_no_source": [], "top_tier_hits": {"authority": ["x"]}, "review_action": "none", "review_class": None, "changed_paths": []}
         import unicodedata
         refused = ["BIN/CHAT_CLEAR.PY", "./bin/chat_clear.py", "bin//chat_clear.py", "docs/../bin/chat_clear.py", "bin/chat_cl\u00e9ar.py".replace("\u00e9", "e"), unicodedata.normalize("NFD", "bin/delegated_clear.py"),
-                   "bin/impact_hold.py", "shims/gh", "plugins/fleet-hooks/x.mjs", ".github/workflows/ci.yml", "docs/review-laws/impact-matrix.json", "DOCS/REVIEW-LAWS/IMPACT-MATRIX.JSON"]
+                   "bin/impact_hold.py", "bin/plan_check.py", "bin/plan_ledger.py", "bin/repo_exclusion.py", "shims/gh", "plugins/fleet-hooks/x.mjs", ".github/workflows/ci.yml", "docs/review-laws/impact-matrix.json", "DOCS/REVIEW-LAWS/IMPACT-MATRIX.JSON"]
         for path in refused:
             for shape in ({"filename": path, "status": "modified"}, {"filename": "docs/ok.md", "previous_filename": path, "status": "renamed"}):
                 self.assertTrue(module.refusals(rule, good, [shape], sb.impact_floor.matches, {}), (path, shape))
@@ -28994,7 +28994,7 @@ class TestImpactHold(LedgerBase):
             self.assertTrue(module.refusals(rule, good, [shape], sb.impact_floor.matches, {}), shape)
         self.assertTrue(module.refusals(rule, good, [{"filename": "a\x00b", "status": "modified"}], sb.impact_floor.matches, {}), "a path with a NUL cannot be told: refused")
         for allowed in ({"filename": "docs/switchboard.md", "status": "modified"}, {"filename": "README.md", "status": "modified"}, {"filename": "bin/test-switchboard", "status": "modified"},
-                        {"filename": "bin/decision_core.py", "status": "modified"}, {"filename": "bin/plan_ledger.py", "status": "modified"}, {"filename": "bin/triage_digest.py", "status": "modified"}):
+                        {"filename": "bin/decision_core.py", "status": "modified"}, {"filename": "bin/triage_digest.py", "status": "modified"}):
             self.assertEqual(module.refusals(rule, good, [allowed], sb.impact_floor.matches, {}), [], allowed)
         self.assertTrue(module.refusals(rule, good, [{"filename": "bin/fleet-switchboard", "status": "modified"}], sb.impact_floor.matches, {}), "the daemon file with no mapping: refused")
         self.assertEqual(module.refusals(rule, good, [{"filename": "bin/fleet-switchboard", "status": "modified"}], sb.impact_floor.matches, {"bin/fleet-switchboard": []}), [])
@@ -29060,6 +29060,46 @@ class TestImpactHold(LedgerBase):
         self.assertTrue(self.closure_check(source, "@@ garbage @@"), "a hunk header that cannot be read")
         comment = list(lines); comment.insert(k, "# a comment between the definitions")
         self.assertEqual(refuse(comment), [], "a comment between top-level statements changes nothing")
+
+    def synthetic(self, base, head):
+        import difflib
+        diff = "\n".join(list(difflib.unified_diff(base.split("\n"), head.split("\n"), lineterm="", n=1))[2:])
+        return sb.load_module("delegated_clear").closure_refusals(base, head, diff, ["root"], {"root"})
+
+    def test_a_line_holding_two_statements_is_judged_by_both_and_a_dropped_reference_to_the_clear_is_refused(self):
+        base = "def root():\n    return 1\n\nHARMLESS = 1\n\ndef other():\n    return root\n"
+        self.assertTrue(self.synthetic(base, base.replace("HARMLESS = 1", "HARMLESS = 1; root = lambda: 2")), "a second statement on the changed line rebinds the clear")
+        self.assertTrue(self.synthetic(base, base.replace("HARMLESS = 1", "HARMLESS = 1; OTHER = 2")), "a changed line with two statements is refused")
+        self.assertTrue(self.synthetic(base, base.replace("return root", "return None")), "removing a reference to a clear entry point is refused (the base is read too)")
+        self.assertEqual(self.synthetic(base, base.replace("HARMLESS = 1", "HARMLESS = 2")), [])
+
+    def test_the_glue_that_maps_a_daemon_file_reads_both_blobs_and_refuses_what_it_cannot_read(self):
+        import base64
+        module = sb.load_module("delegated_clear")
+        text = base64.b64encode(b"def a():\n    return 1\n").decode()
+        self.assertEqual(module.decode_blob({"encoding": "base64", "content": text}), "def a():\n    return 1\n")
+        for bad in (None, {}, {"encoding": "utf-8", "content": "x"}, {"encoding": "base64", "content": "!!!"}, {"encoding": "base64", "content": base64.b64encode(b"\xff\xfe").decode()}):
+            self.assertIsNone(module.decode_blob(bad), bad)
+        rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
+        answers = {}
+        def fake(engine, runner, repo, path):
+            for key, value in answers.items():
+                if key in path:
+                    if isinstance(value, Exception):
+                        raise value
+                    return value
+            raise sb.IntentError("not found")
+        item = {"filename": "bin/fleet-switchboard", "sha": "headsha", "patch": "@@ -1,2 +1,2 @@\n def a():\n-    return 1\n+    return 2"}
+        answers.update({"contents/bin/fleet-switchboard": {"type": "file", "sha": "basesha"}, "git/blobs/basesha": {"encoding": "base64", "content": text},
+                        "git/blobs/headsha": {"encoding": "base64", "content": base64.b64encode(b"def a():\n    return 2\n").decode()}})
+        with mock.patch.object(sb, "_gh_json", fake):
+            self.assertEqual(sb.delegated_clear_map(None, None, "acme-org/widget-api", item, "b" * 40, rule), [])
+            self.assertIsNone(sb.delegated_clear_map(None, None, "acme-org/widget-api", dict(item, patch=None), "b" * 40, rule), "no patch")
+            answers["git/blobs/headsha"] = {"encoding": "base64", "content": "!!!"}
+            self.assertIsNone(sb.delegated_clear_map(None, None, "acme-org/widget-api", item, "b" * 40, rule), "a blob that does not decode")
+            answers["contents/bin/fleet-switchboard"] = [{"name": "x"}]
+            self.assertIsNone(sb.delegated_clear_map(None, None, "acme-org/widget-api", item, "b" * 40, rule), "a directory, not a file")
+            self.assertTrue(rule["closure_roots"] and set(rule["closure_roots"]) <= set(rule["clear_entry_points"]), "the roots are entry points")
 
     def test_a_repeated_order_number_makes_the_whole_feature_off(self):
         module = sb.load_module("delegated_clear")
