@@ -37,7 +37,7 @@ Staff; an epic or workspace plan, the Chief of Staff, then the owner.
 
 `fleet-switchboard plan check <owner/repo#N> [--ask <owner/repo#N>] [--json]` prints `PASS` or `FAIL`, one defect per line,
 and the plan hash (editing anything changes it). Before you send a draft, run `plan check --file <plan> --done-when <the
-issue's Done-when>` (format 2 needs a `clauses:` and a `scenarios:` yaml block) and fix every defect. It only reads GitHub.
+issue's Done-when>` (the issue body needs a `## Intent` heading before its `Done when:` line, or the Done-when is not found; format 2 needs a `clauses:` and a `scenarios:` yaml block) and fix every defect. It only reads GitHub.
 
 ## The form
 
