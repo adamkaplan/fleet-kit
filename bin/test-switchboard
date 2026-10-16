@@ -29543,6 +29543,21 @@ class TestPlanCheckRules(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         self.assertIn("independent review", review.split(lines[0], 1)[1].split("\n\n", 1)[0])
 
+    def test_the_mutation_run_rule_is_said_once_in_each_skill_and_in_no_reviewer_definition(self):
+        words = ("mutation or fault-injection run", "heavy wrapper", "time limit", "process group", "background")
+        for skill in ("fleet-review", "fleet-coordination"):
+            text = " ".join((REPO / "skills" / skill / "SKILL.md").read_text().split())
+            with self.subTest(skill=skill):
+                self.assertEqual(text.count("A mutation or fault-injection run"), 1)
+                sentence = text.split("A mutation or fault-injection run", 1)[1].split("without one.", 1)[0]
+                for word in words[1:]:
+                    self.assertIn(word, sentence)
+        definitions = sorted((REPO / "agents" / "reviewers").glob("*.md"))
+        self.assertEqual(len(definitions), 5)
+        for path in definitions:
+            with self.subTest(definition=path.name):
+                self.assertNotIn("fault-injection", path.read_text().lower())
+
     def test_a_plan_that_opts_in_needs_a_size_in_agent_time_and_one_that_does_not_is_left_alone(self):
         self.assertEqual(self.codes(GOOD_PLAN), [], "a plan written before the rule has no plan-format line and is not flagged")
         self.assertEqual(self.codes("plan-format: 1\n" + GOOD_PLAN), [])
