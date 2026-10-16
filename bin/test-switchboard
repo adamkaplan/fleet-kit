@@ -13737,7 +13737,7 @@ class TestHeadlessPresence(Base):
         self.url = "http://127.0.0.1:49374"
 
     def headless(self, name="hw", role="coder", reports_to="boss", register=True, fleet_name=None):
-        sid = self.world.v2.create_session({"fleet": {"name": fleet_name or name, "role": role, "reports_to": reports_to, "headless": True}})
+        sid = self.world.v2.create_session({"fleet": {"name": fleet_name or name, "role": role, "reports_to": reports_to, "headless": True}}, directory=str(self.home))
         if register:
             self.ap.save_record(self.world.state, name, sid, self.url, now=self.world.clock.now())
         return sid
@@ -14212,6 +14212,68 @@ class TestHeadlessPresence(Base):
                     self.launch_hl(name="busy")
         self.assertIn("another launch or reattach of busy is running", str(raised.exception))
         self.assertIsNone(self.ap.load_record(self.world.state, "busy"))
+
+    def watch_cli(self, name="hw", *extra):
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]                      # the worker's own boss may watch it
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        return self.run_cli("watch", name, *extra)
+
+    def test_watch_opens_one_terminal_on_the_existing_session_and_closing_it_leaves_the_worker_as_it_was(self):
+        sid = self.headless()
+        record_before = (Path(self.world.state) / "headless" / "hw.json").read_bytes()
+        sessions, messages = set(self.world.v2.sessions), len(self.world.v2.sessions[sid]["messages"])
+        panes = set(self.world.herdr.panes)
+        code, out, err = self.watch_cli()
+        self.assertEqual(code, 0, err)
+        done = json.loads(out)
+        self.assertEqual((done["name"], done["session"]), ("hw", sid))
+        self.assertEqual(set(self.world.herdr.panes) - panes, {done["pane"]}, "exactly one terminal opened")
+        self.assertEqual(set(self.world.v2.sessions), sessions, "no second session")
+        self.assertEqual(len(self.world.v2.sessions[sid]["messages"]), messages, "no prompt was sent")
+        self.assertEqual(self.discover().agents["hw"].pane, done["pane"], "the terminal now shows the worker")
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "headless.watched" and e["subject"] == "hw"])
+        self.world.herdr.panes.pop(done["pane"])                                    # the person closes the terminal
+        after = self.discover().agents["hw"]
+        self.assertEqual((after.headless, after.session_id), (True, sid), "the worker is a headless worker again, on the same session")
+        self.assertEqual(set(self.world.v2.sessions), sessions)
+        self.assertEqual((Path(self.world.state) / "headless" / "hw.json").read_bytes(), record_before, "the record is untouched")
+        self.assertFalse([m for m in self.world.v2.sessions[sid]["messages"] if m.get("type") == "user" and "abort" in str(m).lower()])
+
+    def test_watch_refuses_a_worker_with_a_terminal_an_unknown_name_and_a_retired_worker_and_opens_nothing(self):
+        self.headless()
+        self.world.add_agent("termworker", fleet={"role": "coder", "reports_to": "boss"})
+        panes = dict(self.world.herdr.panes)
+        code, out, err = self.watch_cli("termworker")
+        self.assertEqual(code, 1)
+        self.assertIn("already has a terminal (pane %s)" % self.world.panes["termworker"], err)
+        code, out, err = self.watch_cli("nobody")
+        self.assertEqual(code, 1)
+        self.assertIn("nobody", err)
+        self.watch_cli("nobody")                                                    # sets the caller's environment for the retire below
+        self.assertEqual(self.run_cli("retire", "hw")[0], 0)
+        code, out, err = self.watch_cli("hw")
+        self.assertEqual(code, 1)
+        self.assertIn("retired", err)
+        self.assertEqual(self.world.herdr.panes, panes, "no terminal was opened")
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "headless.watch_refused"]), 3, "the terminal and the unknown name (twice) are audited; the retired one is said without a record")
+
+    def test_watch_without_a_workspace_or_with_a_terminal_that_cannot_open_fails_with_the_reason_and_leaves_the_worker_untouched(self):
+        sid = self.headless()
+        record_before = (Path(self.world.state) / "headless" / "hw.json").read_bytes()
+        os.environ.pop("HERDR_WORKSPACE_ID", None)
+        os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        code, out, err = self.run_cli("watch", "hw")
+        self.assertEqual(code, 1)
+        self.assertIn("--workspace", err)
+        with mock.patch.object(sb.HerdrClient, "open_tab_running", side_effect=sb.HerdrError("exit", "no room")):
+            code, out, err = self.watch_cli()
+        self.assertEqual(code, 1)
+        self.assertIn("no room", err)
+        self.assertEqual((Path(self.world.state) / "headless" / "hw.json").read_bytes(), record_before)
+        self.assertTrue(self.discover().agents["hw"].headless)
+        self.assertFalse([e for e in self.world.audit() if e["event"] == "headless.watched"])
 
     def test_the_service_url_is_read_from_a_private_service_file_and_never_includes_the_password(self):
         service = self.home / "service" / "service.json"
