@@ -34882,6 +34882,13 @@ class TestTheConfigIsReloadedWhenTheFileChanges(Base):
                 self.assertIsNone(self.settle())
                 self.assertIsNotNone(self.watch.invalid)
 
+    def test_a_declaration_that_goes_missing_is_refused_on_reload_and_the_last_good_config_keeps_running(self):
+        with mock.patch.object(sb, "CONFIG_MUST_DECLARE", {"excluded_repos": "no_such_module"}):
+            self.edit({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "poll_seconds": 9})
+            self.assertIsNone(self.settle(), "refused: nothing to rebuild")
+            self.assertIsNotNone(self.watch.invalid)
+            self.assertIn("no_such_module.py", self.watch.invalid["reason"])
+
     def test_fixing_it_recovers_and_a_different_fix_reloads(self):
         self.edit("{")
         self.settle()
@@ -54469,8 +54476,11 @@ class TestConfigDeclarations(Base):
     FIXTURE = ('CONFIG_KEY = "fixture_key"\nCONFIG_DEFAULT = {"n": 1}\n\n\n'
                'def validate(raw, source):\n    if not isinstance(raw, dict):\n        raise ValueError("fixture: bad value")\n')
 
-    def bin(self, **files):
+    def bin(self, must=None, **files):
         directory = Path(tempfile.mkdtemp(prefix="decl-"))
+        floor = mock.patch.object(sb, "CONFIG_MUST_DECLARE", must or {})
+        floor.start()
+        self.addCleanup(floor.stop)
         self.addCleanup(shutil.rmtree, directory, True)
         for name, text in files.items():
             (directory / name).write_text(text)
@@ -54560,7 +54570,7 @@ class TestConfigDeclarations(Base):
             sb.validate_config({})
         self.assertIn("novalidate.py", str(caught.exception))
         self.assertIn("no validate", str(caught.exception))
-        self.bin(**{"liar.py": '"""\nCONFIG_KEY = "doc_key"\n"""\nCONFIG_KEY = "other_key"\ndef validate(raw, source):\n    pass\n'})
+        self.bin(**{"liar.py": 'CONFIG_KEY = "doc_key"\nif True:\n    CONFIG_KEY = "other_key"\ndef validate(raw, source):\n    pass\n'})
         with self.assertRaises(sb.ConfigError) as caught:
             sb.validate_config({})
         self.assertIn("liar.py", str(caught.exception))
@@ -54574,10 +54584,46 @@ class TestConfigDeclarations(Base):
         self.assertIn("no configuration is loaded", str(caught.exception))
 
     def test_the_declaration_line_has_its_edges(self):
-        big = "#" * 200000 + '\nCONFIG_KEY = "late_key"\n'
-        self.bin(**{"commented.py": 'CONFIG_KEY = "ok_key"   # a comment\n', "upper.py": 'CONFIG_KEY = "Upper"\n', "digit.py": 'CONFIG_KEY = "1key"\n',
-                    "indented.py": '    CONFIG_KEY = "ind_key"\n', "late.py": big})
-        self.assertEqual(sb.config_declarations(), {"ok_key": "commented"}, "an uppercase or digit-led key, an indented line and a line past 200 KB are not declarations")
+        big = "#" * 1000000 + '\nCONFIG_KEY = "late_key"\n'
+        self.bin(**{"commented.py": 'CONFIG_KEY = "ok_key"   # a comment\n', "single.py": "CONFIG_KEY = 'sq_key'\n", "spaced.py": 'CONFIG_KEY   =   "sp_key"\n',
+                    "tabbed.py": 'CONFIG_KEY\t=\t"tb_key"\n', "typed.py": 'CONFIG_KEY: str = "ty_key"\n', "late.py": big,
+                    "nested.py": 'if True:\n    CONFIG_KEY = "nested_key"\n', "text.py": '# CONFIG_KEY = "text_key"\nx = "CONFIG_KEY = \'str_key\'"\n'})
+        self.assertEqual(sb.config_declarations(), {"ok_key": "commented", "sq_key": "single", "sp_key": "spaced", "tb_key": "tabbed", "ty_key": "typed"},
+                         "quotes, spacing, a tab and an annotation do not matter; a nested statement, a comment, a string and a line past the 1 MB read are not declarations")
+
+    def test_a_key_of_the_wrong_form_is_refused_naming_the_file(self):
+        for text in ('CONFIG_KEY = "Upper"\n', 'CONFIG_KEY = "1key"\n', 'CONFIG_KEY = 3\n'):
+            with self.subTest(text):
+                self.bin(**{"badform.py": text})
+                with self.assertRaises(sb.ConfigError) as caught:
+                    sb.config_declarations()
+                self.assertIn("badform.py", str(caught.exception))
+
+    def test_a_required_key_whose_declaration_is_not_found_refuses_the_whole_configuration(self):
+        must = {"excluded_repos": "repo_exclusion"}
+        validate = 'def validate(raw, source):\n    pass\n'
+        good = {"single quotes": "CONFIG_KEY = 'excluded_repos'\n", "extra spaces": 'CONFIG_KEY    =    "excluded_repos"\n', "a tab": 'CONFIG_KEY\t=\t"excluded_repos"\n'}
+        for what, line in good.items():
+            with self.subTest(what):
+                self.bin(must=must, **{"repo_exclusion.py": line + validate})
+                self.assertEqual(sb.validate_config({}).get("excluded_repos"), None)
+        bad = {"commented out": '# CONFIG_KEY = "excluded_repos"\n' + validate, "truncated": 'CONFIG_KEY = "excl', "a renamed key": 'CONFIG_KEY = "excluded_repo"\n' + validate,
+               "inside a string": 'x = """\nCONFIG_KEY = "excluded_repos"\n"""\n' + validate, "empty module": ""}
+        for what, text in bad.items():
+            with self.subTest(what):
+                self.bin(must=must, **{"repo_exclusion.py": text})
+                with self.assertRaises(sb.ConfigError) as caught:
+                    sb.validate_config({"excluded_repos": ["acme/api"]})
+                self.assertIn("repo_exclusion.py", str(caught.exception))
+                self.assertIn("excluded_repos", str(caught.exception))
+        self.bin(must=must)
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.validate_config({})
+        self.assertIn("repo_exclusion.py", str(caught.exception), "the module is missing")
+
+    def test_the_real_floor_names_the_two_moved_keys_and_the_real_modules_meet_it(self):
+        self.assertEqual(sb.CONFIG_MUST_DECLARE, {"excluded_repos": "repo_exclusion", "spotlight_guard": "spotlight_guard"})
+        self.assertEqual({k: sb.config_declarations()[k] for k in sb.CONFIG_MUST_DECLARE}, sb.CONFIG_MUST_DECLARE)
 
     def test_s7_the_moved_keys_are_known_through_their_declarations(self):
         self.assertTrue({"spotlight_guard", "excluded_repos"} <= set(sb.config_known_keys()))

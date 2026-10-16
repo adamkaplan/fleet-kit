@@ -47,6 +47,7 @@ import urllib.parse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import collections
+import ast
 import copy
 import errno
 import fcntl
@@ -482,7 +483,10 @@ UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `s
 TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "chat_clear", "temp_janitor", "load_alert", "source_budgets", "hold_labels"}
 
 
-CONFIG_DECLARATION = re.compile(rb'^CONFIG_KEY[ \t]*=[ \t]*"([a-z][a-z0-9_]*)"[ \t]*(?:#.*)?$', re.M)
+CONFIG_DECLARATION_TEXT = re.compile(rb'^[ \t]*CONFIG_KEY[ \t]*(?::[^=\n]*)?=[ \t]*[\'"]([^\'"\n]*)[\'"]', re.M)   # only the fallback for a file that does not parse
+CONFIG_KEY_FORM = re.compile(r"[a-z][a-z0-9_]*")
+CONFIG_READ_BYTES = 1000000
+CONFIG_MUST_DECLARE = {"excluded_repos": "repo_exclusion", "spotlight_guard": "spotlight_guard"}   # keys that MUST be declared by their module: a missing, truncated or unmatched declaration refuses the whole configuration (an unvalidated `excluded_repos` would exclude nothing)
 CONFIG_DECLARATIONS_DIR = None   # None = the bin directory beside this program; only a test points it elsewhere (never configuration or input)
 _DECLARED_CACHE = {}
 
@@ -498,6 +502,23 @@ def _declared_listing(directory):
     return out
 
 
+def _declared_key(data):
+    """The key a module's source declares with a top-level `CONFIG_KEY = "<key>"` (read with `ast`, so quotes, spacing and indentation of the line do not matter;
+    an annotation is allowed), or None. A file that does not parse falls back to the text of the line, so a broken declaring module is still SEEN (and then refused
+    when it is loaded), never silently skipped."""
+    try:
+        declared = None
+        for node in ast.parse(data).body:   # the LAST top-level assignment is the one the module ends up holding
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
+            if any(isinstance(t, ast.Name) and t.id == "CONFIG_KEY" for t in targets):
+                value = getattr(node, "value", None)
+                declared = value.value if isinstance(value, ast.Constant) and isinstance(value.value, str) else ""
+        return declared
+    except (SyntaxError, ValueError, RecursionError):
+        found = CONFIG_DECLARATION_TEXT.search(data)
+        return found.group(1).decode("utf-8", "replace") if found else None
+
+
 def config_declarations():
     """{key: module name} for the modules of the bin directory that declare a configuration key with a `CONFIG_KEY = "<key>"` line (and then
     `CONFIG_DEFAULT` and `validate(value, source)`): a new module with a key needs no line in the shared key set or the validation chain.
@@ -509,24 +530,35 @@ def config_declarations():
         raise ConfigError("the module directory %s cannot be read (%s): no configuration is loaded" % (directory, err.strerror or err)) from None
     cached = _DECLARED_CACHE.get(directory)
     if cached is not None and cached[0] == listing:
-        return dict(cached[1])
+        return _meets_floor(dict(cached[1]))
     shared = set(DEFAULTS) | set(PR7_CONFIG_KEYS) | TOP_LEVEL_EXTRA_KEYS
     found = {}
     for name, path, _, _ in listing:
         try:
             with open(path, "rb") as handle:
-                declared = CONFIG_DECLARATION.search(handle.read(200000))
+                declared = _declared_key(handle.read(CONFIG_READ_BYTES))
         except OSError as err:
             raise ConfigError("config module %s.py cannot be read (%s): no configuration is loaded" % (name, err.strerror or err)) from None
         if declared is None:
             continue
-        key = declared.group(1).decode()
+        key = declared
+        if not CONFIG_KEY_FORM.fullmatch(key):
+            raise ConfigError("config module %s.py declares an invalid configuration key %r (lowercase letters, digits and underscores): no configuration is loaded" % (name, _one_line(key, 40)))
         if key in shared:
             raise ConfigError("config key %r is declared by %s.py and is also owned by the shared defaults" % (key, name))
         if key in found:
             raise ConfigError("config key %r is declared by two modules: %s.py and %s.py" % (key, found[key], name))
         found[key] = name
     _DECLARED_CACHE[directory] = (listing, dict(found))
+    return _meets_floor(found)
+
+
+def _meets_floor(found):
+    """`found` once every key of CONFIG_MUST_DECLARE is declared by its module (checked on every call, cached or not)."""
+    for key, name in sorted(CONFIG_MUST_DECLARE.items()):
+        if found.get(key) != name:
+            raise ConfigError("config key %r must be declared by %s.py, and it is not (the module is missing, its CONFIG_KEY line is missing or damaged, or it names another key): "
+                              "no configuration is loaded" % (key, name))
     return found
 
 
