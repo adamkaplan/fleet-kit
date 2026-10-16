@@ -20,10 +20,12 @@ import errno
 import fcntl
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 DEFAULT_SLOTS = 3
@@ -37,6 +39,16 @@ INFO_MAX = 4096         # bytes of a slot file read
 SLOT_ENV = "FLEET_HEAVY_SLOT"   # set in the command's environment: a command already in a slot does not take a second one
 OFF_ENV = "FLEET_HEAVY"         # "off": bypass (CI never uses slots)
 SLOTS_MAX = 64
+MEM_ENV = "FLEET_HEAVY_MEM_MB"           # memory ceiling of the command's whole process tree, in MB; 0 = off
+TIME_ENV = "FLEET_HEAVY_MAX_SECONDS"     # run-time ceiling, in seconds; 0 = off
+DEFAULT_MEM_MB = 16384
+DEFAULT_MAX_SECONDS = 7200
+WATCH_SECONDS = 5       # how often the watchdog looks
+KILL_GRACE_SECONDS = 10  # between the polite stop and the forced one
+SWEEP_ROUNDS = 5        # forced-stop rounds that look again for what is left
+SWEEP_SECONDS = 0.3     # between them
+EXIT_TIME = 124
+EXIT_MEMORY = 137
 FORWARDED = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
 
@@ -166,9 +178,216 @@ def _resolve(command, environ):
     return shutil.which(word, path=environ.get("PATH"))
 
 
+def ceilings(environ):
+    """(memory MB, seconds) the watchdog enforces, each 0 when off: FLEET_HEAVY_MEM_MB (default 16384) and FLEET_HEAVY_MAX_SECONDS (default 7200). Anything that is
+    not a whole number of 0 or more reads as the default: a typo never turns the guard off."""
+    def read(key, default):
+        raw = str(environ.get(key, "")).strip()
+        return int(raw) if re.fullmatch(r"[0-9]{1,12}", raw) else default
+    return read(MEM_ENV, DEFAULT_MEM_MB), read(TIME_ENV, DEFAULT_MAX_SECONDS)
+
+
+def read_process_table():
+    """[(pid, ppid, pgid, rss_kb, start)] from `ps`; `start` is the process's start time as text, so a pid that was reused is told from the process it was. Raises
+    OSError when the table cannot be read."""
+    try:
+        done = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid=,rss=,lstart="], capture_output=True, text=True, timeout=20)
+    except (subprocess.SubprocessError, OSError) as err:
+        raise OSError("ps failed: %s" % err)
+    rows = []
+    for line in done.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and all(part.isdigit() for part in parts[:4]):
+            rows.append(tuple(int(part) for part in parts[:4]) + (" ".join(parts[4:]),))
+    if done.returncode != 0 or not rows:
+        raise OSError("ps gave no process table")
+    return rows
+
+
+def read_lock_holders(path):
+    """The pids that have `path` open, from `lsof -t` (same user only); raises OSError when lsof is missing, fails or is too slow (no holder is then known)."""
+    try:
+        done = subprocess.run(["lsof", "-a", "-u", str(os.getuid()), "-t", "--", str(path)], capture_output=True, text=True, timeout=10)
+    except (subprocess.SubprocessError, OSError) as err:
+        raise OSError("lsof failed: %s" % err)
+    if done.returncode not in (0, 1):   # 1: nothing has it open
+        raise OSError("lsof exited %d" % done.returncode)
+    return {int(word) for word in done.stdout.split() if word.isdigit()}
+
+
+def _start(row):
+    return row[4] if len(row) > 4 else ""
+
+
+def tree(rows, roots):
+    """The pids of `roots` and everything below them by parent links."""
+    kids = {}
+    for row in rows:
+        kids.setdefault(row[1], []).append(row[0])
+    found, todo = set(), list(roots)
+    while todo:
+        pid = todo.pop()
+        if pid not in found:
+            found.add(pid)
+            todo.extend(kids.get(pid, ()))
+    return found
+
+
+class Watchdog:
+    """Stops the command the wrapper started when its process tree passes a memory ceiling or it runs past a time ceiling: SIGTERM, a grace, then SIGKILL, then a
+    sweep that repeats until nothing of the run is alive (or says who is).
+
+    Every process seen in the command's tree is remembered by (pid, start time) at each sample, so a double-forked orphan, a child that ignores the polite stop and a
+    child that started its own session are still found and stopped, and a pid that was reused by another process never is. Only those remembered processes (and the
+    command's own process group when it has one) are signalled; never the wrapper, its parent, its own group, pid 1 or any other process. A process table that cannot
+    be read stops nothing beyond the command itself (one note); the time ceiling needs no table."""
+
+    def __init__(self, pid, command, mem_mb, max_seconds, out, started, read_table=read_process_table, clock=time.time, pause=None, killpg=os.killpg,
+                 kill=os.kill, every=WATCH_SECONDS, grace=KILL_GRACE_SECONDS, rounds=SWEEP_ROUNDS, sweep_every=SWEEP_SECONDS, sweep_pause=time.sleep, me=None, lock_path=None, lsof=read_lock_holders):
+        self.pid, self.command, self.mem_mb, self.max_seconds, self.out, self.started = pid, command, mem_mb, max_seconds, out, started
+        self.read_table, self.clock, self.killpg, self.kill, self.every, self.grace = read_table, clock, killpg, kill, every, grace
+        self.rounds, self.sweep_every, self.sweep_pause = rounds, sweep_every, sweep_pause
+        self.lock_path, self.lsof, self.lock_noted, self.candidates = lock_path, lsof, False, set()
+        self.me = me if me is not None else (os.getpid(), os.getppid(), os.getpgrp())   # never signalled: this wrapper, its caller, its group
+        self.stop_event = threading.Event()
+        self.pause = pause or (lambda seconds: self.stop_event.wait(seconds))
+        self.peak_kb, self.reason, self.noted, self.survivors = 0, None, False, []
+        self.pgids = {}      # pid -> process group, as last seen
+        self.seen = set()    # (pid, start time) of every process seen in the command's tree
+        self.group = None    # the command's own process group, when it is not the wrapper's
+        self.thread = threading.Thread(target=self.watch, daemon=True)
+
+    def start(self):
+        if self.mem_mb or self.max_seconds:
+            self.thread.start()
+
+    def finish(self):
+        self.stop_event.set()
+        if self.thread.is_alive():
+            self.thread.join(timeout=self.grace + self.rounds * (self.sweep_every + 1) + 10)
+
+    def exit_status(self):
+        return {"memory": EXIT_MEMORY, "time": EXIT_TIME}.get(self.reason)
+
+    def remember(self, rows):
+        """Add what is below the command (or below anything remembered that is still alive) to the remembered set; returns the live remembered (pid, start) keys."""
+        at = {row[0]: row for row in rows}
+        alive = {key for key in self.seen if key[0] in at and _start(at[key[0]]) == key[1]}
+        if self.pid in at and (self.pid, _start(at[self.pid])) not in self.seen:
+            alive.add((self.pid, _start(at[self.pid])))
+        holding = set()
+        for pid in self.lock_holders():   # the slot lock's descriptor is inherited by every descendant, a double fork that left the tree included
+            if pid in at and pid not in self.me[:2]:
+                holding.add((pid, _start(at[pid])))
+        alive |= holding & self.candidates   # held at two looks IN A ROW: not a process that only opened the lock file for an instant (a waiting wrapper, holders())
+        self.candidates = holding            # the next look compares with this one only; it never grows beyond one look's holders
+        own = at.get(self.pid)
+        if own is not None and own[2] not in (0, 1, self.me[2]):
+            self.group = own[2]
+            alive |= {(row[0], _start(row)) for row in rows if row[2] == self.group}
+        for pid in tree(rows, [key[0] for key in alive]):
+            alive.add((pid, _start(at[pid])))
+        alive = {key for key in alive if key[0] not in self.me[:2] and key[0] > 1}
+        self.seen |= alive
+        self.pgids.update({row[0]: row[2] for row in rows})
+        return alive
+
+    def lock_holders(self):
+        if self.lock_path is None:
+            return set()
+        try:
+            return self.lsof(self.lock_path)
+        except OSError as err:
+            if not self.lock_noted:
+                self.lock_noted = True
+                self.out.write("heavy: cannot list who holds the slot lock (%s): a process that left the command's tree is not found\n" % err)
+            return set()
+
+    def sample(self):
+        """One look; returns ("memory" | "time" | None, live keys)."""
+        live = set()
+        try:
+            rows = self.read_table()
+            live = self.remember(rows)
+            at = {row[0]: row for row in rows}
+            self.peak_kb = max(self.peak_kb, sum(at[pid][3] for pid, _s in live))
+        except OSError as err:
+            if not self.noted:
+                self.noted = True
+                self.out.write("heavy: cannot read the process table (%s): only the command itself can be stopped, and the memory ceiling is not enforced\n" % err)
+        if self.mem_mb and self.peak_kb // 1024 > self.mem_mb:
+            return "memory", live
+        if self.max_seconds and self.clock() - self.started > self.max_seconds:
+            return "time", live
+        return None, live
+
+    def watch(self):
+        while not self.stop_event.is_set() and not self.pause(self.every):
+            reason, live = self.sample()
+            if reason:
+                self.reason = reason
+                self.say(reason)
+                self.signal(signal.SIGTERM, live, fallback=True)   # no table: at least the command itself
+                self.stop_event.wait(self.grace)   # the grace ends the moment the command is gone; its children may not have gone with it
+                self.sweep()
+                return
+
+    def sweep(self):
+        """Kill what is left of the run, round after round, looking again each time (a child forked since is found; a process that is gone is not signalled)."""
+        live = set()
+        for _ in range(self.rounds):
+            live = self.look()
+            if live is None:   # no table: the command itself is all that can be judged
+                self.signal(signal.SIGKILL, set(), fallback=True)
+                return
+            if not live:
+                return
+            self.signal(signal.SIGKILL, live)
+            self.sweep_pause(self.sweep_every)
+        live = self.look()
+        if live:
+            self.survivors = sorted(pid for pid, _s in live)
+            self.out.write("heavy: survivors after the stop: %s (a process that left the tree and closed the slot lock cannot be found)\n"
+                           % ", ".join(str(pid) for pid in self.survivors))
+            self.out.flush()
+
+    def look(self):
+        try:
+            return self.remember(self.read_table())
+        except OSError:
+            return None
+
+    def say(self, reason):
+        text = _plain(" ".join(self.command), 120)
+        if reason == "memory":
+            self.out.write("heavy: stopped `%s`: its process tree passed the memory ceiling of %d MB (peak %d MB); FLEET_HEAVY_MEM_MB changes it, 0 turns it off\n"
+                           % (text, self.mem_mb, self.peak_kb // 1024))
+        else:
+            self.out.write("heavy: stopped `%s`: it ran past the time ceiling of %d s (peak %d MB); FLEET_HEAVY_MAX_SECONDS changes it, 0 turns it off\n"
+                           % (text, self.max_seconds, self.peak_kb // 1024))
+        self.out.flush()
+
+    def signal(self, number, live, fallback=False):
+        """Send `number` to each live remembered process, and to the command's own group when it has one. The wrapper, its parent and its group are refused here."""
+        grouped = self.group is not None and self.group not in (0, 1, self.me[2]) and any(pid == self.pid for pid, _s in live)   # the group only while the command that led it is there: a gone leader's group id may be another's
+        if grouped:
+            try:
+                self.killpg(self.group, number)
+            except OSError:
+                pass
+        for pid in sorted({pid for pid, _s in live} or ({self.pid} if fallback else set())):
+            if pid in self.me[:2] or pid <= 1 or (grouped and self.pgids.get(pid) == self.group):   # a group member has had the group's signal
+                continue
+            try:
+                self.kill(pid, number)
+            except OSError:
+                pass
+
+
 def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name=None, environ=None, out=None, clock=time.time, sleep=time.sleep,
-        which=shutil.which):
-    """Wait for a slot, run `command` in it, return its exit status. 75 when no slot came within `wait_max` seconds, 127 when the command does not exist."""
+        which=shutil.which, watchdog=None):
+    """Wait for a slot, run `command` in it, return its exit status. 75 when no slot came within `wait_max` seconds, 127 when the command does not exist.
+    A watchdog stops a runaway: 137 past the memory ceiling, 124 past the time ceiling (see `ceilings`); `watchdog` is a dict of Watchdog keyword arguments (tests)."""
     environ = os.environ if environ is None else environ
     out = sys.stderr if out is None else out
     if _resolve(command, environ) is None:
@@ -239,12 +458,21 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
                 child["p"].send_signal(got["signal"])
             except OSError:
                 pass
-        while True:
-            try:
-                status = child["p"].wait()
-                break
-            except InterruptedError:   # a signal during wait: Python retries; this is belt and braces
-                continue
+        mem_mb, max_seconds = ceilings(environ)
+        lock = slot_path(state_dir, index) if fd is not None else None
+        dog = Watchdog(child["p"].pid, command, mem_mb, max_seconds, out, clock(), clock=clock, **dict({"lock_path": lock}, **(watchdog or {})))
+        dog.start()
+        try:
+            while True:
+                try:
+                    status = child["p"].wait()
+                    break
+                except InterruptedError:   # a signal during wait: Python retries; this is belt and braces
+                    continue
+        finally:
+            dog.finish()
+        if dog.exit_status():
+            return dog.exit_status()
         return 128 - status if status < 0 else status   # a signal: 128 + n, as a shell reports it
     finally:
         for number, handler in old.items():

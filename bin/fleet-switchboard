@@ -6193,7 +6193,7 @@ def resume_agent(engine, name, session_id, workspace, patience=LAUNCH_PATIENCE, 
             raise LaunchError(str(err)) from None
     taken = engine.discover(engine.now()).agents.get(name)
     released = []
-    if taken is not None:
+    if taken is not None and not taken.headless:   # a headless worker has no pane to release (#433: `watch` opens the first terminal on it)
         released = release_stale_binding(engine, name, taken, session_id, replace=replace)   # refuses (LaunchError) a pane that is really running it
     argv = [engine.config["opencode"], "-s", session_id]
     pane = None
@@ -7608,6 +7608,64 @@ def cmd_read(args, runner, now):
     return run_cloud("cmd_read", args, runner, now)
 
 
+def watch_problem(engine, state, name, discovery):
+    """None when `watch` may open a terminal on `name`, else one line: the worker is unknown or retired, or a terminal already runs it (named)."""
+    if name in read_retired(state):
+        return "%s is retired (a finished worker): nothing to watch" % name
+    seen = discovery.agents.get(name)
+    if seen is None:
+        return "no fleet agent named %s is known: `%s status` lists the workers" % (name, PROG)
+    if not seen.headless:
+        return "%s already has a terminal (pane %s): switch to it, or `%s retire %s --close` first" % (name, seen.pane, PROG, name)
+    return None
+
+
+def cmd_watch(args, runner, now, socket_call=None):
+    """`watch <name> [--workspace W]` (#433): open a terminal on a headless worker's EXISTING session. It creates no session and sends no prompt, so
+    closing the terminal leaves the worker running. Refused (exit 1, nothing opened) for a worker that has a terminal, is unknown or is retired.
+    The caller rule is `reattach`'s: the operator, the Chief of Staff or the worker's own boss."""
+    engine, state, _ = build_engine(runner, now, "cli", socket_call=socket_call)
+    name = args.name
+    if not NAME_RE.match(name or ""):
+        raise LaunchError("name the worker: `%s watch <name>`" % PROG)
+    discovery = engine.discover(engine.now())
+    if name in read_retired(state):   # said first: a retired worker is not discovered, so the caller rule could only say "not your worker"
+        raise LaunchError("refused: %s is retired (a finished worker): nothing to watch" % name)
+    who = reattach_caller_problem(engine, runner, now, discovery, name)
+    if who:
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "headless.watch_refused", name, {"why": _one_line(who, 160)})
+        raise LaunchError("refused: %s" % who)
+    try:
+        with agent_lock(state, name):
+            discovery = engine.discover(engine.now())   # read again under the lock: a terminal opened a moment ago is seen
+            who = reattach_caller_problem(engine, runner, now, discovery, name)   # and the caller rule with it: check and act are one step
+            if who:
+                raise LaunchError("refused: %s" % who)
+            why = watch_problem(engine, state, name, discovery)
+            if why:
+                if engine.audit is not None:
+                    engine.audit.append(engine.actor, "headless.watch_refused", name, {"why": _one_line(why, 160)})
+                raise LaunchError("refused: %s" % why)
+            seen = discovery.agents[name]
+            workspace = args.workspace or os.environ.get("HERDR_WORKSPACE_ID")
+            if not workspace:
+                raise LaunchError("no workspace to open the terminal in: pass --workspace (or run it from a herdr pane)")
+            done = resume_agent(engine, name, seen.session_id, workspace)
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "headless.watched", name, {"session": seen.session_id, "pane": done["pane"], "tab": done.get("tab")})
+    except ImpactStateBusy:
+        raise LaunchError("another watch or reattach of %s is running: wait for it" % name) from None
+    print(json.dumps(done, sort_keys=True))
+    return EXIT_OK
+
+
+def add_watch_parsers(sub):
+    watch = sub.add_parser("watch", help="Open a terminal on a headless worker's existing session; closing it leaves the worker running")
+    watch.add_argument("name", help="The headless worker's fleet name")
+    watch.add_argument("--workspace", help="The herdr workspace for the new tab (default: this pane's)")
+
+
 def add_reattach_parsers(sub):
     reattach = sub.add_parser("reattach", help="Put a detached or dead agent back in a pane on its existing session (no prompt is sent)")
     reattach.add_argument("name", nargs="?", help="The agent's fleet name")
@@ -8958,6 +9016,48 @@ def mark_escalated(state_dir, key, when):
         found = read_escalated(state_dir)
         found[key] = iso(when)
         write_escalated(state_dir, found)
+
+
+BATCH_NOTES_FILE = "batch-notes.json"
+BATCH_NOTES_KEEP = 100
+
+
+def batch_note_key(repo, number, text):
+    return "%s#%d:%s" % (repo, number, hashlib.sha256(text.encode("utf-8")).hexdigest()[:16])
+
+
+def read_batch_notes(state_dir):
+    """{"<repo>#<n>:<digest of the note>": iso time} of the answer notes already delivered. A DISPOSABLE file: it only stops a re-run of an answer
+    (the note went, the comment did not) from sending the same note again. Missing or unreadable reads as empty (then the note is sent again)."""
+    try:
+        raw = json.loads((Path(state_dir) / BATCH_NOTES_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in raw.items() if isinstance(k, str) and isinstance(v, str)} if isinstance(raw, dict) else {}
+
+
+def mark_batch_note(state_dir, key, when):
+    """Record the note as delivered and pending (`when` set), or forget it (`when` None: the answer is fully recorded)."""
+    found = read_batch_notes(state_dir)
+    if when is None:
+        found.pop(key, None)
+    else:
+        found[key] = iso(when)
+    kept = dict(sorted(found.items(), key=lambda kv: kv[1])[-BATCH_NOTES_KEEP:])
+    path = Path(state_dir) / BATCH_NOTES_FILE
+    temp = path.with_name("%s.%d.tmp" % (BATCH_NOTES_FILE, os.getpid()))
+    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(kept, handle, indent=1, sort_keys=True)
+            handle.write("\n")
+        os.replace(str(temp), str(path))
+    except BaseException:
+        try:
+            os.unlink(str(temp))
+        except OSError:
+            pass
+        raise
 
 
 def captain_escalations_to_keep(engine):
@@ -10750,6 +10850,12 @@ def publish_decisions(engine):
                                ((engine.config.get("impact_hold") or {}).get("calls_per_pass") or IMPACT_PASS_CALLS))   # its own cap of gh reads, the impact hold's setting
     except Exception as err:
         engine._note("merged_labels.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+    try:
+        ejections = load_module("queue_ejections")   # #584: a pull request ejected from the merge queue wakes its orchestrator with the failing tests
+        ejections.run_pass(types.SimpleNamespace(**{n: globals()[n] for n in ejections.NEEDS}), engine, now,
+                           ((engine.config.get("impact_hold") or {}).get("calls_per_pass") or IMPACT_PASS_CALLS))
+    except Exception as err:
+        engine._note("queue_ejection.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
     apply_notice_effects(engine)
     store = decision_store(engine)
     try:
@@ -11817,7 +11923,7 @@ class SweepFacts:
 
 TRIAGE_DEFAULTS = {"enabled": False, "repos": None, "required_labels": {}, "sla": {}, "sla_overrides": {},
                    "our_logins": None, "daily_summary": True, "realarm_hours": 24, "max_findings": 30,
-                   "calls_per_pass": 30, "pass_seconds": 10, "backoff": True, "digest_interval_minutes": 60}
+                   "calls_per_pass": 30, "pass_seconds": 10, "backoff": True, "digest_interval_minutes": 60, "ownerless": None}
 # Every `_days` value is in days and may be a fraction (2/24 is two hours); `t7_ours_hours` is in hours.
 TRIAGE_SLA = {"t1_days": 1, "t2_days": 1 / 24, "t3_ask_days": 1, "t3_other_days": 3, "t5_days": 2 / 24, "t6_days": 2,
               "t7_ours_hours": 4, "t7_other_days": 2, "t8_days": 1, "t9_days": 3, "t11_days": 1}
@@ -11907,6 +12013,18 @@ def validate_triage_config(config, source):
         raise ConfigError("%s.realarm_hours' must be a positive number, got %r" % (where, section["realarm_hours"]))
     if not _is_number(section["digest_interval_minutes"]) or section["digest_interval_minutes"] < 0:
         raise ConfigError("%s.digest_interval_minutes' must be a number of minutes, 0 or more (0 sends a digest every pass that has one), got %r" % (where, section["digest_interval_minutes"]))
+    own = section["ownerless"]   # #605: off unless the owner names the team repositories
+    if own is not None:
+        if not isinstance(own, dict) or set(own) - {"repos", "days", "limit", "owner_labels"}:
+            raise ConfigError("%s.ownerless' must be null or {repos, days, limit, owner_labels}, got %r" % (where, own))
+        if not (isinstance(own.get("repos"), list) and own["repos"] and all(isinstance(r, str) and REPO_RE.match(r) for r in own["repos"])):
+            raise ConfigError("%s.ownerless.repos' must be a non-empty list of OWNER/REPO names, got %r" % (where, own.get("repos")))
+        if "days" in own and (not _is_number(own["days"]) or own["days"] <= 0):
+            raise ConfigError("%s.ownerless.days' must be a positive number of days, got %r" % (where, own["days"]))
+        if "limit" in own and (not isinstance(own["limit"], int) or isinstance(own["limit"], bool) or not 100 <= own["limit"] <= 2000):
+            raise ConfigError("%s.ownerless.limit' must be a whole number from 100 to 2000, got %r" % (where, own["limit"]))
+        if "owner_labels" in own and not (isinstance(own["owner_labels"], list) and all(isinstance(x, str) and x for x in own["owner_labels"])):
+            raise ConfigError("%s.ownerless.owner_labels' must be a list of label names or patterns (agent:*), got %r" % (where, own["owner_labels"]))
     cap = section["max_findings"]
     if not isinstance(cap, int) or isinstance(cap, bool) or not 1 <= cap <= 200:
         raise ConfigError("%s.max_findings' must be a whole number from 1 to 200, got %r" % (where, cap))
@@ -12120,8 +12238,7 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
     ask = number in ctx["asks"]
     if not item["pr"]:
         named = item.get("owner_body", False)   # an explicit `Owner: <name>` or `owned by <name>` line names the owner
-        if not item["assignees"] and not chain and not named and number not in ctx["owned"] and number not in ctx["unresolved"] \
-                and age_created >= sla["t1_days"]:
+        if not load_module("triage_ownerless").is_claimed(dict(item, owner_body=named), ctx) and age_created >= sla["t1_days"]:   # one definition of "has an owner" (#605)
             found["T1"] = {"created_days": round(age_created, 2)}
         group_missing = [g for g in required if not any(l in item["labels"] for l in (g if isinstance(g, list) else [g]))]
         if group_missing and age_created >= sla["t2_days"]:
@@ -12449,6 +12566,101 @@ def triage_verify_t7(engine, state, repo, number, cfg, now, budget):
     return True
 
 
+def triage_ownerless_options(cfg):
+    """The `triage.ownerless` settings with their defaults, or None when it is off."""
+    own = (cfg or {}).get("ownerless") if isinstance(cfg, dict) else None
+    if not isinstance(own, dict) or not own.get("repos"):
+        return None
+    module = load_module("triage_ownerless")
+    return {"repos": list(own["repos"]), "days": own.get("days", module.DEFAULT_DAYS), "limit": own.get("limit", module.DEFAULT_LIMIT),
+            "owner_labels": list(own.get("owner_labels") or module.DEFAULT_OWNER_LABELS)}
+
+
+def triage_read_ownerless(hub, repo, options, budget):
+    """(records, cut, total) of one team repository: every open item, page by page to `limit` items, and the repository's own count of open items (one more read) for
+    `read X of Y`. Charged to the pass's call budget."""
+    records, cut = hub.read_pages("repos/%s/issues?state=open&sort=updated&direction=asc&per_page=100" % repo, cap=max(1, -(-options["limit"] // 100)))   # the LEAST recently updated first: a cut keeps the stale ones this line exists for (the triage's own shared read is unchanged)
+    budget[0] -= sweep_pages_used(records, cut) + 1
+    total = None
+    try:
+        total = hub.open_issues_count(repo)
+    except GitHubUnavailable:
+        total = None
+    if total is None and not cut:
+        total = len(records)
+    return records, cut, total
+
+
+def triage_refresh_ownerless(engine, state, cfg, now, budget, seconds):
+    """Read the team repositories' whole lists (the stalest first) while the call budget and time allow. A failed read keeps the old copy."""
+    options, hub = triage_ownerless_options(cfg), getattr(engine, "hub", None)
+    if options is None or hub is None:
+        return
+    todo = sorted((state.units.get((repo, "ownerless"), {"at": 0})["at"], repo) for repo in options["repos"]
+                  if repo not in state.unreadable and now - state.units.get((repo, "ownerless"), {"at": 0})["at"] >= TRIAGE_TTL)
+    for _, repo in todo:
+        if budget[0] < 2 or engine.now() - state.started >= seconds:
+            return
+        try:
+            records, cut, total = triage_read_ownerless(hub, repo, options, budget)
+            state.units[(repo, "ownerless")] = {"at": now, "data": records, "truncated": cut, "total": total, "error": None}
+        except GitHubUnavailable as err:
+            budget[0] -= 1
+            if (repo, "ownerless") in state.units:   # it was read before: a failed refresh keeps the old copy and tries again after the usual wait
+                state.units[(repo, "ownerless")].update(at=now, error=_one_line(str(err), 160))
+            else:
+                state.units[(repo, "ownerless")] = {"at": now - TRIAGE_TTL + 60, "data": [], "truncated": False, "total": None, "error": _one_line(str(err), 160), "empty": True}
+
+
+OWNERLESS_FILE = "triage-ownerless.json"   # {repo: {"at": epoch}}: when each repository's daily line was last sent (private; survives a restart)
+
+
+def triage_ownerless_pass(engine, state, cfg, now):
+    """#605: once a day per team repository, ONE line to the Chief of Staff and to the orchestrators of that repository: how many open issues have no owner and no
+    activity for N days, how old the oldest is, the five oldest as links, and how much of the list was read. Counts, ages and links only; nothing is written to any issue.
+    Returns {repo: summary} for the report. Never raises."""
+    options = triage_ownerless_options(cfg)
+    if options is None or engine.state_dir is None:
+        return {}
+    module, shown = load_module("triage_ownerless"), {}
+    try:
+        discovery, ours = getattr(engine, "discovery", None), triage_our_logins(engine, cfg)
+        for repo in options["repos"]:
+            unit = state.units.get((repo, "ownerless"))
+            if unit is None or unit.get("empty") or unit.get("error") and not unit["data"]:
+                continue
+            items = {}
+            for record in unit["data"]:
+                item = triage_norm(record)
+                if item is not None and item["state"] == "open":
+                    items[item["number"]] = item
+            rows = module.ownerless_stale(items, triage_context(engine, repo, items, discovery), ours, options["owner_labels"], now, options["days"])
+            read, total = len(unit["data"]), unit.get("total")
+            shown[repo] = {"count": len(rows), "read": read, "total": total, "oldest_days": int(rows[0][1]) if rows else None}
+            if not rows:
+                continue
+            sent = _read_small(engine.state_dir, OWNERLESS_FILE)
+            if now - sent.get(repo, {}).get("at", 0) < 86400:
+                continue
+            sent[repo] = {"at": int(now)}
+            _write_small(engine.state_dir, OWNERLESS_FILE, sent)   # before the send: at most one line a day, even when a send fails
+            line = module.summary_line(repo, rows, read, total, options["days"], unit.get("truncated") is True)
+            names = ["chief-of-staff"] + sorted(name for name, agent in (discovery.agents.items() if discovery else [])
+                                                if _is_orchestrator(agent) and _fleet_repo(agent.fleet or {}, engine.config) == repo)
+            told = []
+            for name in names:
+                try:
+                    outcome = engine.send("switchboard", name, line)
+                    if not (isinstance(outcome, dict) and outcome.get("sent") is False):
+                        told.append(name)
+                except Exception as err:   # a failed send is audited, never retried into a second line
+                    engine._note("triage.ownerless_send_failed", repo, {"to": name, "error": _one_line(str(err), 120)})
+            engine._note("triage.ownerless", repo, {"count": len(rows), "read": read, "total": total, "told": told})
+    except Exception as err:
+        engine._note("triage.ownerless_error", "", {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
+    return shown
+
+
 def triage_pass(engine, decisions, now, errors=()):
     """The triage's whole pass: refresh a few units, judge, re-check each candidate against a fresh read, audit, count,
     and (only when enabled) queue ONE batched fact for the Chief of Staff and the daily summary. Writes nothing to GitHub."""
@@ -12465,8 +12677,10 @@ def triage_pass(engine, decisions, now, errors=()):
     units = ["issues", "comments", "merged"] + ["closed:" + l for l in sorted(triage_awaiting_labels(engine))]
     triage_refresh(engine, state, repos, units, now, budget, max(1, budget[0] // 3), seconds)  # a third kept for fresh checks
     triage_read_live(engine, state, repos, now, budget, max(1, cfg.get("calls_per_pass", TRIAGE_CALLS_PER_PASS) // 3), seconds)
+    triage_refresh_ownerless(engine, state, cfg, now, budget, seconds)   # #605: the team repositories' whole lists, after the shared units
     candidates, unchecked_units, truncated = triage_findings(engine, state, repos, decisions, cfg, now, errors)
     findings, unchecked, unchecked_other, oldest = [], 0, 0, 0.0
+    why = {}   # #605: repo -> {reason: count}, and its other-owner share and oldest age, for the report
 
     def verify(rule, ref, evidence):
         """True/False/None for one finding; keeps the confirmed, verified and attempted records."""
@@ -12501,6 +12715,12 @@ def triage_pass(engine, decisions, now, errors=()):
             unchecked += 1
             unchecked_other += rule == "OO"
             oldest = max(oldest, now - state.verified.get(pair, state.first_seen[pair]))
+            repo_of = ref.rpartition("#")[0]
+            reason = "call budget" if (budget[0] < 1 or engine.now() - state.started >= seconds) else "failed read"
+            entry = why.setdefault(repo_of, {"reasons": {}, "other_owner": 0, "oldest": 0.0})
+            entry["reasons"][reason] = entry["reasons"].get(reason, 0) + 1
+            entry["other_owner"] += rule == "OO"
+            entry["oldest"] = max(entry["oldest"], now - state.verified.get(pair, state.first_seen[pair]))
     findings.sort()
     day = int(now // 86400)
     counts, other_owner = {}, 0
@@ -12517,12 +12737,23 @@ def triage_pass(engine, decisions, now, errors=()):
             state.logged.add((rule, ref, day))
             engine._note("triage.finding", ref, {"rule": rule, "ref": ref, "what": TRIAGE_KINDS[rule],
                                                  "evidence": evidence, "woken": cfg["enabled"], "applied": False})
+    for repo_of, units_missing in unchecked_units.items():   # a unit not read yet is a finding that could not be judged
+        if units_missing:
+            why.setdefault(repo_of, {"reasons": {}, "other_owner": 0, "oldest": 0.0})["reasons"]["not read yet"] = len(units_missing)
+    for repo_of in repos:
+        if (repo_of, "issues") not in state.units and repo_of not in state.unreadable:
+            why.setdefault(repo_of, {"reasons": {}, "other_owner": 0, "oldest": 0.0})["reasons"]["not read yet"] = why.get(repo_of, {}).get("reasons", {}).get("not read yet", 0) + 1
+    ownerless = triage_ownerless_pass(engine, state, cfg, now)
     state.current = {"enabled": cfg["enabled"], "counts": counts, "total": sum(counts.values()),
                      "other_owner": other_owner, "at": iso(now),
                      "unchecked": unchecked, "unchecked_other_owner": unchecked_other,
                      "oldest_unchecked_seconds": int(oldest), "unchecked_units": {r: sorted(u) for r, u in unchecked_units.items()},
                      "unreadable": sorted(state.unreadable), "truncated": sorted(truncated), "repos": len(repos),
                      "digest_interval_minutes": cfg.get("digest_interval_minutes", 60)}
+    if why:
+        state.current["unchecked_why"] = {r: {"reasons": v["reasons"], "other_owner": v["other_owner"], "oldest_seconds": int(v["oldest"])} for r, v in sorted(why.items())}
+    if ownerless:
+        state.current["ownerless"] = ownerless
     triage_write(engine, state)
     flagged = [(r, ref) for r, ref, _ in findings if r == "OO" and now - state.alarmed.get((r, ref), 0) >= cfg["realarm_hours"] * 3600]
     due, invalid = triage_digest_due(engine, state, [(r, ref) for r, ref, _ in findings if r != "OO"],
@@ -12696,6 +12927,13 @@ def triage_status_lines(triage):
             extra += "; oldest unchecked for %s" % format_age(triage["oldest_unchecked_seconds"])
         lines.append("      triage     %d finding(s) not checked this pass (call budget or a failed read)%s: neither "
                      "raised nor audited" % (triage["unchecked"], extra))
+    for repo_of, info in sorted((triage.get("unchecked_why") or {}).items()):   # #605: why, per repository
+        text = load_module("triage_ownerless").reasons_line(repo_of, info.get("reasons") or {}, info.get("other_owner", 0), info.get("oldest_seconds"))
+        if text:
+            lines.append("      triage     " + text)
+    for repo_of, info in sorted((triage.get("ownerless") or {}).items()):
+        lines.append("      triage     ownerless in %s: %d open issue(s) with no owner and quiet; read %s of %s open item(s)" % (
+            repo_of, info.get("count", 0), info.get("read"), info.get("total") if info.get("total") is not None else "an unknown number"))
     if triage.get("truncated"):
         lines.append("      triage     lists capped for " + ", ".join(triage["truncated"]))
     cadence = triage_digest.digest_line(triage.get("digest"), parse_iso(triage.get("at")) or time.time(), triage.get("digest_interval_minutes", 60))   # #406
@@ -14497,6 +14735,12 @@ class GitHubHub:
             self._cache[key] = (now + GITHUB_LOOKUP_TTL, data)
         return data
 
+    def open_issues_count(self, repo):
+        """The repository's own count of open issues and pull requests (`open_issues_count` of `repos/<repo>`), one read; None when it cannot be told. Raises GitHubUnavailable."""
+        pages = self.gh_api("repos/%s" % repo, paginate=False, timeout=min(self.config["call_timeout_seconds"], GITHUB_ROUTE_READ_TIMEOUT))
+        count = pages[0].get("open_issues_count") if pages and isinstance(pages[0], dict) else None
+        return count if isinstance(count, int) and not isinstance(count, bool) else None
+
     # -- the issues that wait on you (PR 14): events keep the picture, the catch-up read makes it right
 
     def note_awaiting_issue(self, repo, issue, when=None):
@@ -15236,6 +15480,8 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
             work_line = work_status_line(config, state, now())
             if work_line is not None:
                 report["external"]["work_line"] = work_line
+    skills_ok, skills_text = skills_status_line()
+    report["skills"] = {"ok": skills_ok, "detail": skills_text}   # read only
     report["cos_orders"] = cos_orders_summary(config if config_ok else None)  # PR 18
     report["plan_gates"] = plan_gates_status(config if config_ok else None, state if state_ok else None, now()) if state_ok else None
     if config_ok and state_ok:
@@ -15246,7 +15492,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
     report["service"] = service_report(platform)
     report["key"] = key_report(config if config_ok else None, report["daemon"], report["service"])   # PR 16
     report["plugin"] = plugin_report(config, runner) if config_ok else {"state": "unknown", "detail": "config unusable"}
-    report["ok"] = all(report[part]["ok"] for part in ("config", "state_dir", "lab", "v2", "herdr"))
+    report["ok"] = all(report[part]["ok"] for part in ("config", "state_dir", "lab", "v2", "herdr", "skills"))
     return report
 
 
@@ -15436,6 +15682,8 @@ def format_status(report):
     lines.extend("      " + line for line in ((report.get("plan_gates") or {}).get("lines") or []))  # #107
     lines.extend("      " + report["policy"]["line"] for _ in [0] if "policy" in report)
     lines.extend(format_install_lines(report))  # PR 16
+    if "skills" in report:
+        lines.append("%s skills     %s" % (mark(report["skills"]), report["skills"]["detail"]))
     return "\n".join(lines)
 
 
@@ -21941,6 +22189,28 @@ class _RedsReader:
             raise load_reds().RedsError("gh api %s: %s" % (path.split("?")[0], self.accounts.scrub(_one_line(err, 120)) or "exit %d" % done.returncode))
         return done.stdout
 
+    PULL_STATE_QUERY = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){state mergeQueueEntry{id}}}}"
+
+    def pull_state(self, number):
+        """{"state": "OPEN"|"MERGED"|"CLOSED", "queued": bool} of one pull request (#584): ONE GraphQL read, a query with fixed text (the number is a typed variable).
+        gh's `pr view` has no merge queue field. Raises RedsError when it cannot be read."""
+        refuse_excluded(self.config, self.repo)
+        owner, _, name = self.repo.partition("/")
+        env = self.accounts.env_for(self.repo)
+        extra = {"env": env} if env is not None else {}
+        argv = [self.config["gh"], "api", "graphql", "-f", "query=" + self.PULL_STATE_QUERY, "-f", "owner=" + owner, "-f", "name=" + name, "-F", "number=%d" % number]
+        done = self.runner(argv, capture_output=True, text=True, timeout=self.config["call_timeout_seconds"], stdin=subprocess.DEVNULL, **extra)
+        if done.returncode != 0:
+            raise load_reds().RedsError("gh api graphql: %s" % (self.accounts.scrub(_one_line(done.stderr or done.stdout or "", 120)) or "exit %d" % done.returncode))
+        try:
+            pull = json.loads(done.stdout)["data"]["repository"]["pullRequest"]
+            state = pull["state"]
+        except (ValueError, KeyError, TypeError):
+            raise load_reds().RedsError("gh api graphql: no pull request in the answer") from None
+        if state not in ("OPEN", "MERGED", "CLOSED"):
+            raise load_reds().RedsError("gh api graphql: unknown pull request state")
+        return {"state": state, "queued": bool(pull.get("mergeQueueEntry"))}
+
 
 def cmd_reds(args, runner, now):
     """`reds <owner/repo#N>`: classify a pull request's failing tests (#342): failing on main's latest run, flaky there, or new. Read only."""
@@ -25911,13 +26181,125 @@ def kit_skill_names(kit_root=KIT_ROOT):
     return sorted(p.name for p in root.iterdir() if (p / "SKILL.md").is_file())
 
 
-def install_skills(skills_dir, kit_root=KIT_ROOT):
-    """The kit's skills into `skills_dir`, one directory each. True when any file changed."""
-    changed = False
+def _kit_skill_text(name, kit_root):
+    return (Path(kit_root) / "skills" / name / "SKILL.md").read_text()
+
+
+def skill_locations(home=None, data_dir=None):
+    """The folders agents read skills from that exist on this machine: the switchboard's own skills folder and the
+    shared ~/.agents/skills (read by several harnesses). Only a folder that exists is a location."""
+    home = Path(home) if home else Path.home()
+    data = Path(data_dir) if data_dir else _xdg("XDG_DATA_HOME", ".local/share") / PROG
+    return [p for p in (data / "skills", home / ".agents" / "skills") if p.is_dir()]
+
+
+def skills_drift(locations, kit_root=KIT_ROOT):
+    """[(location, skill, "differs" | "missing")] for every kit skill whose installed SKILL.md is not the kit's. Reads files only."""
+    out = []
+    names = kit_skill_names(kit_root)
+    for location in locations:
+        for name in names:
+            path = Path(location) / name / "SKILL.md"
+            try:
+                same = path.read_text() == _kit_skill_text(name, kit_root)
+            except OSError:
+                out.append((location, name, "missing"))
+                continue
+            except ValueError:
+                same = False
+            if not same:
+                out.append((location, name, "differs"))
+    return out
+
+
+def skills_status_line(locations=None, kit_root=KIT_ROOT):
+    """(ok, text) for status and the doctor: in sync, or each skill that differs or is missing and the command that fixes it."""
+    locations = skill_locations() if locations is None else locations
+    if not locations:
+        return True, "no installed skills folder found (`%s install` creates it)" % PROG
+    drift = skills_drift(locations, kit_root)
+    if not drift:
+        return True, "in sync with the kit (%s)" % ", ".join(str(p) for p in locations)
+    return False, "NOT in sync: %s; run `%s skills sync`" % (
+        "; ".join("%s %s in %s" % (name, why, loc) for loc, name, why in drift), PROG)
+
+
+def _replace_skill_file(path, text):
+    """Replace `path` with `text`: keep the old file as a backup beside it, write a temporary file then rename, keep the mode."""
+    path = Path(path)
+    mode = 0o644
+    if path.exists():
+        mode = path.stat().st_mode & 0o7777
+        stamp = time.strftime("%Y%m%d%H%M%S")
+        backup = path.with_name("%s.bak-%s" % (path.name, stamp))
+        n = 0
+        while backup.exists():
+            n += 1
+            backup = path.with_name("%s.bak-%s-%d" % (path.name, stamp, n))
+        shutil.copy2(str(path), str(backup))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temp = tempfile.mkstemp(prefix=".%s." % path.name, dir=str(path.parent))
+    try:
+        with os.fdopen(handle, "w") as out:
+            out.write(text)
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(temp, mode)
+        os.replace(temp, str(path))
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
+
+
+def sync_skills(skills_dir, kit_root=KIT_ROOT):
+    """The one step: make `skills_dir` hold the kit's skills, one directory each, and nothing else changes (a skill that
+    is not the kit's, a file beside the skills: untouched). A file already equal is not written. Returns the changed paths."""
+    changed = []
     for name in kit_skill_names(kit_root):
-        text = (Path(kit_root) / "skills" / name / "SKILL.md").read_text()
-        changed |= write_if_changed(Path(skills_dir) / name / "SKILL.md", text)
+        path = Path(skills_dir) / name / "SKILL.md"
+        text = _kit_skill_text(name, kit_root)
+        try:
+            if path.read_text() == text:
+                continue
+        except (OSError, ValueError):
+            pass
+        _replace_skill_file(path, text)
+        changed.append(str(path))
     return changed
+
+
+def install_skills(skills_dir, kit_root=KIT_ROOT):
+    """The kit's skills into `skills_dir` (the sync step). True when any file changed."""
+    return bool(sync_skills(skills_dir, kit_root))
+
+
+def cmd_skills(args, runner, now):
+    """`skills check` (read only) and `skills sync` (the kit's skills into every installed folder that exists)."""
+    locations = skill_locations()
+    if args.skills_action == "check":
+        ok, text = skills_status_line(locations, KIT_ROOT)
+        print(text)
+        return EXIT_OK if ok else EXIT_ERROR
+    if not locations:
+        sys.stderr.write("%s: skills: no installed skills folder found; run `%s install`\n" % (PROG, PROG))
+        return EXIT_ERROR
+    for location in locations:
+        changed = sync_skills(location, KIT_ROOT)
+        print("%s: %s" % (location, "%d file(s) replaced (old ones kept as SKILL.md.bak-*)" % len(changed) if changed else "already in sync"))
+    return EXIT_OK
+
+
+cmd_skills.direct = True   # files only: no daemon start
+
+
+def add_skills_parsers(sub):
+    skills = sub.add_parser("skills", help="Compare the installed skills with the kit's (`skills check`, read only) or copy the kit's into every installed folder (`skills sync`)")
+    skills_sub = skills.add_subparsers(dest="skills_action", required=True)
+    skills_sub.add_parser("check", help="Say whether the installed skills equal the kit's; exit 1 naming each that differs or is missing")
+    skills_sub.add_parser("sync", help="Copy exactly the kit's skills into the installed folders, keeping a backup of each file replaced")
 
 
 def _read_json_object(path, what):
@@ -28134,13 +28516,17 @@ def answer_batch(engine, runner, decision, args, name):
                             "nothing was sent or written. Shorten the --row choices or the --note, or answer from the issue itself"
                             % (ident, size, decision_core.BATCH_COMMENT_MAX_CHARS))
     told = ""
+    note_key = None
     raised = decision.get("raised_by")
     if raised and name:
         text = "Batch %s (%s#%d) is answered: %s. The record is the comment on it; you act on it, nothing was done to " \
                "the row issues." % (ident, repo, number, "as recommended" if not changed else "%d row(s) changed" % changed)
+        note_key = batch_note_key(repo, number, text + "\n" + "\n".join(lines)) if engine.state_dir is not None else None   # the answer's identity: every row's outcome and the note, not counts
+        if note_key is not None and note_key in read_batch_notes(engine.state_dir):
+            raised = None                  # this very note went on an earlier run whose comment failed: not sent a second time
         try:
             outcome = ReportSendDelivery(engine).deliver(decision, {"by": name, "to": raised, "text": text,
-                                                                    "ask": number, "repo": repo})
+                                                                    "ask": number, "repo": repo}) if raised else {"sent": True}
         except Exception as err:
             raise DecisionError("%s was not answered: the note to %s could not be delivered (%s); its labels stay, the "
                                 "batch stays with the Chief of Staff, nothing was commented. Run the same answer again "
@@ -28149,10 +28535,20 @@ def answer_batch(engine, runner, decision, args, name):
             raise DecisionError("%s was not answered: the note to %s was not delivered (%s); its labels stay, the batch "
                                 "stays with the Chief of Staff, nothing was commented. Run the same answer again once "
                                 "%s can be reached" % (ident, raised, outcome.get("reason") or outcome.get("action"), raised))
-        told = "; told %s" % raised
+        if raised and note_key is not None:
+            try:
+                mark_batch_note(engine.state_dir, note_key, engine.now())
+            except OSError:
+                pass
+        told = "; told %s" % raised if raised else "; already told %s" % decision.get("raised_by")
     IssueDelivery(engine, runner).deliver(decision, {
         "repo": repo, "number": number, "add": (), "remove": [awaiting_cos_label(engine.config), awaiting_label(engine.config)],
         "author": name, "comment": "\n".join(lines), "comment_first": True})
+    if note_key is not None:               # fully recorded (note sent, comment written): a later answer, even the same text, sends its own note
+        try:
+            mark_batch_note(engine.state_dir, note_key, None)
+        except OSError:
+            pass
     engine._note("decisions.answer", ident, {"kind": "batch", "repo": repo, "issue": number, "by": name,
                                             "rows": len(outcomes), "changed": changed,
                                             "note": _one_line(args.note or "", 200)})
