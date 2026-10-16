@@ -23725,14 +23725,14 @@ class TestOwnerlessSummary(Base):
         self.assertTrue(set(reasons) <= {"call budget", "failed read", "not read yet"} and reasons, reasons)
         self.assertGreater(why[self.TEAM]["oldest_seconds"], -1)
 
-    def test_t1_fires_and_stays_silent_in_the_same_cases_has_owner_decides(self):
+    def test_t1_fires_and_stays_silent_in_the_same_cases_is_claimed_decides(self):
         module = sb.load_module("triage_ownerless")
         now = self.world.clock.now()
         items = {n: sb.triage_norm(tri_issue(now, n, created=5, author="alice", assignees=["bob"] if n == 31 else (), body="Owner: carol" if n == 32 else "")) for n in (30, 31, 32)}
         ctx = {"chain": set(), "owned": set(), "unresolved": set(), "charters": set(), "asks": set()}
         for number, item in items.items():
             found, _ours = sb.triage_rules(item, [], ctx, sb.triage_sla(self.engine.config["triage"], self.TEAM), now, ["bot"], [], set())
-            self.assertEqual("T1" in found, not module.has_owner(item, ctx), number)
+            self.assertEqual("T1" in found, not module.is_claimed(item, ctx), number)
 
     def test_the_default_is_off_and_a_bad_setting_is_refused(self):
         self.engine.config["triage"]["ownerless"] = None
@@ -23746,13 +23746,13 @@ class TestOwnerlessSummary(Base):
     def test_one_definition_of_has_an_owner_is_shared_with_t1(self):
         import inspect
         source = inspect.getsource(sb.triage_rules)
-        self.assertIn("has_owner(", source)
+        self.assertIn("is_claimed(", source)
         module = sb.load_module("triage_ownerless")
         ctx = {"chain": {5}, "owned": {6}, "unresolved": {7}}
         base = {"number": 1, "assignees": [], "owner_body": False}
-        self.assertFalse(module.has_owner(base, ctx))
+        self.assertFalse(module.is_claimed(base, ctx))
         for change in ({"assignees": ["x"]}, {"number": 5}, {"number": 6}, {"number": 7}, {"owner_body": True}):
-            self.assertTrue(module.has_owner(dict(base, **change), ctx), change)
+            self.assertTrue(module.is_claimed(dict(base, **change), ctx), change)
 
 
 class TestTriageDigest(Base):

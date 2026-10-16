@@ -2,7 +2,7 @@
 
 Triage calls an issue `ours` when a fleet account wrote it, is assigned to it, or has a pull request notice. Every other issue of a team repository is an
 `other-owner` flag, counted apart and never a finding, so dozens of issues nobody owns and nobody touched for days read as "found 0". This module says which
-open ISSUES of such a repository have NO owner (the one rule T1 uses: `has_owner`), carry no owner label, were not written by the fleet and have been quiet
+open ISSUES of such a repository have NO owner (the one rule T1 uses: `is_claimed`), carry no owner label, were not written by the fleet and have been quiet
 for `days` or more, and builds the one daily line about them (counts, the age of the oldest, links: no issue text) and the per-repository breakdown of what
 the triage could not check, and why.
 
@@ -17,14 +17,14 @@ OLDEST = 5
 REASONS = ("call budget", "failed read", "not read yet")
 
 
-def has_owner(item, ctx):
+def is_claimed(item, ctx):
     """The ONE definition of an issue with an owner that T1 and this summary share: assigned, below a charter, named by an `Owner:` line, owned by a running agent, or
     whose owner cannot be told yet (its parent chain leaves the issues read). `ctx` is the triage context of the repository."""
     number = item["number"]
     return bool(item["assignees"] or number in ctx["chain"] or item.get("owner_body", False) or number in ctx["owned"] or number in ctx["unresolved"])
 
 
-def owner_label(labels, patterns):
+def claim_label(labels, patterns):
     """True when one of `labels` matches a configured owner-label pattern (`agent:*`, an exact name)."""
     return any(fnmatch.fnmatchcase(str(label).lower(), str(pattern).lower()) for label in labels for pattern in patterns)
 
@@ -36,7 +36,7 @@ def ownerless_stale(items, ctx, ours_logins, patterns, now, days=DEFAULT_DAYS):
     for number, item in items.items():
         if item.get("pr") or item.get("state") != "open":
             continue
-        if has_owner(item, ctx) or owner_label(item["labels"], patterns) or item["author"] in ours_logins:
+        if is_claimed(item, ctx) or claim_label(item["labels"], patterns) or item["author"] in ours_logins:
             continue
         quiet = (now - item["updated"]) / 86400.0
         if quiet >= days:

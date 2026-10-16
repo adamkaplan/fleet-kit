@@ -12039,7 +12039,7 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
     ask = number in ctx["asks"]
     if not item["pr"]:
         named = item.get("owner_body", False)   # an explicit `Owner: <name>` or `owned by <name>` line names the owner
-        if not load_module("triage_ownerless").has_owner(dict(item, owner_body=named), ctx) and age_created >= sla["t1_days"]:   # one definition of "has an owner" (#605)
+        if not load_module("triage_ownerless").is_claimed(dict(item, owner_body=named), ctx) and age_created >= sla["t1_days"]:   # one definition of "has an owner" (#605)
             found["T1"] = {"created_days": round(age_created, 2)}
         group_missing = [g for g in required if not any(l in item["labels"] for l in (g if isinstance(g, list) else [g]))]
         if group_missing and age_created >= sla["t2_days"]:
