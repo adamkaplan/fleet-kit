@@ -296,7 +296,7 @@ def scenario_state(scenario, entries, pr, plan_hash, head, authors):
     """One scenario's G1 picture: {id, evaluator, proof, verdict, status, missing[], void[]}. A proof or verdict counts
     only for THIS plan hash and THIS head; one for another is shown as void, not hidden."""
     sid, evaluator = scenario["id"], evaluator_of(scenario)
-    out = {"id": sid, "evaluator": evaluator, "claim": scenario.get("claim") or "pr", "missing": [], "void": []}
+    out = {"id": sid, "evaluator": evaluator, "claim": claim_of(scenario), "missing": [], "void": []}
     for kind in ("proof", "verdict"):
         mine = [e for e in entries if e.get("pr") == pr and e.get("scenario") == sid and e.get("kind") == kind
                 and (kind == "proof" or e.get("evaluator") == evaluator)]

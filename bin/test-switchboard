@@ -25022,6 +25022,35 @@ class TestG1UnwrittenClaim(LedgerBase):
         self.assertEqual(row["detail"].count("S2"), 1)
         self.assertRegex(row["detail"], r"epic-claimed, proven after the merge at the integration head: S2, S4")
 
+    def test_prove_verdict_and_verdict_all_refuse_an_unwritten_tester_measure_like_an_explicit_epic_claim(self):
+        self.plan_issue["body"] = self.plan()                    # S2: tester + measure, no claim written
+        refusals = []
+        for run in (lambda: self.prove("coder", "S2"), lambda: self.verdict("tst", "S2", "tester"),
+                    lambda: self.run_as("tst", "verdict", "--all", "--pr", self.PR, "--as", "tester", "--result", "pass", "--evidence", "judged it: matches the scenario")):
+            code, _, err = run()
+            self.assertNotEqual(code, 0)
+            refusals.append(err)
+        self.assertIn("S2 is claimed at the epic, not per PR", refusals[0])
+        self.assertIn("S2 is claimed at the epic, not per PR", refusals[1])
+        self.assertIn("no per-PR scenario of this plan is judged by tester", refusals[2], "verdict --all has nothing to record for the tester")
+        self.assertEqual(self.ledger(), [], "nothing was recorded at the PR head")
+        self.plan_issue["body"] = self.plan(s2_claim="epic")
+        self.assertIn("claimed at the epic", self.prove("coder", "S2")[2], "an explicit claim: epic refuses with the same message")
+
+    def test_an_explicit_claim_pr_on_a_tester_measure_still_records_and_the_other_scenarios_are_unchanged(self):
+        self.plan_issue["body"] = self.plan(s2_claim="pr")
+        self.assertEqual(self.prove("coder", "S2")[0], 0)
+        self.assertEqual(self.verdict("tst", "S2", "tester")[0], 0)
+        self.assertEqual(self.prove("coder", "S1")[0], 0)
+        self.assertEqual(self.verdict("cibot", "S1", "ci")[0], 0)
+        self.assertEqual(sorted(e["scenario"] for e in self.ledger()), ["S1", "S1", "S2", "S2"])
+
+    def test_no_consumer_of_a_claim_defaults_it_to_pr_on_its_own(self):
+        import re as _re
+        for name in ("fleet-switchboard", "plan_ledger.py"):
+            text = (BIN / name).read_text()
+            self.assertEqual(_re.findall(r'\.get\("claim"\) or "pr"', text), [], name + " reads a claim without claim_of")
+
     def test_a_tester_scenario_whose_proof_is_not_a_measure_stays_claimed(self):
         row = self.g1(self.plan(s2_proof="live"))
         self.assertEqual(row["status"], "missing", "a tester scenario whose proof is not a measure is claimed as before")
