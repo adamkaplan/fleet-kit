@@ -34,6 +34,9 @@ AUTH:       <the authority already granted, explicitly>
 CHECKPOINT: <a UTC time or an agreed event, with an overdue time>
 ```
 
+A brief for a credential, permission or privileged-script change links `docs/adversarial-checklist.md`.
+The pull request body answers each item of it in one line.
+
 Before the coder's first push, it runs both focused (a push voids proofs):
 
 ```text
