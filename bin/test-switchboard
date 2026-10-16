@@ -48469,7 +48469,7 @@ class TestHeavyWatchdog(unittest.TestCase):
     def test_s7_a_mutant_loop_that_never_ends_fails_at_the_call_bound(self):
         logic = TestHeavyQueueLogic("test_s1_a_busy_queue_waits_says_so_once_and_takes_the_freed_slot")
         logic.setUp()
-        logic.addCleanup = lambda *a, **k: None
+        self.addCleanup(logic.doCleanups)   # stops the patches the queue fakes start (a leaked Popen fake breaks later tests)
         logic.attempts = BoundedList()
         with self.assertRaises(AssertionError) as caught:
             logic.run_heavy(lambda state, slots: (None, None), 0.001, wait_max=10 ** 12)
