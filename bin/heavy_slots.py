@@ -20,6 +20,7 @@ import errno
 import fcntl
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -180,7 +181,7 @@ def ceilings(environ):
     not a whole number of 0 or more reads as the default: a typo never turns the guard off."""
     def read(key, default):
         raw = str(environ.get(key, "")).strip()
-        return int(raw) if raw.isdigit() else default
+        return int(raw) if re.fullmatch(r"[0-9]{1,12}", raw) else default
     return read(MEM_ENV, DEFAULT_MEM_MB), read(TIME_ENV, DEFAULT_MAX_SECONDS)
 
 
@@ -241,9 +242,12 @@ class Watchdog:
         return {"memory": EXIT_MEMORY, "time": EXIT_TIME}.get(self.reason)
 
     def targets(self, rows):
-        """(pgid or None, pids): where the stop goes. Never this wrapper's own group."""
+        """(pgid or None, pids): where the stop goes. Never this wrapper's own group. With no table at hand (the memory ceiling is off) it is read now, for the stop."""
         if rows is None:
-            return None, [self.pid]
+            try:
+                rows = self.read_table()
+            except OSError:
+                return None, [self.pid]
         pids, _kb = family(rows, self.pid)
         pgid = next((g for p, _pp, g, _r in rows if p == self.pid), None)
         return (pgid if pgid not in (None, os.getpgrp()) else None), sorted(pids)
@@ -273,9 +277,9 @@ class Watchdog:
                 self.reason = reason
                 self.say(reason)
                 self.signal(signal.SIGTERM, rows)
-                self.pause(self.grace)
+                self.stop_event.wait(self.grace)   # the grace ends the moment the command is gone
                 if not self.stop_event.is_set():   # the command went with the polite stop: no forced one
-                    self.signal(signal.SIGKILL, rows)
+                    self.signal(signal.SIGKILL, None, before=rows)   # a fresh look: a child forked since is in it, a pid that is gone is not signalled
                 return
 
     def say(self, reason):
@@ -288,8 +292,16 @@ class Watchdog:
                            % (text, self.max_seconds, self.peak_kb // 1024))
         self.out.flush()
 
-    def signal(self, number, rows):
+    def signal(self, number, rows, before=None):
         pgid, pids = self.targets(rows)
+        if before is not None and rows is None:   # the earlier tree's pids that are still there, with the same parent and group, are kept (an orphaned child)
+            try:
+                now = {(p, pp, g) for p, pp, g, _r in self.read_table()}
+                old = {(p, pp, g) for p, pp, g, _r in before}
+                kept = {p for p, pp, g in now & old if p in family(before, self.pid)[0]}
+                pids = sorted(set(pids) | kept)
+            except OSError:
+                pass
         try:
             if pgid is not None:
                 self.killpg(pgid, number)

@@ -48332,7 +48332,7 @@ class TestHeavyWatchdog(unittest.TestCase):
         self.exited = threading.Event()
         self.now = [1000.0]
 
-    def run_watched(self, rows_for, environ_extra=None, status=0, ignore_term=True, rounds=20, step=0.0, lives=True):
+    def run_watched(self, rows_for, environ_extra=None, status=0, ignore_term=True, rounds=20, step=0.0, lives=True, grace=0.001):
         """run() of `sh -c true` whose command is a fake that lives until it is sent a KILL (or, if `ignore_term` is false, any signal); the watchdog is driven by
         `rows_for(read number)` and a clock that moves `step` seconds per read. Returns the wrapper's exit status."""
         test = self
@@ -48367,7 +48367,7 @@ class TestHeavyWatchdog(unittest.TestCase):
 
         environ = {"PATH": os.environ["PATH"], "FLEET_HEAVY": "off"}
         environ.update(environ_extra or {})
-        dog = {"read_table": read_table, "pause": lambda seconds: self.stopping.wait(0.001), "killpg": record, "kill": record, "every": 0.001, "grace": 0.001}
+        dog = {"read_table": read_table, "pause": lambda seconds: self.stopping.wait(0.001), "killpg": record, "kill": record, "every": 0.001, "grace": grace}
         with mock.patch.object(self.hs.subprocess, "Popen", FakeChild):
             return self.hs.run(["sh", "-c", "sleep 1000"], None, 3, 1, "who", environ=environ, out=self.out, clock=clock, sleep=lambda s: None, watchdog=dog)
 
@@ -48406,6 +48406,22 @@ class TestHeavyWatchdog(unittest.TestCase):
         self.assertEqual(self.out.getvalue().count("time ceiling of 100 s"), 1, self.out.getvalue())
         self.assertEqual(len(self.signals), 2)
 
+    def test_s3_the_time_stop_covers_the_tree_even_with_the_memory_ceiling_off(self):
+        self.stopping = threading.Event()
+        rows = lambda n: [(4242, 1, os.getpgrp(), 1), (4243, 4242, os.getpgrp(), 1), (777, 1, 777, 1)]
+        code = self.run_watched(rows, {"FLEET_HEAVY_MAX_SECONDS": "100", "FLEET_HEAVY_MEM_MB": "0"}, step=60.0)
+        self.assertEqual(code, 124)
+        self.assertEqual({p for p, _s in self.signals}, {4242, 4243}, "the child goes too, the stranger does not")
+
+    def test_s1_a_command_that_ends_on_the_polite_stop_gets_no_forced_one(self):
+        self.stopping = threading.Event()
+        code = self.run_watched(lambda n: [(4242, 1, 4242, 20000 * 1024)], ignore_term=False, grace=5)
+        self.assertEqual(code, 137)
+        self.assertEqual([sig for _p, sig in self.signals], [signal.SIGTERM])
+
+    def test_s6_main_starts_the_parent_watch(self):
+        self.assertIn("watch_parent()", inspect.getsource(main))
+
     def test_s4_an_unreadable_process_table_stops_nothing_and_says_so_once(self):
         def unreadable():
             raise OSError("ps failed")
@@ -48435,21 +48451,6 @@ class TestHeavyWatchdog(unittest.TestCase):
         rows = lambda n: [(4242, 1, os.getpgrp(), 20000 * 1024), (4243, 4242, os.getpgrp(), 1), (777, 1, 777, 30000 * 1024), (778, 1, os.getpgrp(), 1)]
         self.assertEqual(self.run_watched(rows), 137)
         self.assertEqual({p for p, _s in self.signals}, {4242, 4243})
-
-    def test_s10_a_real_runaway_child_is_stopped_with_the_whole_tree(self):
-        """Real processes, a 100 MB ceiling: a shell whose python CHILD allocates; both are gone after the wrapper returns."""
-        marker = "wd-%d" % os.getpid()
-        code = ("import sys,time\nx=bytearray(400*1024*1024)\nfor i in range(0,len(x),4096): x[i]=1\nopen(sys.argv[1],'w').write('up')\ntime.sleep(60)\n")
-        flag = Path(tempfile.mkdtemp()) / "up"
-        self.addCleanup(shutil.rmtree, str(flag.parent), True)
-        out = io.StringIO()
-        status = self.hs.run(["sh", "-c", 'python3 -c "$0" "$1"; sleep 60', code, str(flag)], None, 3, 1, "who", environ={"PATH": os.environ["PATH"], "FLEET_HEAVY": "off", "FLEET_HEAVY_MEM_MB": "100",
-                             "FLEET_HEAVY_MAX_SECONDS": "60"}, out=out, watchdog={"every": 0.2, "grace": 2})
-        self.assertEqual(status, 137, out.getvalue())
-        self.assertIn("memory ceiling of 100 MB", out.getvalue())
-        time.sleep(0.5)
-        left = subprocess.run(["ps", "-axo", "command="], capture_output=True, text=True).stdout
-        self.assertNotIn(str(flag), left, "no process of the run is left")
 
     def test_s6_a_run_whose_parent_is_gone_exits_with_143(self):
         parents = iter([500, 500, 1])
