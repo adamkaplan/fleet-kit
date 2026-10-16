@@ -18519,7 +18519,7 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
         if review:
             decision = "hold"
     return {"pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude,
-            "floor_paths": hit, "files_read": len(files), "complete": complete, "unknown": unknown, "rated": [list(r) for r in rated],
+            "floor_paths": hit, "files_read": len(files), "files_total": total, "renamed_no_source": renamed[:20], "complete": complete, "unknown": unknown, "rated": [list(r) for r in rated],
             "decision": decision, "reasons": reasons, "owner_decision": owner[0], "owner_reasons": owner[1], "draft": raw.get("isDraft") is True}
 
 
@@ -18551,14 +18551,45 @@ def cmd_impact_floor(args, runner, now):
                 raise ValueError("--rating SEVERITY/PROBABILITY: severity is one of %s, probability one of %s (got %s/%s)" % (
                     ", ".join(matrix["severities"]), ", ".join(matrix["probabilities"] + matrix["not_rated"]), severity, probability))
         report = pr_floor_report(engine, repo, number, pairs)
+    except impact_floor.MatrixError as err:   # the rule file cannot be read: it is HELD ON PURPOSE (never read as "no floor"), said in words and in json; nothing was judged and nothing is written
+        why = _one_line(str(err), 200)
+        if args.json:
+            print(json.dumps({"pr": "%s#%d" % (repo, number), "head": None, "decision": "hold", "owner_decision": "hold", "reasons": [], "owner_reasons": ["held on purpose: the rule file cannot be read: %s" % why],
+                              "unknown": "the rule file cannot be read", "floor_paths": [], "globs": []}, sort_keys=True))
+        else:
+            print("impact floor for %s: HELD ON PURPOSE (advisory: nothing is written)" % ("%s#%d" % (repo, number)))
+            print("  held on purpose: the rule file cannot be read, so nothing was judged and no change may be read as not held: %s" % why)
+        return EXIT_OK
     except (NoticeError, ValueError) as err:
         sys.stderr.write("%s: impact floor: %s\n" % (PROG, _one_line(str(err), 300)))
         return EXIT_USAGE
     if args.json:
-        print(json.dumps(report, sort_keys=True))
+        print(json.dumps(report, sort_keys=True))   # the report as the daemon's pass reads it: `owner_decision` and `owner_reasons` next to the path-floor fields
     else:
-        print("impact floor for %s at %s: %s (advisory: nothing is written)" % (
-            report["pr"], (report["head"] or "unknown head")[:8], report["decision"].upper().replace("-", " ")))
+        owner = report.get("owner_decision")
+        words = {"hold": "HOLD for the owner", "second-review": "not held for the owner: a second independent review", "none": "not held"}.get(owner, "HELD ON PURPOSE (unknown decision %r)" % (owner,))
+        read, total = report.get("files_read"), report.get("files_total")
+        counted = "%s file%s read" % (read, "" if read == 1 else "s") if isinstance(read, int) else "files read unknown"
+        cut = report.get("complete") is False
+        blind = report.get("renamed_no_source") or []   # renamed or copied files whose source path the list does not carry: a top tier path could be the source
+        stamp = "(advisory: nothing is written)"
+        if cut and owner != "hold":   # the daemon's own answer for a list it could not read in full is printed as it is, and said to be no verdict: a cut list never reads as "not held"
+            print("impact floor for %s at %s: CANNOT TELL: only %s of %s files were read (the daemon's decision for the files it read: %s) %s" % (
+                report["pr"], (report["head"] or "unknown head")[:8], read, total, words, stamp))
+        elif blind and owner != "hold":
+            print("impact floor for %s at %s: CANNOT TELL: %d renamed or copied file(s) with no source path (the daemon's decision for the paths it saw: %s), %s %s" % (
+                report["pr"], (report["head"] or "unknown head")[:8], len(blind), words, counted, stamp))
+        else:
+            print("impact floor for %s at %s: %s, %s %s" % (report["pr"], (report["head"] or "unknown head")[:8], words, counted, stamp))
+        for reason in report.get("owner_reasons") or []:
+            print("  %s: %s" % ("why" if owner == "hold" else "because", reason))
+        if owner == "none" and not report.get("owner_reasons") and not cut and not blind:
+            print("  because: no changed path is a top tier path of the matrix, and no independent review or rating holds it")
+        if cut and owner != "hold":
+            print("  incomplete: GitHub gave %s of %s changed files, so a path outside those may be a top tier path; this is not a verdict of \"not held\"" % (read, total))
+        if blind and owner != "hold":
+            print("  rename: the source path of %s was not seen, and it may have been a top tier path; this is not a verdict of \"not held\"" % ", ".join(blind[:3]))
+        print("  path floor (older advisory, not the owner's rule): %s" % report["decision"].upper().replace("-", " "))
         for reason in report["reasons"]:
             print("  %s" % reason)
         for path in report["floor_paths"]:
