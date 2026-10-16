@@ -4,7 +4,7 @@ Status: design for decision (#568, under the least-privilege law #540). Nothing 
 
 **The intent.** An agent's GitHub credential for a repository cannot change that repository's settings, rulesets, branch protection or collaborators, nor merge around the ruleset. Only the owner's own login can.
 
-Names below are neutral (`acme-org/widget-api`, `agent-bot`). No token, key, account or keyring entry of a real installation appears in this file, and a test (`TestAgentCredentialsDoc` in `bin/test-switchboard`) scans it for token-like strings.
+Names below are neutral (`acme-org/widget-api`, `acme-bot`). No token, key, account or keyring entry of a real installation appears in this file, and a test (`TestAgentCredentialsDoc` in `bin/test-switchboard`) scans it for token-like strings.
 
 ## How the scopes were read
 
@@ -51,13 +51,13 @@ One fine-grained personal access token per repository, created by the owner, wit
 
 ### Option B: a separate machine user with write, not admin
 
-One extra GitHub account (`agent-bot`), added to each repository as a collaborator with the Write role, with its own token in the keyring under its own name.
+One machine user per owner account that owns repositories (for example `acme-bot` for `acme-org`, `notes-bot` for `owner-user`), each added to that owner's repositories as a collaborator with the Write role, and each with ONE token in the keyring under its own name. `gh` keeps one login and one token per user name, and the shim maps one account per repository owner (`owner/*` in `gh_users`), so one user per owner is the shape that matches both.
 
 | Criterion | Assessment |
 |-----------|------------|
-| Cost | One extra account, no money for public repositories. A seat on private organisation repositories. A one-time setup per repository (invite and accept). It fits the existing `gh_users` map as a new account name, so no shim code changes |
+| Cost | One extra account per owner account, no money for public repositories. A seat on private organisation repositories. A one-time setup per repository (invite and accept). It fits the existing `gh_users` map as a new account name, so no shim code changes |
 | What breaks | Little. A Write collaborator cannot change settings, rulesets, branch protection or collaborators, which is the intent, and everything else agents do (push, pull request, label, comment) is allowed. Anything that relied on admin power breaks and moves to the owner. Pull requests now show a different author, which is useful: the owner can approve what an agent wrote |
-| Rotation | The machine user's token has its own expiry (fine-grained, up to a year; a fine-grained token reaches only repositories its owner account owns or an organisation grants, so for repositories under another personal account a classic token with `repo` may be the only form, which is broader and must be weighed first) or a classic token with no expiry, which the owner should avoid. Rotating means one new token and one `gh auth login` in the keyring; revoking the user's access is one step per repository, or deleting the account |
+| Rotation | The machine user's token has its own expiry (fine-grained, up to a year, for the organisation's user; a classic token with no expiry for the personal-account user, because a fine-grained token cannot be issued for another person's personal account; see the owner's steps). Rotating means one new token and one `gh auth login` per machine user; revoking the user's access is one step per repository, or deleting the account |
 | Who merges | The owner's own login merges, clears holds and can approve what the machine user wrote. A Write-role user can still approve other people's pull requests and can merge any pull request the ruleset allows. What stops it is only the ruleset's required checks and required approvals: with 0 required approvals an agent's approval changes nothing for GitHub. The independent review in this fleet is a fleet gate (the switchboard's), not a GitHub rule. So Option B satisfies "cannot merge around the ruleset" only partly: the agent cannot bypass the ruleset, but it can merge through it. The machine user does not hold bypass |
 
 ### Option C: the App installation token for local agents too
@@ -79,7 +79,7 @@ Why:
 
 - It is the only option that needs no code change and still separates the agent's identity from the owner's, so the owner can approve an agent's pull requests, and the audit trail says which actor did what.
 - It meets the intent with GitHub enforcing the limit, by role, rather than a shim that tries to guess.
-- It fits the existing account map (`gh_users`): the machine user is one more account name.
+- It fits the existing account map (`gh_users`): each machine user is one more account name, mapped from its owner's `owner/*` entry.
 - Option C is a better end state, with an hour of lifetime and no manual rotation, but it needs a top-tier shim change first. Take it as the follow-up once B is in place. Option A leaves agents acting under the owner's name and a manual token per repository.
 
 Who merges with which credential after the change:
@@ -92,10 +92,10 @@ Who merges with which credential after the change:
 
 Steps are in order. Every step that creates or changes a credential is the owner's (see "The owner's own steps"). Agents run none of them and run no command that creates a credential.
 
-1. The owner creates the machine user and a token for it with `contents: write`, `pull_requests: write`, `metadata: read` (and `issues: write` if wanted).
-2. The owner invites the machine user to each repository as a collaborator with the Write role, and the user accepts.
-3. The owner adds the machine user to the keyring with `gh auth login` in a shell the agents do not share.
-4. The owner adds the account name to `gh_users` for each repository, or for `owner/*`, in `~/.config/fleet-switchboard/config.json`. The `git` shim follows the same map.
+1. The owner creates one machine user per owner account that owns repositories, and one token for each (see the owner's steps for its type), with `contents: write`, `pull_requests: write`, `metadata: read` (and `issues: write` if wanted).
+2. The owner invites each machine user to that owner's repositories as a collaborator with the Write role, and the user accepts.
+3. The owner adds each machine user to the keyring with `gh auth login` in a shell the agents do not share.
+4. The owner adds each account name to `gh_users` for its owner (`owner/*`) or repository, in `~/.config/fleet-switchboard/config.json`. The `git` shim follows the same map.
 5. The owner removes the broad token from the agents' environment: the inherited `GH_TOKEN` and `GITHUB_TOKEN` of the pane, so the shim has nothing broader to fall back on for reads.
 6. An agent, with the owner present, runs the live proof of clause (4): an admin call is refused (403 or 404) and a branch push, pull request, label, comment and a merge through the ruleset still work.
 
@@ -114,19 +114,19 @@ Rollback returns to today's behaviour, including admin reach for agents, so reco
 
 These are the only credential-creating or credential-changing steps. No command here belongs in a script an agent runs.
 
-1. Create the account for the agent (once), with an email the owner controls, and turn on two-factor authentication.
-2. Create the token or tokens, one per resource owner. A fine-grained token is scoped to ONE resource owner (the account or organisation that owns the repositories), so the coverage is:
+1. Create one machine user per owner account that owns repositories, each with an email the owner controls and two-factor authentication. `gh` stores ONE token per user name, so a user can have only one token type; a machine user per owner account is what lets each owner have the right type. This is the coverage:
 
-   | Repository (neutral) | Owner | Token that can cover it |
-   |----------------------|-------|-------------------------|
-   | `acme-org/widget-api`, `acme-org/widget-web` | an organisation | A fine-grained token with the organisation as resource owner (the machine user is a member or outside collaborator, and the organisation allows it): one token for all of them |
-   | `owner-user/notes` | the owner's personal account | A fine-grained token cannot be issued for another person's personal account. Use a classic token of the machine user with the `repo` scope. It is broader on paper, but the Write role caps what it can do (no settings, rulesets or collaborators), so weigh that and record it |
-   | `other-user/widget-lib` (the other account) | a different personal account | Out of reach for the owner's tokens and untouched by this work (read-only, as today). No step below applies to it |
+   | Repository (neutral) | Owner | Machine user and its single token | What it can and cannot do |
+   |----------------------|-------|-----------------------------------|---------------------------|
+   | `acme-org/widget-api`, `acme-org/widget-web` | an organisation | `acme-bot`: a fine-grained token with the organisation as resource owner, limited to the chosen repositories (the organisation must allow fine-grained tokens) | Contents, pull requests, metadata only; narrowed to named repositories; expires within a year. Cannot change settings (no Administration permission, Write role) |
+   | `owner-user/notes` | the owner's personal account | `notes-bot`: a classic token with the `repo` scope. A fine-grained token cannot be issued for another person's personal account | Cannot be narrowed to one repository: it reaches every repository `notes-bot` collaborates on, with no expiry unless the owner sets one. The Write role still caps it: no settings, rulesets or collaborators. Weigh that and record it |
+   | `other-user/widget-lib` (the other account) | a different personal account | none | Out of reach and untouched by this work (read-only, as today). No step here applies to it |
 
-   Give each token the three permissions above, an expiry of no more than a year, and store it only in the keyring, never in a file, an issue or a message.
-3. In each repository's settings, add the account as a collaborator with the Write role. Never Maintain or Admin.
+   Give a fine-grained token the three permissions above and an expiry of no more than a year. Store every token only in the keyring, never in a file, an issue or a message.
+2. Invite each machine user to its owner's repositories as a collaborator with the Write role. Never Maintain or Admin.
+3. For each organisation, allow the machine user as a member or outside collaborator, and approve its fine-grained token if the organisation requires it.
 4. Check each ruleset: its required checks (and any required approvals) are what you want agents held to, because a Write-role user can approve and merge through it, and the machine user is not in a bypass list.
-5. Run `gh auth login` for the machine user in the owner's own terminal.
-6. Edit the account map (one entry per owner or repository, matching the token above) and remove the inherited broad token from the agents' shells.
-7. Put the token's expiry date in a calendar. At expiry, repeat step 2 and step 5.
+5. Run `gh auth login` for each machine user in the owner's own terminal.
+6. Edit the account map (`acme-org/*` to `acme-bot`, `owner-user/*` to `notes-bot`) and remove the inherited broad token from the agents' shells.
+7. Put each token's expiry date in a calendar. At expiry, create a new token (step 1) and repeat step 5.
 8. Leave repositories on the other account alone.
