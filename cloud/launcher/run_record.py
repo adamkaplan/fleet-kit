@@ -222,10 +222,11 @@ class Recorder:
             return None, "the messages could not be read"
         finally:
             if pf is not None:
-                try:
-                    os.killpg(pf.pid, 15)
-                except OSError:
-                    pass
+                if pf.poll() is None:   # a reaped child's pid may already be another process's: signal only a live one
+                    try:
+                        os.killpg(pf.pid, 15)
+                    except OSError:
+                        pass
                 try:
                     pf.wait(timeout=5)
                 except Exception:
