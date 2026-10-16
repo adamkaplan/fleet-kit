@@ -19,12 +19,12 @@ Two things decide whether the panel can judge at all:
 
 Each reviewer runs its shell commands **bare**: one command per call, no pipe (`| head`), no redirect (`2>&1`, `>`), no `cd X &&` chain; the permissions refuse anything compound or with a `>` in it, and the commands it needs (`fleet-switchboard review laws <pr>`, `gh pr diff <pr>`, `gh pr view <pr>`, `gh pr checks <pr> --repo <owner/repo>`, `git diff|log|show ...`) print what it needs without them. A reviewer reads the head's check results with `gh pr checks` to judge a claim about behaviour (R-LAW-16); it still never runs, builds or tests anything, and it never opens a browser or watches (`--web`, `-w` and `--watch` are refused). Tell it so when you invoke it.
 
-A mutation or fault-injection run goes through the heavy wrapper (`fleet-switchboard heavy -- ...`) with a time limit and a hard stop of its whole process group, and never runs in the background without one.
-
 Each reviewer:
 - loads the repository's laws and overlay **from the pull request's base commit** with `fleet-switchboard review laws <pr>`, never from your branch (a pull request cannot rewrite the law it is judged by);
 - reads the change and judges it; it **never builds, runs or tests** anything, writes nothing and holds no write command; it has at most 50 turns and answers `verdict: incomplete` rather than ending in silence;
 - **returns its verdict as text** (a `verdict:` block with `head:` and one line per finding).
+
+**For testers and workers who run checks.** An agent that is asked to run a mutation or fault-injection check (a tester or the orchestrator's own worker, never a reviewer, who runs nothing) runs each run through `fleet-switchboard heavy` with a time limit (`heavy -- timeout N <command>`), in its own process group which it stops as a whole when the limit is hit, and never leaves one running in the background. The wrapper also stops a tree that passes its ceiling, but do not rely on that for a mutant that can loop.
 
 **You record what they returned**, one record per reviewer per head: put the returned block in a file (or pipe it) and run
 `fleet-switchboard review record <pr> --reviewer <role> --block <file or ->`. The verdict, the head and the counts are read from the block (a blocking finding that cites no rule counts as a note), and a block for any commit other
