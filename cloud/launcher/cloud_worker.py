@@ -752,8 +752,10 @@ class Launcher:
             info["rid"], info["cost"] = "pod/" + name, self.cost(pod)
             try:
                 raw = self.kube.exec(name, "head", "-c", "%d" % (REPORT_MAX * 4), REPORT_PATH, keep_stdout=True)
-            except CloudError:
-                raise CloudError("no report yet: %s is missing or unreadable in %s" % (REPORT_PATH, worker))
+            except CloudError as e:
+                if "No such file" in str(e) or "cannot open" in str(e):
+                    raise CloudError("no report yet: %s is missing in %s" % (REPORT_PATH, worker))
+                raise
             line = self.kube.scrub(" ".join(raw.split()), limit=REPORT_MAX)
             if not line:
                 raise CloudError("no report yet: %s is empty in %s" % (REPORT_PATH, worker))

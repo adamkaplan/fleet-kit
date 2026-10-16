@@ -144,6 +144,19 @@ class Record(td.Driver):
         self.assertTrue(json.loads(self.read(os.path.join(d, "run.json")))["transcript_truncated"])
         self.assert_record_has_no_secret()
 
+    def test_a_message_over_the_line_limit_is_replaced_by_a_marker_and_the_record_says_cut(self):
+        msgs = messages()
+        msgs[0]["text"] = "x " * 150000
+        with open(self.msgfile, "w") as f:
+            json.dump(msgs, f)
+        p, out = self.run_driver()
+        self.assertEqual(p.returncode, 0, out)
+        d = self.the_record()
+        lines = self.read(os.path.join(d, "transcript.jsonl")).splitlines()
+        self.assertIn("MESSAGE CUT", lines[0])
+        self.assertTrue(json.loads(self.read(os.path.join(d, "run.json")))["transcript_truncated"])
+        self.assertEqual([n for n in os.listdir(d) if n.endswith(".part")], [])
+
     def test_the_default_record_directory_is_beside_the_audit_file(self):
         env = dict(self.denv)
         del env["CW_RUN_RECORD_DIR"]
@@ -186,6 +199,24 @@ class Record(td.Driver):
         self.assertIn("no report yet", err)
         code, out, err = self.run_cli("report", "nobody")
         self.assertEqual(code, cw.EXIT_USAGE)
+
+    def test_s6_a_cluster_error_is_not_called_a_missing_report_and_json_gives_an_object(self):
+        self.create("coder7")
+        self.patch_state(report={self.name: "done\n"})
+        code, out, err = self.run_cli("report", "coder7", "--json")
+        self.assertEqual(json.loads(out)["report"], "done")
+        self.patch_state(fail_cmd="exec")
+        code, out, err = self.run_cli("report", "coder7")
+        self.assertEqual(code, cw.EXIT_CLOUD)
+        self.assertNotIn("no report yet", err)
+        self.assertIn("kubectl", err)
+
+    def test_s6_an_empty_report_file_says_no_report_yet(self):
+        self.create("coder7")
+        self.patch_state(report={self.name: "  \n\n"})
+        code, out, err = self.run_cli("report", "coder7")
+        self.assertEqual(code, cw.EXIT_CLOUD)
+        self.assertIn("no report yet", err)
 
     def test_the_driver_brief_tells_the_worker_where_to_write_its_report(self):
         p, out = self.run_driver()

@@ -36,7 +36,6 @@ import http.client
 import json
 import os
 import re
-import secrets
 import shlex
 import secrets
 import shutil
@@ -317,10 +316,12 @@ class Driver:
             os.path.dirname(env.get("CW_CLOUD_AUDIT") or os.path.join(env.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "cw-cloud", "audit.jsonl")), "runs")
 
     def _write_private(self, name, text):
-        fd = os.open(os.path.join(self.record_dir, name), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        final = os.path.join(self.record_dir, name)
+        part = final + ".part"   # a crash leaves only the .part, never a torn record file
+        fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f:
             f.write(text)
-        os.chmod(os.path.join(self.record_dir, name), 0o600)
+        os.replace(part, final)
 
     def _read_messages(self):
         """The session's messages through a port-forward to the pod's server; (list, None) or (None, why)."""
@@ -392,7 +393,7 @@ class Driver:
                     info["reason"] = why
                 else:
                     cap = int(self.env.get("CW_RECORD_MAX_BYTES") or TRANSCRIPT_CAP)
-                    lines, size, cut = [], 0, False
+                    lines, size, cut, msg_cut = [], 0, False, False
                     tally, turns = {}, 0
                     for m in msgs:
                         names = []
@@ -402,17 +403,21 @@ class Driver:
                             tally[n] = tally.get(n, 0) + 1
                         if isinstance(m, dict) and m.get("type") == "assistant":
                             turns += 1
-                        line = self.kube.scrub(json.dumps(m, sort_keys=True), limit=cw.SCRUB_INPUT_MAX)
-                        if size + len(line) + 1 > cap and not cut:
+                        raw = json.dumps(m, sort_keys=True)
+                        line = self.kube.scrub(raw, limit=cw.SCRUB_INPUT_MAX)
+                        if len(raw) > cw.SCRUB_INPUT_MAX:   # the scrub cuts a longer line: say so on the line itself
+                            line = json.dumps({"truncated": True, "note": "MESSAGE CUT: over %d characters" % cw.SCRUB_INPUT_MAX})
+                            msg_cut = True
+                        if size + len(line.encode()) + 1 > cap and not cut:
                             cut = True
                             lines.append(json.dumps({"truncated": True, "note": "TRANSCRIPT CUT: over %d bytes; the rest is not kept" % cap}))
                         if not cut:
                             lines.append(line)
-                            size += len(line) + 1
+                            size += len(line.encode()) + 1
                     self._write_private("transcript.jsonl", "".join(x + "\n" for x in lines))
                     self._write_private("tally.json", json.dumps({"tool_calls": tally, "turns": turns, "messages": len(msgs)}, sort_keys=True) + "\n")
                     info["transcript"], info["reason"] = "saved", None
-                    info["transcript_truncated"] = cut
+                    info["transcript_truncated"] = cut or msg_cut
             finally:
                 info["head_sha"] = self._head_sha()
         except (OSError, ValueError, cw.CloudError) as e:
