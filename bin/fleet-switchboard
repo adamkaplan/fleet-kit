@@ -21234,6 +21234,21 @@ def _held_class_tokens(tag):
     return tokens
 
 
+def _held_tag_end(line, at):
+    """Index of the `>` that closes the tag opened at `at`, skipping quoted attribute values (a `>` inside quotes does not close it); -1 when it never closes."""
+    i, size = at, len(line)
+    while i < size:
+        c = line[i]
+        if c in "\"'":
+            i = line.find(c, i + 1)
+            if i < 0:
+                return -1
+        elif c == ">":
+            return i
+        i += 1
+    return -1
+
+
 def _held_pre_mermaid(line):
     """True when `line` opens a `<pre>` whose class tokens include `mermaid`, or a `<pre` that is never closed on the line (it cannot be judged, so it
     counts). Each `<pre` is walked to its closing `>` with `find` and the search resumes after it: linear, no window, no backtracking."""
@@ -21242,7 +21257,7 @@ def _held_pre_mermaid(line):
     while at >= 0:
         after = low[at + 4:at + 5]
         if not after.isalpha():
-            end = line.find(">", at)
+            end = _held_tag_end(line, at)
             if end < 0:
                 return True
             if "mermaid" in _held_class_tokens(line[at:end]):

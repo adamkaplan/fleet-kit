@@ -39873,6 +39873,8 @@ class TestHeldTop(DecisionsBase):
             tag = '<pre data-x="%s" class=mermaid>' % ("a" * n)
             found = self.defects(top_with(tag))
             self.assertEqual((self.named(found, "diagram"), len(found)), (1, 1), (n, found))
+        for tag in ('<pre data-x=">" class=mermaid>', "<pre title='a > b' class='mermaid'>"):
+            self.assertEqual(self.named(self.defects(top_with(tag)), "diagram"), 1, tag)
         for tag in ("<pre class='a mermaid b'>", '<PRE CLASS="MERMAID">', "<pre  class = mermaid >"):
             self.assertEqual(self.named(self.defects(top_with(tag)), "diagram"), 1, tag)
         for tag in ('<pre class="code">', "<pre>", "<preview class=mermaid>"):
