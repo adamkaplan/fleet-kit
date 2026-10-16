@@ -479,7 +479,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "chat_clear", "temp_janitor", "load_alert", "spotlight_guard", "excluded_repos", "source_budgets"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "chat_clear", "temp_janitor", "load_alert", "spotlight_guard", "excluded_repos", "source_budgets", "hold_labels"}
 
 
 def config_known_keys():
@@ -617,6 +617,7 @@ def validate_config(raw, source="config"):
     validate_plan_evaluators(config, source)  # #107: who may record a plan scenario's verdict
     validate_plan_gates_config(config, source)  # #107 slice 3a
     validate_plan_review_config(config, source)  # #109 part 2, R2
+    validate_hold_labels_config(config, source)  # #376
     return config
 
 
@@ -649,6 +650,21 @@ def validate_plan_review_config(config, source):
         if out[key] is not None and not isinstance(out[key], str):
             raise ConfigError("%s: 'plan_review.%s' must be text" % (source, key))
     config["plan_review"] = out
+
+
+def validate_hold_labels_config(config, source):
+    """`hold_labels`: per repository, the label the gh shim holds a pull request by (shims/gh_hold.py reads it live from this file). Absent means none."""
+    if config.get("hold_labels") is None:
+        config.pop("hold_labels", None)
+        return
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "shims", "gh_hold.py")
+    spec = importlib.util.spec_from_file_location("gh_hold_check", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    try:
+        module.validate_config(config["hold_labels"])
+    except ValueError as err:
+        raise ConfigError("%s: %s" % (source, err)) from None
 
 
 def validate_plan_gates_config(config, source):
@@ -8521,7 +8537,7 @@ def decision_repos(engine):
     return watched_repos(engine.config, discovered_fleets(engine.discovery))
 
 
-# ---- a batch: related findings raised as ONE decision (one issue, one `decision-rows` block in its body)
+# ---- a batch: related findings raised as ONE decision (one issue, one Markdown section per row in its body)
 
 BATCH_FENCE = decision_core.BATCH_FENCE
 BATCH_ROWS_MAX = decision_core.BATCH_ROWS_MAX            # rows one batch may carry (the panel draws one line or two per row)
@@ -8558,11 +8574,11 @@ def batch_headline(title, count):
 
 
 def batch_body(name, rows):
-    lines = "\n".join("%s | %s | %s" % (r["ref"], r["finding"], r["recommendation"]) for r in rows)
-    return ("Related findings raised as ONE decision (%d rows) by %s. Each row is `<issue> | <finding> | <recommendation>`; "
-            "one answer (`as recommended`, or per-row changes) answers every row. Nothing here changes the row "
-            "issues: the raising orchestrator acts on the answer.\n\n```%s\n%s\n```\n\n%s"
-            % (len(rows), name, BATCH_FENCE, lines, fleet_mark(name)))
+    """The issue body of a batch: a short introduction, then one Markdown section for each row in FULL (see decision_core.batch_row_sections), then the fleet's mark."""
+    return ("Related findings raised as ONE decision (%d rows) by %s. Each section below is one row: the issue, the finding and the recommendation, "
+            "in full. One answer (`as recommended`, or per-row changes) answers every row. Nothing here changes the row "
+            "issues: the raising orchestrator acts on the answer.\n\n%s\n\n%s"
+            % (len(rows), name, decision_core.batch_row_sections(rows), fleet_mark(name)))
 
 
 def decisions_from_github(engine, now):
@@ -10455,6 +10471,12 @@ def publish_decisions(engine):
         impact_would_hold_pass(engine, now)   # #179 L3: audits gate.would_hold from the diff's floor; ADVISORY, writes nothing to GitHub
     except Exception as err:
         engine._note("impact.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+    try:
+        merged_labels = load_module("merged_labels")   # #559: the merge and hold labels of a merged PR come off (fresh read, fleet labels only)
+        merged_labels.run_pass(types.SimpleNamespace(**{n: globals()[n] for n in merged_labels.NEEDS}), engine, now,
+                               ((engine.config.get("impact_hold") or {}).get("calls_per_pass") or IMPACT_PASS_CALLS))   # its own cap of gh reads, the impact hold's setting
+    except Exception as err:
+        engine._note("merged_labels.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
     apply_notice_effects(engine)
     store = decision_store(engine)
     try:
@@ -10847,7 +10869,7 @@ SWEEP_KINDS = {"S6a": "first-line marker without the merge-captain label (our PR
                "S5": "cos-tier decision aged (and not already in the owner's tier)",
                "S7": "decisions that wait for each other (a cycle): none of them can be done first",
                "S8": "a decision waits for an issue that is closed or missing",
-               "S9": "a merge or hold label left on a merged or closed PR"}
+               "S9": "a merge or hold label left on a closed, unmerged PR"}
 SWEEP_WAIT_VERBS = ("held for", "hold for", "waiting on", "waits on", "awaiting", "blocked on", "pending", "needs")
 
 
@@ -11060,7 +11082,7 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
     for record in recent:
         number = _number(record)
         names = {(l.get("name") if isinstance(l, dict) else l) for l in record.get("labels") or []}
-        if number is not None and _is_pr(record) and _label_kind(names, CAPTAIN_MERGE_LABELS[:1] + CAPTAIN_HOLD_LABELS):
+        if number is not None and _is_pr(record) and not _issue_pr_merged(record) and _label_kind(names, CAPTAIN_MERGE_LABELS[:1] + CAPTAIN_HOLD_LABELS):   # #559: a merged PR is the daemon's to clean, never a finding
             closed_holds[number] = sorted(_label_kind(names, CAPTAIN_MERGE_LABELS[:1] + CAPTAIN_HOLD_LABELS))
     comments, cut = hub.read_pages("repos/%s/issues/comments?since=%s&sort=created&direction=desc&per_page=100"
                                    % (repo, since), older=("created_at", since), cap=SWEEP_LIST_PAGES)
@@ -11244,7 +11266,7 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
                 and now - since >= cfg["aged_cos_hours"] * 3600
                 and not (sweep_ref_keys(d, home, repos_known) & human_keys)):   # already the owner's: not stale for cos
             found.add(("S5", d.get("id") or ref_text(*(ref or ("?", 0)))))
-    for repo, picture in state.repos.items():   # S9: a merge or hold label left on a merged or closed PR (read-only: nothing is removed)
+    for repo, picture in state.repos.items():   # S9: a merge or hold label left on a closed, unmerged PR (read-only: nothing is removed; a merged one is the daemon's to clean, #559)
         for number in sorted(picture.get("closed_holds") or {}):
             found.add(("S9", ref_text(repo, number)))
     for group in decision_core.find_cycles(decisions):   # S7: one finding per cycle, named by its first member
@@ -11259,6 +11281,12 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
                 found.add(("S8", target))
     state.unattributed = unattributed
     return sorted(found)
+
+
+def _issue_pr_merged(record):
+    """True when an issue record (the issues API) of a pull request says it was merged: its `pull_request.merged_at` is set (#559)."""
+    pull = record.get("pull_request") if isinstance(record, dict) else None
+    return isinstance(pull, dict) and bool(pull.get("merged_at"))
 
 
 def sweep_verify(engine, state, kind, ref, now, cfg, regex, budget):
@@ -11278,7 +11306,7 @@ def sweep_verify(engine, state, kind, ref, now, cfg, regex, budget):
     if budget[0] < (2 if comments_raised else 1):
         return None
     budget[0] -= 1
-    if kind == "S9":   # still a PR, no longer open, and still carrying a merge or hold label
+    if kind == "S9":   # still a PR, no longer open, not merged, and still carrying a merge or hold label
         try:
             data = hub._read_one(repo, "issues/%d" % number, now, fresh=True)
         except GitHubUnavailable:
@@ -11286,7 +11314,7 @@ def sweep_verify(engine, state, kind, ref, now, cfg, regex, budget):
         if not isinstance(data, dict) or "state" not in data:
             return None
         names = {(l.get("name") if isinstance(l, dict) else l) for l in data.get("labels") or []}
-        return _is_pr(data) and data.get("state") != "open" and bool(_label_kind(names, CAPTAIN_MERGE_LABELS[:1] + CAPTAIN_HOLD_LABELS))
+        return _is_pr(data) and data.get("state") != "open" and not _issue_pr_merged(data) and bool(_label_kind(names, CAPTAIN_MERGE_LABELS[:1] + CAPTAIN_HOLD_LABELS))
     if kind == "S8":   # a decision waits for this issue: it still holds when the issue is closed, or is not there at all
         try:
             data = hub._read_one(repo, "issues/%d" % number, now, fresh=True)
@@ -18540,7 +18568,15 @@ def apply_impact_hold(engine, repo, number, report, record):
     bin/clear_carry.py). Returns the number of gh calls spent. The labels are ensured once per repo per process."""
     carry = impact_carry_decision(engine, repo, number, report["head"])   # reads GitHub: before, and outside, the lock
     with impact_state_lock(engine.state_dir):   # the clear check, the label write and the record are ONE step against an owner clear
-        return _apply_impact_hold_locked(engine, repo, number, report, record, carry)
+        spent = _apply_impact_hold_locked(engine, repo, number, report, record, carry)
+    if carry is not None and carry.get("carried"):   # told once the carry is RECORDED, outside the lock (a send is slow)
+        try:
+            recorded = read_impact_state(engine.state_dir)[0].get("carried", {}).get("%s#%d" % (repo, number)) or {}
+            if recorded.get("head") == report["head"]:
+                notify_clear(engine, "carry", repo, number, report["head"], previous=carry["from"], body=(record or {}).get("body"))
+        except Exception as err:   # the carry is recorded: nothing here may fail the pass
+            engine._note("gate.clear_notify_failed", "%s#%d" % (repo, number), {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
+    return spent
 
 
 def _consume_record(state, pr, clear=None):
@@ -18692,6 +18728,126 @@ def neutralise_marker(engine, runner, repo, number, head, first=None):
         return failed(err)
 
 
+CLEAR_NOTIFIED_FILE = "clear-notified.json"
+CLEAR_NOTIFIED_MAX = 400
+_PLAN_ISSUE_RE = re.compile(r"github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(?:issues|pull)/([0-9]+)")
+
+
+def clear_lane(engine, repo, number, body):
+    """(lane, how): the orchestrator that merges the pull request, or (None, None) when it cannot be told (never a guess). In order: the agent that recorded the pull request's notice (or, when
+    that is a worker, its boss; or the boss the notice recorded), then the `PLAN:` link of the body up to the charter that owns the ask. Only a running orchestrator counts."""
+    discovery = engine.discover(engine.now())
+    agents = discovery.agents
+    item = next((i for i in read_pr_notices(engine.state_dir) if i["repo"] == repo and i["number"] == number), None) if engine.state_dir is not None else None
+    if item:
+        for name in notice_senders(item)[::-1] + ([item["boss"]] if isinstance(item.get("boss"), str) else []):
+            agent = agents.get(name)
+            if agent is None:
+                continue
+            lane = name if _is_orchestrator(agent) else boss_name(discovery, agent)
+            if lane in agents and _is_orchestrator(agents[lane]):
+                return lane, "the notice"
+    found = PLAN_LINE_RE.search(body or "")
+    link = _PLAN_ISSUE_RE.search(found.group(1)) if found else None
+    reader = getattr(engine, "intents", None)
+    if link and link.group(1) == repo and reader is not None:
+        chain, current = [int(link.group(2))], int(link.group(2))
+        try:
+            for _ in range(3):
+                current = reader.parent(current, repo)
+                if current is None:
+                    break
+                chain.append(current)
+        except IntentError:
+            pass   # the chain so far is all that can be told
+        owner = pick_owner(agents, chain, repo, engine.config.get("intent_repo") if len(getattr(engine, "watches", ()) or ()) > 1 else None)
+        if owner and _is_orchestrator(agents[owner]):
+            return owner, "the PLAN link"
+    return None, None
+
+
+def _notify_clear_body(engine, abandoned, kind, repo, number, head, reason=None, body=None, previous=None):
+    """(the work of `notify_clear`, run on its own thread; `abandoned` is set when the caller gave up waiting: then nothing more is audited) #541: tell the Chief of Staff, and the orchestrator whose lane merges the pull request, at once that the owner cleared it (`kind` "clear": his command or his words in the chat, called
+    ONCE from `impact_clear_core`) or that his clear carried to a new head (`kind` "carry": from `previous`, called once from the carry decision). One line. Once per pull request, head and kind (a
+    small private file). The caller has already RECORDED the clear; nothing here can undo it: a failure is audited and swallowed. An unknown lane says `lane unknown` and only the Chief of Staff is told:
+    nobody is guessed. Returns the audit detail it wrote, or None when nothing was sent."""
+    pr = "%s#%d" % (repo, number)
+    try:
+        if engine.state_dir is None or engine.audit is None:
+            return None
+        key = "%s@%s:%s" % (pr, head, kind)
+        with impact_state_lock(engine.state_dir):   # the command and the daemon are two processes: the check and the mark are one step (the send is outside it)
+            seen = _read_small(engine.state_dir, CLEAR_NOTIFIED_FILE)
+            if key in seen:
+                return None
+            seen[key] = {"at": int(engine.now())}
+            if len(seen) > CLEAR_NOTIFIED_MAX:
+                for old in sorted(seen, key=lambda k: seen[k].get("at", 0))[:len(seen) - CLEAR_NOTIFIED_MAX]:
+                    del seen[old]
+            _write_small(engine.state_dir, CLEAR_NOTIFIED_FILE, seen)   # before the send: at most once, even when the send fails
+        lane, how = clear_lane(engine, repo, number, body)
+        if kind == "carry":
+            line = "owner's clear carried %s from %s to %s; %s" % (pr, (previous or "?")[:8], head[:8], "%s merges it" % lane if lane else "lane unknown")
+        else:
+            flat = re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", re.sub(r"[\n\r\t]", " ", reason or ""))   # line breaks become spaces, other control characters vanish BEFORE the redaction: a token cannot hide behind one
+            words = " ".join(redact_command_text(flat).split())
+            line = "owner cleared %s at %s: \"%s\"; %s" % (pr, head[:8], plan_ledger.clip(words, 300), "%s merges it" % lane if lane else "lane unknown")
+        sent, failed = [], []
+        for name in ["chief-of-staff"] + ([lane] if lane else []):
+            try:
+                outcome = engine.send("switchboard", name, line)
+                if isinstance(outcome, dict) and outcome.get("sent") is False:
+                    failed.append("%s: %s" % (name, _one_line(str(outcome.get("reason") or outcome.get("action") or "not delivered"), 100)))
+                else:
+                    sent.append(name)
+            except Exception as err:   # a send that fails never undoes the clear
+                failed.append("%s: %s" % (name, _one_line(str(err), 100)))
+        detail = {"head": head, "kind": kind, "lane": lane, "lane_from": how, "sent": sent}
+        if failed:
+            detail["failed"] = failed
+        if not abandoned.is_set():
+            engine.audit.append(engine.actor, "gate.clear_notified" if sent else "gate.clear_notify_failed", pr, detail)
+        return detail
+    except BaseException as err:   # on this thread nothing may escape, an exit or an interrupt inside a send included
+        try:
+            if not abandoned.is_set():
+                engine.audit.append(engine.actor, "gate.clear_notify_failed", pr, {"head": head, "kind": kind, "error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
+        except Exception:
+            pass
+        return None
+
+
+NOTIFY_CLEAR_DEADLINE_SECONDS = 2.0   # the most a clear waits for its notice
+
+
+def notify_clear(engine, kind, repo, number, head, reason=None, body=None, previous=None):
+    """#541: the notice of an owner clear (or of a carry), LAST, after everything else of it is done and bounded by a deadline: the work (lane lookup, sends) runs on its own thread and the
+    caller waits at most NOTIFY_CLEAR_DEADLINE_SECONDS. On a timeout, an interrupt or an exception it gives up, audits `gate.clear_notify_failed` once with the reason, and returns None: the clear's
+    result, exit status and output are exactly as without a notice. (A send still running when it gives up is left to finish on its daemon thread; it audits nothing more.)"""
+    pr = "%s#%d" % (repo, number)
+    abandoned, result = threading.Event(), []
+
+    def work():
+        result.append(_notify_clear_body(engine, abandoned, kind, repo, number, head, reason, body, previous))
+    worker = threading.Thread(target=work, name="clear-notice", daemon=True)
+    why = None
+    try:
+        worker.start()
+        worker.join(NOTIFY_CLEAR_DEADLINE_SECONDS)
+        if worker.is_alive():
+            why = "timed out after %gs" % NOTIFY_CLEAR_DEADLINE_SECONDS
+    except BaseException as err:   # an interrupt while waiting: the clear is already complete
+        why = "interrupted (%s)" % type(err).__name__
+    if why is None:
+        return result[0] if result else None
+    abandoned.set()
+    try:
+        engine.audit.append(engine.actor, "gate.clear_notify_failed", pr, {"head": head, "kind": kind, "error": "notice not sent: " + why})
+    except BaseException:
+        pass
+    return None
+
+
 def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, head=None, via=None, verify=None):
     """The owner's clear: record it head-bound (the daemon does not re-add the hold for that head) and remove `hold-impact`, and
     `merge-captain` too when the switchboard itself added it for this hold. Returns the lines to print.
@@ -18746,7 +18902,9 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
         if fingerprint is not None:
             detail["fingerprint"] = fingerprint
         engine.audit.append(engine.actor, "gate.hold_cleared", pr, detail)   # inside the lock
-    return ["cleared the impact hold of %s at %s: removed %s; the daemon will not re-add it for this head" % (pr, head_now[:8], ", ".join(remove))] + neutralise_marker(engine, runner, repo, number, head_now, raw)
+    lines = ["cleared the impact hold of %s at %s: removed %s; the daemon will not re-add it for this head" % (pr, head_now[:8], ", ".join(remove))] + neutralise_marker(engine, runner, repo, number, head_now, raw)
+    notify_clear(engine, "clear", repo, number, head_now, reason=reason, body=raw.get("body"))   # LAST: the state, the labels, the marker line and the audit are all done; it can neither delay nor alter them
+    return lines
 
 
 def cmd_impact_clear(args, runner, now):
@@ -24529,6 +24687,16 @@ def validate_load_alert_config(config, source):
         raise ConfigError(str(err)) from None
 
 
+def coder_finished(obs, retired, last_reports):
+    """True for a coder that is on the books but done: on the retired list (the same name and session, as the pane check reads it), or whose
+    last report was a final `done` or `failed` (a later `working` report replaces it, so a coder given new work counts again)."""
+    name = obs.name
+    entry = retired.get(name)
+    if isinstance(entry, dict) and entry.get("session") in (None, obs.session_id):
+        return True
+    return (last_reports.get(name) or {}).get("state") in ("done", "failed")
+
+
 def load_tick(engine, discovery):
     """The end of a pass: the load figures per orchestrator, and the alert to the Chief of Staff when a threshold is crossed. Reads no v2 and
     makes at most a bounded number of GitHub reads an hour; a source it cannot read means no wake. Returns what was sent."""
@@ -24537,12 +24705,14 @@ def load_tick(engine, discovery):
     health, now = load_fleet_health(), engine.now()
     cfg = engine.config.get("load_alert") or dict(health.DEFAULTS)
     reminders = read_reminders(engine.state_dir)
+    retired, last_reports = read_retired(engine.state_dir), _read_small(engine.state_dir, LAST_REPORT_FILE)
     orchestrators = {}
     for name, seen in sorted(discovery.agents.items()):
         fleet = seen.fleet or {}
         if fleet.get("role") != "orchestrator":
             continue
-        coders = [o for o in discovery.agents.values() if (o.fleet or {}).get("reports_to") == name and (o.fleet or {}).get("role") == "coder"]
+        coders = [o for o in discovery.agents.values() if (o.fleet or {}).get("reports_to") == name and (o.fleet or {}).get("role") == "coder"
+                  and not coder_finished(o, retired, last_reports)]   # a retired coder, or one that made its final report, is on the books but not a coder of this workspace
         orchestrators[name] = {"charter": fleet.get("charter") if _is_issue_number(fleet.get("charter")) else None,   # a fallback: the charter is found by the yaml that names the agent
                                "repo": _fleet_repo(fleet, engine.config) or (engine.intents.repo if engine.intents is not None else None),
                                "busy": sum(1 for c in coders if c.status == "working"), "idle": sum(1 for c in coders if c.status == "idle"),
@@ -27382,15 +27552,22 @@ def read_batch_rows(args):
     lines.extend(line for line in more if line.strip())
     if not lines:
         raise BatchError("a batch needs rows: --row \"<repo#N> | <finding> | <recommendation>\" (repeat it), or --file")
-    if len(lines) > BATCH_ROWS_MAX:
+    if len(lines) > decision_core.BATCH_RAISE_ROWS_MAX:
         raise BatchError("a batch is at most %d rows (this one is %d): raise the rest as a second batch"
-                         % (BATCH_ROWS_MAX, len(lines)))
-    return [parse_batch_row(line) for line in lines]
+                         % (decision_core.BATCH_RAISE_ROWS_MAX, len(lines)))
+    rows = [parse_batch_row(line) for line in lines]   # the FULL text: it is cut only when a list or the panel draws it
+    for number, row in enumerate(rows, 1):
+        for part, text, cap in (("finding", row["finding"], decision_core.BATCH_FINDING_RAISE_MAX),
+                                ("recommendation", row["recommendation"], decision_core.BATCH_REC_RAISE_MAX)):
+            if len(text) > cap:
+                raise BatchError("the %s of row %d is %d characters: it is at most %d; shorten it or split the row, nothing was raised"
+                                 % (part, number, len(text), cap))
+    return rows
 
 
 def cmd_decision_batch(args, runner, now):
     """`decisions batch`: an orchestrator raises related findings as ONE issue in ITS OWN repo, labelled for the
-    Chief of Staff, with the rows in a fenced `decision-rows` block. Creates nothing anywhere else."""
+    Chief of Staff, with the rows as Markdown sections. Creates nothing anywhere else."""
     try:
         engine, _, config = build_engine(runner, now, "cli")
         name, role, fleet = orders_caller(engine, args)
@@ -27410,10 +27587,14 @@ def cmd_decision_batch(args, runner, now):
                 raise BatchError("row %r names an issue outside %s: a batch holds only issues of its own repo, so a "
                                  "finding about a private repo can never land in a public one's batch. Raise it from "
                                  "that repo's orchestrator" % (_one_line(row["ref"], 60), repo))
+        body = batch_body(name, rows)
+        if len(body) > decision_core.BATCH_BODY_MAX_CHARS:
+            raise BatchError("the batch is %d characters: the issue body is at most %d (GitHub's limit is 65536); raise the rest as a second batch, nothing was raised"
+                             % (len(body), decision_core.BATCH_BODY_MAX_CHARS))
         subject = "issue:%s" % repo
         with engine._external("decisions.batch", subject, {"repo": repo, "rows": len(rows), "by": name}):
             done = _gh_write(engine, runner, repo, "repos/%s/issues" % repo, "POST",
-                             {"title": title, "body": batch_body(name, rows),
+                             {"title": title, "body": body,
                               "labels": [awaiting_cos_label(config)]})
         try:
             made = json.loads(done.stdout or "")
@@ -27461,6 +27642,19 @@ def batch_answer_rows(decision, args):
     return out
 
 
+def batch_answer_lines(outcomes, note):
+    """The lines of the comment that records a batch answer (the one place its format is built, so a test measures what is posted)."""
+    changed = sum(1 for _, _, c in outcomes if c)
+    lines = ["Answer to this batch (%d rows): %s." % (len(outcomes), "as recommended" if not changed else
+                                                      "%d row%s changed, the rest as recommended"
+                                                      % (changed, "" if changed == 1 else "s"))]
+    lines += ["%d. %s: %s" % (n, row["ref"], text) for n, (row, text, _) in enumerate(outcomes, 1)]
+    if note:
+        lines.append("Note: %s" % _one_line(note, 300))
+    lines.append("The row issues were not changed by this answer: the orchestrator that raised the batch acts on it.")
+    return lines
+
+
 def answer_batch(engine, runner, decision, args, name):
     """First the note to the orchestrator that raised the batch; only once it is delivered, ONE comment on the batch
     issue recording every row's outcome, then both awaiting labels off it, so the batch and all its rows leave the
@@ -27475,13 +27669,12 @@ def answer_batch(engine, runner, decision, args, name):
     repo, number = target
     outcomes = batch_answer_rows(decision, args)
     changed = sum(1 for _, _, c in outcomes if c)
-    lines = ["Answer to this batch (%d rows): %s." % (len(outcomes), "as recommended" if not changed else
-                                                      "%d row%s changed, the rest as recommended"
-                                                      % (changed, "" if changed == 1 else "s"))]
-    lines += ["%d. %s: %s" % (n, row["ref"], text) for n, (row, text, _) in enumerate(outcomes, 1)]
-    if args.note:
-        lines.append("Note: %s" % _one_line(args.note, 300))
-    lines.append("The row issues were not changed by this answer: the orchestrator that raised the batch acts on it.")
+    lines = batch_answer_lines(outcomes, args.note)
+    size = len("\n".join(lines))
+    if size > decision_core.BATCH_COMMENT_MAX_CHARS:   # before ANY side effect (the note, the comment, the labels): refused whole, nothing sent or written
+        raise DecisionError("%s was not answered: the answer comment would be %d characters and a comment holds at most %d (the rows' recommendations are long); "
+                            "nothing was sent or written. Shorten the --row choices or the --note, or answer from the issue itself"
+                            % (ident, size, decision_core.BATCH_COMMENT_MAX_CHARS))
     told = ""
     raised = decision.get("raised_by")
     if raised and name:

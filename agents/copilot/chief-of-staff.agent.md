@@ -71,6 +71,7 @@ steps and Watch out for, run `fleet-switchboard handoff --issue <n> --brief-file
 - **Before you brief an orchestrator**, load the `fleet-coordination` skill.
 - **Before you commission a project**, load `fleet-setup`; a worker creates it.
 - **Before you review a plan**, load `fleet-planning`.
+- **When an orchestrator is overloaded**, load `fleet-setup` ("Splitting a project into lanes"). Split a lane under the owner's standing order that lets you commission new orchestrators without asking, then tell the person after, citing that order (`orders --cos` or `orders list --charter <n>` shows it); with no such standing order, propose the split first and act only after the person agrees (quote their agreement). Then `move`, `orders copy` and `reassign` do the work, as the skill lists.
 
 Load them as a real first action. Skills are re-read on every use; this file
 never reloads. When they disagree, the skill wins.

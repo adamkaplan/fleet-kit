@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""fleet-token-mint: mint a short-lived GitHub token inside the pod, at start and on demand.
+"""cw-token-mint: mint a short-lived GitHub token inside the pod, at start and on demand.
 
-POSTs to FLEET_TOKEN_ENDPOINT, authenticated by the pod's federated identity token (a projected file the
+POSTs to CW_TOKEN_ENDPOINT, authenticated by the pod's federated identity token (a projected file the
 platform rotates), and writes the token to a tmpfs file (mode 0600). A reply that lives longer than 60 minutes
 is refused. The token is never printed and never placed in the environment.
 """
@@ -14,7 +14,7 @@ import datetime as dt
 
 MAX_SECONDS = 3600
 IDENTITY_FILE = "/var/run/secrets/azure/tokens/azure-identity-token"
-OUT_FILE = "/run/fleet-tmp/github-token"
+OUT_FILE = "/run/cw-tmp/github-token"
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -62,10 +62,10 @@ def mint(endpoint, identity_file=IDENTITY_FILE, out_file=OUT_FILE, now=None, ope
 
 def main():
     try:
-        print("token minted, lives %d seconds" % mint(os.environ["FLEET_TOKEN_ENDPOINT"]))
+        print("token minted, lives %d seconds" % mint(os.environ["CW_TOKEN_ENDPOINT"]))
         return 0
     except (KeyError, ValueError, TypeError, OSError) as e:
-        print("fleet-token-mint: %s" % e, file=sys.stderr)
+        print("cw-token-mint: %s" % e, file=sys.stderr)
         return 1
 
 

@@ -147,6 +147,17 @@
       "authority": [
         "bin/plan_ledger.py",
         "bin/impact_floor.py",
+        "bin/chat_clear.py",
+        "bin/clear_carry.py",
+        "bin/reassign.py",
+        "bin/launch_testers.py",
+        "bin/plan_review.py",
+        "bin/decision_core.py",
+        "bin/lanes.py",
+        "bin/orders_copy.py",
+        "bin/charter_check.py",
+        "bin/cloud_worker.py",
+        "bin/external_adapter.py",
         "docs/review-laws/impact-matrix.json",
         "plugins/fleet-hooks/**",
         "tools/cos-permissions-proof/**",
@@ -176,6 +187,17 @@
           "tools/cos-permissions-proof/**",
           "bin/plan_ledger.py",
           "bin/impact_floor.py",
+          "bin/chat_clear.py",
+          "bin/clear_carry.py",
+          "bin/reassign.py",
+          "bin/launch_testers.py",
+          "bin/plan_review.py",
+          "bin/decision_core.py",
+          "bin/lanes.py",
+          "bin/orders_copy.py",
+          "bin/charter_check.py",
+          "bin/cloud_worker.py",
+          "bin/external_adapter.py",
           "docs/review-laws/impact-matrix.json"
         ],
         "exclude": [
@@ -197,6 +219,63 @@
       ".github/workflows/**",
       "bin/switchboard-trial"
     ],
+    "authority_modules": {
+      "meaning": "Every module in bin/ that defines a function whose name has a word of `vocabulary` (names split at underscores) decides who may clear, hold, release, carry, consent to, record a verdict for or merge something, so it must be a top tier path above or be named in `exempt` with the reason it is not. A test reads this block and fails, naming the module, when a module is neither. The vocabulary is data: adding a word here widens the guard with no code change. A SECOND rule does not look at names: a module with a comparison (==, !=, in, not in) against one of the `role_literals` (the role names the fleet checks a caller by) decides who may act, so it must be listed or exempted too; a renamed function cannot hide it. When in doubt, LIST: an exemption needs a reason a reviewer can verify. `limits` says what the guard cannot see.",
+      "vocabulary": [
+        "clear",
+        "clearing",
+        "hold",
+        "holds",
+        "release",
+        "carry",
+        "consent",
+        "verdict",
+        "authority",
+        "owner",
+        "gate",
+        "gates",
+        "approve",
+        "approved",
+        "allow",
+        "allowed",
+        "allows",
+        "may",
+        "merge",
+        "merged",
+        "waive",
+        "waiver",
+        "grant",
+        "permit",
+        "authorize",
+        "revoke",
+        "deny",
+        "decide",
+        "caller",
+        "role",
+        "refuse",
+        "refused",
+        "refusal",
+        "chief",
+        "operator",
+        "person",
+        "only"
+      ],
+      "exempt": {
+        "bin/spotlight_guard.py": "holds_files tells whether a folder holds an entry. Trace: used only inside bin/spotlight_guard.py (the Spotlight index check of ask #438); the module returns no role, tier, identity, verdict or clear, and nothing in bin/ reads its result as one.",
+        "bin/triage_digest.py": "gate is a rate limit on the stale digest (warm-up and interval). Trace: its only caller is the triage digest in bin/fleet-switchboard, where `allowed` decides whether a digest message is SENT now; no role, tier, verdict or clear is produced or read.",
+        "bin/triage_plan_open.py": "merged_links reads which links a merged unit names. Trace: its callers are the triage's plan-open check in bin/fleet-switchboard, which only lists findings for people to read; nothing it returns reaches answer_authority, a caller check, a verdict or a clear."
+      },
+      "role_literals": [
+        "chief-of-staff",
+        "operator",
+        "orchestrator"
+      ],
+      "limits": [
+        "The guard reads function NAMES (underscore-separated words) and COMPARISONS (==, !=, in, not in) against the role literals, in the .py files of bin/ only.",
+        "It cannot see: a role held in a constant or variable and compared by that name; a check written with startswith, endswith, a regular expression, match/case or a dictionary lookup; a literal built at run time; code that is not a .py file in bin/ (bin/fleet-switchboard, scripts, shims, plugins, agents); a value that is PRODUCED by an unlisted module and later read by an authority function (a producer trace is the reviewer's).",
+        "The fallback: the strict review (the independent reviewer) looks for exactly these, as R-LAW-12 and the owner-hold rule say, and an exemption must carry a trace of where its values go. When in doubt, LIST."
+      ]
+    },
     "note": "top_tier_outside_floor lists the top tier paths that are deliberately not in the floor globs (the floor excludes agent definitions, which are captain pull requests); a test checks that every other top tier path is inside the floor. bin/fleet-switchboard selects accounts and mints tokens but is not a top tier path (it would hold nearly every change): a change there to credentials or identity must be rated with that class by the independent review."
   }
 }

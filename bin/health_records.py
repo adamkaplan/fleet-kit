@@ -5,6 +5,8 @@ request, and nothing holds text: only agent/session names and numbers.
 It publishes ONE derived file, `health-records.json` (written by the daemon through `state_write`: 0600, renamed into place, capped at FILE_CAP bytes), which the health reader merges:
 
     {"version": 1, "written_at": <s>,
+     "steps":       {"<session>": {"per_minute": [15 ints, oldest first], "approx": true}},            # steps ended per minute, from the events the daemon already receives:
+                                                                                                    # the activity series for a session the counter plugin does not cover (no restart needed)
      "tool_calls":  {"<session>": {"per_minute": [15 ints, oldest first], "approx": true}},           # absent key = not recorded
      "usage":       {"<session>": {"hours": {"<hour epoch>": {"tokens": n, "cost": x, "messages": n}},
                                    "context": {"tokens": n, "limit": n|absent, "percent": x|absent, "at": s}, "partial": true}},
@@ -131,6 +133,7 @@ class Recorder:
         self.context = {}       # session -> {"tokens", "limit", "at"}
         self.heads = {}         # "owner/repo#N" -> last head sha
         self.pushes = {}        # "owner/repo" -> {hour: n}
+        self.steps = {}         # session -> {minute epoch: steps ended}: the activity series that needs no plugin and no restart
         self.dirty = False
         self.lock = threading.Lock()   # the feed's thread ingests messages while the pass thread builds the body
 
@@ -158,6 +161,10 @@ class Recorder:
         at = (stamp / 1000.0 if stamp > 1e11 else stamp) if _num(stamp) else now   # v2 times are milliseconds
         if at > now + 3600 or at < now - HOUR_KEEP * 3600:
             at = now
+        minute = int(at // 60)
+        if minute > int(now // 60) - TOOL_WINDOW:
+            per = self.steps.setdefault(name, {})
+            per[minute] = per.get(minute, 0) + 1
         bucket = self.hours.setdefault(name, {}).setdefault(_hour(at), [0, 0.0, 0, 0])
         bucket[0] += tokens or 0
         bucket[1] += cost or 0.0
@@ -212,7 +219,12 @@ class Recorder:
                 table[key] = {h: v for h, v in table[key].items() if h >= oldest}
                 if not table[key]:
                     del table[key]
-        for table in (self.hours, self.context):
+        for per in self.steps.values():
+            for minute in [m for m in per if m <= int(now // 60) - TOOL_WINDOW]:
+                del per[minute]
+        for session in [s for s, per in self.steps.items() if not per]:
+            del self.steps[session]
+        for table in (self.hours, self.context, self.steps):
             for key in sorted(table, key=self._last)[: max(0, len(table) - MAX_AGENTS)]:
                 del table[key]
         usage = {}
@@ -229,6 +241,7 @@ class Recorder:
         out = {"version": VERSION, "written_at": int(now),
                "tool_calls": {s: {"per_minute": v, "approx": True} for s, v in series.items()},
                "usage": usage,
+               "steps": {s: {"per_minute": [per.get(int(now // 60) - TOOL_WINDOW + 1 + i, 0) for i in range(TOOL_WINDOW)], "approx": True} for s, per in self.steps.items()},
                "sources": {"tool_calls": tool_state(tool_body, now), "usage": ("events" if self.hours else "off: v2_light") if light else "on"},
                "pushes_watched": sorted({n for n in (_name(r) for r in list(watched)[:MAX_AGENTS]) if n}),
                "pushes": {r: {str(h): n for h, n in sorted(v.items())} for r, v in self.pushes.items()}}

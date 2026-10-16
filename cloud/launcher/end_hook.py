@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""fleet-end-hook: runs inside the pod before anything is deleted (contract section 5).
+"""cw-end-hook: runs inside the pod before anything is deleted (contract section 5).
 
 Commits uncommitted work to a WIP commit (secret-looking files left out and reported), pushes HEAD to
 <worker>/wip when it is on no remote branch, and prints one JSON line: {pushed, wip_branch, skipped, error}.
@@ -36,7 +36,7 @@ def run(workdir, worker):
         if keep:
             git(workdir, "add", "-A", "--", *keep)
             if git(workdir, "diff", "--cached", "--quiet", check=False).returncode != 0:
-                git(workdir, "-c", "user.name=fleet-worker", "-c", "user.email=fleet-worker@invalid",
+                git(workdir, "-c", "user.name=cw-worker", "-c", "user.email=cw-worker@invalid",
                     "commit", "-m", "WIP: work in progress saved by %s at the end of the worker" % worker)
     git(workdir, "fetch", "--prune", "origin")  # refs must be current: a stale one could call unpushed work safe
     contained = git(workdir, "branch", "-r", "--contains", "HEAD").stdout.strip()
@@ -48,9 +48,9 @@ def run(workdir, worker):
 
 
 def main():
-    workdir, worker = os.environ.get("FLEET_WORKDIR", "/work/repo"), os.environ.get("FLEET_WORKER", "")
+    workdir, worker = os.environ.get("CW_WORKDIR", "/work/repo"), os.environ.get("CW_WORKER", "")
     if not worker:
-        print(json.dumps({"pushed": False, "wip_branch": None, "error": "FLEET_WORKER is not set"}))
+        print(json.dumps({"pushed": False, "wip_branch": None, "error": "CW_WORKER is not set"}))
         return 1
     try:
         print(json.dumps(run(workdir, worker)))

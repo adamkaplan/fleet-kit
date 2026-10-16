@@ -395,6 +395,41 @@ class Hooks(unittest.TestCase):
         self.assertEqual(engine.health.context["ses_feed"]["tokens"], 70)
 
 
+class StepActivity(unittest.TestCase):
+    """The activity series from the step events the daemon already receives: needs no plugin and no restart of any session."""
+
+    def test_steps_per_minute_from_step_events(self):
+        rec = hr.Recorder(lambda: NOW)
+        rec.ingest_message("ses_o", msg("m1", 10, 0.1, created=NOW - 5))
+        rec.ingest_message("ses_o", msg("m2", 10, 0.1, created=NOW - 10))
+        rec.ingest_message("ses_o", msg("m3", 10, 0.1, created=NOW - 125))
+        rec.ingest_message("ses_o", msg("m1", 10, 0.1, created=NOW - 5))   # the same message again is not a second step
+        got = rec.body(None)["steps"]["ses_o"]
+        self.assertTrue(got["approx"])
+        self.assertEqual(len(got["per_minute"]), 15)
+        self.assertEqual(got["per_minute"][-1], 0)                 # NOW is on a minute boundary: the two newest steps are in the minute before
+        self.assertEqual(got["per_minute"][-2], 2)
+        self.assertEqual(got["per_minute"][-4], 1)
+        self.assertEqual(sum(got["per_minute"]), 3)
+
+    def test_old_steps_age_out_and_a_session_with_none_is_absent(self):
+        clock = [NOW]
+        rec = hr.Recorder(lambda: clock[0])
+        rec.ingest_message("ses_o", msg("m1", 10, 0.1, created=NOW))
+        clock[0] = NOW + 20 * 60
+        self.assertEqual(rec.body(None)["steps"], {})
+
+
+class StepBounds(unittest.TestCase):
+    def test_a_step_older_than_the_window_is_not_kept_and_sessions_are_capped(self):
+        rec = hr.Recorder(lambda: NOW)
+        rec.ingest_message("ses_old", msg("o1", 10, 0.1, created=NOW - 20 * 60))
+        self.assertEqual(rec.body(None)["steps"], {})
+        for i in range(hr.MAX_AGENTS + 5):
+            rec.ingest_message("ses_%d" % i, msg("m%d" % i, 10, 0.1, created=NOW - 5))
+        self.assertEqual(len(rec.body(None)["steps"]), hr.MAX_AGENTS)
+
+
 class StateDirRule(unittest.TestCase):
     """The plugin (plugins/fleet-hooks `stateDirOf`) and the daemon (`state_dir_path`) must name the same directory."""
 

@@ -1,0 +1,395 @@
+#!/usr/bin/env bash
+# Tests for cloud/: manifests parse and dry-run, the containerd fix rewrites the legacy
+# stanza (and is idempotent), and the secret scan finds a planted secret and passes clean.
+set -u
+here=$(cd "$(dirname "$0")/.." && pwd); fail=0
+ok() { echo "ok   $1"; }; bad() { echo "FAIL $1"; fail=1; }
+
+# 1. manifests
+if command -v kubectl >/dev/null; then
+  # `apply --dry-run=client` needs a reachable API server for discovery; with none, fall back to an
+  # offline parse (`label --local`) so the check still runs with no cluster.
+  for f in "$here"/k8s/*.yaml; do
+    if kubectl apply --dry-run=client --validate=false -f "$f" -o name >/dev/null 2>&1; then ok "apply --dry-run=client $(basename "$f")"
+    elif KUBECONFIG=/dev/null kubectl label --local --dry-run=client -f "$f" x=y -o name >/dev/null 2>&1; then ok "offline parse $(basename "$f")"
+    else bad "manifest $(basename "$f")"; fi
+  done
+else echo "skip kubectl not installed"; fi
+
+# 2. the fix script's rewrite, on a legacy-keyed config
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+cat > "$tmp/config.toml" <<'T'
+version = 3
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc]
+  runtime_type = 'io.containerd.runc.v2'
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.sysbox-runc]
+  runtime_type = "io.containerd.runc.v2"
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.sysbox-runc.options]
+  BinaryName = "/usr/bin/sysbox-runc"
+T
+# run the manifest's own fix.sh against a temp config, with stubbed host and label commands
+sed -n '/^  fix.sh: |$/,/^---$/p' "$here/k8s/containerd-fix.yaml" | sed '1d;$d' | sed 's/^    //' > "$tmp/fix.sh"
+cat > "$tmp/host" <<'H'
+#!/bin/sh
+echo "$@" >> "$TMP_LOG"
+case "$1 $2" in
+  "containerd config") [ "${DUMP_OK:-1}" = 1 ] || exit 1; cat "$CFG" ;;
+  "systemctl restart")
+    n=$(grep -c 'systemctl restart containerd' "$TMP_LOG")
+    for k in ${RESTART_FAIL_ON:-}; do [ "$k" = "$n" ] && exit 1; done
+    [ "${KILL_BAK:-0}" = 1 ] && [ "$n" = 1 ] && rm -f "$CFG.sysbox-fix.bak"
+    exit 0 ;;
+  "timeout 10")
+    [ "${CTR_DOWN:-0}" = 1 ] && exit 1
+    [ "${SLOW_PROBE:-0}" -gt 0 ] && [ "$(grep -c 'systemctl restart containerd' "$TMP_LOG")" = 1 ] && { sleep "$SLOW_PROBE"; exit 1; }
+    # ctr version: fails while DOWN_UNTIL probes have not yet been made after a restart (DOWN_UNTIL=999: never answers)
+    if [ "$(grep -c 'systemctl restart containerd' "$TMP_LOG")" = 1 ]; then
+      [ "$(grep -c 'ctr version' "$TMP_LOG")" -le "${DOWN_UNTIL:-0}" ] && exit 1
+    fi
+    exit 0 ;;
+esac
+H
+printf '#!/bin/sh
+echo label >> "$TMP_LOG"
+' > "$tmp/label"; chmod +x "$tmp/host" "$tmp/label"
+printf '#!/bin/sh\nexit 0\n' > "$tmp/ready"; chmod +x "$tmp/ready"
+runfix() { : > "$tmp/log"; READY_CMD="${READY_CMD:-$tmp/ready}" TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/host" LABEL_CMD="$tmp/label" ONCE=1 sh "$tmp/fix.sh" >/dev/null 2>&1; }
+restarts() { grep -c 'systemctl restart containerd' "$tmp/log" || true; }
+
+runfix; rc=$?
+[ $rc = 0 ] && ! grep -q "grpc.v1.cri" "$tmp/config.toml" && [ "$(restarts)" = 1 ] && grep -q label "$tmp/log" \
+  && ok "fix: legacy stanza moved, containerd restarted once, node labelled" || bad "fix: legacy stanza (rc=$rc)"
+cp "$tmp/config.toml" "$tmp/after1"
+runfix; rc=$?
+[ $rc = 0 ] && cmp -s "$tmp/after1" "$tmp/config.toml" && [ "$(restarts)" = 0 ] \
+  && ok "fix: already right is a no-op, no restart" || bad "fix: not idempotent (rc=$rc)"
+# invalid config: backup restored, exit non-zero
+cat > "$tmp/config.toml" <<'T'
+version = 3
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.sysbox-runc]
+  runtime_type = "x"
+T
+cp "$tmp/config.toml" "$tmp/orig"
+DUMP_OK=0 runfix; rc=$?
+[ $rc = 1 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && [ "$(restarts)" = 0 ] \
+  && ok "fix: invalid config restored, no restart, exit 1" || bad "fix: invalid path (rc=$rc)"
+# installer stanza absent: waits (exit 3 under ONCE)
+printf 'version = 3\n' > "$tmp/config.toml"
+runfix; rc=$?
+[ $rc = 3 ] && [ "$(restarts)" = 0 ] && ok "fix: waits when sysbox-runc is not registered" || bad "fix: absent stanza (rc=$rc)"
+
+# the installer's real form on a managed node: indented headers, the sysbox tables under the legacy
+# key beside the real runtimes under the new key, empty legacy parents
+fx="$here/tests/fixtures/containerd-aks-installer-form.toml"
+keep() { grep -E 'runtimes\.(runc|untrusted)|cri\.v1\.images|^\[metrics\]|0\.0\.0\.0|pause|certs\.d|azure/aks|runc"|SystemdCgroup|BinaryName = "/usr/bin/runc"' "$1" | grep -v sysbox; }
+cp "$fx" "$tmp/config.toml"; keep "$tmp/config.toml" > "$tmp/keep.before"
+runfix; rc=$?
+nh() { grep -E '^[[:space:]]*\[' "$tmp/config.toml" | sort | uniq -d | wc -l | tr -d ' '; }
+[ $rc = 0 ] && ! grep -q 'grpc.v1.cri' "$tmp/config.toml" \
+  && grep -q '^        \[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.sysbox-runc\]' "$tmp/config.toml" \
+  && grep -q 'runtimes.sysbox-runc.options\]' "$tmp/config.toml" && [ "$(nh)" = 0 ] \
+  && [ "$(tail -c1 "$tmp/config.toml" | od -An -c | tr -d ' ')" = '\n' ] && [ ! -e "$tmp/config.toml.tmp" ] \
+  && [ "$(restarts)" = 1 ] && ok "fix: installer form: sysbox-runc moved, legacy parents gone, no duplicate header" || bad "fix: installer form (rc=$rc)"
+keep "$tmp/config.toml" | cmp -s - "$tmp/keep.before" && ok "fix: installer form: runc/untrusted/images/metrics lines unchanged" || bad "fix: other stanzas changed"
+cp "$tmp/config.toml" "$tmp/after2"; runfix; rc=$?
+[ $rc = 0 ] && cmp -s "$tmp/after2" "$tmp/config.toml" && [ "$(restarts)" = 0 ] && ok "fix: installer form: second run changes nothing" || bad "fix: installer form second run"
+# a legacy parent that still holds another table or a key is kept
+cat > "$tmp/config.toml" <<'T'
+version = 3
+  [plugins."io.containerd.grpc.v1.cri"]
+    x = 1
+  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.sysbox-runc]
+    runtime_type = "io.containerd.runc.v2"
+  [plugins."io.containerd.grpc.v1.cri".other]
+    y = 2
+T
+runfix; rc=$?
+grep -q '^  \[plugins."io.containerd.grpc.v1.cri"\]' "$tmp/config.toml" && grep -q 'grpc.v1.cri".other' "$tmp/config.toml" \
+  && grep -q 'cri.v1.runtime".containerd.runtimes.sysbox-runc\]' "$tmp/config.toml" && [ $rc = 0 ] \
+  && ok "fix: legacy header with other content is kept" || bad "fix: kept legacy header (rc=$rc)"
+# installer form that stays invalid: backup restored
+cp "$fx" "$tmp/config.toml"; cp "$fx" "$tmp/orig"
+DUMP_OK=0 runfix; rc=$?
+[ $rc = 1 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && [ "$(restarts)" = 0 ] && [ ! -e "$tmp/config.toml.tmp" ] \
+  && ok "fix: installer form, invalid result: backup restored" || bad "fix: installer form invalid (rc=$rc)"
+# the earlier col-0 form, single quotes on the new key
+cat > "$tmp/config.toml" <<'T'
+version = 3
+[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc]
+runtime_type = 'io.containerd.runc.v2'
+[plugins.'io.containerd.grpc.v1.cri'.containerd.runtimes.sysbox-runc]
+runtime_type = 'io.containerd.runc.v2'
+T
+runfix; rc=$?
+[ $rc = 0 ] && ! grep -q 'grpc.v1.cri' "$tmp/config.toml" && grep -q "^\[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.sysbox-runc\]" "$tmp/config.toml" \
+  && ok "fix: column-0 legacy form still handled" || bad "fix: col-0 form (rc=$rc)"
+
+# a pre-existing duplicate header makes the rewrite refuse: exit 1, config untouched, no restart
+cat > "$tmp/config.toml" <<'T'
+version = 3
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.sysbox-runc]
+  runtime_type = "x"
+[dup]
+[dup]
+T
+cp "$tmp/config.toml" "$tmp/orig"; runfix; rc=$?
+[ $rc = 1 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && [ "$(restarts)" = 0 ] && [ ! -e "$tmp/config.toml.tmp" ] \
+  && ok "fix: duplicate header refused, config unchanged" || bad "fix: duplicate header (rc=$rc)"
+# sysbox-runc registered in a form the fix does not move: exit 1, config untouched, no restart
+cat > "$tmp/config.toml" <<'T'
+version = 3
+[plugins."other.key".containerd.runtimes.sysbox-runc]
+  runtime_type = "x"
+T
+cp "$tmp/config.toml" "$tmp/orig"; runfix; rc=$?
+[ $rc = 1 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && [ "$(restarts)" = 0 ] \
+  && ok "fix: unmovable form refused, config unchanged" || bad "fix: unmovable form (rc=$rc)"
+# after the restart containerd does not answer: backup restored byte for byte, restarted again, exit 1, no label
+cp "$fx" "$tmp/config.toml"; cp "$fx" "$tmp/orig"
+DOWN_UNTIL=999 WAIT=2 POLL=1 runfix; rc=$?
+[ $rc = 1 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && [ "$(restarts)" = 2 ] && ! grep -q label "$tmp/log" \
+  && ok "fix: containerd down after restart: backup restored, restarted again, exit 1" || bad "fix: rollback after restart (rc=$rc)"
+mk="$tmp/config.toml.sysbox-fix.failed"
+[ "$(sed -n 's/^count=//p' "$mk")" = 1 ] && ok "fix: first failure writes the marker with count 1" || bad "fix: marker count 1"
+# second failure: count 2
+DOWN_UNTIL=999 WAIT=2 POLL=1 runfix; rc=$?
+[ $rc = 1 ] && [ "$(sed -n 's/^count=//p' "$mk")" = 2 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && ok "fix: second failure: count 2, backup restored" || bad "fix: marker count 2 (rc=$rc)"
+# third start: nothing touched, exits (ONCE) with 4, no restart, no label
+runfix; rc=$?
+[ $rc = 4 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && [ "$(restarts)" = 0 ] && ! grep -q label "$tmp/log" \
+  && ok "fix: at the cap: no edit, no restart, no label, idles" || bad "fix: cap (rc=$rc)"
+# a corrupt marker counts as the cap
+echo garbage > "$mk"; runfix; rc=$?
+[ $rc = 4 ] && [ "$(restarts)" = 0 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && ok "fix: corrupt marker fails closed" || bad "fix: corrupt marker (rc=$rc)"
+# below the cap, a healthy restart succeeds and removes the marker
+printf 'count=1\ntime=x\n' > "$mk"; runfix; rc=$?
+[ $rc = 0 ] && [ ! -e "$mk" ] && [ "$(restarts)" = 1 ] && ok "fix: success removes the marker" || bad "fix: marker removal (rc=$rc)"
+rm -f "$mk"; cp "$fx" "$tmp/config.toml"
+# containerd answers but the node is not Ready: same rollback
+printf '#!/bin/sh\nexit 1\n' > "$tmp/notready"; chmod +x "$tmp/notready"
+cp "$fx" "$tmp/config.toml"
+READY_CMD="$tmp/notready" WAIT=2 POLL=1 runfix; rc=$?
+[ $rc = 1 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && [ "$(restarts)" = 2 ] && ! grep -q label "$tmp/log" \
+  && ok "fix: node not Ready after restart: backup restored, exit 1" || bad "fix: not-Ready rollback (rc=$rc)"
+rm -f "$mk"
+# already-correct config but containerd dead, or the node not Ready: not labelled, no restart, config unchanged, exit 1
+cp "$fx" "$tmp/config.toml"; runfix >/dev/null 2>&1; rm -f "$mk"; cp "$tmp/config.toml" "$tmp/after_ok"
+CTR_DOWN=1 WAIT=2 POLL=1 runfix; rc=$?
+[ $rc = 1 ] && cmp -s "$tmp/after_ok" "$tmp/config.toml" && ! grep -q '^label' "$tmp/log" && [ "$(restarts)" = 0 ] \
+  && ok "fix: already right but containerd not answering: not labelled, exit 1" || bad "fix: no-op, containerd dead (rc=$rc)"
+READY_CMD="$tmp/notready" WAIT=2 POLL=1 runfix; rc=$?
+[ $rc = 1 ] && cmp -s "$tmp/after_ok" "$tmp/config.toml" && ! grep -q '^label' "$tmp/log" && [ "$(restarts)" = 0 ] \
+  && ok "fix: already right but node not Ready: not labelled, exit 1" || bad "fix: no-op, node not Ready (rc=$rc)"
+# (a) the restart itself returns non-zero: rollback runs, backup restored byte for byte, marker, exit 1, no label
+cp "$fx" "$tmp/config.toml"; rm -f "$mk"
+RESTART_FAIL_ON=1 WAIT=2 POLL=1 runfix; rc=$?
+[ $rc = 1 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && [ "$(sed -n 's/^count=//p' "$mk")" = 1 ] && ! grep -q label "$tmp/log" && [ "$(restarts)" = 2 ] \
+  && ok "fix: restart returns non-zero: rolled back, marker count 1, no label" || bad "fix: failed restart (rc=$rc)"
+# (c) containerd answers late (after 2 polls, within WAIT): passes, labelled once, no marker
+cp "$fx" "$tmp/config.toml"; rm -f "$mk"
+DOWN_UNTIL=2 WAIT=10 POLL=1 runfix; rc=$?
+[ $rc = 0 ] && [ "$(grep -c '^label' "$tmp/log")" = 1 ] && [ "$(restarts)" = 1 ] && [ ! -e "$mk" ] && ! grep -q 'grpc.v1.cri' "$tmp/config.toml" \
+  && ok "fix: containerd answers late within WAIT: kept, labelled once" || bad "fix: late answer (rc=$rc)"
+# M2: the saved copy is gone, so the restore fails: loud last line, exit 1, no label, no 'restored'
+cp "$fx" "$tmp/config.toml"; rm -f "$mk"
+: > "$tmp/log"
+TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/host" LABEL_CMD="$tmp/label" READY_CMD="$tmp/ready" ONCE=1 KILL_BAK=1 DOWN_UNTIL=999 WAIT=2 POLL=1 sh "$tmp/fix.sh" >"$tmp/out" 2>"$tmp/err"; rc=$?
+[ $rc = 1 ] && tail -n 1 "$tmp/err" | grep -q '^config restore FAILED: node needs manual repair' && ! grep -qi 'restored,' "$tmp/err" && ! grep -q label "$tmp/log" \
+  && ok "fix: restore fails (no saved copy): loud last line, exit 1, no label" || bad "fix: failed restore (rc=$rc)"
+# the restored file differs from the saved copy (a truncating cp): detected, same outcome
+mkdir -p "$tmp/cpshim"; printf '#!/bin/sh\nfor a; do last=$a; done\ncase "$last" in *.restore.tmp) head -c 10 "$1" > "$last" ;; *) exec /bin/cp "$@" ;; esac\n' > "$tmp/cpshim/cp"; chmod +x "$tmp/cpshim/cp"
+: > "$tmp/log"; cp "$fx" "$tmp/config.toml"; rm -f "$mk" "$tmp/config.toml.sysbox-fix.bak"
+PATH="$tmp/cpshim:$PATH" TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/host" LABEL_CMD="$tmp/label" READY_CMD="$tmp/ready" ONCE=1 DOWN_UNTIL=999 WAIT=2 POLL=1 sh "$tmp/fix.sh" >"$tmp/out" 2>"$tmp/err"; rc=$?
+[ $rc = 1 ] && tail -n 1 "$tmp/err" | grep -q '^config restore FAILED: node needs manual repair' && ! grep -q label "$tmp/log" \
+  && ok "fix: restored file differs from the saved copy: loud last line, exit 1, no label" || bad "fix: restore mismatch (rc=$rc)"
+# the restart after a good restore also fails: loud last line, exit 1, config byte-identical to the original
+cp "$fx" "$tmp/config.toml"; rm -f "$mk" "$tmp/config.toml.sysbox-fix.inprogress"  # (a failed restore leaves the flag, by design)
+: > "$tmp/log"
+TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/host" LABEL_CMD="$tmp/label" READY_CMD="$tmp/ready" ONCE=1 RESTART_FAIL_ON="1 2" WAIT=2 POLL=1 sh "$tmp/fix.sh" >"$tmp/out" 2>"$tmp/err"; rc=$?
+[ $rc = 1 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && tail -n 1 "$tmp/err" | grep -q 'NOT healthy after the second restart: node needs manual repair' && ! grep -q label "$tmp/log" \
+  && ok "fix: restart after the restore fails: loud last line, config restored, exit 1" || bad "fix: second restart fails (rc=$rc)"
+rm -f "$mk"; cp "$fx" "$tmp/config.toml"
+# --- a killed or stopped run (the in-progress flag, the trap, the recovery at start) ---
+ip="$tmp/config.toml.sysbox-fix.inprogress"
+# (d) normal success: flag removed, no rollback, one restart
+cp "$fx" "$tmp/config.toml"; rm -f "$mk" "$ip"; : > "$tmp/log"
+TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/host" LABEL_CMD="$tmp/label" READY_CMD="$tmp/ready" ONCE=1 WAIT=2 POLL=1 sh "$tmp/fix.sh" >"$tmp/out" 2>"$tmp/err"; rc=$?
+[ $rc = 0 ] && [ ! -e "$ip" ] && [ "$(restarts)" = 1 ] && ! grep -q 'rolling back' "$tmp/err" && grep -q label "$tmp/log" \
+  && ok "fix: success removes the in-progress flag, fires no rollback" || bad "fix: success flag (rc=$rc)"
+# (e) a normal rollback is not repeated by the exit trap: exactly two restarts, one rollback message, flag gone
+cp "$fx" "$tmp/config.toml"; rm -f "$mk" "$ip"; : > "$tmp/log"
+TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/host" LABEL_CMD="$tmp/label" READY_CMD="$tmp/ready" ONCE=1 DOWN_UNTIL=999 WAIT=2 POLL=1 sh "$tmp/fix.sh" >"$tmp/out" 2>"$tmp/err"; rc=$?
+[ $rc = 1 ] && [ "$(restarts)" = 2 ] && [ "$(grep -c 'rolling back' "$tmp/err")" = 1 ] && [ ! -e "$ip" ] && cmp -s "$tmp/orig" "$tmp/config.toml" \
+  && ok "fix: normal rollback is not repeated by the trap (2 restarts, 1 rollback)" || bad "fix: double rollback (rc=$rc restarts=$(restarts))"
+# (a, b) SIGTERM / SIGINT during the first wait: the trap restores byte for byte, restarts, checks, exits non-zero, no label
+for sig in TERM INT; do
+  cp "$fx" "$tmp/config.toml"; rm -f "$mk" "$ip"; : > "$tmp/log"
+  # a non-interactive shell starts background jobs with INT ignored: re-enable it, as a pod's PID 1 has it
+  TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/host" LABEL_CMD="$tmp/label" READY_CMD="$tmp/ready" ONCE=1 DOWN_UNTIL=999 WAIT=30 POLL=1 \
+    sh -c 'trap - INT; exec sh "$0"' "$tmp/fix.sh" >"$tmp/out" 2>"$tmp/err" &
+  pid=$!; i=0
+  while ! grep -q 'ctr version' "$tmp/log" && [ $i -lt 200 ]; do sleep 0.1; i=$((i + 1)); done
+  [ $i -lt 200 ] || { bad "fix: SIG$sig test: the first probe never started"; kill -9 $pid; }
+  kill -$sig $pid; wait $pid; rc=$?
+  [ $rc != 0 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && [ "$(restarts)" = 2 ] && ! grep -q label "$tmp/log" && [ ! -e "$ip" ] \
+    && [ "$(sed -n 's/^count=//p' "$mk")" = 1 ] && grep -q 'rolling back' "$tmp/err" && [ "$(grep -c 'ctr version' "$tmp/log")" -ge 2 ] \
+    && ok "fix: SIG$sig in the first wait: trap restores byte for byte, restarts, health check, non-zero, no label" || bad "fix: SIG$sig trap (rc=$rc restarts=$(restarts))"
+done
+# a failing label command after a healthy restart: no rollback, config stays new, exit non-zero, flag gone, loud line
+printf '#!/bin/sh\necho label >> "$TMP_LOG"\nexit 1\n' > "$tmp/labelfail"; chmod +x "$tmp/labelfail"
+cp "$fx" "$tmp/config.toml"; rm -f "$mk" "$ip"; : > "$tmp/log"
+TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/host" LABEL_CMD="$tmp/labelfail" READY_CMD="$tmp/ready" ONCE=1 WAIT=2 POLL=1 sh "$tmp/fix.sh" >"$tmp/out" 2>"$tmp/err"; rc=$?
+[ $rc = 1 ] && ! grep -q 'grpc.v1.cri' "$tmp/config.toml" && [ "$(restarts)" = 1 ] && [ ! -e "$ip" ] && ! grep -q 'rolling back' "$tmp/err" && grep -q 'runtime healthy but the label could not be set' "$tmp/err" \
+  && ok "fix: label fails: no rollback, config stays new, exit non-zero, loud line" || bad "fix: label failure (rc=$rc restarts=$(restarts))"
+# SIGTERM during the label command: the healthy runtime and the new config are kept, no second restart
+printf '#!/bin/sh\necho label >> "$TMP_LOG"\nsleep 3\n' > "$tmp/labelslow"; chmod +x "$tmp/labelslow"
+cp "$fx" "$tmp/config.toml"; rm -f "$mk" "$ip"; : > "$tmp/log"
+TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/host" LABEL_CMD="$tmp/labelslow" READY_CMD="$tmp/ready" ONCE=1 WAIT=2 POLL=1 sh "$tmp/fix.sh" >"$tmp/out" 2>"$tmp/err" &
+pid=$!; i=0
+while ! grep -q '^label' "$tmp/log" && [ $i -lt 200 ]; do sleep 0.1; i=$((i + 1)); done
+[ $i -lt 200 ] || { bad "fix: label-window test: the label never started"; kill -9 $pid; }
+kill -TERM $pid; wait $pid; rc=$?
+[ $rc != 0 ] && ! grep -q 'grpc.v1.cri' "$tmp/config.toml" && [ "$(restarts)" = 1 ] && [ ! -e "$ip" ] && ! grep -q 'rolling back' "$tmp/err" \
+  && ok "fix: SIGTERM during labelling: healthy runtime and new config kept, no rollback" || bad "fix: TERM in the label window (rc=$rc restarts=$(restarts))"
+rm -f "$mk" "$ip"
+# a rollback that cannot restore health sets the cap at once, keeps the flag, exits once; the next start touches nothing
+cp "$fx" "$tmp/config.toml"; rm -f "$mk" "$ip"
+RESTART_FAIL_ON="1 2" WAIT=2 POLL=1 runfix; rc=$?
+[ $rc = 1 ] && [ "$(sed -n 's/^count=//p' "$mk")" = 2 ] && [ -e "$ip" ] \
+  && ok "fix: rollback cannot restore health: marker set to the cap, flag kept, exit 1" || bad "fix: unhealthy after rollback (rc=$rc)"
+runfix; rc=$?
+[ $rc = 4 ] && [ "$(restarts)" = 0 ] && [ -e "$ip" ] && ! grep -q label "$tmp/log" && [ "$(sed -n 's/^count=//p' "$mk")" = 2 ] \
+  && ok "fix: next start at the cap: no recovery, no restart, flag kept, idles" || bad "fix: next start after unrecoverable (rc=$rc restarts=$(restarts))"
+# the same with a failed restore (no saved copy)
+cp "$fx" "$tmp/config.toml"; rm -f "$mk" "$ip"
+KILL_BAK=1 DOWN_UNTIL=999 WAIT=2 POLL=1 runfix; rc=$?
+[ $rc = 1 ] && [ "$(sed -n 's/^count=//p' "$mk")" = 2 ] && [ -e "$ip" ] && ok "fix: failed restore: marker set to the cap, flag kept" || bad "fix: failed restore cap (rc=$rc)"
+runfix; rc=$?
+[ $rc = 4 ] && [ "$(restarts)" = 0 ] && ok "fix: failed restore, next start: nothing touched, idles" || bad "fix: failed restore next start (rc=$rc)"
+# a flag with count at the cap does nothing (no recovery), even though the config is edited
+killed_pre() { cp "$tmp/after_ok" "$tmp/config.toml"; cp "$fx" "$tmp/config.toml.sysbox-fix.bak"; : > "$ip"; }
+killed_pre; printf 'count=2\ntime=x\n' > "$mk"; runfix; rc=$?
+[ $rc = 4 ] && [ "$(restarts)" = 0 ] && cmp -s "$tmp/after_ok" "$tmp/config.toml" && [ -e "$ip" ] && ok "fix: flag with count at the cap: no recovery, nothing touched" || bad "fix: flag at the cap (rc=$rc)"
+rm -f "$mk" "$ip"
+# (c) simulated SIGKILL: the flag and the edited config are left; the next start recovers and counts one failed attempt
+killed() { cp "$tmp/after_ok" "$tmp/config.toml"; cp "$fx" "$tmp/config.toml.sysbox-fix.bak"; : > "$ip"; }
+killed; rm -f "$mk"
+MAX_ATTEMPTS=1 runfix; rc=$?
+[ $rc = 4 ] && cmp -s "$fx" "$tmp/config.toml" && [ "$(restarts)" = 1 ] && grep -q 'ctr version' "$tmp/log" && [ "$(sed -n 's/^count=//p' "$mk")" = 1 ] && [ ! -e "$ip" ] && ! grep -q label "$tmp/log" \
+  && ok "fix: killed run: start restores, restarts, checks, counts one failed attempt (cap 1 reached: off)" || bad "fix: kill recovery (rc=$rc)"
+killed; printf 'count=1\ntime=x\n' > "$mk"
+runfix; rc=$?
+[ $rc = 4 ] && cmp -s "$fx" "$tmp/config.toml" && [ "$(sed -n 's/^count=//p' "$mk")" = 2 ] && [ "$(restarts)" = 1 ] && ! grep -q label "$tmp/log" \
+  && ok "fix: a second kill reaches the cap: restored, stays off" || bad "fix: second kill (rc=$rc)"
+killed; rm -f "$mk"
+runfix; rc=$?
+[ $rc = 0 ] && [ "$(restarts)" = 2 ] && grep -q label "$tmp/log" && [ ! -e "$ip" ] && ! grep -q 'grpc.v1.cri' "$tmp/config.toml" \
+  && ok "fix: killed run below the cap: recovers, then continues as normal" || bad "fix: recover then continue (rc=$rc)"
+rm -f "$mk" "$ip"
+# (f) the wait is a clock: probes that take 2s each, WAIT=4 POLL=1: the script ends in about 5s (bound WAIT + probe + POLL = 7s); a loop count would take 12s.
+# The test bound is deliberately coarse (under 10s) so a loaded machine or whole-second rounding cannot fail it, yet the loop-count version still does.
+cp "$fx" "$tmp/config.toml"; : > "$tmp/log"; t0=$(date +%s)
+TMP_LOG="$tmp/log" CFG="$tmp/config.toml" HOST="$tmp/host" LABEL_CMD="$tmp/label" READY_CMD="$tmp/ready" ONCE=1 SLOW_PROBE=2 WAIT=4 POLL=1 sh "$tmp/fix.sh" >/dev/null 2>&1; rc=$?
+el=$(( $(date +%s) - t0 ))
+[ $rc = 1 ] && [ "$el" -lt 10 ] && [ "$el" -ge 3 ] && ok "fix: the wait ends by the clock (${el}s for WAIT=4)" || bad "fix: clock (rc=$rc ${el}s)"
+rm -f "$mk" "$ip"; cp "$fx" "$tmp/config.toml"
+# healthy restart (node Ready): one restart, labelled, as before
+printf '#!/bin/sh\nexit 0\n' > "$tmp/ready"; chmod +x "$tmp/ready"
+cp "$fx" "$tmp/config.toml"
+READY_CMD="$tmp/ready" WAIT=2 POLL=1 runfix; rc=$?
+[ $rc = 0 ] && ! grep -q 'grpc.v1.cri' "$tmp/config.toml" && [ "$(restarts)" = 1 ] && grep -q label "$tmp/log" \
+  && ok "fix: healthy restart: kept, one restart, labelled" || bad "fix: healthy restart (rc=$rc)"
+# containerd config version 1 (declared, or legacy key only with no version): refused, node untouched
+for v in declared bare; do
+  if [ $v = declared ]; then printf 'version = 1\n[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.sysbox-runc]\n  runtime_type = "x"\n' > "$tmp/config.toml"
+  else printf '[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.sysbox-runc]\n  runtime_type = "x"\n' > "$tmp/config.toml"; fi
+  cp "$tmp/config.toml" "$tmp/orig"; rm -f "$tmp/config.toml.sysbox-fix.bak"
+  runfix; rc=$?
+  [ $rc = 1 ] && cmp -s "$tmp/orig" "$tmp/config.toml" && [ ! -e "$tmp/config.toml.sysbox-fix.bak" ] && [ "$(restarts)" = 0 ] && ! grep -q label "$tmp/log" \
+    && ok "fix: version 1 config ($v) refused, node untouched" || bad "fix: v1 guard $v (rc=$rc)"
+done
+# the sysbox-runtime=running label must never gate anything: no nodeSelector, affinity or scheduling on it
+gate=$(python3 - "$here" <<'PYX'
+import re, sys, pathlib
+root = pathlib.Path(sys.argv[1]); hits = []
+for f in list(root.glob("k8s/*.yaml")) + [root / "README.md"]:
+    text = f.read_text(); lines = text.splitlines()
+    for n, l in enumerate(lines):
+        if re.search(r"nodeSelector|nodeAffinity|matchExpressions|matchLabels|scheduling|--node-selector", l) and not l.lstrip().startswith("#"):
+            if any("sysbox-runtime" in x for x in lines[n:n + 5]): hits.append(f"{f.name}:{n + 1}")
+    if f.name == "README.md" and "expect: running" in text: hits.append(f.name + ": label presented as proof")
+print("\n".join(hits))
+PYX
+)
+[ -z "$gate" ] && ok "the sysbox-runtime label gates nothing and is not presented as proof" || bad "label gates scheduling or is shown as proof: $gate"
+# the worker's activity reader (stub server, no network)
+nice python3 -m unittest discover -s "$here/worker/tests" -p 'test_*.py' >"$tmp/ut" 2>&1 \
+  && ok "worker activity reader tests" || { bad "worker activity reader tests"; tail -20 "$tmp/ut"; }
+
+# 2b. no floating image tag: every image reference in cloud/ has an exact tag or a digest
+pins=$(python3 - "$here" <<'P'
+import re, sys, pathlib
+root = pathlib.Path(sys.argv[1]); bad = []
+refs = []
+for f in list(root.glob("k8s/*.yaml")) + list(root.glob("**/Dockerfile*")):
+    for n, line in enumerate(f.read_text().splitlines(), 1):
+        m = re.match(r"\s*FROM\s+(?:--\S+\s+)?(\S+)", line) if "Dockerfile" in f.name else re.match(r"\s*-?\s*image:\s*(\S+)", line)
+        if m: refs.append((f, n, m.group(1)))
+for f, n, ref in refs:
+    if ref.lower() == "scratch" or ref.startswith("$"): continue
+    if "@sha256:" in ref: continue
+    tag = ref.rsplit("/", 1)[-1].partition(":")[2]
+    if not tag or tag == "latest": bad.append(f"{f.name}:{n}: {ref}")
+print(len(refs)); [print(b) for b in bad]
+P
+)
+nrefs=$(echo "$pins" | head -1)
+[ "${nrefs:-0}" -ge 2 ] && [ "$(echo "$pins" | wc -l | tr -d ' ')" = 1 ] \
+  && ok "images pinned: $nrefs references, none floating" || { bad "floating or missing image tag"; echo "$pins" | tail -n +2; }
+
+# 3. secret scan on a directory
+mkdir "$tmp/clean" "$tmp/dirty"; echo "hello" > "$tmp/clean/a.txt"
+printf 'GH_TOKEN=%s\n' "ghp_$(printf 'a%.0s' $(seq 36))" > "$tmp/dirty/env"
+"$here/worker/scan-secrets.sh" --dir "$tmp/clean" >/dev/null 2>&1 && ok "clean dir: 0 hits" || bad "clean dir"
+out=$("$here/worker/scan-secrets.sh" --dir "$tmp/dirty" 2>&1); rc=$?
+[ "$rc" = 1 ] && ok "planted token: fails" || bad "planted token rc=$rc"
+mkdir "$tmp/key"; printf -- '-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n' > "$tmp/key/k"
+"$here/worker/scan-secrets.sh" --dir "$tmp/key" >/dev/null 2>&1 && bad "private key passed" || ok "private key fails"
+echo "$out" | grep -q 'ghp_' && bad "scan printed the value" || ok "scan never prints the value"
+
+# 3b. a layer that cannot be extracted is an error (exit 2), never a pass
+mkdir "$tmp/stub" "$tmp/fake"; echo '[{"Layers":["l/layer.tar"]}]' > "$tmp/fake/manifest.json"
+mkdir "$tmp/fake/l"; echo "not a tar" > "$tmp/fake/l/layer.tar"
+(cd "$tmp/fake" && tar -cf "$tmp/fake.tar" manifest.json l)
+printf '#!/bin/sh\ncp "%s" "$4"\n' "$tmp/fake.tar" > "$tmp/stub/docker"; chmod +x "$tmp/stub/docker"
+PATH="$tmp/stub:$PATH" "$here/worker/scan-secrets.sh" any:image >/dev/null 2>&1; rc=$?
+[ "$rc" = 2 ] && ok "unreadable layer: exit 2, not a pass" || bad "unreadable layer rc=$rc"
+
+# 4. image scan, only when docker is up
+if docker info >/dev/null 2>&1; then
+  printf 'FROM busybox\nRUN echo "GITHUB_TOKEN=ghp_%s" > /t\n' "$(printf 'b%.0s' $(seq 36))" > "$tmp/Dockerfile"
+  printf 'FROM busybox\nRUN echo hi > /t\n' > "$tmp/Dockerfile.clean"
+  # a secret written in one layer and deleted in the next must still be found
+  printf 'FROM busybox\nRUN echo "GITHUB_TOKEN=ghp_%s" > /t\nRUN rm /t\n' "$(printf 'c%.0s' $(seq 36))" > "$tmp/Dockerfile.deleted"
+  # a secret in the image env
+  printf 'FROM busybox\nENV GH_TOKEN=ghp_%s\n' "$(printf 'd%.0s' $(seq 36))" > "$tmp/Dockerfile.env"
+  # build every image; a failed build is a test failure, never a pass
+  cp "$tmp/Dockerfile" "$tmp/Dockerfile.baked"
+  built=1
+  for v in baked deleted env clean; do
+    docker build -q -t "cw-scan-$v" -f "$tmp/Dockerfile.$v" "$tmp" >/dev/null 2>&1 || { bad "image build failed: $v"; built=0; }
+  done
+  if [ $built = 1 ]; then
+    # secret images: exit exactly 1 and the report names the pattern
+    for v in baked deleted env; do
+      out=$("$here/worker/scan-secrets.sh" "cw-scan-$v" 2>&1); rc=$?
+      [ "$rc" = 1 ] && echo "$out" | grep -q 'github-token\|generic-token-assignment' \
+        && ok "image with secret ($v): exit 1 and pattern named" || bad "image with secret ($v) rc=$rc"
+    done
+    "$here/worker/scan-secrets.sh" cw-scan-clean >/dev/null 2>&1 && ok "clean image: 0 hits" || bad "clean image"
+  fi
+  docker rmi cw-scan-baked cw-scan-deleted cw-scan-env cw-scan-clean >/dev/null 2>&1
+else
+  [ "${CLOUD_TEST_SKIP_DOCKER:-0}" = 1 ] && echo "skip docker not running (CLOUD_TEST_SKIP_DOCKER=1)" || bad "docker is required for the image-scan cases (set CLOUD_TEST_SKIP_DOCKER=1 to skip)"
+fi
+[ $fail = 0 ] && echo "RESULT: PASS" || { echo "RESULT: FAIL"; exit 1; }

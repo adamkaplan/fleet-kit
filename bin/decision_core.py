@@ -352,6 +352,14 @@ BATCH_FENCE = "decision-rows"
 BATCH_ROWS_MAX = 40            # rows one batch may carry (the panel draws one line or two per row)
 BATCH_REF_MAX, BATCH_FINDING_MAX, BATCH_REC_MAX = 100, 200, 120
 BATCH_TITLE_MAX = 120
+BATCH_RAISE_ROWS_MAX = 20      # rows one batch may carry when it is RAISED (a batch already open may hold up to BATCH_ROWS_MAX: it is read, never refused)
+BATCH_FINDING_RAISE_MAX = 4000   # the finding of one row as raised, kept in FULL in the issue body
+BATCH_REC_RAISE_MAX = 2500       # the recommendation of one row as raised: shorter, because the recorded answer quotes it for every row (20 x (2500 + a 240-char choice + a 100-char ref) fits one comment)
+BATCH_BODY_MAX_CHARS = 65000     # the whole issue body (GitHub's limit is 65536 characters)
+BATCH_COMMENT_MAX_CHARS = 65000  # the recorded answer comment (the same platform limit): checked before anything is sent or written
+OUTWARD_ROWS_BUDGET = 3000       # the characters of row text one outward message carries whole; a row that does not fit is sent cut AND marked, with a pointer to the issue
+OUTWARD_CUT_MIN = 100            # a cut row still carries at least this much of each part
+_BATCH_ROW_HEADING = re.compile(r"^###[ \t]+(?:[0-9]+\.[ \t]+)?([^\s|]+)[ \t]*$")
 _ROWS_BLOCK = re.compile(r"^```%s[ \t]*\r?\n(.*?)^```[ \t]*\r?$" % BATCH_FENCE, re.M | re.S)
 _ROW_REF = re.compile(r"^(?:[A-Za-z0-9_.-]+/)?[A-Za-z0-9_.-]+#[0-9]+$")
 
@@ -368,7 +376,7 @@ def short_ref_of(ref):
 
 def parse_batch_row(line):
     """One row line `<ref> | <finding> | <recommendation>` as {ref, short, finding, recommendation, text}. Raises
-    BatchError for an empty part, a ref that names no issue, or a fence in the text; a part over its cap is cut."""
+    BatchError for an empty part, a ref that names no issue, or a fence in the text. The text is kept whole (the command bounds its length)."""
     parts = [" ".join(part.split()) for part in line.split("|", 2)]
     if len(parts) != 3 or not all(parts):
         raise BatchError("a row is `<repo#N> | <finding> | <recommendation>`, each part not empty: %r" % one_line(line, 80))
@@ -388,19 +396,86 @@ def row_repo(ref):
     return ref.split("#")[0] if "/" in ref.split("#")[0] else None
 
 
+def display_cut(text, width):
+    """The ONLY cut a row's text takes: for drawing. Nothing stored, answered, escalated or synced ever goes through it."""
+    return text if len(text) <= width else text[:width - 1] + "\u2026"
+
+
 def row_of(ref, finding, rec):
-    cut = lambda text, width: text if len(text) <= width else text[:width - 1] + "\u2026"
-    finding, rec = cut(finding, BATCH_FINDING_MAX), cut(rec, BATCH_REC_MAX)
+    """A row, whole: `finding` and `recommendation` are exactly the stored text (every reader that acts on a row uses these). `text` is the one DISPLAY field (what the
+    decision list and the panel draw), the recommendation cut for drawing."""
     short = short_ref_of(ref)
     return {"ref": ref, "short": short, "finding": finding, "recommendation": rec,
-            "text": "%s: %s" % (short, short_refs(rec))}
+            "text": "%s: %s" % (short, display_cut(short_refs(rec), BATCH_REC_MAX))}
+
+
+_MD_ACTIVE = re.compile(r"([\\<>@\[\]`*_])")
+_MD_ESCAPED = re.compile(r"\\([\\<>@\[\]`*_])")
+
+
+def md_escape(text):
+    """Row text made inert as Markdown: each active character is backslash-escaped (no mention, link, image, HTML or comment, and no look-alike of the signer mark), and
+    md_unescape gives the exact text back."""
+    return _MD_ACTIVE.sub(r"\\\1", text)
+
+
+def md_unescape(text):
+    return _MD_ESCAPED.sub(r"\1", text)
+
+
+def batch_row_sections(rows):
+    """The Markdown of a batch's rows: one section for each, `### N. <issue>` then `**Finding:** ...` and `**Recommendation:** ...` as their own paragraphs, the FULL text, no code
+    block. A row's text is one line (whitespace is collapsed when it is parsed), so it can never start a line: a heading, a fence marker or a row-looking text inside it is
+    mid-line text and cannot split the section."""
+    return "\n\n".join("### %d. %s\n\n**Finding:** %s\n\n**Recommendation:** %s" % (number, row["ref"], md_escape(row["finding"]), md_escape(row["recommendation"]))
+                       for number, row in enumerate(rows, 1))
+
+
+def parse_markdown_rows(body):
+    """The rows of a batch body written as Markdown sections (see batch_row_sections), in order; [] when it has none. Lenient like the fenced reader: a section without a finding and
+    a recommendation, or whose heading names no issue, is skipped; at most BATCH_ROWS_MAX are read. The rows are the same records the fenced format gives (cut for display)."""
+    rows, current, mode = [], None, None
+
+    def close():
+        if current and current["finding"] and current["rec"]:
+            try:
+                rows.append(row_of(current["ref"], md_unescape(" ".join(current["finding"])), md_unescape(" ".join(current["rec"]))))
+            except BatchError:
+                pass
+    for line in body.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        heading = _BATCH_ROW_HEADING.match(line)
+        if heading and (_ROW_REF.match(heading.group(1)) or _GITHUB_REF.match(heading.group(1))):
+            close()
+            if len(rows) >= BATCH_ROWS_MAX:
+                return rows
+            current, mode = {"ref": heading.group(1), "finding": [], "rec": []}, None
+            continue
+        if line.startswith("### "):
+            close()
+            current, mode = None, None
+            continue
+        if current is None or line.lstrip().startswith("<!--"):
+            continue
+        text = line.strip()
+        if text.startswith("**Finding:**"):
+            mode, text = "finding", text[len("**Finding:**"):].strip()
+        elif text.startswith("**Recommendation:**"):
+            mode, text = "rec", text[len("**Recommendation:**"):].strip()
+        if mode and text:
+            current[mode].append(" ".join(text.split()))
+    close()
+    return rows
 
 
 def parse_decision_rows(body):
-    """The rows in an issue body's fenced `decision-rows` block, in order; [] for a body with none. Lenient: a line
-    that is not a row is skipped, and at most BATCH_ROWS_MAX rows are read (the daemon never refuses an issue)."""
-    found = _ROWS_BLOCK.search(body) if isinstance(body, str) else None
-    rows = []
+    """The rows of an issue body: its Markdown row sections, or, for a batch already open in the older format, its fenced `decision-rows` block; [] for a body with none.
+    Lenient: a line or section that is not a row is skipped, and at most BATCH_ROWS_MAX rows are read (the daemon never refuses an issue)."""
+    if not isinstance(body, str):
+        return []
+    rows = parse_markdown_rows(body)
+    if rows:
+        return rows
+    found = _ROWS_BLOCK.search(body)
     for line in (found.group(1).splitlines() if found else []):
         if not line.strip():
             continue
@@ -831,6 +906,26 @@ def goes_outward(entry, repos, kinds=("issue", "report")):
             and entry.get("repo") in (repos or ()))
 
 
+def outward_rows(entry):
+    """The rows of a batch as said outside: WHOLE while they fit OUTWARD_ROWS_BUDGET characters of text, then a row that does not fit is sent cut and marked
+    (`cut: true`, `see: "row N: see <repo>#<issue>"`), never silently."""
+    where = "%s#%s" % (entry.get("repo"), entry.get("ask"))
+    left, out = OUTWARD_ROWS_BUDGET, []
+    whole = BATCH_BODY_MAX_CHARS
+    for n, r in enumerate(entry["rows"], 1):
+        finding, rec = line_of(r.get("finding"), whole), line_of(r.get("recommendation"), whole)
+        row = {"n": n, "ref": line_of(r.get("ref"), 100), "finding": finding, "recommendation": rec}
+        if len(finding) + len(rec) <= left:
+            left -= len(finding) + len(rec)
+        else:
+            share = max(OUTWARD_CUT_MIN, left // 2)
+            cut = lambda text: text if len(text) <= share else text[:share - 1] + "\u2026"
+            row.update({"finding": cut(finding), "recommendation": cut(rec), "cut": True, "see": "row %d: see %s" % (n, where)})
+            left = max(0, left - 2 * share)
+        out.append(row)
+    return out
+
+
 def outward_payload(entry, floor):
     """What is said about a decision outside, from the list entry: text with anything shaped like a credential taken
     out, and the floor tier the mapping assigns its tier. `rows` (a batch) go as options by id."""
@@ -840,9 +935,7 @@ def outward_payload(entry, floor):
                "repo": entry.get("repo"), "agent": entry.get("agent"), "since": entry.get("since")}
     if entry.get("rows"):
         payload["batch"] = True
-        payload["rows"] = [{"n": n, "ref": line_of(r.get("ref"), 100), "finding": line_of(r.get("finding"), 200),
-                            "recommendation": line_of(r.get("recommendation"), 120)}
-                           for n, r in enumerate(entry["rows"], 1)]
+        payload["rows"] = outward_rows(entry)
         payload["options"] = [{"id": "as_recommended", "label": "As recommended"}]
     return payload
 

@@ -82,7 +82,7 @@ test("states: dead beats waiting beats working beats idle", () => {
   assert.equal(by.gamma, "dead") // the switchboard found its pane dead
   assert.equal(by.delta, null) // detached: not recorded, shown as ?
   assert.equal(by.eps, null) // not checked yet: not dead
-  assert.equal(by.cos, "idle") // the plugin is recording and this session made no calls in 15 minutes
+  assert.equal(by.cos, "wait") // a decision waits on the owner, which the Chief of Staff presents
 })
 
 test("sparkline and bars scale to the largest value; a missing hour is a dot", () => {
@@ -171,7 +171,7 @@ test("live shape: the state word comes from the load record when no tool calls a
 
 test("live shape: a missing counter says plugin not installed, v2_light says off, a watched repository reads 0", () => {
   const rows = healthRows(live, NOW, 34).map((r) => text(r.segs))
-  assert.ok(rows.includes("tool calls: plugin not installed"), rows.join("|"))
+  assert.ok(rows.includes("activity: plugin not installed"), rows.join("|"))
   assert.ok(rows.includes("ctx: off: v2_light"))
   const orch = buildBlocks(live, NOW).find((b) => b.name === "orch")
   assert.equal(orch.pushes, 0)
@@ -186,14 +186,47 @@ test("live shape: a missing counter says plugin not installed, v2_light says off
 
 test("live shape: a stale counter says plugin not running", () => {
   const rows = healthRows({ ...live, records: { ...liveRecords, sources: { tool_calls: "stale", usage: "on" } } }, NOW, 34).map((r) => text(r.segs))
-  assert.ok(rows.includes("tool calls: plugin not running"))
+  assert.ok(rows.includes("activity: plugin not running"))
 })
 
-test("the Chief of Staff has no load row and says so, within the width", () => {
+test("the Chief of Staff row carries its state word and the decisions waiting on the owner, within the width", () => {
   const cos = buildBlocks(live, NOW).find((b) => b.name === "cos")
-  const [, l2] = blockLines(cos, 34).map(text)
-  assert.equal(l2, "d0 no load row: not orchestrator")
+  const [l1, l2] = blockLines(cos, 34).map(text)
+  assert.equal(l2, "d0 waiting on you")
+  assert.match(l1, /cos\s+idle/)
   assert.ok(l2.length <= 34)
+  const two = { ...live, decisions: { decisions: [{ agent: "orch", tier: "human" }, { agent: "x", tier: "human" }, { agent: "x", tier: "cos" }, { agent: "x", tier: "human", closed: true }, { agent: "x", kind: "notice" }] } }
+  const waiting = buildBlocks(two, NOW).find((b) => b.name === "cos")
+  assert.equal(waiting.state, "wait")
+  assert.equal(text(blockLines(waiting, 34)[1]), "d2 waiting on you")
+  const unread = buildBlocks({ ...live, decisions: null }, NOW).find((b) => b.name === "cos")
+  assert.equal(text(blockLines(unread, 34)[1]), "d not recorded")
+})
+
+test("steps stand in for tool calls: a workspace the counter does not cover shows the step series, else says restart for counter", () => {
+  const withCounter = { ...liveRecords, sources: { tool_calls: "ok", usage: "events" }, tool_calls: { ses_other: { per_minute: new Array(15).fill(1), approx: true } } }
+  const quiet = { ...live, records: withCounter, load: { ...liveLoad, latest: { orch: { busy: 0, idle: 3, moved_1h: 0 } } } }
+  const bare = buildBlocks(quiet, NOW).find((b) => b.name === "orch")
+  assert.equal(bare.spark, null) // the counter runs, but has no row: not a flat line
+  assert.match(text(blockLines(bare, 120)[0]), /no calls in 15 min/) // a quiet workspace (its row was pruned) is not told to restart
+  assert.doesNotMatch(text(blockLines(bare, 120)[0]), /restart/)
+  const working = { ...live, records: withCounter, load: { ...liveLoad, latest: { orch: { busy: 2, idle: 0 } } } }
+  assert.match(text(blockLines(buildBlocks(working, NOW).find((b) => b.name === "orch"), 120)[0]), /restart for counter/) // working by another source, no counter row, no step
+  const steps = { ...withCounter, steps: { ses_o: { per_minute: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 0, 4], approx: true } } }
+  const got = buildBlocks({ ...live, records: steps }, NOW).find((b) => b.name === "orch")
+  assert.equal(got.sparkKind, "steps")
+  assert.match(text(blockLines(got, 120)[0]), /[▁-█]{15}≈steps/)
+  assert.equal(got.state, "work") // steps in the last 3 minutes: working
+  const calls = { ...withCounter, tool_calls: { ses_o: { per_minute: new Array(15).fill(1), approx: true } }, steps: steps.steps }
+  assert.equal(buildBlocks({ ...live, records: calls }, NOW).find((b) => b.name === "orch").sparkKind, "calls") // the counter wins where it has the session
+})
+
+test("ctx says why when the usage source is on but the session has not ended a step", () => {
+  const on = { ...liveRecords, sources: { tool_calls: "missing", usage: "events" }, usage: { ses_x: { context: { tokens: 5, percent: 1 }, hours: {} } } }
+  const orch = buildBlocks({ ...live, records: on }, NOW).find((b) => b.name === "orch")
+  assert.match(text(blockLines(orch, 120)[1]), /ctx no step seen yet/)
+  const seen = { ...on, usage: { ses_o: { context: { tokens: 50, limit: 100, percent: 50 }, hours: {} } } }
+  assert.match(text(blockLines(buildBlocks({ ...live, records: seen }, NOW).find((b) => b.name === "orch"), 120)[1]), /ctx50%/)
 })
 
 test("the legend names q s d c p ctx and the state words, one line each within the width", () => {
@@ -202,4 +235,13 @@ test("the legend names q s d c p ctx and the state words, one line each within t
   for (const line of legend) assert.ok(line.length <= 34, line)
   const all = legend.join(" ")
   for (const word of ["q open", "s stalled", "d decisions", "c busy", "p pushes", "ctx", "work", "idle", "wait", "dead"]) assert.ok(all.includes(word), word)
+})
+
+test("a counter that has some of a workspace's sessions sums those, and steps cover the rest only when it has none", () => {
+  const pane2 = { ...livePane, agents: { ...livePane.agents, orch1: { role: "coder", workspace: "wA", session: "ses_o1", repo: null } } }
+  const rec = { ...liveRecords, sources: { tool_calls: "ok", usage: "events" }, tool_calls: { ses_o1: { per_minute: new Array(15).fill(2), approx: true } },
+    steps: { ses_o: { per_minute: new Array(15).fill(9), approx: true } } }
+  const orch = buildBlocks({ ...live, pane: pane2, records: rec }, NOW).find((b) => b.name === "orch")
+  assert.equal(orch.sparkKind, "calls")
+  assert.deepEqual(orch.spark, new Array(15).fill(2))
 })
