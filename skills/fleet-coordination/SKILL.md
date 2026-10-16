@@ -44,6 +44,8 @@ bin/test-switchboard -k test_the_role_files_do_not_grow   # the role-file byte c
 bin/test-switchboard -k TestHygiene                       # shebang, stdlib-only, executable bits
 ```
 
+When a scenario's evidence is your own measurement, launch a tester of your lane (`--role tester --reports-to <you>`, headless is enough) to re-measure and record the verdict: never record as yourself, and do not ask for a waiver.
+
 `ASK` carries the Intent and Done when of the ask this assignment serves
 (`fleet-switchboard intent <issue>` prints them), so a coder who never sees the
 charter still knows what the work is for. `GOAL` and `DONE` narrow the ask to this

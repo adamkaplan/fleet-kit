@@ -14770,6 +14770,21 @@ class TestSelfRegisteringCli(unittest.TestCase):
         self.assertIn("alphabetical by function name", (REPO / "docs" / "switchboard.md").read_text())
 
 
+class TestOwnMeasurementTester(unittest.TestCase):
+    """An orchestrator that measured a scenario itself re-measures through a tester of its lane, never a waiver."""
+    PLANNING = "**Your own measurement:** an orchestrator that measured a scenario is its author: launch a tester of your lane (`--role tester --reports-to <you>`, headless is enough) to re-measure and record it, never as yourself; ask no waiver."
+    COORDINATION = "When a scenario's evidence is your own measurement, launch a tester of your lane (`--role tester --reports-to <you>`, headless is enough) to re-measure and record the verdict: never record as yourself, and do not ask for a waiver."
+
+    def test_each_text_is_in_its_skill_exactly_once(self):
+        for skill, text in (("fleet-planning", self.PLANNING), ("fleet-coordination", self.COORDINATION)):
+            with self.subTest(skill=skill):
+                self.assertEqual((REPO / "skills" / skill / "SKILL.md").read_text().count(text), 1)
+
+    def test_the_texts_name_roles_never_agents_or_people(self):
+        for text in (self.PLANNING, self.COORDINATION):
+            self.assertNotRegex(text, r"(?i)\b(coder\d|cos\b|fleet-upkeep|adam)")
+
+
 class TestPlanningSkill(unittest.TestCase):
     """skills/fleet-planning: short, installed like the other skills, and its own example passes `plan check`."""
     SKILL = REPO / "skills" / "fleet-planning" / "SKILL.md"

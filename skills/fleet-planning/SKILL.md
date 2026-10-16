@@ -24,19 +24,21 @@ Staff; an epic or workspace plan, the Chief of Staff, then the owner.
    screenshot`), `pass` (a concrete observable: a status, a number, a quoted value), `discriminates` (the specific wrong
    build that would FAIL it), `evaluator` (`ci | tester | reviewer | owner`, able to record that proof), and optionally
    `claim: epic` for what only an integrated head can prove (name the integration branch in the plan).
-   **Owner evaluators are rare**: only where the owner's own eyes are the test (an infographic's look, an access grant), proved once with `claim: epic`; never for a routine PR.
+   **Owner evaluators are rare**: only where the owner's own eyes are the test, proved once with `claim: epic`; never for a routine PR.
+
+   **Your own measurement:** an orchestrator that measured a scenario is its author: launch a tester of your lane (`--role tester --reports-to <you>`, headless is enough) to re-measure and record it, never as yourself; ask no waiver.
 3. **Constraints** (`PC-n`): what must hold and why (a shared contract, a security rule, a held path). Nothing else is a
    constraint.
 4. **Out of scope**, **areas touched** (and whether any is held-PR), **risks and rollback**, **open questions**, **size and
    tier**, and **the integration-branch decision** (stay on main, or `integration/<epic-slug>`).
    **Size** is a T-shirt in AGENT time, never human-days: S under 1 hour, M a few hours, L about a day, XL several days, each with what makes it that
-   size (a light plan may carry just `size: S`). Never prefer the smaller option merely because it is less work when a larger one
+   size. Never prefer the smaller option merely because it is less work when a larger one
    simplifies the system. Put `plan-format: 2` and a `size:` line in the plan; `plan check` then flags a missing size and days for work under L.
 
 ## Check it
 
 `fleet-switchboard plan check <owner/repo#N> [--ask <owner/repo#N>] [--json]` prints `PASS` or `FAIL`, one defect per line,
-and the plan hash (editing anything changes it). Before you send a draft, run `plan check --file <plan> --done-when <the
+and the plan hash. Before you send a draft, run `plan check --file <plan> --done-when <the
 issue's Done-when>` (the issue body needs `## Intent` before `Done when:`; format 2 needs a `clauses:` and a `scenarios:` yaml block) and fix every defect. It only reads GitHub.
 
 ## The form
@@ -96,4 +98,4 @@ Link it in every brief (`PLAN: <link>`). The worker proves each scenario with `f
 --evidence <link-or-what-you-ran>`, an evaluator records `verdict`, and `fleet-switchboard gates <pr>` shows what is still
 open. The order does not matter (a `ci` verdict recorded before your `prove` counts once the proof exists at the same head, and
 the daemon records `ci` verdicts itself within minutes of green checks): a coder's only extra step is `prove`. A push voids every proof and
-verdict. Owner evaluators are rare (only where the owner's own eyes are the test). A hotfix may be waived by the Chief of Staff, logged; the plan is then due retroactively within a day.
+verdict. A hotfix may be waived by the Chief of Staff, logged; the plan is then due retroactively within a day.
