@@ -22373,6 +22373,42 @@ class TestTriage(Base):
         self.go()
         self.assertEqual(self.only("T7"), ["acme/api#330", "acme/api#331", "acme/api#332"])
 
+    def verdict_prs(self, cases, start):
+        """One PR of ours per (state, body) case, each with a formal review from the author's own account ("bot")."""
+        for n, (state, body) in enumerate(cases, start):
+            self.add(n, created=0.4, pr=True)
+            self.describe_pr(n, reviews=[("bot", state, TRI_HEAD_A, body)])
+        self.go()
+        return ["acme/api#%d" % n for n in range(start, start + len(cases))]
+
+    def test_t7_a_verdict_review_from_the_authors_account_counts_approve_or_changes_requested(self):
+        self.charter()
+        self.verdict_prs([("COMMENTED", "Review of %s: APPROVE" % TRI_HEAD_A), ("COMMENTED", "Review of %s: CHANGES REQUESTED\nx" % TRI_HEAD_A)], 340)
+        self.assertEqual(self.only("T7"), [])
+
+    def test_t7_a_review_that_does_not_name_this_head_or_start_with_the_phrase_is_not_counted(self):
+        self.charter()
+        refs = self.verdict_prs([("COMMENTED", "Review of %s: APPROVE" % TRI_HEAD_B), ("COMMENTED", "looks fine"),
+                                 ("COMMENTED", ""), ("COMMENTED", "see: Review of %s: APPROVE" % TRI_HEAD_A),
+                                 ("PENDING", "Review of %s: APPROVE" % TRI_HEAD_A), ("DISMISSED", "Review of %s: APPROVE" % TRI_HEAD_A),
+                                 ("COMMENTED", "Review of %s: LGTM" % TRI_HEAD_A)], 350)
+        self.assertEqual(self.only("T7"), refs)
+
+    def test_t7_the_sha_is_a_whole_token_of_at_least_seven_characters_of_the_head(self):
+        self.charter()
+        refs = self.verdict_prs([("COMMENTED", "Review of %s: APPROVE" % TRI_HEAD_A[:7]), ("COMMENTED", "Review of %s: APPROVE" % TRI_HEAD_A[:6]),
+                                 ("COMMENTED", "Review of %s: APPROVE" % TRI_HEAD_B[:7]), ("COMMENTED", "Review of %sc: APPROVE" % TRI_HEAD_A[:7])], 360)
+        self.assertEqual(self.only("T7"), refs[1:])
+
+    def test_a_verdict_review_from_the_authors_account_is_not_a_review_for_the_gates_the_hold_or_the_captain_evidence(self):
+        data = captain_pr(head=TRI_HEAD_A, reviews=[("bot", "COMMENTED", TRI_HEAD_A, "Review of %s: APPROVE" % TRI_HEAD_A)], author="bot")
+        data = json.loads(data) if isinstance(data, str) else data
+        facts = sb.pr_facts_from(data)
+        self.assertTrue(facts["verdict_review"])
+        self.assertEqual(sb.pr_reviews_at(data["reviews"], TRI_HEAD_A, "bot"), [])
+        self.assertEqual(facts["reviews"], [])
+        self.assertEqual(sb.captain_evidence(facts, set()), None if facts["signed"] is None else [])
+
     def test_t10_waits_ten_minutes_after_the_close(self):
         self.charter()
         fresh = dict(tri_issue(self.now, 101, created=9, labels=[self.USER, "kind"], state="closed"), closed_at=sb.iso(self.now - 240))
@@ -40240,7 +40276,8 @@ HEAD_A, HEAD_B = "a" * 40, "b" * 40
 def captain_pr(body="MERGE: captain\n\nland it", head=HEAD_A, reviews=None, author="coder-bot", state="OPEN", comments=(), **more):
     """pr_view_json for a PR with a body, an author, a head and reviews [(login, state, commit oid)]."""
     fields = {"body": body, "headRefOid": head, "author": {"login": author}, "reviews": [
-        {"author": {"login": who}, "state": st, "commit": {"oid": oid}} for who, st, oid in (reviews or [])]}
+        dict({"author": {"login": r[0]}, "state": r[1], "commit": {"oid": r[2]}}, **({"body": r[3]} if len(r) > 3 else {}))
+        for r in (reviews or [])]}
     fields["comments"] = [{"author": {"login": author}, "body": text + (
         "\n<!-- fleet-switchboard:from=%s -->" % who if who else "")} for who, text in comments]
     fields.update(more)
