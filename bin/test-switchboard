@@ -30404,6 +30404,15 @@ class TestDecisionsFromGitHub(Base):
         self.closed_pass()
         self.assertEqual([d["ask"] for d in self.derive()[0]], [7], "an open decision is never hidden by an old payload")
 
+    def test_a_closed_payload_with_no_awaiting_label_drops_nothing_either(self):
+        issue = self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
+        self.rig.pump(15)
+        forged = dict(issue, state="closed", labels=[])   # a stale or forged closed payload that carries no label
+        self.gh.send("issues", {"action": "closed", "issue": forged})
+        self.assertEqual([d["ask"] for d in self.derive()[0]], [7], "the payload alone drops nothing, with or without the label")
+        self.rig.pump(15)   # the next catch-up read (open issues only) says what is true: the issue is open and labelled
+        self.assertEqual([d["ask"] for d in self.derive()[0]], [7])
+
     def test_a_read_that_fails_keeps_the_decision_listed(self):
         issue = self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
         self.rig.pump(15)

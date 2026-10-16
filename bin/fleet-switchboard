@@ -14301,9 +14301,9 @@ class GitHubHub:
         tier = decision_core.issue_tier(names, awaiting_label(self.config), awaiting_cos_label(self.config))
         with self.lock:
             closed = issue.get("state", "open") == "closed"
-            if tier is not None and closed:
-                return   # #570: a closed PAYLOAD alone never drops an issue (a late or replayed event would hide an open decision): bin/closed_labels.py reads it fresh and
-                         # calls forget_awaiting when GitHub says closed; a closed issue not yet kept is never added
+            if closed:
+                return   # #570: a closed PAYLOAD alone never drops (or adds) an issue, whatever labels it carries (a late, replayed or forged event would hide an open decision):
+                         # bin/closed_labels.py reads it fresh and calls forget_awaiting when GitHub says closed; the next catch-up read (open issues only) corrects the rest
             if tier is not None:
                 known = self.awaiting.get(key)
                 stamp = parse_iso(issue.get("updated_at"))
