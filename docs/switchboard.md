@@ -1392,6 +1392,8 @@ refuses, naming the entry it wants, when `gh_users` is set, the repo's owner has
 no entry, and no default token is in the environment. The `one-account` fault
 uses the default token for every repo.
 
+What scope those tokens really have, and the design to narrow them, is in [agent-credentials.md](agent-credentials.md).
+
 **Commissioning a project.** The Chief of Staff does not create repos and never
 runs `gh repo create`; it commissions a worker to. The `fleet-setup` skill is the
 procedure: check the account map, record a decision for the person ("Create
