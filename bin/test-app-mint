@@ -1,0 +1,585 @@
+#!/usr/bin/env python3
+"""test-app-mint: offline tests for the GitHub App installation token the gh and git shims use (shims/app_mint.py, shims/gh, shims/git; work item #609). No network
+beyond 127.0.0.1, no real key: a throwaway RSA key is generated with the system openssl, and a fake token endpoint answers on a local port.
+
+    bin/test-app-mint
+
+The last line printed is `RESULT: PASS` or `RESULT: FAIL`. Every repository, id and token here is invented."""
+import ast
+import http.server
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import sysconfig
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+GH_SHIM, GIT_SHIM, MODULE = REPO / "shims" / "gh", REPO / "shims" / "git", REPO / "shims" / "app_mint.py"
+SAFE_PATH = "/usr/bin:/bin"
+MAPPED, OTHER = "acme-org/widget-api", "acme-org/other-service"
+TOKEN, STORED = "ghs_fake_1", "stored_login_token"
+APP_ID, INSTALL = 123456, 7654321
+KEY_FILE_NAME = "app-key.pem"
+
+FAKE_GH = """#!/usr/bin/env python3
+import json, os, sys
+a = sys.argv[1:]
+cfg = os.environ.get("GH_CONFIG_DIR")
+token = None
+if cfg:
+    for line in open(os.path.join(cfg, "hosts.yml")):
+        if line.strip().startswith("oauth_token:"):
+            token = line.split(":", 1)[1].strip()
+open(os.environ["FAKE_CALLS"], "a").write(json.dumps({"argv": a, "token": token or os.environ.get("GH_TOKEN"), "from_file": bool(token),
+                                                       "env": dict(os.environ), "config_dir": cfg, "dir_mode": oct(os.stat(cfg).st_mode & 0o777) if cfg else None}) + "\\n")
+if a[:2] == ["auth", "token"]:
+    print(os.environ.get("FAKE_STORED", "stored_login_token")); sys.exit(0)
+if a[:2] == ["auth", "git-credential"]:
+    sys.stdin.read()
+    print("username=x-access-token"); print("password=%s" % (token or os.environ.get("GH_TOKEN"))); sys.exit(0)
+print("real gh out"); sys.exit(7)
+"""
+FAKE_GIT = "#!/usr/bin/env python3\nimport json,os,sys\nopen(os.environ['FAKE_GIT_LOG'],'w').write(json.dumps(sys.argv[1:]))\n"
+
+
+class Endpoint:
+    """The fake token endpoint: records every request (method, path, body, whether the App JWT verified) and answers as `answer` says."""
+
+    def __init__(self, pub):
+        self.pub, self.requests, self.status, self.permissions, self.token = pub, [], 201, None, TOKEN
+        self.raw, self.delay, self.install_status, self.expires_in, self.extra = None, 0, 200, 3600, {}
+        endpoint = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def handle_any(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length).decode() if length else ""
+                jwt = (self.headers.get("Authorization") or "").replace("Bearer ", "")
+                endpoint.requests.append({"method": self.command, "path": self.path, "body": body, "jwt_ok": endpoint.verify(jwt)})
+                if endpoint.delay:
+                    time.sleep(endpoint.delay)
+                if self.path.endswith("/installation"):
+                    return self.reply(endpoint.install_status, {"id": INSTALL})
+                if endpoint.raw is not None:
+                    return self.reply(endpoint.status, None, endpoint.raw)
+                perms = endpoint.permissions if endpoint.permissions is not None else {"contents": "write", "pull_requests": "write", "metadata": "read"}
+                expires = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + endpoint.expires_in))
+                answer = {"token": endpoint.token, "expires_at": expires, "permissions": perms, "repository_selection": "selected"}
+                answer.update(endpoint.extra)
+                self.reply(endpoint.status, answer)
+
+            def reply(self, status, obj, raw=None):
+                data = raw.encode() if raw is not None else json.dumps(obj).encode()
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            do_GET = do_POST = handle_any
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = "http://127.0.0.1:%d" % self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def verify(self, jwt):
+        try:
+            head, body, sig = jwt.split(".")
+            pad = lambda t: t + "=" * (-len(t) % 4)
+            import base64
+            signature = base64.urlsafe_b64decode(pad(sig))
+            fd, sigfile = tempfile.mkstemp()
+            os.write(fd, signature)
+            os.close(fd)
+            done = subprocess.run(["/usr/bin/openssl", "dgst", "-sha256", "-verify", str(self.pub), "-signature", sigfile], input=("%s.%s" % (head, body)).encode(),
+                                  capture_output=True)
+            os.unlink(sigfile)
+            claims = json.loads(base64.urlsafe_b64decode(pad(body)))
+            return done.returncode == 0 and claims.get("iss") == str(APP_ID) and claims["exp"] - claims["iat"] <= 600
+        except Exception:
+            return False
+
+    def mints(self):
+        return [r for r in self.requests if r["method"] == "POST"]
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class Base(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.keydir = Path(tempfile.mkdtemp(prefix="app-mint-key-"))
+        cls.key = cls.keydir / KEY_FILE_NAME
+        subprocess.run(["/usr/bin/openssl", "genrsa", "-out", str(cls.key), "2048"], check=True, capture_output=True)
+        cls.key.chmod(0o600)
+        cls.pub = cls.keydir / "pub.pem"
+        subprocess.run(["/usr/bin/openssl", "rsa", "-in", str(cls.key), "-pubout", "-out", str(cls.pub)], check=True, capture_output=True)
+        cls.key_lines = [l for l in cls.key.read_text().splitlines() if l and not l.startswith("-----")]
+        cls.endpoint = Endpoint(cls.pub)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.endpoint.close()
+        shutil.rmtree(str(cls.keydir), True)
+
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp(prefix="app-mint-"))
+        self.addCleanup(shutil.rmtree, str(self.home), True)
+        e = self.endpoint
+        e.requests.clear()
+        e.status, e.permissions, e.token, e.raw, e.delay, e.install_status, e.expires_in, e.extra = 201, None, TOKEN, None, 0, 200, 3600, {}
+        self.bin = self.home / "realbin"
+        self.bin.mkdir()
+        for name, text in (("gh", FAKE_GH), ("git", FAKE_GIT)):
+            (self.bin / name).write_text(text)
+            (self.bin / name).chmod(0o755)
+        self.sb = self.home / "fakesb"
+        self.state, self.calls = self.home / "state", self.home / "calls.log"
+        self.state.mkdir()
+        self.repo = MAPPED
+        self.write_config()
+
+    def write_config(self, **over):
+        cfg = {"app_installations": {MAPPED: {"app_id": APP_ID, "installation_id": INSTALL}}, "app_key_path": str(self.key), "app_api_base": self.endpoint.url,
+               "gh_users": {"acme-org/*": "acme-bot"}}
+        cfg.update(over)
+        cfg = {k: v for k, v in cfg.items() if v is not None}
+        path = self.home / ".config" / "fleet-switchboard" / "config.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(cfg))
+
+    def environ(self, extra=None):
+        body = json.dumps({"name": "worker", "repo": self.repo})
+        self.sb.write_text("#!/bin/sh\nif [ \"$1\" = whoami ] && [ \"$2\" = --json ]; then echo '%s'; exit 0; fi\n[ \"$1\" = whoami ] && echo worker && exit 0\nexit 2\n" % body)
+        self.sb.chmod(0o755)
+        env = {"PATH": "%s:%s:%s" % (GH_SHIM.parent, self.bin, SAFE_PATH), "HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / ".config"),
+               "FLEET_SWITCHBOARD_STATE": str(self.state), "FLEET_SWITCHBOARD_BIN": str(self.sb), "FLEET_SHIM_LOOKUP_SECONDS": "10", "FAKE_CALLS": str(self.calls),
+               "FLEET_REAL_GH": str(self.bin / "gh"), "FLEET_REAL_GIT": str(self.bin / "git"), "FAKE_GIT_LOG": str(self.home / "git.json"), "GH_TOKEN": STORED}
+        env.update(extra or {})
+        return env
+
+    def gh(self, *args, env=None, stdin=""):
+        if self.calls.exists():
+            self.calls.unlink()
+        done = subprocess.run([sys.executable, str(GH_SHIM), *args], capture_output=True, text=True, env=self.environ(env), input=stdin, timeout=60)
+        return done, self.recorded()
+
+    def recorded(self):
+        return [json.loads(l) for l in self.calls.read_text().splitlines()] if self.calls.exists() else []
+
+    def leaks(self, done, calls):
+        """Every place a key or token could show: stdout, stderr, the real gh's argv and environment (as the fake recorded them)."""
+        text = done.stdout + done.stderr + json.dumps([[c["argv"], c["env"]] for c in calls])
+        found = [line for line in self.key_lines if line in text]
+        return found + ([TOKEN] if TOKEN in text else [])
+
+    def module(self):
+        spec = importlib.util.spec_from_file_location("app_mint_under_test", str(MODULE))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def load(self, mod):
+        old = {k: os.environ.get(k) for k in ("XDG_CONFIG_HOME", "FLEET_SWITCHBOARD_STATE")}
+        os.environ["XDG_CONFIG_HOME"], os.environ["FLEET_SWITCHBOARD_STATE"] = str(self.home / ".config"), str(self.state)
+        self.addCleanup(lambda: [os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v) for k, v in old.items()])
+        return mod.read_config()
+
+
+class TestToken(Base):
+    def test_s1_a_write_carries_the_installation_token_and_not_the_stored_login(self):
+        done, calls = self.gh("issue", "comment", "7", "--body", "hello")
+        self.assertEqual(done.returncode, 7, done.stderr)
+        self.assertEqual([c["token"] for c in calls], [TOKEN])
+        self.assertTrue(calls[0]["from_file"])
+        self.assertNotIn(STORED, json.dumps(calls[0]["env"]))
+        self.assertEqual(len(self.endpoint.mints()), 1)
+        self.assertTrue(all(r["jwt_ok"] for r in self.endpoint.requests), "the App JWT is a valid RS256 token for the app id")
+        body = json.loads(self.endpoint.mints()[0]["body"])
+        self.assertEqual(body["repositories"], ["widget-api"])
+        self.assertEqual(calls[0]["dir_mode"], "0o700")
+        self.assertEqual(list((self.state / "app-run").iterdir()), [], "the token file is removed after the call")
+
+    def test_s1_a_read_of_a_mapped_repository_uses_the_token_too(self):
+        done, calls = self.gh("issue", "view", "7")
+        self.assertEqual([c["token"] for c in calls], [TOKEN])
+
+    def test_s2_git_asks_the_credential_route_and_gets_the_installation_token(self):
+        done, calls = self.gh("auth", "git-credential", "get", stdin="protocol=https\nhost=github.com\n\n")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual([l for l in done.stdout.splitlines() if l.startswith("password=")], ["password=" + TOKEN])
+        self.assertNotIn(STORED, done.stdout)
+
+    def test_s2_the_git_shim_routes_a_fleet_with_only_app_mappings_through_the_gh_helper(self):
+        self.write_config(gh_users=None)
+        done = subprocess.run([sys.executable, str(GIT_SHIM), "push", "origin", "main"], capture_output=True, text=True, env=self.environ(), timeout=60)
+        argv = json.loads((self.home / "git.json").read_text())
+        self.assertEqual(argv, ["-c", "credential.https://github.com.helper=", "-c", "credential.https://github.com.helper=!gh auth git-credential", "push", "origin", "main"])
+
+    def test_s2_a_corrupt_config_naming_the_app_still_routes_git_so_the_gh_shim_can_refuse(self):
+        (self.home / ".config" / "fleet-switchboard" / "config.json").write_text('{"app_installations": {')
+        subprocess.run([sys.executable, str(GIT_SHIM), "push"], capture_output=True, text=True, env=self.environ(), timeout=60)
+        self.assertIn("auth git-credential", (self.home / "git.json").read_text())
+        done, calls = self.gh("issue", "comment", "7", "--body", "x")
+        self.assertEqual((done.returncode, calls), (1, []))
+
+    @unittest.skipUnless(shutil.which("gh", path=":".join(p for p in os.environ.get("PATH", "").split(":") if "shims" not in p)), "no real gh on this machine")
+    def test_s2_the_real_gh_reads_the_token_from_the_private_hosts_file(self):
+        real = shutil.which("gh", path=":".join(p for p in os.environ.get("PATH", "").split(":") if "shims" not in p))
+        mod = self.module()
+        directory = mod.write_hosts_dir(TOKEN) if self.load(mod) is not None or True else None
+        self.addCleanup(mod.remove_dir, directory)
+        env = {"PATH": SAFE_PATH, "HOME": str(self.home), "GH_CONFIG_DIR": directory}
+        done = subprocess.run([real, "auth", "git-credential", "get"], input="protocol=https\nhost=github.com\n\n", capture_output=True, text=True, env=env, timeout=30)
+        self.assertIn("password=" + TOKEN, done.stdout, done.stderr)
+        done = subprocess.run([real, "auth", "token"], capture_output=True, text=True, env=env, timeout=30)
+        self.assertEqual(done.stdout.strip(), TOKEN, done.stderr)
+
+    def test_s3_two_calls_inside_the_hour_reuse_one_token_and_a_call_after_expiry_mints_a_new_one(self):
+        mod = self.module()
+        config = self.load(mod)
+        now = time.time()
+        self.assertEqual(mod.token_for(config, MAPPED, now), TOKEN)
+        self.assertEqual(mod.token_for(config, MAPPED, now + 1800), TOKEN)
+        self.assertEqual(len(self.endpoint.mints()), 1)
+        self.endpoint.token, self.endpoint.expires_in = "ghs_fake_2", 7200
+        self.assertEqual(mod.token_for(config, MAPPED, now + 3600 - 60), "ghs_fake_2", "inside the five-minute margin counts as expired")
+        self.assertEqual(len(self.endpoint.mints()), 2)
+        cache = list((self.state / "app-tokens").iterdir())
+        self.assertEqual([oct(p.stat().st_mode & 0o777) for p in cache], ["0o600"])
+
+    def test_s3_two_shim_calls_mint_once(self):
+        self.gh("issue", "view", "7")
+        self.gh("issue", "view", "8")
+        self.assertEqual(len(self.endpoint.mints()), 1)
+
+    def test_the_cache_is_not_reused_after_the_configuration_changes(self):
+        self.gh("issue", "view", "7")
+        self.write_config(app_permissions={"contents": "read", "metadata": "read"})
+        self.gh("issue", "view", "7")
+        self.assertEqual(len(self.endpoint.mints()), 2)
+
+
+class TestFailClosed(Base):
+    def refused(self, repo=None, args=("issue", "comment", "7", "--body", "x"), mapped_message=True):
+        done, calls = self.gh(*args)
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertEqual(calls, [], "the real gh never runs, and the stored login is never used")
+        self.assertIn("stored login is not used" if mapped_message else "", done.stderr)
+        self.assertEqual(self.leaks(done, calls), [])
+        return done
+
+    def test_s4_each_of_the_five_failures_refuses_the_write(self):
+        cases = {}
+        missing = self.home / "nokey.pem"
+        cases["missing key"] = lambda: self.write_config(app_key_path=str(missing))
+        loose = self.home / "loose.pem"
+        shutil.copy(str(self.key), str(loose))
+        loose.chmod(0o644)
+        cases["key readable by others"] = lambda: self.write_config(app_key_path=str(loose))
+        cases["unreadable key (a directory)"] = lambda: self.write_config(app_key_path=str(self.home))
+        cases["mint answers 500"] = lambda: setattr(self.endpoint, "status", 500)
+        cases["unparseable answer"] = lambda: setattr(self.endpoint, "raw", "not json {")
+        for name, setup in cases.items():
+            with self.subTest(name):
+                self.setUp()
+                setup()
+                self.refused()
+                self.assertEqual(self.endpoint.mints() if name.startswith("mint") or name.startswith("unparse") else [], self.endpoint.mints())
+
+    def test_s4_a_timeout_refuses(self):
+        self.endpoint.delay = 1.5
+        done, calls = self.gh("issue", "comment", "7", "--body", "x", env={"FLEET_APP_MINT_SECONDS": "0.3"})
+        self.assertEqual((done.returncode, calls), (1, []))
+        self.assertIn("stored login is not used", done.stderr)
+        self.endpoint.delay = 0
+
+    def test_s4_a_failing_key_command_refuses_and_a_working_one_is_used(self):
+        self.write_config(app_key_path=None, app_key_command=["/bin/false"])
+        self.refused()
+        self.write_config(app_key_path=None, app_key_command=["/bin/cat", str(self.key)])
+        done, calls = self.gh("issue", "comment", "7", "--body", "x")
+        self.assertEqual([c["token"] for c in calls], [TOKEN])
+        self.assertEqual(self.leaks(done, calls), [])
+
+    def test_s4_the_read_of_a_mapped_repository_is_refused_too(self):
+        self.endpoint.status = 500
+        self.refused(args=("issue", "view", "7"))
+
+    def test_s5_a_token_with_administration_or_any_unlisted_permission_is_never_used(self):
+        for perms in ({"contents": "write", "administration": "write"}, {"contents": "write", "organization_administration": "read"}, {"contents": "write", "secrets": "read"},
+                      {"contents": "admin"}, {"metadata": "write"}, {}, None):
+            with self.subTest(perms=perms):
+                self.setUp()
+                self.endpoint.permissions = perms if perms is not None else None
+                if perms is None:
+                    self.endpoint.extra = {"permissions": None}
+                if perms == {}:
+                    self.endpoint.permissions = {}
+                self.refused()
+                self.assertEqual(len(self.endpoint.mints()), 1)
+
+    def test_s5_a_token_for_another_repository_or_all_repositories_is_refused(self):
+        self.endpoint.extra = {"repositories": [{"full_name": "acme-org/other-service"}]}
+        self.refused()
+        self.endpoint.extra = {"repository_selection": "all"}
+        self.refused()
+
+    def test_s5_the_configuration_never_allows_administration(self):
+        mod = self.module()
+        for perms in ({"administration": "read"}, {"contents": "admin"}, {"organization_administration": "write"}, {}, []):
+            with self.subTest(perms=perms):
+                self.write_config(app_permissions=perms)
+                with self.assertRaises(mod.ConfigError):
+                    self.load(mod)
+
+    def test_s6_a_repository_with_no_installation_is_refused_naming_it(self):
+        self.write_config(app_installations={MAPPED: {"app_id": APP_ID}})
+        self.endpoint.install_status = 404
+        done = self.refused(mapped_message=False)
+        self.assertIn(MAPPED, done.stderr)
+        self.setUp()
+        self.endpoint.status = 404
+        done = self.refused(mapped_message=False)
+        self.assertIn(MAPPED, done.stderr)
+        self.assertEqual([r for r in self.endpoint.requests if r["method"] == "POST"], self.endpoint.mints())
+
+    def test_s6_an_unspecified_installation_is_looked_up_once_and_used(self):
+        self.write_config(app_installations={MAPPED: {"app_id": APP_ID}})
+        done, calls = self.gh("issue", "comment", "7", "--body", "x")
+        self.assertEqual([c["token"] for c in calls], [TOKEN])
+        self.assertEqual([r["path"] for r in self.endpoint.requests], ["/repos/acme-org/widget-api/installation", "/app/installations/%d/access_tokens" % INSTALL])
+
+    def test_the_configuration_refuses_fleetkits_own_repository_wildcards_and_bad_shapes(self):
+        mod = self.module()
+        good = {"app_id": APP_ID, "installation_id": INSTALL}
+        bad = [{"adamkaplan/fleet-kit": good}, {"Acme/Fleet-Kit.git": good}, {"acme-org/*": good}, {"acme-org/../x": good}, {"": good}, {MAPPED: {"app_id": "abc"}},
+               {MAPPED: {"app_id": 0}}, {MAPPED: {"app_id": True}}, {MAPPED: "x"}, {MAPPED: good, "ACME-ORG/Widget-API": good}, ["x"]]
+        for mapped in bad:
+            with self.subTest(mapped=mapped):
+                self.write_config(app_installations=mapped)
+                with self.assertRaises(mod.ConfigError):
+                    self.load(mod)
+                done, calls = self.gh("issue", "view", "7")
+                self.assertEqual((done.returncode, calls), (1, []), done.stderr)
+        for over in ({"app_key_path": None}, {"app_key_command": ["x"]}, {"app_key_path": "relative.pem"}, {"app_api_base": "https://evil.example"},
+                     {"app_api_base": "http://example.com:80"}):
+            with self.subTest(over=over):
+                self.write_config(**over)
+                with self.assertRaises(mod.ConfigError):
+                    self.load(mod)
+
+    def test_a_shim_without_its_module_refuses_when_the_config_names_the_app(self):
+        lone = self.home / "lone"
+        lone.mkdir()
+        shutil.copy(str(GH_SHIM), str(lone / "gh"))
+        shutil.copy(str(REPO / "shims" / "repo_match.py"), str(lone / "repo_match.py"))
+        done = subprocess.run([sys.executable, str(lone / "gh"), "issue", "view", "7"], capture_output=True, text=True, env=self.environ(), timeout=60)
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertEqual(self.recorded(), [])
+
+    def test_a_corrupt_config_that_names_the_app_refuses_every_network_call(self):
+        (self.home / ".config" / "fleet-switchboard" / "config.json").write_text('{"app_installations": ')
+        done, calls = self.gh("issue", "view", "7")
+        self.assertEqual((done.returncode, calls), (1, []))
+        done, calls = self.gh("--version")
+        self.assertEqual(done.returncode, 7)
+
+
+class TestNeverLeaks(Base):
+    def test_s7_the_key_and_the_token_are_nowhere_in_output_argv_or_environment_across_success_and_five_failures(self):
+        outcomes = [lambda: None]
+        outcomes.append(lambda: self.write_config(app_key_path=str(self.home / "nokey.pem")))
+        outcomes.append(lambda: setattr(self.endpoint, "status", 500))
+        outcomes.append(lambda: setattr(self.endpoint, "raw", "{" + TOKEN))
+        outcomes.append(lambda: setattr(self.endpoint, "permissions", {"administration": "write"}))
+        outcomes.append(lambda: setattr(self.endpoint, "delay", 1.0))
+        seen = 0
+        for index, setup in enumerate(outcomes):
+            with self.subTest(index=index):
+                self.setUp()
+                setup()
+                done, calls = self.gh("issue", "comment", "7", "--body", "x", env={"FLEET_APP_MINT_SECONDS": "0.3"})
+                self.assertEqual(self.leaks(done, calls) if index else [t for t in self.leaks(done, calls) if t != TOKEN], [])
+                self.assertNotIn(TOKEN, done.stdout + done.stderr)
+                for call in calls:
+                    self.assertNotIn(TOKEN, json.dumps(call["argv"]) + json.dumps(call["env"]))
+                seen += 1
+        self.assertEqual(seen, 6)
+
+    def test_s7_a_key_command_does_not_leak_the_key_either(self):
+        self.write_config(app_key_path=None, app_key_command=["/bin/cat", str(self.key)])
+        done, calls = self.gh("pr", "create", "--title", "t", "--body", "b")
+        self.assertEqual(self.leaks(done, calls), [])
+
+    def test_the_inherited_token_variables_are_removed_from_the_child(self):
+        done, calls = self.gh("issue", "view", "7", env={"GITHUB_TOKEN": STORED, "GH_ENTERPRISE_TOKEN": STORED})
+        for name in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"):
+            self.assertNotIn(name, calls[0]["env"])
+
+    def test_the_signing_never_puts_the_key_in_argv(self):
+        text = MODULE.read_text()
+        self.assertIn("/dev/fd/", text)
+        self.assertNotIn("shutil.which", text)
+        self.assertNotIn("PATH", re.sub(r'"""[\s\S]*?"""', "", text).replace("os.environ.get", ""), "the openssl is a fixed absolute path, never found on PATH")
+
+
+class TestMatching(Base):
+    SPELLINGS = ["acme-org/widget-api", "ACME-ORG/Widget-API", "  acme-org/widget-api  ", "acme-org/widget-api.git", "Acme-Org/Widget-API.git", "acme-org/widget-api/",
+                 "acme-org/../widget-api", "acme\u2011org/widget-api", "acme-org/widget-api\u212a", "acme-org/widget-api.git.git", "", "acme-org//widget-api"]
+
+    def test_s8_twelve_hostile_spellings_reach_the_mint_as_the_one_normalised_name_or_are_refused(self):
+        mod = self.module()
+        config = self.load(mod)
+        self.assertEqual(len(self.SPELLINGS), 12)
+        allowed = {"/app/installations/%d/access_tokens" % INSTALL}
+        for text in self.SPELLINGS:
+            with self.subTest(text=text):
+                self.endpoint.requests.clear()
+                shutil.rmtree(str(self.state / "app-tokens"), True)
+                try:
+                    mod.token_for(config, text)
+                    ok = True
+                except mod.MintRefused:
+                    ok = False
+                bodies = [json.loads(r["body"]) for r in self.endpoint.mints()]
+                self.assertEqual([r["path"] for r in self.endpoint.mints()], [p for p in allowed] * len(bodies))
+                self.assertTrue(all(b["repositories"] == ["widget-api"] for b in bodies), bodies)
+                self.assertEqual(ok, len(bodies) == 1)
+                if text in ("acme-org/../widget-api", "acme\u2011org/widget-api", "acme-org/widget-api\u212a", "acme-org/widget-api.git.git", "", "acme-org//widget-api"):
+                    self.assertFalse(ok, text)
+                else:
+                    self.assertTrue(ok, text)
+                    self.assertEqual(self.endpoint.mints()[0]["path"], "/app/installations/%d/access_tokens" % INSTALL)
+
+    def test_s8_the_mint_is_asked_for_the_name_the_shared_matcher_gives(self):
+        mod = self.module()
+        self.assertEqual(mod._matcher().normal_repo("Acme-Org/Widget-API.git"), "acme-org/widget-api")
+
+    def test_s8_through_the_shim_a_cos_style_explicit_repo_is_normalised_before_the_mint(self):
+        self.repo = OTHER   # the caller's own repository is unmapped; the command names the mapped one in odd spelling
+        done, calls = self.gh("issue", "comment", "7", "-R", "ACME-ORG/Widget-API.git", "--body", "x")
+        self.assertEqual(done.returncode, 7, done.stderr)
+        self.assertTrue(all(json.loads(r["body"])["repositories"] == ["widget-api"] for r in self.endpoint.mints()))
+
+
+class TestUnmapped(Base):
+    def control(self, repo, args):
+        """The same call with no App mapping at all: the stored-login behaviour the shim had before."""
+        self.write_config(app_installations=None, app_key_path=None, app_api_base=None)
+        self.repo = repo
+        done, calls = self.gh(*args)
+        for c in calls:
+            c.pop("config_dir", None)
+        return done.returncode, done.stdout, done.stderr, [(c["argv"], c["token"], c["from_file"]) for c in calls]
+
+    def test_s9_u1_an_unmapped_repository_uses_the_stored_login_exactly_as_before_and_never_asks_the_mint(self):
+        for repo in (OTHER, "acme-org/third", "acme-org/fourth.git".replace(".git", "")):
+            with self.subTest(repo=repo):
+                self.setUp()
+                args = ("issue", "comment", "7", "--body", "x")
+                before = self.control(repo, args)
+                self.setUp()
+                self.repo = repo
+                done, calls = self.gh(*args)
+                after = (done.returncode, done.stdout, done.stderr, [(c["argv"], c["token"], c["from_file"]) for c in calls])
+                self.assertEqual(after, before)
+                self.assertEqual(self.endpoint.requests, [])
+                self.assertEqual({c["token"] for c in calls} - {None}, {STORED})
+
+    def test_s9_the_credential_route_for_an_unmapped_repository_is_unchanged(self):
+        self.repo = OTHER
+        done, calls = self.gh("auth", "git-credential", "get", stdin="host=github.com\n\n")
+        self.assertEqual(self.endpoint.requests, [])
+        self.assertIn("password=" + STORED, done.stdout)
+
+    def test_no_app_config_at_all_runs_the_real_gh_in_place_with_the_stored_token(self):
+        self.write_config(app_installations=None, app_key_path=None, app_api_base=None)
+        done, calls = self.gh("issue", "view", "7")
+        calls = [c for c in calls if c["argv"][:2] != ["auth", "token"]]
+        self.assertEqual([c["token"] for c in calls], [STORED])
+        self.assertFalse(calls[0]["from_file"])
+
+    def test_a_hold_label_refusal_still_comes_first_and_nothing_is_written(self):
+        self.write_config(hold_labels={MAPPED: {"label": "acme:hold", "message": "held by the owner"}})
+        fake = self.bin / "gh"
+        fake.write_text(FAKE_GH.replace('print("real gh out")', '''if a[:2] in (["pr", "view"], ["issue", "view"]) and "url,number,labels" in a:
+    print(json.dumps({"url": "https://github.com/acme-org/widget-api/pull/7", "number": 7, "labels": [{"name": "acme:hold"}]})); sys.exit(0)
+print("real gh out")'''))
+        done, calls = self.gh("pr", "merge", "7", "-R", MAPPED)
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn("held by the owner", done.stderr)
+        self.assertFalse([c for c in calls if c["argv"][:2] == ["pr", "merge"]], "the refused merge never reaches gh")
+
+
+class TestConfigLoad(Base):
+    def test_the_switchboard_config_loader_accepts_the_keys_and_refuses_fleetkits_own_repository(self):
+        loader = importlib.machinery.SourceFileLoader("fleet_switchboard_cfg", str(REPO / "bin" / "fleet-switchboard"))
+        spec = importlib.util.spec_from_loader("fleet_switchboard_cfg", loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        good = {"app_installations": {MAPPED: {"app_id": APP_ID}}, "app_key_path": str(self.key)}
+        path = self.home / "c.json"
+        path.write_text(json.dumps(good))
+        self.assertIn("app_installations", module.load_config(str(path)))
+        path.write_text(json.dumps(dict(good, app_installations={"adamkaplan/fleet-kit": {"app_id": APP_ID}})))
+        with self.assertRaises(module.ConfigError):
+            module.load_config(str(path))
+
+
+class TestHygieneOfTheModule(unittest.TestCase):
+    def test_s11_the_module_imports_only_the_standard_library(self):
+        roots = tuple(os.path.realpath(sysconfig.get_paths()[k]) for k in ("stdlib", "platstdlib"))
+        names = set()
+        for node in ast.walk(ast.parse(MODULE.read_text())):
+            if isinstance(node, ast.Import):
+                names.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                names.add(node.module.split(".")[0])
+        self.assertTrue(names)
+        for name in sorted(names):
+            origin = importlib.util.find_spec(name).origin or ""
+            self.assertTrue(origin in ("built-in", "frozen") or (os.path.realpath(origin).startswith(roots) and "site-packages" not in origin), name)
+
+    def test_the_module_is_portable_and_impersonal(self):
+        text = MODULE.read_text()
+        pattern = re.compile("|".join(["jan" + "us", "sp" + "ire", "adk" + "aplan", "/Us" + "ers/", "direc" + "tor(?!y|ies)"]), re.IGNORECASE)
+        for number, line in enumerate(text.splitlines(), 1):
+            self.assertIsNone(pattern.search(line), "%d: %s" % (number, line))
+
+    def test_s10_no_tracked_or_new_file_holds_a_key_or_a_token(self):
+        block, token = re.compile("-----BEGIN [A-Z ]*PRIVATE " + "KEY-----"), re.compile(r"gh[sp]_[A-Za-z0-9]{16,}")
+        listed = subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard"], cwd=str(REPO), capture_output=True, text=True).stdout.split("\n")
+        hits = []
+        for name in filter(None, listed):
+            if not name.startswith(("shims/", "docs/", "bin/")):
+                continue
+            path = REPO / name
+            if not path.is_file() or path.stat().st_size > 2_000_000:
+                continue
+            try:
+                text = path.read_text()
+            except (UnicodeDecodeError, OSError):
+                continue
+            if block.search(text) or token.search(text):
+                hits.append(name)
+        self.assertEqual(hits, [])
+
+
+if __name__ == "__main__":
+    result = unittest.main(exit=False, verbosity=1)
+    print("RESULT: PASS" if result.result.wasSuccessful() else "RESULT: FAIL")
+    sys.exit(0 if result.result.wasSuccessful() else 1)
