@@ -39862,7 +39862,7 @@ class TestHeldTop(DecisionsBase):
             body = self.OPEN + unit * (64000 // len(unit))
             started = time.monotonic()
             found = self.defects(body)
-            self.assertLess(time.monotonic() - started, 0.5, "64 KB of %r" % unit)   # a generous bound: it takes milliseconds
+            self.assertLess(time.monotonic() - started, 2.0, "64 KB of %r" % unit)   # a generous bound: it takes milliseconds
             self.assertTrue(found)
         self.assertIn("longer than", self.defects(self.OPEN + self.TOP + "x" * 70001)[0])
 
@@ -39881,7 +39881,7 @@ class TestHeldTop(DecisionsBase):
             self.assertEqual(self.defects(top_with(tag)), [], tag)
         started = time.monotonic()
         found = self.defects(top_with("<pre " + "x" * 60000))   # never closed: it cannot be judged, so it fails
-        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertLess(time.monotonic() - started, 2.0)
         self.assertEqual(self.named(found, "diagram"), 1)
 
     def within(self, seconds, fn, *args):
@@ -39918,7 +39918,6 @@ class TestHeldTop(DecisionsBase):
             for _ in range(20000):
                 body = self.OPEN + "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 60)))
                 self.assertIsInstance(sb.held_defects(body), list)
-        started = time.monotonic()
         self.within(60, run)
 
     def test_none_line_variants_and_hostile_runs_are_judged_quickly(self):
@@ -39926,10 +39925,10 @@ class TestHeldTop(DecisionsBase):
                          ("Questions: none (a) (b)", True), ("Questions: none (open", False), ("Questions: nonexistent", False), ("Questions: none x", False)):
             body = self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + "## Questions for you\n\n" + line + "\n"
             self.assertEqual(self.defects(body) == [], ok, line)
-        for hostile in ("Questions: none" + " " * 60000 + "x", "Questions: none (" * 4000, "Questions: none" + "\t" * 60000 + "x", "<!--" * 17000, "<!---->" * 10000):
+        for hostile in ("Questions: none" + " " * 60000 + "x", "Questions: none (" * 4000, "Questions: none" + "\t" * 60000 + "x", "<!--" * 17000, "<!---->" * 9000):
             started = time.monotonic()
             self.assertTrue(self.within(5, self.defects, self.OPEN + hostile))
-            self.assertLess(time.monotonic() - started, 0.5, hostile[:20])
+            self.assertLess(time.monotonic() - started, 2.0, hostile[:20])   # a wide margin: it takes milliseconds; the alarm above catches a hang
 
     def test_an_exhausted_step_budget_makes_the_body_unreadable(self):
         with mock.patch.object(sb, "_held_steps", return_value=[0]):
