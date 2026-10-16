@@ -360,3 +360,5 @@ report the switchboard retires it by itself; retire is for the cases it cannot t
 ## Heavy runs
 
 Full suites and browser/e2e runs go through `fleet-switchboard heavy -- <cmd>`: it waits for one of a few CPU slots and runs the command at background priority, so many agents do not starve the machine.
+
+An agent that is asked to run a mutation or fault-injection check (a tester or the orchestrator's own worker, never a reviewer, who runs nothing) runs each run through `fleet-switchboard heavy` with a time limit (`heavy -- timeout N <command>`), in its own process group which it stops as a whole when the limit is hit, and never leaves one running in the background. The wrapper also stops a tree that passes its ceiling, but do not rely on that for a mutant that can loop.
