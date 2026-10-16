@@ -12969,7 +12969,7 @@ class TestClearCarry(unittest.TestCase):
 
     def test_s8_there_is_one_fingerprint_function_and_the_carry_code_holds_no_path_or_class_literal(self):
         import ast
-        main = Path(sb.__file__).read_text()
+        main = Path(sb.__file__).read_text() + "\n" + (Path(sb.__file__).parent / "impact_hold.py").read_text()   # #532: the clear's wrapper moved to bin/impact_hold.py, still "the switchboard's" code
         module = Path(sb.__file__).parent / "clear_carry.py"
         text = module.read_text()
         defs = [n.name for src in (main, text) for n in ast.walk(ast.parse(src)) if isinstance(n, ast.FunctionDef) and "fingerprint" in n.name]
