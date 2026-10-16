@@ -49509,14 +49509,69 @@ class TestHeavyFifo(unittest.TestCase):
         self.assertEqual(seen, {"express": True, "ordinary": [False, False, False]})
 
     def test_a_dead_waiters_pid_reused_by_another_process_is_not_that_waiter(self):
-        self.seed([1001])
-        entry = json.loads((self.dir / "heavy-queue.json").read_text())
-        entry["entries"][0]["start"] = "Mon Jan  1 00:00:00 2024"
-        (self.dir / "heavy-queue.json").write_text(json.dumps(entry))
-        starts = {1001: "Tue Jan  2 00:00:00 2024"}
-        self.assertFalse(self.hs._alive(os.getpid(), "not this process's start time") and False)
-        line = self.hs.Line(str(self.dir), "w", pid=1002, alive=lambda p, st: starts.get(p, "x") == st, start_of=lambda p: "t")
-        self.assertEqual(line.place(), 1, "the entry's start time no longer matches the process that has the pid")
+        """The real `_alive` with a mocked start-time reader: the pid exists (this process) but its start time is not the one the entry recorded."""
+        with mock.patch.object(self.hs, "_process_start", lambda pid: "Tue Jan  2 00:00:00 2024"):
+            self.assertFalse(self.hs._alive(os.getpid(), "Mon Jan  1 00:00:00 2024"), "another process now has the pid")
+            self.assertTrue(self.hs._alive(os.getpid(), "Tue Jan  2 00:00:00 2024"), "the same process")
+            self.assertTrue(self.hs._alive(os.getpid(), ""), "an entry with no recorded start time is judged by the pid alone")
+        gone = subprocess.Popen(["true"])
+        gone.wait()
+        self.assertFalse(self.hs._alive(gone.pid, ""), "a pid that is gone is not alive")
+
+    def test_a_short_write_never_leaves_a_half_written_order_file_or_a_temporary_file(self):
+        line = self.hs.Line(str(self.dir), "w", pid=1001, alive=lambda p, st: True, start_of=lambda p: "t")
+        line.place()
+        before = (self.dir / "heavy-queue.json").read_text()
+        with mock.patch.object(self.hs.os, "fsync", side_effect=OSError(5, "disk")):
+            with self.assertRaises(self.hs.QueueUnusable):
+                self.hs.Line(str(self.dir), "w", pid=1002, alive=lambda p, st: True, start_of=lambda p: "t").place()
+        self.assertEqual((self.dir / "heavy-queue.json").read_text(), before, "the file is as it was")
+        self.assertEqual([p.name for p in self.dir.iterdir() if p.name.endswith(".tmp")], [], "no temporary file is left")
+
+
+    def test_a_caller_that_fell_back_after_joining_leaves_no_entry_behind(self):
+        real = self.hs.Line.place
+        calls = []
+
+        def once_then_fail(line):
+            calls.append(1)
+            if len(calls) > 1:
+                raise self.hs.QueueUnusable("the order file is corrupt")
+            return real(line)
+        with mock.patch.object(self.hs.Line, "place", once_then_fail):
+            self.assertEqual(self.run_as(1001, wait_max=25), 75)
+        self.assertEqual(self.entries(), [], "it joined, then fell back, and is not in the line any more")
+
+    def test_a_caller_that_is_not_short_never_uses_the_express_slot(self):
+        self.assertEqual(self.run_as(1001, short=False, wait_max=15), 75)
+        self.assertEqual(list(self.started), [])
+        self.assertFalse((self.dir / "heavy-slot-express.lock").exists(), "the express slot was not even opened")
+
+    def test_the_short_flag_of_the_command_reaches_the_wrapper(self):
+        seen = {}
+        args = types.SimpleNamespace(command=["--", "true"], slots=None, wait_max=None, name=None, short=True)
+        with mock.patch.object(sb.load_heavy_slots(), "run", lambda *a, **k: seen.update(k) or 0), mock.patch.object(sb, "ensure_state_dir", lambda: str(self.dir)), \
+                mock.patch.object(sb, "config_path", lambda: self.dir / "no-config"):
+            self.assertEqual(sb.cmd_heavy(args), 0)
+        self.assertIs(seen.get("short"), True)
+
+    def test_an_oversize_file_a_bad_entry_and_a_lock_that_stays_held_are_unusable_not_trusted(self):
+        make = lambda: self.hs.Line(str(self.dir), "w", pid=1001, alive=lambda p, st: True, start_of=lambda p: "t", lock_tries=2, lock_pause=0.001)
+        (self.dir / "heavy-queue.json").write_text(" " * (self.hs.QUEUE_BYTES + 10))
+        with self.assertRaises(self.hs.QueueUnusable):
+            make().place()
+        (self.dir / "heavy-queue.json").write_text(json.dumps({"entries": [{"pid": "x", "start": 1}]}))
+        with self.assertRaises(self.hs.QueueUnusable):
+            make().place()
+        (self.dir / "heavy-queue.json").write_text(json.dumps({"entries": [{"pid": 1, "start": "t"}] * (self.hs.QUEUE_MAX + 1)}))
+        with self.assertRaises(self.hs.QueueUnusable):
+            make().place()
+        (self.dir / "heavy-queue.json").unlink()
+        holder = os.open(str(self.dir / "heavy-queue.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, holder)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        with self.assertRaises(self.hs.QueueUnusable):
+            make().place()
 
 
 class TestHeavySlots(Base):

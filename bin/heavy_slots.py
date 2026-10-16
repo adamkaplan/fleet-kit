@@ -177,6 +177,7 @@ class Line:
         self.alive, self.lock_tries, self.lock_pause = alive, lock_tries, lock_pause
         self.path, self.lock_path = os.path.join(self.dir, QUEUE_FILE), os.path.join(self.dir, QUEUE_LOCK)
         self.joined = False
+        self.verified = {}   # (pid, start) -> monotonic time its liveness was last checked with `ps`
 
     def _locked(self):
         fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
@@ -190,7 +191,7 @@ class Line:
                     raise
                 time.sleep(self.lock_pause)
         os.close(fd)
-        raise OSError(errno.EAGAIN, "the order file stays locked")
+        raise OSError(errno.EAGAIN, "the order file stays locked")   # a deliberate fail-open: after about a second the caller takes whatever slot is free (one note)
 
     def _read(self):
         try:
@@ -217,12 +218,23 @@ class Line:
 
     def _write(self, entries):
         temporary = "%s.%d.tmp" % (self.path, os.getpid())
+        data = json.dumps({"entries": entries}).encode("utf-8")
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         try:
-            os.write(fd, json.dumps({"entries": entries}).encode("utf-8"))
-        finally:
-            os.close(fd)
-        os.replace(temporary, self.path)
+            try:
+                view = memoryview(data)
+                while view:   # a short write is finished, never renamed into place half done
+                    view = view[os.write(fd, view):]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(temporary, self.path)
+        except OSError:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
 
     def _mine(self, entry):
         return entry["pid"] == self.pid and entry["start"] == self.start
@@ -235,7 +247,7 @@ class Line:
             raise QueueUnusable(err.strerror or str(err))
         try:
             entries = self._read()
-            kept = [entry for entry in entries if self._mine(entry) or self.alive(entry["pid"], entry["start"])]
+            kept = [entry for entry in entries if self._mine(entry) or self._still_there(entry)]
             if join and not any(self._mine(entry) for entry in kept):
                 kept.append({"pid": self.pid, "start": self.start, "name": _plain(self.name, 40), "short": self.short})
             if kept != entries:
@@ -245,6 +257,24 @@ class Line:
             raise QueueUnusable(err.strerror or str(err))
         finally:
             os.close(lock)
+
+    def _still_there(self, entry):
+        """Is the entry's process alive? What `ps` said is kept for 5 s, so a line of waiters does not run it for every entry at every poll."""
+        key, now = (entry["pid"], entry["start"]), time.monotonic()
+        if self.alive is _alive and key in self.verified and now - self.verified[key] < 5.0:   # (an injected check is asked every time)
+            try:
+                os.kill(entry["pid"], 0)   # the cheap check every time: a pid that is gone is dropped at once
+            except ProcessLookupError:
+                self.verified.pop(key, None)
+                return False
+            except OSError:
+                pass
+            return True
+        if self.alive(entry["pid"], entry["start"]):
+            self.verified[key] = now
+            return True
+        self.verified.pop(key, None)
+        return False
 
     def place(self):
         """This caller's place in the line (1 is the head), joining at the end the first time. Raises QueueUnusable."""
@@ -588,6 +618,7 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
                     if not queue_noted:
                         queue_noted = True
                         out.write("heavy: no waiting order (%s): taking whichever slot is free\n" % err)
+                    queue.leave()   # an entry it already wrote must not stay behind it: a head that is not waiting would hold the others back
                     queue = None
             try:
                 fd = None
