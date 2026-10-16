@@ -60,6 +60,39 @@ def _raise_interrupted(signum, frame):
     raise Interrupted("signal %d" % signum)
 
 
+TOKEN_SHAPES = [re.compile(p) for p in (
+    r"gh[pousr]_[A-Za-z0-9]{6,}", r"github_pat_[A-Za-z0-9_]{6,}", r"eyJ[A-Za-z0-9_-]{6,}(?:\.[A-Za-z0-9_-]*)*",
+    r"[A-Za-z0-9+/]{40,}={0,2}", r"[A-Za-z0-9_-]{40,}", r"[0-9a-fA-F]{40,}")]  # standard and URL-safe base64, hex
+SCRUB_INPUT_MAX = 200000
+MIN_FRAGMENT = 8
+
+
+def scrub(text, secrets_known=(), limit=300):
+    """THE one place kubectl output (and anything built from it) is made safe to show, log or audit: the exact values
+    of this run's secrets and any 8+ character piece of one, token-shaped strings and long base64/hex runs are removed,
+    then the text is cut to `limit`. Control characters become '?'."""
+    text = str(text)[:SCRUB_INPUT_MAX]
+    for sec in sorted({v for v in secrets_known if v and len(v.strip()) >= MIN_FRAGMENT}, key=len, reverse=True):
+        for v in {sec, sec.strip()}:
+            text = text.replace(v, "[redacted]")
+        out, i = [], 0
+        while i < len(text):  # any run of 8+ characters that is a piece of the secret
+            head = text[i:i + MIN_FRAGMENT]
+            if len(head) == MIN_FRAGMENT and head in sec:
+                j = i + MIN_FRAGMENT
+                while j < len(text) and text[i:j + 1] in sec:
+                    j += 1
+                out.append("[redacted]")
+                i = j
+            else:
+                out.append(text[i])
+                i += 1
+        text = "".join(out)
+    for pat in TOKEN_SHAPES:
+        text = pat.sub("[redacted]", text)
+    return re.sub(r"[^\x20-\x7e]", "?", text)[:limit]
+
+
 def token_mode(env):
     """True when either service-account setting is present: the token-file login is then the only one (S8, S10)."""
     return bool((env.get("CW_CLOUD_SERVER") or "").strip() or (env.get("CW_CLOUD_TOKEN_FILE") or "").strip())
@@ -128,6 +161,7 @@ class Kube:
         self.context = (env.get("CW_KUBE_CONTEXT") or "").strip()
         self.kubeconfig = (env.get("CW_KUBECONFIG") or "").strip()
         self.dir = None
+        self.known = set()  # values of this run's secrets, known to scrub(); never logged
         if token_mode(env):
             self._generate_kubeconfig(env)
 
@@ -139,7 +173,9 @@ class Kube:
         token_file, server = (env.get("CW_CLOUD_TOKEN_FILE") or "").strip(), (env.get("CW_CLOUD_SERVER") or "").strip()
         try:
             with open(token_file) as f:
-                usable = bool(f.read(65536).strip())
+                body = f.read(65536)
+            usable = bool(body.strip())
+            self.known.add(body.strip())
         except OSError:
             usable = False
         if not usable:
@@ -163,6 +199,20 @@ class Kube:
             json.dump(cfg, f)
         self.env["KUBECONFIG"] = os.devnull  # no default kubeconfig can add a login
 
+    def scrub(self, text, limit=300):
+        return scrub(text, self.known, limit)
+
+    def add_secrets(self, *values):
+        self.known.update(v for v in values if v)
+
+    def delete_command(self, kind, name):
+        """The exact command that removes one object by hand: the configured login flags, never a value."""
+        if self.dir:
+            login = ["--kubeconfig", "<a kubeconfig for the service account whose token file is %s>" % (self.env.get("CW_CLOUD_TOKEN_FILE") or "")]
+        else:
+            login = (["--kubeconfig", self.kubeconfig] if self.kubeconfig else []) + ["--context", self.context]
+        return " ".join([self.bin] + login + ["-n", self.ns, "delete", kind, name])
+
     def close(self):
         if self.dir:
             shutil.rmtree(self.dir, ignore_errors=True)
@@ -175,15 +225,15 @@ class Kube:
         try:
             p = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=120, env=self.env)
         except (OSError, subprocess.TimeoutExpired) as e:
-            raise CloudError("kubectl failed: %s" % e)
+            raise CloudError("kubectl failed: %s" % self.scrub(e))
         if p.returncode != 0:
             if keep_stdout and p.stdout.strip():
                 return p.stdout  # the caller reads the failure from the tool's own JSON
             if ok_missing and "NotFound" in p.stderr:
                 return None
-            last = (p.stderr.strip().splitlines() or ["failed"])[-1]
-            raise CloudError("kubectl %s: %s" % (args[0], re.sub(r"[^\x20-\x7e]", "?", last)[:300]))
-        return p.stdout
+            last = (self.scrub(p.stderr, limit=SCRUB_INPUT_MAX).strip().splitlines() or ["failed"])[-1]
+            raise CloudError("kubectl %s: %s" % (args[0], self.scrub(last)))
+        return p.stdout  # a caller that renders it passes it through scrub() first
 
     def apply(self, obj):
         self.run(["apply", "-f", "-"], stdin=json.dumps(obj))
@@ -208,9 +258,17 @@ class Kube:
         self.run(["delete", "secret", name + "-run", "--ignore-not-found"])
 
     def delete(self, name):
-        self.delete_pod(name)
-        self.delete_secret(name)
-        self.delete_run_secret(name)
+        """Delete the pod and both Secrets, each attempted even if another fails; names what REMAINS and how to delete it."""
+        left = []
+        for kind, obj, fn in (("pod", name, self.delete_pod), ("secret", name + "-pw", self.delete_secret),
+                              ("secret", name + "-run", self.delete_run_secret)):
+            try:
+                fn(name)
+            except CloudError:
+                left.append((kind, obj))
+        if left:
+            raise CloudError("delete incomplete; REMAINS: %s; delete each with: %s" % (
+                ", ".join("%s/%s" % x for x in left), "; ".join(self.delete_command(k, o) for k, o in left)))
 
     def create_run_secret(self, name, pod, values):
         """One Secret per run. Each value goes to kubectl's stdin (--from-file=KEY=/dev/stdin, or a patch file on stdin
@@ -323,7 +381,7 @@ class Launcher:
     def audit(self, worker, runtime_id, action, cost, ok, reason=""):
         os.makedirs(os.path.dirname(self.audit_path), exist_ok=True)
         line = {"ts": iso(self.clock()), "worker": worker, "runtime_id": runtime_id, "action": action,
-                "cost_estimate_usd": cost, "ok": ok, "actor": pwd.getpwuid(os.getuid()).pw_name, "reason": reason}
+                "cost_estimate_usd": cost, "ok": ok, "actor": pwd.getpwuid(os.getuid()).pw_name, "reason": self.kube.scrub(reason, limit=1000)}
         try:
             fd = os.open(self.audit_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
             with os.fdopen(fd, "a") as f:  # one short O_APPEND write: atomic enough for one line, the chosen guarantee
@@ -341,11 +399,12 @@ class Launcher:
             result = fn(info)
         except CloudError as e:
             if not e.audited:
-                self.audit(worker, info["rid"], action, info["cost"], False, reason or str(e))
+                # the failure is never dropped: a caller's own reason (a stop reason, the run-secret names) comes first
+                self.audit(worker, info["rid"], action, info["cost"], False, "%s; %s" % (reason, e) if reason else str(e))
             raise
         except (ValueError, TypeError, KeyError) as e:  # a bad annotation or reply still writes its ok:false line
             self.audit(worker, info["rid"], action, info["cost"], False, reason or str(e)[:300])
-            raise CloudError("unexpected cloud data: %s" % str(e)[:200])
+            raise CloudError("unexpected cloud data: %s" % self.kube.scrub(e, 200))
         self.audit(worker, info["rid"], action, info["cost"], True, reason)
         return result
 
@@ -390,6 +449,7 @@ class Launcher:
                 raise CloudError("--hard is past --max-hard", EXIT_REFUSED)
             self.check_cap(a.shape, int((hard - now).total_seconds()))
             run_values = read_run_secret_values(parse_run_secret_fds(a.run_secret_fd))  # before anything is made
+            self.kube.add_secrets(*run_values.values())
             spec = render_pod(a, worker, name, now, hard, self.env, sorted(run_values))
             hits = scan_credentials(spec)
             if hits:
@@ -397,6 +457,7 @@ class Launcher:
             if self.kube.get_pod(name):
                 raise CloudError("worker %s already exists" % worker, EXIT_USAGE)
             password = secrets.token_urlsafe(32)
+            self.kube.add_secrets(password)
             # Single operator assumed: the check above and the applies below are not one atomic step.
             try:
                 made["secret"] = True
@@ -415,7 +476,11 @@ class Launcher:
                 left = self._cleanup(name, made)  # nothing is left running (and costing) or holding a password
                 err = e if isinstance(e, CloudError) else CloudError("could not hand over the password: %s" % e)
                 if left:
-                    err = CloudError("%s; CLEANUP FAILED, REMAINS: %s" % (err, ", ".join(left)), err.code)
+                    err = CloudError("%s; CLEANUP FAILED, REMAINS: %s; delete each with: %s" % (
+                        err, ", ".join(left), "; ".join(self._delete_cmd(l) for l in left)), err.code)
+                note = self._run_secret_note(name, made, left)
+                if note:
+                    err = CloudError("%s; %s" % (err, note), err.code)
                 raise err
             except BaseException as e:  # interrupt or an unexpected exception: clean up, audit, say what was cleaned
                 self._abort(worker, name, made, e)
@@ -464,13 +529,29 @@ class Launcher:
             print("cloud-worker: CLEANUP FAILED, REMAINS in the cluster (delete by hand): %s" % ", ".join(left), file=sys.stderr)
         return left
 
+    def _delete_cmd(self, label):
+        kind, obj = label.split("/", 1)
+        return self.kube.delete_command(kind, obj)
+
+    def _run_secret_note(self, name, made, left):
+        """What happened to the per-run Secret of a failed create, said once, with the delete command when it remains."""
+        if not made["run"]:
+            return ""
+        label = "secret/%s-run" % name
+        if label in left:
+            return "create failed; per-run secret %s-run REMAINS: delete it with: %s" % (name, self.kube.delete_command("secret", name + "-run"))
+        return "create failed; per-run secret %s-run cleaned" % name
+
     def _abort(self, worker, name, made, exc):
         interrupted = isinstance(exc, (Interrupted, KeyboardInterrupt))
         left = self._cleanup(name, made)
         cleaned = [l for k, l in (("pod", "pod/" + name), ("secret", "secret/%s-pw" % name), ("run", "secret/%s-run" % name)) if made[k] and l not in left]
         reason = "%s; cleaned: %s" % ("interrupted" if interrupted else "failed: %s" % str(exc)[:200], ", ".join(cleaned) or "nothing")
         if left:
-            reason += "; REMAINS: %s" % ", ".join(left)
+            reason += "; REMAINS: %s; delete each with: %s" % (", ".join(left), "; ".join(self._delete_cmd(l) for l in left))
+        note = self._run_secret_note(name, made, left)
+        if note:
+            reason += "; " + note
         self.audit(worker, "pod/" + name, "create.interrupted" if interrupted else "create.failed", 0.0, False, reason)
         err = CloudError("create %s" % reason, EXIT_INTERRUPTED if interrupted else EXIT_CLOUD)
         err.audited = True
@@ -498,8 +579,8 @@ class Launcher:
             return {"pushed": False, "wip_branch": None, "error": "end hook gave no result"}
         if not isinstance(res, dict):
             return {"pushed": False, "wip_branch": None, "error": "end hook gave no result"}
-        if res.get("error"):  # text from inside the pod and the remote: printable, short, before it is shown or audited
-            res["error"] = re.sub(r"[^\x20-\x7e]", "?", str(res["error"]))[:300]
+        if res.get("error"):  # text from inside the pod and the remote: scrubbed and short before it is shown or audited
+            res["error"] = self.kube.scrub(res["error"])
         return res
 
     def stop(self, a, reason=None):
@@ -533,8 +614,8 @@ class Launcher:
             skipped, note = [], ""
             try:
                 raw = res.get("skipped")
-                skipped = [re.sub(r"[^\x20-\x7e]", "?", str(x))[:200] for x in raw][:50] if isinstance(raw, list) else []
-                note = re.sub(r"[^\x20-\x7e]", "?", str(res.get("note") or ""))[:300]
+                skipped = [self.kube.scrub(x, 200) for x in raw][:50] if isinstance(raw, list) else []
+                note = self.kube.scrub(res.get("note") or "")
             except Exception:  # output handling never undoes the stop
                 pass
             if note:
@@ -717,7 +798,7 @@ def main(argv=None, env=None, clock=None, sleep=time.sleep):
         print(json.dumps(result, sort_keys=True))
         return 0
     except CloudError as e:
-        print("cloud-worker: %s" % e, file=sys.stderr)
+        print("cloud-worker: %s" % (kube.scrub(e, 1500) if kube else scrub(e, (), 1500)), file=sys.stderr)
         return e.code
     except (Interrupted, KeyboardInterrupt):
         print("cloud-worker: interrupted", file=sys.stderr)

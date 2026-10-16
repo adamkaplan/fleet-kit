@@ -460,5 +460,136 @@ class S6Names(K1Base):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
 
 
+SA_TOKEN_SHAPED = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJzeXN0ZW06c2Vy.c2lnbmF0dXJl"
+
+
+class M1Scrub(TokenBase):
+    """Every failure path echoes each planted value on stderr AND stdout: none may reach output, audit or exception text."""
+    PLANTED = [MODEL_VALUE, GIT_VALUE, TOKEN]
+
+    def setUp(self):
+        super().setUp()
+        self.env["FAKE_KUBE_ECHO"] = " ".join(self.PLANTED + [GIT_VALUE[3:] + "x", "ghp_" + "a" * 36])
+
+    def everything(self, outs):
+        return json.dumps(outs) + json.dumps(self.audit_lines())
+
+    def assert_clean(self, outs):
+        text = self.everything(outs)
+        for v in self.PLANTED + ["ghp_" + "a" * 36]:
+            self.assertNotIn(v, text)
+
+    def test_create_failure_paths(self):
+        for cmd in ("apply", "get", "create", "patch", "label"):
+            self.write_state({"pods": {}})
+            for f in (self.env["FAKE_KUBE_CALLS"], self.env["CW_CLOUD_AUDIT"]):
+                if os.path.exists(f):
+                    os.unlink(f)
+            self.patch_state(fail_cmd=cmd)
+            out = self.create_with_secrets("coder7")
+            self.assertNotEqual(out[0], 0, cmd)
+            self.assert_clean([out])
+
+    def test_create_cleanup_delete_failure_path(self):
+        self.patch_state(never_ready=True, fail_cmd="delete")
+        out = self.create_with_secrets("coder7", "--wait", "4")
+        self.assertNotEqual(out[0], 0)
+        self.assert_clean([out])
+
+    def test_stop_delete_exec_annotate_status_reap_failure_paths(self):
+        for cmd in ("exec", "annotate", "delete", "get"):
+            self.write_state({"pods": {}})
+            if os.path.exists(self.env["CW_CLOUD_AUDIT"]):
+                os.unlink(self.env["CW_CLOUD_AUDIT"])
+            self.assertEqual(self.create_with_secrets("coder7")[0], 0)
+            self.patch_state(fail_cmd=cmd)
+            outs = [self.run_cli("stop", "coder7"), self.run_cli("delete", "coder7", "--force"), self.run_cli("status"), self.run_cli("reap")]
+            self.assert_clean(outs)
+
+    def test_hook_error_text_is_scrubbed_of_the_token(self):
+        self.assertEqual(self.create_with_secrets("coder7")[0], 0)
+        self.patch_state(fail_cmd="exec")
+        code, out, err = self.run_cli("stop", "coder7")
+        self.assertEqual(code, 1)
+        self.assertNotIn(TOKEN, out + err + json.dumps(self.audit_lines()))
+        self.assertIn("[redacted]", err)
+
+    def test_scrub_function(self):
+        sec = {"abcdefgh-secret-value-123"}
+        self.assertNotIn("secret-value", cw.scrub("x abcdefgh-secret-value-123 y", sec))
+        self.assertNotIn("secret-value", cw.scrub("part secret-value-12 here", sec))  # a 8+ char piece
+        self.assertEqual(cw.scrub("short abc", sec), "short abc")  # a short piece is not a secret
+        for shaped in ("ghp_" + "b" * 30, "github_pat_" + "c" * 30, SA_TOKEN_SHAPED, "A" * 44, "0f" * 25):
+            self.assertNotIn(shaped, cw.scrub("e: %s" % shaped, ()))
+        self.assertLessEqual(len(cw.scrub("z " * 1000, ())), 300)
+        self.assertNotIn("\n", cw.scrub("a\nb", ()))
+
+
+class M2CreateAndDeleteFailureSaysSo(K1Base):
+    def hook_ok(self, tag="r"):
+        work, _ = base.make_repo(self.tmp.name, tag, dirty=False)
+        self.patch_state(hook_env={"CW_WORKDIR": work, "CW_WORKER": "coder7"})
+
+    def delete_cmd(self, name):
+        return "%s --context acme-cw -n cw delete secret %s" % (self.env["CW_KUBECTL"], name)
+
+    def test_failed_create_with_cleanup_ok_says_cleaned_once_in_audit_and_output(self):
+        self.patch_state(never_ready=True)
+        code, _, err = self.create_with_secrets("coder7", "--wait", "4")
+        run = cw.pod_name("coder7") + "-run"
+        phrase = "create failed; per-run secret %s cleaned" % run
+        self.assertEqual(code, 4)
+        self.assertEqual(err.count(phrase), 1)
+        creates = [x for x in self.audit_lines() if x["action"] == "create"]
+        self.assertEqual(len(creates), 1)
+        self.assertEqual(creates[0]["reason"].count(phrase), 1)
+
+    def test_failed_create_with_failed_cleanup_says_remains_with_name_and_command(self):
+        self.patch_state(never_ready=True, fail_cmd="delete", fail_cmd_only_run=True)
+        self.env["FAKE_KUBE_ECHO"] = "noise"
+        code, _, err = self.create_with_secrets("coder7", "--wait", "4")
+        run = cw.pod_name("coder7") + "-run"
+        self.assertEqual(code, 4)
+        cmd = self.delete_cmd(run)
+        for where, text in (("stderr", err), ("audit", self.audit_lines()[-1]["reason"])):
+            self.assertIn("per-run secret %s REMAINS: delete it with: %s" % (run, cmd), text, where)
+            self.assertNotIn(MODEL_VALUE, text)
+            self.assertNotIn(GIT_VALUE, text)
+        self.assertEqual(len([x for x in self.audit_lines() if x["action"] == "create"]), 1)
+
+    def test_interrupted_create_names_the_remaining_run_secret_and_command(self):
+        real = cw.Launcher._wait_ready
+
+        def boom(self_, name, seconds):
+            self.patch_state(fail_cmd="delete", fail_cmd_only_run=True)
+            raise cw.Interrupted("signal 15")
+        cw.Launcher._wait_ready = boom
+        self.addCleanup(setattr, cw.Launcher, "_wait_ready", real)
+        code, _, err = self.create_with_secrets("coder7")
+        run = cw.pod_name("coder7") + "-run"
+        self.assertEqual(code, 130)
+        self.assertIn(self.delete_cmd(run), err)
+        self.assertIn(self.delete_cmd(run), self.audit_lines()[-1]["reason"])
+        self.assertIn("per-run secret %s REMAINS" % run, self.audit_lines()[-1]["reason"])
+
+    def test_stop_and_delete_where_the_secret_delete_fails_after_the_pod_is_gone(self):
+        run = cw.pod_name("coder7") + "-run"
+        for argv in (("stop", "coder7"), ("delete", "coder7", "--force")):
+            self.write_state({"pods": {}})
+            self.hook_ok("r" + argv[0])
+            self.assertEqual(self.create_with_secrets("coder7")[0], 0)
+            self.patch_state(fail_cmd="delete", fail_cmd_only_run=True)
+            self.env["FAKE_KUBE_ECHO"] = "noise"
+            code, _, err = self.run_cli(*argv)
+            self.assertNotEqual(code, 0, argv)
+            self.assertIsNone(self.pod())  # the pod really is gone
+            self.assertIn("REMAINS: secret/%s" % run, err)
+            self.assertIn(self.delete_cmd(run), err)
+            last = self.audit_lines()[-1]
+            self.assertFalse(last["ok"])
+            self.assertIn(self.delete_cmd(run), last["reason"])
+            self.assertEqual(last["reason"].count("REMAINS: secret/%s" % run), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -32,6 +32,10 @@ if `CW_KUBECONFIG` or `CW_KUBE_CONTEXT` is also set. A missing or unreadable tok
 descriptor `N`, pipes it to `kubectl` on stdin into one Secret `<pod>-run`, and mounts it read-only at `/run/cw/NAME` (0400).
 The Secret goes with the pod at `stop`, `delete` and a failed or interrupted `create`; a pod kept because the end hook failed keeps it.
 
+Accepted scope of the role: `cw-operator` can get and list every secret in the workers namespace (a Role cannot limit `list` by label), so the namespace must hold only worker pods and their per-pod secrets; that is enforced in the deployment repository, not here.
+
+Everything that renders `kubectl` output (errors, the end hook's text, audit reasons) passes through one `scrub()`: this run's secret values and any 8+ character piece of one, token-shaped strings and long base64/hex runs are removed, then the text is cut. A failed `create`, `stop` or `delete` that leaves a per-run Secret says so once (audit and stderr) with its name and the exact `kubectl ... delete secret NAME` command, never a value.
+
 ## Create is interrupt-safe
 Ctrl-C, SIGTERM or any exception inside `create` deletes the per-run Secret and the pod it made and writes a
 `create.interrupted` (or `create.failed`) audit line naming what was cleaned. If a delete fails, stderr and the audit line

@@ -21,6 +21,11 @@ st = json.load(open(path))
 if st.get("fail_delete") and args[0] == "delete":
     print("Error from server (Forbidden): delete denied", file=sys.stderr); sys.exit(1)
 cmd = args[0]
+if st.get("fail_cmd") == cmd and not (cmd == "delete" and st.get("fail_cmd_only_run") and not args[2].endswith("-run")):
+    # a failure that ECHOES the planted values on stderr and on stdout (a real server error can quote what it was sent)
+    echo = os.environ.get("FAKE_KUBE_ECHO", "")
+    print(json.dumps({"error": echo, "pushed": False}))
+    print("Error from server (Forbidden): quota says %s" % echo, file=sys.stderr); sys.exit(1)
 def save():
     json.dump(st, open(path, "w"))
 def missing(what):
