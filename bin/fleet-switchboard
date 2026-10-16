@@ -6073,7 +6073,8 @@ def launch_headless(engine, name, agent, directory, role=None, reports_to=None, 
             ap = load_agent_presence()
             if ap.read_record(engine.state_dir, name)[0] is not None:
                 raise LaunchError("a headless record for %s already exists: `%s retire %s` first, or pick another name" % (name, PROG, name))
-            identity = headless_identity(engine, repo)   # refuses a repo that maps to a named gh account: a headless worker cannot be pinned to it
+            identity = headless_identity(engine, repo)   # a repo that maps to a named gh account is refused unless the route can be proved (below, once the session exists)
+            account = engine.accounts.account_for(repo) if repo and getattr(engine, "accounts", None) is not None else None
             fleet = fleet_record(name, role, reports_to, issue, charter, repo, launched_by)
             fleet["headless"] = True
             with engine._external("v2.session.create", name, {"agent": agent, "directory": directory, "fleet": fleet, "headless": True}) as result:
@@ -6084,6 +6085,8 @@ def launch_headless(engine, name, agent, directory, role=None, reports_to=None, 
                 info = engine.v2.session_get(session_id) or {}
                 if ((_fleet_meta(info) or {}).get("name")) != name:
                     raise LaunchError("the service does not show the new session as %s: nothing was sent" % name)
+                if account:
+                    identity = prove_headless_route(engine, session_id, name, repo, account)   # before the brief: nothing runs as a wrong account
                 if brief:
                     send_brief(engine, name, session_id, brief)
                 if engine.audit is not None:
@@ -6101,24 +6104,66 @@ def headless_identity(engine, repo):
     """The identity a headless worker will have, as one line; refuses (LaunchError) when it would be the WRONG one.
 
     A terminal worker is pinned to its repo's gh account by its pane's environment (GH_TOKEN). A headless worker's tools run in the OpenCode service,
-    and nothing durable pins them: `session.create` and `session.prompt` carry no environment, and `PUT /api/session/{id}/environment`, which does
-    set one, is held in the service's memory and is gone after a service restart (measured in a throwaway profile: the variable was set, then empty
-    after `service restart`), at which point the worker would silently act as the service's default account. So a repo that `gh_users` maps to a
-    named account is refused: use a terminal launch. Any other worker acts as the account of the service's environment, and says so."""
+    where nothing per session is durable (`PUT /api/session/{id}/environment` is lost on a service restart). What IS durable is the per-command route:
+    the fleet-hooks plugin puts the `gh` and `git` shims first on PATH of every shell command, and the shim asks `whoami --json` (the command's
+    OPENCODE_SESSION_ID and the repo in the session's metadata) which account to use, for that one command. So a repo that `gh_users` maps to a named
+    account is accepted only when `engine.route_check` exists and `prove_headless_route` proves that route for the new session; with no route check
+    it is refused, as before. Any other worker acts as the account of the service's environment, and says so."""
     accounts = getattr(engine, "accounts", None)
     if repo and accounts is None:   # fail closed: with no account map nothing says which account this repo uses
         raise LaunchError("cannot tell which gh account %s uses (no account map): a headless worker is refused" % repo)
     if repo:
         account = accounts.account_for(repo)
         if account:
-            raise LaunchError("a headless worker cannot work as the gh account %s that gh_users maps %s to: its tools run in the OpenCode service's environment, "
-                              "which cannot be pinned to an account (a service restart drops any per-session setting), so it would act as the service's own "
-                              "default account. Use a terminal launch (omit --headless)" % (account, repo))
+            if getattr(engine, "route_check", None) is None:
+                raise LaunchError("a headless worker cannot work as the gh account %s that gh_users maps %s to: its tools run in the OpenCode service's environment, "
+                                  "which cannot be pinned to an account (a service restart drops any per-session setting), so it would act as the service's own "
+                                  "default account. Use a terminal launch (omit --headless)" % (account, repo))
+            problem = engine.route_check()   # the shims the service puts first on PATH exist: a text, or None
+            if problem:
+                raise LaunchError("a headless worker cannot work as the gh account %s that gh_users maps %s to: its tools run in the OpenCode service's environment, "
+                                  "which cannot be pinned to an account, and the per-command route that would choose it cannot be proved (%s). "
+                                  "Use a terminal launch (omit --headless)" % (account, repo, problem))
+            return "this headless worker acts as the gh account %s for %s (the gh and git shims choose it per command; unproved until the session exists)" % (account, repo)
         problem = launch_account_problem(engine.config, accounts, repo)
         if problem:
             raise LaunchError(problem)
         return "this headless worker acts as the OpenCode service environment's own gh account (gh_users has no entry for %s)" % repo
     return "this headless worker acts as the OpenCode service environment's own gh account (it has no repo)"
+
+
+def shim_route_problem(environ=None, home=None):
+    """None when the `gh` and `git` shims the fleet-hooks plugin puts first on a shell's PATH exist and are executable, else the reason. The plugin takes
+    FLEET_SWITCHBOARD_SHIMS, or else the `shims` directory beside the checkout that ~/.local/bin/fleet-switchboard links to."""
+    environ = os.environ if environ is None else environ
+    given = environ.get("FLEET_SWITCHBOARD_SHIMS")
+    try:
+        if given:
+            shims = Path(given)
+            if not shims.is_absolute():
+                return "FLEET_SWITCHBOARD_SHIMS is not an absolute path, so the plugin's shell hook is off"
+        else:
+            shims = Path(os.path.realpath(Path(home or Path.home()) / ".local" / "bin" / "fleet-switchboard")).parent.parent / "shims"
+        for tool in ("gh", "git"):
+            if not os.access(shims / tool, os.X_OK):
+                return "the %s shim is not in place, so the plugin's shell hook has nothing to put first on PATH" % tool
+    except OSError as err:
+        return "the shims directory cannot be read (%s)" % _one_line(str(err))
+    return None
+
+
+def prove_headless_route(engine, session_id, name, repo, account):
+    """The same lookup the gh shim makes from a command of the new session (`whoami --json`: its OPENCODE_SESSION_ID, then the repo in the service's
+    own record of that session) must name this worker and this repo, and the map must give the repo's account. Names only, never a token. Raises
+    LaunchError (the caller deletes the session) when it does not."""
+    try:
+        fleet = session_identity(engine.herdr, engine.v2, {SESSION_ENV: session_id})
+    except (V2Error, CallerError, IdentityUncertain) as err:
+        raise LaunchError("a headless worker cannot be proved to act as the gh account %s for %s: the session lookup failed (%s)" % (account, repo, _one_line(str(err)))) from err
+    seen = (fleet or {}).get("repo")
+    if (fleet or {}).get("name") != name or not isinstance(seen, str) or engine.accounts.account_for(seen) != account:
+        raise LaunchError("a headless worker cannot be proved to act as the gh account %s for %s: the service's record of the session names %s as its repo" % (account, repo, seen or "none"))
+    return "this headless worker acts as the gh account %s for %s (proved: the session resolves to that repo; the shims choose the account per command)" % (account, repo)
 
 
 def undo_headless_launch(engine, ap, name, session_id):
@@ -15851,6 +15896,7 @@ def build_engine(runner, now, actor, writable=True, socket_call=None):
     engine = Switchboard(config, v2, herdr, audit, fact_sources(state), now, actor,
                          intents=intent_reader_for(config, runner, now), state_dir=state)
     engine.accounts = GhAccounts(config, runner, now)  # PR 15
+    engine.route_check = shim_route_problem   # headless launch: is the per-command gh/git route in place (#669)
     engine.accounts.audit, engine.accounts.actor = audit, actor   # the rate-limit pause is audited, once per episode
     if engine.intents is not None:
         engine.intents.accounts = engine.accounts   # ONE gate for every read of one account: one pause, one counter, one set of remembered answers
