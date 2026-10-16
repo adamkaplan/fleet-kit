@@ -95,7 +95,7 @@ Why:
 
 ### What C needs on top of the App
 
-- A local mint in the `gh` and `git` shims. The private key is read only by the shim process, never by an agent's shell or environment.
+- A local mint in the `gh` and `git` shims. The private key is meant to be read only by the shim process, never by an agent's shell or environment. A file mode is a convenience, not a guarantee, against an agent running as the same user; the real guard is that the key sits outside the agent's reach, for example under a different user or behind a vault call.
 - A one-hour per-repository token, cached with its expiry and renewed before it ends.
 - Fail closed: a mint failure, or a repository with no installation, refuses the call with one clear line. It never falls back to another login.
 - A repository-to-installation map extending `gh_users`.
@@ -117,9 +117,9 @@ Who merges after the change, in scope:
 
 Every step that creates or changes a credential is the owner's (see "The owner's own steps"). Agents run none of them and run no command that creates a credential. Steps apply only to the organisation's repositories where the App is installed.
 
-1. The owner adds `issues: write` and `checks: read` to the App's permissions and confirms there is no Administration permission.
-2. The owner confirms the App's installation on each in-scope repository.
-3. The shim work item lands separately (top tier, size L, owner's clear), with the mint, cache and fail-closed behaviour above.
+1. The owner confirms the App's installation on each in-scope repository.
+2. The shim work item lands separately (top tier, size L, owner's clear), with the mint, cache and fail-closed behaviour above. In the same change set, or before it, the cloud mint's expected permission map (`cloud/launcher/app_token.py`, which checks for exact equality) is updated to the new set, also a top-tier credential change with its own review and the owner's clear.
+3. Only after that is merged, the owner adds `issues: write` and `checks: read` to the App's permissions and confirms there is no Administration permission. Widening the App earlier makes the cloud mint refuse every cloud token, because the permissions no longer match its exact check. If that happens, narrow the App back to its previous permissions.
 4. The owner stores the App key where only the shim process reads it, and adds the repository-to-installation map beside `gh_users` in `~/.config/fleet-switchboard/config.json`.
 5. The owner removes the broad token from the agents' environment for in-scope repositories, so there is nothing broader to fall back on.
 6. An agent, with the owner present, runs the live proof of clause (4): an admin call is refused (403 or 404) and a branch push, pull request, label, comment and a merge through the ruleset still work. The same proof checks that the fleet-kit repository itself is unchanged.
@@ -131,7 +131,7 @@ If the App token breaks agent work on an in-scope repository, return to the curr
 1. Remove that repository's entry from the installation map, or restore the previous `gh_users` entry from the copy kept before step 4. The shims read it on every call, so there is no restart.
 2. Restore the inherited token for the agent's shell, if step 5 removed it.
 3. The previous keyring login was never deleted by this migration, so it is still there.
-4. If the cause was the key, the owner rotates it in the App's settings.
+4. If the cause was the key, the owner rotates it in the App's settings. If widening the App made cloud tokens refused, narrow the App back to `contents: write`, `pull_requests: write`, `metadata: read`.
 
 Rollback returns to today's behaviour, including admin reach for agents on that repository, so record why and treat it as temporary.
 
@@ -139,9 +139,9 @@ Rollback returns to today's behaviour, including admin reach for agents on that 
 
 These are the only credential-creating or credential-changing steps. No command here belongs in a script an agent runs.
 
-1. In the App's settings, set the permissions to `contents: write`, `pull_requests: write`, `issues: write`, `checks: read`, `metadata: read`, and no Administration.
+1. Only after the shim and cloud-mint changes are merged (see Migration, steps 2 and 3), in the App's settings set the permissions to `contents: write`, `pull_requests: write`, `issues: write`, `checks: read`, `metadata: read`, and no Administration.
 2. Confirm the App is installed on each in-scope repository (for example `acme-org/widget-api` and `acme-org/widget-web`), and on nothing else.
-3. Generate or keep the App's private key; store it only where the shim process can read it, never in a file an agent's shell reads, an issue or a message.
+3. Generate or keep the App's private key; store it outside the agent's reach (a different user, or a vault call the shim makes), never in a file an agent's shell reads, an issue or a message. A file mode alone is not a boundary against the same user.
 4. Review each in-scope ruleset: its required checks and approvals are what agents are held to, and the App is not in a bypass list.
 5. Add the repository-to-installation map to the configuration once the shim work has landed.
 6. Remove the broad inherited token from the agents' shells for in-scope repositories.
