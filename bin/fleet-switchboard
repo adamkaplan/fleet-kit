@@ -6175,7 +6175,7 @@ def resume_agent(engine, name, session_id, workspace, patience=LAUNCH_PATIENCE, 
             raise LaunchError(str(err)) from None
     taken = engine.discover(engine.now()).agents.get(name)
     released = []
-    if taken is not None:
+    if taken is not None and not taken.headless:   # a headless worker has no pane to release (#433: `watch` opens the first terminal on it)
         released = release_stale_binding(engine, name, taken, session_id, replace=replace)   # refuses (LaunchError) a pane that is really running it
     argv = [engine.config["opencode"], "-s", session_id]
     pane = None
@@ -7513,6 +7513,64 @@ def add_read_parsers(sub):
 
 def cmd_read(args, runner, now):
     return run_cloud("cmd_read", args, runner, now)
+
+
+def watch_problem(engine, state, name, discovery):
+    """None when `watch` may open a terminal on `name`, else one line: the worker is unknown or retired, or a terminal already runs it (named)."""
+    if name in read_retired(state):
+        return "%s is retired (a finished worker): nothing to watch" % name
+    seen = discovery.agents.get(name)
+    if seen is None:
+        return "no fleet agent named %s is known: `%s status` lists the workers" % (name, PROG)
+    if not seen.headless:
+        return "%s already has a terminal (pane %s): switch to it, or `%s retire %s --close` first" % (name, seen.pane, PROG, name)
+    return None
+
+
+def cmd_watch(args, runner, now, socket_call=None):
+    """`watch <name> [--workspace W]` (#433): open a terminal on a headless worker's EXISTING session. It creates no session and sends no prompt, so
+    closing the terminal leaves the worker running. Refused (exit 1, nothing opened) for a worker that has a terminal, is unknown or is retired.
+    The caller rule is `reattach`'s: the operator, the Chief of Staff or the worker's own boss."""
+    engine, state, _ = build_engine(runner, now, "cli", socket_call=socket_call)
+    name = args.name
+    if not NAME_RE.match(name or ""):
+        raise LaunchError("name the worker: `%s watch <name>`" % PROG)
+    discovery = engine.discover(engine.now())
+    if name in read_retired(state):   # said first: a retired worker is not discovered, so the caller rule could only say "not your worker"
+        raise LaunchError("refused: %s is retired (a finished worker): nothing to watch" % name)
+    who = reattach_caller_problem(engine, runner, now, discovery, name)
+    if who:
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "headless.watch_refused", name, {"why": _one_line(who, 160)})
+        raise LaunchError("refused: %s" % who)
+    try:
+        with agent_lock(state, name):
+            discovery = engine.discover(engine.now())   # read again under the lock: a terminal opened a moment ago is seen
+            who = reattach_caller_problem(engine, runner, now, discovery, name)   # and the caller rule with it: check and act are one step
+            if who:
+                raise LaunchError("refused: %s" % who)
+            why = watch_problem(engine, state, name, discovery)
+            if why:
+                if engine.audit is not None:
+                    engine.audit.append(engine.actor, "headless.watch_refused", name, {"why": _one_line(why, 160)})
+                raise LaunchError("refused: %s" % why)
+            seen = discovery.agents[name]
+            workspace = args.workspace or os.environ.get("HERDR_WORKSPACE_ID")
+            if not workspace:
+                raise LaunchError("no workspace to open the terminal in: pass --workspace (or run it from a herdr pane)")
+            done = resume_agent(engine, name, seen.session_id, workspace)
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "headless.watched", name, {"session": seen.session_id, "pane": done["pane"], "tab": done.get("tab")})
+    except ImpactStateBusy:
+        raise LaunchError("another watch or reattach of %s is running: wait for it" % name) from None
+    print(json.dumps(done, sort_keys=True))
+    return EXIT_OK
+
+
+def add_watch_parsers(sub):
+    watch = sub.add_parser("watch", help="Open a terminal on a headless worker's existing session; closing it leaves the worker running")
+    watch.add_argument("name", help="The headless worker's fleet name")
+    watch.add_argument("--workspace", help="The herdr workspace for the new tab (default: this pane's)")
 
 
 def add_reattach_parsers(sub):
