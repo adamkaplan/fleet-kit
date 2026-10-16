@@ -10581,6 +10581,12 @@ def publish_decisions(engine):
                                ((engine.config.get("impact_hold") or {}).get("calls_per_pass") or IMPACT_PASS_CALLS))   # its own cap of gh reads, the impact hold's setting
     except Exception as err:
         engine._note("merged_labels.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+    try:
+        ejections = load_module("queue_ejections")   # #584: a pull request ejected from the merge queue wakes its orchestrator with the failing tests
+        ejections.run_pass(types.SimpleNamespace(**{n: globals()[n] for n in ejections.NEEDS}), engine, now,
+                           ((engine.config.get("impact_hold") or {}).get("calls_per_pass") or IMPACT_PASS_CALLS))
+    except Exception as err:
+        engine._note("queue_ejection.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
     apply_notice_effects(engine)
     store = decision_store(engine)
     try:
@@ -21641,6 +21647,28 @@ class _RedsReader:
             err = done.stderr if isinstance(done.stderr, str) else (done.stderr or b"").decode("utf-8", "replace")
             raise load_reds().RedsError("gh api %s: %s" % (path.split("?")[0], self.accounts.scrub(_one_line(err, 120)) or "exit %d" % done.returncode))
         return done.stdout
+
+    PULL_STATE_QUERY = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){state mergeQueueEntry{id}}}}"
+
+    def pull_state(self, number):
+        """{"state": "OPEN"|"MERGED"|"CLOSED", "queued": bool} of one pull request (#584): ONE GraphQL read, a query with fixed text (the number is a typed variable).
+        gh's `pr view` has no merge queue field. Raises RedsError when it cannot be read."""
+        refuse_excluded(self.config, self.repo)
+        owner, _, name = self.repo.partition("/")
+        env = self.accounts.env_for(self.repo)
+        extra = {"env": env} if env is not None else {}
+        argv = [self.config["gh"], "api", "graphql", "-f", "query=" + self.PULL_STATE_QUERY, "-f", "owner=" + owner, "-f", "name=" + name, "-F", "number=%d" % number]
+        done = self.runner(argv, capture_output=True, text=True, timeout=self.config["call_timeout_seconds"], stdin=subprocess.DEVNULL, **extra)
+        if done.returncode != 0:
+            raise load_reds().RedsError("gh api graphql: %s" % (self.accounts.scrub(_one_line(done.stderr or done.stdout or "", 120)) or "exit %d" % done.returncode))
+        try:
+            pull = json.loads(done.stdout)["data"]["repository"]["pullRequest"]
+            state = pull["state"]
+        except (ValueError, KeyError, TypeError):
+            raise load_reds().RedsError("gh api graphql: no pull request in the answer") from None
+        if state not in ("OPEN", "MERGED", "CLOSED"):
+            raise load_reds().RedsError("gh api graphql: unknown pull request state")
+        return {"state": state, "queued": bool(pull.get("mergeQueueEntry"))}
 
 
 def cmd_reds(args, runner, now):
