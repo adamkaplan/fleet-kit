@@ -57743,6 +57743,16 @@ class TestAgentCredentialsDoc(unittest.TestCase):
             self.assertIn(name, self.sections)
             self.assertRegex(self.sections[name], r"(?m)^\d+\. ", name)
 
+    def test_scope_and_cloud_rule_stated_once_each(self):
+        rule = "Cloud workers serve the organisation's repositories only; no fleet-kit task, test or demo runs in a cloud worker."
+        self.assertEqual(self.text.count(rule), 1)
+        with open(str(REPO / "cloud" / "README.md"), encoding="utf-8") as handle:
+            self.assertEqual(handle.read().count(rule), 1)
+        self.assertIn("Recommended option: Option C", self.text)
+        self.assertIn("No second App and no machine user is created for them", self.text)
+        for opt in ("Option A", "Option B"):
+            self.assertRegex(self.text, r"(?m)^### %s:.*\(rejected\)" % opt)
+
     def test_agents_create_no_credential(self):
         low = self.text.lower()
         self.assertIn("agents run none of them", low)
