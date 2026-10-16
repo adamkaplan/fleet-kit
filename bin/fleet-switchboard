@@ -145,6 +145,17 @@ def run_cloud(function, *arguments):
         raise LaunchError(str(err)) from None
 
 
+def refuse_cloud_name(name):
+    """A LOCAL launch of a name that has a cloud record is refused (LaunchError). Fail-open: a cloud module that is missing, broken or cannot read its
+    records never breaks a local launch (only a real refusal does)."""
+    try:
+        run_cloud("refuse_local_launch", name)
+    except LaunchError:
+        raise
+    except Exception:
+        return
+
+
 def load_plan_check():
     """The plan checker, bin/plan_check.py (#135), loaded by path from beside this file, as load_decision_core does."""
     return load_module("plan_check")
@@ -15950,7 +15961,7 @@ def read_brief(path, stdin):
 def cmd_launch(args, runner, now, socket_call=None):
     if getattr(args, "cloud", False):   # a worker in the cloud (#371): its own module; nothing below runs
         return run_cloud("cmd_launch", args, runner, now)
-    run_cloud("refuse_local_launch", args.name)   # a name that has a cloud record is not launched locally (#640)
+    refuse_cloud_name(args.name)   # a name that has a cloud record is not launched locally (#640)
     engine, state, _ = build_engine(runner, now, "cli", socket_call=socket_call)
     workspace = args.workspace if (args.workspace or getattr(args, "new_workspace", None) or getattr(args, "headless", False)) \
         else caller_workspace(engine, None)   # a workspace made now, or none at all, needs no look at the caller's own

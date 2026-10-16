@@ -925,6 +925,29 @@ class TestNameCollision(Base):
         self.assertIn("already exists", err)
 
 
+class TestLocalLaunchIsNeverBrokenByTheCloudModule(Base):
+    """#640 U1: the hook in every local launch refuses only a name with a cloud record; a missing, broken or unreadable cloud side lets the launch go on."""
+
+    def test_no_cloud_directory_means_no_refusal(self):
+        self.assertIsNone(sb.refuse_cloud_name("coder7"))
+
+    def test_a_name_with_a_record_is_refused(self):
+        self.assertEqual(self.launch()[0], 0)
+        with self.assertRaises(sb.LaunchError):
+            sb.refuse_cloud_name("coder7")
+
+    def test_a_missing_or_raising_cloud_module_is_fail_open(self):
+        for failure in (ImportError("no module"), FileNotFoundError("gone"), RuntimeError("broken"), OSError(13, "unreadable record store")):
+            with self.subTest(failure=type(failure).__name__):
+                with mock.patch.object(sb, "load_module", side_effect=failure):
+                    self.assertIsNone(sb.refuse_cloud_name("coder7"))
+
+    def test_an_unreadable_record_store_is_fail_open(self):
+        module = sb.load_module("cloud_worker").bind(sb.__dict__)
+        with mock.patch.object(module, "_reserved", side_effect=OSError(13, "unreadable")):
+            self.assertIsNone(sb.refuse_cloud_name("coder7"))
+
+
 class TestStopAndStatus(Base):
     """#640 review Lows: a launch's stop carries the run id; status mints no token for a worker that has ended."""
 
