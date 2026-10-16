@@ -44770,7 +44770,8 @@ class TestExternalWiring(ExternalWorld):
 
     def test_the_loader_is_the_one_the_core_uses(self):
         text = SWITCHBOARD.read_text()
-        self.assertIn("def load_external_adapter", text)
+        self.assertIs(sb.load_external_adapter(), sb.load_module("external_adapter"))   # #437: the loaders are generated from HELPER_MODULES, not written as a def each
+        self.assertEqual(sb.HELPER_MODULES["load_external_adapter"], "external_adapter")
         self.assertNotIn("\nimport external_adapter", text)
         self.assertNotIn("\nfrom external_adapter", text)
 
