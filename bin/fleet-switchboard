@@ -14573,6 +14573,11 @@ class GitHubHub:
         """The owner of an item (see `route_of`, which also says by which link)."""
         return self.route_of(item, agents, now)[0]
 
+    def notice_names(self, repo, number):
+        """The agent names a `notice pr` record of this pull request names (its sender, then its boss), whether or not they run: who WAS told to watch it."""
+        notice = self._notices.get((repo, number)) or {}
+        return [n for n in (notice.get("from"), notice.get("boss")) if isinstance(n, str) and n]
+
     def route_of(self, item, agents, now):
         """(owner, routed_by) of an item, or (None, None). PR 52: the links in order: (closing) the issues the item
         or its PR names, the existing routing, unchanged and first so that nothing that routes today moves;

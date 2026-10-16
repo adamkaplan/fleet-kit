@@ -42,6 +42,7 @@ MAX_NAMES = 20
 NAME_MAX = 200
 NAMES_CHARS = 2400        # the characters of the names in one line (20 names of 200 would overrun a message)
 LINE_MAX = 3600
+UNOWNED_HOURLY = 3600     # the Chief of Staff is told of ONE pull request no oftener than this; the runs between are counted and carried
 LEDGER_MAX = 500
 LEDGER_KEEP = 86400
 ZIP_MAX = 2 * 1024 * 1024
@@ -182,11 +183,30 @@ def _quoted(names, total):
     return " | ".join(shown), max(0, total - len(shown))
 
 
+def build_unowned_line(entry, head):
+    """The line the Chief of Staff gets for a pull request whose orchestrator cannot be told: FACTS only (the repository, the pull request, the run, how many failed, of what kind, where
+    the names are). No name taken from the artifact or from a job is in it: the Chief of Staff reads no outsider text."""
+    if entry.get("absent"):
+        who = "Its orchestrator %s is not running." % safe(entry["absent"], 80)
+    else:
+        who = "No orchestrator owns this pull request."
+    if entry["kind"] == "tests":
+        what = "%d failing test%s" % (entry["total"], "" if entry["total"] == 1 else "s")
+    elif entry["kind"] == "jobs":
+        what = "%d failed job%s (no %s artifact)" % (entry["total"], "" if entry["total"] == 1 else "s", entry["artifact"])
+    else:
+        what = "the result is unreadable"
+    line = "%s %s Kind: %s, %s. The names are in the run: https://github.com/%s/actions/runs/%d" % (head, who, entry["kind"], what, entry["repo"], entry["run"])
+    if entry.get("unannounced"):
+        line += " (%d earlier failed run%s of this pull request went unannounced in the last hour)" % (entry["unannounced"], "" if entry["unannounced"] == 1 else "s")
+    return line[:LINE_MAX]
+
+
 def build_line(entry, others, now):
     """The one line. `entry`: repo, pr, run, at (ISO or None), kind ("tests", "jobs" or "unreadable"), names, total, why."""
     head = "Merge queue ejection: %s#%d left the queue when run %d failed (%s)." % (entry["repo"], entry["pr"], entry["run"], entry["at"] or "time unknown")
     if entry.get("unowned"):
-        head += " No orchestrator owns this pull request."
+        return build_unowned_line(entry, head)
     if entry["kind"] == "tests":
         if entry["names"]:
             body, left = _quoted(entry["names"], entry["total"])
@@ -346,6 +366,13 @@ def run_pass(sb, engine, now, calls):
                     _skip(skips, memory, key, "no_chief")
                     continue
                 owner = chiefs[0]
+                recent = _last_unowned_wake(woke, batch, repo, number, now)
+                if recent is not None and now - recent < UNOWNED_HOURLY:   # this pull request's runs keep failing: counted, not announced again
+                    woke[key] = {"pr": number, "repo": repo, "ts": ts, "woke": False, "names": [], "kind": "suppressed", "sup_at": now}
+                    engine.audit.append(engine.actor, "queue_ejection.suppressed", "%s#%d" % (repo, number), {"run": run["id"], "last_wake_seconds_ago": int(now - recent)})
+                    continue
+                named = getattr(hub, "notice_names", lambda *_: [])(repo, number)
+                absent = next((n for n in named if n not in discovery.agents), None)
             try:
                 spent += 2
                 found = read_failure(reader, sb.load_module("reds"), repo, run["id"], artifact)
@@ -358,6 +385,9 @@ def run_pass(sb, engine, now, calls):
                     continue
                 found = {"kind": "unreadable", "names": [], "total": 0, "why": "its artifact could not be read", "download": False}
             entry = dict(found, repo=repo, pr=number, run=run["id"], at=at, ts=ts, owner=owner, artifact=artifact, key=key, unowned=unowned)
+            if unowned:
+                entry["absent"] = absent
+                entry["unannounced"] = _unannounced(woke, repo, number)
             memory["built"][key] = entry
         batch.append(entry)
     others = [v for v in woke.values() if v.get("woke")]
@@ -367,6 +397,8 @@ def run_pass(sb, engine, now, calls):
         if not _deliver(sb, engine, memory, entry["owner"], line, entry["key"]):
             continue
         woke[entry["key"]] = {"pr": entry["pr"], "repo": entry["repo"], "ts": entry["ts"], "woke": True, "kind": entry["kind"], "names": entry["names"]}
+        if entry.get("unowned"):
+            woke[entry["key"]]["unowned_at"] = now   # when the Chief of Staff was told of this pull request
         memory["built"].pop(entry["key"], None)
         detail = {"run": entry["run"], "to": entry["owner"], "kind": entry["kind"], "names": len(entry["names"])}
         detail.update(memory["first"].get(entry["key"]) or {})   # how late it was first seen, and why
@@ -385,6 +417,19 @@ def run_pass(sb, engine, now, calls):
             memory[table].pop(key, None)
     _say_skips(engine, memory, skips)
     return spent
+
+
+def _last_unowned_wake(woke, batch, repo, number, now):
+    """When the Chief of Staff was last told of this pull request (this pass's batch counts as now); None when never."""
+    times = [v["unowned_at"] for v in woke.values() if v.get("repo") == repo and v.get("pr") == number and isinstance(v.get("unowned_at"), (int, float))]
+    times += [now for b in batch if b["repo"] == repo and b["pr"] == number and b.get("unowned")]
+    return max(times) if times else None
+
+
+def _unannounced(woke, repo, number):
+    """How many failed runs of this pull request went unannounced since the Chief of Staff was last told of it."""
+    last = _last_unowned_wake(woke, [], repo, number, 0)
+    return len([v for v in woke.values() if v.get("kind") == "suppressed" and v.get("repo") == repo and v.get("pr") == number and (last is None or v.get("sup_at", 0) >= last)])
 
 
 def _skip(skips, memory, key, reason):
