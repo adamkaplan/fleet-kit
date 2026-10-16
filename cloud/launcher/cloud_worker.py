@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")  # the switchboard's agent name rule
 SHAPES = {"S": {"cpu": "2", "memory": "4Gi", "usd_per_hour": 0.10},
@@ -91,6 +92,54 @@ def scrub(text, secrets_known=(), limit=300):
     for pat in TOKEN_SHAPES:
         text = pat.sub("[redacted]", text)
     return re.sub(r"[^\x20-\x7e]", "?", text)[:limit]
+
+
+def _json_strings(node, out):
+    if isinstance(node, str):
+        out.append(node)
+    elif isinstance(node, dict):
+        for v in node.values():  # key names are not secrets
+            _json_strings(v, out)
+    elif isinstance(node, list):
+        for v in node:
+            _json_strings(v, out)
+
+
+def secret_forms(value):
+    """Every form in which a secret value can be printed: itself, base64 (standard and URL-safe, padded or not, at each of
+    the three alignments of a stream: the pieces fixed by the value alone), hex, percent-encoded and JSON-escaped. A model
+    entry that is a JSON object also yields the forms of each string value inside it. Scrubbing treats each form, and any
+    8+ character piece of it, as it treats the plain value."""
+    texts = {value, value.strip()}
+    try:
+        parsed = json.loads(value)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, (dict, list)):
+        found = []
+        _json_strings(parsed, found)
+        texts.update(s for s in found if s.strip())
+    forms = set()
+    for t in texts:
+        if not t:
+            continue
+        forms.add(t)
+        raw = t.encode("utf-8", "replace")
+        for k in (0, 1, 2):
+            enc = base64.b64encode(b"\0" * k + raw).decode()
+            core = enc.rstrip("=")
+            lead = (0, 2, 3)[k]  # leading characters that also hold filler bits
+            tail = 0 if (k + len(raw)) % 3 == 0 else 1  # a last partial character also holds bits of what follows
+            stable = core[lead:len(core) - tail]
+            for s in (stable, stable.replace("+", "-").replace("/", "_")):
+                if s:
+                    forms.add(s)
+            if k == 0:
+                forms.update({enc, core, enc.replace("+", "-").replace("/", "_"), core.replace("+", "-").replace("/", "_")})
+        hx = raw.hex()
+        forms.update({hx, hx.upper(), urllib.parse.quote(t, safe=""), urllib.parse.quote_plus(t), urllib.parse.quote(t),
+                      json.dumps(t)[1:-1], json.dumps(t, ensure_ascii=False)[1:-1]})
+    return {f for f in forms if f}
 
 
 def token_mode(env):
@@ -175,7 +224,7 @@ class Kube:
             with open(token_file) as f:
                 body = f.read(65536)
             usable = bool(body.strip())
-            self.known.add(body.strip())
+            self.add_secrets(body.strip())
         except OSError:
             usable = False
         if not usable:
@@ -203,7 +252,9 @@ class Kube:
         return scrub(text, self.known, limit)
 
     def add_secrets(self, *values):
-        self.known.update(v for v in values if v)
+        for v in values:
+            if v:
+                self.known.update(secret_forms(v))
 
     def delete_command(self, kind, name):
         """The exact command that removes one object by hand: the configured login flags, never a value."""
@@ -447,9 +498,9 @@ class Launcher:
             max_hard = now + dt.timedelta(seconds=parse_duration(a.max_hard))
             if hard > max_hard:
                 raise CloudError("--hard is past --max-hard", EXIT_REFUSED)
-            self.check_cap(a.shape, int((hard - now).total_seconds()))
             run_values = read_run_secret_values(parse_run_secret_fds(a.run_secret_fd))  # before anything is made
-            self.kube.add_secrets(*run_values.values())
+            self.kube.add_secrets(*run_values.values())  # known to scrub before the first kubectl call
+            self.check_cap(a.shape, int((hard - now).total_seconds()))
             spec = render_pod(a, worker, name, now, hard, self.env, sorted(run_values))
             hits = scan_credentials(spec)
             if hits:

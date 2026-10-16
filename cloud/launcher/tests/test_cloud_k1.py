@@ -525,6 +525,120 @@ class M1Scrub(TokenBase):
         self.assertNotIn("\n", cw.scrub("a\nb", ()))
 
 
+def gen_value(n, tag):
+    """A deterministic synthetic value of n characters, with characters that encode differently."""
+    import hashlib
+    s, i = "", 0
+    while len(s) < n:
+        s += hashlib.sha256(("%s%d" % (tag, i)).encode()).hexdigest()
+        i += 1
+    s = list(s[:n])
+    for pos, ch in ((3, "+"), (5, "/"), (7, " "), (9, "\u00e9")):
+        if pos < n:
+            s[pos] = ch
+    return "".join(s)
+
+
+def encoded_pieces(value, window=8):
+    """Independent of the code under test: every encoded form of the value, as 8-character windows. Base64 is taken at
+    the three alignments of a stream (filler before, text after), keeping only the characters the value alone fixes."""
+    raw = value.encode()
+    forms = [value, raw.hex(), raw.hex().upper(), json.dumps(value)[1:-1]]
+    import urllib.parse
+    forms += [urllib.parse.quote(value, safe=""), urllib.parse.quote_plus(value)]
+    for k in (0, 1, 2):
+        for enc in (base64.b64encode(b"\xa5" * k + raw + b"Z" * 5).decode(),
+                    base64.urlsafe_b64encode(b"\x5a" * k + raw + b"Q" * 4).decode()):
+            forms.append(enc[4:-4])
+    forms += [base64.b64encode(raw).decode(), base64.b64encode(raw).decode().rstrip("="),
+              base64.urlsafe_b64encode(raw).decode(), base64.urlsafe_b64encode(raw).decode().rstrip("=")]
+    return {f[i:i + window] for f in forms for i in range(max(0, len(f) - window + 1)) if len(f) >= window}
+
+
+class M3EncodedForms(K1Base):
+    """The base64, hex, percent and JSON-escaped forms of a secret, and the pieces of them, never show (kubectl prints
+    Secret data in base64)."""
+
+    def encoded_echo(self, values):
+        parts = []
+        for v in values:
+            raw = v.encode()
+            parts += [v, base64.b64encode(raw).decode(), base64.urlsafe_b64encode(raw).decode().rstrip("="), raw.hex(),
+                      raw.hex().upper(), json.dumps(v)[1:-1]]
+            for k in (1, 2):
+                parts.append(base64.b64encode(b"x" * k + raw + b"y").decode()[4:-4])
+        yaml = "apiVersion: v1\\ndata:\\n" + "".join("  k%d: %s\\n" % (i, base64.b64encode(v.encode()).decode()) for i, v in enumerate(values))
+        return " ".join(parts) + " " + yaml
+
+    def run_length(self, n):
+        a, r, g = gen_value(n, "a"), gen_value(n, "r"), gen_value(n, "g")
+        model = json.dumps({"access": a, "refresh": r, "type": "oauth"})
+        self.env["FAKE_KUBE_ECHO"] = self.encoded_echo([model, a, r, g])
+        pieces = set()
+        for v in (model, a, r, g):
+            pieces |= encoded_pieces(v)
+        fds = [fd_with(model), fd_with(g)]
+        self.addCleanup(lambda: [self._close(f) for f in fds])
+
+        def create(w):
+            return self.run_cli("create", w, "--repo", "acme-org/widget-service", "--branch", "main", "--pull-secret", "cw-pull",
+                                "--run-secret-fd", "model-key=%d" % fds[0], "--run-secret-fd", "git-key=%d" % fds[1])
+
+        def check(outs):
+            text = "\n".join(str(x) for o in outs for x in o) + "\n" + "\n".join(self.read_lines(self.env["CW_CLOUD_AUDIT"]))
+            text = text + "\n" + json.dumps(outs)
+            for p in pieces:
+                self.assertNotIn(p, text, "length %d: an encoded piece shows" % n)
+        return create, check
+
+    def test_each_encoded_form_is_gone_in_create_failures(self):
+        for n in (12, 24, 39, 200):
+            for cmd in ("apply", "get", "create", "patch", "label"):
+                self.write_state({"pods": {}})
+                if os.path.exists(self.env["CW_CLOUD_AUDIT"]):
+                    os.unlink(self.env["CW_CLOUD_AUDIT"])
+                create, check = self.run_length(n)
+                self.patch_state(fail_cmd=cmd)
+                out = create("coder7")
+                self.assertNotEqual(out[0], 0)
+                check([out])
+
+    def test_forms_are_registered(self):
+        forms = cw.secret_forms('{"access": "abcdefgh1234", "type": "oauth"}')
+        for f in ("abcdefgh1234", base64.b64encode(b"abcdefgh1234").decode(), b"abcdefgh1234".hex().upper()):
+            self.assertIn(f, forms)
+        self.assertNotIn("access", forms)  # a key name is not a secret
+        for sec in forms:
+            self.assertTrue(sec)
+        text = "data: " + base64.b64encode(b"xx" + b"abcdefgh1234" + b"yy").decode()
+        self.assertNotIn(base64.b64encode(b"xx" + b"abcdefgh1234" + b"yy").decode()[4:-4], cw.scrub(text, forms))
+
+
+class M3TokenEncodedForms(TokenBase):
+    """The same for the service account's token, which every command knows: stop, delete, status and reap, with exec and get
+    failing, print each encoded form of it."""
+
+    def test_each_encoded_form_of_the_token_is_gone(self):
+        for n in (12, 24, 39, 200):
+            tok = gen_value(n, "t")
+            with open(self.token_file, "w") as f:
+                f.write(tok)
+            self.env["FAKE_KUBE_ECHO"] = M3EncodedForms.encoded_echo(None, [tok])
+            pieces = encoded_pieces(tok)
+            for cmd in ("exec", "get", "delete", "annotate"):
+                self.write_state({"pods": {}})
+                if os.path.exists(self.env["CW_CLOUD_AUDIT"]):
+                    os.unlink(self.env["CW_CLOUD_AUDIT"])
+                self.assertEqual(self.create_with_secrets("coder7")[0], 0)
+                self.patch_state(fail_cmd=cmd)
+                outs = [self.run_cli("stop", "coder7"), self.run_cli("delete", "coder7", "--force"), self.run_cli("status"),
+                        self.run_cli("reap")]
+                text = "\n".join(str(x) for o in outs for x in o) + "\n" + json.dumps(outs) + "\n" + \
+                       "\n".join(self.read_lines(self.env["CW_CLOUD_AUDIT"]))
+                for p in pieces:
+                    self.assertNotIn(p, text, "token length %d: an encoded piece shows" % n)
+
+
 class M2CreateAndDeleteFailureSaysSo(K1Base):
     def hook_ok(self, tag="r"):
         work, _ = base.make_repo(self.tmp.name, tag, dirty=False)
