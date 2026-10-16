@@ -56918,6 +56918,75 @@ class TestMergedLabels(Base):
             self.assertFalse(sb._issue_pr_merged(record), record)
 
 
+# ---- docs/agent-credentials.md (#568): the document has its sections and no token-like text (S1, S2, S3, S5, U1)
+CRED_DOC_PATH = str(REPO / "docs" / "agent-credentials.md")
+CRED_TOKEN_PATTERNS = [
+    r"gh[pousr]_[A-Za-z0-9]{20,}", r"github_pat_[A-Za-z0-9_]{20,}", r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
+    r"\bAKIA[0-9A-Z]{16}\b", r"\bxox[baprs]-[A-Za-z0-9-]{10,}", r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
+    r"(?i)\b(token|secret|password)\s*[:=]\s*[\"']?[A-Za-z0-9+/_-]{24,}",
+]
+CRED_CRITERIA = ("Cost", "What breaks", "Rotation", "Who merges")
+
+
+def cred_doc_sections(text):
+    """{heading: body} for every `## ` section."""
+    parts = re.split(r"(?m)^## (.+)$", text)
+    return {parts[i].strip(): parts[i + 1] for i in range(1, len(parts) - 1, 2)}
+
+
+class TestAgentCredentialsDoc(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        with open(CRED_DOC_PATH, encoding="utf-8") as handle:
+            cls.text = handle.read()
+        cls.sections = cred_doc_sections(cls.text)
+
+    def test_inventory_has_at_least_four_paths_with_scope_and_admin(self):
+        body = self.sections["Inventory of credential paths"]
+        rows = [r for r in body.splitlines() if re.match(r"\|\s*\d+\s*\|", r)]
+        self.assertGreaterEqual(len(rows), 4)
+        for row in rows:
+            self.assertEqual(len(row.strip().strip("|").split("|")), 5, row[:60])
+        low = body.lower()
+        for word in ("gh_users", "git", "keyring", "mint"):
+            self.assertIn(word, low)
+
+    def test_three_options_on_four_criteria(self):
+        body = self.sections["Design: three options"]
+        options = re.findall(r"(?m)^### (Option [A-C]):", body)
+        self.assertEqual(options, ["Option A", "Option B", "Option C"])
+        for chunk in re.split(r"(?m)^### ", body)[1:]:
+            rows = [r.split("|")[1].strip() for r in chunk.splitlines() if r.startswith("| ") and not r.startswith("| Criterion")]
+            self.assertEqual([r for r in rows if r in CRED_CRITERIA], list(CRED_CRITERIA), chunk[:30])
+
+    def test_exactly_one_recommendation(self):
+        self.assertEqual(len([h for h in self.sections if h.startswith("Recommendation")]), 1)
+        self.assertEqual(len(re.findall(r"(?m)^Recommended option:", self.text)), 1)
+
+    def test_migration_rollback_owner_sections(self):
+        for name in ("Migration", "Rollback", "The owner's own steps"):
+            self.assertIn(name, self.sections)
+            self.assertRegex(self.sections[name], r"(?m)^\d+\. ", name)
+
+    def test_agents_create_no_credential(self):
+        low = self.text.lower()
+        self.assertIn("agents run none of them", low)
+        for cmd in ("gh auth login --with-token", "gh auth token <", "gh api -x post", "-x patch"):
+            self.assertNotIn(cmd, low)
+
+    def test_no_token_like_string(self):
+        for pattern in CRED_TOKEN_PATTERNS:
+            self.assertIsNone(re.search(pattern, self.text), "token-like text matched pattern #%d" % CRED_TOKEN_PATTERNS.index(pattern))
+
+    def test_every_pattern_fires_on_a_planted_sample(self):
+        samples = ["ghp_" + "a" * 36, "github_pat_" + "a" * 30, "-----BEGIN RSA PRIVATE KEY-----", "AKIA" + "A" * 16, "xoxb-" + "1" * 12,
+                   "eyJ" + "a" * 12 + "." + "b" * 12, "token = " + "a" * 30]
+        self.assertEqual(len(samples), len(CRED_TOKEN_PATTERNS))
+        for pattern, sample in zip(CRED_TOKEN_PATTERNS, samples):
+            self.assertIsNotNone(re.search(pattern, sample), pattern)
+
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.
