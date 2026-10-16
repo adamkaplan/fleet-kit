@@ -21995,7 +21995,40 @@ class TestTriage(Base):
         self.assertEqual(self.only("T9"), ["acme/api#115", "acme/api#116", "acme/api#117"])
         reasons = {e["detail"]["ref"]: e["detail"]["evidence"]["reason"] for e in self.world.audit() if e["event"] == "triage.finding" and e["detail"]["rule"] == "T9"}
         self.assertEqual(set(reasons.values()), {"awaiting-live age unknown"})
-        self.assertNotIn("label_days", [e for e in self.world.audit() if e["event"] == "triage.finding"][0]["detail"]["evidence"])
+        for e in self.world.audit():
+            if e["event"] == "triage.finding" and e["detail"]["rule"] == "T9":
+                self.assertNotIn("label_days", e["detail"]["evidence"])             # an unknown age claims no age
+
+    def test_awaiting_live_expiry_edges_an_older_comment_does_not_count_just_inside_the_limit_is_quiet_and_a_failed_read_is_retried(self):
+        self.charter()
+        self.add(130, created=30, updated=3, assignees=["bot"], labels=["kind", self.LIVE], body="Next: go")   # a comment BEFORE the label: still expires
+        self.add(131, created=30, updated=3, assignees=["bot"], labels=["kind", self.LIVE], body="Next: go")   # just inside 14 days: not yet
+        self.add(132, created=30, updated=3, assignees=["bot"], labels=["kind", self.LIVE], body="Next: go")   # the read fails now, works later
+        self.timeline(130, label_days=15, comment_days=16)
+        self.timeline(131, label_days=14 - 0.0005)                                  # a minute inside the limit (the pass ticks the clock)
+        self.go(passes=1)
+        self.assertEqual(self.only("T9"), ["acme/api#130", "acme/api#132"])     # 132: age unknown
+        self.timeline(132, label_days=1)
+        self.go(passes=1)
+        self.assertEqual(self.only("T9"), ["acme/api#130", "acme/api#132"])     # inside the retry wait: still the unknown finding, no new read
+        self.assertEqual(len([c for c in self.hub.calls if "/issues/132/timeline" in c]), 1)
+        self.world.tick(sb.TRIAGE_TTL + 5)
+        self.go(passes=1)
+        self.assertEqual(len([c for c in self.hub.calls if "/issues/132/timeline" in c]), 2)   # read again after the wait
+        self.assertIsNotNone(sb.triage_state(self.engine).live[("acme/api", 132)]["info"])      # now read: its age is known and fresh
+
+    def test_awaiting_live_days_falls_back_to_the_default_for_an_unusable_value_and_t12_stays_exempt_for_a_fresh_label(self):
+        module = sb.load_module("awaiting_live")
+        for bad in (None, 0, -3, True, "x", 4000):
+            self.assertEqual(module.days_of({"awaiting_live_days": bad}), 14)
+        self.assertEqual(module.days_of({"awaiting_live_days": 2.5}), 2.5)
+        self.charter()
+        self.add(133, created=60, updated=3, assignees=["bot"], labels=["kind", self.LIVE], body="Next: go")
+        self.timeline(133, label_days=1)
+        self.merged_pr(260, "Part of #133")
+        self.go(passes=1)
+        self.assertEqual(self.only("T12"), [])                                  # its PR merged, yet the fresh label keeps T12 quiet
+        self.assertEqual(self.only("T9"), [])
 
     def test_awaiting_live_expiry_an_issue_without_the_label_is_never_read_and_judged_as_before(self):
         self.charter()
