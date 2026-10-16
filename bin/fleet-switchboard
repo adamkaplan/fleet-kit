@@ -8886,8 +8886,12 @@ def read_batch_notes(state_dir):
 
 
 def mark_batch_note(state_dir, key, when):
+    """Record the note as delivered and pending (`when` set), or forget it (`when` None: the answer is fully recorded)."""
     found = read_batch_notes(state_dir)
-    found[key] = iso(when)
+    if when is None:
+        found.pop(key, None)
+    else:
+        found[key] = iso(when)
     kept = dict(sorted(found.items(), key=lambda kv: kv[1])[-BATCH_NOTES_KEEP:])
     path = Path(state_dir) / BATCH_NOTES_FILE
     temp = path.with_name("%s.%d.tmp" % (BATCH_NOTES_FILE, os.getpid()))
@@ -28079,11 +28083,12 @@ def answer_batch(engine, runner, decision, args, name):
                             "nothing was sent or written. Shorten the --row choices or the --note, or answer from the issue itself"
                             % (ident, size, decision_core.BATCH_COMMENT_MAX_CHARS))
     told = ""
+    note_key = None
     raised = decision.get("raised_by")
     if raised and name:
         text = "Batch %s (%s#%d) is answered: %s. The record is the comment on it; you act on it, nothing was done to " \
                "the row issues." % (ident, repo, number, "as recommended" if not changed else "%d row(s) changed" % changed)
-        note_key = batch_note_key(repo, number, text) if engine.state_dir is not None else None
+        note_key = batch_note_key(repo, number, text + "\n" + "\n".join(lines)) if engine.state_dir is not None else None   # the answer's identity: every row's outcome and the note, not counts
         if note_key is not None and note_key in read_batch_notes(engine.state_dir):
             raised = None                  # this very note went on an earlier run whose comment failed: not sent a second time
         try:
@@ -28106,6 +28111,11 @@ def answer_batch(engine, runner, decision, args, name):
     IssueDelivery(engine, runner).deliver(decision, {
         "repo": repo, "number": number, "add": (), "remove": [awaiting_cos_label(engine.config), awaiting_label(engine.config)],
         "author": name, "comment": "\n".join(lines), "comment_first": True})
+    if note_key is not None:               # fully recorded (note sent, comment written): a later answer, even the same text, sends its own note
+        try:
+            mark_batch_note(engine.state_dir, note_key, None)
+        except OSError:
+            pass
     engine._note("decisions.answer", ident, {"kind": "batch", "repo": repo, "issue": number, "by": name,
                                             "rows": len(outcomes), "changed": changed,
                                             "note": _one_line(args.note or "", 200)})

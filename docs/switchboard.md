@@ -2024,7 +2024,7 @@ one entry: the headline, one line per row (`web#7: close it`, URLs as short refs
 sends the raising orchestrator a note from the answerer naming the batch, and only once it is delivered posts ONE comment
 on the batch issue recording each row's outcome and takes both awaiting labels off it. A note that cannot be delivered
 (agent gone, held, error) refuses the answer: nothing is commented, the labels stay, the batch stays in the Chief of
-Staff's tier, the command says why and exits non-zero, and the same answer can be run again. If the note went but the comment write failed, a re-run does not send that note a second time (the delivered note is kept in the disposable `batch-notes.json`, 100 entries) and posts the comment once. A row may name an issue that is only being
+Staff's tier, the command says why and exits non-zero, and the same answer can be run again. If the note went but the comment write failed, a re-run does not send that note a second time (the delivered note is kept, keyed by the batch and every row's outcome and the note text, in the disposable `batch-notes.json`, 100 entries; the key is forgotten once the comment is written, so a later answer, even the same text, sends its own note) and posts the comment once. A row may name an issue that is only being
 *proposed* for closing: the code never closes, labels or edits a row's issue. The answer is the record, and the
 orchestrator acts on the rows. `answer` keeps its meaning for permission requests and questions, and goes through the
 same judge as before. `decisions supersede` (command table) clears several open decisions made moot by one issue.
