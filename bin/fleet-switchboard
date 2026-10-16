@@ -419,7 +419,8 @@ TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst
 CONFIG_DECLARATION_TEXT = re.compile(rb'^[ \t]*CONFIG_KEY[ \t]*(?::[^=\n]*)?=[ \t]*[\'"]([^\'"\n]*)[\'"]', re.M)   # only the fallback for a file that does not parse
 CONFIG_KEY_FORM = re.compile(r"[a-z][a-z0-9_]*")
 CONFIG_READ_BYTES = 1000000
-CONFIG_MUST_DECLARE = {"excluded_repos": "repo_exclusion", "spotlight_guard": "spotlight_guard"}   # keys that MUST be declared by their module: a missing, truncated or unmatched declaration refuses the whole configuration (an unvalidated `excluded_repos` would exclude nothing)
+CONFIG_MUST_DECLARE = {"excluded_repos": "repo_exclusion", "spotlight_guard": "spotlight_guard", "temp_janitor": "disk_janitor", "chat_clear": "chat_clear",
+                       "impact_floor": "impact_floor"}   # keys that MUST be declared by their module: a missing, truncated or unmatched declaration refuses the whole configuration (an unvalidated `excluded_repos` would exclude nothing, an unvalidated `impact_floor` could hold nothing)
 CONFIG_DECLARATIONS_DIR = None   # None = the bin directory beside this program; only a test points it elsewhere (never configuration or input)
 _DECLARED_CACHE = {}
 
