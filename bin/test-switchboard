@@ -13896,6 +13896,39 @@ class TestHeadlessPresence(Base):
         blocked = [f for f in facts if f.kind == sb.WORKER_BLOCKED and f.recipient == "boss"]
         self.assertEqual(len(blocked), 1, [(f.kind, f.recipient) for f in facts])
 
+    def watched(self):
+        """A headless worker with a watch terminal open on it: (session id, pane)."""
+        sid = self.headless()
+        code, out, err = self.watch_cli()
+        self.assertEqual(code, 0, err)
+        return sid, json.loads(out)["pane"]
+
+    def test_closing_a_watch_terminal_is_not_a_dead_pane_and_wakes_nobody(self):
+        """Evidence: a watched headless worker's tab was closed; the pass that still held the old pane called it DEAD and its boss got a 'dead' report."""
+        sid, pane = self.watched()
+        engine = self.world.new_engine("cli")
+        discovery = engine.discover(self.world.clock.now())
+        self.assertEqual(discovery.agents["hw"].pane, pane, "the premise: the pass saw the watch pane")
+        self.world.herdr.panes.pop(pane)                                  # the person closes the watch terminal between discovery and the check
+        sb.pane_health_pass(engine, self.world.clock.now())
+        self.assertEqual([e for e in self.world.audit() if e["event"] in ("fleetpane.dead", "fleetpane.detached")], [], "no dead event for a closed watch pane")
+        self.assertEqual(engine.pane_alerts, {}, "and no alert for cos")
+        later = engine.discover(self.world.clock.now() + 60)
+        self.assertTrue(later.agents["hw"].headless)
+        sb.pane_health_pass(engine, self.world.clock.now() + 60)
+        self.assertEqual(engine.pane_alerts, {})
+        self.assertNotIn("hw", sb.read_pane_health(self.world.state)["states"], "a headless worker keeps no pane verdict at all")
+
+    def test_a_terminal_worker_whose_pane_is_really_gone_is_still_dead(self):
+        self.world.add_agent("termworker", fleet={"role": "coder", "reports_to": "boss"})
+        engine = self.world.new_engine("cli")
+        discovery = engine.discover(self.world.clock.now())
+        pane = discovery.agents["termworker"].pane
+        self.world.herdr.panes.pop(pane)
+        sb.pane_health_pass(engine, self.world.clock.now())
+        self.assertEqual([e["subject"] for e in self.world.audit() if e["event"] == "fleetpane.dead"], ["termworker"])
+        self.assertIn("termworker", engine.pane_alerts)
+
     def test_the_status_command_lists_a_headless_worker_it_reads_the_records_from_the_state_directory(self):
         sid = self.headless()
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
