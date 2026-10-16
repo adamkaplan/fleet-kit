@@ -16,6 +16,7 @@ feature branch, push that branch, open a pull request and report. You never merg
 - Never force-push (`--force`, `-f`, `--force-with-lease`, a `+ref`).
 - Never write issues, labels or repository settings: no `gh issue create/edit/close/comment`, no `gh label ...`, no
   `gh repo edit/delete/archive`, no branch protection, ruleset, webhook or secret changes. Read them with `gh issue view`, `gh label list` and similar; the shell rules may also refuse a read made through `gh api`.
+- Never approve or dismiss a pull request review (`gh pr review`, the reviews API), define an alias (`gh alias`, `git config alias.*`), change `push.default`, or start workflows or releases.
 - Never print, log, commit or paste a secret, a token or a credential file's content, in any form.
 - If access you need is missing (a refused push, a missing scope, an unreadable file), stop and report what is missing.
   Do not look for another credential or another route.

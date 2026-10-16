@@ -53,6 +53,20 @@ also reads `CW_DEFAULT_BRANCH`, space or comma separated, and `origin/HEAD`), `g
 branch is refused by the wrapper only, and the config's patterns can over-refuse (a branch named `fix-main-menu`). A
 missing guard file refuses the start. Tests: `cloud/worker/tests/test_guard.py`.
 
+### What else the wrapper refuses, and what it leaves (review round)
+
+Beyond the six, the wrapper (and, where a text pattern can say it, the OpenCode config) refuses:
+
+- **Aliases are covered.** `gh alias set|import|delete`, `git config` of any `alias.*` key and `git -c alias.*` (also `--config-env`) are refused, and a first word of `gh` it does not know is refused as a possible alias (`gh m 5`). A built-in command passes. The config cannot name an unknown word, so that part is the wrapper's only. Extensions are refused too (`gh extension install`, and any `gh extension` except `list|search|browse`); an installed extension's own name is an unknown word.
+- **`gh api` endpoints** are read after a scheme, host, port, userinfo, query, fragment and leading or trailing slash are stripped (`https://api.github.com/repos/o/r/pulls/5/merge` is the merge call). An endpoint it cannot parse (`%` escapes, `..`, a bare scheme) is refused. GraphQL passes only when the query is a plain `-f query=...` on the command line; a query from a file, `-F query=@...`, `--input` or stdin is refused, because the wrapper cannot read it.
+- **`git push`**: a refspec with `*`, any `push.default` override (`-c`, `git config`), and the `--repo=`, `--receive-pack=` and `--exec=` forms are handled by name.
+- **Approving or dismissing a review is refused** (`gh pr review` in any form, and `gh api` writes under `repos/*/pulls/*/reviews`), because a bot approval can count toward a required-reviews rule on another pull request. `gh pr close`, `ready`, `reopen` and `comment` are NOT refused: they act on the worker's own pull request and grant nothing another one relies on; the repository's ruleset (who may approve, who may merge) is what stops an approval counting.
+- Also refused: `gh pr edit --add-assignee|--remove-assignee`, `gh workflow run|enable|disable`, `gh release create|edit|delete|upload`, `gh run rerun|cancel`, `gh api` writes to `repos/*/dispatches`, `.../git/refs` (any write), `.../releases` and `orgs/*`. `gh ruleset` is only reads (`list`, `view`, `check`), so it is no longer refused.
+- Known over-refusals: the config's patterns refuse a read of `.../reviews`, `.../dispatches`, `.../git/refs`, `.../releases` or `orgs/*` through `gh api` (the wrapper lets a GET through), and a branch such as `fix-main-menu` (a `main` pattern); an unknown first word of `gh` is refused.
+- Known passes: when `origin/HEAD` cannot be read the default branch is only `main`, `master` and `CW_DEFAULT_BRANCH`; the config cannot say a literal `*` refspec, so that is the wrapper's only; an option the parser cannot read passes.
+
+The OpenCode config is written under the worker's own tmpfs, so the worker user can edit it, and a repository's own `opencode.json` is merged over it by OpenCode (not run here: whether a later file can lift a `deny` is unproven). The deny rules are a convenience. `"*": "allow"` followed by the denies is allow-by-default for the shell tool: it grants nothing the pod could not already do, and narrows nothing by itself. The guard is the repository's rules and the token's scope.
+
 ## The operator driver
 
 ```sh

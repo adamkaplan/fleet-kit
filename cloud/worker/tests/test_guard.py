@@ -56,6 +56,93 @@ ORDINARY = [
     ["git", "status"],
 ]
 
+U = "https://api.github.com/repos/%s" % REPO
+# slice-2 review round: (the phrase the refusal gives, the command, also denied by the OpenCode config?). DATA, one row per form.
+EXTRA_REFUSED = [
+    # M1 aliases (a defined alias would hide the command from the wrapper)
+    ("defining or changing a gh alias", ["gh", "alias", "set", "m", "pr merge"], True),
+    ("defining or changing a gh alias", ["gh", "alias", "import", "a.yml"], True),
+    ("defining or changing a gh alias", ["gh", "alias", "delete", "m"], True),
+    ("defining or changing a gh alias", ["gh", "-R", REPO, "alias", "set", "m", "pr merge"], True),
+    ("a gh command it does not know (it could be an alias)", ["gh", "m", "5"], False),
+    ("a gh command it does not know (it could be an alias)", ["gh", "--repo", REPO, "p", "5"], False),
+    ("defining a git alias", ["git", "config", "alias.p", "push --force"], True),
+    ("defining a git alias", ["git", "config", "--global", "ALIAS.p", "push --force"], True),
+    ("defining a git alias", ["git", "-c", "alias.p=push --force", "p"], True),
+    ("defining a git alias", ["git", "--config-env=alias.p=VAR", "p"], False),
+    ("defining a git alias", ["git", "--config-env", "alias.p=VAR", "p"], False),
+    # M2 a full URL hides the path
+    ("merging a pull request", ["gh", "api", U + "/pulls/5/merge", "-X", "PUT"], False),
+    ("merging a pull request", ["gh", "api", "https://api.github.com:443/repos/o/r/pulls/5/merge", "-X", "PUT"], False),
+    ("merging a pull request", ["gh", "api", "https://user:pw@host.example/repos/o/r/pulls/5/merge?x=1", "-X", "PUT"], False),
+    ("merging a pull request", ["gh", "api", "http://h/api/v3/repos/o/r/merges", "-X", "POST"], False),
+    ("merging a pull request", ["gh", "api", "//repos/o/r/pulls/5/merge/", "-X", "PUT"], False),
+    ("writing issues", ["gh", "api", U + "/issues", "-f", "title=t"], False),
+    ("writing labels", ["gh", "api", U + "/labels", "-X", "POST"], False),
+    ("a gh api endpoint it cannot read", ["gh", "api", "https://"], False),
+    ("a gh api endpoint it cannot read", ["gh", "api", "https:///repos/o/r/pulls/5/merge", "-X", "PUT"], False),
+    ("a gh api endpoint it cannot read", ["gh", "api", "repos/o/r/pulls/5/%6derge", "-X", "PUT"], False),
+    ("a gh api endpoint it cannot read", ["gh", "api", "repos/o/r/x/../pulls/5/merge", "-X", "PUT"], False),
+    ("a gh api endpoint it cannot read", ["gh", "api", "x:y/repos"], False),
+    # M3 a GraphQL query that cannot be read here
+    ("a GraphQL query it cannot read (from a file or stdin)", ["gh", "api", "graphql", "-F", "query=@q.graphql"], False),
+    ("a GraphQL query it cannot read (from a file or stdin)", ["gh", "api", "graphql", "--field", "query=@q.graphql"], False),
+    ("a GraphQL query it cannot read (from a file or stdin)", ["gh", "api", "graphql", "-Fquery=@q.graphql"], False),
+    ("a GraphQL query it cannot read (from a file or stdin)", ["gh", "api", "graphql", "--input", "q.json"], False),
+    ("a GraphQL query it cannot read (from a file or stdin)", ["gh", "api", "graphql", "--input=-"], False),
+    ("a GraphQL query it cannot read (from a file or stdin)", ["gh", "api", "graphql"], False),
+    ("a GraphQL query it cannot read (from a file or stdin)", ["gh", "api", "graphql", "-f", "query={ viewer { login } }", "--input", "q.json"], False),
+    ("a GraphQL query it cannot read (from a file or stdin)", ["gh", "api", "https://api.github.com/graphql", "--input", "-"], False),
+    # M4 git push
+    ("pushing by a glob refspec", ["git", "push", "origin", "refs/heads/*:refs/heads/*"], False),
+    ("pushing by a glob refspec", ["git", "push", "origin", "feature-*"], False),
+    ("overriding push.default", ["git", "-c", "push.default=matching", "push", "origin"], True),
+    ("overriding push.default", ["git", "config", "push.default", "matching"], True),
+    ("overriding push.default", ["git", "-c", "PUSH.default=matching", "push"], False),
+    ("pushing to the default branch", ["git", "push", "--repo=origin", "trunk"], False),
+    ("pushing to the default branch", ["git", "push", "--repo", "origin", "main"], False),
+    ("pushing to the default branch", ["git", "push", "--receive-pack=x", "origin", "main"], False),
+    ("pushing to the default branch", ["git", "push", "--exec=x", "origin", "main"], False),
+    # M5 approving or dismissing a review
+    ("approving or dismissing a pull request review", ["gh", "pr", "review", "5", "--approve"], True),
+    ("approving or dismissing a pull request review", ["gh", "pr", "review", "-a"], True),
+    ("approving or dismissing a pull request review", ["gh", "-R", REPO, "pr", "review", "5", "--request-changes"], True),
+    ("approving or dismissing a pull request review", ["gh", "api", "repos/%s/pulls/5/reviews" % REPO, "-X", "POST", "-f", "event=APPROVE"], True),
+    ("approving or dismissing a pull request review", ["gh", "api", "repos/%s/pulls/5/reviews" % REPO, "-f", "event=APPROVE"], True),
+    ("approving or dismissing a pull request review", ["gh", "api", "-X", "PUT", "repos/%s/pulls/5/reviews/9/dismissals" % REPO], True),
+    ("approving or dismissing a pull request review", ["gh", "api", U + "/pulls/5/reviews", "-X", "POST"], True),
+    # the cheap lows
+    ("writing assignees", ["gh", "pr", "edit", "5", "--add-assignee", "x"], True),
+    ("starting workflows or releases", ["gh", "workflow", "run", "ci.yml"], True),
+    ("starting workflows or releases", ["gh", "release", "create", "v1"], True),
+    ("installing or running a gh extension", ["gh", "extension", "install", "o/gh-x"], True),
+    ("starting workflows or releases", ["gh", "api", "repos/%s/dispatches" % REPO, "-X", "POST"], True),
+    ("changing repository settings", ["gh", "api", "orgs/acme-org/rulesets", "-X", "POST"], True),
+    ("force-pushing or pushing to the default branch", ["gh", "api", "repos/%s/git/refs" % REPO, "-X", "POST", "-f", "ref=refs/heads/x"], True),
+]
+EXTRA_ALLOWED = [
+    ["gh", "ruleset", "list"],
+    ["gh", "alias", "list"],
+    ["gh", "pr", "create", "--title", "t"],
+    ["gh", "pr", "view", "5"],
+    ["gh", "pr", "comment", "5", "--body", "x"],
+    ["gh", "pr", "edit", "5", "--title", "t"],
+    ["gh", "api", "graphql", "-f", "query={ viewer { login } }"],
+    ["gh", "api", "graphql", "-f", "query=query($o:String!){ repository(owner:$o,name:\"x\"){ id } }", "-F", "o=acme-org"],
+    ["gh", "api", U + "/pulls/5"],
+    ["gh", "api", "https://api.github.com/repos/o/r/pulls/5/reviews"],
+    ["gh", "api", "repos/%s/pulls/5/comments" % REPO, "-f", "body=x"],
+    ["gh", "--version"],
+    ["gh", "extension", "list"],
+    ["git", "push", "origin", "feature-x"],
+    ["git", "push", "-u", "origin", "HEAD:feature-x"],
+    ["git", "push", "--repo=origin", "feature-x"],
+    ["git", "push", "--receive-pack=x", "origin", "feature-x"],
+    ["git", "-c", "user.name=x", "commit", "-m", "m"],
+    ["git", "config", "user.name", "x"],
+    ["git", "push", "origin", "feature/maintenance"],
+]
+
 
 def read(path):
     with open(path) as f:
@@ -142,6 +229,43 @@ class Guard(unittest.TestCase):
                 self.assertEqual(len(r.stderr.splitlines()), 1)
         for cmd in (["gh", "api", "-H", "Accept: x", "repos/%s/pulls/12" % REPO], ["git", "push", "origin", "feature/maintenance"]):
             self.assertEqual(self.call(cmd).returncode, 0, cmd)   # the wrapper does not over-refuse a read or a branch named like main
+
+    def test_review_round_forms_are_refused_by_phrase_and_the_real_binary_never_runs(self):
+        for what, cmd, _ in EXTRA_REFUSED:
+            with self.subTest(cmd=" ".join(cmd)):
+                r = self.call(cmd)
+                self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+                self.assertEqual(r.stdout, "")
+                self.assertEqual(r.stderr, "refused: %s: %s\n" % (what, TAIL))
+
+    def test_review_round_allowed_controls_still_pass_unchanged(self):
+        for cmd in EXTRA_ALLOWED:
+            with self.subTest(cmd=" ".join(cmd)):
+                r = self.call(cmd)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(r.stdout.splitlines()[-1].split(" ran: ")[1], " ".join(cmd[1:]))
+
+    def test_review_round_the_config_denies_what_it_can_express(self):
+        glob = self.conf["permission"]["bash"]
+        self.assertEqual(glob, self.conf["agent"]["worker"]["permission"]["bash"])
+        denies = self.deny(glob)
+        def match(pat, line):
+            return re.fullmatch(".*".join(re.escape(x) for x in pat.split("*")), line, re.S) is not None
+        for _, cmd, in_config in EXTRA_REFUSED:
+            if in_config:
+                with self.subTest(cmd=" ".join(cmd)):
+                    self.assertTrue(any(match(p, " ".join(cmd)) for p in denies), cmd)
+        for cmd in EXTRA_ALLOWED:   # and a read or an ordinary call is not denied
+            if cmd[:3] in (["gh", "ruleset", "list"], ["gh", "alias", "list"], ["gh", "pr", "create"], ["gh", "pr", "view"], ["git", "push", "-u"]):   # (the config over-refuses a branch named like main; README)
+                self.assertFalse(any(match(p, " ".join(cmd)) for p in denies), cmd)
+
+    def test_u1_the_new_refusals_do_not_print_an_argument_value(self):
+        for cmd in (["gh", "alias", "set", SECRET, "pr merge"], ["gh", SECRET, "5"], ["gh", "api", "https://" + SECRET + "/repos/o/r/pulls/5/merge", "-X", "PUT"],
+                    ["git", "config", "alias." + SECRET, "x"], ["git", "push", "origin", "*" + SECRET]):
+            r = self.call(cmd)
+            self.assertEqual(r.returncode, 3)
+            self.assertNotIn(SECRET, r.stdout + r.stderr)
+            self.assertEqual(len((r.stdout + r.stderr).splitlines()), 1)
 
     def test_s3_an_unsafe_cw_model_refuses_the_start(self):
         r = subprocess.run(["sh", ENTRYPOINT, "echo", "started"], env=dict(self.env, CW_TMP_DIR=self.tmpfs + "-3", CW_MODEL='a","permission":"allow'),
