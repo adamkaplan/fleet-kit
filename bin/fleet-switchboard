@@ -18892,7 +18892,6 @@ CLEAR_NOTIFIED_MAX = 400
 _PLAN_ISSUE_RE = re.compile(r"github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(?:issues|pull)/([0-9]+)")
 
 
-_PLAN_LINE_ANCHORED = re.compile(r"(?m)^PLAN: (https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/(?:issues|pull)/[0-9]+)(?:#issuecomment-[0-9]+)?[ \t]*$")
 _PLAN_REF_SHORT = re.compile(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)$")
 
 
@@ -18948,49 +18947,46 @@ def _lane_of_issue(engine, repo, issue, orchestrators):
 
 
 def clear_lane(engine, repo, number, body):
-    """(lane, how, extra): the orchestrator that merges the pull request; (None, None, extra) when it cannot be told: never a guess. The PR BODY is the author's text and picks nothing. In order:
-    (1) the plan the LEDGER records for this pull request (the proofs and verdicts agents wrote with `prove` and `verdict`), up to the charter that holds it as it is now, and that charter's one running
-    orchestrator; (2) the agent that recorded the pull request's notice (its boss when it is a worker); else unknown. A charter with two or more running orchestrators is `unknown` naming them (extra
-    `candidates`); one nobody runs goes on to the next rule. A `PLAN:` link in the body that names a DIFFERENT lane is not followed and is said in `extra` (`link_lane`)."""
+    """(lane, how, extra): the orchestrator that merges the pull request; (None, None, extra) when it cannot be told: never a guess. Two sources, each only when resolvable:
+    (1) the PLAN of the pull request, taken through `authoritative_plan` (the function the gates use: the PR body's PLAN line, else the first ledger entry's plan) and only when it PASSES the plan
+    check at this moment, up to the charter that holds it as it is now (parents read fresh) and that charter's ONE running orchestrator; (2) the agent that recorded the pull request's notice (its boss
+    when it is a worker). When both resolve and AGREE the lane is told; when they DISAGREE neither is (`extra["unclear"]` = [plan lane, notice lane]); when one resolves it is used; none is unknown.
+    A charter with two or more running orchestrators is never picked between (`extra["candidates"]`); one nobody runs counts as no plan lane."""
     discovery = engine.discover(engine.now())
     agents = discovery.agents
     orchestrators = {name: agent for name, agent in agents.items() if _is_orchestrator(agent)}
-    extra, lane, how = {}, None, None
-    plan_ref = None
+    pr = "%s#%d" % (repo, number)
+    extra, plan_lane = {}, None
     if engine.state_dir is not None:
         try:
-            entries = [e for e in plan_ledger.read_ledger(engine.state_dir)[0] if e.get("pr") == "%s#%d" % (repo, number) and e.get("kind") in ("proof", "verdict") and e.get("plan_ref")]
-            plan_ref = entries[-1]["plan_ref"] if entries else None
-        except Exception:   # an unreadable ledger is no trusted plan: the next rule decides
-            plan_ref = None
-    issue = _plan_issue_of(plan_ref, repo) if plan_ref else None
-    decided = issue is not None and _lane_of_issue(engine, repo, issue, orchestrators)
-    if decided and decided[0] == "one":
-        lane, how = decided[1], "the plan the ledger records"
-    elif decided and decided[0] == "many":
-        extra["candidates"], extra["charter"] = decided[1], decided[2]
-        return None, None, dict(extra, **_link_lane_note(engine, repo, body, orchestrators, None))
-    if lane is None and engine.state_dir is not None:
-        item = next((i for i in read_pr_notices(engine.state_dir) if i["repo"] == repo and i["number"] == number), None)
-        for name in (notice_senders(item)[::-1] + ([item["boss"]] if isinstance(item.get("boss"), str) else [])) if item else []:
-            agent = agents.get(name)
-            if agent is None:
-                continue
-            boss = name if _is_orchestrator(agent) else boss_name(discovery, agent)
-            if boss in orchestrators:
-                lane, how = boss, "the notice"
-                break
-    extra.update(_link_lane_note(engine, repo, body, orchestrators, lane))
-    return lane, how, extra
-
-
-def _link_lane_note(engine, repo, body, orchestrators, trusted):
-    """{"link_lane": name} when the body's anchored `PLAN:` line names a lane that is not `trusted` (it is only ever REPORTED, never followed), else {}."""
-    found = _PLAN_LINE_ANCHORED.search(body or "")
-    issue = _plan_issue_of(found.group(1), repo) if found else None
-    seen = _lane_of_issue(engine, repo, issue, orchestrators) if issue is not None else None
-    named = seen[1] if seen and seen[0] == "one" else None
-    return {"link_lane": named} if named and named != trusted else {}
+            entries = plan_ledger.read_ledger(engine.state_dir)[0]
+            source, _where = authoritative_plan(entries, pr, body)
+            issue = _plan_issue_of(source, repo) if source else None
+            if issue is not None and checked_plan(engine.config, source, None, getattr(engine, "gh_runner", None) or subprocess.run, engine.now).get("result") == "pass":
+                decided = _lane_of_issue(engine, repo, issue, orchestrators)
+                if decided and decided[0] == "one":
+                    plan_lane = decided[1]
+                elif decided and decided[0] == "many":
+                    extra["candidates"], extra["charter"] = decided[1], decided[2]
+                    return None, None, extra
+        except Exception:   # an unreadable ledger or plan is no plan lane: the notice decides
+            plan_lane = None
+    notice_lane = None
+    item = next((i for i in read_pr_notices(engine.state_dir) if i["repo"] == repo and i["number"] == number), None) if engine.state_dir is not None else None
+    for name in (notice_senders(item)[::-1] + ([item["boss"]] if isinstance(item.get("boss"), str) else [])) if item else []:
+        agent = agents.get(name)
+        if agent is None:
+            continue
+        boss = name if _is_orchestrator(agent) else boss_name(discovery, agent)
+        if boss in orchestrators:
+            notice_lane = boss
+            break
+    if plan_lane and notice_lane and plan_lane != notice_lane:
+        extra["unclear"] = [plan_lane, notice_lane]
+        return None, None, extra
+    if plan_lane:
+        return plan_lane, "the pull request's plan" + (" and the notice" if notice_lane else ""), extra
+    return notice_lane, "the notice" if notice_lane else None, extra
 
 
 def _notify_clear_body(engine, abandoned, kind, repo, number, head, reason=None, body=None, previous=None):
@@ -19013,7 +19009,7 @@ def _notify_clear_body(engine, abandoned, kind, repo, number, head, reason=None,
                     del seen[old]
             _write_small(engine.state_dir, CLEAR_NOTIFIED_FILE, seen)   # before the send: at most once, even when the send fails
         lane, how, extra = clear_lane(engine, repo, number, body)
-        unknown = "lane unknown" + (": charter #%s has %d orchestrators: %s" % (extra.get("charter"), len(extra["candidates"]), ", ".join(extra["candidates"])) if extra.get("candidates") else "")
+        unknown = ("lane unclear: plan lane %s, notice by %s" % tuple(extra["unclear"]) if extra.get("unclear") else "lane unknown") + (": charter #%s has %d orchestrators: %s" % (extra.get("charter"), len(extra["candidates"]), ", ".join(extra["candidates"])) if extra.get("candidates") else "")
         if kind == "carry":
             line = "owner's clear carried %s from %s to %s; %s" % (pr, (previous or "?")[:8], head[:8], "%s merges it" % lane if lane else unknown)
         else:
@@ -19033,8 +19029,8 @@ def _notify_clear_body(engine, abandoned, kind, repo, number, head, reason=None,
         detail = {"head": head, "kind": kind, "lane": lane, "lane_from": how, "sent": sent}
         if extra.get("candidates"):
             detail["candidates"] = extra["candidates"]
-        if extra.get("link_lane"):
-            detail["plan_link_disagrees"] = extra["link_lane"]   # the body's PLAN link named another lane: reported, never followed
+        if extra.get("unclear"):
+            detail["lane_unclear"] = extra["unclear"]   # the plan's lane and the notice sender's lane differ: neither is told to merge
         if failed:
             detail["failed"] = failed
         if not abandoned.is_set():

@@ -13175,6 +13175,10 @@ class TestClearNotice(Base):
         self.labels = [self.names["merge-captain"], self.names["hold-impact"]]
         self.parents = {3: 2, 2: 1, 1: None}
         self.order = []
+        self.plan_result = "pass"
+        real_checked = sb.checked_plan
+        sb.checked_plan = lambda *a, **k: {"result": self.plan_result, "defects": [], "scenarios_parsed": []}   # the plan check at this moment (the gates' own function is patched: no GitHub here)
+        self.addCleanup(setattr, sb, "checked_plan", real_checked)
         self.record_plan("%s#3" % self.REPO)   # the plan the LEDGER records for this pull request (written by `prove`, not by the PR body)
         self.engine.intents = types.SimpleNamespace(parent=lambda number, repo=None: self.parents.get(number), repo=self.REPO, header=lambda *a, **k: None, ask_of=lambda number, repo=None: (number, None))
 
@@ -13211,7 +13215,7 @@ class TestClearNotice(Base):
         self.assertEqual((self.told("cos"), self.told("orch-a")), ([line], [line]))
         self.assertEqual(self.told("orch-b"), [])
         (event,) = self.events("gate.clear_notified")
-        self.assertEqual((event["detail"]["lane"], event["detail"]["lane_from"], sorted(event["detail"]["sent"])), ("orch-a", "the plan the ledger records", ["chief-of-staff", "orch-a"]))   # #597: the PLAN link now comes first (the body here has one), the same lane as the notice's
+        self.assertEqual((event["detail"]["lane"], event["detail"]["lane_from"], sorted(event["detail"]["sent"])), ("orch-a", "the pull request's plan and the notice", ["chief-of-staff", "orch-a"]))
 
     def no_ledger_plan(self):
         for name in ("plan-ledger.jsonl", "plan-ledger.head"):
@@ -13224,24 +13228,33 @@ class TestClearNotice(Base):
         (event,) = self.events("gate.clear_notified")
         return event["detail"]["lane"], event["detail"]["lane_from"], sorted(event["detail"]["sent"])
 
-    def test_s1_the_plan_link_beats_a_notice_recorded_by_another_lane(self):
+    def test_s1_a_plan_lane_and_a_notice_lane_that_agree_tell_that_lane(self):
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now())   # the worker's boss is orch-a, the plan sits under charter 1 (orch-a)
+        self.clear()
+        self.assertEqual(self.lane_event(), ("orch-a", "the pull request's plan and the notice", ["chief-of-staff", "orch-a"]))
+
+    def test_a_plan_lane_and_a_notice_lane_that_disagree_are_unclear_and_only_the_chief_of_staff_is_told(self):
         sb.record_pr_notice(self.world.state, self.REPO, 7, "orch-b", "ready", self.world.clock.now())   # orchestrator B recorded the notice; the plan sits under A's charter
         self.clear()
-        self.assertEqual(self.lane_event(), ("orch-a", "the plan the ledger records", ["chief-of-staff", "orch-a"]))
-        (line,) = self.told("orch-a")
-        self.assertIn("orch-a merges it", line)
-        self.assertNotIn("orch-b", line)
-        self.assertEqual(self.told("orch-b"), [])
+        (line,) = self.told("cos")
+        self.assertIn("lane unclear: plan lane orch-a, notice by orch-b", line)
+        self.assertNotIn("merges it", line)
+        self.assertEqual((self.told("orch-a"), self.told("orch-b")), ([], []), "neither lane is told to merge")
+        (event,) = self.events("gate.clear_notified")
+        self.assertEqual((event["detail"]["lane"], event["detail"]["lane_unclear"], event["detail"]["sent"]), (None, ["orch-a", "orch-b"], ["chief-of-staff"]))
+        self.clear()
+        self.assertEqual(len(self.events("gate.clear_notified")), 1, "audited once")
 
     def test_s2_a_moved_ask_counts_under_the_charter_it_has_now(self):
         cache, live = {2: 1}, {3: 2, 2: 50, 1: None, 50: None}   # the cache still says charter 1 for ask 2; today it is charter 50
         self.engine.intents = types.SimpleNamespace(parent=lambda number, repo=None: cache[number] if number in cache else live.get(number), invalidate=lambda number, repo=None: cache.pop(number, None),
                                                     repo=self.REPO, header=lambda *a, **k: None, ask_of=lambda number, repo=None: (number, None))
         self.clear()
-        self.assertEqual(self.lane_event()[:2], ("orch-b", "the plan the ledger records"))
+        self.assertEqual(self.lane_event()[:2], ("orch-b", "the pull request's plan"))
         self.assertEqual(self.told("orch-a"), [])
 
     def test_s3_a_plan_in_another_repository_is_not_used_and_the_notice_sender_decides(self):
+        self.body = "no plan line here\n"
         self.no_ledger_plan()
         self.record_plan("other-org/widget-web#3")
         sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now(), boss="orch-a")
@@ -13255,47 +13268,36 @@ class TestClearNotice(Base):
         self.assertEqual(self.lane_event(), ("orch-b", "the notice", ["chief-of-staff", "orch-b"]))
         self.assertEqual(self.told("orch-a"), [], "not the repository's other orchestrator")
 
-    def test_s5_with_no_plan_link_the_notice_senders_boss_is_the_lane_as_before(self):
-        self.no_ledger_plan()
+    def test_s5_with_no_plan_the_notice_senders_boss_is_the_lane_as_before(self):
         self.body = "no plan link here\n"
+        self.no_ledger_plan()
         sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now())
         self.clear()
         self.assertEqual(self.lane_event()[:2], ("orch-a", "the notice"))
 
-    def test_s6_with_no_link_and_no_notice_the_line_says_lane_unknown_and_only_the_chief_of_staff_is_told(self):
-        self.no_ledger_plan()
+    def test_s6_with_no_plan_and_no_notice_the_line_says_lane_unknown_and_only_the_chief_of_staff_is_told(self):
         self.body = "no plan link here\n"
+        self.no_ledger_plan()
         self.clear()
         (line,) = self.told("cos")
         self.assertIn("lane unknown", line)
         self.assertEqual((self.told("orch-a"), self.told("orch-b")), ([], []))
         self.assertEqual(self.lane_event(), (None, None, ["chief-of-staff"]))
 
-    def test_a_body_link_naming_another_lane_is_not_followed_and_is_audited(self):
-        self.body = "PLAN: https://github.com/acme-org/widget-api/issues/60#issuecomment-5\n"   # issue 60 sits under charter 50 (orch-b); the ledger's plan is under charter 1 (orch-a)
-        self.parents[60] = 50
-        self.parents[50] = None
+    def test_with_only_a_ledger_plan_and_no_body_link_the_ledgers_first_plan_decides(self):
+        self.body = "no plan line in the body\n"
         self.clear()
-        self.assertEqual(self.lane_event(), ("orch-a", "the plan the ledger records", ["chief-of-staff", "orch-a"]))
-        self.assertEqual(self.told("orch-b"), [])
-        (event,) = self.events("gate.clear_notified")
-        self.assertEqual(event["detail"]["plan_link_disagrees"], "orch-b")
+        self.assertEqual(self.lane_event()[:2], ("orch-a", "the pull request's plan"))
 
-    def test_a_body_link_alone_picks_no_lane_and_a_disagreement_is_still_audited(self):
-        self.no_ledger_plan()
-        self.clear()   # the body's link names a lane (orch-a); with no ledger plan and no notice nothing trusted names one
-        (line,) = self.told("cos")
-        self.assertIn("lane unknown", line)
-        self.assertEqual((self.told("orch-a"), self.told("orch-b")), ([], []))
-        (event,) = self.events("gate.clear_notified")
-        self.assertEqual(event["detail"]["plan_link_disagrees"], "orch-a")
-
-    def test_the_ledger_plan_beats_the_notice_and_with_no_ledger_plan_the_notice_sender_decides(self):
+    def test_a_plan_that_does_not_pass_the_plan_check_is_ignored_and_the_notice_decides(self):
+        self.plan_result = "fail"
         sb.record_pr_notice(self.world.state, self.REPO, 7, "orch-b", "ready", self.world.clock.now())
         self.clear()
-        self.assertEqual(self.lane_event()[:2], ("orch-a", "the plan the ledger records"))
+        self.assertEqual(self.lane_event()[:2], ("orch-b", "the notice"), "an invalid plan names no lane: no disagreement either")
         self.head = "c" * 40
         self.no_ledger_plan()
+        self.body = "no plan line\n"
+        self.plan_result = "fail"
         self.clear()
         self.assertEqual([e["detail"]["lane"] for e in self.events("gate.clear_notified")][-1], "orch-b")
 
@@ -13308,20 +13310,6 @@ class TestClearNotice(Base):
         (event,) = self.events("gate.clear_notified")
         self.assertEqual((event["detail"]["lane"], event["detail"]["candidates"], event["detail"]["sent"]), (None, ["orch-a", "orch-a2"], ["chief-of-staff"]))
 
-    def test_the_body_line_is_read_only_as_a_whole_anchored_plan_line(self):
-        for body, expected in (("PLAN: https://github.com/acme-org/widget-api/issues/60\n", "orch-b"),
-                               ("PLAN: https://github.com/acme-org/widget-api/issues/60#issuecomment-9\n", "orch-b"),
-                               ("PLAN: https://github.com/acme-org/widget-api/issues/60 and then some text\n", None),
-                               ("see PLAN: https://github.com/acme-org/widget-api/issues/60\n", None),
-                               ("PLAN: https://github.com/acme-org/widget-api/issues/60#frag\n", None),
-                               ("PLAN: https://evil.example/acme-org/widget-api/issues/60\n", None)):
-            self.setUp()
-            self.parents.update({60: 50, 50: None})
-            self.body = body
-            self.clear()
-            (event,) = self.events("gate.clear_notified")
-            self.assertEqual(event["detail"].get("plan_link_disagrees"), expected, body)
-
     def test_a_worker_that_owns_the_work_item_is_never_taken_for_the_lane(self):
         self.parents = {3: 2, 2: 99, 99: None}   # the plan's own chain reaches a worker's issue (3) but no running orchestrator
         self.clear()
@@ -13332,7 +13320,7 @@ class TestClearNotice(Base):
         self.clear()
         self.assertEqual(len(self.told("orch-a")), 1, "ask 2 sits under charter 1")
         self.assertEqual(self.told("orch-b"), [])
-        self.assertEqual(self.events("gate.clear_notified")[0]["detail"]["lane_from"], "the plan the ledger records")
+        self.assertEqual(self.events("gate.clear_notified")[0]["detail"]["lane_from"], "the pull request's plan")
 
     def test_s8_a_lane_that_cannot_be_found_says_lane_unknown_to_the_chief_of_staff_only_and_nobody_is_guessed(self):
         self.no_ledger_plan()
