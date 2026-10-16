@@ -11,7 +11,9 @@ import json
 import os
 import re
 
-KEY = "excluded_repos"
+CONFIG_KEY = "excluded_repos"   # the module declares its own configuration key (bin/fleet-switchboard config_declarations)
+CONFIG_DEFAULT = None           # None: no default is added to the configuration
+KEY = CONFIG_KEY
 MAX_ENTRIES = 200
 MAPPING_MAX = 65536       # bytes of the mapping file read for the warning
 REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")   # matched with fullmatch: a trailing newline is not a repository name

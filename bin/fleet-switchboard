@@ -479,11 +479,71 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "chat_clear", "temp_janitor", "load_alert", "spotlight_guard", "excluded_repos", "source_budgets"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "chat_clear", "temp_janitor", "load_alert", "source_budgets"}
+
+
+CONFIG_DECLARATION = re.compile(rb'^CONFIG_KEY[ \t]*=[ \t]*"([a-z][a-z0-9_]*)"[ \t]*(?:#.*)?$', re.M)
+CONFIG_DECLARATIONS_DIR = None   # None = the bin directory beside this program; only a test points it elsewhere (never configuration or input)
+_DECLARED_CACHE = {}
+
+
+def _declared_listing(directory):
+    """[(module name, path, mtime, size)] of the `*.py` files directly in `directory` (no recursion, regular files, plain module names)."""
+    out = []
+    for entry in sorted(os.scandir(directory), key=lambda e: e.name):
+        stem = entry.name[:-3]
+        if entry.name.endswith(".py") and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", stem) and entry.is_file(follow_symlinks=False):   # a symlink is never read
+            info = entry.stat()
+            out.append((stem, entry.path, info.st_mtime_ns, info.st_size))
+    return out
+
+
+def config_declarations():
+    """{key: module name} for the modules of the bin directory that declare a configuration key with a `CONFIG_KEY = "<key>"` line (and then
+    `CONFIG_DEFAULT` and `validate(value, source)`): a new module with a key needs no line in the shared key set or the validation chain.
+    Reads only the `*.py` files directly in the bin directory beside this program; a key declared twice, or one the shared defaults own, is a ConfigError."""
+    directory = CONFIG_DECLARATIONS_DIR or os.path.dirname(os.path.realpath(__file__))
+    listing = _declared_listing(directory)
+    cached = _DECLARED_CACHE.get(directory)
+    if cached is not None and cached[0] == listing:
+        return dict(cached[1])
+    shared = set(DEFAULTS) | set(PR7_CONFIG_KEYS) | TOP_LEVEL_EXTRA_KEYS
+    found = {}
+    for name, path, _, _ in listing:
+        try:
+            with open(path, "rb") as handle:
+                declared = CONFIG_DECLARATION.search(handle.read(200000))
+        except OSError as err:
+            raise ConfigError("config module %s.py cannot be read (%s): no configuration is loaded" % (name, err.strerror or err)) from None
+        if declared is None:
+            continue
+        key = declared.group(1).decode()
+        if key in shared:
+            raise ConfigError("config key %r is declared by %s.py and is also owned by the shared defaults" % (key, name))
+        if key in found:
+            raise ConfigError("config key %r is declared by two modules: %s.py and %s.py" % (key, found[key], name))
+        found[key] = name
+    _DECLARED_CACHE[directory] = (listing, dict(found))
+    return found
+
+
+def _declared_module(name):
+    """The module that declares a key, loaded by the generic loader (a test's directory: by path). A module that fails to load fails the WHOLE configuration,
+    naming its file: a daemon never runs on a partial configuration."""
+    try:
+        if CONFIG_DECLARATIONS_DIR is None:
+            return load_module(name)
+        spec = importlib.util.spec_from_file_location("declared_" + name, os.path.join(CONFIG_DECLARATIONS_DIR, name + ".py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception as err:
+        raise ConfigError("config module %s.py declares a configuration key but cannot be loaded (%s: %s): no configuration is loaded"
+                          % (name, type(err).__name__, _one_line(str(err), 160))) from None
 
 
 def config_known_keys():
-    return sorted(set(DEFAULTS) | set(PR7_CONFIG_KEYS) | TOP_LEVEL_EXTRA_KEYS)
+    return sorted(set(DEFAULTS) | set(PR7_CONFIG_KEYS) | TOP_LEVEL_EXTRA_KEYS | set(config_declarations()))
 
 
 def warn_unknown_config(message, section="", names=(), known=()):
@@ -511,7 +571,8 @@ def validate_config(raw, source="config"):
     """Defaults overlaid with `raw`, fully checked. Raises ConfigError."""
     if not isinstance(raw, dict):
         raise ConfigError("%s must be a JSON object" % source)
-    unknown = sorted(set(raw) - set(DEFAULTS) - set(PR7_CONFIG_KEYS) - TOP_LEVEL_EXTRA_KEYS)
+    declared = config_declarations()
+    unknown = sorted(set(raw) - set(DEFAULTS) - set(PR7_CONFIG_KEYS) - TOP_LEVEL_EXTRA_KEYS - set(declared))
     if unknown:
         warn_unknown_config(
             "%s contains key(s) this tool does not read: %s" % (source, ", ".join(unknown)), '', unknown, config_known_keys())
@@ -556,14 +617,15 @@ def validate_config(raw, source="config"):
         load_cpu_guard().validate(config["cpu_guard"], source)
     except ValueError as err:
         raise ConfigError(str(err))
-    try:
-        load_module("spotlight_guard").validate(config.get("spotlight_guard"), source)
-    except ValueError as err:
-        raise ConfigError(str(err)) from None
-    try:
-        load_module("repo_exclusion").validate(config.get("excluded_repos"), source)
-    except ValueError as err:
-        raise ConfigError(str(err)) from None
+    for key, name in sorted(declared.items(), key=lambda item: item[1]):   # the modules that declare their own key: its default, then its validator
+        module = _declared_module(name)
+        default = getattr(module, "CONFIG_DEFAULT", None)
+        if key not in raw and default is not None:
+            config[key] = copy.deepcopy(default)
+        try:
+            module.validate(config.get(key), source)
+        except ValueError as err:
+            raise ConfigError(str(err)) from None
     if not isinstance(config["docker_reaper"], bool):
         raise ConfigError("%s: 'docker_reaper' must be true or false, got %r" % (source, config["docker_reaper"]))
     if config["v2_events"] not in ("auto", "off"):

@@ -54221,6 +54221,99 @@ def main(argv):
     return 0 if ok else 1
 
 
+class TestConfigDeclarations(Base):
+    """#437 slice 2: a module declares its own configuration key, default and validator; the shared code reads the declarations from the bin directory only."""
+
+    FIXTURE = ('CONFIG_KEY = "fixture_key"\nCONFIG_DEFAULT = {"n": 1}\n\n\n'
+               'def validate(raw, source):\n    if not isinstance(raw, dict):\n        raise ValueError("fixture: bad value")\n')
+
+    def bin(self, **files):
+        directory = Path(tempfile.mkdtemp(prefix="decl-"))
+        self.addCleanup(shutil.rmtree, directory, True)
+        for name, text in files.items():
+            (directory / name).write_text(text)
+        patcher = mock.patch.object(sb, "CONFIG_DECLARATIONS_DIR", str(directory))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return directory
+
+    def warnings(self):
+        seen = []
+        patcher = mock.patch.object(sb, "warn_unknown_config", lambda message, section="", names=(), known=(): seen.append(list(names)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return seen
+
+    def test_s1_a_declared_key_is_known_defaulted_and_needs_no_shared_line(self):
+        self.bin(**{"fixture_mod.py": self.FIXTURE})
+        seen = self.warnings()
+        self.assertEqual(sb.validate_config({})["fixture_key"], {"n": 1}, "the declared default is applied when the key is absent")
+        self.assertEqual(sb.validate_config({"fixture_key": {"n": 5}})["fixture_key"], {"n": 5})
+        self.assertEqual(seen, [], "no unknown-key warning for a declared key")
+        self.assertIn("fixture_key", sb.config_known_keys())
+        self.assertNotIn("fixture_key", sb.TOP_LEVEL_EXTRA_KEYS)
+        self.assertNotIn("fixture_key", sb.DEFAULTS)
+
+    def test_s2_the_declared_validator_runs_and_its_message_is_the_error(self):
+        self.bin(**{"fixture_mod.py": self.FIXTURE})
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.validate_config({"fixture_key": "nope"})
+        self.assertEqual(str(caught.exception), "fixture: bad value")
+
+    def test_s4_a_key_declared_twice_or_owned_by_the_shared_defaults_is_refused_naming_both(self):
+        self.bin(**{"one.py": self.FIXTURE, "two.py": self.FIXTURE})
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.config_declarations()
+        self.assertIn("one.py", str(caught.exception))
+        self.assertIn("two.py", str(caught.exception))
+        self.bin(**{"shared.py": 'CONFIG_KEY = "poll_seconds"\n'})
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.config_declarations()
+        self.assertIn("shared.py", str(caught.exception))
+        self.assertIn("shared defaults", str(caught.exception))
+
+    def test_s5_only_py_files_directly_in_the_bin_directory_are_read(self):
+        directory = self.bin(**{"real.py": 'CONFIG_KEY = "real_key"\n', "backup.py.bak": 'CONFIG_KEY = "bak_key"\n', "notes.txt": 'CONFIG_KEY = "txt_key"\n'})
+        (directory / "sub").mkdir()
+        (directory / "sub" / "deep.py").write_text('CONFIG_KEY = "deep_key"\n')
+        outside = Path(tempfile.mkdtemp(prefix="outside-"))
+        self.addCleanup(shutil.rmtree, outside, True)
+        (outside / "out.py").write_text('CONFIG_KEY = "outside_key"\n')
+        (directory / "link.py").symlink_to(outside / "out.py")
+        self.assertEqual(sb.config_declarations(), {"real_key": "real"}, "0 decoys: a subdirectory, a backup, a text file and a symlink are not read")
+
+    def test_s6_shared_keys_stay_shared_and_an_undeclared_key_still_warns(self):
+        self.bin(**{"fixture_mod.py": self.FIXTURE})
+        seen = self.warnings()
+        sb.validate_config({"reds": None, "heavy": None, "nowhere_key": 1})
+        self.assertEqual(seen, [["nowhere_key"]])
+
+    def test_s7_the_moved_keys_are_known_through_their_declarations(self):
+        self.assertTrue({"spotlight_guard", "excluded_repos"} <= set(sb.config_known_keys()))
+        self.assertFalse({"spotlight_guard", "excluded_repos"} & sb.TOP_LEVEL_EXTRA_KEYS)
+        self.assertEqual(sb.config_declarations(), {"excluded_repos": "repo_exclusion", "spotlight_guard": "spotlight_guard"})
+
+    def test_a_declaring_module_that_cannot_load_fails_the_whole_configuration_naming_its_file(self):
+        self.bin(**{"broken.py": 'CONFIG_KEY = "broken_key"\nthis is not python\n', "fine.py": 'x = (\n'})
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.validate_config({})
+        self.assertIn("broken.py", str(caught.exception))
+        self.assertIn("no configuration is loaded", str(caught.exception))
+
+    def test_a_module_that_does_not_declare_is_never_imported(self):
+        self.bin(**{"fine.py": 'raise RuntimeError("imported")\n', "decl.py": self.FIXTURE})
+        self.assertEqual(sb.validate_config({})["fixture_key"], {"n": 1})
+
+    def test_the_moved_keys_validate_as_before_and_a_bad_value_keeps_its_message(self):
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.validate_config({"excluded_repos": "acme/api"})
+        self.assertIn("'excluded_repos' must be a list", str(caught.exception))
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.validate_config({"spotlight_guard": {"folders": 3}})
+        self.assertIn("spotlight_guard", str(caught.exception))
+        self.assertNotIn("excluded_repos", sb.validate_config({}), "an absent key with no default adds nothing")
+
+
 class TestSpotlightGuard(Base):
     """Ask #438: an hourly background check that the code and temp folders are still kept out of Spotlight; read-only, no process in a normal pass."""
 
