@@ -503,7 +503,10 @@ def config_declarations():
     `CONFIG_DEFAULT` and `validate(value, source)`): a new module with a key needs no line in the shared key set or the validation chain.
     Reads only the `*.py` files directly in the bin directory beside this program; a key declared twice, or one the shared defaults own, is a ConfigError."""
     directory = CONFIG_DECLARATIONS_DIR or os.path.dirname(os.path.realpath(__file__))
-    listing = _declared_listing(directory)
+    try:
+        listing = _declared_listing(directory)
+    except OSError as err:
+        raise ConfigError("the module directory %s cannot be read (%s): no configuration is loaded" % (directory, err.strerror or err)) from None
     cached = _DECLARED_CACHE.get(directory)
     if cached is not None and cached[0] == listing:
         return dict(cached[1])
@@ -527,19 +530,24 @@ def config_declarations():
     return found
 
 
-def _declared_module(name):
-    """The module that declares a key, loaded by the generic loader (a test's directory: by path). A module that fails to load fails the WHOLE configuration,
-    naming its file: a daemon never runs on a partial configuration."""
+def _declared_module(name, key):
+    """The module that declares a key, loaded by the generic loader (a test's directory: by path). A module that fails to load, whose own `CONFIG_KEY` is not the
+    key the scan read, or that has no `validate`, fails the WHOLE configuration naming its file: a daemon never runs on a partial configuration."""
     try:
         if CONFIG_DECLARATIONS_DIR is None:
             return load_module(name)
         spec = importlib.util.spec_from_file_location("declared_" + name, os.path.join(CONFIG_DECLARATIONS_DIR, name + ".py"))
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        return module
     except Exception as err:
         raise ConfigError("config module %s.py declares a configuration key but cannot be loaded (%s: %s): no configuration is loaded"
                           % (name, type(err).__name__, _one_line(str(err), 160))) from None
+    if getattr(module, "CONFIG_KEY", None) != key:
+        raise ConfigError("config module %s.py declares the key %r in its text but its CONFIG_KEY is %r: no configuration is loaded"
+                          % (name, key, getattr(module, "CONFIG_KEY", None)))
+    if not callable(getattr(module, "validate", None)):
+        raise ConfigError("config module %s.py declares the key %r but has no validate(value, source): no configuration is loaded" % (name, key))
+    return module
 
 
 def config_known_keys():
@@ -618,7 +626,7 @@ def validate_config(raw, source="config"):
     except ValueError as err:
         raise ConfigError(str(err))
     for key, name in sorted(declared.items(), key=lambda item: item[1]):   # the modules that declare their own key: its default, then its validator
-        module = _declared_module(name)
+        module = _declared_module(name, key)
         default = getattr(module, "CONFIG_DEFAULT", None)
         if key not in raw and default is not None:
             config[key] = copy.deepcopy(default)
@@ -626,6 +634,8 @@ def validate_config(raw, source="config"):
             module.validate(config.get(key), source)
         except ValueError as err:
             raise ConfigError(str(err)) from None
+        except Exception as err:   # a validator that fails any other way is a broken module, not a bad value: still the whole configuration, naming the file
+            raise ConfigError("config module %s.py: its validator failed (%s: %s): no configuration is loaded" % (name, type(err).__name__, _one_line(str(err), 160))) from None
     if not isinstance(config["docker_reaper"], bool):
         raise ConfigError("%s: 'docker_reaper' must be true or false, got %r" % (source, config["docker_reaper"]))
     if config["v2_events"] not in ("auto", "off"):

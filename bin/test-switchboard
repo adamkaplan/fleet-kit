@@ -54288,16 +54288,67 @@ class TestConfigDeclarations(Base):
         sb.validate_config({"reds": None, "heavy": None, "nowhere_key": 1})
         self.assertEqual(seen, [["nowhere_key"]])
 
+    def test_the_listing_is_cached_until_a_file_changes_and_a_caller_cannot_change_the_cache(self):
+        directory = self.bin(**{"one.py": 'CONFIG_KEY = "one_key"\n'})
+        first = sb.config_declarations()
+        first["tampered"] = "x"
+        self.assertEqual(sb.config_declarations(), {"one_key": "one"}, "the returned dict is a copy")
+        (directory / "two.py").write_text('CONFIG_KEY = "two_key"\n')
+        self.assertEqual(sb.config_declarations(), {"one_key": "one", "two_key": "two"}, "a new file is seen")
+        (directory / "one.py").write_text('CONFIG_KEY = "uno_key"  # renamed\n')
+        self.assertEqual(sb.config_declarations(), {"uno_key": "one", "two_key": "two"}, "an edited file is seen")
+
+    def test_an_unreadable_file_or_directory_fails_the_whole_configuration_naming_it(self):
+        directory = self.bin(**{"locked.py": 'CONFIG_KEY = "locked_key"\n'})
+        real_open = open
+        def deny(path, *args, **kwargs):
+            if str(path).endswith("locked.py"):
+                raise PermissionError(13, "Permission denied")
+            return real_open(path, *args, **kwargs)
+        with mock.patch("builtins.open", deny), self.assertRaises(sb.ConfigError) as caught:
+            sb.config_declarations()
+        self.assertIn("locked.py", str(caught.exception))
+        with mock.patch.object(sb, "CONFIG_DECLARATIONS_DIR", str(directory / "missing")), self.assertRaises(sb.ConfigError) as caught:
+            sb.config_declarations()
+        self.assertIn("cannot be read", str(caught.exception))
+
+    def test_a_declaring_module_must_hold_its_key_and_a_validate(self):
+        self.bin(**{"novalidate.py": 'CONFIG_KEY = "nv_key"\n'})
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.validate_config({})
+        self.assertIn("novalidate.py", str(caught.exception))
+        self.assertIn("no validate", str(caught.exception))
+        self.bin(**{"liar.py": '"""\nCONFIG_KEY = "doc_key"\n"""\nCONFIG_KEY = "other_key"\ndef validate(raw, source):\n    pass\n'})
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.validate_config({})
+        self.assertIn("liar.py", str(caught.exception))
+        self.assertIn("'doc_key'", str(caught.exception))
+
+    def test_a_validator_that_fails_any_other_way_is_a_broken_module(self):
+        self.bin(**{"crash.py": 'CONFIG_KEY = "crash_key"\ndef validate(raw, source):\n    raise KeyError("boom")\n'})
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.validate_config({})
+        self.assertIn("crash.py", str(caught.exception))
+        self.assertIn("no configuration is loaded", str(caught.exception))
+
+    def test_the_declaration_line_has_its_edges(self):
+        big = "#" * 200000 + '\nCONFIG_KEY = "late_key"\n'
+        self.bin(**{"commented.py": 'CONFIG_KEY = "ok_key"   # a comment\n', "upper.py": 'CONFIG_KEY = "Upper"\n', "digit.py": 'CONFIG_KEY = "1key"\n',
+                    "indented.py": '    CONFIG_KEY = "ind_key"\n', "late.py": big})
+        self.assertEqual(sb.config_declarations(), {"ok_key": "commented"}, "an uppercase or digit-led key, an indented line and a line past 200 KB are not declarations")
+
     def test_s7_the_moved_keys_are_known_through_their_declarations(self):
         self.assertTrue({"spotlight_guard", "excluded_repos"} <= set(sb.config_known_keys()))
         self.assertFalse({"spotlight_guard", "excluded_repos"} & sb.TOP_LEVEL_EXTRA_KEYS)
-        self.assertEqual(sb.config_declarations(), {"excluded_repos": "repo_exclusion", "spotlight_guard": "spotlight_guard"})
+        declared = sb.config_declarations()
+        self.assertEqual((declared["excluded_repos"], declared["spotlight_guard"]), ("repo_exclusion", "spotlight_guard"))
 
     def test_a_declaring_module_that_cannot_load_fails_the_whole_configuration_naming_its_file(self):
         self.bin(**{"broken.py": 'CONFIG_KEY = "broken_key"\nthis is not python\n', "fine.py": 'x = (\n'})
         with self.assertRaises(sb.ConfigError) as caught:
             sb.validate_config({})
         self.assertIn("broken.py", str(caught.exception))
+        self.assertNotIn("fine.py", str(caught.exception), "only a declaring module fails the load")
         self.assertIn("no configuration is loaded", str(caught.exception))
 
     def test_a_module_that_does_not_declare_is_never_imported(self):
