@@ -13,6 +13,7 @@ before a byte is sent.
 """
 import base64
 import contextlib
+import datetime
 import http.client
 import importlib.util
 import json
@@ -20,6 +21,7 @@ import os
 import re
 import shlex
 import shutil
+import secrets as secrets_module
 import signal
 import socket
 import stat
@@ -187,6 +189,14 @@ def list_records(state):
             if record is not None:
                 found.append(record)
     return found
+
+
+def refuse_local_launch(name):
+    """Called first by a LOCAL `launch`: a name that has a cloud record is refused, because `route` would send every later send/read/retire for
+    the new local agent into the pod. No cluster or herdr call: the record is a file. A broken record also refuses (it still holds the name)."""
+    if valid_name(name or "") and (H["state_dir_path"]() / CLOUD_DIR / (name + ".json")).exists():
+        raise CloudError("a cloud worker named %s exists: a local agent cannot take its name (send, read and retire by name would reach the "
+                         "pod); `%s retire %s` ends it first; nothing was launched" % (name, H["PROG"], name))
 
 
 def route(name):
@@ -405,11 +415,11 @@ class Refusal(CloudError):
 VAULT_CHECK = ("run the platform team's firewall check for the vault (the vault pre-check) first; nothing was changed and no other credential "
                "was tried")
 MAX_TOKEN_SECONDS = 3600
+HANDLED_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
 TOKEN_CMD_SECONDS = 60
 CLUSTER_DROP = ("CW_KUBE_CONTEXT", "CW_KUBECONFIG", "KUBECONFIG", "CW_CLOUD_SERVER", "CW_CLOUD_TOKEN_FILE", "CW_CLOUD_CA_FILE",
                 "CW_CLUSTER_TOKEN_CMD", "CW_CLUSTER_ADMIN_CMD")
 POD_RE = re.compile(r"pod/([a-z0-9][a-z0-9.-]{0,100})")
-REPO_RE = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}")
 MODEL_PROVIDER = "github-copilot"
 _LIB = {}
 
@@ -433,22 +443,38 @@ def _scrub_lib():
     return _lib().scrub
 
 
-def allowed_repos():
-    return [x for x in re.split(r"[,\s]+", os.environ.get("CW_ALLOWED_REPOS", "")) if x]
+_OWNER_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
+_NAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,100}")
 
 
-def check_allowed(repo):
-    """The allow-list (#639 owns the real one; this is the thin check until it lands): only a repository named in CW_ALLOWED_REPOS, exactly,
-    can be launched, and never the tooling repository (CW_TOOLING_REPO) even if listed. Runs before anything is created."""
-    if not isinstance(repo, str) or not REPO_RE.fullmatch(repo) or repo.split("/")[0] in (".", "..") or repo.split("/")[1] in (".", ".."):
-        raise Refusal("not a repository (OWNER/NAME): %r; nothing was created" % (repo,))
-    listed = allowed_repos()
-    if not listed:
-        raise Refusal("CW_ALLOWED_REPOS is empty: no repository can be launched; nothing was created")
-    if repo.lower() == (os.environ.get("CW_TOOLING_REPO") or "").strip().lower():
-        raise Refusal("%s is the tooling repository: cloud workers serve product repositories only; nothing was created" % repo)
-    if repo not in listed:
-        raise Refusal("%s is not on the allow-list (CW_ALLOWED_REPOS); nothing was created" % repo)
+def _repo_key(text):
+    """OWNER/NAME lower-cased (ASCII), or None when it is not exactly that shape. Identical in behaviour to the launcher's `_repo_key`."""
+    owner, sep, name = (text or "").partition("/")
+    if not sep or not _OWNER_RE.fullmatch(owner) or not _NAME_RE.fullmatch(name) or set(name) == {"."}:
+        return None
+    return (owner + "/" + name).lower()
+
+
+def check_allowed(repo, env=None):
+    """The allow-list. A COPY of the launcher's `check_repo_allowed` (cloud/launcher/cloud_worker.py, #659) with the same behaviour, so the two
+    entry points accept the same repositories from the same variable (tests/test_same_allow_list runs both over the same inputs).
+    TODO(follow-up once #659 is in the base): replace this copy by a call to `_lib().check_repo_allowed(repo, env)`.
+    CW_ALLOWED_REPOS: comma-separated OWNER/NAME, exact, ASCII case-insensitive; unset, empty or ANY malformed entry refuses the whole list.
+    CW_TOOLING_REPO: refused even when listed; unset adds no check, a malformed value refuses. Runs before anything is created."""
+    env = os.environ if env is None else env
+    raw = (env.get("CW_ALLOWED_REPOS") or "").strip()
+    if not raw:
+        raise Refusal("%s is not on the cloud allow-list (CW_ALLOWED_REPOS is unset or empty); nothing was created" % _one(str(repo), 120))
+    allowed = [_repo_key(x.strip()) for x in raw.split(",")]
+    if None in allowed:
+        raise Refusal("CW_ALLOWED_REPOS has an entry that is not OWNER/NAME; nothing was created")
+    tooling = (env.get("CW_TOOLING_REPO") or "").strip()
+    tkey = _repo_key(tooling) if tooling else None
+    if tooling and tkey is None:
+        raise Refusal("CW_TOOLING_REPO is not OWNER/NAME; nothing was created")
+    key = _repo_key(repo) if isinstance(repo, str) else None
+    if key is None or key not in allowed or key == tkey:
+        raise Refusal("%s is not on the cloud allow-list; nothing was created" % _one(str(repo), 120))
 
 
 def _capture(argv, env=None, feed=None, timeout=TOKEN_CMD_SECONDS, limit=1000000):
@@ -568,10 +594,53 @@ def private_root():
     return root
 
 
+def _ps(pid, field):
+    """One `ps -o FIELD= -p PID` value (the process's start time or full command line), or None when the process is gone or ps cannot say."""
+    try:
+        out = subprocess.run(["ps", "-o", field + "=", "-p", str(int(pid))], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"}, timeout=10).stdout.decode("utf-8", "replace").strip()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return " ".join(out.split()) or None
+
+
+def stop_recorded_tunnels(directory):
+    """Stop an orphaned `kubectl port-forward` of a dead command: the pid and start time it recorded in its directory. A pid is signalled only when
+    the process STILL has the recorded start time AND its command line is a kubectl port-forward that uses THIS directory's kubeconfig: a reused
+    pid (another program, or another run's tunnel) is never touched."""
+    stopped = 0
+    config = os.path.join(directory, "config")
+    for note in sorted(Path(directory).glob("tunnel-*.pid")):
+        try:
+            pid_text, _, started = _read_private(note, 400).partition(" ")
+            pid = int(pid_text)
+        except (CloudError, OSError, ValueError):
+            continue
+        command = _ps(pid, "command")
+        if pid <= 1 or not started or _ps(pid, "lstart") != started or not command or "kubectl" not in command \
+                or "port-forward" not in command or config not in command:
+            continue
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                if os.getpgid(pid) == pid:
+                    os.killpg(pid, sig)
+                else:
+                    os.kill(pid, sig)
+            except OSError:
+                break
+            time.sleep(0.2)
+            if _ps(pid, "lstart") != started:
+                break
+        stopped += 1
+    return stopped
+
+
 def sweep_stale(root):
     """At the start of every command: remove what a command killed by SIGKILL left: a `cmd-<pid>-*` directory of ours whose process is gone, or
-    that is older than the token's longest life. Nothing else is touched. Says so once when it removed one (never what was in it)."""
+    that is older than the token's longest life, and STOP the `kubectl port-forward` that command left running (see stop_recorded_tunnels).
+    Nothing else is touched. Says so once when it removed one (never what was in it)."""
     removed = 0
+    tunnels = 0
     for entry in root.iterdir():
         match = re.fullmatch(r"cmd-(\d+)-[A-Za-z0-9_]+", entry.name)
         try:
@@ -588,16 +657,18 @@ def sweep_stale(root):
         except OSError:
             pass
         if dead or time.time() - found.st_mtime > MAX_TOKEN_SECONDS:
+            tunnels += stop_recorded_tunnels(str(entry))
             shutil.rmtree(str(entry), ignore_errors=True)
             removed += 1
     if removed:
-        sys.stderr.write("%s: removed %d leftover cluster-token directory of an earlier command that was killed\n" % (H["PROG"], removed))
+        sys.stderr.write("%s: removed %d leftover cluster-token directory of an earlier command that was killed%s\n"
+                         % (H["PROG"], removed, " and stopped %d tunnel it left" % tunnels if tunnels else ""))
 
 
 class Cluster:
     """The login for ONE command. `with Cluster() as cluster:` mints a token, writes it to a 0600 O_EXCL file in a private 0700 directory (the only
     place it touches disk: the launcher's tokenFile mechanism needs a file), and removes the directory on every way out: normal end, failure,
-    SIGINT and SIGTERM. A stale directory of a killed command is swept at the start of every command. No token is kept between commands."""
+    SIGINT, SIGTERM, SIGHUP and SIGQUIT. A stale directory of a killed command is swept at the start of every command. No token is kept between commands."""
 
     def __init__(self):
         self.known = set()
@@ -606,10 +677,13 @@ class Cluster:
         self.token_file = None
         self.server = None
         self.old = {}
+        self.tunnels = []
 
     def __enter__(self):
         if threading.current_thread() is threading.main_thread():
-            self.old = {signal.SIGTERM: signal.signal(signal.SIGTERM, _terminate)}
+            # the SAME handler for every way a terminal or a person ends a command: a closed window (SIGHUP) and SIGQUIT take their default action
+            # otherwise, which ends the process with no cleanup and leaves the tunnel (its own session gets no hangup) running
+            self.old = {sig: signal.signal(sig, self._on_signal) for sig in HANDLED_SIGNALS}
         try:
             server = (os.environ.get("CW_CLOUD_SERVER") or "").strip()
             if not server:
@@ -648,6 +722,11 @@ class Cluster:
         self.close()
         return False
 
+    def _on_signal(self, signum, frame):
+        for child in list(self.tunnels):   # stop the tunnels now, whatever the stack is doing; the `finally` blocks then remove the files
+            _kill_group(child)
+        raise KeyboardInterrupt
+
     def close(self):
         if self.dir:
             shutil.rmtree(self.dir, ignore_errors=True)
@@ -673,10 +752,6 @@ class Cluster:
         return env
 
 
-def _terminate(signum, frame):
-    raise KeyboardInterrupt
-
-
 @contextlib.contextmanager
 def tunnel(cluster, record):
     """A `kubectl port-forward` to the worker's pod that exists for the `with` block only. Yields the record with its url set to the loopback address
@@ -696,7 +771,15 @@ def tunnel(cluster, record):
             child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, env=cluster.env(), start_new_session=True)
         except OSError as err:
             raise CloudError("cannot open the tunnel: %s" % (err.strerror or err)) from None
+    cluster.tunnels.append(child)
     try:
+        # the pid and start time go in the command's private directory: if this command is killed outright (SIGKILL), the NEXT command stops
+        # the orphaned port-forward (only while the pid still has this start time and is a port-forward of this directory)
+        started = _ps(child.pid, "lstart")
+        if started:
+            fd = os.open(os.path.join(cluster.dir, "tunnel-%d.pid" % port), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as note:
+                note.write("%d %s" % (child.pid, started))
         deadline = time.monotonic() + float(os.environ.get("CW_TUNNEL_TIMEOUT") or 30)
         ready = ("Forwarding from 127.0.0.1:%d" % port).encode()
         while True:
@@ -716,6 +799,8 @@ def tunnel(cluster, record):
         yield dict(record, url="http://127.0.0.1:%d" % port)
     finally:
         _kill_group(child)
+        if child in cluster.tunnels:
+            cluster.tunnels.remove(child)
 
 
 def refusals(function):
@@ -786,10 +871,15 @@ def cmd_launch(args, runner, now):
         raise LaunchError("--branch is not a branch name: %r" % branch)
     check_allowed(repo)   # before anything is read, minted or created
     engine, state, _ = H["build_engine"](runner, now, "cli")
+    local = engine.discover(engine.now()).agents.get(name)
+    if local is not None:   # `route` prefers a cloud record: every later send/read/retire for the local agent would go INTO the pod
+        raise LaunchError("a local fleet agent named %s exists: a cloud worker cannot take its name (send, read and retire by name would reach "
+                          "the pod instead of the local agent); retire it or pick another name; nothing was created" % name)
     if load_record(state, name) is not None:
         raise LaunchError("a cloud worker named %s already exists (`%s retire %s` ends it)" % (name, H["PROG"], name))
     brief = H["read_brief"](args.brief_file, sys.stdin)
-    options = ["--repo", repo, "--branch", branch]
+    run_id = secrets_module.token_hex(16)   # this command's nonce: recorded on what `create` makes, so a later stop can say it is ours
+    options = ["--repo", repo, "--branch", branch, "--run-id", run_id]
     for flag, value in (("--idle", args.idle), ("--hard", args.hard), ("--shape", args.shape)):
         if value:
             options += [flag, str(value)]
@@ -806,12 +896,12 @@ def cmd_launch(args, runner, now):
                 code, body, note = run_launcher(runner, "create", name, options, LAUNCH_SECONDS, password_fd=write_fd, cluster=cluster,
                                                 secrets=[("model-auth", model), ("git-token", token)])
             except CloudError as err:
-                _stop_after_failure(engine, runner, name, "launch: the launcher did not finish", cluster)   # a pod made just before the cut is stopped too
+                _stop_after_failure(engine, runner, name, run_id, "launch: the launcher did not finish", cluster)   # a pod made just before the cut is stopped too
                 raise LaunchError(str(err)) from None
             except BaseException:
                 os.close(write_fd)
                 write_fd = None
-                _stop_after_failure(engine, runner, name, "launch interrupted", cluster)
+                _stop_after_failure(engine, runner, name, run_id, "launch interrupted", cluster)
                 raise
             finally:
                 if write_fd is not None:
@@ -823,7 +913,7 @@ def cmd_launch(args, runner, now):
             try:
                 password = _read_password(read_fd)
             except CloudError as err:
-                _stop_after_failure(engine, runner, name, "launch: no password", cluster)
+                _stop_after_failure(engine, runner, name, run_id, "launch: no password", cluster)
                 raise LaunchError(str(err)) from None
             cluster.add(password)
         finally:
@@ -838,7 +928,7 @@ def cmd_launch(args, runner, now):
             save_record(state, record)
         except (CloudError, OSError) as err:
             remove_record(state, name)
-            _stop_after_failure(engine, runner, name, "launch: record not stored", cluster)
+            _stop_after_failure(engine, runner, name, run_id, "launch: record not stored", cluster)
             raise LaunchError("the worker was created but its record could not be stored (%s); stop was requested" % _one(cluster.clean(str(err), 100), 100)) from None
         _audit(engine, "cloud.created", name, {"runtime_id": record["runtime_id"], "host": urllib.parse.urlsplit(record["url"]).hostname,
                                                "idle_deadline": record.get("idle_deadline"), "hard_deadline": record.get("hard_deadline")})
@@ -852,13 +942,13 @@ def cmd_launch(args, runner, now):
                 if brief:
                     v2.prompt(session, brief, {"fleet": {"from": "switchboard", "brief": True}})
         except (H["V2Error"], H["V2Unreachable"], CloudError, OSError, KeyError, TypeError) as err:
-            stopped = _stop_after_failure(engine, runner, name, "launch failed: %s" % _one(cluster.clean(str(err), 80), 80), cluster)
+            stopped = _stop_after_failure(engine, runner, name, run_id, "launch failed: %s" % _one(cluster.clean(str(err), 80), 80), cluster)
             if stopped:
                 remove_record(state, name)
             raise LaunchError("%s (the worker was created; %s)" % (
                 _one(cluster.clean(str(err))), "it was stopped" if stopped else "stop it with `%s retire %s`" % (H["PROG"], name))) from None
         except BaseException:
-            if _stop_after_failure(engine, runner, name, "launch interrupted", cluster):
+            if _stop_after_failure(engine, runner, name, run_id, "launch interrupted", cluster):
                 remove_record(state, name)
             raise
     print(json.dumps({"name": name, "session": session, "runtime_id": record["runtime_id"], "url": record["url"], "cloud": True}, sort_keys=True))
@@ -879,16 +969,22 @@ def _record_from_create(name, body):
     return record
 
 
-def _stop_after_failure(engine, runner, name, reason, cluster):
-    """Best effort: stop a pod that a failed or interrupted launch left (the launcher deletes the pod and its per-run secret). True when stop exited 0."""
+def _stop_after_failure(engine, runner, name, run_id, reason, cluster):
+    """Best effort: stop a pod that a failed or interrupted launch left (the launcher deletes the pod and its per-run secret). The stop carries this
+    command's run id, so a worker of the same name that is not this command's is left whole. A launcher whose `stop` does not take --run-id yet is
+    stopped by name as before, and the audit line says which it was. True when stop exited 0."""
     old = _ignore_signals()   # a second Ctrl-C must not abandon the cleanup
+    by = "run-id"
     try:
-        code, _, _ = run_launcher(runner, "stop", name, ["--reason", reason], STOP_SECONDS, cluster=cluster)
+        code, _, note = run_launcher(runner, "stop", name, ["--reason", reason, "--run-id", run_id], STOP_SECONDS, cluster=cluster)
+        if code == 2 and "--run-id" in (note or ""):   # the launcher does not know the option: usage error, nothing was stopped
+            by = "name (the launcher's stop takes no --run-id)"
+            code, _, note = run_launcher(runner, "stop", name, ["--reason", reason], STOP_SECONDS, cluster=cluster)
     except CloudError:
         return False
     finally:
         _restore_signals(old)
-    _audit(engine, "cloud.stopped", name, {"exit": code, "why": "launch failed"})
+    _audit(engine, "cloud.stopped", name, {"exit": code, "why": "launch failed", "stopped_by": by, "run_id": run_id[:8]})
     return code == 0
 
 
@@ -972,6 +1068,16 @@ def cmd_read(args, runner, now):
 
 # ---------------------------------------------------------------- status
 
+def _ended(record, clock=None):
+    """True when the worker's hard deadline has passed: its pod is gone by design, so there is nothing to probe (and no token to mint for it)."""
+    text = record.get("hard_deadline")
+    try:
+        when = datetime.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return False
+    return when.timestamp() < (time.time() if clock is None else clock)
+
+
 def status_lines(runner, state, timeout=STATUS_SECONDS):
     """(lines, rows) for `status`: per cloud worker its record and, from the launcher's read-only `status`, phase and cost, and whether the worker
     answers through a tunnel that exists only for that probe. One cluster token serves the whole command. A trouble is said on the line, never raised."""
@@ -979,7 +1085,8 @@ def status_lines(runner, state, timeout=STATUS_SECONDS):
     lines, rows = [], []
     cluster = None
     try:
-        if any("problem" not in r for r in records):
+        # one mint per `status` command, and none when no record needs a probe (a broken record, or a worker past its hard deadline)
+        if any("problem" not in r and not _ended(r) for r in records):
             try:
                 cluster = Cluster().__enter__()
             except CloudError as err:
@@ -992,6 +1099,11 @@ def status_lines(runner, state, timeout=STATUS_SECONDS):
                 rows.append(row)
                 continue
             row.update({key: record.get(key) for key in ("runtime_id", "idle_deadline", "hard_deadline", "session")})
+            if _ended(record):
+                row["launcher_status"] = "ended"
+                rows.append(row)
+                lines.append("      cloud %s: %s, past its hard deadline %s (not queried)" % (record["worker"], record["runtime_id"], record.get("hard_deadline")))
+                continue
             if cluster is None:
                 row["launcher_status"] = "no cluster reached"
                 rows.append(row)

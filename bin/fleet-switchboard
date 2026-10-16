@@ -15950,6 +15950,7 @@ def read_brief(path, stdin):
 def cmd_launch(args, runner, now, socket_call=None):
     if getattr(args, "cloud", False):   # a worker in the cloud (#371): its own module; nothing below runs
         return run_cloud("cmd_launch", args, runner, now)
+    run_cloud("refuse_local_launch", args.name)   # a name that has a cloud record is not launched locally (#640)
     engine, state, _ = build_engine(runner, now, "cli", socket_call=socket_call)
     workspace = args.workspace if (args.workspace or getattr(args, "new_workspace", None) or getattr(args, "headless", False)) \
         else caller_workspace(engine, None)   # a workspace made now, or none at all, needs no look at the caller's own

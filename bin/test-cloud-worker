@@ -114,7 +114,7 @@ if command == "create":
     os.write(fd, (os.environ["STUB_PASSWORD"] + "\\n").encode())
     os.close(fd)
     print(json.dumps({"worker": worker, "url": os.environ["STUB_URL"], "auth_ref": "file:/etc/passwd", "runtime_id": "pod/%%s-7f9c" %% worker,
-                      "idle_deadline": "2026-10-14T12:10:00Z", "hard_deadline": "2026-10-14T14:00:00Z"}))
+                      "idle_deadline": "2099-10-14T12:10:00Z", "hard_deadline": "2099-10-14T14:00:00Z"}))
 elif command == "stop":
     code = int(os.environ.get("STUB_STOP_EXIT", "0"))
     if code:
@@ -737,6 +737,185 @@ class TestWiring(Base):
         for entry in self.jsonl("login.log"):
             self.assertNotIn("CW_KUBE_CONTEXT", entry["env"])
             self.assertNotIn("CW_KUBECONFIG", entry["env"])
+
+
+class TestSignalsAndOrphans(Base):
+    """#640 review M1: every signal that ends a command leaves no token directory and no tunnel; a SIGKILL leftover is cleaned by the next command."""
+    assertNothingKept = TestWiring.assertNothingKept
+    assertNoSecret = TestWiring.assertNoSecret
+    forms = TestWiring.forms
+    PLANTED = TestWiring.PLANTED
+    _signalled = TestWiring._signalled
+
+    def test_signal_table_leaves_no_directory_and_no_tunnel(self):
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+            with self.subTest(signal=signal.Signals(signum).name):
+                (self.stub_dir / "pf_hang").unlink(missing_ok=True)
+                for leftover in (self.state / "cloud").glob("coder7.*"):
+                    leftover.unlink()
+                self._signalled(signum)
+
+    def _killed_command(self, launch=True):
+        if launch:
+            self.assertEqual(self.launch()[0], 0)
+        (self.stub_dir / "pf_hang").write_text("")
+        before = len((self.stub_dir / "pf.pid").read_text().split())
+        env = dict(os.environ, FLEET_SWITCHBOARD_UNDER_TEST="1")
+        child = subprocess.Popen([sys.executable, str(BIN / "fleet-switchboard"), "read", "coder7"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        deadline = time.time() + 60
+        while time.time() < deadline and len((self.stub_dir / "pf.pid").read_text().split()) == before:
+            time.sleep(0.1)
+        notes = []
+        while time.time() < deadline and not notes:
+            notes = list(self.root.glob("cmd-*/tunnel-*.pid"))
+            time.sleep(0.1)
+        self.assertTrue(notes, "the tunnel was not recorded")
+        child.kill()
+        child.communicate(timeout=60)
+        (self.stub_dir / "pf_hang").unlink()
+        return notes[0]
+
+    def test_a_sigkilled_command_leaves_a_tunnel_that_the_next_command_stops(self):
+        self._killed_command()
+        self.addCleanup(lambda: [os.kill(int(p), signal.SIGKILL) for p in self.pf_alive()])
+        self.assertEqual(len(self.pf_alive()), 1)   # the orphan
+        self.assertEqual(len(list(self.root.glob("cmd-*"))), 1)
+        code, out, err = self.main("read", "coder7")
+        self.assertEqual(code, 0, err)
+        self.assertIn("stopped 1 tunnel", err)
+        self.assertEqual(self.pf_alive(), [])
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_recorded_pid_that_was_reused_is_not_signalled(self):
+        other = subprocess.Popen(["sleep", "300"])
+        self.addCleanup(other.kill)
+        started = sb.load_module("cloud_worker")._ps(other.pid, "lstart")
+        self.assertEqual(self.launch()[0], 0)
+        for text in ("%d %s" % (other.pid, started), "%d Thu Jan  1 00:00:00 1970" % other.pid):   # not a port-forward / not that start time
+            note = self._killed_command(launch=False)
+            note.write_text(text)
+            os.chmod(str(note), 0o600)
+            code, out, err = self.main("read", "coder7")
+            self.assertEqual(code, 0, err)
+            self.assertIsNone(other.poll(), "a reused pid was signalled")
+            self.assertEqual(self.leftovers(), [])
+            for orphan in self.pf_alive():   # the real orphan's record was replaced, so it is not ours to find: clean it up here
+                os.kill(int(orphan), signal.SIGKILL)
+
+
+class TestSameAllowList(unittest.TestCase):
+    """#640 review M2: this program's check and the launcher's `check_repo_allowed` give the SAME answer for the same inputs."""
+
+    @staticmethod
+    def launcher_function():
+        path = BIN.parent / "cloud" / "launcher" / "cloud_worker.py"
+        source = path.read_text() if path.exists() else ""
+        if "def check_repo_allowed" not in source:   # not in the base yet (#659): the branch that adds it is read instead
+            shown = subprocess.run(["git", "show", "origin/cloud/g-s4:cloud/launcher/cloud_worker.py"], cwd=str(BIN.parent), stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, text=True)
+            source = shown.stdout if shown.returncode == 0 else ""
+        if "def check_repo_allowed" not in source:
+            return None
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader("cw_launcher_ref", loader=None))
+        sys.modules["cw_launcher_ref"] = module
+        exec(compile(source, "cloud_worker.py", "exec"), module.__dict__)
+        return module
+
+    CASES = [
+        ("acme-org/widget-service", "acme-org/widget-service", None), ("acme-org/Widget-Service", "acme-org/widget-service", None),
+        ("ACME-ORG/WIDGET-SERVICE", "acme-org/widget-service", None), ("acme-org/widget-service", "ACME-ORG/Widget-Service", None),
+        ("acme-org/widget-service", "", None), ("acme-org/widget-service", None, None), ("acme-org/widget-service", "   ", None),
+        ("acme-org/widget-service", "acme-org/widget-service,acme-org/other", None), ("acme-org/other", "acme-org/widget-service, acme-org/other", None),
+        ("acme-org/other", "acme-org/widget-service acme-org/other", None), ("acme-org/other", "acme-org/widget-service,\tacme-org/other", None),
+        ("acme-org/widget-service", "acme-org/widget-service,", None), ("acme-org/widget-service", ",acme-org/widget-service", None),
+        ("acme-org/widget-service", "acme-org/widget-service,,acme-org/other", None), ("acme-org/widget-service", "acme-org/widget-service,bogus", None),
+        ("acme-org/widget-service", "acme-org/*", None), ("acme-org/widget-service", "*", None), ("acme-org/widget-service", "acme-org/", None),
+        ("acme-org/widget-service", "/widget-service", None), ("acme-org/widget-service", "acme-org/widget-service/extra", None),
+        ("acme-org/widget-service\n", "acme-org/widget-service", None), ("acme-org/widget-service", "acme-org/widget-service\n", None),
+        ("acme-org/widget-service", "acme-org/widget-service\nacme-org/other", None), ("acme-org/..", "acme-org/..", None),
+        ("acme-org/.", "acme-org/.", None), ("acme-org/.hidden", "acme-org/.hidden", None), ("-acme/widget", "-acme/widget", None),
+        ("acme_org/widget", "acme_org/widget", None), ("acme/w", "acme/w", None), ("acme-org/widget-service", "acme-org/widget-service", "acme-org/widget-service"),
+        ("acme-org/widget-service", "acme-org/widget-service", "ACME-ORG/Widget-Service"), ("acme-org/widget-service", "acme-org/widget-service", "acme-org/tooling"),
+        ("acme-org/tooling", "acme-org/widget-service,acme-org/tooling", "acme-org/tooling"), ("acme-org/widget-service", "acme-org/widget-service", "not a repo"),
+        ("acme-org/widget-service", "acme-org/widget-service", "   "), ("acme-org/widget-service", "acme-org/widget-service", ""),
+        ("acme-org/widget-service", "acme-org/widget-service", "acme-org/tooling\n"), ("", "acme-org/widget-service", None), (None, "acme-org/widget-service", None),
+        ("acme-org/wid\u212aget", "acme-org/wid\u212aget", None), ("ac\u212ae/widget", "ac\u212ae/widget", None),
+        ("a" * 40 + "/widget", "a" * 40 + "/widget", None), ("a" * 39 + "/widget", "a" * 39 + "/widget", None), ("acme-org/" + "w" * 101, "acme-org/" + "w" * 101, None),
+        ("acme-org/" + "w" * 100, "acme-org/" + "w" * 100, None),
+    ]
+
+    def test_both_functions_answer_alike_over_the_same_inputs(self):
+        ref = self.launcher_function()
+        if ref is None:
+            self.skipTest("the launcher's check_repo_allowed is not available (neither in the tree nor on origin/cloud/g-s4)")
+        mine = sb.load_module("cloud_worker").bind(sb.__dict__)
+        self.assertGreaterEqual(len(self.CASES), 40)
+        for repo, allowed, tooling in self.CASES:
+            env = {k: v for k, v in (("CW_ALLOWED_REPOS", allowed), ("CW_TOOLING_REPO", tooling)) if v is not None}
+            answers = []
+            for function in (lambda: ref.check_repo_allowed(repo, env), lambda: mine.check_allowed(repo, env)):
+                try:
+                    function()
+                    answers.append("allowed")
+                except (ref.CloudError, mine.CloudError):
+                    answers.append("refused")
+            self.assertEqual(answers[0], answers[1], "drift for %r %r %r: launcher %s, here %s" % (repo, allowed, tooling, answers[0], answers[1]))
+
+
+class TestNameCollision(Base):
+    """#640 review M3: one name never means both a local agent and a cloud worker, so send, read and retire cannot reach the wrong one."""
+
+    def test_a_cloud_launch_of_a_name_that_a_local_agent_has_is_refused(self):
+        seen = mock.Mock(session_id="ses_example")
+        with mock.patch.object(sb.Switchboard, "discover", return_value=mock.Mock(agents={"coder7": seen}, problems=[])):
+            code, out, err = self.launch()
+        self.assertEqual(code, 1)
+        self.assertIn("a local fleet agent named coder7 exists", err)
+        self.assertEqual(self.stub_calls(), [])   # nothing was created, nothing minted
+        self.assertFalse((self.state / "cloud" / "coder7.json").exists())
+
+    def test_a_local_launch_of_a_name_that_has_a_cloud_record_is_refused(self):
+        self.assertEqual(self.launch()[0], 0)
+        brief = self.home / "b.txt"
+        brief.write_text("x\n")
+        with mock.patch.object(sb, "build_engine", side_effect=AssertionError("the refusal comes first")):
+            code, out, err = self.main("launch", "coder7", "--agent", "coder", "--dir", str(self.home), "--workspace", "w1", "--brief-file", str(brief))
+        self.assertEqual(code, 1)
+        self.assertIn("a cloud worker named coder7 exists", err)
+
+    def test_the_cloud_record_is_the_only_route_so_the_other_kind_cannot_be_made(self):
+        self.assertEqual(self.launch()[0], 0)
+        self.assertEqual(sb.load_module("cloud_worker").bind(sb.__dict__).route("coder7")["worker"], "coder7")
+        self.assertEqual(self.launch()[0], 1)   # and a second cloud worker of that name is refused too
+
+
+class TestStopAndStatus(Base):
+    """#640 review Lows: a launch's stop carries the run id; status mints no token for a worker that has ended."""
+
+    def test_a_cut_launch_stops_with_the_run_id_of_its_own_create(self):
+        (self.stub_dir / "pf_die").write_text("")
+        self.assertEqual(self.launch()[0], 1)
+        calls = [c for c in self.stub_calls() if c[0] in ("create", "stop")]
+        create, stop = calls[0], calls[-1]
+        self.assertEqual(stop[0], "stop")
+        run_id = create[create.index("--run-id") + 1]
+        self.assertRegex(run_id, r"^[0-9a-f]{32}$")
+        self.assertEqual(stop[stop.index("--run-id") + 1], run_id)
+        audit = [l for l in (self.state / "audit.log").read_text().splitlines() if "cloud.stopped" in l] if (self.state / "audit.log").exists() else []
+        self.assertTrue(all(run_id not in l for l in audit))   # the line names a short id, not the nonce itself
+
+    def test_status_mints_no_token_for_a_worker_past_its_hard_deadline(self):
+        self.assertEqual(self.launch()[0], 0)
+        path = self.state / "cloud" / "coder7.json"
+        record = json.loads(path.read_text())
+        record["hard_deadline"] = "2000-01-01T00:00:00Z"
+        path.write_text(json.dumps(record))
+        os.chmod(str(path), 0o600)
+        mints = lambda: len([c for c in self.jsonl("kubectl.log") if "token" in c["args"] and "create" in c["args"]])
+        before = mints()
+        code, out, err = self.main("status")
+        self.assertIn("past its hard deadline", out + err)
+        self.assertEqual(mints(), before)
 
 
 if __name__ == "__main__":
