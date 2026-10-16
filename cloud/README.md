@@ -10,6 +10,8 @@ This image takes everything it needs from the environment and mounted files at s
 (`cloud/launcher/`) supplies the per-run files; the entrypoint installs them (next section) and the operator driver
 (`cloud/launcher/run_task.py`) runs one task end to end.
 
+Cloud workers serve the organisation's repositories only; no task, test or demo of the tooling that runs the workers runs in a cloud worker.
+
 ## What is in the image
 
 Ubuntu 24.04, Python 3, git, `gh`, Docker Engine with the compose plugin, and `opencode` v2 (pinned,
