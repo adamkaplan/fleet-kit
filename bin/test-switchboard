@@ -49339,6 +49339,186 @@ class TestHeavyWatchdog(unittest.TestCase):
         self.assertLessEqual(logic.out.tell(), BoundedOut.LIMIT)
 
 
+class TestHeavyFifo(unittest.TestCase):
+    """Heavy slots in arrival order and the express slot (ask #620). The order file, the lock files and the process table are real or injected, the clock never
+    moves on its own, the command is a fake, and every list is bounded; no test waits on a real slot."""
+
+    def setUp(self):
+        self.hs = sb.load_heavy_slots()
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.dir), True)
+        self.out, self.takes, self.started, self.clock_calls = BoundedOut(), BoundedList(), BoundedList(), BoundedList()
+        self.now = [1000.0]
+        self.alive = {1001, 1002, 1003, 1004, 1005}
+
+    def seed(self, pids):
+        (self.dir / "heavy-queue.json").write_text(json.dumps({"entries": [{"pid": pid, "start": "t", "name": "w%d" % pid, "short": False} for pid in pids]}))
+
+    def entries(self):
+        return [entry["pid"] for entry in json.loads((self.dir / "heavy-queue.json").read_text())["entries"]]
+
+    def run_as(self, pid, take=None, step=10.0, wait_max=15, short=False, report="100000", on_child=None, environ_extra=None, watchdog=None):
+        """One caller's run(): `pid` is its place in the line, `take(state, slots)` the ordinary slots (default: all busy)."""
+        test = self
+
+        def clock():
+            test.clock_calls.append(1)
+            test.now[0] += step
+            return test.now[0]
+
+        def ordinary(state, slots):
+            test.takes.append(pid)
+            return take(state, slots) if take else (None, None)
+
+        class FakeChild:
+            pid = 4242
+
+            def __init__(child, argv, **kwargs):
+                test.started.append(pid)
+
+            def wait(child):
+                return on_child() if on_child else 0
+        environ = {"PATH": os.environ["PATH"], "FLEET_HEAVY_REPORT_SECONDS": report}
+        environ.update(environ_extra or {})
+        held = [{"slot": i, "name": "who-%s" % c, "pid": 10 + i, "command": "sh", "since": 1} for i, c in enumerate("abc")]
+        with mock.patch.object(self.hs, "_take", ordinary), mock.patch.object(self.hs, "holders", lambda state, slots=3: held), \
+                mock.patch.object(self.hs.subprocess, "Popen", FakeChild):
+            return self.hs.run(["sh", "-c", "true"], str(self.dir), 3, wait_max, "w%d" % pid, environ=environ, out=self.out, clock=clock, sleep=lambda s: None,
+                               short=short, watchdog=watchdog, line={"pid": pid, "alive": lambda p, st: p in self.alive, "start_of": lambda p: "t"})
+
+    def free(self):
+        fd = os.open(os.devnull, os.O_RDWR)
+        return lambda state, slots: (fd, 0)
+
+    def test_s1_slots_go_to_the_callers_in_the_order_they_arrived(self):
+        self.seed([1001, 1002, 1003, 1004])
+        self.assertEqual(self.run_as(1004, self.free()), 75, "D arrived last: it never gets a slot while A B C wait")
+        self.assertEqual(list(self.takes), [], "and it did not even try one")
+        self.assertEqual(self.entries(), [1001, 1002, 1003], "it left the line when it gave up; the others kept their places")
+        order = []
+        for pid in (1001, 1002, 1003):
+            self.assertEqual(self.run_as(pid, self.free()), 0)
+            order.append(self.started[-1])
+        self.assertEqual(order, [1001, 1002, 1003])
+        self.assertEqual(self.entries(), [], "each left the line when it took its slot")
+        self.assertEqual(self.run_as(1004, self.free()), 0)
+
+    def test_s2_a_new_caller_polling_at_the_instant_a_slot_frees_does_not_take_it_from_an_earlier_waiter(self):
+        self.seed([1001])
+        self.assertEqual(self.run_as(1002, self.free(), wait_max=5), 75)
+        self.assertEqual(list(self.started), [])
+        self.assertEqual(self.entries(), [1001], "it also left the line when it gave up")
+        self.assertEqual(self.run_as(1001, self.free()), 0)
+
+    def test_s3_a_waiter_at_the_head_that_died_does_not_block_the_one_behind_it(self):
+        self.seed([1001, 1002])
+        self.alive.discard(1001)
+        self.assertEqual(self.run_as(1002, self.free()), 0)
+        self.assertEqual(list(self.takes), [1002], "it took the slot at its first look, with no wait for the wait limit")
+        self.assertEqual(list(self.started), [1002])
+
+    def test_s4_a_short_command_runs_in_the_express_slot_when_the_ordinary_ones_are_busy_and_a_second_waits_for_it_only(self):
+        second = {}
+
+        def while_first_runs():
+            second["status"] = self.run_as(1002, short=True, wait_max=15)
+            return 0
+        self.assertEqual(self.run_as(1001, short=True, on_child=while_first_runs), 0)
+        self.assertEqual(second["status"], 75, "the express slot was held: the second one waited and gave up")
+        self.assertEqual(list(self.started), [1001])
+
+    def test_s5_a_short_command_past_120_seconds_is_stopped_with_124_and_frees_the_express_slot(self):
+        stopped = threading.Event()
+        signals = BoundedList()
+
+        def record(target, number):
+            signals.append((target, number))
+            stopped.set()
+        rows = [(4242, 1, os.getpgrp(), 10, "c")]
+        dog = {"read_table": lambda: [] if stopped.is_set() else rows, "pause": lambda seconds: stopped.wait(0.001), "killpg": record, "kill": record, "every": 0.001,
+               "grace": 0.001, "sweep_pause": lambda s: None, "me": (9001, 9002, 9003), "lsof": lambda path: set()}
+        code = self.run_as(1001, short=True, step=60.0, on_child=lambda: (stopped.wait(30), -9)[1], watchdog=dog)
+        self.assertEqual(code, 124)
+        self.assertIn("time ceiling of 120 s", self.out.getvalue())
+        fd = self.hs._take_express(str(self.dir))
+        self.assertIsNotNone(fd, "the express slot is free again")
+        os.close(fd)
+
+    def test_s6_the_waiting_line_says_the_place_in_the_order_and_names_the_holders(self):
+        self.seed([1001, 1002, 1003])
+        self.assertEqual(self.run_as(1003, report="5"), 75)
+        text = self.out.getvalue()
+        self.assertEqual(text.count("place 3 in line (2 ahead)"), 1, text)
+        for name in ("who-a", "who-b", "who-c"):
+            self.assertIn(name, text)
+
+    def test_s7_a_corrupt_order_file_and_one_that_cannot_be_used_fall_back_to_the_present_behaviour_and_say_so_once(self):
+        for label in ("corrupt", "unusable"):
+            with self.subTest(label):
+                self.out = BoundedOut()
+                self.takes, self.started = BoundedList(), BoundedList()
+                for name in ("heavy-queue.json", "heavy-queue.lock"):
+                    target = self.dir / name
+                    if target.is_dir():
+                        shutil.rmtree(str(target))
+                    elif target.exists():
+                        target.unlink()
+                if label == "corrupt":
+                    (self.dir / "heavy-queue.json").write_text("{not json")
+                else:
+                    (self.dir / "heavy-queue.lock").mkdir()
+                attempts = BoundedList()
+
+                def take(state, slots):
+                    attempts.append(1)
+                    return self.free()(state, slots) if len(attempts) >= 2 else (None, None)
+                self.assertEqual(self.run_as(1002, take), 0)
+                self.assertEqual(self.out.getvalue().count("no waiting order"), 1, self.out.getvalue())
+                self.assertEqual(len(attempts), 2)
+
+    def test_s8_the_defaults_and_the_exit_status_of_giving_up_are_as_before(self):
+        self.assertEqual((self.hs.DEFAULT_SLOTS, self.hs.DEFAULT_WAIT_MAX, self.hs.EXIT_TEMPFAIL), (3, 1800, 75))
+        self.assertEqual(self.hs.settings(None), 3)
+        self.assertEqual(self.run_as(1001, wait_max=15), 75, "nobody waiting, no slot: gives up as before")
+        self.assertIs(inspect.signature(self.hs.run).parameters["short"].default, False)
+
+    def test_s10_entries_of_processes_that_are_gone_are_dropped_and_the_live_one_keeps_its_place(self):
+        self.seed([1001, 1002, 1003])
+        self.alive -= {1001, 1003}
+        line = self.hs.Line(str(self.dir), "w", pid=1002, alive=lambda p, st: p in self.alive, start_of=lambda p: "t")
+        self.assertEqual(line.place(), 1)
+        self.assertEqual(self.entries(), [1002])
+
+    def test_s11_the_express_slot_has_its_own_lock_file_and_the_ordinary_ones_are_untouched(self):
+        seen = {}
+
+        def while_running():
+            def locked(path):
+                fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return False
+                except OSError:
+                    return True
+                finally:
+                    os.close(fd)
+            seen["express"] = locked(str(self.dir / "heavy-slot-express.lock"))
+            seen["ordinary"] = [locked(str(self.dir / ("heavy-slot-%d.lock" % i))) for i in range(3)]
+            return 0
+        self.assertEqual(self.run_as(1001, short=True, on_child=while_running), 0)
+        self.assertEqual(seen, {"express": True, "ordinary": [False, False, False]})
+
+    def test_a_dead_waiters_pid_reused_by_another_process_is_not_that_waiter(self):
+        self.seed([1001])
+        entry = json.loads((self.dir / "heavy-queue.json").read_text())
+        entry["entries"][0]["start"] = "Mon Jan  1 00:00:00 2024"
+        (self.dir / "heavy-queue.json").write_text(json.dumps(entry))
+        starts = {1001: "Tue Jan  2 00:00:00 2024"}
+        self.assertFalse(self.hs._alive(os.getpid(), "not this process's start time") and False)
+        line = self.hs.Line(str(self.dir), "w", pid=1002, alive=lambda p, st: starts.get(p, "x") == st, start_of=lambda p: "t")
+        self.assertEqual(line.place(), 1, "the entry's start time no longer matches the process that has the pid")
+
+
 class TestHeavySlots(Base):
     """`fleet-switchboard heavy` (ask #34): a flock slot semaphore in the state directory; the COMMAND holds the lock; the queue, the kill, the exit status, taskpolicy
     or nice, the holder list, the wait limit and the no-shell guarantee are each run for real with small commands."""

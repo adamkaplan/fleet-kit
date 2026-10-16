@@ -49,6 +49,12 @@ SWEEP_ROUNDS = 5        # forced-stop rounds that look again for what is left
 SWEEP_SECONDS = 0.3     # between them
 EXIT_TIME = 124
 EXIT_MEMORY = 137
+EXPRESS = "express"                    # the name of the one extra slot a declared-short command may use
+EXPRESS_SECONDS = 120                   # the wrapper's own time ceiling on a command in it
+QUEUE_FILE = "heavy-queue.json"          # the arrival order of the waiters
+QUEUE_LOCK = "heavy-queue.lock"
+QUEUE_MAX = 1000                        # entries read; more reads as a corrupt file
+QUEUE_BYTES = 262144
 FORWARDED = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
 
@@ -92,7 +98,7 @@ def holder_name(environ):
 
 
 def slot_path(state_dir, index):
-    return os.path.join(str(state_dir), "heavy-slot-%d.lock" % index)
+    return os.path.join(str(state_dir), "heavy-slot-%s.lock" % index)   # index: 0, 1, ... or "express"
 
 
 def _open(state_dir, index):
@@ -131,6 +137,152 @@ def holders(state_dir, slots=DEFAULT_SLOTS):
         finally:
             os.close(fd)
     return found
+
+
+def _process_start(pid):
+    """The start time of `pid` as text ("" when it cannot be read): with the pid it names one process, so a reused pid is never taken for the waiter that died."""
+    try:
+        done = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
+    except (subprocess.SubprocessError, OSError):
+        return ""
+    return " ".join(done.stdout.split()) if done.returncode == 0 else ""
+
+
+def _alive(pid, start):
+    """Is the process (pid, start time) still there? A pid that exists with another start time is another process."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        pass   # exists, not ours to signal
+    return not start or _process_start(pid) in ("", start)
+
+
+class QueueUnusable(Exception):
+    """The order file cannot be read, written or locked: the caller falls back to taking whatever slot is free."""
+
+
+class Line:
+    """The arrival order of the callers waiting for a slot, kept in `heavy-queue.json` in the state directory (written atomically, read and changed under a lock).
+    An entry is {"pid", "start", "name", "short"}, in arrival order; an entry whose process is gone is dropped at the next look, so a dead waiter never blocks the
+    ones behind it. The waiter at the head of the line is the only one that tries an ordinary slot: a slot that frees goes to the one that has waited longest."""
+
+    def __init__(self, state_dir, name, short=False, pid=None, alive=_alive, start_of=_process_start, lock_tries=50, lock_pause=0.02):
+        self.dir, self.name, self.short = str(state_dir), name, bool(short)
+        if not os.path.isdir(self.dir):
+            raise OSError(errno.ENOENT, "no state directory")   # the caller takes whatever slot is free, as before
+        self.pid = os.getpid() if pid is None else pid
+        self.start = start_of(self.pid)
+        self.alive, self.lock_tries, self.lock_pause = alive, lock_tries, lock_pause
+        self.path, self.lock_path = os.path.join(self.dir, QUEUE_FILE), os.path.join(self.dir, QUEUE_LOCK)
+        self.joined = False
+
+    def _locked(self):
+        fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        for _ in range(self.lock_tries):
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except OSError as err:
+                if err.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                    os.close(fd)
+                    raise
+                time.sleep(self.lock_pause)
+        os.close(fd)
+        raise OSError(errno.EAGAIN, "the order file stays locked")
+
+    def _read(self):
+        try:
+            fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except FileNotFoundError:
+            return []
+        try:
+            raw = os.read(fd, QUEUE_BYTES + 1)
+        finally:
+            os.close(fd)
+        if len(raw) > QUEUE_BYTES:
+            raise QueueUnusable("the order file is too large")
+        try:
+            data = json.loads(raw.decode("utf-8")) if raw.strip() else {"entries": []}
+            entries = data["entries"]
+            if not isinstance(entries, list) or len(entries) > QUEUE_MAX:
+                raise ValueError("entries")
+            for entry in entries:
+                if not (isinstance(entry, dict) and isinstance(entry.get("pid"), int) and not isinstance(entry.get("pid"), bool) and isinstance(entry.get("start"), str)):
+                    raise ValueError("entry")
+        except (ValueError, KeyError, TypeError, UnicodeDecodeError):
+            raise QueueUnusable("the order file is corrupt")
+        return entries
+
+    def _write(self, entries):
+        temporary = "%s.%d.tmp" % (self.path, os.getpid())
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            os.write(fd, json.dumps({"entries": entries}).encode("utf-8"))
+        finally:
+            os.close(fd)
+        os.replace(temporary, self.path)
+
+    def _mine(self, entry):
+        return entry["pid"] == self.pid and entry["start"] == self.start
+
+    def _update(self, join):
+        """Under the lock: drop the entries of processes that are gone, add this caller at the end when `join` and not there yet, write back if changed; the entries."""
+        try:
+            lock = self._locked()
+        except OSError as err:
+            raise QueueUnusable(err.strerror or str(err))
+        try:
+            entries = self._read()
+            kept = [entry for entry in entries if self._mine(entry) or self.alive(entry["pid"], entry["start"])]
+            if join and not any(self._mine(entry) for entry in kept):
+                kept.append({"pid": self.pid, "start": self.start, "name": _plain(self.name, 40), "short": self.short})
+            if kept != entries:
+                self._write(kept)
+            return kept
+        except OSError as err:
+            raise QueueUnusable(err.strerror or str(err))
+        finally:
+            os.close(lock)
+
+    def place(self):
+        """This caller's place in the line (1 is the head), joining at the end the first time. Raises QueueUnusable."""
+        entries = self._update(True)
+        self.joined = True
+        return next(index for index, entry in enumerate(entries, 1) if self._mine(entry))
+
+    def leave(self):
+        """Take this caller out of the line (it got a slot, gave up or was stopped). Never raises."""
+        if not self.joined:
+            return
+        self.joined = False
+        try:
+            lock = self._locked()
+        except OSError:
+            return
+        try:
+            entries = self._read()
+            kept = [entry for entry in entries if not self._mine(entry)]
+            if kept != entries:
+                self._write(kept)
+        except (OSError, QueueUnusable):
+            pass
+        finally:
+            os.close(lock)
+
+
+def _take_express(state_dir):
+    """The fd of the express slot just locked, or None when it is busy."""
+    fd = os.open(slot_path(state_dir, EXPRESS), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as err:
+        os.close(fd)
+        if err.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+            return None
+        raise
+    return fd
 
 
 def _describe(held):
@@ -385,9 +537,11 @@ class Watchdog:
 
 
 def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name=None, environ=None, out=None, clock=time.time, sleep=time.sleep,
-        which=shutil.which, watchdog=None):
+        which=shutil.which, watchdog=None, short=False, line=None):
     """Wait for a slot, run `command` in it, return its exit status. 75 when no slot came within `wait_max` seconds, 127 when the command does not exist.
-    A watchdog stops a runaway: 137 past the memory ceiling, 124 past the time ceiling (see `ceilings`); `watchdog` is a dict of Watchdog keyword arguments (tests)."""
+    A watchdog stops a runaway: 137 past the memory ceiling, 124 past the time ceiling (see `ceilings`); `watchdog` is a dict of Watchdog keyword arguments and `line` one of Line's (tests).
+    Callers wait in arrival order (`Line`); `short` declares the command short: it may use the express slot when the ordinary ones are busy and is stopped after
+    EXPRESS_SECONDS by the watchdog."""
     environ = os.environ if environ is None else environ
     out = sys.stderr if out is None else out
     if _resolve(command, environ) is None:
@@ -417,10 +571,31 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
 
     old = {number: signal.signal(number, on_signal) for number in FORWARDED}
     fd = None
+    queue = None
+    queue_noted = False
     try:
-        while unslotted is None:
+        if unslotted is None:
             try:
-                fd, index = _take(state_dir, slots)
+                queue = Line(state_dir, name, short, **(line or {}))
+            except OSError:
+                queue = None
+        while unslotted is None:
+            place = None
+            if queue is not None:
+                try:
+                    place = queue.place()
+                except QueueUnusable as err:   # the order cannot be kept: the present behaviour (whoever polls first), said once
+                    if not queue_noted:
+                        queue_noted = True
+                        out.write("heavy: no waiting order (%s): taking whichever slot is free\n" % err)
+                    queue = None
+            try:
+                fd = None
+                if place is None or place == 1:   # only the head of the line tries an ordinary slot
+                    fd, index = _take(state_dir, slots)
+                if fd is None and short:
+                    fd = _take_express(state_dir)
+                    index = EXPRESS
             except OSError as err:   # a missing, unwritable or locked-out directory never stops the command: one line, and it runs without a slot
                 out.write("heavy: no slot (%s): running without one\n" % (err.strerror or err))
                 unslotted = "unusable"
@@ -436,10 +611,13 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
                 return EXIT_TEMPFAIL
             if now >= next_report:
                 held = holders(state_dir, slots)
-                out.write("heavy: waiting for a slot (%d of %d busy: %s)\n" % (len(held), slots, _describe(held)))
+                where = ", place %d in line (%d ahead)" % (place, place - 1) if place is not None else ""
+                out.write("heavy: waiting for a slot (%d of %d busy: %s)%s\n" % (len(held), slots, _describe(held), where))
                 out.flush()
                 next_report = now + every
             sleep(POLL_SECONDS)
+        if queue is not None:
+            queue.leave()   # it has its slot (or none will come): out of the line at once
         env = dict(environ)
         if fd is not None:
             _record(fd, name, os.getpid(), command[0], clock())   # at once, so a killed holder's old record is never shown for this one
@@ -459,6 +637,8 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
             except OSError:
                 pass
         mem_mb, max_seconds = ceilings(environ)
+        if fd is not None and short and index == EXPRESS:   # the express slot's own time ceiling (an environment value may only make it shorter)
+            max_seconds = EXPRESS_SECONDS if not max_seconds else min(max_seconds, EXPRESS_SECONDS)
         lock = slot_path(state_dir, index) if fd is not None else None
         dog = Watchdog(child["p"].pid, command, mem_mb, max_seconds, out, clock(), clock=clock, **dict({"lock_path": lock}, **(watchdog or {})))
         dog.start()
@@ -475,6 +655,8 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
             return dog.exit_status()
         return 128 - status if status < 0 else status   # a signal: 128 + n, as a shell reports it
     finally:
+        if queue is not None:
+            queue.leave()
         for number, handler in old.items():
             signal.signal(number, handler)
         if fd is not None:

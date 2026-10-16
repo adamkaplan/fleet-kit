@@ -22173,7 +22173,8 @@ def cmd_heavy(args):
     except Exception as err:   # a state directory that cannot be made or is refused: the command still runs, without a slot (heavy never fails someone else's command)
         sys.stderr.write("heavy: no slot (%s): running without one\n" % _one_line(str(err), 160))
         state = None
-    return module.run(command, state, args.slots or configured, module.DEFAULT_WAIT_MAX if args.wait_max is None else args.wait_max, args.name)
+    return module.run(command, state, args.slots or configured, module.DEFAULT_WAIT_MAX if args.wait_max is None else args.wait_max, args.name,
+                      short=bool(getattr(args, "short", False)))
 
 
 cmd_heavy.direct = True   # the wrapper of someone else's command: no daemon start, no error mapping
@@ -22181,11 +22182,12 @@ cmd_heavy.direct = True   # the wrapper of someone else's command: no daemon sta
 
 def add_heavy_parsers(sub):
     heavy = sub.add_parser("heavy", help="Run a heavy command (a full test suite, a browser or e2e run) in one of a few CPU slots, at background priority",
-                           description="`heavy [--slots N] [--wait-max SECONDS] [--name WHO] -- <command...>`: waits for a free slot (default 3, config `heavy.slots`; one line "
-                                       "every 30 s says who holds them), then runs the command as `taskpolicy -b <command>` (else `nice -n 10`) with its stdin, stdout, "
+                           description="`heavy [--slots N] [--wait-max SECONDS] [--short] [--name WHO] -- <command...>`: waits for a free slot in arrival order (default 3, config `heavy.slots`; one line "
+                                       "every 30 s says your place and who holds them), then runs the command as `taskpolicy -b <command>` (else `nice -n 10`) with its stdin, stdout, "
                                        "exit status and signals passed through. After --wait-max seconds (default 1800) it exits 75 and does not run the command.")
     heavy.add_argument("--slots", type=int, help="How many commands may run at once (default: config heavy.slots, else 3)")
     heavy.add_argument("--wait-max", type=int, dest="wait_max", help="Give up after this many seconds without a slot: exit 75 (default 1800)")
+    heavy.add_argument("--short", action="store_true", help="The command is short: when the ordinary slots are busy it may use the one express slot, and the wrapper stops it after 120 seconds (exit 124)")
     heavy.add_argument("--name", help="Who the slot is held for (default: FLEET_HEAVY_NAME, the OpenCode session id, the user)")
     heavy.add_argument("command", nargs=argparse.REMAINDER, help="-- <command...>")
 
