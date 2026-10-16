@@ -776,7 +776,8 @@ def labels_entry(repo, number, tag, record, escalated, default_repo=None):
     sha, created time, labels already reduced to `holds`). It has no sender and no lane, and says so: `no notice recorded`."""
     head = record.get("head")
     lead = "%s#%d" % (tag, number) if not default_repo else ("#%d" % number if repo == default_repo else "%s#%d" % (repo.split("/")[-1], number))
-    headline = fit_lines(" ".join((lead, record.get("title") or "")).strip())
+    title = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", record.get("title") or "")   # the title is the author's text: no control character reaches the list
+    headline = fit_lines(" ".join((lead, title)).strip())
     entry = {"id": "pr:%s#%d" % (tag, number), "title": line_of(headline, DECISION_TITLE_MAX), "headline": headline, "ask": None, "repo": repo, "agent": None,
              "kind": "captain", "tier": "human" if escalated else "cos", "since": record.get("since"), "number": number,
              "url": "https://github.com/%s/pull/%d" % (repo, number), "state": "open", "additions": None, "deletions": None, "files": None, "ci": None,

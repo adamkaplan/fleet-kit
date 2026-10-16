@@ -9805,6 +9805,8 @@ def label_hold_entries(engine, now, noticed, escalated, in_play):
                     if key[0] == repo_key and key[1] not in seen:
                         shown.setdefault(key, row)
         for key in [k for k in previous if k[0] not in set(state.lists)]:
+            if key[0] not in watched or load_module("repo_exclusion").is_excluded(engine.config, key[0]):
+                continue   # a repository that is no longer watched, or is excluded now, keeps nothing
             shown.setdefault(key, previous[key])   # a repository whose list is gone for now keeps its rows
         engine.hold_rows = shown
         out = []

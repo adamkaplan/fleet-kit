@@ -40323,12 +40323,14 @@ class TestHeldRowsFromLabels(DecisionsBase):
         self.assertEqual(again["id"], "pr:api#30", "the same id with a notice: one row, not two")
 
     def test_s6_an_excluded_and_an_unwatched_repository_add_no_row_and_no_read_is_made(self):
+        self.engine.config["plan_gates"]["repos"]["acme/secret"] = {"mode": "shadow"}   # WATCHED: only the exclusion can drop it
         self.engine.config["excluded_repos"] = ["acme/secret"]
         self.lists(self.pr(40, "merge-captain"), repo="acme/secret")
         self.lists(self.pr(41, "merge-captain"), repo="elsewhere/unwatched")
+        self.lists(self.pr(42, "merge-captain"), repo="acme/api")
         before = len(self.reads)
-        self.assertEqual([d for d in self.rows() if d["number"] in (40, 41)], [])
-        self.assertEqual(len(self.reads), before, "no gh read is made for them")
+        self.assertEqual(sorted(d["number"] for d in self.rows() if d["number"] in (40, 41, 42)), [42], "only the watched, not excluded repository lists a row")
+        self.assertEqual(len(self.reads), before, "no gh read is made for any of them")
 
     def test_u2_the_rows_cost_no_read_of_their_own(self):
         self.lists(*[self.pr(200 + n, "merge-captain") for n in range(20)])
@@ -40336,6 +40338,36 @@ class TestHeldRowsFromLabels(DecisionsBase):
         rows = [d for d in self.rows() if 200 <= d["number"] < 220]
         self.assertEqual(len(rows), 20)
         self.assertEqual(len(self.reads), before, "20 held pull requests, 0 reads of their own")
+
+    def test_an_escalated_labels_only_row_is_the_persons_for_that_head_and_a_new_head_is_not(self):
+        self.lists(self.pr(60, "merge-captain", head=HEAD_A))
+        (row,) = [d for d in self.rows() if d["number"] == 60]
+        self.assertEqual(row["tier"], "cos")
+        sb.escalate_decision(self.engine, None, row, "needs you", "cos")
+        (row,) = [d for d in self.rows() if d["number"] == 60]
+        self.assertEqual(row["tier"], "human")
+        self.lists(self.pr(60, "merge-captain", head=HEAD_B))
+        (row,) = [d for d in self.rows() if d["number"] == 60]
+        self.assertEqual((row["tier"], row["head"]), ("cos", HEAD_B), "an escalation of an older head does not make a new head the person's")
+
+    def test_a_repository_whose_list_is_gone_keeps_its_rows_and_a_failure_in_the_build_is_audited_and_lists_nothing(self):
+        self.lists(self.pr(70, "hold-security"))
+        self.assertEqual([d["number"] for d in self.rows() if d["number"] == 70], [70])
+        self.engine.ci_record_state.lists.clear()
+        self.engine.ci_record_state.lists["acme/other"] = (self.world.clock.now(), [])
+        self.assertEqual([d["number"] for d in self.rows() if d["number"] == 70], [70], "its list is gone for now: the row stays")
+        self.engine.config["excluded_repos"] = ["acme/api"]
+        self.assertEqual([d for d in self.rows() if d["number"] == 70], [], "excluded now: nothing is kept")
+        self.engine.config["excluded_repos"] = []
+        self.engine.ci_record_state.lists["acme/api"] = (self.world.clock.now(), [self.pr(71, "merge-captain")])
+        with mock.patch.object(sb, "plan_ledger", types.SimpleNamespace(normal_repo=lambda r: (_ for _ in ()).throw(RuntimeError("broken")))):
+            self.assertEqual(sb.label_hold_entries(self.engine, self.world.clock.now(), set(), {}, set()), [])
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "decisions.hold_rows_error"])
+
+    def test_a_title_with_an_escape_sequence_reaches_the_list_without_it(self):
+        self.lists(self.pr(80, "merge-captain", title="Add it \x1b]0;evil\x07 now"))
+        (row,) = [d for d in self.rows() if d["number"] == 80]
+        self.assertNotRegex(row["title"] + row["headline"], r"[\x00-\x08\x0b-\x1f\x7f]")
 
     def test_a_pr_with_only_a_merge_automatic_label_is_not_held(self):
         self.lists(self.pr(50, "merge-automatic"))
