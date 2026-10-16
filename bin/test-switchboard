@@ -49629,6 +49629,40 @@ class TestHeavyFifo(unittest.TestCase):
         self.assertFalse(mine.exists(), "and its own was renamed into place")
 
 
+    def test_odd_file_names_in_the_state_directory_are_left_alone_and_never_stop_the_wrapper(self):
+        gone = subprocess.Popen(["true"])
+        gone.wait()
+        live = os.getppid()
+        stray = ["heavy-queue.json.%s.tmp" % ("9" * 23), "heavy-queue.json.\u00b23.tmp", "heavy-queue.json.0.tmp", "heavy-queue.json.1.tmp", "heavy-queue.json.-1.tmp",
+                 "heavy-queue.json..tmp", "heavy-queue.json.%d.tmp.bak" % gone.pid, "heavy-queue.json.\u0663.tmp", "heavy-queue.json.%d.tmp" % (2 ** 22 + 1)]
+        for name in stray:
+            (self.dir / name).write_text("x")
+        (self.dir / ("heavy-queue.json.%d.tmp" % live)).write_text("x")           # a live process's: not deleted
+        (self.dir / ("heavy-queue.json.%d.tmp" % gone.pid)).write_text("x")       # a dead process's: deleted
+        folder = self.dir / ("heavy-queue.json.%d.tmp" % (gone.pid + 1 if gone.pid < 2 ** 22 - 2 else 2))
+        folder.mkdir()                                                            # a directory with such a name: left alone
+        target = self.dir / "target.txt"
+        target.write_text("keep")
+        link = self.dir / ("heavy-queue.json.%d.tmp" % (gone.pid + 2 if gone.pid < 2 ** 22 - 3 else 3))
+        os.symlink(str(target), str(link))                                        # a symlink: never followed, left alone
+        notes = BoundedList()
+        self.hs.Line(str(self.dir), "w", pid=1001, alive=lambda p, st: True, start_of=lambda p: "t", held=lambda: set(), note=notes.append).place()
+        for name in stray:
+            self.assertTrue((self.dir / name).exists(), "left alone: %r" % name)
+        self.assertTrue((self.dir / ("heavy-queue.json.%d.tmp" % live)).exists())
+        self.assertFalse((self.dir / ("heavy-queue.json.%d.tmp" % gone.pid)).exists())
+        self.assertTrue(folder.is_dir() and link.is_symlink() and target.read_text() == "keep")
+        self.assertEqual(list(notes), [], "none of it was an error")
+
+    def test_a_sweep_that_raises_never_stops_the_command_and_says_so_once(self):
+        with mock.patch.object(self.hs.os, "listdir", side_effect=RuntimeError("boom")):
+            self.assertEqual(self.run_as(1001, self.free()), 0)
+        self.assertEqual(list(self.started), [1001], "the command still ran")
+        self.assertEqual(self.out.getvalue().count("queue sweep failed: RuntimeError"), 1, self.out.getvalue())
+
+    def test_the_numbers_read_from_files_and_ps_are_ascii_digits_only(self):
+        self.assertNotIn("isdigit", inspect.getsource(self.hs), "str.isdigit() accepts a superscript: int() then raises")
+
 class TestHeavySlots(Base):
     """`fleet-switchboard heavy` (ask #34): a flock slot semaphore in the state directory; the COMMAND holds the lock; the queue, the kill, the exit status, taskpolicy
     or nice, the holder list, the wait limit and the no-shell guarantee are each run for real with small commands."""

@@ -23,6 +23,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -55,6 +56,8 @@ QUEUE_FILE = "heavy-queue.json"          # the arrival order of the waiters
 QUEUE_LOCK = "heavy-queue.lock"
 QUEUE_MAX = 1000                        # entries read; more reads as a corrupt file
 QUEUE_BYTES = 262144
+TEMPORARY_NAME = re.compile(r"heavy-queue\.json\.([0-9]{1,9})\.tmp", re.ASCII)   # a temporary file of the order, with the pid of the process that wrote it
+PID_MAX = 2 ** 22                       # no pid is larger (Linux pid_max at most 4194304)
 FORWARDED = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
 
@@ -179,7 +182,7 @@ class Line:
     An entry is {"pid", "start", "name", "short"}, in arrival order; an entry whose process is gone is dropped at the next look, so a dead waiter never blocks the
     ones behind it. The waiter at the head of the line is the only one that tries an ordinary slot: a slot that frees goes to the one that has waited longest."""
 
-    def __init__(self, state_dir, name, short=False, pid=None, alive=_alive, start_of=_process_start, lock_tries=50, lock_pause=0.02, slots=DEFAULT_SLOTS, held=None):
+    def __init__(self, state_dir, name, short=False, pid=None, alive=_alive, start_of=_process_start, lock_tries=50, lock_pause=0.02, slots=DEFAULT_SLOTS, held=None, note=None):
         self.dir, self.name, self.short = str(state_dir), name, bool(short)
         if not os.path.isdir(self.dir):
             raise OSError(errno.ENOENT, "no state directory")   # the caller takes whatever slot is free, as before
@@ -189,6 +192,7 @@ class Line:
         self.path, self.lock_path = os.path.join(self.dir, QUEUE_FILE), os.path.join(self.dir, QUEUE_LOCK)
         self.joined = False
         self.held = held if held is not None else (lambda: held_by(self.dir, slots))   # pids that hold a slot now: a ticket never outlives the slot its owner took
+        self.note, self.sweep_noted = note or (lambda text: None), False
         self.verified = {}   # (pid, start) -> monotonic time its liveness was last checked with `ps`
 
     def _locked(self):
@@ -250,24 +254,31 @@ class Line:
             raise
 
     def _sweep_temporaries(self):
-        """Remove the `heavy-queue.json.<pid>.tmp` files of processes that are gone (a kill between the write and the rename leaves one)."""
-        prefix = QUEUE_FILE + "."
+        """Remove the `heavy-queue.json.<pid>.tmp` files of processes that are gone (a kill between the write and the rename leaves one). It can never raise into the
+        wrapper: a name that is not exactly that shape (ASCII digits, a possible pid) is left alone, only a regular file is removed (a directory or a symlink never),
+        and any failure is one note and the command carries on."""
         try:
-            names = os.listdir(self.dir)
-        except OSError:
-            return
-        for name in names:
-            middle = name[len(prefix):-4] if name.startswith(prefix) and name.endswith(".tmp") else ""
-            if middle.isdigit() and int(middle) != os.getpid():
+            for name in os.listdir(self.dir):
+                found = TEMPORARY_NAME.fullmatch(name)
+                if found is None:
+                    continue
+                pid = int(found.group(1))
+                if not 2 <= pid <= PID_MAX or pid == os.getpid():
+                    continue
+                path = os.path.join(self.dir, name)
                 try:
-                    os.kill(int(middle), 0)
+                    os.kill(pid, 0)
+                    continue   # the process is there
                 except ProcessLookupError:
-                    try:
-                        os.unlink(os.path.join(self.dir, name))
-                    except OSError:
-                        pass
-                except OSError:
                     pass
+                except OSError:
+                    continue
+                if stat.S_ISREG(os.lstat(path).st_mode):
+                    os.unlink(path)
+        except Exception as err:   # the guard fails open for the command
+            if not self.sweep_noted:
+                self.sweep_noted = True
+                self.note("heavy: queue sweep failed: %s\n" % type(err).__name__)
 
     def _mine(self, entry):
         return entry["pid"] == self.pid and entry["start"] == self.start
@@ -438,7 +449,7 @@ def read_process_table():
     rows = []
     for line in done.stdout.splitlines():
         parts = line.split()
-        if len(parts) >= 5 and all(part.isdigit() for part in parts[:4]):
+        if len(parts) >= 5 and all(re.fullmatch(r"[0-9]{1,12}", part) for part in parts[:4]):
             rows.append(tuple(int(part) for part in parts[:4]) + (" ".join(parts[4:]),))
     if done.returncode != 0 or not rows:
         raise OSError("ps gave no process table")
@@ -453,7 +464,7 @@ def read_lock_holders(path):
         raise OSError("lsof failed: %s" % err)
     if done.returncode not in (0, 1):   # 1: nothing has it open
         raise OSError("lsof exited %d" % done.returncode)
-    return {int(word) for word in done.stdout.split() if word.isdigit()}
+    return {int(word) for word in done.stdout.split() if re.fullmatch(r"[0-9]{1,12}", word)}
 
 
 def _start(row):
@@ -665,7 +676,7 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
     try:
         if unslotted is None:
             try:
-                queue = Line(state_dir, name, short, **dict({"slots": slots}, **(line or {})))
+                queue = Line(state_dir, name, short, **dict({"slots": slots, "note": out.write}, **(line or {})))
             except OSError:
                 queue = None
         while unslotted is None:
