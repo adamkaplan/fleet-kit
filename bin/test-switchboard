@@ -13905,6 +13905,17 @@ class TestHeadlessPresence(Base):
         self.assertEqual((rows["hw"]["observation"]["session"], rows["hw"]["observation"]["status"]), (sid, "idle"))
         self.assertTrue(rows["hw"]["observation"]["headless"])
 
+    def test_a_discovery_that_did_not_scan_the_records_judges_nothing_lost(self):
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        sid = self.headless()
+        engine = self.world.new_engine("cli")
+        engine.discover(self.world.clock.now())
+        del self.world.v2.sessions[sid]
+        engine.discovery.headless_records = None                          # this look did not scan (or the scan failed)
+        self.assertEqual([f for f in engine.collect_facts()[0] if f.kind in ("headless.lost", "headless.restarted")], [])
+        engine.discover(self.world.clock.now())                           # the next look scans, sees the record, finds the session gone
+        self.assertEqual(len([f for f in engine.collect_facts()[0] if f.kind == "headless.lost"]), 1)
+
     def test_the_status_command_writes_nothing_in_the_state_directory(self):
         self.headless()
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})

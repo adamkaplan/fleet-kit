@@ -6655,7 +6655,7 @@ class HeadlessRestartFacts:
             return []
         state = engine.state_dir
         records = discovery.headless_records   # the records this pass's discovery scanned, never a second scan: a launch that landed after discovery is not "lost"
-        unread = discovery.problems
+        unread = discovery.problems   # every problem of the look (records, the service, herdr), not only unreadable records: on any of them a remembered boss is kept, never pruned
         if records is None:
             return []
         remembered = _read_small(state, HEADLESS_SERVICE_FILE)
