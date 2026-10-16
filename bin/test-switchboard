@@ -37362,7 +37362,7 @@ class TestHubTiers(Base):
     def test_your_label_is_human_the_chief_of_staffs_is_cos_and_both_is_human(self):
         self.gh.issue(5, labels=["me:awaiting-user"])
         self.gh.issue(6, labels=["me:awaiting-cos"])
-        self.gh.issue(7, labels=["me:awaiting-cos"])
+        self.gh.issue(7, labels=["me:awaiting-cos", "me:awaiting-user"])
         self.gh.issue(8, labels=["bug"])
         self.rig.pump(15)
         self.assertEqual(self.tiers(), {5: "human", 6: "cos", 7: "human"})
@@ -37376,7 +37376,7 @@ class TestHubTiers(Base):
         reads = [c for c in self.gh.api_calls if "labels=" in c][before:]
         self.assertEqual(len(reads), 2, reads)
         self.assertEqual(sorted(urllib.parse.unquote(re.search(r"labels=([^&]+)", c).group(1)) for c in reads),
-                         ["me:awaiting-cos"])
+                         ["me:awaiting-cos", "me:awaiting-user"])
         self.assertTrue(all("page=1" in c and "--paginate" not in c for c in reads))
         self.assertEqual(len(self.tiers()), 20)
 
@@ -41136,7 +41136,7 @@ class BaselineWorld(WriteWorld):
         """One decision of every source kind, in every tier, and a notice."""
         self.gh.issue(API, 2, "Which database?", labels=["me:awaiting-cos"])
         self.gh.issue(WEB, 4, "Pick the cache layer", labels=["me:awaiting-user"])
-        self.gh.issue(API, 9, "Both labels on one issue", labels=["me:awaiting-cos"])
+        self.gh.issue(API, 9, "Both labels on one issue", labels=["me:awaiting-cos", "me:awaiting-user"])
         self.world.tick(5)
         code = self.raise_batch()["code"]
         self.assertEqual(code, 0)
@@ -41212,7 +41212,7 @@ class TestDecisionBaselineSources(BaselineWorld):
         tiers = lambda found: sorted((d["id"], d["kind"], d["tier"]) for d in found["decisions"])
         self.gh.issue(API, 2, "your label", labels=["me:awaiting-user"])
         self.gh.issue(API, 3, "the cos label", labels=["me:awaiting-cos"])
-        self.gh.issue(API, 4, "both labels", labels=["me:awaiting-cos"])
+        self.gh.issue(API, 4, "both labels", labels=["me:awaiting-cos", "me:awaiting-user"])
         self.gh.issue(API, 5, "another label", labels=["bug"])
         steps["1 issue labels"] = tiers(self.fresh())
         self.say("api-orch", "question", "a report to a boss that has no boss")
@@ -42074,7 +42074,7 @@ class TestDecisionBaselineSeams(BaselineWorld):
     def test_a_report_about_an_escalated_issue_is_not_a_second_decision(self):
         self.gh.issue(API, 2, "Escalated to you", labels=["me:awaiting-user"])
         self.gh.issue(API, 3, "Still with the cos", labels=["me:awaiting-cos"])
-        self.gh.issue(API, 4, "Both labels", labels=["me:awaiting-cos"])
+        self.gh.issue(API, 4, "Both labels", labels=["me:awaiting-cos", "me:awaiting-user"])
         self.say("api-orch", "question", "which engine, on the escalated issue?", 2)
         self.say("api-coder", "blocked", "waiting on the cos issue", 3)
         self.say("api-orch", "question", "and on the issue with both labels?", 4)
@@ -42162,7 +42162,7 @@ class TestDecisionBaselineSeams(BaselineWorld):
         hands it one label at a time): both labels is yours, the cos label alone is the cos's, neither is no decision."""
         baseline_attach_hub(self.world.engine, self.route, self.world.clock.now)
         hub = self.world.engine.hub
-        cases = {10: ["me:awaiting-cos"], 11: ["me:awaiting-user"], 12: ["me:awaiting-cos"],
+        cases = {10: ["me:awaiting-cos", "me:awaiting-user"], 11: ["me:awaiting-user"], 12: ["me:awaiting-cos"],
                  13: ["bug"], 14: ["me:awaiting-user", "me:awaiting-cos"]}
         for number, names in cases.items():
             hub.note_awaiting_issue(API, {"number": number, "title": "issue %d" % number, "state": "open",
