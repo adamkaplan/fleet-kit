@@ -59092,12 +59092,101 @@ class TestQueueEjections(Base):
         self.assertIn("unreadable", self.sent[0][1])
         self.assertEqual(len([e for e in self.world.audit() if e["event"] == "queue_ejection.read_failed"]), 1)
 
-    def test_a_pull_request_nobody_owns_is_said_once_and_not_read_again(self):
+    def chief(self, *names):
+        """Discovery that holds Chief of Staff agents, found by their metadata role (the name carries nothing)."""
+        self.engine.discovery.agents = {n: types.SimpleNamespace(fleet={"role": "chief-of-staff"}) for n in names}
+        self.engine.discovery.agents["worker"] = types.SimpleNamespace(fleet={"role": "coder"})
+
+    def skipped(self):
+        return [e["detail"] for e in self.world.audit() if e["event"] == "queue_ejection.skipped"]
+
+    def test_s5_a_pull_request_nobody_owns_wakes_the_chief_of_staff_once_and_never_again(self):
         self.engine.hub.owner = None
-        self.add(1401, 501, names=["t"])
+        self.chief("boss")
+        self.add(1401, 501, names=["tests/t.py::boom"])
         self.go()
         self.go()
-        self.assertEqual((self.sent, len([e for e in self.world.audit() if e["event"] == "queue_ejection.unrouted"]), self.gh.count(self.REPO, "/zip")), ([], 1, 0))
+        self.engine.__dict__.pop("queue_ejections")   # a restart
+        self.go()
+        (to, line), = self.sent
+        self.assertEqual(to, "boss")
+        for needle in ("%s#501" % self.REPO, "1401", "tests/t.py::boom", "No orchestrator owns"):
+            self.assertIn(needle, line)
+        self.assertEqual([e["event"] for e in self.world.audit() if e["event"].startswith("queue_ejection.") and e["event"] != "queue_ejection.skipped"], ["queue_ejection.unowned_woke"])
+
+    def test_s6_an_owned_pull_request_wakes_only_its_owner_and_the_chief_line_is_filtered(self):
+        self.chief("boss")
+        self.add(1402, 502, names=["t"])
+        self.go()
+        self.assertEqual([to for to, _ in self.sent], ["orch"])
+        self.engine.hub.owner = None
+        self.world.tick(self.module.LIST_SECONDS + 1)
+        self.add(1403, 503, names=["@all /deploy https://x.example/p ghp_" + "Ab1" * 10])
+        self.go()
+        to, line = self.sent[1]
+        self.assertEqual(to, "boss")
+        self.assertEqual(("@" in line, "://" in line, "ghp_" in line, "/deploy" in line.replace(" /deploy", "")), (False, False, False, False))
+        self.assertEqual(len(self.sent), 2)
+
+    def test_s7_an_unowned_pull_request_with_no_chief_is_said_and_woken_once_one_exists(self):
+        self.engine.hub.owner = None
+        self.add(1404, 504, names=["t"])
+        self.go()
+        self.assertEqual((self.sent, self.skipped()), ([], [{"no_chief": 1, "reason": "no_chief"}]))
+        self.chief("boss")
+        self.world.tick(self.module.RETRY_SECONDS + 1)
+        self.go()
+        self.assertEqual([to for to, _ in self.sent], ["boss"])
+
+    def test_s1_a_pass_that_returns_early_says_why(self):
+        self.add(1405, 505, names=["t"])
+        self.engine.discovery.problems = ["herdr unreachable", "v2 unreachable"]
+        self.assertEqual(self.go(), 0)
+        self.assertEqual((self.skipped(), self.gh.calls, self.sent), ([{"discovery": 2, "reason": "discovery"}], [], []))
+        self.engine.discovery = None
+        self.go()
+        self.assertEqual(self.skipped()[-1], {"discovery": 1, "reason": "discovery"})
+
+    def test_s2_a_budget_that_fits_one_candidate_says_how_many_wait(self):
+        for n in range(3):
+            self.add(1410 + n, 510 + n, names=["t"], age=100 - n)
+        self.go(calls=2 + 3)   # the 2 lists, and one candidate's 3 reads
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.skipped(), [{"budget": 2, "reason": "budget"}])
+
+    def test_s3_a_skip_is_said_once_until_it_changes(self):
+        self.add(1420, 520, names=["t"])
+        self.gh.pulls[(self.REPO, 520)] = ("OPEN", True)
+        for _ in range(3):
+            self.go()
+        self.assertEqual(self.skipped(), [{"queued": 1, "reason": "queued"}], "1 line in 3 passes")
+        self.add(1421, 521, names=["t"])
+        self.gh.pulls[(self.REPO, 521)] = ("OPEN", True)
+        self.world.tick(self.module.LIST_SECONDS + 1)
+        self.go()
+        self.go()
+        self.assertEqual(self.skipped()[-1], {"queued": 2, "reason": "queued"})
+        self.assertEqual(len(self.skipped()), 2)
+
+    def test_s4_the_line_that_settles_a_run_says_how_late_it_was_first_seen_and_why(self):
+        self.chief("boss")
+        self.engine.hub.owner = None
+        self.add(1430, 530, names=["t"], age=1200)
+        self.gh.pulls[(self.REPO, 530)] = ("OPEN", True)
+        self.go()
+        self.gh.pulls[(self.REPO, 530)] = ("OPEN", False)
+        self.world.tick(self.module.RECHECK_SECONDS + 1)
+        self.go()
+        (line,) = [e for e in self.world.audit() if e["event"] == "queue_ejection.unowned_woke"]
+        detail = line["detail"]
+        self.assertTrue(1200 <= detail["seen_after"] <= 1260, detail)
+        self.assertEqual((detail["why"], detail["held"]), ("first_list", {"queued": 1}))
+        self.engine.hub.owner = "orch"
+        self.add(1431, 531, names=["t"], age=1300)
+        self.world.tick(self.module.LIST_SECONDS + 1)
+        self.go()
+        (late,) = [e for e in self.world.audit() if e["event"] == "queue_ejection.woke"]
+        self.assertEqual(late["detail"]["why"], "list_interval")
 
     def test_the_daemons_pass_runs_it_and_a_failure_never_stops_the_pass(self):
         self.add(1501, 601, names=["t"])
