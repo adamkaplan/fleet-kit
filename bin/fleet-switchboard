@@ -12380,7 +12380,7 @@ def triage_ownerless_options(cfg):
 def triage_read_ownerless(hub, repo, options, budget):
     """(records, cut, total) of one team repository: every open item, page by page to `limit` items, and the repository's own count of open items (one more read) for
     `read X of Y`. Charged to the pass's call budget."""
-    records, cut = hub.read_pages("repos/%s/issues?state=open&per_page=100" % repo, cap=max(1, -(-options["limit"] // 100)))
+    records, cut = hub.read_pages("repos/%s/issues?state=open&sort=updated&direction=asc&per_page=100" % repo, cap=max(1, -(-options["limit"] // 100)))   # the LEAST recently updated first: a cut keeps the stale ones this line exists for (the triage's own shared read is unchanged)
     budget[0] -= sweep_pages_used(records, cut) + 1
     total = None
     try:
@@ -12445,7 +12445,7 @@ def triage_ownerless_pass(engine, state, cfg, now):
                 continue
             sent[repo] = {"at": int(now)}
             _write_small(engine.state_dir, OWNERLESS_FILE, sent)   # before the send: at most one line a day, even when a send fails
-            line = module.summary_line(repo, rows, read, total, options["days"])
+            line = module.summary_line(repo, rows, read, total, options["days"], unit.get("truncated") is True)
             names = ["chief-of-staff"] + sorted(name for name, agent in (discovery.agents.items() if discovery else [])
                                                 if _is_orchestrator(agent) and _fleet_repo(agent.fleet or {}, engine.config) == repo)
             told = []

@@ -23542,6 +23542,10 @@ class FakeOwnerlessHub(FakeTriageHub):
             if repo in self.unreadable:
                 raise sb.GitHubUnavailable("HTTP 404: Not Found")
             everything = list(self.open.get(repo, {}).values())
+            if "direction=asc" in path:   # GitHub sorts by the updated time; the fake does too
+                everything.sort(key=lambda record: record["updated_at"])
+            elif "sort=" not in path:
+                everything.sort(key=lambda record: record["updated_at"], reverse=True)   # the default listing is newest first
             return everything[:cap * 100], len(everything) > cap * 100
         return super().read_pages(path, key, timeout, older, cap)
 
@@ -23657,6 +23661,34 @@ class TestOwnerlessSummary(Base):
         text = "\n".join(sb.triage_status_lines(dict(sb.TRIAGE_DEFAULTS, **{"enabled": True, "counts": {}, "total": 0, "at": "2026-01-01T00:00:00Z"}, **info)))
         self.assertIn("not checked for acme/web: 12 call budget, 6 failed read, 3 not read yet (15 of them other-owner flags); oldest unchecked for 6 hour(s)", text)
         self.assertIn("21 finding(s) not checked this pass", text, "the older line is unchanged")
+
+    def test_a_cut_list_is_read_oldest_first_so_the_stale_issues_are_counted_and_the_count_is_a_lower_bound(self):
+        for n in range(20, 170):
+            self.add(n, created=30, updated=20, author="alice")   # 150 stale: the least recently updated
+        for n in range(200, 750):
+            self.add(n, created=30, updated=1, author="alice")    # 550 touched yesterday
+        self.hub.open_total[self.TEAM] = 700
+        self.go(1)
+        (line,) = self.lines("cos")
+        self.assertIn("at least 150 open issue(s) with no owner", line)
+        self.assertIn("oldest quiet for 20 day(s)", line)
+        self.assertIn("read 500 of 700 open item(s), least recently updated first", line)
+        self.assertTrue(any("sort=updated&direction=asc" in c for c in self.hub.calls), "the summary's own read is oldest first")
+
+    def test_a_complete_list_says_no_at_least(self):
+        for n in range(20, 30):
+            self.add(n, created=10, author="alice")
+        self.go(1)
+        (line,) = self.lines("cos")
+        self.assertNotIn("at least", line)
+        self.assertNotIn("least recently updated first", line)
+
+    def test_label_case_and_empty_labels_are_handled(self):
+        self.add(20, created=10, author="alice", labels=["Agent:Crew-B"])      # an owner label in another case: owned
+        self.add(21, created=10, author="alice", labels=[])                     # no labels at all: ownerless
+        self.go(1)
+        (line,) = self.lines("cos")
+        self.assertIn(" 1 open issue(s) with no owner", line)
 
     def test_the_line_goes_out_again_after_a_day_and_not_just_under_one(self):
         self.add(1, created=10, author="alice")

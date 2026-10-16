@@ -44,11 +44,13 @@ def ownerless_stale(items, ctx, ours_logins, patterns, now, days=DEFAULT_DAYS):
     return sorted(found, key=lambda row: (-row[1], row[0]))
 
 
-def summary_line(repo, rows, read, total, days=DEFAULT_DAYS):
-    """The ONE line about a repository: how many, how old the oldest is, the five oldest as links, and how much of the list was read. Counts, ages and links only: no title, no text."""
+def summary_line(repo, rows, read, total, days=DEFAULT_DAYS, cut=False):
+    """The ONE line about a repository: how many, how old the oldest is, the five oldest as links, and how much of the list was read. Counts, ages and links only: no title, no text.
+    When the list was CUT the read took the least recently updated first, so the count is a lower bound (`at least N`) and the oldest are the true oldest."""
     links = ", ".join("https://github.com/%s/issues/%d" % (repo, number) for number, _ in rows[:OLDEST])
-    return "ownerless in %s: %d open issue(s) with no owner and no activity for %d day(s) or more; oldest quiet for %d day(s); oldest %d: %s; read %s of %s open item(s)" % (
-        repo, len(rows), days, int(rows[0][1]), min(OLDEST, len(rows)), links, read, total if total is not None else "an unknown number")
+    return "ownerless in %s: %s%d open issue(s) with no owner and no activity for %d day(s) or more; oldest quiet for %d day(s); oldest %d: %s; read %s of %s open item(s)%s" % (
+        repo, "at least " if cut else "", len(rows), days, int(rows[0][1]), min(OLDEST, len(rows)), links, read,
+        total if total is not None else "an unknown number", ", least recently updated first" if cut else "")
 
 
 def reasons_line(repo, reasons, other_owner=0, oldest_seconds=None):
