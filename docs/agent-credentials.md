@@ -19,17 +19,18 @@ Names below are neutral (`acme-org/widget-api`, `agent-bot`). No token, key, acc
 |---|------|----------------------------|------------|---------------------------------|
 | 1 | `gh` shim account map (`gh_users`) | `gh auth token --user <account>` at the moment of use, put only in the child's `GH_TOKEN` | Whatever the mapped account's stored token has (row 4). The shim picks the account; it does not narrow the token | Yes, wherever that account is an admin of the repository |
 | 2 | `git` shim credential route | No token of its own. Network verbs (`push`, `fetch`, `pull`, `clone`, `ls-remote`) are sent through `gh auth git-credential`, which is row 1 | Same as row 1 | Git itself cannot call the settings API, but the token it is given is the row 1 token: yes in the sense that matters |
-| 3 | Token in the shell environment (`GH_TOKEN`, `GITHUB_TOKEN` and the two enterprise names) | Inherited from whoever started the pane | On the machine read: a classic token with `repo`, `workflow`, `gist` and `admin:org`. The shim replaces it for a repository with a mapping; reads and unmapped repositories fall back to it | Yes (admin of repositories it owns; organisation admin through `admin:org`) |
-| 4 | Keyring logins of `gh` | `gh auth login`, stored by the operating system keyring | Classic tokens. The owner-account login: `repo`, `workflow`, `gist`, `admin:org`. A login for another account: `repo`, `workflow`, `gist`, `read:org` and a key-management scope | Yes for repositories where that account is admin. The other-account login must stay unused for settings by policy, not by its scope |
+| 3 | Token in the shell environment (`GH_TOKEN`, `GITHUB_TOKEN` and the two enterprise names) | Inherited from whoever started the pane | On the machine read: a broad classic token (repository, workflow and organisation administration scopes). The shim replaces it for a repository with a mapping; reads and unmapped repositories fall back to it | Yes (admin of repositories it owns, and organisation administration) |
+| 4 | Keyring logins of `gh` | `gh auth login`, stored by the operating system keyring | Broad classic tokens: the owner-account login includes organisation administration; a login for another account has repository access without it | Yes for repositories where that account is admin. The other-account login must stay unused for settings by policy, not by its scope |
 | 5 | Cloud token mint (#450, #545) | An App installation token for one repository, one hour at most, minted inside the pod from the pod's federated identity | Exactly `contents: write`, `pull_requests: write`, `metadata: read`. The mint refuses an answer with an extra key, a higher level or a missing key | No. There is no `Administration` permission. A token a cloud worker holds cannot reach settings |
 | 6 | The switchboard's own calls (daemon, sweeps, intent reads) | The same per-account tokens as row 1, marked `FLEET_SWITCHBOARD_OWN_GH` | Same as row 4 | Yes in scope, but it is the daemon's own process, not an agent's shell |
 
 Reading the table:
 
-- Four of the six paths end in a classic `repo` token. A local agent therefore holds, in effect, the owner's admin power over every repository the owner administers.
+- Five of the six paths (rows 1, 2, 3, 4 and 6) end in a classic `repo` token. A local agent therefore holds, in effect, the owner's admin power over every repository the owner administers.
 - The shim's own text says it: the fail-closed rule is "a guardrail, not a boundary: the boundary is which account's token a pane can reach". Choosing the account does not narrow it.
 - Only the cloud path (row 5) is narrow by construction, and it is the model the options below copy.
 - A token reachable from the shell can also be asked for by name. Whether an agent shell can print it through `gh auth token` was not tested here.
+- So the real boundary is which tokens an agent shell can reach. Option B's limit holds only if the owner's broad login is out of the agents' reach (migration steps 3 and 5). That is unverified, and clause (4)'s live proof is what verifies it.
 
 ## Design: three options
 
@@ -56,7 +57,7 @@ One extra GitHub account (`agent-bot`), added to each repository as a collaborat
 |-----------|------------|
 | Cost | One extra account, no money for public repositories. A seat on private organisation repositories. A one-time setup per repository (invite and accept). It fits the existing `gh_users` map as a new account name, so no shim code changes |
 | What breaks | Little. A Write collaborator cannot change settings, rulesets, branch protection or collaborators, which is the intent, and everything else agents do (push, pull request, label, comment) is allowed. Anything that relied on admin power breaks and moves to the owner. Pull requests now show a different author, which is useful: the owner can approve what an agent wrote |
-| Rotation | The machine user's token has its own expiry (fine-grained, up to a year) or a classic token with no expiry, which the owner should avoid. Rotating means one new token and one `gh auth login` in the keyring; revoking the user's access is one step per repository, or deleting the account |
+| Rotation | The machine user's token has its own expiry (fine-grained, up to a year; a fine-grained token reaches only repositories its owner account owns or an organisation grants, so for repositories under another personal account a classic token with `repo` may be the only form, which is broader and must be weighed first) or a classic token with no expiry, which the owner should avoid. Rotating means one new token and one `gh auth login` in the keyring; revoking the user's access is one step per repository, or deleting the account |
 | Who merges | The owner's own login approves and merges, or clears holds. The machine user's pull requests can be approved by the owner without the self-approval problem, so the ruleset's review rule keeps working. The machine user itself does not hold bypass |
 
 ### Option C: the App installation token for local agents too
