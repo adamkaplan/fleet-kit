@@ -63,6 +63,8 @@ if cmd == "apply" or (cmd == "create" and args[1:2] == ["-f"]):   # `create -f` 
     st.setdefault("applied", []).append(obj)
     if obj["kind"] == "Secret":
         st.setdefault("secrets", {})[obj["metadata"]["name"]] = 1
+        if "password" in obj.get("stringData", {}):
+            st.setdefault("secret_bodies", {})[obj["metadata"]["name"]] = {"password": obj["stringData"]["password"]}
         st.setdefault("secret_labels", {})[obj["metadata"]["name"]] = obj["metadata"].get("labels", {})
     else:
         obj["status"] = {"phase": "Pending" if st.get("never_ready") else "Running",
@@ -82,6 +84,7 @@ elif cmd == "create" and args[1:3] == ["secret", "generic"]:
         with open(path + ".stdin", "a") as f:  # stdin of 'create secret' is recorded apart from argv
             f.write(body + "\n")
         data[key] = len(body)
+        st.setdefault("secret_bodies", {}).setdefault(args[3], {})[key] = body
     st.setdefault("secrets", {})[args[3]] = 1
     st.setdefault("secret_labels", {}).pop(args[3], None)   # a new Secret starts without labels
     st.setdefault("secret_keys", {})[args[3]] = data
@@ -94,6 +97,7 @@ elif cmd == "patch" and args[1] == "secret":
     import base64
     for k, v in json.loads(body)["data"].items():
         st["secret_keys"][args[2]][k] = len(base64.b64decode(v))
+        st.setdefault("secret_bodies", {}).setdefault(args[2], {})[k] = base64.b64decode(v).decode()
     save()
 elif cmd == "label" and args[1] == "secret":
     st.setdefault("secret_labels", {})[args[2]] = dict(kv.split("=", 1) for kv in args[3:])
@@ -126,10 +130,26 @@ elif cmd == "exec":
     name, tool = args[1], args[3]
     if tool == "cw-worker-activity":
         print(json.dumps(st["activity"][name]))
-    elif tool == "head":   # the report file of the pod: st["report"][pod]
-        if name not in st.get("report", {}):
-            print("head: cannot open: No such file", file=sys.stderr); sys.exit(1)
-        sys.stdout.write(st["report"][name])
+    elif tool == "ls":   # /run/cw of the pod: the password and the run secrets, as the mounts name them
+        print("server-password")
+        for k in st.get("secret_bodies", {}).get(name + "-run", {}): print(k)
+    elif tool == "cat":
+        fname = args[4].rsplit("/", 1)[1]
+        bodies = st.get("secret_bodies", {})
+        body = bodies.get(name + "-pw", {}).get("password") if fname == "server-password" else bodies.get(name + "-run", {}).get(fname)
+        if body is None:
+            print("cat: No such file", file=sys.stderr); sys.exit(1)
+        sys.stdout.write(body)
+    elif tool == "sh":   # the report read: the script must refuse a link or a non-regular file, as the real one does
+        script, path = args[5], args[7]
+        fs = st.get("report_fs", {}).get(name)   # {"type": file|symlink|dir, "content": ..., "target": what a followed link reaches}
+        if fs is None and name in st.get("report", {}):
+            fs = {"type": "file", "content": st["report"][name]}
+        if fs is None:
+            print("head: cannot open '%s' for reading: No such file or directory" % path, file=sys.stderr); sys.exit(1)
+        if fs["type"] != "file" and "-L" in script:
+            print("not a regular file", file=sys.stderr); sys.exit(3)
+        sys.stdout.write(fs["content"] if fs["type"] == "file" else fs.get("target", ""))
     elif tool == "git":
         if st.get("head_sha"): print(st["head_sha"])
         else: sys.exit(1)

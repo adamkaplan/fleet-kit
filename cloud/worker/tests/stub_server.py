@@ -47,9 +47,22 @@ class H(http.server.BaseHTTPRequestHandler):
             old, new = {"id": "ses_0", "time": {"created": 1700000000000, "updated": 1700000100000}}, {"id": "ses_1", "time": {"created": 1700000000000, "updated": 1700000500000}}
             return self.send(200, {"data": [] if MODE == "no-sessions" else [old, new], "cursor": {}} if MODE != "bad-list" else {"oops": 1})
         if self.path == "/api/session/ses_1/message":
-            polls["m"] = polls.get("m", 0) + 1
+            counter = (LOG or "stub") + ".m"   # a file: the driver's poll and the launcher's record are two processes
+            with open(counter, "a") as f:
+                f.write("x")
+            polls["m"] = len(open(counter).read())
             if MODE == "messages-down" and polls["m"] > 1:
                 return self.send(500)   # the first read (the poll that sees the session finish) works; the transcript read after it fails
+            if os.environ.get("STUB_MESSAGES_RAW") and polls["m"] > 1:   # a hostile body, as bytes, for the record's read only
+                raw = open(os.environ["STUB_MESSAGES_RAW"], "rb").read()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                try:
+                    self.wfile.write(raw)
+                except OSError:
+                    pass
+                return
         if self.path == "/api/session/ses_1/message" and os.environ.get("STUB_MESSAGES"):
             return self.send(200, {"data": json.load(open(os.environ["STUB_MESSAGES"]))})   # a canned transcript
         if self.path == "/api/session/ses_1/message":

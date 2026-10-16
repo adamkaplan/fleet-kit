@@ -56,6 +56,14 @@ class Record(td.Driver):
         d = self.the_record()
         return "\n".join(self.read(os.path.join(d, n)) for n in sorted(os.listdir(d)))
 
+    def assert_lines_are_json(self, lines):
+        """M2: the scrub works on the string values, so every line is still the JSON message it was."""
+        parsed = [json.loads(x) for x in lines]   # raises when the scrub broke the structure
+        self.assertEqual([m["type"] for m in parsed[:3]], ["user", "assistant", "assistant"])
+        self.assertEqual(parsed[1]["content"][1]["tool"], "bash")
+        self.assertIn("state", parsed[1]["content"][1])
+        self.assertEqual(parsed[1]["time"], {"created": 1, "completed": 2})
+
     def assert_record_has_no_secret(self):
         text = self.all_record_text()
         for form in planted_forms():
@@ -76,6 +84,7 @@ class Record(td.Driver):
         lines = self.read(os.path.join(d, "transcript.jsonl")).splitlines()
         self.assertEqual(len(lines), 3)
         self.assertIn("hello.txt", lines[0])
+        self.assert_lines_are_json(lines)
         self.assertIn("[redacted]", self.all_record_text())
         tally = json.loads(self.read(os.path.join(d, "tally.json")))
         self.assertEqual(tally, {"messages": 3, "tool_calls": {"bash": 2, "edit": 1}, "turns": 2})
@@ -170,6 +179,190 @@ class Record(td.Driver):
             self.run_driver()
         self.assertEqual(len(self.run_dirs()), 2)
 
+    # -- M3: the record is the launcher's stop's: retire and a person get it too --
+    def stub_env(self, **extra):
+        self.env.update(CW_RUN_RECORD_DIR=self.records, STUB_MESSAGES=self.msgfile, STUB_LOG=self.stub_log, CW_RECORD_TIMEOUT="5")
+        self.env.update(extra)
+
+    def create_with_secrets(self):
+        """A worker made by the launcher with the model entry and the git token as run secrets, as the driver makes it."""
+        import subprocess
+        pw_r, pw_w = os.pipe()
+        fds = []
+        args = ["create", "coder7", "--repo", td.REPO, "--branch", "main", "--password-fd", str(pw_w)]
+        for name, value in (("model-auth", json.dumps({"github-copilot": td.ENTRY})), ("git-token", td.GIT)):
+            r, w = os.pipe()
+            os.write(w, value.encode()); os.close(w)
+            fds.append(r)
+            args += ["--run-secret-fd", "%s=%d" % (name, r)]
+        env = dict(os.environ, **self.env)
+        p = subprocess.run([sys.executable, os.path.join(os.path.dirname(HERE), "cloud_worker.py")] + args, env=env,
+                           capture_output=True, text=True, pass_fds=fds + [pw_w], timeout=120)
+        os.close(pw_w)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_s5_the_launchers_stop_alone_writes_the_record_so_retire_gets_one(self):
+        self.stub_env()
+        self.create_with_secrets()
+        code, out, err = self.run_cli("stop", "coder7", "--reason", "retired")
+        self.assertEqual(code, 0, err)
+        d = self.the_record()
+        self.assertEqual(sorted(os.listdir(d)), ["run.json", "tally.json", "transcript.jsonl"])
+        self.assertEqual(self.st()["pods"], {})
+        info = json.loads(self.read(os.path.join(d, "run.json")))
+        self.assertEqual((info["transcript"], info["exit_reason"], info["repository"]), ("saved", "retired", td.REPO))
+        self.assertEqual(json.loads(out)["record"], d)
+        self.assertEqual(err.count(d), 1)
+        self.assertEqual(self.audit_lines()[-1]["reason"], "retired; run record %s" % d)
+        lines = self.read(os.path.join(d, "transcript.jsonl")).splitlines()
+        self.assert_lines_are_json(lines)
+        self.assert_record_has_no_secret()   # the launcher learned the secrets from the pod's own mounts
+
+    def test_no_record_and_a_dir_flag_are_honoured(self):
+        self.stub_env()
+        self.create_with_secrets()
+        code, out, err = self.run_cli("stop", "coder7", "--no-record")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.run_dirs(), [])
+        self.create_with_secrets()
+        other = os.path.join(self.tmp.name, "elsewhere")
+        code, out, err = self.run_cli("stop", "coder7", "--record-dir", other)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(os.listdir(other)), 1)
+
+    # -- M1: a hostile body never raises out of record() and never keeps the pod --
+    def hostile(self, body):
+        raw = os.path.join(self.tmp.name, "raw.json")
+        with open(raw, "wb") as f:
+            f.write(body)
+        return raw
+
+    def check_hostile(self, body, via_driver):
+        raw = self.hostile(body)
+        if via_driver:
+            p, out = self.run_driver(STUB_MESSAGES_RAW=raw, CW_RECORD_TIMEOUT="5")
+            self.assertEqual(p.returncode, 0, out)
+        else:
+            self.stub_env(STUB_MESSAGES_RAW=raw)
+            self.create_with_secrets()
+            open(self.stub_log + ".m", "w").write("x")   # the first message read is the driver's poll: the record's is the second
+            code, out, err = self.run_cli("stop", "coder7")
+            self.assertEqual(code, 0, err)
+        self.assertEqual(self.st()["pods"], {}, "the pod must be stopped")
+        info = json.loads(self.read(os.path.join(self.the_record(), "run.json")))
+        self.assertEqual(info["transcript"], "unavailable")
+        self.assertTrue(info["reason"])
+
+    def test_m1_a_body_nested_1100_5000_and_100000_levels_is_unavailable_and_the_pod_is_stopped(self):
+        for depth in (1100, 5000, 100000):
+            with self.subTest(depth=depth):
+                self.setUp()
+                self.check_hostile(b'{"data":' + b"[" * depth + b"]" * depth + b"}", via_driver=False)
+
+    def test_m1_the_failure_path_through_the_driver_still_stops_the_pod(self):
+        self.check_hostile(b'{"data":' + b"[" * 100000 + b"]" * 100000 + b"}", via_driver=True)
+
+    def test_m1_a_50_megabyte_body_is_refused_unread(self):
+        self.check_hostile(b"x" * (50 * 1024 * 1024), via_driver=False)
+
+    def test_m1_depth_is_checked_without_parsing_and_quotes_do_not_fool_it(self):
+        rr = cw.run_record
+        self.assertTrue(rr.depth_ok(b"[" * 100 + b"]" * 100))
+        self.assertFalse(rr.depth_ok(b"[" * 101 + b"]" * 101))
+        self.assertTrue(rr.depth_ok(b'{"a": "' + b"[" * 5000 + b'\\", "b": "\"[[[["}'))   # brackets inside strings do not count
+        deep = cur = []
+        for _ in range(100000):
+            nxt = []
+            cur.append(nxt)
+            cur = nxt
+        cur.append("leaf")
+        names = []
+        out = rr.walk_scrub({"type": "tool", "tool": "bash", "x": deep}, str.upper, names)   # no RecursionError
+        self.assertEqual(names, ["bash"])
+        self.assertIsInstance(out["X"], list)
+
+    # -- lows --
+    def test_a_record_directory_that_is_a_symbolic_link_is_refused_and_not_chmodded(self):
+        target = os.path.join(self.tmp.name, "target")
+        os.mkdir(target, 0o755)
+        link = os.path.join(self.tmp.name, "link")
+        os.symlink(target, link)
+        for how in ("env", "flag"):
+            self.setUp() if how == "flag" else None
+            self.stub_env(CW_RUN_RECORD_DIR=link) if how == "env" else self.stub_env()
+            self.create_with_secrets()
+            args = ["stop", "coder7"] + (["--record-dir", link] if how == "flag" else [])
+            code, out, err = self.run_cli(*args)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(self.st()["pods"], {})
+            self.assertEqual(os.listdir(target), [], how)
+            self.assertEqual(os.stat(target).st_mode & 0o777, 0o755, how)
+            self.assertNotIn("run record:", err)
+
+    def test_the_scrub_output_limit_is_above_the_input_maximum(self):
+        self.assertGreater(cw.SCRUB_OUTPUT_MAX, cw.SCRUB_INPUT_MAX)
+        secret = "Zk9Wp3Zk9Wp3Zk9Wp3Zk9Wp3"
+        grown = (secret[:8] + " ") * (cw.SCRUB_INPUT_MAX // 9)   # every 8-character piece becomes the 10-character marker
+        out = cw.scrub(grown, (secret,), limit=cw.SCRUB_OUTPUT_MAX)
+        self.assertGreater(len(out), cw.SCRUB_INPUT_MAX)
+        self.assertEqual(out.count("[redacted]"), cw.SCRUB_INPUT_MAX // 9)
+        self.assertNotIn(secret[:8], out)
+
+    def test_a_key_that_is_a_secret_is_scrubbed_too(self):
+        self.stub_env()
+        msgs = [{"type": "user", "text": "x", td.MODEL_VALUES[1]: "v"}]
+        with open(self.msgfile, "w") as f:
+            json.dump(msgs, f)
+        self.create_with_secrets()
+        code, out, err = self.run_cli("stop", "coder7")
+        self.assertEqual(code, 0, err)
+        self.assert_record_has_no_secret()
+
+    def test_prune_removes_only_old_per_run_directories_of_this_tool(self):
+        root = self.records
+        os.makedirs(root, mode=0o700)
+        old = time_ago = __import__("time").time() - 40 * 86400
+
+        def make(name, files=("run.json",), age=40):
+            p = os.path.join(root, name)
+            os.mkdir(p)
+            for f in files:
+                open(os.path.join(p, f), "w").write("{}")
+            t = __import__("time").time() - age * 86400
+            os.utime(p, (t, t))
+            return p
+        old_run = make("coder7-20260101T000000Z-abc123", ("run.json", "tally.json", "transcript.jsonl"))
+        new_run = make("coder7-20260901T000000Z-def456", age=1)
+        foreign = make("my-photos", ("a.jpg",))
+        foreign_named = make("coder7-20260101T000000Z-aaaaaa", ("notes.txt",))   # named like a run, holds a foreign file
+        stray = os.path.join(root, "coder7-20260101T000000Z-bbbbbb")
+        outside = os.path.join(self.tmp.name, "outside")
+        os.mkdir(outside)
+        os.symlink(outside, stray)
+        os.utime(stray, (old, old), follow_symlinks=False)
+        open(os.path.join(root, "audit.jsonl"), "w").write("x")
+        self.stub_env()
+        code, out, err = self.run_cli("prune-records", "--days", "30")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["removed"], ["coder7-20260101T000000Z-abc123"])
+        self.assertFalse(os.path.exists(old_run))
+        for keep in (new_run, foreign, foreign_named, stray, outside, os.path.join(root, "audit.jsonl")):
+            self.assertTrue(os.path.lexists(keep), keep)
+        link = os.path.join(self.tmp.name, "rootlink")
+        os.symlink(root, link)
+        self.stub_env(CW_RUN_RECORD_DIR=link)
+        code, out, err = self.run_cli("prune-records")
+        self.assertEqual(code, cw.EXIT_USAGE)
+
+    def test_s6_a_report_that_is_a_link_or_not_a_regular_file_is_refused_and_never_read(self):
+        self.create("coder7")
+        for kind in ("symlink", "dir"):
+            self.patch_state(report_fs={self.name: {"type": kind, "target": "SECRET-" + "Qw8Er5" * 6}})
+            code, out, err = self.run_cli("report", "coder7")
+            self.assertEqual(code, cw.EXIT_CLOUD, kind)
+            self.assertIn("not a regular file", err)
+            self.assertNotIn("SECRET-", out + err)
+
     # -- S6: the report, with no switchboard command in the pod --
     def test_s6_report_returns_the_one_line_the_worker_wrote_and_runs_nothing_but_head(self):
         self.create("coder7")
@@ -181,7 +374,8 @@ class Record(td.Driver):
         self.assertEqual(len(out.strip().splitlines()), 1)
         execs = [json.loads(x) for x in self.read(self.env["FAKE_KUBE_CALLS"]).splitlines() if '"exec"' in x]
         used = [c[c.index("--") + 1] for c in execs]
-        self.assertEqual(used, ["head"])
+        self.assertEqual(used, ["sh"])   # one read-only shell script whose only reader is head
+        self.assertIn("head -c", execs[0][execs[0].index("-c") + 1])
         self.assertFalse([c for c in execs if "switchboard" in " ".join(c)])
         self.assertEqual(self.audit_lines()[-1]["action"], "report")
 

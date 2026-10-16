@@ -21,14 +21,10 @@ port-forward's own log; the cluster login file is the launcher's (a path, never 
 
 Environment: CW_KUBE_CONTEXT or CW_CLOUD_SERVER + CW_CLOUD_TOKEN_FILE (as the launcher), CW_MODEL_AUTH_FILE (default
 ~/.local/share/opencode/auth.json), CW_GIT_TOKEN_CMD, CW_WORKDIR (default /home/worker), CW_TMPDIR, CW_RUN_TIMEOUT
-(1800 s), CW_HEALTH_TIMEOUT (180 s), CW_POLL_SECONDS (3), CW_PROGRESS_SECONDS (30), CW_LAUNCHER, CW_CREATE_TIMEOUT (900 s),
-CW_RUN_RECORD_DIR (where each run's record goes; default: runs/ beside the launcher's audit file), CW_RECORD_TIMEOUT (30 s), CW_RECORD_MAX_BYTES (transcript cap, 5 MiB).
+(1800 s), CW_HEALTH_TIMEOUT (180 s), CW_POLL_SECONDS (3), CW_PROGRESS_SECONDS (30), CW_LAUNCHER, CW_CREATE_TIMEOUT (900 s).
 
-The run record: BEFORE the pod and its Secrets are deleted (every end takes this path) the driver saves, in
-RECORD_DIR/<run id>/ (0700; files 0600): transcript.jsonl (the session's messages, one scrubbed line each, at most
-TRANSCRIPT_CAP bytes), tally.json (tool calls by name and the turn count; no content) and run.json (worker, repository,
-start, end, exit reason, head sha when known, and `transcript: unavailable` with a reason when it could not be read). A record
-that fails never keeps a pod, and a failed stop never deletes a record.
+The run record is written by the launcher's `stop` (cloud/launcher/run_record.py), which this driver calls on every end:
+nothing is recorded here. CW_RUN_RECORD_DIR, CW_RECORD_TIMEOUT and CW_RECORD_MAX_BYTES reach it through the environment.
 """
 import argparse
 import base64
@@ -36,8 +32,8 @@ import http.client
 import json
 import os
 import re
-import shlex
 import secrets
+import shlex
 import shutil
 import signal
 import socket
@@ -55,9 +51,7 @@ REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 MODEL_PROVIDER = "github-copilot"
 MAX_BODY = 8 * 1024 * 1024
 EXIT_INTERRUPTED = cw.EXIT_INTERRUPTED
-TRANSCRIPT_CAP = 5 * 1024 * 1024   # bytes of transcript.jsonl kept per run; more is cut with a loud marker line
 REPORT_NOTE = "\n\nWhen you are finished, write your final report as ONE line to the file %s (replace the file; one line, no secrets)." % cw.REPORT_PATH
-TOOL_PART_TYPES = {"tool", "tool-call", "tool_call", "tool-use", "tool_use", "tool-invocation"}
 
 
 class Interrupted(BaseException):
@@ -80,11 +74,6 @@ class Driver:
         self.pf = None
         self.tmp = None
         self.password = ""
-        self.sid = None
-        self.recorded = False
-        self.record_dir = None
-        self.started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        self.run_id = "%s-%s-%s" % (a.worker, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), secrets.token_hex(3))
         self.nonce = secrets.token_hex(8)   # chosen before anything is made; the launcher records it on what it creates
         self.refused = False   # the launcher found the worker already there: it is another run's, never ours to touch
 
@@ -226,7 +215,6 @@ class Driver:
                "port-forward", "pod/" + pod, "%d:4096" % port, "--address", "127.0.0.1"]
         self.logf = open(os.path.join(self.tmp, "pf.log"), "wb")
         self.pf = subprocess.Popen(cmd, stdout=self.logf, stderr=subprocess.STDOUT, env=k.env, start_new_session=True)
-        self.pf_port = port
         return port
 
     def api(self, port, method, path, body=None):
@@ -277,7 +265,6 @@ class Driver:
                 raise ValueError
         except (ValueError, KeyError, TypeError):
             raise cw.CloudError("session: could not create one (status %d)" % st)
-        self.sid = sid
         self.step("session created (%s)" % sid)
         st, _ = self.api(port, "POST", "/api/session/%s/prompt" % sid, {"text": self.brief.rstrip() + REPORT_NOTE})
         if st >= 300:
@@ -309,139 +296,18 @@ class Driver:
         replies = [m for m in msgs if isinstance(m, dict) and m.get("type") == "assistant"]
         return bool(replies and isinstance(replies[-1].get("time"), dict) and replies[-1]["time"].get("completed"))
 
-    # -- the run record: kept on the operator's machine, written before the pod is deleted --
-    def record_root(self):
-        env = self.env
-        return env.get("CW_RUN_RECORD_DIR") or os.path.join(
-            os.path.dirname(env.get("CW_CLOUD_AUDIT") or os.path.join(env.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "cw-cloud", "audit.jsonl")), "runs")
-
-    def _write_private(self, name, text):
-        final = os.path.join(self.record_dir, name)
-        part = final + ".part"   # a crash leaves only the .part, never a torn record file
-        fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(text)
-        os.replace(part, final)
-
-    def _read_messages(self):
-        """The session's messages through a port-forward to the pod's server; (list, None) or (None, why)."""
-        if not self.sid or not self.password:
-            return None, "no session was opened"
-        try:
-            if self.pf is None or self.pf.poll() is not None:
-                port = self.port_forward(self.name)
-            else:
-                port = self.pf_port
-            end = time.monotonic() + float(self.env.get("CW_RECORD_TIMEOUT") or 30)
-            while True:
-                try:
-                    if self.api(port, "GET", "/api/info")[0] == 200:
-                        break
-                except (OSError, http.client.HTTPException):
-                    pass
-                if self.pf.poll() is not None or time.monotonic() >= end:
-                    return None, "the pod's server could not be reached"
-                time.sleep(0.3)
-            st, body = self.api(port, "GET", "/api/session/%s/message" % self.sid)
-            if st != 200:
-                return None, "the server answered status %d" % st
-            msgs = json.loads(body).get("data")
-            if not isinstance(msgs, list):
-                return None, "the messages were not a list"
-            return msgs, None
-        except (OSError, ValueError, AttributeError, http.client.HTTPException, cw.CloudError):
-            return None, "the messages could not be read"
-
-    @staticmethod
-    def _tool_names(node, out):
-        if isinstance(node, dict):
-            if node.get("type") in TOOL_PART_TYPES:
-                n = node.get("tool") or node.get("name") or node.get("toolName")
-                out.append(n if isinstance(n, str) and n else "unknown")
-            for v in node.values():
-                Driver._tool_names(v, out)
-        elif isinstance(node, list):
-            for v in node:
-                Driver._tool_names(v, out)
-
-    def _head_sha(self):
-        try:
-            out = self.kube.exec(self.name, "git", "-C", self.env.get("CW_WORKDIR") or "/home/worker", "rev-parse", "HEAD", keep_stdout=True)
-        except cw.CloudError:
-            return None
-        sha = (out.strip().splitlines() or [""])[0]
-        return sha if re.fullmatch(r"[0-9a-f]{40}", sha) else None
-
-    def record(self, reason):
-        """Save the run's record once, before the pod goes. Never raises an error (an interrupt apart, and then run.json
-        is still written): a record that fails must not keep a pod."""
-        if self.recorded or not self.created:
-            return
-        self.recorded = True
-        info = {"worker": self.a.worker, "repository": self.a.repo, "run_id": self.run_id, "start": self.started,
-                "end": None, "exit_reason": self.kube.scrub(reason, limit=300), "head_sha": None, "transcript": "unavailable",
-                "reason": "the record was not finished"}
-        try:
-            root = self.record_root()
-            os.makedirs(root, mode=0o700, exist_ok=True)
-            os.chmod(root, 0o700)
-            self.record_dir = os.path.join(root, self.run_id)
-            os.mkdir(self.record_dir, 0o700)
-            try:
-                msgs, why = self._read_messages()
-                if msgs is None:
-                    info["reason"] = why
-                else:
-                    cap = int(self.env.get("CW_RECORD_MAX_BYTES") or TRANSCRIPT_CAP)
-                    lines, size, cut, msg_cut = [], 0, False, False
-                    tally, turns = {}, 0
-                    for m in msgs:
-                        names = []
-                        self._tool_names(m, names)
-                        for n in names:
-                            n = self.kube.scrub(n, limit=64)
-                            tally[n] = tally.get(n, 0) + 1
-                        if isinstance(m, dict) and m.get("type") == "assistant":
-                            turns += 1
-                        raw = json.dumps(m, sort_keys=True)
-                        line = self.kube.scrub(raw, limit=cw.SCRUB_INPUT_MAX)
-                        if len(raw) > cw.SCRUB_INPUT_MAX:   # the scrub cuts a longer line: say so on the line itself
-                            line = json.dumps({"truncated": True, "note": "MESSAGE CUT: over %d characters" % cw.SCRUB_INPUT_MAX})
-                            msg_cut = True
-                        if size + len(line.encode()) + 1 > cap and not cut:
-                            cut = True
-                            lines.append(json.dumps({"truncated": True, "note": "TRANSCRIPT CUT: over %d bytes; the rest is not kept" % cap}))
-                        if not cut:
-                            lines.append(line)
-                            size += len(line.encode()) + 1
-                    self._write_private("transcript.jsonl", "".join(x + "\n" for x in lines))
-                    self._write_private("tally.json", json.dumps({"tool_calls": tally, "turns": turns, "messages": len(msgs)}, sort_keys=True) + "\n")
-                    info["transcript"], info["reason"] = "saved", None
-                    info["transcript_truncated"] = cut or msg_cut
-            finally:
-                info["head_sha"] = self._head_sha()
-        except (OSError, ValueError, cw.CloudError) as e:
-            info["reason"] = "the record could not be written: %s" % self.kube.scrub(e, limit=200)
-        finally:
-            info["end"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            if info["reason"] is None:
-                del info["reason"]
-            try:
-                self._write_private("run.json", json.dumps(info, sort_keys=True) + "\n")
-            except (OSError, TypeError, AttributeError):
-                pass
-            if self.record_dir:
-                self.say("run record: %s" % self.record_dir)
-
     def stop(self, reason):
-        self.record(reason)   # before anything is deleted; it never raises and never holds the stop back
-        if self.record_dir:
-            reason = "%s; run record %s" % (reason, self.record_dir)
-        self.kill_pf()   # the record has read what it needs
         rc, out, err = self.run_cloud_worker(["stop", self.a.worker, "--reason", reason], timeout=600)
         self.relay(err)
         if out.strip():
-            self.relay("stopped; result: " + out.strip().splitlines()[-1], sys.stdout)
+            last = out.strip().splitlines()[-1]
+            try:   # the record's directory is already on screen once (the launcher's own line): not again in the result
+                res = json.loads(last)
+                res.pop("record", None)
+                last = json.dumps(res, sort_keys=True)
+            except (ValueError, AttributeError):
+                pass
+            self.relay("stopped; result: " + last, sys.stdout)
         return rc == 0
 
     def kill_pf(self):
@@ -489,6 +355,7 @@ class Driver:
 
     def cleanup(self):
         self._shield()
+        self.kill_pf()
         if self.refused:
             self.say("worker %s belongs to another run; left whole (no end hook, no Secret touched)" % self.name)
         elif self.create_started and not self.created and not self.note_seen:
@@ -516,7 +383,6 @@ class Driver:
                      % self.kube.delete_command("pod", self.name))
         if self.created:
             self.secret_line()
-        self.kill_pf()
         if self.tmp:
             shutil.rmtree(self.tmp, ignore_errors=True)
 
@@ -551,6 +417,7 @@ class Driver:
             self.step("pod created")
             self.task(self.name)
             self.step("stopping: running the end hook and deleting the per-run secret")
+            self.kill_pf()
             if self.stop("task done"):
                 self.stopped = True
                 self.step("stopped")

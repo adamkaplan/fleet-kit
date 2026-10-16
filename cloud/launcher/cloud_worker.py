@@ -26,6 +26,9 @@ import tempfile
 import time
 import urllib.parse
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import run_record  # noqa: E402  (the run record: one module, one function the stop calls)
+
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")  # the switchboard's agent name rule
 SHAPES = {"S": {"cpu": "2", "memory": "4Gi", "usd_per_hour": 0.10},
           "M": {"cpu": "4", "memory": "8Gi", "usd_per_hour": 0.20}}  # list-price estimates, not billed figures
@@ -35,6 +38,8 @@ DEFAULT_SPEND_CAP_USD = 25.0  # the prototype's cap; applies when CW_CLOUD_SPEND
 LABEL = "cw-worker"
 REPORT_PATH = "/home/worker/report"  # the worker's final one-line report, written here inside the pod (the image's workdir)
 REPORT_MAX = 2000
+# the worker owns the file, and `head` follows a link: refuse anything but a regular file BEFORE reading ($1 the path, $2 the byte limit)
+REPORT_READ = 'if [ -L "$1" ] || { [ -e "$1" ] && [ ! -f "$1" ]; }; then echo "not a regular file" >&2; exit 3; fi; head -c "$2" "$1"'
 EXIT_DONE, EXIT_HOOK, EXIT_USAGE, EXIT_CLOUD, EXIT_TIMEOUT, EXIT_CAP, EXIT_REFUSED = 0, 1, 2, 3, 4, 5, 6
 EXIT_EXISTS = 7  # create found a worker of that name already there: this call made nothing and touched nothing
 
@@ -68,6 +73,7 @@ TOKEN_SHAPES = [re.compile(p) for p in (
     r"gh[pousr]_[A-Za-z0-9]{6,}", r"github_pat_[A-Za-z0-9_]{6,}", r"eyJ[A-Za-z0-9_-]{6,}(?:\.[A-Za-z0-9_-]*)*",
     r"[A-Za-z0-9+/]{40,}={0,2}", r"[A-Za-z0-9_-]{40,}", r"[0-9a-fA-F]{40,}")]  # standard and URL-safe base64, hex
 SCRUB_INPUT_MAX = 200000
+SCRUB_OUTPUT_MAX = 2 * SCRUB_INPUT_MAX   # a limit above the input maximum: redaction lengthens text (8 characters become 10), and a cut there would be silent
 MIN_FRAGMENT = 8
 
 
@@ -285,7 +291,7 @@ class Kube:
                 return p.stdout  # the caller reads the failure from the tool's own JSON
             if ok_missing and "NotFound" in p.stderr:
                 return None
-            last = (self.scrub(p.stderr, limit=SCRUB_INPUT_MAX).strip().splitlines() or ["failed"])[-1]
+            last = (self.scrub(p.stderr, limit=SCRUB_OUTPUT_MAX).strip().splitlines() or ["failed"])[-1]
             raise CloudError("kubectl %s: %s" % (args[0], self.scrub(last)))
         return p.stdout  # a caller that renders it passes it through scrub() first
 
@@ -367,6 +373,17 @@ class Kube:
 
     def exec(self, name, *cmd, keep_stdout=False):
         return self.run(["exec", name, "--"] + list(cmd), keep_stdout=keep_stdout)
+
+
+def _pod_repo(pod):
+    try:
+        for c in pod["spec"]["containers"]:
+            for e in c.get("env") or []:
+                if e.get("name") == "CW_REPO" and isinstance(e.get("value"), str):
+                    return e["value"][:200]
+    except (KeyError, TypeError, AttributeError):
+        pass
+    return ""
 
 
 def ann(pod, key, default=None):
@@ -459,6 +476,7 @@ class Launcher:
     def __init__(self, kube, env, clock=None, sleep=time.sleep):
         self.kube, self.env, self.sleep = kube, env, sleep
         self.run_id, self.foreign = None, []
+        self.recorder = run_record.Recorder(kube, env)
         self.clock = clock or (lambda: dt.datetime.now(dt.timezone.utc))
         self.audit_path = env.get("CW_CLOUD_AUDIT") or os.path.join(
             env.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "cw-cloud", "audit.jsonl")
@@ -481,17 +499,20 @@ class Launcher:
 
     def _audited(self, worker, action, fn, reason="", runtime_id=""):
         info = {"rid": runtime_id, "cost": 0.0}
+
+        def why():   # a stop that wrote a run record names its directory once, here
+            return "%s; run record %s" % (reason, info["record"]) if info.get("record") else reason
         try:
             result = fn(info)
         except CloudError as e:
             if not e.audited:
                 # the failure is never dropped: a caller's own reason (a stop reason, the run-secret names) comes first
-                self.audit(worker, info["rid"], action, info["cost"], False, "%s; %s" % (reason, e) if reason else str(e))
+                self.audit(worker, info["rid"], action, info["cost"], False, "%s; %s" % (why(), e) if why() else str(e))
             raise
         except (ValueError, TypeError, KeyError) as e:  # a bad annotation or reply still writes its ok:false line
-            self.audit(worker, info["rid"], action, info["cost"], False, reason or str(e)[:300])
+            self.audit(worker, info["rid"], action, info["cost"], False, why() or str(e)[:300])
             raise CloudError("unexpected cloud data: %s" % self.kube.scrub(e, 200))
-        self.audit(worker, info["rid"], action, info["cost"], True, reason)
+        self.audit(worker, info["rid"], action, info["cost"], True, why())
         return result
 
     def _need(self, worker):
@@ -706,6 +727,12 @@ class Launcher:
             if not pod:
                 return {"worker": worker, "runtime_id": "", "pushed": False, "wip_branch": None}
             info["rid"], info["cost"] = "pod/" + name, self.cost(pod)
+            if not getattr(a, "no_record", False):   # BEFORE the hook and the delete; never raises, never holds the stop back
+                where = self.recorder.record(worker, name, reason or "stop", repo=_pod_repo(pod), started=ann(pod, "started") or "",
+                                             root=getattr(a, "record_dir", None))
+                if where:
+                    info["record"] = where
+                    print("cloud-worker: run record: %s" % where, file=sys.stderr)
             phase = (pod.get("status") or {}).get("phase")
             if phase in ("Failed", "Succeeded") and ann(pod, "kept") != "true":  # a pod kept for unpushed work is never deleted here
                 # No container is running, so no hook can run and a kept pod would only linger: delete it and its
@@ -713,7 +740,7 @@ class Launcher:
                 self.kube.delete(name)
                 print("cloud-worker: pod was %s; end hook not run; deleted" % phase, file=sys.stderr)
                 return {"worker": worker, "runtime_id": "pod/" + name, "pushed": False, "wip_branch": None,
-                        "skipped": [], "note": "pod was %s; end hook not run" % phase}
+                        "skipped": [], "note": "pod was %s; end hook not run" % phase, "record": info.get("record", "")}
             try:
                 res = self.run_hook(name)
             except CloudError as e:
@@ -737,8 +764,20 @@ class Launcher:
             if skipped:  # these files were not pushed and went with the pod: say so, loudly
                 print("cloud-worker: WARNING: not saved (secret-looking names): %s" % ", ".join(skipped), file=sys.stderr)
             return {"worker": worker, "runtime_id": "pod/" + name, "pushed": bool(res.get("pushed")),
-                    "wip_branch": res.get("wip_branch"), "skipped": skipped}
+                    "wip_branch": res.get("wip_branch"), "skipped": skipped, "record": info.get("record", "")}
         return self._audited(worker, "stop", go, reason)
+
+    def prune_records(self, a):
+        """Remove run records older than --days (default CW_RECORD_KEEP_DAYS, else 30): only this tool's per-run directories."""
+        days = a.days if a.days is not None else int(self.env.get("CW_RECORD_KEEP_DAYS") or run_record.KEEP_DAYS)
+        if days < 1:
+            raise CloudError("--days must be at least 1", EXIT_USAGE)
+        root = self.recorder.root(a.record_dir)
+        try:
+            removed = run_record.prune(root, days)
+        except OSError as e:
+            raise CloudError("prune-records: %s" % self.kube.scrub(e, 200), EXIT_USAGE)
+        return {"root": root, "days": days, "removed": removed}
 
     def report(self, a):
         """The worker's one-line report: the content of REPORT_PATH read with `kubectl exec head`, so nothing of the
@@ -751,8 +790,10 @@ class Launcher:
                 raise CloudError("unknown worker %s" % worker, EXIT_USAGE)
             info["rid"], info["cost"] = "pod/" + name, self.cost(pod)
             try:
-                raw = self.kube.exec(name, "head", "-c", "%d" % (REPORT_MAX * 4), REPORT_PATH)   # not keep_stdout: a failed read must be an error, not a "report"
+                raw = self.kube.exec(name, "sh", "-c", REPORT_READ, "sh", REPORT_PATH, "%d" % (REPORT_MAX * 4))   # not keep_stdout: a failed read must be an error, not a "report"
             except CloudError as e:
+                if "not a regular file" in str(e):   # a link or a device the worker put there could name a secret mount
+                    raise CloudError("report refused: %s is not a regular file in %s" % (REPORT_PATH, worker))
                 if "No such file" in str(e) or "cannot open" in str(e):
                     raise CloudError("no report yet: %s is missing in %s" % (REPORT_PATH, worker))
                 raise
@@ -899,6 +940,8 @@ def build_parser():
     c.add_argument("--password-fd", type=int, help="a file descriptor the caller holds; the password is written there once")
     s = cmd("stop")
     s.add_argument("--reason", default="")
+    s.add_argument("--record-dir", help="where the run record goes (default: $CW_RUN_RECORD_DIR, else runs/ beside the audit file)")
+    s.add_argument("--no-record", action="store_true", help="write no run record (a record is the default: every stop makes one)")
     e = cmd("extend")
     e.add_argument("--hard")
     e.add_argument("--idle")
@@ -908,6 +951,9 @@ def build_parser():
     d.add_argument("--reason", default="")
     cmd("status")
     cmd("report")
+    pr = cmd("prune-records", worker=False)
+    pr.add_argument("--days", type=int, help="remove run records older than this many days (default: $CW_RECORD_KEEP_DAYS, else 30)")
+    pr.add_argument("--record-dir")
     r = cmd("reap", worker=False)
     r.add_argument("--loop", type=int, help="seconds between passes (default: one pass)")
     return p
@@ -939,7 +985,7 @@ def main(argv=None, env=None, clock=None, sleep=time.sleep):
                 if not a.loop:
                     return EXIT_HOOK if any(c for _, _, c in res) else 0
                 sleep(min(a.loop, 60))  # never slower than the contract's once a minute
-        result = getattr(L, a.cmd)(a)
+        result = getattr(L, a.cmd.replace("-", "_"))(a)
         print(result["report"] if a.cmd == "report" and not a.json else json.dumps(result, sort_keys=True))
         return 0
     except CloudError as e:
