@@ -28924,12 +28924,13 @@ class TestImpactHold(LedgerBase):
         matches = sb.impact_floor.matches
         missing = sorted("%s:%s" % (f, n) for f, n in seen if f.endswith(".py") and not matches(f, rule["clear_code_paths"]) and n not in (roots.get(f) or []))
         self.assertEqual(missing, [], "a function the real clear ran in a module that is not refused whole is not in module_roots")
-        # every module that declares a CONFIG_KEY has its config readers run at config load
+        self.assertTrue(seen, "the profile saw the clear run")
+        # every module's config readers run at config load (a key set or not): its validate and settings are roots
         for path in sorted(BIN.glob("*.py")):
             tree = ast.parse(path.read_text())
-            if any(isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "CONFIG_KEY" for t in n.targets) for n in tree.body) and not matches("bin/" + path.name, rule["clear_code_paths"]):
-                readers = [n.name for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("validate", "settings")]
-                self.assertTrue(readers and set(readers) <= set(roots.get("bin/" + path.name) or []), "%s declares a config key: its reader is run at config load" % path.name)
+            readers = [n.name for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("validate", "settings")]
+            if readers and not matches("bin/" + path.name, rule["clear_code_paths"]):
+                self.assertTrue(set(readers) <= set(roots.get("bin/" + path.name) or []), "%s has a config reader (%s) that is not a root" % (path.name, readers))
         self.assertIn("one_line", roots["bin/decision_core.py"])
         # a module is judged on its import-time code too, and a function the clear does not run stays allowed
         module = sb.load_module("delegated_clear")
@@ -28942,6 +28943,12 @@ class TestImpactHold(LedgerBase):
         self.assertTrue(judge(mod, mod.replace("import os", "import sys"), ["one_line"]), "an import")
         self.assertTrue(judge(mod, mod.replace("def one_line(x):\n    return x", "def one_line(x):\n    return 1"), ["one_line"]), "a function the clear runs")
         self.assertEqual(judge(mod, mod.replace("def ordinary(x):\n    return x", "def ordinary(x):\n    return 2"), ["one_line"]), [], "an ordinary function")
+        more = mod + "\nclass Thing:\n    LIMIT = 1\n\n    def method(self):\n        return 1\n"
+        self.assertTrue(judge(more, more.replace("LIMIT = 1", "LIMIT = 2"), ["one_line"]), "a class body runs at import")
+        self.assertEqual(judge(more, more.replace("return 1\n", "return 5\n", 1) if False else more.replace("        return 1", "        return 7"), ["one_line"]), [], "a method body does not")
+        self.assertTrue(judge(mod, mod.replace("def ordinary(x):", "def ordinary(x=print(1)):"), ["one_line"]), "a default runs at import")
+        self.assertTrue(judge(mod, mod.replace("def ordinary(x):", "@hook\ndef ordinary(x):"), ["one_line"]), "a decorator runs at import")
+        self.assertTrue(judge(mod, mod.replace("def ordinary(x):", "def ordinary(\n        x):"), ["one_line"]), "a signature line runs at import")
 
     def test_the_blobs_are_read_at_the_merge_base_not_the_branch_tip(self):
         self.delegate()
@@ -29252,6 +29259,7 @@ class TestImpactHold(LedgerBase):
             self.assertIsNone(sb.delegated_clear_map(None, None, "acme-org/widget-api", item, "b" * 40, rule), "a blob that does not decode")
             answers["contents/bin/fleet-switchboard"] = [{"name": "x"}]
             self.assertIsNone(sb.delegated_clear_map(None, None, "acme-org/widget-api", item, "b" * 40, rule), "a directory, not a file")
+            self.assertIsNone(sb.delegated_clear_map(None, None, "acme-org/widget-api", item, None, rule), "no merge-base: refused")
             self.assertTrue(rule["closure_roots"] and set(rule["closure_roots"]) <= set(rule["clear_entry_points"]), "the roots are entry points")
 
     def test_a_repeated_order_number_makes_the_whole_feature_off(self):

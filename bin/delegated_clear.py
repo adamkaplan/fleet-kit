@@ -128,6 +128,17 @@ DEF_KINDS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 BIND_KINDS = (ast.Assign, ast.AnnAssign, ast.AugAssign)
 
 
+def import_time(node, number):
+    """True when line `number` of the definition `node` RUNS WHEN THE MODULE IS IMPORTED: a decorator, a signature (defaults, annotations, bases) or, in a class, anything that is not inside a method's body.
+    A function's own body does not run at import."""
+    if isinstance(node, ast.ClassDef):
+        for child in node.body:
+            if isinstance(child, DEF_KINDS) and _span(child)[0] <= number <= child.end_lineno:
+                return import_time(child, number)
+        return True
+    return number < node.body[0].lineno
+
+
 def _span(node):
     start = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
     return start, node.end_lineno
@@ -174,7 +185,7 @@ def closure(tree, roots):
                     refs.add(x.id)
                     if x.id in defs:
                         todo.append(x.id)
-                    elif x.id in binds and x.id not in globals_:
+                    if x.id in binds and x.id not in globals_:   # a name that is a def AND is rebound (`f = wrap(f)`): both are followed
                         globals_.add(x.id)
                         nodes.extend(binds[x.id])
     return seen, globals_, refs
@@ -235,6 +246,8 @@ def closure_refusals(base_src, head_src, patch, roots, entry_points, module_leve
                     used = entry_points & {x.id for x in ast.walk(owner) if isinstance(x, ast.Name)}
                     if owner.name in in_defs:
                         reasons.append("it changes %s, part of the clear (%s file)" % (owner.name, side))
+                    elif module_level and import_time(owner, number):
+                        reasons.append("it changes import-time code of a module the clear loads (%s line %d, in %s): refused" % (side, number, owner.name))
                     elif used:
                         reasons.append("it changes %s, which refers to a clear entry point (%s)" % (owner.name, ", ".join(sorted(used)[:3])))
                 elif isinstance(owner, BIND_KINDS + (ast.Import, ast.ImportFrom)):

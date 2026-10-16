@@ -19712,6 +19712,8 @@ def delegated_clear_map(engine, runner, repo, item, base_sha, rule):
     """[reasons] for ONE changed file of the daemon's own (`closure_refusals` over its text before and after and its patch), or None when it cannot be read or mapped. The text comes from the
     git blobs API (the contents API refuses a file this large): the head's blob id is the file's own `sha`, the base's is the file's own `sha` at the base commit. #661."""
     try:
+        if not isinstance(base_sha, str) or not base_sha:
+            return None   # no merge-base: nothing to read the old text from
         module = load_module("delegated_clear")
         entry = _gh_json(engine, runner, repo, "repos/%s/contents/%s?ref=%s" % (repo, item["filename"], base_sha))
         base_blob = entry["sha"] if isinstance(entry, dict) and entry.get("type") == "file" else None

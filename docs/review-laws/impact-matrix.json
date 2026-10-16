@@ -325,6 +325,7 @@
         "bin/cpu_guard.py": ["settings", "validate"],
         "bin/decision_core.py": ["one_line"],
         "bin/disk_janitor.py": ["settings", "validate"],
+        "bin/fleet_health.py": ["validate"],
         "bin/heavy_slots.py": ["settings"],
         "bin/queue_ejections.py": ["validate"],
         "bin/reds.py": ["settings"],
