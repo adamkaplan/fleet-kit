@@ -169,7 +169,7 @@ class Record(td.Driver):
         execs = [json.loads(x) for x in self.read(self.env["FAKE_KUBE_CALLS"]).splitlines() if '"exec"' in x]
         used = [c[c.index("--") + 1] for c in execs]
         self.assertEqual(used, ["head"])
-        self.assertFalse([c for c in execs if "fleet-switchboard" in " ".join(c)])
+        self.assertFalse([c for c in execs if "switchboard" in " ".join(c)])
         self.assertEqual(self.audit_lines()[-1]["action"], "report")
 
     def test_s6_a_long_report_is_cut_to_2000_characters(self):
