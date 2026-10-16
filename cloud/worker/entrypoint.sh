@@ -48,18 +48,20 @@ XDG_CONFIG_HOME="$cfgdir"; export XDG_CONFIG_HOME
 if usable git-token; then
   bin="$TMP/bin"
   ( umask 077; mkdir -p "$bin" )
-  # The helper answers only for https://github.com: the token is never offered to another host.
-  cat > "$bin/git-credential-cw" <<'H'
+  tokfile="$RUN/git-token"   # baked into the generated files: a caller's CW_RUN_DIR changes nothing
+  # The helper answers only for https://github.com: the token is never offered to another host. At every call the token
+  # file must be readable and not empty, or the call fails with one line (never an empty password, never a value).
+  cat > "$bin/git-credential-cw" <<H
 #!/bin/sh
-[ "${1:-}" = get ] || exit 0
+[ "\${1:-}" = get ] || exit 0
 proto="" host=""
 while IFS='=' read -r k v; do
-  case "$k" in protocol) proto=$v;; host) host=$v;; "") break;; esac
+  case "\$k" in protocol) proto=\$v;; host) host=\$v;; "") break;; esac
 done
-[ "$proto" = https ] && [ "$host" = github.com ] || exit 0
-printf 'username=x-access-token\npassword='
-tr -d '\r\n' < "${CW_RUN_DIR:-/run/cw}/git-token"
-printf '\n'
+[ "\$proto" = https ] && [ "\$host" = github.com ] || exit 0
+tok=\$({ tr -d '\\r\\n' < "$tokfile"; } 2>/dev/null) || tok=""
+if [ -z "\$tok" ]; then echo "worker: the git token file is unreadable or empty" >&2; exit 1; fi
+printf 'username=x-access-token\\npassword=%s\\n' "\$tok"
 H
   chmod 755 "$bin/git-credential-cw"
   real_gh=$(command -v gh || true)
@@ -67,7 +69,9 @@ H
     cat > "$bin/gh" <<H
 #!/bin/sh
 # the token is read for this one call and lives only in the environment of that gh process
-GH_TOKEN=\$(tr -d '\r\n' < "\${CW_RUN_DIR:-/run/cw}/git-token") exec "$real_gh" "\$@"
+tok=\$({ tr -d '\\r\\n' < "$tokfile"; } 2>/dev/null) || tok=""
+if [ -z "\$tok" ]; then echo "worker: the git token file is unreadable or empty" >&2; exit 1; fi
+GH_TOKEN=\$tok exec "$real_gh" "\$@"
 H
     chmod 755 "$bin/gh"
   fi

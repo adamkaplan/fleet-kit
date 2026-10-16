@@ -42,8 +42,10 @@ if st.get("fail_cmd") == cmd and not (cmd == "delete" and st.get("fail_cmd_only_
     echo = os.environ.get("FAKE_KUBE_ECHO", "")
     print(json.dumps({"error": echo, "pushed": False}))
     print("Error from server (Forbidden): quota says %s" % echo, file=sys.stderr); sys.exit(1)
-def save():
-    json.dump(st, open(path, "w"))
+def save():  # atomic: a test reading the state meanwhile never sees a half-written file
+    with open(path + ".tmp%d" % os.getpid(), "w") as f:
+        json.dump(st, f)
+    os.replace(path + ".tmp%d" % os.getpid(), path)
 def missing(what):
     print('Error from server (NotFound): %s not found' % what, file=sys.stderr); sys.exit(1)
 if cmd == "apply":
@@ -53,6 +55,7 @@ if cmd == "apply":
     st.setdefault("applied", []).append(obj)
     if obj["kind"] == "Secret":
         st.setdefault("secrets", {})[obj["metadata"]["name"]] = 1
+        st.setdefault("secret_labels", {})[obj["metadata"]["name"]] = obj["metadata"].get("labels", {})
     else:
         obj["status"] = {"phase": "Pending" if st.get("never_ready") else "Running",
                          "conditions": [] if st.get("never_ready") else [{"type": "Ready", "status": "True"}]}
@@ -86,6 +89,9 @@ elif cmd == "label" and args[1] == "secret":
     save()
 elif cmd == "port-forward":  # become the stub headless server on the local port, so the caller can end us
     os.execv(sys.executable, [sys.executable, os.path.join(HERE, "..", "..", "worker", "tests", "stub_server.py"), args[2].split(":")[0]])
+elif cmd == "get" and args[1] == "secret":
+    if args[2] not in st.get("secrets", {}): missing('secrets "%s"' % args[2])
+    print(json.dumps({"metadata": {"name": args[2], "labels": st.get("secret_labels", {}).get(args[2], {})}}))
 elif cmd == "get" and args[1] == "pod":
     if args[2] not in st.get("pods", {}): missing('pods "%s"' % args[2])
     print(json.dumps(st["pods"][args[2]]))

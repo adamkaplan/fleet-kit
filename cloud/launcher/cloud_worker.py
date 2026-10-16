@@ -36,6 +36,7 @@ LABEL = "cw-worker"
 REPORT_PATH = "/home/worker/report"  # the worker's final one-line report, written here inside the pod (the image's workdir)
 REPORT_MAX = 2000
 EXIT_DONE, EXIT_HOOK, EXIT_USAGE, EXIT_CLOUD, EXIT_TIMEOUT, EXIT_CAP, EXIT_REFUSED = 0, 1, 2, 3, 4, 5, 6
+EXIT_EXISTS = 7  # create found a worker of that name already there: this call made nothing and touched nothing
 
 CREDENTIAL_PATTERNS = [re.compile(p) for p in (
     r"gh[pousr]_[A-Za-z0-9]{20,}", r"github_pat_[A-Za-z0-9_]{20,}", r"sk-[A-Za-z0-9]{20,}", r"AKIA[0-9A-Z]{16}",
@@ -323,7 +324,11 @@ class Kube:
             raise CloudError("delete incomplete; REMAINS: %s; delete each with: %s" % (
                 ", ".join("%s/%s" % x for x in left), "; ".join(self.delete_command(k, o) for k, o in left)))
 
-    def create_run_secret(self, name, pod, values):
+    def get_run_secret(self, name):
+        out = self.run(["get", "secret", name + "-run", "-o", "json"], ok_missing=True)
+        return json.loads(out) if out else None
+
+    def create_run_secret(self, name, pod, values, run_id=None):
         """One Secret per run. Each value goes to kubectl's stdin (--from-file=KEY=/dev/stdin, or a patch file on stdin
         for the keys after the first), never into an argument."""
         items = sorted(values.items())
@@ -332,7 +337,7 @@ class Kube:
         for key, val in items[1:]:
             body = json.dumps({"data": {key: base64.b64encode(val.encode()).decode()}})
             self.run(["patch", "secret", name + "-run", "--type=merge", "--patch-file=/dev/stdin"], stdin=body)
-        self.run(["label", "secret", name + "-run", "cw/pod=" + pod])
+        self.run(["label", "secret", name + "-run", "cw/pod=" + pod] + (["cw/run-id=" + run_id] if run_id else []))
 
     def exec(self, name, *cmd, keep_stdout=False):
         return self.run(["exec", name, "--"] + list(cmd), keep_stdout=keep_stdout)
@@ -402,7 +407,8 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
         "name": name, "labels": {"app": LABEL, "cw/worker": worker, "azure.workload.identity/use": "true"},
         "annotations": {"cw/worker": worker, "cw/started": iso(now), "cw/hard-deadline": iso(hard),
                         "cw/idle-seconds": e["CW_IDLE_SECONDS"], "cw/shape": a.shape,
-                        "cw/max-hard": iso(now + dt.timedelta(seconds=parse_duration(a.max_hard)))}},
+                        "cw/max-hard": iso(now + dt.timedelta(seconds=parse_duration(a.max_hard))),
+                        **({"cw/run-id": a.run_id} if getattr(a, "run_id", None) else {})}},
         "spec": {"restartPolicy": "Never", "serviceAccountName": env.get("CW_CLOUD_SERVICE_ACCOUNT", "cw-worker"),
                   "automountServiceAccountToken": False,
                   "securityContext": {"runAsNonRoot": True, "runAsUser": SERVER_UID, "runAsGroup": SERVER_UID,
@@ -508,17 +514,17 @@ class Launcher:
             if hits:
                 raise CloudError("refusing a pod spec with a stored credential: %s" % ", ".join(hits), EXIT_USAGE)
             if self.kube.get_pod(name):
-                raise CloudError("worker %s already exists" % worker, EXIT_USAGE)
+                raise CloudError("worker %s already exists" % worker, EXIT_EXISTS)
             password = secrets.token_urlsafe(32)
             self.kube.add_secrets(password)
             # Single operator assumed: the check above and the applies below are not one atomic step.
             try:
                 made["secret"] = True
-                self.kube.apply({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": name + "-pw", "labels": {"app": LABEL}},
+                self.kube.apply({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": name + "-pw", "labels": dict({"app": LABEL}, **({"cw/run-id": a.run_id} if getattr(a, "run_id", None) else {}))},
                                  "type": "Opaque", "stringData": {"password": password}})
                 if run_values:
                     made["run"] = True
-                    self.kube.create_run_secret(name, name, run_values)
+                    self.kube.create_run_secret(name, name, run_values, *([a.run_id] if getattr(a, "run_id", None) else []))
                 made["pod"] = True
                 self.kube.apply(spec)
                 self._wait_ready(name, a.wait)
@@ -831,6 +837,8 @@ def build_parser():
     c.add_argument("--pull-secret", help="name of an existing image-pull Secret (pull-only) for imagePullSecrets")
     c.add_argument("--run-secret-fd", action="append", default=[], metavar="NAME=N",
                    help="repeatable; the value is read from inherited descriptor N and piped to kubectl's stdin into the run's one Secret, mounted read-only at /run/cw/NAME (0400), deleted with the pod")
+    c.add_argument("--run-id", type=_run_id,
+                   help="a caller's nonce (lowercase hex), recorded on the pod and Secrets it creates so the caller can prove they are its own")
     c.add_argument("--password-fd", type=int, help="a file descriptor the caller holds; the password is written there once")
     s = cmd("stop")
     s.add_argument("--reason", default="")
@@ -846,6 +854,12 @@ def build_parser():
     r = cmd("reap", worker=False)
     r.add_argument("--loop", type=int, help="seconds between passes (default: one pass)")
     return p
+
+
+def _run_id(v):
+    if not re.fullmatch(r"[0-9a-f]{8,64}", v):
+        raise argparse.ArgumentTypeError("--run-id is 8 to 64 lowercase hex characters")
+    return v
 
 
 def main(argv=None, env=None, clock=None, sleep=time.sleep):

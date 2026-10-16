@@ -163,6 +163,45 @@ class Entrypoint(unittest.TestCase):
         self.assertIn("left in the environment: nothing", r.stdout)
         self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.tmpfs, "bin")).st_mode), 0o700)
 
+    def test_s4_a_token_file_that_vanishes_or_empties_makes_the_helper_and_the_wrapper_fail_with_one_line(self):
+        self.assertEqual(self.start().returncode, 0)
+        helper, gh = os.path.join(self.tmpfs, "bin", "git-credential-cw"), os.path.join(self.tmpfs, "bin", "gh")
+        path = os.path.join(self.run_dir, "git-token")
+        os.chmod(path, 0o600)
+        for how in ("vanished", "empty", "only a newline"):
+            with self.subTest(how=how):
+                if how == "vanished":
+                    os.remove(path)
+                else:
+                    with open(path, "w") as f:
+                        f.write("" if how == "empty" else "\n")
+                h = subprocess.run([helper, "get"], input="protocol=https\nhost=github.com\n\n", capture_output=True, text=True,
+                                   env={"PATH": self.bin + ":/usr/bin:/bin"})
+                self.assertNotEqual(h.returncode, 0)
+                self.assertNotIn("password", h.stdout)   # never an empty password
+                w = subprocess.run([gh], capture_output=True, text=True, env={"PATH": self.bin + ":/usr/bin:/bin"})
+                self.assertNotEqual(w.returncode, 0)
+                self.assertNotIn("gh token length", w.stdout)   # the real gh was never run with an empty token
+                for r in (h, w):
+                    self.assertEqual(len(r.stderr.strip().splitlines()), 1, r.stderr)
+                    self.assertIn("git token file is unreadable or empty", r.stderr)
+                    self.assert_not_printed(r.stdout + r.stderr, "a failed read")
+
+    def test_s4_the_helper_and_the_wrapper_use_the_baked_directory_not_the_callers_cw_run_dir(self):
+        self.assertEqual(self.start().returncode, 0)
+        other = os.path.join(self.d, "other")
+        os.mkdir(other)
+        with open(os.path.join(other, "git-token"), "w") as f:
+            f.write("a-token-from-another-directory")
+        env = {"PATH": self.bin + ":/usr/bin:/bin", "CW_RUN_DIR": other}
+        h = subprocess.run([os.path.join(self.tmpfs, "bin", "git-credential-cw"), "get"], input="protocol=https\nhost=github.com\n\n",
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(h.stdout, "username=x-access-token\npassword=%s\n" % GIT)
+        w = subprocess.run([os.path.join(self.tmpfs, "bin", "gh")], capture_output=True, text=True, env=env)
+        self.assertIn("gh token length %d" % len(GIT), w.stdout)
+        for name in ("git-credential-cw", "gh"):
+            self.assertNotIn("CW_RUN_DIR", read(os.path.join(self.tmpfs, "bin", name)))
+
     def test_s4_a_present_file_that_is_unreadable_or_empty_refuses_and_never_falls_back(self):
         for name in ("model-auth", "git-token", "server-password"):
             for how in ("empty", "unreadable"):
