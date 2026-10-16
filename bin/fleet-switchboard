@@ -19688,6 +19688,28 @@ def delegated_clear_checks(engine, runner, now, kind, number):
     return {"number": number, "text": re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", text)}, None
 
 
+def delegated_clear_map(engine, runner, repo, item, base_sha, rule):
+    """[reasons] for ONE changed file of the daemon's own (`closure_refusals` over its text before and after and its patch), or None when it cannot be read or mapped. The text comes from the
+    git blobs API (the contents API refuses a file this large): the head's blob id is the file's own `sha`, the base's is found in the directory listing of the base commit. #661."""
+    try:
+        module = load_module("delegated_clear")
+        directory, name = item["filename"].rsplit("/", 1)
+        listing = _gh_json(engine, runner, repo, "repos/%s/contents/%s?ref=%s" % (repo, directory, base_sha))
+        base_blob = next(e["sha"] for e in listing if isinstance(e, dict) and e.get("name") == name and e.get("type") == "file")
+        base = module.decode_blob(_gh_json(engine, runner, repo, "repos/%s/git/blobs/%s" % (repo, base_blob)))
+        head = module.decode_blob(_gh_json(engine, runner, repo, "repos/%s/git/blobs/%s" % (repo, item["sha"])))
+        if base is None or head is None or not isinstance(item.get("patch"), str):
+            return None
+        return module.closure_refusals(base, head, item["patch"], list(rule["closure_roots"]), set(rule["clear_entry_points"]))
+    except Exception:
+        return None
+
+
+def _gh_json(engine, runner, repo, path):
+    done = _gh_write(engine, runner, repo, path, "GET")
+    return json.loads(done.stdout or "null")
+
+
 def delegated_clear_pr_checks(engine, runner, repo, number):
     """(report, None) when this pull request may be cleared under an order, else (None, why). The owner-hold decision is the daemon's own (`pr_floor_report`: no second rule), the rule (the classes
     never delegated and the clear code) is the matrix's `owner_hold.delegated_clear`; anything unreadable is refused. #661."""
@@ -19709,14 +19731,19 @@ def delegated_clear_pr_checks(engine, runner, repo, number):
             files = None   # more than 3000 files: not read in full
     except Exception:
         files = None
+    module, base_sha, closure = load_module("delegated_clear"), None, {}
     if files is not None:   # the file list and the decision must be of ONE head: the head read again after the files must still be the one the decision read
         try:
-            after = (get("repos/%s/pulls/%d" % (repo, number)).get("head") or {}).get("sha")
+            pull = get("repos/%s/pulls/%d" % (repo, number))
+            after, base_sha = (pull.get("head") or {}).get("sha"), (pull.get("base") or {}).get("sha")
         except Exception:
             after = None
         if after != report.get("head"):
             return None, "the pull request's head moved while it was being checked (%s, then %s): nothing was cleared" % (str(report.get("head"))[:8], str(after)[:8])
-    reasons = load_module("delegated_clear").refusals(rule, report, files, impact_floor.matches, impact_floor.matches_named)
+        for item in files:   # a changed file of the daemon's own: each changed LINE is mapped to its definition by the ast of the file it belongs to
+            if isinstance(item.get("filename"), str) and impact_floor.matches(item["filename"], (rule or {}).get("closure_files") or []) and item.get("status") == "modified":
+                closure[item["filename"]] = delegated_clear_map(engine, runner, repo, item, base_sha, rule)
+    reasons = module.refusals(rule, report, files, impact_floor.matches, closure)
     if reasons:
         return None, "; ".join(reasons)
     return report, None

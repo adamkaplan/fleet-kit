@@ -286,7 +286,7 @@
     },
     "note": "top_tier_outside_floor lists the top tier paths that are deliberately not in the floor globs (the floor excludes agent definitions, which are captain pull requests); a test checks that every other top tier path is inside the floor. bin/fleet-switchboard selects accounts and mints tokens but is not a top tier path (it would hold nearly every change): a change there to credentials or identity must be rated with that class by the independent review.",
     "delegated_clear": {
-      "meaning": "What the Chief of Staff's clear under the owner's standing order may NEVER lift (bin/delegated_clear.py reads this block and holds no path or class of its own): a pull request whose top tier path hits include a class of `never_path_classes`, whose independent review's class is one of `top_tier_review_classes`, or that adds, changes, deletes or renames ANY file matching `clear_code_paths` (globs, judged by the floor's own case- and normalisation-insensitive matcher: everything the daemon and the CLI execute or load at start, the clear command and its helpers, this rule's own data) and is not matched by `clear_code_exclude` (the test file: it is never loaded). A pull request that touches the daemon file stays the owner's own clear. Functions are NOT inferred from hunks.",
+      "meaning": "What the Chief of Staff's clear under the owner's standing order may NEVER lift (bin/delegated_clear.py reads this block and holds no path, class or function name of its own): a pull request whose top tier path hits include a class of `never_path_classes`; whose independent review's class is one of `top_tier_review_classes` (or none is recorded); that changes ANY file matching `clear_code_paths` (the clear and hold machinery by name, and the directories the daemon and the CLI load at start); that ADDS, DELETES or RENAMES a file matching `new_file_globs` (a new file under bin/ is loaded at config load); or that changes a file of `closure_files` (the daemon file) on a line that belongs to the CLEAR CLOSURE: the definitions reachable by name from `closure_roots`, the module-level bindings they read, any other top-level statement, or a definition that refers to a `clear_entry_points` name. Other changes under bin/ (an authority module edit that does not change who may do what) are allowed.",
       "never_path_classes": [
         "credentials",
         "identity"
@@ -297,16 +297,42 @@
         "authority"
       ],
       "clear_code_paths": [
-        "bin/**",
+        "docs/review-laws/impact-matrix.json",
+        "bin/delegated_clear.py",
+        "bin/chat_clear.py",
+        "bin/clear_carry.py",
+        "bin/impact_hold.py",
+        "bin/impact_floor.py",
         "plugins/fleet-hooks/**",
         "shims/**",
         "templates/**",
         "tools/cos-permissions-proof/**",
-        ".github/workflows/**",
-        "docs/review-laws/impact-matrix.json"
+        ".github/workflows/**"
       ],
-      "clear_code_exclude": [
-        "bin/test-switchboard"
+      "new_file_globs": [
+        "bin/**"
+      ],
+      "closure_files": [
+        "bin/fleet-switchboard"
+      ],
+      "closure_roots": [
+        "cmd_impact_clear",
+        "delegated_clear_checks",
+        "delegated_clear_pr_checks",
+        "impact_clear_core"
+      ],
+      "clear_entry_points": [
+        "impact_clear_core",
+        "cmd_impact_clear",
+        "delegated_clear_checks",
+        "delegated_clear_pr_checks",
+        "chat_clear_apply",
+        "chat_clear_pass",
+        "write_impact_state",
+        "impact_state_lock",
+        "notify_clear",
+        "neutralise_marker",
+        "gates_caller_kind"
       ]
     }
   }
