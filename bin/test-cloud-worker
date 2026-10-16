@@ -153,9 +153,13 @@ if "port-forward" in args:
         import time
         time.sleep(600)
     local = int(args[args.index("port-forward") + 2].split(":")[0])
+    if os.path.exists(d + "/pf_squat"):
+        import time
+        time.sleep(600)
     target = int(os.environ["STUB_URL"].rsplit(":", 1)[1])
     srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", local)); srv.listen(8)
+    print("Forwarding from 127.0.0.1:" + str(local) + " -> 4096", flush=True)
     def pipe(a, b):
         try:
             while True:
@@ -486,11 +490,12 @@ class TestWiring(Base):
         self.assertTrue(any("model-auth=" in a for a in self.stub_calls()[0]))
 
     def test_s2_send_read_and_status_each_open_and_close_their_own_tunnel(self):
+        baseline = self.main("status")[0]   # the base status reflects the daemon and herdr (absent here); a cloud worker adds no failure of its own
         self.assertEqual(self.launch()[0], 0)
         for argv in (("send", "coder7", "hi"), ("read", "coder7"), ("status",)):
             before = len([e for e in self.jsonl("kubectl.log") if "port-forward" in e["args"]])
             code, out, err = self.main(*argv)
-            self.assertEqual(code, 0 if argv[0] != "status" else code, err)
+            self.assertEqual(code, baseline if argv[0] == "status" else 0, err)
             after = [e for e in self.jsonl("kubectl.log") if "port-forward" in e["args"]]
             self.assertEqual(len(after), before + 1, argv)
             self.assertEqual(self.pf_alive(), [], argv)
@@ -697,6 +702,20 @@ class TestWiring(Base):
         self.assertEqual(self.leftovers(), [])
         self.assertEqual(self.stub_calls(), [])
 
+    def test_g_a_port_taken_by_another_process_is_never_trusted(self):
+        """The readiness is kubectl's own word that it forwards on THIS port; a stranger that answers there gets nothing (no password)."""
+        self.assertEqual(self.launch()[0], 0)
+        stranger = FakeRemote("someone-else")
+        self.addCleanup(stranger.close)
+        (self.stub_dir / "pf_squat").write_text("")   # kubectl never says it forwards
+        with mock.patch.dict(os.environ, {"CW_TUNNEL_TIMEOUT": "2"}):
+            before = len(self.remote.requests)
+            code, out, err = self.main("read", "coder7")
+        self.assertEqual(code, 1)
+        self.assertIn("did not open", err)
+        self.assertEqual(len(self.remote.requests), before)
+        self.assertNothingKept()
+
     def test_g_two_commands_at_once_have_their_own_directories(self):
         module = sb.load_module("cloud_worker").bind(vars(sb))
         with module.Cluster() as first, module.Cluster() as second:
@@ -705,7 +724,7 @@ class TestWiring(Base):
             self.assertEqual(oct(os.stat(first.dir).st_mode & 0o777), "0o700")
         self.assertEqual(self.leftovers(), [])
 
-    def test_g_kubectl_killed_mid_use_is_an_error_not_a_hang(self):
+    def test_g_kubectl_that_exits_at_start_is_an_error_not_a_hang(self):
         self.assertEqual(self.launch()[0], 0)
         (self.stub_dir / "pf_die").write_text("")
         code, out, err = self.main("read", "coder7")

@@ -698,18 +698,19 @@ def tunnel(cluster, record):
             raise CloudError("cannot open the tunnel: %s" % (err.strerror or err)) from None
     try:
         deadline = time.monotonic() + float(os.environ.get("CW_TUNNEL_TIMEOUT") or 30)
+        ready = ("Forwarding from 127.0.0.1:%d" % port).encode()
         while True:
             try:
-                socket.create_connection(("127.0.0.1", port), timeout=1).close()
-                break
+                with open(log_path, "rb") as log:
+                    said = log.read(4000)
             except OSError:
-                pass
+                said = b""
+            # ready only when OUR kubectl says it is forwarding on this port and is still alive: a port that merely answers might be another
+            # process that took it first, and the worker's password must never go there
+            if ready in said and child.poll() is None:
+                break
             if child.poll() is not None or time.monotonic() >= deadline:
-                try:
-                    with open(log_path, "rb") as log:
-                        why = log.read(400).decode("utf-8", "replace")
-                except OSError:
-                    why = ""
+                why = said[:400].decode("utf-8", "replace")
                 raise CloudError("the tunnel to %s did not open%s" % (record.get("worker"), (": " + _one(cluster.clean(why), 160)) if why.strip() else ""))
             time.sleep(0.1)
         yield dict(record, url="http://127.0.0.1:%d" % port)
@@ -735,7 +736,7 @@ def model_entry():
     path = os.environ.get("CW_MODEL_AUTH_FILE") or os.path.expanduser("~/.local/share/opencode/auth.json")
     try:
         with open(path) as handle:
-            entry = json.load(handle).get(MODEL_PROVIDER)
+            entry = json.loads(handle.read(1000001)[:1000000]).get(MODEL_PROVIDER)
     except (OSError, ValueError, AttributeError):
         entry = None
     if not entry or not isinstance(entry, dict):
@@ -805,6 +806,7 @@ def cmd_launch(args, runner, now):
                 code, body, note = run_launcher(runner, "create", name, options, LAUNCH_SECONDS, password_fd=write_fd, cluster=cluster,
                                                 secrets=[("model-auth", model), ("git-token", token)])
             except CloudError as err:
+                _stop_after_failure(engine, runner, name, "launch: the launcher did not finish", cluster)   # a pod made just before the cut is stopped too
                 raise LaunchError(str(err)) from None
             except BaseException:
                 os.close(write_fd)
