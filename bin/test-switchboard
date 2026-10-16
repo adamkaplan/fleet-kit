@@ -2433,7 +2433,7 @@ class TestFacts(Base):
     def test_the_registration_point_lists_the_lab_source(self):
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts"])
 
 
 # ---------------------------------------------------------------- observing
@@ -9714,7 +9714,7 @@ class TestFrictionWake(FrictionBase):
         self.assertNotIn("friction_wake", sb.DEFAULTS)
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts"])
         self.assertNotIn("friction_wake", sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}))
         self.assertEqual(sb.FRICTION_DEFAULTS, {"enabled": False, "hour": 9, "to": "cos", "cos_to": "improver", "text": None})
         self.make("off")
@@ -38362,6 +38362,246 @@ class TestAnswerARequest(WriteWorld):
         call = [c for c in self.world.v2.calls if "session.form.reply" in c][-1]
         self.assertEqual(call[3:], ["--param", "sessionID=" + self.sid, "--param", "formID=" + form["id"],
                                     "-d", '{"answer":{"db":"x"}}'])
+
+
+class TestHeadlessAnswerPath(WriteWorld):
+    """#433 slice 4 (S1, S2, S3, S7): a worker with NO terminal that needs an answer reaches its boss and is answered through the switchboard."""
+
+    def setUp(self):
+        super().setUp()
+        self.ap = sb.load_agent_presence()
+        self.sid = self.world.v2.create_session({"fleet": {"name": "hw", "role": "coder", "reports_to": "api-orch", "headless": True}}, directory=str(self.home))
+        self.ap.save_record(self.world.state, "hw", self.sid, None, now=self.world.clock.now())
+        self.world.v2.start_turn(self.sid, "work", False, lasts=86400)
+
+    def facts(self):
+        self.world.engine.discover(self.world.clock.now())
+        return [f for f in self.world.engine.collect_facts()[0] if f.kind == sb.WORKER_BLOCKED]
+
+    def test_a_permission_and_then_a_question_each_wake_the_boss_and_are_answered_through_decisions_to_the_right_request(self):
+        permission = self.world.v2.ask_permission(self.sid, resources=["ls"], timed=True)
+        first = self.facts()
+        self.assertEqual([(f.recipient, "permission" in f.summary, "hw" in f.summary) for f in first], [("api-orch", True, True)])
+        form = self.world.v2.ask_form(self.sid)
+        both = self.facts()
+        self.assertEqual(sorted(f.recipient for f in both), ["api-orch", "api-orch"])
+        self.assertEqual(len([f for f in both if "question" in f.summary]), 1)
+        self.as_agent("cos")
+        code, out, err = self.main("decisions", "answer", self.id_of("shell ls"), "allow")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.world.v2.permission_replies, [{"session": self.sid, "request": permission["id"], "decision": "once", "message": None}])
+        code, out, err = self.main("decisions", "answer", self.id_of("Which database?"), "db1")
+        self.assertEqual(code, 0, err)
+        self.assertEqual([(r["session"], r["form"]) for r in self.world.v2.form_replies], [(self.sid, form["id"])])
+        self.assertEqual(len(self.audit_events("decisions.answer")), 4, "two intents and two results")
+        self.assertEqual(self.facts(), [], "nothing is pending any more")
+
+    def test_a_blocked_headless_worker_stays_blocked_and_is_never_read_as_working_for_30_passes(self):
+        self.world.v2.ask_permission(self.sid, timed=True)
+        states = []
+        for _ in range(30):
+            self.world.tick(60)
+            states.append(self.world.engine.discover(self.world.clock.now()).agents["hw"].status)
+        self.assertEqual(states, ["blocked"] * 30)
+
+    def test_an_answer_from_someone_who_may_not_answer_or_for_a_request_that_is_not_pending_delivers_nothing(self):
+        self.world.v2.ask_permission(self.sid, resources=["ls"], timed=True)
+        ident = self.id_of("shell ls")
+        self.as_agent("api-orch")
+        code, out, err = self.main("decisions", "answer", ident, "allow")
+        self.assertEqual(code, 2)
+        self.as_agent("cos")
+        self.world.v2.answer_permissions(self.sid)                       # answered elsewhere: the request is gone
+        code, out, err = self.main("decisions", "answer", ident, "allow")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(getattr(self.world.v2, "permission_replies", []), [], "no reply reached the service")
+
+
+class TestHeadlessRestartNotice(Base):
+    """#433 slice 4 (S4, S5, S6, U1): a restart of the OpenCode service, or a session that is gone, is told to the worker's boss; never silent."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("boss", "boss2", "termworker"))
+        self.ap = sb.load_agent_presence()
+        self.engine = self.world.new_engine("cli")
+        self.pid = [100]
+        patch = mock.patch.object(sb.V2Client, "service_identity", lambda client: self.pid[0])
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def worker(self, name, boss="boss"):
+        sid = self.world.v2.create_session({"fleet": {"name": name, "role": "coder", "reports_to": boss, "headless": True}}, directory=str(self.home))
+        self.ap.save_record(self.world.state, name, sid, None, now=self.world.clock.now() - 1000)
+        return sid
+
+    def notices(self, kind="headless.restarted"):
+        self.engine.discover(self.world.clock.now())
+        return sorted((f.recipient, f.summary.split(" has no terminal")[0].split(". ")[-1]) for f in self.engine.collect_facts()[0] if f.kind == kind)
+
+    def test_a_restart_tells_each_workers_boss_once_and_a_second_pass_tells_nobody_new(self):
+        self.worker("w1"); self.worker("w2", "boss2"); self.worker("w3")
+        self.assertEqual(self.notices(), [], "the first process id ever seen is recorded, not announced")
+        self.world.tick(60)
+        self.pid[0] = 200
+        first = self.notices()
+        self.assertEqual(first, [("boss", "w1"), ("boss", "w3"), ("boss2", "w2")])
+        self.assertEqual(self.notices(), first, "the same facts again: the delivery key makes them once")
+        keys = {f.key for f in self.engine.collect_facts()[0] if f.kind == "headless.restarted"}
+        self.assertEqual(len(keys), 3)
+        self.assertEqual(sorted(a for a in self.engine.discover(self.world.clock.now()).agents if a.startswith("w")), ["w1", "w2", "w3"], "none is missing from discovery")
+        self.pid[0] = 300
+        self.assertEqual(len({f.key for f in self.engine.collect_facts()[0] if f.kind == "headless.restarted"} - keys), 3, "a second restart is a new notice")
+
+    def test_an_outage_is_not_a_restart_and_a_terminal_worker_gets_no_notice(self):
+        self.worker("w1")
+        self.notices()
+        self.pid[0] = None                                               # the service file is unreadable: unknown, not a new process
+        self.world.v2.down = True
+        found = self.engine.discover(self.world.clock.now()).agents["w1"]
+        self.assertEqual(found.status, "unknown")
+        self.assertEqual(self.notices(), [])
+        self.world.v2.down = False
+        self.pid[0] = 100                                                # back with the same identity
+        self.assertEqual(self.notices(), [])
+        self.pid[0] = 200
+        self.assertEqual([r for r, _ in self.notices()], ["boss"], "only the headless worker, never termworker")
+
+    def test_a_restart_that_happens_during_an_outage_is_told_once_and_an_outage_with_the_same_process_is_not_a_restart(self):
+        self.worker("w1")
+        self.notices()                                                    # pid 100 recorded
+        self.pid[0] = None                                                # the service is down: nothing is compared
+        self.assertEqual(self.notices(), [])
+        self.pid[0] = 200                                                 # it came back as a NEW process
+        first = self.notices()
+        self.assertEqual(first, [("boss", "w1")], "exactly one notice for the restart that happened while it was down")
+        self.assertEqual(len({f.key for f in self.engine.collect_facts()[0] if f.kind == "headless.restarted"}), 1)
+        self.pid[0] = None
+        self.assertEqual(self.notices(), first, "the same single notice while it is down again; no second one")
+        self.pid[0] = 200
+        self.assertEqual(len({f.key for f in self.engine.collect_facts()[0] if f.kind == "headless.restarted"}), 1, "the same restart, the same key")
+
+    def test_the_notice_says_what_is_known_and_does_not_claim_the_session_was_resumed(self):
+        self.worker("w1")
+        self.notices()
+        self.pid[0] = 200
+        self.engine.discover(self.world.clock.now())
+        text = [f.summary for f in self.engine.collect_facts()[0] if f.kind == "headless.restarted"][0]
+        self.assertIn("restarted", text)
+        self.assertIn("poke", text)
+        self.assertNotIn("resumed", text)
+
+    def test_a_problem_in_discovery_holds_back_every_lost_report_and_it_comes_when_the_problem_is_gone(self):
+        sid = self.worker("w1")
+        self.notices("headless.lost")
+        del self.world.v2.sessions[sid]
+        bad = Path(self.world.state) / "headless" / "bad.json"
+        bad.write_text("{not json")
+        bad.chmod(0o600)
+        self.assertEqual(self.notices("headless.lost"), [], "a pass with a problem may only be missing a read: nothing is called lost")
+        bad.unlink()
+        self.assertEqual([r for r, _ in self.notices("headless.lost")], ["boss"])
+
+    def test_a_worker_launched_after_the_restart_is_not_told_it_was_hit(self):
+        self.worker("w1")
+        self.notices()
+        self.pid[0] = 200
+        self.notices()
+        self.world.tick(600)
+        sid = self.world.v2.create_session({"fleet": {"name": "late", "role": "coder", "reports_to": "boss", "headless": True}}, directory=str(self.home))
+        self.ap.save_record(self.world.state, "late", sid, None, now=self.world.clock.now())
+        self.assertEqual([n for _, n in self.notices()], ["w1"])
+
+    def test_a_session_that_is_gone_is_reported_to_its_boss_and_not_listed_as_working(self):
+        sid = self.worker("w1")
+        self.world.v2.sessions[sid]["turn"] = None
+        self.notices("headless.lost")                                    # the boss is remembered while the worker is seen
+        del self.world.v2.sessions[sid]
+        self.pid[0] = 200
+        found = self.engine.discover(self.world.clock.now())
+        self.assertNotIn("w1", found.agents)
+        lost = [f for f in self.engine.collect_facts()[0] if f.kind == "headless.lost"]
+        self.assertEqual([(f.recipient, "no longer exists" in f.summary, "w1" in f.summary) for f in lost], [("boss", True, True)])
+
+    def test_a_lost_worker_with_no_remembered_boss_goes_to_the_chiefs_of_staff_once_and_a_forgotten_boss_is_pruned(self):
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        sid = self.worker("w1")
+        del self.world.v2.sessions[sid]                                   # gone before any pass ever saw it: no boss is remembered
+        lost = [f for f in (self.engine.discover(self.world.clock.now()) and self.engine.collect_facts()[0]) if f.kind == "headless.lost"]
+        self.assertEqual([f.recipient for f in lost], ["cos"])
+        self.assertEqual(len({f.key for f in lost}), 1, "one key per session: delivered once")
+        other = self.worker("w2")
+        self.notices()
+        remembered = json.loads((Path(self.world.state) / sb.HEADLESS_SERVICE_FILE).read_text())
+        self.assertEqual(remembered["bosses"], {"w2": "boss"})
+        self.ap.remove_record(self.world.state, "w2")                    # retired: its record goes, and so does the remembered boss
+        self.notices()
+        self.assertEqual(json.loads((Path(self.world.state) / sb.HEADLESS_SERVICE_FILE).read_text())["bosses"], {})
+
+    def test_a_state_file_that_cannot_be_written_is_said_and_the_restart_notice_still_goes_out(self):
+        self.worker("w1")
+        self.notices()
+        self.pid[0] = 200
+        with mock.patch.object(sb, "_write_small", side_effect=OSError("disk full")):
+            self.engine.discover(self.world.clock.now())
+            facts = [f for f in self.engine.collect_facts()[0] if f.kind == "headless.restarted"]
+        self.assertEqual(len(facts), 1)
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "source.error" and "headless_restart_facts" in str(e)])
+
+    def test_a_service_that_does_not_answer_never_makes_a_worker_lost(self):
+        self.worker("w1")
+        self.notices("headless.lost")
+        self.world.v2.down = True
+        self.assertEqual(self.notices("headless.lost"), [])
+
+
+class TestServiceIdentity(unittest.TestCase):
+    """#433 slice 4: the REAL fresh read of the service's process id (`V2Http.service_identity`), over a temp service file."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.dir), True)
+        self.dir.chmod(0o700)
+        self.file = self.dir / "service.json"
+        self.alive = {111: True, 222: True}
+        self.http = sb.V2Http(self.file, 5, alive=lambda pid: self.alive.get(pid, False))
+
+    def write(self, pid, mode=0o600, password="s3cret-value"):
+        body = {"url": "http://127.0.0.1:49374", "password": password}
+        if pid is not None:
+            body["pid"] = pid
+        self.file.write_text(json.dumps(body))
+        self.file.chmod(mode)
+
+    def test_a_changed_pid_is_seen_on_the_next_call_and_nothing_is_cached(self):
+        self.write(111)
+        self.assertEqual(self.http.service_identity(), 111)
+        self.http.base_url()                                              # a cached connection record exists now
+        self.write(222)
+        self.assertEqual(self.http.service_identity(), 222, "a fresh read, not the cached one")
+
+    def test_a_missing_unsafe_dead_or_odd_pid_gives_none_and_the_password_is_never_returned(self):
+        self.assertIsNone(self.http.service_identity(), "no file")
+        self.write(111, mode=0o644)
+        self.assertIsNone(self.http.service_identity(), "a file others can read is not trusted")
+        self.write(333)
+        self.assertIsNone(self.http.service_identity(), "a pid that is gone")
+        self.write(True)
+        self.assertIsNone(self.http.service_identity(), "a bool is not a pid")
+        self.write(None)
+        self.assertIsNone(self.http.service_identity(), "no pid in the file")
+        self.write(111)
+        self.assertNotIn("s3cret", repr(self.http.service_identity()))
+        self.dir.chmod(0o777)
+        self.assertIsNone(self.http.service_identity(), "a directory others can write is not trusted")
+        self.dir.chmod(0o700)
+
+    def test_load_still_connects_with_the_same_checks(self):
+        self.write(111)
+        self.assertEqual(self.http.base_url(), "http://127.0.0.1:49374")
+        self.write(333)
+        self.http._info = None
+        self.assertIsNone(self.http.base_url(), "a service file naming a dead process is still refused")
 
 
 class TestEscalateARequestOrAReport(WriteWorld):
