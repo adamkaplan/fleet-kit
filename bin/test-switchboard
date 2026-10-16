@@ -55092,6 +55092,129 @@ def main(argv):
     return 0 if ok else 1
 
 
+class TestSlice3Modules(Base):
+    """#437 slice 3: the loaders come from one generator, three more modules declare their own key, and two modules added on two branches never touch a shared line."""
+
+    OLD = [   # what validate_config said before the move (recorded from the previous program): the error text is the contract
+        ("temp_janitor", {"days": 0}, "config: temp_janitor.days must be a whole number from 1 to 365, got 0"),
+        ("temp_janitor", "x", "config: 'temp_janitor' must be an object with only enabled, days, keep, dir, scan_seconds and weekly_scan_seconds, got 'x'"),
+        ("chat_clear", {"live": "y"}, 'config: \'chat_clear\' must be {"enabled": true|false, "live": true|false}, got {\'live\': \'y\'}'),
+        ("chat_clear", [1], 'config: \'chat_clear\' must be {"enabled": true|false, "live": true|false}, got [1]'),
+        ("impact_floor", {"enabled": "y"}, "config: 'impact_floor.enabled' must be true or false"),
+        ("impact_floor", "x", "config: 'impact_floor' must be an object"),
+        ("impact_floor", {"zzz": 1}, "config: 'impact_floor' has key(s) this tool does not read: zzz"),
+    ]
+    GOOD = {"temp_janitor": [None, {"days": 3}], "chat_clear": [None, {"live": True}], "impact_floor": [None, {"enabled": True}]}
+
+    def test_s1_every_loader_is_generated_and_returns_the_module_load_module_returns(self):
+        tree = ast.parse(SWITCHBOARD.read_text())
+        defined = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+        self.assertEqual(len(sb.HELPER_MODULES), 22)
+        self.assertEqual(defined & set(sb.HELPER_MODULES), set(), "0 of the loaders has a def of its own")
+        for function, module in sb.HELPER_MODULES.items():
+            with self.subTest(function=function):
+                loader = getattr(sb, function)
+                self.assertIs(loader(), sb.load_module(module))
+                self.assertIs(loader(), loader(), "the second call returns the identical object")
+                self.assertEqual(loader.__name__, function)
+
+    def test_s2_the_moved_keys_give_the_old_results_and_the_old_error_text(self):
+        for key, values in self.GOOD.items():
+            for value in values:
+                with self.subTest(key=key, value=value):
+                    sb.validate_config({key: value})
+        sb.validate_config({})
+        for key, value, text in self.OLD:
+            with self.subTest(key=key, value=value), self.assertRaises(sb.ConfigError) as caught:
+                sb.validate_config({key: value})
+            self.assertEqual(str(caught.exception), text)
+
+    def test_s3_the_three_keys_are_declared_by_their_modules_and_in_no_shared_place(self):
+        declared = sb.config_declarations()
+        for key, module in (("temp_janitor", "disk_janitor"), ("chat_clear", "chat_clear"), ("impact_floor", "impact_floor")):
+            with self.subTest(key=key):
+                self.assertEqual(declared[key], module)
+                self.assertNotIn(key, sb.TOP_LEVEL_EXTRA_KEYS)
+                self.assertIn(key, sb.config_known_keys())
+        source = inspect.getsource(sb.validate_config)
+        for text in ('"temp_janitor"', '"chat_clear"', '"impact_floor"'):
+            self.assertNotIn(text, source, "no inline block for it is left in the validation chain")
+
+    def make_program(self, extra):
+        """A copy of the real program and its modules in a scratch directory, with `extra` files added to its bin."""
+        directory = Path(tempfile.mkdtemp(prefix="slice3-"))
+        self.addCleanup(shutil.rmtree, directory, True)
+        for path in BIN.glob("*.py"):
+            shutil.copy(str(path), str(directory / path.name))
+        shutil.copy(str(SWITCHBOARD), str(directory / "fleet-switchboard"))
+        for name, text in extra.items():
+            (directory / name).write_text(text)
+        return directory
+
+    def load_copy(self, directory):
+        loader = importlib.machinery.SourceFileLoader("sb_copy_%d" % id(directory), str(directory / "fleet-switchboard"))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(module)
+        return module
+
+    def test_s4_a_fixture_module_with_a_key_needs_no_change_to_the_program(self):
+        fixture = 'CONFIG_KEY = "slice3_key"\nCONFIG_DEFAULT = {"n": 2}\n\n\ndef validate(raw, source):\n    if not isinstance(raw, dict):\n        raise ValueError("%s: slice3 bad" % source)\n\n\ndef hello():\n    return "hi"\n'
+        directory = self.make_program({"slice3_mod.py": fixture})
+        before = (directory / "fleet-switchboard").read_bytes()
+        copy = self.load_copy(directory)
+        self.assertEqual(copy.load_module("slice3_mod").hello(), "hi", "found by name from its own file")
+        self.assertEqual(copy.validate_config({})["slice3_key"], {"n": 2})
+        with self.assertRaises(copy.ConfigError) as caught:
+            copy.validate_config({"slice3_key": 5})
+        self.assertEqual(str(caught.exception), "config: slice3 bad")
+        self.assertEqual((directory / "fleet-switchboard").read_bytes(), before)
+
+    def test_s5_two_branches_that_each_add_a_module_merge_without_a_conflict(self):
+        directory = Path(tempfile.mkdtemp(prefix="slice3-merge-"))
+        self.addCleanup(shutil.rmtree, directory, True)
+        (directory / "bin").mkdir()
+        shutil.copy(str(SWITCHBOARD), str(directory / "bin" / "fleet-switchboard"))
+
+        def git(*args):
+            return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"] + list(args), cwd=str(directory),
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+
+        self.assertEqual(git("init", "-q", "-b", "main").returncode, 0)
+        git("add", "-A"), git("commit", "-q", "-m", "base")
+        for branch, key in (("one", "fixture_one"), ("two", "fixture_two")):
+            git("checkout", "-q", "-b", branch, "main")
+            (directory / "bin" / ("%s.py" % key)).write_text('CONFIG_KEY = "%s"\nCONFIG_DEFAULT = None\n\n\ndef validate(raw, source):\n    return None\n' % key)
+            git("add", "-A"), git("commit", "-q", "-m", branch)
+            self.assertEqual(git("diff", "--name-only", "main", branch).stdout.split(), ["bin/%s.py" % key], "0 lines of the program changed")
+        git("checkout", "-q", "one")
+        merged = git("merge", "--no-edit", "two")
+        self.assertEqual(merged.returncode, 0, merged.stdout)
+        self.assertEqual(sorted(p.name for p in (directory / "bin").glob("*.py")), ["fixture_one.py", "fixture_two.py"])
+
+    def test_s6_a_default_owned_key_and_a_key_with_its_validator_in_the_program_stay_where_they_were(self):
+        self.assertTrue({"reds", "heavy", "cpu_guard"} <= set(sb.DEFAULTS))
+        self.assertTrue({"sweep", "triage", "plan_review", "impact_hold"} <= sb.TOP_LEVEL_EXTRA_KEYS)
+        for key, value in (("sweep", "x"), ("impact_hold", "x"), ("plan_review", "x")):
+            with self.subTest(key=key), self.assertRaises(sb.ConfigError):
+                sb.validate_config({key: value})
+
+    def test_s7_a_module_name_that_is_a_path_or_missing_is_refused(self):
+        for name in ("../fleet_health", "/etc/passwd", "no_such_module_xyz", "a/b", ""):
+            with self.subTest(name=name), self.assertRaises((ValueError, ImportError, OSError)):
+                sb.load_module(name)
+
+    def test_u2_a_missing_or_broken_module_fails_with_an_error_and_is_not_kept(self):
+        directory = self.make_program({"broken_mod.py": "def (:\n"})
+        copy = self.load_copy(directory)
+        with self.assertRaises(SyntaxError):
+            copy.load_module("broken_mod")
+        with self.assertRaises(SyntaxError):
+            copy.load_module("broken_mod")   # a failed import is never kept: it fails again
+        with self.assertRaises(FileNotFoundError):
+            copy.load_module("absent_mod")
+        self.assertNotIn("broken_mod", sys.modules)
+
+
 class TestConfigDeclarations(Base):
     """#437 slice 2: a module declares its own configuration key, default and validator; the shared code reads the declarations from the bin directory only."""
 
