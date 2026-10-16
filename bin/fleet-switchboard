@@ -6508,6 +6508,17 @@ def write_pane_health(state_dir, data):
     state_write(Path(state_dir) / PANE_HEALTH_FILE, json.dumps(data, indent=1, sort_keys=True) + "\n", json.dumps(stable, sort_keys=True), HEARTBEAT_HEALTH, fsync=True)
 
 
+def watch_terminal_closed(engine, name, session_id):
+    """True when `name` has a headless record for THIS session (it is a worker that runs with no terminal), so a pane that vanished was a `watch`
+    terminal. A record for another session, no record, or an unreadable one is False: a real terminal worker's gone pane is still dead (the fail mode
+    is chosen: when in doubt the alert goes out, never silence)."""
+    try:
+        record = load_agent_presence().load_record(engine.state_dir, name)
+    except Exception:
+        return False
+    return record is not None and record.get("session") == session_id
+
+
 def pane_health_pass(engine, now):
     """The daemon's look at every fleet agent's pane (after discovery). Records `pane-health.json` (what `status` shows and `reattach` reads),
     audits each change of state (`pane.detached`, `pane.dead`, `pane.recovered`) and leaves `engine.pane_alerts` for the cos fact. Reads only; bounded
@@ -6522,6 +6533,10 @@ def pane_health_pass(engine, now):
     sessions = [o.session_id for o in discovery.agents.values()]
     budget = PANE_CHECKS_PER_PASS
     for name, obs in sorted(discovery.agents.items()):
+        if obs.headless:   # no terminal now (#433): a pane verdict it was given while a `watch` terminal was open is stale, and is dropped with its alert (also while the service is unreadable: `unknown` carries no pane verdict)
+            for table in (agents, states, missing):
+                table.pop(name, None)
+            continue
         if not obs.pane or not obs.session_id:
             continue
         missing.pop(name, None)
@@ -6535,6 +6550,11 @@ def pane_health_pass(engine, now):
         if due and budget > 0:
             budget -= 1
             state, why, info = pane_state(engine, name, obs.session_id, obs.pane, names, sessions)
+            if state == PANE_DEAD and watch_terminal_closed(engine, name, obs.session_id):
+                for table in (agents, states, missing):   # the person closed a `watch` terminal: the worker still runs headless, nothing is dead
+                    table.pop(name, None)
+                engine.pane_checked[name] = int(now)   # a check was made: this pane does not take a slot of every pass until discovery shows the worker headless
+                continue
             if state != PANE_UNKNOWN:   # an unreadable look is not a check: it is repeated, as before
                 engine.pane_checked[name] = int(now)
                 if state != prev.get("state") and engine.audit is not None:
