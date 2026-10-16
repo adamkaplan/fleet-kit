@@ -272,6 +272,167 @@ class Driver(base.Base):
         self.assertNotIn("per-run secret", out)
         self.assertFalse(os.path.exists(self.git_ran), "the token was minted for a run that was refused")
 
+    # -- the race: a run that loses the name changes nothing --
+    def other_run_script(self, name, wait_for_pod=False):
+        """A token command that stands in for the OTHER run: the slow step in which it makes the worker (pod and both Secrets,
+        another run id) in the cluster state, and snapshots the state it made. `wait_for_pod`: it waits instead for a real
+        run to have made the pod, then mints the token."""
+        snap = os.path.join(self.tmp.name, "other-snapshot.json")
+        code = (
+            "import json, os, sys, time\n"
+            "path, snap, name, wait = os.environ['FAKE_KUBE_STATE'], %r, %r, %r\n"
+            "if wait:\n"
+            "    for _ in range(300):\n"
+            "        if name in json.load(open(path)).get('pods', {}): break\n"
+            "        time.sleep(0.1)\n"
+            "    time.sleep(0.3)\n"
+            "else:\n"
+            "    st = json.load(open(path))\n"
+            "    st['pods'][name] = {'metadata': {'name': name, 'annotations': {'cw/run-id': 'feedface00000000'}}, 'status': {'phase': 'Running', 'conditions': [{'type': 'Ready', 'status': 'True'}]}}\n"
+            "    st['secrets'] = {name + '-pw': 1, name + '-run': 1}\n"
+            "    st['secret_labels'] = {name + '-run': {'cw/run-id': 'feedface00000000'}}\n"
+            "    json.dump(st, open(path, 'w'))\n"
+            "    json.dump(st, open(snap, 'w'))\n"
+            "sys.stdout.write(%r)\n" % (snap, name, wait_for_pod, GIT))
+        script = os.path.join(self.tmp.name, "other-run.py")
+        with open(script, "w") as f:
+            f.write(code)
+        return "%s %s" % (sys.executable, script), snap
+
+    def calls(self):
+        return [json.loads(x) for x in self.read(self.env["FAKE_KUBE_CALLS"]).splitlines()]
+
+    def test_a_pod_that_appears_between_the_check_and_the_create_is_left_whole(self):
+        cmd, snap = self.other_run_script(self.name)
+        p, out = self.run_driver(CW_GIT_TOKEN_CMD=cmd)
+        self.assertEqual(p.returncode, cw.EXIT_REFUSED, out)
+        self.assertIn("already exists", out)
+        with open(snap) as f:
+            self.assertEqual(self.st(), json.load(f))   # the other run's pod and both Secrets: nothing added, nothing deleted
+        for forbidden in ("delete", "exec", "annotate", "patch", "label", "apply"):
+            self.assertNotIn(forbidden, [c[4] for c in self.calls() if c[0] == "--context"], "the loser touched the cluster: " + forbidden)
+        self.assertNotIn("per-run secret", out.replace("belongs to another run", ""))   # it made none, so it says nothing of one
+        self.assertIn("belongs to another run", out)
+        self.assertEqual(os.listdir(self.scratch), [])
+        self.assert_no_secret(self.everything(out))
+
+    def test_the_launcher_says_already_exists_with_its_own_exit_code_and_makes_nothing(self):
+        self.create("coder7", "--run-secret-fd", "model-auth=%d" % self.fd(MODEL_VALUES[0]))
+        before = self.st()
+        code, out, err = self.run_cli("create", "coder7", "--repo", REPO, "--branch", "main", "--run-secret-fd", "model-auth=%d" % self.fd(MODEL_VALUES[1]))
+        self.assertEqual(code, cw.EXIT_EXISTS)
+        self.assertIn("already exists", err)
+        self.assertEqual(self.st(), before)
+
+    def test_two_drivers_racing_for_one_name_one_wins_and_the_loser_changes_nothing(self):
+        wait_cmd, _ = self.other_run_script(self.name, wait_for_pod=True)
+        winner = self.spawn(STUB_MODE="busy-forever")
+        end = time.time() + 40
+        while time.time() < end and not self.pf_up():
+            time.sleep(0.1)
+        self.assertTrue(self.pf_up(), "the first run never got going")
+        # the second run passed its own first check before the first made the pod (its token step is the slow one)
+        loser_args = self.args()
+        slow = os.path.join(self.tmp.name, "slow-token")
+        with open(slow, "w") as f:
+            f.write("#!/bin/sh\nsleep 0.5\nprintf '%%s' '%s'\n" % GIT)
+        os.chmod(slow, 0o700)
+        st_mid, calls_mid = self.st(), len(self.calls())
+        p = subprocess.run(loser_args, env=dict(self.denv, CW_GIT_TOKEN_CMD=slow), capture_output=True, text=True, timeout=120)
+        out = p.stdout + p.stderr
+        self.assertEqual(p.returncode, cw.EXIT_REFUSED, out)
+        self.assertIn("already exists", out)
+        after = self.st()
+        self.assertEqual(after["pods"], st_mid["pods"])      # the winner's pod and its Secrets are whole
+        self.assertEqual(after["secrets"], st_mid["secrets"])
+        mutating = [c for c in self.calls()[calls_mid:] if c[0] == "--context" and c[4] in ("delete", "exec", "apply", "create", "patch", "label", "annotate")]
+        self.assertEqual(mutating, [], "the loser changed the cluster")
+        winner.send_signal(signal.SIGINT)
+        wout, werr = winner.communicate(timeout=120)
+        self.assertEqual(winner.returncode, 130, wout + werr)
+        self.assertEqual(self.st().get("secrets", {}), {})   # only now, by the winner's own cleanup, is everything gone
+        self.assertEqual(self.st()["pods"], {})
+
+    def test_every_secret_and_the_pod_of_a_run_carry_its_nonce_and_the_driver_reads_it_back(self):
+        proc = self.spawn(STUB_MODE="busy-forever")
+        end = time.time() + 40
+        while time.time() < end and not self.pf_up():
+            time.sleep(0.1)
+        st = self.st()
+        nonce = st["pods"][self.name]["metadata"]["annotations"]["cw/run-id"]
+        self.assertRegex(nonce, r"^[0-9a-f]{16}$")
+        self.assertEqual(st["secret_labels"][self.name + "-pw"]["cw/run-id"], nonce)
+        self.assertEqual(st["secret_labels"][self.name + "-run"]["cw/run-id"], nonce)
+        self.assertTrue(any(c[-2:] == ["get", "pod"] or "get" in c for c in self.calls()))
+        proc.send_signal(signal.SIGINT)
+        proc.communicate(timeout=120)
+
+    # -- cleanup decides only on proof: unit cases with a stub cluster --
+    def stub_driver(self, pod=None, secret=None, boom=False):
+        sys.path.insert(0, os.path.dirname(HERE))
+        import run_task
+        calls = []
+
+        class K:
+            def get_pod(s, n):
+                if boom: raise cw.CloudError("kubectl get: odd answer")
+                return pod
+            def get_run_secret(s, n):
+                if boom: raise cw.CloudError("kubectl get: odd answer")
+                return secret
+            def delete(s, n): calls.append(("delete", n))
+            def delete_run_secret(s, n): calls.append(("delete-run", n))
+            def delete_command(s, k, o): return "kubectl delete %s %s" % (k, o)
+            def scrub(s, t, limit=0): return t
+            def close(s): pass
+        a = type("A", (), {"worker": "coder7"})()
+        d = run_task.Driver(a, {})
+        d.kube, d.create_started = K(), True
+        d.stop = lambda reason: calls.append(("stop", reason)) or True
+        return d, calls
+
+    def quiet(self, d):
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf), contextlib.redirect_stdout(buf):
+            d.cleanup()
+        return buf.getvalue()
+
+    def test_cleanup_leaves_a_pod_with_a_missing_or_other_run_id_and_runs_no_end_hook(self):
+        for label, meta in (("other id", {"annotations": {"cw/run-id": "feedface00000000"}}), ("no annotation", {}), ("odd type", {"annotations": None})):
+            with self.subTest(label):
+                d, calls = self.stub_driver(pod={"metadata": meta})
+                out = self.quiet(d)
+                self.assertEqual(calls, [])
+                self.assertIn("left whole", out)
+                self.assertNotIn("cleaned", out)
+
+    def test_cleanup_stops_a_pod_only_when_the_read_back_nonce_matches(self):
+        d, calls = self.stub_driver()
+        d.kube.get_pod = lambda n: {"metadata": {"annotations": {"cw/run-id": d.nonce}}}
+        out = self.quiet(d)
+        self.assertEqual([c[0] for c in calls], ["stop", "delete-run"])
+        self.assertIn("per-run secret %s-run cleaned" % d.name, out)
+
+    def test_cleanup_with_no_pod_deletes_a_run_secret_only_when_it_carries_the_nonce(self):
+        d, calls = self.stub_driver(secret={"metadata": {"labels": {"cw/run-id": "feedface00000000"}}})
+        self.quiet(d)
+        self.assertEqual(calls, [])
+        d, calls = self.stub_driver()
+        d.kube.get_run_secret = lambda n: {"metadata": {"labels": {"cw/run-id": d.nonce}}}
+        self.assertIn("cleaned", self.quiet(d))
+        self.assertEqual(calls, [("delete", d.name)])
+        d, calls = self.stub_driver()   # nothing there at all: nothing to do and nothing said of a secret
+        self.assertNotIn("per-run secret", self.quiet(d))
+        self.assertEqual(calls, [])
+
+    def test_cleanup_that_cannot_read_ownership_touches_nothing_and_says_how_to_delete(self):
+        d, calls = self.stub_driver(boom=True)
+        out = self.quiet(d)
+        self.assertEqual(calls, [])
+        self.assertIn("REMAINS", out)
+        self.assertIn("kubectl delete secret %s-run" % d.name, out)
+
     def fd(self, value):
         r, w = os.pipe()
         os.write(w, value.encode())
