@@ -7726,6 +7726,13 @@ def validate_foreground_config(config, source):
         raise ConfigError("%s: 'classifier_mode' \"act\" needs a 'jev' object: there is no decision model to ask" % source)
 
 
+def chiefs_of_staff(discovery):
+    """The names of the Chief of Staff agents in a discovery, by the fleet metadata role (never by a name in configuration); none when discovery has problems."""
+    if discovery is None or discovery.problems:
+        return []
+    return sorted(n for n, o in discovery.agents.items() if (getattr(o, "fleet", None) or {}).get("role") == "chief-of-staff")
+
+
 def chief_busy(engine):
     """True when the newest look found a chief-of-staff-role agent working: the daemon then polls fast."""
     found = getattr(engine, "discovery", None)
@@ -14665,6 +14672,11 @@ class GitHubHub:
     def owner_of(self, item, agents, now):
         """The owner of an item (see `route_of`, which also says by which link)."""
         return self.route_of(item, agents, now)[0]
+
+    def notice_names(self, repo, number):
+        """The agent names a `notice pr` record of this pull request names (its sender, then its boss), whether or not they run: who WAS told to watch it."""
+        notice = self._notices.get((repo, number)) or {}
+        return [n for n in (notice.get("from"), notice.get("boss")) if isinstance(n, str) and n]
 
     def route_of(self, item, agents, now):
         """(owner, routed_by) of an item, or (None, None). PR 52: the links in order: (closing) the issues the item
