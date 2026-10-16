@@ -49357,7 +49357,7 @@ class TestHeavyFifo(unittest.TestCase):
     def entries(self):
         return [entry["pid"] for entry in json.loads((self.dir / "heavy-queue.json").read_text())["entries"]]
 
-    def run_as(self, pid, take=None, step=10.0, wait_max=15, short=False, report="100000", on_child=None, environ_extra=None, watchdog=None):
+    def run_as(self, pid, take=None, step=10.0, wait_max=15, short=False, report="100000", on_child=None, environ_extra=None, watchdog=None, held=None):
         """One caller's run(): `pid` is its place in the line, `take(state, slots)` the ordinary slots (default: all busy)."""
         test = self
 
@@ -49380,11 +49380,11 @@ class TestHeavyFifo(unittest.TestCase):
                 return on_child() if on_child else 0
         environ = {"PATH": os.environ["PATH"], "FLEET_HEAVY_REPORT_SECONDS": report}
         environ.update(environ_extra or {})
-        held = [{"slot": i, "name": "who-%s" % c, "pid": 10 + i, "command": "sh", "since": 1} for i, c in enumerate("abc")]
-        with mock.patch.object(self.hs, "_take", ordinary), mock.patch.object(self.hs, "holders", lambda state, slots=3: held), \
+        slot_records = [{"slot": i, "name": "who-%s" % c, "pid": 10 + i, "command": "sh", "since": 1} for i, c in enumerate("abc")]
+        with mock.patch.object(self.hs, "_take", ordinary), mock.patch.object(self.hs, "holders", lambda state, slots=3: slot_records), \
                 mock.patch.object(self.hs.subprocess, "Popen", FakeChild):
             return self.hs.run(["sh", "-c", "true"], str(self.dir), 3, wait_max, "w%d" % pid, environ=environ, out=self.out, clock=clock, sleep=lambda s: None,
-                               short=short, watchdog=watchdog, line={"pid": pid, "alive": lambda p, st: p in self.alive, "start_of": lambda p: "t"})
+                               short=short, watchdog=watchdog, line={"pid": pid, "alive": lambda p, st: p in self.alive, "start_of": lambda p: "t", "held": (lambda: held or set())})
 
     def free(self):
         fd = os.open(os.devnull, os.O_RDWR)
@@ -49572,6 +49572,61 @@ class TestHeavyFifo(unittest.TestCase):
         fcntl.flock(holder, fcntl.LOCK_EX)
         with self.assertRaises(self.hs.QueueUnusable):
             make().place()
+
+
+    def test_a_ticket_whose_owner_holds_a_slot_is_dropped_so_a_ghost_never_blocks_the_line(self):
+        self.seed([1001, 1002])
+        line = self.hs.Line(str(self.dir), "w", pid=1002, alive=lambda p, st: True, start_of=lambda p: "t", held=lambda: {1001})
+        self.assertEqual(line.place(), 1, "1001 holds a slot: its ticket is not a place in the line")
+        self.assertEqual(self.entries(), [1002])
+
+    def test_a_caller_whose_ticket_could_not_be_removed_says_so_and_the_waiter_behind_it_still_gets_the_next_slot(self):
+        self.seed([1001, 1002])
+        attempts = []
+        with mock.patch.object(self.hs.Line, "leave", lambda line: attempts.append(1) and False):
+            self.assertEqual(self.run_as(1001, self.free()), 0)
+        self.assertGreaterEqual(len(attempts), 2, "it tried to leave again before saying so")
+        self.assertEqual(self.out.getvalue().count("could not leave the waiting order"), 1, self.out.getvalue())
+        self.assertEqual(self.entries(), [1001, 1002], "the ghost is still in the file")
+        self.out, self.takes, self.started = BoundedOut(), BoundedList(), BoundedList()
+        self.assertEqual(self.run_as(1002, self.free(), held={1001}), 0, "the waiter behind the ghost still takes the next free slot")
+        self.assertEqual(list(self.started), [1002])
+
+    def test_the_slot_record_names_the_wrapper_and_held_by_lists_it_with_the_express_holder(self):
+        fd = os.open(str(self.dir / "heavy-slot-1.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.hs._record(fd, "w", 4242, "sh", 1000.0)
+        express = self.hs._take_express(str(self.dir))
+        self.addCleanup(os.close, express)
+        self.hs._record(express, "w", 4343, "sh", 1000.0)
+        self.assertEqual(self.hs.held_by(str(self.dir), 3), {4242, 4343, os.getpid()})
+        self.assertFalse((self.dir / "heavy-slot-0.lock").exists(), "looking creates no lock file")
+
+    def test_a_process_that_died_and_was_not_reaped_is_gone(self):
+        with mock.patch.object(self.hs, "_is_zombie", lambda pid: True), mock.patch.object(self.hs, "_process_start", lambda pid: "t"):
+            self.assertFalse(self.hs._alive(os.getpid(), "t"))
+        with mock.patch.object(self.hs, "_is_zombie", lambda pid: False), mock.patch.object(self.hs, "_process_start", lambda pid: "t"):
+            self.assertTrue(self.hs._alive(os.getpid(), "t"))
+        done = subprocess.Popen(["true"])
+        while subprocess.run(["ps", "-o", "stat=", "-p", str(done.pid)], capture_output=True, text=True).stdout.strip()[:1] not in ("Z", ""):
+            time.sleep(0.01)   # (bounded by the test timeout: a process that exits at once)
+        if subprocess.run(["ps", "-o", "stat=", "-p", str(done.pid)], capture_output=True, text=True).stdout.strip().startswith("Z"):
+            self.assertFalse(self.hs._alive(done.pid, ""), "a real zombie")
+        done.wait()
+
+    def test_the_temporary_files_of_processes_that_are_gone_are_swept_when_the_order_is_rewritten(self):
+        gone = subprocess.Popen(["true"])
+        gone.wait()
+        stale = self.dir / ("heavy-queue.json.%d.tmp" % gone.pid)
+        mine = self.dir / ("heavy-queue.json.%d.tmp" % os.getpid())
+        other = self.dir / "unrelated.tmp"
+        for path in (stale, other):
+            path.write_text("x")
+        self.hs.Line(str(self.dir), "w", pid=1001, alive=lambda p, st: True, start_of=lambda p: "t", held=lambda: set()).place()
+        self.assertFalse(stale.exists(), "the dead process's temporary file is gone")
+        self.assertTrue(other.exists(), "nothing else is touched")
+        self.assertFalse(mine.exists(), "and its own was renamed into place")
 
 
 class TestHeavySlots(Base):

@@ -148,6 +148,15 @@ def _process_start(pid):
     return " ".join(done.stdout.split()) if done.returncode == 0 else ""
 
 
+def _is_zombie(pid):
+    """A process that has died and not been reaped: it still has a pid, but it is gone."""
+    try:
+        done = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
+    except (subprocess.SubprocessError, OSError):
+        return False
+    return done.returncode == 0 and done.stdout.strip().startswith("Z")
+
+
 def _alive(pid, start):
     """Is the process (pid, start time) still there? A pid that exists with another start time is another process."""
     try:
@@ -156,6 +165,8 @@ def _alive(pid, start):
         return False
     except OSError:
         pass   # exists, not ours to signal
+    if _is_zombie(pid):
+        return False
     return not start or _process_start(pid) in ("", start)
 
 
@@ -168,7 +179,7 @@ class Line:
     An entry is {"pid", "start", "name", "short"}, in arrival order; an entry whose process is gone is dropped at the next look, so a dead waiter never blocks the
     ones behind it. The waiter at the head of the line is the only one that tries an ordinary slot: a slot that frees goes to the one that has waited longest."""
 
-    def __init__(self, state_dir, name, short=False, pid=None, alive=_alive, start_of=_process_start, lock_tries=50, lock_pause=0.02):
+    def __init__(self, state_dir, name, short=False, pid=None, alive=_alive, start_of=_process_start, lock_tries=50, lock_pause=0.02, slots=DEFAULT_SLOTS, held=None):
         self.dir, self.name, self.short = str(state_dir), name, bool(short)
         if not os.path.isdir(self.dir):
             raise OSError(errno.ENOENT, "no state directory")   # the caller takes whatever slot is free, as before
@@ -177,6 +188,7 @@ class Line:
         self.alive, self.lock_tries, self.lock_pause = alive, lock_tries, lock_pause
         self.path, self.lock_path = os.path.join(self.dir, QUEUE_FILE), os.path.join(self.dir, QUEUE_LOCK)
         self.joined = False
+        self.held = held if held is not None else (lambda: held_by(self.dir, slots))   # pids that hold a slot now: a ticket never outlives the slot its owner took
         self.verified = {}   # (pid, start) -> monotonic time its liveness was last checked with `ps`
 
     def _locked(self):
@@ -218,6 +230,7 @@ class Line:
 
     def _write(self, entries):
         temporary = "%s.%d.tmp" % (self.path, os.getpid())
+        self._sweep_temporaries()
         data = json.dumps({"entries": entries}).encode("utf-8")
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         try:
@@ -236,6 +249,26 @@ class Line:
                 pass
             raise
 
+    def _sweep_temporaries(self):
+        """Remove the `heavy-queue.json.<pid>.tmp` files of processes that are gone (a kill between the write and the rename leaves one)."""
+        prefix = QUEUE_FILE + "."
+        try:
+            names = os.listdir(self.dir)
+        except OSError:
+            return
+        for name in names:
+            middle = name[len(prefix):-4] if name.startswith(prefix) and name.endswith(".tmp") else ""
+            if middle.isdigit() and int(middle) != os.getpid():
+                try:
+                    os.kill(int(middle), 0)
+                except ProcessLookupError:
+                    try:
+                        os.unlink(os.path.join(self.dir, name))
+                    except OSError:
+                        pass
+                except OSError:
+                    pass
+
     def _mine(self, entry):
         return entry["pid"] == self.pid and entry["start"] == self.start
 
@@ -247,7 +280,8 @@ class Line:
             raise QueueUnusable(err.strerror or str(err))
         try:
             entries = self._read()
-            kept = [entry for entry in entries if self._mine(entry) or self._still_there(entry)]
+            holding = self.held()
+            kept = [entry for entry in entries if self._mine(entry) or (entry["pid"] not in holding and self._still_there(entry))]
             if join and not any(self._mine(entry) for entry in kept):
                 kept.append({"pid": self.pid, "start": self.start, "name": _plain(self.name, 40), "short": self.short})
             if kept != entries:
@@ -283,21 +317,23 @@ class Line:
         return next(index for index, entry in enumerate(entries, 1) if self._mine(entry))
 
     def leave(self):
-        """Take this caller out of the line (it got a slot, gave up or was stopped). Never raises."""
+        """Take this caller out of the line (it got a slot, gave up or was stopped). True when it is out (or never was in); False when the file could not be
+        changed. Never raises."""
         if not self.joined:
-            return
-        self.joined = False
+            return True
         try:
             lock = self._locked()
         except OSError:
-            return
+            return False
         try:
             entries = self._read()
             kept = [entry for entry in entries if not self._mine(entry)]
             if kept != entries:
                 self._write(kept)
+            self.joined = False
+            return True
         except (OSError, QueueUnusable):
-            pass
+            return False
         finally:
             os.close(lock)
 
@@ -313,6 +349,29 @@ def _take_express(state_dir):
             return None
         raise
     return fd
+
+
+def held_by(state_dir, slots=DEFAULT_SLOTS):
+    """The pids that hold a slot NOW, the express slot included: the command's and the wrapper's (`pid` and `wrapper` of each held slot's record). Nothing is created."""
+    pids = set()
+    for index in list(range(slots)) + [EXPRESS]:
+        try:
+            fd = os.open(slot_path(state_dir, index), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError:
+            continue
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                continue   # free
+            except OSError as err:
+                if err.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                    continue
+            info = _read_info(fd)
+            pids |= {value for value in (info.get("pid"), info.get("wrapper")) if isinstance(value, int) and not isinstance(value, bool)}
+        finally:
+            os.close(fd)
+    return pids
 
 
 def _describe(held):
@@ -338,7 +397,7 @@ def _record(fd, name, pid, command, now):
     """Write who holds the slot (truncating what the last holder wrote). Best effort: a slot without a record is still a held slot."""
     try:
         os.ftruncate(fd, 0)
-        os.pwrite(fd, json.dumps({"name": name, "pid": pid, "command": os.path.basename(command)[:80], "since": int(now)}).encode("utf-8"), 0)
+        os.pwrite(fd, json.dumps({"name": name, "pid": pid, "wrapper": os.getpid(), "command": os.path.basename(command)[:80], "since": int(now)}).encode("utf-8"), 0)
     except OSError:
         pass
 
@@ -606,7 +665,7 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
     try:
         if unslotted is None:
             try:
-                queue = Line(state_dir, name, short, **(line or {}))
+                queue = Line(state_dir, name, short, **dict({"slots": slots}, **(line or {})))
             except OSError:
                 queue = None
         while unslotted is None:
@@ -647,8 +706,8 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
                 out.flush()
                 next_report = now + every
             sleep(POLL_SECONDS)
-        if queue is not None:
-            queue.leave()   # it has its slot (or none will come): out of the line at once
+        if queue is not None and not (queue.leave() or queue.leave()):   # it has its slot (or none will come): out of the line at once; one more try before it says so
+            out.write("heavy: could not leave the waiting order: the others pass this caller's ticket once its slot shows as held\n")
         env = dict(environ)
         if fd is not None:
             _record(fd, name, os.getpid(), command[0], clock())   # at once, so a killed holder's old record is never shown for this one
