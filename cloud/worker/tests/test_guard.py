@@ -119,6 +119,26 @@ EXTRA_REFUSED = [
     ("starting workflows or releases", ["gh", "api", "repos/%s/dispatches" % REPO, "-X", "POST"], True),
     ("changing repository settings", ["gh", "api", "orgs/acme-org/rulesets", "-X", "POST"], True),
     ("force-pushing or pushing to the default branch", ["gh", "api", "repos/%s/git/refs" % REPO, "-X", "POST", "-f", "ref=refs/heads/x"], True),
+    # round 3: short-flag clusters, upper-case paths (table-driven; the refused phrase is part of the row)
+    ("merging a pull request", ["gh", "api", "-iX", "PUT", "repos/%s/pulls/5/merge" % REPO], False),
+    ("merging a pull request", ["gh", "api", "-iXPUT", "repos/%s/pulls/5/merge" % REPO], False),
+    ("merging a pull request", ["gh", "api", "-XPUT", "repos/%s/pulls/5/merge" % REPO], False),
+    ("merging a pull request", ["gh", "api", "-i", "repos/%s/pulls/5/merge" % REPO, "-X", "PUT"], False),
+    ("a gh api call it cannot read (more than one endpoint)", ["gh", "api", "-pX", "PUT", "repos/%s/pulls/5/merge" % REPO], False),
+    ("writing issues", ["gh", "api", "-ifkey=v", "repos/%s/issues" % REPO], False),
+    ("writing issues", ["gh", "api", "-iF", "title=t", "repos/%s/issues" % REPO], False),
+    ("a gh api option cluster it cannot read", ["gh", "api", "-ik", "repos/%s/issues" % REPO], False),
+    ("a gh api option cluster it cannot read", ["gh", "api", "-zX", "PUT", "repos/%s/pulls/5/merge" % REPO], False),
+    ("writing issues", ["gh", "api", "-X", "POST", "repos/%s/Issues" % REPO], False),
+    ("writing issues", ["gh", "api", "-X", "POST", "repos/%s/ISSUES" % REPO], False),
+    ("approving or dismissing a pull request review", ["gh", "api", "-X", "POST", "repos/%s/PULLS/5/REVIEWS" % REPO], False),
+    ("writing labels", ["gh", "api", "-X", "POST", "repos/%s/Labels" % REPO], False),
+    ("force-pushing or pushing to the default branch", ["gh", "api", "-X", "POST", "REPOS/%s/Git/Refs" % REPO], False),
+    ("merging a pull request", ["gh", "api", "-X", "PUT", "Repos/%s/pulls/5/MERGE" % REPO], False),
+    ("force-pushing", ["git", "push", "-uf", "origin", "feature-x"], False),
+    ("pushing to the default branch", ["git", "push", "-uo", "opt", "origin", "main"], False),
+    ("pushing to the default branch", ["git", "push", "-u", "-o", "opt", "origin", "main"], False),
+    ("defining a git alias", ["git", "config", "--global", "alias.p", "push -f"], False),
 ]
 EXTRA_ALLOWED = [
     ["gh", "ruleset", "list"],
@@ -141,6 +161,15 @@ EXTRA_ALLOWED = [
     ["git", "-c", "user.name=x", "commit", "-m", "m"],
     ["git", "config", "user.name", "x"],
     ["git", "push", "origin", "feature/maintenance"],
+    ["git", "config", "--get", "alias.p"],
+    ["git", "config", "--list"],
+    ["git", "config", "-l"],
+    ["gh", "api", "-i", "repos/%s/pulls/5" % REPO],
+    ["gh", "api", "-iX", "GET", "repos/%s/pulls/5" % REPO],
+    ["gh", "api", "-iH", "Accept: x", "repos/%s/pulls/5" % REPO],
+    ["gh", "api", "-iq", ".id", "repos/%s/pulls/5" % REPO],
+    ["gh", "api", "-X", "POST", "repos/%s/pulls" % REPO, "-f", "title=t"],
+    ["git", "push", "-uo", "opt", "origin", "feature-x"],
 ]
 
 
@@ -237,6 +266,17 @@ class Guard(unittest.TestCase):
                 self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
                 self.assertEqual(r.stdout, "")
                 self.assertEqual(r.stderr, "refused: %s: %s\n" % (what, TAIL))
+
+    def test_git_environment_configuration_is_refused_and_the_wrapper_leaves_the_workers_own_git_alone(self):
+        for name in ("GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_KEY_0", "GIT_CONFIG_KEY_7", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"):
+            with self.subTest(name=name):
+                r = self.call(["git", "push", "origin", "feature-x"], **{name: "1"})
+                self.assertEqual(r.returncode, 3, r.stdout)
+                self.assertEqual(r.stderr, "refused: git configuration from the environment (GIT_CONFIG_*): %s\n" % TAIL)
+                self.assertEqual(self.call(["git", "push", "origin", "feature-x"], **{name: ""}).returncode, 0)   # set but empty: not refused
+        self.assertEqual(self.call(["gh", "pr", "view"], GIT_CONFIG_COUNT="1").returncode, 0)   # gh is not git
+        self.assertNotIn("GIT_CONFIG_", read(ENTRYPOINT).replace("GIT_CONFIG_NOSYSTEM", ""))   # the entrypoint sets the helper in ~/.gitconfig (a file), never these variables
+        self.assertEqual(self.call(["git", "push", "origin", "feature-x"]).returncode, 0)   # GIT_CONFIG_NOSYSTEM (the test's) is not on the list
 
     def test_review_round_allowed_controls_still_pass_unchanged(self):
         for cmd in EXTRA_ALLOWED:

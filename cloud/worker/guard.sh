@@ -35,7 +35,14 @@ bad_cfg() {   # $1: a git config name or name=value: an alias or a push.default 
   case "$k" in alias.*) refuse "defining a git alias" ;; push.default*) refuse "overriding push.default" ;; esac
 }
 
+env_cfg() {   # git's environment configuration is the environment form of the two -c refusals: any of it set and not empty is refused
+  [ -n "${GIT_CONFIG_COUNT:-}${GIT_CONFIG_PARAMETERS:-}${GIT_CONFIG_GLOBAL:-}${GIT_CONFIG_SYSTEM:-}" ] && refuse "git configuration from the environment (GIT_CONFIG_*)"
+  env | grep -q '^GIT_CONFIG_KEY_[A-Za-z0-9_]*=.' && refuse "git configuration from the environment (GIT_CONFIG_*)"
+  return 0
+}
+
 do_git() {
+  env_cfg
   # skip git's own options before the subcommand
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -47,6 +54,9 @@ do_git() {
     esac
   done
   if [ "${1:-}" = config ]; then
+    for a in "$@"; do   # a read (--get, --list, -l ...) defines nothing
+      case "$a" in --get|--get-all|--get-regexp|--get-urlmatch|--list|-l|--get-color|--get-colorbool) return 0 ;; esac
+    done
     for a in "$@"; do bad_cfg "$a"; done
     return 0
   fi
@@ -69,6 +79,7 @@ do_git() {
       --repo) skip=1; n=$((n + 1)); continue ;;   # the remote is given by the option
       --repo=*) n=$((n + 1)); continue ;;
       -o|--push-option|--receive-pack|--exec) skip=1; continue ;;
+      -[!-]*o) skip=1; continue ;;   # a short cluster ending in o: the next word is its value
       --push-option=*|--receive-pack=*|--exec=*) continue ;;
       -*) continue ;;
     esac
@@ -108,7 +119,7 @@ api_path() {   # $1: the endpoint as given; prints the path to match: no scheme,
   esac
   p=${p%%[?#]*}
   case "$p" in *:*) refuse "a gh api endpoint it cannot read" ;; esac
-  p=$(printf '%s' "$p" | sed 's|^/*||; s|/*$||; s|^api/v3/||')
+  p=$(printf '%s' "$p" | tr 'A-Z' 'a-z' | sed 's|^/*||; s|/*$||; s|^api/v3/||')
   printf '%s' "$p"
 }
 
@@ -121,6 +132,29 @@ api_check() {   # gh api ...: $@ are the words after `api`
       raw) body=1; take=""; case "$a" in query=*) gql_q=1 ;; esac; continue ;;
       typed) body=1; take=""; case "$a" in query=*) gql_bad=1 ;; esac; continue ;;
       input) body=1; gql_bad=1; take=""; continue ;;
+    esac
+    case "$a" in
+      -[!-]?*)   # a cluster of short flags, read letter by letter: i (no value) or X H q t p f F (the rest of the cluster, or the next word, is the value)
+        rest=${a#-}
+        while [ -n "$rest" ]; do
+          l=${rest%"${rest#?}"}; rest=${rest#?}
+          case "$l" in
+            i) continue ;;
+            X|H|q|t|p|f|F)
+              case "$l" in X) k=method ;; f) k=raw ;; F) k=typed ;; *) k=skip ;; esac
+              if [ -z "$rest" ]; then take=$k
+              else
+                case "$k" in
+                  method) method=$rest ;;
+                  raw) body=1; case "$rest" in query=*) gql_q=1 ;; esac ;;
+                  typed) body=1; case "$rest" in query=*) gql_bad=1 ;; esac ;;
+                esac
+              fi
+              break ;;
+            *) refuse "a gh api option cluster it cannot read" ;;
+          esac
+        done
+        continue ;;
     esac
     case "$a" in
       -X|--method) take=method ;;
@@ -136,7 +170,7 @@ api_check() {   # gh api ...: $@ are the words after `api`
       -F?*) body=1; v=${a#-F}; case "$v" in query=*) gql_bad=1 ;; esac ;;
       --field=*) body=1; v=${a#--field=}; case "$v" in query=*) gql_bad=1 ;; esac ;;
       -*) ;;
-      *) [ -z "$path" ] && path=$a ;;
+      *) if [ -z "$path" ]; then path=$a; else refuse "a gh api call it cannot read (more than one endpoint)"; fi ;;
     esac
   done
   p=$(api_path "$path") || exit $?
