@@ -30,7 +30,7 @@
   ],
   "notes": {
    "api-orch": [
-    "[switchboard] 1 for api-orch: Superseded by acme/api#50. Your question on this ask is covered there; carry on with that.\n- send from cos (issue api#5): Superseded by acme/api#50. Your question on this ask is covered there; carry on with that."
+    "[switchboard] 1 for api-orch (sent 08:00Z, delivered 08:00Z): Superseded by acme/api#50. Your question on this ask is covered there; carry on with that.\n- send from cos (issue api#5): Superseded by acme/api#50. Your question on this ask is covered there; carry on with that."
    ]
   },
   "out": "api#5kj: done: sent to api-orch, both labels off acme/api#5\n"
