@@ -59115,6 +59115,24 @@ def _zip_with(member, data):
     return stream.getvalue()
 
 
+class TestScratchFileRule(unittest.TestCase):
+    """Ask #653: the coordination skill tells coders to keep scratch files in a private mktemp -d directory."""
+
+    RULE = 'Write scratch files (PR bodies, message bodies, notes) under a private directory made with mktemp -d, never under a fixed name in the shared temp folder: another agent may write the same name, and a body file is published as it stands.'
+
+    def test_s1_the_skill_carries_the_scratch_rule_exactly_once(self):
+        text = (REPO / "skills/fleet-coordination/SKILL.md").read_text()
+        self.assertEqual(text.count(self.RULE), 1)
+
+    def test_s2_it_is_never_inside_a_code_fence(self):
+        inside = False
+        for line in (REPO / "skills/fleet-coordination/SKILL.md").read_text().splitlines():
+            if line.strip().startswith("```"):
+                inside = not inside
+            elif inside:
+                self.assertNotIn("mktemp -d", line)
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.
