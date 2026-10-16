@@ -335,6 +335,8 @@ class Driver:
             sec = self.kube.get_run_secret(self.name)
             if sec:
                 got = ((sec.get("metadata") or {}).get("labels") or {}).get("cw/run-id")
+                if got is None:   # a Secret with credentials and no run id (a crash before it was labelled): never guessed
+                    return "unknown", False
                 return ("ours" if got == self.nonce else "theirs"), False
             return "none", False
         except (cw.CloudError, ValueError, AttributeError, TypeError):

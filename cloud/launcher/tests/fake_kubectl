@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """A fake kubectl for the offline tests: state is one JSON file (FAKE_KUBE_STATE). Supports only what cloud-worker uses."""
-import json, os, subprocess, sys
+import fcntl, json, os, subprocess, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 path = os.environ["FAKE_KUBE_STATE"]
 args = sys.argv[1:]
@@ -17,6 +17,8 @@ if args[0] == "--kubeconfig":
 assert args[0] == "--context", "no explicit --context"
 assert args[2] == "-n"
 args = args[4:]
+lock = open(path + ".lock", "w")   # one kubectl at a time reads and writes the state, like one API server
+fcntl.flock(lock, fcntl.LOCK_EX)
 st = json.load(open(path))
 if os.environ.get("FAKE_SCAN_DIR"):  # leak check on every call: no file under the scratch dir may hold a planted value
     for root, _, names in os.walk(os.environ["FAKE_SCAN_DIR"]):
@@ -32,12 +34,13 @@ if os.environ.get("FAKE_KUBE_SEEN"):  # what a child could see of its parent: th
         f.write(json.dumps({"env": {k: v for k, v in os.environ.items() if k not in ("FAKE_SCAN_VALUES", "FAKE_KUBE_ECHO")}, "parent": subprocess.run(["ps", "-o", "command=", "-p", str(os.getppid())], capture_output=True, text=True).stdout}) + "\n")
 if os.environ.get("FAKE_KUBE_HANG") == args[0]:  # a call that never ends: the test signals the caller meanwhile
     open(os.environ["FAKE_KUBE_HANG_MARK"], "w").write(args[0])
+    fcntl.flock(lock, fcntl.LOCK_UN)
     import time
     time.sleep(120)
 if st.get("fail_delete") and args[0] == "delete":
     print("Error from server (Forbidden): delete denied", file=sys.stderr); sys.exit(1)
 cmd = args[0]
-if st.get("fail_cmd") == cmd and not (cmd == "delete" and st.get("fail_cmd_only_run") and not args[2].endswith("-run")):
+if st.get("fail_cmd") == ("apply" if cmd == "create" and args[1:2] == ["-f"] else cmd) and not (cmd == "delete" and st.get("fail_cmd_only_run") and not args[2].endswith("-run")):
     # a failure that ECHOES the planted values on stderr and on stdout (a real server error can quote what it was sent)
     echo = os.environ.get("FAKE_KUBE_ECHO", "")
     print(json.dumps({"error": echo, "pushed": False}))
@@ -48,10 +51,15 @@ def save():  # atomic: a test reading the state meanwhile never sees a half-writ
     os.replace(path + ".tmp%d" % os.getpid(), path)
 def missing(what):
     print('Error from server (NotFound): %s not found' % what, file=sys.stderr); sys.exit(1)
-if cmd == "apply":
+def exists(what):
+    print('Error from server (AlreadyExists): %s already exists' % what, file=sys.stderr); sys.exit(1)
+if cmd == "apply" or (cmd == "create" and args[1:2] == ["-f"]):   # `create -f` is exclusive, like a real cluster; `apply` replaces
     obj = json.load(sys.stdin)
     if st.get("fail_apply"):
         print("Error from server (Forbidden): quota exceeded", file=sys.stderr); sys.exit(1)
+    if cmd == "create":
+        if obj["metadata"]["name"] in st.get("secrets" if obj["kind"] == "Secret" else "pods", {}):
+            exists('%ss "%s"' % (obj["kind"].lower(), obj["metadata"]["name"]))
     st.setdefault("applied", []).append(obj)
     if obj["kind"] == "Secret":
         st.setdefault("secrets", {})[obj["metadata"]["name"]] = 1
@@ -64,6 +72,8 @@ if cmd == "apply":
 elif cmd == "create" and args[1:3] == ["secret", "generic"]:
     if st.get("fail_secret"):
         print("Error from server (Forbidden): secrets is forbidden", file=sys.stderr); sys.exit(1)
+    if args[3] in st.get("secrets", {}):
+        exists('secrets "%s"' % args[3])
     data = {}
     for a in args[4:]:  # --from-file=KEY=PATH: PATH must be /dev/stdin (a value is never a file name); keep sizes and keys only
         key, fpath = a[len("--from-file="):].split("=", 1)
@@ -73,6 +83,7 @@ elif cmd == "create" and args[1:3] == ["secret", "generic"]:
             f.write(body + "\n")
         data[key] = len(body)
     st.setdefault("secrets", {})[args[3]] = 1
+    st.setdefault("secret_labels", {}).pop(args[3], None)   # a new Secret starts without labels
     st.setdefault("secret_keys", {})[args[3]] = data
     save()
 elif cmd == "patch" and args[1] == "secret":
@@ -109,6 +120,7 @@ elif cmd == "annotate":
 elif cmd == "delete":
     kind, name = args[1], args[2]
     (st.get("pods" if kind == "pod" else "secrets", {})).pop(name, None)
+    if kind == "secret": st.get("secret_labels", {}).pop(name, None)
     save()
 elif cmd == "exec":
     name, tool = args[1], args[3]

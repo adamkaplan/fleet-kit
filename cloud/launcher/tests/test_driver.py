@@ -433,6 +433,114 @@ class Driver(base.Base):
         self.assertIn("REMAINS", out)
         self.assertIn("kubectl delete secret %s-run" % d.name, out)
 
+    # -- the create itself is exclusive: of two callers exactly one wins, and a loser never deletes the winner's objects --
+    A_ID, B_ID = "aaaaaaaa11111111", "bbbbbbbb22222222"
+
+    def loser_create(self, run_id=None, **patches):
+        """A second launcher call that passed its own first check (the check is made to see nothing, as in the race)."""
+        real = cw.Kube.get_pod
+        seen = []
+
+        def get_pod(kube, name):
+            seen.append(name)
+            return None if len(seen) == 1 else real(kube, name)
+        patches = dict(patches, get_pod=get_pod)
+        olds = {k: getattr(cw.Kube, k) for k in patches}
+        for k, v in patches.items():
+            setattr(cw.Kube, k, v)
+        try:
+            return self.run_cli("create", "coder7", "--repo", REPO, "--branch", "main", "--run-id", run_id or self.B_ID,
+                                "--run-secret-fd", "model-auth=%d" % self.fd(MODEL_VALUES[1]))
+        finally:
+            for k, v in olds.items():
+                setattr(cw.Kube, k, v)
+
+    def test_the_second_create_fails_after_the_first_wins_and_the_winners_objects_are_untouched(self):
+        self.create("coder7", "--run-id", self.A_ID, "--run-secret-fd", "model-auth=%d" % self.fd(MODEL_VALUES[0]))
+        before = self.st()
+        code, out, err = self.loser_create()
+        self.assertEqual(code, cw.EXIT_EXISTS, err)
+        self.assertIn("already exists", err)
+        self.assertEqual(self.st(), before)   # password Secret, run Secret and pod: not replaced, not deleted
+        self.assertEqual(before["pods"][self.name]["metadata"]["annotations"]["cw/run-id"], self.A_ID)
+        self.assertNotIn("CLEANUP", err)
+
+    def test_a_loser_that_made_its_own_secrets_before_the_pod_clash_deletes_only_those(self):
+        self.patch_state(pods={self.name: {"metadata": {"name": self.name, "annotations": {"cw/run-id": self.A_ID}}, "status": {}}})
+        code, out, err = self.loser_create()
+        self.assertEqual(code, cw.EXIT_EXISTS, err)
+        st = self.st()
+        self.assertEqual(st.get("secrets", {}), {})   # its own two Secrets (labelled with its id) are gone
+        self.assertIn(self.name, st["pods"])         # the other run's pod is whole
+        self.assertEqual(st["pods"][self.name]["metadata"]["annotations"]["cw/run-id"], self.A_ID)
+
+    def test_a_failed_create_never_deletes_an_object_that_carries_another_run_id(self):
+        first = self.create("coder7", "--run-id", self.A_ID, "--run-secret-fd", "model-auth=%d" % self.fd(MODEL_VALUES[0]))
+        before = self.st()
+
+        def boom(kube, obj):   # the pod create fails for another reason than AlreadyExists, after the objects are flagged made
+            raise cw.CloudError("kubectl create: quota exceeded")
+        code, out, err = self.loser_create(apply=boom, create_run_secret=lambda *a, **k: None)
+        self.assertNotEqual(code, cw.EXIT_EXISTS)
+        after = self.st()
+        self.assertEqual(after["pods"], before["pods"])
+        self.assertEqual(after["secrets"], before["secrets"])   # the winner's Secrets and pod are whole
+        self.assertIn("left whole", err)
+        self.assertNotIn("cleaned", err.replace("left whole", ""))
+
+    def test_an_unreadable_object_during_the_launchers_cleanup_is_left_and_reported_not_deleted(self):
+        self.create("coder7", "--run-id", self.A_ID, "--run-secret-fd", "model-auth=%d" % self.fd(MODEL_VALUES[0]))
+        before = self.st()
+
+        def boom(kube, obj):
+            raise cw.CloudError("kubectl create: quota exceeded")
+
+        def odd(kube, name):
+            raise cw.CloudError("kubectl get: odd answer")
+        code, out, err = self.loser_create(apply=boom, get_secret=odd, create_run_secret=lambda *a, **k: None)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(self.st(), before)
+        self.assertIn("REMAINS", err)
+
+    def test_a_run_secret_whose_label_step_fails_is_removed_by_the_launcher_not_left_unlabelled(self):
+        self.patch_state(fail_cmd="label")
+        code, out, err = self.run_cli("create", "coder7", "--repo", REPO, "--branch", "main", "--run-id", self.B_ID,
+                                      "--run-secret-fd", "model-auth=%d" % self.fd(MODEL_VALUES[1]))
+        self.assertNotEqual(code, 0)
+        self.assertEqual(self.st().get("secrets", {}), {})
+
+    def test_a_run_secret_with_no_run_id_is_unknown_to_the_driver_and_reported_as_remaining(self):
+        d, calls = self.stub_driver(secret={"metadata": {"labels": {"cw/pod": "x"}}})
+        out = self.quiet(d)
+        self.assertEqual(calls, [])
+        self.assertIn("REMAINS", out)
+        self.assertIn("delete it with", out)
+
+    def test_two_drivers_started_together_exactly_one_wins(self):
+        gate = os.path.join(self.tmp.name, "gate")
+        os.mkdir(gate)
+        tok = os.path.join(self.tmp.name, "gate-token")
+        with open(tok, "w") as f:   # each driver announces itself, then waits until both have: both then create at once
+            f.write("#!/bin/sh\ntouch \"%s/$$\"\nwhile [ $(ls \"%s\" | wc -l) -lt 2 ]; do sleep 0.05; done\nprintf '%%s' '%s'\n" % (gate, gate, GIT))
+        os.chmod(tok, 0o700)
+        procs = [self.spawn(CW_GIT_TOKEN_CMD=tok) for _ in range(2)]
+        results = []
+        for pr in procs:
+            out, err = pr.communicate(timeout=120)
+            results.append((pr.returncode, out + err))
+        codes = sorted(r[0] for r in results)
+        self.assertEqual(codes, [0, cw.EXIT_REFUSED], results)
+        loser = [o for c, o in results if c != 0][0]
+        self.assertIn("already exists", loser)
+        self.assertNotIn("stopped", loser)
+        winner = [o for c, o in results if c == 0][0]
+        self.assertIn("per-run secret %s-run cleaned" % self.name, winner)
+        calls = self.calls()
+        hooks = [c for c in calls if c[0] == "--context" and c[4] == "exec"]
+        self.assertEqual(len(hooks), 1, "the end hook ran more than once")
+        self.assertEqual(self.st().get("secrets", {}), {})
+        self.assertEqual(self.st()["pods"], {})
+
     def fd(self, value):
         r, w = os.pipe()
         os.write(w, value.encode())
