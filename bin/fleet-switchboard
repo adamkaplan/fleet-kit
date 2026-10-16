@@ -9665,6 +9665,26 @@ def pr_reviews_at(reviews, head, author):
     return [{"by": by, "state": state} for by, state in sorted(found.items())]
 
 
+_VERDICT_REVIEW = re.compile(r"Review of ([0-9A-Fa-f]{7,40}):[ \t]*(?:APPROVE|CHANGES REQUESTED)(?![A-Za-z0-9_])")
+
+
+def pr_verdict_review(reviews, head):
+    """True when a formal review (not pending or dismissed) of the PR has a body that STARTS with `Review of <sha>:` and then
+    APPROVE or CHANGES REQUESTED, the sha being the head in full or a prefix of at least 7 characters (a whole token). The
+    reviewer's account is NOT looked at: the independent reviewer posts from the author's own account. Used by T7 only; it is
+    not `pr_reviews_at` (the gates, the hold rule and the captain evidence keep that stricter reading). False when it cannot be told."""
+    if not isinstance(reviews, list) or not isinstance(head, str) or not head:
+        return False
+    for review in reviews:
+        if not isinstance(review, dict) or str(review.get("state") or "").upper() not in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED"):
+            continue
+        body = review.get("body")
+        found = _VERDICT_REVIEW.match(body) if isinstance(body, str) else None
+        if found and head.lower().startswith(found.group(1).lower()):
+            return True
+    return False
+
+
 def pr_review_older(reviews, head, author):
     """True when someone other than the author reviewed this PR at a commit that is NOT its head (the review predates the
     last push). Companion of `pr_reviews_at`; False when none or when the list cannot be read."""
@@ -9750,6 +9770,7 @@ def pr_facts_from(data):
             "reviews": pr_reviews_at(data.get("reviews"), head, pr_login(data.get("author"))),
             "signed": pr_signed_at(data.get("comments"), head),
             "signed_review": pr_signed_at(data.get("comments"), head, True),
+            "verdict_review": pr_verdict_review(data.get("reviews"), head),
             "reviews_older": pr_review_older(data.get("reviews"), head, pr_login(data.get("author"))),
             "head_at": pr_head_time(data.get("commits")),
             "additions": count("additions"), "deletions": count("deletions"), "files": count("changedFiles"),
@@ -12537,6 +12558,8 @@ def triage_verify_t7(engine, state, repo, number, cfg, now, budget):
         return None
     if facts["state"] != "open":
         return False
+    if facts.get("verdict_review"):
+        return False         # the independent reviewer's verdict review of this exact head, from any account (T7 only)
     senders, noticed = set(), False
     try:
         for item in read_pr_notices(engine.state_dir):
