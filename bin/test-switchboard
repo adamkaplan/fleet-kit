@@ -57840,6 +57840,97 @@ class TestCallerWorkspace(unittest.TestCase):
 
 
 
+class TestSkillsSync(unittest.TestCase):
+    """Installed skills equal the kit's (ask 596): the check reads, the sync copies, install reuses the step."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.tmp), True)
+        self.kit = self.tmp / "kit"
+        self.names = ["fleet-a", "fleet-b", "fleet-c", "fleet-d", "fleet-e"]
+        for n in self.names:
+            (self.kit / "skills" / n).mkdir(parents=True)
+            (self.kit / "skills" / n / "SKILL.md").write_text("kit %s\n" % n)
+        self.dest = self.tmp / "installed"
+        for n in self.names:
+            (self.dest / n).mkdir(parents=True)
+            (self.dest / n / "SKILL.md").write_text("kit %s\n" % n)
+            os.utime(str(self.dest / n / "SKILL.md"), (1000, 1000))
+
+    def skill(self, n):
+        return self.dest / n / "SKILL.md"
+
+    def drift(self):
+        (self.dest / "fleet-b" / "SKILL.md").write_text("old\n")
+        os.utime(str(self.skill("fleet-b")), (1000, 1000))
+        self.skill("fleet-d").unlink()
+
+    def test_s1_in_sync_names_no_skill(self):
+        ok, text = sb.skills_status_line([self.dest], self.kit)
+        self.assertTrue(ok)
+        self.assertEqual(text.count("in sync"), 1)
+        self.assertFalse([n for n in self.names if n in text])
+
+    def test_s2_names_exactly_the_two_and_the_command(self):
+        self.drift()
+        ok, text = sb.skills_status_line([self.dest], self.kit)
+        self.assertFalse(ok)
+        self.assertEqual([n for n in self.names if n in text], ["fleet-b", "fleet-d"])
+        self.assertEqual(text.count("skills sync"), 1)
+        self.assertEqual(sorted(w for _, _, w in sb.skills_drift([self.dest], self.kit)), ["differs", "missing"])
+
+    def test_s3_sync_changes_two_files_only(self):
+        self.drift()
+        before = {n: self.skill(n).stat().st_mtime for n in self.names if self.skill(n).exists()}
+        changed = sb.sync_skills(self.dest, self.kit)
+        self.assertEqual(len(changed), 2)
+        for n in ("fleet-a", "fleet-c", "fleet-e"):
+            self.assertEqual(self.skill(n).stat().st_mtime, before[n])
+        self.assertTrue(sb.skills_status_line([self.dest], self.kit)[0])
+
+    def test_s4_backup_and_mode(self):
+        self.drift()
+        os.chmod(str(self.skill("fleet-b")), 0o600)
+        sb.sync_skills(self.dest, self.kit)
+        backups = list((self.dest / "fleet-b").glob("SKILL.md.bak-*"))
+        self.assertEqual([b.read_text() for b in backups], ["old\n"])
+        self.assertEqual(self.skill("fleet-b").stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.skill("fleet-b").read_text(), "kit fleet-b\n")
+        self.assertEqual([p.name for p in (self.dest / "fleet-b").iterdir() if p.name.startswith(".")], [])
+
+    def test_s5_nothing_else_touched(self):
+        self.drift()
+        (self.dest / "other").mkdir()
+        (self.dest / "other" / "SKILL.md").write_text("mine\n")
+        (self.dest / "opencode.json").write_text("{}\n")
+        sb.sync_skills(self.dest, self.kit)
+        self.assertEqual((self.dest / "other" / "SKILL.md").read_text(), "mine\n")
+        self.assertEqual((self.dest / "opencode.json").read_text(), "{}\n")
+
+    def test_s6_check_writes_nothing(self):
+        self.drift()
+        seen = lambda: sorted((str(p), p.stat().st_mtime) for p in self.dest.rglob("*"))
+        before = seen()
+        os.chmod(str(self.dest), 0o555)
+        self.addCleanup(os.chmod, str(self.dest), 0o755)
+        ok, _ = sb.skills_status_line([self.dest], self.kit)
+        self.assertFalse(ok)
+        self.assertEqual(seen(), before)
+
+    def test_install_uses_the_same_step(self):
+        self.drift()
+        self.assertTrue(sb.install_skills(self.dest, self.kit))
+        self.assertFalse(sb.install_skills(self.dest, self.kit))
+        self.assertTrue(sb.skills_status_line([self.dest], self.kit)[0])
+
+    def test_locations_name_both_folders(self):
+        home, data = self.tmp / "home", self.tmp / "data"
+        (data / "skills").mkdir(parents=True)
+        (home / ".agents" / "skills").mkdir(parents=True)
+        self.assertEqual(sb.skill_locations(home, data), [data / "skills", home / ".agents" / "skills"])
+        self.assertEqual(sb.skill_locations(self.tmp / "none", self.tmp / "none"), [])
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.

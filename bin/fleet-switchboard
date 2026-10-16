@@ -15143,6 +15143,8 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
             work_line = work_status_line(config, state, now())
             if work_line is not None:
                 report["external"]["work_line"] = work_line
+    skills_ok, skills_text = skills_status_line()
+    report["skills"] = {"ok": skills_ok, "detail": skills_text}   # read only
     report["cos_orders"] = cos_orders_summary(config if config_ok else None)  # PR 18
     report["plan_gates"] = plan_gates_status(config if config_ok else None, state if state_ok else None, now()) if state_ok else None
     if config_ok and state_ok:
@@ -15153,7 +15155,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
     report["service"] = service_report(platform)
     report["key"] = key_report(config if config_ok else None, report["daemon"], report["service"])   # PR 16
     report["plugin"] = plugin_report(config, runner) if config_ok else {"state": "unknown", "detail": "config unusable"}
-    report["ok"] = all(report[part]["ok"] for part in ("config", "state_dir", "lab", "v2", "herdr"))
+    report["ok"] = all(report[part]["ok"] for part in ("config", "state_dir", "lab", "v2", "herdr", "skills"))
     return report
 
 
@@ -15343,6 +15345,8 @@ def format_status(report):
     lines.extend("      " + line for line in ((report.get("plan_gates") or {}).get("lines") or []))  # #107
     lines.extend("      " + report["policy"]["line"] for _ in [0] if "policy" in report)
     lines.extend(format_install_lines(report))  # PR 16
+    if "skills" in report:
+        lines.append("%s skills     %s" % (mark(report["skills"]), report["skills"]["detail"]))
     return "\n".join(lines)
 
 
@@ -25818,13 +25822,125 @@ def kit_skill_names(kit_root=KIT_ROOT):
     return sorted(p.name for p in root.iterdir() if (p / "SKILL.md").is_file())
 
 
-def install_skills(skills_dir, kit_root=KIT_ROOT):
-    """The kit's skills into `skills_dir`, one directory each. True when any file changed."""
-    changed = False
+def _kit_skill_text(name, kit_root):
+    return (Path(kit_root) / "skills" / name / "SKILL.md").read_text()
+
+
+def skill_locations(home=None, data_dir=None):
+    """The folders agents read skills from that exist on this machine: the switchboard's own skills folder and the
+    shared ~/.agents/skills (read by several harnesses). Only a folder that exists is a location."""
+    home = Path(home) if home else Path.home()
+    data = Path(data_dir) if data_dir else _xdg("XDG_DATA_HOME", ".local/share") / PROG
+    return [p for p in (data / "skills", home / ".agents" / "skills") if p.is_dir()]
+
+
+def skills_drift(locations, kit_root=KIT_ROOT):
+    """[(location, skill, "differs" | "missing")] for every kit skill whose installed SKILL.md is not the kit's. Reads files only."""
+    out = []
+    names = kit_skill_names(kit_root)
+    for location in locations:
+        for name in names:
+            path = Path(location) / name / "SKILL.md"
+            try:
+                same = path.read_text() == _kit_skill_text(name, kit_root)
+            except OSError:
+                out.append((location, name, "missing"))
+                continue
+            except ValueError:
+                same = False
+            if not same:
+                out.append((location, name, "differs"))
+    return out
+
+
+def skills_status_line(locations=None, kit_root=KIT_ROOT):
+    """(ok, text) for status and the doctor: in sync, or each skill that differs or is missing and the command that fixes it."""
+    locations = skill_locations() if locations is None else locations
+    if not locations:
+        return True, "no installed skills folder found (`%s install` creates it)" % PROG
+    drift = skills_drift(locations, kit_root)
+    if not drift:
+        return True, "in sync with the kit (%s)" % ", ".join(str(p) for p in locations)
+    return False, "NOT in sync: %s; run `%s skills sync`" % (
+        "; ".join("%s %s in %s" % (name, why, loc) for loc, name, why in drift), PROG)
+
+
+def _replace_skill_file(path, text):
+    """Replace `path` with `text`: keep the old file as a backup beside it, write a temporary file then rename, keep the mode."""
+    path = Path(path)
+    mode = 0o644
+    if path.exists():
+        mode = path.stat().st_mode & 0o7777
+        stamp = time.strftime("%Y%m%d%H%M%S")
+        backup = path.with_name("%s.bak-%s" % (path.name, stamp))
+        n = 0
+        while backup.exists():
+            n += 1
+            backup = path.with_name("%s.bak-%s-%d" % (path.name, stamp, n))
+        shutil.copy2(str(path), str(backup))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temp = tempfile.mkstemp(prefix=".%s." % path.name, dir=str(path.parent))
+    try:
+        with os.fdopen(handle, "w") as out:
+            out.write(text)
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(temp, mode)
+        os.replace(temp, str(path))
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
+
+
+def sync_skills(skills_dir, kit_root=KIT_ROOT):
+    """The one step: make `skills_dir` hold the kit's skills, one directory each, and nothing else changes (a skill that
+    is not the kit's, a file beside the skills: untouched). A file already equal is not written. Returns the changed paths."""
+    changed = []
     for name in kit_skill_names(kit_root):
-        text = (Path(kit_root) / "skills" / name / "SKILL.md").read_text()
-        changed |= write_if_changed(Path(skills_dir) / name / "SKILL.md", text)
+        path = Path(skills_dir) / name / "SKILL.md"
+        text = _kit_skill_text(name, kit_root)
+        try:
+            if path.read_text() == text:
+                continue
+        except (OSError, ValueError):
+            pass
+        _replace_skill_file(path, text)
+        changed.append(str(path))
     return changed
+
+
+def install_skills(skills_dir, kit_root=KIT_ROOT):
+    """The kit's skills into `skills_dir` (the sync step). True when any file changed."""
+    return bool(sync_skills(skills_dir, kit_root))
+
+
+def cmd_skills(args, runner, now):
+    """`skills check` (read only) and `skills sync` (the kit's skills into every installed folder that exists)."""
+    locations = skill_locations()
+    if args.skills_action == "check":
+        ok, text = skills_status_line(locations)
+        print(text)
+        return EXIT_OK if ok else EXIT_ERROR
+    if not locations:
+        sys.stderr.write("%s: skills: no installed skills folder found; run `%s install`\n" % (PROG, PROG))
+        return EXIT_ERROR
+    for location in locations:
+        changed = sync_skills(location)
+        print("%s: %s" % (location, "%d file(s) replaced (old ones kept as SKILL.md.bak-*)" % len(changed) if changed else "already in sync"))
+    return EXIT_OK
+
+
+cmd_skills.direct = True   # files only: no daemon start
+
+
+def add_skills_parsers(sub):
+    skills = sub.add_parser("skills", help="Compare the installed skills with the kit's (`skills check`, read only) or copy the kit's into every installed folder (`skills sync`)")
+    skills_sub = skills.add_subparsers(dest="skills_action", required=True)
+    skills_sub.add_parser("check", help="Say whether the installed skills equal the kit's; exit 1 naming each that differs or is missing")
+    skills_sub.add_parser("sync", help="Copy exactly the kit's skills into the installed folders, keeping a backup of each file replaced")
 
 
 def _read_json_object(path, what):
