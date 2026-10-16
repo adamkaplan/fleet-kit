@@ -29,16 +29,20 @@ class Activity(unittest.TestCase):
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
         s.close()
-        p = subprocess.Popen([sys.executable, STUB, str(port)], env=dict(os.environ, STUB_MODE=mode, STUB_LOG=self.log))
+        p = subprocess.Popen([sys.executable, STUB, str(port)], env=dict(os.environ, STUB_MODE=mode, STUB_LOG=self.log), stderr=subprocess.PIPE, text=True)
         self.addCleanup(p.wait)
+        self.addCleanup(p.stderr.close)
         self.addCleanup(p.kill)
         for _ in range(50):
+            if p.poll() is not None:
+                self.fail("stub exited %s at start (python %s, port %s): %s" % (p.returncode, sys.version.split()[0], port, p.stderr.read().strip()))
             try:
                 socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
                 return port
             except OSError:
                 time.sleep(0.1)
-        self.fail("stub did not start")
+        p.kill()
+        self.fail("stub did not start in 5s (python %s, port %s): %s" % (sys.version.split()[0], port, p.stderr.read().strip()))
 
     def run_script(self, port, **env):
         e = dict(os.environ, CW_ACTIVITY_PORT=str(port), CW_ACTIVITY_PASSWORD_FILE=self.pwfile)
