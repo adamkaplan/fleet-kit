@@ -57267,6 +57267,22 @@ class TestMessageTimesDelivery(Base):
         fleet = record["metadata"]["fleet"]
         self.assertEqual((fleet["sender"], fleet["issue"], fleet["repo"]), ("coder", 7, "acme/api"))
 
+    def test_a_waiting_message_carrying_sends_for_two_issues_is_never_named_by_a_later_send_about_one_of_them(self):
+        engine = self.world.engine
+        discovery = engine.discover(engine.now())
+        first = sb.Fact("send:coder:a1", "platform", "send", "text for A", engine.now(), issue=7, batch=False, sender="coder", repo=None)
+        second = sb.Fact("send:coder:b1", "platform", "send", "text for B", engine.now(), issue=8, batch=False, sender="coder", repo=None)
+        self.assertTrue(engine.send_fact(first, discovery, engine.now(), carried=[second])["sent"])   # ONE waiting message, two issues
+        self.world.tick(70)
+        self.assertTrue(self.send("newer text for A", issue=7)["sent"])
+        mixed, newer = self.waiting()
+        self.assertIn("text for A", mixed)
+        self.assertIn("text for B", mixed, "the other issue's send is fully shown and untouched")
+        self.assertNotIn("superseded", mixed)
+        self.assertNotIn("supersedes", newer.splitlines()[0], "the waiting message is not only about issue 7, so it is not named")
+        self.assertEqual(sb.Switchboard._send_meta([first, second]), {})
+        self.assertEqual(sb.Switchboard._send_meta([first]), {"sender": "coder", "issue": 7})
+
     def test_s4_a_forged_or_absurd_time_in_the_inbox_never_stops_or_lies_in_a_send(self):   # security finding: gmtime(1e30) raised inside compose
         self.send("first")
         item = self.world.v2.sessions[self.world.sessions["platform"]]["inbox"][0]

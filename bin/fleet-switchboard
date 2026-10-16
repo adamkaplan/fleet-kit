@@ -4605,9 +4605,12 @@ class Switchboard:
     @staticmethod
     def _send_meta(carried):
         """#583: the ask a delivered `send` is about, in the message's metadata, so a LATER send can tell which waiting messages are about the same issue."""
-        one = next((f for f in carried if f.kind == "send" and f.sender and f.issue), None)
-        if one is None:
+        sends = [f for f in carried if f.kind == "send"]
+        one = sends[0] if sends else None
+        if one is None or not one.sender or not one.issue:
             return {}
+        if any((f.sender, f.repo, f.issue) != (one.sender, one.repo, one.issue) for f in carried):
+            return {}   # a message that also carries another issue's (or sender's) facts is about none of them alone: a later send never names it
         return {"sender": one.sender, "issue": one.issue, "repo": one.repo} if one.repo else {"sender": one.sender, "issue": one.issue}
 
     def waiting_earlier(self, discovery, recipient, sender, repo, issue, now):
