@@ -213,20 +213,33 @@ def _reserved(name):
 def reservation(state, name):
     """Holds the name for the length of a `launch --cloud` with an flock on `cloud/NAME.launching`, so two launches of one name (or a local launch
     meanwhile, see refuse_local_launch) cannot both pass the checks and then both create. A lock dies with its process, so a killed command never
-    holds a name, and the file is never read or unlinked (nothing to race on). A refusal here is intended: the name is taken."""
+    holds a name, and the holder removes the file as it leaves (a later holder re-checks that the file it locked is still the one at the path). A refusal here is intended: the name is taken."""
     path = cloud_dir(state) / (name + ".launching")
-    try:
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    except OSError as err:
-        raise CloudError("the launch reservation of %s cannot be made (%s); nothing was created" % (name, err.strerror or err)) from None
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    for _ in range(5):
+        try:
+            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        except OSError as err:
+            raise CloudError("the launch reservation of %s cannot be made (%s); nothing was created" % (name, err.strerror or err)) from None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            raise CloudError("%s is being launched by another command right now; nothing was created" % name) from None
+        try:   # the holder before us unlinks the file as it leaves: the lock counts only if the file we hold is still the one at the path
+            if os.fstat(fd).st_ino == os.stat(str(path)).st_ino:
+                break
+        except OSError:
+            pass
         os.close(fd)
-        raise CloudError("%s is being launched by another command right now; nothing was created" % name) from None
+    else:
+        raise CloudError("the launch reservation of %s is contended; nothing was created" % name)
     try:
         yield
     finally:
+        try:
+            os.unlink(str(path))   # while the lock is still held
+        except OSError:
+            pass
         os.close(fd)   # releases the lock
 
 
