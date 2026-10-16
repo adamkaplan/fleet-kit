@@ -29258,11 +29258,11 @@ class TestPlanCheckRules(unittest.TestCase):
         self.assertIn("test_the_role_files_do_not_grow", block[0])
         self.assertIn("TestHygiene", block[1])
         planning = (skills / "fleet-planning" / "SKILL.md").read_text()
-        self.assertEqual(planning.count("`## Intent` heading before its `Done when:`"), 1)
+        self.assertEqual(planning.count("`## Intent` before `Done when:`"), 1)
         review = (skills / "fleet-review" / "SKILL.md").read_text()
         lines = [l for l in review.splitlines() if l.startswith("In a repository with no review laws installed, the ORCHESTRATOR")]
         self.assertEqual(len(lines), 1)
-        self.assertIn("ORCHESTRATOR", review.split(lines[0], 1)[1].split("\n\n", 1)[0] + lines[0])
+        self.assertIn("independent review", review.split(lines[0], 1)[1].split("\n\n", 1)[0])
 
     def test_a_plan_that_opts_in_needs_a_size_in_agent_time_and_one_that_does_not_is_left_alone(self):
         self.assertEqual(self.codes(GOOD_PLAN), [], "a plan written before the rule has no plan-format line and is not flagged")

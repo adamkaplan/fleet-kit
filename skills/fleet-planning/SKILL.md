@@ -6,8 +6,8 @@ description: How to write a plan before work starts, check it, and get it challe
 # Planning
 
 A plan says **what** the work must achieve and how anyone will know, never gratuitous **how**. It is written before
-work starts, checked by a command, challenged by independent reviewers, and approved. The full rules and every check
-`plan check` enforces are in `docs/plan-template.md` (read it when a check fails); this page is the short path.
+work starts, checked by a command, challenged by independent reviewers, and approved. Every rule and check is in
+`docs/plan-template.md` (read it when a check fails); this page is the short path.
 
 ## When a plan is required
 
@@ -30,28 +30,26 @@ Staff; an epic or workspace plan, the Chief of Staff, then the owner.
 4. **Out of scope**, **areas touched** (and whether any is held-PR), **risks and rollback**, **open questions**, **size and
    tier**, and **the integration-branch decision** (stay on main, or `integration/<epic-slug>`).
    **Size** is a T-shirt in AGENT time, never human-days: S under 1 hour, M a few hours, L about a day, XL several days, each with what makes it that
-   size (a light plan may carry just `size: S`). A recommendation never prefers the smaller option because it is less work when a larger one
+   size (a light plan may carry just `size: S`). Never prefer the smaller option merely because it is less work when a larger one
    simplifies the system. Put `plan-format: 2` and a `size:` line in the plan; `plan check` then flags a missing size and days for work under L.
 
 ## Check it
 
 `fleet-switchboard plan check <owner/repo#N> [--ask <owner/repo#N>] [--json]` prints `PASS` or `FAIL`, one defect per line,
 and the plan hash (editing anything changes it). Before you send a draft, run `plan check --file <plan> --done-when <the
-issue's Done-when>` (the issue body needs a `## Intent` heading before its `Done when:` line, or the Done-when is not found; format 2 needs a `clauses:` and a `scenarios:` yaml block) and fix every defect. It only reads GitHub.
+issue's Done-when>` (the issue body needs `## Intent` before `Done when:`; format 2 needs a `clauses:` and a `scenarios:` yaml block) and fix every defect. It only reads GitHub.
 
 ## The form
 
 Put it in the repo the work concerns. **A short issue body** (the one-paragraph outcome, the Done-when, the link to the
 detail) plus **one detail comment** whose first line is a heading containing `Plan (scenarios)`: the plan text and the
-`scenarios:` yaml block. Revise by posting a new such comment (the latest one counts). Keep one plan per ask; sections for
-work items.
+`scenarios:` yaml block. Revise by posting a new such comment (the latest counts). One plan per ask; sections for work items.
 
 ## Challenge it
 
 When available: a `plan review` command launches independent read-only reviewers and records their verdicts (not built yet:
 until then ask the Chief of Staff for a hand-run review). The tier is computed from the ask or epic the plan serves, not
-chosen per item. Expect up to three rounds; an objection still standing after round three goes up to the Chief of Staff and
-then the owner, never dropped.
+chosen per item. Expect up to three rounds; an objection still standing after round three goes to the Chief of Staff, then the owner.
 
 ## What the reviewers attack
 
@@ -64,7 +62,7 @@ then the owner, never dropped.
   is not warranted.
 - **The owner's view**: would the owner be surprised; does it solve the asked problem or a neighbouring one.
 
-## Good and bad (neutral names)
+## Good and bad
 
 Good: Done-when (1) "a project with no agents lists none, and after commissioning lists exactly one".
 
