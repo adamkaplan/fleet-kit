@@ -14291,7 +14291,8 @@ class GitHubHub:
         forgotten otherwise. `since` is kept from the first time it was seen listed; a `labeled` event says
         when (the issue's `updated_at`), and a read can only say when the issue last changed. PR 18: the tier
         is `human` with your label (an issue with both was escalated), `cos` with the Chief of Staff's only. A CLOSED issue is
-        forgotten whatever label it carries (#570): it never shows in the list; the daemon takes its awaiting labels off (bin/closed_labels.py)."""
+        never ADDED (#570), and one already kept leaves only when a FRESH read says it is closed (`forget_awaiting`, called by bin/closed_labels.py): a closed
+        payload alone, which may be late or replayed after a reopen, never hides an open decision."""
         number = _number(issue)
         if number is None or _is_pr(issue) or not isinstance(issue.get("labels"), list):
             return
@@ -14300,7 +14301,10 @@ class GitHubHub:
         tier = decision_core.issue_tier(names, awaiting_label(self.config), awaiting_cos_label(self.config))
         with self.lock:
             closed = issue.get("state", "open") == "closed"
-            if tier is not None and not closed:   # #570: a closed issue is never kept, whatever label it carries
+            if tier is not None and closed:
+                return   # #570: a closed PAYLOAD alone never drops an issue (a late or replayed event would hide an open decision): bin/closed_labels.py reads it fresh and
+                         # calls forget_awaiting when GitHub says closed; a closed issue not yet kept is never added
+            if tier is not None:
                 known = self.awaiting.get(key)
                 stamp = parse_iso(issue.get("updated_at"))
                 since = known["since"] if known else (stamp if stamp is not None else when or self.now())
@@ -14340,6 +14344,11 @@ class GitHubHub:
             self.note_awaiting_issue(repo, issue)
             if event == "issues" and payload.get("action") == "closed":
                 self.note_closed_issue(repo, issue)
+
+    def forget_awaiting(self, repo, number):
+        """#570: the issue is CLOSED by a fresh read: it leaves the list. (A closed event payload alone never does: see `note_awaiting_issue`.)"""
+        with self.lock:
+            self.awaiting.pop((repo, number), None)
 
     def note_closed_issue(self, repo, issue):
         """#570: a verified `issues` closed event for an issue (not a pull request): keep its ref and labels, in memory, for the pass that takes its awaiting labels off

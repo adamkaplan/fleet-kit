@@ -30363,13 +30363,58 @@ class TestDecisionsFromGitHub(Base):
         self.assertTrue([p for p in reads if "state=open" in p], reads)
         self.assertFalse([p for p in reads if "state=all" in p], reads)   # #570: it used to ask for state=all for the person's label
 
-    def test_a_closed_issue_that_keeps_the_persons_label_is_not_listed_at_all(self):   # #570: it used to stay listed, marked closed
+    def closed_pass(self, runner=None):
+        """One run of the closed-issue pass on the rig's hub: the fresh read of every closed event it holds (bin/closed_labels.py)."""
+        engine = self.world.engine
+        engine.gh_runner = runner or FakeMergedGh()
+        closed_labels = sb.load_module("closed_labels")
+        ns = types.SimpleNamespace(**{n: getattr(sb, n) for n in closed_labels.NEEDS})
+        return closed_labels.run_pass(ns, engine, self.world.clock.now(), sb.IMPACT_PASS_CALLS)
+
+    def close_event(self, issue):
+        issue["state"] = "closed"
+        self.gh.send("issues", {"action": "closed", "issue": dict(issue)})
+
+    def test_a_closed_issue_leaves_the_list_when_a_fresh_read_says_it_is_closed_and_not_before(self):   # #570
         issue = self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
         self.rig.pump(15)
         self.assertEqual(len(self.derive()[0]), 1)
-        issue["state"] = "closed"
-        self.gh.send("issues", {"action": "closed", "issue": dict(issue)})
-        self.assertEqual(self.derive()[0], [], "a closed issue leaves the list when it closes, whatever label it still carries")
+        self.close_event(issue)
+        self.assertEqual(len(self.derive()[0]), 1, "the event payload alone drops nothing: a late or replayed event must not hide a decision")
+        self.closed_pass()
+        self.assertEqual(self.derive()[0], [], "the fresh read says closed: it leaves the list, whatever label it still carries")
+
+    def test_a_reopened_issue_stays_listed_even_though_a_closed_event_was_seen(self):
+        issue = self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
+        self.rig.pump(15)
+        self.close_event(issue)
+        issue["state"] = "open"   # reopened before the pass looks
+        self.gh.send("issues", {"action": "reopened", "issue": dict(issue)})
+        self.closed_pass()
+        self.assertEqual([d["ask"] for d in self.derive()[0]], [7], "the current read says open: still listed")
+
+    def test_a_replayed_old_closed_event_after_a_reopen_hides_nothing(self):
+        issue = self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
+        self.rig.pump(15)
+        stale = dict(issue, state="closed")
+        self.gh.send("issues", {"action": "closed", "issue": stale})
+        self.closed_pass()   # the issue is open: nothing happens
+        self.world.tick(60)
+        self.gh.send("issues", {"action": "closed", "issue": stale})   # the same old event again
+        self.closed_pass()
+        self.assertEqual([d["ask"] for d in self.derive()[0]], [7], "an open decision is never hidden by an old payload")
+
+    def test_a_read_that_fails_keeps_the_decision_listed(self):
+        issue = self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
+        self.rig.pump(15)
+        self.close_event(issue)
+        self.gh.api_down = True
+        self.closed_pass()
+        self.assertEqual([d["ask"] for d in self.derive()[0]], [7], "fail toward showing the decision")
+        self.gh.api_down = False
+        self.world.tick(sb.load_module("closed_labels").RETRY_SECONDS + 1)
+        self.closed_pass()
+        self.assertEqual(self.derive()[0], [], "once the read works and says closed, it leaves")
 
     def test_derivation_adds_no_gh_call_per_pass(self):
         self.gh.issue(5, title="A", labels=[DECISION_LABEL])
@@ -41616,19 +41661,21 @@ class TestDecisionBaselineSeams(BaselineWorld):
         decisions, errors = baseline_derive(self.world.engine, self.world.clock.now)
         self.assertFalse([d for d in decisions if "order" in d or "waits_for" in d], "no line anywhere: the list carries nothing new")
 
-    def test_a_closed_issue_is_never_kept_whatever_label_it_carries(self):   # #570: it used to stay listed, marked closed
+    def test_a_closed_issue_is_never_added_and_one_kept_leaves_only_when_forgotten_by_a_fresh_read(self):   # #570: it used to stay listed, marked closed
         baseline_attach_hub(self.world.engine, self.route, self.world.clock.now)
         hub = self.world.engine.hub
         mine, cos = "me:awaiting-user", "me:awaiting-cos"
         issue = lambda n, state, names: {"number": n, "title": "issue %d" % n, "state": state,
                                          "labels": [{"name": x} for x in names], "updated_at": "2027-01-15T07:00:00Z"}
-        hub.note_awaiting_issue(API, issue(20, "closed", [mine]))              # closed, the person's label: not kept
-        hub.note_awaiting_issue(API, issue(21, "closed", [cos]))               # closed, the Chief of Staff's: not kept
+        hub.note_awaiting_issue(API, issue(20, "closed", [mine]))              # closed, the person's label: never added
+        hub.note_awaiting_issue(API, issue(21, "closed", [cos]))               # closed, the Chief of Staff's: never added
         hub.note_awaiting_issue(API, issue(22, "open", [mine]))                # open: as ever
-        hub.note_awaiting_issue(API, issue(23, "closed", [mine, cos]))         # both: not kept
+        hub.note_awaiting_issue(API, issue(23, "closed", [mine, cos]))         # both: never added
         got = {r["number"]: (r["tier"], r["closed"]) for r in hub.awaiting_listing()[0]}
         self.assertEqual(got, {22: ("human", False)})
-        hub.note_awaiting_issue(API, issue(22, "closed", [mine]))              # an open one that closes leaves too
+        hub.note_awaiting_issue(API, issue(22, "closed", [mine]))              # a closed PAYLOAD for a kept issue drops nothing
+        self.assertEqual([r["number"] for r in hub.awaiting_listing()[0]], [22])
+        hub.forget_awaiting(API, 22)                                           # a fresh read said closed
         self.assertEqual(hub.awaiting_listing()[0], [])
 
     def test_a_closed_issue_never_shows_and_the_report_that_named_it_goes_with_it(self):   # #570: it used to show in the human tier marked closed
@@ -56932,6 +56979,9 @@ class StubIssueHub:
     def closed_issue_snapshot(self):
         return {ref: dict(entry) for ref, entry in self.entries.items()}
 
+    def forget_awaiting(self, repo, number):
+        self.forgotten = getattr(self, "forgotten", []) + [(repo, number)]
+
     def _read_one(self, repo, path, now, fresh=False):
         number = int(path.rsplit("/", 1)[1])
         self.read_log.append((repo, number, fresh))
@@ -57085,6 +57135,12 @@ class TestClosedIssueLabels(Base):
         self.assertEqual([(e, s) for e, s, _ in said], [("github.rejected", "acme/api")])
         self.assertIn("issues closed event not kept", said[0][2]["reason"])
 
+    def test_the_hub_is_told_to_forget_an_issue_only_when_the_fresh_read_says_closed(self):
+        gh = FakeMergedGh()
+        self.go({"acme/api#41": self.entry(), "acme/api#42": self.entry(), "acme/api#43": self.entry()},
+                {41: self.issue("closed"), 42: self.issue("open"), 43: sb.GitHubUnavailable("HTTP 502")}, gh)
+        self.assertEqual(self.engine.hub.forgotten, [("acme/api", 41)], "closed: forgotten; reopened or unreadable: still listed")
+
     def test_the_live_label_name_is_pinned_to_the_fleet_prefix(self):
         with mock.patch.object(sb.getpass, "getuser", return_value="osuser"):
             self.assertEqual(sb.awaiting_live_label({}), "osuser:awaiting-live")
@@ -57098,7 +57154,7 @@ class TestClosedIssueLabels(Base):
         self.assertEqual([ref.rpartition("#")[2] for ref in rig.hub.closed_issue_snapshot()], ["7"], "exactly the issue that closed")
         (entry,) = rig.hub.closed_issue_snapshot().values()
         self.assertEqual(entry["labels"], sorted([DECISION_LABEL, "bug"]))
-        self.assertEqual(rig.hub.awaiting_listing()[0], [], "and the issue is no longer kept for the list")
+        self.assertEqual(len(rig.hub.awaiting_listing()[0]), 1, "the payload alone drops nothing: the fresh-read pass decides")
 
     def test_the_hub_keeps_a_closed_event_in_memory_and_the_daemons_pass_runs_the_cleaning(self):
         self.engine.hub = StubIssueHub({}, {})

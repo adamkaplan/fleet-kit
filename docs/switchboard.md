@@ -4491,9 +4491,11 @@ a parked ASK can still raise T9 (an ask idle for 3 days); whether parking should
 
 ## A closed issue never shows in your panel, and its awaiting labels come off (#570)
 
-An ISSUE that closes leaves the decision list at once, whatever label it still carries: the list never holds a closed issue or a closed pull
+An ISSUE that closes leaves the decision list, whatever label it still carries: the list never holds a closed issue or a closed pull
 request, and it is never shown "marked closed" (#117 had kept it listed so a question closed as won't-do would not vanish unseen; the owner does not
-want it). The catch-up read asks for open issues only, a webhook for a closed issue forgets it, and a report that named it goes with it.
+want it). The catch-up read asks for open issues only, a closed issue is never added, and a report that named it goes with it. A closed webhook
+PAYLOAD alone drops nothing (a late or replayed event, arriving after a reopen, would hide an open decision): the issue leaves only when a FRESH read says it is
+closed (the pass below tells the hub to forget it); one that reads open, or whose read fails, stays listed (fail toward showing the decision).
 
 So that an unanswered question is not lost silently, the daemon cleans up after the close (`bin/closed_labels.py`, built like the merged pull request
 labels of #559). From the verified `issues` closed events the hub keeps (memory only), for an issue that carried one of the fleet's awaiting labels

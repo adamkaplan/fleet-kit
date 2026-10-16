@@ -1,6 +1,8 @@
 """A closed issue never keeps asking for an answer (ask #570).
 
-The decision list no longer holds a closed issue (see `note_awaiting_issue`). This is the other half: when an issue closes while it carries one of
+The decision list never holds a closed issue: a closed event payload alone does NOT drop one (a late or replayed event would hide an open decision), so this pass
+reads the issue fresh and, when GitHub says it is closed, tells the hub to forget it (`forget_awaiting`); an issue that reads open stays listed, and so does one whose
+read fails (fail toward showing the decision). This is also the other half: when an issue closes while it carries one of
 the fleet's awaiting labels, the daemon takes those labels off, so the closed issue stops asking, and tells the Chief of Staff in ONE line so an
 unanswered question is not lost silently. It works from the `issues` closed events the hub keeps (memory only), as `bin/merged_labels.py` works
 from pull request merge events, and is built the same way:
@@ -75,6 +77,8 @@ def run_pass(sb, engine, now, calls):
             engine.audit.append(engine.actor, "closed.labels_skipped", ref, {"fresh_state": sb._one_line(str(state), 20)})
             _done(memory, ref, now)
             continue
+        if hasattr(hub, "forget_awaiting"):
+            hub.forget_awaiting(repo, number)   # GitHub says closed NOW: the issue leaves the list (before any label write, which may fail)
         remove = sorted(ours & shared.label_set(data.get("labels")))
         if remove:
             runner = getattr(engine, "gh_runner", None) or sb.subprocess.run
