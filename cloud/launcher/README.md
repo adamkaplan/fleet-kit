@@ -60,7 +60,7 @@ The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below 
   kubeconfig is read from the vault by command and given to `kubectl create token cw-operator` on a pipe (never a file or
   an argument). The token is checked (a JWT's `exp` and `iat` are read; a lifetime over 60 minutes is refused; for a token
   that is not a JWT the requested duration is trusted). It is written once to a 0600 file (`O_EXCL`) in a private 0700
-  directory `$TMPDIR/fleet-cw-<uid>/cmd-<pid>-<random>/` that the launcher's token-file login needs, and the directory is
+  directory `$TMPDIR/cwtok-<uid>/cmd-<pid>-<random>/` that the launcher's token-file login needs, and the directory is
   removed when the command ends, however it ends (normal, failure, SIGINT, SIGTERM). A command killed with SIGKILL leaves its
   directory until the next command, which removes any directory of a dead process or older than an hour and says so once.
   No token is cached or kept between commands. Nothing else (no other context or credential) is ever tried.

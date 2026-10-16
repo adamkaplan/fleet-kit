@@ -221,7 +221,7 @@ class Base(unittest.TestCase):
         (self.stub_dir / "git_token").write_text(GIT_TOKEN + "\n")
         (self.home / "auth.json").write_text(json.dumps({"github-copilot": MODEL_ENTRY, "other": {"key": "must-not-travel"}}))
         (self.home / "tmp").mkdir()
-        self.root = self.home / "tmp" / ("fleet-cw-%d" % os.getuid())
+        self.root = self.home / "tmp" / ("cwtok-%d" % os.getuid())
         tmpdir = mock.patch.object(tempfile, "tempdir", str(self.home / "tmp"))
         tmpdir.start()
         self.addCleanup(tmpdir.stop)

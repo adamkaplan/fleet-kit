@@ -557,7 +557,7 @@ def cluster_token(env=None, now=None):
 def private_root():
     """The per-user directory (0700, ours, not a link) under the temp dir that holds the token files of running commands. One that has another
     owner, another mode or is a link is REFUSED, never repaired."""
-    root = Path(tempfile.gettempdir()) / ("fleet-cw-%d" % os.getuid())
+    root = Path(tempfile.gettempdir()) / ("cwtok-%d" % os.getuid())
     try:
         root.mkdir(mode=0o700, exist_ok=True)
         found = os.lstat(str(root))
