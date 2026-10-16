@@ -8,9 +8,9 @@ Status: design for decision, corrected to the owner's standing order (#568, unde
 
 In scope: the organisation's repositories where the existing GitHub App ("the App") is installed.
 
-Out of scope and unchanged: FleetKit's own repository, and any repository the App is not installed on. Their local agents keep today's login, with the repository ruleset as the server-side guard. No second App and no machine user is created for them.
+Out of scope and unchanged: The fleet-kit repository itself, and any repository the App is not installed on. Their local agents keep today's login, with the repository ruleset as the server-side guard. No second App and no machine user is created for them.
 
-Cloud workers serve the organisation's repositories only; no FleetKit task, test or demo runs in a cloud worker.
+Cloud workers serve the organisation's repositories only; no fleet-kit task, test or demo runs in a cloud worker.
 
 Names below are neutral (`acme-org/widget-api`, `acme-bot`, used only to describe the rejected Option B). No token, key, account or keyring entry of a real installation appears in this file, and a test (`TestAgentCredentialsDoc` in `bin/test-switchboard`) scans it for token-like strings.
 
@@ -106,7 +106,7 @@ That shim work is a separate top-tier work item, size L, with the owner's clear.
 
 ### Out of scope, unchanged
 
-FleetKit's own repository and any repository without the App keep today's local login, with the ruleset as the server-side guard. No second App and no machine user is created for them, and the inventory rows 1 to 4 and 6 stay as they are for them.
+The fleet-kit repository itself and any repository without the App keep today's local login, with the ruleset as the server-side guard. No second App and no machine user is created for them, and the inventory rows 1 to 4 and 6 stay as they are for them.
 
 Who merges after the change, in scope:
 
@@ -122,7 +122,7 @@ Every step that creates or changes a credential is the owner's (see "The owner's
 3. The shim work item lands separately (top tier, size L, owner's clear), with the mint, cache and fail-closed behaviour above.
 4. The owner stores the App key where only the shim process reads it, and adds the repository-to-installation map beside `gh_users` in `~/.config/fleet-switchboard/config.json`.
 5. The owner removes the broad token from the agents' environment for in-scope repositories, so there is nothing broader to fall back on.
-6. An agent, with the owner present, runs the live proof of clause (4): an admin call is refused (403 or 404) and a branch push, pull request, label, comment and a merge through the ruleset still work. The same proof checks that FleetKit's own repository is unchanged.
+6. An agent, with the owner present, runs the live proof of clause (4): an admin call is refused (403 or 404) and a branch push, pull request, label, comment and a merge through the ruleset still work. The same proof checks that the fleet-kit repository itself is unchanged.
 
 ## Rollback
 
@@ -146,4 +146,4 @@ These are the only credential-creating or credential-changing steps. No command 
 5. Add the repository-to-installation map to the configuration once the shim work has landed.
 6. Remove the broad inherited token from the agents' shells for in-scope repositories.
 7. Put the key's rotation date in a calendar; at rotation, generate a new key in the App's settings and replace the stored one.
-8. Leave FleetKit's own repository and any repository without the App alone.
+8. Leave the fleet-kit repository itself and any repository without the App alone.
