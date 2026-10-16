@@ -41687,6 +41687,18 @@ class TestDecisionBaselineSeams(BaselineWorld):
         hub.forget_awaiting(API, 22)                                           # a fresh read said closed
         self.assertEqual(hub.awaiting_listing()[0], [])
 
+    def test_a_mixed_case_repo_is_one_key_for_events_reads_and_the_fresh_read_forget(self):   # #570: the closed ref is folded; the hub must fold the same way
+        baseline_attach_hub(self.world.engine, self.route, self.world.clock.now)
+        hub = self.world.engine.hub
+        issue = {"number": 30, "title": "x", "state": "open", "labels": [{"name": "me:awaiting-user"}], "updated_at": "2027-01-15T07:00:00Z"}
+        hub.note_awaiting_issue("Acme-Org/Widget-Service", issue)
+        hub.note_awaiting_issue("acme-org/widget-service", issue)              # the lower-cased variant of the same repo: the same issue
+        hub.note_awaiting_issue("ACME-ORG/WIDGET-SERVICE", issue)
+        self.assertEqual(len(hub.awaiting_listing()[0]), 1, "three spellings, one issue")
+        self.assertEqual(hub.awaiting_key("Acme-Org/Widget-Service", 30), hub.awaiting_key("ACME-ORG/widget-service", 30))
+        hub.forget_awaiting("acme-org/widget-service", 30)                     # the closed ref carries the folded name
+        self.assertEqual(hub.awaiting_listing()[0], [], "it leaves the list whatever case configured or sent")
+
     def test_a_closed_issue_never_shows_and_the_report_that_named_it_goes_with_it(self):   # #570: it used to show in the human tier marked closed
         entries = sb.decision_core.build_entries(
             [{"kind": "issue", "title": "Won't-do: drop the legacy path", "ask": 7, "agent": None, "since": 100.0, "seed": "issue:acme/api#7",
@@ -57143,6 +57155,19 @@ class TestClosedIssueLabels(Base):
         self.assertEqual(hub.closed_issues, {}, "nothing was kept")
         self.assertEqual([(e, s) for e, s, _ in said], [("github.rejected", "acme/api")])
         self.assertIn("issues closed event not kept", said[0][2]["reason"])
+
+    def test_a_mixed_case_configured_repo_is_cleaned_and_an_excluded_one_stays_excluded_in_any_case(self):   # #570
+        world = World(self, agents=(), config={"gh": FAKE_GH, "github_repos": ["Acme-Org/Widget-Service"], "excluded_repos": ["Acme-Org/Secret-Repo"]})
+        world.add_agent("chief-of-staff", fleet={"role": "chief-of-staff"})
+        self.engine = world.new_engine()
+        self.world = world
+        gh = FakeMergedGh()
+        entries = {"acme-org/widget-service#7": self.entry(), "ACME-ORG/SECRET-REPO#8": self.entry(), "acme-org/secret-repo#9": self.entry()}
+        hub_calls = []
+        self.go(entries, {7: self.issue(), 8: self.issue(), 9: self.issue()}, gh)
+        self.assertEqual(sorted(gh.removed), sorted(self.awaiting), "only the watched repo, found in a different case, was cleaned")
+        (line,) = self.audit("closed.labels_removed")
+        self.assertEqual(line["subject"], "acme-org/widget-service#7")
 
     def test_the_hub_is_told_to_forget_an_issue_only_when_the_fresh_read_says_closed(self):
         gh = FakeMergedGh()

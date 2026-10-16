@@ -14286,6 +14286,12 @@ class GitHubHub:
 
     # -- the issues that wait on you (PR 14): events keep the picture, the catch-up read makes it right
 
+    @staticmethod
+    def awaiting_key(repo, number):
+        """THE key of an awaiting issue: the repository folded the one way the fleet folds names everywhere else (`plan_ledger.normal_repo`), so the
+        configured case, the case an event carries and the case a ref carries are one issue. Every read and write of `self.awaiting` goes through it."""
+        return (plan_ledger.normal_repo(repo), number)
+
     def note_awaiting_issue(self, repo, issue, when=None):
         """One issue as a webhook payload or a read shows it: listed when it is open and carries a label,
         forgotten otherwise. `since` is kept from the first time it was seen listed; a `labeled` event says
@@ -14297,7 +14303,7 @@ class GitHubHub:
         if number is None or _is_pr(issue) or not isinstance(issue.get("labels"), list):
             return
         names = {(label.get("name") if isinstance(label, dict) else label) for label in issue["labels"]}
-        key = (repo, number)
+        key = self.awaiting_key(repo, number)
         tier = decision_core.issue_tier(names, awaiting_label(self.config), awaiting_cos_label(self.config))
         with self.lock:
             closed = issue.get("state", "open") == "closed"
@@ -14314,7 +14320,8 @@ class GitHubHub:
                 waits = decision_core.parse_waits_for(issue["body"], repo) if "body" in issue else (known or {}).get("waits_for", [])
                 self.awaiting[key] = {"title": str(issue.get("title") or ""), "since": since,
                                       "parent": parent_of(issue), "tier": tier, "rows": rows,
-                                      "raised_by": raised if rows else None, "closed": closed, "waits_for": waits}
+                                      "raised_by": raised if rows else None, "closed": closed, "waits_for": waits,
+                                      "repo": repo}
             else:
                 self.awaiting.pop(key, None)
 
@@ -14348,7 +14355,7 @@ class GitHubHub:
     def forget_awaiting(self, repo, number):
         """#570: the issue is CLOSED by a fresh read: it leaves the list. (A closed event payload alone never does: see `note_awaiting_issue`.)"""
         with self.lock:
-            self.awaiting.pop((repo, number), None)
+            self.awaiting.pop(self.awaiting_key(repo, number), None)
 
     def note_closed_issue(self, repo, issue):
         """#570: a verified `issues` closed event for an issue (not a pull request): keep its ref and labels, in memory, for the pass that takes its awaiting labels off
@@ -14391,16 +14398,17 @@ class GitHubHub:
             if truncated:
                 self.last_truncated.setdefault("capped_reads", []).append("%s issues" % name)
         with self.lock:
-            old = {key: value for key, value in self.awaiting.items() if key[0] == repo}
-            self.awaiting = {key: value for key, value in self.awaiting.items() if key[0] != repo}
+            folded = plan_ledger.normal_repo(repo)
+            old = {key: value for key, value in self.awaiting.items() if key[0] == folded}
+            self.awaiting = {key: value for key, value in self.awaiting.items() if key[0] != folded}
         for name, label in reversed(wanted):  # your label last: an issue with both is yours
             for record in found[name]:
                 self.note_awaiting_issue(repo, dict(record, state="closed" if record.get("state") == "closed" else "open",
                                                     labels=[{"name": label}]), now)
-                known = old.get((repo, _number(record)))
+                known = old.get(self.awaiting_key(repo, _number(record)))
                 if known:
                     with self.lock:
-                        self.awaiting[(repo, _number(record))]["since"] = known["since"]
+                        self.awaiting[self.awaiting_key(repo, _number(record))]["since"] = known["since"]
         with self.lock:
             self.awaiting_read[repo] = None
         return None
@@ -14408,7 +14416,8 @@ class GitHubHub:
     def awaiting_listing(self):
         """(records, errors) for the decisions: what the hub knows, and what it could not read."""
         with self.lock:
-            records = [{"repo": repo, "number": number, "title": entry["title"], "since": entry["since"],
+            names = {plan_ledger.normal_repo(name): name for name in self.watches}   # shown in the configured case, whatever case an event carried
+            records = [{"repo": names.get(repo, entry.get("repo") or repo), "number": number, "title": entry["title"], "since": entry["since"],
                         "parent": entry["parent"], "tier": entry["tier"], "rows": entry.get("rows", []),
                         "raised_by": entry.get("raised_by"), "closed": bool(entry.get("closed")),
                         "waits_for": entry.get("waits_for") or []}
