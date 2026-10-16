@@ -39866,6 +39866,22 @@ class TestHeldTop(DecisionsBase):
             self.assertTrue(found)
         self.assertIn("longer than", self.defects(self.OPEN + self.TOP + "x" * 70001)[0])
 
+    def test_a_pre_mermaid_tag_fails_in_the_top_however_long_its_attributes_or_spelled(self):
+        def top_with(tag):
+            return self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + self.QS + tag + "\n"   # in the top part, after the questions
+        for n in (250, 1000, 60000):
+            tag = '<pre data-x="%s" class=mermaid>' % ("a" * n)
+            found = self.defects(top_with(tag))
+            self.assertEqual((self.named(found, "diagram"), len(found)), (1, 1), (n, found))
+        for tag in ("<pre class='a mermaid b'>", '<PRE CLASS="MERMAID">', "<pre  class = mermaid >"):
+            self.assertEqual(self.named(self.defects(top_with(tag)), "diagram"), 1, tag)
+        for tag in ('<pre class="code">', "<pre>", "<preview class=mermaid>"):
+            self.assertEqual(self.defects(top_with(tag)), [], tag)
+        started = time.monotonic()
+        found = self.defects(top_with("<pre " + "x" * 60000))   # never closed: it cannot be judged, so it fails
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(self.named(found, "diagram"), 1)
+
     def test_underscore_only_cells_fail(self):
         table = ("## What changes for you\n\n| Before | After |\n|---|---|\n| ___ | You get one card. |\n| You open a list. | It opens itself. |\n\n")
         found = self.defects(self.OPEN + self.WHY + table + self.EXAMPLE + self.QS)

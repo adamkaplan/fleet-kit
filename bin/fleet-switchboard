@@ -21205,20 +21205,51 @@ def pr_is_held(labels, body, now=None):
 _HELD_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 HELD_BODY_MAX = 70000   # a longer body is not read (GitHub's own cap is 65536)
 _HELD_PLACEHOLDER_RE = re.compile(r"<[^<>]*>")   # linear: the class stops at the next `<`
-_HELD_CLASS_MERMAID_RE = re.compile(r"\bclass\s*=\s*[\"']?[^\"'>]*\bmermaid\b", re.I)
+
+
+def _held_class_tokens(tag):
+    """The class tokens (lower case) of an HTML tag's text: a linear walk over every `class=` (any case, spaces around `=`, quoted either way or bare)."""
+    low = tag.lower()
+    tokens, at = [], low.find("class")
+    while at >= 0:
+        i = at + 5
+        while i < len(low) and low[i] in " \t":
+            i += 1
+        if i < len(low) and low[i] == "=":
+            i += 1
+            while i < len(low) and low[i] in " \t":
+                i += 1
+            if i < len(low) and low[i] in "\"'":
+                end = low.find(low[i], i + 1)
+                end = len(low) if end < 0 else end
+                tokens += low[i + 1:end].split()
+                i = end
+            else:
+                end = i
+                while end < len(low) and low[end] not in " \t>":
+                    end += 1
+                tokens += low[i:end].split()
+                i = end
+        at = low.find("class", max(i, at + 5))
+    return tokens
 
 
 def _held_pre_mermaid(line):
-    """True when `line` opens a `<pre class=...mermaid...>`: a bounded scan (each `<pre` looks at most 200 characters ahead), so it is linear."""
+    """True when `line` opens a `<pre>` whose class tokens include `mermaid`, or a `<pre` that is never closed on the line (it cannot be judged, so it
+    counts). Each `<pre` is walked to its closing `>` with `find` and the search resumes after it: linear, no window, no backtracking."""
     low = line.lower()
     at = low.find("<pre")
     while at >= 0:
-        tag = line[at:at + 200]
-        end = tag.find(">")
-        tag = tag[:end] if end >= 0 else tag
-        if "mermaid" in tag.lower() and _HELD_CLASS_MERMAID_RE.search(tag):
-            return True
-        at = low.find("<pre", at + 4)
+        after = low[at + 4:at + 5]
+        if not after.isalpha():
+            end = line.find(">", at)
+            if end < 0:
+                return True
+            if "mermaid" in _held_class_tokens(line[at:end]):
+                return True
+            at = low.find("<pre", end)
+        else:
+            at = low.find("<pre", at + 4)
     return False
 
 
