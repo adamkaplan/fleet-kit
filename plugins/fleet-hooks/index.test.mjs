@@ -285,3 +285,84 @@ test("a failed rename removes the temporary file", async () => {
   assert.equal(removed.length, 1);
   assert.match(removed[0], /tool-rate\.json\.\d+\.[0-9a-f]{12}\.tmp$/);
 });
+
+// ---- #290 slice 6: the plugin's pushes
+import { makeEventSender, eventOf, sessionOf, wireEvents, EVENT_QUEUE_MAX } from "./index.js";
+
+function fakeSocket({ fail = false, written }) {
+  const handlers = {};
+  const socket = {
+    on: (name, fn) => { handlers[name] = fn; return socket; },
+    end: (text, cb) => { written.push(text); cb && cb(); },
+    destroy() {},
+  };
+  setImmediate(() => (fail ? handlers.error && handlers.error(new Error("ENOENT")) : handlers.connect && handlers.connect()));
+  return socket;
+}
+const tick = () => new Promise((resolve) => setTimeout(resolve, 20));
+
+test("1000 events with no socket return at once, throw nothing, and the first later message carries the count dropped", async () => {
+  const written = [];
+  let failing = true;
+  const sender = makeEventSender({ dir: "/nowhere", connect: () => fakeSocket({ fail: failing, written }) });
+  const started = process.hrtime.bigint();
+  for (let n = 0; n < 1000; n += 1) assert.doesNotThrow(() => sender.push("idle", "ses_a"));
+  const took = Number(process.hrtime.bigint() - started) / 1e6;
+  assert.ok(took < 50, `1000 hooks took ${took} ms`);
+  await tick();
+  await tick();
+  failing = false;
+  sender.push("idle", "ses_a");
+  await tick();
+  await tick();
+  assert.equal(written.length >= 1, true);
+  const last = JSON.parse(written[written.length - 1]);
+  assert.ok(last.dropped >= 1000 - EVENT_QUEUE_MAX, `the next message carries the count, got ${last.dropped}`);
+  assert.equal(sender.dropped(), 0, "the count was told, so it is owed no more");
+});
+
+test("a message holds only the fixed fields: no text, and a bad session or event name is never sent", async () => {
+  const written = [];
+  const sender = makeEventSender({ dir: "/nowhere", connect: () => fakeSocket({ written }) });
+  assert.equal(sender.push("prompt", "ses_b", { person: true, id: "msg_1", text: "SECRET PROMPT" }), true);
+  assert.equal(sender.push("nonsense", "ses_b"), false);
+  assert.equal(sender.push("idle", "not-a-session"), false);
+  await tick();
+  assert.equal(written.length, 1);
+  const message = JSON.parse(written[0]);
+  assert.deepEqual(Object.keys(message).sort(), ["at", "event", "id", "kind", "person", "sessionID", "v"]);
+  assert.ok(!written[0].includes("SECRET"));
+});
+
+test("only the facts named are pushed: a compaction hook, an idle event and a user message; anything else pushes nothing", async () => {
+  const pushed = [];
+  const sender = { push: (...args) => pushed.push(args) };
+  let compaction;
+  const events = [
+    { type: "session.idle", data: { sessionID: "ses_c" } },
+    { type: "message.created", data: { sessionID: "ses_c", role: "user", id: "msg_9" } },
+    { type: "message.created", data: { sessionID: "ses_c", role: "assistant", id: "msg_8" } },
+    { type: "session.deleted", data: { sessionID: "ses_c" } },
+  ];
+  const api = {
+    session: { hook: (name, fn) => { if (name === "compaction") compaction = fn; } },
+    event: { subscribe: async function* () { yield* events; } },
+  };
+  wireEvents(api, sender);
+  compaction({ sessionID: "ses_c" });
+  await tick();
+  assert.deepEqual(pushed.map((p) => p[0]).sort(), ["compaction", "idle", "prompt"]);
+  assert.equal(eventOf({ type: "session.updated" }), null);
+  assert.equal(sessionOf({ durable: { aggregateID: "ses_d" } }), "ses_d");
+});
+
+test("setup with an api that offers none of it, or with events switched off, registers nothing new", async () => {
+  const { home } = fakeHome();
+  const made = [];
+  const sender = { push: (...a) => made.push(a) };
+  await plugin.setup({ shell: { hook() {} }, permission: { hook() {} } }, {}, { home, sender });
+  assert.deepEqual(made, []);
+  let hooked = 0;
+  await plugin.setup({ session: { hook: () => { hooked += 1; } }, shell: { hook() {} }, permission: { hook() {} } }, { FLEET_SWITCHBOARD_PLUGIN_EVENTS: "off" }, { home, sender });
+  assert.equal(hooked, 0);
+});
