@@ -1443,7 +1443,8 @@ class V2Http:
             except Exception:
                 return None
 
-    def _load(self):
+    def _read_file(self):
+        """(host, port, password, pid) of the service file, read with every safety check. Raises V2Unreachable."""
         try:
             parent = os.lstat(str(self.file.parent))
             if parent.st_uid != os.getuid() or parent.st_mode & 0o022 or stat.S_ISLNK(parent.st_mode):
@@ -1466,6 +1467,19 @@ class V2Http:
             host, port = url.hostname, url.port
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             raise V2Unreachable("no usable service file") from None
+        return host, port, password, pid
+
+    def service_identity(self):
+        """The service's process id from a FRESH read of its private service file (a restart changes it), or None when the file cannot be read or names a
+        process that is gone. Nothing is cached and the password is never returned."""
+        try:
+            pid = self._read_file()[3]
+        except V2Unreachable:
+            return None
+        return pid if isinstance(pid, int) and not isinstance(pid, bool) and self.alive(pid) else None
+
+    def _load(self):
+        host, port, password, pid = self._read_file()
         if isinstance(pid, int) and not self.alive(pid):
             raise V2Unreachable("the service file names a process that is gone")
         token = base64.b64encode(("opencode:" + password).encode("utf-8")).decode("ascii")
@@ -1903,6 +1917,10 @@ class V2Client:
     def _limit(limit):
         """A page of a transcript is never larger than V2_READ_LIMIT_MAX messages, whatever a caller asks."""
         return min(limit, V2_READ_LIMIT_MAX) if isinstance(limit, int) and not isinstance(limit, bool) else limit
+
+    def service_identity(self):
+        """The service's process id (changes when it restarts), or None (the CLI transport, no readable service file, or the process is gone)."""
+        return self.http.service_identity() if self.http is not None and hasattr(self.http, "service_identity") else None
 
     def service_url(self):
         """Where the service is, `http://127.0.0.1:<port>`, or None (the CLI transport, or no readable service file)."""
@@ -3010,7 +3028,7 @@ def fact_sources(state_dir):
     the same rule, and stores nothing.
     """
     return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir),
-            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), JobFacts(), PaneFacts(), DiskFacts(), CpuFacts(), SpotlightFacts(), DockerReapFacts()]
+            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), JobFacts(), PaneFacts(), HeadlessRestartFacts(), DiskFacts(), CpuFacts(), SpotlightFacts(), DockerReapFacts()]
 
 
 # --------------------------------------------------------- observing the fleet
@@ -6605,6 +6623,85 @@ class PaneFacts:
                     out.append(Fact("pane:%s:%s:%s" % (name, info["state"], info.get("session")), chief, "pane", summary,
                                     float(info.get("at") or 0), sender="switchboard"))
         return out
+
+
+HEADLESS_SERVICE_FILE = "headless-service.json"   # {"service": {"pid", "from", "at"}, "bosses": {worker: boss}}: what the restart notice remembers
+
+
+class HeadlessRestartFacts:
+    """#433 slice 4: a worker with no terminal is never silently lost. (1) When the OpenCode service restarts (its process id, read fresh from the
+    private service file, differs from the one seen before) each headless worker's boss is told once, naming the worker: the service has resumed
+    the session itself, so nothing needs relaunching, but a boss that waited on it should know. The key holds the new process id, so a restart
+    is delivered once and a pass is the same pass again. A service that does not answer is NOT a restart (the id is only compared when it is read),
+    and the first id ever seen is recorded without a notice. (2) A headless worker whose session no longer exists is reported to the boss it
+    last had (remembered here), or to every Chief of Staff when none is known. Terminal workers are not touched."""
+
+    __name__ = "headless_restart_facts"
+
+    def __init__(self):
+        self.engine = None
+
+    def bind(self, engine):
+        self.engine = engine
+
+    def __call__(self):
+        engine = self.engine
+        discovery = getattr(engine, "discovery", None) if engine else None
+        if engine is None or discovery is None or engine.state_dir is None:
+            return []
+        state = engine.state_dir
+        try:
+            records, unread = load_agent_presence().scan_records(state)
+        except Exception as err:
+            engine._note("source.error", "headless_restart_facts", {"error": "the headless records could not be read: %s" % _one_line(str(err), 100)})
+            return []
+        remembered = _read_small(state, HEADLESS_SERVICE_FILE)
+        service, bosses = dict(remembered.get("service") or {}), dict(remembered.get("bosses") or {})
+        pid = engine.v2.service_identity()
+        changed = False
+        if pid is not None and service.get("pid") != pid:
+            service = {"pid": pid, "from": service.get("pid"), "at": engine.now()}
+            changed = True
+        headless = {o.name: o for o in discovery.agents.values() if o.headless}
+        created = {r["worker"]: r.get("created") or 0 for r in records}
+        for name, observation in headless.items():
+            boss = boss_name(discovery, observation)
+            if boss is not None and bosses.get(name) != boss:
+                bosses[name] = boss
+                changed = True
+        for gone in [n for n in bosses if n not in created] if not unread else []:   # a worker with no record any more (retired) is forgotten: the file does not grow for ever
+            del bosses[gone]
+            changed = True
+        if changed:
+            try:
+                _write_small(state, HEADLESS_SERVICE_FILE, {"service": service, "bosses": bosses})
+            except OSError as err:
+                engine._note("source.error", "headless_restart_facts", {"error": _one_line(str(err))})
+        facts = []
+        if service.get("from") is not None and isinstance(service.get("pid"), int):
+            for name, observation in sorted(headless.items()):
+                boss = boss_name(discovery, observation)
+                if boss is None or observation.conflict or created.get(name, 0) > (service.get("at") or 0):   # a worker launched after the restart was not hit by it
+                    continue
+                facts.append(Fact("headless.restarted:%s:%s" % (service["pid"], observation.session_id), boss, "headless.restarted",
+                                  "The OpenCode service restarted (process %s replaced %s), seen at %s. %s has no terminal: if it was working, its turn may have been interrupted "
+                                  "and the session may need a poke: check it with `%s status`." % (
+                                      service["pid"], service["from"], iso(service.get("at") or engine.now()), name, PROG),
+                                  float(service.get("at") or engine.now()), issue=_issue_of(observation.fleet), sender="switchboard"))
+        if discovery.problems:   # the service (or herdr) did not answer cleanly: a missing worker may only be unread, so nothing is called lost
+            return facts
+        chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff")
+        for record in records:
+            name = record["worker"]
+            if name in headless or name in discovery.agents:
+                continue
+            to = [bosses[name]] if bosses.get(name) in discovery.agents else chiefs
+            for recipient in to:
+                facts.append(Fact("headless.lost:%s" % record["session"], recipient, "headless.lost",
+                                  "%s has no terminal and its session %s no longer exists in the OpenCode service (or is not the worker's). Its record is still here: "
+                                  "`%s retire %s` if it is finished, otherwise relaunch it." % (name, record["session"], PROG, name),
+                                  float(record.get("created") or engine.now()), sender="switchboard"))
+        return facts
 
 
 def pane_health_status_lines(state_dir, now=None):
