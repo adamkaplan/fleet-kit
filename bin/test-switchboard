@@ -27726,12 +27726,22 @@ class TestImpactClassAndNarrowForm(LedgerBase):
         code, out, err = self.record_impact("hold", "--impact-class", "two words")
         self.assertEqual(code, 2)
         self.assertEqual(err.count("impact-class"), 1)
-        self.assertEqual(self.record_impact("hold")[0], 0)
+        self.assertEqual(self.record_impact("second-review")[0], 0)
         code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "code", "--verdict", "approve", "--impact-class", "data")
         self.assertEqual(code, 2)
         self.assertIn("belongs to the impact reviewer", err)
         stored = [e.get("impact_class") for e in self.ledger() if e["kind"] == "review_record"]
         self.assertEqual(stored, ["credentials", None])
+
+    def test_a_hold_with_no_class_is_refused_and_nothing_is_recorded(self):
+        for more in ((), ("--impact-class", "")):
+            code, out, err = self.record_impact("hold", *more)
+            self.assertEqual(code, 2)
+            self.assertIn("run the review again", err)
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "review_record"], [])
+        self.assertEqual(self.record_impact("none")[0], 0)
+        self.assertEqual(self.record_impact("hold", "--impact-class", "data")[0], 0)
+        self.assertEqual(len([e for e in self.ledger() if e["kind"] == "review_record"]), 2)
         self.assertEqual(self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve", "--impact-action", "hold",
                                      "--block", "/nonexistent")[0], 2)
 
@@ -27747,8 +27757,12 @@ class TestImpactClassAndNarrowForm(LedgerBase):
     def test_s2_a_hold_record_holds_for_the_owner_unless_its_class_is_not_top_tier(self):
         outcome = {}
         for label, more in (("credentials", ("--impact-class", "credentials")), ("performance", ("--impact-class", "performance")),
-                            ("unknown", ("--impact-class", "gizmo")), ("missing", ())):
-            self.assertEqual(self.record_impact("hold", *more)[0], 0)
+                            ("unknown", ("--impact-class", "gizmo")), ("missing", None)):
+            if more is None:   # a record already in the ledger without a class (new recordings are refused): it keeps its top-tier reading
+                sb.plan_ledger.append_entry(self.world.state, {"kind": "review_record", "pr": self.PR, "head": LEDGER_HEAD, "reviewer": "impact", "verdict": "approve",
+                                                               "blocks": 0, "notes": 0, "by": "rev", "impact_action": "hold", "summary": "x"}, 1)
+            else:
+                self.assertEqual(self.record_impact("hold", *more)[0], 0)
             outcome[label] = self.decide()
         self.assertEqual({k: v[0] for k, v in outcome.items()},
                          {"credentials": "hold", "performance": "second-review", "unknown": "hold", "missing": "hold"})
@@ -27769,6 +27783,9 @@ class TestImpactClassAndNarrowForm(LedgerBase):
         classes = rule[0] + rule[1]
         self.assertEqual(len(classes), 10)
         self.assertEqual(text.count("impact-class"), 1)
+        self.assertIn("always names its class", text)
+        self.assertIn("A hold without a class is rejected", text)
+        self.assertNotIn("Leave the class line out", text)
         self.assertEqual([c for c in classes if "`%s`" % c not in text], [])
 
     # -- S4 to S6: the agent definitions
@@ -28337,7 +28354,11 @@ class TestImpactRejudge(LedgerBase):
         self.passes([self.listed(n) for n in (9, 10, 11)])
         self.assertEqual(self.posts(), [])
         reads = len(self.view_reads)
-        for number, more in ((9, ("--impact-class", "performance")), (10, ("--impact-class", "credentials")), (11, ())):
+        for number, more in ((9, ("--impact-class", "performance")), (10, ("--impact-class", "credentials")), (11, None)):
+            if more is None:   # a record already in the ledger without a class
+                sb.plan_ledger.append_entry(self.world.state, {"kind": "review_record", "pr": "acme/app#%d" % number, "head": LEDGER_HEAD, "reviewer": "impact", "verdict": "approve",
+                                                               "blocks": 0, "notes": 0, "by": "rev", "impact_action": "hold", "summary": "x"}, 1)
+                continue
             code, out, err = self.run_as("coder", "review", "record", "acme/app#%d" % number, "--reviewer", "impact", "--verdict", "approve", "--impact-action", "hold", *more)
             self.assertEqual(code, 0, err)
         self.passes([self.listed(n) for n in (9, 10, 11)], advance=400)
@@ -53657,6 +53678,10 @@ class TestReviewerSubagents(LedgerBase):
 
     def test_the_impact_block_carries_its_action_and_a_block_for_another_head_or_a_malformed_one_is_refused(self):
         code, out, err = self.record_block("coder", "impact", self.block_text("comment", extra="impact-action: hold\n", findings=()))
+        self.assertEqual(code, 2)
+        self.assertIn("run the review again", err)
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "review_record"], [])
+        code, out, err = self.record_block("coder", "impact", self.block_text("comment", extra="impact-action: hold\nimpact-class: data\n", findings=()))
         self.assertEqual(code, 0, err)
         self.assertEqual([e["impact_action"] for e in self.ledger() if e["kind"] == "review_record"], ["hold"])
         cases = ((self.block_text(head="d" * 40), "is not the PR's head"),
