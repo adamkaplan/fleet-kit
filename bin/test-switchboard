@@ -13919,6 +13919,30 @@ class TestHeadlessPresence(Base):
         self.assertEqual(engine.pane_alerts, {})
         self.assertNotIn("hw", sb.read_pane_health(self.world.state)["states"], "a headless worker keeps no pane verdict at all")
 
+    def test_a_stale_dead_verdict_of_a_headless_worker_is_cleared_with_its_alert(self):
+        sid, pane = self.watched()
+        engine = self.world.new_engine("cli")
+        engine.discover(self.world.clock.now())
+        data = sb.read_pane_health(self.world.state)
+        data["states"]["hw"] = {"state": sb.PANE_DEAD, "why": "left by an earlier pass", "pane": pane, "session": sid, "at": int(self.world.clock.now())}
+        data["agents"]["hw"] = {"session": sid, "pane": pane}
+        sb.write_pane_health(self.world.state, dict(data, at=int(self.world.clock.now())))
+        self.world.herdr.panes.pop(pane)
+        engine.discover(self.world.clock.now() + 1)                       # headless again
+        sb.pane_health_pass(engine, self.world.clock.now() + 1)
+        self.assertEqual(engine.pane_alerts, {})
+        self.assertNotIn("hw", sb.read_pane_health(self.world.state)["states"])
+
+    def test_a_headless_record_for_another_session_does_not_hide_a_dead_terminal_worker(self):
+        self.world.add_agent("termworker", fleet={"role": "coder", "reports_to": "boss"})
+        self.ap.save_record(self.world.state, "termworker", "ses_someoneelse", None, now=self.world.clock.now())   # a stale record from an earlier headless life of the name
+        engine = self.world.new_engine("cli")
+        pane = engine.discover(self.world.clock.now()).agents["termworker"].pane
+        self.world.herdr.panes.pop(pane)
+        sb.pane_health_pass(engine, self.world.clock.now())
+        self.assertEqual([e["subject"] for e in self.world.audit() if e["event"] == "fleetpane.dead"], ["termworker"], "exactly one dead event")
+        self.assertIn("termworker", engine.pane_alerts)
+
     def test_a_terminal_worker_whose_pane_is_really_gone_is_still_dead(self):
         self.world.add_agent("termworker", fleet={"role": "coder", "reports_to": "boss"})
         engine = self.world.new_engine("cli")
