@@ -3287,8 +3287,33 @@ def steers_into_turn(config, observation, carried, discovery=None):
             and any(fact.kind == "send" and fact.sender and fact.sender == boss_name(discovery, observation) for fact in carried))
 
 
-def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None):
-    """One message for `facts`, oldest first. Returns (text, the facts it carries).
+def clock_utc(epoch):
+    """HH:MMZ (UTC) of an epoch: the time a message was sent or delivered, as the header shows it."""
+    return time.strftime("%H:%MZ", time.gmtime(epoch))
+
+
+def superseded_by(facts):
+    """{key of an older undelivered `send`: the newer `send` that replaces it}: the same sender, about the same issue (repo and number), to the same
+    recipient. Never across senders or issues, and a send with no issue is never superseded. The older text is KEPT (the caller marks it, never drops it)."""
+    newest = {}
+    for fact in facts:
+        if fact.kind == "send" and fact.sender and fact.issue:
+            group = (fact.recipient, fact.sender, fact.repo, fact.issue)
+            if group not in newest or (fact.created, fact.key) > (newest[group].created, newest[group].key):
+                newest[group] = fact
+    found = {}
+    for fact in facts:
+        if fact.kind == "send" and fact.sender and fact.issue:
+            top = newest[(fact.recipient, fact.sender, fact.repo, fact.issue)]
+            if top is not fact:
+                found[fact.key] = top
+    return found
+
+
+def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, delivered=None):
+    """One message for `facts`, oldest first. Returns (text, the facts it carries). With `delivered` (epoch) the header says when the
+    message was sent (the carried facts' creation) and when it is delivered; a send that a NEWER one from the same sender about the
+    same issue replaces (`superseded_by`) stays in the message, marked, so no key is left out of what is acknowledged.
 
     The first line names the count and the first item; each item follows in
     full. Items that do not fit under `cap` stay pending: the message ends with
@@ -3302,15 +3327,26 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None):
     if facts[0].orders:  # PR 17: the orders note, whole: up to twenty orders of 300 characters
         return orders_note(recipient, facts[0], repos), facts[:1]
 
+    replaced = {}
+
     def item(fact):
         where = " (issue %s)" % issue_tag(fact.repo, fact.issue, repos) if fact.issue else ""
         body = fact.summary.strip().replace("\n", "\n  ")
-        return "- %s from %s%s: %s" % (fact.kind, fact.sender or "the fleet", where, body)
+        mark = ""
+        if fact.key in replaced:
+            mark = " [superseded by the newer message from %s sent %s]" % (fact.sender, clock_utc(replaced[fact.key].created))
+        return "- %s from %s%s%s: %s" % (fact.kind, fact.sender or "the fleet", where, mark, body)
 
     def render(count):
         lead = next((fact for fact in facts if not fact.rider), facts[0])
-        head = "[switchboard] %d for %s: %s" % (count, recipient, _one_line(lead.summary, 200))
         taken = facts[:count]
+        replaced.clear()
+        replaced.update(superseded_by(taken))
+        when = ""
+        if delivered is not None:
+            first, last = clock_utc(min(f.created for f in taken)), clock_utc(max(f.created for f in taken))
+            when = " (sent %s, delivered %s)" % (first if first == last else "%s-%s" % (first, last), clock_utc(delivered))
+        head = "[switchboard] %d for %s%s: %s" % (count, recipient, when, _one_line(lead.summary, 200))
         idle = [fact for fact in taken if fact.kind == WORKER_IDLE and fact.rider and getattr(fact, "clean", False)]
         shown = [fact for fact in taken if fact not in idle] if len(idle) < len(taken) else taken
         if shown is taken:
@@ -4495,11 +4531,11 @@ class Switchboard:
             observation = fresh
         repos = self.repos_in_play()
         text, carried = compose(plan.recipient, plan.pending, section=section_resolver(self, observation),
-                                repos=repos)
+                                repos=repos, delivered=self.now())
         sent = next((fact for fact in carried if fact.kind == "send"), None)
         if sent is not None and "\n[cut at %d characters]" % MESSAGE_CAP in text[-40:]:  # never cut silently
             whole, _ = compose(plan.recipient, plan.pending[:1], cap=10 ** 9, section=section_resolver(self, observation),
-                               repos=repos)
+                               repos=repos, delivered=self.now())
             allowed = max(0, len(sent.summary) - (len(whole) - MESSAGE_CAP))
             raise MessageTooLong("message is %d characters and would be cut at the delivery cap of %d once its header and "
                                  "ask sections are added; the allowed text for this message is %d characters: nothing was "
@@ -7822,9 +7858,9 @@ def handoff_ask(engine, caller, issue, brief, name=None, directory=None, workspa
 
 
 def cmd_handoff(args, runner, now, socket_call=None):
-    workspace = args.workspace or os.environ.get("HERDR_WORKSPACE_ID")
     brief = read_brief(args.brief_file, sys.stdin)
     engine, _, _ = build_engine(runner, now, "cli", socket_call=socket_call)
+    workspace = caller_workspace(engine, args.workspace)
     caller = identify_caller(engine.herdr, engine.v2, os.environ)
     try:
         repo, number = resolve_for_sender(engine, engine.config, args.issue, caller)
@@ -15348,6 +15384,8 @@ def warn_pane_disagrees(herdr, v2, environ, own, name):
         return
     if not theirs or theirs == own:
         return
+    if _agent_label(v2, theirs) == name:
+        return   # the pane's agent is THIS fleet agent under an older or newer session (a restart, a move): the inherited variable is stale, not another agent's
     _WARNED_PANES.add((pane, own))
     where = ""
     try:
@@ -15361,6 +15399,33 @@ def warn_pane_disagrees(herdr, v2, environ, own, name):
                      "identity is taken from the session, not from the pane; fix the environment (HERDR_PANE_ID, "
                      "FLEET_SWITCHBOARD_ROLE, FLEET_SWITCHBOARD_REPO and the token travel together)\n"
                      % (PROG, pane, theirs, _agent_label(v2, theirs), own, name, where))
+
+
+def caller_workspace(engine, explicit, environ=None):
+    """The herdr workspace a launch or handoff goes to when --workspace is not given: the workspace of the CALLER'S OWN session (OPENCODE_SESSION_ID, found
+    in herdr's agent list), never an inherited HERDR_WORKSPACE_ID that may belong to another session. An explicit --workspace wins. When the two
+    disagree, the caller's own is used and stderr says which one was used and which was left. When the caller's own workspace cannot be found
+    (a plain shell, a session herdr does not show), the variable is used as before: never a refusal."""
+    if explicit:
+        return explicit
+    environ = os.environ if environ is None else environ
+    inherited = environ.get("HERDR_WORKSPACE_ID")
+    own = environ.get(SESSION_ENV)
+    mine = None
+    if own:
+        try:
+            for entry in engine.herdr.agent_list():
+                if agent_session(entry) == own and isinstance(entry.get("pane_id"), str):
+                    mine = entry.get("workspace_id") if isinstance(entry.get("workspace_id"), str) else engine.herdr.pane_get(entry["pane_id"]).get("workspace_id")
+                    break
+        except (HerdrError, V2Error, AttributeError, TypeError):
+            mine = None
+    if not isinstance(mine, str) or not mine:
+        return inherited
+    if inherited and inherited != mine:
+        sys.stderr.write("%s: workspace: using %s, the workspace of this session; HERDR_WORKSPACE_ID=%s belongs to another session and was not used "
+                         "(pass --workspace to choose)\n" % (PROG, mine, inherited))
+    return mine
 
 
 def no_pane_error(how):
@@ -15500,8 +15565,9 @@ def read_brief(path, stdin):
 def cmd_launch(args, runner, now, socket_call=None):
     if getattr(args, "cloud", False):   # a worker in the cloud (#371): its own module; nothing below runs
         return run_cloud("cmd_launch", args, runner, now)
-    workspace = args.workspace or os.environ.get("HERDR_WORKSPACE_ID")
     engine, state, _ = build_engine(runner, now, "cli", socket_call=socket_call)
+    workspace = args.workspace if (args.workspace or getattr(args, "new_workspace", None) or getattr(args, "headless", False)) \
+        else caller_workspace(engine, None)   # a workspace made now, or none at all, needs no look at the caller's own
     if args.resume:
         given = getattr(args, "repo", None)
         if given:
