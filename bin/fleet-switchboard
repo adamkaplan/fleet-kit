@@ -21202,46 +21202,87 @@ def pr_is_held(labels, body, now=None):
     return bool(pr_hold_reasons(labels)) or is_captain({"labels": labels, "body": body}, now)
 
 
-def _unfenced(lines):
-    """`lines` without the fenced code blocks (the fences included) and without HTML comments."""
-    out, fenced = [], False
-    for line in lines:
-        if line.lstrip().startswith("```"):
-            fenced = not fenced
-        elif not fenced and not line.strip().startswith("<!--"):
-            out.append(line)
-    return out
+_HELD_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+_HELD_PRE_MERMAID_RE = re.compile(r"<pre\b[^>]*\bclass\s*=\s*[\"']?[^\"'>]*\bmermaid\b", re.I)
+
+
+def held_scan(lines):
+    """(clean, mermaid): `clean` is `lines` with every fenced code block (fences included: three or more backticks or tildes, up to three spaces of
+    indent, closed by the same character at least as long, an unclosed fence running to the end) and every HTML comment blanked, so a heading
+    counts only outside them (the explainer block's own opening marker is kept); `mermaid` lists the indexes where a Mermaid block opens (a fence
+    whose info string starts with `mermaid`, any case, or a `<pre class=mermaid>`)."""
+    clean, mermaid, fence, comment = [], [], None, False
+    for i, line in enumerate(lines):
+        if fence is not None:
+            found = _HELD_FENCE_RE.match(line)
+            if found and found.group(1)[0] == fence[0] and len(found.group(1)) >= fence[1] and not found.group(2).strip():
+                fence = None
+            clean.append("")
+            continue
+        if not comment:
+            found = _HELD_FENCE_RE.match(line)
+            if found and not (found.group(1)[0] == "`" and "`" in found.group(2)):
+                fence = (found.group(1)[0], len(found.group(1)))
+                words = found.group(2).split()
+                if words and words[0].lower() == "mermaid":
+                    mermaid.append(i)
+                clean.append("")
+                continue
+            if line.strip() == EXPLAINER_BEGIN:
+                clean.append(line)
+                continue
+        if _HELD_PRE_MERMAID_RE.search(line):
+            mermaid.append(i)
+        out, rest = "", line
+        while rest:
+            if comment:
+                end = rest.find("-->")
+                if end < 0:
+                    rest = ""
+                else:
+                    comment, rest = False, rest[end + 3:]
+            else:
+                start = rest.find("<!--")
+                if start < 0:
+                    out, rest = out + rest, ""
+                else:
+                    out, comment, rest = out + rest[:start], True, rest[start + 4:]
+        clean.append(out)
+    return clean, mermaid
 
 
 def held_top_end(rest):
-    """Index in `rest` where the top part ends (PC-5): the first heading after the first top part that is not one of the four top parts (or the explainer block's opening marker);
-    the end of the body when there is none. `rest` is the body after the opening lines."""
-    first = next((i for i, l in enumerate(rest) if l.strip() in HELD_PARTS), None)
+    """Index in `rest` where the top part ends (PC-5): the first heading (outside code fences and comments) after the first top part that is not one of
+    the four top parts, or the explainer block's opening marker; the end of the body when there is none. `rest` is the body after the opening lines."""
+    clean = held_scan(rest)[0]
+    first = next((i for i, l in enumerate(clean) if l.strip() in HELD_PARTS), None)
     if first is None:
         return len(rest)
-    fenced = set()   # a `#` line inside a code fence is not a heading
-    inside = False
-    for i, l in enumerate(rest):
-        if l.lstrip().startswith("```"):
-            inside = not inside
-        elif inside:
-            fenced.add(i)
-    return next((i for i in range(first + 1, len(rest)) if i not in fenced and (rest[i].startswith("#") and rest[i].strip() not in HELD_PARTS) or rest[i].strip() == EXPLAINER_BEGIN), len(rest))
+    return next((i for i in range(first + 1, len(rest)) if (clean[i].startswith("#") and clean[i].strip() not in HELD_PARTS) or clean[i].strip() == EXPLAINER_BEGIN), len(rest))
 
 
 def held_defects(body):
-    """What is wrong with the top of a PR body held for the owner (the ONE check, used by `pr-explain --check` and gate G6b). After the opening lines
+    """The ONE check of a held PR's top (see `_held_defects`); anything it cannot read is a defect, never a pass."""
+    try:
+        return _held_defects(body)
+    except Exception as err:   # a body it cannot parse fails: unreadable, never ok
+        return ["the held PR's top is unreadable (%s)" % _one_line("%s: %s" % (type(err).__name__, err), 100)]
+
+
+def _held_defects(body):
+    """What is wrong with the top of a PR body held for the owner (used by `pr-explain --check` and gate G6b). After the opening lines
     (PLAN:, MERGE:, canon:), in this order: `## Why this needs you` (1 to 3 sentences, no placeholder), `## What changes for you` (a Before | After
-    table of 2 to 4 rows), `## Example` (not empty), `## Questions for you` (a numbered list, each item with `Recommendation:`) or the line
-    `Questions: none (reason)`. An image may sit anywhere in the top; a Mermaid block in the top is a defect; nothing below the top part is judged.
-    Reads the body only."""
+    table of 2 to 4 rows of real cells), `## Example` (real text), `## Questions for you` (a numbered list, each item with `Recommendation:`) or the
+    line `Questions: none (reason)`. An image may sit anywhere in the top; a Mermaid block in the top is a defect; nothing below the top part is
+    judged. Headings count only outside code fences and comments. Reads the body only."""
     lines = (body or "").split("\n")
+    clean_all, mermaid_all = held_scan(lines)
     at = 0
-    while at < len(lines) and (EXPLAINER_HEADER_RE.match(lines[at]) or not lines[at].strip()):
+    while at < len(lines) and (EXPLAINER_HEADER_RE.match(lines[at]) or not clean_all[at].strip()):
         at += 1
     rest = lines[at:]
-    end = held_top_end(rest)
-    top = rest[:end]
+    top_end = held_top_end(rest)
+    top = clean_all[at:at + top_end]
     pos = {}
     for i, l in enumerate(top):
         pos.setdefault(l.strip(), i)
@@ -21251,39 +21292,42 @@ def held_defects(body):
         stop = next((i for i in range(start, len(top)) if top[i].startswith("## ")), len(top))
         return top[start:stop]
 
+    def words(text):
+        return len(re.findall(r"\w", text))
+
     problems = []
     if HELD_WHY not in pos:
         problems.append("the held PR needs a `%s` section after the opening lines" % HELD_WHY)
     else:
-        text = " ".join(l.strip() for l in _unfenced(section(HELD_WHY)) if l.strip() and not l.strip().startswith("!["))
+        text = " ".join(l.strip() for l in section(HELD_WHY) if l.strip() and not l.strip().startswith("!["))
         sentences = [x for x in re.split(r"(?<=[.!?])\s+", text) if x.strip()]
-        if not text or re.search(r"<[^>]*>", text):
+        if words(text) < 3 or re.search(r"<[^>]*>", text):
             problems.append("`%s` is empty or still has a <placeholder>" % HELD_WHY)
         elif len(sentences) > 3:
             problems.append("`%s` has %d sentences: it is one to three" % (HELD_WHY, len(sentences)))
     if HELD_TABLE not in pos:
         problems.append("the held PR needs a `%s` table (Before | After, 2 to 4 rows)" % HELD_TABLE)
     else:
-        rows = [[c.strip() for c in l.strip().strip("|").split("|")] for l in _unfenced(section(HELD_TABLE)) if l.strip().startswith("|")]
+        rows = [[c.strip() for c in l.strip().strip("|").split("|")] for l in section(HELD_TABLE) if l.strip().startswith("|")]
         head = [c.lower() for c in rows[0]] if rows else []
         data = [r for r in rows[2:]] if len(rows) >= 2 and all(re.fullmatch(r":?-{3,}:?", c) for c in rows[1]) else None
         if head != ["before", "after"] or data is None:
             problems.append("`%s`: the table needs a Before and an After column (a header row, a separator row, then the rows)" % HELD_TABLE)
         elif not 2 <= len(data) <= 4:
             problems.append("`%s`: the table has %d rows, it is 2 to 4" % (HELD_TABLE, len(data)))
-        elif any(len(r) != 2 or not r[0] or not r[1] or any(re.search(r"<[^>]*>", c) for c in r) for r in data):
-            problems.append("`%s`: every table cell is a plain sentence (no empty cell, no <placeholder>)" % HELD_TABLE)
+        elif any(len(r) != 2 or any(words(c) < 3 or re.search(r"<[^>]*>", c) for c in r) for r in data):
+            problems.append("`%s`: every table cell is a plain sentence (at least 3 word characters, no <placeholder>)" % HELD_TABLE)
     if HELD_EXAMPLE not in pos:
         problems.append("the held PR needs an `%s` section: one concrete case in a few lines" % HELD_EXAMPLE)
     else:
-        text = " ".join(l.strip() for l in _unfenced(section(HELD_EXAMPLE)) if l.strip() and not l.strip().startswith("!["))
-        if not text or re.search(r"<[^>]*>", text):
-            problems.append("`%s` is empty or still has a <placeholder>" % HELD_EXAMPLE)
-    if any(l.strip() == "```mermaid" for l in top):
+        text = " ".join(l.strip() for l in section(HELD_EXAMPLE) if l.strip() and not l.strip().startswith("!["))
+        if len(text) < 20 or re.search(r"<[^>]*>", text):
+            problems.append("`%s` is empty, too short (20 characters) or still has a <placeholder>" % HELD_EXAMPLE)
+    if any(at <= m < at + top_end for m in mermaid_all):
         problems.append("the top part shows a Mermaid diagram: it goes below, in the technical section")
     nones = [i for i, l in enumerate(top) if _HELD_NONE_RE.match(l.strip())]
     if HELD_QUESTIONS in pos:
-        section_lines = [l for l in _unfenced(section(HELD_QUESTIONS)) if l.strip()]
+        section_lines = [l for l in section(HELD_QUESTIONS) if l.strip()]
         items, cur = [], None
         for l in section_lines:
             if re.match(r"^\s*\d+\.\s", l):
