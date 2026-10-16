@@ -39920,7 +39920,21 @@ class TestHeldTop(DecisionsBase):
                 self.assertIsInstance(sb.held_defects(body), list)
         started = time.monotonic()
         self.within(60, run)
-        self.assertLess(time.monotonic() - started, 30)
+
+    def test_none_line_variants_and_hostile_runs_are_judged_quickly(self):
+        for line, ok in (("Questions: none", True), ("Questions: none.", True), ("Questions: none (clear to merge on your word).", True),
+                         ("Questions: none (a) (b)", True), ("Questions: none (open", False), ("Questions: nonexistent", False), ("Questions: none x", False)):
+            body = self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + "## Questions for you\n\n" + line + "\n"
+            self.assertEqual(self.defects(body) == [], ok, line)
+        for hostile in ("Questions: none" + " " * 60000 + "x", "Questions: none (" * 4000, "Questions: none" + "\t" * 60000 + "x", "<!--" * 17000, "<!---->" * 10000):
+            started = time.monotonic()
+            self.assertTrue(self.within(5, self.defects, self.OPEN + hostile))
+            self.assertLess(time.monotonic() - started, 0.5, hostile[:20])
+
+    def test_an_exhausted_step_budget_makes_the_body_unreadable(self):
+        with mock.patch.object(sb, "_held_steps", return_value=[0]):
+            found = sb.held_defects(self.OPEN + self.TOP + "<!-- a -->\n")
+        self.assertEqual((len(found), "unreadable" in found[0]), (1, True))
 
     def test_underscore_only_cells_fail(self):
         table = ("## What changes for you\n\n| Before | After |\n|---|---|\n| ___ | You get one card. |\n| You open a list. | It opens itself. |\n\n")

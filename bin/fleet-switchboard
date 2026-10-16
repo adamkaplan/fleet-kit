@@ -21194,7 +21194,13 @@ HELD_TABLE = "## What changes for you"
 HELD_EXAMPLE = "## Example"
 HELD_QUESTIONS = "## Questions for you"
 HELD_PARTS = (HELD_WHY, HELD_TABLE, HELD_EXAMPLE, HELD_QUESTIONS)
-_HELD_NONE_RE = re.compile(r"^Questions: none(?:\s*\(.*\))?\.?\s*$")   # `Questions: none`, then an optional one-line parenthetical
+def _held_none(line):
+    """True for the line `Questions: none`, then an optional one-line parenthetical (and an optional final dot). Plain string tests: no backtracking."""
+    line = line.strip()
+    if not line.startswith("Questions: none"):
+        return False
+    tail = line[len("Questions: none"):].strip()
+    return tail in ("", ".") or (tail.startswith("(") and (tail.endswith(")") or tail.endswith(").")))
 
 
 def pr_is_held(labels, body, now=None):
@@ -21319,22 +21325,25 @@ def held_scan(lines):
                 continue
         if _held_pre_mermaid(line):
             mermaid.append(i)
-        out, rest = "", line
-        budget = _held_steps(len(line))
-        while rest:
+        parts, pos, size = [], 0, len(line)   # walk with an index: no slicing, no growing concatenation
+        budget = _held_steps(size)
+        while pos < size:
             _held_spend(budget)
             if comment:
-                end = rest.find("-->")
+                end = line.find("-->", pos)
                 if end < 0:
-                    rest = ""
+                    pos = size
                 else:
-                    comment, rest = False, rest[end + 3:]
+                    comment, pos = False, end + 3
             else:
-                start = rest.find("<!--")
+                start = line.find("<!--", pos)
                 if start < 0:
-                    out, rest = out + rest, ""
+                    parts.append(line[pos:])
+                    pos = size
                 else:
-                    out, comment, rest = out + rest[:start], True, rest[start + 4:]
+                    parts.append(line[pos:start])
+                    comment, pos = True, start + 4
+        out = "".join(parts)
         clean.append(out)
     return clean, mermaid
 
@@ -21415,7 +21424,7 @@ def _held_defects(body):
             problems.append("`%s` is empty, too short (20 characters) or still has a <placeholder>" % HELD_EXAMPLE)
     if any(at <= m < at + top_end for m in mermaid_all):
         problems.append("the top part shows a Mermaid diagram: it goes below, in the technical section")
-    nones = [i for i, l in enumerate(top) if _HELD_NONE_RE.match(l.strip())]
+    nones = [i for i, l in enumerate(top) if _held_none(l)]
     if HELD_QUESTIONS in pos:
         section_lines = [l for l in section(HELD_QUESTIONS) if l.strip()]
         items, cur = [], None
@@ -21429,7 +21438,7 @@ def _held_defects(body):
             for n, item in enumerate(items, 1):
                 if "Recommendation:" not in " ".join(item):
                     problems.append("question %d has no `Recommendation:`" % n)
-        elif not (len(section_lines) == 1 and _HELD_NONE_RE.match(section_lines[0].strip())):
+        elif not (len(section_lines) == 1 and _held_none(section_lines[0])):
             problems.append("`%s` is a numbered list (each with `Recommendation:`) or exactly one line `Questions: none (reason)`" % HELD_QUESTIONS)
     elif len(nones) != 1:
         problems.append("the held PR needs `%s` (a numbered list, each question with `Recommendation:`) or the line `Questions: none (reason)`" % HELD_QUESTIONS)
