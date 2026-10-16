@@ -52,7 +52,7 @@ def read(events, names, parse):
     return {"set": set_at, "event_id": event_id, "commented": commented}
 
 
-def verdict(info, now, days):
+def judge(info, now, days):
     """None while the label is within its limit or a comment came after it (the issue stays quiet); `EXPIRED` once it is older than `days` with no comment
     since; `UNKNOWN` when the age is not known (info is None)."""
     if info is None:

@@ -11971,7 +11971,7 @@ def triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_pr
             found["T9"] = {"quiet_days": round(age_updated, 2)}
         if triage_awaits_live(item):   # #576: the exemption is capped: an old label with no comment since comes back, an unreadable age stays visible
             module = load_module("awaiting_live")
-            reason = module.verdict(live, now, live_days or module.CONFIG_DEFAULT)
+            reason = module.judge(live, now, live_days or module.CONFIG_DEFAULT)
             if reason:
                 found["T9"] = {"quiet_days": round(age_updated, 2), "reason": reason}
                 if live is not None:

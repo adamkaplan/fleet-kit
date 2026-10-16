@@ -252,7 +252,7 @@ class TestConfig(Base):
             "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "reds": None, "heavy": None, "docker_reaper": True,
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
                               "check_suite", "workflow_run"],
-            "awaiting_label": None, "decisions_lookback_hours": 72,  # PR 14
+            "awaiting_live_days": 14, "awaiting_label": None, "decisions_lookback_hours": 72,  # PR 14
             "awaiting_cos_label": None, "decisions_cos_grace_seconds": 300, "cos_orders_file": None,  # PR 18
             "pr_notice_hold_minutes": 0,  # PR notices
             "intent_repo": None, "intent_required": True,
