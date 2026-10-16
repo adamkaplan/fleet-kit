@@ -13943,6 +13943,15 @@ class TestHeadlessPresence(Base):
         self.assertEqual([e["subject"] for e in self.world.audit() if e["event"] == "fleetpane.dead"], ["termworker"], "exactly one dead event")
         self.assertIn("termworker", engine.pane_alerts)
 
+    def test_an_unreadable_headless_record_never_hides_a_dead_pane(self):
+        sid, pane = self.watched()
+        engine = self.world.new_engine("cli")
+        engine.discover(self.world.clock.now())
+        self.world.herdr.panes.pop(pane)
+        with mock.patch.object(self.ap, "load_record", side_effect=OSError("unreadable")), mock.patch.object(sb, "load_agent_presence", lambda: self.ap):
+            sb.pane_health_pass(engine, self.world.clock.now())
+        self.assertEqual([e["subject"] for e in self.world.audit() if e["event"] == "fleetpane.dead"], ["hw"], "when in doubt the alert goes out")
+
     def test_a_terminal_worker_whose_pane_is_really_gone_is_still_dead(self):
         self.world.add_agent("termworker", fleet={"role": "coder", "reports_to": "boss"})
         engine = self.world.new_engine("cli")
