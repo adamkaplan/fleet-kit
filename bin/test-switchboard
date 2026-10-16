@@ -48199,6 +48199,50 @@ class TestHeavyQueueLogic(unittest.TestCase):
         self.assertIn("no slot after", self.out.getvalue())
         self.assertEqual(self.started, [])
 
+    def scripted(self, nows):
+        """A clock that reads 1000.0 first (when the wait starts), then each of `nows` (seconds since the start) for the clock reads of the wait, then the last again."""
+        values = iter([1000.0] + [1000.0 + n for n in nows])
+        last = [1000.0]
+
+        def clock():
+            last[0] = next(values, last[0])
+            return last[0]
+        return clock
+
+    def at(self, limit, elapsed, free_after=None):
+        """run() with a wait limit of `limit` seconds, whose first check of the clock says `elapsed` seconds have passed; a slot comes free on the attempt numbered `free_after`."""
+        attempts = []
+
+        def take(state, slots):
+            attempts.append(1)
+            return (self.fd, 0) if free_after is not None and len(attempts) >= free_after else (None, None)
+        self.patched(take, 1.0)
+        environ = {"PATH": os.environ["PATH"], "FLEET_HEAVY_REPORT_SECONDS": "100000"}
+        code = self.hs.run(["sh", "-c", "true"], "/state", 3, limit, "who-d", environ=environ, out=self.out, clock=self.scripted([elapsed]), sleep=lambda seconds: None)
+        if free_after is not None:
+            self.fd = None
+        return code, len(attempts)
+
+    def test_the_wait_limit_is_pinned_at_its_boundary_for_the_stated_and_the_default_limit(self):
+        for limit in (250, self.hs.DEFAULT_WAIT_MAX):
+            for elapsed, rule in ((limit - 1, "one second before the limit it still waits and takes the slot that frees"),
+                                  (limit, "at exactly the limit it gives up (the rule is `elapsed >= limit`)"),
+                                  (limit + 1, "past the limit it gives up")):
+                with self.subTest(limit=limit, elapsed=elapsed, rule=rule):
+                    self.out, self.started = io.StringIO(), []
+                    self.fd = os.open(os.devnull, os.O_RDWR)
+                    code, attempts = self.at(limit, elapsed, free_after=2)
+                    if elapsed < limit:
+                        self.assertEqual((code, attempts, len(self.started)), (0, 2, 1), rule)
+                        self.assertNotIn("no slot after", self.out.getvalue())
+                    else:
+                        self.assertEqual((code, attempts, self.started), (75, 1, []), rule)
+                        self.assertIn("no slot after %d s (3 of 3 busy" % elapsed, self.out.getvalue())
+                    for patcher_stop in (os.close,):
+                        if self.fd is not None:
+                            patcher_stop(self.fd)
+                            self.fd = None
+
     def test_s3_a_state_that_cannot_be_used_runs_the_command_without_a_slot_and_says_so(self):
         def take(state, slots):
             raise OSError(13, "Permission denied")
