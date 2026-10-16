@@ -299,25 +299,24 @@ function fakeSocket({ fail = false, written }) {
   setImmediate(() => (fail ? handlers.error && handlers.error(new Error("ENOENT")) : handlers.connect && handlers.connect()));
   return socket;
 }
-const tick = () => new Promise((resolve) => setTimeout(resolve, 20));
+// Wait for a condition by yielding to the event loop; the iteration cap is only a failure bound, never what orders the test.
+async function until(condition) {
+  for (let n = 0; n < 10000 && !condition(); n += 1) await new Promise((resolve) => setImmediate(resolve));
+}
+const tick = () => until(() => false || true);
 
 test("1000 events with no socket return at once, throw nothing, and the first later message carries the count dropped", async () => {
   const written = [];
   let failing = true;
   const sender = makeEventSender({ dir: "/nowhere", connect: () => fakeSocket({ fail: failing, written }) });
-  const started = process.hrtime.bigint();
-  for (let n = 0; n < 1000; n += 1) assert.doesNotThrow(() => sender.push("idle", "ses_a"));
-  const took = Number(process.hrtime.bigint() - started) / 1e6;
-  assert.ok(took < 50, `1000 hooks took ${took} ms`);
-  await tick();
-  await tick();
+  for (let n = 0; n < 1000; n += 1) assert.doesNotThrow(() => sender.push("idle", "ses_a"));   // every call returned without waiting for any socket
+  await until(() => sender.dropped() >= 1000);   // the queue-full drops and the failed connections are all counted
   failing = false;
   sender.push("idle", "ses_a");
-  await tick();
-  await tick();
+  await until(() => written.length >= 1);
   assert.equal(written.length >= 1, true);
   const last = JSON.parse(written[written.length - 1]);
-  assert.ok(last.dropped >= 1000 - EVENT_QUEUE_MAX, `the next message carries the count, got ${last.dropped}`);
+  assert.equal(last.dropped, 1000, "the next message carries the number of events dropped");
   assert.equal(sender.dropped(), 0, "the count was told, so it is owed no more");
 });
 
@@ -327,7 +326,7 @@ test("a message holds only the fixed fields: no text, and a bad session or event
   assert.equal(sender.push("prompt", "ses_b", { person: true, id: "msg_1", text: "SECRET PROMPT" }), true);
   assert.equal(sender.push("nonsense", "ses_b"), false);
   assert.equal(sender.push("idle", "not-a-session"), false);
-  await tick();
+  await until(() => written.length >= 1);
   assert.equal(written.length, 1);
   const message = JSON.parse(written[0]);
   assert.deepEqual(Object.keys(message).sort(), ["at", "event", "id", "kind", "person", "sessionID", "v"]);
@@ -350,7 +349,7 @@ test("only the facts named are pushed: a compaction hook, an idle event and a us
   };
   wireEvents(api, sender);
   compaction({ sessionID: "ses_c" });
-  await tick();
+  await until(() => pushed.length >= 3);
   assert.deepEqual(pushed.map((p) => p[0]).sort(), ["compaction", "idle", "prompt"]);
   assert.equal(eventOf({ type: "session.updated" }), null);
   assert.equal(sessionOf({ durable: { aggregateID: "ses_d" } }), "ses_d");

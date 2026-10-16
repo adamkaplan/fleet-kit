@@ -23910,8 +23910,13 @@ def start_judge_server(config, state, runner, now, engine=None):
     on_event = None
     if listening:
         def known():
-            discovery = getattr(engine, "discovery", None)
-            return {o.session_id for o in discovery.agents.values() if getattr(o, "session_id", None)} if discovery else set()
+            """This fleet's session ids. Read from the socket thread while the pass thread replaces the discovery: a snapshot of the values, and any
+            fault means "none known", so the event is ignored (fail closed)."""
+            try:
+                discovery = getattr(engine, "discovery", None)
+                return {o.session_id for o in list(discovery.agents.values()) if getattr(o, "session_id", None)} if discovery else set()
+            except RuntimeError:
+                return set()
         engine.event_receiver = EventReceiver(feed, engine.audit, now, known=known)
         on_event = engine.event_receiver.handle
     return JudgeServer(state, handle, on_event).start()

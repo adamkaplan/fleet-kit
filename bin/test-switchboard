@@ -53523,13 +53523,48 @@ class TestPluginPush(unittest.TestCase):
         self.now[0] += 2
         self.assertTrue(self.receiver.handle(self.message()), "the next second starts clean: nothing was queued")
 
-    def test_s15_an_event_that_was_limited_away_is_still_found_by_the_reconciliation(self):
+    def test_s15_an_event_limited_away_is_still_found_by_the_reconciliation_and_said_to_be_missed(self):
         engine = types.SimpleNamespace(v2=types.SimpleNamespace(calls=[], message_list=lambda *a, **k: [{"id": "msg_new"}]))
         self.feed.need("test")
         self.feed.handle(feed_line("session.step.ended", session=self.SESSION, assistantMessageID="msg_old"))
-        self.now[0] += sb.FEED_RECONCILE_SECONDS + 1
+        for _ in range(sb.PLUGIN_SESSION_PER_SECOND + 5):
+            self.receiver.handle(self.message())
+        self.assertEqual(self.receiver.status()["rate_limited"], 5, "the last pushes were limited away")
+        self.feed.seen[self.SESSION]["read"] = self.now[0] + 1   # the pushed read already happened: only the reconciliation is left to find it
+        self.now[0] += sb.FEED_RECONCILE_SECONDS + 2
         self.feed.tick(engine, [self.SESSION])
         self.assertEqual([n for n, _ in self.audits].count("event.missed"), 1)
+
+    def test_a_push_is_read_while_the_stream_is_down_at_most_four_sessions_a_pass_and_a_failed_read_is_tried_again(self):
+        sessions = ["ses_%02d" % n for n in range(6)]
+        self.receiver.known = lambda: set(sessions)
+        self.feed.connected = False   # the stream is down and nobody registered as a consumer
+        for session in sessions:
+            self.receiver.handle(self.message(sessionID=session))
+        engine = types.SimpleNamespace(v2=self.Stub())
+        self.feed.tick(engine, sessions)
+        self.assertEqual(len(engine.v2.calls), sb.FEED_PUSHED_PER_PASS)
+        self.feed.tick(engine, sessions)
+        self.assertEqual(sorted(c[0] for c in engine.v2.calls), sessions, "the other two the next pass; none twice")
+
+        class Failing:
+            calls = 0
+
+            def message_list(self, *a, **k):
+                Failing.calls += 1
+                raise sb.V2Error("backoff", None, "skipped")
+        self.now[0] += 1
+        self.receiver.handle(self.message(sessionID="ses_00"))
+        self.feed.tick(types.SimpleNamespace(v2=Failing()), sessions)
+        self.feed.tick(types.SimpleNamespace(v2=Failing()), sessions)
+        self.assertEqual(Failing.calls, 2, "a failed read is tried again, and counted")
+        self.assertEqual(self.feed.status()["read_errors"], 2)
+
+    def test_under_v2_light_a_push_causes_no_read(self):
+        engine = types.SimpleNamespace(v2=self.Stub(), light=True, feed=self.feed, discovery=types.SimpleNamespace(agents={"a": types.SimpleNamespace(session_id=self.SESSION)}))
+        self.receiver.handle(self.message())
+        sb.feed_tick(engine)
+        self.assertEqual(engine.v2.calls, [], "the owner's hotfix switch stops every optional history read, a pushed one too")
 
     def test_s16_with_no_pushes_ten_simulated_minutes_for_twenty_idle_agents_cost_at_most_fifty_calls(self):
         engine = types.SimpleNamespace(v2=self.Stub())
@@ -53555,7 +53590,12 @@ class TestPluginPush(unittest.TestCase):
     def test_the_socket_carries_pushes_to_the_receiver_without_a_reply_and_judge_requests_as_before(self):
         state = Path(tempfile.mkdtemp(prefix="sbp"))
         self.addCleanup(shutil.rmtree, state, True)
-        server = sb.JudgeServer(state, lambda text: sb.policy_reply("deny", "judged"), self.receiver.handle).start()
+        arrived = threading.Event()
+
+        def on_event(raw):
+            self.receiver.handle(raw)
+            arrived.set()
+        server = sb.JudgeServer(state, lambda text: sb.policy_reply("deny", "judged"), on_event).start()
         self.addCleanup(server.stop)
         reply = sb.ask_judge_daemon(state, json.dumps({"sessionID": self.SESSION, "tool": "shell", "arguments": "ls", "outcome": "allow"}), 2)
         self.assertEqual(reply["outcome"], "deny", "a judge request is answered as before")
@@ -53567,9 +53607,7 @@ class TestPluginPush(unittest.TestCase):
         sock.shutdown(socket.SHUT_WR)
         self.assertEqual(sock.recv(100), b"", "a push gets no reply")
         sock.close()
-        deadline = time.time() + 2
-        while time.time() < deadline and self.receiver.status()["accepted"] < 1:
-            time.sleep(0.02)
+        self.assertTrue(arrived.wait(5), "the receiver was reached")   # the wait is only a failure bound
         self.assertEqual(self.receiver.status()["accepted"], 1)
 
     def test_the_socket_is_bound_for_pushes_when_the_judge_is_off_and_only_when_a_feed_runs(self):
