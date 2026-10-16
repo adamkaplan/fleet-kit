@@ -20,6 +20,18 @@ One block, between `<!-- pr-explainer:begin -->` and `<!-- pr-explainer:end -->`
 2. **Every PR: the why-block**, a short ```text block with exactly two lines: `before: ...` the behaviour as it was, `after: ...` the
    behaviour now. Behaviour, not code: what a person or a caller sees, in plain words or two lines of pseudo-code.
 
+## Held pull requests
+
+A PR held for the owner opens, right after the opening lines and in this order, with:
+
+1. `## Why this needs you`: one to three plain sentences naming the hold reason.
+2. `## What changes for you`: a `Before | After` table of 2 to 4 rows, each cell a plain sentence about what a person sees or does.
+3. `## Example`: one concrete case in a few lines.
+4. Optional: a real screenshot or rendered image of the actual screen, card or message, before and after. Never a box-and-arrow diagram.
+5. `## Questions for you`: a numbered list, each item one question ending `Recommendation: ...`; or the one line `Questions: none (reason)`.
+
+The rest of the body follows. A Mermaid diagram goes below, in the technical section for reviewers; it is not judged there, and in the top it fails. `pr-explain --check` and gate `G6b` name each missing part and the question number that lacks its recommendation.
+
 ## The command
 
 `fleet-switchboard pr-explain <owner/repo#N> --before "..." --after "..."` reads the PR once (a GET) and PRINTS the block; it writes
@@ -31,4 +43,4 @@ real before and after (no `<placeholder>` left), and for a captain PR a diagram 
 ## What the explainer must not do
 
 No advice, no review findings, no "consider", no summary of the code's quality, no restating the PR's own text, no second block, no
-image or link. If the before or the after cannot be said in two lines, say so in the PR and say what is unclear; do not pad.
+image or link inside the block. If the before or the after cannot be said in two lines, say so in the PR and say what is unclear; do not pad.
