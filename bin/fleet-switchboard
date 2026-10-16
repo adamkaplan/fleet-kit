@@ -19681,7 +19681,7 @@ def delegated_clear_pr_checks(engine, runner, repo, number):
             after = None
         if after != report.get("head"):
             return None, "the pull request's head moved while it was being checked (%s, then %s): nothing was cleared" % (str(report.get("head"))[:8], str(after)[:8])
-    reasons = load_module("delegated_clear").refusals(rule, report, files)
+    reasons = load_module("delegated_clear").refusals(rule, report, files, impact_floor.matches, impact_floor.matches_named)
     if reasons:
         return None, "; ".join(reasons)
     return report, None

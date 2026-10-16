@@ -35,8 +35,8 @@ def validate(raw, source):
     if not isinstance(raw, dict) or set(raw) - {"orders", "charter"}:
         raise ValueError("%s: 'delegated_clear' must be false or an object with only orders and charter, got %r" % (source, raw))
     orders, charter = raw.get("orders"), raw.get("charter")
-    if not (isinstance(orders, list) and len(orders) <= MAX_ORDERS and all(_entry_ok(e) for e in orders)):
-        raise ValueError("%s: delegated_clear.orders must be a list of {\"number\": N, \"sha256\": <64 hex of the order's text>} (an empty list is off)" % source)
+    if not (isinstance(orders, list) and len(orders) <= MAX_ORDERS and all(_entry_ok(e) for e in orders)) or len({e["number"] for e in orders}) != len(orders):
+        raise ValueError("%s: delegated_clear.orders must be a list of {\"number\": N, \"sha256\": <64 hex of the order's text>} (an empty list is off; a number may appear once)" % source)
     if not (isinstance(charter, int) and not isinstance(charter, bool) and charter >= 1):
         raise ValueError("%s: delegated_clear.charter must be the charter's issue number" % source)
 
@@ -63,13 +63,14 @@ def order_text(orders, number):
     return None
 
 
-def refusals(rule, report, files):
+def refusals(rule, report, files, matches=None, matches_named=None):
     """[reasons] a delegated clear is refused for this pull request; [] when none. `rule` is the matrix's `owner_hold.delegated_clear` block; `report` is the owner-hold report the
     daemon uses (`pr_floor_report`: its decision, its top tier path hits by class, the independent review's class, whether the file list is complete); `files` is the pull request's
-    changed files with their patches ([{"filename", "patch"}]) or None when they could not be read."""
-    if not isinstance(rule, dict) or not isinstance(report, dict):
+    changed files ([{"filename", "previous_filename"}]) or None when they could not be read. `matches(path, globs)` and `matches_named(path, globs)` are the owner-hold floor's OWN
+    path matchers (case-, normalisation- and spelling-insensitive: `./bin/x`, `bin//x`, `BIN/X` and a `..` all read as the file they name): the caller passes them, this module holds no second one."""
+    if not isinstance(rule, dict) or not isinstance(report, dict) or matches is None or matches_named is None:
         return ["the delegated-clear rule or the owner-hold decision cannot be read"]
-    for key in ("never_path_classes", "top_tier_review_classes", "clear_code_paths"):
+    for key in ("never_path_classes", "top_tier_review_classes", "clear_code_paths", "clear_code_exclude"):
         if not isinstance(rule.get(key), list) or not all(isinstance(x, str) for x in rule[key]):
             return ["the delegated-clear rule is malformed (%s)" % key]
     if report.get("owner_decision") not in ("hold", "second-review", "none"):
@@ -88,10 +89,16 @@ def refusals(rule, report, files):
         reasons.append("the independent review holds it with no class named: unknown is refused")
     if isinstance(review, str) and review.lower() in {c.lower() for c in rule["top_tier_review_classes"]}:
         reasons.append("the independent review's class is %s, a top tier class: that stays the owner's own clear" % review)
-    changed = {f.get("filename") for f in files or [] if isinstance(f, dict)} | {f.get("previous_filename") for f in files or [] if isinstance(f, dict)} | set(report.get("changed_paths") or [])
-    for path in sorted(p for p in changed if isinstance(p, str)):
-        if path in rule["clear_code_paths"]:
-            reasons.append("it changes a file that holds the clear code or what it depends on (%s): that stays the owner's own clear" % path)
     if files is None:
         reasons.append("the changed files cannot be read, so a change to the clear code cannot be ruled out")
+        return reasons
+    paths = set(report.get("changed_paths") or [])
+    for item in files:
+        if isinstance(item, dict):
+            paths |= {item.get("filename"), item.get("previous_filename")}
+    for path in sorted(p for p in paths if p is not None):
+        if not isinstance(path, str) or "\x00" in path:
+            reasons.append("a changed path cannot be read (%r): refused" % str(path)[:60])
+        elif matches(path, rule["clear_code_paths"]) and not matches_named(path, rule["clear_code_exclude"]):
+            reasons.append("it adds, changes, deletes or renames a file the clear command or the daemon runs or loads (%s): that stays the owner's own clear" % path[:80])
     return reasons

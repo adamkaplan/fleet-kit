@@ -28840,9 +28840,9 @@ class TestImpactHold(LedgerBase):
             self.passes()
             code, out, err = self.under()
             self.assertEqual(code, 2, label)
-            self.assertIn("clear code", err, label)
+            self.assertIn("runs or loads", err, label)
         self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [])
-        self.files_of_pr("bin/some_unrelated_module.py")
+        self.files_of_pr("src/unrelated_module.py")
         self.assertEqual(self.under()[0], 0, "a pull request that touches no such file may be cleared")
 
     def test_s5_only_the_listed_order_is_accepted_and_a_missing_order_is_refused(self):
@@ -28925,7 +28925,7 @@ class TestImpactHold(LedgerBase):
         self.passes()
         code, out, err = self.under()
         self.assertEqual(code, 2)
-        self.assertIn("clear code", err)
+        self.assertIn("runs or loads", err)
 
     def test_every_file_that_defines_something_reachable_from_the_clear_command_is_a_refused_file(self):
         import ast
@@ -28945,27 +28945,68 @@ class TestImpactHold(LedgerBase):
                     modules.add(node.args[0].value)
                 if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in ("impact_floor", "plan_ledger", "plan_check", "decision_core", "repo_exclusion"):
                     modules.add(node.value.id)
-        listed = set(sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]["clear_code_paths"])
+        rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
         self.assertTrue(len(reached) > 40, "the walk found the clear command's reach (%d functions)" % len(reached))
-        self.assertEqual(sorted("bin/%s.py" % m for m in modules if "bin/%s.py" % m not in listed), [], "a module the clear reaches is not a refused file")
-        self.assertIn("bin/fleet-switchboard", listed)
+        self.assertEqual(sorted("bin/%s.py" % m for m in modules if not sb.impact_floor.matches("bin/%s.py" % m, rule["clear_code_paths"])), [], "a module the clear reaches is not a refused file")
+        self.assertTrue(sb.impact_floor.matches("bin/fleet-switchboard", rule["clear_code_paths"]))
+        self.assertIn("bin/**", rule["clear_code_paths"], "every file the daemon and the CLI load is refused, not a list of names that a new module escapes")
+
+    def floor_matchers(self):
+        return sb.impact_floor.matches, sb.impact_floor.matches_named
+
+    def test_the_spellings_of_a_clear_code_path_are_all_refused_and_only_docs_and_the_test_file_pass(self):
+        module = sb.load_module("delegated_clear")
+        rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
+        good = {"owner_decision": "hold", "complete": True, "unknown": None, "renamed_no_source": [], "top_tier_hits": {"authority": ["x"]}, "review_action": "none", "review_class": None, "changed_paths": []}
+        import unicodedata
+        refused = ["BIN/FLEET-SWITCHBOARD", "./bin/fleet-switchboard", "bin//fleet-switchboard", "bin/fleet-switchboard ", "bin/fleet-switchboard.", "docs/../bin/fleet-switchboard",
+                   "bin/fleet-\u017fwitchboard", unicodedata.normalize("NFD", "bin/fleet-sw\u00efitchboard"), "bin/newmodule.py", "bin/anything_at_all", "shims/gh", "plugins/fleet-hooks/x.mjs",
+                   ".github/workflows/ci.yml", "docs/review-laws/impact-matrix.json", "DOCS/REVIEW-LAWS/IMPACT-MATRIX.JSON", "bin\\fleet-switchboard"]
+        for path in refused:
+            for shape in ({"filename": path}, {"filename": "docs/ok.md", "previous_filename": path}):
+                self.assertTrue(module.refusals(rule, good, [shape], *self.floor_matchers()), (path, shape))
+        self.assertTrue(module.refusals(rule, good, [{"filename": "a\x00b"}], *self.floor_matchers()), "a path with a NUL cannot be told: refused")
+        for allowed in ("docs/switchboard.md", "README.md", "bin/test-switchboard", "BIN/TEST-SWITCHBOARD"):
+            self.assertEqual(module.refusals(rule, good, [{"filename": allowed}], *self.floor_matchers()), [], allowed)
+
+    def test_a_pr_that_only_adds_a_new_module_under_bin_is_refused_and_a_docs_only_and_a_test_only_pr_pass(self):
+        self.delegate()
+        self.floor_pr(path="migrations/0002.sql")
+        self.passes()
+        self.files_of_pr("bin/newmodule.py")
+        code, out, err = self.under()
+        self.assertEqual(code, 2)
+        self.assertIn("runs or loads", err)
+        self.files_of_pr("docs/switchboard.md")
+        self.assertEqual(self.under()[0], 0)
+        self.files_of_pr("bin/test-switchboard")
+        self.assertEqual(self.run_as("cos", "impact", "clear", self.PR, "--under-order", "17", "--revoke", "--reason", "taking the clear back: a test")[0], 0)
+        self.assertEqual(self.under()[0], 0, "a test-only pull request passes")
+
+    def test_a_repeated_order_number_makes_the_whole_feature_off(self):
+        module = sb.load_module("delegated_clear")
+        entry = lambda n, h: {"number": n, "sha256": h * 64}
+        config = {"delegated_clear": {"orders": [entry(17, "a"), entry(17, "b")], "charter": 40}}
+        self.assertIsNone(module.settings(config))
+        with self.assertRaises(ValueError):
+            module.validate(config["delegated_clear"], "config")
 
     def test_the_refusals_table_of_the_pure_module(self):
         module = sb.load_module("delegated_clear")
         rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
         good = {"owner_decision": "hold", "complete": True, "unknown": None, "renamed_no_source": [], "top_tier_hits": {"authority": ["x"]}, "review_action": "none", "review_class": None, "changed_paths": ["x"]}
         files = [{"filename": "docs/x.md", "patch": "@@ -1 +1 @@\n-a\n+b"}]
-        self.assertEqual(module.refusals(rule, good, files), [])
+        self.assertEqual(module.refusals(rule, good, files, *self.floor_matchers()), [])
         cases = (("complete false", dict(good, complete=False)), ("unknown", dict(good, unknown="3 of 9 files")), ("renamed", dict(good, renamed_no_source=["a"])),
                  ("unreadable decision", dict(good, owner_decision=None)), ("credentials upper case", dict(good, top_tier_hits={"Credentials": ["shims/gh"]})),
                  ("review class mixed case", dict(good, review_class="Identity")), ("no review", dict(good, review_action=None)))
         for label, report in cases:
-            self.assertTrue(module.refusals(rule, report, files), label)
-        self.assertTrue(module.refusals(rule, good, None), "no file list")
-        self.assertTrue(module.refusals(rule, good, [{"filename": "bin/fleet-switchboard"}]), "the daemon file")
-        self.assertTrue(module.refusals(rule, good, [{"filename": "docs/x.md", "previous_filename": "bin/chat_clear.py"}]), "a rename out of a clear-code file")
-        self.assertTrue(module.refusals(dict(rule, clear_code_paths="x"), good, files), "a malformed rule")
-        self.assertTrue(module.refusals(None, good, files))
+            self.assertTrue(module.refusals(rule, report, files, *self.floor_matchers()), label)
+        self.assertTrue(module.refusals(rule, good, None, *self.floor_matchers()), "no file list")
+        self.assertTrue(module.refusals(rule, good, [{"filename": "bin/fleet-switchboard"}], *self.floor_matchers()), "the daemon file")
+        self.assertTrue(module.refusals(rule, good, [{"filename": "docs/x.md", "previous_filename": "bin/chat_clear.py"}], *self.floor_matchers()), "a rename out of a clear-code file")
+        self.assertTrue(module.refusals(dict(rule, clear_code_paths="x"), good, files, *self.floor_matchers()), "a malformed rule")
+        self.assertTrue(module.refusals(None, good, files, *self.floor_matchers()))
         self.assertFalse(module.caller_is_chief(("agent", "x", "orchestrator")))
         self.assertFalse(module.caller_is_chief(("person", "me")))
         self.assertFalse(module.caller_is_chief(("agent", "x")))
