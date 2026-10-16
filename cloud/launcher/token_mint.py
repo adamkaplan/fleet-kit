@@ -26,6 +26,9 @@ def _open(req, timeout):
     return urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout)
 
 
+open_no_redirect = _open  # the one HTTP opener of the cloud programs: it never follows a redirect
+
+
 def mint(endpoint, identity_file=IDENTITY_FILE, out_file=OUT_FILE, now=None, opener=_open):
     u = urllib.parse.urlparse(endpoint)
     if u.scheme != "https" and u.hostname not in ("127.0.0.1", "localhost"):
