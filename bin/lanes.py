@@ -31,21 +31,32 @@ class MoveRefused(Exception):
     """The move cannot be made, and nothing was written."""
 
 
+BLOCK_AT_TOP = re.compile(r"\A\s*```ya?ml[ \t]*\r?\n(.*?)\r?\n[ \t]*```", re.DOTALL | re.IGNORECASE)
+BLOCK_ORCHESTRATOR = re.compile(r"^orchestrator:[ \t]*([A-Za-z0-9][A-Za-z0-9._-]*)[ \t]*(?:#[^\r\n]*)?\r?$", re.MULTILINE)
+
+
+def block_orchestrator(body):
+    """The name in the `orchestrator:` key of the first fenced yaml block at the very top of a charter body, or None. Prose or a later
+    block never counts: the body is untrusted text and only selects among live agents."""
+    block = BLOCK_AT_TOP.match(body if isinstance(body, str) else "")
+    found = BLOCK_ORCHESTRATOR.search(block.group(1)) if block else None
+    return found.group(1) if found else None
+
+
 def charter_orchestrators(sb, discovery, repo, charter, body=None):
-    """The names of the live orchestrators of `charter` in `repo`, sorted. The orchestrator the charter issue's own block names
-    (`orchestrator: <name>`, read now, the rule the load pass uses) wins when it is a live orchestrator; the `charter` field of
-    an orchestrator's session metadata is the fallback."""
-    named = sb.load_module("fleet_health").charter_agent(body)
-    agent = discovery.agents.get(named) if named else None
-    if agent is not None and (agent.fleet or {}).get("role") == "orchestrator":
-        return [agent.name]
-    found = []
-    for agent in discovery.agents.values():
+    """The live orchestrator of `charter` in `repo` as a list of exactly one name, or [] when none or more than one can be told apart.
+    The orchestrator the charter body's top block names wins when it is a live orchestrator of THIS repo; the `charter` field of an
+    orchestrator's session metadata (in this repo) is the fallback."""
+    def mine(agent):
         fleet = agent.fleet or {}
-        if fleet.get("role") == "orchestrator" and fleet.get("charter") == charter \
-                and sb._fleet_repo(fleet, sb.engine.config) == repo:
-            found.append(agent.name)
-    return sorted(found)
+        return fleet.get("role") == "orchestrator" and sb._fleet_repo(fleet, sb.engine.config) == repo
+
+    named = block_orchestrator(body)
+    agent = discovery.agents.get(named) if named else None
+    if agent is not None and mine(agent):
+        return [agent.name]
+    found = sorted(a.name for a in discovery.agents.values() if mine(a) and (a.fleet or {}).get("charter") == charter)
+    return found if len(found) == 1 else []
 
 
 def charter_body(sb, repo, number):
