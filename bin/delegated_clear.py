@@ -78,7 +78,7 @@ def refusals(rule, report, files, matches=None, closure=None):
             return ["the delegated-clear rule is malformed (%s)" % key]
     if report.get("owner_decision") not in ("hold", "second-review", "none"):
         return ["the owner-hold decision cannot be read"]
-    if report.get("complete") is False or report.get("unknown") or report.get("renamed_no_source"):
+    if report.get("complete") is not True or report.get("unknown") or report.get("renamed_no_source"):
         return ["the pull request's changes cannot be read in full (%s)" % (report.get("unknown") or "the file list is cut")]
     reasons = []
     hits = report.get("top_tier_hits") or {}
@@ -136,7 +136,8 @@ def import_time(node, number):
             if isinstance(child, DEF_KINDS) and _span(child)[0] <= number <= child.end_lineno:
                 return import_time(child, number)
         return True
-    return number < node.body[0].lineno
+    header_end = max([node.lineno] + [x.end_lineno for x in ast.walk(node.args) if hasattr(x, "end_lineno")] + ([node.returns.end_lineno] if node.returns is not None else []) + [d.end_lineno for d in node.decorator_list])
+    return number <= header_end or number < node.body[0].lineno   # a body that starts on the line the signature ends on is not told apart from it: that line is import-time
 
 
 def _span(node):

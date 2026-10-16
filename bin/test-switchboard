@@ -28945,10 +28945,14 @@ class TestImpactHold(LedgerBase):
         self.assertEqual(judge(mod, mod.replace("def ordinary(x):\n    return x", "def ordinary(x):\n    return 2"), ["one_line"]), [], "an ordinary function")
         more = mod + "\nclass Thing:\n    LIMIT = 1\n\n    def method(self):\n        return 1\n"
         self.assertTrue(judge(more, more.replace("LIMIT = 1", "LIMIT = 2"), ["one_line"]), "a class body runs at import")
-        self.assertEqual(judge(more, more.replace("return 1\n", "return 5\n", 1) if False else more.replace("        return 1", "        return 7"), ["one_line"]), [], "a method body does not")
+        self.assertEqual(judge(more, more.replace("        return 1", "        return 7"), ["one_line"]), [], "a method body does not")
         self.assertTrue(judge(mod, mod.replace("def ordinary(x):", "def ordinary(x=print(1)):"), ["one_line"]), "a default runs at import")
         self.assertTrue(judge(mod, mod.replace("def ordinary(x):", "@hook\ndef ordinary(x):"), ["one_line"]), "a decorator runs at import")
         self.assertTrue(judge(mod, mod.replace("def ordinary(x):", "def ordinary(\n        x):"), ["one_line"]), "a signature line runs at import")
+        one = mod + "\ndef short(a=1): return a\n\ndef split(a=1,\n          b=2): return a\n"
+        self.assertTrue(judge(one, one.replace("def short(a=1)", "def short(a=print())"), ["one_line"]), "a one-line def: the default shares the line with the body")
+        self.assertTrue(judge(one, one.replace("b=2)", "b=print())"), ["one_line"]), "a split signature whose last line carries the body")
+        self.assertTrue(judge(one, one.replace("def short(a=1):", "def short(a=1) -> print():"), ["one_line"]), "a return annotation")
 
     def test_the_blobs_are_read_at_the_merge_base_not_the_branch_tip(self):
         self.delegate()
