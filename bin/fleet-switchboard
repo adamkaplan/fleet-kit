@@ -21233,30 +21233,38 @@ def _held_spend(budget):
         raise ValueError("the scan did not finish within its step budget")
 
 
+_HTML_SPACE = " \t\n\f\r"   # HTML whitespace: space, tab, LF, FF, CR (not NBSP, not a vertical tab)
+_HTML_SPACE_RE = re.compile(r"[ \t\n\f\r]+")
+
+
+def _held_skip_space(text, i):
+    """The first index at or after `i` that is not HTML whitespace: the ONE helper for every attribute step."""
+    while i < len(text) and text[i] in _HTML_SPACE:
+        i += 1
+    return i
+
+
 def _held_class_tokens(tag):
-    """The class tokens (lower case) of an HTML tag's text: a linear walk over every `class=` (any case, spaces around `=`, quoted either way or bare)."""
+    """The class tokens (ASCII-lowered) of an HTML tag's text: a linear walk over every `class` (HTML whitespace around the name and the `=`, quoted either
+    way or bare); tokens are separated by HTML whitespace only."""
     low = _ascii_lower(tag)
     budget = _held_steps(len(low))
     tokens, at = [], low.find("class")
     while at >= 0:
         _held_spend(budget)
-        i = at + 5
-        while i < len(low) and low[i] in " \t":
-            i += 1
+        i = _held_skip_space(low, at + 5)
         if i < len(low) and low[i] == "=":
-            i += 1
-            while i < len(low) and low[i] in " \t":
-                i += 1
+            i = _held_skip_space(low, i + 1)
             if i < len(low) and low[i] in "\"'":
                 end = low.find(low[i], i + 1)
                 end = len(low) if end < 0 else end
-                tokens += low[i + 1:end].split()
+                tokens += [t for t in _HTML_SPACE_RE.split(low[i + 1:end]) if t]
                 i = end
             else:
                 end = i
-                while end < len(low) and low[end] not in " \t>":
+                while end < len(low) and low[end] not in _HTML_SPACE and low[end] != ">":
                     end += 1
-                tokens += low[i:end].split()
+                tokens += [t for t in _HTML_SPACE_RE.split(low[i:end]) if t]
                 i = end
         at = low.find("class", max(i, at + 5))
     return tokens
