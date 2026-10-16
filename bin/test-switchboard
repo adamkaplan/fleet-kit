@@ -2691,7 +2691,7 @@ class TestDeliver(Base):
         self.assertEqual((admitted["resume"], admitted["delivery"]), (True, "queue"))
         self.assertEqual(admitted["id"], sb.derive_message_id(sid, ["lab.fact:1", "lab.fact:2"]))
         self.assertEqual(admitted["from"], "switchboard")
-        self.assertTrue(admitted["text"].startswith("[switchboard] 2 for platform: First"))
+        self.assertRegex(admitted["text"].splitlines()[0], r"^\[switchboard\] 2 for platform \(sent \d\d:\d\dZ(-\d\d:\d\dZ)?, delivered \d\d:\d\dZ\): First")
         intent, result = [e for e in self.world.audit() if e["event"] == "v2.synthetic"]
         self.assertEqual((intent["phase"], result["phase"], result["ok"]), ("intent", "result", True))
         self.assertEqual(intent["detail"]["message_id"], admitted["id"])
@@ -57501,6 +57501,227 @@ class TestAgentCredentialsDoc(unittest.TestCase):
         self.assertEqual(len(samples), len(CRED_TOKEN_PATTERNS))
         for pattern, sample in zip(CRED_TOKEN_PATTERNS, samples):
             self.assertIsNotNone(re.search(pattern, sample), pattern)
+
+
+# ======================================================================
+# #583: a message says when it was sent and delivered; a newer send replaces older waiting ones (marked, kept); the pane warning is
+# only for a real mismatch; a launch goes to the caller's own workspace.
+# ======================================================================
+def _clock_at(hour, minute, second=0):
+    return calendar.timegm((2027, 1, 15, hour, minute, second))
+
+
+class TestMessageTimes(unittest.TestCase):
+    def sends(self, *rows):
+        return [fact("k%d" % n, created, kind="send", sender=sender, issue=issue, repo=repo, summary="text %d" % n)
+                for n, (created, sender, issue, repo) in enumerate(rows)]
+
+    def test_s1_the_header_says_when_it_was_sent_and_when_it_is_delivered(self):
+        text, _ = sb.compose("platform", [fact("a", _clock_at(14, 2, 10), summary="First")], delivered=_clock_at(14, 5, 30))
+        self.assertIn("sent 14:02Z, delivered 14:05Z", text.splitlines()[0])
+
+    def test_a_batch_header_gives_the_range_and_no_delivery_time_means_none_in_the_header(self):
+        text, _ = sb.compose("platform", [fact("a", _clock_at(14, 0)), fact("b", _clock_at(14, 4))], delivered=_clock_at(14, 5))
+        self.assertIn("sent 14:00Z-14:04Z, delivered 14:05Z", text.splitlines()[0])
+        plain, _ = sb.compose("platform", [fact("a", _clock_at(14, 0))])
+        self.assertEqual(plain.splitlines()[0], "[switchboard] 1 for platform: s a")
+
+    def test_s2_a_newer_send_from_the_same_sender_about_the_same_issue_marks_the_older_one_and_keeps_both(self):
+        facts = self.sends((_clock_at(14, 0), "coder", 7, "acme/api"), (_clock_at(14, 4), "coder", 7, "acme/api"))
+        text, carried = sb.compose("platform", facts, delivered=_clock_at(14, 5))
+        lines = [l for l in text.splitlines() if l.startswith("- send from")]
+        self.assertEqual(len(lines), 2)
+        self.assertIn("superseded", lines[0])
+        self.assertIn("text 0", lines[0])
+        self.assertNotIn("superseded", lines[1])
+        self.assertIn("text 1", lines[1])
+        self.assertEqual([f.key for f in carried], ["k0", "k1"], "both keys are carried, so both are acknowledged")
+
+    def test_s3_another_sender_or_another_issue_or_repo_is_never_superseded(self):
+        for rows in (((_clock_at(14, 0), "coder", 7, "acme/api"), (_clock_at(14, 4), "other", 7, "acme/api")),
+                     ((_clock_at(14, 0), "coder", 7, "acme/api"), (_clock_at(14, 4), "coder", 8, "acme/api")),
+                     ((_clock_at(14, 0), "coder", 7, "acme/api"), (_clock_at(14, 4), "coder", 7, "acme/web")),
+                     ((_clock_at(14, 0), "coder", None, None), (_clock_at(14, 4), "coder", None, None))):
+            with self.subTest(rows=rows):
+                text, carried = sb.compose("platform", self.sends(*rows), delivered=_clock_at(14, 5))
+                self.assertEqual(text.count("superseded"), 0)
+                self.assertEqual(len(carried), 2)
+
+    def test_s5_only_the_pending_facts_are_looked_at_so_a_delivered_message_is_never_marked(self):
+        text, carried = sb.compose("platform", self.sends((_clock_at(14, 4), "coder", 7, "acme/api")), delivered=_clock_at(14, 5))   # the older one was delivered: not pending
+        self.assertEqual((text.count("- send from"), text.count("superseded")), (1, 0))
+
+    def test_no_message_is_lost_n_in_is_n_out_with_every_text_and_key_visible(self):   # the no-loss property of the marker
+        rows = [(_clock_at(14, n), sender, issue, repo) for n, (sender, issue, repo) in enumerate(
+            [("coder", 7, "acme/api"), ("coder", 7, "acme/api"), ("other", 7, "acme/api"), ("coder", 8, "acme/api"), ("coder", 7, "acme/api"),
+             ("other", 7, "acme/api"), ("coder", None, None), ("coder", 7, "acme/web")])]
+        facts = self.sends(*rows)
+        text, carried = sb.compose("platform", facts, delivered=_clock_at(14, 30))
+        self.assertEqual([f.key for f in carried], [f.key for f in facts])
+        self.assertEqual(text.count("- send from"), len(facts))
+        for number in range(len(facts)):
+            self.assertIn("text %d" % number, text)
+        self.assertEqual(text.count("superseded"), 3, "k0 and k1 (by k4) and k2 (by k5) only")
+
+    def test_three_sends_mark_the_two_older_ones_only(self):
+        text, _ = sb.compose("platform", self.sends((_clock_at(14, 0), "coder", 7, "acme/api"), (_clock_at(14, 2), "coder", 7, "acme/api"),
+                                                    (_clock_at(14, 4), "coder", 7, "acme/api")), delivered=_clock_at(14, 5))
+        self.assertEqual([("superseded" in l) for l in text.splitlines() if l.startswith("- send from")], [True, True, False])
+
+
+class TestMessageTimesDelivery(Base):
+    """The REAL send path: a recipient that has not yet taken an earlier message from the same sender on the same issue."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("platform", "coder", "other"), config={"v2_cache_seconds": 0})
+        self.world.you("platform")   # a person is typing: the sends are notes, which wait in the inbox until taken
+
+    def send(self, text, issue=7, sender="coder", repo=None):
+        return self.world.engine.send(sender, "platform", text, issue, repo)
+
+    def waiting(self):
+        return [m["text"] for m in self.world.admissions("platform")]
+
+    def test_s4_the_newer_send_says_it_supersedes_the_waiting_one_and_both_are_delivered(self):
+        self.assertTrue(self.send("first text")["sent"])
+        self.world.tick(70)
+        self.assertTrue(self.send("second text")["sent"])
+        first, second = self.waiting()
+        self.assertNotIn("supersedes", first.splitlines()[0])
+        head = second.splitlines()[0]
+        self.assertIn("supersedes 1 earlier message from coder on this issue, still waiting: sent", head)
+        self.assertIn("second text", second)
+        self.assertIn("first text", first, "the older message was delivered as it was and stays")
+        self.assertEqual(len(self.world.admissions("platform")), 2, "N in, N out: nothing cancelled or removed")
+
+    def test_s3_another_sender_or_issue_is_never_marked(self):
+        self.send("one")
+        self.world.tick(5)
+        self.send("two", issue=8)                      # another issue
+        self.send("three", issue=7, sender="other")    # another sender
+        self.world.tick(5)
+        self.assertEqual(sum("supersedes" in text.splitlines()[0] for text in self.waiting()), 0)
+
+    def test_s5_an_older_message_the_recipient_already_took_is_not_waiting_so_nothing_is_marked(self):
+        self.send("first")
+        self.world.v2.sessions[self.world.sessions["platform"]]["inbox"].clear()   # the recipient took it
+        self.world.tick(70)
+        self.send("second")
+        self.assertNotIn("supersedes", self.waiting()[-1].splitlines()[0])
+
+    def test_an_unreadable_inbox_sends_as_before_with_no_marking(self):
+        self.send("first")
+        self.world.engine.reads.inbox = lambda *a, **k: (_ for _ in ()).throw(sb.V2Error("unavailable", "down"))
+        self.send("second")
+        self.assertEqual(len(self.world.admissions("platform")), 2)
+        self.assertNotIn("supersedes", self.waiting()[-1].splitlines()[0])
+
+    def test_under_v2_light_nothing_is_read_and_nothing_is_marked(self):
+        world = World(self, agents=("platform", "coder"), config={"v2_light": True, "v2_cache_seconds": 900})
+        world.you("platform")
+        world.engine.send("coder", "platform", "first", 7)
+        world.engine.send("coder", "platform", "second", 7)
+        self.assertEqual([("supersedes" in m["text"].splitlines()[0]) for m in world.admissions("platform")], [False, False])
+
+    def test_the_metadata_of_a_send_names_its_issue_sender_and_repo(self):
+        self.send("first", repo="acme/api")
+        (record,) = self.world.v2.sessions[self.world.sessions["platform"]]["inbox"]
+        fleet = record["metadata"]["fleet"]
+        self.assertEqual((fleet["sender"], fleet["issue"], fleet["repo"]), ("coder", 7, "acme/api"))
+
+    def test_a_waiting_message_carrying_sends_for_two_issues_is_never_named_by_a_later_send_about_one_of_them(self):
+        engine = self.world.engine
+        discovery = engine.discover(engine.now())
+        first = sb.Fact("send:coder:a1", "platform", "send", "text for A", engine.now(), issue=7, batch=False, sender="coder", repo=None)
+        second = sb.Fact("send:coder:b1", "platform", "send", "text for B", engine.now(), issue=8, batch=False, sender="coder", repo=None)
+        self.assertTrue(engine.send_fact(first, discovery, engine.now(), carried=[second])["sent"])   # ONE waiting message, two issues
+        self.world.tick(70)
+        self.assertTrue(self.send("newer text for A", issue=7)["sent"])
+        mixed, newer = self.waiting()
+        self.assertIn("text for A", mixed)
+        self.assertIn("text for B", mixed, "the other issue's send is fully shown and untouched")
+        self.assertNotIn("superseded", mixed)
+        self.assertNotIn("supersedes", newer.splitlines()[0], "the waiting message is not only about issue 7, so it is not named")
+        self.assertEqual(sb.Switchboard._send_meta([first, second]), {})
+        self.assertEqual(sb.Switchboard._send_meta([first]), {"sender": "coder", "issue": 7})
+
+    def test_s4_a_forged_or_absurd_time_in_the_inbox_never_stops_or_lies_in_a_send(self):   # security finding: gmtime(1e30) raised inside compose
+        self.send("first")
+        item = self.world.v2.sessions[self.world.sessions["platform"]]["inbox"][0]
+        item["time"] = {"created": 1e33}
+        self.world.tick(5)
+        self.assertTrue(self.send("second")["sent"])
+        self.assertNotIn("supersedes", self.waiting()[-1].splitlines()[0], "an implausible time is not shown")
+        self.assertEqual(sb.clock_utc(1e30), "??:??Z")
+
+
+class TestPaneWarningRule(unittest.TestCase):
+    class Herdr:
+        def __init__(self, pane_session):
+            self.pane_session = pane_session
+
+        def agent_get(self, pane):
+            return {"agent_session": self.pane_session}
+
+        def agent_list(self):
+            return []
+
+    class V2:
+        def __init__(self, names):
+            self.names = names
+
+        def session_get(self, session):
+            return {"metadata": {"fleet": {"name": self.names[session]}}} if self.names.get(session) else {"metadata": {}}
+
+    def warn(self, pane_session, names):
+        sb._WARNED_PANES.clear()
+        with captured() as (_, err):
+            sb.warn_pane_disagrees(self.Herdr(pane_session), self.V2(names), {"HERDR_PANE_ID": "w1:p1"}, "ses_own", "coder")
+        return err.getvalue()
+
+    def test_s6_the_same_fleet_agent_under_another_session_is_silent(self):
+        self.assertEqual(self.warn("ses_old", {"ses_old": "coder", "ses_own": "coder"}), "")
+
+    def test_s6_a_different_fleet_agent_or_no_fleet_agent_still_warns_once(self):
+        self.assertIn("belongs to session ses_old (other)", self.warn("ses_old", {"ses_old": "other", "ses_own": "coder"}))
+        self.assertIn("belongs to session ses_old (not a fleet agent)", self.warn("ses_old", {"ses_own": "coder"}))
+
+
+class TestCallerWorkspace(unittest.TestCase):
+    class Herdr:
+        def __init__(self, agents):
+            self.agents = agents
+
+        def agent_list(self):
+            if self.agents is None:
+                raise sb.HerdrError("unavailable", "down")
+            return self.agents
+
+    def engine(self, agents):
+        return types.SimpleNamespace(herdr=self.Herdr(agents))
+
+    own = [{"agent_session": "ses_own", "pane_id": "wW:p1", "workspace_id": "wW"}]
+
+    def go(self, agents, explicit, **environ):
+        with captured() as (_, err):
+            return sb.caller_workspace(self.engine(agents), explicit, environ), err.getvalue()
+
+    def test_s7_a_disagreeing_inherited_workspace_is_not_used_and_both_are_named(self):
+        got, err = self.go(self.own, None, OPENCODE_SESSION_ID="ses_own", HERDR_WORKSPACE_ID="wD")
+        self.assertEqual(got, "wW")
+        self.assertIn("wW", err)
+        self.assertIn("wD", err)
+
+    def test_s8_an_explicit_workspace_wins_and_an_unresolvable_caller_keeps_the_variable(self):
+        self.assertEqual(self.go(self.own, "wX", OPENCODE_SESSION_ID="ses_own", HERDR_WORKSPACE_ID="wD"), ("wX", ""))
+        self.assertEqual(self.go(self.own, None, HERDR_WORKSPACE_ID="wD"), ("wD", ""))                            # a plain shell
+        self.assertEqual(self.go([], None, OPENCODE_SESSION_ID="ses_own", HERDR_WORKSPACE_ID="wD"), ("wD", ""))   # herdr does not show the session
+        self.assertEqual(self.go(None, None, OPENCODE_SESSION_ID="ses_own", HERDR_WORKSPACE_ID="wD"), ("wD", ""))  # herdr unreadable
+
+    def test_u3_when_they_agree_nothing_is_said(self):
+        self.assertEqual(self.go(self.own, None, OPENCODE_SESSION_ID="ses_own", HERDR_WORKSPACE_ID="wW"), ("wW", ""))
+        self.assertEqual(self.go(self.own, None, OPENCODE_SESSION_ID="ses_own"), ("wW", ""))
 
 
 
