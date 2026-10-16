@@ -142,6 +142,37 @@ def secret_forms(value):
     return {f for f in forms if f}
 
 
+_OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
+_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
+
+
+def _repo_key(text):
+    """OWNER/NAME lower-cased, or None when it is not exactly that shape (no wildcard, space, dot segment or extra slash)."""
+    owner, sep, name = (text or "").partition("/")
+    if not sep or not _OWNER_RE.match(owner) or not _NAME_RE.match(name) or set(name) == {"."}:
+        return None
+    return (owner + "/" + name).lower()
+
+
+def check_repo_allowed(repo, env):
+    """The one allow-list check (the launcher's create and the driver both call it). Raises CloudError(EXIT_USAGE) before anything is
+    made. CW_ALLOWED_REPOS: comma-separated OWNER/NAME, exact and case-insensitive; unset, empty or any malformed entry refuses.
+    CW_TOOLING_REPO: the tooling's own repository, refused even when listed; unset adds no check, malformed refuses."""
+    raw = (env.get("CW_ALLOWED_REPOS") or "").strip()
+    if not raw:
+        raise CloudError("refused: %s is not on the cloud allow-list (CW_ALLOWED_REPOS is unset or empty)" % scrub(repo, (), 120), EXIT_USAGE)
+    allowed = [_repo_key(x.strip()) for x in raw.split(",")]
+    if None in allowed:
+        raise CloudError("refused: CW_ALLOWED_REPOS has an entry that is not OWNER/NAME; nothing was created", EXIT_USAGE)
+    tooling = (env.get("CW_TOOLING_REPO") or "").strip()
+    tkey = _repo_key(tooling) if tooling else None
+    if tooling and tkey is None:
+        raise CloudError("refused: CW_TOOLING_REPO is not OWNER/NAME; nothing was created", EXIT_USAGE)
+    key = _repo_key(repo)
+    if key is None or key not in allowed or key == tkey:
+        raise CloudError("refused: %s is not on the cloud allow-list" % scrub(repo, (), 120), EXIT_USAGE)
+
+
 def token_mode(env):
     """True when either service-account setting is present: the token-file login is then the only one (S8, S10)."""
     return bool((env.get("CW_CLOUD_SERVER") or "").strip() or (env.get("CW_CLOUD_TOKEN_FILE") or "").strip())
@@ -489,6 +520,7 @@ class Launcher:
 
         def go(info):
             info["rid"] = "pod/" + name
+            check_repo_allowed(a.repo, self.env)  # before anything is read or made
             if not NAME_RE.match(worker):
                 raise CloudError("bad worker name %r" % worker, EXIT_USAGE)
             if a.shape not in SHAPES:

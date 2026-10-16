@@ -411,6 +411,11 @@ def main(argv=None, env=None):
     if not cw.NAME_RE.match(a.worker) or not REPO_RE.match(a.repo) or not re.match(r"^[A-Za-z0-9._/-]{1,200}$", a.branch):
         print("run-task: bad worker name, repository (OWNER/NAME) or branch", file=sys.stderr)
         return 2
+    try:
+        cw.check_repo_allowed(a.repo, env)  # the launcher's own check, before the driver reads or makes anything
+    except cw.CloudError as e:
+        print("run-task: %s" % e, file=sys.stderr)
+        return e.code
     if not (cw.token_mode(env) or (env.get("CW_KUBE_CONTEXT") or "").strip()):
         print("run-task: CW_KUBE_CONTEXT is not set; refusing to run (the active kubectl context is never used)", file=sys.stderr)
         return 2

@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# check-parity-table [FILE]: the parity table's shape (no network). Exit 1 on a blank cell, a row with no status, a GAP with
+# no owner, an unknown FK-LAW id or no rows; 0 otherwise. It never judges whether a claim is true.
+here=$(cd "$(dirname "$0")/../.." && pwd)
+exec python3 - "${1:-$here/docs/cloud-guard-parity.md}" <<'P'
+import re, sys
+path, bad, rows = sys.argv[1], [], 0
+try:
+    lines = open(path).read().splitlines()
+except OSError as e:
+    print("check-parity-table: cannot read %s" % path); sys.exit(1)
+for n, line in enumerate(lines, 1):
+    if not line.startswith("|") or re.match(r"^\|[\s:|-]+\|$", line):
+        continue
+    cells = [c.strip() for c in line.strip().strip("|").split("|")]
+    if cells[0] == "Guard":
+        continue
+    rows += 1
+    if len(cells) != 7:
+        bad.append("line %d: %d cells, want 7" % (n, len(cells))); continue
+    for i, c in enumerate(cells):
+        if not c:
+            bad.append("line %d: blank cell %d" % (n, i + 1))
+    status = cells[6]
+    if not re.match(r"^(covered|covered another way|GAP)\b", status):
+        bad.append("line %d: status must be covered, covered another way or GAP (owner: ...; item: ...)" % n)
+    if status.startswith("GAP") and not re.match(r"^GAP \(owner: [^;)]*\S[^;)]*; item: [^)]*\S[^)]*\)$", status):
+        bad.append("line %d: a GAP needs an owner and an item" % n)
+    for law in re.findall(r"FK-LAW-\S*", cells[5]) if cells[5] else []:
+        if not re.match(r"^FK-LAW-[1-8],?$", law):
+            bad.append("line %d: unknown law id %s" % (n, law.rstrip(",")))
+    if cells[5] and not re.search(r"FK-LAW-[1-8]", cells[5]):
+        bad.append("line %d: no law id" % n)
+if rows == 0:
+    bad.append("no rows")
+for b in bad:
+    print("check-parity-table: " + b)
+print("check-parity-table: %d rows, %s" % (rows, "FAIL" if bad else "ok"))
+sys.exit(1 if bad else 0)
+P
