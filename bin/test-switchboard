@@ -23609,6 +23609,265 @@ class TestCaptainSweepFindings(TestSweep):
             self.assertNotIn(forbidden, text[start:end], forbidden)
 
 
+class FakeOwnerlessHub(FakeTriageHub):
+    """The triage hub for #605: the open list is paged by `cap` pages of 100 (cut when more remain) and the repository answers its own count of open items."""
+
+    def __init__(self):
+        super().__init__()
+        self.open_total = {}
+
+    def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
+        if "state=open" in path and "/issues?" in path and cap is not None:
+            self.calls.append(path)
+            repo = re.search(r"repos/([^/]+/[^/]+)/", path).group(1)
+            if repo in self.unreadable:
+                raise sb.GitHubUnavailable("HTTP 404: Not Found")
+            everything = list(self.open.get(repo, {}).values())
+            if "direction=asc" in path:   # GitHub sorts by the updated time; the fake does too
+                everything.sort(key=lambda record: record["updated_at"])
+            elif "sort=" not in path:
+                everything.sort(key=lambda record: record["updated_at"], reverse=True)   # the default listing is newest first
+            return everything[:cap * 100], len(everything) > cap * 100
+        return super().read_pages(path, key, timeout, older, cap)
+
+    def open_issues_count(self, repo):
+        self.calls.append("repos/%s" % repo)
+        return self.open_total.get(repo, len(self.open.get(repo, {})))
+
+
+class TestOwnerlessSummary(Base):
+    """#605: ownerless, quiet issues of a team repository are one daily line to the Chief of Staff and the repository's orchestrators; nothing is written to any issue."""
+
+    TEAM = "acme/web"
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=(), config={"github_repos": ["acme/api", self.TEAM]})
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.world.add_agent("orch-web-1", fleet={"role": "orchestrator", "charter": 11, "repo": self.TEAM})
+        self.world.add_agent("orch-web-2", fleet={"role": "orchestrator", "charter": 12, "repo": self.TEAM})
+        self.world.add_agent("orch-api", fleet={"role": "orchestrator", "charter": 1, "repo": "acme/api"})
+        self.hub = FakeOwnerlessHub()
+        self.engine = self.world.engine
+        self.engine.hub = self.hub
+        self.runs = []
+        self.engine.gh_runner = lambda argv, **kw: (self.runs.append(argv), subprocess.CompletedProcess(argv, 0, "{}", ""))[1]
+        self.engine.config["triage"] = dict(sb.TRIAGE_DEFAULTS, repos=["acme/api", self.TEAM], our_logins=["bot"], calls_per_pass=60,
+                                            ownerless={"repos": [self.TEAM, "acme/api"], "days": 3, "limit": 500})
+        self.engine.discover(self.world.clock.now())
+        self.hub.open[self.TEAM], self.hub.open["acme/api"] = {}, {}
+
+    def add(self, number, repo=None, **kw):
+        repo = repo or self.TEAM
+        self.hub.open[repo][number] = tri_issue(self.world.clock.now(), number, repo=repo, **kw)
+
+    def go(self, passes=3):
+        for _ in range(passes):
+            self.world.tick(1)
+            sb.triage_pass(self.engine, [], self.world.clock.now(), ())
+
+    def told(self, name):
+        return [a["text"] for a in self.world.admissions(name) if a["text"].count("ownerless in") and "open issue(s) with no owner" in a["text"]]
+
+    def lines(self, name):
+        out = []
+        for text in self.told(name):
+            out.append(re.findall(r"ownerless in [^\n]*", text)[-1])   # the delivery's headline is clipped; the full line follows it
+        return out
+
+    def populate(self):
+        for n in range(20, 75):
+            self.add(n, created=10 + n * 0.1, author="alice")                                   # no owner, no label, quiet 10+ days
+        for n in range(100, 110):
+            self.add(n, created=10, author="alice", labels=["agent:other-crew"])                # another crew's owner label: owned
+        for n in range(200, 205):
+            self.add(n, created=10, updated=1, author="alice")                                   # touched yesterday
+
+    def test_s1_s2_one_line_with_the_count_the_oldest_age_and_five_links_and_nothing_per_issue(self):
+        self.populate()
+        self.go()
+        (line,) = self.lines("cos")
+        self.assertIn("55 open issue(s) with no owner and no activity for 3 day(s) or more", line)
+        self.assertEqual(line.count("https://github.com/acme/web/issues/"), 5)
+        self.assertIn("oldest quiet for 17 day(s)", line)
+        self.assertIn("read 70 of 70 open item(s)", line)
+        self.assertEqual(len(self.world.admissions("cos")), 1, "one message, not one per issue")
+        self.assertFalse([a for a in self.runs if "--method" in a or "PATCH" in a or "POST" in a or "DELETE" in a], "nothing is written to any issue")
+
+    def test_s3_the_list_is_read_page_by_page_to_the_end_or_to_the_limit_and_says_how_much(self):
+        for n in range(20, 270):
+            self.add(n, created=10, author="alice")
+        self.go(1)
+        self.assertIn("read 250 of 250 open item(s)", self.lines("cos")[0])
+        self.hub.open[self.TEAM] = {}
+        self.hub.open_total[self.TEAM] = 731
+        for n in range(20, 751):
+            self.add(n, created=10, author="alice")
+        self.engine.state_dir.joinpath(sb.OWNERLESS_FILE).unlink()
+        state = sb.triage_state(self.engine)
+        state.units.pop((self.TEAM, "ownerless"), None)
+        self.go(1)
+        self.assertIn("read 500 of 731 open item(s)", self.lines("cos")[-1])
+
+    def test_s4_one_line_a_day_even_after_a_restart_and_none_for_a_clean_repository(self):
+        self.add(1, created=10, author="alice")
+        self.go(4)
+        self.assertEqual(len(self.lines("cos")), 1)
+        state = sb.triage_state(self.engine)
+        state.units.pop((self.TEAM, "ownerless"), None)   # a restart: the in-memory read is gone, the file stays
+        self.go(3)
+        self.assertEqual(len(self.lines("cos")), 1, "no second line the same day")
+        self.assertEqual([a for a in self.world.admissions("orch-api")], [], "a repository with no such issue gets none")
+
+    def test_s5_the_orchestrators_of_the_repository_and_the_chief_of_staff_get_it_and_a_repository_with_none_only_the_chief(self):
+        self.add(1, created=10, author="alice")
+        self.add(2, repo="acme/api", created=10, author="alice")
+        self.go()
+        self.assertEqual((len(self.lines("orch-web-1")), len(self.lines("orch-web-2"))), (1, 1))
+        self.assertEqual(len(self.lines("cos")), 2, "one line per repository")
+        self.assertEqual(len(self.lines("orch-api")), 1, "acme/api's own orchestrator gets acme/api's line only")
+
+    def test_s7_the_line_holds_links_and_no_title_text(self):
+        self.add(1, created=10, author="alice", body="a body with @mention and https://example.test/x")
+        self.hub.open[self.TEAM][1]["title"] = "@alice see https://evil.example " + "T" * 300
+        self.go()
+        (line,) = self.lines("cos")
+        self.assertNotIn("TTTT", line)
+        self.assertNotIn("@alice", line)
+        self.assertNotIn("evil.example", line)
+        self.assertLess(len(line), 400)
+
+    def test_s6_the_report_says_why_per_repository_with_the_other_owner_share_and_the_oldest_age(self):
+        info = {"unchecked": 21, "unchecked_why": {self.TEAM: {"reasons": {"call budget": 12, "failed read": 6, "not read yet": 3}, "other_owner": 15, "oldest_seconds": 7200 * 3}}}
+        text = "\n".join(sb.triage_status_lines(dict(sb.TRIAGE_DEFAULTS, **{"enabled": True, "counts": {}, "total": 0, "at": "2026-01-01T00:00:00Z"}, **info)))
+        self.assertIn("not checked for acme/web: 12 call budget, 6 failed read, 3 not read yet (15 of them other-owner flags); oldest unchecked for 6 hour(s)", text)
+        self.assertIn("21 finding(s) not checked this pass", text, "the older line is unchanged")
+
+    def test_a_cut_list_is_read_oldest_first_so_the_stale_issues_are_counted_and_the_count_is_a_lower_bound(self):
+        for n in range(20, 170):
+            self.add(n, created=30, updated=20, author="alice")   # 150 stale: the least recently updated
+        for n in range(200, 750):
+            self.add(n, created=30, updated=1, author="alice")    # 550 touched yesterday
+        self.hub.open_total[self.TEAM] = 700
+        self.go(1)
+        (line,) = self.lines("cos")
+        self.assertIn("at least 150 open issue(s) with no owner", line)
+        self.assertIn("oldest quiet for 20 day(s)", line)
+        self.assertIn("read 500 of 700 open item(s), least recently updated first", line)
+        self.assertTrue(any("sort=updated&direction=asc" in c for c in self.hub.calls), "the summary's own read is oldest first")
+
+    def test_a_complete_list_says_no_at_least(self):
+        for n in range(20, 30):
+            self.add(n, created=10, author="alice")
+        self.go(1)
+        (line,) = self.lines("cos")
+        self.assertNotIn("at least", line)
+        self.assertNotIn("least recently updated first", line)
+
+    def test_label_case_and_empty_labels_are_handled(self):
+        self.add(20, created=10, author="alice", labels=["Agent:Crew-B"])      # an owner label in another case: owned
+        self.add(21, created=10, author="alice", labels=[])                     # no labels at all: ownerless
+        self.go(1)
+        (line,) = self.lines("cos")
+        self.assertIn(" 1 open issue(s) with no owner", line)
+
+    def test_the_line_goes_out_again_after_a_day_and_not_just_under_one(self):
+        self.add(1, created=10, author="alice")
+        self.go(2)
+        self.assertEqual(len(self.lines("cos")), 1)
+        state = sb.triage_state(self.engine)
+        self.world.tick(86400 - 4 * 3600)
+        state.units.pop((self.TEAM, "ownerless"), None)
+        sb.triage_pass(self.engine, [], self.world.clock.now(), ())
+        self.assertEqual(len(self.lines("cos")), 1, "just under a day: nothing")
+        self.world.tick(5 * 3600)
+        state.units.pop((self.TEAM, "ownerless"), None)
+        sb.triage_pass(self.engine, [], self.world.clock.now(), ())
+        self.assertEqual(len(self.lines("cos")), 2, "a day later: the next line")
+
+    def test_a_repository_with_no_orchestrator_tells_only_the_chief_of_staff(self):
+        self.engine.config["triage"]["ownerless"]["repos"] = [self.TEAM, "acme/solo"]
+        self.engine.config["triage"]["repos"] = ["acme/api", self.TEAM, "acme/solo"]
+        self.hub.open["acme/solo"] = {}
+        self.add(1, repo="acme/solo", created=10, author="alice")
+        self.go()
+        (line,) = self.lines("cos")
+        self.assertIn("ownerless in acme/solo", line)
+        for name in ("orch-web-1", "orch-web-2", "orch-api"):
+            self.assertEqual(self.lines(name), [], name)
+
+    def test_a_failed_count_on_a_cut_list_says_an_unknown_number_and_an_unreadable_repository_keeps_the_old_copy(self):
+        for n in range(20, 170):
+            self.add(n, created=10, author="alice")
+        self.engine.config["triage"]["ownerless"]["limit"] = 100
+        self.hub.open_issues_count = lambda repo: (_ for _ in ()).throw(sb.GitHubUnavailable("HTTP 502"))
+        self.go(1)
+        self.assertIn("read 100 of an unknown number open item(s)", self.lines("cos")[0])
+        self.hub.unreadable.add(self.TEAM)
+        state = sb.triage_state(self.engine)
+        before = len(self.lines("cos"))
+        state.units[(self.TEAM, "ownerless")]["at"] = 0
+        self.go(2)
+        self.assertEqual(len(self.lines("cos")), before, "an unreadable repository keeps the old copy and adds no line")
+        self.assertEqual(len(state.units[(self.TEAM, "ownerless")]["data"]), 100)
+        self.assertTrue(state.units[(self.TEAM, "ownerless")]["error"])
+
+    def test_a_send_that_fails_is_audited_and_the_day_is_not_retried(self):
+        self.add(1, created=10, author="alice")
+        real = self.engine.send
+
+        def broken(sender, recipient, text, **kw):
+            raise RuntimeError("herdr is down")
+        self.engine.send = broken
+        self.go(3)
+        failed = [e for e in self.world.audit() if e["event"] == "triage.ownerless_send_failed"]
+        self.assertTrue(failed)
+        self.engine.send = real
+        self.go(3)
+        self.assertEqual(self.lines("cos"), [], "the mark was written before the send: no second try the same day")
+
+    def test_the_pass_itself_says_why_findings_were_not_checked_per_repository(self):
+        for n in range(20, 40):
+            self.add(n, created=5, author="bot")   # ours, no assignee: T1 candidates that need a fresh read each
+        self.engine.config["triage"]["calls_per_pass"] = 6
+        self.hub.live[self.TEAM] = {}
+        self.go(1)
+        why = sb.triage_state(self.engine).current.get("unchecked_why") or {}
+        self.assertIn(self.TEAM, why)
+        reasons = why[self.TEAM]["reasons"]
+        self.assertTrue(set(reasons) <= {"call budget", "failed read", "not read yet"} and reasons, reasons)
+        self.assertGreater(why[self.TEAM]["oldest_seconds"], -1)
+
+    def test_t1_fires_and_stays_silent_in_the_same_cases_is_claimed_decides(self):
+        module = sb.load_module("triage_ownerless")
+        now = self.world.clock.now()
+        items = {n: sb.triage_norm(tri_issue(now, n, created=5, author="alice", assignees=["bob"] if n == 31 else (), body="Owner: carol" if n == 32 else "")) for n in (30, 31, 32)}
+        ctx = {"chain": set(), "owned": set(), "unresolved": set(), "charters": set(), "asks": set()}
+        for number, item in items.items():
+            found, _ours = sb.triage_rules(item, [], ctx, sb.triage_sla(self.engine.config["triage"], self.TEAM), now, ["bot"], [], set())
+            self.assertEqual("T1" in found, not module.is_claimed(item, ctx), number)
+
+    def test_the_default_is_off_and_a_bad_setting_is_refused(self):
+        self.engine.config["triage"]["ownerless"] = None
+        self.hub.open[self.TEAM][1] = tri_issue(self.world.clock.now(), 1, created=10, author="alice", repo=self.TEAM)
+        self.go()
+        self.assertEqual(self.lines("cos"), [])
+        for bad in ({"repos": []}, {"repos": ["acme/web"], "days": 0}, {"repos": ["acme/web"], "limit": 5}, {"repos": ["acme/web"], "owner_labels": "agent:*"}, {"repos": ["acme/web"], "nope": 1}):
+            with self.assertRaises(sb.ConfigError, msg=str(bad)):
+                sb.validate_triage_config({"triage": {"ownerless": bad}}, "config")
+
+    def test_one_definition_of_has_an_owner_is_shared_with_t1(self):
+        import inspect
+        source = inspect.getsource(sb.triage_rules)
+        self.assertIn("is_claimed(", source)
+        module = sb.load_module("triage_ownerless")
+        ctx = {"chain": {5}, "owned": {6}, "unresolved": {7}}
+        base = {"number": 1, "assignees": [], "owner_body": False}
+        self.assertFalse(module.is_claimed(base, ctx))
+        for change in ({"assignees": ["x"]}, {"number": 5}, {"number": 6}, {"number": 7}, {"owner_body": True}):
+            self.assertTrue(module.is_claimed(dict(base, **change), ctx), change)
+
+
 class TestTriageDigest(Base):
     """#349: the stale digest: one per pass, a backoff, changes, parked, 'seen, leave', the cost figure. It reuses the triage
     harness's setup without inheriting (and so re-running) its tests."""
