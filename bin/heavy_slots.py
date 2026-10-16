@@ -308,6 +308,9 @@ class Watchdog:
         live = set()
         for _ in range(self.rounds):
             live = self.look()
+            if live is None:   # no table: the command itself is all that can be judged
+                self.signal(signal.SIGKILL, set(), fallback=True)
+                return
             if not live:
                 return
             self.signal(signal.SIGKILL, live)
@@ -322,7 +325,7 @@ class Watchdog:
         try:
             return self.remember(self.read_table())
         except OSError:
-            return set()   # nothing can be judged: nothing more is signalled
+            return None
 
     def say(self, reason):
         text = _plain(" ".join(self.command), 120)

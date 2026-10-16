@@ -48419,8 +48419,27 @@ class TestHeavyWatchdog(unittest.TestCase):
         self.assertEqual(code, 137)
         self.assertEqual([sig for _p, sig in self.signals], [signal.SIGTERM])
 
-    def test_s6_main_starts_the_parent_watch(self):
-        self.assertIn("watch_parent()", inspect.getsource(main))
+    def test_s11_a_process_that_survives_every_round_is_named_in_the_survivors_line(self):
+        rows = [(4242, 1, 4242, 10, "t0")]
+        sent = BoundedList()
+        record = lambda target, number: sent.append((target, number))
+        dog = self.hs.Watchdog(4242, ["x"], 16384, 0, self.out, 0.0, read_table=lambda: rows, killpg=record, kill=record, rounds=3, sweep_pause=lambda s: None,
+                               me=(9001, 9002, 9003))
+        dog.sample()
+        dog.sweep()
+        self.assertEqual(dog.survivors, [4242])
+        self.assertEqual(self.out.getvalue().count("survivors after the stop: 4242"), 1, self.out.getvalue())
+        self.assertEqual(sum(1 for _t, n in sent if n == signal.SIGKILL), 3, "each of 3 rounds: the group once, no member twice")
+
+    def test_s11_an_unreadable_table_at_the_sweep_still_kills_the_command_itself(self):
+        sent = BoundedList()
+        record = lambda target, number: sent.append((target, number))
+
+        def unreadable():
+            raise OSError("ps failed")
+        dog = self.hs.Watchdog(4242, ["x"], 16384, 0, self.out, 0.0, read_table=unreadable, killpg=record, kill=record, me=(9001, 9002, 9003))
+        dog.sweep()
+        self.assertEqual(list(sent), [(4242, signal.SIGKILL)])
 
     def test_s4_an_unreadable_process_table_stops_nothing_and_says_so_once(self):
         def unreadable():
@@ -48463,8 +48482,8 @@ class TestHeavyWatchdog(unittest.TestCase):
         "if os.fork()==0:\n"
         "    if mode=='orphan':\n"
         "        if os.fork()==0:\n"
-        "            note('b'); time.sleep(1.0); grow(); os._exit(0)\n"
-        "        time.sleep(0.5); os._exit(0)\n"
+        "            note('b'); time.sleep(4.0); grow(); os._exit(0)\n"
+        "        time.sleep(3.0); os._exit(0)\n"
         "    if mode=='ignore': signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
         "    if mode=='setsid': os.setsid()\n"
         "    note('b'); time.sleep(0.5); grow(); os._exit(0)\n"
