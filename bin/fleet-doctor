@@ -275,6 +275,16 @@ else
   emit WARN agents-skills "missing or no SKILL.md in ~/.agents/skills:$sk_missing (INSTALL STEP 8)"
 fi
 
+# The installed skills must equal the kit's: `fleet-switchboard skills check` reads files only and names each skill that differs.
+sb_here="$(dirname "$0")/fleet-switchboard"
+if [ -x "$sb_here" ]; then
+  if run_to 20 "$sb_here" skills check; then
+    emit ok skills-sync "$(printf '%s' "$LAST_OUT" | head -n1)"
+  else
+    emit FAIL skills-sync "$(printf '%s' "$LAST_OUT" | head -n1)"
+  fi
+fi
+
 if ! have copilot; then
   emit WARN skills "skipped — copilot not installed"
 else
