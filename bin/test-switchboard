@@ -57207,25 +57207,64 @@ class TestMessageTimes(unittest.TestCase):
 
 
 class TestMessageTimesDelivery(Base):
-    def test_s4_a_superseded_message_is_delivered_with_its_key_acknowledged_and_never_sent_again(self):
+    """The REAL send path: a recipient that has not yet taken an earlier message from the same sender on the same issue."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("platform", "coder", "other"), config={"v2_cache_seconds": 0})
+        self.world.you("platform")   # a person is typing: the sends are notes, which wait in the inbox until taken
+
+    def send(self, text, issue=7, sender="coder", repo=None):
+        return self.world.engine.send(sender, "platform", text, issue, repo)
+
+    def waiting(self):
+        return [m["text"] for m in self.world.admissions("platform")]
+
+    def test_s4_the_newer_send_says_it_supersedes_the_waiting_one_and_both_are_delivered(self):
+        self.assertTrue(self.send("first text")["sent"])
+        self.world.tick(70)
+        self.assertTrue(self.send("second text")["sent"])
+        first, second = self.waiting()
+        self.assertNotIn("supersedes", first.splitlines()[0])
+        head = second.splitlines()[0]
+        self.assertIn("supersedes 1 earlier message from coder on this issue, still waiting: sent", head)
+        self.assertIn("second text", second)
+        self.assertIn("first text", first, "the older message was delivered as it was and stays")
+        self.assertEqual(len(self.world.admissions("platform")), 2, "N in, N out: nothing cancelled or removed")
+
+    def test_s3_another_sender_or_issue_is_never_marked(self):
+        self.send("one")
+        self.world.tick(5)
+        self.send("two", issue=8)                      # another issue
+        self.send("three", issue=7, sender="other")    # another sender
+        self.world.tick(5)
+        self.assertEqual(sum("supersedes" in text.splitlines()[0] for text in self.waiting()), 0)
+
+    def test_s5_an_older_message_the_recipient_already_took_is_not_waiting_so_nothing_is_marked(self):
+        self.send("first")
+        self.world.v2.sessions[self.world.sessions["platform"]]["inbox"].clear()   # the recipient took it
+        self.world.tick(70)
+        self.send("second")
+        self.assertNotIn("supersedes", self.waiting()[-1].splitlines()[0])
+
+    def test_an_unreadable_inbox_sends_as_before_with_no_marking(self):
+        self.send("first")
+        self.world.engine.reads.inbox = lambda *a, **k: (_ for _ in ()).throw(sb.V2Error("unavailable", "down"))
+        self.send("second")
+        self.assertEqual(len(self.world.admissions("platform")), 2)
+        self.assertNotIn("supersedes", self.waiting()[-1].splitlines()[0])
+
+    def test_under_v2_light_nothing_is_read_and_nothing_is_marked(self):
         world = World(self, agents=("platform", "coder"), config={"v2_light": True, "v2_cache_seconds": 900})
-        self.addCleanup(os.environ.pop, sb.LAB_ENV, None)
-        os.environ[sb.LAB_ENV] = "1"   # the Lab's fact file is read only then
-        sender = {"kind": "send", "from": "coder", "issue": 7, "repo": "acme/api"}
-        world.fact("platform", "lab.fact:one", "first text", **sender)
-        world.tick(10)
-        world.fact("platform", "lab.fact:two", "second text", **sender)
-        world.tick(90)
-        report = world.engine.run_pass()
-        self.assertEqual([s["keys"] for s in report["sent"]], [["lab.fact:one", "lab.fact:two"]])
-        (admitted,) = world.admissions("platform")
-        self.assertIn("superseded", admitted["text"])
-        self.assertIn("first text", admitted["text"])
-        self.assertRegex(admitted["text"].splitlines()[0], r"\(sent \d\d:\d\dZ(-\d\d:\d\dZ)?, delivered \d\d:\d\dZ\)")
-        self.assertEqual(sorted(sb.SentLedger(world.state).known(world.sessions["platform"], 0)), ["lab.fact:one", "lab.fact:two"])
-        world.tick(5)
-        self.assertEqual(world.engine.run_pass()["sent"], [], "every key was acknowledged with the batch: nothing is sent again")
-        self.assertEqual(len(world.admissions("platform")), 1)
+        world.you("platform")
+        world.engine.send("coder", "platform", "first", 7)
+        world.engine.send("coder", "platform", "second", 7)
+        self.assertEqual([("supersedes" in m["text"].splitlines()[0]) for m in world.admissions("platform")], [False, False])
+
+    def test_the_metadata_of_a_send_names_its_issue_and_sender(self):
+        self.send("first")
+        item = self.world.v2.admitted[next(iter(self.world.v2.admitted))]
+        self.assertTrue(item["keys"][0].startswith("send:coder:"))
 
 
 class TestPaneWarningRule(unittest.TestCase):

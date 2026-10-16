@@ -2940,6 +2940,7 @@ class Fact:
             raise FactError("fact repo must be OWNER/REPO, got %r" % (repo,))
         self.repo = repo  # PR 15: the repo `issue` is in; None means the recipient's own
         self.orders = orders  # PR 17: the charter's standing orders: a note on its own, at once, never a wake
+        self.supersedes = ()  # #583: the creation times of this sender's earlier messages on this issue that the recipient has not seen yet (set by `send`; never stored)
 
     @classmethod
     def from_json(cls, obj):
@@ -3346,6 +3347,11 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
         if delivered is not None:
             first, last = clock_utc(min(f.created for f in taken)), clock_utc(max(f.created for f in taken))
             when = " (sent %s, delivered %s)" % (first if first == last else "%s-%s" % (first, last), clock_utc(delivered))
+        waiting = sorted({t for f in taken for t in f.supersedes})
+        if waiting:   # the earlier messages stay where they are, unchanged: this says only that the newer one replaces them
+            names = sorted({f.sender for f in taken if f.supersedes and f.sender})
+            when = (when[:-1] + "; " if when else " (") + "supersedes %d earlier message%s from %s on this issue, still waiting: sent %s)" % (
+                len(waiting), "" if len(waiting) == 1 else "s", ", ".join(names) or "the same sender", ", ".join(clock_utc(t) for t in waiting[:5]))
         head = "[switchboard] %d for %s%s: %s" % (count, recipient, when, _one_line(lead.summary, 200))
         idle = [fact for fact in taken if fact.kind == WORKER_IDLE and fact.rider and getattr(fact, "clean", False)]
         shown = [fact for fact in taken if fact not in idle] if len(idle) < len(taken) else taken
@@ -4569,7 +4575,7 @@ class Switchboard:
         try:
             with self._external("v2.synthetic", plan.recipient, detail) as result:
                 record = self.v2.synthetic(observation.session_id, text,
-                                           {"fleet": {"keys": keys, "from": "switchboard"}},
+                                           {"fleet": dict({"keys": keys, "from": "switchboard"}, **self._send_meta(carried))},
                                            resume, delivery, message_id, description)
                 if fault("crash-after-send"):
                     raise SimulatedCrash("crash-after-send: %s was admitted; stopping before the audit result"
@@ -4592,6 +4598,33 @@ class Switchboard:
         self._acknowledge(keys)
         return {"sent": True, "action": plan.action, "message_id": message_id, "keys": keys,
                 "left": len(plan.pending) - len(keys)}
+
+    @staticmethod
+    def _send_meta(carried):
+        """#583: the ask a delivered `send` is about, in the message's metadata, so a LATER send can tell which waiting messages are about the same issue."""
+        one = next((f for f in carried if f.kind == "send" and f.sender and f.issue), None)
+        if one is None:
+            return {}
+        return {"sender": one.sender, "issue": one.issue, "repo": one.repo} if one.repo else {"sender": one.sender, "issue": one.issue}
+
+    def waiting_earlier(self, discovery, recipient, sender, repo, issue, now):
+        """#583: when the recipient has not yet taken earlier messages from `sender` on this issue (they wait in its v2 inbox), their times. Read only: nothing is
+        cancelled or changed. Where the inbox cannot be read (v2_light, a failed read, an older message that did not say its issue) it is (): sent as before."""
+        try:
+            target = discovery.agents.get(recipient)
+            if self.light or target is None or not target.session_id or not sender or not issue:
+                return ()
+            found = []
+            for item in self.reads.inbox(target.session_id, now, fresh=True) or []:
+                meta = _fleet_meta(item) or {}
+                if meta.get("from") == "switchboard" and meta.get("sender") == sender and meta.get("issue") == issue \
+                        and meta.get("repo") == (repo or None) and all(key.startswith("send:") for key in _fleet_keys(item)):
+                    when = _created(item)
+                    if when is not None:
+                        found.append(when)
+            return tuple(sorted(found))
+        except Exception:
+            return ()   # fail toward showing everything: no marking
 
     def convert_lapsed_notes(self, observation, now):
         """A note still in v2's inbox once you have not prompted for the
@@ -4811,6 +4844,7 @@ class Switchboard:
         fact = Fact("send:%s:%s" % (sender, uuid.uuid4().hex[:16]), recipient, "send", text, now,
                     issue=None if issue is None else int(issue), batch=False, sender=sender,
                     repo=repo or issue_repo(issue))
+        fact.supersedes = self.waiting_earlier(discovery, recipient, sender, fact.repo, fact.issue, now)
         outcome = self.send_fact(fact, discovery, now, interrupt=interrupt)
         if outcome.get("sent") and sender != recipient and sender in discovery.agents and self.state_dir is not None:
             # Beside `report`'s record: both count as being in touch with that boss. #352: only a send that woke the boss is one a report folds
