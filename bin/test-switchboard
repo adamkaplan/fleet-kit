@@ -39884,6 +39884,44 @@ class TestHeldTop(DecisionsBase):
         self.assertLess(time.monotonic() - started, 0.5)
         self.assertEqual(self.named(found, "diagram"), 1)
 
+    def within(self, seconds, fn, *args):
+        """Run fn(*args) with a hard alarm: a hang fails the test instead of hanging the suite."""
+        def boom(signum, frame):
+            raise AssertionError("did not finish in %d s (a hang)" % seconds)
+        old = signal.signal(signal.SIGALRM, boom)
+        signal.alarm(seconds)
+        try:
+            return fn(*args)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
+
+    def test_unicode_case_folding_cannot_hang_or_hide_a_mermaid_pre(self):
+        dotted = "\u0130"
+        for n in (1, 2, 50, 2000):
+            body = self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + self.QS + (dotted * n + "<PRE class=mermaid>") + "\n"
+            found = self.within(5, self.defects, body)
+            self.assertEqual(self.named(found, "diagram"), 1, (n, found))   # still found: folding is ASCII-only, the length never changes
+        self.assertTrue(self.within(5, self.defects, self.OPEN + dotted * 5000))   # a body of only U+0130 is judged (and fails)
+        # ASCII-only folding: the Kelvin sign and the long s are NOT k or s, and a dotless i is not i, so these are not Mermaid
+        for tag in ('<pre class="mermaid\u0131">', '<pre class="\u017fermaid">', '<pre class="code" data-k="\u212a">'):
+            self.assertEqual(self.within(5, self.defects, self.OPEN + self.TOP + tag + "\n"), [], tag)
+        # the real spellings still are
+        self.assertEqual(self.named(self.within(5, self.defects, self.OPEN + self.TOP + "<PrE ClAsS='MeRmAiD'>\n"), "diagram"), 1)
+        self.assertEqual(self.named(self.within(5, self.defects, self.OPEN + self.TOP + "```MERMAID\nx\n```\n"), "diagram"), 1)
+
+    def test_a_fuzz_of_random_unicode_bodies_never_hangs_or_crashes(self):
+        import random
+        rng = random.Random(604)
+        alphabet = ["\u0130", "\u212a", "\u017f", "\u0131", "<", ">", "pre", "PRE", "class=", "mermaid", "'", '"', "`", "```", "~~~", "|", "\n", " ", "#", "## ", "<!--", "-->", "I", "i", "K", "s", "\u00e9", "\U0001f600", "1.", "Recommendation:"]
+        def run():
+            for _ in range(20000):
+                body = self.OPEN + "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 60)))
+                self.assertIsInstance(sb.held_defects(body), list)
+        started = time.monotonic()
+        self.within(60, run)
+        self.assertLess(time.monotonic() - started, 30)
+
     def test_underscore_only_cells_fail(self):
         table = ("## What changes for you\n\n| Before | After |\n|---|---|\n| ___ | You get one card. |\n| You open a list. | It opens itself. |\n\n")
         found = self.defects(self.OPEN + self.WHY + table + self.EXAMPLE + self.QS)

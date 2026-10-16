@@ -21207,11 +21207,33 @@ HELD_BODY_MAX = 70000   # a longer body is not read (GitHub's own cap is 65536)
 _HELD_PLACEHOLDER_RE = re.compile(r"<[^<>]*>")   # linear: the class stops at the next `<`
 
 
+_ASCII_LOWER = {c: c + 32 for c in range(ord("A"), ord("Z") + 1)}
+
+
+def _ascii_lower(text):
+    """`text` with only A-Z lowered: the length never changes (str.lower() can make a string LONGER, e.g. U+0130), so an index found in the copy is
+    an index of the original. ONE helper for every case-insensitive scan of a held body."""
+    return text.translate(_ASCII_LOWER)
+
+
+def _held_steps(size):
+    """A fresh step budget for one scan loop: each iteration spends one, and running out raises (the body is then unreadable), so no input can hang the daemon."""
+    return [4 * size + 64]
+
+
+def _held_spend(budget):
+    budget[0] -= 1
+    if budget[0] < 0:
+        raise ValueError("the scan did not finish within its step budget")
+
+
 def _held_class_tokens(tag):
     """The class tokens (lower case) of an HTML tag's text: a linear walk over every `class=` (any case, spaces around `=`, quoted either way or bare)."""
-    low = tag.lower()
+    low = _ascii_lower(tag)
+    budget = _held_steps(len(low))
     tokens, at = [], low.find("class")
     while at >= 0:
+        _held_spend(budget)
         i = at + 5
         while i < len(low) and low[i] in " \t":
             i += 1
@@ -21252,9 +21274,11 @@ def _held_tag_end(line, at):
 def _held_pre_mermaid(line):
     """True when `line` opens a `<pre>` whose class tokens include `mermaid`, or a `<pre` that is never closed on the line (it cannot be judged, so it
     counts). Each `<pre` is walked to its closing `>` with `find` and the search resumes after it: linear, no window, no backtracking."""
-    low = line.lower()
+    low = _ascii_lower(line)
+    budget = _held_steps(len(low))
     at = low.find("<pre")
     while at >= 0:
+        _held_spend(budget)
         after = low[at + 4:at + 5]
         if not after.isalpha():
             end = _held_tag_end(line, at)
@@ -21286,7 +21310,7 @@ def held_scan(lines):
             if found and not (found.group(1)[0] == "`" and "`" in found.group(2)):
                 fence = (found.group(1)[0], len(found.group(1)))
                 words = found.group(2).split()
-                if words and words[0].lower() == "mermaid":
+                if words and _ascii_lower(words[0]) == "mermaid":
                     mermaid.append(i)
                 clean.append("")
                 continue
@@ -21296,7 +21320,9 @@ def held_scan(lines):
         if _held_pre_mermaid(line):
             mermaid.append(i)
         out, rest = "", line
+        budget = _held_steps(len(line))
         while rest:
+            _held_spend(budget)
             if comment:
                 end = rest.find("-->")
                 if end < 0:
@@ -21373,7 +21399,7 @@ def _held_defects(body):
         problems.append("the held PR needs a `%s` table (Before | After, 2 to 4 rows)" % HELD_TABLE)
     else:
         rows = [[c.strip() for c in l.strip().strip("|").split("|")] for l in section(HELD_TABLE) if l.strip().startswith("|")]
-        head = [c.lower() for c in rows[0]] if rows else []
+        head = [_ascii_lower(c) for c in rows[0]] if rows else []
         data = [r for r in rows[2:]] if len(rows) >= 2 and all(re.fullmatch(r":?-{3,}:?", c) for c in rows[1]) else None
         if head != ["before", "after"] or data is None:
             problems.append("`%s`: the table needs a Before and an After column (a header row, a separator row, then the rows)" % HELD_TABLE)
