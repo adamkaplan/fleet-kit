@@ -21618,12 +21618,20 @@ class FakeTriageHub:
         self.open, self.comments, self.closed, self.live = {}, {}, {}, {}   # per repo: open {n: rec}; comments [rec]; closed {label: [rec]}
         self.pulls = {}   # per repo: [recently closed pull request records] (#384)
         self.calls, self.unreadable = [], set()
+        self.timelines, self.cut = {}, set()   # (repo, number) -> [timeline events] (#576); numbers whose timeline page is not the whole timeline
 
     def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
         self.calls.append(path)
         repo = re.search(r"repos/([^/]+/[^/]+)/", path).group(1)
         if repo in self.unreadable:
             raise sb.GitHubUnavailable("HTTP 404: Not Found")
+        match = re.search(r"/issues/(\d+)/timeline", path)
+        if match:
+            number = int(match.group(1))
+            events = self.timelines.get((repo, number))
+            if events is None:
+                raise sb.GitHubUnavailable("HTTP 500: no timeline")
+            return list(events), number in self.cut
         match = re.search(r"/issues/(\d+)/comments", path)
         if match:
             return [c for c in self.comments.get(repo, []) if c["issue_url"].endswith("/%s" % match.group(1))][::-1], False
@@ -21710,6 +21718,17 @@ class TestTriage(Base):
 
     def comment(self, number, body, hours_ago=1.0):
         self.hub.comments.setdefault("acme/api", []).append(tri_comment(self.world.clock.now(), number, body, hours_ago))
+
+    LIVE = "bot:awaiting-live"
+
+    def timeline(self, number, label_days=None, comment_days=None, extra=(), name=None):
+        """The timeline of an issue (#576): the label set `label_days` ago, a comment `comment_days` ago; `extra` events come first (older)."""
+        now, events = self.world.clock.now(), list(extra)
+        if label_days is not None:
+            events.append({"id": 900 + number, "event": "labeled", "label": {"name": name or self.LIVE}, "created_at": sb.iso(now - label_days * 86400)})
+        if comment_days is not None:
+            events.append({"event": "commented", "created_at": sb.iso(now - comment_days * 86400)})
+        self.hub.timelines[("acme/api", number)] = events
 
     def go(self, decisions=(), passes=10, errors=(), **cfg):
         self.engine.config["triage"].update(cfg)
@@ -21921,6 +21940,8 @@ class TestTriage(Base):
         self.add(93, created=20, updated=4, assignees=["bot"], labels=["kind"], body="Next: go")
         self.add(94, created=20, updated=4, assignees=["bot"], labels=["kind", "bot:awaiting-live"], body="Next: go")
         self.merged_pr(250, "Part of #93. Part of #94.")
+        for n in (90, 92, 94):
+            self.timeline(n, label_days=1)                                          # a fresh label (#576): quiet
         self.go()
         self.assertEqual(self.only("T3"), ["acme/api#91"])                  # T3 skips any awaiting label (pinned)
         self.assertNotIn(("T3", "acme/api#90"), self.found())
@@ -21932,8 +21953,86 @@ class TestTriage(Base):
         self.charter()
         self.add(95, created=9, updated=4, parent=1, labels=["kind", "bot:awaiting-live"], body="Next: x")
         self.add(96, created=9, updated=4, parent=1, labels=["kind"], body="Next: x")
+        self.timeline(95, label_days=1)
         self.go()
         self.assertEqual(self.only("T9"), ["acme/api#96"])
+
+    def test_awaiting_live_expiry_a_fresh_label_or_one_with_a_newer_comment_is_quiet_an_old_one_is_t9(self):
+        self.charter()
+        self.add(110, created=30, updated=3, assignees=["bot"], labels=["kind", self.LIVE], body="Next: go")   # label 14d + 1h old, no comment
+        self.add(111, created=30, updated=3, assignees=["bot"], labels=["kind", self.LIVE], body="Next: go")   # label 13d old
+        self.add(112, created=30, updated=3, assignees=["bot"], labels=["kind", self.LIVE], body="Next: go")   # label 15d old, a comment after it
+        self.timeline(110, label_days=14 + 1 / 24)
+        self.timeline(111, label_days=13)
+        self.timeline(112, label_days=15, comment_days=2)
+        self.go(passes=1)
+        self.assertEqual(self.only("T9"), ["acme/api#110"])
+        row = [e for e in self.world.audit() if e["event"] == "triage.finding" and e["detail"]["rule"] == "T9"][0]
+        self.assertEqual(row["detail"]["evidence"]["reason"], "awaiting-live expired")
+        self.assertEqual(self.only("T12"), [])
+
+    def test_awaiting_live_expiry_the_limit_is_the_configured_key_and_a_re_added_label_resets_the_age(self):
+        self.charter()
+        self.add(113, created=30, updated=3, assignees=["bot"], labels=["kind", self.LIVE], body="Next: go")
+        self.add(114, created=30, updated=3, assignees=["bot"], labels=["kind", self.LIVE], body="Next: go")
+        old = {"id": 1, "event": "labeled", "label": {"name": self.LIVE}, "created_at": sb.iso(self.now - 20 * 86400)}
+        gone = {"id": 2, "event": "unlabeled", "label": {"name": self.LIVE}, "created_at": sb.iso(self.now - 19 * 86400)}
+        self.timeline(113, label_days=1, extra=[old, gone])                      # set 20d ago, removed, set again 1d ago: the latest event counts
+        self.timeline(114, label_days=5)
+        self.engine.config["awaiting_live_days"] = 4                             # the module-declared key
+        self.go(passes=1)
+        self.assertEqual(self.only("T9"), ["acme/api#114"])
+
+    def test_awaiting_live_expiry_an_unreadable_or_cut_timeline_is_visible_as_age_unknown_never_quiet(self):
+        self.charter()
+        self.add(115, created=30, updated=3, assignees=["bot"], labels=["kind", self.LIVE], body="Next: go")   # the read fails
+        self.add(116, created=30, updated=3, assignees=["bot"], labels=["kind", self.LIVE], body="Next: go")   # the page is not the whole timeline
+        self.add(117, created=30, updated=3, assignees=["bot"], labels=["kind", self.LIVE], body="Next: go")   # no label event in it
+        self.timeline(116, label_days=30)
+        self.hub.cut.add(116)
+        self.timeline(117)
+        self.go(passes=1)
+        self.assertEqual(self.only("T9"), ["acme/api#115", "acme/api#116", "acme/api#117"])
+        reasons = {e["detail"]["ref"]: e["detail"]["evidence"]["reason"] for e in self.world.audit() if e["event"] == "triage.finding" and e["detail"]["rule"] == "T9"}
+        self.assertEqual(set(reasons.values()), {"awaiting-live age unknown"})
+        self.assertNotIn("label_days", [e for e in self.world.audit() if e["event"] == "triage.finding"][0]["detail"]["evidence"])
+
+    def test_awaiting_live_expiry_an_issue_without_the_label_is_never_read_and_judged_as_before(self):
+        self.charter()
+        self.add(118, created=30, updated=4, parent=1, labels=["kind"], body="Next: x")
+        self.go()
+        self.assertEqual(self.only("T9"), ["acme/api#118"])
+        self.assertEqual([c for c in self.hub.calls if "/timeline" in c], [])
+
+    def test_awaiting_live_expiry_reads_each_timeline_once_cached_while_the_issue_is_unchanged_and_inside_the_call_limit(self):
+        self.charter()
+        for n in (120, 121, 122):
+            self.add(n, created=30, updated=3, assignees=["bot"], labels=["kind", self.LIVE], body="Next: go")
+            self.timeline(n, label_days=1)
+        self.go(passes=1)
+        reads = lambda: [c for c in self.hub.calls if "/timeline" in c]
+        self.assertEqual(len(reads()), 3)
+        self.go(passes=3)
+        self.assertEqual(len(reads()), 3)                                       # cached: nothing new while the issue is unchanged
+        self.hub.open["acme/api"][121] = tri_issue(self.world.clock.now(), 121, created=30, updated=0.1, assignees=["bot"], labels=["kind", self.LIVE], body="Next: go")
+        self.world.tick(sb.TRIAGE_TTL + 5)                                      # the list is read again
+        self.go(passes=1)
+        self.assertEqual(len(reads()), 4)                                       # a new update (a re-added label, a comment) is read again, once
+        # the call limit: with a pass budget too small for all of them the rest are shown as unknown, and no pass reads more than it may
+        self.hub.calls.clear()
+        state = sb.triage_state(self.engine)
+        state.live.clear()
+        budget = [4]
+        sb.triage_read_live(self.engine, state, ["acme/api"], self.world.clock.now(), budget, reserve=2)
+        self.assertEqual((len([c for c in self.hub.calls if "/timeline" in c]), budget[0]), (2, 2))
+
+    def test_awaiting_live_days_is_a_module_declared_key_with_default_14_and_a_checked_value(self):
+        self.assertIn("awaiting_live_days", sb.config_declarations())
+        self.assertEqual(sb.validate_config({})["awaiting_live_days"], 14)
+        self.assertEqual(sb.validate_config({"awaiting_live_days": 3.5})["awaiting_live_days"], 3.5)
+        for bad in (0, -1, True, "14", 366):
+            with self.assertRaises(sb.ConfigError, msg=repr(bad)):
+                sb.validate_config({"awaiting_live_days": bad})
 
     def test_t1_an_explicit_owner_line_in_the_body_is_an_owner(self):
         self.charter()
