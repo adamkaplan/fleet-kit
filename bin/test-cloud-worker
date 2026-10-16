@@ -877,6 +877,9 @@ class TestSameAllowList(unittest.TestCase):
         ("acme-org/wid\u212aget", "acme-org/wid\u212aget", None), ("ac\u212ae/widget", "ac\u212ae/widget", None),
         ("a" * 40 + "/widget", "a" * 40 + "/widget", None), ("a" * 39 + "/widget", "a" * 39 + "/widget", None), ("acme-org/" + "w" * 101, "acme-org/" + "w" * 101, None),
         ("acme-org/" + "w" * 100, "acme-org/" + "w" * 100, None),
+        ("acme-org/widget.git", "acme-org/widget.git", None), ("acme-org/widget.GIT", "acme-org/widget.GIT", None), ("acme-org/widget.git", "acme-org/widget", None),
+        ("acme-org/widget", "acme-org/widget,acme-org/other.git", None), ("acme-org/widget", "acme-org/widget", "acme-org/tool.git"),
+        ("acme-org/widget.gitx", "acme-org/widget.gitx", None),
     ]
 
     def test_both_functions_answer_alike_over_the_same_inputs(self):
@@ -939,13 +942,25 @@ class TestLocalLaunchIsNeverBrokenByTheCloudModule(Base):
     def test_a_missing_or_raising_cloud_module_is_fail_open(self):
         for failure in (ImportError("no module"), FileNotFoundError("gone"), RuntimeError("broken"), OSError(13, "unreadable record store")):
             with self.subTest(failure=type(failure).__name__):
-                with mock.patch.object(sb, "load_module", side_effect=failure):
+                err = io.StringIO()
+                with mock.patch.object(sb, "load_module", side_effect=failure), contextlib.redirect_stderr(err):
                     self.assertIsNone(sb.refuse_cloud_name("coder7"))
+                self.assertIn("cloud-name check could not run (%s)" % type(failure).__name__, err.getvalue())
+                self.assertNotIn("unreadable record store", err.getvalue())   # the class only, never the text
 
     def test_an_unreadable_record_store_is_fail_open(self):
         module = sb.load_module("cloud_worker").bind(sb.__dict__)
-        with mock.patch.object(module, "_reserved", side_effect=OSError(13, "unreadable")):
+        err = io.StringIO()
+        with mock.patch.object(module, "_reserved", side_effect=OSError(13, "unreadable")), contextlib.redirect_stderr(err):
             self.assertIsNone(sb.refuse_cloud_name("coder7"))
+        self.assertIn("cloud-name check could not run (PermissionError)", err.getvalue())
+
+    def test_a_corrupt_record_file_still_holds_its_name(self):
+        """A record FILE that exists (even a corrupt one) still refuses: only a cloud side that cannot answer at all is fail-open."""
+        self.assertEqual(self.launch()[0], 0)
+        (self.state / "cloud" / "coder7.json").write_text("{not json")
+        with self.assertRaises(sb.LaunchError):
+            sb.refuse_cloud_name("coder7")
 
 
 class TestStopAndStatus(Base):
@@ -964,6 +979,16 @@ class TestStopAndStatus(Base):
         audit = [l for p in logs for l in p.read_text(errors="replace").splitlines() if "cloud.stopped" in l]
         self.assertTrue(audit, "no cloud.stopped audit line")
         self.assertTrue(all(run_id not in l and "run-id" in l for l in audit))   # the line names a short id, not the nonce itself
+
+    def test_a_local_agent_that_appears_while_the_pod_is_made_stops_the_pod_and_keeps_no_record(self):
+        seen = mock.Mock(session_id="ses_example")
+        answers = [mock.Mock(agents={}, problems=[]), mock.Mock(agents={"coder7": seen}, problems=[])]
+        with mock.patch.object(sb.Switchboard, "discover", side_effect=answers):
+            code, out, err = self.launch()
+        self.assertEqual(code, 1)
+        self.assertIn("appeared while the pod was being made", err)
+        self.assertIn("stop", [c[0] for c in self.stub_calls()])
+        self.assertFalse((self.state / "cloud" / "coder7.json").exists())
 
     def test_a_launcher_whose_stop_takes_no_run_id_is_stopped_by_name_and_the_audit_says_so(self):
         text = self.stub.read_text().replace('elif command == "stop":', 'elif command == "stop":\n    if "--run-id" in argv:\n        sys.stderr.write("error: unrecognized arguments: --run-id\\n")\n        sys.exit(2)')

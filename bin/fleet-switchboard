@@ -146,13 +146,14 @@ def run_cloud(function, *arguments):
 
 
 def refuse_cloud_name(name):
-    """A LOCAL launch of a name that has a cloud record is refused (LaunchError). Fail-open: a cloud module that is missing, broken or cannot read its
+    """A LOCAL launch of a name that has a cloud record is refused (LaunchError). Fail-open WITH a warning line on stderr: a cloud module that is missing, broken or cannot read its
     records never breaks a local launch (only a real refusal does)."""
     try:
         run_cloud("refuse_local_launch", name)
     except LaunchError:
         raise
-    except Exception:
+    except Exception as err:   # loud, never silent: the one-name-one-kind guard could not run (the class of the failure only, never its text)
+        sys.stderr.write("%s: warning: the cloud-name check could not run (%s); launching locally\n" % (PROG, type(err).__name__))
         return
 
 

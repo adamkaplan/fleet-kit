@@ -504,7 +504,7 @@ _NAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,100}")
 def _repo_key(text):
     """OWNER/NAME lower-cased (ASCII), or None when it is not exactly that shape. Identical in behaviour to the launcher's `_repo_key`."""
     owner, sep, name = (text or "").partition("/")
-    if not sep or not _OWNER_RE.fullmatch(owner) or not _NAME_RE.fullmatch(name) or set(name) == {"."}:
+    if not sep or not _OWNER_RE.fullmatch(owner) or not _NAME_RE.fullmatch(name) or set(name) == {"."} or name.lower().endswith(".git"):
         return None
     return (owner + "/" + name).lower()
 
@@ -987,6 +987,9 @@ def _launch(args, runner, now, reserve):
             cluster.add(password)
         finally:
             os.close(read_fd)
+        if engine.discover(engine.now()).agents.get(name) is not None:   # a local agent took the name while the pod was being made: the pod goes
+            _stop_after_failure(engine, runner, name, run_id, "launch: a local agent took the name", cluster)
+            raise LaunchError("a local fleet agent named %s appeared while the pod was being made; the pod was stopped and no record kept" % name)
         try:
             record = _record_from_create(name, body)
             _write_private(password_path(state, name), password + "\n")
