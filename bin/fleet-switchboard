@@ -6132,9 +6132,12 @@ def headless_identity(engine, repo):
     return "this headless worker acts as the OpenCode service environment's own gh account (it has no repo)"
 
 
-def shim_route_problem(environ=None, home=None):
-    """None when the `gh` and `git` shims the fleet-hooks plugin puts first on a shell's PATH exist and are executable, else the reason. The plugin takes
-    FLEET_SWITCHBOARD_SHIMS, or else the `shims` directory beside the checkout that ~/.local/bin/fleet-switchboard links to."""
+def shim_route_problem(environ=None, home=None, config_dir=None, kit_root=None):
+    """None when what the OpenCode service loads would put this checkout's `gh` and `git` shims first on a shell's PATH, else the reason. Two things are read
+    (files only, nothing written): (1) the shims: FLEET_SWITCHBOARD_SHIMS, or else the `shims` directory beside the checkout that ~/.local/bin/fleet-switchboard
+    links to, each of `gh` and `git` executable; (2) the install state of the plugin: `plugins/fleet-hooks.js` in the OpenCode profile's config directory
+    (`opencode_config_dir` of the caller, else $XDG_CONFIG_HOME/opencode) is present and byte-equal to this checkout's plugin. It cannot see the service's own
+    environment: a mistake-guard, not a proof."""
     environ = os.environ if environ is None else environ
     given = environ.get("FLEET_SWITCHBOARD_SHIMS")
     try:
@@ -6147,8 +6150,17 @@ def shim_route_problem(environ=None, home=None):
         for tool in ("gh", "git"):
             if not os.access(shims / tool, os.X_OK):
                 return "the %s shim is not in place, so the plugin's shell hook has nothing to put first on PATH" % tool
+        config = Path(config_dir) if config_dir else _xdg("XDG_CONFIG_HOME", ".config") / "opencode"
+        installed = config / "plugins" / HOOKS_PLUGIN_FILE
+        wanted = (Path(kit_root or KIT_ROOT) / "plugins" / "fleet-hooks" / "index.js").read_bytes()
+        try:
+            have = installed.read_bytes()
+        except FileNotFoundError:
+            return "the plugin file %s is not installed in the OpenCode profile (%s), so the service has no shell hook" % (HOOKS_PLUGIN_FILE, config)
+        if hashlib.sha256(have).digest() != hashlib.sha256(wanted).digest():
+            return "the installed plugin file %s (%s) differs from this checkout's: run `%s install`" % (HOOKS_PLUGIN_FILE, config, PROG)
     except OSError as err:
-        return "the shims directory cannot be read (%s)" % _one_line(str(err))
+        return "the shims or the plugin file cannot be read (%s)" % _one_line(str(err))
     return None
 
 
@@ -6161,11 +6173,12 @@ def prove_headless_route(engine, session_id, name, repo, account):
     except (V2Error, CallerError, IdentityUncertain) as err:
         raise LaunchError("a headless worker cannot be proved to act as the gh account %s for %s: the session lookup failed (%s)" % (account, repo, _one_line(str(err)))) from err
     seen = (fleet or {}).get("repo")
-    if (fleet or {}).get("name") != name or not isinstance(seen, str) or engine.accounts.account_for(seen) != account:
+    if (fleet or {}).get("name") != name or seen != repo or engine.accounts.account_for(seen) != account:
         raise LaunchError("a headless worker cannot be proved to act as the gh account %s for %s: the service's record of the session names %s as its repo" % (account, repo, seen or "none"))
-    return ("this headless worker is set up to act as the gh account %s for %s: the shims are present on the launcher's side and the session record resolves to that repo. "
-            "NOT checked: that the OpenCode service runs the fleet-hooks plugin (it cannot be probed without a model turn), and a tool that reads a token from its own "
-            "environment bypasses the shims. A terminal launch is the boundary" % (account, repo))
+    return ("this headless worker is set up to act as the gh account %s for %s: the shims and the installed plugin file are in place on the launcher's side and the session record resolves to that repo. "
+            "NOT checked: that the OpenCode service runs the plugin it was started with (the installed plugin file is checked, not the running service; it cannot be probed "
+            "without a model turn). This is a mistake-guard, not a boundary: a command can name another session, and a tool that reads a token from its own environment "
+            "bypasses the shims. A terminal launch pins the account in the pane's environment" % (account, repo))
 
 
 def undo_headless_launch(engine, ap, name, session_id):
@@ -6676,6 +6689,7 @@ class PaneFacts:
         return out
 
 
+HEADLESS_ROUTE_FILE = "headless-route.json"   # {"workers": {worker: {"problem", "repo"}}}: headless workers whose account route is not in place (#669)
 HEADLESS_SERVICE_FILE = "headless-service.json"   # {"service": {"pid", "from", "at"}, "bosses": {worker: boss}}: what the restart notice remembers
 
 
@@ -6738,6 +6752,7 @@ class HeadlessRestartFacts:
                                   "and the session may need a poke: check it with `%s status`." % (
                                       service["pid"], service["from"], iso(service.get("at") or engine.now()), name, PROG),
                                   float(service.get("at") or engine.now()), issue=_issue_of(observation.fleet), sender="switchboard"))
+        facts.extend(self.route_facts(engine, state, discovery, headless))
         if discovery.problems:   # the service (or herdr) did not answer cleanly: a missing worker may only be unread, so nothing is called lost
             return facts
         chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff")
@@ -6752,6 +6767,48 @@ class HeadlessRestartFacts:
                                   "`%s retire %s` if it is finished, otherwise relaunch it." % (name, record["session"], PROG, name),
                                   float(record.get("created") or engine.now()), sender="switchboard"))
         return facts
+
+
+    def route_facts(self, engine, state, discovery, headless):
+        """#669: every pass, each headless worker whose repo `gh_users` maps to a named account is checked again with the launch's own route check (files
+        only). While it fails the boss gets ONE wake per problem and `status` prints a line; when it holds again the line goes. Nothing is written but
+        this small state file."""
+        check, accounts = getattr(engine, "route_check", None), getattr(engine, "accounts", None)
+        if check is None or accounts is None:
+            return []
+        bad, facts = {}, []
+        try:
+            problem = check()
+            for name, observation in sorted(headless.items()):
+                repo = (observation.fleet or {}).get("repo")
+                if problem and isinstance(repo, str) and accounts.account_for(repo):
+                    bad[name] = {"problem": _one_line(problem, 240), "repo": repo}
+        except Exception as err:   # a check that cannot run is no finding
+            engine._note("source.error", "headless_route_facts", {"error": _one_line(str(err))})
+            return []
+        for name, found in bad.items():
+            boss = boss_name(discovery, headless[name])
+            if boss is not None:
+                key = "headless.route:%s:%s:%s" % (name, headless[name].session_id, hashlib.sha256(found["problem"].encode()).hexdigest()[:12])
+                facts.append(Fact(key, boss, "headless.route",
+                                  "%s has no terminal and works on %s, which maps to a named gh account, but the route that picks that account is no longer in place: %s. "
+                                  "Until it is, its gh and git commands may run as the service's default account. Fix the install, or relaunch it with a terminal." % (
+                                      name, found["repo"], found["problem"]), float(engine.now()), issue=_issue_of(headless[name].fleet), sender="switchboard"))
+        if _read_small(state, HEADLESS_ROUTE_FILE).get("workers", {}) != bad:
+            try:
+                _write_small(state, HEADLESS_ROUTE_FILE, {"workers": bad})
+            except OSError as err:
+                engine._note("source.error", "headless_route_facts", {"error": _one_line(str(err))})
+        return facts
+
+
+def headless_route_status_lines(state_dir):
+    """The `status` lines for headless workers whose account route stopped being true (nothing when all hold)."""
+    if state_dir is None:
+        return []
+    workers = _read_small(state_dir, HEADLESS_ROUTE_FILE).get("workers") or {}
+    return ["      route      %s: gh account route for %s is NOT in place: %s" % (_one_line(n, 60), _one_line(str(v.get("repo")), 80), _one_line(str(v.get("problem")), 200))
+            for n, v in sorted(workers.items()) if isinstance(v, dict)]
 
 
 def pane_health_status_lines(state_dir, now=None):
@@ -15522,7 +15579,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         report["sweep"] = sweep_summary(state)  # #117
         report["triage"] = triage_summary(state)  # #130
         report["ci_record"] = ci_record_status_line(state, now())
-        report["pane_lines"] = pane_health_status_lines(state, now())
+        report["pane_lines"] = pane_health_status_lines(state, now()) + headless_route_status_lines(state)
         report["catching_up"] = catching_up_lines(state, now())
         report["v2_link"] = v2_link_status_line(state, now())
         if config_ok:
