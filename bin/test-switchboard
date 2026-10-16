@@ -48175,19 +48175,50 @@ class TestTempJanitor(Base):
             self.assertIn(phrase, text)
 
 
+class CallBound(AssertionError):
+    pass
+
+
+class BoundedList(list):
+    """A list of recorded calls that refuses the 10001st: a mutant that never leaves its loop fails fast instead of growing until the machine is out of memory."""
+    BOUND = 10000
+
+    def append(self, item):
+        if len(self) >= self.BOUND:
+            raise CallBound("call bound of %d recorded calls passed: a loop that never ends" % self.BOUND)
+        super().append(item)
+
+
+class BoundedOut(io.StringIO):
+    """The wrapper's output in a test: refuses more than 1 MB, or more than 10000 writes, for the same reason."""
+    LIMIT = 1024 * 1024
+
+    def __init__(self):
+        super().__init__()
+        self.writes = 0
+
+    def write(self, text):
+        self.writes += 1
+        if self.writes > BoundedList.BOUND or self.tell() + len(text) > self.LIMIT:
+            raise CallBound("call bound passed: the output holds %d bytes after %d writes" % (self.tell(), self.writes))
+        return super().write(text)
+
+
 class TestHeavyQueueLogic(unittest.TestCase):
     """The queueing logic of `heavy_slots.run`, in one process: the lock attempt, the holder list, the clock, the sleep and the command's start are all injected, so no race
     between real processes decides anything (TestHeavySlots keeps the real-process integration check)."""
 
     def setUp(self):
         self.hs = sb.load_heavy_slots()
-        self.out, self.attempts, self.sleeps, self.started, self.now = io.StringIO(), [], [], [], [1000.0]
+        self.out, self.attempts, self.sleeps, self.started, self.now = BoundedOut(), BoundedList(), BoundedList(), BoundedList(), [1000.0]
+        self.clock_calls = BoundedList()
         self.fd = os.open(os.devnull, os.O_RDWR)
         self.addCleanup(lambda: os.close(self.fd) if self.fd is not None else None)
         self.held = [{"slot": i, "name": "who-%s" % c, "pid": 10 + i, "command": "sh", "since": 1} for i, c in enumerate("abc")]
 
     def patched(self, take, step):
         def clock():
+            self.clock_calls.append(1)
             self.now[0] += step
             return self.now[0]
 
@@ -48244,7 +48275,7 @@ class TestHeavyQueueLogic(unittest.TestCase):
 
     def at(self, limit, elapsed, free_after=None):
         """run() with a wait limit of `limit` seconds, whose first check of the clock says `elapsed` seconds have passed; a slot comes free on the attempt numbered `free_after`."""
-        attempts = []
+        attempts = BoundedList()
 
         def take(state, slots):
             attempts.append(1)
@@ -48262,7 +48293,7 @@ class TestHeavyQueueLogic(unittest.TestCase):
                                   (limit, "at exactly the limit it gives up (the rule is `elapsed >= limit`)"),
                                   (limit + 1, "past the limit it gives up")):
                 with self.subTest(limit=limit, elapsed=elapsed, rule=rule):
-                    self.out, self.started = io.StringIO(), []
+                    self.out, self.started = BoundedOut(), BoundedList()
                     self.fd = os.open(os.devnull, os.O_RDWR)
                     code, attempts = self.at(limit, elapsed, free_after=2)
                     if elapsed < limit:
@@ -48289,6 +48320,166 @@ class TestHeavyQueueLogic(unittest.TestCase):
             "test_s1_a_busy_queue_waits_says_so_once_and_takes_the_freed_slot", "test_s2_past_the_wait_limit_it_gives_up_and_does_not_run_the_command",
             "test_s3_a_state_that_cannot_be_used_runs_the_command_without_a_slot_and_says_so")) + inspect.getsource(self.patched) + inspect.getsource(self.run_heavy)
         self.assertEqual((source.count("time" + ".sleep"), source.count("subprocess" + ".Popen(")), (0, 0))
+
+
+class TestHeavyWatchdog(unittest.TestCase):
+    """The runaway guard of the heavy wrapper (ask #598): a memory and a time ceiling on the command it started, stopping only what it started. The process table, the
+    clock, the pauses and the signals are injected, so nothing here is timed by the machine; every loop is bounded."""
+
+    def setUp(self):
+        self.hs = sb.load_heavy_slots()
+        self.out, self.signals, self.table_reads, self.started = BoundedOut(), BoundedList(), BoundedList(), BoundedList()
+        self.exited = threading.Event()
+        self.now = [1000.0]
+
+    def run_watched(self, rows_for, environ_extra=None, status=0, ignore_term=True, rounds=20, step=0.0, lives=True):
+        """run() of `sh -c true` whose command is a fake that lives until it is sent a KILL (or, if `ignore_term` is false, any signal); the watchdog is driven by
+        `rows_for(read number)` and a clock that moves `step` seconds per read. Returns the wrapper's exit status."""
+        test = self
+
+        def clock():
+            test.now[0] += step
+            return test.now[0]
+
+        class FakeChild:
+            pid = 4242
+
+            def __init__(child, argv, **kwargs):
+                test.started.append(argv)
+
+            def wait(child):
+                if not lives:
+                    return status   # the command just ends
+                if not test.exited.wait(30):
+                    raise AssertionError("the fake command was never stopped")
+                return -9
+
+        def read_table():
+            test.table_reads.append(1)
+            if len(test.table_reads) > rounds:
+                test.exited.set()   # the bound: a watchdog that never decides ends the test, which then fails its assertions
+            return rows_for(len(test.table_reads))
+
+        def record(number, sig):
+            self.signals.append((number, sig))
+            if sig == signal.SIGKILL or not ignore_term:
+                self.exited.set()
+
+        environ = {"PATH": os.environ["PATH"], "FLEET_HEAVY": "off"}
+        environ.update(environ_extra or {})
+        dog = {"read_table": read_table, "pause": lambda seconds: self.stopping.wait(0.001), "killpg": record, "kill": record, "every": 0.001, "grace": 0.001}
+        with mock.patch.object(self.hs.subprocess, "Popen", FakeChild):
+            return self.hs.run(["sh", "-c", "sleep 1000"], None, 3, 1, "who", environ=environ, out=self.out, clock=clock, sleep=lambda s: None, watchdog=dog)
+
+    def test_s1_a_tree_past_the_memory_ceiling_is_stopped_politely_then_forced_with_137(self):
+        rows = lambda n: [(4242, 1, 4242, 20000 * 1024)]
+        self.stopping = threading.Event()
+        code = self.run_watched(rows)
+        self.assertEqual(code, 137)
+        self.assertEqual([sig for _p, sig in self.signals], [signal.SIGTERM, signal.SIGKILL])
+        text = self.out.getvalue()
+        self.assertEqual(text.count("memory ceiling of 16384 MB"), 1, text)
+        self.assertEqual(text.count("peak 20000 MB"), 1, text)
+        self.assertIn("sh -c sleep 1000", text)
+
+    def test_s1_a_child_of_the_command_that_grows_is_counted_and_stopped_with_the_command(self):
+        """rev-wake's run: the command itself is small, its CHILD is the one that grows."""
+        rows = lambda n: [(4242, 100, 4242, 2 * 1024), (4300, 4242, 4242, 9000 * 1024), (4301, 4300, 4242, 9000 * 1024), (999, 1, 999, 1024)]
+        self.stopping = threading.Event()
+        code = self.run_watched(rows)
+        self.assertEqual(code, 137)
+        self.assertIn("peak 18002 MB", self.out.getvalue())
+        self.assertEqual({p for p, _s in self.signals}, {4242}, "its own group, once: the child is in it")
+
+    def test_s2_a_small_command_is_left_alone_and_keeps_its_own_status(self):
+        for status in (0, 7):
+            with self.subTest(status=status):
+                self.signals, self.table_reads = BoundedList(), BoundedList()
+                self.stopping = threading.Event()
+                self.assertEqual(self.run_watched(lambda n: [(4242, 1, 4242, 3000 * 1024)], status=status, lives=False), status)
+                self.assertEqual(list(self.signals), [])
+
+    def test_s3_past_the_time_ceiling_by_the_clock_it_is_stopped_with_124(self):
+        self.stopping = threading.Event()
+        code = self.run_watched(lambda n: [(4242, 1, 4242, 1024)], {"FLEET_HEAVY_MAX_SECONDS": "100"}, step=60.0)
+        self.assertEqual(code, 124)
+        self.assertEqual(self.out.getvalue().count("time ceiling of 100 s"), 1, self.out.getvalue())
+        self.assertEqual(len(self.signals), 2)
+
+    def test_s4_an_unreadable_process_table_stops_nothing_and_says_so_once(self):
+        def unreadable():
+            raise OSError("ps failed")
+        self.stopping = threading.Event()
+        self.stopping.set()
+        dog = self.hs.Watchdog(4242, ["x"], 16384, 0, self.out, 0.0, read_table=unreadable, killpg=self.signals.append, kill=self.signals.append)
+        for _ in range(5):
+            self.assertEqual(dog.sample()[0], None)
+        self.assertEqual(list(self.signals), [])
+        self.assertEqual(self.out.getvalue().count("cannot read the process table"), 1, self.out.getvalue())
+
+    def test_s5_the_ceilings_read_the_defaults_a_value_and_off(self):
+        self.assertEqual(self.hs.ceilings({}), (16384, 7200))
+        self.assertEqual(self.hs.ceilings({"FLEET_HEAVY_MEM_MB": "8192", "FLEET_HEAVY_MAX_SECONDS": "60"}), (8192, 60))
+        self.assertEqual(self.hs.ceilings({"FLEET_HEAVY_MEM_MB": "0", "FLEET_HEAVY_MAX_SECONDS": "0"}), (0, 0))
+        self.assertEqual(self.hs.ceilings({"FLEET_HEAVY_MEM_MB": "lots", "FLEET_HEAVY_MAX_SECONDS": "-5"}), (16384, 7200), "a typo never turns the guard off")
+
+    def test_s10_only_the_group_or_tree_the_wrapper_started_is_signalled_never_another_process(self):
+        # (a) the command has its own group: one killpg to that group
+        rows = lambda n: [(4242, 1, 4242, 20000 * 1024), (777, 1, 777, 30000 * 1024)]
+        self.stopping = threading.Event()
+        self.assertEqual(self.run_watched(rows), 137)
+        self.assertEqual({p for p, _s in self.signals}, {4242})
+        # (b) it shares the wrapper's group: its descendants one by one, never the group, never the 30000 MB stranger
+        self.signals, self.table_reads, self.stopping = BoundedList(), BoundedList(), threading.Event()
+        self.exited = threading.Event()
+        rows = lambda n: [(4242, 1, os.getpgrp(), 20000 * 1024), (4243, 4242, os.getpgrp(), 1), (777, 1, 777, 30000 * 1024), (778, 1, os.getpgrp(), 1)]
+        self.assertEqual(self.run_watched(rows), 137)
+        self.assertEqual({p for p, _s in self.signals}, {4242, 4243})
+
+    def test_s10_a_real_runaway_child_is_stopped_with_the_whole_tree(self):
+        """Real processes, a 100 MB ceiling: a shell whose python CHILD allocates; both are gone after the wrapper returns."""
+        marker = "wd-%d" % os.getpid()
+        code = ("import sys,time\nx=bytearray(400*1024*1024)\nfor i in range(0,len(x),4096): x[i]=1\nopen(sys.argv[1],'w').write('up')\ntime.sleep(60)\n")
+        flag = Path(tempfile.mkdtemp()) / "up"
+        self.addCleanup(shutil.rmtree, str(flag.parent), True)
+        out = io.StringIO()
+        status = self.hs.run(["sh", "-c", 'python3 -c "$0" "$1"; sleep 60', code, str(flag)], None, 3, 1, "who", environ={"PATH": os.environ["PATH"], "FLEET_HEAVY": "off", "FLEET_HEAVY_MEM_MB": "100",
+                             "FLEET_HEAVY_MAX_SECONDS": "60"}, out=out, watchdog={"every": 0.2, "grace": 2})
+        self.assertEqual(status, 137, out.getvalue())
+        self.assertIn("memory ceiling of 100 MB", out.getvalue())
+        time.sleep(0.5)
+        left = subprocess.run(["ps", "-axo", "command="], capture_output=True, text=True).stdout
+        self.assertNotIn(str(flag), left, "no process of the run is left")
+
+    def test_s6_a_run_whose_parent_is_gone_exits_with_143(self):
+        parents = iter([500, 500, 1])
+        exits = BoundedList()
+        thread = watch_parent(getppid=lambda: next(parents, 1), exit_fn=exits.append, pause=lambda s: None, rounds=10)
+        thread.join(5)
+        self.assertEqual(list(exits), [143])
+
+    def test_s6_a_parent_that_stays_does_not_end_the_run_and_init_as_parent_is_not_watched(self):
+        exits = BoundedList()
+        thread = watch_parent(getppid=lambda: 500, exit_fn=exits.append, pause=lambda s: None, rounds=50)
+        thread.join(5)
+        self.assertEqual(list(exits), [])
+        self.assertIsNone(watch_parent(getppid=lambda: 1, exit_fn=exits.append))
+
+    def test_s7_a_mutant_loop_that_never_ends_fails_at_the_call_bound(self):
+        logic = TestHeavyQueueLogic("test_s1_a_busy_queue_waits_says_so_once_and_takes_the_freed_slot")
+        logic.setUp()
+        logic.addCleanup = lambda *a, **k: None
+        logic.attempts = BoundedList()
+        with self.assertRaises(AssertionError) as caught:
+            logic.run_heavy(lambda state, slots: (None, None), 0.001, wait_max=10 ** 12)
+        self.assertIn("call bound", str(caught.exception))
+        for recorded in (logic.attempts, logic.sleeps, logic.clock_calls):
+            self.assertLessEqual(len(recorded), 10000)
+        with self.assertRaises(AssertionError) as caught:   # the output the loop fills is capped too (1 MB)
+            for _ in range(2000):
+                logic.out.write("y" * 1000)
+        self.assertIn("call bound", str(caught.exception))
+        self.assertLessEqual(logic.out.tell(), BoundedOut.LIMIT)
 
 
 class TestHeavySlots(Base):
@@ -54783,7 +54974,28 @@ class TestLoadAlert(Base):
 
 
 
+def watch_parent(getppid=os.getppid, exit_fn=os._exit, pause=time.sleep, every=2.0, rounds=None):
+    """A daemon thread that ends this run (status 143) when its parent process is gone (the parent id changes, to 1 or to a subreaper), so no run outlives the shell
+    that started it. Returns the thread, or None when the parent was already init (a container's pid 1: nothing to compare with). `rounds` bounds the loop (tests)."""
+    start = getppid()
+    if start == 1:
+        return None
+
+    def watch():
+        left = rounds
+        while left is None or left > 0:
+            if getppid() != start:
+                exit_fn(143)
+                return
+            pause(every)
+            left = None if left is None else left - 1
+    thread = threading.Thread(target=watch, daemon=True)
+    thread.start()
+    return thread
+
+
 def main(argv):
+    watch_parent()
     loader = unittest.TestLoader()
     suite = loader.loadTestsFromModule(sys.modules[__name__])
     if argv:

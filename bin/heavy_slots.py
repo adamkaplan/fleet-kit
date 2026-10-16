@@ -24,6 +24,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 DEFAULT_SLOTS = 3
@@ -37,6 +38,14 @@ INFO_MAX = 4096         # bytes of a slot file read
 SLOT_ENV = "FLEET_HEAVY_SLOT"   # set in the command's environment: a command already in a slot does not take a second one
 OFF_ENV = "FLEET_HEAVY"         # "off": bypass (CI never uses slots)
 SLOTS_MAX = 64
+MEM_ENV = "FLEET_HEAVY_MEM_MB"           # memory ceiling of the command's whole process tree, in MB; 0 = off
+TIME_ENV = "FLEET_HEAVY_MAX_SECONDS"     # run-time ceiling, in seconds; 0 = off
+DEFAULT_MEM_MB = 16384
+DEFAULT_MAX_SECONDS = 7200
+WATCH_SECONDS = 5       # how often the watchdog looks
+KILL_GRACE_SECONDS = 10  # between the polite stop and the forced one
+EXIT_TIME = 124
+EXIT_MEMORY = 137
 FORWARDED = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
 
@@ -166,9 +175,138 @@ def _resolve(command, environ):
     return shutil.which(word, path=environ.get("PATH"))
 
 
+def ceilings(environ):
+    """(memory MB, seconds) the watchdog enforces, each 0 when off: FLEET_HEAVY_MEM_MB (default 16384) and FLEET_HEAVY_MAX_SECONDS (default 7200). Anything that is
+    not a whole number of 0 or more reads as the default: a typo never turns the guard off."""
+    def read(key, default):
+        raw = str(environ.get(key, "")).strip()
+        return int(raw) if raw.isdigit() else default
+    return read(MEM_ENV, DEFAULT_MEM_MB), read(TIME_ENV, DEFAULT_MAX_SECONDS)
+
+
+def read_process_table():
+    """[(pid, ppid, pgid, rss_kb)] from `ps`; raises OSError when it cannot be read."""
+    try:
+        done = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid=,rss="], capture_output=True, text=True, timeout=20)
+    except (subprocess.SubprocessError, OSError) as err:
+        raise OSError("ps failed: %s" % err)
+    rows = []
+    for line in done.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 4 and all(part.isdigit() for part in parts):
+            rows.append(tuple(int(part) for part in parts))
+    if done.returncode != 0 or not rows:
+        raise OSError("ps gave no process table")
+    return rows
+
+
+def family(rows, root):
+    """The pids of `root` and everything below it by parent links, with their summed RSS in KB: (set of pids, kb)."""
+    kids = {}
+    for pid, ppid, _pgid, _rss in rows:
+        kids.setdefault(ppid, []).append(pid)
+    found, todo = set(), [root]
+    while todo:
+        pid = todo.pop()
+        if pid not in found:
+            found.add(pid)
+            todo.extend(kids.get(pid, ()))
+    return found, sum(rss for pid, _p, _g, rss in rows if pid in found)
+
+
+class Watchdog:
+    """Stops the command the wrapper started when its process tree passes a memory ceiling or it runs past a time ceiling: SIGTERM, then SIGKILL after a grace.
+    Only what the wrapper started is signalled: the command's own process group when it has one, else the command and its descendants one pid at a time;
+    never another process. A process table that cannot be read stops nothing (one note); the time ceiling needs no table."""
+
+    def __init__(self, pid, command, mem_mb, max_seconds, out, started, read_table=read_process_table, clock=time.time, pause=None, killpg=os.killpg,
+                 kill=os.kill, every=WATCH_SECONDS, grace=KILL_GRACE_SECONDS):
+        self.pid, self.command, self.mem_mb, self.max_seconds, self.out, self.started = pid, command, mem_mb, max_seconds, out, started
+        self.read_table, self.clock, self.killpg, self.kill, self.every, self.grace = read_table, clock, killpg, kill, every, grace
+        self.stop_event = threading.Event()
+        self.pause = pause or (lambda seconds: self.stop_event.wait(seconds))
+        self.peak_kb, self.reason, self.noted = 0, None, False
+        self.thread = threading.Thread(target=self.watch, daemon=True)
+
+    def start(self):
+        if self.mem_mb or self.max_seconds:
+            self.thread.start()
+
+    def finish(self):
+        self.stop_event.set()
+        if self.thread.is_alive():
+            self.thread.join(timeout=self.grace + 5)
+
+    def exit_status(self):
+        return {"memory": EXIT_MEMORY, "time": EXIT_TIME}.get(self.reason)
+
+    def targets(self, rows):
+        """(pgid or None, pids): where the stop goes. Never this wrapper's own group."""
+        if rows is None:
+            return None, [self.pid]
+        pids, _kb = family(rows, self.pid)
+        pgid = next((g for p, _pp, g, _r in rows if p == self.pid), None)
+        return (pgid if pgid not in (None, os.getpgrp()) else None), sorted(pids)
+
+    def sample(self):
+        """One look; returns "memory", "time" or None."""
+        rows = None
+        if self.mem_mb:
+            try:
+                rows = self.read_table()
+                self.peak_kb = max(self.peak_kb, family(rows, self.pid)[1])
+            except OSError as err:
+                rows = None
+                if not self.noted:
+                    self.noted = True
+                    self.out.write("heavy: cannot read the process table (%s): the memory ceiling is not enforced\n" % err)
+        if self.mem_mb and self.peak_kb // 1024 > self.mem_mb:
+            return "memory", rows
+        if self.max_seconds and self.clock() - self.started > self.max_seconds:
+            return "time", rows
+        return None, rows
+
+    def watch(self):
+        while not self.stop_event.is_set() and not self.pause(self.every):
+            reason, rows = self.sample()
+            if reason:
+                self.reason = reason
+                self.say(reason)
+                self.signal(signal.SIGTERM, rows)
+                self.pause(self.grace)
+                if not self.stop_event.is_set():   # the command went with the polite stop: no forced one
+                    self.signal(signal.SIGKILL, rows)
+                return
+
+    def say(self, reason):
+        text = _plain(" ".join(self.command), 120)
+        if reason == "memory":
+            self.out.write("heavy: stopped `%s`: its process tree passed the memory ceiling of %d MB (peak %d MB); FLEET_HEAVY_MEM_MB changes it, 0 turns it off\n"
+                           % (text, self.mem_mb, self.peak_kb // 1024))
+        else:
+            self.out.write("heavy: stopped `%s`: it ran past the time ceiling of %d s (peak %d MB); FLEET_HEAVY_MAX_SECONDS changes it, 0 turns it off\n"
+                           % (text, self.max_seconds, self.peak_kb // 1024))
+        self.out.flush()
+
+    def signal(self, number, rows):
+        pgid, pids = self.targets(rows)
+        try:
+            if pgid is not None:
+                self.killpg(pgid, number)
+                return
+            for pid in pids:
+                try:
+                    self.kill(pid, number)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+
 def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name=None, environ=None, out=None, clock=time.time, sleep=time.sleep,
-        which=shutil.which):
-    """Wait for a slot, run `command` in it, return its exit status. 75 when no slot came within `wait_max` seconds, 127 when the command does not exist."""
+        which=shutil.which, watchdog=None):
+    """Wait for a slot, run `command` in it, return its exit status. 75 when no slot came within `wait_max` seconds, 127 when the command does not exist.
+    A watchdog stops a runaway: 137 past the memory ceiling, 124 past the time ceiling (see `ceilings`); `watchdog` is a dict of Watchdog keyword arguments (tests)."""
     environ = os.environ if environ is None else environ
     out = sys.stderr if out is None else out
     if _resolve(command, environ) is None:
@@ -239,12 +377,20 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
                 child["p"].send_signal(got["signal"])
             except OSError:
                 pass
-        while True:
-            try:
-                status = child["p"].wait()
-                break
-            except InterruptedError:   # a signal during wait: Python retries; this is belt and braces
-                continue
+        mem_mb, max_seconds = ceilings(environ)
+        dog = Watchdog(child["p"].pid, command, mem_mb, max_seconds, out, clock(), clock=clock, **(watchdog or {}))
+        dog.start()
+        try:
+            while True:
+                try:
+                    status = child["p"].wait()
+                    break
+                except InterruptedError:   # a signal during wait: Python retries; this is belt and braces
+                    continue
+        finally:
+            dog.finish()
+        if dog.exit_status():
+            return dog.exit_status()
         return 128 - status if status < 0 else status   # a signal: 128 + n, as a shell reports it
     finally:
         for number, handler in old.items():

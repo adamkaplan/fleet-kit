@@ -4795,6 +4795,8 @@ While every slot is busy it prints `heavy: waiting for a slot (3 of 3 busy: <nam
 
 `bin/test-switchboard`, run directly, takes a slot itself (it re-runs through `heavy`); `FLEET_HEAVY=off`, a CI run (`CI=true`), a run already inside a slot, or a state directory that cannot be written (then ONE line on stderr) run it as it is. Put full suites and browser/e2e runs behind `heavy` in your own scripts too.
 
+**A runaway is stopped (#598).** While the command runs, a watchdog reads the process table (`ps`) every few seconds. When the command's process tree (the command and everything below it) passes `FLEET_HEAVY_MEM_MB` (default 16384) or the run passes `FLEET_HEAVY_MAX_SECONDS` (default 7200), it sends SIGTERM to what the wrapper started (the command's own process group when it has one, else the command and its descendants, never another process), SIGKILL after a 10 s grace, prints one line naming the ceiling, the peak and the command, and exits 137 (memory) or 124 (time). `0` turns a ceiling off; a value that is not a whole number reads as the default. A process table that cannot be read stops nothing (one note). `bin/test-switchboard` also ends itself (status 143) when its parent process is gone, so no run outlives its shell. These are guards against a runaway, not a limit on the fleet.
+
 ### GitHub reads: conditional, counted, paused when the limit is spent
 
 Every read the daemon makes with `gh api` (the Intent reader's issue and parent reads, the hub's catch-up lists and single-item reads) goes through ONE gate per account (`GhAccounts.read`):
