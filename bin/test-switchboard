@@ -26826,6 +26826,180 @@ def top_tier_migrations(test):
     test.addCleanup(test.top_tier_patcher.stop)
 
 
+class TestImpactFloorOwnerDecision(LedgerBase):
+    """#553: `impact floor` says what the daemon decides under the owner-hold rule (read from the same report), so a pull request the daemon holds never reads NONE. The REAL matrix file."""
+
+    def setUp(self):
+        super().setUp()
+        self.extra_config = dict(FLOOR_CONFIG, plan_gates={"repos": {"acme/app": {"mode": "shadow"}}})
+        self.configure()
+
+    def files(self, *paths):
+        self.pr.update({"changedFiles": len(paths), "files": [{"path": p, "additions": 1, "deletions": 0} for p in paths]})
+
+    def floor(self, *extra):
+        code, out, err = self.run_as("coder", "impact", "floor", self.PR, *extra)
+        self.assertEqual(code, 0, err)
+        return out
+
+    def test_s1_a_credential_module_outside_the_old_globs_reads_hold_and_names_the_path_and_its_class(self):
+        self.files("shims/gh")
+        out = self.floor()
+        self.assertEqual(out.count("HOLD for the owner"), 1, out)
+        self.assertIn("top tier path (credentials): shims/gh", out)
+        self.assertIn("path floor (older advisory, not the owner's rule): NONE", out, "the old decision is still shown, labelled")
+
+    def test_s2_an_agent_definition_prose_edit_says_not_held_and_gives_the_reason(self):
+        self.files("agents/opencode/coder.md")
+        with mock.patch.object(sb, "agent_block_states", return_value={"agents/opencode/coder.md": "unchanged"}):
+            out = self.floor()
+        self.assertEqual(out.count("not held for the owner"), 1, out)
+        self.assertIn("because: definition change without a permission block change", out)
+        self.assertNotIn("HOLD for the owner", out)
+        self.files("docs/switchboard.md")
+        out = self.floor()
+        self.assertIn("not held", out)
+        self.assertIn("because: no changed path is a top tier path", out)
+
+    def test_s3_the_json_equals_what_the_daemon_decides_for_five_fixtures(self):
+        fixtures = (["shims/gh"], [".github/workflows/ci.yml"], ["api/routes/users.py"], ["agents/opencode/coder.md"], ["docs/switchboard.md"])
+        for paths in fixtures:
+            self.files(*paths)
+            with mock.patch.object(sb, "agent_block_states", return_value={p: "unchanged" for p in paths}):
+                shown = json.loads(self.floor("--json"))
+                engine = self.world.new_engine("daemon")
+                engine.gh_runner = self.route
+                engine.config, engine.state_dir = sb.load_config(), self.world.state
+                report = sb.pr_floor_report(engine, "acme/app", 9)
+                what, _ = sb.impact_plan(engine, report, [], sb.read_impact_state(self.world.state)[0], {}, None)
+            self.assertEqual((shown["owner_decision"], shown["owner_reasons"]), (report["owner_decision"], report["owner_reasons"]), paths)
+            self.assertEqual(what in ("add", "held", "cleared"), shown["owner_decision"] == "hold", "the daemon's plan %s agrees with the command's %s for %s" % (what, shown["owner_decision"], paths))
+            self.assertEqual(shown["owner_decision"], {"shims/gh": "hold", ".github/workflows/ci.yml": "hold", "api/routes/users.py": "second-review", "agents/opencode/coder.md": "second-review"}.get(paths[0], "none"), paths)
+
+    def cut(self, *paths, total=3000):
+        self.pr.update({"changedFiles": total, "files": [{"path": p, "additions": 1, "deletions": 0} for p in paths]})
+
+    def test_a_complete_list_says_how_many_files_were_read_in_the_headline(self):
+        self.files("docs/switchboard.md", "docs/plan-template.md")
+        out = self.floor()
+        self.assertIn("not held, 2 files read (advisory: nothing is written)", out)
+        self.assertNotIn("CANNOT TELL", out)
+
+    def test_a_cut_list_in_a_repo_with_no_floor_globs_never_reads_as_not_held(self):
+        self.extra_config = {"plan_gates": {"repos": {"acme/app": {"mode": "shadow"}}}}   # no impact_floor globs for the repo
+        self.configure()
+        self.cut(*["docs/f%d.md" % n for n in range(100)])
+        out = self.floor()
+        self.assertIn("CANNOT TELL: only 100 of 3000 files were read", out)
+        self.assertIn("(the daemon's decision for the files it read: not held)", out, "the daemon's own answer, printed as it is")
+        self.assertIn("this is not a verdict of \"not held\"", out)
+        self.assertNotIn("not held, ", out.split("\n")[0])
+        shown = json.loads(self.floor("--json"))
+        self.assertEqual((shown["owner_decision"], shown["complete"], shown["files_read"], shown["files_total"]), ("none", False, 100, 3000))
+
+    def test_a_cut_list_with_a_top_tier_path_among_the_files_read_is_a_hold(self):
+        self.cut("shims/gh", *["docs/f%d.md" % n for n in range(99)])
+        out = self.floor()
+        self.assertIn("HOLD for the owner, 100 files read", out.split("\n")[0])
+        self.assertNotIn("CANNOT TELL", out)
+
+    def test_a_cut_list_in_a_repo_with_floor_globs_is_held_on_purpose_as_the_daemon_holds_it(self):
+        self.cut(*["docs/f%d.md" % n for n in range(100)])   # the repo of this class has floor globs
+        out = self.floor()
+        self.assertIn("HOLD for the owner, 100 files read", out.split("\n")[0])
+        self.assertIn("floor unknown: GitHub listed 100 of 3000", out)
+
+    def test_the_cut_list_fixtures_equal_what_the_daemon_decides_too(self):
+        for globs in (True, False):
+            self.extra_config = dict(FLOOR_CONFIG, plan_gates={"repos": {"acme/app": {"mode": "shadow"}}}) if globs else {"plan_gates": {"repos": {"acme/app": {"mode": "shadow"}}}}
+            self.configure()
+            self.cut("docs/a.md", *["docs/f%d.md" % n for n in range(99)])
+            shown = json.loads(self.floor("--json"))
+            engine = self.world.new_engine("daemon")
+            engine.gh_runner = self.route
+            engine.config, engine.state_dir = sb.load_config(), self.world.state
+            report = sb.pr_floor_report(engine, "acme/app", 9)
+            what, _ = sb.impact_plan(engine, report, [], sb.read_impact_state(self.world.state)[0], {}, None)
+            self.assertEqual((shown["owner_decision"], shown["owner_reasons"]), (report["owner_decision"], report["owner_reasons"]), globs)
+            self.assertEqual(what in ("add", "held", "cleared"), shown["owner_decision"] == "hold", (globs, what))
+
+    def renamed(self, source=None):
+        item = {"path": "docs/neutral.md", "additions": 0, "deletions": 0, "changeType": "RENAMED"}
+        if source:
+            item["previous_filename"] = source
+        self.pr.update({"changedFiles": 1, "files": [item]})
+
+    def daemon_agrees(self, shown):
+        engine = self.world.new_engine("daemon")
+        engine.gh_runner = self.route
+        engine.config, engine.state_dir = sb.load_config(), self.world.state
+        report = sb.pr_floor_report(engine, "acme/app", 9)
+        what, _ = sb.impact_plan(engine, report, [], sb.read_impact_state(self.world.state)[0], {}, None)
+        self.assertEqual((shown["owner_decision"], shown["owner_reasons"]), (report["owner_decision"], report["owner_reasons"]))
+        self.assertEqual(what in ("add", "held", "cleared"), shown["owner_decision"] == "hold")
+
+    def test_a_rename_out_of_a_top_tier_path_with_its_source_known_is_a_hold_naming_the_source_and_its_class(self):
+        for globs in (True, False):
+            self.extra_config = dict(FLOOR_CONFIG, plan_gates={"repos": {"acme/app": {"mode": "shadow"}}}) if globs else {"plan_gates": {"repos": {"acme/app": {"mode": "shadow"}}}}
+            self.configure()
+            self.renamed(source="shims/gh")
+            out = self.floor()
+            self.assertIn("HOLD for the owner, 1 file read", out.split("\n")[0], globs)
+            self.assertIn("top tier path (credentials): shims/gh", out)
+            self.daemon_agrees(json.loads(self.floor("--json")))
+
+    def test_a_rename_whose_source_path_is_not_listed_never_reads_as_not_held_in_a_repo_with_no_floor_globs(self):
+        self.extra_config = {"plan_gates": {"repos": {"acme/app": {"mode": "shadow"}}}}
+        self.configure()
+        self.renamed()
+        out = self.floor()
+        self.assertIn("CANNOT TELL: 1 renamed or copied file(s) with no source path (the daemon's decision for the paths it saw: not held)", out)
+        self.assertIn("this is not a verdict of \"not held\"", out)
+        self.assertNotIn("not held, ", out.split("\n")[0])
+        shown = json.loads(self.floor("--json"))
+        self.assertEqual((shown["owner_decision"], shown["renamed_no_source"]), ("none", ["docs/neutral.md"]), "the daemon reads it as none: said, not changed here")
+        self.daemon_agrees(shown)
+
+    def test_a_rename_whose_source_path_is_not_listed_is_held_in_a_repo_with_floor_globs_as_the_daemon_holds_it(self):
+        self.renamed()   # the repo of this class has floor globs
+        out = self.floor()
+        self.assertIn("HOLD for the owner, 1 file read", out.split("\n")[0])
+        self.assertIn("renamed or copied file(s) with no known source path", out)
+        self.daemon_agrees(json.loads(self.floor("--json")))
+
+    def test_s4_a_rule_file_that_cannot_be_read_is_held_on_purpose_with_the_reason_and_nothing_is_written(self):
+        self.files("docs/switchboard.md")
+
+        def broken(path=None):
+            raise sb.impact_floor.MatrixError("the matrix file is not valid JSON")
+        with mock.patch.object(sb.impact_floor, "load_matrix", broken):
+            out = self.floor()
+            shown = json.loads(self.floor("--json"))
+        self.assertEqual(out.count("held on purpose"), 1, out)
+        self.assertIn("not valid JSON", out)
+        self.assertEqual((shown["owner_decision"], shown["decision"]), ("hold", "hold"))
+        self.assertIn("held on purpose", shown["owner_reasons"][0])
+        self.assertEqual(self.ledger(), [])
+        self.assertEqual([e for e in self.world.audit() if e["event"].startswith(("gate.", "plan.", "impact."))], [])
+
+    def test_s5_the_old_json_fields_are_still_there_next_to_the_owner_decision(self):
+        self.files("shims/gh")
+        shown = json.loads(self.floor("--json"))
+        for field in ("decision", "reasons", "floor_paths", "globs"):
+            self.assertIn(field, shown)
+        for field in ("owner_decision", "owner_reasons"):
+            self.assertIn(field, shown)
+
+    def test_s6_the_command_reads_the_reports_owner_decision_and_holds_no_path_or_class_of_the_rule(self):
+        import inspect
+        source = inspect.getsource(sb.cmd_impact_floor)
+        block = sb.impact_floor.load_matrix()["owner_hold"]
+        literals = list(block["top_tier_classes"]) + [g for globs in block["top_tier_paths"].values() for g in globs]
+        self.assertEqual([x for x in literals if '"%s"' % x in source or "'%s'" % x in source], [], "a path or class of the rule is written in the command")
+        self.assertIn('report.get("owner_decision")', source)
+        self.assertNotIn("owner_decide(", source, "no second copy of the rule")
+
+
 class TestImpactFloorCommandAndPass(LedgerBase):
     """`impact floor <pr>` and the daemon's advisory `gate.would_hold`: both read, neither writes a label, comment or ledger entry."""
 
@@ -26845,7 +27019,7 @@ class TestImpactFloorCommandAndPass(LedgerBase):
         self.assertEqual(self.ledger(), [])
         self.assertEqual([e for e in self.world.audit() if e["event"].startswith(("gate.", "plan."))], [])
         code, out, err = self.run_as("coder", "impact", "floor", self.PR)
-        self.assertIn("HOLD (advisory: nothing is written)", out)
+        self.assertIn("HOLD for the owner, 2 files read (advisory: nothing is written)", out)   # #553: the headline is the owner decision and the files read (was "HOLD (advisory...")
 
     def test_a_huge_change_outside_the_floor_does_not_hold_and_a_rating_can_add_one(self):
         self.pr.update({"changedFiles": 1, "files": [{"path": "src/app.py", "additions": 100000, "deletions": 100000}]})
