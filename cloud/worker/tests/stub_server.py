@@ -4,6 +4,7 @@ STUB_LOG (file): one line per event. STUB_PID_FILE: our pid. STUB_MODE: ok (defa
 import http.server
 import json
 import os
+import socketserver
 import sys
 
 MODE = os.environ.get("STUB_MODE", "ok")
@@ -66,4 +67,14 @@ class H(http.server.BaseHTTPRequestHandler):
 if os.environ.get("STUB_PID_FILE"):
     with open(os.environ["STUB_PID_FILE"], "w") as f:
         f.write(str(os.getpid()))
-http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+
+
+class Server(http.server.ThreadingHTTPServer):
+    # HTTPServer.server_bind calls socket.getfqdn(host): a reverse DNS lookup that can stall for many seconds on a hosted runner,
+    # during which the port is bound but nothing accepts. The stub has no use for the name.
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[0], self.server_address[1]
+
+
+Server(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
