@@ -38756,6 +38756,20 @@ class TestHeadlessRestartNotice(Base):
         self.assertEqual(self.route_facts(), [])
         self.assertEqual(sb.headless_route_status_lines(self.world.state), [], "a restored route clears the line")
 
+    def test_a_changed_route_problem_is_a_new_key_a_raising_check_is_no_finding_and_a_worker_without_a_boss_is_not_told(self):
+        self.engine.accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5, "gh_users": {"acme-org/*": "acme-bot"}}, self.world.route, self.world.clock.now, environ={})
+        problem = ["first"]
+        self.engine.route_check = lambda: problem[0]
+        self.route_worker("mapped", "acme-org/widget-api")
+        one = {f.key for f in self.route_facts()}
+        problem[0] = "second"
+        self.assertEqual(len(one | {f.key for f in self.route_facts()}), 2, "a new problem is a new key")
+        def boom():
+            raise RuntimeError("unreadable")
+        self.engine.route_check = boom
+        self.assertEqual(self.route_facts(), [])
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "source.error" and "headless_route_facts" in str(e)])
+
     def test_the_route_recheck_only_reads_files_and_calls_nothing(self):
         self.engine.accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5, "gh_users": {"acme-org/*": "acme-bot"}}, self.world.route, self.world.clock.now, environ={})
         with tempfile.TemporaryDirectory() as cfg:
