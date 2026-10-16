@@ -4,7 +4,7 @@ Status: design for decision (#568, under the least-privilege law #540). Nothing 
 
 **The intent.** An agent's GitHub credential for a repository cannot change that repository's settings, rulesets, branch protection or collaborators, nor merge around the ruleset. Only the owner's own login can.
 
-Names below are neutral (`acme-org/widget-api`, `agent-bot`). No token, key, account or keyring entry of a real installation appears in this file, and a test (`bin/test-agent-credentials-doc`) scans it for token-like strings.
+Names below are neutral (`acme-org/widget-api`, `agent-bot`). No token, key, account or keyring entry of a real installation appears in this file, and a test (`TestAgentCredentialsDoc` in `bin/test-switchboard`) scans it for token-like strings.
 
 ## How the scopes were read
 
