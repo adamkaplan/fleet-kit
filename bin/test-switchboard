@@ -59125,7 +59125,8 @@ class TestQueueEjections(Base):
         self.go()
         to, line = self.sent[1]
         self.assertEqual(to, "boss")
-        self.assertEqual(("@" in line, "://" in line, "ghp_" in line, "/deploy" in line.replace(" /deploy", "")), (False, False, False, False))
+        self.assertEqual(("@" in line, "://" in line, "ghp_" in line), (False, False, False))
+        self.assertNotIn("/deploy", line)
         self.assertEqual(len(self.sent), 2)
 
     def test_s7_an_unowned_pull_request_with_no_chief_is_said_and_woken_once_one_exists(self):
@@ -59153,6 +59154,28 @@ class TestQueueEjections(Base):
         self.go(calls=2 + 3)   # the 2 lists, and one candidate's 3 reads
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(self.skipped(), [{"budget": 2, "reason": "budget"}])
+
+    def test_a_pass_with_no_hub_says_so_and_a_candidate_in_its_back_off_is_counted(self):
+        self.add(1440, 540, names=["t"])
+        hub, self.engine.hub = self.engine.hub, None
+        self.go()
+        self.assertEqual(self.skipped(), [{"no_hub": 1, "reason": "no_hub"}])
+        self.engine.hub = hub
+        self.gh.graphql_fault = "exit"
+        self.go()
+        self.gh.graphql_fault = None
+        self.go()   # inside the back-off
+        self.assertEqual(self.skipped()[-1], {"retry": 1, "reason": "retry"})
+
+    def test_what_is_remembered_about_a_run_that_never_wakes_is_forgotten(self):
+        self.add(1450, 550, names=["t"])
+        self.gh.pulls[(self.REPO, 550)] = ("OPEN", True)
+        self.go()
+        memory = self.engine.queue_ejections
+        self.assertEqual((len(memory["first"]), len(memory["held"])), (1, 1))
+        self.world.tick(self.module.WAKE_WINDOW + self.module.LIST_SECONDS + 100)   # the run is history now
+        self.go()
+        self.assertEqual((len(memory["first"]), len(memory["held"])), (0, 0))
 
     def test_s3_a_skip_is_said_once_until_it_changes(self):
         self.add(1420, 520, names=["t"])

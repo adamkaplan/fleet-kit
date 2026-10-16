@@ -313,7 +313,8 @@ def run_pass(sb, engine, now, calls):
         reader = _reader(sb, engine, runner, now, repo)
         if entry is None:
             if spent + 3 > calls or downloads >= MAX_DOWNLOADS:   # the pull request read and the run's two reads must fit this pass; the rest wait
-                waiting = [c[5] for c in candidates if c[5] == key or (c[0], c[1], c[2]) > (ts, repo, number)]
+                waiting = [c[5] for c in candidates if (c[5] == key or (c[0], c[1], c[2]) > (ts, repo, number))
+                           and now >= memory["retry"].get(c[5], 0) and now >= memory["recheck"].get(c[5], 0) and c[5] not in memory["built"]]   # only those that would have been read
                 for left in waiting:
                     _skip(skips, memory, left, "budget")
                 break
@@ -379,8 +380,9 @@ def run_pass(sb, engine, now, calls):
         for key in [k for k, v in memory[table].items() if k in woke or (table in ("retry", "recheck") and now >= v)]:
             memory[table].pop(key, None)
     memory["said"] -= set(woke)
-    for table in ("first", "held"):
-        for key in [k for k in memory[table] if k in woke]:
+    current = {c[5] for c in candidates}
+    for table in ("first", "held"):   # a run that settled, aged out of the window, was superseded or whose pull request closed is no longer a candidate
+        for key in [k for k in memory[table] if k in woke or k not in current]:
             memory[table].pop(key, None)
     _say_skips(engine, memory, skips)
     return spent
