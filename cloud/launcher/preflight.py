@@ -9,6 +9,12 @@ Reads with GET only (https://api.github.com; CW_GITHUB_API_BASE may name a loopb
   /repos/{o}/{r}/branches/{b}          the `protected` flag
 The token comes from app_token.py, or from the command CW_PREFLIGHT_TOKEN_CMD when set (tests).
 
+An ORGANIZATION ruleset the token cannot read (HTTP 403 on its GET: an App token never can) is not counted, one line
+each. If everything that is then missing would be supplied by the rules such rulesets carry, the repository fails
+(exit 1) unless the owner approval entry for it exists in the file named by CW_REPO_APPROVALS (see approval()): then it
+passes with a loud "NOT VERIFIED" line on every run. Any other failed read (404, 500, a dropped connection, odd JSON,
+too large; a 403 on a repository's own ruleset) is exit 2.
+
 PASS (exit 0, "preflight ok: <rule names>") only when the branch has, from rulesets that are `active` and cover it,
 a pull_request rule with required_approving_review_count of at least 1 (only the count; dismiss-stale and code-owner
 flags are not required) OR a merge_queue rule (a direct push is refused), AND non_fast_forward (no force-push) AND
@@ -44,7 +50,9 @@ NEED = (("pull_request|merge_queue", "a pull_request or merge_queue rule (direct
 
 
 class Unreadable(Exception):
-    pass
+    def __init__(self, msg, status=None):
+        super().__init__(msg)
+        self.status = status  # the HTTP status of a refused read, else None
 
 
 def say(msg):
@@ -62,7 +70,7 @@ def get(base, path, token):
             raise Unreadable("the answer to GET %s is larger than %d bytes" % (path, app_token.MAX_BYTES))
         return json.loads(raw)
     except urllib.error.HTTPError as e:
-        raise Unreadable("GET %s: %s" % (path, app_token.http_error_text(e.code)))
+        raise Unreadable("GET %s: %s" % (path, app_token.http_error_text(e.code)), e.code)
     except (OSError, ValueError):
         raise Unreadable("GET %s failed or its answer was not JSON" % path)
 
@@ -125,15 +133,19 @@ def covers(conditions, branch, default_branch):
     return (inc and not exc), odd
 
 
-def judge(rules, branch, default_branch, fetch):
+def judge(rules, branch, default_branch, fetch, unreadable=None):
     """Keep only the rules of rulesets that are active and cover the branch. Returns (problems, kept rules), or
     (problems, None) when a ruleset cannot be read.
 
     The branch rules endpoint returns only rules that apply to the branch. We rely on that and do not trust it alone:
     every rule must name its ruleset (ruleset_id, ruleset_source_type, ruleset_source), and each ruleset is fetched
     once (GET only, bounded) to read its `enforcement` (must be `active`: `evaluate` and `disabled` are not enforced)
-    and its `conditions` (must cover the branch). Anything odd fails closed."""
+    and its `conditions` (must cover the branch). Anything odd fails closed.
+
+    The one exception: an ORGANIZATION ruleset whose read is refused (HTTP 403 only; an App token can never read
+    them) is not counted. Its id goes into `unreadable` (a dict id -> its rules) and the rules it carries are not kept."""
     problems, kept, verdict = [], [], {}
+    unreadable = {} if unreadable is None else unreadable
     for r in rules:
         if not isinstance(r, dict) or not isinstance(r.get("type"), str):
             say("cannot read: a rule has no type")
@@ -150,8 +162,13 @@ def judge(rules, branch, default_branch, fetch):
             try:
                 rs = fetch(path)
             except Unreadable as e:
-                say("cannot read: %s" % e)
-                return problems, None
+                if st != "Organization" or e.status != 403:
+                    say("cannot read: %s" % e)
+                    return problems, None
+                say("organization ruleset %d: not readable with this token, not counted" % rid)
+                verdict[key] = None
+                unreadable[rid] = []
+        if key not in verdict:
             enf = rs.get("enforcement") if isinstance(rs, dict) else None
             cov, odd = covers(rs.get("conditions"), branch, default_branch) if isinstance(rs, dict) else (None, None)
             if enf not in ("active", "evaluate", "disabled") or cov is None or (isinstance(rs, dict) and rs.get("target") != "branch"):
@@ -163,9 +180,61 @@ def judge(rules, branch, default_branch, fetch):
                 problems.append("ruleset %d does not cover the branch%s" % (
                     rid, " (a pattern was not understood: %s)" % ", ".join(odd) if odd else ""))
             verdict[key] = enf == "active" and cov
-        if verdict[key]:
+        if verdict[key] is None:
+            unreadable[rid].append(r)
+        elif verdict[key]:
             kept.append(r)
     return problems, kept
+
+
+def evaluate(valid):
+    """(missing, has_pr, types, review problems) for a list of rules."""
+    types = {r.get("type") for r in valid}
+    counts = [(r.get("parameters") or {}).get("required_approving_review_count") for r in valid
+              if r.get("type") == "pull_request"]
+    has_pr = "pull_request" in types
+    reviews_ok = "merge_queue" in types or any(isinstance(c, int) and not isinstance(c, bool) and c >= 1 for c in counts)
+    problems, missing = [], []
+    if has_pr and not reviews_ok:
+        problems.append("the pull_request rule has no required approving reviews (required_approving_review_count must be "
+                        "at least 1, or use a merge_queue rule)")
+    if not has_pr and "merge_queue" not in types:
+        missing.append(NEED[0][1])
+    missing += [what for alts, what in NEED[1:] if not (types & set(alts.split("|")))]
+    return missing, has_pr, types, problems
+
+
+def _field(v):
+    return isinstance(v, str) and v.strip() != "" and len(v) <= 300 and not re.search(r"[\x00-\x1f\x7f]", v)
+
+
+def approval(target):
+    """The owner approval entry for target from the file named by CW_REPO_APPROVALS: (who, date, reason), None when
+    there is none (no file named, or no entry for this repository), or raises Unreadable (fail closed) when the file
+    or the matching entry cannot be read."""
+    path = os.environ.get("CW_REPO_APPROVALS")
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(65537)
+        if len(raw) > 65536:
+            raise Unreadable("the approvals file is larger than 65536 bytes")
+        data = json.loads(raw)
+    except Unreadable:
+        raise
+    except (OSError, ValueError):
+        raise Unreadable("the approvals file could not be read or is not JSON")
+    if not isinstance(data, dict):
+        raise Unreadable("the approvals file is not a JSON object")
+    hits = [v for k, v in data.items() if isinstance(k, str) and k.lower() == target.lower()]
+    if not hits:
+        return None
+    e = hits[0]
+    if len(hits) != 1 or not isinstance(e, dict) or not all(_field(e.get(k)) for k in ("approved_by", "approved_at", "reason")):
+        raise Unreadable("the approval entry for this repository is malformed (approved_by, approved_at and reason must "
+                         "be non-empty one-line strings, once)")
+    return e["approved_by"].strip(), e["approved_at"].strip(), e["reason"].strip()
 
 
 def main(argv):
@@ -207,24 +276,32 @@ def main(argv):
     if len(rules) >= 100:
         say("cannot read: 100 or more rules apply; the answer may be paginated and is not read in full")
         return 2
-    problems, valid = judge(rules, branch, repo.get("default_branch"), lambda path: get(base, path, token))
+    unreadable = {}
+    problems, valid = judge(rules, branch, repo.get("default_branch"), lambda path: get(base, path, token), unreadable)
     if valid is None:
         return 2
-    types = {r.get("type") for r in valid}
-    counts = [(r.get("parameters") or {}).get("required_approving_review_count") for r in valid
-              if r.get("type") == "pull_request"]
-    has_pr = "pull_request" in types
-    reviews_ok = "merge_queue" in types or any(isinstance(c, int) and not isinstance(c, bool) and c >= 1 for c in counts)
-    missing = []
-    if has_pr and not reviews_ok:
-        problems.append("the pull_request rule has no required approving reviews (required_approving_review_count must be "
-                        "at least 1, or use a merge_queue rule)")
-    if not has_pr and "merge_queue" not in types:
-        missing.append(NEED[0][1])
-    missing += [what for alts, what in NEED[1:] if not (types & set(alts.split("|")))]
+    missing, has_pr, types, review_problem = evaluate(valid)
+    problems += review_problem
     if not missing and not problems:
         say("preflight ok: " + ", ".join(sorted(t for t in types if isinstance(t, str))))
         return 0
+    if unreadable and not problems and missing:
+        # Could the unreadable organization rulesets have supplied everything that is missing? Then (and only then)
+        # the owner approval entry is read. A rule the preflight can see is missing stays missing.
+        extra = [r for rs in unreadable.values() for r in rs]
+        if not evaluate(valid + extra)[0] and not evaluate(valid + extra)[3]:
+            ids = ", ".join(str(i) for i in sorted(unreadable))
+            try:
+                ok = approval(target)
+            except Unreadable as e:
+                say("cannot read: %s" % e)
+                return 2
+            if ok:
+                say("preflight ok: protection NOT VERIFIED (organization ruleset %s unreadable); owner-approved by %s on %s: %s" % ((ids,) + ok))
+                return 0
+            say("FAIL on %s: protection comes from an organization ruleset this token cannot read; an owner approval entry "
+                "is needed: see CW_REPO_APPROVALS" % branch)
+            return 1
     for m in missing:
         say("FAIL on %s: missing %s" % (branch, m))
     for m in problems:

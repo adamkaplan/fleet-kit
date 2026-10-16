@@ -32,8 +32,12 @@ class Stub(http.server.BaseHTTPRequestHandler):
     no_id = False  # answer rules without a ruleset_id
     redirect_code = 302
     redirect = None  # a Location to answer every GET with, as a 302
+    fail_code = 500
     fail = None  # a path suffix that answers 500, or "badjson"
     methods = []
+    org_code = None  # status (or "drop") answered for any /orgs/ GET
+    org_extra = []  # extra organization-sourced rules (ruleset 9) on top of the repository's own
+    org_types = []  # rule types sourced from unreadable-able organization ruleset 9
 
     def log_message(self, *a):
         pass
@@ -54,12 +58,18 @@ class Stub(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
         path = unquote(urlparse(self.path).path)
+        if path.startswith("/orgs/") and Stub.org_code:
+            if Stub.org_code == "drop":
+                self.close_connection = True
+                self.connection.close()
+                return
+            return self.reply(Stub.org_code, {})
         if Stub.fail == "badjson":
             return self.reply(200, b"<html>")
         if Stub.fail == "huge":
             return self.reply(200, b" " * 1_100_000 + b"{}")
         if Stub.fail and path.endswith(Stub.fail):
-            return self.reply(500, {})
+            return self.reply(Stub.fail_code, {})
         if path == "/repos/" + REPO:
             return self.reply(200, {"default_branch": Stub.default})
         if path.startswith("/repos/%s/rules/branches/" % REPO):
@@ -68,11 +78,15 @@ class Stub(http.server.BaseHTTPRequestHandler):
                 r = {"type": x, "ruleset_id": Stub.rule_ids.get(x, 7), "ruleset_source_type": "Repository", "ruleset_source": REPO}
                 if Stub.org:
                     r.update(ruleset_source_type="Organization", ruleset_source="acme-org")
+                if x in Stub.org_types:
+                    r.update(ruleset_id=9, ruleset_source_type="Organization", ruleset_source="acme-org")
                 if Stub.no_id:
                     del r["ruleset_id"]
                 if x == "pull_request":
                     r["parameters"] = {"required_approving_review_count": Stub.review_count}
                 out.append(r)
+            for x in Stub.org_extra:
+                out.append({"type": x, "ruleset_id": 9, "ruleset_source_type": "Organization", "ruleset_source": "acme-org"})
             return self.reply(200, out)
         if path in ("/repos/%s/rulesets/7" % REPO, "/orgs/acme-org/rulesets/7"):
             cond = {"ref_name": {"include": Stub.include, "exclude": Stub.exclude}} if Stub.conditions == "ok" else None
@@ -123,7 +137,15 @@ class Preflight(unittest.TestCase):
         Stub.rules, Stub.protected, Stub.fail, Stub.methods, Stub.redirect = list(FULL), False, None, [], None
         Stub.review_count, Stub.enforcement, Stub.include, Stub.conditions = 1, "active", ["~DEFAULT_BRANCH"], "ok"
         Stub.exclude, Stub.target, Stub.default, Stub.rule_ids, Stub.extra, Stub.org, Stub.no_id = [], "branch", "main", {}, {}, False, False
+        Stub.org_code, Stub.org_types, Stub.fail_code, Stub.org_extra = None, [], 500, []
         Other.seen = []
+        self.dir = tempfile.mkdtemp()
+
+    def approvals(self, content, raw=False):
+        path = os.path.join(self.dir, "approvals.json")
+        with open(path, "w") as f:
+            f.write(content if raw else json.dumps(content))
+        return path
 
     def run_pf(self, *args, **env):
         e = dict(os.environ, CW_GITHUB_API_BASE=self.base, CW_PREFLIGHT_TOKEN_CMD="echo " + TOKEN)
@@ -223,6 +245,81 @@ class Preflight(unittest.TestCase):
         Stub.org = True
         self.assertEqual(self.run_pf().returncode, 0)
         Stub.fail = "/rulesets/7"  # a token that cannot read the organization's ruleset fails closed
+        self.assertEqual(self.run_pf().returncode, 2)
+
+    def org_only(self, code=403, types=None):
+        Stub.org_types = types or list(FULL)
+        Stub.org_code = code
+
+    ENTRY = {"approved_by": "the owner", "approved_at": "2026-10-16", "reason": "protected by the org ruleset"}
+
+    def test_a_403_on_an_org_ruleset_is_not_counted_and_the_repo_own_rules_can_pass(self):
+        Stub.rules = list(FULL)
+        Stub.org_extra = ["deletion"]  # an unreadable organization ruleset on top of the repository's own three
+        Stub.org_code = 403
+        p = self.run_pf()
+        self.assertEqual(p.returncode, 0, p.stdout)
+        self.assertIn("organization ruleset 9: not readable with this token, not counted", p.stdout)
+        self.assertIn("preflight ok: deletion, non_fast_forward, pull_request", p.stdout)
+
+    def test_only_unreadable_org_rules_fail_with_the_approvals_pointer(self):
+        self.org_only()
+        p = self.run_pf()
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertIn("not readable with this token, not counted", p.stdout)
+        self.assertIn("an owner approval entry is needed: see CW_REPO_APPROVALS", p.stdout)
+        self.assertEqual(self.run_pf(CW_REPO_APPROVALS=self.approvals({"acme-org/other": self.ENTRY})).returncode, 1)
+
+    def test_a_valid_approval_passes_loudly_every_run(self):
+        self.org_only()
+        f = self.approvals({REPO.upper(): self.ENTRY})
+        for _ in range(2):
+            p = self.run_pf(CW_REPO_APPROVALS=f)
+            self.assertEqual(p.returncode, 0, p.stdout)
+            self.assertIn("preflight ok: protection NOT VERIFIED (organization ruleset 9 unreadable); owner-approved by "
+                          "the owner on 2026-10-16: protected by the org ruleset", p.stdout)
+
+    def test_a_bad_approvals_file_or_entry_exits_2(self):
+        self.org_only()
+        for bad in ({"approved_by": "x", "approved_at": "d"}, {**self.ENTRY, "reason": " "}, {**self.ENTRY, "approved_by": 5}, "x"):
+            self.assertEqual(self.run_pf(CW_REPO_APPROVALS=self.approvals({REPO: bad})).returncode, 2, bad)
+        self.assertEqual(self.run_pf(CW_REPO_APPROVALS=self.approvals("{not json", raw=True)).returncode, 2)
+        self.assertEqual(self.run_pf(CW_REPO_APPROVALS=self.approvals("[]", raw=True)).returncode, 2)
+        self.assertEqual(self.run_pf(CW_REPO_APPROVALS=os.path.join(self.dir, "none.json")).returncode, 2)
+        self.assertEqual(self.run_pf(CW_REPO_APPROVALS=self.dir).returncode, 2)
+
+    def test_the_approvals_file_is_not_read_when_it_is_not_the_reason(self):
+        Stub.rules = ["pull_request", "deletion"]  # non_fast_forward is visibly missing and no unreadable rule carries it
+        Stub.org_types = ["deletion"]
+        Stub.org_code = 403
+        f = self.approvals({REPO: self.ENTRY})
+        self.assertEqual(self.run_pf(CW_REPO_APPROVALS=f).returncode, 1)
+        self.assertEqual(self.run_pf(CW_REPO_APPROVALS=os.path.join(self.dir, "none")).returncode, 1)  # not even read
+        Stub.rules, Stub.org_types = [], []
+        self.assertEqual(self.run_pf(CW_REPO_APPROVALS=f).returncode, 1)  # an unprotected repo
+
+    def test_an_approval_does_not_rescue_a_readable_ruleset_without_a_rule_or_with_a_problem(self):
+        Stub.rules, Stub.enforcement = ["pull_request", "deletion"], "evaluate"
+        Stub.org_types, Stub.org_code = ["pull_request"], 403
+        self.assertEqual(self.run_pf(CW_REPO_APPROVALS=self.approvals({REPO: self.ENTRY})).returncode, 1)
+
+    def test_only_a_403_on_an_org_ruleset_is_not_readable(self):
+        for code in (404, 500, "drop"):
+            self.org_only(code)
+            p = self.run_pf(CW_REPO_APPROVALS=self.approvals({REPO: self.ENTRY}))
+            self.assertEqual(p.returncode, 2, (code, p.stdout))
+            self.assertNotIn("not counted", p.stdout)
+        Stub.org_code = None
+        Stub.org_types = []
+        Stub.org = False
+        Stub.fail = "/rulesets/7"
+        self.assertEqual(self.run_pf().returncode, 2)
+
+    def test_a_403_on_the_repository_own_ruleset_or_rules_endpoint_exits_2(self):
+        Stub.fail = "/rulesets/7"
+        Stub.fail_code = 403
+        self.assertEqual(self.run_pf().returncode, 2)
+        Stub.fail = "/rules/branches/main"
         self.assertEqual(self.run_pf().returncode, 2)
 
     def test_a_ruleset_that_is_not_a_branch_ruleset_fails_closed(self):

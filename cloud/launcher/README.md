@@ -85,6 +85,26 @@ be read. A branch protected only by classic branch protection fails closed (a re
 requirement); `--accept-classic` is the explicit, owner-approved override and prints a warning. It overrides only that one failure (the review requirement on a branch GitHub reports as protected), never an unreadable answer, an unprotected branch, or a missing `non_fast_forward` or `deletion` rule. Redirects are never followed, and `OWNER/REPO` may not contain a `.` or `..` segment. It cannot see bypass
 actors: the live refusal check on a disposable repository is the real proof.
 
+*Organization rulesets.* An App installation token can never read an organization ruleset (GitHub asks for the
+organization `Administration` permission at write; this project does not grant it). When the read of an organization
+ruleset is refused with HTTP 403, that ruleset is not counted and the output says so, one line each:
+`organization ruleset <id>: not readable with this token, not counted`. The repository passes on the rules the
+preflight can verify. If it fails only because those rules are not counted (exit 1: `protection comes from an
+organization ruleset this token cannot read; an owner approval entry is needed: see CW_REPO_APPROVALS`), the owner can
+enable it with one entry, set once per repository, in the JSON file named by `CW_REPO_APPROVALS` (default: none; the
+program never writes it):
+
+```json
+{"acme-org/widget-service": {"approved_by": "the owner", "approved_at": "2026-10-16", "reason": "protected by the organization ruleset"}}
+```
+
+The file is read only in that one case. The key is the exact `OWNER/NAME` (case-insensitive, no wildcards); an entry for
+another repository is ignored; the three fields must be non-empty one-line strings. A matching entry passes with a line on
+every run: `preflight ok: protection NOT VERIFIED (organization ruleset <id> unreadable); owner-approved by <who> on
+<date>: <reason>`. A file or matching entry that cannot be read exits 2. The approval never covers a rule the preflight can
+see is missing, an unprotected repository, or a readable ruleset that is not enforced. Any other failed read (404, 500, a
+dropped connection, odd JSON, too large) of any ruleset, and a 403 on a repository's own ruleset, still exits 2.
+
 Settings (environment): `CW_APP_ID_CMD`, `CW_APP_KEY_CMD`, `CW_APP_INSTALLATION_CMD` (each a command printing the
 value; otherwise read from the vault), `CW_VAULT_SUBSCRIPTION` and `CW_VAULT_NAME` (no defaults), `CW_OPENSSL`,
-`CW_GITHUB_API_BASE` (tests), `CW_PREFLIGHT_TOKEN_CMD` (tests: replaces the mint in the preflight).
+`CW_REPO_APPROVALS` (path of the approvals file, default none), `CW_GITHUB_API_BASE` (tests), `CW_PREFLIGHT_TOKEN_CMD` (tests: replaces the mint in the preflight).
