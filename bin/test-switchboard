@@ -28931,6 +28931,36 @@ class TestImpactHold(LedgerBase):
             readers = [n.name for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("validate", "settings")]
             if readers and not matches("bin/" + path.name, rule["clear_code_paths"]):
                 self.assertTrue(set(readers) <= set(roots.get("bin/" + path.name) or []), "%s has a config reader (%s) that is not a root" % (path.name, readers))
+        # the modules the clear really loads: the daemon's imports at load + every module with a config reader + what the recorded run executed (NOT a glob of bin/*.py)
+        daemon = ast.parse((BIN / "fleet-switchboard").read_text())
+        names = {p.stem for p in BIN.glob("*.py")}
+        loaders = {}
+        for node in daemon.body:
+            if isinstance(node, ast.FunctionDef):
+                for x in ast.walk(node):
+                    if isinstance(x, ast.Call) and getattr(x.func, "id", "") == "load_module" and x.args and isinstance(x.args[0], ast.Constant):
+                        loaders.setdefault(node.name, set()).add(x.args[0].value)
+        derived = {f[len("bin/"):-3] for f, _ in seen if f.endswith(".py")}
+        for node in daemon.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for x in ast.walk(node):
+                if isinstance(x, ast.Import):
+                    derived |= {a.name for a in x.names} & names
+                elif isinstance(x, ast.ImportFrom) and x.module in names:
+                    derived.add(x.module)
+                elif isinstance(x, ast.Call):
+                    f = getattr(x.func, "id", "")
+                    if f == "load_module" and x.args and isinstance(x.args[0], ast.Constant):
+                        derived.add(x.args[0].value)
+                    derived |= loaders.get(f, set())
+        for path in sorted(BIN.glob("*.py")):
+            if any(isinstance(n, ast.FunctionDef) and n.name in ("validate", "settings") for n in ast.parse(path.read_text()).body):
+                derived.add(path.stem)
+        derived = {m for m in derived if m in names and not matches("bin/%s.py" % m, rule["clear_code_paths"])}
+        listed = {f[len("bin/"):-3] for f in rule["closure_files"] if f.endswith(".py")}
+        self.assertEqual(sorted(derived ^ listed), [], "closure_files is the set of modules the clear loads or runs, not a glob (a module in one and not the other)")
+        self.assertNotIn("bin/lanes.py", rule["closure_files"])
         self.assertIn("one_line", roots["bin/decision_core.py"])
         # a module is judged on its import-time code too, and a function the clear does not run stays allowed
         module = sb.load_module("delegated_clear")
@@ -28948,7 +28978,9 @@ class TestImpactHold(LedgerBase):
         self.assertEqual(judge(more, more.replace("        return 1", "        return 7"), ["one_line"]), [], "a method body does not")
         self.assertTrue(judge(mod, mod.replace("def ordinary(x):", "def ordinary(x=print(1)):"), ["one_line"]), "a default runs at import")
         self.assertTrue(judge(mod, mod.replace("def ordinary(x):", "@hook\ndef ordinary(x):"), ["one_line"]), "a decorator runs at import")
-        self.assertTrue(judge(mod, mod.replace("def ordinary(x):", "def ordinary(\n        x):"), ["one_line"]), "a signature line runs at import")
+        self.assertEqual(judge(mod, mod.replace("def ordinary(x):", "def ordinary(\n        x):"), ["one_line"]), [], "a plain signature only binds a name")
+        self.assertEqual(judge(mod, mod.replace("def ordinary(x):", "def ordinary(x, y=1):"), ["one_line"]), [], "a constant default only binds")
+        self.assertEqual(judge(mod, mod + "\ndef added(a, b=None):\n    return a\n", ["one_line"]), [], "a new function with a plain signature")
         one = mod + "\ndef short(a=1): return a\n\ndef split(a=1,\n          b=2): return a\n"
         self.assertTrue(judge(one, one.replace("def short(a=1)", "def short(a=print())"), ["one_line"]), "a one-line def: the default shares the line with the body")
         self.assertTrue(judge(one, one.replace("b=2)", "b=print())"), ["one_line"]), "a split signature whose last line carries the body")
@@ -29133,7 +29165,7 @@ class TestImpactHold(LedgerBase):
             self.assertTrue(module.refusals(rule, good, [shape], sb.impact_floor.matches, {}), shape)
         self.assertTrue(module.refusals(rule, good, [{"filename": "a\x00b", "status": "modified"}], sb.impact_floor.matches, {}), "a path with a NUL cannot be told: refused")
         for allowed in ({"filename": "docs/switchboard.md", "status": "modified"}, {"filename": "README.md", "status": "modified"}, {"filename": "bin/test-switchboard", "status": "modified"},
-                        {"filename": "bin/decision_core.py", "status": "modified"}, {"filename": "bin/triage_digest.py", "status": "modified"}):
+                        {"filename": "bin/decision_core.py", "status": "modified"}, {"filename": "bin/lanes.py", "status": "modified"}, {"filename": "bin/triage_digest.py", "status": "modified"}):
             self.assertEqual(module.refusals(rule, good, [allowed], sb.impact_floor.matches, {allowed["filename"]: []}), [], allowed)
         self.assertTrue(module.refusals(rule, good, [{"filename": "bin/fleet-switchboard", "status": "modified"}], sb.impact_floor.matches, {}), "the daemon file with no mapping: refused")
         self.assertEqual(module.refusals(rule, good, [{"filename": "bin/fleet-switchboard", "status": "modified"}], sb.impact_floor.matches, {"bin/fleet-switchboard": []}), [])
@@ -29166,7 +29198,7 @@ class TestImpactHold(LedgerBase):
 
     def test_an_unrelated_edit_in_the_daemon_file_is_allowed_and_a_new_call_into_the_clear_is_refused(self):
         source = self.real_source()
-        for name in ("cmd_triage", "format_decisions_status"):
+        for name in ("cmd_triage", "format_decisions_status", "decisions_from_notices", "triage_pass"):
             self.assertIn("def %s(" % name, source)
             head, diff = self.edit_one_line_under(source, name)
             self.assertEqual(self.closure_check(head, diff), [], name)
@@ -29225,6 +29257,17 @@ class TestImpactHold(LedgerBase):
         import difflib
         diff = "\n".join(list(difflib.unified_diff(base.split("\n"), head.split("\n"), lineterm="", n=1))[2:])
         return sb.load_module("delegated_clear").closure_refusals(base, head, diff, ["root"], {"root"})
+
+    def test_a_class_the_clear_refers_to_runs_only_the_methods_it_reads_and_the_special_ones(self):
+        base = "class Source:\n    def __init__(self):\n        self.a = 1\n\n    def read(self):\n        return 1\n\n    def other(self):\n        return 2\n\nREGISTRY = (Source,)\n\ndef root():\n    return REGISTRY\n"
+        self.assertEqual(self.synthetic(base, base.replace("return 2", "return 3")), [], "a method nothing reads is not run")
+        self.assertTrue(self.synthetic(base, base.replace("self.a = 1", "self.a = 2")), "a special method of a class the clear refers to runs")
+        reader = base.replace("    return REGISTRY", "    return REGISTRY[0]().read()")
+        self.assertTrue(self.synthetic(reader, reader.replace("return 1", "return 9")), "a method the clear reads by name (an attribute) is in the closure")
+        self.assertEqual(self.synthetic(reader, reader.replace("return 2", "return 9")), [], "the other member still is not")
+        mutant = base.replace("    return REGISTRY", "    return REGISTRY, Source.other")
+        self.assertTrue(self.synthetic(mutant, mutant.replace("return 2", "return 3")), "a mutant that makes the clear read the other member refuses an edit to it")
+        self.assertTrue(self.synthetic(base, base.replace("REGISTRY = (Source,)", "REGISTRY = (Source, Other)")), "the binding the clear reads")
 
     def test_a_line_holding_two_statements_is_judged_by_both_and_a_dropped_reference_to_the_clear_is_refused(self):
         base = "def root():\n    return 1\n\nHARMLESS = 1\n\ndef other():\n    return root\n"

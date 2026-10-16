@@ -128,16 +128,25 @@ DEF_KINDS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 BIND_KINDS = (ast.Assign, ast.AnnAssign, ast.AugAssign)
 
 
+_RUNS_CODE = (ast.Call, ast.Lambda, ast.NamedExpr, ast.Await, ast.Yield, ast.YieldFrom, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+
 def import_time(node, number):
-    """True when line `number` of the definition `node` RUNS WHEN THE MODULE IS IMPORTED: a decorator, a signature (defaults, annotations, bases) or, in a class, anything that is not inside a method's body.
-    A function's own body does not run at import."""
+    """True when line `number` of the definition `node` RUNS CODE WHEN THE MODULE IS IMPORTED: a decorator, a default or an annotation that calls something (a plain name or constant only
+    binds, so a new function with a plain signature is not import-time code), or, in a class, anything that is not inside a method's body. A function's own body does not run at import.
+    A body that starts on the line its signature ends on is judged as the signature (the stricter way)."""
     if isinstance(node, ast.ClassDef):
         for child in node.body:
             if isinstance(child, DEF_KINDS) and _span(child)[0] <= number <= child.end_lineno:
                 return import_time(child, number)
         return True
-    header_end = max([node.lineno] + [x.end_lineno for x in ast.walk(node.args) if hasattr(x, "end_lineno")] + ([node.returns.end_lineno] if node.returns is not None else []) + [d.end_lineno for d in node.decorator_list])
-    return number <= header_end or number < node.body[0].lineno   # a body that starts on the line the signature ends on is not told apart from it: that line is import-time
+    args = node.args
+    header = list(node.decorator_list) + list(args.defaults) + [d for d in args.kw_defaults if d is not None] + ([node.returns] if node.returns is not None else [])
+    header += [a.annotation for a in args.posonlyargs + args.args + args.kwonlyargs + [x for x in (args.vararg, args.kwarg) if x] if a.annotation is not None]
+    header_end = max([node.lineno] + [x.end_lineno for x in ast.walk(args) if hasattr(x, "end_lineno")] + [h.end_lineno for h in header])
+    if node.decorator_list and number < node.lineno:
+        return True   # a decorator is applied (called) at import
+    return number <= header_end and any(isinstance(x, _RUNS_CODE) for h in header for x in ast.walk(h))
 
 
 def _span(node):
@@ -169,18 +178,20 @@ def _index(tree):
     return defs, binds
 
 
+def _is_dunder(name):
+    return name.startswith("__") and name.endswith("__")
+
+
 def closure(tree, roots):
-    """(def names, global names, referenced names) reachable from `roots` by NAME: every module-level definition a closure definition refers to (a call, a value, a default, a decorator, a
-    base class) and every module-level binding it reads, classes expanded WHOLE (every method). Over-approximate on purpose: dynamic dispatch by string is not followed (a stated limit)."""
+    """(def names, global names, referenced names, {class: methods}) reachable from `roots` by NAME: every module-level definition a closure definition refers to (a call, a value, a default, a
+    decorator, a base class) and every module-level binding it reads (its right-hand side, to a fixed point). A CLASS the closure refers to brings its own statements (bases, decorators, class
+    body) and only those methods whose name the closure reads (as a name or an attribute) or that are special methods (`__init__`, `__getattr__`, `__call__`...): a method nothing reads is not run.
+    Over-approximate by name on purpose (any attribute of that name); dynamic dispatch by string is not followed (a stated limit)."""
     defs, binds = _index(tree)
-    seen, globals_, refs, todo = set(), set(), set(), [r for r in roots]
-    while todo:
-        name = todo.pop()
-        if name in seen or name not in defs:
-            continue
-        seen.add(name)
-        nodes = [defs[name]]
-        while nodes:   # a binding the closure reads is walked too (its whole right-hand side, to a fixed point): `load = lambda: load_module("x")` and `thing = _Lazy()` lead to what they call
+    seen, globals_, refs, members, todo = set(), set(), set(), {}, [r for r in roots]
+
+    def walk(nodes):
+        while nodes:
             for x in ast.walk(nodes.pop()):
                 if isinstance(x, ast.Name):
                     refs.add(x.id)
@@ -189,7 +200,30 @@ def closure(tree, roots):
                     if x.id in binds and x.id not in globals_:   # a name that is a def AND is rebound (`f = wrap(f)`): both are followed
                         globals_.add(x.id)
                         nodes.extend(binds[x.id])
-    return seen, globals_, refs
+                elif isinstance(x, ast.Attribute):
+                    refs.add(x.attr)
+
+    while True:
+        while todo:
+            name = todo.pop()
+            if name in seen or name not in defs:
+                continue
+            seen.add(name)
+            node = defs[name]
+            if isinstance(node, ast.ClassDef):
+                members[name] = set()
+                walk([c for c in node.body if not isinstance(c, DEF_KINDS)] + list(node.bases) + list(node.keywords) + list(node.decorator_list))
+            else:
+                walk([node])
+        grew = False
+        for name in sorted(members):   # a method the closure reads by name (or a special method) is run
+            for method in defs[name].body:
+                if isinstance(method, DEF_KINDS) and method.name not in members[name] and (method.name in refs or _is_dunder(method.name)):
+                    members[name].add(method.name)
+                    walk([method])
+                    grew = True
+        if not grew and not todo:
+            return seen, globals_, refs, members
 
 
 def changed_lines(patch):
@@ -232,6 +266,7 @@ def closure_refusals(base_src, head_src, patch, roots, entry_points, module_leve
         return ["the daemon file does not parse before or after the change: refused"]
     base_closure, head_closure = closure(base, roots), closure(head, roots)
     in_defs, in_globals, in_refs = (base_closure[0] | head_closure[0]), (base_closure[1] | head_closure[1]), (base_closure[2] | head_closure[2])
+    in_members = {k: base_closure[3].get(k, set()) | head_closure[3].get(k, set()) for k in set(base_closure[3]) | set(head_closure[3])}
     reasons = []
     for side, tree, numbers in (("base", base, lines[0]), ("head", head, lines[1])):
         spans = [(_span(n), n) for n in tree.body]
@@ -244,9 +279,11 @@ def closure_refusals(base_src, head_src, patch, roots, entry_points, module_leve
             for owner in owners:
                 names = _bound_names(owner)
                 if isinstance(owner, DEF_KINDS):
-                    used = entry_points & {x.id for x in ast.walk(owner) if isinstance(x, ast.Name)}
-                    if owner.name in in_defs:
-                        reasons.append("it changes %s, part of the clear (%s file)" % (owner.name, side))
+                    method = next((c for c in owner.body if isinstance(c, DEF_KINDS) and _span(c)[0] <= number <= c.end_lineno), None) if isinstance(owner, ast.ClassDef) else None
+                    unit = method or owner   # a changed line inside one method is judged by that method, not by the whole class
+                    used = entry_points & {x.id for x in ast.walk(unit) if isinstance(x, ast.Name)}
+                    if owner.name in in_defs and (method is None or method.name in in_members.get(owner.name, set()) or owner.name in roots):
+                        reasons.append("it changes %s, part of the clear (%s file)" % (owner.name if method is None else "%s.%s" % (owner.name, method.name), side))
                     elif module_level and import_time(owner, number):
                         reasons.append("it changes import-time code of a module the clear loads (%s line %d, in %s): refused" % (side, number, owner.name))
                     elif used:
