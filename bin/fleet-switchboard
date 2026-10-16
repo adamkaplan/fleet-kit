@@ -479,7 +479,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "chat_clear", "temp_janitor", "load_alert", "source_budgets"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "chat_clear", "temp_janitor", "load_alert", "source_budgets", "hold_labels"}
 
 
 CONFIG_DECLARATION = re.compile(rb'^CONFIG_KEY[ \t]*=[ \t]*"([a-z][a-z0-9_]*)"[ \t]*(?:#.*)?$', re.M)
@@ -689,6 +689,7 @@ def validate_config(raw, source="config"):
     validate_plan_evaluators(config, source)  # #107: who may record a plan scenario's verdict
     validate_plan_gates_config(config, source)  # #107 slice 3a
     validate_plan_review_config(config, source)  # #109 part 2, R2
+    validate_hold_labels_config(config, source)  # #376
     return config
 
 
@@ -721,6 +722,21 @@ def validate_plan_review_config(config, source):
         if out[key] is not None and not isinstance(out[key], str):
             raise ConfigError("%s: 'plan_review.%s' must be text" % (source, key))
     config["plan_review"] = out
+
+
+def validate_hold_labels_config(config, source):
+    """`hold_labels`: per repository, the label the gh shim holds a pull request by (shims/gh_hold.py reads it live from this file). Absent means none."""
+    if config.get("hold_labels") is None:
+        config.pop("hold_labels", None)
+        return
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "shims", "gh_hold.py")
+    spec = importlib.util.spec_from_file_location("gh_hold_check", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    try:
+        module.validate_config(config["hold_labels"])
+    except ValueError as err:
+        raise ConfigError("%s: %s" % (source, err)) from None
 
 
 def validate_plan_gates_config(config, source):
@@ -18624,7 +18640,15 @@ def apply_impact_hold(engine, repo, number, report, record):
     bin/clear_carry.py). Returns the number of gh calls spent. The labels are ensured once per repo per process."""
     carry = impact_carry_decision(engine, repo, number, report["head"])   # reads GitHub: before, and outside, the lock
     with impact_state_lock(engine.state_dir):   # the clear check, the label write and the record are ONE step against an owner clear
-        return _apply_impact_hold_locked(engine, repo, number, report, record, carry)
+        spent = _apply_impact_hold_locked(engine, repo, number, report, record, carry)
+    if carry is not None and carry.get("carried"):   # told once the carry is RECORDED, outside the lock (a send is slow)
+        try:
+            recorded = read_impact_state(engine.state_dir)[0].get("carried", {}).get("%s#%d" % (repo, number)) or {}
+            if recorded.get("head") == report["head"]:
+                notify_clear(engine, "carry", repo, number, report["head"], previous=carry["from"], body=(record or {}).get("body"))
+        except Exception as err:   # the carry is recorded: nothing here may fail the pass
+            engine._note("gate.clear_notify_failed", "%s#%d" % (repo, number), {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
+    return spent
 
 
 def _consume_record(state, pr, clear=None):
@@ -18776,6 +18800,126 @@ def neutralise_marker(engine, runner, repo, number, head, first=None):
         return failed(err)
 
 
+CLEAR_NOTIFIED_FILE = "clear-notified.json"
+CLEAR_NOTIFIED_MAX = 400
+_PLAN_ISSUE_RE = re.compile(r"github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(?:issues|pull)/([0-9]+)")
+
+
+def clear_lane(engine, repo, number, body):
+    """(lane, how): the orchestrator that merges the pull request, or (None, None) when it cannot be told (never a guess). In order: the agent that recorded the pull request's notice (or, when
+    that is a worker, its boss; or the boss the notice recorded), then the `PLAN:` link of the body up to the charter that owns the ask. Only a running orchestrator counts."""
+    discovery = engine.discover(engine.now())
+    agents = discovery.agents
+    item = next((i for i in read_pr_notices(engine.state_dir) if i["repo"] == repo and i["number"] == number), None) if engine.state_dir is not None else None
+    if item:
+        for name in notice_senders(item)[::-1] + ([item["boss"]] if isinstance(item.get("boss"), str) else []):
+            agent = agents.get(name)
+            if agent is None:
+                continue
+            lane = name if _is_orchestrator(agent) else boss_name(discovery, agent)
+            if lane in agents and _is_orchestrator(agents[lane]):
+                return lane, "the notice"
+    found = PLAN_LINE_RE.search(body or "")
+    link = _PLAN_ISSUE_RE.search(found.group(1)) if found else None
+    reader = getattr(engine, "intents", None)
+    if link and link.group(1) == repo and reader is not None:
+        chain, current = [int(link.group(2))], int(link.group(2))
+        try:
+            for _ in range(3):
+                current = reader.parent(current, repo)
+                if current is None:
+                    break
+                chain.append(current)
+        except IntentError:
+            pass   # the chain so far is all that can be told
+        owner = pick_owner(agents, chain, repo, engine.config.get("intent_repo") if len(getattr(engine, "watches", ()) or ()) > 1 else None)
+        if owner and _is_orchestrator(agents[owner]):
+            return owner, "the PLAN link"
+    return None, None
+
+
+def _notify_clear_body(engine, abandoned, kind, repo, number, head, reason=None, body=None, previous=None):
+    """(the work of `notify_clear`, run on its own thread; `abandoned` is set when the caller gave up waiting: then nothing more is audited) #541: tell the Chief of Staff, and the orchestrator whose lane merges the pull request, at once that the owner cleared it (`kind` "clear": his command or his words in the chat, called
+    ONCE from `impact_clear_core`) or that his clear carried to a new head (`kind` "carry": from `previous`, called once from the carry decision). One line. Once per pull request, head and kind (a
+    small private file). The caller has already RECORDED the clear; nothing here can undo it: a failure is audited and swallowed. An unknown lane says `lane unknown` and only the Chief of Staff is told:
+    nobody is guessed. Returns the audit detail it wrote, or None when nothing was sent."""
+    pr = "%s#%d" % (repo, number)
+    try:
+        if engine.state_dir is None or engine.audit is None:
+            return None
+        key = "%s@%s:%s" % (pr, head, kind)
+        with impact_state_lock(engine.state_dir):   # the command and the daemon are two processes: the check and the mark are one step (the send is outside it)
+            seen = _read_small(engine.state_dir, CLEAR_NOTIFIED_FILE)
+            if key in seen:
+                return None
+            seen[key] = {"at": int(engine.now())}
+            if len(seen) > CLEAR_NOTIFIED_MAX:
+                for old in sorted(seen, key=lambda k: seen[k].get("at", 0))[:len(seen) - CLEAR_NOTIFIED_MAX]:
+                    del seen[old]
+            _write_small(engine.state_dir, CLEAR_NOTIFIED_FILE, seen)   # before the send: at most once, even when the send fails
+        lane, how = clear_lane(engine, repo, number, body)
+        if kind == "carry":
+            line = "owner's clear carried %s from %s to %s; %s" % (pr, (previous or "?")[:8], head[:8], "%s merges it" % lane if lane else "lane unknown")
+        else:
+            flat = re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", re.sub(r"[\n\r\t]", " ", reason or ""))   # line breaks become spaces, other control characters vanish BEFORE the redaction: a token cannot hide behind one
+            words = " ".join(redact_command_text(flat).split())
+            line = "owner cleared %s at %s: \"%s\"; %s" % (pr, head[:8], plan_ledger.clip(words, 300), "%s merges it" % lane if lane else "lane unknown")
+        sent, failed = [], []
+        for name in ["chief-of-staff"] + ([lane] if lane else []):
+            try:
+                outcome = engine.send("switchboard", name, line)
+                if isinstance(outcome, dict) and outcome.get("sent") is False:
+                    failed.append("%s: %s" % (name, _one_line(str(outcome.get("reason") or outcome.get("action") or "not delivered"), 100)))
+                else:
+                    sent.append(name)
+            except Exception as err:   # a send that fails never undoes the clear
+                failed.append("%s: %s" % (name, _one_line(str(err), 100)))
+        detail = {"head": head, "kind": kind, "lane": lane, "lane_from": how, "sent": sent}
+        if failed:
+            detail["failed"] = failed
+        if not abandoned.is_set():
+            engine.audit.append(engine.actor, "gate.clear_notified" if sent else "gate.clear_notify_failed", pr, detail)
+        return detail
+    except BaseException as err:   # on this thread nothing may escape, an exit or an interrupt inside a send included
+        try:
+            if not abandoned.is_set():
+                engine.audit.append(engine.actor, "gate.clear_notify_failed", pr, {"head": head, "kind": kind, "error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
+        except Exception:
+            pass
+        return None
+
+
+NOTIFY_CLEAR_DEADLINE_SECONDS = 2.0   # the most a clear waits for its notice
+
+
+def notify_clear(engine, kind, repo, number, head, reason=None, body=None, previous=None):
+    """#541: the notice of an owner clear (or of a carry), LAST, after everything else of it is done and bounded by a deadline: the work (lane lookup, sends) runs on its own thread and the
+    caller waits at most NOTIFY_CLEAR_DEADLINE_SECONDS. On a timeout, an interrupt or an exception it gives up, audits `gate.clear_notify_failed` once with the reason, and returns None: the clear's
+    result, exit status and output are exactly as without a notice. (A send still running when it gives up is left to finish on its daemon thread; it audits nothing more.)"""
+    pr = "%s#%d" % (repo, number)
+    abandoned, result = threading.Event(), []
+
+    def work():
+        result.append(_notify_clear_body(engine, abandoned, kind, repo, number, head, reason, body, previous))
+    worker = threading.Thread(target=work, name="clear-notice", daemon=True)
+    why = None
+    try:
+        worker.start()
+        worker.join(NOTIFY_CLEAR_DEADLINE_SECONDS)
+        if worker.is_alive():
+            why = "timed out after %gs" % NOTIFY_CLEAR_DEADLINE_SECONDS
+    except BaseException as err:   # an interrupt while waiting: the clear is already complete
+        why = "interrupted (%s)" % type(err).__name__
+    if why is None:
+        return result[0] if result else None
+    abandoned.set()
+    try:
+        engine.audit.append(engine.actor, "gate.clear_notify_failed", pr, {"head": head, "kind": kind, "error": "notice not sent: " + why})
+    except BaseException:
+        pass
+    return None
+
+
 def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, head=None, via=None, verify=None):
     """The owner's clear: record it head-bound (the daemon does not re-add the hold for that head) and remove `hold-impact`, and
     `merge-captain` too when the switchboard itself added it for this hold. Returns the lines to print.
@@ -18830,7 +18974,9 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
         if fingerprint is not None:
             detail["fingerprint"] = fingerprint
         engine.audit.append(engine.actor, "gate.hold_cleared", pr, detail)   # inside the lock
-    return ["cleared the impact hold of %s at %s: removed %s; the daemon will not re-add it for this head" % (pr, head_now[:8], ", ".join(remove))] + neutralise_marker(engine, runner, repo, number, head_now, raw)
+    lines = ["cleared the impact hold of %s at %s: removed %s; the daemon will not re-add it for this head" % (pr, head_now[:8], ", ".join(remove))] + neutralise_marker(engine, runner, repo, number, head_now, raw)
+    notify_clear(engine, "clear", repo, number, head_now, reason=reason, body=raw.get("body"))   # LAST: the state, the labels, the marker line and the audit are all done; it can neither delay nor alter them
+    return lines
 
 
 def cmd_impact_clear(args, runner, now):
