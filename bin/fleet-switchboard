@@ -6651,8 +6651,9 @@ class HeadlessRestartFacts:
             return []
         state = engine.state_dir
         try:
-            records, _ = load_agent_presence().scan_records(state)
-        except Exception:
+            records, unread = load_agent_presence().scan_records(state)
+        except Exception as err:
+            engine._note("source.error", "headless_restart_facts", {"error": "the headless records could not be read: %s" % _one_line(str(err), 100)})
             return []
         remembered = _read_small(state, HEADLESS_SERVICE_FILE)
         service, bosses = dict(remembered.get("service") or {}), dict(remembered.get("bosses") or {})
@@ -6668,6 +6669,9 @@ class HeadlessRestartFacts:
             if boss is not None and bosses.get(name) != boss:
                 bosses[name] = boss
                 changed = True
+        for gone in [n for n in bosses if n not in created] if not unread else []:   # a worker with no record any more (retired) is forgotten: the file does not grow for ever
+            del bosses[gone]
+            changed = True
         if changed:
             try:
                 _write_small(state, HEADLESS_SERVICE_FILE, {"service": service, "bosses": bosses})

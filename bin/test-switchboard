@@ -38473,11 +38473,85 @@ class TestHeadlessRestartNotice(Base):
         lost = [f for f in self.engine.collect_facts()[0] if f.kind == "headless.lost"]
         self.assertEqual([(f.recipient, "no longer exists" in f.summary, "w1" in f.summary) for f in lost], [("boss", True, True)])
 
+    def test_a_lost_worker_with_no_remembered_boss_goes_to_the_chiefs_of_staff_once_and_a_forgotten_boss_is_pruned(self):
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        sid = self.worker("w1")
+        del self.world.v2.sessions[sid]                                   # gone before any pass ever saw it: no boss is remembered
+        lost = [f for f in (self.engine.discover(self.world.clock.now()) and self.engine.collect_facts()[0]) if f.kind == "headless.lost"]
+        self.assertEqual([f.recipient for f in lost], ["cos"])
+        self.assertEqual(len({f.key for f in lost}), 1, "one key per session: delivered once")
+        other = self.worker("w2")
+        self.notices()
+        remembered = json.loads((Path(self.world.state) / sb.HEADLESS_SERVICE_FILE).read_text())
+        self.assertEqual(remembered["bosses"], {"w2": "boss"})
+        self.ap.remove_record(self.world.state, "w2")                    # retired: its record goes, and so does the remembered boss
+        self.notices()
+        self.assertEqual(json.loads((Path(self.world.state) / sb.HEADLESS_SERVICE_FILE).read_text())["bosses"], {})
+
+    def test_a_state_file_that_cannot_be_written_is_said_and_the_restart_notice_still_goes_out(self):
+        self.worker("w1")
+        self.notices()
+        self.pid[0] = 200
+        with mock.patch.object(sb, "_write_small", side_effect=OSError("disk full")):
+            self.engine.discover(self.world.clock.now())
+            facts = [f for f in self.engine.collect_facts()[0] if f.kind == "headless.restarted"]
+        self.assertEqual(len(facts), 1)
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "source.error" and "headless_restart_facts" in str(e)])
+
     def test_a_service_that_does_not_answer_never_makes_a_worker_lost(self):
         self.worker("w1")
         self.notices("headless.lost")
         self.world.v2.down = True
         self.assertEqual(self.notices("headless.lost"), [])
+
+
+class TestServiceIdentity(unittest.TestCase):
+    """#433 slice 4: the REAL fresh read of the service's process id (`V2Http.service_identity`), over a temp service file."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.dir), True)
+        self.dir.chmod(0o700)
+        self.file = self.dir / "service.json"
+        self.alive = {111: True, 222: True}
+        self.http = sb.V2Http(self.file, 5, alive=lambda pid: self.alive.get(pid, False))
+
+    def write(self, pid, mode=0o600, password="s3cret-value"):
+        body = {"url": "http://127.0.0.1:49374", "password": password}
+        if pid is not None:
+            body["pid"] = pid
+        self.file.write_text(json.dumps(body))
+        self.file.chmod(mode)
+
+    def test_a_changed_pid_is_seen_on_the_next_call_and_nothing_is_cached(self):
+        self.write(111)
+        self.assertEqual(self.http.service_identity(), 111)
+        self.http.base_url()                                              # a cached connection record exists now
+        self.write(222)
+        self.assertEqual(self.http.service_identity(), 222, "a fresh read, not the cached one")
+
+    def test_a_missing_unsafe_dead_or_odd_pid_gives_none_and_the_password_is_never_returned(self):
+        self.assertIsNone(self.http.service_identity(), "no file")
+        self.write(111, mode=0o644)
+        self.assertIsNone(self.http.service_identity(), "a file others can read is not trusted")
+        self.write(333)
+        self.assertIsNone(self.http.service_identity(), "a pid that is gone")
+        self.write(True)
+        self.assertIsNone(self.http.service_identity(), "a bool is not a pid")
+        self.write(None)
+        self.assertIsNone(self.http.service_identity(), "no pid in the file")
+        self.write(111)
+        self.assertNotIn("s3cret", repr(self.http.service_identity()))
+        self.dir.chmod(0o777)
+        self.assertIsNone(self.http.service_identity(), "a directory others can write is not trusted")
+        self.dir.chmod(0o700)
+
+    def test_load_still_connects_with_the_same_checks(self):
+        self.write(111)
+        self.assertEqual(self.http.base_url(), "http://127.0.0.1:49374")
+        self.write(333)
+        self.http._info = None
+        self.assertIsNone(self.http.base_url(), "a service file naming a dead process is still refused")
 
 
 class TestEscalateARequestOrAReport(WriteWorld):
