@@ -8867,6 +8867,44 @@ def mark_escalated(state_dir, key, when):
         write_escalated(state_dir, found)
 
 
+BATCH_NOTES_FILE = "batch-notes.json"
+BATCH_NOTES_KEEP = 100
+
+
+def batch_note_key(repo, number, text):
+    return "%s#%d:%s" % (repo, number, hashlib.sha256(text.encode("utf-8")).hexdigest()[:16])
+
+
+def read_batch_notes(state_dir):
+    """{"<repo>#<n>:<digest of the note>": iso time} of the answer notes already delivered. A DISPOSABLE file: it only stops a re-run of an answer
+    (the note went, the comment did not) from sending the same note again. Missing or unreadable reads as empty (then the note is sent again)."""
+    try:
+        raw = json.loads((Path(state_dir) / BATCH_NOTES_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in raw.items() if isinstance(k, str) and isinstance(v, str)} if isinstance(raw, dict) else {}
+
+
+def mark_batch_note(state_dir, key, when):
+    found = read_batch_notes(state_dir)
+    found[key] = iso(when)
+    kept = dict(sorted(found.items(), key=lambda kv: kv[1])[-BATCH_NOTES_KEEP:])
+    path = Path(state_dir) / BATCH_NOTES_FILE
+    temp = path.with_name("%s.%d.tmp" % (BATCH_NOTES_FILE, os.getpid()))
+    fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(kept, handle, indent=1, sort_keys=True)
+            handle.write("\n")
+        os.replace(str(temp), str(path))
+    except BaseException:
+        try:
+            os.unlink(str(temp))
+        except OSError:
+            pass
+        raise
+
+
 def captain_escalations_to_keep(engine):
     """The escalations of `MERGE: captain` PR decisions that must survive a pass in which the PR could not be judged: those
     whose notice is still on file. An unreadable PR (a restart's first passes, a 404 under the wrong account, an outage) derives
@@ -28045,9 +28083,12 @@ def answer_batch(engine, runner, decision, args, name):
     if raised and name:
         text = "Batch %s (%s#%d) is answered: %s. The record is the comment on it; you act on it, nothing was done to " \
                "the row issues." % (ident, repo, number, "as recommended" if not changed else "%d row(s) changed" % changed)
+        note_key = batch_note_key(repo, number, text) if engine.state_dir is not None else None
+        if note_key is not None and note_key in read_batch_notes(engine.state_dir):
+            raised = None                  # this very note went on an earlier run whose comment failed: not sent a second time
         try:
             outcome = ReportSendDelivery(engine).deliver(decision, {"by": name, "to": raised, "text": text,
-                                                                    "ask": number, "repo": repo})
+                                                                    "ask": number, "repo": repo}) if raised else {"sent": True}
         except Exception as err:
             raise DecisionError("%s was not answered: the note to %s could not be delivered (%s); its labels stay, the "
                                 "batch stays with the Chief of Staff, nothing was commented. Run the same answer again "
@@ -28056,7 +28097,12 @@ def answer_batch(engine, runner, decision, args, name):
             raise DecisionError("%s was not answered: the note to %s was not delivered (%s); its labels stay, the batch "
                                 "stays with the Chief of Staff, nothing was commented. Run the same answer again once "
                                 "%s can be reached" % (ident, raised, outcome.get("reason") or outcome.get("action"), raised))
-        told = "; told %s" % raised
+        if raised and note_key is not None:
+            try:
+                mark_batch_note(engine.state_dir, note_key, engine.now())
+            except OSError:
+                pass
+        told = "; told %s" % raised if raised else "; already told %s" % decision.get("raised_by")
     IssueDelivery(engine, runner).deliver(decision, {
         "repo": repo, "number": number, "add": (), "remove": [awaiting_cos_label(engine.config), awaiting_label(engine.config)],
         "author": name, "comment": "\n".join(lines), "comment_first": True})

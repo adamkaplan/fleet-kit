@@ -38513,6 +38513,19 @@ class TestBatchAnswer(BatchWorld):
         self.assertNotEqual(code, 0, "answered: nothing is waiting")
         self.assertEqual(len(self.gh.comments), 1)
 
+    def test_a_note_that_went_before_the_comment_failed_is_not_sent_again_when_the_answer_is_run_again(self):
+        notes = lambda: len([a for a in self.world.admissions("api-orch") if "is answered" in str(a)])
+        with mock.patch.object(sb.IssueDelivery, "deliver", side_effect=sb.DecisionError("gh is down")):
+            code, out, err = self.answer("--as-recommended")
+        self.assertNotEqual(code, 0, out)
+        self.assertEqual((notes(), self.gh.comments), (1, []), "the note went, the comment did not")
+        code, out, err = self.answer("--as-recommended")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(notes(), 1, "the re-run sends no second note")
+        self.assertIn("already told api-orch", out)
+        self.assertEqual(len(self.gh.comments), 1)
+        self.assertEqual(self.gh.names(*self.batch), [])
+
     def test_bad_answers_are_refused_and_write_nothing(self):
         for argv, why in ((("--row", "4=x"), "does not exist"), (("--row", "0=x"), "does not exist"),
                           (("--row", "1=a", "--row", "1=b"), "twice"), (("--row", "x"), "not a row answer"),
