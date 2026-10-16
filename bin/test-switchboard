@@ -14178,7 +14178,9 @@ class TestHeadlessPresence(Base):
     def test_a_headless_launch_for_a_mapped_repo_is_accepted_when_the_route_is_proved_and_no_token_is_kept_anywhere(self):
         self.mapped_route()
         done = self.launch_hl(name="mapped", repo="acme-org/widget-api")
-        self.assertIn("acme-bot", done["identity"])
+        self.assertIn("set up to act as the gh account acme-bot", done["identity"])
+        self.assertIn("record resolves to that repo", done["identity"], "the line that only the proof returns, so a launch that never proved fails")
+        self.assertIn("NOT checked", done["identity"])
         self.assertEqual(self.world.v2.sessions[done["session"]]["metadata"]["fleet"]["repo"], "acme-org/widget-api")
         self.assertEqual(len([m for m in self.world.v2.sessions[done["session"]]["messages"] if m["type"] == "user"]), 1, "the brief was sent")
         blob = json.dumps([done, self.world.v2.sessions[done["session"]], self.ap.load_record(self.world.state, "mapped")], default=str)
@@ -14206,17 +14208,22 @@ class TestHeadlessPresence(Base):
         def down(sid):
             raise sb.V2Error("unreachable", None)
         self.engine.v2.session_get = down
-        with self.assertRaises(sb.LaunchError):
+        with self.assertRaises(sb.LaunchError) as raised:
             self.launch_hl(name="down", repo="acme-org/widget-api")
+        self.assertIn("session lookup failed", str(raised.exception))
         self.engine.v2.session_get = real_get
         self.assertEqual(set(self.world.v2.sessions) - before, set())
 
-    def test_the_route_proof_gives_the_same_answer_after_a_service_restart_because_it_reads_the_session_record_not_service_memory(self):
+    def test_the_route_proof_reads_the_session_record_and_no_per_session_environment_so_nothing_depends_on_service_memory(self):
         self.mapped_route()
         done = self.launch_hl(name="again", repo="acme-org/widget-api")
         for _ in range(2):   # the second read stands for the answer of a new service process: the record, never a per-session environment
             self.assertIn("acme-bot", sb.prove_headless_route(self.engine, done["session"], "again", "acme-org/widget-api", "acme-bot"))
         self.assertNotIn("environment", self.world.v2.sessions[done["session"]])
+        self.world.v2.sessions[done["session"]]["metadata"]["fleet"]["repo"] = "other-org/thing"   # a record that maps to no (or another) account
+        with self.assertRaises(sb.LaunchError) as raised:
+            sb.prove_headless_route(self.engine, done["session"], "again", "acme-org/widget-api", "acme-bot")
+        self.assertIn("other-org/thing", str(raised.exception))
 
     def test_a_mapped_repo_with_no_route_check_keeps_the_shipped_refusal_and_the_shim_check_names_what_is_missing(self):
         self.engine.accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5, "gh_users": {"acme-org/*": "acme-bot"}}, self.world.route, self.world.clock.now, environ={})
@@ -14231,6 +14238,10 @@ class TestHeadlessPresence(Base):
             for tool in ("gh", "git"):
                 (Path(d) / tool).write_text("#!/bin/sh\n"); os.chmod(Path(d) / tool, 0o755)
             self.assertIsNone(sb.shim_route_problem({"FLEET_SWITCHBOARD_SHIMS": d}))
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "gh").write_text("#!/bin/sh\n"); os.chmod(Path(d) / "gh", 0o755)
+            (Path(d) / "git").write_text("#!/bin/sh\n"); os.chmod(Path(d) / "git", 0o644)   # present, not executable
+            self.assertIn("git shim", sb.shim_route_problem({"FLEET_SWITCHBOARD_SHIMS": d}))
         self.assertIn("absolute", sb.shim_route_problem({"FLEET_SWITCHBOARD_SHIMS": "rel"}))
 
     def test_the_named_account_refusal_holds_for_every_spelling_of_a_mapped_repo_exact_and_wildcard_with_a_default_token_set(self):

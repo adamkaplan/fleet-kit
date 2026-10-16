@@ -6090,7 +6090,7 @@ def launch_headless(engine, name, agent, directory, role=None, reports_to=None, 
                 if brief:
                     send_brief(engine, name, session_id, brief)
                 if engine.audit is not None:
-                    engine.audit.append(engine.actor, "headless.launched", name, {"session": session_id, "agent": agent, "directory": _one_line(directory, 160), "brief_chars": len(brief or "")})
+                    engine.audit.append(engine.actor, "headless.launched", name, {"session": session_id, "agent": agent, "directory": _one_line(directory, 160), "brief_chars": len(brief or ""), "account": account or None, "repo": repo, "route": "shims+record" if account else None})
             except Exception as err:
                 cleaned = undo_headless_launch(engine, ap, name, session_id)
                 raise LaunchError("%s (%s)" % (_one_line(str(err)), cleaned)) from err
@@ -6124,7 +6124,7 @@ def headless_identity(engine, repo):
                 raise LaunchError("a headless worker cannot work as the gh account %s that gh_users maps %s to: its tools run in the OpenCode service's environment, "
                                   "which cannot be pinned to an account, and the per-command route that would choose it cannot be proved (%s). "
                                   "Use a terminal launch (omit --headless)" % (account, repo, problem))
-            return "this headless worker acts as the gh account %s for %s (the gh and git shims choose it per command; unproved until the session exists)" % (account, repo)
+            return "this headless worker is set up to act as the gh account %s for %s (the gh and git shims choose it per command; the service side is not checked yet)" % (account, repo)
         problem = launch_account_problem(engine.config, accounts, repo)
         if problem:
             raise LaunchError(problem)
@@ -6153,7 +6153,7 @@ def shim_route_problem(environ=None, home=None):
 
 
 def prove_headless_route(engine, session_id, name, repo, account):
-    """The same lookup the gh shim makes from a command of the new session (`whoami --json`: its OPENCODE_SESSION_ID, then the repo in the service's
+    """A best-effort check, NOT a proof of the service side: the same lookup the gh shim makes from a command of the new session (`whoami --json`: its OPENCODE_SESSION_ID, then the repo in the service's
     own record of that session) must name this worker and this repo, and the map must give the repo's account. Names only, never a token. Raises
     LaunchError (the caller deletes the session) when it does not."""
     try:
@@ -6163,7 +6163,9 @@ def prove_headless_route(engine, session_id, name, repo, account):
     seen = (fleet or {}).get("repo")
     if (fleet or {}).get("name") != name or not isinstance(seen, str) or engine.accounts.account_for(seen) != account:
         raise LaunchError("a headless worker cannot be proved to act as the gh account %s for %s: the service's record of the session names %s as its repo" % (account, repo, seen or "none"))
-    return "this headless worker acts as the gh account %s for %s (proved: the session resolves to that repo; the shims choose the account per command)" % (account, repo)
+    return ("this headless worker is set up to act as the gh account %s for %s: the shims are present on the launcher's side and the session record resolves to that repo. "
+            "NOT checked: that the OpenCode service runs the fleet-hooks plugin (it cannot be probed without a model turn), and a tool that reads a token from its own "
+            "environment bypasses the shims. A terminal launch is the boundary" % (account, repo))
 
 
 def undo_headless_launch(engine, ap, name, session_id):
