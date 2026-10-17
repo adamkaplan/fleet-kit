@@ -22025,7 +22025,8 @@ def cmd_preflight_pr(args, runner, now):
         for name, ceiling, commands, under in PREFLIGHT_CLASSES:
             if under is not None and changed is not None and not any(path.startswith(under) for path in changed):
                 continue
-            env = dict(os.environ, FLEET_HEAVY_MAX_SECONDS=str(ceiling))
+            env = dict(os.environ, FLEET_HEAVY_MAX_SECONDS=str(ceiling))   # the ceiling runs INSIDE the slot (heavy's watchdog starts when the slot is granted): a wait in the queue is never a timeout
+            sys.stderr.write("preflight-pr: %s: waiting for a slot, then running (ceiling %ds once running)\n" % (name, ceiling))
             if under is not None:
                 scratch = os.path.join(work, ("tok_" + "x" * PREFLIGHT_TOKEN_LENGTH)[:PREFLIGHT_TOKEN_LENGTH])
                 os.makedirs(scratch, exist_ok=True)
@@ -22033,18 +22034,21 @@ def cmd_preflight_pr(args, runner, now):
             started, verdict, tail = now(), "PASS", ""
             for command in commands:
                 try:
-                    done = runner([sys.executable, os.path.abspath(__file__), "heavy", "--"] + list(command), cwd=root, env=env, capture_output=True, text=True, timeout=ceiling + 30)
-                except subprocess.TimeoutExpired:
+                    done = runner([sys.executable, os.path.abspath(__file__), "heavy", "--"] + list(command), cwd=root, env=env, capture_output=True, text=True)
+                except subprocess.TimeoutExpired:   # only a runner of its own making raises this: heavy has no outer clock here
                     verdict, tail = "FAIL", "timed out after %ds" % ceiling
                     break
                 if done.returncode == 124:
-                    verdict, tail = "FAIL", "timed out after %ds" % ceiling
+                    verdict, tail = "FAIL", "timed out after %ds running" % ceiling
+                    break
+                if done.returncode == 75:
+                    verdict, tail = "NOSLOT", "no heavy slot came in time (the tests did not run)"
                     break
                 if done.returncode != 0:
                     verdict, tail = "FAIL", "exit %d: %s" % (done.returncode, _one_line(" ".join(command), 80))
                     sys.stderr.write("".join(("%s: %s\n" % (name, line)) for line in ((done.stdout or "") + (done.stderr or "")).splitlines()[-15:]))
                     break
-            failed += verdict == "FAIL"
+            failed += verdict != "PASS"
             print("%s %s (%ds)%s" % (verdict, name, max(0, int(now() - started)), (": " + tail) if tail else ""))
     return EXIT_ERROR if failed else EXIT_OK
 

@@ -61796,6 +61796,42 @@ class TestPreflightPr(unittest.TestCase):
         self.assertEqual([l for l in lines if l.startswith("FAIL")].__len__(), 1)
         self.assertTrue([l for l in lines if l.startswith("FAIL")][0].startswith("FAIL public-names"))
 
+    def test_a_slot_wait_is_never_a_timeout_and_the_ceiling_runs_inside_the_slot(self):
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append((list(argv), kwargs))
+            done = mock.Mock(returncode=0, stdout="/work/repo\n" if argv[:2] == ["git", "rev-parse"] else "abc\n" if argv[:2] == ["git", "merge-base"] else "", stderr="")
+            if "heavy" in argv:
+                done.returncode = 75   # all slots held: heavy gave up waiting
+            return done
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = sb.cmd_preflight_pr(None, runner, time.time)
+        self.assertEqual(code, 1)
+        self.assertNotIn("timed out", out.getvalue())
+        self.assertIn("no heavy slot", out.getvalue())
+        self.assertIn("waiting for a slot", err.getvalue())
+        for argv, kwargs in calls:
+            if "heavy" in argv:
+                self.assertNotIn("timeout", kwargs)   # no outer clock around the queue
+                self.assertIn("FLEET_HEAVY_MAX_SECONDS", kwargs["env"])
+
+    def test_exit_124_from_the_heavy_watchdog_is_a_timeout_line_with_its_ceiling(self):
+        code, lines, calls = self.run_preflight(["x"])
+        self.assertEqual({c[1]["env"]["FLEET_HEAVY_MAX_SECONDS"] for c in calls if "heavy" in c[0]}, {"240", "60"})
+        calls_124 = []
+
+        def runner(argv, **kwargs):
+            done = mock.Mock(returncode=124 if "heavy" in argv else 0, stdout="/r\n", stderr="")
+            return done
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = sb.cmd_preflight_pr(None, runner, time.time)
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL cli-surface", out.getvalue())
+        self.assertIn("timed out after 240s running", out.getvalue())
+
     def test_s2_a_class_over_its_ceiling_says_it_timed_out(self):
         code, lines, _ = self.run_preflight(["x"], timing_out=("TestHygiene",))
         self.assertEqual(code, 1)
