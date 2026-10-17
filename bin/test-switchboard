@@ -21727,12 +21727,13 @@ class TestSweep(Base):
         self.assertEqual(len(self.sweep([report, self.human(33, "captain")])), 2)
         self.assertEqual(self.hub.single, [("acme/api", "issues/33")])
 
-    def test_s4_a_closed_issue_that_still_carries_the_persons_label_is_not_withdrawn(self):
+    def test_s4_a_closed_issue_that_still_carries_the_persons_label_is_withdrawn_like_any_other(self):   # #570: it used to be kept, listed on purpose
         self.hub.closed = {30, 31, 32}
         closed_but_labelled = dict(self.human(30), closed=True)
         kept = self.sweep([closed_but_labelled, self.human(31), self.human(32, "captain")])
-        self.assertEqual([d["ask"] for d in kept], [30], "only the one listed on purpose stays; the others are withdrawn as before")
-        self.assertNotIn(("acme/api", "issues/30"), self.hub.single, "no read is spent on it")
+        self.assertEqual([d["ask"] for d in kept], [], "a closed issue is no decision: withdrawn like the others (the list never holds one now)")
+        self.assertIn(("acme/api", "issues/30"), self.hub.single, "it is read like any other, and found closed")
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "sweep.withdrawn"]), 3, "each of the 3 is withdrawn and audited")
 
     def test_s4_a_decision_whose_issue_is_closed_is_withdrawn_and_audited_once(self):
         self.hub.closed = {30}
@@ -23734,6 +23735,13 @@ class TestCaptainSweepFindings(TestSweep):
         self.hub.live = {70: sweep_issue(70, "x", [], pr=True)}
         self.sweep()
         self.assertEqual([f for f in self.found() if f[0] == "S9"], [])
+
+    def test_s7_a_closed_issue_that_carried_an_awaiting_label_raises_no_waiting_finding(self):   # #570
+        self.hub.closed_records = {96: sweep_issue(96, "x", [self.USER], pr=False)}
+        self.hub.closed = {96}
+        self.sweep()
+        self.sweep()
+        self.assertEqual([f for f in self.found() if f[1] == "acme/api#96"], [], "0 findings name the closed issue")
 
     def test_s9_a_merged_pr_is_no_finding_and_a_closed_unmerged_one_still_is(self):
         captain = self.USER.replace("awaiting-user", "merge-captain")
@@ -31370,18 +31378,74 @@ class TestDecisionsFromGitHub(Base):
         self.assertEqual(self.derive()[0], [])
         self.assertEqual(len(self.gh.api_calls), calls)
 
-    def test_a_closed_issue_that_keeps_the_persons_label_stays_marked_closed_and_leaves_with_the_label(self):
+    def test_the_catch_up_read_asks_for_open_issues_only(self):
+        self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
+        self.rig.pump(15)
+        reads = [p for p in self.gh.api_calls if "awaiting-user" in p]
+        self.assertTrue([p for p in reads if "state=open" in p], reads)
+        self.assertFalse([p for p in reads if "state=all" in p], reads)   # #570: it used to ask for state=all for the person's label
+
+    def closed_pass(self, runner=None):
+        """One run of the closed-issue pass on the rig's hub: the fresh read of every closed event it holds (bin/closed_labels.py)."""
+        engine = self.world.engine
+        engine.gh_runner = runner or FakeMergedGh()
+        closed_labels = sb.load_module("closed_labels")
+        ns = types.SimpleNamespace(**{n: getattr(sb, n) for n in closed_labels.NEEDS})
+        return closed_labels.run_pass(ns, engine, self.world.clock.now(), sb.IMPACT_PASS_CALLS)
+
+    def close_event(self, issue):
+        issue["state"] = "closed"
+        self.gh.send("issues", {"action": "closed", "issue": dict(issue)})
+
+    def test_a_closed_issue_leaves_the_list_when_a_fresh_read_says_it_is_closed_and_not_before(self):   # #570
         issue = self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
         self.rig.pump(15)
         self.assertEqual(len(self.derive()[0]), 1)
-        issue["state"] = "closed"
-        self.gh.send("issues", {"action": "closed", "issue": dict(issue)})
-        (entry,) = self.derive()[0]
-        self.assertEqual((entry["tier"], entry.get("closed")), ("human", True))
-        self.assertTrue(entry["headline"].endswith("(closed)"))
-        issue["labels"] = []
-        self.gh.send("issues", {"action": "unlabeled", "issue": dict(issue)})
-        self.assertEqual(self.derive()[0], [])
+        self.close_event(issue)
+        self.assertEqual(len(self.derive()[0]), 1, "the event payload alone drops nothing: a late or replayed event must not hide a decision")
+        self.closed_pass()
+        self.assertEqual(self.derive()[0], [], "the fresh read says closed: it leaves the list, whatever label it still carries")
+
+    def test_a_reopened_issue_stays_listed_even_though_a_closed_event_was_seen(self):
+        issue = self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
+        self.rig.pump(15)
+        self.close_event(issue)
+        issue["state"] = "open"   # reopened before the pass looks
+        self.gh.send("issues", {"action": "reopened", "issue": dict(issue)})
+        self.closed_pass()
+        self.assertEqual([d["ask"] for d in self.derive()[0]], [7], "the current read says open: still listed")
+
+    def test_a_replayed_old_closed_event_after_a_reopen_hides_nothing(self):
+        issue = self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
+        self.rig.pump(15)
+        stale = dict(issue, state="closed")
+        self.gh.send("issues", {"action": "closed", "issue": stale})
+        self.closed_pass()   # the issue is open: nothing happens
+        self.world.tick(60)
+        self.gh.send("issues", {"action": "closed", "issue": stale})   # the same old event again
+        self.closed_pass()
+        self.assertEqual([d["ask"] for d in self.derive()[0]], [7], "an open decision is never hidden by an old payload")
+
+    def test_a_closed_payload_with_no_awaiting_label_drops_nothing_either(self):
+        issue = self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
+        self.rig.pump(15)
+        forged = dict(issue, state="closed", labels=[])   # a stale or forged closed payload that carries no label
+        self.gh.send("issues", {"action": "closed", "issue": forged})
+        self.assertEqual([d["ask"] for d in self.derive()[0]], [7], "the payload alone drops nothing, with or without the label")
+        self.rig.pump(15)   # the next catch-up read (open issues only) says what is true: the issue is open and labelled
+        self.assertEqual([d["ask"] for d in self.derive()[0]], [7])
+
+    def test_a_read_that_fails_keeps_the_decision_listed(self):
+        issue = self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
+        self.rig.pump(15)
+        self.close_event(issue)
+        self.gh.api_down = True
+        self.closed_pass()
+        self.assertEqual([d["ask"] for d in self.derive()[0]], [7], "fail toward showing the decision")
+        self.gh.api_down = False
+        self.world.tick(sb.load_module("closed_labels").RETRY_SECONDS + 1)
+        self.closed_pass()
+        self.assertEqual(self.derive()[0], [], "once the read works and says closed, it leaves")
 
     def test_derivation_adds_no_gh_call_per_pass(self):
         self.gh.issue(5, title="A", labels=[DECISION_LABEL])
@@ -42918,22 +42982,36 @@ class TestDecisionBaselineSeams(BaselineWorld):
         decisions, errors = baseline_derive(self.world.engine, self.world.clock.now)
         self.assertFalse([d for d in decisions if "order" in d or "waits_for" in d], "no line anywhere: the list carries nothing new")
 
-    def test_a_closed_issue_with_the_persons_label_stays_listed_marked_closed_until_the_label_goes(self):
+    def test_a_closed_issue_is_never_added_and_one_kept_leaves_only_when_forgotten_by_a_fresh_read(self):   # #570: it used to stay listed, marked closed
         baseline_attach_hub(self.world.engine, self.route, self.world.clock.now)
         hub = self.world.engine.hub
         mine, cos = "me:awaiting-user", "me:awaiting-cos"
         issue = lambda n, state, names: {"number": n, "title": "issue %d" % n, "state": state,
                                          "labels": [{"name": x} for x in names], "updated_at": "2027-01-15T07:00:00Z"}
-        hub.note_awaiting_issue(API, issue(20, "closed", [mine]))              # closed, the person's label: listed, closed
-        hub.note_awaiting_issue(API, issue(21, "closed", [cos]))               # closed, the Chief of Staff's: forgotten
+        hub.note_awaiting_issue(API, issue(20, "closed", [mine]))              # closed, the person's label: never added
+        hub.note_awaiting_issue(API, issue(21, "closed", [cos]))               # closed, the Chief of Staff's: never added
         hub.note_awaiting_issue(API, issue(22, "open", [mine]))                # open: as ever
-        hub.note_awaiting_issue(API, issue(23, "closed", [mine, cos]))         # both: the person's
+        hub.note_awaiting_issue(API, issue(23, "closed", [mine, cos]))         # both: never added
         got = {r["number"]: (r["tier"], r["closed"]) for r in hub.awaiting_listing()[0]}
-        self.assertEqual(got, {20: ("human", True), 22: ("human", False), 23: ("human", True)})
-        hub.note_awaiting_issue(API, issue(20, "closed", []))                  # the label comes off: it leaves
-        self.assertNotIn(20, {r["number"] for r in hub.awaiting_listing()[0]})
+        self.assertEqual(got, {22: ("human", False)})
+        hub.note_awaiting_issue(API, issue(22, "closed", [mine]))              # a closed PAYLOAD for a kept issue drops nothing
+        self.assertEqual([r["number"] for r in hub.awaiting_listing()[0]], [22])
+        hub.forget_awaiting(API, 22)                                           # a fresh read said closed
+        self.assertEqual(hub.awaiting_listing()[0], [])
 
-    def test_the_closed_issue_shows_in_the_human_tier_with_its_report_folded_in(self):
+    def test_a_mixed_case_repo_is_one_key_for_events_reads_and_the_fresh_read_forget(self):   # #570: the closed ref is folded; the hub must fold the same way
+        baseline_attach_hub(self.world.engine, self.route, self.world.clock.now)
+        hub = self.world.engine.hub
+        issue = {"number": 30, "title": "x", "state": "open", "labels": [{"name": "me:awaiting-user"}], "updated_at": "2027-01-15T07:00:00Z"}
+        hub.note_awaiting_issue("Acme-Org/Widget-Service", issue)
+        hub.note_awaiting_issue("acme-org/widget-service", issue)              # the lower-cased variant of the same repo: the same issue
+        hub.note_awaiting_issue("ACME-ORG/WIDGET-SERVICE", issue)
+        self.assertEqual(len(hub.awaiting_listing()[0]), 1, "three spellings, one issue")
+        self.assertEqual(hub.awaiting_key("Acme-Org/Widget-Service", 30), hub.awaiting_key("ACME-ORG/widget-service", 30))
+        hub.forget_awaiting("acme-org/widget-service", 30)                     # the closed ref carries the folded name
+        self.assertEqual(hub.awaiting_listing()[0], [], "it leaves the list whatever case configured or sent")
+
+    def test_a_closed_issue_never_shows_and_the_report_that_named_it_goes_with_it(self):   # #570: it used to show in the human tier marked closed
         entries = sb.decision_core.build_entries(
             [{"kind": "issue", "title": "Won't-do: drop the legacy path", "ask": 7, "agent": None, "since": 100.0, "seed": "issue:acme/api#7",
               "bare": True, "repo": "acme/api", "tier": "human", "closed": True},
@@ -42943,16 +43021,11 @@ class TestDecisionBaselineSeams(BaselineWorld):
               "seed": "report:1", "bare": False, "repo": "acme/api", "tier": "cos", "repo_known": True}],
             ["d1", "d2", "d3"], "acme/api", lambda repo, number: None)
         by = {e["ask"]: e for e in entries}
-        self.assertEqual(sorted(by), [7, 8], "the report folded into the issue's row: one row, not two")
-        self.assertEqual((by[7]["tier"], by[7]["closed"], by[7]["reported_by"]), ("human", True, ["orch"]))
-        self.assertTrue(by[7]["headline"].endswith("(closed)"))
+        self.assertEqual(sorted(by), [8], "the closed issue is not listed, and neither is the report folded into it")
         self.assertNotIn("closed", by[8])
         self.assertFalse(by[8]["headline"].endswith("(closed)"))
-        long_title = "x " * 120
-        got = sb.decision_core.build_entries([{"kind": "issue", "title": long_title, "ask": 9, "agent": None, "since": 1.0,
-                                               "seed": "i", "bare": True, "repo": "acme/api", "tier": "human", "closed": True}],
-                                              ["d9"], "acme/api", lambda r, n: None)
-        self.assertTrue(got[0]["headline"].endswith("(closed)"), "the suffix is never cut")
+        self.assertEqual(sb.decision_core.build_entries([{"kind": "issue", "title": "x " * 120, "ask": 9, "agent": None, "since": 1.0, "seed": "i", "bare": True,
+                                                          "repo": "acme/api", "tier": "human", "closed": True}], ["d9"], "acme/api", lambda r, n: None), [])
 
     def test_the_tier_of_an_issue_payload_with_both_labels(self):
         """The webhook path hands the hub one payload with every label the issue carries (the catch-up read
@@ -59158,6 +59231,220 @@ class TestMergedLabels(Base):
         self.assertTrue(sb._issue_pr_merged({"pull_request": {"merged_at": "2026-10-15T10:00:00Z"}}))
         for record in ({"pull_request": {"merged_at": None}}, {"pull_request": {}}, {}, None, {"pull_request": "x"}):
             self.assertFalse(sb._issue_pr_merged(record), record)
+
+
+class StubIssueHub:
+    """The hub as the closed-issue pass sees it: the events it holds, and a fresh read per issue (`reads`: number -> dict, or an exception)."""
+
+    def __init__(self, entries, reads):
+        self.entries, self.reads, self.read_log = entries, reads, []
+
+    def closed_issue_snapshot(self):
+        return {ref: dict(entry) for ref, entry in self.entries.items()}
+
+    def forget_awaiting(self, repo, number):
+        self.forgotten = getattr(self, "forgotten", []) + [(repo, number)]
+
+    def _read_one(self, repo, path, now, fresh=False):
+        number = int(path.rsplit("/", 1)[1])
+        self.read_log.append((repo, number, fresh))
+        found = self.reads[number]
+        if isinstance(found, Exception):
+            raise found
+        return dict(found)
+
+
+class TestClosedIssueLabels(Base):
+    """Ask #570: a closed issue's awaiting labels come off (fleet prefix only), the Chief of Staff gets one line, and nothing else is touched."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=(), config={"gh": FAKE_GH, "github_repos": ["acme/api"], "excluded_repos": ["acme/secret"]})
+        self.world.add_agent("chief-of-staff", fleet={"role": "chief-of-staff"})
+        user = sb.getpass.getuser()
+        self.awaiting = ["%s:awaiting-user" % user, "%s:awaiting-cos" % user]
+        self.live = "%s:awaiting-live" % user
+        self.parked = "%s:parked" % user
+        self.engine = self.world.new_engine()
+
+    def entry(self, labels=None):
+        return {"labels": sorted(labels if labels is not None else self.awaiting + [self.parked, "bug"]), "at": 1}
+
+    def issue(self, state="closed", labels=None, **more):
+        names = labels if labels is not None else self.awaiting + [self.parked, "bug"]
+        return dict({"state": state, "labels": [{"name": n} for n in names]}, **more)
+
+    def go(self, entries, reads, gh):
+        self.engine.hub, self.engine.gh_runner = StubIssueHub(entries, reads), gh
+        closed_labels = sb.load_module("closed_labels")
+        ns = types.SimpleNamespace(**{n: getattr(sb, n) for n in closed_labels.NEEDS})
+        return closed_labels.run_pass(ns, self.engine, self.world.clock.now(), sb.IMPACT_PASS_CALLS)
+
+    def audit(self, event):
+        return [e for e in self.world.audit() if e["event"] == event]
+
+    def told(self):
+        return [a["text"] for a in self.world.admissions("chief-of-staff")]
+
+    def test_s2_the_awaiting_labels_come_off_and_the_parked_and_other_labels_stay(self):
+        gh = FakeMergedGh()
+        self.go({"acme/api#7": self.entry()}, {7: self.issue()}, gh)
+        self.assertEqual(sorted(gh.removed), sorted(self.awaiting), "2 awaiting labels removed; parked and bug stay")
+        (line,) = self.audit("closed.labels_removed")
+        self.assertEqual((line["subject"], sorted(line["detail"]["labels"])), ("acme/api#7", sorted(self.awaiting)))
+
+    def test_the_live_label_of_the_fleet_prefix_goes_too_and_another_prefixs_does_not(self):
+        gh = FakeMergedGh()
+        labels = [self.live, "someone-else:awaiting-user", self.parked]
+        self.go({"acme/api#8": self.entry(labels)}, {8: self.issue(labels=labels)}, gh)
+        self.assertEqual(gh.removed, [self.live])
+
+    def test_s3_a_reopened_issue_or_a_pull_request_loses_nothing(self):
+        for number, fresh in ((9, self.issue("open")), (19, self.issue("closed", pull_request={"url": "x"}))):
+            gh = FakeMergedGh()
+            self.go({"acme/api#%d" % number: self.entry()}, {number: fresh}, gh)
+            self.assertEqual(gh.removed, [], "the event said closed; the fresh read did not say an issue is closed")
+        self.assertEqual(len(self.audit("closed.labels_skipped")), 2)
+
+    def test_s4_a_failed_read_removes_nothing_audits_once_and_is_retried_after_the_back_off(self):
+        gh = FakeMergedGh()
+        entries = {"acme/api#10": self.entry()}
+        reads = {10: sb.GitHubUnavailable("HTTP 502")}
+        self.go(entries, reads, gh)
+        self.go(entries, reads, gh)
+        self.assertEqual((gh.removed, len(self.audit("closed.labels_read_failed"))), ([], 1))
+        self.world.tick(sb.load_module("closed_labels").RETRY_SECONDS + 1)
+        reads[10] = self.issue()
+        self.go(entries, reads, gh)
+        self.assertEqual(sorted(gh.removed), sorted(self.awaiting))
+        self.assertEqual(len(self.audit("closed.labels_read_failed")), 1, "said once")
+
+    def test_s5_an_excluded_or_unwatched_repository_is_never_read_or_written(self):
+        gh = FakeMergedGh()
+        hub_entries = {"acme/secret#1": self.entry(), "other/repo#2": self.entry()}
+        self.go(hub_entries, {1: self.issue(), 2: self.issue()}, gh)
+        self.assertEqual((self.engine.hub.read_log, gh.removed), ([], []), "0 reads and 0 writes in 2 of 2 cases")
+
+    def test_s6_the_chief_of_staff_gets_one_line_for_the_issue_and_a_second_pass_sends_nothing(self):
+        gh = FakeMergedGh()
+        entries = {"acme/api#11": self.entry()}
+        self.go(entries, {11: self.issue()}, gh)
+        self.assertEqual(len(self.told()), 1, "exactly 1 message")
+        self.assertIn("acme/api#11", self.told()[0])
+        for label in self.awaiting:
+            self.assertIn(label, self.told()[0])
+        self.go(entries, {11: self.issue()}, gh)
+        self.assertEqual(len(self.told()), 1, "0 more after a second pass")
+
+    def test_an_event_that_carried_no_awaiting_label_costs_no_read_and_sends_nothing(self):
+        gh = FakeMergedGh()
+        self.go({"acme/api#12": self.entry([self.parked, "bug"])}, {12: self.issue()}, gh)
+        self.assertEqual((self.engine.hub.read_log, gh.removed, self.told()), ([], [], []))
+
+    def test_a_failed_label_write_is_not_done_sends_nothing_and_is_retried(self):
+        gh = FakeMergedGh()
+        entries = {"acme/api#13": self.entry()}
+        with mock.patch.object(sb, "change_issue_labels", side_effect=sb.IntentError("gh", "HTTP 502")):
+            self.go(entries, {13: self.issue()}, gh)
+        self.assertEqual((self.audit("closed.labels_removed"), self.told()), ([], []))
+        self.world.tick(sb.load_module("closed_labels").RETRY_SECONDS + 1)
+        self.go(entries, {13: self.issue()}, gh)
+        self.assertEqual((sorted(gh.removed), len(self.told())), (sorted(self.awaiting), 1))
+
+    def test_an_issue_closed_reopened_and_closed_again_is_cleaned_on_the_second_close(self):
+        gh = FakeMergedGh()
+        entries = {"acme/api#16": self.entry()}
+        self.go(entries, {16: self.issue("open")}, gh)   # the first pass finds it reopened: nothing removed, marked handled
+        self.assertEqual(gh.removed, [])
+        self.world.tick(60)
+        entries["acme/api#16"] = dict(self.entry(), at=self.world.clock.now())   # the hub records a NEWER closed event
+        self.go(entries, {16: self.issue("closed")}, gh)
+        self.assertEqual(sorted(gh.removed), sorted(self.awaiting), "the second close is handled afresh")
+
+    def test_the_passs_cap_bounds_the_reads_and_the_rest_wait_for_the_next_pass(self):
+        gh = FakeMergedGh()
+        entries = {"acme/api#%d" % n: self.entry() for n in (21, 22)}
+        reads = {21: self.issue("open"), 22: self.issue("open")}
+        self.engine.hub, self.engine.gh_runner = StubIssueHub(entries, reads), gh
+        closed_labels = sb.load_module("closed_labels")
+        ns = types.SimpleNamespace(**{n: getattr(sb, n) for n in closed_labels.NEEDS})
+        closed_labels.run_pass(ns, self.engine, self.world.clock.now(), 1)
+        self.assertEqual([n for _, n, _ in self.engine.hub.read_log], [21], "calls=1: one read, of the first issue")
+        closed_labels.run_pass(ns, self.engine, self.world.clock.now(), 1)
+        self.assertEqual([n for _, n, _ in self.engine.hub.read_log], [21, 22], "the other waits for the next pass: a different issue, not the same twice")
+
+    def test_retry_and_said_state_of_a_ref_the_hub_no_longer_holds_is_dropped(self):
+        gh = FakeMergedGh()
+        entries = {"acme/api#23": self.entry()}
+        self.go(entries, {23: sb.GitHubUnavailable("HTTP 502")}, gh)
+        memory = self.engine.__dict__["closed_labels"]
+        self.assertEqual((sorted(memory["retry"]), sorted(memory["said"])), (["acme/api#23"], ["acme/api#23"]))
+        self.go({}, {}, gh)   # the hub evicted it
+        self.assertEqual((memory["retry"], memory["said"]), ({}, set()), "pruned with the ref")
+
+    def test_a_closed_event_the_hub_cannot_keep_is_audited_and_the_snapshot_is_unchanged(self):
+        class BrokenLock:
+            def __enter__(self):
+                raise RuntimeError("lock broken")
+
+            def __exit__(self, *exc):
+                return False
+        said = []
+        hub = sb.GitHubHub.__new__(sb.GitHubHub)
+        hub.lock, hub.closed_issues, hub.now = BrokenLock(), {}, self.world.clock.now
+        hub._audit = lambda event, subject, detail: said.append((event, subject, detail))
+        hub.note_closed_issue("acme/api", {"number": 24, "labels": [{"name": self.awaiting[0]}]})
+        self.assertEqual(hub.closed_issues, {}, "nothing was kept")
+        self.assertEqual([(e, s) for e, s, _ in said], [("github.rejected", "acme/api")])
+        self.assertIn("issues closed event not kept", said[0][2]["reason"])
+
+    def test_a_mixed_case_configured_repo_is_cleaned_and_an_excluded_one_stays_excluded_in_any_case(self):   # #570
+        world = World(self, agents=(), config={"gh": FAKE_GH, "github_repos": ["Acme-Org/Widget-Service"], "excluded_repos": ["Acme-Org/Secret-Repo"]})
+        world.add_agent("chief-of-staff", fleet={"role": "chief-of-staff"})
+        self.engine = world.new_engine()
+        self.world = world
+        gh = FakeMergedGh()
+        entries = {"acme-org/widget-service#7": self.entry(), "ACME-ORG/SECRET-REPO#8": self.entry(), "acme-org/secret-repo#9": self.entry()}
+        hub_calls = []
+        self.go(entries, {7: self.issue(), 8: self.issue(), 9: self.issue()}, gh)
+        self.assertEqual(sorted(gh.removed), sorted(self.awaiting), "only the watched repo, found in a different case, was cleaned")
+        (line,) = self.audit("closed.labels_removed")
+        self.assertEqual(line["subject"], "acme-org/widget-service#7")
+
+    def test_the_hub_is_told_to_forget_an_issue_only_when_the_fresh_read_says_closed(self):
+        gh = FakeMergedGh()
+        self.go({"acme/api#41": self.entry(), "acme/api#42": self.entry(), "acme/api#43": self.entry()},
+                {41: self.issue("closed"), 42: self.issue("open"), 43: sb.GitHubUnavailable("HTTP 502")}, gh)
+        self.assertEqual(self.engine.hub.forgotten, [("acme/api", 41)], "closed: forgotten; reopened or unreadable: still listed")
+
+    def test_the_live_label_name_is_pinned_to_the_fleet_prefix(self):
+        with mock.patch.object(sb.getpass, "getuser", return_value="osuser"):
+            self.assertEqual(sb.awaiting_live_label({}), "osuser:awaiting-live")
+
+    def test_a_real_issues_closed_event_through_the_hub_reaches_the_snapshot(self):
+        rig = GithubRig(self, config={"awaiting_label": DECISION_LABEL})
+        issue = rig.gh.issue(7, title="Pick one", labels=[DECISION_LABEL, "bug"], age=0)
+        rig.pump(15)
+        issue["state"] = "closed"
+        rig.gh.send("issues", {"action": "closed", "issue": dict(issue)})
+        self.assertEqual([ref.rpartition("#")[2] for ref in rig.hub.closed_issue_snapshot()], ["7"], "exactly the issue that closed")
+        (entry,) = rig.hub.closed_issue_snapshot().values()
+        self.assertEqual(entry["labels"], sorted([DECISION_LABEL, "bug"]))
+        self.assertEqual(len(rig.hub.awaiting_listing()[0]), 1, "the payload alone drops nothing: the fresh-read pass decides")
+
+    def test_the_hub_keeps_a_closed_event_in_memory_and_the_daemons_pass_runs_the_cleaning(self):
+        self.engine.hub = StubIssueHub({}, {})
+        hub = sb.GitHubHub.__new__(sb.GitHubHub)   # only the event bookkeeping is under test
+        hub.lock, hub.closed_issues, hub.now = threading.RLock(), {}, self.world.clock.now
+        hub.note_closed_issue("acme/api", {"number": 14, "labels": [{"name": self.awaiting[0]}, {"name": "bug"}]})
+        hub.note_closed_issue("acme/api", {"number": 15, "labels": [], "pull_request": {"url": "x"}})   # a pull request is not an issue
+        self.assertEqual(sorted(hub.closed_issue_snapshot()), ["acme/api#14"])
+        self.engine.hub, self.engine.gh_runner = StubIssueHub(hub.closed_issue_snapshot(), {14: self.issue()}), FakeMergedGh()
+        sb.publish_decisions(self.engine)
+        self.assertEqual(sorted(self.engine.gh_runner.removed), sorted(self.awaiting), "publish_decisions (the pass) cleans it")
+        with mock.patch.object(sb.load_module("closed_labels"), "run_pass", side_effect=RuntimeError("boom")):
+            sb.publish_decisions(self.engine)   # never raises
+        self.assertTrue(self.audit("closed_labels.error"))
 
 
 # ---- docs/agent-credentials.md (#568): the document has its sections and no token-like text (S1, S2, S3, S5, U1)
