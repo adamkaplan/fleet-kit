@@ -103,6 +103,7 @@ jobs:
 
       - name: bin/test-cloud-launcher
         if: ${{ !cancelled() }}
+        timeout-minutes: 5
         run: |
           bin/test-cloud-launcher 2>&1 | tee "$RUNNER_TEMP/out.txt"
           grep -qx 'RESULT: PASS' "$RUNNER_TEMP/out.txt"
@@ -110,6 +111,7 @@ jobs:
       # The image-scan cases build images FROM a pulled base image (network): skipped here, with a visible "skip docker" line.
       - name: cloud/tests/test-cloud
         if: ${{ !cancelled() }}
+        timeout-minutes: 5
         env:
           CLOUD_TEST_SKIP_DOCKER: "1"
         run: |

@@ -4,6 +4,13 @@
 set -u
 here=$(cd "$(dirname "$0")/.." && pwd); fail=0
 ok() { echo "ok   $1"; }; bad() { echo "FAIL $1"; fail=1; }
+# Every skip goes through skip(): it prints "skip <case>: <reason>" and records the case, so the CI skip can be pinned (below).
+skiplog=$(mktemp); skip() { echo "skip $1: $2"; echo "$1" >> "$skiplog"; }
+# pin_check <list> <skiplog>: the skipped cases must be EXACTLY the ones in <list> (one per line; # comments and blanks ignored).
+pin_check() {
+  local want got; want=$(grep -v '^[[:space:]]*\(#\|$\)' "$1" | sort); got=$(sort "$2")
+  [ "$want" = "$got" ]
+}
 
 # 1. manifests
 if command -v kubectl >/dev/null; then
@@ -14,10 +21,10 @@ if command -v kubectl >/dev/null; then
     elif KUBECONFIG=/dev/null kubectl label --local --dry-run=client -f "$f" x=y -o name >/dev/null 2>&1; then ok "offline parse $(basename "$f")"
     else bad "manifest $(basename "$f")"; fi
   done
-else echo "skip kubectl not installed"; fi
+else skip kubectl-manifests "kubectl not installed"; fi
 
 # 2. the fix script's rewrite, on a legacy-keyed config
-tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+tmp=$(mktemp -d); trap 'rm -rf "$tmp" "$skiplog"' EXIT
 cat > "$tmp/config.toml" <<'T'
 version = 3
 [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc]
@@ -366,7 +373,7 @@ PATH="$tmp/stub:$PATH" "$here/worker/scan-secrets.sh" any:image >/dev/null 2>&1;
 [ "$rc" = 2 ] && ok "unreadable layer: exit 2, not a pass" || bad "unreadable layer rc=$rc"
 
 # 4. image scan, only when docker is up
-if [ "${CLOUD_TEST_SKIP_DOCKER:-0}" = 1 ]; then echo "skip docker build cases: CLOUD_TEST_SKIP_DOCKER=1 (needs a base-image pull from the network)"
+if [ "${CLOUD_TEST_SKIP_DOCKER:-0}" = 1 ]; then skip docker-build-cases "CLOUD_TEST_SKIP_DOCKER=1 (needs a base-image pull from the network)"
 elif docker info >/dev/null 2>&1; then
   printf 'FROM busybox\nRUN echo "GITHUB_TOKEN=ghp_%s" > /t\n' "$(printf 'b%.0s' $(seq 36))" > "$tmp/Dockerfile"
   printf 'FROM busybox\nRUN echo hi > /t\n' > "$tmp/Dockerfile.clean"
@@ -391,6 +398,15 @@ elif docker info >/dev/null 2>&1; then
   fi
   docker rmi cw-scan-baked cw-scan-deleted cw-scan-env cw-scan-clean >/dev/null 2>&1
 else
-  [ "${CLOUD_TEST_SKIP_DOCKER:-0}" = 1 ] && echo "skip docker not running (CLOUD_TEST_SKIP_DOCKER=1)" || bad "docker is required for the image-scan cases (set CLOUD_TEST_SKIP_DOCKER=1 to skip)"
+  [ "${CLOUD_TEST_SKIP_DOCKER:-0}" = 1 ] && skip docker-not-running "CLOUD_TEST_SKIP_DOCKER=1" || bad "docker is required for the image-scan cases (set CLOUD_TEST_SKIP_DOCKER=1 to skip)"
+fi
+# 5. the CI skip is pinned: cloud/tests/ci-skips.txt names the cases CI cannot run. The check itself is tested first.
+pins="$here/tests/ci-skips.txt"
+printf 'a\nb\n' > "$tmp/pin"
+printf 'a\nb\n' > "$tmp/s1"; printf 'a\nb\nextra\n' > "$tmp/s2"; printf 'a\n' > "$tmp/s3"
+pin_check "$tmp/pin" "$tmp/s1" && ! pin_check "$tmp/pin" "$tmp/s2" && ! pin_check "$tmp/pin" "$tmp/s3" \
+  && ok "skip pin: exact list passes; a planted extra or a missing skip fails" || bad "skip pin check is broken"
+if [ "${CLOUD_TEST_SKIP_DOCKER:-0}" = 1 ]; then
+  pin_check "$pins" "$skiplog" && ok "skip pin: skipped cases are exactly ci-skips.txt" || bad "skipped cases differ from ci-skips.txt: $(tr '\n' ' ' < "$skiplog")"
 fi
 [ $fail = 0 ] && echo "RESULT: PASS" || { echo "RESULT: FAIL"; exit 1; }
