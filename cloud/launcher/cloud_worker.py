@@ -277,13 +277,13 @@ class Kube:
         if self.dir:
             shutil.rmtree(self.dir, ignore_errors=True)
 
-    def run(self, args, stdin=None, ok_missing=False, keep_stdout=False):
+    def run(self, args, stdin=None, ok_missing=False, keep_stdout=False, timeout=120):
         if not self.context:  # never fall back to the active context
             raise CloudError("CW_KUBE_CONTEXT is not set; refusing to run kubectl against an unnamed context", EXIT_USAGE)
         cmd = [self.bin] + (["--kubeconfig", self.kubeconfig] if self.kubeconfig else []) + \
               ["--context", self.context, "-n", self.ns] + args
         try:
-            p = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=120, env=self.env)
+            p = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=timeout, env=self.env)
         except (OSError, subprocess.TimeoutExpired) as e:
             raise CloudError("kubectl failed: %s" % self.scrub(e))
         if p.returncode != 0:
@@ -371,8 +371,8 @@ class Kube:
                 pass   # the launcher's cleanup finds it unlabelled and says it REMAINS
             raise
 
-    def exec(self, name, *cmd, keep_stdout=False):
-        return self.run(["exec", name, "--"] + list(cmd), keep_stdout=keep_stdout)
+    def exec(self, name, *cmd, keep_stdout=False, timeout=120):
+        return self.run(["exec", name, "--"] + list(cmd), keep_stdout=keep_stdout, timeout=timeout)
 
 
 def _pod_repo(pod):

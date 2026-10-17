@@ -128,6 +128,11 @@ elif cmd == "delete":
     save()
 elif cmd == "exec":
     name, tool = args[1], args[3]
+    if tool in ("ls", "cat", "git") and os.environ.get("FAKE_KUBE_EXEC_SLEEP"):   # a slow read: the record's calls only, never the end hook
+        import time
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        time.sleep(float(os.environ["FAKE_KUBE_EXEC_SLEEP"]))
+        fcntl.flock(lock, fcntl.LOCK_EX)
     if tool == "cw-worker-activity":
         print(json.dumps(st["activity"][name]))
     elif tool == "ls":   # /run/cw of the pod: the password and the run secrets, as the mounts name them

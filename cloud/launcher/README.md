@@ -42,7 +42,7 @@ and a person running `cloud-worker stop`. Before the end hook and the delete, `s
 the pod's own mounts, opens its own loopback port-forward, reads the session's messages and writes `$CW_RUN_RECORD_DIR/<run id>/`
 (`--record-dir` overrides; default `runs/` beside the audit file; directory 0700, files 0600; a root that is a symbolic link is refused):
 `transcript.jsonl` (each message one JSON line, every string value and key through the one scrub, so a line still parses; at most 5 MiB,
-cut with a `TRANSCRIPT CUT` marker line; `CW_RECORD_MAX_BYTES` lowers it), `tally.json` (tool calls by tool name, turns; no content) and
+cut with a `TRANSCRIPT CUT` marker line; `CW_RECORD_MAX_BYTES` lowers it; the whole record phase has one deadline, `CW_RECORD_SECONDS`, default 90 s, maximum 240 s: past it the record says `transcript: unavailable (record timed out)` and the stop still deletes), `tally.json` (tool calls by tool name, turns; no content) and
 `run.json` (worker, repository, start, end, exit reason, head sha when known; `transcript: unavailable` plus a reason when the server could
 not be read, or its answer was over 8 MiB or nested deeper than 100 levels: checked before parsing). A failing record never holds the stop
 back and a failing stop never deletes it; `--no-record` skips it. `stop` prints `run record: DIR` once and the audit reason names it.

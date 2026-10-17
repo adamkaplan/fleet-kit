@@ -65,7 +65,8 @@ class Driver(base.Base):
         return p, p.stdout + p.stderr
 
     def spawn(self, **env):
-        return subprocess.Popen(self.args(), env=dict(self.denv, **env), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return subprocess.Popen(self.args(), env=dict(self.denv, **env), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                preexec_fn=lambda: [signal.signal(x, signal.SIG_DFL) for x in (signal.SIGINT, signal.SIGTERM)])   # a runner that started us with SIGINT ignored must not hide the interrupt
 
     def read(self, path):
         if not os.path.exists(path):

@@ -10,8 +10,12 @@ can exec), reads the session's messages, scrubs every STRING VALUE of every mess
   tally.json         tool calls by tool name and the turn count; no content
   run.json           worker, repository, start, end, exit reason, head sha when known, `transcript: unavailable` and why
 
-`record` never raises (any Exception is caught: a record that fails must not keep a pod) and never blocks the stop for
-longer than CW_RECORD_TIMEOUT per step. A KeyboardInterrupt or the driver's interrupt passes through.
+`record` never raises (any Exception is caught: a record that fails must not keep a pod). ONE monotonic deadline bounds
+the whole phase: CW_RECORD_SECONDS (default 90, hard maximum 240; STOP_SECONDS is 600). Every kubectl call is given only
+the time that is left, the transcript is read in chunks with the clock checked on each, a watchdog closes the connection
+at the deadline, and the port-forward is killed. At the deadline the record says `transcript: unavailable` with the reason
+`record timed out` and the stop goes on to the end hook and the delete: a worker cannot prevent its own cleanup by being
+slow. A KeyboardInterrupt or the driver's interrupt passes through.
 
 The transcript is the worker's text, so it is hostile input: the body is size-capped and its bracket depth is checked by
 a scan that parses nothing BEFORE `json.loads`; it is then walked with an explicit stack.
@@ -27,6 +31,7 @@ import socket
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 
 MAX_BODY = 8 * 1024 * 1024      # a larger answer is not read (a cut JSON text cannot be parsed anyway)
@@ -38,6 +43,24 @@ TOOL_PART_TYPES = {"tool", "tool-call", "tool_call", "tool-use", "tool_use", "to
 RUN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}-\d{8}T\d{6}Z-[0-9a-f]{6}$")
 RECORD_FILES = {"transcript.jsonl", "tally.json", "run.json"}
 SECRET_FILES_MAX = 10
+RECORD_SECONDS = 90.0            # the default overall deadline of the record phase (less than half of the 600 s stop)
+RECORD_SECONDS_MAX = 240.0       # the hard maximum: CW_RECORD_SECONDS above it is cut to it
+CHUNK = 64 * 1024
+TIMED_OUT = "record timed out"
+
+
+class RecordTimeout(Exception):
+    pass
+
+
+def record_seconds(env):
+    try:
+        v = float(env.get("CW_RECORD_SECONDS") or RECORD_SECONDS)
+    except ValueError:
+        v = RECORD_SECONDS
+    if not v > 0:   # zero, negative or nan
+        v = RECORD_SECONDS
+    return min(v, RECORD_SECONDS_MAX)
 
 
 class TooDeep(ValueError):
@@ -123,8 +146,21 @@ def write_private(directory, name, text):
 
 
 class Recorder:
-    def __init__(self, kube, env):
-        self.kube, self.env = kube, env
+    def __init__(self, kube, env, clock=time.monotonic):
+        self.kube, self.env, self.clock = kube, env, clock
+        self.deadline = None
+
+    def left(self):
+        """Seconds of the record phase that remain; raises RecordTimeout when none. No deadline set: effectively none."""
+        if self.deadline is None:
+            return 120.0
+        r = self.deadline - self.clock()
+        if r <= 0:
+            raise RecordTimeout(TIMED_OUT)
+        return r
+
+    def _exec(self, pod, *cmd, **kw):
+        return self.kube.exec(pod, *cmd, timeout=min(120.0, self.left()), **kw)
 
     def root(self, override=None):
         return override or self.env.get("CW_RUN_RECORD_DIR") or default_root(self.env)
@@ -133,29 +169,61 @@ class Recorder:
         """Register the pod's run secrets (so the scrub knows them) and return the server password."""
         password = ""
         try:
-            names = [n for n in self.kube.exec(pod, "ls", "-1", "/run/cw").split()
+            names = [n for n in self._exec(pod, "ls", "-1", "/run/cw").split()
                      if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", n)][:SECRET_FILES_MAX]
+        except RecordTimeout:
+            raise
         except Exception:
+            self.left()   # a call cut by the deadline is a timeout, not "no secrets"
             names = []
         for n in names:
             try:
-                text = self.kube.exec(pod, "cat", "/run/cw/" + n)[:1024 * 1024]
+                text = self._exec(pod, "cat", "/run/cw/" + n)[:1024 * 1024]
+            except RecordTimeout:
+                raise
             except Exception:
+                self.left()
                 continue
             self.kube.add_secrets(text.strip())
             if n == "server-password":
                 password = text.strip()
         return password
 
-    @staticmethod
-    def _api(port, password, path):
-        c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+    def _api(self, port, password, path):
+        """(status, body). Bounded by the record deadline: the socket never waits longer than what is left, the body is
+        read in chunks with the clock checked on each, and a watchdog closes the connection at the deadline."""
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=min(30.0, self.left()))
+        dog = None
         try:
+            c.connect()
+            sock = c.sock   # kept: an HTTP/1.0 answer detaches it from the connection once the headers are in
+            dog = threading.Timer(self.left(), lambda: self._close_now(sock))
+            dog.daemon = True
+            dog.start()
             c.request("GET", path, headers={"Authorization": "Basic " + base64.b64encode(("opencode:" + password).encode()).decode()})
             r = c.getresponse()
-            return r.status, r.read(MAX_BODY + 1)
+            body = b""
+            while len(body) <= MAX_BODY:
+                self.left()
+                chunk = r.read(min(CHUNK, MAX_BODY + 1 - len(body)))
+                if not chunk:
+                    break
+                body += chunk
+            return r.status, body
+        except (OSError, http.client.HTTPException):
+            self.left()   # a connection the watchdog closed is a timeout, not a plain failure
+            raise
         finally:
+            if dog is not None:
+                dog.cancel()
             c.close()
+
+    @staticmethod
+    def _close_now(sock):
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
 
     def _forward(self, pod, tmpdir):
         s = socket.socket()
@@ -186,16 +254,16 @@ class Recorder:
                 return None, "the server password could not be read from the pod"
             tmp = tempfile.mkdtemp(prefix="cw-rec-")
             pf, port, log = self._forward(pod, tmp)
-            end = time.monotonic() + float(self.env.get("CW_RECORD_TIMEOUT") or 30)
+            end = self.clock() + float(self.env.get("CW_RECORD_TIMEOUT") or 30)
             while True:
                 try:
                     if self._api(port, password, "/api/info")[0] == 200:
                         break
                 except (OSError, http.client.HTTPException):
                     pass
-                if pf.poll() is not None or time.monotonic() >= end:
+                if pf.poll() is not None or self.clock() >= end:
                     return None, "the pod's server could not be reached"
-                time.sleep(0.3)
+                time.sleep(min(0.3, self.left()))
             st, body = self._api(port, password, "/api/session")
             if st != 200:
                 return None, "the server answered status %d" % st
@@ -216,6 +284,8 @@ class Recorder:
             if not isinstance(msgs, list):
                 return None, "the messages were not a list"
             return msgs, None
+        except RecordTimeout:
+            return None, TIMED_OUT
         except TooDeep as e:
             return None, "the messages were refused: %s" % e
         except Exception:   # RecursionError, MemoryError, a bad shape, a closed socket: unavailable, and the stop goes on
@@ -230,7 +300,10 @@ class Recorder:
                 try:
                     pf.wait(timeout=5)
                 except Exception:
-                    pass
+                    try:
+                        os.killpg(pf.pid, 9)
+                    except OSError:
+                        pass
             if log is not None:
                 log.close()
             if tmp:
@@ -238,7 +311,7 @@ class Recorder:
 
     def head_sha(self, pod):
         try:
-            out = self.kube.exec(pod, "git", "-C", self.env.get("CW_WORKDIR") or "/home/worker", "rev-parse", "HEAD", keep_stdout=True)
+            out = self._exec(pod, "git", "-C", self.env.get("CW_WORKDIR") or "/home/worker", "rev-parse", "HEAD", keep_stdout=True)
         except Exception:
             return None
         sha = (out.strip().splitlines() or [""])[0]
@@ -255,6 +328,7 @@ class Recorder:
             base = private_root(self.root(root))
             directory = os.path.join(base, run_id)
             os.mkdir(directory, 0o700)
+            self.deadline = self.clock() + record_seconds(self.env)
             try:
                 msgs, why = self.read_messages(pod)
                 if msgs is None:

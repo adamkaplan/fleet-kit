@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """A stub headless server on loopback, for the driver tests. usage: stub_server.py PORT.
-STUB_LOG (file): one line per event. STUB_PID_FILE: our pid. STUB_MODE: ok (default) | never-healthy | busy-forever | die (exit 3 at start)."""
+STUB_LOG (file): one line per event. STUB_PID_FILE: our pid. STUB_DRIP (seconds): the record's message read drips one byte per interval. STUB_MODE: ok (default) | never-healthy | busy-forever | die (exit 3 at start)."""
 import http.server
 import json
 import os
@@ -57,6 +57,19 @@ class H(http.server.BaseHTTPRequestHandler):
                 polls["m"] = polls.get("m", 0) + 1
             if MODE == "messages-down" and polls["m"] > 1:
                 return self.send(500)   # the first read (the poll that sees the session finish) works; the transcript read after it fails
+            if os.environ.get("STUB_DRIP") and polls["m"] > 1:   # headers, then one byte every STUB_DRIP seconds: a read that never finishes
+                import time
+                self.send_response(200)
+                self.send_header("Content-Length", str(8 * 1024 * 1024))
+                self.end_headers()
+                try:
+                    while True:
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                        time.sleep(float(os.environ["STUB_DRIP"]))
+                except OSError:
+                    pass
+                return
             if os.environ.get("STUB_MESSAGES_RAW") and polls["m"] > 1:   # a hostile body, as bytes, for the record's read only
                 raw = open(os.environ["STUB_MESSAGES_RAW"], "rb").read()
                 self.send_response(200)

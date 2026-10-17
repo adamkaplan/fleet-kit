@@ -235,6 +235,55 @@ class Record(td.Driver):
         self.assertEqual(code, 0, err)
         self.assertEqual(len(os.listdir(other)), 1)
 
+    # -- the record phase has ONE deadline, and the stop always reaches the delete --
+    def check_timed_out(self, started, limit, **env):
+        p, out = self.run_driver(**env)
+        took = time.monotonic() - started
+        self.assertLess(took, limit, "the stop took %.1f s" % took)
+        self.assertEqual(self.st()["pods"], {}, "the pod must be deleted")
+        info = json.loads(self.read(os.path.join(self.the_record(), "run.json")))
+        self.assertEqual(info["transcript"], "unavailable")
+        self.assertIn("timed out", info["reason"])
+        self.assert_clean(out)
+
+    def test_a_server_that_drips_one_byte_at_a_time_cannot_keep_the_pod_past_the_deadline(self):
+        t = time.monotonic()
+        self.check_timed_out(t, 25, STUB_DRIP="1", CW_RECORD_SECONDS="3", CW_RECORD_TIMEOUT="30")
+
+    def test_kubectl_reads_that_each_hang_near_their_limit_are_bounded_by_the_one_deadline(self):
+        t = time.monotonic()   # ls + cat + git each sleep 2 s: the sum (6 s+) is over the 3 s deadline
+        self.check_timed_out(t, 25, FAKE_KUBE_EXEC_SLEEP="2", CW_RECORD_SECONDS="3")
+
+    def test_the_record_deadline_default_maximum_and_bad_values(self):
+        rr = cw.run_record
+        self.assertEqual(rr.record_seconds({}), 90.0)
+        self.assertEqual(rr.record_seconds({"CW_RECORD_SECONDS": "5"}), 5.0)
+        self.assertEqual(rr.record_seconds({"CW_RECORD_SECONDS": "100000"}), 240.0)
+        for bad in ("0", "-3", "nan", "x"):
+            self.assertEqual(rr.record_seconds({"CW_RECORD_SECONDS": bad}), 90.0, bad)
+
+    def test_every_kubectl_call_is_given_only_the_time_that_is_left(self):
+        rr = cw.run_record
+        now = [100.0]
+        seen = []
+
+        class K:
+            def exec(self, pod, *cmd, timeout=120, **kw):
+                seen.append(timeout)
+                now[0] += timeout   # each call hangs to the very limit it was given
+                raise cw.CloudError("kubectl failed: timed out")
+        rec = rr.Recorder(K(), {}, clock=lambda: now[0])
+        rec.deadline = now[0] + 100
+        with self.assertRaises(rr.RecordTimeout):
+            rec._learn_secrets("p")
+        self.assertEqual(seen, [100.0])
+        self.assertLessEqual(sum(seen), 100.0)
+        rec.deadline = now[0] + 100
+        seen.clear()
+        self.assertIsNone(rec.head_sha("p"))
+        self.assertLessEqual(sum(seen), 100.0)
+        self.assertTrue(all(x <= 120 for x in seen))
+
     # -- M1: a hostile body never raises out of record() and never keeps the pod --
     def hostile(self, body):
         raw = os.path.join(self.tmp.name, "raw.json")
