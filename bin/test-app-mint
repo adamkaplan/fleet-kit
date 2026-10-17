@@ -168,7 +168,9 @@ class Base(unittest.TestCase):
     def environ(self, extra=None):
         ident = {"name": "worker", "repo": self.repo}
         if getattr(self, "own", None) is not None:
-            ident["own"] = self.own   # False: the caller has no repository of its own (the repo is only the default)
+            ident["own"] = self.own
+        if getattr(self, "role", None) is not None:
+            ident["role"] = self.role   # False: the caller has no repository of its own (the repo is only the default)
         body = json.dumps(ident)
         self.sb.write_text("#!/bin/sh\nif [ \"$1\" = whoami ] && [ \"$2\" = --json ]; then echo '%s'; exit 0; fi\n[ \"$1\" = whoami ] && echo worker && exit 0\nexit 2\n" % body)
         self.sb.chmod(0o755)
@@ -479,7 +481,7 @@ class TestMatching(Base):
         self.assertEqual(mod._matcher().normal_repo("Acme-Org/Widget-API.git"), "acme-org/widget-api")
 
     def test_s8_through_the_shim_a_cos_style_explicit_repo_is_normalised_before_the_mint(self):
-        self.repo, self.own = OTHER, False   # a caller with no repository of its own acts as the repository the command names (odd spelling here)
+        self.repo, self.own, self.role = OTHER, False, "chief-of-staff"   # a caller with no repository of its own acts as the repository the command names (odd spelling here)
         done, calls = self.gh("issue", "comment", "7", "-R", "ACME-ORG/Widget-API.git", "--body", "x")
         self.assertEqual(done.returncode, 7, done.stderr)
         self.assertTrue(all(json.loads(r["body"])["repositories"] == ["widget-api"] for r in self.endpoint.mints()))
@@ -557,12 +559,52 @@ class TestHardening(Base):
                 self.assertEqual(self.endpoint.mints(), [])
 
     def test_a_caller_with_no_repository_of_its_own_gets_the_named_mapped_repository_token(self):
-        self.repo, self.own = OTHER, False
+        self.repo, self.own, self.role = OTHER, False, "chief-of-staff"
         for args in (("issue", "comment", "7", "--body", "x", "-R", MAPPED), ("issue", "view", "https://github.com/%s/issues/3" % MAPPED)):
             with self.subTest(args):
                 done, calls = self.gh(*args)
                 self.assertEqual([c["token"] for c in calls], [TOKEN], done.stderr)
                 self.assertEqual(json.loads(self.endpoint.mints()[-1]["body"])["repositories"], ["widget-api"])
+
+    def test_a_caller_with_no_repository_that_is_not_the_chief_of_staff_is_refused(self):
+        for role in ("coder", "orchestrator", "", None):
+            for repo, extra in ((OTHER, ("-R", MAPPED)), (MAPPED, ())):   # names a mapped repository, or its recorded default is one
+                with self.subTest(role=role, repo=repo, extra=extra):
+                    self.setUp()
+                    self.repo, self.own, self.role = repo, False, role
+                    done, calls = self.gh("issue", "comment", "7", "--body", "x", *extra)
+                    self.assertEqual((done.returncode, calls), (1, []), done.stderr)
+                    self.assertIn("Chief of Staff", done.stderr)
+                    self.assertEqual(self.endpoint.mints(), [])
+
+    def test_a_caller_with_no_repository_and_no_mapped_target_is_unchanged_whatever_its_role(self):
+        self.repo, self.own, self.role = OTHER, False, "coder"
+        done, calls = self.gh("issue", "view", "7")
+        self.assertEqual({c["token"] for c in calls} - {None}, {STORED})
+        self.assertEqual(self.endpoint.requests, [])
+
+    def test_rule_table_rows_not_covered_above(self):
+        # a worker whose own repository is mapped, naming an unmapped one: still its own token (never the named repository's account)
+        done, calls = self.gh("issue", "comment", "7", "--body", "x", "-R", OTHER)
+        self.assertEqual([c["token"] for c in calls], [TOKEN])
+        self.assertEqual(json.loads(self.endpoint.mints()[-1]["body"])["repositories"], ["widget-api"])
+        # the Chief of Staff naming nothing, with the default repository mapped: that repository's token
+        self.setUp()
+        self.repo, self.own, self.role = MAPPED, False, "chief-of-staff"
+        done, calls = self.gh("issue", "view", "7")
+        self.assertEqual([c["token"] for c in calls], [TOKEN])
+        # the Chief of Staff naming an unmapped repository: the App is not asked
+        self.setUp()
+        self.repo, self.own, self.role = MAPPED, False, "chief-of-staff"
+        done, calls = self.gh("issue", "view", "7", "-R", OTHER)
+        self.assertEqual(self.endpoint.requests, [])
+        self.assertEqual({c["token"] for c in calls} - {None}, {STORED})
+        # git's credential route for a caller with no repository of its own is refused whatever its role
+        self.setUp()
+        self.repo, self.own, self.role = OTHER, False, "chief-of-staff"
+        done, calls = self.gh("auth", "git-credential", "get", stdin="host=github.com\n\n")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertNotIn("password=", done.stdout)
 
     def test_a_worker_naming_its_own_mapped_repository_gets_its_token(self):
         done, calls = self.gh("issue", "comment", "7", "--body", "x", "-R", MAPPED)

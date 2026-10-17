@@ -8121,7 +8121,7 @@ def cmd_whoami(args, runner, now):
         own = repo or _fleet_repo(fleet, config)
         # `own` is false when the repo is only the config's `intent_repo` default: an agent with no repo of its own (the Chief of Staff) has no account of
         # its own to keep, so the gh shim may use the account of the repo a command names
-        print(json.dumps({"name": fleet["name"], "repo": own or config.get("intent_repo") or None, "own": bool(own)}, sort_keys=True))
+        print(json.dumps({"name": fleet["name"], "repo": own or config.get("intent_repo") or None, "own": bool(own), "role": fleet.get("role") if isinstance(fleet.get("role"), str) else None}, sort_keys=True))   # the RECORDED role: the gh shim gives only the Chief of Staff the named repository's App token
         return EXIT_OK
     if getattr(args, "repo", False):
         fleet = caller_fleet(engine.herdr, engine.v2, os.environ)

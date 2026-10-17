@@ -167,7 +167,8 @@ class Lookup:
             name, repo = data.get("name"), data.get("repo")
             self._ident = {"name": name if isinstance(name, str) and NAME_RE.match(name) else None,
                            "repo": repo if isinstance(repo, str) and REPO_RE.match(repo) else None,
-                           "own": data.get("own") is not False}   # False: the repo is only the default (`intent_repo`), the caller has none of its own
+                           "own": data.get("own") is not False,
+                           "role": data.get("role") if isinstance(data.get("role"), str) else None}   # False: the repo is only the default (`intent_repo`), the caller has none of its own
             return self._ident
         plain = self.run([binary, "whoami"])   # an older switchboard: the name only
         if plain is not None and plain.returncode != 0:
@@ -435,6 +436,10 @@ def account_env(gh, lookup=None, strict=False, credential=False, args=None):
                 raise NoAccountMapped("repository %s" % _clean_reason(str(repo)))   # a repository that cannot be read is unmatched and refused, never defaulted
             return None
         if app is not None:
+            if ident.get("own") is False and ident.get("role") != "chief-of-staff" and app[1].entry(repo) is not None:
+                # no repository of its own AND not the Chief of Staff (by the RECORDED role; a missing role counts as not): the repository above is the default or the one the
+                # command names, and neither is this caller's to write in
+                raise AppMintRefused("gh: refused: only the Chief of Staff, by its recorded role, may act for a repository it does not own: %s is mapped to the App and this caller has no repository of its own" % _clean_reason(str(repo)))
             if ident.get("own") is not False:   # a caller WITH its own repository never gets another mapped repository's token by naming it (-R, a URL): refused, naming both
                 named = explicit_repo(args or [])
                 if named and matcher.normal_repo(named) is not None and matcher.normal_repo(named) != matcher.normal_repo(repo) and app[1].entry(named) is not None:
