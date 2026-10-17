@@ -12,3 +12,5 @@ Closes #<the plan or work-item issue, only when this PR finishes it>   <!-- othe
 ## Verified
 
 <tests run, with what you could not run>
+
+<!-- A Mermaid diagram appears only where it shows data flow, system design or component design, never at the top of a body and never as a summary of what changes, what it touches, what is irreversible and the risk. -->

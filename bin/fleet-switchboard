@@ -21005,89 +21005,39 @@ def add_review_parsers(sub):
 # ---------------------------------------------------------------- `pr-explain` (#179, slice L6)
 #
 # The explainer is NOT a reviewer: reviewers give no advice and no summaries. It writes, for the PR description, (a) a short before and after
-# pseudo-code WHY block on every PR and (b) for a captain PR a Mermaid infographic: what changes, what it touches, what is irreversible, the
-# risk cell. This command is the simplest thing that works without write authority: it reads the PR once (a GET) and PRINTS the block (or the
+# pseudo-code WHY block on every PR. It never writes a summary flowchart (ask #687: a Mermaid diagram belongs only where it shows data flow, system
+# design or component design, never at the top of a body). This command is the simplest thing that works without write authority: it reads the PR once (a GET) and PRINTS the block (or the
 # whole new body with the block put in once); the author pastes it with their own `gh pr edit --body-file`. `--check` judges a body.
 
 EXPLAINER_BEGIN = "<!-- pr-explainer:begin -->"
 EXPLAINER_END = "<!-- pr-explainer:end -->"
 EXPLAINER_HEADER_RE = re.compile(r"^(?:PLAN|MERGE|canon):", re.I)   # the lines a body opens with; the block goes right after them
-EXPLAINER_LABEL_MAX = 70
-_MERMAID_ID = r"[A-Za-z][A-Za-z0-9_]{0,30}"
-_MERMAID_NODE = re.compile(r'^(%s)\["([^"\n]{1,%d})"\]$' % (_MERMAID_ID, EXPLAINER_LABEL_MAX + 12))
-_MERMAID_EDGE = re.compile(r'^(%s)(?:\["[^"\n]+"\])? -->(?:\|[^|\n]{1,40}\| )? ?(%s)(?:\["[^"\n]+"\])?$' % (_MERMAID_ID, _MERMAID_ID))
+# The generated summary flowchart this tool used to write (four boxes: Changes, Touches, Irreversible, Risk). It is never emitted; a body that still holds it fails
+# `--check`. Detection is by the four box labels inside ONE Mermaid fence, read line by line (bounded, linear, no lowered copy, ASCII-only matching).
+SUMMARY_FLOWCHART_LABELS = ("Changes", "Touches", "Irreversible", "Risk")
+_SUMMARY_LABEL = re.compile(r'[\["(]\s*(Changes|Touches|Irreversible|Risk)\s*:', re.A | re.I)
+_SUMMARY_LINE_MAX = 400   # a box label is short: the rest of a longer line is not looked at
+_SUMMARY_BODY_MAX = 1 << 20   # a body is cut at 1 MB for this check (GitHub's own limit is 65536 characters)
 
 
-def explainer_label(text, limit=EXPLAINER_LABEL_MAX):
-    """Text made safe for a quoted Mermaid label: only plain characters, one line, bounded. A label never carries a quote, a bracket or markup."""
-    plain = re.sub(r"[^A-Za-z0-9 ,.:/()#+_=-]", " ", str(text or ""))   # no % (a Mermaid comment marker), quote, bracket, angle bracket or semicolon
-    plain = " ".join(plain.split())
-    return plain if len(plain) <= limit else plain[:limit - 3].rstrip() + "..."
-
-
-def explainer_areas(paths):
-    """The changed paths grouped by their top directory (root files together), as `bin 3, docs 2`; at most five, the rest as `+N more`."""
-    counts = {}
-    for path in paths:
-        top = path.split("/", 1)[0] if "/" in path else "root files"
-        counts[top] = counts.get(top, 0) + 1
-    ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
-    shown = ", ".join("%s %d" % kv for kv in ordered[:5])
-    return shown + (", +%d more" % (len(ordered) - 5) if len(ordered) > 5 else "") if ordered else "nothing"
-
-
-def explainer_risk_cell(severity=None, probability=None, eliminated=False, matrix=None):
-    """The risk cell as text from the single-source matrix (`docs/review-laws/impact-matrix.json`): `Marginal x Occasional: Medium (request a
-    second independent review)`, `Eliminated (not rated)`, or `not rated yet`. A severity or probability the matrix does not know is an error."""
-    if eliminated:
-        return "Eliminated (not rated)"
-    if severity is None and probability is None:
-        return "not rated yet"
-    matrix = matrix if matrix is not None else json.loads((review_laws_source() / "impact-matrix.json").read_text())
-    if severity not in matrix["severities"] or probability not in matrix["probabilities"]:
-        raise ValueError("severity is one of %s and probability one of %s" % (", ".join(matrix["severities"]), ", ".join(matrix["probabilities"])))
-    cell = matrix["cells"][severity][probability]
-    return "%s x %s: %s (%s)" % (severity, probability, cell["level"], matrix["action_meaning"][cell["action"]])
-
-
-def explainer_count(listed, total):
-    """`4 files`, or `100 of 140 files listed` when `gh` returned fewer files than the PR changes (its list is capped): a cut list is said, not hidden."""
-    if isinstance(total, int) and not isinstance(total, bool) and total > listed:
-        return "%d of %d files listed" % (listed, total)
-    return "%d file%s" % (listed, "" if listed == 1 else "s")
-
-
-def explainer_mermaid(title, paths, irreversible, risk, total=None):
-    """The infographic of a captain PR, as a Mermaid flowchart of four labelled boxes: what changes, what it touches, what is irreversible, the risk cell."""
-    return "\n".join(["flowchart LR",
-                      '  A["Changes: %s"] --> B["Touches: %s (%s)"]' % (explainer_label(title, 50), explainer_label(explainer_areas(paths), 50), explainer_count(len(paths), total)),
-                      '  B --> C["Irreversible: %s"]' % explainer_label(irreversible, 60),
-                      '  C --> D["Risk: %s"]' % explainer_label(risk, 70)])
-
-
-def mermaid_defects(text):
-    """What is wrong with a diagram, checked against the SUBSET of Mermaid this command writes (a flowchart of quoted-label nodes and `-->` edges),
-    not against Mermaid's own parser: a header, at least two nodes and an edge, every edge end a node that is defined, nothing else."""
-    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
-    if not lines or not re.fullmatch(r"flowchart (?:LR|RL|TD|TB|BT)", lines[0]):
-        return ["the diagram does not open with `flowchart LR` (or TD)"]
-    defined, edges, bad = set(), [], []
-    for line in lines[1:]:
-        node = _MERMAID_NODE.match(line)
-        edge = _MERMAID_EDGE.match(line)
-        if edge:
-            edges.append(edge.groups())
-            for found in re.finditer(r'(%s)\["[^"\n]+"\]' % _MERMAID_ID, line):
-                defined.add(found.group(1))
-        elif node:
-            defined.add(node.group(1))
-        else:
-            bad.append(line[:60])
-    problems = ["not part of the supported diagram syntax: %s" % ", ".join(bad)] if bad else []
-    if len(defined) < 2 or not edges:
-        problems.append("the diagram needs at least two nodes and one edge")
-    problems += ["edge end %s is never defined as a node" % end for edge in edges for end in edge if end not in defined]
-    return sorted(set(problems))
+def summary_flowchart_found(body):
+    """True when a Mermaid fence of the body holds the four labelled boxes of the generated summary flowchart (Changes:, Touches:, Irreversible:, Risk:), wherever
+    it is. One pass over the lines, each cut to _SUMMARY_LINE_MAX; a diagram that shows data flow (without all four labels) is not it."""
+    inside, seen = False, set()
+    for line in str(body or "")[:_SUMMARY_BODY_MAX].splitlines():
+        text = line.strip()[:_SUMMARY_LINE_MAX]
+        if text.startswith("```"):
+            if inside:
+                if len(seen) == len(SUMMARY_FLOWCHART_LABELS):
+                    return True
+                inside, seen = False, set()
+            elif text[3:].strip().lower() == "mermaid":
+                inside, seen = True, set()
+            continue
+        if inside:
+            for found in _SUMMARY_LABEL.finditer(text):
+                seen.add(found.group(1).capitalize())
+    return inside and len(seen) == len(SUMMARY_FLOWCHART_LABELS)   # a fence left open at the end of the body still counts
 
 
 def explainer_text(text):
@@ -21099,19 +21049,17 @@ def explainer_text(text):
     return " ".join(plain.split())
 
 
-def explainer_block(why_before, why_after, mermaid=None):
-    """The ONE block of a PR description: the why part (every PR) and the infographic (a captain PR), between two marker comments."""
+def explainer_block(why_before, why_after):
+    """The ONE block of a PR description: the why part (every PR), between two marker comments. Never a diagram."""
     why_before, why_after = explainer_text(why_before), explainer_text(why_after)
     parts = [EXPLAINER_BEGIN, ""]
-    if mermaid:
-        parts += ["```mermaid", mermaid, "```", ""]
     parts += ["**Why (before and after)**", "", "```text", "before: %s" % why_before, "after:  %s" % why_after, "```", "", EXPLAINER_END]
     return "\n".join(parts)
 
 
 def explainer_insert(body, block):
     """`body` with `block` in it ONCE: any block already there (between the markers) is removed first, and the new one goes right after the lines the
-    body opens with (`PLAN:`, `MERGE:`, `canon:`), so a gate that reads the first line still sees it and the diagram is the first block after them."""
+    body opens with (`PLAN:`, `MERGE:`, `canon:`), so a gate that reads the first line still sees it."""
     body = body or ""
     while EXPLAINER_BEGIN in body and EXPLAINER_END in body.split(EXPLAINER_BEGIN, 1)[1]:
         head, rest = body.split(EXPLAINER_BEGIN, 1)
@@ -21124,9 +21072,9 @@ def explainer_insert(body, block):
     return "\n".join(head + ([""] if head and head[-1].strip() else []) + block.split("\n") + ([""] if tail and tail[0].strip() else []) + tail)
 
 
-def explainer_defects(body, captain):
-    """What is wrong with a PR description's explainer: exactly one block, a why part with a real before and a real after (no placeholder left), and for
-    a captain PR a diagram that parses and comes first in the block."""
+def explainer_defects(body):
+    """What is wrong with a PR description's explainer: exactly one block, a why part with a real before and a real after (no placeholder left), and no
+    generated summary flowchart anywhere in the body. A body with no diagram passes."""
     body = body or ""
     count = body.count(EXPLAINER_BEGIN)
     if count != 1 or body.count(EXPLAINER_END) != 1 or body.index(EXPLAINER_BEGIN) > body.index(EXPLAINER_END):
@@ -21140,18 +21088,13 @@ def explainer_defects(body, captain):
         problems.append("the why part needs a ```text block with a `before:` line and an `after:` line")
     elif any(re.search(r"<[^>]*>", m.group(1)) for m in (before, after)):
         problems.append("the why part still has a placeholder in <angle brackets>")
-    diagram = re.search(r"```mermaid\n(.*?)```", inner, re.S)
-    if captain and not diagram:
-        problems.append("a captain PR carries the infographic (a ```mermaid block)")
-    if diagram:
-        problems += mermaid_defects(diagram.group(1))
-        if why and inner.index("```mermaid") > inner.index("```text"):
-            problems.append("the diagram comes first in the block")
+    if summary_flowchart_found(body):
+        problems.append("the description holds the generated summary flowchart (a Mermaid diagram with the boxes Changes:, Touches:, Irreversible:, Risk:): remove it; a diagram is only for data flow, system design or component design")
     return problems
 
 
 def cmd_pr_explain(args, runner, now):
-    """`pr-explain <owner/repo#N>`: read the PR once and print the explainer block (the why part and, for a captain PR, the infographic), or with
+    """`pr-explain <owner/repo#N>`: read the PR once and print the explainer block (the why part), or with
     `--body-file F` the whole new body with the block in once, or with `--check` judge the description it has. It writes nothing anywhere."""
     try:
         repo, number = parse_pr_ref(args.pr)
@@ -21160,27 +21103,18 @@ def cmd_pr_explain(args, runner, now):
         return EXIT_USAGE
     engine, _, _ = build_engine(runner, now, "cli", writable=False)
     try:
-        pr = read_pr_json(engine, repo, number, "files,labels")
+        pr = read_pr_json(engine, repo, number)
     except NoticeError as err:
         sys.stderr.write("%s: %s\n" % (PROG, _one_line(str(err), 300)))
         return EXIT_ERROR
     body = pr.get("body") if isinstance(pr.get("body"), str) else ""
-    captain = bool(args.captain) or is_captain({"labels": {(l.get("name") if isinstance(l, dict) else l) for l in pr.get("labels") or []}, "body": body})
     if args.check:
-        problems = explainer_defects(body, captain)
+        problems = explainer_defects(body)
         for problem in problems:
             print("DEFECT: %s" % problem)
-        print("explainer: %s (%s PR)" % ("FAIL" if problems else "PASS", "captain" if captain else "ordinary"))
+        print("explainer: %s" % ("FAIL" if problems else "PASS"))
         return EXIT_ERROR if problems else EXIT_OK
-    paths = [f.get("path") for f in pr.get("files") or [] if isinstance(f, dict) and isinstance(f.get("path"), str)]
-    try:
-        risk = explainer_risk_cell(args.severity, args.probability, args.eliminated)
-    except (ValueError, OSError, KeyError) as err:
-        sys.stderr.write("%s: pr-explain: %s\n" % (PROG, _one_line(str(err), 300)))
-        return EXIT_USAGE
-    diagram = explainer_mermaid(pr.get("title") or "this change", paths, args.irreversible or "nothing found by path: check by hand", risk,
-                                total=pr.get("changedFiles")) if captain else None
-    block = explainer_block(args.before or "<what happened before, one or two lines>", args.after or "<what happens after, one or two lines>", diagram)
+    block = explainer_block(args.before or "<what happened before, one or two lines>", args.after or "<what happens after, one or two lines>")
     if args.body_file:
         try:
             current = body if args.body_file == "-" else Path(args.body_file).read_text()
@@ -21197,19 +21131,14 @@ cmd_pr_explain.direct = True   # no error mapping, no daemon start
 
 
 def add_pr_explain_parsers(sub):
-    explain = sub.add_parser("pr-explain", help="Print the PR explainer block: a before/after why part and, for a captain PR, the infographic (read-only)",
+    explain = sub.add_parser("pr-explain", help="Print the PR explainer block: a before/after why part (read-only; never a diagram)",
                              description="Reads the PR once and PRINTS the block for its description; it writes nothing. Paste it, or use --body-file to get the whole "
                                          "new body with the block in once, then `gh pr edit --body-file`. --check judges the description the PR has.")
     explain.add_argument("pr", help="The pull request: owner/repo#N or its URL")
     explain.add_argument("--before", help="The behaviour before, one or two lines")
     explain.add_argument("--after", help="The behaviour after, one or two lines")
-    explain.add_argument("--irreversible", help="What cannot be undone (captain PRs)")
-    explain.add_argument("--severity", help="The impact rating's severity, from the matrix (captain PRs)")
-    explain.add_argument("--probability", help="The impact rating's probability, from the matrix (captain PRs)")
-    explain.add_argument("--eliminated", action="store_true", help="The risk is eliminated (not rated)")
-    explain.add_argument("--captain", action="store_true", help="Treat the PR as a captain PR (the infographic)")
     explain.add_argument("--body-file", help="A file with a PR body (or - for the PR's own): print it with the block in once")
-    explain.add_argument("--check", action="store_true", help="Judge the PR description: one block, a real why part, a diagram that parses (captain)")
+    explain.add_argument("--check", action="store_true", help="Judge the PR description: one block, a real why part, no generated summary flowchart")
 
 
 def add_impact_parsers(sub):
