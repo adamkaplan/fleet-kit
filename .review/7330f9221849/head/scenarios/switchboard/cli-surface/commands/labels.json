@@ -1,4 +1,0 @@
-{
- "command": "labels",
- "help": "usage: fleet-switchboard labels [-h] {ensure,apply-from-markers} ... `labels ensure` creates the labels the fleet uses, each with the repo's own gh account, unless they exist: <user>:orchestrator, <user>:awaiting-cos and <user>:awaiting-user. Idempotent. Run it when a repo joins. positional arguments: {ensure,apply-from-markers} ensure Create the missing labels (every watched repo by default) apply-from-markers Label the open PRs and issues whose first body line says MERGE: captain|automatic (a person's command; a dry run unless --apply) options: -h, --help show this help message and exit"
-}

@@ -1,4 +1,0 @@
-{
- "command": "verdict",
- "help": "usage: fleet-switchboard verdict [-h] --pr PR [--plan PLAN] [--ask ASK] [--head HEAD] [--all] --as {ci,tester,reviewer,owner} --result {pass,fail} --evidence EVIDENCE [scenario] positional arguments: scenario The scenario id in the plan (S1, U2, ...) options: -h, --help show this help message and exit --pr PR The pull request: owner/repo#N or its URL --plan PLAN The plan: owner/repo#N or an issue URL (default: the one the PR's ledger entries name, else the `PLAN:` line of the PR body) --ask ASK The ask whose Done-when the plan must cover (as `plan check --ask`) --head HEAD The PR head sha (default: read from GitHub) --all Record the verdict for EVERY per-PR scenario of the plan judged by --as, at the current head (no scenario id) --as {ci,tester,reviewer,owner} --result {pass,fail} --evidence EVIDENCE A link, or the evaluator's own artefact"
-}

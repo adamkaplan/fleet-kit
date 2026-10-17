@@ -350,7 +350,9 @@ def named_repos(args):
                 rest.append(a)
         path = re.sub(r"^https://api\.github\.com/", "", (rest[1] if len(rest) > 1 else "").split("?")[0].split("#")[0]).lstrip("/")
         m = re.match(r"^repos/([^/]*)/([^/]*)", path)
-        if m:
+        if "\\" in path or "%" in path or "//" in path or any(seg in (".", "..") for seg in path.split("/")):
+            bad = True   # a dot segment (plain, percent-encoded, mixed case), a backslash or an empty segment can walk out of the repository that was matched: refused whole
+        elif m:
             found.add("%s/%s" % m.groups())
         elif path not in ("user", "rate_limit", "meta"):
             bad = True   # graphql, search, repositories/ID, orgs/..., anything else could reach a repository it does not name: refused

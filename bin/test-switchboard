@@ -23473,6 +23473,18 @@ class TestIdentityCheck(ReportBase):
         done, seen = self.read_repo_run(("issue", "view", "5", "-Racme-org/widget-api"))
         self.assertEqual((done.returncode, seen["token"]), (0, "tok-bot"), done.stderr)
 
+    def test_an_api_path_that_walks_out_of_the_read_repository_is_refused_in_every_spelling(self):
+        base = "repos/acme-org/widget-api"
+        for tail in ("/../widget-service/issues", "/../../other/x", "/%2e%2e/other", "/%2E%2E/other", "/%2e./other", "/.%2E/other", "//issues", "/issues/..",
+                     "/issues/.", "\\..\\other", "/%2f..%2fother", "/issues/%2E%2E"):
+            for prefix in ("", "/", "https://api.github.com/"):
+                with self.subTest(path=prefix + base + tail):
+                    done, seen = self.read_repo_run(("api", prefix + base + tail))
+                    self.assertEqual(done.returncode, 1, done.stderr)
+                    self.assertIsNone(seen)
+        done, seen = self.read_repo_run(("api", "repos/acme-org/widget-api/issues?per_page=5"))
+        self.assertEqual((done.returncode, seen["token"]), (0, "tok-bot"), done.stderr)
+
     def test_s6_a_worker_without_a_read_repository_is_untouched_by_the_guard(self):
         for args in (("issue", "view", "5", "-R", "acme-org/other"), ("api", "graphql", "-f", "query=x"), ("issue", "comment", "5", "-R", "acme-org/other", "--body", "x")):
             with self.subTest(args=args):
