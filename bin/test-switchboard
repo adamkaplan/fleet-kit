@@ -29216,12 +29216,12 @@ class TestImpactHold(LedgerBase):
         self.passes(records=[self.listed(head=LEDGER_NEW_HEAD)], advance=8000)
         self.assertEqual(len(self.label_writes()), before + 1, "a new head is held again")
 
-    def test_a_clear_keeps_a_merge_captain_label_the_switchboard_did_not_add(self):
+    def test_a_clear_also_takes_off_a_merge_captain_label_the_switchboard_did_not_add(self):   # #742: it was `..._keeps_...` (#179 L4: only the labels the switchboard added came off)
         self.passes(records=[self.listed(labels=[self.names["merge-captain"]])])
         self.assertEqual(self.run_as(None, "impact", "clear", self.PR, "--reason", "a false hold: the file is a fixture")[0], 0)
         deletes = [w[1] for w in self.writes if w[0] == "DELETE"]
-        self.assertEqual(len(deletes), 1)
-        self.assertIn("hold-impact", deletes[0])
+        self.assertEqual(len(deletes), 2)
+        self.assertTrue(any("hold-impact" in d for d in deletes) and any("merge-captain" in d for d in deletes))
 
     def test_cos_and_every_agent_are_refused_the_clear_and_nothing_is_written_or_recorded(self):
         self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
