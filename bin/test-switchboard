@@ -50726,21 +50726,31 @@ class TestHeavySlots(Base):
     READY_PAUSE = 0.1
     START_DELAY = 0      # seconds a holder is made slow to start (the injected-delay class sets it)
 
-    def ready_holders(self, count, slots=3, name=None, seconds=None, state=None):
-        """Wait until `count` holders are READY, then return them. Ready is read from the record the product itself reads (`holders`: the slot's lock is held and the
-        record names the holder and its command), never from a timer: a lock that is held before its record is written reads as '?' and is not ready yet. Bounded:
-        READY_TRIES reads (or `seconds` / READY_PAUSE); when it runs out it fails and says which holder was expected and what was missing."""
+    @staticmethod
+    def holders_ready(found, count, name=None, wrapper_pids=()):
+        """The readiness decision, from what `holders` listed: `count` holders, each with a real name and command (the record is written) and, for the real-process
+        tests, a pid that is NOT its wrapper's. The wrapper writes the record TWICE: first its own pid, then (a moment later, after truncating the file first) the
+        command's pid: the first record is not the holder's final one, and a read between the second truncate and the second write shows '?'. Ready is the final record."""
+        known = [h for h in found if h["name"] != "?" and h["command"] != "?" and h["pid"] is not None and h["pid"] not in set(wrapper_pids)
+                 and (name is None or h["name"] == name)]
+        return len(found) == count and len(known) == count
+
+    def ready_holders(self, count, slots=3, name=None, seconds=None, state=None, wrappers=()):
+        """Wait until `count` holders are READY, then return them. Ready is read from the record the product itself reads (`holders`), never from a timer and never
+        from the lock alone: the lock is taken first and the record written after, so a held lock is not ready. `wrappers` are the heavy wrapper processes started for
+        the holders: a holder is ready only once its record shows the COMMAND's pid (see holders_ready). Bounded: READY_TRIES reads (or `seconds` / READY_PAUSE); when
+        it runs out it fails and says which holder was expected and what was missing."""
         tries = int(seconds / self.READY_PAUSE) if seconds is not None else self.READY_TRIES
         state = state or self.state()
+        pids = [w.pid for w in wrappers]
         found = []
         for attempt in range(max(1, tries)):
             found = self.hs.holders(state, slots)
-            known = [h for h in found if h["name"] != "?" and h["command"] != "?" and (name is None or h["name"] == name)]
-            if len(found) == count and len(known) == count:
+            if self.holders_ready(found, count, name, pids):
                 return found
             time.sleep(self.READY_PAUSE)
-        self.fail("holder %r not ready after %d reads of its record (%.1f s): expected %d ready holder(s), found %s (a '?' is a held lock whose record is not written yet)" % (
-            name, max(1, tries), max(1, tries) * self.READY_PAUSE, count, found))
+        self.fail("holder %r not ready after %d reads of its record (%.1f s): expected %d ready holder(s) with the command's pid (not the wrapper pids %s), found %s (a '?' is a held lock whose record is not written yet)" % (
+            name, max(1, tries), max(1, tries) * self.READY_PAUSE, count, pids, found))
 
     def test_s1_four_callers_of_three_slots_queue_and_the_fourth_runs_when_one_frees(self):
         """The integration check with real processes (the queue logic itself is tested deterministically in TestHeavyQueueLogic)."""
@@ -50749,7 +50759,7 @@ class TestHeavySlots(Base):
         self.assertTrue(ok, "3 commands started\n" + (self.why(procs) if not ok else ""))
         # the three locks are really held now (the kernel's own answer, not a file): the fourth cannot take one, whatever the machine's speed
         try:
-            self.ready_holders(3, seconds=self.HOLD_CEILING_SECONDS)   # the three locks held AND their records written (the kernel's own answer, not a timer)
+            self.ready_holders(3, seconds=self.HOLD_CEILING_SECONDS, wrappers=list(procs.values()))   # the three locks held AND their records written (the kernel's own answer, not a timer)
         except AssertionError as err:
             self.fail("3 of 3 slots held before the fourth starts\n%s\n%s" % (err, self.why(procs)))
         fourth = self.start(*self.waiter("d"), name="who-d")
@@ -50795,7 +50805,7 @@ class TestHeavySlots(Base):
     def test_s2_a_holder_killed_with_its_whole_group_frees_its_slot_by_itself(self):
         holder = self.start(*self.waiter("h"), slots=1, name="doomed")
         self.assertTrue(self.until(lambda: "started.h" in self.started()))
-        self.assertEqual([h["name"] for h in self.ready_holders(1, slots=1, name="doomed")], ["doomed"])
+        self.assertEqual([h["name"] for h in self.ready_holders(1, slots=1, name="doomed", wrappers=[holder])], ["doomed"])
         os.killpg(holder.pid, signal.SIGKILL)
         holder.wait(timeout=90)
         waiter = self.start("sh", "-c", 'touch "%s/second"' % self.home, slots=1)
@@ -50871,7 +50881,7 @@ class TestHeavySlots(Base):
 
     def test_s5_the_holder_list_names_who_holds_a_slot_and_a_free_slot_says_nothing(self):
         proc = self.start("sleep", "5", slots=2, name="the-coder")
-        (entry,) = self.ready_holders(1, slots=2, name="the-coder")
+        (entry,) = self.ready_holders(1, slots=2, name="the-coder", wrappers=[proc])
         self.assertEqual((entry["name"], entry["command"]), ("the-coder", "sleep"))
         self.assertIsInstance(entry["pid"], int)
         self.assertLessEqual(abs(entry["since"] - time.time()), 30)
@@ -50883,7 +50893,7 @@ class TestHeavySlots(Base):
 
     def test_s6_past_the_wait_limit_it_exits_75_and_does_not_run_the_command(self):
         holder = self.start("sleep", "30", slots=1, name="busy-one")
-        self.ready_holders(1, slots=1, name="busy-one")
+        self.ready_holders(1, slots=1, name="busy-one", wrappers=[holder])
         marker = self.home / "marker"
         late = self.start("touch", str(marker), slots=1, wait_max=1)
         self.assertEqual(late.wait(timeout=90), 75)
@@ -50931,7 +50941,7 @@ class TestHeavySlots(Base):
 
     def test_a_signal_while_waiting_a_zero_wait_limit_and_a_command_that_cannot_start(self):
         holder = self.start("sleep", "30", slots=1)
-        self.ready_holders(1, slots=1, name="t")
+        self.ready_holders(1, slots=1, name="t", wrappers=[holder])
         waiting = self.start("true", slots=1)
         seen = ""
         end = time.time() + 90
@@ -51014,7 +51024,7 @@ class TestHeavySlots(Base):
         cg = sb.load_cpu_guard()
         self.assertEqual(cg.slots_text({}, self.state()), "heavy slots 0/3")
         holder = self.start("sleep", "30", name="the-coder")
-        self.ready_holders(1, name="the-coder")
+        self.ready_holders(1, name="the-coder", wrappers=[holder])
         line = cg.slots_text({}, self.state())
         self.assertRegex(line, r"^heavy slots 1/3 \(the-coder sleep \d+[ms]\)$")
         self.assertEqual(cg.slots_text({"heavy": {"slots": 5}}, self.state())[:15], "heavy slots 1/5")
@@ -51077,6 +51087,35 @@ class TestHeavySlotsReadiness(TestHeavySlots):
         os.write(fd, json.dumps({"name": "slow-one", "command": "sleep", "pid": 1, "since": time.time()}).encode())
         (entry,) = self.ready_holders(1, name="slow-one", seconds=1)
         self.assertEqual((entry["name"], entry["command"]), ("slow-one", "sleep"))
+
+    def test_the_readiness_decision_is_the_final_record_not_the_lock_and_not_the_wrappers_first_record(self):
+        """Deterministic: no process, no clock. The cases a lock-only (or first-record) readiness would accept and this one must not."""
+        def held(name, command, pid):
+            return {"slot": 0, "name": name, "command": command, "pid": pid, "since": 1}
+        ready = self.holders_ready
+        self.assertFalse(ready([held("?", "?", None)], 1, "the-coder", [100]), "the lock is held, no record yet")
+        self.assertFalse(ready([held("the-coder", "sleep", 100)], 1, "the-coder", [100]), "the wrapper's own first record: the second write (truncate, then the command's pid) is still to come")
+        self.assertFalse(ready([held("?", "?", None)], 1, None, []), "a '?' holder is never ready, with or without a name asked for")
+        self.assertFalse(ready([held("other", "sleep", 200)], 1, "the-coder", [100]), "the wrong holder")
+        self.assertFalse(ready([], 1, "the-coder", [100]), "no holder")
+        self.assertFalse(ready([held("the-coder", "sleep", 200), held("?", "?", None)], 2, None, [100]), "one of two is not ready")
+        self.assertTrue(ready([held("the-coder", "sleep", 200)], 1, "the-coder", [100]), "the command's pid: the final record")
+
+    def test_the_helper_waits_through_the_wrappers_first_record_until_the_second_is_written(self):
+        """The product's own two records, in order and with a deterministic gap: the helper returns only after the second."""
+        import fcntl
+        state = self.state()
+        fd = os.open(str(state / "heavy-slot-0.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.hs._record(fd, "the-coder", 100, "sleep", time.time())   # the wrapper's first record: pid 100 is the wrapper
+        wrapper = mock.Mock(pid=100)
+        with self.assertRaises(AssertionError) as caught:
+            self.ready_holders(1, name="the-coder", seconds=0.5, wrappers=[wrapper])
+        self.assertIn("not ready", str(caught.exception))
+        self.hs._record(fd, "the-coder", 200, "sleep", time.time())   # the second: the command's pid
+        (entry,) = self.ready_holders(1, name="the-coder", seconds=0.5, wrappers=[wrapper])
+        self.assertEqual(entry["pid"], 200)
 
 
 class TestHeavySlotsSlowStart(TestHeavySlots):
