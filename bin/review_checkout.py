@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import stat
+import time
 
 MARKER = ".fleet-review-checkout"
 MARKER_TOOL = "fleet-switchboard review checkout"
@@ -26,6 +27,9 @@ MAX_FILE_BYTES = 5 * 1024 * 1024
 MAX_FILES = 5000
 MAX_TOTAL_BYTES = 100 * 1024 * 1024
 MAX_DIFF_BYTES = 5 * 1024 * 1024
+MAX_DIFF_LINES = 20000   # lines of one side: past it the line diff is skipped (difflib is quadratic)
+DIFF_SECONDS = 30        # the time all line diffs together may take; past it each remaining file says the diff was skipped
+DEADLINE_SECONDS = 900   # the whole checkout
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 
 
@@ -54,6 +58,8 @@ def bad_path(path):
     parts = path.split("/")
     if any(p in ("", ".", "..") for p in parts):
         return "a path with an empty, '.' or '..' part"
+    if any(p.lower() == ".git" for p in parts):
+        return "a path with a .git component (a hostile .git/config would run when git is run there)"
     return None
 
 
@@ -157,11 +163,14 @@ def write_file(root, rel, data):
         handle.write(data)
 
 
-def _diff_text(path, old, new):
+def _diff_text(path, old, new, late=False):
     def text(data):
         return None if data is None else data.decode("utf-8", "replace").splitlines(keepends=True)
     if (old is not None and b"\x00" in old) or (new is not None and b"\x00" in new):
         return "Binary files a/%s and b/%s differ\n" % (path, path)
+    counts = [len(d.splitlines()) for d in (old, new) if d is not None]
+    if late or (counts and max(counts) > MAX_DIFF_LINES):
+        return "diff skipped: too large to compare here (%d lines) for %s\n" % (max(counts) if counts else 0, path)
     lines = list(difflib.unified_diff(text(old) or [], text(new) or [], "a/" + path if old is not None else "/dev/null",
                                       "b/" + path if new is not None else "/dev/null"))
     out = "".join(l if l.endswith("\n") else l + "\n\\ No newline at end of file\n" for l in lines)
@@ -229,9 +238,12 @@ def checkout(api, repo, number, head, base, cwd, limits=None, notify=lambda text
         total = sum(v[1] for v in head_files.values()) + sum(base_files[p][1] for p in touched if p in base_files)
         if total > limits["total"]:
             raise OverBound("the head and base copies are %d bytes in all, over the limit of %d bytes in total" % (total, limits["total"]))
+        started = time.monotonic()
         cache, fetched = {}, [0]
 
         def blob(entry):
+            if time.monotonic() - started > DEADLINE_SECONDS:
+                raise OverBound("the checkout took more than %d seconds (the time limit)" % DEADLINE_SECONDS)
             if entry[0] not in cache:
                 cache[entry[0]] = fetch_blob(api, repo, entry[0], limits)
                 fetched[0] += len(cache[entry[0]])
@@ -243,13 +255,13 @@ def checkout(api, repo, number, head, base, cwd, limits=None, notify=lambda text
         os.mkdir(os.path.join(root, "base"), 0o700)
         for path in sorted(head_files):
             write_file(os.path.join(root, "head"), path, blob(head_files[path]))
-        diff, written = [], 0
+        diff, written, diff_started = [], 0, time.monotonic()
         for path in touched:
             old = blob(base_files[path]) if path in base_files else None
             new = blob(head_files[path]) if path in head_files else None
             if old is not None:
                 write_file(os.path.join(root, "base"), path, old)
-            piece = _diff_text(path, old, new)
+            piece = _diff_text(path, old, new, late=time.monotonic() - diff_started > DIFF_SECONDS)
             written += len(piece.encode())
             if written > MAX_DIFF_BYTES:
                 raise OverBound("the diff is over the limit of %d bytes" % MAX_DIFF_BYTES)

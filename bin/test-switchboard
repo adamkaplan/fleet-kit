@@ -55117,6 +55117,38 @@ class TestReviewCheckout(LedgerBase):
                 self.assertTrue(d.is_dir())
                 shutil.rmtree(d)
 
+    def test_a_dot_git_component_in_any_case_is_refused_and_nothing_is_written(self):
+        for path in (".git/config", ".GIT/config", ".Git/hooks/x", "a/.git/config", ".git", "a/.GiT"):
+            with self.subTest(path=path):
+                self.extra_entries = [{"path": path, "type": "blob", "mode": "100644", "sha": "f" * 40, "size": 1}]
+                code, out, err = self.checkout()
+                self.assertEqual(code, 1)
+                self.assertIn(".git component", err)
+                self.made_nothing()
+        self.extra_entries = [{"path": ".gitignore", "type": "blob", "mode": "100644", "sha": "f" * 40, "size": 1}]
+        self.blobs["f" * 40] = "x"
+        self.assertEqual(self.checkout()[0], 0, ".gitignore is not a .git component")
+
+    def test_a_huge_file_skips_its_line_diff_fast_and_says_so_and_the_deadline_bounds_the_whole(self):
+        self.base_tree = {"big.txt": "x\n" * 3}
+        self.head_tree = {"big.txt": "y\n" * 1000000}
+        started = time.monotonic()
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertIn("diff skipped: too large to compare here (1000000 lines)", (Path(out.strip()) / "pr.diff").read_text())
+        self.run_as("coder", "review", "checkout", "--remove", out.strip())
+        with mock.patch.object(self.rc, "DIFF_SECONDS", -1):   # the time budget is spent: every file says so
+            code, out, err = self.checkout()
+            self.assertEqual(code, 0, err)
+            self.assertIn("diff skipped", (Path(out.strip()) / "pr.diff").read_text())
+        self.run_as("coder", "review", "checkout", "--remove", out.strip())
+        with mock.patch.object(self.rc, "DEADLINE_SECONDS", -1):
+            code, out, err = self.checkout()
+            self.assertEqual(code, 2)
+            self.assertIn("time limit", err)
+            self.made_nothing()
+
     def test_a_directory_that_exists_is_not_overwritten(self):
         self.assertEqual(self.checkout()[0], 0)
         code, out, err = self.checkout()
