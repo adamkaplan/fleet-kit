@@ -54,9 +54,18 @@ do_git() {
     esac
   done
   if [ "${1:-}" = config ]; then
-    for a in "$@"; do   # a read (--get, --list, -l ...) defines nothing
-      case "$a" in --get|--get-all|--get-regexp|--get-urlmatch|--list|-l|--get-color|--get-colorbool) return 0 ;; esac
+    # a read is exactly: config MODE [modifier ...] [one KEY or PATTERN]; any other shape is judged word by word below
+    shift; mode=0; pos=0; ok=1
+    for a in "$@"; do
+      case "$a" in
+        --get|--get-all|--get-regexp|--get-urlmatch|--list|-l|--get-color|--get-colorbool) if [ "$mode" = 0 ] && [ "$pos" = 0 ]; then mode=1; else ok=0; fi ;;
+        --global|--local|--system|--worktree|--show-origin|--show-scope|--name-only|-z|--includes|--no-includes) ;;
+        -*) ok=0 ;;
+        *) pos=$((pos + 1)) ;;
+      esac
     done
+    [ "$ok" = 1 ] && [ "$mode" = 1 ] && [ "$pos" -le 1 ] && return 0
+    set -- config "$@"
     for a in "$@"; do bad_cfg "$a"; done
     return 0
   fi
@@ -216,6 +225,8 @@ do_gh() {
   case "$group $verb" in
     "alias list") ;;
     "alias "*) refuse "defining or changing a gh alias" ;;
+    "config get"|"config list") ;;
+    "config "*) refuse "changing the gh configuration" ;;
     "pr merge") refuse "merging a pull request" ;;
     "pr review") refuse "approving or dismissing a pull request review" ;;
     "pr edit") for a in "$@"; do case "$a" in --add-label|--add-label=*|--remove-label|--remove-label=*) refuse "writing labels" ;; --add-assignee|--add-assignee=*|--remove-assignee|--remove-assignee=*) refuse "writing assignees" ;; esac; done ;;
