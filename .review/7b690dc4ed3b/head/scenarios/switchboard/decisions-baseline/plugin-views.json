@@ -1,0 +1,296 @@
+{
+ "ages": [
+  "0s",
+  "59s",
+  "1m",
+  "59m",
+  "1h",
+  "1h05m",
+  "1d"
+ ],
+ "api": {
+  "lines": [
+   "Decisions (6) acme/api",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "Waits on you (2)",
+   "acme/api",
+   "Both labels on one issue",
+   "api#9 1h06m",
+   "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+   "permission: shell echo hi",
+   "api#2df 1h05m",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "Heads-up (1)",
+   "acme/api",
+   "acme/api#7 Add the parser",
+   "+120/-14, 5 files, CI green,",
+   "approved",
+   "pr:acme/api#7 1h05m",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "Waits on cos (3, 3 over 1h)",
+   "acme/api",
+   "Which database?",
+   "api#2 1h06m",
+   "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+   "Cleanup of stale issues (3 rows)",
+   "api#31: close it",
+   "api#32: close as duplicate of",
+   "api#31",
+   "api#33: label it done",
+   "api#101 1h05m",
+   "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+   "blocked: cannot build until the",
+   "key is rotated",
+   "api#7hz 1h05m",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "Waits on orchestrator (1)",
+   "acme/api",
+   "Which table should hold the",
+   "totals?",
+   "api#6cc 1h05m"
+  ],
+  "notices": [
+   "pr:acme/api#7"
+  ],
+  "sections": [
+   {
+    "count": 2,
+    "key": "human",
+    "title": "Waits on you (2)"
+   },
+   {
+    "count": 1,
+    "key": "notice",
+    "title": "Heads-up (1)"
+   },
+   {
+    "count": 3,
+    "key": "cos",
+    "title": "Waits on cos (3, 3 over 1h)"
+   },
+   {
+    "count": 1,
+    "key": "orchestrator",
+    "title": "Waits on orchestrator (1)"
+   }
+  ],
+  "selected": [
+   "api#2",
+   "api#9",
+   "api#101",
+   "api#2df",
+   "api#6cc",
+   "api#7hz"
+  ],
+  "title": "Decisions (6) acme/api",
+  "view": {
+   "kind": "repo",
+   "label": "acme/api",
+   "repo": "acme/api"
+  }
+ },
+ "chief": {
+  "lines": [
+   "Decisions (9) all",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "Waits on you (4)",
+   "acme/api",
+   "Both labels on one issue",
+   "api#9 1h06m",
+   "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+   "permission: shell echo hi",
+   "api#2df 1h05m",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "acme/web",
+   "Pick the cache layer",
+   "web#4 1h06m",
+   "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+   "question: Which database?",
+   "web#2mv 1h05m",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "Heads-up (1)",
+   "acme/api",
+   "acme/api#7 Add the parser",
+   "+120/-14, 5 files, CI green,",
+   "approved",
+   "pr:acme/api#7 1h05m",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "Waits on cos (4, 4 over 1h)",
+   "acme/api",
+   "Which database?",
+   "api#2 1h06m",
+   "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+   "Cleanup of stale issues (3 rows)",
+   "api#31: close it",
+   "api#32: close as duplicate of",
+   "api#31",
+   "api#33: label it done",
+   "api#101 1h05m",
+   "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+   "blocked: cannot build until the",
+   "key is rotated",
+   "api#7hz 1h05m",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "acme/web",
+   "Which region for the cache?",
+   "web#8gj 1h05m",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "Waits on orchestrator (1)",
+   "acme/api",
+   "Which table should hold the",
+   "totals?",
+   "api#6cc 1h05m"
+  ],
+  "notices": [
+   "pr:acme/api#7"
+  ],
+  "sections": [
+   {
+    "count": 4,
+    "key": "human",
+    "title": "Waits on you (4)"
+   },
+   {
+    "count": 1,
+    "key": "notice",
+    "title": "Heads-up (1)"
+   },
+   {
+    "count": 4,
+    "key": "cos",
+    "title": "Waits on cos (4, 4 over 1h)"
+   },
+   {
+    "count": 1,
+    "key": "orchestrator",
+    "title": "Waits on orchestrator (1)"
+   }
+  ],
+  "selected": [
+   "api#2",
+   "api#9",
+   "web#4",
+   "api#101",
+   "api#2df",
+   "web#2mv",
+   "api#6cc",
+   "api#7hz",
+   "web#8gj"
+  ],
+  "title": "Decisions (9) all",
+  "view": {
+   "kind": "all",
+   "label": "all",
+   "repo": null
+  }
+ },
+ "facts": [
+  "+120/-14, 5 files, CI green, approved"
+ ],
+ "human": {
+  "lines": [
+   "Decisions (4) for you",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "Waits on you (4)",
+   "acme/api",
+   "Both labels on one issue",
+   "api#9 1h06m",
+   "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+   "permission: shell echo hi",
+   "api#2df 1h05m",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "acme/web",
+   "Pick the cache layer",
+   "web#4 1h06m",
+   "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+   "question: Which database?",
+   "web#2mv 1h05m",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "Heads-up (1)",
+   "acme/api",
+   "acme/api#7 Add the parser",
+   "+120/-14, 5 files, CI green,",
+   "approved",
+   "pr:acme/api#7 1h05m"
+  ],
+  "notices": [
+   "pr:acme/api#7"
+  ],
+  "sections": [
+   {
+    "count": 4,
+    "key": "human",
+    "title": "Waits on you (4)"
+   },
+   {
+    "count": 1,
+    "key": "notice",
+    "title": "Heads-up (1)"
+   }
+  ],
+  "selected": [
+   "api#9",
+   "web#4",
+   "api#2df",
+   "web#2mv"
+  ],
+  "title": "Decisions (4) for you",
+  "view": {
+   "kind": "human",
+   "label": "for you",
+   "repo": null
+  }
+ },
+ "stale": {
+  "groups": [],
+  "rows": [
+   {
+    "key": "state",
+    "text": "daemon not updating"
+   }
+  ],
+  "title": "Decisions (?)"
+ },
+ "web": {
+  "lines": [
+   "Decisions (3) acme/web",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "Waits on you (2)",
+   "acme/web",
+   "Pick the cache layer",
+   "web#4 1h06m",
+   "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+   "question: Which database?",
+   "web#2mv 1h05m",
+   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+   "Waits on cos (1, 1 over 1h)",
+   "acme/web",
+   "Which region for the cache?",
+   "web#8gj 1h05m"
+  ],
+  "notices": [],
+  "sections": [
+   {
+    "count": 2,
+    "key": "human",
+    "title": "Waits on you (2)"
+   },
+   {
+    "count": 1,
+    "key": "cos",
+    "title": "Waits on cos (1, 1 over 1h)"
+   }
+  ],
+  "selected": [
+   "web#4",
+   "web#2mv",
+   "web#8gj"
+  ],
+  "title": "Decisions (3) acme/web",
+  "view": {
+   "kind": "repo",
+   "label": "acme/web",
+   "repo": "acme/web"
+  }
+ }
+}

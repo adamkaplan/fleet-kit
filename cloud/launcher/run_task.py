@@ -458,7 +458,7 @@ def main(argv=None, env=None):
     except cw.CloudError as e:
         print("run-task: %s" % e, file=sys.stderr)
         return e.code
-    try:
+    try:   # FAIL CLOSED: a missing, killed or silent preflight refuses
         print(cw.check_repo_preflight(a.repo, env))  # the repository preflight: after the allow-list, before any token is minted
     except cw.CloudError as e:
         print("run-task: %s" % e, file=sys.stderr)

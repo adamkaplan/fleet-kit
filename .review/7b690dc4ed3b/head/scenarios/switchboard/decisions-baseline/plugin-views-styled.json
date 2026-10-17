@@ -1,0 +1,445 @@
+{
+ "api": {
+  "ids": [
+   "api#9",
+   "api#2df",
+   "pr:acme/api#7",
+   "api#6cc"
+  ],
+  "styles": [
+   [
+    "b",
+    "m"
+   ],
+   [
+    "b+w",
+    "m",
+    "i"
+   ],
+   [
+    "m",
+    "w"
+   ],
+   [
+    ""
+   ],
+   [
+    "b"
+   ],
+   [
+    "b"
+   ],
+   [
+    "b"
+   ],
+   [
+    "m",
+    "m"
+   ],
+   [
+    ""
+   ],
+   [
+    "b"
+   ],
+   [
+    "m",
+    "m"
+   ],
+   [
+    ""
+   ],
+   [
+    "b"
+   ],
+   [
+    "b"
+   ],
+   [
+    "s",
+    "",
+    "m"
+   ],
+   [
+    ""
+   ],
+   [
+    "b"
+   ],
+   [
+    "",
+    "m"
+   ],
+   [
+    ""
+   ],
+   [
+    "b"
+   ],
+   [
+    "b"
+   ],
+   [
+    "",
+    "m"
+   ]
+  ],
+  "text": [
+   "Decisions                 acme/api",
+   "2 need human · 1 PR",
+   "4 on cos (4 over 1h)",
+   " ",
+   "Waits on you",
+   "api",
+   "Both labels on one issue",
+   "api#9                        1h06m",
+   " ",
+   "permission: shell echo hi",
+   "api#2df                      1h05m",
+   " ",
+   "Heads-up",
+   "api",
+   "#7 Add the parser            1h05m",
+   " ",
+   "Waits on cos",
+   "api               3 · oldest 1h06m",
+   " ",
+   "Waits on orchestrator",
+   "api",
+   "Which table should hold the… 1h05m"
+  ]
+ },
+ "chief": {
+  "ids": [
+   "api#9",
+   "api#2df",
+   "web#4",
+   "web#2mv",
+   "pr:acme/api#7",
+   "api#6cc"
+  ],
+  "styles": [
+   [
+    "b",
+    "m"
+   ],
+   [
+    "b+w",
+    "m",
+    "i"
+   ],
+   [
+    "m",
+    "w"
+   ],
+   [
+    ""
+   ],
+   [
+    "b"
+   ],
+   [
+    "b"
+   ],
+   [
+    "b"
+   ],
+   [
+    "m",
+    "m"
+   ],
+   [
+    ""
+   ],
+   [
+    "b"
+   ],
+   [
+    "m",
+    "m"
+   ],
+   [
+    ""
+   ],
+   [
+    "b"
+   ],
+   [
+    "b"
+   ],
+   [
+    "m",
+    "m"
+   ],
+   [
+    ""
+   ],
+   [
+    "b"
+   ],
+   [
+    "m",
+    "m"
+   ],
+   [
+    ""
+   ],
+   [
+    "b"
+   ],
+   [
+    "b"
+   ],
+   [
+    "s",
+    "",
+    "m"
+   ],
+   [
+    ""
+   ],
+   [
+    "b"
+   ],
+   [
+    "",
+    "m"
+   ],
+   [
+    "",
+    "m"
+   ],
+   [
+    ""
+   ],
+   [
+    "b"
+   ],
+   [
+    "b"
+   ],
+   [
+    "",
+    "m"
+   ]
+  ],
+  "text": [
+   "Decisions                      all",
+   "4 need human · 1 PR",
+   "4 on cos (4 over 1h)",
+   " ",
+   "Waits on you",
+   "api",
+   "Both labels on one issue",
+   "api#9                        1h06m",
+   " ",
+   "permission: shell echo hi",
+   "api#2df                      1h05m",
+   " ",
+   "web",
+   "Pick the cache layer",
+   "web#4                        1h06m",
+   " ",
+   "question: Which database?",
+   "web#2mv                      1h05m",
+   " ",
+   "Heads-up",
+   "api",
+   "#7 Add the parser            1h05m",
+   " ",
+   "Waits on cos",
+   "api               3 · oldest 1h06m",
+   "web               1 · oldest 1h05m",
+   " ",
+   "Waits on orchestrator",
+   "api",
+   "Which table should hold the… 1h05m"
+  ]
+ },
+ "human": {
+  "ids": [
+   "api#9",
+   "api#2df",
+   "web#4",
+   "web#2mv",
+   "pr:acme/api#7"
+  ],
+  "styles": [
+   [
+    "b",
+    "m"
+   ],
+   [
+    "b+w",
+    "m",
+    "i"
+   ],
+   [
+    "m",
+    "w"
+   ],
+   [
+    ""
+   ],
+   [
+    "b"
+   ],
+   [
+    "b"
+   ],
+   [
+    "b"
+   ],
+   [
+    "m",
+    "m"
+   ],
+   [
+    ""
+   ],
+   [
+    "b"
+   ],
+   [
+    "m",
+    "m"
+   ],
+   [
+    ""
+   ],
+   [
+    "b"
+   ],
+   [
+    "b"
+   ],
+   [
+    "m",
+    "m"
+   ],
+   [
+    ""
+   ],
+   [
+    "b"
+   ],
+   [
+    "m",
+    "m"
+   ],
+   [
+    ""
+   ],
+   [
+    "b"
+   ],
+   [
+    "b"
+   ],
+   [
+    "s",
+    "",
+    "m"
+   ]
+  ],
+  "text": [
+   "Decisions                  for you",
+   "4 need you · 1 PR",
+   "4 with cos (4 over 1h)",
+   " ",
+   "Waits on you",
+   "api",
+   "Both labels on one issue",
+   "api#9                        1h06m",
+   " ",
+   "permission: shell echo hi",
+   "api#2df                      1h05m",
+   " ",
+   "web",
+   "Pick the cache layer",
+   "web#4                        1h06m",
+   " ",
+   "question: Which database?",
+   "web#2mv                      1h05m",
+   " ",
+   "Heads-up",
+   "api",
+   "#7 Add the parser            1h05m"
+  ]
+ },
+ "stale": [
+  "Decisions (?)",
+  "daemon not updating"
+ ],
+ "web": {
+  "ids": [
+   "web#4",
+   "web#2mv"
+  ],
+  "styles": [
+   [
+    "b",
+    "m"
+   ],
+   [
+    "b+w"
+   ],
+   [
+    "m",
+    "w"
+   ],
+   [
+    ""
+   ],
+   [
+    "b"
+   ],
+   [
+    "b"
+   ],
+   [
+    "b"
+   ],
+   [
+    "m",
+    "m"
+   ],
+   [
+    ""
+   ],
+   [
+    "b"
+   ],
+   [
+    "m",
+    "m"
+   ],
+   [
+    ""
+   ],
+   [
+    "b"
+   ],
+   [
+    "",
+    "m"
+   ]
+  ],
+  "text": [
+   "Decisions                 acme/web",
+   "2 need human",
+   "4 on cos (4 over 1h)",
+   " ",
+   "Waits on you",
+   "web",
+   "Pick the cache layer",
+   "web#4                        1h06m",
+   " ",
+   "question: Which database?",
+   "web#2mv                      1h05m",
+   " ",
+   "Waits on cos",
+   "web               1 · oldest 1h05m"
+  ]
+ }
+}

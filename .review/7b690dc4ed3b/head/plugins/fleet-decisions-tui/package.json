@@ -1,0 +1,8 @@
+{
+  "name": "fleet-decisions-tui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A read-only OpenCode v2 TUI plugin: the Decisions list in the sidebar, read from decisions.json.",
+  "main": "tui.tsx"
+}

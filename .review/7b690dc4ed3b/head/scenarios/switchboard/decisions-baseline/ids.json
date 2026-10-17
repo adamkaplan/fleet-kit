@@ -1,0 +1,90 @@
+{
+ "1000 for one agent run past every digit triple": {
+  "count": 1000,
+  "first": [
+   "a-821",
+   "a-390",
+   "a-572"
+  ],
+  "last": [
+   "a-8acf04b7d145",
+   "a-29ecee8e07e9",
+   "a-b101d0d1b21"
+  ],
+  "unique": 1000
+ },
+ "300 on one issue": {
+  "count": 300,
+  "first": [
+   "#2kj",
+   "#2ok",
+   "#2vc"
+  ],
+  "last": [
+   "#2if",
+   "#2cc",
+   "#2et"
+  ],
+  "unique": 300
+ },
+ "700 on one issue run past every letter pair": {
+  "count": 700,
+  "first": [
+   "#2kj",
+   "#2ok",
+   "#2vc"
+  ],
+  "last": [
+   "#2-cd76833afc02",
+   "#2-29dc382f2a39",
+   "#2-8e5ac5396fdc"
+  ],
+  "unique": 700
+ },
+ "a bare issue is #N": [
+  "#5"
+ ],
+ "an id does not change when another goes away": {
+  "both": [
+   "#2vu",
+   "#2pw"
+  ],
+  "the later one alone": [
+   "#2pw"
+  ]
+ },
+ "another decision on an issue is #N and two letters": [
+  "#2wj",
+  "#2vu"
+ ],
+ "ids are the same on every call": true,
+ "no agent either: fleet and three digits": [
+  "fleet-377"
+ ],
+ "none about an issue: agent and three digits": [
+  "platform-377",
+  "platform-890"
+ ],
+ "the longer wait keeps the id, whatever the order given": [
+  [
+   "#2vu",
+   "#2im"
+  ],
+  [
+   "#2im",
+   "#2vu"
+  ]
+ ],
+ "the same wait: the seed decides": [
+  "#2jh",
+  "#2ll"
+ ],
+ "two repos, no repo list: the second takes the next free id": [
+  "#5",
+  "#5uq"
+ ],
+ "with two repos the tag names the repo": [
+  "web#5",
+  "api#5"
+ ]
+}

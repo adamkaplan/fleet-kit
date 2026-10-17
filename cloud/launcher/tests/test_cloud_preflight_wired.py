@@ -76,8 +76,9 @@ class S2Passes(Wired):
 
 class S3FailClosed(Wired):
     def test_a_missing_killed_or_silent_program_refuses_and_mints_nothing(self):
-        for kind, argv in (("missing", ["/nonexistent/preflight"]), ("killed", ["sh", "-c", "kill -9 $$"]), ("empty output", ["true"])):
-            with self.subTest(kind), mock.patch.object(cw, "PREFLIGHT_ARGV", argv):
+        for kind, argv in (("missing", ["/nonexistent/preflight"]), ("killed", ["sh", "-c", "kill -9 $$"]), ("empty output", ["true"]),
+                           ("timed out", ["sleep", "5"]), ("non-zero, no message", ["sh", "-c", "exit 3"])):
+            with self.subTest(kind), mock.patch.object(cw, "PREFLIGHT_ARGV", argv), mock.patch.object(cw, "PREFLIGHT_SECONDS", 1):
                 code, out, err = self.drive()
                 self.assertEqual(code, 2, err)
                 self.assertIn("refused", err)

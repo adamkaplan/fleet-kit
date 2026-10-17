@@ -1,0 +1,86 @@
+[
+ {
+  "argv": "decisions answer api#101 --row 4=x",
+  "as": "cos",
+  "code": 2,
+  "err": "fleet-switchboard: row 4 does not exist: api#101 has rows 1 to 3\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions answer api#101 --row 0=x",
+  "as": "cos",
+  "code": 2,
+  "err": "fleet-switchboard: row 0 does not exist: api#101 has rows 1 to 3\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions answer api#101 --row 1=a --row 1=b",
+  "as": "cos",
+  "code": 2,
+  "err": "fleet-switchboard: row 1 is answered twice\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions answer api#101 --row x",
+  "as": "cos",
+  "code": 2,
+  "err": "fleet-switchboard: 'x' is not a row answer: write --row N=<choice>\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions answer api#101 --row 1=",
+  "as": "cos",
+  "code": 2,
+  "err": "fleet-switchboard: '1=' is not a row answer: write --row N=<choice>\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions answer api#101 --as-recommended --row 1=a",
+  "as": "cos",
+  "code": 2,
+  "err": "fleet-switchboard: api#101 is a batch of 3 rows: answer it with --as-recommended, or --row N=<choice> for the rows that change (the rest keep their recommendation); not both, not neither\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions answer api#101",
+  "as": "cos",
+  "code": 2,
+  "err": "fleet-switchboard: api#101 is a batch of 3 rows: answer it with --as-recommended, or --row N=<choice> for the rows that change (the rest keep their recommendation); not both, not neither\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions answer api#101 allow",
+  "as": "cos",
+  "code": 2,
+  "err": "fleet-switchboard: api#101 is a batch of 3 rows: answer it with --as-recommended, or --row N=<choice> for the rows that change (the rest keep their recommendation); not both, not neither\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions answer api#101 --as-recommended",
+  "as": "api-orch",
+  "code": 2,
+  "err": "fleet-switchboard: only the Chief of Staff, or you in a plain shell, may answer a decision; api-orch is a orchestrator. Raise it with `fleet-switchboard report question \"...\"` and your awaiting-cos label\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions answer api#2 --as-recommended",
+  "as": "cos",
+  "code": 2,
+  "err": "fleet-switchboard: api#2 is not a batch: --as-recommended and --row answer a batch; answer this with its own value\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions answer api#2 allow",
+  "as": "cos",
+  "code": 2,
+  "err": "fleet-switchboard: api#2 is an issue: `decisions answer` is for a permission request or a question. Answer a report with `fleet-switchboard send`; an issue with a comment, then `decisions resolve`\n",
+  "out": ""
+ },
+ {
+  "argv": "decisions answer api#2",
+  "as": "cos",
+  "code": 2,
+  "err": "fleet-switchboard: answer api#2 with a value: `allow` or `deny` for a permission request, the text for a question\n",
+  "out": ""
+ }
+]

@@ -1,0 +1,27 @@
+{
+  "id": "D4",
+  "title": "The decisions file is deleted and the next pass writes it again",
+  "problem": null,
+  "since_pr": 14,
+  "tiers": ["offline"],
+  "cast": {
+    "platform": {"role": "orchestrator", "charter": 1},
+    "coder": {"role": "coder", "reports_to": "platform", "issue": 2}
+  },
+  "issues": {
+    "2": {"intent": "Add a health check", "done_when": "GET /health returns 200"}
+  },
+  "steps": [
+    {"at": "10s", "actor": "coder", "do": "report", "state": "question", "text": "Which database?", "issue": 2},
+    {"at": "42s", "actor": "world", "do": "delete-decisions",
+     "why": "A projection: deleting it loses nothing. Just after a pass, so the next one is 3 s away"},
+    {"at": "60s", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "listed", "that": "decisions", "at": "40s", "count": 1, "text": "Which database?"},
+    {"name": "missing-meanwhile", "that": "decisions_say", "at": "42s", "text": "not updating this list"},
+    {"name": "back", "that": "decisions", "at": "60s", "count": 1, "text": "Which database?",
+     "why": "Nothing was lost: the next pass derived the same list again"}
+  ],
+  "control": {"fault": "no-decisions-file", "fails": ["listed", "back"]}
+}

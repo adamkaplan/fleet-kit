@@ -1203,8 +1203,9 @@ class TestLaunchRunsThePreflight(Base):
         self.assertTrue(self.mint.exists())
 
     def test_s3_a_missing_killed_or_silent_program_refuses_with_exit_2_and_no_mint(self):
-        for kind, argv in (("missing", ["/nonexistent/preflight"]), ("killed", ["sh", "-c", "kill -9 $$"]), ("empty output", ["true"])):
-            with self.subTest(kind), mock.patch.object(self.lib, "PREFLIGHT_ARGV", argv):
+        for kind, argv in (("missing", ["/nonexistent/preflight"]), ("killed", ["sh", "-c", "kill -9 $$"]), ("empty output", ["true"]),
+                           ("timed out", ["sleep", "5"]), ("non-zero, no message", ["sh", "-c", "exit 3"])):
+            with self.subTest(kind), mock.patch.object(self.lib, "PREFLIGHT_ARGV", argv), mock.patch.object(self.lib, "PREFLIGHT_SECONDS", 1):
                 code, out, err = self.launch()
                 self.assertEqual(code, 2, err)
                 self.assertIn("refused", err)

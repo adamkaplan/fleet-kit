@@ -1,0 +1,22 @@
+{
+ "file text, cos": {
+  "code": 0,
+  "err": "",
+  "out": "Decisions: all repos, all tiers (for chief-of-staff)\napi#2    waiting 12m  [cos]  api-coder  Which database?\napi#9    waiting 12m  [human]  -          Both labels on one issue\nweb#4    waiting 12m  [human]  -          Pick the cache layer\napi#101  waiting 11m  [cos]  -          Cleanup of stale issues\napi#2df  waiting 11m  [human]  api-coder  permission: shell echo hi\nweb#2mv  waiting 11m  [human]  web-coder  question: Which database?\napi#6cc  waiting 11m  [orchestrator]  api-coder  Which table should hold the totals?\napi#7hz  waiting 11m  [cos]  api-orch   blocked: cannot build until the key is rotated\nweb#8gj  waiting 11m  [cos]  web-orch   Which region for the cache?\n"
+ },
+ "file text, you": {
+  "code": 0,
+  "err": "",
+  "out": "Decisions: all repos, tier human (for you)\napi#9    waiting 12m  -          Both labels on one issue\nweb#4    waiting 12m  -          Pick the cache layer\napi#2df  waiting 11m  api-coder  permission: shell echo hi\nweb#2mv  waiting 11m  web-coder  question: Which database?\n"
+ },
+ "fresh text, cos": {
+  "code": 0,
+  "err": "",
+  "out": "Decisions: all repos, all tiers (for chief-of-staff)\napi#2    waiting 12m  [cos]  api-coder  Which database?\napi#9    waiting 12m  [human]  -          Both labels on one issue\nweb#4    waiting 12m  [human]  -          Pick the cache layer\napi#101  waiting 11m  [cos]  -          Cleanup of stale issues\napi#2df  waiting 11m  [human]  api-coder  permission: shell echo hi\nweb#2mv  waiting 11m  [human]  web-coder  question: Which database?\napi#6cc  waiting 11m  [orchestrator]  api-coder  Which table should hold the totals?\n      no send from api-orch to api-coder in the last 72 hours\napi#7hz  waiting 11m  [cos]  api-orch   blocked: cannot build until the key is rotated\n      no send from cos to api-orch in the last 72 hours\nweb#8gj  waiting 11m  [cos]  web-orch   Which region for the cache?\n      no send from cos to web-orch in the last 72 hours\n"
+ },
+ "fresh text, you": {
+  "code": 0,
+  "err": "",
+  "out": "Decisions: all repos, tier human (for you)\napi#9    waiting 12m  -          Both labels on one issue\nweb#4    waiting 12m  -          Pick the cache layer\napi#2df  waiting 11m  api-coder  permission: shell echo hi\nweb#2mv  waiting 11m  web-coder  question: Which database?\n"
+ }
+}

@@ -1,0 +1,34 @@
+{
+  "id": "D6",
+  "title": "Two repos, an awaiting-user issue each with the same number: two decisions, each naming its repo",
+  "problem": null,
+  "since_pr": 15,
+  "tiers": ["offline"],
+  "tags": ["multi-repo"],
+  "cast": {
+    "api-orch": {"role": "orchestrator", "charter": 1, "repo": "acme/api"},
+    "web-orch": {"role": "orchestrator", "charter": 1, "repo": "acme/web"}
+  },
+  "repos": {
+    "acme/api": {"account": "alice-bot"},
+    "acme/web": {"account": "acme-ci"}
+  },
+  "issues": {
+    "acme/api#1": {"intent": null},
+    "acme/web#1": {"intent": null}
+  },
+  "steps": [
+    {"at": "20s", "actor": "api-orch", "do": "awaiting", "repo": "acme/api", "issue": 2, "on": true,
+     "title": "Ship the API?",
+     "why": "Each repo's orchestrator labels its own issue number 2; the two are different questions"},
+    {"at": "25s", "actor": "web-orch", "do": "awaiting", "repo": "acme/web", "issue": 2, "on": true,
+     "title": "Launch the page?"},
+    {"at": "90s", "actor": "world", "do": "wait", "why": "Both repos were read, each with its own account"}
+  ],
+  "expect": [
+    {"name": "two-decisions", "that": "decisions", "at": "90s", "count": 2},
+    {"name": "api-tag", "that": "decisions_say", "at": "90s", "text": "api#2  waiting"},
+    {"name": "web-tag", "that": "decisions_say", "at": "90s", "text": "web#2  waiting"}
+  ],
+  "control": {"fault": "bare-issue-number", "fails": ["api-tag", "web-tag"]}
+}

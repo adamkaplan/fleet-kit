@@ -1,0 +1,39 @@
+{
+  "id": "C2",
+  "title": "An edit to the config file is applied without a restart; a broken edit leaves the daemon running and says so; fixing it recovers",
+  "problem": null,
+  "since_pr": 16,
+  "tiers": ["offline"],
+  "tags": ["config"],
+  "cast": {
+    "platform": {"role": "orchestrator", "charter": 1, "repo": "acme/api"}
+  },
+  "repos": {
+    "acme/api": {"account": "alice-bot"},
+    "acme/web": {"account": "acme-ci"},
+    "acme/docs": {"account": "acme-ci"}
+  },
+  "issues": {
+    "acme/api#1": {"intent": null}
+  },
+  "steps": [
+    {"at": "20s", "actor": "world", "do": "edit-config", "add_repo": "acme/web",
+     "why": "The person adds a watched repo to the config file; nobody restarts the daemon"},
+    {"at": "60s", "actor": "world", "do": "edit-config", "broken": true,
+     "why": "An editor leaves the file half written"},
+    {"at": "100s", "actor": "world", "do": "edit-config", "add_repo": "acme/docs",
+     "why": "The file is fixed, and says something new"},
+    {"at": "130s", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "edit-applied", "that": "repo_watch", "repo": "acme/web", "how": "forwarder",
+     "why": "The daemon reloaded the file by itself and started the forwarder"},
+    {"name": "says-invalid", "that": "config_says", "at": "90s", "text": "INVALID",
+     "why": "status shows the broken file as a first-class line"},
+    {"name": "still-watching", "that": "repo_watch", "repo": "acme/api", "how": "forwarder",
+     "why": "The daemon went on running on the config it had"},
+    {"name": "fix-recovers", "that": "repo_watch", "repo": "acme/docs", "how": "forwarder",
+     "why": "Fixed, the file is applied; nothing stayed stuck on the invalid one"}
+  ],
+  "control": {"fault": "config-read-once", "fails": ["edit-applied", "says-invalid", "fix-recovers"]}
+}

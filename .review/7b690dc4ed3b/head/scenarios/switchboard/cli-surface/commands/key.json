@@ -1,0 +1,4 @@
+{
+ "command": "key",
+ "help": "usage: fleet-switchboard key [-h] {set,status} ... positional arguments: {set,status} set Read the key from standard input (hidden at a terminal) into a private file status Say where the key comes from: file, environment or none options: -h, --help show this help message and exit"
+}

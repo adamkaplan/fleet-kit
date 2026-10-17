@@ -958,7 +958,7 @@ def _launch(args, runner, now, reserve):
     if not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", branch) or branch.startswith("-"):
         raise LaunchError("--branch is not a branch name: %r" % branch)
     check_allowed(repo)   # before anything is read, minted or created
-    try:   # the repository preflight, before any token is minted (stdout stays the one JSON line)
+    try:   # the repository preflight, before any token is minted; FAIL CLOSED: a missing, killed or silent program refuses (stdout stays the one JSON line)
         print(_lib().check_repo_preflight(repo, {k: v for k, v in os.environ.items() if k not in CLUSTER_DROP}), file=sys.stderr)
     except _lib().CloudError as err:
         raise Refusal(str(err)) from None
