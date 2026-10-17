@@ -118,7 +118,10 @@ def _make_dirs(root, rel_parts, made):
         try:
             info = os.lstat(here)
         except FileNotFoundError:
-            os.mkdir(here, 0o700)
+            try:
+                os.mkdir(here, 0o700)
+            except OSError as err:
+                raise Unsafe("%s cannot be created: %s" % (_shown(here), err.strerror or err)) from None
             made.append(here)
             continue
         if not stat.S_ISDIR(info.st_mode):
@@ -202,14 +205,17 @@ def checkout(api, repo, number, head, base, cwd, limits=None, notify=lambda text
             shutil.rmtree(parent, ignore_errors=True)
         raise
     try:
-        merge_base = base
+        merge_base, fallback = base, False
         try:
             cmp = api("repos/%s/compare/%s...%s?per_page=1" % (repo, base, head))
             found = ((cmp or {}).get("merge_base_commit") or {}).get("sha") if isinstance(cmp, dict) else None
             if isinstance(found, str) and SHA_RE.fullmatch(found):
                 merge_base = found
-        except Exception:   # the base copy then comes from the base commit itself
-            pass
+            if merge_base == base and found != base:
+                fallback = True
+        except Problem as err:   # the base copy then comes from the base commit itself, said aloud and recorded in the marker
+            fallback = True
+            notify("the merge base could not be read (%s): the base copies come from the base commit %s" % (err, base[:12]))
         head_files, skipped, refused = read_tree(api, repo, head, limits)
         base_files, base_skipped, base_refused = read_tree(api, repo, merge_base, limits)
         refused = refused + [(p + " (base)", w) for p, w in base_refused]
@@ -223,11 +229,14 @@ def checkout(api, repo, number, head, base, cwd, limits=None, notify=lambda text
         total = sum(v[1] for v in head_files.values()) + sum(base_files[p][1] for p in touched if p in base_files)
         if total > limits["total"]:
             raise OverBound("the head and base copies are %d bytes in all, over the limit of %d bytes in total" % (total, limits["total"]))
-        cache = {}
+        cache, fetched = {}, [0]
 
         def blob(entry):
             if entry[0] not in cache:
                 cache[entry[0]] = fetch_blob(api, repo, entry[0], limits)
+                fetched[0] += len(cache[entry[0]])
+                if fetched[0] > limits["total"]:
+                    raise OverBound("the blobs fetched are %d bytes in all, over the limit of %d bytes in total" % (fetched[0], limits["total"]))
             return cache[entry[0]]
 
         os.mkdir(os.path.join(root, "head"), 0o700)
@@ -247,7 +256,7 @@ def checkout(api, repo, number, head, base, cwd, limits=None, notify=lambda text
             diff.append(piece)
         write_file(root, "pr.diff", "".join(diff).encode())
         write_file(root, MARKER, (json.dumps({"tool": MARKER_TOOL, "pr": "%s#%d" % (repo, number), "head": head, "base": base,
-                                              "merge_base": merge_base, "touched": len(touched)}, indent=1, sort_keys=True) + "\n").encode())
+                                              "merge_base": merge_base, "merge_base_fallback": fallback, "touched": len(touched)}, indent=1, sort_keys=True) + "\n").encode())
         for path, why in skipped:
             notify("skipped %s: %s (never followed or created)" % (_shown(path), why))
         make_readonly(root)
@@ -305,8 +314,9 @@ def remove(directory, cwd):
         info = os.lstat(marker)
         if not stat.S_ISREG(info.st_mode):
             raise ValueError("not a file")
-        data = json.loads(open(marker, encoding="utf-8").read())
-        if not isinstance(data, dict) or data.get("tool") != MARKER_TOOL or data.get("head", "")[:12] != os.path.basename(absolute):
+        with open(marker, encoding="utf-8") as handle:
+            data = json.loads(handle.read(65536))
+        if not isinstance(data, dict) or data.get("tool") != MARKER_TOOL or not isinstance(data.get("head"), str) or data["head"][:12] != os.path.basename(absolute):
             raise ValueError("not our marker")
     except (OSError, ValueError, AttributeError):
         raise Unsafe("%s has no marker of this command: it was not created by it, so it is left alone" % _shown(directory)) from None

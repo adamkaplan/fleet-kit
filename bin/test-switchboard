@@ -55047,7 +55047,7 @@ class TestReviewCheckout(LedgerBase):
         self.extra_entries = [link] + [{"path": p, "type": "blob", "mode": m, "sha": "f" * 40, "size": 1} for p, m in hostile]
         code, out, err = self.checkout()
         self.assertEqual(code, 1)
-        for name in ("up.txt", "abs.txt", "nul", "b.txt"):
+        for name in ("up.txt", "abs.txt", "nul\\\\x00.txt", "b.txt"):
             self.assertIn(name, err)
         self.assertIn("'link'", err)
         self.made_nothing()
@@ -55095,6 +55095,27 @@ class TestReviewCheckout(LedgerBase):
         self.assertEqual((root / "head" / "a.txt").read_text(), "one changed\n")
         self.assertFalse((root / "head" / "tip.txt").exists())
         self.assertFalse(any(self.OLD_TIP in p for p in self.fetched if "/git/trees/" in p or "/compare/" in p))
+
+    def test_a_failed_compare_falls_back_to_the_base_commit_aloud_and_in_the_marker(self):
+        plain = self.route
+        self.route = lambda argv, **kw: (subprocess.CompletedProcess(argv, 1, "", "gh: boom") if "/compare/" in " ".join(argv) else plain(argv, **kw))
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        self.assertIn("merge base could not be read", err)
+        marker = json.loads((Path(out.strip()) / ".fleet-review-checkout").read_text())
+        self.assertTrue(marker["merge_base_fallback"])
+
+    def test_remove_refuses_a_marker_that_is_malformed_or_names_another_head(self):
+        for text in ("{not json", json.dumps({"tool": "fleet-switchboard review checkout", "head": 5}),
+                     json.dumps({"tool": "fleet-switchboard review checkout", "head": "9" * 40})):
+            with self.subTest(marker=text[:20]):
+                d = self.cwd / ".review" / LEDGER_HEAD[:12]
+                d.mkdir(parents=True)
+                (d / ".fleet-review-checkout").write_text(text)
+                code, out, err = self.run_as("coder", "review", "checkout", "--remove", str(d))
+                self.assertEqual(code, 1)
+                self.assertTrue(d.is_dir())
+                shutil.rmtree(d)
 
     def test_a_directory_that_exists_is_not_overwritten(self):
         self.assertEqual(self.checkout()[0], 0)
