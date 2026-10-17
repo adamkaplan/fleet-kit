@@ -1,4 +1,0 @@
-{
- "command": "judge-tool",
- "help": "usage: fleet-switchboard judge-tool [-h] options: -h, --help show this help message and exit"
-}

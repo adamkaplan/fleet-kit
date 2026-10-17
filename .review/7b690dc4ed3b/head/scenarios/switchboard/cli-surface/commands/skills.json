@@ -1,4 +1,0 @@
-{
- "command": "skills",
- "help": "usage: fleet-switchboard skills [-h] {check,sync} ... positional arguments: {check,sync} check Say whether the installed skills equal the kit's; exit 1 naming each that differs or is missing sync Copy exactly the kit's skills into the installed folders, keeping a backup of each file replaced options: -h, --help show this help message and exit"
-}

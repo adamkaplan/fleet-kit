@@ -1,4 +1,0 @@
-{
- "command": "read",
- "help": "usage: fleet-switchboard read [-h] [--limit LIMIT] name positional arguments: name The agent's fleet name options: -h, --help show this help message and exit --limit LIMIT How many messages (default 20, at most 200)"
-}

@@ -1,4 +1,0 @@
-{
- "command": "intents",
- "help": "usage: fleet-switchboard intents [-h] options: -h, --help show this help message and exit"
-}
