@@ -438,6 +438,9 @@ def charter_agent(body):
 
 def charter_retired(body):
     """True only when a charter's yaml says `status: retired`: a body that cannot be read, or says anything else, is not a retired signal."""
+    body = body if isinstance(body, str) else ""
+    fenced = re.match(r"\s*```ya?ml[ \t]*\r?\n(.*?)^```", body, re.S | re.M)   # a charter opens with its yaml block: a line in a quote or later fence is not its status
+    body = fenced.group(1) if fenced else body
     return bool(re.search(r"^status:[ \t]*retired[ \t]*(?:#[^\r\n]*)?\r?$", body if isinstance(body, str) else "", re.M))
 
 
@@ -524,14 +527,16 @@ def _resolve_charters(ctx, state, now, budget):
             problems.append(text)
             cache[repo] = dict(entry, tried=now, error=text)
             continue
-        named, gone = {}, set()
+        named, dead = {}, set()
         for number, body in found:
             agent = charter_agent(body)
             if agent:
                 named[number] = agent
                 if charter_retired(body):
-                    gone.add(agent)
-        cache[repo] = {"at": now, "map": {a: n for n, a in sorted(named.items(), reverse=True)}, "named": {str(n): a for n, a in named.items()}, "retired": sorted(gone)}   # the lowest number wins a duplicate
+                    dead.add(number)
+        chosen = {a: n for n, a in sorted(named.items(), reverse=True)}   # the charter the agent is known by (the lowest number)
+        gone = {a for a in chosen if all(n in dead for n, who in named.items() if who == a)}   # retired only when EVERY open charter naming it says so: a live one left open (a relaunch) keeps it
+        cache[repo] = {"at": now, "map": chosen, "named": {str(n): a for n, a in named.items()}, "retired": sorted(gone)}   # the lowest number wins a duplicate
     for name, info in ctx.orchestrators.items():
         entry = cache.get(info.get("repo")) or {}
         mapped, fallback = (entry.get("map") or {}).get(name), info.get("charter")

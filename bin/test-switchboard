@@ -58172,6 +58172,22 @@ class TestLoadAlert(Base):
         got = self._load_names({"a": "s1", "b": "s2"}, bodies={2: "orchestrator: b\nstatus: retired\n", 1: "orchestrator: a\nstatus: active\n"})
         self.assertEqual(got, ["a"])
 
+    def test_a_retired_and_a_live_charter_naming_the_same_agent_show_the_agent(self):
+        got = self._load_names({"a": "s1"}, bodies={10: "orchestrator: a\nstatus: retired\n", 20: "orchestrator: a\nstatus: active\n"})
+        self.assertEqual(got, ["a"])   # one live charter keeps it shown
+        got = self._load_names({"a": "s1"}, bodies={10: "orchestrator: a\nstatus: active\n", 20: "orchestrator: a\nstatus: retired\n"})
+        self.assertEqual(got, ["a"])
+
+    def test_two_charters_naming_one_agent_that_both_say_retired_hide_it(self):
+        got = self._load_names({"a": "s1"}, bodies={10: "orchestrator: a\nstatus: retired\n", 20: "orchestrator: a\nstatus: retired\n"})
+        self.assertEqual(got, [])
+
+    def test_a_status_line_outside_the_leading_yaml_block_does_not_retire(self):
+        body = "```yaml\norchestrator: a\nstatus: active\n```\n\nquoted:\nstatus: retired\n"
+        self.assertEqual(self._load_names({"a": "s1"}, bodies={1: body}), ["a"])
+        self.assertTrue(self.health.charter_retired("```yaml\norchestrator: a\nstatus: retired\n```\n"))
+        self.assertFalse(self.health.charter_retired("orchestrator: a\nstatus: retiredX\n"))
+
     def test_an_undone_retirement_and_a_never_retired_orchestrator_keep_their_rows(self):   # S3
         got = self._load_names({"a": "s1", "b": "s2"}, retired={})
         self.assertEqual(got, ["a", "b"])
