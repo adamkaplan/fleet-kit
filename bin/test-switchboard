@@ -16749,6 +16749,20 @@ class TestGhShimGateProbe(Base):
         done, seen = self.merge_decided([self.review_at("CHANGES_REQUESTED", "reviewer-a", self.OLD)], "APPROVED")
         self.assertEqual(done.returncode, 7, done.stderr)
 
+    def test_a_review_without_a_commit_blocks_and_a_comment_before_it_or_another_changes_request_does_not_clear_it(self):
+        for reviews in ([self.review("CHANGES_REQUESTED", "reviewer-a")],
+                        [self.review_at("COMMENTED", "reviewer-a", self.HEAD), self.review_at("CHANGES_REQUESTED", "reviewer-a", self.HEAD)],
+                        [self.review_at("CHANGES_REQUESTED", "reviewer-a", self.OLD), self.review_at("COMMENTED", "reviewer-a", self.OLD),
+                         self.review_at("CHANGES_REQUESTED", "reviewer-a", self.HEAD)]):
+            with self.subTest(reviews=[r["state"] for r in reviews]):
+                done, seen = self.merge_decided(reviews, None)
+                self.assertEqual((done.returncode, seen), (10, None), done.stderr)
+
+    def test_a_same_head_changes_requested_review_answered_by_the_same_reviewers_comment_stops_blocking_when_github_gives_no_decision(self):
+        reviews = [self.review_at("CHANGES_REQUESTED", "reviewer-a", self.HEAD), self.review_at("COMMENTED", "reviewer-a", self.HEAD)]
+        done, seen = self.merge_decided(reviews, "")   # the intended rule; GitHub's branch protection is the boundary
+        self.assertEqual(done.returncode, 7, done.stderr)
+
     def test_s4_a_newer_comment_by_another_reviewer_does_not_supersede(self):
         reviews = [self.review_at("CHANGES_REQUESTED", "reviewer-a", self.HEAD), self.review_at("COMMENTED", "reviewer-b", self.HEAD)]
         done, seen = self.merge_decided(reviews, "")

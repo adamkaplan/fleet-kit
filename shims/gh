@@ -650,7 +650,8 @@ def review_blockers(reviews, head="", decision=""):
     """The reviewers whose latest decisive review (APPROVED, CHANGES_REQUESTED or DISMISSED) is CHANGES_REQUESTED AND still blocks this head: it is at the
     PR's current head (its commit oid equals `head`), or its commit is not known, or GitHub's `decision` (reviewDecision) is CHANGES_REQUESTED. A
     later review by the same reviewer of any kind, a plain comment included, supersedes an earlier changes-requested one for this rule only, unless
-    GitHub's own decision still says CHANGES_REQUESTED."""
+    GitHub's own decision still says CHANGES_REQUESTED. Where GitHub gives no decision (no required reviews) this guard fails open on a
+    superseded or old-head review: it is a guardrail, GitHub's branch protection is the boundary. `tagged_blockers` is separate and ignores comments."""
     latest = {}
     for review in reviews if isinstance(reviews, list) else []:
         if not isinstance(review, dict):
