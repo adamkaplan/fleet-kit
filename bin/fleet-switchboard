@@ -123,14 +123,43 @@ def load_module(name):
         return module
 
 
-def load_decision_core():
-    """The pure core of the Decision subsystem, bin/decision_core.py, loaded by path from beside this file.
+HELPER_MODULES = {   # the old `load_<module>()` names: each returns `load_module(<name>)`. A NEW module needs no line here: call `load_module("name")`.
+    "load_decision_core": "decision_core",
+    "load_plan_check": "plan_check",
+    "load_plan_ledger": "plan_ledger",
+    "load_launch_testers": "launch_testers",
+    "load_report_fold": "report_fold",
+    "load_triage_plan_open": "triage_plan_open",
+    "load_pr_events": "pr_events",
+    "load_disk_janitor": "disk_janitor",
+    "load_heavy_slots": "heavy_slots",
+    "load_cpu_guard": "cpu_guard",
+    "load_agent_presence": "agent_presence",
+    "load_health_records": "health_records",
+    "load_reds": "reds",
+    "load_impact_floor": "impact_floor",
+    "load_plan_review": "plan_review",
+    "load_external_adapter": "external_adapter",
+    "load_decision_sync": "decision_sync",
+    "load_work_sync": "work_sync",
+    "load_agent_calls": "agent_calls",
+    "load_triage_digest": "triage_digest",
+    "load_dead_hint": "dead_hint",
+    "load_fleet_health": "fleet_health",
+}
 
-    Not by `import`: this file has no .py name, is run through a symlink (~/.local/bin), by the daemon's service
-    unit, by wrappers, and is loaded by tests with SourceFileLoader, and none of those puts its directory on
-    sys.path. The real path of this file (symlinks resolved) is always right. A copy already loaded from the
-    same file is reused, so two loads of this script share one module."""
-    return load_module("decision_core")
+
+def _make_loader(function, module):
+    def loader():
+        return load_module(module)
+    loader.__name__ = loader.__qualname__ = function
+    loader.__doc__ = "The helper module bin/%s.py, loaded by path from beside this file (`load_module(%r)`)." % (module, module)
+    return loader
+
+
+for _function, _module in HELPER_MODULES.items():
+    globals()[_function] = _make_loader(_function, _module)
+del _function, _module
 
 
 decision_core = load_decision_core()
@@ -145,71 +174,14 @@ def run_cloud(function, *arguments):
         raise LaunchError(str(err)) from None
 
 
-def load_plan_check():
-    """The plan checker, bin/plan_check.py (#135), loaded by path from beside this file, as load_decision_core does."""
-    return load_module("plan_check")
 
 
-def load_plan_ledger():
-    """The evidence ledger and gates, bin/plan_ledger.py (#107), loaded by path like plan_check."""
-    return load_module("plan_ledger")
 
 
-def load_launch_testers():
-    """The launch-record testers' pure core, bin/launch_testers.py (#372), loaded by path like plan_check."""
-    return load_module("launch_testers")
 
 
-def load_report_fold():
-    """The report fold's pure core, bin/report_fold.py (#352), loaded by path like plan_check."""
-    return load_module("report_fold")
 
 
-def load_triage_plan_open():
-    """The plan-issue-still-open rule, bin/triage_plan_open.py (#384), loaded by path like plan_check."""
-    return load_module("triage_plan_open")
-
-
-def load_pr_events():
-    """The webhook-event rule for `pr-state`, bin/pr_events.py (#354), loaded by path like plan_check."""
-    return load_module("pr_events")
-
-
-def load_disk_janitor():
-    """The temp-directory janitor, bin/disk_janitor.py (#321), loaded by path like plan_check."""
-    return load_module("disk_janitor")
-
-
-def load_heavy_slots():
-    """The CPU slots for heavy commands, bin/heavy_slots.py (#34), loaded by path like the other modules."""
-    return load_module("heavy_slots")
-
-
-def load_cpu_guard():
-    """The CPU guard, bin/cpu_guard.py (the P0 CPU order), loaded by path like plan_check."""
-    return load_module("cpu_guard")
-
-
-def load_agent_presence():
-    """The presence rule for a worker with no terminal, bin/agent_presence.py (#433), loaded by path like cpu_guard."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "agent_presence.py")
-    held = sys.modules.get("agent_presence")
-    if held is not None and os.path.realpath(getattr(held, "__file__", "") or "") == path:
-        return held
-    spec = importlib.util.spec_from_file_location("agent_presence", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["agent_presence"] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop("agent_presence", None)
-        raise
-    return module
-
-
-def load_health_records():
-    """The health recorders, bin/health_records.py (#357), loaded by path like disk_janitor."""
-    return load_module("health_records")
 
 
 def health_recorder(engine):
@@ -268,14 +240,6 @@ def health_write(engine, state, now):
         _health_fault(engine, "write", err)
 
 
-def load_reds():
-    """`reds`, bin/reds.py (#342), loaded by path like the other modules."""
-    return load_module("reds")
-
-
-def load_impact_floor():
-    """The impact floor and hold table, bin/impact_floor.py (#179, L3), loaded by path like plan_check."""
-    return load_module("impact_floor")
 
 
 class _LazyImpactFloor:
@@ -285,10 +249,6 @@ class _LazyImpactFloor:
 
 impact_floor = _LazyImpactFloor()
 
-
-def load_plan_review():
-    """The plan review engine's pure core, bin/plan_review.py (#109), loaded by path like plan_check."""
-    return load_module("plan_review")
 
 
 class _LazyPlanReview:
@@ -322,49 +282,22 @@ class _LazyPlanCheck:
 plan_check = _LazyPlanCheck()
 
 
-def load_external_adapter():
-    """The generic external adapter, bin/external_adapter.py, loaded by path from beside this file, the way
-    load_decision_core loads the core. Called only when an external decision system is switched on and names this
-    adapter: while it is off the file is never read or imported."""
-    return load_module("external_adapter")
-
-
-def load_decision_sync():
-    """The sync engine for external decision systems, bin/decision_sync.py, loaded by path like decision_core (it
-    imports decision_core, which is already registered)."""
-    return load_module("decision_sync")
 
 
 decision_sync = load_decision_sync()
 
 
-def load_work_sync():
-    """The work-item pump, bin/work_sync.py, loaded by path like the others."""
-    return load_module("work_sync")
-
 
 work_sync = load_work_sync()
 
-
-def load_agent_calls():
-    """The agent-shell call counter, bin/agent_calls.py (#367), loaded by path like the others."""
-    return load_module("agent_calls")
 
 
 agent_calls = load_agent_calls()
 
 
-def load_triage_digest():
-    """The stale digest's rules and files, bin/triage_digest.py (#349), loaded by path like the others."""
-    return load_module("triage_digest")
-
 
 triage_digest = load_triage_digest()
 
-
-def load_dead_hint():
-    """The DEAD agent's hint, bin/dead_hint.py (#379), loaded by path like the others."""
-    return load_module("dead_hint")
 
 
 dead_hint = load_dead_hint()
@@ -480,13 +413,14 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_floor", "impact_hold", "chat_clear", "temp_janitor", "load_alert", "source_budgets", "hold_labels"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_hold", "load_alert", "source_budgets", "hold_labels"}
 
 
 CONFIG_DECLARATION_TEXT = re.compile(rb'^[ \t]*CONFIG_KEY[ \t]*(?::[^=\n]*)?=[ \t]*[\'"]([^\'"\n]*)[\'"]', re.M)   # only the fallback for a file that does not parse
 CONFIG_KEY_FORM = re.compile(r"[a-z][a-z0-9_]*")
 CONFIG_READ_BYTES = 1000000
-CONFIG_MUST_DECLARE = {"excluded_repos": "repo_exclusion", "spotlight_guard": "spotlight_guard"}   # keys that MUST be declared by their module: a missing, truncated or unmatched declaration refuses the whole configuration (an unvalidated `excluded_repos` would exclude nothing)
+CONFIG_MUST_DECLARE = {"excluded_repos": "repo_exclusion", "spotlight_guard": "spotlight_guard", "temp_janitor": "disk_janitor", "chat_clear": "chat_clear",
+                       "impact_floor": "impact_floor"}   # keys that MUST be declared by their module: a missing, truncated or unmatched declaration refuses the whole configuration (an unvalidated `excluded_repos` would exclude nothing, an unvalidated `impact_floor` could hold nothing)
 CONFIG_DECLARATIONS_DIR = None   # None = the bin directory beside this program; only a test points it elsewhere (never configuration or input)
 _DECLARED_CACHE = {}
 
@@ -699,21 +633,9 @@ def validate_config(raw, source="config"):
     validate_worktree_config(config, source)
     validate_orphan_config(config, source)
     validate_order_burst(config, source)
-    try:
-        load_disk_janitor().validate(config.get("temp_janitor"), source)
-    except ValueError as err:
-        raise ConfigError(str(err))
-    raw_chat = config.get("chat_clear")
-    if raw_chat is not None and (not isinstance(raw_chat, dict) or set(raw_chat) - {"enabled", "live"} or any(not isinstance(v, bool) for v in raw_chat.values())):
-        raise ConfigError("%s: 'chat_clear' must be {\"enabled\": true|false, \"live\": true|false}, got %r" % (source, raw_chat))   # #457: live is the owner's key
     if config.get("impact_hold") is not None:   # #179 L4: the hold is off unless `enabled` is true
         try:
             impact_floor.validate_hold_config(config["impact_hold"])
-        except ValueError as err:
-            raise ConfigError("%s: %s" % (source, err)) from None
-    if config.get("impact_floor") is not None:   # #179 L3: a string where a list belongs must fail loudly, never hold nothing
-        try:
-            impact_floor.validate_config(config["impact_floor"])
         except ValueError as err:
             raise ConfigError("%s: %s" % (source, err)) from None
     validate_sweep_config(config, source)  # #117
@@ -24878,9 +24800,6 @@ def build_parser():
 
 
 # ---- the load of each orchestrator and the threshold alert (#348); the logic is in bin/fleet_health.py, this supplies the facts
-def load_fleet_health():
-    return load_module("fleet_health")
-
 
 # ---- #494: a time budget for each heavy reader that had none, so a restart under load cannot hold a pass for minutes. The reader checks the
 # budget BETWEEN calls (no thread, no process), stops at a safe point and finishes over the following passes; 0 means no limit.

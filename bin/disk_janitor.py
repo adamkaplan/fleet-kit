@@ -46,6 +46,10 @@ def settings(raw):
     return merged
 
 
+CONFIG_KEY = "temp_janitor"   # the module declares its own configuration key (bin/fleet-switchboard config_declarations)
+CONFIG_DEFAULT = None         # None: no default is added to the configuration (absent = the defaults in settings())
+
+
 def validate(raw, source="config"):
     """Raises ValueError with a message when `temp_janitor` is not {"enabled": bool, "days": 1..365, "keep": [glob, ...], "dir": absolute path}."""
     if raw is None:
