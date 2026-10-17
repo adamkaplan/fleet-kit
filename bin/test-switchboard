@@ -58487,6 +58487,97 @@ class TestMoveAnAsk(LanesCase):
         self.assertIn("no orchestrator is running charter #10", out)
         self.assertEqual([r["issue"] for r in sb.read_reminders(self.world.state)], [4])
 
+    def block_named(self):
+        """The live shape: the orchestrators carry no charter number in their metadata; each charter's own block names its orchestrator."""
+        for name in ("orch-a", "orch-b"):
+            fleet = self.world.v2.sessions[self.world.sessions[name]]["metadata"]["fleet"]
+            del fleet["charter"]
+            fleet["repo"] = FAKE_REPO
+        self.gh.bodies = {1: "```yaml\norchestrator: orch-a\nstatus: active\n```\n", 10: "```yaml\norchestrator: orch-b\nstatus: active\n```\n"}
+
+    def notice_lines(self):
+        return [e for e in self.world.audit() if e["event"] == "lanes.move.notice"]
+
+    def test_s1_orchestrators_named_only_by_the_charter_block_are_told_and_audited(self):
+        self.block_named()
+        code, out, err = self.main("move", "2", "--to", "10")
+        self.assertEqual((code, err), (0, ""), out)
+        (note,) = [a["text"] for a in self.world.admissions("orch-b")]
+        self.assertEqual(sum("## %s" % h in note for h in sb.load_module("lanes").HANDOVER_SECTIONS), 6)
+        self.assertEqual(len(self.world.admissions("orch-a")), 1)
+        lines = self.notice_lines()
+        self.assertEqual(sorted((l["detail"]["recipient"], l["detail"]["outcome"]) for l in lines), [("orch-a", "sent"), ("orch-b", "sent")])
+        self.assertIn("reminders: 2 carried", out)
+        held = {(r["issue"], r["to"]) for r in sb.read_reminders(self.world.state)}
+        self.assertEqual(held, {(2, "orch-b"), (4, "orch-a")}, "the reminders follow the block-named orchestrator")
+
+    def test_s5_a_charter_block_that_names_no_live_orchestrator_falls_back_to_the_metadata(self):
+        self.gh.bodies = {10: "```yaml\norchestrator: nobody-here\n```\n"}
+        code, out, err = self.main("move", "2", "--to", "10")
+        self.assertEqual((code, len(self.world.admissions("orch-b"))), (0, 1), err)
+
+    def skipped_for_new(self):
+        code, out, err = self.main("move", "%s#2" % FAKE_REPO, "--to", "%s#10" % FAKE_REPO)
+        self.assertEqual((code, self.parents(), self.world.admissions("orch-b")), (1, [10], []), err + out)
+        self.assertEqual([l["detail"]["outcome"] for l in self.notice_lines() if l["detail"]["role"] == "new orchestrator"], ["skipped"])
+
+    def test_a_body_naming_an_orchestrator_of_another_repository_tells_no_one(self):
+        self.block_named()
+        fleet = self.world.v2.sessions[self.world.sessions["orch-b"]]["metadata"]["fleet"]
+        fleet["repo"] = "other-org/other-repo"
+        self.skipped_for_new()
+
+    def test_a_prose_line_before_the_block_does_not_name_the_orchestrator(self):
+        self.block_named()
+        self.gh.bodies[10] = "Notes:\norchestrator: orch-b\n\n```yaml\norchestrator: platform\n```\n"
+        self.skipped_for_new()
+
+    def test_a_body_naming_a_coder_tells_no_one(self):
+        self.block_named()
+        self.gh.bodies[10] = "```yaml\norchestrator: worker\n```\n"
+        sid = self.world.sessions["orch-b"]
+        self.world.v2.sessions[sid]["metadata"]["fleet"]["role"] = "coder"
+        self.skipped_for_new()
+
+    def test_two_metadata_candidates_for_one_charter_tell_no_one(self):
+        self.world.add_agent("orch-c", fleet={"role": "orchestrator", "charter": 10})
+        self.skipped_for_new()
+
+    def test_s6_the_audit_lines_hold_the_recipient_outcome_and_reason_and_never_the_text(self):
+        self.main("move", "2", "--to", "10")
+        lines = self.notice_lines()
+        self.assertEqual(len(lines), 2)
+        for line in lines:
+            self.assertEqual(sorted(line["detail"]), ["outcome", "reason", "recipient", "role"])
+            self.assertNotIn("## State", json.dumps(line))
+
+    def test_s3_with_no_findable_orchestrator_the_ask_is_moved_one_line_says_skipped_and_the_exit_is_1(self):
+        sid = self.world.sessions.pop("orch-b")
+        self.world.v2.sessions[sid]["metadata"]["fleet"]["role"] = "coder"
+        code, out, err = self.main("move", "2", "--to", "10")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.parents(), [10])
+        self.assertIn("no orchestrator is running charter #10", out)
+        self.assertIn("handover note (no orchestrator is running charter #10)", err)
+        skipped = [l for l in self.notice_lines() if l["detail"]["outcome"] == "skipped"]
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("charter #10", skipped[0]["detail"]["reason"])
+
+    def test_s4_a_failed_send_to_the_new_orchestrator_does_not_stop_the_old_notice(self):
+        real = sb.Switchboard.send
+
+        def send(engine, sender, recipient, *a, **k):
+            if recipient == "orch-b":
+                raise RuntimeError("herdr is down")
+            return real(engine, sender, recipient, *a, **k)
+        with mock.patch.object(sb.Switchboard, "send", send):
+            code, out, err = self.main("move", "2", "--to", "10")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.parents(), [10])
+        self.assertEqual((len(self.world.admissions("orch-a")), len(self.world.admissions("orch-b"))), (1, 0))
+        outcomes = sorted((l["detail"]["recipient"], l["detail"]["outcome"]) for l in self.notice_lines())
+        self.assertEqual(outcomes, [("orch-a", "sent"), ("orch-b", "failed")])
+
     def test_s3_a_refused_write_leaves_the_ask_under_its_charter_and_names_the_step(self):
         self.gh.fail_write = True
         code, out, err = self.main("move", "2", "--to", "10")
