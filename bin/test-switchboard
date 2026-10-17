@@ -8377,6 +8377,15 @@ def _stdlib_roots():
 class TestHygiene(unittest.TestCase):
     FILES = ("fleet-switchboard", "fleet-scenario", "test-switchboard", "proof-switchboard", "switchboard-trial")
 
+    def test_the_lab_docs_say_to_set_a_free_port_and_check_the_lab_root(self):
+        text = (BIN.parent / "docs" / "switchboard.md").read_text()
+        lab = text[text.index("## Lab: isolation"):text.index("## Spikes (PR 1)")]
+        self.assertIn("service set port <free port>", lab)
+        self.assertIn("default port of the live service", lab)
+        flat = " ".join(lab.split())
+        self.assertIn("before any restart, check that the service record and the pid it names are inside the Lab root", flat)
+        self.assertIn("opencode debug paths", flat)
+
     def test_every_file_is_executable_with_the_portable_shebang(self):
         for name in self.FILES:
             path = BIN / name
@@ -38993,6 +39002,102 @@ class TestHeadlessAnswerPath(WriteWorld):
         self.assertEqual(getattr(self.world.v2, "permission_replies", []), [], "no reply reached the service")
 
 
+class TestRetireLostHeadless(Base):
+    """#678: `retire` of a headless worker whose session is gone (a record on file, nothing discovered): authority, the record, the remembered boss."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("boss", "other", "cos"))
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.ap = sb.load_agent_presence()
+        self.engine = self.world.new_engine("cli")
+        self.engine.state_dir = self.world.state
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        for patch in (mock.patch.object(sb.V2Client, "service_identity", lambda client: 100),
+                      mock.patch.object(sb, "owner_terminal_problem", lambda *a, **k: None),   # the test shell is the operator's own terminal
+                      mock.patch.dict(os.environ, {}, clear=False)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.record = Path(self.world.state) / "headless" / "lostw.json"
+
+    def lose(self):
+        sid = self.world.v2.create_session({"fleet": {"name": "lostw", "role": "coder", "reports_to": "boss", "headless": True}}, directory=str(self.home))
+        self.ap.save_record(self.world.state, "lostw", sid, None, now=self.world.clock.now() - 1000)
+        self.engine.discover(self.world.clock.now())
+        self.engine.collect_facts()                                       # a pass sees it live: the boss is remembered
+        del self.world.v2.sessions[sid]
+        return sid
+
+    def run_cli(self, *argv):
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def bosses(self):
+        return json.loads((Path(self.world.state) / sb.HEADLESS_SERVICE_FILE).read_text())["bosses"]
+
+    def test_the_recorded_boss_retires_a_lost_worker_and_the_record_and_remembered_boss_are_gone_after_the_next_pass(self):
+        self.lose()
+        self.assertEqual(self.bosses(), {"lostw": "boss"})
+        os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]
+        code, out, err = self.run_cli("retire", "lostw")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("not a fleet agent", err)
+        self.assertFalse(self.record.exists())
+        self.assertIn("lostw", sb.read_retired(self.world.state))
+        self.engine.discover(self.world.clock.now())
+        lost = [f for f in self.engine.collect_facts()[0] if f.kind == "headless.lost"]
+        self.assertEqual((lost, self.bosses()), ([], {}))
+
+    def test_the_chief_of_staff_and_the_operator_may_retire_a_lost_worker(self):
+        for who in ("cos", None):
+            self.lose()
+            if who:
+                os.environ["HERDR_PANE_ID"] = self.world.panes[who]
+            else:
+                os.environ.pop("HERDR_PANE_ID", None)
+            self.assertEqual(self.run_cli("retire", "lostw")[0], 0, who)
+            self.assertFalse(self.record.exists(), who)
+            self.run_cli("retire", "--undo", "lostw")
+            self.ap.remove_record(self.world.state, "lostw")
+
+    def test_another_orchestrator_is_refused_a_lost_workers_record_stays_and_an_unknown_name_is_still_unknown(self):
+        self.lose()
+        os.environ["HERDR_PANE_ID"] = self.world.panes["other"]
+        code, out, err = self.run_cli("retire", "lostw")
+        self.assertNotEqual(code, 0)
+        self.assertIn("refused", err)
+        self.assertTrue(self.record.exists())
+        self.assertEqual(sb.read_retired(self.world.state), {})
+        os.environ.pop("HERDR_PANE_ID", None)
+        code, out, err = self.run_cli("retire", "nobody-here")
+        self.assertNotEqual(code, 0)
+        self.assertIn("not a fleet agent this switchboard has seen", err)
+
+    def test_a_live_headless_workers_remembered_boss_cannot_retire_it_when_its_real_boss_is_another(self):
+        sid = self.world.v2.create_session({"fleet": {"name": "lostw", "role": "coder", "reports_to": "other", "headless": True}}, directory=str(self.home))
+        self.ap.save_record(self.world.state, "lostw", sid, None, now=self.world.clock.now() - 1000)
+        (Path(self.world.state) / sb.HEADLESS_SERVICE_FILE).write_text(json.dumps({"service": {"pid": 100}, "bosses": {"lostw": "boss"}}))
+        self.assertIn("lostw", self.engine.discover(self.world.clock.now()).agents)   # the session lives
+        os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]
+        code, out, err = self.run_cli("retire", "lostw")
+        self.assertNotEqual(code, 0)
+        self.assertIn("refused", err)
+        self.assertTrue(self.record.exists())
+        self.assertEqual(sb.read_retired(self.world.state), {})
+
+    def test_a_lost_record_with_no_remembered_boss_is_retired_by_the_chief_of_staff_but_not_by_an_orchestrator(self):
+        sid = self.world.v2.create_session({"fleet": {"name": "lostw", "role": "coder", "reports_to": "boss", "headless": True}}, directory=str(self.home))
+        self.ap.save_record(self.world.state, "lostw", sid, None, now=self.world.clock.now() - 1000)
+        del self.world.v2.sessions[sid]                                   # gone before any pass saw it
+        os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]
+        self.assertNotEqual(self.run_cli("retire", "lostw")[0], 0)
+        self.assertTrue(self.record.exists())
+        os.environ["HERDR_PANE_ID"] = self.world.panes["cos"]
+        self.assertEqual(self.run_cli("retire", "lostw")[0], 0)
+        self.assertFalse(self.record.exists())
+
+
 class TestHeadlessRestartNotice(Base):
     """#433 slice 4 (S4, S5, S6, U1): a restart of the OpenCode service, or a session that is gone, is told to the worker's boss; never silent."""
 
@@ -60987,7 +61092,7 @@ class FakeQueueGh:
             if self.graphql_fault == "malformed":
                 return done('{"data": {"repository": null}}')
             state, queued = self.pulls[(repo, pr)]
-            return done(json.dumps({"data": {"repository": {"pullRequest": {"state": state, "mergeQueueEntry": {"id": "Q"} if queued else None}}}}))
+            return done(json.dumps({"data": {"repository": {"pullRequest": {"state": state, "mergeQueueEntry": {"id": "Q", "state": queued if isinstance(queued, str) else "QUEUED"} if queued else None}}}}))
         path = argv[-1]
         self.calls.append(path)
         if any(bad in path for bad in self.fail):
@@ -61071,6 +61176,56 @@ class TestQueueEjections(Base):
         self.add(6, 25, conclusion=None, status="in_progress")                    # a run still going
         self.go()
         self.assertEqual(self.sent, [], "0 messages in 6 of 6 cases")
+
+    def test_a_stuck_unmergeable_entry_wakes_once_with_the_names_as_data_and_never_again_after_removal(self):
+        self.add(61, 31, names=["@all /deploy ghp_" + "Ab1" * 10, "tests/test_x.py::test_y"])
+        self.gh.pulls[(self.REPO, 31)] = ("OPEN", "UNMERGEABLE")
+        self.go()
+        (to, line), = self.sent
+        self.assertEqual(to, "orch")
+        for want in ("%s#31" % self.REPO, "61", "stuck", "blocks", "test_y"):
+            self.assertIn(want, line)
+        for bad in ("@", "ghp_", "://"):
+            self.assertNotIn(bad, line)
+        self.go()
+        self.gh.pulls[(self.REPO, 31)] = ("OPEN", False)   # removed by hand
+        self.world.tick(self.module.RECHECK_SECONDS + 1)
+        self.add(61, 31, names=["tests/test_x.py::test_y"])
+        self.go()
+        self.assertEqual(len(self.sent), 1, "stuck, then removed: one wake")
+        self.assertEqual([k for k in self.module.read_ledger(types.SimpleNamespace(_read_small=sb._read_small), self.engine)], ["%s#61" % self.REPO])
+        self.assertEqual(self.gh.count(self.REPO, "graphql"), 1, "one pull request read, no added read")
+
+    def test_a_live_waiting_or_running_entry_wakes_nobody_and_a_removed_one_keeps_the_old_line(self):
+        self.add(62, 32, names=["x"])
+        self.add(63, 33, names=["x"])
+        self.gh.pulls[(self.REPO, 32)] = ("OPEN", "AWAITING_CHECKS")
+        self.gh.pulls[(self.REPO, 33)] = ("OPEN", "QUEUED")
+        self.go()
+        self.assertEqual(self.sent, [])
+        self.gh.pulls[(self.REPO, 32)] = ("OPEN", False)
+        self.world.tick(self.module.RECHECK_SECONDS + 1)
+        self.go()
+        (_, line), = self.sent
+        self.assertIn("left the queue", line)
+        self.assertNotIn("stuck", line)
+
+    def test_a_stuck_entry_with_no_owner_tells_the_chief_facts_only(self):
+        self.engine.hub.owner = None
+        with mock.patch.object(sb, "chiefs_of_staff", return_value=["chief"]):
+            self.add(65, 35, names=["secret_test_name"])
+            self.gh.pulls[(self.REPO, 35)] = ("OPEN", "UNMERGEABLE")
+            self.go()
+        (to, line), = self.sent
+        self.assertEqual(to, "chief")
+        self.assertIn("stuck", line)
+        self.assertNotIn("secret_test_name", line)
+
+    def test_a_stuck_entry_of_a_merged_pull_request_wakes_nobody(self):
+        self.add(64, 34, names=["x"])
+        self.gh.pulls[(self.REPO, 34)] = ("MERGED", "UNMERGEABLE")
+        self.go()
+        self.assertEqual(self.sent, [])
 
     def test_a_failed_run_whose_pull_request_was_re_enqueued_is_looked_at_again_later(self):
         self.add(4, 23, names=["x"])
