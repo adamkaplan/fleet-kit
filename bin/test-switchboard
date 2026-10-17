@@ -42571,6 +42571,7 @@ class TestEscalationPrune(DecisionsBase):
 
     def read_ok(self, *records, cut=False, repo=None):
         """A list read that SUCCEEDED in this process (what the ci recorder records)."""
+        self.world.tick(1)   # a read is later than any key written before it
         state, key, now = self.engine.ci_record_state, (repo or self.REPO).lower(), self.world.clock.now()
         state.lists[key] = (now, list(records))
         state.good[key] = (now, list(records), cut)
@@ -42659,6 +42660,22 @@ class TestEscalationPrune(DecisionsBase):
         sb.ci_record_pass(self.engine, now + sb.CI_RECORD_LIST_TTL + 1)
         self.assertEqual(sorted(good), [], "a failed read leaves no success on record")
         self.assertEqual(len(self.engine.ci_record_state.lists[self.REPO][1]), 1, "the rows still use the old list")
+
+    def test_s8_a_key_written_after_the_list_was_read_is_kept_and_one_older_than_the_read_is_pruned(self):
+        self.escalate()
+        self.read_ok(self.pr(9, "merge-captain"))     # a successful read in which PR 7 is absent
+        self.world.tick(5)
+        with sb.escalated_lock(self.world.state):      # a fresh escalation (a new PR) written after that read
+            found = sb.read_escalated(self.world.state)
+            fresh = "captain:%s#8@%s" % (self.REPO, HEAD_A)
+            found[fresh] = sb.iso(self.world.clock.now())
+            sb.write_escalated(self.world.state, found)
+        self.row()
+        self.assertEqual(self.keys(), [fresh], "the older key is pruned, the fresh one waits for a later read")
+        self.assertEqual([e["detail"]["reason"] for e in self.pruned()], ["absent"])
+        self.read_ok(self.pr(9, "merge-captain"))
+        self.row()
+        self.assertEqual(self.keys(), [])
 
     def test_s5_a_key_older_than_14_days_is_pruned_and_a_younger_one_stays(self):
         self.escalate()

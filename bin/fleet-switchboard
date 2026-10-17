@@ -9171,7 +9171,8 @@ def captain_escalation_leaves(engine, escalated, now):
     """{key: reason} for the captain escalations that may be pruned, and only on evidence: older than ESCALATION_MAX_AGE_SECONDS
     (`expired`), or a list read of that repository that SUCCEEDED in this process (`state.good`) shows the pull request absent
     (`absent`, not from a list that may be cut), at another head (`another head`) or without the hold labels (`no longer held`).
-    An empty, unread, failed or never-listed repository gives none. Never raises."""
+    The list must have been read AFTER the key was written (a fresh escalation is kept this pass). An empty, unread, failed or
+    never-listed repository gives none. Never raises."""
     out = {}
     left = (getattr(engine, "notice_effects", None) or {}).get("left") or set()
     state = getattr(engine, "ci_record_state", None)
@@ -9192,6 +9193,8 @@ def captain_escalation_leaves(engine, escalated, now):
             read = good.get(plan_ledger.normal_repo(repo))
             if read is None or not number.isdigit() or not head:
                 continue
+            if at is None or read[0] <= at:
+                continue   # the list was read no later than the key was written: it cannot show whether the pull request left
             records, cut = read[1], read[2]
             record = next((r for r in records if isinstance(r, dict) and _number(r) == int(number)
                            and r.get("state", "open") == "open" and not r.get("merged_at")), None)
