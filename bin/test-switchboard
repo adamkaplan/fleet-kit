@@ -14883,6 +14883,35 @@ class TestOwnMeasurementTester(unittest.TestCase):
             self.assertNotRegex(text, r"(?i)\b(coder\d|cos\b|fleet-upkeep|adam\b)")
 
 
+class TestWorkerRulesInSkills(unittest.TestCase):
+    """#719: the message cap, the daemon-recorded ci verdict and the plan check wordings, each said once."""
+    CAP = "`send` messages are capped (about 3000 characters in practice, 4000 hard): put long text in a file made under `mktemp -d` and pass it as `\"$(cat <file>)\"`."
+    CI = "The daemon records the `ci` verdict itself about five minutes after CI is green at the head, so read `fleet-switchboard gates <pr>` and do not ask for `gates ci-record`, which stays for a hurry."
+    LIST = "## Wordings `plan check` accepts"
+    SHAPES = ("every declared `DW`/`PC` is covered by a scenario", "`discriminates` names a concrete wrong build (a stub that returns an empty list)",
+              "`pass` has an observable number or status", "the declared clauses joined equal the ask's Done-when", "check a slice with `--ask <its own work item>`")
+
+    def read(self, skill):
+        return (REPO / "skills" / skill / "SKILL.md").read_text()
+
+    def test_the_message_cap_sentence_is_in_the_coordination_skill_once(self):
+        self.assertEqual(self.read("fleet-coordination").count(self.CAP), 1)
+
+    def test_the_ci_verdict_sentence_is_in_the_skills_once_overall(self):
+        self.assertEqual(sum(self.read(s).count(self.CI) for s in ("fleet-coordination", "fleet-planning")), 1)
+
+    def test_the_plan_check_wording_list_is_in_the_planning_skill_once_with_its_five_shapes(self):
+        text = self.read("fleet-planning")
+        self.assertEqual(text.count(self.LIST), 1)
+        section = text.split(self.LIST, 1)[1].split("\n## ", 1)[0]
+        for shape in self.SHAPES:
+            self.assertEqual(section.count(shape), 1, shape)
+
+    def test_the_texts_name_roles_never_agents_or_people(self):
+        for text in (self.CAP, self.CI, self.LIST) + self.SHAPES:
+            self.assertNotRegex(text, r"(?i)\b(coder\d|cos\b|fleet-upkeep|adam\b)")
+
+
 class TestPlanningSkill(unittest.TestCase):
     """skills/fleet-planning: short, installed like the other skills, and its own example passes `plan check`."""
     SKILL = REPO / "skills" / "fleet-planning" / "SKILL.md"

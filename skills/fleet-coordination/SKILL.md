@@ -98,6 +98,10 @@ For complex or newly-shaped scope, ask the coder for a short readback of task,
 authority and exclusions before it starts. Two sentences of readback catches the
 misunderstanding that would otherwise cost you an afternoon and a wasted branch.
 
+`send` messages are capped (about 3000 characters in practice, 4000 hard): put long text in a file made under `mktemp -d` and pass it as `"$(cat <file>)"`.
+
+The daemon records the `ci` verdict itself about five minutes after CI is green at the head, so read `fleet-switchboard gates <pr>` and do not ask for `gates ci-record`, which stays for a hurry.
+
 ## Starting a named agent in a pane
 
 **Under the switchboard, use one command and stop reading this section.** If
