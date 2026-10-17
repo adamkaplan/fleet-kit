@@ -18640,7 +18640,7 @@ def _ledger_context(args, runner, now, writable, parts=None, floor=False):
     repo, number, pr = _ledger_pr(args)
     entries, problem = plan_ledger.read_ledger(state)
     facts, body, senders, unreadable = pr_picture(engine, repo, number, state)
-    facts = dict(facts or {}, body=body, notice_senders=senders)
+    facts = dict(facts or {}, body=body, notice_senders=senders, held_check=lambda: held_defects(body))
     if floor and facts.get("head"):
         facts["floor"] = gate_floor_fact(engine, state, repo, number, facts["head"])
     source = plan_source_for(args.plan, entries, pr, body, config.get("intent_repo"))
@@ -21078,6 +21078,9 @@ def explainer_insert(body, block):
     at = 0
     while at < len(lines) and (EXPLAINER_HEADER_RE.match(lines[at]) or (not lines[at].strip() and at and EXPLAINER_HEADER_RE.match(lines[at - 1]))):
         at += 1
+    if HELD_WHY in body:   # a held PR's top part stays first: the block goes below it, where the technical section begins
+        at = next((i for i, l in enumerate(lines) if l.strip() in HELD_PARTS), at)
+        at += held_top_end(lines[at:])
     head, tail = lines[:at], lines[at:]
     return "\n".join(head + ([""] if head and head[-1].strip() else []) + block.split("\n") + ([""] if tail and tail[0].strip() else []) + tail)
 
@@ -21103,6 +21106,275 @@ def explainer_defects(body):
     return problems
 
 
+HELD_WHY = "## Why this needs you"
+HELD_TABLE = "## What changes for you"
+HELD_EXAMPLE = "## Example"
+HELD_QUESTIONS = "## Questions for you"
+HELD_PARTS = (HELD_WHY, HELD_TABLE, HELD_EXAMPLE, HELD_QUESTIONS)
+def _held_none(line):
+    """True for the line `Questions: none`, then an optional one-line parenthetical (and an optional final dot). Plain string tests: no backtracking."""
+    line = line.strip()
+    if not line.startswith("Questions: none"):
+        return False
+    tail = line[len("Questions: none"):].strip()
+    return tail in ("", ".") or (tail.startswith("(") and (tail.endswith(")") or tail.endswith(").")))
+
+
+def pr_is_held(labels, body, now=None):
+    """A PR is held for the owner: it carries a hold label, or (the same rule as everywhere) a merge-captain label or the legacy first line."""
+    return bool(pr_hold_reasons(labels)) or is_captain({"labels": labels, "body": body}, now)
+
+
+_HELD_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+HELD_BODY_MAX = 70000   # a longer body is not read (GitHub's own cap is 65536)
+_HELD_PLACEHOLDER_RE = re.compile(r"<[^<>]*>")   # linear: the class stops at the next `<`
+
+
+_ASCII_LOWER = {c: c + 32 for c in range(ord("A"), ord("Z") + 1)}
+
+
+def _ascii_lower(text):
+    """`text` with only A-Z lowered: the length never changes (str.lower() can make a string LONGER, e.g. U+0130), so an index found in the copy is
+    an index of the original. ONE helper for every case-insensitive scan of a held body."""
+    return text.translate(_ASCII_LOWER)
+
+
+def _held_steps(size):
+    """A fresh step budget for one scan loop: each iteration spends one, and running out raises (the body is then unreadable), so no input can hang the daemon."""
+    return [4 * size + 64]
+
+
+def _held_spend(budget):
+    budget[0] -= 1
+    if budget[0] < 0:
+        raise ValueError("the scan did not finish within its step budget")
+
+
+_HTML_SPACE = " \t\n\f\r"   # HTML whitespace: space, tab, LF, FF, CR (not NBSP, not a vertical tab)
+_HTML_SPACE_RE = re.compile(r"[ \t\n\f\r]+")
+
+
+def _held_skip_space(text, i):
+    """The first index at or after `i` that is not HTML whitespace: the ONE helper for every attribute step."""
+    while i < len(text) and text[i] in _HTML_SPACE:
+        i += 1
+    return i
+
+
+def _held_class_tokens(tag):
+    """The class tokens (ASCII-lowered) of an HTML tag's text: a linear walk over every `class` (HTML whitespace around the name and the `=`, quoted either
+    way or bare); tokens are separated by HTML whitespace only."""
+    low = _ascii_lower(tag)
+    budget = _held_steps(len(low))
+    tokens, at = [], low.find("class")
+    while at >= 0:
+        _held_spend(budget)
+        i = _held_skip_space(low, at + 5)
+        if i < len(low) and low[i] == "=":
+            i = _held_skip_space(low, i + 1)
+            if i < len(low) and low[i] in "\"'":
+                end = low.find(low[i], i + 1)
+                end = len(low) if end < 0 else end
+                tokens += [t for t in _HTML_SPACE_RE.split(low[i + 1:end]) if t]
+                i = end
+            else:
+                end = i
+                while end < len(low) and low[end] not in _HTML_SPACE and low[end] != ">":
+                    end += 1
+                tokens += [t for t in _HTML_SPACE_RE.split(low[i:end]) if t]
+                i = end
+        at = low.find("class", max(i, at + 5))
+    return tokens
+
+
+def _held_tag_end(line, at):
+    """Index of the `>` that closes the tag opened at `at`, skipping quoted attribute values (a `>` inside quotes does not close it); -1 when it never closes."""
+    i, size = at, len(line)
+    while i < size:
+        c = line[i]
+        if c in "\"'":
+            i = line.find(c, i + 1)
+            if i < 0:
+                return -1
+        elif c == ">":
+            return i
+        i += 1
+    return -1
+
+
+def _held_pre_mermaid(line):
+    """True when `line` opens a `<pre>` whose class tokens include `mermaid`, or a `<pre` that is never closed on the line (it cannot be judged, so it
+    counts). Each `<pre` is walked to its closing `>` with `find` and the search resumes after it: linear, no window, no backtracking."""
+    low = _ascii_lower(line)
+    budget = _held_steps(len(low))
+    at = low.find("<pre")
+    while at >= 0:
+        _held_spend(budget)
+        after = low[at + 4:at + 5]
+        if not after.isalpha():
+            end = _held_tag_end(line, at)
+            if end < 0:
+                return True
+            if "mermaid" in _held_class_tokens(line[at:end]):
+                return True
+            at = low.find("<pre", end)
+        else:
+            at = low.find("<pre", at + 4)
+    return False
+
+
+def held_scan(lines):
+    """(clean, mermaid): `clean` is `lines` with every fenced code block (fences included: three or more backticks or tildes, up to three spaces of
+    indent, closed by the same character at least as long, an unclosed fence running to the end) and every HTML comment blanked, so a heading
+    counts only outside them (the explainer block's own opening marker is kept); `mermaid` lists the indexes where a Mermaid block opens (a fence
+    whose info string starts with `mermaid`, any case, or a `<pre class=mermaid>`)."""
+    clean, mermaid, fence, comment = [], [], None, False
+    for i, line in enumerate(lines):
+        if fence is not None:
+            found = _HELD_FENCE_RE.match(line)
+            if found and found.group(1)[0] == fence[0] and len(found.group(1)) >= fence[1] and not found.group(2).strip():
+                fence = None
+            clean.append("")
+            continue
+        if not comment:
+            found = _HELD_FENCE_RE.match(line)
+            if found and not (found.group(1)[0] == "`" and "`" in found.group(2)):
+                fence = (found.group(1)[0], len(found.group(1)))
+                words = found.group(2).split()
+                if words and _ascii_lower(words[0]) == "mermaid":
+                    mermaid.append(i)
+                clean.append("")
+                continue
+            if line.strip() == EXPLAINER_BEGIN:
+                clean.append(line)
+                continue
+        if _held_pre_mermaid(line):
+            mermaid.append(i)
+        parts, pos, size = [], 0, len(line)   # walk with an index: no slicing, no growing concatenation
+        budget = _held_steps(size)
+        while pos < size:
+            _held_spend(budget)
+            if comment:
+                end = line.find("-->", pos)
+                if end < 0:
+                    pos = size
+                else:
+                    comment, pos = False, end + 3
+            else:
+                start = line.find("<!--", pos)
+                if start < 0:
+                    parts.append(line[pos:])
+                    pos = size
+                else:
+                    parts.append(line[pos:start])
+                    comment, pos = True, start + 4
+        out = "".join(parts)
+        clean.append(out)
+    return clean, mermaid
+
+
+def held_top_end(rest):
+    """Index in `rest` where the top part ends (PC-5): the first heading (outside code fences and comments) after the first top part that is not one of
+    the four top parts, or the explainer block's opening marker; the end of the body when there is none. `rest` is the body after the opening lines."""
+    clean = held_scan(rest)[0]
+    first = next((i for i, l in enumerate(clean) if l.strip() in HELD_PARTS), None)
+    if first is None:
+        return len(rest)
+    return next((i for i in range(first + 1, len(rest)) if (clean[i].startswith("#") and clean[i].strip() not in HELD_PARTS) or clean[i].strip() == EXPLAINER_BEGIN), len(rest))
+
+
+def held_defects(body):
+    """The ONE check of a held PR's top (see `_held_defects`); anything it cannot read is a defect, never a pass."""
+    try:
+        if len(body or "") > HELD_BODY_MAX:
+            return ["the held PR's top is unreadable: the body is longer than %d characters" % HELD_BODY_MAX]
+        return _held_defects(body)
+    except Exception as err:   # a body it cannot parse fails: unreadable, never ok
+        return ["the held PR's top is unreadable (%s)" % _one_line("%s: %s" % (type(err).__name__, err), 100)]
+
+
+def _held_defects(body):
+    """What is wrong with the top of a PR body held for the owner (used by `pr-explain --check` and gate G6b). After the opening lines
+    (PLAN:, MERGE:, canon:), in this order: `## Why this needs you` (1 to 3 sentences, no placeholder), `## What changes for you` (a Before | After
+    table of 2 to 4 rows of real cells), `## Example` (real text), `## Questions for you` (a numbered list, each item with `Recommendation:`) or the
+    line `Questions: none (reason)`. An image may sit anywhere in the top; a Mermaid block in the top is a defect; nothing below the top part is
+    judged. Headings count only outside code fences and comments. Reads the body only."""
+    lines = (body or "").split("\n")
+    clean_all, mermaid_all = held_scan(lines)
+    at = 0
+    while at < len(lines) and (EXPLAINER_HEADER_RE.match(lines[at]) or not clean_all[at].strip()):
+        at += 1
+    rest = lines[at:]
+    top_end = held_top_end(rest)
+    top = clean_all[at:at + top_end]
+    pos = {}
+    for i, l in enumerate(top):
+        pos.setdefault(l.strip(), i)
+
+    def section(name):
+        start = pos[name] + 1
+        stop = next((i for i in range(start, len(top)) if top[i].startswith("## ")), len(top))
+        return top[start:stop]
+
+    def words(text):
+        return len(re.findall(r"[^\W_]", text))   # underscores are not word characters here
+
+    problems = []
+    if HELD_WHY not in pos:
+        problems.append("the held PR needs a `%s` section after the opening lines" % HELD_WHY)
+    else:
+        text = " ".join(l.strip() for l in section(HELD_WHY) if l.strip() and not l.strip().startswith("!["))
+        sentences = [x for x in re.split(r"(?<=[.!?])\s+", text) if x.strip()]
+        if words(text) < 3 or _HELD_PLACEHOLDER_RE.search(text):
+            problems.append("`%s` is empty or still has a <placeholder>" % HELD_WHY)
+        elif len(sentences) > 3:
+            problems.append("`%s` has %d sentences: it is one to three" % (HELD_WHY, len(sentences)))
+    if HELD_TABLE not in pos:
+        problems.append("the held PR needs a `%s` table (Before | After, 2 to 4 rows)" % HELD_TABLE)
+    else:
+        rows = [[c.strip() for c in l.strip().strip("|").split("|")] for l in section(HELD_TABLE) if l.strip().startswith("|")]
+        head = [_ascii_lower(c) for c in rows[0]] if rows else []
+        data = [r for r in rows[2:]] if len(rows) >= 2 and all(re.fullmatch(r":?-{3,}:?", c) for c in rows[1]) else None
+        if head != ["before", "after"] or data is None:
+            problems.append("`%s`: the table needs a Before and an After column (a header row, a separator row, then the rows)" % HELD_TABLE)
+        elif not 2 <= len(data) <= 4:
+            problems.append("`%s`: the table has %d rows, it is 2 to 4" % (HELD_TABLE, len(data)))
+        elif any(len(r) != 2 or any(words(c) < 3 or _HELD_PLACEHOLDER_RE.search(c) for c in r) for r in data):
+            problems.append("`%s`: every table cell is a plain sentence (at least 3 word characters, no <placeholder>)" % HELD_TABLE)
+    if HELD_EXAMPLE not in pos:
+        problems.append("the held PR needs an `%s` section: one concrete case in a few lines" % HELD_EXAMPLE)
+    else:
+        text = " ".join(l.strip() for l in section(HELD_EXAMPLE) if l.strip() and not l.strip().startswith("!["))
+        if len(text) < 20 or _HELD_PLACEHOLDER_RE.search(text):
+            problems.append("`%s` is empty, too short (20 characters) or still has a <placeholder>" % HELD_EXAMPLE)
+    if any(at <= m < at + top_end for m in mermaid_all):
+        problems.append("the top part shows a Mermaid diagram: it goes below, in the technical section")
+    nones = [i for i, l in enumerate(top) if _held_none(l)]
+    if HELD_QUESTIONS in pos:
+        section_lines = [l for l in section(HELD_QUESTIONS) if l.strip()]
+        items, cur = [], None
+        for l in section_lines:
+            if re.match(r"^\s*\d+\.\s", l):
+                cur = [l]
+                items.append(cur)
+            elif cur is not None:
+                cur.append(l)
+        if items:
+            for n, item in enumerate(items, 1):
+                if "Recommendation:" not in " ".join(item):
+                    problems.append("question %d has no `Recommendation:`" % n)
+        elif not (len(section_lines) == 1 and _held_none(section_lines[0])):
+            problems.append("`%s` is a numbered list (each with `Recommendation:`) or exactly one line `Questions: none (reason)`" % HELD_QUESTIONS)
+    elif len(nones) != 1:
+        problems.append("the held PR needs `%s` (a numbered list, each question with `Recommendation:`) or the line `Questions: none (reason)`" % HELD_QUESTIONS)
+    order = [pos[n] for n in HELD_PARTS if n in pos]
+    if HELD_QUESTIONS not in pos and len(nones) == 1:
+        order.append(nones[0])
+    if order != sorted(order):
+        problems.append("the order is wrong: Why this needs you, What changes for you, Example, then Questions for you")
+    return problems
+
+
 def cmd_pr_explain(args, runner, now):
     """`pr-explain <owner/repo#N>`: read the PR once and print the explainer block (the why part), or with
     `--body-file F` the whole new body with the block in once, or with `--check` judge the description it has. It writes nothing anywhere."""
@@ -21120,6 +21392,8 @@ def cmd_pr_explain(args, runner, now):
     body = pr.get("body") if isinstance(pr.get("body"), str) else ""
     if args.check:
         problems = explainer_defects(body)
+        if pr_is_held(pr.get("labels") or [], body):
+            problems += held_defects(body)
         for problem in problems:
             print("DEFECT: %s" % problem)
         print("explainer: %s" % ("FAIL" if problems else "PASS"))

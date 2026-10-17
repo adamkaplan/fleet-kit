@@ -26253,7 +26253,7 @@ class TestPlanLedger(LedgerBase):
         self.assertEqual([r["status"] for r in report["gates"] if r["gate"] in ("G0a", "G1", "G4", "G5", "G6")], ["ok"] * 5)
         self.assertEqual(report["untracked"], ["G0b", "G0c", "G2/G3"])
         self.assertEqual({r["gate"] for r in report["gates"]},
-                         {"G0a", "G0b", "G0c", "G1", "G2/G3", "G4", "G5", "G6", "G7", "G8"})
+                         {"G0a", "G0b", "G0c", "G1", "G2/G3", "G4", "G5", "G6", "G6b", "G7", "G8"})
         self.assertEqual([self.row(report, g)["status"] for g in ("G7", "G8")], ["n/a", "n/a"])
         self.assertIn("epic-claimed", self.row(report, "G1")["detail"])
         self.assertTrue(all(r["decided_by"] for r in report["gates"]))
@@ -26601,7 +26601,7 @@ class TestWaive(LedgerBase):
         self.assertEqual(self.row(report, "G6")["status"], "waiting")               # the owner's hold stands
         self.assertEqual(self.row(report, "G1")["status"], "waived")
         code, payload, _ = self.check()
-        self.assertEqual([f["gate"] for f in payload["failed"]], ["G6"])             # still failing (reported: a repo lists G6 to enforce it)
+        self.assertEqual([f["gate"] for f in payload["failed"]], ["G6", "G6b"])      # still failing (reported: a repo lists G6 to enforce it)
         self.assertEqual(self.run_as("coder", "gates-check", self.PR, "--for", "merge")[0], 0)   # G6 is not in this repo's enforced list
 
     def test_a_short_reason_is_refused(self):
@@ -26752,11 +26752,11 @@ class TestPlanGatesCheck(LedgerBase):
         self.pr["labels"] = [{"name": "tester:merge-captain"}]
         self.pr["statusCheckRollup"] = [{"conclusion": "SUCCESS", "status": "COMPLETED"}]
         code, out, _ = self.check("merge")
-        self.assertEqual((code, [f["gate"] for f in out["failed"]]), (10, ["G6"]))
+        self.assertEqual((code, [f["gate"] for f in out["failed"]]), (10, ["G6", "G6b"]))
         self.set_gates({"acme/app": {"mode": "enforce"}})
         code, out, _ = self.check("merge")
         self.assertEqual(code, 0, "G4 and G6 are enforced only when listed")
-        self.assertEqual([(f["gate"], f["enforced"]) for f in out["failed"]], [("G6", False)])
+        self.assertEqual([(f["gate"], f["enforced"]) for f in out["failed"]], [("G6", False), ("G6b", False)])
 
     def test_a_repo_in_enforce_with_the_default_list_reports_g4_and_g6_but_never_refuses_on_them(self):
         self.all_proven()
@@ -26765,10 +26765,10 @@ class TestPlanGatesCheck(LedgerBase):
         self.set_gates({"acme/app": {"mode": "enforce"}})
         code, out, err = self.check("merge")
         self.assertEqual((code, out["verdict"]), (0, "allow"))
-        self.assertEqual(sorted((f["gate"], f["enforced"]) for f in out["failed"]), [("G4", False), ("G6", False)])
+        self.assertEqual(sorted((f["gate"], f["enforced"]) for f in out["failed"]), [("G4", False), ("G6", False), ("G6b", False)])
         self.assertIn("reported, not enforced", out["reason"])
         (event,) = self.events("gate.reported")
-        self.assertEqual((event["detail"]["failed"], event["detail"]["enforced"]), (["G4", "G6"], []))
+        self.assertEqual((event["detail"]["failed"], event["detail"]["enforced"]), (["G4", "G6", "G6b"], []))
         self.assertEqual(self.events("gate.refused") + self.events("gate.would_refuse"), [])
         self.set_gates({"acme/app": {"mode": "enforce", "enforce_gates": ["G0a", "G1", "G4"]}})
         code, out, _ = self.check("merge")
@@ -41073,6 +41073,241 @@ class TestCaptainDecisionFromLabels(TestCaptainPrs):
         self.assertEqual(self.only()["kind"], "notice")
 
 
+class TestHeldTop(DecisionsBase):
+    """#604: a PR held for the owner opens with why, what changes (a Before | After table), an example and its questions; one check (held_defects)
+    serves pr-explain --check and gate G6b. A Mermaid block in the top part fails; below it, nothing is judged."""
+    OPEN = "MERGE: captain\nPLAN: https://example.test/acme/api/issues/9\n\n"
+    WHY = "## Why this needs you\n\nIt changes a credential path. The owner decides if it ships.\n\n"
+    TABLE = ("## What changes for you\n\n| Before | After |\n|---|---|\n| You get two cards. | You get one card. |\n"
+             "| You open a list. | The list opens itself. |\n| You retry by hand. | It retries once. |\n\n")
+    EXAMPLE = "## Example\n\nToday a failed job sends two cards and a pointer.\nAfter, one card reads: job 4 failed, retried once.\n\n"
+    QS = "## Questions for you\n\n1. Ship it now? Recommendation: yes.\n2. Keep the flag? Recommendation: no.\n\n"
+    MERMAID = "```mermaid\nflowchart LR\n  A[\"Change\"] --> B[\"Owner\"]\n```\n\n"
+    TOP = WHY + TABLE + EXAMPLE + QS
+    GOOD = TOP + "## For reviewers (technical)\n\n" + MERMAID + "| a | b | c |\n|---|---|---|\n" + "| 1 | 2 | 3 |\n" * 6
+
+    def defects(self, body):
+        return sb.held_defects(body)
+
+    def named(self, found, word):
+        return sum(word in d for d in found)
+
+    def test_a_complete_top_is_ok(self):                                                                    # S1
+        self.assertEqual(self.defects(self.OPEN + self.TOP), [])
+
+    def test_the_why_section_is_one_to_three_sentences_and_no_placeholder(self):                           # S2
+        for why in ("", "## Why this needs you\n\nOne. Two. Three. Four. Five.\n\n", "## Why this needs you\n\n<one to three sentences: the hold reason>\n\n"):
+            with self.subTest(why=why[:30]):
+                found = self.defects(self.OPEN + why + self.TABLE + self.EXAMPLE + self.QS)
+                self.assertEqual(self.named(found, "Why this needs you"), 1, found)
+                self.assertEqual(len(found), 1, found)
+
+    def test_the_table_needs_both_columns_and_two_to_four_rows(self):                                       # S3
+        row = "| A sentence. | Another. |\n"
+        for table in ("", "## What changes for you\n\n| Before | After |\n|---|---|\n" + row + "\n",
+                      "## What changes for you\n\n| Before | After |\n|---|---|\n" + row * 6 + "\n",
+                      "## What changes for you\n\n| Before | Later |\n|---|---|\n" + row * 3 + "\n"):
+            with self.subTest(table=table[:60]):
+                found = self.defects(self.OPEN + self.WHY + table + self.EXAMPLE + self.QS)
+                self.assertEqual((self.named(found, "table"), len(found)), (1, 1), found)
+
+    def test_the_example_must_be_there_and_not_empty(self):                                                 # S4
+        for example in ("", "## Example\n\n"):
+            found = self.defects(self.OPEN + self.WHY + self.TABLE + example + self.QS)
+            self.assertEqual((self.named(found, "Example"), len(found)), (1, 1), found)
+
+    def test_a_mermaid_block_fails_in_the_top_and_is_not_judged_below(self):                                # S5, U2
+        top = self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + self.MERMAID + self.QS
+        found = self.defects(top)
+        self.assertEqual((self.named(found, "diagram"), len(found)), (1, 1), found)
+        self.assertEqual(self.defects(self.OPEN + self.GOOD), [])
+
+    def test_questions_numbered_none_or_missing(self):                                                      # S6
+        qs = "## Questions for you\n\n1. A? Recommendation: yes.\n2. B?\n3. C? Recommendation: no.\n"
+        self.assertEqual(self.defects(self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + qs), ["question 2 has no `Recommendation:`"])
+        for none in ("Questions: none (clear to merge on your word).", "Questions: none", "Questions: none (clear to merge on your word, after #12)"):
+            self.assertEqual(self.defects(self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + "## Questions for you\n\n" + none + "\n"), [], none)
+        found = self.defects(self.OPEN + self.WHY + self.TABLE + self.EXAMPLE)
+        self.assertEqual(self.named(found, "Questions for you"), 1, found)
+
+    def test_the_order_and_an_image_in_the_top(self):                                                       # S7
+        found = self.defects(self.OPEN + self.QS + self.EXAMPLE + self.TABLE + self.WHY)
+        self.assertEqual((self.named(found, "order"), len(found)), (1, 1), found)
+        image = "![the real card, after](https://example.test/card.png)\n\n"
+        self.assertEqual(self.defects(self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + image + self.QS), [])
+
+    def test_a_pr_that_is_not_held_is_not_read_by_the_gate(self):                                           # S8
+        reads = []
+        report = sb.plan_ledger.evaluate_gates(None, [], None, {"head": "a" * 40, "captain": False, "held_check": lambda: reads.append(1) or ["x"]}, "acme/api#1")
+        row = next(r for r in report["gates"] if r["gate"] == "G6b")
+        self.assertEqual((row["status"], reads), ("n/a", []))
+        held = sb.plan_ledger.evaluate_gates(None, [], None, {"head": "a" * 40, "captain": True, "held_check": lambda: ["no table"]}, "acme/api#1")
+        self.assertEqual(next(r for r in held["gates"] if r["gate"] == "G6b")["missing"], ["no table"])
+
+    def test_a_hold_label_alone_or_a_floor_hold_makes_the_gate_judge_and_a_missing_check_fails_closed(self):
+        facts = {"head": "a" * 40, "captain": False, "holds": ["security"], "held_check": lambda: ["no table"]}
+        row = lambda f: next(r for r in sb.plan_ledger.evaluate_gates(None, [], None, f, "acme/api#1")["gates"] if r["gate"] == "G6b")
+        self.assertEqual(row(facts)["status"], "missing")
+        floor = {"head": "a" * 40, "captain": False, "floor": {"decision": "hold", "cleared": False, "reasons": []}, "held_check": lambda: []}
+        self.assertEqual(row(floor)["status"], "ok")
+        self.assertEqual(row({"head": "a" * 40, "captain": True})["status"], "missing")
+
+    def test_headings_inside_a_code_fence_or_comment_do_not_count(self):
+        fenced = self.OPEN + "```text\n" + self.TOP + "```\n"
+        found = self.defects(fenced)
+        for part in ("Why this needs you", "What changes for you", "Example", "Questions for you"):
+            self.assertTrue(any(part in d for d in found), (part, found))
+        found = self.defects(self.OPEN + "~~~~\n" + self.TOP)   # an unclosed fence runs to the end
+        self.assertGreaterEqual(len(found), 4, found)
+        found = self.defects(self.OPEN + "<!--\n" + self.TOP + "-->\n")
+        self.assertGreaterEqual(len(found), 4, found)
+
+    def test_every_spelling_of_a_mermaid_fence_in_the_top_fails_and_below_it_does_not(self):
+        graph = "flowchart LR\n  A[\"x\"] --> B[\"y\"]\n"
+        for opener, closer in (("```mermaid", "```"), ("```Mermaid", "```"), ("```  MERMAID", "```"), ("```mermaid title=\"flow\"", "```"),
+                               ("````mermaid", "````"), ("~~~mermaid", "~~~"), ("   ```mermaid", "   ```")):
+            with self.subTest(opener=opener):
+                body = self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + opener + "\n" + graph + closer + "\n\n" + self.QS
+                found = self.defects(body)
+                self.assertEqual((self.named(found, "diagram"), len(found)), (1, 1), found)
+                below = self.OPEN + self.TOP + "## For reviewers\n\n" + opener + "\n" + graph + closer + "\n"
+                self.assertEqual(self.defects(below), [])
+        pre = self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + '<pre class="mermaid">\nflowchart LR\n</pre>\n\n' + self.QS
+        self.assertEqual(self.named(self.defects(pre), "diagram"), 1)
+
+    def test_placeholder_cells_and_a_thin_example_fail(self):
+        for cell in ("...", "---", "", "<before>", "a b"):
+            table = ("## What changes for you\n\n| Before | After |\n|---|---|\n| %s | You get one card. |\n| You open a list. | It opens itself. |\n\n" % cell)
+            found = self.defects(self.OPEN + self.WHY + table + self.EXAMPLE + self.QS)
+            self.assertEqual((self.named(found, "table"), len(found)), (1, 1), (cell, found))
+        found = self.defects(self.OPEN + self.WHY + self.TABLE + "## Example\n\nIt works.\n\n" + self.QS)
+        self.assertEqual((self.named(found, "Example"), len(found)), (1, 1), found)
+
+    def test_a_pathological_64kb_body_is_judged_quickly_and_a_longer_one_is_not_read(self):
+        for unit in ("<", "<pre ", "```", "<pre class=", "`", "<!--"):
+            body = self.OPEN + unit * (64000 // len(unit))
+            started = time.monotonic()
+            found = self.defects(body)
+            self.assertLess(time.monotonic() - started, 2.0, "64 KB of %r" % unit)   # a generous bound: it takes milliseconds
+            self.assertTrue(found)
+        self.assertIn("longer than", self.defects(self.OPEN + self.TOP + "x" * 70001)[0])
+
+    def test_a_pre_mermaid_tag_fails_in_the_top_however_long_its_attributes_or_spelled(self):
+        def top_with(tag):
+            return self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + self.QS + tag + "\n"   # in the top part, after the questions
+        for n in (250, 1000, 60000):
+            tag = '<pre data-x="%s" class=mermaid>' % ("a" * n)
+            found = self.defects(top_with(tag))
+            self.assertEqual((self.named(found, "diagram"), len(found)), (1, 1), (n, found))
+        for tag in ('<pre data-x=">" class=mermaid>', "<pre title='a > b' class='mermaid'>"):
+            self.assertEqual(self.named(self.defects(top_with(tag)), "diagram"), 1, tag)
+        for tag in ("<pre class='a mermaid b'>", '<PRE CLASS="MERMAID">', "<pre  class = mermaid >"):
+            self.assertEqual(self.named(self.defects(top_with(tag)), "diagram"), 1, tag)
+        for tag in ('<pre class="code">', "<pre>", "<preview class=mermaid>"):
+            self.assertEqual(self.defects(top_with(tag)), [], tag)
+        started = time.monotonic()
+        found = self.defects(top_with("<pre " + "x" * 60000))   # never closed: it cannot be judged, so it fails
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertEqual(self.named(found, "diagram"), 1)
+
+    def within(self, seconds, fn, *args):
+        """Run fn(*args) with a hard alarm: a hang fails the test instead of hanging the suite."""
+        def boom(signum, frame):
+            raise AssertionError("did not finish in %d s (a hang)" % seconds)
+        old = signal.signal(signal.SIGALRM, boom)
+        signal.alarm(seconds)
+        try:
+            return fn(*args)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
+
+    def test_unicode_case_folding_cannot_hang_or_hide_a_mermaid_pre(self):
+        dotted = "\u0130"
+        for n in (1, 2, 50, 2000):
+            body = self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + self.QS + (dotted * n + "<PRE class=mermaid>") + "\n"
+            found = self.within(5, self.defects, body)
+            self.assertEqual(self.named(found, "diagram"), 1, (n, found))   # still found: folding is ASCII-only, the length never changes
+        self.assertTrue(self.within(5, self.defects, self.OPEN + dotted * 5000))   # a body of only U+0130 is judged (and fails)
+        # ASCII-only folding: the Kelvin sign and the long s are NOT k or s, and a dotless i is not i, so these are not Mermaid
+        for tag in ('<pre class="mermaid\u0131">', '<pre class="\u017fermaid">', '<pre class="code" data-k="\u212a">'):
+            self.assertEqual(self.within(5, self.defects, self.OPEN + self.TOP + tag + "\n"), [], tag)
+        # the real spellings still are
+        self.assertEqual(self.named(self.within(5, self.defects, self.OPEN + self.TOP + "<PrE ClAsS='MeRmAiD'>\n"), "diagram"), 1)
+        self.assertEqual(self.named(self.within(5, self.defects, self.OPEN + self.TOP + "```MERMAID\nx\n```\n"), "diagram"), 1)
+
+    def test_a_fuzz_of_random_unicode_bodies_never_hangs_or_crashes(self):
+        import random
+        rng = random.Random(604)
+        alphabet = ["\u0130", "\u212a", "\u017f", "\u0131", "<", ">", "pre", "PRE", "class=", "mermaid", "'", '"', "`", "```", "~~~", "|", "\n", " ", "#", "## ", "<!--", "-->", "I", "i", "K", "s", "\u00e9", "\U0001f600", "1.", "Recommendation:"]
+        def run():
+            for _ in range(20000):
+                body = self.OPEN + "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 60)))
+                self.assertIsInstance(sb.held_defects(body), list)
+        self.within(60, run)
+
+    def test_none_line_variants_and_hostile_runs_are_judged_quickly(self):
+        for line, ok in (("Questions: none", True), ("Questions: none.", True), ("Questions: none (clear to merge on your word).", True),
+                         ("Questions: none (a) (b)", True), ("Questions: none (open", False), ("Questions: nonexistent", False), ("Questions: none x", False)):
+            body = self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + "## Questions for you\n\n" + line + "\n"
+            self.assertEqual(self.defects(body) == [], ok, line)
+        for hostile in ("Questions: none" + " " * 60000 + "x", "Questions: none (" * 4000, "Questions: none" + "\t" * 60000 + "x", "<!--" * 17000, "<!---->" * 9000):
+            started = time.monotonic()
+            self.assertTrue(self.within(5, self.defects, self.OPEN + hostile))
+            self.assertLess(time.monotonic() - started, 2.0, hostile[:20])   # a wide margin: it takes milliseconds; the alarm above catches a hang
+
+    def test_an_exhausted_step_budget_makes_the_body_unreadable(self):
+        with mock.patch.object(sb, "_held_steps", return_value=[0]):
+            found = sb.held_defects(self.OPEN + self.TOP + "<!-- a -->\n")
+        self.assertEqual((len(found), "unreadable" in found[0]), (1, True))
+
+    def test_html_whitespace_around_the_class_attribute_is_all_five_characters(self):
+        def top_with(tag):
+            return self.OPEN + self.TOP + tag + "\n"
+        for tag in ("<pre class\f=mermaid>", "<pre class\r=mermaid>", "<pre class=\fmermaid>", '<pre class = "mermaid">', "<pre class\t\n=mermaid>",
+                    '<pre class="x\fmermaid\ry">', "<pre\fclass=mermaid>", "<pre\rclass='mermaid'>"):
+            found = self.within(5, self.defects, top_with(tag))
+            self.assertEqual(self.named(found, "diagram"), 1, repr(tag))
+        # NOT HTML whitespace: a vertical tab and a no-break space make another attribute name or token, so these are not Mermaid
+        for tag in ("<pre class\x0b=mermaid>", "<pre class\u00a0=mermaid>", '<pre class="x\u00a0mermaid">', '<pre class="\x0bmermaid">'):
+            self.assertEqual(self.within(5, self.defects, top_with(tag)), [], repr(tag))
+
+    def test_underscore_only_cells_fail(self):
+        table = ("## What changes for you\n\n| Before | After |\n|---|---|\n| ___ | You get one card. |\n| You open a list. | It opens itself. |\n\n")
+        found = self.defects(self.OPEN + self.WHY + table + self.EXAMPLE + self.QS)
+        self.assertEqual((self.named(found, "table"), len(found)), (1, 1), found)
+
+    def test_a_body_the_check_cannot_read_fails(self):
+        with mock.patch.object(sb, "_held_defects", side_effect=RuntimeError("boom")):
+            found = sb.held_defects(self.OPEN + self.TOP)
+        self.assertEqual((len(found), "unreadable" in found[0]), (1, True))
+
+    def test_a_hash_line_inside_a_fence_does_not_end_the_top(self):
+        example = "## Example\n\nA command:\n\n```text\n# a comment line\n```\n\nIt prints one card.\n\n"
+        self.assertEqual(self.defects(self.OPEN + self.WHY + self.TABLE + example + self.QS), [])
+
+    def test_the_three_files_name_the_parts_in_order_and_put_mermaid_below(self):                           # S9
+        for rel in ("skills/fleet-explainer/SKILL.md", ".github/pull_request_template.md", "skills/fleet-coordination/SKILL.md"):
+            text = (REPO / rel).read_text()
+            why = text.index("Why this needs you")
+            at = [why] + [text.index(n, why) for n in ("What changes for you", "Example", "Questions for you")]
+            self.assertEqual(at, sorted(at), rel)
+            self.assertIn("optional", text[why:].lower(), rel)
+            self.assertRegex(text[why:], r"Mermaid[^\n]*below|below[^\n]*Mermaid", rel)
+
+    def test_the_block_sits_after_the_opening_lines_for_both_readers(self):                                 # S10
+        body = self.OPEN + self.GOOD
+        self.assertEqual(sb.pr_marker(body), "captain")
+        self.assertEqual(sb.plan_ledger.PLAN_LINK_RE.search(body).group(1), "https://example.test/acme/api/issues/9")
+
+    def test_a_top_v2_with_the_explainer_block_and_mermaid_below_passes_both_checks(self):
+        block = sb.explainer_block("old", "new")
+        body = sb.explainer_insert(self.OPEN + self.TOP + "## For reviewers (technical)\n\ntext\n", block) + "\n## How it flows\n\n```mermaid\nflowchart LR\n  A[\"Request\"] --> B[\"Gate\"]\n```\n"
+        self.assertEqual(self.defects(body), [])
+        self.assertEqual(sb.explainer_defects(body), [])
+        self.assertLess(body.index("## Questions for you"), body.index(sb.EXPLAINER_BEGIN))
+
+
 class TestHeldRowsFromLabels(DecisionsBase):
     """#641: an open pull request that carries the fleet's hold labels is a decision row on those labels alone, one row per pull request, read from the open-pull-request list the daemon already holds."""
 
@@ -41337,7 +41572,11 @@ class TestPrExplainer(DecisionsBase):
         self.captain()   # a captain PR needs no diagram either: the same body passes
         self.pr["body"] = sb.explainer_insert("x", block)
         code, out, err = self.cli("pr-explain", "acme/api#7", "--check")
-        self.assertEqual((code, out.strip()), (0, "explainer: PASS"))
+        self.assertEqual(code, 1, out)   # a held (captain) PR also needs why, its table, an example and its questions (TestHeldTop)
+        self.pr["body"] = sb.explainer_insert("x\n" + TestHeldTop.TOP + "## For reviewers\n", block)
+        self.assertEqual(self.cli("pr-explain", "acme/api#7", "--check")[0], 0)
+        self.pr["body"] = sb.explainer_insert("x\n" + TestHeldTop.TOP + "## For reviewers\n", block) + "\n" + self.DATAFLOW
+        self.assertEqual(self.cli("pr-explain", "acme/api#7", "--check")[0], 0, "a data-flow diagram below the top is allowed")
 
     def test_check_accepts_a_body_without_a_diagram_and_one_with_a_data_flow_diagram_and_fails_the_summary_flowchart_anywhere(self):
         block = sb.explainer_block("old", "new")
