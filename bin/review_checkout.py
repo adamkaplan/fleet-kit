@@ -7,19 +7,27 @@ Layout of `<cwd>/.review/<head sha, 12 characters>/`: `head/` (the head tree), `
 Hostile input is the main risk: a symlink or a submodule in the tree is never followed or created (named and skipped); a path with `..`, an
 empty or `.` part, a backslash, an absolute path or a NUL is refused; every file is opened with O_EXCL and O_NOFOLLOW below a directory made
 one component at a time, and the resolved path is checked to be inside the directory. A bound on file size, file count and total size refuses
-with the limit and the number. A refusal removes what this call made. Nothing here reads GitHub itself: the caller passes `api(path) -> JSON`.
+with the limit and the number. A refusal removes what this call made. Nothing here reads GitHub itself: the caller passes `api(path) -> JSON` and `archive(sha) -> bytes` (the tarball of that exact commit).
+The head tree comes from ONE archive call, read member by member by `read_archive` below (the archive is hostile input: it is never handed to an extracting
+tool; every member name goes through bad_path, links and special files are named and skipped, every bound is checked from the member header BEFORE its bytes are
+read). The marker is written FIRST, so a run that is killed or fails part-way leaves a directory `--remove` accepts.
 Python 3.9+, standard library only; loaded by path from beside bin/fleet-switchboard.
 """
 
 import base64
 import difflib
+import gzip
+import hashlib
+import io
 import json
 import os
 import re
 import shutil
 import stat
+import tarfile
 import time
 import unicodedata
+import zlib
 
 MARKER = ".fleet-review-checkout"
 MARKER_TOOL = "fleet-switchboard review checkout"
@@ -171,6 +179,109 @@ def write_file(root, rel, data):
         handle.write(data)
 
 
+def git_blob_sha(data):
+    return hashlib.sha1(b"blob %d\x00" % len(data) + data).hexdigest()
+
+
+class _Capped(io.RawIOBase):
+    """A reader that stops, with OverBound, once more than `cap` decompressed bytes have been read: a gzip bomb, or headers and skipped members, cannot run on."""
+
+    def __init__(self, inner, cap):
+        self.inner, self.cap, self.seen = inner, cap, 0
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        got = self.inner.readinto(buffer)
+        self.seen += got or 0
+        if self.seen > self.cap:
+            raise OverBound("the archive is more than %d bytes unpacked, over the limit of %d bytes in total" % (self.cap, self.cap))
+        return got
+
+
+def read_archive(data, root, limits, started, expected):
+    """Unpack the tarball `data` (bytes) into `root` with write_file, the only writer. Members are read in a stream, never extracted by tarfile.
+    The archive's single top directory prefix is stripped; a member outside it is refused. `expected` is {path: (blob sha, size, exec)} of the git TREE, the authority: a file the tree does not list is refused, and a file whose content does not hash to the tree's blob sha (`export-subst`) is not written (the caller fetches it by blob). Returns ({path: (git blob sha, size)} of what was written, skipped, refused, altered).
+    Raises OverBound before a member's bytes are read when its header passes a bound."""
+    files, skipped, refused, seen, altered = {}, [], [], set(), []
+    members, total, top = 0, 0, None
+    try:
+        # unpacked here, under a byte cap that counts every byte (headers and skipped members too): total bound + room for headers and padding
+        capped = io.BufferedReader(_Capped(gzip.GzipFile(fileobj=io.BytesIO(data)), limits["total"] + 1024 * (4 * limits["files"] + 16)))
+        archive = tarfile.open(fileobj=capped, mode="r|")
+    except (tarfile.TarError, OSError, EOFError, zlib.error) as err:
+        raise Problem("GitHub answered an unreadable archive: %s" % err) from None
+    try:
+        for member in archive:
+            if time.monotonic() - started > DEADLINE_SECONDS:
+                raise OverBound("the checkout took more than %d seconds (the time limit)" % DEADLINE_SECONDS)
+            members += 1
+            if members > 4 * limits["files"] + 16:
+                raise OverBound("the archive has more than %d members, over the limit of %d files" % (4 * limits["files"] + 16, limits["files"]))
+            name = member.name
+            why = bad_path(name.rstrip("/")) if name.rstrip("/") else "an empty path"
+            if why:
+                refused.append((name, why))
+                continue
+            parts = name.rstrip("/").split("/")
+            if top is None:
+                top = parts[0]
+            if parts[0] != top:
+                refused.append((name, "a member outside the archive's single top directory"))
+                continue
+            rel = "/".join(parts[1:])
+            if member.isdir():
+                continue
+            if not rel:
+                refused.append((name, "a file in place of the archive's top directory"))
+                continue
+            if member.issym() or member.islnk():
+                skipped.append((rel, "a symlink" if member.issym() else "a hardlink"))
+                continue
+            if not member.isreg() or member.issparse():
+                skipped.append((rel, "a special or sparse file"))
+                continue
+            if rel in seen:
+                raise Unsafe("%s appears twice in the archive (duplicate member)" % _shown(rel))
+            seen.add(rel)
+            if len(seen) > limits["files"]:
+                raise OverBound("the head tree has more than %d files, over the limit of %d files" % (limits["files"], limits["files"]))
+            if member.size > limits["file"]:
+                raise OverBound("%s in the head tree is %d bytes, over the limit of %d bytes for one file" % (_shown(rel), member.size, limits["file"]))
+            total += member.size
+            if total > limits["total"]:
+                raise OverBound("the head tree is over %d bytes in all, over the limit of %d bytes in total" % (limits["total"], limits["total"]))
+            if rel not in expected:
+                refused.append((rel, "a file the git tree of the head does not list"))
+                continue
+            handle = archive.extractfile(member)
+            body = handle.read(member.size + 1) if handle is not None else b""
+            if len(body) != member.size:
+                raise Problem("GitHub answered a truncated archive member %s" % _shown(rel))
+            if git_blob_sha(body) != expected[rel][0]:
+                altered.append(rel)   # export-subst or a forged archive: the blob of the tree is fetched instead
+                continue
+            write_file(os.path.join(root, "head"), rel, body)
+            files[rel] = (expected[rel][0], len(body))
+    except (tarfile.TarError, OSError, EOFError, zlib.error) as err:   # a bad gzip or tar stream, or a write that failed
+        raise Problem("GitHub answered an unreadable archive: %s" % err) from None
+    finally:
+        archive.close()
+    return files, skipped, refused, altered
+
+
+def _marker_bytes(fields):
+    return (json.dumps(fields, indent=1, sort_keys=True) + "\n").encode()
+
+
+def _rewrite_marker(root, data):
+    """Replace the content of the marker this call already made (a regular file; never created here, never followed)."""
+    fd = os.open(os.path.join(root, MARKER), os.O_WRONLY | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(data)
+
+
 def _diff_text(path, old, new, late=False):
     def text(data):
         return None if data is None else data.decode("utf-8", "replace").splitlines(keepends=True)
@@ -199,7 +310,7 @@ def make_readonly(root):
     os.chmod(root, 0o555)
 
 
-def checkout(api, repo, number, head, base, cwd, limits=None, notify=lambda text: None):
+def checkout(api, repo, number, head, base, cwd, limits=None, notify=lambda text: None, archive=None):
     """Materialise PR `repo#number` at commit `head` (read ONCE by the caller; every fetch uses it) under `cwd`, diffed against merge base of
     `base`. Returns the directory path. On any failure everything this call made is removed and the exception (Unsafe, OverBound, Problem) is raised."""
     limits = dict({"file": MAX_FILE_BYTES, "files": MAX_FILES, "total": MAX_TOTAL_BYTES}, **(limits or {}))
@@ -207,7 +318,7 @@ def checkout(api, repo, number, head, base, cwd, limits=None, notify=lambda text
         raise Problem("the head and the base must each be a full 40-character commit sha")
     cwd_real = os.path.realpath(cwd)
     parent, root = os.path.join(cwd_real, PARENT), os.path.join(cwd_real, PARENT, head[:12])
-    created_parent = False
+    created_parent = made_root = False
     try:
         if os.path.lexists(parent) and (os.path.islink(parent) or not os.path.isdir(parent)):
             raise Unsafe("%s exists and is not a plain directory" % PARENT)
@@ -217,7 +328,11 @@ def checkout(api, repo, number, head, base, cwd, limits=None, notify=lambda text
         if os.path.lexists(root):
             raise Problem("%s exists already: remove it first (`review checkout --remove`)" % os.path.join(PARENT, head[:12]))
         os.mkdir(root, 0o700)
+        made_root = True
+        write_file(root, MARKER, _marker_bytes({"tool": MARKER_TOOL, "pr": "%s#%d" % (repo, number), "head": head, "base": base}))   # FIRST: a killed run leaves a directory `--remove` accepts
     except BaseException:
+        if made_root:
+            remove_tree(root, force=True)
         if created_parent:
             shutil.rmtree(parent, ignore_errors=True)
         raise
@@ -233,42 +348,63 @@ def checkout(api, repo, number, head, base, cwd, limits=None, notify=lambda text
         except Problem as err:   # the base copy then comes from the base commit itself, said aloud and recorded in the marker
             fallback = True
             notify("the merge base could not be read (%s): the base copies come from the base commit %s" % (err, base[:12]))
-        head_files, skipped, refused = read_tree(api, repo, head, limits)
         base_files, base_skipped, base_refused = read_tree(api, repo, merge_base, limits)
-        refused = refused + [(p + " (base)", w) for p, w in base_refused]
+        started = time.monotonic()
+        os.mkdir(os.path.join(root, "head"), 0o700)
+        os.mkdir(os.path.join(root, "base"), 0o700)
+        if archive is None:
+            raise Problem("no archive reader was given")
+        tree_files, tree_skipped, tree_refused = read_tree(api, repo, head, limits)   # the AUTHORITY on which files the head has (a tarball honours export-ignore and export-subst)
+        check_bounds(tree_files, limits, "head")
+        archived, skipped, refused, altered = read_archive(archive(head), root, limits, started, tree_files)   # ONE call: the exact head sha
+        skipped = tree_skipped + [s_ for s_ in skipped if s_[0] not in {p for p, _ in tree_skipped}]
+        refused = tree_refused + refused + [(p + " (base)", w) for p, w in base_refused]
         if refused:
-            raise Unsafe("refused, nothing written: " + "; ".join("%s: %s" % (_shown(p), w) for p, w in refused[:20])
+            raise Unsafe("refused, nothing kept: " + "; ".join("%s: %s" % (_shown(p), w) for p, w in refused[:20])
                          + ("; skipped (never followed): " + ", ".join(_shown(p) for p, _ in skipped[:20]) if skipped else ""))
+        head_files, from_blob = dict(archived), sorted(set(tree_files) - set(archived))   # the tree files the archive left out or altered: fetched by blob, never silently fewer
+        fetched = [0]
+        for path in from_blob:
+            if time.monotonic() - started > DEADLINE_SECONDS:
+                raise OverBound("the checkout took more than %d seconds (the time limit)" % DEADLINE_SECONDS)
+            data = fetch_blob(api, repo, tree_files[path][0], limits)
+            fetched[0] += len(data)
+            if fetched[0] > limits["total"]:
+                raise OverBound("the blobs fetched are %d bytes in all, over the limit of %d bytes in total" % (fetched[0], limits["total"]))
+            if git_blob_sha(data) != tree_files[path][0]:
+                raise Problem("the blob GitHub answered for %s is not the tree's blob" % _shown(path))
+            write_file(os.path.join(root, "head"), path, data)
+            head_files[path] = (tree_files[path][0], len(data))
+        if from_blob:
+            notify("%d of %d files were not in the archive as the tree has them (export-ignore or export-subst) and came from the blob API: %s"
+                   % (len(from_blob), len(tree_files), ", ".join(_shown(p) for p in from_blob[:20])))
         touched = sorted(p for p in set(head_files) | set(base_files)
                          if (head_files.get(p) or (0,))[0] != (base_files.get(p) or (0,))[0])
-        check_bounds(head_files, limits, "head")
         check_bounds({p: base_files[p] for p in touched if p in base_files}, limits, "base")
         total = sum(v[1] for v in head_files.values()) + sum(base_files[p][1] for p in touched if p in base_files)
         if total > limits["total"]:
             raise OverBound("the head and base copies are %d bytes in all, over the limit of %d bytes in total" % (total, limits["total"]))
-        started = time.monotonic()
-        cache, fetched = {}, [0]
+        fetched = [0]
 
-        def blob(entry):
+        def base_blob(entry):
             if time.monotonic() - started > DEADLINE_SECONDS:
                 raise OverBound("the checkout took more than %d seconds (the time limit)" % DEADLINE_SECONDS)
-            if entry[0] not in cache:
-                cache[entry[0]] = fetch_blob(api, repo, entry[0], limits)
-                fetched[0] += len(cache[entry[0]])
-                if fetched[0] > limits["total"]:
-                    raise OverBound("the blobs fetched are %d bytes in all, over the limit of %d bytes in total" % (fetched[0], limits["total"]))
-            return cache[entry[0]]
+            data = fetch_blob(api, repo, entry[0], limits)
+            fetched[0] += len(data)
+            if fetched[0] > limits["total"]:
+                raise OverBound("the blobs fetched are %d bytes in all, over the limit of %d bytes in total" % (fetched[0], limits["total"]))
+            return data
 
-        os.mkdir(os.path.join(root, "head"), 0o700)
-        os.mkdir(os.path.join(root, "base"), 0o700)
-        for path in sorted(head_files):
-            write_file(os.path.join(root, "head"), path, blob(head_files[path]))
+        def head_text(path):
+            fd = os.open(os.path.join(root, "head", *path.split("/")), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(fd, "rb") as handle:
+                return handle.read(limits["file"] + 1)
         diff, written, diff_started = [], 0, time.monotonic()
         for path in touched:
             if time.monotonic() - started > DEADLINE_SECONDS:
                 raise OverBound("the checkout took more than %d seconds (the time limit)" % DEADLINE_SECONDS)
-            old = blob(base_files[path]) if path in base_files else None
-            new = blob(head_files[path]) if path in head_files else None
+            old = base_blob(base_files[path]) if path in base_files else None
+            new = head_text(path) if path in head_files else None
             if old is not None:
                 write_file(os.path.join(root, "base"), path, old)
             piece = _diff_text(path, old, new, late=time.monotonic() - diff_started > DIFF_SECONDS)
@@ -277,8 +413,9 @@ def checkout(api, repo, number, head, base, cwd, limits=None, notify=lambda text
                 raise OverBound("the diff is over the limit of %d bytes" % MAX_DIFF_BYTES)
             diff.append(piece)
         write_file(root, "pr.diff", "".join(diff).encode())
-        write_file(root, MARKER, (json.dumps({"tool": MARKER_TOOL, "pr": "%s#%d" % (repo, number), "head": head, "base": base,
-                                              "merge_base": merge_base, "merge_base_fallback": fallback, "touched": len(touched)}, indent=1, sort_keys=True) + "\n").encode())
+        _rewrite_marker(root, _marker_bytes({"tool": MARKER_TOOL, "pr": "%s#%d" % (repo, number), "head": head, "base": base,
+                                             "merge_base": merge_base, "merge_base_fallback": fallback, "touched": len(touched),
+                                             "from_blob_api": from_blob, "altered_in_archive": sorted(altered)}))
         for path, why in skipped:
             notify("skipped %s: %s (never followed or created)" % (_shown(path), why))
         make_readonly(root)
