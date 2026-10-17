@@ -42149,6 +42149,7 @@ class TestCaptainPrs(DecisionsBase):
         self.world.engine.run_pass()
         self.world.engine.run_pass()
         self.assertEqual(self.escalated_file(), {})
+        self.assertEqual([e["detail"]["reason"] for e in self.world.audit() if e["event"] == "escalation.pruned"], ["merged or closed"])
 
     def test_an_escalation_of_an_older_head_does_not_make_a_new_head_the_persons(self):
         sb.escalate_decision(self.world.engine, None, self.only(), "needs you", "cos")
@@ -42544,6 +42545,183 @@ class TestHeldSummaryFlowchart(unittest.TestCase):
         self.assertEqual(sum("generated summary flowchart" in d for d in sb.explainer_defects(self.SUMMARY)), 1)
         block = sb.explainer_block("old", "new")
         self.assertEqual(sum("generated summary flowchart" in d for d in sb.explainer_defects(sb.explainer_insert(self.SUMMARY, block))), 1)
+
+
+class TestEscalationPrune(DecisionsBase):
+    """#750: the daemon's end-of-pass prune of an owner-tier escalation of a labels-only held pull request goes only on evidence."""
+
+    REPO = "acme-org/widget-service"
+    NUMBER = 7
+
+    def setUp(self):
+        super().setUp()
+        self.gh = FakeGhPr({7: (0, captain_pr(reviews=[("reviewer", "APPROVED", HEAD_A)]), ""), 8: (0, captain_pr(reviews=[("reviewer", "APPROVED", HEAD_A)]), "")})
+        self.engine = self.world.engine
+        self.engine.gh_runner = self.gh
+        self.engine.config["plan_gates"] = {"repos": {self.REPO: {"mode": "shadow"}}}
+        self.engine.ci_record_state = sb.CiRecordState()
+        self.key = "captain:%s#%d@%s" % (self.REPO, self.NUMBER, HEAD_A)
+
+    def pr(self, number=7, *labels, head=HEAD_A, state="open", merged=False):
+        record = {"number": number, "title": "Add the widget", "state": state, "head": {"sha": head}, "created_at": sb.iso(self.world.clock.now() - 3600),
+                  "labels": [{"name": "tester:%s" % l} for l in labels], "draft": False}
+        if merged:
+            record["merged_at"] = sb.iso(self.world.clock.now() - 60)
+        return record
+
+    def read_ok(self, *records, cut=False, repo=None):
+        """A list read that SUCCEEDED in this process (what the ci recorder records)."""
+        self.world.tick(1)   # a read is later than any key written before it
+        state, key, now = self.engine.ci_record_state, (repo or self.REPO).lower(), self.world.clock.now()
+        state.lists[key] = (now, list(records))
+        state.good[key] = (now, list(records), cut)
+
+    def escalate(self):
+        self.read_ok(self.pr(7, "merge-captain"))
+        (row,) = [d for d in self.listed() if d.get("number") == 7]
+        sb.escalate_decision(self.engine, None, row, "needs you", "cos")
+        self.assertEqual(list(sb.read_escalated(self.world.state)), [self.key])
+
+    def keys(self):
+        return sorted(sb.read_escalated(self.world.state))
+
+    def pruned(self):
+        return [e for e in self.world.audit() if e["event"] == "escalation.pruned"]
+
+    def row(self):
+        """One daemon pass (derive, publish, prune), then the list as the person sees it."""
+        self.world.engine.discover(self.world.clock.now())
+        self.world.engine.collect_facts()
+        sb.publish_decisions(self.engine)
+        return [d for d in self.listed() if d.get("number") == 7]
+
+    def test_s1_a_restart_with_an_empty_unread_or_failed_list_keeps_the_key_and_the_owner_tier(self):
+        self.escalate()
+        state = self.engine.ci_record_state
+        state.lists.clear()
+        state.good.clear()                      # unread: the restart
+        self.row(); self.assertEqual(self.keys(), [self.key])
+        state.lists[self.REPO] = (self.world.clock.now(), [])   # a failed first read: (now, [])
+        self.row(); self.assertEqual(self.keys(), [self.key])
+        self.read_ok(self.pr(9, "merge-captain"), cut=True)       # a list without it, but cut
+        self.row(); self.assertEqual(self.keys(), [self.key])
+        self.read_ok(self.pr(7, "merge-captain"))
+        (row,) = self.row()
+        self.assertEqual(row["tier"], "human")
+        self.assertEqual(self.pruned(), [])
+
+    def test_s2_a_successful_read_prunes_a_gone_merged_other_head_or_unlabelled_pr_and_not_a_held_one(self):
+        cases = {"gone": [self.pr(9, "merge-captain")], "merged": [self.pr(7, "merge-captain", merged=True)],
+                 "another head": [self.pr(7, "merge-captain", head=HEAD_B)], "no longer held": [self.pr(7)]}
+        for name, records in cases.items():
+            self.escalate()
+            self.row(); self.assertEqual(self.keys(), [self.key])
+            self.read_ok(*records)
+            self.row()
+            self.assertEqual(self.keys(), [], name)
+        self.assertEqual([e["detail"]["reason"] for e in self.pruned()], ["absent", "absent", "another head", "no longer held"])
+        self.escalate()
+        self.read_ok(self.pr(7, "merge-captain"))
+        self.row(); self.assertEqual(self.keys(), [self.key])
+
+    def test_s3_a_failed_later_read_a_cut_list_and_an_unlisted_repository_keep_the_key(self):
+        self.escalate()
+        # a read fails after a good one: the recorder keeps the old list for the rows but the good record goes
+        state = self.engine.ci_record_state
+        state.lists[self.REPO] = (self.world.clock.now(), [self.pr(9, "merge-captain")])
+        state.good.pop(self.REPO)
+        self.row(); self.assertEqual(self.keys(), [self.key])
+        self.read_ok(self.pr(9, "merge-captain"), cut=True)
+        self.row(); self.assertEqual(self.keys(), [self.key])
+        self.read_ok(self.pr(9, "merge-captain"), repo="acme-org/other-service")   # another repository was listed; this one never
+        state.good.pop(self.REPO); state.lists.pop(self.REPO)
+        self.row(); self.assertEqual(self.keys(), [self.key])
+        self.assertEqual(self.pruned(), [])
+
+    def test_s4_a_pr_with_a_notice_keeps_its_key_in_every_list_state(self):
+        self.escalate()
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "platform", "ready", self.world.clock.now())
+        for records in ([], [self.pr(9, "merge-captain")]):
+            self.read_ok(*records)
+            self.row(); self.assertEqual(self.keys(), [self.key])
+        self.engine.ci_record_state.good.clear()
+        self.row(); self.assertEqual(self.keys(), [self.key])
+        self.assertEqual(self.pruned(), [])
+
+    def test_the_recorder_keeps_a_success_only_until_a_read_of_that_repository_fails(self):
+        hub = FakeHub({self.REPO: [self.pr(7, "merge-captain")]})
+        self.engine.hub = hub
+        now = self.world.clock.now()
+        sb.ci_record_pass(self.engine, now)
+        good = self.engine.ci_record_state.good
+        self.assertEqual(sorted(good), [self.REPO])
+        self.assertEqual((len(good[self.REPO][1]), good[self.REPO][2]), (1, False))
+        hub.down = True
+        sb.ci_record_pass(self.engine, now + sb.CI_RECORD_LIST_TTL + 1)
+        self.assertEqual(sorted(good), [], "a failed read leaves no success on record")
+        self.assertEqual(len(self.engine.ci_record_state.lists[self.REPO][1]), 1, "the rows still use the old list")
+
+    def test_s8_a_key_written_after_the_list_was_read_is_kept_and_one_older_than_the_read_is_pruned(self):
+        self.escalate()
+        self.read_ok(self.pr(9, "merge-captain"))     # a successful read in which PR 7 is absent
+        self.world.tick(5)
+        with sb.escalated_lock(self.world.state):      # a fresh escalation (a new PR) written after that read
+            found = sb.read_escalated(self.world.state)
+            fresh = "captain:%s#8@%s" % (self.REPO, HEAD_A)
+            found[fresh] = sb.iso(self.world.clock.now())
+            sb.write_escalated(self.world.state, found)
+        self.row()
+        self.assertEqual(self.keys(), [fresh], "the older key is pruned, the fresh one waits for a later read")
+        self.assertEqual([e["detail"]["reason"] for e in self.pruned()], ["absent"])
+        self.read_ok(self.pr(9, "merge-captain"))
+        self.row()
+        self.assertEqual(self.keys(), [])
+
+    def test_s5_a_key_older_than_14_days_is_pruned_and_a_younger_one_stays(self):
+        self.escalate()
+        old = "captain:%s#8@%s" % (self.REPO, HEAD_A)
+        with sb.escalated_lock(self.world.state):
+            found = sb.read_escalated(self.world.state)
+            found[self.key] = sb.iso(self.world.clock.now() - 13 * 86400)
+            found[old] = sb.iso(self.world.clock.now() - 15 * 86400)
+            sb.write_escalated(self.world.state, found)
+        self.engine.ci_record_state.good.clear()
+        self.row()
+        self.assertEqual(self.keys(), [self.key])
+        self.assertEqual([(e["detail"]["escalation"], e["detail"]["reason"]) for e in self.pruned()], [(old, "expired")])
+
+    def test_s5b_an_old_key_goes_even_with_a_notice(self):
+        self.escalate()
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "platform", "ready", self.world.clock.now())
+        with sb.escalated_lock(self.world.state):
+            sb.write_escalated(self.world.state, {self.key: sb.iso(self.world.clock.now() - 15 * 86400)})
+        self.row()
+        self.assertEqual(self.keys(), [])
+
+    def test_s6_every_prune_is_audited_with_the_key_and_a_reason_and_a_pass_that_prunes_nothing_writes_none(self):
+        self.escalate()
+        self.row()
+        self.assertEqual(self.pruned(), [])
+        self.read_ok(self.pr(7, "merge-captain", head=HEAD_B))
+        self.row()
+        (event,) = self.pruned()
+        self.assertEqual((event["detail"]["escalation"], event["detail"]["reason"], event["subject"]), (self.key, "another head", self.key))
+        self.row()
+        self.assertEqual(len(self.pruned()), 1)
+
+    def test_u1_a_request_no_longer_pending_is_pruned_as_before_and_unreadable_notices_prune_nothing(self):
+        stale = "ses_example:req_1"
+        with sb.escalated_lock(self.world.state):
+            sb.write_escalated(self.world.state, {stale: sb.iso(self.world.clock.now())})
+        self.row()
+        self.assertEqual(self.keys(), [])
+        self.assertEqual([e["detail"]["reason"] for e in self.pruned()], ["request no longer pending"])
+        with sb.escalated_lock(self.world.state):
+            sb.write_escalated(self.world.state, {stale: sb.iso(self.world.clock.now())})
+        before = (self.world.state / sb.ESCALATED_FILE).read_bytes()
+        with mock.patch.object(sb, "read_pr_notices", side_effect=sb.NoticeError("unreadable")):
+            sb.prune_escalations_pass(self.engine, sb.decision_store(self.engine), self.world.clock.now())
+        self.assertEqual((self.world.state / sb.ESCALATED_FILE).read_bytes(), before)
 
 
 class TestHeldRowsFromLabels(DecisionsBase):

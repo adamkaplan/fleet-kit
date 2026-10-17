@@ -9164,6 +9164,53 @@ def mark_batch_note(state_dir, key, when):
         raise
 
 
+ESCALATION_MAX_AGE_SECONDS = 14 * 86400   # a captain escalation older than this is forgotten, whatever else holds it
+
+
+def captain_escalation_leaves(engine, escalated, now):
+    """{key: reason} for the captain escalations that may be pruned, and only on evidence: older than ESCALATION_MAX_AGE_SECONDS
+    (`expired`), or a list read of that repository that SUCCEEDED in this process (`state.good`) shows the pull request absent
+    (`absent`, not from a list that may be cut), at another head (`another head`) or without the hold labels (`no longer held`).
+    The list must have been read AFTER the key was written (a fresh escalation is kept this pass). An empty, unread, failed or
+    never-listed repository gives none. Never raises."""
+    out = {}
+    left = (getattr(engine, "notice_effects", None) or {}).get("left") or set()
+    state = getattr(engine, "ci_record_state", None)
+    good = getattr(state, "good", None) or {}
+    for key, stamp in escalated.items():
+        if not key.startswith("captain:"):
+            continue
+        at = parse_iso(stamp)
+        if at is not None and now - at > ESCALATION_MAX_AGE_SECONDS:
+            out[key] = "expired"
+            continue
+        try:
+            ref, _, head = key[len("captain:"):].rpartition("@")
+            repo, _, number = ref.rpartition("#")
+            if ref in left:
+                out[key] = "merged or closed"
+                continue
+            read = good.get(plan_ledger.normal_repo(repo))
+            if read is None or not number.isdigit() or not head:
+                continue
+            if at is None or read[0] <= at:
+                continue   # the list was read no later than the key was written: it cannot show whether the pull request left
+            records, cut = read[1], read[2]
+            record = next((r for r in records if isinstance(r, dict) and _number(r) == int(number)
+                           and r.get("state", "open") == "open" and not r.get("merged_at")), None)
+            if record is None:
+                if not cut:
+                    out[key] = "absent"
+            elif ((record.get("head") or {}).get("sha") if isinstance(record.get("head"), dict) else None) != head:
+                out[key] = "another head"
+            elif not _label_kind({(l.get("name") if isinstance(l, dict) else l) for l in record.get("labels") or []},
+                                 CAPTAIN_MERGE_LABELS[:1] + CAPTAIN_HOLD_LABELS):
+                out[key] = "no longer held"
+        except Exception:
+            continue
+    return out
+
+
 def captain_escalations_to_keep(engine):
     """The escalations of `MERGE: captain` PR decisions that must survive a pass in which the PR could not be judged: those
     whose notice is still on file. An unreadable PR (a restart's first passes, a 404 under the wrong account, an outage) derives
@@ -9178,15 +9225,32 @@ def captain_escalations_to_keep(engine):
     return {k for k in escalated if k.startswith("captain:") and k[len("captain:"):].rpartition("@")[0] in alive}
 
 
+def prune_escalations_pass(engine, store, now):
+    """The daemon's end-of-pass prune. A captain key is kept unless `captain_escalation_leaves` has evidence (a noticed one is kept
+    as before, but not past the age cap); every other key goes when no longer pending. Each removed key is audited with its reason."""
+    keep = captain_escalations_to_keep(engine)
+    if keep is None or engine.request_keys is None:
+        return
+    escalated = read_escalated(engine.state_dir)
+    leaves = captain_escalation_leaves(engine, escalated, now)
+    captains = {k for k in escalated if k.startswith("captain:")}
+    pending = (set(engine.request_keys) | keep | (captains - set(leaves))) - {k for k, why in leaves.items() if why == "expired"}
+    removed = store.prune_escalated(pending)
+    for key in sorted(removed or ()):
+        if engine.audit is not None:   # not `_note`: the same key pruned twice is two events
+            engine.audit.append(engine.actor, "escalation.pruned", key, {"escalation": key, "reason": leaves.get(key, "request no longer pending")})
+
+
 def prune_escalated(state_dir, pending):
     """Forget every escalation of a request that is no longer pending (the daemon's, once a pass)."""
     if pending is None or not (Path(state_dir) / ESCALATED_FILE).exists():
-        return
+        return []
     with escalated_lock(state_dir):
         found = read_escalated(state_dir)
         kept = {k: v for k, v in found.items() if k in pending}
         if kept != found:
             write_escalated(state_dir, kept)
+        return sorted(set(found) - set(kept))
 
 
 def synthetic_lines(engine, session_id, since, waiting=False):
@@ -10056,7 +10120,7 @@ def decisions_from_notices(engine, now):
     Not a decision, so not counted with them. The facts come from `gh pr view`, cached; a PR that is merged or
     closed is not listed and is queued in engine.notice_effects for the daemon to forget; one that cannot be read
     keeps its last facts, marked stale, and is dropped (and logged) after PR_NOTICE_UNREADABLE_SECONDS."""
-    engine.notice_effects = {"drop": set(), "unreadable": {}, "observed": {}}
+    engine.notice_effects = {"drop": set(), "unreadable": {}, "observed": {}, "left": set()}
     state_dir = getattr(engine, "state_dir", None)
     if state_dir is None:
         return [], []
@@ -10082,6 +10146,7 @@ def decisions_from_notices(engine, now):
         facts = held["facts"]
         if facts is not None and facts["state"] in ("merged", "closed"):
             engine.notice_effects["drop"].add(key)
+            engine.notice_effects["left"].add(key)   # read as merged or closed: evidence for the escalation prune
             continue
         since = item.get("unreadable_since")
         if held.get("skipped"):
@@ -10481,7 +10546,7 @@ class LocalStore(decision_core.DecisionStore):
         mark_escalated(self.engine.state_dir, key, when)
 
     def prune_escalated(self, pending):
-        prune_escalated(self.engine.state_dir, pending)
+        return prune_escalated(self.engine.state_dir, pending)
 
 
 class NullExternal(decision_core.ExternalDecisionAdapter):
@@ -11060,8 +11125,7 @@ def publish_decisions(engine):
     apply_notice_effects(engine)
     store = decision_store(engine)
     try:
-        keep = captain_escalations_to_keep(engine)
-        store.prune_escalated(None if keep is None or engine.request_keys is None else set(engine.request_keys) | keep)
+        prune_escalations_pass(engine, store, now)
     except OSError:
         pass  # a disposable file: a failed prune is tried again next pass
     errors = errors + sync_external(engine, decisions, errors, now)  # [] unless external_decisions is enabled
@@ -20311,6 +20375,7 @@ CI_RECORD_RETRY = (300, 1800)   # an unreadable PR is retried after 5 minutes, d
 class CiRecordState:
     def __init__(self):
         self.lists = {}     # normalised repo -> (read at, records)
+        self.good = {}      # normalised repo -> (read at, records, cut): the list of the LAST read of it in this process that SUCCEEDED; a failed read removes it (memory only)
         self.checked = {}   # (normalised repo, number) -> {"list_head", "at", "retry_at", "fails"}: the LAST-CHECKED time decides
         self.recorded = 0   # verdicts this process recorded
         self.last_record = None
@@ -20347,8 +20412,10 @@ def ci_record_pass(engine, now):
             records, cut = hub.read_pages("repos/%s/pulls?state=open&per_page=100" % repo, cap=2)
             budget[0] -= sweep_pages_used(records, cut)
             state.lists[key] = (now, records)
+            state.good[key] = (now, records, bool(cut) or len(records) >= LABEL_HOLD_LIST_CUT)
         except GitHubUnavailable as err:
             budget[0] -= 1
+            state.good.pop(key, None)   # a failed read is no evidence: the old list stays for the rows, never for a prune
             state.lists[key] = (now, state.lists.get(key, (0, []))[1])   # keep the old list and try again after the TTL
             engine._note("ci_record.unreadable", repo, {"repo": repo, "reason": _one_line(str(err), 160)})
     pr_state_from_lists(state, repos)
