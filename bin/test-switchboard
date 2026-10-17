@@ -25633,6 +25633,144 @@ class LedgerBase(Base):
             self.assertEqual(self.verdict(who, sid, ev)[0], 0, (who, sid))
 
 
+# (plan hash, scenario hash) of five plan texts with a tester measure scenario, computed BEFORE the change to how G1 reads an unwritten claim (the checker is not touched by it): an unwritten claim and a
+# written `claim: pr` share one scenario hash because the canonical text has always filled `pr` in.
+PINNED_G1_HASHES = [
+    ("sha256:f59db1a8ea7a7a5a9a14aea40ed171467a1e44a2c22f5b7dad7ee8db9525800c", "sha256:1eb0d1ae3803c387308206baebdee4ec8f46ea649a0bc93ea21d154c9c0c2172"),
+    ("sha256:cda1cf00b68e99a39c2333618de5eb886785c7a380e9f78c4d3a8f700e441269", "sha256:1eb0d1ae3803c387308206baebdee4ec8f46ea649a0bc93ea21d154c9c0c2172"),
+    ("sha256:50a9daea80cdb6d0deb32da91d8b0b0ef938642b69c70ef6d5bb16db17146c98", "sha256:82e8896b50f5a203fa7c9f454d9f0de39a71a5f07183d9847c0b1f71e303238e"),
+    ("sha256:d5dde84d977987a17ed348cc1c2023a1456ef00b00d6b98ba412eccd8b6932a9", "sha256:1eb0d1ae3803c387308206baebdee4ec8f46ea649a0bc93ea21d154c9c0c2172"),
+    ("sha256:d2bead8ec573f01a5fb2ddc9acb39c65c9398838fb1c741d3897c2602a0eab33", "sha256:bfa5d6a9830a09f93946c6a90158edb784c7ca24778c4ece33870c9077a92e64"),
+]
+
+
+class TestG1UnwrittenClaim(LedgerBase):
+    """#579: G1 reads a scenario with NO claim written as the tester's post-merge check when its evaluator is the tester and its proof a measure: not claimed by a slice pull request, listed as proven
+    after the merge. An explicit claim is read as written; the plan hash never changes."""
+
+    def plan(self, s2_proof="measure", s2_claim="", s2_evaluator="tester"):
+        text = LEDGER_PLAN.replace("    proof: live\n    pass: the reply arrives within 5 s", "    proof: %s\n    pass: the reply arrives within 5 s" % s2_proof, 1)
+        text = text.replace("    evaluator: tester\n", "    evaluator: %s\n%s" % (s2_evaluator, "    claim: %s\n" % s2_claim if s2_claim else ""), 1)
+        return text
+
+    def setUp(self):
+        super().setUp()
+        self.configure(evaluators={"reviewer": ["rev"], "tester": ["tst"], "owner": ["own"], "ci": ["cibot"]})
+
+    def g1(self, text, proven=("S1", "S3", "U1")):
+        self.plan_issue["body"] = text
+        for sid in proven:
+            code, _, err = self.prove("coder", sid)
+            self.assertEqual(code, 0, (sid, err))
+        for who, sid, ev in (("cibot", "S1", "ci"), ("rev", "S3", "reviewer"), ("cibot", "U1", "ci")):
+            if sid in proven:
+                self.assertEqual(self.verdict(who, sid, ev)[0], 0, (who, sid))
+        code, report, err = self.gates()
+        self.assertIn(code, (0, 1), err)   # 1: not ready, with the table still printed
+        return self.row(report, "G1")
+
+    def test_s1_s2_an_unwritten_tester_measure_is_not_claimed_and_is_named_as_proven_after_the_merge(self):
+        row = self.g1(self.plan())
+        self.assertEqual(row["status"], "ok", row)
+        self.assertIn("3 of 3 claimed scenarios proven", row["detail"])
+        self.assertEqual(row["detail"].count("S2"), 1)
+        self.assertRegex(row["detail"], r"epic-claimed, proven after the merge at the integration head: S2, S4")
+
+    def test_prove_verdict_and_verdict_all_refuse_an_unwritten_tester_measure_like_an_explicit_epic_claim(self):
+        self.plan_issue["body"] = self.plan()                    # S2: tester + measure, no claim written
+        refusals = []
+        for run in (lambda: self.prove("coder", "S2"), lambda: self.verdict("tst", "S2", "tester"),
+                    lambda: self.run_as("tst", "verdict", "--all", "--pr", self.PR, "--as", "tester", "--result", "pass", "--evidence", "judged it: matches the scenario")):
+            code, _, err = run()
+            self.assertNotEqual(code, 0)
+            refusals.append(err)
+        self.assertIn("S2 is claimed at the epic, not per PR", refusals[0])
+        self.assertIn("S2 is claimed at the epic, not per PR", refusals[1])
+        self.assertIn("no per-PR scenario of this plan is judged by tester", refusals[2], "verdict --all has nothing to record for the tester")
+        self.assertEqual(self.ledger(), [], "nothing was recorded at the PR head")
+        self.plan_issue["body"] = self.plan(s2_claim="epic")
+        self.assertIn("claimed at the epic", self.prove("coder", "S2")[2], "an explicit claim: epic refuses with the same message")
+
+    def test_an_explicit_claim_pr_on_a_tester_measure_still_records_and_the_other_scenarios_are_unchanged(self):
+        self.plan_issue["body"] = self.plan(s2_claim="pr")
+        self.assertEqual(self.prove("coder", "S2")[0], 0)
+        self.assertEqual(self.verdict("tst", "S2", "tester")[0], 0)
+        self.assertEqual(self.prove("coder", "S1")[0], 0)
+        self.assertEqual(self.verdict("cibot", "S1", "ci")[0], 0)
+        self.assertEqual(sorted(e["scenario"] for e in self.ledger()), ["S1", "S1", "S2", "S2"])
+
+    def test_no_consumer_of_a_claim_defaults_it_to_pr_on_its_own(self):
+        import re as _re
+        for name in ("fleet-switchboard", "plan_ledger.py"):
+            text = (BIN / name).read_text()
+            self.assertEqual(_re.findall(r'\.get\("claim"\) or "pr"', text), [], name + " reads a claim without claim_of")
+
+    def test_a_tester_scenario_whose_proof_is_not_a_measure_stays_claimed(self):
+        row = self.g1(self.plan(s2_proof="live"))
+        self.assertEqual(row["status"], "missing", "a tester scenario whose proof is not a measure is claimed as before")
+        self.assertTrue(any(m.startswith("S2") for m in row["missing"]), row)
+
+    def test_s3_an_explicit_claim_pr_is_claimed_and_an_explicit_claim_epic_stays_epic(self):
+        claimed = self.g1(self.plan(s2_claim="pr"))
+        self.assertEqual(claimed["status"], "missing")
+        self.assertTrue(any(m.startswith("S2") for m in claimed["missing"]), claimed)
+        self.assertIn("proven after the merge at the integration head: S4", claimed["detail"], "S2 is not epic when it writes claim: pr")
+        self.assertNotIn("S2", claimed["detail"].split("integration head:")[-1])
+        epic = self.g1(self.plan(s2_claim="epic"))
+        self.assertEqual(epic["status"], "ok")
+        self.assertIn("S2, S4", epic["detail"])
+
+    def test_s4_a_tester_scenario_whose_proof_is_a_test_and_a_reviewer_measure_are_claimed_as_today(self):
+        """The checker refuses these pairings in a real plan (a test is recorded by ci, a measure by the tester or the owner), so G1 is read directly over a hand-built plan."""
+        pl = sb.load_module("plan_ledger")
+        plan = {"result": "pass", "defects": [], "plan_hash": "sha256:" + "0" * 64, "text": "", "scenarios_parsed": [
+            {"id": "S1", "evaluator": "tester", "proof": "test"}, {"id": "S2", "evaluator": "reviewer", "proof": "measure"}, {"id": "S3", "evaluator": "tester", "proof": "measure"}]}
+        table = pl.evaluate_gates(plan, [], None, {"head": LEDGER_HEAD}, self.PR)
+        row = next(r for r in table["gates"] if r["gate"] == "G1")
+        self.assertEqual(row["status"], "missing")
+        self.assertIn("0 of 2 claimed scenarios proven", row["detail"], "S1 and S2 are claimed, S3 (tester + measure, unwritten) is not")
+        self.assertEqual(sorted(m.split(":")[0] for m in row["missing"]), ["S1", "S2"])
+        self.assertIn("integration head: S3", row["detail"])
+
+    def test_a_plan_whose_only_scenarios_are_unwritten_tester_measures_never_passes_vacuously(self):
+        pl = sb.load_module("plan_ledger")
+        plan = {"result": "pass", "defects": [], "plan_hash": "sha256:" + "0" * 64, "text": "", "scenarios_parsed": [
+            {"id": "S1", "evaluator": "tester", "proof": "measure"}, {"id": "S2", "evaluator": "tester", "proof": "measure"}]}
+        row = next(r for r in pl.evaluate_gates(plan, [], None, {"head": LEDGER_HEAD}, self.PR)["gates"] if r["gate"] == "G1")
+        self.assertEqual(row["status"], "missing", "no scenario is claimed per PR: G1 still asks for the reasoned statement")
+        self.assertIn("no scenario is claimed per PR", " ".join(row["missing"]))
+        plan["text"] = "per-pr scenarios: none because every scenario is the tester's live check after the merge"
+        row = next(r for r in pl.evaluate_gates(plan, [], None, {"head": LEDGER_HEAD}, self.PR)["gates"] if r["gate"] == "G1")
+        self.assertEqual(row["status"], "n/a")
+
+    def test_claim_of_reads_only_what_is_written(self):
+        pl = sb.load_module("plan_ledger")
+        self.assertEqual(pl.claim_of({"id": "S1", "evaluator": "tester", "proof": "measure"}), "epic")
+        self.assertEqual(pl.claim_of({"id": "S1", "evaluator": "tester", "proof": "measure", "claim": " pr "}), "pr")
+        self.assertEqual(pl.claim_of({"id": "S1", "evaluator": "tester", "proof": "measure", "claim": ""}), "epic", "a blank claim is no claim")
+        self.assertEqual(pl.claim_of({"id": "S1", "evaluator": "tester", "proof": "test"}), "pr")
+        self.assertEqual(pl.claim_of({"id": "S1", "evaluator": "ci", "proof": "measure"}), "pr")
+        self.assertEqual(pl.claim_of({"id": "S1", "evaluator": "owner", "proof": "live", "claim": "epic"}), "epic")
+
+    def test_s5_the_hashes_of_five_plans_with_a_tester_measure_scenario_are_pinned_and_the_parser_is_untouched(self):
+        pc = sb.load_module("plan_check")
+        texts = [self.plan(s2_proof="measure", s2_claim=claim) for claim in ("", "pr", "epic")] + \
+                [self.plan(s2_proof="measure").replace("Commissioning works.", "Commissioning works twice."), self.plan(s2_proof="measure").replace("alpha", "beta")]
+        hashes = [(pc.plan_hash(t), pc.content_hash(pc.parse_scenarios(pc.scenario_block(t)), [], t)) for t in texts]
+        self.assertEqual(hashes, PINNED_G1_HASHES)
+        parsed = pc.parse_scenarios(pc.scenario_block(texts[0]))
+        s2 = next(x for x in parsed if x["id"] == "S2")
+        self.assertNotIn("claim", s2, "the parser fills nothing in: only the canonical text defaults the claim")
+
+    def test_s6_plan_check_still_requires_the_fields_of_an_unwritten_tester_measure_scenario(self):
+        done = "(1) an owner can commission an agent; (2) it answers a chat message."
+        complete = sb.plan_check.check(self.plan(), done)
+        missing_pass = sb.plan_check.check(self.plan().replace("    pass: the reply arrives within 5 s and is longer than 0 characters\n", "", 1), done)
+        self.assertNotIn("missing-pass", [d["code"] for d in complete["defects"]])
+        self.assertIn("missing-pass", [d["code"] for d in missing_pass["defects"]])
+        self.assertNotEqual(missing_pass["result"], "pass")
+
+
 class TestLaunchTesters(LedgerBase):
     """#372: a tester launched with --role tester for its orchestrator's repo may record tester verdicts, beside the configured list."""
 

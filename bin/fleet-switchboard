@@ -18675,7 +18675,7 @@ def _scenario_of(ctx, sid):
     found = next((x for x in ctx.plan["scenarios_parsed"] if x.get("id") == sid), None)
     if found is None:
         raise LedgerCommandError("the plan has no scenario %s (it has %s)" % (sid, ", ".join(x.get("id", "?") for x in ctx.plan["scenarios_parsed"][:12])))
-    if (found.get("claim") or "pr") != "pr":
+    if plan_ledger.claim_of(found) != "pr":
         raise LedgerCommandError("%s is claimed at the epic, not per PR: it is proven at the epic's integrated head" % sid)
     return found
 
@@ -18753,7 +18753,7 @@ def cmd_verdict(args, runner, now):
             raise LedgerCommandError("--all takes no scenario id: it records every scenario the plan names for --as %s" % args.evaluator)
         _plan_usable(ctx)
         targets = [x for x in ctx.plan["scenarios_parsed"]
-                   if (x.get("claim") or "pr") == "pr" and plan_ledger.evaluator_of(x) == args.evaluator]
+                   if plan_ledger.claim_of(x) == "pr" and plan_ledger.evaluator_of(x) == args.evaluator]
         if not targets:
             raise LedgerCommandError("no per-PR scenario of this plan is judged by %s: nothing was recorded" % args.evaluator)
         named = args.evaluator
@@ -20054,7 +20054,7 @@ def ci_record_core(ctx, now, quiet=False):
     out.update(head=head, ci=ci)
     if ctx.plan is None or ctx.plan["result"] != "pass":
         return dict(out, status="no-plan", why="no passing plan for the PR (%s)" % (ctx.plan_problem or "run `plan check`"))
-    wanted = [x for x in ctx.plan["scenarios_parsed"] if (x.get("claim") or "pr") == "pr" and plan_ledger.evaluator_of(x) == "ci"]
+    wanted = [x for x in ctx.plan["scenarios_parsed"] if plan_ledger.claim_of(x) == "pr" and plan_ledger.evaluator_of(x) == "ci"]
     out["scenarios"] = [x["id"] for x in wanted]
     detail = {"head": head, "ci": ci, "scenarios": out["scenarios"], "at": int(now())}
     if not head:
