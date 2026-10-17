@@ -21028,6 +21028,7 @@ SUMMARY_FLOWCHART_LABELS = ("Changes", "Touches", "Irreversible", "Risk")
 _SUMMARY_LABEL = re.compile(r'[\["(]\s*(%s)\s*:' % "|".join(SUMMARY_FLOWCHART_LABELS), re.A | re.I)   # built from the tuple: one list of labels
 _SUMMARY_LINE_MAX = 400   # a box label is short: the rest of a longer line is not looked at
 _SUMMARY_BODY_MAX = 1 << 20   # a body is cut at 1 MB for this check (GitHub's own limit is 65536 characters)
+_SUMMARY_FENCE_RE = re.compile(r"^[ \t>]*(`{3,}|~{3,})(.*)$")   # a fence at any indent or inside a blockquote or list item: GitHub renders those too
 SUMMARY_FLOWCHART_DEFECT = ("the body holds the generated summary flowchart (a Mermaid diagram whose boxes are Changes:, Touches:, Irreversible:, Risk:): remove it; "
                             "a diagram is only for data flow, system design or component design")
 
@@ -21035,7 +21036,8 @@ SUMMARY_FLOWCHART_DEFECT = ("the body holds the generated summary flowchart (a M
 def summary_flowchart_found(body):
     """True when a Mermaid fence ANYWHERE in the body holds the four labelled boxes of the generated summary flowchart (Changes:, Touches:, Irreversible:, Risk:). One
     pass over the lines under a step budget; each line is cut to _SUMMARY_LINE_MAX; fences are read as the held-body scan reads them (three or more backticks or
-    tildes, up to three spaces of indent, closed by the same character at least as long, an unclosed fence running to the end); no lowered copy is indexed
+    tildes, closed by the same character at least as long, an unclosed fence running to the end) but at ANY indent and behind blockquote marks, since GitHub renders a fence
+    nested in a list item or a quote; it is a lint for the generator's own output (a renamed label is not caught), not a boundary; no lowered copy is indexed
     (ASCII-only folding). A diagram that shows data flow (without all four labels in ONE fence) is not it."""
     lines = str(body or "")[:_SUMMARY_BODY_MAX].split("\n")
     budget = _held_steps(len(lines))
@@ -21043,7 +21045,7 @@ def summary_flowchart_found(body):
     for line in lines:
         _held_spend(budget)
         text = line[:_SUMMARY_LINE_MAX]
-        found = _HELD_FENCE_RE.match(text)
+        found = _SUMMARY_FENCE_RE.match(text)
         if fence is None:
             if found and not (found.group(1)[0] == "`" and "`" in found.group(2)):
                 words = found.group(2).split()
@@ -21057,6 +21059,14 @@ def summary_flowchart_found(body):
             for label in _SUMMARY_LABEL.finditer(text):
                 seen.add(label.group(1).capitalize())
     return fence is not None and mermaid and len(seen) == len(SUMMARY_FLOWCHART_LABELS)   # a fence left open at the end of the body counts too
+
+
+def summary_flowchart_defects(body):
+    """The defect list for the summary flowchart: [] when absent, one message when found, and a message (never a raise) when the scan could not finish."""
+    try:
+        return [SUMMARY_FLOWCHART_DEFECT] if summary_flowchart_found(body) else []
+    except ValueError as err:
+        return ["the body could not be scanned for the summary flowchart (%s)" % _one_line(str(err), 100)]
 
 
 def explainer_text(text):
@@ -21101,7 +21111,7 @@ def explainer_defects(body):
     count = body.count(EXPLAINER_BEGIN)
     if count != 1 or body.count(EXPLAINER_END) != 1 or body.index(EXPLAINER_BEGIN) > body.index(EXPLAINER_END):
         return ["the description has %d explainer blocks: it carries exactly one (between %s and %s)" % (count, EXPLAINER_BEGIN, EXPLAINER_END)] + (
-            [SUMMARY_FLOWCHART_DEFECT] if summary_flowchart_found(body) else [])
+            summary_flowchart_defects(body))
     inner = body.split(EXPLAINER_BEGIN, 1)[1].split(EXPLAINER_END, 1)[0]
     problems = []
     why = re.search(r"```text\n(.*?)```", inner, re.S)
@@ -21111,8 +21121,7 @@ def explainer_defects(body):
         problems.append("the why part needs a ```text block with a `before:` line and an `after:` line")
     elif any(re.search(r"<[^>]*>", m.group(1)) for m in (before, after)):
         problems.append("the why part still has a placeholder in <angle brackets>")
-    if summary_flowchart_found(body):
-        problems.append(SUMMARY_FLOWCHART_DEFECT)
+    problems += summary_flowchart_defects(body)
     return problems
 
 

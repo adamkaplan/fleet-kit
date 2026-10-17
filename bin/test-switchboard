@@ -41331,6 +41331,8 @@ class TestHeldSummaryFlowchart(unittest.TestCase):
                  ("a tilde fence", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + top),
                  ("a four backtick fence", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + self.SUMMARY.replace("```", "````")),
                  ("an indented fence", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + self.SUMMARY.replace("```mermaid", "   ```mermaid")),
+                 ("a fence in a blockquote", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + "".join("> " + l + "\n" for l in self.SUMMARY.splitlines())),
+                 ("a fence in a list item", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + "- an item\n\n" + "".join("      " + l + "\n" for l in self.SUMMARY.splitlines())),
                  ("an unclosed fence", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + self.SUMMARY.rsplit("```", 1)[0]))
         for name, body in cases:
             with self.subTest(case=name):
@@ -41372,6 +41374,7 @@ class TestHeldSummaryFlowchart(unittest.TestCase):
         with mock.patch.object(sb, "_held_steps", return_value=[3]):
             with self.assertRaises(ValueError):
                 sb.summary_flowchart_found("x\n" * 100)
+            self.assertIn("could not be scanned", sb.explainer_defects("x\n" * 100)[-1], "a scan that cannot finish is a defect, never a raise")
         self.assertEqual(self.defects(TestHeldTop.OPEN + "x\n" * 40000)[0][:30], "the held PR's top is unreadabl")   # over the held cap: unreadable, never ok
         # a label past the 400 character cut of its line is not read; a body past 1 MB is cut
         padded = self.SUMMARY.replace('B["Touches', 'B["' + " " * sb._SUMMARY_LINE_MAX + 'Touches')
