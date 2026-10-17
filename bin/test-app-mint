@@ -560,8 +560,25 @@ class TestHygieneOfTheModule(unittest.TestCase):
         for number, line in enumerate(text.splitlines(), 1):
             self.assertIsNone(pattern.search(line), "%d: %s" % (number, line))
 
-    def test_s10_no_tracked_or_new_file_holds_a_key_or_a_token(self):
+    # The one exemption: a synthetic fixture in another lane's test (no real credential). Exact path AND exact value; any other value, or the same value in another file, is still flagged.
+    SYNTHETIC_FIXTURES = {"bin/test-cloud-worker": {"gh" + "s_GitInstallationTokenAbCdEf0123456789"}}
+
+    @classmethod
+    def secret_hits(cls, name, text):
         block, token = re.compile("-----BEGIN [A-Z ]*PRIVATE " + "KEY-----"), re.compile(r"gh[sp]_[A-Za-z0-9]{16,}")
+        if block.search(text):
+            return True
+        allowed = cls.SYNTHETIC_FIXTURES.get(name, set())
+        return any(found not in allowed for found in token.findall(text))
+
+    def test_s10_the_exemption_is_exact(self):
+        fixture = "gh" + "s_GitInstallationTokenAbCdEf0123456789"
+        self.assertFalse(self.secret_hits("bin/test-cloud-worker", 'GIT_TOKEN = "%s"' % fixture))
+        self.assertTrue(self.secret_hits("bin/other-file", fixture))
+        self.assertTrue(self.secret_hits("bin/test-cloud-worker", "gh" + "s_SomeOtherTokenValue0123456789"))
+        self.assertTrue(self.secret_hits("bin/test-cloud-worker", fixture + " gh" + "s_SomeOtherTokenValue0123456789"))
+
+    def test_s10_no_tracked_or_new_file_holds_a_key_or_a_token(self):
         listed = subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard"], cwd=str(REPO), capture_output=True, text=True).stdout.split("\n")
         hits = []
         for name in filter(None, listed):
@@ -574,7 +591,7 @@ class TestHygieneOfTheModule(unittest.TestCase):
                 text = path.read_text()
             except (UnicodeDecodeError, OSError):
                 continue
-            if block.search(text) or token.search(text):
+            if self.secret_hits(name, text):
                 hits.append(name)
         self.assertEqual(hits, [])
 
