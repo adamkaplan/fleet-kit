@@ -9910,6 +9910,76 @@ def facts_text(entry):
     return ", ".join(parts)
 
 
+LABEL_HOLD_KEEP_SECONDS = 86400   # a row kept because its list is cut or gone is dropped after a day (a pull request that merged meanwhile does not stay)
+LABEL_HOLD_LIST_CUT = 200   # the daemon's open-pull-request list is read to 2 pages of 100: a list this long may be cut
+
+
+def label_hold_entries(engine, now, noticed, escalated, in_play):
+    """#641: [(order, entry, key)] for the open pull requests that carry the fleet's hold labels (`merge-captain` or a `hold-*`) and have NO recorded notice: a decision row on the labels
+    alone, with its head and its hold reasons. Read from the open-pull-request list the daemon ALREADY holds (the ci recorder's: no read of its own, none per pull request), so only the
+    daemon's passes make them. One row per pull request (a noticed one keeps its notice row); a merged, closed, excluded or unwatched one adds none; a list that failed or may be cut keeps the
+    rows already shown (`engine.hold_rows`). Never raises."""
+    state = getattr(engine, "ci_record_state", None)
+    if state is None or not getattr(state, "lists", None):
+        return []
+    try:
+        noticed_keys = {decision_core.pr_key(k.rpartition("#")[0], int(k.rpartition("#")[2])) for k in noticed if k.rpartition("#")[2].isdigit()}
+        gates = (engine.config.get("plan_gates") or {}).get("repos") or {}
+        watched = {plan_ledger.normal_repo(r) for r in decision_repos(engine)} | {plan_ledger.normal_repo(r) for r in gates}   # the list is read for the plan_gates repos
+        shown, previous = {}, engine.__dict__.setdefault("hold_rows", {})
+        default_repo = engine.config.get("intent_repo")
+        for repo_key, (_read_at, records) in sorted(state.lists.items()):
+            if repo_key not in watched:
+                continue
+            try:
+                refuse_excluded(engine.config, repo_key)
+            except AccountError:
+                continue
+            seen = set()
+            for record in records:
+                number = _number(record)
+                if number is None or not isinstance(record, dict) or record.get("state", "open") != "open" or record.get("merged_at"):
+                    continue
+                seen.add(number)
+                names = {(l.get("name") if isinstance(l, dict) else l) for l in record.get("labels") or []}
+                if not _label_kind(names, CAPTAIN_MERGE_LABELS[:1] + CAPTAIN_HOLD_LABELS):
+                    continue
+                full = ((record.get("base") or {}).get("repo") or {}).get("full_name") if isinstance(record.get("base"), dict) else None
+                repo = full if isinstance(full, str) and plan_ledger.normal_repo(full) == repo_key else repo_key
+                head = (record.get("head") or {}).get("sha") if isinstance(record.get("head"), dict) else None
+                created = parse_iso(record.get("created_at"))
+                shown[(repo_key, number)] = {"repo": repo, "number": number, "title": record.get("title") if isinstance(record.get("title"), str) else "", "head": head,
+                                             "since": iso(created if created is not None else now), "holds": pr_hold_reasons(names)}
+            if len(records) >= LABEL_HOLD_LIST_CUT:   # the list may be cut: a held pull request beyond it is not dropped, for at most LABEL_HOLD_KEEP_SECONDS (the next complete list drops it at once)
+                for key, row in previous.items():
+                    if key[0] == repo_key and key[1] not in seen:
+                        kept_at = row.get("kept_at", now)
+                        if now - kept_at <= LABEL_HOLD_KEEP_SECONDS:
+                            shown.setdefault(key, dict(row, kept_at=kept_at))
+        for key in [k for k in previous if k[0] not in set(state.lists)]:
+            if key[0] not in watched or load_module("repo_exclusion").is_excluded(engine.config, key[0]):
+                continue   # a repository that is no longer watched, or is excluded now, keeps nothing
+            kept_at = previous[key].get("kept_at", now)
+            if now - kept_at <= LABEL_HOLD_KEEP_SECONDS:
+                shown.setdefault(key, dict(previous[key], kept_at=kept_at))   # a repository whose list is gone for now keeps its rows, for a day at most
+        engine.hold_rows = shown
+        out = []
+        for (repo_key, number), row in sorted(shown.items()):
+            repo = row["repo"]
+            if decision_core.pr_key(repo, number) in noticed_keys:
+                continue   # a noticed pull request keeps its notice row: one row (the identity is folded once, `pr_key`, for both sources)
+            tag = repo if len(in_play) > 1 else repo.split("/")[-1]
+            captain_key = "captain:%s#%d@%s" % (repo, number, row["head"]) if row["head"] else None
+            entry = decision_core.labels_entry(repo, number, tag, row, bool(captain_key and captain_key in escalated), default_repo)
+            if captain_key and isinstance(engine.request_keys, set):
+                engine.request_keys.add(captain_key)   # keeps its escalation through the daemon's prune
+            out.append(((now, repo, number), entry, "%s#%d" % (repo, number)))
+        return out
+    except Exception as err:
+        engine._note("decisions.hold_rows_error", "", {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
+        return []
+
+
 def decisions_from_notices(engine, now):
     """(entries, problems): each recorded PR notice as an entry of kind `notice` (tier `human`, id `pr:<repo>#N`).
 
@@ -9974,6 +10044,7 @@ def decisions_from_notices(engine, now):
             if isinstance(engine.request_keys, set):
                 engine.request_keys.add(captain_key)  # keeps its escalation through the daemon's prune
         entries.append((order(item), entry, key))
+    entries.extend(label_hold_entries(engine, now, {key for _, _, key in entries}, escalated, in_play))   # #641: held on labels alone, no notice
     # The drop counts only time the daemon OBSERVED: seconds between passes of this process in which `gh` demonstrably worked (some
     # notice read fine), added for the notices that still cannot be read. A pass where every read fails is an outage (gh, auth, the
     # network), not a bad notice: nobody counts and nobody drops. A new process starts every count again, so downtime is not counted.

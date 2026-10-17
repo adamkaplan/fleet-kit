@@ -767,6 +767,30 @@ def captain_entry(notice, facts, escalated, evidence):
     return entry
 
 
+def pr_key(repo, number):
+    """The ONE fold of a pull request's identity (`owner/repo` is case-insensitive on GitHub): every source of a pull request's decision row and the merge of the sources by pull request use this key,
+    so a notice recorded as `Acme-Org/Widget` and a list that names `acme-org/widget` are one pull request."""
+    return (str(repo or "").strip().lower(), int(number))
+
+
+def labels_entry(repo, number, tag, record, escalated, default_repo=None):
+    """#641: a held pull request as a decision row on its hold labels ALONE (no recorded notice): kind `captain`, the SAME id a notice would give it (`pr:<tag>#N`, so one row once a
+    notice is recorded), tier `cos` until the Chief of Staff escalated it for this head. `record` is the pull request as the daemon's open-pull-request list read it (number, title, head
+    sha, created time, labels already reduced to `holds`). It has no sender and no lane, and says so: `no notice recorded`."""
+    head = record.get("head")
+    lead = "%s#%d" % (tag, number) if not default_repo else ("#%d" % number if repo == default_repo else "%s#%d" % (repo.split("/")[-1], number))
+    title = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", record.get("title") or "")   # the title is the author's text: no control character reaches the list
+    headline = fit_lines(" ".join((lead, title)).strip())
+    entry = {"id": "pr:%s#%d" % (tag, number), "title": line_of(headline, DECISION_TITLE_MAX), "headline": headline, "ask": None, "repo": repo, "agent": None,
+             "kind": "captain", "tier": "human" if escalated else "cos", "since": record.get("since"), "number": number,
+             "url": "https://github.com/%s/pull/%d" % (repo, number), "state": "open", "additions": None, "deletions": None, "files": None, "ci": None,
+             "review": "not read: no notice recorded", "reviews": None, "review_evidence": "no notice recorded: held on its labels alone", "stale": False,
+             "note": "no notice recorded: no sender and no lane; held on its labels alone", "merge_after": None, "head": head}
+    if record.get("holds"):
+        entry["holds"] = list(record["holds"])
+    return entry
+
+
 _PR_URL = re.compile(r"https?://github\.com/([A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+)/pull/([0-9]+)", re.I)
 _PR_SHORT = re.compile(r"(?<![\w/.:-])([A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+)#([0-9]+)")
 
