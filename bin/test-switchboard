@@ -63107,6 +63107,15 @@ class TestScratchFileRule(unittest.TestCase):
                 self.assertNotIn("mktemp -d", line)
 
 
+class TestDeployFromMainSentence(unittest.TestCase):
+    SENTENCE = ("Production is deployed from the head of main only: never from a side branch, a cherry-pick or a revert off main; "
+                "when main is not shippable, the fix goes into main (the owner's standing order).")
+
+    def test_s2_the_coordination_skill_states_the_deploy_rule_once(self):
+        text = (REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text()
+        self.assertEqual(text.count(self.SENTENCE), 1)
+
+
 class TestPreflightPr(unittest.TestCase):
     """`preflight-pr` (#716): one PASS or FAIL line per CI-critical class, run under `heavy`; the runner is faked, nothing real runs."""
     SENTENCE = "`fleet-switchboard preflight-pr` runs the CI-critical focused classes"
