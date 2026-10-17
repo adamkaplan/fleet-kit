@@ -6042,6 +6042,7 @@ def launch_headless(engine, name, agent, directory, role=None, reports_to=None, 
                 raise
             except Exception as err:   # the service did not answer or refused: a route problem, not a mistake in the arguments
                 raise HeadlessRefused("the OpenCode service could not create the session (%s)" % _one_line(str(err), 120)) from err
+            brief_started = False
             try:
                 ap.save_record(engine.state_dir, name, session_id, engine.v2.service_url(), now=engine.now())
                 info = engine.v2.session_get(session_id) or {}
@@ -6050,12 +6051,16 @@ def launch_headless(engine, name, agent, directory, role=None, reports_to=None, 
                 if account:
                     identity = prove_headless_route(engine, session_id, name, repo, account)   # before the brief: nothing runs as a wrong account
                 if brief:
+                    brief_started = True   # from here a failure may have delivered the brief: it is never a reason to start the worker a second time
                     send_brief(engine, name, session_id, brief)
                 if engine.audit is not None:
                     engine.audit.append(engine.actor, "headless.launched", name, {"session": session_id, "agent": agent, "directory": _one_line(directory, 160), "brief_chars": len(brief or ""), "account": account or None, "repo": repo, "route": "shims+record" if account else None})
             except Exception as err:
-                cleaned = undo_headless_launch(engine, ap, name, session_id)
-                raise (HeadlessRefused if isinstance(err, HeadlessRefused) or not isinstance(err, LaunchError) else LaunchError)("%s (%s)" % (_one_line(str(err)), cleaned)) from err
+                remains = []
+                cleaned = undo_headless_launch(engine, ap, name, session_id, remains)
+                # only a route problem found BEFORE the brief, with nothing left behind, may be answered by a terminal (#433): else a second worker would start beside the first
+                refused = (isinstance(err, HeadlessRefused) or not isinstance(err, LaunchError)) and not brief_started and not remains
+                raise (HeadlessRefused if refused else LaunchError)("%s (%s)" % (_one_line(str(err)), cleaned)) from err
     except ImpactStateBusy:
         raise LaunchError("another launch or reattach of %s is running: wait for it" % name) from None
     register_launch_worktree(engine, name, directory, repo)
@@ -6143,7 +6148,7 @@ def prove_headless_route(engine, session_id, name, repo, account):
             "bypasses the shims. A terminal launch pins the account in the pane's environment" % (account, repo))
 
 
-def undo_headless_launch(engine, ap, name, session_id):
+def undo_headless_launch(engine, ap, name, session_id, remains=None):
     """Best effort after a headless launch failed past `session.create`: stop whatever the brief started, delete the session, then remove the record.
     Returns one sentence saying exactly what was cleaned and what remains. The record is removed only when the session is gone: a session that is
     still there keeps its record, so `status` shows it and it is not invisible."""
@@ -6184,6 +6189,8 @@ def undo_headless_launch(engine, ap, name, session_id):
             engine.audit.append(engine.actor, "headless.launch_undone", name, {"session": session_id, "cleaned": done, "remains": left})
     except Exception:
         pass   # the sentence below is the report; a failing audit sink must not hide it
+    if remains is not None:
+        remains.extend(left)   # the caller learns whether anything was left behind without reading the sentence
     return "launch failed; " + "; ".join(done + left if (done or left) else ["nothing was created"])
 
 

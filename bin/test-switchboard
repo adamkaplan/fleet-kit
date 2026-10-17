@@ -34305,6 +34305,85 @@ class TestLaunchDefault(TwoRepoCase):
         self.assertEqual(len(made), 1, "only the terminal worker's session exists")
         self.assertTrue([e for e in self.world.audit() if e["event"] == "launch.fallback_terminal"])
 
+    def assert_one_fallback(self, code, out, err, sessions_before):
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.fallback_lines(err)), 1, err)
+        self.assertEqual(len(self.tabs()), 1)
+        self.assertIsNone(sb.load_agent_presence().load_record(self.world.state, "dflt"), "no headless record is left")
+        self.assertEqual(len([sid for sid in self.world.v2.sessions if sid not in sessions_before]), 1, "only the terminal worker's session exists")
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "launch.fallback_terminal"])
+        self.assertEqual(len([m for sid, s in self.world.v2.sessions.items() if sid not in sessions_before for m in s["messages"] if m["type"] == "user"]), 1,
+                         "the brief reached exactly one session")
+
+    def fall_back_with(self, ctx):
+        sessions_before = set(self.world.v2.sessions)
+        with ctx:
+            code, out, err = self.launch("--brief-file", self.brief())
+        self.assert_one_fallback(code, out, err, sessions_before)
+
+    def test_an_unreachable_service_falls_back_once_and_leaves_nothing_behind(self):
+        real, calls = sb.V2Client.session_create, []
+
+        def once(self_, *a, **k):
+            calls.append(1)
+            if len(calls) == 1:
+                raise sb.V2Error("exit", None, "no answer")
+            return real(self_, *a, **k)
+        self.fall_back_with(mock.patch.object(sb.V2Client, "session_create", once))
+
+    def test_an_unwritable_record_falls_back_once_and_deletes_the_headless_session(self):
+        real, calls = sb.load_agent_presence().save_record, []
+
+        def once(*a, **k):
+            calls.append(1)
+            if len(calls) == 1:
+                raise OSError("disk full")
+            return real(*a, **k)
+        sessions_before = set(self.world.v2.sessions)
+        with mock.patch.object(sb.load_agent_presence(), "save_record", once):
+            code, out, err = self.launch("--brief-file", self.brief())
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.fallback_lines(err)), 1, err)
+        self.assertEqual(len(self.tabs()), 1)
+        self.assertEqual(len([m for sid, s in self.world.v2.sessions.items() if sid not in sessions_before for m in s["messages"] if m["type"] == "user"]), 1)
+
+    def test_a_failure_after_the_brief_or_a_session_that_cannot_be_deleted_never_starts_a_second_worker(self):
+        def refuse(self_, *a, **k):
+            raise sb.V2Error("exit", None, "the service refused the prompt")
+        with mock.patch.object(sb.V2Client, "prompt", refuse):
+            code, out, err = self.launch("--brief-file", self.brief())
+        self.assertEqual((code, self.tabs(), self.fallback_lines(err)), (1, [], []), err)
+
+        def remove_fails(self_, *a):
+            raise sb.V2Error("exit", None, "cannot delete")
+        with mock.patch.object(sb.load_agent_presence(), "save_record", side_effect=OSError("disk full")), \
+                mock.patch.object(sb.V2Client, "session_remove", remove_fails):
+            code, out, err = self.launch("--brief-file", self.brief(), name="dflt2")
+        self.assertEqual((code, self.tabs(), self.fallback_lines(err)), (1, [], []), err)
+        self.assertIn("could NOT be deleted", err)
+
+    def brief(self):
+        path = self.home / "brief.md"
+        path.write_text("Do the thing\n")
+        return str(path)
+
+    def test_a_refusal_with_no_terminal_workspace_says_both_reasons(self):
+        os.environ.pop("HERDR_WORKSPACE_ID", None)
+        with mock.patch.object(sb, "caller_workspace", side_effect=RuntimeError("no workspace")):
+            code, out, err = self.launch("--repo", ACME_WEB)
+        self.assertEqual((code, self.tabs()), (1, []))
+        self.assertIn("no terminal workspace could be found", err)
+        self.assertIn("headless refused", err)
+
+    def test_the_launch_default_module_accepts_only_its_two_words(self):
+        module = sb.load_module("launch_default")
+        for good in ("headless", "terminal"):
+            module.validate(good)
+        for bad in ("tabs", "", None, 1, ["headless"], "Headless"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                module.validate(bad)
+        self.assertEqual((module.mode({}), module.mode({"launch_default": "terminal"})), ("headless", "terminal"))
+
     def test_an_explicit_headless_still_refuses_and_a_name_clash_never_falls_back(self):
         code, out, err = self.launch("--repo", ACME_WEB, "--headless")
         self.assertEqual(code, 1)

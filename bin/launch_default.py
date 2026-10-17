@@ -17,6 +17,6 @@ def validate(raw, source="config"):
 
 
 def mode(config):
-    """The configured mode for a plain launch."""
+    """The configured mode for a plain launch. An unknown value cannot get here (`validate` refuses the whole configuration); if one did, it reads as the shipped default."""
     value = (config or {}).get(CONFIG_KEY)
     return value if value in MODES else CONFIG_DEFAULT
