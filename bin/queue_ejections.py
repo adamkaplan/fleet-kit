@@ -8,7 +8,9 @@ is told ONCE per failed run, in one line: the repository, the pull request, the 
 (else the failed job names, else a plain statement that the result is unreadable: never a guess), and whether the same test failed on other ejected
 pull requests of that repository in the last 2 hours (a flake on the base branch reads differently from the pull request's own fault).
 
-Nobody is woken for a cancelled run, a run a newer one superseded, a pull request still in the queue, or a pull request that merged or closed. A repository
+A failed run whose pull request still holds a queue entry in state UNMERGEABLE is told the same way, once, as a stuck entry (the entry state comes with the pull request read: no added read; the ledger key is the run's, so a later removal wakes nobody again).
+
+Nobody is woken for a cancelled run, a run a newer one superseded, a pull request still in the queue in any other state, or a pull request that merged or closed. A repository
 that is excluded or not watched is never read. Reads are bounded: one list per repository, at most MAX_DOWNLOADS artifact downloads a pass, the whole pass
 inside the caller's call budget. A run is remembered in `queue-ejections.json` (state directory) once its wake was sent, so a restart wakes nobody twice.
 
@@ -29,6 +31,7 @@ CONFIG_DEFAULT = None            # absent: the defaults below
 DEFAULT_WORKFLOW = "ci"
 DEFAULT_ARTIFACT = "failing-tests"
 STATE_FILE = "queue-ejections.json"
+STUCK_STATE = "UNMERGEABLE"   # a queue entry in this state after a failed run is not removed by GitHub (#696)
 
 LIST_SECONDS = 120        # a repository's runs are listed no oftener than this
 LIST_PAGE = 100           # runs asked for in the one list
@@ -204,7 +207,11 @@ def build_unowned_line(entry, head):
 
 def build_line(entry, others, now):
     """The one line. `entry`: repo, pr, run, at (ISO or None), kind ("tests", "jobs" or "unreadable"), names, total, why."""
-    head = "Merge queue ejection: %s#%d left the queue when run %d failed (%s)." % (entry["repo"], entry["pr"], entry["run"], entry["at"] or "time unknown")
+    if entry.get("stuck"):
+        head = "Merge queue entry stuck: run %d of %s#%d failed (%s) and its queue entry is still there in state %s, so it is stuck and blocks the pull requests behind it." % (
+            entry["run"], entry["repo"], entry["pr"], entry["at"] or "time unknown", STUCK_STATE)
+    else:
+        head = "Merge queue ejection: %s#%d left the queue when run %d failed (%s)." % (entry["repo"], entry["pr"], entry["run"], entry["at"] or "time unknown")
     if entry.get("unowned"):
         return build_unowned_line(entry, head)
     if entry["kind"] == "tests":
@@ -347,7 +354,9 @@ def run_pass(sb, engine, now, calls):
             if state["state"] != "OPEN":   # merged or closed: nobody is woken, and it is never looked at again
                 woke[key] = {"pr": number, "ts": ts, "woke": False, "names": [], "kind": "skipped"}
                 continue
-            if state["queued"]:            # it holds a queue entry: it is in the queue, not ejected; looked at again later
+            # an entry state that cannot be read is None: not stuck, so the run is looked at again later (quiet, never a guess)
+            stuck = state["queued"] and state.get("entry_state") == STUCK_STATE   # a failed run whose entry GitHub left in the queue: it blocks those behind it (#696)
+            if state["queued"] and not stuck:   # it holds a queue entry: it is in the queue, not ejected; looked at again later
                 memory["recheck"][key] = now + RECHECK_SECONDS
                 _skip(skips, memory, key, "queued")
                 continue
@@ -384,7 +393,7 @@ def run_pass(sb, engine, now, calls):
                 if memory["attempts"][key] < ATTEMPTS:
                     continue
                 found = {"kind": "unreadable", "names": [], "total": 0, "why": "its artifact could not be read", "download": False}
-            entry = dict(found, repo=repo, pr=number, run=run["id"], at=at, ts=ts, owner=owner, artifact=artifact, key=key, unowned=unowned)
+            entry = dict(found, repo=repo, pr=number, run=run["id"], at=at, ts=ts, owner=owner, artifact=artifact, key=key, unowned=unowned, stuck=bool(stuck))
             if unowned:
                 entry["absent"] = absent
                 entry["unannounced"] = _unannounced(woke, repo, number)

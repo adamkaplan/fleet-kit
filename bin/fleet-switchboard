@@ -21850,10 +21850,10 @@ class _RedsReader:
             raise load_reds().RedsError("gh api %s: %s" % (path.split("?")[0], self.accounts.scrub(_one_line(err, 120)) or "exit %d" % done.returncode))
         return done.stdout
 
-    PULL_STATE_QUERY = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){state mergeQueueEntry{id}}}}"
+    PULL_STATE_QUERY = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){state mergeQueueEntry{id state}}}}"
 
     def pull_state(self, number):
-        """{"state": "OPEN"|"MERGED"|"CLOSED", "queued": bool} of one pull request (#584): ONE GraphQL read, a query with fixed text (the number is a typed variable).
+        """{"state": "OPEN"|"MERGED"|"CLOSED", "queued": bool, "entry_state": the queue entry's state or None} of one pull request (#584, #696): ONE GraphQL read, a query with fixed text (the number is a typed variable).
         gh's `pr view` has no merge queue field. Raises RedsError when it cannot be read."""
         refuse_excluded(self.config, self.repo)
         owner, _, name = self.repo.partition("/")
@@ -21870,7 +21870,9 @@ class _RedsReader:
             raise load_reds().RedsError("gh api graphql: no pull request in the answer") from None
         if state not in ("OPEN", "MERGED", "CLOSED"):
             raise load_reds().RedsError("gh api graphql: unknown pull request state")
-        return {"state": state, "queued": bool(pull.get("mergeQueueEntry"))}
+        entry = pull.get("mergeQueueEntry")
+        entry_state = entry.get("state") if isinstance(entry, dict) and isinstance(entry.get("state"), str) else None
+        return {"state": state, "queued": bool(entry), "entry_state": entry_state}
 
 
 def cmd_reds(args, runner, now):

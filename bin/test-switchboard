@@ -60996,7 +60996,7 @@ class FakeQueueGh:
             if self.graphql_fault == "malformed":
                 return done('{"data": {"repository": null}}')
             state, queued = self.pulls[(repo, pr)]
-            return done(json.dumps({"data": {"repository": {"pullRequest": {"state": state, "mergeQueueEntry": {"id": "Q"} if queued else None}}}}))
+            return done(json.dumps({"data": {"repository": {"pullRequest": {"state": state, "mergeQueueEntry": {"id": "Q", "state": queued if isinstance(queued, str) else "QUEUED"} if queued else None}}}}))
         path = argv[-1]
         self.calls.append(path)
         if any(bad in path for bad in self.fail):
@@ -61080,6 +61080,56 @@ class TestQueueEjections(Base):
         self.add(6, 25, conclusion=None, status="in_progress")                    # a run still going
         self.go()
         self.assertEqual(self.sent, [], "0 messages in 6 of 6 cases")
+
+    def test_a_stuck_unmergeable_entry_wakes_once_with_the_names_as_data_and_never_again_after_removal(self):
+        self.add(61, 31, names=["@all /deploy ghp_" + "Ab1" * 10, "tests/test_x.py::test_y"])
+        self.gh.pulls[(self.REPO, 31)] = ("OPEN", "UNMERGEABLE")
+        self.go()
+        (to, line), = self.sent
+        self.assertEqual(to, "orch")
+        for want in ("%s#31" % self.REPO, "61", "stuck", "blocks", "test_y"):
+            self.assertIn(want, line)
+        for bad in ("@", "ghp_", "://"):
+            self.assertNotIn(bad, line)
+        self.go()
+        self.gh.pulls[(self.REPO, 31)] = ("OPEN", False)   # removed by hand
+        self.world.tick(self.module.RECHECK_SECONDS + 1)
+        self.add(61, 31, names=["tests/test_x.py::test_y"])
+        self.go()
+        self.assertEqual(len(self.sent), 1, "stuck, then removed: one wake")
+        self.assertEqual([k for k in self.module.read_ledger(types.SimpleNamespace(_read_small=sb._read_small), self.engine)], ["%s#61" % self.REPO])
+        self.assertEqual(self.gh.count(self.REPO, "graphql"), 1, "one pull request read, no added read")
+
+    def test_a_live_waiting_or_running_entry_wakes_nobody_and_a_removed_one_keeps_the_old_line(self):
+        self.add(62, 32, names=["x"])
+        self.add(63, 33, names=["x"])
+        self.gh.pulls[(self.REPO, 32)] = ("OPEN", "AWAITING_CHECKS")
+        self.gh.pulls[(self.REPO, 33)] = ("OPEN", "QUEUED")
+        self.go()
+        self.assertEqual(self.sent, [])
+        self.gh.pulls[(self.REPO, 32)] = ("OPEN", False)
+        self.world.tick(self.module.RECHECK_SECONDS + 1)
+        self.go()
+        (_, line), = self.sent
+        self.assertIn("left the queue", line)
+        self.assertNotIn("stuck", line)
+
+    def test_a_stuck_entry_with_no_owner_tells_the_chief_facts_only(self):
+        self.engine.hub.owner = None
+        with mock.patch.object(sb, "chiefs_of_staff", return_value=["chief"]):
+            self.add(65, 35, names=["secret_test_name"])
+            self.gh.pulls[(self.REPO, 35)] = ("OPEN", "UNMERGEABLE")
+            self.go()
+        (to, line), = self.sent
+        self.assertEqual(to, "chief")
+        self.assertIn("stuck", line)
+        self.assertNotIn("secret_test_name", line)
+
+    def test_a_stuck_entry_of_a_merged_pull_request_wakes_nobody(self):
+        self.add(64, 34, names=["x"])
+        self.gh.pulls[(self.REPO, 34)] = ("MERGED", "UNMERGEABLE")
+        self.go()
+        self.assertEqual(self.sent, [])
 
     def test_a_failed_run_whose_pull_request_was_re_enqueued_is_looked_at_again_later(self):
         self.add(4, 23, names=["x"])
