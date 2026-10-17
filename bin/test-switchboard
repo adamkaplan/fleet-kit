@@ -11531,6 +11531,41 @@ class TestCosTriageAllowRule(unittest.TestCase):
                 self.assertEqual(sorted(got), sorted(old[rel.split("/")[-1]] + ["triage", "move", "reassign"]))
 
 
+class TestCosDelegatedClearPermission(unittest.TestCase):
+    """Ask #720: the Chief of Staff definition allows the delegated clear (`impact clear * --under-order *`) and no other impact command beyond the
+    two read-only ones. The copilot definition has no per-command list (a `tools:` allow-list and prose), so the line is only in the opencode one."""
+    RULE = '  - {action: shell, resource: "fleet-switchboard impact clear * --under-order *", effect: allow}'
+    PATH = REPO / "agents" / "opencode" / "chief-of-staff.md"
+
+    def test_S1_the_line_once_and_the_other_impact_permissions_are_the_two_read_only_ones(self):
+        lines = self.PATH.read_text().splitlines()
+        self.assertEqual(lines.count(self.RULE), 1)
+        others = [l for l in lines if l.lstrip().startswith("- {action: shell") and "fleet-switchboard impact " in l and l != self.RULE]
+        self.assertEqual(others, ['  - {action: shell, resource: "fleet-switchboard impact floor *", effect: allow}',
+                                  '  - {action: shell, resource: "fleet-switchboard impact hold --dry-run*", effect: allow}'])
+
+    def test_S1_the_copilot_definition_names_no_impact_command(self):
+        text = (REPO / "agents" / "copilot" / "chief-of-staff.agent.md").read_text()
+        self.assertNotIn("fleet-switchboard impact", text)
+        self.assertNotIn("--under-order", text)
+
+    def test_S2_last_match_wins_allows_only_the_delegated_clear(self):
+        _, rules = TestChiefOfStaffNativePermissions.parse(self.PATH)
+        verdicts = [TestChiefOfStaffNativePermissions.evaluate(rules, "shell", c) for c in (
+            "fleet-switchboard impact clear 5 --reason why",
+            "fleet-switchboard impact clear 5 --reason why --under-order 1",
+            "fleet-switchboard impact waive 5")]
+        self.assertEqual(verdicts, ["deny", "allow", "deny"])
+
+    def test_S5_the_matrix_and_the_delegated_clear_module_are_not_changed_by_this_change(self):
+        base = subprocess.run(["git", "merge-base", "HEAD", "origin/main"], cwd=REPO, capture_output=True, text=True)
+        if base.returncode:
+            self.skipTest("no origin/main to diff against")
+        names = subprocess.run(["git", "diff", "--name-only", base.stdout.strip(), "HEAD"], cwd=REPO, capture_output=True, text=True).stdout.split()
+        self.assertNotIn("docs/review-laws/impact-matrix.json", names)
+        self.assertFalse([n for n in names if "delegated_clear" in n])
+
+
 class TestVerdictRecordingText(unittest.TestCase):
     """The reviewer and tester roles record their verdict in ONE command as the last step of the review they already do (text only)."""
     ONE = 'fleet-switchboard verdict --all --pr <repo#N> --as reviewer|tester --result pass|fail --head <full head sha> --evidence'
