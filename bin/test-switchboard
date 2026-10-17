@@ -61757,6 +61757,88 @@ class TestScratchFileRule(unittest.TestCase):
                 self.assertNotIn("mktemp -d", line)
 
 
+class TestPreflightPr(unittest.TestCase):
+    """`preflight-pr` (#716): one PASS or FAIL line per CI-critical class, run under `heavy`; the runner is faked, nothing real runs."""
+    SENTENCE = "`fleet-switchboard preflight-pr` runs the CI-critical focused classes"
+
+    def run_preflight(self, changed, failing=(), timing_out=()):
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append((list(argv), kwargs))
+            done = mock.Mock(returncode=0, stdout="", stderr="")
+            if argv[:2] == ["git", "rev-parse"]:
+                done.stdout = "/work/repo\n"
+            elif argv[:2] == ["git", "merge-base"]:
+                done.stdout = "abc123\n"
+            elif argv[:2] == ["git", "diff"]:
+                done.stdout = "\n".join(changed)
+            elif "heavy" in argv:
+                command = " ".join(argv[argv.index("--") + 1:])
+                if any(word in command for word in timing_out):
+                    raise subprocess.TimeoutExpired(argv, 1)
+                done.returncode = 1 if any(word in command for word in failing) else 0
+            return done
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = sb.cmd_preflight_pr(None, runner, time.time)
+        return code, out.getvalue().splitlines(), calls
+
+    def test_s1_every_class_passing_prints_one_pass_line_each_and_exits_0(self):
+        code, lines, calls = self.run_preflight(["bin/fleet-switchboard"])
+        self.assertEqual(code, 0)
+        self.assertEqual([l.split()[:2] for l in lines], [["PASS", "cli-surface"], ["PASS", "hygiene"], ["PASS", "public-names"]])
+        self.assertEqual([c for c in calls if "heavy" in c[0] and "cloud" in " ".join(c[0])], [])
+
+    def test_s2_a_failing_class_prints_fail_with_its_name_and_exits_1(self):
+        code, lines, _ = self.run_preflight(["x"], failing=("check-public-names",))
+        self.assertEqual(code, 1)
+        self.assertEqual([l for l in lines if l.startswith("FAIL")].__len__(), 1)
+        self.assertTrue([l for l in lines if l.startswith("FAIL")][0].startswith("FAIL public-names"))
+
+    def test_s2_a_class_over_its_ceiling_says_it_timed_out(self):
+        code, lines, _ = self.run_preflight(["x"], timing_out=("TestHygiene",))
+        self.assertEqual(code, 1)
+        self.assertIn("timed out after", [l for l in lines if l.startswith("FAIL hygiene")][0])
+
+    def test_s3_a_cloud_change_runs_the_cloud_suites_with_a_49_character_tmpdir(self):
+        code, lines, calls = self.run_preflight(["cloud/worker/guard.py"])
+        self.assertEqual(code, 0)
+        self.assertEqual(len([l for l in lines if l.startswith("PASS cloud")]), 1)
+        envs = [c[1]["env"] for c in calls if "heavy" in c[0] and "cloud" in " ".join(c[0])]
+        self.assertEqual(len(envs), 3)
+        for env in envs:
+            self.assertEqual(len(os.path.basename(env["TMPDIR"])), 49)
+        self.assertEqual(len([c for c in calls if "heavy" in c[0]]), 6)
+
+    def test_s4_it_only_runs_git_reads_and_heavy_tests_and_leaves_no_scratch(self):
+        _, _, calls = self.run_preflight(["cloud/x"])
+        for argv, kwargs in calls:
+            self.assertTrue(argv[0] == "git" and argv[1] in ("rev-parse", "merge-base", "diff") or "heavy" in argv, argv)
+            self.assertNotIn("gh", argv[0])
+        scratch = {os.path.dirname(c[1]["env"]["TMPDIR"]) for c in calls if "TMPDIR" in c[1].get("env", {}) and "cloud" in " ".join(c[0])}
+        self.assertTrue(scratch and not any(os.path.exists(d) for d in scratch))
+
+    @classmethod
+    def sentence_count(cls, text):
+        return " ".join(text.split()).count(cls.SENTENCE)
+
+    def test_s5_the_coordination_skill_names_the_command_once_and_the_count_is_exact(self):
+        text = (REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text()
+        self.assertEqual(self.sentence_count(text), 1)
+        self.assertEqual(self.sentence_count(text.replace(self.SENTENCE, "")), 0)
+        self.assertEqual(self.sentence_count(text + "\n" + self.SENTENCE), 2)
+
+    def test_s6_the_class_list_is_one_table_with_each_class_once(self):
+        source = SWITCHBOARD.read_text()
+        self.assertEqual(source.count("PREFLIGHT_CLASSES = ("), 1)
+        table = source.split("PREFLIGHT_CLASSES = (", 1)[1].split("\n)\n", 1)[0]
+        names = [row[0] for row in sb.PREFLIGHT_CLASSES]
+        self.assertEqual(len(names), 4)
+        for name in names:
+            self.assertEqual(table.count('("%s",' % name), 1)
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.
