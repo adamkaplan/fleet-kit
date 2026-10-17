@@ -16,6 +16,7 @@ Python 3.9+, standard library only; loaded by path from beside bin/fleet-switchb
 
 import base64
 import difflib
+import gzip
 import hashlib
 import io
 import json
@@ -182,6 +183,23 @@ def git_blob_sha(data):
     return hashlib.sha1(b"blob %d\x00" % len(data) + data).hexdigest()
 
 
+class _Capped(io.RawIOBase):
+    """A reader that stops, with OverBound, once more than `cap` decompressed bytes have been read: a gzip bomb, or headers and skipped members, cannot run on."""
+
+    def __init__(self, inner, cap):
+        self.inner, self.cap, self.seen = inner, cap, 0
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        got = self.inner.readinto(buffer)
+        self.seen += got or 0
+        if self.seen > self.cap:
+            raise OverBound("the archive is more than %d bytes unpacked, over the limit of %d bytes in total" % (self.cap, self.cap))
+        return got
+
+
 def read_archive(data, root, limits, started):
     """Unpack the tarball `data` (bytes) into `root` with write_file, the only writer. Members are read in a stream, never extracted by tarfile.
     The archive's single top directory prefix is stripped; a member outside it is refused. Returns ({path: (git blob sha, size)}, skipped, refused).
@@ -189,7 +207,9 @@ def read_archive(data, root, limits, started):
     files, skipped, refused, seen = {}, [], [], set()
     members, total, top = 0, 0, None
     try:
-        archive = tarfile.open(fileobj=io.BytesIO(data), mode="r|*")
+        # unpacked here, under a byte cap that counts every byte (headers and skipped members too): total bound + room for headers and padding
+        capped = io.BufferedReader(_Capped(gzip.GzipFile(fileobj=io.BytesIO(data)), limits["total"] + 1024 * (4 * limits["files"] + 16)))
+        archive = tarfile.open(fileobj=capped, mode="r|")
     except (tarfile.TarError, OSError, EOFError, zlib.error) as err:
         raise Problem("GitHub answered an unreadable archive: %s" % err) from None
     try:

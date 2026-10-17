@@ -56029,10 +56029,25 @@ class TestReviewCheckout(LedgerBase):
         written = []
         real = self.rc.write_file
         self.extra_members = [self.member("bomb.bin", data=b"\x00" * (6 * 1024 * 1024))]   # compresses to a few KB; its header says 6 MiB
-        with mock.patch.object(self.rc, "write_file", lambda root, rel, data: written.append(rel) or real(root, rel, data)):
+        reads = []
+        real_extract = tarfile.TarFile.extractfile
+        with mock.patch.object(self.rc, "write_file", lambda root, rel, data: written.append(rel) or real(root, rel, data)), \
+                mock.patch.object(tarfile.TarFile, "extractfile", lambda tf, m: reads.append(m.name) or real_extract(tf, m)):
             code, out, err = self.checkout()
         self.assertEqual(code, 2, err)
+        self.assertNotIn("bomb.bin", reads, "the body is never read once the header is over the bound")
         self.assertNotIn("bomb.bin", [w for w in written])
+        self.made_nothing()
+
+    def test_a_skipped_member_with_a_huge_declared_size_is_still_bounded(self):
+        self.extra_members = [self.member("fifo", tarfile.FIFOTYPE), self.member("sparse-ish.bin", data=b"\x00" * 400)]
+        with mock.patch.object(self.rc, "MAX_TOTAL_BYTES", 100):
+            plain = self.route
+            self.route = lambda argv, **kw: plain(argv, **kw)
+            self.head_tree, self.base_tree = {}, {}
+            code, out, err = self.checkout()
+        self.assertEqual(code, 2, err)
+        self.assertIn("in total", err)
         self.made_nothing()
 
     def test_the_marker_is_written_first_and_a_kill_after_the_first_file_leaves_a_removable_directory(self):
@@ -56070,8 +56085,35 @@ class TestReviewCheckout(LedgerBase):
         with mock.patch.object(self.rc, "write_file", boom):
             code, out, err = self.checkout()
         self.assertEqual(code, 1)
-        left = self.files(self.cwd)
-        self.assertTrue(left == [] or all(p.endswith(".fleet-review-checkout") for p in left), left)
+        self.made_nothing()   # the failure path removes everything it made, marker included
+
+    def test_an_interrupted_checkout_removes_what_it_made(self):
+        real = self.rc.write_file
+
+        def die_after_first(root, rel, data):
+            real(root, rel, data)
+            if rel == "a.txt":
+                raise KeyboardInterrupt
+        with mock.patch.object(self.rc, "write_file", die_after_first), self.assertRaises(KeyboardInterrupt):
+            self.checkout()
+        self.made_nothing()
+
+    def test_an_unreadable_archive_a_failed_gh_and_an_oversize_archive_leave_nothing(self):
+        plain = self.route
+        for label, answer in (("garbage", subprocess.CompletedProcess([], 0, b"not a tarball", b"")),
+                              ("truncated", subprocess.CompletedProcess([], 0, self.archive(self.head_tree)[:60], b"")),
+                              ("gh failed", subprocess.CompletedProcess([], 1, b"", b"gh: boom")),
+                              ("not found", subprocess.CompletedProcess([], 1, b"", b"gh: Not Found (HTTP 404)"))):
+            with self.subTest(label):
+                self.route = lambda argv, answer=answer, **kw: (answer if "/tarball/" in " ".join(argv) else plain(argv, **kw))
+                code, out, err = self.checkout()
+                self.assertEqual(code, 1, err)
+                self.made_nothing()
+        self.route = plain
+        with mock.patch.object(self.rc, "MAX_TOTAL_BYTES", 10 - 16 * 1024 * 1024 + 16 * 1024 * 1024 - 10):   # 0: any archive is over the limit
+            code, out, err = self.checkout()
+        self.assertIn(code, (1, 2), err)
+        self.made_nothing()
 
     def test_the_writer_refuses_a_symlinked_directory_in_the_way(self):
         root = self.work / "root"
