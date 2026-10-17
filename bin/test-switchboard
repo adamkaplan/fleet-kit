@@ -30442,8 +30442,10 @@ class TestPlanCheckRules(unittest.TestCase):
             with self.subTest(skill=skill):
                 self.assertEqual(text.count("An agent that is asked to run a mutation or fault-injection check"), 1)
                 sentence = text.split("An agent that is asked to run a mutation or fault-injection check", 1)[1].split("can loop.", 1)[0]
-                for word in words[1:]:
+                for word in words[1:] + ("named job", "job record", "the job-start rule"):
                     self.assertIn(word, sentence)
+                for old in ("never runs in the background without one", "never leaves one running in the background"):
+                    self.assertEqual(text.count(old), 0)
         definitions = sorted((REPO / "agents" / "reviewers").glob("*.md"))
         self.assertEqual(len(definitions), 5)
         for path in definitions:
