@@ -26019,6 +26019,79 @@ class TestPlanLedger(LedgerBase):
         self.assertTrue(entry["env"])
         self.assertIn("plan.proof", [e["event"] for e in self.world.audit()])
 
+    def prove_many(self, who, *sids, result="pass"):
+        return self.run_as(who, "prove", *sids, "--pr", self.PR, "--evidence", "ran the suite: 12 passed", "--result", result)
+
+    def test_prove_names_every_scenario_and_exits_4_when_one_was_not_recorded(self):
+        code, out, err = self.prove_many("coder", "S4", "U1")
+        self.assertEqual(code, 4, err)
+        self.assertEqual(len(out.strip().splitlines()), 1)
+        self.assertRegex(out, r"^recorded proof #1: U1 pass at %s \(acme/app#9\), bound to plan sha256:" % LEDGER_HEAD[:8])
+        self.assertEqual(len(err.strip().splitlines()), 1)
+        self.assertIn("S4", err)
+        self.assertIn("claimed at the epic", err)
+        self.assertEqual([e["scenario"] for e in self.ledger()], ["U1"])
+
+    def test_prove_of_several_scenarios_records_each_and_exits_0(self):
+        code, out, err = self.prove_many("coder", "S1", "U1")
+        self.assertEqual((code, err), (0, ""))
+        lines = out.strip().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn(": S1 pass", lines[0])
+        self.assertIn(": U1 pass", lines[1])
+        self.assertEqual([e["scenario"] for e in self.ledger()], ["S1", "U1"])
+
+    def test_prove_reports_a_scenario_already_recorded_at_this_head_and_plan(self):
+        self.assertEqual(self.prove_many("coder", "U1")[0], 0)
+        code, out, err = self.prove_many("coder", "U1", "S1")
+        self.assertEqual((code, err), (0, ""))
+        lines = out.strip().splitlines()
+        self.assertRegex(lines[0], r"^already recorded proof #1: U1 pass at ")
+        self.assertRegex(lines[1], r"^recorded proof #2: S1 pass at ")
+        self.assertEqual([e["scenario"] for e in self.ledger()], ["U1", "S1"])
+        code, out, err = self.prove_many("coder", "U1", result="fail")   # another result is a new proof
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.ledger()), 3)
+
+    def test_prove_is_not_already_recorded_for_another_head_or_another_plan_hash(self):
+        self.assertEqual(self.prove_many("coder", "U1")[0], 0)
+        self.pr["headRefOid"] = "b" * 40   # the head moved: the proof at the old head is void
+        code, out, err = self.prove_many("coder", "U1")
+        self.assertEqual((code, err), (0, ""))
+        self.assertRegex(out, r"^recorded proof #2: U1 pass at bbbbbbbb")
+        self.assertEqual([(e["scenario"], e["head"][:1]) for e in self.ledger()], [("U1", "a"), ("U1", "b")])
+        before = self.ledger()[-1]["plan_hash"]
+        self.plan_issue["body"] = LEDGER_PLAN.replace("exactly 1 agent named", "exactly one agent named")   # the plan changed: a new hash
+        code, out, err = self.prove_many("coder", "U1")
+        self.assertEqual((code, err), (0, ""))
+        self.assertRegex(out, r"^recorded proof #3: U1 pass at bbbbbbbb")
+        self.assertNotEqual(self.ledger()[-1]["plan_hash"], before)
+
+    def test_prove_of_the_only_named_id_missing_from_the_plan_exits_4_with_the_reason(self):
+        code, out, err = self.prove_many("coder", "S9")
+        self.assertEqual(code, 4)
+        self.assertEqual(out, "")
+        self.assertIn("not recorded: S9: the plan has no scenario S9", err)
+        self.assertEqual(self.ledger(), [])
+
+    def test_prove_an_id_not_in_the_plan_is_refused_with_its_reason_and_the_rest_recorded(self):
+        code, out, err = self.prove_many("coder", "S9", "U1")
+        self.assertEqual(code, 4)
+        self.assertIn("not recorded: S9: the plan has no scenario S9", err)
+        self.assertEqual([e["scenario"] for e in self.ledger()], ["U1"])
+
+    def test_prove_whole_command_failures_stay_usage_errors(self):
+        self.plan_issue["body"] = LEDGER_PLAN.replace('pass: the list call returns status 200 and exactly 1 agent named "alpha"', "pass: works")
+        code, out, err = self.prove_many("coder", "S1", "U1")
+        self.assertEqual(code, 2)
+        self.assertIn("nothing was recorded", err)
+        self.assertEqual(self.ledger(), [])
+        self.plan_issue["body"] = LEDGER_PLAN
+        code, out, err = self.prove_many(None, "S1", "U1")
+        self.assertNotIn(code, (0, 4))
+        self.assertIn("HERDR_PANE_ID", err)
+        self.assertEqual(self.ledger(), [])
+
     def test_prove_refuses_what_it_cannot_bind(self):
         for who, sid, extra, fragment in (("coder", "S9", (), "no scenario S9"), ("coder", "S4", (), "claimed at the epic"),
                                           (None, "S1", (), "HERDR_PANE_ID")):

@@ -308,6 +308,7 @@ PROG = "fleet-switchboard"
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_USAGE = 2
+EXIT_PARTIAL = 4   # `prove`: at least one named scenario was not recorded (a usage error is 2)
 EXIT_HELD = 3   # `send`: the delivery rule says hold; nothing was sent
 EXIT_CRASH = 70  # the `crash-after-send` fault stopped the process, as a crash would
 
@@ -18717,20 +18718,47 @@ def _evidence(args):
     return text
 
 
+def _already_proven(ctx, sid, plan_hash, head, result):
+    """The newest proof of `sid` for this PR when it is at THIS plan hash and head with the same result, else None."""
+    mine = [e for e in ctx.entries if e.get("pr") == ctx.pr and e.get("kind") == "proof" and e.get("scenario") == sid]
+    fresh = [e for e in mine if e.get("plan_hash") == plan_hash and e.get("head") == head]
+    return fresh[-1] if fresh and fresh[-1].get("result") == result else None
+
+
 def cmd_prove(args, runner, now):
-    """`prove <scenario> --pr <repo#N> --evidence ...`: the calling agent records what it ran and saw for a scenario of the
-    PR's plan, at the PR's head, bound to the plan's hash. It records a PROOF; it never records a verdict."""
+    """`prove <scenario>... --pr <repo#N> --evidence ...`: the calling agent records what it ran and saw for each named scenario of
+    the PR's plan, at the PR's head, bound to the plan's hash. It records a PROOF; it never records a verdict. Each scenario gets one
+    line: recorded (stdout), or already recorded at this head and plan hash (stdout, counts as recorded), or refused with its
+    reason (stderr). Exit 0 when every named scenario is recorded; EXIT_PARTIAL when any was refused. What applies to the whole
+    command (no plan, a failing plan check, no caller, no evidence, an unknown head) stays a usage error: nothing is recorded."""
     ctx = _ledger_context(args, runner, now, True)
     caller = identify_caller(ctx.engine.herdr, ctx.engine.v2, os.environ)
-    scenario = _scenario_of(ctx, args.scenario)
-    entry = {"kind": "proof", "pr": ctx.pr, "scenario": args.scenario, "plan_ref": ctx.source,
-             "plan_hash": ctx.plan["plan_hash"], "head": _head_of(ctx, args), "result": args.result, "by": caller,
-             "evidence": _evidence(args), "command": plan_ledger.clip(redact_command_text(args.command or "")),
-             "env": "%s %s" % (sys.platform, "python%d.%d" % sys.version_info[:2])}
-    stored = _record(ctx, args, now, entry)
-    print("recorded proof #%d: %s %s at %s (%s), bound to plan %s" % (stored["seq"], args.scenario, args.result,
-                                                                      entry["head"][:8], ctx.pr, entry["plan_hash"][:19]))
-    return EXIT_OK
+    _plan_usable(ctx)
+    refused, common = 0, None
+    for sid in dict.fromkeys(args.scenario):
+        try:
+            _scenario_of(ctx, sid)
+        except LedgerCommandError as err:
+            print("not recorded: %s: %s" % (sid, err), file=sys.stderr)
+            refused += 1
+            continue
+        if common is None:
+            head = _head_of(ctx, args)
+            common = (head, _evidence(args))
+        head, evidence = common
+        found = _already_proven(ctx, sid, ctx.plan["plan_hash"], head, args.result)
+        if found:
+            print("already recorded proof #%d: %s %s at %s (%s), bound to plan %s" % (found["seq"], sid, args.result, head[:8], ctx.pr,
+                                                                                  ctx.plan["plan_hash"][:19]))
+            continue
+        entry = {"kind": "proof", "pr": ctx.pr, "scenario": sid, "plan_ref": ctx.source,
+                 "plan_hash": ctx.plan["plan_hash"], "head": head, "result": args.result, "by": caller,
+                 "evidence": evidence, "command": plan_ledger.clip(redact_command_text(args.command or "")),
+                 "env": "%s %s" % (sys.platform, "python%d.%d" % sys.version_info[:2])}
+        stored = _record(ctx, args, now, entry)
+        print("recorded proof #%d: %s %s at %s (%s), bound to plan %s" % (stored["seq"], sid, args.result,
+                                                                          head[:8], ctx.pr, entry["plan_hash"][:19]))
+    return EXIT_PARTIAL if refused else EXIT_OK
 
 
 cmd_prove.ledger = True   # state and GETs only; its own errors are usage errors
@@ -20523,9 +20551,9 @@ def plan_gates_status(config, state, now_ts):
 
 
 def add_ledger_parsers(sub):
-    def common(p, scenario=True):
+    def common(p, scenario=True, multi=False):
         if scenario:
-            p.add_argument("scenario", help="The scenario id in the plan (S1, U2, ...)")
+            p.add_argument("scenario", nargs="+" if multi else None, help="The scenario id in the plan (S1, U2, ...)")
             p.add_argument("--pr", required=True, help="The pull request: owner/repo#N or its URL")
         else:
             p.add_argument("pr", help="The pull request: owner/repo#N or its URL")
@@ -20534,7 +20562,7 @@ def add_ledger_parsers(sub):
         p.add_argument("--ask", help="The ask whose Done-when the plan must cover (as `plan check --ask`)")
         p.add_argument("--head", help="The PR head sha (default: read from GitHub)")
     prove = sub.add_parser("prove", help="Record proof for a plan scenario of a PR, at its head, bound to the plan's hash")
-    common(prove)
+    common(prove, multi=True)
     prove.add_argument("--evidence", required=True, help="A link, or what you ran and saw")
     prove.add_argument("--result", choices=("pass", "fail"), default="pass")
     prove.add_argument("--command", help="The command you ran, if any")
