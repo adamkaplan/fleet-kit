@@ -1,0 +1,28 @@
+{
+  "id": "D3",
+  "title": "A worker's question is listed until its boss answers it",
+  "problem": null,
+  "since_pr": 14,
+  "tiers": ["offline"],
+  "cast": {
+    "platform": {"role": "orchestrator", "charter": 1},
+    "coder": {"role": "coder", "reports_to": "platform", "issue": 2}
+  },
+  "issues": {
+    "2": {"intent": "Add a health check", "done_when": "GET /health returns 200"}
+  },
+  "steps": [
+    {"at": "10s", "actor": "coder", "do": "report", "state": "question", "text": "Which database?", "issue": 2,
+     "why": "The worker needs a decision and says so with `report question`"},
+    {"at": "45s", "actor": "world", "do": "wait", "why": "The report is in the boss's transcript and a pass has run"},
+    {"at": "60s", "actor": "platform", "do": "send", "to": "coder", "text": "Use postgres", "issue": 2,
+     "why": "The boss answers on the same ask"},
+    {"at": "90s", "actor": "world", "do": "wait"}
+  ],
+  "expect": [
+    {"name": "listed", "that": "decisions", "at": "45s", "count": 1, "text": "Which database?"},
+    {"name": "resolved", "that": "decisions", "at": "90s", "count": 0,
+     "why": "A newer send from the boss to that worker on the same ask answers the report"}
+  ],
+  "control": {"fault": "decision-resolves-never", "fails": ["resolved"]}
+}

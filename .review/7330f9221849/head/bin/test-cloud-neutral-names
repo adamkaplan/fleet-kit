@@ -1,0 +1,34 @@
+#!/bin/sh
+# test-cloud-neutral-names: self-test of cloud/tests/check-neutral-names with a STAND-IN word written to a temp list
+# at run time (no real list needed, none in the repo). Prints RESULT: PASS.
+cd "$(dirname "$0")/.." || exit 1
+t=$(mktemp -d) || exit 1; trap 'rm -rf "$t"' EXIT
+chk=cloud/tests/check-neutral-names; fail=0
+ok() { echo "ok   $1"; }; bad() { echo "FAIL $1"; fail=1; }
+word=standinword
+# S1/U1: list unset or unreadable -> exit 2 with a message
+env -u CLOUD_BANNED_WORDS_FILE $chk >/dev/null 2>"$t/e"; [ $? = 2 ] && [ -s "$t/e" ] && ok "unset list exits 2" || bad "unset list"
+CLOUD_BANNED_WORDS_FILE="$t/none" $chk >/dev/null 2>&1; [ $? = 2 ] && ok "unreadable list exits 2" || bad "unreadable list"
+echo $word > "$t/list"
+# S2: the real surfaces are clean of the stand-in word
+CLOUD_BANNED_WORDS_FILE="$t/list" $chk >"$t/o" 2>&1; [ $? = 0 ] && ok "clean tree exits 0" || bad "clean tree: $(cat "$t/o")"
+# S3: a planted word in each surface is found, by place, never printed
+for s in image manifests logs sources; do
+  mkdir -p "$t/s/$s"; echo "x $word y" > "$t/s/$s/f.txt"
+done
+for f in labels.txt env.txt; do echo "k=$word" > "$t/s/$f"; done
+CLOUD_BANNED_WORDS_FILE="$t/list" $chk --surfaces "$t/s" >"$t/o" 2>&1; rc=$?
+[ $rc = 1 ] && ok "planted word exits 1" || bad "planted word rc=$rc"
+for place in image/f.txt manifests/f.txt logs/f.txt sources/f.txt labels.txt env.txt; do
+  grep -q "^$place:" "$t/o" && ok "found in $place" || bad "missed $place"
+done
+! grep -q $word "$t/o" && ok "the word is never printed" || bad "the word was printed"
+# K2 (#563) S6: the driver and the entrypoint read only prefixed or standard names; an unprefixed new one fails
+printf 'x = env.get("NEW_FLAG")\n' > "$t/new.py"; printf 'a=${NEW_SHELL_FLAG:-1}\nexport OTHER_FLAG\n' > "$t/new.sh"
+CLOUD_BANNED_WORDS_FILE="$t/list" $chk --extra-source "$t/new.py" >"$t/o" 2>&1; rc=$?
+[ $rc = 1 ] && grep -q "env NEW_FLAG read in new.py" "$t/o" && ok "an unprefixed Python environment name exits 1" || bad "unprefixed python name rc=$rc"
+CLOUD_BANNED_WORDS_FILE="$t/list" $chk --extra-source "$t/new.sh" >"$t/o" 2>&1; rc=$?
+[ $rc = 1 ] && grep -q "env NEW_SHELL_FLAG" "$t/o" && grep -q "env OTHER_FLAG" "$t/o" && ok "unprefixed shell names exit 1" || bad "unprefixed shell names rc=$rc"
+printf 'x = env.get("CW_NEW_FLAG") or env.get("HOME")\n' > "$t/ok.py"
+CLOUD_BANNED_WORDS_FILE="$t/list" $chk --extra-source "$t/ok.py" >"$t/o" 2>&1; [ $? = 0 ] && ok "prefixed and standard names pass" || bad "prefixed name: $(cat "$t/o")"
+[ $fail = 0 ] && echo "RESULT: PASS" || { echo "RESULT: FAIL"; exit 1; }

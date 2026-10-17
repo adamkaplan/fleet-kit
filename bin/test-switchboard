@@ -5854,7 +5854,7 @@ class TestLaunch(Base):
                 code, out, err = self.launch_read("--read-repo", bad, users={"acme-org/widget-service": "acme-dev", "acme-org/widget-api": "acme-bot"})
                 self.assertEqual(code, 1, (out, err))
                 self.assertEqual(len(self.world.v2.sessions), sessions)
-        for flag in ("--headless", "--cloud"):
+        for flag in ("--headless", "--cloud", "--resume=ses_example"):
             code, out, err = self.launch_read("--read-repo", "acme-org/widget-api", flag)
             self.assertEqual(code, 1, flag)
             self.assertIn("--read-repo", err)
@@ -16442,6 +16442,15 @@ class TestGitShim(Base):
                 done, seen = self.run_git("push", target, "main", env=env)
                 self.assertEqual(done.returncode, 1, done.stderr)
                 self.assertIsNone(seen)
+        for pushed in (("-o", "x", "https://github.com/acme-org/widget-api.git"), ("--push-option", "x", "https://github.com/acme-org/widget-api.git"),
+                       ("--repo=https://github.com/acme-org/widget-api.git",), ("-u", "https://github.com/acme-org/widget-api.git", "main"),
+                       ("--receive-pack=x", "git@github.com:acme-org/widget-api.git"), ("-o", "x", "file:///tmp/x")):
+            with self.subTest(pushed=pushed):
+                done, seen = self.run_git("push", *pushed, env=env)
+                self.assertEqual(done.returncode, 1, done.stderr)
+                self.assertIsNone(seen)
+        done, seen = self.run_git("-C", "/w", "push", "https://github.com/acme-org/widget-api.git", env=env)
+        self.assertEqual((done.returncode, seen), (1, None))
         done, seen = self.run_git("push", "https://github.com/acme-org/widget-service.git", "main", env=env)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIsNotNone(seen)
@@ -23453,6 +23462,16 @@ class TestIdentityCheck(ReportBase):
         done, seen = self.read_repo_run(("issue", "view", "5", "-R", "acme-org/widget-api"), tokens={"acme-dev": "tok-dev"})
         self.assertEqual(done.returncode, 1, "no token for the read repository's account: refused")
         self.assertIsNone(seen)
+
+    def test_groups_that_reach_any_repository_without_naming_one_and_attached_or_missing_flag_values_are_refused(self):
+        for args in (("search", "code", "x"), ("search", "issues", "x", "--owner", "acme-org"), ("gist", "view", "abc"), ("status",), ("alias", "list"),
+                     ("issue", "view", "5", "-Racme-org/other"), ("issue", "view", "5", "-R"), ("issue", "view", "5", "-R", "")):
+            with self.subTest(args=args):
+                done, seen = self.read_repo_run(args)
+                self.assertEqual(done.returncode, 1, done.stderr)
+                self.assertIsNone(seen)
+        done, seen = self.read_repo_run(("issue", "view", "5", "-Racme-org/widget-api"))
+        self.assertEqual((done.returncode, seen["token"]), (0, "tok-bot"), done.stderr)
 
     def test_s6_a_worker_without_a_read_repository_is_untouched_by_the_guard(self):
         for args in (("issue", "view", "5", "-R", "acme-org/other"), ("api", "graphql", "-f", "query=x"), ("issue", "comment", "5", "-R", "acme-org/other", "--body", "x")):

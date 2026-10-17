@@ -145,15 +145,13 @@ def push_refusal(args, git):
         extra = data["read_repo"]
         if not (isinstance(extra, str) and re.fullmatch(r"[a-z0-9_.-]+/[a-z0-9_.-]+", extra)):
             return "git: refused: this worker's read-only repository record cannot be read, so the fleet shim refuses every push rather than run with no restriction\n"
-        positional = [a for a in args[verb_at + 1:] if not a.startswith("-")]
-        target = positional[0] if positional else "origin"
-        if "/" not in target and ":" not in target:
-            return None   # a NAMED remote is not resolved: no shim reads a directory's remote settings (a worker controls them, #473), so only an explicit url is judged here
-        urls = [target]
-        for url in urls:
-            m = re.fullmatch(r"(?:https://github\.com/|git@github\.com:)([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?", url)
+        for arg in args[verb_at + 1:]:   # EVERY argument is judged (an option's value, `--repo=URL`, a url anywhere): which one is the target is never guessed
+            text = arg.split("=", 1)[1] if arg.startswith("--") and "=" in arg else arg
+            if "github.com" not in text.lower() and "://" not in text and not text.startswith("git@"):
+                continue   # a branch, a refspec or a remote name: a named remote is not resolved (no shim reads a directory's remote settings, #473)
+            m = re.fullmatch(r"(?:https://github\.com/|git@github\.com:)([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?", text)
             if not m:
-                return "git: refused: this worker has a read-only repository, so a push to a remote that cannot be read as a GitHub owner/name is refused\n"
+                return "git: refused: this worker has a read-only repository, so a push naming a url that cannot be read as a GitHub owner/name is refused\n"
             if ("%s/%s" % (m.group(1), m.group(2))).lower() == extra:
                 return "git: refused: %s is read only for this worker (a shim guard): it may fetch there, never push\n" % extra
         return None

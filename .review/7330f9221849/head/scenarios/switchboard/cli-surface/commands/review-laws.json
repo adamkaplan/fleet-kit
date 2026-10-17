@@ -1,0 +1,4 @@
+{
+ "command": "review-laws",
+ "help": "usage: fleet-switchboard review-laws [-h] {install} ... positional arguments: {install} install Copy the generic review laws and standards into a repository and say what to edit options: -h, --help show this help message and exit"
+}

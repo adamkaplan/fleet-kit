@@ -1,0 +1,485 @@
+#!/usr/bin/env python3
+"""test-health-records: offline tests for bin/health_records.py and its hooks in fleet-switchboard (#357). No network, no OpenCode.
+
+    bin/test-health-records
+
+The last line printed is `RESULT: PASS` or `RESULT: FAIL`."""
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import sys
+import tempfile
+import time
+import unittest
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+spec = importlib.util.spec_from_file_location("health_records", os.path.join(HERE, "health_records.py"))
+hr = importlib.util.module_from_spec(spec)
+sys.modules["health_records"] = hr
+spec.loader.exec_module(hr)
+
+NOW = 1_800_000_000.0
+
+
+def msg(mid, tokens, cost, created=None, model=None):
+    out = {"id": mid, "type": "assistant", "agent": "coder", "cost": cost,
+           "tokens": {"input": tokens, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+           "time": {"created": int((created or NOW) * 1000)}, "model": model or {"id": "m", "providerID": "p"}}
+    return out
+
+
+class ToolCalls(unittest.TestCase):
+    def test_series_per_minute(self):
+        end = int(NOW // 60)
+        body = {"written_at": NOW - 5, "sessions": {"ses_a": {str(end): 2, str(end - 1): 7}}}
+        got = hr.tool_series(body, NOW)["ses_a"]
+        self.assertEqual(got[-2:], [7, 2])
+        self.assertEqual(len(got), 15)
+
+    def test_stale_or_missing_is_not_recorded(self):
+        self.assertEqual(hr.tool_series(None, NOW), {})
+        self.assertEqual(hr.tool_series({"written_at": NOW - 181, "sessions": {"s": {}}}, NOW), {})
+        self.assertEqual(hr.tool_series({"sessions": {"s": {}}}, NOW), {})
+        body = hr.Recorder(lambda: NOW).body(None)
+        self.assertEqual(body["tool_calls"], {})
+
+    def test_old_minutes_fall_out_of_the_window(self):
+        end = int(NOW // 60)
+        got = hr.tool_series({"written_at": NOW, "sessions": {"s": {str(end - 15): 9, str(end - 14): 1}}}, NOW)["s"]
+        self.assertEqual(got[0], 1)
+        self.assertEqual(sum(got), 1)
+
+
+class Usage(unittest.TestCase):
+    def test_dedupe_sum_and_context(self):
+        rec = hr.Recorder(lambda: NOW)
+        self.assertTrue(rec.ingest_message("ses_a", msg("m1", 1000, 0.02, NOW + 10)))
+        self.assertTrue(rec.ingest_message("ses_a", msg("m2", 3000, 0.06, NOW + 20)))
+        self.assertFalse(rec.ingest_message("ses_a", msg("m1", 1000, 0.02, NOW + 10)))
+        u = rec.body()["usage"]["ses_a"]
+        hour = u["hours"][str(hr._hour(NOW))]
+        self.assertEqual((hour["tokens"], hour["cost"], hour["messages"]), (4000, 0.08, 2))
+        self.assertEqual(u["context"]["tokens"], 3000)
+        self.assertTrue(u["partial"])
+
+    def test_no_limit_means_no_percent(self):
+        rec = hr.Recorder(lambda: NOW)
+        rec.ingest_message("ses_a", msg("m1", 1000, 0.01))
+        ctx = rec.body()["usage"]["ses_a"]["context"]
+        self.assertEqual(ctx["tokens"], 1000)
+        self.assertNotIn("percent", ctx)
+        self.assertNotIn("limit", ctx)
+
+    def test_limit_from_model_info(self):
+        rec = hr.Recorder(lambda: NOW)
+        rec.ingest_message("ses_a", msg("m1", 50000, 0.01, model={"id": "m", "providerID": "p", "limit": {"context": 200000}}))
+        self.assertEqual(rec.body()["usage"]["ses_a"]["context"]["percent"], 25.0)
+
+    def test_no_cost_is_not_zero_cost(self):
+        rec = hr.Recorder(lambda: NOW)
+        m = msg("m1", 10, None)
+        del m["cost"]
+        rec.ingest_message("ses_a", m)
+        self.assertNotIn("cost", rec.body()["usage"]["ses_a"]["hours"][str(hr._hour(NOW))])
+
+    def test_message_without_numbers_is_ignored(self):
+        rec = hr.Recorder(lambda: NOW)
+        self.assertFalse(rec.ingest_message("ses_a", {"id": "m9", "type": "assistant"}))
+        self.assertEqual(rec.body()["usage"], {})
+
+
+class Pushes(unittest.TestCase):
+    def test_changed_head_counts_first_sighting_does_not(self):
+        rec = hr.Recorder(lambda: NOW)
+        rec.ingest_prs({"acme/api#1": {"head": "a"}, "acme/api#2": {"head": "x"}})
+        rec.ingest_prs({"acme/api#1": {"head": "b"}, "acme/api#2": {"head": "x"}})
+        rec.ingest_prs({"acme/api#1": {"head": "c"}, "acme/api#2": {"head": "x"}})
+        self.assertEqual(rec.body()["pushes"], {"acme/api": {str(hr._hour(NOW)): 2}})
+
+    def test_no_pushes_is_absent_not_zero(self):
+        self.assertEqual(hr.Recorder(lambda: NOW).body()["pushes"], {})
+
+
+class Sources(unittest.TestCase):
+    def test_tool_source_says_why_it_is_empty(self):
+        rec = hr.Recorder(lambda: NOW)
+        self.assertEqual(rec.body(None)["sources"]["tool_calls"], "missing")           # the counter file is not there: plugin not installed
+        self.assertEqual(rec.body({"written_at": NOW - 1000, "sessions": {}})["sources"]["tool_calls"], "stale")
+        self.assertEqual(rec.body({"written_at": NOW, "sessions": {}})["sources"]["tool_calls"], "ok")
+
+    def test_usage_source_is_off_under_v2_light_until_an_event_carries_figures(self):
+        rec = hr.Recorder(lambda: NOW)
+        self.assertEqual(rec.body(None, light=True)["sources"]["usage"], "off: v2_light")
+        self.assertEqual(rec.body(None)["sources"]["usage"], "on")
+        rec.ingest_message("ses_a", {"id": "evt_1", "tokens": {"input": 100, "output": 20}, "cost": 0.01, "time": {"created": NOW * 1000}})
+        body = rec.body(None, light=True)
+        self.assertEqual(body["sources"]["usage"], "events")
+        self.assertEqual(body["usage"]["ses_a"]["context"]["tokens"], 120)
+
+
+class Bounds(unittest.TestCase):
+    def test_long_run_stays_bounded(self):
+        clock = [NOW]
+        rec = hr.Recorder(lambda: clock[0])
+        n = 0
+        for hour in range(72):
+            clock[0] = NOW + hour * 3600
+            for agent in range(600):
+                n += 1
+                rec.ingest_message("ses_%d" % agent, msg("m%d" % n, 100, 0.001, clock[0]))
+        body = rec.body()
+        self.assertLessEqual(len(json.dumps(body)), hr.FILE_CAP)
+        self.assertLessEqual(len(body["usage"]), hr.MAX_AGENTS)
+        oldest = min(int(h) for u in body["usage"].values() for h in u["hours"])
+        self.assertGreaterEqual(oldest, hr._hour(clock[0]) - 47 * 3600)
+        self.assertLessEqual(len(rec.seen), hr.MAX_SEEN)
+
+    def test_file_cap_trims_oldest_hours_first(self):
+        clock = [NOW]
+        rec = hr.Recorder(lambda: clock[0])
+        n = 0
+        for hour in range(40):
+            clock[0] = NOW + hour * 3600
+            for agent in range(30):
+                n += 1
+                rec.ingest_message("ses_%d" % agent, msg("m%d" % n, 100, 0.001, clock[0]))
+        full = len(json.dumps(rec.body(), sort_keys=True))
+        old_cap, hr.FILE_CAP = hr.FILE_CAP, full // 2
+        try:
+            body = rec.body()
+        finally:
+            hr.FILE_CAP = old_cap
+        self.assertLessEqual(len(json.dumps(body, sort_keys=True)), full // 2)
+        newest = hr._hour(clock[0])
+        kept = [int(h) for u in body["usage"].values() for h in u["hours"]]
+        self.assertIn(newest, kept)           # the newest hour survives
+        self.assertGreater(min(kept), hr._hour(NOW))   # the oldest ingested hour is gone
+        self.assertLess(len(kept), 40 * 30)   # something was dropped
+
+    def test_only_names_and_numbers(self):
+        rec = hr.Recorder(lambda: NOW)
+        rec.ingest_message("ses_a", dict(msg("m1", 5, 0.1), content=[{"type": "text", "text": "secret prompt"}]))
+        self.assertNotIn("secret", json.dumps(rec.body()))
+
+
+class Hooks(unittest.TestCase):
+    """The daemon's hooks make no request of their own, write only on a change, and say a fault once."""
+
+    @classmethod
+    def setUpClass(cls):
+        loader = importlib.machinery.SourceFileLoader("sb_under_test", os.path.join(HERE, "fleet-switchboard"))
+        sp = importlib.util.spec_from_loader("sb_under_test", loader)
+        cls.sb = importlib.util.module_from_spec(sp)
+        sys.modules["sb_under_test"] = cls.sb
+        loader.exec_module(cls.sb)
+
+    def engine(self, d):
+        class Client:
+            calls = []
+            def __getattr__(self, name):
+                def call(*a, **k):
+                    Client.calls.append(name)
+                    raise AssertionError("the recorder made a request: " + name)
+                return call
+
+        class Engine:
+            state_dir = d
+            v2 = Client()
+            notes = []
+            def _note(self, event, subject, detail):
+                self.notes.append((event, subject, detail))
+
+        engine = Engine()
+        engine.notes = []
+        engine.health = hr.Recorder(lambda: NOW)   # a fixed clock: no test depends on the hour it runs in
+        Client.calls = []
+        return engine
+
+    def test_ingest_and_write_without_any_client(self):
+        class State:
+            pr_state = {"acme/api#1": {"head": "a"}}
+
+        with tempfile.TemporaryDirectory() as d:
+            engine = self.engine(d)
+            self.sb.health_ingest_messages(engine, "ses_a", [msg("m1", 10, 0.5, NOW)])
+            self.sb.health_write(engine, State, NOW)
+            State.pr_state = {"acme/api#1": {"head": "b"}}
+            self.sb.health_write(engine, State, NOW)
+            with open(os.path.join(d, hr.FILE)) as fh:
+                body = json.load(fh)
+            self.assertEqual(body["usage"]["ses_a"]["context"]["tokens"], 10)
+            self.assertEqual(sum(list(body["pushes"]["acme/api"].values())), 1)
+            self.assertEqual(body["tool_calls"], {})   # no plugin file: not recorded
+            self.assertEqual(engine.v2.calls, [])      # no OpenCode request
+            self.assertEqual(engine.notes, [])
+            self.assertEqual(oct(os.stat(os.path.join(d, hr.FILE)).st_mode & 0o777), "0o600")
+
+    def test_the_feed_hands_a_step_ended_events_usage_over_with_v2_light_on(self):
+        feed = self.sb.EventFeed(None)
+        got = []
+        feed.on_usage = lambda session, step: got.append((session, step))
+        feed.handle("data: " + json.dumps({"id": "evt_1", "type": "session.step.ended", "created": 5, "data": {"sessionID": "ses_a", "assistantMessageID": "m1", "tokens": {"input": 3, "output": 4}, "cost": 0.5}}))
+        feed.handle("data: " + json.dumps({"id": "evt_2", "type": "session.step.ended", "data": {"sessionID": "ses_a", "assistantMessageID": "m1"}}))   # no figures: nothing handed over
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0][0], "ses_a")
+        self.assertEqual(got[0][1]["tokens"], {"input": 3, "output": 4})
+
+    def test_watched_repositories_are_listed_without_a_push(self):
+        body = hr.Recorder(lambda: NOW).body(None, watched=["acme/api", "acme/api", "acme/web"])
+        self.assertEqual(body["pushes_watched"], ["acme/api", "acme/web"])
+        self.assertEqual(body["pushes"], {})     # no push: the reader turns a watched repository into 0
+
+    def test_health_watched_repos_keeps_only_running_watches_and_survives_bad_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(self.sb.health_watched_repos(d), [])                       # no file
+            path = os.path.join(d, "github-watch.json")
+            with open(path, "w") as fh:
+                json.dump({"watches": [{"repo": "acme/api", "state": "running"}, {"repo": "acme/web", "state": "backoff"}, {"state": "running"}, "x"]}, fh)
+            self.assertEqual(self.sb.health_watched_repos(d), ["acme/api"])
+            with open(path, "w") as fh:
+                fh.write("not json")
+            self.assertEqual(self.sb.health_watched_repos(d), [])                       # malformed
+            with open(path, "w") as fh:
+                fh.write("[]")
+            self.assertEqual(self.sb.health_watched_repos(d), [])                       # not an object
+
+    def test_health_write_carries_v2_light_and_the_watched_repositories(self):
+        class State:
+            pr_state = {}
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "github-watch.json"), "w") as fh:
+                json.dump({"watches": [{"repo": "acme/api", "state": "running"}]}, fh)
+            engine = self.engine(d)
+            engine.config = {"v2_light": True}
+            self.sb.health_write(engine, State, NOW)
+            with open(os.path.join(d, hr.FILE)) as fh:
+                body = json.load(fh)
+            self.assertEqual(body["sources"], {"tool_calls": "missing", "usage": "off: v2_light"})
+            self.assertEqual(body["pushes_watched"], ["acme/api"])
+            self.assertEqual(body["pushes"], {})
+
+    def test_the_feed_records_usage_only_under_v2_light(self):
+        class Http:
+            pass
+        class V2:
+            http = Http()
+        class Engine:
+            v2 = V2()
+            audit = None
+        started = self.sb.EventFeed.start
+        self.sb.EventFeed.start = lambda feed: None     # no thread, no connection
+        try:
+            for light in (True, False):
+                feed = self.sb.start_event_feed(Engine(), {"v2_events": "auto", "v2_light": light}, time.time)
+                self.assertEqual(feed.on_usage is not None, light)
+        finally:
+            self.sb.EventFeed.start = started
+
+    def test_usage_may_come_as_usage_and_a_failing_callback_does_not_stop_the_feed(self):
+        feed = self.sb.EventFeed(None)
+        def boom(session, step):
+            raise RuntimeError("x")
+        feed.on_usage = boom
+        feed.handle("data: " + json.dumps({"id": "e1", "type": "session.step.ended", "data": {"sessionID": "ses_a", "usage": {"input": 1}}}))
+        self.assertEqual(feed.counts["errors"], 1)
+        got = []
+        feed.on_usage = lambda session, step: got.append(step)
+        feed.handle("data: " + json.dumps({"id": "e2", "type": "session.step.ended", "data": {"sessionID": "ses_a", "usage": {"input": 1}}}))
+        feed.handle("data: " + json.dumps({"type": "session.step.ended", "data": {"sessionID": "ses_a", "tokens": {"input": 1}}}))   # no id of any kind: nothing handed over
+        self.assertEqual([g["id"] for g in got], ["e2"])
+
+    def test_the_end_of_every_pass_writes_the_file_with_no_plan_gates_configured(self):
+        """The ci recorder returns early on a fleet with no `plan_gates`; the records must not depend on it."""
+        class Engine:
+            config = {}               # no plan_gates, no policy, nothing
+            state_dir = None
+            audit = None
+            actor = "daemon"
+            failed = []
+            def now(self):
+                return NOW
+            def _failed(self, subject, step, err, report):
+                self.failed.append(subject)
+            def _note(self, event, subject, detail):
+                pass
+
+        with tempfile.TemporaryDirectory() as d:
+            engine = Engine()
+            engine.state_dir = d
+            engine.failed = []
+            engine.health = hr.Recorder(lambda: NOW)
+            self.sb.health_ingest_messages(engine, "ses_a", [msg("m1", 10, 0.5, NOW)])
+            self.sb.finish_pass(engine, None, {"errors": []})
+            self.assertNotIn("health-records", engine.failed)
+            with open(os.path.join(d, hr.FILE)) as fh:
+                body = json.load(fh)
+            self.assertEqual(body["usage"]["ses_a"]["context"]["tokens"], 10)
+
+    def test_concurrent_ingest_and_body_do_not_raise(self):
+        import threading
+        rec = hr.Recorder(lambda: NOW)
+        errors = []
+
+        def feed():
+            try:
+                for i in range(400):
+                    rec.ingest_message("ses_%d" % i, msg("m%d" % i, 1, 0.0, NOW))
+            except Exception as err:   # pragma: no cover
+                errors.append(err)
+        thread = threading.Thread(target=feed)
+        thread.start()
+        for _ in range(300):
+            rec.body()
+        thread.join()
+        self.assertEqual(errors, [])
+
+    def test_written_only_when_the_content_changed(self):
+        class State:
+            pr_state = {}
+
+        wrote = []
+        real = self.sb.state_write
+
+        def counting(*args, **kwargs):
+            got = real(*args, **kwargs)
+            wrote.append(got)
+            return got
+
+        self.sb.state_write = counting
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                engine = self.engine(d)
+                self.sb.health_ingest_messages(engine, "ses_a", [msg("m1", 10, 0.5, NOW)])
+                self.sb.health_write(engine, State, NOW)
+                self.assertEqual(wrote, [True])
+                self.sb.health_write(engine, State, NOW + 5)   # nothing new; only the timestamp would move
+                self.assertEqual(wrote, [True, False])
+                self.sb.health_ingest_messages(engine, "ses_a", [msg("m2", 10, 0.5, NOW)])
+                self.sb.health_write(engine, State, NOW + 6)
+                self.assertEqual(wrote, [True, False, True])
+        finally:
+            self.sb.state_write = real
+
+    def test_a_fault_never_raises_and_is_said_once_per_change(self):
+        class State:
+            pr_state = {}
+
+        engine = self.engine("/nonexistent-dir-for-test")
+        engine.health = None
+        self.sb.health_ingest_messages(engine, "ses_a", "not a list")   # nothing to ingest: no fault
+        self.sb.health_write(engine, State, NOW)
+        self.assertEqual([n[0] for n in engine.notes], ["health.error"])
+        self.assertEqual(engine.notes[0][1], "write")
+        # `_note` of the real engine says an unchanged error once and a changed one again: the hook passes the same detail for the same fault
+        self.sb.health_write(engine, State, NOW)
+        self.assertEqual(len(engine.notes), 2)
+        self.assertEqual(engine.notes[0], engine.notes[1])   # identical detail, so the engine's own once-per-change rule silences the repeat
+
+    def test_the_feed_hands_what_it_read_to_the_recorder(self):
+        class Stream:
+            pass
+
+        class V2:
+            def message_list(self, session, limit=None, order=None, type=None, cursor=None):
+                return [msg("m7", 70, 0.7, NOW)]
+
+        class Engine:
+            v2 = V2()
+            health = None
+
+        engine = Engine()
+        feed = self.sb.EventFeed(Stream())
+        self.assertTrue(feed._read(engine, "ses_feed", NOW, announced=False))
+        self.assertEqual(engine.health.context["ses_feed"]["tokens"], 70)
+
+
+class StepActivity(unittest.TestCase):
+    """The activity series from the step events the daemon already receives: needs no plugin and no restart of any session."""
+
+    def test_steps_per_minute_from_step_events(self):
+        rec = hr.Recorder(lambda: NOW)
+        rec.ingest_message("ses_o", msg("m1", 10, 0.1, created=NOW - 5))
+        rec.ingest_message("ses_o", msg("m2", 10, 0.1, created=NOW - 10))
+        rec.ingest_message("ses_o", msg("m3", 10, 0.1, created=NOW - 125))
+        rec.ingest_message("ses_o", msg("m1", 10, 0.1, created=NOW - 5))   # the same message again is not a second step
+        got = rec.body(None)["steps"]["ses_o"]
+        self.assertTrue(got["approx"])
+        self.assertEqual(len(got["per_minute"]), 15)
+        self.assertEqual(got["per_minute"][-1], 0)                 # NOW is on a minute boundary: the two newest steps are in the minute before
+        self.assertEqual(got["per_minute"][-2], 2)
+        self.assertEqual(got["per_minute"][-4], 1)
+        self.assertEqual(sum(got["per_minute"]), 3)
+
+    def test_old_steps_age_out_and_a_session_with_none_is_absent(self):
+        clock = [NOW]
+        rec = hr.Recorder(lambda: clock[0])
+        rec.ingest_message("ses_o", msg("m1", 10, 0.1, created=NOW))
+        clock[0] = NOW + 20 * 60
+        self.assertEqual(rec.body(None)["steps"], {})
+
+
+class StepBounds(unittest.TestCase):
+    def test_a_step_older_than_the_window_is_not_kept_and_sessions_are_capped(self):
+        rec = hr.Recorder(lambda: NOW)
+        rec.ingest_message("ses_old", msg("o1", 10, 0.1, created=NOW - 20 * 60))
+        self.assertEqual(rec.body(None)["steps"], {})
+        for i in range(hr.MAX_AGENTS + 5):
+            rec.ingest_message("ses_%d" % i, msg("m%d" % i, 10, 0.1, created=NOW - 5))
+        self.assertEqual(len(rec.body(None)["steps"]), hr.MAX_AGENTS)
+
+
+class StateDirRule(unittest.TestCase):
+    """The plugin (plugins/fleet-hooks `stateDirOf`) and the daemon (`state_dir_path`) must name the same directory."""
+
+    CASES = [({"XDG_STATE_HOME": "/xdg/state"}, "/xdg/state/fleet-switchboard"),
+             ({"XDG_STATE_HOME": "relative/state"}, "/home/user/.local/state/fleet-switchboard"),
+             ({}, "/home/user/.local/state/fleet-switchboard")]
+
+    def test_file_names_agree(self):
+        with open(os.path.join(HERE, "..", "plugins", "fleet-hooks", "index.js")) as fh:
+            self.assertIn('TALLY_FILE = "%s"' % hr.TOOL_FILE, fh.read())
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_daemon_and_plugin_agree(self):
+        import subprocess
+        loader = importlib.machinery.SourceFileLoader("sb_state_rule", os.path.join(HERE, "fleet-switchboard"))
+        sp = importlib.util.spec_from_loader("sb_state_rule", loader)
+        sb = importlib.util.module_from_spec(sp)
+        sys.modules["sb_state_rule"] = sb
+        loader.exec_module(sb)
+        plugin = os.path.join(HERE, "..", "plugins", "fleet-hooks", "index.js")
+        code = ("import(%r).then(m => console.log(JSON.stringify(%s.map(e => m.stateDirOf(e, '/home/user')))))"
+                % ("file://" + os.path.realpath(plugin), json.dumps([env for env, _ in self.CASES])))
+        out = subprocess.run(["node", "-e", code], capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        theirs = json.loads(out.stdout)
+        keep = {k: os.environ.get(k) for k in ("XDG_STATE_HOME", "HOME")}
+        try:
+            for (env, want), plugin_says in zip(self.CASES, theirs):
+                os.environ.pop("XDG_STATE_HOME", None)
+                os.environ.update(env)
+                os.environ["HOME"] = "/home/user"
+                import pathlib
+                real_home = pathlib.Path.home
+                pathlib.Path.home = classmethod(lambda cls: pathlib.Path("/home/user"))
+                try:
+                    daemon_says = str(sb.state_dir_path())
+                finally:
+                    pathlib.Path.home = real_home
+                self.assertEqual(daemon_says, want)
+                self.assertEqual(plugin_says, want)
+        finally:
+            for k, v in keep.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
+if __name__ == "__main__":
+    result = unittest.main(exit=False, verbosity=1).result
+    ok = result.wasSuccessful()
+    print("RESULT: PASS" if ok else "RESULT: FAIL")
+    sys.exit(0 if ok else 1)

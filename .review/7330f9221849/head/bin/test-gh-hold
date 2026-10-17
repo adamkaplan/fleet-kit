@@ -1,0 +1,585 @@
+#!/usr/bin/env python3
+"""test-gh-hold: offline tests for the gh shim's hold label and write audit (shims/gh_hold.py, shims/gh; ask #376). No network.
+
+    bin/test-gh-hold
+
+The last line printed is `RESULT: PASS` or `RESULT: FAIL`. Every repository, label and agent name here is invented."""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+SHIM = REPO / "shims" / "gh"
+MODULE = REPO / "shims" / "gh_hold.py"
+MATCH = REPO / "shims" / "repo_match.py"
+SAFE_PATH = "/usr/bin:/bin"
+CFG_REPO, LABEL, MESSAGE = "acme-org/widget-api", "acme:hold-proof", "held: the project merges this one itself"
+FAKE_GH = """#!/usr/bin/env python3
+import json, os, sys, time
+a = sys.argv[1:]
+open(os.environ["FAKE_CALLS"], "a").write(json.dumps(a) + "\\n")
+if a[:2] in (["pr", "view"], ["issue", "view"]) and "url,number,labels" in a:
+    if os.environ.get("FAKE_READ_SLEEP"): time.sleep(float(os.environ["FAKE_READ_SLEEP"]))
+    n = os.environ.get("FAKE_READ_FAIL_ONCE")
+    if n and not os.path.exists(n): open(n, "w").write("x"); sys.exit(1)
+    if os.environ.get("FAKE_READ_FAIL"): sys.exit(1)
+    if os.environ.get("FAKE_READ_RAW") is not None: print(os.environ["FAKE_READ_RAW"]); sys.exit(0)
+    labels = [{"name": x} for x in os.environ.get("FAKE_LABELS", "").split(",") if x]
+    print(json.dumps({"url": os.environ.get("FAKE_URL", "https://github.com/acme-org/widget-api/pull/7"), "number": 7, "labels": labels}))
+    sys.exit(0)
+if a[:1] == ["api"] and len(a) == 2 and a[1].startswith("repos/") and "/issues/" in a[1]:
+    if os.environ.get("FAKE_READ_FAIL"): sys.exit(1)
+    labels = [{"name": x} for x in os.environ.get("FAKE_LABELS", "").split(",") if x]
+    d = {"number": 7, "labels": labels}
+    if not os.environ.get("FAKE_ISSUE"): d["pull_request"] = {"url": "x"}
+    print(json.dumps(d)); sys.exit(0)
+if a[:2] == ["alias", "list"]:
+    print(os.environ.get("FAKE_ALIASES", "")); sys.exit(0)
+if a[:2] == ["repo", "view"]:
+    print(os.environ.get("FAKE_REPO", "")); sys.exit(0 if os.environ.get("FAKE_REPO") else 1)
+print("real gh out"); sys.exit(7)
+"""
+READ_CALLS = (["pr", "view"], ["issue", "view"], ["alias", "list"], ["repo", "view"])   # a pr view of `reviews,headRefOid` is the shim's own older merge check
+
+
+def is_label_read(call):
+    return ("url,number,labels" in call) or (call[:1] == ["api"] and len(call) == 2 and "/issues/" in call[1] and call[1].startswith("repos/"))
+
+
+def is_read(call):
+    return call[:2] in READ_CALLS or (call[:1] == ["api"] and len(call) == 2 and "/issues/" in call[1] and call[1].startswith("repos/"))
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp(prefix="gh-hold-"))
+        self.addCleanup(shutil.rmtree, str(self.home), True)
+        self.bin = self.home / "realbin"
+        self.bin.mkdir()
+        (self.bin / "gh").write_text(FAKE_GH)
+        (self.bin / "gh").chmod(0o755)
+        self.sb = self.home / "fakesb"
+        self.sb.write_text("#!/bin/sh\nif [ \"$1\" = whoami ]; then\n  if [ \"$2\" = --json ]; then echo \"{\\\"name\\\": \\\"${FAKE_NAME:-worker}\\\", \\\"repo\\\": \\\"acme/app\\\"}\"; "
+                           "else echo ${FAKE_NAME:-worker}; fi; exit 0; fi\nexit 2\n")
+        self.sb.chmod(0o755)
+        self.state = self.home / "state"
+        self.state.mkdir()
+        self.calls = self.home / "calls.log"
+        self.audit_dir = self.home / "state-audit"
+        self.config({CFG_REPO: {"label": LABEL, "message": MESSAGE, "allowed_removers": ["coordinator"]}})
+
+    def config(self, holds, raw=None):
+        path = self.home / ".config" / "fleet-switchboard" / "config.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(raw if raw is not None else json.dumps({"hold_labels": holds} if holds is not None else {}))
+
+    def run_gh(self, *args, env=None, labels=LABEL, shim=SHIM):
+        environ = {"PATH": "%s:%s:%s" % (SHIM.parent, self.bin, SAFE_PATH), "HOME": str(self.home), "FLEET_SWITCHBOARD_STATE": str(self.state),
+                   "FLEET_SWITCHBOARD_BIN": str(self.sb), "FLEET_SHIM_LOOKUP_SECONDS": "10", "FAKE_CALLS": str(self.calls), "FAKE_LABELS": labels,
+                   "FLEET_REAL_GH": str(self.bin / "gh")}
+        environ.update(env or {})
+        if self.calls.exists():
+            self.calls.unlink()
+        done = subprocess.run([sys.executable, str(shim), *args], capture_output=True, text=True, env=environ, timeout=60)
+        return done, self.recorded()
+
+    def recorded(self):
+        return [json.loads(l) for l in self.calls.read_text().splitlines()] if self.calls.exists() else []
+
+    def writes(self):
+        return [c for c in self.recorded() if not is_read(c)]
+
+    def reads(self):
+        return [c for c in self.recorded() if is_label_read(c)]
+
+    def refused(self, *args, **kw):
+        done, calls = self.run_gh(*args, **kw)
+        self.assertEqual(done.returncode, 1, (args, done.stderr))
+        self.assertEqual([c for c in calls if not is_read(c)], [], args)
+        return done
+
+    def passed(self, *args, **kw):
+        done, calls = self.run_gh(*args, **kw)
+        self.assertEqual(done.returncode, 7, (args, done.stderr))
+        self.assertNotIn("held", done.stderr)
+        self.assertEqual(len(self.writes()), 1, args)
+        return done
+
+    def audit(self):
+        path = self.audit_dir / "gh-writes.jsonl"
+        return [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
+
+
+class TestRefusals(Base):
+    def test_s1_merge_is_refused_with_the_configured_message_once(self):
+        done = self.refused("pr", "merge", "7", "-R", CFG_REPO)
+        self.assertEqual(done.stderr.count(MESSAGE), 1)
+        self.assertEqual(self.writes(), [])
+
+    def test_s2_the_five_other_verbs_are_refused(self):
+        for cmd in (["pr", "merge", "7", "--auto"], ["pr", "merge", "7", "--disable-auto"], ["pr", "review", "7", "--approve"], ["pr", "close", "7"],
+                    ["pr", "edit", "7", "--base", "release"]):
+            with self.subTest(cmd=cmd):
+                done = self.refused(*cmd, "-R", CFG_REPO)
+                self.assertIn(MESSAGE, done.stderr)
+
+    def test_s3_nothing_else_changes(self):
+        self.passed("pr", "merge", "7", "-R", CFG_REPO, labels="bug")                  # unlabelled
+        self.passed("pr", "merge", "7", "-R", "acme-org/other-repo")                   # another repository
+        for read in (["pr", "view", "7"], ["pr", "checks", "7"], ["pr", "list"]):
+            with self.subTest(read=read):
+                done, calls = self.run_gh(*read, "-R", CFG_REPO)
+                self.assertEqual((done.returncode, len(calls)), (7, 1))
+                self.assertNotIn("held", done.stderr)
+        for other in (["pr", "comment", "7", "-b", "x"], ["pr", "edit", "7", "--title", "t"], ["pr", "review", "7", "--comment", "-b", "x"],
+                      ["pr", "review", "7", "--request-changes", "-b", "x"], ["issue", "comment", "7", "-b", "x"], ["pr", "edit", "7", "--add-label", LABEL]):
+            with self.subTest(other=other):
+                self.passed(*other, "-R", CFG_REPO)
+
+    def test_s4_only_a_named_agent_removes_the_label(self):
+        for removal in (["pr", "edit", "7", "--remove-label", LABEL], ["pr", "edit", "7", "--remove-label=" + LABEL], ["pr", "edit", "7", "--remove-label", "bug," + LABEL.upper()],
+                        ["issue", "edit", "7", "--remove-label", LABEL], ["label", "delete", LABEL, "--yes"], ["label", "edit", LABEL, "--name", "x"]):
+            with self.subTest(removal=removal):
+                self.refused(*removal, "-R", CFG_REPO)
+                self.assertEqual(self.reads(), [])
+                self.passed(*removal, "-R", CFG_REPO, env={"FAKE_NAME": "coordinator"})
+        self.passed("pr", "edit", "7", "--remove-label", "bug", "-R", CFG_REPO)
+        self.refused("api", "-X", "DELETE", "repos/%s/issues/7/labels/%s" % (CFG_REPO, LABEL))
+        self.passed("api", "-X", "DELETE", "repos/%s/issues/7/labels/%s" % (CFG_REPO, LABEL), env={"FAKE_NAME": "coordinator"})
+        self.refused("api", "-X", "PUT", "repos/%s/issues/7/labels" % CFG_REPO, "-f", "labels[]=bug")
+        self.refused("api", "-X", "PATCH", "repos/%s/issues/7" % CFG_REPO, "-f", "labels[]=bug")
+        self.passed("api", "-X", "PATCH", "repos/%s/issues/7" % CFG_REPO, "-f", "labels[]=bug", labels="bug")   # an unlabelled pull request: nothing held
+
+    def test_s5_a_failed_read_refuses_with_the_retry_message(self):
+        for env in ({"FAKE_READ_FAIL": "1"}, {"FAKE_READ_RAW": "not json"}, {"FAKE_READ_RAW": "{}"}, {"FAKE_READ_RAW": "[]"},
+                    {"FAKE_READ_RAW": json.dumps({"url": "https://github.com/acme-org/widget-api/pull/7", "number": 7, "labels": "x"})},
+                    {"FAKE_READ_RAW": json.dumps({"url": "nonsense", "number": 7, "labels": []})}):
+            with self.subTest(env=env):
+                done = self.refused("pr", "merge", "7", "-R", CFG_REPO, env=env)
+                self.assertIn("retry", done.stderr)
+        done = self.refused("api", "-X", "PUT", "repos/%s/pulls/7/merge" % CFG_REPO, env={"FAKE_READ_FAIL": "1"})
+        self.assertIn("retry", done.stderr)
+
+    def test_s10_a_timeout_refuses_and_a_retry_works(self):
+        done = self.refused("pr", "merge", "7", "-R", CFG_REPO, env={"FAKE_READ_SLEEP": "30", "FLEET_SHIM_HOLD_SECONDS": "0.5"})
+        self.assertIn("retry", done.stderr)
+        once = str(self.home / "once")
+        done = self.refused("pr", "merge", "7", "-R", CFG_REPO, env={"FAKE_READ_FAIL_ONCE": once})
+        self.assertIn("retry", done.stderr)
+        done = self.refused("pr", "merge", "7", "-R", CFG_REPO, env={"FAKE_READ_FAIL_ONCE": once})   # the second read answers: the label is read and acted on
+        self.assertIn(MESSAGE, done.stderr)
+        self.passed("pr", "merge", "7", "-R", CFG_REPO, labels="bug", env={"FAKE_READ_FAIL_ONCE": once})
+
+    def test_s6_a_repository_without_a_hold_makes_no_read(self):
+        for cmd in (["pr", "merge", "7"], ["pr", "close", "7"], ["pr", "review", "7", "--approve"], ["pr", "edit", "7", "--base", "x"]):
+            with self.subTest(cmd=cmd):
+                self.passed(*cmd, "-R", "acme-org/other-repo")
+                self.assertEqual(self.reads(), [])
+        self.passed("api", "-X", "PUT", "repos/acme-org/other-repo/pulls/7/merge")
+        self.assertEqual(self.reads(), [])
+        self.config(None)                                                  # no hold configured at all: nothing is read for any repository
+        self.passed("pr", "merge", "7", "-R", CFG_REPO)
+        self.assertEqual(self.reads(), [])
+        self.config({}, raw="{}")
+        self.passed("pr", "merge", "https://github.com/acme-org/widget-api/pull/7")
+        self.assertEqual(self.reads(), [])
+
+    def test_s7_admin_and_auto_flags_do_not_bypass(self):
+        for flags in (["--admin"], ["--auto"], ["--admin", "--squash", "--delete-branch"], ["-sd", "--admin"], ["--disable-auto"]):
+            with self.subTest(flags=flags):
+                self.refused("pr", "merge", "7", *flags, "-R", CFG_REPO)
+
+
+class TestHostileInput(Base):
+    def test_repository_spellings(self):
+        for repo in ("ACME-ORG/Widget-API", "acme-org/widget-api.git", " acme-org/widget-api ", "github.com/acme-org/widget-api", "Acme-Org/WIDGET-api.git"):
+            with self.subTest(repo=repo):
+                self.refused("pr", "merge", "7", "-R", repo)
+                self.refused("pr", "merge", "7", "--repo=" + repo)
+                self.refused("pr", "merge", "7", "-R" + repo)
+        self.refused("pr", "-R", CFG_REPO, "merge", "7")
+        self.refused("pr", "merge", "7", env={"GH_REPO": "ACME-ORG/widget-api"})
+
+    def test_unusual_other_repository_spellings_are_looked_up_not_trusted(self):
+        self.refused("pr", "merge", "7", "-R", "acme-org/widget-api?x")                   # not an owner/repo: the real gh answers which PR it is
+        self.assertEqual(len(self.reads()), 1)
+
+    def test_a_target_by_url_branch_or_nothing(self):
+        self.refused("pr", "merge", "https://github.com/acme-org/widget-api/pull/7")
+        self.refused("pr", "merge", "HTTPS://GITHUB.COM/ACME-ORG/Widget-Api/pull/7/files")
+        self.refused("pr", "merge", "feature-branch", env={"FAKE_URL": "https://github.com/acme-org/widget-api/pull/9"})
+        self.refused("pr", "merge")                                                          # the current branch
+        self.refused("pr", "merge", "someone:feature", "-R", CFG_REPO)
+        self.passed("pr", "merge", "feature-branch", env={"FAKE_URL": "https://github.com/acme-org/other-repo/pull/9"})   # resolved elsewhere
+        self.passed("pr", "merge", "feature-branch", labels="bug")
+
+    def test_arguments_after_flags_and_clusters(self):
+        for cmd in (["pr", "merge", "--squash", "7", "-R", CFG_REPO], ["pr", "merge", "-R", CFG_REPO, "-sd", "7"], ["pr", "merge", "-b", "text -a", "7", "-R", CFG_REPO],
+                    ["pr", "review", "-a", "7", "-R", CFG_REPO], ["pr", "review", "-bText", "-a", "7", "-R", CFG_REPO], ["pr", "review", "7", "-R", CFG_REPO, "--approve=true"],
+                    ["pr", "edit", "-B", "x", "7", "-R", CFG_REPO], ["pr", "edit", "7", "-Bx", "-R", CFG_REPO], ["pr", "edit", "7", "--base=x", "-R", CFG_REPO],
+                    ["pr", "close", "-c", "bye", "7", "-R", CFG_REPO], ["pr", "close", "7", "-R", CFG_REPO, "--", "-x"]):
+            with self.subTest(cmd=cmd):
+                self.refused(*cmd)
+        self.passed("pr", "review", "7", "-R", CFG_REPO, "--approve=false")
+        self.passed("pr", "review", "7", "-R", CFG_REPO, "-b", "an approve in the text -a --approve")
+        self.refused("pr", "merge", "7", "--surprise-flag", "x", "-R", CFG_REPO)           # an unknown flag may swallow a word: refused, not guessed
+        self.assertEqual(self.reads(), [])
+
+    def test_label_names_by_case_and_unicode(self):
+        for label in (LABEL.upper(), "  " + LABEL + "  ", "ａｃｍｅ：ｈｏｌｄ－ｐｒｏｏｆ"):
+            with self.subTest(label=label):
+                self.refused("pr", "merge", "7", "-R", CFG_REPO, labels=label)
+        self.passed("pr", "merge", "7", "-R", CFG_REPO, labels="acme:hold-proof-2,other")
+        self.refused("pr", "edit", "7", "--remove-label", "ACME:HOLD-PROOF", "-R", CFG_REPO)
+        self.refused("pr", "edit", "7", "--remove-label", "ａｃｍｅ：ｈｏｌｄ－ｐｒｏｏｆ", "-R", CFG_REPO)
+
+    def test_api_path_variants(self):
+        base = "repos/%s" % CFG_REPO
+        merge = [["api", "-X", "PUT", p] for p in (base + "/pulls/7/merge", "/" + base + "/pulls/7/merge", base + "//pulls/7/merge", base + "/pulls/7/merge?x=1",
+                                                     "REPOS/ACME-ORG/Widget-API/pulls/7/merge", base + "/pulls/7/merge/", base + "/./pulls/7/merge",
+                                                     base + "/pulls/8/../7/merge", base + "/pulls/7/%6derge", "repos/acme-org/widget-api.git/pulls/7/merge",
+                                                     "https://api.github.com/" + base + "/pulls/7/merge", base + "\\pulls\\7\\merge")]
+        for cmd in merge:
+            with self.subTest(cmd=cmd):
+                self.refused(*cmd)
+        for cmd in (["api", "--method", "PUT", base + "/pulls/7/merge"], ["api", "--method=PUT", base + "/pulls/7/merge"], ["api", "-XPUT", base + "/pulls/7/merge"],
+                    ["api", base + "/pulls/7/merge", "-X", "PUT"], ["api", "-H", "Accept: x", base + "/pulls/7/merge", "-f", "merge_method=squash"],
+                    ["api", "-X", "PATCH", base + "/pulls/7", "-f", "state=closed"], ["api", "-X", "PATCH", base + "/pulls/7", "-f", "base=main"],
+                    ["api", "-X", "PATCH", base + "/pulls/7", "--input", "-"], ["api", "-X", "PATCH", base + "/issues/7", "-f", "state=closed"],
+                    ["api", "-X", "POST", base + "/pulls/7/reviews", "-f", "event=APPROVE"], ["api", "-X", "POST", base + "/pulls/7/reviews/3/events", "-f", "event=approve"],
+                    ["api", "-X", "POST", "repos/{owner}/{repo}/pulls/7/merge", "--input", "x"]):
+            with self.subTest(cmd=cmd):
+                self.refused(*cmd, env={"GH_REPO": CFG_REPO, "FAKE_REPO": CFG_REPO})
+        for cmd in (["api", "-iXPUT", base + "/pulls/7/merge"], ["api", "-i", "-XPUT", base + "/pulls/7/merge"], ["api", "-ifstate=closed", "-X", "PATCH", base + "/pulls/7"],
+                    ["api", "-i", "--silent", "-X", "PUT", base + "/pulls/7/merge"]):
+            with self.subTest(cmd=cmd):
+                self.refused(*cmd)
+        self.passed("api", "-X", "PATCH", base + "/pulls/7", "-f", "title=new")
+        self.passed("api", "-X", "POST", base + "/pulls/7/reviews", "-f", "event=COMMENT")
+        self.passed("api", "-X", "POST", base + "/issues/7/comments", "-f", "body=hello")
+        self.passed("api", "-X", "PATCH", base + "/issues/7", "-f", "state=closed", env={"FAKE_ISSUE": "1"})     # a plain issue, not a pull request
+        self.passed("api", "-X", "PUT", base + "/pulls/7/merge", labels="bug")
+        done, calls = self.run_gh("api", base + "/pulls/7/merge")                         # a read (GET)
+        self.assertEqual(len(calls), 1)
+        self.refused("api", "-X", "PUT", "repositories/123/pulls/7/merge")                  # a repository id cannot be named: refused
+
+    def test_graphql_mutations_cannot_be_tied_to_a_pull_request(self):
+        for query in ("mutation { mergePullRequest(input:{pullRequestId:\"x\"}) { clientMutationId } }", "mutation { enablePullRequestAutoMerge(input:{}) {x} }",
+                      "mutation { a: closePullRequest(input:{}) {x} }", "MUTATION { ADDPULLREQUESTREVIEW(input:{}) {x} }"):
+            with self.subTest(query=query):
+                self.refused("api", "graphql", "-f", "query=" + query)
+        qfile = self.home / "q.graphql"
+        qfile.write_text("mutation { disablePullRequestAutoMerge(input:{}) {x} }")
+        self.refused("api", "graphql", "-F", "query=@" + str(qfile))
+        self.refused("api", "graphql", "-F", "query=@" + str(self.home / "missing"))
+        self.refused("api", "graphql", "--input", str(qfile))
+        self.passed("api", "graphql", "-f", "query=query { viewer { login } }")
+        self.refused("api", "graphql", "-f", "query=mutation { enqueuePullRequest(input:{}) {x} }")
+        self.refused("api", "graphql", "-f", "query=mutation { addComment(input:{}) {x} }")        # every mutation: none can be tied to a repository
+
+    def test_help_with_a_value_and_hidden_graphql_forms_do_not_bypass(self):
+        self.refused("pr", "merge", "7", "--help=false", "-R", CFG_REPO)
+        self.refused("pr", "merge", "7", "-hx", "-R", CFG_REPO)
+        done, calls = self.run_gh("pr", "merge", "--help")
+        self.assertEqual(done.returncode, 7)
+        escaped = self.home / "q.json"
+        escaped.write_text(json.dumps({"query": "mutation { x }"}).replace("mutation", "\\u006dutation"))
+        self.refused("api", "graphql", "--input", str(escaped))
+        padded = self.home / "big.graphql"
+        padded.write_text("#" * 300000 + "\nmutation { x }")
+        self.refused("api", "graphql", "-F", "query=@" + str(padded))
+
+    def test_a_bad_config_refuses_api_writes_in_any_flag_form(self):
+        self.config(None, raw="{not json")
+        self.refused("api", "-iXPUT", "repos/%s/pulls/7/merge" % CFG_REPO)
+        done, _ = self.run_gh("api", "repos/%s/pulls/7" % CFG_REPO)
+        self.assertEqual(done.returncode, 7)
+
+    def test_aliases_are_refused_and_other_words_pass(self):
+        self.refused("shipit", "7", env={"FAKE_ALIASES": "shipit:\tpr merge"})
+        self.refused("mm", "view", env={"FAKE_ALIASES": "mm\tpr merge $1"})            # no colon, and a second word that looks like a read
+        self.refused("mm", "list", env={"FAKE_ALIASES": "mm:\tpr merge $1"})
+        self.passed("shipit", "7", env={"FAKE_ALIASES": "other:\tpr view"})
+        done, _ = self.run_gh("workflow", "run", "x.yml")
+        self.assertEqual(done.returncode, 7)
+
+    def test_a_broken_configuration_refuses_guarded_writes_only(self):
+        for raw in ("{not json", json.dumps({"hold_labels": []}), json.dumps({"hold_labels": {"nonsense": {"label": "x"}}}),
+                    json.dumps({"hold_labels": {CFG_REPO: {"message": "m"}}}), json.dumps({"hold_labels": {CFG_REPO: {"label": "x", "allowed_removers": "me"}}})):
+            with self.subTest(raw=raw):
+                self.config(None, raw=raw)
+                self.refused("pr", "merge", "7", "-R", CFG_REPO)
+                done, calls = self.run_gh("pr", "view", "7", "-R", CFG_REPO)
+                self.assertEqual(done.returncode, 7)
+
+    def test_a_missing_module_refuses_while_a_hold_is_named(self):
+        copy = self.home / "shimcopy"
+        copy.mkdir()
+        shutil.copy(str(SHIM), str(copy / "gh"))
+        done, _ = self.run_gh("pr", "merge", "7", "-R", CFG_REPO, shim=copy / "gh")
+        self.assertEqual(done.returncode, 1)
+        self.config(None)
+        done, _ = self.run_gh("pr", "merge", "7", "-R", CFG_REPO, shim=copy / "gh")
+        self.assertEqual(done.returncode, 7)
+
+
+class TestAudit(Base):
+    def test_s11_every_write_is_audited_and_the_refused_one_is_marked(self):
+        self.passed("pr", "merge", "7", "-R", "acme-org/other-repo")
+        self.passed("pr", "comment", "8", "-R", "acme-org/other-repo", "-b", "hello")
+        self.passed("pr", "edit", "9", "-R", "acme-org/other-repo", "--title", "t")
+        self.passed("pr", "close", "10", "-R", "acme-org/other-repo")
+        self.passed("issue", "create", "-R", "acme-org/other-repo", "-t", "t", "-b", "b")
+        self.refused("pr", "merge", "7", "-R", CFG_REPO)
+        rows = self.audit()
+        self.assertEqual(len(rows), 6)
+        self.assertEqual([(r["verb"], r["repo"], r["number"], r["caller"], r["outcome"]) for r in rows],
+                         [("pr merge", "acme-org/other-repo", 7, "worker", "passed"), ("pr comment", "acme-org/other-repo", 8, "worker", "passed"),
+                          ("pr edit", "acme-org/other-repo", 9, "worker", "passed"), ("pr close", "acme-org/other-repo", 10, "worker", "passed"),
+                          ("issue create", "acme-org/other-repo", None, "worker", "passed"), ("pr merge", CFG_REPO, 7, "worker", "refused")])
+        self.assertEqual(len([r for r in rows if r["outcome"] == "refused"]), 1)
+
+    def test_reads_are_not_audited_and_api_writes_name_the_endpoint_class(self):
+        self.run_gh("pr", "view", "7", "-R", CFG_REPO)
+        self.assertEqual(self.audit(), [])
+        self.run_gh("api", "-X", "PUT", "repos/acme-org/other-repo/pulls/12/merge")
+        self.assertEqual([(r["verb"], r["repo"], r["number"]) for r in self.audit()], [("api PUT", "acme-org/other-repo", 12)])
+
+    def test_the_log_is_rotated_at_one_mebibyte(self):
+        self.audit_dir.mkdir(exist_ok=True)
+        (self.audit_dir / "gh-writes.jsonl").write_text("x" * 1048576)
+        self.passed("pr", "comment", "3", "-R", "acme-org/other-repo", "-b", "hi")
+        self.assertEqual(len((self.audit_dir / "gh-writes.jsonl.1").read_text()), 1048576)
+        self.assertEqual(len(self.audit()), 1)
+
+    def test_skips_and_other_refusals(self):
+        self.passed("pr", "comment", "3", "-R", "acme-org/other-repo", "-b", "hi", env={"FLEET_SWITCHBOARD_OWN_GH": "1"})
+        self.assertEqual(self.audit(), [])                                                     # the switchboard's own call is not audited
+        self.run_gh("auth", "git-credential", "get")
+        self.assertEqual(self.audit(), [])                                                     # nor a git credential call
+        self.config({"acme-org/widget-api": {"label": LABEL, "message": MESSAGE}})
+        self.refused("pr", "merge", "7", "--surprise-flag", "x", "-R", CFG_REPO)               # a refusal other than the label one
+        self.assertEqual([r["outcome"] for r in self.audit()], ["refused"])
+
+    def test_s12_no_command_line_value_is_audited_and_an_unwritable_audit_changes_nothing(self):
+        token, text = "ghp_" + "a1b2c3d4e5f6" * 3, "free text that must stay out"
+        self.run_gh("api", "-X", "POST", "repos/acme-org/other-repo/issues/3/comments", "-f", "body=%s %s" % (token, text), "-H", "Authorization: token " + token,
+                    env={"GH_TOKEN": token})
+        self.run_gh("pr", "comment", "3", "-R", "acme-org/other-repo", "-b", "%s %s" % (token, text))
+        raw = (self.audit_dir / "gh-writes.jsonl").read_text()
+        for leak in (token, text, "Authorization"):
+            self.assertNotIn(leak, raw)
+        for row in map(json.loads, raw.splitlines()):
+            self.assertEqual(sorted(row), ["caller", "number", "outcome", "repo", "ts", "verb"])
+        (self.audit_dir / "gh-writes.jsonl").unlink()
+        (self.audit_dir / "gh-writes.jsonl").mkdir()                                              # the audit cannot be opened
+        done, _ = self.run_gh("pr", "merge", "7", "-R", "acme-org/other-repo")
+        self.assertEqual(done.returncode, 7)
+        done, _ = self.run_gh("pr", "merge", "7", "-R", CFG_REPO)
+        self.assertEqual(done.returncode, 1)
+
+
+def load_by_path(name, path):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(name, str(path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+GUARD = []
+
+
+def guard():
+    """The launch guard's own matcher (bin/fleet-switchboard, unchanged), for the parity checks."""
+    if not GUARD:
+        import importlib.machinery, importlib.util
+        loader = importlib.machinery.SourceFileLoader("sb_match", str(REPO / "bin" / "fleet-switchboard"))
+        spec = importlib.util.spec_from_loader("sb_match", loader)
+        sb = importlib.util.module_from_spec(spec)
+        sys.modules["sb_match"] = sb
+        loader.exec_module(sb)
+        GUARD.append(sb.GhAccounts)
+    return GUARD[0]
+
+
+SPELLINGS = ["acme-org/widget-api", " Acme-Org/Widget-API.git ", "ACME-ORG/WIDGET-API", "acme-org/widget-api.git", "\tacme-org/Widget-Api/\n", "acme-org/widget-api.GIT/"]
+HOSTILE = ["", "   ", "\n", "acme-org/", "/widget-api", "acme-org", "acme-org/../x", "../acme-org/x", "acme-org/./x", "acme-org/widget-api/extra",
+           "acme-org/widget-api.git.git", "acme-org/.git", "acme\u2011org/widget-api", "ACME-ORG/widget-api\u212a", "\uff41cme-org/widget-api",
+           "https://github.com/acme-org/widget-api", "acme-org/widget api", None, 5, ["acme-org/widget-api"]]
+
+
+REPO_SHAPE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+class TestSharedMatcher(unittest.TestCase):
+    """#479: the shims match a repository the way the launch guard does, through one module."""
+    USERS = {"acme-org/widget-api": "acme-bot", "other-org/*": "other-bot"}
+
+    def setUp(self):
+        self.m = load_by_path("repo_match_t", MATCH)
+
+    def test_s1_every_spelling_of_a_mapped_repository_resolves_the_same_account(self):
+        for text in SPELLINGS:
+            with self.subTest(text=text):
+                self.assertEqual(self.m.account_for(self.USERS, text), "acme-bot")
+
+    def test_s1_a_differently_spelled_key_in_the_map_matches_too(self):
+        self.assertEqual(self.m.account_for({" Acme-Org/Widget-API.git ": "acme-bot"}, "acme-org/widget-api"), "acme-bot")
+
+    def test_u1_an_exact_spelling_resolves_as_before_and_an_exact_entry_beats_the_wildcard(self):
+        self.assertEqual(self.m.account_for(self.USERS, "acme-org/widget-api"), "acme-bot")
+        users = {"acme-org/*": "wild-bot", "acme-org/widget-api": "acme-bot"}
+        self.assertEqual(self.m.account_for(users, "acme-org/widget-api"), "acme-bot")
+        self.assertEqual(self.m.account_for(users, "acme-org/other"), "wild-bot")
+        self.assertIsNone(self.m.account_for(self.USERS, "acme-org/unmapped"))
+
+    def test_s2_a_wildcard_matches_any_case_and_only_its_owner(self):
+        users = {"Acme-Org/*": "acme-bot"}
+        for text in ("acme-org/other-repo", "ACME-ORG/Other-Repo", " acme-org/other-repo.git "):
+            with self.subTest(text=text):
+                self.assertEqual(self.m.account_for(users, text), "acme-bot")
+        for text in ("acme-org2/other-repo", "xacme-org/other-repo"):
+            with self.subTest(text=text):
+                self.assertIsNone(self.m.account_for(users, text))
+
+    def test_s3_hostile_inputs_match_nothing_even_with_a_wildcard_entry(self):
+        users = dict(self.USERS, **{"acme-org/*": "wild-bot"})
+        for text in HOSTILE:
+            with self.subTest(text=text):
+                self.assertIsNone(self.m.normal_repo(text))
+                self.assertIsNone(self.m.account_for(users, text))
+
+    def test_a_conflicting_or_unreadable_map_matches_nothing_and_never_raises(self):
+        self.assertIsNone(self.m.account_for({"acme-org/widget-api": "a", "ACME-ORG/widget-api.git": "b"}, "acme-org/widget-api"))
+        self.assertEqual(self.m.account_for({"acme-org/widget-api": "a", "ACME-ORG/widget-api.git": "a"}, "acme-org/widget-api"), "a")
+        for users in (None, [], "x", {}, {"": "a", None: "b", "acme-org/widget-api": ""}, {"acme-org/widget-api": None}):
+            with self.subTest(users=users):
+                self.assertIsNone(self.m.account_for(users, "acme-org/widget-api"))
+
+    def test_parity_with_the_launch_guard_on_every_spelling_it_accepts(self):
+        users = dict(self.USERS, **{"Acme-Org/*": "wild-bot"})
+        accounts = guard()({"gh_users": users})
+        for text in SPELLINGS + ["acme-org/other-repo", "OTHER-ORG/x.git", "nobody/x"]:
+            with self.subTest(text=text):
+                self.assertEqual(self.m.account_for(users, text), accounts.account_for(text))
+        for text in HOSTILE:        # where the guard would still match (the path-like owner/../x reaches the wildcard) the shim is only stricter
+            with self.subTest(hostile=text):
+                self.assertIsNone(self.m.account_for(users, text))
+
+    def test_the_guard_is_untouched_by_this_change_and_the_shim_does_not_import_it(self):
+        self.assertNotIn("repo_match", (REPO / "bin" / "fleet-switchboard").read_text())
+
+    def test_s4_the_docs_no_longer_say_the_matching_is_the_same_for_every_caller(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        self.assertEqual(text.count("same for every caller"), 0)
+        self.assertEqual(text.count("shims/repo_match.py"), 1)
+
+
+class TestShimsUseIt(Base):
+    """The gh shim in a subprocess with a fake gh that logs the token it ran with; git reaches it as `gh auth git-credential`."""
+    def setUp(self):
+        super().setUp()
+        self.token_gh = self.home / "tokbin"
+        self.token_gh.mkdir()
+        (self.token_gh / "gh").write_text("#!/usr/bin/env python3\nimport os, sys\n"
+                                          "if sys.argv[1:3] == ['auth', 'token']:\n    print('tok-' + sys.argv[4]); sys.exit(0)\n"
+                                          "print('TOKEN=' + os.environ.get('GH_TOKEN', '')); sys.exit(0)\n")
+        (self.token_gh / "gh").chmod(0o755)
+
+    def credential(self, repo, users, own=True, args=("auth", "git-credential", "get")):
+        self.config(None, json.dumps({"gh_users": users}))
+        self.sb.write_text("#!/bin/sh\nif [ \"$1\" = whoami ] && [ \"$2\" = --json ]; then echo '%s'; exit 0; fi\n[ \"$1\" = whoami ] && echo worker && exit 0\nexit 2\n"
+                           % json.dumps({"name": "worker", "repo": repo, "own": own}))
+        environ = {"PATH": "%s:%s:%s" % (SHIM.parent, self.token_gh, SAFE_PATH), "HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / ".config"),
+                   "FLEET_SWITCHBOARD_STATE": str(self.state), "FLEET_SWITCHBOARD_BIN": str(self.sb), "FLEET_SHIM_LOOKUP_SECONDS": "10",
+                   "FLEET_REAL_GH": str(self.token_gh / "gh"), "GH_TOKEN": "inherited"}
+        return subprocess.run([sys.executable, str(SHIM), *args], capture_output=True, text=True, env=environ, timeout=60)
+
+    def test_s1_s2_u1_each_spelling_gets_the_mapped_account_token_by_exact_and_wildcard_entry(self):
+        for users in ({"acme-org/widget-api": "acme-bot"}, {"acme-org/*": "acme-bot"}):
+            for text in [t for t in SPELLINGS if REPO_SHAPE.match(t)]:   # whoami only hands the shim a repo of this shape; the others are proven on the module
+                with self.subTest(users=users, text=text):
+                    done = self.credential(text, users)
+                    self.assertEqual((done.returncode, done.stdout.strip()), (0, "TOKEN=tok-acme-bot"), done.stderr)
+
+    def test_s3_hostile_repositories_are_refused_with_exit_one_and_the_real_gh_never_runs(self):
+        users = {"acme-org/*": "acme-bot"}
+        for text in ["", "   ", "acme-org/..", "acme-org/.", "acme\u2011org/widget-api", "ACME-ORG/widget-api\u212a", "acme-org/.git", "acme-org/widget-api.git.git/x"]:
+            with self.subTest(text=text):
+                done = self.credential(text, users)
+                self.assertEqual(done.returncode, 1, done.stderr)
+                self.assertNotIn("TOKEN=", done.stdout)
+                self.assertIn("no GitHub account is mapped", done.stderr)
+
+    def test_a_shim_without_its_matcher_refuses_a_credential_and_a_write_and_never_runs_gh(self):
+        lone = self.home / "lone"
+        lone.mkdir()
+        shutil.copy(str(SHIM), str(lone / "gh"))                   # the shim alone: repo_match.py is not beside it
+        for args in (("auth", "git-credential", "get"), ("issue", "comment", "7", "--body", "x")):
+            with self.subTest(args=args):
+                self.config(None, json.dumps({"gh_users": {"acme-org/*": "acme-bot"}}))
+                self.sb.write_text("#!/bin/sh\nif [ \"$1\" = whoami ] && [ \"$2\" = --json ]; then echo '{\"name\": \"worker\", \"repo\": \"acme-org/widget-api\"}'; exit 0; fi\nexit 2\n")
+                environ = {"PATH": "%s:%s" % (self.token_gh, SAFE_PATH), "HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / ".config"),
+                           "FLEET_SWITCHBOARD_STATE": str(self.state), "FLEET_SWITCHBOARD_BIN": str(self.sb), "FLEET_SHIM_LOOKUP_SECONDS": "10",
+                           "FLEET_REAL_GH": str(self.token_gh / "gh"), "GH_TOKEN": "inherited"}
+                done = subprocess.run([sys.executable, str(lone / "gh"), *args], capture_output=True, text=True, env=environ, timeout=60)
+                self.assertEqual(done.returncode, 1, done.stderr)
+                self.assertNotIn("TOKEN=", done.stdout)
+
+    def test_the_git_shim_has_no_matcher_of_its_own_and_still_routes_credentials_to_the_gh_shim(self):
+        self.assertNotIn("users.get", (REPO / "shims" / "git").read_text())
+        done = self.credential("Acme-Org/Other.git", {"acme-org/*": "acme-bot"}, args=("auth", "git-credential", "get"))
+        self.assertEqual(done.stdout.strip(), "TOKEN=tok-acme-bot")
+
+    def test_an_unmapped_but_readable_repository_is_still_refused_for_a_credential_and_unchanged_for_a_read(self):
+        done = self.credential("acme-org/widget-api", {"other-org/*": "x"})
+        self.assertEqual(done.returncode, 1)
+        done = self.credential("acme-org/widget-api", {"other-org/*": "x"}, args=("issue", "list"))
+        self.assertEqual(done.stdout.strip(), "TOKEN=inherited")
+
+
+class TestHygiene(unittest.TestCase):
+    def test_s8_the_change_names_no_private_thing(self):
+        pattern = re.compile("|".join(["jan" + "us", "sp" + "ire", "adk" + "aplan", "/Us" + "ers/", "direc" + "tor(?!y|ies)"]), re.I)
+        for path in (MODULE, MATCH, Path(__file__)):
+            for number, line in enumerate(path.read_text().splitlines(), 1):
+                self.assertIsNone(pattern.search(line), "%s:%d" % (path.name, number))
+
+    def test_the_switchboard_refuses_a_bad_entry_at_load(self):
+        import importlib.machinery, importlib.util
+        loader = importlib.machinery.SourceFileLoader("sb_hold", str(REPO / "bin" / "fleet-switchboard"))
+        spec = importlib.util.spec_from_loader("sb_hold", loader)
+        sb = importlib.util.module_from_spec(spec)
+        sys.modules["sb_hold"] = sb
+        loader.exec_module(sb)
+        self.assertIn("hold_labels", sb.validate_config({"hold_labels": {CFG_REPO: {"label": LABEL, "message": "m"}}}))
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"hold_labels": {CFG_REPO: {"label": LABEL}}})
+
+    def test_the_config_check_accepts_the_shape_and_names_what_is_wrong(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("gh_hold_t", str(MODULE))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        good = {CFG_REPO: {"label": LABEL, "message": MESSAGE, "allowed_removers": ["coordinator"]}}
+        self.assertEqual(mod.validate_config(good), good)
+        for bad in ([], {"nonsense": {}}, {CFG_REPO: {"label": LABEL}}, {CFG_REPO: {"label": "", "message": "m"}}, {CFG_REPO: {"label": "l", "message": "m", "x": 1}},
+                    {CFG_REPO: {"label": "l", "message": "m", "allowed_removers": ["Bad Name"]}},
+                    {CFG_REPO: {"label": "l", "message": "m"}, CFG_REPO.upper() + ".git": {"label": "l", "message": "m"}}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    mod.validate_config(bad)
+
+
+if __name__ == "__main__":
+    result = unittest.main(exit=False, verbosity=1).result
+    ok = result.wasSuccessful()
+    print("RESULT: PASS" if ok else "RESULT: FAIL")
+    sys.exit(0 if ok else 1)

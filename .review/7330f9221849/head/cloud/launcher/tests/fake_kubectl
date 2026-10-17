@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""A fake kubectl for the offline tests: state is one JSON file (FAKE_KUBE_STATE). Supports only what cloud-worker uses."""
+import fcntl, json, os, subprocess, sys
+HERE = os.path.dirname(os.path.abspath(__file__))
+path = os.environ["FAKE_KUBE_STATE"]
+args = sys.argv[1:]
+if os.environ.get("FAKE_KUBE_CALLS"):
+    with open(os.environ["FAKE_KUBE_CALLS"], "a") as f:
+        f.write(json.dumps(args) + "\n")
+if args[0] == "--kubeconfig":
+    if os.environ.get("FAKE_KUBE_CFGDUMP"):  # what the launcher generated, as kubectl would read it
+        with open(os.environ["FAKE_KUBE_CFGDUMP"], "a") as f:
+            f.write(json.dumps({"path": args[1], "mode": os.stat(args[1]).st_mode & 0o777,
+                                "dirmode": os.stat(os.path.dirname(args[1])).st_mode & 0o777,
+                                "config": open(args[1]).read()}) + "\n")
+    args = args[2:]
+assert args[0] == "--context", "no explicit --context"
+assert args[2] == "-n"
+args = args[4:]
+lock = open(path + ".lock", "w")   # one kubectl at a time reads and writes the state, like one API server
+fcntl.flock(lock, fcntl.LOCK_EX)
+st = json.load(open(path))
+if os.environ.get("FAKE_SCAN_DIR"):  # leak check on every call: no file under the scratch dir may hold a planted value
+    for root, _, names in os.walk(os.environ["FAKE_SCAN_DIR"]):
+        for n in names:
+            try:
+                body = open(os.path.join(root, n), errors="replace").read()
+            except OSError:
+                continue
+            if any(v and v in body for v in os.environ.get("FAKE_SCAN_VALUES", "").split(",")):
+                open(path + ".leaks", "a").write(n + "\n")
+if os.environ.get("FAKE_KUBE_SEEN"):  # what a child could see of its parent: the environment and the parent's command line
+    with open(os.environ["FAKE_KUBE_SEEN"], "a") as f:
+        f.write(json.dumps({"env": {k: v for k, v in os.environ.items() if k not in ("FAKE_SCAN_VALUES", "FAKE_KUBE_ECHO")}, "parent": subprocess.run(["ps", "-o", "command=", "-p", str(os.getppid())], capture_output=True, text=True).stdout}) + "\n")
+if os.environ.get("FAKE_KUBE_HANG") == args[0]:  # a call that never ends: the test signals the caller meanwhile
+    open(os.environ["FAKE_KUBE_HANG_MARK"], "w").write(args[0])
+    fcntl.flock(lock, fcntl.LOCK_UN)
+    import time
+    time.sleep(120)
+if st.get("fail_delete") and args[0] == "delete":
+    print("Error from server (Forbidden): delete denied", file=sys.stderr); sys.exit(1)
+cmd = args[0]
+if st.get("fail_cmd") == ("apply" if cmd == "create" and args[1:2] == ["-f"] else cmd) and not (cmd == "delete" and st.get("fail_cmd_only_run") and not args[2].endswith("-run")):
+    # a failure that ECHOES the planted values on stderr and on stdout (a real server error can quote what it was sent)
+    echo = os.environ.get("FAKE_KUBE_ECHO", "")
+    print(json.dumps({"error": echo, "pushed": False}))
+    print("Error from server (Forbidden): quota says %s" % echo, file=sys.stderr); sys.exit(1)
+def save():  # atomic: a test reading the state meanwhile never sees a half-written file
+    with open(path + ".tmp%d" % os.getpid(), "w") as f:
+        json.dump(st, f)
+    os.replace(path + ".tmp%d" % os.getpid(), path)
+def missing(what):
+    print('Error from server (NotFound): %s not found' % what, file=sys.stderr); sys.exit(1)
+def exists(what):
+    print('Error from server (AlreadyExists): %s already exists' % what, file=sys.stderr); sys.exit(1)
+if cmd == "apply" or (cmd == "create" and args[1:2] == ["-f"]):   # `create -f` is exclusive, like a real cluster; `apply` replaces
+    obj = json.load(sys.stdin)
+    if st.get("fail_apply"):
+        print("Error from server (Forbidden): quota exceeded", file=sys.stderr); sys.exit(1)
+    if cmd == "create":
+        if obj["metadata"]["name"] in st.get("secrets" if obj["kind"] == "Secret" else "pods", {}):
+            exists('%ss "%s"' % (obj["kind"].lower(), obj["metadata"]["name"]))
+    st.setdefault("applied", []).append(obj)
+    if obj["kind"] == "Secret":
+        st.setdefault("secrets", {})[obj["metadata"]["name"]] = 1
+        if "password" in obj.get("stringData", {}):
+            st.setdefault("secret_bodies", {})[obj["metadata"]["name"]] = {"password": obj["stringData"]["password"]}
+        st.setdefault("secret_labels", {})[obj["metadata"]["name"]] = obj["metadata"].get("labels", {})
+    else:
+        obj["status"] = {"phase": "Pending" if st.get("never_ready") else "Running",
+                         "conditions": [] if st.get("never_ready") else [{"type": "Ready", "status": "True"}]}
+        st.setdefault("pods", {})[obj["metadata"]["name"]] = obj
+    save()
+elif cmd == "create" and args[1:3] == ["secret", "generic"]:
+    if st.get("fail_secret"):
+        print("Error from server (Forbidden): secrets is forbidden", file=sys.stderr); sys.exit(1)
+    if args[3] in st.get("secrets", {}):
+        exists('secrets "%s"' % args[3])
+    data = {}
+    for a in args[4:]:  # --from-file=KEY=PATH: PATH must be /dev/stdin (a value is never a file name); keep sizes and keys only
+        key, fpath = a[len("--from-file="):].split("=", 1)
+        assert fpath == "/dev/stdin", "a run secret must come from stdin"
+        body = sys.stdin.read()
+        with open(path + ".stdin", "a") as f:  # stdin of 'create secret' is recorded apart from argv
+            f.write(body + "\n")
+        data[key] = len(body)
+        st.setdefault("secret_bodies", {}).setdefault(args[3], {})[key] = body
+    st.setdefault("secrets", {})[args[3]] = 1
+    st.setdefault("secret_labels", {}).pop(args[3], None)   # a new Secret starts without labels
+    st.setdefault("secret_keys", {})[args[3]] = data
+    save()
+elif cmd == "patch" and args[1] == "secret":
+    assert "--patch-file=/dev/stdin" in args, "a patch must come from stdin"
+    body = sys.stdin.read()
+    with open(path + ".stdin", "a") as f:
+        f.write(body + "\n")
+    import base64
+    for k, v in json.loads(body)["data"].items():
+        st["secret_keys"][args[2]][k] = len(base64.b64decode(v))
+        st.setdefault("secret_bodies", {}).setdefault(args[2], {})[k] = base64.b64decode(v).decode()
+    save()
+elif cmd == "label" and args[1] == "secret":
+    st.setdefault("secret_labels", {})[args[2]] = dict(kv.split("=", 1) for kv in args[3:])
+    save()
+elif cmd == "port-forward":  # become the stub headless server on the local port, so the caller can end us
+    os.execv(sys.executable, [sys.executable, os.path.join(HERE, "..", "..", "worker", "tests", "stub_server.py"), args[2].split(":")[0]])
+elif cmd == "get" and args[1] == "secret":
+    if args[2] not in st.get("secrets", {}): missing('secrets "%s"' % args[2])
+    print(json.dumps({"metadata": {"name": args[2], "labels": st.get("secret_labels", {}).get(args[2], {})}}))
+elif cmd == "get" and args[1] == "pod":
+    if args[2] not in st.get("pods", {}): missing('pods "%s"' % args[2])
+    print(json.dumps(st["pods"][args[2]]))
+elif cmd == "get" and args[1] == "pods":
+    items = list(st.get("pods", {}).values())
+    if "-l" in args:  # honour a label selector `key=value`
+        k, v = args[args.index("-l") + 1].split("=", 1)
+        items = [p for p in items if p["metadata"].get("labels", {}).get(k) == v]
+    print(json.dumps({"items": items}))
+elif cmd == "annotate":
+    pod = st["pods"][args[2]]
+    for kv in args[4:]:
+        k, v = kv.split("=", 1); pod["metadata"]["annotations"][k] = v
+    save()
+elif cmd == "delete":
+    kind, name = args[1], args[2]
+    (st.get("pods" if kind == "pod" else "secrets", {})).pop(name, None)
+    if kind == "secret": st.get("secret_labels", {}).pop(name, None)
+    save()
+elif cmd == "exec":
+    name, tool = args[1], args[3]
+    if tool in ("ls", "cat", "git") and os.environ.get("FAKE_KUBE_EXEC_SLEEP"):   # a slow read: the record's calls only, never the end hook
+        import time
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        time.sleep(float(os.environ["FAKE_KUBE_EXEC_SLEEP"]))
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    if tool == "cw-worker-activity":
+        print(json.dumps(st["activity"][name]))
+    elif tool == "ls":   # /run/cw of the pod: the password and the run secrets, as the mounts name them
+        print("server-password")
+        for k in st.get("secret_bodies", {}).get(name + "-run", {}): print(k)
+    elif tool == "cat":
+        fname = args[4].rsplit("/", 1)[1]
+        bodies = st.get("secret_bodies", {})
+        body = bodies.get(name + "-pw", {}).get("password") if fname == "server-password" else bodies.get(name + "-run", {}).get(fname)
+        if body is None:
+            print("cat: No such file", file=sys.stderr); sys.exit(1)
+        sys.stdout.write(body)
+    elif tool == "sh":   # the report read: the script must refuse a link or a non-regular file, as the real one does
+        script, path = args[5], args[7]
+        fs = st.get("report_fs", {}).get(name)   # {"type": file|symlink|dir, "content": ..., "target": what a followed link reaches}
+        if fs is None and name in st.get("report", {}):
+            fs = {"type": "file", "content": st["report"][name]}
+        if fs is None:
+            print("head: cannot open '%s' for reading: No such file or directory" % path, file=sys.stderr); sys.exit(1)
+        if fs["type"] != "file" and "-L" in script:
+            print("not a regular file", file=sys.stderr); sys.exit(3)
+        sys.stdout.write(fs["content"] if fs["type"] == "file" else fs.get("target", ""))
+    elif tool == "git":
+        if st.get("head_sha"): print(st["head_sha"])
+        else: sys.exit(1)
+    elif tool == "cw-end-hook" and st.get("hook_result"):  # a canned end hook answer
+        print(json.dumps(st["hook_result"]))
+        if st["hook_result"].get("error"): sys.exit(1)
+    elif tool == "cw-end-hook":
+        env = dict(os.environ, **st["hook_env"])
+        p = subprocess.run([sys.executable, os.path.join(HERE, "..", "end_hook.py")], env=env, capture_output=True, text=True)
+        sys.stdout.write(p.stdout)
+        if p.returncode:
+            sys.stdout.write(p.stdout); sys.exit(p.returncode)
+else:
+    sys.exit("fake kubectl: unsupported " + " ".join(args))

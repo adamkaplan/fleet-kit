@@ -1,0 +1,4 @@
+{
+ "command": "waive",
+ "help": "usage: fleet-switchboard waive [-h] --gates GATES --reason REASON [--head HEAD] pr Waive gates G0 to G5 for ONE PR at its CURRENT head, for a hotfix: the chief of staff (or a person at a shell) only, with a reason of at least 20 characters, never G6, G7 or G8 and never by a writer of the PR. A ledger entry and an audit line; it lasts 24 hours (the retroactive plan is due then) and a push needs a new one. `gates` shows the gate as waived, not passed. positional arguments: pr The pull request: owner/repo#N or its URL options: -h, --help show this help message and exit --gates GATES Comma-separated gates: G0a,G0b,G0c,G1,G2/G3,G4,G5 --reason REASON Why (at least 20 characters) --head HEAD The PR head sha (default: read from GitHub)"
+}

@@ -25353,7 +25353,7 @@ def build_parser():
                                        "account (config gh_users) is the agent's GH_TOKEN")
     launch.add_argument("--read-repo", dest="read_repo", metavar="OWNER/NAME",
                         help="ONE extra repository the worker may READ (issue view, pr view, api GET...) as that repository's gh_users account; every write "
-                             "there and every read of any other repository is refused by the gh and git shims. Exact lower-case owner/name. A shim guard, not a GitHub guard")
+                             "there, every command that names another repository and `gh search|gist|status|...` are refused by the gh and git shims. Exact lower-case owner/name. A shim guard, not a GitHub guard")
     launch.add_argument("--new-workspace", dest="new_workspace", metavar="LABEL",
                         help="Create a herdr workspace with this label in --dir (never focused), and launch "
                              "into it. A --charter whose `workspace:` line differs is refused")

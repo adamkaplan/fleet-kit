@@ -314,6 +314,9 @@ def load_matcher():
 API_VALUE_FLAGS = {"-H", "--header", "-X", "--method", "-q", "--jq", "-t", "--template", "-f", "-F", "--field", "--raw-field", "--input", "--hostname", "--cache", "-R", "--repo"}
 
 
+UNNAMED_REPO_GROUPS = {"search", "gist", "status", "browse", "attestation", "extension", "ext", "alias", "org", "project", "codespace", "ssh-key", "gpg-key"}
+
+
 def named_repos(args):
     """(set of the repository spellings a gh command NAMES, True when something it names cannot be read). Read from the real `-R`/`--repo` flag, from a
     GitHub URL given as an argument, from a `gh api` path (`repos/OWNER/NAME/...`) and from the argument of `gh repo ...`; never from the value of another
@@ -372,6 +375,8 @@ def read_scope(args, lookup, write):
             return None
         extra = ident["read_repo"]
         words = command_words(args)
+        if words and words[0] in UNNAMED_REPO_GROUPS:
+            return ("refuse", "gh: refused: `gh %s` can reach any repository without naming it, so a worker with a read-only repository may not run it" % words[0])
         if words and words[0] in NO_NETWORK_GROUPS and words[0] != "auth":
             return None
         if not extra:

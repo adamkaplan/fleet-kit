@@ -1,0 +1,4 @@
+#!/bin/sh
+# test-cloud-launcher: offline tests for the cloud-worker launcher (fake kubectl, fake clock). Prints RESULT: PASS.
+cd "$(dirname "$0")/.." || exit 1
+if python3 cloud/launcher/tests/test_cloud_worker.py "$@" && python3 cloud/launcher/tests/test_cw_names.py "$@" && python3 cloud/launcher/tests/test_cloud_k1.py "$@" && python3 cloud/launcher/tests/test_driver.py "$@" && python3 cloud/launcher/tests/test_run_record.py "$@" && python3 cloud/launcher/tests/test_cloud_allowlist.py "$@" && python3 cloud/launcher/tests/test_app_token.py && python3 cloud/launcher/tests/test_preflight.py; then echo "RESULT: PASS"; else echo "RESULT: FAIL"; exit 1; fi
