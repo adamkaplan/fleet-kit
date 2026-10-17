@@ -17311,19 +17311,27 @@ class TestGhShim(Base):
                 self.assertEqual(seen["argv"][:3], ["issue", "comment", "2"])
 
     def test_s2_the_other_spellings_and_commands_warn_too(self):
-        for args in (("pr", "create", "--title", "t", "--body=a\\nb"), ("issue", "edit", "2", "-ba\\nb"), ("pr", "review", "2", "-b", "x\\ny"),
-                     ("issue", "comment", "2", "--body-file", str(self.home / "f.md"))):
-            (self.home / "f.md").write_text("one\\ntwo\n")
+        for args in (("pr", "create", "--title", "t", "--body=a\\nb"), ("issue", "edit", "2", "-ba\\nb"), ("pr", "review", "2", "-b", "x\\ny")):
             with self.subTest(args=args):
                 done, seen = self.run_shim(*args)
                 self.assertEqual(done.stderr.count(self.WARN), 1, done.stderr)
                 self.assertIsNotNone(seen)
 
-    def test_s2_stdin_text_the_shim_already_read_is_checked_and_an_edit_on_stdin_is_skipped(self):
-        done, _ = self.run_shim("issue", "comment", "2", "-F", "-", stdin="a\\nb")
-        self.assertEqual(done.stderr.count(self.WARN), 1, done.stderr)
-        done, _ = self.run_shim("issue", "edit", "2", "-F", "-", stdin="a\\nb")
-        self.assertNotIn(self.WARN, done.stderr)
+    def test_s2_a_body_file_and_stdin_are_never_opened_or_read_by_the_warning(self):
+        module = self.load_warn()
+        fifo = self.home / "pipe"
+        os.mkfifo(fifo)
+        (self.home / "f.md").write_text("one\\ntwo\n")
+        for args in (("issue", "comment", "2", "--body-file", str(fifo)), ("issue", "comment", "2", "-F", str(fifo)), ("issue", "comment", "2", "--body-file=" + str(fifo)),
+                     ("issue", "comment", "2", "-F", str(self.home / "f.md")), ("issue", "comment", "2", "-F", "-")):
+            with self.subTest(args=args):
+                self.assertIsNone(module.warning(list(args)))   # a FIFO with no writer would hang a warning that opened it
+        # through the shim: a regular file and stdin go to gh without a warning (the shim's own signing reads them, as before)
+        for args, stdin in ((("issue", "comment", "2", "-F", str(self.home / "f.md")), None), (("issue", "comment", "2", "-F", "-"), "a\\nb")):
+            with self.subTest(shim=args):
+                done, seen = self.run_shim(*args, stdin=stdin)
+                self.assertNotIn(self.WARN, done.stderr)
+                self.assertIsNotNone(seen)
 
     def test_s3_a_fence_or_a_code_span_hides_what_would_warn(self):
         for body in ("Intro.\n\n```\n" + self.LONG + "\n(1) (2) (3) \\n\n```\n", "Run `printf 'a\\nb (1) (2) (3)'` and see.", "~~~sh\nx\\ny\n~~~\n"):
@@ -17345,48 +17353,20 @@ class TestGhShim(Base):
         done, seen = self.run_shim("issue", "view", "2")
         self.assertEqual(done.stderr, "real gh err\n")
         source = (SHIM.parent / "body_warn.py").read_text()
-        self.assertNotRegex(source, r"import .*\b(subprocess|socket|urllib|http)\b")
+        self.assertNotRegex(source, r"import .*\b(subprocess|socket|urllib|http|os)\b")
 
-    def test_s8_a_body_file_post_reads_the_file_and_starts_no_process_and_no_network(self):
+    def test_s8_an_inline_post_starts_no_process_and_no_network_and_opens_no_file(self):
         module = self.load_warn()
-        path = self.home / "body.md"
-        path.write_text("a\\nb\n")
         def boom(*a, **k):
-            raise AssertionError("no process or network")
+            raise AssertionError("no process, network or file")
         with mock.patch.object(subprocess, "run", boom), mock.patch.object(subprocess, "Popen", boom), mock.patch.object(socket, "socket", boom), \
-                mock.patch.object(os, "system", boom):
-            self.assertIn(self.WARN, module.warning(["issue", "comment", "2", "--body-file", str(path)]))
-
-    def test_a_body_file_that_is_not_a_regular_file_is_never_read_and_never_hangs(self):
-        module = self.load_warn()
-        fifo = self.home / "pipe"
-        os.mkfifo(fifo)
-        args = ["issue", "comment", "2", "--body-file", str(fifo)]
-        self.assertIsNone(module.warning(args))   # a FIFO with no writer: no hang
-        writer = os.open(fifo, os.O_RDWR)
-        try:
-            os.write(writer, b"a\\nb\n")
-            self.assertIsNone(module.warning(args))   # a FIFO with a writer: nothing is consumed
-            self.assertEqual(os.read(writer, 100), b"a\\nb\n")
-        finally:
-            os.close(writer)
-        self.assertIsNone(module.warning(["issue", "comment", "2", "--body-file", str(self.home)]))   # a directory
-        self.assertIsNone(module.warning(["issue", "comment", "2", "--body-file", "/dev/null"]))   # a device
-
-    def test_a_body_file_over_the_bound_is_skipped_and_a_regular_file_still_warns(self):
-        module = self.load_warn()
-        big = self.home / "big.md"
-        big.write_text("a\\nb\n" + "x" * module.MAX_FILE_BYTES)
-        self.assertIsNone(module.warning(["issue", "comment", "2", "--body-file", str(big)]))
-        small = self.home / "small.md"
-        small.write_text("a\\nb\n")
-        self.assertIn(self.WARN, module.warning(["issue", "comment", "2", "--body-file", str(small)]))
-        self.assertIsNone(module.warning(["issue", "comment", "2", "--body-file", "-"], None))   # stdin not read: nothing
-        self.assertIn(self.WARN, module.warning(["issue", "comment", "2", "--body-file", "-"], "a\\nb"))
+                mock.patch.object(os, "system", boom), mock.patch.object(os, "open", boom), mock.patch.object(os, "stat", boom), mock.patch("builtins.open", boom):
+            self.assertIn(self.WARN, module.warning(["issue", "comment", "2", "--body", "a\\nb"]))
+            self.assertIsNone(module.warning(["issue", "comment", "2", "--body-file", "/no/such"]))
 
     def test_a_doubt_means_no_warning(self):
         module = self.load_warn()
-        for args in (["issue", "comment", "2", "--body-file", "/no/such"], ["issue", "comment", "2", "--body"], ["issue", "view", "2", "--body", "a\\nb"], ["issue"]):
+        for args in (["issue", "comment", "2", "--body"], ["issue", "view", "2", "--body", "a\\nb"], ["issue"]):
             with self.subTest(args=args):
                 self.assertIsNone(module.warning(args))
 

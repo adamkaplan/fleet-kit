@@ -1,45 +1,26 @@
 """A warning, never a refusal, for GitHub text that is hard to read, for the fleet's gh shim (loaded by path, like repo_match.py).
 
-`warning(args, stdin_text)` reads only the body, body-file and comment text the command line carries (a file named by `--body-file`, or the
-stdin text the shim already read) for `issue` and `pr` `create`, `edit`, `comment` and `pr review`. It starts no process and makes no network call.
+`warning(args)` reads only the body text the command line carries inline (`--body`, `-b`; never a file, never stdin, so no stream the real
+gh needs is touched) for `issue` and `pr` `create`, `edit`, `comment` and `pr review`. It starts no process and makes no network call.
 Code fences and code spans are left out. It returns one line to print on stderr, or None when the text reads well or anything is in doubt
 (a warning is not a guard: any doubt means no warning). Standard library only.
 """
-import os
 import re
-import stat
 
 LONG_PARAGRAPH = 600
 MAX_MARKERS = 3
-MAX_FILE_BYTES = 1048576
 COMMANDS = {("issue", "create"), ("issue", "edit"), ("issue", "comment"), ("pr", "create"), ("pr", "edit"), ("pr", "comment"), ("pr", "review")}
 FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 SPAN_RE = re.compile(r"(`+)(?:(?!\1).)+?\1", re.S)
 ITEM_RE = re.compile(r"^\s{0,6}(?:[-*+]|\d{1,3}[.)])\s")
 MARKER_RE = re.compile(r"\(\d{1,2}\)")
 HINT = "gh: this text may be hard to read (%s): use short paragraphs and Markdown lists, one item per line (a warning only; the command ran)\n"
-BODY_FLAGS = {"-b": "body", "--body": "body", "-F": "file", "--body-file": "file"}
+BODY_FLAGS = {"-b": "body", "--body": "body"}
 
 
-def read_regular(path):
-    """The text of a REGULAR file of at most MAX_FILE_BYTES, else None: a FIFO, a process substitution, /dev/stdin, a socket, a directory or a
-    device is never read (reading would consume the stream the real gh needs, or hang), and a file over the bound is skipped. The file is opened
-    without blocking and judged by its descriptor, so a path swapped for a FIFO after a check cannot hang the shim."""
-    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE_BYTES:
-            return None
-        data = os.read(fd, MAX_FILE_BYTES + 1)
-        if len(data) > MAX_FILE_BYTES:
-            return None
-        return data.decode("utf-8")
-    finally:
-        os.close(fd)
-
-
-def texts(args, stdin_text):
-    """The texts of the body flags among args[2:] (the files read, `-` taken from stdin_text, which is None when it was not read)."""
+def texts(args):
+    """The inline texts of the body flags (`--body`, `-b`) among args[2:]. A `--body-file` or `-F` is never opened, statted or read: reading a FIFO, a
+    process substitution or `-` would consume the stream the real gh needs."""
     found, i = [], 2
     while i < len(args):
         arg = args[i]
@@ -52,19 +33,11 @@ def texts(args, stdin_text):
             i += 1
         elif arg.startswith("--") and "=" in arg and arg.split("=", 1)[0] in BODY_FLAGS:
             name, value = arg.split("=", 1)
-        elif arg[:2] in ("-b", "-F") and not arg.startswith("--") and len(arg) > 2:
+        elif arg[:2] == "-b" and not arg.startswith("--") and len(arg) > 2:
             name, value = arg[:2], arg[2:].lstrip("=") if arg[2] == "=" else arg[2:]
         if name is None or value is None:
             continue
-        if BODY_FLAGS[name] == "body":
-            found.append(value)
-        elif value == "-":
-            if stdin_text is not None:
-                found.append(stdin_text)
-        else:
-            text = read_regular(value)
-            if text is not None:
-                found.append(text)
+        found.append(value)
     return found
 
 
@@ -110,13 +83,13 @@ def problems(text):
     return found
 
 
-def warning(args, stdin_text=None):
+def warning(args):
     """One line for stderr, or None (nothing to say, or any doubt)."""
     try:
         if len(args) < 3 or (args[0], args[1]) not in COMMANDS:
             return None
         found = []
-        for text in texts(args, stdin_text):
+        for text in texts(args):
             for item in problems(text):
                 if item not in found:
                     found.append(item)
