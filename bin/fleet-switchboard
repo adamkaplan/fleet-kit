@@ -7285,7 +7285,8 @@ def reclaim_worktree(engine, runner, path, entry, apply=True):
     stale = "" if _unregister_worktree(engine.state_dir, path) else "; the registry entry could not be dropped (it is harmless: the directory is gone)"
     if engine.audit is not None:
         engine.audit.append(engine.actor, "worktree.removed", agent or path, {"path": str(path), "branch": facts["branch"], "repo": entry.get("repo")})
-    return "removed", "%s: removed (clean, pushed; branch %s kept)%s" % (path, facts["branch"], stale)
+    return "removed", ("%s: removed (clean, pushed; branch %s kept). The session of %s cannot be resumed from that directory: it is gone; "
+                       "the way back is a fresh launch under a new name%s") % (path, facts["branch"], _one_line(str(agent or "its worker"), 40), stale)
 
 
 def reclaim_for_agent(engine, runner, name, apply=True, why="retired"):
