@@ -1,6 +1,6 @@
 """#665: the operator driver runs the repository preflight after the allow-list and before any token is minted (S1, S2, S3, U1).
 Offline: the real preflight.py against a loopback stub of the GitHub API; the fake kubectl and a marker file count the calls."""
-import io, os, sys, unittest
+import io, os, pwd, subprocess, sys, unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
@@ -112,11 +112,95 @@ class EnvironmentCannotRedirectTheGuard(Wired):
                 self.assertEqual(tp.Stub.methods, [], "the stub was contacted")
                 self.nothing_made()
 
-    def test_the_child_gets_only_the_allow_list(self):
-        env = {"PATH": "/usr/bin", "HOME": "/home/user", "LC_ALL": "C", "CW_GITHUB_API_BASE": "http://127.0.0.1:1", "CW_PREFLIGHT_TOKEN_CMD": "x",
-               "CW_GIT_TOKEN_CMD": "y", "GH_TOKEN": "z", "GITHUB_TOKEN": "z", "HTTPS_PROXY": "p", "CW_VAULT_NAME": "v"}
+    def test_the_child_gets_only_the_allow_list_a_fixed_path_and_a_private_home(self):
+        env = {"PATH": "/tmp/evil", "HOME": "/home/evil", "LC_ALL": "C", "CW_GITHUB_API_BASE": "http://127.0.0.1:1", "CW_PREFLIGHT_TOKEN_CMD": "x",
+               "CW_GIT_TOKEN_CMD": "y", "GH_TOKEN": "z", "GITHUB_TOKEN": "z", "HTTPS_PROXY": "p", "CW_VAULT_NAME": "v", "PYTHONPATH": "/tmp/evil",
+               "TMPDIR": "/tmp/evil", "CW_OPENSSL": "relative-openssl", "AZURE_CONFIG_DIR": "relative"}
         with mock.patch.object(cw, "PREFLIGHT_TEST_ENV", {}):
-            self.assertEqual(cw._preflight_env(env), {"PATH": "/usr/bin", "HOME": "/home/user", "LC_ALL": "C", "CW_VAULT_NAME": "v"})
+            got = cw._preflight_env(env, "/private/home")
+        self.assertEqual(got["PATH"], cw.PREFLIGHT_PATH)
+        self.assertEqual((got["HOME"], got["TMPDIR"]), ("/private/home", "/private/home"))
+        self.assertEqual(got["AZURE_CONFIG_DIR"], os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".azure"))   # from the password database, never $HOME
+        self.assertEqual({k: got[k] for k in got if k not in ("PATH", "HOME", "TMPDIR", "AZURE_CONFIG_DIR")}, {"LC_ALL": "C", "CW_VAULT_NAME": "v"})
+
+    def test_an_absolute_existing_azure_config_dir_is_kept_and_an_absolute_openssl_too(self):
+        cfg = self.tmp.name
+        ossl = "/bin/sh"
+        with mock.patch.object(cw, "PREFLIGHT_TEST_ENV", {}):
+            got = cw._preflight_env({"AZURE_CONFIG_DIR": cfg, "CW_OPENSSL": ossl}, "/h")
+        self.assertEqual((got["AZURE_CONFIG_DIR"], got["CW_OPENSSL"]), (cfg, ossl))
+
+
+class PoisonedEnvironment(Wired):
+    """HOME with a usercustomize.py, a PYTHONPATH with a sitecustomize.py and fake python/gh/az/sh on PATH: none of it may run, at BOTH entry points."""
+    FAKE = "#!/bin/sh\ntouch \"$SENTINEL\"\necho preflight ok: deletion, non_fast_forward, pull_request\nexit 0\n"
+
+    def poison(self):
+        root = self.tmp.name
+        self.sentinel = os.path.join(root, "fake-ran")
+        home, pp, bindir = (os.path.join(root, d) for d in ("poison-home", "poison-pp", "poison-bin"))
+        for d in (home, pp, bindir):
+            os.makedirs(d)
+        code = "import sys, os\nif any(a.endswith('preflight.py') for a in sys.argv):\n    open(%r, 'w').close()\n    print('preflight: preflight ok: deletion, non_fast_forward, pull_request')\n    os._exit(0)\n" % self.sentinel
+        probe = subprocess.run([sys.executable, "-c", "import site; print(site.getusersitepackages())"], capture_output=True, text=True,
+                               env={"HOME": home, "PATH": os.environ.get("PATH", "")}).stdout.strip()
+        os.makedirs(probe, exist_ok=True)
+        with open(os.path.join(probe, "usercustomize.py"), "w") as f:
+            f.write(code)
+        with open(os.path.join(pp, "sitecustomize.py"), "w") as f:
+            f.write(code)
+        for name in ("python", "python3", "gh", "az", "sh", "openssl"):
+            p = os.path.join(bindir, name)
+            with open(p, "w") as f:
+                f.write(self.FAKE)
+            os.chmod(p, 0o755)
+        return {"HOME": home, "PYTHONPATH": pp, "PATH": bindir + ":" + os.environ.get("PATH", ""), "SENTINEL": self.sentinel}
+
+    def check_refused(self, out, err):
+        self.assertNotIn("preflight ok", out + err)
+        self.assertFalse(os.path.exists(self.sentinel), "a fake from the caller's environment ran")
+
+    def test_the_driver_ignores_it(self):
+        env = self.poison()
+        with mock.patch.object(cw, "PREFLIGHT_TEST_ENV", {}):
+            code, out, err = self.drive(**env)
+        self.assertEqual(code, 2, err)
+        self.assertIn("did not pass", err)
+        self.check_refused(out, err)
+        self.nothing_made()
+
+    def test_launch_cloud_ignores_it(self):   # `launch --cloud` calls the same function with the caller's environment
+        env = dict(self.poison(), **{"CW_ALLOWED_REPOS": REPO})
+        with mock.patch.object(cw, "PREFLIGHT_TEST_ENV", {}):
+            with self.assertRaises(cw.CloudError) as cm:
+                cw.check_repo_preflight(REPO, env)
+        self.check_refused("", str(cm.exception))
+
+    def test_the_legitimate_route_still_works_with_the_environment_scrubbed(self):
+        env = self.poison()
+        tp.Stub.rules = list(tp.FULL)
+        code, out, err = self.drive(**env)   # the stub route is injected through the hook; the poisoned caller environment is not read
+        self.assertEqual(code, 0, err)
+        self.assertIn("preflight ok", out + err)
+        self.assertFalse(os.path.exists(self.sentinel))
+
+    def test_the_child_command_is_isolated_and_the_home_is_removed_afterwards(self):
+        seen = {}
+        real = subprocess.run
+
+        def spy(argv, **kw):
+            seen["argv"], seen["env"], seen["cwd"] = argv, kw["env"], kw.get("cwd")
+            seen["empty"] = os.listdir(kw["env"]["HOME"]) == []
+            seen["mode"] = os.stat(kw["env"]["HOME"]).st_mode & 0o777
+            return real(argv, **kw)
+        with mock.patch.object(cw.subprocess, "run", spy):
+            self.drive()
+        self.assertEqual(seen["argv"][:3], [os.path.realpath(sys.executable), "-I", "-S"])
+        self.assertTrue(os.path.isabs(seen["argv"][0]))
+        self.assertEqual(seen["env"]["PATH"], cw.PREFLIGHT_PATH)
+        self.assertTrue(seen["empty"])
+        self.assertEqual(seen["mode"], 0o700)
+        self.assertFalse(os.path.exists(seen["env"]["HOME"]), "the private home was not removed")
 
 
 class Shared(unittest.TestCase):

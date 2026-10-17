@@ -37,10 +37,15 @@ do it for you.
 
 A refusal at step 1 or 2 means no token was minted and nothing was created.
 
-The preflight runs with a cleaned environment: only `PATH`, `HOME`, `LANG`/`LC_*`, `TMPDIR`, `AZURE_CONFIG_DIR` and the settings its own
-token route needs (`CW_VAULT_SUBSCRIPTION`, `CW_VAULT_NAME`, `CW_APP_ID_CMD`, `CW_APP_INSTALLATION_CMD`, `CW_APP_KEY_CMD`, `CW_OPENSSL`) are passed on.
-`CW_GITHUB_API_BASE` and `CW_PREFLIGHT_TOKEN_CMD` set in your shell are ignored by `launch --cloud` and `run-task`, and so are
-`CW_GIT_TOKEN_CMD` (that one is the mint's), proxy variables and `GH_`/`GITHUB_` token variables: nothing in the environment can point the check at another host.
+The preflight runs as `python -I -S` (no user site, no `PYTHON*` variable) by the launcher's own absolute interpreter, in a cleaned environment.
+The child sees only:
+
+- a fixed `PATH` (`/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin`), never yours;
+- an empty private `HOME` and `TMPDIR`, removed when the check ends;
+- `AZURE_CONFIG_DIR`: yours when it is an absolute existing directory, else `~/.azure` of your account (read from the password database, not `$HOME`);
+- `LANG`/`LC_*` and the token route's settings (`CW_VAULT_SUBSCRIPTION`, `CW_VAULT_NAME`, `CW_APP_ID_CMD`, `CW_APP_INSTALLATION_CMD`, `CW_APP_KEY_CMD`), and `CW_OPENSSL` only when it is an absolute executable file.
+
+`CW_GITHUB_API_BASE`, `CW_PREFLIGHT_TOKEN_CMD`, `CW_GIT_TOKEN_CMD`, proxy variables, `GH_`/`GITHUB_` token variables, `HOME` and `PATH` set in your shell are ignored by `launch --cloud` and `run-task`: nothing in the environment can point the check at another host or run your code inside it.
 
 ## 3. Run one worker
 

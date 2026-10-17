@@ -191,22 +191,40 @@ PREFLIGHT_SECONDS = 120
 # The preflight child gets ONLY these variables from the caller (an allow-list). It never gets CW_GITHUB_API_BASE or CW_PREFLIGHT_TOKEN_CMD (they
 # point the guard at a fake GitHub), CW_GIT_TOKEN_CMD (that is the mint's), proxy variables, or GH_/GITHUB_ token variables.
 PREFLIGHT_ENV_NAMES = (
-    "PATH",                    # to find sh, az and openssl
-    "HOME",                    # where `az` keeps its sign-in
     "LANG",                    # (LC_* too) text encoding
-    "TMPDIR",                  # a private temporary directory, when one is set
-    "AZURE_CONFIG_DIR",        # where `az` keeps its sign-in, when it is not under HOME
     "CW_VAULT_SUBSCRIPTION",   # the vault the GitHub App's id and key are read from (app_token.py)
     "CW_VAULT_NAME",           # the same
     "CW_APP_ID_CMD",           # optional commands that print the App id, installation id and key instead of the vault (app_token.py)
     "CW_APP_INSTALLATION_CMD",
     "CW_APP_KEY_CMD",
-    "CW_OPENSSL",              # the openssl binary used to sign the App's JWT
 )
+# Never taken from the caller: PATH (a fixed one is built here), HOME and TMPDIR (a private empty directory), PYTHON* (the child runs `python -I`),
+# AZURE_CONFIG_DIR (a checked constant), CW_OPENSSL (kept only when it is an absolute executable file).
+PREFLIGHT_PATH = "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin"
 
 
-def _preflight_env(env):
+def _abs_executable(path):
+    return bool(path) and os.path.isabs(path) and os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def _preflight_env(env, home):
+    """The child's whole environment: the allow-listed names, a fixed PATH, an empty private HOME and TMPDIR, and where `az` keeps its sign-in
+    (the caller's AZURE_CONFIG_DIR when it is an absolute existing directory, else the account's own ~/.azure from the password database, never $HOME)."""
     clean = {k: v for k, v in env.items() if k in PREFLIGHT_ENV_NAMES or k.startswith("LC_")}
+    clean["PATH"] = PREFLIGHT_PATH
+    clean["HOME"] = home
+    clean["TMPDIR"] = home
+    cfg = env.get("AZURE_CONFIG_DIR") or ""
+    if not (os.path.isabs(cfg) and os.path.isdir(cfg)):
+        try:
+            cfg = os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".azure")
+        except (KeyError, OSError):
+            cfg = ""
+    if cfg:
+        clean["AZURE_CONFIG_DIR"] = cfg
+    ossl = env.get("CW_OPENSSL") or ""
+    if _abs_executable(ossl):
+        clean["CW_OPENSSL"] = ossl
     clean.update(PREFLIGHT_TEST_ENV)
     return clean
 
@@ -215,9 +233,10 @@ def check_repo_preflight(repo, env):
     """The one preflight call (the operator driver and `launch --cloud` both call it), run AFTER the allow-list and BEFORE any token is minted.
     Returns the preflight's one result line. Raises CloudError(EXIT_USAGE) (fail closed) unless the program ran, exited 0 and printed something:
     a missing, killed, timed-out or silent program is a refusal, never a pass. The refusal carries the program's own message."""
-    argv = list(PREFLIGHT_ARGV) + [repo] if PREFLIGHT_ARGV else [sys.executable, PREFLIGHT_PROGRAM, repo]
+    argv = list(PREFLIGHT_ARGV) + [repo] if PREFLIGHT_ARGV else [os.path.realpath(sys.executable), "-I", "-S", PREFLIGHT_PROGRAM, repo]
     try:
-        p = subprocess.run(argv, capture_output=True, text=True, timeout=PREFLIGHT_SECONDS, stdin=subprocess.DEVNULL, env=_preflight_env(env))
+        with tempfile.TemporaryDirectory(prefix="cw-preflight-") as home:   # 0700, empty, removed when the child ends (also on failure)
+            p = subprocess.run(argv, capture_output=True, text=True, timeout=PREFLIGHT_SECONDS, stdin=subprocess.DEVNULL, env=_preflight_env(env, home), cwd=home)
     except (OSError, subprocess.TimeoutExpired, ValueError):
         raise CloudError("refused: the repository preflight for %s could not be run; nothing was created" % scrub(repo, (), 120), EXIT_USAGE) from None
     lines = [x.strip() for x in p.stdout.splitlines() if x.strip()]
