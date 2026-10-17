@@ -141,7 +141,8 @@
         "cloud/launcher/cloud_worker.py",
         "cloud/launcher/app_token.py",
         "cloud/launcher/preflight.py",
-        "cloud/worker/entrypoint.sh"
+        "cloud/worker/entrypoint.sh",
+        "cloud/launcher/repo-approvals.json"
       ],
       "identity": [
         "shims/**",
@@ -162,6 +163,7 @@
         "bin/cloud_worker.py",
         "bin/external_adapter.py",
         "bin/delegated_clear.py",
+        "bin/impact_hold.py",
         "docs/review-laws/impact-matrix.json",
         "plugins/fleet-hooks/**",
         "tools/cos-permissions-proof/**",
@@ -203,6 +205,7 @@
           "bin/cloud_worker.py",
           "bin/external_adapter.py",
           "bin/delegated_clear.py",
+          "bin/impact_hold.py",
           "docs/review-laws/impact-matrix.json",
           "cloud/launcher/app_token.py",
           "cloud/launcher/preflight.py",
@@ -224,6 +227,7 @@
       "agents/**",
       "cloud/launcher/token_mint.py",
       "cloud/launcher/cloud_worker.py",
+      "cloud/launcher/repo-approvals.json",
       ".github/workflows/**",
       "bin/switchboard-trial"
     ],
@@ -318,6 +322,7 @@
       "closure_files": [
         "bin/fleet-switchboard",
         "bin/agent_calls.py",
+        "bin/agent_presence.py",
         "bin/awaiting_live.py",
         "bin/ci_runs.py",
         "bin/cpu_guard.py",
@@ -339,21 +344,106 @@
       ],
       "daemon_file": "bin/fleet-switchboard",
       "module_roots": {
-        "bin/awaiting_live.py": ["validate"],
-        "bin/cpu_guard.py": ["settings", "validate"],
-        "bin/decision_core.py": ["one_line"],
-        "bin/disk_janitor.py": ["settings", "validate"],
-        "bin/fleet_health.py": ["validate"],
-        "bin/heavy_slots.py": ["settings"],
-        "bin/queue_ejections.py": ["validate"],
-        "bin/reds.py": ["settings"],
-        "bin/spotlight_guard.py": ["settings", "validate"]
+        "bin/agent_presence.py": [
+          "*"
+        ],
+        "bin/awaiting_live.py": [
+          "validate"
+        ],
+        "bin/ci_runs.py": [
+          "*"
+        ],
+        "bin/cpu_guard.py": [
+          "settings",
+          "validate"
+        ],
+        "bin/decision_core.py": [
+          "one_line"
+        ],
+        "bin/disk_janitor.py": [
+          "settings",
+          "validate"
+        ],
+        "bin/fleet_health.py": [
+          "validate"
+        ],
+        "bin/heavy_slots.py": [
+          "settings"
+        ],
+        "bin/queue_ejections.py": [
+          "validate"
+        ],
+        "bin/reassign.py": [
+          "*"
+        ],
+        "bin/reds.py": [
+          "settings"
+        ],
+        "bin/report_fold.py": [
+          "*"
+        ],
+        "bin/spotlight_guard.py": [
+          "settings",
+          "validate"
+        ]
       },
       "closure_roots": [
-        "cmd_impact_clear",
-        "delegated_clear_checks",
-        "delegated_clear_pr_checks",
-        "impact_clear_core"
+        "CLEAR_NOTIFIED_FILE",
+        "CLEAR_NOTIFIED_MAX",
+        "ConfigError",
+        "EXIT_ERROR",
+        "EXIT_OK",
+        "EXIT_USAGE",
+        "HELPER_MODULES",
+        "IMPACT_STATE_FILE",
+        "IMPACT_STATE_MAX_BYTES",
+        "ImpactStateBusy",
+        "IntentError",
+        "LABEL_SPECS",
+        "NOTIFY_CLEAR_DEADLINE_SECONDS",
+        "NoticeError",
+        "PROG",
+        "Path",
+        "_PLAN_ISSUE_RE",
+        "_PLAN_REF_SHORT",
+        "_gh_write",
+        "_intent_reader",
+        "_is_orchestrator",
+        "_make_loader",
+        "_one_line",
+        "_read_small",
+        "_write_small",
+        "authoritative_plan",
+        "boss_name",
+        "build_engine",
+        "change_issue_labels",
+        "checked_plan",
+        "ensure_labels",
+        "fetch_orders",
+        "gates_caller_kind",
+        "impact_carry_get",
+        "impact_floor",
+        "impact_records",
+        "impact_review_record",
+        "impact_state_lock",
+        "json",
+        "label_names",
+        "load_module",
+        "notice_senders",
+        "os",
+        "parse_pr_ref",
+        "plan_ledger",
+        "pr_floor_report",
+        "pr_marker",
+        "re",
+        "read_open_items",
+        "read_pr_json",
+        "read_pr_notices",
+        "redact_command_text",
+        "subprocess",
+        "sys",
+        "threading",
+        "types"
       ],
       "clear_entry_points": [
         "impact_clear_core",
@@ -367,7 +457,20 @@
         "notify_clear",
         "neutralise_marker",
         "gates_caller_kind"
-      ]
+      ],
+      "closure_exempt": {
+        "bin/closed_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
+        "bin/cloud_worker.py": "loaded only by `run_cloud` and `cmd_status`: the cloud commands, not the clear",
+        "bin/external_adapter.py": "loaded only by the external-decision adapter path, which the clear does not run",
+        "bin/health_records.py": "loaded only by the health and pane pass, which the clear does not run",
+        "bin/lanes.py": "loaded only by `cmd_move`: the lane command, not the clear",
+        "bin/launch_testers.py": "loaded only by the tester launch command, not the clear",
+        "bin/merged_labels.py": "loaded only by `publish_decisions` (the decision list), which the clear never calls",
+        "bin/orders_copy.py": "loaded only by `cmd_orders_copy`, not the clear",
+        "bin/resume_brief.py": "loaded only by `cmd_launch`, not the clear",
+        "bin/triage_ownerless.py": "loaded only by the triage passes, which the clear does not run",
+        "bin/triage_plan_open.py": "loaded only by the triage plan-open pass, which the clear does not run"
+      }
     }
   }
 }

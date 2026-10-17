@@ -12969,7 +12969,7 @@ class TestClearCarry(unittest.TestCase):
 
     def test_s8_there_is_one_fingerprint_function_and_the_carry_code_holds_no_path_or_class_literal(self):
         import ast
-        main = Path(sb.__file__).read_text()
+        main = Path(sb.__file__).read_text() + "\n" + (Path(sb.__file__).parent / "impact_hold.py").read_text()   # #532: the clear's wrapper moved to bin/impact_hold.py, still "the switchboard's" code
         module = Path(sb.__file__).parent / "clear_carry.py"
         text = module.read_text()
         defs = [n.name for src in (main, text) for n in ast.walk(ast.parse(src)) if isinstance(n, ast.FunctionDef) and "fingerprint" in n.name]
@@ -21727,12 +21727,13 @@ class TestSweep(Base):
         self.assertEqual(len(self.sweep([report, self.human(33, "captain")])), 2)
         self.assertEqual(self.hub.single, [("acme/api", "issues/33")])
 
-    def test_s4_a_closed_issue_that_still_carries_the_persons_label_is_not_withdrawn(self):
+    def test_s4_a_closed_issue_that_still_carries_the_persons_label_is_withdrawn_like_any_other(self):   # #570: it used to be kept, listed on purpose
         self.hub.closed = {30, 31, 32}
         closed_but_labelled = dict(self.human(30), closed=True)
         kept = self.sweep([closed_but_labelled, self.human(31), self.human(32, "captain")])
-        self.assertEqual([d["ask"] for d in kept], [30], "only the one listed on purpose stays; the others are withdrawn as before")
-        self.assertNotIn(("acme/api", "issues/30"), self.hub.single, "no read is spent on it")
+        self.assertEqual([d["ask"] for d in kept], [], "a closed issue is no decision: withdrawn like the others (the list never holds one now)")
+        self.assertIn(("acme/api", "issues/30"), self.hub.single, "it is read like any other, and found closed")
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "sweep.withdrawn"]), 3, "each of the 3 is withdrawn and audited")
 
     def test_s4_a_decision_whose_issue_is_closed_is_withdrawn_and_audited_once(self):
         self.hub.closed = {30}
@@ -23735,6 +23736,13 @@ class TestCaptainSweepFindings(TestSweep):
         self.sweep()
         self.assertEqual([f for f in self.found() if f[0] == "S9"], [])
 
+    def test_s7_a_closed_issue_that_carried_an_awaiting_label_raises_no_waiting_finding(self):   # #570
+        self.hub.closed_records = {96: sweep_issue(96, "x", [self.USER], pr=False)}
+        self.hub.closed = {96}
+        self.sweep()
+        self.sweep()
+        self.assertEqual([f for f in self.found() if f[1] == "acme/api#96"], [], "0 findings name the closed issue")
+
     def test_s9_a_merged_pr_is_no_finding_and_a_closed_unmerged_one_still_is(self):
         captain = self.USER.replace("awaiting-user", "merge-captain")
         hold = self.USER.replace("awaiting-user", "hold-impact")
@@ -25625,6 +25633,144 @@ class LedgerBase(Base):
             self.assertEqual(self.verdict(who, sid, ev)[0], 0, (who, sid))
 
 
+# (plan hash, scenario hash) of five plan texts with a tester measure scenario, computed BEFORE the change to how G1 reads an unwritten claim (the checker is not touched by it): an unwritten claim and a
+# written `claim: pr` share one scenario hash because the canonical text has always filled `pr` in.
+PINNED_G1_HASHES = [
+    ("sha256:f59db1a8ea7a7a5a9a14aea40ed171467a1e44a2c22f5b7dad7ee8db9525800c", "sha256:1eb0d1ae3803c387308206baebdee4ec8f46ea649a0bc93ea21d154c9c0c2172"),
+    ("sha256:cda1cf00b68e99a39c2333618de5eb886785c7a380e9f78c4d3a8f700e441269", "sha256:1eb0d1ae3803c387308206baebdee4ec8f46ea649a0bc93ea21d154c9c0c2172"),
+    ("sha256:50a9daea80cdb6d0deb32da91d8b0b0ef938642b69c70ef6d5bb16db17146c98", "sha256:82e8896b50f5a203fa7c9f454d9f0de39a71a5f07183d9847c0b1f71e303238e"),
+    ("sha256:d5dde84d977987a17ed348cc1c2023a1456ef00b00d6b98ba412eccd8b6932a9", "sha256:1eb0d1ae3803c387308206baebdee4ec8f46ea649a0bc93ea21d154c9c0c2172"),
+    ("sha256:d2bead8ec573f01a5fb2ddc9acb39c65c9398838fb1c741d3897c2602a0eab33", "sha256:bfa5d6a9830a09f93946c6a90158edb784c7ca24778c4ece33870c9077a92e64"),
+]
+
+
+class TestG1UnwrittenClaim(LedgerBase):
+    """#579: G1 reads a scenario with NO claim written as the tester's post-merge check when its evaluator is the tester and its proof a measure: not claimed by a slice pull request, listed as proven
+    after the merge. An explicit claim is read as written; the plan hash never changes."""
+
+    def plan(self, s2_proof="measure", s2_claim="", s2_evaluator="tester"):
+        text = LEDGER_PLAN.replace("    proof: live\n    pass: the reply arrives within 5 s", "    proof: %s\n    pass: the reply arrives within 5 s" % s2_proof, 1)
+        text = text.replace("    evaluator: tester\n", "    evaluator: %s\n%s" % (s2_evaluator, "    claim: %s\n" % s2_claim if s2_claim else ""), 1)
+        return text
+
+    def setUp(self):
+        super().setUp()
+        self.configure(evaluators={"reviewer": ["rev"], "tester": ["tst"], "owner": ["own"], "ci": ["cibot"]})
+
+    def g1(self, text, proven=("S1", "S3", "U1")):
+        self.plan_issue["body"] = text
+        for sid in proven:
+            code, _, err = self.prove("coder", sid)
+            self.assertEqual(code, 0, (sid, err))
+        for who, sid, ev in (("cibot", "S1", "ci"), ("rev", "S3", "reviewer"), ("cibot", "U1", "ci")):
+            if sid in proven:
+                self.assertEqual(self.verdict(who, sid, ev)[0], 0, (who, sid))
+        code, report, err = self.gates()
+        self.assertIn(code, (0, 1), err)   # 1: not ready, with the table still printed
+        return self.row(report, "G1")
+
+    def test_s1_s2_an_unwritten_tester_measure_is_not_claimed_and_is_named_as_proven_after_the_merge(self):
+        row = self.g1(self.plan())
+        self.assertEqual(row["status"], "ok", row)
+        self.assertIn("3 of 3 claimed scenarios proven", row["detail"])
+        self.assertEqual(row["detail"].count("S2"), 1)
+        self.assertRegex(row["detail"], r"epic-claimed, proven after the merge at the integration head: S2, S4")
+
+    def test_prove_verdict_and_verdict_all_refuse_an_unwritten_tester_measure_like_an_explicit_epic_claim(self):
+        self.plan_issue["body"] = self.plan()                    # S2: tester + measure, no claim written
+        refusals = []
+        for run in (lambda: self.prove("coder", "S2"), lambda: self.verdict("tst", "S2", "tester"),
+                    lambda: self.run_as("tst", "verdict", "--all", "--pr", self.PR, "--as", "tester", "--result", "pass", "--evidence", "judged it: matches the scenario")):
+            code, _, err = run()
+            self.assertNotEqual(code, 0)
+            refusals.append(err)
+        self.assertIn("S2 is claimed at the epic, not per PR", refusals[0])
+        self.assertIn("S2 is claimed at the epic, not per PR", refusals[1])
+        self.assertIn("no per-PR scenario of this plan is judged by tester", refusals[2], "verdict --all has nothing to record for the tester")
+        self.assertEqual(self.ledger(), [], "nothing was recorded at the PR head")
+        self.plan_issue["body"] = self.plan(s2_claim="epic")
+        self.assertIn("claimed at the epic", self.prove("coder", "S2")[2], "an explicit claim: epic refuses with the same message")
+
+    def test_an_explicit_claim_pr_on_a_tester_measure_still_records_and_the_other_scenarios_are_unchanged(self):
+        self.plan_issue["body"] = self.plan(s2_claim="pr")
+        self.assertEqual(self.prove("coder", "S2")[0], 0)
+        self.assertEqual(self.verdict("tst", "S2", "tester")[0], 0)
+        self.assertEqual(self.prove("coder", "S1")[0], 0)
+        self.assertEqual(self.verdict("cibot", "S1", "ci")[0], 0)
+        self.assertEqual(sorted(e["scenario"] for e in self.ledger()), ["S1", "S1", "S2", "S2"])
+
+    def test_no_consumer_of_a_claim_defaults_it_to_pr_on_its_own(self):
+        import re as _re
+        for name in ("fleet-switchboard", "plan_ledger.py"):
+            text = (BIN / name).read_text()
+            self.assertEqual(_re.findall(r'\.get\("claim"\) or "pr"', text), [], name + " reads a claim without claim_of")
+
+    def test_a_tester_scenario_whose_proof_is_not_a_measure_stays_claimed(self):
+        row = self.g1(self.plan(s2_proof="live"))
+        self.assertEqual(row["status"], "missing", "a tester scenario whose proof is not a measure is claimed as before")
+        self.assertTrue(any(m.startswith("S2") for m in row["missing"]), row)
+
+    def test_s3_an_explicit_claim_pr_is_claimed_and_an_explicit_claim_epic_stays_epic(self):
+        claimed = self.g1(self.plan(s2_claim="pr"))
+        self.assertEqual(claimed["status"], "missing")
+        self.assertTrue(any(m.startswith("S2") for m in claimed["missing"]), claimed)
+        self.assertIn("proven after the merge at the integration head: S4", claimed["detail"], "S2 is not epic when it writes claim: pr")
+        self.assertNotIn("S2", claimed["detail"].split("integration head:")[-1])
+        epic = self.g1(self.plan(s2_claim="epic"))
+        self.assertEqual(epic["status"], "ok")
+        self.assertIn("S2, S4", epic["detail"])
+
+    def test_s4_a_tester_scenario_whose_proof_is_a_test_and_a_reviewer_measure_are_claimed_as_today(self):
+        """The checker refuses these pairings in a real plan (a test is recorded by ci, a measure by the tester or the owner), so G1 is read directly over a hand-built plan."""
+        pl = sb.load_module("plan_ledger")
+        plan = {"result": "pass", "defects": [], "plan_hash": "sha256:" + "0" * 64, "text": "", "scenarios_parsed": [
+            {"id": "S1", "evaluator": "tester", "proof": "test"}, {"id": "S2", "evaluator": "reviewer", "proof": "measure"}, {"id": "S3", "evaluator": "tester", "proof": "measure"}]}
+        table = pl.evaluate_gates(plan, [], None, {"head": LEDGER_HEAD}, self.PR)
+        row = next(r for r in table["gates"] if r["gate"] == "G1")
+        self.assertEqual(row["status"], "missing")
+        self.assertIn("0 of 2 claimed scenarios proven", row["detail"], "S1 and S2 are claimed, S3 (tester + measure, unwritten) is not")
+        self.assertEqual(sorted(m.split(":")[0] for m in row["missing"]), ["S1", "S2"])
+        self.assertIn("integration head: S3", row["detail"])
+
+    def test_a_plan_whose_only_scenarios_are_unwritten_tester_measures_never_passes_vacuously(self):
+        pl = sb.load_module("plan_ledger")
+        plan = {"result": "pass", "defects": [], "plan_hash": "sha256:" + "0" * 64, "text": "", "scenarios_parsed": [
+            {"id": "S1", "evaluator": "tester", "proof": "measure"}, {"id": "S2", "evaluator": "tester", "proof": "measure"}]}
+        row = next(r for r in pl.evaluate_gates(plan, [], None, {"head": LEDGER_HEAD}, self.PR)["gates"] if r["gate"] == "G1")
+        self.assertEqual(row["status"], "missing", "no scenario is claimed per PR: G1 still asks for the reasoned statement")
+        self.assertIn("no scenario is claimed per PR", " ".join(row["missing"]))
+        plan["text"] = "per-pr scenarios: none because every scenario is the tester's live check after the merge"
+        row = next(r for r in pl.evaluate_gates(plan, [], None, {"head": LEDGER_HEAD}, self.PR)["gates"] if r["gate"] == "G1")
+        self.assertEqual(row["status"], "n/a")
+
+    def test_claim_of_reads_only_what_is_written(self):
+        pl = sb.load_module("plan_ledger")
+        self.assertEqual(pl.claim_of({"id": "S1", "evaluator": "tester", "proof": "measure"}), "epic")
+        self.assertEqual(pl.claim_of({"id": "S1", "evaluator": "tester", "proof": "measure", "claim": " pr "}), "pr")
+        self.assertEqual(pl.claim_of({"id": "S1", "evaluator": "tester", "proof": "measure", "claim": ""}), "epic", "a blank claim is no claim")
+        self.assertEqual(pl.claim_of({"id": "S1", "evaluator": "tester", "proof": "test"}), "pr")
+        self.assertEqual(pl.claim_of({"id": "S1", "evaluator": "ci", "proof": "measure"}), "pr")
+        self.assertEqual(pl.claim_of({"id": "S1", "evaluator": "owner", "proof": "live", "claim": "epic"}), "epic")
+
+    def test_s5_the_hashes_of_five_plans_with_a_tester_measure_scenario_are_pinned_and_the_parser_is_untouched(self):
+        pc = sb.load_module("plan_check")
+        texts = [self.plan(s2_proof="measure", s2_claim=claim) for claim in ("", "pr", "epic")] + \
+                [self.plan(s2_proof="measure").replace("Commissioning works.", "Commissioning works twice."), self.plan(s2_proof="measure").replace("alpha", "beta")]
+        hashes = [(pc.plan_hash(t), pc.content_hash(pc.parse_scenarios(pc.scenario_block(t)), [], t)) for t in texts]
+        self.assertEqual(hashes, PINNED_G1_HASHES)
+        parsed = pc.parse_scenarios(pc.scenario_block(texts[0]))
+        s2 = next(x for x in parsed if x["id"] == "S2")
+        self.assertNotIn("claim", s2, "the parser fills nothing in: only the canonical text defaults the claim")
+
+    def test_s6_plan_check_still_requires_the_fields_of_an_unwritten_tester_measure_scenario(self):
+        done = "(1) an owner can commission an agent; (2) it answers a chat message."
+        complete = sb.plan_check.check(self.plan(), done)
+        missing_pass = sb.plan_check.check(self.plan().replace("    pass: the reply arrives within 5 s and is longer than 0 characters\n", "", 1), done)
+        self.assertNotIn("missing-pass", [d["code"] for d in complete["defects"]])
+        self.assertIn("missing-pass", [d["code"] for d in missing_pass["defects"]])
+        self.assertNotEqual(missing_pass["result"], "pass")
+
+
 class TestLaunchTesters(LedgerBase):
     """#372: a tester launched with --role tester for its orchestrator's repo may record tester verdicts, beside the configured list."""
 
@@ -26294,6 +26440,81 @@ class TestPlanLedger(LedgerBase):
         for path in (BIN / "plan_ledger.py",):
             for number, line in enumerate(path.read_text().splitlines(), 1):
                 self.assertIsNone(FORBIDDEN_IN_PUBLIC_TEXT.search(line), "%s:%d %s" % (path.name, number, line))
+
+
+class TestLedgerReadRace(unittest.TestCase):
+    """A ledger read that races an append is not a cut-off (#673); a real cut-off or rewrite is still reported."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.now = 1767225600
+        for n in (1, 2):
+            self.append(n)
+
+    def append(self, n):
+        return sb.plan_ledger.append_entry(self.dir, {"kind": "proof", "pr": "acme/api#1", "scenario": "S%d" % n, "result": "pass"}, self.now)
+
+    def read_with_append_after_file_read(self):
+        """Read the ledger; the moment its file has been read, a writer completes an append (entry and head pointer)."""
+        real, fired = Path.read_text, []
+
+        def hooked(path, *a, **kw):
+            text = real(path, *a, **kw)
+            if path.name == sb.plan_ledger.LEDGER_FILE and not fired:
+                fired.append(1)
+                self.append(3)
+            return text
+        with mock.patch.object(Path, "read_text", hooked):
+            result = sb.plan_ledger.read_ledger(self.dir)
+        self.assertTrue(fired, "the interleaving hook ran")
+        return result
+
+    def test_s1_a_read_that_races_an_append_reports_no_break(self):
+        entries, problem = self.read_with_append_after_file_read()
+        self.assertIsNone(problem)
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(len(sb.plan_ledger.read_ledger(self.dir)[0]), 3)
+
+    def test_s4_a_racing_read_of_a_long_ledger_answers_like_a_quiet_read(self):
+        sb.plan_ledger.append_many(self.dir, [{"kind": "proof", "pr": "acme/api#1", "scenario": "S%d" % n, "result": "pass"}
+                                              for n in range(3, 1103)], self.now)
+        quiet = sb.plan_ledger.read_ledger(self.dir)
+        self.assertEqual((len(quiet[0]), quiet[1]), (1102, None))
+        self.append(1103)
+        # the same interleaving, on 1000+ entries: an append completes right after the file was read
+        real, fired = Path.read_text, []
+
+        def hooked(path, *a, **kw):
+            text = real(path, *a, **kw)
+            if path.name == sb.plan_ledger.LEDGER_FILE and not fired:
+                fired.append(1)
+                self.append(1104)
+            return text
+        with mock.patch.object(Path, "read_text", hooked):
+            raced = sb.plan_ledger.read_ledger(self.dir)
+        self.assertEqual((len(raced[0]), raced[1]), (1103, None))
+
+    def test_s2_a_cut_off_ledger_still_reports_the_break(self):
+        self.append(3)
+        path = Path(self.dir) / sb.plan_ledger.LEDGER_FILE
+        path.write_text("".join(path.read_text().splitlines(True)[:2]))
+        self.assertIn("ends before entry 3", sb.plan_ledger.read_ledger(self.dir)[1])
+
+    def test_s5_a_rewritten_middle_entry_is_reported_with_the_same_message(self):
+        self.append(3)
+        path = Path(self.dir) / sb.plan_ledger.LEDGER_FILE
+        lines = path.read_text().splitlines()
+        lines[1] = json.dumps(dict(json.loads(lines[1]), result="fail"), sort_keys=True)
+        path.write_text("\n".join(lines) + "\n")
+        self.assertEqual(sb.plan_ledger.read_ledger(self.dir)[1], "entry 2 does not follow from the one before it: the ledger was edited")
+
+    def test_s3_a_rewritten_ledger_still_reports_the_break(self):
+        path = Path(self.dir) / sb.plan_ledger.LEDGER_FILE
+        forged = dict(json.loads(path.read_text().splitlines()[0]), result="fail")
+        forged["hash"] = sb.plan_ledger.entry_hash(forged)
+        path.write_text(json.dumps(forged, sort_keys=True) + "\n")
+        self.assertIsNotNone(sb.plan_ledger.read_ledger(self.dir)[1])
 
 
 class TestWaive(LedgerBase):
@@ -28931,45 +29152,68 @@ class TestImpactHold(LedgerBase):
             readers = [n.name for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("validate", "settings")]
             if readers and not matches("bin/" + path.name, rule["clear_code_paths"]):
                 self.assertTrue(set(readers) <= set(roots.get("bin/" + path.name) or []), "%s has a config reader (%s) that is not a root" % (path.name, readers))
-        # the modules the clear really loads: the daemon's imports at load + every module with a config reader + what the recorded run executed (NOT a glob of bin/*.py)
-        daemon = ast.parse((BIN / "fleet-switchboard").read_text())
+        # the modules the clear loads or runs, DERIVED: every loader of the daemon (a `load_module("x")` call, a name in HELPER_MODULES, a function that returns one) is enumerated by ast; a module
+        # is judged when the clear reaches its loader, the daemon loads it at import, it has a config reader, or the recorded run executed it; every other loaded module is listed with its reason
+        daemon, hold = ast.parse((BIN / "fleet-switchboard").read_text()), ast.parse((BIN / "impact_hold.py").read_text())
         names = {p.stem for p in BIN.glob("*.py")}
-        loaders = {}
-        for node in daemon.body:
-            if isinstance(node, ast.FunctionDef):
-                for x in ast.walk(node):
-                    if isinstance(x, ast.Call) and getattr(x.func, "id", "") == "load_module" and x.args and isinstance(x.args[0], ast.Constant):
-                        loaders.setdefault(node.name, set()).add(x.args[0].value)
-        derived = {f[len("bin/"):-3] for f, _ in seen if f.endswith(".py")}
+        helper = next(ast.literal_eval(n.value) for n in daemon.body if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "HELPER_MODULES" for t in n.targets))
+        defs = {n.name: n for n in daemon.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
+        direct = lambda node: {x.args[0].value for x in ast.walk(node) if isinstance(x, ast.Call) and getattr(x.func, "id", "") == "load_module" and x.args and isinstance(x.args[0], ast.Constant)}
+        loaders = {name: direct(node) for name, node in defs.items() if direct(node)}
+        def modules_of(node):
+            found = direct(node)
+            for x in ast.walk(node):
+                if isinstance(x, ast.Name):
+                    found |= ({helper[x.id]} if x.id in helper else set()) | loaders.get(x.id, set())
+            return found
+        clear_functions = [n for n in hold.body if isinstance(n, ast.FunctionDef)]
+        wanted_roots = sorted({x.id for f in clear_functions for x in ast.walk(f) if isinstance(x, ast.Name)} & set(sb.load_module("delegated_clear")._index(daemon)[0]) | {x.id for f in clear_functions for x in ast.walk(f) if isinstance(x, ast.Name)} & set(sb.load_module("delegated_clear")._index(daemon)[1]))
+        self.assertEqual(sorted(rule["closure_roots"]), sorted(set(wanted_roots) | {"HELPER_MODULES", "_make_loader"}), "closure_roots is every daemon name the moved clear code reads (bin/impact_hold.py), and the table that generates the daemon's loaders")
+        reach = sb.load_module("delegated_clear").closure(daemon, rule["closure_roots"])[0]
+        reached = set()
+        for name in reach:
+            reached |= modules_of(defs[name])
+        for f in clear_functions:
+            reached |= modules_of(f)
+        at_load = set()
         for node in daemon.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             for x in ast.walk(node):
                 if isinstance(x, ast.Import):
-                    derived |= {a.name for a in x.names} & names
-                elif isinstance(x, ast.ImportFrom) and x.module in names:
-                    derived.add(x.module)
+                    at_load |= {a.name for a in x.names}
+                elif isinstance(x, ast.ImportFrom) and x.module:
+                    at_load.add(x.module)
                 elif isinstance(x, ast.Call):
                     f = getattr(x.func, "id", "")
                     if f == "load_module" and x.args and isinstance(x.args[0], ast.Constant):
-                        derived.add(x.args[0].value)
-                    derived |= loaders.get(f, set())
-        reached = sb.load_module("delegated_clear").closure(daemon, rule["closure_roots"])[0]   # and the modules the clear's own closure loads, found statically
-        for node in daemon.body:
-            if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in reached:
-                for x in ast.walk(node):
-                    if isinstance(x, ast.Call):
-                        f = getattr(x.func, "id", "")
-                        if f == "load_module" and x.args and isinstance(x.args[0], ast.Constant):
-                            derived.add(x.args[0].value)
-                        derived |= loaders.get(f, set())
-        for path in sorted(BIN.glob("*.py")):
-            if any(isinstance(n, ast.FunctionDef) and n.name in ("validate", "settings") for n in ast.parse(path.read_text()).body):
-                derived.add(path.stem)
-        derived = {m for m in derived if m in names and not matches("bin/%s.py" % m, rule["clear_code_paths"])}
+                        at_load.add(x.args[0].value)
+                    at_load |= ({helper[f]} if f in helper else set()) | loaders.get(f, set())
+        with_reader = {p.stem for p in BIN.glob("*.py") if any(isinstance(n, ast.FunctionDef) and n.name in ("validate", "settings") for n in ast.parse(p.read_text()).body)}
+        profiled = {f[len("bin/"):-3] for f, _ in seen if f.endswith(".py")}
+        named = lambda m: matches("bin/%s.py" % m, rule["clear_code_paths"])
+        judged = {m for m in (reached | at_load | with_reader | profiled) if m in names and not named(m)}
         listed = {f[len("bin/"):-3] for f in rule["closure_files"] if f.endswith(".py")}
-        self.assertEqual(sorted(derived ^ listed), [], "closure_files is the set of modules the clear loads or runs, not a glob (a module in one and not the other)")
+        self.assertEqual(sorted(judged ^ listed), [], "closure_files is the set of modules the clear loads or runs, derived (a module in one and not the other)")
+        every_loaded = {m for m in (set(helper.values()) | set().union(*loaders.values()) | set().union(*[direct(f) for f in clear_functions])) if m in names and not named(m)}
+        exempt = {"bin/%s.py" % m for m in every_loaded - judged}
+        self.assertEqual(sorted(exempt), sorted(rule["closure_exempt"]), "every loaded module is judged or listed, with its reason, as one the clear cannot reach")
+        self.assertTrue(all(isinstance(why, str) and len(why) > 20 for why in rule["closure_exempt"].values()))
+        for module_name in reached & names:   # a module whose loader the clear reaches must say which of its functions run
+            if not named(module_name):
+                self.assertIn("bin/%s.py" % module_name, roots, "%s is loaded by the clear's own code: its roots are named (`*` for every function)" % module_name)
+        for dropped in ("agent_presence", "ci_runs"):
+            self.assertIn("bin/%s.py" % dropped, rule["closure_files"])
         self.assertNotIn("bin/lanes.py", rule["closure_files"])
+        # the way in a strict review found: the notice path runs agent_presence through a generated loader; a change to it is refused, and to a module the clear does not load it is not
+        import difflib
+        presence = (BIN / "agent_presence.py").read_text().split("\n")
+        k = next(i for i, l in enumerate(presence) if l.startswith("def ") and i + 1 < len(presence))
+        j = next(i for i in range(k, len(presence)) if presence[i].rstrip().endswith(":") and not presence[i].startswith("def ") or presence[i].startswith("    ") and i > k)
+        edited = list(presence)
+        edited[j] = edited[j] + "  # touched"
+        diff = "\n".join(list(difflib.unified_diff(presence, edited, lineterm="", n=1))[2:])
+        self.assertTrue(sb.load_module("delegated_clear").closure_refusals("\n".join(presence), "\n".join(edited), diff, rule["module_roots"]["bin/agent_presence.py"], set(), True), "a change to agent_presence.py is refused")
         self.assertIn("one_line", roots["bin/decision_core.py"])
         # a module is judged on its import-time code too, and a function the clear does not run stays allowed
         module = sb.load_module("delegated_clear")
@@ -29204,7 +29448,7 @@ class TestImpactHold(LedgerBase):
 
     def test_the_five_functions_hunk_headers_missed_are_refused_by_the_ast_on_the_real_daemon_file(self):
         source = self.real_source()
-        for name in ("_apply_impact_hold_locked", "fetch_orders", "_intent_reader", "impact_carry_get", "read_pr_json", "cmd_impact_clear", "impact_clear_core", "delegated_clear_checks", "delegated_clear_pr_checks"):
+        for name in ("fetch_orders", "_intent_reader", "impact_carry_get", "read_pr_json"):
             head, diff = self.edit_one_line_under(source, name)
             self.assertTrue(self.closure_check(head, diff), name)
 
@@ -29250,12 +29494,15 @@ class TestImpactHold(LedgerBase):
         def refuse(new_lines):
             diff = "\n".join(list(difflib.unified_diff(lines, new_lines, lineterm="", n=1))[2:])
             return self.closure_check("\n".join(new_lines), diff)
-        k = next(i for i, l in enumerate(lines) if l.startswith("def load_impact_floor("))
+        k = next(i for i, l in enumerate(lines) if l.strip() == '"load_impact_floor": "impact_floor",')
         mutant = list(lines)
-        j = next(i for i in range(k, k + 8) if "load_module(" in lines[i])
-        mutant[j] = mutant[j].replace('"impact_floor"', '"lanes"')
-        self.assertNotEqual(mutant, lines, "the mutant changed the loader")
-        self.assertTrue(refuse(mutant), "load_impact_floor returning another module")
+        mutant[k] = mutant[k].replace('"impact_floor"', '"lanes"')
+        self.assertNotEqual(mutant, lines, "the mutant changed the loader table")
+        self.assertTrue(refuse(mutant), "load_impact_floor, generated from the table, returning another module")
+        k = next(i for i, l in enumerate(lines) if l.startswith("def _make_loader("))
+        mutant = list(lines)
+        mutant.insert(k + 1, "    # touched")
+        self.assertTrue(refuse(mutant), "the function that makes the loaders")
         k = next(i for i, l in enumerate(lines) if l.startswith("class _LazyImpactFloor"))
         mutant = list(lines)
         mutant.insert(k + 2, "    # touched")
@@ -29319,7 +29566,7 @@ class TestImpactHold(LedgerBase):
             answers["contents/bin/fleet-switchboard"] = [{"name": "x"}]
             self.assertIsNone(sb.delegated_clear_map(None, None, "acme-org/widget-api", item, "b" * 40, rule), "a directory, not a file")
             self.assertIsNone(sb.delegated_clear_map(None, None, "acme-org/widget-api", item, None, rule), "no merge-base: refused")
-            self.assertTrue(rule["closure_roots"] and set(rule["closure_roots"]) <= set(rule["clear_entry_points"]), "the roots are entry points")
+            self.assertTrue(rule["closure_roots"], "the roots are named")
 
     def test_a_repeated_order_number_makes_the_whole_feature_off(self):
         module = sb.load_module("delegated_clear")
@@ -31909,18 +32156,74 @@ class TestDecisionsFromGitHub(Base):
         self.assertEqual(self.derive()[0], [])
         self.assertEqual(len(self.gh.api_calls), calls)
 
-    def test_a_closed_issue_that_keeps_the_persons_label_stays_marked_closed_and_leaves_with_the_label(self):
+    def test_the_catch_up_read_asks_for_open_issues_only(self):
+        self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
+        self.rig.pump(15)
+        reads = [p for p in self.gh.api_calls if "awaiting-user" in p]
+        self.assertTrue([p for p in reads if "state=open" in p], reads)
+        self.assertFalse([p for p in reads if "state=all" in p], reads)   # #570: it used to ask for state=all for the person's label
+
+    def closed_pass(self, runner=None):
+        """One run of the closed-issue pass on the rig's hub: the fresh read of every closed event it holds (bin/closed_labels.py)."""
+        engine = self.world.engine
+        engine.gh_runner = runner or FakeMergedGh()
+        closed_labels = sb.load_module("closed_labels")
+        ns = types.SimpleNamespace(**{n: getattr(sb, n) for n in closed_labels.NEEDS})
+        return closed_labels.run_pass(ns, engine, self.world.clock.now(), sb.IMPACT_PASS_CALLS)
+
+    def close_event(self, issue):
+        issue["state"] = "closed"
+        self.gh.send("issues", {"action": "closed", "issue": dict(issue)})
+
+    def test_a_closed_issue_leaves_the_list_when_a_fresh_read_says_it_is_closed_and_not_before(self):   # #570
         issue = self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
         self.rig.pump(15)
         self.assertEqual(len(self.derive()[0]), 1)
-        issue["state"] = "closed"
-        self.gh.send("issues", {"action": "closed", "issue": dict(issue)})
-        (entry,) = self.derive()[0]
-        self.assertEqual((entry["tier"], entry.get("closed")), ("human", True))
-        self.assertTrue(entry["headline"].endswith("(closed)"))
-        issue["labels"] = []
-        self.gh.send("issues", {"action": "unlabeled", "issue": dict(issue)})
-        self.assertEqual(self.derive()[0], [])
+        self.close_event(issue)
+        self.assertEqual(len(self.derive()[0]), 1, "the event payload alone drops nothing: a late or replayed event must not hide a decision")
+        self.closed_pass()
+        self.assertEqual(self.derive()[0], [], "the fresh read says closed: it leaves the list, whatever label it still carries")
+
+    def test_a_reopened_issue_stays_listed_even_though_a_closed_event_was_seen(self):
+        issue = self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
+        self.rig.pump(15)
+        self.close_event(issue)
+        issue["state"] = "open"   # reopened before the pass looks
+        self.gh.send("issues", {"action": "reopened", "issue": dict(issue)})
+        self.closed_pass()
+        self.assertEqual([d["ask"] for d in self.derive()[0]], [7], "the current read says open: still listed")
+
+    def test_a_replayed_old_closed_event_after_a_reopen_hides_nothing(self):
+        issue = self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
+        self.rig.pump(15)
+        stale = dict(issue, state="closed")
+        self.gh.send("issues", {"action": "closed", "issue": stale})
+        self.closed_pass()   # the issue is open: nothing happens
+        self.world.tick(60)
+        self.gh.send("issues", {"action": "closed", "issue": stale})   # the same old event again
+        self.closed_pass()
+        self.assertEqual([d["ask"] for d in self.derive()[0]], [7], "an open decision is never hidden by an old payload")
+
+    def test_a_closed_payload_with_no_awaiting_label_drops_nothing_either(self):
+        issue = self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
+        self.rig.pump(15)
+        forged = dict(issue, state="closed", labels=[])   # a stale or forged closed payload that carries no label
+        self.gh.send("issues", {"action": "closed", "issue": forged})
+        self.assertEqual([d["ask"] for d in self.derive()[0]], [7], "the payload alone drops nothing, with or without the label")
+        self.rig.pump(15)   # the next catch-up read (open issues only) says what is true: the issue is open and labelled
+        self.assertEqual([d["ask"] for d in self.derive()[0]], [7])
+
+    def test_a_read_that_fails_keeps_the_decision_listed(self):
+        issue = self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
+        self.rig.pump(15)
+        self.close_event(issue)
+        self.gh.api_down = True
+        self.closed_pass()
+        self.assertEqual([d["ask"] for d in self.derive()[0]], [7], "fail toward showing the decision")
+        self.gh.api_down = False
+        self.world.tick(sb.load_module("closed_labels").RETRY_SECONDS + 1)
+        self.closed_pass()
+        self.assertEqual(self.derive()[0], [], "once the read works and says closed, it leaves")
 
     def test_derivation_adds_no_gh_call_per_pass(self):
         self.gh.issue(5, title="A", labels=[DECISION_LABEL])
@@ -41237,6 +41540,153 @@ class TestCaptainDecisionFromLabels(TestCaptainPrs):
         self.assertEqual(self.only()["kind"], "notice")
 
 
+class TestHeldRowsFromLabels(DecisionsBase):
+    """#641: an open pull request that carries the fleet's hold labels is a decision row on those labels alone, one row per pull request, read from the open-pull-request list the daemon already holds."""
+
+    REPO = "acme/api"
+
+    def setUp(self):
+        super().setUp()
+        self.gh = FakeGhPr({7: (0, captain_pr(reviews=[("reviewer", "APPROVED", HEAD_A)]), ""), 30: (0, captain_pr(reviews=[("reviewer", "APPROVED", HEAD_A)]), "")})
+        self.engine = self.world.engine
+        self.engine.config["plan_gates"] = {"repos": {"acme/api": {"mode": "shadow"}}}   # the daemon reads this repository's open pull requests
+        self.engine.ci_record_state = sb.CiRecordState()
+        self.reads = []
+        self.engine.gh_runner = lambda argv, **kw: (self.reads.append(argv), self.gh(argv, **kw))[1]
+
+    def pr(self, number, *labels, head=HEAD_A, state="open", merged=False, title="Add the widget", repo=None):
+        record = {"number": number, "title": title, "state": state, "head": {"sha": head}, "created_at": sb.iso(self.world.clock.now() - 3600),
+                  "labels": [{"name": "tester:%s" % l} for l in labels], "draft": False}
+        if merged:
+            record["merged_at"] = sb.iso(self.world.clock.now() - 60)
+        return record
+
+    def lists(self, *records, repo=None, cut=False):
+        self.engine.ci_record_state.lists[(repo or self.REPO).lower()] = (self.world.clock.now(), list(records))
+
+    def rows(self):
+        return [d for d in self.listed() if d.get("number") in range(7, 400) and d.get("kind") in ("captain", "notice")]
+
+    def test_s1_a_held_pr_with_no_notice_is_one_row_with_its_head_its_holds_and_no_notice_recorded(self):
+        self.lists(self.pr(9, "merge-captain", "hold-security", "hold-contract"))
+        (row,) = [d for d in self.rows() if d["number"] == 9]
+        self.assertEqual((row["id"], row["kind"], row["tier"], row["head"], row["holds"], row["agent"]), ("pr:api#9", "captain", "cos", HEAD_A, ["contract", "security"], None))
+        self.assertEqual(row["note"].count("no notice recorded"), 1)
+        self.assertEqual(row["url"], "https://github.com/acme/api/pull/9")
+
+    def test_s2_a_pr_with_a_notice_and_labels_is_still_one_row_and_keeps_its_notice(self):
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "platform", "ready", self.world.clock.now())
+        self.lists(self.pr(7, "merge-captain", "hold-security"))
+        self.gh.answers[7] = (0, captain_pr(labels=[{"name": "tester:merge-captain"}, {"name": "tester:hold-security"}], reviews=[("reviewer", "APPROVED", HEAD_A)]), "")
+        rows = [d for d in self.rows() if d["number"] == 7]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["agent"], "platform", "the notice's sender")
+
+    def test_s3_a_merged_a_closed_and_an_unlabelled_pr_are_no_row(self):
+        self.lists(self.pr(10, "merge-captain", "hold-security", merged=True), self.pr(11, "hold-security", state="closed"), self.pr(12))
+        self.assertEqual([d for d in self.rows() if d["number"] in (10, 11, 12)], [])
+
+    def test_s4_a_failed_or_cut_read_keeps_the_rows_already_shown(self):
+        self.lists(self.pr(20, "merge-captain"), self.pr(21, "hold-contract"))
+        self.assertEqual(sorted(d["number"] for d in self.rows() if d["number"] in (20, 21)), [20, 21])
+        # the list is read again and is CUT (200 records, the held ones beyond it): the rows stay
+        self.lists(*[self.pr(100 + n) for n in range(sb.LABEL_HOLD_LIST_CUT)])
+        self.assertEqual(sorted(d["number"] for d in self.rows() if d["number"] in (20, 21)), [20, 21])
+        # a complete list without them (they were merged or unlabelled) drops them
+        self.lists(self.pr(100))
+        self.assertEqual([d for d in self.rows() if d["number"] in (20, 21)], [])
+
+    def test_s5_a_labels_only_row_is_cos_then_human_when_escalated_and_its_id_is_the_notices_id(self):
+        self.lists(self.pr(30, "merge-captain", "hold-security"))
+        (row,) = [d for d in self.rows() if d["number"] == 30]
+        self.assertEqual((row["tier"], row["id"]), ("cos", "pr:api#30"))
+        sb.record_pr_notice(self.world.state, self.REPO, 30, "platform", "", self.world.clock.now())
+        self.gh.answers[30] = (0, captain_pr(labels=[{"name": "tester:merge-captain"}], reviews=[("reviewer", "APPROVED", HEAD_A)]), "")
+        self.world.tick(sb.PR_FACTS_TTL + 1)
+        (again,) = [d for d in self.rows() if d["number"] == 30]
+        self.assertEqual(again["id"], "pr:api#30", "the same id with a notice: one row, not two")
+
+    def test_s6_an_excluded_and_an_unwatched_repository_add_no_row_and_no_read_is_made(self):
+        self.engine.config["plan_gates"]["repos"]["acme/secret"] = {"mode": "shadow"}   # WATCHED: only the exclusion can drop it
+        self.engine.config["excluded_repos"] = ["acme/secret"]
+        self.lists(self.pr(40, "merge-captain"), repo="acme/secret")
+        self.lists(self.pr(41, "merge-captain"), repo="elsewhere/unwatched")
+        self.lists(self.pr(42, "merge-captain"), repo="acme/api")
+        before = len(self.reads)
+        self.assertEqual(sorted(d["number"] for d in self.rows() if d["number"] in (40, 41, 42)), [42], "only the watched, not excluded repository lists a row")
+        self.assertEqual(len(self.reads), before, "no gh read is made for any of them")
+
+    def test_u2_the_rows_cost_no_read_of_their_own(self):
+        self.lists(*[self.pr(200 + n, "merge-captain") for n in range(20)])
+        before = len(self.reads)
+        rows = [d for d in self.rows() if 200 <= d["number"] < 220]
+        self.assertEqual(len(rows), 20)
+        self.assertEqual(len(self.reads), before, "20 held pull requests, 0 reads of their own")
+
+    def test_an_escalated_labels_only_row_is_the_persons_for_that_head_and_a_new_head_is_not(self):
+        self.lists(self.pr(60, "merge-captain", head=HEAD_A))
+        (row,) = [d for d in self.rows() if d["number"] == 60]
+        self.assertEqual(row["tier"], "cos")
+        sb.escalate_decision(self.engine, None, row, "needs you", "cos")
+        (row,) = [d for d in self.rows() if d["number"] == 60]
+        self.assertEqual(row["tier"], "human")
+        self.lists(self.pr(60, "merge-captain", head=HEAD_B))
+        (row,) = [d for d in self.rows() if d["number"] == 60]
+        self.assertEqual((row["tier"], row["head"]), ("cos", HEAD_B), "an escalation of an older head does not make a new head the person's")
+
+    def test_a_repository_whose_list_is_gone_keeps_its_rows_and_a_failure_in_the_build_is_audited_and_lists_nothing(self):
+        self.lists(self.pr(70, "hold-security"))
+        self.assertEqual([d["number"] for d in self.rows() if d["number"] == 70], [70])
+        self.engine.ci_record_state.lists.clear()
+        self.engine.ci_record_state.lists["acme/other"] = (self.world.clock.now(), [])
+        self.assertEqual([d["number"] for d in self.rows() if d["number"] == 70], [70], "its list is gone for now: the row stays")
+        self.engine.config["excluded_repos"] = ["acme/api"]
+        self.assertEqual([d for d in self.rows() if d["number"] == 70], [], "excluded now: nothing is kept")
+        self.engine.config["excluded_repos"] = []
+        self.engine.ci_record_state.lists["acme/api"] = (self.world.clock.now(), [self.pr(71, "merge-captain")])
+        with mock.patch.object(sb, "plan_ledger", types.SimpleNamespace(normal_repo=lambda r: (_ for _ in ()).throw(RuntimeError("broken")))):
+            self.assertEqual(sb.label_hold_entries(self.engine, self.world.clock.now(), set(), {}, set()), [])
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "decisions.hold_rows_error"])
+
+    def test_a_title_with_an_escape_sequence_reaches_the_list_without_it(self):
+        self.lists(self.pr(80, "merge-captain", title="Add it \x1b]0;evil\x07 now"))
+        (row,) = [d for d in self.rows() if d["number"] == 80]
+        self.assertNotRegex(row["title"] + row["headline"], r"[\x00-\x08\x0b-\x1f\x7f]")
+
+    def test_a_notice_with_a_mixed_case_repository_and_the_same_pr_from_the_list_are_one_row(self):
+        for noticed_as, listed_as in (("Acme/Api", "acme/api"), ("ACME/API", "acme/api"), ("acme/api", "acme/api")):
+            self.setUp()
+            sb.record_pr_notice(self.world.state, noticed_as, 7, "platform", "ready", self.world.clock.now())
+            self.lists(self.pr(7, "merge-captain", "hold-security"), repo=listed_as)
+            self.gh.answers[7] = (0, captain_pr(labels=[{"name": "tester:merge-captain"}], reviews=[("reviewer", "APPROVED", HEAD_A)]), "")
+            rows = [d for d in self.rows() if d["number"] == 7]
+            self.assertEqual(len(rows), 1, (noticed_as, [d["id"] for d in rows]))
+            self.assertEqual(rows[0]["agent"], "platform")
+
+    def test_the_exclusion_holds_for_a_case_variant_of_an_excluded_repository(self):
+        self.engine.config["plan_gates"]["repos"]["Acme/Secret"] = {"mode": "shadow"}
+        self.engine.config["excluded_repos"] = ["acme/secret"]
+        self.lists(self.pr(90, "merge-captain"), repo="ACME/SECRET")
+        self.assertEqual([d for d in self.rows() if d["number"] == 90], [])
+
+    def test_a_row_kept_because_its_list_is_cut_expires_after_a_day(self):
+        self.lists(self.pr(95, "merge-captain"))
+        self.assertEqual([d["number"] for d in self.rows() if d["number"] == 95], [95])
+        self.lists(*[self.pr(100 + n) for n in range(sb.LABEL_HOLD_LIST_CUT)])
+        self.assertEqual([d["number"] for d in self.rows() if d["number"] == 95], [95], "kept while the list is cut")
+        self.world.tick(sb.LABEL_HOLD_KEEP_SECONDS + 60)
+        self.lists(*[self.pr(100 + n) for n in range(sb.LABEL_HOLD_LIST_CUT)])
+        self.assertEqual([d for d in self.rows() if d["number"] == 95], [], "a pull request that merged meanwhile does not stay for ever")
+
+    def test_a_pr_with_only_a_merge_automatic_label_is_not_held(self):
+        self.lists(self.pr(50, "merge-automatic"))
+        self.assertEqual([d for d in self.rows() if d["number"] == 50], [])
+
+    def test_no_list_no_rows_and_a_command_engine_adds_none(self):
+        self.engine.__dict__.pop("ci_record_state", None)
+        self.assertEqual([d for d in self.rows() if d["number"] >= 8], [])
+
+
 class TestPrExplainer(DecisionsBase):
     """#179 slice L6: the explainer block (a before and after why part on every PR; for a captain PR the infographic first), printed by a read-only
     command and put in a description ONCE. The Mermaid check is against the SUBSET this command writes, not Mermaid's own parser."""
@@ -43457,22 +43907,36 @@ class TestDecisionBaselineSeams(BaselineWorld):
         decisions, errors = baseline_derive(self.world.engine, self.world.clock.now)
         self.assertFalse([d for d in decisions if "order" in d or "waits_for" in d], "no line anywhere: the list carries nothing new")
 
-    def test_a_closed_issue_with_the_persons_label_stays_listed_marked_closed_until_the_label_goes(self):
+    def test_a_closed_issue_is_never_added_and_one_kept_leaves_only_when_forgotten_by_a_fresh_read(self):   # #570: it used to stay listed, marked closed
         baseline_attach_hub(self.world.engine, self.route, self.world.clock.now)
         hub = self.world.engine.hub
         mine, cos = "me:awaiting-user", "me:awaiting-cos"
         issue = lambda n, state, names: {"number": n, "title": "issue %d" % n, "state": state,
                                          "labels": [{"name": x} for x in names], "updated_at": "2027-01-15T07:00:00Z"}
-        hub.note_awaiting_issue(API, issue(20, "closed", [mine]))              # closed, the person's label: listed, closed
-        hub.note_awaiting_issue(API, issue(21, "closed", [cos]))               # closed, the Chief of Staff's: forgotten
+        hub.note_awaiting_issue(API, issue(20, "closed", [mine]))              # closed, the person's label: never added
+        hub.note_awaiting_issue(API, issue(21, "closed", [cos]))               # closed, the Chief of Staff's: never added
         hub.note_awaiting_issue(API, issue(22, "open", [mine]))                # open: as ever
-        hub.note_awaiting_issue(API, issue(23, "closed", [mine, cos]))         # both: the person's
+        hub.note_awaiting_issue(API, issue(23, "closed", [mine, cos]))         # both: never added
         got = {r["number"]: (r["tier"], r["closed"]) for r in hub.awaiting_listing()[0]}
-        self.assertEqual(got, {20: ("human", True), 22: ("human", False), 23: ("human", True)})
-        hub.note_awaiting_issue(API, issue(20, "closed", []))                  # the label comes off: it leaves
-        self.assertNotIn(20, {r["number"] for r in hub.awaiting_listing()[0]})
+        self.assertEqual(got, {22: ("human", False)})
+        hub.note_awaiting_issue(API, issue(22, "closed", [mine]))              # a closed PAYLOAD for a kept issue drops nothing
+        self.assertEqual([r["number"] for r in hub.awaiting_listing()[0]], [22])
+        hub.forget_awaiting(API, 22)                                           # a fresh read said closed
+        self.assertEqual(hub.awaiting_listing()[0], [])
 
-    def test_the_closed_issue_shows_in_the_human_tier_with_its_report_folded_in(self):
+    def test_a_mixed_case_repo_is_one_key_for_events_reads_and_the_fresh_read_forget(self):   # #570: the closed ref is folded; the hub must fold the same way
+        baseline_attach_hub(self.world.engine, self.route, self.world.clock.now)
+        hub = self.world.engine.hub
+        issue = {"number": 30, "title": "x", "state": "open", "labels": [{"name": "me:awaiting-user"}], "updated_at": "2027-01-15T07:00:00Z"}
+        hub.note_awaiting_issue("Acme-Org/Widget-Service", issue)
+        hub.note_awaiting_issue("acme-org/widget-service", issue)              # the lower-cased variant of the same repo: the same issue
+        hub.note_awaiting_issue("ACME-ORG/WIDGET-SERVICE", issue)
+        self.assertEqual(len(hub.awaiting_listing()[0]), 1, "three spellings, one issue")
+        self.assertEqual(hub.awaiting_key("Acme-Org/Widget-Service", 30), hub.awaiting_key("ACME-ORG/widget-service", 30))
+        hub.forget_awaiting("acme-org/widget-service", 30)                     # the closed ref carries the folded name
+        self.assertEqual(hub.awaiting_listing()[0], [], "it leaves the list whatever case configured or sent")
+
+    def test_a_closed_issue_never_shows_and_the_report_that_named_it_goes_with_it(self):   # #570: it used to show in the human tier marked closed
         entries = sb.decision_core.build_entries(
             [{"kind": "issue", "title": "Won't-do: drop the legacy path", "ask": 7, "agent": None, "since": 100.0, "seed": "issue:acme/api#7",
               "bare": True, "repo": "acme/api", "tier": "human", "closed": True},
@@ -43482,16 +43946,11 @@ class TestDecisionBaselineSeams(BaselineWorld):
               "seed": "report:1", "bare": False, "repo": "acme/api", "tier": "cos", "repo_known": True}],
             ["d1", "d2", "d3"], "acme/api", lambda repo, number: None)
         by = {e["ask"]: e for e in entries}
-        self.assertEqual(sorted(by), [7, 8], "the report folded into the issue's row: one row, not two")
-        self.assertEqual((by[7]["tier"], by[7]["closed"], by[7]["reported_by"]), ("human", True, ["orch"]))
-        self.assertTrue(by[7]["headline"].endswith("(closed)"))
+        self.assertEqual(sorted(by), [8], "the closed issue is not listed, and neither is the report folded into it")
         self.assertNotIn("closed", by[8])
         self.assertFalse(by[8]["headline"].endswith("(closed)"))
-        long_title = "x " * 120
-        got = sb.decision_core.build_entries([{"kind": "issue", "title": long_title, "ask": 9, "agent": None, "since": 1.0,
-                                               "seed": "i", "bare": True, "repo": "acme/api", "tier": "human", "closed": True}],
-                                              ["d9"], "acme/api", lambda r, n: None)
-        self.assertTrue(got[0]["headline"].endswith("(closed)"), "the suffix is never cut")
+        self.assertEqual(sb.decision_core.build_entries([{"kind": "issue", "title": "x " * 120, "ask": 9, "agent": None, "since": 1.0, "seed": "i", "bare": True,
+                                                          "repo": "acme/api", "tier": "human", "closed": True}], ["d9"], "acme/api", lambda r, n: None), [])
 
     def test_the_tier_of_an_issue_payload_with_both_labels(self):
         """The webhook path hands the hub one payload with every label the issue carries (the catch-up read
@@ -46155,7 +46614,8 @@ class TestExternalWiring(ExternalWorld):
 
     def test_the_loader_is_the_one_the_core_uses(self):
         text = SWITCHBOARD.read_text()
-        self.assertIn("def load_external_adapter", text)
+        self.assertIs(sb.load_external_adapter(), sb.load_module("external_adapter"))   # #437: the loaders are generated from HELPER_MODULES, not written as a def each
+        self.assertEqual(sb.HELPER_MODULES["load_external_adapter"], "external_adapter")
         self.assertNotIn("\nimport external_adapter", text)
         self.assertNotIn("\nfrom external_adapter", text)
 
@@ -57187,6 +57647,173 @@ def main(argv):
     return 0 if ok else 1
 
 
+class TestSlice3Modules(Base):
+    """#437 slice 3: the loaders come from one generator, three more modules declare their own key, and two modules added on two branches never touch a shared line."""
+
+    OLD = [   # what validate_config said before the move (recorded from the previous program): the error text is the contract
+        ("temp_janitor", {"days": 0}, "config: temp_janitor.days must be a whole number from 1 to 365, got 0"),
+        ("temp_janitor", "x", "config: 'temp_janitor' must be an object with only enabled, days, keep, dir, scan_seconds and weekly_scan_seconds, got 'x'"),
+        ("chat_clear", {"live": "y"}, 'config: \'chat_clear\' must be {"enabled": true|false, "live": true|false}, got {\'live\': \'y\'}'),
+        ("chat_clear", [1], 'config: \'chat_clear\' must be {"enabled": true|false, "live": true|false}, got [1]'),
+        ("impact_floor", {"enabled": "y"}, "config: 'impact_floor.enabled' must be true or false"),
+        ("impact_floor", "x", "config: 'impact_floor' must be an object"),
+        ("impact_floor", {"zzz": 1}, "config: 'impact_floor' has key(s) this tool does not read: zzz"),
+    ]
+    GOOD = {"temp_janitor": [None, {"days": 3}], "chat_clear": [None, {"live": True}], "impact_floor": [None, {"enabled": True}]}
+
+    def test_s1_every_loader_is_generated_and_returns_the_module_load_module_returns(self):
+        tree = ast.parse(SWITCHBOARD.read_text())
+        defined = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+        self.assertEqual(len(sb.HELPER_MODULES), 22)
+        self.assertEqual(defined & set(sb.HELPER_MODULES), set(), "0 of the loaders has a def of its own")
+        for function, module in sb.HELPER_MODULES.items():
+            with self.subTest(function=function):
+                loader = getattr(sb, function)
+                self.assertIs(loader(), sb.load_module(module))
+                self.assertIs(loader(), loader(), "the second call returns the identical object")
+                self.assertEqual(loader.__name__, function)
+
+    def test_s2_the_moved_keys_give_the_old_results_and_the_old_error_text(self):
+        for key, values in self.GOOD.items():
+            for value in values:
+                with self.subTest(key=key, value=value):
+                    sb.validate_config({key: value})
+        sb.validate_config({})
+        for key, value, text in self.OLD:
+            with self.subTest(key=key, value=value), self.assertRaises(sb.ConfigError) as caught:
+                sb.validate_config({key: value})
+            self.assertEqual(str(caught.exception), text)
+
+    def test_s3_the_three_keys_are_declared_by_their_modules_and_in_no_shared_place(self):
+        declared = sb.config_declarations()
+        for key, module in (("temp_janitor", "disk_janitor"), ("chat_clear", "chat_clear"), ("impact_floor", "impact_floor")):
+            with self.subTest(key=key):
+                self.assertEqual(declared[key], module)
+                self.assertNotIn(key, sb.TOP_LEVEL_EXTRA_KEYS)
+                self.assertIn(key, sb.config_known_keys())
+        source = inspect.getsource(sb.validate_config)
+        for text in ('"temp_janitor"', '"chat_clear"', '"impact_floor"'):
+            self.assertNotIn(text, source, "no inline block for it is left in the validation chain")
+
+    def make_program(self, extra):
+        """A copy of the real program and its modules in a scratch directory, with `extra` files added to its bin."""
+        directory = Path(tempfile.mkdtemp(prefix="slice3-"))
+        self.addCleanup(shutil.rmtree, directory, True)
+        for path in BIN.glob("*.py"):
+            shutil.copy(str(path), str(directory / path.name))
+        shutil.copy(str(SWITCHBOARD), str(directory / "fleet-switchboard"))
+        for name, text in extra.items():
+            (directory / name).write_text(text)
+        return directory
+
+    def load_copy(self, directory):
+        loader = importlib.machinery.SourceFileLoader("sb_copy_%d" % id(directory), str(directory / "fleet-switchboard"))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(module)
+        return module
+
+    def test_s4_a_fixture_module_with_a_key_needs_no_change_to_the_program(self):
+        fixture = 'CONFIG_KEY = "slice3_key"\nCONFIG_DEFAULT = {"n": 2}\n\n\ndef validate(raw, source):\n    if not isinstance(raw, dict):\n        raise ValueError("%s: slice3 bad" % source)\n\n\ndef hello():\n    return "hi"\n'
+        directory = self.make_program({"slice3_mod.py": fixture})
+        before = (directory / "fleet-switchboard").read_bytes()
+        copy = self.load_copy(directory)
+        self.assertEqual(copy.load_module("slice3_mod").hello(), "hi", "found by name from its own file")
+        self.assertEqual(copy.validate_config({})["slice3_key"], {"n": 2})
+        with self.assertRaises(copy.ConfigError) as caught:
+            copy.validate_config({"slice3_key": 5})
+        self.assertEqual(str(caught.exception), "config: slice3 bad")
+        self.assertEqual((directory / "fleet-switchboard").read_bytes(), before)
+
+    def test_s5_two_branches_that_each_add_a_module_merge_without_a_conflict_and_both_keys_work_after_the_merge(self):
+        directory = Path(tempfile.mkdtemp(prefix="slice3-merge-"))
+        self.addCleanup(shutil.rmtree, directory, True)
+        (directory / "bin").mkdir()
+        for path in BIN.glob("*.py"):
+            shutil.copy(str(path), str(directory / "bin" / path.name))
+        shutil.copy(str(SWITCHBOARD), str(directory / "bin" / "fleet-switchboard"))
+
+        def git(*args):
+            return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"] + list(args), cwd=str(directory),
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+
+        self.assertEqual(git("init", "-q", "-b", "main").returncode, 0)
+        git("add", "-A"), git("commit", "-q", "-m", "base")
+        for branch, key in (("one", "fixture_one"), ("two", "fixture_two")):
+            git("checkout", "-q", "-b", branch, "main")
+            (directory / "bin" / ("%s.py" % key)).write_text('CONFIG_KEY = "%s"\nCONFIG_DEFAULT = {"n": 1}\n\n\ndef validate(raw, source):\n    if raw is not None and not isinstance(raw, dict):\n        raise ValueError("%s: bad")\n' % (key, key))
+            git("add", "-A"), git("commit", "-q", "-m", branch)
+            self.assertEqual(git("diff", "--name-only", "main", branch).stdout.split(), ["bin/%s.py" % key], "0 lines of the program changed")
+        git("checkout", "-q", "one")
+        merged = git("merge", "--no-edit", "two")
+        self.assertEqual(merged.returncode, 0, merged.stdout)
+        loader = importlib.machinery.SourceFileLoader("sb_merged_%d" % id(directory), str(directory / "bin" / "fleet-switchboard"))
+        program = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(program)
+        seen = []
+        program.warn_unknown_config = lambda message, section="", names=(), known=(): seen.append(list(names))
+        config = program.validate_config({})
+        self.assertEqual((config["fixture_one"], config["fixture_two"]), ({"n": 1}, {"n": 1}), "both modules are found and defaulted after the merge, with no line in the program")
+        self.assertEqual(seen, [])
+        with self.assertRaises(program.ConfigError):
+            program.validate_config({"fixture_two": "bad"})
+        # the test fails when the behaviour breaks: a program that kept a shared key table (no declaration scan) does not know the keys
+        program.config_declarations = lambda: {}
+        program.validate_config({"fixture_one": {"n": 2}, "fixture_two": {"n": 3}})
+        self.assertEqual(seen, [["fixture_one", "fixture_two"]], "with the declarations removed the keys are unknown: this test would fail")
+
+    def test_a_missing_module_file_refuses_the_configuration_for_each_of_the_three_moved_keys_with_the_floor_message(self):
+        for key, module, good in (("temp_janitor", "disk_janitor", {"days": 3}), ("chat_clear", "chat_clear", {"live": True}), ("impact_floor", "impact_floor", {"enabled": True})):
+            with self.subTest(key=key):
+                directory = Path(tempfile.mkdtemp(prefix="slice3-missing-"))
+                self.addCleanup(shutil.rmtree, directory, True)
+                for path in BIN.glob("*.py"):
+                    if path.stem != module:   # the module file is gone
+                        shutil.copy(str(path), str(directory / path.name))
+                with mock.patch.object(sb, "CONFIG_DECLARATIONS_DIR", str(directory)), self.assertRaises(sb.ConfigError) as caught:
+                    sb.validate_config({key: good})
+                self.assertEqual(str(caught.exception), "config key %r must be declared by %s.py, and it is not (the module is missing, its CONFIG_KEY line is missing or damaged, "
+                                 "or it names another key): no configuration is loaded" % (key, module))
+
+    def test_when_two_keys_are_wrong_the_declared_modules_win_in_module_name_order_and_the_earlier_checks_win_over_them(self):
+        bad = {"temp_janitor": "x", "chat_clear": "x", "impact_floor": "x"}
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.validate_config(dict(bad))
+        self.assertIn("'chat_clear'", str(caught.exception), "chat_clear.py sorts before disk_janitor.py and impact_floor.py")
+        del bad["chat_clear"]
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.validate_config(dict(bad))
+        self.assertIn("temp_janitor", str(caught.exception), "disk_janitor.py sorts before impact_floor.py")
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.validate_config({"chat_clear": "x", "cpu_guard": "x"})
+        self.assertIn("cpu_guard", str(caught.exception), "the checks that run before the declared ones still win")
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.validate_config({"chat_clear": "x", "docker_reaper": "x"})
+        self.assertIn("chat_clear", str(caught.exception), "a declared module's check wins over the ones that follow it")
+
+    def test_s6_a_default_owned_key_and_a_key_with_its_validator_in_the_program_stay_where_they_were(self):
+        self.assertTrue({"reds", "heavy", "cpu_guard"} <= set(sb.DEFAULTS))
+        self.assertTrue({"sweep", "triage", "plan_review", "impact_hold"} <= sb.TOP_LEVEL_EXTRA_KEYS)
+        for key, value in (("sweep", "x"), ("impact_hold", "x"), ("plan_review", "x")):
+            with self.subTest(key=key), self.assertRaises(sb.ConfigError):
+                sb.validate_config({key: value})
+
+    def test_s7_a_module_name_that_is_a_path_or_missing_is_refused(self):
+        for name in ("../fleet_health", "/etc/passwd", "no_such_module_xyz", "a/b", ""):
+            with self.subTest(name=name), self.assertRaises((ValueError, ImportError, OSError)):
+                sb.load_module(name)
+
+    def test_u2_a_missing_or_broken_module_fails_with_an_error_and_is_not_kept(self):
+        directory = self.make_program({"broken_mod.py": "def (:\n"})
+        copy = self.load_copy(directory)
+        with self.assertRaises(SyntaxError):
+            copy.load_module("broken_mod")
+        with self.assertRaises(SyntaxError):
+            copy.load_module("broken_mod")   # a failed import is never kept: it fails again
+        with self.assertRaises(FileNotFoundError):
+            copy.load_module("absent_mod")
+        self.assertNotIn("broken_mod", sys.modules)
+
+
 class TestConfigDeclarations(Base):
     """#437 slice 2: a module declares its own configuration key, default and validator; the shared code reads the declarations from the bin directory only."""
 
@@ -57339,7 +57966,8 @@ class TestConfigDeclarations(Base):
         self.assertIn("repo_exclusion.py", str(caught.exception), "the module is missing")
 
     def test_the_real_floor_names_the_two_moved_keys_and_the_real_modules_meet_it(self):
-        self.assertEqual(sb.CONFIG_MUST_DECLARE, {"excluded_repos": "repo_exclusion", "spotlight_guard": "spotlight_guard"})
+        self.assertEqual(sb.CONFIG_MUST_DECLARE, {"excluded_repos": "repo_exclusion", "spotlight_guard": "spotlight_guard", "temp_janitor": "disk_janitor",
+                                                  "chat_clear": "chat_clear", "impact_floor": "impact_floor"})
         self.assertEqual({k: sb.config_declarations()[k] for k in sb.CONFIG_MUST_DECLARE}, sb.CONFIG_MUST_DECLARE)
 
     def test_s7_the_moved_keys_are_known_through_their_declarations(self):
@@ -58069,6 +58697,70 @@ class TestAuthorityModulesGuard(unittest.TestCase):
         self.assertTrue(words and all(isinstance(w, str) and re.fullmatch(r"[a-z]+", w) for w in words))
 
 
+class TestOwnerClearModule(unittest.TestCase):
+    """Ask #532, slice 3: the code that decides who may clear, hold or release lives in bin/impact_hold.py (listed in the matrix), not in the daemon file. The names come from the
+    module's own MOVED tuple and the paths from the matrix: this test has no list of its own."""
+
+    def setUp(self):
+        self.floor = sb.load_module("impact_floor")
+        self.matrix = self.floor.load_matrix()
+        self.module = sb.load_module("impact_hold")
+        self.daemon = BIN / "fleet-switchboard"
+
+    @staticmethod
+    def defined(source):
+        import ast
+        return {n.name for n in ast.parse(source).body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+    def test_the_moved_functions_are_defined_in_the_module_and_found_in_the_daemon_under_their_old_names(self):
+        self.assertGreaterEqual(len(self.module.MOVED), 8)
+        self.assertEqual(self.defined(Path(self.module.__file__).read_text()) & set(self.module.MOVED), set(self.module.MOVED))
+        for name in self.module.MOVED:
+            self.assertTrue(callable(getattr(sb, name)), name)
+            self.assertIs(getattr(sb, name).__globals__, vars(sb), name + " runs in the daemon's own globals, as before the move")
+
+    def test_s5_s7_none_of_the_moved_functions_is_defined_in_the_daemon_file_and_one_registration_names_the_module(self):
+        source = self.daemon.read_text()
+        self.assertEqual(self.defined(source) & set(self.module.MOVED), set())
+        self.assertEqual(source.count('load_module("impact_hold").bind('), 1)
+
+    def test_s7_a_moved_function_copied_back_into_the_daemon_is_named(self):
+        name = self.module.MOVED[0]
+        copied = self.daemon.read_text() + "\n\ndef %s(*args):\n    return None\n" % name
+        self.assertEqual(sorted(self.defined(copied) & set(self.module.MOVED)), [name])
+
+    def test_s3_no_code_outside_the_matrix_names_a_top_tier_path_as_a_literal(self):
+        import ast
+        listed = {g for globs in self.matrix["owner_hold"]["top_tier_paths"].values() for g in globs}
+        files = sorted(BIN.glob("*.py")) + [self.daemon]
+        hits = []
+        for path in files:
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in listed:
+                    hits.append("%s: %s" % (path.name, node.value))
+        self.assertEqual(hits, [])
+
+    def test_s6_a_change_to_the_module_holds_for_the_owner_and_naming_it_a_change_to_another_daemon_function_does_not(self):
+        globs, exclude, force = self.floor.floor_for("adamkaplan/fleet-kit")
+        floor_hit = lambda paths: self.floor.floor_paths(paths, globs, exclude, force)
+        moved = self.floor.owner_decide(self.matrix, ["bin/impact_hold.py"], [], None, floor_hit(["bin/impact_hold.py"]))
+        other = self.floor.owner_decide(self.matrix, ["bin/fleet-switchboard"], [], None, floor_hit(["bin/fleet-switchboard"]))
+        self.assertEqual(moved[0], "hold")
+        self.assertTrue(any("bin/impact_hold.py" in r for r in moved[1]), moved)
+        self.assertNotEqual(other[0], "hold", other)
+
+    def test_s8_without_the_module_the_daemon_refuses_loudly_and_names_it(self):
+        import shutil
+        with tempfile.TemporaryDirectory() as tmp:
+            for path in list(BIN.glob("*.py")) + [self.daemon]:
+                if path.name != "impact_hold.py":
+                    shutil.copy(path, Path(tmp) / path.name)
+            done = subprocess.run([sys.executable, str(Path(tmp) / "fleet-switchboard"), "impact", "clear", "acme/api#1", "--reason", "x"], capture_output=True, text=True, timeout=60,
+                                  env=dict(os.environ, FLEET_SWITCHBOARD_STATE_DIR=tmp))
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn("impact_hold", done.stderr)
+
+
 class TestOwnerHoldRule(unittest.TestCase):
     """Ask #451, slice 1: the owner's own clear is for credentials, identity and who may do what only. The rule is data in the impact matrix file."""
 
@@ -58750,6 +59442,97 @@ class TestMoveAnAsk(LanesCase):
         self.assertIn("reminders: 2 cancelled", out)
         self.assertIn("no orchestrator is running charter #10", out)
         self.assertEqual([r["issue"] for r in sb.read_reminders(self.world.state)], [4])
+
+    def block_named(self):
+        """The live shape: the orchestrators carry no charter number in their metadata; each charter's own block names its orchestrator."""
+        for name in ("orch-a", "orch-b"):
+            fleet = self.world.v2.sessions[self.world.sessions[name]]["metadata"]["fleet"]
+            del fleet["charter"]
+            fleet["repo"] = FAKE_REPO
+        self.gh.bodies = {1: "```yaml\norchestrator: orch-a\nstatus: active\n```\n", 10: "```yaml\norchestrator: orch-b\nstatus: active\n```\n"}
+
+    def notice_lines(self):
+        return [e for e in self.world.audit() if e["event"] == "lanes.move.notice"]
+
+    def test_s1_orchestrators_named_only_by_the_charter_block_are_told_and_audited(self):
+        self.block_named()
+        code, out, err = self.main("move", "2", "--to", "10")
+        self.assertEqual((code, err), (0, ""), out)
+        (note,) = [a["text"] for a in self.world.admissions("orch-b")]
+        self.assertEqual(sum("## %s" % h in note for h in sb.load_module("lanes").HANDOVER_SECTIONS), 6)
+        self.assertEqual(len(self.world.admissions("orch-a")), 1)
+        lines = self.notice_lines()
+        self.assertEqual(sorted((l["detail"]["recipient"], l["detail"]["outcome"]) for l in lines), [("orch-a", "sent"), ("orch-b", "sent")])
+        self.assertIn("reminders: 2 carried", out)
+        held = {(r["issue"], r["to"]) for r in sb.read_reminders(self.world.state)}
+        self.assertEqual(held, {(2, "orch-b"), (4, "orch-a")}, "the reminders follow the block-named orchestrator")
+
+    def test_s5_a_charter_block_that_names_no_live_orchestrator_falls_back_to_the_metadata(self):
+        self.gh.bodies = {10: "```yaml\norchestrator: nobody-here\n```\n"}
+        code, out, err = self.main("move", "2", "--to", "10")
+        self.assertEqual((code, len(self.world.admissions("orch-b"))), (0, 1), err)
+
+    def skipped_for_new(self):
+        code, out, err = self.main("move", "%s#2" % FAKE_REPO, "--to", "%s#10" % FAKE_REPO)
+        self.assertEqual((code, self.parents(), self.world.admissions("orch-b")), (1, [10], []), err + out)
+        self.assertEqual([l["detail"]["outcome"] for l in self.notice_lines() if l["detail"]["role"] == "new orchestrator"], ["skipped"])
+
+    def test_a_body_naming_an_orchestrator_of_another_repository_tells_no_one(self):
+        self.block_named()
+        fleet = self.world.v2.sessions[self.world.sessions["orch-b"]]["metadata"]["fleet"]
+        fleet["repo"] = "other-org/other-repo"
+        self.skipped_for_new()
+
+    def test_a_prose_line_before_the_block_does_not_name_the_orchestrator(self):
+        self.block_named()
+        self.gh.bodies[10] = "Notes:\norchestrator: orch-b\n\n```yaml\norchestrator: platform\n```\n"
+        self.skipped_for_new()
+
+    def test_a_body_naming_a_coder_tells_no_one(self):
+        self.block_named()
+        self.gh.bodies[10] = "```yaml\norchestrator: worker\n```\n"
+        sid = self.world.sessions["orch-b"]
+        self.world.v2.sessions[sid]["metadata"]["fleet"]["role"] = "coder"
+        self.skipped_for_new()
+
+    def test_two_metadata_candidates_for_one_charter_tell_no_one(self):
+        self.world.add_agent("orch-c", fleet={"role": "orchestrator", "charter": 10})
+        self.skipped_for_new()
+
+    def test_s6_the_audit_lines_hold_the_recipient_outcome_and_reason_and_never_the_text(self):
+        self.main("move", "2", "--to", "10")
+        lines = self.notice_lines()
+        self.assertEqual(len(lines), 2)
+        for line in lines:
+            self.assertEqual(sorted(line["detail"]), ["outcome", "reason", "recipient", "role"])
+            self.assertNotIn("## State", json.dumps(line))
+
+    def test_s3_with_no_findable_orchestrator_the_ask_is_moved_one_line_says_skipped_and_the_exit_is_1(self):
+        sid = self.world.sessions.pop("orch-b")
+        self.world.v2.sessions[sid]["metadata"]["fleet"]["role"] = "coder"
+        code, out, err = self.main("move", "2", "--to", "10")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.parents(), [10])
+        self.assertIn("no orchestrator is running charter #10", out)
+        self.assertIn("handover note (no orchestrator is running charter #10)", err)
+        skipped = [l for l in self.notice_lines() if l["detail"]["outcome"] == "skipped"]
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("charter #10", skipped[0]["detail"]["reason"])
+
+    def test_s4_a_failed_send_to_the_new_orchestrator_does_not_stop_the_old_notice(self):
+        real = sb.Switchboard.send
+
+        def send(engine, sender, recipient, *a, **k):
+            if recipient == "orch-b":
+                raise RuntimeError("herdr is down")
+            return real(engine, sender, recipient, *a, **k)
+        with mock.patch.object(sb.Switchboard, "send", send):
+            code, out, err = self.main("move", "2", "--to", "10")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.parents(), [10])
+        self.assertEqual((len(self.world.admissions("orch-a")), len(self.world.admissions("orch-b"))), (1, 0))
+        outcomes = sorted((l["detail"]["recipient"], l["detail"]["outcome"]) for l in self.notice_lines())
+        self.assertEqual(outcomes, [("orch-a", "sent"), ("orch-b", "failed")])
 
     def test_s3_a_refused_write_leaves_the_ask_under_its_charter_and_names_the_step(self):
         self.gh.fail_write = True
@@ -59633,6 +60416,220 @@ class TestMergedLabels(Base):
         self.assertTrue(sb._issue_pr_merged({"pull_request": {"merged_at": "2026-10-15T10:00:00Z"}}))
         for record in ({"pull_request": {"merged_at": None}}, {"pull_request": {}}, {}, None, {"pull_request": "x"}):
             self.assertFalse(sb._issue_pr_merged(record), record)
+
+
+class StubIssueHub:
+    """The hub as the closed-issue pass sees it: the events it holds, and a fresh read per issue (`reads`: number -> dict, or an exception)."""
+
+    def __init__(self, entries, reads):
+        self.entries, self.reads, self.read_log = entries, reads, []
+
+    def closed_issue_snapshot(self):
+        return {ref: dict(entry) for ref, entry in self.entries.items()}
+
+    def forget_awaiting(self, repo, number):
+        self.forgotten = getattr(self, "forgotten", []) + [(repo, number)]
+
+    def _read_one(self, repo, path, now, fresh=False):
+        number = int(path.rsplit("/", 1)[1])
+        self.read_log.append((repo, number, fresh))
+        found = self.reads[number]
+        if isinstance(found, Exception):
+            raise found
+        return dict(found)
+
+
+class TestClosedIssueLabels(Base):
+    """Ask #570: a closed issue's awaiting labels come off (fleet prefix only), the Chief of Staff gets one line, and nothing else is touched."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=(), config={"gh": FAKE_GH, "github_repos": ["acme/api"], "excluded_repos": ["acme/secret"]})
+        self.world.add_agent("chief-of-staff", fleet={"role": "chief-of-staff"})
+        user = sb.getpass.getuser()
+        self.awaiting = ["%s:awaiting-user" % user, "%s:awaiting-cos" % user]
+        self.live = "%s:awaiting-live" % user
+        self.parked = "%s:parked" % user
+        self.engine = self.world.new_engine()
+
+    def entry(self, labels=None):
+        return {"labels": sorted(labels if labels is not None else self.awaiting + [self.parked, "bug"]), "at": 1}
+
+    def issue(self, state="closed", labels=None, **more):
+        names = labels if labels is not None else self.awaiting + [self.parked, "bug"]
+        return dict({"state": state, "labels": [{"name": n} for n in names]}, **more)
+
+    def go(self, entries, reads, gh):
+        self.engine.hub, self.engine.gh_runner = StubIssueHub(entries, reads), gh
+        closed_labels = sb.load_module("closed_labels")
+        ns = types.SimpleNamespace(**{n: getattr(sb, n) for n in closed_labels.NEEDS})
+        return closed_labels.run_pass(ns, self.engine, self.world.clock.now(), sb.IMPACT_PASS_CALLS)
+
+    def audit(self, event):
+        return [e for e in self.world.audit() if e["event"] == event]
+
+    def told(self):
+        return [a["text"] for a in self.world.admissions("chief-of-staff")]
+
+    def test_s2_the_awaiting_labels_come_off_and_the_parked_and_other_labels_stay(self):
+        gh = FakeMergedGh()
+        self.go({"acme/api#7": self.entry()}, {7: self.issue()}, gh)
+        self.assertEqual(sorted(gh.removed), sorted(self.awaiting), "2 awaiting labels removed; parked and bug stay")
+        (line,) = self.audit("closed.labels_removed")
+        self.assertEqual((line["subject"], sorted(line["detail"]["labels"])), ("acme/api#7", sorted(self.awaiting)))
+
+    def test_the_live_label_of_the_fleet_prefix_goes_too_and_another_prefixs_does_not(self):
+        gh = FakeMergedGh()
+        labels = [self.live, "someone-else:awaiting-user", self.parked]
+        self.go({"acme/api#8": self.entry(labels)}, {8: self.issue(labels=labels)}, gh)
+        self.assertEqual(gh.removed, [self.live])
+
+    def test_s3_a_reopened_issue_or_a_pull_request_loses_nothing(self):
+        for number, fresh in ((9, self.issue("open")), (19, self.issue("closed", pull_request={"url": "x"}))):
+            gh = FakeMergedGh()
+            self.go({"acme/api#%d" % number: self.entry()}, {number: fresh}, gh)
+            self.assertEqual(gh.removed, [], "the event said closed; the fresh read did not say an issue is closed")
+        self.assertEqual(len(self.audit("closed.labels_skipped")), 2)
+
+    def test_s4_a_failed_read_removes_nothing_audits_once_and_is_retried_after_the_back_off(self):
+        gh = FakeMergedGh()
+        entries = {"acme/api#10": self.entry()}
+        reads = {10: sb.GitHubUnavailable("HTTP 502")}
+        self.go(entries, reads, gh)
+        self.go(entries, reads, gh)
+        self.assertEqual((gh.removed, len(self.audit("closed.labels_read_failed"))), ([], 1))
+        self.world.tick(sb.load_module("closed_labels").RETRY_SECONDS + 1)
+        reads[10] = self.issue()
+        self.go(entries, reads, gh)
+        self.assertEqual(sorted(gh.removed), sorted(self.awaiting))
+        self.assertEqual(len(self.audit("closed.labels_read_failed")), 1, "said once")
+
+    def test_s5_an_excluded_or_unwatched_repository_is_never_read_or_written(self):
+        gh = FakeMergedGh()
+        hub_entries = {"acme/secret#1": self.entry(), "other/repo#2": self.entry()}
+        self.go(hub_entries, {1: self.issue(), 2: self.issue()}, gh)
+        self.assertEqual((self.engine.hub.read_log, gh.removed), ([], []), "0 reads and 0 writes in 2 of 2 cases")
+
+    def test_s6_the_chief_of_staff_gets_one_line_for_the_issue_and_a_second_pass_sends_nothing(self):
+        gh = FakeMergedGh()
+        entries = {"acme/api#11": self.entry()}
+        self.go(entries, {11: self.issue()}, gh)
+        self.assertEqual(len(self.told()), 1, "exactly 1 message")
+        self.assertIn("acme/api#11", self.told()[0])
+        for label in self.awaiting:
+            self.assertIn(label, self.told()[0])
+        self.go(entries, {11: self.issue()}, gh)
+        self.assertEqual(len(self.told()), 1, "0 more after a second pass")
+
+    def test_an_event_that_carried_no_awaiting_label_costs_no_read_and_sends_nothing(self):
+        gh = FakeMergedGh()
+        self.go({"acme/api#12": self.entry([self.parked, "bug"])}, {12: self.issue()}, gh)
+        self.assertEqual((self.engine.hub.read_log, gh.removed, self.told()), ([], [], []))
+
+    def test_a_failed_label_write_is_not_done_sends_nothing_and_is_retried(self):
+        gh = FakeMergedGh()
+        entries = {"acme/api#13": self.entry()}
+        with mock.patch.object(sb, "change_issue_labels", side_effect=sb.IntentError("gh", "HTTP 502")):
+            self.go(entries, {13: self.issue()}, gh)
+        self.assertEqual((self.audit("closed.labels_removed"), self.told()), ([], []))
+        self.world.tick(sb.load_module("closed_labels").RETRY_SECONDS + 1)
+        self.go(entries, {13: self.issue()}, gh)
+        self.assertEqual((sorted(gh.removed), len(self.told())), (sorted(self.awaiting), 1))
+
+    def test_an_issue_closed_reopened_and_closed_again_is_cleaned_on_the_second_close(self):
+        gh = FakeMergedGh()
+        entries = {"acme/api#16": self.entry()}
+        self.go(entries, {16: self.issue("open")}, gh)   # the first pass finds it reopened: nothing removed, marked handled
+        self.assertEqual(gh.removed, [])
+        self.world.tick(60)
+        entries["acme/api#16"] = dict(self.entry(), at=self.world.clock.now())   # the hub records a NEWER closed event
+        self.go(entries, {16: self.issue("closed")}, gh)
+        self.assertEqual(sorted(gh.removed), sorted(self.awaiting), "the second close is handled afresh")
+
+    def test_the_passs_cap_bounds_the_reads_and_the_rest_wait_for_the_next_pass(self):
+        gh = FakeMergedGh()
+        entries = {"acme/api#%d" % n: self.entry() for n in (21, 22)}
+        reads = {21: self.issue("open"), 22: self.issue("open")}
+        self.engine.hub, self.engine.gh_runner = StubIssueHub(entries, reads), gh
+        closed_labels = sb.load_module("closed_labels")
+        ns = types.SimpleNamespace(**{n: getattr(sb, n) for n in closed_labels.NEEDS})
+        closed_labels.run_pass(ns, self.engine, self.world.clock.now(), 1)
+        self.assertEqual([n for _, n, _ in self.engine.hub.read_log], [21], "calls=1: one read, of the first issue")
+        closed_labels.run_pass(ns, self.engine, self.world.clock.now(), 1)
+        self.assertEqual([n for _, n, _ in self.engine.hub.read_log], [21, 22], "the other waits for the next pass: a different issue, not the same twice")
+
+    def test_retry_and_said_state_of_a_ref_the_hub_no_longer_holds_is_dropped(self):
+        gh = FakeMergedGh()
+        entries = {"acme/api#23": self.entry()}
+        self.go(entries, {23: sb.GitHubUnavailable("HTTP 502")}, gh)
+        memory = self.engine.__dict__["closed_labels"]
+        self.assertEqual((sorted(memory["retry"]), sorted(memory["said"])), (["acme/api#23"], ["acme/api#23"]))
+        self.go({}, {}, gh)   # the hub evicted it
+        self.assertEqual((memory["retry"], memory["said"]), ({}, set()), "pruned with the ref")
+
+    def test_a_closed_event_the_hub_cannot_keep_is_audited_and_the_snapshot_is_unchanged(self):
+        class BrokenLock:
+            def __enter__(self):
+                raise RuntimeError("lock broken")
+
+            def __exit__(self, *exc):
+                return False
+        said = []
+        hub = sb.GitHubHub.__new__(sb.GitHubHub)
+        hub.lock, hub.closed_issues, hub.now = BrokenLock(), {}, self.world.clock.now
+        hub._audit = lambda event, subject, detail: said.append((event, subject, detail))
+        hub.note_closed_issue("acme/api", {"number": 24, "labels": [{"name": self.awaiting[0]}]})
+        self.assertEqual(hub.closed_issues, {}, "nothing was kept")
+        self.assertEqual([(e, s) for e, s, _ in said], [("github.rejected", "acme/api")])
+        self.assertIn("issues closed event not kept", said[0][2]["reason"])
+
+    def test_a_mixed_case_configured_repo_is_cleaned_and_an_excluded_one_stays_excluded_in_any_case(self):   # #570
+        world = World(self, agents=(), config={"gh": FAKE_GH, "github_repos": ["Acme-Org/Widget-Service"], "excluded_repos": ["Acme-Org/Secret-Repo"]})
+        world.add_agent("chief-of-staff", fleet={"role": "chief-of-staff"})
+        self.engine = world.new_engine()
+        self.world = world
+        gh = FakeMergedGh()
+        entries = {"acme-org/widget-service#7": self.entry(), "ACME-ORG/SECRET-REPO#8": self.entry(), "acme-org/secret-repo#9": self.entry()}
+        hub_calls = []
+        self.go(entries, {7: self.issue(), 8: self.issue(), 9: self.issue()}, gh)
+        self.assertEqual(sorted(gh.removed), sorted(self.awaiting), "only the watched repo, found in a different case, was cleaned")
+        (line,) = self.audit("closed.labels_removed")
+        self.assertEqual(line["subject"], "acme-org/widget-service#7")
+
+    def test_the_hub_is_told_to_forget_an_issue_only_when_the_fresh_read_says_closed(self):
+        gh = FakeMergedGh()
+        self.go({"acme/api#41": self.entry(), "acme/api#42": self.entry(), "acme/api#43": self.entry()},
+                {41: self.issue("closed"), 42: self.issue("open"), 43: sb.GitHubUnavailable("HTTP 502")}, gh)
+        self.assertEqual(self.engine.hub.forgotten, [("acme/api", 41)], "closed: forgotten; reopened or unreadable: still listed")
+
+    def test_the_live_label_name_is_pinned_to_the_fleet_prefix(self):
+        with mock.patch.object(sb.getpass, "getuser", return_value="osuser"):
+            self.assertEqual(sb.awaiting_live_label({}), "osuser:awaiting-live")
+
+    def test_a_real_issues_closed_event_through_the_hub_reaches_the_snapshot(self):
+        rig = GithubRig(self, config={"awaiting_label": DECISION_LABEL})
+        issue = rig.gh.issue(7, title="Pick one", labels=[DECISION_LABEL, "bug"], age=0)
+        rig.pump(15)
+        issue["state"] = "closed"
+        rig.gh.send("issues", {"action": "closed", "issue": dict(issue)})
+        self.assertEqual([ref.rpartition("#")[2] for ref in rig.hub.closed_issue_snapshot()], ["7"], "exactly the issue that closed")
+        (entry,) = rig.hub.closed_issue_snapshot().values()
+        self.assertEqual(entry["labels"], sorted([DECISION_LABEL, "bug"]))
+        self.assertEqual(len(rig.hub.awaiting_listing()[0]), 1, "the payload alone drops nothing: the fresh-read pass decides")
+
+    def test_the_hub_keeps_a_closed_event_in_memory_and_the_daemons_pass_runs_the_cleaning(self):
+        self.engine.hub = StubIssueHub({}, {})
+        hub = sb.GitHubHub.__new__(sb.GitHubHub)   # only the event bookkeeping is under test
+        hub.lock, hub.closed_issues, hub.now = threading.RLock(), {}, self.world.clock.now
+        hub.note_closed_issue("acme/api", {"number": 14, "labels": [{"name": self.awaiting[0]}, {"name": "bug"}]})
+        hub.note_closed_issue("acme/api", {"number": 15, "labels": [], "pull_request": {"url": "x"}})   # a pull request is not an issue
+        self.assertEqual(sorted(hub.closed_issue_snapshot()), ["acme/api#14"])
+        self.engine.hub, self.engine.gh_runner = StubIssueHub(hub.closed_issue_snapshot(), {14: self.issue()}), FakeMergedGh()
+        sb.publish_decisions(self.engine)
+        self.assertEqual(sorted(self.engine.gh_runner.removed), sorted(self.awaiting), "publish_decisions (the pass) cleans it")
+        with mock.patch.object(sb.load_module("closed_labels"), "run_pass", side_effect=RuntimeError("boom")):
+            sb.publish_decisions(self.engine)   # never raises
+        self.assertTrue(self.audit("closed_labels.error"))
 
 
 # ---- docs/agent-credentials.md (#568): the document has its sections and no token-like text (S1, S2, S3, S5, U1)

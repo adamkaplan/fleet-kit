@@ -1,5 +1,7 @@
 """Offline tests for cloud/launcher/preflight.py (S1, U2): a loopback stub for the GitHub API; no network."""
+import hashlib
 import http.server
+import shutil
 import json
 import os
 import subprocess
@@ -32,8 +34,13 @@ class Stub(http.server.BaseHTTPRequestHandler):
     no_id = False  # answer rules without a ruleset_id
     redirect_code = 302
     redirect = None  # a Location to answer every GET with, as a 302
+    fail_code = 500
     fail = None  # a path suffix that answers 500, or "badjson"
     methods = []
+    org_hint = None  # retry | remaining | body: rate-limit signs on the /orgs/ answer
+    org_code = None  # status (or "drop") answered for any /orgs/ GET
+    org_extra = []  # extra organization-sourced rules (ruleset 9) on top of the repository's own
+    org_types = []  # rule types sourced from unreadable-able organization ruleset 9
 
     def log_message(self, *a):
         pass
@@ -54,12 +61,29 @@ class Stub(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
         path = unquote(urlparse(self.path).path)
+        if path.startswith("/orgs/") and Stub.org_code:
+            if Stub.org_code == "drop":
+                self.close_connection = True
+                self.connection.close()
+                return
+            if Stub.org_hint:
+                out = b'{"message": "You have exceeded a secondary rate limit"}' if Stub.org_hint == "body" else b"{}"
+                self.send_response(Stub.org_code)
+                if Stub.org_hint == "retry":
+                    self.send_header("Retry-After", "60")
+                if Stub.org_hint == "remaining":
+                    self.send_header("X-RateLimit-Remaining", "0")
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+                return
+            return self.reply(Stub.org_code, {})
         if Stub.fail == "badjson":
             return self.reply(200, b"<html>")
         if Stub.fail == "huge":
             return self.reply(200, b" " * 1_100_000 + b"{}")
         if Stub.fail and path.endswith(Stub.fail):
-            return self.reply(500, {})
+            return self.reply(Stub.fail_code, {})
         if path == "/repos/" + REPO:
             return self.reply(200, {"default_branch": Stub.default})
         if path.startswith("/repos/%s/rules/branches/" % REPO):
@@ -68,11 +92,15 @@ class Stub(http.server.BaseHTTPRequestHandler):
                 r = {"type": x, "ruleset_id": Stub.rule_ids.get(x, 7), "ruleset_source_type": "Repository", "ruleset_source": REPO}
                 if Stub.org:
                     r.update(ruleset_source_type="Organization", ruleset_source="acme-org")
+                if x in Stub.org_types:
+                    r.update(ruleset_id=9, ruleset_source_type="Organization", ruleset_source="acme-org")
                 if Stub.no_id:
                     del r["ruleset_id"]
                 if x == "pull_request":
                     r["parameters"] = {"required_approving_review_count": Stub.review_count}
                 out.append(r)
+            for x in Stub.org_extra:
+                out.append({"type": x, "ruleset_id": 9, "ruleset_source_type": "Organization", "ruleset_source": "acme-org"})
             return self.reply(200, out)
         if path in ("/repos/%s/rulesets/7" % REPO, "/orgs/acme-org/rulesets/7"):
             cond = {"ref_name": {"include": Stub.include, "exclude": Stub.exclude}} if Stub.conditions == "ok" else None
@@ -123,12 +151,27 @@ class Preflight(unittest.TestCase):
         Stub.rules, Stub.protected, Stub.fail, Stub.methods, Stub.redirect = list(FULL), False, None, [], None
         Stub.review_count, Stub.enforcement, Stub.include, Stub.conditions = 1, "active", ["~DEFAULT_BRANCH"], "ok"
         Stub.exclude, Stub.target, Stub.default, Stub.rule_ids, Stub.extra, Stub.org, Stub.no_id = [], "branch", "main", {}, {}, False, False
+        Stub.org_code, Stub.org_types, Stub.fail_code, Stub.org_extra, Stub.org_hint = None, [], 500, [], None
         Other.seen = []
+        self.dir = tempfile.mkdtemp()
+        # a private copy of the program: its repo-approvals.json is the only approvals file there is
+        self.copy = os.path.join(self.dir, "launcher")
+        os.makedirs(self.copy)
+        for n in ("preflight.py", "app_token.py", "token_mint.py", "repo-approvals.json"):
+            shutil.copy(os.path.join(os.path.dirname(PREFLIGHT), n), self.copy)
+        self.prog = os.path.join(self.copy, "preflight.py")
+
+    def approvals(self, content, raw=False):
+        """Write the private copy's repo-approvals.json; returns its path."""
+        path = os.path.join(self.copy, "repo-approvals.json")
+        with open(path, "w") as f:
+            f.write(content if raw else json.dumps(content))
+        return path
 
     def run_pf(self, *args, **env):
         e = dict(os.environ, CW_GITHUB_API_BASE=self.base, CW_PREFLIGHT_TOKEN_CMD="echo " + TOKEN)
         e.update(env)
-        return subprocess.run([sys.executable, PREFLIGHT, REPO, *args], env=e, capture_output=True, text=True, timeout=60)
+        return subprocess.run([sys.executable, self.prog, REPO, *args], env=e, capture_output=True, text=True, timeout=60)
 
     def test_fully_protected_passes_and_only_reads(self):
         p = self.run_pf()
@@ -223,6 +266,174 @@ class Preflight(unittest.TestCase):
         Stub.org = True
         self.assertEqual(self.run_pf().returncode, 0)
         Stub.fail = "/rulesets/7"  # a token that cannot read the organization's ruleset fails closed
+        self.assertEqual(self.run_pf().returncode, 2)
+
+    def org_only(self, code=403, types=None):
+        Stub.org_types = types or list(FULL)
+        Stub.org_code = code
+
+    KEY = hashlib.sha256(REPO.lower().encode()).hexdigest()
+    ENTRY = {"approved_by": "the-owner", "approved_at": "2026-10-16", "reason": "protected by the org ruleset", "pr": "12"}
+    LOUD = ("preflight ok: protection NOT VERIFIED (organization ruleset 9 unreadable); owner-approved by "
+            "the-owner on 2026-10-16 (pr #12): protected by the org ruleset")
+
+    def test_a_403_on_an_org_ruleset_is_not_counted_and_the_repo_own_rules_can_pass(self):
+        Stub.org_extra = ["deletion"]  # an unreadable organization ruleset on top of the repository's own three
+        Stub.org_code = 403
+        p = self.run_pf()
+        self.assertEqual(p.returncode, 0, p.stdout)
+        self.assertIn("organization ruleset 9: not readable with this token, not counted", p.stdout)
+        self.assertIn("preflight ok: deletion, non_fast_forward, pull_request", p.stdout)
+
+    def test_S1_the_shipped_file_is_empty_and_an_org_only_repo_fails_with_the_pointer(self):
+        with open(os.path.join(os.path.dirname(PREFLIGHT), "repo-approvals.json")) as f:
+            self.assertEqual(json.load(f), {})
+        self.org_only()
+        p = self.run_pf()
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertIn("not readable with this token, not counted", p.stdout)
+        self.assertIn("an owner approval entry is needed", p.stdout)
+
+    def test_S1_a_valid_entry_passes_loudly_and_matches_the_lowercased_name(self):
+        self.org_only()
+        self.approvals({self.KEY: self.ENTRY})
+        p = self.run_pf()
+        self.assertEqual(p.returncode, 0, p.stdout)
+        self.assertIn(self.LOUD, p.stdout)
+
+    def test_S2_absent_malformed_incomplete_or_other_repo_fails_safe(self):
+        self.org_only()
+        os.remove(os.path.join(self.copy, "repo-approvals.json"))
+        self.assertEqual(self.run_pf().returncode, 2)  # absent
+        for raw in ("{not json", "[]", ""):
+            self.approvals(raw, raw=True)
+            self.assertEqual(self.run_pf().returncode, 2, raw)
+        for field in self.ENTRY:  # each field missing or empty
+            for bad in (None, " ", 5):
+                e = dict(self.ENTRY)
+                e.pop(field) if bad is None else e.update({field: bad})
+                self.approvals({self.KEY: e})
+                self.assertEqual(self.run_pf().returncode, 2, (field, bad))
+        self.approvals({self.KEY: "x"})
+        self.assertEqual(self.run_pf().returncode, 2)
+        # an entry for another repository (or the unhashed name) is ignored: an ordinary failure, exit 1
+        self.approvals({hashlib.sha256(b"acme-org/other").hexdigest(): self.ENTRY, REPO: self.ENTRY})
+        self.assertEqual(self.run_pf().returncode, 1)
+
+    def test_duplicate_keys_are_refused_in_every_shape(self):
+        self.org_only()
+        e = json.dumps(self.ENTRY)
+        bad = json.dumps(dict(self.ENTRY, reason=""))
+        other = json.dumps(dict(self.ENTRY, approved_by="someone-else"))
+        for name, raw in (
+                ("repo hash twice", '{"%s": %s, "%s": %s}' % (self.KEY, e, self.KEY, other)),
+                ("field twice", '{"%s": {"approved_by": "a", "approved_by": "b", "approved_at": "2026-10-16", '
+                                '"reason": "r", "pr": "1"}}' % self.KEY),
+                ("malformed first, valid last", '{"%s": %s, "%s": %s}' % (self.KEY, bad, self.KEY, e))):
+            self.approvals(raw, raw=True)
+            p = self.run_pf()
+            self.assertEqual(p.returncode, 2, name)
+            self.assertNotIn("NOT VERIFIED", p.stdout)
+
+    def test_a_deeply_nested_file_is_unreadable_not_a_traceback(self):
+        self.org_only()
+        self.approvals("[" * 65000, raw=True)
+        p = self.run_pf()
+        self.assertEqual(p.returncode, 2)
+        self.assertNotIn("Traceback", p.stderr)
+
+    def test_control_and_bidi_characters_in_a_field_refuse_the_entry(self):
+        self.org_only()
+        for ch in ("\x00", "\x1b", "\x7f", "\x85", "\x9b", "\u2028", "\u2029", "\u202a", "\u202e", "\u2066", "\u2069"):
+            for field in ("reason", "approved_by"):
+                self.approvals({self.KEY: dict(self.ENTRY, **{field: "ab" + ch + "cd"})})
+                p = self.run_pf()
+                self.assertEqual(p.returncode, 2, (field, ch))
+                self.assertNotIn(ch, p.stdout)
+
+    def test_a_symlink_to_the_program_reads_the_checkouts_file_not_one_beside_the_link(self):
+        self.org_only()
+        self.approvals({})  # the checkout's own file grants nothing
+        other = os.path.join(self.dir, "elsewhere")
+        os.makedirs(other)
+        with open(os.path.join(other, "repo-approvals.json"), "w") as f:
+            json.dump({self.KEY: self.ENTRY}, f)  # a grant beside the link
+        link = os.path.join(other, "preflight.py")
+        os.symlink(self.prog, link)
+        self.prog = link
+        p = self.run_pf()
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertNotIn("NOT VERIFIED", p.stdout)
+
+    def test_a_403_with_a_sign_of_a_rate_limit_is_refused_a_plain_one_is_not_counted(self):
+        self.approvals({self.KEY: self.ENTRY})
+        for hint in ("retry", "remaining", "body"):
+            self.org_only(403)
+            Stub.org_hint = hint
+            p = self.run_pf()
+            self.assertEqual(p.returncode, 2, (hint, p.stdout))
+            self.assertNotIn("not counted", p.stdout)
+            self.assertNotIn("60", p.stdout)
+        Stub.org_hint = None
+        p = self.run_pf()
+        self.assertEqual(p.returncode, 0, p.stdout)
+        self.assertIn("not counted", p.stdout)
+
+    def test_S3_the_loud_line_is_printed_on_every_run(self):
+        self.org_only()
+        self.approvals({self.KEY: self.ENTRY})
+        for _ in range(3):
+            self.assertIn(self.LOUD, self.run_pf().stdout)
+
+    def test_S4_an_approval_rescues_no_visible_missing_rule_and_no_other_problem(self):
+        self.approvals({self.KEY: self.ENTRY})
+        Stub.rules = ["pull_request", "deletion"]  # non_fast_forward visibly missing, no unreadable rule carries it
+        Stub.org_types, Stub.org_code = ["deletion"], 403
+        self.assertEqual(self.run_pf().returncode, 1)
+        Stub.rules, Stub.org_types = [], []  # an unprotected repository
+        self.assertEqual(self.run_pf().returncode, 1)
+        Stub.rules, Stub.enforcement = ["pull_request", "deletion"], "evaluate"  # a readable ruleset not enforced
+        Stub.org_types = ["non_fast_forward"]
+        self.assertEqual(self.run_pf().returncode, 1)
+        Stub.rules, Stub.enforcement = ["non_fast_forward", "deletion"], "active"  # no review rule anywhere
+        Stub.org_types = []
+        self.assertEqual(self.run_pf().returncode, 1)
+
+    def test_S5_no_override_path_an_environment_setting_a_flag_or_a_file_elsewhere_is_ignored(self):
+        self.org_only()
+        outside = os.path.join(self.dir, "elsewhere.json")
+        with open(outside, "w") as f:
+            json.dump({self.KEY: self.ENTRY, REPO: self.ENTRY}, f)
+        for env in ({"CW_REPO_APPROVALS": outside}, {"CW_REPO_APPROVALS": "1"}, {"CW_APPROVALS": outside}):
+            p = self.run_pf(**env)
+            self.assertEqual(p.returncode, 1, p.stdout)
+            self.assertNotIn("NOT VERIFIED", p.stdout)
+        for flag in ("--approve", "--approvals=" + outside, "--accept-org"):
+            self.assertEqual(self.run_pf(flag).returncode, 2)  # not an option: usage, exit 2
+        with open(PREFLIGHT) as f:
+            self.assertNotIn("CW_REPO_APPROVALS", f.read())
+
+    def test_S6_the_approvals_file_is_a_top_tier_credentials_path_in_the_impact_matrix(self):
+        matrix = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(HERE))), "docs", "review-laws", "impact-matrix.json")
+        with open(matrix) as f:
+            paths = json.load(f)["owner_hold"]["top_tier_paths"]["credentials"]
+        self.assertEqual(paths.count("cloud/launcher/repo-approvals.json"), 1)
+
+    def test_S4_only_a_403_on_an_org_ruleset_is_not_readable(self):
+        self.approvals({self.KEY: self.ENTRY})
+        for code in (404, 500, "drop"):
+            self.org_only(code)
+            p = self.run_pf()
+            self.assertEqual(p.returncode, 2, (code, p.stdout))
+            self.assertNotIn("not counted", p.stdout)
+        Stub.org_code, Stub.org_types, Stub.org = None, [], False
+        Stub.fail = "/rulesets/7"
+        self.assertEqual(self.run_pf().returncode, 2)
+
+    def test_a_403_on_the_repository_own_ruleset_or_rules_endpoint_exits_2(self):
+        Stub.fail, Stub.fail_code = "/rulesets/7", 403
+        self.assertEqual(self.run_pf().returncode, 2)
+        Stub.fail = "/rules/branches/main"
         self.assertEqual(self.run_pf().returncode, 2)
 
     def test_a_ruleset_that_is_not_a_branch_ruleset_fails_closed(self):

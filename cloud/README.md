@@ -6,8 +6,9 @@ Part of the cloud-worker prototype (plan scenarios S10 and S12). Two pieces:
   and `scan-secrets.sh`, a build-failing scan for stored credentials.
 - `k8s/`: the RuntimeClass and a DaemonSet that repairs the containerd registration of Sysbox on a node, repeatably.
 
-This image takes everything it needs from the environment at start and stores nothing. The launcher, run secrets,
-service account and driver are later pull requests; this one is only the image, the scan and the node fix.
+This image takes everything it needs from the environment and mounted files at start and stores nothing. The launcher
+(`cloud/launcher/`) supplies the per-run files; the entrypoint installs them (next section) and the operator driver
+(`cloud/launcher/run_task.py`) runs one task end to end.
 
 Cloud workers serve the organisation's repositories only; no task, test or demo of the tooling that runs the workers runs in a cloud worker.
 
@@ -20,6 +21,47 @@ launcher's end hook and token mint are copied in as `cw-end-hook` and `cw-token-
 the entrypoint uses it to start the nested `dockerd` and then execs the command. Default command:
 `opencode serve --hostname 0.0.0.0 --port 4096`. Set `WORKER_DOCKER=0` to skip the Docker daemon. No credential is
 built in: `OPENCODE_SERVER_PASSWORD`, `GH_TOKEN` and any cloud identity are supplied by the launcher at run time.
+
+## Per-run secrets in the image
+
+The launcher mounts per-run files read-only under `/run/cw` (`CW_RUN_DIR`). The entrypoint, which never prints a value:
+
+- `server-password`: read into `OPENCODE_SERVER_PASSWORD` for the server it starts (OpenCode reads the password only from its environment).
+- `model-auth`: the model provider's access entry (JSON), copied with mode 600 to `<tmpfs>/data/opencode/auth.json` (`XDG_DATA_HOME`), so the server refreshes its short-lived token in the copy and never in the Secret. A model config naming `CW_MODEL` (default `github-copilot/claude-sonnet-5.5`) is written beside it (`XDG_CONFIG_HOME`); it holds no secret.
+- `git-token`: never copied. A git credential helper (`git config --global`, so every process of the worker user sees it, including a fresh-environment `kubectl exec` such as the end hook) and a `gh` wrapper read the file at call time. The helper answers only for `https://github.com`; the token is never in git config, argv or the environment. The directory is the path baked in when the files were generated (a caller's `CW_RUN_DIR` changes nothing), and at every call an unreadable or empty token file makes both fail with one line and a non-zero exit (never an empty password, never a `gh` with an empty token). The `gh` wrapper passes every subcommand: the guard is the token's own permissions (a per-run, one-repository App token), not the wrapper. The server password is in the server's environment, so every process the agent starts can read it; that is accepted by design.
+
+A file that is absent is skipped (a pod started without per-run secrets). A file that is present but unreadable or empty
+refuses the start with one line naming it; there is no fallback to another source. The tmpfs is `CW_TMP_DIR` (default `/run/cw-tmp`).
+
+## The operator driver
+
+```sh
+export CW_KUBE_CONTEXT=<context>      # or CW_CLOUD_SERVER + CW_CLOUD_TOKEN_FILE, as the launcher
+cloud/launcher/run_task.py WORKER OWNER/NAME BRANCH BRIEF_FILE [--pull-secret NAME] [--image IMAGE]
+```
+
+The target repository is an argument and has no default. The driver reads the model entry (the `github-copilot` entry of
+`CW_MODEL_AUTH_FILE`, default `~/.local/share/opencode/auth.json`) and a git token (the output of `CW_GIT_TOKEN_CMD`;
+default `app_token.py OWNER/NAME` beside the driver, the one-hour GitHub App token) in memory, creates the pod through
+the launcher with both handed over inherited pipes (`--run-secret-fd`), port-forwards, opens a session, sends the brief,
+waits for idle, then stops the worker (the end hook pushes the work; the pod and its Secrets are deleted).
+
+- A normal end, a failure and an interrupt (SIGINT, SIGTERM) all clean up, and it says exactly once
+  `per-run secret NAME-run cleaned` or `per-run secret NAME-run REMAINS: delete it with: <command>`.
+- A worker whose end hook cannot push is kept so the work is not lost; its per-run Secret is still deleted and the
+  pod's name and delete command are printed.
+- Every line it prints passes through the launcher's one `scrub()`. No secret is in an argument, an environment
+  variable of a child, a log or a file; the only file is a private temporary directory (`CW_TMPDIR`) holding the
+  port-forward's own log, removed at exit. The server password comes back on a pipe and stays in memory.
+- A missing or unreadable input (auth file, entry, token command, brief) refuses before anything is created. A second run
+  with a worker name that exists refuses and changes nothing. So does a run that LOSES a race for the name (another run made
+  the worker while this one minted its token): the launcher exits with its own code (7, "already exists") and the driver
+  returns without an end hook and without deleting anything. The driver acts on a worker only when it can prove it is
+  its own: a nonce it chose before the create is set (`--run-id`) on the pod and Secrets as `cw/run-id` and read back;
+  no match, or no answer, leaves it whole. The launcher makes the password Secret, the per-run Secret and the pod with `kubectl create` (exclusive: of two simultaneous creates exactly one wins, the other exits 7 having made nothing), and its own cleanup deletes only objects that carry its `--run-id`. A per-run Secret with no run id (a crash before it was labelled) is never guessed at: it is reported with the exact delete command (and says the delete command when ownership could not be read).
+- A kill with SIGKILL cannot be cleaned by the driver: the launcher's `delete` or the reaper removes what remains.
+
+Tests: `bin/test-cloud-launcher` (driver, fake kubectl), `cloud/tests/test-cloud` (entrypoint, stub server).
 
 ## The Sysbox node fix
 

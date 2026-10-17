@@ -188,7 +188,8 @@ def closure(tree, roots):
     body) and only those methods whose name the closure reads (as a name or an attribute) or that are special methods (`__init__`, `__getattr__`, `__call__`...): a method nothing reads is not run.
     Over-approximate by name on purpose (any attribute of that name); dynamic dispatch by string is not followed (a stated limit)."""
     defs, binds = _index(tree)
-    seen, globals_, refs, members, todo = set(), set(), set(), {}, [r for r in roots]
+    roots = list(defs) if "*" in roots else list(roots)   # `*`: every function of the module (a module the clear runs and no recording says which)
+    seen, globals_, refs, members, todo = set(), set(), set(), {}, list(roots)
 
     def walk(nodes):
         while nodes:
@@ -203,6 +204,7 @@ def closure(tree, roots):
                 elif isinstance(x, ast.Attribute):
                     refs.add(x.attr)
 
+    walk([n for r in roots if r in binds and r not in globals_ and not globals_.add(r) for n in binds[r]])   # a root that is a binding is read too
     while True:
         while todo:
             name = todo.pop()
