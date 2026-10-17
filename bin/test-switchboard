@@ -11501,6 +11501,11 @@ class TestCosDelegatedClearPermission(unittest.TestCase):
         self.assertEqual(others, ['  - {action: shell, resource: "fleet-switchboard impact floor *", effect: allow}',
                                   '  - {action: shell, resource: "fleet-switchboard impact hold --dry-run*", effect: allow}'])
 
+    def test_S1_the_copilot_definition_names_no_impact_command(self):
+        text = (REPO / "agents" / "copilot" / "chief-of-staff.agent.md").read_text()
+        self.assertNotIn("fleet-switchboard impact", text)
+        self.assertNotIn("--under-order", text)
+
     def test_S2_last_match_wins_allows_only_the_delegated_clear(self):
         _, rules = TestChiefOfStaffNativePermissions.parse(self.PATH)
         verdicts = [TestChiefOfStaffNativePermissions.evaluate(rules, "shell", c) for c in (
