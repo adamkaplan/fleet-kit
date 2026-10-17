@@ -54,6 +54,9 @@ def read_ledger(state_dir):
     """(entries, problem): every line parsed, and None when the chain holds, else a sentence naming the first break
     (the entries before it are still returned: they are intact, the ones from the break on are not trusted)."""
     path = Path(state_dir) / LEDGER_FILE
+    # The head pointer is read BEFORE the ledger file: a writer adds the entry and only then moves the pointer, so a file read after the
+    # pointer is never behind it. Reading them the other way round lets an append land between the two reads and look like a cut-off.
+    pointer = _read_head(state_dir)
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -73,7 +76,6 @@ def read_ledger(state_dir):
             return entries, "entry %d does not follow from the one before it: the ledger was edited" % (len(entries) + 1)
         entries.append(entry)
         prev = entry["hash"]
-    pointer = _read_head(state_dir)
     if pointer is not None and (len(entries) < pointer["seq"] or entries[pointer["seq"] - 1]["hash"] != pointer["hash"]):
         return entries, ("the ledger ends before entry %d, where its head pointer says it should (entries were cut off or the "
                          "file was rewritten)" % pointer["seq"])

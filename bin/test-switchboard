@@ -26442,6 +26442,81 @@ class TestPlanLedger(LedgerBase):
                 self.assertIsNone(FORBIDDEN_IN_PUBLIC_TEXT.search(line), "%s:%d %s" % (path.name, number, line))
 
 
+class TestLedgerReadRace(unittest.TestCase):
+    """A ledger read that races an append is not a cut-off (#673); a real cut-off or rewrite is still reported."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.now = 1767225600
+        for n in (1, 2):
+            self.append(n)
+
+    def append(self, n):
+        return sb.plan_ledger.append_entry(self.dir, {"kind": "proof", "pr": "acme/api#1", "scenario": "S%d" % n, "result": "pass"}, self.now)
+
+    def read_with_append_after_file_read(self):
+        """Read the ledger; the moment its file has been read, a writer completes an append (entry and head pointer)."""
+        real, fired = Path.read_text, []
+
+        def hooked(path, *a, **kw):
+            text = real(path, *a, **kw)
+            if path.name == sb.plan_ledger.LEDGER_FILE and not fired:
+                fired.append(1)
+                self.append(3)
+            return text
+        with mock.patch.object(Path, "read_text", hooked):
+            result = sb.plan_ledger.read_ledger(self.dir)
+        self.assertTrue(fired, "the interleaving hook ran")
+        return result
+
+    def test_s1_a_read_that_races_an_append_reports_no_break(self):
+        entries, problem = self.read_with_append_after_file_read()
+        self.assertIsNone(problem)
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(len(sb.plan_ledger.read_ledger(self.dir)[0]), 3)
+
+    def test_s4_a_racing_read_of_a_long_ledger_answers_like_a_quiet_read(self):
+        sb.plan_ledger.append_many(self.dir, [{"kind": "proof", "pr": "acme/api#1", "scenario": "S%d" % n, "result": "pass"}
+                                              for n in range(3, 1103)], self.now)
+        quiet = sb.plan_ledger.read_ledger(self.dir)
+        self.assertEqual((len(quiet[0]), quiet[1]), (1102, None))
+        self.append(1103)
+        # the same interleaving, on 1000+ entries: an append completes right after the file was read
+        real, fired = Path.read_text, []
+
+        def hooked(path, *a, **kw):
+            text = real(path, *a, **kw)
+            if path.name == sb.plan_ledger.LEDGER_FILE and not fired:
+                fired.append(1)
+                self.append(1104)
+            return text
+        with mock.patch.object(Path, "read_text", hooked):
+            raced = sb.plan_ledger.read_ledger(self.dir)
+        self.assertEqual((len(raced[0]), raced[1]), (1103, None))
+
+    def test_s2_a_cut_off_ledger_still_reports_the_break(self):
+        self.append(3)
+        path = Path(self.dir) / sb.plan_ledger.LEDGER_FILE
+        path.write_text("".join(path.read_text().splitlines(True)[:2]))
+        self.assertIn("ends before entry 3", sb.plan_ledger.read_ledger(self.dir)[1])
+
+    def test_s5_a_rewritten_middle_entry_is_reported_with_the_same_message(self):
+        self.append(3)
+        path = Path(self.dir) / sb.plan_ledger.LEDGER_FILE
+        lines = path.read_text().splitlines()
+        lines[1] = json.dumps(dict(json.loads(lines[1]), result="fail"), sort_keys=True)
+        path.write_text("\n".join(lines) + "\n")
+        self.assertEqual(sb.plan_ledger.read_ledger(self.dir)[1], "entry 2 does not follow from the one before it: the ledger was edited")
+
+    def test_s3_a_rewritten_ledger_still_reports_the_break(self):
+        path = Path(self.dir) / sb.plan_ledger.LEDGER_FILE
+        forged = dict(json.loads(path.read_text().splitlines()[0]), result="fail")
+        forged["hash"] = sb.plan_ledger.entry_hash(forged)
+        path.write_text(json.dumps(forged, sort_keys=True) + "\n")
+        self.assertIsNotNone(sb.plan_ledger.read_ledger(self.dir)[1])
+
+
 class TestWaive(LedgerBase):
     """`waive`: the chief of staff's logged override of G0 to G5 for one PR at its head. Never G6, G7, G8, never a writer, never
     an unknown session; it expires; a waived gate reads `waived`, not passed. Neutral names."""
