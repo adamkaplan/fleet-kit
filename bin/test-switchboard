@@ -62029,7 +62029,7 @@ class TestScratchFileRule(unittest.TestCase):
 
 class TestDeployFromMainSentence(unittest.TestCase):
     SENTENCE = ("Production is deployed from the head of main only: never from a side branch, a cherry-pick or a revert off main; "
-                "when main is not shippable, the fix goes into main (the owner's law).")
+                "when main is not shippable, the fix goes into main (the owner's standing order).")
 
     def test_s2_the_coordination_skill_states_the_deploy_rule_once(self):
         text = (REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text()
