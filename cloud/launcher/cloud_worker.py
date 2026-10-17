@@ -186,7 +186,29 @@ def check_repo_allowed(repo, env):
 # preflight.py. PREFLIGHT_ARGV is a test hook (a module attribute, no setting, no environment variable): None means the real program.
 PREFLIGHT_PROGRAM = os.path.join(os.path.dirname(os.path.realpath(__file__)), "preflight.py")
 PREFLIGHT_ARGV = None
+PREFLIGHT_TEST_ENV = {}   # a test hook too: variables added to the child's environment (a test's loopback API base and token command). Never read from the environment.
 PREFLIGHT_SECONDS = 120
+# The preflight child gets ONLY these variables from the caller (an allow-list). It never gets CW_GITHUB_API_BASE or CW_PREFLIGHT_TOKEN_CMD (they
+# point the guard at a fake GitHub), CW_GIT_TOKEN_CMD (that is the mint's), proxy variables, or GH_/GITHUB_ token variables.
+PREFLIGHT_ENV_NAMES = (
+    "PATH",                    # to find sh, az and openssl
+    "HOME",                    # where `az` keeps its sign-in
+    "LANG",                    # (LC_* too) text encoding
+    "TMPDIR",                  # a private temporary directory, when one is set
+    "AZURE_CONFIG_DIR",        # where `az` keeps its sign-in, when it is not under HOME
+    "CW_VAULT_SUBSCRIPTION",   # the vault the GitHub App's id and key are read from (app_token.py)
+    "CW_VAULT_NAME",           # the same
+    "CW_APP_ID_CMD",           # optional commands that print the App id, installation id and key instead of the vault (app_token.py)
+    "CW_APP_INSTALLATION_CMD",
+    "CW_APP_KEY_CMD",
+    "CW_OPENSSL",              # the openssl binary used to sign the App's JWT
+)
+
+
+def _preflight_env(env):
+    clean = {k: v for k, v in env.items() if k in PREFLIGHT_ENV_NAMES or k.startswith("LC_")}
+    clean.update(PREFLIGHT_TEST_ENV)
+    return clean
 
 
 def check_repo_preflight(repo, env):
@@ -195,7 +217,7 @@ def check_repo_preflight(repo, env):
     a missing, killed, timed-out or silent program is a refusal, never a pass. The refusal carries the program's own message."""
     argv = list(PREFLIGHT_ARGV) + [repo] if PREFLIGHT_ARGV else [sys.executable, PREFLIGHT_PROGRAM, repo]
     try:
-        p = subprocess.run(argv, capture_output=True, text=True, timeout=PREFLIGHT_SECONDS, stdin=subprocess.DEVNULL, env=dict(env))
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=PREFLIGHT_SECONDS, stdin=subprocess.DEVNULL, env=_preflight_env(env))
     except (OSError, subprocess.TimeoutExpired, ValueError):
         raise CloudError("refused: the repository preflight for %s could not be run; nothing was created" % scrub(repo, (), 120), EXIT_USAGE) from None
     lines = [x.strip() for x in p.stdout.splitlines() if x.strip()]

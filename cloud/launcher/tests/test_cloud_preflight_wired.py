@@ -30,8 +30,10 @@ class Wired(allow.Allow):
         tp.Stub.exclude, tp.Stub.target, tp.Stub.default, tp.Stub.rule_ids, tp.Stub.extra, tp.Stub.org, tp.Stub.no_id = [], "branch", "main", {}, {}, False, False
         tp.Stub.org_code, tp.Stub.org_types, tp.Stub.fail_code, tp.Stub.org_extra, tp.Stub.org_hint = None, [], 500, [], None
         self.env["CW_ALLOWED_REPOS"] = REPO
-        self.env["CW_GITHUB_API_BASE"] = self.base
-        self.env["CW_PREFLIGHT_TOKEN_CMD"] = "echo " + tp.TOKEN
+        # the loopback stub reaches the real program ONLY through the library's test hook, never through the caller's environment
+        hook = mock.patch.object(cw, "PREFLIGHT_TEST_ENV", {"CW_GITHUB_API_BASE": self.base, "CW_PREFLIGHT_TOKEN_CMD": "echo " + tp.TOKEN})
+        hook.start()
+        self.addCleanup(hook.stop)
         self.mint = os.path.join(self.tmp.name, "mint-ran")
         self.env["CW_GIT_TOKEN_CMD"] = "touch " + self.mint   # a mint leaves its mark
         self.driver = mock.patch.object(run_task, "Driver").start()   # the driver proper: a fake that proves whether it was reached
@@ -96,6 +98,25 @@ class U1AllowListFirst(Wired):
                 self.assertIn("is not on the cloud allow-list", err)
         self.assertFalse(os.path.exists(mark), "the preflight was called")
         self.nothing_made()
+
+
+class EnvironmentCannotRedirectTheGuard(Wired):
+    def test_a_loopback_api_base_and_token_command_in_the_callers_environment_are_ignored(self):
+        tp.Stub.rules = list(tp.FULL)   # the stub would ACCEPT the repository: it must never be asked
+        with mock.patch.object(cw, "PREFLIGHT_TEST_ENV", {}):
+            for env in ({}, {"CW_VAULT_SUBSCRIPTION": "", "CW_VAULT_NAME": ""}):
+                code, out, err = self.drive(CW_GITHUB_API_BASE=self.base, CW_PREFLIGHT_TOKEN_CMD="echo " + tp.TOKEN, **env)
+                self.assertEqual(code, 2, err)
+                self.assertIn("did not pass", err)
+                self.assertNotIn("preflight ok", out + err)
+                self.assertEqual(tp.Stub.methods, [], "the stub was contacted")
+                self.nothing_made()
+
+    def test_the_child_gets_only_the_allow_list(self):
+        env = {"PATH": "/usr/bin", "HOME": "/home/user", "LC_ALL": "C", "CW_GITHUB_API_BASE": "http://127.0.0.1:1", "CW_PREFLIGHT_TOKEN_CMD": "x",
+               "CW_GIT_TOKEN_CMD": "y", "GH_TOKEN": "z", "GITHUB_TOKEN": "z", "HTTPS_PROXY": "p", "CW_VAULT_NAME": "v"}
+        with mock.patch.object(cw, "PREFLIGHT_TEST_ENV", {}):
+            self.assertEqual(cw._preflight_env(env), {"PATH": "/usr/bin", "HOME": "/home/user", "LC_ALL": "C", "CW_VAULT_NAME": "v"})
 
 
 class Shared(unittest.TestCase):

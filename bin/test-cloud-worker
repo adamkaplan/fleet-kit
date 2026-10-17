@@ -1166,15 +1166,29 @@ class TestLaunchRunsThePreflight(Base):
         script = self.home / "git-token-cmd"
         script.write_text("#!/bin/sh\ntouch %s\necho ghs_synthetic\n" % self.mint)
         script.chmod(0o700)
-        env = mock.patch.dict(os.environ, {"CW_GIT_TOKEN_CMD": str(script), "CW_GITHUB_API_BASE": self.base,
-                                           "CW_PREFLIGHT_TOKEN_CMD": "echo " + tp.TOKEN})
+        env = mock.patch.dict(os.environ, {"CW_GIT_TOKEN_CMD": str(script), })
         env.start()
         self.addCleanup(env.stop)
 
     def real_program(self):
-        p = mock.patch.object(self.lib, "PREFLIGHT_ARGV", None)
-        p.start()
-        self.addCleanup(p.stop)
+        """The real preflight, pointed at the loopback stub through the library's test hook (never through the environment)."""
+        for name, value in (("PREFLIGHT_ARGV", None), ("PREFLIGHT_TEST_ENV", {"CW_GITHUB_API_BASE": self.base, "CW_PREFLIGHT_TOKEN_CMD": "echo " + self.tp.TOKEN})):
+            p = mock.patch.object(self.lib, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_a_loopback_api_base_and_token_command_in_the_callers_environment_are_ignored(self):
+        self.tp.Stub.rules = list(self.tp.FULL)   # the stub would ACCEPT: it must never be asked
+        with mock.patch.object(self.lib, "PREFLIGHT_ARGV", None), mock.patch.object(self.lib, "PREFLIGHT_TEST_ENV", {}), \
+                mock.patch.dict(os.environ, {"CW_GITHUB_API_BASE": self.base, "CW_PREFLIGHT_TOKEN_CMD": "echo " + self.tp.TOKEN}):
+            for name in ("CW_VAULT_SUBSCRIPTION", "CW_VAULT_NAME", "CW_APP_ID_CMD", "CW_APP_INSTALLATION_CMD", "CW_APP_KEY_CMD"):
+                os.environ.pop(name, None)
+            code, out, err = self.launch()
+        self.assertEqual(code, 2, err)
+        self.assertIn("did not pass", err)
+        self.assertNotIn("preflight ok", out + err)
+        self.assertEqual(self.tp.Stub.methods, [], "the stub was contacted")
+        self.nothing_made()
 
     def nothing_made(self):
         self.assertFalse(self.mint.exists(), "a mint ran")

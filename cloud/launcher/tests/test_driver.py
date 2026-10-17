@@ -2,8 +2,6 @@
 checklist cases of a secret-handling driver. Offline: the fake kubectl (it becomes a stub headless server on port-forward), no
 cluster. The planted values are synthetic, in several lengths and encodings."""
 import base64
-import http.server
-import threading
 import json
 import os
 import re
@@ -20,6 +18,7 @@ import test_cloud_worker as base  # noqa: E402
 cw = base.cw
 
 DRIVER = os.path.join(os.path.dirname(HERE), "run_task.py")
+FAKE_PREFLIGHT_DRIVER = os.path.join(HERE, "fake_preflight", "run_task.py")   # the driver with a passing fake preflight (#665): the real one cannot run offline
 REPO = "acme-org/widget-service"
 MODEL_VALUES = ["ab12CD34e", "modelvalue-Qx7Lm2Qx7Lm2Qx7Lm2", "m" * 7 + "-" + "Zk9Wp3" * 12]   # short, medium, long
 OTHER = "othervalue-Zk9Wp3Zk9Wp3Zk9Wp3Zk9Wp3"   # another provider in the same auth file: never read out
@@ -31,25 +30,6 @@ RUN = r"per-run secret %s-run (cleaned|REMAINS)"
 
 def forms(v):
     return cw.secret_forms(v)
-
-
-class PassingGitHub(http.server.BaseHTTPRequestHandler):
-    def log_message(self, *a):
-        pass
-
-    def do_GET(self):
-        path = self.path.split("?")[0]
-        rule = lambda t: {"type": t, "ruleset_id": 7, "ruleset_source_type": "Repository", "ruleset_source": REPO,
-                          "parameters": {"required_approving_review_count": 1}}
-        body = {"/repos/" + REPO: {"default_branch": "main"},
-                "/repos/%s/rules/branches/main" % REPO: [rule(t) for t in ("pull_request", "non_fast_forward", "deletion")],
-                "/repos/%s/rulesets/7" % REPO: {"id": 7, "target": "branch", "enforcement": "active", "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}}},
-                "/repos/%s/branches/main" % REPO: {"name": "main", "protected": False}}.get(path)
-        out = json.dumps(body if body is not None else {}).encode()
-        self.send_response(200 if body is not None else 404)
-        self.send_header("Content-Length", str(len(out)))
-        self.end_headers()
-        self.wfile.write(out)
 
 
 class Driver(base.Base):
@@ -73,19 +53,13 @@ class Driver(base.Base):
         self.mark = os.path.join(d, "hang.mark")
         self.name = cw.pod_name("coder7")
         self.patch_state(hook_result={"pushed": True, "wip_branch": "coder7/wip"})
-        # the driver now runs the repository preflight (#665) before it mints: a loopback stub that answers a fully protected repository
-        self.pf_srv = http.server.HTTPServer(("127.0.0.1", 0), PassingGitHub)
-        threading.Thread(target=self.pf_srv.serve_forever, daemon=True).start()
-        self.addCleanup(self.pf_srv.server_close)
-        self.addCleanup(self.pf_srv.shutdown)
-        self.pf_env = {"CW_GITHUB_API_BASE": "http://127.0.0.1:%d" % self.pf_srv.server_port, "CW_PREFLIGHT_TOKEN_CMD": "echo ghs_synthetic"}
         self.denv = dict({"PATH": os.environ["PATH"], "HOME": d}, **self.env, TMPDIR=self.scratch, CW_TMPDIR=self.scratch, CW_MODEL_AUTH_FILE=self.auth,
                          CW_GIT_TOKEN_CMD=self.gitcmd, FAKE_SCAN_DIR=self.scratch, FAKE_KUBE_SEEN=self.seen,
                          FAKE_SCAN_VALUES=",".join(MODEL_VALUES + [GIT, OTHER, json.dumps({"github-copilot": ENTRY})]),
-                         STUB_LOG=self.stub_log, CW_POLL_SECONDS="0.2", CW_HEALTH_TIMEOUT="3", CW_RUN_TIMEOUT="60", CW_CREATE_TIMEOUT="60", **self.pf_env)
+                         STUB_LOG=self.stub_log, CW_POLL_SECONDS="0.2", CW_HEALTH_TIMEOUT="3", CW_RUN_TIMEOUT="60", CW_CREATE_TIMEOUT="60")
 
     def args(self, worker="coder7", repo=REPO, brief=None):
-        return [sys.executable, DRIVER, worker, repo, "main", brief or self.brief, "--pull-secret", "cw-pull", "--image", "registry.example.internal/cw-worker:1"]
+        return [sys.executable, FAKE_PREFLIGHT_DRIVER, worker, repo, "main", brief or self.brief, "--pull-secret", "cw-pull", "--image", "registry.example.internal/cw-worker:1"]
 
     def run_driver(self, **env):
         p = subprocess.run(self.args(), env=dict(self.denv, **env), capture_output=True, text=True, timeout=120)

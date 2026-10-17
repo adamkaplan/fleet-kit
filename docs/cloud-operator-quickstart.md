@@ -37,6 +37,11 @@ do it for you.
 
 A refusal at step 1 or 2 means no token was minted and nothing was created.
 
+The preflight runs with a cleaned environment: only `PATH`, `HOME`, `LANG`/`LC_*`, `TMPDIR`, `AZURE_CONFIG_DIR` and the settings its own
+token route needs (`CW_VAULT_SUBSCRIPTION`, `CW_VAULT_NAME`, `CW_APP_ID_CMD`, `CW_APP_INSTALLATION_CMD`, `CW_APP_KEY_CMD`, `CW_OPENSSL`) are passed on.
+`CW_GITHUB_API_BASE` and `CW_PREFLIGHT_TOKEN_CMD` set in your shell are ignored by `launch --cloud` and `run-task`, and so are
+`CW_GIT_TOKEN_CMD` (that one is the mint's), proxy variables and `GH_`/`GITHUB_` token variables: nothing in the environment can point the check at another host.
+
 ## 3. Run one worker
 
 ```text
