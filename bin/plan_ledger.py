@@ -54,6 +54,9 @@ def read_ledger(state_dir):
     """(entries, problem): every line parsed, and None when the chain holds, else a sentence naming the first break
     (the entries before it are still returned: they are intact, the ones from the break on are not trusted)."""
     path = Path(state_dir) / LEDGER_FILE
+    # The head pointer is read BEFORE the ledger file: a writer adds the entry and only then moves the pointer, so a file read after the
+    # pointer is never behind it. Reading them the other way round lets an append land between the two reads and look like a cut-off.
+    pointer = _read_head(state_dir)
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -73,7 +76,6 @@ def read_ledger(state_dir):
             return entries, "entry %d does not follow from the one before it: the ledger was edited" % (len(entries) + 1)
         entries.append(entry)
         prev = entry["hash"]
-    pointer = _read_head(state_dir)
     if pointer is not None and (len(entries) < pointer["seq"] or entries[pointer["seq"] - 1]["hash"] != pointer["hash"]):
         return entries, ("the ledger ends before entry %d, where its head pointer says it should (entries were cut off or the "
                          "file was rewritten)" % pointer["seq"])
@@ -165,6 +167,18 @@ def append_many(state_dir, entries_in, now):
 def evaluator_of(scenario):
     name = " ".join(str(scenario.get("evaluator", "")).split())
     return EVALUATOR_ALIASES.get(name, name)
+
+
+def claim_of(scenario):
+    """`pr` or `epic`: who claims a scenario, read AS WRITTEN (the checker's parsed scenario keeps only the keys the author wrote; its canonical text, and so the plan hash, fills `pr` in and is not
+    touched here). An explicit claim is read as it is written. With NONE written, a scenario whose evaluator is the tester and whose proof is a measure is a live check that can only be made after
+    the merge, so it is not claimed by a slice pull request: it is read as `epic` (proven at the ask's integration check, and listed as such). Every other scenario with no claim is `pr`."""
+    written = " ".join(str(scenario.get("claim") or "").split())
+    if written:
+        return written
+    if evaluator_of(scenario) == "tester" and " ".join(str(scenario.get("proof") or "").split()) == "measure":
+        return "epic"
+    return "pr"
 
 
 def authors_of(entries, pr, notice_senders=(), github_author=None):
@@ -284,7 +298,7 @@ def scenario_state(scenario, entries, pr, plan_hash, head, authors):
     """One scenario's G1 picture: {id, evaluator, proof, verdict, status, missing[], void[]}. A proof or verdict counts
     only for THIS plan hash and THIS head; one for another is shown as void, not hidden."""
     sid, evaluator = scenario["id"], evaluator_of(scenario)
-    out = {"id": sid, "evaluator": evaluator, "claim": scenario.get("claim") or "pr", "missing": [], "void": []}
+    out = {"id": sid, "evaluator": evaluator, "claim": claim_of(scenario), "missing": [], "void": []}
     for kind in ("proof", "verdict"):
         mine = [e for e in entries if e.get("pr") == pr and e.get("scenario") == sid and e.get("kind") == kind
                 and (kind == "proof" or e.get("evaluator") == evaluator)]
@@ -355,7 +369,7 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             elif not head:
                 row.update(status="missing", missing=["the PR head is unknown"])
             else:
-                claimed = [s for s in plan["scenarios_parsed"] if (s.get("claim") or "pr") == "pr"]
+                claimed = [s for s in plan["scenarios_parsed"] if claim_of(s) == "pr"]
                 scen_rows = [scenario_state(s, entries, pr, plan["plan_hash"], head, authors) for s in claimed]
                 bad = [s for s in scen_rows if s["status"] != "ok"]
                 row["detail"] = "%d of %d claimed scenarios proven and judged at %s" % (len(scen_rows) - len(bad), len(scen_rows), head[:8])
@@ -371,9 +385,9 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
                     row.update(status="missing", missing=["%s: %s" % (s["id"], "; ".join(s["missing"])) for s in bad])
                 else:
                     row["status"] = "ok"
-                epic = [s["id"] for s in plan["scenarios_parsed"] if (s.get("claim") or "pr") == "epic"]
+                epic = [s["id"] for s in plan["scenarios_parsed"] if claim_of(s) == "epic"]
                 if epic:
-                    row["detail"] += "; epic-claimed, proven at the integration head: %s" % ", ".join(epic)
+                    row["detail"] += "; epic-claimed, proven after the merge at the integration head: %s" % ", ".join(epic)
         elif gid == "G4":
             ci = (facts or {}).get("ci")
             if ci in ("green", "passing"):

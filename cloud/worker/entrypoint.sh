@@ -38,10 +38,17 @@ if usable model-auth; then
   XDG_DATA_HOME="$data"; export XDG_DATA_HOME
 fi
 
-# the default model: the pod has no OpenCode config, so write one (no secret in it) on tmpfs and point the server at it
+# the default model and the worker agent: the pod has no OpenCode config, so write one (no secret in it) on tmpfs and point the server at it
+case "${CW_MODEL:-}" in
+  *[!A-Za-z0-9._/:-]*) echo "worker: CW_MODEL has a character outside [A-Za-z0-9._/:-]; refusing to start" >&2; exit 1 ;;
+esac
 cfgdir="$TMP/config"
 ( umask 077; mkdir -p "$cfgdir/opencode"
-  printf '{"model": "%s"}\n' "${CW_MODEL:-github-copilot/claude-sonnet-5.5}" > "$cfgdir/opencode/opencode.json" )
+  printf '{"model": "%s",\n' "${CW_MODEL:-github-copilot/claude-sonnet-5.5}" > "$cfgdir/opencode/opencode.json"
+  # the worker agent (default) and the shell tool's deny rules: the template's first line is its opening brace
+  tail -n +2 "${CW_SHARE_DIR:-/usr/local/share/cw}/opencode-worker.json" >> "$cfgdir/opencode/opencode.json"
+  mkdir -p "$cfgdir/opencode/agents"
+  cat "${CW_SHARE_DIR:-/usr/local/share/cw}/worker.md" > "$cfgdir/opencode/agents/worker.md" )
 chmod 600 "$cfgdir/opencode/opencode.json"
 XDG_CONFIG_HOME="$cfgdir"; export XDG_CONFIG_HOME
 
@@ -64,16 +71,36 @@ if [ -z "\$tok" ]; then echo "worker: the git token file is unreadable or empty"
 printf 'username=x-access-token\\npassword=%s\\n' "\$tok"
 H
   chmod 755 "$bin/git-credential-cw"
+  # No git-token means no wrappers: the OpenCode deny rules are then the only pod-side layer.
+  # The pod-side refusal of merge, force-push, push to the default branch, issue/label writes and settings calls. It is a
+  # convenience and NOT the guard: calling the real binary by its path skips it. The guard is the repository's own rules
+  # and the token's scope. Installed with the wrappers; a missing guard file refuses the start (no wrapper without it).
+  guard="${CW_SHARE_DIR:-/usr/local/share/cw}/guard.sh"
+  if [ ! -r "$guard" ] || [ ! -s "$guard" ]; then
+    echo "worker: the guard file is unreadable or empty; refusing to start" >&2
+    exit 1
+  fi
+  cat "$guard" > "$bin/cw-guard"; chmod 755 "$bin/cw-guard"
   real_gh=$(command -v gh || true)
+  real_git=$(command -v git || true)
   if [ -n "$real_gh" ]; then
     cat > "$bin/gh" <<H
 #!/bin/sh
-# the token is read for this one call and lives only in the environment of that gh process
+# refuse the six (exit 3, one line), then run gh. The token is read for this one call and lives only in the environment of that gh process
+"$bin/cw-guard" gh "\$@" || exit \$?
 tok=\$({ tr -d '\\r\\n' < "$tokfile"; } 2>/dev/null) || tok=""
 if [ -z "\$tok" ]; then echo "worker: the git token file is unreadable or empty" >&2; exit 1; fi
 GH_TOKEN=\$tok exec "$real_gh" "\$@"
 H
     chmod 755 "$bin/gh"
+  fi
+  if [ -n "$real_git" ]; then
+    cat > "$bin/git" <<H
+#!/bin/sh
+CW_REAL_GIT="$real_git" "$bin/cw-guard" git "\$@" || exit \$?
+exec "$real_git" "\$@"
+H
+    chmod 755 "$bin/git"
   fi
   # ~/.gitconfig is read by every process of this user, including a fresh-environment `kubectl exec` (the end hook)
   git config --global credential.helper "$bin/git-credential-cw"

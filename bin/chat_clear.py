@@ -23,6 +23,8 @@ import tempfile
 import time
 from pathlib import Path
 
+CONFIG_KEY = "chat_clear"   # the module declares its own configuration key (bin/fleet-switchboard config_declarations)
+CONFIG_DEFAULT = None       # None: no default is added to the configuration (absent = on, in SHADOW)
 OFFERS_FILE = "chat-clear-offers.json"
 OFFERS_MAX_BYTES = 262144
 OFFERS_MAX = 500
@@ -39,6 +41,12 @@ LOCK_SECONDS = 5
 CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 DIGITS = re.compile(r"[0-9]+")   # ASCII digits only
 OFFER_TTL = 7 * 86400          # seconds: an offer older than this is not clearable (the owner is shown it again first)
+
+
+def validate(raw, source="config"):
+    """`chat_clear`: absent = the defaults; else {"enabled": true|false, "live": true|false} and nothing else. Raises ValueError naming the key."""
+    if raw is not None and (not isinstance(raw, dict) or set(raw) - {"enabled", "live"} or any(not isinstance(v, bool) for v in raw.values())):
+        raise ValueError("%s: 'chat_clear' must be {\"enabled\": true|false, \"live\": true|false}, got %r" % (source, raw))   # #457: live is the owner's key
 
 
 def _label_names(labels):
