@@ -430,7 +430,7 @@ def _kill_group(child):
 def _ignore_signals():
     if threading.current_thread() is not threading.main_thread():
         return {}
-    return {s: signal.signal(s, signal.SIG_IGN) for s in (signal.SIGINT, signal.SIGTERM)}
+    return {s: signal.signal(s, signal.SIG_IGN) for s in HANDLED_SIGNALS}
 
 
 def _restore_signals(old):
@@ -834,7 +834,12 @@ def tunnel(cluster, record):
     try:
         # the pid and start time go in the command's private directory: if this command is killed outright (SIGKILL), the NEXT command stops
         # the orphaned port-forward (only while the pid still has this start time and is a port-forward of this directory)
-        started = _ps(child.pid, "lstart")
+        started = None
+        for _ in range(5):   # ps can fail for a moment on a loaded machine
+            started = _ps(child.pid, "lstart")
+            if started:
+                break
+            time.sleep(0.2)
         if not started:
             sys.stderr.write("%s: warning: the tunnel could not be recorded; if this command is killed outright it may leave the tunnel running\n" % H["PROG"])
         else:
@@ -987,9 +992,6 @@ def _launch(args, runner, now, reserve):
             cluster.add(password)
         finally:
             os.close(read_fd)
-        if engine.discover(engine.now()).agents.get(name) is not None:   # a local agent took the name while the pod was being made: the pod goes
-            _stop_after_failure(engine, runner, name, run_id, "launch: a local agent took the name", cluster)
-            raise LaunchError("a local fleet agent named %s appeared while the pod was being made; the pod was stopped and no record kept" % name)
         try:
             record = _record_from_create(name, body)
             _write_private(password_path(state, name), password + "\n")
@@ -1004,6 +1006,17 @@ def _launch(args, runner, now, reserve):
             raise LaunchError("the worker was created but its record could not be stored (%s); stop was requested" % _one(cluster.clean(str(err), 100), 100)) from None
         _audit(engine, "cloud.created", name, {"runtime_id": record["runtime_id"], "host": urllib.parse.urlsplit(record["url"]).hostname,
                                                "idle_deadline": record.get("idle_deadline"), "hard_deadline": record.get("hard_deadline")})
+        try:   # a local agent may have taken the name while the pod was being made; discovery that cannot answer counts as a failure (cannot tell)
+            taken = engine.discover(engine.now()).agents.get(name) is not None
+            problem = "a local fleet agent named %s appeared while the pod was being made" % name if taken else None
+        except Exception as err:
+            problem = "the check for a local agent of that name failed (%s)" % type(err).__name__
+        if problem:
+            stopped = _stop_after_failure(engine, runner, name, run_id, "launch: " + _one(problem, 100), cluster)
+            if stopped:
+                remove_record(state, name)
+            raise LaunchError("%s: %s (the worker %s was created; %s)" % (
+                name, problem, name, "it was stopped and its record dropped" if stopped else "the stop failed: the pod and its record are kept; stop it with `%s retire %s`" % (H["PROG"], name)))
         fleet = H["fleet_record"](name, args.role, args.reports_to, None if args.issue is None else int(args.issue), args.charter, repo)
         try:
             with tunnel(cluster, record) as live:

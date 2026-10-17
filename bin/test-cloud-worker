@@ -747,6 +747,17 @@ class TestSignalsAndOrphans(Base):
     PLANTED = TestWiring.PLANTED
     _signalled = TestWiring._signalled
 
+    def test_the_cleanup_stop_ignores_all_four_signals(self):
+        ignored = []
+        module = sb.load_module("cloud_worker").bind(sb.__dict__)
+        old = module._ignore_signals()
+        try:
+            for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+                ignored.append(signal.getsignal(sig) == signal.SIG_IGN)
+        finally:
+            module._restore_signals(old)
+        self.assertEqual(ignored, [True] * 4)
+
     def test_signal_table_leaves_no_directory_and_no_tunnel(self):
         for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
             with self.subTest(signal=signal.Signals(signum).name):
@@ -766,6 +777,7 @@ class TestSignalsAndOrphans(Base):
         while time.time() < deadline and len((self.stub_dir / "pf.pid").read_text().split()) == before:
             time.sleep(0.1)
         notes = []
+        deadline = time.time() + 60
         while time.time() < deadline and not notes:
             notes = list(self.root.glob("cmd-*/tunnel-*.pid"))
             time.sleep(0.1)
@@ -980,15 +992,34 @@ class TestStopAndStatus(Base):
         self.assertTrue(audit, "no cloud.stopped audit line")
         self.assertTrue(all(run_id not in l and "run-id" in l for l in audit))   # the line names a short id, not the nonce itself
 
+    def _second_discovery(self, second):
+        first = mock.Mock(agents={}, problems=[])
+        with mock.patch.object(sb.Switchboard, "discover", side_effect=[first, second]):
+            return self.launch()
+
     def test_a_local_agent_that_appears_while_the_pod_is_made_stops_the_pod_and_keeps_no_record(self):
-        seen = mock.Mock(session_id="ses_example")
-        answers = [mock.Mock(agents={}, problems=[]), mock.Mock(agents={"coder7": seen}, problems=[])]
-        with mock.patch.object(sb.Switchboard, "discover", side_effect=answers):
-            code, out, err = self.launch()
+        code, out, err = self._second_discovery(mock.Mock(agents={"coder7": mock.Mock(session_id="ses_example")}, problems=[]))
         self.assertEqual(code, 1)
         self.assertIn("appeared while the pod was being made", err)
         self.assertIn("stop", [c[0] for c in self.stub_calls()])
         self.assertFalse((self.state / "cloud" / "coder7.json").exists())
+
+    def test_a_second_discovery_that_raises_stops_the_pod_and_names_the_worker(self):
+        code, out, err = self._second_discovery(RuntimeError("herdr exploded: secret-looking text"))
+        self.assertEqual(code, 1)
+        self.assertIn("coder7", err)
+        self.assertIn("it was stopped", err)
+        self.assertNotIn("secret-looking text", err)   # the class only
+        self.assertIn("stop", [c[0] for c in self.stub_calls()])
+        self.assertFalse((self.state / "cloud" / "coder7.json").exists())
+
+    def test_a_second_discovery_that_raises_and_a_stop_that_fails_keeps_the_record_with_a_retire_hint(self):
+        with mock.patch.dict(os.environ, {"STUB_STOP_EXIT": "1"}):
+            code, out, err = self._second_discovery(RuntimeError("boom"))
+        self.assertEqual(code, 1)
+        self.assertIn("coder7", err)
+        self.assertIn("retire coder7", err)
+        self.assertTrue((self.state / "cloud" / "coder7.json").exists())
 
     def test_a_launcher_whose_stop_takes_no_run_id_is_stopped_by_name_and_the_audit_says_so(self):
         text = self.stub.read_text().replace('elif command == "stop":', 'elif command == "stop":\n    if "--run-id" in argv:\n        sys.stderr.write("error: unrecognized arguments: --run-id\\n")\n        sys.exit(2)')
