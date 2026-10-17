@@ -14338,6 +14338,138 @@ class TestHeadlessPresence(Base):
         self.assertIn("other/thing", done["identity"])
         self.assertIn("it has no repo", self.launch_hl(name="norepo")["identity"])
 
+    def mapped_route(self, check=None):
+        self.engine.accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5, "gh_users": {"acme-org/*": "acme-bot"}}, self.world.route, self.world.clock.now,
+                                             environ={"GH_TOKEN": "tok-FAKE-9f3a"})
+        self.engine.route_check = check if check is not None else (lambda: None)
+
+    def test_a_headless_launch_for_a_mapped_repo_is_accepted_when_the_route_is_proved_and_no_token_is_kept_anywhere(self):
+        self.mapped_route()
+        done = self.launch_hl(name="mapped", repo="acme-org/widget-api")
+        self.assertIn("set up to act as the gh account acme-bot", done["identity"])
+        self.assertIn("record resolves to that repo", done["identity"], "the line that only the proof returns, so a launch that never proved fails")
+        self.assertIn("NOT checked", done["identity"])
+        self.assertEqual(self.world.v2.sessions[done["session"]]["metadata"]["fleet"]["repo"], "acme-org/widget-api")
+        self.assertEqual(len([m for m in self.world.v2.sessions[done["session"]]["messages"] if m["type"] == "user"]), 1, "the brief was sent")
+        blob = json.dumps([done, self.world.v2.sessions[done["session"]], self.ap.load_record(self.world.state, "mapped")], default=str)
+        for path in Path(self.world.state).rglob("*"):
+            if path.is_file():
+                blob += path.read_text(errors="replace")
+        self.assertNotIn("tok-FAKE-9f3a", blob)
+
+    def test_a_headless_launch_for_a_mapped_repo_is_refused_with_no_session_when_the_route_cannot_be_proved(self):
+        before = set(self.world.v2.sessions)
+        self.mapped_route(check=lambda: "the gh shim is not in place")
+        with self.assertRaises(sb.LaunchError) as raised:
+            self.launch_hl(name="nopath", repo="acme-org/widget-api")
+        self.assertIn("the gh shim is not in place", str(raised.exception))
+        self.assertEqual(set(self.world.v2.sessions), before)
+        self.mapped_route()
+        real_get = self.engine.v2.session_get
+        self.engine.v2.session_get = lambda sid: ({"id": sid, "metadata": {"fleet": {"name": "norepo"}}} if sid not in before and self.world.v2.sessions[sid]["title"] == "norepo" else real_get(sid))
+        with self.assertRaises(sb.LaunchError) as raised:
+            self.launch_hl(name="norepo", repo="acme-org/widget-api")
+        self.assertIn("names none as its repo", str(raised.exception))
+        self.assertEqual(set(self.world.v2.sessions) - before, set(), "the session was deleted again")
+        self.assertIsNone(self.ap.load_record(self.world.state, "norepo"))
+        self.mapped_route()
+        def down(sid):
+            raise sb.V2Error("unreachable", None)
+        self.engine.v2.session_get = down
+        with self.assertRaises(sb.LaunchError) as raised:
+            self.launch_hl(name="down", repo="acme-org/widget-api")
+        self.assertIn("was deleted", str(raised.exception))
+        self.engine.v2.session_get = real_get
+        self.assertEqual(set(self.world.v2.sessions) - before, set())
+
+    def test_the_route_proof_reads_the_session_record_and_no_per_session_environment_so_nothing_depends_on_service_memory(self):
+        self.mapped_route()
+        done = self.launch_hl(name="again", repo="acme-org/widget-api")
+        for _ in range(2):   # the second read stands for the answer of a new service process: the record, never a per-session environment
+            self.assertIn("acme-bot", sb.prove_headless_route(self.engine, done["session"], "again", "acme-org/widget-api", "acme-bot"))
+        self.assertNotIn("environment", self.world.v2.sessions[done["session"]])
+        self.world.v2.sessions[done["session"]]["metadata"]["fleet"]["repo"] = "other-org/thing"   # a record that maps to no (or another) account
+        with self.assertRaises(sb.LaunchError) as raised:
+            sb.prove_headless_route(self.engine, done["session"], "again", "acme-org/widget-api", "acme-bot")
+        self.assertIn("other-org/thing", str(raised.exception))
+
+    def test_a_mapped_repo_with_no_route_check_keeps_the_shipped_refusal_and_the_shim_check_names_what_is_missing(self):
+        self.engine.accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5, "gh_users": {"acme-org/*": "acme-bot"}}, self.world.route, self.world.clock.now, environ={})
+        self.engine.route_check = None
+        before = set(self.world.v2.sessions)
+        with self.assertRaises(sb.LaunchError) as raised:
+            self.launch_hl(name="old", repo="acme-org/widget-api")
+        self.assertIn("cannot be pinned to an account", str(raised.exception))
+        self.assertEqual(set(self.world.v2.sessions), before)
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIn("gh shim", sb.shim_route_problem({"FLEET_SWITCHBOARD_SHIMS": d}))
+            for tool in ("gh", "git"):
+                (Path(d) / tool).write_text("#!/bin/sh\n"); os.chmod(Path(d) / tool, 0o755)
+            with tempfile.TemporaryDirectory() as cfg:
+                (Path(cfg) / "plugins").mkdir()
+                (Path(cfg) / "plugins" / "fleet-hooks.js").write_bytes((Path(sb.KIT_ROOT) / "plugins" / "fleet-hooks" / "index.js").read_bytes())
+                self.assertIsNone(sb.shim_route_problem({"FLEET_SWITCHBOARD_SHIMS": d}, config_dir=cfg))
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "gh").write_text("#!/bin/sh\n"); os.chmod(Path(d) / "gh", 0o755)
+            (Path(d) / "git").write_text("#!/bin/sh\n"); os.chmod(Path(d) / "git", 0o644)   # present, not executable
+            self.assertIn("git shim", sb.shim_route_problem({"FLEET_SWITCHBOARD_SHIMS": d}))
+        self.assertIn("absolute", sb.shim_route_problem({"FLEET_SWITCHBOARD_SHIMS": "rel"}))
+
+    def test_the_launch_refuses_a_mapped_repo_when_the_plugin_file_is_not_installed_or_differs_from_this_checkout(self):
+        with tempfile.TemporaryDirectory() as shims, tempfile.TemporaryDirectory() as cfg, tempfile.TemporaryDirectory() as kit:
+            for tool in ("gh", "git"):
+                (Path(shims) / tool).write_text("#!/bin/sh\n"); os.chmod(Path(shims) / tool, 0o755)
+            (Path(kit) / "plugins" / "fleet-hooks").mkdir(parents=True)
+            (Path(kit) / "plugins" / "fleet-hooks" / "index.js").write_text("export const a = 1\n")
+            check = lambda: sb.shim_route_problem({"FLEET_SWITCHBOARD_SHIMS": shims}, config_dir=cfg, kit_root=kit)
+            self.mapped_route(check=check)
+            before = set(self.world.v2.sessions)
+            for state in ("missing", "differs"):
+                if state == "differs":
+                    (Path(cfg) / "plugins").mkdir(parents=True)
+                    (Path(cfg) / "plugins" / "fleet-hooks.js").write_text("export const a = 2\n")
+                with self.assertRaises(sb.LaunchError, msg=state) as raised:
+                    self.launch_hl(name="plug", repo="acme-org/widget-api")
+                self.assertIn("fleet-hooks.js", str(raised.exception), state)
+                self.assertEqual(set(self.world.v2.sessions), before, state)
+            (Path(cfg) / "plugins" / "fleet-hooks.js").write_text("export const a = 1\n")
+            self.assertIsNone(check())
+            self.assertIn("acme-bot", self.launch_hl(name="plug", repo="acme-org/widget-api")["identity"])
+
+    def test_each_comparison_of_the_route_proof_refuses_and_leaves_no_session_or_record(self):
+        self.engine.accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5, "gh_users": {"acme-org/*": "acme-bot", "other-org/*": "other-bot"}}, self.world.route,
+                                             self.world.clock.now, environ={})
+        self.engine.route_check = lambda: None
+        before = set(self.world.v2.sessions)
+        real = self.engine.v2.session_get
+        cases = {"another name": {"name": "someone-else", "repo": "acme-org/widget-api"}, "no repo": {"name": "cmp"},
+                 "another account": {"name": "cmp", "repo": "other-org/thing"}, "another repo, same account": {"name": "cmp", "repo": "acme-org/other-api"}}
+        for label, fleet in cases.items():
+            self.engine.v2.session_get = lambda sid, fleet=fleet: {"id": sid, "metadata": {"fleet": fleet}}
+            with self.assertRaises(sb.LaunchError, msg="direct " + label):   # the proof's own comparison, whatever the launcher checked before it
+                sb.prove_headless_route(self.engine, "ses_x", "cmp", "acme-org/widget-api", "acme-bot")
+            with self.assertRaises(sb.LaunchError, msg=label):
+                self.launch_hl(name="cmp", repo="acme-org/widget-api")
+            self.engine.v2.session_get = real
+            self.assertEqual(set(self.world.v2.sessions) - before, set(), label)
+            self.assertIsNone(self.ap.load_record(self.world.state, "cmp"), label)
+        self.engine.v2.session_get = lambda sid: {"id": sid, "metadata": {"fleet": {"name": "cmp", "repo": "acme-org/widget-api"}}}
+        with self.assertRaises(sb.LaunchError, msg="the map gives another account than the one launched for"):
+            sb.prove_headless_route(self.engine, "ses_x", "cmp", "acme-org/widget-api", "other-bot")
+        self.engine.v2.session_get = real
+
+    def test_the_launch_output_and_the_docs_call_the_route_a_mistake_guard_and_a_terminal_launch_the_pane_environment_pin(self):
+        self.mapped_route()
+        line = self.launch_hl(name="words", repo="acme-org/widget-api")["identity"]
+        self.assertIn("pins the account in the pane's environment", line)
+        self.assertIn("mistake-guard", line)
+        docs = (Path(sb.KIT_ROOT) / "docs" / "switchboard.md").read_text()
+        paragraph = docs[docs.index("What differs from a terminal worker"):][:6000]
+        for text in (line, paragraph):
+            self.assertNotIn("is the boundary", text)
+        self.assertIn("OPENCODE_SESSION_ID", paragraph)
+        self.assertIn("mistake-guard", paragraph)
+
     def test_the_named_account_refusal_holds_for_every_spelling_of_a_mapped_repo_exact_and_wildcard_with_a_default_token_set(self):
         users = {"acme/widget": "acct-ops", "wild-org/*": "acct-ops"}
         self.engine.accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5, "gh_users": users}, self.world.route, self.world.clock.now, environ={"GH_TOKEN": "x"})
@@ -40033,6 +40165,61 @@ class TestHeadlessRestartNotice(Base):
         sid = self.world.v2.create_session({"fleet": {"name": "late", "role": "coder", "reports_to": "boss", "headless": True}}, directory=str(self.home))
         self.ap.save_record(self.world.state, "late", sid, None, now=self.world.clock.now())
         self.assertEqual([n for _, n in self.notices()], ["w1"])
+
+    def route_worker(self, name, repo):
+        sid = self.world.v2.create_session({"fleet": {"name": name, "role": "coder", "reports_to": "boss", "headless": True, "repo": repo}}, directory=str(self.home))
+        self.ap.save_record(self.world.state, name, sid, None, now=self.world.clock.now() - 1000)
+        return sid
+
+    def route_facts(self):
+        self.engine.discover(self.world.clock.now())
+        return [f for f in self.engine.collect_facts()[0] if f.kind == "headless.route"]
+
+    def test_the_daemon_rechecks_the_account_route_of_each_mapped_headless_worker_and_tells_its_boss_once_and_status_shows_it(self):
+        self.engine.accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5, "gh_users": {"acme-org/*": "acme-bot"}}, self.world.route, self.world.clock.now, environ={})
+        problem = [None]
+        self.engine.route_check = lambda: problem[0]
+        self.route_worker("mapped", "acme-org/widget-api"); self.route_worker("free", "other-org/thing")
+        self.assertEqual(self.route_facts(), [], "the route holds: nothing to say")
+        self.assertEqual(sb.headless_route_status_lines(self.world.state), [])
+        problem[0] = "the plugin file fleet-hooks.js is not installed"
+        first, second = self.route_facts(), self.route_facts()
+        self.assertEqual([(f.recipient, "mapped" in f.summary, "free" in f.summary) for f in first], [("boss", True, False)], "the unmapped worker is never named")
+        self.assertEqual({f.key for f in first}, {f.key for f in second}, "one key per problem: delivered once")
+        lines = sb.headless_route_status_lines(self.world.state)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("mapped", lines[0])
+        self.assertIn("fleet-hooks.js", lines[0])
+        problem[0] = None
+        self.assertEqual(self.route_facts(), [])
+        self.assertEqual(sb.headless_route_status_lines(self.world.state), [], "a restored route clears the line")
+
+    def test_a_changed_route_problem_is_a_new_key_a_raising_check_is_no_finding_and_a_worker_without_a_boss_is_not_told(self):
+        self.engine.accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5, "gh_users": {"acme-org/*": "acme-bot"}}, self.world.route, self.world.clock.now, environ={})
+        problem = ["first"]
+        self.engine.route_check = lambda: problem[0]
+        self.route_worker("mapped", "acme-org/widget-api")
+        one = {f.key for f in self.route_facts()}
+        problem[0] = "second"
+        self.assertEqual(len(one | {f.key for f in self.route_facts()}), 2, "a new problem is a new key")
+        def boom():
+            raise RuntimeError("unreadable")
+        self.engine.route_check = boom
+        self.assertEqual(self.route_facts(), [])
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "source.error" and "headless_route_facts" in str(e)])
+
+    def test_the_route_recheck_only_reads_files_and_calls_nothing(self):
+        self.engine.accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5, "gh_users": {"acme-org/*": "acme-bot"}}, self.world.route, self.world.clock.now, environ={})
+        with tempfile.TemporaryDirectory() as cfg:
+            self.engine.route_check = lambda: sb.shim_route_problem({"FLEET_SWITCHBOARD_SHIMS": str(self.home)}, config_dir=cfg)
+            self.route_worker("mapped", "acme-org/widget-api")
+            before = sorted((str(q.relative_to(cfg)), q.read_bytes()) for q in Path(cfg).rglob("*") if q.is_file())
+            seen = []
+            real_route = self.world.route
+            self.engine.accounts = sb.GhAccounts({"gh": "gh", "call_timeout_seconds": 5, "gh_users": {"acme-org/*": "acme-bot"}}, lambda argv, **kw: seen.append(argv) or real_route(argv, **kw), self.world.clock.now, environ={})
+            self.route_facts(); self.route_facts()
+            self.assertEqual(sorted((str(q.relative_to(cfg)), q.read_bytes()) for q in Path(cfg).rglob("*") if q.is_file()), before)
+            self.assertEqual(seen, [], "the check ran no gh and no other command")
 
     def test_a_session_that_is_gone_is_reported_to_its_boss_and_not_listed_as_working(self):
         sid = self.worker("w1")
