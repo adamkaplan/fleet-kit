@@ -19,6 +19,7 @@ import re
 import shutil
 import stat
 import time
+import unicodedata
 
 MARKER = ".fleet-review-checkout"
 MARKER_TOOL = "fleet-switchboard review checkout"
@@ -27,7 +28,7 @@ MAX_FILE_BYTES = 5 * 1024 * 1024
 MAX_FILES = 5000
 MAX_TOTAL_BYTES = 100 * 1024 * 1024
 MAX_DIFF_BYTES = 5 * 1024 * 1024
-MAX_DIFF_LINES = 20000   # lines of one side: past it the line diff is skipped (difflib is quadratic)
+MAX_DIFF_LINES = 4000    # lines of one side: past it the line diff is skipped (difflib is quadratic: 4000 x 4000 fully different lines takes well under a second)
 DIFF_SECONDS = 30        # the time all line diffs together may take; past it each remaining file says the diff was skipped
 DEADLINE_SECONDS = 900   # the whole checkout
 SHA_RE = re.compile(r"[0-9a-f]{40}")
@@ -45,6 +46,13 @@ class Problem(Exception):
     """GitHub answered something unusable, or the destination is taken (exit 1)."""
 
 
+def _dot_git(part):
+    """Whether a path component could be the `.git` directory on some filesystem: any case, trailing dots or spaces (NTFS), zero-width and other
+    invisible characters (HFS+), or the NTFS short name `git~1`."""
+    folded = "".join(c for c in part if unicodedata.category(c) not in ("Cf", "Mn")).lower().rstrip(". ")
+    return folded in (".git", "git~1")
+
+
 def bad_path(path):
     """Why `path` may not be written below the directory, or None."""
     if not isinstance(path, str) or not path:
@@ -58,7 +66,7 @@ def bad_path(path):
     parts = path.split("/")
     if any(p in ("", ".", "..") for p in parts):
         return "a path with an empty, '.' or '..' part"
-    if any(p.lower() == ".git" for p in parts):
+    if any(_dot_git(p) for p in parts):
         return "a path with a .git component (a hostile .git/config would run when git is run there)"
     return None
 
@@ -257,6 +265,8 @@ def checkout(api, repo, number, head, base, cwd, limits=None, notify=lambda text
             write_file(os.path.join(root, "head"), path, blob(head_files[path]))
         diff, written, diff_started = [], 0, time.monotonic()
         for path in touched:
+            if time.monotonic() - started > DEADLINE_SECONDS:
+                raise OverBound("the checkout took more than %d seconds (the time limit)" % DEADLINE_SECONDS)
             old = blob(base_files[path]) if path in base_files else None
             new = blob(head_files[path]) if path in head_files else None
             if old is not None:

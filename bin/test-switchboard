@@ -55118,7 +55118,7 @@ class TestReviewCheckout(LedgerBase):
                 shutil.rmtree(d)
 
     def test_a_dot_git_component_in_any_case_is_refused_and_nothing_is_written(self):
-        for path in (".git/config", ".GIT/config", ".Git/hooks/x", "a/.git/config", ".git", "a/.GiT"):
+        for path in (".git/config", ".GIT/config", ".Git/hooks/x", "a/.git/config", ".git", "a/.GiT", ".git.", ".git ", ".g\u200bit/config", "GIT~1/config"):
             with self.subTest(path=path):
                 self.extra_entries = [{"path": path, "type": "blob", "mode": "100644", "sha": "f" * 40, "size": 1}]
                 code, out, err = self.checkout()
@@ -55137,6 +55137,13 @@ class TestReviewCheckout(LedgerBase):
         self.assertEqual(code, 0, err)
         self.assertLess(time.monotonic() - started, 20)
         self.assertIn("diff skipped: too large to compare here (1000000 lines)", (Path(out.strip()) / "pr.diff").read_text())
+        self.run_as("coder", "review", "checkout", "--remove", out.strip())
+        self.base_tree = {"c.txt": "".join("old %d\n" % i for i in range(3900))}   # just under the cap, every line different
+        self.head_tree = {"c.txt": "".join("new %d\n" % i for i in range(3900))}
+        started = time.monotonic()
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        self.assertLess(time.monotonic() - started, 10, "a diff just under the line cap stays fast")
         self.run_as("coder", "review", "checkout", "--remove", out.strip())
         with mock.patch.object(self.rc, "DIFF_SECONDS", -1):   # the time budget is spent: every file says so
             code, out, err = self.checkout()
