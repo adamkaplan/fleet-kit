@@ -182,6 +182,31 @@ def check_repo_allowed(repo, env):
         raise CloudError("refused: %s is not on the cloud allow-list" % scrub(repo, (), 120), EXIT_USAGE)
 
 
+# The repository preflight (#665): the program beside this file, found by this file's realpath exactly as repo-approvals.json is found by
+# preflight.py. PREFLIGHT_ARGV is a test hook (a module attribute, no setting, no environment variable): None means the real program.
+PREFLIGHT_PROGRAM = os.path.join(os.path.dirname(os.path.realpath(__file__)), "preflight.py")
+PREFLIGHT_ARGV = None
+PREFLIGHT_SECONDS = 120
+
+
+def check_repo_preflight(repo, env):
+    """The one preflight call (the operator driver and `launch --cloud` both call it), run AFTER the allow-list and BEFORE any token is minted.
+    Returns the preflight's one result line. Raises CloudError(EXIT_USAGE) (fail closed) unless the program ran, exited 0 and printed something:
+    a missing, killed, timed-out or silent program is a refusal, never a pass. The refusal carries the program's own message."""
+    argv = list(PREFLIGHT_ARGV) + [repo] if PREFLIGHT_ARGV else [sys.executable, PREFLIGHT_PROGRAM, repo]
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=PREFLIGHT_SECONDS, stdin=subprocess.DEVNULL, env=dict(env))
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        raise CloudError("refused: the repository preflight for %s could not be run; nothing was created" % scrub(repo, (), 120), EXIT_USAGE) from None
+    lines = [x.strip() for x in p.stdout.splitlines() if x.strip()]
+    if p.returncode != 0:
+        said = " | ".join(lines[-4:]) or "no message (exit %d)" % p.returncode
+        raise CloudError("refused: the repository preflight for %s did not pass: %s; nothing was created" % (scrub(repo, (), 120), scrub(said, (), 400)), EXIT_USAGE)
+    if not lines:
+        raise CloudError("refused: the repository preflight for %s printed nothing; nothing was created" % scrub(repo, (), 120), EXIT_USAGE)
+    return scrub(lines[-1], (), 300)
+
+
 def token_mode(env):
     """True when either service-account setting is present: the token-file login is then the only one (S8, S10)."""
     return bool((env.get("CW_CLOUD_SERVER") or "").strip() or (env.get("CW_CLOUD_TOKEN_FILE") or "").strip())

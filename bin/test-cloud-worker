@@ -203,6 +203,8 @@ MODEL_ENTRY = {"type": "oauth", "refresh": "ghu_ModelRefreshSecret0123456789", "
 GIT_TOKEN = "ghs_GitInstallationTokenAbCdEf0123456789"
 
 
+PREFLIGHT_PASS = ["sh", "-c", 'echo "preflight: preflight ok: deletion, non_fast_forward, pull_request"']
+
 class Base(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(dir=str(BIN.parent))   # under the worktree, never the shared /tmp
@@ -243,6 +245,10 @@ class Base(unittest.TestCase):
             "CW_TUNNEL_TIMEOUT": "10"})
         patcher.start()
         self.addCleanup(patcher.stop)
+        lib = sb.load_module("cloud_worker").bind(sb.__dict__)._lib()   # the launch path now runs the repository preflight (#665): a passing fake, unless a test sets its own
+        hook = mock.patch.object(lib, "PREFLIGHT_ARGV", PREFLIGHT_PASS)
+        hook.start()
+        self.addCleanup(hook.stop)
         for name in ("HERDR_PANE_ID", "OPENCODE_SESSION_ID", "CW_KUBE_CONTEXT", "CW_TOOLING_REPO", "CW_CLUSTER_TOKEN_CMD"):
             os.environ.pop(name, None)
         config = self.home / "cfg" / "fleet-switchboard" / "config.json"
@@ -1133,6 +1139,85 @@ class TestStopAndStatus(Base):
         code, out, err = self.main("status")
         self.assertIn("past its hard deadline", out + err)
         self.assertEqual(mints(), before)
+
+
+class TestLaunchRunsThePreflight(Base):
+    """#665: `launch --cloud` runs the repository preflight after the allow-list and before any token is minted (S1, S3, U1; S2 is every other launch test)."""
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(BIN.parent / "cloud" / "launcher" / "tests"))
+        import test_preflight as tp
+        cls.tp = tp
+        tp.Preflight.setUpClass.__func__(cls)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tp.Preflight.tearDownClass.__func__(cls)
+
+    def setUp(self):
+        super().setUp()
+        tp = self.tp
+        tp.Stub.rules, tp.Stub.protected, tp.Stub.fail, tp.Stub.methods, tp.Stub.redirect = list(tp.FULL), False, None, [], None
+        tp.Stub.review_count, tp.Stub.enforcement, tp.Stub.include, tp.Stub.conditions = 1, "active", ["~DEFAULT_BRANCH"], "ok"
+        tp.Stub.exclude, tp.Stub.target, tp.Stub.default, tp.Stub.rule_ids, tp.Stub.extra, tp.Stub.org, tp.Stub.no_id = [], "branch", "main", {}, {}, False, False
+        tp.Stub.org_code, tp.Stub.org_types, tp.Stub.fail_code, tp.Stub.org_extra, tp.Stub.org_hint = None, [], 500, [], None
+        self.lib = sb.load_module("cloud_worker").bind(sb.__dict__)._lib()
+        self.mint = self.home / "mint-ran"
+        script = self.home / "git-token-cmd"
+        script.write_text("#!/bin/sh\ntouch %s\necho ghs_synthetic\n" % self.mint)
+        script.chmod(0o700)
+        env = mock.patch.dict(os.environ, {"CW_GIT_TOKEN_CMD": str(script), "CW_GITHUB_API_BASE": self.base,
+                                           "CW_PREFLIGHT_TOKEN_CMD": "echo " + tp.TOKEN})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def real_program(self):
+        p = mock.patch.object(self.lib, "PREFLIGHT_ARGV", None)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def nothing_made(self):
+        self.assertFalse(self.mint.exists(), "a mint ran")
+        self.assertEqual(self.stub_calls(), [], "the launcher or the cluster was called")
+
+    def test_s1_three_of_three_refusal_kinds_mint_nothing_create_nothing_and_show_the_message(self):
+        self.real_program()
+        tp = self.tp
+        for kind, rules, fail, message in (("protection missing", ["pull_request"], None, "missing a non_fast_forward rule"),
+                                           ("unreadable answer", list(tp.FULL), "badjson", "cannot read"),
+                                           ("repository not found", list(tp.FULL), "/repos/acme-org/widget-service", "cannot read")):
+            with self.subTest(kind):
+                tp.Stub.rules, tp.Stub.fail = rules, fail
+                code, out, err = self.launch()
+                self.assertEqual(code, 2, err)
+                self.assertIn("did not pass", err)
+                self.assertIn(message, err)
+                self.assertNotIn("preflight ok", out + err)
+                self.nothing_made()
+
+    def test_s2_a_passing_preflight_prints_one_result_line(self):
+        self.real_program()
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err.count("preflight: preflight ok"), 1, err)
+        self.assertTrue(self.mint.exists())
+
+    def test_s3_a_missing_killed_or_silent_program_refuses_with_exit_2_and_no_mint(self):
+        for kind, argv in (("missing", ["/nonexistent/preflight"]), ("killed", ["sh", "-c", "kill -9 $$"]), ("empty output", ["true"])):
+            with self.subTest(kind), mock.patch.object(self.lib, "PREFLIGHT_ARGV", argv):
+                code, out, err = self.launch()
+                self.assertEqual(code, 2, err)
+                self.assertIn("refused", err)
+                self.nothing_made()
+
+    def test_u1_an_off_list_repository_is_refused_before_the_preflight_is_called(self):
+        mark = self.home / "pf-ran"
+        os.environ["CW_ALLOWED_REPOS"] = "acme-org/other"
+        with mock.patch.object(self.lib, "PREFLIGHT_ARGV", ["sh", "-c", "touch %s" % mark]):
+            code, out, err = self.launch()
+        self.assertEqual(code, 2, err)
+        self.assertFalse(mark.exists(), "the preflight was called")
+        self.nothing_made()
 
 
 if __name__ == "__main__":

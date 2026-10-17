@@ -458,6 +458,11 @@ def main(argv=None, env=None):
     except cw.CloudError as e:
         print("run-task: %s" % e, file=sys.stderr)
         return e.code
+    try:
+        print(cw.check_repo_preflight(a.repo, env))  # the repository preflight: after the allow-list, before any token is minted
+    except cw.CloudError as e:
+        print("run-task: %s" % e, file=sys.stderr)
+        return e.code
     if not (cw.token_mode(env) or (env.get("CW_KUBE_CONTEXT") or "").strip()):
         print("run-task: CW_KUBE_CONTEXT is not set; refusing to run (the active kubectl context is never used)", file=sys.stderr)
         return 2
