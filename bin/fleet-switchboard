@@ -17209,6 +17209,29 @@ class IntentReader:
         except ValueError:
             raise IntentError("gh", "gh returned non-JSON: %s" % _one_line(result.stdout, 120)) from None
 
+    def _api_bytes(self, path, repo=None, limit=None):
+        """The raw bytes `gh api <path>` prints (an archive), through the same account and exclusion rule as `_api`. `limit` bounds the bytes kept."""
+        config = self.config if self.config is not None else getattr(self.accounts, "config", None)
+        if config is not None and load_module("repo_exclusion").is_excluded(config, repo or self.repo):
+            raise IntentError("excluded", "repository %s is excluded from the fleet's reads (excluded_repos)" % (repo or self.repo))
+        env = self.env_for(repo)
+        extra = {"env": env} if env is not None else {}
+        try:
+            result = self.runner([self.gh, "api", path], capture_output=True, timeout=self.timeout, stdin=subprocess.DEVNULL, **extra)
+        except subprocess.TimeoutExpired:
+            raise IntentError("unavailable", "gh did not answer within %ss" % self.timeout) from None
+        except OSError as err:
+            raise IntentError("unavailable", "cannot run %s: %s" % (self.gh, err.strerror or err)) from None
+        if result.returncode != 0:
+            detail = _one_line((result.stderr or b"").decode("utf-8", "replace")) or "exit %d" % result.returncode
+            if self.accounts is not None:
+                detail = self.accounts.scrub(detail)
+            raise IntentError("not_found" if re.search(r"\b404\b|Not Found", detail) else "gh", detail)
+        out = result.stdout if isinstance(result.stdout, bytes) else str(result.stdout or "").encode()
+        if limit is not None and len(out) > limit:
+            raise IntentError("gh", "the archive is %d bytes, over the limit of %d bytes" % (len(out), limit))
+        return out
+
     def _generation(self, key):
         """The running forwarder's generation for this entry's repo (for the long-lived kinds), or None."""
         if self.live is None or self.ttl <= 0 or key[0] not in ("issue", "parent"):
@@ -20952,8 +20975,14 @@ def cmd_review_checkout(args, runner, now):
             except IntentError as err:
                 raise rc.Problem("%s: %s" % (path.split("?")[0], _one_line(str(err), 160))) from None
 
+        def archive(sha):
+            try:
+                return reader._api_bytes("repos/%s/tarball/%s" % (repo, sha), repo, limit=rc.MAX_TOTAL_BYTES + 16 * 1024 * 1024)
+            except IntentError as err:
+                raise rc.Problem("tarball: %s" % _one_line(str(err), 160)) from None
+
         try:
-            path = rc.checkout(api, repo, number, head, base, os.getcwd(), notify=lambda text: sys.stderr.write("%s: review checkout: %s\n" % (PROG, text)))
+            path = rc.checkout(api, repo, number, head, base, os.getcwd(), archive=archive, notify=lambda text: sys.stderr.write("%s: review checkout: %s\n" % (PROG, text)))
         except rc.OverBound as err:
             sys.stderr.write("%s: review checkout: refused, nothing left behind: %s\n" % (PROG, _one_line(str(err), 400)))
             return EXIT_USAGE
@@ -22106,6 +22135,26 @@ PREFLIGHT_CLASSES = (
     ("public-names", 60, (("python3", "bin/check-public-names"),), None),
     ("cloud", 600, (("bin/test-cloud-worker",), ("bin/test-cloud-launcher",), ("cloud/tests/test-cloud",)), "cloud/"),
 )
+PREFLIGHT_CEILING_MAX = 3600   # the absolute maximum of any class's ceiling, in seconds: a hung class still ends
+
+
+def preflight_ceiling(base, load1, cores):
+    """The ceiling of a class on a machine with this load: `base * (1 + load1 / cores)`, at most PREFLIGHT_CEILING_MAX .
+    Load 0 gives `base`; a load of one per core doubles it."""
+    try:
+        factor = 1.0 + max(0.0, float(load1)) / max(1, int(cores))
+    except (TypeError, ValueError):
+        factor = 1.0
+    return int(min(base * factor, PREFLIGHT_CEILING_MAX))
+
+
+def preflight_load():
+    try:
+        return os.getloadavg()[0], os.cpu_count() or 1
+    except (OSError, AttributeError):
+        return 0.0, 1
+
+
 PREFLIGHT_TOKEN_LENGTH = 49   # the macOS-only path-length trap: a token-shaped directory name of this length under TMPDIR
 
 
@@ -22130,7 +22179,9 @@ def cmd_preflight_pr(args, runner, now):
     changed = preflight_changed(runner, root)
     failed = 0
     with tempfile.TemporaryDirectory(prefix="preflight-") as work:
-        for name, ceiling, commands, under in PREFLIGHT_CLASSES:
+        for name, base_ceiling, commands, under in PREFLIGHT_CLASSES:
+            load1, cores = preflight_load()
+            ceiling = preflight_ceiling(base_ceiling, load1, cores)
             if under is not None and changed is not None and not any(path.startswith(under) for path in changed):
                 continue
             env = dict(os.environ, FLEET_HEAVY_MAX_SECONDS=str(ceiling))   # the ceiling runs INSIDE the slot (heavy's watchdog starts when the slot is granted): a wait in the queue is never a timeout
@@ -22144,10 +22195,10 @@ def cmd_preflight_pr(args, runner, now):
                 try:
                     done = runner([sys.executable, os.path.abspath(__file__), "heavy", "--"] + list(command), cwd=root, env=env, capture_output=True, text=True)
                 except subprocess.TimeoutExpired:   # only a runner of its own making raises this: heavy has no outer clock here
-                    verdict, tail = "FAIL", "timed out after %ds" % ceiling
+                    verdict, tail = "FAIL", "timed out after %ds, its ceiling (load average %.1f on %d cores)" % (ceiling, load1, cores)
                     break
                 if done.returncode == 124:
-                    verdict, tail = "FAIL", "timed out after %ds running" % ceiling
+                    verdict, tail = "FAIL", "timed out after %ds running, its ceiling (load average %.1f on %d cores)" % (ceiling, load1, cores)
                     break
                 if done.returncode == 75:
                     verdict, tail = "NOSLOT", "no heavy slot came in time (the tests did not run)"

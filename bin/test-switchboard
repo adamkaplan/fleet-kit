@@ -43,6 +43,7 @@ import zipfile
 import signal
 import socket
 import stat
+import tarfile
 import subprocess
 import sys
 import sysconfig
@@ -55820,13 +55821,35 @@ class TestReviewCheckout(LedgerBase):
         self.blobs, self.trees, self.fetched = {}, {}, []
         self.base_tree = {"a.txt": "one\n", "b.txt": "two\n", "same.txt": "same\n"}
         self.head_tree = {"a.txt": "one changed\n", "b.txt": "two\n", "same.txt": "same\n", "new.txt": "new file\n"}
-        self.extra_entries = []
+        self.extra_members = []
         self.tip_tree = {"tip.txt": "the branch moved\n"}
+
+    TOP = "acme-widget-" + LEDGER_HEAD[:7]
+
+    def archive(self, tree, extra=(), top=None, gz=True):
+        """A tarball like GitHub's: one top directory, then the files; `extra` are hostile members (name, kind, data, linkname)."""
+        top = self.TOP if top is None else top
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz" if gz else "w") as tar:
+            def add(name, kind=tarfile.REGTYPE, data=b"", linkname=""):
+                info = tarfile.TarInfo(name)
+                info.type, info.linkname, info.size = kind, linkname, (len(data) if kind == tarfile.REGTYPE else 0)
+                info.mode = 0o644
+                tar.addfile(info, io.BytesIO(data) if kind == tarfile.REGTYPE else None)
+            add(top + "/", tarfile.DIRTYPE)
+            for path, text in tree.items():
+                add(top + "/" + path, data=text.encode() if isinstance(text, str) else text)
+            for name, kind, data, linkname in extra:
+                add(name[1:] if name.startswith("=") else name if name.startswith(("/", "../")) else top + "/" + name, kind, data, linkname)
+        return buffer.getvalue()
+
+    def member(self, name, kind=tarfile.REGTYPE, data=b"x", linkname=""):
+        return (name, kind, data, linkname)
 
     def entries(self, tree):
         out = []
         for path, text in tree.items():
-            sha = hashlib.sha1(text.encode()).hexdigest()
+            sha = hashlib.sha1(b"blob %d\x00" % len(text.encode()) + text.encode()).hexdigest()
             self.blobs[sha] = text
             out.append({"path": path, "type": "blob", "mode": "100644", "sha": sha, "size": len(text.encode())})
         return out
@@ -55837,11 +55860,15 @@ class TestReviewCheckout(LedgerBase):
             self.fetched.append(path)
             if "/compare/" in path:
                 return subprocess.CompletedProcess(argv, 0, json.dumps({"merge_base_commit": {"sha": self.BASE}}), "")
+            ball = re.search(r"/tarball/([0-9a-f]+)", path)
+            if ball:
+                table = {LEDGER_HEAD: self.head_tree, self.OLD_TIP: self.tip_tree}[ball.group(1)]
+                return subprocess.CompletedProcess(argv, 0, self.archive(table, self.extra_members), b"")
             tree = re.search(r"/git/trees/([0-9a-f]+)", path)
             if tree:
                 sha = tree.group(1)
-                table = {LEDGER_HEAD: self.head_tree, self.BASE: self.base_tree, self.OLD_TIP: self.tip_tree}[sha]
-                body = {"tree": self.entries(table) + self.extra_entries if sha == LEDGER_HEAD else self.entries(table), "truncated": False}
+                table = {self.BASE: self.base_tree, self.OLD_TIP: self.tip_tree}[sha]
+                body = {"tree": self.entries(table), "truncated": False}
                 return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
             blob = re.search(r"/git/blobs/([0-9a-f]+)", path)
             if blob:
@@ -55916,35 +55943,135 @@ class TestReviewCheckout(LedgerBase):
     def test_s4_a_symlink_is_skipped_and_the_hostile_paths_are_refused_by_name(self):
         secret = self.outside / "secret.txt"
         secret.write_text("outside")
-        link = {"path": "link", "type": "blob", "mode": "120000", "sha": "e" * 40, "size": 5}
-        self.extra_entries = [link]
+        link = self.member("link", tarfile.SYMTYPE, linkname=str(secret))
+        hard = self.member("hard", tarfile.LNKTYPE, linkname="a.txt")
+        self.extra_members = [link, hard]
         code, out, err = self.checkout()
         self.assertEqual(code, 0, err)
         root = Path(out.strip())
         self.assertIn("'link'", err)
+        self.assertIn("'hard'", err)
         self.assertFalse(any(p.is_symlink() for p in root.rglob("*")), "0 symlinks created")
-        self.assertFalse((root / "head" / "link").exists())
+        self.assertFalse((root / "head" / "link").exists() or (root / "head" / "hard").exists())
         self.run_as("coder", "review", "checkout", "--remove", str(root))
-        hostile = [("../up.txt", "100644"), ("/abs.txt", "100644"), ("nul\x00.txt", "100644"), ("a/../../b.txt", "100644")]
-        self.extra_entries = [link] + [{"path": p, "type": "blob", "mode": m, "sha": "f" * 40, "size": 1} for p, m in hostile]
+        hostile = ["../up.txt", "/abs.txt", "a/../../b.txt"]
+        self.extra_members = [link] + [self.member(p) for p in hostile]
         code, out, err = self.checkout()
         self.assertEqual(code, 1)
-        for name in ("up.txt", "abs.txt", "nul\\\\x00.txt", "b.txt"):
+        for name in ("up.txt", "abs.txt", "b.txt"):
             self.assertIn(name, err)
         self.assertIn("'link'", err)
         self.made_nothing()
         self.assertEqual(os.listdir(self.outside), ["secret.txt"])
         self.assertEqual(secret.read_text(), "outside")
-        self.assertFalse(any("/git/blobs/" + "f" * 40 in p or "/git/blobs/" + "e" * 40 in p for p in self.fetched), "no blob of a hostile entry was read")
+        self.assertFalse((self.cwd.parent / "up.txt").exists() or (self.cwd / "up.txt").exists())
+
+    def test_a_nul_in_a_member_name_is_refused(self):
+        self.assertIn("NUL", self.rc.bad_path("nul\x00.txt"))
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz", format=tarfile.PAX_FORMAT) as tar:
+            top = tarfile.TarInfo(self.TOP)
+            top.type = tarfile.DIRTYPE
+            tar.addfile(top)
+            info = tarfile.TarInfo(self.TOP + "/nul.txt")
+            info.size = 1
+            info.pax_headers = {"path": self.TOP + "/nul\x00.txt"}
+            tar.addfile(info, io.BytesIO(b"x"))
+        plain = self.route
+        self.route = lambda argv, **kw: (subprocess.CompletedProcess(argv, 0, buffer.getvalue(), b"") if "/tarball/" in " ".join(argv) else plain(argv, **kw))
+        code, out, err = self.checkout()
+        self.assertEqual(os.listdir(self.outside), [])
+        self.assertEqual(code, 1, err)
+        self.assertIn("NUL", err)
+        self.made_nothing()
 
     def test_s9_a_tree_whose_only_path_escapes_writes_no_file_outside(self):
         self.head_tree, self.base_tree = {}, {}
-        self.extra_entries = [{"path": "../escape", "type": "blob", "mode": "100644", "sha": "f" * 40, "size": 1}]
+        self.extra_members = [self.member("../escape")]
         code, out, err = self.checkout()
         self.assertEqual(code, 1)
         self.assertFalse((self.cwd.parent / "escape").exists())
         self.assertFalse((self.cwd / "escape").exists())
         self.made_nothing()
+
+    def test_s4_the_head_tree_is_one_archive_call_and_no_blob_call_per_file(self):
+        self.head_tree = {"dir%d/f%d.txt" % (i % 5, i): "content %d\n" % i for i in range(50)}
+        self.base_tree = dict(self.head_tree)
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip())
+        self.assertEqual(len([p for p in self.fetched if "/tarball/" in p]), 1)
+        self.assertEqual([p for p in self.fetched if "/git/blobs/" in p], [])
+        self.assertEqual(len(self.files(root / "head")), 50)
+        for path, text in self.head_tree.items():
+            self.assertEqual((root / "head" / path).read_text(), text)
+
+    def test_a_hostile_archive_is_refused_by_shape_and_writes_nothing_outside(self):
+        big = b"y" * 100
+        shapes = {
+            "dot git": ([self.member(n) for n in (".git/config", ".GIT/config", ".Git/hooks/x", "a/.gIt/config")], 1, ".git component"),
+            "oversize member": ([self.member("huge.bin", data=big)], 2, "bytes for one file"),
+            "too many members": ([self.member("m%d" % i) for i in range(30)], 2, "files"),
+            "duplicate names": ([self.member("dup.txt"), self.member("dup.txt")], 1, "twice"),
+            "outside the top directory": ([self.member("=other-top/x.txt")], 1, "single top directory"),
+        }
+        for label, (members, want, snippet) in shapes.items():
+            with self.subTest(label), mock.patch.object(self.rc, "MAX_FILE_BYTES", 50 if "oversize" in label else 5 * 1024 * 1024), \
+                    mock.patch.object(self.rc, "MAX_FILES", 20 if "many" in label else 5000):
+                self.extra_members = members
+                code, out, err = self.checkout()
+                self.assertEqual(code, want, err)
+                self.assertIn(snippet, err)
+                self.made_nothing()
+                self.assertEqual(os.listdir(self.outside), [])
+
+    def test_a_bomb_is_stopped_by_its_header_before_any_byte_is_written(self):
+        written = []
+        real = self.rc.write_file
+        self.extra_members = [self.member("bomb.bin", data=b"\x00" * (6 * 1024 * 1024))]   # compresses to a few KB; its header says 6 MiB
+        with mock.patch.object(self.rc, "write_file", lambda root, rel, data: written.append(rel) or real(root, rel, data)):
+            code, out, err = self.checkout()
+        self.assertEqual(code, 2, err)
+        self.assertNotIn("bomb.bin", [w for w in written])
+        self.made_nothing()
+
+    def test_the_marker_is_written_first_and_a_kill_after_the_first_file_leaves_a_removable_directory(self):
+        order = []
+        real = self.rc.write_file
+
+        def spy(root, rel, data):
+            order.append(rel)
+            if rel == "a.txt":   # the first tree file is on disk, then the process dies
+                real(root, rel, data)
+                raise KeyboardInterrupt
+            return real(root, rel, data)
+        with mock.patch.object(self.rc, "write_file", spy):
+            with self.assertRaises(KeyboardInterrupt):
+                self.checkout()
+        self.assertEqual(order[0], self.rc.MARKER)
+        self.assertEqual(self.rc.MARKER, ".fleet-review-checkout")
+        # a hard kill leaves what was on disk at that moment: marker plus one file; --remove takes it
+        d = Path(os.path.realpath(self.cwd)) / ".review" / LEDGER_HEAD[:12]
+        d.mkdir(parents=True)
+        (d / ".fleet-review-checkout").write_text(json.dumps({"tool": "fleet-switchboard review checkout", "head": LEDGER_HEAD}))
+        (d / "head").mkdir()
+        (d / "head" / "a.txt").write_text("one")
+        code, out, err = self.run_as("coder", "review", "checkout", "--remove", str(d))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.files(self.cwd), [])
+
+    def test_a_failure_on_the_first_file_leaves_nothing_or_a_marker_only_directory(self):
+        real = self.rc.write_file
+
+        def boom(root, rel, data):
+            if rel != self.rc.MARKER:
+                raise self.rc.Unsafe("first file fails")
+            return real(root, rel, data)
+        with mock.patch.object(self.rc, "write_file", boom):
+            code, out, err = self.checkout()
+        self.assertEqual(code, 1)
+        left = self.files(self.cwd)
+        self.assertTrue(left == [] or all(p.endswith(".fleet-review-checkout") for p in left), left)
 
     def test_the_writer_refuses_a_symlinked_directory_in_the_way(self):
         root = self.work / "root"
@@ -56002,13 +56129,12 @@ class TestReviewCheckout(LedgerBase):
     def test_a_dot_git_component_in_any_case_is_refused_and_nothing_is_written(self):
         for path in (".git/config", ".GIT/config", ".Git/hooks/x", "a/.git/config", ".git", "a/.GiT", ".git.", ".git ", ".g\u200bit/config", "GIT~1/config"):
             with self.subTest(path=path):
-                self.extra_entries = [{"path": path, "type": "blob", "mode": "100644", "sha": "f" * 40, "size": 1}]
+                self.extra_members = [self.member(path)]
                 code, out, err = self.checkout()
                 self.assertEqual(code, 1)
                 self.assertIn(".git component", err)
                 self.made_nothing()
-        self.extra_entries = [{"path": ".gitignore", "type": "blob", "mode": "100644", "sha": "f" * 40, "size": 1}]
-        self.blobs["f" * 40] = "x"
+        self.extra_members = [self.member(".gitignore")]
         self.assertEqual(self.checkout()[0], 0, ".gitignore is not a .git component")
 
     def test_a_huge_file_skips_its_line_diff_fast_and_says_so_and_the_deadline_bounds_the_whole(self):
@@ -63071,7 +63197,7 @@ class TestPreflightPr(unittest.TestCase):
                 done.returncode = 1 if any(word in command for word in failing) else 0
             return done
         out, err = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), mock.patch.object(sb, "preflight_load", lambda: (0.0, 4)):
             code = sb.cmd_preflight_pr(None, runner, time.time)
         return code, out.getvalue().splitlines(), calls
 
@@ -63117,11 +63243,19 @@ class TestPreflightPr(unittest.TestCase):
             done = mock.Mock(returncode=124 if "heavy" in argv else 0, stdout="/r\n", stderr="")
             return done
         out = io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()), mock.patch.object(sb, "preflight_load", lambda: (4.0, 4)):
             code = sb.cmd_preflight_pr(None, runner, time.time)
         self.assertEqual(code, 1)
         self.assertIn("FAIL cli-surface", out.getvalue())
-        self.assertIn("timed out after 240s running", out.getvalue())
+        self.assertIn("timed out after 480s running, its ceiling (load average 4.0 on 4 cores)", out.getvalue())   # S2: 240 * (1 + 4/4)
+
+    def test_s1_the_ceiling_grows_with_the_load_and_never_passes_the_maximum(self):
+        low, high, absurd = (sb.preflight_ceiling(600, load, 8) for load in (1, 60, 1000))
+        self.assertGreater(high, low)
+        self.assertLessEqual(max(low, high), sb.PREFLIGHT_CEILING_MAX)
+        self.assertEqual(absurd, sb.PREFLIGHT_CEILING_MAX)   # S3
+        self.assertEqual(sb.preflight_ceiling(600, 0, 8), 600)
+        self.assertEqual(sb.preflight_ceiling(600, "x", 0), 600)
 
     def test_s2_a_class_over_its_ceiling_says_it_timed_out(self):
         code, lines, _ = self.run_preflight(["x"], timing_out=("TestHygiene",))
