@@ -2,8 +2,10 @@
 import base64
 import json
 import os
+import shutil
 import signal
 import sys
+import tempfile
 import time
 import unittest
 import urllib.parse
@@ -37,6 +39,14 @@ def messages():
 
 
 class Record(td.Driver):
+    # A short fixed base: no assertion here may depend on the runner's temp-path shape (a long token-shaped
+    # segment, as under macOS /var/folders, is redacted by the launcher's scrub in audit and screen text).
+    TMP_BASE = "/tmp" if os.path.isdir("/tmp") else None
+
+    def shown(self, path):
+        """The path as audit and screen text carry it: through the launcher's own scrub."""
+        return cw.scrub(path, limit=10 ** 6)
+
     def setUp(self):
         super().setUp()
         self.records = os.path.join(self.tmp.name, "records")
@@ -73,6 +83,9 @@ class Record(td.Driver):
 
     # -- S5: the record survives the pod --
     def test_s5_after_the_stop_deletes_the_pod_the_record_holds_a_transcript_and_a_tally_with_no_secret(self):
+        self.check_s5_after_the_stop()
+
+    def check_s5_after_the_stop(self):
         p, out = self.run_driver()
         self.assertEqual(p.returncode, 0, out)
         self.assertEqual(self.st()["pods"], {})
@@ -94,8 +107,9 @@ class Record(td.Driver):
         self.assertTrue(info["start"] and info["end"])
         self.assert_record_has_no_secret()
         self.assert_clean(out)
-        self.assertEqual(out.count(d), 1, "named once on screen")
-        self.assertEqual(self.read(self.env["CW_CLOUD_AUDIT"]).count(d), 1)
+        self.assertEqual(os.path.dirname(d), self.records)   # in the configured directory, not another
+        self.assertEqual(out.count(self.shown(d)), 1, "named once on screen")
+        self.assertEqual(self.read(self.env["CW_CLOUD_AUDIT"]).count(self.shown(d)), 1)
 
     def test_the_head_sha_is_kept_when_the_pod_can_say_it(self):
         self.patch_state(head_sha="a" * 40)
@@ -207,6 +221,9 @@ class Record(td.Driver):
         self.assertEqual(p.returncode, 0, p.stderr)
 
     def test_s5_the_launchers_stop_alone_writes_the_record_so_retire_gets_one(self):
+        self.check_stop_alone()
+
+    def check_stop_alone(self):
         self.stub_env()
         self.create_with_secrets()
         code, out, err = self.run_cli("stop", "coder7", "--reason", "retired")
@@ -216,10 +233,11 @@ class Record(td.Driver):
         self.assertEqual(self.st()["pods"], {})
         info = json.loads(self.read(os.path.join(d, "run.json")))
         self.assertEqual((info["transcript"], info["exit_reason"], info["repository"]), ("saved", "retired", td.REPO))
+        self.assertEqual(os.path.dirname(d), self.records)   # in the configured directory, not another
         self.assertEqual(json.loads(out)["record"], d)
         self.assertEqual(err.count(d), 1)
-        # the audit scrubs token-shaped runs in a temp path (macOS), so compare only the fixed parts
-        self.assertRegex(self.audit_lines()[-1]["reason"], r"^retired; run record .*-\d{8}T\d{6}Z-[0-9a-f]{6}$")
+        self.assertEqual(self.audit_lines()[-1]["reason"], "retired; run record %s" % self.shown(d))
+        self.assertTrue(self.audit_lines()[-1]["reason"].endswith(os.path.basename(d)))
         lines = self.read(os.path.join(d, "transcript.jsonl")).splitlines()
         self.assert_lines_are_json(lines)
         self.assert_record_has_no_secret()   # the launcher learned the secrets from the pod's own mounts
@@ -473,6 +491,36 @@ class Record(td.Driver):
         prompt = log[log.index("prompt "):]   # the brief is multi-line: everything the stub logged from the prompt on
         self.assertTrue(prompt.startswith("prompt " + td.BRIEF), prompt)
         self.assertIn("/home/worker/report", prompt)
+
+
+class RecordUnderATokenShapedPath(Record):
+    """The key checks again with a 49-character token-shaped temp-path segment (as under macOS /var/folders):
+    they must not depend on the shape of the runner's temp path."""
+    @classmethod
+    def setUpClass(cls):
+        cls.base = tempfile.mkdtemp(prefix="cwlong")
+        seg = os.path.join(cls.base, "q7Zx9LmN3vB8kT2pR5wY1cD4fG6hJ0sA9eU3iO7nM5aXbVc"[:49])
+        os.mkdir(seg)
+        cls.TMP_BASE = seg
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.base, ignore_errors=True)
+
+    def test_the_temp_path_really_is_token_shaped(self):
+        self.assertNotEqual(self.shown(self.records), self.records)
+
+    def test_s5_after_the_stop_deletes_the_pod_the_record_holds_a_transcript_and_a_tally_with_no_secret(self):
+        self.check_s5_after_the_stop()
+
+    def test_s5_the_launchers_stop_alone_writes_the_record_so_retire_gets_one(self):
+        self.check_stop_alone()
+
+
+for _n in [n for n in dir(Record) if n.startswith("test_") and n not in
+           ("test_s5_after_the_stop_deletes_the_pod_the_record_holds_a_transcript_and_a_tally_with_no_secret",
+            "test_s5_the_launchers_stop_alone_writes_the_record_so_retire_gets_one")]:
+    setattr(RecordUnderATokenShapedPath, _n, None)   # only the key checks run under the long path
 
 
 if __name__ == "__main__":

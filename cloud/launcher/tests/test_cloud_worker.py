@@ -37,8 +37,10 @@ class Clock:
 
 
 class Base(unittest.TestCase):
+    TMP_BASE = None   # a class may root its temp directory in a path of a known shape (None: the platform's)
+
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(dir=self.TMP_BASE)
         self.addCleanup(self.tmp.cleanup)
         d = self.tmp.name
         self.state = os.path.join(d, "kube.json")
