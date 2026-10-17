@@ -249,7 +249,7 @@ class TestConfig(Base):
             "worker_lookback_hours": 24, "send_to_working": "steer",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
-            "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "reds": None, "heavy": None, "docker_reaper": True,
+            "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_plugin_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "reds": None, "heavy": None, "docker_reaper": True,
             "github_events": ["issues", "issue_comment", "sub_issues", "pull_request", "pull_request_review",
                               "check_suite", "workflow_run"],
             "awaiting_live_days": 14, "awaiting_label": None, "decisions_lookback_hours": 72,  # PR 14
@@ -56967,6 +56967,161 @@ class TestEventFeedStreamEdges(V2TransportBase):
         self.assertIsNone(sb.start_event_feed(types.SimpleNamespace(v2=types.SimpleNamespace(), audit=None), {"v2_events": "auto"}, time.time))
         with self.assertRaises(sb.ConfigError):
             sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "v2_events": "bogus"})
+
+
+class TestPluginPush(unittest.TestCase):
+    """#290 slice 6: the plugin's pushes. The receiver only MARKS a session; the pass thread makes the one bounded read."""
+    SESSION = "ses_alpha"
+
+    class Stub:
+        def __init__(self):
+            self.calls = []
+
+        def message_list(self, session, limit=None, order=None, type=None, cursor=None):
+            self.calls.append((session, limit, type))
+            return []
+
+        def __getattr__(self, name):   # any other call (a write, a send) is a failure of the test
+            raise AssertionError("the push must cause no call but a bounded read: %s" % name)
+
+    def setUp(self):
+        self.now, self.audits = [1000.0], []
+        audit = types.SimpleNamespace(append=lambda actor, name, subject, detail: self.audits.append((name, detail)))
+        self.feed = sb.EventFeed(None, audit, lambda: self.now[0])
+        self.feed.connected, self.feed.needs_resync = True, False
+        self.receiver = sb.EventReceiver(self.feed, audit, lambda: self.now[0], known=lambda: {self.SESSION, "ses_beta"})
+
+    def message(self, **fields):
+        body = {"v": 1, "kind": "event", "event": "prompt", "sessionID": self.SESSION, "at": 1000000}
+        body.update(fields)
+        return json.dumps(body).encode()
+
+    def test_s9_a_good_message_marks_only_that_session_and_the_next_pass_reads_it_once(self):
+        engine = types.SimpleNamespace(v2=self.Stub())
+        self.assertTrue(self.receiver.handle(self.message()))
+        self.assertEqual(engine.v2.calls, [], "the receiver reads nothing")
+        self.assertEqual(list(self.feed.seen), [self.SESSION])
+        self.feed.tick(engine, [self.SESSION, "ses_beta"])
+        self.assertEqual(engine.v2.calls, [(self.SESSION, sb.FEED_PAGE, "assistant")], "one bounded read, for that session only")
+        self.feed.tick(engine, [self.SESSION, "ses_beta"])
+        self.assertEqual(len(engine.v2.calls), 1, "read once: nothing new was pushed")
+
+    def test_s10_seven_kinds_of_bad_message_touch_nothing_and_are_counted(self):
+        bad = [self.message(pad="x" * 3000), self.message(v=2), self.message(event="nonsense"), self.message(sessionID="not a session"),
+               self.message(text="a prompt"), b"this is not json", bytes(range(128, 200))]
+        for raw in bad:
+            self.assertFalse(self.receiver.handle(raw))
+        self.assertEqual((self.feed.seen, self.receiver.status()["ignored"]), ({}, 7))
+        self.assertFalse(self.receiver.handle(self.message(sessionID="ses_stranger")), "a valid id of no agent of this fleet proves nothing")
+
+    def test_s11_a_burst_is_limited_counted_audited_once_and_never_queued(self):
+        for _ in range(100):
+            self.receiver.handle(self.message())
+        status = self.receiver.status()
+        self.assertEqual((status["accepted"], status["rate_limited"]), (sb.PLUGIN_SESSION_PER_SECOND, 100 - sb.PLUGIN_SESSION_PER_SECOND))
+        self.assertEqual([n for n, _ in self.audits].count("event.rate_limited"), 1)
+        self.now[0] += 2
+        self.assertTrue(self.receiver.handle(self.message()), "the next second starts clean: nothing was queued")
+
+    def test_s15_an_event_limited_away_is_still_found_by_the_reconciliation_and_said_to_be_missed(self):
+        engine = types.SimpleNamespace(v2=types.SimpleNamespace(calls=[], message_list=lambda *a, **k: [{"id": "msg_new"}]))
+        self.feed.need("test")
+        self.feed.handle(feed_line("session.step.ended", session=self.SESSION, assistantMessageID="msg_old"))
+        for _ in range(sb.PLUGIN_SESSION_PER_SECOND + 5):
+            self.receiver.handle(self.message())
+        self.assertEqual(self.receiver.status()["rate_limited"], 5, "the last pushes were limited away")
+        self.feed.seen[self.SESSION]["read"] = self.now[0] + 1   # the pushed read already happened: only the reconciliation is left to find it
+        self.now[0] += sb.FEED_RECONCILE_SECONDS + 2
+        self.feed.tick(engine, [self.SESSION])
+        self.assertEqual([n for n, _ in self.audits].count("event.missed"), 1)
+
+    def test_a_push_is_read_while_the_stream_is_down_at_most_four_sessions_a_pass_and_a_failed_read_is_tried_again(self):
+        sessions = ["ses_%02d" % n for n in range(6)]
+        self.receiver.known = lambda: set(sessions)
+        self.feed.connected = False   # the stream is down and nobody registered as a consumer
+        for session in sessions:
+            self.receiver.handle(self.message(sessionID=session))
+        engine = types.SimpleNamespace(v2=self.Stub())
+        self.feed.tick(engine, sessions)
+        self.assertEqual(len(engine.v2.calls), sb.FEED_PUSHED_PER_PASS)
+        self.feed.tick(engine, sessions)
+        self.assertEqual(sorted(c[0] for c in engine.v2.calls), sessions, "the other two the next pass; none twice")
+
+        class Failing:
+            calls = 0
+
+            def message_list(self, *a, **k):
+                Failing.calls += 1
+                raise sb.V2Error("backoff", None, "skipped")
+        self.now[0] += 1
+        self.receiver.handle(self.message(sessionID="ses_00"))
+        self.feed.tick(types.SimpleNamespace(v2=Failing()), sessions)
+        self.feed.tick(types.SimpleNamespace(v2=Failing()), sessions)
+        self.assertEqual(Failing.calls, 2, "a failed read is tried again, and counted")
+        self.assertEqual(self.feed.status()["read_errors"], 2)
+
+    def test_under_v2_light_a_push_causes_no_read(self):
+        engine = types.SimpleNamespace(v2=self.Stub(), light=True, feed=self.feed, discovery=types.SimpleNamespace(agents={"a": types.SimpleNamespace(session_id=self.SESSION)}))
+        self.receiver.handle(self.message())
+        sb.feed_tick(engine)
+        self.assertEqual(engine.v2.calls, [], "the owner's hotfix switch stops every optional history read, a pushed one too")
+
+    def test_s16_with_no_pushes_ten_simulated_minutes_for_twenty_idle_agents_cost_at_most_fifty_calls(self):
+        engine = types.SimpleNamespace(v2=self.Stub())
+        self.feed.need("test")
+        sessions = ["ses_%02d" % n for n in range(20)]
+        for _ in range(120):
+            self.now[0] += 5
+            self.feed.tick(engine, sessions)
+        self.assertLessEqual(len(engine.v2.calls), 50)
+
+    def test_u4_no_text_of_a_message_reaches_the_audit_or_the_status(self):
+        self.receiver.handle(self.message(text="SENTINEL-PROMPT-TEXT"))
+        for _ in range(40):
+            self.receiver.handle(self.message(event="idle"))
+        self.assertNotIn("SENTINEL-PROMPT-TEXT", repr(self.audits) + repr(self.receiver.status()) + repr(self.feed.status()) + repr(self.feed.seen))
+
+    def test_u5_a_pushed_claim_causes_no_write(self):
+        engine = types.SimpleNamespace(v2=self.Stub())   # any call but message_list raises
+        self.receiver.handle(self.message(id="msg_claimed", person=True))
+        self.feed.tick(engine, [self.SESSION])
+        self.assertEqual(len(engine.v2.calls), 1)
+
+    def test_the_socket_carries_pushes_to_the_receiver_without_a_reply_and_judge_requests_as_before(self):
+        state = Path(tempfile.mkdtemp(prefix="sbp"))
+        self.addCleanup(shutil.rmtree, state, True)
+        arrived = threading.Event()
+
+        def on_event(raw):
+            self.receiver.handle(raw)
+            arrived.set()
+        server = sb.JudgeServer(state, lambda text: sb.policy_reply("deny", "judged"), on_event).start()
+        self.addCleanup(server.stop)
+        reply = sb.ask_judge_daemon(state, json.dumps({"sessionID": self.SESSION, "tool": "shell", "arguments": "ls", "outcome": "allow"}), 2)
+        self.assertEqual(reply["outcome"], "deny", "a judge request is answered as before")
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(2)
+        with sb.in_directory(state):
+            sock.connect(sb.POLICY_SOCKET)
+        sock.sendall(self.message() + b"\n")
+        sock.shutdown(socket.SHUT_WR)
+        self.assertEqual(sock.recv(100), b"", "a push gets no reply")
+        sock.close()
+        self.assertTrue(arrived.wait(5), "the receiver was reached")   # the wait is only a failure bound
+        self.assertEqual(self.receiver.status()["accepted"], 1)
+
+    def test_the_socket_is_bound_for_pushes_when_the_judge_is_off_and_only_when_a_feed_runs(self):
+        state = Path(tempfile.mkdtemp(prefix="sbp"))
+        self.addCleanup(shutil.rmtree, state, True)
+        config = {"policy": {"enabled": False}, "v2_plugin_events": "auto"}
+        self.assertIsNone(sb.start_judge_server(config, state, None, time.time, types.SimpleNamespace(feed=None, audit=None)))
+        engine = types.SimpleNamespace(feed=self.feed, audit=None)
+        server = sb.start_judge_server(config, state, None, time.time, engine)
+        self.addCleanup(server.stop)
+        self.assertTrue((state / sb.POLICY_SOCKET).exists())
+        self.assertIsNotNone(engine.event_receiver)
+        server.stop()
+        self.assertIsNone(sb.start_judge_server(dict(config, v2_plugin_events="off"), state, None, time.time, engine), "off: the gate is the only signal")
 
 
 class TestEventFeedReads(unittest.TestCase):
