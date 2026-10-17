@@ -46,7 +46,7 @@ class Base(unittest.TestCase):
         self.env = {"CW_KUBECTL": os.path.join(HERE, "fake_kubectl"), "FAKE_KUBE_STATE": self.state,
                     "CW_CLOUD_AUDIT": os.path.join(d, "audit.jsonl"), "CW_CLOUD_IMAGE": "registry.example.internal/worker:1",
                     "CW_TOKEN_ENDPOINT": "https://tokens.example.internal/mint", "CW_CLOUD_DOMAIN": "example.internal",
-                    "CW_KUBE_CONTEXT": "acme-cw", "FAKE_KUBE_CALLS": os.path.join(d, "calls.jsonl")}
+                    "CW_KUBE_CONTEXT": "acme-cw", "CW_ALLOWED_REPOS": "a/b,acme-org/widget-service", "FAKE_KUBE_CALLS": os.path.join(d, "calls.jsonl")}
         self.clock = Clock()
 
     def write_state(self, st):

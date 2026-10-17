@@ -12969,7 +12969,7 @@ class TestClearCarry(unittest.TestCase):
 
     def test_s8_there_is_one_fingerprint_function_and_the_carry_code_holds_no_path_or_class_literal(self):
         import ast
-        main = Path(sb.__file__).read_text()
+        main = Path(sb.__file__).read_text() + "\n" + (Path(sb.__file__).parent / "impact_hold.py").read_text()   # #532: the clear's wrapper moved to bin/impact_hold.py, still "the switchboard's" code
         module = Path(sb.__file__).parent / "clear_carry.py"
         text = module.read_text()
         defs = [n.name for src in (main, text) for n in ast.walk(ast.parse(src)) if isinstance(n, ast.FunctionDef) and "fingerprint" in n.name]
@@ -21727,12 +21727,13 @@ class TestSweep(Base):
         self.assertEqual(len(self.sweep([report, self.human(33, "captain")])), 2)
         self.assertEqual(self.hub.single, [("acme/api", "issues/33")])
 
-    def test_s4_a_closed_issue_that_still_carries_the_persons_label_is_not_withdrawn(self):
+    def test_s4_a_closed_issue_that_still_carries_the_persons_label_is_withdrawn_like_any_other(self):   # #570: it used to be kept, listed on purpose
         self.hub.closed = {30, 31, 32}
         closed_but_labelled = dict(self.human(30), closed=True)
         kept = self.sweep([closed_but_labelled, self.human(31), self.human(32, "captain")])
-        self.assertEqual([d["ask"] for d in kept], [30], "only the one listed on purpose stays; the others are withdrawn as before")
-        self.assertNotIn(("acme/api", "issues/30"), self.hub.single, "no read is spent on it")
+        self.assertEqual([d["ask"] for d in kept], [], "a closed issue is no decision: withdrawn like the others (the list never holds one now)")
+        self.assertIn(("acme/api", "issues/30"), self.hub.single, "it is read like any other, and found closed")
+        self.assertEqual(len([e for e in self.world.audit() if e["event"] == "sweep.withdrawn"]), 3, "each of the 3 is withdrawn and audited")
 
     def test_s4_a_decision_whose_issue_is_closed_is_withdrawn_and_audited_once(self):
         self.hub.closed = {30}
@@ -23735,6 +23736,13 @@ class TestCaptainSweepFindings(TestSweep):
         self.sweep()
         self.assertEqual([f for f in self.found() if f[0] == "S9"], [])
 
+    def test_s7_a_closed_issue_that_carried_an_awaiting_label_raises_no_waiting_finding(self):   # #570
+        self.hub.closed_records = {96: sweep_issue(96, "x", [self.USER], pr=False)}
+        self.hub.closed = {96}
+        self.sweep()
+        self.sweep()
+        self.assertEqual([f for f in self.found() if f[1] == "acme/api#96"], [], "0 findings name the closed issue")
+
     def test_s9_a_merged_pr_is_no_finding_and_a_closed_unmerged_one_still_is(self):
         captain = self.USER.replace("awaiting-user", "merge-captain")
         hold = self.USER.replace("awaiting-user", "hold-impact")
@@ -25625,6 +25633,144 @@ class LedgerBase(Base):
             self.assertEqual(self.verdict(who, sid, ev)[0], 0, (who, sid))
 
 
+# (plan hash, scenario hash) of five plan texts with a tester measure scenario, computed BEFORE the change to how G1 reads an unwritten claim (the checker is not touched by it): an unwritten claim and a
+# written `claim: pr` share one scenario hash because the canonical text has always filled `pr` in.
+PINNED_G1_HASHES = [
+    ("sha256:f59db1a8ea7a7a5a9a14aea40ed171467a1e44a2c22f5b7dad7ee8db9525800c", "sha256:1eb0d1ae3803c387308206baebdee4ec8f46ea649a0bc93ea21d154c9c0c2172"),
+    ("sha256:cda1cf00b68e99a39c2333618de5eb886785c7a380e9f78c4d3a8f700e441269", "sha256:1eb0d1ae3803c387308206baebdee4ec8f46ea649a0bc93ea21d154c9c0c2172"),
+    ("sha256:50a9daea80cdb6d0deb32da91d8b0b0ef938642b69c70ef6d5bb16db17146c98", "sha256:82e8896b50f5a203fa7c9f454d9f0de39a71a5f07183d9847c0b1f71e303238e"),
+    ("sha256:d5dde84d977987a17ed348cc1c2023a1456ef00b00d6b98ba412eccd8b6932a9", "sha256:1eb0d1ae3803c387308206baebdee4ec8f46ea649a0bc93ea21d154c9c0c2172"),
+    ("sha256:d2bead8ec573f01a5fb2ddc9acb39c65c9398838fb1c741d3897c2602a0eab33", "sha256:bfa5d6a9830a09f93946c6a90158edb784c7ca24778c4ece33870c9077a92e64"),
+]
+
+
+class TestG1UnwrittenClaim(LedgerBase):
+    """#579: G1 reads a scenario with NO claim written as the tester's post-merge check when its evaluator is the tester and its proof a measure: not claimed by a slice pull request, listed as proven
+    after the merge. An explicit claim is read as written; the plan hash never changes."""
+
+    def plan(self, s2_proof="measure", s2_claim="", s2_evaluator="tester"):
+        text = LEDGER_PLAN.replace("    proof: live\n    pass: the reply arrives within 5 s", "    proof: %s\n    pass: the reply arrives within 5 s" % s2_proof, 1)
+        text = text.replace("    evaluator: tester\n", "    evaluator: %s\n%s" % (s2_evaluator, "    claim: %s\n" % s2_claim if s2_claim else ""), 1)
+        return text
+
+    def setUp(self):
+        super().setUp()
+        self.configure(evaluators={"reviewer": ["rev"], "tester": ["tst"], "owner": ["own"], "ci": ["cibot"]})
+
+    def g1(self, text, proven=("S1", "S3", "U1")):
+        self.plan_issue["body"] = text
+        for sid in proven:
+            code, _, err = self.prove("coder", sid)
+            self.assertEqual(code, 0, (sid, err))
+        for who, sid, ev in (("cibot", "S1", "ci"), ("rev", "S3", "reviewer"), ("cibot", "U1", "ci")):
+            if sid in proven:
+                self.assertEqual(self.verdict(who, sid, ev)[0], 0, (who, sid))
+        code, report, err = self.gates()
+        self.assertIn(code, (0, 1), err)   # 1: not ready, with the table still printed
+        return self.row(report, "G1")
+
+    def test_s1_s2_an_unwritten_tester_measure_is_not_claimed_and_is_named_as_proven_after_the_merge(self):
+        row = self.g1(self.plan())
+        self.assertEqual(row["status"], "ok", row)
+        self.assertIn("3 of 3 claimed scenarios proven", row["detail"])
+        self.assertEqual(row["detail"].count("S2"), 1)
+        self.assertRegex(row["detail"], r"epic-claimed, proven after the merge at the integration head: S2, S4")
+
+    def test_prove_verdict_and_verdict_all_refuse_an_unwritten_tester_measure_like_an_explicit_epic_claim(self):
+        self.plan_issue["body"] = self.plan()                    # S2: tester + measure, no claim written
+        refusals = []
+        for run in (lambda: self.prove("coder", "S2"), lambda: self.verdict("tst", "S2", "tester"),
+                    lambda: self.run_as("tst", "verdict", "--all", "--pr", self.PR, "--as", "tester", "--result", "pass", "--evidence", "judged it: matches the scenario")):
+            code, _, err = run()
+            self.assertNotEqual(code, 0)
+            refusals.append(err)
+        self.assertIn("S2 is claimed at the epic, not per PR", refusals[0])
+        self.assertIn("S2 is claimed at the epic, not per PR", refusals[1])
+        self.assertIn("no per-PR scenario of this plan is judged by tester", refusals[2], "verdict --all has nothing to record for the tester")
+        self.assertEqual(self.ledger(), [], "nothing was recorded at the PR head")
+        self.plan_issue["body"] = self.plan(s2_claim="epic")
+        self.assertIn("claimed at the epic", self.prove("coder", "S2")[2], "an explicit claim: epic refuses with the same message")
+
+    def test_an_explicit_claim_pr_on_a_tester_measure_still_records_and_the_other_scenarios_are_unchanged(self):
+        self.plan_issue["body"] = self.plan(s2_claim="pr")
+        self.assertEqual(self.prove("coder", "S2")[0], 0)
+        self.assertEqual(self.verdict("tst", "S2", "tester")[0], 0)
+        self.assertEqual(self.prove("coder", "S1")[0], 0)
+        self.assertEqual(self.verdict("cibot", "S1", "ci")[0], 0)
+        self.assertEqual(sorted(e["scenario"] for e in self.ledger()), ["S1", "S1", "S2", "S2"])
+
+    def test_no_consumer_of_a_claim_defaults_it_to_pr_on_its_own(self):
+        import re as _re
+        for name in ("fleet-switchboard", "plan_ledger.py"):
+            text = (BIN / name).read_text()
+            self.assertEqual(_re.findall(r'\.get\("claim"\) or "pr"', text), [], name + " reads a claim without claim_of")
+
+    def test_a_tester_scenario_whose_proof_is_not_a_measure_stays_claimed(self):
+        row = self.g1(self.plan(s2_proof="live"))
+        self.assertEqual(row["status"], "missing", "a tester scenario whose proof is not a measure is claimed as before")
+        self.assertTrue(any(m.startswith("S2") for m in row["missing"]), row)
+
+    def test_s3_an_explicit_claim_pr_is_claimed_and_an_explicit_claim_epic_stays_epic(self):
+        claimed = self.g1(self.plan(s2_claim="pr"))
+        self.assertEqual(claimed["status"], "missing")
+        self.assertTrue(any(m.startswith("S2") for m in claimed["missing"]), claimed)
+        self.assertIn("proven after the merge at the integration head: S4", claimed["detail"], "S2 is not epic when it writes claim: pr")
+        self.assertNotIn("S2", claimed["detail"].split("integration head:")[-1])
+        epic = self.g1(self.plan(s2_claim="epic"))
+        self.assertEqual(epic["status"], "ok")
+        self.assertIn("S2, S4", epic["detail"])
+
+    def test_s4_a_tester_scenario_whose_proof_is_a_test_and_a_reviewer_measure_are_claimed_as_today(self):
+        """The checker refuses these pairings in a real plan (a test is recorded by ci, a measure by the tester or the owner), so G1 is read directly over a hand-built plan."""
+        pl = sb.load_module("plan_ledger")
+        plan = {"result": "pass", "defects": [], "plan_hash": "sha256:" + "0" * 64, "text": "", "scenarios_parsed": [
+            {"id": "S1", "evaluator": "tester", "proof": "test"}, {"id": "S2", "evaluator": "reviewer", "proof": "measure"}, {"id": "S3", "evaluator": "tester", "proof": "measure"}]}
+        table = pl.evaluate_gates(plan, [], None, {"head": LEDGER_HEAD}, self.PR)
+        row = next(r for r in table["gates"] if r["gate"] == "G1")
+        self.assertEqual(row["status"], "missing")
+        self.assertIn("0 of 2 claimed scenarios proven", row["detail"], "S1 and S2 are claimed, S3 (tester + measure, unwritten) is not")
+        self.assertEqual(sorted(m.split(":")[0] for m in row["missing"]), ["S1", "S2"])
+        self.assertIn("integration head: S3", row["detail"])
+
+    def test_a_plan_whose_only_scenarios_are_unwritten_tester_measures_never_passes_vacuously(self):
+        pl = sb.load_module("plan_ledger")
+        plan = {"result": "pass", "defects": [], "plan_hash": "sha256:" + "0" * 64, "text": "", "scenarios_parsed": [
+            {"id": "S1", "evaluator": "tester", "proof": "measure"}, {"id": "S2", "evaluator": "tester", "proof": "measure"}]}
+        row = next(r for r in pl.evaluate_gates(plan, [], None, {"head": LEDGER_HEAD}, self.PR)["gates"] if r["gate"] == "G1")
+        self.assertEqual(row["status"], "missing", "no scenario is claimed per PR: G1 still asks for the reasoned statement")
+        self.assertIn("no scenario is claimed per PR", " ".join(row["missing"]))
+        plan["text"] = "per-pr scenarios: none because every scenario is the tester's live check after the merge"
+        row = next(r for r in pl.evaluate_gates(plan, [], None, {"head": LEDGER_HEAD}, self.PR)["gates"] if r["gate"] == "G1")
+        self.assertEqual(row["status"], "n/a")
+
+    def test_claim_of_reads_only_what_is_written(self):
+        pl = sb.load_module("plan_ledger")
+        self.assertEqual(pl.claim_of({"id": "S1", "evaluator": "tester", "proof": "measure"}), "epic")
+        self.assertEqual(pl.claim_of({"id": "S1", "evaluator": "tester", "proof": "measure", "claim": " pr "}), "pr")
+        self.assertEqual(pl.claim_of({"id": "S1", "evaluator": "tester", "proof": "measure", "claim": ""}), "epic", "a blank claim is no claim")
+        self.assertEqual(pl.claim_of({"id": "S1", "evaluator": "tester", "proof": "test"}), "pr")
+        self.assertEqual(pl.claim_of({"id": "S1", "evaluator": "ci", "proof": "measure"}), "pr")
+        self.assertEqual(pl.claim_of({"id": "S1", "evaluator": "owner", "proof": "live", "claim": "epic"}), "epic")
+
+    def test_s5_the_hashes_of_five_plans_with_a_tester_measure_scenario_are_pinned_and_the_parser_is_untouched(self):
+        pc = sb.load_module("plan_check")
+        texts = [self.plan(s2_proof="measure", s2_claim=claim) for claim in ("", "pr", "epic")] + \
+                [self.plan(s2_proof="measure").replace("Commissioning works.", "Commissioning works twice."), self.plan(s2_proof="measure").replace("alpha", "beta")]
+        hashes = [(pc.plan_hash(t), pc.content_hash(pc.parse_scenarios(pc.scenario_block(t)), [], t)) for t in texts]
+        self.assertEqual(hashes, PINNED_G1_HASHES)
+        parsed = pc.parse_scenarios(pc.scenario_block(texts[0]))
+        s2 = next(x for x in parsed if x["id"] == "S2")
+        self.assertNotIn("claim", s2, "the parser fills nothing in: only the canonical text defaults the claim")
+
+    def test_s6_plan_check_still_requires_the_fields_of_an_unwritten_tester_measure_scenario(self):
+        done = "(1) an owner can commission an agent; (2) it answers a chat message."
+        complete = sb.plan_check.check(self.plan(), done)
+        missing_pass = sb.plan_check.check(self.plan().replace("    pass: the reply arrives within 5 s and is longer than 0 characters\n", "", 1), done)
+        self.assertNotIn("missing-pass", [d["code"] for d in complete["defects"]])
+        self.assertIn("missing-pass", [d["code"] for d in missing_pass["defects"]])
+        self.assertNotEqual(missing_pass["result"], "pass")
+
+
 class TestLaunchTesters(LedgerBase):
     """#372: a tester launched with --role tester for its orchestrator's repo may record tester verdicts, beside the configured list."""
 
@@ -26107,7 +26253,7 @@ class TestPlanLedger(LedgerBase):
         self.assertEqual([r["status"] for r in report["gates"] if r["gate"] in ("G0a", "G1", "G4", "G5", "G6")], ["ok"] * 5)
         self.assertEqual(report["untracked"], ["G0b", "G0c", "G2/G3"])
         self.assertEqual({r["gate"] for r in report["gates"]},
-                         {"G0a", "G0b", "G0c", "G1", "G2/G3", "G4", "G5", "G6", "G7", "G8"})
+                         {"G0a", "G0b", "G0c", "G1", "G2/G3", "G4", "G5", "G6", "G6b", "G7", "G8"})
         self.assertEqual([self.row(report, g)["status"] for g in ("G7", "G8")], ["n/a", "n/a"])
         self.assertIn("epic-claimed", self.row(report, "G1")["detail"])
         self.assertTrue(all(r["decided_by"] for r in report["gates"]))
@@ -26296,6 +26442,81 @@ class TestPlanLedger(LedgerBase):
                 self.assertIsNone(FORBIDDEN_IN_PUBLIC_TEXT.search(line), "%s:%d %s" % (path.name, number, line))
 
 
+class TestLedgerReadRace(unittest.TestCase):
+    """A ledger read that races an append is not a cut-off (#673); a real cut-off or rewrite is still reported."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.now = 1767225600
+        for n in (1, 2):
+            self.append(n)
+
+    def append(self, n):
+        return sb.plan_ledger.append_entry(self.dir, {"kind": "proof", "pr": "acme/api#1", "scenario": "S%d" % n, "result": "pass"}, self.now)
+
+    def read_with_append_after_file_read(self):
+        """Read the ledger; the moment its file has been read, a writer completes an append (entry and head pointer)."""
+        real, fired = Path.read_text, []
+
+        def hooked(path, *a, **kw):
+            text = real(path, *a, **kw)
+            if path.name == sb.plan_ledger.LEDGER_FILE and not fired:
+                fired.append(1)
+                self.append(3)
+            return text
+        with mock.patch.object(Path, "read_text", hooked):
+            result = sb.plan_ledger.read_ledger(self.dir)
+        self.assertTrue(fired, "the interleaving hook ran")
+        return result
+
+    def test_s1_a_read_that_races_an_append_reports_no_break(self):
+        entries, problem = self.read_with_append_after_file_read()
+        self.assertIsNone(problem)
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(len(sb.plan_ledger.read_ledger(self.dir)[0]), 3)
+
+    def test_s4_a_racing_read_of_a_long_ledger_answers_like_a_quiet_read(self):
+        sb.plan_ledger.append_many(self.dir, [{"kind": "proof", "pr": "acme/api#1", "scenario": "S%d" % n, "result": "pass"}
+                                              for n in range(3, 1103)], self.now)
+        quiet = sb.plan_ledger.read_ledger(self.dir)
+        self.assertEqual((len(quiet[0]), quiet[1]), (1102, None))
+        self.append(1103)
+        # the same interleaving, on 1000+ entries: an append completes right after the file was read
+        real, fired = Path.read_text, []
+
+        def hooked(path, *a, **kw):
+            text = real(path, *a, **kw)
+            if path.name == sb.plan_ledger.LEDGER_FILE and not fired:
+                fired.append(1)
+                self.append(1104)
+            return text
+        with mock.patch.object(Path, "read_text", hooked):
+            raced = sb.plan_ledger.read_ledger(self.dir)
+        self.assertEqual((len(raced[0]), raced[1]), (1103, None))
+
+    def test_s2_a_cut_off_ledger_still_reports_the_break(self):
+        self.append(3)
+        path = Path(self.dir) / sb.plan_ledger.LEDGER_FILE
+        path.write_text("".join(path.read_text().splitlines(True)[:2]))
+        self.assertIn("ends before entry 3", sb.plan_ledger.read_ledger(self.dir)[1])
+
+    def test_s5_a_rewritten_middle_entry_is_reported_with_the_same_message(self):
+        self.append(3)
+        path = Path(self.dir) / sb.plan_ledger.LEDGER_FILE
+        lines = path.read_text().splitlines()
+        lines[1] = json.dumps(dict(json.loads(lines[1]), result="fail"), sort_keys=True)
+        path.write_text("\n".join(lines) + "\n")
+        self.assertEqual(sb.plan_ledger.read_ledger(self.dir)[1], "entry 2 does not follow from the one before it: the ledger was edited")
+
+    def test_s3_a_rewritten_ledger_still_reports_the_break(self):
+        path = Path(self.dir) / sb.plan_ledger.LEDGER_FILE
+        forged = dict(json.loads(path.read_text().splitlines()[0]), result="fail")
+        forged["hash"] = sb.plan_ledger.entry_hash(forged)
+        path.write_text(json.dumps(forged, sort_keys=True) + "\n")
+        self.assertIsNotNone(sb.plan_ledger.read_ledger(self.dir)[1])
+
+
 class TestWaive(LedgerBase):
     """`waive`: the chief of staff's logged override of G0 to G5 for one PR at its head. Never G6, G7, G8, never a writer, never
     an unknown session; it expires; a waived gate reads `waived`, not passed. Neutral names."""
@@ -26380,7 +26601,7 @@ class TestWaive(LedgerBase):
         self.assertEqual(self.row(report, "G6")["status"], "waiting")               # the owner's hold stands
         self.assertEqual(self.row(report, "G1")["status"], "waived")
         code, payload, _ = self.check()
-        self.assertEqual([f["gate"] for f in payload["failed"]], ["G6"])             # still failing (reported: a repo lists G6 to enforce it)
+        self.assertEqual([f["gate"] for f in payload["failed"]], ["G6", "G6b"])      # still failing (reported: a repo lists G6 to enforce it)
         self.assertEqual(self.run_as("coder", "gates-check", self.PR, "--for", "merge")[0], 0)   # G6 is not in this repo's enforced list
 
     def test_a_short_reason_is_refused(self):
@@ -26531,11 +26752,11 @@ class TestPlanGatesCheck(LedgerBase):
         self.pr["labels"] = [{"name": "tester:merge-captain"}]
         self.pr["statusCheckRollup"] = [{"conclusion": "SUCCESS", "status": "COMPLETED"}]
         code, out, _ = self.check("merge")
-        self.assertEqual((code, [f["gate"] for f in out["failed"]]), (10, ["G6"]))
+        self.assertEqual((code, [f["gate"] for f in out["failed"]]), (10, ["G6", "G6b"]))
         self.set_gates({"acme/app": {"mode": "enforce"}})
         code, out, _ = self.check("merge")
         self.assertEqual(code, 0, "G4 and G6 are enforced only when listed")
-        self.assertEqual([(f["gate"], f["enforced"]) for f in out["failed"]], [("G6", False)])
+        self.assertEqual([(f["gate"], f["enforced"]) for f in out["failed"]], [("G6", False), ("G6b", False)])
 
     def test_a_repo_in_enforce_with_the_default_list_reports_g4_and_g6_but_never_refuses_on_them(self):
         self.all_proven()
@@ -26544,10 +26765,10 @@ class TestPlanGatesCheck(LedgerBase):
         self.set_gates({"acme/app": {"mode": "enforce"}})
         code, out, err = self.check("merge")
         self.assertEqual((code, out["verdict"]), (0, "allow"))
-        self.assertEqual(sorted((f["gate"], f["enforced"]) for f in out["failed"]), [("G4", False), ("G6", False)])
+        self.assertEqual(sorted((f["gate"], f["enforced"]) for f in out["failed"]), [("G4", False), ("G6", False), ("G6b", False)])
         self.assertIn("reported, not enforced", out["reason"])
         (event,) = self.events("gate.reported")
-        self.assertEqual((event["detail"]["failed"], event["detail"]["enforced"]), (["G4", "G6"], []))
+        self.assertEqual((event["detail"]["failed"], event["detail"]["enforced"]), (["G4", "G6", "G6b"], []))
         self.assertEqual(self.events("gate.refused") + self.events("gate.would_refuse"), [])
         self.set_gates({"acme/app": {"mode": "enforce", "enforce_gates": ["G0a", "G1", "G4"]}})
         code, out, _ = self.check("merge")
@@ -27807,7 +28028,7 @@ class TestImpactClassAndNarrowForm(LedgerBase):
         code, out, err = self.record_impact("hold", "--impact-class", "two words")
         self.assertEqual(code, 2)
         self.assertEqual(err.count("impact-class"), 1)
-        self.assertEqual(self.record_impact("hold")[0], 0)
+        self.assertEqual(self.record_impact("second-review")[0], 0)
         code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "code", "--verdict", "approve", "--impact-class", "data")
         self.assertEqual(code, 2)
         self.assertIn("belongs to the impact reviewer", err)
@@ -27815,6 +28036,90 @@ class TestImpactClassAndNarrowForm(LedgerBase):
         self.assertEqual(stored, ["credentials", None])
         self.assertEqual(self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve", "--impact-action", "hold",
                                      "--block", "/nonexistent")[0], 2)
+
+    def test_a_hold_with_no_class_is_refused_and_nothing_is_recorded(self):
+        for more in ((), ("--impact-class", "")):
+            code, out, err = self.record_impact("hold", *more)
+            self.assertEqual(code, 2)
+            self.assertIn("run the review again", err)
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "review_record"], [])
+        self.assertEqual(self.record_impact("none")[0], 0)
+        self.assertEqual(self.record_impact("hold", "--impact-class", "data")[0], 0)
+        self.assertEqual(len([e for e in self.ledger() if e["kind"] == "review_record"]), 2)
+
+    # -- #692: a hold names a class of the matrix file
+
+    def hold_records(self):
+        return [e for e in self.ledger() if e["kind"] == "review_record" and e.get("impact_action") == "hold"]
+
+    def matrix_copy(self, edit):
+        impact_floor = sb.load_impact_floor()
+        matrix = json.loads(impact_floor.MATRIX_PATH.read_text())
+        edit(matrix["owner_hold"])
+        path = self.world.state / "matrix-copy.json"
+        path.write_text(json.dumps(matrix))
+        return impact_floor, path
+
+    def test_692_s1_s7_an_unknown_class_is_refused_lists_the_classes_and_records_nothing(self):
+        code, out, err = self.record_impact("hold", "--impact-class", "x")
+        self.assertEqual(code, 2)
+        rule = sb.load_impact_floor().owner_hold_rule(sb.load_impact_floor().load_matrix())
+        self.assertEqual(len(rule[0] + rule[1]), 10)
+        self.assertEqual([c for c in rule[0] + rule[1] if c not in err], [])
+        self.assertIn("run the review again", err)
+        self.assertEqual(self.hold_records(), [])
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "review_record"], [])
+        block = "verdict: approve\nhead: %s\nimpact-action: hold\nimpact-class: x\nfindings:\n" % LEDGER_HEAD
+        path = self.world.state / "block.txt"
+        path.write_text(block)
+        code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--block", str(path))
+        self.assertEqual(code, 2)
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "review_record"], [])
+        self.assertEqual(self.decide()[0], "none")
+
+    def test_692_s2_none_is_refused_and_a_valid_class_in_another_case_is_recorded_lower_case(self):
+        self.assertEqual(self.record_impact("hold", "--impact-class", "none")[0], 2)
+        self.assertEqual(self.hold_records(), [])
+        self.assertEqual(self.record_impact("hold", "--impact-class", " Credentials ")[0], 0)
+        self.assertEqual([e["impact_class"] for e in self.hold_records()], ["credentials"])
+
+    def test_692_s3_every_matrix_class_holds_and_other_actions_need_no_class(self):
+        impact_floor = sb.load_impact_floor()
+        rule = impact_floor.owner_hold_rule(impact_floor.load_matrix())
+        for cls in rule[0] + rule[1]:
+            self.assertEqual(self.record_impact("hold", "--impact-class", cls)[0], 0, cls)
+        self.assertEqual(self.record_impact("second-review")[0], 0)
+        self.assertEqual(self.record_impact("none")[0], 0)
+        self.assertEqual(len([e for e in self.ledger() if e["kind"] == "review_record"]), 12)
+
+    def test_692_s4_the_classes_come_from_the_matrix_file_not_the_code(self):
+        impact_floor, path = self.matrix_copy(lambda b: (b["other_classes"].remove("cost"), b["other_classes"].append("novelty")))
+        with mock.patch.object(impact_floor, "MATRIX_PATH", path):
+            self.assertEqual(self.record_impact("hold", "--impact-class", "novelty")[0], 0)
+            code, out, err = self.record_impact("hold", "--impact-class", "cost")
+            self.assertEqual(code, 2)
+            self.assertIn("run the review again", err)
+        self.assertEqual([e["impact_class"] for e in self.hold_records()], ["novelty"])
+        source = (REPO / "bin" / "fleet-switchboard").read_text()
+        rule = impact_floor.owner_hold_rule(impact_floor.load_matrix())
+        names = rule[0] + rule[1]   # no line of the code lists several of the classes (single words like "data" occur elsewhere)
+        self.assertEqual([l for l in source.splitlines() if sum(1 for c in names if re.search(r"[\"']%s[\"']" % c, l)) >= 3], [])
+
+    def test_692_s5_an_unreadable_matrix_refuses_the_hold_loudly(self):
+        impact_floor = sb.load_impact_floor()
+        for text in (None, "{not json"):
+            path = self.world.state / "gone.json"
+            if text is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_text(text)
+            impact_floor._MATRIX_CACHE.clear()
+            with mock.patch.object(impact_floor, "MATRIX_PATH", path):
+                code, out, err = self.record_impact("hold", "--impact-class", "credentials")
+            self.assertEqual(code, 2)
+            self.assertIn("matrix file cannot be read", err)
+            self.assertEqual(self.hold_records(), [])
+        impact_floor._MATRIX_CACHE.clear()
 
     def test_the_block_form_carries_the_class_line(self):
         block = "verdict: approve\nhead: %s\nimpact-action: hold\nimpact-class: Data\nfindings:\n" % LEDGER_HEAD
@@ -27828,8 +28133,15 @@ class TestImpactClassAndNarrowForm(LedgerBase):
     def test_s2_a_hold_record_holds_for_the_owner_unless_its_class_is_not_top_tier(self):
         outcome = {}
         for label, more in (("credentials", ("--impact-class", "credentials")), ("performance", ("--impact-class", "performance")),
-                            ("unknown", ("--impact-class", "gizmo")), ("missing", ())):
-            self.assertEqual(self.record_impact("hold", *more)[0], 0)
+                            ("unknown", ("--impact-class", "gizmo")), ("missing", None)):
+            if more is None or label == "unknown":   # a record already in the ledger without a class or with an unknown one (new recordings are refused): it keeps its top-tier reading
+                entry = {"kind": "review_record", "pr": self.PR, "head": LEDGER_HEAD, "reviewer": "impact", "verdict": "approve",
+                         "blocks": 0, "notes": 0, "by": "rev", "impact_action": "hold", "summary": "x"}
+                if label == "unknown":
+                    entry["impact_class"] = "gizmo"
+                sb.plan_ledger.append_entry(self.world.state, entry, 1)
+            else:
+                self.assertEqual(self.record_impact("hold", *more)[0], 0)
             outcome[label] = self.decide()
         self.assertEqual({k: v[0] for k, v in outcome.items()},
                          {"credentials": "hold", "performance": "second-review", "unknown": "hold", "missing": "hold"})
@@ -27850,6 +28162,9 @@ class TestImpactClassAndNarrowForm(LedgerBase):
         classes = rule[0] + rule[1]
         self.assertEqual(len(classes), 10)
         self.assertEqual(text.count("impact-class"), 1)
+        self.assertIn("always names its class", text)
+        self.assertIn("A hold without a class is rejected", text)
+        self.assertNotIn("Leave the class line out", text)
         self.assertEqual([c for c in classes if "`%s`" % c not in text], [])
 
     # -- S4 to S6: the agent definitions
@@ -28418,7 +28733,11 @@ class TestImpactRejudge(LedgerBase):
         self.passes([self.listed(n) for n in (9, 10, 11)])
         self.assertEqual(self.posts(), [])
         reads = len(self.view_reads)
-        for number, more in ((9, ("--impact-class", "performance")), (10, ("--impact-class", "credentials")), (11, ())):
+        for number, more in ((9, ("--impact-class", "performance")), (10, ("--impact-class", "credentials")), (11, None)):
+            if more is None:   # a record already in the ledger without a class
+                sb.plan_ledger.append_entry(self.world.state, {"kind": "review_record", "pr": "acme/app#%d" % number, "head": LEDGER_HEAD, "reviewer": "impact", "verdict": "approve",
+                                                               "blocks": 0, "notes": 0, "by": "rev", "impact_action": "hold", "summary": "x"}, 1)
+                continue
             code, out, err = self.run_as("coder", "review", "record", "acme/app#%d" % number, "--reviewer", "impact", "--verdict", "approve", "--impact-action", "hold", *more)
             self.assertEqual(code, 0, err)
         self.passes([self.listed(n) for n in (9, 10, 11)], advance=400)
@@ -31370,18 +31689,74 @@ class TestDecisionsFromGitHub(Base):
         self.assertEqual(self.derive()[0], [])
         self.assertEqual(len(self.gh.api_calls), calls)
 
-    def test_a_closed_issue_that_keeps_the_persons_label_stays_marked_closed_and_leaves_with_the_label(self):
+    def test_the_catch_up_read_asks_for_open_issues_only(self):
+        self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
+        self.rig.pump(15)
+        reads = [p for p in self.gh.api_calls if "awaiting-user" in p]
+        self.assertTrue([p for p in reads if "state=open" in p], reads)
+        self.assertFalse([p for p in reads if "state=all" in p], reads)   # #570: it used to ask for state=all for the person's label
+
+    def closed_pass(self, runner=None):
+        """One run of the closed-issue pass on the rig's hub: the fresh read of every closed event it holds (bin/closed_labels.py)."""
+        engine = self.world.engine
+        engine.gh_runner = runner or FakeMergedGh()
+        closed_labels = sb.load_module("closed_labels")
+        ns = types.SimpleNamespace(**{n: getattr(sb, n) for n in closed_labels.NEEDS})
+        return closed_labels.run_pass(ns, engine, self.world.clock.now(), sb.IMPACT_PASS_CALLS)
+
+    def close_event(self, issue):
+        issue["state"] = "closed"
+        self.gh.send("issues", {"action": "closed", "issue": dict(issue)})
+
+    def test_a_closed_issue_leaves_the_list_when_a_fresh_read_says_it_is_closed_and_not_before(self):   # #570
         issue = self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
         self.rig.pump(15)
         self.assertEqual(len(self.derive()[0]), 1)
-        issue["state"] = "closed"
-        self.gh.send("issues", {"action": "closed", "issue": dict(issue)})
-        (entry,) = self.derive()[0]
-        self.assertEqual((entry["tier"], entry.get("closed")), ("human", True))
-        self.assertTrue(entry["headline"].endswith("(closed)"))
-        issue["labels"] = []
-        self.gh.send("issues", {"action": "unlabeled", "issue": dict(issue)})
-        self.assertEqual(self.derive()[0], [])
+        self.close_event(issue)
+        self.assertEqual(len(self.derive()[0]), 1, "the event payload alone drops nothing: a late or replayed event must not hide a decision")
+        self.closed_pass()
+        self.assertEqual(self.derive()[0], [], "the fresh read says closed: it leaves the list, whatever label it still carries")
+
+    def test_a_reopened_issue_stays_listed_even_though_a_closed_event_was_seen(self):
+        issue = self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
+        self.rig.pump(15)
+        self.close_event(issue)
+        issue["state"] = "open"   # reopened before the pass looks
+        self.gh.send("issues", {"action": "reopened", "issue": dict(issue)})
+        self.closed_pass()
+        self.assertEqual([d["ask"] for d in self.derive()[0]], [7], "the current read says open: still listed")
+
+    def test_a_replayed_old_closed_event_after_a_reopen_hides_nothing(self):
+        issue = self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
+        self.rig.pump(15)
+        stale = dict(issue, state="closed")
+        self.gh.send("issues", {"action": "closed", "issue": stale})
+        self.closed_pass()   # the issue is open: nothing happens
+        self.world.tick(60)
+        self.gh.send("issues", {"action": "closed", "issue": stale})   # the same old event again
+        self.closed_pass()
+        self.assertEqual([d["ask"] for d in self.derive()[0]], [7], "an open decision is never hidden by an old payload")
+
+    def test_a_closed_payload_with_no_awaiting_label_drops_nothing_either(self):
+        issue = self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
+        self.rig.pump(15)
+        forged = dict(issue, state="closed", labels=[])   # a stale or forged closed payload that carries no label
+        self.gh.send("issues", {"action": "closed", "issue": forged})
+        self.assertEqual([d["ask"] for d in self.derive()[0]], [7], "the payload alone drops nothing, with or without the label")
+        self.rig.pump(15)   # the next catch-up read (open issues only) says what is true: the issue is open and labelled
+        self.assertEqual([d["ask"] for d in self.derive()[0]], [7])
+
+    def test_a_read_that_fails_keeps_the_decision_listed(self):
+        issue = self.gh.issue(7, title="Pick one", labels=[DECISION_LABEL], age=0)
+        self.rig.pump(15)
+        self.close_event(issue)
+        self.gh.api_down = True
+        self.closed_pass()
+        self.assertEqual([d["ask"] for d in self.derive()[0]], [7], "fail toward showing the decision")
+        self.gh.api_down = False
+        self.world.tick(sb.load_module("closed_labels").RETRY_SECONDS + 1)
+        self.closed_pass()
+        self.assertEqual(self.derive()[0], [], "once the read works and says closed, it leaves")
 
     def test_derivation_adds_no_gh_call_per_pass(self):
         self.gh.issue(5, title="A", labels=[DECISION_LABEL])
@@ -40698,9 +41073,391 @@ class TestCaptainDecisionFromLabels(TestCaptainPrs):
         self.assertEqual(self.only()["kind"], "notice")
 
 
+class TestHeldTop(DecisionsBase):
+    """#604: a PR held for the owner opens with why, what changes (a Before | After table), an example and its questions; one check (held_defects)
+    serves pr-explain --check and gate G6b. A Mermaid block in the top part fails; below it, nothing is judged."""
+    OPEN = "MERGE: captain\nPLAN: https://example.test/acme/api/issues/9\n\n"
+    WHY = "## Why this needs you\n\nIt changes a credential path. The owner decides if it ships.\n\n"
+    TABLE = ("## What changes for you\n\n| Before | After |\n|---|---|\n| You get two cards. | You get one card. |\n"
+             "| You open a list. | The list opens itself. |\n| You retry by hand. | It retries once. |\n\n")
+    EXAMPLE = "## Example\n\nToday a failed job sends two cards and a pointer.\nAfter, one card reads: job 4 failed, retried once.\n\n"
+    QS = "## Questions for you\n\n1. Ship it now? Recommendation: yes.\n2. Keep the flag? Recommendation: no.\n\n"
+    MERMAID = "```mermaid\nflowchart LR\n  A[\"Change\"] --> B[\"Owner\"]\n```\n\n"
+    TOP = WHY + TABLE + EXAMPLE + QS
+    GOOD = TOP + "## For reviewers (technical)\n\n" + MERMAID + "| a | b | c |\n|---|---|---|\n" + "| 1 | 2 | 3 |\n" * 6
+
+    def defects(self, body):
+        return sb.held_defects(body)
+
+    def named(self, found, word):
+        return sum(word in d for d in found)
+
+    def test_a_complete_top_is_ok(self):                                                                    # S1
+        self.assertEqual(self.defects(self.OPEN + self.TOP), [])
+
+    def test_the_why_section_is_one_to_three_sentences_and_no_placeholder(self):                           # S2
+        for why in ("", "## Why this needs you\n\nOne. Two. Three. Four. Five.\n\n", "## Why this needs you\n\n<one to three sentences: the hold reason>\n\n"):
+            with self.subTest(why=why[:30]):
+                found = self.defects(self.OPEN + why + self.TABLE + self.EXAMPLE + self.QS)
+                self.assertEqual(self.named(found, "Why this needs you"), 1, found)
+                self.assertEqual(len(found), 1, found)
+
+    def test_the_table_needs_both_columns_and_two_to_four_rows(self):                                       # S3
+        row = "| A sentence. | Another. |\n"
+        for table in ("", "## What changes for you\n\n| Before | After |\n|---|---|\n" + row + "\n",
+                      "## What changes for you\n\n| Before | After |\n|---|---|\n" + row * 6 + "\n",
+                      "## What changes for you\n\n| Before | Later |\n|---|---|\n" + row * 3 + "\n"):
+            with self.subTest(table=table[:60]):
+                found = self.defects(self.OPEN + self.WHY + table + self.EXAMPLE + self.QS)
+                self.assertEqual((self.named(found, "table"), len(found)), (1, 1), found)
+
+    def test_the_example_must_be_there_and_not_empty(self):                                                 # S4
+        for example in ("", "## Example\n\n"):
+            found = self.defects(self.OPEN + self.WHY + self.TABLE + example + self.QS)
+            self.assertEqual((self.named(found, "Example"), len(found)), (1, 1), found)
+
+    def test_a_mermaid_block_fails_in_the_top_and_is_not_judged_below(self):                                # S5, U2
+        top = self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + self.MERMAID + self.QS
+        found = self.defects(top)
+        self.assertEqual((self.named(found, "diagram"), len(found)), (1, 1), found)
+        self.assertEqual(self.defects(self.OPEN + self.GOOD), [])
+
+    def test_questions_numbered_none_or_missing(self):                                                      # S6
+        qs = "## Questions for you\n\n1. A? Recommendation: yes.\n2. B?\n3. C? Recommendation: no.\n"
+        self.assertEqual(self.defects(self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + qs), ["question 2 has no `Recommendation:`"])
+        for none in ("Questions: none (clear to merge on your word).", "Questions: none", "Questions: none (clear to merge on your word, after #12)"):
+            self.assertEqual(self.defects(self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + "## Questions for you\n\n" + none + "\n"), [], none)
+        found = self.defects(self.OPEN + self.WHY + self.TABLE + self.EXAMPLE)
+        self.assertEqual(self.named(found, "Questions for you"), 1, found)
+
+    def test_the_order_and_an_image_in_the_top(self):                                                       # S7
+        found = self.defects(self.OPEN + self.QS + self.EXAMPLE + self.TABLE + self.WHY)
+        self.assertEqual((self.named(found, "order"), len(found)), (1, 1), found)
+        image = "![the real card, after](https://example.test/card.png)\n\n"
+        self.assertEqual(self.defects(self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + image + self.QS), [])
+
+    def test_a_pr_that_is_not_held_is_not_read_by_the_gate(self):                                           # S8
+        reads = []
+        report = sb.plan_ledger.evaluate_gates(None, [], None, {"head": "a" * 40, "captain": False, "held_check": lambda: reads.append(1) or ["x"]}, "acme/api#1")
+        row = next(r for r in report["gates"] if r["gate"] == "G6b")
+        self.assertEqual((row["status"], reads), ("n/a", []))
+        held = sb.plan_ledger.evaluate_gates(None, [], None, {"head": "a" * 40, "captain": True, "held_check": lambda: ["no table"]}, "acme/api#1")
+        self.assertEqual(next(r for r in held["gates"] if r["gate"] == "G6b")["missing"], ["no table"])
+
+    def test_a_hold_label_alone_or_a_floor_hold_makes_the_gate_judge_and_a_missing_check_fails_closed(self):
+        facts = {"head": "a" * 40, "captain": False, "holds": ["security"], "held_check": lambda: ["no table"]}
+        row = lambda f: next(r for r in sb.plan_ledger.evaluate_gates(None, [], None, f, "acme/api#1")["gates"] if r["gate"] == "G6b")
+        self.assertEqual(row(facts)["status"], "missing")
+        floor = {"head": "a" * 40, "captain": False, "floor": {"decision": "hold", "cleared": False, "reasons": []}, "held_check": lambda: []}
+        self.assertEqual(row(floor)["status"], "ok")
+        self.assertEqual(row({"head": "a" * 40, "captain": True})["status"], "missing")
+
+    def test_headings_inside_a_code_fence_or_comment_do_not_count(self):
+        fenced = self.OPEN + "```text\n" + self.TOP + "```\n"
+        found = self.defects(fenced)
+        for part in ("Why this needs you", "What changes for you", "Example", "Questions for you"):
+            self.assertTrue(any(part in d for d in found), (part, found))
+        found = self.defects(self.OPEN + "~~~~\n" + self.TOP)   # an unclosed fence runs to the end
+        self.assertGreaterEqual(len(found), 4, found)
+        found = self.defects(self.OPEN + "<!--\n" + self.TOP + "-->\n")
+        self.assertGreaterEqual(len(found), 4, found)
+
+    def test_every_spelling_of_a_mermaid_fence_in_the_top_fails_and_below_it_does_not(self):
+        graph = "flowchart LR\n  A[\"x\"] --> B[\"y\"]\n"
+        for opener, closer in (("```mermaid", "```"), ("```Mermaid", "```"), ("```  MERMAID", "```"), ("```mermaid title=\"flow\"", "```"),
+                               ("````mermaid", "````"), ("~~~mermaid", "~~~"), ("   ```mermaid", "   ```")):
+            with self.subTest(opener=opener):
+                body = self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + opener + "\n" + graph + closer + "\n\n" + self.QS
+                found = self.defects(body)
+                self.assertEqual((self.named(found, "diagram"), len(found)), (1, 1), found)
+                below = self.OPEN + self.TOP + "## For reviewers\n\n" + opener + "\n" + graph + closer + "\n"
+                self.assertEqual(self.defects(below), [])
+        pre = self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + '<pre class="mermaid">\nflowchart LR\n</pre>\n\n' + self.QS
+        self.assertEqual(self.named(self.defects(pre), "diagram"), 1)
+
+    def test_placeholder_cells_and_a_thin_example_fail(self):
+        for cell in ("...", "---", "", "<before>", "a b"):
+            table = ("## What changes for you\n\n| Before | After |\n|---|---|\n| %s | You get one card. |\n| You open a list. | It opens itself. |\n\n" % cell)
+            found = self.defects(self.OPEN + self.WHY + table + self.EXAMPLE + self.QS)
+            self.assertEqual((self.named(found, "table"), len(found)), (1, 1), (cell, found))
+        found = self.defects(self.OPEN + self.WHY + self.TABLE + "## Example\n\nIt works.\n\n" + self.QS)
+        self.assertEqual((self.named(found, "Example"), len(found)), (1, 1), found)
+
+    def test_a_pathological_64kb_body_is_judged_quickly_and_a_longer_one_is_not_read(self):
+        for unit in ("<", "<pre ", "```", "<pre class=", "`", "<!--"):
+            body = self.OPEN + unit * (64000 // len(unit))
+            started = time.monotonic()
+            found = self.defects(body)
+            self.assertLess(time.monotonic() - started, 2.0, "64 KB of %r" % unit)   # a generous bound: it takes milliseconds
+            self.assertTrue(found)
+        self.assertIn("longer than", self.defects(self.OPEN + self.TOP + "x" * 70001)[0])
+
+    def test_a_pre_mermaid_tag_fails_in_the_top_however_long_its_attributes_or_spelled(self):
+        def top_with(tag):
+            return self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + self.QS + tag + "\n"   # in the top part, after the questions
+        for n in (250, 1000, 60000):
+            tag = '<pre data-x="%s" class=mermaid>' % ("a" * n)
+            found = self.defects(top_with(tag))
+            self.assertEqual((self.named(found, "diagram"), len(found)), (1, 1), (n, found))
+        for tag in ('<pre data-x=">" class=mermaid>', "<pre title='a > b' class='mermaid'>"):
+            self.assertEqual(self.named(self.defects(top_with(tag)), "diagram"), 1, tag)
+        for tag in ("<pre class='a mermaid b'>", '<PRE CLASS="MERMAID">', "<pre  class = mermaid >"):
+            self.assertEqual(self.named(self.defects(top_with(tag)), "diagram"), 1, tag)
+        for tag in ('<pre class="code">', "<pre>", "<preview class=mermaid>"):
+            self.assertEqual(self.defects(top_with(tag)), [], tag)
+        started = time.monotonic()
+        found = self.defects(top_with("<pre " + "x" * 60000))   # never closed: it cannot be judged, so it fails
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertEqual(self.named(found, "diagram"), 1)
+
+    def within(self, seconds, fn, *args):
+        """Run fn(*args) with a hard alarm: a hang fails the test instead of hanging the suite."""
+        def boom(signum, frame):
+            raise AssertionError("did not finish in %d s (a hang)" % seconds)
+        old = signal.signal(signal.SIGALRM, boom)
+        signal.alarm(seconds)
+        try:
+            return fn(*args)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
+
+    def test_unicode_case_folding_cannot_hang_or_hide_a_mermaid_pre(self):
+        dotted = "\u0130"
+        for n in (1, 2, 50, 2000):
+            body = self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + self.QS + (dotted * n + "<PRE class=mermaid>") + "\n"
+            found = self.within(5, self.defects, body)
+            self.assertEqual(self.named(found, "diagram"), 1, (n, found))   # still found: folding is ASCII-only, the length never changes
+        self.assertTrue(self.within(5, self.defects, self.OPEN + dotted * 5000))   # a body of only U+0130 is judged (and fails)
+        # ASCII-only folding: the Kelvin sign and the long s are NOT k or s, and a dotless i is not i, so these are not Mermaid
+        for tag in ('<pre class="mermaid\u0131">', '<pre class="\u017fermaid">', '<pre class="code" data-k="\u212a">'):
+            self.assertEqual(self.within(5, self.defects, self.OPEN + self.TOP + tag + "\n"), [], tag)
+        # the real spellings still are
+        self.assertEqual(self.named(self.within(5, self.defects, self.OPEN + self.TOP + "<PrE ClAsS='MeRmAiD'>\n"), "diagram"), 1)
+        self.assertEqual(self.named(self.within(5, self.defects, self.OPEN + self.TOP + "```MERMAID\nx\n```\n"), "diagram"), 1)
+
+    def test_a_fuzz_of_random_unicode_bodies_never_hangs_or_crashes(self):
+        import random
+        rng = random.Random(604)
+        alphabet = ["\u0130", "\u212a", "\u017f", "\u0131", "<", ">", "pre", "PRE", "class=", "mermaid", "'", '"', "`", "```", "~~~", "|", "\n", " ", "#", "## ", "<!--", "-->", "I", "i", "K", "s", "\u00e9", "\U0001f600", "1.", "Recommendation:"]
+        def run():
+            for _ in range(20000):
+                body = self.OPEN + "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 60)))
+                self.assertIsInstance(sb.held_defects(body), list)
+        self.within(60, run)
+
+    def test_none_line_variants_and_hostile_runs_are_judged_quickly(self):
+        for line, ok in (("Questions: none", True), ("Questions: none.", True), ("Questions: none (clear to merge on your word).", True),
+                         ("Questions: none (a) (b)", True), ("Questions: none (open", False), ("Questions: nonexistent", False), ("Questions: none x", False)):
+            body = self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + "## Questions for you\n\n" + line + "\n"
+            self.assertEqual(self.defects(body) == [], ok, line)
+        for hostile in ("Questions: none" + " " * 60000 + "x", "Questions: none (" * 4000, "Questions: none" + "\t" * 60000 + "x", "<!--" * 17000, "<!---->" * 9000):
+            started = time.monotonic()
+            self.assertTrue(self.within(5, self.defects, self.OPEN + hostile))
+            self.assertLess(time.monotonic() - started, 2.0, hostile[:20])   # a wide margin: it takes milliseconds; the alarm above catches a hang
+
+    def test_an_exhausted_step_budget_makes_the_body_unreadable(self):
+        with mock.patch.object(sb, "_held_steps", return_value=[0]):
+            found = sb.held_defects(self.OPEN + self.TOP + "<!-- a -->\n")
+        self.assertEqual((len(found), "unreadable" in found[0]), (1, True))
+
+    def test_html_whitespace_around_the_class_attribute_is_all_five_characters(self):
+        def top_with(tag):
+            return self.OPEN + self.TOP + tag + "\n"
+        for tag in ("<pre class\f=mermaid>", "<pre class\r=mermaid>", "<pre class=\fmermaid>", '<pre class = "mermaid">', "<pre class\t\n=mermaid>",
+                    '<pre class="x\fmermaid\ry">', "<pre\fclass=mermaid>", "<pre\rclass='mermaid'>"):
+            found = self.within(5, self.defects, top_with(tag))
+            self.assertEqual(self.named(found, "diagram"), 1, repr(tag))
+        # NOT HTML whitespace: a vertical tab and a no-break space make another attribute name or token, so these are not Mermaid
+        for tag in ("<pre class\x0b=mermaid>", "<pre class\u00a0=mermaid>", '<pre class="x\u00a0mermaid">', '<pre class="\x0bmermaid">'):
+            self.assertEqual(self.within(5, self.defects, top_with(tag)), [], repr(tag))
+
+    def test_underscore_only_cells_fail(self):
+        table = ("## What changes for you\n\n| Before | After |\n|---|---|\n| ___ | You get one card. |\n| You open a list. | It opens itself. |\n\n")
+        found = self.defects(self.OPEN + self.WHY + table + self.EXAMPLE + self.QS)
+        self.assertEqual((self.named(found, "table"), len(found)), (1, 1), found)
+
+    def test_a_body_the_check_cannot_read_fails(self):
+        with mock.patch.object(sb, "_held_defects", side_effect=RuntimeError("boom")):
+            found = sb.held_defects(self.OPEN + self.TOP)
+        self.assertEqual((len(found), "unreadable" in found[0]), (1, True))
+
+    def test_a_hash_line_inside_a_fence_does_not_end_the_top(self):
+        example = "## Example\n\nA command:\n\n```text\n# a comment line\n```\n\nIt prints one card.\n\n"
+        self.assertEqual(self.defects(self.OPEN + self.WHY + self.TABLE + example + self.QS), [])
+
+    def test_the_three_files_name_the_parts_in_order_and_put_mermaid_below(self):                           # S9
+        for rel in ("skills/fleet-explainer/SKILL.md", ".github/pull_request_template.md", "skills/fleet-coordination/SKILL.md"):
+            text = (REPO / rel).read_text()
+            why = text.index("Why this needs you")
+            at = [why] + [text.index(n, why) for n in ("What changes for you", "Example", "Questions for you")]
+            self.assertEqual(at, sorted(at), rel)
+            self.assertIn("optional", text[why:].lower(), rel)
+            self.assertRegex(text[why:], r"Mermaid[^\n]*below|below[^\n]*Mermaid", rel)
+
+    def test_the_block_sits_after_the_opening_lines_for_both_readers(self):                                 # S10
+        body = self.OPEN + self.GOOD
+        self.assertEqual(sb.pr_marker(body), "captain")
+        self.assertEqual(sb.plan_ledger.PLAN_LINK_RE.search(body).group(1), "https://example.test/acme/api/issues/9")
+
+    def test_a_top_v2_with_the_explainer_block_and_mermaid_below_passes_both_checks(self):
+        block = sb.explainer_block("old", "new")
+        body = sb.explainer_insert(self.OPEN + self.TOP + "## For reviewers (technical)\n\ntext\n", block) + "\n## How it flows\n\n```mermaid\nflowchart LR\n  A[\"Request\"] --> B[\"Gate\"]\n```\n"
+        self.assertEqual(self.defects(body), [])
+        self.assertEqual(sb.explainer_defects(body), [])
+        self.assertLess(body.index("## Questions for you"), body.index(sb.EXPLAINER_BEGIN))
+
+
+class TestHeldRowsFromLabels(DecisionsBase):
+    """#641: an open pull request that carries the fleet's hold labels is a decision row on those labels alone, one row per pull request, read from the open-pull-request list the daemon already holds."""
+
+    REPO = "acme/api"
+
+    def setUp(self):
+        super().setUp()
+        self.gh = FakeGhPr({7: (0, captain_pr(reviews=[("reviewer", "APPROVED", HEAD_A)]), ""), 30: (0, captain_pr(reviews=[("reviewer", "APPROVED", HEAD_A)]), "")})
+        self.engine = self.world.engine
+        self.engine.config["plan_gates"] = {"repos": {"acme/api": {"mode": "shadow"}}}   # the daemon reads this repository's open pull requests
+        self.engine.ci_record_state = sb.CiRecordState()
+        self.reads = []
+        self.engine.gh_runner = lambda argv, **kw: (self.reads.append(argv), self.gh(argv, **kw))[1]
+
+    def pr(self, number, *labels, head=HEAD_A, state="open", merged=False, title="Add the widget", repo=None):
+        record = {"number": number, "title": title, "state": state, "head": {"sha": head}, "created_at": sb.iso(self.world.clock.now() - 3600),
+                  "labels": [{"name": "tester:%s" % l} for l in labels], "draft": False}
+        if merged:
+            record["merged_at"] = sb.iso(self.world.clock.now() - 60)
+        return record
+
+    def lists(self, *records, repo=None, cut=False):
+        self.engine.ci_record_state.lists[(repo or self.REPO).lower()] = (self.world.clock.now(), list(records))
+
+    def rows(self):
+        return [d for d in self.listed() if d.get("number") in range(7, 400) and d.get("kind") in ("captain", "notice")]
+
+    def test_s1_a_held_pr_with_no_notice_is_one_row_with_its_head_its_holds_and_no_notice_recorded(self):
+        self.lists(self.pr(9, "merge-captain", "hold-security", "hold-contract"))
+        (row,) = [d for d in self.rows() if d["number"] == 9]
+        self.assertEqual((row["id"], row["kind"], row["tier"], row["head"], row["holds"], row["agent"]), ("pr:api#9", "captain", "cos", HEAD_A, ["contract", "security"], None))
+        self.assertEqual(row["note"].count("no notice recorded"), 1)
+        self.assertEqual(row["url"], "https://github.com/acme/api/pull/9")
+
+    def test_s2_a_pr_with_a_notice_and_labels_is_still_one_row_and_keeps_its_notice(self):
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "platform", "ready", self.world.clock.now())
+        self.lists(self.pr(7, "merge-captain", "hold-security"))
+        self.gh.answers[7] = (0, captain_pr(labels=[{"name": "tester:merge-captain"}, {"name": "tester:hold-security"}], reviews=[("reviewer", "APPROVED", HEAD_A)]), "")
+        rows = [d for d in self.rows() if d["number"] == 7]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["agent"], "platform", "the notice's sender")
+
+    def test_s3_a_merged_a_closed_and_an_unlabelled_pr_are_no_row(self):
+        self.lists(self.pr(10, "merge-captain", "hold-security", merged=True), self.pr(11, "hold-security", state="closed"), self.pr(12))
+        self.assertEqual([d for d in self.rows() if d["number"] in (10, 11, 12)], [])
+
+    def test_s4_a_failed_or_cut_read_keeps_the_rows_already_shown(self):
+        self.lists(self.pr(20, "merge-captain"), self.pr(21, "hold-contract"))
+        self.assertEqual(sorted(d["number"] for d in self.rows() if d["number"] in (20, 21)), [20, 21])
+        # the list is read again and is CUT (200 records, the held ones beyond it): the rows stay
+        self.lists(*[self.pr(100 + n) for n in range(sb.LABEL_HOLD_LIST_CUT)])
+        self.assertEqual(sorted(d["number"] for d in self.rows() if d["number"] in (20, 21)), [20, 21])
+        # a complete list without them (they were merged or unlabelled) drops them
+        self.lists(self.pr(100))
+        self.assertEqual([d for d in self.rows() if d["number"] in (20, 21)], [])
+
+    def test_s5_a_labels_only_row_is_cos_then_human_when_escalated_and_its_id_is_the_notices_id(self):
+        self.lists(self.pr(30, "merge-captain", "hold-security"))
+        (row,) = [d for d in self.rows() if d["number"] == 30]
+        self.assertEqual((row["tier"], row["id"]), ("cos", "pr:api#30"))
+        sb.record_pr_notice(self.world.state, self.REPO, 30, "platform", "", self.world.clock.now())
+        self.gh.answers[30] = (0, captain_pr(labels=[{"name": "tester:merge-captain"}], reviews=[("reviewer", "APPROVED", HEAD_A)]), "")
+        self.world.tick(sb.PR_FACTS_TTL + 1)
+        (again,) = [d for d in self.rows() if d["number"] == 30]
+        self.assertEqual(again["id"], "pr:api#30", "the same id with a notice: one row, not two")
+
+    def test_s6_an_excluded_and_an_unwatched_repository_add_no_row_and_no_read_is_made(self):
+        self.engine.config["plan_gates"]["repos"]["acme/secret"] = {"mode": "shadow"}   # WATCHED: only the exclusion can drop it
+        self.engine.config["excluded_repos"] = ["acme/secret"]
+        self.lists(self.pr(40, "merge-captain"), repo="acme/secret")
+        self.lists(self.pr(41, "merge-captain"), repo="elsewhere/unwatched")
+        self.lists(self.pr(42, "merge-captain"), repo="acme/api")
+        before = len(self.reads)
+        self.assertEqual(sorted(d["number"] for d in self.rows() if d["number"] in (40, 41, 42)), [42], "only the watched, not excluded repository lists a row")
+        self.assertEqual(len(self.reads), before, "no gh read is made for any of them")
+
+    def test_u2_the_rows_cost_no_read_of_their_own(self):
+        self.lists(*[self.pr(200 + n, "merge-captain") for n in range(20)])
+        before = len(self.reads)
+        rows = [d for d in self.rows() if 200 <= d["number"] < 220]
+        self.assertEqual(len(rows), 20)
+        self.assertEqual(len(self.reads), before, "20 held pull requests, 0 reads of their own")
+
+    def test_an_escalated_labels_only_row_is_the_persons_for_that_head_and_a_new_head_is_not(self):
+        self.lists(self.pr(60, "merge-captain", head=HEAD_A))
+        (row,) = [d for d in self.rows() if d["number"] == 60]
+        self.assertEqual(row["tier"], "cos")
+        sb.escalate_decision(self.engine, None, row, "needs you", "cos")
+        (row,) = [d for d in self.rows() if d["number"] == 60]
+        self.assertEqual(row["tier"], "human")
+        self.lists(self.pr(60, "merge-captain", head=HEAD_B))
+        (row,) = [d for d in self.rows() if d["number"] == 60]
+        self.assertEqual((row["tier"], row["head"]), ("cos", HEAD_B), "an escalation of an older head does not make a new head the person's")
+
+    def test_a_repository_whose_list_is_gone_keeps_its_rows_and_a_failure_in_the_build_is_audited_and_lists_nothing(self):
+        self.lists(self.pr(70, "hold-security"))
+        self.assertEqual([d["number"] for d in self.rows() if d["number"] == 70], [70])
+        self.engine.ci_record_state.lists.clear()
+        self.engine.ci_record_state.lists["acme/other"] = (self.world.clock.now(), [])
+        self.assertEqual([d["number"] for d in self.rows() if d["number"] == 70], [70], "its list is gone for now: the row stays")
+        self.engine.config["excluded_repos"] = ["acme/api"]
+        self.assertEqual([d for d in self.rows() if d["number"] == 70], [], "excluded now: nothing is kept")
+        self.engine.config["excluded_repos"] = []
+        self.engine.ci_record_state.lists["acme/api"] = (self.world.clock.now(), [self.pr(71, "merge-captain")])
+        with mock.patch.object(sb, "plan_ledger", types.SimpleNamespace(normal_repo=lambda r: (_ for _ in ()).throw(RuntimeError("broken")))):
+            self.assertEqual(sb.label_hold_entries(self.engine, self.world.clock.now(), set(), {}, set()), [])
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "decisions.hold_rows_error"])
+
+    def test_a_title_with_an_escape_sequence_reaches_the_list_without_it(self):
+        self.lists(self.pr(80, "merge-captain", title="Add it \x1b]0;evil\x07 now"))
+        (row,) = [d for d in self.rows() if d["number"] == 80]
+        self.assertNotRegex(row["title"] + row["headline"], r"[\x00-\x08\x0b-\x1f\x7f]")
+
+    def test_a_notice_with_a_mixed_case_repository_and_the_same_pr_from_the_list_are_one_row(self):
+        for noticed_as, listed_as in (("Acme/Api", "acme/api"), ("ACME/API", "acme/api"), ("acme/api", "acme/api")):
+            self.setUp()
+            sb.record_pr_notice(self.world.state, noticed_as, 7, "platform", "ready", self.world.clock.now())
+            self.lists(self.pr(7, "merge-captain", "hold-security"), repo=listed_as)
+            self.gh.answers[7] = (0, captain_pr(labels=[{"name": "tester:merge-captain"}], reviews=[("reviewer", "APPROVED", HEAD_A)]), "")
+            rows = [d for d in self.rows() if d["number"] == 7]
+            self.assertEqual(len(rows), 1, (noticed_as, [d["id"] for d in rows]))
+            self.assertEqual(rows[0]["agent"], "platform")
+
+    def test_the_exclusion_holds_for_a_case_variant_of_an_excluded_repository(self):
+        self.engine.config["plan_gates"]["repos"]["Acme/Secret"] = {"mode": "shadow"}
+        self.engine.config["excluded_repos"] = ["acme/secret"]
+        self.lists(self.pr(90, "merge-captain"), repo="ACME/SECRET")
+        self.assertEqual([d for d in self.rows() if d["number"] == 90], [])
+
+    def test_a_row_kept_because_its_list_is_cut_expires_after_a_day(self):
+        self.lists(self.pr(95, "merge-captain"))
+        self.assertEqual([d["number"] for d in self.rows() if d["number"] == 95], [95])
+        self.lists(*[self.pr(100 + n) for n in range(sb.LABEL_HOLD_LIST_CUT)])
+        self.assertEqual([d["number"] for d in self.rows() if d["number"] == 95], [95], "kept while the list is cut")
+        self.world.tick(sb.LABEL_HOLD_KEEP_SECONDS + 60)
+        self.lists(*[self.pr(100 + n) for n in range(sb.LABEL_HOLD_LIST_CUT)])
+        self.assertEqual([d for d in self.rows() if d["number"] == 95], [], "a pull request that merged meanwhile does not stay for ever")
+
+    def test_a_pr_with_only_a_merge_automatic_label_is_not_held(self):
+        self.lists(self.pr(50, "merge-automatic"))
+        self.assertEqual([d for d in self.rows() if d["number"] == 50], [])
+
+    def test_no_list_no_rows_and_a_command_engine_adds_none(self):
+        self.engine.__dict__.pop("ci_record_state", None)
+        self.assertEqual([d for d in self.rows() if d["number"] >= 8], [])
+
+
 class TestPrExplainer(DecisionsBase):
-    """#179 slice L6: the explainer block (a before and after why part on every PR; for a captain PR the infographic first), printed by a read-only
-    command and put in a description ONCE. The Mermaid check is against the SUBSET this command writes, not Mermaid's own parser."""
+    """#179 slice L6: the explainer block (a before and after why part on every PR, never a diagram: #687), printed by a read-only
+    command and put in a description ONCE. `--check` fails a body that holds the generated summary flowchart."""
     FILES = [{"path": "bin/fleet-switchboard"}, {"path": "bin/test-switchboard"}, {"path": "docs/switchboard.md"}, {"path": "README.md"}]
 
     def setUp(self):
@@ -40732,84 +41489,37 @@ class TestPrExplainer(DecisionsBase):
         self.assertIn("after:  a list shows one agent", out)
         self.assertEqual(len(self.calls), 1, "one GET of the PR, nothing else")
 
-    def test_a_captain_pr_gets_the_infographic_first_and_it_parses(self):
-        self.captain()
-        code, out, err = self.cli("pr-explain", "acme/api#7", "--before", "b", "--after", "a", "--irreversible", "a migration cannot be undone",
-                                  "--severity", "Marginal", "--probability", "Occasional")
-        self.assertEqual(code, 0, err)
-        self.assertLess(out.index("```mermaid"), out.index("```text"), "the diagram comes first in the block")
-        diagram = re.search(r"```mermaid\n(.*?)```", out, re.S).group(1)
-        self.assertEqual(sb.mermaid_defects(diagram), [])
-        for label in ("Changes: Add the parser", "Touches: bin 2, docs 1, root files 1 (4 files)", "Irreversible: a migration cannot be undone", "Risk: Marginal x Occasional: Medium"):
-            self.assertIn(label, diagram)
+    SUMMARY = ('```mermaid\nflowchart LR\n  A["Changes: Add the parser"] --> B["Touches: bin 2, docs 1 (4 files)"]\n  B --> C["Irreversible: nothing"]\n'
+               '  C --> D["Risk: not rated yet"]\n```\n')
+    DATAFLOW = '```mermaid\nflowchart LR\n  A["Request"] --> B["Gate"]\n  B --> C["Ledger"]\n```\n'
 
-    def test_the_risk_cell_comes_from_the_single_source_matrix_and_a_wrong_name_is_refused(self):
-        self.assertEqual(sb.explainer_risk_cell(eliminated=True), "Eliminated (not rated)")
-        self.assertEqual(sb.explainer_risk_cell(), "not rated yet")
-        matrix = json.loads((REPO / "docs" / "review-laws" / "impact-matrix.json").read_text())
-        for severity in matrix["severities"]:
-            for probability in matrix["probabilities"]:
-                cell = matrix["cells"][severity][probability]
-                self.assertIn(": %s (" % cell["level"], sb.explainer_risk_cell(severity, probability))
+    def test_a_captain_pr_gets_the_same_block_and_never_a_diagram(self):
         self.captain()
-        code, out, err = self.cli("pr-explain", "acme/api#7", "--severity", "Huge", "--probability", "Occasional")
-        self.assertEqual(code, 2)
-        self.assertIn("severity is one of", err)
-
-    def test_the_title_cannot_break_or_extend_the_diagram(self):
-        self.captain()
-        self.pr["title"] = 'x"] --> Z["evil"] %% <script> [bad](http://x) ' + "y" * 300
         code, out, err = self.cli("pr-explain", "acme/api#7", "--before", "b", "--after", "a")
-        diagram = re.search(r"```mermaid\n(.*?)```", out, re.S).group(1)
-        self.assertEqual(sb.mermaid_defects(diagram), [])
-        self.assertEqual(len(diagram.splitlines()), 4, "four lines: the header and the three edges, no node added by the title")
-        for bad in ('"] --> Z', "<script>", "](http", "%%"):
-            self.assertNotIn(bad, diagram)
-        self.assertTrue(all(len(line) < 160 for line in diagram.splitlines()))
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("mermaid", out.lower())
+        self.assertNotIn("flowchart", out)
+        self.assertIn("before: b", out)
+        self.assertIn("after:  a", out)
 
-    def test_a_broken_or_foreign_diagram_is_refused(self):
-        good = 'flowchart LR\n  A["a"] --> B["b"]'
-        self.assertEqual(sb.mermaid_defects(good), [])
-        for text, want in (("", "does not open"), ("graph LR\n  A[a] --> B[b]", "does not open"), ('flowchart LR\n  A["a"]', "at least two nodes"),
-                           ('flowchart LR\n  A["a"] --> B', "never defined"), ('flowchart LR\n  A["a"] --> B["b"]\n  click A "http://x"', "not part of the supported"),
-                           ('flowchart LR\n  A["a"] --> B["b"]\n  style A fill:#f00', "not part of the supported")):
-            with self.subTest(text=text[:30]):
-                self.assertTrue(any(want in d for d in sb.mermaid_defects(text)), sb.mermaid_defects(text))
+    def test_the_diagram_arguments_are_gone(self):
+        for flag in ("--irreversible", "--severity", "--probability", "--eliminated", "--captain"):
+            with self.subTest(flag=flag):
+                self.assertEqual(self.cli("pr-explain", "acme/api#7", flag, "x")[0], 2)
 
     def test_text_that_would_end_or_split_the_block_cannot_break_check(self):
         nasty = "ends <!-- pr-explainer:end --> early --> and ``` fences <!-- pr-explainer:begin --> here"
         block = sb.explainer_block(nasty, nasty)
         body = sb.explainer_insert("PLAN: https://example.test/1\n\ntext", block)
         self.assertEqual((body.count(sb.EXPLAINER_BEGIN), body.count(sb.EXPLAINER_END)), (1, 1))
-        self.assertEqual(sb.explainer_defects(body, False), [])
+        self.assertEqual(sb.explainer_defects(body), [])
         self.pr["body"] = body
         self.assertEqual(self.cli("pr-explain", "acme/api#7", "--check")[0], 0)
         code, out, err = self.cli("pr-explain", "acme/api#7", "--before", nasty, "--after", nasty)
         self.assertEqual((out.count(sb.EXPLAINER_BEGIN), out.count(sb.EXPLAINER_END)), (1, 1))
 
-    def test_a_cut_file_list_is_said_in_the_diagram_not_hidden(self):
-        self.assertEqual(sb.explainer_count(4, 4), "4 files")
-        self.assertEqual(sb.explainer_count(1, 1), "1 file")
-        self.assertEqual(sb.explainer_count(100, 140), "100 of 140 files listed")
-        self.assertEqual(sb.explainer_count(4, None), "4 files")
-        self.captain()
-        self.pr["files"] = [{"path": "bin/f%d" % i} for i in range(100)]
-        self.pr["changedFiles"] = 140
-        with mock.patch.object(sb, "read_pr_json", return_value=dict(self.pr, state="OPEN")):
-            code, out, err = self.cli("pr-explain", "acme/api#7", "--before", "b", "--after", "a")
-        self.assertIn("100 of 140 files listed", out)
-        self.assertEqual(sb.mermaid_defects(re.search(r"```mermaid\n(.*?)```", out, re.S).group(1)), [])
-
-    def test_a_diagram_outside_the_subset_is_refused_and_the_printed_block_has_no_image(self):
-        foreign = ('flowchart LR\n  A["a"] --> B["b"]\n  click A "http://example.test"', 'flowchart LR\n  A["a"] --> B["b"]\n  style A fill:#f00', 'graph LR\n  A["a"] --> B["b"]')
-        self.assertTrue(all(sb.mermaid_defects(text) for text in foreign))
-        self.captain()
-        code, out, err = self.cli("pr-explain", "acme/api#7", "--before", "b", "--after", "a")
-        for image in ("![", ".png", ".svg", "<img"):
-            self.assertNotIn(image, out)
-
     def test_a_body_gets_at_most_one_block_however_often_it_is_inserted(self):
-        block = sb.explainer_block("old", "new", "flowchart LR\n  A[\"a\"] --> B[\"b\"]")
+        block = sb.explainer_block("old", "new")
         body = self.pr["body"]
         once = sb.explainer_insert(body, block)
         twice = sb.explainer_insert(once, sb.explainer_block("old2", "new2"))
@@ -40850,7 +41560,7 @@ class TestPrExplainer(DecisionsBase):
         block = sb.explainer_block("old", "new")
         self.pr["body"] = sb.explainer_insert(self.pr["body"], block)
         code, out, err = self.cli("pr-explain", "acme/api#7", "--check")
-        self.assertEqual((code, out.strip()), (0, "explainer: PASS (ordinary PR)"))
+        self.assertEqual((code, out.strip()), (0, "explainer: PASS"))
         for body, want in ((self.PR_NONE, "0 explainer blocks"), (self.PR_TWO, "2 explainer blocks"),
                            (sb.explainer_insert("x", sb.explainer_block("old", "<what happens after>")), "placeholder"),
                            ("x\n" + sb.EXPLAINER_BEGIN + "\n```text\nbefore: only a before\n```\n" + sb.EXPLAINER_END, "`after:` line")):
@@ -40859,16 +41569,66 @@ class TestPrExplainer(DecisionsBase):
                 code, out, err = self.cli("pr-explain", "acme/api#7", "--check")
                 self.assertEqual(code, 1)
                 self.assertIn(want, out)
-        self.captain()
-        self.pr["body"] = sb.explainer_insert("x", block)   # a captain PR without the infographic
+        self.captain()   # a captain PR needs no diagram either: the same body passes
+        self.pr["body"] = sb.explainer_insert("x", block)
         code, out, err = self.cli("pr-explain", "acme/api#7", "--check")
-        self.assertEqual(code, 1)
-        self.assertIn("infographic", out)
-        self.pr["body"] = sb.explainer_insert("x", sb.explainer_block("old", "new", sb.explainer_mermaid("t", ["a/b"], "none", "not rated yet")))
+        self.assertEqual(code, 1, out)   # a held (captain) PR also needs why, its table, an example and its questions (TestHeldTop)
+        self.pr["body"] = sb.explainer_insert("x\n" + TestHeldTop.TOP + "## For reviewers\n", block)
         self.assertEqual(self.cli("pr-explain", "acme/api#7", "--check")[0], 0)
+        self.pr["body"] = sb.explainer_insert("x\n" + TestHeldTop.TOP + "## For reviewers\n", block) + "\n" + self.DATAFLOW
+        self.assertEqual(self.cli("pr-explain", "acme/api#7", "--check")[0], 0, "a data-flow diagram below the top is allowed")
+
+    def test_check_accepts_a_body_without_a_diagram_and_one_with_a_data_flow_diagram_and_fails_the_summary_flowchart_anywhere(self):
+        block = sb.explainer_block("old", "new")
+        plain = sb.explainer_insert(self.pr["body"], block)
+        cases = ((plain, 0, ""), (plain + "\n## How it flows\n\n" + self.DATAFLOW, 0, ""),
+                 (self.SUMMARY + plain, 1, "generated summary flowchart"),   # at the top
+                 (plain + "\n" + self.SUMMARY, 1, "generated summary flowchart"),   # below the top
+                 (sb.explainer_insert(self.pr["body"], block.replace(sb.EXPLAINER_END, self.SUMMARY + sb.EXPLAINER_END)), 1, "generated summary flowchart"))   # inside the markers
+        for body, want_code, want in cases:
+            with self.subTest(want=want, head=body[:30]):
+                self.pr["body"] = body
+                code, out, err = self.cli("pr-explain", "acme/api#7", "--check")
+                self.assertEqual(code, want_code, out)
+                self.assertIn(want, out)
+                if want_code:
+                    self.assertIn("Changes:", out)
+
+    def test_the_summary_flowchart_detector_reads_a_mermaid_fence_with_the_four_labels_only(self):
+        self.assertTrue(sb.summary_flowchart_found(self.SUMMARY))
+        self.assertTrue(sb.summary_flowchart_found(self.SUMMARY.replace("```\n", "")))   # an unclosed fence still counts
+        self.assertTrue(sb.summary_flowchart_found(self.SUMMARY.replace("Changes", "CHANGES")))
+        self.assertFalse(sb.summary_flowchart_found(self.DATAFLOW))
+        self.assertFalse(sb.summary_flowchart_found("Changes: a, Touches: b, Irreversible: c, Risk: d in prose"))
+        self.assertFalse(sb.summary_flowchart_found(self.SUMMARY.replace("```mermaid", "```text")))
+        self.assertFalse(sb.summary_flowchart_found(self.SUMMARY.replace("Risk", "Danger")))
+        self.assertFalse(sb.summary_flowchart_found(""))
+        self.assertFalse(sb.summary_flowchart_found(None))
+
+    def test_the_summary_flowchart_detector_is_bounded_by_its_cuts_not_by_a_clock(self):
+        """Bounded and linear by construction: one pass over the lines, the body cut at 1 MB and each line at 400 characters. Shown by what is NOT seen past a cut."""
+        fence = self.SUMMARY
+        self.assertTrue(sb.summary_flowchart_found(fence * 400), "a 64 KB body made of the summary flowchart repeated is found")
+        self.assertFalse(sb.summary_flowchart_found("x" * sb._SUMMARY_BODY_MAX + "\n" + fence), "past the 1 MB cut nothing is read")
+        padded = fence.replace('B["Touches', 'B["' + " " * sb._SUMMARY_LINE_MAX + 'Touches')
+        self.assertFalse(sb.summary_flowchart_found(padded), "past the 400 character cut of a line nothing is read")
+        two = '```mermaid\nflowchart LR\n  A["Changes: a"] --> B["Touches: b"]\n```\n```mermaid\nflowchart LR\n  C["Irreversible: c"] --> D["Risk: d"]\n```\n'
+        self.assertFalse(sb.summary_flowchart_found(two), "the four labels are read inside ONE fence")
+        hostile = ('```mermaid\n["Changes: ["Touches: ["Irreversible: ' + "\u0130\u212a" * 20 + "\n") * 400 + "[" * 20000
+        self.assertFalse(sb.summary_flowchart_found(hostile[:65536]))
 
     PR_NONE = "text only"
     PR_TWO = sb.EXPLAINER_BEGIN + "\n```text\nbefore: a\nafter:  b\n```\n" + sb.EXPLAINER_END + "\n" + sb.EXPLAINER_BEGIN + "\n```text\nbefore: a\nafter:  b\n```\n" + sb.EXPLAINER_END
+
+    def test_the_skill_the_template_and_the_coordination_skill_each_say_a_diagram_is_for_data_flow_or_design_and_never_the_top(self):
+        rule = "only where it shows data flow, system design or component design, never at the top of a body"
+        for path in ("skills/fleet-explainer/SKILL.md", ".github/pull_request_template.md", "skills/fleet-coordination/SKILL.md"):
+            with self.subTest(path=path):
+                text = " ".join((REPO / path).read_text().split())
+                self.assertEqual(text.count(rule), 1)
+                self.assertNotRegex(text.lower(), r"infographic|captain prs only|flowchart of four")
+        skill = (REPO / "skills" / "fleet-explainer" / "SKILL.md").read_text()
+        self.assertNotIn("first in the block", skill)
 
     def test_a_pr_that_cannot_be_read_is_an_error_and_a_bad_reference_is_usage(self):
         self.assertEqual(self.cli("pr-explain", "not-a-pr")[0], 2)
@@ -42918,22 +43678,36 @@ class TestDecisionBaselineSeams(BaselineWorld):
         decisions, errors = baseline_derive(self.world.engine, self.world.clock.now)
         self.assertFalse([d for d in decisions if "order" in d or "waits_for" in d], "no line anywhere: the list carries nothing new")
 
-    def test_a_closed_issue_with_the_persons_label_stays_listed_marked_closed_until_the_label_goes(self):
+    def test_a_closed_issue_is_never_added_and_one_kept_leaves_only_when_forgotten_by_a_fresh_read(self):   # #570: it used to stay listed, marked closed
         baseline_attach_hub(self.world.engine, self.route, self.world.clock.now)
         hub = self.world.engine.hub
         mine, cos = "me:awaiting-user", "me:awaiting-cos"
         issue = lambda n, state, names: {"number": n, "title": "issue %d" % n, "state": state,
                                          "labels": [{"name": x} for x in names], "updated_at": "2027-01-15T07:00:00Z"}
-        hub.note_awaiting_issue(API, issue(20, "closed", [mine]))              # closed, the person's label: listed, closed
-        hub.note_awaiting_issue(API, issue(21, "closed", [cos]))               # closed, the Chief of Staff's: forgotten
+        hub.note_awaiting_issue(API, issue(20, "closed", [mine]))              # closed, the person's label: never added
+        hub.note_awaiting_issue(API, issue(21, "closed", [cos]))               # closed, the Chief of Staff's: never added
         hub.note_awaiting_issue(API, issue(22, "open", [mine]))                # open: as ever
-        hub.note_awaiting_issue(API, issue(23, "closed", [mine, cos]))         # both: the person's
+        hub.note_awaiting_issue(API, issue(23, "closed", [mine, cos]))         # both: never added
         got = {r["number"]: (r["tier"], r["closed"]) for r in hub.awaiting_listing()[0]}
-        self.assertEqual(got, {20: ("human", True), 22: ("human", False), 23: ("human", True)})
-        hub.note_awaiting_issue(API, issue(20, "closed", []))                  # the label comes off: it leaves
-        self.assertNotIn(20, {r["number"] for r in hub.awaiting_listing()[0]})
+        self.assertEqual(got, {22: ("human", False)})
+        hub.note_awaiting_issue(API, issue(22, "closed", [mine]))              # a closed PAYLOAD for a kept issue drops nothing
+        self.assertEqual([r["number"] for r in hub.awaiting_listing()[0]], [22])
+        hub.forget_awaiting(API, 22)                                           # a fresh read said closed
+        self.assertEqual(hub.awaiting_listing()[0], [])
 
-    def test_the_closed_issue_shows_in_the_human_tier_with_its_report_folded_in(self):
+    def test_a_mixed_case_repo_is_one_key_for_events_reads_and_the_fresh_read_forget(self):   # #570: the closed ref is folded; the hub must fold the same way
+        baseline_attach_hub(self.world.engine, self.route, self.world.clock.now)
+        hub = self.world.engine.hub
+        issue = {"number": 30, "title": "x", "state": "open", "labels": [{"name": "me:awaiting-user"}], "updated_at": "2027-01-15T07:00:00Z"}
+        hub.note_awaiting_issue("Acme-Org/Widget-Service", issue)
+        hub.note_awaiting_issue("acme-org/widget-service", issue)              # the lower-cased variant of the same repo: the same issue
+        hub.note_awaiting_issue("ACME-ORG/WIDGET-SERVICE", issue)
+        self.assertEqual(len(hub.awaiting_listing()[0]), 1, "three spellings, one issue")
+        self.assertEqual(hub.awaiting_key("Acme-Org/Widget-Service", 30), hub.awaiting_key("ACME-ORG/widget-service", 30))
+        hub.forget_awaiting("acme-org/widget-service", 30)                     # the closed ref carries the folded name
+        self.assertEqual(hub.awaiting_listing()[0], [], "it leaves the list whatever case configured or sent")
+
+    def test_a_closed_issue_never_shows_and_the_report_that_named_it_goes_with_it(self):   # #570: it used to show in the human tier marked closed
         entries = sb.decision_core.build_entries(
             [{"kind": "issue", "title": "Won't-do: drop the legacy path", "ask": 7, "agent": None, "since": 100.0, "seed": "issue:acme/api#7",
               "bare": True, "repo": "acme/api", "tier": "human", "closed": True},
@@ -42943,16 +43717,11 @@ class TestDecisionBaselineSeams(BaselineWorld):
               "seed": "report:1", "bare": False, "repo": "acme/api", "tier": "cos", "repo_known": True}],
             ["d1", "d2", "d3"], "acme/api", lambda repo, number: None)
         by = {e["ask"]: e for e in entries}
-        self.assertEqual(sorted(by), [7, 8], "the report folded into the issue's row: one row, not two")
-        self.assertEqual((by[7]["tier"], by[7]["closed"], by[7]["reported_by"]), ("human", True, ["orch"]))
-        self.assertTrue(by[7]["headline"].endswith("(closed)"))
+        self.assertEqual(sorted(by), [8], "the closed issue is not listed, and neither is the report folded into it")
         self.assertNotIn("closed", by[8])
         self.assertFalse(by[8]["headline"].endswith("(closed)"))
-        long_title = "x " * 120
-        got = sb.decision_core.build_entries([{"kind": "issue", "title": long_title, "ask": 9, "agent": None, "since": 1.0,
-                                               "seed": "i", "bare": True, "repo": "acme/api", "tier": "human", "closed": True}],
-                                              ["d9"], "acme/api", lambda r, n: None)
-        self.assertTrue(got[0]["headline"].endswith("(closed)"), "the suffix is never cut")
+        self.assertEqual(sb.decision_core.build_entries([{"kind": "issue", "title": "x " * 120, "ask": 9, "agent": None, "since": 1.0, "seed": "i", "bare": True,
+                                                          "repo": "acme/api", "tier": "human", "closed": True}], ["d9"], "acme/api", lambda r, n: None), [])
 
     def test_the_tier_of_an_issue_payload_with_both_labels(self):
         """The webhook path hands the hub one payload with every label the issue carries (the catch-up read
@@ -45616,7 +46385,8 @@ class TestExternalWiring(ExternalWorld):
 
     def test_the_loader_is_the_one_the_core_uses(self):
         text = SWITCHBOARD.read_text()
-        self.assertIn("def load_external_adapter", text)
+        self.assertIs(sb.load_external_adapter(), sb.load_module("external_adapter"))   # #437: the loaders are generated from HELPER_MODULES, not written as a def each
+        self.assertEqual(sb.HELPER_MODULES["load_external_adapter"], "external_adapter")
         self.assertNotIn("\nimport external_adapter", text)
         self.assertNotIn("\nfrom external_adapter", text)
 
@@ -50144,7 +50914,12 @@ class TestHeavySlots(Base):
         argv = [sys.executable, str(SWITCHBOARD), "heavy", "--slots", str(slots), "--name", name]
         if wait_max is not None:
             argv += ["--wait-max", str(wait_max)]
-        proc = subprocess.Popen(argv + ["--"] + list(words), env=env or self.env(), start_new_session=new_session, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        argv = argv + ["--"] + list(words)
+        if self.START_DELAY:   # a holder slow to write its record: the real wrapper holds its lock at once but its record (os.pwrite) lands START_DELAY seconds late
+            runner = ("import os, sys, time, runpy; real, delay = os.pwrite, float(sys.argv[1]); os.pwrite = lambda *a: (time.sleep(delay), real(*a))[1]; "
+                      "script = sys.argv[2]; sys.argv = [script] + sys.argv[3:]; runpy.run_path(script, run_name='__main__')")
+            argv = [sys.executable, "-c", runner, str(self.START_DELAY), str(SWITCHBOARD)] + argv[2:]
+        proc = subprocess.Popen(argv, env=env or self.env(), start_new_session=new_session, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 stdin=popen.pop("stdin", subprocess.DEVNULL), text=True, **popen)
         self.procs.append(proc)
         return proc
@@ -50186,14 +50961,36 @@ class TestHeavySlots(Base):
     def started(self):
         return sorted(p.name for p in self.home.glob("started.*"))
 
+    READY_TRIES = 600    # the readiness helper: 600 reads of the holder record, 0.1 s apart (60 s: a bound for a hang, not a delay: a healthy holder is ready in milliseconds), unless a test names its own bound
+    READY_PAUSE = 0.1
+    START_DELAY = 0      # seconds a holder is made slow to start (the injected-delay class sets it)
+
+    def ready_holders(self, count, slots=3, name=None, seconds=None, state=None):
+        """Wait until `count` holders are READY, then return them. Ready is read from the record the product itself reads (`holders`: the slot's lock is held and the
+        record names the holder and its command), never from a timer: a lock that is held before its record is written reads as '?' and is not ready yet. Bounded:
+        READY_TRIES reads (or `seconds` / READY_PAUSE); when it runs out it fails and says which holder was expected and what was missing."""
+        tries = int(seconds / self.READY_PAUSE) if seconds is not None else self.READY_TRIES
+        state = state or self.state()
+        found = []
+        for attempt in range(max(1, tries)):
+            found = self.hs.holders(state, slots)
+            known = [h for h in found if h["name"] != "?" and h["command"] != "?" and (name is None or h["name"] == name)]
+            if len(found) == count and len(known) == count:
+                return found
+            time.sleep(self.READY_PAUSE)
+        self.fail("holder %r not ready after %d reads of its record (%.1f s): expected %d ready holder(s), found %s (a '?' is a held lock whose record is not written yet)" % (
+            name, max(1, tries), max(1, tries) * self.READY_PAUSE, count, found))
+
     def test_s1_four_callers_of_three_slots_queue_and_the_fourth_runs_when_one_frees(self):
         """The integration check with real processes (the queue logic itself is tested deterministically in TestHeavyQueueLogic)."""
         procs = {tag: self.start(*self.waiter(tag), name="who-%s" % tag) for tag in "abcd"[:3]}
         ok = self.until(lambda: len(self.started()) == 3, self.HOLD_CEILING_SECONDS)
         self.assertTrue(ok, "3 commands started\n" + (self.why(procs) if not ok else ""))
         # the three locks are really held now (the kernel's own answer, not a file): the fourth cannot take one, whatever the machine's speed
-        ok = self.until(lambda: len(self.hs.holders(self.state(), 3)) == 3, self.HOLD_CEILING_SECONDS)
-        self.assertTrue(ok, "3 of 3 slots held before the fourth starts\n" + (self.why(procs) if not ok else ""))
+        try:
+            self.ready_holders(3, seconds=self.HOLD_CEILING_SECONDS)   # the three locks held AND their records written (the kernel's own answer, not a timer)
+        except AssertionError as err:
+            self.fail("3 of 3 slots held before the fourth starts\n%s\n%s" % (err, self.why(procs)))
         fourth = self.start(*self.waiter("d"), name="who-d")
         lines, queued = [], threading.Event()
 
@@ -50237,7 +51034,7 @@ class TestHeavySlots(Base):
     def test_s2_a_holder_killed_with_its_whole_group_frees_its_slot_by_itself(self):
         holder = self.start(*self.waiter("h"), slots=1, name="doomed")
         self.assertTrue(self.until(lambda: "started.h" in self.started()))
-        self.assertEqual([h["name"] for h in self.hs.holders(self.state(), 1)], ["doomed"])
+        self.assertEqual([h["name"] for h in self.ready_holders(1, slots=1, name="doomed")], ["doomed"])
         os.killpg(holder.pid, signal.SIGKILL)
         holder.wait(timeout=90)
         waiter = self.start("sh", "-c", 'touch "%s/second"' % self.home, slots=1)
@@ -50313,8 +51110,7 @@ class TestHeavySlots(Base):
 
     def test_s5_the_holder_list_names_who_holds_a_slot_and_a_free_slot_says_nothing(self):
         proc = self.start("sleep", "5", slots=2, name="the-coder")
-        self.assertTrue(self.until(lambda: len(self.hs.holders(self.state(), 2)) == 1))
-        (entry,) = self.hs.holders(self.state(), 2)
+        (entry,) = self.ready_holders(1, slots=2, name="the-coder")
         self.assertEqual((entry["name"], entry["command"]), ("the-coder", "sleep"))
         self.assertIsInstance(entry["pid"], int)
         self.assertLessEqual(abs(entry["since"] - time.time()), 30)
@@ -50326,7 +51122,7 @@ class TestHeavySlots(Base):
 
     def test_s6_past_the_wait_limit_it_exits_75_and_does_not_run_the_command(self):
         holder = self.start("sleep", "30", slots=1, name="busy-one")
-        self.assertTrue(self.until(lambda: len(self.hs.holders(self.state(), 1)) == 1))
+        self.ready_holders(1, slots=1, name="busy-one")
         marker = self.home / "marker"
         late = self.start("touch", str(marker), slots=1, wait_max=1)
         self.assertEqual(late.wait(timeout=90), 75)
@@ -50374,7 +51170,7 @@ class TestHeavySlots(Base):
 
     def test_a_signal_while_waiting_a_zero_wait_limit_and_a_command_that_cannot_start(self):
         holder = self.start("sleep", "30", slots=1)
-        self.assertTrue(self.until(lambda: len(self.hs.holders(self.state(), 1)) == 1))
+        self.ready_holders(1, slots=1, name="t")
         waiting = self.start("true", slots=1)
         seen = ""
         end = time.time() + 90
@@ -50457,7 +51253,7 @@ class TestHeavySlots(Base):
         cg = sb.load_cpu_guard()
         self.assertEqual(cg.slots_text({}, self.state()), "heavy slots 0/3")
         holder = self.start("sleep", "30", name="the-coder")
-        self.assertTrue(self.until(lambda: len(self.hs.holders(self.state(), 3)) == 1))
+        self.ready_holders(1, name="the-coder")
         line = cg.slots_text({}, self.state())
         self.assertRegex(line, r"^heavy slots 1/3 \(the-coder sleep \d+[ms]\)$")
         self.assertEqual(cg.slots_text({"heavy": {"slots": 5}}, self.state())[:15], "heavy slots 1/5")
@@ -50489,6 +51285,51 @@ class TestHeavySlots(Base):
         for path in ("agents/opencode/coder.md", "agents/opencode/orchestrator.md", "skills/fleet-coordination/SKILL.md"):
             found = (REPO / path).read_text()
             self.assertEqual(found.lower().count(line), 1, path)
+
+
+class TestHeavySlotsReadiness(TestHeavySlots):
+    """#688: the readiness helper of TestHeavySlots. Its own checks run here (the inherited tests below are removed: they run once, in TestHeavySlots, and the three
+    that failed in CI run again in TestHeavySlotsSlowStart)."""
+
+    def test_the_helper_reads_the_holder_record_the_product_reads_and_the_class_has_no_bare_sleep_wait(self):
+        helper = inspect.getsource(TestHeavySlots.ready_holders)
+        self.assertIn("self.hs.holders(", helper)
+        source = inspect.getsource(TestHeavySlots)
+        self.assertEqual(source.count("            time.sleep("), 2, "only the two bounded waits (until, ready_holders) sleep: no test waits by a bare sleep")
+        self.assertEqual(TestHeavySlots.READY_TRIES * TestHeavySlots.READY_PAUSE, 60.0)
+
+    def test_a_holder_whose_lock_is_held_but_record_is_not_written_is_not_ready_and_a_never_ready_holder_fails_within_the_bound_naming_it(self):
+        import fcntl
+        state = self.state()
+        fd = os.open(str(state / "heavy-slot-0.lock"), os.O_RDWR | os.O_CREAT, 0o600)   # held, with no record: what the product lists as '?'
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.assertEqual([h["name"] for h in self.hs.holders(state, 3)], ["?"])
+        begun = time.time()
+        with self.assertRaises(AssertionError) as caught:
+            self.ready_holders(1, name="slow-one", seconds=1)
+        self.assertLess(time.time() - begun, 2.5)
+        self.assertIn("slow-one", str(caught.exception))
+        self.assertIn("not ready", str(caught.exception))
+        self.assertIn("'?'", str(caught.exception))
+        os.ftruncate(fd, 0)
+        os.write(fd, json.dumps({"name": "slow-one", "command": "sleep", "pid": 1, "since": time.time()}).encode())
+        (entry,) = self.ready_holders(1, name="slow-one", seconds=1)
+        self.assertEqual((entry["name"], entry["command"]), ("slow-one", "sleep"))
+
+
+class TestHeavySlotsSlowStart(TestHeavySlots):
+    """#688: the three tests that failed in CI, run again with every holder one second slow to write its record (its lock is held at once)."""
+    START_DELAY = 1
+
+
+_KEEP_SLOW = ("test_s5_the_holder_list_names_who_holds_a_slot_and_a_free_slot_says_nothing", "test_the_cpu_line_shows_the_slots_in_use_through_the_real_heavy_module",
+              "test_s1_four_callers_of_three_slots_queue_and_the_fourth_runs_when_one_frees")
+for _name in dir(TestHeavySlots):
+    if _name.startswith("test"):
+        if _name not in _KEEP_SLOW:
+            setattr(TestHeavySlotsSlowStart, _name, None)
+        setattr(TestHeavySlotsReadiness, _name, None)
 
 
 def _artifact_zip(names, complete=True, run=1, head="a" * 40):
@@ -53738,6 +54579,10 @@ class TestReviewerSubagents(LedgerBase):
 
     def test_the_impact_block_carries_its_action_and_a_block_for_another_head_or_a_malformed_one_is_refused(self):
         code, out, err = self.record_block("coder", "impact", self.block_text("comment", extra="impact-action: hold\n", findings=()))
+        self.assertEqual(code, 2)
+        self.assertIn("run the review again", err)
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "review_record"], [])
+        code, out, err = self.record_block("coder", "impact", self.block_text("comment", extra="impact-action: hold\nimpact-class: data\n", findings=()))
         self.assertEqual(code, 0, err)
         self.assertEqual([e["impact_action"] for e in self.ledger() if e["kind"] == "review_record"], ["hold"])
         cases = ((self.block_text(head="d" * 40), "is not the PR's head"),
@@ -56648,6 +57493,173 @@ def main(argv):
     return 0 if ok else 1
 
 
+class TestSlice3Modules(Base):
+    """#437 slice 3: the loaders come from one generator, three more modules declare their own key, and two modules added on two branches never touch a shared line."""
+
+    OLD = [   # what validate_config said before the move (recorded from the previous program): the error text is the contract
+        ("temp_janitor", {"days": 0}, "config: temp_janitor.days must be a whole number from 1 to 365, got 0"),
+        ("temp_janitor", "x", "config: 'temp_janitor' must be an object with only enabled, days, keep, dir, scan_seconds and weekly_scan_seconds, got 'x'"),
+        ("chat_clear", {"live": "y"}, 'config: \'chat_clear\' must be {"enabled": true|false, "live": true|false}, got {\'live\': \'y\'}'),
+        ("chat_clear", [1], 'config: \'chat_clear\' must be {"enabled": true|false, "live": true|false}, got [1]'),
+        ("impact_floor", {"enabled": "y"}, "config: 'impact_floor.enabled' must be true or false"),
+        ("impact_floor", "x", "config: 'impact_floor' must be an object"),
+        ("impact_floor", {"zzz": 1}, "config: 'impact_floor' has key(s) this tool does not read: zzz"),
+    ]
+    GOOD = {"temp_janitor": [None, {"days": 3}], "chat_clear": [None, {"live": True}], "impact_floor": [None, {"enabled": True}]}
+
+    def test_s1_every_loader_is_generated_and_returns_the_module_load_module_returns(self):
+        tree = ast.parse(SWITCHBOARD.read_text())
+        defined = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+        self.assertEqual(len(sb.HELPER_MODULES), 22)
+        self.assertEqual(defined & set(sb.HELPER_MODULES), set(), "0 of the loaders has a def of its own")
+        for function, module in sb.HELPER_MODULES.items():
+            with self.subTest(function=function):
+                loader = getattr(sb, function)
+                self.assertIs(loader(), sb.load_module(module))
+                self.assertIs(loader(), loader(), "the second call returns the identical object")
+                self.assertEqual(loader.__name__, function)
+
+    def test_s2_the_moved_keys_give_the_old_results_and_the_old_error_text(self):
+        for key, values in self.GOOD.items():
+            for value in values:
+                with self.subTest(key=key, value=value):
+                    sb.validate_config({key: value})
+        sb.validate_config({})
+        for key, value, text in self.OLD:
+            with self.subTest(key=key, value=value), self.assertRaises(sb.ConfigError) as caught:
+                sb.validate_config({key: value})
+            self.assertEqual(str(caught.exception), text)
+
+    def test_s3_the_three_keys_are_declared_by_their_modules_and_in_no_shared_place(self):
+        declared = sb.config_declarations()
+        for key, module in (("temp_janitor", "disk_janitor"), ("chat_clear", "chat_clear"), ("impact_floor", "impact_floor")):
+            with self.subTest(key=key):
+                self.assertEqual(declared[key], module)
+                self.assertNotIn(key, sb.TOP_LEVEL_EXTRA_KEYS)
+                self.assertIn(key, sb.config_known_keys())
+        source = inspect.getsource(sb.validate_config)
+        for text in ('"temp_janitor"', '"chat_clear"', '"impact_floor"'):
+            self.assertNotIn(text, source, "no inline block for it is left in the validation chain")
+
+    def make_program(self, extra):
+        """A copy of the real program and its modules in a scratch directory, with `extra` files added to its bin."""
+        directory = Path(tempfile.mkdtemp(prefix="slice3-"))
+        self.addCleanup(shutil.rmtree, directory, True)
+        for path in BIN.glob("*.py"):
+            shutil.copy(str(path), str(directory / path.name))
+        shutil.copy(str(SWITCHBOARD), str(directory / "fleet-switchboard"))
+        for name, text in extra.items():
+            (directory / name).write_text(text)
+        return directory
+
+    def load_copy(self, directory):
+        loader = importlib.machinery.SourceFileLoader("sb_copy_%d" % id(directory), str(directory / "fleet-switchboard"))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(module)
+        return module
+
+    def test_s4_a_fixture_module_with_a_key_needs_no_change_to_the_program(self):
+        fixture = 'CONFIG_KEY = "slice3_key"\nCONFIG_DEFAULT = {"n": 2}\n\n\ndef validate(raw, source):\n    if not isinstance(raw, dict):\n        raise ValueError("%s: slice3 bad" % source)\n\n\ndef hello():\n    return "hi"\n'
+        directory = self.make_program({"slice3_mod.py": fixture})
+        before = (directory / "fleet-switchboard").read_bytes()
+        copy = self.load_copy(directory)
+        self.assertEqual(copy.load_module("slice3_mod").hello(), "hi", "found by name from its own file")
+        self.assertEqual(copy.validate_config({})["slice3_key"], {"n": 2})
+        with self.assertRaises(copy.ConfigError) as caught:
+            copy.validate_config({"slice3_key": 5})
+        self.assertEqual(str(caught.exception), "config: slice3 bad")
+        self.assertEqual((directory / "fleet-switchboard").read_bytes(), before)
+
+    def test_s5_two_branches_that_each_add_a_module_merge_without_a_conflict_and_both_keys_work_after_the_merge(self):
+        directory = Path(tempfile.mkdtemp(prefix="slice3-merge-"))
+        self.addCleanup(shutil.rmtree, directory, True)
+        (directory / "bin").mkdir()
+        for path in BIN.glob("*.py"):
+            shutil.copy(str(path), str(directory / "bin" / path.name))
+        shutil.copy(str(SWITCHBOARD), str(directory / "bin" / "fleet-switchboard"))
+
+        def git(*args):
+            return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"] + list(args), cwd=str(directory),
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+
+        self.assertEqual(git("init", "-q", "-b", "main").returncode, 0)
+        git("add", "-A"), git("commit", "-q", "-m", "base")
+        for branch, key in (("one", "fixture_one"), ("two", "fixture_two")):
+            git("checkout", "-q", "-b", branch, "main")
+            (directory / "bin" / ("%s.py" % key)).write_text('CONFIG_KEY = "%s"\nCONFIG_DEFAULT = {"n": 1}\n\n\ndef validate(raw, source):\n    if raw is not None and not isinstance(raw, dict):\n        raise ValueError("%s: bad")\n' % (key, key))
+            git("add", "-A"), git("commit", "-q", "-m", branch)
+            self.assertEqual(git("diff", "--name-only", "main", branch).stdout.split(), ["bin/%s.py" % key], "0 lines of the program changed")
+        git("checkout", "-q", "one")
+        merged = git("merge", "--no-edit", "two")
+        self.assertEqual(merged.returncode, 0, merged.stdout)
+        loader = importlib.machinery.SourceFileLoader("sb_merged_%d" % id(directory), str(directory / "bin" / "fleet-switchboard"))
+        program = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(program)
+        seen = []
+        program.warn_unknown_config = lambda message, section="", names=(), known=(): seen.append(list(names))
+        config = program.validate_config({})
+        self.assertEqual((config["fixture_one"], config["fixture_two"]), ({"n": 1}, {"n": 1}), "both modules are found and defaulted after the merge, with no line in the program")
+        self.assertEqual(seen, [])
+        with self.assertRaises(program.ConfigError):
+            program.validate_config({"fixture_two": "bad"})
+        # the test fails when the behaviour breaks: a program that kept a shared key table (no declaration scan) does not know the keys
+        program.config_declarations = lambda: {}
+        program.validate_config({"fixture_one": {"n": 2}, "fixture_two": {"n": 3}})
+        self.assertEqual(seen, [["fixture_one", "fixture_two"]], "with the declarations removed the keys are unknown: this test would fail")
+
+    def test_a_missing_module_file_refuses_the_configuration_for_each_of_the_three_moved_keys_with_the_floor_message(self):
+        for key, module, good in (("temp_janitor", "disk_janitor", {"days": 3}), ("chat_clear", "chat_clear", {"live": True}), ("impact_floor", "impact_floor", {"enabled": True})):
+            with self.subTest(key=key):
+                directory = Path(tempfile.mkdtemp(prefix="slice3-missing-"))
+                self.addCleanup(shutil.rmtree, directory, True)
+                for path in BIN.glob("*.py"):
+                    if path.stem != module:   # the module file is gone
+                        shutil.copy(str(path), str(directory / path.name))
+                with mock.patch.object(sb, "CONFIG_DECLARATIONS_DIR", str(directory)), self.assertRaises(sb.ConfigError) as caught:
+                    sb.validate_config({key: good})
+                self.assertEqual(str(caught.exception), "config key %r must be declared by %s.py, and it is not (the module is missing, its CONFIG_KEY line is missing or damaged, "
+                                 "or it names another key): no configuration is loaded" % (key, module))
+
+    def test_when_two_keys_are_wrong_the_declared_modules_win_in_module_name_order_and_the_earlier_checks_win_over_them(self):
+        bad = {"temp_janitor": "x", "chat_clear": "x", "impact_floor": "x"}
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.validate_config(dict(bad))
+        self.assertIn("'chat_clear'", str(caught.exception), "chat_clear.py sorts before disk_janitor.py and impact_floor.py")
+        del bad["chat_clear"]
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.validate_config(dict(bad))
+        self.assertIn("temp_janitor", str(caught.exception), "disk_janitor.py sorts before impact_floor.py")
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.validate_config({"chat_clear": "x", "cpu_guard": "x"})
+        self.assertIn("cpu_guard", str(caught.exception), "the checks that run before the declared ones still win")
+        with self.assertRaises(sb.ConfigError) as caught:
+            sb.validate_config({"chat_clear": "x", "docker_reaper": "x"})
+        self.assertIn("chat_clear", str(caught.exception), "a declared module's check wins over the ones that follow it")
+
+    def test_s6_a_default_owned_key_and_a_key_with_its_validator_in_the_program_stay_where_they_were(self):
+        self.assertTrue({"reds", "heavy", "cpu_guard"} <= set(sb.DEFAULTS))
+        self.assertTrue({"sweep", "triage", "plan_review", "impact_hold"} <= sb.TOP_LEVEL_EXTRA_KEYS)
+        for key, value in (("sweep", "x"), ("impact_hold", "x"), ("plan_review", "x")):
+            with self.subTest(key=key), self.assertRaises(sb.ConfigError):
+                sb.validate_config({key: value})
+
+    def test_s7_a_module_name_that_is_a_path_or_missing_is_refused(self):
+        for name in ("../fleet_health", "/etc/passwd", "no_such_module_xyz", "a/b", ""):
+            with self.subTest(name=name), self.assertRaises((ValueError, ImportError, OSError)):
+                sb.load_module(name)
+
+    def test_u2_a_missing_or_broken_module_fails_with_an_error_and_is_not_kept(self):
+        directory = self.make_program({"broken_mod.py": "def (:\n"})
+        copy = self.load_copy(directory)
+        with self.assertRaises(SyntaxError):
+            copy.load_module("broken_mod")
+        with self.assertRaises(SyntaxError):
+            copy.load_module("broken_mod")   # a failed import is never kept: it fails again
+        with self.assertRaises(FileNotFoundError):
+            copy.load_module("absent_mod")
+        self.assertNotIn("broken_mod", sys.modules)
+
+
 class TestConfigDeclarations(Base):
     """#437 slice 2: a module declares its own configuration key, default and validator; the shared code reads the declarations from the bin directory only."""
 
@@ -56800,7 +57812,8 @@ class TestConfigDeclarations(Base):
         self.assertIn("repo_exclusion.py", str(caught.exception), "the module is missing")
 
     def test_the_real_floor_names_the_two_moved_keys_and_the_real_modules_meet_it(self):
-        self.assertEqual(sb.CONFIG_MUST_DECLARE, {"excluded_repos": "repo_exclusion", "spotlight_guard": "spotlight_guard"})
+        self.assertEqual(sb.CONFIG_MUST_DECLARE, {"excluded_repos": "repo_exclusion", "spotlight_guard": "spotlight_guard", "temp_janitor": "disk_janitor",
+                                                  "chat_clear": "chat_clear", "impact_floor": "impact_floor"})
         self.assertEqual({k: sb.config_declarations()[k] for k in sb.CONFIG_MUST_DECLARE}, sb.CONFIG_MUST_DECLARE)
 
     def test_s7_the_moved_keys_are_known_through_their_declarations(self):
@@ -57530,6 +58543,70 @@ class TestAuthorityModulesGuard(unittest.TestCase):
         self.assertTrue(words and all(isinstance(w, str) and re.fullmatch(r"[a-z]+", w) for w in words))
 
 
+class TestOwnerClearModule(unittest.TestCase):
+    """Ask #532, slice 3: the code that decides who may clear, hold or release lives in bin/impact_hold.py (listed in the matrix), not in the daemon file. The names come from the
+    module's own MOVED tuple and the paths from the matrix: this test has no list of its own."""
+
+    def setUp(self):
+        self.floor = sb.load_module("impact_floor")
+        self.matrix = self.floor.load_matrix()
+        self.module = sb.load_module("impact_hold")
+        self.daemon = BIN / "fleet-switchboard"
+
+    @staticmethod
+    def defined(source):
+        import ast
+        return {n.name for n in ast.parse(source).body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+    def test_the_moved_functions_are_defined_in_the_module_and_found_in_the_daemon_under_their_old_names(self):
+        self.assertGreaterEqual(len(self.module.MOVED), 8)
+        self.assertEqual(self.defined(Path(self.module.__file__).read_text()) & set(self.module.MOVED), set(self.module.MOVED))
+        for name in self.module.MOVED:
+            self.assertTrue(callable(getattr(sb, name)), name)
+            self.assertIs(getattr(sb, name).__globals__, vars(sb), name + " runs in the daemon's own globals, as before the move")
+
+    def test_s5_s7_none_of_the_moved_functions_is_defined_in_the_daemon_file_and_one_registration_names_the_module(self):
+        source = self.daemon.read_text()
+        self.assertEqual(self.defined(source) & set(self.module.MOVED), set())
+        self.assertEqual(source.count('load_module("impact_hold").bind('), 1)
+
+    def test_s7_a_moved_function_copied_back_into_the_daemon_is_named(self):
+        name = self.module.MOVED[0]
+        copied = self.daemon.read_text() + "\n\ndef %s(*args):\n    return None\n" % name
+        self.assertEqual(sorted(self.defined(copied) & set(self.module.MOVED)), [name])
+
+    def test_s3_no_code_outside_the_matrix_names_a_top_tier_path_as_a_literal(self):
+        import ast
+        listed = {g for globs in self.matrix["owner_hold"]["top_tier_paths"].values() for g in globs}
+        files = sorted(BIN.glob("*.py")) + [self.daemon]
+        hits = []
+        for path in files:
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in listed:
+                    hits.append("%s: %s" % (path.name, node.value))
+        self.assertEqual(hits, [])
+
+    def test_s6_a_change_to_the_module_holds_for_the_owner_and_naming_it_a_change_to_another_daemon_function_does_not(self):
+        globs, exclude, force = self.floor.floor_for("adamkaplan/fleet-kit")
+        floor_hit = lambda paths: self.floor.floor_paths(paths, globs, exclude, force)
+        moved = self.floor.owner_decide(self.matrix, ["bin/impact_hold.py"], [], None, floor_hit(["bin/impact_hold.py"]))
+        other = self.floor.owner_decide(self.matrix, ["bin/fleet-switchboard"], [], None, floor_hit(["bin/fleet-switchboard"]))
+        self.assertEqual(moved[0], "hold")
+        self.assertTrue(any("bin/impact_hold.py" in r for r in moved[1]), moved)
+        self.assertNotEqual(other[0], "hold", other)
+
+    def test_s8_without_the_module_the_daemon_refuses_loudly_and_names_it(self):
+        import shutil
+        with tempfile.TemporaryDirectory() as tmp:
+            for path in list(BIN.glob("*.py")) + [self.daemon]:
+                if path.name != "impact_hold.py":
+                    shutil.copy(path, Path(tmp) / path.name)
+            done = subprocess.run([sys.executable, str(Path(tmp) / "fleet-switchboard"), "impact", "clear", "acme/api#1", "--reason", "x"], capture_output=True, text=True, timeout=60,
+                                  env=dict(os.environ, FLEET_SWITCHBOARD_STATE_DIR=tmp))
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn("impact_hold", done.stderr)
+
+
 class TestOwnerHoldRule(unittest.TestCase):
     """Ask #451, slice 1: the owner's own clear is for credentials, identity and who may do what only. The rule is data in the impact matrix file."""
 
@@ -58211,6 +59288,97 @@ class TestMoveAnAsk(LanesCase):
         self.assertIn("reminders: 2 cancelled", out)
         self.assertIn("no orchestrator is running charter #10", out)
         self.assertEqual([r["issue"] for r in sb.read_reminders(self.world.state)], [4])
+
+    def block_named(self):
+        """The live shape: the orchestrators carry no charter number in their metadata; each charter's own block names its orchestrator."""
+        for name in ("orch-a", "orch-b"):
+            fleet = self.world.v2.sessions[self.world.sessions[name]]["metadata"]["fleet"]
+            del fleet["charter"]
+            fleet["repo"] = FAKE_REPO
+        self.gh.bodies = {1: "```yaml\norchestrator: orch-a\nstatus: active\n```\n", 10: "```yaml\norchestrator: orch-b\nstatus: active\n```\n"}
+
+    def notice_lines(self):
+        return [e for e in self.world.audit() if e["event"] == "lanes.move.notice"]
+
+    def test_s1_orchestrators_named_only_by_the_charter_block_are_told_and_audited(self):
+        self.block_named()
+        code, out, err = self.main("move", "2", "--to", "10")
+        self.assertEqual((code, err), (0, ""), out)
+        (note,) = [a["text"] for a in self.world.admissions("orch-b")]
+        self.assertEqual(sum("## %s" % h in note for h in sb.load_module("lanes").HANDOVER_SECTIONS), 6)
+        self.assertEqual(len(self.world.admissions("orch-a")), 1)
+        lines = self.notice_lines()
+        self.assertEqual(sorted((l["detail"]["recipient"], l["detail"]["outcome"]) for l in lines), [("orch-a", "sent"), ("orch-b", "sent")])
+        self.assertIn("reminders: 2 carried", out)
+        held = {(r["issue"], r["to"]) for r in sb.read_reminders(self.world.state)}
+        self.assertEqual(held, {(2, "orch-b"), (4, "orch-a")}, "the reminders follow the block-named orchestrator")
+
+    def test_s5_a_charter_block_that_names_no_live_orchestrator_falls_back_to_the_metadata(self):
+        self.gh.bodies = {10: "```yaml\norchestrator: nobody-here\n```\n"}
+        code, out, err = self.main("move", "2", "--to", "10")
+        self.assertEqual((code, len(self.world.admissions("orch-b"))), (0, 1), err)
+
+    def skipped_for_new(self):
+        code, out, err = self.main("move", "%s#2" % FAKE_REPO, "--to", "%s#10" % FAKE_REPO)
+        self.assertEqual((code, self.parents(), self.world.admissions("orch-b")), (1, [10], []), err + out)
+        self.assertEqual([l["detail"]["outcome"] for l in self.notice_lines() if l["detail"]["role"] == "new orchestrator"], ["skipped"])
+
+    def test_a_body_naming_an_orchestrator_of_another_repository_tells_no_one(self):
+        self.block_named()
+        fleet = self.world.v2.sessions[self.world.sessions["orch-b"]]["metadata"]["fleet"]
+        fleet["repo"] = "other-org/other-repo"
+        self.skipped_for_new()
+
+    def test_a_prose_line_before_the_block_does_not_name_the_orchestrator(self):
+        self.block_named()
+        self.gh.bodies[10] = "Notes:\norchestrator: orch-b\n\n```yaml\norchestrator: platform\n```\n"
+        self.skipped_for_new()
+
+    def test_a_body_naming_a_coder_tells_no_one(self):
+        self.block_named()
+        self.gh.bodies[10] = "```yaml\norchestrator: worker\n```\n"
+        sid = self.world.sessions["orch-b"]
+        self.world.v2.sessions[sid]["metadata"]["fleet"]["role"] = "coder"
+        self.skipped_for_new()
+
+    def test_two_metadata_candidates_for_one_charter_tell_no_one(self):
+        self.world.add_agent("orch-c", fleet={"role": "orchestrator", "charter": 10})
+        self.skipped_for_new()
+
+    def test_s6_the_audit_lines_hold_the_recipient_outcome_and_reason_and_never_the_text(self):
+        self.main("move", "2", "--to", "10")
+        lines = self.notice_lines()
+        self.assertEqual(len(lines), 2)
+        for line in lines:
+            self.assertEqual(sorted(line["detail"]), ["outcome", "reason", "recipient", "role"])
+            self.assertNotIn("## State", json.dumps(line))
+
+    def test_s3_with_no_findable_orchestrator_the_ask_is_moved_one_line_says_skipped_and_the_exit_is_1(self):
+        sid = self.world.sessions.pop("orch-b")
+        self.world.v2.sessions[sid]["metadata"]["fleet"]["role"] = "coder"
+        code, out, err = self.main("move", "2", "--to", "10")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.parents(), [10])
+        self.assertIn("no orchestrator is running charter #10", out)
+        self.assertIn("handover note (no orchestrator is running charter #10)", err)
+        skipped = [l for l in self.notice_lines() if l["detail"]["outcome"] == "skipped"]
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("charter #10", skipped[0]["detail"]["reason"])
+
+    def test_s4_a_failed_send_to_the_new_orchestrator_does_not_stop_the_old_notice(self):
+        real = sb.Switchboard.send
+
+        def send(engine, sender, recipient, *a, **k):
+            if recipient == "orch-b":
+                raise RuntimeError("herdr is down")
+            return real(engine, sender, recipient, *a, **k)
+        with mock.patch.object(sb.Switchboard, "send", send):
+            code, out, err = self.main("move", "2", "--to", "10")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.parents(), [10])
+        self.assertEqual((len(self.world.admissions("orch-a")), len(self.world.admissions("orch-b"))), (1, 0))
+        outcomes = sorted((l["detail"]["recipient"], l["detail"]["outcome"]) for l in self.notice_lines())
+        self.assertEqual(outcomes, [("orch-a", "sent"), ("orch-b", "failed")])
 
     def test_s3_a_refused_write_leaves_the_ask_under_its_charter_and_names_the_step(self):
         self.gh.fail_write = True
@@ -59094,6 +60262,220 @@ class TestMergedLabels(Base):
         self.assertTrue(sb._issue_pr_merged({"pull_request": {"merged_at": "2026-10-15T10:00:00Z"}}))
         for record in ({"pull_request": {"merged_at": None}}, {"pull_request": {}}, {}, None, {"pull_request": "x"}):
             self.assertFalse(sb._issue_pr_merged(record), record)
+
+
+class StubIssueHub:
+    """The hub as the closed-issue pass sees it: the events it holds, and a fresh read per issue (`reads`: number -> dict, or an exception)."""
+
+    def __init__(self, entries, reads):
+        self.entries, self.reads, self.read_log = entries, reads, []
+
+    def closed_issue_snapshot(self):
+        return {ref: dict(entry) for ref, entry in self.entries.items()}
+
+    def forget_awaiting(self, repo, number):
+        self.forgotten = getattr(self, "forgotten", []) + [(repo, number)]
+
+    def _read_one(self, repo, path, now, fresh=False):
+        number = int(path.rsplit("/", 1)[1])
+        self.read_log.append((repo, number, fresh))
+        found = self.reads[number]
+        if isinstance(found, Exception):
+            raise found
+        return dict(found)
+
+
+class TestClosedIssueLabels(Base):
+    """Ask #570: a closed issue's awaiting labels come off (fleet prefix only), the Chief of Staff gets one line, and nothing else is touched."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=(), config={"gh": FAKE_GH, "github_repos": ["acme/api"], "excluded_repos": ["acme/secret"]})
+        self.world.add_agent("chief-of-staff", fleet={"role": "chief-of-staff"})
+        user = sb.getpass.getuser()
+        self.awaiting = ["%s:awaiting-user" % user, "%s:awaiting-cos" % user]
+        self.live = "%s:awaiting-live" % user
+        self.parked = "%s:parked" % user
+        self.engine = self.world.new_engine()
+
+    def entry(self, labels=None):
+        return {"labels": sorted(labels if labels is not None else self.awaiting + [self.parked, "bug"]), "at": 1}
+
+    def issue(self, state="closed", labels=None, **more):
+        names = labels if labels is not None else self.awaiting + [self.parked, "bug"]
+        return dict({"state": state, "labels": [{"name": n} for n in names]}, **more)
+
+    def go(self, entries, reads, gh):
+        self.engine.hub, self.engine.gh_runner = StubIssueHub(entries, reads), gh
+        closed_labels = sb.load_module("closed_labels")
+        ns = types.SimpleNamespace(**{n: getattr(sb, n) for n in closed_labels.NEEDS})
+        return closed_labels.run_pass(ns, self.engine, self.world.clock.now(), sb.IMPACT_PASS_CALLS)
+
+    def audit(self, event):
+        return [e for e in self.world.audit() if e["event"] == event]
+
+    def told(self):
+        return [a["text"] for a in self.world.admissions("chief-of-staff")]
+
+    def test_s2_the_awaiting_labels_come_off_and_the_parked_and_other_labels_stay(self):
+        gh = FakeMergedGh()
+        self.go({"acme/api#7": self.entry()}, {7: self.issue()}, gh)
+        self.assertEqual(sorted(gh.removed), sorted(self.awaiting), "2 awaiting labels removed; parked and bug stay")
+        (line,) = self.audit("closed.labels_removed")
+        self.assertEqual((line["subject"], sorted(line["detail"]["labels"])), ("acme/api#7", sorted(self.awaiting)))
+
+    def test_the_live_label_of_the_fleet_prefix_goes_too_and_another_prefixs_does_not(self):
+        gh = FakeMergedGh()
+        labels = [self.live, "someone-else:awaiting-user", self.parked]
+        self.go({"acme/api#8": self.entry(labels)}, {8: self.issue(labels=labels)}, gh)
+        self.assertEqual(gh.removed, [self.live])
+
+    def test_s3_a_reopened_issue_or_a_pull_request_loses_nothing(self):
+        for number, fresh in ((9, self.issue("open")), (19, self.issue("closed", pull_request={"url": "x"}))):
+            gh = FakeMergedGh()
+            self.go({"acme/api#%d" % number: self.entry()}, {number: fresh}, gh)
+            self.assertEqual(gh.removed, [], "the event said closed; the fresh read did not say an issue is closed")
+        self.assertEqual(len(self.audit("closed.labels_skipped")), 2)
+
+    def test_s4_a_failed_read_removes_nothing_audits_once_and_is_retried_after_the_back_off(self):
+        gh = FakeMergedGh()
+        entries = {"acme/api#10": self.entry()}
+        reads = {10: sb.GitHubUnavailable("HTTP 502")}
+        self.go(entries, reads, gh)
+        self.go(entries, reads, gh)
+        self.assertEqual((gh.removed, len(self.audit("closed.labels_read_failed"))), ([], 1))
+        self.world.tick(sb.load_module("closed_labels").RETRY_SECONDS + 1)
+        reads[10] = self.issue()
+        self.go(entries, reads, gh)
+        self.assertEqual(sorted(gh.removed), sorted(self.awaiting))
+        self.assertEqual(len(self.audit("closed.labels_read_failed")), 1, "said once")
+
+    def test_s5_an_excluded_or_unwatched_repository_is_never_read_or_written(self):
+        gh = FakeMergedGh()
+        hub_entries = {"acme/secret#1": self.entry(), "other/repo#2": self.entry()}
+        self.go(hub_entries, {1: self.issue(), 2: self.issue()}, gh)
+        self.assertEqual((self.engine.hub.read_log, gh.removed), ([], []), "0 reads and 0 writes in 2 of 2 cases")
+
+    def test_s6_the_chief_of_staff_gets_one_line_for_the_issue_and_a_second_pass_sends_nothing(self):
+        gh = FakeMergedGh()
+        entries = {"acme/api#11": self.entry()}
+        self.go(entries, {11: self.issue()}, gh)
+        self.assertEqual(len(self.told()), 1, "exactly 1 message")
+        self.assertIn("acme/api#11", self.told()[0])
+        for label in self.awaiting:
+            self.assertIn(label, self.told()[0])
+        self.go(entries, {11: self.issue()}, gh)
+        self.assertEqual(len(self.told()), 1, "0 more after a second pass")
+
+    def test_an_event_that_carried_no_awaiting_label_costs_no_read_and_sends_nothing(self):
+        gh = FakeMergedGh()
+        self.go({"acme/api#12": self.entry([self.parked, "bug"])}, {12: self.issue()}, gh)
+        self.assertEqual((self.engine.hub.read_log, gh.removed, self.told()), ([], [], []))
+
+    def test_a_failed_label_write_is_not_done_sends_nothing_and_is_retried(self):
+        gh = FakeMergedGh()
+        entries = {"acme/api#13": self.entry()}
+        with mock.patch.object(sb, "change_issue_labels", side_effect=sb.IntentError("gh", "HTTP 502")):
+            self.go(entries, {13: self.issue()}, gh)
+        self.assertEqual((self.audit("closed.labels_removed"), self.told()), ([], []))
+        self.world.tick(sb.load_module("closed_labels").RETRY_SECONDS + 1)
+        self.go(entries, {13: self.issue()}, gh)
+        self.assertEqual((sorted(gh.removed), len(self.told())), (sorted(self.awaiting), 1))
+
+    def test_an_issue_closed_reopened_and_closed_again_is_cleaned_on_the_second_close(self):
+        gh = FakeMergedGh()
+        entries = {"acme/api#16": self.entry()}
+        self.go(entries, {16: self.issue("open")}, gh)   # the first pass finds it reopened: nothing removed, marked handled
+        self.assertEqual(gh.removed, [])
+        self.world.tick(60)
+        entries["acme/api#16"] = dict(self.entry(), at=self.world.clock.now())   # the hub records a NEWER closed event
+        self.go(entries, {16: self.issue("closed")}, gh)
+        self.assertEqual(sorted(gh.removed), sorted(self.awaiting), "the second close is handled afresh")
+
+    def test_the_passs_cap_bounds_the_reads_and_the_rest_wait_for_the_next_pass(self):
+        gh = FakeMergedGh()
+        entries = {"acme/api#%d" % n: self.entry() for n in (21, 22)}
+        reads = {21: self.issue("open"), 22: self.issue("open")}
+        self.engine.hub, self.engine.gh_runner = StubIssueHub(entries, reads), gh
+        closed_labels = sb.load_module("closed_labels")
+        ns = types.SimpleNamespace(**{n: getattr(sb, n) for n in closed_labels.NEEDS})
+        closed_labels.run_pass(ns, self.engine, self.world.clock.now(), 1)
+        self.assertEqual([n for _, n, _ in self.engine.hub.read_log], [21], "calls=1: one read, of the first issue")
+        closed_labels.run_pass(ns, self.engine, self.world.clock.now(), 1)
+        self.assertEqual([n for _, n, _ in self.engine.hub.read_log], [21, 22], "the other waits for the next pass: a different issue, not the same twice")
+
+    def test_retry_and_said_state_of_a_ref_the_hub_no_longer_holds_is_dropped(self):
+        gh = FakeMergedGh()
+        entries = {"acme/api#23": self.entry()}
+        self.go(entries, {23: sb.GitHubUnavailable("HTTP 502")}, gh)
+        memory = self.engine.__dict__["closed_labels"]
+        self.assertEqual((sorted(memory["retry"]), sorted(memory["said"])), (["acme/api#23"], ["acme/api#23"]))
+        self.go({}, {}, gh)   # the hub evicted it
+        self.assertEqual((memory["retry"], memory["said"]), ({}, set()), "pruned with the ref")
+
+    def test_a_closed_event_the_hub_cannot_keep_is_audited_and_the_snapshot_is_unchanged(self):
+        class BrokenLock:
+            def __enter__(self):
+                raise RuntimeError("lock broken")
+
+            def __exit__(self, *exc):
+                return False
+        said = []
+        hub = sb.GitHubHub.__new__(sb.GitHubHub)
+        hub.lock, hub.closed_issues, hub.now = BrokenLock(), {}, self.world.clock.now
+        hub._audit = lambda event, subject, detail: said.append((event, subject, detail))
+        hub.note_closed_issue("acme/api", {"number": 24, "labels": [{"name": self.awaiting[0]}]})
+        self.assertEqual(hub.closed_issues, {}, "nothing was kept")
+        self.assertEqual([(e, s) for e, s, _ in said], [("github.rejected", "acme/api")])
+        self.assertIn("issues closed event not kept", said[0][2]["reason"])
+
+    def test_a_mixed_case_configured_repo_is_cleaned_and_an_excluded_one_stays_excluded_in_any_case(self):   # #570
+        world = World(self, agents=(), config={"gh": FAKE_GH, "github_repos": ["Acme-Org/Widget-Service"], "excluded_repos": ["Acme-Org/Secret-Repo"]})
+        world.add_agent("chief-of-staff", fleet={"role": "chief-of-staff"})
+        self.engine = world.new_engine()
+        self.world = world
+        gh = FakeMergedGh()
+        entries = {"acme-org/widget-service#7": self.entry(), "ACME-ORG/SECRET-REPO#8": self.entry(), "acme-org/secret-repo#9": self.entry()}
+        hub_calls = []
+        self.go(entries, {7: self.issue(), 8: self.issue(), 9: self.issue()}, gh)
+        self.assertEqual(sorted(gh.removed), sorted(self.awaiting), "only the watched repo, found in a different case, was cleaned")
+        (line,) = self.audit("closed.labels_removed")
+        self.assertEqual(line["subject"], "acme-org/widget-service#7")
+
+    def test_the_hub_is_told_to_forget_an_issue_only_when_the_fresh_read_says_closed(self):
+        gh = FakeMergedGh()
+        self.go({"acme/api#41": self.entry(), "acme/api#42": self.entry(), "acme/api#43": self.entry()},
+                {41: self.issue("closed"), 42: self.issue("open"), 43: sb.GitHubUnavailable("HTTP 502")}, gh)
+        self.assertEqual(self.engine.hub.forgotten, [("acme/api", 41)], "closed: forgotten; reopened or unreadable: still listed")
+
+    def test_the_live_label_name_is_pinned_to_the_fleet_prefix(self):
+        with mock.patch.object(sb.getpass, "getuser", return_value="osuser"):
+            self.assertEqual(sb.awaiting_live_label({}), "osuser:awaiting-live")
+
+    def test_a_real_issues_closed_event_through_the_hub_reaches_the_snapshot(self):
+        rig = GithubRig(self, config={"awaiting_label": DECISION_LABEL})
+        issue = rig.gh.issue(7, title="Pick one", labels=[DECISION_LABEL, "bug"], age=0)
+        rig.pump(15)
+        issue["state"] = "closed"
+        rig.gh.send("issues", {"action": "closed", "issue": dict(issue)})
+        self.assertEqual([ref.rpartition("#")[2] for ref in rig.hub.closed_issue_snapshot()], ["7"], "exactly the issue that closed")
+        (entry,) = rig.hub.closed_issue_snapshot().values()
+        self.assertEqual(entry["labels"], sorted([DECISION_LABEL, "bug"]))
+        self.assertEqual(len(rig.hub.awaiting_listing()[0]), 1, "the payload alone drops nothing: the fresh-read pass decides")
+
+    def test_the_hub_keeps_a_closed_event_in_memory_and_the_daemons_pass_runs_the_cleaning(self):
+        self.engine.hub = StubIssueHub({}, {})
+        hub = sb.GitHubHub.__new__(sb.GitHubHub)   # only the event bookkeeping is under test
+        hub.lock, hub.closed_issues, hub.now = threading.RLock(), {}, self.world.clock.now
+        hub.note_closed_issue("acme/api", {"number": 14, "labels": [{"name": self.awaiting[0]}, {"name": "bug"}]})
+        hub.note_closed_issue("acme/api", {"number": 15, "labels": [], "pull_request": {"url": "x"}})   # a pull request is not an issue
+        self.assertEqual(sorted(hub.closed_issue_snapshot()), ["acme/api#14"])
+        self.engine.hub, self.engine.gh_runner = StubIssueHub(hub.closed_issue_snapshot(), {14: self.issue()}), FakeMergedGh()
+        sb.publish_decisions(self.engine)
+        self.assertEqual(sorted(self.engine.gh_runner.removed), sorted(self.awaiting), "publish_decisions (the pass) cleans it")
+        with mock.patch.object(sb.load_module("closed_labels"), "run_pass", side_effect=RuntimeError("boom")):
+            sb.publish_decisions(self.engine)   # never raises
+        self.assertTrue(self.audit("closed_labels.error"))
 
 
 # ---- docs/agent-credentials.md (#568): the document has its sections and no token-like text (S1, S2, S3, S5, U1)
