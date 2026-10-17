@@ -56110,7 +56110,7 @@ class TestReviewCheckout(LedgerBase):
                 self.assertEqual(code, 1, err)
                 self.made_nothing()
         self.route = plain
-        with mock.patch.object(self.rc, "MAX_TOTAL_BYTES", 10 - 16 * 1024 * 1024 + 16 * 1024 * 1024 - 10):   # 0: any archive is over the limit
+        with mock.patch.object(self.rc, "MAX_TOTAL_BYTES", -16 * 1024 * 1024):   # the archive limit is then 0 bytes: any archive is over it
             code, out, err = self.checkout()
         self.assertIn(code, (1, 2), err)
         self.made_nothing()
