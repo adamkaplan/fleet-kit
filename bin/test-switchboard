@@ -17345,7 +17345,7 @@ class TestGhShim(Base):
         done, seen = self.run_shim("issue", "view", "2")
         self.assertEqual(done.stderr, "real gh err\n")
         source = (SHIM.parent / "body_warn.py").read_text()
-        self.assertNotRegex(source, r"import .*\b(subprocess|socket|urllib|http|os)\b")
+        self.assertNotRegex(source, r"import .*\b(subprocess|socket|urllib|http)\b")
 
     def test_s8_a_body_file_post_reads_the_file_and_starts_no_process_and_no_network(self):
         module = self.load_warn()
@@ -17356,6 +17356,33 @@ class TestGhShim(Base):
         with mock.patch.object(subprocess, "run", boom), mock.patch.object(subprocess, "Popen", boom), mock.patch.object(socket, "socket", boom), \
                 mock.patch.object(os, "system", boom):
             self.assertIn(self.WARN, module.warning(["issue", "comment", "2", "--body-file", str(path)]))
+
+    def test_a_body_file_that_is_not_a_regular_file_is_never_read_and_never_hangs(self):
+        module = self.load_warn()
+        fifo = self.home / "pipe"
+        os.mkfifo(fifo)
+        args = ["issue", "comment", "2", "--body-file", str(fifo)]
+        self.assertIsNone(module.warning(args))   # a FIFO with no writer: no hang
+        writer = os.open(fifo, os.O_RDWR)
+        try:
+            os.write(writer, b"a\\nb\n")
+            self.assertIsNone(module.warning(args))   # a FIFO with a writer: nothing is consumed
+            self.assertEqual(os.read(writer, 100), b"a\\nb\n")
+        finally:
+            os.close(writer)
+        self.assertIsNone(module.warning(["issue", "comment", "2", "--body-file", str(self.home)]))   # a directory
+        self.assertIsNone(module.warning(["issue", "comment", "2", "--body-file", "/dev/null"]))   # a device
+
+    def test_a_body_file_over_the_bound_is_skipped_and_a_regular_file_still_warns(self):
+        module = self.load_warn()
+        big = self.home / "big.md"
+        big.write_text("a\\nb\n" + "x" * module.MAX_FILE_BYTES)
+        self.assertIsNone(module.warning(["issue", "comment", "2", "--body-file", str(big)]))
+        small = self.home / "small.md"
+        small.write_text("a\\nb\n")
+        self.assertIn(self.WARN, module.warning(["issue", "comment", "2", "--body-file", str(small)]))
+        self.assertIsNone(module.warning(["issue", "comment", "2", "--body-file", "-"], None))   # stdin not read: nothing
+        self.assertIn(self.WARN, module.warning(["issue", "comment", "2", "--body-file", "-"], "a\\nb"))
 
     def test_a_doubt_means_no_warning(self):
         module = self.load_warn()

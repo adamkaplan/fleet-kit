@@ -5,7 +5,9 @@ stdin text the shim already read) for `issue` and `pr` `create`, `edit`, `commen
 Code fences and code spans are left out. It returns one line to print on stderr, or None when the text reads well or anything is in doubt
 (a warning is not a guard: any doubt means no warning). Standard library only.
 """
+import os
 import re
+import stat
 
 LONG_PARAGRAPH = 600
 MAX_MARKERS = 3
@@ -17,6 +19,23 @@ ITEM_RE = re.compile(r"^\s{0,6}(?:[-*+]|\d{1,3}[.)])\s")
 MARKER_RE = re.compile(r"\(\d{1,2}\)")
 HINT = "gh: this text may be hard to read (%s): use short paragraphs and Markdown lists, one item per line (a warning only; the command ran)\n"
 BODY_FLAGS = {"-b": "body", "--body": "body", "-F": "file", "--body-file": "file"}
+
+
+def read_regular(path):
+    """The text of a REGULAR file of at most MAX_FILE_BYTES, else None: a FIFO, a process substitution, /dev/stdin, a socket, a directory or a
+    device is never read (reading would consume the stream the real gh needs, or hang), and a file over the bound is skipped. The file is opened
+    without blocking and judged by its descriptor, so a path swapped for a FIFO after a check cannot hang the shim."""
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE_BYTES:
+            return None
+        data = os.read(fd, MAX_FILE_BYTES + 1)
+        if len(data) > MAX_FILE_BYTES:
+            return None
+        return data.decode("utf-8")
+    finally:
+        os.close(fd)
 
 
 def texts(args, stdin_text):
@@ -43,8 +62,9 @@ def texts(args, stdin_text):
             if stdin_text is not None:
                 found.append(stdin_text)
         else:
-            with open(value, "r", encoding="utf-8") as handle:
-                found.append(handle.read(MAX_FILE_BYTES))
+            text = read_regular(value)
+            if text is not None:
+                found.append(text)
     return found
 
 
