@@ -138,7 +138,8 @@
         "shims/gh",
         "shims/git",
         "cloud/launcher/token_mint.py",
-        "cloud/launcher/cloud_worker.py"
+        "cloud/launcher/cloud_worker.py",
+        "cloud/launcher/repo-approvals.json"
       ],
       "identity": [
         "shims/**",
@@ -158,6 +159,7 @@
         "bin/charter_check.py",
         "bin/cloud_worker.py",
         "bin/external_adapter.py",
+        "bin/impact_hold.py",
         "docs/review-laws/impact-matrix.json",
         "plugins/fleet-hooks/**",
         "tools/cos-permissions-proof/**",
@@ -198,6 +200,7 @@
           "bin/charter_check.py",
           "bin/cloud_worker.py",
           "bin/external_adapter.py",
+          "bin/impact_hold.py",
           "docs/review-laws/impact-matrix.json"
         ],
         "exclude": [
@@ -216,6 +219,7 @@
       "agents/**",
       "cloud/launcher/token_mint.py",
       "cloud/launcher/cloud_worker.py",
+      "cloud/launcher/repo-approvals.json",
       ".github/workflows/**",
       "bin/switchboard-trial"
     ],

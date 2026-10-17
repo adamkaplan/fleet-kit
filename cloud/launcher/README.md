@@ -62,3 +62,62 @@ hash for the pod name. Shape rates are placeholders (`S` 0.10, `M` 0.20 USD/hour
 **Not in this slice.** Automatic detection of a node drain notice: the end hook runs on `stop`, the idle stop and the hard limit; a drain is handled today by the operator running `stop --reason "node drain"`. The `cw-worker` service account's cloud identity and what it may do belong to the image/cluster setup (slice A and the platform), not here. `bin/test-cloud-launcher` is not yet wired into CI (the suite lists are CI's own).
 
 **Old names.** The launcher reads and writes only the neutral `cw` names (one table in `tests/test_cw_names.py`). No worker exists under an earlier name, and none is read: a pod or secret left under an old name is invisible to `status` and `reap` and must be removed by hand.
+
+## Server-side guards: `app_token.py` and `preflight.py`
+
+A guard is enforced where the action takes effect (the repository's rules, the token's scope), not in a wrapper.
+These two programs are the server side of that. Neither writes a file; neither prints a secret.
+
+**`app_token.py OWNER/REPO`** prints a one-hour GitHub App installation token for that one repository, and nothing
+else, on stdout. It refuses (exit 1, one line on stderr naming the key, never a value) to print a token unless:
+
+- the answer lists exactly the one repository and expires within 61 minutes, and
+- its `permissions` equal exactly `contents: write`, `pull_requests: write`, `metadata: read`: no extra key, no higher
+  level, none missing.
+
+The private key travels only through a pipe to `openssl`; only `https://api.github.com` is used (`CW_GITHUB_API_BASE`
+may name a loopback `http` address, for tests).
+
+**`preflight.py OWNER/REPO [--branch NAME] [--accept-classic]`** reads, with GET only, whether the default branch
+refuses direct pushes (a `pull_request` rule that requires at least one approving review, or a `merge_queue` rule, in an active ruleset that covers the branch; `evaluate` and `disabled` rulesets and rulesets not covering the branch are refused by name; ref patterns follow GitHub: `*` stops at `/`, `**` crosses it, and a pattern the program does not understand, such as a character class, covers nothing), force-pushes (`non_fast_forward`) and deletion
+(`deletion`). Exit 0 prints `preflight ok: <rules>`; exit 1 names each missing rule; exit 2 means the answer could not
+be read. A branch protected only by classic branch protection fails closed (a read-only token cannot see its review
+requirement); `--accept-classic` is the explicit, owner-approved override and prints a warning. It overrides only that one failure (the review requirement on a branch GitHub reports as protected), never an unreadable answer, an unprotected branch, or a missing `non_fast_forward` or `deletion` rule. Redirects are never followed, and `OWNER/REPO` may not contain a `.` or `..` segment. It cannot see bypass
+actors: the live refusal check on a disposable repository is the real proof.
+
+*Organization rulesets.* An App installation token can never read an organization ruleset (GitHub asks for the
+organization `Administration` permission at write; this project does not grant it). When the read of an organization
+ruleset is refused with HTTP 403, that ruleset is not counted and the output says so, one line each:
+`organization ruleset <id>: not readable with this token, not counted`. The repository passes on the rules the
+preflight can verify. If it fails only because those rules are not counted (exit 1: `protection comes from an
+organization ruleset this token cannot read; an owner approval entry is needed`), it is enabled by one entry in
+`cloud/launcher/repo-approvals.json`, which ships as `{}` (nothing is enabled). The launcher and the preflight run from
+the operator's main checkout, so a changed copy in a worker's branch is not the one that counts. The file is read from the
+real location of the program (a symlink to it is followed, and a file beside the link is ignored): there is no setting, flag or other path for it, and an approval can arrive only through a pull request that
+changes that file, which needs the owner's clear. To add one, compute the key (the repository is public, so only a hash
+of the lowercased `owner/name` is stored; the hash is not a secret: it avoids listing names in clear but discloses that a
+named repository is approved):
+
+```sh
+python3 -c 'import hashlib;print(hashlib.sha256(b"owner/name".lower()).hexdigest())'
+```
+
+```json
+{"<that hash>": {"approved_by": "<the owner's login>", "approved_at": "2026-10-16", "reason": "<one neutral line>", "pr": "<the number of the pull request that adds this entry>"}}
+```
+
+All four fields must be non-empty one-line strings (no control or bidirectional characters); a repeated key, at any level, makes the file unreadable (exit 2). The file is read only when the sole reason for failing is the
+unreadable organization rulesets (everything missing would be supplied by the rules they carry). A matching entry passes
+with a line on every run: `preflight ok: protection NOT VERIFIED (organization ruleset <id> unreadable); owner-approved
+by <who> on <date> (pr #<n>): <reason>`. A file or matching entry that cannot be read exits 2; an entry for another
+repository is ignored. The approval never covers a rule the preflight can see is missing, an unprotected repository, or
+a readable ruleset that is not enforced. Any other failed read (404, 500, a dropped connection, odd JSON, too large) of
+any ruleset, and a 403 on a repository's own ruleset, still exits 2.
+
+Residual: an agent that runs as the owner's operating-system user can edit any local file, including this installed
+program. The approvals file is no weaker than the code itself; the repository's review gate and the owner's clear are
+what protect both.
+
+Settings (environment): `CW_APP_ID_CMD`, `CW_APP_KEY_CMD`, `CW_APP_INSTALLATION_CMD` (each a command printing the
+value; otherwise read from the vault), `CW_VAULT_SUBSCRIPTION` and `CW_VAULT_NAME` (no defaults), `CW_OPENSSL`,
+`CW_GITHUB_API_BASE` (tests), `CW_PREFLIGHT_TOKEN_CMD` (tests: replaces the mint in the preflight).

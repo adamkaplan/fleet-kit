@@ -34,12 +34,17 @@ AUTH:       <the authority already granted, explicitly>
 CHECKPOINT: <a UTC time or an agreed event, with an overdue time>
 ```
 
+A brief for a credential, permission or privileged-script change links `docs/adversarial-checklist.md`.
+The pull request body answers each item of it in one line.
+
 Before the coder's first push, it runs both focused (a push voids proofs):
 
 ```text
 bin/test-switchboard -k test_the_role_files_do_not_grow   # the role-file byte cap
 bin/test-switchboard -k TestHygiene                       # shebang, stdlib-only, executable bits
 ```
+
+When a scenario's evidence is your own measurement, from your own pane launch a tester of your lane (`--role tester --repo <the pull request's repo> --reports-to <you>`, headless is enough) to re-measure and record the verdict: never record as yourself, and do not ask for a waiver.
 
 `ASK` carries the Intent and Done when of the ask this assignment serves
 (`fleet-switchboard intent <issue>` prints them), so a coder who never sees the
@@ -287,6 +292,8 @@ handoff, on the issue — the GitHub record has to survive a lost message.
 
 **Pushing.** git push works as the repository's account (fetch, pull and clone too): the fleet's `git` shim, first on your shell's PATH next to `gh`, routes the credential through the `gh` shim, which picks the account for your session's repository. Use plain `git push`: no manual -c credential route is needed, and if the account lookup fails, or no account is mapped for your repository in `gh_users`, the push fails with one clear line rather than going out as another login, when the shim is first on your PATH (with no `gh_users` at all, git keeps its own credentials, and `FLEET_GIT_SHIM=off` turns the routing off) (say so in your report and retry; do not try the stored login). It is a guardrail, not a boundary: the account's own permissions are the boundary.
 
+Write scratch files (PR bodies, message bodies, notes) under a private directory made with mktemp -d, never under a fixed name in the shared temp folder: another agent may write the same name, and a body file is published as it stands.
+
 ## Evidence
 
 Evidence is something the reader can open. A link to a PR, a CI run, a commit at
@@ -357,3 +364,5 @@ report the switchboard retires it by itself; retire is for the cases it cannot t
 ## Heavy runs
 
 Full suites and browser/e2e runs go through `fleet-switchboard heavy -- <cmd>`: it waits for one of a few CPU slots and runs the command at background priority, so many agents do not starve the machine.
+
+An agent that is asked to run a mutation or fault-injection check (a tester or the orchestrator's own worker, never a reviewer, who runs nothing) runs each run through `fleet-switchboard heavy` with a time limit (`heavy -- timeout N <command>`), in its own process group which it stops as a whole when the limit is hit, and never leaves one running in the background. The wrapper also stops a tree that passes its ceiling, but do not rely on that for a mutant that can loop.

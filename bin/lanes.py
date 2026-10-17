@@ -31,15 +31,48 @@ class MoveRefused(Exception):
     """The move cannot be made, and nothing was written."""
 
 
-def charter_orchestrators(sb, discovery, repo, charter):
-    """The names of the live orchestrators whose charter is `charter` in `repo`, sorted."""
-    found = []
-    for agent in discovery.agents.values():
+BLOCK_AT_TOP = re.compile(r"\A\s*```ya?ml[ \t]*\r?\n(.*?)\r?\n[ \t]*```", re.DOTALL | re.IGNORECASE)
+BLOCK_ORCHESTRATOR = re.compile(r"^orchestrator:[ \t]*([A-Za-z0-9][A-Za-z0-9._-]*)[ \t]*(?:#[^\r\n]*)?\r?$", re.MULTILINE)
+
+
+def block_orchestrator(body):
+    """The name in the `orchestrator:` key of the first fenced yaml block at the very top of a charter body, or None. Prose or a later
+    block never counts: the body is untrusted text and only selects among live agents."""
+    block = BLOCK_AT_TOP.match(body if isinstance(body, str) else "")
+    found = BLOCK_ORCHESTRATOR.search(block.group(1)) if block else None
+    return found.group(1) if found else None
+
+
+def charter_orchestrators(sb, discovery, repo, charter, body=None):
+    """The live orchestrator of `charter` in `repo` as a list of exactly one name, or [] when none or more than one can be told apart.
+    The orchestrator the charter body's top block names wins when it is a live orchestrator of THIS repo; the `charter` field of an
+    orchestrator's session metadata (in this repo) is the fallback."""
+    def mine(agent):
         fleet = agent.fleet or {}
-        if fleet.get("role") == "orchestrator" and fleet.get("charter") == charter \
-                and sb._fleet_repo(fleet, sb.engine.config) == repo:
-            found.append(agent.name)
-    return sorted(found)
+        return fleet.get("role") == "orchestrator" and sb._fleet_repo(fleet, sb.engine.config) == repo
+
+    named = block_orchestrator(body)
+    agent = discovery.agents.get(named) if named else None
+    if agent is not None and mine(agent):
+        return [agent.name]
+    found = sorted(a.name for a in discovery.agents.values() if mine(a) and (a.fleet or {}).get("charter") == charter)
+    return found if len(found) == 1 else []
+
+
+def charter_body(sb, repo, number):
+    """The charter issue's body, read now (never cached), or None when it cannot be read: the metadata then decides."""
+    try:
+        return read_issue(sb, repo, number).get("body")
+    except (MoveRefused, sb.IntentError):
+        return None
+
+
+def audit_notice(sb, subject, role, recipient, outcome, reason=None):
+    """One audit line for one notice: who, the outcome (sent, skipped or failed) and why; never the text."""
+    audit = sb.engine.audit
+    if audit is not None:
+        audit.append(sb.engine.actor, "lanes.move.notice", subject,
+                     {"role": role, "recipient": recipient, "outcome": outcome, "reason": reason})
 
 
 def check_caller(caller, role):
@@ -278,7 +311,8 @@ def run_move(sb, repo, ask, to_charter, caller, role, out, err, watched=None):
         out("ask %s#%d is already under charter #%d: nothing to do" % (repo, ask, new))
         return sb.EXIT_OK
     discovery = engine.discover(engine.now())
-    old_names, new_names = charter_orchestrators(sb, discovery, repo, old), charter_orchestrators(sb, discovery, repo, new)
+    old_names = charter_orchestrators(sb, discovery, repo, old, charter_body(sb, repo, old))
+    new_names = charter_orchestrators(sb, discovery, repo, new, charter_body(sb, repo, new))
     old_owner, new_owner = (old_names[0] if old_names else None), (new_names[0] if new_names else None)
     workers = ask_workers(sb, discovery, repo, ask)
     prs = pull_requests(sb, repo, ask)
@@ -330,14 +364,20 @@ def run_move(sb, repo, ask, to_charter, caller, role, out, err, watched=None):
     note = handover_note(sb, plan, who, workers, prs, tag).replace("{reminders}", reminders_section(sb, verb, held))
     for owner, text, label, charter in ((new_owner, note, "handover note", new),
                                         (old_owner, old_notice(plan, who, new_owner, workers, reminder_text, tag), "notice", old)):
+        role = "new orchestrator" if charter == new else "old orchestrator"
         if owner is None:
-            out("%s: no orchestrator is running charter #%d, so no one was told" % (label, charter))
+            reason = "no orchestrator is running charter #%d" % charter
+            out("%s: %s, so no one was told" % (label, reason))
+            audit_notice(sb, subject, role, None, "skipped", reason)
+            failed.append("%s (%s)" % (label, reason))
             continue
         why = send_notice(sb, caller, owner, text, plan)
         if why:
             failed.append("%s to %s (%s)" % (label, owner, why))
+            audit_notice(sb, subject, role, owner, "failed", why)
         else:
             out("%s: sent to %s" % (label, owner))
+            audit_notice(sb, subject, role, owner, "sent")
     # step 5, what the old charter still holds.
     try:
         remaining = [a for a in engine.intents.open_asks(old, repo) if a.number != ask]
