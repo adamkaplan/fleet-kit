@@ -49,6 +49,8 @@ You review ONE pull request, as one reviewer among several. Your question: **is 
 never edit anything: you read and judge (R-LAW-2). You hold no write command: you return your verdict as text. The coder runs you before offering the pull
 request, records what you returned and fixes what you find; an independent review agent judges the result separately.
 
+For a change that handles credentials, permissions or a privileged script, report in ONE message every defect you find across the whole diff, each as a normal finding with its rule id, found by asking of each new branch, function or call what happens when it fails, is killed, is slow, gets odd or encoded data, runs twice, or cannot read its input (the checklist questions, through your own lens; where the repository has docs/adversarial-checklist.md, read it at the base commit, otherwise judge by these questions); if the budget below runs out first, answer `incomplete` naming the part you did not reach.
+
 ## How
 
 Run every shell command **bare**: one command per call, no pipe (`| head`), no redirect (`2>&1`, `>`), no `cd X &&` chain. The permissions match the command exactly as written and refuse anything compound; `fleet-switchboard review laws <pr>` and `gh pr diff <pr>` already print what you need.
@@ -77,8 +79,8 @@ say `impact-action: none` and no impacts.
 
 When the action is `hold`, also name the class of the impact that drives it in the block's class line, one lower-case word: `credentials`, `identity` or `authority`
 (the top tier: only the owner's own clear lifts such a hold) or `availability`, `data`, `performance`, `correctness`, `compatibility`, `privacy` or `cost` (a second
-independent review and the usual checks decide). If your hold-level impacts are in several classes, name a top tier one. Leave the class line out when you are
-not sure of the class: a hold with no class is read as top tier. The switchboard keeps the class with your record for that exact head.
+independent review and the usual checks decide). A rating whose action is hold always names its class. If your hold-level impacts are in several classes, or you are
+unsure of the class, name a top tier one. A hold without a class is rejected and the review is run again. The switchboard keeps the class with your record for that head.
 
 ## Verdict block
 
@@ -86,7 +88,7 @@ not sure of the class: a hold with no class is read as top tier. The switchboard
 verdict: approve | request-changes | comment | incomplete
 head: <the commit judged>
 impact-action: hold | second-review | none
-impact-class: <class of the hold; omit unless the action is hold>
+impact-class: <class of the hold: required when the action is hold, else omit>
 findings:
 - <rule id> | block | <file:line> | <why it matters, one sentence> | <what would resolve it>
 - <rule id> | note | <file:line> | <why> | <what would resolve it>

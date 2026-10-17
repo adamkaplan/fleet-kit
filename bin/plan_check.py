@@ -702,8 +702,8 @@ def validate(scenarios, clauses, text=""):
         if evaluator and evaluator not in EVALUATORS:
             bad(ident, "bad-evaluator", "evaluator %r must be one of %s" % (evaluator, "|".join(EVALUATORS)))
         if proof in PROOF_EVALUATORS and evaluator in EVALUATORS and evaluator not in PROOF_EVALUATORS[proof]:
-            bad(ident, "evaluator-mismatch", "proof %s is recorded by %s, not %s"
-                % (proof, " or ".join(PROOF_EVALUATORS[proof]), evaluator))
+            bad(ident, "evaluator-mismatch", "proof %s is recorded by %s, not %s: the evaluator that fits proof %s is %s"
+                % (proof, " or ".join(PROOF_EVALUATORS[proof]), evaluator, proof, " or ".join(PROOF_EVALUATORS[proof])))
         claim = _normal(scenario.get("claim", "")) or "pr"
         if claim not in CLAIMS:
             bad(ident, "bad-claim", "claim %r must be pr or epic" % claim)
@@ -726,7 +726,7 @@ def validate(scenarios, clauses, text=""):
         if not covering:
             bad("-", "uncovered-clause", "%s is not covered by any S scenario: %s" % (tag, clauses[number - 1][:80]))
     if not clauses:
-        bad("-", "no-done-when", "the ask has no Done-when to cover: coverage cannot be checked")
+        bad("-", "no-done-when", "the ask has no Done-when to cover: coverage cannot be checked (the issue body needs a \"## Intent\" heading, then a line starting \"Done when:\" under it)")
     if not any(_normal(s.get("id", "")).startswith("U") for s in scenarios):
         reason = UNCHANGED_NONE_RE.search(text or "")
         if not (reason and unchanged_reason_ok(reason.group(1))):

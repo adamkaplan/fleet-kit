@@ -53,7 +53,7 @@ def build_surfaces(out, build_log):
     for sub in ("image", "manifests", "logs", "sources"):
         os.makedirs(os.path.join(out, sub), exist_ok=True)
     if os.path.isdir(os.path.join(CLOUD, "worker")):  # the image arrives in a later slice
-        shutil.copytree(os.path.join(CLOUD, "worker"), os.path.join(out, "image", "worker"))
+        shutil.copytree(os.path.join(CLOUD, "worker"), os.path.join(out, "image", "worker"), ignore=shutil.ignore_patterns("__pycache__"))
     if build_log:
         shutil.copy(build_log, os.path.join(out, "image", "build.log"))
     k8s = os.path.join(CLOUD, "k8s")
@@ -80,7 +80,7 @@ def build_surfaces(out, build_log):
     put(state, json.dumps({"pods": {}}))
     env = {"CW_KUBECTL": os.path.join(CLOUD, "launcher", "tests", "fake_kubectl"), "FAKE_KUBE_STATE": state,
            "CW_CLOUD_AUDIT": os.path.join(work, "audit.jsonl"), "CW_CLOUD_IMAGE": "registry.example.internal/cw-worker:1",
-           "CW_TOKEN_ENDPOINT": "https://tokens.example.internal/mint", "CW_CLOUD_DOMAIN": "example.internal", "CW_KUBE_CONTEXT": "acme-cw"}
+           "CW_TOKEN_ENDPOINT": "https://tokens.example.internal/mint", "CW_CLOUD_DOMAIN": "example.internal", "CW_KUBE_CONTEXT": "acme-cw", "CW_ALLOWED_REPOS": "acme-org/widget-service"}
     log = []
     for argv in (["create", "coder7", "--repo", "acme-org/widget-service", "--branch", "main"],
                  ["extend", "coder7", "--hard", "3h"], ["status", "--json"],
@@ -124,6 +124,30 @@ def prefix_misses(pod):
     return miss
 
 
+# Environment variables the cloud code and the image entrypoint READ or SET: ours carry the cw prefix. Standard ones of
+# the platform, of git, gh and OpenCode are not ours; WORKER_DOCKER pre-dates the prefix rule and is named in the image docs.
+STANDARD_ENV = re.compile(r"^(HOME|PATH|TMPDIR|USER|PWD|XDG_[A-Z_]+|KUBECONFIG|GIT_[A-Z_]+|GH_(TOKEN|REPO)|OPENCODE_SERVER_PASSWORD|WORKER_DOCKER)$")
+SOURCE_ENV_FILES = ("launcher/run_task.py", "worker/entrypoint.sh")
+ENV_READS = (re.compile(r"(?:env|environ|os\.environ)(?:\.get\(|\[)\s*[\"']([A-Z][A-Z0-9_]*)[\"']"),   # python
+             re.compile(r"\$\{([A-Z][A-Z0-9_]*):?[-=?+]"), re.compile(r"(?:^|[\s;])export\s+([A-Z][A-Z0-9_]*)"))   # shell
+
+
+def source_misses(files):
+    """Environment names read or exported by these files that are neither ours (cw prefix) nor a standard one."""
+    miss = []
+    for f in files:
+        try:
+            text = open(f, errors="replace").read()
+        except OSError:
+            miss.append("unreadable source " + os.path.basename(f))
+            continue
+        for pat in ENV_READS:
+            for name in sorted({m.group(1) for m in pat.finditer(text)}):
+                if not name.startswith("CW_") and not STANDARD_ENV.match(name):
+                    miss.append("env %s read in %s" % (name, os.path.basename(f)))
+    return sorted(set(miss))
+
+
 def hit_fields(line, pats):
     """For a JSON line, name the fields (never their values) that hold a hit."""
     try:
@@ -164,6 +188,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--surfaces")
     ap.add_argument("--build-log")
+    ap.add_argument("--extra-source", action="append", default=[], help="another source file whose environment names are checked (tests)")
     a = ap.parse_args()
     words = load_words()
     miss = []
@@ -172,6 +197,7 @@ def main():
     else:
         root = tempfile.mkdtemp(prefix="cw-surfaces-", dir=os.environ.get("CW_CHECK_TMP"))
         miss = prefix_misses(build_surfaces(root, a.build_log))
+    miss += source_misses([os.path.join(CLOUD, f) for f in SOURCE_ENV_FILES] + a.extra_source)
     hits = scan(root, words)
     for m in miss:
         print("name without the cw prefix: " + m)

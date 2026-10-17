@@ -6,8 +6,11 @@ Part of the cloud-worker prototype (plan scenarios S10 and S12). Two pieces:
   and `scan-secrets.sh`, a build-failing scan for stored credentials.
 - `k8s/`: the RuntimeClass and a DaemonSet that repairs the containerd registration of Sysbox on a node, repeatably.
 
-This image takes everything it needs from the environment at start and stores nothing. The launcher, run secrets,
-service account and driver are later pull requests; this one is only the image, the scan and the node fix.
+This image takes everything it needs from the environment and mounted files at start and stores nothing. The launcher
+(`cloud/launcher/`) supplies the per-run files; the entrypoint installs them (next section) and the operator driver
+(`cloud/launcher/run_task.py`) runs one task end to end.
+
+Cloud workers serve the organisation's repositories only; no task, test or demo of the tooling that runs the workers runs in a cloud worker.
 
 ## What is in the image
 
@@ -18,6 +21,83 @@ launcher's end hook and token mint are copied in as `cw-end-hook` and `cw-token-
 the entrypoint uses it to start the nested `dockerd` and then execs the command. Default command:
 `opencode serve --hostname 0.0.0.0 --port 4096`. Set `WORKER_DOCKER=0` to skip the Docker daemon. No credential is
 built in: `OPENCODE_SERVER_PASSWORD`, `GH_TOKEN` and any cloud identity are supplied by the launcher at run time.
+
+## Per-run secrets in the image
+
+The launcher mounts per-run files read-only under `/run/cw` (`CW_RUN_DIR`). The entrypoint, which never prints a value:
+
+- `server-password`: read into `OPENCODE_SERVER_PASSWORD` for the server it starts (OpenCode reads the password only from its environment).
+- `model-auth`: the model provider's access entry (JSON), copied with mode 600 to `<tmpfs>/data/opencode/auth.json` (`XDG_DATA_HOME`), so the server refreshes its short-lived token in the copy and never in the Secret. A model config naming `CW_MODEL` (default `github-copilot/claude-sonnet-5.5`) is written beside it (`XDG_CONFIG_HOME`); it holds no secret.
+- `git-token`: never copied. A git credential helper (`git config --global`, so every process of the worker user sees it, including a fresh-environment `kubectl exec` such as the end hook) and a `gh` wrapper read the file at call time. The helper answers only for `https://github.com`; the token is never in git config, argv or the environment. The directory is the path baked in when the files were generated (a caller's `CW_RUN_DIR` changes nothing), and at every call an unreadable or empty token file makes both fail with one line and a non-zero exit (never an empty password, never a `gh` with an empty token). The `gh` wrapper passes every subcommand: the guard is the token's own permissions (a per-run, one-repository App token), not the wrapper. The server password is in the server's environment, so every process the agent starts can read it; that is accepted by design.
+
+A file that is absent is skipped (a pod started without per-run secrets). A file that is present but unreadable or empty
+refuses the start with one line naming it; there is no fallback to another source. The tmpfs is `CW_TMP_DIR` (default `/run/cw-tmp`).
+
+## The worker's rules in the pod (a convenience, not the guard)
+
+A cloud worker holds the same rules a local agent has. The entrypoint writes an OpenCode config (on tmpfs, no secret in it)
+that defines a `worker` agent (`worker.md`, with the STOP rules in prose) and denies, for the shell tool and for every agent, six
+kinds of command: merging a pull request (`gh pr merge`, the API merge call, the GraphQL merge mutations), force-pushing
+(`--force`, `-f`, `--force-with-lease`, `+ref`), pushing to the default branch, writing issues, writing labels, and
+repository settings calls (`gh repo edit/delete/archive`, `gh api` with PATCH/PUT/DELETE, branch protection, rulesets,
+webhooks, secrets). The `gh` and `git` wrappers first on the worker's PATH (installed with the token file) refuse the same
+six with exit status 3 and one line, `refused: <what>: the repository's rules are the guard; this wrapper is only a
+convenience`; the line names a fixed phrase and never an argument value. Everything else passes unchanged (the `gh` wrapper
+still reads the token file at call time).
+
+What this is NOT: the guard. Both layers are defence in depth and can be bypassed: calling the real binary by its path,
+another HTTP client or a script skips the wrapper, and a pattern is only text matching. The guard is the repository's own
+rules (branch protection or a ruleset that forbids merge by the worker, pushes to the default branch and force-pushes) and
+the token's scope (the preflight, #545). Known limits: the `permission.bash` block was checked to load and convert in a local OpenCode 2.0.28 server (it becomes `shell` deny rules), but that server did not list the `worker` agent in isolation, so the agent definition is not proven to register or to be the default (no `default_agent` is set); the global deny block applies to every agent either way. the config's patterns name `main` and `master` only (the wrapper
+also reads `CW_DEFAULT_BRANCH`, space or comma separated, and `origin/HEAD`), `git push` from a checkout of the default
+branch is refused by the wrapper only, and the config's patterns can over-refuse (a branch named `fix-main-menu`). A
+missing guard file refuses the start. Tests: `cloud/worker/tests/test_guard.py`.
+
+### What else the wrapper refuses, and what it leaves (review round)
+
+Beyond the six, the wrapper (and, where a text pattern can say it, the OpenCode config) refuses:
+
+- **Aliases are covered.** `gh alias set|import|delete`, `git config` of any `alias.*` key and `git -c alias.*` (also `--config-env`) are refused, and a first word of `gh` it does not know is refused as a possible alias (`gh m 5`). A built-in command passes. The config cannot name an unknown word, so that part is the wrapper's only. Extensions are refused too (`gh extension install`, and any `gh extension` except `list|search|browse`); an installed extension's own name is an unknown word.
+- **`gh api` endpoints** are read after a scheme, host, port, userinfo, query, fragment and leading or trailing slash are stripped (`https://api.github.com/repos/o/r/pulls/5/merge` is the merge call). An endpoint it cannot parse (`%` escapes, `..`, a bare scheme) is refused. GraphQL passes only when the query is a plain `-f query=...` on the command line; a query from a file, `-F query=@...`, `--input` or stdin is refused, because the wrapper cannot read it.
+- **Short-flag clusters** of `gh api` are read letter by letter (`-iX PUT` is `-i` and `-X PUT`; a value-taking letter `X H q t p f F` takes the rest of the cluster or the next word); a cluster with any other letter, or a second endpoint word, is refused. The `gh api` path is folded to lower case before matching.
+- **Git's environment configuration is refused**: any `git` command when `GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`, any `GIT_CONFIG_KEY_*`, `GIT_CONFIG_GLOBAL` or `GIT_CONFIG_SYSTEM` is set and not empty, because they carry the `alias.*` and `push.default` overrides the `-c` refusals cover. The pod's own credential helper is written to `~/.gitconfig` (a file) and the entrypoint exports none of these, so the worker's own git is not affected. `GH_CONFIG_DIR` is not refused: a `gh` alias only expands for a first word `gh` does not know, and the wrapper refuses every such word. `git config` passes as a read only in the exact shape one read mode (`--get`, `--list`, `-l` ...), scope flags, at most one key; any other shape is judged word by word, so an `alias.*` or `push.default` is refused. `gh config set` is refused.
+- **`git push`**: a refspec with `*`, any `push.default` override (`-c`, `git config`), and the `--repo=`, `--receive-pack=` and `--exec=` forms are handled by name.
+- **Approving or dismissing a review is refused** (`gh pr review` in any form, and `gh api` writes under `repos/*/pulls/*/reviews`), because a bot approval can count toward a required-reviews rule on another pull request. `gh pr close`, `ready`, `reopen` and `comment` are NOT refused: they act on the worker's own pull request and grant nothing another one relies on; the repository's ruleset (who may approve, who may merge) is what stops an approval counting.
+- Also refused: `gh pr edit --add-assignee|--remove-assignee`, `gh workflow run|enable|disable`, `gh release create|edit|delete|upload`, `gh run rerun|cancel`, `gh api` writes to `repos/*/dispatches`, `.../git/refs` (any write), `.../releases` and `orgs/*`. `gh ruleset` is only reads (`list`, `view`, `check`), so it is no longer refused.
+- Known over-refusals: the config's patterns refuse a read of `.../reviews`, `.../dispatches`, `.../git/refs`, `.../releases` or `orgs/*` through `gh api` (the wrapper lets a GET through), and a branch such as `fix-main-menu` (a `main` pattern); an unknown first word of `gh` is refused (so a new `gh` command is refused too until the list in `guard.sh` is updated).
+- Known passes: when `origin/HEAD` cannot be read the default branch is only `main`, `master` and `CW_DEFAULT_BRANCH`; the config cannot say a literal `*` refspec, so that is the wrapper's only; an option the parser cannot read passes.
+
+The OpenCode config is written under the worker's own tmpfs, so the worker user can edit it, and a repository's own `opencode.json` is merged over it by OpenCode (not run here: whether a later file can lift a `deny` is unproven). The deny rules are a convenience. `"*": "allow"` followed by the denies is allow-by-default for the shell tool: it grants nothing the pod could not already do, and narrows nothing by itself. The guard is the repository's rules and the token's scope.
+
+## The operator driver
+
+```sh
+export CW_KUBE_CONTEXT=<context>      # or CW_CLOUD_SERVER + CW_CLOUD_TOKEN_FILE, as the launcher
+cloud/launcher/run_task.py WORKER OWNER/NAME BRANCH BRIEF_FILE [--pull-secret NAME] [--image IMAGE]
+```
+
+The target repository is an argument and has no default. The driver reads the model entry (the `github-copilot` entry of
+`CW_MODEL_AUTH_FILE`, default `~/.local/share/opencode/auth.json`) and a git token (the output of `CW_GIT_TOKEN_CMD`;
+default `app_token.py OWNER/NAME` beside the driver, the one-hour GitHub App token) in memory, creates the pod through
+the launcher with both handed over inherited pipes (`--run-secret-fd`), port-forwards, opens a session, sends the brief,
+waits for idle, then stops the worker (the end hook pushes the work; the pod and its Secrets are deleted).
+
+- A normal end, a failure and an interrupt (SIGINT, SIGTERM) all clean up, and it says exactly once
+  `per-run secret NAME-run cleaned` or `per-run secret NAME-run REMAINS: delete it with: <command>`.
+- A worker whose end hook cannot push is kept so the work is not lost; its per-run Secret is still deleted and the
+  pod's name and delete command are printed.
+- Every line it prints passes through the launcher's one `scrub()`. No secret is in an argument, an environment
+  variable of a child, a log or a file; the only file is a private temporary directory (`CW_TMPDIR`) holding the
+  port-forward's own log, removed at exit. The server password comes back on a pipe and stays in memory.
+- A missing or unreadable input (auth file, entry, token command, brief) refuses before anything is created. A second run
+  with a worker name that exists refuses and changes nothing. So does a run that LOSES a race for the name (another run made
+  the worker while this one minted its token): the launcher exits with its own code (7, "already exists") and the driver
+  returns without an end hook and without deleting anything. The driver acts on a worker only when it can prove it is
+  its own: a nonce it chose before the create is set (`--run-id`) on the pod and Secrets as `cw/run-id` and read back;
+  no match, or no answer, leaves it whole. The launcher makes the password Secret, the per-run Secret and the pod with `kubectl create` (exclusive: of two simultaneous creates exactly one wins, the other exits 7 having made nothing), and its own cleanup deletes only objects that carry its `--run-id`. A per-run Secret with no run id (a crash before it was labelled) is never guessed at: it is reported with the exact delete command (and says the delete command when ownership could not be read).
+- A kill with SIGKILL cannot be cleaned by the driver: the launcher's `delete` or the reaper removes what remains.
+
+Tests: `bin/test-cloud-launcher` (driver, fake kubectl), `cloud/tests/test-cloud` (entrypoint, stub server).
 
 ## The Sysbox node fix
 
