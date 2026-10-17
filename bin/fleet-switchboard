@@ -21028,7 +21028,7 @@ SUMMARY_FLOWCHART_LABELS = ("Changes", "Touches", "Irreversible", "Risk")
 _SUMMARY_LABEL = re.compile(r'[\["(]\s*(%s)\s*:' % "|".join(SUMMARY_FLOWCHART_LABELS), re.A | re.I)   # built from the tuple: one list of labels
 _SUMMARY_LINE_MAX = 400   # a box label is short: the rest of a longer line is not looked at
 _SUMMARY_BODY_MAX = 1 << 20   # a body is cut at 1 MB for this check (GitHub's own limit is 65536 characters)
-_SUMMARY_FENCE_RE = re.compile(r"^[ \t>]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?(`{3,}|~{3,})(.*)$")   # a fence at any indent, inside a blockquote, or opened on a list marker line: GitHub renders those too
+_SUMMARY_FENCE_RE = re.compile(r"^(?:[ \t>]|[-*+][ \t]|\d{1,9}[.)][ \t])*(`{3,}|~{3,})(.*)$")   # a fence at any indent, inside quotes, or opened after any run of quote marks and list markers: GitHub renders those too (each prefix piece starts with a different character, so the run has one way to match: linear)
 SUMMARY_FLOWCHART_DEFECT = ("the body holds the generated summary flowchart (a Mermaid diagram whose boxes are Changes:, Touches:, Irreversible:, Risk:): remove it; "
                             "a diagram is only for data flow, system design or component design")
 
@@ -21037,19 +21037,23 @@ def summary_flowchart_found(body):
     """True when a Mermaid fence ANYWHERE in the body holds the four labelled boxes of the generated summary flowchart (Changes:, Touches:, Irreversible:, Risk:). One
     pass over the lines under a step budget; each line is cut to _SUMMARY_LINE_MAX; fences are read as the held-body scan reads them (three or more backticks or
     tildes, closed by the same character at least as long, an unclosed fence running to the end) but at ANY indent and behind blockquote marks, since GitHub renders a fence
-    nested in a list item or a quote; it is a lint for the generator's own output (a renamed label is not caught), not a boundary; no lowered copy is indexed
+    nested in a list item or a quote; it is a lint for the generator's own output (a renamed label is not caught, and it errs toward finding it: a closing line written `- ```` counts), not a boundary; no lowered copy is indexed
     (ASCII-only folding). A diagram that shows data flow (without all four labels in ONE fence) is not it."""
-    lines = str(body or "")[:_SUMMARY_BODY_MAX].split("\n")
+    lines = str(body or "")[:_SUMMARY_BODY_MAX].splitlines()   # any line break, CR-only included
     budget = _held_steps(len(lines))
     fence, mermaid, seen = None, False, set()
     for line in lines:
         _held_spend(budget)
         text = line[:_SUMMARY_LINE_MAX]
         found = _SUMMARY_FENCE_RE.match(text)
+        opens = found and not (found.group(1)[0] == "`" and "`" in found.group(2))
+        words = found.group(2).split() if opens else []
+        if opens and words and _ascii_lower(words[0]) == "mermaid":   # a Mermaid opener always (re)starts the scan, even inside a decoy fence: a decoy cannot hide the real one
+            fence, mermaid, seen = (found.group(1)[0], len(found.group(1))), True, set()
+            continue
         if fence is None:
-            if found and not (found.group(1)[0] == "`" and "`" in found.group(2)):
-                words = found.group(2).split()
-                fence, mermaid, seen = (found.group(1)[0], len(found.group(1))), bool(words) and _ascii_lower(words[0]) == "mermaid", set()
+            if opens:
+                fence, mermaid, seen = (found.group(1)[0], len(found.group(1))), False, set()
             continue
         if found and found.group(1)[0] == fence[0] and len(found.group(1)) >= fence[1] and not found.group(2).strip():
             if mermaid and len(seen) == len(SUMMARY_FLOWCHART_LABELS):
