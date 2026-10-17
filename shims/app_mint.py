@@ -40,7 +40,7 @@ MARGIN_SECONDS = 300          # a cached token with less than this left is not u
 LIFETIME_CAP = 3600           # a token is never trusted for longer than an hour, whatever the endpoint said
 HTTP_SECONDS = 10.0
 KEY_COMMAND_SECONDS = 15.0
-KEY_MAX_BYTES = 16384
+KEY_MAX_BYTES = 8192   # well under the smallest pipe capacity (16 KiB): the key is written without blocking
 OWN_REPO_NAME = "fleet-kit"   # this kit's own repository stays with local workers: never mappable, under any owner
 TOKEN_RE = re.compile(r"[A-Za-z0-9_]{8,255}")
 PERMISSION_RE = re.compile(r"[a-z][a-z_]{0,63}")
@@ -200,11 +200,15 @@ def sign(data, pem):
     openssl = find_openssl()
     read_end, write_end = os.pipe()
     try:
-        os.write(write_end, pem)       # a key is well under the pipe's capacity
+        os.set_blocking(write_end, False)
+        if os.write(write_end, pem) != len(pem):   # never blocks: a short write is a refusal, not a hang
+            raise MintRefused("the key could not be passed to openssl")
         os.close(write_end)
         write_end = None
         done = subprocess.run([openssl, "dgst", "-sha256", "-sign", "/dev/fd/%d" % read_end], input=data, capture_output=True, env={},
                               pass_fds=(read_end,), timeout=HTTP_SECONDS)
+    except MintRefused:
+        raise
     except Exception:
         raise MintRefused("the App JWT could not be signed")
     finally:

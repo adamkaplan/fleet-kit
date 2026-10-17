@@ -31,7 +31,7 @@ APP_ID, INSTALL = 123456, 7654321
 KEY_FILE_NAME = "app-key.pem"
 
 FAKE_GH = """#!/usr/bin/env python3
-import json, os, sys
+import json, os, sys, time
 a = sys.argv[1:]
 cfg = os.environ.get("GH_CONFIG_DIR")
 token = None
@@ -41,6 +41,8 @@ if cfg:
             token = line.split(":", 1)[1].strip()
 open(os.environ["FAKE_CALLS"], "a").write(json.dumps({"argv": a, "token": token or os.environ.get("GH_TOKEN"), "from_file": bool(token),
                                                        "env": dict(os.environ), "config_dir": cfg, "dir_mode": oct(os.stat(cfg).st_mode & 0o777) if cfg else None}) + "\\n")
+if os.environ.get("FAKE_SLEEP"):
+    time.sleep(30)
 if a[:2] == ["auth", "token"]:
     print(os.environ.get("FAKE_STORED", "stored_login_token")); sys.exit(0)
 if a[:2] == ["auth", "git-credential"]:
@@ -56,7 +58,7 @@ class Endpoint:
 
     def __init__(self, pub):
         self.pub, self.requests, self.status, self.permissions, self.token = pub, [], 201, None, TOKEN
-        self.raw, self.delay, self.install_status, self.expires_in, self.extra = None, 0, 200, 3600, {}
+        self.raw, self.delay, self.install_status, self.expires_in, self.extra, self.location = None, 0, 200, 3600, {}, None
         endpoint = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -83,6 +85,8 @@ class Endpoint:
             def reply(self, status, obj, raw=None):
                 data = raw.encode() if raw is not None else json.dumps(obj).encode()
                 self.send_response(status)
+                if endpoint.location:
+                    self.send_header("Location", endpoint.location)
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
@@ -140,7 +144,7 @@ class Base(unittest.TestCase):
         self.addCleanup(shutil.rmtree, str(self.home), True)
         e = self.endpoint
         e.requests.clear()
-        e.status, e.permissions, e.token, e.raw, e.delay, e.install_status, e.expires_in, e.extra = 201, None, TOKEN, None, 0, 200, 3600, {}
+        e.status, e.permissions, e.token, e.raw, e.delay, e.install_status, e.expires_in, e.extra, e.location = 201, None, TOKEN, None, 0, 200, 3600, {}, None
         self.bin = self.home / "realbin"
         self.bin.mkdir()
         for name, text in (("gh", FAKE_GH), ("git", FAKE_GIT)):
@@ -240,7 +244,8 @@ class TestToken(Base):
     def test_s2_the_real_gh_reads_the_token_from_the_private_hosts_file(self):
         real = shutil.which("gh", path=":".join(p for p in os.environ.get("PATH", "").split(":") if "shims" not in p))
         mod = self.module()
-        directory = mod.write_hosts_dir(TOKEN) if self.load(mod) is not None or True else None
+        self.load(mod)
+        directory = mod.write_hosts_dir(TOKEN)
         self.addCleanup(mod.remove_dir, directory)
         env = {"PATH": SAFE_PATH, "HOME": str(self.home), "GH_CONFIG_DIR": directory}
         done = subprocess.run([real, "auth", "git-credential", "get"], input="protocol=https\nhost=github.com\n\n", capture_output=True, text=True, env=env, timeout=30)
@@ -298,7 +303,8 @@ class TestFailClosed(Base):
                 self.setUp()
                 setup()
                 self.refused()
-                self.assertEqual(self.endpoint.mints() if name.startswith("mint") or name.startswith("unparse") else [], self.endpoint.mints())
+                if not (name.startswith("mint") or name.startswith("unparse")):
+                    self.assertEqual(self.endpoint.mints(), [], "a refusal before the mint asks the endpoint for nothing")
 
     def test_s4_a_timeout_refuses(self):
         self.endpoint.delay = 1.5
@@ -523,6 +529,83 @@ print("real gh out")'''))
         self.assertEqual(done.returncode, 1, done.stderr)
         self.assertIn("held by the owner", done.stderr)
         self.assertFalse([c for c in calls if c["argv"][:2] == ["pr", "merge"]], "the refused merge never reaches gh")
+
+
+class TestHardening(Base):
+    def test_extension_and_alias_for_a_mapped_repository_use_the_token(self):
+        for group in ("extension", "alias", "auth"):
+            with self.subTest(group):
+                self.setUp()
+                done, calls = self.gh(group, "exec" if group == "extension" else "list")
+                self.assertEqual([c["token"] for c in calls], [TOKEN])
+                self.assertNotIn(STORED, json.dumps(calls[0]["env"]))
+
+    def test_a_command_that_names_a_mapped_repository_uses_the_token_whoever_the_caller_is(self):
+        self.repo = OTHER
+        done, calls = self.gh("issue", "comment", "7", "--body", "x", "-R", MAPPED)
+        self.assertEqual([c["token"] for c in calls], [TOKEN])
+
+    def test_no_switchboard_or_no_identity_refuses_when_the_app_is_configured(self):
+        done, calls = self.gh("issue", "view", "7", env={"FLEET_SWITCHBOARD_BIN": "relative-not-absolute"})
+        self.assertEqual((done.returncode, calls), (1, []))
+        self.assertIn("stored login is not used", done.stderr)
+        self.repo = ""
+        done, calls = self.gh("issue", "view", "7")
+        self.assertEqual((done.returncode, calls), (1, []))
+        self.assertIn("stored login is not used", done.stderr)
+
+    def test_an_unwritable_state_directory_refuses_and_never_uses_the_stored_login(self):
+        (self.state / "app-run").write_text("a file where the directory should be")
+        done, calls = self.gh("issue", "view", "7")
+        self.assertEqual((done.returncode, calls), (1, []))
+        self.assertIn("stored login is not used", done.stderr)
+
+    def test_with_only_app_mappings_an_unmapped_repository_keeps_the_stored_login_through_gh_and_git_credentials(self):
+        self.write_config(gh_users=None)
+        self.repo = OTHER
+        done, calls = self.gh("issue", "view", "7")
+        self.assertEqual({c["token"] for c in calls} - {None}, {STORED})
+        done, calls = self.gh("auth", "git-credential", "get", stdin="host=github.com\n\n")
+        self.assertIn("password=" + STORED, done.stdout, done.stderr)
+        self.assertEqual(self.endpoint.requests, [])
+
+    def test_a_killed_shim_removes_the_token_file_and_stops_its_child(self):
+        env = self.environ({"FAKE_SLEEP": "1", "FAKE_CALLS": str(self.calls)})
+        proc = subprocess.Popen([sys.executable, str(GH_SHIM), "issue", "view", "7"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(proc.kill)
+        deadline = time.time() + 30
+        while time.time() < deadline and not self.calls.exists():
+            time.sleep(0.05)
+        self.assertTrue(self.calls.exists(), "the real gh was started")
+        self.assertTrue(list((self.state / "app-run").iterdir()), "the token file exists while gh runs")
+        proc.terminate()
+        self.assertEqual(proc.wait(timeout=30), 128 + 15)
+        self.assertEqual(list((self.state / "app-run").iterdir()), [])
+
+    def test_a_stale_token_directory_is_swept_by_the_next_call_and_a_fresh_one_is_kept(self):
+        run = self.state / "app-run"
+        run.mkdir(mode=0o700)
+        old, fresh = run / "gh-old", run / "gh-fresh"
+        for d in (old, fresh):
+            d.mkdir()
+        os.utime(str(old), (time.time() - 7200, time.time() - 7200))
+        self.gh("issue", "view", "7")
+        self.assertFalse(old.exists())
+        self.assertTrue(fresh.exists())
+
+    def test_a_redirect_from_the_mint_endpoint_is_refused_and_never_followed(self):
+        self.endpoint.status, self.endpoint.location = 302, self.endpoint.url + "/elsewhere"
+        done, calls = self.gh("issue", "comment", "7", "--body", "x")
+        self.assertEqual((done.returncode, calls), (1, []))
+        self.assertFalse([r for r in self.endpoint.requests if r["path"] == "/elsewhere"], "the signed JWT is never sent to the redirect target")
+
+    def test_a_key_that_is_too_large_to_pass_without_blocking_is_refused(self):
+        big = self.home / "big.pem"
+        big.write_text("-----BEGIN PRIVATE " + "KEY-----\n" + "A" * 9000 + "\n-----END PRIVATE " + "KEY-----\n")
+        big.chmod(0o600)
+        self.write_config(app_key_path=str(big))
+        done, calls = self.gh("issue", "view", "7")
+        self.assertEqual((done.returncode, calls), (1, []))
 
 
 class TestConfigLoad(Base):
