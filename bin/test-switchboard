@@ -41332,7 +41332,9 @@ class TestHeldSummaryFlowchart(unittest.TestCase):
                  ("a four backtick fence", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + self.SUMMARY.replace("```", "````")),
                  ("an indented fence", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + self.SUMMARY.replace("```mermaid", "   ```mermaid")),
                  ("a fence in a blockquote", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + "".join("> " + l + "\n" for l in self.SUMMARY.splitlines())),
-                 ("a fence in a list item", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + "- an item\n\n" + "".join("      " + l + "\n" for l in self.SUMMARY.splitlines())),
+                 ("a fence in a list item", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + "- an item\n" + "".join("  " + l + "\n" for l in self.SUMMARY.splitlines())),
+                 ("a fence opened on the bullet line", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + "- " + self.SUMMARY.replace("\n  ", "\n  ")),
+                 ("a fence opened on a numbered line", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + "1. " + self.SUMMARY),
                  ("an unclosed fence", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + self.SUMMARY.rsplit("```", 1)[0]))
         for name, body in cases:
             with self.subTest(case=name):
@@ -41364,12 +41366,16 @@ class TestHeldSummaryFlowchart(unittest.TestCase):
         unit = '```mermaid\n["Changes: ["Touches: ["Irreversible: ' + "\u0130\u212a" * 20 + '\n'
         body = (unit * 400 + "[" * 20000 + ("```\n" + '"Risk:' * 5) * 2000)[:65536]
         self.assertEqual(len(body), 65536)
-        begun = time.time()
-        self.defects(TestHeldTop.OPEN + body[:65000])
-        self.assertLess(time.time() - begun, 0.5, "plan S5: a quadratic scan takes seconds on this body")
-        begun = time.time()
+        def best(call):   # the plan's bound (S5: under 0.5 s) on the best of three runs, so a loaded runner's one slow run is not a failure
+            took = []
+            for _ in range(3):
+                begun = time.time()
+                call()
+                took.append(time.time() - begun)
+            return min(took)
+        self.assertLess(best(lambda: self.defects(TestHeldTop.OPEN + body[:65000])), 0.5, "plan S5: a quadratic scan takes seconds on this body")
         self.assertTrue(sb.summary_flowchart_found(self.SUMMARY * 400))   # 64 KB of the real thing
-        self.assertLess(time.time() - begun, 0.5)
+        self.assertLess(best(lambda: sb.summary_flowchart_found(self.SUMMARY * 400)), 0.5)
         # by construction: the detector spends one step per line from a budget, so it cannot run on
         with mock.patch.object(sb, "_held_steps", return_value=[3]):
             with self.assertRaises(ValueError):
@@ -41380,6 +41386,16 @@ class TestHeldSummaryFlowchart(unittest.TestCase):
         padded = self.SUMMARY.replace('B["Touches', 'B["' + " " * sb._SUMMARY_LINE_MAX + 'Touches')
         self.assertFalse(sb.summary_flowchart_found(padded))
         self.assertFalse(sb.summary_flowchart_found("x" * sb._SUMMARY_BODY_MAX + "\n" + self.SUMMARY))
+
+    def test_pr_explain_check_on_a_held_body_names_the_flowchart_on_one_line(self):
+        """The combined path: the explainer check and the held check both see the flowchart, and the command prints it once."""
+        pr = {"title": "t", "state": "OPEN", "labels": [{"name": "me:merge-captain"}], "files": [], "additions": 1, "deletions": 0, "changedFiles": 1,
+              "body": TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + self.SUMMARY}
+        with mock.patch.object(sb, "read_pr_json", return_value=pr), mock.patch.object(sb, "build_engine", return_value=(mock.Mock(), None, None)):
+            with captured() as (out, err):
+                code = sb.main(["pr-explain", "acme/api#7", "--check"])
+        self.assertEqual(code, 1, out.getvalue() + err.getvalue())
+        self.assertEqual(out.getvalue().count("generated summary flowchart"), 1, out.getvalue())
 
     def test_the_explainer_check_names_the_flowchart_once_with_or_without_a_block(self):
         self.assertEqual(sum("generated summary flowchart" in d for d in sb.explainer_defects(self.SUMMARY)), 1)

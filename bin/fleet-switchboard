@@ -21028,7 +21028,7 @@ SUMMARY_FLOWCHART_LABELS = ("Changes", "Touches", "Irreversible", "Risk")
 _SUMMARY_LABEL = re.compile(r'[\["(]\s*(%s)\s*:' % "|".join(SUMMARY_FLOWCHART_LABELS), re.A | re.I)   # built from the tuple: one list of labels
 _SUMMARY_LINE_MAX = 400   # a box label is short: the rest of a longer line is not looked at
 _SUMMARY_BODY_MAX = 1 << 20   # a body is cut at 1 MB for this check (GitHub's own limit is 65536 characters)
-_SUMMARY_FENCE_RE = re.compile(r"^[ \t>]*(`{3,}|~{3,})(.*)$")   # a fence at any indent or inside a blockquote or list item: GitHub renders those too
+_SUMMARY_FENCE_RE = re.compile(r"^[ \t>]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?(`{3,}|~{3,})(.*)$")   # a fence at any indent, inside a blockquote, or opened on a list marker line: GitHub renders those too
 SUMMARY_FLOWCHART_DEFECT = ("the body holds the generated summary flowchart (a Mermaid diagram whose boxes are Changes:, Touches:, Irreversible:, Risk:): remove it; "
                             "a diagram is only for data flow, system design or component design")
 
