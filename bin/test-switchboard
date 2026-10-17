@@ -25981,6 +25981,27 @@ class TestPlanLedger(LedgerBase):
         self.assertEqual(code, 0, err)
         self.assertEqual(len(self.ledger()), 3)
 
+    def test_prove_is_not_already_recorded_for_another_head_or_another_plan_hash(self):
+        self.assertEqual(self.prove_many("coder", "U1")[0], 0)
+        self.pr["headRefOid"] = "b" * 40   # the head moved: the proof at the old head is void
+        code, out, err = self.prove_many("coder", "U1")
+        self.assertEqual((code, err), (0, ""))
+        self.assertRegex(out, r"^recorded proof #2: U1 pass at bbbbbbbb")
+        self.assertEqual([(e["scenario"], e["head"][:1]) for e in self.ledger()], [("U1", "a"), ("U1", "b")])
+        before = self.ledger()[-1]["plan_hash"]
+        self.plan_issue["body"] = LEDGER_PLAN.replace("exactly 1 agent named", "exactly one agent named")   # the plan changed: a new hash
+        code, out, err = self.prove_many("coder", "U1")
+        self.assertEqual((code, err), (0, ""))
+        self.assertRegex(out, r"^recorded proof #3: U1 pass at bbbbbbbb")
+        self.assertNotEqual(self.ledger()[-1]["plan_hash"], before)
+
+    def test_prove_of_the_only_named_id_missing_from_the_plan_exits_4_with_the_reason(self):
+        code, out, err = self.prove_many("coder", "S9")
+        self.assertEqual(code, 4)
+        self.assertEqual(out, "")
+        self.assertIn("not recorded: S9: the plan has no scenario S9", err)
+        self.assertEqual(self.ledger(), [])
+
     def test_prove_an_id_not_in_the_plan_is_refused_with_its_reason_and_the_rest_recorded(self):
         code, out, err = self.prove_many("coder", "S9", "U1")
         self.assertEqual(code, 4)
