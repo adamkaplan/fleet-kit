@@ -606,6 +606,12 @@ class TestHardening(Base):
         self.assertNotEqual(done.returncode, 0)
         self.assertNotIn("password=", done.stdout)
 
+    def test_a_non_chief_caller_with_no_repository_naming_an_unmapped_repository_is_as_before(self):
+        self.repo, self.own, self.role = MAPPED, False, "coder"
+        done, calls = self.gh("issue", "view", "7", "-R", OTHER)
+        self.assertEqual(self.endpoint.requests, [])
+        self.assertEqual({c["token"] for c in calls} - {None}, {STORED})
+
     def test_a_worker_naming_its_own_mapped_repository_gets_its_token(self):
         done, calls = self.gh("issue", "comment", "7", "--body", "x", "-R", MAPPED)
         self.assertEqual([c["token"] for c in calls], [TOKEN])
