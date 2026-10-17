@@ -338,6 +338,7 @@ DEFAULTS = {
     "heavy": None,                 # CPU slots for `heavy -- <command>` (full suites, e2e runs): None = 3 slots; or {"slots": n}
     "docker_reaper": True,         # the daily removal of EXPIRED labelled docker containers, networks and volumes (`disk reap-docker`): false is the kill switch
     "v2_events": "auto",           # the daemon's news of sessions: "auto" (the service's event stream, where the HTTP route exists; reads only what an event did not say) or "off" (the old reads)
+    "v2_plugin_events": "auto",    # the in-service plugin's pushed facts (#290 slice 6): "auto" (the daemon listens on its socket and marks the named session for one bounded read) or "off" (the session.list gate is the only signal)
     "v2_transport": "auto",        # how v2 calls travel: "auto" (HTTP to the service when it can, else the CLI) or "cli" (always `opencode api`: the kill switch)
     # The daemon's reads of v2 (every one is an `opencode api` process): what it may remember, and how much it may read.
     "v2_light": False,             # the owner's hotfix switch: ON turns OFF every optional read of session history (see V2_LIGHT_OFF); sends and writes are untouched
@@ -607,6 +608,8 @@ def validate_config(raw, source="config"):
         raise ConfigError("%s: 'docker_reaper' must be true or false, got %r" % (source, config["docker_reaper"]))
     if config["v2_events"] not in ("auto", "off"):
         raise ConfigError("%s: 'v2_events' must be \"auto\" or \"off\", got %r" % (source, config["v2_events"]))
+    if config["v2_plugin_events"] not in ("auto", "off"):
+        raise ConfigError("%s: 'v2_plugin_events' must be \"auto\" or \"off\", got %r" % (source, config["v2_plugin_events"]))
     if not isinstance(config["v2_light"], bool):
         raise ConfigError("%s: 'v2_light' must be true or false, got %r" % (source, config["v2_light"]))
     if config["v2_transport"] not in ("auto", "cli"):
@@ -3629,6 +3632,7 @@ FEED_PAGE = 1                    # messages in a resync or reconcile read (the n
 FEED_RECONCILES_PER_PASS = 2     # sessions reconciled in one pass: the work is spread, never a burst
 FEED_RESYNC_PER_PASS = 4         # sessions re-synced in one pass after a (re)connect: spread over passes, never a burst
 FEED_RESYNC_MIN_SECONDS = 120    # a session read this recently is not read again by a re-sync (a flapping stream cannot cause a read storm)
+FEED_PUSHED_PER_PASS = 4         # sessions the plugin named, read in one pass: one bounded read each, never a burst
 FEED_SESSIONS_MAX = 500
 FEED_BACKOFF_MAX = 60
 FEED_STABLE_SECONDS = 30         # a connection that lasted this long starts the reconnect wait over
@@ -3765,9 +3769,18 @@ class EventFeed:
             entry = self.seen.get(session_id)
             return entry is None or entry["read"] is None or (entry["event_at"] is not None and entry["event_at"] > entry["read"])
 
+    def touch(self, session_id, now=None):
+        """#290 slice 6: the plugin said something happened in this session. Only MARKS it: the pass thread makes the one bounded read (see `tick`)."""
+        with self.lock:
+            entry = self._entry(session_id)
+            moment = self.now() if now is None else now
+            entry["event_at"] = moment
+            entry["pushed"] = moment
+            self.counts["pushed"] = self.counts.get("pushed", 0) + 1
+
     def status(self):
         with self.lock:
-            return {"connected": self.connected, "events": self.counts["events"], "connects": self.counts["connects"], "resyncs": self.counts["resyncs"],
+            return {"pushed": self.counts.get("pushed", 0), "connected": self.connected, "events": self.counts["events"], "connects": self.counts["connects"], "resyncs": self.counts["resyncs"],
                     "missed": self.counts["missed"], "errors": self.counts["errors"], "read_errors": self.counts["read_errors"], "sessions": len(self.seen), "down": self.down_reason}
 
     def tick(self, engine, sessions):
@@ -3776,6 +3789,11 @@ class EventFeed:
         FEED_RECONCILE_SECONDS (`event.missed` when an assistant message landed that no event announced). A read that fails (the breaker is open, the
         service is slow) is simply tried again at the next pass. While the stream is down nothing is read here: the old reads are all there is."""
         now = self.now()
+        with self.lock:   # #290 slice 6: a session the plugin named since the last read: ONE bounded read each, at most FEED_PUSHED_PER_PASS a pass (a real event, so it needs no consumer and no stream)
+            pushed = sorted((s for s in sessions if self.seen.get(s) is not None and self.seen[s].get("pushed") is not None
+                             and (self.seen[s]["read"] is None or self.seen[s]["pushed"] > self.seen[s]["read"])), key=lambda s: self.seen[s]["pushed"])
+        for session in pushed[:FEED_PUSHED_PER_PASS]:
+            self._read(engine, session, now, announced=False)   # the push is itself the news: it is not a missed-event check
         with self.lock:
             if not self.connected or not self.consumers:
                 return   # down, or nobody uses what a read would find: no read
@@ -16002,8 +16020,8 @@ def cmd_run(args, runner, now, wait):
     engine.docker_reap_runner = runner   # the daily reap of expired labelled docker objects runs only in the real daemon
     hub = attach_github(engine, config, state, runner, now)
     start_event_feed(engine, config, now)
-    judge_server = start_judge_server(config, state, runner, now)  # PR 9: the daemon holds the key, not v2
-    if judge_server is not None:
+    judge_server = start_judge_server(config, state, runner, now, engine)  # PR 9: the daemon holds the key, not v2
+    if judge_server is not None and config["policy"]["enabled"]:
         engine.judge_warm = make_judge_warmer(config, runner, now)
     watch = ConfigWatch(config_path(), config, now, engine.audit, engine.actor,
                         lambda **fields: update_daemon_record(state, **fields), signature)
@@ -19099,7 +19117,9 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
         if review:
             decision = "hold"
     return {"pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude,
-            "floor_paths": hit, "files_read": len(files), "files_total": total, "renamed_no_source": renamed[:20], "complete": complete, "unknown": unknown, "rated": [list(r) for r in rated],
+            "floor_paths": hit, "files_read": len(files), "files_total": total, "renamed_no_source": renamed[:20], "complete": complete,
+            "top_tier_hits": impact_floor.top_tier_hits(paths, matrix), "review_action": record[0] if record else None, "review_class": record[1] if record else None,   # #661: display data the delegated clear reads; no decision changes
+            "changed_paths": [p for p in paths if isinstance(p, str)][:200], "unknown": unknown, "rated": [list(r) for r in rated],
             "decision": decision, "reasons": reasons, "owner_decision": owner[0], "owner_reasons": owner[1], "draft": raw.get("isDraft") is True}
 
 
@@ -20790,6 +20810,8 @@ def cmd_review(args, runner, now):
     its result per head). Reads GitHub with GETs only; `record` writes the hash-chained ledger and the audit."""
     if args.review_cmd == "measure":
         return cmd_review_measure(args, runner, now)
+    if args.review_cmd == "checkout":
+        return cmd_review_checkout(args, runner, now)
     try:
         engine, state, config = build_engine(runner, now, "cli", writable=args.review_cmd == "record")
         repo, number, ref, raw = _review_pr(args, engine)
@@ -20890,6 +20912,50 @@ def cmd_review(args, runner, now):
 
 
 cmd_review.direct = True   # no error mapping, no daemon start
+
+
+def cmd_review_checkout(args, runner, now):
+    """`review checkout <pr>` (#721): the PR's exact head tree, diff and base copies in `.review/<head sha>/` of the working directory, printed;
+    `review checkout --remove <dir>` removes a directory this command made. The head is read ONCE (or given) and used for every fetch."""
+    rc = load_module("review_checkout")
+    try:
+        if args.remove:
+            if args.pr or args.head:
+                raise ReviewError("--remove takes only the directory")
+            try:
+                removed = rc.remove(args.remove, os.getcwd())
+            except rc.Unsafe as err:
+                raise ReviewError("refused: %s" % err) from None
+            print("removed %s" % removed)
+            return EXIT_OK
+        if not args.pr:
+            raise ReviewError("give the pull request (owner/repo#N), or --remove <directory>")
+        engine, state, config = build_engine(runner, now, "cli", writable=False)
+        repo, number, ref, raw = _review_pr(args, engine)
+        head = args.head or raw.get("headRefOid")
+        base = raw.get("baseRefOid")
+        if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
+            raise ReviewError("the head must be a full 40-character commit sha (the PR's head is unknown, or --head is short)")
+        reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"], accounts=GhAccounts(config, runner, now))
+
+        def api(path):
+            try:
+                return reader._api(path, repo)
+            except IntentError as err:
+                raise rc.Problem("%s: %s" % (path.split("?")[0], _one_line(str(err), 160))) from None
+
+        try:
+            path = rc.checkout(api, repo, number, head, base, os.getcwd(), notify=lambda text: sys.stderr.write("%s: review checkout: %s\n" % (PROG, text)))
+        except rc.OverBound as err:
+            sys.stderr.write("%s: review checkout: refused, nothing left behind: %s\n" % (PROG, _one_line(str(err), 400)))
+            return EXIT_USAGE
+        except (rc.Unsafe, rc.Problem) as err:
+            raise ReviewError("refused, nothing left behind: %s" % err) from None
+        print(path)
+        return EXIT_OK
+    except (ReviewError, ConfigError, IdentityUncertain, CallerError) as err:
+        sys.stderr.write("%s: review: %s\n" % (PROG, _one_line(str(err), 400)))
+        return EXIT_ERROR
 
 
 # ---------------------------------------------------------------- `review measure` (#179, slice L7)
@@ -21050,6 +21116,10 @@ def add_review_parsers(sub):
                         help="The impact reviewer's action from the matrix")
     record.add_argument("--impact-class", dest="impact_class", help="The class of the impact that drives the action (a class of the matrix file's owner_hold block)")
     record.add_argument("--summary", help="One line (at most 200 characters)")
+    checkout = rsub.add_parser("checkout", help="Write the PR's exact head tree, its diff and the base copies of the touched files into .review/<head sha> here, read-only, and print the path; --remove <dir> removes one")
+    checkout.add_argument("pr", nargs="?", help="owner/repo#N or the PR's URL")
+    checkout.add_argument("--head", help="The commit to materialise (default: the PR's head, read once at the start)")
+    checkout.add_argument("--remove", metavar="DIR", help="Remove a directory this command made (restores the permissions it set; anything else is refused)")
     measure = rsub.add_parser("measure", help="Read-only: per merged PR, time to green CI, review rounds, findings, escaped defects; baseline and after medians")
     measure.add_argument("repo", help="owner/repo")
     measure.add_argument("--count", type=int, default=10, help="PRs per group (default 10)")
@@ -21507,8 +21577,9 @@ def add_impact_parsers(sub):
     hold = impact_sub.add_parser("hold", help="What the daemon would label as held right now (read-only dry run; the daemon writes the labels)")
     hold.add_argument("--dry-run", action="store_true", dest="dry_run")
     hold.add_argument("--repo", help="One repo (OWNER/REPO); default: every repo under plan_gates")
-    clear = impact_sub.add_parser("clear", help="The owner's own terminal only: clear a false impact hold for this head, with a reason")
+    clear = impact_sub.add_parser("clear", help="The owner's own terminal: clear a false impact hold for this head, with a reason (the Chief of Staff only under a standing order of the owner's, with --under-order)")
     clear.add_argument("pr", help="The pull request: owner/repo#N or its URL")
+    clear.add_argument("--under-order", type=int, dest="under_order", metavar="N", help="The Chief of Staff only: clear under the owner's standing order N (it must be listed under delegated_clear in the configuration); recorded as her act under that order")
     clear.add_argument("--reason", required=True, help="Why the hold is false (at least 10 characters), logged")
     clear.add_argument("--revoke", action="store_true", help="Take the clear back (and any carry of it): the PR is held again at the daemon's next pass")
 
@@ -22017,6 +22088,79 @@ def add_heavy_parsers(sub):
     heavy.add_argument("--short", action="store_true", help="The command is short: when the ordinary slots are busy it may use the one express slot, and the wrapper stops it after 120 seconds (exit 124)")
     heavy.add_argument("--name", help="Who the slot is held for (default: FLEET_HEAVY_NAME, the OpenCode session id, the user)")
     heavy.add_argument("command", nargs=argparse.REMAINDER, help="-- <command...>")
+
+
+# ---- `preflight-pr`: the CI-critical focused classes a coder skips, one PASS or FAIL line each. The ONE table of classes is PREFLIGHT_CLASSES.
+# (name, time ceiling in seconds, commands: each runs in turn under `heavy`, and the class passes when every one exits 0, when files change under: None = always)
+PREFLIGHT_CLASSES = (
+    ("cli-surface", 240, (("bin/test-switchboard", "-k", "TestSelfRegisteringCli"),), None),
+    ("hygiene", 240, (("bin/test-switchboard", "-k", "TestHygiene", "-k", "test_the_role_files_do_not_grow"),), None),
+    ("public-names", 60, (("python3", "bin/check-public-names"),), None),
+    ("cloud", 600, (("bin/test-cloud-worker",), ("bin/test-cloud-launcher",), ("cloud/tests/test-cloud",)), "cloud/"),
+)
+PREFLIGHT_TOKEN_LENGTH = 49   # the macOS-only path-length trap: a token-shaped directory name of this length under TMPDIR
+
+
+def preflight_changed(runner, root):
+    """The files changed against the base (merge-base with origin/main, else main), or None when no base can be found (the cloud class then runs: safe side)."""
+    for base in ("origin/main", "main"):
+        found = runner(["git", "merge-base", "HEAD", base], cwd=root, capture_output=True, text=True)
+        if found.returncode == 0 and found.stdout.strip():
+            diff = runner(["git", "diff", "--name-only", found.stdout.strip()], cwd=root, capture_output=True, text=True)
+            if diff.returncode == 0:
+                return diff.stdout.split()
+    return None
+
+
+def cmd_preflight_pr(args, runner, now):
+    """`preflight-pr`: run each class of PREFLIGHT_CLASSES under `heavy`, print one PASS or FAIL line per class, exit 1 when any fails. Only runs tests."""
+    top = runner(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    if top.returncode != 0:
+        sys.stderr.write("%s: preflight-pr: not inside a git work tree\n" % PROG)
+        return EXIT_USAGE
+    root = top.stdout.strip()
+    changed = preflight_changed(runner, root)
+    failed = 0
+    with tempfile.TemporaryDirectory(prefix="preflight-") as work:
+        for name, ceiling, commands, under in PREFLIGHT_CLASSES:
+            if under is not None and changed is not None and not any(path.startswith(under) for path in changed):
+                continue
+            env = dict(os.environ, FLEET_HEAVY_MAX_SECONDS=str(ceiling))   # the ceiling runs INSIDE the slot (heavy's watchdog starts when the slot is granted): a wait in the queue is never a timeout
+            sys.stderr.write("preflight-pr: %s: waiting for a slot, then running (ceiling %ds once running)\n" % (name, ceiling))
+            if under is not None:
+                scratch = os.path.join(work, ("tok_" + "x" * PREFLIGHT_TOKEN_LENGTH)[:PREFLIGHT_TOKEN_LENGTH])
+                os.makedirs(scratch, exist_ok=True)
+                env.update(TMPDIR=scratch, CLOUD_TEST_SKIP_DOCKER="1")
+            started, verdict, tail = now(), "PASS", ""
+            for command in commands:
+                try:
+                    done = runner([sys.executable, os.path.abspath(__file__), "heavy", "--"] + list(command), cwd=root, env=env, capture_output=True, text=True)
+                except subprocess.TimeoutExpired:   # only a runner of its own making raises this: heavy has no outer clock here
+                    verdict, tail = "FAIL", "timed out after %ds" % ceiling
+                    break
+                if done.returncode == 124:
+                    verdict, tail = "FAIL", "timed out after %ds running" % ceiling
+                    break
+                if done.returncode == 75:
+                    verdict, tail = "NOSLOT", "no heavy slot came in time (the tests did not run)"
+                    break
+                if done.returncode != 0:
+                    verdict, tail = "FAIL", "exit %d: %s" % (done.returncode, _one_line(" ".join(command), 80))
+                    sys.stderr.write("".join(("%s: %s\n" % (name, line)) for line in ((done.stdout or "") + (done.stderr or "")).splitlines()[-15:]))
+                    break
+            failed += verdict != "PASS"
+            print("%s %s (%ds)%s" % (verdict, name, max(0, int(now() - started)), (": " + tail) if tail else ""))
+    return EXIT_ERROR if failed else EXIT_OK
+
+
+cmd_preflight_pr.direct = True   # only runs tests: no daemon start, no GitHub, no ledger
+
+
+def add_preflight_pr_parsers(sub):
+    sub.add_parser("preflight-pr", help="Run the CI-critical focused test classes coders skip, under `heavy`: one PASS or FAIL line each, exit 1 when any fails",
+                   description="Runs, each under the `heavy` wrapper and a time ceiling: the command-surface snapshot class, the hygiene and role-file classes, "
+                               "bin/check-public-names and, when files under cloud/ changed against the base, the cloud suites with TMPDIR a 49-character "
+                               "token-shaped directory name. Only runs tests: it never pushes, labels or records a verdict.")
 
 
 def add_disk_parsers(sub):
@@ -23730,6 +23874,104 @@ POLICY_CLIENT_SLACK = 0.4    # seconds past the budget `judge-tool` waits for th
 POLICY_CONNECTIONS = 16      # judgements the daemon runs at once
 
 
+# ---- #290 slice 6: what the in-service plugin pushes. One narrow message kind on the judge socket; the daemon only MARKS the session.
+PLUGIN_EVENT_MAX = 2048          # bytes of one message
+PLUGIN_EVENTS = frozenset(("prompt", "compaction", "idle", "activity"))
+PLUGIN_EVENT_KEYS = frozenset(("v", "kind", "event", "sessionID", "at", "person", "id", "dropped"))
+PLUGIN_MESSAGE_RE = re.compile(r"^msg_[A-Za-z0-9]{1,80}$")
+PLUGIN_SESSION_PER_SECOND = 20   # accepted from one session in one second; the rest are dropped and counted
+PLUGIN_TOTAL_PER_SECOND = 100    # accepted in all in one second
+
+
+def parse_plugin_event(raw):
+    """The checked event of one message, or None. Every field is validated against a fixed pattern or enum; anything else is refused whole, never trimmed,
+    and no text of the message is ever returned."""
+    if not isinstance(raw, (bytes, bytearray)) or len(raw) > PLUGIN_EVENT_MAX:
+        return None
+    try:
+        data = json.loads(bytes(raw).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict) or set(data) - PLUGIN_EVENT_KEYS or data.get("v") != 1 or data.get("kind") != "event":
+        return None
+    session, event = data.get("sessionID"), data.get("event")
+    if event not in PLUGIN_EVENTS or not isinstance(session, str) or not POLICY_SESSION_RE.match(session):
+        return None
+    for key in ("at", "dropped"):
+        value = data.get(key)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 10 ** 15):
+            return None
+    if data.get("person") is not None and not isinstance(data["person"], bool):
+        return None
+    if data.get("id") is not None and not (isinstance(data["id"], str) and PLUGIN_MESSAGE_RE.match(data["id"])):
+        return None
+    return {"event": event, "session": session, "dropped": data.get("dropped") or 0}
+
+
+class EventReceiver:
+    """The daemon's end of the plugin's pushes. It makes no read and no write: an accepted event marks the session on the feed (`touch`); the pass thread
+    reads. Over-limit messages are dropped and counted (one audit line per change, never queued)."""
+
+    def __init__(self, feed, audit=None, now=time.time, actor="daemon", known=None):
+        self.feed, self.audit, self.now, self.actor, self.known = feed, audit, now, actor, known   # `known()`: the session ids of this fleet's agents; any other id is ignored
+        self.lock = threading.Lock()
+        self.counts = {"accepted": 0, "ignored": 0, "rate_limited": 0, "plugin_dropped": 0}
+        self.window, self.per_session, self.total, self.limiting = None, {}, 0, False
+
+    def handle(self, raw):
+        """One message. True when it marked a session."""
+        event = parse_plugin_event(raw)
+        if event is not None and self.known is not None and event["session"] not in self.known():
+            event = None   # not a session of this fleet: a valid id proves nothing
+        if event is None or self.feed is None:
+            with self.lock:
+                self.counts["ignored"] += 1
+            return False
+        moment = self.now()
+        with self.lock:
+            second = int(moment)
+            if self.window != second:
+                self.window, self.per_session, self.total = second, {}, 0
+            seen = self.per_session.get(event["session"], 0)
+            over = seen >= PLUGIN_SESSION_PER_SECOND or self.total >= PLUGIN_TOTAL_PER_SECOND
+            if over:
+                self.counts["rate_limited"] += 1
+                announce, self.limiting = not self.limiting, True
+            else:
+                self.per_session[event["session"]], self.total = seen + 1, self.total + 1
+                self.counts["accepted"] += 1
+                self.counts["plugin_dropped"] += event["dropped"]
+                announce, self.limiting = False, False
+        if over:
+            if announce:
+                self._audit("event.rate_limited", {"limit_per_session": PLUGIN_SESSION_PER_SECOND, "limit_total": PLUGIN_TOTAL_PER_SECOND})
+            return False
+        self.feed.touch(event["session"], moment)
+        return True
+
+    def status(self):
+        with self.lock:
+            return dict(self.counts)
+
+    def _audit(self, name, detail):
+        if self.audit is not None:
+            try:
+                self.audit.append(self.actor, name, "v2", detail)
+            except OSError:
+                pass
+
+
+def looks_like_plugin_event(raw):
+    """True for a request whose JSON object says `kind: event`: it goes to the receiver, never to the judge. Anything else is a judge request as before."""
+    if not raw.lstrip().startswith(b"{") or b'"kind"' not in raw:
+        return False
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return False
+    return isinstance(data, dict) and data.get("kind") == "event"
+
+
 class PolicyDaemonError(Exception):
     """The daemon could not be reached, or did not answer in time."""
 
@@ -23789,8 +24031,8 @@ class JudgeServer:
     slow judgement never delays a pass or another judgement.
     """
 
-    def __init__(self, state_dir, handle):
-        self.state_dir, self.handle = state_dir, handle
+    def __init__(self, state_dir, handle, on_event=None):
+        self.state_dir, self.handle, self.on_event = state_dir, handle, on_event
         self.sock = self.thread = None
         self.slots = threading.BoundedSemaphore(POLICY_CONNECTIONS)
         self.stopping = threading.Event()
@@ -23848,11 +24090,16 @@ class JudgeServer:
             conn.settimeout(POLICY_READ_SECONDS)
             raw = read_judge_line(conn, POLICY_STDIN_LIMIT)
             text = raw.decode("utf-8", "replace")
+            if self.on_event is not None and looks_like_plugin_event(raw):
+                self.on_event(raw)   # a pushed fact: marks a session, no reply is written
+                return
             if len(raw) > POLICY_STDIN_LIMIT:
                 reply = policy_reply(_guess_configured(text), "unusable request (larger than %d bytes): no change"
                                      % POLICY_STDIN_LIMIT)
             else:
                 reply = self.handle(text)
+            if reply is None:
+                return   # the judge is off here: the socket is only for pushed facts, and a judge request keeps its configured outcome
             conn.sendall((json.dumps(reply, sort_keys=True) + "\n").encode("utf-8"))
         except (OSError, ValueError):
             pass  # a caller that went away or sent nothing in time: nothing to answer
@@ -23877,11 +24124,27 @@ def make_judge_handler(runner, now):
     return handle
 
 
-def start_judge_server(config, state, runner, now):
-    """The daemon's judge socket when `policy.enabled`, else None."""
-    if not config["policy"]["enabled"]:
+def start_judge_server(config, state, runner, now, engine=None):
+    """The daemon's judge socket when `policy.enabled`, or when `v2_plugin_events` is "auto" and the event feed runs (the plugin's pushes use it), else None."""
+    judging = config["policy"]["enabled"]
+    feed = getattr(engine, "feed", None)
+    listening = config["v2_plugin_events"] == "auto" and feed is not None
+    if not judging and not listening:
         return None
-    return JudgeServer(state, make_judge_handler(runner, now)).start()
+    handle = make_judge_handler(runner, now) if judging else (lambda text: None)
+    on_event = None
+    if listening:
+        def known():
+            """This fleet's session ids. Read from the socket thread while the pass thread replaces the discovery: a snapshot of the values, and any
+            fault means "none known", so the event is ignored (fail closed)."""
+            try:
+                discovery = getattr(engine, "discovery", None)
+                return {o.session_id for o in list(discovery.agents.values()) if getattr(o, "session_id", None)} if discovery else set()
+            except RuntimeError:
+                return set()
+        engine.event_receiver = EventReceiver(feed, engine.audit, now, known=known)
+        on_event = engine.event_receiver.handle
+    return JudgeServer(state, handle, on_event).start()
 
 
 def cmd_judge_tool(args, runner, now, stdin=None):

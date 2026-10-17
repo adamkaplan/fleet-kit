@@ -289,6 +289,24 @@ def explicit_repo(args):
         return None
 
 
+MATCHER = [None, False]   # (module, tried): repo_match.py beside this file, loaded by path
+
+
+def load_matcher():
+    """The shared repository matcher (the launch guard's rules), or None when it cannot be loaded (callers then refuse a write: fail closed)."""
+    if not MATCHER[1]:
+        MATCHER[1] = True
+        try:
+            path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "repo_match.py")
+            spec = importlib.util.spec_from_file_location("repo_match", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            MATCHER[0] = module
+        except Exception:
+            MATCHER[0] = None
+    return MATCHER[0]
+
+
 def account_env(gh, lookup=None, strict=False, credential=False, args=None):
     """The environment for the real gh with GH_TOKEN of the account that `gh_users` maps to the repo of the caller's RESOLVED
     identity (`fleet-switchboard whoami --json`: its session, never an inherited variable), the same map and the same
@@ -322,7 +340,12 @@ def account_env(gh, lookup=None, strict=False, credential=False, args=None):
             if credential:
                 raise NoAccountMapped("this shell (it has no repository identity)")
             return None
-        account = users.get(repo) or users.get(repo.split("/")[0] + "/*")
+        matcher = load_matcher()
+        if matcher is None or matcher.normal_repo(repo) is None:
+            if credential or strict:
+                raise NoAccountMapped("repository %s" % _clean_reason(str(repo)))   # a repository that cannot be read is unmatched and refused, never defaulted
+            return None
+        account = matcher.account_for(users, repo)
         if not isinstance(account, str) or not account:
             if credential:
                 raise NoAccountMapped("repository %s" % repo)

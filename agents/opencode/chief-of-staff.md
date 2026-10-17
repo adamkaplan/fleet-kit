@@ -48,6 +48,7 @@ permissions:
   - {action: shell, resource: "fleet-switchboard review laws *", effect: allow}
   - {action: shell, resource: "fleet-switchboard impact floor *", effect: allow}
   - {action: shell, resource: "fleet-switchboard impact hold --dry-run*", effect: allow}
+  - {action: shell, resource: "fleet-switchboard impact clear * --under-order *", effect: allow}
   - {action: shell, resource: "fleet-switchboard pr-explain *", effect: allow}
   - {action: shell, resource: "fleet-switchboard agents verify*", effect: allow}
   - {action: shell, resource: "gh * view *", effect: allow}

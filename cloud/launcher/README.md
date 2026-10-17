@@ -36,6 +36,31 @@ Accepted scope of the role: `cw-operator` can get and list every secret in the w
 
 Everything that renders `kubectl` output (errors, the end hook's text, audit reasons) passes through one `scrub()`: this run's secret values and any 8+ character piece of one, token-shaped strings and long base64/hex runs are removed, then the text is cut. A failed `create`, `stop` or `delete` that leaves a per-run Secret says so once (audit and stderr) with its name and the exact `kubectl ... delete secret NAME` command, never a value.
 
+## The run record and the report (slice 3)
+The record is the launcher's `stop`'s, so every end gets one: `run-task` (normal end, failure, interrupt), the switchboard's `retire`
+and a person running `cloud-worker stop`. Before the end hook and the delete, `stop` reads the pod's server password and run secrets from
+the pod's own mounts, opens its own loopback port-forward, reads the session's messages and writes `$CW_RUN_RECORD_DIR/<run id>/`
+(`--record-dir` overrides; default `runs/` beside the audit file; directory 0700, files 0600; a root that is a symbolic link is refused):
+`transcript.jsonl` (each message one JSON line, every string value and key through the one scrub, so a line still parses; at most 5 MiB,
+cut with a `TRANSCRIPT CUT` marker line; `CW_RECORD_MAX_BYTES` lowers it; the whole record phase has one deadline, `CW_RECORD_SECONDS`, default 90 s, maximum 240 s: past it the record says `transcript: unavailable (record timed out)` and the stop still deletes), `tally.json` (tool calls by tool name, turns; no content) and
+`run.json` (worker, repository, start, end, exit reason, head sha when known; `transcript: unavailable` plus a reason when the server could
+not be read, or its answer was over 8 MiB or nested deeper than 100 levels: checked before parsing). A failing record never holds the stop
+back and a failing stop never deletes it; `--no-record` skips it. `stop` prints `run record: DIR` once and the audit reason names it.
+Full contract: `docs/cloud-worker-interface.md`.
+
+**What the scrub covers (and not).** Removed: a secret's whole value, base64, base64url, hex, percent-encoding and JSON escapes of the whole
+value, and any piece of 8+ characters of those (split over fields, lines or 8-character pieces); token shapes; keys as well as values.
+Not covered: per-character escapes (`\uXXXX` or `%XX` one character at a time) and pieces under 8 characters. Everything is reduced to
+printable ASCII, so non-ASCII text in a transcript or report becomes `?`.
+
+**Retention.** Records stay until you remove them. `cloud-worker prune-records [--days N]` (default 30, or `CW_RECORD_KEEP_DAYS`) removes
+only this tool's per-run directories older than that; run it from cron for a rolling window.
+
+The worker writes its final report as ONE line to `/home/worker/report` (the driver adds this to the brief). `cloud-worker report NAME`
+returns it through `kubectl exec`: scrubbed, one line, at most 2000 printable ASCII characters (control characters, escapes, bidi marks and
+non-ASCII become `?`), audited, with no switchboard command inside the pod. It refuses a symbolic link or any file that is not a regular
+file (exit 3, `report refused`), and exits 3 (`no report yet`) when the file is missing or empty.
+
 ## Create is interrupt-safe
 Ctrl-C, SIGTERM or any exception inside `create` deletes the per-run Secret and the pod it made and writes a
 `create.interrupted` (or `create.failed`) audit line naming what was cleaned. If a delete fails, stderr and the audit line

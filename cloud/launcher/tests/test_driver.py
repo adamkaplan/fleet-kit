@@ -65,7 +65,8 @@ class Driver(base.Base):
         return p, p.stdout + p.stderr
 
     def spawn(self, **env):
-        return subprocess.Popen(self.args(), env=dict(self.denv, **env), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return subprocess.Popen(self.args(), env=dict(self.denv, **env), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                preexec_fn=lambda: [signal.signal(x, signal.SIG_DFL) for x in (signal.SIGINT, signal.SIGTERM)])   # a runner that started us with SIGINT ignored must not hide the interrupt
 
     def read(self, path):
         if not os.path.exists(path):
@@ -536,7 +537,7 @@ class Driver(base.Base):
         winner = [o for c, o in results if c == 0][0]
         self.assertIn("per-run secret %s-run cleaned" % self.name, winner)
         calls = self.calls()
-        hooks = [c for c in calls if c[0] == "--context" and c[4] == "exec"]
+        hooks = [c for c in calls if c[0] == "--context" and c[4] == "exec" and "cw-end-hook" in c]   # the run record's read-only git rev-parse is not a hook
         self.assertEqual(len(hooks), 1, "the end hook ran more than once")
         self.assertEqual(self.st().get("secrets", {}), {})
         self.assertEqual(self.st()["pods"], {})

@@ -22,6 +22,9 @@ port-forward's own log; the cluster login file is the launcher's (a path, never 
 Environment: CW_KUBE_CONTEXT or CW_CLOUD_SERVER + CW_CLOUD_TOKEN_FILE (as the launcher), CW_MODEL_AUTH_FILE (default
 ~/.local/share/opencode/auth.json), CW_GIT_TOKEN_CMD, CW_WORKDIR (default /home/worker), CW_TMPDIR, CW_RUN_TIMEOUT
 (1800 s), CW_HEALTH_TIMEOUT (180 s), CW_POLL_SECONDS (3), CW_PROGRESS_SECONDS (30), CW_LAUNCHER, CW_CREATE_TIMEOUT (900 s).
+
+The run record is written by the launcher's `stop` (cloud/launcher/run_record.py), which this driver calls on every end:
+nothing is recorded here. CW_RUN_RECORD_DIR, CW_RECORD_TIMEOUT and CW_RECORD_MAX_BYTES reach it through the environment.
 """
 import argparse
 import base64
@@ -48,6 +51,7 @@ REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 MODEL_PROVIDER = "github-copilot"
 MAX_BODY = 8 * 1024 * 1024
 EXIT_INTERRUPTED = cw.EXIT_INTERRUPTED
+REPORT_NOTE = "\n\nWhen you are finished, write your final report as ONE line to the file %s (replace the file; one line, no secrets)." % cw.REPORT_PATH
 
 
 class Interrupted(BaseException):
@@ -262,7 +266,7 @@ class Driver:
         except (ValueError, KeyError, TypeError):
             raise cw.CloudError("session: could not create one (status %d)" % st)
         self.step("session created (%s)" % sid)
-        st, _ = self.api(port, "POST", "/api/session/%s/prompt" % sid, {"text": self.brief})
+        st, _ = self.api(port, "POST", "/api/session/%s/prompt" % sid, {"text": self.brief.rstrip() + REPORT_NOTE})
         if st >= 300:
             raise cw.CloudError("prompt: could not send the brief (status %d)" % st)
         self.step("prompt sent")
@@ -296,7 +300,14 @@ class Driver:
         rc, out, err = self.run_cloud_worker(["stop", self.a.worker, "--reason", reason], timeout=600)
         self.relay(err)
         if out.strip():
-            self.relay("stopped; result: " + out.strip().splitlines()[-1], sys.stdout)
+            last = out.strip().splitlines()[-1]
+            try:   # the record's directory is already on screen once (the launcher's own line): not again in the result
+                res = json.loads(last)
+                res.pop("record", None)
+                last = json.dumps(res, sort_keys=True)
+            except (ValueError, AttributeError):
+                pass
+            self.relay("stopped; result: " + last, sys.stdout)
         return rc == 0
 
     def kill_pf(self):
