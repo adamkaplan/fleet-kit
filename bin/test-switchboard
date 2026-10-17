@@ -29205,6 +29205,18 @@ class TestImpactHold(LedgerBase):
         for dropped in ("agent_presence", "ci_runs"):
             self.assertIn("bin/%s.py" % dropped, rule["closure_files"])
         self.assertNotIn("bin/lanes.py", rule["closure_files"])
+        import collections, difflib
+        counts = collections.Counter(n.name for n in hold.body if isinstance(n, ast.FunctionDef))
+        self.assertEqual([k for k, v in counts.items() if v > 1], [], "each function of the moved clear code is defined once (a later copy would silently replace the first)")
+        for pinned in ("impact_carry_get", "fetch_orders", "read_pr_json", "HELPER_MODULES", "_make_loader"):
+            self.assertIn(pinned, rule["closure_roots"])
+        table = (BIN / "fleet-switchboard").read_text().split("\n")
+        k = next(i for i, l in enumerate(table) if l.strip().startswith('"load_agent_presence":'))
+        mutated = list(table)
+        mutated[k] = mutated[k].replace('"agent_presence"', '"lanes"')
+        diff = "\n".join(list(difflib.unified_diff(table, mutated, lineterm="", n=1))[2:])
+        self.assertTrue(sb.load_module("delegated_clear").closure_refusals("\n".join(table), "\n".join(mutated), diff, rule["closure_roots"], set(rule["clear_entry_points"])), "a HELPER_MODULES value changed")
+        self.assertTrue(rule["closure_files"] and "bin/lanes.py" not in rule["closure_files"], "lanes.py is not judged, so the same edit to it is not refused")
         # the way in a strict review found: the notice path runs agent_presence through a generated loader; a change to it is refused, and to a module the clear does not load it is not
         import difflib
         presence = (BIN / "agent_presence.py").read_text().split("\n")
