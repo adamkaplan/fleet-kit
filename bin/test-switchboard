@@ -23349,11 +23349,11 @@ class TestIdentityCheck(ReportBase):
         self.world.add_agent("boss", fleet={"role": "chief-of-staff"})
         os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]
         code, out, err = self.call("whoami", "--json")
-        self.assertEqual((code, json.loads(out)), (0, {"name": "boss", "repo": "acme-ops/default", "own": False}), err)
+        self.assertEqual((code, json.loads(out)), (0, {"name": "boss", "repo": "acme-ops/default", "own": False, "role": "chief-of-staff"}), err)
         self.world.add_agent("worker", fleet={"role": "coder", "repo": "acme/api"})
         os.environ["HERDR_PANE_ID"] = self.world.panes["worker"]
         code, out, err = self.call("whoami", "--json")
-        self.assertEqual((code, json.loads(out)), (0, {"name": "worker", "repo": "acme/api", "own": True}), err)
+        self.assertEqual((code, json.loads(out)), (0, {"name": "worker", "repo": "acme/api", "own": True, "role": "coder"}), err)
 
     def test_the_reviewer_shape_an_inherited_wrong_account_token_is_replaced_by_the_callers_repo_account(self):
         users = {"acme-ops/service": "acct-ops", "acme-ops/*": "acct-ops-other", "acme/*": "acct-personal"}
@@ -23630,7 +23630,7 @@ class TestIdentityCheck(ReportBase):
         code, out, err = self.call("whoami", "--repo")
         self.assertEqual((code, out.strip()), (0, "acme-ops/service"))
         code, out, err = self.call("whoami", "--json")
-        self.assertEqual((code, json.loads(out)), (0, {"name": "ops", "repo": "acme-ops/service", "own": True}))
+        self.assertEqual((code, json.loads(out)), (0, {"name": "ops", "repo": "acme-ops/service", "own": True, "role": "orchestrator"}))
         code, out, err = self.call("whoami")
         self.assertEqual((code, out.strip()), (0, "ops"))
         os.environ["HERDR_PANE_ID"] = self.world.panes["coder"]                      # a pane of ANOTHER agent changes nothing

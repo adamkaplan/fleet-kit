@@ -422,7 +422,7 @@ def _is_number(value):
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_hold", "load_alert", "source_budgets", "hold_labels"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_hold", "load_alert", "source_budgets", "hold_labels", "app_installations", "app_key_path", "app_key_command", "app_permissions", "app_api_base"}
 
 
 CONFIG_DECLARATION_TEXT = re.compile(rb'^[ \t]*CONFIG_KEY[ \t]*(?::[^=\n]*)?=[ \t]*[\'"]([^\'"\n]*)[\'"]', re.M)   # only the fallback for a file that does not parse
@@ -655,6 +655,7 @@ def validate_config(raw, source="config"):
     validate_plan_gates_config(config, source)  # #107 slice 3a
     validate_plan_review_config(config, source)  # #109 part 2, R2
     validate_hold_labels_config(config, source)  # #376
+    validate_app_config(config, source)  # #609
     return config
 
 
@@ -701,6 +702,25 @@ def validate_hold_labels_config(config, source):
     try:
         module.validate_config(config["hold_labels"])
     except ValueError as err:
+        raise ConfigError("%s: %s" % (source, err)) from None
+
+
+def validate_app_config(config, source):
+    """`app_installations` and its key, permission and endpoint settings: the repositories whose gh and git calls use a GitHub App installation token (shims/app_mint.py
+    reads them live from this file). The shim's own loader judges them, so a config the shim would refuse is refused here: this kit's own repository, a wildcard, a
+    permission beyond the allowed set, no key source. All absent means the feature is off."""
+    keys = ("app_installations", "app_key_path", "app_key_command", "app_permissions", "app_api_base")
+    if all(config.get(k) is None for k in keys):
+        for key in keys:
+            config.pop(key, None)
+        return
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "shims", "app_mint.py")
+    spec = importlib.util.spec_from_file_location("app_mint_check", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    try:
+        module.load_config(config)
+    except module.ConfigError as err:
         raise ConfigError("%s: %s" % (source, err)) from None
 
 
@@ -8101,7 +8121,7 @@ def cmd_whoami(args, runner, now):
         own = repo or _fleet_repo(fleet, config)
         # `own` is false when the repo is only the config's `intent_repo` default: an agent with no repo of its own (the Chief of Staff) has no account of
         # its own to keep, so the gh shim may use the account of the repo a command names
-        print(json.dumps({"name": fleet["name"], "repo": own or config.get("intent_repo") or None, "own": bool(own)}, sort_keys=True))
+        print(json.dumps({"name": fleet["name"], "repo": own or config.get("intent_repo") or None, "own": bool(own), "role": fleet.get("role") if isinstance(fleet.get("role"), str) else None}, sort_keys=True))   # the RECORDED role: the gh shim gives only the Chief of Staff the named repository's App token
         return EXIT_OK
     if getattr(args, "repo", False):
         fleet = caller_fleet(engine.herdr, engine.v2, os.environ)
