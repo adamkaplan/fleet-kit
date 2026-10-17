@@ -28047,6 +28047,80 @@ class TestImpactClassAndNarrowForm(LedgerBase):
         self.assertEqual(self.record_impact("hold", "--impact-class", "data")[0], 0)
         self.assertEqual(len([e for e in self.ledger() if e["kind"] == "review_record"]), 2)
 
+    # -- #692: a hold names a class of the matrix file
+
+    def hold_records(self):
+        return [e for e in self.ledger() if e["kind"] == "review_record" and e.get("impact_action") == "hold"]
+
+    def matrix_copy(self, edit):
+        impact_floor = sb.load_impact_floor()
+        matrix = json.loads(impact_floor.MATRIX_PATH.read_text())
+        edit(matrix["owner_hold"])
+        path = self.world.state / "matrix-copy.json"
+        path.write_text(json.dumps(matrix))
+        return impact_floor, path
+
+    def test_692_s1_s7_an_unknown_class_is_refused_lists_the_classes_and_records_nothing(self):
+        code, out, err = self.record_impact("hold", "--impact-class", "x")
+        self.assertEqual(code, 2)
+        rule = sb.load_impact_floor().owner_hold_rule(sb.load_impact_floor().load_matrix())
+        self.assertEqual(len(rule[0] + rule[1]), 10)
+        self.assertEqual([c for c in rule[0] + rule[1] if c not in err], [])
+        self.assertIn("run the review again", err)
+        self.assertEqual(self.hold_records(), [])
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "review_record"], [])
+        block = "verdict: approve\nhead: %s\nimpact-action: hold\nimpact-class: x\nfindings:\n" % LEDGER_HEAD
+        path = self.world.state / "block.txt"
+        path.write_text(block)
+        code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--block", str(path))
+        self.assertEqual(code, 2)
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "review_record"], [])
+        self.assertEqual(self.decide()[0], "none")
+
+    def test_692_s2_none_is_refused_and_a_valid_class_in_another_case_is_recorded_lower_case(self):
+        self.assertEqual(self.record_impact("hold", "--impact-class", "none")[0], 2)
+        self.assertEqual(self.hold_records(), [])
+        self.assertEqual(self.record_impact("hold", "--impact-class", " Credentials ")[0], 0)
+        self.assertEqual([e["impact_class"] for e in self.hold_records()], ["credentials"])
+
+    def test_692_s3_every_matrix_class_holds_and_other_actions_need_no_class(self):
+        impact_floor = sb.load_impact_floor()
+        rule = impact_floor.owner_hold_rule(impact_floor.load_matrix())
+        for cls in rule[0] + rule[1]:
+            self.assertEqual(self.record_impact("hold", "--impact-class", cls)[0], 0, cls)
+        self.assertEqual(self.record_impact("second-review")[0], 0)
+        self.assertEqual(self.record_impact("none")[0], 0)
+        self.assertEqual(len([e for e in self.ledger() if e["kind"] == "review_record"]), 12)
+
+    def test_692_s4_the_classes_come_from_the_matrix_file_not_the_code(self):
+        impact_floor, path = self.matrix_copy(lambda b: (b["other_classes"].remove("cost"), b["other_classes"].append("novelty")))
+        with mock.patch.object(impact_floor, "MATRIX_PATH", path):
+            self.assertEqual(self.record_impact("hold", "--impact-class", "novelty")[0], 0)
+            code, out, err = self.record_impact("hold", "--impact-class", "cost")
+            self.assertEqual(code, 2)
+            self.assertIn("run the review again", err)
+        self.assertEqual([e["impact_class"] for e in self.hold_records()], ["novelty"])
+        source = (REPO / "bin" / "fleet-switchboard").read_text()
+        rule = impact_floor.owner_hold_rule(impact_floor.load_matrix())
+        names = rule[0] + rule[1]   # no line of the code lists several of the classes (single words like "data" occur elsewhere)
+        self.assertEqual([l for l in source.splitlines() if sum(1 for c in names if re.search(r"[\"']%s[\"']" % c, l)) >= 3], [])
+
+    def test_692_s5_an_unreadable_matrix_refuses_the_hold_loudly(self):
+        impact_floor = sb.load_impact_floor()
+        for text in (None, "{not json"):
+            path = self.world.state / "gone.json"
+            if text is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_text(text)
+            impact_floor._MATRIX_CACHE.clear()
+            with mock.patch.object(impact_floor, "MATRIX_PATH", path):
+                code, out, err = self.record_impact("hold", "--impact-class", "credentials")
+            self.assertEqual(code, 2)
+            self.assertIn("matrix file cannot be read", err)
+            self.assertEqual(self.hold_records(), [])
+        impact_floor._MATRIX_CACHE.clear()
+
     def test_the_block_form_carries_the_class_line(self):
         block = "verdict: approve\nhead: %s\nimpact-action: hold\nimpact-class: Data\nfindings:\n" % LEDGER_HEAD
         fields, problem = sb.parse_review_block(block)
@@ -28060,9 +28134,12 @@ class TestImpactClassAndNarrowForm(LedgerBase):
         outcome = {}
         for label, more in (("credentials", ("--impact-class", "credentials")), ("performance", ("--impact-class", "performance")),
                             ("unknown", ("--impact-class", "gizmo")), ("missing", None)):
-            if more is None:   # a record already in the ledger without a class (new recordings are refused): it keeps its top-tier reading
-                sb.plan_ledger.append_entry(self.world.state, {"kind": "review_record", "pr": self.PR, "head": LEDGER_HEAD, "reviewer": "impact", "verdict": "approve",
-                                                               "blocks": 0, "notes": 0, "by": "rev", "impact_action": "hold", "summary": "x"}, 1)
+            if more is None or label == "unknown":   # a record already in the ledger without a class or with an unknown one (new recordings are refused): it keeps its top-tier reading
+                entry = {"kind": "review_record", "pr": self.PR, "head": LEDGER_HEAD, "reviewer": "impact", "verdict": "approve",
+                         "blocks": 0, "notes": 0, "by": "rev", "impact_action": "hold", "summary": "x"}
+                if label == "unknown":
+                    entry["impact_class"] = "gizmo"
+                sb.plan_ledger.append_entry(self.world.state, entry, 1)
             else:
                 self.assertEqual(self.record_impact("hold", *more)[0], 0)
             outcome[label] = self.decide()
