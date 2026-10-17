@@ -307,6 +307,21 @@ def load_matcher():
     return MATCHER[0]
 
 
+def warn_text(args):
+    """Warn on stderr when a body or comment reads badly (shims/body_warn.py beside this file). Only a warning: any doubt or trouble prints nothing."""
+    try:
+        if not any(a[:2] == "-b" or a == "--body" or a.startswith("--body=") for a in args[2:]):
+            return   # no inline text flag: nothing is loaded; a --body-file or stdin is never opened or read
+        spec = importlib.util.spec_from_file_location("body_warn", os.path.join(os.path.dirname(os.path.realpath(__file__)), "body_warn.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        line = module.warning(args)
+        if line:
+            sys.stderr.write(line)
+    except Exception:
+        pass
+
+
 def account_env(gh, lookup=None, strict=False, credential=False, args=None):
     """The environment for the real gh with GH_TOKEN of the account that `gh_users` maps to the repo of the caller's RESOLVED
     identity (`fleet-switchboard whoami --json`: its session, never an inherited variable), the same map and the same
@@ -960,6 +975,7 @@ def main(args):
             audit_write(args, lookup, "refused", write, hold_repo, hold_number)
             return 1
     audit_write(args, lookup, "passed", write, hold_repo, hold_number)
+    warn_text(args)
     count_call(args)
     if plan is None:
         if env is not None:

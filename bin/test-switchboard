@@ -17289,6 +17289,93 @@ class TestGhShim(Base):
         done, seen = self.run_shim("issue", "comment", "2", "--body-file", "/no/such/file.md")
         self.assertEqual(seen["argv"], ["issue", "comment", "2", "--body-file", "/no/such/file.md"])
 
+    # ---- readable text: the shim warns on stderr, never refuses (ask #401, shims/body_warn.py)
+    WARN = "may be hard to read"
+    LONG = "word " * 140                                  # 700 characters
+    GOOD = "Short paragraph one.\n\n" + "- first item\n- second item\n- third item\n\n" + ("A fair sentence. " * 17).strip() + "\n"
+
+    def load_warn(self):
+        spec = importlib.util.spec_from_file_location("body_warn_t", str(SHIM.parent / "body_warn.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_s2_each_bad_comment_prints_one_warning_and_the_real_gh_runs_with_its_status(self):
+        for body in ("line one\\nline two", self.LONG, "Steps: (1) a (2) b (3) c done."):
+            with self.subTest(body=body[:20]):
+                done, seen = self.run_shim("issue", "comment", "2", "--body", body, env={"FAKE_GH_EXIT": "3"})
+                self.assertEqual(done.returncode, 3)
+                self.assertEqual(done.stderr.count(self.WARN), 1, done.stderr)
+                self.assertIn("real gh out", done.stdout)
+                self.assertIn("Markdown lists", done.stderr)
+                self.assertEqual(seen["argv"][:3], ["issue", "comment", "2"])
+
+    def test_s2_the_other_spellings_and_commands_warn_too(self):
+        for args in (("pr", "create", "--title", "t", "--body=a\\nb"), ("issue", "edit", "2", "-ba\\nb"), ("pr", "review", "2", "-b", "x\\ny")):
+            with self.subTest(args=args):
+                done, seen = self.run_shim(*args)
+                self.assertEqual(done.stderr.count(self.WARN), 1, done.stderr)
+                self.assertIsNotNone(seen)
+
+    def test_s2_a_body_file_and_stdin_are_never_opened_or_read_by_the_warning(self):
+        module = self.load_warn()
+        fifo = self.home / "pipe"
+        os.mkfifo(fifo)
+        (self.home / "f.md").write_text("one\\ntwo\n")
+        for args in (("issue", "comment", "2", "--body-file", str(fifo)), ("issue", "comment", "2", "-F", str(fifo)), ("issue", "comment", "2", "--body-file=" + str(fifo)),
+                     ("issue", "comment", "2", "-F", str(self.home / "f.md")), ("issue", "comment", "2", "-F", "-")):
+            with self.subTest(args=args):
+                self.assertIsNone(module.warning(list(args)))   # a FIFO with no writer would hang a warning that opened it
+        # through the shim: a regular file and stdin go to gh without a warning (the shim's own signing reads them, as before)
+        for args, stdin in ((("issue", "comment", "2", "-F", str(self.home / "f.md")), None), (("issue", "comment", "2", "-F", "-"), "a\\nb")):
+            with self.subTest(shim=args):
+                done, seen = self.run_shim(*args, stdin=stdin)
+                self.assertNotIn(self.WARN, done.stderr)
+                self.assertIsNotNone(seen)
+
+    def test_s3_a_fence_or_a_code_span_hides_what_would_warn(self):
+        for body in ("Intro.\n\n```\n" + self.LONG + "\n(1) (2) (3) \\n\n```\n", "Run `printf 'a\\nb (1) (2) (3)'` and see.", "~~~sh\nx\\ny\n~~~\n"):
+            with self.subTest(body=body[:20]):
+                done, _ = self.run_shim("issue", "comment", "2", "--body", body)
+                self.assertNotIn(self.WARN, done.stderr)
+
+    def test_s4_a_well_formed_body_prints_nothing_and_the_real_gh_runs_once(self):
+        done, seen = self.run_shim("issue", "comment", "2", "--body", self.GOOD)
+        self.assertEqual(done.stderr, "real gh err\n")
+        self.assertIsNotNone(seen)
+        self.assertGreater(max(len(p) for p in self.GOOD.split("\n\n")), 200)
+
+    def test_s4_a_long_list_is_not_one_long_paragraph(self):
+        done, _ = self.run_shim("issue", "comment", "2", "--body", "\n".join("- item number %d of the list" % n for n in range(40)))
+        self.assertNotIn(self.WARN, done.stderr)
+
+    def test_u1_a_command_with_no_text_flag_loads_nothing_and_spawns_nothing_extra(self):
+        done, seen = self.run_shim("issue", "view", "2")
+        self.assertEqual(done.stderr, "real gh err\n")
+        source = (SHIM.parent / "body_warn.py").read_text()
+        self.assertNotRegex(source, r"import .*\b(subprocess|socket|urllib|http|os)\b")
+
+    def test_s8_an_inline_post_starts_no_process_and_no_network_and_opens_no_file(self):
+        module = self.load_warn()
+        def boom(*a, **k):
+            raise AssertionError("no process, network or file")
+        with mock.patch.object(subprocess, "run", boom), mock.patch.object(subprocess, "Popen", boom), mock.patch.object(socket, "socket", boom), \
+                mock.patch.object(os, "system", boom), mock.patch.object(os, "open", boom), mock.patch.object(os, "stat", boom), mock.patch("builtins.open", boom):
+            self.assertIn(self.WARN, module.warning(["issue", "comment", "2", "--body", "a\\nb"]))
+            self.assertIsNone(module.warning(["issue", "comment", "2", "--body-file", "/no/such"]))
+
+    def test_a_doubt_means_no_warning(self):
+        module = self.load_warn()
+        for args in (["issue", "comment", "2", "--body"], ["issue", "view", "2", "--body", "a\\nb"], ["issue"]):
+            with self.subTest(args=args):
+                self.assertIsNone(module.warning(args))
+
+    def test_s6_the_warning_files_name_no_private_thing(self):
+        pattern = re.compile("|".join(["jan" + "us", "sp" + "ire", "adk" + "aplan", "/Us" + "ers/", "direc" + "tor(?!y|ies)"]), re.I)
+        for path in (SHIM.parent / "body_warn.py",):
+            for number, line in enumerate(path.read_text().splitlines(), 1):
+                self.assertIsNone(pattern.search(line), "%s:%d" % (path.name, number))
+
 
 class TestSignedComments(HandoffCase):
     """The trial's agents share the user's GitHub account, so an agent's comment came back to it as a wake.
