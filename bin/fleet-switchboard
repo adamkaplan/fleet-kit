@@ -334,6 +334,7 @@ DEFAULTS = {
     "launch_env": {},
     "herdr": "herdr",
     "batch_seconds": 90,
+    "launch_default": "headless",   # #433: what a plain `launch` starts: "headless" (no terminal) or "terminal" (a herdr tab)
     "send_to_working": "steer",     # a boss's `send` to a working agent: "steer" (its next safe point) or "queue" (after its turn)
     "engaged_minutes": 10,
     "call_timeout_seconds": 20,
@@ -572,6 +573,8 @@ def validate_config(raw, source="config"):
     if config["send_to_working"] not in ("steer", "queue"):
         raise ConfigError("%s: 'send_to_working' must be \"steer\" or \"queue\", got %r"
                           % (source, config["send_to_working"]))
+    if config["launch_default"] not in ("headless", "terminal"):
+        raise ConfigError("%s: 'launch_default' must be \"headless\" or \"terminal\", got %r" % (source, config["launch_default"]))
     executable = config["opencode_executable"]
     if executable is not None and (not isinstance(executable, str) or not os.path.isabs(executable)):
         raise ConfigError("%s: 'opencode_executable' must be an absolute path, got %r" % (source, executable))
@@ -16221,7 +16224,7 @@ def cmd_launch(args, runner, now, socket_call=None):
         raise LaunchError("--terminal and --headless contradict each other: pick one")
     # #433: a plain launch takes its mode from `launch_default` (shipped: headless). A terminal is asked for by --terminal, or implied by --workspace/--new-workspace.
     by_default = not (args.resume or getattr(args, "headless", False) or getattr(args, "terminal", False) or args.workspace or getattr(args, "new_workspace", None))
-    use_headless = bool(getattr(args, "headless", False)) or (by_default and load_module("launch_default").mode(engine.config) == "headless")
+    use_headless = bool(getattr(args, "headless", False)) or (by_default and engine.config.get("launch_default", "headless") == "headless")
     workspace = args.workspace if (args.workspace or getattr(args, "new_workspace", None) or use_headless) \
         else caller_workspace(engine, None)   # a workspace made now, or none at all, needs no look at the caller's own
     if args.resume:

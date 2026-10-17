@@ -246,7 +246,7 @@ class TestConfig(Base):
         self.assertEqual(sb.load_config(), {
             "opencode": None, "opencode_env": {}, "opencode_executable": None, "launch_env": {},
             "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "call_timeout_seconds": 20, "send_timeout_seconds": 60, "poll_seconds": 5,
-            "worker_lookback_hours": 24, "send_to_working": "steer",
+            "worker_lookback_hours": 24, "send_to_working": "steer", "launch_default": "headless",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
             "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_plugin_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "reds": None, "heavy": None, "docker_reaper": True,
@@ -34388,14 +34388,14 @@ class TestLaunchDefault(TwoRepoCase):
         self.assertIn("no terminal workspace could be found", err)
         self.assertIn("headless refused", err)
 
-    def test_the_launch_default_module_accepts_only_its_two_words(self):
-        module = sb.load_module("launch_default")
+    def test_the_launch_default_key_accepts_only_its_two_words(self):
         for good in ("headless", "terminal"):
-            module.validate(good)
+            self.write_config(dict(self.raw, launch_default=good))
+            self.assertEqual(sb.load_config()["launch_default"], good)
         for bad in ("tabs", "", None, 1, ["headless"], "Headless"):
-            with self.assertRaises(ValueError, msg=repr(bad)):
-                module.validate(bad)
-        self.assertEqual((module.mode({}), module.mode({"launch_default": "terminal"})), ("headless", "terminal"))
+            self.write_config(dict(self.raw, launch_default=bad))
+            with self.assertRaises(sb.ConfigError, msg=repr(bad)):
+                sb.load_config()
 
     def test_an_explicit_headless_still_refuses_and_a_name_clash_never_falls_back(self):
         code, out, err = self.launch("--repo", ACME_WEB, "--headless")
