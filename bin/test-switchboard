@@ -13671,6 +13671,22 @@ class TestClearRemovesTheAuthorsHold(Base):
         state["applied"]["%s#7" % self.REPO] = {"head": self.H[7], "merge_label_added": self.names["merge-captain"] in labels, "added": sorted(labels), "at": 1}
         sb.write_impact_state(self.world.state, state)
 
+    def test_a_delete_that_fails_partway_leaves_the_clear_recorded_and_a_second_run_removes_the_rest(self):
+        real, calls = self.route, []
+        def failing(argv, **kwargs):
+            if argv[0] == FAKE_GH and "--method" in argv and argv[argv.index("--method") + 1] == "DELETE":
+                calls.append(argv[2])
+                if len(calls) == 2:
+                    return subprocess.CompletedProcess(argv, 1, "", "HTTP 502")
+            return real(argv, **kwargs)
+        with self.assertRaises(Exception):
+            sb.impact_clear_core(self.engine, failing, self.REPO, 7, "owner", "a false hold: it is a fixture")
+        self.assertEqual(self.clears()["%s#7" % self.REPO]["head"], self.H[7], "the clear is recorded first")
+        self.assertEqual(len(self.labels[7]), 4, "1 of the 4 holds came off, 'bug' stays")
+        self.assertEqual(self.audits(), [])
+        self.clear(7)
+        self.assertEqual(self.labels[7], ["bug"])
+
     def test_d1_a_delegated_clear_keeps_the_old_rule_only_what_the_switchboard_added_comes_off(self):
         n = self.names
         self.daemon_added(n["merge-captain"], n["hold-impact"])

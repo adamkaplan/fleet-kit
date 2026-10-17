@@ -494,8 +494,10 @@ def authors_hold_labels(names, raw, already):
 
 
 def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, head=None, via=None, verify=None, under_order=None):
-    """The owner's clear: record it head-bound (the daemon does not re-add the hold for that head) and remove `hold-impact`, and
-    `merge-captain` too when the switchboard itself added it for this hold. Returns the lines to print.
+    """The owner's clear: record it head-bound (the daemon does not re-add the hold for that head) and remove `hold-impact`, plus (#742) every other
+    hold label of the fleet's prefix the PR carries at that head (`merge-captain` and each `hold-<reason>`, whoever added it). A DELEGATED clear (`under_order`)
+    keeps the narrower rule: only `hold-impact` and a `merge-captain` the switchboard added come off, and it is refused (audited, nothing written) when the PR
+    carries a `merge-captain` the switchboard did not add. Returns the lines to print.
 
     `remove` (the chat clear, #457) names the labels to take off instead: the caller has already read the PR and checked that each is an owner-tier hold label or the captain
     marker; here every one of them is checked again against the owner-tier set, so no other label can ever be removed. `head` is the head the owner was shown: the clear
