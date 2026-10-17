@@ -37,11 +37,13 @@ RUN userdel -r ubuntu 2>/dev/null || true \
 
 COPY worker/start-dockerd.sh /usr/local/bin/start-dockerd
 COPY worker/entrypoint.sh /usr/local/bin/worker-entrypoint
+COPY worker/guard.sh worker/opencode-worker.json worker/agents/worker.md /usr/local/share/cw/
 COPY launcher/end_hook.py /usr/local/bin/cw-end-hook
 COPY launcher/token_mint.py /usr/local/bin/cw-token-mint
 COPY worker/activity.py /usr/local/bin/cw-worker-activity
 RUN chmod 0755 /usr/local/bin/start-dockerd /usr/local/bin/worker-entrypoint \
-      /usr/local/bin/cw-end-hook /usr/local/bin/cw-token-mint /usr/local/bin/cw-worker-activity
+      /usr/local/bin/cw-end-hook /usr/local/bin/cw-token-mint /usr/local/bin/cw-worker-activity \
+ && chmod 0755 /usr/local/share/cw/guard.sh && chmod 0644 /usr/local/share/cw/opencode-worker.json /usr/local/share/cw/worker.md
 
 USER worker
 WORKDIR /home/worker

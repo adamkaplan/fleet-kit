@@ -6,8 +6,8 @@ description: How to write a plan before work starts, check it, and get it challe
 # Planning
 
 A plan says **what** the work must achieve and how anyone will know, never gratuitous **how**. It is written before
-work starts, checked by a command, challenged by independent reviewers, and approved. The full rules and every check
-`plan check` enforces are in `docs/plan-template.md` (read it when a check fails); this page is the short path.
+work starts, checked by a command, challenged by independent reviewers, and approved. Every rule and check is in
+`docs/plan-template.md` (read it when a check fails).
 
 ## When a plan is required
 
@@ -24,34 +24,34 @@ Staff; an epic or workspace plan, the Chief of Staff, then the owner.
    screenshot`), `pass` (a concrete observable: a status, a number, a quoted value), `discriminates` (the specific wrong
    build that would FAIL it), `evaluator` (`ci | tester | reviewer | owner`, able to record that proof), and optionally
    `claim: epic` for what only an integrated head can prove (name the integration branch in the plan).
-   **Owner evaluators are rare**: only where the owner's own eyes are the test (an infographic's look, an access grant), proved once with `claim: epic`; never for a routine PR.
+   **Owner evaluators are rare**: only where the owner's own eyes are the test, proved once with `claim: epic`; never for a routine PR.
+
+   **Own measurement:** launch a tester of your lane (`--role tester --repo <the pull request's repo> --reports-to <you>`, headless) to re-measure and record; never record as yourself.
 3. **Constraints** (`PC-n`): what must hold and why (a shared contract, a security rule, a held path). Nothing else is a
    constraint.
 4. **Out of scope**, **areas touched** (and whether any is held-PR), **risks and rollback**, **open questions**, **size and
    tier**, and **the integration-branch decision** (stay on main, or `integration/<epic-slug>`).
    **Size** is a T-shirt in AGENT time, never human-days: S under 1 hour, M a few hours, L about a day, XL several days, each with what makes it that
-   size (a light plan may carry just `size: S`). A recommendation never prefers the smaller option because it is less work when a larger one
-   simplifies the system. Put `plan-format: 2` and a `size:` line in the plan; `plan check` then flags a missing size and days for work under L.
+   size. Never prefer the smaller option merely because it is less work when a larger one
+   simplifies the system. Put `plan-format: 2` and a `size:` line in the plan; `plan check` flags a missing size and days for work under L (a light plan may carry just `size: S`).
 
 ## Check it
 
 `fleet-switchboard plan check <owner/repo#N> [--ask <owner/repo#N>] [--json]` prints `PASS` or `FAIL`, one defect per line,
 and the plan hash (editing anything changes it). Before you send a draft, run `plan check --file <plan> --done-when <the
-issue's Done-when>` (format 2 needs a `clauses:` and a `scenarios:` yaml block) and fix every defect. It only reads GitHub.
+issue's Done-when>` (the issue body needs `## Intent` before `Done when:`; format 2 needs a `clauses:` and a `scenarios:` yaml block) and fix every defect.
 
 ## The form
 
 Put it in the repo the work concerns. **A short issue body** (the one-paragraph outcome, the Done-when, the link to the
 detail) plus **one detail comment** whose first line is a heading containing `Plan (scenarios)`: the plan text and the
-`scenarios:` yaml block. Revise by posting a new such comment (the latest one counts). Keep one plan per ask; sections for
-work items.
+`scenarios:` yaml block. Revise by posting a new such comment (the latest counts). One plan per ask; sections for work items.
 
 ## Challenge it
 
 When available: a `plan review` command launches independent read-only reviewers and records their verdicts (not built yet:
 until then ask the Chief of Staff for a hand-run review). The tier is computed from the ask or epic the plan serves, not
-chosen per item. Expect up to three rounds; an objection still standing after round three goes up to the Chief of Staff and
-then the owner, never dropped.
+chosen per item. Expect up to three rounds; an objection still standing after round three goes to the Chief of Staff, then the owner.
 
 ## What the reviewers attack
 
@@ -64,7 +64,7 @@ then the owner, never dropped.
   is not warranted.
 - **The owner's view**: would the owner be surprised; does it solve the asked problem or a neighbouring one.
 
-## Good and bad (neutral names)
+## Good and bad
 
 Good: Done-when (1) "a project with no agents lists none, and after commissioning lists exactly one".
 
@@ -86,11 +86,15 @@ scenarios:
     evaluator: ci
 ```
 
-Bad, each fails `plan check` or a reviewer:
-- `pass: works`: a wrong build also "works". Say what is observed.
-- `discriminates: a wrong build would fail this`: it names no wrong build, so a stub could satisfy it.
-- a plan whose scenarios only cover clause 1 of two: clause 2 has no proof.
-- "add a `commission()` method to `ProjectService`": that is how, not what; say the observable outcome.
+Bad: `pass: works`, `discriminates: a wrong build would fail this`, or "add a `commission()` method" (how, not what).
+
+## Wordings `plan check` accepts
+
+- every declared `DW`/`PC` is covered by a scenario;
+- `discriminates` names a concrete wrong build (a stub that returns an empty list);
+- `pass` has an observable number or status (`exit status is 0`);
+- the declared clauses joined equal the ask's Done-when;
+- check a slice with `--ask <its own work item>`.
 
 ## After the plan
 
@@ -98,4 +102,4 @@ Link it in every brief (`PLAN: <link>`). The worker proves each scenario with `f
 --evidence <link-or-what-you-ran>`, an evaluator records `verdict`, and `fleet-switchboard gates <pr>` shows what is still
 open. The order does not matter (a `ci` verdict recorded before your `prove` counts once the proof exists at the same head, and
 the daemon records `ci` verdicts itself within minutes of green checks): a coder's only extra step is `prove`. A push voids every proof and
-verdict. Owner evaluators are rare (only where the owner's own eyes are the test). A hotfix may be waived by the Chief of Staff, logged; the plan is then due retroactively within a day.
+verdict. A hotfix may be waived by the Chief of Staff, logged; the plan is then due retroactively within a day.

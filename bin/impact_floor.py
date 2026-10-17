@@ -162,6 +162,18 @@ def floor_for(repo, config=None):
     return [], [], []
 
 
+CONFIG_KEY = "impact_floor"   # the module declares its own configuration key (bin/fleet-switchboard config_declarations)
+CONFIG_DEFAULT = None         # None: no default is added to the configuration (absent = off)
+
+
+def validate(raw, source="config"):
+    """The configuration check the shared validator calls: `validate_config`, with the source named in front of its message."""
+    try:
+        validate_config(raw)
+    except ValueError as err:
+        raise ValueError("%s: %s" % (source, err)) from None
+
+
 def validate_config(raw):
     """Raise ValueError naming the key when `impact_floor` is not {enabled?, calls_per_pass?, repos: {owner/repo: {globs, exclude?, force?}}}
     with lists of non-empty strings: a string where a list belongs must never silently hold nothing."""
