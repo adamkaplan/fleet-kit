@@ -62027,6 +62027,15 @@ class TestScratchFileRule(unittest.TestCase):
                 self.assertNotIn("mktemp -d", line)
 
 
+class TestDeployFromMainSentence(unittest.TestCase):
+    SENTENCE = ("Production is deployed from the head of main only: never from a side branch, a cherry-pick or a revert off main; "
+                "when main is not shippable, the fix goes into main (the owner's law).")
+
+    def test_s2_the_coordination_skill_states_the_deploy_rule_once(self):
+        text = (REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text()
+        self.assertEqual(text.count(self.SENTENCE), 1)
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.
