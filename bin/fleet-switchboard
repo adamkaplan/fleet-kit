@@ -21025,29 +21025,38 @@ EXPLAINER_HEADER_RE = re.compile(r"^(?:PLAN|MERGE|canon):", re.I)   # the lines 
 # The generated summary flowchart this tool used to write (four boxes: Changes, Touches, Irreversible, Risk). It is never emitted; a body that still holds it fails
 # `--check`. Detection is by the four box labels inside ONE Mermaid fence, read line by line (bounded, linear, no lowered copy, ASCII-only matching).
 SUMMARY_FLOWCHART_LABELS = ("Changes", "Touches", "Irreversible", "Risk")
-_SUMMARY_LABEL = re.compile(r'[\["(]\s*(Changes|Touches|Irreversible|Risk)\s*:', re.A | re.I)
+_SUMMARY_LABEL = re.compile(r'[\["(]\s*(%s)\s*:' % "|".join(SUMMARY_FLOWCHART_LABELS), re.A | re.I)   # built from the tuple: one list of labels
 _SUMMARY_LINE_MAX = 400   # a box label is short: the rest of a longer line is not looked at
 _SUMMARY_BODY_MAX = 1 << 20   # a body is cut at 1 MB for this check (GitHub's own limit is 65536 characters)
+SUMMARY_FLOWCHART_DEFECT = ("the body holds the generated summary flowchart (a Mermaid diagram whose boxes are Changes:, Touches:, Irreversible:, Risk:): remove it; "
+                            "a diagram is only for data flow, system design or component design")
 
 
 def summary_flowchart_found(body):
-    """True when a Mermaid fence of the body holds the four labelled boxes of the generated summary flowchart (Changes:, Touches:, Irreversible:, Risk:), wherever
-    it is. One pass over the lines, each cut to _SUMMARY_LINE_MAX; a diagram that shows data flow (without all four labels) is not it."""
-    inside, seen = False, set()
-    for line in str(body or "")[:_SUMMARY_BODY_MAX].splitlines():
-        text = line.strip()[:_SUMMARY_LINE_MAX]
-        if text.startswith("```"):
-            if inside:
-                if len(seen) == len(SUMMARY_FLOWCHART_LABELS):
-                    return True
-                inside, seen = False, set()
-            elif text[3:].strip().lower() == "mermaid":
-                inside, seen = True, set()
+    """True when a Mermaid fence ANYWHERE in the body holds the four labelled boxes of the generated summary flowchart (Changes:, Touches:, Irreversible:, Risk:). One
+    pass over the lines under a step budget; each line is cut to _SUMMARY_LINE_MAX; fences are read as the held-body scan reads them (three or more backticks or
+    tildes, up to three spaces of indent, closed by the same character at least as long, an unclosed fence running to the end); no lowered copy is indexed
+    (ASCII-only folding). A diagram that shows data flow (without all four labels in ONE fence) is not it."""
+    lines = str(body or "")[:_SUMMARY_BODY_MAX].split("\n")
+    budget = _held_steps(len(lines))
+    fence, mermaid, seen = None, False, set()
+    for line in lines:
+        _held_spend(budget)
+        text = line[:_SUMMARY_LINE_MAX]
+        found = _HELD_FENCE_RE.match(text)
+        if fence is None:
+            if found and not (found.group(1)[0] == "`" and "`" in found.group(2)):
+                words = found.group(2).split()
+                fence, mermaid, seen = (found.group(1)[0], len(found.group(1))), bool(words) and _ascii_lower(words[0]) == "mermaid", set()
             continue
-        if inside:
-            for found in _SUMMARY_LABEL.finditer(text):
-                seen.add(found.group(1).capitalize())
-    return inside and len(seen) == len(SUMMARY_FLOWCHART_LABELS)   # a fence left open at the end of the body still counts
+        if found and found.group(1)[0] == fence[0] and len(found.group(1)) >= fence[1] and not found.group(2).strip():
+            if mermaid and len(seen) == len(SUMMARY_FLOWCHART_LABELS):
+                return True
+            fence = None
+        elif mermaid:
+            for label in _SUMMARY_LABEL.finditer(text):
+                seen.add(label.group(1).capitalize())
+    return fence is not None and mermaid and len(seen) == len(SUMMARY_FLOWCHART_LABELS)   # a fence left open at the end of the body counts too
 
 
 def explainer_text(text):
@@ -21091,7 +21100,8 @@ def explainer_defects(body):
     body = body or ""
     count = body.count(EXPLAINER_BEGIN)
     if count != 1 or body.count(EXPLAINER_END) != 1 or body.index(EXPLAINER_BEGIN) > body.index(EXPLAINER_END):
-        return ["the description has %d explainer blocks: it carries exactly one (between %s and %s)" % (count, EXPLAINER_BEGIN, EXPLAINER_END)]
+        return ["the description has %d explainer blocks: it carries exactly one (between %s and %s)" % (count, EXPLAINER_BEGIN, EXPLAINER_END)] + (
+            [SUMMARY_FLOWCHART_DEFECT] if summary_flowchart_found(body) else [])
     inner = body.split(EXPLAINER_BEGIN, 1)[1].split(EXPLAINER_END, 1)[0]
     problems = []
     why = re.search(r"```text\n(.*?)```", inner, re.S)
@@ -21102,7 +21112,7 @@ def explainer_defects(body):
     elif any(re.search(r"<[^>]*>", m.group(1)) for m in (before, after)):
         problems.append("the why part still has a placeholder in <angle brackets>")
     if summary_flowchart_found(body):
-        problems.append("the description holds the generated summary flowchart (a Mermaid diagram with the boxes Changes:, Touches:, Irreversible:, Risk:): remove it; a diagram is only for data flow, system design or component design")
+        problems.append(SUMMARY_FLOWCHART_DEFECT)
     return problems
 
 
@@ -21298,7 +21308,7 @@ def _held_defects(body):
     (PLAN:, MERGE:, canon:), in this order: `## Why this needs you` (1 to 3 sentences, no placeholder), `## What changes for you` (a Before | After
     table of 2 to 4 rows of real cells), `## Example` (real text), `## Questions for you` (a numbered list, each item with `Recommendation:`) or the
     line `Questions: none (reason)`. An image may sit anywhere in the top; a Mermaid block in the top is a defect; nothing below the top part is
-    judged. Headings count only outside code fences and comments. Reads the body only."""
+    judged, except that the generated summary flowchart (four boxes: Changes:, Touches:, Irreversible:, Risk:) is a defect ANYWHERE in the body. Headings count only outside code fences and comments. Reads the body only."""
     lines = (body or "").split("\n")
     clean_all, mermaid_all = held_scan(lines)
     at = 0
@@ -21349,6 +21359,8 @@ def _held_defects(body):
             problems.append("`%s` is empty, too short (20 characters) or still has a <placeholder>" % HELD_EXAMPLE)
     if any(at <= m < at + top_end for m in mermaid_all):
         problems.append("the top part shows a Mermaid diagram: it goes below, in the technical section")
+    if summary_flowchart_found(body):   # ANYWHERE in the body, the top part or below it or inside the explainer markers (ask #687)
+        problems.append(SUMMARY_FLOWCHART_DEFECT)
     nones = [i for i, l in enumerate(top) if _held_none(l)]
     if HELD_QUESTIONS in pos:
         section_lines = [l for l in section(HELD_QUESTIONS) if l.strip()]
@@ -21393,7 +21405,7 @@ def cmd_pr_explain(args, runner, now):
     if args.check:
         problems = explainer_defects(body)
         if pr_is_held(pr.get("labels") or [], body):
-            problems += held_defects(body)
+            problems += [p for p in held_defects(body) if p not in problems]   # the summary flowchart is named once
         for problem in problems:
             print("DEFECT: %s" % problem)
         print("explainer: %s" % ("FAIL" if problems else "PASS"))
