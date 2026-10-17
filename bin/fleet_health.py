@@ -436,6 +436,11 @@ def charter_agent(body):
     return found.group(1) if found else None
 
 
+def charter_retired(body):
+    """True only when a charter's yaml says `status: retired`: a body that cannot be read, or says anything else, is not a retired signal."""
+    return bool(re.search(r"^status:[ \t]*retired[ \t]*(?:#[^\r\n]*)?\r?$", body if isinstance(body, str) else "", re.M))
+
+
 class _Budget:
     """The reads of the last hour, counted for each gh account (the repositories one account reads share its count). `ctx` may supply
     `account_of(repo)`, `paused(repo)` and `begin_read()` / `read_cost(token, repo)` (the reads GitHub really billed: a 304 is free); without them every
@@ -519,12 +524,14 @@ def _resolve_charters(ctx, state, now, budget):
             problems.append(text)
             cache[repo] = dict(entry, tried=now, error=text)
             continue
-        named = {}
+        named, gone = {}, set()
         for number, body in found:
             agent = charter_agent(body)
             if agent:
                 named[number] = agent
-        cache[repo] = {"at": now, "map": {a: n for n, a in sorted(named.items(), reverse=True)}, "named": {str(n): a for n, a in named.items()}}   # the lowest number wins a duplicate
+                if charter_retired(body):
+                    gone.add(agent)
+        cache[repo] = {"at": now, "map": {a: n for n, a in sorted(named.items(), reverse=True)}, "named": {str(n): a for n, a in named.items()}, "retired": sorted(gone)}   # the lowest number wins a duplicate
     for name, info in ctx.orchestrators.items():
         entry = cache.get(info.get("repo")) or {}
         mapped, fallback = (entry.get("map") or {}).get(name), info.get("charter")
@@ -650,6 +657,7 @@ def _refresh_asks(ctx, state, now, rows=()):
     charters, more = _resolve_charters(ctx, state, now, budget)
     problems.extend(more)
     state["charter_of"] = {n: c for n, c in charters.items() if c is not None}
+    state["charter_retired"] = sorted({a for e in (state.get("charters") or {}).values() if isinstance(e, dict) for a in e.get("retired") or []})   # only a read charter that says retired
     for name in sorted(ctx.orchestrators, key=lambda n: cache.get(n, {}).get("at", 0)):
         info = dict(ctx.orchestrators[name], charter=charters.get(name))
         entry = cache.get(name) or {}
@@ -701,6 +709,8 @@ def tick(ctx):
     series, sent, episodes, latest = state.get("series", {}), [], state.get("episodes", {}), {}
     unchartered = []
     for name in sorted(ctx.orchestrators):
+        if name in (state.get("charter_retired") or []):
+            continue   # its charter says retired: no figures and no row
         info, entry = ctx.orchestrators[name], (state.get("asks") or {}).get(name)
         asks = None
         if entry and now - entry.get("at", 0) < ASKS_STALE_SECONDS:
