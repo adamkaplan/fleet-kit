@@ -42,6 +42,7 @@ class FakeRemote:
     def __init__(self, password):
         self.password = password
         self.requests = []     # (method, path, authorization or None)
+        self.bodies = []       # (method, path, JSON body)
         self.messages = []
         outer = self
 
@@ -62,6 +63,7 @@ class FakeRemote:
                 body = json.loads(self.rfile.read(length)) if length else None
                 auth = self.headers.get("Authorization")
                 outer.requests.append((self.command, self.path, auth))
+                outer.bodies.append((self.command, self.path, body))
                 expected = "Basic " + base64.b64encode(("opencode:" + outer.password).encode()).decode()
                 if auth != expected:
                     return self._answer(401, {"error": "unauthorized"})
@@ -309,7 +311,7 @@ class TestCloudWorkerLifecycle(Base):
         self.assertEqual(record["auth_ref"], "file:" + str(self.state / "cloud" / "coder7.password"))   # our own path, never the launcher's
         self.assertEqual(oct(stat.S_IMODE((self.state / "cloud" / "coder7.json").stat().st_mode)), "0o600")
         self.assertEqual(oct(stat.S_IMODE((self.state / "cloud" / "coder7.password").stat().st_mode)), "0o600")
-        self.assertEqual(self.remote.messages[0]["text"], "Build the thing.\n")   # the brief reached the remote session
+        self.assertTrue(self.remote.messages[0]["text"].endswith("Task:\nBuild the thing.\n"))   # the brief (after the setup preamble) reached the remote session
 
         code, out, err = self.main("send", "coder7", "please", "rebase")
         self.assertEqual(code, 0, err)
@@ -353,6 +355,42 @@ class TestCloudWorkerLifecycle(Base):
         code, out, err = self.main("retire", "coder7")   # once the push can succeed, the same command finishes it
         self.assertEqual(code, 0, err)
         self.assertFalse((self.state / "cloud" / "coder7.json").exists())
+
+
+class TestLiveFindings(Base):
+    """#640 live run: the session directory exists in the pod, the worker is told to clone, and a stuck retire names its last resort."""
+
+    def test_the_session_is_created_in_the_scratch_volume_not_in_a_directory_the_image_lacks(self):
+        self.assertEqual(self.launch()[0], 0)
+        sessions = [b for m, path, b in self.remote.bodies if m == "POST" and path == "/api/session"]
+        self.assertEqual([b["location"]["directory"] for b in sessions], ["/work"])
+        self.assertNotIn("/workspace", json.dumps(sessions))
+
+    def test_the_session_runs_the_images_worker_agent_never_the_local_agent_name(self):
+        self.assertEqual(self.launch()[0], 0)   # launch() passes --agent coder
+        sessions = [b for m, path, b in self.remote.bodies if m == "POST" and path == "/api/session"]
+        self.assertEqual([b["agent"] for b in sessions], ["worker"])
+        self.assertNotIn('"agent": "coder"', json.dumps(self.remote.bodies))   # no request to the pod names the local agent as its agent
+        record = json.loads((self.state / "cloud" / "coder7.json").read_text())
+        self.assertEqual(record["agent"], "coder")   # the local role is only recorded
+
+    def test_the_brief_is_preceded_by_the_setup_preamble(self):
+        self.assertEqual(self.launch()[0], 0)
+        prompts = [b["text"] for m, path, b in self.remote.bodies if path.endswith("/prompt")]
+        self.assertEqual(len(prompts), 1)
+        text = prompts[0]
+        self.assertTrue(text.startswith("Setup (do this first"))
+        for needle in ("https://github.com/acme-org/widget-service.git", "/work/repo", "switch to the branch main", "never print, write or commit a token"):
+            self.assertIn(needle, text)
+        self.assertTrue(text.endswith("Task:\nBuild the thing.\n"))   # the operator's brief follows, whole
+
+    def test_a_retire_that_cannot_push_names_the_explicit_last_resort(self):
+        self.assertEqual(self.launch()[0], 0)
+        with mock.patch.dict(os.environ, {"STUB_STOP_EXIT": "1"}):
+            code, out, err = self.main("retire", "coder7")
+        self.assertEqual(code, 1)
+        self.assertIn("cloud-worker delete coder7 --force", err)
+        self.assertTrue((self.state / "cloud" / "coder7.json").exists())
 
 
 class TestCloudWorkerEndpoint(Base):

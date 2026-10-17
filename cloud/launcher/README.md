@@ -75,7 +75,7 @@ The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below 
 - `CW_CLUSTER_TOKEN_CMD` and `CW_CLUSTER_ADMIN_CMD` run through `sh -c` from the caller's environment, like `TMPDIR`: they are guardrails of the operator's own account, not a boundary against an agent that can set the environment.
 - **A missing vault is a refusal.** When the vault is unreachable or the credential unreadable, the command exits 2 with a
   message naming the vault pre-check (the operator runs the platform team's firewall check first) and makes no cluster call.
-- **`launch --cloud`** checks the allow-list, mints the token, reads the model entry and the git token, and hands both to
+- **`launch --cloud`** creates the session in `/work` (the scratch volume; `--dir` overrides) and puts a setup preamble before the brief: clone the repository into `/work/repo`, switch to the task branch, work only there (the end hook pushes from `/work/repo`). It checks the allow-list, mints the token, reads the model entry and the git token, and hands both to
   `create` as per-run secrets through pipes (`--run-secret-fd`), then sends the session and the brief through a tunnel.
 - **`send`, `read`, `status`** each open a `kubectl port-forward` to the pod for the length of the command and kill it
   (its whole process group) before returning, also on an interrupt. No tunnel is stored; the record's `url` is not used for traffic.

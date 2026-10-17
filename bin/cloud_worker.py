@@ -39,7 +39,16 @@ H = {}   # the switchboard's own namespace, set by bind()
 LAUNCHER_ENV = "FLEET_CLOUD_WORKER_BIN"   # the launcher program; default `cloud-worker` on PATH
 DEFAULT_LAUNCHER = "cloud-worker"
 CLOUD_DIR = "cloud"
-DEFAULT_DIRECTORY = "/workspace"          # the worker's working directory inside the pod (OPEN in the interface; overridable with --dir)
+DEFAULT_DIRECTORY = "/work"   # the session's directory in the pod: the scratch volume (writable by the image's user via fsGroup); /workspace does not exist there
+CLOUD_WORKER_AGENT = "worker"   # the agent the image defines (cloud/worker/agents/worker.md): a cloud session always runs it; the local --agent name is only recorded
+WORK_REPO = "/work/repo"      # where the worker clones the repository: the launcher's end hook (CW_WORKDIR default) pushes from here
+SETUP_PREAMBLE = """Setup (do this first, before the task below):
+- Clone https://github.com/%(repo)s.git into /work/repo. The pod already holds the git credentials: never print, write or commit a token.
+- In /work/repo switch to the branch %(branch)s (create it from the default branch if it does not exist yet).
+- Do ALL your work in /work/repo, and nothing outside it: the end hook pushes from there when this worker is retired.
+
+Task:
+"""
 RECORD_MAX = 8192
 PASSWORD_MAX = 512
 LAUNCH_SECONDS = 900                      # `create` returns only once the worker answers
@@ -997,6 +1006,7 @@ def _launch(args, runner, now, reserve):
             _write_private(password_path(state, name), password + "\n")
             record["auth_ref"] = "file:" + str(password_path(state, name))   # the switchboard's own copy: its path never comes from the launcher
             record["repo"], record["branch"] = repo, branch
+            record["agent"] = args.agent   # the local role name, for the operator: the pod runs CLOUD_WORKER_AGENT
             if args.reports_to:
                 record["reports_to"] = args.reports_to
             save_record(state, record)
@@ -1021,11 +1031,12 @@ def _launch(args, runner, now, reserve):
         try:
             with tunnel(cluster, record) as live:
                 v2 = remote_v2(state, live, engine.config["call_timeout_seconds"])
-                session = v2.session_create(args.agent, name, args.dir or DEFAULT_DIRECTORY, {"fleet": fleet, "cloud": {"runtime_id": record["runtime_id"]}})["id"]
+                session = v2.session_create(CLOUD_WORKER_AGENT, name, args.dir or DEFAULT_DIRECTORY,
+                                            {"fleet": fleet, "cloud": {"runtime_id": record["runtime_id"], "agent": CLOUD_WORKER_AGENT}})["id"]
                 record["session"] = session
                 save_record(state, record)
                 if brief:
-                    v2.prompt(session, brief, {"fleet": {"from": "switchboard", "brief": True}})
+                    v2.prompt(session, SETUP_PREAMBLE % {"repo": repo, "branch": branch} + brief, {"fleet": {"from": "switchboard", "brief": True}})
         except (H["V2Error"], H["V2Unreachable"], CloudError, OSError, KeyError, TypeError) as err:
             stopped = _stop_after_failure(engine, runner, name, run_id, "launch failed: %s" % _one(cluster.clean(str(err), 80), 80), cluster)
             if stopped:
@@ -1261,8 +1272,9 @@ def cmd_retire(args, runner, now, record):
     _audit(engine, "cloud.stopped", args.name, {"exit": code, "reason": reason, "runtime_id": record.get("runtime_id"),
                                                 "pushed": (body or {}).get("pushed"), "wip_branch": (body or {}).get("wip_branch")})
     if code == 1:
-        sys.stderr.write("%s: %s was not retired: the end hook could not push (%s): pod kept, record kept; `%s retire %s` again once it can\n"
-                         % (H["PROG"], args.name, note or "no reason given", H["PROG"], args.name))
+        sys.stderr.write("%s: %s was not retired: the end hook could not push (%s): pod kept, record kept; `%s retire %s` again once it can "
+                         "(only if there is nothing to save, `cloud-worker delete %s --force` is the explicit last resort: it discards the pod and its work)\n"
+                         % (H["PROG"], args.name, note or "no reason given", H["PROG"], args.name, args.name))
         print("%s: pod kept" % args.name)
         return H["EXIT_ERROR"]
     if code != 0:

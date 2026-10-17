@@ -24776,7 +24776,7 @@ def build_parser():
     launch.add_argument("--overdue", metavar="WHEN", help="Wake --reports-to at this time if the worker has not "
                         "reported since the launch (60m, or an ISO time with a zone)")
     launch.add_argument("--brief-file", dest="brief_file", help="The first prompt: a file, or - for stdin")
-    launch.add_argument("--cloud", action="store_true", help="Run the worker in the cloud (needs --repo and --branch; --dir is its path in the pod)")
+    launch.add_argument("--cloud", action="store_true", help="Run the worker in the cloud (needs --repo and --branch; --dir is its path in the pod, default /work; the pod always runs its own 'worker' agent: --agent is only recorded)")
     launch.add_argument("--branch", help="With --cloud: the branch the worker starts on")
     launch.add_argument("--idle", help="With --cloud: stop after this long idle (default 10m)")
     launch.add_argument("--hard", help="With --cloud: stop after this long whatever it does (default 2h)")
