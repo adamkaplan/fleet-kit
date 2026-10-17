@@ -43501,6 +43501,19 @@ class TestEscalateALabelsOnlyHeldPullRequest(BaselineWorld):
         self.assertEqual(len(self.audit_events("decisions.refused")), 2)
         self.assertEqual((self.reads, self.marks()), ([], []))
 
+    def test_a_row_the_file_lists_as_already_the_owners_says_so_and_changes_nothing(self):
+        self.file(self.row("human"))
+        got = self.cmd("cos", "decisions", "escalate", self.PID)
+        self.assertEqual(got["code"], 0, got)
+        self.assertIn("already yours", got["out"])
+        self.assertEqual((self.reads, self.marks(), self.writes(), self.audit_events("decisions.escalate")), ([], [], [], []))
+
+    def test_only_a_captain_or_notice_row_of_the_file_is_taken_for_a_pr_id(self):
+        self.file(self.row(kind="issue"))
+        got = self.cmd("cos", "decisions", "escalate", self.PID)
+        self.assertIn("no decision pr:api#7 is waiting", got["err"])
+        self.assertEqual((self.reads, self.marks()), ([], []))
+
     def test_u2_an_id_the_fresh_derivation_finds_never_reads_the_file(self):
         self.prs[7] = pr_view_json()
         self.assertEqual(self.cmd("api-coder", "notice", "pr", "acme/api#7", "look")["code"], 0)
