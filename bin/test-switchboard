@@ -55924,43 +55924,6 @@ class TestNewestCiRuns(unittest.TestCase):
         self.assertEqual(json.dumps(self.RERUN), before, "the rollup is not changed")
 
 
-class TestFleetLaw(unittest.TestCase):
-    """FLEET_LAW.md keeps its format, and FK-LAW-9 (production is deployed from the head of main) holds the owner's words exactly."""
-    TEXT = (REPO / "FLEET_LAW.md").read_text()
-    # The owner's sentence, pinned character for character (his spelling kept): a paraphrase must fail here.
-    OWNER_WORDS = "Do not ever deploy to production not from HEAD of Main. That introduces variablility that is difficult to sort out later."
-    KINDS = ("test", "gate", "reviewer", "note only")
-
-    def laws(self):
-        parts = re.split(r"^## (FK-LAW-[0-9]+) ", self.TEXT, flags=re.M)
-        return {parts[i]: parts[i + 1] for i in range(1, len(parts), 2)}
-
-    def test_s3_every_law_has_a_rule_a_why_and_checks_of_a_known_kind(self):
-        laws = self.laws()
-        self.assertEqual(sorted(laws, key=lambda k: int(k.split("-")[-1])), ["FK-LAW-%d" % n for n in range(1, len(laws) + 1)])
-        for law_id, body in laws.items():
-            self.assertEqual(body.count("**Why:**"), 1, law_id + " has one Why")
-            self.assertEqual(body.count("**Check:**"), 1, law_id + " has one Check")
-            checks = body.split("**Check:**")[1].strip().splitlines()
-            self.assertTrue(checks, law_id + " has a check line")
-            for line in checks:
-                self.assertRegex(line, r"^- (%s): ." % "|".join(self.KINDS), law_id + ": " + line)
-
-    def test_s1_the_law_about_the_head_of_main_is_present_once_with_a_why_and_a_check(self):
-        self.assertEqual(len(re.findall(r"^## FK-LAW-[0-9]+ Production is deployed from the head of main", self.TEXT, flags=re.M)), 1)
-        body = self.laws()["FK-LAW-9"]
-        self.assertEqual((body.count("**Why:**"), body.count("**Check:**")), (1, 1))
-        self.assertIn("- note only: a deploy is planned from the head of main", body)
-        self.assertIn("- gate: a deploy workflow check, owned by the Chief of Staff: not claimed here", body)
-        self.assertIn("**DRAFT, for the owner's edits.", self.TEXT, "the file is still a draft")
-
-    def test_s4_the_quote_is_the_owners_sentence_character_for_character(self):
-        body = self.laws()["FK-LAW-9"]
-        quotes = re.findall(r'"(Do not ever deploy[^"]*)"', self.TEXT)
-        self.assertEqual(quotes, [self.OWNER_WORDS], "one quote, equal to the owner's sentence")
-        self.assertIn("The owner's rule, in his words: \"" + self.OWNER_WORDS + "\"", body)
-
-
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.

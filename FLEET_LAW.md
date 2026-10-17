@@ -122,13 +122,3 @@ CI followed. The fix (#513) delivers it or fails and says the pane is open witho
 
 **Check:**
 - test: a resume whose brief cannot be sent exits 1 and says the pane is open without the brief (`TestLaunch.test_s3_a_failed_send_exits_1_and_says_the_pane_is_open_without_the_brief`, #513).
-
-## FK-LAW-9 Production is deployed from the head of main and nothing else
-
-The owner's rule, in his words: "Do not ever deploy to production not from HEAD of Main. That introduces variablility that is difficult to sort out later." Production is deployed from the head of main and from nothing else: no release or other side branch, no cherry-pick, no revert made on a side branch. When main is not shippable, the fix goes into main.
-
-**Why:** the owner's words above: a deploy from anywhere but the head of main introduces a variation between what is on main and what runs, and that variation is hard to sort out later. The incident behind it lives in the team repository, not in this one, and is not named here: this repository has no failure of its own to cite for this law.
-
-**Check:**
-- note only: a deploy is planned from the head of main (the reviewer and the Chief of Staff look).
-- gate: a deploy workflow check, owned by the Chief of Staff: not claimed here.
