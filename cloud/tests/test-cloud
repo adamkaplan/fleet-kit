@@ -416,4 +416,19 @@ pin_check "$tmp/pin" "$tmp/s1" && ! pin_check "$tmp/pin" "$tmp/s2" && ! pin_chec
 if [ "${CLOUD_TEST_SKIP_DOCKER:-0}" = 1 ]; then
   pin_check "$pins" "$skiplog" && ok "skip pin: skipped cases are exactly ci-skips.txt" || bad "skipped cases differ from ci-skips.txt: $(tr '\n' ' ' < "$skiplog")"
 fi
+# 5. the parity table: the real one passes; each planted fault exits 1
+chk="$here/tests/check-parity-table"; tbl="$here/../docs/cloud-guard-parity.md"
+"$chk" "$tbl" >/dev/null 2>&1 && ok "parity table: shape ok" || bad "parity table shape"
+planted() { # name, sed expression applied to the first data row
+  sed "$2" "$tbl" > "$tmp/p.md"; "$chk" "$tmp/p.md" >/dev/null 2>&1; rc=$?
+  [ "$rc" = 1 ] && ok "parity table: $1 exits 1" || bad "parity table: $1 rc=$rc"; }
+row=$(grep -n '^| Token scope' "$tbl" | cut -d: -f1)
+planted "a blank cell" "${row}s/| covered |\$/|  |/"
+planted "a row with no status" "${row}s/| covered |\$/| done |/"
+planted "a GAP with no owner" "${row}s/| covered |\$/| GAP (item: #1) |/"
+planted "an unknown law id" "${row}s/FK-LAW-1,/FK-LAW-99,/"
+planted "'covered, mostly'" "${row}s/| covered |\$/| covered, mostly |/"
+planted "a GAP whose item is -" "${row}s/| covered |\$/| GAP (owner: x; item: -) |/"
+planted "a law id not in the list" "${row}s/FK-LAW-1,/FK-LAW-9,/"
+printf '# empty\n' > "$tmp/e.md"; "$chk" "$tmp/e.md" >/dev/null 2>&1; [ $? = 1 ] && ok "parity table: no rows exits 1" || bad "parity table: no rows"
 [ $fail = 0 ] && echo "RESULT: PASS" || { echo "RESULT: FAIL"; exit 1; }

@@ -80,7 +80,7 @@ def build_surfaces(out, build_log):
     put(state, json.dumps({"pods": {}}))
     env = {"CW_KUBECTL": os.path.join(CLOUD, "launcher", "tests", "fake_kubectl"), "FAKE_KUBE_STATE": state,
            "CW_CLOUD_AUDIT": os.path.join(work, "audit.jsonl"), "CW_CLOUD_IMAGE": "registry.example.internal/cw-worker:1",
-           "CW_TOKEN_ENDPOINT": "https://tokens.example.internal/mint", "CW_CLOUD_DOMAIN": "example.internal", "CW_KUBE_CONTEXT": "acme-cw"}
+           "CW_TOKEN_ENDPOINT": "https://tokens.example.internal/mint", "CW_CLOUD_DOMAIN": "example.internal", "CW_KUBE_CONTEXT": "acme-cw", "CW_ALLOWED_REPOS": "acme-org/widget-service"}
     log = []
     for argv in (["create", "coder7", "--repo", "acme-org/widget-service", "--branch", "main"],
                  ["extend", "coder7", "--hard", "3h"], ["status", "--json"],

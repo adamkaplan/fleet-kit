@@ -26,6 +26,15 @@ The launcher reaches the cluster with an explicit `--context` taken from `CW_KUB
 Instead of a context the launcher can log in as the namespace service account: set `CW_CLOUD_SERVER` and `CW_CLOUD_TOKEN_FILE` (and optionally `CW_CLOUD_CA_FILE`, a path). It then generates a minimal `0600` kubeconfig in a private temporary directory, removed at exit, whose only credential is the token file's path (never a token value, never `--token`), and every call uses it. The two logins are never mixed: with both a context or kubeconfig and the token settings it refuses (exit `2`). A missing, empty or unreadable token file exits `3` with `token unavailable` and makes no call; no other credential is tried. The account is `cw-operator` in `cloud/k8s/operator-rbac.yaml`: namespaced to the workers namespace, only pods, their logs, exec and port-forward, and secrets, with no wildcard and nothing cluster-wide.
 
 `create` may also take `--pull-secret NAME` (an existing image-pull Secret, referenced by `imagePullSecrets`) and, repeated, `--run-secret-fd NAME=N`: each value is read once from the inherited descriptor `N` and sent to `kubectl` on stdin into one per-run Secret `<pod>-run`, mounted read-only at `/run/cw/NAME` (mode `0400`), never an argument, environment variable or spec field. That Secret is deleted at `stop` (when the pod is deleted), at `delete`, and when a `create` fails or is interrupted; it is kept when `stop` keeps the pod because the end hook could not push. A pod that is already `Failed` or `Succeeded` is deleted by `stop` with its Secrets (no hook can run, so its unpushed work is discarded, and stderr says so); a pod kept for a failed push (`cw/kept`) is never deleted this way. At most 8 run secrets, each at most 1 MiB, else exit `2`. With a run secret supplied, `CW_TOKEN_ENDPOINT` is optional.
+Settings that decide which repositories a worker may serve (read from the environment; exit `2` with `refused: <repo> is not on the cloud allow-list`, before anything is created):
+
+| Setting | Meaning |
+|---|---|
+| `CW_ALLOWED_REPOS` | comma-separated `OWNER/NAME` allow-list, exact and case-insensitive, no wildcard; unset, empty or a malformed entry refuses every repository; read from the environment of whoever runs the launcher or driver (the operator exports it), so a mistake-guard for the operator, not a boundary: the stops are the token's one-repository scope and the repository's rules; spellings only (a renamed repository is not matched); an entry ending in `.git` is malformed |
+| `CW_TOOLING_REPO` | `OWNER/NAME` of the tooling's own repository: refused even when listed; unset adds no extra check, malformed (including a trailing `.git`) refuses; same environment and spelling-only caveats as above |
+
+The guards of the cloud worker against the Mac agent and CI are in `docs/cloud-guard-parity.md`.
+
 A command is idempotent: a repeated `stop` or `delete` of a worker that is gone exits `0`.
 
 ## 2. Worker environment (slices A and B)
