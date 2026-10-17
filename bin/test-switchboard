@@ -28954,6 +28954,15 @@ class TestImpactHold(LedgerBase):
                     if f == "load_module" and x.args and isinstance(x.args[0], ast.Constant):
                         derived.add(x.args[0].value)
                     derived |= loaders.get(f, set())
+        reached = sb.load_module("delegated_clear").closure(daemon, rule["closure_roots"])[0]   # and the modules the clear's own closure loads, found statically
+        for node in daemon.body:
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in reached:
+                for x in ast.walk(node):
+                    if isinstance(x, ast.Call):
+                        f = getattr(x.func, "id", "")
+                        if f == "load_module" and x.args and isinstance(x.args[0], ast.Constant):
+                            derived.add(x.args[0].value)
+                        derived |= loaders.get(f, set())
         for path in sorted(BIN.glob("*.py")):
             if any(isinstance(n, ast.FunctionDef) and n.name in ("validate", "settings") for n in ast.parse(path.read_text()).body):
                 derived.add(path.stem)
@@ -28978,6 +28987,9 @@ class TestImpactHold(LedgerBase):
         self.assertEqual(judge(more, more.replace("        return 1", "        return 7"), ["one_line"]), [], "a method body does not")
         self.assertTrue(judge(mod, mod.replace("def ordinary(x):", "def ordinary(x=print(1)):"), ["one_line"]), "a default runs at import")
         self.assertTrue(judge(mod, mod.replace("def ordinary(x):", "@hook\ndef ordinary(x):"), ["one_line"]), "a decorator runs at import")
+        self.assertTrue(judge(mod, mod.replace("def ordinary(x):", "def ordinary(x: make() = 1):"), ["one_line"]), "an annotation that calls runs at import")
+        self.assertTrue(judge(mod, mod.replace("def ordinary(x):", "def ordinary(x=lambda: 1):"), ["one_line"]), "a lambda default")
+        self.assertEqual(judge(mod, mod.replace("def ordinary(x):", "def ordinary(x: int):"), ["one_line"]), [], "a plain annotation only binds")
         self.assertEqual(judge(mod, mod.replace("def ordinary(x):", "def ordinary(\n        x):"), ["one_line"]), [], "a plain signature only binds a name")
         self.assertEqual(judge(mod, mod.replace("def ordinary(x):", "def ordinary(x, y=1):"), ["one_line"]), [], "a constant default only binds")
         self.assertEqual(judge(mod, mod + "\ndef added(a, b=None):\n    return a\n", ["one_line"]), [], "a new function with a plain signature")

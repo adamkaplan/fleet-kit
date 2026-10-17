@@ -319,6 +319,7 @@
         "bin/fleet-switchboard",
         "bin/agent_calls.py",
         "bin/awaiting_live.py",
+        "bin/ci_runs.py",
         "bin/cpu_guard.py",
         "bin/dead_hint.py",
         "bin/decision_core.py",
