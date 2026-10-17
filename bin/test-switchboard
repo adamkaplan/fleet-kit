@@ -41221,8 +41221,8 @@ class TestHeldRowsFromLabels(DecisionsBase):
 
 
 class TestPrExplainer(DecisionsBase):
-    """#179 slice L6: the explainer block (a before and after why part on every PR; for a captain PR the infographic first), printed by a read-only
-    command and put in a description ONCE. The Mermaid check is against the SUBSET this command writes, not Mermaid's own parser."""
+    """#179 slice L6: the explainer block (a before and after why part on every PR, never a diagram: #687), printed by a read-only
+    command and put in a description ONCE. `--check` fails a body that holds the generated summary flowchart."""
     FILES = [{"path": "bin/fleet-switchboard"}, {"path": "bin/test-switchboard"}, {"path": "docs/switchboard.md"}, {"path": "README.md"}]
 
     def setUp(self):
@@ -41254,84 +41254,37 @@ class TestPrExplainer(DecisionsBase):
         self.assertIn("after:  a list shows one agent", out)
         self.assertEqual(len(self.calls), 1, "one GET of the PR, nothing else")
 
-    def test_a_captain_pr_gets_the_infographic_first_and_it_parses(self):
-        self.captain()
-        code, out, err = self.cli("pr-explain", "acme/api#7", "--before", "b", "--after", "a", "--irreversible", "a migration cannot be undone",
-                                  "--severity", "Marginal", "--probability", "Occasional")
-        self.assertEqual(code, 0, err)
-        self.assertLess(out.index("```mermaid"), out.index("```text"), "the diagram comes first in the block")
-        diagram = re.search(r"```mermaid\n(.*?)```", out, re.S).group(1)
-        self.assertEqual(sb.mermaid_defects(diagram), [])
-        for label in ("Changes: Add the parser", "Touches: bin 2, docs 1, root files 1 (4 files)", "Irreversible: a migration cannot be undone", "Risk: Marginal x Occasional: Medium"):
-            self.assertIn(label, diagram)
+    SUMMARY = ('```mermaid\nflowchart LR\n  A["Changes: Add the parser"] --> B["Touches: bin 2, docs 1 (4 files)"]\n  B --> C["Irreversible: nothing"]\n'
+               '  C --> D["Risk: not rated yet"]\n```\n')
+    DATAFLOW = '```mermaid\nflowchart LR\n  A["Request"] --> B["Gate"]\n  B --> C["Ledger"]\n```\n'
 
-    def test_the_risk_cell_comes_from_the_single_source_matrix_and_a_wrong_name_is_refused(self):
-        self.assertEqual(sb.explainer_risk_cell(eliminated=True), "Eliminated (not rated)")
-        self.assertEqual(sb.explainer_risk_cell(), "not rated yet")
-        matrix = json.loads((REPO / "docs" / "review-laws" / "impact-matrix.json").read_text())
-        for severity in matrix["severities"]:
-            for probability in matrix["probabilities"]:
-                cell = matrix["cells"][severity][probability]
-                self.assertIn(": %s (" % cell["level"], sb.explainer_risk_cell(severity, probability))
+    def test_a_captain_pr_gets_the_same_block_and_never_a_diagram(self):
         self.captain()
-        code, out, err = self.cli("pr-explain", "acme/api#7", "--severity", "Huge", "--probability", "Occasional")
-        self.assertEqual(code, 2)
-        self.assertIn("severity is one of", err)
-
-    def test_the_title_cannot_break_or_extend_the_diagram(self):
-        self.captain()
-        self.pr["title"] = 'x"] --> Z["evil"] %% <script> [bad](http://x) ' + "y" * 300
         code, out, err = self.cli("pr-explain", "acme/api#7", "--before", "b", "--after", "a")
-        diagram = re.search(r"```mermaid\n(.*?)```", out, re.S).group(1)
-        self.assertEqual(sb.mermaid_defects(diagram), [])
-        self.assertEqual(len(diagram.splitlines()), 4, "four lines: the header and the three edges, no node added by the title")
-        for bad in ('"] --> Z', "<script>", "](http", "%%"):
-            self.assertNotIn(bad, diagram)
-        self.assertTrue(all(len(line) < 160 for line in diagram.splitlines()))
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("mermaid", out.lower())
+        self.assertNotIn("flowchart", out)
+        self.assertIn("before: b", out)
+        self.assertIn("after:  a", out)
 
-    def test_a_broken_or_foreign_diagram_is_refused(self):
-        good = 'flowchart LR\n  A["a"] --> B["b"]'
-        self.assertEqual(sb.mermaid_defects(good), [])
-        for text, want in (("", "does not open"), ("graph LR\n  A[a] --> B[b]", "does not open"), ('flowchart LR\n  A["a"]', "at least two nodes"),
-                           ('flowchart LR\n  A["a"] --> B', "never defined"), ('flowchart LR\n  A["a"] --> B["b"]\n  click A "http://x"', "not part of the supported"),
-                           ('flowchart LR\n  A["a"] --> B["b"]\n  style A fill:#f00', "not part of the supported")):
-            with self.subTest(text=text[:30]):
-                self.assertTrue(any(want in d for d in sb.mermaid_defects(text)), sb.mermaid_defects(text))
+    def test_the_diagram_arguments_are_gone(self):
+        for flag in ("--irreversible", "--severity", "--probability", "--eliminated", "--captain"):
+            with self.subTest(flag=flag):
+                self.assertEqual(self.cli("pr-explain", "acme/api#7", flag, "x")[0], 2)
 
     def test_text_that_would_end_or_split_the_block_cannot_break_check(self):
         nasty = "ends <!-- pr-explainer:end --> early --> and ``` fences <!-- pr-explainer:begin --> here"
         block = sb.explainer_block(nasty, nasty)
         body = sb.explainer_insert("PLAN: https://example.test/1\n\ntext", block)
         self.assertEqual((body.count(sb.EXPLAINER_BEGIN), body.count(sb.EXPLAINER_END)), (1, 1))
-        self.assertEqual(sb.explainer_defects(body, False), [])
+        self.assertEqual(sb.explainer_defects(body), [])
         self.pr["body"] = body
         self.assertEqual(self.cli("pr-explain", "acme/api#7", "--check")[0], 0)
         code, out, err = self.cli("pr-explain", "acme/api#7", "--before", nasty, "--after", nasty)
         self.assertEqual((out.count(sb.EXPLAINER_BEGIN), out.count(sb.EXPLAINER_END)), (1, 1))
 
-    def test_a_cut_file_list_is_said_in_the_diagram_not_hidden(self):
-        self.assertEqual(sb.explainer_count(4, 4), "4 files")
-        self.assertEqual(sb.explainer_count(1, 1), "1 file")
-        self.assertEqual(sb.explainer_count(100, 140), "100 of 140 files listed")
-        self.assertEqual(sb.explainer_count(4, None), "4 files")
-        self.captain()
-        self.pr["files"] = [{"path": "bin/f%d" % i} for i in range(100)]
-        self.pr["changedFiles"] = 140
-        with mock.patch.object(sb, "read_pr_json", return_value=dict(self.pr, state="OPEN")):
-            code, out, err = self.cli("pr-explain", "acme/api#7", "--before", "b", "--after", "a")
-        self.assertIn("100 of 140 files listed", out)
-        self.assertEqual(sb.mermaid_defects(re.search(r"```mermaid\n(.*?)```", out, re.S).group(1)), [])
-
-    def test_a_diagram_outside_the_subset_is_refused_and_the_printed_block_has_no_image(self):
-        foreign = ('flowchart LR\n  A["a"] --> B["b"]\n  click A "http://example.test"', 'flowchart LR\n  A["a"] --> B["b"]\n  style A fill:#f00', 'graph LR\n  A["a"] --> B["b"]')
-        self.assertTrue(all(sb.mermaid_defects(text) for text in foreign))
-        self.captain()
-        code, out, err = self.cli("pr-explain", "acme/api#7", "--before", "b", "--after", "a")
-        for image in ("![", ".png", ".svg", "<img"):
-            self.assertNotIn(image, out)
-
     def test_a_body_gets_at_most_one_block_however_often_it_is_inserted(self):
-        block = sb.explainer_block("old", "new", "flowchart LR\n  A[\"a\"] --> B[\"b\"]")
+        block = sb.explainer_block("old", "new")
         body = self.pr["body"]
         once = sb.explainer_insert(body, block)
         twice = sb.explainer_insert(once, sb.explainer_block("old2", "new2"))
@@ -41372,7 +41325,7 @@ class TestPrExplainer(DecisionsBase):
         block = sb.explainer_block("old", "new")
         self.pr["body"] = sb.explainer_insert(self.pr["body"], block)
         code, out, err = self.cli("pr-explain", "acme/api#7", "--check")
-        self.assertEqual((code, out.strip()), (0, "explainer: PASS (ordinary PR)"))
+        self.assertEqual((code, out.strip()), (0, "explainer: PASS"))
         for body, want in ((self.PR_NONE, "0 explainer blocks"), (self.PR_TWO, "2 explainer blocks"),
                            (sb.explainer_insert("x", sb.explainer_block("old", "<what happens after>")), "placeholder"),
                            ("x\n" + sb.EXPLAINER_BEGIN + "\n```text\nbefore: only a before\n```\n" + sb.EXPLAINER_END, "`after:` line")):
@@ -41381,16 +41334,62 @@ class TestPrExplainer(DecisionsBase):
                 code, out, err = self.cli("pr-explain", "acme/api#7", "--check")
                 self.assertEqual(code, 1)
                 self.assertIn(want, out)
-        self.captain()
-        self.pr["body"] = sb.explainer_insert("x", block)   # a captain PR without the infographic
+        self.captain()   # a captain PR needs no diagram either: the same body passes
+        self.pr["body"] = sb.explainer_insert("x", block)
         code, out, err = self.cli("pr-explain", "acme/api#7", "--check")
-        self.assertEqual(code, 1)
-        self.assertIn("infographic", out)
-        self.pr["body"] = sb.explainer_insert("x", sb.explainer_block("old", "new", sb.explainer_mermaid("t", ["a/b"], "none", "not rated yet")))
-        self.assertEqual(self.cli("pr-explain", "acme/api#7", "--check")[0], 0)
+        self.assertEqual((code, out.strip()), (0, "explainer: PASS"))
+
+    def test_check_accepts_a_body_without_a_diagram_and_one_with_a_data_flow_diagram_and_fails_the_summary_flowchart_anywhere(self):
+        block = sb.explainer_block("old", "new")
+        plain = sb.explainer_insert(self.pr["body"], block)
+        cases = ((plain, 0, ""), (plain + "\n## How it flows\n\n" + self.DATAFLOW, 0, ""),
+                 (self.SUMMARY + plain, 1, "generated summary flowchart"),   # at the top
+                 (plain + "\n" + self.SUMMARY, 1, "generated summary flowchart"),   # below the top
+                 (sb.explainer_insert(self.pr["body"], block.replace(sb.EXPLAINER_END, self.SUMMARY + sb.EXPLAINER_END)), 1, "generated summary flowchart"))   # inside the markers
+        for body, want_code, want in cases:
+            with self.subTest(want=want, head=body[:30]):
+                self.pr["body"] = body
+                code, out, err = self.cli("pr-explain", "acme/api#7", "--check")
+                self.assertEqual(code, want_code, out)
+                self.assertIn(want, out)
+                if want_code:
+                    self.assertIn("Changes:", out)
+
+    def test_the_summary_flowchart_detector_reads_a_mermaid_fence_with_the_four_labels_only(self):
+        self.assertTrue(sb.summary_flowchart_found(self.SUMMARY))
+        self.assertTrue(sb.summary_flowchart_found(self.SUMMARY.replace("```\n", "")))   # an unclosed fence still counts
+        self.assertTrue(sb.summary_flowchart_found(self.SUMMARY.replace("Changes", "CHANGES")))
+        self.assertFalse(sb.summary_flowchart_found(self.DATAFLOW))
+        self.assertFalse(sb.summary_flowchart_found("Changes: a, Touches: b, Irreversible: c, Risk: d in prose"))
+        self.assertFalse(sb.summary_flowchart_found(self.SUMMARY.replace("```mermaid", "```text")))
+        self.assertFalse(sb.summary_flowchart_found(self.SUMMARY.replace("Risk", "Danger")))
+        self.assertFalse(sb.summary_flowchart_found(""))
+        self.assertFalse(sb.summary_flowchart_found(None))
+
+    def test_the_summary_flowchart_detector_is_bounded_by_its_cuts_not_by_a_clock(self):
+        """Bounded and linear by construction: one pass over the lines, the body cut at 1 MB and each line at 400 characters. Shown by what is NOT seen past a cut."""
+        fence = self.SUMMARY
+        self.assertTrue(sb.summary_flowchart_found(fence * 400), "a 64 KB body made of the summary flowchart repeated is found")
+        self.assertFalse(sb.summary_flowchart_found("x" * sb._SUMMARY_BODY_MAX + "\n" + fence), "past the 1 MB cut nothing is read")
+        padded = fence.replace('B["Touches', 'B["' + " " * sb._SUMMARY_LINE_MAX + 'Touches')
+        self.assertFalse(sb.summary_flowchart_found(padded), "past the 400 character cut of a line nothing is read")
+        two = '```mermaid\nflowchart LR\n  A["Changes: a"] --> B["Touches: b"]\n```\n```mermaid\nflowchart LR\n  C["Irreversible: c"] --> D["Risk: d"]\n```\n'
+        self.assertFalse(sb.summary_flowchart_found(two), "the four labels are read inside ONE fence")
+        hostile = ('```mermaid\n["Changes: ["Touches: ["Irreversible: ' + "\u0130\u212a" * 20 + "\n") * 400 + "[" * 20000
+        self.assertFalse(sb.summary_flowchart_found(hostile[:65536]))
 
     PR_NONE = "text only"
     PR_TWO = sb.EXPLAINER_BEGIN + "\n```text\nbefore: a\nafter:  b\n```\n" + sb.EXPLAINER_END + "\n" + sb.EXPLAINER_BEGIN + "\n```text\nbefore: a\nafter:  b\n```\n" + sb.EXPLAINER_END
+
+    def test_the_skill_the_template_and_the_coordination_skill_each_say_a_diagram_is_for_data_flow_or_design_and_never_the_top(self):
+        rule = "only where it shows data flow, system design or component design, never at the top of a body"
+        for path in ("skills/fleet-explainer/SKILL.md", ".github/pull_request_template.md", "skills/fleet-coordination/SKILL.md"):
+            with self.subTest(path=path):
+                text = " ".join((REPO / path).read_text().split())
+                self.assertEqual(text.count(rule), 1)
+                self.assertNotRegex(text.lower(), r"infographic|captain prs only|flowchart of four")
+        skill = (REPO / "skills" / "fleet-explainer" / "SKILL.md").read_text()
+        self.assertNotIn("first in the block", skill)
 
     def test_a_pr_that_cannot_be_read_is_an_error_and_a_bad_reference_is_usage(self):
         self.assertEqual(self.cli("pr-explain", "not-a-pr")[0], 2)
