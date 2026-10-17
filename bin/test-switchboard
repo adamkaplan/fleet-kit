@@ -50599,7 +50599,12 @@ class TestHeavySlots(Base):
         argv = [sys.executable, str(SWITCHBOARD), "heavy", "--slots", str(slots), "--name", name]
         if wait_max is not None:
             argv += ["--wait-max", str(wait_max)]
-        proc = subprocess.Popen(argv + ["--"] + list(words), env=env or self.env(), start_new_session=new_session, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        argv = argv + ["--"] + list(words)
+        if self.START_DELAY:   # a holder slow to write its record: the real wrapper holds its lock at once but its record (os.pwrite) lands START_DELAY seconds late
+            runner = ("import os, sys, time, runpy; real, delay = os.pwrite, float(sys.argv[1]); os.pwrite = lambda *a: (time.sleep(delay), real(*a))[1]; "
+                      "script = sys.argv[2]; sys.argv = [script] + sys.argv[3:]; runpy.run_path(script, run_name='__main__')")
+            argv = [sys.executable, "-c", runner, str(self.START_DELAY), str(SWITCHBOARD)] + argv[2:]
+        proc = subprocess.Popen(argv, env=env or self.env(), start_new_session=new_session, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 stdin=popen.pop("stdin", subprocess.DEVNULL), text=True, **popen)
         self.procs.append(proc)
         return proc
@@ -50641,14 +50646,36 @@ class TestHeavySlots(Base):
     def started(self):
         return sorted(p.name for p in self.home.glob("started.*"))
 
+    READY_TRIES = 600    # the readiness helper: 600 reads of the holder record, 0.1 s apart (60 s: a bound for a hang, not a delay: a healthy holder is ready in milliseconds), unless a test names its own bound
+    READY_PAUSE = 0.1
+    START_DELAY = 0      # seconds a holder is made slow to start (the injected-delay class sets it)
+
+    def ready_holders(self, count, slots=3, name=None, seconds=None, state=None):
+        """Wait until `count` holders are READY, then return them. Ready is read from the record the product itself reads (`holders`: the slot's lock is held and the
+        record names the holder and its command), never from a timer: a lock that is held before its record is written reads as '?' and is not ready yet. Bounded:
+        READY_TRIES reads (or `seconds` / READY_PAUSE); when it runs out it fails and says which holder was expected and what was missing."""
+        tries = int(seconds / self.READY_PAUSE) if seconds is not None else self.READY_TRIES
+        state = state or self.state()
+        found = []
+        for attempt in range(max(1, tries)):
+            found = self.hs.holders(state, slots)
+            known = [h for h in found if h["name"] != "?" and h["command"] != "?" and (name is None or h["name"] == name)]
+            if len(found) == count and len(known) == count:
+                return found
+            time.sleep(self.READY_PAUSE)
+        self.fail("holder %r not ready after %d reads of its record (%.1f s): expected %d ready holder(s), found %s (a '?' is a held lock whose record is not written yet)" % (
+            name, max(1, tries), max(1, tries) * self.READY_PAUSE, count, found))
+
     def test_s1_four_callers_of_three_slots_queue_and_the_fourth_runs_when_one_frees(self):
         """The integration check with real processes (the queue logic itself is tested deterministically in TestHeavyQueueLogic)."""
         procs = {tag: self.start(*self.waiter(tag), name="who-%s" % tag) for tag in "abcd"[:3]}
         ok = self.until(lambda: len(self.started()) == 3, self.HOLD_CEILING_SECONDS)
         self.assertTrue(ok, "3 commands started\n" + (self.why(procs) if not ok else ""))
         # the three locks are really held now (the kernel's own answer, not a file): the fourth cannot take one, whatever the machine's speed
-        ok = self.until(lambda: len(self.hs.holders(self.state(), 3)) == 3, self.HOLD_CEILING_SECONDS)
-        self.assertTrue(ok, "3 of 3 slots held before the fourth starts\n" + (self.why(procs) if not ok else ""))
+        try:
+            self.ready_holders(3, seconds=self.HOLD_CEILING_SECONDS)   # the three locks held AND their records written (the kernel's own answer, not a timer)
+        except AssertionError as err:
+            self.fail("3 of 3 slots held before the fourth starts\n%s\n%s" % (err, self.why(procs)))
         fourth = self.start(*self.waiter("d"), name="who-d")
         lines, queued = [], threading.Event()
 
@@ -50692,7 +50719,7 @@ class TestHeavySlots(Base):
     def test_s2_a_holder_killed_with_its_whole_group_frees_its_slot_by_itself(self):
         holder = self.start(*self.waiter("h"), slots=1, name="doomed")
         self.assertTrue(self.until(lambda: "started.h" in self.started()))
-        self.assertEqual([h["name"] for h in self.hs.holders(self.state(), 1)], ["doomed"])
+        self.assertEqual([h["name"] for h in self.ready_holders(1, slots=1, name="doomed")], ["doomed"])
         os.killpg(holder.pid, signal.SIGKILL)
         holder.wait(timeout=90)
         waiter = self.start("sh", "-c", 'touch "%s/second"' % self.home, slots=1)
@@ -50768,8 +50795,7 @@ class TestHeavySlots(Base):
 
     def test_s5_the_holder_list_names_who_holds_a_slot_and_a_free_slot_says_nothing(self):
         proc = self.start("sleep", "5", slots=2, name="the-coder")
-        self.assertTrue(self.until(lambda: len(self.hs.holders(self.state(), 2)) == 1))
-        (entry,) = self.hs.holders(self.state(), 2)
+        (entry,) = self.ready_holders(1, slots=2, name="the-coder")
         self.assertEqual((entry["name"], entry["command"]), ("the-coder", "sleep"))
         self.assertIsInstance(entry["pid"], int)
         self.assertLessEqual(abs(entry["since"] - time.time()), 30)
@@ -50781,7 +50807,7 @@ class TestHeavySlots(Base):
 
     def test_s6_past_the_wait_limit_it_exits_75_and_does_not_run_the_command(self):
         holder = self.start("sleep", "30", slots=1, name="busy-one")
-        self.assertTrue(self.until(lambda: len(self.hs.holders(self.state(), 1)) == 1))
+        self.ready_holders(1, slots=1, name="busy-one")
         marker = self.home / "marker"
         late = self.start("touch", str(marker), slots=1, wait_max=1)
         self.assertEqual(late.wait(timeout=90), 75)
@@ -50829,7 +50855,7 @@ class TestHeavySlots(Base):
 
     def test_a_signal_while_waiting_a_zero_wait_limit_and_a_command_that_cannot_start(self):
         holder = self.start("sleep", "30", slots=1)
-        self.assertTrue(self.until(lambda: len(self.hs.holders(self.state(), 1)) == 1))
+        self.ready_holders(1, slots=1, name="t")
         waiting = self.start("true", slots=1)
         seen = ""
         end = time.time() + 90
@@ -50912,7 +50938,7 @@ class TestHeavySlots(Base):
         cg = sb.load_cpu_guard()
         self.assertEqual(cg.slots_text({}, self.state()), "heavy slots 0/3")
         holder = self.start("sleep", "30", name="the-coder")
-        self.assertTrue(self.until(lambda: len(self.hs.holders(self.state(), 3)) == 1))
+        self.ready_holders(1, name="the-coder")
         line = cg.slots_text({}, self.state())
         self.assertRegex(line, r"^heavy slots 1/3 \(the-coder sleep \d+[ms]\)$")
         self.assertEqual(cg.slots_text({"heavy": {"slots": 5}}, self.state())[:15], "heavy slots 1/5")
@@ -50944,6 +50970,51 @@ class TestHeavySlots(Base):
         for path in ("agents/opencode/coder.md", "agents/opencode/orchestrator.md", "skills/fleet-coordination/SKILL.md"):
             found = (REPO / path).read_text()
             self.assertEqual(found.lower().count(line), 1, path)
+
+
+class TestHeavySlotsReadiness(TestHeavySlots):
+    """#688: the readiness helper of TestHeavySlots. Its own checks run here (the inherited tests below are removed: they run once, in TestHeavySlots, and the three
+    that failed in CI run again in TestHeavySlotsSlowStart)."""
+
+    def test_the_helper_reads_the_holder_record_the_product_reads_and_the_class_has_no_bare_sleep_wait(self):
+        helper = inspect.getsource(TestHeavySlots.ready_holders)
+        self.assertIn("self.hs.holders(", helper)
+        source = inspect.getsource(TestHeavySlots)
+        self.assertEqual(source.count("            time.sleep("), 2, "only the two bounded waits (until, ready_holders) sleep: no test waits by a bare sleep")
+        self.assertEqual(TestHeavySlots.READY_TRIES * TestHeavySlots.READY_PAUSE, 60.0)
+
+    def test_a_holder_whose_lock_is_held_but_record_is_not_written_is_not_ready_and_a_never_ready_holder_fails_within_the_bound_naming_it(self):
+        import fcntl
+        state = self.state()
+        fd = os.open(str(state / "heavy-slot-0.lock"), os.O_RDWR | os.O_CREAT, 0o600)   # held, with no record: what the product lists as '?'
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.assertEqual([h["name"] for h in self.hs.holders(state, 3)], ["?"])
+        begun = time.time()
+        with self.assertRaises(AssertionError) as caught:
+            self.ready_holders(1, name="slow-one", seconds=1)
+        self.assertLess(time.time() - begun, 2.5)
+        self.assertIn("slow-one", str(caught.exception))
+        self.assertIn("not ready", str(caught.exception))
+        self.assertIn("'?'", str(caught.exception))
+        os.ftruncate(fd, 0)
+        os.write(fd, json.dumps({"name": "slow-one", "command": "sleep", "pid": 1, "since": time.time()}).encode())
+        (entry,) = self.ready_holders(1, name="slow-one", seconds=1)
+        self.assertEqual((entry["name"], entry["command"]), ("slow-one", "sleep"))
+
+
+class TestHeavySlotsSlowStart(TestHeavySlots):
+    """#688: the three tests that failed in CI, run again with every holder one second slow to write its record (its lock is held at once)."""
+    START_DELAY = 1
+
+
+_KEEP_SLOW = ("test_s5_the_holder_list_names_who_holds_a_slot_and_a_free_slot_says_nothing", "test_the_cpu_line_shows_the_slots_in_use_through_the_real_heavy_module",
+              "test_s1_four_callers_of_three_slots_queue_and_the_fourth_runs_when_one_frees")
+for _name in dir(TestHeavySlots):
+    if _name.startswith("test"):
+        if _name not in _KEEP_SLOW:
+            setattr(TestHeavySlotsSlowStart, _name, None)
+        setattr(TestHeavySlotsReadiness, _name, None)
 
 
 def _artifact_zip(names, complete=True, run=1, head="a" * 40):
