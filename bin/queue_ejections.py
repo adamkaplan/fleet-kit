@@ -354,6 +354,7 @@ def run_pass(sb, engine, now, calls):
             if state["state"] != "OPEN":   # merged or closed: nobody is woken, and it is never looked at again
                 woke[key] = {"pr": number, "ts": ts, "woke": False, "names": [], "kind": "skipped"}
                 continue
+            # an entry state that cannot be read is None: not stuck, so the run is looked at again later (quiet, never a guess)
             stuck = state["queued"] and state.get("entry_state") == STUCK_STATE   # a failed run whose entry GitHub left in the queue: it blocks those behind it (#696)
             if state["queued"] and not stuck:   # it holds a queue entry: it is in the queue, not ejected; looked at again later
                 memory["recheck"][key] = now + RECHECK_SECONDS

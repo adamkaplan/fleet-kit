@@ -60827,6 +60827,17 @@ class TestQueueEjections(Base):
         self.assertIn("left the queue", line)
         self.assertNotIn("stuck", line)
 
+    def test_a_stuck_entry_with_no_owner_tells_the_chief_facts_only(self):
+        self.engine.hub.owner = None
+        with mock.patch.object(sb, "chiefs_of_staff", return_value=["chief"]):
+            self.add(65, 35, names=["secret_test_name"])
+            self.gh.pulls[(self.REPO, 35)] = ("OPEN", "UNMERGEABLE")
+            self.go()
+        (to, line), = self.sent
+        self.assertEqual(to, "chief")
+        self.assertIn("stuck", line)
+        self.assertNotIn("secret_test_name", line)
+
     def test_a_stuck_entry_of_a_merged_pull_request_wakes_nobody(self):
         self.add(64, 34, names=["x"])
         self.gh.pulls[(self.REPO, 34)] = ("MERGED", "UNMERGEABLE")
