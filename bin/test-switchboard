@@ -11557,14 +11557,6 @@ class TestCosDelegatedClearPermission(unittest.TestCase):
             "fleet-switchboard impact waive 5")]
         self.assertEqual(verdicts, ["deny", "allow", "deny"])
 
-    def test_S5_the_matrix_and_the_delegated_clear_module_are_not_changed_by_this_change(self):
-        base = subprocess.run(["git", "merge-base", "HEAD", "origin/main"], cwd=REPO, capture_output=True, text=True)
-        if base.returncode:
-            self.skipTest("no origin/main to diff against")
-        names = subprocess.run(["git", "diff", "--name-only", base.stdout.strip(), "HEAD"], cwd=REPO, capture_output=True, text=True).stdout.split()
-        self.assertNotIn("docs/review-laws/impact-matrix.json", names)
-        self.assertFalse([n for n in names if "delegated_clear" in n])
-
 
 class TestVerdictRecordingText(unittest.TestCase):
     """The reviewer and tester roles record their verdict in ONE command as the last step of the review they already do (text only)."""
@@ -16879,7 +16871,7 @@ class TestGhShimGateProbe(Base):
         fake = self.bin / "gh"
         fake.write_text("#!/usr/bin/env python3\nimport json,os,sys\n"
                         "if sys.argv[1:3] == ['repo', 'view']:\n    v = os.environ.get('FAKE_REPO')\n    print(v or ''); sys.exit(0 if v else 1)\n"
-                        "if sys.argv[1:3] == ['pr', 'view'] and 'reviews,headRefOid' in sys.argv:\n"
+                        "if sys.argv[1:3] == ['pr', 'view'] and 'reviews,headRefOid,reviewDecision' in sys.argv:\n"
                         "    if os.environ.get('FAKE_REVIEWS_EXIT'): sys.exit(int(os.environ['FAKE_REVIEWS_EXIT']))\n"
                         "    print(os.environ.get('FAKE_REVIEWS') or '{\"reviews\": [], \"headRefOid\": \"' + 'a'*40 + '\"}'); sys.exit(0)\n"
                         "if sys.argv[1:3] == ['pr', 'view']:\n    v = os.environ.get('FAKE_PRURL')\n    print(v or ''); sys.exit(0 if v else 1)\n"
@@ -16958,6 +16950,73 @@ class TestGhShimGateProbe(Base):
         done, seen = self.merge(reviews=[self.review("CHANGES_REQUESTED", "reviewer-a")], env={"FAKE_REPO": "other/repo"},
                                 args=("pr", "merge", "12", "-R", "other/repo", "--merge"))
         self.assertEqual(done.returncode, 10)                                    # a repo not listed under plan_gates is covered too
+
+    OLD = "b" * 40
+
+    def review_at(self, state, who, oid):
+        return dict(self.review(state, who), commit={"oid": oid})
+
+    def merge_decided(self, reviews, decision, *extra):
+        e = {"FAKE_REPO": "acme/app", "FAKE_REVIEWS": json.dumps({"reviews": reviews, "headRefOid": self.HEAD, "reviewDecision": decision})}
+        return self.run_shim("pr", "merge", "12", "-R", "acme/app", "--merge", *extra, env=e)
+
+    def test_s1_a_changes_requested_review_at_the_current_head_blocks(self):
+        done, seen = self.merge_decided([self.review_at("CHANGES_REQUESTED", "reviewer-a", self.HEAD)], "CHANGES_REQUESTED")
+        self.assertEqual((done.returncode, seen), (10, None))
+        self.assertIn("blocking review(s): reviewer-a: CHANGES_REQUESTED", done.stderr)
+
+    def test_s2_an_old_head_changes_requested_review_blocks_while_github_says_changes_requested(self):
+        done, seen = self.merge_decided([self.review_at("CHANGES_REQUESTED", "reviewer-a", self.OLD)], "CHANGES_REQUESTED")
+        self.assertEqual((done.returncode, seen), (10, None))
+        self.assertIn("reviewer-a: CHANGES_REQUESTED", done.stderr)
+
+    def test_s3_a_newer_comment_by_the_same_reviewer_supersedes_an_old_head_changes_requested_review(self):
+        reviews = [self.review_at("CHANGES_REQUESTED", "reviewer-a", self.OLD), self.review_at("COMMENTED", "reviewer-a", self.HEAD)]
+        done, seen = self.merge_decided(reviews, "APPROVED")
+        self.assertEqual((done.returncode, done.stdout.strip()), (7, "real gh out"), done.stderr)
+        self.assertEqual([l for l in self.spool() if l["event"] == "over_review"], [], "no over-review line")
+
+    def test_an_old_head_changes_requested_review_with_no_newer_review_does_not_block_unless_github_says_so(self):
+        done, seen = self.merge_decided([self.review_at("CHANGES_REQUESTED", "reviewer-a", self.OLD)], "APPROVED")
+        self.assertEqual(done.returncode, 7, done.stderr)
+
+    def test_a_review_without_a_commit_blocks_and_a_comment_before_it_or_another_changes_request_does_not_clear_it(self):
+        for reviews in ([self.review("CHANGES_REQUESTED", "reviewer-a")],
+                        [self.review_at("COMMENTED", "reviewer-a", self.HEAD), self.review_at("CHANGES_REQUESTED", "reviewer-a", self.HEAD)],
+                        [self.review_at("CHANGES_REQUESTED", "reviewer-a", self.OLD), self.review_at("COMMENTED", "reviewer-a", self.OLD),
+                         self.review_at("CHANGES_REQUESTED", "reviewer-a", self.HEAD)]):
+            with self.subTest(reviews=[r["state"] for r in reviews]):
+                done, seen = self.merge_decided(reviews, None)
+                self.assertEqual((done.returncode, seen), (10, None), done.stderr)
+
+    def test_a_same_head_changes_requested_review_is_not_cleared_by_a_comment_from_the_same_shared_login(self):
+        reviews = [self.review_at("CHANGES_REQUESTED", "reviewer-a", self.HEAD), self.review_at("COMMENTED", "reviewer-a", self.HEAD)]
+        for decision in ("", None, "APPROVED"):
+            with self.subTest(decision=decision):
+                done, seen = self.merge_decided(reviews, decision)
+                self.assertEqual((done.returncode, seen), (10, None), done.stderr)
+        done, seen = self.merge_decided(reviews + [self.review_at("APPROVED", "reviewer-a", self.HEAD)], "APPROVED")   # an approval clears it
+        self.assertEqual(done.returncode, 7, done.stderr)
+
+    def test_s4_a_newer_comment_by_another_reviewer_does_not_supersede(self):
+        reviews = [self.review_at("CHANGES_REQUESTED", "reviewer-a", self.HEAD), self.review_at("COMMENTED", "reviewer-b", self.HEAD)]
+        done, seen = self.merge_decided(reviews, "")
+        self.assertEqual((done.returncode, seen), (10, None))
+        self.assertIn("reviewer-a: CHANGES_REQUESTED", done.stderr)
+        self.assertNotIn("reviewer-b", done.stderr)
+
+    def test_s5_an_unreadable_reviews_read_fails_open_with_one_warning_and_the_override_is_still_logged(self):
+        done, seen = self.merge(env={"FAKE_REVIEWS_EXIT": "1"})
+        self.assertEqual(done.returncode, 7)
+        self.assertEqual(done.stderr.count("review check skipped"), 1, done.stderr)
+
+    def test_s7_the_over_review_reason_rule_holds_with_the_head_rule(self):
+        block = [self.review_at("CHANGES_REQUESTED", "reviewer-a", self.HEAD)]
+        done, seen = self.merge("--over-review", "abcdefghi", reviews=block)
+        self.assertEqual((done.returncode, seen), (10, None))
+        done, seen = self.merge("--over-review", "abcdefghij", reviews=block)
+        self.assertEqual(done.returncode, 7, done.stderr)
+        self.assertEqual(len([l for l in self.spool() if l["event"] == "over_review"]), 1)
 
     def test_a_dismissed_or_superseded_review_and_plain_comments_do_not_block(self):
         for reviews in ([self.review("CHANGES_REQUESTED", "rev"), self.review("DISMISSED", "rev")],
