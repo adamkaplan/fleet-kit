@@ -29,6 +29,7 @@ MOVED = ('gate_floor_fact',
          'clear_lane',
          '_notify_clear_body',
          'notify_clear',
+         'authors_hold_labels',
          'impact_clear_core',
          'cmd_impact_clear',
          'delegated_clear_checks',
@@ -483,6 +484,15 @@ def notify_clear(engine, kind, repo, number, head, reason=None, body=None, previ
     return None
 
 
+def authors_hold_labels(names, raw, already):
+    """The fleet's own hold labels the PR in `raw` carries now and `already` does not name: `merge-captain` and every `hold-<reason>` of the fleet's prefix, by exact name. Nothing is
+    guessed from a substring or a prefix: only those exact names, only what the read shows (so the audit names what was really on the PR), never a label of another prefix. #742."""
+    ours = [names[key] for key in ("merge-captain",) + tuple(CAPTAIN_HOLD_LABELS) if key in names]
+    live = raw.get("labels")
+    have = {(l.get("name") if isinstance(l, dict) else l) for l in live} if isinstance(live, list) else set()
+    return [label for label in ours if label in have and label not in already]
+
+
 def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, head=None, via=None, verify=None, under_order=None):
     """The owner's clear: record it head-bound (the daemon does not re-add the hold for that head) and remove `hold-impact`, and
     `merge-captain` too when the switchboard itself added it for this hold. Returns the lines to print.
@@ -518,6 +528,7 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
             remove = [names["hold-impact"]]
             if ours.get("merge_label_added"):
                 remove.append(names["merge-captain"])
+            remove += authors_hold_labels(names, raw, remove)   # #742: the author's own hold goes with the floor's, from THIS read (the PR's labels at the cleared head)
         else:
             remove = list(remove)
         head_now = current
