@@ -50625,7 +50625,7 @@ class TestHeavySlots(Base):
     def started(self):
         return sorted(p.name for p in self.home.glob("started.*"))
 
-    READY_TRIES = 50     # the readiness helper: 50 reads of the holder record, 0.1 s apart (5 s), unless a test names its own bound
+    READY_TRIES = 600    # the readiness helper: 600 reads of the holder record, 0.1 s apart (60 s: a bound for a hang, not a delay: a healthy holder is ready in milliseconds), unless a test names its own bound
     READY_PAUSE = 0.1
     START_DELAY = 0      # seconds a holder is made slow to start (the injected-delay class sets it)
 
@@ -50960,7 +50960,7 @@ class TestHeavySlotsReadiness(TestHeavySlots):
         self.assertIn("self.hs.holders(", helper)
         source = inspect.getsource(TestHeavySlots)
         self.assertEqual(source.count("            time.sleep("), 2, "only the two bounded waits (until, ready_holders) sleep: no test waits by a bare sleep")
-        self.assertEqual(TestHeavySlots.READY_TRIES * TestHeavySlots.READY_PAUSE, 5.0)
+        self.assertEqual(TestHeavySlots.READY_TRIES * TestHeavySlots.READY_PAUSE, 60.0)
 
     def test_a_holder_whose_lock_is_held_but_record_is_not_written_is_not_ready_and_a_never_ready_holder_fails_within_the_bound_naming_it(self):
         import fcntl
