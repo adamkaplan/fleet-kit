@@ -55821,7 +55821,7 @@ class TestReviewCheckout(LedgerBase):
         self.blobs, self.trees, self.fetched = {}, {}, []
         self.base_tree = {"a.txt": "one\n", "b.txt": "two\n", "same.txt": "same\n"}
         self.head_tree = {"a.txt": "one changed\n", "b.txt": "two\n", "same.txt": "same\n", "new.txt": "new file\n"}
-        self.extra_members = []
+        self.extra_members, self.extra_entries, self.hidden, self.altered, self.truncated = [], [], set(), {}, False
         self.tip_tree = {"tip.txt": "the branch moved\n"}
 
     TOP = "acme-widget-" + LEDGER_HEAD[:7]
@@ -55863,12 +55863,14 @@ class TestReviewCheckout(LedgerBase):
             ball = re.search(r"/tarball/([0-9a-f]+)", path)
             if ball:
                 table = {LEDGER_HEAD: self.head_tree, self.OLD_TIP: self.tip_tree}[ball.group(1)]
+                if ball.group(1) == LEDGER_HEAD:   # what the tarball holds: export-ignore hides files, export-subst alters them
+                    table = {k: self.altered.get(k, v) for k, v in table.items() if k not in self.hidden}
                 return subprocess.CompletedProcess(argv, 0, self.archive(table, self.extra_members), b"")
             tree = re.search(r"/git/trees/([0-9a-f]+)", path)
             if tree:
                 sha = tree.group(1)
-                table = {self.BASE: self.base_tree, self.OLD_TIP: self.tip_tree}[sha]
-                body = {"tree": self.entries(table), "truncated": False}
+                table = {self.BASE: self.base_tree, self.OLD_TIP: self.tip_tree, LEDGER_HEAD: self.head_tree}[sha]
+                body = {"tree": self.entries(table) + (self.extra_entries if sha == LEDGER_HEAD else []), "truncated": sha == LEDGER_HEAD and self.truncated}
                 return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
             blob = re.search(r"/git/blobs/([0-9a-f]+)", path)
             if blob:
@@ -56005,6 +56007,37 @@ class TestReviewCheckout(LedgerBase):
         self.assertEqual(len(self.files(root / "head")), 50)
         for path, text in self.head_tree.items():
             self.assertEqual((root / "head" / path).read_text(), text)
+
+    def test_export_ignore_and_export_subst_never_make_the_checkout_fewer_or_different_from_the_tree(self):
+        self.head_tree = {"keep%d.txt" % i: "k%d\n" % i for i in range(16)}
+        self.head_tree.update({"hidden%d.sh" % i: "evil %d\n" % i for i in range(25)})   # 41 files in the tree
+        self.base_tree = {}
+        self.hidden = {"hidden%d.sh" % i for i in range(25)}   # only 16 in the tarball
+        self.altered = {"keep3.txt": "$Format:%H$ expanded\n"}
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip())
+        self.assertEqual(len(self.files(root / "head")), 41)
+        self.assertEqual((root / "head" / "hidden7.sh").read_text(), "evil 7\n")
+        self.assertEqual((root / "head" / "keep3.txt").read_text(), "k3\n", "the tree's blob, not the substituted text")
+        self.assertIn("26 of 41 files were not in the archive", err)
+        marker = json.loads((root / ".fleet-review-checkout").read_text())
+        self.assertEqual(len(marker["from_blob_api"]), 26)
+        self.assertEqual(marker["altered_in_archive"], ["keep3.txt"])
+
+    def test_a_file_in_the_archive_that_the_tree_does_not_list_is_refused(self):
+        self.extra_members = [self.member("planted.sh")]
+        code, out, err = self.checkout()
+        self.assertEqual(code, 1)
+        self.assertIn("does not list", err)
+        self.made_nothing()
+
+    def test_a_truncated_tree_is_refused_with_the_limit(self):
+        self.truncated = True
+        code, out, err = self.checkout()
+        self.assertEqual(code, 2, err)
+        self.assertIn("too large", err)
+        self.made_nothing()
 
     def test_a_hostile_archive_is_refused_by_shape_and_writes_nothing_outside(self):
         big = b"y" * 100
@@ -56176,7 +56209,8 @@ class TestReviewCheckout(LedgerBase):
                 self.assertEqual(code, 1)
                 self.assertIn(".git component", err)
                 self.made_nothing()
-        self.extra_members = [self.member(".gitignore")]
+        self.extra_members = []
+        self.head_tree[".gitignore"] = "x"
         self.assertEqual(self.checkout()[0], 0, ".gitignore is not a .git component")
 
     def test_a_huge_file_skips_its_line_diff_fast_and_says_so_and_the_deadline_bounds_the_whole(self):

@@ -200,11 +200,11 @@ class _Capped(io.RawIOBase):
         return got
 
 
-def read_archive(data, root, limits, started):
+def read_archive(data, root, limits, started, expected):
     """Unpack the tarball `data` (bytes) into `root` with write_file, the only writer. Members are read in a stream, never extracted by tarfile.
-    The archive's single top directory prefix is stripped; a member outside it is refused. Returns ({path: (git blob sha, size)}, skipped, refused).
+    The archive's single top directory prefix is stripped; a member outside it is refused. `expected` is {path: (blob sha, size, exec)} of the git TREE, the authority: a file the tree does not list is refused, and a file whose content does not hash to the tree's blob sha (`export-subst`) is not written (the caller fetches it by blob). Returns ({path: (git blob sha, size)} of what was written, skipped, refused, altered).
     Raises OverBound before a member's bytes are read when its header passes a bound."""
-    files, skipped, refused, seen = {}, [], [], set()
+    files, skipped, refused, seen, altered = {}, [], [], set(), []
     members, total, top = 0, 0, None
     try:
         # unpacked here, under a byte cap that counts every byte (headers and skipped members too): total bound + room for headers and padding
@@ -245,24 +245,30 @@ def read_archive(data, root, limits, started):
             if rel in seen:
                 raise Unsafe("%s appears twice in the archive (duplicate member)" % _shown(rel))
             seen.add(rel)
-            if len(files) + 1 > limits["files"]:
+            if len(seen) > limits["files"]:
                 raise OverBound("the head tree has more than %d files, over the limit of %d files" % (limits["files"], limits["files"]))
             if member.size > limits["file"]:
                 raise OverBound("%s in the head tree is %d bytes, over the limit of %d bytes for one file" % (_shown(rel), member.size, limits["file"]))
             total += member.size
             if total > limits["total"]:
                 raise OverBound("the head tree is over %d bytes in all, over the limit of %d bytes in total" % (limits["total"], limits["total"]))
+            if rel not in expected:
+                refused.append((rel, "a file the git tree of the head does not list"))
+                continue
             handle = archive.extractfile(member)
             body = handle.read(member.size + 1) if handle is not None else b""
             if len(body) != member.size:
                 raise Problem("GitHub answered a truncated archive member %s" % _shown(rel))
+            if git_blob_sha(body) != expected[rel][0]:
+                altered.append(rel)   # export-subst or a forged archive: the blob of the tree is fetched instead
+                continue
             write_file(os.path.join(root, "head"), rel, body)
-            files[rel] = (git_blob_sha(body), len(body))
+            files[rel] = (expected[rel][0], len(body))
     except (tarfile.TarError, OSError, EOFError, zlib.error) as err:   # a bad gzip or tar stream, or a write that failed
         raise Problem("GitHub answered an unreadable archive: %s" % err) from None
     finally:
         archive.close()
-    return files, skipped, refused
+    return files, skipped, refused, altered
 
 
 def _marker_bytes(fields):
@@ -348,11 +354,30 @@ def checkout(api, repo, number, head, base, cwd, limits=None, notify=lambda text
         os.mkdir(os.path.join(root, "base"), 0o700)
         if archive is None:
             raise Problem("no archive reader was given")
-        head_files, skipped, refused = read_archive(archive(head), root, limits, started)   # ONE call: the exact head sha
-        refused = refused + [(p + " (base)", w) for p, w in base_refused]
+        tree_files, tree_skipped, tree_refused = read_tree(api, repo, head, limits)   # the AUTHORITY on which files the head has (a tarball honours export-ignore and export-subst)
+        check_bounds(tree_files, limits, "head")
+        archived, skipped, refused, altered = read_archive(archive(head), root, limits, started, tree_files)   # ONE call: the exact head sha
+        skipped = tree_skipped + [s_ for s_ in skipped if s_[0] not in {p for p, _ in tree_skipped}]
+        refused = tree_refused + refused + [(p + " (base)", w) for p, w in base_refused]
         if refused:
             raise Unsafe("refused, nothing kept: " + "; ".join("%s: %s" % (_shown(p), w) for p, w in refused[:20])
                          + ("; skipped (never followed): " + ", ".join(_shown(p) for p, _ in skipped[:20]) if skipped else ""))
+        head_files, from_blob = dict(archived), sorted(set(tree_files) - set(archived))   # the tree files the archive left out or altered: fetched by blob, never silently fewer
+        fetched = [0]
+        for path in from_blob:
+            if time.monotonic() - started > DEADLINE_SECONDS:
+                raise OverBound("the checkout took more than %d seconds (the time limit)" % DEADLINE_SECONDS)
+            data = fetch_blob(api, repo, tree_files[path][0], limits)
+            fetched[0] += len(data)
+            if fetched[0] > limits["total"]:
+                raise OverBound("the blobs fetched are %d bytes in all, over the limit of %d bytes in total" % (fetched[0], limits["total"]))
+            if git_blob_sha(data) != tree_files[path][0]:
+                raise Problem("the blob GitHub answered for %s is not the tree's blob" % _shown(path))
+            write_file(os.path.join(root, "head"), path, data)
+            head_files[path] = (tree_files[path][0], len(data))
+        if from_blob:
+            notify("%d of %d files were not in the archive as the tree has them (export-ignore or export-subst) and came from the blob API: %s"
+                   % (len(from_blob), len(tree_files), ", ".join(_shown(p) for p in from_blob[:20])))
         touched = sorted(p for p in set(head_files) | set(base_files)
                          if (head_files.get(p) or (0,))[0] != (base_files.get(p) or (0,))[0])
         check_bounds({p: base_files[p] for p in touched if p in base_files}, limits, "base")
@@ -389,7 +414,8 @@ def checkout(api, repo, number, head, base, cwd, limits=None, notify=lambda text
             diff.append(piece)
         write_file(root, "pr.diff", "".join(diff).encode())
         _rewrite_marker(root, _marker_bytes({"tool": MARKER_TOOL, "pr": "%s#%d" % (repo, number), "head": head, "base": base,
-                                             "merge_base": merge_base, "merge_base_fallback": fallback, "touched": len(touched)}))
+                                             "merge_base": merge_base, "merge_base_fallback": fallback, "touched": len(touched),
+                                             "from_blob_api": from_blob, "altered_in_archive": sorted(altered)}))
         for path, why in skipped:
             notify("skipped %s: %s (never followed or created)" % (_shown(path), why))
         make_readonly(root)
