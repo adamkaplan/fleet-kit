@@ -58145,6 +58145,60 @@ class TestLoadAlert(Base):
         fig = self.latest()["orch"]
         self.assertEqual((fig["busy"], fig["idle"]), (1, 1))
 
+    def _load_names(self, orchs, retired=None, bodies=None, unreadable=False):
+        """Run load_tick over `orchs` ({name: session}) and return the names that got figures."""
+        if retired is not None:
+            (self.state_dir / "retired.json").write_text(json.dumps(retired))
+        def _api(path, repo):
+            if unreadable:
+                raise RuntimeError("charters unreadable")
+            if "labels?" in path:
+                return [{"name": "x:orchestrator"}]
+            return [{"number": n, "body": b} for n, b in (bodies or {}).items()]
+        intents = types.SimpleNamespace(repo="acme/widget", _api=_api, open_asks=lambda charter, repo: [])
+        engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.T0, audit=None, actor="daemon", intents=intents,
+                                       config={"load_alert": self.health.validate({"enabled": True}, "x")})
+        discovery = types.SimpleNamespace(agents={n: types.SimpleNamespace(name=n, session_id=sid, status="idle",
+                                                  fleet={"role": "orchestrator", "charter": i + 1, "repo": "acme/widget"})
+                                                  for i, (n, sid) in enumerate(orchs.items())})
+        sb.load_tick(engine, discovery)
+        return sorted(self.latest())
+
+    def test_a_retired_orchestrator_has_no_figures(self):   # S1
+        got = self._load_names({"a": "s1", "b": "s2", "c": "s3"}, retired={"c": {"at": self.T0, "session": "s3"}})
+        self.assertEqual(got, ["a", "b"])
+
+    def test_an_orchestrator_whose_charter_says_retired_has_no_figures(self):   # S2
+        got = self._load_names({"a": "s1", "b": "s2"}, bodies={2: "orchestrator: b\nstatus: retired\n", 1: "orchestrator: a\nstatus: active\n"})
+        self.assertEqual(got, ["a"])
+
+    def test_a_retired_and_a_live_charter_naming_the_same_agent_show_the_agent(self):
+        got = self._load_names({"a": "s1"}, bodies={10: "orchestrator: a\nstatus: retired\n", 20: "orchestrator: a\nstatus: active\n"})
+        self.assertEqual(got, ["a"])   # one live charter keeps it shown
+        got = self._load_names({"a": "s1"}, bodies={10: "orchestrator: a\nstatus: active\n", 20: "orchestrator: a\nstatus: retired\n"})
+        self.assertEqual(got, ["a"])
+
+    def test_two_charters_naming_one_agent_that_both_say_retired_hide_it(self):
+        got = self._load_names({"a": "s1"}, bodies={10: "orchestrator: a\nstatus: retired\n", 20: "orchestrator: a\nstatus: retired\n"})
+        self.assertEqual(got, [])
+
+    def test_a_status_line_outside_the_leading_yaml_block_does_not_retire(self):
+        body = "```yaml\norchestrator: a\nstatus: active\n```\n\nquoted:\nstatus: retired\n"
+        self.assertEqual(self._load_names({"a": "s1"}, bodies={1: body}), ["a"])
+        self.assertTrue(self.health.charter_retired("```yaml\norchestrator: a\nstatus: retired\n```\n"))
+        self.assertFalse(self.health.charter_retired("orchestrator: a\nstatus: retiredX\n"))
+
+    def test_an_undone_retirement_and_a_never_retired_orchestrator_keep_their_rows(self):   # S3
+        got = self._load_names({"a": "s1", "b": "s2"}, retired={})
+        self.assertEqual(got, ["a", "b"])
+
+    def test_an_unreadable_charter_never_hides_an_orchestrator(self):   # S4
+        self.assertEqual(self._load_names({"a": "s1"}, unreadable=True), ["a"])
+
+    def test_a_retired_entry_with_another_session_does_not_hide_the_new_session(self):   # S5
+        got = self._load_names({"a": "new"}, retired={"a": {"at": self.T0, "session": "old"}})
+        self.assertEqual(got, ["a"])
+
     def test_the_daemon_tick_without_an_ask_repo_wakes_nobody_and_says_so(self):
         self.asks = {1: [1, 2]}
         engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.T0, audit=None, actor="daemon", intents=None,
