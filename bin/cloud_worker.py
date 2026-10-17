@@ -41,6 +41,7 @@ DEFAULT_LAUNCHER = "cloud-worker"
 CLOUD_DIR = "cloud"
 DEFAULT_DIRECTORY = "/work"   # the session's directory in the pod: the scratch volume (writable by the image's user via fsGroup); /workspace does not exist there
 CLOUD_WORKER_AGENT = "worker"   # the agent the image defines (cloud/worker/agents/worker.md): a cloud session always runs it; the local --agent name is only recorded
+POD_DIR_ROOTS = ("/work", "/home/worker")   # the only roots a cloud session directory may be under (a local path does not exist in the pod)
 WORK_REPO = "/work/repo"      # where the worker clones the repository: the launcher's end hook (CW_WORKDIR default) pushes from here
 SETUP_PREAMBLE = """Setup (do this first, before the task below):
 - Clone https://github.com/%(repo)s.git into /work/repo. The pod already holds the git credentials: never print, write or commit a token.
@@ -945,6 +946,11 @@ def _launch(args, runner, now, reserve):
         raise LaunchError("--cloud and --headless do not combine: a cloud worker has its own endpoint, a headless one runs in the local service")
     if not args.agent:
         raise LaunchError("--agent is required")
+    if args.dir:
+        given = str(args.dir)   # a normal absolute path (no `..`, no doubled or trailing slash) under a pod root
+        if given != os.path.normpath(given) or not any(given == root or given.startswith(root + "/") for root in POD_DIR_ROOTS):
+            raise LaunchError("--dir %r is not a path in the pod: with --cloud it must be an absolute path under %s (a local directory does not exist "
+                              "there); leave --dir out to use %s; nothing was created" % (_one(given, 80), " or ".join(POD_DIR_ROOTS), DEFAULT_DIRECTORY))
     repo = H["launch_repo"](args)
     branch = getattr(args, "branch", None)
     if not repo or not branch:

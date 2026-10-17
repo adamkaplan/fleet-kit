@@ -374,6 +374,30 @@ class TestLiveFindings(Base):
         record = json.loads((self.state / "cloud" / "coder7.json").read_text())
         self.assertEqual(record["agent"], "coder")   # the local role is only recorded
 
+    def test_a_dir_that_is_not_a_pod_path_is_refused_before_anything_is_created(self):
+        brief = self.home / "brief.txt"
+        brief.write_text("x\n")
+        for bad in (str(self.home), "relative/dir", "/workspace", "/work/../etc", "/workx", "/home/other", "/", "/work/repo/../../etc"):
+            with self.subTest(dir=bad):
+                code, out, err = self.main("launch", "coder7", "--cloud", "--agent", "coder", "--repo", "acme-org/widget-service", "--branch", "main",
+                                           "--dir", bad, "--brief-file", str(brief))
+                self.assertEqual(code, 1)
+                self.assertIn("not a path in the pod", err)
+                self.assertIn("/work or /home/worker", err)
+                self.assertEqual(self.stub_calls(), [])
+                self.assertFalse((self.state / "cloud" / "coder7.json").exists())
+
+    def test_a_dir_under_the_pod_roots_is_accepted(self):
+        for ok, name in (("/work/repo", "coder7"), ("/home/worker", "coder8"), ("/work", "coder9")):
+            with self.subTest(dir=ok):
+                brief = self.home / "brief.txt"
+                brief.write_text("x\n")
+                code, out, err = self.main("launch", name, "--cloud", "--agent", "coder", "--repo", "acme-org/widget-service", "--branch", "main",
+                                           "--dir", ok, "--brief-file", str(brief))
+                self.assertEqual(code, 0, err)
+        dirs = [b["location"]["directory"] for m, path, b in self.remote.bodies if m == "POST" and path == "/api/session"]
+        self.assertEqual(dirs, ["/work/repo", "/home/worker", "/work"])
+
     def test_the_brief_is_preceded_by_the_setup_preamble(self):
         self.assertEqual(self.launch()[0], 0)
         prompts = [b["text"] for m, path, b in self.remote.bodies if path.endswith("/prompt")]
