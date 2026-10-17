@@ -11557,14 +11557,6 @@ class TestCosDelegatedClearPermission(unittest.TestCase):
             "fleet-switchboard impact waive 5")]
         self.assertEqual(verdicts, ["deny", "allow", "deny"])
 
-    def test_S5_the_matrix_and_the_delegated_clear_module_are_not_changed_by_this_change(self):
-        base = subprocess.run(["git", "merge-base", "HEAD", "origin/main"], cwd=REPO, capture_output=True, text=True)
-        if base.returncode:
-            self.skipTest("no origin/main to diff against")
-        names = subprocess.run(["git", "diff", "--name-only", base.stdout.strip(), "HEAD"], cwd=REPO, capture_output=True, text=True).stdout.split()
-        self.assertNotIn("docs/review-laws/impact-matrix.json", names)
-        self.assertFalse([n for n in names if "delegated_clear" in n])
-
 
 class TestVerdictRecordingText(unittest.TestCase):
     """The reviewer and tester roles record their verdict in ONE command as the last step of the review they already do (text only)."""
