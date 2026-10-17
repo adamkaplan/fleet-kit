@@ -218,7 +218,8 @@ class Record(td.Driver):
         self.assertEqual((info["transcript"], info["exit_reason"], info["repository"]), ("saved", "retired", td.REPO))
         self.assertEqual(json.loads(out)["record"], d)
         self.assertEqual(err.count(d), 1)
-        self.assertEqual(self.audit_lines()[-1]["reason"], "retired; run record %s" % d)
+        # the audit scrubs token-shaped runs in a temp path (macOS), so compare only the fixed parts
+        self.assertRegex(self.audit_lines()[-1]["reason"], r"^retired; run record .*-\d{8}T\d{6}Z-[0-9a-f]{6}$")
         lines = self.read(os.path.join(d, "transcript.jsonl")).splitlines()
         self.assert_lines_are_json(lines)
         self.assert_record_has_no_secret()   # the launcher learned the secrets from the pod's own mounts
