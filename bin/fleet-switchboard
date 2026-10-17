@@ -20761,6 +20761,8 @@ def cmd_review(args, runner, now):
     its result per head). Reads GitHub with GETs only; `record` writes the hash-chained ledger and the audit."""
     if args.review_cmd == "measure":
         return cmd_review_measure(args, runner, now)
+    if args.review_cmd == "checkout":
+        return cmd_review_checkout(args, runner, now)
     try:
         engine, state, config = build_engine(runner, now, "cli", writable=args.review_cmd == "record")
         repo, number, ref, raw = _review_pr(args, engine)
@@ -20861,6 +20863,50 @@ def cmd_review(args, runner, now):
 
 
 cmd_review.direct = True   # no error mapping, no daemon start
+
+
+def cmd_review_checkout(args, runner, now):
+    """`review checkout <pr>` (#721): the PR's exact head tree, diff and base copies in `.review/<head sha>/` of the working directory, printed;
+    `review checkout --remove <dir>` removes a directory this command made. The head is read ONCE (or given) and used for every fetch."""
+    rc = load_module("review_checkout")
+    try:
+        if args.remove:
+            if args.pr or args.head:
+                raise ReviewError("--remove takes only the directory")
+            try:
+                removed = rc.remove(args.remove, os.getcwd())
+            except rc.Unsafe as err:
+                raise ReviewError("refused: %s" % err) from None
+            print("removed %s" % removed)
+            return EXIT_OK
+        if not args.pr:
+            raise ReviewError("give the pull request (owner/repo#N), or --remove <directory>")
+        engine, state, config = build_engine(runner, now, "cli", writable=False)
+        repo, number, ref, raw = _review_pr(args, engine)
+        head = args.head or raw.get("headRefOid")
+        base = raw.get("baseRefOid")
+        if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
+            raise ReviewError("the head must be a full 40-character commit sha (the PR's head is unknown, or --head is short)")
+        reader = IntentReader(config["gh"], repo, runner, now, config["call_timeout_seconds"], accounts=GhAccounts(config, runner, now))
+
+        def api(path):
+            try:
+                return reader._api(path, repo)
+            except IntentError as err:
+                raise rc.Problem("%s: %s" % (path.split("?")[0], _one_line(str(err), 160))) from None
+
+        try:
+            path = rc.checkout(api, repo, number, head, base, os.getcwd(), notify=lambda text: sys.stderr.write("%s: review checkout: %s\n" % (PROG, text)))
+        except rc.OverBound as err:
+            sys.stderr.write("%s: review checkout: refused, nothing left behind: %s\n" % (PROG, _one_line(str(err), 400)))
+            return EXIT_USAGE
+        except (rc.Unsafe, rc.Problem) as err:
+            raise ReviewError("refused, nothing left behind: %s" % err) from None
+        print(path)
+        return EXIT_OK
+    except (ReviewError, ConfigError, IdentityUncertain, CallerError) as err:
+        sys.stderr.write("%s: review: %s\n" % (PROG, _one_line(str(err), 400)))
+        return EXIT_ERROR
 
 
 # ---------------------------------------------------------------- `review measure` (#179, slice L7)
@@ -21021,6 +21067,10 @@ def add_review_parsers(sub):
                         help="The impact reviewer's action from the matrix")
     record.add_argument("--impact-class", dest="impact_class", help="The class of the impact that drives the action (a class of the matrix file's owner_hold block)")
     record.add_argument("--summary", help="One line (at most 200 characters)")
+    checkout = rsub.add_parser("checkout", help="Write the PR's exact head tree, its diff and the base copies of the touched files into .review/<head sha> here, read-only, and print the path; --remove <dir> removes one")
+    checkout.add_argument("pr", nargs="?", help="owner/repo#N or the PR's URL")
+    checkout.add_argument("--head", help="The commit to materialise (default: the PR's head, read once at the start)")
+    checkout.add_argument("--remove", metavar="DIR", help="Remove a directory this command made (restores the permissions it set; anything else is refused)")
     measure = rsub.add_parser("measure", help="Read-only: per merged PR, time to green CI, review rounds, findings, escaped defects; baseline and after medians")
     measure.add_argument("repo", help="owner/repo")
     measure.add_argument("--count", type=int, default=10, help="PRs per group (default 10)")

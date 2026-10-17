@@ -17,6 +17,8 @@ Two things decide whether the panel can judge at all:
 - **Run it from a checkout at the pull request's head.** A subagent reads the working tree of the session that launched it, not the pull request: from another branch it cannot see the files the change touches and answers `verdict: incomplete`. Switch your session to a worktree at the head (and check `git rev-parse HEAD` equals the head you record) before you invoke the reviewers.
 - **Give each reviewer the FULL form of its commands in the prompt**, with the repository and the number: `fleet-switchboard review laws owner/repo#N` (a bare number is refused) and `gh pr diff N --repo owner/repo`, and say "one command per call, no pipes, no redirects".
 
+Run `fleet-switchboard review checkout owner/repo#N` once from the directory the reviewers start in, and tell each reviewer to read the directory it prints (the exact head tree, `pr.diff` and the base copies), then `fleet-switchboard review checkout --remove <directory>` when the review is done.
+
 Each reviewer runs its shell commands **bare**: one command per call, no pipe (`| head`), no redirect (`2>&1`, `>`), no `cd X &&` chain; the permissions refuse anything compound or with a `>` in it, and the commands it needs (`fleet-switchboard review laws <pr>`, `gh pr diff <pr>`, `gh pr view <pr>`, `gh pr checks <pr> --repo <owner/repo>`, `git diff|log|show ...`) print what it needs without them. A reviewer reads the head's check results with `gh pr checks` to judge a claim about behaviour (R-LAW-16); it still never runs, builds or tests anything, and it never opens a browser or watches (`--web`, `-w` and `--watch` are refused). Tell it so when you invoke it.
 
 Each reviewer:
