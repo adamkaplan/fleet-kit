@@ -2806,6 +2806,14 @@ flowchart LR
   the Lab, acts for you there, and tears the cast down afterwards. It types
   only into panes of the "Switchboard Lab" workspace.
 - **Work.** A local scratch git repo. No GitHub until PR 5.
+- **The Lab service's port.** A service started from a Lab shell inherits the
+  default port of the live service, so it fails with "port already in use" or,
+  worse, reaches the live service. Before the first start, and before any
+  restart, give the Lab service its own port: run `service set port <free port>`
+  (for example `service set port 49392`) from the Lab shell. Also, before any
+  restart, check that the service record and the pid it names are inside the Lab
+  root (for example under `/home/user/lab`); if either is outside it, stop,
+  because the restart would hit the live service.
 
 ## Spikes (PR 1)
 
