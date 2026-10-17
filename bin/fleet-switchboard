@@ -822,8 +822,12 @@ def ensure_state_dir(path=None):
     """
     path = Path(path) if path else state_dir_path()
     if not path.exists():
-        path.mkdir(parents=True, mode=0o700)
-        os.chmod(str(path), 0o700)  # mkdir's mode is filtered by the umask
+        try:
+            path.mkdir(parents=True, mode=0o700)
+        except FileExistsError:
+            pass   # another process (three `heavy` wrappers started together) made it between the look and the mkdir: checked below like any existing one
+        else:
+            os.chmod(str(path), 0o700)  # mkdir's mode is filtered by the umask; only the process that made it sets it
     info = path.stat()
     if not path.is_dir():
         raise ConfigError("state path is not a directory: %s" % path)
