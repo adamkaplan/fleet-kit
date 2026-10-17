@@ -528,7 +528,12 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
             remove = [names["hold-impact"]]
             if ours.get("merge_label_added"):
                 remove.append(names["merge-captain"])
-            remove += authors_hold_labels(names, raw, remove)   # #742: the author's own hold goes with the floor's, from THIS read (the PR's labels at the cleared head)
+            if under_order is None:
+                remove += authors_hold_labels(names, raw, remove)   # #742: the OWNER's clear lifts the author's own hold with the floor's, from THIS read (the PR's labels at the cleared head)
+            elif names["merge-captain"] in authors_hold_labels(names, raw, remove):
+                why = "%s carries a %s label the switchboard did not add: it is a person's own hold, not the Chief of Staff's to lift under an order; the owner clears it" % (pr, names["merge-captain"])
+                engine.audit.append(engine.actor, "gate.hold_clear_refused", pr, {"head": current, "by": who, "under_order": under_order["number"], "why": _one_line(why, 300)})
+                raise NoticeError(why)   # nothing is written: the check runs before the clear is recorded
         else:
             remove = list(remove)
         head_now = current

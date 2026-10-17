@@ -13664,6 +13664,38 @@ class TestClearRemovesTheAuthorsHold(Base):
         removable = set(sb.authors_hold_labels(n, {"labels": sorted(every)}, []))
         self.assertEqual(removable, {n[k] for k in ("merge-captain",) + tuple(sb.CAPTAIN_HOLD_LABELS)})
 
+    ORDER = {"number": 5, "text": "the owner's standing order"}
+
+    def daemon_added(self, *labels):
+        state, _ = sb.read_impact_state(self.world.state)
+        state["applied"]["%s#7" % self.REPO] = {"head": self.H[7], "merge_label_added": self.names["merge-captain"] in labels, "added": sorted(labels), "at": 1}
+        sb.write_impact_state(self.world.state, state)
+
+    def test_d1_a_delegated_clear_keeps_the_old_rule_only_what_the_switchboard_added_comes_off(self):
+        n = self.names
+        self.daemon_added(n["merge-captain"], n["hold-impact"])
+        self.clear(7, head=self.H[7], via="order:5", under_order=self.ORDER)
+        self.assertEqual(sorted(self.labels[7]), sorted([n["hold-policy"], n["hold-security"], "bug"]), "the author's hold-<reason> labels stay under an order")
+        (cleared,) = self.audits()
+        self.assertEqual(sorted(cleared["detail"]["removed"]), sorted([n["merge-captain"], n["hold-impact"]]))
+
+    def test_d2_a_delegated_clear_is_refused_for_a_merge_captain_the_switchboard_did_not_add_and_nothing_changes(self):
+        self.daemon_added(self.names["hold-impact"])
+        with self.assertRaises(sb.NoticeError) as raised:
+            self.clear(7, head=self.H[7], via="order:5", under_order=self.ORDER)
+        self.assertIn("a person's own hold", str(raised.exception))
+        self.assertEqual((self.deletes, self.labels[7], self.clears(), self.audits()), ([], self.held, {}, []))
+        (refused,) = [e for e in self.world.audit() if e["event"] == "gate.hold_clear_refused"]
+        self.assertEqual(refused["detail"]["under_order"], 5)
+
+    def test_d3_a_delegated_clear_never_removes_a_label_of_another_prefix_or_another_pr(self):
+        n = self.names
+        self.labels[7] = [n["hold-impact"], "other:merge-captain", "other:hold-policy"]
+        self.daemon_added(n["hold-impact"])
+        self.clear(7, head=self.H[7], via="order:5", under_order=self.ORDER)
+        self.assertEqual(self.labels[7], ["other:merge-captain", "other:hold-policy"])
+        self.assertEqual(self.labels[8], self.held)
+
     def test_the_chat_clear_keeps_the_list_the_owner_confirmed(self):
         self.clear(7, remove=[self.names["hold-impact"]])
         self.assertEqual(sorted(l for n, l in self.deletes), [self.names["hold-impact"]])
