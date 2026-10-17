@@ -6,9 +6,15 @@ here=$(cd "$(dirname "$0")/.." && pwd); fail=0
 ok() { echo "ok   $1"; }; bad() { echo "FAIL $1"; fail=1; }
 # Every skip goes through skip(): it prints "skip <case>: <reason>" and records the case, so the CI skip can be pinned (below).
 skiplog=$(mktemp); skip() { echo "skip $1: $2"; echo "$1" >> "$skiplog"; }
-# pin_check <list> <skiplog>: the skipped cases must be EXACTLY the ones in <list> (one per line; # comments and blanks ignored).
+# pin_check <list> <skiplog>: the skipped cases must be EXACTLY the ones in <list> (one case per line; # comments and blanks ignored).
+# Line forms: `case`; `case <uname -s>` (that OS only); `case <uname -s> optional` (that OS only, and the case may also run).
+# $PIN_OS overrides uname for the test.
 pin_check() {
-  local want got; want=$(grep -v '^[[:space:]]*\(#\|$\)' "$1" | sort); got=$(sort "$2")
+  local os=${PIN_OS:-$(uname -s)} want opt got
+  want=$(grep -v '^[[:space:]]*\(#\|$\)' "$1" | awk -v os="$os" '(NF==1||$2==os)&&$3!="optional"{print $1}' | sort)
+  opt=$(grep -v '^[[:space:]]*\(#\|$\)' "$1" | awk -v os="$os" '$2==os&&$3=="optional"{print $1}')
+  # the skipped cases, less the optional ones that skipped, must equal the required list
+  got=$(sort "$2" | awk -v opt="$opt" 'BEGIN{n=split(opt,a,"\n");for(k=1;k<=n;k++)o[a[k]]=1} !($1 in o)')
   [ "$want" = "$got" ]
 }
 
@@ -405,6 +411,7 @@ pins="$here/tests/ci-skips.txt"
 printf 'a\nb\n' > "$tmp/pin"
 printf 'a\nb\n' > "$tmp/s1"; printf 'a\nb\nextra\n' > "$tmp/s2"; printf 'a\n' > "$tmp/s3"
 pin_check "$tmp/pin" "$tmp/s1" && ! pin_check "$tmp/pin" "$tmp/s2" && ! pin_check "$tmp/pin" "$tmp/s3" \
+  && ! PIN_OS=Linux pin_check "$here/tests/ci-skips.txt" "$tmp/s3" && PIN_OS=Darwin pin_check "$here/tests/ci-skips.txt" <(printf 'docker-build-cases\nkubectl-manifests\n') && ! PIN_OS=Darwin pin_check "$here/tests/ci-skips.txt" <(printf 'docker-build-cases\nother\n') \
   && ok "skip pin: exact list passes; a planted extra or a missing skip fails" || bad "skip pin check is broken"
 if [ "${CLOUD_TEST_SKIP_DOCKER:-0}" = 1 ]; then
   pin_check "$pins" "$skiplog" && ok "skip pin: skipped cases are exactly ci-skips.txt" || bad "skipped cases differ from ci-skips.txt: $(tr '\n' ' ' < "$skiplog")"
