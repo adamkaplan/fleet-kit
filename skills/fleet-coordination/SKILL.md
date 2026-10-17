@@ -35,7 +35,7 @@ CHECKPOINT: <a UTC time or an agreed event, with an overdue time>
 ```
 
 A brief for a credential, permission or privileged-script change links `docs/adversarial-checklist.md`.
-The pull request body answers each item of it in one line.
+The pull request body answers each item of it in one line. A Mermaid diagram appears only where it shows data flow, system design or component design, never at the top of a body and never as a summary of what changes, what it touches, what is irreversible and the risk.
 
 Before the coder's first push, it runs both focused (a push voids proofs):
 
@@ -43,6 +43,10 @@ Before the coder's first push, it runs both focused (a push voids proofs):
 bin/test-switchboard -k test_the_role_files_do_not_grow   # the role-file byte cap
 bin/test-switchboard -k TestHygiene                       # shebang, stdlib-only, executable bits
 ```
+
+Before marking the pull request ready, `fleet-switchboard preflight-pr` runs the CI-critical focused classes you otherwise skip (command surface, hygiene, public names, and the cloud suites when `cloud/` changed) and prints one PASS or FAIL line each.
+
+When a scenario's evidence is your own measurement, from your own pane launch a tester of your lane (`--role tester --repo <the pull request's repo> --reports-to <you>`, headless is enough) to re-measure and record the verdict: never record as yourself, and do not ask for a waiver.
 
 `ASK` carries the Intent and Done when of the ask this assignment serves
 (`fleet-switchboard intent <issue>` prints them), so a coder who never sees the
@@ -64,7 +68,7 @@ answers it. A decision goes up a tier at a time: a worker's to its orchestrator,
 the Chief of Staff (with the issue's `<user>:awaiting-cos` label), which resolves it from the owner's
 orders or escalates it to the owner. Never apply `awaiting-user` yourself.
 
-A PR held for the owner carries the `<user>:merge-captain` label and a `<user>:hold-<reason>` label (`security`, `credential`, `contract`, `policy`, `prod-config` or `other-area`) and gets a `fleet-switchboard notice pr`; keep `MERGE: captain` as the first line of its body too, in repos whose own checks read it and until 2026-11-10, after which it is dropped. Any other owner decision is a `report question` PLUS a `## Decision required` section at the top of the issue body (and the `<user>:awaiting-cos` label, never `awaiting-user`), never only words in a report: a report or comment saying something waits on the owner does not reach the panel; the section and label do. The switchboard sweep (#117) flags mismatches to cos. A deliberately deferred item carries `<user>:parked` and a `Parked until: <YYYY-MM-DD>` line in its body; it is exempt from the no-next-step flag until that date (never from an owner wait or a held PR).
+A PR held for the owner carries the `<user>:merge-captain` label and a `<user>:hold-<reason>` label (`security`, `credential`, `contract`, `policy`, `prod-config` or `other-area`) and gets a `fleet-switchboard notice pr`; keep `MERGE: captain` as the first line of its body too, in repos whose own checks read it and until 2026-11-10, after which it is dropped. A held PR's body then opens (after those lines) with `## Why this needs you`, `## What changes for you` (a Before | After table), `## Example`, an optional real image, then `## Questions for you` (each with a Recommendation:); any Mermaid diagram goes below. Any other owner decision is a `report question` PLUS a `## Decision required` section at the top of the issue body (and the `<user>:awaiting-cos` label, never `awaiting-user`), never only words in a report: a report or comment saying something waits on the owner does not reach the panel; the section and label do. The switchboard sweep (#117) flags mismatches to cos. A deliberately deferred item carries `<user>:parked` and a `Parked until: <YYYY-MM-DD>` line in its body; it is exempt from the no-next-step flag until that date (never from an owner wait or a held PR).
 
 Related findings go up as one **batch**, never one question each: `fleet-switchboard decisions batch
 --title "<title>" --row "<repo#N> | <finding> | <recommendation>" ...` (or `--file`, or stdin) creates one
@@ -95,6 +99,10 @@ is a denial, not an invitation — see the authority rules below.
 For complex or newly-shaped scope, ask the coder for a short readback of task,
 authority and exclusions before it starts. Two sentences of readback catches the
 misunderstanding that would otherwise cost you an afternoon and a wasted branch.
+
+`send` messages are capped (about 3000 characters in practice, 4000 hard): put long text in a file made under `mktemp -d` and pass it as `"$(cat <file>)"`.
+
+The daemon records the `ci` verdict itself about five minutes after CI is green at the head, so read `fleet-switchboard gates <pr>` and do not ask for `gates ci-record`, which stays for a hurry.
 
 ## Starting a named agent in a pane
 
@@ -363,4 +371,4 @@ report the switchboard retires it by itself; retire is for the cases it cannot t
 
 Full suites and browser/e2e runs go through `fleet-switchboard heavy -- <cmd>`: it waits for one of a few CPU slots and runs the command at background priority, so many agents do not starve the machine.
 
-An agent that is asked to run a mutation or fault-injection check (a tester or the orchestrator's own worker, never a reviewer, who runs nothing) runs each run through `fleet-switchboard heavy` with a time limit (`heavy -- timeout N <command>`), in its own process group which it stops as a whole when the limit is hit, and never leaves one running in the background. The wrapper also stops a tree that passes its ceiling, but do not rely on that for a mutant that can loop.
+An agent that is asked to run a mutation or fault-injection check (a tester or the orchestrator's own worker, never a reviewer, who runs nothing) runs each run through `fleet-switchboard heavy` with a time limit (`heavy -- timeout N <command>`), in its own process group which it stops as a whole when the limit is hit, and runs in the background only as a named job with a time limit and a job record (the job-start rule), never as a loose background process. The wrapper also stops a tree that passes its ceiling, but do not rely on that for a mutant that can loop.

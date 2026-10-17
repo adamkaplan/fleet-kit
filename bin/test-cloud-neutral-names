@@ -23,4 +23,12 @@ for place in image/f.txt manifests/f.txt logs/f.txt sources/f.txt labels.txt env
   grep -q "^$place:" "$t/o" && ok "found in $place" || bad "missed $place"
 done
 ! grep -q $word "$t/o" && ok "the word is never printed" || bad "the word was printed"
+# K2 (#563) S6: the driver and the entrypoint read only prefixed or standard names; an unprefixed new one fails
+printf 'x = env.get("NEW_FLAG")\n' > "$t/new.py"; printf 'a=${NEW_SHELL_FLAG:-1}\nexport OTHER_FLAG\n' > "$t/new.sh"
+CLOUD_BANNED_WORDS_FILE="$t/list" $chk --extra-source "$t/new.py" >"$t/o" 2>&1; rc=$?
+[ $rc = 1 ] && grep -q "env NEW_FLAG read in new.py" "$t/o" && ok "an unprefixed Python environment name exits 1" || bad "unprefixed python name rc=$rc"
+CLOUD_BANNED_WORDS_FILE="$t/list" $chk --extra-source "$t/new.sh" >"$t/o" 2>&1; rc=$?
+[ $rc = 1 ] && grep -q "env NEW_SHELL_FLAG" "$t/o" && grep -q "env OTHER_FLAG" "$t/o" && ok "unprefixed shell names exit 1" || bad "unprefixed shell names rc=$rc"
+printf 'x = env.get("CW_NEW_FLAG") or env.get("HOME")\n' > "$t/ok.py"
+CLOUD_BANNED_WORDS_FILE="$t/list" $chk --extra-source "$t/ok.py" >"$t/o" 2>&1; [ $? = 0 ] && ok "prefixed and standard names pass" || bad "prefixed name: $(cat "$t/o")"
 [ $fail = 0 ] && echo "RESULT: PASS" || { echo "RESULT: FAIL"; exit 1; }

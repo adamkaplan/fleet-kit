@@ -8,7 +8,9 @@ is told ONCE per failed run, in one line: the repository, the pull request, the 
 (else the failed job names, else a plain statement that the result is unreadable: never a guess), and whether the same test failed on other ejected
 pull requests of that repository in the last 2 hours (a flake on the base branch reads differently from the pull request's own fault).
 
-Nobody is woken for a cancelled run, a run a newer one superseded, a pull request still in the queue, or a pull request that merged or closed. A repository
+A failed run whose pull request still holds a queue entry in state UNMERGEABLE is told the same way, once, as a stuck entry (the entry state comes with the pull request read: no added read; the ledger key is the run's, so a later removal wakes nobody again).
+
+Nobody is woken for a cancelled run, a run a newer one superseded, a pull request still in the queue in any other state, or a pull request that merged or closed. A repository
 that is excluded or not watched is never read. Reads are bounded: one list per repository, at most MAX_DOWNLOADS artifact downloads a pass, the whole pass
 inside the caller's call budget. A run is remembered in `queue-ejections.json` (state directory) once its wake was sent, so a restart wakes nobody twice.
 
@@ -29,6 +31,7 @@ CONFIG_DEFAULT = None            # absent: the defaults below
 DEFAULT_WORKFLOW = "ci"
 DEFAULT_ARTIFACT = "failing-tests"
 STATE_FILE = "queue-ejections.json"
+STUCK_STATE = "UNMERGEABLE"   # a queue entry in this state after a failed run is not removed by GitHub (#696)
 
 LIST_SECONDS = 120        # a repository's runs are listed no oftener than this
 LIST_PAGE = 100           # runs asked for in the one list
@@ -42,10 +45,11 @@ MAX_NAMES = 20
 NAME_MAX = 200
 NAMES_CHARS = 2400        # the characters of the names in one line (20 names of 200 would overrun a message)
 LINE_MAX = 3600
+UNOWNED_HOURLY = 3600     # the Chief of Staff is told of ONE pull request no oftener than this; the runs between are counted and carried
 LEDGER_MAX = 500
 LEDGER_KEEP = 86400
 ZIP_MAX = 2 * 1024 * 1024
-NEEDS = ("_RedsReader", "GitHubItem", "PROG", "_read_small", "_write_small", "_one_line", "load_module", "subprocess")
+NEEDS = ("_RedsReader", "GitHubItem", "PROG", "_read_small", "_write_small", "_one_line", "load_module", "subprocess", "chiefs_of_staff")
 
 BRANCH = re.compile(r"gh-readonly-queue/[^\s]+/pr-(\d{1,9})-[0-9a-f]{7,40}")
 ISO = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
@@ -182,9 +186,34 @@ def _quoted(names, total):
     return " | ".join(shown), max(0, total - len(shown))
 
 
+def build_unowned_line(entry, head):
+    """The line the Chief of Staff gets for a pull request whose orchestrator cannot be told: FACTS only (the repository, the pull request, the run, how many failed, of what kind, where
+    the names are). No name taken from the artifact or from a job is in it: the Chief of Staff reads no outsider text."""
+    if entry.get("absent"):
+        who = "Its orchestrator %s is not running." % safe(entry["absent"], 80)
+    else:
+        who = "No orchestrator owns this pull request."
+    if entry["kind"] == "tests":
+        what = "%d failing test%s" % (entry["total"], "" if entry["total"] == 1 else "s")
+    elif entry["kind"] == "jobs":
+        what = "%d failed job%s (no %s artifact)" % (entry["total"], "" if entry["total"] == 1 else "s", entry["artifact"])
+    else:
+        what = "the result is unreadable"
+    line = "%s %s Kind: %s, %s. The names are in the run: https://github.com/%s/actions/runs/%d" % (head, who, entry["kind"], what, entry["repo"], entry["run"])
+    if entry.get("unannounced"):
+        line += " (%d earlier failed run%s of this pull request went unannounced in the last hour)" % (entry["unannounced"], "" if entry["unannounced"] == 1 else "s")
+    return line[:LINE_MAX]
+
+
 def build_line(entry, others, now):
     """The one line. `entry`: repo, pr, run, at (ISO or None), kind ("tests", "jobs" or "unreadable"), names, total, why."""
-    head = "Merge queue ejection: %s#%d left the queue when run %d failed (%s)." % (entry["repo"], entry["pr"], entry["run"], entry["at"] or "time unknown")
+    if entry.get("stuck"):
+        head = "Merge queue entry stuck: run %d of %s#%d failed (%s) and its queue entry is still there in state %s, so it is stuck and blocks the pull requests behind it." % (
+            entry["run"], entry["repo"], entry["pr"], entry["at"] or "time unknown", STUCK_STATE)
+    else:
+        head = "Merge queue ejection: %s#%d left the queue when run %d failed (%s)." % (entry["repo"], entry["pr"], entry["run"], entry["at"] or "time unknown")
+    if entry.get("unowned"):
+        return build_unowned_line(entry, head)
     if entry["kind"] == "tests":
         if entry["names"]:
             body, left = _quoted(entry["names"], entry["total"])
@@ -262,13 +291,20 @@ def write_ledger(sb, engine, woke, now):
 def run_pass(sb, engine, now, calls):
     """One pass. `calls` is the pass's budget of gh reads. Never raises into the caller. Returns the number of reads spent."""
     hub = getattr(engine, "hub", None)
-    if hub is None or engine.audit is None or engine.state_dir is None or not hasattr(hub, "route_of"):
+    if engine.audit is None or engine.state_dir is None:
         return 0
+    memory = engine.__dict__.setdefault("queue_ejections", {})
+    for name, empty in (("listed", {}), ("runs", {}), ("retry", {}), ("attempts", {}), ("built", {}), ("said", set()), ("recheck", {}),
+                        ("lists", {}), ("first", {}), ("held", {}), ("skip_last", None)):
+        memory.setdefault(name, empty)
     discovery = getattr(engine, "discovery", None)   # the pass's own discovery: no second look at every pane
+    if hub is None or not hasattr(hub, "route_of"):
+        return 0   # no GitHub hub in this process: the check is not in play (nothing to skip), so it says nothing
     if discovery is None or discovery.problems:
+        _say_skips(engine, memory, {"discovery": len(discovery.problems) if discovery is not None else 1})
         return 0
     workflow, artifact = names_of(engine.config)
-    memory = engine.__dict__.setdefault("queue_ejections", {"listed": {}, "runs": {}, "retry": {}, "attempts": {}, "built": {}, "said": set(), "recheck": {}})
+    skips = {}   # why a candidate was not handled in THIS pass: said once at its end (never a silent skip)
     woke = read_ledger(sb, engine)
     before = {k: dict(v) for k, v in woke.items()}
     runner = getattr(engine, "gh_runner", None) or sb.subprocess.run
@@ -288,19 +324,26 @@ def run_pass(sb, engine, now, calls):
                     memory["said"].add(repo)
                     engine.audit.append(engine.actor, "queue_ejection.read_failed", repo, {"error": sb._one_line(str(err), 160)})
             memory["listed"][repo] = now
+            memory["lists"][repo] = memory["lists"].get(repo, 0) + 1
         for number, run in sorted(newest_by_pr(memory["runs"].get(repo), workflow).items()):
             at, ts = _stamp(run)
             key = "%s#%d" % (repo, run["id"])
             if is_failed(run) and key not in woke and ts is not None and now - ts <= WAKE_WINDOW:
                 candidates.append((ts, repo, number, run, at, key))
+                memory["first"].setdefault(key, {"seen_after": max(0, int(now - ts)), "why": "first_list" if memory["lists"].get(repo, 0) <= 1 else "list_interval"})
     for ts, repo, number, run, at, key in sorted(candidates, key=lambda c: (c[0], c[1], c[2])):
         if now < memory["retry"].get(key, 0) or now < memory["recheck"].get(key, 0):
+            _skip(skips, memory, key, "retry" if now < memory["retry"].get(key, 0) else "queued")
             continue
         entry = memory["built"].get(key)
         reader = _reader(sb, engine, runner, now, repo)
         if entry is None:
-            if spent + 3 > calls or downloads >= MAX_DOWNLOADS:
-                break   # the pull request read and the run's two reads must fit this pass; the rest wait
+            if spent + 3 > calls or downloads >= MAX_DOWNLOADS:   # the pull request read and the run's two reads must fit this pass; the rest wait
+                waiting = [c[5] for c in candidates if (c[5] == key or (c[0], c[1], c[2]) > (ts, repo, number))
+                           and now >= memory["retry"].get(c[5], 0) and now >= memory["recheck"].get(c[5], 0) and c[5] not in memory["built"]]   # only those that would have been read
+                for left in waiting:
+                    _skip(skips, memory, left, "budget")
+                break
             spent += 1
             try:
                 state = reader.pull_state(number)
@@ -311,8 +354,11 @@ def run_pass(sb, engine, now, calls):
             if state["state"] != "OPEN":   # merged or closed: nobody is woken, and it is never looked at again
                 woke[key] = {"pr": number, "ts": ts, "woke": False, "names": [], "kind": "skipped"}
                 continue
-            if state["queued"]:            # it holds a queue entry: it is in the queue, not ejected; looked at again later
+            # an entry state that cannot be read is None: not stuck, so the run is looked at again later (quiet, never a guess)
+            stuck = state["queued"] and state.get("entry_state") == STUCK_STATE   # a failed run whose entry GitHub left in the queue: it blocks those behind it (#696)
+            if state["queued"] and not stuck:   # it holds a queue entry: it is in the queue, not ejected; looked at again later
                 memory["recheck"][key] = now + RECHECK_SECONDS
+                _skip(skips, memory, key, "queued")
                 continue
             item = sb.GitHubItem("ejection:%s" % key, "ejection", "", repo, [], [("pr", number)], sb.PROG, now, numbers=[number])
             try:
@@ -321,10 +367,21 @@ def run_pass(sb, engine, now, calls):
                 memory["retry"][key] = now + RETRY_SECONDS
                 _said(sb, engine, memory, key, "queue_ejection.read_failed", {"error": sb._one_line(str(err), 160)})
                 continue
-            if not owner:   # nobody owns it: said once, and not looked at again
-                woke[key] = {"pr": number, "ts": ts, "woke": False, "names": [], "kind": "unrouted"}
-                engine.audit.append(engine.actor, "queue_ejection.unrouted", "%s#%d" % (repo, number), {"run": run["id"]})
-                continue
+            unowned = not owner
+            if unowned:   # nobody owns it: the Chief of Staff (found by its metadata role) is told instead, once per failed run
+                chiefs = sb.chiefs_of_staff(discovery)
+                if not chiefs:
+                    memory["retry"][key] = now + RETRY_SECONDS
+                    _skip(skips, memory, key, "no_chief")
+                    continue
+                owner = chiefs[0]
+                recent = _last_unowned_wake(woke, batch, repo, number, now)
+                if recent is not None and now - recent < UNOWNED_HOURLY:   # this pull request's runs keep failing: counted, not announced again
+                    woke[key] = {"pr": number, "repo": repo, "ts": ts, "woke": False, "names": [], "kind": "suppressed", "sup_at": now}
+                    engine.audit.append(engine.actor, "queue_ejection.suppressed", "%s#%d" % (repo, number), {"run": run["id"], "last_wake_seconds_ago": int(now - recent)})
+                    continue
+                named = getattr(hub, "notice_names", lambda *_: [])(repo, number)
+                absent = next((n for n in named if n not in discovery.agents), None)
             try:
                 spent += 2
                 found = read_failure(reader, sb.load_module("reds"), repo, run["id"], artifact)
@@ -336,7 +393,10 @@ def run_pass(sb, engine, now, calls):
                 if memory["attempts"][key] < ATTEMPTS:
                     continue
                 found = {"kind": "unreadable", "names": [], "total": 0, "why": "its artifact could not be read", "download": False}
-            entry = dict(found, repo=repo, pr=number, run=run["id"], at=at, ts=ts, owner=owner, artifact=artifact, key=key)
+            entry = dict(found, repo=repo, pr=number, run=run["id"], at=at, ts=ts, owner=owner, artifact=artifact, key=key, unowned=unowned, stuck=bool(stuck))
+            if unowned:
+                entry["absent"] = absent
+                entry["unannounced"] = _unannounced(woke, repo, number)
             memory["built"][key] = entry
         batch.append(entry)
     others = [v for v in woke.values() if v.get("woke")]
@@ -346,16 +406,56 @@ def run_pass(sb, engine, now, calls):
         if not _deliver(sb, engine, memory, entry["owner"], line, entry["key"]):
             continue
         woke[entry["key"]] = {"pr": entry["pr"], "repo": entry["repo"], "ts": entry["ts"], "woke": True, "kind": entry["kind"], "names": entry["names"]}
+        if entry.get("unowned"):
+            woke[entry["key"]]["unowned_at"] = now   # when the Chief of Staff was told of this pull request
         memory["built"].pop(entry["key"], None)
-        engine.audit.append(engine.actor, "queue_ejection.woke", "%s#%d" % (entry["repo"], entry["pr"]),
-                            {"run": entry["run"], "to": entry["owner"], "kind": entry["kind"], "names": len(entry["names"])})
+        detail = {"run": entry["run"], "to": entry["owner"], "kind": entry["kind"], "names": len(entry["names"])}
+        detail.update(memory["first"].get(entry["key"]) or {})   # how late it was first seen, and why
+        if memory["held"].get(entry["key"]):
+            detail["held"] = dict(memory["held"][entry["key"]])
+        engine.audit.append(engine.actor, "queue_ejection.unowned_woke" if entry.get("unowned") else "queue_ejection.woke", "%s#%d" % (entry["repo"], entry["pr"]), detail)
         before = _save(sb, engine, woke, before, now)   # at once: a crash after a send must not wake it again
     _save(sb, engine, woke, before, now)
     for table in ("retry", "attempts", "built", "recheck"):   # what is done, or past its time, is forgotten: the memory does not grow with the days
         for key in [k for k, v in memory[table].items() if k in woke or (table in ("retry", "recheck") and now >= v)]:
             memory[table].pop(key, None)
     memory["said"] -= set(woke)
+    current = {c[5] for c in candidates}
+    for table in ("first", "held"):   # a run that settled, aged out of the window, was superseded or whose pull request closed is no longer a candidate
+        for key in [k for k in memory[table] if k in woke or k not in current]:
+            memory[table].pop(key, None)
+    _say_skips(engine, memory, skips)
     return spent
+
+
+def _last_unowned_wake(woke, batch, repo, number, now):
+    """When the Chief of Staff was last told of this pull request (this pass's batch counts as now); None when never."""
+    times = [v["unowned_at"] for v in woke.values() if v.get("repo") == repo and v.get("pr") == number and isinstance(v.get("unowned_at"), (int, float))]
+    times += [now for b in batch if b["repo"] == repo and b["pr"] == number and b.get("unowned")]
+    return max(times) if times else None
+
+
+def _unannounced(woke, repo, number):
+    """How many failed runs of this pull request went unannounced since the Chief of Staff was last told of it."""
+    last = _last_unowned_wake(woke, [], repo, number, 0)
+    return len([v for v in woke.values() if v.get("kind") == "suppressed" and v.get("repo") == repo and v.get("pr") == number and (last is None or v.get("sup_at", 0) >= last)])
+
+
+def _skip(skips, memory, key, reason):
+    """A candidate not handled this pass: counted for the pass's one line, and kept against the run for the line that settles it."""
+    skips[reason] = skips.get(reason, 0) + 1
+    held = memory["held"].setdefault(key, {})
+    held[reason] = held.get(reason, 0) + 1
+
+
+def _say_skips(engine, memory, skips):
+    """The pass's ONE line about what it skipped: the reasons and counts. A pass that skipped nothing says nothing; a pass that skipped just what the one before skipped does not repeat it."""
+    summary = dict(skips)
+    if summary == (memory.get("skip_last") or {}):
+        return
+    memory["skip_last"] = summary or None
+    if summary:
+        engine.audit.append(engine.actor, "queue_ejection.skipped", None, dict(summary, reason="+".join(sorted(summary))))
 
 
 def _save(sb, engine, woke, before, now):

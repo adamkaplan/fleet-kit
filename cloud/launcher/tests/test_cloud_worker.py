@@ -37,8 +37,10 @@ class Clock:
 
 
 class Base(unittest.TestCase):
+    TMP_BASE = None   # a class may root its temp directory in a path of a known shape (None: the platform's)
+
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(dir=self.TMP_BASE)
         self.addCleanup(self.tmp.cleanup)
         d = self.tmp.name
         self.state = os.path.join(d, "kube.json")
@@ -46,7 +48,7 @@ class Base(unittest.TestCase):
         self.env = {"CW_KUBECTL": os.path.join(HERE, "fake_kubectl"), "FAKE_KUBE_STATE": self.state,
                     "CW_CLOUD_AUDIT": os.path.join(d, "audit.jsonl"), "CW_CLOUD_IMAGE": "registry.example.internal/worker:1",
                     "CW_TOKEN_ENDPOINT": "https://tokens.example.internal/mint", "CW_CLOUD_DOMAIN": "example.internal",
-                    "CW_KUBE_CONTEXT": "acme-cw", "FAKE_KUBE_CALLS": os.path.join(d, "calls.jsonl")}
+                    "CW_KUBE_CONTEXT": "acme-cw", "CW_ALLOWED_REPOS": "a/b,acme-org/widget-service", "FAKE_KUBE_CALLS": os.path.join(d, "calls.jsonl")}
         self.clock = Clock()
 
     def write_state(self, st):
@@ -395,7 +397,7 @@ class S5EndHook(Base):
             code, out, _ = self.run_cli("stop", "coder7", "--reason", reason)
             self.assertEqual(code, 0)
             self.assertEqual(json.loads(out)["wip_branch"], "coder7/wip")
-            self.assertEqual(self.audit_lines()[-1]["reason"], reason)
+            self.assertTrue(self.audit_lines()[-1]["reason"].startswith(reason + "; run record "), self.audit_lines()[-1]["reason"])   # every stop records (#638)
 
     def test_push_failure_keeps_the_pod_and_exits_1(self):
         work, origin = make_repo(self.tmp.name, "r", dirty=True)
@@ -485,7 +487,7 @@ class S6Context(Base):
         calls = self.calls()
         self.assertGreater(len(calls), 15)
         verbs = {c[c.index("-n") + 2] for c in calls}
-        self.assertTrue({"apply", "get", "annotate", "delete", "exec"} <= verbs, verbs)
+        self.assertTrue({"create", "get", "annotate", "delete", "exec"} <= verbs, verbs)
         for c in calls:
             self.assertEqual(c[:4], ["--kubeconfig", "/home/user/.kube/cw-config", "--context", "acme-cw"], c)
 

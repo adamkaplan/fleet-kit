@@ -1,0 +1,4 @@
+{
+ "command": "preflight-pr",
+ "help": "usage: fleet-switchboard preflight-pr [-h] Runs, each under the `heavy` wrapper and a time ceiling: the command-surface snapshot class, the hygiene and role-file classes, bin/check-public-names and, when files under cloud/ changed against the base, the cloud suites with TMPDIR a 49-character token-shaped directory name. Only runs tests: it never pushes, labels or records a verdict. options: -h, --help show this help message and exit"
+}

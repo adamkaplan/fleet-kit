@@ -11,6 +11,7 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
@@ -253,6 +254,106 @@ export function makeTally({ dir, now = Date.now, writeFile = fs.promises.writeFi
   return tally;
 }
 
+// #290 slice 6: tell the daemon that something happened in a session, so it reads that one session once instead of polling. One short
+// JSON line per event on the daemon's own socket (mode 0600, $STATE/judge.sock), written with node `net` (no child process). The message
+// holds a version, a kind, one of a few event names, a session id, a time and at most a message id, a person flag and a count of events
+// dropped before it: NEVER prompt text, never anything from the environment. It is fire and forget: the caller returns at once, a bounded
+// queue and a bounded number of open connections hold the rest, and a full queue or a daemon that is not there drops the event and counts it.
+export const EVENT_SOCKET = "judge.sock";
+export const EVENT_QUEUE_MAX = 20;
+export const EVENT_INFLIGHT_MAX = 4;
+export const EVENT_CONNECT_MS = 500;
+export const EVENT_NAMES = ["prompt", "compaction", "idle", "activity"];
+const SESSION_RE = /^ses_[A-Za-z0-9]{1,80}$/;
+const MESSAGE_RE = /^msg_[A-Za-z0-9]{1,80}$/;
+
+export function makeEventSender({ dir, now = Date.now, connect = net.createConnection, setTimer = setTimeout } = {}) {
+  const queue = [];
+  let inflight = 0;
+  let dropped = 0; // events lost since the last message that carried the count
+  const socketPath = dir ? path.join(dir, EVENT_SOCKET) : null;
+  const pump = () => {
+    while (inflight < EVENT_INFLIGHT_MAX && queue.length > 0) {
+      const message = queue.shift();
+      if (dropped > 0) { message.dropped = dropped; }
+      const owed = message.dropped || 0;
+      if (owed > 0) dropped -= owed;
+      inflight += 1;
+      let done = false;
+      let socket = null;
+      const finish = (ok) => {
+        if (done) return;
+        done = true;
+        inflight -= 1;
+        if (!ok) dropped += 1 + owed; // this event and the count it carried are lost: both are told to the next one
+        try { socket && socket.destroy(); } catch { /* nothing to close */ }
+        if (queue.length > 0) setImmediate(pump);
+      };
+      try {
+        socket = connect(socketPath);
+        const timer = setTimer(() => finish(false), EVENT_CONNECT_MS);
+        timer.unref?.();
+        socket.on("error", () => finish(false));
+        socket.on("connect", () => { socket.end(JSON.stringify(message) + "\n", () => finish(true)); });
+      } catch {
+        finish(false);
+      }
+    }
+  };
+  return {
+    // Never throws and never waits.
+    push(event, sessionID, extra = {}) {
+      try {
+        if (!socketPath || !EVENT_NAMES.includes(event) || typeof sessionID !== "string" || !SESSION_RE.test(sessionID)) return false;
+        if (queue.length >= EVENT_QUEUE_MAX) { dropped += 1; return false; }
+        const message = { v: 1, kind: "event", event, sessionID, at: now() };
+        if (typeof extra.person === "boolean") message.person = extra.person;
+        if (typeof extra.id === "string" && MESSAGE_RE.test(extra.id)) message.id = extra.id;
+        queue.push(message);
+        setImmediate(pump);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    dropped: () => dropped,
+  };
+}
+
+// The in-process facts that name a session. UNVERIFIED until the plugin is loaded in the service: the hook and event names below were read
+// from the service binary and from another plugin, not exercised. A name or shape that does not match pushes nothing (the daemon's
+// `session.list` gate stays the signal); a wrong guess can never push more than the four events above.
+export function sessionOf(event) {
+  const id = event && (event.sessionID ?? event.data?.sessionID ?? event.durable?.aggregateID);
+  return typeof id === "string" ? id : null;
+}
+
+export function eventOf(event) {
+  const type = event && event.type;
+  if (type === "session.idle") return { name: "idle" };
+  if (type === "message.created" && (event.data?.role === "user" || event.data?.message?.role === "user")) {
+    const id = event.data?.id ?? event.data?.messageID ?? event.data?.message?.id;
+    return { name: "prompt", id: typeof id === "string" ? id : undefined };
+  }
+  return null;
+}
+
+export function wireEvents(api, sender) {
+  if (api.session && typeof api.session.hook === "function") {
+    api.session.hook("compaction", (event) => { sender.push("compaction", sessionOf(event)); });
+  }
+  if (api.event && typeof api.event.subscribe === "function") {
+    (async () => {
+      try {
+        for await (const event of api.event.subscribe({})) {
+          const found = eventOf(event);
+          if (found) sender.push(found.name, sessionOf(event), { id: found.id });
+        }
+      } catch { /* the subscription ended: the gate is the signal */ }
+    })();
+  }
+}
+
 export function makeHandler({ bin, timeoutMs = DEFAULT_TIMEOUT_MS, spawnFn = spawn, now = Date.now, state = null, tally = null }) {
   const mode = state || {};
   mode.inflight = mode.inflight || 0;
@@ -348,6 +449,10 @@ export default {
   id: "fleet.hooks",
   async setup(api, env = process.env, deps = {}) {
     const { bin, timeoutMs, shims } = resolveSettings(env, deps);
+    if (env.FLEET_SWITCHBOARD_PLUGIN_EVENTS !== "off") {
+      const sender = deps.sender === undefined ? makeEventSender({ dir: stateDirOf(env, deps.home) }) : deps.sender;
+      if (sender) wireEvents(api, sender); // each part is wired only if the service offers it; never any effect on a tool call
+    }
     if (shims && api.shell && typeof api.shell.hook === "function") api.shell.hook("create.before", makeShellHook(shims));
     if (!bin) return; // not configured: tool calls follow the configured rules alone (and none is counted)
     const tally = deps.tally === undefined ? makeTally({ dir: stateDirOf(env, deps.home) }) : deps.tally;
