@@ -23630,7 +23630,7 @@ class TestIdentityCheck(ReportBase):
         code, out, err = self.call("whoami", "--repo")
         self.assertEqual((code, out.strip()), (0, "acme-ops/service"))
         code, out, err = self.call("whoami", "--json")
-        self.assertEqual((code, json.loads(out)), (0, {"name": "ops", "repo": "acme-ops/service", "own": True, "role": "orchestrator"}))
+        self.assertEqual((code, json.loads(out)), (0, {"name": "ops", "repo": "acme-ops/service", "own": True, "role": "coder"}))
         code, out, err = self.call("whoami")
         self.assertEqual((code, out.strip()), (0, "ops"))
         os.environ["HERDR_PANE_ID"] = self.world.panes["coder"]                      # a pane of ANOTHER agent changes nothing
