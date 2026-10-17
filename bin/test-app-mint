@@ -166,7 +166,10 @@ class Base(unittest.TestCase):
         path.write_text(json.dumps(cfg))
 
     def environ(self, extra=None):
-        body = json.dumps({"name": "worker", "repo": self.repo})
+        ident = {"name": "worker", "repo": self.repo}
+        if getattr(self, "own", None) is not None:
+            ident["own"] = self.own   # False: the caller has no repository of its own (the repo is only the default)
+        body = json.dumps(ident)
         self.sb.write_text("#!/bin/sh\nif [ \"$1\" = whoami ] && [ \"$2\" = --json ]; then echo '%s'; exit 0; fi\n[ \"$1\" = whoami ] && echo worker && exit 0\nexit 2\n" % body)
         self.sb.chmod(0o755)
         env = {"PATH": "%s:%s:%s" % (GH_SHIM.parent, self.bin, SAFE_PATH), "HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / ".config"),
@@ -476,7 +479,7 @@ class TestMatching(Base):
         self.assertEqual(mod._matcher().normal_repo("Acme-Org/Widget-API.git"), "acme-org/widget-api")
 
     def test_s8_through_the_shim_a_cos_style_explicit_repo_is_normalised_before_the_mint(self):
-        self.repo = OTHER   # the caller's own repository is unmapped; the command names the mapped one in odd spelling
+        self.repo, self.own = OTHER, False   # a caller with no repository of its own acts as the repository the command names (odd spelling here)
         done, calls = self.gh("issue", "comment", "7", "-R", "ACME-ORG/Widget-API.git", "--body", "x")
         self.assertEqual(done.returncode, 7, done.stderr)
         self.assertTrue(all(json.loads(r["body"])["repositories"] == ["widget-api"] for r in self.endpoint.mints()))
@@ -540,8 +543,28 @@ class TestHardening(Base):
                 self.assertEqual([c["token"] for c in calls], [TOKEN])
                 self.assertNotIn(STORED, json.dumps(calls[0]["env"]))
 
-    def test_a_command_that_names_a_mapped_repository_uses_the_token_whoever_the_caller_is(self):
+    def test_a_worker_with_its_own_repository_naming_another_mapped_one_is_refused_naming_both(self):
         self.repo = OTHER
+        for extra in (("-R", MAPPED), ("--repo=" + MAPPED,), ("https://github.com/%s/issues/3" % MAPPED,)):
+            with self.subTest(extra):
+                self.setUp()
+                self.repo = OTHER
+                args = ("issue", "comment", "7", "--body", "x") + extra if extra[0] != "https://github.com/%s/issues/3" % MAPPED else ("issue", "view") + extra
+                done, calls = self.gh(*args)
+                self.assertEqual((done.returncode, calls), (1, []), done.stderr)
+                self.assertIn(OTHER, done.stderr)
+                self.assertIn(MAPPED, done.stderr)
+                self.assertEqual(self.endpoint.mints(), [])
+
+    def test_a_caller_with_no_repository_of_its_own_gets_the_named_mapped_repository_token(self):
+        self.repo, self.own = OTHER, False
+        for args in (("issue", "comment", "7", "--body", "x", "-R", MAPPED), ("issue", "view", "https://github.com/%s/issues/3" % MAPPED)):
+            with self.subTest(args):
+                done, calls = self.gh(*args)
+                self.assertEqual([c["token"] for c in calls], [TOKEN], done.stderr)
+                self.assertEqual(json.loads(self.endpoint.mints()[-1]["body"])["repositories"], ["widget-api"])
+
+    def test_a_worker_naming_its_own_mapped_repository_gets_its_token(self):
         done, calls = self.gh("issue", "comment", "7", "--body", "x", "-R", MAPPED)
         self.assertEqual([c["token"] for c in calls], [TOKEN])
 
