@@ -19099,7 +19099,9 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
         if review:
             decision = "hold"
     return {"pr": "%s#%d" % (repo, number), "head": raw.get("headRefOid"), "globs": globs, "exclude": exclude,
-            "floor_paths": hit, "files_read": len(files), "files_total": total, "renamed_no_source": renamed[:20], "complete": complete, "unknown": unknown, "rated": [list(r) for r in rated],
+            "floor_paths": hit, "files_read": len(files), "files_total": total, "renamed_no_source": renamed[:20], "complete": complete,
+            "top_tier_hits": impact_floor.top_tier_hits(paths, matrix), "review_action": record[0] if record else None, "review_class": record[1] if record else None,   # #661: display data the delegated clear reads; no decision changes
+            "changed_paths": [p for p in paths if isinstance(p, str)][:200], "unknown": unknown, "rated": [list(r) for r in rated],
             "decision": decision, "reasons": reasons, "owner_decision": owner[0], "owner_reasons": owner[1], "draft": raw.get("isDraft") is True}
 
 
@@ -21507,8 +21509,9 @@ def add_impact_parsers(sub):
     hold = impact_sub.add_parser("hold", help="What the daemon would label as held right now (read-only dry run; the daemon writes the labels)")
     hold.add_argument("--dry-run", action="store_true", dest="dry_run")
     hold.add_argument("--repo", help="One repo (OWNER/REPO); default: every repo under plan_gates")
-    clear = impact_sub.add_parser("clear", help="The owner's own terminal only: clear a false impact hold for this head, with a reason")
+    clear = impact_sub.add_parser("clear", help="The owner's own terminal: clear a false impact hold for this head, with a reason (the Chief of Staff only under a standing order of the owner's, with --under-order)")
     clear.add_argument("pr", help="The pull request: owner/repo#N or its URL")
+    clear.add_argument("--under-order", type=int, dest="under_order", metavar="N", help="The Chief of Staff only: clear under the owner's standing order N (it must be listed under delegated_clear in the configuration); recorded as her act under that order")
     clear.add_argument("--reason", required=True, help="Why the hold is false (at least 10 characters), logged")
     clear.add_argument("--revoke", action="store_true", help="Take the clear back (and any carry of it): the PR is held again at the daemon's next pass")
 

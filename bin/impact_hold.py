@@ -31,6 +31,10 @@ MOVED = ('gate_floor_fact',
          'notify_clear',
          'impact_clear_core',
          'cmd_impact_clear',
+         'delegated_clear_checks',
+         'delegated_clear_pr_checks',
+         'delegated_clear_map',
+         '_gh_json',
          'impact_plan',
          'cmd_impact_hold',
          'release_impact_hold',)
@@ -392,7 +396,7 @@ def clear_lane(engine, repo, number, body):
     return notice_lane, "the notice" if notice_lane else None, extra
 
 
-def _notify_clear_body(engine, abandoned, kind, repo, number, head, reason=None, body=None, previous=None):
+def _notify_clear_body(engine, abandoned, kind, repo, number, head, reason=None, body=None, previous=None, under_order=None):
     """(the work of `notify_clear`, run on its own thread; `abandoned` is set when the caller gave up waiting: then nothing more is audited) #541: tell the Chief of Staff, and the orchestrator whose lane merges the pull request, at once that the owner cleared it (`kind` "clear": his command or his words in the chat, called
     ONCE from `impact_clear_core`) or that his clear carried to a new head (`kind` "carry": from `previous`, called once from the carry decision). One line. Once per pull request, head and kind (a
     small private file). The caller has already RECORDED the clear; nothing here can undo it: a failure is audited and swallowed. An unknown lane says `lane unknown` and only the Chief of Staff is told:
@@ -418,7 +422,10 @@ def _notify_clear_body(engine, abandoned, kind, repo, number, head, reason=None,
         else:
             flat = re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", re.sub(r"[\n\r\t]", " ", reason or ""))   # line breaks become spaces, other control characters vanish BEFORE the redaction: a token cannot hide behind one
             words = " ".join(redact_command_text(flat).split())
-            line = "owner cleared %s at %s: \"%s\"; %s" % (pr, head[:8], plan_ledger.clip(words, 300), "%s merges it" % lane if lane else unknown)
+            if under_order:   # #661: the same line, naming the Chief of Staff as the clearer and the owner's order
+                line = "%s cleared %s at %s under the owner's standing order %s: \"%s\"; %s" % (under_order.get("by") or "the chief of staff", pr, head[:8], under_order["number"], plan_ledger.clip(words, 300), "%s merges it" % lane if lane else unknown)
+            else:
+                line = "owner cleared %s at %s: \"%s\"; %s" % (pr, head[:8], plan_ledger.clip(words, 300), "%s merges it" % lane if lane else unknown)
         sent, failed = [], []
         for name in ["chief-of-staff"] + ([lane] if lane else []):
             try:
@@ -448,7 +455,7 @@ def _notify_clear_body(engine, abandoned, kind, repo, number, head, reason=None,
         return None
 
 
-def notify_clear(engine, kind, repo, number, head, reason=None, body=None, previous=None):
+def notify_clear(engine, kind, repo, number, head, reason=None, body=None, previous=None, under_order=None):
     """#541: the notice of an owner clear (or of a carry), LAST, after everything else of it is done and bounded by a deadline: the work (lane lookup, sends) runs on its own thread and the
     caller waits at most NOTIFY_CLEAR_DEADLINE_SECONDS. On a timeout, an interrupt or an exception it gives up, audits `gate.clear_notify_failed` once with the reason, and returns None: the clear's
     result, exit status and output are exactly as without a notice. (A send still running when it gives up is left to finish on its daemon thread; it audits nothing more.)"""
@@ -456,7 +463,7 @@ def notify_clear(engine, kind, repo, number, head, reason=None, body=None, previ
     abandoned, result = threading.Event(), []
 
     def work():
-        result.append(_notify_clear_body(engine, abandoned, kind, repo, number, head, reason, body, previous))
+        result.append(_notify_clear_body(engine, abandoned, kind, repo, number, head, reason, body, previous, under_order))
     worker = threading.Thread(target=work, name="clear-notice", daemon=True)
     why = None
     try:
@@ -476,7 +483,7 @@ def notify_clear(engine, kind, repo, number, head, reason=None, body=None, previ
     return None
 
 
-def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, head=None, via=None, verify=None):
+def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, head=None, via=None, verify=None, under_order=None):
     """The owner's clear: record it head-bound (the daemon does not re-add the hold for that head) and remove `hold-impact`, and
     `merge-captain` too when the switchboard itself added it for this hold. Returns the lines to print.
 
@@ -527,12 +534,108 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
         detail = {"head": head_now, "by": who, "reason": reason, "removed": remove}
         if via:
             detail["via"] = via
+        if under_order:   # #661: the Chief of Staff's clear under the owner's standing order: recorded as HER act under that order, never as the owner's
+            detail["under_order"] = under_order["number"]
+            detail["order"] = plan_ledger.clip(under_order["text"], 300)
         if fingerprint is not None:
             detail["fingerprint"] = fingerprint
         engine.audit.append(engine.actor, "gate.hold_cleared", pr, detail)   # inside the lock
     lines = ["cleared the impact hold of %s at %s: removed %s; the daemon will not re-add it for this head" % (pr, head_now[:8], ", ".join(remove))] + neutralise_marker(engine, runner, repo, number, head_now, raw)
-    notify_clear(engine, "clear", repo, number, head_now, reason=reason, body=raw.get("body"))   # LAST: the state, the labels, the marker line and the audit are all done; it can neither delay nor alter them
+    notify_clear(engine, "clear", repo, number, head_now, reason=reason, body=raw.get("body"), under_order=under_order and dict(under_order, by=who))   # LAST: the state, the labels, the marker line and the audit are all done; it can neither delay nor alter them
     return lines
+
+
+def delegated_clear_checks(engine, runner, now, kind, number):
+    """(order {"number", "text"}, None) when the caller may clear under standing order `number`, else (None, why): the caller is the Chief of Staff's own session (its RECORDED role, never a
+    flag or a text), the delegated clear is configured (`delegated_clear`), the order is listed there and really is an order of the charter (read from GitHub). #661."""
+    module = load_module("delegated_clear")
+    if not module.caller_is_chief(kind):
+        return None, "only the Chief of Staff may clear under the owner's standing order (%s is %s)" % (kind[1], "an agent" if kind[0] == "agent" else "not known")
+    configured = module.settings(engine.config)
+    if configured is None:
+        return None, "the delegated clear is not enabled: the owner has not listed a standing order under delegated_clear in the configuration"
+    orders, charter = configured
+    if number not in orders:
+        return None, "order %d is not listed as a delegated clear" % number
+    try:
+        reader = _intent_reader(runner, now)
+        text = module.order_text(fetch_orders(reader, charter, engine.config.get("intent_repo")), number)
+    except (IntentError, ConfigError, OSError) as err:
+        return None, "the charter's orders cannot be read (%s): refused" % _one_line(str(err), 120)
+    if text is None:
+        return None, "order %d does not exist on charter #%d" % (number, charter)
+    if module.order_hash(text) != orders[number]:   # the order numbers are POSITIONS: the text bound in the configuration must still be the text at that number
+        return None, "the text of order %d is no longer the one the configuration is bound to (an order was edited, inserted or removed): the owner re-binds it" % number
+    return {"number": number, "text": re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", text)}, None
+
+
+def delegated_clear_map(engine, runner, repo, item, base_sha, rule):
+    """[reasons] for ONE changed file of the daemon's own (`closure_refusals` over its text before and after and its patch), or None when it cannot be read or mapped. The text comes from the
+    git blobs API (the contents API refuses a file this large): the head's blob id is the file's own `sha`, the base's is the file's own `sha` at the base commit. #661."""
+    try:
+        if not isinstance(base_sha, str) or not base_sha:
+            return None   # no merge-base: nothing to read the old text from
+        module = load_module("delegated_clear")
+        entry = _gh_json(engine, runner, repo, "repos/%s/contents/%s?ref=%s" % (repo, item["filename"], base_sha))
+        base_blob = entry["sha"] if isinstance(entry, dict) and entry.get("type") == "file" else None
+        if not isinstance(base_blob, str):
+            return None
+        base = module.decode_blob(_gh_json(engine, runner, repo, "repos/%s/git/blobs/%s" % (repo, base_blob)))
+        head = module.decode_blob(_gh_json(engine, runner, repo, "repos/%s/git/blobs/%s" % (repo, item["sha"])))
+        if base is None or head is None or not isinstance(item.get("patch"), str):
+            return None
+        if item["filename"] == rule["daemon_file"]:
+            return module.closure_refusals(base, head, item["patch"], list(rule["closure_roots"]), set(rule["clear_entry_points"]))
+        return module.closure_refusals(base, head, item["patch"], list((rule.get("module_roots") or {}).get(item["filename"]) or []), set(), True)   # any other module the clear loads: its import-time code and the functions the clear runs
+    except Exception:
+        return None
+
+
+def _gh_json(engine, runner, repo, path):
+    done = _gh_write(engine, runner, repo, path, "GET")
+    return json.loads(done.stdout or "null")
+
+
+def delegated_clear_pr_checks(engine, runner, repo, number):
+    """(report, None) when this pull request may be cleared under an order, else (None, why). The owner-hold decision is the daemon's own (`pr_floor_report`: no second rule), the rule (the classes
+    never delegated and the clear code) is the matrix's `owner_hold.delegated_clear`; anything unreadable is refused. #661."""
+    try:
+        report = pr_floor_report(engine, repo, number)
+        rule = (impact_floor.load_matrix().get("owner_hold") or {}).get("delegated_clear")
+    except (impact_floor.MatrixError, NoticeError, ValueError) as err:
+        return None, "the owner-hold decision or its rule cannot be read (%s): refused" % _one_line(str(err), 140)
+    files, get = [], impact_carry_get(engine, runner, repo)
+    try:
+        for page in range(1, 31):
+            got = get("repos/%s/pulls/%d/files?per_page=100&page=%d" % (repo, number, page))
+            if not isinstance(got, list):
+                raise ValueError("not a list")
+            files.extend(f for f in got if isinstance(f, dict))
+            if len(got) < 100:
+                break
+        else:
+            files = None   # more than 3000 files: not read in full
+    except Exception:
+        files = None
+    module, base_sha, closure = load_module("delegated_clear"), None, {}
+    if files is not None:   # the file list and the decision must be of ONE head: the head read again after the files must still be the one the decision read
+        try:
+            pull = get("repos/%s/pulls/%d" % (repo, number))
+            after, base_sha = (pull.get("head") or {}).get("sha"), (pull.get("base") or {}).get("sha")
+            if after == report.get("head") and base_sha and any(f.get("status") == "modified" for f in files):   # the files' patches are against the MERGE-BASE, not the base branch's tip: read the blobs at that commit
+                compared = get("repos/%s/compare/%s...%s?per_page=1" % (repo, base_sha, after))
+                base_sha = ((compared or {}).get("merge_base_commit") or {}).get("sha")
+        except Exception:
+            after = None
+        if after != report.get("head"):
+            return None, "the pull request's head moved while it was being checked (%s, then %s): nothing was cleared" % (str(report.get("head"))[:8], str(after)[:8])
+        for item in files:   # a changed file of the daemon's own: each changed LINE is mapped to its definition by the ast of the file it belongs to
+            if isinstance(item.get("filename"), str) and impact_floor.matches(item["filename"], (rule or {}).get("closure_files") or []) and not impact_floor.matches(item["filename"], (rule or {}).get("clear_code_paths") or []) and item.get("status") == "modified":
+                closure[item["filename"]] = delegated_clear_map(engine, runner, repo, item, base_sha, rule)
+    reasons = module.refusals(rule, report, files, impact_floor.matches, closure)
+    if reasons:
+        return None, "; ".join(reasons)
+    return report, None
 
 
 def cmd_impact_clear(args, runner, now):
@@ -545,12 +648,24 @@ def cmd_impact_clear(args, runner, now):
     except NoticeError as err:
         sys.stderr.write("%s: impact clear: %s\n" % (PROG, err))
         return EXIT_USAGE
+    under, delegated = getattr(args, "under_order", None), None
     if kind[0] != "person":
         who = kind[1]
-        if engine.audit is not None:
-            engine.audit.append(engine.actor, "gate.hold_clear_refused", "%s#%d" % (repo, number), {"by": who, "why": "not the owner's own terminal"})
-        sys.stderr.write("%s: impact clear: refused: only the owner, from the owner's own terminal, clears an impact hold (%s is %s)\n" % (
-            PROG, who, "an agent" if kind[0] == "agent" else "not known"))
+        if under is not None:   # #661: the Chief of Staff's clear under the owner's standing order: every check in `delegated_clear_checks`, or a refusal that names it
+            delegated, why = delegated_clear_checks(engine, runner, now, kind, under)
+            if delegated is None:
+                if engine.audit is not None:
+                    engine.audit.append(engine.actor, "gate.hold_clear_refused", "%s#%d" % (repo, number), {"by": who, "under_order": under, "why": _one_line(why, 300)})
+                sys.stderr.write("%s: impact clear: refused: %s\n" % (PROG, _one_line(why, 400)))
+                return EXIT_USAGE
+        else:
+            if engine.audit is not None:
+                engine.audit.append(engine.actor, "gate.hold_clear_refused", "%s#%d" % (repo, number), {"by": who, "why": "not the owner's own terminal"})
+            sys.stderr.write("%s: impact clear: refused: only the owner, from the owner's own terminal, clears an impact hold (%s is %s)\n" % (
+                PROG, who, "an agent" if kind[0] == "agent" else "not known"))
+            return EXIT_USAGE
+    elif under is not None:
+        sys.stderr.write("%s: impact clear: --under-order is for the Chief of Staff; the owner's own clear needs no order\n" % PROG)
         return EXIT_USAGE
     if len(reason) < 10:
         sys.stderr.write("%s: impact clear: --reason needs at least 10 characters: say why the hold is false\n" % PROG)
@@ -568,15 +683,25 @@ def cmd_impact_clear(args, runner, now):
                     _consume_record(state, pr, had)   # an older record of the daemon's labels is stale (a newer one, applied after the clear, is kept)
                 if had is not None or carried is not None:   # nothing to take back: nothing is written
                     write_impact_state(engine.state_dir, state)
-                    engine.audit.append(engine.actor, "gate.clear_revoked", pr, {"by": kind[1], "reason": plan_ledger.clip(redact_command_text(reason), 300),
-                                                                              "cleared_head": (had or {}).get("head"), "carried_head": (carried or {}).get("head")})
+                    engine.audit.append(engine.actor, "gate.clear_revoked", pr, dict({"by": kind[1], "reason": plan_ledger.clip(redact_command_text(reason), 300),
+                                                                                    "cleared_head": (had or {}).get("head"), "carried_head": (carried or {}).get("head")},
+                                                                                   **({"under_order": delegated["number"]} if delegated else {})))
         except (ImpactStateBusy, RuntimeError) as err:
             sys.stderr.write("%s: impact clear --revoke: %s; nothing was changed\n" % (PROG, _one_line(str(err), 200)))
             return EXIT_ERROR
         print("revoked the owner's clear of %s%s: the daemon holds it again at its next pass, and nothing carries" % (pr, " (and its carry)" if carried else "") if (had or carried) else "%s has no clear to revoke" % pr)
         return EXIT_OK
     try:
-        for line in impact_clear_core(engine, runner, repo, number, kind[1], plan_ledger.clip(redact_command_text(reason), 300)):
+        extra = {}
+        if delegated:   # #661: the checks of THIS pull request, at the head they read, and the clear bound to that head
+            report, why = delegated_clear_pr_checks(engine, runner, repo, number)
+            if why:
+                if engine.audit is not None:
+                    engine.audit.append(engine.actor, "gate.hold_clear_refused", "%s#%d" % (repo, number), {"by": kind[1], "under_order": delegated["number"], "why": _one_line(why, 300)})
+                sys.stderr.write("%s: impact clear: refused: %s\n" % (PROG, _one_line(why, 600)))
+                return EXIT_USAGE
+            extra = {"head": report["head"], "via": "order:%d" % delegated["number"], "under_order": delegated}
+        for line in impact_clear_core(engine, runner, repo, number, kind[1], plan_ledger.clip(redact_command_text(reason), 300), **extra):
             print(line)
     except (NoticeError, IntentError) as err:
         sys.stderr.write("%s: impact clear: %s\n" % (PROG, _one_line(str(err), 300)))
