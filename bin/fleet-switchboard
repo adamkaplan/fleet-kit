@@ -16307,8 +16307,11 @@ def cmd_launch(args, runner, now, socket_call=None):
                     raise   # asked for by name: the refusal is the answer
                 reason = _one_line(str(err), 200)
                 sys.stderr.write("%s: launch: headless refused for %s (%s); opened a terminal instead\n" % (PROG, args.name, reason))
-                if engine.audit is not None:
-                    engine.audit.append(engine.actor, "launch.fallback_terminal", args.name, {"why": reason, "repo": repo})
+                try:
+                    if engine.audit is not None:
+                        engine.audit.append(engine.actor, "launch.fallback_terminal", args.name, {"why": reason, "repo": repo})
+                except Exception as aerr:   # the line above is the report; a failing audit sink must not turn a safe fallback into a failed launch
+                    sys.stderr.write("%s: launch: the fallback could not be audited (%s)\n" % (PROG, _one_line(str(aerr), 100)))
                 try:
                     workspace = caller_workspace(engine, None)
                 except Exception as werr:

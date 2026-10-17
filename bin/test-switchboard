@@ -34345,6 +34345,7 @@ class TestLaunchDefault(TwoRepoCase):
         self.assertEqual(code, 0, err)
         self.assertEqual(len(self.fallback_lines(err)), 1, err)
         self.assertEqual(len(self.tabs()), 1)
+        self.assertEqual(len([sid for sid in self.world.v2.sessions if sid not in sessions_before]), 1, "the headless session was deleted: only the terminal worker's exists")
         self.assertEqual(len([m for sid, s in self.world.v2.sessions.items() if sid not in sessions_before for m in s["messages"] if m["type"] == "user"]), 1)
 
     def test_a_failure_after_the_brief_or_a_session_that_cannot_be_deleted_never_starts_a_second_worker(self):
@@ -34366,6 +34367,18 @@ class TestLaunchDefault(TwoRepoCase):
         path = self.home / "brief.md"
         path.write_text("Do the thing\n")
         return str(path)
+
+    def test_a_failing_audit_does_not_turn_the_fallback_into_a_failed_launch(self):
+        real = sb.AuditLog.append
+
+        def flaky(self_, actor, event, *a, **k):
+            if event == "launch.fallback_terminal":
+                raise OSError("audit full")
+            return real(self_, actor, event, *a, **k)
+        with mock.patch.object(sb.AuditLog, "append", flaky):
+            code, out, err = self.launch("--repo", ACME_WEB)
+        self.assertEqual((code, len(self.tabs())), (0, 1), err)
+        self.assertIn("could not be audited", err)
 
     def test_a_refusal_with_no_terminal_workspace_says_both_reasons(self):
         os.environ.pop("HERDR_WORKSPACE_ID", None)
