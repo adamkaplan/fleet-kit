@@ -27,7 +27,7 @@ A PR held for the owner opens, right after the opening lines and in this order, 
 4. Optional: a real screenshot or rendered image of the actual screen, card or message, before and after. Never a box-and-arrow diagram.
 5. `## Questions for you`: a numbered list, each item one question ending `Recommendation: ...`; or the one line `Questions: none (reason)`.
 
-The rest of the body follows. A Mermaid diagram goes below, in the technical section for reviewers; it is not judged there, and in the top it fails. `pr-explain --check` and gate `G6b` name each missing part and the question number that lacks its recommendation.
+The rest of the body follows. A Mermaid diagram goes below, in the technical section for reviewers; it is not judged there unless it is the generated summary flowchart, which fails anywhere in a held body; in the top any diagram fails. `pr-explain --check` and gate `G6b` name each missing part and the question number that lacks its recommendation.
 
 ## The command
 

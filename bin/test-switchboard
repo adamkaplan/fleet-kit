@@ -41413,6 +41413,110 @@ class TestHeldTop(DecisionsBase):
         self.assertLess(body.index("## Questions for you"), body.index(sb.EXPLAINER_BEGIN))
 
 
+class TestHeldSummaryFlowchart(unittest.TestCase):
+    """#687: a held PR body that holds the generated summary flowchart (a Mermaid fence whose boxes are Changes:, Touches:, Irreversible:, Risk:) ANYWHERE is refused
+    by the held-body check (gate G6b and `pr-explain --check`), naming it; a data-flow diagram below the top passes. The detector is one pass under a step budget."""
+    SUMMARY = ('```mermaid\nflowchart LR\n  A["Changes: Add the parser"] --> B["Touches: bin 2, docs 1 (4 files)"]\n  B --> C["Irreversible: nothing"]\n'
+               '  C --> D["Risk: not rated yet"]\n```\n')
+    DATAFLOW = '```mermaid\nflowchart LR\n  A["Request"] --> B["Gate"]\n  B --> C["Ledger"]\n```\n'
+    TECH = "## For reviewers (technical)\n\n"
+
+    def defects(self, body):
+        return sb.held_defects(body)
+
+    def flow(self, found):
+        return [d for d in found if "generated summary flowchart" in d]
+
+    def test_s3_the_summary_flowchart_is_refused_in_the_top_below_it_and_inside_the_explainer_markers_naming_it(self):
+        top = self.SUMMARY.replace("```mermaid", "~~~mermaid").replace("```", "~~~")
+        block = sb.explainer_block("old", "new")
+        cases = (("top", TestHeldTop.OPEN + self.SUMMARY + TestHeldTop.TOP),
+                 ("below the top", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + self.SUMMARY),
+                 ("inside the explainer markers", sb.explainer_insert(TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + "text\n", block.replace(sb.EXPLAINER_END, self.SUMMARY + sb.EXPLAINER_END))),
+                 ("a tilde fence", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + top),
+                 ("a four backtick fence", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + self.SUMMARY.replace("```", "````")),
+                 ("an indented fence", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + self.SUMMARY.replace("```mermaid", "   ```mermaid")),
+                 ("a fence in a blockquote", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + "".join("> " + l + "\n" for l in self.SUMMARY.splitlines())),
+                 ("a fence in a list item", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + "- an item\n" + "".join("  " + l + "\n" for l in self.SUMMARY.splitlines())),
+                 ("a fence opened on the bullet line", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + "- " + self.SUMMARY),
+                 ("a fence opened on a numbered line", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + "1. " + self.SUMMARY),
+                 ("nested markers", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + "- > " + self.SUMMARY),
+                 ("behind a decoy fence", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + "    ````\n" + self.SUMMARY),
+                 ("CR-only line breaks", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH.replace("\n", "\r") + self.SUMMARY.replace("\n", "\r")),
+                 ("an unclosed fence", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + self.SUMMARY.rsplit("```", 1)[0]))
+        for name, body in cases:
+            with self.subTest(case=name):
+                found = self.defects(body)
+                self.assertEqual(len(self.flow(found)), 1, found)
+                self.assertIn("Changes:", self.flow(found)[0])
+        self.assertEqual(self.defects(TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + "text\n"), [], "the same body without it is clean")
+
+    def test_s4_a_data_flow_diagram_below_the_top_passes_and_so_does_a_body_that_only_names_the_labels_in_prose(self):
+        body = TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + self.DATAFLOW
+        self.assertEqual(self.defects(body), [])
+        prose = TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + "The old box read Changes: x, Touches: y, Irreversible: z, Risk: w.\n"
+        self.assertEqual(self.defects(prose), [])
+        split = self.SUMMARY.replace("  C --> D", "```\n\n```mermaid\n  C --> D")   # the four labels across two fences are not one flowchart
+        self.assertEqual(self.flow(self.defects(TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + split)), [])
+        self.assertEqual(self.flow(self.defects(TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + self.SUMMARY.replace("Risk", "Danger"))), [])
+
+    def test_the_detector_reads_each_fence_form_and_ignores_the_rest(self):
+        found = sb.summary_flowchart_found
+        self.assertTrue(found(self.SUMMARY))
+        self.assertTrue(found(self.SUMMARY.replace("Changes", "CHANGES")))
+        self.assertFalse(found(self.DATAFLOW))
+        self.assertFalse(found(self.SUMMARY.replace("```mermaid", "```text")))
+        self.assertFalse(found(self.SUMMARY.replace("```mermaid", "```python")))
+        self.assertFalse(found(self.SUMMARY.replace("```mermaid", "```mermaid `x`")), "a backtick opener whose info string has a backtick is not a fence")
+        self.assertTrue(found(self.SUMMARY.replace("```", "````")), "a four backtick fence closed by four")
+        self.assertTrue(found(self.SUMMARY.replace("```mermaid", "````mermaid", 1)), "closed by a shorter fence: it stays open to the end, and an open fence counts")
+        self.assertTrue(found(self.SUMMARY.replace("```mermaid", "~~~mermaid", 1)), "closed by another character: it stays open to the end, and an open fence counts")
+        self.assertTrue(found(self.SUMMARY.replace("\n```\n", "\n``` text\n")), "a closing line carrying text does not close it: open to the end counts")
+        self.assertFalse(found(""))
+        self.assertFalse(found(None))
+
+    def test_s5_a_64_kb_body_of_repeated_labels_and_fences_is_judged_in_well_under_half_a_second_and_by_a_step_budget(self):
+        unit = '```mermaid\n["Changes: ["Touches: ["Irreversible: ' + "\u0130\u212a" * 20 + '\n'
+        body = (unit * 400 + "[" * 20000 + ("```\n" + '"Risk:' * 5) * 2000)[:65536]
+        self.assertEqual(len(body), 65536)
+        def best(call):   # the plan's bound (S5: under 0.5 s) on the best of three runs, so a loaded runner's one slow run is not a failure
+            took = []
+            for _ in range(3):
+                begun = time.time()
+                call()
+                took.append(time.time() - begun)
+            return min(took)
+        self.assertTrue(any("generated summary flowchart" in d for d in self.defects(TestHeldTop.OPEN + body[:65000])), "the scan ran and found it")
+        self.assertLess(best(lambda: self.defects(TestHeldTop.OPEN + body[:65000])), 0.5, "plan S5: a quadratic scan takes seconds on this body")
+        self.assertTrue(sb.summary_flowchart_found(self.SUMMARY * 400))   # 64 KB of the real thing
+        self.assertLess(best(lambda: sb.summary_flowchart_found(self.SUMMARY * 400)), 0.5)
+        # by construction: the detector spends one step per line from a budget, so it cannot run on
+        with mock.patch.object(sb, "_held_steps", return_value=[3]):
+            with self.assertRaises(ValueError):
+                sb.summary_flowchart_found("x\n" * 100)
+            self.assertIn("could not be scanned", sb.explainer_defects("x\n" * 100)[-1], "a scan that cannot finish is a defect, never a raise")
+        self.assertEqual(self.defects(TestHeldTop.OPEN + "x\n" * 40000)[0][:30], "the held PR's top is unreadabl")   # over the held cap: unreadable, never ok
+        # a label past the 400 character cut of its line is not read; a body past 1 MB is cut
+        padded = self.SUMMARY.replace('B["Touches', 'B["' + " " * sb._SUMMARY_LINE_MAX + 'Touches')
+        self.assertFalse(sb.summary_flowchart_found(padded))
+        self.assertFalse(sb.summary_flowchart_found("x" * sb._SUMMARY_BODY_MAX + "\n" + self.SUMMARY))
+
+    def test_pr_explain_check_on_a_held_body_names_the_flowchart_on_one_line(self):
+        """The combined path: the explainer check and the held check both see the flowchart, and the command prints it once."""
+        pr = {"title": "t", "state": "OPEN", "labels": [{"name": "me:merge-captain"}], "files": [], "additions": 1, "deletions": 0, "changedFiles": 1,
+              "body": TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + self.SUMMARY}
+        with mock.patch.object(sb, "read_pr_json", return_value=pr), mock.patch.object(sb, "build_engine", return_value=(mock.Mock(), None, None)):
+            with captured() as (out, err):
+                code = sb.main(["pr-explain", "acme/api#7", "--check"])
+        self.assertEqual(code, 1, out.getvalue() + err.getvalue())
+        self.assertEqual(out.getvalue().count("generated summary flowchart"), 1, out.getvalue())
+
+    def test_the_explainer_check_names_the_flowchart_once_with_or_without_a_block(self):
+        self.assertEqual(sum("generated summary flowchart" in d for d in sb.explainer_defects(self.SUMMARY)), 1)
+        block = sb.explainer_block("old", "new")
+        self.assertEqual(sum("generated summary flowchart" in d for d in sb.explainer_defects(sb.explainer_insert(self.SUMMARY, block))), 1)
+
+
 class TestHeldRowsFromLabels(DecisionsBase):
     """#641: an open pull request that carries the fleet's hold labels is a decision row on those labels alone, one row per pull request, read from the open-pull-request list the daemon already holds."""
 
