@@ -6711,7 +6711,15 @@ def cmd_reattach(args, runner, now, socket_call=None):
         raise LaunchError("another reattach of %s is running: wait for it, then run `%s status`" % (name, PROG)) from None
 
 
-def reattach_caller_problem(engine, runner, now, discovery, name, session=None):
+def lost_headless_boss(state_dir, name):
+    """The remembered boss of a headless worker that has a record on file but is not discovered (its session is gone), or None. Reads only."""
+    if state_dir is None or headless_record_to_free(state_dir, name) is None:
+        return None
+    boss = (_read_small(state_dir, HEADLESS_SERVICE_FILE).get("bosses") or {}).get(name)
+    return boss if isinstance(boss, str) and boss else None
+
+
+def reattach_caller_problem(engine, runner, now, discovery, name, session=None, lost_headless=False):
     """None when the caller may reattach `name`: the operator at their own terminal, the Chief of Staff, or the agent's own boss. Else why not."""
     kind = gates_caller_kind(runner, now)
     if kind[0] == "person":
@@ -6732,6 +6740,8 @@ def reattach_caller_problem(engine, runner, now, discovery, name, session=None):
         except Exception:
             boss = None
         if boss is not None and boss == kind[1]:
+            return None
+        if lost_headless and kind[1] == lost_headless_boss(engine.state_dir, name):   # `retire` only: a lost headless worker's boss is the one the daemon remembered
             return None
     return "%s may not reattach %s: only the operator, the Chief of Staff, or %s's own boss may" % (kind[1], name, name)
 
@@ -6948,7 +6958,7 @@ def cmd_retire(args, runner, now):
         raise LaunchError("name the agent: `%s retire <name>`" % PROG)
     discovery = engine.discover(engine.now())
     hint = ((read_retired(state).get(name) or {}).get("session") if args.undo else None)   # a retired headless worker is not discovered: its boss is found from its stored session
-    who = reattach_caller_problem(engine, runner, now, discovery, name, hint)
+    who = reattach_caller_problem(engine, runner, now, discovery, name, hint, lost_headless=not args.undo)
     if who:
         if engine.audit is not None:
             engine.audit.append(engine.actor, "fleetpane.retire_refused", name, {"why": _one_line(who, 160)})
@@ -6967,7 +6977,7 @@ def cmd_retire(args, runner, now):
                 engine.audit.append(engine.actor, "fleetpane.close_refused", name, {"pane": seen.pane if seen is not None else None, "by": close_by, "why": _one_line(why, 160)})
             raise LaunchError("refused: %s (nothing was retired or closed)" % why)
     with agent_lock(state, "files"):
-        who = reattach_caller_problem(engine, runner, now, discovery, name, hint)   # judged again inside the lock: check and write are one step
+        who = reattach_caller_problem(engine, runner, now, discovery, name, hint, lost_headless=not args.undo)   # judged again inside the lock: check and write are one step
         if who:
             raise LaunchError("refused: %s" % who)
         retired = read_retired(state)
@@ -6997,12 +7007,15 @@ def cmd_retire(args, runner, now):
             if restored:
                 print(restored)
             return EXIT_OK
-        if seen is None and not known:
+        headless_lost = seen is None and not known and headless_record_to_free(state, name) is not None   # a headless record with no session: the worker is lost, not unknown
+        if seen is None and not known and not headless_lost:
             raise LaunchError("%s is not a fleet agent this switchboard has seen (see `%s status`)" % (name, PROG))
         prune_retired(retired, now())
         retired[name] = {"at": int(now()), "by": identify_who(engine, runner, now), "reason": reason or "finished",
                          "session": (seen.session_id if seen else None) or known.get("session"), "auto": False}
         headless_kept = headless_record_to_free(state, name)
+        if headless_lost:
+            retired[name]["session"] = headless_kept["session"]
         if headless_kept is not None:
             retired[name]["headless"] = headless_kept   # kept here so `retire --undo` can put the record back
         try:
