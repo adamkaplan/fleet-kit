@@ -107,3 +107,13 @@ A clean tree whose HEAD is already pushed pushes nothing and reports `pushed: fa
   whatever the activity. `extend` is the only way to move it; the reaper re-reads the record at each pass.
 - Both stops are checked at least every minute and take effect within 3 minutes of the limit (plan scenarios S2, S3).
 - **OPEN**: how a worker asks for its own extension (a command inside the pod, or only an operator).
+
+## 7. How the switchboard reaches the cloud (wiring)
+
+`launch --cloud`, `send`, `read`, `status` and `retire` reach the cluster with a token of at most one hour minted from the
+administrator credential in the vault at the moment of use (`CW_CLUSTER_TOKEN_CMD`, or the vault default; see
+`cloud/launcher/README.md` for the settings). No token and no tunnel is kept between commands: the token lives in a private
+0600 file for one command, and `send`, `read` and `status` open a port-forward that is closed before they return. A missing vault
+is a refusal (exit 2) that names the vault pre-check. Only repositories on `CW_ALLOWED_REPOS` can be launched.
+
+**What the pod is told.** The session is created in `/work` (the scratch volume; `--dir` overrides) with the image's own agent, `worker` (`cloud/worker/agents/worker.md`), whatever `--agent` says: for `launch --cloud`, `--agent` is the local role name and is only recorded in the endpoint record. The brief is sent after a standard setup preamble: clone the repository into `/work/repo`, switch to the task branch, work only there (the end hook pushes from `/work/repo`). `retire` of a worker whose end hook cannot push keeps the pod and the record; `cloud-worker delete NAME --force` is the explicit last resort and discards the pod's work.

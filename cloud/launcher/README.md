@@ -66,6 +66,52 @@ Ctrl-C, SIGTERM or any exception inside `create` deletes the per-run Secret and 
 `create.interrupted` (or `create.failed`) audit line naming what was cleaned. If a delete fails, stderr and the audit line
 say which pod or secret REMAINS, and the exit is non-zero (130 for a signal).
 
+## Driving a cloud worker from the switchboard (`launch --cloud`, `send`, `read`, `status`, `retire`)
+
+The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below are read from the operator's environment.
+
+| Setting | Meaning |
+|---|---|
+| `CW_ALLOWED_REPOS` | the repositories (`OWNER/NAME`, separated by commas; matched exactly, ASCII case-insensitively; empty means none; ONE malformed entry refuses the whole list, as the launcher's own `create` does; a malformed `CW_TOOLING_REPO` also refuses; checked before anything is created; `CW_TOOLING_REPO` is refused even if listed |
+| `CW_CLOUD_SERVER` (`CW_CLOUD_CA_FILE`) | the cluster API address |
+| `CW_CLUSTER_TOKEN_CMD` | a command that prints a cluster token; when unset the default below is used |
+| `CW_VAULT_SUBSCRIPTION`, `CW_VAULT_NAME` | the vault that holds the cluster administrator credential (secret `CW_CLUSTER_ADMIN_SECRET`, default `cw-cluster-admin-kubeconfig`; or a command in `CW_CLUSTER_ADMIN_CMD`) |
+| `CW_CLUSTER_TOKEN_DURATION` | the token's requested life, default `20m`, at most `60m` (kubectl's own floor is 10 minutes) |
+| `CW_GIT_TOKEN_CMD` | prints the one-hour git token for the repository (default: `app_token.py OWNER/NAME`, same settings as `run_task.py`) |
+| `CW_MODEL_AUTH_FILE` | the OpenCode auth file; only its `github-copilot` entry is used |
+| `CW_PULL_SECRET` | optional: the image pull secret name passed to `create` |
+
+- **A cluster token per use.** Every command that needs the cluster mints its own token at that moment: the administrator
+  kubeconfig is read from the vault by command and given to `kubectl create token cw-operator` on a pipe (never a file or
+  an argument). The token is checked (a JWT's `exp` and `iat` are read; a lifetime over 60 minutes is refused; for a token
+  that is not a JWT the requested duration is trusted: a custom `CW_CLUSTER_TOKEN_CMD` that prints a non-JWT token is trusted at its
+  requested life, so "never over 60 minutes" holds only when the token's `exp` can be read). It is written once to a 0600 file
+  (`O_EXCL`) in a private 0700 directory `$TMPDIR/cwtok-<uid>/cmd-<pid>-<random>/` that the launcher's token-file login needs. The
+  file lives for the WHOLE command (for `launch` that includes the tunnel phase, where the session and brief are sent): at most 20
+  minutes of token (the requested life), not only until the last `kubectl` call. The directory is removed when the command ends,
+  however it ends (normal, failure, SIGINT, SIGTERM, SIGHUP, SIGQUIT). `TMPDIR` of the caller's environment chooses where `cwtok-<uid>`
+  goes; it is refused unless it is the user's own, mode 0700 and not a link, but an agent that can set `TMPDIR` can choose the place.
+  A command killed with SIGKILL leaves its directory AND its tunnel until the next command: that command removes any directory of
+  a dead process or older than an hour, stops the `kubectl port-forward` recorded in it (only while the pid still has the recorded
+  start time and is a `kubectl port-forward` using that directory's kubeconfig; a reused pid is never signalled) and says so once.
+  No token is cached or kept between commands. Nothing else (no other context or credential) is ever tried.
+  A mint happens once per command; `status` mints one only when a cloud worker needs a probe (none for a broken record or a worker
+  past its hard deadline), so a poller of `status` causes one vault read and one mint per call.
+- `CW_CLUSTER_TOKEN_CMD` and `CW_CLUSTER_ADMIN_CMD` run through `sh -c` from the caller's environment, like `TMPDIR`: they are guardrails of the operator's own account, not a boundary against an agent that can set the environment.
+- **A missing vault is a refusal.** When the vault is unreachable or the credential unreadable, the command exits 2 with a
+  message naming the vault pre-check (the operator runs the platform team's firewall check first) and makes no cluster call.
+- **`launch --cloud`** creates the session in `/work` (the scratch volume; `--dir` overrides) and puts a setup preamble before the brief: clone the repository into `/work/repo`, switch to the task branch, work only there (the end hook pushes from `/work/repo`). It checks the allow-list, mints the token, reads the model entry and the git token, and hands both to
+  `create` as per-run secrets through pipes (`--run-secret-fd`), then sends the session and the brief through a tunnel.
+- **`send`, `read`, `status`** each open a `kubectl port-forward` to the pod for the length of the command and kill it
+  (its whole process group) before returning, also on an interrupt. No tunnel is stored; the record's `url` is not used for traffic.
+  What is visible while it runs: the loopback port number and the pod name are in the process's arguments (`ps`), and any local user can
+  open a connection to the loopback port, but the server asks for the worker's password, which only this process sends. Nothing secret
+  is in an argument or the environment (the kubeconfig holds only the path of the token file).
+- **One name, one kind.** `launch --cloud NAME` is refused when a local agent has that name, and a local `launch NAME` is refused when
+  a cloud record has it, so `send`, `read` and `retire` by name cannot be routed to the wrong one. A failed or cut `launch --cloud` stops
+  the pod with the run id of its own `create` (`--run-id`); a launcher whose `stop` takes no `--run-id` yet is stopped by name and the audit line says so.
+- **`retire`** runs the launcher's `stop` (end hook, then pod and secrets); a failing end hook keeps the pod. No token or tunnel is kept.
+
 ## Decisions (for the PR description)
 **v2 server auth/TLS (the contract's OPEN item).** Per-worker random password (32 bytes, `secrets`), stored only as
 a cluster Secret scoped to the pod and mounted at `/run/cw/server-password` (0600); Basic auth, as the local v2
