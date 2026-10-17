@@ -7007,13 +7007,13 @@ def cmd_retire(args, runner, now):
             if restored:
                 print(restored)
             return EXIT_OK
-        headless_lost = seen is None and not known and headless_record_to_free(state, name) is not None   # a headless record with no session: the worker is lost, not unknown
+        headless_kept = headless_record_to_free(state, name)
+        headless_lost = seen is None and not known and headless_kept is not None   # a headless record with no session: the worker is lost, not unknown
         if seen is None and not known and not headless_lost:
             raise LaunchError("%s is not a fleet agent this switchboard has seen (see `%s status`)" % (name, PROG))
         prune_retired(retired, now())
         retired[name] = {"at": int(now()), "by": identify_who(engine, runner, now), "reason": reason or "finished",
                          "session": (seen.session_id if seen else None) or known.get("session"), "auto": False}
-        headless_kept = headless_record_to_free(state, name)
         if headless_lost:
             retired[name]["session"] = headless_kept["session"]
         if headless_kept is not None:

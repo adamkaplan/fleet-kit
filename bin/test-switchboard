@@ -39065,6 +39065,18 @@ class TestRetireLostHeadless(Base):
         self.assertNotEqual(code, 0)
         self.assertIn("not a fleet agent this switchboard has seen", err)
 
+    def test_a_live_headless_workers_remembered_boss_cannot_retire_it_when_its_real_boss_is_another(self):
+        sid = self.world.v2.create_session({"fleet": {"name": "lostw", "role": "coder", "reports_to": "other", "headless": True}}, directory=str(self.home))
+        self.ap.save_record(self.world.state, "lostw", sid, None, now=self.world.clock.now() - 1000)
+        (Path(self.world.state) / sb.HEADLESS_SERVICE_FILE).write_text(json.dumps({"service": {"pid": 100}, "bosses": {"lostw": "boss"}}))
+        self.assertIn("lostw", self.engine.discover(self.world.clock.now()).agents)   # the session lives
+        os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]
+        code, out, err = self.run_cli("retire", "lostw")
+        self.assertNotEqual(code, 0)
+        self.assertIn("refused", err)
+        self.assertTrue(self.record.exists())
+        self.assertEqual(sb.read_retired(self.world.state), {})
+
     def test_a_lost_record_with_no_remembered_boss_is_retired_by_the_chief_of_staff_but_not_by_an_orchestrator(self):
         sid = self.world.v2.create_session({"fleet": {"name": "lostw", "role": "coder", "reports_to": "boss", "headless": True}}, directory=str(self.home))
         self.ap.save_record(self.world.state, "lostw", sid, None, now=self.world.clock.now() - 1000)
