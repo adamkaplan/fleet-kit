@@ -2806,6 +2806,19 @@ flowchart LR
   the Lab, acts for you there, and tears the cast down afterwards. It types
   only into panes of the "Switchboard Lab" workspace.
 - **Work.** A local scratch git repo. No GitHub until PR 5.
+- **The Lab service's port.** A service started from a Lab shell inherits the
+  default port of the live service, so it fails with "port already in use" and,
+  without a port of its own, a restart could reach the live service. First
+  confirm this shell is the Lab: run `opencode debug paths` and check that every
+  path is under the Lab root (for example `/home/user/lab`); if any path is
+  outside it, stop, because the next command would change the live service.
+  Then give the Lab service its own port, before the first start and before any
+  restart: `opencode service set port <free port>` (for example
+  `opencode service set port 49392`). Also, before any restart, check that the
+  service record and the pid it names are inside the Lab root: read them from
+  `opencode service status`, or from the service record file under the Lab's
+  data directory if status does not show them. If either is outside the Lab
+  root, stop.
 
 ## Spikes (PR 1)
 

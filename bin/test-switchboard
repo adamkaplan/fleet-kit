@@ -8377,6 +8377,15 @@ def _stdlib_roots():
 class TestHygiene(unittest.TestCase):
     FILES = ("fleet-switchboard", "fleet-scenario", "test-switchboard", "proof-switchboard", "switchboard-trial")
 
+    def test_the_lab_docs_say_to_set_a_free_port_and_check_the_lab_root(self):
+        text = (BIN.parent / "docs" / "switchboard.md").read_text()
+        lab = text[text.index("## Lab: isolation"):text.index("## Spikes (PR 1)")]
+        self.assertIn("service set port <free port>", lab)
+        self.assertIn("default port of the live service", lab)
+        flat = " ".join(lab.split())
+        self.assertIn("before any restart, check that the service record and the pid it names are inside the Lab root", flat)
+        self.assertIn("opencode debug paths", flat)
+
     def test_every_file_is_executable_with_the_portable_shebang(self):
         for name in self.FILES:
             path = BIN / name
