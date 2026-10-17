@@ -20802,6 +20802,16 @@ def cmd_review(args, runner, now):
             raise ReviewError("impact-class must be one lower-case word naming the class of the impact (see the matrix file's classes), got %r" % impact_class[:40])
         if args.impact_action == "hold" and impact_class is None:
             raise ReviewError("an impact hold must name its class (--impact-class or an `impact-class:` line): run the review again (nothing was recorded)")
+        if args.impact_action == "hold":   # #692: the class must be one the matrix file names (read now, never a list of our own)
+            try:
+                rule = impact_floor.owner_hold_rule(impact_floor._matrix_cached())
+            except impact_floor.MatrixError as err:
+                raise ReviewError("refused: the impact matrix file cannot be read, so the class %r cannot be checked: %s (nothing was recorded)" % (impact_class, err)) from None
+            if rule is None:
+                raise ReviewError("refused: the impact matrix file's owner_hold block is missing or malformed, so the class %r cannot be checked (nothing was recorded)" % impact_class)
+            valid = rule[0] + rule[1]
+            if impact_class not in valid:
+                raise ReviewError("an impact hold must name a class of the matrix (%s), got %r: run the review again (nothing was recorded)" % (", ".join(valid), impact_class))
         if not head or not re.fullmatch(r"[0-9a-f]{40}", head):
             raise ReviewError("the PR head is unknown: nothing was recorded")
         given = args.head or head
