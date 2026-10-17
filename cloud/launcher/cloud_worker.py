@@ -199,7 +199,7 @@ PREFLIGHT_ENV_NAMES = (
     "CW_APP_KEY_CMD",
 )
 # Never taken from the caller: PATH (a fixed one is built here), HOME and TMPDIR (a private empty directory), PYTHON* (the child runs `python -I`),
-# AZURE_CONFIG_DIR (a checked constant), CW_OPENSSL (kept only when it is an absolute executable file).
+# AZURE_CONFIG_DIR (kept only when an absolute existing directory, else the account's ~/.azure), CW_OPENSSL (kept only when it is an absolute executable file).
 PREFLIGHT_PATH = "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin"
 
 
