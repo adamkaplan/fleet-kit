@@ -27907,6 +27907,31 @@ def decision_by_id(decisions, ident):
     return found[0] if found else None
 
 
+def persisted_pr_decision(engine, ident, action, now):
+    """(#712) The decision a `pr:` id names in the daemon's persisted file, or None, when the command line's own derivation did not find it: a pull request held
+    on its hold labels alone is derived only by the daemon's passes (the hub it reads is not filled in this process). The file is trusted only for "this pull
+    request was listed": a missing, unreadable or stale file is a miss, and an escalation of a row that is not yet the owner's is taken as a PR notice, whose path
+    reads the pull request NOW and decides from that. Every other action and every check after the lookup see the row as the file lists it."""
+    if not str(ident).startswith("pr:") or engine.state_dir is None:
+        return None
+    report = decisions_report(engine.state_dir, now() if callable(now) else (time.time() if now is None else now))
+    if report["stale"]:
+        return None
+    for row in report["decisions"]:
+        if not isinstance(row, dict) or row.get("kind") not in ("captain", "notice") or not str(row.get("id", "")).startswith("pr:"):
+            continue
+        number = row.get("number")
+        full = "pr:%s#%s" % (row.get("repo"), number)
+        if ident in (row["id"], full):
+            return dict(row, kind="notice") if action == "escalate" and row.get("tier") != "human" else row
+    return None
+
+
+def decision_or_persisted(engine, decisions, ident, action, now):
+    """decision_by_id, then (only on a miss) the persisted file for a `pr:` id; None when neither has it."""
+    return decision_by_id(decisions, ident) or persisted_pr_decision(engine, ident, action, now)
+
+
 def decision_miss_hint(decisions, ident):
     """What to add to a "no decision is waiting" error: the ids of the decisions that carry the same number (the right form is one copy away), or ""."""
     ref = _decision_ref(ident)
@@ -28332,14 +28357,14 @@ def supersede_decision(engine, runner, decision, shown, note, name):
     return "done: sent to %s" % decision["agent"]
 
 
-def cmd_decision_supersede(args, engine, decisions, name, runner, role=None):
+def cmd_decision_supersede(args, engine, decisions, name, runner, role=None, now=None):
     """`decisions supersede <id> ... --by <issue>`: per id one line, `done` or `refused: why`; it carries on past a
     failure. Returns the exit code."""
     repo, number, shown = parse_superseding(engine, args.by)
     failed = 0
     for ident in dict.fromkeys(args.ids):
         try:
-            decision = decision_by_id(decisions, ident)
+            decision = decision_or_persisted(engine, decisions, ident, "supersede", now)
             if decision is None:
                 raise DecisionError("no decision %s is waiting%s" % (ident, decision_miss_hint(decisions, ident)))
             refuse_human_tier(engine, decision, "supersede", name, role)
@@ -28416,11 +28441,11 @@ def cmd_decision_write(args, action, runner, now):
                              % (PROG, action, name, "a %s" % role if role else "not given a role", PROG))
             return EXIT_USAGE
         if action == "supersede":
-            code = cmd_decision_supersede(args, engine, decisions, name, runner, role)
+            code = cmd_decision_supersede(args, engine, decisions, name, runner, role, now)
             if code == EXIT_OK:  # a failed write has nothing to wait for
                 finish_decision_write(action, list(args.ids))
             return code
-        decision = decision_by_id(decisions, args.id)
+        decision = decision_or_persisted(engine, decisions, args.id, action, now)
         if decision is None:
             raise DecisionError("no decision %s is waiting%s (see `%s decisions --tier all`)" % (args.id, decision_miss_hint(decisions, args.id), PROG))
         refuse_human_tier(engine, decision, action, name, role)
