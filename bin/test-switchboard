@@ -12711,7 +12711,7 @@ class TestChatClearHook(Base):
     def test_u1_the_existing_clear_without_the_new_arguments_is_what_it_was(self):
         self.build(live=True)
         lines = sb.impact_clear_core(self.engine, self.route, self.REPO, 9, "the owner", "a false hold: the file is a fixture")
-        self.assertEqual(self.label_deletes(), [self.names["hold-impact"]], "no state says the switchboard added merge-captain: only hold-impact goes")
+        self.assertEqual(self.label_deletes(), sorted([self.names["hold-impact"], self.names["merge-captain"]]), "#742: no state says the switchboard added merge-captain, but the author's own hold comes off with the clear")
         self.assertIn("cleared the impact hold of acme/app#9", lines[0])
         (cleared,) = self.events("gate.hold_cleared")
         self.assertNotIn("via", cleared["detail"])
@@ -13553,7 +13553,120 @@ class TestClearNotice(Base):
     def test_the_notice_changes_nothing_about_what_the_clear_removes(self):
         self.clear()
         (cleared,) = self.events("gate.hold_cleared")
-        self.assertEqual(cleared["detail"]["removed"], [self.names["hold-impact"]], "only the hold label: the merge label was not added by the daemon")
+        self.assertEqual(cleared["detail"]["removed"], [self.names["hold-impact"], self.names["merge-captain"]], "#742: the author's merge label comes off with the clear")
+
+
+class TestClearRemovesTheAuthorsHold(Base):
+    """#742: a recorded clear also removes the author's own hold labels (`merge-captain` and every `hold-<reason>` of the fleet prefix) from THAT pull request, at its current head only."""
+
+    REPO = "acme-org/widget-api"
+    H = {7: "a" * 40, 8: "b" * 40}
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("cos",), config={"gh": FAKE_GH, "impact_hold": {"enabled": True}})
+        self.engine = self.world.new_engine("daemon")
+        self.engine.gh_runner, self.engine.state_dir = self.route, self.world.state
+        self.names = sb.label_names(self.engine.config)
+        n = self.names
+        self.held = [n["merge-captain"], n["hold-impact"], n["hold-policy"], n["hold-security"], "bug"]
+        self.labels = {7: list(self.held), 8: list(self.held)}
+        self.bodies = {7: "MERGE: captain\n\nthe change\n", 8: "MERGE: captain\n\nthe other change\n"}
+        self.deletes = []
+
+    def route(self, argv, **kwargs):
+        if argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"]:
+            number = int(argv[3])
+            raw = {"state": "OPEN", "headRefOid": self.H[number], "title": "t", "labels": [{"name": l} for l in self.labels[number]], "body": self.bodies[number]}
+            return subprocess.CompletedProcess(argv, 0, json.dumps(raw), "")
+        if argv[0] == FAKE_GH and argv[1] == "api" and "--method" in argv:
+            method = argv[argv.index("--method") + 1]
+            if method == "DELETE":
+                number = int(re.search(r"/issues/(\d+)/labels/", argv[2]).group(1))
+                label = urllib.parse.unquote(argv[2].rsplit("/labels/", 1)[1])
+                self.deletes.append((number, label))
+                self.labels[number] = [l for l in self.labels[number] if l != label]
+            if method == "PATCH":
+                number = int(re.search(r"/pulls/(\d+)", argv[2]).group(1))
+                self.bodies[number] = json.loads(kwargs["input"])["body"]
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+        return self.world.route(argv, **kwargs)
+
+    def clear(self, number=7, **kwargs):
+        return sb.impact_clear_core(self.engine, self.route, self.REPO, number, "owner", "a false hold: it is a fixture", **kwargs)
+
+    def audits(self):
+        return [e for e in self.world.audit() if e["event"] == "gate.hold_cleared"]
+
+    def clears(self):
+        state, _ = sb.read_impact_state(self.world.state)
+        return state["clears"]
+
+    def test_s1_a_clear_naming_a_takes_the_floors_hold_and_the_authors_labels_off_a_and_keeps_the_rest(self):
+        self.clear(7)
+        self.assertEqual(self.labels[7], ["bug"])
+        self.assertEqual(sorted(l for n, l in self.deletes), sorted(self.held[:4]))
+
+    def test_s2_a_clear_naming_a_never_writes_b(self):
+        self.clear(7)
+        self.assertEqual([d for d in self.deletes if d[0] == 8], [])
+        self.assertEqual(self.labels[8], self.held)
+        self.assertEqual(self.bodies[8], "MERGE: captain\n\nthe other change\n")
+        self.assertEqual(list(self.clears()), ["%s#7" % self.REPO])
+
+    def test_s3_a_pr_with_only_the_authors_labels_and_no_floor_hold_is_changed_in_one_pass(self):
+        n = self.names
+        self.labels[7] = [n["merge-captain"], n["hold-credential"]]
+        self.clear(7)
+        self.assertEqual(self.labels[7], [])
+        self.assertEqual(self.clears()["%s#7" % self.REPO]["head"], self.H[7])
+        (cleared,) = self.audits()
+        self.assertEqual(sorted(cleared["detail"]["removed"]), sorted([n["hold-impact"], n["merge-captain"], n["hold-credential"]]))
+
+    def test_s4_a_head_that_is_not_the_current_head_changes_nothing(self):
+        with self.assertRaises(sb.NoticeError):
+            self.clear(7, head="c" * 40)
+        self.assertEqual(self.deletes, [])
+        self.assertEqual(self.labels[7], self.held)
+        self.assertEqual(self.clears(), {})
+        self.assertEqual(self.audits(), [])
+
+    def test_s5_the_audit_line_names_every_label_removed(self):
+        self.clear(7)
+        (cleared,) = self.audits()
+        self.assertEqual(len(cleared["detail"]["removed"]), 4)
+        self.assertEqual(sorted(cleared["detail"]["removed"]), sorted(self.held[:4]))
+
+    def test_s6_the_marker_line_goes_too_and_gate_g6_reads_not_held(self):
+        self.clear(7)
+        self.assertTrue(self.bodies[7].startswith("MERGE: automatic"))
+        state = sb.pr_marker_state(self.labels[7], self.bodies[7])
+        self.assertFalse(state["captain"])
+        rows = sb.plan_ledger.evaluate_gates(None, [], None, {"head": self.H[7], "captain": state["captain"], "holds": sb.pr_hold_reasons(self.labels[7])}, "%s#7" % self.REPO)
+        (g6,) = [r for r in rows["gates"] if r["gate"] == "G6"]
+        self.assertEqual((g6["status"], g6["detail"]), ("ok", "not a held PR"))
+
+    def test_s7_a_label_of_another_prefix_or_a_lookalike_is_not_removed(self):
+        self.labels[7] = [self.names["hold-impact"], "other:hold-policy", "hold-policy", "other:merge-captain"]
+        self.clear(7)
+        self.assertEqual(self.labels[7], ["other:hold-policy", "hold-policy", "other:merge-captain"])
+
+    def test_the_helper_names_only_exact_fleet_labels_the_pr_carries(self):
+        n = self.names
+        raw = {"labels": [{"name": n["hold-contract"]}, n["merge-automatic"], "hold-contract", n["parked"]]}
+        self.assertEqual(sb.authors_hold_labels(n, raw, []), [n["hold-contract"]])
+        self.assertEqual(sb.authors_hold_labels(n, raw, [n["hold-contract"]]), [])
+        self.assertEqual(sb.authors_hold_labels(n, {"labels": None}, []), [])
+
+    def test_the_set_of_labels_it_may_remove_is_the_daemons_own_hold_set_and_the_merge_captain_label(self):
+        n = self.names
+        every = {l["name"] for l in [{"name": v} for v in n.values()]}
+        removable = set(sb.authors_hold_labels(n, {"labels": sorted(every)}, []))
+        self.assertEqual(removable, {n[k] for k in ("merge-captain",) + tuple(sb.CAPTAIN_HOLD_LABELS)})
+
+    def test_the_chat_clear_keeps_the_list_the_owner_confirmed(self):
+        self.clear(7, remove=[self.names["hold-impact"]])
+        self.assertEqual(sorted(l for n, l in self.deletes), [self.names["hold-impact"]])
 
 
 class TestClearCarryInTheDaemon(Base):

@@ -487,7 +487,7 @@ def notify_clear(engine, kind, repo, number, head, reason=None, body=None, previ
 def authors_hold_labels(names, raw, already):
     """The fleet's own hold labels the PR in `raw` carries now and `already` does not name: `merge-captain` and every `hold-<reason>` of the fleet's prefix, by exact name. Nothing is
     guessed from a substring or a prefix: only those exact names, only what the read shows (so the audit names what was really on the PR), never a label of another prefix. #742."""
-    ours = [names[key] for key in ("merge-captain",) + tuple(CAPTAIN_HOLD_LABELS) if key in names]
+    ours = [name for key, name in names.items() if key == "merge-captain" or key.startswith("hold-")]   # the fleet's label KEYS (a test pins this set to CAPTAIN_HOLD_LABELS + merge-captain), each with the user prefix
     live = raw.get("labels")
     have = {(l.get("name") if isinstance(l, dict) else l) for l in live} if isinstance(live, list) else set()
     return [label for label in ours if label in have and label not in already]
