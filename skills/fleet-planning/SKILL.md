@@ -7,7 +7,7 @@ description: How to write a plan before work starts, check it, and get it challe
 
 A plan says **what** the work must achieve and how anyone will know, never gratuitous **how**. It is written before
 work starts, checked by a command, challenged by independent reviewers, and approved. Every rule and check is in
-`docs/plan-template.md` (read it when a check fails); this page is the short path.
+`docs/plan-template.md` (read it when a check fails).
 
 ## When a plan is required
 
@@ -39,7 +39,7 @@ Staff; an epic or workspace plan, the Chief of Staff, then the owner.
 
 `fleet-switchboard plan check <owner/repo#N> [--ask <owner/repo#N>] [--json]` prints `PASS` or `FAIL`, one defect per line,
 and the plan hash (editing anything changes it). Before you send a draft, run `plan check --file <plan> --done-when <the
-issue's Done-when>` (the issue body needs `## Intent` before `Done when:`; format 2 needs a `clauses:` and a `scenarios:` yaml block) and fix every defect. It only reads GitHub.
+issue's Done-when>` (the issue body needs `## Intent` before `Done when:`; format 2 needs a `clauses:` and a `scenarios:` yaml block) and fix every defect.
 
 ## The form
 
@@ -86,11 +86,15 @@ scenarios:
     evaluator: ci
 ```
 
-Bad, each fails `plan check` or a reviewer:
-- `pass: works`: a wrong build also "works". Say what is observed.
-- `discriminates: a wrong build would fail this`: it names no wrong build, so a stub could satisfy it.
-- a plan whose scenarios only cover clause 1 of two: clause 2 has no proof.
-- "add a `commission()` method to `ProjectService`": that is how, not what; say the observable outcome.
+Bad: `pass: works`, `discriminates: a wrong build would fail this`, or "add a `commission()` method" (how, not what).
+
+## Wordings `plan check` accepts
+
+- every declared `DW`/`PC` is covered by a scenario;
+- `discriminates` names a concrete wrong build (a stub that returns an empty list);
+- `pass` has an observable number or status (`exit status is 0`);
+- the declared clauses joined equal the ask's Done-when;
+- check a slice with `--ask <its own work item>`.
 
 ## After the plan
 

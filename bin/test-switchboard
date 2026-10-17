@@ -383,6 +383,29 @@ class TestStateDir(Base):
         os.chmod(str(self.state_dir), 0o700)
         self.assertEqual(sb.ensure_state_dir(), self.state_dir)
 
+    def test_a_directory_made_by_another_process_between_the_look_and_the_mkdir_is_accepted(self):
+        """#688: three `heavy` wrappers started together all saw no directory; the one that lost the mkdir got EEXIST and ran its command with NO slot."""
+        self.state_dir.mkdir(parents=True, mode=0o700)
+        os.chmod(str(self.state_dir), 0o700)
+        real = sb.Path.exists
+        sb.Path.exists = lambda self_: False if self_ == self.state_dir else real(self_)   # the look said "not there": the other process made it just after
+        try:
+            self.assertEqual(sb.ensure_state_dir(), self.state_dir)
+        finally:
+            sb.Path.exists = real
+
+    def test_a_directory_made_in_that_gap_is_still_refused_when_it_is_not_private(self):
+        self.state_dir.mkdir(parents=True)
+        os.chmod(str(self.state_dir), 0o755)
+        real = sb.Path.exists
+        sb.Path.exists = lambda self_: False if self_ == self.state_dir else real(self_)
+        try:
+            with self.assertRaises(sb.ConfigError):
+                sb.ensure_state_dir()
+        finally:
+            sb.Path.exists = real
+        self.assertEqual(stat.S_IMODE(self.state_dir.stat().st_mode), 0o755)
+
     def test_group_or_world_readable_dir_is_refused_not_repaired(self):
         for mode in (0o750, 0o705, 0o755, 0o777):
             with self.subTest(mode=oct(mode)):
@@ -4838,6 +4861,49 @@ class TestLaunch(Base):
         self.assertEqual(len([e for e in self.world.audit() if e["event"] == "worktree.kept"]), 2)
         self.assertIn("w-clean", self.git(self.repo_main, "branch", "--list", "w-clean"), "the branch is never deleted")
 
+    def retire_close_with_worktree(self, wt):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.make_repo()
+        self.worker()
+        wt = wt()
+        self.assertTrue(sb.register_worktree(self.world.state, str(wt), "worker", None, wt.name, 1))
+        self.world.herdr.panes[self.world.panes["worker"]]["status"] = "idle"
+        os.environ.pop("HERDR_PANE_ID", None)
+        code, out, err = self.run_cli("retire", "worker", "--close")
+        self.assertEqual(code, 0, err)
+        return wt, out
+
+    def test_retire_close_keeps_a_worktree_with_an_unpushed_commit_and_says_so(self):
+        wt, out = self.retire_close_with_worktree(lambda: self.add_worktree("w-unpushed-close", unpushed=True))
+        self.assertTrue(wt.exists())
+        self.assertRegex(out, r"worktree: .*w-unpushed-close: kept: unpushed")
+        self.assertNotIn("cannot be resumed", out)
+        self.assertIn(str(wt), self.registered())
+
+    def test_retire_close_keeps_a_worktree_with_uncommitted_changes_and_says_so(self):
+        wt, out = self.retire_close_with_worktree(lambda: self.add_worktree("w-dirty-close", dirty=True))
+        self.assertTrue(wt.exists())
+        self.assertRegex(out, r"worktree: .*w-dirty-close: kept: uncommitted changes")
+        self.assertNotIn("cannot be resumed", out)
+
+    def test_retire_close_removes_a_clean_pushed_worktree_and_says_the_session_cannot_be_resumed(self):
+        wt, out = self.retire_close_with_worktree(lambda: self.add_worktree("w-clean-close"))
+        self.assertFalse(wt.exists())
+        self.assertRegex(out, r"worktree: .*w-clean-close: removed")
+        self.assertIn("cannot be resumed from that directory", out)
+        self.assertRegex(out, r"fresh launch under a new name")
+
+    def test_retire_close_of_a_worker_with_no_worktree_prints_no_worktree_line_or_resume_warning(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.make_repo()
+        self.worker()
+        self.world.herdr.panes[self.world.panes["worker"]]["status"] = "idle"
+        os.environ.pop("HERDR_PANE_ID", None)
+        code, out, err = self.run_cli("retire", "worker", "--close")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("worktree:", out)
+        self.assertNotIn("cannot be resumed", out)
+
     def test_a_done_report_only_says_the_worktree_is_reclaimable_and_removes_nothing_so_a_worker_that_goes_on_keeps_it(self):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
         self.make_repo()
@@ -8376,6 +8442,15 @@ def _stdlib_roots():
 
 class TestHygiene(unittest.TestCase):
     FILES = ("fleet-switchboard", "fleet-scenario", "test-switchboard", "proof-switchboard", "switchboard-trial")
+
+    def test_the_lab_docs_say_to_set_a_free_port_and_check_the_lab_root(self):
+        text = (BIN.parent / "docs" / "switchboard.md").read_text()
+        lab = text[text.index("## Lab: isolation"):text.index("## Spikes (PR 1)")]
+        self.assertIn("service set port <free port>", lab)
+        self.assertIn("default port of the live service", lab)
+        flat = " ".join(lab.split())
+        self.assertIn("before any restart, check that the service record and the pid it names are inside the Lab root", flat)
+        self.assertIn("opencode debug paths", flat)
 
     def test_every_file_is_executable_with_the_portable_shebang(self):
         for name in self.FILES:
@@ -14848,6 +14923,35 @@ class TestOwnMeasurementTester(unittest.TestCase):
 
     def test_the_texts_name_roles_never_agents_or_people(self):
         for text in (self.PLANNING, self.COORDINATION):
+            self.assertNotRegex(text, r"(?i)\b(coder\d|cos\b|fleet-upkeep|adam\b)")
+
+
+class TestWorkerRulesInSkills(unittest.TestCase):
+    """#719: the message cap, the daemon-recorded ci verdict and the plan check wordings, each said once."""
+    CAP = "`send` messages are capped (about 3000 characters in practice, 4000 hard): put long text in a file made under `mktemp -d` and pass it as `\"$(cat <file>)\"`."
+    CI = "The daemon records the `ci` verdict itself about five minutes after CI is green at the head, so read `fleet-switchboard gates <pr>` and do not ask for `gates ci-record`, which stays for a hurry."
+    LIST = "## Wordings `plan check` accepts"
+    SHAPES = ("every declared `DW`/`PC` is covered by a scenario", "`discriminates` names a concrete wrong build (a stub that returns an empty list)",
+              "`pass` has an observable number or status", "the declared clauses joined equal the ask's Done-when", "check a slice with `--ask <its own work item>`")
+
+    def read(self, skill):
+        return (REPO / "skills" / skill / "SKILL.md").read_text()
+
+    def test_the_message_cap_sentence_is_in_the_coordination_skill_once(self):
+        self.assertEqual(self.read("fleet-coordination").count(self.CAP), 1)
+
+    def test_the_ci_verdict_sentence_is_in_the_skills_once_overall(self):
+        self.assertEqual(sum(self.read(s).count(self.CI) for s in ("fleet-coordination", "fleet-planning")), 1)
+
+    def test_the_plan_check_wording_list_is_in_the_planning_skill_once_with_its_five_shapes(self):
+        text = self.read("fleet-planning")
+        self.assertEqual(text.count(self.LIST), 1)
+        section = text.split(self.LIST, 1)[1].split("\n## ", 1)[0]
+        for shape in self.SHAPES:
+            self.assertEqual(section.count(shape), 1, shape)
+
+    def test_the_texts_name_roles_never_agents_or_people(self):
+        for text in (self.CAP, self.CI, self.LIST) + self.SHAPES:
             self.assertNotRegex(text, r"(?i)\b(coder\d|cos\b|fleet-upkeep|adam\b)")
 
 
@@ -26253,7 +26357,7 @@ class TestPlanLedger(LedgerBase):
         self.assertEqual([r["status"] for r in report["gates"] if r["gate"] in ("G0a", "G1", "G4", "G5", "G6")], ["ok"] * 5)
         self.assertEqual(report["untracked"], ["G0b", "G0c", "G2/G3"])
         self.assertEqual({r["gate"] for r in report["gates"]},
-                         {"G0a", "G0b", "G0c", "G1", "G2/G3", "G4", "G5", "G6", "G7", "G8"})
+                         {"G0a", "G0b", "G0c", "G1", "G2/G3", "G4", "G5", "G6", "G6b", "G7", "G8"})
         self.assertEqual([self.row(report, g)["status"] for g in ("G7", "G8")], ["n/a", "n/a"])
         self.assertIn("epic-claimed", self.row(report, "G1")["detail"])
         self.assertTrue(all(r["decided_by"] for r in report["gates"]))
@@ -26601,7 +26705,7 @@ class TestWaive(LedgerBase):
         self.assertEqual(self.row(report, "G6")["status"], "waiting")               # the owner's hold stands
         self.assertEqual(self.row(report, "G1")["status"], "waived")
         code, payload, _ = self.check()
-        self.assertEqual([f["gate"] for f in payload["failed"]], ["G6"])             # still failing (reported: a repo lists G6 to enforce it)
+        self.assertEqual([f["gate"] for f in payload["failed"]], ["G6", "G6b"])      # still failing (reported: a repo lists G6 to enforce it)
         self.assertEqual(self.run_as("coder", "gates-check", self.PR, "--for", "merge")[0], 0)   # G6 is not in this repo's enforced list
 
     def test_a_short_reason_is_refused(self):
@@ -26752,11 +26856,11 @@ class TestPlanGatesCheck(LedgerBase):
         self.pr["labels"] = [{"name": "tester:merge-captain"}]
         self.pr["statusCheckRollup"] = [{"conclusion": "SUCCESS", "status": "COMPLETED"}]
         code, out, _ = self.check("merge")
-        self.assertEqual((code, [f["gate"] for f in out["failed"]]), (10, ["G6"]))
+        self.assertEqual((code, [f["gate"] for f in out["failed"]]), (10, ["G6", "G6b"]))
         self.set_gates({"acme/app": {"mode": "enforce"}})
         code, out, _ = self.check("merge")
         self.assertEqual(code, 0, "G4 and G6 are enforced only when listed")
-        self.assertEqual([(f["gate"], f["enforced"]) for f in out["failed"]], [("G6", False)])
+        self.assertEqual([(f["gate"], f["enforced"]) for f in out["failed"]], [("G6", False), ("G6b", False)])
 
     def test_a_repo_in_enforce_with_the_default_list_reports_g4_and_g6_but_never_refuses_on_them(self):
         self.all_proven()
@@ -26765,10 +26869,10 @@ class TestPlanGatesCheck(LedgerBase):
         self.set_gates({"acme/app": {"mode": "enforce"}})
         code, out, err = self.check("merge")
         self.assertEqual((code, out["verdict"]), (0, "allow"))
-        self.assertEqual(sorted((f["gate"], f["enforced"]) for f in out["failed"]), [("G4", False), ("G6", False)])
+        self.assertEqual(sorted((f["gate"], f["enforced"]) for f in out["failed"]), [("G4", False), ("G6", False), ("G6b", False)])
         self.assertIn("reported, not enforced", out["reason"])
         (event,) = self.events("gate.reported")
-        self.assertEqual((event["detail"]["failed"], event["detail"]["enforced"]), (["G4", "G6"], []))
+        self.assertEqual((event["detail"]["failed"], event["detail"]["enforced"]), (["G4", "G6", "G6b"], []))
         self.assertEqual(self.events("gate.refused") + self.events("gate.would_refuse"), [])
         self.set_gates({"acme/app": {"mode": "enforce", "enforce_gates": ["G0a", "G1", "G4"]}})
         code, out, _ = self.check("merge")
@@ -28028,7 +28132,7 @@ class TestImpactClassAndNarrowForm(LedgerBase):
         code, out, err = self.record_impact("hold", "--impact-class", "two words")
         self.assertEqual(code, 2)
         self.assertEqual(err.count("impact-class"), 1)
-        self.assertEqual(self.record_impact("hold")[0], 0)
+        self.assertEqual(self.record_impact("second-review")[0], 0)
         code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "code", "--verdict", "approve", "--impact-class", "data")
         self.assertEqual(code, 2)
         self.assertIn("belongs to the impact reviewer", err)
@@ -28036,6 +28140,90 @@ class TestImpactClassAndNarrowForm(LedgerBase):
         self.assertEqual(stored, ["credentials", None])
         self.assertEqual(self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve", "--impact-action", "hold",
                                      "--block", "/nonexistent")[0], 2)
+
+    def test_a_hold_with_no_class_is_refused_and_nothing_is_recorded(self):
+        for more in ((), ("--impact-class", "")):
+            code, out, err = self.record_impact("hold", *more)
+            self.assertEqual(code, 2)
+            self.assertIn("run the review again", err)
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "review_record"], [])
+        self.assertEqual(self.record_impact("none")[0], 0)
+        self.assertEqual(self.record_impact("hold", "--impact-class", "data")[0], 0)
+        self.assertEqual(len([e for e in self.ledger() if e["kind"] == "review_record"]), 2)
+
+    # -- #692: a hold names a class of the matrix file
+
+    def hold_records(self):
+        return [e for e in self.ledger() if e["kind"] == "review_record" and e.get("impact_action") == "hold"]
+
+    def matrix_copy(self, edit):
+        impact_floor = sb.load_impact_floor()
+        matrix = json.loads(impact_floor.MATRIX_PATH.read_text())
+        edit(matrix["owner_hold"])
+        path = self.world.state / "matrix-copy.json"
+        path.write_text(json.dumps(matrix))
+        return impact_floor, path
+
+    def test_692_s1_s7_an_unknown_class_is_refused_lists_the_classes_and_records_nothing(self):
+        code, out, err = self.record_impact("hold", "--impact-class", "x")
+        self.assertEqual(code, 2)
+        rule = sb.load_impact_floor().owner_hold_rule(sb.load_impact_floor().load_matrix())
+        self.assertEqual(len(rule[0] + rule[1]), 10)
+        self.assertEqual([c for c in rule[0] + rule[1] if c not in err], [])
+        self.assertIn("run the review again", err)
+        self.assertEqual(self.hold_records(), [])
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "review_record"], [])
+        block = "verdict: approve\nhead: %s\nimpact-action: hold\nimpact-class: x\nfindings:\n" % LEDGER_HEAD
+        path = self.world.state / "block.txt"
+        path.write_text(block)
+        code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--block", str(path))
+        self.assertEqual(code, 2)
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "review_record"], [])
+        self.assertEqual(self.decide()[0], "none")
+
+    def test_692_s2_none_is_refused_and_a_valid_class_in_another_case_is_recorded_lower_case(self):
+        self.assertEqual(self.record_impact("hold", "--impact-class", "none")[0], 2)
+        self.assertEqual(self.hold_records(), [])
+        self.assertEqual(self.record_impact("hold", "--impact-class", " Credentials ")[0], 0)
+        self.assertEqual([e["impact_class"] for e in self.hold_records()], ["credentials"])
+
+    def test_692_s3_every_matrix_class_holds_and_other_actions_need_no_class(self):
+        impact_floor = sb.load_impact_floor()
+        rule = impact_floor.owner_hold_rule(impact_floor.load_matrix())
+        for cls in rule[0] + rule[1]:
+            self.assertEqual(self.record_impact("hold", "--impact-class", cls)[0], 0, cls)
+        self.assertEqual(self.record_impact("second-review")[0], 0)
+        self.assertEqual(self.record_impact("none")[0], 0)
+        self.assertEqual(len([e for e in self.ledger() if e["kind"] == "review_record"]), 12)
+
+    def test_692_s4_the_classes_come_from_the_matrix_file_not_the_code(self):
+        impact_floor, path = self.matrix_copy(lambda b: (b["other_classes"].remove("cost"), b["other_classes"].append("novelty")))
+        with mock.patch.object(impact_floor, "MATRIX_PATH", path):
+            self.assertEqual(self.record_impact("hold", "--impact-class", "novelty")[0], 0)
+            code, out, err = self.record_impact("hold", "--impact-class", "cost")
+            self.assertEqual(code, 2)
+            self.assertIn("run the review again", err)
+        self.assertEqual([e["impact_class"] for e in self.hold_records()], ["novelty"])
+        source = (REPO / "bin" / "fleet-switchboard").read_text()
+        rule = impact_floor.owner_hold_rule(impact_floor.load_matrix())
+        names = rule[0] + rule[1]   # no line of the code lists several of the classes (single words like "data" occur elsewhere)
+        self.assertEqual([l for l in source.splitlines() if sum(1 for c in names if re.search(r"[\"']%s[\"']" % c, l)) >= 3], [])
+
+    def test_692_s5_an_unreadable_matrix_refuses_the_hold_loudly(self):
+        impact_floor = sb.load_impact_floor()
+        for text in (None, "{not json"):
+            path = self.world.state / "gone.json"
+            if text is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_text(text)
+            impact_floor._MATRIX_CACHE.clear()
+            with mock.patch.object(impact_floor, "MATRIX_PATH", path):
+                code, out, err = self.record_impact("hold", "--impact-class", "credentials")
+            self.assertEqual(code, 2)
+            self.assertIn("matrix file cannot be read", err)
+            self.assertEqual(self.hold_records(), [])
+        impact_floor._MATRIX_CACHE.clear()
 
     def test_the_block_form_carries_the_class_line(self):
         block = "verdict: approve\nhead: %s\nimpact-action: hold\nimpact-class: Data\nfindings:\n" % LEDGER_HEAD
@@ -28049,8 +28237,15 @@ class TestImpactClassAndNarrowForm(LedgerBase):
     def test_s2_a_hold_record_holds_for_the_owner_unless_its_class_is_not_top_tier(self):
         outcome = {}
         for label, more in (("credentials", ("--impact-class", "credentials")), ("performance", ("--impact-class", "performance")),
-                            ("unknown", ("--impact-class", "gizmo")), ("missing", ())):
-            self.assertEqual(self.record_impact("hold", *more)[0], 0)
+                            ("unknown", ("--impact-class", "gizmo")), ("missing", None)):
+            if more is None or label == "unknown":   # a record already in the ledger without a class or with an unknown one (new recordings are refused): it keeps its top-tier reading
+                entry = {"kind": "review_record", "pr": self.PR, "head": LEDGER_HEAD, "reviewer": "impact", "verdict": "approve",
+                         "blocks": 0, "notes": 0, "by": "rev", "impact_action": "hold", "summary": "x"}
+                if label == "unknown":
+                    entry["impact_class"] = "gizmo"
+                sb.plan_ledger.append_entry(self.world.state, entry, 1)
+            else:
+                self.assertEqual(self.record_impact("hold", *more)[0], 0)
             outcome[label] = self.decide()
         self.assertEqual({k: v[0] for k, v in outcome.items()},
                          {"credentials": "hold", "performance": "second-review", "unknown": "hold", "missing": "hold"})
@@ -28071,6 +28266,9 @@ class TestImpactClassAndNarrowForm(LedgerBase):
         classes = rule[0] + rule[1]
         self.assertEqual(len(classes), 10)
         self.assertEqual(text.count("impact-class"), 1)
+        self.assertIn("always names its class", text)
+        self.assertIn("A hold without a class is rejected", text)
+        self.assertNotIn("Leave the class line out", text)
         self.assertEqual([c for c in classes if "`%s`" % c not in text], [])
 
     # -- S4 to S6: the agent definitions
@@ -28639,7 +28837,11 @@ class TestImpactRejudge(LedgerBase):
         self.passes([self.listed(n) for n in (9, 10, 11)])
         self.assertEqual(self.posts(), [])
         reads = len(self.view_reads)
-        for number, more in ((9, ("--impact-class", "performance")), (10, ("--impact-class", "credentials")), (11, ())):
+        for number, more in ((9, ("--impact-class", "performance")), (10, ("--impact-class", "credentials")), (11, None)):
+            if more is None:   # a record already in the ledger without a class
+                sb.plan_ledger.append_entry(self.world.state, {"kind": "review_record", "pr": "acme/app#%d" % number, "head": LEDGER_HEAD, "reviewer": "impact", "verdict": "approve",
+                                                               "blocks": 0, "notes": 0, "by": "rev", "impact_action": "hold", "summary": "x"}, 1)
+                continue
             code, out, err = self.run_as("coder", "review", "record", "acme/app#%d" % number, "--reviewer", "impact", "--verdict", "approve", "--impact-action", "hold", *more)
             self.assertEqual(code, 0, err)
         self.passes([self.listed(n) for n in (9, 10, 11)], advance=400)
@@ -30889,8 +31091,10 @@ class TestPlanCheckRules(unittest.TestCase):
             with self.subTest(skill=skill):
                 self.assertEqual(text.count("An agent that is asked to run a mutation or fault-injection check"), 1)
                 sentence = text.split("An agent that is asked to run a mutation or fault-injection check", 1)[1].split("can loop.", 1)[0]
-                for word in words[1:]:
+                for word in words[1:] + ("named job", "job record", "the job-start rule"):
                     self.assertIn(word, sentence)
+                for old in ("never runs in the background without one", "never leaves one running in the background"):
+                    self.assertEqual(text.count(old), 0)
         definitions = sorted((REPO / "agents" / "reviewers").glob("*.md"))
         self.assertEqual(len(definitions), 5)
         for path in definitions:
@@ -39472,6 +39676,102 @@ class TestHeadlessAnswerPath(WriteWorld):
         self.assertEqual(getattr(self.world.v2, "permission_replies", []), [], "no reply reached the service")
 
 
+class TestRetireLostHeadless(Base):
+    """#678: `retire` of a headless worker whose session is gone (a record on file, nothing discovered): authority, the record, the remembered boss."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("boss", "other", "cos"))
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.ap = sb.load_agent_presence()
+        self.engine = self.world.new_engine("cli")
+        self.engine.state_dir = self.world.state
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        for patch in (mock.patch.object(sb.V2Client, "service_identity", lambda client: 100),
+                      mock.patch.object(sb, "owner_terminal_problem", lambda *a, **k: None),   # the test shell is the operator's own terminal
+                      mock.patch.dict(os.environ, {}, clear=False)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.record = Path(self.world.state) / "headless" / "lostw.json"
+
+    def lose(self):
+        sid = self.world.v2.create_session({"fleet": {"name": "lostw", "role": "coder", "reports_to": "boss", "headless": True}}, directory=str(self.home))
+        self.ap.save_record(self.world.state, "lostw", sid, None, now=self.world.clock.now() - 1000)
+        self.engine.discover(self.world.clock.now())
+        self.engine.collect_facts()                                       # a pass sees it live: the boss is remembered
+        del self.world.v2.sessions[sid]
+        return sid
+
+    def run_cli(self, *argv):
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def bosses(self):
+        return json.loads((Path(self.world.state) / sb.HEADLESS_SERVICE_FILE).read_text())["bosses"]
+
+    def test_the_recorded_boss_retires_a_lost_worker_and_the_record_and_remembered_boss_are_gone_after_the_next_pass(self):
+        self.lose()
+        self.assertEqual(self.bosses(), {"lostw": "boss"})
+        os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]
+        code, out, err = self.run_cli("retire", "lostw")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("not a fleet agent", err)
+        self.assertFalse(self.record.exists())
+        self.assertIn("lostw", sb.read_retired(self.world.state))
+        self.engine.discover(self.world.clock.now())
+        lost = [f for f in self.engine.collect_facts()[0] if f.kind == "headless.lost"]
+        self.assertEqual((lost, self.bosses()), ([], {}))
+
+    def test_the_chief_of_staff_and_the_operator_may_retire_a_lost_worker(self):
+        for who in ("cos", None):
+            self.lose()
+            if who:
+                os.environ["HERDR_PANE_ID"] = self.world.panes[who]
+            else:
+                os.environ.pop("HERDR_PANE_ID", None)
+            self.assertEqual(self.run_cli("retire", "lostw")[0], 0, who)
+            self.assertFalse(self.record.exists(), who)
+            self.run_cli("retire", "--undo", "lostw")
+            self.ap.remove_record(self.world.state, "lostw")
+
+    def test_another_orchestrator_is_refused_a_lost_workers_record_stays_and_an_unknown_name_is_still_unknown(self):
+        self.lose()
+        os.environ["HERDR_PANE_ID"] = self.world.panes["other"]
+        code, out, err = self.run_cli("retire", "lostw")
+        self.assertNotEqual(code, 0)
+        self.assertIn("refused", err)
+        self.assertTrue(self.record.exists())
+        self.assertEqual(sb.read_retired(self.world.state), {})
+        os.environ.pop("HERDR_PANE_ID", None)
+        code, out, err = self.run_cli("retire", "nobody-here")
+        self.assertNotEqual(code, 0)
+        self.assertIn("not a fleet agent this switchboard has seen", err)
+
+    def test_a_live_headless_workers_remembered_boss_cannot_retire_it_when_its_real_boss_is_another(self):
+        sid = self.world.v2.create_session({"fleet": {"name": "lostw", "role": "coder", "reports_to": "other", "headless": True}}, directory=str(self.home))
+        self.ap.save_record(self.world.state, "lostw", sid, None, now=self.world.clock.now() - 1000)
+        (Path(self.world.state) / sb.HEADLESS_SERVICE_FILE).write_text(json.dumps({"service": {"pid": 100}, "bosses": {"lostw": "boss"}}))
+        self.assertIn("lostw", self.engine.discover(self.world.clock.now()).agents)   # the session lives
+        os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]
+        code, out, err = self.run_cli("retire", "lostw")
+        self.assertNotEqual(code, 0)
+        self.assertIn("refused", err)
+        self.assertTrue(self.record.exists())
+        self.assertEqual(sb.read_retired(self.world.state), {})
+
+    def test_a_lost_record_with_no_remembered_boss_is_retired_by_the_chief_of_staff_but_not_by_an_orchestrator(self):
+        sid = self.world.v2.create_session({"fleet": {"name": "lostw", "role": "coder", "reports_to": "boss", "headless": True}}, directory=str(self.home))
+        self.ap.save_record(self.world.state, "lostw", sid, None, now=self.world.clock.now() - 1000)
+        del self.world.v2.sessions[sid]                                   # gone before any pass saw it
+        os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]
+        self.assertNotEqual(self.run_cli("retire", "lostw")[0], 0)
+        self.assertTrue(self.record.exists())
+        os.environ["HERDR_PANE_ID"] = self.world.panes["cos"]
+        self.assertEqual(self.run_cli("retire", "lostw")[0], 0)
+        self.assertFalse(self.record.exists())
+
+
 class TestHeadlessRestartNotice(Base):
     """#433 slice 4 (S4, S5, S6, U1): a restart of the OpenCode service, or a session that is gone, is told to the worker's boss; never silent."""
 
@@ -41552,6 +41852,345 @@ class TestCaptainDecisionFromLabels(TestCaptainPrs):
         self.assertEqual(self.only()["kind"], "notice")
 
 
+class TestHeldTop(DecisionsBase):
+    """#604: a PR held for the owner opens with why, what changes (a Before | After table), an example and its questions; one check (held_defects)
+    serves pr-explain --check and gate G6b. A Mermaid block in the top part fails; below it, nothing is judged."""
+    OPEN = "MERGE: captain\nPLAN: https://example.test/acme/api/issues/9\n\n"
+    WHY = "## Why this needs you\n\nIt changes a credential path. The owner decides if it ships.\n\n"
+    TABLE = ("## What changes for you\n\n| Before | After |\n|---|---|\n| You get two cards. | You get one card. |\n"
+             "| You open a list. | The list opens itself. |\n| You retry by hand. | It retries once. |\n\n")
+    EXAMPLE = "## Example\n\nToday a failed job sends two cards and a pointer.\nAfter, one card reads: job 4 failed, retried once.\n\n"
+    QS = "## Questions for you\n\n1. Ship it now? Recommendation: yes.\n2. Keep the flag? Recommendation: no.\n\n"
+    MERMAID = "```mermaid\nflowchart LR\n  A[\"Change\"] --> B[\"Owner\"]\n```\n\n"
+    TOP = WHY + TABLE + EXAMPLE + QS
+    GOOD = TOP + "## For reviewers (technical)\n\n" + MERMAID + "| a | b | c |\n|---|---|---|\n" + "| 1 | 2 | 3 |\n" * 6
+
+    def defects(self, body):
+        return sb.held_defects(body)
+
+    def named(self, found, word):
+        return sum(word in d for d in found)
+
+    def test_a_complete_top_is_ok(self):                                                                    # S1
+        self.assertEqual(self.defects(self.OPEN + self.TOP), [])
+
+    def test_the_why_section_is_one_to_three_sentences_and_no_placeholder(self):                           # S2
+        for why in ("", "## Why this needs you\n\nOne. Two. Three. Four. Five.\n\n", "## Why this needs you\n\n<one to three sentences: the hold reason>\n\n"):
+            with self.subTest(why=why[:30]):
+                found = self.defects(self.OPEN + why + self.TABLE + self.EXAMPLE + self.QS)
+                self.assertEqual(self.named(found, "Why this needs you"), 1, found)
+                self.assertEqual(len(found), 1, found)
+
+    def test_the_table_needs_both_columns_and_two_to_four_rows(self):                                       # S3
+        row = "| A sentence. | Another. |\n"
+        for table in ("", "## What changes for you\n\n| Before | After |\n|---|---|\n" + row + "\n",
+                      "## What changes for you\n\n| Before | After |\n|---|---|\n" + row * 6 + "\n",
+                      "## What changes for you\n\n| Before | Later |\n|---|---|\n" + row * 3 + "\n"):
+            with self.subTest(table=table[:60]):
+                found = self.defects(self.OPEN + self.WHY + table + self.EXAMPLE + self.QS)
+                self.assertEqual((self.named(found, "table"), len(found)), (1, 1), found)
+
+    def test_the_example_must_be_there_and_not_empty(self):                                                 # S4
+        for example in ("", "## Example\n\n"):
+            found = self.defects(self.OPEN + self.WHY + self.TABLE + example + self.QS)
+            self.assertEqual((self.named(found, "Example"), len(found)), (1, 1), found)
+
+    def test_a_mermaid_block_fails_in_the_top_and_is_not_judged_below(self):                                # S5, U2
+        top = self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + self.MERMAID + self.QS
+        found = self.defects(top)
+        self.assertEqual((self.named(found, "diagram"), len(found)), (1, 1), found)
+        self.assertEqual(self.defects(self.OPEN + self.GOOD), [])
+
+    def test_questions_numbered_none_or_missing(self):                                                      # S6
+        qs = "## Questions for you\n\n1. A? Recommendation: yes.\n2. B?\n3. C? Recommendation: no.\n"
+        self.assertEqual(self.defects(self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + qs), ["question 2 has no `Recommendation:`"])
+        for none in ("Questions: none (clear to merge on your word).", "Questions: none", "Questions: none (clear to merge on your word, after #12)"):
+            self.assertEqual(self.defects(self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + "## Questions for you\n\n" + none + "\n"), [], none)
+        found = self.defects(self.OPEN + self.WHY + self.TABLE + self.EXAMPLE)
+        self.assertEqual(self.named(found, "Questions for you"), 1, found)
+
+    def test_the_order_and_an_image_in_the_top(self):                                                       # S7
+        found = self.defects(self.OPEN + self.QS + self.EXAMPLE + self.TABLE + self.WHY)
+        self.assertEqual((self.named(found, "order"), len(found)), (1, 1), found)
+        image = "![the real card, after](https://example.test/card.png)\n\n"
+        self.assertEqual(self.defects(self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + image + self.QS), [])
+
+    def test_a_pr_that_is_not_held_is_not_read_by_the_gate(self):                                           # S8
+        reads = []
+        report = sb.plan_ledger.evaluate_gates(None, [], None, {"head": "a" * 40, "captain": False, "held_check": lambda: reads.append(1) or ["x"]}, "acme/api#1")
+        row = next(r for r in report["gates"] if r["gate"] == "G6b")
+        self.assertEqual((row["status"], reads), ("n/a", []))
+        held = sb.plan_ledger.evaluate_gates(None, [], None, {"head": "a" * 40, "captain": True, "held_check": lambda: ["no table"]}, "acme/api#1")
+        self.assertEqual(next(r for r in held["gates"] if r["gate"] == "G6b")["missing"], ["no table"])
+
+    def test_a_hold_label_alone_or_a_floor_hold_makes_the_gate_judge_and_a_missing_check_fails_closed(self):
+        facts = {"head": "a" * 40, "captain": False, "holds": ["security"], "held_check": lambda: ["no table"]}
+        row = lambda f: next(r for r in sb.plan_ledger.evaluate_gates(None, [], None, f, "acme/api#1")["gates"] if r["gate"] == "G6b")
+        self.assertEqual(row(facts)["status"], "missing")
+        floor = {"head": "a" * 40, "captain": False, "floor": {"decision": "hold", "cleared": False, "reasons": []}, "held_check": lambda: []}
+        self.assertEqual(row(floor)["status"], "ok")
+        self.assertEqual(row({"head": "a" * 40, "captain": True})["status"], "missing")
+
+    def test_headings_inside_a_code_fence_or_comment_do_not_count(self):
+        fenced = self.OPEN + "```text\n" + self.TOP + "```\n"
+        found = self.defects(fenced)
+        for part in ("Why this needs you", "What changes for you", "Example", "Questions for you"):
+            self.assertTrue(any(part in d for d in found), (part, found))
+        found = self.defects(self.OPEN + "~~~~\n" + self.TOP)   # an unclosed fence runs to the end
+        self.assertGreaterEqual(len(found), 4, found)
+        found = self.defects(self.OPEN + "<!--\n" + self.TOP + "-->\n")
+        self.assertGreaterEqual(len(found), 4, found)
+
+    def test_every_spelling_of_a_mermaid_fence_in_the_top_fails_and_below_it_does_not(self):
+        graph = "flowchart LR\n  A[\"x\"] --> B[\"y\"]\n"
+        for opener, closer in (("```mermaid", "```"), ("```Mermaid", "```"), ("```  MERMAID", "```"), ("```mermaid title=\"flow\"", "```"),
+                               ("````mermaid", "````"), ("~~~mermaid", "~~~"), ("   ```mermaid", "   ```")):
+            with self.subTest(opener=opener):
+                body = self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + opener + "\n" + graph + closer + "\n\n" + self.QS
+                found = self.defects(body)
+                self.assertEqual((self.named(found, "diagram"), len(found)), (1, 1), found)
+                below = self.OPEN + self.TOP + "## For reviewers\n\n" + opener + "\n" + graph + closer + "\n"
+                self.assertEqual(self.defects(below), [])
+        pre = self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + '<pre class="mermaid">\nflowchart LR\n</pre>\n\n' + self.QS
+        self.assertEqual(self.named(self.defects(pre), "diagram"), 1)
+
+    def test_placeholder_cells_and_a_thin_example_fail(self):
+        for cell in ("...", "---", "", "<before>", "a b"):
+            table = ("## What changes for you\n\n| Before | After |\n|---|---|\n| %s | You get one card. |\n| You open a list. | It opens itself. |\n\n" % cell)
+            found = self.defects(self.OPEN + self.WHY + table + self.EXAMPLE + self.QS)
+            self.assertEqual((self.named(found, "table"), len(found)), (1, 1), (cell, found))
+        found = self.defects(self.OPEN + self.WHY + self.TABLE + "## Example\n\nIt works.\n\n" + self.QS)
+        self.assertEqual((self.named(found, "Example"), len(found)), (1, 1), found)
+
+    def test_a_pathological_64kb_body_is_judged_quickly_and_a_longer_one_is_not_read(self):
+        for unit in ("<", "<pre ", "```", "<pre class=", "`", "<!--"):
+            body = self.OPEN + unit * (64000 // len(unit))
+            started = time.monotonic()
+            found = self.defects(body)
+            self.assertLess(time.monotonic() - started, 2.0, "64 KB of %r" % unit)   # a generous bound: it takes milliseconds
+            self.assertTrue(found)
+        self.assertIn("longer than", self.defects(self.OPEN + self.TOP + "x" * 70001)[0])
+
+    def test_a_pre_mermaid_tag_fails_in_the_top_however_long_its_attributes_or_spelled(self):
+        def top_with(tag):
+            return self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + self.QS + tag + "\n"   # in the top part, after the questions
+        for n in (250, 1000, 60000):
+            tag = '<pre data-x="%s" class=mermaid>' % ("a" * n)
+            found = self.defects(top_with(tag))
+            self.assertEqual((self.named(found, "diagram"), len(found)), (1, 1), (n, found))
+        for tag in ('<pre data-x=">" class=mermaid>', "<pre title='a > b' class='mermaid'>"):
+            self.assertEqual(self.named(self.defects(top_with(tag)), "diagram"), 1, tag)
+        for tag in ("<pre class='a mermaid b'>", '<PRE CLASS="MERMAID">', "<pre  class = mermaid >"):
+            self.assertEqual(self.named(self.defects(top_with(tag)), "diagram"), 1, tag)
+        for tag in ('<pre class="code">', "<pre>", "<preview class=mermaid>"):
+            self.assertEqual(self.defects(top_with(tag)), [], tag)
+        started = time.monotonic()
+        found = self.defects(top_with("<pre " + "x" * 60000))   # never closed: it cannot be judged, so it fails
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertEqual(self.named(found, "diagram"), 1)
+
+    def within(self, seconds, fn, *args):
+        """Run fn(*args) with a hard alarm: a hang fails the test instead of hanging the suite."""
+        def boom(signum, frame):
+            raise AssertionError("did not finish in %d s (a hang)" % seconds)
+        old = signal.signal(signal.SIGALRM, boom)
+        signal.alarm(seconds)
+        try:
+            return fn(*args)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
+
+    def test_unicode_case_folding_cannot_hang_or_hide_a_mermaid_pre(self):
+        dotted = "\u0130"
+        for n in (1, 2, 50, 2000):
+            body = self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + self.QS + (dotted * n + "<PRE class=mermaid>") + "\n"
+            found = self.within(5, self.defects, body)
+            self.assertEqual(self.named(found, "diagram"), 1, (n, found))   # still found: folding is ASCII-only, the length never changes
+        self.assertTrue(self.within(5, self.defects, self.OPEN + dotted * 5000))   # a body of only U+0130 is judged (and fails)
+        # ASCII-only folding: the Kelvin sign and the long s are NOT k or s, and a dotless i is not i, so these are not Mermaid
+        for tag in ('<pre class="mermaid\u0131">', '<pre class="\u017fermaid">', '<pre class="code" data-k="\u212a">'):
+            self.assertEqual(self.within(5, self.defects, self.OPEN + self.TOP + tag + "\n"), [], tag)
+        # the real spellings still are
+        self.assertEqual(self.named(self.within(5, self.defects, self.OPEN + self.TOP + "<PrE ClAsS='MeRmAiD'>\n"), "diagram"), 1)
+        self.assertEqual(self.named(self.within(5, self.defects, self.OPEN + self.TOP + "```MERMAID\nx\n```\n"), "diagram"), 1)
+
+    def test_a_fuzz_of_random_unicode_bodies_never_hangs_or_crashes(self):
+        import random
+        rng = random.Random(604)
+        alphabet = ["\u0130", "\u212a", "\u017f", "\u0131", "<", ">", "pre", "PRE", "class=", "mermaid", "'", '"', "`", "```", "~~~", "|", "\n", " ", "#", "## ", "<!--", "-->", "I", "i", "K", "s", "\u00e9", "\U0001f600", "1.", "Recommendation:"]
+        def run():
+            for _ in range(20000):
+                body = self.OPEN + "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 60)))
+                self.assertIsInstance(sb.held_defects(body), list)
+        self.within(60, run)
+
+    def test_none_line_variants_and_hostile_runs_are_judged_quickly(self):
+        for line, ok in (("Questions: none", True), ("Questions: none.", True), ("Questions: none (clear to merge on your word).", True),
+                         ("Questions: none (a) (b)", True), ("Questions: none (open", False), ("Questions: nonexistent", False), ("Questions: none x", False)):
+            body = self.OPEN + self.WHY + self.TABLE + self.EXAMPLE + "## Questions for you\n\n" + line + "\n"
+            self.assertEqual(self.defects(body) == [], ok, line)
+        for hostile in ("Questions: none" + " " * 60000 + "x", "Questions: none (" * 4000, "Questions: none" + "\t" * 60000 + "x", "<!--" * 17000, "<!---->" * 9000):
+            started = time.monotonic()
+            self.assertTrue(self.within(5, self.defects, self.OPEN + hostile))
+            self.assertLess(time.monotonic() - started, 2.0, hostile[:20])   # a wide margin: it takes milliseconds; the alarm above catches a hang
+
+    def test_an_exhausted_step_budget_makes_the_body_unreadable(self):
+        with mock.patch.object(sb, "_held_steps", return_value=[0]):
+            found = sb.held_defects(self.OPEN + self.TOP + "<!-- a -->\n")
+        self.assertEqual((len(found), "unreadable" in found[0]), (1, True))
+
+    def test_html_whitespace_around_the_class_attribute_is_all_five_characters(self):
+        def top_with(tag):
+            return self.OPEN + self.TOP + tag + "\n"
+        for tag in ("<pre class\f=mermaid>", "<pre class\r=mermaid>", "<pre class=\fmermaid>", '<pre class = "mermaid">', "<pre class\t\n=mermaid>",
+                    '<pre class="x\fmermaid\ry">', "<pre\fclass=mermaid>", "<pre\rclass='mermaid'>"):
+            found = self.within(5, self.defects, top_with(tag))
+            self.assertEqual(self.named(found, "diagram"), 1, repr(tag))
+        # NOT HTML whitespace: a vertical tab and a no-break space make another attribute name or token, so these are not Mermaid
+        for tag in ("<pre class\x0b=mermaid>", "<pre class\u00a0=mermaid>", '<pre class="x\u00a0mermaid">', '<pre class="\x0bmermaid">'):
+            self.assertEqual(self.within(5, self.defects, top_with(tag)), [], repr(tag))
+
+    def test_underscore_only_cells_fail(self):
+        table = ("## What changes for you\n\n| Before | After |\n|---|---|\n| ___ | You get one card. |\n| You open a list. | It opens itself. |\n\n")
+        found = self.defects(self.OPEN + self.WHY + table + self.EXAMPLE + self.QS)
+        self.assertEqual((self.named(found, "table"), len(found)), (1, 1), found)
+
+    def test_a_body_the_check_cannot_read_fails(self):
+        with mock.patch.object(sb, "_held_defects", side_effect=RuntimeError("boom")):
+            found = sb.held_defects(self.OPEN + self.TOP)
+        self.assertEqual((len(found), "unreadable" in found[0]), (1, True))
+
+    def test_a_hash_line_inside_a_fence_does_not_end_the_top(self):
+        example = "## Example\n\nA command:\n\n```text\n# a comment line\n```\n\nIt prints one card.\n\n"
+        self.assertEqual(self.defects(self.OPEN + self.WHY + self.TABLE + example + self.QS), [])
+
+    def test_the_three_files_name_the_parts_in_order_and_put_mermaid_below(self):                           # S9
+        for rel in ("skills/fleet-explainer/SKILL.md", ".github/pull_request_template.md", "skills/fleet-coordination/SKILL.md"):
+            text = (REPO / rel).read_text()
+            why = text.index("Why this needs you")
+            at = [why] + [text.index(n, why) for n in ("What changes for you", "Example", "Questions for you")]
+            self.assertEqual(at, sorted(at), rel)
+            self.assertIn("optional", text[why:].lower(), rel)
+            self.assertRegex(text[why:], r"Mermaid[^\n]*below|below[^\n]*Mermaid", rel)
+
+    def test_the_block_sits_after_the_opening_lines_for_both_readers(self):                                 # S10
+        body = self.OPEN + self.GOOD
+        self.assertEqual(sb.pr_marker(body), "captain")
+        self.assertEqual(sb.plan_ledger.PLAN_LINK_RE.search(body).group(1), "https://example.test/acme/api/issues/9")
+
+    def test_a_top_v2_with_the_explainer_block_and_mermaid_below_passes_both_checks(self):
+        block = sb.explainer_block("old", "new")
+        body = sb.explainer_insert(self.OPEN + self.TOP + "## For reviewers (technical)\n\ntext\n", block) + "\n## How it flows\n\n```mermaid\nflowchart LR\n  A[\"Request\"] --> B[\"Gate\"]\n```\n"
+        self.assertEqual(self.defects(body), [])
+        self.assertEqual(sb.explainer_defects(body), [])
+        self.assertLess(body.index("## Questions for you"), body.index(sb.EXPLAINER_BEGIN))
+
+
+class TestHeldSummaryFlowchart(unittest.TestCase):
+    """#687: a held PR body that holds the generated summary flowchart (a Mermaid fence whose boxes are Changes:, Touches:, Irreversible:, Risk:) ANYWHERE is refused
+    by the held-body check (gate G6b and `pr-explain --check`), naming it; a data-flow diagram below the top passes. The detector is one pass under a step budget."""
+    SUMMARY = ('```mermaid\nflowchart LR\n  A["Changes: Add the parser"] --> B["Touches: bin 2, docs 1 (4 files)"]\n  B --> C["Irreversible: nothing"]\n'
+               '  C --> D["Risk: not rated yet"]\n```\n')
+    DATAFLOW = '```mermaid\nflowchart LR\n  A["Request"] --> B["Gate"]\n  B --> C["Ledger"]\n```\n'
+    TECH = "## For reviewers (technical)\n\n"
+
+    def defects(self, body):
+        return sb.held_defects(body)
+
+    def flow(self, found):
+        return [d for d in found if "generated summary flowchart" in d]
+
+    def test_s3_the_summary_flowchart_is_refused_in_the_top_below_it_and_inside_the_explainer_markers_naming_it(self):
+        top = self.SUMMARY.replace("```mermaid", "~~~mermaid").replace("```", "~~~")
+        block = sb.explainer_block("old", "new")
+        cases = (("top", TestHeldTop.OPEN + self.SUMMARY + TestHeldTop.TOP),
+                 ("below the top", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + self.SUMMARY),
+                 ("inside the explainer markers", sb.explainer_insert(TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + "text\n", block.replace(sb.EXPLAINER_END, self.SUMMARY + sb.EXPLAINER_END))),
+                 ("a tilde fence", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + top),
+                 ("a four backtick fence", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + self.SUMMARY.replace("```", "````")),
+                 ("an indented fence", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + self.SUMMARY.replace("```mermaid", "   ```mermaid")),
+                 ("a fence in a blockquote", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + "".join("> " + l + "\n" for l in self.SUMMARY.splitlines())),
+                 ("a fence in a list item", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + "- an item\n" + "".join("  " + l + "\n" for l in self.SUMMARY.splitlines())),
+                 ("a fence opened on the bullet line", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + "- " + self.SUMMARY),
+                 ("a fence opened on a numbered line", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + "1. " + self.SUMMARY),
+                 ("nested markers", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + "- > " + self.SUMMARY),
+                 ("behind a decoy fence", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + "    ````\n" + self.SUMMARY),
+                 ("CR-only line breaks", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH.replace("\n", "\r") + self.SUMMARY.replace("\n", "\r")),
+                 ("an unclosed fence", TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + self.SUMMARY.rsplit("```", 1)[0]))
+        for name, body in cases:
+            with self.subTest(case=name):
+                found = self.defects(body)
+                self.assertEqual(len(self.flow(found)), 1, found)
+                self.assertIn("Changes:", self.flow(found)[0])
+        self.assertEqual(self.defects(TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + "text\n"), [], "the same body without it is clean")
+
+    def test_s4_a_data_flow_diagram_below_the_top_passes_and_so_does_a_body_that_only_names_the_labels_in_prose(self):
+        body = TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + self.DATAFLOW
+        self.assertEqual(self.defects(body), [])
+        prose = TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + "The old box read Changes: x, Touches: y, Irreversible: z, Risk: w.\n"
+        self.assertEqual(self.defects(prose), [])
+        split = self.SUMMARY.replace("  C --> D", "```\n\n```mermaid\n  C --> D")   # the four labels across two fences are not one flowchart
+        self.assertEqual(self.flow(self.defects(TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + split)), [])
+        self.assertEqual(self.flow(self.defects(TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + self.SUMMARY.replace("Risk", "Danger"))), [])
+
+    def test_the_detector_reads_each_fence_form_and_ignores_the_rest(self):
+        found = sb.summary_flowchart_found
+        self.assertTrue(found(self.SUMMARY))
+        self.assertTrue(found(self.SUMMARY.replace("Changes", "CHANGES")))
+        self.assertFalse(found(self.DATAFLOW))
+        self.assertFalse(found(self.SUMMARY.replace("```mermaid", "```text")))
+        self.assertFalse(found(self.SUMMARY.replace("```mermaid", "```python")))
+        self.assertFalse(found(self.SUMMARY.replace("```mermaid", "```mermaid `x`")), "a backtick opener whose info string has a backtick is not a fence")
+        self.assertTrue(found(self.SUMMARY.replace("```", "````")), "a four backtick fence closed by four")
+        self.assertTrue(found(self.SUMMARY.replace("```mermaid", "````mermaid", 1)), "closed by a shorter fence: it stays open to the end, and an open fence counts")
+        self.assertTrue(found(self.SUMMARY.replace("```mermaid", "~~~mermaid", 1)), "closed by another character: it stays open to the end, and an open fence counts")
+        self.assertTrue(found(self.SUMMARY.replace("\n```\n", "\n``` text\n")), "a closing line carrying text does not close it: open to the end counts")
+        self.assertFalse(found(""))
+        self.assertFalse(found(None))
+
+    def test_s5_a_64_kb_body_of_repeated_labels_and_fences_is_judged_in_well_under_half_a_second_and_by_a_step_budget(self):
+        unit = '```mermaid\n["Changes: ["Touches: ["Irreversible: ' + "\u0130\u212a" * 20 + '\n'
+        body = (unit * 400 + "[" * 20000 + ("```\n" + '"Risk:' * 5) * 2000)[:65536]
+        self.assertEqual(len(body), 65536)
+        def best(call):   # the plan's bound (S5: under 0.5 s) on the best of three runs, so a loaded runner's one slow run is not a failure
+            took = []
+            for _ in range(3):
+                begun = time.time()
+                call()
+                took.append(time.time() - begun)
+            return min(took)
+        self.assertTrue(any("generated summary flowchart" in d for d in self.defects(TestHeldTop.OPEN + body[:65000])), "the scan ran and found it")
+        self.assertLess(best(lambda: self.defects(TestHeldTop.OPEN + body[:65000])), 0.5, "plan S5: a quadratic scan takes seconds on this body")
+        self.assertTrue(sb.summary_flowchart_found(self.SUMMARY * 400))   # 64 KB of the real thing
+        self.assertLess(best(lambda: sb.summary_flowchart_found(self.SUMMARY * 400)), 0.5)
+        # by construction: the detector spends one step per line from a budget, so it cannot run on
+        with mock.patch.object(sb, "_held_steps", return_value=[3]):
+            with self.assertRaises(ValueError):
+                sb.summary_flowchart_found("x\n" * 100)
+            self.assertIn("could not be scanned", sb.explainer_defects("x\n" * 100)[-1], "a scan that cannot finish is a defect, never a raise")
+        self.assertEqual(self.defects(TestHeldTop.OPEN + "x\n" * 40000)[0][:30], "the held PR's top is unreadabl")   # over the held cap: unreadable, never ok
+        # a label past the 400 character cut of its line is not read; a body past 1 MB is cut
+        padded = self.SUMMARY.replace('B["Touches', 'B["' + " " * sb._SUMMARY_LINE_MAX + 'Touches')
+        self.assertFalse(sb.summary_flowchart_found(padded))
+        self.assertFalse(sb.summary_flowchart_found("x" * sb._SUMMARY_BODY_MAX + "\n" + self.SUMMARY))
+
+    def test_pr_explain_check_on_a_held_body_names_the_flowchart_on_one_line(self):
+        """The combined path: the explainer check and the held check both see the flowchart, and the command prints it once."""
+        pr = {"title": "t", "state": "OPEN", "labels": [{"name": "me:merge-captain"}], "files": [], "additions": 1, "deletions": 0, "changedFiles": 1,
+              "body": TestHeldTop.OPEN + TestHeldTop.TOP + self.TECH + self.SUMMARY}
+        with mock.patch.object(sb, "read_pr_json", return_value=pr), mock.patch.object(sb, "build_engine", return_value=(mock.Mock(), None, None)):
+            with captured() as (out, err):
+                code = sb.main(["pr-explain", "acme/api#7", "--check"])
+        self.assertEqual(code, 1, out.getvalue() + err.getvalue())
+        self.assertEqual(out.getvalue().count("generated summary flowchart"), 1, out.getvalue())
+
+    def test_the_explainer_check_names_the_flowchart_once_with_or_without_a_block(self):
+        self.assertEqual(sum("generated summary flowchart" in d for d in sb.explainer_defects(self.SUMMARY)), 1)
+        block = sb.explainer_block("old", "new")
+        self.assertEqual(sum("generated summary flowchart" in d for d in sb.explainer_defects(sb.explainer_insert(self.SUMMARY, block))), 1)
+
+
 class TestHeldRowsFromLabels(DecisionsBase):
     """#641: an open pull request that carries the fleet's hold labels is a decision row on those labels alone, one row per pull request, read from the open-pull-request list the daemon already holds."""
 
@@ -41700,8 +42339,8 @@ class TestHeldRowsFromLabels(DecisionsBase):
 
 
 class TestPrExplainer(DecisionsBase):
-    """#179 slice L6: the explainer block (a before and after why part on every PR; for a captain PR the infographic first), printed by a read-only
-    command and put in a description ONCE. The Mermaid check is against the SUBSET this command writes, not Mermaid's own parser."""
+    """#179 slice L6: the explainer block (a before and after why part on every PR, never a diagram: #687), printed by a read-only
+    command and put in a description ONCE. `--check` fails a body that holds the generated summary flowchart."""
     FILES = [{"path": "bin/fleet-switchboard"}, {"path": "bin/test-switchboard"}, {"path": "docs/switchboard.md"}, {"path": "README.md"}]
 
     def setUp(self):
@@ -41733,84 +42372,37 @@ class TestPrExplainer(DecisionsBase):
         self.assertIn("after:  a list shows one agent", out)
         self.assertEqual(len(self.calls), 1, "one GET of the PR, nothing else")
 
-    def test_a_captain_pr_gets_the_infographic_first_and_it_parses(self):
-        self.captain()
-        code, out, err = self.cli("pr-explain", "acme/api#7", "--before", "b", "--after", "a", "--irreversible", "a migration cannot be undone",
-                                  "--severity", "Marginal", "--probability", "Occasional")
-        self.assertEqual(code, 0, err)
-        self.assertLess(out.index("```mermaid"), out.index("```text"), "the diagram comes first in the block")
-        diagram = re.search(r"```mermaid\n(.*?)```", out, re.S).group(1)
-        self.assertEqual(sb.mermaid_defects(diagram), [])
-        for label in ("Changes: Add the parser", "Touches: bin 2, docs 1, root files 1 (4 files)", "Irreversible: a migration cannot be undone", "Risk: Marginal x Occasional: Medium"):
-            self.assertIn(label, diagram)
+    SUMMARY = ('```mermaid\nflowchart LR\n  A["Changes: Add the parser"] --> B["Touches: bin 2, docs 1 (4 files)"]\n  B --> C["Irreversible: nothing"]\n'
+               '  C --> D["Risk: not rated yet"]\n```\n')
+    DATAFLOW = '```mermaid\nflowchart LR\n  A["Request"] --> B["Gate"]\n  B --> C["Ledger"]\n```\n'
 
-    def test_the_risk_cell_comes_from_the_single_source_matrix_and_a_wrong_name_is_refused(self):
-        self.assertEqual(sb.explainer_risk_cell(eliminated=True), "Eliminated (not rated)")
-        self.assertEqual(sb.explainer_risk_cell(), "not rated yet")
-        matrix = json.loads((REPO / "docs" / "review-laws" / "impact-matrix.json").read_text())
-        for severity in matrix["severities"]:
-            for probability in matrix["probabilities"]:
-                cell = matrix["cells"][severity][probability]
-                self.assertIn(": %s (" % cell["level"], sb.explainer_risk_cell(severity, probability))
+    def test_a_captain_pr_gets_the_same_block_and_never_a_diagram(self):
         self.captain()
-        code, out, err = self.cli("pr-explain", "acme/api#7", "--severity", "Huge", "--probability", "Occasional")
-        self.assertEqual(code, 2)
-        self.assertIn("severity is one of", err)
-
-    def test_the_title_cannot_break_or_extend_the_diagram(self):
-        self.captain()
-        self.pr["title"] = 'x"] --> Z["evil"] %% <script> [bad](http://x) ' + "y" * 300
         code, out, err = self.cli("pr-explain", "acme/api#7", "--before", "b", "--after", "a")
-        diagram = re.search(r"```mermaid\n(.*?)```", out, re.S).group(1)
-        self.assertEqual(sb.mermaid_defects(diagram), [])
-        self.assertEqual(len(diagram.splitlines()), 4, "four lines: the header and the three edges, no node added by the title")
-        for bad in ('"] --> Z', "<script>", "](http", "%%"):
-            self.assertNotIn(bad, diagram)
-        self.assertTrue(all(len(line) < 160 for line in diagram.splitlines()))
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("mermaid", out.lower())
+        self.assertNotIn("flowchart", out)
+        self.assertIn("before: b", out)
+        self.assertIn("after:  a", out)
 
-    def test_a_broken_or_foreign_diagram_is_refused(self):
-        good = 'flowchart LR\n  A["a"] --> B["b"]'
-        self.assertEqual(sb.mermaid_defects(good), [])
-        for text, want in (("", "does not open"), ("graph LR\n  A[a] --> B[b]", "does not open"), ('flowchart LR\n  A["a"]', "at least two nodes"),
-                           ('flowchart LR\n  A["a"] --> B', "never defined"), ('flowchart LR\n  A["a"] --> B["b"]\n  click A "http://x"', "not part of the supported"),
-                           ('flowchart LR\n  A["a"] --> B["b"]\n  style A fill:#f00', "not part of the supported")):
-            with self.subTest(text=text[:30]):
-                self.assertTrue(any(want in d for d in sb.mermaid_defects(text)), sb.mermaid_defects(text))
+    def test_the_diagram_arguments_are_gone(self):
+        for flag in ("--irreversible", "--severity", "--probability", "--eliminated", "--captain"):
+            with self.subTest(flag=flag):
+                self.assertEqual(self.cli("pr-explain", "acme/api#7", flag, "x")[0], 2)
 
     def test_text_that_would_end_or_split_the_block_cannot_break_check(self):
         nasty = "ends <!-- pr-explainer:end --> early --> and ``` fences <!-- pr-explainer:begin --> here"
         block = sb.explainer_block(nasty, nasty)
         body = sb.explainer_insert("PLAN: https://example.test/1\n\ntext", block)
         self.assertEqual((body.count(sb.EXPLAINER_BEGIN), body.count(sb.EXPLAINER_END)), (1, 1))
-        self.assertEqual(sb.explainer_defects(body, False), [])
+        self.assertEqual(sb.explainer_defects(body), [])
         self.pr["body"] = body
         self.assertEqual(self.cli("pr-explain", "acme/api#7", "--check")[0], 0)
         code, out, err = self.cli("pr-explain", "acme/api#7", "--before", nasty, "--after", nasty)
         self.assertEqual((out.count(sb.EXPLAINER_BEGIN), out.count(sb.EXPLAINER_END)), (1, 1))
 
-    def test_a_cut_file_list_is_said_in_the_diagram_not_hidden(self):
-        self.assertEqual(sb.explainer_count(4, 4), "4 files")
-        self.assertEqual(sb.explainer_count(1, 1), "1 file")
-        self.assertEqual(sb.explainer_count(100, 140), "100 of 140 files listed")
-        self.assertEqual(sb.explainer_count(4, None), "4 files")
-        self.captain()
-        self.pr["files"] = [{"path": "bin/f%d" % i} for i in range(100)]
-        self.pr["changedFiles"] = 140
-        with mock.patch.object(sb, "read_pr_json", return_value=dict(self.pr, state="OPEN")):
-            code, out, err = self.cli("pr-explain", "acme/api#7", "--before", "b", "--after", "a")
-        self.assertIn("100 of 140 files listed", out)
-        self.assertEqual(sb.mermaid_defects(re.search(r"```mermaid\n(.*?)```", out, re.S).group(1)), [])
-
-    def test_a_diagram_outside_the_subset_is_refused_and_the_printed_block_has_no_image(self):
-        foreign = ('flowchart LR\n  A["a"] --> B["b"]\n  click A "http://example.test"', 'flowchart LR\n  A["a"] --> B["b"]\n  style A fill:#f00', 'graph LR\n  A["a"] --> B["b"]')
-        self.assertTrue(all(sb.mermaid_defects(text) for text in foreign))
-        self.captain()
-        code, out, err = self.cli("pr-explain", "acme/api#7", "--before", "b", "--after", "a")
-        for image in ("![", ".png", ".svg", "<img"):
-            self.assertNotIn(image, out)
-
     def test_a_body_gets_at_most_one_block_however_often_it_is_inserted(self):
-        block = sb.explainer_block("old", "new", "flowchart LR\n  A[\"a\"] --> B[\"b\"]")
+        block = sb.explainer_block("old", "new")
         body = self.pr["body"]
         once = sb.explainer_insert(body, block)
         twice = sb.explainer_insert(once, sb.explainer_block("old2", "new2"))
@@ -41851,7 +42443,7 @@ class TestPrExplainer(DecisionsBase):
         block = sb.explainer_block("old", "new")
         self.pr["body"] = sb.explainer_insert(self.pr["body"], block)
         code, out, err = self.cli("pr-explain", "acme/api#7", "--check")
-        self.assertEqual((code, out.strip()), (0, "explainer: PASS (ordinary PR)"))
+        self.assertEqual((code, out.strip()), (0, "explainer: PASS"))
         for body, want in ((self.PR_NONE, "0 explainer blocks"), (self.PR_TWO, "2 explainer blocks"),
                            (sb.explainer_insert("x", sb.explainer_block("old", "<what happens after>")), "placeholder"),
                            ("x\n" + sb.EXPLAINER_BEGIN + "\n```text\nbefore: only a before\n```\n" + sb.EXPLAINER_END, "`after:` line")):
@@ -41860,16 +42452,66 @@ class TestPrExplainer(DecisionsBase):
                 code, out, err = self.cli("pr-explain", "acme/api#7", "--check")
                 self.assertEqual(code, 1)
                 self.assertIn(want, out)
-        self.captain()
-        self.pr["body"] = sb.explainer_insert("x", block)   # a captain PR without the infographic
+        self.captain()   # a captain PR needs no diagram either: the same body passes
+        self.pr["body"] = sb.explainer_insert("x", block)
         code, out, err = self.cli("pr-explain", "acme/api#7", "--check")
-        self.assertEqual(code, 1)
-        self.assertIn("infographic", out)
-        self.pr["body"] = sb.explainer_insert("x", sb.explainer_block("old", "new", sb.explainer_mermaid("t", ["a/b"], "none", "not rated yet")))
+        self.assertEqual(code, 1, out)   # a held (captain) PR also needs why, its table, an example and its questions (TestHeldTop)
+        self.pr["body"] = sb.explainer_insert("x\n" + TestHeldTop.TOP + "## For reviewers\n", block)
         self.assertEqual(self.cli("pr-explain", "acme/api#7", "--check")[0], 0)
+        self.pr["body"] = sb.explainer_insert("x\n" + TestHeldTop.TOP + "## For reviewers\n", block) + "\n" + self.DATAFLOW
+        self.assertEqual(self.cli("pr-explain", "acme/api#7", "--check")[0], 0, "a data-flow diagram below the top is allowed")
+
+    def test_check_accepts_a_body_without_a_diagram_and_one_with_a_data_flow_diagram_and_fails_the_summary_flowchart_anywhere(self):
+        block = sb.explainer_block("old", "new")
+        plain = sb.explainer_insert(self.pr["body"], block)
+        cases = ((plain, 0, ""), (plain + "\n## How it flows\n\n" + self.DATAFLOW, 0, ""),
+                 (self.SUMMARY + plain, 1, "generated summary flowchart"),   # at the top
+                 (plain + "\n" + self.SUMMARY, 1, "generated summary flowchart"),   # below the top
+                 (sb.explainer_insert(self.pr["body"], block.replace(sb.EXPLAINER_END, self.SUMMARY + sb.EXPLAINER_END)), 1, "generated summary flowchart"))   # inside the markers
+        for body, want_code, want in cases:
+            with self.subTest(want=want, head=body[:30]):
+                self.pr["body"] = body
+                code, out, err = self.cli("pr-explain", "acme/api#7", "--check")
+                self.assertEqual(code, want_code, out)
+                self.assertIn(want, out)
+                if want_code:
+                    self.assertIn("Changes:", out)
+
+    def test_the_summary_flowchart_detector_reads_a_mermaid_fence_with_the_four_labels_only(self):
+        self.assertTrue(sb.summary_flowchart_found(self.SUMMARY))
+        self.assertTrue(sb.summary_flowchart_found(self.SUMMARY.replace("```\n", "")))   # an unclosed fence still counts
+        self.assertTrue(sb.summary_flowchart_found(self.SUMMARY.replace("Changes", "CHANGES")))
+        self.assertFalse(sb.summary_flowchart_found(self.DATAFLOW))
+        self.assertFalse(sb.summary_flowchart_found("Changes: a, Touches: b, Irreversible: c, Risk: d in prose"))
+        self.assertFalse(sb.summary_flowchart_found(self.SUMMARY.replace("```mermaid", "```text")))
+        self.assertFalse(sb.summary_flowchart_found(self.SUMMARY.replace("Risk", "Danger")))
+        self.assertFalse(sb.summary_flowchart_found(""))
+        self.assertFalse(sb.summary_flowchart_found(None))
+
+    def test_the_summary_flowchart_detector_is_bounded_by_its_cuts_not_by_a_clock(self):
+        """Bounded and linear by construction: one pass over the lines, the body cut at 1 MB and each line at 400 characters. Shown by what is NOT seen past a cut."""
+        fence = self.SUMMARY
+        self.assertTrue(sb.summary_flowchart_found(fence * 400), "a 64 KB body made of the summary flowchart repeated is found")
+        self.assertFalse(sb.summary_flowchart_found("x" * sb._SUMMARY_BODY_MAX + "\n" + fence), "past the 1 MB cut nothing is read")
+        padded = fence.replace('B["Touches', 'B["' + " " * sb._SUMMARY_LINE_MAX + 'Touches')
+        self.assertFalse(sb.summary_flowchart_found(padded), "past the 400 character cut of a line nothing is read")
+        two = '```mermaid\nflowchart LR\n  A["Changes: a"] --> B["Touches: b"]\n```\n```mermaid\nflowchart LR\n  C["Irreversible: c"] --> D["Risk: d"]\n```\n'
+        self.assertFalse(sb.summary_flowchart_found(two), "the four labels are read inside ONE fence")
+        hostile = ('```mermaid\n["Changes: ["Touches: ["Irreversible: ' + "\u0130\u212a" * 20 + "\n") * 400 + "[" * 20000
+        self.assertFalse(sb.summary_flowchart_found(hostile[:65536]))
 
     PR_NONE = "text only"
     PR_TWO = sb.EXPLAINER_BEGIN + "\n```text\nbefore: a\nafter:  b\n```\n" + sb.EXPLAINER_END + "\n" + sb.EXPLAINER_BEGIN + "\n```text\nbefore: a\nafter:  b\n```\n" + sb.EXPLAINER_END
+
+    def test_the_skill_the_template_and_the_coordination_skill_each_say_a_diagram_is_for_data_flow_or_design_and_never_the_top(self):
+        rule = "only where it shows data flow, system design or component design, never at the top of a body"
+        for path in ("skills/fleet-explainer/SKILL.md", ".github/pull_request_template.md", "skills/fleet-coordination/SKILL.md"):
+            with self.subTest(path=path):
+                text = " ".join((REPO / path).read_text().split())
+                self.assertEqual(text.count(rule), 1)
+                self.assertNotRegex(text.lower(), r"infographic|captain prs only|flowchart of four")
+        skill = (REPO / "skills" / "fleet-explainer" / "SKILL.md").read_text()
+        self.assertNotIn("first in the block", skill)
 
     def test_a_pr_that_cannot_be_read_is_an_error_and_a_bad_reference_is_usage(self):
         self.assertEqual(self.cli("pr-explain", "not-a-pr")[0], 2)
@@ -43407,6 +44049,131 @@ class TestEscalateANotice(BaselineWorld):
         with self.assertRaises(sb.DecisionError) as caught:
             sb.escalate_decision(self.world.engine, None, order, None, "cos")
         self.assertIn("information only", str(caught.exception))
+
+
+class TestEscalateALabelsOnlyHeldPullRequest(BaselineWorld):
+    """#712: a pull request held on its hold labels alone is listed by the daemon's file but not derived by the command line. The file only says "this pull
+    request was listed": the pull request is read NOW. Synthetic names; the state directory is the test's own."""
+
+    PID = "pr:api#7"
+
+    def setUp(self):
+        super().setUp()
+        self.hold = {"name": sb.label_names(self.world.config)["merge-captain"]}
+        self.prs[7] = pr_view_json(labels=[self.hold], headRefOid=HEAD_A, body="")
+        self.reads = []
+        self.who("cos")
+
+    def route(self, argv, **kwargs):
+        if argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"]:
+            self.reads.append(argv[3])
+        return super().route(argv, **kwargs)
+
+    def row(self, tier="cos", ident=None, kind="captain"):
+        return {"id": ident or self.PID, "kind": kind, "tier": tier, "title": "held", "repo": "acme/api", "number": 7, "head": HEAD_A}
+
+    def file(self, *rows, age=0):
+        path = self.world.state / sb.DECISIONS_FILE
+        path.write_text(json.dumps({"decisions": list(rows), "errors": [], "written_at": sb.iso(time.time()), "generation": 1, "daemon_pid": 1}))
+        stamp = self.world.clock.now() - age   # the fake clock the command runs on
+        os.utime(path, (stamp, stamp))
+
+    def marks(self):
+        return sorted(sb.read_escalated(self.world.state))
+
+    def test_s1_a_row_only_the_file_has_is_escalated_after_a_read_of_the_pull_request_now(self):
+        self.file(self.row())
+        self.assertEqual([d for d in self.fresh()["decisions"] if d.get("number") == 7], [], "the command line's own derivation misses it")
+        for ident in (self.PID, "pr:acme/api#7"):
+            self.reads.clear()
+            got = self.cmd("cos", "decisions", "escalate", ident, "--reason", "the owner decides")
+            self.assertEqual(got["code"], 0, got)
+            self.assertIn("escalated", got["out"])
+            self.assertEqual(self.marks(), ["captain:acme/api#7@%s" % HEAD_A])
+            self.assertEqual(self.reads, ["7"], "exactly one read of the pull request")
+        self.assertTrue(self.audit_events("decisions.escalate"))
+
+    def test_s2_a_pull_request_that_no_longer_holds_says_so_and_changes_nothing(self):
+        self.file(self.row())
+        for what, view, said in (("merged", pr_view_json(state="MERGED", labels=[self.hold], headRefOid=HEAD_A), "nothing to escalate"),
+                                 ("closed", pr_view_json(state="CLOSED", labels=[self.hold], headRefOid=HEAD_A), "nothing to escalate"),
+                                 ("unlabelled", pr_view_json(headRefOid=HEAD_A, body=""), "information only")):
+            with self.subTest(what):
+                self.prs[7] = view
+                got = self.cmd("cos", "decisions", "escalate", self.PID)
+                self.assertEqual(got["code"], 2, got)
+                self.assertIn(said, got["err"])
+                self.assertEqual((self.marks(), self.writes(), self.audit_events("decisions.escalate")), ([], [], []))
+
+    def test_s3_an_id_in_neither_says_no_decision_is_waiting_and_reads_nothing(self):
+        self.file(self.row())
+        for argv in (("escalate", "pr:api#9"), ("resolve", "pr:api#9"), ("answer", "pr:api#9", "yes"), ("supersede", "pr:api#9", "--by", "acme/api#9")):
+            with self.subTest(argv[0]):
+                got = self.cmd("cos", "decisions", *argv)
+                text = got["out"] + got["err"]
+                self.assertIn("no decision pr:api#9 is waiting%s" % sb.decision_miss_hint(self.fresh()["decisions"], "pr:api#9"), text)   # the message and hint of today
+        self.assertEqual((self.reads, self.marks()), ([], []))
+
+    def test_s4_resolve_answer_and_supersede_refuse_with_the_reason_the_captain_row_gives(self):
+        self.gh.issue(API, 8, "The superseding issue")
+        self.file(self.row())
+        before = self.labels()
+        for argv in (("resolve", self.PID), ("answer", self.PID, "yes")):
+            got = self.cmd("cos", "decisions", *argv)
+            self.assertEqual(got["code"], 2, got)
+            self.assertIn("is a MERGE: captain PR: merge or close the PR", got["err"])
+        got = self.cmd("cos", "decisions", "supersede", self.PID, "--by", "acme/api#8")
+        self.assertIn("pr:api#7: refused: pr:api#7 is a MERGE: captain PR: merge or close the PR", got["out"])
+        self.assertEqual((self.marks(), self.writes(), self.labels(), self.reads), ([], [], before, []))
+
+    def test_s5_no_file_an_unreadable_file_and_a_stale_file_are_a_miss(self):
+        path = self.world.state / sb.DECISIONS_FILE
+        path.unlink(missing_ok=True)
+        cases = [("missing", lambda: None),
+                 ("unreadable", lambda: path.write_text("{not json")),
+                 ("stale", lambda: self.file(self.row(), age=sb.DECISIONS_STALE_SECONDS * 3))]
+        for what, make in cases:
+            with self.subTest(what):
+                make()
+                got = self.cmd("cos", "decisions", "escalate", self.PID)
+                self.assertIn("no decision pr:api#7 is waiting", got["err"])
+                self.assertEqual((self.reads, self.marks()), ([], []))
+
+    def test_s7_the_role_rule_the_tier_rule_and_the_audit_are_the_same_on_this_path(self):
+        self.file(self.row(), self.row("human", "pr:api#8"))
+        got = self.cmd("api-coder", "decisions", "escalate", self.PID)
+        self.assertEqual(got["code"], 2, got)
+        self.assertIn("only the Chief of Staff, or you in a plain shell, may escalate", got["err"])
+        self.assertEqual(len(self.audit_events("decisions.refused")), 1)
+        got = self.cmd("cos", "decisions", "resolve", "pr:api#8")
+        self.assertIn("is on the human tier", got["err"])
+        self.assertEqual(len(self.audit_events("decisions.refused")), 2)
+        self.assertEqual((self.reads, self.marks()), ([], []))
+
+    def test_a_row_the_file_lists_as_already_the_owners_says_so_and_changes_nothing(self):
+        self.file(self.row("human"))
+        got = self.cmd("cos", "decisions", "escalate", self.PID)
+        self.assertEqual(got["code"], 0, got)
+        self.assertIn("already yours", got["out"])
+        self.assertEqual((self.reads, self.marks(), self.writes(), self.audit_events("decisions.escalate")), ([], [], [], []))
+
+    def test_only_a_captain_or_notice_row_of_the_file_is_taken_for_a_pr_id(self):
+        self.file(self.row(kind="issue"))
+        got = self.cmd("cos", "decisions", "escalate", self.PID)
+        self.assertIn("no decision pr:api#7 is waiting", got["err"])
+        self.assertEqual((self.reads, self.marks()), ([], []))
+
+    def test_u2_an_id_the_fresh_derivation_finds_never_reads_the_file(self):
+        self.prs[7] = pr_view_json()
+        self.assertEqual(self.cmd("api-coder", "notice", "pr", "acme/api#7", "look")["code"], 0)
+        _, decisions, _ = sb.fresh_engine_decisions(self.route, self.world.clock.now)
+        (found,) = [d for d in decisions if d.get("number") == 7]
+        self.assertEqual(found["kind"], "notice", "the fresh derivation lists the notice")
+        self.prs[7] = pr_view_json(labels=[self.hold], headRefOid=HEAD_A, body="")
+        self.who("cos")
+        with mock.patch.object(sb, "persisted_pr_decision", side_effect=AssertionError("the file was consulted")):
+            got = self.cmd("cos", "decisions", "escalate", found["id"])
+        self.assertEqual(got["code"], 0, got)
 
 
 class TestDecisionBaselineWrites(BaselineWorld):
@@ -51155,7 +51922,12 @@ class TestHeavySlots(Base):
         argv = [sys.executable, str(SWITCHBOARD), "heavy", "--slots", str(slots), "--name", name]
         if wait_max is not None:
             argv += ["--wait-max", str(wait_max)]
-        proc = subprocess.Popen(argv + ["--"] + list(words), env=env or self.env(), start_new_session=new_session, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        argv = argv + ["--"] + list(words)
+        if self.START_DELAY:   # a holder slow to write its record: the real wrapper holds its lock at once but its record (os.pwrite) lands START_DELAY seconds late
+            runner = ("import os, sys, time, runpy; real, delay = os.pwrite, float(sys.argv[1]); os.pwrite = lambda *a: (time.sleep(delay), real(*a))[1]; "
+                      "script = sys.argv[2]; sys.argv = [script] + sys.argv[3:]; runpy.run_path(script, run_name='__main__')")
+            argv = [sys.executable, "-c", runner, str(self.START_DELAY), str(SWITCHBOARD)] + argv[2:]
+        proc = subprocess.Popen(argv, env=env or self.env(), start_new_session=new_session, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 stdin=popen.pop("stdin", subprocess.DEVNULL), text=True, **popen)
         self.procs.append(proc)
         return proc
@@ -51197,14 +51969,46 @@ class TestHeavySlots(Base):
     def started(self):
         return sorted(p.name for p in self.home.glob("started.*"))
 
+    READY_TRIES = 600    # the readiness helper: 600 reads of the holder record, 0.1 s apart (60 s: a bound for a hang, not a delay: a healthy holder is ready in milliseconds), unless a test names its own bound
+    READY_PAUSE = 0.1
+    START_DELAY = 0      # seconds a holder is made slow to start (the injected-delay class sets it)
+
+    @staticmethod
+    def holders_ready(found, count, name=None, wrapper_pids=()):
+        """The readiness decision, from what `holders` listed: `count` holders, each with a real name and command (the record is written) and, for the real-process
+        tests, a pid that is NOT its wrapper's. The wrapper writes the record TWICE: first its own pid, then (a moment later, after truncating the file first) the
+        command's pid: the first record is not the holder's final one, and a read between the second truncate and the second write shows '?'. Ready is the final record."""
+        known = [h for h in found if h["name"] != "?" and h["command"] != "?" and h["pid"] is not None and h["pid"] not in set(wrapper_pids)
+                 and (name is None or h["name"] == name)]
+        return len(found) == count and len(known) == count
+
+    def ready_holders(self, count, slots=3, name=None, seconds=None, state=None, wrappers=()):
+        """Wait until `count` holders are READY, then return them. Ready is read from the record the product itself reads (`holders`), never from a timer and never
+        from the lock alone: the lock is taken first and the record written after, so a held lock is not ready. `wrappers` are the heavy wrapper processes started for
+        the holders: a holder is ready only once its record shows the COMMAND's pid (see holders_ready). Bounded: READY_TRIES reads (or `seconds` / READY_PAUSE); when
+        it runs out it fails and says which holder was expected and what was missing."""
+        tries = int(seconds / self.READY_PAUSE) if seconds is not None else self.READY_TRIES
+        state = state or self.state()
+        pids = [w.pid for w in wrappers]
+        found = []
+        for attempt in range(max(1, tries)):
+            found = self.hs.holders(state, slots)
+            if self.holders_ready(found, count, name, pids):
+                return found
+            time.sleep(self.READY_PAUSE)
+        self.fail("holder %r not ready after %d reads of its record (%.1f s): expected %d ready holder(s) with the command's pid (not the wrapper pids %s), found %s (a '?' is a held lock whose record is not written yet)" % (
+            name, max(1, tries), max(1, tries) * self.READY_PAUSE, count, pids, found))
+
     def test_s1_four_callers_of_three_slots_queue_and_the_fourth_runs_when_one_frees(self):
         """The integration check with real processes (the queue logic itself is tested deterministically in TestHeavyQueueLogic)."""
         procs = {tag: self.start(*self.waiter(tag), name="who-%s" % tag) for tag in "abcd"[:3]}
         ok = self.until(lambda: len(self.started()) == 3, self.HOLD_CEILING_SECONDS)
         self.assertTrue(ok, "3 commands started\n" + (self.why(procs) if not ok else ""))
         # the three locks are really held now (the kernel's own answer, not a file): the fourth cannot take one, whatever the machine's speed
-        ok = self.until(lambda: len(self.hs.holders(self.state(), 3)) == 3, self.HOLD_CEILING_SECONDS)
-        self.assertTrue(ok, "3 of 3 slots held before the fourth starts\n" + (self.why(procs) if not ok else ""))
+        try:
+            self.ready_holders(3, seconds=self.HOLD_CEILING_SECONDS, wrappers=list(procs.values()))   # the three locks held AND their records written (the kernel's own answer, not a timer)
+        except AssertionError as err:
+            self.fail("3 of 3 slots held before the fourth starts\n%s\n%s" % (err, self.why(procs)))
         fourth = self.start(*self.waiter("d"), name="who-d")
         lines, queued = [], threading.Event()
 
@@ -51248,7 +52052,7 @@ class TestHeavySlots(Base):
     def test_s2_a_holder_killed_with_its_whole_group_frees_its_slot_by_itself(self):
         holder = self.start(*self.waiter("h"), slots=1, name="doomed")
         self.assertTrue(self.until(lambda: "started.h" in self.started()))
-        self.assertEqual([h["name"] for h in self.hs.holders(self.state(), 1)], ["doomed"])
+        self.assertEqual([h["name"] for h in self.ready_holders(1, slots=1, name="doomed", wrappers=[holder])], ["doomed"])
         os.killpg(holder.pid, signal.SIGKILL)
         holder.wait(timeout=90)
         waiter = self.start("sh", "-c", 'touch "%s/second"' % self.home, slots=1)
@@ -51324,8 +52128,7 @@ class TestHeavySlots(Base):
 
     def test_s5_the_holder_list_names_who_holds_a_slot_and_a_free_slot_says_nothing(self):
         proc = self.start("sleep", "5", slots=2, name="the-coder")
-        self.assertTrue(self.until(lambda: len(self.hs.holders(self.state(), 2)) == 1))
-        (entry,) = self.hs.holders(self.state(), 2)
+        (entry,) = self.ready_holders(1, slots=2, name="the-coder", wrappers=[proc])
         self.assertEqual((entry["name"], entry["command"]), ("the-coder", "sleep"))
         self.assertIsInstance(entry["pid"], int)
         self.assertLessEqual(abs(entry["since"] - time.time()), 30)
@@ -51337,7 +52140,7 @@ class TestHeavySlots(Base):
 
     def test_s6_past_the_wait_limit_it_exits_75_and_does_not_run_the_command(self):
         holder = self.start("sleep", "30", slots=1, name="busy-one")
-        self.assertTrue(self.until(lambda: len(self.hs.holders(self.state(), 1)) == 1))
+        self.ready_holders(1, slots=1, name="busy-one", wrappers=[holder])
         marker = self.home / "marker"
         late = self.start("touch", str(marker), slots=1, wait_max=1)
         self.assertEqual(late.wait(timeout=90), 75)
@@ -51385,7 +52188,7 @@ class TestHeavySlots(Base):
 
     def test_a_signal_while_waiting_a_zero_wait_limit_and_a_command_that_cannot_start(self):
         holder = self.start("sleep", "30", slots=1)
-        self.assertTrue(self.until(lambda: len(self.hs.holders(self.state(), 1)) == 1))
+        self.ready_holders(1, slots=1, name="t", wrappers=[holder])
         waiting = self.start("true", slots=1)
         seen = ""
         end = time.time() + 90
@@ -51468,7 +52271,7 @@ class TestHeavySlots(Base):
         cg = sb.load_cpu_guard()
         self.assertEqual(cg.slots_text({}, self.state()), "heavy slots 0/3")
         holder = self.start("sleep", "30", name="the-coder")
-        self.assertTrue(self.until(lambda: len(self.hs.holders(self.state(), 3)) == 1))
+        self.ready_holders(1, name="the-coder", wrappers=[holder])
         line = cg.slots_text({}, self.state())
         self.assertRegex(line, r"^heavy slots 1/3 \(the-coder sleep \d+[ms]\)$")
         self.assertEqual(cg.slots_text({"heavy": {"slots": 5}}, self.state())[:15], "heavy slots 1/5")
@@ -51500,6 +52303,80 @@ class TestHeavySlots(Base):
         for path in ("agents/opencode/coder.md", "agents/opencode/orchestrator.md", "skills/fleet-coordination/SKILL.md"):
             found = (REPO / path).read_text()
             self.assertEqual(found.lower().count(line), 1, path)
+
+
+class TestHeavySlotsReadiness(TestHeavySlots):
+    """#688: the readiness helper of TestHeavySlots. Its own checks run here (the inherited tests below are removed: they run once, in TestHeavySlots, and the three
+    that failed in CI run again in TestHeavySlotsSlowStart)."""
+
+    def test_the_helper_reads_the_holder_record_the_product_reads_and_the_class_has_no_bare_sleep_wait(self):
+        helper = inspect.getsource(TestHeavySlots.ready_holders)
+        self.assertIn("self.hs.holders(", helper)
+        source = inspect.getsource(TestHeavySlots)
+        self.assertEqual(source.count("            time.sleep("), 2, "only the two bounded waits (until, ready_holders) sleep: no test waits by a bare sleep")
+        self.assertEqual(TestHeavySlots.READY_TRIES * TestHeavySlots.READY_PAUSE, 60.0)
+
+    def test_a_holder_whose_lock_is_held_but_record_is_not_written_is_not_ready_and_a_never_ready_holder_fails_within_the_bound_naming_it(self):
+        import fcntl
+        state = self.state()
+        fd = os.open(str(state / "heavy-slot-0.lock"), os.O_RDWR | os.O_CREAT, 0o600)   # held, with no record: what the product lists as '?'
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.assertEqual([h["name"] for h in self.hs.holders(state, 3)], ["?"])
+        begun = time.time()
+        with self.assertRaises(AssertionError) as caught:
+            self.ready_holders(1, name="slow-one", seconds=1)
+        self.assertLess(time.time() - begun, 2.5)
+        self.assertIn("slow-one", str(caught.exception))
+        self.assertIn("not ready", str(caught.exception))
+        self.assertIn("'?'", str(caught.exception))
+        os.ftruncate(fd, 0)
+        os.write(fd, json.dumps({"name": "slow-one", "command": "sleep", "pid": 1, "since": time.time()}).encode())
+        (entry,) = self.ready_holders(1, name="slow-one", seconds=1)
+        self.assertEqual((entry["name"], entry["command"]), ("slow-one", "sleep"))
+
+    def test_the_readiness_decision_is_the_final_record_not_the_lock_and_not_the_wrappers_first_record(self):
+        """Deterministic: no process, no clock. The cases a lock-only (or first-record) readiness would accept and this one must not."""
+        def held(name, command, pid):
+            return {"slot": 0, "name": name, "command": command, "pid": pid, "since": 1}
+        ready = self.holders_ready
+        self.assertFalse(ready([held("?", "?", None)], 1, "the-coder", [100]), "the lock is held, no record yet")
+        self.assertFalse(ready([held("the-coder", "sleep", 100)], 1, "the-coder", [100]), "the wrapper's own first record: the second write (truncate, then the command's pid) is still to come")
+        self.assertFalse(ready([held("?", "?", None)], 1, None, []), "a '?' holder is never ready, with or without a name asked for")
+        self.assertFalse(ready([held("other", "sleep", 200)], 1, "the-coder", [100]), "the wrong holder")
+        self.assertFalse(ready([], 1, "the-coder", [100]), "no holder")
+        self.assertFalse(ready([held("the-coder", "sleep", 200), held("?", "?", None)], 2, None, [100]), "one of two is not ready")
+        self.assertTrue(ready([held("the-coder", "sleep", 200)], 1, "the-coder", [100]), "the command's pid: the final record")
+
+    def test_the_helper_waits_through_the_wrappers_first_record_until_the_second_is_written(self):
+        """The product's own two records, in order and with a deterministic gap: the helper returns only after the second."""
+        import fcntl
+        state = self.state()
+        fd = os.open(str(state / "heavy-slot-0.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.hs._record(fd, "the-coder", 100, "sleep", time.time())   # the wrapper's first record: pid 100 is the wrapper
+        wrapper = mock.Mock(pid=100)
+        with self.assertRaises(AssertionError) as caught:
+            self.ready_holders(1, name="the-coder", seconds=0.5, wrappers=[wrapper])
+        self.assertIn("not ready", str(caught.exception))
+        self.hs._record(fd, "the-coder", 200, "sleep", time.time())   # the second: the command's pid
+        (entry,) = self.ready_holders(1, name="the-coder", seconds=0.5, wrappers=[wrapper])
+        self.assertEqual(entry["pid"], 200)
+
+
+class TestHeavySlotsSlowStart(TestHeavySlots):
+    """#688: the three tests that failed in CI, run again with every holder one second slow to write its record (its lock is held at once)."""
+    START_DELAY = 1
+
+
+_KEEP_SLOW = ("test_s5_the_holder_list_names_who_holds_a_slot_and_a_free_slot_says_nothing", "test_the_cpu_line_shows_the_slots_in_use_through_the_real_heavy_module",
+              "test_s1_four_callers_of_three_slots_queue_and_the_fourth_runs_when_one_frees")
+for _name in dir(TestHeavySlots):
+    if _name.startswith("test"):
+        if _name not in _KEEP_SLOW:
+            setattr(TestHeavySlotsSlowStart, _name, None)
+        setattr(TestHeavySlotsReadiness, _name, None)
 
 
 def _artifact_zip(names, complete=True, run=1, head="a" * 40):
@@ -54749,6 +55626,10 @@ class TestReviewerSubagents(LedgerBase):
 
     def test_the_impact_block_carries_its_action_and_a_block_for_another_head_or_a_malformed_one_is_refused(self):
         code, out, err = self.record_block("coder", "impact", self.block_text("comment", extra="impact-action: hold\n", findings=()))
+        self.assertEqual(code, 2)
+        self.assertIn("run the review again", err)
+        self.assertEqual([e for e in self.ledger() if e["kind"] == "review_record"], [])
+        code, out, err = self.record_block("coder", "impact", self.block_text("comment", extra="impact-action: hold\nimpact-class: data\n", findings=()))
         self.assertEqual(code, 0, err)
         self.assertEqual([e["impact_action"] for e in self.ledger() if e["kind"] == "review_record"], ["hold"])
         cases = ((self.block_text(head="d" * 40), "is not the PR's head"),
@@ -61114,7 +61995,7 @@ class FakeQueueGh:
             if self.graphql_fault == "malformed":
                 return done('{"data": {"repository": null}}')
             state, queued = self.pulls[(repo, pr)]
-            return done(json.dumps({"data": {"repository": {"pullRequest": {"state": state, "mergeQueueEntry": {"id": "Q"} if queued else None}}}}))
+            return done(json.dumps({"data": {"repository": {"pullRequest": {"state": state, "mergeQueueEntry": {"id": "Q", "state": queued if isinstance(queued, str) else "QUEUED"} if queued else None}}}}))
         path = argv[-1]
         self.calls.append(path)
         if any(bad in path for bad in self.fail):
@@ -61198,6 +62079,56 @@ class TestQueueEjections(Base):
         self.add(6, 25, conclusion=None, status="in_progress")                    # a run still going
         self.go()
         self.assertEqual(self.sent, [], "0 messages in 6 of 6 cases")
+
+    def test_a_stuck_unmergeable_entry_wakes_once_with_the_names_as_data_and_never_again_after_removal(self):
+        self.add(61, 31, names=["@all /deploy ghp_" + "Ab1" * 10, "tests/test_x.py::test_y"])
+        self.gh.pulls[(self.REPO, 31)] = ("OPEN", "UNMERGEABLE")
+        self.go()
+        (to, line), = self.sent
+        self.assertEqual(to, "orch")
+        for want in ("%s#31" % self.REPO, "61", "stuck", "blocks", "test_y"):
+            self.assertIn(want, line)
+        for bad in ("@", "ghp_", "://"):
+            self.assertNotIn(bad, line)
+        self.go()
+        self.gh.pulls[(self.REPO, 31)] = ("OPEN", False)   # removed by hand
+        self.world.tick(self.module.RECHECK_SECONDS + 1)
+        self.add(61, 31, names=["tests/test_x.py::test_y"])
+        self.go()
+        self.assertEqual(len(self.sent), 1, "stuck, then removed: one wake")
+        self.assertEqual([k for k in self.module.read_ledger(types.SimpleNamespace(_read_small=sb._read_small), self.engine)], ["%s#61" % self.REPO])
+        self.assertEqual(self.gh.count(self.REPO, "graphql"), 1, "one pull request read, no added read")
+
+    def test_a_live_waiting_or_running_entry_wakes_nobody_and_a_removed_one_keeps_the_old_line(self):
+        self.add(62, 32, names=["x"])
+        self.add(63, 33, names=["x"])
+        self.gh.pulls[(self.REPO, 32)] = ("OPEN", "AWAITING_CHECKS")
+        self.gh.pulls[(self.REPO, 33)] = ("OPEN", "QUEUED")
+        self.go()
+        self.assertEqual(self.sent, [])
+        self.gh.pulls[(self.REPO, 32)] = ("OPEN", False)
+        self.world.tick(self.module.RECHECK_SECONDS + 1)
+        self.go()
+        (_, line), = self.sent
+        self.assertIn("left the queue", line)
+        self.assertNotIn("stuck", line)
+
+    def test_a_stuck_entry_with_no_owner_tells_the_chief_facts_only(self):
+        self.engine.hub.owner = None
+        with mock.patch.object(sb, "chiefs_of_staff", return_value=["chief"]):
+            self.add(65, 35, names=["secret_test_name"])
+            self.gh.pulls[(self.REPO, 35)] = ("OPEN", "UNMERGEABLE")
+            self.go()
+        (to, line), = self.sent
+        self.assertEqual(to, "chief")
+        self.assertIn("stuck", line)
+        self.assertNotIn("secret_test_name", line)
+
+    def test_a_stuck_entry_of_a_merged_pull_request_wakes_nobody(self):
+        self.add(64, 34, names=["x"])
+        self.gh.pulls[(self.REPO, 34)] = ("MERGED", "UNMERGEABLE")
+        self.go()
+        self.assertEqual(self.sent, [])
 
     def test_a_failed_run_whose_pull_request_was_re_enqueued_is_looked_at_again_later(self):
         self.add(4, 23, names=["x"])

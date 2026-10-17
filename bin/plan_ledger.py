@@ -267,6 +267,7 @@ GATES = (
     ("G4", "checks", "P", "CI, or a second agent's re-run", True),
     ("G5", "canon", "P", "the orchestrator", True),
     ("G6", "held PR", "P", "the owner, through cos", True),
+    ("G6b", "held PR explains itself", "P", "the switchboard (rule): a held PR opens with why, a diagram and its questions", True),
     ("G7", "epic integration", "E", "tester agent and the owner", False),
     ("G8", "production", "D", "the owners; the owner for production", False),
 )
@@ -409,6 +410,19 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
                                                       % ("; ".join(floor.get("reasons") or []) or "hold")])
             else:
                 row.update(status="ok", detail="not a held PR")
+        elif gid == "G6b":
+            floor = (facts or {}).get("floor")
+            # held = the same reading as `pr-explain --check`: a hold label, the merge-captain label or marker, or an uncleared floor hold; a missing
+            # `held_check` on a held PR fails closed (missing)
+            held = bool((facts or {}).get("captain")) or bool((facts or {}).get("holds")) or (isinstance(floor, dict) and floor.get("decision") == "hold" and not floor.get("cleared"))
+            check = (facts or {}).get("held_check")   # the ONE check (`held_defects` in the switchboard), called only for a held PR
+            if not held:
+                row.update(status="n/a", detail="not a held PR")
+            elif not callable(check):
+                row.update(status="missing", missing=["the held PR's body could not be checked"])
+            else:
+                defects = check()
+                row.update(status="missing", missing=list(defects)) if defects else row.update(status="ok", detail="the body opens with why, a diagram and its questions")
         rows.append(row)
     if ledger_problem:
         for row in rows:
@@ -492,9 +506,9 @@ CHECK_FOR = ("ready", "merge")
 DEFAULT_BUDGET_MS = 3000
 BUDGET_RANGE = (500, 30000)
 # the gates each check requires, among those the engine tracks (G0b, G0c and G2/G3 are untracked and cannot refuse)
-REQUIRED_FOR = {"ready": ("G0a", "G1"), "merge": ("G0a", "G1", "G4", "G6")}
+REQUIRED_FOR = {"ready": ("G0a", "G1"), "merge": ("G0a", "G1", "G4", "G6", "G6b")}
 DEFAULT_ENFORCED = ("G0a", "G1")   # the gates a repo in `enforce` refuses on unless its `enforce_gates` says otherwise
-ENFORCEABLE = ("G0a", "G1", "G4", "G6")
+ENFORCEABLE = ("G0a", "G1", "G4", "G6", "G6b")
 EXIT_ALLOW, EXIT_REFUSE, EXIT_FAIL_OPEN = 0, 10, 3   # only EXIT_REFUSE refuses; every other exit is an allow
 
 

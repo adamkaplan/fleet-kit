@@ -79,8 +79,8 @@ say `impact-action: none` and no impacts.
 
 When the action is `hold`, also name the class of the impact that drives it in the block's class line, one lower-case word: `credentials`, `identity` or `authority`
 (the top tier: only the owner's own clear lifts such a hold) or `availability`, `data`, `performance`, `correctness`, `compatibility`, `privacy` or `cost` (a second
-independent review and the usual checks decide). If your hold-level impacts are in several classes, name a top tier one. Leave the class line out when you are
-not sure of the class: a hold with no class is read as top tier. The switchboard keeps the class with your record for that exact head.
+independent review and the usual checks decide). A rating whose action is hold always names its class. If your hold-level impacts are in several classes, or you are
+unsure of the class, name a top tier one. A hold without a class is rejected and the review is run again. The switchboard keeps the class with your record for that head.
 
 ## Verdict block
 
@@ -88,7 +88,7 @@ not sure of the class: a hold with no class is read as top tier. The switchboard
 verdict: approve | request-changes | comment | incomplete
 head: <the commit judged>
 impact-action: hold | second-review | none
-impact-class: <class of the hold; omit unless the action is hold>
+impact-class: <class of the hold: required when the action is hold, else omit>
 findings:
 - <rule id> | block | <file:line> | <why it matters, one sentence> | <what would resolve it>
 - <rule id> | note | <file:line> | <why> | <what would resolve it>
