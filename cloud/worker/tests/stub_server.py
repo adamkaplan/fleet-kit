@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """A stub headless server on loopback, for the driver tests. usage: stub_server.py PORT.
-STUB_LOG (file): one line per event. STUB_PID_FILE: our pid. STUB_MODE: ok (default) | never-healthy | busy-forever | die (exit 3 at start)."""
+STUB_LOG (file): one line per event. STUB_PID_FILE: our pid. STUB_DRIP (seconds): the record's message read drips one byte per interval. STUB_MODE: ok (default) | never-healthy | busy-forever | die (exit 3 at start)."""
 import http.server
 import json
 import os
@@ -47,6 +47,41 @@ class H(http.server.BaseHTTPRequestHandler):
         if self.path == "/api/session":  # sessions as the V2 list returns them: time.updated in epoch milliseconds
             old, new = {"id": "ses_0", "time": {"created": 1700000000000, "updated": 1700000100000}}, {"id": "ses_1", "time": {"created": 1700000000000, "updated": 1700000500000}}
             return self.send(200, {"data": [] if MODE == "no-sessions" else [old, new], "cursor": {}} if MODE != "bad-list" else {"oops": 1})
+        if self.path == "/api/session/ses_1/message":
+            if LOG:   # a file beside the log: the driver's poll and the launcher's record are two processes
+                with open(LOG + ".m", "a") as f:
+                    f.write("x")
+                with open(LOG + ".m") as f:
+                    polls["m"] = len(f.read())
+            else:
+                polls["m"] = polls.get("m", 0) + 1
+            if MODE == "messages-down" and polls["m"] > 1:
+                return self.send(500)   # the first read (the poll that sees the session finish) works; the transcript read after it fails
+            if os.environ.get("STUB_DRIP") and polls["m"] > 1:   # headers, then one byte every STUB_DRIP seconds: a read that never finishes
+                import time
+                self.send_response(200)
+                self.send_header("Content-Length", str(8 * 1024 * 1024))
+                self.end_headers()
+                try:
+                    while True:
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                        time.sleep(float(os.environ["STUB_DRIP"]))
+                except OSError:
+                    pass
+                return
+            if os.environ.get("STUB_MESSAGES_RAW") and polls["m"] > 1:   # a hostile body, as bytes, for the record's read only
+                raw = open(os.environ["STUB_MESSAGES_RAW"], "rb").read()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                try:
+                    self.wfile.write(raw)
+                except OSError:
+                    pass
+                return
+        if self.path == "/api/session/ses_1/message" and os.environ.get("STUB_MESSAGES"):
+            return self.send(200, {"data": json.load(open(os.environ["STUB_MESSAGES"]))})   # a canned transcript
         if self.path == "/api/session/ses_1/message":
             return self.send(200, {"data": [{"type": "user", "text": "x"}, {"type": "assistant", "time": {"created": 1, "completed": 2}}]})
         self.send(404)
