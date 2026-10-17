@@ -115,9 +115,15 @@ fleet-switchboard launch <name> --agent coder --dir <worktree> --role coder \
   --reports-to <you> --issue <ask> --brief-file -     # the brief on stdin
 ```
 
-It creates the v2 session, opens the tab by argv in your workspace
-(`$HERDR_WORKSPACE_ID`), proves the pane runs that session, and only then sends the
-brief. It never types into a pane, and it runs the configured OpenCode, not whichever
+By default the worker is **headless**: a session in the OpenCode service with no
+terminal and no pane id (about 2 MB instead of 200 to 400 MB). To look at it run
+`fleet-switchboard watch NAME` (it opens a terminal on the same session; closing it leaves
+the worker running); `herdr agent read` and `send-keys` do not apply to it, so use `send`,
+`status` and `watch`. Add `--terminal` (or `--workspace`) for a tab, or the person sets
+`launch_default` to `terminal`. If the headless route is refused for a repo, `launch` opens
+a terminal instead and says so in one line; an explicit `--headless` refuses. With a terminal
+it opens the tab by argv in your workspace (`$HERDR_WORKSPACE_ID`), proves the pane runs
+that session, and only then sends the brief. It never types into a pane, and it runs the configured OpenCode, not whichever
 `opencode` is first on PATH. A worker started this way reports with
 `fleet-switchboard report`, and its report reaches you as a fact. Do **not** use the
 `herdr tab create` / `herdr agent start` / `herdr agent prompt` routes below for it:

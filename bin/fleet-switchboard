@@ -5806,6 +5806,11 @@ class LaunchError(Exception):
     """A launch that did not finish, and what it left behind."""
 
 
+class HeadlessRefused(LaunchError):
+    """The headless ROUTE was refused for this launch (the account route, the service, the record), as opposed to a bad name or an existing worker (#433).
+    A plain `launch` that took headless from its default falls back to a terminal on this; an explicit `--headless` shows it as the refusal it is."""
+
+
 RESERVED_AGENT_NAMES = ("fleet-switchboard", "switchboard", "plan-review", "owner")   # names the switchboard itself acts under: no agent may take one
 LANE_NAME_PREFIX = "planrev-"   # the plan review engine names its reviewer lanes: only it launches them
 
@@ -6029,9 +6034,14 @@ def launch_headless(engine, name, agent, directory, role=None, reports_to=None, 
             account = engine.accounts.account_for(repo) if repo and getattr(engine, "accounts", None) is not None else None
             fleet = fleet_record(name, role, reports_to, issue, charter, repo, launched_by)
             fleet["headless"] = True
-            with engine._external("v2.session.create", name, {"agent": agent, "directory": directory, "fleet": fleet, "headless": True}) as result:
-                session_id = engine.v2.session_create(agent, name, directory, {"fleet": fleet})["id"]
-                result["session"] = session_id
+            try:
+                with engine._external("v2.session.create", name, {"agent": agent, "directory": directory, "fleet": fleet, "headless": True}) as result:
+                    session_id = engine.v2.session_create(agent, name, directory, {"fleet": fleet})["id"]
+                    result["session"] = session_id
+            except LaunchError:
+                raise
+            except Exception as err:   # the service did not answer or refused: a route problem, not a mistake in the arguments
+                raise HeadlessRefused("the OpenCode service could not create the session (%s)" % _one_line(str(err), 120)) from err
             try:
                 ap.save_record(engine.state_dir, name, session_id, engine.v2.service_url(), now=engine.now())
                 info = engine.v2.session_get(session_id) or {}
@@ -6045,7 +6055,7 @@ def launch_headless(engine, name, agent, directory, role=None, reports_to=None, 
                     engine.audit.append(engine.actor, "headless.launched", name, {"session": session_id, "agent": agent, "directory": _one_line(directory, 160), "brief_chars": len(brief or ""), "account": account or None, "repo": repo, "route": "shims+record" if account else None})
             except Exception as err:
                 cleaned = undo_headless_launch(engine, ap, name, session_id)
-                raise LaunchError("%s (%s)" % (_one_line(str(err)), cleaned)) from err
+                raise (HeadlessRefused if isinstance(err, HeadlessRefused) or not isinstance(err, LaunchError) else LaunchError)("%s (%s)" % (_one_line(str(err)), cleaned)) from err
     except ImpactStateBusy:
         raise LaunchError("another launch or reattach of %s is running: wait for it" % name) from None
     register_launch_worktree(engine, name, directory, repo)
@@ -6063,23 +6073,23 @@ def headless_identity(engine, repo):
     it is refused, as before. Any other worker acts as the account of the service's environment, and says so."""
     accounts = getattr(engine, "accounts", None)
     if repo and accounts is None:   # fail closed: with no account map nothing says which account this repo uses
-        raise LaunchError("cannot tell which gh account %s uses (no account map): a headless worker is refused" % repo)
+        raise HeadlessRefused("cannot tell which gh account %s uses (no account map): a headless worker is refused" % repo)
     if repo:
         account = accounts.account_for(repo)
         if account:
             if getattr(engine, "route_check", None) is None:
-                raise LaunchError("a headless worker cannot work as the gh account %s that gh_users maps %s to: its tools run in the OpenCode service's environment, "
+                raise HeadlessRefused("a headless worker cannot work as the gh account %s that gh_users maps %s to: its tools run in the OpenCode service's environment, "
                                   "which cannot be pinned to an account (a service restart drops any per-session setting), so it would act as the service's own "
                                   "default account. Use a terminal launch (omit --headless)" % (account, repo))
             problem = engine.route_check()   # the shims the service puts first on PATH exist: a text, or None
             if problem:
-                raise LaunchError("a headless worker cannot work as the gh account %s that gh_users maps %s to: its tools run in the OpenCode service's environment, "
+                raise HeadlessRefused("a headless worker cannot work as the gh account %s that gh_users maps %s to: its tools run in the OpenCode service's environment, "
                                   "which cannot be pinned to an account, and the per-command route that would choose it cannot be proved (%s). "
                                   "Use a terminal launch (omit --headless)" % (account, repo, problem))
             return "this headless worker is set up to act as the gh account %s for %s (the gh and git shims choose it per command; the service side is not checked yet)" % (account, repo)
         problem = launch_account_problem(engine.config, accounts, repo)
         if problem:
-            raise LaunchError(problem)
+            raise HeadlessRefused(problem)
         return "this headless worker acts as the OpenCode service environment's own gh account (gh_users has no entry for %s)" % repo
     return "this headless worker acts as the OpenCode service environment's own gh account (it has no repo)"
 
@@ -6123,10 +6133,10 @@ def prove_headless_route(engine, session_id, name, repo, account):
     try:
         fleet = session_identity(engine.herdr, engine.v2, {SESSION_ENV: session_id})
     except (V2Error, CallerError, IdentityUncertain) as err:
-        raise LaunchError("a headless worker cannot be proved to act as the gh account %s for %s: the session lookup failed (%s)" % (account, repo, _one_line(str(err)))) from err
+        raise HeadlessRefused("a headless worker cannot be proved to act as the gh account %s for %s: the session lookup failed (%s)" % (account, repo, _one_line(str(err)))) from err
     seen = (fleet or {}).get("repo")
     if (fleet or {}).get("name") != name or seen != repo or engine.accounts.account_for(seen) != account:
-        raise LaunchError("a headless worker cannot be proved to act as the gh account %s for %s: the service's record of the session names %s as its repo" % (account, repo, seen or "none"))
+        raise HeadlessRefused("a headless worker cannot be proved to act as the gh account %s for %s: the service's record of the session names %s as its repo" % (account, repo, seen or "none"))
     return ("this headless worker is set up to act as the gh account %s for %s: the shims and the installed plugin file are in place on the launcher's side and the session record resolves to that repo. "
             "NOT checked: that the OpenCode service runs the plugin it was started with (the installed plugin file is checked, not the running service; it cannot be probed "
             "without a model turn). This is a mistake-guard, not a boundary: a command can name another session, and a tool that reads a token from its own environment "
@@ -16200,7 +16210,12 @@ def cmd_launch(args, runner, now, socket_call=None):
         return run_cloud("cmd_launch", args, runner, now)
     refuse_cloud_name(args.name)   # a name that has a cloud record is not launched locally (#640)
     engine, state, _ = build_engine(runner, now, "cli", socket_call=socket_call)
-    workspace = args.workspace if (args.workspace or getattr(args, "new_workspace", None) or getattr(args, "headless", False)) \
+    if getattr(args, "terminal", False) and getattr(args, "headless", False):
+        raise LaunchError("--terminal and --headless contradict each other: pick one")
+    # #433: a plain launch takes its mode from `launch_default` (shipped: headless). A terminal is asked for by --terminal, or implied by --workspace/--new-workspace.
+    by_default = not (args.resume or getattr(args, "headless", False) or getattr(args, "terminal", False) or args.workspace or getattr(args, "new_workspace", None))
+    use_headless = bool(getattr(args, "headless", False)) or (by_default and load_module("launch_default").mode(engine.config) == "headless")
+    workspace = args.workspace if (args.workspace or getattr(args, "new_workspace", None) or use_headless) \
         else caller_workspace(engine, None)   # a workspace made now, or none at all, needs no look at the caller's own
     if args.resume:
         given = getattr(args, "repo", None)
@@ -16274,11 +16289,24 @@ def cmd_launch(args, runner, now, socket_call=None):
         launcher = None   # an identity failure records nobody, on purpose: that agent never counts as a launched tester (fail closed)
     launched_by = launcher if isinstance(launcher, str) and launcher else None
     try:
-        if getattr(args, "headless", False):
-            done = launch_headless(engine, args.name, args.agent, args.dir, args.role, args.reports_to,
-                                   None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo,
-                                   launched_by=launched_by)
-        else:
+        done = None
+        if use_headless:
+            try:
+                done = launch_headless(engine, args.name, args.agent, args.dir, args.role, args.reports_to,
+                                       None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo,
+                                       launched_by=launched_by)
+            except HeadlessRefused as err:
+                if getattr(args, "headless", False):
+                    raise   # asked for by name: the refusal is the answer
+                reason = _one_line(str(err), 200)
+                sys.stderr.write("%s: launch: headless refused for %s (%s); opened a terminal instead\n" % (PROG, args.name, reason))
+                if engine.audit is not None:
+                    engine.audit.append(engine.actor, "launch.fallback_terminal", args.name, {"why": reason, "repo": repo})
+                try:
+                    workspace = caller_workspace(engine, None)
+                except Exception as werr:
+                    raise LaunchError("headless refused (%s) and no terminal workspace could be found (%s)" % (reason, _one_line(str(werr), 120))) from werr
+        if done is None:
             done = launch_agent(engine, args.name, args.agent, args.dir, workspace, args.role, args.reports_to,
                                 None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo,
                                 launched_by=launched_by)
@@ -25409,14 +25437,17 @@ def build_parser():
     notice.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
     sub.add_parser("ensure", help="Start the daemon unless it runs (herdr's startup hook calls this)")
     sub.add_parser("poke", help="Ask the daemon for a pass now; silent, never blocks (herdr's event hooks call this)")
-    launch = sub.add_parser("launch", help="Start a fleet agent in a new herdr tab, without typing")
+    launch = sub.add_parser("launch", help="Start a fleet agent (headless by default, or in a new herdr tab with --terminal), without typing")
     launch.add_argument("name", help="The agent's fleet name (lower case, digits, - and _)")
     launch.add_argument("--agent", help="The OpenCode agent definition, such as coder")
     launch.add_argument("--dir", help="The agent's working directory (absolute)")
     launch.add_argument("--resume", metavar="SESSION", help="Open a tab on this existing session of NAME instead "
                                                            "of creating one (a restart that keeps the conversation)")
     launch.add_argument("--headless", action="store_true", help="Start the worker with NO terminal: a session in the OpenCode service, the brief sent through "
-                        "the API (about 2 MB instead of a terminal's 200 to 400 MB). Its tools run in the service's environment; opt in")
+                        "the API (about 2 MB instead of a terminal's 200 to 400 MB). Its tools run in the service's environment. The default of a plain launch (see --terminal); "
+                        "unlike the default, an explicit --headless never falls back to a terminal")
+    launch.add_argument("--terminal", action="store_true", help="Open a herdr tab for the worker (a plain launch is headless unless the configuration key "
+                        "launch_default is terminal). Cannot be combined with --headless; --workspace and --new-workspace imply it")
     launch.add_argument("--workspace", help="The herdr workspace for the new tab (default: the workspace of this session, else $HERDR_WORKSPACE_ID)")
     launch.add_argument("--role", help="metadata.fleet.role")
     launch.add_argument("--reports-to", dest="reports_to", help="metadata.fleet.reports_to")

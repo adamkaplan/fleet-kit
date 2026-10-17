@@ -5854,7 +5854,7 @@ class TestLaunch(Base):
     def test_the_cli_takes_the_workspace_from_the_pane_it_runs_in(self):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
         os.environ["HERDR_WORKSPACE_ID"] = "w1"
-        argv = ["launch", "coder", "--agent", "coder", "--dir", str(self.work), "--role", "coder",
+        argv = ["launch", "coder", "--agent", "coder", "--dir", str(self.work), "--role", "coder", "--terminal",
                 "--reports-to", "platform", "--issue", "7", "--brief-file", "-"]
         with captured() as (out, err), mock.patch.object(sb.sys, "stdin", io.StringIO("Do the thing\n")):
             code = sb.main(argv, runner=self.world.route, now=self.world.clock.now,
@@ -5886,7 +5886,7 @@ class TestLaunch(Base):
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
         os.environ.pop("HERDR_WORKSPACE_ID", None)
         with captured() as (out, err):
-            code = sb.main(["launch", "coder", "--agent", "coder", "--dir", str(self.work)],
+            code = sb.main(["launch", "coder", "--agent", "coder", "--dir", str(self.work), "--terminal"],
                            runner=self.world.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
         self.assertEqual(code, 1)
         self.assertIn("--workspace", err.getvalue())
@@ -27536,7 +27536,7 @@ class TestLaunchGate(LedgerBase):
         os.environ["HERDR_WORKSPACE_ID"] = "w1"
         os.environ.pop("HERDR_PANE_ID", None)
         argv = ["launch", name, "--agent", "coder", "--dir", str(self.work), "--role", "coder", "--reports-to", "own",
-                "--issue", "7", "--brief-file", "-", *more]
+                "--issue", "7", "--brief-file", "-", "--terminal", *more]
         with captured() as (out, err), mock.patch.object(sys, "stdin", io.StringIO(brief)):
             code = sb.main(argv, runner=self.route, now=self.world.clock.now, socket_call=self.world.herdr.socket)
         return code, out.getvalue(), err.getvalue()
@@ -34235,6 +34235,93 @@ class TestRepoQualifiedIssues(TwoRepoCase):
         self.assertEqual(code, 0, err)
         self.assertEqual([c["body"].startswith("a note") for c in self.gh.repos[ACME_WEB].__dict__["comments"]], [True])
         self.assertNotIn("comments", self.gh.repos[ACME_API].__dict__)
+
+
+class TestLaunchDefault(TwoRepoCase):
+    """#433, the default switch: a plain `launch` is headless (key `launch_default`), `--terminal` and `--workspace` open a tab, and a refused headless route
+    falls back to a terminal only when headless was not asked for by name."""
+
+    def setUp(self):
+        super().setUp()
+        self.work = self.home / "checkout"
+        self.work.mkdir(exist_ok=True)
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+
+    def launch(self, *extra, name="dflt"):
+        return self.main("launch", name, "--agent", "coder", "--dir", str(self.work), "--role", "coder", *extra)
+
+    def tabs(self):
+        return [params for method, params in self.world.herdr.socket_calls if method == "layout.apply"]
+
+    def fallback_lines(self, err):
+        return [line for line in err.splitlines() if "opened a terminal instead" in line]
+
+    def test_a_plain_launch_is_headless_and_opens_no_tab(self):
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        done = json.loads(out)
+        self.assertEqual((done["headless"], done["pane"]), (True, None))
+        self.assertEqual(self.tabs(), [])
+        self.assertIsNotNone(sb.load_agent_presence().load_record(self.world.state, "dflt"))
+
+    def test_terminal_and_workspace_forms_open_one_tab_each_and_the_conflicting_pair_is_refused(self):
+        for n, extra in enumerate((("--terminal",), ("--workspace", "w1"), ("--new-workspace", "Lbl"))):
+            before = len(self.tabs())
+            code, out, err = self.launch(*extra, name="t%d" % n)
+            self.assertEqual(code, 0, err)
+            self.assertNotIn("headless", json.loads(out))
+            self.assertEqual(len(self.tabs()) - before, 1, extra)
+        before = len(self.tabs())
+        code, out, err = self.launch("--terminal", "--headless", name="both")
+        self.assertEqual((code, len(self.tabs()) - before), (1, 0))
+        self.assertIn("contradict", err)
+        self.assertIsNone(sb.load_agent_presence().load_record(self.world.state, "both"))
+
+    def test_the_key_flips_the_default_back_to_a_terminal_and_a_bad_value_is_a_configuration_error(self):
+        self.write_config(dict(self.raw, launch_default="terminal"))
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.tabs()), 1)
+        self.assertNotIn("headless", json.loads(out))
+        code, out, err = self.launch("--headless", name="forced")   # an explicit flag beats the key
+        self.assertEqual(code, 0, err)
+        self.assertTrue(json.loads(out)["headless"])
+        self.write_config(dict(self.raw, launch_default="tabs"))
+        code, out, err = self.launch(name="bad")
+        self.assertEqual(code, 1)
+        self.assertIn("launch_default", err)
+        self.assertEqual(len(self.tabs()), 1)
+
+    def test_a_refused_headless_route_falls_back_to_a_terminal_with_one_line_and_the_repos_own_account(self):
+        sessions_before = set(self.world.v2.sessions)
+        code, out, err = self.launch("--repo", ACME_WEB)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.fallback_lines(err)), 1, err)
+        self.assertNotIn("headless", json.loads(out))
+        (params,) = self.tabs()
+        self.assertEqual(params["root"]["env"]["GH_TOKEN"], FAKE_TOKENS["acme-ci"])
+        self.assertIsNone(sb.load_agent_presence().load_record(self.world.state, "dflt"), "no headless record is left")
+        made = [s for sid, s in self.world.v2.sessions.items() if sid not in sessions_before]
+        self.assertEqual(len(made), 1, "only the terminal worker's session exists")
+        self.assertTrue([e for e in self.world.audit() if e["event"] == "launch.fallback_terminal"])
+
+    def test_an_explicit_headless_still_refuses_and_a_name_clash_never_falls_back(self):
+        code, out, err = self.launch("--repo", ACME_WEB, "--headless")
+        self.assertEqual(code, 1)
+        self.assertEqual((self.fallback_lines(err), self.tabs()), ([], []))
+        self.assertIsNone(sb.load_agent_presence().load_record(self.world.state, "dflt"))
+        code, out, err = self.launch(name="web-coder")   # an existing worker: a plain error, not a route refusal
+        self.assertEqual((code, self.fallback_lines(err), self.tabs()), (1, [], []))
+
+    def test_resume_takes_the_resume_path_whatever_the_default(self):
+        session = self.world.sessions["web-coder"]
+        self.as_agent("cos")
+        calls = []
+        with mock.patch.object(sb, "launch_headless", lambda *a, **k: calls.append("headless")), \
+                mock.patch.object(sb, "reattach_caller_problem", lambda *a, **k: None), \
+                mock.patch.object(sb, "resume_agent", lambda *a, **k: calls.append("resume") or {"name": "web-coder"}):
+            code, out, err = self.main("launch", "web-coder", "--resume", session)
+        self.assertEqual((code, calls), (0, ["resume"]), err)
 
 
 class TestLaunchIntoARepo(TwoRepoCase):
