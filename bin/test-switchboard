@@ -16758,9 +16758,13 @@ class TestGhShimGateProbe(Base):
                 done, seen = self.merge_decided(reviews, None)
                 self.assertEqual((done.returncode, seen), (10, None), done.stderr)
 
-    def test_a_same_head_changes_requested_review_answered_by_the_same_reviewers_comment_stops_blocking_when_github_gives_no_decision(self):
+    def test_a_same_head_changes_requested_review_is_not_cleared_by_a_comment_from_the_same_shared_login(self):
         reviews = [self.review_at("CHANGES_REQUESTED", "reviewer-a", self.HEAD), self.review_at("COMMENTED", "reviewer-a", self.HEAD)]
-        done, seen = self.merge_decided(reviews, "")   # the intended rule; GitHub's branch protection is the boundary
+        for decision in ("", None, "APPROVED"):
+            with self.subTest(decision=decision):
+                done, seen = self.merge_decided(reviews, decision)
+                self.assertEqual((done.returncode, seen), (10, None), done.stderr)
+        done, seen = self.merge_decided(reviews + [self.review_at("APPROVED", "reviewer-a", self.HEAD)], "APPROVED")   # an approval clears it
         self.assertEqual(done.returncode, 7, done.stderr)
 
     def test_s4_a_newer_comment_by_another_reviewer_does_not_supersede(self):

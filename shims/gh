@@ -647,33 +647,24 @@ def tagged_blockers(reviews, head):
 
 
 def review_blockers(reviews, head="", decision=""):
-    """The reviewers whose latest decisive review (APPROVED, CHANGES_REQUESTED or DISMISSED) is CHANGES_REQUESTED AND still blocks this head: it is at the
-    PR's current head (its commit oid equals `head`), or its commit is not known, or GitHub's `decision` (reviewDecision) is CHANGES_REQUESTED. A
-    later review by the same reviewer of any kind, a plain comment included, supersedes an earlier changes-requested one for this rule only, unless
-    GitHub's own decision still says CHANGES_REQUESTED. Where GitHub gives no decision (no required reviews) this guard fails open on a
-    superseded or old-head review: it is a guardrail, GitHub's branch protection is the boundary. `tagged_blockers` is separate and ignores comments."""
+    """The reviewers whose latest decisive review (APPROVED, CHANGES_REQUESTED or DISMISSED; a plain comment is not decisive) is CHANGES_REQUESTED AND
+    still blocks this head: it is at the PR's current head (its commit oid equals `head`), or its commit or the head is not known, or GitHub's
+    `decision` (reviewDecision) is CHANGES_REQUESTED. A changes-requested review at an OLDER head is superseded by that reviewer's newer review of any
+    kind (a comment included; this rule only) unless GitHub's decision still says CHANGES_REQUESTED; one at the CURRENT head is cleared only by that
+    reviewer's later approval or dismissal, never by a comment, because several agents can share one login. Where GitHub gives no decision (no required
+    reviews) an old-head review does not block: this is a guardrail, GitHub's branch protection is the boundary. `tagged_blockers` is separate."""
     latest = {}
     for review in reviews if isinstance(reviews, list) else []:
         if not isinstance(review, dict):
             continue
         author = ((review.get("author") or {}).get("login")) if isinstance(review.get("author"), dict) else None
         state = str(review.get("state") or "").upper()
-        if not author:
-            continue
-        if state in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+        if author and state in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
             commit = review.get("commit") if isinstance(review.get("commit"), dict) else {}
-            oid = commit.get("oid") if isinstance(commit.get("oid"), str) else ""
-            latest[author] = (state, oid, False)
-        elif state == "COMMENTED" and author in latest:
-            latest[author] = (latest[author][0], latest[author][1], True)   # answered by a later plain comment
+            latest[author] = (state, commit.get("oid") if isinstance(commit.get("oid"), str) else "")
     blocked = str(decision or "").upper() == "CHANGES_REQUESTED"
-    out = []
-    for who, (state, oid, answered) in latest.items():
-        if state != "CHANGES_REQUESTED":
-            continue
-        if blocked or (not answered and (not oid or not head or oid.lower() == head.lower())):
-            out.append(who)
-    return sorted(out)
+    return sorted(who for who, (state, oid) in latest.items()
+                  if state == "CHANGES_REQUESTED" and (blocked or not oid or not head or oid.lower() == head.lower()))
 
 
 def review_probe(args, found, reason, lookup, gh):
