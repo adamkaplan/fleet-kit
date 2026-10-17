@@ -5822,6 +5822,43 @@ class TestLaunch(Base):
                            now=self.world.clock.now, socket_call=self.world.herdr.socket)
         return code, out.getvalue(), err.getvalue()
 
+    def launch_read(self, *extra, users=None, name="reader"):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR,
+                           "gh_users": users or {"acme-org/widget-service": "acme-dev", "acme-org/widget-api": "acme-bot"}})
+        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        with captured() as (out, err):
+            code = sb.main(["launch", name, "--agent", "coder", "--dir", str(self.work), "--repo", "acme-org/widget-service"] + list(extra),
+                           runner=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "tok\n", "") if argv[1:3] == ["auth", "token"] else self.world.route(argv, **kw),
+                           now=self.world.clock.now, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_s5_a_launch_with_a_read_repo_records_it_and_says_so_once_and_one_without_is_unchanged(self):
+        code, out, err = self.launch_read("--read-repo", "acme-org/widget-api")
+        self.assertEqual(code, 0, err)
+        said = [l for l in (out + err).splitlines() if "acme-org/widget-api" in l and "read only" in l]
+        self.assertEqual(len(said), 1, said)
+        session = json.loads(out)["session"]
+        self.assertEqual(self.world.v2.sessions[session]["metadata"]["fleet"]["read_repo"], "acme-org/widget-api")
+        self.assertNotIn("acme-bot", out + err)
+        code, out, err = self.launch_read(name="plain")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sorted(json.loads(out)), ["name", "pane", "session", "tab"])
+        self.assertNotIn("read_repo", self.world.v2.sessions[json.loads(out)["session"]]["metadata"]["fleet"])
+        self.assertNotIn("read only", out + err)
+
+    def test_a_launch_refuses_a_read_repo_it_cannot_state_exactly_or_cannot_map_and_creates_nothing(self):
+        sessions = len(self.world.v2.sessions)
+        for bad in ("Acme-Org/Widget-Api", " acme-org/widget-api", "acme-org/widget-api.git", "acme-org/*", "", "https://github.com/acme-org/widget-api",
+                    "acme-org/widget-api/", "acme-org/widget\u0430pi", "../x", "acme-org/widget-service", "acme-org/unmapped"):
+            with self.subTest(bad=bad):
+                code, out, err = self.launch_read("--read-repo", bad, users={"acme-org/widget-service": "acme-dev", "acme-org/widget-api": "acme-bot"})
+                self.assertEqual(code, 1, (out, err))
+                self.assertEqual(len(self.world.v2.sessions), sessions)
+        for flag in ("--headless", "--cloud", "--resume=ses_example"):
+            code, out, err = self.launch_read("--read-repo", "acme-org/widget-api", flag)
+            self.assertEqual(code, 1, flag)
+            self.assertIn("--read-repo", err)
+
     def test_a_launch_of_an_agent_the_service_does_not_know_is_refused_before_anything_is_created(self):
         sessions = len(self.world.v2.sessions)
         code, out, err = self.cli_launch(self.listing_runner({"coder": "primary", "orchestrator": "primary", "reviewer-code": "subagent"}), "tester")
@@ -16388,6 +16425,41 @@ class TestGitShim(Base):
     def routed(self, *globals_, verb, rest=()):
         return list(globals_) + ["-c", self.RESET, "-c", self.HELPER, verb] + list(rest)
 
+    def fake_switchboard(self, read_repo):
+        sb_bin = self.home / "sb"
+        answer = {"name": "w", "repo": "acme-org/widget-service", "own": True}
+        if read_repo != "absent":
+            answer["read_repo"] = read_repo
+        sb_bin.write_text("#!/bin/sh\n[ \"$1\" = whoami ] && echo '%s' && exit 0\nexit 2\n" % json.dumps(answer))
+        sb_bin.chmod(0o755)
+        return {"FLEET_SWITCHBOARD_BIN": str(sb_bin)}
+
+    def test_a_push_by_a_worker_with_a_read_repo_is_refused_when_it_targets_that_repository_or_cannot_be_read(self):
+        env = self.fake_switchboard("acme-org/widget-api")
+        for target in ("https://github.com/acme-org/widget-api.git", "git@github.com:Acme-Org/Widget-Api.git", "https://github.com/acme-org/widget-api",
+                       "file:///tmp/x", "https://evil.example/acme-org/widget-service"):
+            with self.subTest(target=target):
+                done, seen = self.run_git("push", target, "main", env=env)
+                self.assertEqual(done.returncode, 1, done.stderr)
+                self.assertIsNone(seen)
+        for pushed in (("-o", "x", "https://github.com/acme-org/widget-api.git"), ("--push-option", "x", "https://github.com/acme-org/widget-api.git"),
+                       ("--repo=https://github.com/acme-org/widget-api.git",), ("-u", "https://github.com/acme-org/widget-api.git", "main"),
+                       ("--receive-pack=x", "git@github.com:acme-org/widget-api.git"), ("-o", "x", "file:///tmp/x")):
+            with self.subTest(pushed=pushed):
+                done, seen = self.run_git("push", *pushed, env=env)
+                self.assertEqual(done.returncode, 1, done.stderr)
+                self.assertIsNone(seen)
+        done, seen = self.run_git("-C", "/w", "push", "https://github.com/acme-org/widget-api.git", env=env)
+        self.assertEqual((done.returncode, seen), (1, None))
+        done, seen = self.run_git("push", "https://github.com/acme-org/widget-service.git", "main", env=env)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIsNotNone(seen)
+        for state in ("absent", "Bad/Record", False):
+            done, seen = self.run_git("push", "https://github.com/acme-org/widget-api.git", env=self.fake_switchboard(state))
+            self.assertEqual(done.returncode == 1, state != "absent", (state, done.stderr))
+        done, seen = self.run_git("fetch", "https://github.com/acme-org/widget-api.git", env=env)
+        self.assertEqual(done.returncode, 0, "a fetch (a read) of the read repository is not a push")
+
     def test_s1_every_network_verb_gets_the_reset_then_the_fleets_helper_right_before_the_verb(self):
         cases = (("push", ["origin", "branch"]), ("fetch", ["--all"]), ("pull", ["--ff-only"]), ("clone", ["https://github.com/acme/api.git", "x"]),
                  ("ls-remote", ["origin"]))
@@ -23243,7 +23315,7 @@ class TestIdentityCheck(ReportBase):
         self.assertEqual((shim.my_name(), shim.account_env("/usr/bin/gh")), ("agent", None))
 
     def run_gh_shim(self, repo, users, token_for=None, who_repo_exit=0, inherited="inherited-personal-token", args=(),
-                    wedge=False, seconds=None, extra_env=None, own=None):
+                    wedge=False, seconds=None, extra_env=None, own=None, ident_extra=""):
         """The real shim in a subprocess with a fake gh and a fake switchboard. The fake gh logs which GH_TOKEN it ran with
         (in a test file only); `gh auth token --user NAME` answers from `token_for`. Returns (done, log)."""
         home = Path(self.home)
@@ -23266,9 +23338,9 @@ class TestIdentityCheck(ReportBase):
         else:
             (bindir / "sb").write_text(
                 "#!/bin/sh\nif [ \"$1\" = whoami ] && [ \"$2\" = --json ]; then [ %d -ne 0 ] && exit %d; "
-                "echo '{\"name\": \"api\", \"repo\": %s%s}'; exit 0; fi\n"
+                "echo '{\"name\": \"api\", \"repo\": %s%s%s}'; exit 0; fi\n"
                 "[ \"$1\" = whoami ] && echo api && exit 0\nexit 2\n"
-                % (who_repo_exit, who_repo_exit, json.dumps(repo) if repo else "null", "" if own is None else ", \"own\": %s" % ("true" if own else "false")))
+                % (who_repo_exit, who_repo_exit, json.dumps(repo) if repo else "null", "" if own is None else ", \"own\": %s" % ("true" if own else "false"), ident_extra))
         (bindir / "sb").chmod(0o755)
         config = home / "xdg-config" / "fleet-switchboard"
         config.mkdir(parents=True, exist_ok=True)
@@ -23327,6 +23399,109 @@ class TestIdentityCheck(ReportBase):
         done, seen = self.run_gh_shim(None, users, {"acct-personal": "tok-personal"}, args=("issue", "list", "-R", "other-org/svc"))
         self.assertEqual((done.returncode, seen["token"]), (0, "inherited-personal-token"), "a read still falls through")
 
+    READ_USERS = {"acme-org/widget-service": "acme-dev", "acme-org/widget-api": "acme-bot"}
+    READ_TOKENS = {"acme-dev": "tok-dev", "acme-bot": "tok-bot"}
+
+    def read_repo_run(self, args, read_repo='"acme-org/widget-api"', users=None, tokens=None, **kw):
+        return self.run_gh_shim("acme-org/widget-service", users or self.READ_USERS, tokens or self.READ_TOKENS, args=args, own=True,
+                                ident_extra=', "read_repo": %s' % read_repo, **kw)
+
+    def test_s1_a_worker_with_a_read_repository_reads_it_as_that_repositorys_account_and_its_own_repository_as_before(self):
+        for args in (("issue", "view", "5", "-R", "acme-org/widget-api"), ("pr", "view", "https://github.com/acme-org/widget-api/pull/3"),
+                     ("api", "repos/acme-org/widget-api/issues/5"), ("api", "-H", "Accept: x", "repos/acme-org/widget-api/pulls", "--jq", ".[0]"),
+                     ("issue", "list", "--repo=acme-org/widget-api"), ("repo", "view", "acme-org/widget-api")):
+            with self.subTest(args=args):
+                done, seen = self.read_repo_run(args)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(seen["token"], "tok-bot")
+        for args in (("issue", "view", "5"), ("issue", "view", "5", "-R", "Acme-Org/Widget-Service"), ("issue", "comment", "5", "--body", "see acme-org/widget-api and https://github.com/x/y/issues/1")):
+            with self.subTest(own=args):
+                done, seen = self.read_repo_run(args)
+                self.assertEqual((done.returncode, seen["token"]), (0, "tok-dev"), done.stderr)
+
+    def test_s2_every_write_on_the_read_repository_is_refused_and_no_call_reaches_github(self):
+        writes = (("issue", "comment", "5", "-R", "acme-org/widget-api", "--body", "x"), ("issue", "edit", "5", "-R", "acme-org/widget-api", "--title", "t"),
+                  ("pr", "merge", "3", "-R", "acme-org/widget-api"), ("api", "-X", "POST", "repos/acme-org/widget-api/issues"),
+                  ("api", "repos/acme-org/widget-api/issues", "-f", "title=t"), ("pr", "close", "3", "--repo", "acme-org/widget-api"),
+                  ("issue", "create", "-R", "acme-org/widget-api", "--title", "t"), ("api", "-X", "DELETE", "repos/acme-org/widget-api/issues/comments/1"))
+        for args in writes:
+            with self.subTest(args=args):
+                done, seen = self.read_repo_run(args)
+                self.assertEqual(done.returncode, 1, done.stderr)
+                self.assertIsNone(seen)
+                self.assertIn("read only", done.stderr)
+
+    def test_s3_a_repository_that_is_neither_the_workers_own_nor_the_declared_one_is_refused_for_reads_and_writes(self):
+        for args in (("issue", "view", "5", "-R", "acme-org/other"), ("pr", "view", "https://github.com/acme-org/other/pull/1"), ("api", "repos/acme-org/other/issues"),
+                     ("repo", "view", "acme-org/other"), ("issue", "comment", "5", "-R", "acme-org/other", "--body", "x"),
+                     ("issue", "view", "5", "-R", "acme-org/widget-api", "-R", "acme-org/other"), ("api", "graphql", "-f", "query=x"), ("api", "search/issues?q=x"),
+                     ("api", "repositories/123")):
+            with self.subTest(args=args):
+                done, seen = self.read_repo_run(args)
+                self.assertEqual(done.returncode, 1, done.stderr)
+                self.assertIsNone(seen)
+
+    def test_s4_hostile_spellings_and_an_unreadable_record_are_refused_and_no_call_reaches_github(self):
+        hostile = ("ACME-ORG/WIDGET-API", "Acme-Org/widget-api", " acme-org/widget-api", "acme-org/widget-api ", "acme-org/widget-api.git", "acme-org/*", "",
+                   "acme-org/widget-api/", "acme-org/widget\u0430pi", "acme-\u212aorg/widget-api", "https://github.com/acme-org/widget-api.git/x/../../other", "acme-org/../widget-api",
+                   "./acme-org/widget-api", "acme-org//widget-api")
+        for spelling in hostile:
+            with self.subTest(spelling=spelling):
+                done, seen = self.read_repo_run(("issue", "view", "5", "-R", spelling))
+                self.assertEqual(done.returncode, 1, done.stderr)
+                self.assertIsNone(seen)
+        for record in ('false', '""', '7', 'null', '["acme-org/widget-api"]', '"Acme-Org/Widget-Api"', '"acme-org/*"'):
+            for args in (("issue", "view", "5"), ("issue", "view", "5", "-R", "acme-org/widget-api"), ("issue", "comment", "5", "--body", "x")):
+                with self.subTest(record=record, args=args):
+                    done, seen = self.read_repo_run(args, read_repo=record)
+                    self.assertEqual(done.returncode, 1, done.stderr)
+                    self.assertIsNone(seen)
+        done, seen = self.read_repo_run(("issue", "view", "5", "-R", "acme-org/widget-api"), users={"acme-org/widget-service": "acme-dev"}, tokens=self.READ_TOKENS)
+        self.assertEqual(done.returncode, 1, "a read repository whose account is not mapped is refused, never read as the inherited account")
+        self.assertIsNone(seen)
+        done, seen = self.read_repo_run(("issue", "view", "5", "-R", "acme-org/widget-api"), tokens={"acme-dev": "tok-dev"})
+        self.assertEqual(done.returncode, 1, "no token for the read repository's account: refused")
+        self.assertIsNone(seen)
+
+    def test_groups_that_reach_any_repository_without_naming_one_and_attached_or_missing_flag_values_are_refused(self):
+        for args in (("search", "code", "x"), ("search", "issues", "x", "--owner", "acme-org"), ("gist", "view", "abc"), ("status",), ("alias", "list"),
+                     ("issue", "view", "5", "-Racme-org/other"), ("issue", "view", "5", "-R"), ("issue", "view", "5", "-R", "")):
+            with self.subTest(args=args):
+                done, seen = self.read_repo_run(args)
+                self.assertEqual(done.returncode, 1, done.stderr)
+                self.assertIsNone(seen)
+        done, seen = self.read_repo_run(("issue", "view", "5", "-Racme-org/widget-api"))
+        self.assertEqual((done.returncode, seen["token"]), (0, "tok-bot"), done.stderr)
+
+    def test_an_api_path_that_walks_out_of_the_read_repository_is_refused_in_every_spelling(self):
+        base = "repos/acme-org/widget-api"
+        for tail in ("/../widget-service/issues", "/../../other/x", "/%2e%2e/other", "/%2E%2E/other", "/%2e./other", "/.%2E/other", "//issues", "/issues/..",
+                     "/issues/.", "\\..\\other", "/%2f..%2fother", "/issues/%2E%2E"):
+            for prefix in ("", "/", "https://api.github.com/"):
+                with self.subTest(path=prefix + base + tail):
+                    done, seen = self.read_repo_run(("api", prefix + base + tail))
+                    self.assertEqual(done.returncode, 1, done.stderr)
+                    self.assertIsNone(seen)
+        for args in (("api", "--preview", "user", "repos/acme-org/other/issues"), ("api", "-p", "meta", "repos/acme-org/other/issues"), ("api", "--preview=user", "repos/acme-org/other/issues"),
+                     ("api", "--unknown", "user", "repos/acme-org/other/issues"), ("api", "user", "repos/acme-org/other/issues"), ("api", "repos/acme-org/widget-api/issues", "extra"),
+                     ("api",), ("api", "-H", "A: b", "-p", "user", "repos/acme-org/other/x")):
+            with self.subTest(args=args):
+                done, seen = self.read_repo_run(args)
+                self.assertEqual(done.returncode, 1, done.stderr)
+                self.assertIsNone(seen)
+        done, seen = self.read_repo_run(("api", "-p", "x", "repos/acme-org/widget-api/issues"))
+        self.assertEqual((done.returncode, seen["token"]), (0, "tok-bot"), done.stderr)
+        done, seen = self.read_repo_run(("api", "repos/acme-org/widget-api/issues?per_page=5"))
+        self.assertEqual((done.returncode, seen["token"]), (0, "tok-bot"), done.stderr)
+
+    def test_s6_a_worker_without_a_read_repository_is_untouched_by_the_guard(self):
+        for args in (("issue", "view", "5", "-R", "acme-org/other"), ("api", "graphql", "-f", "query=x"), ("issue", "comment", "5", "-R", "acme-org/other", "--body", "x")):
+            with self.subTest(args=args):
+                done, seen = self.run_gh_shim("acme-org/widget-service", self.READ_USERS, self.READ_TOKENS, args=args, own=True)
+                self.assertTrue(seen is not None and seen["argv"][0] == args[0], (done.returncode, done.stderr))
+        shim = self.shim()
+        self.assertIsNone(shim.read_scope(["issue", "view", "5", "-R", "x/y"], types.SimpleNamespace(identity=lambda: {"repo": "a/b", "own": True}), False))
+
     def test_the_chief_of_staff_whose_whoami_gives_only_the_default_intent_repo_still_acts_as_the_account_of_the_repo_a_command_names(self):
         """The real shape: cos has no repo of its own, and `whoami --json` falls back to the config's `intent_repo` (own: false). Before, the shim
         used that default repo's account for everything, so the named-repo branch never ran for cos."""
@@ -23354,6 +23529,19 @@ class TestIdentityCheck(ReportBase):
         os.environ["HERDR_PANE_ID"] = self.world.panes["worker"]
         code, out, err = self.call("whoami", "--json")
         self.assertEqual((code, json.loads(out)), (0, {"name": "worker", "repo": "acme/api", "own": True}), err)
+
+    def test_whoami_json_carries_the_read_repo_only_for_a_worker_launched_with_one_and_says_false_when_the_record_is_unreadable(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        for record, expected in (({}, None), ({"read_repo": "acme-org/widget-api"}, "acme-org/widget-api"), ({"read_repo": "Acme-Org/Widget-Api"}, False),
+                                 ({"read_repo": 7}, False), ({"read_repo": ""}, False), ({"read_repo": "acme-org/*"}, False)):
+            name = "w%d" % len(self.world.panes)
+            self.world.add_agent(name, fleet=dict({"role": "coder", "repo": "acme-org/widget-service"}, **record))
+            os.environ["HERDR_PANE_ID"] = self.world.panes[name]
+            code, out, err = self.call("whoami", "--json")
+            self.assertEqual(code, 0, err)
+            got = json.loads(out)
+            self.assertEqual(got.get("read_repo", None) if record else "absent", expected if record else "absent", record)
+            self.assertEqual("read_repo" in got, bool(record))
 
     def test_the_reviewer_shape_an_inherited_wrong_account_token_is_replaced_by_the_callers_repo_account(self):
         users = {"acme-ops/service": "acct-ops", "acme-ops/*": "acct-ops-other", "acme/*": "acct-personal"}

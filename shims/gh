@@ -29,6 +29,7 @@ SIGNED_COMMANDS = {("issue", "comment"), ("pr", "comment"), ("pr", "review"), ("
 LOOKUP_SECONDS = 3.0
 WRITE_LOOKUP_SECONDS = 10.0   # a WRITE waits longer for the account lookup: a slow answer must not make it run as the wrong account
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+READ_REPO_RE = re.compile(r"[a-z0-9_.-]+/[a-z0-9_.-]+")   # the exact, lower-case spelling the launcher records (a worker's `read_repo`)
 TOKEN_ENV_NAMES = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
 
 
@@ -164,6 +165,9 @@ class Lookup:
             self._ident = {"name": name if isinstance(name, str) and NAME_RE.match(name) else None,
                            "repo": repo if isinstance(repo, str) and REPO_RE.match(repo) else None,
                            "own": data.get("own") is not False}   # False: the repo is only the default (`intent_repo`), the caller has none of its own
+            if "read_repo" in data:   # #618: the one extra repository the worker may READ; present but not an exact `owner/name` is False (unreadable: the guard refuses)
+                extra = data["read_repo"]
+                self._ident["read_repo"] = extra if isinstance(extra, str) and READ_REPO_RE.fullmatch(extra) else False
             return self._ident
         plain = self.run([binary, "whoami"])   # an older switchboard: the name only
         if plain is not None and plain.returncode != 0:
@@ -307,13 +311,131 @@ def load_matcher():
     return MATCHER[0]
 
 
-def account_env(gh, lookup=None, strict=False, credential=False, args=None):
+API_VALUE_FLAGS = {"-H", "--header", "-X", "--method", "-q", "--jq", "-t", "--template", "-f", "-F", "--field", "--raw-field", "--input", "--hostname", "--cache", "-R", "--repo", "-p", "--preview"}
+
+
+UNNAMED_REPO_GROUPS = {"search", "gist", "status", "browse", "attestation", "extension", "ext", "alias", "org", "project", "codespace", "ssh-key", "gpg-key"}
+
+
+def named_repos(args):
+    """(set of the repository spellings a gh command NAMES, True when something it names cannot be read). Read from the real `-R`/`--repo` flag, from a
+    GitHub URL given as an argument, from a `gh api` path (`repos/OWNER/NAME/...`) and from the argument of `gh repo ...`; never from the value of another
+    flag (a body or title may say anything). Used only for a worker that has a read-only extra repository (#618)."""
+    found, bad, skip = set(), False, False
+    words = command_words(args)
+    for i, a in enumerate(args):
+        if skip:
+            skip = False
+        elif a in ("-R", "--repo"):
+            skip = True
+            found.add(args[i + 1] if i + 1 < len(args) else "")   # no value at all: an empty name, refused by the caller
+        elif a in VALUE_FLAGS:
+            skip = True
+        elif a.startswith("--repo="):
+            found.add(a.split("=", 1)[1])
+        elif a.startswith("-R") and not a.startswith("--"):
+            found.add(a[2:].lstrip("="))
+        elif not a.startswith("-"):
+            m = re.match(r"^(?:https?://)?(?:www\.)?github\.com[/:]([^/\s?#]*)/([^/\s?#]*)", a, re.I)
+            if m:
+                found.add("%s/%s" % m.groups())
+    if words[:1] == ["api"]:
+        rest, skip_api = [], False
+        for a in args:
+            if skip_api:
+                skip_api = False
+            elif a in API_VALUE_FLAGS:
+                skip_api = True
+            elif not a.startswith("-"):
+                rest.append(a)
+        path = re.sub(r"^https://api\.github\.com/", "", (rest[1] if len(rest) > 1 else "").split("?")[0].split("#")[0]).lstrip("/")
+        m = re.match(r"^repos/([^/]*)/([^/]*)", path)
+        if len(rest) != 2 or "\\" in path or "%" in path or "//" in path or any(seg in (".", "..") for seg in path.split("/")):
+            bad = True   # a dot segment (plain, percent-encoded, mixed case), a backslash or an empty segment can walk out of the repository that was matched: refused whole
+        elif m:
+            found.add("%s/%s" % m.groups())
+        elif path not in ("user", "rate_limit", "meta"):
+            bad = True   # graphql, search, repositories/ID, orgs/..., anything else could reach a repository it does not name: refused
+    elif len(words) >= 3 and words[0] == "repo":
+        found.add(words[2])
+    return found, bad
+
+
+def read_scope(args, lookup, write):
+    """The guard for a worker launched with `--read-repo` (#618): None (not such a worker, or nothing to say: the command runs as it always did),
+    ("refuse", one line) or ("read", the extra repository). A SHIM guard, not a GitHub guard.
+
+    For such a worker, every repository a command names must be the worker's own repository (any spelling the shared matcher reads as it) or EXACTLY the
+    recorded extra one: anything else, an unreadable spelling, or two different repositories, is refused. A command on the extra repository runs as THAT
+    repository's account when it only reads, and is refused when it writes. A record that cannot be read (`read_repo` false) refuses every command that
+    reaches GitHub. Fails closed on its own trouble. A worker without the key is never touched; a lookup that failed says nothing about the record."""
+    try:
+        if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":
+            return None
+        ident = lookup.identity()
+        if "read_repo" not in ident:
+            return None
+        extra = ident["read_repo"]
+        words = command_words(args)
+        if words and words[0] in UNNAMED_REPO_GROUPS:
+            return ("refuse", "gh: refused: `gh %s` can reach any repository without naming it, so a worker with a read-only repository may not run it" % words[0])
+        if words and words[0] in NO_NETWORK_GROUPS and words[0] != "auth":
+            return None
+        if not extra:
+            return ("refuse", "gh: this worker's read-only repository record cannot be read, so the fleet shim refuses every GitHub command "
+                              "(it will not run with no restriction). Relaunch it with `fleet-switchboard launch ... --read-repo OWNER/NAME`")
+        matcher = load_matcher()
+        if matcher is None or matcher.normal_repo(extra) != extra:
+            return ("refuse", "gh: the fleet shim cannot read its repository matcher, so it refuses commands for a worker with a read-only repository")
+        found, bad = named_repos(args)
+        own = matcher.normal_repo(ident.get("repo")) if ident.get("own") and ident.get("repo") else None
+        kinds = set()
+        for raw in found:
+            if raw == extra:
+                kinds.add("extra")
+            elif matcher.normal_repo(raw) is not None and matcher.normal_repo(raw) == own:
+                kinds.add("own")
+            else:
+                return ("refuse", "gh: refused: this worker may use its own repository and read %s (read only), not %s" % (extra, _clean_reason(raw) or "(empty)"))
+        if bad or len(kinds) > 1 or (len(found) > 1 and "extra" in kinds):
+            return ("refuse", "gh: refused: this command names more than one repository, or one that cannot be read: a worker with a read-only repository names exactly one")
+        if kinds == {"extra"}:
+            if write:
+                return ("refuse", "gh: refused: %s is read only for this worker (a shim guard: it may run issue view, pr view, api GET and other reads, never a write)" % extra)
+            return ("read", extra)
+        return None
+    except Exception:
+        return ("refuse", "gh: the read-only repository check failed, retry (the fleet shim refuses rather than run with no restriction)")
+
+
+def read_account_env(gh, lookup, extra):
+    """The environment for a READ of the extra repository: GH_TOKEN of the account `gh_users` maps it to, nothing else. A missing map, mapping or token refuses
+    (NoAccountMapped / AccountLookupFailed): a read of the extra repository never runs as the inherited or the worker's own account."""
+    if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":
+        return None
+    users = config_users()
+    matcher = load_matcher()
+    account = matcher.account_for(users, extra) if matcher is not None and users else None
+    if not isinstance(account, str) or not account:
+        raise NoAccountMapped("repository %s" % extra)
+    COUNT_ACCOUNT[0] = account
+    clean = {k: v for k, v in os.environ.items() if k not in TOKEN_ENV_NAMES}
+    got = (lookup or Lookup()).run([gh, "auth", "token", "--user", account], stdin=subprocess.DEVNULL, env=clean)
+    token = got.stdout.strip() if got is not None and got.returncode == 0 else ""
+    if not token:
+        raise AccountLookupFailed("token")
+    return dict(os.environ, GH_TOKEN=token)
+
+
+def account_env(gh, lookup=None, strict=False, credential=False, args=None, read_repo=None):
     """The environment for the real gh with GH_TOKEN of the account that `gh_users` maps to the repo of the caller's RESOLVED
     identity (`fleet-switchboard whoami --json`: its session, never an inherited variable), the same map and the same
     `gh auth token --user` the daemon uses; so an inherited token never decides who an agent acts as. None leaves the
     environment as it is: no mapping, no switchboard (or one too old to answer), no repo, no token, the lookup deadline
     spent, any trouble. The token is only put in the child's environment: never printed, logged or put in argv."""
     try:
+        if read_repo:
+            return read_account_env(gh, lookup, read_repo)
         if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":
             return None   # the switchboard's own call (the daemon's, or a command's): it named its account; never re-identified
         users = config_users()
@@ -920,6 +1042,11 @@ def main(args):
     args, over_found, over_reason = take_over_review(args)   # the shim's own flag never reaches gh or the signing
     write = is_write(args)
     lookup = Lookup(write=write)   # one identity lookup, one deadline, for the name and the account together
+    scope = read_scope(args, lookup, write)   # a worker with a read-only extra repository (#618): refused here, or told which repository to read as
+    if scope is not None and scope[0] == "refuse":
+        sys.stderr.write(scope[1].strip() + "\n")
+        audit_write(args, lookup, "refused", write)
+        return 1
     held, hold_repo, hold_number = hold_probe(args, lookup, gh, write)   # a hold label refuses before anything else is asked (#376)
     if held:
         sys.stderr.write(held.strip() + "\n")
@@ -943,6 +1070,8 @@ def main(args):
         args = verdict[1]
     credential = is_git_credential(args)
     extra = {"credential": True} if credential else {}   # only the git credential route passes the keyword: every other call is exactly as it was
+    if scope is not None:
+        extra["read_repo"] = scope[1]
     try:
         env = account_env(gh, lookup, strict=is_write(args), args=args, **extra)
     except NoAccountMapped as err:
