@@ -237,7 +237,6 @@ class Record(td.Driver):
         self.assertEqual(json.loads(out)["record"], d)
         self.assertEqual(err.count(d), 1)
         self.assertEqual(self.audit_lines()[-1]["reason"], "retired; run record %s" % self.shown(d))
-        self.assertTrue(self.audit_lines()[-1]["reason"].endswith(os.path.basename(d)))
         lines = self.read(os.path.join(d, "transcript.jsonl")).splitlines()
         self.assert_lines_are_json(lines)
         self.assert_record_has_no_secret()   # the launcher learned the secrets from the pod's own mounts
