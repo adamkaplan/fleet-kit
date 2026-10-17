@@ -311,7 +311,7 @@ def load_matcher():
     return MATCHER[0]
 
 
-API_VALUE_FLAGS = {"-H", "--header", "-X", "--method", "-q", "--jq", "-t", "--template", "-f", "-F", "--field", "--raw-field", "--input", "--hostname", "--cache", "-R", "--repo"}
+API_VALUE_FLAGS = {"-H", "--header", "-X", "--method", "-q", "--jq", "-t", "--template", "-f", "-F", "--field", "--raw-field", "--input", "--hostname", "--cache", "-R", "--repo", "-p", "--preview"}
 
 
 UNNAMED_REPO_GROUPS = {"search", "gist", "status", "browse", "attestation", "extension", "ext", "alias", "org", "project", "codespace", "ssh-key", "gpg-key"}
@@ -350,7 +350,7 @@ def named_repos(args):
                 rest.append(a)
         path = re.sub(r"^https://api\.github\.com/", "", (rest[1] if len(rest) > 1 else "").split("?")[0].split("#")[0]).lstrip("/")
         m = re.match(r"^repos/([^/]*)/([^/]*)", path)
-        if "\\" in path or "%" in path or "//" in path or any(seg in (".", "..") for seg in path.split("/")):
+        if len(rest) != 2 or "\\" in path or "%" in path or "//" in path or any(seg in (".", "..") for seg in path.split("/")):
             bad = True   # a dot segment (plain, percent-encoded, mixed case), a backslash or an empty segment can walk out of the repository that was matched: refused whole
         elif m:
             found.add("%s/%s" % m.groups())

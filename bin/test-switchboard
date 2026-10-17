@@ -23482,6 +23482,15 @@ class TestIdentityCheck(ReportBase):
                     done, seen = self.read_repo_run(("api", prefix + base + tail))
                     self.assertEqual(done.returncode, 1, done.stderr)
                     self.assertIsNone(seen)
+        for args in (("api", "--preview", "user", "repos/acme-org/other/issues"), ("api", "-p", "meta", "repos/acme-org/other/issues"), ("api", "--preview=user", "repos/acme-org/other/issues"),
+                     ("api", "--unknown", "user", "repos/acme-org/other/issues"), ("api", "user", "repos/acme-org/other/issues"), ("api", "repos/acme-org/widget-api/issues", "extra"),
+                     ("api",), ("api", "-H", "A: b", "-p", "user", "repos/acme-org/other/x")):
+            with self.subTest(args=args):
+                done, seen = self.read_repo_run(args)
+                self.assertEqual(done.returncode, 1, done.stderr)
+                self.assertIsNone(seen)
+        done, seen = self.read_repo_run(("api", "-p", "x", "repos/acme-org/widget-api/issues"))
+        self.assertEqual((done.returncode, seen["token"]), (0, "tok-bot"), done.stderr)
         done, seen = self.read_repo_run(("api", "repos/acme-org/widget-api/issues?per_page=5"))
         self.assertEqual((done.returncode, seen["token"]), (0, "tok-bot"), done.stderr)
 
