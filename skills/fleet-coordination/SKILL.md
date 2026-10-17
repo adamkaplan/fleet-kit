@@ -44,6 +44,8 @@ bin/test-switchboard -k test_the_role_files_do_not_grow   # the role-file byte c
 bin/test-switchboard -k TestHygiene                       # shebang, stdlib-only, executable bits
 ```
 
+Before marking the pull request ready, `fleet-switchboard preflight-pr` runs the CI-critical focused classes you otherwise skip (command surface, hygiene, public names, and the cloud suites when `cloud/` changed) and prints one PASS or FAIL line each.
+
 When a scenario's evidence is your own measurement, from your own pane launch a tester of your lane (`--role tester --repo <the pull request's repo> --reports-to <you>`, headless is enough) to re-measure and record the verdict: never record as yourself, and do not ask for a waiver.
 
 `ASK` carries the Intent and Done when of the ask this assignment serves

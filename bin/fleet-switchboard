@@ -22040,6 +22040,79 @@ def add_heavy_parsers(sub):
     heavy.add_argument("command", nargs=argparse.REMAINDER, help="-- <command...>")
 
 
+# ---- `preflight-pr`: the CI-critical focused classes a coder skips, one PASS or FAIL line each. The ONE table of classes is PREFLIGHT_CLASSES.
+# (name, time ceiling in seconds, commands: each runs in turn under `heavy`, and the class passes when every one exits 0, when files change under: None = always)
+PREFLIGHT_CLASSES = (
+    ("cli-surface", 240, (("bin/test-switchboard", "-k", "TestSelfRegisteringCli"),), None),
+    ("hygiene", 240, (("bin/test-switchboard", "-k", "TestHygiene", "-k", "test_the_role_files_do_not_grow"),), None),
+    ("public-names", 60, (("python3", "bin/check-public-names"),), None),
+    ("cloud", 600, (("bin/test-cloud-worker",), ("bin/test-cloud-launcher",), ("cloud/tests/test-cloud",)), "cloud/"),
+)
+PREFLIGHT_TOKEN_LENGTH = 49   # the macOS-only path-length trap: a token-shaped directory name of this length under TMPDIR
+
+
+def preflight_changed(runner, root):
+    """The files changed against the base (merge-base with origin/main, else main), or None when no base can be found (the cloud class then runs: safe side)."""
+    for base in ("origin/main", "main"):
+        found = runner(["git", "merge-base", "HEAD", base], cwd=root, capture_output=True, text=True)
+        if found.returncode == 0 and found.stdout.strip():
+            diff = runner(["git", "diff", "--name-only", found.stdout.strip()], cwd=root, capture_output=True, text=True)
+            if diff.returncode == 0:
+                return diff.stdout.split()
+    return None
+
+
+def cmd_preflight_pr(args, runner, now):
+    """`preflight-pr`: run each class of PREFLIGHT_CLASSES under `heavy`, print one PASS or FAIL line per class, exit 1 when any fails. Only runs tests."""
+    top = runner(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    if top.returncode != 0:
+        sys.stderr.write("%s: preflight-pr: not inside a git work tree\n" % PROG)
+        return EXIT_USAGE
+    root = top.stdout.strip()
+    changed = preflight_changed(runner, root)
+    failed = 0
+    with tempfile.TemporaryDirectory(prefix="preflight-") as work:
+        for name, ceiling, commands, under in PREFLIGHT_CLASSES:
+            if under is not None and changed is not None and not any(path.startswith(under) for path in changed):
+                continue
+            env = dict(os.environ, FLEET_HEAVY_MAX_SECONDS=str(ceiling))   # the ceiling runs INSIDE the slot (heavy's watchdog starts when the slot is granted): a wait in the queue is never a timeout
+            sys.stderr.write("preflight-pr: %s: waiting for a slot, then running (ceiling %ds once running)\n" % (name, ceiling))
+            if under is not None:
+                scratch = os.path.join(work, ("tok_" + "x" * PREFLIGHT_TOKEN_LENGTH)[:PREFLIGHT_TOKEN_LENGTH])
+                os.makedirs(scratch, exist_ok=True)
+                env.update(TMPDIR=scratch, CLOUD_TEST_SKIP_DOCKER="1")
+            started, verdict, tail = now(), "PASS", ""
+            for command in commands:
+                try:
+                    done = runner([sys.executable, os.path.abspath(__file__), "heavy", "--"] + list(command), cwd=root, env=env, capture_output=True, text=True)
+                except subprocess.TimeoutExpired:   # only a runner of its own making raises this: heavy has no outer clock here
+                    verdict, tail = "FAIL", "timed out after %ds" % ceiling
+                    break
+                if done.returncode == 124:
+                    verdict, tail = "FAIL", "timed out after %ds running" % ceiling
+                    break
+                if done.returncode == 75:
+                    verdict, tail = "NOSLOT", "no heavy slot came in time (the tests did not run)"
+                    break
+                if done.returncode != 0:
+                    verdict, tail = "FAIL", "exit %d: %s" % (done.returncode, _one_line(" ".join(command), 80))
+                    sys.stderr.write("".join(("%s: %s\n" % (name, line)) for line in ((done.stdout or "") + (done.stderr or "")).splitlines()[-15:]))
+                    break
+            failed += verdict != "PASS"
+            print("%s %s (%ds)%s" % (verdict, name, max(0, int(now() - started)), (": " + tail) if tail else ""))
+    return EXIT_ERROR if failed else EXIT_OK
+
+
+cmd_preflight_pr.direct = True   # only runs tests: no daemon start, no GitHub, no ledger
+
+
+def add_preflight_pr_parsers(sub):
+    sub.add_parser("preflight-pr", help="Run the CI-critical focused test classes coders skip, under `heavy`: one PASS or FAIL line each, exit 1 when any fails",
+                   description="Runs, each under the `heavy` wrapper and a time ceiling: the command-surface snapshot class, the hygiene and role-file classes, "
+                               "bin/check-public-names and, when files under cloud/ changed against the base, the cloud suites with TMPDIR a 49-character "
+                               "token-shaped directory name. Only runs tests: it never pushes, labels or records a verdict.")
+
+
 def add_disk_parsers(sub):
     disk = sub.add_parser("disk", allow_abbrev=False, help="Disk tools: `disk report` (a bare `disk`) shows what holds the disk, read only; `disk prune` removes old docker build cache and images (never volumes or running containers); `disk reclaim-worktrees` removes the clean, pushed worktrees of retired agents")
     disk_sub = disk.add_subparsers(dest="disk_action", required=False)
