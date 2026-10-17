@@ -20800,6 +20800,8 @@ def cmd_review(args, runner, now):
             raise ReviewError("--impact-class belongs to the impact reviewer")
         if impact_class is not None and not IMPACT_CLASS_RE.fullmatch(impact_class):
             raise ReviewError("impact-class must be one lower-case word naming the class of the impact (see the matrix file's classes), got %r" % impact_class[:40])
+        if args.impact_action == "hold" and impact_class is None:
+            raise ReviewError("an impact hold must name its class (--impact-class or an `impact-class:` line): run the review again (nothing was recorded)")
         if not head or not re.fullmatch(r"[0-9a-f]{40}", head):
             raise ReviewError("the PR head is unknown: nothing was recorded")
         given = args.head or head
