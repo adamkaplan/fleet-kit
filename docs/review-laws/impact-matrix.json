@@ -138,7 +138,8 @@
         "shims/gh",
         "shims/git",
         "cloud/launcher/token_mint.py",
-        "cloud/launcher/cloud_worker.py"
+        "cloud/launcher/cloud_worker.py",
+        "cloud/launcher/repo-approvals.json"
       ],
       "identity": [
         "shims/**",
@@ -216,6 +217,7 @@
       "agents/**",
       "cloud/launcher/token_mint.py",
       "cloud/launcher/cloud_worker.py",
+      "cloud/launcher/repo-approvals.json",
       ".github/workflows/**",
       "bin/switchboard-trial"
     ],

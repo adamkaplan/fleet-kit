@@ -3203,6 +3203,7 @@ class Discovery:
         self.agents = {}
         self.problems = []
         self.entries = []  # herdr's agent list as read, so render can compare tokens
+        self.headless_records = None   # the headless records THIS look scanned (None: it did not look): the fact sources judge only against these
 
     def add(self, observation):
         known = self.agents.get(observation.name)
@@ -4121,6 +4122,7 @@ class Switchboard:
                  state_dir=None):
         self.config, self.v2, self.herdr, self.audit = config, v2, herdr, audit
         self.state_dir = Path(state_dir) if state_dir is not None else None  # PR 14: where decisions.json goes
+        self.headless_state = None   # #433: a READ-ONLY state directory for the headless records, for a caller (`status`) that must not get a state_dir (which writes)
         if getattr(v2, "on_event", False) is None:   # a real client: its breaker's `v2.backoff` / `v2.resume` go to the audit, once per episode
             v2.on_event = lambda name, detail: self._note(name, "v2", detail)
         self.hub = None  # the GitHub hub, when this process has one (PR 14: its awaiting-user issues)
@@ -4273,15 +4275,17 @@ class Switchboard:
         """#433: the workers with no terminal. The index is the private records in state-dir/headless/; PRESENCE is proved by the service (the session
         exists, answers and carries the worker's name in its metadata), never by a record alone. `session.active` is read ONCE for all of them; a
         service that does not answer makes each one `unknown` with a problem (a delivery is held, never dropped), not dead and not working."""
-        if self.state_dir is None:
+        root = self.state_dir if self.state_dir is not None else self.headless_state
+        if root is None:
             return
         try:
             ap = load_agent_presence()
-            records, bad = ap.scan_records(self.state_dir)
+            records, bad = ap.scan_records(root)
         except Exception as err:   # never silent: headless workers would vanish from discovery without a word
             found.problems.append("headless workers could not be read: %s" % _one_line(str(err), 100))
             return
         found.problems.extend(bad)   # a record that is there and cannot be used is said, one line each, never a silent loss
+        found.headless_records = records   # what this look saw: a launch that lands after it is judged by the NEXT look, never called lost by this one
         if not records:
             return
         active, down = None, None
@@ -4326,7 +4330,7 @@ class Switchboard:
         fleet = _fleet_meta(info)
         if not fleet or fleet.get("name") != record["worker"]:
             return None   # the session does not carry the worker's name: the record is not proof of presence
-        fleet = load_module("reassign").overlay(self.state_dir, fleet, session_id)   # a reassigned worker's boss (bin/reassign.py): bound to this session
+        fleet = load_module("reassign").overlay(self.state_dir if self.state_dir is not None else self.headless_state, fleet, session_id)   # a reassigned worker's boss (bin/reassign.py): bound to this session
         times = info.get("time") if isinstance(info.get("time"), dict) else {}
         observation = Observation(fleet["name"], session_id, None, STATUS.get(state, "unknown"), fleet, _seconds(times.get("idle")), info.get("outcome"))
         observation.created = _seconds(times.get("created"))
@@ -6504,6 +6508,17 @@ def write_pane_health(state_dir, data):
     state_write(Path(state_dir) / PANE_HEALTH_FILE, json.dumps(data, indent=1, sort_keys=True) + "\n", json.dumps(stable, sort_keys=True), HEARTBEAT_HEALTH, fsync=True)
 
 
+def watch_terminal_closed(engine, name, session_id):
+    """True when `name` has a headless record for THIS session (it is a worker that runs with no terminal), so a pane that vanished was a `watch`
+    terminal. A record for another session, no record, or an unreadable one is False: a real terminal worker's gone pane is still dead (the fail mode
+    is chosen: when in doubt the alert goes out, never silence)."""
+    try:
+        record = load_agent_presence().load_record(engine.state_dir, name)
+    except Exception:
+        return False
+    return record is not None and record.get("session") == session_id
+
+
 def pane_health_pass(engine, now):
     """The daemon's look at every fleet agent's pane (after discovery). Records `pane-health.json` (what `status` shows and `reattach` reads),
     audits each change of state (`pane.detached`, `pane.dead`, `pane.recovered`) and leaves `engine.pane_alerts` for the cos fact. Reads only; bounded
@@ -6518,6 +6533,10 @@ def pane_health_pass(engine, now):
     sessions = [o.session_id for o in discovery.agents.values()]
     budget = PANE_CHECKS_PER_PASS
     for name, obs in sorted(discovery.agents.items()):
+        if obs.headless:   # no terminal now (#433): a pane verdict it was given while a `watch` terminal was open is stale, and is dropped with its alert (also while the service is unreadable: `unknown` carries no pane verdict)
+            for table in (agents, states, missing):
+                table.pop(name, None)
+            continue
         if not obs.pane or not obs.session_id:
             continue
         missing.pop(name, None)
@@ -6531,6 +6550,11 @@ def pane_health_pass(engine, now):
         if due and budget > 0:
             budget -= 1
             state, why, info = pane_state(engine, name, obs.session_id, obs.pane, names, sessions)
+            if state == PANE_DEAD and watch_terminal_closed(engine, name, obs.session_id):
+                for table in (agents, states, missing):   # the person closed a `watch` terminal: the worker still runs headless, nothing is dead
+                    table.pop(name, None)
+                engine.pane_checked[name] = int(now)   # a check was made: this pane does not take a slot of every pass until discovery shows the worker headless
+                continue
             if state != PANE_UNKNOWN:   # an unreadable look is not a check: it is repeated, as before
                 engine.pane_checked[name] = int(now)
                 if state != prev.get("state") and engine.audit is not None:
@@ -6650,10 +6674,9 @@ class HeadlessRestartFacts:
         if engine is None or discovery is None or engine.state_dir is None:
             return []
         state = engine.state_dir
-        try:
-            records, unread = load_agent_presence().scan_records(state)
-        except Exception as err:
-            engine._note("source.error", "headless_restart_facts", {"error": "the headless records could not be read: %s" % _one_line(str(err), 100)})
+        records = discovery.headless_records   # the records this pass's discovery scanned, never a second scan: a launch that landed after discovery is not "lost"
+        unread = discovery.problems   # every problem of the look (records, the service, herdr), not only unreadable records: on any of them a remembered boss is kept, never pruned
+        if records is None:
             return []
         remembered = _read_small(state, HEADLESS_SERVICE_FILE)
         service, bosses = dict(remembered.get("service") or {}), dict(remembered.get("bosses") or {})
@@ -7721,6 +7744,13 @@ def validate_foreground_config(config, source):
         raise ConfigError("%s: 'busy_poll_seconds' must be a positive number, got %r" % (source, busy))
     if mode == "act" and not config.get("jev"):
         raise ConfigError("%s: 'classifier_mode' \"act\" needs a 'jev' object: there is no decision model to ask" % source)
+
+
+def chiefs_of_staff(discovery):
+    """The names of the Chief of Staff agents in a discovery, by the fleet metadata role (never by a name in configuration); none when discovery has problems."""
+    if discovery is None or discovery.problems:
+        return []
+    return sorted(n for n, o in discovery.agents.items() if (getattr(o, "fleet", None) or {}).get("role") == "chief-of-staff")
 
 
 def chief_busy(engine):
@@ -9662,6 +9692,26 @@ def pr_reviews_at(reviews, head, author):
     return [{"by": by, "state": state} for by, state in sorted(found.items())]
 
 
+_VERDICT_REVIEW = re.compile(r"Review of ([0-9A-Fa-f]{7,40}):[ \t]*(?:APPROVE|CHANGES REQUESTED)(?![A-Za-z0-9_])")
+
+
+def pr_verdict_review(reviews, head):
+    """True when a formal review (not pending or dismissed) of the PR has a body that STARTS with `Review of <sha>:` and then
+    APPROVE or CHANGES REQUESTED, the sha being the head in full or a prefix of at least 7 characters (a whole token). The
+    reviewer's account is NOT looked at: the independent reviewer posts from the author's own account. Used by T7 only; it is
+    not `pr_reviews_at` (the gates, the hold rule and the captain evidence keep that stricter reading). False when it cannot be told."""
+    if not isinstance(reviews, list) or not isinstance(head, str) or not head:
+        return False
+    for review in reviews:
+        if not isinstance(review, dict) or str(review.get("state") or "").upper() not in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED"):
+            continue
+        body = review.get("body")
+        found = _VERDICT_REVIEW.match(body) if isinstance(body, str) else None
+        if found and head.lower().startswith(found.group(1).lower()):
+            return True
+    return False
+
+
 def pr_review_older(reviews, head, author):
     """True when someone other than the author reviewed this PR at a commit that is NOT its head (the review predates the
     last push). Companion of `pr_reviews_at`; False when none or when the list cannot be read."""
@@ -9747,6 +9797,7 @@ def pr_facts_from(data):
             "reviews": pr_reviews_at(data.get("reviews"), head, pr_login(data.get("author"))),
             "signed": pr_signed_at(data.get("comments"), head),
             "signed_review": pr_signed_at(data.get("comments"), head, True),
+            "verdict_review": pr_verdict_review(data.get("reviews"), head),
             "reviews_older": pr_review_older(data.get("reviews"), head, pr_login(data.get("author"))),
             "head_at": pr_head_time(data.get("commits")),
             "additions": count("additions"), "deletions": count("deletions"), "files": count("changedFiles"),
@@ -12534,6 +12585,8 @@ def triage_verify_t7(engine, state, repo, number, cfg, now, budget):
         return None
     if facts["state"] != "open":
         return False
+    if facts.get("verdict_review"):
+        return False         # the independent reviewer's verdict review of this exact head, from any account (T7 only)
     senders, noticed = set(), False
     try:
         for item in read_pr_notices(engine.state_dir):
@@ -14663,6 +14716,11 @@ class GitHubHub:
         """The owner of an item (see `route_of`, which also says by which link)."""
         return self.route_of(item, agents, now)[0]
 
+    def notice_names(self, repo, number):
+        """The agent names a `notice pr` record of this pull request names (its sender, then its boss), whether or not they run: who WAS told to watch it."""
+        notice = self._notices.get((repo, number)) or {}
+        return [n for n in (notice.get("from"), notice.get("boss")) if isinstance(n, str) and n]
+
     def route_of(self, item, agents, now):
         """(owner, routed_by) of an item, or (None, None). PR 52: the links in order: (closing) the issues the item
         or its PR names, the existing routing, unchanged and first so that nothing that routes today moves;
@@ -15429,6 +15487,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         if v2_ok and herdr_ok and state_ok and faults_ok:
             engine = Switchboard(config, v2, herdr, None, fact_sources(state), now,
                                  intents=intent_reader_for(config, runner, now))
+            engine.headless_state = Path(state)   # read-only: the headless records are listed, and `status` still writes nothing
             agents_ok, overview = _check(lambda: fleet_overview(engine, entries))
             agents = overview if agents_ok else {"ok": False, "error": overview}
     else:
@@ -22270,7 +22329,8 @@ def cmd_heavy(args):
     except Exception as err:   # a state directory that cannot be made or is refused: the command still runs, without a slot (heavy never fails someone else's command)
         sys.stderr.write("heavy: no slot (%s): running without one\n" % _one_line(str(err), 160))
         state = None
-    return module.run(command, state, args.slots or configured, module.DEFAULT_WAIT_MAX if args.wait_max is None else args.wait_max, args.name)
+    return module.run(command, state, args.slots or configured, module.DEFAULT_WAIT_MAX if args.wait_max is None else args.wait_max, args.name,
+                      short=bool(getattr(args, "short", False)))
 
 
 cmd_heavy.direct = True   # the wrapper of someone else's command: no daemon start, no error mapping
@@ -22278,11 +22338,12 @@ cmd_heavy.direct = True   # the wrapper of someone else's command: no daemon sta
 
 def add_heavy_parsers(sub):
     heavy = sub.add_parser("heavy", help="Run a heavy command (a full test suite, a browser or e2e run) in one of a few CPU slots, at background priority",
-                           description="`heavy [--slots N] [--wait-max SECONDS] [--name WHO] -- <command...>`: waits for a free slot (default 3, config `heavy.slots`; one line "
-                                       "every 30 s says who holds them), then runs the command as `taskpolicy -b <command>` (else `nice -n 10`) with its stdin, stdout, "
+                           description="`heavy [--slots N] [--wait-max SECONDS] [--short] [--name WHO] -- <command...>`: waits for a free slot in arrival order (default 3, config `heavy.slots`; one line "
+                                       "every 30 s says your place and who holds them), then runs the command as `taskpolicy -b <command>` (else `nice -n 10`) with its stdin, stdout, "
                                        "exit status and signals passed through. After --wait-max seconds (default 1800) it exits 75 and does not run the command.")
     heavy.add_argument("--slots", type=int, help="How many commands may run at once (default: config heavy.slots, else 3)")
     heavy.add_argument("--wait-max", type=int, dest="wait_max", help="Give up after this many seconds without a slot: exit 75 (default 1800)")
+    heavy.add_argument("--short", action="store_true", help="The command is short: when the ordinary slots are busy it may use the one express slot, and the wrapper stops it after 120 seconds (exit 124)")
     heavy.add_argument("--name", help="Who the slot is held for (default: FLEET_HEAVY_NAME, the OpenCode session id, the user)")
     heavy.add_argument("command", nargs=argparse.REMAINDER, help="-- <command...>")
 
