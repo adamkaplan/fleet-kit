@@ -55797,6 +55797,260 @@ class TestReviewerSubagents(LedgerBase):
 plan_review = _load("t_plan_review", BIN / "plan_review.py")
 
 
+class TestReviewCheckout(LedgerBase):
+    """#721: `review checkout` writes the PR's exact head tree, diff and base copies into .review/<head sha>, read-only; `--remove` undoes it;
+    hostile trees (a symlink, `..`, a NUL, an absolute path, a huge file or tree) write nothing outside and leave nothing behind."""
+
+    BASE = "b" * 40
+    OLD_TIP = "c" * 40
+
+    def setUp(self):
+        super().setUp()
+        self.pr = dict(self.pr, baseRefOid=self.BASE, baseRefName="main")
+        self.rc = sb.load_module("review_checkout")
+        self.work = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: self.rc.remove_tree(str(self.work), force=True))
+        self.outside = self.work / "outside"
+        self.outside.mkdir()
+        self.cwd = self.work / "cwd"
+        self.cwd.mkdir()
+        previous = os.getcwd()
+        os.chdir(self.cwd)
+        self.addCleanup(os.chdir, previous)
+        self.blobs, self.trees, self.fetched = {}, {}, []
+        self.base_tree = {"a.txt": "one\n", "b.txt": "two\n", "same.txt": "same\n"}
+        self.head_tree = {"a.txt": "one changed\n", "b.txt": "two\n", "same.txt": "same\n", "new.txt": "new file\n"}
+        self.extra_entries = []
+        self.tip_tree = {"tip.txt": "the branch moved\n"}
+
+    def entries(self, tree):
+        out = []
+        for path, text in tree.items():
+            sha = hashlib.sha1(text.encode()).hexdigest()
+            self.blobs[sha] = text
+            out.append({"path": path, "type": "blob", "mode": "100644", "sha": sha, "size": len(text.encode())})
+        return out
+
+    def route(self, argv, **kwargs):
+        if argv[0] == FAKE_GH and argv[1] == "api":
+            path = argv[2]
+            self.fetched.append(path)
+            if "/compare/" in path:
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"merge_base_commit": {"sha": self.BASE}}), "")
+            tree = re.search(r"/git/trees/([0-9a-f]+)", path)
+            if tree:
+                sha = tree.group(1)
+                table = {LEDGER_HEAD: self.head_tree, self.BASE: self.base_tree, self.OLD_TIP: self.tip_tree}[sha]
+                body = {"tree": self.entries(table) + self.extra_entries if sha == LEDGER_HEAD else self.entries(table), "truncated": False}
+                return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+            blob = re.search(r"/git/blobs/([0-9a-f]+)", path)
+            if blob:
+                text = self.blobs[blob.group(1)]
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"encoding": "base64", "content": base64.b64encode(text.encode()).decode()}), "")
+        return super().route(argv, **kwargs)
+
+    def checkout(self, *more):
+        return self.run_as("coder", "review", "checkout", self.PR, *more)
+
+    def files(self, root):
+        return sorted(str(p.relative_to(root)) for p in Path(root).rglob("*") if p.is_file())
+
+    def made_nothing(self):
+        self.assertEqual(os.listdir(self.cwd), [], "nothing left behind")
+
+    def test_s1_the_directory_holds_the_head_files_the_diff_and_the_base_copies(self):
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        lines = out.strip().splitlines()
+        self.assertEqual(len(lines), 1)
+        root = Path(lines[0])
+        self.assertEqual(root.name, LEDGER_HEAD[:12])
+        self.assertEqual(root.parent.name, ".review")
+        self.assertEqual(self.files(root / "head"), ["a.txt", "b.txt", "new.txt", "same.txt"])
+        self.assertEqual(self.files(root / "base"), ["a.txt"], "the base copy of each touched file that existed there")
+        self.assertEqual((root / "head" / "a.txt").read_text(), "one changed\n")
+        diff = (root / "pr.diff").read_text()
+        self.assertIn("-one\n+one changed", diff)
+        self.assertIn("+++ b/new.txt", diff)
+        self.assertNotIn("same.txt", diff)
+
+    @unittest.skipIf(os.geteuid() == 0, "root can write anything")
+    def test_s2_every_file_and_directory_is_read_only(self):
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip())
+        for name in ("head/a.txt", "head/new.txt", "pr.diff"):
+            with self.subTest(name=name), self.assertRaises(PermissionError):
+                open(root / name, "w")
+        with self.assertRaises(PermissionError):
+            (root / "head" / "x").write_text("x")
+
+    def test_s3_remove_removes_its_own_directory_and_refuses_a_foreign_one(self):
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        root = out.strip()
+        code, out, err = self.run_as("coder", "review", "checkout", "--remove", root)
+        self.assertEqual(code, 0, err)
+        self.assertFalse(os.path.exists(root))
+        foreign = self.cwd / ".review" / ("d" * 12)
+        foreign.mkdir(parents=True)
+        (foreign / "keep.txt").write_text("mine")
+        other = self.cwd / "other"
+        other.mkdir()
+        for target in (foreign, other, self.cwd):
+            with self.subTest(target=str(target)):
+                code, out, err = self.run_as("coder", "review", "checkout", "--remove", str(target))
+                self.assertEqual(code, 1)
+                self.assertTrue(target.is_dir())
+        self.assertEqual((foreign / "keep.txt").read_text(), "mine")
+
+    def test_s8_remove_restores_the_permissions_it_set_and_leaves_nothing(self):
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip())
+        self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o555)
+        code, out, err = self.run_as("coder", "review", "checkout", "--remove", str(root))
+        self.assertEqual(code, 0, err)
+        self.made_nothing()
+
+    def test_s4_a_symlink_is_skipped_and_the_hostile_paths_are_refused_by_name(self):
+        secret = self.outside / "secret.txt"
+        secret.write_text("outside")
+        link = {"path": "link", "type": "blob", "mode": "120000", "sha": "e" * 40, "size": 5}
+        self.extra_entries = [link]
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip())
+        self.assertIn("'link'", err)
+        self.assertFalse(any(p.is_symlink() for p in root.rglob("*")), "0 symlinks created")
+        self.assertFalse((root / "head" / "link").exists())
+        self.run_as("coder", "review", "checkout", "--remove", str(root))
+        hostile = [("../up.txt", "100644"), ("/abs.txt", "100644"), ("nul\x00.txt", "100644"), ("a/../../b.txt", "100644")]
+        self.extra_entries = [link] + [{"path": p, "type": "blob", "mode": m, "sha": "f" * 40, "size": 1} for p, m in hostile]
+        code, out, err = self.checkout()
+        self.assertEqual(code, 1)
+        for name in ("up.txt", "abs.txt", "nul\\\\x00.txt", "b.txt"):
+            self.assertIn(name, err)
+        self.assertIn("'link'", err)
+        self.made_nothing()
+        self.assertEqual(os.listdir(self.outside), ["secret.txt"])
+        self.assertEqual(secret.read_text(), "outside")
+        self.assertFalse(any("/git/blobs/" + "f" * 40 in p or "/git/blobs/" + "e" * 40 in p for p in self.fetched), "no blob of a hostile entry was read")
+
+    def test_s9_a_tree_whose_only_path_escapes_writes_no_file_outside(self):
+        self.head_tree, self.base_tree = {}, {}
+        self.extra_entries = [{"path": "../escape", "type": "blob", "mode": "100644", "sha": "f" * 40, "size": 1}]
+        code, out, err = self.checkout()
+        self.assertEqual(code, 1)
+        self.assertFalse((self.cwd.parent / "escape").exists())
+        self.assertFalse((self.cwd / "escape").exists())
+        self.made_nothing()
+
+    def test_the_writer_refuses_a_symlinked_directory_in_the_way(self):
+        root = self.work / "root"
+        root.mkdir()
+        os.symlink(str(self.outside), str(root / "dir"))
+        with self.assertRaises(self.rc.Unsafe):
+            self.rc.write_file(str(root), "dir/file.txt", b"x")
+        self.assertEqual(os.listdir(self.outside), [])
+
+    def test_s5_a_file_over_the_size_bound_and_a_tree_over_the_count_bound_are_refused_with_the_limit(self):
+        for name, value, snippet in (("MAX_FILE_BYTES", 5, "limit of 5 bytes"), ("MAX_FILES", 2, "limit of 2 files")):
+            with self.subTest(bound=name), mock.patch.object(self.rc, name, value):
+                code, out, err = self.checkout()
+                self.assertEqual(code, 2, err)
+                self.assertIn(snippet, err)
+                self.assertRegex(err, r"\d+ (bytes|files)")
+                self.made_nothing()
+        with mock.patch.object(self.rc, "MAX_TOTAL_BYTES", 10):
+            code, out, err = self.checkout()
+            self.assertEqual(code, 2)
+            self.assertIn("limit of 10 bytes in total", err)
+            self.made_nothing()
+
+    def test_s6_the_tree_is_the_head_asked_for_and_never_the_branch_tip(self):
+        self.pr = dict(self.pr, headRefOid=self.OLD_TIP)   # the branch moved after the sha was given
+        code, out, err = self.checkout("--head", LEDGER_HEAD)
+        self.assertEqual(code, 0, err)
+        root = Path(out.strip())
+        self.assertEqual(root.name, LEDGER_HEAD[:12])
+        self.assertEqual((root / "head" / "a.txt").read_text(), "one changed\n")
+        self.assertFalse((root / "head" / "tip.txt").exists())
+        self.assertFalse(any(self.OLD_TIP in p for p in self.fetched if "/git/trees/" in p or "/compare/" in p))
+
+    def test_a_failed_compare_falls_back_to_the_base_commit_aloud_and_in_the_marker(self):
+        plain = self.route
+        self.route = lambda argv, **kw: (subprocess.CompletedProcess(argv, 1, "", "gh: boom") if "/compare/" in " ".join(argv) else plain(argv, **kw))
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        self.assertIn("merge base could not be read", err)
+        marker = json.loads((Path(out.strip()) / ".fleet-review-checkout").read_text())
+        self.assertTrue(marker["merge_base_fallback"])
+
+    def test_remove_refuses_a_marker_that_is_malformed_or_names_another_head(self):
+        for text in ("{not json", json.dumps({"tool": "fleet-switchboard review checkout", "head": 5}),
+                     json.dumps({"tool": "fleet-switchboard review checkout", "head": "9" * 40})):
+            with self.subTest(marker=text[:20]):
+                d = self.cwd / ".review" / LEDGER_HEAD[:12]
+                d.mkdir(parents=True)
+                (d / ".fleet-review-checkout").write_text(text)
+                code, out, err = self.run_as("coder", "review", "checkout", "--remove", str(d))
+                self.assertEqual(code, 1)
+                self.assertTrue(d.is_dir())
+                shutil.rmtree(d)
+
+    def test_a_dot_git_component_in_any_case_is_refused_and_nothing_is_written(self):
+        for path in (".git/config", ".GIT/config", ".Git/hooks/x", "a/.git/config", ".git", "a/.GiT", ".git.", ".git ", ".g\u200bit/config", "GIT~1/config"):
+            with self.subTest(path=path):
+                self.extra_entries = [{"path": path, "type": "blob", "mode": "100644", "sha": "f" * 40, "size": 1}]
+                code, out, err = self.checkout()
+                self.assertEqual(code, 1)
+                self.assertIn(".git component", err)
+                self.made_nothing()
+        self.extra_entries = [{"path": ".gitignore", "type": "blob", "mode": "100644", "sha": "f" * 40, "size": 1}]
+        self.blobs["f" * 40] = "x"
+        self.assertEqual(self.checkout()[0], 0, ".gitignore is not a .git component")
+
+    def test_a_huge_file_skips_its_line_diff_fast_and_says_so_and_the_deadline_bounds_the_whole(self):
+        self.base_tree = {"big.txt": "x\n" * 3}
+        self.head_tree = {"big.txt": "y\n" * 1000000}
+        started = time.monotonic()
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertIn("diff skipped: too large to compare here (1000000 lines)", (Path(out.strip()) / "pr.diff").read_text())
+        self.run_as("coder", "review", "checkout", "--remove", out.strip())
+        self.base_tree = {"c.txt": "".join("old %d\n" % i for i in range(3900))}   # just under the cap, every line different
+        self.head_tree = {"c.txt": "".join("new %d\n" % i for i in range(3900))}
+        started = time.monotonic()
+        code, out, err = self.checkout()
+        self.assertEqual(code, 0, err)
+        self.assertLess(time.monotonic() - started, 10, "a diff just under the line cap stays fast")
+        self.run_as("coder", "review", "checkout", "--remove", out.strip())
+        with mock.patch.object(self.rc, "DIFF_SECONDS", -1):   # the time budget is spent: every file says so
+            code, out, err = self.checkout()
+            self.assertEqual(code, 0, err)
+            self.assertIn("diff skipped", (Path(out.strip()) / "pr.diff").read_text())
+        self.run_as("coder", "review", "checkout", "--remove", out.strip())
+        with mock.patch.object(self.rc, "DEADLINE_SECONDS", -1):
+            code, out, err = self.checkout()
+            self.assertEqual(code, 2)
+            self.assertIn("time limit", err)
+            self.made_nothing()
+
+    def test_a_directory_that_exists_is_not_overwritten(self):
+        self.assertEqual(self.checkout()[0], 0)
+        code, out, err = self.checkout()
+        self.assertEqual(code, 1)
+        self.assertIn("exists already", err)
+        self.assertEqual(len(os.listdir(self.cwd / ".review")), 1)
+
+    def test_s7_the_panel_brief_tells_reviewers_to_read_the_printed_directory_exactly_once(self):
+        sentence = "tell each reviewer to read the directory it prints"
+        text = (REPO / "skills" / "fleet-review" / "SKILL.md").read_text()
+        self.assertEqual(text.count(sentence), 1)
+
+
 class TestPlanReviewCore(unittest.TestCase):
     """#109 part 2, slice R1: the pure core of the plan review engine (docs/plan-review-engine-design.md). No I/O, no commands."""
 
