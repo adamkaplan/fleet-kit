@@ -106,6 +106,8 @@ The daemon records the `ci` verdict itself about five minutes after CI is green 
 
 ## Starting a named agent in a pane
 
+Launch a new worker or tester only when `memory_pressure` reports a free percentage of at least 40 and the `Swapouts` counter of `vm_stat` is unchanged between two reads 30 seconds apart (swap used is sticky on macOS and is not the test).
+
 **Under the switchboard, use one command and stop reading this section.** If
 `fleet-switchboard` is on your PATH (a message from the switchboard reached you),
 start a worker with
