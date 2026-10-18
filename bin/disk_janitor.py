@@ -343,8 +343,8 @@ def remove_entry(path):
         os.unlink(path)
 
 
-def run(temp_dir, state_dir, now, cfg, apply, audit, uid=None, clock=time.monotonic, busy=None, weekly=False, outcome=None):
-    """Returns (lines, removed, kept). `outcome`, when a list, receives one dict (name, age_days, bytes) for each entry that is removed (or, on a dry run, would be): the daemon's audit summary reads it; it changes nothing else. `audit(name, detail)` is called once for each removal that happened; if it raises, removing STOPS and the line says so.
+def run(temp_dir, state_dir, now, cfg, apply, audit, uid=None, clock=time.monotonic, busy=None, weekly=False, outcome=None, recheck_busy=None):
+    """Returns (lines, removed, kept). `recheck_busy`, when given, is the in-use check for the judgement right before a removal (default: `busy`). `outcome`, when a list, receives one dict (name, age_days, bytes) for each entry that is removed (or, on a dry run, would be): the daemon's audit summary reads it; it changes nothing else. `audit(name, detail)` is called once for each removal that happened; if it raises, removing STOPS and the line says so.
     Right before each removal the entry is judged again from the records as they are then, and removed only if it is still eligible and is the same
     entry (device, inode and newest modification time)."""
     lines, removed, kept = [], 0, 0
@@ -368,7 +368,7 @@ def run(temp_dir, state_dir, now, cfg, apply, audit, uid=None, clock=time.monoto
             removed += 1
             continue
         again_text, again_complete = named_text(state_dir)
-        again = judge(row["path"], again_text, now, cfg, uid, clock, busy)
+        again = judge(row["path"], again_text, now, cfg, uid, clock, recheck_busy or busy)
         if not again_complete or again["action"] != "remove" or again["ident"] != row["ident"] or not safe_dir(temp_dir)[0]:
             lines.append("kept %s: it changed since the scan" % row["name"])
             kept += 1

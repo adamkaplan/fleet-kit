@@ -53969,6 +53969,54 @@ class TestDaemonTempJanitor(Base):
         self.assertTrue(victim.exists())
         self.assertEqual(len(self.events("janitor.error")), 1)
 
+    def test_s12_the_janitors_sweep_state_is_its_own_and_never_the_main_threads(self):
+        engine, source = self.daemon({"daemon_apply": True})
+        inside, leave, seen = threading.Event(), threading.Event(), {}
+
+        def janitor_thread():
+            with sb.worktree_sweep(engine):
+                seen["own"] = engine._wt_sweep
+                inside.set()
+                leave.wait(10)
+            seen["after"] = engine._wt_sweep
+        worker = threading.Thread(target=janitor_thread)
+        worker.start()
+        self.assertTrue(inside.wait(10))
+        try:
+            self.assertFalse(engine._wt_sweep, "the main thread is not in a sweep because another thread is")
+            self.assertTrue(seen["own"])
+            engine._wt_session_index = ({"x": "/elsewhere"}, True)   # the main thread's own state
+        finally:
+            leave.set()
+            worker.join(10)
+        self.assertFalse(seen["after"])
+        self.assertEqual(engine._wt_session_index, ({"x": "/elsewhere"}, True), "the janitor leaving its sweep did not clear the main thread's cache")
+        engine._wt_session_index = None
+        with mock.patch.object(sb.V2Client, "session_list_page", wraps=engine.v2.session_list_page) as listed:   # a main-thread check reads the current list
+            sb.worktree_session_index(engine)
+            sb.worktree_session_index(engine)
+        self.assertEqual(listed.call_count, 2)
+
+    def test_s13_a_session_started_in_an_entry_after_the_scan_keeps_it(self):
+        victim = self.old("old-file-dir", directory=True)
+        engine, source = self.daemon({"daemon_apply": True})
+        engine.discover(self.now)
+        sid = self.world.sessions["coder"]
+        self.world.v2.sessions[sid]["directory"] = str(self.home)
+        real, calls = self.jan.judge, [0]
+
+        def judge(path, *args, **kwargs):
+            calls[0] += 1
+            if calls[0] == 2:   # after the scan judged it, before the removal re-judges it
+                self.world.v2.sessions[sid]["directory"] = str(victim)
+            return real(path, *args, **kwargs)
+        with mock.patch.object(self.jan, "judge", judge):
+            self.go(source)
+        self.assertGreaterEqual(calls[0], 2)
+        self.assertTrue(victim.exists())
+        self.assertEqual(self.events("temp.removed"), [])
+        self.assertIn("kept old-file-dir: it changed since the scan", self.events("janitor.summary")[0]["detail"]["notes"])
+
     def test_s10_no_gh_and_no_network(self):
         self.old("old-file.txt")
         engine, source = self.daemon({"daemon_apply": True})
