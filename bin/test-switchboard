@@ -58643,6 +58643,22 @@ class TestLoadAlert(Base):
     def test_a_pr_with_no_row_a_closed_row_or_another_asks_link_does_not_exempt_the_ask(self):
         self.assertEqual(self.held_world("human", link=False)["stalled"], 1)  # a row and no link to the ask
 
+    def test_unreadable_or_malformed_decision_rows_are_no_held_pull_request(self):
+        path = self.state_dir / "decisions.json"
+        self.assertEqual(self.health.held_prs(str(self.state_dir)), [])                  # no file
+        path.write_text("{not json")
+        self.assertEqual(self.health.held_prs(str(self.state_dir)), [])
+        path.write_text(json.dumps({"decisions": "x"}))
+        self.assertEqual(self.health.held_prs(str(self.state_dir)), [])
+        good = {"kind": "captain", "repo": "acme/widget", "number": 5, "tier": "human", "since": "2026-10-14T10:00:00Z"}
+        path.write_text(json.dumps({"decisions": [dict(good, number=True), dict(good, repo="bad repo!"), dict(good, tier="agent"), dict(good, kind="notice"), "x", dict(good, since="garbage"), good]}))
+        self.assertEqual([(r["number"], r["since"] is None) for r in self.health.held_prs(str(self.state_dir))], [(5, True), (5, False)])
+
+    def test_the_pull_request_links_keep_the_newest_500(self):
+        state = {}
+        self.health.update_pr_links(state, [{"at": n, "repo": "acme/widget", "numbers": [n, 1], "kind": "push"} for n in range(1, 502)], 600)
+        self.assertEqual((len(state["pr_links"]), "acme/widget#1" in state["pr_links"], "acme/widget#501" in state["pr_links"]), (500, False, True))
+
     def test_a_closed_row_does_not_exempt_the_ask(self):
         self.assertEqual(self.held_world("human")["stalled"], 0)
         rows = json.loads((self.state_dir / "decisions.json").read_text())
