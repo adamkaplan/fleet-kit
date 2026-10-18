@@ -136,8 +136,10 @@ The build itself scans the image. `worker/Dockerfile` has a `scan` stage that ru
 the whole filesystem of the finished `worker` stage (skipping only the top-level `proc`, `sys`, `dev` and the script), and the
 `final` stage, the one that is published, depends on it: a hit (exit 1) or a file the scan cannot read (exit 2) fails the build,
 so no image exists to push. The scan runs where the build runs, so a remote `linux/amd64` build reads the layers that
-`docker save` cannot export from an arm64 workstation. The marker is only bind-mounted into `final`, never copied: the shipped
-image holds no scan file.
+`docker save` cannot export from an arm64 workstation. `final` copies a 3-byte marker (`/usr/local/share/cw/scan-ok`, root-owned, mode 0644, never
+executed) from `scan`; that plain `COPY --from` is what makes the registry's legacy builder (`az acr build`) run the scan first,
+because it has no `RUN --mount`. The Dockerfile uses no BuildKit-only syntax, and `test-cloud` fails if one appears. The
+shipped image holds that marker and no scan script.
 
 ```sh
 # the real build: the working directory must be cloud/ (the build context). It fails when the scan finds a secret.

@@ -596,6 +596,13 @@ PATH="$pb/bin:$PATH" "$PUB" --tool crane --staging a.example/x:y --release a.exa
 [ "$r1$r2$r3" = 333 ] && [ "$r4" != 0 ] && ok "publish: a tool outside the list, equal tags, a digest ref and a PATH-only tool are refused" || bad "publish arguments $r1$r2$r3 $r4"
 
 # 4. image scan, only when docker is up
+# 4a. no BuildKit-only syntax in the worker Dockerfile (the registry build, ACR Tasks, uses the legacy builder). Docker-free.
+bk_check() { grep -qE '^#[[:space:]]*syntax[[:space:]]*=' "$1" || grep -vE '^[[:space:]]*#' "$1" | grep -qE -e '--mount|^[[:space:]]*(RUN|COPY)[[:space:]]+<<|--link|--exclude'; }
+if bk_check "$here/worker/Dockerfile"; then bad "worker/Dockerfile uses BuildKit-only syntax"; else ok "Dockerfile: no BuildKit-only syntax"; fi
+for m in 'RUN --mount=type=bind,from=scan,source=/scan-ok,target=/tmp/scan-ok true' 'RUN <<EOF' 'COPY <<EOF /x' '# syntax=docker/dockerfile:1' 'COPY --link a b' 'COPY --exclude=x a b'; do
+  { cat "$here/worker/Dockerfile"; printf '%s\n' "$m"; } > "$tmp/Dockerfile.bk"
+  bk_check "$tmp/Dockerfile.bk" && ok "Dockerfile BuildKit check fires on: ${m%% *} ${m#* }" || bad "BuildKit check missed: $m"
+done
 if [ "${CLOUD_TEST_SKIP_DOCKER:-0}" = 1 ]; then skip docker-build-cases "CLOUD_TEST_SKIP_DOCKER=1 (needs a base-image pull from the network)"
 elif docker info >/dev/null 2>&1; then
   printf 'FROM busybox\nRUN echo "GITHUB_TOKEN=ghp_%s" > /t\n' "$(printf 'b%.0s' $(seq 36))" > "$tmp/Dockerfile"
@@ -650,8 +657,8 @@ elif docker info >/dev/null 2>&1; then
     && ok "build scan: an unreadable directory fails the build (never a pass)" || bad "build scan unreadable rc=$rc"
   out=$(bbuild 'RUN echo hi > /opt/clean.txt' clean); rc=$?
   [ "$rc" = 0 ] && ok "build scan: the clean image builds" || { bad "build scan clean rc=$rc"; echo "$out" | tail -15; }
-  docker run --rm --platform linux/amd64 --entrypoint sh cw-bscan-clean -c 'test ! -e /scan-ok && test ! -e /tmp/scan-ok && test ! -e /scan-secrets.sh && test ! -e /scan-allowlist.txt' \
-    && ok "build scan: the shipped image carries no marker and no scan files" || bad "marker or scan script in the shipped image"
+  docker run --rm --platform linux/amd64 --entrypoint sh cw-bscan-clean -c 'test "$(cat /usr/local/share/cw/scan-ok)" = ok && test ! -e /scan-ok && test ! -e /scan-secrets.sh && test ! -e /scan-allowlist.txt' \
+    && ok "build scan: the shipped image carries only the 3-byte marker and no scan files" || bad "marker missing or scan script in the shipped image"
   docker rmi cw-bscan-clean >/dev/null 2>&1
 else
   [ "${CLOUD_TEST_SKIP_DOCKER:-0}" = 1 ] && skip docker-not-running "CLOUD_TEST_SKIP_DOCKER=1" || bad "docker is required for the image-scan cases (set CLOUD_TEST_SKIP_DOCKER=1 to skip)"
