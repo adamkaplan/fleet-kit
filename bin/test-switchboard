@@ -31264,6 +31264,10 @@ class TestPlanCheckRules(unittest.TestCase):
         got = self.check()
         self.assertEqual(got["result"], "pass")
         self.assertEqual(self.warn_codes(GOOD_PLAN), [("S2", "live-no-claim")])
+        message = [w["message"] for w in self.check(GOOD_PLAN)["warnings"] if w["code"] == "live-no-claim"][0]
+        self.assertIn("`claim: epic`", message)
+        self.assertIn("`claim: pr`", message)
+        self.assertNotIn("is claimed by", message)
         tester = self.edit("    proof: live\n", "    proof: measure\n")
         self.assertEqual(self.warn_codes(tester), [("S2", "live-no-claim")], "evaluator tester alone warns")
         live = self.edit("    evaluator: tester", "    evaluator: owner")

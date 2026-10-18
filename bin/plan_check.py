@@ -708,8 +708,7 @@ def validate(scenarios, clauses, text=""):
         if claim not in CLAIMS:
             bad(ident, "bad-claim", "claim %r must be pr or epic" % claim)
         if (proof == "live" or evaluator == "tester") and not _normal(scenario.get("claim", "")):
-            warnings.append({"id": ident, "code": "live-no-claim", "message": "%s: a %s scenario with no `claim` line is claimed by the pull request: "
-                             "add `claim: epic` if it needs the installed system, or `claim: pr` to say it is meant" % (ident, "live" if proof == "live" else "tester")})
+            warnings.append({"id": ident, "code": "live-no-claim", "message": "%s: a %s scenario has no `claim` line: write `claim: epic` if it needs the installed system, or `claim: pr` if the pull request proves it" % (ident, "live" if proof == "live" else "tester")})
         if _normal(scenario.get("pass", "")):
             problem = pass_rule_problem(scenario["pass"])
             if problem:
@@ -900,7 +899,7 @@ EXPLAIN = {
     "bad-proof": ("`proof` is one of " + "|".join(PROOFS), "pick the kind of proof"),
     "bad-evaluator": ("`evaluator` is one of " + "|".join(EVALUATORS), "pick who records the proof"),
     "evaluator-mismatch": ("the evaluator must be able to record the proof: test needs ci, screenshot needs reviewer or owner, live and measure need tester or owner", "change the evaluator or the proof"),
-    "live-no-claim": ("a live or tester scenario with no `claim` line is claimed by its pull request (a warning only)", "add `claim: epic` (needs the installed system) or `claim: pr`"),
+    "live-no-claim": ("a live or tester scenario should say who claims it with a `claim` line (a warning only)", "add `claim: epic` (needs the installed system) or `claim: pr`"),
     "bad-claim": ("`claim` is `pr` (default) or `epic`", "remove it or use one of the two"),
     "vague-pass": ("`pass` must be an observable a stranger can decide: a status or exit code, a count or threshold, a quoted value, or a named comparison", "for example `exit status is 0`, `exactly 3 items`, `shows \"Ready\"`"),
     "no-discriminator": ("`discriminates` names the specific wrong build that would FAIL this scenario", "write `a build that <does X> <observable wrong outcome>`"),
