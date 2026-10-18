@@ -8520,6 +8520,7 @@ class WorkerFacts:
             if engine is not None:
                 read_mark(engine, "requests", False, "no worker source was read", engine.now())   # #805: an earlier whole mark is not this pass's
             return []
+        read_mark(engine, "requests", False, "the worker read did not finish", engine.now())   # #805: never inherited: whole only at the end of a read that completed
         horizon = worker_horizon(engine.config, engine.now())
         facts, skipped = [], []
         for observation in sorted(discovery.agents.values(), key=lambda o: o.name):
@@ -10388,13 +10389,16 @@ def decisions_from_notices(engine, now):
     keeps its last facts, marked stale, and is dropped (and logged) after PR_NOTICE_UNREADABLE_SECONDS."""
     engine.notice_effects = {"drop": set(), "unreadable": {}, "observed": {}, "left": set()}
     engine.notice_unread = 0   # #796: how many noticed PRs this pass has no facts for (skipped by the time budget, or unreadable): the load alert waits while it is above 0
+    read_mark(engine, "notices", False, "the notice read did not finish", now)   # #805: never inherited: whole only at the end of a read that completed
     state_dir = getattr(engine, "state_dir", None)
     if state_dir is None:
+        read_mark(engine, "notices", True, "", now)
         return [], []
     try:
         items = read_pr_notices(state_dir)
     except NoticeError as err:
         engine.notice_unread = 1   # the notices themselves could not be read: nothing is known about them
+        read_mark(engine, "notices", False, "the notices could not be read", now)
         return [], [str(err)]
     hold = engine.config.get("pr_notice_hold_minutes") or 0
     escalated = read_escalated(state_dir)
@@ -10474,6 +10478,7 @@ def decisions_from_notices(engine, now):
             engine._note("notice.dropped", key, {"reason": "unreadable for %d minutes of observed time" % (PR_NOTICE_UNREADABLE_SECONDS // 60),
                                                  "error": held["error"]})
             dropped.add(key)
+    read_mark(engine, "notices", not engine.notice_unread, "%d notices unread" % engine.notice_unread, now)
     return [entry for _, entry, key in sorted(entries, key=lambda row: row[0]) if key not in dropped], []
 
 
@@ -13224,11 +13229,17 @@ def whole_skipped(engine, consumer, name):
     return True
 
 
+def mark_decisions_read(engine, errors, now):
+    """The decision list is whole only with no error and a notice read that finished whole: a noticed PR the reader has no facts for
+    derives no held-PR row, so its absence is no evidence it left. Never inherited: an input no read marked, or whose read raised, is not whole."""
+    notices, notices_why = whole(engine, "notices")
+    why = "the decision list had errors" if errors else ("" if notices else notices_why)
+    read_mark(engine, "decisions", not errors and notices, why, now)
+
+
 def triage_mark_reads(engine, state, repos, errors, now):
     """The inputs the triage rules judge, marked from the reads this pass already made (no new read)."""
-    unread = getattr(engine, "notice_unread", 0)   # noticed PRs the reader has no facts for: their held-PR rows are not derived
-    why = "the decision list had errors" if errors else ("%d notices unread" % unread if unread else "")
-    read_mark(engine, "decisions", not errors and not unread, why, now)
+    mark_decisions_read(engine, errors, now)
     for repo in repos:
         unit = state.units.get((repo, "issues"))
         if unit is None:

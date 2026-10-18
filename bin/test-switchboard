@@ -25066,6 +25066,8 @@ class TestTriageT5Rollup(Base):
             shown.extend(ref for rule, ref in due if rule in ("T5", "T6"))
             return real(state, due, *a, **k)
         with mock.patch.object(sb, "triage_queue_fact", spy):
+            unread = getattr(self.engine, "notice_unread", 0)                       # what the notice reader would have marked
+            sb.read_mark(self.engine, "notices", not unread, "%d notices unread" % unread, self.world.clock.now())
             sb.triage_pass(self.engine, decisions, self.world.clock.now(), errors)
         lines = [v[0] for k, v in self.engine.triage.facts.items() if k.startswith("triage.rollup") and k not in seen_before]
         return shown, lines
@@ -40759,6 +40761,42 @@ class TestRequestTiers(TierWorld):
         with mock.patch.object(sb, "fault", lambda name: name == "no-worker-source"):
             self.pass_()
         self.assertFalse(sb.whole(engine, "requests")[0])                            # not a stale whole mark from before
+
+    def test_an_exception_of_any_class_in_the_worker_read_leaves_the_requests_not_whole_and_the_escalation_kept(self):
+        ask = self.block_(timed=True)
+        key = "%s:%s" % (self.world.sessions["api-coder"], ask["id"])
+        sb.mark_escalated(self.world.state, key, self.world.clock.now())
+        self.pass_()
+        self.assertEqual(sb.whole(self.world.engine, "requests"), (True, ""))
+        self.world.v2.answer_permissions(self.world.sessions["api-coder"])           # the request is gone
+        for error in (RuntimeError("boom"), KeyError("k"), ValueError("v")):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(sb.WorkerFacts, "blocked", side_effect=error):
+                    try:
+                        self.pass_()
+                    except Exception:
+                        pass                                                         # the engine may or may not absorb it: the mark must hold either way
+                self.assertFalse(sb.whole(self.world.engine, "requests")[0])         # never the previous pass's value
+                self.assertIn(key, sb.read_escalated(self.world.state))
+        self.pass_()
+        self.assertTrue(sb.whole(self.world.engine, "requests")[0])                  # the next clean read
+        self.assertEqual(sb.read_escalated(self.world.state), {})
+
+    def test_a_notice_read_that_raises_leaves_the_decision_list_not_whole(self):
+        engine = self.world.engine
+        self.pass_()
+        self.assertTrue(sb.whole(engine, "notices")[0])
+        with mock.patch.object(sb, "read_pr_notices", side_effect=RuntimeError("boom")):
+            try:
+                sb.decisions_from_notices(engine, engine.now())
+            except RuntimeError:
+                pass
+        self.assertFalse(sb.whole(engine, "notices")[0])
+        sb.mark_decisions_read(engine, [], engine.now())
+        self.assertFalse(sb.whole(engine, "decisions")[0])
+        sb.decisions_from_notices(engine, engine.now())
+        sb.mark_decisions_read(engine, [], engine.now())
+        self.assertTrue(sb.whole(engine, "decisions")[0])
 
     def test_the_audit_log_is_never_read_by_the_derivation(self):
         self.assertNotIn("audit", class_source_fn("decisions_from_requests"))
