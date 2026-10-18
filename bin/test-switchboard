@@ -15129,7 +15129,9 @@ class TestLaunchMemoryTest(unittest.TestCase):
             self.assertNotRegex(f.read_text(), r"(?i)swap[^.\n]{0,40}\d+\s*(%|percent)", f.name)
 
     def test_the_sentence_names_roles_never_agents_or_people(self):
-        self.assertNotRegex(self.SENTENCE, r"(?i)\b(coder\d|cos\b|fleet-upkeep|adam\b)")
+        skill = (REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text()
+        sentence = skill[skill.index("Launch a new worker or tester only when"):].split("\n", 1)[0]
+        self.assertNotRegex(sentence, r"(?i)\b(coder\d|cos\b|fleet-upkeep|adam\b)")
 
 
 class TestPlanningSkill(unittest.TestCase):
