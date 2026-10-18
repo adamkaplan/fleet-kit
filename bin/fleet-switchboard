@@ -2856,6 +2856,95 @@ class DockerReapFacts:
             engine._note("docker.reap_error", None, {"error": _plain("%s: %s" % (type(err).__name__, err), 160)})
 
 
+TEMP_JANITOR_FILE = "temp-janitor-daemon.json"
+TEMP_JANITOR_INTERVAL = 6 * 86400   # the weekly gate: never twice within 6 days
+TEMP_JANITOR_NAMES = 200            # names carried by one audit line (the count says the rest)
+
+
+class TempJanitorFacts:
+    """The weekly temp janitor, run by the daemon itself (ask #762), the way `DockerReapFacts` runs the Docker reaper. The call is told apart from an agent's
+    by the PATH it takes, never by anything a caller passes: this class runs only in the daemon's own process, only when that process set
+    `engine.temp_janitor_runner` (a test engine and every command-line process has none), and it calls `disk_janitor.run` directly, never `cmd_disk_janitor`
+    (whose refusal of an agent stays). It reads `temp_janitor.daemon_apply` (default false: a dry run, audited as `janitor.would_remove`); the command line never reads it.
+    The selection rule is the janitor's own, unchanged. Once `TEMP_JANITOR_INTERVAL` has passed since the last run (kept in `temp-janitor-daemon.json`, written BEFORE
+    the run, so a crash or a restart does not repeat it); an unreadable stamp means do not run. A background thread; returns no facts."""
+
+    __name__ = "temp_janitor_facts"
+
+    def __init__(self):
+        self.engine, self.thread, self.noted = None, None, False
+
+    def bind(self, engine):
+        self.engine = engine
+
+    def _last(self, state_dir):
+        """(ok, time or None): a missing file is (True, None); a file that cannot be read in full is (False, None): the doubt keeps everything."""
+        try:
+            text = (Path(state_dir) / TEMP_JANITOR_FILE).read_text()[:1024]
+        except FileNotFoundError:
+            return True, None
+        except OSError:
+            return False, None
+        try:
+            return True, float(json.loads(text)["at"])
+        except (ValueError, KeyError, TypeError):
+            return False, None
+
+    def __call__(self):
+        engine = self.engine
+        runner = getattr(engine, "temp_janitor_runner", None) if engine is not None else None
+        if runner is None or engine.state_dir is None:
+            return []
+        cfg = engine.config.get("temp_janitor") or {}
+        if cfg.get("enabled", True) is False:
+            return []
+        if self.thread is not None and self.thread.is_alive():
+            return []
+        ok, last = self._last(engine.state_dir)
+        if not ok:
+            if not self.noted:
+                self.noted = True
+                engine._note("janitor.state_unreadable", None, {"file": TEMP_JANITOR_FILE, "kept": "nothing was run this pass"})
+            return []
+        now = engine.now()
+        if last is not None and not (now - last >= TEMP_JANITOR_INTERVAL):
+            return []
+        try:   # the stamp first: a run that dies half way is not repeated until the gate opens again
+            path = Path(engine.state_dir) / TEMP_JANITOR_FILE
+            temp = path.with_name("%s.%d.tmp" % (TEMP_JANITOR_FILE, os.getpid()))
+            with open(str(temp), "w") as handle:
+                handle.write(json.dumps({"at": now}))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(str(temp), str(path))
+        except OSError:
+            return []
+        self.thread = threading.Thread(target=self._run, args=(engine, runner, now), name="temp-janitor", daemon=True)
+        self.thread.start()
+        return []
+
+    def _run(self, engine, runner, now):
+        try:
+            janitor = load_disk_janitor()
+            cfg = janitor.settings(engine.config.get("temp_janitor"))
+            apply = cfg["daemon_apply"] is True
+            temp = Path(cfg["dir"]) if cfg.get("dir") else janitor.default_dir()
+            outcome = []
+            started = time.monotonic()
+            with worktree_sweep(engine):
+                lines, removed, kept = janitor.run(
+                    temp, engine.state_dir, now, cfg, apply,
+                    lambda name, detail: engine.audit.append(engine.actor, "temp.removed", _plain(name, 120), detail),
+                    busy=janitor_busy_function(engine, runner, janitor), weekly=True, outcome=outcome)
+            used = round(time.monotonic() - started, 1)
+            notes = [_plain(l, 200) for l in lines if not l.startswith(("removed ", "would remove "))][:20]
+            detail = {"count": len(outcome), "bytes": sum(o["bytes"] for o in outcome), "names": [_plain(o["name"], 120) for o in outcome[:TEMP_JANITOR_NAMES]],
+                      "budget_seconds": cfg["weekly_scan_seconds"], "used_seconds": used, "kept": kept, "notes": notes}
+            engine.audit.append(engine.actor, "janitor.summary" if apply else "janitor.would_remove", "temp", detail)
+        except Exception as err:   # a janitor never stops the daemon
+            engine._note("janitor.error", None, {"error": _plain("%s: %s" % (type(err).__name__, err), 160)})
+
+
 class Fact:
     """Something one fleet agent should be told.
 
@@ -2965,7 +3054,7 @@ def fact_sources(state_dir):
     the same rule, and stores nothing.
     """
     return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir),
-            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), JobFacts(), PaneFacts(), HeadlessRestartFacts(), DiskFacts(), CpuFacts(), SpotlightFacts(), DockerReapFacts()]
+            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), JobFacts(), PaneFacts(), HeadlessRestartFacts(), DiskFacts(), CpuFacts(), SpotlightFacts(), DockerReapFacts(), TempJanitorFacts()]
 
 
 # --------------------------------------------------------- observing the fleet
@@ -16216,6 +16305,7 @@ def cmd_run(args, runner, now, wait):
     if args.standby:  # PR 16: the service waits for the lock instead of exiting and being restarted
         while run_lock_held(state):
             time.sleep(STANDBY_SECONDS)
+    engine.temp_janitor_runner = runner   # the weekly temp janitor runs only in the real daemon, by this attribute and by nothing a caller passes (#762)
     engine.docker_reap_runner = runner   # the daily reap of expired labelled docker objects runs only in the real daemon
     hub = attach_github(engine, config, state, runner, now)
     start_event_feed(engine, config, now)

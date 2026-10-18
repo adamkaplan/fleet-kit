@@ -2457,7 +2457,7 @@ class TestFacts(Base):
     def test_the_registration_point_lists_the_lab_source(self):
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts"])
 
 
 # ---------------------------------------------------------------- observing
@@ -9790,7 +9790,7 @@ class TestFrictionWake(FrictionBase):
         self.assertNotIn("friction_wake", sb.DEFAULTS)
         self.assertEqual([s.__name__ for s in sb.fact_sources(self.home)],
                          ["lab_facts", "worker_facts", "reminder_facts", "report_rider_facts", "foreground_facts",
-                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts"])
+                          "orders_facts", "sweep_facts", "triage_facts", "job_facts", "pane_facts", "headless_restart_facts", "disk_facts", "cpu_facts", "spotlight_facts", "docker_reap_facts", "temp_janitor_facts"])
         self.assertNotIn("friction_wake", sb.validate_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}))
         self.assertEqual(sb.FRICTION_DEFAULTS, {"enabled": False, "hour": 9, "to": "cos", "cos_to": "improver", "text": None})
         self.make("off")
@@ -53750,6 +53750,227 @@ class TestDockerReaper(Base):
         self.assertIsNone(source.thread)
 
 
+class TestDaemonTempJanitor(Base):
+    """Ask #762: the daemon applies the weekly temp janitor itself (the Docker reaper's path), on the janitor's own rule, dry until `daemon_apply` is on.
+    Fixture directories and fakes only: the real temp directory is never read or written."""
+
+    def setUp(self):
+        super().setUp()
+        self.world = World(self, agents=("coder",), config={})
+        self.jan = sb.load_disk_janitor()
+        self.temp = self.home / "jtmp"
+        self.temp.mkdir()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "temp_janitor": {"dir": str(self.temp), "keep": ["keepme-*"]}})
+        self.world.clock.t = time.time() + 10 * 86400
+        self.now = self.world.clock.now()
+        (self.world.state / "state-marker.json").write_text("{}")
+        self.calls = []
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+
+    def routed(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        if argv[0] == "lsof":
+            return subprocess.CompletedProcess(argv, 0, "p1\nfcwd\nn/\n", "")
+        return self.world.route(argv, **kwargs)
+
+    def old(self, name, days=10, directory=False):
+        path = self.temp / name
+        if directory:
+            path.mkdir()
+            (path / "inner.txt").write_text("x")
+        else:
+            path.write_text("x")
+        stamp = self.now - days * 86400
+        for p in ([path / "inner.txt"] if directory else []) + [path]:
+            os.utime(str(p), (stamp, stamp))
+        return path
+
+    def fixture(self):
+        gone = self.old("scratch-old-unnamed.log")
+        named = self.old("named-by-the-records.txt")
+        (self.world.state / "reminders.json").write_text(json.dumps({"r": "see named-by-the-records.txt"}))
+        marked = self.old("marked-dir", directory=True)
+        (marked / ".fleet-keep").write_text("")
+        link = self.temp / "a-link-to-elsewhere"
+        elsewhere = self.home / "elsewhere"
+        elsewhere.mkdir()
+        os.symlink(str(elsewhere), str(link))
+        os.utime(str(link), (self.now - 10 * 86400,) * 2, follow_symlinks=False)
+        return gone, [named, marked, self.old("recent.txt", days=1), elsewhere]
+
+    def daemon(self, temp_janitor=None, runner=True):
+        engine = self.world.engine
+        cfg = {"dir": str(self.temp), "keep": ["keepme-*"]}
+        cfg.update(temp_janitor or {})
+        engine.config = dict(engine.config, temp_janitor=cfg)
+        engine.temp_janitor_runner = self.routed if runner else None
+        engine.now = lambda: self.now
+        source = [s for s in engine.sources if getattr(s, "__name__", "") == "temp_janitor_facts"][0]
+        return engine, source
+
+    def go(self, source):
+        source()
+        if source.thread:
+            source.thread.join(20)
+
+    def events(self, name):
+        return [e for e in self.world.audit() if e["event"] == name]
+
+    def test_s1_s2_the_daemon_applies_only_the_dry_runs_selection(self):
+        gone, kept = self.fixture()
+        engine, source = self.daemon({"daemon_apply": True})
+        before = self.jan.scan(self.temp, self.world.state, self.now, self.jan.settings({"keep": ["keepme-*"]}), busy=lambda p: None)
+        listed = sorted(r["name"] for r in before if r["action"] == "remove")
+        self.assertEqual(listed, ["a-link-to-elsewhere", "scratch-old-unnamed.log"])
+        self.go(source)
+        self.assertFalse(gone.exists())
+        self.assertFalse(os.path.lexists(str(self.temp / "a-link-to-elsewhere")), "a link is removed as a link")
+        for path in kept:
+            self.assertTrue(path.exists(), path.name)
+        self.assertEqual(sorted(e["subject"] for e in self.events("temp.removed")), listed, "the names the daemon removed are the dry run's")
+
+    def test_s5_one_summary_with_count_bytes_names_only_and_the_budget(self):
+        self.old("a-old-one.txt")
+        self.old("b-old-two.txt")
+        engine, source = self.daemon({"daemon_apply": True, "weekly_scan_seconds": 300})
+        self.go(source)
+        self.assertEqual(len(self.events("temp.removed")), 2)
+        summary = self.events("janitor.summary")
+        self.assertEqual(len(summary), 1)
+        detail = summary[0]["detail"]
+        self.assertEqual((detail["count"], detail["bytes"], detail["names"], detail["budget_seconds"]), (2, 2, ["a-old-one.txt", "b-old-two.txt"], 300))
+        self.assertIn("used_seconds", detail)
+        self.assertNotIn(str(self.temp), json.dumps(detail["names"]))
+
+    def test_s7_the_default_is_a_dry_run_audited_with_the_list_and_nothing_moves(self):
+        gone, kept = self.fixture()
+        engine, source = self.daemon()
+        self.go(source)
+        self.assertTrue(gone.exists())
+        self.assertEqual(self.events("temp.removed"), [])
+        self.assertEqual(self.events("janitor.summary"), [])
+        dry = self.events("janitor.would_remove")
+        self.assertEqual(len(dry), 1)
+        self.assertEqual(dry[0]["detail"]["names"], ["a-link-to-elsewhere", "scratch-old-unnamed.log"])
+        self.assertFalse((self.world.state / self.jan.CURSOR_FILE).exists(), "a dry run does not move the cursor")
+
+    def test_s8_the_switch_is_a_boolean(self):
+        with self.assertRaises(ValueError):
+            self.jan.validate({"daemon_apply": "yes"})
+        self.assertIsNone(self.jan.validate({"daemon_apply": True}))
+        self.assertIs(self.jan.settings(None)["daemon_apply"], False)
+
+    def test_s3_the_command_line_still_refuses_an_agent_and_an_unknown_caller(self):
+        victim = self.old("old-file.txt")
+        engine, source = self.daemon({"daemon_apply": True})   # the switch does not open the command line
+        for who in ("coder", None):
+            if who:
+                os.environ["HERDR_PANE_ID"] = self.world.panes[who]
+            else:
+                os.environ["HERDR_PANE_ID"] = "p_unknown_pane"
+            with captured() as (out, err):
+                code = sb.main(["disk", "janitor", "--apply"], runner=self.routed, now=self.world.clock.now, socket_call=self.world.herdr.socket)
+            self.assertEqual(code, 1)
+            self.assertIn("only the operator or the Chief of Staff may --apply the temp janitor", err.getvalue())
+            self.assertTrue(victim.exists())
+
+    def test_s4_an_engine_that_is_not_the_daemon_never_runs_whatever_the_environment_holds(self):
+        victim = self.old("old-file.txt")
+        engine, source = self.daemon({"daemon_apply": True}, runner=False)
+        with mock.patch.dict(os.environ, {"FLEET_TEMP_JANITOR_APPLY": "1", "FLEET_DAEMON": "1", "TEMP_JANITOR_DAEMON_APPLY": "true"}):
+            self.go(source)
+        self.assertTrue(victim.exists())
+        self.assertIsNone(source.thread)
+        self.assertEqual([e for e in self.world.audit() if e["event"].startswith(("temp.", "janitor."))], [])
+        self.assertEqual(self.calls, [])
+
+    def test_the_kill_switch_runs_nothing(self):
+        victim = self.old("old-file.txt")
+        engine, source = self.daemon({"daemon_apply": True, "enabled": False})
+        self.go(source)
+        self.assertTrue(victim.exists())
+        self.assertIsNone(source.thread)
+
+    def test_s6_every_doubt_keeps_the_entry_and_says_so(self):
+        # an unreadable state file: the janitor judges nothing
+        victim = self.old("old-file.txt")
+        (self.world.state / "broken.json").write_text("x")
+        os.chmod(str(self.world.state / "broken.json"), 0)
+        self.addCleanup(os.chmod, str(self.world.state / "broken.json"), 0o600)
+        engine, source = self.daemon({"daemon_apply": True})
+        self.go(source)
+        self.assertTrue(victim.exists())
+        self.assertEqual(self.events("temp.removed"), [])
+        self.assertTrue(any("not be read" in n or "not judged" in n or "nothing was judged" in n for n in self.events("janitor.summary")[0]["detail"]["notes"]))
+
+    def test_s6_a_scan_over_the_budget_and_an_entry_changed_after_the_scan_are_kept(self):
+        a, b = self.old("a-old.txt"), self.old("b-old.txt")
+        ticks = [0.0]
+
+        def clock():
+            ticks[0] += 100.0
+            return ticks[0]
+        real_run = self.jan.run
+        engine, source = self.daemon({"daemon_apply": True, "weekly_scan_seconds": 150})
+        with mock.patch.object(self.jan, "run", lambda *a_, **k: real_run(*a_, clock=clock, **k)):
+            self.go(source)
+        self.assertTrue(a.exists() or b.exists(), "an entry the budget did not reach is never removed")
+        self.assertTrue(any("not judged" in n for n in self.events("janitor.summary")[0]["detail"]["notes"]))
+        # changed between the scan and the removal: the second judgement of the same entry sees a newer file
+        for path in self.temp.iterdir():
+            path.unlink()
+        c = self.old("c-old.txt")
+        real, seen = self.jan.judge, [0]
+
+        def judge(path, *args, **kwargs):
+            seen[0] += 1
+            if seen[0] == 2:
+                os.utime(str(c), (self.now, self.now))
+            return real(path, *args, **kwargs)
+        (self.world.state / sb.TEMP_JANITOR_FILE).unlink()
+        before = len(self.events("temp.removed"))
+        engine, source = self.daemon({"daemon_apply": True})
+        with mock.patch.object(self.jan, "judge", judge):
+            self.go(source)
+        self.assertGreaterEqual(seen[0], 2)
+        self.assertTrue(c.exists())
+        self.assertEqual(len(self.events("temp.removed")), before)
+
+    def test_s9_the_weekly_gate(self):
+        victim = self.old("old-file.txt")
+        stamp = self.world.state / sb.TEMP_JANITOR_FILE
+        engine, source = self.daemon({"daemon_apply": False})
+        stamp.write_text(json.dumps({"at": self.now - 2 * 86400}))
+        self.go(source)
+        self.assertEqual(self.events("janitor.would_remove"), [], "2 days ago: not yet")
+        stamp.write_text(json.dumps({"at": self.now - 6 * 86400 - 60}))
+        self.go(source)
+        self.assertEqual(len(self.events("janitor.would_remove")), 1)
+        self.assertEqual(json.loads(stamp.read_text())["at"], self.now)
+        self.go(source)
+        self.assertEqual(len(self.events("janitor.would_remove")), 1, "never twice within 6 days")
+        stamp.write_text("{garbage")
+        engine.now = lambda: self.now + 30 * 86400
+        self.go(source)
+        self.assertEqual(len(self.events("janitor.would_remove")), 1, "a stamp that cannot be read means do not run")
+        self.assertEqual(len(self.events("janitor.state_unreadable")), 1)
+        self.assertTrue(victim.exists())
+
+    def test_s10_no_gh_and_no_network(self):
+        self.old("old-file.txt")
+        engine, source = self.daemon({"daemon_apply": True})
+        self.go(source)
+        self.assertTrue(self.calls)
+        for argv in self.calls:
+            self.assertNotIn(os.path.basename(argv[0]), ("gh", "curl", "git", "ssh"))
+            self.assertNotIn("api", argv[:2] if os.path.basename(argv[0]) == "gh" else [])
+
+    def test_s11_the_docs_name_the_redundant_half_and_the_plist_example_is_unchanged(self):
+        text = (Path(sb.__file__).resolve().parent.parent / "docs" / "switchboard.md").read_text()
+        self.assertIn("the janitor half of the launchd job is redundant", text)
+        self.assertIn("disk prune; /home/user/.local/bin/fleet-switchboard disk janitor --apply --weekly</string>", text)
+
+
 class TestComposeTrap(Base):
     """`tools/fleet-compose-trap.sh`: the compose project is brought down WITH its volumes once, on a normal exit and on an interrupt."""
 
@@ -59869,7 +60090,7 @@ class TestSlice3Modules(Base):
 
     OLD = [   # what validate_config said before the move (recorded from the previous program): the error text is the contract
         ("temp_janitor", {"days": 0}, "config: temp_janitor.days must be a whole number from 1 to 365, got 0"),
-        ("temp_janitor", "x", "config: 'temp_janitor' must be an object with only enabled, days, keep, dir, scan_seconds and weekly_scan_seconds, got 'x'"),
+        ("temp_janitor", "x", "config: 'temp_janitor' must be an object with only enabled, days, keep, dir, scan_seconds, weekly_scan_seconds and daemon_apply, got 'x'"),
         ("chat_clear", {"live": "y"}, 'config: \'chat_clear\' must be {"enabled": true|false, "live": true|false}, got {\'live\': \'y\'}'),
         ("chat_clear", [1], 'config: \'chat_clear\' must be {"enabled": true|false, "live": true|false}, got [1]'),
         ("impact_floor", {"enabled": "y"}, "config: 'impact_floor.enabled' must be true or false"),
