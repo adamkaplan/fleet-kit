@@ -4055,6 +4055,66 @@ class TestLaunch(Base):
             with self.subTest(charter=bad), self.assertRaises(sb.LaunchError):
                 self.launch(name="orch", role="orchestrator", charter=bad)
 
+    # --- #767: each launched agent has its own private TMPDIR
+    def wrapper_world(self):
+        """Panes 'run through the wrapper': the temp root is a directory of this test (the fake v2 checks the program path, so the config is not changed)."""
+        root = self.home / "profile-tmp"
+        patch = mock.patch.object(sb, "agent_tmp_root", lambda config: root)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return root
+
+    def test_s1_two_agents_on_one_profile_get_two_private_directories(self):
+        root = self.wrapper_world()
+        first, second = self.launch(name="coder"), self.launch(name="coder2")
+        seen = []
+        for done, name in ((first, "coder"), (second, "coder2")):
+            env = [c[1]["root"]["env"] for c in self.world.herdr.socket_calls if c[1]["root"]["label"] == name][0]
+            seen.append(env["FLEET_AGENT_TMPDIR"])
+        self.assertEqual(seen, [str(root / "coder"), str(root / "coder2")])
+        self.assertNotEqual(seen[0], seen[1])
+        for path in seen:
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o700)
+
+    def test_s2_a_directory_that_cannot_be_made_fails_the_launch_and_starts_nothing(self):
+        root = self.wrapper_world()
+        root.write_text("a file where the temp root should be")   # mkdir under it fails
+        before = set(self.world.v2.sessions)
+        with self.assertRaises(sb.LaunchError) as caught:
+            self.launch()
+        self.assertIn(str(root / "coder"), str(caught.exception))
+        self.assertEqual(self.world.herdr.socket_calls, [])
+        self.assertEqual(set(self.world.v2.sessions), before)
+
+    def test_the_launch_environment_is_otherwise_unchanged(self):
+        self.wrapper_world()
+        self.launch()
+        env = dict(self.world.herdr.socket_calls[0][1]["root"]["env"])
+        del env["FLEET_AGENT_TMPDIR"]
+        self.assertEqual(env, {"XDG_CONFIG_HOME": "/lab/config", "FLEET_SWITCHBOARD_LAB_PANE": "1", "FLEET_SWITCHBOARD_ROLE": "coder", "FLEET_SWITCHBOARD_OWN_GH": ""})
+
+    def test_retire_removes_an_empty_private_directory_and_keeps_one_with_files(self):
+        root = self.wrapper_world()
+        self.launch(name="coder")
+        self.launch(name="coder2")
+        (root / "coder2" / "body.md").write_text("x")
+        self.assertEqual(sb.reclaim_agent_tmp(self.engine, "coder"), ["%s: removed (empty)" % (root / "coder")])
+        self.assertFalse((root / "coder").exists())
+        line = sb.reclaim_agent_tmp(self.engine, "coder2")[0]
+        self.assertIn("kept (1 file(s)", line)
+        self.assertTrue((root / "coder2" / "body.md").exists())
+
+    def test_the_temp_root_is_the_profiles_only_when_panes_run_through_the_wrapper(self):
+        data = self.home / "xdg-data"
+        with mock.patch.dict(os.environ, {"XDG_DATA_HOME": str(data)}):
+            wrapper = str(data / sb.PROG / "bin" / sb.WRAPPER_NAME)
+            self.assertEqual(sb.agent_tmp_root({"opencode": wrapper}), data / sb.PROG / "profile" / "tmp")
+            self.assertIsNone(sb.agent_tmp_root({"opencode": "/some/other/opencode"}))
+
+    def test_the_wrapper_takes_its_agents_directory(self):
+        self.assertIn('export TMPDIR="${{FLEET_AGENT_TMPDIR:-$PROFILE/tmp}}"', sb.PRIVATE_WRAPPER_TEXT)
+        self.assertIn('export TMPDIR="${FLEET_AGENT_TMPDIR:-$PROFILE/tmp}"', sb.PRIVATE_WRAPPER_TEXT.format(**{k: "x" for k in ("profile", "gh_config", "gh", "gh_user_flag", "fleet_bin", "state", "shims", "kit_bin", "key_pattern", "pane_env", "v2")}))
+
     def test_nothing_is_typed_and_focus_is_never_asked_for(self):
         self.launch()
         self.assertEqual(self.world.herdr.typing_attempts, [])
@@ -17745,6 +17805,67 @@ class TestGhShim(Base):
         link = self.home / ".local" / "bin"
         link.mkdir(parents=True, exist_ok=True)
         (link / "fleet-switchboard").symlink_to(self.home / "gone" if dangling else (target or self.who))
+
+    # --- #767: a body file directly in a shared temp directory is warned about, never refused
+    def shim_warnings(self, *args, env=None):
+        done, seen = self.run_shim(*args, env=env)
+        return done, seen, [l for l in done.stderr.splitlines() if "shared temp directory" in l]
+
+    def test_s3_a_body_file_in_a_shared_temp_directory_warns_once_and_runs_unchanged(self):
+        root = self.home / "profile-tmp"
+        env = {"FLEET_AGENT_TMPDIR": str(root / "coder")}
+        for flag, path in (("--body-file", "/tmp/x.md"), ("-F", "/private/tmp/y.md"), ("--body-file", str(root / "z.md"))):
+            with self.subTest(path=path):
+                done, seen, lines = self.shim_warnings("issue", "comment", "2", flag, path, env=env)
+                self.assertEqual((done.returncode, len(lines)), (0, 1))
+                self.assertIn("$TMPDIR", lines[0])
+                self.assertEqual(seen["argv"][:3], ["issue", "comment", "2"])
+        done, seen, lines = self.shim_warnings("pr", "create", "--body-file=/tmp/a.md", env=env)
+        self.assertEqual(len(lines), 1)
+        done, seen, lines = self.shim_warnings("pr", "create", "-F/tmp/a.md", env=env)
+        self.assertEqual(len(lines), 1)
+        done, seen, lines = self.shim_warnings("issue", "comment", "2", "--body-file", "/tmp/../tmp/q.md", env=env)
+        self.assertEqual(len(lines), 1)
+        done, seen, lines = self.shim_warnings("issue", "comment", "2", "--body-file", "/tmp/sub/../x.md", env=env)
+        self.assertEqual(len(lines), 1)   # folded lexically to /tmp/x.md
+
+    def test_s4_an_own_directory_a_mktemp_subdirectory_and_a_relative_path_give_no_warning(self):
+        root = self.home / "profile-tmp"
+        env = {"FLEET_AGENT_TMPDIR": str(root / "coder")}
+        for path in (str(root / "coder" / "x.md"), "/tmp/tmp.AbC123/x.md", "body.md", "./body.md", "/tmp/sub/../tmp.d/x.md"):
+            with self.subTest(path=path):
+                done, seen, lines = self.shim_warnings("issue", "comment", "2", "--body-file", path, env=env)
+                self.assertEqual((done.returncode, lines), (0, []))
+
+    def test_s5_the_path_is_never_opened_stat_ed_or_read(self):
+        spec = importlib.util.spec_from_loader("gh_shim_767", importlib.machinery.SourceFileLoader("gh_shim_767", str(SHIM)))
+        shim = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(shim)
+        fifo = self.home / "pipe"
+        os.mkfifo(str(fifo))
+        locked = self.home / "locked.md"
+        locked.write_text("x")
+        locked.chmod(0)
+        paths = ["/tmp/%s" % fifo.name, "/tmp/missing-767.md", "/tmp/%s" % locked.name]
+        calls = []
+
+        def boom(*a, **k):
+            calls.append(a)
+            raise AssertionError("touched the filesystem")
+        with mock.patch.multiple(os, stat=boom, lstat=boom, open=boom, listdir=boom, access=boom), \
+                mock.patch.multiple(os.path, exists=boom, isfile=boom, isdir=boom, islink=boom, realpath=boom), \
+                mock.patch("builtins.open", boom):
+            for path in paths:
+                self.assertEqual(shim.shared_body_file(["issue", "comment", "2", "--body-file", path], {}), path)
+        self.assertEqual(calls, [])
+        done, seen, lines = self.shim_warnings("issue", "comment", "2", "--body-file", paths[1])
+        self.assertEqual((done.returncode, len(lines)), (0, 1))
+
+    def test_the_unchanged_exit_code_and_gh_api_fields(self):
+        done, seen, lines = self.shim_warnings("issue", "comment", "2", "--body-file", "/tmp/x.md", env={"FAKE_GH_EXIT": "3"})
+        self.assertEqual((done.returncode, len(lines)), (3, 1))
+        done, seen, lines = self.shim_warnings("api", "x", "-F", "/tmp/x.md")
+        self.assertEqual(lines, [])
 
     def test_unset_env_falls_back_to_the_linked_switchboard(self):
         self.link_switchboard()
