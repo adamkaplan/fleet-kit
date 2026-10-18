@@ -8,7 +8,7 @@
 # a digest could not be resolved, the staging tag moved, or the arguments are wrong. In every non-zero case NOTHING is
 # published. A registry login must already exist: this script never reads or prints a credential. The tool is chosen by
 # argument from a fixed list and run from an absolute path (from --tool-dir, else a fixed list of system directories): the
-# environment does not choose it. The staging image must be a single-platform (linux/amd64) image.
+# environment does not choose it. The staging digest must be a single-image (linux/amd64) manifest: an index or manifest list is refused (exit 3) before anything is exported.
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 die() { echo "publish-image: $1" >&2; exit "${2:-3}"; }
@@ -51,6 +51,17 @@ digest_of() { # the digest of the staging tag NOW
 
 D=$(digest_of) || die "cannot resolve the digest of $staging: nothing published"
 src=${staging%:*}@$D
+# ONLY a single-image manifest is published: an index or manifest list would carry platforms this script does not scan
+case $tool in
+  crane) m=$("$bin" manifest "$src") || die "cannot read the manifest of $src: nothing published" ;;
+  skopeo) m=$("$bin" inspect --raw "docker://$src") || die "cannot read the manifest of $src: nothing published" ;;
+esac
+printf '%s' "$m" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+ok = isinstance(d, dict) and "manifests" not in d and isinstance(d.get("layers"), list) and d.get("mediaType", "application/vnd.oci.image.manifest.v1+json") in (
+    "application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json")
+sys.exit(0 if ok else 1)' 2>/dev/null || die "$src is not a single-image manifest (an index or manifest list?): refused, nothing published"
 case $tool in
   crane)
     "$bin" pull --platform linux/amd64 --format oci "$src" "$work/layout" >/dev/null || die "cannot export $src: nothing published"

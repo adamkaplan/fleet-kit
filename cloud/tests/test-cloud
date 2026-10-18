@@ -546,6 +546,7 @@ cat > "$pb/bin/crane" <<'S'
 #!/usr/bin/env bash
 echo "crane $*" >> "$STUB_LOG"
 case $1 in
+  manifest) if [ "$STUB_INDEX" = 1 ]; then echo '{"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{}]}'; else echo '{"mediaType":"application/vnd.oci.image.manifest.v1+json","layers":[]}'; fi ;;
   digest) n=$(cat "$STUB_STATE/n" 2>/dev/null || echo 0); echo $((n+1)) > "$STUB_STATE/n"
           [ "$STUB_FAIL" = digest ] && exit 1
           if [ "$STUB_MOVE" = 1 ] && [ "$n" -ge 1 ]; then echo "$STUB_D2"; else echo "$STUB_D1"; fi ;;
@@ -557,7 +558,8 @@ cat > "$pb/bin/skopeo" <<'S'
 #!/usr/bin/env bash
 echo "skopeo $*" >> "$STUB_LOG"
 case $1 in
-  inspect) n=$(cat "$STUB_STATE/n" 2>/dev/null || echo 0); echo $((n+1)) > "$STUB_STATE/n"
+  inspect) case $* in *@sha256:*) if [ "$STUB_INDEX" = 1 ]; then echo '{"manifests":[{}]}'; else echo '{"mediaType":"application/vnd.oci.image.manifest.v1+json","layers":[]}'; fi; exit 0 ;; esac
+           n=$(cat "$STUB_STATE/n" 2>/dev/null || echo 0); echo $((n+1)) > "$STUB_STATE/n"
            if [ "$STUB_MOVE" = 1 ] && [ "$n" -ge 1 ]; then printf 'manifest-two'; else printf 'manifest-one'; fi ;;
   copy) case $* in *oci-archive:*) for a; do o=$a; done; cp "$STUB_ARCHIVE" "${o#oci-archive:}" ;;
           *) [ "$STUB_FAIL" = copy ] && exit 1; exit 0 ;; esac ;;
@@ -568,7 +570,7 @@ mdig() { printf '%s' "$1" | python3 -c 'import hashlib,sys; print("sha256:"+hash
 # pub <tool> <archive> [move] [fail]: runs the script; sets prc, pout, and the stub call log in $plog
 pub() {
   plog="$pb/calls"; : > "$plog"; rm -rf "$pb/state"; mkdir -p "$pb/state"
-  pout=$(env STUB_LOG="$plog" STUB_STATE="$pb/state" STUB_ARCHIVE="$ad/$2.tar" STUB_MOVE="${3:-0}" STUB_FAIL="${4:-none}" STUB_D1="$D1" STUB_D2="$D2" \
+  pout=$(env STUB_LOG="$plog" STUB_STATE="$pb/state" STUB_ARCHIVE="$ad/$2.tar" STUB_MOVE="${3:-0}" STUB_FAIL="${4:-none}" STUB_INDEX="${5:-0}" STUB_D1="$D1" STUB_D2="$D2" \
     "$PUB" --tool "$1" --tool-dir "$pb/bin" --staging acme-registry.example/cw/worker-candidate:abc --release acme-registry.example/cw/worker:v1 2>&1); prc=$?
   ncopy=$(grep -cE '^(crane copy|skopeo copy .*docker://acme-registry.example/cw/worker:v1)' "$plog")
 }
@@ -581,7 +583,9 @@ for t in crane skopeo; do
   pub $t oci-deleted; [ "$prc" = 1 ] && [ "$ncopy" = 0 ] && ok "publish ($t): a token deleted in a later layer publishes nothing" || bad "publish deleted $t rc=$prc copies=$ncopy"
   pub $t oci-badlayer; [ "$prc" = 2 ] && [ "$ncopy" = 0 ] && ok "publish ($t): an unreadable layer is exit 2, nothing published" || bad "publish unreadable $t rc=$prc copies=$ncopy"
   pub $t oci-clean 1; [ "$prc" = 3 ] && [ "$ncopy" = 0 ] && echo "$pout" | grep -q 'moved' && ok "publish ($t): the staging tag moved after the scan: refused, nothing published" || bad "publish moved $t rc=$prc copies=$ncopy"
-  pub $t oci-clean 0 copy; [ "$prc" != 0 ] && ok "publish ($t): a tool failure on the publish step is non-zero" || bad "publish copy fail $t"
+  pub $t oci-clean 0 none 1; [ "$prc" = 3 ] && [ "$ncopy" = 0 ] && ! grep -qE 'pull|oci-archive' "$plog" && echo "$pout" | grep -q 'not a single-image manifest' \
+    && ok "publish ($t): a multi-platform index is refused (exit 3) before any export or copy" || bad "publish index $t rc=$prc copies=$ncopy"
+  pub $t oci-clean 0 copy; [ "$prc" = 3 ] && grep -qE 'copy .*worker:v1' "$plog" && ok "publish ($t): a tool failure on the publish step is non-zero" || bad "publish copy fail $t"
 done
 for f in digest pull; do pub crane oci-clean 0 $f; [ "$prc" = 3 ] && [ "$ncopy" = 0 ] && ok "publish: a tool failure ($f) is exit 3, nothing published" || bad "publish fail $f rc=$prc"; done
 ! echo "$pout $(pub crane oci-utf16; echo "$pout")" | grep -q "$ltok" && ok "publish: no value is printed" || bad "publish printed a value"

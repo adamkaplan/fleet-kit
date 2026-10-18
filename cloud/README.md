@@ -196,7 +196,7 @@ or `skopeo copy --override-arch amd64 ... oci-archive:`), runs the per-layer sca
 AGAIN and refuses if it no longer points at the scanned digest, and only then copies `<staging>@<digest>` to the release tag
 (`crane copy` / `skopeo copy`), by digest, never by tag. Exit 0 = published; 1 = a hit; 2 = a layer could not be read; 3 = a
 tool failed, a digest could not be resolved, the tag moved, or the arguments were wrong. In every non-zero case nothing is
-published. The staging image must be a single-platform amd64 image. The tool comes from `--tool` (`crane` or `skopeo` only) and
+published. The staging digest must be a single-image (amd64) manifest: an index or manifest list is REFUSED (exit 3) before anything is exported. The tool comes from `--tool` (`crane` or `skopeo` only) and
 runs from an absolute path (`--tool-dir`, else a fixed list of system directories), never from the caller's environment. A registry login must
 already exist: this script never reads or prints a credential. The command shapes for the registry tools are untested against a
 real registry here; the script's logic is tested with stub tools.
