@@ -460,6 +460,16 @@ done
 out=$("$S" --archive "$ad/oci-utf16.tar" 2>&1); rc=$?
 [ "$rc" = 1 ] && echo "$out" | grep -qx 'layer 2: /y: github-token' && ! echo "$out" | grep -q "$ltok" \
   && ok "layer scan: UTF-16LE token inside a layer is found" || bad "layer scan utf16 rc=$rc"
+out=$("$S" --archive "$ad/oci-credfile.tar" 2>&1); rc=$?
+[ "$rc" = 1 ] && echo "$out" | grep -qx 'layer 2: /home/u/.netrc: credential-file' \
+  && ok "layer scan: a credential file by name (deleted in a later layer) is found" || bad "layer scan credential file rc=$rc"
+out=$("$S" --archive "$ad/oci-hostile.tar" 2>&1); rc=$?
+[ "$rc" = 1 ] && ! echo "$out" | grep -q "$(printf '\033')" && ! echo "$out" | grep -q '^layer 9: /forged' && echo "$out" | grep -q 'x\\x1b\[31m\\x0alayer 9' \
+  && ok "layer scan: control characters in a hostile path are escaped, no forged line" || bad "hostile path rc=$rc"
+mkdir "$tmp/hn"; : > "$tmp/hn/$(printf 'a\033[31m\nforged')/.netrc" 2>/dev/null || { mkdir "$tmp/hn/$(printf 'a\033[31m\nforged')" && : > "$tmp/hn/$(printf 'a\033[31m\nforged')/.netrc"; }
+out=$("$S" --dir "$tmp/hn" 2>&1); rc=$?
+[ "$rc" = 1 ] && ! echo "$out" | grep -q "$(printf '\033')" && [ "$(echo "$out" | grep -c credential-file)" = 1 ] \
+  && ok "--dir: a credential file under a hostile name is one escaped line" || bad "hostile dir path rc=$rc"
 out=$("$S" --archive "$ad/oci-env.tar" 2>&1); rc=$?
 [ "$rc" = 1 ] && echo "$out" | grep -qx 'config: github-token' && ! echo "$out" | grep -q "$ltok" \
   && ok "layer scan: a token in the image configuration is found" || bad "layer scan config rc=$rc"

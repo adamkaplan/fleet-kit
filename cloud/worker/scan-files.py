@@ -58,20 +58,26 @@ def load_allow(path):
     return triples
 
 
+def esc(p):
+    """A path for display: control characters (an ESC, a newline) become \\xNN, so a hostile name cannot forge output lines."""
+    return re.sub(r"[\x00-\x1f\x7f]", lambda m: "\\x%02x" % ord(m.group(0)), p)
+
+
 def classify(path, found, sha, allow, pats, emit):
     """Print each pattern hit of one file; an allowlisted triple is printed as ALLOW. Returns (hits, allowed)."""
     hits = allowed = 0
-    for name, _ in pats:
+    order = [n for n, _ in pats] + sorted(found - {n for n, _ in pats})  # pattern names, then e.g. credential-file
+    for name in order:
         if name not in found:
             continue
         if (path, sha, name) in allow:
-            emit("ALLOW", path, name)
+            emit("ALLOW", esc(path), name)
             allowed += 1
         else:
-            emit("HIT", path, name)
+            emit("HIT", esc(path), name)
             hits += 1
             if os.environ.get("SCAN_TRIPLES") == "1":
-                print(f"TRIPLE\t{path} {sha} {name}")
+                print(f"TRIPLE\t{esc(path)} {sha} {name}")
     return hits, allowed
 
 

@@ -18,7 +18,8 @@ jwt@@eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}
 P
 
 # The allowlist of known false positives: exact "<path> <sha256> <pattern> <reason>" lines (README). It must exist and parse;
-# a missing or malformed one is exit 2, never "no allowlist = pass". SCAN_ALLOWLIST overrides the path (tests).
+# a missing or malformed one is exit 2, never "no allowlist = pass". SCAN_ALLOWLIST overrides the path: TEST-ONLY, the
+# build never sets it.
 ALLOWLIST=${SCAN_ALLOWLIST:-$HERE/scan-allowlist.txt}
 ALLOWED=0   # hits the allowlist suppressed (printed, counted)
 
@@ -40,9 +41,9 @@ scan_dir() {
   while IFS= read -r -d '' p; do roots+=("$p"); done < <(roots_of "$dir")
   [ ${#roots[@]} -gt 0 ] || { echo "scan-secrets: nothing to scan under $dir: not scanned" >&2; exit 2; }
   local prefix="${dir%/}/" pf
+  [ -r "$ALLOWLIST" ] || { echo "scan-secrets: cannot read the allowlist $ALLOWLIST: not scanned" >&2; exit 2; }
   # the files are read as bytes by scan-files.py (binary, UTF-16 and NUL-padded files included); an error is exit 2
   pf=$(mktemp); printf '%s\n' "$PATTERNS" > "$pf"
-  [ -r "$ALLOWLIST" ] || { echo "scan-secrets: cannot read the allowlist $ALLOWLIST: not scanned" >&2; exit 2; }
   rc=0; out=$(python3 "$HERE/scan-files.py" --allow "$ALLOWLIST" --prefix "$dir" "$pf" "${roots[@]}" 2>"$pf.err") || rc=$?
   [ "$rc" -le 1 ] || { cat "$pf.err" >&2; rm -f "$pf" "$pf.err"; echo "scan-secrets: could not read some files under $dir: not scanned" >&2; exit 2; }
   rm -f "$pf" "$pf.err"
@@ -57,10 +58,10 @@ scan_dir() {
     done <<<"$out"
   fi
   # an ssh key or credential file by name (an unreadable directory is an error, as above)
-  rc=0; out=$(find "${roots[@]}" \( -path '*/.ssh/id_*' -o -name '.git-credentials' -o -name '.netrc' -o -path '*/.config/gh/hosts.yml' -o -name 'kubeconfig' \) ! -name '*.pub' -type f 2>/dev/null) || rc=$?
+  rc=0; out=$(find "${roots[@]}" \( -path '*/.ssh/id_*' -o -name '.git-credentials' -o -name '.netrc' -o -path '*/.config/gh/hosts.yml' -o -name 'kubeconfig' \) ! -name '*.pub' -type f -print0 2>/dev/null | LC_ALL=C tr '\0\n' '\n?') || rc=$?
   [ "$rc" -eq 0 ] || { echo "scan-secrets: could not read some files under $dir: not scanned" >&2; exit 2; }
   if [ -n "$out" ]; then
-    while IFS= read -r f; do echo "${f#"$prefix"}: credential-file"; hits=$((hits + 1)); done <<<"$out"
+    while IFS= read -r f; do f=${f//[[:cntrl:]]/?}; echo "${f#"$prefix"}: credential-file"; hits=$((hits + 1)); done <<<"$out"
   fi
   return $((hits > 0))
 }

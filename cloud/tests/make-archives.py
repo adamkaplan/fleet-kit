@@ -33,6 +33,10 @@ def layers_for(kind):
         return [l1, {"x": b"GITHUB_TOKEN=" + tok}, {".wh.x": b""}]
     if kind == "utf16":
         return [l1, {"y": ("GH_TOKEN=" + token + "\n").encode("utf-16-le")}, {"z": b"1"}]
+    if kind == "credfile":
+        return [l1, {"home/u/.netrc": b"machine example.org login u\n"}, {".wh.home/u/.netrc": b""}]
+    if kind == "hostile":
+        return [l1, {"x\x1b[31m\nlayer 9: /forged: github-token": b"GITHUB_TOKEN=" + tok}, {"b": b"2"}]
     return [l1, {"a": b"1"}, {"b": b"2"}]
 
 
@@ -67,6 +71,8 @@ dockersave("dockersave-deleted.tar", "deleted")
 oci("oci-clean.tar", "clean")
 oci("oci-deleted.tar", "deleted")
 oci("oci-utf16.tar", "utf16", gz=False)
+oci("oci-credfile.tar", "credfile")
+oci("oci-hostile.tar", "hostile")
 oci("oci-env.tar", "clean", cfg_env="GH_TOKEN=" + token)
 oci("oci-badlayer.tar", "clean", mutate=lambda d: d[:len(d) // 2])
 oci("oci-zstd.tar", "clean", mutate=lambda d: b"\x28\xb5\x2f\xfd" + b"not a zstd frame")

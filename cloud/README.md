@@ -218,6 +218,8 @@ closed. A missing, unreadable or malformed allowlist is exit 2, never "no allowl
 printed (`allowlisted: <path>: <pattern>`) and counted in the totals line, never silent. The file is tracked and COPYed into the
 scan stage only (never into the shipped image); a change to it is a change to the gate and needs a strict review.
 
+The allowlist applies to pattern hits (and to a credential file by name in the archive scan); a credential file by name in the `--dir` scan is never allowlisted. Paths are printed with control characters escaped (`\x1b`), so an image cannot forge output lines. `SCAN_ALLOWLIST` overrides the list path for tests only; the build never sets it.
+
 For a new hit, print its triple (no value is ever printed) and review the file before adding a line:
 
 ```sh
