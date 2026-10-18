@@ -25200,6 +25200,18 @@ class TestTriageT5Rollup(Base):
         lines = [e for e in self.world.audit() if e["event"] == "whole.skipped" and e["detail"]["input"] == "decisions"]
         self.assertEqual(len(lines), 1)
 
+    def test_the_registry_adds_no_read_to_a_pass(self):
+        ds = [self.decision(7)]
+        self.run_pass(ds, 3600)
+        before = len(self.hub.calls)
+        self.run_pass(ds, 3600)
+        with_registry = len(self.hub.calls) - before
+        with mock.patch.object(sb, "read_mark", lambda *a, **k: None):             # the same pass with the registry switched off
+            before = len(self.hub.calls)
+            self.run_pass(ds, 3600)
+            without = len(self.hub.calls) - before
+        self.assertEqual(with_registry, without)
+
     def test_the_registry_marks_an_input_whole_only_after_a_clean_read_and_a_restart_clears_it(self):
         self.assertEqual(sb.whole(self.engine, "decisions"), (False, "not read yet in this process"))
         sb.read_mark(self.engine, "decisions", False, "errors", 1.0)
