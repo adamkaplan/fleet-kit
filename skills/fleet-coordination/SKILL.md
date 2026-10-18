@@ -106,6 +106,8 @@ The daemon records the `ci` verdict itself about five minutes after CI is green 
 
 ## Starting a named agent in a pane
 
+Launch a new worker or tester only when `memory_pressure` reports a free percentage of at least 40 and the `Swapouts` counter of `vm_stat` is unchanged between two reads 30 seconds apart (swap used is sticky on macOS and is not the test); launch applies it itself; `--memory-ok <reason>` overrides.
+
 **Under the switchboard, use one command and stop reading this section.** If
 `fleet-switchboard` is on your PATH (a message from the switchboard reached you),
 start a worker with
@@ -321,6 +323,8 @@ run it. An unverified setting is an explicit evidence gap, not an assumption you
 get to carry forward. `DONE` means the assigned artifact and its evidence are
 complete — it does not mean deployed, and it does not mean runtime behaviour has
 been proved.
+
+`gh run rerun --failed` reuses the run's old merge ref, so a fix that landed on the base branch afterwards does not reach the pull request; closing and reopening it (head unchanged) recomputes the merge ref and starts fresh CI, and for a held pull request the orchestrator that owns it says so first, because the owner's clear is bound to the head, which does not change. A run's logs may be readable while it is in progress, once a job has uploaded its logs, through the jobs logs API (`gh api repos/<repo>/actions/jobs/<id>/logs`, add `--allow-escape-sequences`; it answers 404 before that), because `gh run view --log-failed` waits for the run to end.
 
 ## Two failures and you stop
 

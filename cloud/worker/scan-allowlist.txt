@@ -1,0 +1,7 @@
+# Known false positives of scan-secrets.sh: one exact triple per line, then a reason. A hit is suppressed ONLY when the
+# path in the image, the sha256 of THAT file and the pattern name all match. Any other pattern on the same file, or a
+# changed file, still fails the scan until a reviewed change updates the line. A change here is a change to the gate.
+# Format: <path in the image> <sha256 of the file> <pattern name> <reason: what the false positive is>
+/usr/bin/gh 7469124f706944133d6a169691dd1c6c3511b12e85878d255e044e2948df4c9b github-token the packaged gh binary: a "gho_brew..." string literal run together with its neighbouring strings (no credential)
+/usr/lib/x86_64-linux-gnu/libunistring.so.5.0.0 7bcf825cd449892db5105ad2aed91dcf94a27b796426600c765720c584c54dd1 aws-access-key a locale-name table in the packaged library that happens to read ASIA plus 16 capitals (no credential)
+/usr/lib/x86_64-linux-gnu/libgnutls.so.30.37.1 ddbae2995750875c07bc218d12a062d73f8250678f54dedda7e9be5068781c98 private-key packaged library text: adjacent "BEGIN ... PRIVATE KEY" format strings that join into a key header once NUL bytes are removed (no key)
