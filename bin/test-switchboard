@@ -15110,6 +15110,17 @@ class TestWorkerRulesInSkills(unittest.TestCase):
         for shape in self.SHAPES:
             self.assertEqual(section.count(shape), 1, shape)
 
+    RERUN = "`gh run rerun --failed` reuses the run's old merge ref, so a fix that landed on the base branch afterwards does not reach the pull request; closing and reopening it (head unchanged) recomputes the merge ref and starts fresh CI, and for a held pull request the orchestrator that owns it says so first, because the owner's clear is bound to the head, which does not change. A run's logs may be readable while it is in progress, once a job has uploaded its logs, through the jobs logs API (`gh api repos/<repo>/actions/jobs/<id>/logs`, add `--allow-escape-sequences`; it answers 404 before that), because `gh run view --log-failed` waits for the run to end."
+
+    def test_the_rerun_and_in_progress_logs_paragraph_is_in_the_coordination_skill_exactly_once(self):
+        self.assertEqual(self.read("fleet-coordination").count(self.RERUN), 1)
+        skill = self.read("fleet-coordination")
+        for word in ("rerun --failed", "old merge ref", "reopening", "bound to the head", "actions/jobs", "log-failed"):
+            self.assertIn(word, skill)
+
+    def test_the_rerun_paragraph_names_roles_never_agents_or_people(self):
+        self.assertNotRegex(self.read("fleet-coordination").split("`gh run rerun --failed`",1)[1].split("\n\n",1)[0], r"(?i)\b(coder\d|cos\b|fleet-upkeep|adam\b)")
+
     def test_the_texts_name_roles_never_agents_or_people(self):
         for text in (self.CAP, self.CI, self.LIST) + self.SHAPES:
             self.assertNotRegex(text, r"(?i)\b(coder\d|cos\b|fleet-upkeep|adam\b)")
