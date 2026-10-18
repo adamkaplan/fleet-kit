@@ -15122,6 +15122,11 @@ class TestIntegrationBranchVerdictText(unittest.TestCase):
     SKILL = ("For a PR into an integration branch, link the epic's plan or a plan of its own with at least one scenario judged by `reviewer` (a scenario with no `claim` is per pull request), "
              "or put the line `per-pr scenarios: none because <reason of at least 20 characters>` in the plan (then G1 reads n/a and there is no reviewer verdict to record).")
 
+    DRAFT = "A DRAFT pull request runs no CI tests: mark it ready, then wait for CI."
+
+    def test_the_draft_sentence_is_present_once(self):
+        self.assertEqual((REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text().count(self.DRAFT), 1)
+
     def test_the_doc_passage_is_present_once(self):
         self.assertEqual((REPO / "docs" / "switchboard.md").read_text().count(self.DOC), 1)
 
