@@ -394,6 +394,28 @@ if [ "$(id -u)" != 0 ]; then
   "$here/worker/scan-secrets.sh" --dir "$tmp/unr" >/dev/null 2>&1; rc=$?; chmod 755 "$tmp/unr/d"
   [ "$rc" = 2 ] && ok "unreadable directory: exit 2, not a pass" || bad "unreadable directory rc=$rc"
 else skip unreadable-dir "running as root reads everything"; fi
+# 3d. binary files are scanned too: UTF-16, NUL-padded, CRLF, and a token across a chunk edge (planted at run time)
+btok="ghp_$(python3 -c 'import secrets,string;print("".join(secrets.choice(string.ascii_letters) for _ in range(40)))')"
+mkdir "$tmp/bin"; BT="$btok" BD="$tmp/bin" python3 - <<'PY'
+import os
+t, d = os.environ["BT"], os.environ["BD"]
+w = lambda n, b: open(os.path.join(d, n), "wb").write(b)
+w("utf16le", ("k = " + t + "\n").encode("utf-16-le"))
+w("utf16be", ("k = " + t + "\n").encode("utf-16-be"))
+w("nulpad", b"\x00\x00" + t.encode() + b"\x00")
+w("crlf-key", b"-----BEGIN RSA PRIVATE KEY-----\r\nabc\r\n")
+w("chunk-edge", b"a" * (4 * 1024 * 1024 - 20) + t.encode() + b"b")
+PY
+out=$("$here/worker/scan-secrets.sh" --dir "$tmp/bin" 2>&1); rc=$?
+[ "$rc" = 1 ] && ! echo "$out" | grep -q "$btok" && ok "binary files: no value printed, exit 1" || bad "binary scan rc=$rc"
+for f in utf16le:github-token utf16be:github-token nulpad:github-token crlf-key:private-key chunk-edge:github-token; do
+  echo "$out" | grep -qx "${f%%:*}: ${f#*:}" && ok "binary scan finds ${f%%:*} (${f#*:})" || bad "binary scan missed ${f%%:*}"
+done
+if [ "$(id -u)" != 0 ]; then
+  mkdir "$tmp/unf"; echo x > "$tmp/unf/f"; chmod 000 "$tmp/unf/f"
+  "$here/worker/scan-secrets.sh" --dir "$tmp/unf" >/dev/null 2>&1; rc=$?; chmod 644 "$tmp/unf/f"
+  [ "$rc" = 2 ] && ok "unreadable file: exit 2, not a pass" || bad "unreadable file rc=$rc"
+else skip unreadable-file "running as root reads everything"; fi
 # --meta: config and history with the same patterns (stub docker; no network)
 mkdir "$tmp/mstub"; cat > "$tmp/mstub/docker" <<'S'
 #!/bin/sh
@@ -405,6 +427,11 @@ esac
 S
 chmod +x "$tmp/mstub/docker"
 PATH="$tmp/mstub:$PATH" STUB_ENV=A=b STUB_HIST=true "$here/worker/scan-secrets.sh" --meta any:image >/dev/null 2>&1 && ok "--meta: clean config and history: 0 hits" || bad "--meta clean"
+out=$(PATH="$tmp/mstub:$PATH" STUB_ENV=A=b STUB_HIST=true "$here/worker/scan-secrets.sh" --meta any:image 2>&1)
+echo "$out" | grep -q 'META SCAN ONLY' && echo "$out" | grep -q 'layer FILES NOT SCANNED' && ! echo "$out" | grep -qx 'scan-secrets: 0 hits' \
+  && ok "--meta says it is a meta scan and that layer files were not scanned" || bad "--meta output reads as a full scan"
+out=$(PATH="$tmp/mstub:$PATH" STUB_ENV="GH_TOKEN=$tok" STUB_HIST=true "$here/worker/scan-secrets.sh" --meta any:image 2>&1)
+echo "$out" | grep -q 'META SCAN ONLY' && ok "--meta failure also says meta only" || bad "--meta failure text"
 out=$(PATH="$tmp/mstub:$PATH" STUB_ENV="GH_TOKEN=$tok" STUB_HIST=true "$here/worker/scan-secrets.sh" --meta any:image 2>&1); rc=$?
 [ "$rc" = 1 ] && ! echo "$out" | grep -q "$tok" && ok "--meta: token in the config: exit 1, value not printed" || bad "--meta env rc=$rc"
 out=$(PATH="$tmp/mstub:$PATH" STUB_ENV=A=b STUB_HIST="echo $tok" "$here/worker/scan-secrets.sh" --meta any:image 2>&1); rc=$?
@@ -441,7 +468,7 @@ elif docker info >/dev/null 2>&1; then
   # stand-in `worker` stage, built for linux/amd64 like the remote build. The token is written now, in the context.
   base=$(sed -n 's/^\(FROM ubuntu:[^ ]*\) AS worker$/\1/p' "$here/worker/Dockerfile")
   tail=$(sed -n '/^FROM worker AS scan$/,$p' "$here/worker/Dockerfile")
-  bctx="$tmp/bctx"; mkdir -p "$bctx/worker"; cp "$here/worker/scan-secrets.sh" "$bctx/worker/"
+  bctx="$tmp/bctx"; mkdir -p "$bctx/worker"; cp "$here/worker/scan-secrets.sh" "$here/worker/scan-files.py" "$bctx/worker/"
   ptok="ghp_$(printf 'f%.0s' $(seq 36))"; printf '%s\n' "$ptok" > "$bctx/plant.txt"
   bbuild() { # <variant body for the worker stage> [scan-user]: prints the log, returns docker's status
     { echo "$base AS worker"; printf '%b\n' "$1"; echo "$tail"; } > "$bctx/Dockerfile.$2"

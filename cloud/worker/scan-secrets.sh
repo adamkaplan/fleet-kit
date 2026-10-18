@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Build-failing scan for stored credentials in a built image: every layer's files and
-# the image config (env, history). Prints "path: pattern-name" per hit, never the value.
+# Build-failing scan for stored credentials: files (binary included, via scan-files.py) and the image config
+# (env, history). Prints "path: pattern-name" per hit, never the value.
 # Usage: scan-secrets.sh <image-ref> | --dir <dir> [--skip <name>]... | --meta <image-ref>
 # Exit 0 = 0 hits, 1 = hits, 2 = usage/error/not readable (never a pass).
 set -euo pipefail
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 # name@@ERE, one per line. Values are never printed.
 read -r -d '' PATTERNS <<'P' || true
@@ -29,20 +30,19 @@ roots_of() {
 }
 
 scan_dir() {
-  local dir=$1 hits=0 name re out rc f p
+  local dir=$1 hits=0 out rc f p
   local -a roots=()
   while IFS= read -r -d '' p; do roots+=("$p"); done < <(roots_of "$dir")
   [ ${#roots[@]} -gt 0 ] || { echo "scan-secrets: nothing to scan under $dir: not scanned" >&2; exit 2; }
-  local prefix="${dir%/}/"
-  while IFS= read -r line; do
-    name=${line%%@@*}; re=${line#*@@}
-    rc=0; out=$(grep -rIlE -e "$re" "${roots[@]}" 2>/dev/null) || rc=$?
-    # 0 = hits, 1 = none; anything else means files were not read: an error, never a pass
-    [ "$rc" -le 1 ] || { echo "scan-secrets: could not read some files under $dir: not scanned" >&2; exit 2; }
-    if [ -n "$out" ]; then
-      while IFS= read -r f; do echo "${f#"$prefix"}: $name"; hits=$((hits + 1)); done <<<"$out"
-    fi
-  done <<<"$PATTERNS"
+  local prefix="${dir%/}/" pf
+  # the files are read as bytes by scan-files.py (binary, UTF-16 and NUL-padded files included); an error is exit 2
+  pf=$(mktemp); printf '%s\n' "$PATTERNS" > "$pf"
+  rc=0; out=$(python3 "$HERE/scan-files.py" "$pf" "${roots[@]}" 2>/dev/null) || rc=$?
+  rm -f "$pf"
+  [ "$rc" -le 1 ] || { echo "scan-secrets: could not read some files under $dir: not scanned" >&2; exit 2; }
+  if [ -n "$out" ]; then
+    while IFS= read -r f; do echo "${f#"$prefix"}"; hits=$((hits + 1)); done <<<"$out"
+  fi
   # an ssh key or credential file by name (an unreadable directory is an error, as above)
   rc=0; out=$(find "${roots[@]}" \( -path '*/.ssh/id_*' -o -name '.git-credentials' -o -name '.netrc' -o -path '*/.config/gh/hosts.yml' -o -name 'kubeconfig' \) ! -name '*.pub' -type f 2>/dev/null) || rc=$?
   [ "$rc" -eq 0 ] || { echo "scan-secrets: could not read some files under $dir: not scanned" >&2; exit 2; }
@@ -52,7 +52,10 @@ scan_dir() {
   return $((hits > 0))
 }
 
-report() { if "$@"; then echo "scan-secrets: 0 hits"; exit 0; else echo "scan-secrets: hits found" >&2; exit 1; fi; }
+report() { # <what was scanned> <command...>
+  local what=$1; shift
+  if "$@"; then echo "scan-secrets: 0 hits$what"; exit 0; else echo "scan-secrets: hits found$what" >&2; exit 1; fi
+}
 
 # --dir <dir> [--skip <top-level name>]...: a directory tree (the build runs it with --dir / inside the image).
 if [ "${1:-}" = "--dir" ] && [ -n "${2:-}" ]; then
@@ -61,7 +64,7 @@ if [ "${1:-}" = "--dir" ] && [ -n "${2:-}" ]; then
     [ "$1" = "--skip" ] && [ -n "${2:-}" ] || { echo "usage: $0 --dir <dir> [--skip <name>]..." >&2; exit 2; }
     SKIPS+=("$2"); shift 2
   done
-  report scan_dir "$d"
+  report "" scan_dir "$d"
 fi
 # --meta <image>: the image configuration (env, labels, cmd) and history, with the same patterns. It reads no layer,
 # so it works on any workstation; it does not replace the layer scan the build runs.
@@ -71,7 +74,7 @@ if [ "${1:-}" = "--meta" ] && [ -n "${2:-}" ] && [ $# -eq 2 ]; then
     || { echo "scan-secrets: cannot inspect $2: not scanned" >&2; exit 2; }
   docker history --no-trunc --format '{{.CreatedBy}}' "$2" > "$work/history.txt" 2>/dev/null && [ -s "$work/history.txt" ] \
     || { echo "scan-secrets: cannot read the history of $2: not scanned" >&2; exit 2; }
-  report scan_dir "$work"
+  report " (META SCAN ONLY: image configuration and history; layer FILES NOT SCANNED)" scan_dir "$work"
 fi
 [ $# -eq 1 ] || { echo "usage: $0 <image> | --dir <dir> [--skip <name>]... | --meta <image>" >&2; exit 2; }
 
@@ -92,4 +95,4 @@ done < <(python3 -c 'import json,sys; [print(l) for e in json.load(open(sys.argv
 [ "$n" -gt 0 ] || { echo "scan-secrets: no layers found in the image: not scanned" >&2; exit 2; }
 # layer files may carry modes that hide them from us; make them readable so none is skipped
 chmod -R u+rwX "$work/files" 2>/dev/null || true
-report scan_dir "$work/files"
+report "" scan_dir "$work/files"

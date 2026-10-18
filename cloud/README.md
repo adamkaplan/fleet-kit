@@ -144,17 +144,30 @@ image holds no scan file.
 (cd cloud && az acr build --registry acme-registry --image cw-worker:<tag> --platform linux/amd64 -f worker/Dockerfile .)
 # the same build on a workstation (BuildKit; pass the platform on an arm64 machine)
 docker build --platform linux/amd64 -t cw-worker:dev -f cloud/worker/Dockerfile cloud
-# the configuration and history, with the same patterns, on any workstation, after a pull or a local build
+# the configuration and history ONLY, with the same patterns, on any workstation, after a pull or a local build
 docker pull acme-registry.azurecr.io/cw-worker:<tag>
-cloud/worker/scan-secrets.sh --meta acme-registry.azurecr.io/cw-worker:<tag>   # must print "0 hits", exit 0
+cloud/worker/scan-secrets.sh --meta acme-registry.azurecr.io/cw-worker:<tag>   # prints "0 hits (META SCAN ONLY: ... layer FILES NOT SCANNED)", exit 0
 ```
 
 `--meta <image>` scans `docker image inspect` Config (env, labels, command) and `docker history --no-trunc`. It reads no
-layer. `scan-secrets.sh <image>` (a `docker save` scan, every layer including a file deleted in a later layer) still works
-where the engine can export the layers (an image of the machine's own architecture). The build scan sees the merged
-filesystem, not each layer: a secret written and then deleted inside the `worker` stage is not found by it, so no step of that
-stage may take a credential. Output is `path: pattern-name`, never the value. Exit codes: 0 no hits, 1 hits, 2 not readable
-or a usage error.
+layer, and its output says so (`META SCAN ONLY: image configuration and history; layer FILES NOT SCANNED`, on success and on
+failure): it never prints the plain `0 hits` of a file scan. `scan-secrets.sh <image>` (a `docker save` scan that extracts every
+layer separately) still works where the engine can export the layers (an image of the machine's own architecture); it is not run
+by the build or CI.
+
+What the build scan covers and does NOT cover:
+
+- It covers every regular file of the MERGED filesystem of the finished `worker` stage (minus `proc`, `sys`, `dev` and the
+  scan files), binary files included. Files are read as bytes in streamed 4 MiB chunks with an overlap, so a token across a chunk
+  edge is found and there is no file-size limit; each file is searched as it is and with its NUL bytes removed, which finds
+  UTF-16LE, UTF-16BE and NUL-padded text. A CRLF line end does not hide a private key.
+- A file it cannot read fails the build (exit 2); nothing is skipped.
+- It does NOT see a secret written in one layer and deleted in a later one (the layers are already merged), so no step of the
+  `worker` stage may take a credential. A per-layer scan was judged not cheap: it needs a full scan after every layer-creating step.
+- It does NOT detect base64, compressed (gzip, zip, tar) or otherwise encoded forms, or a token split by other bytes: the
+  patterns are text patterns for known credential shapes.
+
+Output is `path: pattern-name`, never the value. Exit codes: 0 no hits, 1 hits, 2 not readable or a usage error.
 
 ## Resetting a node the fix gave up on
 
