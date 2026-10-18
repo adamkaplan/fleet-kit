@@ -24749,6 +24749,13 @@ class TestTriageT5Rollup(Base):
         self.assertIn("T5 acme/api#7", raw["items"])
         self.run_pass([self.decision(7)], self.DAY)
         self.assertIsNotNone(json.loads((Path(self.engine.state_dir) / sb.triage_digest.SEEN_FILE).read_text())["rollup"])
+        self.engine.triage.seen = self.engine.triage.meta = None      # a restart: the roll-up time comes back from the file
+        self.assertEqual(self.run_pass([self.decision(7)], 3600)[1], [])   # still once in 24 hours
+
+    def test_a_rollup_time_that_is_not_a_number_reads_as_none_sent(self):
+        d = str(self.world.state)
+        sb.triage_digest.write_json(os.path.join(d, sb.triage_digest.SEEN_FILE), {"v": 1, "items": {}, "swept": True, "last": None, "rollup": "x"})
+        self.assertEqual(sb.triage_digest.load_meta(d), {"known": True, "swept": True, "last": None})
 
 
 class TestTriageAncestors(Base):

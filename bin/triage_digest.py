@@ -216,7 +216,7 @@ ROLLUP_SECONDS = 86400
 
 def rollup(seen, meta, t5_refs, now):
     """The one daily roll-up line (#766), or None. It names the T5 items listed at least a day ago that are still findings now
-    (`t5_refs`: an item that left the owner's tier is not there, and `prune` has forgotten it). An item with no earlier listing is not named. Call BEFORE `commit`; on a line, `meta["rollup"]` is set and the caller writes the seen-file."""
+    (`t5_refs`: an item that left the owner's tier is not there, and `prune` has forgotten it). An item with no earlier listing is not named. On a line, `meta["rollup"]` is set and the caller writes the seen-file."""
     last = meta.get("rollup")
     if last is not None and now - last < ROLLUP_SECONDS:
         return None
