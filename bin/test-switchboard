@@ -15110,6 +15110,17 @@ class TestWorkerRulesInSkills(unittest.TestCase):
         for shape in self.SHAPES:
             self.assertEqual(section.count(shape), 1, shape)
 
+    RERUN = "`gh run rerun --failed` reuses the run's old merge ref, so a fix that landed on the base branch afterwards does not reach the pull request; closing and reopening it (head unchanged) recomputes the merge ref and starts fresh CI, and for a held pull request the orchestrator that owns it says so first, because the owner's clear is bound to the head, which does not change. A run's logs may be readable while it is in progress, once a job has uploaded its logs, through the jobs logs API (`gh api repos/<repo>/actions/jobs/<id>/logs`, add `--allow-escape-sequences`; it answers 404 before that), because `gh run view --log-failed` waits for the run to end."
+
+    def test_the_rerun_and_in_progress_logs_paragraph_is_in_the_coordination_skill_exactly_once(self):
+        self.assertEqual(self.read("fleet-coordination").count(self.RERUN), 1)
+        skill = self.read("fleet-coordination")
+        for word in ("rerun --failed", "old merge ref", "reopening", "bound to the head", "actions/jobs", "log-failed"):
+            self.assertIn(word, skill)
+
+    def test_the_rerun_paragraph_names_roles_never_agents_or_people(self):
+        self.assertNotRegex(self.read("fleet-coordination").split("`gh run rerun --failed`",1)[1].split("\n\n",1)[0], r"(?i)\b(coder\d|cos\b|fleet-upkeep|adam\b)")
+
     def test_the_texts_name_roles_never_agents_or_people(self):
         for text in (self.CAP, self.CI, self.LIST) + self.SHAPES:
             self.assertNotRegex(text, r"(?i)\b(coder\d|cos\b|fleet-upkeep|adam\b)")
@@ -15123,7 +15134,7 @@ class TestIntegrationBranchVerdictText(unittest.TestCase):
              "or put the line `per-pr scenarios: none because <reason of at least 20 characters>` in the plan (then G1 reads n/a and there is no reviewer verdict to record).")
 
     DRAFT = ("Some repositories' workflows skip draft pull requests (a coder lost four hours reading that as a failing CI): when a draft shows no CI runs, "
-             "look at the workflow's draft filter and mark the PR ready before waiting for CI.")
+             "look at the workflow's draft filter and mark the PR ready before waiting for CI (if there is no filter, the cause is elsewhere).")
 
     def test_the_draft_sentence_is_present_once(self):
         self.assertEqual((REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text().count(self.DRAFT), 1)
@@ -15140,6 +15151,25 @@ class TestIntegrationBranchVerdictText(unittest.TestCase):
     def test_the_texts_name_roles_never_agents_or_people(self):
         for text in (self.DOC, self.SKILL):
             self.assertNotRegex(text, r"(?i)\b(coder\d|cos\b|fleet-upkeep|adam\b)")
+
+
+class TestLaunchMemoryTest(unittest.TestCase):
+    """#758: the launch memory test is said once in the coordination skill; no swap-used percentage rule anywhere."""
+    SENTENCE = "Launch a new worker or tester only when `memory_pressure` reports a free percentage of at least 40 and the `Swapouts` counter of `vm_stat` is unchanged between two reads 30 seconds apart (swap used is sticky on macOS and is not the test)."
+
+    def test_the_sentence_is_in_the_coordination_skill_exactly_once(self):
+        self.assertEqual((REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text().count(self.SENTENCE), 1)
+
+    def test_no_skill_or_definition_states_a_swap_used_percentage_rule(self):
+        files = list(REPO.glob("skills/*/SKILL.md")) + list(REPO.glob("agents/opencode/*.md")) + list(REPO.glob("agents/copilot/*.agent.md"))
+        self.assertTrue(files)
+        for f in files:
+            self.assertNotRegex(f.read_text(), r"(?i)swap[^.\n]{0,40}\d+\s*(%|percent)", f.name)
+
+    def test_the_sentence_names_roles_never_agents_or_people(self):
+        skill = (REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text()
+        sentence = skill[skill.index("Launch a new worker or tester only when"):].split("\n", 1)[0]
+        self.assertNotRegex(sentence, r"(?i)\b(coder\d|cos\b|fleet-upkeep|adam\b)")
 
 
 class TestPlanningSkill(unittest.TestCase):
@@ -21440,6 +21470,154 @@ class ReportBase(PR4Base):
     def pass_after(self, seconds):
         self.world.tick(seconds)
         return self.world.engine.run_pass()
+
+
+class TestIdleAtASeam(ReportBase):
+    """#773: idle 20 minutes or more, an OPEN assignment, a last report of `working`: ONE nudge, ONE wake, once per idle stretch."""
+
+    def setUp(self):
+        super().setUp()
+        self.world.engine.state_dir = self.world.state
+
+    def seam(self, facts):
+        return sorted((f.kind, f.recipient, f.rider) for f in facts if ":seam:" in f.key)
+
+    def idle_after(self, state, seconds=1300):
+        self.stop("all quiet")
+        self.world.tick(1)
+        self.report(state, "migrating the tables")
+        self.world.tick(seconds)
+
+    def test_idle_20_minutes_after_a_working_report_nudges_the_worker_and_wakes_the_boss_once(self):
+        self.idle_after("working")
+        found = self.derive()
+        self.assertEqual(self.seam(found), [("nudge", "coder", False), ("worker.idle", "platform", False)])
+        nudge = next(f for f in found if f.kind == "nudge")
+        wake = next(f for f in found if ":seam:" in f.key and f.kind == "worker.idle")
+        self.assertEqual(nudge.summary, "you went idle after reporting working on #2: report done, blocked or question, or continue")
+        self.assertEqual(wake.summary, "idle without a closing report: #2 (worker coder, last report: migrating the tables)")
+        self.world.tick(30)
+        self.assertEqual([f.key for f in self.derive() if ":seam:" in f.key], [f.key for f in found if ":seam:" in f.key], "the same stretch has the same keys on a later pass")
+
+    def test_a_worker_idle_under_20_minutes_triggers_nothing(self):
+        self.idle_after("working", seconds=sb.SEAM_IDLE_SECONDS - 60)
+        self.assertEqual(self.seam(self.derive()), [])
+        self.world.tick(120)
+        self.assertEqual(len(self.seam(self.derive())), 2, "the boundary: 20 minutes passed")
+
+    def test_the_stretch_is_delivered_once_over_many_passes(self):
+        self.idle_after("working")
+        for _ in range(3):
+            self.world.engine.run_pass()
+            self.world.tick(30)
+        keys = [k for name in ("coder", "platform") for a in self.world.admissions(name) for k in a["keys"] if ":seam:" in k]
+        self.assertEqual(len(keys), 2, keys)
+        self.assertEqual(len(set(keys)), 2)
+
+    def test_the_four_combinations_of_closing_kind_and_open_or_closed_issue(self):
+        for state in ("done", "blocked", "question", "failed", "paused"):
+            with self.subTest(state=state):
+                self.idle_after(state)
+                self.assertEqual(self.seam(self.derive()), [], "a last report that is not `working` is not this case")
+                self.setUp()
+        self.idle_after("working")
+        self.world.engine.hub = types.SimpleNamespace(closed_issue_snapshot=lambda: {"%s#2" % self.world.engine.config.get("intent_repo", "acme/widget-service"): {"labels": [], "at": 1}})
+        self.world.engine.config["intent_repo"] = self.world.engine.config.get("intent_repo") or "acme/widget-service"
+        self.assertEqual(self.seam(self.derive()), [], "a closed assignment")
+
+    def test_the_closed_issue_check_reads_no_gh(self):
+        self.idle_after("working")
+        calls = []
+        self.world.engine.gh_runner = lambda *a, **k: calls.append(a) or (_ for _ in ()).throw(AssertionError("gh called"))
+        self.assertEqual(len(self.seam(self.derive())), 2)
+        self.assertEqual(calls, [])
+
+    def test_a_worker_with_no_report_at_all_is_left_to_the_stop_triage(self):
+        self.stop("all quiet")
+        self.world.tick(1300)
+        self.assertEqual(self.seam(self.derive()), [])
+
+    def test_a_retired_worker_gets_nothing_and_another_name_does_not_silence_it(self):
+        self.idle_after("working")
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {"other": {"at": 1, "by": "x", "reason": "y", "session": None, "auto": False}})
+        self.assertEqual(len(self.seam(self.derive())), 2)
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {"coder": {"at": 1, "by": "x", "reason": "y", "session": self.world.sessions["coder"], "auto": False}})
+        self.assertEqual(self.seam(self.derive()), [])
+
+    def test_a_worker_that_resumes_and_idles_again_starts_a_new_stretch_with_its_own_clock(self):
+        self.idle_after("working")
+        first = [f.key for f in self.derive() if ":seam:" in f.key]
+        self.stop("again", lasts=5)
+        self.world.tick(60)
+        self.assertEqual(self.seam(self.derive()), [], "the new stretch is 60 seconds old")
+        self.world.tick(1300)
+        again = [f.key for f in self.derive() if ":seam:" in f.key]
+        self.assertTrue(again and not set(again) & set(first), (first, again))
+
+    def test_a_headless_worker_with_no_pane_is_treated_exactly_like_a_terminal_worker(self):
+        self.stop("all quiet")
+        self.world.tick(1)
+        self.report("working", "migrating the tables")
+        self.world.herdr.panes.pop(self.world.panes["coder"])      # no terminal: only the service record shows it
+        sb.load_agent_presence().save_record(self.world.state, "coder", self.coder, "http://127.0.0.1:49374", now=self.world.clock.now())
+        self.world.tick(1300)
+        self.world.engine.discover(self.world.clock.now())
+        self.assertTrue(self.world.engine.discovery.agents["coder"].headless)
+        self.assertEqual(self.seam(self.derive()), [("nudge", "coder", False), ("worker.idle", "platform", False)])
+
+    def test_three_idle_workers_make_no_gh_call_and_no_new_source(self):
+        for n in (2, 3):
+            self.world.add_agent("coder%d" % n, fleet={"role": "coder", "reports_to": "platform", "issue": 10 + n})
+        for name in ("coder", "coder2", "coder3"):
+            self.stop("all quiet", name=name)
+            self.world.tick(1)
+            self.report("working", "going on", sender=name)
+        self.world.tick(1300)
+        calls = []
+        self.world.engine.gh_runner = lambda *a, **k: calls.append(a) or (_ for _ in ()).throw(AssertionError("gh called"))
+        sources = len(self.world.engine.sources)
+        self.assertEqual(len([f for f in self.derive() if ":seam:" in f.key]), 6)
+        self.assertEqual((calls, len(self.world.engine.sources)), ([], sources))
+
+    def test_a_stop_the_triage_already_answers_is_not_also_an_idle_at_a_seam(self):
+        self.idle_after("working", seconds=5)
+        self.stop("OWED-ME: new work finished")      # given work again after the report: an unreported stop, nudged by the triage
+        self.world.tick(1300)
+        found = self.derive()
+        self.assertIn("nudge", [f.kind for f in found])
+        self.assertEqual(self.seam(found), [], "one nudge, not two")
+
+    def test_a_secret_in_a_report_is_redacted_in_the_stored_file_and_in_the_wake(self):
+        secrets = ["ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8", "ghs_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8",
+                   "AKIA" + "ABCDEFGHIJKLMNOP", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcDEFghiJKLmnoPQRstu",
+                   "password=" + "hunter2hunter2"]
+        for secret in secrets:
+            with self.subTest(secret=secret[:6]):
+                self.setUp()
+                self.stop("all quiet")
+                self.world.tick(1)
+                self.report("working", "tried %s and went on" % secret)
+                self.world.tick(1300)
+                stored = (Path(self.world.state) / sb.LAST_REPORT_FILE).read_text()
+                wake = next(f for f in self.derive() if ":seam:" in f.key and f.kind == "worker.idle")
+                value = secret.split("=")[-1]
+                self.assertNotIn(value, stored)
+                self.assertNotIn(value, wake.summary)
+                self.assertIn("[redacted]", stored)
+                self.assertIn("[redacted]", wake.summary)
+
+    def test_the_wake_redacts_a_line_that_an_older_file_holds_raw(self):
+        self.idle_after("working")
+        data = sb._read_small(self.world.state, sb.LAST_REPORT_FILE)
+        data["coder"]["text"] = "tried ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"
+        sb._write_small(self.world.state, sb.LAST_REPORT_FILE, data)
+        wake = next(f for f in self.derive() if ":seam:" in f.key and f.kind == "worker.idle")
+        self.assertNotIn("a1B2c3D4", wake.summary)
+        self.assertIn("[redacted]", wake.summary)
+
+    def test_the_last_report_line_is_kept_with_the_report(self):
+        self.report("working", "on the second step")
+        self.assertEqual(sb._read_small(self.world.state, sb.LAST_REPORT_FILE)["coder"]["text"], "on the second step")
 
 
 # ======================================================================

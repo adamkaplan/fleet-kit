@@ -2530,6 +2530,8 @@ still carried. A worker that failed, errored or was aborted is never folded: its
 report since the worker's latest assignment is only a rider (it never wakes); a report from before the assignment does
 not count, so a worker that stopped twice without reporting its new work is still told to the boss.
 
+**Idle at a seam (#773).** A worker idle 20 minutes or more whose assignment (its `launch --issue`) is still open and whose last report was `working` gets ONE nudge ("you went idle after reporting working on #N: report done, blocked or question, or continue") and its boss ONE wake ("idle without a closing report: #N (worker X, last report: ...)"). Both are keyed by the idle stretch (`idle_at`), so a stretch is told once; a worker that resumes before 20 minutes, one whose last report is `done`, `blocked`, `question` or `failed`, a retired one, and a stop the unreported-stop triage already answers get nothing. It reads nothing new: the observation, `last-reports.json` (which now also keeps the report's one line), the retired list and the closed-issue events the hub already holds (no `gh` call, so after a restart a closed issue is known closed only once its event is seen again). A headless worker is the same observation.
+
 **Checkpoint reminders.** `fleet-switchboard launch` sets two reminders when the worker is up:
 
 | Reminder | To | At | Text | Condition |
