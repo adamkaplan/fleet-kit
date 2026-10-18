@@ -835,12 +835,21 @@ def tunnel(cluster, record):
     argv = [os.environ.get("CW_KUBECTL", "kubectl"), "--kubeconfig", cluster.kubeconfig, "--context", "cw", "-n", os.environ.get("CW_CLOUD_NAMESPACE", "cw"),
             "port-forward", "pod/" + found.group(1), "%d:4096" % port, "--address", "127.0.0.1"]
     log_path = os.path.join(cluster.dir, "forward-%d.log" % port)
-    with open(log_path, "wb") as log:
-        try:
-            child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, env=cluster.env(), start_new_session=True)
-        except OSError as err:
-            raise CloudError("cannot open the tunnel: %s" % (err.strerror or err)) from None
-    cluster.tunnels.append(child)
+    # a signal that arrives between the fork and the registration would end the command with the tunnel unknown to the handler and to the `finally`
+    # below: hold the handled signals back for the spawn and the registration; one that came meanwhile is delivered at the unblock, tunnel known
+    masked = threading.current_thread() is threading.main_thread() and hasattr(signal, "pthread_sigmask")
+    held = signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_SIGNALS) if masked else None
+    try:
+        with open(log_path, "wb") as log:
+            try:
+                child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, env=cluster.env(), start_new_session=True,
+                                         preexec_fn=(lambda: signal.pthread_sigmask(signal.SIG_SETMASK, [])) if masked else None)   # the tunnel starts unblocked
+            except OSError as err:
+                raise CloudError("cannot open the tunnel: %s" % (err.strerror or err)) from None
+        cluster.tunnels.append(child)
+    finally:
+        if masked:
+            signal.pthread_sigmask(signal.SIG_SETMASK, held)
     try:
         # the pid and start time go in the command's private directory: if this command is killed outright (SIGKILL), the NEXT command stops
         # the orphaned port-forward (only while the pid still has this start time and is a port-forward of this directory)

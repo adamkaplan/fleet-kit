@@ -59345,8 +59345,7 @@ class TestPluginPush(unittest.TestCase):
         sock.settimeout(2)
         with sb.in_directory(state):
             sock.connect(sb.POLICY_SOCKET)
-        sock.sendall(self.message() + b"\n")
-        sock.shutdown(socket.SHUT_WR)
+        sock.sendall(self.message() + b"\n")   # no shutdown(SHUT_WR): the server ends at the newline and may close first, and macOS then refuses it (ENOTCONN)
         self.assertEqual(sock.recv(100), b"", "a push gets no reply")
         sock.close()
         self.assertTrue(arrived.wait(5), "the receiver was reached")   # the wait is only a failure bound
