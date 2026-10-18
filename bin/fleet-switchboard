@@ -2931,7 +2931,7 @@ class TempJanitorFacts:
             temp = Path(cfg["dir"]) if cfg.get("dir") else janitor.default_dir()
             outcome = []
             started = time.monotonic()
-            with worktree_sweep(engine):
+            with worktree_sweep(engine):   # the other callers are one-shot commands, never the daemon's own thread, so nothing else touches the sweep state here
                 lines, removed, kept = janitor.run(
                     temp, engine.state_dir, now, cfg, apply,
                     lambda name, detail: engine.audit.append(engine.actor, "temp.removed", _plain(name, 120), detail),

@@ -53914,7 +53914,7 @@ class TestDaemonTempJanitor(Base):
         engine, source = self.daemon({"daemon_apply": True, "weekly_scan_seconds": 150, "scan_seconds": 86400})
         with mock.patch.object(self.jan, "run", lambda *a_, **k: real_run(*a_, clock=clock, **k)):
             self.go(source)
-        self.assertTrue(a.exists() or b.exists(), "an entry the budget did not reach is never removed")
+        self.assertEqual([a.exists(), b.exists()].count(False), 1, "exactly one entry was reached; the one the budget did not reach is never removed")
         self.assertTrue(any("not judged" in n for n in self.events("janitor.summary")[0]["detail"]["notes"]))
         # changed between the scan and the removal: the second judgement of the same entry sees a newer file
         for path in self.temp.iterdir():
@@ -53960,6 +53960,14 @@ class TestDaemonTempJanitor(Base):
         self.addCleanup(os.chmod, str(stamp), 0o600)
         self.go(source)
         self.assertEqual(len(self.events("janitor.would_remove")), 1)
+
+    def test_a_failure_inside_the_run_is_one_janitor_error_and_removes_nothing(self):
+        victim = self.old("old-file.txt")
+        engine, source = self.daemon({"daemon_apply": True})
+        with mock.patch.object(self.jan, "run", side_effect=RuntimeError("boom")):
+            self.go(source)
+        self.assertTrue(victim.exists())
+        self.assertEqual(len(self.events("janitor.error")), 1)
 
     def test_s10_no_gh_and_no_network(self):
         self.old("old-file.txt")
