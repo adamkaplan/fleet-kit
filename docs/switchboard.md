@@ -4604,7 +4604,7 @@ Every agent `launch` (and `launch --resume`) starts in a pane gets its **own tem
 
 **At `retire`** the agent's private `TMPDIR` is handled in the style of its worktrees: it is **removed when it is empty**, and **kept, with one `tmpdir:` line giving the reason** (how many files are still in it), when anything is left in it. It is never forced and never emptied recursively; what is kept is left to the weekly temp janitor.
 
-**Unchanged:** the OpenCode temp-directory sharing for the Chief of Staff and for the reviewer subagents. The reviewers run inside the coder's own session, so they see that coder's `TMPDIR`; the Chief of Staff is not started by `launch`, so it keeps the shared directory.
+**Unchanged:** the OpenCode temp-directory sharing for the Chief of Staff and for the reviewer subagents. The reviewers run inside the coder's own session, so they see that coder's `TMPDIR`; the Chief of Staff (started by `bootstrap`) and the plan review lanes are skipped by name, so they keep the shared directory.
 
 The `gh` shim also writes **one warning line** on stderr when a `--body-file`, `--body-file=PATH`, `-F PATH` or `-FPATH` names an absolute path whose parent directory *is* a shared temp directory (`/tmp`, `/private/tmp`, or the profile's shared temp root, the parent of the agent's own `TMPDIR`), and points at `$TMPDIR`. It looks at the path as text only (`..` is folded lexically): it never opens, stats or reads the file, never refuses, and never changes the arguments, the exit code, the signing or the credential route; any error in it is silent. A path under the agent's own `TMPDIR`, in a `mktemp -d` subdirectory, or a relative path gives no warning.
 

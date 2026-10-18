@@ -6074,7 +6074,7 @@ def agent_tmp_env(engine, name):
     """{FLEET_AGENT_TMPDIR: dir} for a pane: a private directory (0700) named from the agent, made now under the profile's temp root. {} when panes
     have no wrapper. A directory that cannot be made fails the launch (LaunchError): the agent is never started on the shared directory."""
     root = agent_tmp_root(engine.config)
-    if root is None:
+    if root is None or name == "cos" or (name or "").startswith(LANE_NAME_PREFIX):   # the Chief of Staff and the plan review lanes keep the shared directory (unchanged)
         return {}
     if not NAME_RE.match(name or ""):
         raise LaunchError("no private temp directory for %r: not a valid agent name" % (name,))
@@ -6088,7 +6088,11 @@ def agent_tmp_env(engine, name):
         info = os.lstat(str(path))
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
             raise OSError("exists and is not a directory of ours")
-        os.chmod(str(path), 0o700)
+        fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)   # no symlink swapped in after the check
+        try:
+            os.fchmod(fd, 0o700)
+        finally:
+            os.close(fd)
     except OSError as err:
         raise LaunchError("cannot make the private temp directory %s (%s): %s was not started (it never runs on the shared temp directory)" % (path, err.strerror or err, name)) from None
     return {AGENT_TMP_ENV: str(path)}
@@ -6097,7 +6101,7 @@ def agent_tmp_env(engine, name):
 def reclaim_agent_tmp(engine, name):
     """At retire: the agent's private TMPDIR is removed when it is EMPTY, else kept and the reason said. Never forced, never recursive. Returns lines."""
     root = agent_tmp_root(engine.config)
-    if root is None or not NAME_RE.match(name or ""):
+    if root is None or not NAME_RE.match(name or "") or name == "cos" or name.startswith(LANE_NAME_PREFIX):
         return []
     path = root / name
     if not os.path.lexists(str(path)):
@@ -7365,8 +7369,8 @@ def cmd_retire(args, runner, now):
     try:
         for line in reclaim_agent_tmp(engine, name):   # its private TMPDIR (#767): removed when empty, else kept with the reason
             print("tmpdir: " + line)
-    except Exception:
-        pass
+    except Exception as err:   # the retirement is already written: said, never a traceback
+        sys.stderr.write("%s: private temp directory not handled (%s): the agent is retired; remove it by hand\n" % (PROG, _one_line(str(err), 100)))
     return EXIT_OK
 
 

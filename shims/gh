@@ -962,7 +962,7 @@ def warn_shared_body_file(args):
         path = shared_body_file(args)
         if path:
             sys.stderr.write("gh: warning: %s is directly in a shared temp directory, where another agent can write the same name: put it under $TMPDIR "
-                             "(for example $TMPDIR/body.md, or a directory from `mktemp -d`)\n" % path.replace("\n", " ")[:200])
+                             "(for example $TMPDIR/body.md, or a directory from `mktemp -d`)\n" % re.sub(r"[^\x20-\x7e]", "?", path)[:200])
     except Exception:
         pass
 

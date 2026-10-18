@@ -4080,6 +4080,22 @@ class TestLaunch(Base):
         self.assertEqual(self.world.herdr.socket_calls, [])
         self.assertEqual(set(self.world.v2.sessions), before)
 
+    def test_the_chief_of_staff_and_review_lanes_keep_the_shared_directory(self):
+        root = self.wrapper_world()
+        for name in ("cos", "planrev-a"):
+            self.assertEqual(sb.agent_tmp_env(self.engine, name), {})
+        self.assertFalse(root.exists())
+        with self.assertRaises(sb.LaunchError):
+            sb.agent_tmp_env(self.engine, "Bad/Name")
+
+    def test_a_path_that_is_not_our_directory_fails_the_launch(self):
+        root = self.wrapper_world()
+        root.mkdir(parents=True)
+        (root / "coder").symlink_to(self.home)
+        with self.assertRaises(sb.LaunchError):
+            self.launch()
+        self.assertIn("not a plain directory", sb.reclaim_agent_tmp(self.engine, "coder")[0])
+
     def test_the_launch_environment_is_otherwise_unchanged(self):
         self.wrapper_world()
         self.launch()
@@ -17477,6 +17493,12 @@ class TestGhShim(Base):
         self.assertEqual(calls, [])
         done, seen, lines = self.shim_warnings("issue", "comment", "2", "--body-file", paths[1])
         self.assertEqual((done.returncode, len(lines)), (0, 1))
+
+    def test_the_warning_shows_no_control_characters(self):
+        done, seen, lines = self.shim_warnings("issue", "comment", "2", "--body-file", "/tmp/a\x1b[31m\rb.md")
+        self.assertEqual(len(lines), 1)
+        self.assertNotIn("\x1b", done.stderr.split("real gh")[0])
+        self.assertNotIn("\r", done.stderr)
 
     def test_the_unchanged_exit_code_and_gh_api_fields(self):
         done, seen, lines = self.shim_warnings("issue", "comment", "2", "--body-file", "/tmp/x.md", env={"FAKE_GH_EXIT": "3"})
