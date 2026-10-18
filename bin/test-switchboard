@@ -25333,12 +25333,17 @@ class TestPlanWake(Base):
         self.assertTrue(self.to("cos")[0].endswith("plan check FAIL"))
 
     def watch_reads(self):
-        """The single-issue reads made from inside the plan wake pass (other triage rules read issues too)."""
+        """The single-issue reads made from inside the plan wake pass (other triage rules read issues too), as (path, fresh).
+        Like the real hub, a read that is not fresh answers with the CACHED record, a fresh one with the live record."""
         self.reads_made = []
         original = self.hub._read_one
         def counting(repo, path, now, fresh=False):
             if any(f.name == "plan_wake_pass" for f in traceback.extract_stack()):
-                self.reads_made.append(path)
+                self.reads_made.append((path, fresh))
+            if not fresh:
+                number = int(path.rsplit("/", 1)[1])
+                if number in self.hub.open.get(repo, {}):
+                    return dict(self.hub.open[repo][number])
             return original(repo, path, now, fresh)
         self.hub._read_one = counting
 
@@ -25358,7 +25363,7 @@ class TestPlanWake(Base):
         self.go()
         h = sb.plan_check.plan_hash(record["body"])
         self.assertEqual(self.to("orch"), ["plan posted on #3: https://github.com/acme/api/issues/3#issuecomment-%d %s, plan check PASS" % (record["id"], h)])
-        self.assertEqual(len(self.reads()), 1)
+        self.assertEqual(self.reads(), [("issues/2", True)])   # once, fresh, for the ask that supplied the Done-when
 
     def test_a_fresh_body_that_still_mismatches_says_fail_and_audits_the_defect(self):
         notes = []
@@ -25392,6 +25397,23 @@ class TestPlanWake(Base):
         sb.plan_wake_pass(self.engine, self.engine.triage, ["acme/api"], self.world.clock.now(), [0])
         self.assertEqual(self.reads(), [])
         self.assertTrue(self.to("orch")[0].endswith("may be stale; run plan check)"))
+
+    def test_the_re_read_is_charged_to_the_budget_once_per_plan(self):
+        self.add(4, parent=2)
+        self.post(3, self.plan())
+        self.post(4, self.plan())
+        self.stale_ask()
+        self.go()                                  # builds the units and announces both plans
+        self.engine.plan_wake.facts.clear()
+        self.engine.plan_wake.announced.clear()
+        self.reads_made.clear()
+        budget = [1]
+        sb.plan_wake_pass(self.engine, self.engine.triage, ["acme/api"], self.world.clock.now(), budget)
+        self.assertEqual(budget, [0])
+        self.assertEqual(self.reads(), [("issues/2", True)])           # the second plan finds the budget spent: no read
+        texts = sorted(self.to("orch"))
+        self.assertEqual(sum(x.endswith("plan check PASS") for x in texts), 1)
+        self.assertEqual(sum(x.endswith("may be stale; run plan check)") for x in texts), 1)
 
     def test_a_passing_first_check_makes_no_re_read(self):
         self.watch_reads()
