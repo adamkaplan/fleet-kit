@@ -125,6 +125,8 @@ they type into a shell, and a bare `opencode` there is the old v1 install, outsi
 switchboard, with no `fleet-switchboard` on its PATH. The rest of this section is the
 legacy fleet's route, for a fleet with no switchboard.
 
+Launch a new worker or tester only when `memory_pressure` reports a free percentage of at least 40 and the `Swapouts` counter of `vm_stat` is unchanged between two reads 30 seconds apart (swap used is sticky on macOS and is not the test).
+
 How you start a named agent without the switchboard depends on which CLI is
 installed and, for opencode, which generation. A launch that works on one silently
 falls back to the default agent on another. Detect first, then use the matching

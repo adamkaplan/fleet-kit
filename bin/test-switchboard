@@ -15115,6 +15115,23 @@ class TestWorkerRulesInSkills(unittest.TestCase):
             self.assertNotRegex(text, r"(?i)\b(coder\d|cos\b|fleet-upkeep|adam\b)")
 
 
+class TestLaunchMemoryTest(unittest.TestCase):
+    """#758: the launch memory test is said once in the coordination skill; no swap-used percentage rule anywhere."""
+    SENTENCE = "Launch a new worker or tester only when `memory_pressure` reports a free percentage of at least 40 and the `Swapouts` counter of `vm_stat` is unchanged between two reads 30 seconds apart (swap used is sticky on macOS and is not the test)."
+
+    def test_the_sentence_is_in_the_coordination_skill_exactly_once(self):
+        self.assertEqual((REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text().count(self.SENTENCE), 1)
+
+    def test_no_skill_or_definition_states_a_swap_used_percentage_rule(self):
+        files = list(REPO.glob("skills/*/SKILL.md")) + list(REPO.glob("agents/opencode/*.md")) + list(REPO.glob("agents/copilot/*.agent.md"))
+        self.assertTrue(files)
+        for f in files:
+            self.assertNotRegex(f.read_text(), r"(?i)swap[^.\n]{0,40}\d+\s*(%|percent)", f.name)
+
+    def test_the_sentence_names_roles_never_agents_or_people(self):
+        self.assertNotRegex(self.SENTENCE, r"(?i)\b(coder\d|cos\b|fleet-upkeep|adam\b)")
+
+
 class TestPlanningSkill(unittest.TestCase):
     """skills/fleet-planning: short, installed like the other skills, and its own example passes `plan check`."""
     SKILL = REPO / "skills" / "fleet-planning" / "SKILL.md"
