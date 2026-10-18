@@ -24719,6 +24719,34 @@ class TestTriageT5Rollup(Base):
         self.assertEqual(self.run_pass(ds, 3600), ([], []))                          # once in 24 hours
         self.assertEqual(self.run_pass(ds, 3600)[1], [])
 
+    def test_s8_three_thousand_items_are_one_capped_line_under_the_limit(self):
+        seen = {"T5 acme/api#%d" % i: {"at": float(i), "n": 1, "sig": "", "flagged": False} for i in range(3000)}
+        line = sb.triage_digest.rollup(seen, {}, [k[3:] for k in seen], 10 * self.DAY)
+        self.assertLess(len(line), 1500)
+        self.assertTrue(line.startswith("3000 items waiting on the owner for more than a day: #0 #1 #2 "))
+        self.assertEqual(line.count("#"), 30)                                       # 30 names, oldest listing first
+        self.assertTrue(line.endswith("... and 2970 more (fleet-switchboard decisions --tier all)"))
+        long = {"T5 %s/%s#%d" % ("o" * 90, "r" * 90 + str(i), i): {"at": float(i), "n": 1, "sig": "", "flagged": False} for i in range(40)}
+        self.assertLess(len(sb.triage_digest.rollup(long, {}, [k[3:] for k in long], 10 * self.DAY)), 1500)   # long names: still under it
+
+    def test_s9_the_names_carry_the_repository_only_when_there_are_several(self):
+        rec = {"at": 0.0, "n": 1, "sig": "", "flagged": False}
+        two = {"T5 acme/api#7": rec, "T5 acme/web#7": rec}
+        self.assertEqual(sb.triage_digest.rollup(two, {}, ["acme/api#7", "acme/web#7"], self.DAY),
+                         "2 items waiting on the owner for more than a day: acme/api#7 acme/web#7")
+        self.assertEqual(sb.triage_digest.rollup({"T5 acme/api#7": rec}, {}, ["acme/api#7"], self.DAY),
+                         "1 items waiting on the owner for more than a day: #7")
+
+    def test_s10_an_undelivered_roll_up_stays_one_pending_fact_for_the_fact_mechanism_to_retry(self):
+        ds = [self.decision(7)]
+        self.run_pass(ds)
+        self.assertEqual(len(self.run_pass(ds, self.DAY)[1]), 1)
+        pending = lambda: {k: v[0] for k, v in self.engine.triage.facts.items() if k.startswith("triage.rollup")}
+        before = pending()
+        for _ in range(3):
+            self.run_pass(ds, 3600)
+        self.assertEqual(pending(), before)                                          # kept, same text, not duplicated
+
     def test_s4_an_item_that_leaves_the_tier_disappears_and_an_empty_roll_up_is_not_sent(self):
         ds = [self.decision(7), self.decision(9)]
         self.run_pass(ds)

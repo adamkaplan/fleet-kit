@@ -214,17 +214,40 @@ def commit(seen, items, shown, invalid, now):
 ROLLUP_SECONDS = 86400
 
 
-def rollup(seen, meta, t5_refs, now):
+ROLLUP_ITEMS = 30   # the most items one roll-up line names (oldest listing first)
+ROLLUP_CHARS = 1500   # and the most characters it takes: far under the delivered-message cap, whatever the names
+
+
+def _ref_key(ref):
+    repo, _, number = ref.rpartition("#")
+    return (repo, int(number) if number.isdigit() else 0, ref)
+
+
+def rollup(seen, meta, t5_refs, now, limit=ROLLUP_ITEMS):
     """The one daily roll-up line (#766), or None. It names the T5 items listed at least a day ago that are still findings now
-    (`t5_refs`: an item that left the owner's tier is not there, and `prune` has forgotten it). An item with no earlier listing is not named. On a line, `meta["rollup"]` is set and the caller writes the seen-file."""
+    (`t5_refs`: an item that left the owner's tier is not there, and `prune` has forgotten it). At most `limit` names, the oldest
+    listing first, then `... and M more`; the names carry the repository when more than one repository is among them. On a line,
+    `meta["rollup"]` is set and the caller writes the seen-file."""
     last = meta.get("rollup")
     if last is not None and now - last < ROLLUP_SECONDS:
         return None
-    refs = sorted({ref for ref in t5_refs if "T5 " + ref in seen and now - seen["T5 " + ref]["at"] >= ROLLUP_SECONDS}, key=lambda r: (r.rpartition("#")[0], int(r.rpartition("#")[2]) if r.rpartition("#")[2].isdigit() else 0, r))
+    refs = sorted({ref for ref in t5_refs if "T5 " + ref in seen and now - seen["T5 " + ref]["at"] >= ROLLUP_SECONDS},
+                  key=lambda r: (seen["T5 " + r]["at"], _ref_key(r)))
     if not refs:
         return None
     meta["rollup"] = now
-    return "%d items waiting on the owner for more than a day: %s" % (len(refs), " ".join("#" + r.rpartition("#")[2] if "#" in r else r for r in refs))
+    several = len({r.rpartition("#")[0] for r in refs}) > 1
+    name = lambda r: r if several or "#" not in r else "#" + r.rpartition("#")[2]
+    head = "%d items waiting on the owner for more than a day:" % len(refs)
+    shown = []
+    for ref in refs[:limit]:
+        more = len(refs) - len(shown) - 1
+        tail = " ... and %d more (fleet-switchboard decisions --tier all)" % (more + 1) if more >= 0 else ""
+        if len(head) + sum(len(name(r)) + 1 for r in shown) + len(name(ref)) + 1 + len(tail) > ROLLUP_CHARS:
+            break
+        shown.append(ref)
+    left = len(refs) - len(shown)
+    return head + "".join(" " + name(r) for r in shown) + (" ... and %d more (fleet-switchboard decisions --tier all)" % left if left else "")
 
 
 def prune(seen, candidates):
