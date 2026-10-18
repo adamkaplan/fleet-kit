@@ -246,7 +246,7 @@ class TestConfig(Base):
         self.assertFalse(self.config_file.exists())
         self.assertEqual(sb.load_config(), {
             "opencode": None, "opencode_env": {}, "opencode_executable": None, "launch_env": {},
-            "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "call_timeout_seconds": 20, "send_timeout_seconds": 60, "poll_seconds": 5,
+            "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "retire_idle_minutes": 10, "call_timeout_seconds": 20, "send_timeout_seconds": 60, "poll_seconds": 5,
             "worker_lookback_hours": 24, "send_to_working": "steer",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
@@ -5524,6 +5524,25 @@ class TestLaunch(Base):
         self.assertEqual((code, self.world.herdr.closed), (1, []), err)
         self.assertIn("pass --force", err)
 
+    def test_an_entry_of_any_shape_for_the_session_in_session_active_is_unknown_never_idle(self):
+        self.close_world(status="working")
+        sid = self.idle_session(86400)
+        for entry in ({}, None, {"type": "idle"}, 0):
+            with mock.patch.object(sb.V2Client, "session_active", return_value={sid: entry}):
+                self.assertIn("pass --force", self.refused_close(), repr(entry))
+                self.assertIn("session state unknown", self.close_audit("fleetpane.close_refused")[-1]["detail"]["why"])
+
+    def test_a_window_that_is_not_a_finite_number_in_range_refuses_at_use(self):
+        self.close_world(status="working")
+        self.idle_session(86400)
+        for bad in (float("nan"), float("inf"), -1, True, "10", 0):
+            self.engine.config["retire_idle_minutes"] = bad
+            seen = self.engine.discover(self.world.clock.now()).agents["worker"]
+            self.assertIsNone(sb.retire_idle_evidence(self.engine, self.world.clock.now, "worker", seen, "working"), repr(bad))
+        self.engine.config["retire_idle_minutes"] = 10
+        seen = self.engine.discover(self.world.clock.now()).agents["worker"]
+        self.assertIn("idle 1 d 0 h", sb.retire_idle_evidence(self.engine, self.world.clock.now, "worker", seen, "working"))
+
     def test_a_blocked_pane_is_never_treated_as_idle_whatever_its_last_activity(self):   # S5
         self.close_world(status="blocked")
         self.idle_session(86400)
@@ -5540,7 +5559,7 @@ class TestLaunch(Base):
     def test_retire_idle_minutes_is_validated_and_sets_the_window(self):
         base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
         self.assertEqual(sb.validate_config(dict(base))["retire_idle_minutes"], 10)
-        for bad in (0, -1, "10", True, None):
+        for bad in (0, 0.5, -1, "10", True, None, float("nan"), float("inf"), 10081):
             with self.assertRaises(sb.ConfigError):
                 sb.validate_config(dict(base, retire_idle_minutes=bad))
 
