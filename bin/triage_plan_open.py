@@ -160,6 +160,8 @@ def approved_by_comment(plan, plan_hash, issue_comments, signed_by):
 # `send:<sender>:<id>` and `detail.description` is `switchboard: <sender> message on <issue tag>: <first 100 characters of the text>` (200 in all), so
 # `Approved at sha256:` + 64 hex (83 characters) fits. A message batched with others (`N items for ...`) is not recognised: the note then fires, as before.
 
+MAX_SENDS = 50000       # audit entries scanned per pass
+MAX_DESCRIPTION = 400   # the daemon writes at most 200 characters
 _SEND_DESC_RE = re.compile(r"^switchboard: ([A-Za-z0-9_.-]{1,64}) message on [^\s:]{1,120}: (.*)$", re.S)
 _QUOTED_LINE_RE = re.compile(r"(?:^|[\r\n])\s*>")
 
@@ -187,9 +189,10 @@ def approved_by_send(plan, plan_hash, entries, signed_by):
         return False
     token = re.compile(r"(?<![0-9a-f])%s(?![0-9a-f])" % full)
     starts = re.compile(r"^Approved at sha256:%s(?![0-9a-f])" % full, re.I)
-    for entry in entries or []:
+    for entry in (entries or [])[-MAX_SENDS:]:   # bounded: the caller's audit tail is 8 MiB, and only the newest entries are read; a failure to match is only the old note
         detail = entry.get("detail") if isinstance(entry, dict) else None
-        if not isinstance(detail, dict) or entry.get("event") != "v2.synthetic" or not isinstance(detail.get("description"), str):
+        if (not isinstance(detail, dict) or entry.get("event") != "v2.synthetic" or not isinstance(detail.get("description"), str)
+                or len(detail["description"]) > MAX_DESCRIPTION):
             continue
         sender = _send_sender(detail)
         found = _SEND_DESC_RE.match(detail["description"])
