@@ -5450,6 +5450,65 @@ class TestLaunch(Base):
         self.assertEqual(code, 0, err)
         self.assertEqual(self.world.herdr.closed, [self.world.panes["worker"]])
 
+    def idle_session(self, ago, turn=None):
+        sid = self.world.sessions["worker"]
+        self.world.v2.sessions[sid]["idle"] = self.world.clock.now() - ago
+        self.world.v2.sessions[sid]["turn"] = turn
+        return sid
+
+    def refused_close(self, *extra):
+        self.as_("boss")
+        code, out, err = self.run_cli("retire", "worker", "--close", *extra)
+        self.assertEqual((code, self.world.herdr.closed), (1, []), err)
+        return err
+
+    def test_a_working_pane_with_an_idle_session_is_closed_without_force_and_the_evidence_is_named_and_audited(self):   # S1 S6 S8
+        self.close_world(status="working")
+        self.idle_session(27 * 3600)
+        self.as_("boss")
+        with mock.patch.object(sb.V2Client, "session_active", autospec=True, side_effect=sb.V2Client.session_active) as read:
+            code, out, err = self.run_cli("retire", "worker", "--close")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.world.herdr.closed, [self.world.panes["worker"]])
+        self.assertIn("herdr says working; the session has been idle 1 d 3 h and has no turn: treated as idle", out)
+        (row,) = self.close_audit("fleetpane.closed")
+        self.assertIn("idle 1 d 3 h and has no turn", row["detail"]["evidence"])
+        self.assertLessEqual(read.call_count, 1, "one added session read for the whole retire")
+
+    def test_a_working_pane_is_still_refused_for_a_turn_recent_activity_or_a_state_that_is_unreadable_or_odd(self):   # S2 S3 S4
+        self.close_world(status="working")
+        self.idle_session(86400, turn={"id": "t"})
+        self.assertIn("pass --force", self.refused_close())
+        self.idle_session(120)
+        self.assertIn("pass --force", self.refused_close())
+        self.idle_session(86400)
+        with mock.patch.object(sb.V2Client, "session_active", side_effect=sb.V2Error("http", "down")):
+            self.assertIn("pass --force", self.refused_close())
+        with mock.patch.object(sb.V2Client, "session_active", return_value=["x"]):
+            self.assertIn("pass --force", self.refused_close())
+        self.world.v2.sessions[self.world.sessions["worker"]]["idle"] = None   # no last activity known
+        self.assertIn("pass --force", self.refused_close())
+
+    def test_a_blocked_pane_is_never_treated_as_idle_whatever_its_last_activity(self):   # S5
+        self.close_world(status="blocked")
+        self.idle_session(86400)
+        self.assertIn("is blocked: pass --force", self.refused_close())
+
+    def test_an_idle_session_does_not_lift_the_unpushed_work_refusal(self):   # S7
+        self.close_world(status="working")
+        self.make_repo()
+        wt = self.add_worktree("w-idle-unpushed", unpushed=True)
+        sb.register_worktree(self.world.state, str(wt), "worker", None, "w-idle-unpushed", 1)
+        self.idle_session(86400)
+        self.assertIn("unpushed", self.refused_close())
+
+    def test_retire_idle_minutes_is_validated_and_sets_the_window(self):
+        base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
+        self.assertEqual(sb.validate_config(dict(base))["retire_idle_minutes"], 10)
+        for bad in (0, -1, "10", True, None):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_config(dict(base, retire_idle_minutes=bad))
+
     def test_retire_without_close_closes_nothing_and_a_close_that_fails_is_audited_and_the_agent_stays_retired(self):
         self.close_world()
         self.as_("boss")
