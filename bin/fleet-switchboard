@@ -317,6 +317,7 @@ EXIT_ERROR = 1
 EXIT_USAGE = 2
 EXIT_PARTIAL = 4   # `prove`: at least one named scenario was not recorded (a usage error is 2)
 EXIT_HELD = 3   # `send`: the delivery rule says hold; nothing was sent
+EXIT_MEMORY = 5   # `launch`: the memory test refused a NEW launch (the machine cannot take it); `--memory-ok <reason>` overrides
 EXIT_CRASH = 70  # the `crash-after-send` fault stopped the process, as a crash would
 
 # ------------------------------------------------------------------ the config
@@ -2856,6 +2857,104 @@ class DockerReapFacts:
             engine._note("docker.reap_error", None, {"error": _plain("%s: %s" % (type(err).__name__, err), 160)})
 
 
+TEMP_JANITOR_FILE = "temp-janitor-daemon.json"
+TEMP_JANITOR_INTERVAL = 6 * 86400   # the weekly gate: never twice within 6 days
+TEMP_JANITOR_NAMES = 200            # names carried by one audit line (the count says the rest)
+
+
+class TempJanitorFacts:
+    """The weekly temp janitor, run by the daemon itself (ask #762), the way `DockerReapFacts` runs the Docker reaper. The call is told apart from an agent's
+    by the PATH it takes, never by anything a caller passes: this class runs only in the daemon's own process, only when that process set
+    `engine.temp_janitor_runner` (a test engine and every command-line process has none), and it calls `disk_janitor.run` directly, never `cmd_disk_janitor`
+    (whose refusal of an agent stays). It reads `temp_janitor.daemon_apply` (default false: a dry run, audited as `janitor.would_remove`); the command line never reads it.
+    The selection rule is the janitor's own, unchanged. Once `TEMP_JANITOR_INTERVAL` has passed since the last run (kept in `temp-janitor-daemon.json`, written BEFORE
+    the run, so a crash or a restart does not repeat it); an unreadable stamp means do not run. A background thread; returns no facts."""
+
+    __name__ = "temp_janitor_facts"
+
+    def __init__(self):
+        self.engine, self.thread, self.noted = None, None, False
+
+    def bind(self, engine):
+        self.engine = engine
+
+    def _last(self, state_dir):
+        """(ok, time or None): a missing file is (True, None); a file that cannot be read in full is (False, None): the doubt keeps everything."""
+        try:
+            with open(str(Path(state_dir) / TEMP_JANITOR_FILE)) as handle:
+                text = handle.read(1024)
+        except FileNotFoundError:
+            return True, None
+        except OSError:
+            return False, None
+        try:
+            return True, float(json.loads(text)["at"])
+        except (ValueError, KeyError, TypeError):
+            return False, None
+
+    def __call__(self):
+        engine = self.engine
+        runner = getattr(engine, "temp_janitor_runner", None) if engine is not None else None
+        if runner is None or engine.state_dir is None:
+            return []
+        cfg = engine.config.get("temp_janitor") or {}
+        if cfg.get("enabled", True) is False:
+            return []
+        if self.thread is not None and self.thread.is_alive():
+            return []
+        ok, last = self._last(engine.state_dir)
+        if not ok:
+            if not self.noted:
+                self.noted = True
+                engine._note("janitor.state_unreadable", None, {"file": TEMP_JANITOR_FILE, "kept": "nothing was run this pass"})
+            return []
+        now = engine.now()
+        if last is not None and not (now - last >= TEMP_JANITOR_INTERVAL):
+            return []
+        try:   # the stamp first: a run that dies half way is not repeated until the gate opens again
+            path = Path(engine.state_dir) / TEMP_JANITOR_FILE
+            temp = path.with_name("%s.%d.tmp" % (TEMP_JANITOR_FILE, os.getpid()))
+            with open(str(temp), "w") as handle:
+                handle.write(json.dumps({"at": now}))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(str(temp), str(path))
+        except OSError:
+            try:
+                os.unlink(str(temp))
+            except (OSError, UnboundLocalError):
+                pass
+            return []
+        self.thread = threading.Thread(target=self._run, args=(engine, runner, now), name="temp-janitor", daemon=True)
+        self.thread.start()
+        return []
+
+    def _run(self, engine, runner, now):
+        try:
+            janitor = load_disk_janitor()
+            cfg = janitor.settings(engine.config.get("temp_janitor"))
+            apply = cfg["daemon_apply"] is True
+            temp = Path(cfg["dir"]) if cfg.get("dir") else janitor.default_dir()
+            outcome = []
+            started = time.monotonic()
+
+            def fresh_busy(path):   # the re-check right before a removal reads the session index and the processes again, never the run's early copy
+                engine._wt_session_index = None
+                return janitor_busy_function(engine, runner, janitor)(path)
+            with worktree_sweep(engine):   # this thread's own sweep state (it is per thread): the main thread's auto-retire reclaim never shares it
+                lines, removed, kept = janitor.run(
+                    temp, engine.state_dir, now, cfg, apply,
+                    lambda name, detail: engine.audit.append(engine.actor, "temp.removed", _plain(name, 120), detail),
+                    busy=janitor_busy_function(engine, runner, janitor), weekly=True, outcome=outcome, recheck_busy=fresh_busy)
+            used = round(time.monotonic() - started, 1)
+            notes = [_plain(l, 200) for l in lines if not l.startswith(("removed ", "would remove "))][:20]
+            detail = {"count": len(outcome), "bytes": sum(o["bytes"] for o in outcome), "names": [_plain(o["name"], 120) for o in outcome[:TEMP_JANITOR_NAMES]],
+                      "budget_seconds": cfg["weekly_scan_seconds"], "used_seconds": used, "kept": kept, "notes": notes}
+            engine.audit.append(engine.actor, "janitor.summary" if apply else "janitor.would_remove", "temp", detail)
+        except Exception as err:   # a janitor never stops the daemon
+            engine._note("janitor.error", None, {"error": _plain("%s: %s" % (type(err).__name__, err), 160)})
+
+
 class Fact:
     """Something one fleet agent should be told.
 
@@ -2965,7 +3064,7 @@ def fact_sources(state_dir):
     the same rule, and stores nothing.
     """
     return [lab_fact_source(state_dir), WorkerFacts(), ReminderFacts(state_dir), ReportRiderFacts(state_dir),
-            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), JobFacts(), PaneFacts(), HeadlessRestartFacts(), DiskFacts(), CpuFacts(), SpotlightFacts(), DockerReapFacts()]
+            ForegroundFacts(), OrdersFacts(), SweepFacts(), TriageFacts(), PlanWakeFacts(), JobFacts(), PaneFacts(), HeadlessRestartFacts(), DiskFacts(), CpuFacts(), SpotlightFacts(), DockerReapFacts(), TempJanitorFacts()]
 
 
 # --------------------------------------------------------- observing the fleet
@@ -3380,7 +3479,7 @@ def collapse_riders(facts, now, max_age):
 
 
 DESCRIBED_AS = {"send": "message", "report": "report", "worker.idle": "finished", "worker.stopped": "stopped",
-                "worker.blocked": "blocked", "nudge": "nudge", "sweep": "sweep", "triage": "triage", "disk": "disk guard"}
+                "worker.blocked": "blocked", "nudge": "nudge", "sweep": "sweep", "triage": "triage", "plan": "plan posted", "disk": "disk guard"}
 
 
 def _line_of(text, limit):
@@ -4069,6 +4168,31 @@ class Switchboard:
     `audit` None makes it read-only: `pending` and `status` use it that way,
     and any write then raises instead of happening unaudited.
     """
+
+    # The sweep cache of the worktree in-use checks (`worktree_sweep`) is PER THREAD: the daemon's janitor thread and its main thread (auto-retire reclaim)
+    # each hold their own, so one can never read, seed or clear the other's session index (#762).
+    def _wt_state(self):
+        local = self.__dict__.get("_wt_local")
+        if local is None:
+            local = self.__dict__.setdefault("_wt_local", threading.local())
+        return local
+
+    @property
+    def _wt_sweep(self):
+        return getattr(self._wt_state(), "sweep", False)
+
+    @_wt_sweep.setter
+    def _wt_sweep(self, value):
+        self._wt_state().sweep = value
+
+    @property
+    def _wt_session_index(self):
+        return getattr(self._wt_state(), "index", None)
+
+    @_wt_session_index.setter
+    def _wt_session_index(self, value):
+        self._wt_state().index = value
+
 
     def __init__(self, config, v2, herdr, audit, sources=(), now=time.time, actor="daemon", intents=None,
                  state_dir=None):
@@ -4890,7 +5014,7 @@ class Switchboard:
                     now, issue=number, batch=False, sender=sender, repo=repo,
                     rider=state in REPORT_PROGRESS and not fault("no-rider"))
         if fact.rider:
-            if self.state_dir is not None and not record_last_report(self.state_dir, sender, state, now):
+            if self.state_dir is not None and not record_last_report(self.state_dir, sender, state, now, text):
                 self._note("fleetpane.error", sender, {"error": "last-reports.json not written: %s's final report will not retire it automatically" % sender})
             record_report_rider(self, fact)
             return {"sent": False, "action": "rider", "reason": "a progress report is a rider: it rides in the "
@@ -4901,7 +5025,7 @@ class Switchboard:
             earlier = load_report_fold().follows(_read_small(self.state_dir, LAST_REPORT_FILE).get(sender), boss, repo, number, now)
         if earlier is not None:
             fact.summary = load_report_fold().marked(fact.summary, earlier, now)
-        if self.state_dir is not None and not record_last_report(self.state_dir, sender, state, now):
+        if self.state_dir is not None and not record_last_report(self.state_dir, sender, state, now, text):
             self._note("fleetpane.error", sender, {"error": "last-reports.json not written: %s's final report will not retire it automatically" % sender})
         outcome = self.send_fact(fact, discovery, now, waiting, folded=earlier is not None)
         if state == "done" and outcome.get("sent") and self.state_dir is not None and worktree_config(self.config)["on_done"]:
@@ -6025,7 +6149,8 @@ def launch_headless(engine, name, agent, directory, role=None, reports_to=None, 
             ap = load_agent_presence()
             if ap.read_record(engine.state_dir, name)[0] is not None:
                 raise LaunchError("a headless record for %s already exists: `%s retire %s` first, or pick another name" % (name, PROG, name))
-            identity = headless_identity(engine, repo)   # refuses a repo that maps to a named gh account: a headless worker cannot be pinned to it
+            identity = headless_identity(engine, repo)   # a repo that maps to a named gh account is refused unless the route can be proved (below, once the session exists)
+            account = engine.accounts.account_for(repo) if repo and getattr(engine, "accounts", None) is not None else None
             fleet = fleet_record(name, role, reports_to, issue, charter, repo, launched_by)
             fleet["headless"] = True
             with engine._external("v2.session.create", name, {"agent": agent, "directory": directory, "fleet": fleet, "headless": True}) as result:
@@ -6036,10 +6161,12 @@ def launch_headless(engine, name, agent, directory, role=None, reports_to=None, 
                 info = engine.v2.session_get(session_id) or {}
                 if ((_fleet_meta(info) or {}).get("name")) != name:
                     raise LaunchError("the service does not show the new session as %s: nothing was sent" % name)
+                if account:
+                    identity = prove_headless_route(engine, session_id, name, repo, account)   # before the brief: nothing runs as a wrong account
                 if brief:
                     send_brief(engine, name, session_id, brief)
                 if engine.audit is not None:
-                    engine.audit.append(engine.actor, "headless.launched", name, {"session": session_id, "agent": agent, "directory": _one_line(directory, 160), "brief_chars": len(brief or "")})
+                    engine.audit.append(engine.actor, "headless.launched", name, {"session": session_id, "agent": agent, "directory": _one_line(directory, 160), "brief_chars": len(brief or ""), "account": account or None, "repo": repo, "route": "shims+record" if account else None})
             except Exception as err:
                 cleaned = undo_headless_launch(engine, ap, name, session_id)
                 raise LaunchError("%s (%s)" % (_one_line(str(err)), cleaned)) from err
@@ -6053,24 +6180,81 @@ def headless_identity(engine, repo):
     """The identity a headless worker will have, as one line; refuses (LaunchError) when it would be the WRONG one.
 
     A terminal worker is pinned to its repo's gh account by its pane's environment (GH_TOKEN). A headless worker's tools run in the OpenCode service,
-    and nothing durable pins them: `session.create` and `session.prompt` carry no environment, and `PUT /api/session/{id}/environment`, which does
-    set one, is held in the service's memory and is gone after a service restart (measured in a throwaway profile: the variable was set, then empty
-    after `service restart`), at which point the worker would silently act as the service's default account. So a repo that `gh_users` maps to a
-    named account is refused: use a terminal launch. Any other worker acts as the account of the service's environment, and says so."""
+    where nothing per session is durable (`PUT /api/session/{id}/environment` is lost on a service restart). What IS durable is the per-command route:
+    the fleet-hooks plugin puts the `gh` and `git` shims first on PATH of every shell command, and the shim asks `whoami --json` (the command's
+    OPENCODE_SESSION_ID and the repo in the session's metadata) which account to use, for that one command. So a repo that `gh_users` maps to a named
+    account is accepted only when `engine.route_check` exists and `prove_headless_route` proves that route for the new session; with no route check
+    it is refused, as before. Any other worker acts as the account of the service's environment, and says so."""
     accounts = getattr(engine, "accounts", None)
     if repo and accounts is None:   # fail closed: with no account map nothing says which account this repo uses
         raise LaunchError("cannot tell which gh account %s uses (no account map): a headless worker is refused" % repo)
     if repo:
         account = accounts.account_for(repo)
         if account:
-            raise LaunchError("a headless worker cannot work as the gh account %s that gh_users maps %s to: its tools run in the OpenCode service's environment, "
-                              "which cannot be pinned to an account (a service restart drops any per-session setting), so it would act as the service's own "
-                              "default account. Use a terminal launch (omit --headless)" % (account, repo))
+            if getattr(engine, "route_check", None) is None:
+                raise LaunchError("a headless worker cannot work as the gh account %s that gh_users maps %s to: its tools run in the OpenCode service's environment, "
+                                  "which cannot be pinned to an account (a service restart drops any per-session setting), so it would act as the service's own "
+                                  "default account. Use a terminal launch (omit --headless)" % (account, repo))
+            problem = engine.route_check()   # the shims the service puts first on PATH exist: a text, or None
+            if problem:
+                raise LaunchError("a headless worker cannot work as the gh account %s that gh_users maps %s to: its tools run in the OpenCode service's environment, "
+                                  "which cannot be pinned to an account, and the per-command route that would choose it cannot be proved (%s). "
+                                  "Use a terminal launch (omit --headless)" % (account, repo, problem))
+            return "this headless worker is set up to act as the gh account %s for %s (the gh and git shims choose it per command; the service side is not checked yet)" % (account, repo)
         problem = launch_account_problem(engine.config, accounts, repo)
         if problem:
             raise LaunchError(problem)
         return "this headless worker acts as the OpenCode service environment's own gh account (gh_users has no entry for %s)" % repo
     return "this headless worker acts as the OpenCode service environment's own gh account (it has no repo)"
+
+
+def shim_route_problem(environ=None, home=None, config_dir=None, kit_root=None):
+    """None when what the OpenCode service loads would put this checkout's `gh` and `git` shims first on a shell's PATH, else the reason. Two things are read
+    (files only, nothing written): (1) the shims: FLEET_SWITCHBOARD_SHIMS, or else the `shims` directory beside the checkout that ~/.local/bin/fleet-switchboard
+    links to, each of `gh` and `git` executable; (2) the install state of the plugin: `plugins/fleet-hooks.js` in the OpenCode profile's config directory
+    (`opencode_config_dir` of the caller, else $XDG_CONFIG_HOME/opencode) is present and byte-equal to this checkout's plugin. It cannot see the service's own
+    environment: a mistake-guard, not a proof."""
+    environ = os.environ if environ is None else environ
+    given = environ.get("FLEET_SWITCHBOARD_SHIMS")
+    try:
+        if given:
+            shims = Path(given)
+            if not shims.is_absolute():
+                return "FLEET_SWITCHBOARD_SHIMS is not an absolute path, so the plugin's shell hook is off"
+        else:
+            shims = Path(os.path.realpath(Path(home or Path.home()) / ".local" / "bin" / "fleet-switchboard")).parent.parent / "shims"
+        for tool in ("gh", "git"):
+            if not os.access(shims / tool, os.X_OK):
+                return "the %s shim is not in place, so the plugin's shell hook has nothing to put first on PATH" % tool
+        config = Path(config_dir) if config_dir else _xdg("XDG_CONFIG_HOME", ".config") / "opencode"
+        installed = config / "plugins" / HOOKS_PLUGIN_FILE
+        wanted = (Path(kit_root or KIT_ROOT) / "plugins" / "fleet-hooks" / "index.js").read_bytes()
+        try:
+            have = installed.read_bytes()
+        except FileNotFoundError:
+            return "the plugin file %s is not installed in the OpenCode profile (%s), so the service has no shell hook" % (HOOKS_PLUGIN_FILE, config)
+        if hashlib.sha256(have).digest() != hashlib.sha256(wanted).digest():
+            return "the installed plugin file %s (%s) differs from this checkout's: run `%s install`" % (HOOKS_PLUGIN_FILE, config, PROG)
+    except OSError as err:
+        return "the shims or the plugin file cannot be read (%s)" % _one_line(str(err))
+    return None
+
+
+def prove_headless_route(engine, session_id, name, repo, account):
+    """A best-effort check, NOT a proof of the service side: the same lookup the gh shim makes from a command of the new session (`whoami --json`: its OPENCODE_SESSION_ID, then the repo in the service's
+    own record of that session) must name this worker and this repo, and the map must give the repo's account. Names only, never a token. Raises
+    LaunchError (the caller deletes the session) when it does not."""
+    try:
+        fleet = session_identity(engine.herdr, engine.v2, {SESSION_ENV: session_id})
+    except (V2Error, CallerError, IdentityUncertain) as err:
+        raise LaunchError("a headless worker cannot be proved to act as the gh account %s for %s: the session lookup failed (%s)" % (account, repo, _one_line(str(err)))) from err
+    seen = (fleet or {}).get("repo")
+    if (fleet or {}).get("name") != name or seen != repo or engine.accounts.account_for(seen) != account:
+        raise LaunchError("a headless worker cannot be proved to act as the gh account %s for %s: the service's record of the session names %s as its repo" % (account, repo, seen or "none"))
+    return ("this headless worker is set up to act as the gh account %s for %s: the shims and the installed plugin file are in place on the launcher's side and the session record resolves to that repo. "
+            "NOT checked: that the OpenCode service runs the plugin it was started with (the installed plugin file is checked, not the running service; it cannot be probed "
+            "without a model turn). This is a mistake-guard, not a boundary: a command can name another session, and a tool that reads a token from its own environment "
+            "bypasses the shims. A terminal launch pins the account in the pane's environment" % (account, repo))
 
 
 def undo_headless_launch(engine, ap, name, session_id):
@@ -6404,7 +6588,7 @@ def record_last_send(state_dir, sender, recipient, now, repo=None, issue=None):
         return False
 
 
-def record_last_report(state_dir, sender, state, now):
+def record_last_report(state_dir, sender, state, now, text=None):
     """Remember the last report `sender` made (state and time): what lets the daemon tell a worker its boss closed on purpose after its final `done`
     from one that died. Best effort, under a lock, never raises into `report`. Returns whether it was written: a failure is the SAFE direction (the
     worker then still shows DEAD and is never wrongly retired), and the caller notes it."""
@@ -6412,6 +6596,8 @@ def record_last_report(state_dir, sender, state, now):
         with agent_lock(state_dir, "files", seconds=2):
             data = _read_small(state_dir, LAST_REPORT_FILE)
             entry = {"state": state, "at": int(now)}
+            if isinstance(text, str) and text:
+                entry["text"] = _one_line(redact_command_text(text), REPORT_MAX)   # untrusted text: redacted before it is stored (#773)   # the one line, for the idle-at-a-seam wake (#773)
             if isinstance((data.get(sender) or {}).get("send_to"), dict):
                 entry["send_to"] = data[sender]["send_to"]   # a report does not forget the last sends
             if isinstance((data.get(sender) or {}).get("send_on"), dict):
@@ -6601,6 +6787,7 @@ class PaneFacts:
         return out
 
 
+HEADLESS_ROUTE_FILE = "headless-route.json"   # {"workers": {worker: {"problem", "repo"}}}: headless workers whose account route is not in place (#669)
 HEADLESS_SERVICE_FILE = "headless-service.json"   # {"service": {"pid", "from", "at"}, "bosses": {worker: boss}}: what the restart notice remembers
 
 
@@ -6663,6 +6850,7 @@ class HeadlessRestartFacts:
                                   "and the session may need a poke: check it with `%s status`." % (
                                       service["pid"], service["from"], iso(service.get("at") or engine.now()), name, PROG),
                                   float(service.get("at") or engine.now()), issue=_issue_of(observation.fleet), sender="switchboard"))
+        facts.extend(self.route_facts(engine, state, discovery, headless))
         if discovery.problems:   # the service (or herdr) did not answer cleanly: a missing worker may only be unread, so nothing is called lost
             return facts
         chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff")
@@ -6677,6 +6865,48 @@ class HeadlessRestartFacts:
                                   "`%s retire %s` if it is finished, otherwise relaunch it." % (name, record["session"], PROG, name),
                                   float(record.get("created") or engine.now()), sender="switchboard"))
         return facts
+
+
+    def route_facts(self, engine, state, discovery, headless):
+        """#669: every pass, each headless worker whose repo `gh_users` maps to a named account is checked again with the launch's own route check (files
+        only). While it fails the boss gets ONE wake per problem and `status` prints a line; when it holds again the line goes. Nothing is written but
+        this small state file."""
+        check, accounts = getattr(engine, "route_check", None), getattr(engine, "accounts", None)
+        if check is None or accounts is None:
+            return []
+        bad, facts = {}, []
+        try:
+            problem = check()
+            for name, observation in sorted(headless.items()):
+                repo = (observation.fleet or {}).get("repo")
+                if problem and isinstance(repo, str) and accounts.account_for(repo):
+                    bad[name] = {"problem": _one_line(problem, 240), "repo": repo}
+        except Exception as err:   # a check that cannot run is no finding
+            engine._note("source.error", "headless_route_facts", {"error": _one_line(str(err))})
+            return []
+        for name, found in bad.items():
+            boss = boss_name(discovery, headless[name])
+            if boss is not None:
+                key = "headless.route:%s:%s:%s" % (name, headless[name].session_id, hashlib.sha256(found["problem"].encode()).hexdigest()[:12])
+                facts.append(Fact(key, boss, "headless.route",
+                                  "%s has no terminal and works on %s, which maps to a named gh account, but the route that picks that account is no longer in place: %s. "
+                                  "Until it is, its gh and git commands may run as the service's default account. Fix the install, or relaunch it with a terminal." % (
+                                      name, found["repo"], found["problem"]), float(engine.now()), issue=_issue_of(headless[name].fleet), sender="switchboard"))
+        if _read_small(state, HEADLESS_ROUTE_FILE).get("workers", {}) != bad:
+            try:
+                _write_small(state, HEADLESS_ROUTE_FILE, {"workers": bad})
+            except OSError as err:
+                engine._note("source.error", "headless_route_facts", {"error": _one_line(str(err))})
+        return facts
+
+
+def headless_route_status_lines(state_dir):
+    """The `status` lines for headless workers whose account route stopped being true (nothing when all hold)."""
+    if state_dir is None:
+        return []
+    workers = _read_small(state_dir, HEADLESS_ROUTE_FILE).get("workers") or {}
+    return ["      route      %s: gh account route for %s is NOT in place: %s" % (_one_line(n, 60), _one_line(str(v.get("repo")), 80), _one_line(str(v.get("problem")), 200))
+            for n, v in sorted(workers.items()) if isinstance(v, dict)]
 
 
 def pane_health_status_lines(state_dir, now=None):
@@ -8158,6 +8388,7 @@ REPORT_ATTENTION = ("done", "failed", "blocked", "question")  # wake the boss wh
 REPORT_PROGRESS = ("working", "paused", "withdrawn")          # riders: carried, never the reason for a message
 REPORT_STATES = REPORT_ATTENTION + REPORT_PROGRESS
 WITHDRAW_ALL = decision_core.WITHDRAW_ALL  # leads a `withdrawn` report made with --all: it clears every open question of the worker
+SEAM_IDLE_SECONDS = 1200   # #773: an idle worker whose last report was `working` is noticed after this long
 REPORT_MAX = 300  # characters: a report is a sentence; detail goes on GitHub
 SUMMARY_CAP = 600  # characters of a worker's last reply in its fact
 LAB_WORKER_SINCE_ENV = "FLEET_SWITCHBOARD_LAB_WORKER_SINCE"
@@ -8263,7 +8494,40 @@ class WorkerFacts:
         idle = Fact(key, boss, WORKER_IDLE, head + (": " + reply if reply else ""), observation.idle_at,
                     issue=_issue_of(observation.fleet), sender=observation.name, rider=not fault("idle-wakes"))
         idle.clean = observation.outcome in QUIET_OUTCOMES  # only a clean finish may be folded into a quiet line
-        return self.stop_facts(observation, boss, idle_ms, idle, reply)
+        found = self.stop_facts(observation, boss, idle_ms, idle, reply)
+        if len(found) == 1 and found[0].kind == WORKER_IDLE:   # nothing else is said about this stop: it may be an idle at a seam (#773)
+            found = found + self.seam_facts(observation, boss, idle_ms)
+        return found
+
+    def seam_facts(self, observation, boss, idle_ms):
+        """#773: idle SEAM_IDLE_SECONDS or more, an OPEN assignment, and a last report of `working`: ONE nudge for the worker and ONE wake
+        for its boss, each keyed by this idle stretch (`idle_at`), so neither is sent twice. Reads nothing new: the observation, the
+        last-reports.json record `report` wrote, the retired list, and the closed-issue events the hub already holds (no `gh` call)."""
+        engine, state_dir = self.engine, self.engine.state_dir
+        issue = _issue_of(observation.fleet)
+        if state_dir is None or issue is None or engine.now() - observation.idle_at < SEAM_IDLE_SECONDS:
+            return []
+        kept = read_retired(state_dir).get(observation.name)
+        if kept is not None and kept.get("session") in (None, observation.session_id):
+            return []   # retired on purpose
+        last = _read_small(state_dir, LAST_REPORT_FILE).get(observation.name)
+        if not isinstance(last, dict) or last.get("state") != "working":
+            return []   # a closing report (or none) is the existing triage's business
+        repo = _fleet_repo(observation.fleet, engine.config) or engine.config.get("intent_repo")
+        hub = getattr(engine, "hub", None)
+        # Fails OPEN on purpose: the hub keeps closed events in memory only, so after a restart a closed issue can get one nudge and one wake.
+        closed = hub.closed_issue_snapshot() if hub is not None and hasattr(hub, "closed_issue_snapshot") else {}
+        if repo and "%s#%d" % (plan_ledger.normal_repo(repo), issue) in closed:
+            return []   # its assignment is closed
+        stretch = "%s:%s:%d" % ("seam", observation.session_id, int(round(observation.idle_at * 1000)))
+        line = last.get("text") if isinstance(last.get("text"), str) else ""
+        nudge = Fact("%s:%s" % (NUDGE, stretch), observation.name, NUDGE,
+                     "you went idle after reporting working on #%d: report done, blocked or question, or continue" % issue,
+                     observation.idle_at, issue=issue, batch=False, sender="switchboard", repo=repo)
+        wake = Fact("%s:%s" % (WORKER_IDLE, stretch), boss, WORKER_IDLE,
+                    "idle without a closing report: #%d (worker %s, last report: %s)" % (issue, observation.name, _one_line(redact_command_text(line), 160) or "none recorded"),
+                    observation.idle_at, issue=issue, batch=False, sender=observation.name, repo=repo)
+        return [nudge, wake]
 
     def stop_facts(self, observation, boss, idle_ms, idle, reply):
         """The facts for one stop, worked out once (a stop is asked about once; the cache is rebuilt after a
@@ -9064,6 +9328,53 @@ def mark_batch_note(state_dir, key, when):
         raise
 
 
+ESCALATION_MAX_AGE_SECONDS = 14 * 86400   # a captain escalation older than this is forgotten, whatever else holds it
+
+
+def captain_escalation_leaves(engine, escalated, now):
+    """{key: reason} for the captain escalations that may be pruned, and only on evidence: older than ESCALATION_MAX_AGE_SECONDS
+    (`expired`), or a list read of that repository that SUCCEEDED in this process (`state.good`) shows the pull request absent
+    (`absent`, not from a list that may be cut), at another head (`another head`) or without the hold labels (`no longer held`).
+    The list must have been read AFTER the key was written (a fresh escalation is kept this pass). An empty, unread, failed or
+    never-listed repository gives none. Never raises."""
+    out = {}
+    left = (getattr(engine, "notice_effects", None) or {}).get("left") or set()
+    state = getattr(engine, "ci_record_state", None)
+    good = getattr(state, "good", None) or {}
+    for key, stamp in escalated.items():
+        if not key.startswith("captain:"):
+            continue
+        at = parse_iso(stamp)
+        if at is not None and now - at > ESCALATION_MAX_AGE_SECONDS:
+            out[key] = "expired"
+            continue
+        try:
+            ref, _, head = key[len("captain:"):].rpartition("@")
+            repo, _, number = ref.rpartition("#")
+            if ref in left:
+                out[key] = "merged or closed"
+                continue
+            read = good.get(plan_ledger.normal_repo(repo))
+            if read is None or not number.isdigit() or not head:
+                continue
+            if at is None or read[0] <= at:
+                continue   # the list was read no later than the key was written: it cannot show whether the pull request left
+            records, cut = read[1], read[2]
+            record = next((r for r in records if isinstance(r, dict) and _number(r) == int(number)
+                           and r.get("state", "open") == "open" and not r.get("merged_at")), None)
+            if record is None:
+                if not cut:
+                    out[key] = "absent"
+            elif ((record.get("head") or {}).get("sha") if isinstance(record.get("head"), dict) else None) != head:
+                out[key] = "another head"
+            elif not _label_kind({(l.get("name") if isinstance(l, dict) else l) for l in record.get("labels") or []},
+                                 CAPTAIN_MERGE_LABELS[:1] + CAPTAIN_HOLD_LABELS):
+                out[key] = "no longer held"
+        except Exception:
+            continue
+    return out
+
+
 def captain_escalations_to_keep(engine):
     """The escalations of `MERGE: captain` PR decisions that must survive a pass in which the PR could not be judged: those
     whose notice is still on file. An unreadable PR (a restart's first passes, a 404 under the wrong account, an outage) derives
@@ -9078,15 +9389,32 @@ def captain_escalations_to_keep(engine):
     return {k for k in escalated if k.startswith("captain:") and k[len("captain:"):].rpartition("@")[0] in alive}
 
 
+def prune_escalations_pass(engine, store, now):
+    """The daemon's end-of-pass prune. A captain key is kept unless `captain_escalation_leaves` has evidence (a noticed one is kept
+    as before, but not past the age cap); every other key goes when no longer pending. Each removed key is audited with its reason."""
+    keep = captain_escalations_to_keep(engine)
+    if keep is None or engine.request_keys is None:
+        return
+    escalated = read_escalated(engine.state_dir)
+    leaves = captain_escalation_leaves(engine, escalated, now)
+    captains = {k for k in escalated if k.startswith("captain:")}
+    pending = (set(engine.request_keys) | keep | (captains - set(leaves))) - {k for k, why in leaves.items() if why == "expired"}
+    removed = store.prune_escalated(pending)
+    for key in sorted(removed or ()):
+        if engine.audit is not None:   # not `_note`: the same key pruned twice is two events
+            engine.audit.append(engine.actor, "escalation.pruned", key, {"escalation": key, "reason": leaves.get(key, "request no longer pending")})
+
+
 def prune_escalated(state_dir, pending):
     """Forget every escalation of a request that is no longer pending (the daemon's, once a pass)."""
     if pending is None or not (Path(state_dir) / ESCALATED_FILE).exists():
-        return
+        return []
     with escalated_lock(state_dir):
         found = read_escalated(state_dir)
         kept = {k: v for k, v in found.items() if k in pending}
         if kept != found:
             write_escalated(state_dir, kept)
+        return sorted(set(found) - set(kept))
 
 
 def synthetic_lines(engine, session_id, since, waiting=False):
@@ -9749,6 +10077,29 @@ def captain_evidence(facts, senders):
     return None if facts.get("reviews") is None or facts.get("signed") is None else []
 
 
+PR_REF_LINE_RE = re.compile(r"(?im)^[ \t]*(?:closes|fixes|resolves|part of)[ \t]+(?:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#(\d{1,7})[ \t.]*$")
+
+
+def pr_body_refs(body):
+    """[[repo or None, number]] the STRICT references of a pull request body, the forms the switchboard resolves for a pull request: the issue its FIRST line's `PLAN: <issue url or owner/repo#N>` names, and each
+    line that is only `Closes`, `Fixes`, `Resolves` or `Part of` `#N` (or `owner/repo#N`). A number in prose, a branch name or a quoted line is no reference. At most 10."""
+    text = body if isinstance(body, str) else ""
+    out = []
+    lines = text.lstrip().splitlines()
+    plan = re.match(r"PLAN:[ \t]*(\S+)[ \t]*$", lines[0]) if lines else None
+    if plan:
+        try:
+            repo, number, _ = parse_plan_source(plan.group(1).strip("<>.,"), None)
+            out.append([repo, number])
+        except PlanInputError:
+            pass
+    for match in PR_REF_LINE_RE.finditer(text):
+        ref = [match.group(1), int(match.group(2))]
+        if ref not in out and ref[1] > 0:
+            out.append(ref)
+    return out[:10]
+
+
 def pr_facts_from(data):
     """The facts the panel shows, from `gh pr view --json` output; NoticeError when it is not one."""
     if not isinstance(data, dict) or not isinstance(data.get("state"), str):
@@ -9776,7 +10127,7 @@ def pr_facts_from(data):
             # commit is what makes it one event per push
             "mergeable": str(data.get("mergeable") or "").upper() or None,
             "checks": pr_checks_of(data.get("statusCheckRollup")),
-            "head": head}
+            "head": head, "refs": pr_body_refs(data.get("body"))}
 
 
 def read_pr_facts(engine, repo, number, extra_fields=""):
@@ -9956,7 +10307,7 @@ def decisions_from_notices(engine, now):
     Not a decision, so not counted with them. The facts come from `gh pr view`, cached; a PR that is merged or
     closed is not listed and is queued in engine.notice_effects for the daemon to forget; one that cannot be read
     keeps its last facts, marked stale, and is dropped (and logged) after PR_NOTICE_UNREADABLE_SECONDS."""
-    engine.notice_effects = {"drop": set(), "unreadable": {}, "observed": {}}
+    engine.notice_effects = {"drop": set(), "unreadable": {}, "observed": {}, "left": set()}
     state_dir = getattr(engine, "state_dir", None)
     if state_dir is None:
         return [], []
@@ -9982,6 +10333,7 @@ def decisions_from_notices(engine, now):
         facts = held["facts"]
         if facts is not None and facts["state"] in ("merged", "closed"):
             engine.notice_effects["drop"].add(key)
+            engine.notice_effects["left"].add(key)   # read as merged or closed: evidence for the escalation prune
             continue
         since = item.get("unreadable_since")
         if held.get("skipped"):
@@ -10381,7 +10733,7 @@ class LocalStore(decision_core.DecisionStore):
         mark_escalated(self.engine.state_dir, key, when)
 
     def prune_escalated(self, pending):
-        prune_escalated(self.engine.state_dir, pending)
+        return prune_escalated(self.engine.state_dir, pending)
 
 
 class NullExternal(decision_core.ExternalDecisionAdapter):
@@ -10960,8 +11312,7 @@ def publish_decisions(engine):
     apply_notice_effects(engine)
     store = decision_store(engine)
     try:
-        keep = captain_escalations_to_keep(engine)
-        store.prune_escalated(None if keep is None or engine.request_keys is None else set(engine.request_keys) | keep)
+        prune_escalations_pass(engine, store, now)
     except OSError:
         pass  # a disposable file: a failed prune is tried again next pass
     errors = errors + sync_external(engine, decisions, errors, now)  # [] unless external_decisions is enabled
@@ -12022,7 +12373,7 @@ TRIAGE_DEFAULTS = {"enabled": False, "repos": None, "required_labels": {}, "sla"
                    "our_logins": None, "daily_summary": True, "realarm_hours": 24, "max_findings": 30,
                    "calls_per_pass": 30, "pass_seconds": 10, "backoff": True, "digest_interval_minutes": 60, "ownerless": None}
 # Every `_days` value is in days and may be a fraction (2/24 is two hours); `t7_ours_hours` is in hours.
-TRIAGE_SLA = {"t1_days": 1, "t2_days": 1 / 24, "t3_ask_days": 1, "t3_other_days": 3, "t5_days": 2 / 24, "t6_days": 2,
+TRIAGE_SLA = {"t1_days": 1, "t2_days": 1 / 24, "t3_ask_days": 1, "t3_other_days": 3, "t5_days": 1, "t6_days": 2,
               "t7_ours_hours": 4, "t7_other_days": 2, "t8_days": 1, "t9_days": 3, "t11_days": 1}
 # (No tracked repo is named here: a public source names no private org. The extra repos go in the config's `triage.repos`.)
 TRIAGE_KINDS = {"T1": "owner missing", "T2": "required label missing", "T3": "no next step",
@@ -12777,6 +13128,10 @@ def triage_pass(engine, decisions, now, errors=()):
     triage_refresh(engine, state, repos, units, now, budget, max(1, budget[0] // 3), seconds)  # a third kept for fresh checks
     triage_read_live(engine, state, repos, now, budget, max(1, cfg.get("calls_per_pass", TRIAGE_CALLS_PER_PASS) // 3), seconds)
     triage_refresh_ownerless(engine, state, cfg, now, budget, seconds)   # #605: the team repositories' whole lists, after the shared units
+    try:
+        plan_wake_pass(engine, state, repos, now)   # #765: the plans posted or edited, from the units just held
+    except Exception as err:
+        engine._note("plan_wake.error", "", {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
     candidates, unchecked_units, truncated = triage_findings(engine, state, repos, decisions, cfg, now, errors)
     findings, unchecked, unchecked_other, oldest = [], 0, 0, 0.0
     why = {}   # #605: repo -> {reason: count}, and its other-owner share and oldest age, for the report
@@ -12853,6 +13208,10 @@ def triage_pass(engine, decisions, now, errors=()):
         state.current["unchecked_why"] = {r: {"reasons": v["reasons"], "other_owner": v["other_owner"], "oldest_seconds": int(v["oldest"])} for r, v in sorted(why.items())}
     if ownerless:
         state.current["ownerless"] = ownerless
+    held = getattr(engine, "plan_wake", None)
+    if held is not None and held.unapproved:   # #765: the plans that look unapproved, one status line (a hint: see docs/switchboard.md)
+        state.current["plans_unapproved"] = held.unapproved[:load_triage_plan_open().MAX_LISTED]
+        state.current["plans_unapproved_more"] = max(0, len(held.unapproved) - load_triage_plan_open().MAX_LISTED)
     triage_write(engine, state)
     flagged = [(r, ref) for r, ref, _ in findings if r == "OO" and now - state.alarmed.get((r, ref), 0) >= cfg["realarm_hours"] * 3600]
     due, invalid = triage_digest_due(engine, state, [(r, ref) for r, ref, _ in findings if r != "OO"],
@@ -12870,6 +13229,14 @@ def triage_pass(engine, decisions, now, errors=()):
             triage_digest.write_seen(engine.state_dir, state.seen, state.meta)
         if not allowed:
             due, invalid = [], []
+    rolled = None
+    if cfg["enabled"] and state.meta is not None:   # #766: the one daily line for T5 items listed before and still in the owner's tier
+        rolled = triage_digest.rollup(state.seen, state.meta, [ref for r, ref, _ in findings if r == "T5"], now)
+        if rolled:
+            state.facts["triage.rollup:%d" % int(now)] = (rolled, now)
+            triage_digest.cost_record(engine.state_dir, now, rolled)
+            engine._note("triage.rollup", None, {"text": rolled, "at": iso(now)})
+            triage_digest.write_seen(engine.state_dir, state.seen, state.meta)
     if cfg["enabled"] and (due or invalid):   # never a wake solely for other-owner flags: they ride along when a wake happens anyway
         text = triage_queue_fact(state, due, now, cfg, len(flagged), invalid)
         triage_digest.cost_record(engine.state_dir, now, text)
@@ -12987,6 +13354,156 @@ def triage_summary(state_dir):
     return raw
 
 
+# ---- #765: a posted or edited plan tells its approver once per hash. Reads only what the triage pass already holds (no GitHub read of its own).
+
+PLAN_WAKE_FILE = "plan-wake.json"
+PLAN_WAKE_FACT_KEEP = 2 * 86400
+
+
+class PlanWakeState:
+    """The announced hashes (kept in PLAN_WAKE_FILE so a restart never repeats one) and the facts waiting to be delivered (memory)."""
+
+    def __init__(self, state_dir):
+        self.announced, self.facts, self.unapproved, self.problem = {}, {}, [], None
+        try:
+            raw = json.loads((Path(state_dir) / PLAN_WAKE_FILE).read_text())
+            if isinstance(raw, dict) and isinstance(raw.get("announced"), dict):
+                self.announced = {k: v for k, v in raw["announced"].items() if isinstance(k, str) and isinstance(v, (int, float))}
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as err:
+            self.problem = "plan-wake.json cannot be read, so plans of the last 24 hours may be announced again: %s" % _one_line(type(err).__name__, 40)
+
+
+def plan_wake_state(engine):
+    state = getattr(engine, "plan_wake", None)
+    if state is None:
+        state = engine.plan_wake = PlanWakeState(engine.state_dir)
+        if state.problem:
+            engine._note("plan_wake.error", "", {"error": state.problem})
+    return state
+
+
+def plan_wake_consensus(engine):
+    """The plan hashes with a consensus pass in the local ledger; empty when it cannot be read (a plan is then judged on comments and pull requests alone)."""
+    try:
+        entries, _ = plan_ledger.read_ledger(engine.state_dir)
+    except Exception as err:
+        engine._note("plan_wake.error", "", {"error": "the ledger cannot be read for consensus: %s" % _one_line(type(err).__name__, 40)})
+        return set()
+    return {e.get("plan_hash") for e in entries if e.get("kind") == "consensus" and e.get("result") == "pass" and isinstance(e.get("plan_hash"), str)}
+
+
+def plan_wake_route(number, items, ctx, discovery, chiefs):
+    """(recipient names, "ask" or "work item") for the plan of issue `number`, from the held parent links alone (never from the plan's text):
+    a sub-issue of a charter is an ask (the Chief of Staff); a sub-issue of such an ask is a work item (its charter's orchestrator). None otherwise."""
+    parent = (items.get(number) or {}).get("parent")
+    if parent in ctx["charters"]:
+        return list(chiefs), "ask"
+    if parent in ctx["asks"]:
+        charter = (items.get(parent) or {}).get("parent")
+        names = sorted(n for n, o in (discovery.agents.items() if discovery else [])
+                       if (o.fleet or {}).get("role") == "orchestrator" and (o.fleet or {}).get("charter") == charter)
+        return names, "work item"
+    return None
+
+
+def plan_wake_pass(engine, state, repos, now):
+    """Announce each new plan hash to its approver once, and list the plans that look unapproved. Never raises; reads nothing from GitHub."""
+    wake = plan_wake_state(engine)
+    module, check_module = load_triage_plan_open(), load_plan_check()
+    discovery = getattr(engine, "discovery", None)
+    if discovery is None or discovery.problems:
+        return
+    chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff")
+    consensus, listed, changed = None, [], False
+    for repo in repos:
+        issues_unit, comments_unit = state.units.get((repo, "issues")), state.units.get((repo, "comments"))
+        if issues_unit is None or comments_unit is None:
+            continue
+        raw = {}
+        for record in issues_unit["data"]:
+            item = triage_norm(record)
+            if item is not None and item["state"] == "open" and not item["pr"]:
+                raw[item["number"]] = (item, record)
+        items = {n: i for n, (i, _) in raw.items()}
+        ctx = triage_context(engine, repo, items, discovery)
+        by_issue = {}
+        for comment in comments_unit["data"]:
+            n = _url_number(comment.get("issue_url")) if isinstance(comment, dict) else None
+            if n is not None:
+                by_issue.setdefault(n, []).append(comment)
+        pulls = [r for r in issues_unit["data"] if _is_pr(r)] + list((state.units.get((repo, "merged")) or {}).get("data") or [])
+        for number, plan in sorted(module.latest_plans(comments_unit["data"], check_module.HEADING_RE, _url_number).items()):
+            if number not in items:
+                continue
+            route = plan_wake_route(number, items, ctx, discovery, chiefs)
+            if route is None:
+                continue
+            posted = parse_iso(plan.get("updated_at") or plan.get("created_at"))
+            if posted is None or now - posted > module.ANNOUNCE_SECONDS:
+                continue
+            body = plan["body"]
+            plan_hash = check_module.plan_hash(body)
+            if consensus is None:
+                consensus = plan_wake_consensus(engine)
+            if (plan_hash in consensus or module.approved_by_comment(plan, plan_hash, by_issue.get(number, []), signed_by_fleet)
+                    or module.cited_by_pr(repo, number, plan, pulls, parse_iso)):
+                continue
+            url = module.plan_url(repo, number, plan["id"])
+            key = "%s#%d:%s" % (repo, number, plan_hash)
+            names = route[0]
+            if key not in wake.announced and names:
+                own = raw[number][1]
+                done_when = parse_intent(own.get("body"))[1]
+                if route[1] == "work item":
+                    parent_record = (raw.get((items[number] or {}).get("parent")) or (None, {}))[1]
+                    done_when = parse_intent(parent_record.get("body"))[1] or done_when
+                try:
+                    passed = check_module.check(body, done_when, None)["result"] == "pass"
+                except Exception:
+                    passed = False
+                text = module.line(number, url, plan_hash, passed)
+                for name in names:
+                    wake.facts["plan:%s:%s" % (key, name)] = (text, now, name, repo, number)
+                wake.announced[key] = now
+                changed = True
+                engine._note("plan_wake.announced", "%s#%d" % (repo, number), {"hash": plan_hash, "to": names, "route": route[1], "check": "PASS" if passed else "FAIL"})
+            if now - posted >= module.UNAPPROVED_SECONDS:
+                listed.append("%s#%d" % (repo, number) if len(repos) > 1 else "#%d" % number)
+    wake.unapproved = sorted(listed)
+    for old in [k for k, v in wake.announced.items() if now - v > 14 * 86400]:
+        del wake.announced[old]
+        changed = True
+    for old in [k for k, v in wake.facts.items() if now - v[1] > PLAN_WAKE_FACT_KEEP]:
+        del wake.facts[old]
+    if changed:
+        try:
+            state_write(Path(engine.state_dir) / PLAN_WAKE_FILE, json.dumps({"announced": wake.announced}, sort_keys=True) + "\n", fsync=True)
+        except OSError as err:
+            engine._note("plan_wake.error", "", {"error": "plan-wake.json was not saved, so a restart may announce again: %s" % _one_line(type(err).__name__, 40)})
+
+
+class PlanWakeFacts:
+    """The one line each approver is told about a new plan hash: an ordinary fact, so the usual rule picks a note or a wake and a key found in the
+    recipient's inbox is never delivered again."""
+
+    __name__ = "plan_wake_facts"
+
+    def __init__(self):
+        self.engine = None
+
+    def bind(self, engine):
+        self.engine = engine
+
+    def __call__(self):
+        wake = getattr(self.engine, "plan_wake", None) if self.engine else None
+        if not wake or not wake.facts:
+            return []
+        return [Fact(key, name, "plan", text, created, issue=number, sender="switchboard", repo=repo)
+                for key, (text, created, name, repo, number) in sorted(wake.facts.items())]
+
+
 def testers_status(config, agents, fleets, state):
     """The `status` lines of the resolved testers per repo with their source (#372); [] when there are none or the picture is unreadable."""
     try:
@@ -13011,6 +13528,9 @@ def triage_status_lines(triage):
     lines = ["      triage     %s: %s finding(s) (%s) over %s repo(s) as of %s" % (
         "on (wakes the Chief of Staff; writes nothing to GitHub)" if triage.get("enabled") else "shadow (audit only; writes nothing to GitHub)",
         triage.get("total", 0), parts, triage.get("repos", "?"), triage.get("at", "?"))]
+    plans = load_triage_plan_open().unapproved_line(triage.get("plans_unapproved"), triage.get("plans_unapproved_more", 0))
+    if plans:
+        lines.append("      triage     " + plans)
     if triage.get("other_owner"):
         lines.append("      triage     %d other-owner flag(s): not ours, not counted, never a wake on their own" % triage["other_owner"])
     if triage.get("unreadable"):
@@ -15618,7 +16138,7 @@ def collect_status(runner=subprocess.run, now=time.time, platform=None):
         report["sweep"] = sweep_summary(state)  # #117
         report["triage"] = triage_summary(state)  # #130
         report["ci_record"] = ci_record_status_line(state, now())
-        report["pane_lines"] = pane_health_status_lines(state, now())
+        report["pane_lines"] = pane_health_status_lines(state, now()) + headless_route_status_lines(state)
         report["catching_up"] = catching_up_lines(state, now())
         report["v2_link"] = v2_link_status_line(state, now())
         if config_ok:
@@ -15994,6 +16514,7 @@ def build_engine(runner, now, actor, writable=True, socket_call=None):
     engine = Switchboard(config, v2, herdr, audit, fact_sources(state), now, actor,
                          intents=intent_reader_for(config, runner, now), state_dir=state)
     engine.accounts = GhAccounts(config, runner, now)  # PR 15
+    engine.route_check = shim_route_problem   # headless launch: is the per-command gh/git route in place (#669)
     engine.accounts.audit, engine.accounts.actor = audit, actor   # the rate-limit pause is audited, once per episode
     if engine.intents is not None:
         engine.intents.accounts = engine.accounts   # ONE gate for every read of one account: one pause, one counter, one set of remembered answers
@@ -16028,6 +16549,7 @@ def cmd_run(args, runner, now, wait):
     if args.standby:  # PR 16: the service waits for the lock instead of exiting and being restarted
         while run_lock_held(state):
             time.sleep(STANDBY_SECONDS)
+    engine.temp_janitor_runner = runner   # the weekly temp janitor runs only in the real daemon, by this attribute and by nothing a caller passes (#762)
     engine.docker_reap_runner = runner   # the daily reap of expired labelled docker objects runs only in the real daemon
     hub = attach_github(engine, config, state, runner, now)
     start_event_feed(engine, config, now)
@@ -16094,6 +16616,86 @@ def read_brief(path, stdin):
     return text
 
 
+MEMORY_FREE_MIN = 40          # percent: the lanes' safety check for a NEW launch, not a rule about coders
+MEMORY_WAIT_SECONDS = 30      # the two Swapouts reads are this far apart
+MEMORY_CACHE_SECONDS = 60     # a cached reading older than this is never trusted
+MEMORY_CACHE_FILE = "memory-reading.json"
+MEMORY_PROBES = {"memory_pressure": "/usr/bin/memory_pressure", "vm_stat": "/usr/bin/vm_stat"}   # absolute paths, never resolved through PATH; a missing one is "not available" (pass open)
+memory_sleep = time.sleep   # a test replaces it; production never does
+
+
+def memory_read(runner):
+    """(free_percent, swapouts), or None when either probe is missing or its output cannot be read (Linux, a failure): the test then passes open."""
+    try:
+        pressure = runner([MEMORY_PROBES["memory_pressure"]], capture_output=True, text=True, timeout=20)
+        vm = runner([MEMORY_PROBES["vm_stat"]], capture_output=True, text=True, timeout=20)
+        free = re.search(r"free percentage:\s*(\d{1,3})\s*%", pressure.stdout or "")
+        swapouts = re.search(r"^Swapouts:\s*(\d+)\.?\s*$", vm.stdout or "", re.M)
+        if pressure.returncode != 0 or vm.returncode != 0 or not free or not swapouts:
+            return None
+        return int(free.group(1)), int(swapouts.group(1))
+    except (OSError, subprocess.SubprocessError, TypeError, AttributeError, ValueError):
+        return None
+
+
+def launch_memory_check(args, engine, state, runner, now):
+    """The lanes' safety check before a NEW launch (not the owner's rule; no caps on coders): `memory_pressure` free >= 40 percent AND the `vm_stat`
+    Swapouts counter unchanged between two reads 30 s apart. Returns None to go on, or the refusal line (the caller exits EXIT_MEMORY). A fresh cached
+    reading (state dir, < 60 s old) that shows the counter flat saves the wait, but never makes a launch pass when this first read's free is under 40.
+    FAIL OPEN: a missing or unreadable probe passes with one line and an audit record. `--memory-ok <reason>` skips the test and audits it."""
+    reason = getattr(args, "memory_ok", None)
+    path = Path(state) / MEMORY_CACHE_FILE
+    audit = lambda kind, data: engine.audit.append(engine.actor, kind, args.name, data) if engine.audit is not None else None
+    first = memory_read(runner)
+
+    def remember(*reads):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".%d.tmp" % os.getpid())
+            tmp.write_text(json.dumps({"at": now(), "reads": [list(r) for r in reads][-2:]}))
+            os.replace(tmp, path)
+        except OSError:
+            pass   # the cache is only an optimisation: a failed write costs the next launch one wait, deliberately silent
+    if reason is not None:
+        audit("launch.memory_ok", {"reason": _one_line(reason, 200), "measured": ("free %d%%, swapouts %d" % first) if first else "not measured"})
+        return None
+    if first is None:
+        sys.stderr.write("%s: memory test not available: launching\n" % PROG)
+        audit("launch.memory_unavailable", {"measured": "not measured"})
+        return None
+    free, before = first
+    cached = None
+    try:
+        with open(path) as handle:
+            record = json.loads(handle.read(4096))   # a small file: a bigger one is not ours and is not trusted
+        reads = record["reads"]
+        if not isinstance(reads, list) or len(reads) > 2:
+            raise ValueError("unexpected cache shape")
+        if 0 <= now() - float(record["at"]) < MEMORY_CACHE_SECONDS and len(reads) >= 1:
+            cached = reads[-1][1]
+            if len(reads) >= 2 and reads[-2][1] != cached:
+                cached = None   # the cached pair moved: not flat
+    except (OSError, ValueError, KeyError, IndexError, TypeError):
+        cached = None
+    if free < MEMORY_FREE_MIN:
+        remember(first)
+        return "memory: free %d%%, swapouts %d: not launching; override: --memory-ok <reason>" % (free, before)
+    if cached is not None and cached == before:
+        remember(first, first)
+        sys.stderr.write("%s: memory: free %d%%, swapouts flat (cached reading under %d s old)\n" % (PROG, free, MEMORY_CACHE_SECONDS))
+        return None
+    memory_sleep(MEMORY_WAIT_SECONDS)   # the wait is a constant: no environment variable or argument changes it; only `--memory-ok <reason>` skips the test
+    second = memory_read(runner)
+    if second is None:
+        sys.stderr.write("%s: memory test not available: launching\n" % PROG)
+        audit("launch.memory_unavailable", {"measured": "free %d%%, swapouts %d" % first})
+        return None
+    remember(first, second)
+    if second[0] < MEMORY_FREE_MIN or second[1] != before:
+        return "memory: free %d%%, swapouts %d -> %d in %d s: not launching; override: --memory-ok <reason>" % (second[0], before, second[1], MEMORY_WAIT_SECONDS)
+    return None
+
+
 def cmd_launch(args, runner, now, socket_call=None):
     if getattr(args, "read_repo", None) is not None and (getattr(args, "cloud", False) or args.resume):
         raise LaunchError("--read-repo needs a terminal launch of a new worker (not --headless, --cloud or --resume)")
@@ -16134,6 +16736,13 @@ def cmd_launch(args, runner, now, socket_call=None):
         return EXIT_OK
     if not args.agent or not args.dir:
         raise LaunchError("--agent and --dir are required (or --resume SESSION for an existing agent)")
+    if getattr(args, "memory_ok", None) is not None and (not args.memory_ok.strip() or re.search(r"[\x00-\x1f\x7f-\x9f]", args.memory_ok)):
+        sys.stderr.write("%s: launch: --memory-ok needs a reason: non-empty text on one line, no control characters\n" % PROG)
+        return EXIT_USAGE
+    refusal = launch_memory_check(args, engine, state, runner, now)   # a NEW launch only: every resume, --cloud and the other routes returned above
+    if refusal:
+        sys.stderr.write("%s: %s\n" % (PROG, refusal))
+        return EXIT_MEMORY
     if getattr(args, "headless", False) and (args.workspace or args.new_workspace):
         raise LaunchError("--headless opens no terminal, so it takes no --workspace or --new-workspace (`%s watch NAME` opens one later)" % PROG)
     if (args.name or "").startswith(LANE_NAME_PREFIX):
@@ -17241,6 +17850,29 @@ class IntentReader:
             return json.loads(result.stdout)
         except ValueError:
             raise IntentError("gh", "gh returned non-JSON: %s" % _one_line(result.stdout, 120)) from None
+
+    def _api_bytes(self, path, repo=None, limit=None):
+        """The raw bytes `gh api <path>` prints (an archive), through the same account and exclusion rule as `_api`. `limit` bounds the bytes kept."""
+        config = self.config if self.config is not None else getattr(self.accounts, "config", None)
+        if config is not None and load_module("repo_exclusion").is_excluded(config, repo or self.repo):
+            raise IntentError("excluded", "repository %s is excluded from the fleet's reads (excluded_repos)" % (repo or self.repo))
+        env = self.env_for(repo)
+        extra = {"env": env} if env is not None else {}
+        try:
+            result = self.runner([self.gh, "api", path], capture_output=True, timeout=self.timeout, stdin=subprocess.DEVNULL, **extra)
+        except subprocess.TimeoutExpired:
+            raise IntentError("unavailable", "gh did not answer within %ss" % self.timeout) from None
+        except OSError as err:
+            raise IntentError("unavailable", "cannot run %s: %s" % (self.gh, err.strerror or err)) from None
+        if result.returncode != 0:
+            detail = _one_line((result.stderr or b"").decode("utf-8", "replace")) or "exit %d" % result.returncode
+            if self.accounts is not None:
+                detail = self.accounts.scrub(detail)
+            raise IntentError("not_found" if re.search(r"\b404\b|Not Found", detail) else "gh", detail)
+        out = result.stdout if isinstance(result.stdout, bytes) else str(result.stdout or "").encode()
+        if limit is not None and len(out) > limit:
+            raise IntentError("gh", "the archive is %d bytes, over the limit of %d bytes" % (len(out), limit))
+        return out
 
     def _generation(self, key):
         """The running forwarder's generation for this entry's repo (for the long-lived kinds), or None."""
@@ -20216,6 +20848,7 @@ CI_RECORD_RETRY = (300, 1800)   # an unreadable PR is retried after 5 minutes, d
 class CiRecordState:
     def __init__(self):
         self.lists = {}     # normalised repo -> (read at, records)
+        self.good = {}      # normalised repo -> (read at, records, cut): the list of the LAST read of it in this process that SUCCEEDED; a failed read removes it (memory only)
         self.checked = {}   # (normalised repo, number) -> {"list_head", "at", "retry_at", "fails"}: the LAST-CHECKED time decides
         self.recorded = 0   # verdicts this process recorded
         self.last_record = None
@@ -20252,8 +20885,10 @@ def ci_record_pass(engine, now):
             records, cut = hub.read_pages("repos/%s/pulls?state=open&per_page=100" % repo, cap=2)
             budget[0] -= sweep_pages_used(records, cut)
             state.lists[key] = (now, records)
+            state.good[key] = (now, records, bool(cut) or len(records) >= LABEL_HOLD_LIST_CUT)
         except GitHubUnavailable as err:
             budget[0] -= 1
+            state.good.pop(key, None)   # a failed read is no evidence: the old list stays for the rows, never for a prune
             state.lists[key] = (now, state.lists.get(key, (0, []))[1])   # keep the old list and try again after the TTL
             engine._note("ci_record.unreadable", repo, {"repo": repo, "reason": _one_line(str(err), 160)})
     pr_state_from_lists(state, repos)
@@ -20985,8 +21620,14 @@ def cmd_review_checkout(args, runner, now):
             except IntentError as err:
                 raise rc.Problem("%s: %s" % (path.split("?")[0], _one_line(str(err), 160))) from None
 
+        def archive(sha):
+            try:
+                return reader._api_bytes("repos/%s/tarball/%s" % (repo, sha), repo, limit=rc.MAX_TOTAL_BYTES + 16 * 1024 * 1024)
+            except IntentError as err:
+                raise rc.Problem("tarball: %s" % _one_line(str(err), 160)) from None
+
         try:
-            path = rc.checkout(api, repo, number, head, base, os.getcwd(), notify=lambda text: sys.stderr.write("%s: review checkout: %s\n" % (PROG, text)))
+            path = rc.checkout(api, repo, number, head, base, os.getcwd(), archive=archive, notify=lambda text: sys.stderr.write("%s: review checkout: %s\n" % (PROG, text)))
         except rc.OverBound as err:
             sys.stderr.write("%s: review checkout: refused, nothing left behind: %s\n" % (PROG, _one_line(str(err), 400)))
             return EXIT_USAGE
@@ -22139,6 +22780,26 @@ PREFLIGHT_CLASSES = (
     ("public-names", 60, (("python3", "bin/check-public-names"),), None),
     ("cloud", 600, (("bin/test-cloud-worker",), ("bin/test-cloud-launcher",), ("cloud/tests/test-cloud",)), "cloud/"),
 )
+PREFLIGHT_CEILING_MAX = 3600   # the absolute maximum of any class's ceiling, in seconds: a hung class still ends
+
+
+def preflight_ceiling(base, load1, cores):
+    """The ceiling of a class on a machine with this load: `base * (1 + load1 / cores)`, at most PREFLIGHT_CEILING_MAX .
+    Load 0 gives `base`; a load of one per core doubles it."""
+    try:
+        factor = 1.0 + max(0.0, float(load1)) / max(1, int(cores))
+    except (TypeError, ValueError):
+        factor = 1.0
+    return int(min(base * factor, PREFLIGHT_CEILING_MAX))
+
+
+def preflight_load():
+    try:
+        return os.getloadavg()[0], os.cpu_count() or 1
+    except (OSError, AttributeError):
+        return 0.0, 1
+
+
 PREFLIGHT_TOKEN_LENGTH = 49   # the macOS-only path-length trap: a token-shaped directory name of this length under TMPDIR
 
 
@@ -22163,7 +22824,9 @@ def cmd_preflight_pr(args, runner, now):
     changed = preflight_changed(runner, root)
     failed = 0
     with tempfile.TemporaryDirectory(prefix="preflight-") as work:
-        for name, ceiling, commands, under in PREFLIGHT_CLASSES:
+        for name, base_ceiling, commands, under in PREFLIGHT_CLASSES:
+            load1, cores = preflight_load()
+            ceiling = preflight_ceiling(base_ceiling, load1, cores)
             if under is not None and changed is not None and not any(path.startswith(under) for path in changed):
                 continue
             env = dict(os.environ, FLEET_HEAVY_MAX_SECONDS=str(ceiling))   # the ceiling runs INSIDE the slot (heavy's watchdog starts when the slot is granted): a wait in the queue is never a timeout
@@ -22177,10 +22840,10 @@ def cmd_preflight_pr(args, runner, now):
                 try:
                     done = runner([sys.executable, os.path.abspath(__file__), "heavy", "--"] + list(command), cwd=root, env=env, capture_output=True, text=True)
                 except subprocess.TimeoutExpired:   # only a runner of its own making raises this: heavy has no outer clock here
-                    verdict, tail = "FAIL", "timed out after %ds" % ceiling
+                    verdict, tail = "FAIL", "timed out after %ds, its ceiling (load average %.1f on %d cores)" % (ceiling, load1, cores)
                     break
                 if done.returncode == 124:
-                    verdict, tail = "FAIL", "timed out after %ds running" % ceiling
+                    verdict, tail = "FAIL", "timed out after %ds running, its ceiling (load average %.1f on %d cores)" % (ceiling, load1, cores)
                     break
                 if done.returncode == 75:
                     verdict, tail = "NOSLOT", "no heavy slot came in time (the tests did not run)"
@@ -22851,6 +23514,7 @@ _SECRET_PATTERNS = (
     (re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}"
                 r"|AKIA[0-9A-Z]{12,}|xox[abprs]-[A-Za-z0-9-]{8,})"), "[redacted]"),
     (re.compile(r"(://[^/\s:@]+:)[^@\s/]+@"), r"\1[redacted]@"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]*"), "[redacted]"),   # a JWT (#773)
 )
 
 
@@ -25337,7 +26001,7 @@ def build_parser():
     notice.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
     sub.add_parser("ensure", help="Start the daemon unless it runs (herdr's startup hook calls this)")
     sub.add_parser("poke", help="Ask the daemon for a pass now; silent, never blocks (herdr's event hooks call this)")
-    launch = sub.add_parser("launch", help="Start a fleet agent in a new herdr tab, without typing")
+    launch = sub.add_parser("launch", help="Start a fleet agent in a new herdr tab, without typing", description="Start a fleet agent in a new herdr tab, without typing. A NEW launch (not a resume or --cloud) first runs the memory test: this is the lanes' safety check, not the owner's rule (there are no caps on coders), and `--memory-ok <reason>` overrides it. A refusal exits 5.")
     launch.add_argument("name", help="The agent's fleet name (lower case, digits, - and _)")
     launch.add_argument("--agent", help="The OpenCode agent definition, such as coder")
     launch.add_argument("--dir", help="The agent's working directory (absolute)")
@@ -25363,6 +26027,7 @@ def build_parser():
     launch.add_argument("--overdue", metavar="WHEN", help="Wake --reports-to at this time if the worker has not "
                         "reported since the launch (60m, or an ISO time with a zone)")
     launch.add_argument("--brief-file", dest="brief_file", help="The first prompt: a file, or - for stdin")
+    launch.add_argument("--memory-ok", dest="memory_ok", metavar="REASON", help="Skip the memory test of a new launch (audited with the reason)")
     launch.add_argument("--cloud", action="store_true", help="Run the worker in the cloud (needs --repo and --branch; --dir is its path in the pod, default /work; the pod always runs its own 'worker' agent: --agent is only recorded)")
     launch.add_argument("--branch", help="With --cloud: the branch the worker starts on")
     launch.add_argument("--idle", help="With --cloud: stop after this long idle (default 10m)")
@@ -25479,13 +26144,19 @@ def load_tick(engine, discovery):
         fleet = seen.fleet or {}
         if fleet.get("role") != "orchestrator":
             continue
+        entry = retired.get(name)
+        if isinstance(entry, dict) and entry.get("session") in (None, getattr(seen, "session_id", None)):
+            continue   # on the retired list (the same name and session rule as coder_finished): no load figures and no health row
         coders = [o for o in discovery.agents.values() if (o.fleet or {}).get("reports_to") == name and (o.fleet or {}).get("role") == "coder"
                   and not coder_finished(o, retired, last_reports)]   # a retired coder, or one that made its final report, is on the books but not a coder of this workspace
         orchestrators[name] = {"charter": fleet.get("charter") if _is_issue_number(fleet.get("charter")) else None,   # a fallback: the charter is found by the yaml that names the agent
                                "repo": _fleet_repo(fleet, engine.config) or (engine.intents.repo if engine.intents is not None else None),
                                "busy": sum(1 for c in coders if c.status == "working"), "idle": sum(1 for c in coders if c.status == "idle"),
+                               "workers": [o.name for o in coders if getattr(o, "name", None)],
                                "messages": sum(1 for r in reminders if r.get("to") == name and isinstance(r.get("at"), (int, float)) and r["at"] <= now)}
     cos = next((n for n, o in sorted(discovery.agents.items()) if (o.fleet or {}).get("role") == "chief-of-staff"), None)
+    pr_refs = {key.lower(): (held.get("facts") or {}).get("refs") or [] for key, held in list(getattr(engine, "notice_facts", {}).items())
+               if isinstance(held, dict) and not (held.get("facts") or {}).get("state") in ("merged", "closed")}   # the strict references of each noticed PR's current body, from the facts already read: no read of its own
 
     def read_asks(charter, repo):
         if engine.intents is None:
@@ -25538,7 +26209,7 @@ def load_tick(engine, discovery):
     budget = SourceBudget(source_budget_seconds(engine.config, "load_alert"), engine.now)   # #494: the reads stop between calls when this pass's time is spent
     pending = []
     sent = health.tick(health.Context(now=now, state_dir=engine.state_dir, cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, read_charters=read_charters, read_parent=read_parent, cos=cos, wake=wake,
-                                      time_up=budget.spent, pending=pending, **meter))
+                                      time_up=budget.spent, pending=pending, reminders=reminders, pr_refs=pr_refs, **meter))
     set_source_state(engine, "load_alert", pending)
     return sent
 

@@ -81,14 +81,18 @@ def load_meta(state_dir):
     raw = read_json(os.path.join(state_dir, SEEN_FILE)) if state_dir else None
     if raw is None or not isinstance(raw.get("items"), dict):
         return {"known": False, "swept": False, "last": None}
-    last = raw.get("last")
-    return {"known": True, "swept": bool(raw.get("swept", True)), "last": float(last) if _number(last) else None}
+    last, rolled = raw.get("last"), raw.get("rollup")
+    meta = {"known": True, "swept": bool(raw.get("swept", True)), "last": float(last) if _number(last) else None}
+    if _number(rolled):
+        meta["rollup"] = float(rolled)   # #766: only once a roll-up was sent; a file without one reads as before
+    return meta
 
 
 def write_seen(state_dir, seen, meta=None):
     if state_dir:
         meta = meta or {"swept": True, "last": None}
-        write_json(os.path.join(state_dir, SEEN_FILE), {"v": 1, "items": seen, "swept": bool(meta.get("swept")), "last": meta.get("last")})
+        write_json(os.path.join(state_dir, SEEN_FILE), {"v": 1, "items": seen, "swept": bool(meta.get("swept")), "last": meta.get("last"),
+                                                           **({"rollup": meta["rollup"]} if meta.get("rollup") is not None else {})})
 
 
 WARMUP_MAX_SECONDS = 1800   # a sweep that cannot finish (a list that never reads) ends its warm-up after this: the digest must never stay silent for good
@@ -170,6 +174,8 @@ def select(seen, items, mutes, ours, now, backoff=True, alarmed=None, realarm_se
         if ref in mutes and (item is None or item["updated"] <= mutes[ref]):
             continue   # 'seen, leave': quiet until the item changes
         rec = seen.get("%s %s" % (rule, ref))
+        if rule == "T5" and rec is not None:
+            continue   # #766: a decision already in the owner's tier is listed ONCE; after that only the daily roll-up names it
         if item is not None:
             until = item.get("parked_until")
             awaiting = any("awaiting" in str(l) for l in item["labels"])
@@ -203,6 +209,45 @@ def commit(seen, items, shown, invalid, now):
         seen["PARKED " + ref] = {"sig": "", "at": now, "n": 1, "flagged": True}   # the once-only flag
     for key in sorted(seen, key=lambda k: seen[k]["at"])[:max(0, len(seen) - SEEN_MAX)]:
         del seen[key]
+
+
+ROLLUP_SECONDS = 86400
+
+
+ROLLUP_ITEMS = 30   # the most items one roll-up line names (oldest listing first)
+ROLLUP_CHARS = 1500   # and the most characters it takes: far under the delivered-message cap, whatever the names
+
+
+def _ref_key(ref):
+    repo, _, number = ref.rpartition("#")
+    return (repo, int(number) if number.isdigit() else 0, ref)
+
+
+def rollup(seen, meta, t5_refs, now, limit=ROLLUP_ITEMS):
+    """The one daily roll-up line (#766), or None. It names the T5 items listed at least a day ago that are still findings now
+    (`t5_refs`: an item that left the owner's tier is not there, and `prune` has forgotten it). At most `limit` names, the oldest
+    listing first, then `... and M more`; the names carry the repository when more than one repository is among them. On a line,
+    `meta["rollup"]` is set and the caller writes the seen-file."""
+    last = meta.get("rollup")
+    if last is not None and now - last < ROLLUP_SECONDS:
+        return None
+    refs = sorted({ref for ref in t5_refs if "T5 " + ref in seen and now - seen["T5 " + ref]["at"] >= ROLLUP_SECONDS},
+                  key=lambda r: (seen["T5 " + r]["at"], _ref_key(r)))
+    if not refs:
+        return None
+    meta["rollup"] = now
+    several = len({r.rpartition("#")[0] for r in refs}) > 1
+    name = lambda r: r if several or "#" not in r else "#" + r.rpartition("#")[2]
+    head = "%d items waiting on the owner for more than a day:" % len(refs)
+    shown = []
+    for ref in refs[:limit]:
+        more = len(refs) - len(shown) - 1
+        tail = " ... and %d more (fleet-switchboard decisions --tier all)" % (more + 1) if more >= 0 else ""
+        if len(head) + sum(len(name(r)) + 1 for r in shown) + len(name(ref)) + 1 + len(tail) > ROLLUP_CHARS:
+            break
+        shown.append(ref)
+    left = len(refs) - len(shown)
+    return head + "".join(" " + name(r) for r in shown) + (" ... and %d more (fleet-switchboard decisions --tier all)" % left if left else "")
 
 
 def prune(seen, candidates):

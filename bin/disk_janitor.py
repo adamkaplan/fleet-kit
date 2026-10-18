@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 
 SCAN_SECONDS = 60.0          # the whole scan (config `scan_seconds`): past it the rest are NOT JUDGED, and the next run continues after the last judged name
-DEFAULTS = {"enabled": True, "days": 7, "keep": [], "dir": None, "scan_seconds": SCAN_SECONDS, "weekly_scan_seconds": 600}
+DEFAULTS = {"enabled": True, "days": 7, "keep": [], "dir": None, "scan_seconds": SCAN_SECONDS, "weekly_scan_seconds": 600, "daemon_apply": False}
 KEEP_MARKER = ".fleet-keep"
 WALK_ENTRIES = 20000          # files one entry may hold and still be judged
 WALK_SECONDS = 5.0            # one entry's walk
@@ -55,13 +55,15 @@ def validate(raw, source="config"):
     if raw is None:
         return
     if not isinstance(raw, dict) or set(raw) - set(DEFAULTS):
-        raise ValueError("%s: 'temp_janitor' must be an object with only enabled, days, keep, dir, scan_seconds and weekly_scan_seconds, got %r" % (source, raw))
+        raise ValueError("%s: 'temp_janitor' must be an object with only enabled, days, keep, dir, scan_seconds, weekly_scan_seconds and daemon_apply, got %r" % (source, raw))
     for key in ("scan_seconds", "weekly_scan_seconds"):
         value = raw.get(key, DEFAULTS[key])
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not 1 <= value <= BUDGET_MAX:
             raise ValueError("%s: temp_janitor.%s must be a number of seconds from 1 to %d, got %r" % (source, key, BUDGET_MAX, value))
     if "enabled" in raw and not isinstance(raw["enabled"], bool):
         raise ValueError("%s: temp_janitor.enabled must be true or false" % source)
+    if "daemon_apply" in raw and not isinstance(raw["daemon_apply"], bool):
+        raise ValueError("%s: temp_janitor.daemon_apply must be true or false" % source)
     days = raw.get("days", DEFAULTS["days"])
     if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 365:
         raise ValueError("%s: temp_janitor.days must be a whole number from 1 to 365, got %r" % (source, days))
@@ -341,8 +343,8 @@ def remove_entry(path):
         os.unlink(path)
 
 
-def run(temp_dir, state_dir, now, cfg, apply, audit, uid=None, clock=time.monotonic, busy=None, weekly=False):
-    """Returns (lines, removed, kept). `audit(name, detail)` is called once for each removal that happened; if it raises, removing STOPS and the line says so.
+def run(temp_dir, state_dir, now, cfg, apply, audit, uid=None, clock=time.monotonic, busy=None, weekly=False, outcome=None, recheck_busy=None):
+    """Returns (lines, removed, kept). `recheck_busy`, when given, is the in-use check for the judgement right before a removal (default: `busy`). `outcome`, when a list, receives one dict (name, age_days, bytes) for each entry that is removed (or, on a dry run, would be): the daemon's audit summary reads it; it changes nothing else. `audit(name, detail)` is called once for each removal that happened; if it raises, removing STOPS and the line says so.
     Right before each removal the entry is judged again from the records as they are then, and removed only if it is still eligible and is the same
     entry (device, inode and newest modification time)."""
     lines, removed, kept = [], 0, 0
@@ -361,10 +363,12 @@ def run(temp_dir, state_dir, now, cfg, apply, audit, uid=None, clock=time.monoto
             break
         if not apply:
             lines.append("would remove %s (%d day(s) old, %d bytes)" % (row["name"], row["age_days"], row["size"]))
+            if outcome is not None:
+                outcome.append({"name": row["name"], "age_days": row["age_days"], "bytes": row["size"]})
             removed += 1
             continue
         again_text, again_complete = named_text(state_dir)
-        again = judge(row["path"], again_text, now, cfg, uid, clock, busy)
+        again = judge(row["path"], again_text, now, cfg, uid, clock, recheck_busy or busy)
         if not again_complete or again["action"] != "remove" or again["ident"] != row["ident"] or not safe_dir(temp_dir)[0]:
             lines.append("kept %s: it changed since the scan" % row["name"])
             kept += 1
@@ -376,6 +380,8 @@ def run(temp_dir, state_dir, now, cfg, apply, audit, uid=None, clock=time.monoto
             kept += 1
             continue
         removed += 1
+        if outcome is not None:
+            outcome.append({"name": row["name"], "age_days": row["age_days"], "bytes": row["size"]})
         lines.append("removed %s (%d day(s) old, %d bytes)" % (row["name"], row["age_days"], row["size"]))
         try:
             audit(row["name"], {"path": row["path"], "age_days": row["age_days"], "bytes": row["size"]})
