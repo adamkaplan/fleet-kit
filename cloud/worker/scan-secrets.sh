@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build-failing scan for stored credentials: files (binary included, via scan-files.py) and the image config
 # (env, history). Prints "path: pattern-name" per hit, never the value.
-# Usage: scan-secrets.sh <image-ref> | --dir <dir> [--skip <name>]... | --meta <image-ref>
+# Usage: scan-secrets.sh <image-ref> | --archive <file.tar> | --dir <dir> [--skip <name>]... | --meta <image-ref>
 # Exit 0 = 0 hits, 1 = hits, 2 = usage/error/not readable (never a pass).
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -76,23 +76,18 @@ if [ "${1:-}" = "--meta" ] && [ -n "${2:-}" ] && [ $# -eq 2 ]; then
     || { echo "scan-secrets: cannot read the history of $2: not scanned" >&2; exit 2; }
   report " (META SCAN ONLY: image configuration and history; layer FILES NOT SCANNED)" scan_dir "$work"
 fi
-[ $# -eq 1 ] || { echo "usage: $0 <image> | --dir <dir> [--skip <name>]... | --meta <image>" >&2; exit 2; }
+# --archive <file>: an image archive (docker save or OCI layout), scanned layer by layer (THE gate; see README).
+archive_scan() {
+  local pf rc=0; pf=$(mktemp); printf '%s\n' "$PATTERNS" > "$pf"
+  python3 "$HERE/scan-layers.py" "$pf" "$1" || rc=$?
+  rm -f "$pf"; exit "$rc"
+}
+if [ "${1:-}" = "--archive" ] && [ -n "${2:-}" ] && [ $# -eq 2 ]; then
+  [ -f "$2" ] || { echo "scan-secrets: no such archive $2: not scanned" >&2; exit 2; }
+  archive_scan "$2"
+fi
+[ $# -eq 1 ] || { echo "usage: $0 <image> | --archive <file.tar> | --dir <dir> [--skip <name>]... | --meta <image>" >&2; exit 2; }
 
 work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
-docker save "$1" -o "$work/image.tar"
-mkdir "$work/img" "$work/files"
-tar -xf "$work/image.tar" -C "$work/img"
-# image config and manifest (env, history) scanned as text
-cp "$work/img"/*.json "$work/files/" 2>/dev/null || true
-cp "$work/img"/blobs/sha256/* "$work/files/" 2>/dev/null || true
-# every layer, extracted separately so a file deleted in a later layer is still seen
-n=0
-while IFS= read -r layer; do
-  n=$((n + 1)); mkdir "$work/files/layer$n"
-  tar -xf "$work/img/$layer" -C "$work/files/layer$n" --exclude='dev/*' 2>/dev/null \
-    || { echo "scan-secrets: cannot extract layer $layer: not scanned" >&2; exit 2; }
-done < <(python3 -c 'import json,sys; [print(l) for e in json.load(open(sys.argv[1])) for l in e["Layers"]]' "$work/img/manifest.json")
-[ "$n" -gt 0 ] || { echo "scan-secrets: no layers found in the image: not scanned" >&2; exit 2; }
-# layer files may carry modes that hide them from us; make them readable so none is skipped
-chmod -R u+rwX "$work/files" 2>/dev/null || true
-report "" scan_dir "$work/files"
+docker save "$1" -o "$work/image.tar" 2>/dev/null || { echo "scan-secrets: cannot export $1: not scanned" >&2; exit 2; }
+archive_scan "$work/image.tar"

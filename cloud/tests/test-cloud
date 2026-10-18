@@ -439,6 +439,40 @@ out=$(PATH="$tmp/mstub:$PATH" STUB_ENV=A=b STUB_HIST="echo $tok" "$here/worker/s
 PATH="/usr/bin:/bin" "$here/worker/scan-secrets.sh" --meta any:image >/dev/null 2>&1; rc2=$?
 [ "$rc2" = 2 ] && ok "--meta: an image that cannot be inspected is exit 2" || bad "--meta uninspectable rc=$rc2"
 
+# 3f. the PER-LAYER scan of image archives (docker-free: tiny archives built in python; the token is made now)
+ltok="ghp_$(printf 'f%.0s' $(seq 36))"; ad="$tmp/arch"; mkdir "$ad"
+python3 "$here/tests/make-archives.py" "$ad" "$ltok" || bad "could not build the test archives"
+S="$here/worker/scan-secrets.sh"
+for f in dockersave-clean oci-clean; do
+  out=$("$S" --archive "$ad/$f.tar" 2>&1); rc=$?
+  [ "$rc" = 0 ] && echo "$out" | grep -qx 'scan-secrets: all 3 layers scanned (files + configuration + history)' \
+    && echo "$out" | grep -q '^layer 3 .*: 1 files, .* MiB, 0 hits$' && echo "$out" | grep -q '^total: 3 layers, 3 files' \
+    && ok "layer scan ($f): all 3 layers scanned, exit 0" || bad "layer scan clean $f rc=$rc"
+done
+# written in layer 2, deleted in layer 3: the merged filesystem does not see it; the layer scan does (both formats)
+"$S" --dir "$ad/merged-deleted" >/dev/null 2>&1 && ok "merged filesystem of the deleted-token image: 0 hits (blind to it)" || bad "merged scan saw the deleted file?"
+for f in dockersave-deleted oci-deleted; do
+  out=$("$S" --archive "$ad/$f.tar" 2>&1); rc=$?
+  [ "$rc" = 1 ] && echo "$out" | grep -qx 'layer 2: /x: github-token' && ! echo "$out" | grep -q "$ltok" \
+    && echo "$out" | grep -q '^layer 3 .*0 hits$' && ! echo "$out" | grep -q 'all [0-9]* layers scanned' \
+    && ok "layer scan ($f): token written in layer 2, deleted in 3: exit 1, 'layer 2: /x: pattern', no value" || bad "layer scan deleted $f rc=$rc"
+done
+out=$("$S" --archive "$ad/oci-utf16.tar" 2>&1); rc=$?
+[ "$rc" = 1 ] && echo "$out" | grep -qx 'layer 2: /y: github-token' && ! echo "$out" | grep -q "$ltok" \
+  && ok "layer scan: UTF-16LE token inside a layer is found" || bad "layer scan utf16 rc=$rc"
+out=$("$S" --archive "$ad/oci-env.tar" 2>&1); rc=$?
+[ "$rc" = 1 ] && echo "$out" | grep -qx 'config: github-token' && ! echo "$out" | grep -q "$ltok" \
+  && ok "layer scan: a token in the image configuration is found" || bad "layer scan config rc=$rc"
+for f in oci-badlayer oci-zstd notimage; do
+  out=$("$S" --archive "$ad/$f.tar" 2>&1); rc=$?
+  [ "$rc" = 2 ] && echo "$out" | grep -q 'not scanned' && ! echo "$out" | grep -q 'all [0-9]* layers scanned' \
+    && ok "layer scan ($f): an unreadable or unsupported layer is exit 2, never a pass" || bad "layer scan $f rc=$rc"
+done
+"$S" --archive "$ad/missing.tar" >/dev/null 2>&1; [ $? = 2 ] && ok "layer scan: a missing archive is exit 2" || bad "missing archive"
+# the meta line is not the full-scan line
+PATH="$tmp/mstub:$PATH" STUB_ENV=A=b STUB_HIST=true "$S" --meta any:image 2>&1 | grep -q 'all [0-9]* layers scanned' \
+  && bad "meta output reads as a layer scan" || ok "the --meta line differs from the full-scan line"
+
 # 4. image scan, only when docker is up
 if [ "${CLOUD_TEST_SKIP_DOCKER:-0}" = 1 ]; then skip docker-build-cases "CLOUD_TEST_SKIP_DOCKER=1 (needs a base-image pull from the network)"
 elif docker info >/dev/null 2>&1; then
@@ -462,7 +496,15 @@ elif docker info >/dev/null 2>&1; then
         && ok "image with secret ($v): exit 1 and pattern named" || bad "image with secret ($v) rc=$rc"
     done
     "$here/worker/scan-secrets.sh" cw-scan-clean >/dev/null 2>&1 && ok "clean image: 0 hits" || bad "clean image"
+    out=$("$here/worker/scan-secrets.sh" cw-scan-deleted 2>&1)
+    echo "$out" | grep -q '^layer [0-9]*: /t: github-token$' && ok "image with the token deleted in a later layer: found in its own layer" || bad "deleted-token image: not found per layer"
   fi
+  # route 1 (README): a registry-free OCI export that holds the amd64 layers, scanned by --archive
+  if docker buildx build -q --platform linux/amd64 --output "type=oci,dest=$tmp/deleted-oci.tar" -f "$tmp/Dockerfile.deleted" "$tmp" >/dev/null 2>&1; then
+    out=$("$here/worker/scan-secrets.sh" --archive "$tmp/deleted-oci.tar" 2>&1); rc=$?
+    [ "$rc" = 1 ] && echo "$out" | grep -q '^layer [0-9]*: /t: github-token$' && ! echo "$out" | grep -q "ghp_" \
+      && ok "buildx OCI export (amd64): the deleted token is found per layer" || bad "buildx oci export scan rc=$rc"
+  else bad "buildx OCI export failed"; fi
   docker rmi cw-scan-baked cw-scan-deleted cw-scan-env cw-scan-clean >/dev/null 2>&1
   # 4b. the BUILD scan: the real Dockerfile's scan and final stages (from "FROM worker AS scan") on top of a small
   # stand-in `worker` stage, built for linux/amd64 like the remote build. The token is written now, in the context.

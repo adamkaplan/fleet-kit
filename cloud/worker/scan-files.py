@@ -30,22 +30,27 @@ def load(path):
     return out
 
 
+def scan_fileobj(fh, pats, found):
+    """Search a binary stream chunk by chunk (as it is and NUL-stripped); add the names of the patterns that hit."""
+    tail = b""
+    while True:
+        data = fh.read(CHUNK)
+        if not data and tail:
+            break
+        buf = tail + data
+        for name, rx in pats:
+            if name in found:
+                continue
+            if rx.search(buf) or rx.search(buf.replace(b"\x00", b"")):
+                found.add(name)
+        if not data:
+            break
+        tail = buf[-OVERLAP:]
+
+
 def scan_file(path, pats, found):
     with open(path, "rb") as fh:
-        tail = b""
-        while True:
-            data = fh.read(CHUNK)
-            if not data and tail:
-                break
-            buf = tail + data
-            for name, rx in pats:
-                if name in found:
-                    continue
-                if rx.search(buf) or rx.search(buf.replace(b"\x00", b"")):
-                    found.add(name)
-            if not data:
-                break
-            tail = buf[-OVERLAP:]
+        scan_fileobj(fh, pats, found)
 
 
 def main(argv):

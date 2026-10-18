@@ -151,21 +151,58 @@ cloud/worker/scan-secrets.sh --meta acme-registry.azurecr.io/cw-worker:<tag>   #
 
 `--meta <image>` scans `docker image inspect` Config (env, labels, command) and `docker history --no-trunc`. It reads no
 layer, and its output says so (`META SCAN ONLY: image configuration and history; layer FILES NOT SCANNED`, on success and on
-failure): it never prints the plain `0 hits` of a file scan. `scan-secrets.sh <image>` (a `docker save` scan that extracts every
-layer separately) still works where the engine can export the layers (an image of the machine's own architecture); it is not run
-by the build or CI.
+failure): it never prints the plain `0 hits` of a file scan.
 
-What the build scan covers and does NOT cover:
+### The per-layer scan is THE gate
 
-- It covers every regular file of the MERGED filesystem of the finished `worker` stage (minus `proc`, `sys`, `dev` and the
-  scan files), binary files included. Files are read as bytes in streamed 4 MiB chunks with an overlap, so a token across a chunk
-  edge is found and there is no file-size limit; each file is searched as it is and with its NUL bytes removed, which finds
-  UTF-16LE, UTF-16BE and NUL-padded text. A CRLF line end does not hide a private key.
-- A file it cannot read fails the build (exit 2); nothing is skipped.
-- It does NOT see a secret written in one layer and deleted in a later one (the layers are already merged), so no step of the
-  `worker` stage may take a credential. A per-layer scan was judged not cheap: it needs a full scan after every layer-creating step.
-- It does NOT detect base64, compressed (gzip, zip, tar) or otherwise encoded forms, or a token split by other bytes: the
-  patterns are text patterns for known credential shapes.
+`scan-secrets.sh --archive <file.tar>` reads an image archive as a stream (python `tarfile`, nothing extracted to disk),
+every layer ONCE, so the work is the sum of the layer sizes. It scans every regular file of every layer, including a file
+that a later layer deletes (the deletion is only a `.wh.<name>` entry in the later layer), plus the image configuration
+(environment, labels) and history. Formats: `docker save` output (`manifest.json` + layer tarballs) and an OCI image layout
+(`index.json` -> manifest -> blobs; plain or gzip layers; zstd only where python can read it). It prints
+`layer <n> <short digest>: <files> files, <MiB> MiB, <hits> hits` per layer, `layer <n>: <path>: <pattern>` per hit (never a
+value), a `total:` line and, only when every layer was read and nothing hit, `all N layers scanned (files + configuration +
+history)`. Exit 0 / 1 hits / 2 a layer, a member or the archive could not be read (`not scanned`, never a pass; a layer that
+is zstd where python has no zstd is exit 2). `scan-secrets.sh <image>` is `docker save` + `--archive`.
+
+The in-build stage (`--dir /` over the merged filesystem) stays as a cheap early gate: it stops a bad build before anything
+is exported. It cannot see a file deleted in a later layer, so it is not the gate.
+
+How to get the archive (the layers of an amd64 image cannot come out of `docker save` on an arm64 machine with the containerd
+image store: it writes only the index, and the scanner then exits 2 for the missing blobs):
+
+```sh
+# 1. a local, registry-free export that holds the amd64 layers (tested)
+docker buildx build --platform linux/amd64 --output type=oci,dest=/tmp/worker.tar -f cloud/worker/Dockerfile cloud
+cloud/worker/scan-secrets.sh --archive /tmp/worker.tar
+# 2. an image in the registry, without a docker daemon (command shapes; NOT tested here)
+crane pull --platform linux/amd64 --format oci acme-registry.azurecr.io/cw/worker-candidate:<sha> /tmp/worker-oci   # an OCI layout directory: tar it (tar -C /tmp/worker-oci -cf /tmp/worker.tar .)
+skopeo copy --override-arch amd64 docker://acme-registry.azurecr.io/cw/worker-candidate:<sha> oci-archive:/tmp/worker.tar
+# 3. an amd64 host
+docker save acme-registry.azurecr.io/cw/worker-candidate:<sha> -o /tmp/worker.tar   # or: scan-secrets.sh <image>
+```
+
+Publishing flow: build to a STAGING tag, export the candidate by route 2, scan it, and retag to the real tag only on exit 0, so
+nothing is published under the real name before the scan:
+
+```sh
+(cd cloud && az acr build --registry acme-registry -t cw/worker-candidate:<sha> --platform linux/amd64 -f worker/Dockerfile .)
+# export by route 2, then: cloud/worker/scan-secrets.sh --archive /tmp/worker.tar     (0 = go on, anything else = stop)
+az acr import --registry acme-registry --source acme-registry.azurecr.io/cw/worker-candidate:<sha> --image cw-worker:<tag>   # shape only
+```
+
+What the per-layer scan covers and does NOT cover:
+
+- It covers every regular file of every layer, binary files included (hardlinks are covered by the layer that holds the data),
+  searched as bytes in streamed 4 MiB chunks with an overlap, as they are and with NUL bytes removed (UTF-16LE/BE, NUL-padded
+  text), a CRLF line end not hiding a key; the image configuration and history; credential file names (ssh keys,
+  `.git-credentials`, `.netrc`, `gh/hosts.yml`, `kubeconfig`).
+- It does NOT detect base64, compressed (gzip, zip, tar) or otherwise encoded copies of a secret inside a file, nor a secret
+  split across two files or by other bytes: the patterns are text patterns for known credential shapes.
+- It does NOT read a layer it cannot decompress: that is exit 2 (fail), not a skip.
+
+What the in-build stage covers: the merged filesystem of the finished `worker` stage (minus `proc`, `sys`, `dev` and the scan
+files), nothing deleted in a layer, same byte scan. A file it cannot read fails the build (exit 2).
 
 Output is `path: pattern-name`, never the value. Exit codes: 0 no hits, 1 hits, 2 not readable or a usage error.
 
