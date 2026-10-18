@@ -13169,8 +13169,8 @@ def triage_pass(engine, decisions, now, errors=()):
         state.current["ownerless"] = ownerless
     held = getattr(engine, "plan_wake", None)
     if held is not None and held.unapproved:   # #765: the plans that look unapproved, one status line (a hint: see docs/switchboard.md)
-        state.current["plans_unapproved"] = held.unapproved[:load_module("plan_wake").MAX_LISTED]
-        state.current["plans_unapproved_more"] = max(0, len(held.unapproved) - load_module("plan_wake").MAX_LISTED)
+        state.current["plans_unapproved"] = held.unapproved[:load_triage_plan_open().MAX_LISTED]
+        state.current["plans_unapproved_more"] = max(0, len(held.unapproved) - load_triage_plan_open().MAX_LISTED)
     triage_write(engine, state)
     flagged = [(r, ref) for r, ref, _ in findings if r == "OO" and now - state.alarmed.get((r, ref), 0) >= cfg["realarm_hours"] * 3600]
     due, invalid = triage_digest_due(engine, state, [(r, ref) for r, ref, _ in findings if r != "OO"],
@@ -13362,7 +13362,7 @@ def plan_wake_route(number, items, ctx, discovery, chiefs):
 def plan_wake_pass(engine, state, repos, now):
     """Announce each new plan hash to its approver once, and list the plans that look unapproved. Never raises; reads nothing from GitHub."""
     wake = plan_wake_state(engine)
-    module, check_module = load_module("plan_wake"), load_module("plan_check")
+    module, check_module = load_triage_plan_open(), load_plan_check()
     discovery = getattr(engine, "discovery", None)
     if discovery is None or discovery.problems:
         return
@@ -13479,7 +13479,7 @@ def triage_status_lines(triage):
     lines = ["      triage     %s: %s finding(s) (%s) over %s repo(s) as of %s" % (
         "on (wakes the Chief of Staff; writes nothing to GitHub)" if triage.get("enabled") else "shadow (audit only; writes nothing to GitHub)",
         triage.get("total", 0), parts, triage.get("repos", "?"), triage.get("at", "?"))]
-    plans = load_module("plan_wake").unapproved_line(triage.get("plans_unapproved"), triage.get("plans_unapproved_more", 0))
+    plans = load_triage_plan_open().unapproved_line(triage.get("plans_unapproved"), triage.get("plans_unapproved_more", 0))
     if plans:
         lines.append("      triage     " + plans)
     if triage.get("other_owner"):

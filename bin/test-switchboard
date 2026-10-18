@@ -24964,6 +24964,7 @@ class TestPlanWake(Base):
         self.engine.plan_wake.announced[key] = self.world.clock.now() - 15 * 86400
         self.go()
         self.assertEqual(self.engine.plan_wake.announced, {})
+        self.assertEqual(json.loads((Path(self.world.state) / sb.PLAN_WAKE_FILE).read_text()), {"announced": {}})   # the pruned file is rewritten
 
     def pr(self, number, body, minutes_ago):
         record = tri_issue(self.world.clock.now(), number, created=0.01, body=body, pr=True)
