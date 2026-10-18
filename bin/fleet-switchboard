@@ -8517,6 +8517,8 @@ class WorkerFacts:
         engine = self.engine
         discovery = getattr(engine, "discovery", None)
         if engine is None or discovery is None or fault("no-worker-source"):
+            if engine is not None:
+                read_mark(engine, "requests", False, "no worker source was read", engine.now())   # #805: an earlier whole mark is not this pass's
             return []
         horizon = worker_horizon(engine.config, engine.now())
         facts, skipped = [], []

@@ -40739,6 +40739,27 @@ class TestRequestTiers(TierWorld):
         self.pass_()
         self.assertEqual(sb.read_escalated(self.world.state), {})                    # a whole pass without the request: forgotten
 
+    def test_the_requests_are_not_whole_for_a_problem_worker_a_fleet_problem_or_no_worker_source(self):
+        self.block_(timed=True)
+        self.pass_()
+        engine = self.world.engine
+        self.assertEqual(sb.whole(engine, "requests"), (True, ""))
+        observation = engine.discovery.agents["api-coder"]
+        worker = next(x for x in engine.sources if isinstance(x, sb.WorkerFacts))
+        with mock.patch.object(observation, "problem", "unreadable", create=True):
+            worker()                                                                 # the source is called on the held discovery
+        self.assertFalse(sb.whole(engine, "requests")[0])
+        self.pass_()
+        self.assertTrue(sb.whole(engine, "requests")[0])
+        with mock.patch.object(engine.discovery, "problems", ["herdr down"], create=True):
+            worker()
+        self.assertEqual(sb.whole(engine, "requests"), (False, "the fleet could not be read whole"))
+        self.pass_()
+        self.assertTrue(sb.whole(engine, "requests")[0])
+        with mock.patch.object(sb, "fault", lambda name: name == "no-worker-source"):
+            self.pass_()
+        self.assertFalse(sb.whole(engine, "requests")[0])                            # not a stale whole mark from before
+
     def test_the_audit_log_is_never_read_by_the_derivation(self):
         self.assertNotIn("audit", class_source_fn("decisions_from_requests"))
         self.assertNotIn("audit.jsonl", class_source_fn("derive_decisions"))
