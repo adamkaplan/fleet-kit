@@ -141,7 +141,7 @@ def main(argv):
         found = set()
         try:
             sf.scan_fileobj(blob(cfg), pats, found)
-        except (Unreadable, OSError, tarfile.TarError):
+        except Exception:  # fail closed: any error is 'not scanned', never an exit that reads as hits
             print(f"scan-secrets: cannot read the image configuration {cfg}: not scanned", file=sys.stderr)
             errors += 1
             continue
@@ -178,8 +178,8 @@ def main(argv):
                         lhits += lh
                         hits += lh
                         allowed_t += la
-            except (Unreadable, OSError, EOFError, tarfile.TarError, ValueError, io.UnsupportedOperation) as e:
-                print(f"scan-secrets: cannot read layer {n} {short}: not scanned ({e})", file=sys.stderr)
+            except Exception as e:  # a corrupt zstd/gzip/tar stream, a missing codec: all 'not scanned'
+                print(f"scan-secrets: cannot read layer {n} {short}: not scanned ({type(e).__name__})", file=sys.stderr)
                 errors += 1
             print(f"layer {n} {short}: {nfiles} files, {nbytes / 1048576:.1f} MiB, {lhits} hits")
             files_t += nfiles
@@ -198,4 +198,9 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    try:
+        code = main(sys.argv)
+    except Exception as e:  # nothing may end as a traceback with exit 1: that would read as "hits found"
+        print(f"scan-secrets: cannot scan the archive: not scanned ({type(e).__name__})", file=sys.stderr)
+        code = 2
+    sys.exit(code)

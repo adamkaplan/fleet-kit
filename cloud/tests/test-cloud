@@ -539,6 +539,58 @@ SCAN_ALLOWLIST="$al/list-wrong" "$S" --archive "$al/arch.tar" >/dev/null 2>&1; [
 out=$(SCAN_TRIPLES=1 SCAN_ALLOWLIST="$al/list-wrong" "$S" --archive "$al/arch.tar" 2>&1)
 echo "$out" | grep -q "^TRIPLE.*/lib/f $h1 github-token$" && ! echo "$out" | grep -q "$ltok" && ok "SCAN_TRIPLES=1 prints the triple of a hit, never the value" || bad "triple output"
 
+# 3h. publish-image.sh: scan, then publish BY DIGEST, or publish nothing (stub crane/skopeo on a private dir; docker-free)
+pb="$tmp/pub"; mkdir -p "$pb/bin"; PUB="$here/worker/publish-image.sh"
+D1="sha256:$(printf '1%.0s' $(seq 64))"; D2="sha256:$(printf '2%.0s' $(seq 64))"
+cat > "$pb/bin/crane" <<'S'
+#!/usr/bin/env bash
+echo "crane $*" >> "$STUB_LOG"
+case $1 in
+  digest) n=$(cat "$STUB_STATE/n" 2>/dev/null || echo 0); echo $((n+1)) > "$STUB_STATE/n"
+          [ "$STUB_FAIL" = digest ] && exit 1
+          if [ "$STUB_MOVE" = 1 ] && [ "$n" -ge 1 ]; then echo "$STUB_D2"; else echo "$STUB_D1"; fi ;;
+  pull) [ "$STUB_FAIL" = pull ] && exit 1; for a; do dir=$a; done; mkdir -p "$dir"; tar -xf "$STUB_ARCHIVE" -C "$dir" ;;
+  copy) [ "$STUB_FAIL" = copy ] && exit 1; exit 0 ;;
+esac
+S
+cat > "$pb/bin/skopeo" <<'S'
+#!/usr/bin/env bash
+echo "skopeo $*" >> "$STUB_LOG"
+case $1 in
+  inspect) n=$(cat "$STUB_STATE/n" 2>/dev/null || echo 0); echo $((n+1)) > "$STUB_STATE/n"
+           if [ "$STUB_MOVE" = 1 ] && [ "$n" -ge 1 ]; then printf 'manifest-two'; else printf 'manifest-one'; fi ;;
+  copy) case $* in *oci-archive:*) for a; do o=$a; done; cp "$STUB_ARCHIVE" "${o#oci-archive:}" ;;
+          *) [ "$STUB_FAIL" = copy ] && exit 1; exit 0 ;; esac ;;
+esac
+S
+chmod +x "$pb/bin/crane" "$pb/bin/skopeo"
+mdig() { printf '%s' "$1" | python3 -c 'import hashlib,sys; print("sha256:"+hashlib.sha256(sys.stdin.buffer.read()).hexdigest())'; }
+# pub <tool> <archive> [move] [fail]: runs the script; sets prc, pout, and the stub call log in $plog
+pub() {
+  plog="$pb/calls"; : > "$plog"; rm -rf "$pb/state"; mkdir -p "$pb/state"
+  pout=$(env STUB_LOG="$plog" STUB_STATE="$pb/state" STUB_ARCHIVE="$ad/$2.tar" STUB_MOVE="${3:-0}" STUB_FAIL="${4:-none}" STUB_D1="$D1" STUB_D2="$D2" \
+    "$PUB" --tool "$1" --tool-dir "$pb/bin" --staging acme-registry.example/cw/worker-candidate:abc --release acme-registry.example/cw/worker:v1 2>&1); prc=$?
+  ncopy=$(grep -cE '^(crane copy|skopeo copy .*docker://acme-registry.example/cw/worker:v1)' "$plog")
+}
+for t in crane skopeo; do
+  pub $t oci-clean
+  want=$D1; [ $t = skopeo ] && want=$(mdig manifest-one)
+  [ "$prc" = 0 ] && [ "$ncopy" = 1 ] && grep -q "worker-candidate@$want" <(grep -E 'copy .*worker:v1' "$plog") && ! grep -E 'copy .*worker:v1' "$plog" | grep -q 'candidate:abc' \
+    && echo "$pout" | grep -q 'all 3 layers scanned' && ok "publish ($t): a clean image is published once, BY the scanned digest" || bad "publish clean $t rc=$prc copies=$ncopy"
+  pub $t oci-utf16; [ "$prc" = 1 ] && [ "$ncopy" = 0 ] && ok "publish ($t): a token in a layer publishes nothing (exit 1)" || bad "publish planted $t rc=$prc copies=$ncopy"
+  pub $t oci-deleted; [ "$prc" = 1 ] && [ "$ncopy" = 0 ] && ok "publish ($t): a token deleted in a later layer publishes nothing" || bad "publish deleted $t rc=$prc copies=$ncopy"
+  pub $t oci-badlayer; [ "$prc" = 2 ] && [ "$ncopy" = 0 ] && ok "publish ($t): an unreadable layer is exit 2, nothing published" || bad "publish unreadable $t rc=$prc copies=$ncopy"
+  pub $t oci-clean 1; [ "$prc" = 3 ] && [ "$ncopy" = 0 ] && echo "$pout" | grep -q 'moved' && ok "publish ($t): the staging tag moved after the scan: refused, nothing published" || bad "publish moved $t rc=$prc copies=$ncopy"
+  pub $t oci-clean 0 copy; [ "$prc" != 0 ] && ok "publish ($t): a tool failure on the publish step is non-zero" || bad "publish copy fail $t"
+done
+for f in digest pull; do pub crane oci-clean 0 $f; [ "$prc" = 3 ] && [ "$ncopy" = 0 ] && ok "publish: a tool failure ($f) is exit 3, nothing published" || bad "publish fail $f rc=$prc"; done
+! echo "$pout $(pub crane oci-utf16; echo "$pout")" | grep -q "$ltok" && ok "publish: no value is printed" || bad "publish printed a value"
+"$PUB" --tool docker --tool-dir "$pb/bin" --staging a.example/x:y --release a.example/x:z >/dev/null 2>&1; r1=$?
+"$PUB" --tool crane --tool-dir "$pb/bin" --staging a.example/x:y --release a.example/x:y >/dev/null 2>&1; r2=$?
+"$PUB" --tool crane --tool-dir "$pb/bin" --staging 'a.example/x@sha256:1' --release a.example/x:z >/dev/null 2>&1; r3=$?
+PATH="$pb/bin:$PATH" "$PUB" --tool crane --staging a.example/x:y --release a.example/x:z >/dev/null 2>&1; r4=$?
+[ "$r1$r2$r3" = 333 ] && [ "$r4" != 0 ] && ok "publish: a tool outside the list, equal tags, a digest ref and a PATH-only tool are refused" || bad "publish arguments $r1$r2$r3 $r4"
+
 # 4. image scan, only when docker is up
 if [ "${CLOUD_TEST_SKIP_DOCKER:-0}" = 1 ]; then skip docker-build-cases "CLOUD_TEST_SKIP_DOCKER=1 (needs a base-image pull from the network)"
 elif docker info >/dev/null 2>&1; then

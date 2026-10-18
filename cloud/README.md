@@ -182,14 +182,24 @@ skopeo copy --override-arch amd64 docker://acme-registry.azurecr.io/cw/worker-ca
 docker save acme-registry.azurecr.io/cw/worker-candidate:<sha> -o /tmp/worker.tar   # or: scan-secrets.sh <image>
 ```
 
-Publishing flow: build to a STAGING tag, export the candidate by route 2, scan it, and retag to the real tag only on exit 0, so
-nothing is published under the real name before the scan:
+Publishing is ONE command, `worker/publish-image.sh`. Build to a STAGING tag first (nothing is published under the real
+name), then:
 
 ```sh
 (cd cloud && az acr build --registry acme-registry -t cw/worker-candidate:<sha> --platform linux/amd64 -f worker/Dockerfile .)
-# export by route 2, then: cloud/worker/scan-secrets.sh --archive /tmp/worker.tar     (0 = go on, anything else = stop)
-az acr import --registry acme-registry --source acme-registry.azurecr.io/cw/worker-candidate:<sha> --image cw-worker:<tag>   # shape only
+cloud/worker/publish-image.sh --tool crane \
+  --staging acme-registry.example/cw/worker-candidate:<sha> --release acme-registry.example/cw/worker:<tag>
 ```
+
+It resolves the staging tag to a digest, exports exactly `<staging>@<digest>` (`crane pull --platform linux/amd64 --format oci`,
+or `skopeo copy --override-arch amd64 ... oci-archive:`), runs the per-layer scan on that export, resolves the staging tag
+AGAIN and refuses if it no longer points at the scanned digest, and only then copies `<staging>@<digest>` to the release tag
+(`crane copy` / `skopeo copy`), by digest, never by tag. Exit 0 = published; 1 = a hit; 2 = a layer could not be read; 3 = a
+tool failed, a digest could not be resolved, the tag moved, or the arguments were wrong. In every non-zero case nothing is
+published. The staging image must be a single-platform amd64 image. The tool comes from `--tool` (`crane` or `skopeo` only) and
+runs from an absolute path (`--tool-dir`, else a fixed list of system directories), never from the caller's environment. A registry login must
+already exist: this script never reads or prints a credential. The command shapes for the registry tools are untested against a
+real registry here; the script's logic is tested with stub tools.
 
 What the per-layer scan covers and does NOT cover:
 
