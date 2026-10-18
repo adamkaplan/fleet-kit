@@ -34,6 +34,8 @@ AUTH:       <the authority already granted, explicitly>
 CHECKPOINT: <a UTC time or an agreed event, with an overdue time>
 ```
 
+A coder that posts a plan also reports `working: plan posted <hash> <url>` (a report arrives even when a send is lost).
+
 A brief for a credential, permission or privileged-script change links `docs/adversarial-checklist.md`.
 The pull request body answers each item of it in one line. A Mermaid diagram appears only where it shows data flow, system design or component design, never at the top of a body and never as a summary of what changes, what it touches, what is irreversible and the risk.
 
