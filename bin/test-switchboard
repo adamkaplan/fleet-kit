@@ -25200,6 +25200,20 @@ class TestTriageT5Rollup(Base):
         lines = [e for e in self.world.audit() if e["event"] == "whole.skipped" and e["detail"]["input"] == "decisions"]
         self.assertEqual(len(lines), 1)
 
+    def test_a_pass_with_unread_notices_is_not_whole_and_keeps_the_t6_records(self):
+        ds = [self.decision(51, hours=72, kind="captain"), self.decision(7)]
+        self.run_pass(ds)
+        self.assertEqual(self.seen_keys(), ["T5 acme/api#7", "T6 acme/api#51"])
+        self.engine.notice_unread = 3                                                 # no error, but the notice reader skipped three
+        self.run_pass([], 3600)
+        self.assertEqual(sb.whole(self.engine, "decisions"), (False, "3 notices unread"))
+        self.assertEqual(self.seen_keys(), ["T5 acme/api#7", "T6 acme/api#51"])      # kept
+        self.engine.notice_unread = 0
+        self.assertEqual(self.run_pass(ds, 3600)[0], [])                             # nothing already listed is listed again
+        self.assertEqual(sb.whole(self.engine, "decisions"), (True, ""))
+        self.run_pass(ds[:1], 3600)
+        self.assertEqual(self.seen_keys(), ["T6 acme/api#51"])                       # a whole pass without #7 prunes it
+
     def test_the_registry_adds_no_read_to_a_pass(self):
         ds = [self.decision(7)]
         self.run_pass(ds, 3600)

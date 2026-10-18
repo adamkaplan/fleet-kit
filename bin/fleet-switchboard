@@ -13216,7 +13216,9 @@ def whole_skipped(engine, consumer, name):
 
 def triage_mark_reads(engine, state, repos, errors, now):
     """The inputs the triage rules judge, marked from the reads this pass already made (no new read)."""
-    read_mark(engine, "decisions", not errors, "the decision list had errors" if errors else "", now)
+    unread = getattr(engine, "notice_unread", 0)   # noticed PRs the reader has no facts for: their held-PR rows are not derived
+    why = "the decision list had errors" if errors else ("%d notices unread" % unread if unread else "")
+    read_mark(engine, "decisions", not errors and not unread, why, now)
     for repo in repos:
         unit = state.units.get((repo, "issues"))
         if unit is None:
