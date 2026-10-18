@@ -25307,6 +25307,7 @@ class TestPlanWake(Base):
         self.send("Approved at sha256:%s" % h, keys="send:cos:1")                                  # keys not a list
         self.send("Approved at sha256:%s" % h, keys=[5])                                           # a key not a string
         self.send("Approved at sha256:%s" % h, desc="switchboard: cos message on #3: " + "x" * 400 + " Approved at sha256:%s" % h)   # over the bound
+        self.send("Approved at sha256:%s" % h, sender="switchboard", keys=["send:switchboard:1"])   # the daemon's own line is never an approver
         self.send("Approved at sha256:%s" % h, keys=["report:cos:1"])                              # not a send key
         self.send("Approved at sha256:%s" % h, desc="switchboard: 2 items for orch: Approved at sha256:%s" % h)   # a batch is not recognised
         self.go()

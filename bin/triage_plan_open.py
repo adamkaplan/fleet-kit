@@ -160,6 +160,7 @@ def approved_by_comment(plan, plan_hash, issue_comments, signed_by):
 # `send:<sender>:<id>` and `detail.description` is `switchboard: <sender> message on <issue tag>: <first 100 characters of the text>` (200 in all), so
 # `Approved at sha256:` + 64 hex (83 characters) fits. A message batched with others (`N items for ...`) is not recognised: the note then fires, as before.
 
+DAEMON_SENDERS = ("switchboard", "fleet-switchboard", "fleet-daemon")   # the daemon's own lines quote other people; they are never an approver
 MAX_SENDS = 50000       # audit entries scanned per pass
 MAX_DESCRIPTION = 400   # the daemon writes at most 200 characters
 _SEND_DESC_RE = re.compile(r"^switchboard: ([A-Za-z0-9_.-]{1,64}) message on [^\s:]{1,120}: (.*)$", re.S)
@@ -196,7 +197,7 @@ def approved_by_send(plan, plan_hash, entries, signed_by):
             continue
         sender = _send_sender(detail)
         found = _SEND_DESC_RE.match(detail["description"])
-        if sender is None or found is None or found.group(1).lower() != sender or "agent:" + sender == mine:
+        if sender is None or found is None or found.group(1).lower() != sender or sender in DAEMON_SENDERS or "agent:" + sender == mine:
             continue
         text = found.group(2)
         if starts.match(text):
