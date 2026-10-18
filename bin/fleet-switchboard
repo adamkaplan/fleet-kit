@@ -16288,7 +16288,12 @@ def launch_memory_check(args, engine, state, runner, now, sleep=None):
     sleep = sleep or time.sleep
     reason = getattr(args, "memory_ok", None)
     path = Path(state) / MEMORY_CACHE_FILE
-    wait = float(os.environ.get("FLEET_MEMORY_WAIT_SECONDS", MEMORY_WAIT_SECONDS))   # a test seam; never set it in production
+    try:   # a test seam (never set in production); FAIL MODE: a value that is not a number from 0 to 120 is ignored and the 30 s applies
+        wait = float(os.environ.get("FLEET_MEMORY_WAIT_SECONDS", MEMORY_WAIT_SECONDS))
+        if not 0 <= wait <= 120:
+            wait = MEMORY_WAIT_SECONDS
+    except ValueError:
+        wait = MEMORY_WAIT_SECONDS
     audit = lambda kind, data: engine.audit.append(engine.actor, kind, args.name, data) if engine.audit is not None else None
     first = memory_read(runner)
 
@@ -16299,7 +16304,7 @@ def launch_memory_check(args, engine, state, runner, now, sleep=None):
             tmp.write_text(json.dumps({"at": now(), "reads": [list(r) for r in reads][-2:]}))
             os.replace(tmp, path)
         except OSError:
-            pass
+            pass   # the cache is only an optimisation: a failed write costs the next launch one wait, deliberately silent
     if reason is not None:
         audit("launch.memory_ok", {"reason": _one_line(reason, 200), "measured": ("free %d%%, swapouts %d" % first) if first else "not measured"})
         return None
@@ -16310,8 +16315,11 @@ def launch_memory_check(args, engine, state, runner, now, sleep=None):
     free, before = first
     cached = None
     try:
-        record = json.loads(path.read_text())
+        with open(path) as handle:
+            record = json.loads(handle.read(4096))   # a small file: a bigger one is not ours and is not trusted
         reads = record["reads"]
+        if not isinstance(reads, list) or len(reads) > 2:
+            raise ValueError("unexpected cache shape")
         if 0 <= now() - float(record["at"]) < MEMORY_CACHE_SECONDS and len(reads) >= 1:
             cached = reads[-1][1]
             if len(reads) >= 2 and reads[-2][1] != cached:

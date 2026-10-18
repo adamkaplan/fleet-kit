@@ -34639,6 +34639,19 @@ class TestLaunchMemoryGate(TwoRepoCase):
         code, _, _ = self.launch()
         self.assertEqual((code, self.sessions() - before), (sb.EXIT_MEMORY, 0))
 
+    def test_a_bad_wait_value_and_a_corrupt_cache_are_ignored(self):
+        (self.world.state / sb.MEMORY_CACHE_FILE).write_text("{not json")
+        for bad in ("abc", "-5", "nan"):
+            with mock.patch.dict(os.environ, {"FLEET_MEMORY_WAIT_SECONDS": bad}), mock.patch.object(sb, "MEMORY_WAIT_SECONDS", 0):
+                code, _, err = self.launch(name="web-" + bad.strip("-"))
+            self.assertEqual(code, 0, err)
+
+    def test_a_cached_pair_that_moved_is_not_flat(self):
+        (self.world.state / sb.MEMORY_CACHE_FILE).write_text(json.dumps({"at": self.world.clock.now() - 5, "reads": [[55, 90], [55, 100]]}))
+        code, _, err = self.launch()
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("cached", err)
+
     def test_s10_the_help_says_it_is_the_lanes_check_and_not_the_owners_rule(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
