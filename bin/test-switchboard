@@ -22507,20 +22507,20 @@ class TestTriage(Base):
         self.go(decisions, passes=3)
         self.assertEqual((self.only("T5"), self.only("T6")), (["acme/api#50"], ["acme/api#51"]))
 
-    def test_t5_fires_at_two_hours_with_the_hours_in_its_evidence(self):
+    def test_t5_fires_past_a_day_with_the_hours_in_its_evidence(self):
         decisions = [{"id": "d5", "kind": "issue", "tier": "human", "repo": "acme/api", "ask": 54,
-                      "since": sb.iso(self.now - 3 * 3600)},
+                      "since": sb.iso(self.now - 30 * 3600)},
                      {"id": "d6", "kind": "issue", "tier": "human", "repo": "acme/api", "ask": 55,
-                      "since": sb.iso(self.now - 5400)}]                      # 1.5 hours: not yet
+                      "since": sb.iso(self.now - 20 * 3600)}]                 # 20 hours: not yet (#766)
         self.go(decisions, passes=2)
         self.assertEqual(self.only("T5"), ["acme/api#54"])
         row = [e for e in self.world.audit() if e["event"] == "triage.finding" and e["detail"]["rule"] == "T5"][0]
-        self.assertGreaterEqual(row["detail"]["evidence"]["waiting_hours"], 3.0)
+        self.assertGreaterEqual(row["detail"]["evidence"]["waiting_hours"], 30.0)
 
     def test_the_default_slas_are_the_approved_ones_and_fractions_validate(self):
         sla = sb.TRIAGE_SLA
         self.assertEqual((sla["t2_days"], sla["t3_ask_days"], sla["t3_other_days"], sla["t5_days"], sla["t11_days"]),
-                         (1 / 24, 1, 3, 2 / 24, 1))
+                         (1 / 24, 1, 3, 1, 1))
         self.assertEqual((sla["t1_days"], sla["t6_days"], sla["t7_ours_hours"], sla["t7_other_days"], sla["t8_days"],
                           sla["t9_days"]), (1, 2, 4, 2, 1, 3))                    # the others are unchanged
         base = {"opencode": FAKE_OPENCODE}
@@ -24666,6 +24666,89 @@ class TestTriageDigest(Base):
     def test_backoff_false_restores_the_fixed_realarm(self):
         self.add(140, created=3, updated=0.2, labels=["kind"])
         self.assertEqual([d for d, _ in self.passes(3, backoff=False)], [0, 1, 2, 3])   # the fixed 24-hour re-alarm is back
+
+
+class TestTriageT5Rollup(Base):
+    """#766: a T5 decision is listed once past a day, then only in one daily roll-up line. Temp state dir, a fake hub: nothing real."""
+    DAY = 86400
+
+    def setUp(self):
+        Base.setUp(self)
+        self.world = World(self, agents=(), config={"github_repos": ["acme/api"]})
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.hub = FakeTriageHub()
+        self.engine = self.world.engine
+        self.engine.hub = self.hub
+        self.engine.config["triage"] = dict(sb.TRIAGE_DEFAULTS, repos=["acme/api"], our_logins=["bot"], enabled=True, backoff=True)
+        self.engine.discover(self.world.clock.now())
+        self.hub.open["acme/api"] = {}
+        self.now = self.world.clock.now()
+
+    def decision(self, n, hours=30, kind="issue"):
+        d = {"id": "d%d" % n, "kind": kind, "tier": "human", "repo": "acme/api", "since": sb.iso(self.now - hours * 3600)}
+        d["number" if kind == "captain" else "ask"] = n
+        return d
+
+    def run_pass(self, decisions, tick=1):
+        """One pass; returns (T5 refs in the digest, the roll-up lines queued)."""
+        self.world.tick(tick)
+        seen_before = set(getattr(self.engine, "triage", None).facts) if getattr(self.engine, "triage", None) else set()
+        shown = []
+        real = sb.triage_queue_fact
+        def spy(state, due, *a, **k):
+            shown.extend(ref for rule, ref in due if rule == "T5")
+            return real(state, due, *a, **k)
+        with mock.patch.object(sb, "triage_queue_fact", spy):
+            sb.triage_pass(self.engine, decisions, self.world.clock.now(), ())
+        lines = [v[0] for k, v in self.engine.triage.facts.items() if k.startswith("triage.rollup") and k not in seen_before]
+        return shown, lines
+
+    def test_s1_s2_listed_once_then_never_again_even_after_a_reload(self):
+        ds = [self.decision(7)]
+        self.assertEqual(self.run_pass(ds)[0], ["acme/api#7"])
+        self.assertEqual(self.run_pass(ds, 2 * 3600)[0], [])
+        self.engine.triage.seen = self.engine.triage.meta = None      # a restart: the memory comes back from the file
+        self.assertEqual(self.run_pass(ds, 3 * self.DAY)[0], [])
+
+    def test_s3_one_roll_up_line_a_day_naming_the_listed_items(self):
+        ds = [self.decision(7), self.decision(9)]
+        self.assertEqual(self.run_pass(ds), (["acme/api#7", "acme/api#9"], []))     # the listing itself is not the roll-up
+        self.assertEqual(self.run_pass(ds, 3600), ([], []))                          # a day has not passed since the listing
+        shown, lines = self.run_pass(ds, self.DAY)
+        self.assertEqual((shown, lines), ([], ["2 items waiting on the owner for more than a day: #7 #9"]))
+        self.assertEqual(self.run_pass(ds, 3600), ([], []))                          # once in 24 hours
+        self.assertEqual(self.run_pass(ds, 3600)[1], [])
+
+    def test_s4_an_item_that_leaves_the_tier_disappears_and_an_empty_roll_up_is_not_sent(self):
+        ds = [self.decision(7), self.decision(9)]
+        self.run_pass(ds)
+        self.assertEqual(self.run_pass(ds[1:], self.DAY)[1], ["1 items waiting on the owner for more than a day: #9"])
+        self.assertEqual(self.run_pass([], self.DAY)[1], [])
+
+    def test_s5_a_returning_item_is_listed_once_as_new(self):
+        ds = [self.decision(7)]
+        self.run_pass(ds)
+        self.run_pass([], 3600)                                                      # it left
+        self.assertEqual(self.run_pass(ds, 3600)[0], ["acme/api#7"])
+        self.assertEqual(self.run_pass(ds, 3600)[0], [])
+
+    def test_s6_t6_is_not_rolled_up_and_keeps_its_backoff(self):
+        ds = [self.decision(51, hours=72, kind="captain")]
+        listed = []
+        for _ in range(3):
+            real = sb.triage_queue_fact
+            with mock.patch.object(sb, "triage_queue_fact", lambda s, due, *a, **k: (listed.extend(due), real(s, due, *a, **k))[1]):
+                self.world.tick(1)
+                sb.triage_pass(self.engine, ds, self.world.clock.now(), ())
+        self.assertEqual(listed, [("T6", "acme/api#51")])                            # shown once, then the day's backoff
+        self.assertFalse([k for k in self.engine.triage.facts if k.startswith("triage.rollup")])
+
+    def test_s7_the_memory_is_in_the_seen_file_of_the_state_dir(self):
+        self.run_pass([self.decision(7)])
+        raw = json.loads((Path(self.engine.state_dir) / sb.triage_digest.SEEN_FILE).read_text())
+        self.assertIn("T5 acme/api#7", raw["items"])
+        self.run_pass([self.decision(7)], self.DAY)
+        self.assertIsNotNone(json.loads((Path(self.engine.state_dir) / sb.triage_digest.SEEN_FILE).read_text())["rollup"])
 
 
 class TestTriageAncestors(Base):

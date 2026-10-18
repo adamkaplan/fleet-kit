@@ -81,14 +81,18 @@ def load_meta(state_dir):
     raw = read_json(os.path.join(state_dir, SEEN_FILE)) if state_dir else None
     if raw is None or not isinstance(raw.get("items"), dict):
         return {"known": False, "swept": False, "last": None}
-    last = raw.get("last")
-    return {"known": True, "swept": bool(raw.get("swept", True)), "last": float(last) if _number(last) else None}
+    last, rolled = raw.get("last"), raw.get("rollup")
+    meta = {"known": True, "swept": bool(raw.get("swept", True)), "last": float(last) if _number(last) else None}
+    if _number(rolled):
+        meta["rollup"] = float(rolled)   # #766: only once a roll-up was sent; a file without one reads as before
+    return meta
 
 
 def write_seen(state_dir, seen, meta=None):
     if state_dir:
         meta = meta or {"swept": True, "last": None}
-        write_json(os.path.join(state_dir, SEEN_FILE), {"v": 1, "items": seen, "swept": bool(meta.get("swept")), "last": meta.get("last")})
+        write_json(os.path.join(state_dir, SEEN_FILE), {"v": 1, "items": seen, "swept": bool(meta.get("swept")), "last": meta.get("last"),
+                                                           **({"rollup": meta["rollup"]} if meta.get("rollup") is not None else {})})
 
 
 WARMUP_MAX_SECONDS = 1800   # a sweep that cannot finish (a list that never reads) ends its warm-up after this: the digest must never stay silent for good
@@ -170,6 +174,8 @@ def select(seen, items, mutes, ours, now, backoff=True, alarmed=None, realarm_se
         if ref in mutes and (item is None or item["updated"] <= mutes[ref]):
             continue   # 'seen, leave': quiet until the item changes
         rec = seen.get("%s %s" % (rule, ref))
+        if rule == "T5" and rec is not None:
+            continue   # #766: a decision already in the owner's tier is listed ONCE; after that only the daily roll-up names it
         if item is not None:
             until = item.get("parked_until")
             awaiting = any("awaiting" in str(l) for l in item["labels"])
@@ -203,6 +209,22 @@ def commit(seen, items, shown, invalid, now):
         seen["PARKED " + ref] = {"sig": "", "at": now, "n": 1, "flagged": True}   # the once-only flag
     for key in sorted(seen, key=lambda k: seen[k]["at"])[:max(0, len(seen) - SEEN_MAX)]:
         del seen[key]
+
+
+ROLLUP_SECONDS = 86400
+
+
+def rollup(seen, meta, t5_refs, now):
+    """The one daily roll-up line (#766), or None. It names the T5 items listed at least a day ago that are still findings now
+    (`t5_refs`: an item that left the owner's tier is not there, and `prune` has forgotten it). An item with no earlier listing is not named. Call BEFORE `commit`; on a line, `meta["rollup"]` is set and the caller writes the seen-file."""
+    last = meta.get("rollup")
+    if last is not None and now - last < ROLLUP_SECONDS:
+        return None
+    refs = sorted({ref for ref in t5_refs if "T5 " + ref in seen and now - seen["T5 " + ref]["at"] >= ROLLUP_SECONDS}, key=lambda r: (r.rpartition("#")[0], int(r.rpartition("#")[2]) if r.rpartition("#")[2].isdigit() else 0, r))
+    if not refs:
+        return None
+    meta["rollup"] = now
+    return "%d items waiting on the owner for more than a day: %s" % (len(refs), " ".join("#" + r.rpartition("#")[2] if "#" in r else r for r in refs))
 
 
 def prune(seen, candidates):

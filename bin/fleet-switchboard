@@ -12332,7 +12332,7 @@ TRIAGE_DEFAULTS = {"enabled": False, "repos": None, "required_labels": {}, "sla"
                    "our_logins": None, "daily_summary": True, "realarm_hours": 24, "max_findings": 30,
                    "calls_per_pass": 30, "pass_seconds": 10, "backoff": True, "digest_interval_minutes": 60, "ownerless": None}
 # Every `_days` value is in days and may be a fraction (2/24 is two hours); `t7_ours_hours` is in hours.
-TRIAGE_SLA = {"t1_days": 1, "t2_days": 1 / 24, "t3_ask_days": 1, "t3_other_days": 3, "t5_days": 2 / 24, "t6_days": 2,
+TRIAGE_SLA = {"t1_days": 1, "t2_days": 1 / 24, "t3_ask_days": 1, "t3_other_days": 3, "t5_days": 1, "t6_days": 2,
               "t7_ours_hours": 4, "t7_other_days": 2, "t8_days": 1, "t9_days": 3, "t11_days": 1}
 # (No tracked repo is named here: a public source names no private org. The extra repos go in the config's `triage.repos`.)
 TRIAGE_KINDS = {"T1": "owner missing", "T2": "required label missing", "T3": "no next step",
@@ -13180,6 +13180,14 @@ def triage_pass(engine, decisions, now, errors=()):
             triage_digest.write_seen(engine.state_dir, state.seen, state.meta)
         if not allowed:
             due, invalid = [], []
+    rolled = None
+    if cfg["enabled"] and state.meta is not None:   # #766: the one daily line for T5 items listed before and still in the owner's tier
+        rolled = triage_digest.rollup(state.seen, state.meta, [ref for r, ref, _ in findings if r == "T5"], now)
+        if rolled:
+            state.facts["triage.rollup:%d" % int(now)] = (rolled, now)
+            triage_digest.cost_record(engine.state_dir, now, rolled)
+            engine._note("triage.rollup", None, {"text": rolled, "at": iso(now)})
+            triage_digest.write_seen(engine.state_dir, state.seen, state.meta)
     if cfg["enabled"] and (due or invalid):   # never a wake solely for other-owner flags: they ride along when a wake happens anyway
         text = triage_queue_fact(state, due, now, cfg, len(flagged), invalid)
         triage_digest.cost_record(engine.state_dir, now, text)
