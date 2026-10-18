@@ -25674,6 +25674,7 @@ def load_tick(engine, discovery):
         orchestrators[name] = {"charter": fleet.get("charter") if _is_issue_number(fleet.get("charter")) else None,   # a fallback: the charter is found by the yaml that names the agent
                                "repo": _fleet_repo(fleet, engine.config) or (engine.intents.repo if engine.intents is not None else None),
                                "busy": sum(1 for c in coders if c.status == "working"), "idle": sum(1 for c in coders if c.status == "idle"),
+                               "workers": [o.name for o in coders if getattr(o, "name", None)],
                                "messages": sum(1 for r in reminders if r.get("to") == name and isinstance(r.get("at"), (int, float)) and r["at"] <= now)}
     cos = next((n for n, o in sorted(discovery.agents.items()) if (o.fleet or {}).get("role") == "chief-of-staff"), None)
 
@@ -25728,7 +25729,7 @@ def load_tick(engine, discovery):
     budget = SourceBudget(source_budget_seconds(engine.config, "load_alert"), engine.now)   # #494: the reads stop between calls when this pass's time is spent
     pending = []
     sent = health.tick(health.Context(now=now, state_dir=engine.state_dir, cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, read_charters=read_charters, read_parent=read_parent, cos=cos, wake=wake,
-                                      time_up=budget.spent, pending=pending, **meter))
+                                      time_up=budget.spent, pending=pending, reminders=reminders, **meter))
     set_source_state(engine, "load_alert", pending)
     return sent
 

@@ -287,20 +287,79 @@ def ask_wait(ask, now):
     until = ask.get("parked_until")
     if has("parked") and isinstance(until, (int, float)) and not isinstance(until, bool) and now < until <= now + PARKED_MAX_DAYS * 86400.0:
         return "parked"
+    if ask.get("via_pr") in ("owner_pr", "cos_pr"):
+        return ask["via_pr"]   # a held pull request that serves it waits on the owner (tier human) or on the Chief of Staff (tier cos, not yet escalated)
+    if ask.get("timed"):
+        return "time"          # a pending reminder due later names it: a time somebody set
     return None
+
+
+def held_prs(state_dir):
+    """[{repo, number, tier, since}] the open held pull requests (kind `captain`) of decisions.json, or [] when it cannot be read: the same file the pass already reads, nothing from GitHub."""
+    try:
+        listed = json.loads((Path(state_dir) / "decisions.json").read_text()).get("decisions")
+    except (OSError, ValueError, AttributeError):
+        return []
+    out = []
+    for item in (listed if isinstance(listed, list) else [])[:DECISIONS_MAX]:
+        if not isinstance(item, dict) or item.get("closed") or item.get("kind") != "captain":
+            continue
+        number, repo = item.get("number"), item.get("repo")
+        since = _epoch(item.get("since")) if isinstance(item.get("since"), str) else None
+        if isinstance(number, int) and not isinstance(number, bool) and isinstance(repo, str) and _REPO_SHAPE.match(repo) and item.get("tier") in ("human", "cos"):
+            out.append({"repo": repo, "number": number, "tier": item["tier"], "since": since})
+    return out
+
+
+PR_LINKS_MAX = 500
+
+
+def update_pr_links(state, rows, now):
+    """Remember, for each pull request a movement row names, the issues on its chain (its body's `Closes`, `Part of` and `PLAN:` references and their parents): a held pull request waits longer than the
+    movement rows are kept, so the link is kept in the load state. Newest 500 kept."""
+    links = state.setdefault("pr_links", {})
+    for row in rows:
+        if row.get("kind") in ("push", "pr_opened") and len(row.get("numbers") or []) > 1 and row.get("repo"):
+            links["%s#%d" % (str(row["repo"]).lower(), row["numbers"][0])] = {"at": row["at"], "numbers": list(row["numbers"][1:])}
+    while len(links) > PR_LINKS_MAX:
+        links.pop(min(links, key=lambda k: links[k]["at"]))
+
+
+def serving_waits(asks, held, links, reminders, names, now, stalled_hours):
+    """{(repo, number): "owner_pr" | "cos_pr" | "time"} for the asks waiting on a held pull request that serves them (tier human: the owner's wait; tier cos: the Chief of Staff's wait, only while the row is younger than
+    `stalled_hours`) or on a pending reminder due later that names them and is for `names` (the orchestrator or a worker of it). Owner beats cos beats time."""
+    out = {}
+    for ask in asks:
+        best = None
+        for row in held:
+            link = links.get("%s#%d" % (row["repo"].lower(), row["number"]))
+            if not link or ask["number"] not in link["numbers"] or not _same_repo(ask["repo"], row["repo"]):
+                continue
+            if row["tier"] == "human":
+                best = "owner_pr"
+                break
+            if row["since"] is not None and now - row["since"] < stalled_hours * 3600:
+                best = "cos_pr"
+        if best is None and any(r.get("issue") == ask["number"] and not isinstance(r.get("issue"), bool) and r.get("to") in names
+                                and isinstance(r.get("at"), (int, float)) and r["at"] > now and _same_repo(ask["repo"], r.get("repo")) for r in reminders):
+            best = "time"
+        if best:
+            out[(ask["repo"], ask["number"])] = best
+    return out
 
 
 def figures(name, info, rows, now, cfg):
     """One orchestrator's figures. `info`: asks [{repo, number, first_seen}] or None (unreadable), busy, idle, messages, decisions."""
     out = {"name": name, "busy": info["busy"], "idle": info["idle"], "messages": info["messages"], "decisions": info["decisions"],
            "open_asks": None, "active_asks": None, "stalled": None, "stalled_asks": [], "oldest_stall_hours": None, "moved_1h": None, "moved_backlog": None,
-           "waiting_owner": None, "waiting_cos": None, "waiting_live": None, "parked": None, "charter_moves_1h": None}
+           "waiting_owner": None, "waiting_cos": None, "waiting_live": None, "parked": None, "charter_moves_1h": None,
+           "waiting_owner_pr": None, "waiting_time": None}
     asks = info.get("asks")
     if asks is None:
         return out
     last = last_moves(asks, rows)
     out["open_asks"] = len(asks)
-    ages, stalled, waits = [], [], {"owner": 0, "cos": 0, "live": 0, "parked": 0}
+    ages, stalled, waits = [], [], {"owner": 0, "cos": 0, "live": 0, "parked": 0, "owner_pr": 0, "cos_pr": 0, "time": 0}
     for ask in asks:
         wait = ask_wait(ask, now)
         if wait:
@@ -312,7 +371,8 @@ def figures(name, info, rows, now, cfg):
         if now - at >= cfg["stalled_hours"] * 3600:
             stalled.append(ask["number"])
     out["stalled"], out["stalled_asks"] = len(stalled), sorted(stalled)
-    out["waiting_owner"], out["waiting_cos"], out["waiting_live"], out["parked"] = waits["owner"], waits["cos"], waits["live"], waits["parked"]
+    out["waiting_owner"], out["waiting_cos"], out["waiting_live"], out["parked"] = waits["owner"] + waits["owner_pr"], waits["cos"] + waits["cos_pr"], waits["live"], waits["parked"]
+    out["waiting_owner_pr"], out["waiting_time"] = waits["owner_pr"], waits["time"]
     out["active_asks"] = len(asks) - sum(waits.values())
     out["oldest_stall_hours"] = round(max(ages) / 3600.0, 1) if ages else 0.0
     moved = lambda hours: sum(1 for ask in asks if last[(ask["repo"], ask["number"])] is not None and now - last[(ask["repo"], ask["number"])] < hours * 3600)
@@ -343,6 +403,10 @@ def crossing(fig, cfg):
     return severity, reasons
 
 
+def waiting_phrase(fig):
+    return "waiting on the owner: %d (via a held PR), on a set time: %d" % (fig.get("waiting_owner_pr") or 0, fig.get("waiting_time") or 0)
+
+
 def wake_text(fig, reasons, cfg):
     asks = ", ".join("#%d" % n for n in fig["stalled_asks"][:5])
     name = re.sub(r"[\x00-\x1f\x7f]+|\s+", " ", str(fig["name"]))[:60]
@@ -357,6 +421,8 @@ def wake_text(fig, reasons, cfg):
         actions.append("split a lane or add coders: all coders are busy and an ask is stalled (%s)" % (asks or "named above"))
     if "outnumbered" in reasons:
         actions.append("split a lane or add coders: all coders are busy, open asks are at least twice those moved in %g h and none moved in the last hour" % cfg["backlog_hours"])
+    if fig.get("waiting_owner_pr") or fig.get("waiting_time"):
+        text += " Not stalled, waiting: %s." % waiting_phrase(fig)
     return text + " Recommended: " + "; or ".join(actions) + "."
 
 
@@ -705,6 +771,8 @@ def tick(ctx):
     audited = audit_moves(ctx.state_dir, now - 24 * 3600)
     rows += audited or []
     problems, rows = _refresh_asks(ctx, state, now, rows)
+    update_pr_links(state, rows, now)
+    held, reminders = held_prs(ctx.state_dir), list(getattr(ctx, "reminders", None) or [])
     if audited is None:
         problems.append("movement: the audit log cannot be read")
     waiting = state.get("decision_counts")
@@ -724,6 +792,11 @@ def tick(ctx):
             problems.append("%s: no recent list of its open asks" % name) if (name + ": ") not in " ".join(problems) else None
         else:
             unchartered.append(name)
+        if asks:
+            names = {name} | set(info.get("workers") or [])
+            serving = serving_waits(asks, held, state.get("pr_links") or {}, reminders, names, now, ctx.cfg["stalled_hours"])
+            asks = [dict(a, via_pr=serving[(a["repo"], a["number"])]) if serving.get((a["repo"], a["number"])) in ("owner_pr", "cos_pr")
+                    else dict(a, timed=True) if serving.get((a["repo"], a["number"])) == "time" else a for a in asks]
         fig = figures(name, {"asks": asks, "busy": info["busy"], "idle": info["idle"], "messages": info["messages"],
                              "decisions": None if waiting is None else waiting.get(name, 0),
                              "charter": (state.get("charter_of") or {}).get(name), "repo": info.get("repo")}, rows, now, ctx.cfg)
@@ -735,7 +808,7 @@ def tick(ctx):
             for gone in sorted(history)[:-HISTORY_DAYS]:
                 del history[gone]
         mine = old if isinstance(old, dict) and old.get("day") == day else {"day": day, "hours": {}}
-        mine["hours"][hour] = {k: fig[k] for k in ("open_asks", "active_asks", "waiting_owner", "waiting_cos", "waiting_live", "parked", "stalled", "stalled_asks", "moved_1h", "moved_backlog", "charter_moves_1h", "busy", "idle", "messages", "decisions", "oldest_stall_hours")}
+        mine["hours"][hour] = {k: fig[k] for k in ("open_asks", "active_asks", "waiting_owner", "waiting_owner_pr", "waiting_time", "waiting_cos", "waiting_live", "parked", "stalled", "stalled_asks", "moved_1h", "moved_backlog", "charter_moves_1h", "busy", "idle", "messages", "decisions", "oldest_stall_hours")}
         series[name] = mine
         before = episodes.get(name)
         text, episodes[name] = judge(fig, ctx.cfg, before)
@@ -768,6 +841,8 @@ def status_lines(state_dir, now):
         out.append("  %-12s asks %s, stalled %s, waiting on owner %s, parked %s, waiting on cos %s, waiting live %s, oldest stall %s h, moved 1h %s, charter moves 1h %s; waiting %d msg %s dec; coders %d busy %d idle" % (
             name, num(f["open_asks"]), num(f["stalled"]), num(f.get("waiting_owner")), num(f.get("parked")), num(f.get("waiting_cos")), num(f.get("waiting_live")),
             num(f["oldest_stall_hours"]), num(f["moved_1h"]), num(f.get("charter_moves_1h")), f["messages"], num(f["decisions"]), f["busy"], f["idle"]))
+        if f.get("waiting_owner_pr") or f.get("waiting_time"):
+            out[-1] += "; " + waiting_phrase(f)
     if state.get("decisions_unattributed"):
         out.append("  %d decision(s) not attributed (the parent of their issue could not be read, or no orchestrator's charter is on its chain)" % state["decisions_unattributed"])
     if state.get("pr_notices"):
