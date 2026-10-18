@@ -246,7 +246,7 @@ class TestConfig(Base):
         self.assertFalse(self.config_file.exists())
         self.assertEqual(sb.load_config(), {
             "opencode": None, "opencode_env": {}, "opencode_executable": None, "launch_env": {},
-            "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "call_timeout_seconds": 20, "send_timeout_seconds": 60, "poll_seconds": 5,
+            "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "retire_idle_minutes": 10, "call_timeout_seconds": 20, "send_timeout_seconds": 60, "poll_seconds": 5,
             "worker_lookback_hours": 24, "send_to_working": "steer", "launch_default": "headless",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
@@ -5454,6 +5454,119 @@ class TestLaunch(Base):
         code, out, err = self.run_cli("retire", "worker", "--close", "--force")
         self.assertEqual(code, 0, err)
         self.assertEqual(self.world.herdr.closed, [self.world.panes["worker"]])
+
+    def idle_session(self, ago, turn=None):
+        sid = self.world.sessions["worker"]
+        self.world.v2.sessions[sid]["idle"] = self.world.clock.now() - ago
+        self.world.v2.sessions[sid]["turn"] = turn
+        return sid
+
+    def refused_close(self, *extra):
+        self.as_("boss")
+        code, out, err = self.run_cli("retire", "worker", "--close", *extra)
+        self.assertEqual((code, self.world.herdr.closed), (1, []), err)
+        return err
+
+    def test_a_working_pane_with_an_idle_session_is_closed_without_force_and_the_evidence_is_named_and_audited(self):   # S1 S6 S8
+        self.close_world(status="working")
+        self.idle_session(27 * 3600)
+        self.as_("boss")
+        with mock.patch.object(sb.V2Client, "session_active", autospec=True, side_effect=sb.V2Client.session_active) as read:
+            code, out, err = self.run_cli("retire", "worker", "--close")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.world.herdr.closed, [self.world.panes["worker"]])
+        self.assertIn("herdr says working; the session has been idle 1 d 3 h and has no turn: treated as idle", out)
+        (row,) = self.close_audit("fleetpane.closed")
+        self.assertIn("idle 1 d 3 h and has no turn", row["detail"]["evidence"])
+        self.assertEqual(read.call_count, 2, "one session read per judgment: before the retirement and again just before the close")
+
+    def test_a_working_pane_is_still_refused_for_a_turn_recent_activity_or_a_state_that_is_unreadable_or_odd(self):   # S2 S3 S4
+        self.close_world(status="working")
+        self.idle_session(86400, turn={"id": "t"})
+        self.assertIn("pass --force", self.refused_close())
+        self.idle_session(120)
+        self.assertIn("pass --force", self.refused_close())
+        self.idle_session(86400)
+        with mock.patch.object(sb.V2Client, "session_active", side_effect=sb.V2Error("http", "down")):
+            self.assertIn("pass --force", self.refused_close())
+        with mock.patch.object(sb.V2Client, "session_active", return_value=["x"]):
+            self.assertIn("pass --force", self.refused_close())
+        self.world.v2.sessions[self.world.sessions["worker"]]["idle"] = None   # no last activity known
+        self.assertIn("pass --force", self.refused_close())
+
+    def test_a_turn_that_begins_between_the_two_judgments_stops_the_close_and_a_refusal_reads_once(self):   # S8
+        self.close_world(status="working")
+        sid = self.idle_session(86400)
+        real, calls = sb.retire_close_problem, []
+
+        def turn_begins(engine, runner, now, discovery, name, seen, force):
+            calls.append(1)
+            if len(calls) == 2:
+                self.world.v2.sessions[sid]["turn"] = {"id": "t"}
+            return real(engine, runner, now, discovery, name, seen, force)
+
+        self.as_("boss")
+        with mock.patch.object(sb, "retire_close_problem", turn_begins):
+            code, out, err = self.run_cli("retire", "worker", "--close")
+        self.assertEqual(self.world.herdr.closed, [], out)
+        self.assertIn("was not closed", out)
+        self.idle_session(86400, turn={"id": "t"})
+        with mock.patch.object(sb.V2Client, "session_active", autospec=True, side_effect=sb.V2Client.session_active) as read:
+            self.refused_close()
+        self.assertEqual(read.call_count, 1, "refused at the first judgment: one read")
+
+    def test_a_last_turn_exactly_the_window_ago_is_idle(self):
+        self.close_world(status="working")
+        self.idle_session(10 * 60)
+        self.as_("boss")
+        self.assertEqual(self.run_cli("retire", "worker", "--close")[0], 0, "exactly the window is idle")
+
+    def test_a_last_turn_dated_in_the_future_is_not_idle(self):
+        self.close_world(status="working")
+        self.idle_session(-3600)
+        self.as_("boss")
+        code, out, err = self.run_cli("retire", "worker", "--close")
+        self.assertEqual((code, self.world.herdr.closed), (1, []), err)
+        self.assertIn("pass --force", err)
+
+    def test_an_entry_of_any_shape_for_the_session_in_session_active_is_unknown_never_idle(self):
+        self.close_world(status="working")
+        sid = self.idle_session(86400)
+        for entry in ({}, None, {"type": "idle"}, 0):
+            with mock.patch.object(sb.V2Client, "session_active", return_value={sid: entry}):
+                self.assertIn("pass --force", self.refused_close(), repr(entry))
+                self.assertIn("session state unknown", self.close_audit("fleetpane.close_refused")[-1]["detail"]["why"])
+
+    def test_a_window_that_is_not_a_finite_number_in_range_refuses_at_use(self):
+        self.close_world(status="working")
+        self.idle_session(86400)
+        for bad in (float("nan"), float("inf"), -1, True, "10", 0):
+            self.engine.config["retire_idle_minutes"] = bad
+            seen = self.engine.discover(self.world.clock.now()).agents["worker"]
+            self.assertIsNone(sb.retire_idle_evidence(self.engine, self.world.clock.now, "worker", seen, "working"), repr(bad))
+        self.engine.config["retire_idle_minutes"] = 10
+        seen = self.engine.discover(self.world.clock.now()).agents["worker"]
+        self.assertIn("idle 1 d 0 h", sb.retire_idle_evidence(self.engine, self.world.clock.now, "worker", seen, "working"))
+
+    def test_a_blocked_pane_is_never_treated_as_idle_whatever_its_last_activity(self):   # S5
+        self.close_world(status="blocked")
+        self.idle_session(86400)
+        self.assertIn("is blocked: pass --force", self.refused_close())
+
+    def test_an_idle_session_does_not_lift_the_unpushed_work_refusal(self):   # S7
+        self.close_world(status="working")
+        self.make_repo()
+        wt = self.add_worktree("w-idle-unpushed", unpushed=True)
+        sb.register_worktree(self.world.state, str(wt), "worker", None, "w-idle-unpushed", 1)
+        self.idle_session(86400)
+        self.assertIn("unpushed", self.refused_close())
+
+    def test_retire_idle_minutes_is_validated_and_sets_the_window(self):
+        base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
+        self.assertEqual(sb.validate_config(dict(base))["retire_idle_minutes"], 10)
+        for bad in (0, 0.5, -1, "10", True, None, float("nan"), float("inf"), 10081):
+            with self.assertRaises(sb.ConfigError):
+                sb.validate_config(dict(base, retire_idle_minutes=bad))
 
     def test_retire_without_close_closes_nothing_and_a_close_that_fails_is_audited_and_the_agent_stays_retired(self):
         self.close_world()
@@ -15128,6 +15241,33 @@ class TestWorkerRulesInSkills(unittest.TestCase):
 
     def test_the_texts_name_roles_never_agents_or_people(self):
         for text in (self.CAP, self.CI, self.LIST) + self.SHAPES:
+            self.assertNotRegex(text, r"(?i)\b(coder\d|cos\b|fleet-upkeep|adam\b)")
+
+
+class TestIntegrationBranchVerdictText(unittest.TestCase):
+    """#776: what plan a PR into an integration branch must link, said once in the docs and once in the coordination skill."""
+    DOC = ("The ledger never uses the pull request's base branch to choose or relax a plan: a pull request, including one into an integration branch, is gated by the plan its body links with a `PLAN:` line (or `--plan`), "
+           "and `verdict --all` refuses with \"no per-PR scenario of this plan is judged by reviewer\" (naming the evaluator you passed) when the linked plan has no per-PR scenario naming that evaluator.")
+    SKILL = ("For a PR into an integration branch, link the epic's plan or a plan of its own with at least one scenario judged by `reviewer` (a scenario with no `claim` is per pull request), "
+             "or put the line `per-pr scenarios: none because <reason of at least 20 characters>` in the plan (then G1 reads n/a and there is no reviewer verdict to record).")
+
+    DRAFT = ("Some repositories' workflows skip draft pull requests (a coder lost four hours reading that as a failing CI): when a draft shows no CI runs, "
+             "look at the workflow's draft filter and mark the PR ready before waiting for CI (if there is no filter, the cause is elsewhere).")
+
+    def test_the_draft_sentence_is_present_once(self):
+        self.assertEqual((REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text().count(self.DRAFT), 1)
+
+    def test_the_doc_passage_is_present_once(self):
+        self.assertEqual((REPO / "docs" / "switchboard.md").read_text().count(self.DOC), 1)
+
+    def test_the_skill_sentence_is_present_once(self):
+        self.assertEqual((REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text().count(self.SKILL), 1)
+
+    def test_the_refusal_wording_is_the_one_the_command_prints(self):
+        self.assertIn("no per-PR scenario of this plan is judged by %s", (REPO / "bin" / "fleet-switchboard").read_text())
+
+    def test_the_texts_name_roles_never_agents_or_people(self):
+        for text in (self.DOC, self.SKILL):
             self.assertNotRegex(text, r"(?i)\b(coder\d|cos\b|fleet-upkeep|adam\b)")
 
 
@@ -31809,6 +31949,43 @@ class TestPlanCheckRules(unittest.TestCase):
         self.assertRegex(got["scenario_hash"], r"^sha256:[0-9a-f]{64}$")
         self.assertRegex(got["plan_hash"], r"^sha256:[0-9a-f]{64}$")
 
+    def warn_codes(self, text):
+        return [(w["id"], w["code"]) for w in self.check(text)["warnings"] if w["code"] == "live-no-claim"]
+
+    def test_a_live_or_tester_scenario_with_no_claim_warns_and_never_fails_or_changes_the_hash(self):
+        got = self.check()
+        self.assertEqual(got["result"], "pass")
+        self.assertEqual(self.warn_codes(GOOD_PLAN), [("S2", "live-no-claim")])
+        message = [w["message"] for w in self.check(GOOD_PLAN)["warnings"] if w["code"] == "live-no-claim"][0]
+        self.assertIn("`claim: epic`", message)
+        self.assertIn("`claim: pr`", message)
+        self.assertNotIn("is claimed by", message)
+        tester = self.edit("    proof: live\n", "    proof: measure\n")
+        self.assertEqual(self.warn_codes(tester), [("S2", "live-no-claim")], "evaluator tester alone warns")
+        live = self.edit("    evaluator: tester", "    evaluator: owner")
+        self.assertEqual(self.warn_codes(live), [("S2", "live-no-claim")], "proof live alone warns")
+        claimed = self.edit("    evaluator: tester", "    evaluator: tester\n    claim: epic")
+        self.assertEqual(self.warn_codes(claimed), [])
+        self.assertEqual(self.check(claimed)["result"], "pass")
+        self.assertEqual(self.warn_codes(self.edit("    evaluator: tester", "    evaluator: tester\n    claim: pr")), [])
+        same = self.check(GOOD_PLAN)["plan_hash"]
+        self.assertEqual(same, got["plan_hash"])
+        self.assertEqual(same, "sha256:2ad49344a1bf3ea7fc5ceeef6f60013e02fa465dc04da8a3b5b389a82b686cdb", "the hash the checker gave this plan before the warning existed")
+        self.assertEqual([w["code"] for w in got["warnings"] if w["code"] != "live-no-claim"], ["no-constraint-list"])
+
+    def test_the_template_marks_every_stub_with_a_ready_claim_line_and_a_live_one_for_live_or_tester(self):
+        lines = sb.plan_check.template(["one thing", "another"])
+        want = "    # claim: epic   # " + sb.plan_check.CLAIM_WHY
+        self.assertEqual(lines.count(want), 3, "one per stub: two clauses and the unchanged one")
+        self.assertFalse([l for l in lines if l.strip().startswith("claim:")], "a test/ci stub is never claimed epic")
+        for proof, evaluator in (("live", "tester"), ("test", "tester"), ("live", "ci")):
+            self.assertEqual(sb.plan_check.claim_lines(proof, evaluator), ["    claim: epic   # " + sb.plan_check.CLAIM_WHY])
+        self.assertEqual(sb.plan_check.claim_lines("test", "ci"), [want])
+
+    def test_the_brief_template_carries_the_plan_posted_report_line_once(self):
+        text = (REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text()
+        self.assertEqual(text.count("working: plan posted <hash> <url>"), 1)
+
     def test_clauses_are_the_numbered_parts_and_a_plain_line_is_one(self):
         c = sb.plan_check.clauses_of
         self.assertEqual(c("(1) one thing; (2) another (see (3) below)"), ["one thing", "another (see (3) below)"])
@@ -32012,7 +32189,7 @@ class TestPlanCheckRules(unittest.TestCase):
         text = GOOD_PLAN.replace("  - id: U1", extra + "  - id: U1", 1)
         got = self.check(text)
         self.assertEqual((got["result"], got["scenarios"]), ("pass", 33))
-        self.assertEqual(sorted(w["code"] for w in got["warnings"]), ["many-scenarios", "no-constraint-list"])
+        self.assertEqual(sorted(w["code"] for w in got["warnings"]), ["live-no-claim", "many-scenarios", "no-constraint-list"])
 
     def test_the_hash_ignores_whitespace_comments_quoting_order_and_defaults_but_not_content(self):
         base = self.check()["scenario_hash"]

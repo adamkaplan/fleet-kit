@@ -34,6 +34,8 @@ AUTH:       <the authority already granted, explicitly>
 CHECKPOINT: <a UTC time or an agreed event, with an overdue time>
 ```
 
+A coder that posts a plan also reports `working: plan posted <hash> <url>` (a report arrives even when a send is lost).
+
 A brief for a credential, permission or privileged-script change links `docs/adversarial-checklist.md`.
 The pull request body answers each item of it in one line. A Mermaid diagram appears only where it shows data flow, system design or component design, never at the top of a body and never as a summary of what changes, what it touches, what is irreversible and the risk.
 
@@ -43,6 +45,8 @@ Before the coder's first push, it runs both focused (a push voids proofs):
 bin/test-switchboard -k test_the_role_files_do_not_grow   # the role-file byte cap
 bin/test-switchboard -k TestHygiene                       # shebang, stdlib-only, executable bits
 ```
+
+Some repositories' workflows skip draft pull requests (a coder lost four hours reading that as a failing CI): when a draft shows no CI runs, look at the workflow's draft filter and mark the PR ready before waiting for CI (if there is no filter, the cause is elsewhere).
 
 Before marking the pull request ready, `fleet-switchboard preflight-pr` runs the CI-critical focused classes you otherwise skip (command surface, hygiene, public names, and the cloud suites when `cloud/` changed) and prints one PASS or FAIL line each.
 
@@ -360,7 +364,7 @@ Formal approval means the required reviewer approved the full current commit SHA
 A pending review, a comment, or an approval against a stale head is not approval.
 If the head moved, the approval did not move with it.
 
-A reviewer or tester records the verdict as the last step of the review or test run it already does, in ONE command: `fleet-switchboard verdict --all --pr <repo#N> --as reviewer|tester --result pass|fail --head <full head sha> --evidence "<review url or what you ran>"`. (`--all` is available; the per-scenario form remains valid for recording a single scenario: `fleet-switchboard verdict <scenario> --pr <repo#N> --as reviewer|tester --result pass|fail --head <full head sha> --evidence "<what you ran>"`.) Say it only when it is true: an approval or a run at head H. A push voids it: re-record after the delta review. Never record a verdict on a PR you wrote (the switchboard refuses it, and it would be grading your own work).
+A reviewer or tester records the verdict as the last step of the review or test run it already does, in ONE command: `fleet-switchboard verdict --all --pr <repo#N> --as reviewer|tester --result pass|fail --head <full head sha> --evidence "<review url or what you ran>"`. (`--all` is available; the per-scenario form remains valid for recording a single scenario: `fleet-switchboard verdict <scenario> --pr <repo#N> --as reviewer|tester --result pass|fail --head <full head sha> --evidence "<what you ran>"`.) Say it only when it is true: an approval or a run at head H. A push voids it: re-record after the delta review. Never record a verdict on a PR you wrote (the switchboard refuses it, and it would be grading your own work). For a PR into an integration branch, link the epic's plan or a plan of its own with at least one scenario judged by `reviewer` (a scenario with no `claim` is per pull request), or put the line `per-pr scenarios: none because <reason of at least 20 characters>` in the plan (then G1 reads n/a and there is no reviewer verdict to record).
 
 A tester records verdicts only and never runs `prove`: a proof makes it an author of the PR, and its verdicts are then refused.
 
