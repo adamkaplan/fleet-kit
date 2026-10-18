@@ -39848,6 +39848,12 @@ class TestOrdersDelivery(OrdersDeliveryCase):
             self.run_pass()
         self.assertEqual(len(self.order_messages("orch")), 1)
 
+    def test_the_first_full_pass_clears_the_load_tick_gate_and_not_before(self):   # #796 S6
+        engine = self.world.engine
+        self.assertTrue(engine.awaiting_first_full_pass)
+        self.run_pass()
+        self.assertFalse(engine.awaiting_first_full_pass)
+
     def test_a_restart_repeats_nothing(self):
         self.run_pass()
         self.world.engine = self.world.new_engine()
@@ -60123,14 +60129,20 @@ class TestLoadAlert(Base):
         return report
 
     # ---- #796: no alert before the first full pass after a start
-    def first_pass_world(self, awaiting=True, held=False):
+    def first_pass_world(self, awaiting=True, held=False, links=False, numbers=(1, 2)):
         """An engine as the daemon makes it at a start (`awaiting_first_full_pass`), one orchestrator with two asks nobody moves; `self.clock` is its time."""
         self.clock = [self.T0]
-        issues = [types.SimpleNamespace(repo="acme/widget", number=n, labels=(), parked_until=None) for n in (1, 2)]
-        intents = types.SimpleNamespace(repo="acme/widget", open_asks=lambda charter, repo: issues, _api=lambda path, repo: [])
+        issues = [types.SimpleNamespace(repo="acme/widget", number=n, labels=(), parked_until=None) for n in numbers]
+        self.parent_fails = True
+
+        def api(path, repo):
+            if self.parent_fails:
+                raise RuntimeError("the read was cut")
+            return []
+        intents = types.SimpleNamespace(repo="acme/widget", open_asks=lambda charter, repo: issues, _api=api)
         facts = {"acme/widget#50": {"facts": {"refs": [["acme/widget", 1]]}}} if held else {}
         engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.clock[0], audit=None, actor="daemon", intents=intents, notice_facts=facts,
-                                       awaiting_first_full_pass=awaiting, config={"load_alert": self.health.validate({"enabled": True}, "x")})
+                                       awaiting_first_full_pass=awaiting, awaiting_held_links=links, config={"load_alert": self.health.validate({"enabled": True}, "x")})
         agents = {"o": types.SimpleNamespace(name="o", session_id="s", status="idle", fleet={"role": "orchestrator", "charter": 1, "repo": "acme/widget"}),
                   "cos": types.SimpleNamespace(name="cos", session_id="c", status="idle", fleet={"role": "chief-of-staff"})}
         return engine, types.SimpleNamespace(agents=agents)
@@ -60171,6 +60183,26 @@ class TestLoadAlert(Base):
         engine.awaiting_first_full_pass = False
         self.assertEqual(self.run_ticks(engine, discovery, (3.1, 3.2)), [])
         self.assertEqual(self.latest()["o"]["waiting_owner_pr"], 1)
+
+    @mock.patch.object(sb, "HELD_LINKS_WAIT_SECONDS", 20 * 3600)   # the passes below are hours apart: the bound is not what this test is about
+    def test_a_held_pr_whose_links_are_cut_keeps_the_alert_quiet_until_a_pass_with_them_whole(self):   # S7
+        engine, discovery = self.first_pass_world(awaiting=False, held=True, links=True, numbers=(1, 2, 3))
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [{"kind": "captain", "repo": "acme/widget", "number": 50, "tier": "human",
+                                                                                   "since": "2026-10-14T10:00:00Z"}]}))
+        self.assertEqual(self.run_ticks(engine, discovery, (0, 3, 4)), [])   # the parent read is cut every time: three asks look stalled, none is judged
+        self.assertTrue(engine.awaiting_held_links)
+        self.assertIn("load: waiting for held PR links", self.health.status_lines(str(self.state_dir), self.T0))
+        self.parent_fails = False
+        self.assertEqual(len(self.run_ticks(engine, discovery, (5,))), 1)   # the first pass with the links whole: ask 1 is the owner's wait, 2 and 3 are truly stalled: it alerts now
+        self.assertFalse(engine.awaiting_held_links)
+        self.assertNotIn("load: waiting for held PR links", self.health.status_lines(str(self.state_dir), self.T0))
+
+    def test_the_wait_for_held_pr_links_lapses_after_its_bound(self):   # S7
+        engine, discovery = self.first_pass_world(awaiting=False, held=True, links=True, numbers=(1, 2, 3))
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [{"kind": "captain", "repo": "acme/widget", "number": 50, "tier": "human",
+                                                                                   "since": "2026-10-14T10:00:00Z"}]}))
+        self.assertEqual(self.run_ticks(engine, discovery, (0, 0.1)), [])   # inside the bound
+        self.assertEqual(len(self.run_ticks(engine, discovery, (3,))), 1)   # more than 900 s of unreadable links: the alert is not silenced for ever
 
     def stalled_world(self, count=2):
         self.asks = {1: list(range(1, count + 1))}

@@ -4222,6 +4222,7 @@ class Switchboard:
         self.gh_runner = None           # PR notices: the runner for `gh pr view` (None: subprocess.run)
         self.stopped_news_errors = set()  # reasons already audited: one line per distinct failure
         self.stopped_news = {}          # #96: worker.stopped key -> judged clearly no news (decided once per note)
+        self.awaiting_held_links = True        # #796: cleared by the first load tick whose held-PR links were all whole (it lapses after HELD_LINKS_WAIT_SECONDS)
         self.awaiting_first_full_pass = True   # #796: set False once a pass has published a non-provisional decisions file; the load tick judges nothing before
         self.notice_facts = {}          # PR notices: "owner/repo#N" -> {at, facts, stale, error}; memory only
         self.notice_effects = {"drop": set(), "unreadable": {}}  # what the last derivation asks the daemon to record
@@ -26172,6 +26173,9 @@ def coder_finished(obs, retired, last_reports):
     return (last_reports.get(name) or {}).get("state") in ("done", "failed")
 
 
+HELD_LINKS_WAIT_SECONDS = 900   # #796: after a start the alert waits at most this long for every human-tier held PR's links, so an unreadable one cannot silence it for ever
+
+
 def load_tick(engine, discovery):
     """The end of a pass: the load figures per orchestrator, and the alert to the Chief of Staff when a threshold is crossed. Reads no v2 and
     makes at most a bounded number of GitHub reads an hour; a source it cannot read means no wake. Returns what was sent."""
@@ -26181,6 +26185,8 @@ def load_tick(engine, discovery):
         load_fleet_health().mark_waiting(engine.state_dir)   # status says so; the figures, the episodes and the alert are left exactly as they were
         return []
     health, now = load_fleet_health(), engine.now()
+    waited = engine.__dict__.setdefault("links_wait_since", now) if hasattr(engine, "__dict__") else now
+    links_gate = getattr(engine, "awaiting_held_links", False) and now - waited < HELD_LINKS_WAIT_SECONDS   # #796: a start's held-PR links must be whole before the first alert; it lapses after a bound
     cfg = engine.config.get("load_alert") or dict(health.DEFAULTS)
     reminders = read_reminders(engine.state_dir)
     retired, last_reports = read_retired(engine.state_dir), _read_small(engine.state_dir, LAST_REPORT_FILE)
@@ -26253,8 +26259,11 @@ def load_tick(engine, discovery):
                  "begin_read": begin_read, "read_cost": read_cost}
     budget = SourceBudget(source_budget_seconds(engine.config, "load_alert"), engine.now)   # #494: the reads stop between calls when this pass's time is spent
     pending = []
-    sent = health.tick(health.Context(now=now, state_dir=engine.state_dir, cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, read_charters=read_charters, read_parent=read_parent, cos=cos, wake=wake,
-                                      time_up=budget.spent, pending=pending, reminders=reminders, pr_refs=pr_refs, **meter))
+    context = health.Context(now=now, state_dir=engine.state_dir, cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, read_charters=read_charters, read_parent=read_parent, cos=cos, wake=wake,
+                                      time_up=budget.spent, pending=pending, reminders=reminders, pr_refs=pr_refs, links_gate=links_gate, **meter)
+    sent = health.tick(context)
+    if getattr(context, "links_complete", False):
+        engine.awaiting_held_links = False   # #796: one pass with every human-tier held PR's links whole: the alert may judge from now on
     set_source_state(engine, "load_alert", pending)
     return sent
 
