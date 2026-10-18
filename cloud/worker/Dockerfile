@@ -60,7 +60,7 @@ CMD ["opencode", "serve", "--hostname", "0.0.0.0", "--port", "4096"]
 # credential, and a person who adds one must not write it to disk.
 FROM worker AS scan
 USER root
-COPY worker/scan-secrets.sh worker/scan-files.py /
+COPY worker/scan-secrets.sh worker/scan-files.py worker/scan-allowlist.txt /
 RUN /scan-secrets.sh --dir / --skip proc --skip sys --skip dev --skip scan-secrets.sh --skip scan-files.py && echo ok > /scan-ok
 
 # The shipped image is `worker` plus one empty step: the marker is only BIND-MOUNTED from `scan` (so BuildKit must

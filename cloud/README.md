@@ -201,6 +201,29 @@ What the per-layer scan covers and does NOT cover:
   split across two files or by other bytes: the patterns are text patterns for known credential shapes.
 - It does NOT read a layer it cannot decompress: that is exit 2 (fail), not a skip.
 
+### The allowlist (known false positives)
+
+Scanning packaged binaries as bytes finds strings that only look like credentials (the `gh` binary, a locale table in
+`libunistring`, format strings in `libgnutls`). `worker/scan-allowlist.txt` lists them as exact triples, one per line, each
+with a reason:
+
+```text
+<path in the image> <sha256 of THAT file> <pattern name> <reason: what the false positive is>
+```
+
+A hit is suppressed ONLY when the path, the sha256 of that file (in a layer scan: of that layer's copy) and the pattern name all
+match. The same file with any other pattern still fails; a changed binary (a new sha256, for example after a base-image or `gh`
+update) fails the build until a reviewed PR updates its line. That is the maintenance cost, and it is deliberate: the gate fails
+closed. A missing, unreadable or malformed allowlist is exit 2, never "no allowlist, pass everything". Every suppressed hit is
+printed (`allowlisted: <path>: <pattern>`) and counted in the totals line, never silent. The file is tracked and COPYed into the
+scan stage only (never into the shipped image); a change to it is a change to the gate and needs a strict review.
+
+For a new hit, print its triple (no value is ever printed) and review the file before adding a line:
+
+```sh
+SCAN_TRIPLES=1 cloud/worker/scan-secrets.sh --archive /tmp/worker.tar     # or --dir <dir>: prints "TRIPLE<TAB><path> <sha256> <pattern>"
+```
+
 What the in-build stage covers: the merged filesystem of the finished `worker` stage (minus `proc`, `sys`, `dev` and the scan
 files), nothing deleted in a layer, same byte scan. A file it cannot read fails the build (exit 2).
 

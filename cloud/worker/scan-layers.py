@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Per-layer scanner for scan-secrets.sh (stdlib only). Usage: scan-layers.py <patterns-file> <image-archive>
+"""Per-layer scanner for scan-secrets.sh (stdlib only). Usage: scan-layers.py <patterns-file> <image-archive> <allowlist>
 
 Reads an image archive as a stream, one layer at a time, without extracting anything to disk: the output of
 `docker save` (manifest.json + layer tarballs) or an OCI image layout (index.json -> manifest -> layer blobs, plain or
@@ -11,6 +11,7 @@ Prints "layer <n> <digest>: <files> files, <MiB> MiB, <hits> hits" per layer, "l
 could not be read: "not scanned", never a pass.
 """
 import gzip
+import hashlib
 import importlib.util
 import io
 import json
@@ -60,10 +61,15 @@ def norm(p):
 
 
 def main(argv):
-    if len(argv) != 3:
-        print("usage: scan-layers.py <patterns-file> <image-archive>", file=sys.stderr)
+    if len(argv) != 4:
+        print("usage: scan-layers.py <patterns-file> <image-archive> <allowlist>", file=sys.stderr)
         return 2
     pats = sf.load(argv[1])
+    try:
+        allow = sf.load_allow(argv[3])
+    except sf.AllowlistError as e:
+        print(f"scan-secrets: {e}: not scanned", file=sys.stderr)
+        return 2
     try:
         outer = tarfile.open(argv[2], "r:")
         members = {norm(m.name): m for m in outer.getmembers()}
@@ -117,7 +123,7 @@ def main(argv):
         print(f"scan-secrets: cannot read the image manifest: not scanned ({e})", file=sys.stderr)
         return 2
 
-    hits = errors = files_t = 0
+    hits = errors = files_t = allowed_t = 0
     bytes_t = 0
     n = 0
     seen = set()
@@ -161,12 +167,17 @@ def main(argv):
                         if CRED_NAMES.search(path) and not path.endswith(".pub"):
                             found.add("credential-file")
                         fo = lt.extractfile(m)
-                        sf.scan_fileobj(fo, pats, found)
+                        h = hashlib.sha256()
+                        sf.scan_fileobj(fo, pats, found, h)
                         nfiles += 1
                         nbytes += m.size
-                        for name in sorted(found):
-                            lhits += 1
-                            report_hit(f"layer {n}: {path}", name)
+                        lh, la = sf.classify(path, found, h.hexdigest(), allow, pats,
+                                             lambda kind, p, name: print(
+                                                 f"layer {n}: {p}: {name}" if kind == "HIT"
+                                                 else f"allowlisted: layer {n}: {p}: {name}"))
+                        lhits += lh
+                        hits += lh
+                        allowed_t += la
             except (Unreadable, OSError, EOFError, tarfile.TarError, ValueError, io.UnsupportedOperation) as e:
                 print(f"scan-secrets: cannot read layer {n} {short}: not scanned ({e})", file=sys.stderr)
                 errors += 1
@@ -176,7 +187,7 @@ def main(argv):
     if n == 0 and not errors:
         print("scan-secrets: no layers found in the image: not scanned", file=sys.stderr)
         return 2
-    print(f"total: {n} layers, {files_t} files, {bytes_t / 1048576:.1f} MiB, {hits} hits")
+    print(f"total: {n} layers, {files_t} files, {bytes_t / 1048576:.1f} MiB, {hits} hits, {allowed_t} allowlisted")
     if errors:
         return 2
     if hits:

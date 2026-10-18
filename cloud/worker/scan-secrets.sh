@@ -17,6 +17,11 @@ generic-token-assignment@@(GH_TOKEN|GITHUB_TOKEN|API_KEY|ACCESS_TOKEN)["']?[=:] 
 jwt@@eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}
 P
 
+# The allowlist of known false positives: exact "<path> <sha256> <pattern> <reason>" lines (README). It must exist and parse;
+# a missing or malformed one is exit 2, never "no allowlist = pass". SCAN_ALLOWLIST overrides the path (tests).
+ALLOWLIST=${SCAN_ALLOWLIST:-$HERE/scan-allowlist.txt}
+ALLOWED=0   # hits the allowlist suppressed (printed, counted)
+
 SKIPS=()   # top-level names of --dir that are not scanned (--skip)
 # Roots to scan: the children of $1 that are real (not symlinks) and not skipped. Skips are exact top-level
 # names, never a name matched at any depth (a directory called "proc" deeper down IS scanned).
@@ -37,11 +42,19 @@ scan_dir() {
   local prefix="${dir%/}/" pf
   # the files are read as bytes by scan-files.py (binary, UTF-16 and NUL-padded files included); an error is exit 2
   pf=$(mktemp); printf '%s\n' "$PATTERNS" > "$pf"
-  rc=0; out=$(python3 "$HERE/scan-files.py" "$pf" "${roots[@]}" 2>/dev/null) || rc=$?
-  rm -f "$pf"
-  [ "$rc" -le 1 ] || { echo "scan-secrets: could not read some files under $dir: not scanned" >&2; exit 2; }
+  [ -r "$ALLOWLIST" ] || { echo "scan-secrets: cannot read the allowlist $ALLOWLIST: not scanned" >&2; exit 2; }
+  rc=0; out=$(python3 "$HERE/scan-files.py" --allow "$ALLOWLIST" --prefix "$dir" "$pf" "${roots[@]}" 2>"$pf.err") || rc=$?
+  [ "$rc" -le 1 ] || { cat "$pf.err" >&2; rm -f "$pf" "$pf.err"; echo "scan-secrets: could not read some files under $dir: not scanned" >&2; exit 2; }
+  rm -f "$pf" "$pf.err"
   if [ -n "$out" ]; then
-    while IFS= read -r f; do echo "${f#"$prefix"}"; hits=$((hits + 1)); done <<<"$out"
+    # lines are "HIT<TAB>path: name", "ALLOW<TAB>path: name" or "TRIPLE<TAB>path sha256 name"
+    while IFS= read -r f; do
+      case $f in
+        HIT$'\t'*) f=${f#HIT$'\t'}; echo "${f#/}"; hits=$((hits + 1)) ;;
+        ALLOW$'\t'*) f=${f#ALLOW$'\t'}; echo "allowlisted: ${f#/}"; ALLOWED=$((ALLOWED + 1)) ;;
+        TRIPLE$'\t'*) echo "triple: ${f#TRIPLE$'\t'}" ;;
+      esac
+    done <<<"$out"
   fi
   # an ssh key or credential file by name (an unreadable directory is an error, as above)
   rc=0; out=$(find "${roots[@]}" \( -path '*/.ssh/id_*' -o -name '.git-credentials' -o -name '.netrc' -o -path '*/.config/gh/hosts.yml' -o -name 'kubeconfig' \) ! -name '*.pub' -type f 2>/dev/null) || rc=$?
@@ -54,7 +67,8 @@ scan_dir() {
 
 report() { # <what was scanned> <command...>
   local what=$1; shift
-  if "$@"; then echo "scan-secrets: 0 hits$what"; exit 0; else echo "scan-secrets: hits found$what" >&2; exit 1; fi
+  local al=""
+  if "$@"; then [ "$ALLOWED" -eq 0 ] || al=" ($ALLOWED allowlisted)"; echo "scan-secrets: 0 hits$al$what"; exit 0; else echo "scan-secrets: hits found$what" >&2; exit 1; fi
 }
 
 # --dir <dir> [--skip <top-level name>]...: a directory tree (the build runs it with --dir / inside the image).
@@ -79,7 +93,7 @@ fi
 # --archive <file>: an image archive (docker save or OCI layout), scanned layer by layer (THE gate; see README).
 archive_scan() {
   local pf rc=0; pf=$(mktemp); printf '%s\n' "$PATTERNS" > "$pf"
-  python3 "$HERE/scan-layers.py" "$pf" "$1" || rc=$?
+  python3 "$HERE/scan-layers.py" "$pf" "$1" "$ALLOWLIST" || rc=$?
   rm -f "$pf"; exit "$rc"
 }
 if [ "${1:-}" = "--archive" ] && [ -n "${2:-}" ] && [ $# -eq 2 ]; then

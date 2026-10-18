@@ -473,6 +473,62 @@ done
 PATH="$tmp/mstub:$PATH" STUB_ENV=A=b STUB_HIST=true "$S" --meta any:image 2>&1 | grep -q 'all [0-9]* layers scanned' \
   && bad "meta output reads as a layer scan" || ok "the --meta line differs from the full-scan line"
 
+# 3g. the allowlist: a hit is suppressed only when path AND sha256 AND pattern all match (planted at run time)
+shaof() { python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1"; }
+akey="AKIA$(printf 'A%.0s' $(seq 16))"
+al="$tmp/al"; mkdir -p "$al/d1/lib" "$al/d2/lib" "$al/d3/lib" "$al/d4/lib" "$al/d5/lib" "$al/d6/lib"
+printf 'x %s y\n' "$ltok" > "$al/d1/lib/f"                                  # the allowlisted file
+printf 'x %s y\n' "$ltok" > "$al/d3/lib/f"; printf '%s\n' "$akey" >> "$al/d3/lib/f"   # same path, other content, other pattern too
+printf 'other %s\n' "$ltok" > "$al/d2/lib/f"                                  # same path, DIFFERENT sha256
+printf 'x %s y\n' "$ltok" > "$al/d4/lib/g"                                    # same sha256, DIFFERENT path
+printf 'x %s y\n' "$ltok" > "$al/d5/lib/f"; printf '%s\n' "$akey" > "$al/d6/lib/f"
+h1=$(shaof "$al/d1/lib/f"); h3=$(shaof "$al/d3/lib/f"); h5=$h1
+printf '# test\n/lib/f %s github-token the test file\n' "$h1" > "$al/list-ok"
+alscan() { SCAN_ALLOWLIST="$1" "$S" --dir "$2" 2>&1; }
+out=$(alscan "$al/list-ok" "$al/d1"); rc=$?
+[ "$rc" = 0 ] && echo "$out" | grep -qx 'allowlisted: lib/f: github-token' && echo "$out" | grep -qx 'scan-secrets: 0 hits (1 allowlisted)' && ! echo "$out" | grep -q "$ltok" \
+  && ok "allowlist: an exact path+sha256+pattern triple is suppressed, printed and counted" || bad "allowlist exact rc=$rc"
+out=$(alscan "$al/list-ok" "$al/d2"); rc=$?
+[ "$rc" = 1 ] && echo "$out" | grep -qx 'lib/f: github-token' && ok "allowlist: the same path with another sha256 fails" || bad "allowlist other sha rc=$rc"
+printf '/lib/f %s github-token matching the old file\n' "$h1" > "$al/list-d3"
+out=$(alscan "$al/list-d3" "$al/d3"); rc=$?
+[ "$rc" = 1 ] && ok "allowlist: a changed file (an extra pattern appended) fails" || bad "allowlist appended rc=$rc"
+printf '/lib/f %s github-token the file with both\n' "$h3" > "$al/list-d3b"
+out=$(alscan "$al/list-d3b" "$al/d3"); rc=$?
+[ "$rc" = 1 ] && echo "$out" | grep -qx 'lib/f: aws-access-key' && echo "$out" | grep -qx 'allowlisted: lib/f: github-token' \
+  && ok "allowlist: the same file with another pattern still fails on that pattern" || bad "allowlist other pattern rc=$rc"
+printf '/lib/f %s aws-access-key not a pattern this file hits\n' "$h1" > "$al/list-np"
+alscan "$al/list-np" "$al/d1" >/dev/null; [ $? = 1 ] && ok "allowlist: an entry for a pattern the file does not hit changes nothing" || bad "allowlist unused entry"
+out=$(alscan "$al/list-ok" "$al/d4"); rc=$?
+[ "$rc" = 1 ] && ok "allowlist: the same sha256 at another path fails" || bad "allowlist other path rc=$rc"
+for v in missing empty-reason bad-sha bad-path; do
+  case $v in missing) f="$al/none";; empty-reason) f="$al/m1"; printf '/lib/f %s github-token\n' "$h1" > "$f";;
+    bad-sha) f="$al/m2"; printf '/lib/f abc github-token why\n' > "$f";; bad-path) f="$al/m3"; printf 'lib/f %s github-token why\n' "$h1" > "$f";; esac
+  alscan "$f" "$al/d1" >/dev/null; r1=$?
+  SCAN_ALLOWLIST="$f" "$S" --archive "$ad/oci-clean.tar" >/dev/null 2>&1; r2=$?
+  [ "$r1" = 2 ] && [ "$r2" = 2 ] && ok "allowlist ($v): unreadable or malformed is exit 2 (dir and archive), never a pass" || bad "allowlist $v rc=$r1/$r2"
+done
+# the same allowlist in the per-layer scan: the hash is the layer copy's
+python3 - "$al/arch.tar" "$ltok" <<'PY'
+import io, sys, tarfile
+t = tarfile.open(sys.argv[1], "w")
+def add(n, d):
+    ti = tarfile.TarInfo(n); ti.size = len(d); t.addfile(ti, io.BytesIO(d))
+import hashlib, json
+lay = io.BytesIO(); lt = tarfile.open(fileobj=lay, mode="w")
+d = ("x %s y\n" % sys.argv[2]).encode(); ti = tarfile.TarInfo("lib/f"); ti.size = len(d); lt.addfile(ti, io.BytesIO(d)); lt.close()
+add("l/layer.tar", lay.getvalue()); add("c.json", b"{}")
+add("manifest.json", json.dumps([{"Config": "c.json", "Layers": ["l/layer.tar"]}]).encode()); t.close()
+PY
+out=$(SCAN_ALLOWLIST="$al/list-ok" "$S" --archive "$al/arch.tar" 2>&1); rc=$?
+[ "$rc" = 0 ] && echo "$out" | grep -qx 'allowlisted: layer 1: /lib/f: github-token' && echo "$out" | grep -q '^total: 1 layers, 1 files, .* 0 hits, 1 allowlisted$' \
+  && ok "layer scan: the allowlist is applied to a layer's file (visible, counted)" || bad "layer allowlist rc=$rc"
+SCAN_ALLOWLIST="$al/list-d3" "$S" --archive "$al/arch.tar" >/dev/null 2>&1; [ $? = 0 ] && ok "layer scan: matching triple (the same bytes)" || bad "layer allowlist2"
+printf '/lib/f %s github-token wrong hash\n' "$(printf 'a%.0s' $(seq 64))" > "$al/list-wrong"
+SCAN_ALLOWLIST="$al/list-wrong" "$S" --archive "$al/arch.tar" >/dev/null 2>&1; [ $? = 1 ] && ok "layer scan: an allowlist entry with another sha256 fails" || bad "layer allowlist wrong sha"
+out=$(SCAN_TRIPLES=1 SCAN_ALLOWLIST="$al/list-wrong" "$S" --archive "$al/arch.tar" 2>&1)
+echo "$out" | grep -q "^TRIPLE.*/lib/f $h1 github-token$" && ! echo "$out" | grep -q "$ltok" && ok "SCAN_TRIPLES=1 prints the triple of a hit, never the value" || bad "triple output"
+
 # 4. image scan, only when docker is up
 if [ "${CLOUD_TEST_SKIP_DOCKER:-0}" = 1 ]; then skip docker-build-cases "CLOUD_TEST_SKIP_DOCKER=1 (needs a base-image pull from the network)"
 elif docker info >/dev/null 2>&1; then
@@ -510,7 +566,7 @@ elif docker info >/dev/null 2>&1; then
   # stand-in `worker` stage, built for linux/amd64 like the remote build. The token is written now, in the context.
   base=$(sed -n 's/^\(FROM ubuntu:[^ ]*\) AS worker$/\1/p' "$here/worker/Dockerfile")
   tail=$(sed -n '/^FROM worker AS scan$/,$p' "$here/worker/Dockerfile")
-  bctx="$tmp/bctx"; mkdir -p "$bctx/worker"; cp "$here/worker/scan-secrets.sh" "$here/worker/scan-files.py" "$bctx/worker/"
+  bctx="$tmp/bctx"; mkdir -p "$bctx/worker"; cp "$here/worker/scan-secrets.sh" "$here/worker/scan-files.py" "$here/worker/scan-allowlist.txt" "$bctx/worker/"
   ptok="ghp_$(printf 'f%.0s' $(seq 36))"; printf '%s\n' "$ptok" > "$bctx/plant.txt"
   bbuild() { # <variant body for the worker stage> [scan-user]: prints the log, returns docker's status
     { echo "$base AS worker"; printf '%b\n' "$1"; echo "$tail"; } > "$bctx/Dockerfile.$2"
@@ -528,7 +584,7 @@ elif docker info >/dev/null 2>&1; then
     && ok "build scan: an unreadable directory fails the build (never a pass)" || bad "build scan unreadable rc=$rc"
   out=$(bbuild 'RUN echo hi > /opt/clean.txt' clean); rc=$?
   [ "$rc" = 0 ] && ok "build scan: the clean image builds" || { bad "build scan clean rc=$rc"; echo "$out" | tail -15; }
-  docker run --rm --platform linux/amd64 --entrypoint sh cw-bscan-clean -c 'test ! -e /scan-ok && test ! -e /tmp/scan-ok && test ! -e /scan-secrets.sh' \
+  docker run --rm --platform linux/amd64 --entrypoint sh cw-bscan-clean -c 'test ! -e /scan-ok && test ! -e /tmp/scan-ok && test ! -e /scan-secrets.sh && test ! -e /scan-allowlist.txt' \
     && ok "build scan: the shipped image carries no marker and no scan files" || bad "marker or scan script in the shipped image"
   docker rmi cw-bscan-clean >/dev/null 2>&1
 else
