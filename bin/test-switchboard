@@ -5473,7 +5473,7 @@ class TestLaunch(Base):
         self.assertIn("herdr says working; the session has been idle 1 d 3 h and has no turn: treated as idle", out)
         (row,) = self.close_audit("fleetpane.closed")
         self.assertIn("idle 1 d 3 h and has no turn", row["detail"]["evidence"])
-        self.assertLessEqual(read.call_count, 1, "one added session read for the whole retire")
+        self.assertEqual(read.call_count, 2, "one session read per judgment: before the retirement and again just before the close")
 
     def test_a_working_pane_is_still_refused_for_a_turn_recent_activity_or_a_state_that_is_unreadable_or_odd(self):   # S2 S3 S4
         self.close_world(status="working")
@@ -5488,6 +5488,41 @@ class TestLaunch(Base):
             self.assertIn("pass --force", self.refused_close())
         self.world.v2.sessions[self.world.sessions["worker"]]["idle"] = None   # no last activity known
         self.assertIn("pass --force", self.refused_close())
+
+    def test_a_turn_that_begins_between_the_two_judgments_stops_the_close_and_a_refusal_reads_once(self):   # S8
+        self.close_world(status="working")
+        sid = self.idle_session(86400)
+        real, calls = sb.retire_close_problem, []
+
+        def turn_begins(engine, runner, now, discovery, name, seen, force):
+            calls.append(1)
+            if len(calls) == 2:
+                self.world.v2.sessions[sid]["turn"] = {"id": "t"}
+            return real(engine, runner, now, discovery, name, seen, force)
+
+        self.as_("boss")
+        with mock.patch.object(sb, "retire_close_problem", turn_begins):
+            code, out, err = self.run_cli("retire", "worker", "--close")
+        self.assertEqual(self.world.herdr.closed, [], out)
+        self.assertIn("was not closed", out)
+        self.idle_session(86400, turn={"id": "t"})
+        with mock.patch.object(sb.V2Client, "session_active", autospec=True, side_effect=sb.V2Client.session_active) as read:
+            self.refused_close()
+        self.assertEqual(read.call_count, 1, "refused at the first judgment: one read")
+
+    def test_a_last_turn_exactly_the_window_ago_is_idle(self):
+        self.close_world(status="working")
+        self.idle_session(10 * 60)
+        self.as_("boss")
+        self.assertEqual(self.run_cli("retire", "worker", "--close")[0], 0, "exactly the window is idle")
+
+    def test_a_last_turn_dated_in_the_future_is_not_idle(self):
+        self.close_world(status="working")
+        self.idle_session(-3600)
+        self.as_("boss")
+        code, out, err = self.run_cli("retire", "worker", "--close")
+        self.assertEqual((code, self.world.herdr.closed), (1, []), err)
+        self.assertIn("pass --force", err)
 
     def test_a_blocked_pane_is_never_treated_as_idle_whatever_its_last_activity(self):   # S5
         self.close_world(status="blocked")

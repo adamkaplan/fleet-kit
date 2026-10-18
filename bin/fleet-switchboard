@@ -7106,21 +7106,15 @@ def _idle_span_text(seconds):
 
 def retire_idle_evidence(engine, now, name, seen, herdr_status):
     """The evidence line when the session's OWN state shows a pane herdr reads as `working` is idle, else None (fail toward keeping).
-    Idle means: herdr says working (a blocked pane is never idle), `session.active` (the ONE read this adds, remembered per agent and session so
-    the second judgment of the same retire reads nothing) has no entry for the session (no turn, so no pending permission or question), and
-    the session's last activity (`time.idle` of the discovery's own session record) is at least `retire_idle_minutes` ago. Anything unreadable,
+    Idle means: herdr says working (a blocked pane is never idle), `session.active` (ONE read per judgment: a retire judges twice, so a closed agent costs 2, one refused at the first costs at most 1) has no entry for the session (no turn, so no pending permission or question), and
+    the last turn's end (`time.idle` of the discovery's own session record) is at least `retire_idle_minutes` ago. Anything unreadable,
     missing or in the future is None."""
     if herdr_status != "working" or seen is None or not seen.session_id or seen.idle_at is None:
         return None
-    cache = engine.__dict__.setdefault("retire_idle_reads", {})
-    key = (name, seen.session_id)
-    if key not in cache:
-        try:
-            active = engine.v2.session_active()
-        except Exception:
-            active = None
-        cache[key] = active
-    active = cache[key]
+    try:
+        active = engine.v2.session_active()   # read at every judgment: the final one before the close must see a turn that began since the first
+    except Exception:
+        return None
     if not isinstance(active, dict) or active.get(seen.session_id):
         return None
     idle_for = now() - seen.idle_at
