@@ -9913,6 +9913,29 @@ def captain_evidence(facts, senders):
     return None if facts.get("reviews") is None or facts.get("signed") is None else []
 
 
+PR_REF_LINE_RE = re.compile(r"(?im)^[ \t]*(?:closes|fixes|resolves|part of)[ \t]+(?:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#(\d{1,7})[ \t.]*$")
+
+
+def pr_body_refs(body):
+    """[[repo or None, number]] the STRICT references of a pull request body, the forms the switchboard resolves for a pull request: the issue its FIRST line's `PLAN: <issue url or owner/repo#N>` names, and each
+    line that is only `Closes`, `Fixes`, `Resolves` or `Part of` `#N` (or `owner/repo#N`). A number in prose, a branch name or a quoted line is no reference. At most 10."""
+    text = body if isinstance(body, str) else ""
+    out = []
+    lines = text.lstrip().splitlines()
+    plan = re.match(r"PLAN:[ \t]*(\S+)[ \t]*$", lines[0]) if lines else None
+    if plan:
+        try:
+            repo, number, _ = parse_plan_source(plan.group(1).strip("<>.,"), None)
+            out.append([repo, number])
+        except PlanInputError:
+            pass
+    for match in PR_REF_LINE_RE.finditer(text):
+        ref = [match.group(1), int(match.group(2))]
+        if ref not in out and ref[1] > 0:
+            out.append(ref)
+    return out[:10]
+
+
 def pr_facts_from(data):
     """The facts the panel shows, from `gh pr view --json` output; NoticeError when it is not one."""
     if not isinstance(data, dict) or not isinstance(data.get("state"), str):
@@ -9940,7 +9963,7 @@ def pr_facts_from(data):
             # commit is what makes it one event per push
             "mergeable": str(data.get("mergeable") or "").upper() or None,
             "checks": pr_checks_of(data.get("statusCheckRollup")),
-            "head": head}
+            "head": head, "refs": pr_body_refs(data.get("body"))}
 
 
 def read_pr_facts(engine, repo, number, extra_fields=""):
@@ -25674,8 +25697,11 @@ def load_tick(engine, discovery):
         orchestrators[name] = {"charter": fleet.get("charter") if _is_issue_number(fleet.get("charter")) else None,   # a fallback: the charter is found by the yaml that names the agent
                                "repo": _fleet_repo(fleet, engine.config) or (engine.intents.repo if engine.intents is not None else None),
                                "busy": sum(1 for c in coders if c.status == "working"), "idle": sum(1 for c in coders if c.status == "idle"),
+                               "workers": [o.name for o in coders if getattr(o, "name", None)],
                                "messages": sum(1 for r in reminders if r.get("to") == name and isinstance(r.get("at"), (int, float)) and r["at"] <= now)}
     cos = next((n for n, o in sorted(discovery.agents.items()) if (o.fleet or {}).get("role") == "chief-of-staff"), None)
+    pr_refs = {key.lower(): (held.get("facts") or {}).get("refs") or [] for key, held in list(getattr(engine, "notice_facts", {}).items())
+               if isinstance(held, dict) and not (held.get("facts") or {}).get("state") in ("merged", "closed")}   # the strict references of each noticed PR's current body, from the facts already read: no read of its own
 
     def read_asks(charter, repo):
         if engine.intents is None:
@@ -25728,7 +25754,7 @@ def load_tick(engine, discovery):
     budget = SourceBudget(source_budget_seconds(engine.config, "load_alert"), engine.now)   # #494: the reads stop between calls when this pass's time is spent
     pending = []
     sent = health.tick(health.Context(now=now, state_dir=engine.state_dir, cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, read_charters=read_charters, read_parent=read_parent, cos=cos, wake=wake,
-                                      time_up=budget.spent, pending=pending, **meter))
+                                      time_up=budget.spent, pending=pending, reminders=reminders, pr_refs=pr_refs, **meter))
     set_source_state(engine, "load_alert", pending)
     return sent
 
