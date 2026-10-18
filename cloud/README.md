@@ -132,18 +132,31 @@ directory and image, a failure on a planted token and on an image with one baked
 
 ## Build and scan the image
 
+The build itself scans the image. `worker/Dockerfile` has a `scan` stage that runs `scan-secrets.sh --dir /` as root over
+the whole filesystem of the finished `worker` stage (skipping only the top-level `proc`, `sys`, `dev` and the script), and the
+`final` stage, the one that is published, depends on it: a hit (exit 1) or a file the scan cannot read (exit 2) fails the build,
+so no image exists to push. The scan runs where the build runs, so a remote `linux/amd64` build reads the layers that
+`docker save` cannot export from an arm64 workstation. The marker is only bind-mounted into `final`, never copied: the shipped
+image holds no scan file.
+
 ```sh
-docker build -t cw-worker:dev -f cloud/worker/Dockerfile cloud     # image reference is yours to publish
-# with Azure Container Registry, the working directory must be cloud/ (the build context), then use -f worker/Dockerfile:
-(cd cloud && az acr build --registry <registry> --image cw-worker:<tag> -f worker/Dockerfile .)
-cloud/worker/scan-secrets.sh cw-worker:dev                        # must print "0 hits", exit 0; run it before every push
-docker push <registry>/cw-worker:<tag>                            # only after the scan passes
+# the real build: the working directory must be cloud/ (the build context). It fails when the scan finds a secret.
+(cd cloud && az acr build --registry acme-registry --image cw-worker:<tag> --platform linux/amd64 -f worker/Dockerfile .)
+# the same build on a workstation (BuildKit; pass the platform on an arm64 machine)
+docker build --platform linux/amd64 -t cw-worker:dev -f cloud/worker/Dockerfile cloud
+# the configuration and history, with the same patterns, on any workstation, after a pull or a local build
+docker pull acme-registry.azurecr.io/cw-worker:<tag>
+cloud/worker/scan-secrets.sh --meta acme-registry.azurecr.io/cw-worker:<tag>   # must print "0 hits", exit 0
 ```
 
-The scan covers every layer (including files deleted in a later layer) and the image config (env, history). It prints
-`path: pattern-name`, never the value. A hit exits 1, so a build pipeline that runs it fails the build.
+`--meta <image>` scans `docker image inspect` Config (env, labels, command) and `docker history --no-trunc`. It reads no
+layer. `scan-secrets.sh <image>` (a `docker save` scan, every layer including a file deleted in a later layer) still works
+where the engine can export the layers (an image of the machine's own architecture). The build scan sees the merged
+filesystem, not each layer: a secret written and then deleted inside the `worker` stage is not found by it, so no step of that
+stage may take a credential. Output is `path: pattern-name`, never the value. Exit codes: 0 no hits, 1 hits, 2 not readable
+or a usage error.
 
-### Resetting a node the fix gave up on
+## Resetting a node the fix gave up on
 
 When the fix cannot bring a node back (a failed restore, or containerd still unhealthy after the rollback) it sets its
 failed-attempt marker to the cap and exits non-zero once; later pods then idle and restart nothing. After the node has
