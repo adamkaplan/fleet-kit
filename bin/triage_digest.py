@@ -234,7 +234,7 @@ def rollup(seen, meta, t5_refs, now, limit=ROLLUP_ITEMS):
     if last is not None and now - last < ROLLUP_SECONDS:
         return None
     pairs = {(x if isinstance(x, tuple) else ("T5", x)) for x in t5_refs}
-    keyed = {ref: "%s %s" % (rule, ref) for rule, ref in sorted(pairs)}
+    keyed = {ref: "%s %s" % (rule, ref) for rule, ref in sorted(pairs)}   # one rule per ref: a T5 and a T6 never share an item
     refs = sorted({ref for ref, key in keyed.items() if key in seen and now - seen[key]["at"] >= ROLLUP_SECONDS},
                   key=lambda r: (seen[keyed[r]]["at"], _ref_key(r)))
     if not refs:
@@ -259,7 +259,7 @@ def prune(seen, candidates, keep=None):
     `keep(rule, ref)` is True for a record whose candidates could not be computed in this pass (its input was not whole):
     that record is kept, since an absent candidate is then no evidence the item left the tier. `rule` is "PARKED" for the once-only flag."""
     live = {"%s %s" % pair for pair in candidates} | {"PARKED " + ref for _, ref in candidates}
-    for key in [k for k in seen if k not in live and not (keep and keep(*k.split(" ", 1)))]:
+    for key in [k for k in seen if k not in live and not (keep and " " in k and keep(*k.split(" ", 1)))]:
         del seen[key]
 
 

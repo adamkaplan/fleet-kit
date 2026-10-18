@@ -25178,17 +25178,27 @@ class TestTriageT5Rollup(Base):
         self.assertEqual(self.run_pass(ds, 3600)[0], [])                             # nothing listed again
         self.assertEqual(self.seen_keys(), ["T5 acme/api#7", "T6 acme/api#51"])
 
-    def test_the_records_of_a_repository_whose_issue_list_was_not_read_are_kept(self):
+    def test_the_records_of_a_repository_whose_issue_list_was_not_read_whole_are_kept(self):
+        for damage in ({"error": "rate limited"}, {"truncated": True}):
+            with self.subTest(damage=damage):
+                self.run_pass([self.decision(7)], 3600)                              # past the digest hour: it is listed
+                unit = self.engine.triage.units[("acme/api", "issues")]
+                self.engine.triage.units[("acme/api", "issues")] = dict(unit, **damage)
+                self.run_pass([], 60)                                                # the decision list is whole and has no #7
+                self.assertEqual(sb.whole(self.engine, "decisions")[0], True)
+                self.assertEqual(sb.whole(self.engine, "issues:acme/api")[0], False)
+                self.assertEqual(self.seen_keys(), ["T5 acme/api#7"])                # kept: its repository's list was not whole
+                self.engine.triage.units[("acme/api", "issues")] = unit
+                self.run_pass([], 60)                                                # a whole pass without it: forgotten
+                self.assertEqual(self.seen_keys(), [])
+
+    def test_a_skipped_prune_says_so_once_per_pass_and_input(self):
         self.run_pass([self.decision(7)])
-        unit = self.engine.triage.units[("acme/api", "issues")]
-        self.engine.triage.units[("acme/api", "issues")] = dict(unit, error="rate limited")
-        self.engine.triage.seen["T5 acme/web#9"] = dict(self.engine.triage.seen["T5 acme/api#7"])
-        triage_state = self.engine.triage
-        sb.read_mark(self.engine, "decisions", True, "", self.now)
-        sb.read_mark(self.engine, "issues:acme/api", False, "the last read failed", self.now)
-        sb.read_mark(self.engine, "issues:acme/web", True, "", self.now)
-        sb.triage_digest.prune(triage_state.seen, [], sb.triage_digest_keep(self.engine))
-        self.assertEqual(sorted(triage_state.seen), ["T5 acme/api#7"])               # the unread repository's record stays; the whole-read one's departed item goes
+        self.run_pass([], 3600, errors=[{"source": "github", "error": "not read yet"}])
+        keep = sb.triage_digest_keep(self.engine)
+        self.assertTrue(keep("T5", "acme/api#7") and keep("T6", "acme/api#9"))      # two prunes in one pass
+        lines = [e for e in self.world.audit() if e["event"] == "whole.skipped" and e["detail"]["input"] == "decisions"]
+        self.assertEqual(len(lines), 1)
 
     def test_the_registry_marks_an_input_whole_only_after_a_clean_read_and_a_restart_clears_it(self):
         self.assertEqual(sb.whole(self.engine, "decisions"), (False, "not read yet in this process"))
