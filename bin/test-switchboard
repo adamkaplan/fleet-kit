@@ -58663,6 +58663,10 @@ class TestLoadAlert(Base):
         self.tick(self.T0 + 3 * 3600 + 120, {"o": dict(self.orch(idle=1, charter=1), workers=["w1"])})
         self.assertEqual((self.latest()["o"]["stalled"], self.latest()["o"]["waiting_owner_pr"]), (1, 0))
 
+    def test_a_same_repository_reference_links_through_the_pull_requests_own_repository(self):
+        got = self.held_world("human", refs=[[None, 1]])
+        self.assertEqual((got["stalled"], got["waiting_owner_pr"]), (0, 1))
+
     def test_a_reference_to_another_ask_or_another_owners_repository_leaves_the_ask_stalled(self):
         self.assertEqual(self.held_world("human", refs=[["acme/widget", 300]])["stalled"], 1)     # a held PR that names another issue
         got = self.held_world("human", refs=[["other-org/widget", 1]], pr=51)                      # the same number and repository name under another owner
