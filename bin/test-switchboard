@@ -21439,7 +21439,8 @@ class TestIdleAtASeam(ReportBase):
         wake = next(f for f in found if ":seam:" in f.key and f.kind == "worker.idle")
         self.assertEqual(nudge.summary, "you went idle after reporting working on #2: report done, blocked or question, or continue")
         self.assertEqual(wake.summary, "idle without a closing report: #2 (worker coder, last report: migrating the tables)")
-        self.assertEqual([f.key for f in self.derive() if ":seam:" in f.key], [f.key for f in found if ":seam:" in f.key], "the same stretch has the same keys")
+        self.world.tick(30)
+        self.assertEqual([f.key for f in self.derive() if ":seam:" in f.key], [f.key for f in found if ":seam:" in f.key], "the same stretch has the same keys on a later pass")
 
     def test_a_worker_idle_under_20_minutes_triggers_nothing(self):
         self.idle_after("working", seconds=sb.SEAM_IDLE_SECONDS - 60)
@@ -21521,6 +21522,14 @@ class TestIdleAtASeam(ReportBase):
         self.assertEqual(len([f for f in self.derive() if ":seam:" in f.key]), 6)
         self.assertEqual((calls, len(self.world.engine.sources)), ([], sources))
         self.assertEqual(sorted(type(s).__name__ for s in self.world.engine.sources if "Seam" in type(s).__name__ or "Idle" in type(s).__name__), [])
+
+    def test_a_stop_the_triage_already_answers_is_not_also_an_idle_at_a_seam(self):
+        self.idle_after("working", seconds=5)
+        self.stop("OWED-ME: new work finished")      # given work again after the report: an unreported stop, nudged by the triage
+        self.world.tick(1300)
+        found = self.derive()
+        self.assertIn("nudge", [f.kind for f in found])
+        self.assertEqual(self.seam(found), [], "one nudge, not two")
 
     def test_the_last_report_line_is_kept_with_the_report(self):
         self.report("working", "on the second step")
