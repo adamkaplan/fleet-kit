@@ -21530,6 +21530,34 @@ class TestIdleAtASeam(ReportBase):
         self.assertIn("nudge", [f.kind for f in found])
         self.assertEqual(self.seam(found), [], "one nudge, not two")
 
+    def test_a_secret_in_a_report_is_redacted_in_the_stored_file_and_in_the_wake(self):
+        secrets = ["ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8", "ghs_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8",
+                   "AKIA" + "ABCDEFGHIJKLMNOP", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcDEFghiJKLmnoPQRstu",
+                   "password=" + "hunter2hunter2"]
+        for secret in secrets:
+            with self.subTest(secret=secret[:6]):
+                self.setUp()
+                self.stop("all quiet")
+                self.world.tick(1)
+                self.report("working", "tried %s and went on" % secret)
+                self.world.tick(1300)
+                stored = (Path(self.world.state) / sb.LAST_REPORT_FILE).read_text()
+                wake = next(f for f in self.derive() if ":seam:" in f.key and f.kind == "worker.idle")
+                value = secret.split("=")[-1]
+                self.assertNotIn(value, stored)
+                self.assertNotIn(value, wake.summary)
+                self.assertIn("[redacted]", stored)
+                self.assertIn("[redacted]", wake.summary)
+
+    def test_the_wake_redacts_a_line_that_an_older_file_holds_raw(self):
+        self.idle_after("working")
+        data = sb._read_small(self.world.state, sb.LAST_REPORT_FILE)
+        data["coder"]["text"] = "tried ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"
+        sb._write_small(self.world.state, sb.LAST_REPORT_FILE, data)
+        wake = next(f for f in self.derive() if ":seam:" in f.key and f.kind == "worker.idle")
+        self.assertNotIn("a1B2c3D4", wake.summary)
+        self.assertIn("[redacted]", wake.summary)
+
     def test_the_last_report_line_is_kept_with_the_report(self):
         self.report("working", "on the second step")
         self.assertEqual(sb._read_small(self.world.state, sb.LAST_REPORT_FILE)["coder"]["text"], "on the second step")

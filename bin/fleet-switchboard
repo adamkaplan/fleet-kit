@@ -6596,7 +6596,7 @@ def record_last_report(state_dir, sender, state, now, text=None):
             data = _read_small(state_dir, LAST_REPORT_FILE)
             entry = {"state": state, "at": int(now)}
             if isinstance(text, str) and text:
-                entry["text"] = _line_of(text, REPORT_MAX)   # credential-shaped text is taken out   # the one line, for the idle-at-a-seam wake (#773)
+                entry["text"] = _one_line(redact_command_text(text), REPORT_MAX)   # untrusted text: redacted before it is stored (#773)   # the one line, for the idle-at-a-seam wake (#773)
             if isinstance((data.get(sender) or {}).get("send_to"), dict):
                 entry["send_to"] = data[sender]["send_to"]   # a report does not forget the last sends
             if isinstance((data.get(sender) or {}).get("send_on"), dict):
@@ -8520,7 +8520,7 @@ class WorkerFacts:
                      "you went idle after reporting working on #%d: report done, blocked or question, or continue" % issue,
                      observation.idle_at, issue=issue, batch=False, sender="switchboard", repo=repo)
         wake = Fact("%s:%s" % (WORKER_IDLE, stretch), boss, WORKER_IDLE,
-                    "idle without a closing report: #%d (worker %s, last report: %s)" % (issue, observation.name, _line_of(line, 160) or "none recorded"),
+                    "idle without a closing report: #%d (worker %s, last report: %s)" % (issue, observation.name, _one_line(redact_command_text(line), 160) or "none recorded"),
                     observation.idle_at, issue=issue, batch=False, sender=observation.name, repo=repo)
         return [nudge, wake]
 
@@ -23224,6 +23224,7 @@ _SECRET_PATTERNS = (
     (re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}"
                 r"|AKIA[0-9A-Z]{12,}|xox[abprs]-[A-Za-z0-9-]{8,})"), "[redacted]"),
     (re.compile(r"(://[^/\s:@]+:)[^@\s/]+@"), r"\1[redacted]@"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]*"), "[redacted]"),   # a JWT (#773)
 )
 
 
