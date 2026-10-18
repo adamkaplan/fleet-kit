@@ -39848,6 +39848,18 @@ class TestOrdersDelivery(OrdersDeliveryCase):
             self.run_pass()
         self.assertEqual(len(self.order_messages("orch")), 1)
 
+    def test_the_first_full_pass_clears_the_load_tick_gate_and_not_before(self):   # #796 S6
+        engine = self.world.engine
+        self.assertTrue(engine.awaiting_first_full_pass)
+        self.run_pass()
+        self.assertFalse(engine.awaiting_first_full_pass)
+
+    def test_a_pass_that_publishes_nothing_leaves_the_gate_set(self):   # #796 (a Low of the review)
+        engine = self.world.engine
+        with mock.patch.object(sb, "fault", lambda name: name == "no-decisions-file"):
+            self.run_pass()
+        self.assertTrue(engine.awaiting_first_full_pass)
+
     def test_a_restart_repeats_nothing(self):
         self.run_pass()
         self.world.engine = self.world.new_engine()
@@ -39922,6 +39934,7 @@ class TestOrdersDelivery(OrdersDeliveryCase):
 
     def test_the_charter_is_read_once_per_cache_lifetime_not_once_per_pass(self):
         self.run_pass()
+        self.run_pass()   # #796: the load line reads nothing in the first pass after a start; its reads begin with the second
         first = self.gh_gets()
         loads = self.load_gets()
         for _ in range(6):
@@ -44582,6 +44595,23 @@ class TestPrNotices(DecisionsBase):
         self.world.tick(61)  # the cached ones expire; the next pass reads the skipped ones first
         self.notices()
         self.assertEqual([c[0][3] for c in runner.calls[reads:]], ["3", "4"])
+
+    def test_the_pass_counts_the_noticed_prs_it_has_no_facts_for(self):   # #796 S8
+        hang = subprocess.TimeoutExpired(["gh"], 8)
+        runner = FakeGhPr({n: hang for n in range(1, 7)})
+        slow = lambda argv, **kw: (setattr(self.world.clock, "t", self.world.clock.t + 8), runner(argv, **kw))[1]
+        self.world.engine.gh_runner = slow
+        for n in range(1, 7):
+            self.notify(number=n, at=EPOCH + n)
+        self.notices()
+        self.assertEqual(self.world.engine.notice_unread, 6)   # two were tried and failed, four were skipped by the budget: none has facts
+        self.world.engine.gh_runner = None
+        self.world.tick(61)
+
+    def test_a_pass_that_reads_every_notice_counts_none_unread(self):   # #796 S8
+        self.notify()
+        self.notices()
+        self.assertEqual(self.world.engine.notice_unread, 0)
 
     def test_resolve_and_answer_on_a_pr_notice_say_it_is_information(self):
         self.notify()
@@ -60120,6 +60150,109 @@ class TestLoadAlert(Base):
         report = sb.collect_status(runner=lambda *a, **k: types.SimpleNamespace(returncode=1, stdout="", stderr=""), now=lambda: self.T0)
         report["load"] = []
         return report
+
+    # ---- #796: no alert before the first full pass after a start
+    def first_pass_world(self, awaiting=True, held=False, links=False, numbers=(1, 2)):
+        """An engine as the daemon makes it at a start (`awaiting_first_full_pass`), one orchestrator with two asks nobody moves; `self.clock` is its time."""
+        self.clock = [self.T0]
+        issues = [types.SimpleNamespace(repo="acme/widget", number=n, labels=(), parked_until=None) for n in numbers]
+        self.parent_fails = True
+
+        def api(path, repo):
+            if self.parent_fails:
+                raise RuntimeError("the read was cut")
+            return []
+        intents = types.SimpleNamespace(repo="acme/widget", open_asks=lambda charter, repo: issues, _api=api)
+        facts = {"acme/widget#50": {"facts": {"refs": [["acme/widget", 1]]}}} if held else {}
+        engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.clock[0], audit=None, actor="daemon", intents=intents, notice_facts=facts,
+                                       awaiting_first_full_pass=awaiting, awaiting_held_links=links, config={"load_alert": self.health.validate({"enabled": True}, "x")})
+        agents = {"o": types.SimpleNamespace(name="o", session_id="s", status="idle", fleet={"role": "orchestrator", "charter": 1, "repo": "acme/widget"}),
+                  "cos": types.SimpleNamespace(name="cos", session_id="c", status="idle", fleet={"role": "chief-of-staff"})}
+        return engine, types.SimpleNamespace(agents=agents)
+
+    def run_ticks(self, engine, discovery, hours):
+        for hour in hours:
+            self.clock[0] = self.T0 + hour * 3600
+            sb.load_tick(engine, discovery)
+        return [r for r in sb.read_reminders(str(self.state_dir)) if "overloaded" in str(r.get("text"))]
+
+    def test_a_fresh_start_raises_no_alert_and_says_it_is_waiting(self):   # S1 S2
+        engine, discovery = self.first_pass_world()
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [], "provisional": True}))
+        self.assertEqual(self.run_ticks(engine, discovery, (0, 3, 4)), [])
+        self.assertIn("load: waiting for the first full pass", self.health.status_lines(str(self.state_dir), self.T0))
+
+    def test_after_the_first_full_pass_the_same_stalled_state_alerts_once(self):   # S3
+        engine, discovery = self.first_pass_world()
+        self.run_ticks(engine, discovery, (0, 3))
+        engine.awaiting_first_full_pass = False
+        self.assertEqual(len(self.run_ticks(engine, discovery, (4, 7))), 1)
+        self.assertNotIn("load: waiting for the first full pass", self.health.status_lines(str(self.state_dir), self.T0))
+
+    def test_a_restart_does_not_re_arm_the_alert(self):   # S4
+        engine, discovery = self.first_pass_world(awaiting=False)
+        self.assertEqual(len(self.run_ticks(engine, discovery, (0, 3))), 1)
+        engine, discovery = self.first_pass_world()   # restart: a new engine, the same state directory
+        self.clock[0] = self.T0 + 3 * 3600
+        self.assertEqual(len(self.run_ticks(engine, discovery, (4, 5))), 1)
+        engine.awaiting_first_full_pass = False
+        self.assertEqual(len(self.run_ticks(engine, discovery, (6, 7))), 1)
+
+    def test_a_held_pr_that_appears_in_the_first_full_pass_is_counted_before_any_alert(self):   # S5
+        engine, discovery = self.first_pass_world(held=True)
+        self.assertEqual(self.run_ticks(engine, discovery, (0, 3)), [])
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [{"kind": "captain", "repo": "acme/widget", "number": 50, "tier": "human",
+                                                                                   "since": "2026-10-14T10:00:00Z"}]}))
+        engine.awaiting_first_full_pass = False
+        self.assertEqual(self.run_ticks(engine, discovery, (3.1, 3.2)), [])
+        self.assertEqual(self.latest()["o"]["waiting_owner_pr"], 1)
+
+    @mock.patch.object(sb, "HELD_LINKS_WAIT_SECONDS", 20 * 3600)   # the passes below are hours apart: the bound is not what this test is about
+    def test_a_held_pr_whose_links_are_cut_keeps_the_alert_quiet_until_a_pass_with_them_whole(self):   # S7
+        engine, discovery = self.first_pass_world(awaiting=False, held=True, links=True, numbers=(1, 2, 3))
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [{"kind": "captain", "repo": "acme/widget", "number": 50, "tier": "human",
+                                                                                   "since": "2026-10-14T10:00:00Z"}]}))
+        self.assertEqual(self.run_ticks(engine, discovery, (0, 3, 4)), [])   # the parent read is cut every time: three asks look stalled, none is judged
+        self.assertTrue(engine.awaiting_held_links)
+        self.assertIn("load: waiting for held PR links", self.health.status_lines(str(self.state_dir), self.T0))
+        self.parent_fails = False
+        self.assertEqual(len(self.run_ticks(engine, discovery, (5,))), 1)   # the first pass with the links whole: ask 1 is the owner's wait, 2 and 3 are truly stalled: it alerts now
+        self.assertFalse(engine.awaiting_held_links)
+        self.assertNotIn("load: waiting for held PR links", self.health.status_lines(str(self.state_dir), self.T0))
+
+    def test_the_wait_for_held_pr_links_lapses_after_its_bound(self):   # S7
+        engine, discovery = self.first_pass_world(awaiting=False, held=True, links=True, numbers=(1, 2, 3))
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [{"kind": "captain", "repo": "acme/widget", "number": 50, "tier": "human",
+                                                                                   "since": "2026-10-14T10:00:00Z"}]}))
+        self.assertEqual(self.run_ticks(engine, discovery, (0, 0.1)), [])   # inside the bound
+        self.assertEqual(len(self.run_ticks(engine, discovery, (3,))), 1)   # more than 900 s of unreadable links: the alert is not silenced for ever
+
+    def held_row(self, number=50):
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [{"kind": "captain", "repo": "acme/widget", "number": number, "tier": "human",
+                                                                                   "since": "2026-10-14T10:00:00Z"}]}))
+
+    @mock.patch.object(sb, "HELD_LINKS_WAIT_SECONDS", 20 * 3600)
+    def test_noticed_prs_the_reader_could_not_read_keep_the_alert_quiet_until_a_pass_reads_them(self):   # S8
+        engine, discovery = self.first_pass_world(awaiting=False, links=True, numbers=(1, 2, 3))
+        self.parent_fails = False
+        engine.notice_unread = 2
+        self.assertEqual(self.run_ticks(engine, discovery, (0, 3, 4)), [])   # three asks look stalled; the notice reads were cut: nothing is judged
+        self.assertTrue(engine.awaiting_held_links)
+        self.assertIn("load: waiting for held PR links", self.health.status_lines(str(self.state_dir), self.T0))
+        engine.notice_unread = 0   # the next uncut pass read them all
+        self.assertEqual(len(self.run_ticks(engine, discovery, (5,))), 1)
+        self.assertFalse(engine.awaiting_held_links)
+
+    @mock.patch.object(sb, "HELD_LINKS_WAIT_SECONDS", 20 * 3600)
+    def test_a_human_tier_held_pr_with_no_read_references_keeps_the_alert_quiet(self):   # S8: the key-not-in-refs rule
+        engine, discovery = self.first_pass_world(awaiting=False, links=True, numbers=(1, 2, 3))
+        self.parent_fails = False
+        self.held_row()   # a held PR with no entry in the notice facts: its references were never read
+        self.assertEqual(self.run_ticks(engine, discovery, (0, 3, 4)), [])
+        self.assertTrue(engine.awaiting_held_links)
+        engine.notice_facts["acme/widget#50"] = {"facts": {"refs": [["acme/widget", 1]]}}
+        self.assertEqual(len(self.run_ticks(engine, discovery, (5,))), 1)
+        self.assertFalse(engine.awaiting_held_links)
 
     def stalled_world(self, count=2):
         self.asks = {1: list(range(1, count + 1))}
