@@ -5013,7 +5013,7 @@ class Switchboard:
                     now, issue=number, batch=False, sender=sender, repo=repo,
                     rider=state in REPORT_PROGRESS and not fault("no-rider"))
         if fact.rider:
-            if self.state_dir is not None and not record_last_report(self.state_dir, sender, state, now):
+            if self.state_dir is not None and not record_last_report(self.state_dir, sender, state, now, text):
                 self._note("fleetpane.error", sender, {"error": "last-reports.json not written: %s's final report will not retire it automatically" % sender})
             record_report_rider(self, fact)
             return {"sent": False, "action": "rider", "reason": "a progress report is a rider: it rides in the "
@@ -5024,7 +5024,7 @@ class Switchboard:
             earlier = load_report_fold().follows(_read_small(self.state_dir, LAST_REPORT_FILE).get(sender), boss, repo, number, now)
         if earlier is not None:
             fact.summary = load_report_fold().marked(fact.summary, earlier, now)
-        if self.state_dir is not None and not record_last_report(self.state_dir, sender, state, now):
+        if self.state_dir is not None and not record_last_report(self.state_dir, sender, state, now, text):
             self._note("fleetpane.error", sender, {"error": "last-reports.json not written: %s's final report will not retire it automatically" % sender})
         outcome = self.send_fact(fact, discovery, now, waiting, folded=earlier is not None)
         if state == "done" and outcome.get("sent") and self.state_dir is not None and worktree_config(self.config)["on_done"]:
@@ -6587,7 +6587,7 @@ def record_last_send(state_dir, sender, recipient, now, repo=None, issue=None):
         return False
 
 
-def record_last_report(state_dir, sender, state, now):
+def record_last_report(state_dir, sender, state, now, text=None):
     """Remember the last report `sender` made (state and time): what lets the daemon tell a worker its boss closed on purpose after its final `done`
     from one that died. Best effort, under a lock, never raises into `report`. Returns whether it was written: a failure is the SAFE direction (the
     worker then still shows DEAD and is never wrongly retired), and the caller notes it."""
@@ -6595,6 +6595,8 @@ def record_last_report(state_dir, sender, state, now):
         with agent_lock(state_dir, "files", seconds=2):
             data = _read_small(state_dir, LAST_REPORT_FILE)
             entry = {"state": state, "at": int(now)}
+            if isinstance(text, str) and text:
+                entry["text"] = _one_line(redact_command_text(text), REPORT_MAX)   # untrusted text: redacted before it is stored (#773)   # the one line, for the idle-at-a-seam wake (#773)
             if isinstance((data.get(sender) or {}).get("send_to"), dict):
                 entry["send_to"] = data[sender]["send_to"]   # a report does not forget the last sends
             if isinstance((data.get(sender) or {}).get("send_on"), dict):
@@ -8381,6 +8383,7 @@ REPORT_ATTENTION = ("done", "failed", "blocked", "question")  # wake the boss wh
 REPORT_PROGRESS = ("working", "paused", "withdrawn")          # riders: carried, never the reason for a message
 REPORT_STATES = REPORT_ATTENTION + REPORT_PROGRESS
 WITHDRAW_ALL = decision_core.WITHDRAW_ALL  # leads a `withdrawn` report made with --all: it clears every open question of the worker
+SEAM_IDLE_SECONDS = 1200   # #773: an idle worker whose last report was `working` is noticed after this long
 REPORT_MAX = 300  # characters: a report is a sentence; detail goes on GitHub
 SUMMARY_CAP = 600  # characters of a worker's last reply in its fact
 LAB_WORKER_SINCE_ENV = "FLEET_SWITCHBOARD_LAB_WORKER_SINCE"
@@ -8486,7 +8489,40 @@ class WorkerFacts:
         idle = Fact(key, boss, WORKER_IDLE, head + (": " + reply if reply else ""), observation.idle_at,
                     issue=_issue_of(observation.fleet), sender=observation.name, rider=not fault("idle-wakes"))
         idle.clean = observation.outcome in QUIET_OUTCOMES  # only a clean finish may be folded into a quiet line
-        return self.stop_facts(observation, boss, idle_ms, idle, reply)
+        found = self.stop_facts(observation, boss, idle_ms, idle, reply)
+        if len(found) == 1 and found[0].kind == WORKER_IDLE:   # nothing else is said about this stop: it may be an idle at a seam (#773)
+            found = found + self.seam_facts(observation, boss, idle_ms)
+        return found
+
+    def seam_facts(self, observation, boss, idle_ms):
+        """#773: idle SEAM_IDLE_SECONDS or more, an OPEN assignment, and a last report of `working`: ONE nudge for the worker and ONE wake
+        for its boss, each keyed by this idle stretch (`idle_at`), so neither is sent twice. Reads nothing new: the observation, the
+        last-reports.json record `report` wrote, the retired list, and the closed-issue events the hub already holds (no `gh` call)."""
+        engine, state_dir = self.engine, self.engine.state_dir
+        issue = _issue_of(observation.fleet)
+        if state_dir is None or issue is None or engine.now() - observation.idle_at < SEAM_IDLE_SECONDS:
+            return []
+        kept = read_retired(state_dir).get(observation.name)
+        if kept is not None and kept.get("session") in (None, observation.session_id):
+            return []   # retired on purpose
+        last = _read_small(state_dir, LAST_REPORT_FILE).get(observation.name)
+        if not isinstance(last, dict) or last.get("state") != "working":
+            return []   # a closing report (or none) is the existing triage's business
+        repo = _fleet_repo(observation.fleet, engine.config) or engine.config.get("intent_repo")
+        hub = getattr(engine, "hub", None)
+        # Fails OPEN on purpose: the hub keeps closed events in memory only, so after a restart a closed issue can get one nudge and one wake.
+        closed = hub.closed_issue_snapshot() if hub is not None and hasattr(hub, "closed_issue_snapshot") else {}
+        if repo and "%s#%d" % (plan_ledger.normal_repo(repo), issue) in closed:
+            return []   # its assignment is closed
+        stretch = "%s:%s:%d" % ("seam", observation.session_id, int(round(observation.idle_at * 1000)))
+        line = last.get("text") if isinstance(last.get("text"), str) else ""
+        nudge = Fact("%s:%s" % (NUDGE, stretch), observation.name, NUDGE,
+                     "you went idle after reporting working on #%d: report done, blocked or question, or continue" % issue,
+                     observation.idle_at, issue=issue, batch=False, sender="switchboard", repo=repo)
+        wake = Fact("%s:%s" % (WORKER_IDLE, stretch), boss, WORKER_IDLE,
+                    "idle without a closing report: #%d (worker %s, last report: %s)" % (issue, observation.name, _one_line(redact_command_text(line), 160) or "none recorded"),
+                    observation.idle_at, issue=issue, batch=False, sender=observation.name, repo=repo)
+        return [nudge, wake]
 
     def stop_facts(self, observation, boss, idle_ms, idle, reply):
         """The facts for one stop, worked out once (a stop is asked about once; the cache is rebuilt after a
@@ -23188,6 +23224,7 @@ _SECRET_PATTERNS = (
     (re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}"
                 r"|AKIA[0-9A-Z]{12,}|xox[abprs]-[A-Za-z0-9-]{8,})"), "[redacted]"),
     (re.compile(r"(://[^/\s:@]+:)[^@\s/]+@"), r"\1[redacted]@"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]*"), "[redacted]"),   # a JWT (#773)
 )
 
 
