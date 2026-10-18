@@ -317,6 +317,7 @@ EXIT_ERROR = 1
 EXIT_USAGE = 2
 EXIT_PARTIAL = 4   # `prove`: at least one named scenario was not recorded (a usage error is 2)
 EXIT_HELD = 3   # `send`: the delivery rule says hold; nothing was sent
+EXIT_MEMORY = 5   # `launch`: the memory test refused a NEW launch (the machine cannot take it); `--memory-ok <reason>` overrides
 EXIT_CRASH = 70  # the `crash-after-send` fault stopped the process, as a crash would
 
 # ------------------------------------------------------------------ the config
@@ -16611,6 +16612,86 @@ def read_brief(path, stdin):
     return text
 
 
+MEMORY_FREE_MIN = 40          # percent: the lanes' safety check for a NEW launch, not a rule about coders
+MEMORY_WAIT_SECONDS = 30      # the two Swapouts reads are this far apart
+MEMORY_CACHE_SECONDS = 60     # a cached reading older than this is never trusted
+MEMORY_CACHE_FILE = "memory-reading.json"
+MEMORY_PROBES = {"memory_pressure": "/usr/bin/memory_pressure", "vm_stat": "/usr/bin/vm_stat"}   # absolute paths, never resolved through PATH; a missing one is "not available" (pass open)
+memory_sleep = time.sleep   # a test replaces it; production never does
+
+
+def memory_read(runner):
+    """(free_percent, swapouts), or None when either probe is missing or its output cannot be read (Linux, a failure): the test then passes open."""
+    try:
+        pressure = runner([MEMORY_PROBES["memory_pressure"]], capture_output=True, text=True, timeout=20)
+        vm = runner([MEMORY_PROBES["vm_stat"]], capture_output=True, text=True, timeout=20)
+        free = re.search(r"free percentage:\s*(\d{1,3})\s*%", pressure.stdout or "")
+        swapouts = re.search(r"^Swapouts:\s*(\d+)\.?\s*$", vm.stdout or "", re.M)
+        if pressure.returncode != 0 or vm.returncode != 0 or not free or not swapouts:
+            return None
+        return int(free.group(1)), int(swapouts.group(1))
+    except (OSError, subprocess.SubprocessError, TypeError, AttributeError, ValueError):
+        return None
+
+
+def launch_memory_check(args, engine, state, runner, now):
+    """The lanes' safety check before a NEW launch (not the owner's rule; no caps on coders): `memory_pressure` free >= 40 percent AND the `vm_stat`
+    Swapouts counter unchanged between two reads 30 s apart. Returns None to go on, or the refusal line (the caller exits EXIT_MEMORY). A fresh cached
+    reading (state dir, < 60 s old) that shows the counter flat saves the wait, but never makes a launch pass when this first read's free is under 40.
+    FAIL OPEN: a missing or unreadable probe passes with one line and an audit record. `--memory-ok <reason>` skips the test and audits it."""
+    reason = getattr(args, "memory_ok", None)
+    path = Path(state) / MEMORY_CACHE_FILE
+    audit = lambda kind, data: engine.audit.append(engine.actor, kind, args.name, data) if engine.audit is not None else None
+    first = memory_read(runner)
+
+    def remember(*reads):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".%d.tmp" % os.getpid())
+            tmp.write_text(json.dumps({"at": now(), "reads": [list(r) for r in reads][-2:]}))
+            os.replace(tmp, path)
+        except OSError:
+            pass   # the cache is only an optimisation: a failed write costs the next launch one wait, deliberately silent
+    if reason is not None:
+        audit("launch.memory_ok", {"reason": _one_line(reason, 200), "measured": ("free %d%%, swapouts %d" % first) if first else "not measured"})
+        return None
+    if first is None:
+        sys.stderr.write("%s: memory test not available: launching\n" % PROG)
+        audit("launch.memory_unavailable", {"measured": "not measured"})
+        return None
+    free, before = first
+    cached = None
+    try:
+        with open(path) as handle:
+            record = json.loads(handle.read(4096))   # a small file: a bigger one is not ours and is not trusted
+        reads = record["reads"]
+        if not isinstance(reads, list) or len(reads) > 2:
+            raise ValueError("unexpected cache shape")
+        if 0 <= now() - float(record["at"]) < MEMORY_CACHE_SECONDS and len(reads) >= 1:
+            cached = reads[-1][1]
+            if len(reads) >= 2 and reads[-2][1] != cached:
+                cached = None   # the cached pair moved: not flat
+    except (OSError, ValueError, KeyError, IndexError, TypeError):
+        cached = None
+    if free < MEMORY_FREE_MIN:
+        remember(first)
+        return "memory: free %d%%, swapouts %d: not launching; override: --memory-ok <reason>" % (free, before)
+    if cached is not None and cached == before:
+        remember(first, first)
+        sys.stderr.write("%s: memory: free %d%%, swapouts flat (cached reading under %d s old)\n" % (PROG, free, MEMORY_CACHE_SECONDS))
+        return None
+    memory_sleep(MEMORY_WAIT_SECONDS)   # the wait is a constant: no environment variable or argument changes it; only `--memory-ok <reason>` skips the test
+    second = memory_read(runner)
+    if second is None:
+        sys.stderr.write("%s: memory test not available: launching\n" % PROG)
+        audit("launch.memory_unavailable", {"measured": "free %d%%, swapouts %d" % first})
+        return None
+    remember(first, second)
+    if second[0] < MEMORY_FREE_MIN or second[1] != before:
+        return "memory: free %d%%, swapouts %d -> %d in %d s: not launching; override: --memory-ok <reason>" % (second[0], before, second[1], MEMORY_WAIT_SECONDS)
+    return None
+
+
 def cmd_launch(args, runner, now, socket_call=None):
     if getattr(args, "cloud", False):   # a worker in the cloud (#371): its own module; nothing below runs
         return run_cloud("cmd_launch", args, runner, now)
@@ -16649,6 +16730,13 @@ def cmd_launch(args, runner, now, socket_call=None):
         return EXIT_OK
     if not args.agent or not args.dir:
         raise LaunchError("--agent and --dir are required (or --resume SESSION for an existing agent)")
+    if getattr(args, "memory_ok", None) is not None and (not args.memory_ok.strip() or re.search(r"[\x00-\x1f\x7f-\x9f]", args.memory_ok)):
+        sys.stderr.write("%s: launch: --memory-ok needs a reason: non-empty text on one line, no control characters\n" % PROG)
+        return EXIT_USAGE
+    refusal = launch_memory_check(args, engine, state, runner, now)   # a NEW launch only: every resume, --cloud and the other routes returned above
+    if refusal:
+        sys.stderr.write("%s: %s\n" % (PROG, refusal))
+        return EXIT_MEMORY
     if getattr(args, "headless", False) and (args.workspace or args.new_workspace):
         raise LaunchError("--headless opens no terminal, so it takes no --workspace or --new-workspace (`%s watch NAME` opens one later)" % PROG)
     if (args.name or "").startswith(LANE_NAME_PREFIX):
@@ -25880,7 +25968,7 @@ def build_parser():
     notice.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
     sub.add_parser("ensure", help="Start the daemon unless it runs (herdr's startup hook calls this)")
     sub.add_parser("poke", help="Ask the daemon for a pass now; silent, never blocks (herdr's event hooks call this)")
-    launch = sub.add_parser("launch", help="Start a fleet agent in a new herdr tab, without typing")
+    launch = sub.add_parser("launch", help="Start a fleet agent in a new herdr tab, without typing", description="Start a fleet agent in a new herdr tab, without typing. A NEW launch (not a resume or --cloud) first runs the memory test: this is the lanes' safety check, not the owner's rule (there are no caps on coders), and `--memory-ok <reason>` overrides it. A refusal exits 5.")
     launch.add_argument("name", help="The agent's fleet name (lower case, digits, - and _)")
     launch.add_argument("--agent", help="The OpenCode agent definition, such as coder")
     launch.add_argument("--dir", help="The agent's working directory (absolute)")
@@ -25903,6 +25991,7 @@ def build_parser():
     launch.add_argument("--overdue", metavar="WHEN", help="Wake --reports-to at this time if the worker has not "
                         "reported since the launch (60m, or an ISO time with a zone)")
     launch.add_argument("--brief-file", dest="brief_file", help="The first prompt: a file, or - for stdin")
+    launch.add_argument("--memory-ok", dest="memory_ok", metavar="REASON", help="Skip the memory test of a new launch (audited with the reason)")
     launch.add_argument("--cloud", action="store_true", help="Run the worker in the cloud (needs --repo and --branch; --dir is its path in the pod, default /work; the pod always runs its own 'worker' agent: --agent is only recorded)")
     launch.add_argument("--branch", help="With --cloud: the branch the worker starts on")
     launch.add_argument("--idle", help="With --cloud: stop after this long idle (default 10m)")

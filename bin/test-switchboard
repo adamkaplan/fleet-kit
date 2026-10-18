@@ -2246,6 +2246,9 @@ class World:
 
     def __init__(self, test, agents=("platform", "coder"), config=None, state=None):
         os.environ[sb.LAB_ENV] = "1"  # lab facts are the event source in these tests
+        patch = mock.patch.object(sb, "memory_sleep", lambda seconds: None)   # a new launch's memory test (#779) never waits 30 s here
+        patch.start()
+        test.addCleanup(patch.stop)
         self.clock = SimClock()
         self.v2 = FakeV2(self.clock)
         self.herdr = FakeHerdr(self.v2)
@@ -2283,6 +2286,8 @@ class World:
             return self.v2(argv, **kwargs)
         if argv[0] == FAKE_HERDR:
             return self.herdr(argv, **kwargs)
+        if argv[0] in sb.MEMORY_PROBES.values():   # a healthy, flat machine: the memory test of a new launch (#779) passes
+            return subprocess.CompletedProcess(argv, 0, "System-wide memory free percentage: 80%\n" if argv[0].endswith("memory_pressure") else "Swapouts:  5.\n", "")
         raise AssertionError("a test reached for a real binary: %r" % argv[0])
 
     def fact(self, to, key, summary="something happened", **extra):
@@ -15128,7 +15133,7 @@ class TestWorkerRulesInSkills(unittest.TestCase):
 
 class TestLaunchMemoryTest(unittest.TestCase):
     """#758: the launch memory test is said once in the coordination skill; no swap-used percentage rule anywhere."""
-    SENTENCE = "Launch a new worker or tester only when `memory_pressure` reports a free percentage of at least 40 and the `Swapouts` counter of `vm_stat` is unchanged between two reads 30 seconds apart (swap used is sticky on macOS and is not the test)."
+    SENTENCE = "Launch a new worker or tester only when `memory_pressure` reports a free percentage of at least 40 and the `Swapouts` counter of `vm_stat` is unchanged between two reads 30 seconds apart (swap used is sticky on macOS and is not the test); launch applies it itself; `--memory-ok <reason>` overrides."
 
     def test_the_sentence_is_in_the_coordination_skill_exactly_once(self):
         self.assertEqual((REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text().count(self.SENTENCE), 1)
@@ -35011,6 +35016,200 @@ class TestLaunchSetsCheckpointReminders(TwoRepoCase):
     def test_no_brief_and_no_flags_is_silent(self):
         code, _, err = self.launch()
         self.assertEqual((code, err, sb.read_reminders(self.world.state)), (0, "", []))
+
+
+class TestLaunchMemoryGate(TwoRepoCase):
+    """#779: a NEW launch runs the lanes' memory test (fake `memory_pressure` and `vm_stat` at the probe paths); nothing else does."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.fake), True)
+        self.bindir = self.fake / "bin"
+        self.bindir.mkdir()
+        self.calls = self.fake / "calls"
+        self.calls.write_text("")
+        (self.fake / "free").write_text("54")
+        (self.fake / "swap").write_text("100")
+        (self.bindir / "memory_pressure").write_text('#!/bin/sh\necho memory_pressure >> "%s"\n[ -f "%s/broken" ] && exit 1\n'
+                                                      'echo "System-wide memory free percentage: $(cat "%s/free")%%"\n' % (self.calls, self.fake, self.fake))
+        (self.bindir / "vm_stat").write_text('#!/bin/sh\necho vm_stat >> "%s"\n[ -f "%s/garbage" ] && echo nonsense && exit 0\n'
+                                              'v=$(head -n1 "%s/swap"); n=$(wc -l < "%s/swap"); [ "$n" -gt 1 ] && sed -i.bak 1d "%s/swap"\n'
+                                              'echo "Swapouts:                    $v."\n' % ((self.calls, self.fake) + (self.fake,) * 3))
+        for f in ("memory_pressure", "vm_stat"):
+            os.chmod(str(self.bindir / f), 0o755)
+        patcher = mock.patch.object(sb, "MEMORY_PROBES", {name: str(self.bindir / name) for name in ("memory_pressure", "vm_stat")})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("HERDR_PANE_ID", None)
+        self.work = self.home / "checkout"
+        self.work.mkdir(exist_ok=True)
+
+    def main(self, *argv):
+        real = self.world.route
+
+        def route(argv, **kwargs):
+            if argv[0] in sb.MEMORY_PROBES.values():
+                return subprocess.run(argv, **kwargs)
+            return self.gh(argv, **kwargs) if argv[0] == FAKE_GH else real(argv, **kwargs)
+        with captured() as (out, err):
+            code = sb.main(list(argv), runner=route, now=self.world.clock.now, wait=lambda sock, s: False, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def launch(self, *extra, name="web-new"):
+        return self.main("launch", name, "--agent", "coder", "--dir", str(self.work), "--workspace", "w1", "--role", "coder", "--repo", ACME_WEB, *extra)
+
+    def probes(self):
+        return len(self.calls.read_text().split())
+
+    def audit(self, event):
+        return [e for e in self.world.audit() if e["event"] == event]
+
+    def sessions(self):
+        return len(self.world.v2.sessions)
+
+    def test_s1_a_healthy_machine_launches(self):
+        (self.fake / "swap").write_text("100\n100\n")
+        before = self.sessions()
+        code, _, err = self.launch()
+        self.assertEqual((code, self.sessions() - before), (0, 1), err)
+
+    def test_s2_low_free_is_refused_with_the_numbers_and_a_distinct_status(self):
+        (self.fake / "free").write_text("31")
+        before = self.sessions()
+        code, _, err = self.launch()
+        self.assertEqual((code, self.sessions() - before), (sb.EXIT_MEMORY, 0))
+        self.assertNotIn(sb.EXIT_MEMORY, (0, 1, 2, 3, 4, 70))
+        (line,) = [l for l in err.splitlines() if "memory:" in l]
+        self.assertIn("free 31%", line)
+        self.assertIn("swapouts 100", line)
+        self.assertIn("--memory-ok <reason>", line)
+
+    def test_s3_a_moving_swapouts_counter_is_refused_naming_both_values(self):
+        (self.fake / "free").write_text("60")
+        (self.fake / "swap").write_text("12758267\n12760001\n")
+        before = self.sessions()
+        code, _, err = self.launch()
+        self.assertEqual((code, self.sessions() - before), (sb.EXIT_MEMORY, 0))
+        (line,) = [l for l in err.splitlines() if "memory:" in l]
+        self.assertIn("12758267 -> 12760001", line)
+
+    def test_s4_the_other_routes_never_run_the_test(self):
+        (self.fake / "free").write_text("5")
+        code, _, err = self.main("launch", "web-new", "--cloud", "--repo", ACME_WEB)
+        self.assertNotEqual(code, sb.EXIT_MEMORY, err)
+        code, _, err = self.main("launch", "web-new", "--resume", "ses_example", "--repo", ACME_WEB)
+        self.assertNotEqual(code, sb.EXIT_MEMORY, err)
+        code, _, err = self.main("reattach", "web-coder")
+        self.assertNotEqual(code, sb.EXIT_MEMORY, err)
+        self.assertEqual(self.probes(), 0, "no probe was run")
+
+    def test_s5_override_with_a_reason_launches_and_writes_one_audit_line(self):
+        (self.fake / "free").write_text("10")
+        before = self.sessions()
+        code, _, err = self.launch("--memory-ok", "release fix")
+        self.assertEqual((code, self.sessions() - before), (0, 1), err)
+        (entry,) = self.audit("launch.memory_ok")
+        self.assertEqual(entry["subject"], "web-new")
+        self.assertEqual(entry["detail"]["reason"], "release fix")
+        self.assertIn("free 10%", entry["detail"]["measured"])
+
+    def test_s11_an_empty_reason_is_a_usage_error_and_launches_nothing(self):
+        (self.fake / "free").write_text("10")
+        for reason in ("", "   "):
+            before = self.sessions()
+            code, _, err = self.launch("--memory-ok", reason)
+            self.assertEqual((code, self.sessions() - before), (2, 0), err)
+
+    def test_s6_a_broken_probe_passes_open_with_a_line_and_an_audit_record(self):
+        for how in ("broken", "garbage"):
+            (self.fake / how).write_text("")
+            before = self.sessions()
+            code, _, err = self.launch(name="web-" + how)
+            self.assertEqual((code, self.sessions() - before), (0, 1), err)
+            self.assertEqual(err.count("memory test not available"), 1)
+            (self.fake / how).unlink()
+        self.assertEqual(len(self.audit("launch.memory_unavailable")), 2)
+
+    def test_s6b_a_missing_probe_passes_open(self):
+        with mock.patch.object(sb, "MEMORY_PROBES", {"memory_pressure": str(self.bindir / "none"), "vm_stat": str(self.bindir / "none2")}):
+            code, _, err = self.launch()
+        self.assertEqual(code, 0, err)
+        self.assertIn("memory test not available", err)
+
+    def test_s7_a_headless_launch_is_refused_like_any_other(self):
+        (self.fake / "free").write_text("10")
+        before = self.sessions()
+        code, _, err = self.main("launch", "web-hl", "--agent", "coder", "--dir", str(self.work), "--headless", "--role", "coder", "--repo", ACME_WEB)
+        self.assertEqual((code, self.sessions() - before), (sb.EXIT_MEMORY, 0), err)
+
+    def test_s8_a_fresh_cache_skips_the_wait_and_a_stale_one_reads_twice(self):
+        state = self.world.state
+        (state / sb.MEMORY_CACHE_FILE).write_text(json.dumps({"at": self.world.clock.now() - 20, "reads": [[55, 100], [55, 100]]}))
+        (self.fake / "free").write_text("55")
+        (self.fake / "swap").write_text("100")
+        code, _, err = self.launch()
+        self.assertEqual(code, 0, err)
+        self.assertIn("cached", err)
+        self.assertEqual(self.calls.read_text().split().count("vm_stat"), 1)
+        self.calls.write_text("")
+        (state / sb.MEMORY_CACHE_FILE).write_text(json.dumps({"at": self.world.clock.now() - 90, "reads": [[55, 100], [55, 100]]}))
+        code, _, err = self.launch(name="web-two")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("cached", err)
+        self.assertEqual(self.calls.read_text().split().count("vm_stat"), 2)
+
+    def test_s9_the_cache_never_overrides_a_low_free_percentage(self):
+        (self.world.state / sb.MEMORY_CACHE_FILE).write_text(json.dumps({"at": self.world.clock.now() - 5, "reads": [[55, 100], [55, 100]]}))
+        (self.fake / "free").write_text("30")
+        before = self.sessions()
+        code, _, _ = self.launch()
+        self.assertEqual((code, self.sessions() - before), (sb.EXIT_MEMORY, 0))
+
+    def test_no_environment_variable_changes_the_test(self):
+        (self.fake / "free").write_text("60")
+        for value in ("0", "1", "abc", "-5"):
+            (self.fake / "swap").write_text("100\n200\n")
+            with mock.patch.dict(os.environ, {"FLEET_MEMORY_WAIT_SECONDS": value, "FLEET_MEMORY_OK": "1", "FLEET_MEMORY_TEST": "off"}):
+                before = self.sessions()
+                code, _, err = self.launch(name="web-x")
+            self.assertEqual((code, self.sessions() - before), (sb.EXIT_MEMORY, 0), (value, err))
+        self.assertEqual(sb.MEMORY_WAIT_SECONDS, 30)
+
+    def test_a_probe_is_never_found_through_path(self):
+        with mock.patch.dict(os.environ, {"PATH": str(self.bindir)}):
+            self.assertTrue(all(os.path.isabs(path) for path in sb.MEMORY_PROBES.values()))
+
+    def test_a_reason_with_a_control_character_is_refused(self):
+        before = self.sessions()
+        code, _, err = self.launch("--memory-ok", "ok\n{\"event\":\"forged\"}")
+        self.assertEqual((code, self.sessions() - before, self.audit("launch.memory_ok")), (2, 0, []), err)
+
+    def test_a_corrupt_cache_is_ignored_and_a_future_one_is_not_trusted(self):
+        cache = self.world.state / sb.MEMORY_CACHE_FILE
+        cache.write_text("{not json")
+        code, _, err = self.launch()
+        self.assertEqual(code, 0, err)
+        cache.write_text(json.dumps({"at": self.world.clock.now() + 3600, "reads": [[55, 100], [55, 100]]}))
+        self.calls.write_text("")
+        code, _, err = self.launch(name="web-two")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("cached", err)
+        self.assertEqual(self.calls.read_text().split().count("vm_stat"), 2)
+
+    def test_a_cached_pair_that_moved_is_not_flat(self):
+        (self.world.state / sb.MEMORY_CACHE_FILE).write_text(json.dumps({"at": self.world.clock.now() - 5, "reads": [[55, 90], [55, 100]]}))
+        code, _, err = self.launch()
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("cached", err)
+
+    def test_s10_the_help_says_it_is_the_lanes_check_and_not_the_owners_rule(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = sb.main(["launch", "--help"])
+        self.assertEqual(code, 0)
+        text = " ".join(out.getvalue().split())
+        self.assertRegex(text, r"lanes' safety check, not the owner's rule.*--memory-ok")
 
 
 class TestLaunchNewWorkspace(TwoRepoCase):
