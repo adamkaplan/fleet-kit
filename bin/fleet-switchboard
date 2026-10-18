@@ -16411,13 +16411,15 @@ MEMORY_FREE_MIN = 40          # percent: the lanes' safety check for a NEW launc
 MEMORY_WAIT_SECONDS = 30      # the two Swapouts reads are this far apart
 MEMORY_CACHE_SECONDS = 60     # a cached reading older than this is never trusted
 MEMORY_CACHE_FILE = "memory-reading.json"
+MEMORY_PROBES = {"memory_pressure": "/usr/bin/memory_pressure", "vm_stat": "/usr/bin/vm_stat"}   # absolute paths, never resolved through PATH; a missing one is "not available" (pass open)
+memory_sleep = time.sleep   # a test replaces it; production never does
 
 
 def memory_read(runner):
     """(free_percent, swapouts), or None when either probe is missing or its output cannot be read (Linux, a failure): the test then passes open."""
     try:
-        pressure = runner(["memory_pressure"], capture_output=True, text=True, timeout=20)
-        vm = runner(["vm_stat"], capture_output=True, text=True, timeout=20)
+        pressure = runner([MEMORY_PROBES["memory_pressure"]], capture_output=True, text=True, timeout=20)
+        vm = runner([MEMORY_PROBES["vm_stat"]], capture_output=True, text=True, timeout=20)
         free = re.search(r"free percentage:\s*(\d{1,3})\s*%", pressure.stdout or "")
         swapouts = re.search(r"^Swapouts:\s*(\d+)\.?\s*$", vm.stdout or "", re.M)
         if pressure.returncode != 0 or vm.returncode != 0 or not free or not swapouts:
@@ -16427,20 +16429,13 @@ def memory_read(runner):
         return None
 
 
-def launch_memory_check(args, engine, state, runner, now, sleep=None):
+def launch_memory_check(args, engine, state, runner, now):
     """The lanes' safety check before a NEW launch (not the owner's rule; no caps on coders): `memory_pressure` free >= 40 percent AND the `vm_stat`
     Swapouts counter unchanged between two reads 30 s apart. Returns None to go on, or the refusal line (the caller exits EXIT_MEMORY). A fresh cached
     reading (state dir, < 60 s old) that shows the counter flat saves the wait, but never makes a launch pass when this first read's free is under 40.
     FAIL OPEN: a missing or unreadable probe passes with one line and an audit record. `--memory-ok <reason>` skips the test and audits it."""
-    sleep = sleep or time.sleep
     reason = getattr(args, "memory_ok", None)
     path = Path(state) / MEMORY_CACHE_FILE
-    try:   # a test seam (never set in production); FAIL MODE: a value that is not a number from 0 to 120 is ignored and the 30 s applies
-        wait = float(os.environ.get("FLEET_MEMORY_WAIT_SECONDS", MEMORY_WAIT_SECONDS))
-        if not 0 <= wait <= 120:
-            wait = MEMORY_WAIT_SECONDS
-    except ValueError:
-        wait = MEMORY_WAIT_SECONDS
     audit = lambda kind, data: engine.audit.append(engine.actor, kind, args.name, data) if engine.audit is not None else None
     first = memory_read(runner)
 
@@ -16480,7 +16475,7 @@ def launch_memory_check(args, engine, state, runner, now, sleep=None):
         remember(first, first)
         sys.stderr.write("%s: memory: free %d%%, swapouts flat (cached reading under %d s old)\n" % (PROG, free, MEMORY_CACHE_SECONDS))
         return None
-    sleep(wait)
+    memory_sleep(MEMORY_WAIT_SECONDS)   # the wait is a constant: no environment variable or argument changes it; only `--memory-ok <reason>` skips the test
     second = memory_read(runner)
     if second is None:
         sys.stderr.write("%s: memory test not available: launching\n" % PROG)
@@ -16488,7 +16483,7 @@ def launch_memory_check(args, engine, state, runner, now, sleep=None):
         return None
     remember(first, second)
     if second[0] < MEMORY_FREE_MIN or second[1] != before:
-        return "memory: free %d%%, swapouts %d -> %d in %d s: not launching; override: --memory-ok <reason>" % (second[0], before, second[1], wait)
+        return "memory: free %d%%, swapouts %d -> %d in %d s: not launching; override: --memory-ok <reason>" % (second[0], before, second[1], MEMORY_WAIT_SECONDS)
     return None
 
 
@@ -16530,8 +16525,8 @@ def cmd_launch(args, runner, now, socket_call=None):
         return EXIT_OK
     if not args.agent or not args.dir:
         raise LaunchError("--agent and --dir are required (or --resume SESSION for an existing agent)")
-    if getattr(args, "memory_ok", None) is not None and not args.memory_ok.strip():
-        sys.stderr.write("%s: launch: --memory-ok needs a reason (a non-empty text)\n" % PROG)
+    if getattr(args, "memory_ok", None) is not None and (not args.memory_ok.strip() or re.search(r"[\x00-\x1f\x7f-\x9f]", args.memory_ok)):
+        sys.stderr.write("%s: launch: --memory-ok needs a reason: non-empty text on one line, no control characters\n" % PROG)
         return EXIT_USAGE
     refusal = launch_memory_check(args, engine, state, runner, now)   # a NEW launch only: every resume, --cloud and the other routes returned above
     if refusal:

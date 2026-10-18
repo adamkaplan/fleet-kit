@@ -2246,7 +2246,7 @@ class World:
 
     def __init__(self, test, agents=("platform", "coder"), config=None, state=None):
         os.environ[sb.LAB_ENV] = "1"  # lab facts are the event source in these tests
-        patch = mock.patch.dict(os.environ, {"FLEET_MEMORY_WAIT_SECONDS": "0"})   # a new launch's memory test (#779) never waits 30 s here
+        patch = mock.patch.object(sb, "memory_sleep", lambda seconds: None)   # a new launch's memory test (#779) never waits 30 s here
         patch.start()
         test.addCleanup(patch.stop)
         self.clock = SimClock()
@@ -2286,8 +2286,8 @@ class World:
             return self.v2(argv, **kwargs)
         if argv[0] == FAKE_HERDR:
             return self.herdr(argv, **kwargs)
-        if argv[0] in ("memory_pressure", "vm_stat"):   # a healthy, flat machine: the memory test of a new launch (#779) passes
-            return subprocess.CompletedProcess(argv, 0, "System-wide memory free percentage: 80%\n" if argv[0] == "memory_pressure" else "Swapouts:  5.\n", "")
+        if argv[0] in sb.MEMORY_PROBES.values():   # a healthy, flat machine: the memory test of a new launch (#779) passes
+            return subprocess.CompletedProcess(argv, 0, "System-wide memory free percentage: 80%\n" if argv[0].endswith("memory_pressure") else "Swapouts:  5.\n", "")
         raise AssertionError("a test reached for a real binary: %r" % argv[0])
 
     def fact(self, to, key, summary="something happened", **extra):
@@ -34491,7 +34491,7 @@ class TestLaunchSetsCheckpointReminders(TwoRepoCase):
 
 
 class TestLaunchMemoryGate(TwoRepoCase):
-    """#779: a NEW launch runs the lanes' memory test (fake `memory_pressure` and `vm_stat` on PATH); nothing else does."""
+    """#779: a NEW launch runs the lanes' memory test (fake `memory_pressure` and `vm_stat` at the probe paths); nothing else does."""
 
     def setUp(self):
         super().setUp()
@@ -34510,7 +34510,7 @@ class TestLaunchMemoryGate(TwoRepoCase):
                                               'echo "Swapouts:                    $v."\n' % ((self.calls, self.fake) + (self.fake,) * 3))
         for f in ("memory_pressure", "vm_stat"):
             os.chmod(str(self.bindir / f), 0o755)
-        patcher = mock.patch.dict(os.environ, {"PATH": "%s:%s" % (self.bindir, os.environ["PATH"]), "FLEET_MEMORY_WAIT_SECONDS": "0"})
+        patcher = mock.patch.object(sb, "MEMORY_PROBES", {name: str(self.bindir / name) for name in ("memory_pressure", "vm_stat")})
         patcher.start()
         self.addCleanup(patcher.stop)
         os.environ.pop("HERDR_PANE_ID", None)
@@ -34521,7 +34521,7 @@ class TestLaunchMemoryGate(TwoRepoCase):
         real = self.world.route
 
         def route(argv, **kwargs):
-            if argv[0] in ("memory_pressure", "vm_stat"):
+            if argv[0] in sb.MEMORY_PROBES.values():
                 return subprocess.run(argv, **kwargs)
             return self.gh(argv, **kwargs) if argv[0] == FAKE_GH else real(argv, **kwargs)
         with captured() as (out, err):
@@ -34604,8 +34604,7 @@ class TestLaunchMemoryGate(TwoRepoCase):
         self.assertEqual(len(self.audit("launch.memory_unavailable")), 2)
 
     def test_s6b_a_missing_probe_passes_open(self):
-        (self.bindir / "vm_stat").unlink()
-        with mock.patch.dict(os.environ, {"PATH": str(self.bindir)}):
+        with mock.patch.object(sb, "MEMORY_PROBES", {"memory_pressure": str(self.bindir / "none"), "vm_stat": str(self.bindir / "none2")}):
             code, _, err = self.launch()
         self.assertEqual(code, 0, err)
         self.assertIn("memory test not available", err)
@@ -34639,12 +34638,36 @@ class TestLaunchMemoryGate(TwoRepoCase):
         code, _, _ = self.launch()
         self.assertEqual((code, self.sessions() - before), (sb.EXIT_MEMORY, 0))
 
-    def test_a_bad_wait_value_and_a_corrupt_cache_are_ignored(self):
-        (self.world.state / sb.MEMORY_CACHE_FILE).write_text("{not json")
-        for bad in ("abc", "-5", "nan"):
-            with mock.patch.dict(os.environ, {"FLEET_MEMORY_WAIT_SECONDS": bad}), mock.patch.object(sb, "MEMORY_WAIT_SECONDS", 0):
-                code, _, err = self.launch(name="web-" + bad.strip("-"))
-            self.assertEqual(code, 0, err)
+    def test_no_environment_variable_changes_the_test(self):
+        (self.fake / "free").write_text("60")
+        for value in ("0", "1", "abc", "-5"):
+            (self.fake / "swap").write_text("100\n200\n")
+            with mock.patch.dict(os.environ, {"FLEET_MEMORY_WAIT_SECONDS": value, "FLEET_MEMORY_OK": "1", "FLEET_MEMORY_TEST": "off"}):
+                before = self.sessions()
+                code, _, err = self.launch(name="web-x")
+            self.assertEqual((code, self.sessions() - before), (sb.EXIT_MEMORY, 0), (value, err))
+        self.assertEqual(sb.MEMORY_WAIT_SECONDS, 30)
+
+    def test_a_probe_is_never_found_through_path(self):
+        with mock.patch.dict(os.environ, {"PATH": str(self.bindir)}):
+            self.assertTrue(all(os.path.isabs(path) for path in sb.MEMORY_PROBES.values()))
+
+    def test_a_reason_with_a_control_character_is_refused(self):
+        before = self.sessions()
+        code, _, err = self.launch("--memory-ok", "ok\n{\"event\":\"forged\"}")
+        self.assertEqual((code, self.sessions() - before, self.audit("launch.memory_ok")), (2, 0, []), err)
+
+    def test_a_corrupt_cache_is_ignored_and_a_future_one_is_not_trusted(self):
+        cache = self.world.state / sb.MEMORY_CACHE_FILE
+        cache.write_text("{not json")
+        code, _, err = self.launch()
+        self.assertEqual(code, 0, err)
+        cache.write_text(json.dumps({"at": self.world.clock.now() + 3600, "reads": [[55, 100], [55, 100]]}))
+        self.calls.write_text("")
+        code, _, err = self.launch(name="web-two")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("cached", err)
+        self.assertEqual(self.calls.read_text().split().count("vm_stat"), 2)
 
     def test_a_cached_pair_that_moved_is_not_flat(self):
         (self.world.state / sb.MEMORY_CACHE_FILE).write_text(json.dumps({"at": self.world.clock.now() - 5, "reads": [[55, 90], [55, 100]]}))
