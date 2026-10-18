@@ -45,7 +45,7 @@ if a[:2] == ["repo", "view"]:
     print(os.environ.get("FAKE_REPO", "")); sys.exit(0 if os.environ.get("FAKE_REPO") else 1)
 print("real gh out"); sys.exit(7)
 """
-READ_CALLS = (["pr", "view"], ["issue", "view"], ["alias", "list"], ["repo", "view"])   # a pr view of `reviews,headRefOid` is the shim's own older merge check
+READ_CALLS = (["pr", "view"], ["issue", "view"], ["alias", "list"], ["repo", "view"])   # a pr view of `reviews,headRefOid,reviewDecision` is the shim's own older merge check
 
 
 def is_label_read(call):

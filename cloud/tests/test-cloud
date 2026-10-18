@@ -4,6 +4,19 @@
 set -u
 here=$(cd "$(dirname "$0")/.." && pwd); fail=0
 ok() { echo "ok   $1"; }; bad() { echo "FAIL $1"; fail=1; }
+# Every skip goes through skip(): it prints "skip <case>: <reason>" and records the case, so the CI skip can be pinned (below).
+skiplog=$(mktemp); skip() { echo "skip $1: $2"; echo "$1" >> "$skiplog"; }
+# pin_check <list> <skiplog>: the skipped cases must be EXACTLY the ones in <list> (one case per line; # comments and blanks ignored).
+# Line forms: `case`; `case <uname -s>` (that OS only); `case <uname -s> optional` (that OS only, and the case may also run).
+# $PIN_OS overrides uname for the test.
+pin_check() {
+  local os=${PIN_OS:-$(uname -s)} want opt got
+  want=$(grep -v '^[[:space:]]*\(#\|$\)' "$1" | awk -v os="$os" '(NF==1||$2==os)&&$3!="optional"{print $1}' | sort)
+  opt=$(grep -v '^[[:space:]]*\(#\|$\)' "$1" | awk -v os="$os" '$2==os&&$3=="optional"{print $1}')
+  # the skipped cases, less the optional ones that skipped, must equal the required list
+  got=$(sort "$2" | awk -v opt="$opt" 'BEGIN{n=split(opt,a,"\n");for(k=1;k<=n;k++)o[a[k]]=1} !($1 in o)')
+  [ "$want" = "$got" ]
+}
 
 # 1. manifests
 if command -v kubectl >/dev/null; then
@@ -14,10 +27,10 @@ if command -v kubectl >/dev/null; then
     elif KUBECONFIG=/dev/null kubectl label --local --dry-run=client -f "$f" x=y -o name >/dev/null 2>&1; then ok "offline parse $(basename "$f")"
     else bad "manifest $(basename "$f")"; fi
   done
-else echo "skip kubectl not installed"; fi
+else skip kubectl-manifests "kubectl not installed"; fi
 
 # 2. the fix script's rewrite, on a legacy-keyed config
-tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+tmp=$(mktemp -d); trap 'rm -rf "$tmp" "$skiplog"' EXIT
 cat > "$tmp/config.toml" <<'T'
 version = 3
 [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc]
@@ -332,9 +345,12 @@ import re, sys, pathlib
 root = pathlib.Path(sys.argv[1]); bad = []
 refs = []
 for f in list(root.glob("k8s/*.yaml")) + list(root.glob("**/Dockerfile*")):
+    stages = set()   # a later FROM <earlier stage> is not an external image
     for n, line in enumerate(f.read_text().splitlines(), 1):
+        a = re.match(r"\s*FROM\s+.*\s+AS\s+(\S+)\s*$", line, re.I) if "Dockerfile" in f.name else None
+        if a: stages.add(a.group(1))
         m = re.match(r"\s*FROM\s+(?:--\S+\s+)?(\S+)", line) if "Dockerfile" in f.name else re.match(r"\s*-?\s*image:\s*(\S+)", line)
-        if m: refs.append((f, n, m.group(1)))
+        if m and m.group(1) not in stages: refs.append((f, n, m.group(1)))
 for f, n, ref in refs:
     if ref.lower() == "scratch" or ref.startswith("$"): continue
     if "@sha256:" in ref: continue
@@ -365,8 +381,223 @@ printf '#!/bin/sh\ncp "%s" "$4"\n' "$tmp/fake.tar" > "$tmp/stub/docker"; chmod +
 PATH="$tmp/stub:$PATH" "$here/worker/scan-secrets.sh" any:image >/dev/null 2>&1; rc=$?
 [ "$rc" = 2 ] && ok "unreadable layer: exit 2, not a pass" || bad "unreadable layer rc=$rc"
 
+# 3c. --dir / skips are exact top-level names: a "proc" deeper down is scanned; unreadable files are exit 2
+mkdir -p "$tmp/sk/proc" "$tmp/sk/usr/proc" "$tmp/sk/own"; tok="ghp_$(printf 'e%.0s' $(seq 36))"
+echo "$tok" > "$tmp/sk/proc/a"; echo "$tok" > "$tmp/sk/own/scan.sh"
+"$here/worker/scan-secrets.sh" --dir "$tmp/sk" --skip proc --skip own >/dev/null 2>&1 && ok "--skip: top-level names are not scanned" || bad "--skip did not skip"
+echo "$tok" > "$tmp/sk/usr/proc/b"
+out=$("$here/worker/scan-secrets.sh" --dir "$tmp/sk" --skip proc --skip own 2>&1); rc=$?
+[ "$rc" = 1 ] && [ "$(echo "$out" | grep -c ': github-token')" = 1 ] && echo "$out" | grep -q '^usr/proc/b: github-token$' && ! echo "$out" | grep -q "$tok" \
+  && ok "--skip: a nested dir named like a skip is scanned; 1 path, 1 pattern, no value" || bad "nested skip name rc=$rc"
+if [ "$(id -u)" != 0 ]; then
+  mkdir -p "$tmp/unr/d"; echo x > "$tmp/unr/d/f"; chmod 000 "$tmp/unr/d"
+  "$here/worker/scan-secrets.sh" --dir "$tmp/unr" >/dev/null 2>&1; rc=$?; chmod 755 "$tmp/unr/d"
+  [ "$rc" = 2 ] && ok "unreadable directory: exit 2, not a pass" || bad "unreadable directory rc=$rc"
+else skip unreadable-dir "running as root reads everything"; fi
+# 3d. binary files are scanned too: UTF-16, NUL-padded, CRLF, and a token across a chunk edge (planted at run time)
+btok="ghp_$(python3 -c 'import secrets,string;print("".join(secrets.choice(string.ascii_letters) for _ in range(40)))')"
+mkdir "$tmp/bin"; BT="$btok" BD="$tmp/bin" python3 - <<'PY'
+import os
+t, d = os.environ["BT"], os.environ["BD"]
+w = lambda n, b: open(os.path.join(d, n), "wb").write(b)
+w("utf16le", ("k = " + t + "\n").encode("utf-16-le"))
+w("utf16be", ("k = " + t + "\n").encode("utf-16-be"))
+w("nulpad", b"\x00\x00" + t.encode() + b"\x00")
+w("crlf-key", b"-----BEGIN RSA PRIVATE KEY-----\r\nabc\r\n")
+w("chunk-edge", b"a" * (4 * 1024 * 1024 - 20) + t.encode() + b"b")
+PY
+out=$("$here/worker/scan-secrets.sh" --dir "$tmp/bin" 2>&1); rc=$?
+[ "$rc" = 1 ] && ! echo "$out" | grep -q "$btok" && ok "binary files: no value printed, exit 1" || bad "binary scan rc=$rc"
+for f in utf16le:github-token utf16be:github-token nulpad:github-token crlf-key:private-key chunk-edge:github-token; do
+  echo "$out" | grep -qx "${f%%:*}: ${f#*:}" && ok "binary scan finds ${f%%:*} (${f#*:})" || bad "binary scan missed ${f%%:*}"
+done
+if [ "$(id -u)" != 0 ]; then
+  mkdir "$tmp/unf"; echo x > "$tmp/unf/f"; chmod 000 "$tmp/unf/f"
+  "$here/worker/scan-secrets.sh" --dir "$tmp/unf" >/dev/null 2>&1; rc=$?; chmod 644 "$tmp/unf/f"
+  [ "$rc" = 2 ] && ok "unreadable file: exit 2, not a pass" || bad "unreadable file rc=$rc"
+else skip unreadable-file "running as root reads everything"; fi
+# --meta: config and history with the same patterns (stub docker; no network)
+mkdir "$tmp/mstub"; cat > "$tmp/mstub/docker" <<'S'
+#!/bin/sh
+case "$1 $2" in
+  "image inspect") printf '{"Env":["PATH=/bin","%s"]}\n' "$STUB_ENV" ;;
+  "history --no-trunc") printf '/bin/sh -c %s\n' "$STUB_HIST" ;;
+  *) exit 1 ;;
+esac
+S
+chmod +x "$tmp/mstub/docker"
+PATH="$tmp/mstub:$PATH" STUB_ENV=A=b STUB_HIST=true "$here/worker/scan-secrets.sh" --meta any:image >/dev/null 2>&1 && ok "--meta: clean config and history: 0 hits" || bad "--meta clean"
+out=$(PATH="$tmp/mstub:$PATH" STUB_ENV=A=b STUB_HIST=true "$here/worker/scan-secrets.sh" --meta any:image 2>&1)
+echo "$out" | grep -q 'META SCAN ONLY' && echo "$out" | grep -q 'layer FILES NOT SCANNED' && ! echo "$out" | grep -qx 'scan-secrets: 0 hits' \
+  && ok "--meta says it is a meta scan and that layer files were not scanned" || bad "--meta output reads as a full scan"
+out=$(PATH="$tmp/mstub:$PATH" STUB_ENV="GH_TOKEN=$tok" STUB_HIST=true "$here/worker/scan-secrets.sh" --meta any:image 2>&1)
+echo "$out" | grep -q 'META SCAN ONLY' && ok "--meta failure also says meta only" || bad "--meta failure text"
+out=$(PATH="$tmp/mstub:$PATH" STUB_ENV="GH_TOKEN=$tok" STUB_HIST=true "$here/worker/scan-secrets.sh" --meta any:image 2>&1); rc=$?
+[ "$rc" = 1 ] && ! echo "$out" | grep -q "$tok" && ok "--meta: token in the config: exit 1, value not printed" || bad "--meta env rc=$rc"
+out=$(PATH="$tmp/mstub:$PATH" STUB_ENV=A=b STUB_HIST="echo $tok" "$here/worker/scan-secrets.sh" --meta any:image 2>&1); rc=$?
+[ "$rc" = 1 ] && echo "$out" | grep -q 'history.txt: github-token' && ok "--meta: token in the history: exit 1" || bad "--meta history rc=$rc"
+PATH="/usr/bin:/bin" "$here/worker/scan-secrets.sh" --meta any:image >/dev/null 2>&1; rc2=$?
+[ "$rc2" = 2 ] && ok "--meta: an image that cannot be inspected is exit 2" || bad "--meta uninspectable rc=$rc2"
+
+# 3f. the PER-LAYER scan of image archives (docker-free: tiny archives built in python; the token is made now)
+ltok="ghp_$(printf 'f%.0s' $(seq 36))"; ad="$tmp/arch"; mkdir "$ad"
+python3 "$here/tests/make-archives.py" "$ad" "$ltok" || bad "could not build the test archives"
+S="$here/worker/scan-secrets.sh"
+for f in dockersave-clean oci-clean; do
+  out=$("$S" --archive "$ad/$f.tar" 2>&1); rc=$?
+  [ "$rc" = 0 ] && echo "$out" | grep -qx 'scan-secrets: all 3 layers scanned (files + configuration + history)' \
+    && echo "$out" | grep -q '^layer 3 .*: 1 files, .* MiB, 0 hits$' && echo "$out" | grep -q '^total: 3 layers, 3 files' \
+    && ok "layer scan ($f): all 3 layers scanned, exit 0" || bad "layer scan clean $f rc=$rc"
+done
+# written in layer 2, deleted in layer 3: the merged filesystem does not see it; the layer scan does (both formats)
+"$S" --dir "$ad/merged-deleted" >/dev/null 2>&1 && ok "merged filesystem of the deleted-token image: 0 hits (blind to it)" || bad "merged scan saw the deleted file?"
+for f in dockersave-deleted oci-deleted; do
+  out=$("$S" --archive "$ad/$f.tar" 2>&1); rc=$?
+  [ "$rc" = 1 ] && echo "$out" | grep -qx 'layer 2: /x: github-token' && ! echo "$out" | grep -q "$ltok" \
+    && echo "$out" | grep -q '^layer 3 .*0 hits$' && ! echo "$out" | grep -q 'all [0-9]* layers scanned' \
+    && ok "layer scan ($f): token written in layer 2, deleted in 3: exit 1, 'layer 2: /x: pattern', no value" || bad "layer scan deleted $f rc=$rc"
+done
+out=$("$S" --archive "$ad/oci-utf16.tar" 2>&1); rc=$?
+[ "$rc" = 1 ] && echo "$out" | grep -qx 'layer 2: /y: github-token' && ! echo "$out" | grep -q "$ltok" \
+  && ok "layer scan: UTF-16LE token inside a layer is found" || bad "layer scan utf16 rc=$rc"
+out=$("$S" --archive "$ad/oci-credfile.tar" 2>&1); rc=$?
+[ "$rc" = 1 ] && echo "$out" | grep -qx 'layer 2: /home/u/.netrc: credential-file' \
+  && ok "layer scan: a credential file by name (deleted in a later layer) is found" || bad "layer scan credential file rc=$rc"
+out=$("$S" --archive "$ad/oci-hostile.tar" 2>&1); rc=$?
+[ "$rc" = 1 ] && ! echo "$out" | grep -q "$(printf '\033')" && ! echo "$out" | grep -q '^layer 9: /forged' && echo "$out" | grep -q 'x\\x1b\[31m\\x0alayer 9' \
+  && ok "layer scan: control characters in a hostile path are escaped, no forged line" || bad "hostile path rc=$rc"
+mkdir "$tmp/hn"; : > "$tmp/hn/$(printf 'a\033[31m\nforged')/.netrc" 2>/dev/null || { mkdir "$tmp/hn/$(printf 'a\033[31m\nforged')" && : > "$tmp/hn/$(printf 'a\033[31m\nforged')/.netrc"; }
+out=$("$S" --dir "$tmp/hn" 2>&1); rc=$?
+[ "$rc" = 1 ] && ! echo "$out" | grep -q "$(printf '\033')" && [ "$(echo "$out" | grep -c credential-file)" = 1 ] \
+  && ok "--dir: a credential file under a hostile name is one escaped line" || bad "hostile dir path rc=$rc"
+out=$("$S" --archive "$ad/oci-env.tar" 2>&1); rc=$?
+[ "$rc" = 1 ] && echo "$out" | grep -qx 'config: github-token' && ! echo "$out" | grep -q "$ltok" \
+  && ok "layer scan: a token in the image configuration is found" || bad "layer scan config rc=$rc"
+for f in oci-badlayer oci-zstd notimage; do
+  out=$("$S" --archive "$ad/$f.tar" 2>&1); rc=$?
+  [ "$rc" = 2 ] && echo "$out" | grep -q 'not scanned' && ! echo "$out" | grep -q 'all [0-9]* layers scanned' \
+    && ok "layer scan ($f): an unreadable or unsupported layer is exit 2, never a pass" || bad "layer scan $f rc=$rc"
+done
+"$S" --archive "$ad/missing.tar" >/dev/null 2>&1; [ $? = 2 ] && ok "layer scan: a missing archive is exit 2" || bad "missing archive"
+# the meta line is not the full-scan line
+PATH="$tmp/mstub:$PATH" STUB_ENV=A=b STUB_HIST=true "$S" --meta any:image 2>&1 | grep -q 'all [0-9]* layers scanned' \
+  && bad "meta output reads as a layer scan" || ok "the --meta line differs from the full-scan line"
+
+# 3g. the allowlist: a hit is suppressed only when path AND sha256 AND pattern all match (planted at run time)
+shaof() { python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1"; }
+akey="AKIA$(printf 'A%.0s' $(seq 16))"
+al="$tmp/al"; mkdir -p "$al/d1/lib" "$al/d2/lib" "$al/d3/lib" "$al/d4/lib" "$al/d5/lib" "$al/d6/lib"
+printf 'x %s y\n' "$ltok" > "$al/d1/lib/f"                                  # the allowlisted file
+printf 'x %s y\n' "$ltok" > "$al/d3/lib/f"; printf '%s\n' "$akey" >> "$al/d3/lib/f"   # same path, other content, other pattern too
+printf 'other %s\n' "$ltok" > "$al/d2/lib/f"                                  # same path, DIFFERENT sha256
+printf 'x %s y\n' "$ltok" > "$al/d4/lib/g"                                    # same sha256, DIFFERENT path
+printf 'x %s y\n' "$ltok" > "$al/d5/lib/f"; printf '%s\n' "$akey" > "$al/d6/lib/f"
+h1=$(shaof "$al/d1/lib/f"); h3=$(shaof "$al/d3/lib/f"); h5=$h1
+printf '# test\n/lib/f %s github-token the test file\n' "$h1" > "$al/list-ok"
+alscan() { SCAN_ALLOWLIST="$1" "$S" --dir "$2" 2>&1; }
+out=$(alscan "$al/list-ok" "$al/d1"); rc=$?
+[ "$rc" = 0 ] && echo "$out" | grep -qx 'allowlisted: lib/f: github-token' && echo "$out" | grep -qx 'scan-secrets: 0 hits (1 allowlisted)' && ! echo "$out" | grep -q "$ltok" \
+  && ok "allowlist: an exact path+sha256+pattern triple is suppressed, printed and counted" || bad "allowlist exact rc=$rc"
+out=$(alscan "$al/list-ok" "$al/d2"); rc=$?
+[ "$rc" = 1 ] && echo "$out" | grep -qx 'lib/f: github-token' && ok "allowlist: the same path with another sha256 fails" || bad "allowlist other sha rc=$rc"
+printf '/lib/f %s github-token matching the old file\n' "$h1" > "$al/list-d3"
+out=$(alscan "$al/list-d3" "$al/d3"); rc=$?
+[ "$rc" = 1 ] && ok "allowlist: a changed file (an extra pattern appended) fails" || bad "allowlist appended rc=$rc"
+printf '/lib/f %s github-token the file with both\n' "$h3" > "$al/list-d3b"
+out=$(alscan "$al/list-d3b" "$al/d3"); rc=$?
+[ "$rc" = 1 ] && echo "$out" | grep -qx 'lib/f: aws-access-key' && echo "$out" | grep -qx 'allowlisted: lib/f: github-token' \
+  && ok "allowlist: the same file with another pattern still fails on that pattern" || bad "allowlist other pattern rc=$rc"
+printf '/lib/f %s aws-access-key not a pattern this file hits\n' "$h1" > "$al/list-np"
+alscan "$al/list-np" "$al/d1" >/dev/null; [ $? = 1 ] && ok "allowlist: an entry for a pattern the file does not hit changes nothing" || bad "allowlist unused entry"
+out=$(alscan "$al/list-ok" "$al/d4"); rc=$?
+[ "$rc" = 1 ] && ok "allowlist: the same sha256 at another path fails" || bad "allowlist other path rc=$rc"
+for v in missing empty-reason bad-sha bad-path; do
+  case $v in missing) f="$al/none";; empty-reason) f="$al/m1"; printf '/lib/f %s github-token\n' "$h1" > "$f";;
+    bad-sha) f="$al/m2"; printf '/lib/f abc github-token why\n' > "$f";; bad-path) f="$al/m3"; printf 'lib/f %s github-token why\n' "$h1" > "$f";; esac
+  alscan "$f" "$al/d1" >/dev/null; r1=$?
+  SCAN_ALLOWLIST="$f" "$S" --archive "$ad/oci-clean.tar" >/dev/null 2>&1; r2=$?
+  [ "$r1" = 2 ] && [ "$r2" = 2 ] && ok "allowlist ($v): unreadable or malformed is exit 2 (dir and archive), never a pass" || bad "allowlist $v rc=$r1/$r2"
+done
+# the same allowlist in the per-layer scan: the hash is the layer copy's
+python3 - "$al/arch.tar" "$ltok" <<'PY'
+import io, sys, tarfile
+t = tarfile.open(sys.argv[1], "w")
+def add(n, d):
+    ti = tarfile.TarInfo(n); ti.size = len(d); t.addfile(ti, io.BytesIO(d))
+import hashlib, json
+lay = io.BytesIO(); lt = tarfile.open(fileobj=lay, mode="w")
+d = ("x %s y\n" % sys.argv[2]).encode(); ti = tarfile.TarInfo("lib/f"); ti.size = len(d); lt.addfile(ti, io.BytesIO(d)); lt.close()
+add("l/layer.tar", lay.getvalue()); add("c.json", b"{}")
+add("manifest.json", json.dumps([{"Config": "c.json", "Layers": ["l/layer.tar"]}]).encode()); t.close()
+PY
+out=$(SCAN_ALLOWLIST="$al/list-ok" "$S" --archive "$al/arch.tar" 2>&1); rc=$?
+[ "$rc" = 0 ] && echo "$out" | grep -qx 'allowlisted: layer 1: /lib/f: github-token' && echo "$out" | grep -q '^total: 1 layers, 1 files, .* 0 hits, 1 allowlisted$' \
+  && ok "layer scan: the allowlist is applied to a layer's file (visible, counted)" || bad "layer allowlist rc=$rc"
+SCAN_ALLOWLIST="$al/list-d3" "$S" --archive "$al/arch.tar" >/dev/null 2>&1; [ $? = 0 ] && ok "layer scan: matching triple (the same bytes)" || bad "layer allowlist2"
+printf '/lib/f %s github-token wrong hash\n' "$(printf 'a%.0s' $(seq 64))" > "$al/list-wrong"
+SCAN_ALLOWLIST="$al/list-wrong" "$S" --archive "$al/arch.tar" >/dev/null 2>&1; [ $? = 1 ] && ok "layer scan: an allowlist entry with another sha256 fails" || bad "layer allowlist wrong sha"
+out=$(SCAN_TRIPLES=1 SCAN_ALLOWLIST="$al/list-wrong" "$S" --archive "$al/arch.tar" 2>&1)
+echo "$out" | grep -q "^TRIPLE.*/lib/f $h1 github-token$" && ! echo "$out" | grep -q "$ltok" && ok "SCAN_TRIPLES=1 prints the triple of a hit, never the value" || bad "triple output"
+
+# 3h. publish-image.sh: scan, then publish BY DIGEST, or publish nothing (stub crane/skopeo on a private dir; docker-free)
+pb="$tmp/pub"; mkdir -p "$pb/bin"; PUB="$here/worker/publish-image.sh"
+D1="sha256:$(printf '1%.0s' $(seq 64))"; D2="sha256:$(printf '2%.0s' $(seq 64))"
+cat > "$pb/bin/crane" <<'S'
+#!/usr/bin/env bash
+echo "crane $*" >> "$STUB_LOG"
+case $1 in
+  manifest) if [ "$STUB_INDEX" = 1 ]; then echo '{"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{}]}'; else echo '{"mediaType":"application/vnd.oci.image.manifest.v1+json","layers":[]}'; fi ;;
+  digest) n=$(cat "$STUB_STATE/n" 2>/dev/null || echo 0); echo $((n+1)) > "$STUB_STATE/n"
+          [ "$STUB_FAIL" = digest ] && exit 1
+          if [ "$STUB_MOVE" = 1 ] && [ "$n" -ge 1 ]; then echo "$STUB_D2"; else echo "$STUB_D1"; fi ;;
+  pull) [ "$STUB_FAIL" = pull ] && exit 1; for a; do dir=$a; done; mkdir -p "$dir"; tar -xf "$STUB_ARCHIVE" -C "$dir" ;;
+  copy) [ "$STUB_FAIL" = copy ] && exit 1; exit 0 ;;
+esac
+S
+cat > "$pb/bin/skopeo" <<'S'
+#!/usr/bin/env bash
+echo "skopeo $*" >> "$STUB_LOG"
+case $1 in
+  inspect) case $* in *@sha256:*) if [ "$STUB_INDEX" = 1 ]; then echo '{"manifests":[{}]}'; else echo '{"mediaType":"application/vnd.oci.image.manifest.v1+json","layers":[]}'; fi; exit 0 ;; esac
+           n=$(cat "$STUB_STATE/n" 2>/dev/null || echo 0); echo $((n+1)) > "$STUB_STATE/n"
+           if [ "$STUB_MOVE" = 1 ] && [ "$n" -ge 1 ]; then printf 'manifest-two'; else printf 'manifest-one'; fi ;;
+  copy) case $* in *oci-archive:*) for a; do o=$a; done; cp "$STUB_ARCHIVE" "${o#oci-archive:}" ;;
+          *) [ "$STUB_FAIL" = copy ] && exit 1; exit 0 ;; esac ;;
+esac
+S
+chmod +x "$pb/bin/crane" "$pb/bin/skopeo"
+mdig() { printf '%s' "$1" | python3 -c 'import hashlib,sys; print("sha256:"+hashlib.sha256(sys.stdin.buffer.read()).hexdigest())'; }
+# pub <tool> <archive> [move] [fail]: runs the script; sets prc, pout, and the stub call log in $plog
+pub() {
+  plog="$pb/calls"; : > "$plog"; rm -rf "$pb/state"; mkdir -p "$pb/state"
+  pout=$(env STUB_LOG="$plog" STUB_STATE="$pb/state" STUB_ARCHIVE="$ad/$2.tar" STUB_MOVE="${3:-0}" STUB_FAIL="${4:-none}" STUB_INDEX="${5:-0}" STUB_D1="$D1" STUB_D2="$D2" \
+    "$PUB" --tool "$1" --tool-dir "$pb/bin" --staging acme-registry.example/cw/worker-candidate:abc --release acme-registry.example/cw/worker:v1 2>&1); prc=$?
+  ncopy=$(grep -cE '^(crane copy|skopeo copy .*docker://acme-registry.example/cw/worker:v1)' "$plog")
+}
+for t in crane skopeo; do
+  pub $t oci-clean
+  want=$D1; [ $t = skopeo ] && want=$(mdig manifest-one)
+  [ "$prc" = 0 ] && [ "$ncopy" = 1 ] && grep -q "worker-candidate@$want" <(grep -E 'copy .*worker:v1' "$plog") && ! grep -E 'copy .*worker:v1' "$plog" | grep -q 'candidate:abc' \
+    && echo "$pout" | grep -q 'all 3 layers scanned' && ok "publish ($t): a clean image is published once, BY the scanned digest" || bad "publish clean $t rc=$prc copies=$ncopy"
+  pub $t oci-utf16; [ "$prc" = 1 ] && [ "$ncopy" = 0 ] && ok "publish ($t): a token in a layer publishes nothing (exit 1)" || bad "publish planted $t rc=$prc copies=$ncopy"
+  pub $t oci-deleted; [ "$prc" = 1 ] && [ "$ncopy" = 0 ] && ok "publish ($t): a token deleted in a later layer publishes nothing" || bad "publish deleted $t rc=$prc copies=$ncopy"
+  pub $t oci-badlayer; [ "$prc" = 2 ] && [ "$ncopy" = 0 ] && ok "publish ($t): an unreadable layer is exit 2, nothing published" || bad "publish unreadable $t rc=$prc copies=$ncopy"
+  pub $t oci-clean 1; [ "$prc" = 3 ] && [ "$ncopy" = 0 ] && echo "$pout" | grep -q 'moved' && ok "publish ($t): the staging tag moved after the scan: refused, nothing published" || bad "publish moved $t rc=$prc copies=$ncopy"
+  pub $t oci-clean 0 none 1; [ "$prc" = 3 ] && [ "$ncopy" = 0 ] && ! grep -qE 'pull|oci-archive' "$plog" && echo "$pout" | grep -q 'not a single-image manifest' \
+    && ok "publish ($t): a multi-platform index is refused (exit 3) before any export or copy" || bad "publish index $t rc=$prc copies=$ncopy"
+  pub $t oci-clean 0 copy; [ "$prc" = 3 ] && grep -qE 'copy .*worker:v1' "$plog" && ok "publish ($t): a tool failure on the publish step is non-zero" || bad "publish copy fail $t"
+done
+for f in digest pull; do pub crane oci-clean 0 $f; [ "$prc" = 3 ] && [ "$ncopy" = 0 ] && ok "publish: a tool failure ($f) is exit 3, nothing published" || bad "publish fail $f rc=$prc"; done
+! echo "$pout $(pub crane oci-utf16; echo "$pout")" | grep -q "$ltok" && ok "publish: no value is printed" || bad "publish printed a value"
+"$PUB" --tool docker --tool-dir "$pb/bin" --staging a.example/x:y --release a.example/x:z >/dev/null 2>&1; r1=$?
+"$PUB" --tool crane --tool-dir "$pb/bin" --staging a.example/x:y --release a.example/x:y >/dev/null 2>&1; r2=$?
+"$PUB" --tool crane --tool-dir "$pb/bin" --staging 'a.example/x@sha256:1' --release a.example/x:z >/dev/null 2>&1; r3=$?
+PATH="$pb/bin:$PATH" "$PUB" --tool crane --staging a.example/x:y --release a.example/x:z >/dev/null 2>&1; r4=$?
+[ "$r1$r2$r3" = 333 ] && [ "$r4" != 0 ] && ok "publish: a tool outside the list, equal tags, a digest ref and a PATH-only tool are refused" || bad "publish arguments $r1$r2$r3 $r4"
+
 # 4. image scan, only when docker is up
-if docker info >/dev/null 2>&1; then
+if [ "${CLOUD_TEST_SKIP_DOCKER:-0}" = 1 ]; then skip docker-build-cases "CLOUD_TEST_SKIP_DOCKER=1 (needs a base-image pull from the network)"
+elif docker info >/dev/null 2>&1; then
   printf 'FROM busybox\nRUN echo "GITHUB_TOKEN=ghp_%s" > /t\n' "$(printf 'b%.0s' $(seq 36))" > "$tmp/Dockerfile"
   printf 'FROM busybox\nRUN echo hi > /t\n' > "$tmp/Dockerfile.clean"
   # a secret written in one layer and deleted in the next must still be found
@@ -387,9 +618,67 @@ if docker info >/dev/null 2>&1; then
         && ok "image with secret ($v): exit 1 and pattern named" || bad "image with secret ($v) rc=$rc"
     done
     "$here/worker/scan-secrets.sh" cw-scan-clean >/dev/null 2>&1 && ok "clean image: 0 hits" || bad "clean image"
+    out=$("$here/worker/scan-secrets.sh" cw-scan-deleted 2>&1)
+    echo "$out" | grep -q '^layer [0-9]*: /t: github-token$' && ok "image with the token deleted in a later layer: found in its own layer" || bad "deleted-token image: not found per layer"
   fi
+  # route 1 (README): a registry-free OCI export that holds the amd64 layers, scanned by --archive
+  if docker buildx build -q --platform linux/amd64 --output "type=oci,dest=$tmp/deleted-oci.tar" -f "$tmp/Dockerfile.deleted" "$tmp" >/dev/null 2>&1; then
+    out=$("$here/worker/scan-secrets.sh" --archive "$tmp/deleted-oci.tar" 2>&1); rc=$?
+    [ "$rc" = 1 ] && echo "$out" | grep -q '^layer [0-9]*: /t: github-token$' && ! echo "$out" | grep -q "ghp_" \
+      && ok "buildx OCI export (amd64): the deleted token is found per layer" || bad "buildx oci export scan rc=$rc"
+  else bad "buildx OCI export failed"; fi
   docker rmi cw-scan-baked cw-scan-deleted cw-scan-env cw-scan-clean >/dev/null 2>&1
+  # 4b. the BUILD scan: the real Dockerfile's scan and final stages (from "FROM worker AS scan") on top of a small
+  # stand-in `worker` stage, built for linux/amd64 like the remote build. The token is written now, in the context.
+  base=$(sed -n 's/^\(FROM ubuntu:[^ ]*\) AS worker$/\1/p' "$here/worker/Dockerfile")
+  tail=$(sed -n '/^FROM worker AS scan$/,$p' "$here/worker/Dockerfile")
+  bctx="$tmp/bctx"; mkdir -p "$bctx/worker"; cp "$here/worker/scan-secrets.sh" "$here/worker/scan-files.py" "$here/worker/scan-allowlist.txt" "$bctx/worker/"
+  ptok="ghp_$(printf 'f%.0s' $(seq 36))"; printf '%s\n' "$ptok" > "$bctx/plant.txt"
+  bbuild() { # <variant body for the worker stage> [scan-user]: prints the log, returns docker's status
+    { echo "$base AS worker"; echo "RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends python3 && rm -rf /var/lib/apt/lists/*"; printf '%b\n' "$1"; echo "$tail"; } > "$bctx/Dockerfile.$2"
+    [ -z "${3:-}" ] || sed -i.bak "s/^USER root$/USER $3/" "$bctx/Dockerfile.$2"
+    docker build --platform linux/amd64 --progress=plain --no-cache -t "cw-bscan-$2" -f "$bctx/Dockerfile.$2" "$bctx" 2>&1
+  }
+  grep -q '^FROM worker AS scan$' "$here/worker/Dockerfile" && [ -n "$base" ] || bad "Dockerfile stages not found for the build-scan cases"
+  out=$(bbuild 'COPY plant.txt /opt/plant.txt' planted); rc=$?
+  hits=$(echo "$out" | grep -v 'allowlisted: ' | grep -oE '[^ ]+: [a-z-]+$' | sort -u | wc -l | tr -d ' ')   # docker prints a step's output twice
+  [ "$rc" = 1 ] && [ "$hits" = 1 ] && echo "$out" | grep -q 'opt/plant.txt: github-token$' && ! echo "$out" | grep -q "$ptok" \
+    && ok "build scan: planted token fails the build (exit 1), 1 path 1 pattern, no value" || bad "build scan planted rc=$rc hits=$hits"
+  docker image inspect cw-bscan-planted >/dev/null 2>&1 && bad "build scan: an image was produced despite a hit" || ok "build scan: no image after a hit"
+  out=$(bbuild 'RUN mkdir /opt/locked && echo x > /opt/locked/f && chmod 000 /opt/locked' unreadable nobody); rc=$?
+  [ "$rc" != 0 ] && echo "$out" | grep -q 'could not read some files' \
+    && ok "build scan: an unreadable directory fails the build (never a pass)" || bad "build scan unreadable rc=$rc"
+  out=$(bbuild 'RUN echo hi > /opt/clean.txt' clean); rc=$?
+  [ "$rc" = 0 ] && ok "build scan: the clean image builds" || { bad "build scan clean rc=$rc"; echo "$out" | tail -15; }
+  docker run --rm --platform linux/amd64 --entrypoint sh cw-bscan-clean -c 'test ! -e /scan-ok && test ! -e /tmp/scan-ok && test ! -e /scan-secrets.sh && test ! -e /scan-allowlist.txt' \
+    && ok "build scan: the shipped image carries no marker and no scan files" || bad "marker or scan script in the shipped image"
+  docker rmi cw-bscan-clean >/dev/null 2>&1
 else
-  [ "${CLOUD_TEST_SKIP_DOCKER:-0}" = 1 ] && echo "skip docker not running (CLOUD_TEST_SKIP_DOCKER=1)" || bad "docker is required for the image-scan cases (set CLOUD_TEST_SKIP_DOCKER=1 to skip)"
+  [ "${CLOUD_TEST_SKIP_DOCKER:-0}" = 1 ] && skip docker-not-running "CLOUD_TEST_SKIP_DOCKER=1" || bad "docker is required for the image-scan cases (set CLOUD_TEST_SKIP_DOCKER=1 to skip)"
 fi
+# 5. the CI skip is pinned: cloud/tests/ci-skips.txt names the cases CI cannot run. The check itself is tested first.
+pins="$here/tests/ci-skips.txt"
+printf 'a\nb\n' > "$tmp/pin"
+printf 'a\nb\n' > "$tmp/s1"; printf 'a\nb\nextra\n' > "$tmp/s2"; printf 'a\n' > "$tmp/s3"
+pin_check "$tmp/pin" "$tmp/s1" && ! pin_check "$tmp/pin" "$tmp/s2" && ! pin_check "$tmp/pin" "$tmp/s3" \
+  && ! PIN_OS=Linux pin_check "$here/tests/ci-skips.txt" "$tmp/s3" && PIN_OS=Darwin pin_check "$here/tests/ci-skips.txt" <(printf 'docker-build-cases\nkubectl-manifests\n') && ! PIN_OS=Darwin pin_check "$here/tests/ci-skips.txt" <(printf 'docker-build-cases\nother\n') \
+  && ok "skip pin: exact list passes; a planted extra or a missing skip fails" || bad "skip pin check is broken"
+if [ "${CLOUD_TEST_SKIP_DOCKER:-0}" = 1 ]; then
+  pin_check "$pins" "$skiplog" && ok "skip pin: skipped cases are exactly ci-skips.txt" || bad "skipped cases differ from ci-skips.txt: $(tr '\n' ' ' < "$skiplog")"
+fi
+# 5. the parity table: the real one passes; each planted fault exits 1
+chk="$here/tests/check-parity-table"; tbl="$here/../docs/cloud-guard-parity.md"
+"$chk" "$tbl" >/dev/null 2>&1 && ok "parity table: shape ok" || bad "parity table shape"
+planted() { # name, sed expression applied to the first data row
+  sed "$2" "$tbl" > "$tmp/p.md"; "$chk" "$tmp/p.md" >/dev/null 2>&1; rc=$?
+  [ "$rc" = 1 ] && ok "parity table: $1 exits 1" || bad "parity table: $1 rc=$rc"; }
+row=$(grep -n '^| Token scope' "$tbl" | cut -d: -f1)
+planted "a blank cell" "${row}s/| covered |\$/|  |/"
+planted "a row with no status" "${row}s/| covered |\$/| done |/"
+planted "a GAP with no owner" "${row}s/| covered |\$/| GAP (item: #1) |/"
+planted "an unknown law id" "${row}s/FK-LAW-1,/FK-LAW-99,/"
+planted "'covered, mostly'" "${row}s/| covered |\$/| covered, mostly |/"
+planted "a GAP whose item is -" "${row}s/| covered |\$/| GAP (owner: x; item: -) |/"
+planted "a law id not in the list" "${row}s/FK-LAW-1,/FK-LAW-9,/"
+printf '# empty\n' > "$tmp/e.md"; "$chk" "$tmp/e.md" >/dev/null 2>&1; [ $? = 1 ] && ok "parity table: no rows exits 1" || bad "parity table: no rows"
 [ $fail = 0 ] && echo "RESULT: PASS" || { echo "RESULT: FAIL"; exit 1; }

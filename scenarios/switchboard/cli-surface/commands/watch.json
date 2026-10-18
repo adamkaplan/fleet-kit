@@ -1,0 +1,4 @@
+{
+ "command": "watch",
+ "help": "usage: fleet-switchboard watch [-h] [--workspace WORKSPACE] name positional arguments: name The headless worker's fleet name options: -h, --help show this help message and exit --workspace WORKSPACE The herdr workspace for the new tab (default: this pane's)"
+}

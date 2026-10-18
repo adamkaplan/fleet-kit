@@ -287,20 +287,94 @@ def ask_wait(ask, now):
     until = ask.get("parked_until")
     if has("parked") and isinstance(until, (int, float)) and not isinstance(until, bool) and now < until <= now + PARKED_MAX_DAYS * 86400.0:
         return "parked"
+    if ask.get("via_pr") in ("owner_pr", "cos_pr"):
+        return ask["via_pr"]   # a held pull request that serves it waits on the owner (tier human) or on the Chief of Staff (tier cos, not yet escalated)
+    if ask.get("timed"):
+        return "time"          # a pending reminder due later names it: a time somebody set
     return None
+
+
+def held_prs(state_dir):
+    """[{repo, number, tier, since}] the open held pull requests (kind `captain`) of decisions.json, or [] when it cannot be read: the same file the pass already reads, nothing from GitHub."""
+    try:
+        listed = json.loads((Path(state_dir) / "decisions.json").read_text()).get("decisions")
+    except (OSError, ValueError, AttributeError):
+        return []
+    out = []
+    for item in (listed if isinstance(listed, list) else [])[:DECISIONS_MAX]:
+        if not isinstance(item, dict) or item.get("closed") or item.get("kind") != "captain":
+            continue
+        number, repo = item.get("number"), item.get("repo")
+        since = _epoch(item.get("since")) if isinstance(item.get("since"), str) else None
+        if isinstance(number, int) and not isinstance(number, bool) and isinstance(repo, str) and _REPO_SHAPE.match(repo) and item.get("tier") in ("human", "cos"):
+            out.append({"repo": repo, "number": number, "tier": item["tier"], "since": since})
+    return out
+
+
+PR_REFS_MAX = 10      # references kept for one pull request
+HELD_LINKS_MAX = 200  # held pull requests resolved in one pass
+
+
+def resolve_held_links(ctx, state, budget, held, now, problems):
+    """{"owner/repo#N" (lower case): {(repo, number), ...}}: for each held pull request, the issues it is linked to, from `ctx.pr_refs` (the strict references the daemon read from the CURRENT body of its notice facts:
+    its first-line `PLAN:` link and its `Closes` / `Part of` lines, never prose or a branch name) and each one's parents (the cached, budgeted parent reads the pass already makes). Rebuilt in full every pass, so a
+    reference removed from the body is gone at the next pass; the full `owner/repo` is compared, never the name alone."""
+    refs = getattr(ctx, "pr_refs", None) or {}
+    out = {}
+    for row in held[:HELD_LINKS_MAX]:
+        key = "%s#%d" % (row["repo"].lower(), row["number"])
+        found = set()
+        for ref in (refs.get(key) or [])[:PR_REFS_MAX]:
+            if not (isinstance(ref, (list, tuple)) and len(ref) == 2 and isinstance(ref[1], int) and not isinstance(ref[1], bool) and ref[1] > 0):
+                continue
+            repo = ref[0] if isinstance(ref[0], str) and _REPO_SHAPE.match(ref[0]) and "/" in ref[0] else row["repo"]
+            found.add((repo.lower(), ref[1]))
+            cur = ref[1]
+            for _ in range(PARENT_LEVELS):
+                parent, resolved = _parent_of(ctx, state, budget, repo, cur, now, problems)
+                if not resolved or not parent:
+                    break
+                found.add((repo.lower(), parent))
+                cur = parent
+        out[key] = found
+    return out
+
+
+def serving_waits(asks, held, links, reminders, names, now, stalled_hours):
+    """{(repo, number): "owner_pr" | "cos_pr" | "time"} for the asks waiting on a held pull request that serves them (tier human: the owner's wait; tier cos: the Chief of Staff's wait, only while the row is younger than
+    `stalled_hours`) or on a pending reminder due later that names them and is for `names` (the orchestrator or a worker of it). Owner beats cos beats time."""
+    out = {}
+    for ask in asks:
+        best = None
+        for row in held:
+            link = links.get("%s#%d" % (row["repo"].lower(), row["number"]))
+            if not link or (str(ask["repo"]).lower(), ask["number"]) not in {tuple(x) for x in link}:   # the full owner/repo and the number: the name of a repository alone is never enough
+                continue
+            if row["tier"] == "human":
+                best = "owner_pr"
+                break
+            if row["since"] is not None and now - row["since"] < stalled_hours * 3600:
+                best = "cos_pr"
+        if best is None and any(r.get("issue") == ask["number"] and not isinstance(r.get("issue"), bool) and r.get("to") in names
+                                and isinstance(r.get("at"), (int, float)) and r["at"] > now and (not r.get("repo") or str(r["repo"]).lower() == str(ask["repo"]).lower()) for r in reminders):
+            best = "time"
+        if best:
+            out[(ask["repo"], ask["number"])] = best
+    return out
 
 
 def figures(name, info, rows, now, cfg):
     """One orchestrator's figures. `info`: asks [{repo, number, first_seen}] or None (unreadable), busy, idle, messages, decisions."""
     out = {"name": name, "busy": info["busy"], "idle": info["idle"], "messages": info["messages"], "decisions": info["decisions"],
            "open_asks": None, "active_asks": None, "stalled": None, "stalled_asks": [], "oldest_stall_hours": None, "moved_1h": None, "moved_backlog": None,
-           "waiting_owner": None, "waiting_cos": None, "waiting_live": None, "parked": None, "charter_moves_1h": None}
+           "waiting_owner": None, "waiting_cos": None, "waiting_live": None, "parked": None, "charter_moves_1h": None,
+           "waiting_owner_pr": None, "waiting_time": None}
     asks = info.get("asks")
     if asks is None:
         return out
     last = last_moves(asks, rows)
     out["open_asks"] = len(asks)
-    ages, stalled, waits = [], [], {"owner": 0, "cos": 0, "live": 0, "parked": 0}
+    ages, stalled, waits = [], [], {"owner": 0, "cos": 0, "live": 0, "parked": 0, "owner_pr": 0, "cos_pr": 0, "time": 0}
     for ask in asks:
         wait = ask_wait(ask, now)
         if wait:
@@ -312,7 +386,8 @@ def figures(name, info, rows, now, cfg):
         if now - at >= cfg["stalled_hours"] * 3600:
             stalled.append(ask["number"])
     out["stalled"], out["stalled_asks"] = len(stalled), sorted(stalled)
-    out["waiting_owner"], out["waiting_cos"], out["waiting_live"], out["parked"] = waits["owner"], waits["cos"], waits["live"], waits["parked"]
+    out["waiting_owner"], out["waiting_cos"], out["waiting_live"], out["parked"] = waits["owner"] + waits["owner_pr"], waits["cos"] + waits["cos_pr"], waits["live"], waits["parked"]
+    out["waiting_owner_pr"], out["waiting_time"] = waits["owner_pr"], waits["time"]
     out["active_asks"] = len(asks) - sum(waits.values())
     out["oldest_stall_hours"] = round(max(ages) / 3600.0, 1) if ages else 0.0
     moved = lambda hours: sum(1 for ask in asks if last[(ask["repo"], ask["number"])] is not None and now - last[(ask["repo"], ask["number"])] < hours * 3600)
@@ -343,6 +418,10 @@ def crossing(fig, cfg):
     return severity, reasons
 
 
+def waiting_phrase(fig):
+    return "waiting on the owner: %d (via a held PR), on a set time: %d" % (fig.get("waiting_owner_pr") or 0, fig.get("waiting_time") or 0)
+
+
 def wake_text(fig, reasons, cfg):
     asks = ", ".join("#%d" % n for n in fig["stalled_asks"][:5])
     name = re.sub(r"[\x00-\x1f\x7f]+|\s+", " ", str(fig["name"]))[:60]
@@ -357,6 +436,8 @@ def wake_text(fig, reasons, cfg):
         actions.append("split a lane or add coders: all coders are busy and an ask is stalled (%s)" % (asks or "named above"))
     if "outnumbered" in reasons:
         actions.append("split a lane or add coders: all coders are busy, open asks are at least twice those moved in %g h and none moved in the last hour" % cfg["backlog_hours"])
+    if fig.get("waiting_owner_pr") or fig.get("waiting_time"):
+        text += " Not stalled, waiting: %s." % waiting_phrase(fig)
     return text + " Recommended: " + "; or ".join(actions) + "."
 
 
@@ -434,6 +515,14 @@ def charter_agent(body):
     """The agent a charter issue names: the `orchestrator: <name>` line of its yaml block, or None."""
     found = re.search(r"^orchestrator:[ \t]*([A-Za-z0-9][A-Za-z0-9._-]*)[ \t]*(?:#[^\r\n]*)?\r?$", body if isinstance(body, str) else "", re.M)   # a trailing comment and a CRLF line end are fine
     return found.group(1) if found else None
+
+
+def charter_retired(body):
+    """True only when a charter's yaml says `status: retired`: a body that cannot be read, or says anything else, is not a retired signal."""
+    body = body if isinstance(body, str) else ""
+    fenced = re.match(r"\s*```ya?ml[ \t]*\r?\n(.*?)^```", body, re.S | re.M)   # a charter opens with its yaml block: a line in a quote or later fence is not its status
+    body = fenced.group(1) if fenced else body
+    return bool(re.search(r"^status:[ \t]*retired[ \t]*(?:#[^\r\n]*)?\r?$", body if isinstance(body, str) else "", re.M))
 
 
 class _Budget:
@@ -519,12 +608,16 @@ def _resolve_charters(ctx, state, now, budget):
             problems.append(text)
             cache[repo] = dict(entry, tried=now, error=text)
             continue
-        named = {}
+        named, dead = {}, set()
         for number, body in found:
             agent = charter_agent(body)
             if agent:
                 named[number] = agent
-        cache[repo] = {"at": now, "map": {a: n for n, a in sorted(named.items(), reverse=True)}, "named": {str(n): a for n, a in named.items()}}   # the lowest number wins a duplicate
+                if charter_retired(body):
+                    dead.add(number)
+        chosen = {a: n for n, a in sorted(named.items(), reverse=True)}   # the charter the agent is known by (the lowest number)
+        gone = {a for a in chosen if all(n in dead for n, who in named.items() if who == a)}   # retired only when EVERY open charter naming it says so: a live one left open (a relaunch) keeps it
+        cache[repo] = {"at": now, "map": chosen, "named": {str(n): a for n, a in named.items()}, "retired": sorted(gone)}   # the lowest number wins a duplicate
     for name, info in ctx.orchestrators.items():
         entry = cache.get(info.get("repo")) or {}
         mapped, fallback = (entry.get("map") or {}).get(name), info.get("charter")
@@ -650,6 +743,7 @@ def _refresh_asks(ctx, state, now, rows=()):
     charters, more = _resolve_charters(ctx, state, now, budget)
     problems.extend(more)
     state["charter_of"] = {n: c for n, c in charters.items() if c is not None}
+    state["charter_retired"] = sorted({a for e in (state.get("charters") or {}).values() if isinstance(e, dict) for a in e.get("retired") or []})   # only a read charter that says retired
     for name in sorted(ctx.orchestrators, key=lambda n: cache.get(n, {}).get("at", 0)):
         info = dict(ctx.orchestrators[name], charter=charters.get(name))
         entry = cache.get(name) or {}
@@ -680,6 +774,8 @@ def _refresh_asks(ctx, state, now, rows=()):
     state["unattributed"] = unattributed
     counts, nobody, notices = attribute_decisions(ctx, state, budget, asks_by_name, charter_numbers, now, problems)
     state["decision_counts"], state["decisions_unattributed"], state["pr_notices"] = counts, nobody, notices
+    held = held_prs(ctx.state_dir)
+    state["held_links"] = {k: sorted(v) for k, v in resolve_held_links(ctx, state, budget, held, now, problems).items()}
     state["reads"] = budget.to_state()
     return problems, rows
 
@@ -692,6 +788,7 @@ def tick(ctx):
     audited = audit_moves(ctx.state_dir, now - 24 * 3600)
     rows += audited or []
     problems, rows = _refresh_asks(ctx, state, now, rows)
+    held, reminders = held_prs(ctx.state_dir), list(getattr(ctx, "reminders", None) or [])
     if audited is None:
         problems.append("movement: the audit log cannot be read")
     waiting = state.get("decision_counts")
@@ -701,6 +798,8 @@ def tick(ctx):
     series, sent, episodes, latest = state.get("series", {}), [], state.get("episodes", {}), {}
     unchartered = []
     for name in sorted(ctx.orchestrators):
+        if name in (state.get("charter_retired") or []):
+            continue   # its charter says retired: no figures and no row
         info, entry = ctx.orchestrators[name], (state.get("asks") or {}).get(name)
         asks = None
         if entry and now - entry.get("at", 0) < ASKS_STALE_SECONDS:
@@ -709,6 +808,11 @@ def tick(ctx):
             problems.append("%s: no recent list of its open asks" % name) if (name + ": ") not in " ".join(problems) else None
         else:
             unchartered.append(name)
+        if asks:
+            names = {name} | set(info.get("workers") or [])
+            serving = serving_waits(asks, held, state.get("held_links") or {}, reminders, names, now, ctx.cfg["stalled_hours"])
+            asks = [dict(a, via_pr=serving[(a["repo"], a["number"])]) if serving.get((a["repo"], a["number"])) in ("owner_pr", "cos_pr")
+                    else dict(a, timed=True) if serving.get((a["repo"], a["number"])) == "time" else a for a in asks]
         fig = figures(name, {"asks": asks, "busy": info["busy"], "idle": info["idle"], "messages": info["messages"],
                              "decisions": None if waiting is None else waiting.get(name, 0),
                              "charter": (state.get("charter_of") or {}).get(name), "repo": info.get("repo")}, rows, now, ctx.cfg)
@@ -720,7 +824,7 @@ def tick(ctx):
             for gone in sorted(history)[:-HISTORY_DAYS]:
                 del history[gone]
         mine = old if isinstance(old, dict) and old.get("day") == day else {"day": day, "hours": {}}
-        mine["hours"][hour] = {k: fig[k] for k in ("open_asks", "active_asks", "waiting_owner", "waiting_cos", "waiting_live", "parked", "stalled", "stalled_asks", "moved_1h", "moved_backlog", "charter_moves_1h", "busy", "idle", "messages", "decisions", "oldest_stall_hours")}
+        mine["hours"][hour] = {k: fig[k] for k in ("open_asks", "active_asks", "waiting_owner", "waiting_owner_pr", "waiting_time", "waiting_cos", "waiting_live", "parked", "stalled", "stalled_asks", "moved_1h", "moved_backlog", "charter_moves_1h", "busy", "idle", "messages", "decisions", "oldest_stall_hours")}
         series[name] = mine
         before = episodes.get(name)
         text, episodes[name] = judge(fig, ctx.cfg, before)
@@ -753,6 +857,8 @@ def status_lines(state_dir, now):
         out.append("  %-12s asks %s, stalled %s, waiting on owner %s, parked %s, waiting on cos %s, waiting live %s, oldest stall %s h, moved 1h %s, charter moves 1h %s; waiting %d msg %s dec; coders %d busy %d idle" % (
             name, num(f["open_asks"]), num(f["stalled"]), num(f.get("waiting_owner")), num(f.get("parked")), num(f.get("waiting_cos")), num(f.get("waiting_live")),
             num(f["oldest_stall_hours"]), num(f["moved_1h"]), num(f.get("charter_moves_1h")), f["messages"], num(f["decisions"]), f["busy"], f["idle"]))
+        if f.get("waiting_owner_pr") or f.get("waiting_time"):
+            out[-1] += "; " + waiting_phrase(f)
     if state.get("decisions_unattributed"):
         out.append("  %d decision(s) not attributed (the parent of their issue could not be read, or no orchestrator's charter is on its chain)" % state["decisions_unattributed"])
     if state.get("pr_notices"):

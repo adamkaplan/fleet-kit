@@ -1,0 +1,55 @@
+# Accounts for the cloud-worker launcher, namespaced to the workers namespace (the one the egress policy uses).
+# cw-operator is the launcher's account: it can manage pods, their logs, exec and port-forward, and the per-pod
+# secrets, and nothing else. cw-worker is the pod's own account: no role, and its token is never mounted.
+# Nothing here is cluster-wide and no rule uses a wildcard. Administrator access is for deploys only.
+# The boundary for secrets is the namespace: it must hold only worker pods and their per-pod secrets (a role cannot
+# limit list by label), so get/list on secrets and exec reach nothing else. Token lifetime and rotation are the deployment's.
+# The namespace and the egress policy live in the deployment repository, not here.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cw-operator
+  namespace: cw
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cw-worker
+  namespace: cw
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cw-operator
+  namespace: cw
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["pods/portforward"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "create", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cw-operator
+  namespace: cw
+subjects:
+  - kind: ServiceAccount
+    name: cw-operator
+    namespace: cw
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cw-operator

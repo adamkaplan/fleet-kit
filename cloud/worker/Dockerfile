@@ -3,7 +3,7 @@
 # built in: the launcher supplies every credential at start (see cloud/README.md).
 # Base pinned by the index digest of ubuntu:24.04 (read from the registry); bump both together.
 # apt packages below are deliberately unversioned: they follow the base's security updates.
-FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
+FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55 AS worker
 ARG OPENCODE_VERSION=2.0.28
 ARG OPENCODE_SHA256=15cc878cfc7462fe477238538df27ae3fbd03c1ea7631615cacf0977f5b629c6
 ENV DEBIAN_FRONTEND=noninteractive
@@ -37,11 +37,13 @@ RUN userdel -r ubuntu 2>/dev/null || true \
 
 COPY worker/start-dockerd.sh /usr/local/bin/start-dockerd
 COPY worker/entrypoint.sh /usr/local/bin/worker-entrypoint
+COPY worker/guard.sh worker/opencode-worker.json worker/agents/worker.md /usr/local/share/cw/
 COPY launcher/end_hook.py /usr/local/bin/cw-end-hook
 COPY launcher/token_mint.py /usr/local/bin/cw-token-mint
 COPY worker/activity.py /usr/local/bin/cw-worker-activity
 RUN chmod 0755 /usr/local/bin/start-dockerd /usr/local/bin/worker-entrypoint \
-      /usr/local/bin/cw-end-hook /usr/local/bin/cw-token-mint /usr/local/bin/cw-worker-activity
+      /usr/local/bin/cw-end-hook /usr/local/bin/cw-token-mint /usr/local/bin/cw-worker-activity \
+ && chmod 0755 /usr/local/share/cw/guard.sh && chmod 0644 /usr/local/share/cw/opencode-worker.json /usr/local/share/cw/worker.md
 
 USER worker
 WORKDIR /home/worker
@@ -49,3 +51,19 @@ EXPOSE 4096
 ENTRYPOINT ["/usr/local/bin/worker-entrypoint"]
 # The launcher sets OPENCODE_SERVER_PASSWORD at run time; it is never in the image.
 CMD ["opencode", "serve", "--hostname", "0.0.0.0", "--port", "4096"]
+
+# ---- build-time secret scan (the stages below the line "FROM worker AS scan" are reused by cloud/tests/test-cloud) ----
+# The scan runs INSIDE the (remote, linux/amd64) build, where the files can be read: `docker save` on an arm64
+# workstation cannot export an amd64-only image's layers. It reads the final filesystem of the `worker` stage as root;
+# a hit (exit 1) or a file it cannot read (exit 2) fails the build, so nothing is published. A secret written in one
+# layer and deleted in a later one is NOT visible here (the layers are already merged): no step of `worker` takes a
+# credential, and a person who adds one must not write it to disk.
+FROM worker AS scan
+USER root
+COPY worker/scan-secrets.sh worker/scan-files.py worker/scan-allowlist.txt /
+RUN /scan-secrets.sh --dir / --skip proc --skip sys --skip dev --skip scan-secrets.sh --skip scan-files.py && echo ok > /scan-ok
+
+# The shipped image is `worker` plus one empty step: the marker is only BIND-MOUNTED from `scan` (so BuildKit must
+# run the scan first) and is never copied into the image.
+FROM worker AS final
+RUN --mount=type=bind,from=scan,source=/scan-ok,target=/tmp/scan-ok true
