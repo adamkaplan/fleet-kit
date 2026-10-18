@@ -15244,6 +15244,33 @@ class TestWorkerRulesInSkills(unittest.TestCase):
             self.assertNotRegex(text, r"(?i)\b(coder\d|cos\b|fleet-upkeep|adam\b)")
 
 
+class TestIntegrationBranchVerdictText(unittest.TestCase):
+    """#776: what plan a PR into an integration branch must link, said once in the docs and once in the coordination skill."""
+    DOC = ("The ledger never uses the pull request's base branch to choose or relax a plan: a pull request, including one into an integration branch, is gated by the plan its body links with a `PLAN:` line (or `--plan`), "
+           "and `verdict --all` refuses with \"no per-PR scenario of this plan is judged by reviewer\" (naming the evaluator you passed) when the linked plan has no per-PR scenario naming that evaluator.")
+    SKILL = ("For a PR into an integration branch, link the epic's plan or a plan of its own with at least one scenario judged by `reviewer` (a scenario with no `claim` is per pull request), "
+             "or put the line `per-pr scenarios: none because <reason of at least 20 characters>` in the plan (then G1 reads n/a and there is no reviewer verdict to record).")
+
+    DRAFT = ("Some repositories' workflows skip draft pull requests (a coder lost four hours reading that as a failing CI): when a draft shows no CI runs, "
+             "look at the workflow's draft filter and mark the PR ready before waiting for CI (if there is no filter, the cause is elsewhere).")
+
+    def test_the_draft_sentence_is_present_once(self):
+        self.assertEqual((REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text().count(self.DRAFT), 1)
+
+    def test_the_doc_passage_is_present_once(self):
+        self.assertEqual((REPO / "docs" / "switchboard.md").read_text().count(self.DOC), 1)
+
+    def test_the_skill_sentence_is_present_once(self):
+        self.assertEqual((REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text().count(self.SKILL), 1)
+
+    def test_the_refusal_wording_is_the_one_the_command_prints(self):
+        self.assertIn("no per-PR scenario of this plan is judged by %s", (REPO / "bin" / "fleet-switchboard").read_text())
+
+    def test_the_texts_name_roles_never_agents_or_people(self):
+        for text in (self.DOC, self.SKILL):
+            self.assertNotRegex(text, r"(?i)\b(coder\d|cos\b|fleet-upkeep|adam\b)")
+
+
 class TestLaunchMemoryTest(unittest.TestCase):
     """#758: the launch memory test is said once in the coordination skill; no swap-used percentage rule anywhere."""
     SENTENCE = "Launch a new worker or tester only when `memory_pressure` reports a free percentage of at least 40 and the `Swapouts` counter of `vm_stat` is unchanged between two reads 30 seconds apart (swap used is sticky on macOS and is not the test); launch applies it itself; `--memory-ok <reason>` overrides."

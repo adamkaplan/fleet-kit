@@ -4386,7 +4386,7 @@ GitHub account, the hold is a **guardrail, not a boundary**: whoever can edit la
 **`verdict --all` and `gates stats`.** `fleet-switchboard verdict --all --pr <repo#N> --as reviewer|tester|ci|owner --result pass|fail --evidence TEXT` records the
 verdict for **every** per-PR scenario of the PR's plan that names that evaluator, in one command, **all or none** (one write under the ledger lock), and it **requires `--head <sha>`**, the head you judged, which must be the PR's current head (a batch is never stamped with whatever the head is now) (the same checks as a single verdict, once:
 the registered evaluator, never an author of the PR, the owner's own terminal for `owner`; it never records for another evaluator's scenarios, takes no scenario id, and
-refuses when the plan names no scenario for that role). `fleet-switchboard gates stats [--limit N] [--json]` reads the ledger and prints, for each merged gated PR
+refuses when the plan names no scenario for that role). The ledger never uses the pull request's base branch to choose or relax a plan: a pull request, including one into an integration branch, is gated by the plan its body links with a `PLAN:` line (or `--plan`), and `verdict --all` refuses with "no per-PR scenario of this plan is judged by reviewer" (naming the evaluator you passed) when the linked plan has no per-PR scenario naming that evaluator. `fleet-switchboard gates stats [--limit N] [--json]` reads the ledger and prints, for each merged gated PR
 (newest first, default 10), the evidence records by actor (the switchboard's own `ci` records are the automatic ones) and the minutes from the first gate record to the merge,
 so the steps and minutes the gates cost can be reported.
 
