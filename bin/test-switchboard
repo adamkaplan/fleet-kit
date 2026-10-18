@@ -21650,6 +21650,52 @@ class TestIdleAtASeam(ReportBase):
         self.assertEqual(len(self.seam(self.derive())), 2)
         self.assertEqual(calls, [])
 
+    def idle_worker(self, name, fleet, issue_note=None):
+        self.world.add_agent(name, fleet=fleet)
+        self.stop("all quiet", name=name)
+        self.world.tick(1)
+        self.report("working", "going on", sender=name)
+
+    def seam_for(self, name):
+        self.world.tick(1300)
+        return [f for f in self.derive() if ":seam:" in f.key and (f.recipient == name or "worker %s" % name in f.summary)]
+
+    def test_793_roles_other_than_coder_and_tester_get_none_and_tester_is_nudged(self):
+        for name, role, want in (("orch", "orchestrator", 0), ("cosx", "chief-of-staff", 0), ("revx", "reviewer-code", 0), ("tstx", "tester", 2), ("nox", None, 0), ("badx", 7, 0)):
+            with self.subTest(role=role):
+                fleet = {"reports_to": "platform", "issue": 30}
+                fleet["role"] = role
+                self.idle_worker(name, fleet)
+        self.world.tick(1300)
+        found = [f for f in self.derive() if ":seam:" in f.key]
+        for name, want in (("orch", 0), ("cosx", 0), ("revx", 0), ("tstx", 2), ("nox", 0), ("badx", 0)):
+            self.assertEqual(len([f for f in found if f.recipient == name or "worker %s," % name in f.summary]), want, name)
+
+    def test_793_a_worker_on_a_charter_gets_none_by_each_signal(self):
+        self.idle_worker("own", {"role": "coder", "reports_to": "platform", "issue": 40, "charter": 40})
+        self.idle_worker("orch2", {"role": "coder", "reports_to": "platform", "issue": 41})
+        self.idle_worker("lead", {"role": "orchestrator", "reports_to": "platform", "issue": 50, "charter": 41})
+        self.idle_worker("lab", {"role": "coder", "reports_to": "platform", "issue": 42})
+        self.world.engine.config["intent_repo"] = self.world.engine.config.get("intent_repo") or "acme/widget-service"
+        repo = self.world.engine.config["intent_repo"]
+        self.world.engine.hub = types.SimpleNamespace(closed_issue_snapshot=lambda: {})
+        self.world.tick(1300)
+        found = [f for f in self.derive() if ":seam:" in f.key]
+        self.assertEqual([f for f in found if f.recipient in ("own", "orch2", "lead") or any("worker %s," % n in f.summary for n in ("own", "orch2", "lead"))], [])
+        self.assertEqual(len([f for f in found if f.recipient == "lab"]), 1, "a work item with no charter signal is nudged")
+        self.world.engine.hub = types.SimpleNamespace(closed_issue_snapshot=lambda: {"%s#42" % sb.plan_ledger.normal_repo(repo): {"labels": ["someone:orchestrator"], "at": 1}})
+        self.assertEqual([f for f in self.derive() if ":seam:" in f.key and f.recipient == "lab"], [], "a closed charter entry")
+
+    def test_793_an_orchestrator_idle_after_working_gets_no_nudge_and_no_wake(self):
+        self.world.engine.discovery  # the fixture's agents are discovered by derive()
+        self.idle_worker("orch3", {"role": "orchestrator", "reports_to": "platform", "issue": 60, "charter": 60})
+        self.assertEqual(self.seam_for("orch3"), [])
+
+    def test_793_an_ask_is_still_nudged_and_woken(self):
+        self.idle_worker("askw", {"role": "coder", "reports_to": "platform", "issue": 70, "charter": 5})
+        got = self.seam_for("askw")
+        self.assertEqual(sorted((f.kind, f.recipient) for f in got), [("nudge", "askw"), ("worker.idle", "platform")])
+
     def test_a_worker_with_no_report_at_all_is_left_to_the_stop_triage(self):
         self.stop("all quiet")
         self.world.tick(1300)
