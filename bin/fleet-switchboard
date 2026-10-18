@@ -13315,19 +13315,23 @@ class PlanWakeState:
     """The announced hashes (kept in PLAN_WAKE_FILE so a restart never repeats one) and the facts waiting to be delivered (memory)."""
 
     def __init__(self, state_dir):
-        self.announced, self.facts, self.unapproved, self.loaded = {}, {}, [], False
+        self.announced, self.facts, self.unapproved, self.problem = {}, {}, [], None
         try:
             raw = json.loads((Path(state_dir) / PLAN_WAKE_FILE).read_text())
             if isinstance(raw, dict) and isinstance(raw.get("announced"), dict):
                 self.announced = {k: v for k, v in raw["announced"].items() if isinstance(k, str) and isinstance(v, (int, float))}
-        except (OSError, ValueError):
+        except FileNotFoundError:
             pass
+        except (OSError, ValueError) as err:
+            self.problem = "plan-wake.json cannot be read, so plans of the last 24 hours may be announced again: %s" % _one_line(type(err).__name__, 40)
 
 
 def plan_wake_state(engine):
     state = getattr(engine, "plan_wake", None)
     if state is None:
         state = engine.plan_wake = PlanWakeState(engine.state_dir)
+        if state.problem:
+            engine._note("plan_wake.error", "", {"error": state.problem})
     return state
 
 
@@ -13335,7 +13339,8 @@ def plan_wake_consensus(engine):
     """The plan hashes with a consensus pass in the local ledger; empty when it cannot be read (a plan is then judged on comments and pull requests alone)."""
     try:
         entries, _ = plan_ledger.read_ledger(engine.state_dir)
-    except Exception:
+    except Exception as err:
+        engine._note("plan_wake.error", "", {"error": "the ledger cannot be read for consensus: %s" % _one_line(type(err).__name__, 40)})
         return set()
     return {e.get("plan_hash") for e in entries if e.get("kind") == "consensus" and e.get("result") == "pass" and isinstance(e.get("plan_hash"), str)}
 
@@ -13426,8 +13431,8 @@ def plan_wake_pass(engine, state, repos, now):
     if changed:
         try:
             state_write(Path(engine.state_dir) / PLAN_WAKE_FILE, json.dumps({"announced": wake.announced}, sort_keys=True) + "\n", fsync=True)
-        except OSError:
-            pass
+        except OSError as err:
+            engine._note("plan_wake.error", "", {"error": "plan-wake.json was not saved, so a restart may announce again: %s" % _one_line(type(err).__name__, 40)})
 
 
 class PlanWakeFacts:

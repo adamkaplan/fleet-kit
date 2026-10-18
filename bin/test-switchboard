@@ -24921,6 +24921,50 @@ class TestPlanWake(Base):
         self.go()
         self.assertEqual(self.engine.plan_wake.unapproved, [])
 
+    def test_a_plan_with_no_orchestrator_is_not_recorded_and_is_announced_once_one_exists(self):
+        self.world.add_agent("late", fleet={"role": "orchestrator", "charter": 7, "repo": "acme/api"})
+        self.add(7, labels=["x:orchestrator"])
+        self.add(8, parent=7)
+        self.add(9, parent=8)
+        self.post(9, self.plan())
+        self.go(2)
+        self.assertEqual(self.to("orch"), [])
+        self.assertEqual(self.engine.plan_wake.announced, {})
+        self.engine.discover(self.world.clock.now())
+        self.go()
+        self.assertEqual(len(self.to("late")), 1)
+
+    def test_a_pass_that_raises_is_noted_and_the_triage_pass_completes(self):
+        self.post(3, self.plan())
+        original = sb.plan_wake_pass
+        sb.plan_wake_pass = lambda *a, **k: 1 / 0
+        try:
+            self.go()
+        finally:
+            sb.plan_wake_pass = original
+        self.assertIn("plan_wake.error", [e["event"] for e in self.world.audit()])
+        self.assertIsNotNone(sb.triage_summary(self.world.state))
+
+    def test_a_corrupt_file_is_an_audit_line_and_more_than_ten_unapproved_plans_are_capped(self):
+        (Path(self.world.state) / sb.PLAN_WAKE_FILE).write_text("{not json")
+        for n in range(10, 23):
+            self.add(n, parent=2)
+            self.post(n, self.plan("\nplan %d" % n), minutes_ago=40)
+        self.go()
+        self.assertIn("plan_wake.error", [e["event"] for e in self.world.audit()])
+        summary = sb.triage_summary(self.world.state)
+        self.assertEqual(len(summary["plans_unapproved"]), 10)
+        self.assertEqual(summary["plans_unapproved_more"], 3)
+        self.assertIn("(+3 more)", [l for l in sb.triage_status_lines(summary) if "no PR citing it" in l][0])
+
+    def test_an_announced_key_older_than_fourteen_days_is_forgotten(self):
+        self.post(3, self.plan())
+        self.go()
+        key = next(iter(self.engine.plan_wake.announced))
+        self.engine.plan_wake.announced[key] = self.world.clock.now() - 15 * 86400
+        self.go()
+        self.assertEqual(self.engine.plan_wake.announced, {})
+
     def pr(self, number, body, minutes_ago):
         record = tri_issue(self.world.clock.now(), number, created=0.01, body=body, pr=True)
         record["created_at"] = sb.iso(self.world.clock.now() - minutes_ago * 60)
