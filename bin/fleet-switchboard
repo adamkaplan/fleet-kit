@@ -6070,13 +6070,18 @@ def agent_tmp_root(config):
         return None
 
 
+def agent_tmp_shared_name(name):
+    """The Chief of Staff and the plan review lanes keep the shared temp directory (unchanged by #767)."""
+    return name == "cos" or (name or "").startswith(LANE_NAME_PREFIX)
+
+
 def agent_tmp_env(engine, name):
     """{FLEET_AGENT_TMPDIR: dir} for a pane: a private directory (0700) named from the agent, made now under the profile's temp root. {} when panes
     have no wrapper. A directory that cannot be made fails the launch (LaunchError): the agent is never started on the shared directory."""
     root = agent_tmp_root(engine.config)
-    if root is None or name == "cos" or (name or "").startswith(LANE_NAME_PREFIX):   # the Chief of Staff and the plan review lanes keep the shared directory (unchanged)
+    if root is None or agent_tmp_shared_name(name):
         return {}
-    if not NAME_RE.match(name or ""):
+    if not NAME_RE.fullmatch(name or ""):
         raise LaunchError("no private temp directory for %r: not a valid agent name" % (name,))
     path = root / name
     try:
@@ -6101,7 +6106,7 @@ def agent_tmp_env(engine, name):
 def reclaim_agent_tmp(engine, name):
     """At retire: the agent's private TMPDIR is removed when it is EMPTY, else kept and the reason said. Never forced, never recursive. Returns lines."""
     root = agent_tmp_root(engine.config)
-    if root is None or not NAME_RE.match(name or "") or name == "cos" or name.startswith(LANE_NAME_PREFIX):
+    if root is None or not NAME_RE.match(name or "") or agent_tmp_shared_name(name):
         return []
     path = root / name
     if not os.path.lexists(str(path)):
@@ -6111,7 +6116,7 @@ def reclaim_agent_tmp(engine, name):
             return ["%s: kept (not a plain directory)" % path]
         left = len(os.listdir(str(path)))
         if left:
-            return ["%s: kept (%d file(s) still in it; remove them by hand or leave them to the temp janitor)" % (path, left)]
+            return ["%s: kept (%d file(s) still in it; remove them by hand)" % (path, left)]
         os.rmdir(str(path))
         return ["%s: removed (empty)" % path]
     except OSError as err:
