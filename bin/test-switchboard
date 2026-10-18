@@ -31809,6 +31809,43 @@ class TestPlanCheckRules(unittest.TestCase):
         self.assertRegex(got["scenario_hash"], r"^sha256:[0-9a-f]{64}$")
         self.assertRegex(got["plan_hash"], r"^sha256:[0-9a-f]{64}$")
 
+    def warn_codes(self, text):
+        return [(w["id"], w["code"]) for w in self.check(text)["warnings"] if w["code"] == "live-no-claim"]
+
+    def test_a_live_or_tester_scenario_with_no_claim_warns_and_never_fails_or_changes_the_hash(self):
+        got = self.check()
+        self.assertEqual(got["result"], "pass")
+        self.assertEqual(self.warn_codes(GOOD_PLAN), [("S2", "live-no-claim")])
+        message = [w["message"] for w in self.check(GOOD_PLAN)["warnings"] if w["code"] == "live-no-claim"][0]
+        self.assertIn("`claim: epic`", message)
+        self.assertIn("`claim: pr`", message)
+        self.assertNotIn("is claimed by", message)
+        tester = self.edit("    proof: live\n", "    proof: measure\n")
+        self.assertEqual(self.warn_codes(tester), [("S2", "live-no-claim")], "evaluator tester alone warns")
+        live = self.edit("    evaluator: tester", "    evaluator: owner")
+        self.assertEqual(self.warn_codes(live), [("S2", "live-no-claim")], "proof live alone warns")
+        claimed = self.edit("    evaluator: tester", "    evaluator: tester\n    claim: epic")
+        self.assertEqual(self.warn_codes(claimed), [])
+        self.assertEqual(self.check(claimed)["result"], "pass")
+        self.assertEqual(self.warn_codes(self.edit("    evaluator: tester", "    evaluator: tester\n    claim: pr")), [])
+        same = self.check(GOOD_PLAN)["plan_hash"]
+        self.assertEqual(same, got["plan_hash"])
+        self.assertEqual(same, "sha256:2ad49344a1bf3ea7fc5ceeef6f60013e02fa465dc04da8a3b5b389a82b686cdb", "the hash the checker gave this plan before the warning existed")
+        self.assertEqual([w["code"] for w in got["warnings"] if w["code"] != "live-no-claim"], ["no-constraint-list"])
+
+    def test_the_template_marks_every_stub_with_a_ready_claim_line_and_a_live_one_for_live_or_tester(self):
+        lines = sb.plan_check.template(["one thing", "another"])
+        want = "    # claim: epic   # " + sb.plan_check.CLAIM_WHY
+        self.assertEqual(lines.count(want), 3, "one per stub: two clauses and the unchanged one")
+        self.assertFalse([l for l in lines if l.strip().startswith("claim:")], "a test/ci stub is never claimed epic")
+        for proof, evaluator in (("live", "tester"), ("test", "tester"), ("live", "ci")):
+            self.assertEqual(sb.plan_check.claim_lines(proof, evaluator), ["    claim: epic   # " + sb.plan_check.CLAIM_WHY])
+        self.assertEqual(sb.plan_check.claim_lines("test", "ci"), [want])
+
+    def test_the_brief_template_carries_the_plan_posted_report_line_once(self):
+        text = (REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text()
+        self.assertEqual(text.count("working: plan posted <hash> <url>"), 1)
+
     def test_clauses_are_the_numbered_parts_and_a_plain_line_is_one(self):
         c = sb.plan_check.clauses_of
         self.assertEqual(c("(1) one thing; (2) another (see (3) below)"), ["one thing", "another (see (3) below)"])
@@ -32012,7 +32049,7 @@ class TestPlanCheckRules(unittest.TestCase):
         text = GOOD_PLAN.replace("  - id: U1", extra + "  - id: U1", 1)
         got = self.check(text)
         self.assertEqual((got["result"], got["scenarios"]), ("pass", 33))
-        self.assertEqual(sorted(w["code"] for w in got["warnings"]), ["many-scenarios", "no-constraint-list"])
+        self.assertEqual(sorted(w["code"] for w in got["warnings"]), ["live-no-claim", "many-scenarios", "no-constraint-list"])
 
     def test_the_hash_ignores_whitespace_comments_quoting_order_and_defaults_but_not_content(self):
         base = self.check()["scenario_hash"]
