@@ -15115,6 +15115,27 @@ class TestWorkerRulesInSkills(unittest.TestCase):
             self.assertNotRegex(text, r"(?i)\b(coder\d|cos\b|fleet-upkeep|adam\b)")
 
 
+class TestIntegrationBranchVerdictText(unittest.TestCase):
+    """#776: what plan a PR into an integration branch must link, said once in the docs and once in the coordination skill."""
+    DOC = ("The ledger does not read the pull request's base branch at all: a pull request, including one into an integration branch, is gated by the plan its body links with a `PLAN:` line (or `--plan`), "
+           "and `verdict --all` refuses with \"no per-PR scenario of this plan is judged by reviewer\" (naming the evaluator you passed) when the linked plan has no per-PR scenario naming that evaluator.")
+    SKILL = ("For a PR into an integration branch, link the epic's plan or a plan of its own with at least one scenario judged by `reviewer` (a scenario with no `claim` is per pull request), "
+             "or put the line `per-pr scenarios: none because <reason of at least 20 characters>` in the plan (then G1 reads n/a and there is no reviewer verdict to record).")
+
+    def test_the_doc_passage_is_present_once(self):
+        self.assertEqual((REPO / "docs" / "switchboard.md").read_text().count(self.DOC), 1)
+
+    def test_the_skill_sentence_is_present_once(self):
+        self.assertEqual((REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text().count(self.SKILL), 1)
+
+    def test_the_refusal_wording_is_the_one_the_command_prints(self):
+        self.assertIn("no per-PR scenario of this plan is judged by %s", (REPO / "bin" / "fleet-switchboard").read_text())
+
+    def test_the_texts_name_roles_never_agents_or_people(self):
+        for text in (self.DOC, self.SKILL):
+            self.assertNotRegex(text, r"(?i)\b(coder\d|cos\b|fleet-upkeep|adam\b)")
+
+
 class TestPlanningSkill(unittest.TestCase):
     """skills/fleet-planning: short, installed like the other skills, and its own example passes `plan check`."""
     SKILL = REPO / "skills" / "fleet-planning" / "SKILL.md"
