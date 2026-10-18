@@ -53911,7 +53911,7 @@ class TestDaemonTempJanitor(Base):
             ticks[0] += 100.0
             return ticks[0]
         real_run = self.jan.run
-        engine, source = self.daemon({"daemon_apply": True, "weekly_scan_seconds": 150})
+        engine, source = self.daemon({"daemon_apply": True, "weekly_scan_seconds": 150, "scan_seconds": 86400})
         with mock.patch.object(self.jan, "run", lambda *a_, **k: real_run(*a_, clock=clock, **k)):
             self.go(source)
         self.assertTrue(a.exists() or b.exists(), "an entry the budget did not reach is never removed")
@@ -53955,6 +53955,11 @@ class TestDaemonTempJanitor(Base):
         self.assertEqual(len(self.events("janitor.would_remove")), 1, "a stamp that cannot be read means do not run")
         self.assertEqual(len(self.events("janitor.state_unreadable")), 1)
         self.assertTrue(victim.exists())
+        stamp.write_text(json.dumps({"at": 0}))   # a stamp that cannot be read (permission) is the same doubt
+        os.chmod(str(stamp), 0)
+        self.addCleanup(os.chmod, str(stamp), 0o600)
+        self.go(source)
+        self.assertEqual(len(self.events("janitor.would_remove")), 1)
 
     def test_s10_no_gh_and_no_network(self):
         self.old("old-file.txt")
