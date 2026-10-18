@@ -58642,7 +58642,12 @@ class TestLoadAlert(Base):
 
     def test_a_pr_with_no_row_a_closed_row_or_another_asks_link_does_not_exempt_the_ask(self):
         self.assertEqual(self.held_world("human", link=False)["stalled"], 1)  # a row and no link to the ask
-        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [{"kind": "captain", "repo": "acme/widget", "number": 50, "tier": "human", "since": "2026-10-14T10:00:00Z", "closed": True}]}))
+
+    def test_a_closed_row_does_not_exempt_the_ask(self):
+        self.assertEqual(self.held_world("human")["stalled"], 0)
+        rows = json.loads((self.state_dir / "decisions.json").read_text())
+        rows["decisions"][0]["closed"] = True
+        (self.state_dir / "decisions.json").write_text(json.dumps(rows))
         self.tick(self.T0 + 3 * 3600 + 120, {"o": dict(self.orch(idle=1, charter=1), workers=["w1"])})
         self.assertEqual(self.latest()["o"]["stalled"], 1)
 
