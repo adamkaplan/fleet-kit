@@ -13186,6 +13186,60 @@ def triage_ownerless_pass(engine, state, cfg, now):
     return shown
 
 
+def read_mark(engine, name, whole, reason, now):
+    """Record that the input `name` was (or was not) read whole in this pass: no error, not cut by a budget, not provisional.
+    The record lives in memory only, so a restart leaves every input not whole until its first whole read (#805)."""
+    reads = engine.__dict__.setdefault("read_whole", {})
+    reads[name] = {"whole": bool(whole), "reason": "" if whole else (reason or "not read whole"), "at": now}
+
+
+def whole(engine, name):
+    """(True, "") when `name` was read whole in the latest pass, else (False, why). Never read yet in this process is not whole."""
+    held = getattr(engine, "read_whole", {}).get(name)
+    if held is None:
+        return False, "not read yet in this process"
+    return held["whole"], held["reason"]
+
+
+def whole_skipped(engine, consumer, name):
+    """One debug audit line, at most once per pass and consumer, saying a destructive step was skipped because `name` was not whole."""
+    ok, why = whole(engine, name)
+    if ok:
+        return False
+    at = engine.read_whole.get(name, {}).get("at") if getattr(engine, "read_whole", None) else None
+    said = engine.__dict__.setdefault("read_whole_said", {})
+    if said.get((consumer, name)) != at:
+        said[(consumer, name)] = at
+        engine._note("whole.skipped", None, {"consumer": consumer, "input": name, "why": why})
+    return True
+
+
+def triage_mark_reads(engine, state, repos, errors, now):
+    """The inputs the triage rules judge, marked from the reads this pass already made (no new read)."""
+    read_mark(engine, "decisions", not errors, "the decision list had errors" if errors else "", now)
+    for repo in repos:
+        unit = state.units.get((repo, "issues"))
+        if unit is None:
+            read_mark(engine, "issues:" + repo, False, "not read yet", now)
+        elif unit.get("error"):
+            read_mark(engine, "issues:" + repo, False, "the last read failed: %s" % unit["error"], now)
+        elif unit.get("truncated"):
+            read_mark(engine, "issues:" + repo, False, "the list was cut", now)
+        else:
+            read_mark(engine, "issues:" + repo, True, "", now)
+
+
+def triage_owner_tier_t6(engine, decisions):
+    """{("T6", ref)} for the merge-held PR decisions already at the owner's tier."""
+    out = set()
+    for d in decisions:
+        if d.get("kind") == "captain" and d.get("tier") == "human":
+            ref = sweep_ref_of(d, engine.config.get("intent_repo"))
+            if ref and ref[0]:
+                out.add(("T6", "%s#%d" % ref))
+    return out
+
+
 def triage_pass(engine, decisions, now, errors=()):
     """The triage's whole pass: refresh a few units, judge, re-check each candidate against a fresh read, audit, count,
     and (only when enabled) queue ONE batched fact for the Chief of Staff and the daily summary. Writes nothing to GitHub."""
@@ -13207,6 +13261,7 @@ def triage_pass(engine, decisions, now, errors=()):
         plan_wake_pass(engine, state, repos, now)   # #765: the plans posted or edited, from the units just held
     except Exception as err:
         engine._note("plan_wake.error", "", {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
+    triage_mark_reads(engine, state, repos, errors, now)
     candidates, unchecked_units, truncated = triage_findings(engine, state, repos, decisions, cfg, now, errors)
     findings, unchecked, unchecked_other, oldest = [], 0, 0, 0.0
     why = {}   # #605: repo -> {reason: count}, and its other-owner share and oldest age, for the report
@@ -13289,8 +13344,9 @@ def triage_pass(engine, decisions, now, errors=()):
         state.current["plans_unapproved_more"] = max(0, len(held.unapproved) - load_triage_plan_open().MAX_LISTED)
     triage_write(engine, state)
     flagged = [(r, ref) for r, ref, _ in findings if r == "OO" and now - state.alarmed.get((r, ref), 0) >= cfg["realarm_hours"] * 3600]
+    owner_t6 = triage_owner_tier_t6(engine, decisions)
     due, invalid = triage_digest_due(engine, state, [(r, ref) for r, ref, _ in findings if r != "OO"],
-                                     [(r, ref) for r, ref, _ in candidates if r != "OO"], cfg, now)
+                                     [(r, ref) for r, ref, _ in candidates if r != "OO"], cfg, now, owner_t6)
     if cfg["enabled"] and cfg.get("backoff", True):   # #406: warm up first, then at most one digest per interval; a held digest keeps its memory untouched
         before = state.meta["swept"]
         open_units = sum(len(u) for u in unchecked_units.values()) + sum(1 for r in repos if (r, "issues") not in state.units and r not in state.unreadable)   # a list not read yet is a finding not checked
@@ -13306,7 +13362,7 @@ def triage_pass(engine, decisions, now, errors=()):
             due, invalid = [], []
     rolled = None
     if cfg["enabled"] and state.meta is not None:   # #766: the one daily line for T5 items listed before and still in the owner's tier
-        rolled = triage_digest.rollup(state.seen, state.meta, [ref for r, ref, _ in findings if r == "T5"], now)
+        rolled = triage_digest.rollup(state.seen, state.meta, [(r, ref) for r, ref, _ in findings if r == "T5" or (r, ref) in owner_t6], now)
         if rolled:
             state.facts["triage.rollup:%d" % int(now)] = (rolled, now)
             triage_digest.cost_record(engine.state_dir, now, rolled)
@@ -13346,13 +13402,23 @@ def triage_digest_memory(engine, state):
         state.meta = triage_digest.load_meta(engine.state_dir)
 
 
-def triage_digest_due(engine, state, ours, candidates, cfg, now):
+def triage_digest_keep(engine):
+    """keep(rule, ref) for the prune: True when the record's candidates could not be computed in this pass (#805)."""
+    def keep(rule, ref):
+        if rule in ("T5", "T6") and whole_skipped(engine, "triage.prune", "decisions"):
+            return True
+        repo = ref.rpartition("#")[0]
+        return bool(repo) and whole_skipped(engine, "triage.prune", "issues:" + repo)
+    return keep
+
+
+def triage_digest_due(engine, state, ours, candidates, cfg, now, owner_t6=()):
     """([(rule, ref)] for this pass's one digest, [ref] with an invalid parked label); see bin/triage_digest.py."""
     triage_digest_memory(engine, state)
-    triage_digest.prune(state.seen, candidates)
+    triage_digest.prune(state.seen, candidates, triage_digest_keep(engine))
     mutes = triage_digest.load_mutes(engine.state_dir) if engine.state_dir else {}
     return triage_digest.select(state.seen, triage_digest_items(state), mutes, ours, now, cfg.get("backoff", True), state.alarmed,
-                                cfg["realarm_hours"] * 3600, PARKED_MAX_DAYS)
+                                cfg["realarm_hours"] * 3600, PARKED_MAX_DAYS, owner_t6)
 
 
 def triage_digest_commit(engine, state, shown, invalid, now):

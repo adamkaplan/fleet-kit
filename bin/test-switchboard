@@ -25055,17 +25055,17 @@ class TestTriageT5Rollup(Base):
         d["number" if kind == "captain" else "ask"] = n
         return d
 
-    def run_pass(self, decisions, tick=1):
+    def run_pass(self, decisions, tick=1, errors=()):
         """One pass; returns (T5 refs in the digest, the roll-up lines queued)."""
         self.world.tick(tick)
         seen_before = set(getattr(self.engine, "triage", None).facts) if getattr(self.engine, "triage", None) else set()
         shown = []
         real = sb.triage_queue_fact
         def spy(state, due, *a, **k):
-            shown.extend(ref for rule, ref in due if rule == "T5")
+            shown.extend(ref for rule, ref in due if rule in ("T5", "T6"))
             return real(state, due, *a, **k)
         with mock.patch.object(sb, "triage_queue_fact", spy):
-            sb.triage_pass(self.engine, decisions, self.world.clock.now(), ())
+            sb.triage_pass(self.engine, decisions, self.world.clock.now(), errors)
         lines = [v[0] for k, v in self.engine.triage.facts.items() if k.startswith("triage.rollup") and k not in seen_before]
         return shown, lines
 
@@ -25126,16 +25126,76 @@ class TestTriageT5Rollup(Base):
         self.assertEqual(self.run_pass(ds, 3600)[0], ["acme/api#7"])
         self.assertEqual(self.run_pass(ds, 3600)[0], [])
 
-    def test_s6_t6_is_not_rolled_up_and_keeps_its_backoff(self):
-        ds = [self.decision(51, hours=72, kind="captain")]
-        listed = []
+    def seen_keys(self):
+        return sorted(self.engine.triage.seen)
+
+    def test_s6_an_owner_tier_t6_is_listed_once_then_only_in_the_roll_up_with_t5(self):
+        ds = [self.decision(51, hours=72, kind="captain"), self.decision(7)]
+        shown, _ = self.run_pass(ds)
+        self.assertEqual(sorted(shown), ["acme/api#51", "acme/api#7"])
         for _ in range(3):
-            real = sb.triage_queue_fact
-            with mock.patch.object(sb, "triage_queue_fact", lambda s, due, *a, **k: (listed.extend(due), real(s, due, *a, **k))[1]):
-                self.world.tick(1)
-                sb.triage_pass(self.engine, ds, self.world.clock.now(), ())
-        self.assertEqual(listed, [("T6", "acme/api#51")])                            # shown once, then the day's backoff
-        self.assertFalse([k for k in self.engine.triage.facts if k.startswith("triage.rollup")])
+            self.assertEqual(self.run_pass(ds, 3600)[0], [])                         # not again, backoff or no backoff
+        lines = self.run_pass(ds, self.DAY)[1]
+        self.assertEqual(lines, ["2 items waiting on the owner for more than a day: #7 #51"])
+
+    def test_s6b_a_t6_not_at_the_owners_tier_keeps_its_backoff_and_stays_out_of_the_roll_up(self):
+        ds = [self.decision(51, hours=72, kind="captain")]
+        self.run_pass(ds)
+        pair = ("T6", "acme/api#51")
+        seen = self.engine.triage.seen
+        self.assertIn("T6 acme/api#51", seen)
+        due, _ = sb.triage_digest.select(seen, {}, {}, [pair], self.now + 3 * self.DAY, True, None, 86400.0, 366, ())
+        self.assertEqual(due, [pair])                                                # not in `once`: the day's backoff lists it again
+        self.assertIsNone(sb.triage_digest.rollup(seen, {}, [], self.now + 3 * self.DAY))
+
+    def test_a_not_whole_pass_keeps_the_t5_and_t6_records_and_a_whole_pass_without_an_item_prunes_it(self):
+        ds = [self.decision(7), self.decision(51, hours=72, kind="captain")]
+        self.run_pass(ds)
+        self.assertEqual(self.seen_keys(), ["T5 acme/api#7", "T6 acme/api#51"])
+        self.run_pass([], 3600, errors=[{"source": "github", "error": "not read yet"}])
+        self.assertEqual(self.seen_keys(), ["T5 acme/api#7", "T6 acme/api#51"])      # kept: the list was not whole
+        self.assertEqual(sb.whole(self.engine, "decisions")[0], False)
+        self.assertIn("whole.skipped", [e["event"] for e in self.world.audit()])
+        self.run_pass(ds[1:], 3600)
+        self.assertEqual(self.seen_keys(), ["T6 acme/api#51"])                       # a whole pass without #7: forgotten
+        self.run_pass([], 3600)
+        self.assertEqual(self.seen_keys(), [])
+
+    def test_a_returning_item_after_a_whole_absence_is_new_once(self):
+        ds = [self.decision(51, hours=72, kind="captain")]
+        self.run_pass(ds)
+        self.run_pass([], 3600)
+        self.assertEqual(self.run_pass(ds, 3600)[0], ["acme/api#51"])
+        self.assertEqual(self.run_pass(ds, 3600)[0], [])
+
+    def test_a_restart_with_a_first_pass_that_is_not_whole_then_a_whole_pass_lists_nothing_already_listed(self):
+        ds = [self.decision(7), self.decision(51, hours=72, kind="captain")]
+        self.run_pass(ds)
+        self.engine.triage.seen = self.engine.triage.meta = None                     # a restart: memory in the engine is gone
+        self.engine.__dict__.pop("read_whole", None)
+        self.assertEqual(sb.whole(self.engine, "decisions"), (False, "not read yet in this process"))
+        self.assertEqual(self.run_pass([], 3600, errors=[{"source": "github", "error": "not read yet"}])[0], [])
+        self.assertEqual(self.run_pass(ds, 3600)[0], [])                             # nothing listed again
+        self.assertEqual(self.seen_keys(), ["T5 acme/api#7", "T6 acme/api#51"])
+
+    def test_the_records_of_a_repository_whose_issue_list_was_not_read_are_kept(self):
+        self.run_pass([self.decision(7)])
+        unit = self.engine.triage.units[("acme/api", "issues")]
+        self.engine.triage.units[("acme/api", "issues")] = dict(unit, error="rate limited")
+        self.engine.triage.seen["T5 acme/web#9"] = dict(self.engine.triage.seen["T5 acme/api#7"])
+        triage_state = self.engine.triage
+        sb.read_mark(self.engine, "decisions", True, "", self.now)
+        sb.read_mark(self.engine, "issues:acme/api", False, "the last read failed", self.now)
+        sb.read_mark(self.engine, "issues:acme/web", True, "", self.now)
+        sb.triage_digest.prune(triage_state.seen, [], sb.triage_digest_keep(self.engine))
+        self.assertEqual(sorted(triage_state.seen), ["T5 acme/api#7"])               # the unread repository's record stays; the whole-read one's departed item goes
+
+    def test_the_registry_marks_an_input_whole_only_after_a_clean_read_and_a_restart_clears_it(self):
+        self.assertEqual(sb.whole(self.engine, "decisions"), (False, "not read yet in this process"))
+        sb.read_mark(self.engine, "decisions", False, "errors", 1.0)
+        self.assertEqual(sb.whole(self.engine, "decisions"), (False, "errors"))
+        sb.read_mark(self.engine, "decisions", True, "", 2.0)
+        self.assertEqual(sb.whole(self.engine, "decisions"), (True, ""))
 
     def test_s7_the_memory_is_in_the_seen_file_of_the_state_dir(self):
         self.run_pass([self.decision(7)])
