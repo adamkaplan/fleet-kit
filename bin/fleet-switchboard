@@ -19410,6 +19410,8 @@ def cmd_item_prove(args, runner, now):
     iv = load_module("item_verdicts")
     ctx = item_context(args, runner, now, True)
     caller = identify_caller(ctx.engine.herdr, ctx.engine.v2, os.environ)
+    if not caller:
+        raise LedgerCommandError("refused: a proof names who recorded it: run this as a fleet agent")
     _plan_usable(ctx)
     pin = iv.pinned(ctx.entries, ctx.item)
     if not pin:

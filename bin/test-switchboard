@@ -64472,11 +64472,12 @@ class TestItemVerdicts(unittest.TestCase):
 
     def test_s4_nothing_configured_a_same_named_check_of_another_app_or_a_commit_off_the_branch_records_nothing(self):
         other = dict(self.RUN, app={"slug": "evil-workflow"})
-        for runs, kwargs in (([self.RUN], {"checks": False}), ([other], {}), ([self.RUN], {"on_branch": False}), ([dict(self.RUN, conclusion="failure")], {}),
-                             ([dict(self.RUN, status="in_progress", conclusion=None)], {})):
+        for runs, kwargs, reason in (([self.RUN], {"checks": False}, "no item_checks"), ([other], {}, "no run of build by github-actions"), ([self.RUN], {"on_branch": False}, "not on the default branch"),
+                                     ([dict(self.RUN, conclusion="failure")], {}, "did not succeed"), ([dict(self.RUN, status="in_progress", conclusion=None)], {}, "not complete")):
             self.setUp()
             code, why = self.ci(runs, **kwargs)
             self.assertIsNone(code, (runs, kwargs))
+            self.assertIn(reason, why)
             self.assertEqual(self.verdicts(), [], (runs, kwargs))
 
     def test_s4_mutant_matching_a_check_by_name_alone_records_the_faked_one(self):
@@ -64542,15 +64543,21 @@ class TestItemVerdicts(unittest.TestCase):
         self.register("human")                                # a tester that is also the issue's GitHub author
         self.fleets["wk"] = {"role": "coder", "repo": self.REPO, "reports_to": "orch", "launched_by": "orch", "issue": 700}   # the orchestrator's coder on ANOTHER item (the notifier)
         self.sessions["wk"] = "ses_wk"
-        refused = 0
+        reasons = {}
         for who in ("human", "c1", "wk", "nt"):
             if who in ("c1", "wk"):
                 self.register(who)
             code, why = self.verdict(who)
-            refused += code is None
-        self.assertEqual(refused, 4)
+            self.assertIsNone(code, who)
+            reasons[who] = why
+        self.assertIn("wrote or runs", reasons["human"])        # the issue's author, a launched tester
+        self.assertIn("wrote or runs", reasons["nt"])           # a launched tester in the session of the item's coder
+        self.assertIn("not a tester launched", reasons["c1"])   # the coders are no launched testers at all
+        self.assertIn("not a tester launched", reasons["wk"])
         self.assertEqual(self.verdicts(), [])
-        self.assertIn("orch", self.iv.excluded(self.ITEM, self.N, None, "human", self.entries(), self.fleets, self.sessions))
+        writers = self.iv.excluded(self.ITEM, self.N, None, "human", self.entries(), self.fleets, self.sessions)
+        self.assertTrue({"orch", "c1", "wk", "human", "nt"} <= writers)       # the exclusion itself, whatever else refuses first
+        self.assertEqual(self.iv.verdict_problem(self.ITEM, "wk", self.entries(), writers, "ses_wk", self.now(), self.PIN)[:2], "wk")
 
     def test_s8_mutant_excluding_only_the_issue_author_records_the_others(self):
         for who in ("c1", "wk"):
@@ -64599,13 +64606,15 @@ class TestItemVerdicts(unittest.TestCase):
         code, why = self.verdict("t1")
         self.assertIsNone(code)
         self.assertIn("registration expired", why)
-        self.sessions["t1"] = "ses_other"                    # a tester moved to another session
-        self.register()
+        self.register()                                      # a fresh registration for ses_t1
+        self.sessions["t1"] = "ses_other"                    # the tester now runs in another session
+        code, why = self.verdict("t1")
+        self.assertIsNone(code)
+        self.assertIn("another session", why)
         self.sessions["t1"] = "ses_t1"
-        self.assertIsNone(self.verdict("t1")[0])
-        self.sessions["t1"] = "ses_t1"
-        self.register()
-        self.assertIsNone(self.verdict("t1", retired={"t1": {"session": None}})[0])
+        code, why = self.verdict("t1", retired={"t1": {"session": None}})
+        self.assertIsNone(code)
+        self.assertIn("not a tester launched", why)
 
     def test_s18_mutant_never_expiring_records_at_25_hours(self):
         self.register()
@@ -64674,11 +64683,78 @@ class TestItemVerdicts(unittest.TestCase):
         names = {n.id for n in ast.walk(func) if isinstance(n, ast.Name)}
         self.assertFalse(names & {"KINDS", "ITEM_KINDS", "EVIDENCE_KINDS"}, "read_ledger must not judge kinds: an older build must read a ledger with item entries")
 
+    # ---- item-prove and the refusals of the registration
+    def prove(self, caller, sid="S1", item_key=None):
+        args = types.SimpleNamespace(item=item_key or self.ITEM, scenario=[sid], plan=None, ask=None, head=None, evidence="ran it", result="pass", command=None)
+        with mock.patch.object(sb, "item_context", lambda a, r, n, w: self.ctx()), mock.patch.object(sb, "identify_caller", lambda *a: caller):
+            try:
+                return sb.cmd_item_prove(args, None, self.now), None
+            except sb.LedgerCommandError as err:
+                return None, str(err)
+
+    def test_item_prove_records_at_the_reference_commit_audits_it_and_makes_its_author_an_excluded_writer(self):
+        code, why = self.prove("c1")
+        self.assertIsNone(code)
+        self.assertIn("no reference commit", why)              # nothing is registered yet
+        self.register()
+        self.assertEqual(self.prove("c1")[0], sb.EXIT_OK)
+        proofs = [e for e in self.entries() if e.get("kind") == "proof"]
+        self.assertEqual([(e["pr"], e["by"], e["head"], e["scenario"]) for e in proofs], [(self.ITEM, "c1", self.PIN, "S1")])
+        self.assertIn("plan.item.proof", [a[0] for a in self.audit])
+        self.assertEqual(self.prove("t1", sid="S2")[0], sb.EXIT_OK)      # a tester that proves becomes an author: its verdict is then refused
+        code, why = self.verdict("t1")
+        self.assertIsNone(code)
+        self.assertIn("wrote or runs", why)
+        self.assertEqual(self.prove("c1", sid="S3")[0], sb.EXIT_PARTIAL)   # an epic-claimed scenario is not claimed by an item
+        self.assertEqual(len([e for e in self.entries() if e.get("kind") == "proof"]), 2)    # c1's S1 and t1's S2; S3 recorded nothing
+
+    def register_world(self, **page_changes):
+        self.pages.update({"repos/%s/issues/777" % self.REPO: {"user": {"login": "human"}, "body": "", "state": "open", "parent_issue_url": "https://api.github.com/repos/acme-org/widget-service/issues/770"},
+                           "repos/%s/issues/770" % self.REPO: {"parent_issue_url": "https://api.github.com/repos/acme-org/widget-service/issues/587"},
+                           "repos/%s" % self.REPO: {"default_branch": "main"}, "repos/%s/commits/main" % self.REPO: {"sha": self.PIN}})
+        self.pages.update(page_changes)
+        agents = {n: types.SimpleNamespace(fleet=f) for n, f in self.fleets.items()}
+        ctx = self.ctx()
+        ctx.engine.discover = lambda now: types.SimpleNamespace(agents=agents)
+        ctx.engine.now = lambda: self.now()
+        ctx.engine.config = {}
+        return ctx.engine
+
+    def register_try(self, engine, launched_by="orch", reports_to="orch"):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            sb.register_item_tester(engine, self.state, types.SimpleNamespace(role="tester", issue=777, name="t1", reports_to=reports_to), self.REPO, launched_by,
+                                    {"session": "ses_t1"}, self.now)
+        return len(self.iv.registrations(self.entries(), self.ITEM)), [a for a in self.audit if a[0].startswith("plan.item.")]
+
+    def test_every_refusal_of_a_registration_writes_no_entry_and_audits_why(self):
+        issue = "repos/%s/issues/777" % self.REPO
+        base = {"user": {"login": "human"}, "body": "", "state": "open", "parent_issue_url": "https://api.github.com/repos/acme-org/widget-service/issues/770"}
+        cases = (("is not open", dict(self.pages, **{issue: dict(base, state="closed")}), {}),
+                 ("does not reach", {}, {"orch_charter": 999}),
+                 ("could not be read", {"repos/%s/commits/main" % self.REPO: {"sha": "xyz"}}, {}),
+                 ("not run by an orchestrator", {}, {"launched_by": "c1"}),
+                 ("report to the orchestrator", {}, {"reports_to": "c1"}))
+        for reason, changes, extra in cases:
+            self.setUp()
+            self.fleets["orch"]["charter"] = extra.get("orch_charter", 587)
+            engine = self.register_world(**({issue: dict(base, state="closed")} if reason == "is not open" else changes))
+            count, audit = self.register_try(engine, launched_by=extra.get("launched_by", "orch"), reports_to=extra.get("reports_to", "orch"))
+            self.assertEqual(count, 0, reason)
+            self.assertEqual([a[0] for a in audit], ["plan.item.refused"], reason)
+            self.assertIn(reason, audit[0][2]["why"])
+        self.setUp()                                           # a pull request number: this path does not apply, and says nothing
+        engine = self.register_world(**{issue: {"pull_request": {"url": "x"}, "user": {"login": "a"}}})
+        self.assertEqual(self.register_try(engine), (0, []))
+        self.assertTrue(self.iv.lane_ok([777, 770, 587], 587))
+        self.assertFalse(self.iv.lane_ok([777, 770], 587))
+        self.assertFalse(self.iv.lane_ok([777], None))
+
     def test_u1_the_pull_request_rules_are_untouched(self):
         import subprocess as sp
         for name in ("may_record_verdict", "scenario_state", "authors_of"):
             self.assertTrue(callable(getattr(sb.plan_ledger, name)))
-        text = Path(sb.__file__ if hasattr(sb, "__file__") else SWITCHBOARD).read_text() if False else SWITCHBOARD.read_text()
+        text = SWITCHBOARD.read_text()
         for name in ("ci_record_core", "launched_testers_for"):
             self.assertEqual(text.count("def %s(" % name), 1)
 
