@@ -4956,6 +4956,32 @@ class TestLaunch(Base):
         self.assertEqual(code, 0, err)
         return wt, out
 
+    def test_retire_reports_the_private_tmpdir_removed_or_kept_and_survives_a_failure(self):
+        root = self.home / "profile-tmp"
+        for kept in (False, True):
+            with self.subTest(kept=kept):
+                self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+                self.worker()
+                (root / "worker").mkdir(parents=True, exist_ok=True)
+                if kept:
+                    (root / "worker" / "f").write_text("x")
+                self.world.herdr.panes[self.world.panes["worker"]]["status"] = "idle"
+                os.environ.pop("HERDR_PANE_ID", None)
+                with mock.patch.object(sb, "agent_tmp_root", lambda config: root):
+                    code, out, err = self.run_cli("retire", "worker")
+                self.assertEqual(code, 0, err)
+                if kept:
+                    self.assertRegex(out, r"tmpdir: .*worker: kept \(1 file\(s\)")
+                    self.assertTrue((root / "worker" / "f").exists())
+                else:
+                    self.assertRegex(out, r"tmpdir: .*worker: removed \(empty\)")
+                    self.assertFalse((root / "worker").exists())
+                self.run_cli("retire", "--undo", "worker")
+        with mock.patch.object(sb, "reclaim_agent_tmp", side_effect=RuntimeError("boom")):
+            code, out, err = self.run_cli("retire", "worker")
+        self.assertEqual(code, 0)
+        self.assertIn("private temp directory not handled", err)
+
     def test_retire_close_keeps_a_worktree_with_an_unpushed_commit_and_says_so(self):
         wt, out = self.retire_close_with_worktree(lambda: self.add_worktree("w-unpushed-close", unpushed=True))
         self.assertTrue(wt.exists())
@@ -5877,6 +5903,16 @@ class TestLaunch(Base):
         found = self.engine.discover(self.world.clock.now()).agents["platform"]
         self.assertEqual((found.session_id, found.pane), (session, done["pane"]))
         self.assertEqual(self.world.herdr.typing_attempts, [])
+
+    def test_resume_gives_the_agent_its_private_tmpdir_and_reuses_an_existing_one(self):
+        root = self.home / "profile-tmp"
+        (root / "platform").mkdir(parents=True)
+        session = self.gone()
+        with mock.patch.object(sb, "agent_tmp_root", lambda config: root):
+            sb.resume_agent(self.engine, "platform", session, "w1", patience=5, sleep=self.sleep)
+        env = self.world.herdr.socket_calls[-1][1]["root"]["env"]
+        self.assertEqual(env["FLEET_AGENT_TMPDIR"], str(root / "platform"))
+        self.assertEqual(stat.S_IMODE(os.stat(str(root / "platform")).st_mode), 0o700)
 
     def test_resume_refuses_a_session_that_belongs_to_someone_else(self):
         other = self.world.add_agent("coder3", fleet={"role": "coder"})
