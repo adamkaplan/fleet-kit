@@ -596,6 +596,45 @@ PATH="$pb/bin:$PATH" "$PUB" --tool crane --staging a.example/x:y --release a.exa
 [ "$r1$r2$r3" = 333 ] && [ "$r4" != 0 ] && ok "publish: a tool outside the list, equal tags, a digest ref and a PATH-only tool are refused" || bad "publish arguments $r1$r2$r3 $r4"
 
 # 4. image scan, only when docker is up
+# 4a. no BuildKit-only syntax in the worker Dockerfile (the registry build, ACR Tasks, uses the legacy builder). Docker-free.
+# tests/check-dockerfile-legacy is a small parser (continuations joined, comments dropped, directives read, flags allow-listed).
+bkc="$here/tests/check-dockerfile-legacy"
+bk_suite() { # <checker>: 0 when every planted case gets the right answer
+  local c="$1" m
+  printf 'FROM a AS w\nRUN echo hi\n' > "$tmp/bk.ok"; "$c" "$tmp/bk.ok" >/dev/null 2>&1 || return 1
+  printf 'FROM a AS w\nCOPY --from=w --chown=1:1 a /b\nADD --chown=1:1 a /b\nRUN echo --mount\n' > "$tmp/bk.ok"; "$c" "$tmp/bk.ok" >/dev/null 2>&1 || return 1
+  while IFS= read -r m; do
+    printf "FROM a AS w\n$m\n" > "$tmp/bk.bad"; "$c" "$tmp/bk.bad" >/dev/null 2>&1; [ $? = 1 ] || return 1
+  done <<'BAD'
+RUN --mount=type=bind,from=scan,source=/scan-ok,target=/tmp/scan-ok true
+RUN \\\n --mount=type=cache,target=/c true
+RUN --MOUNT=type=cache,target=/c true
+RUN --network=none true
+RUN --security=insecure true
+RUN cat <<EOF
+RUN <<EOF
+COPY <<EOF /x
+ADD <<EOF /x
+COPY --link a b
+COPY --chmod=755 a b
+COPY --exclude=x a b
+COPY --parents a b
+ADD --checksum=sha256:00 http://x/y /z
+ADD --keep-git-dir=true http://x/y.git /z
+COPY --Link a b
+BAD
+  for d in '# syntax=docker/dockerfile:1' '# SYNTAX=docker/dockerfile:1' '#Syntax = x' '# check=skip=all'; do
+    printf '%s\nFROM a AS w\n' "$d" > "$tmp/bk.bad"; "$c" "$tmp/bk.bad" >/dev/null 2>&1; [ $? = 1 ] || return 1
+  done
+  return 0
+}
+bk_suite "$bkc" && ok "Dockerfile check: clean cases pass, each of 20 BuildKit-only forms fails" || bad "check-dockerfile-legacy fails its own cases"
+"$bkc" "$here/worker/Dockerfile" >/dev/null 2>&1 && ok "Dockerfile: no BuildKit-only syntax" || bad "worker/Dockerfile uses BuildKit-only syntax"
+# mutants of the checker: each must be caught by the cases above
+for mut in 's/if "<<" in ins:/if False:/' 's/if name not in ALLOWED\[op\]:/if False:/' 's/m.group(1).lower() in/m.group(1) in/'; do
+  sed "$mut" "$bkc" > "$tmp/mut.py"; chmod +x "$tmp/mut.py"; cmp -s "$bkc" "$tmp/mut.py" && bad "mutation did not apply: $mut"
+  bk_suite "$tmp/mut.py" && bad "Dockerfile check: mutant survived: $mut" || ok "Dockerfile check: mutant caught ($mut)"
+done
 if [ "${CLOUD_TEST_SKIP_DOCKER:-0}" = 1 ]; then skip docker-build-cases "CLOUD_TEST_SKIP_DOCKER=1 (needs a base-image pull from the network)"
 elif docker info >/dev/null 2>&1; then
   printf 'FROM busybox\nRUN echo "GITHUB_TOKEN=ghp_%s" > /t\n' "$(printf 'b%.0s' $(seq 36))" > "$tmp/Dockerfile"
@@ -650,8 +689,8 @@ elif docker info >/dev/null 2>&1; then
     && ok "build scan: an unreadable directory fails the build (never a pass)" || bad "build scan unreadable rc=$rc"
   out=$(bbuild 'RUN echo hi > /opt/clean.txt' clean); rc=$?
   [ "$rc" = 0 ] && ok "build scan: the clean image builds" || { bad "build scan clean rc=$rc"; echo "$out" | tail -15; }
-  docker run --rm --platform linux/amd64 --entrypoint sh cw-bscan-clean -c 'test ! -e /scan-ok && test ! -e /tmp/scan-ok && test ! -e /scan-secrets.sh && test ! -e /scan-allowlist.txt' \
-    && ok "build scan: the shipped image carries no marker and no scan files" || bad "marker or scan script in the shipped image"
+  docker run --rm --platform linux/amd64 --entrypoint sh cw-bscan-clean -c 'test "$(cat /usr/local/share/cw/scan-ok)" = ok && test ! -e /scan-ok && test ! -e /scan-secrets.sh && test ! -e /scan-allowlist.txt' \
+    && ok "build scan: the shipped image carries only the 3-byte marker and no scan files" || bad "marker missing or scan script in the shipped image"
   docker rmi cw-bscan-clean >/dev/null 2>&1
 else
   [ "${CLOUD_TEST_SKIP_DOCKER:-0}" = 1 ] && skip docker-not-running "CLOUD_TEST_SKIP_DOCKER=1" || bad "docker is required for the image-scan cases (set CLOUD_TEST_SKIP_DOCKER=1 to skip)"

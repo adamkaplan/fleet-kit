@@ -63,7 +63,10 @@ USER root
 COPY worker/scan-secrets.sh worker/scan-files.py worker/scan-allowlist.txt /
 RUN /scan-secrets.sh --dir / --skip proc --skip sys --skip dev --skip scan-secrets.sh --skip scan-files.py && echo ok > /scan-ok
 
-# The shipped image is `worker` plus one empty step: the marker is only BIND-MOUNTED from `scan` (so BuildKit must
-# run the scan first) and is never copied into the image.
+# The shipped image is `worker` plus one 3-byte marker file, /usr/local/share/cw/scan-ok ("ok"), COPIED from `scan`. It is
+# there only to make `final` depend on `scan`: the legacy builder (`az acr build`, ACR Tasks) builds stages in order and
+# has no `RUN --mount`, so a plain COPY --from is what forces the scan to run first and fail the build on a hit. The
+# marker is root-owned and world-readable (mode 0644); nothing executes or reads it. This file uses no BuildKit-only
+# syntax (no --mount, heredoc, # syntax=, --link, --exclude): cloud/tests/test-cloud fails if one appears.
 FROM worker AS final
-RUN --mount=type=bind,from=scan,source=/scan-ok,target=/tmp/scan-ok true
+COPY --from=scan /scan-ok /usr/local/share/cw/scan-ok
