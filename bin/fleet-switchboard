@@ -6596,7 +6596,7 @@ def record_last_report(state_dir, sender, state, now, text=None):
             data = _read_small(state_dir, LAST_REPORT_FILE)
             entry = {"state": state, "at": int(now)}
             if isinstance(text, str) and text:
-                entry["text"] = _one_line(text, REPORT_MAX)   # the one line, for the idle-at-a-seam wake (#773)
+                entry["text"] = _line_of(text, REPORT_MAX)   # credential-shaped text is taken out   # the one line, for the idle-at-a-seam wake (#773)
             if isinstance((data.get(sender) or {}).get("send_to"), dict):
                 entry["send_to"] = data[sender]["send_to"]   # a report does not forget the last sends
             if isinstance((data.get(sender) or {}).get("send_on"), dict):
@@ -8510,6 +8510,7 @@ class WorkerFacts:
             return []   # a closing report (or none) is the existing triage's business
         repo = _fleet_repo(observation.fleet, engine.config) or engine.config.get("intent_repo")
         hub = getattr(engine, "hub", None)
+        # Fails OPEN on purpose: the hub keeps closed events in memory only, so after a restart a closed issue can get one nudge and one wake.
         closed = hub.closed_issue_snapshot() if hub is not None and hasattr(hub, "closed_issue_snapshot") else {}
         if repo and "%s#%d" % (plan_ledger.normal_repo(repo), issue) in closed:
             return []   # its assignment is closed
@@ -8519,7 +8520,7 @@ class WorkerFacts:
                      "you went idle after reporting working on #%d: report done, blocked or question, or continue" % issue,
                      observation.idle_at, issue=issue, batch=False, sender="switchboard", repo=repo)
         wake = Fact("%s:%s" % (WORKER_IDLE, stretch), boss, WORKER_IDLE,
-                    "idle without a closing report: #%d (worker %s, last report: %s)" % (issue, observation.name, _one_line(line, 160) or "none recorded"),
+                    "idle without a closing report: #%d (worker %s, last report: %s)" % (issue, observation.name, _line_of(line, 160) or "none recorded"),
                     observation.idle_at, issue=issue, batch=False, sender=observation.name, repo=repo)
         return [nudge, wake]
 

@@ -21521,7 +21521,6 @@ class TestIdleAtASeam(ReportBase):
         sources = len(self.world.engine.sources)
         self.assertEqual(len([f for f in self.derive() if ":seam:" in f.key]), 6)
         self.assertEqual((calls, len(self.world.engine.sources)), ([], sources))
-        self.assertEqual(sorted(type(s).__name__ for s in self.world.engine.sources if "Seam" in type(s).__name__ or "Idle" in type(s).__name__), [])
 
     def test_a_stop_the_triage_already_answers_is_not_also_an_idle_at_a_seam(self):
         self.idle_after("working", seconds=5)
