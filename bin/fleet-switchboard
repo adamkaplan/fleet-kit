@@ -2880,7 +2880,8 @@ class TempJanitorFacts:
     def _last(self, state_dir):
         """(ok, time or None): a missing file is (True, None); a file that cannot be read in full is (False, None): the doubt keeps everything."""
         try:
-            text = (Path(state_dir) / TEMP_JANITOR_FILE).read_text()[:1024]
+            with open(str(Path(state_dir) / TEMP_JANITOR_FILE)) as handle:
+                text = handle.read(1024)
         except FileNotFoundError:
             return True, None
         except OSError:
@@ -2918,6 +2919,10 @@ class TempJanitorFacts:
                 os.fsync(handle.fileno())
             os.replace(str(temp), str(path))
         except OSError:
+            try:
+                os.unlink(str(temp))
+            except (OSError, UnboundLocalError):
+                pass
             return []
         self.thread = threading.Thread(target=self._run, args=(engine, runner, now), name="temp-janitor", daemon=True)
         self.thread.start()
