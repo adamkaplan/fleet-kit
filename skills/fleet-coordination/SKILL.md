@@ -44,7 +44,7 @@ bin/test-switchboard -k test_the_role_files_do_not_grow   # the role-file byte c
 bin/test-switchboard -k TestHygiene                       # shebang, stdlib-only, executable bits
 ```
 
-A DRAFT pull request runs no CI tests: mark it ready, then wait for CI.
+Some repositories' workflows skip draft pull requests (a coder lost four hours reading that as a failing CI): when a draft shows no CI runs, look at the workflow's draft filter and mark the PR ready before waiting for CI.
 
 Before marking the pull request ready, `fleet-switchboard preflight-pr` runs the CI-critical focused classes you otherwise skip (command surface, hygiene, public names, and the cloud suites when `cloud/` changed) and prints one PASS or FAIL line each.
 

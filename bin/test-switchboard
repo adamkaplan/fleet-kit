@@ -15117,12 +15117,13 @@ class TestWorkerRulesInSkills(unittest.TestCase):
 
 class TestIntegrationBranchVerdictText(unittest.TestCase):
     """#776: what plan a PR into an integration branch must link, said once in the docs and once in the coordination skill."""
-    DOC = ("The ledger does not read the pull request's base branch at all: a pull request, including one into an integration branch, is gated by the plan its body links with a `PLAN:` line (or `--plan`), "
+    DOC = ("The ledger never uses the pull request's base branch to choose or relax a plan: a pull request, including one into an integration branch, is gated by the plan its body links with a `PLAN:` line (or `--plan`), "
            "and `verdict --all` refuses with \"no per-PR scenario of this plan is judged by reviewer\" (naming the evaluator you passed) when the linked plan has no per-PR scenario naming that evaluator.")
     SKILL = ("For a PR into an integration branch, link the epic's plan or a plan of its own with at least one scenario judged by `reviewer` (a scenario with no `claim` is per pull request), "
              "or put the line `per-pr scenarios: none because <reason of at least 20 characters>` in the plan (then G1 reads n/a and there is no reviewer verdict to record).")
 
-    DRAFT = "A DRAFT pull request runs no CI tests: mark it ready, then wait for CI."
+    DRAFT = ("Some repositories' workflows skip draft pull requests (a coder lost four hours reading that as a failing CI): when a draft shows no CI runs, "
+             "look at the workflow's draft filter and mark the PR ready before waiting for CI.")
 
     def test_the_draft_sentence_is_present_once(self):
         self.assertEqual((REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text().count(self.DRAFT), 1)
