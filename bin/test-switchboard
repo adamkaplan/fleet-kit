@@ -39854,6 +39854,12 @@ class TestOrdersDelivery(OrdersDeliveryCase):
         self.run_pass()
         self.assertFalse(engine.awaiting_first_full_pass)
 
+    def test_a_pass_that_publishes_nothing_leaves_the_gate_set(self):   # #796 (a Low of the review)
+        engine = self.world.engine
+        with mock.patch.object(sb, "fault", lambda name: name == "no-decisions-file"):
+            self.run_pass()
+        self.assertTrue(engine.awaiting_first_full_pass)
+
     def test_a_restart_repeats_nothing(self):
         self.run_pass()
         self.world.engine = self.world.new_engine()
@@ -44589,6 +44595,23 @@ class TestPrNotices(DecisionsBase):
         self.world.tick(61)  # the cached ones expire; the next pass reads the skipped ones first
         self.notices()
         self.assertEqual([c[0][3] for c in runner.calls[reads:]], ["3", "4"])
+
+    def test_the_pass_counts_the_noticed_prs_it_has_no_facts_for(self):   # #796 S8
+        hang = subprocess.TimeoutExpired(["gh"], 8)
+        runner = FakeGhPr({n: hang for n in range(1, 7)})
+        slow = lambda argv, **kw: (setattr(self.world.clock, "t", self.world.clock.t + 8), runner(argv, **kw))[1]
+        self.world.engine.gh_runner = slow
+        for n in range(1, 7):
+            self.notify(number=n, at=EPOCH + n)
+        self.notices()
+        self.assertEqual(self.world.engine.notice_unread, 6)   # two were tried and failed, four were skipped by the budget: none has facts
+        self.world.engine.gh_runner = None
+        self.world.tick(61)
+
+    def test_a_pass_that_reads_every_notice_counts_none_unread(self):   # #796 S8
+        self.notify()
+        self.notices()
+        self.assertEqual(self.world.engine.notice_unread, 0)
 
     def test_resolve_and_answer_on_a_pr_notice_say_it_is_information(self):
         self.notify()
@@ -60203,6 +60226,33 @@ class TestLoadAlert(Base):
                                                                                    "since": "2026-10-14T10:00:00Z"}]}))
         self.assertEqual(self.run_ticks(engine, discovery, (0, 0.1)), [])   # inside the bound
         self.assertEqual(len(self.run_ticks(engine, discovery, (3,))), 1)   # more than 900 s of unreadable links: the alert is not silenced for ever
+
+    def held_row(self, number=50):
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [{"kind": "captain", "repo": "acme/widget", "number": number, "tier": "human",
+                                                                                   "since": "2026-10-14T10:00:00Z"}]}))
+
+    @mock.patch.object(sb, "HELD_LINKS_WAIT_SECONDS", 20 * 3600)
+    def test_noticed_prs_the_reader_could_not_read_keep_the_alert_quiet_until_a_pass_reads_them(self):   # S8
+        engine, discovery = self.first_pass_world(awaiting=False, links=True, numbers=(1, 2, 3))
+        self.parent_fails = False
+        engine.notice_unread = 2
+        self.assertEqual(self.run_ticks(engine, discovery, (0, 3, 4)), [])   # three asks look stalled; the notice reads were cut: nothing is judged
+        self.assertTrue(engine.awaiting_held_links)
+        self.assertIn("load: waiting for held PR links", self.health.status_lines(str(self.state_dir), self.T0))
+        engine.notice_unread = 0   # the next uncut pass read them all
+        self.assertEqual(len(self.run_ticks(engine, discovery, (5,))), 1)
+        self.assertFalse(engine.awaiting_held_links)
+
+    @mock.patch.object(sb, "HELD_LINKS_WAIT_SECONDS", 20 * 3600)
+    def test_a_human_tier_held_pr_with_no_read_references_keeps_the_alert_quiet(self):   # S8: the key-not-in-refs rule
+        engine, discovery = self.first_pass_world(awaiting=False, links=True, numbers=(1, 2, 3))
+        self.parent_fails = False
+        self.held_row()   # a held PR with no entry in the notice facts: its references were never read
+        self.assertEqual(self.run_ticks(engine, discovery, (0, 3, 4)), [])
+        self.assertTrue(engine.awaiting_held_links)
+        engine.notice_facts["acme/widget#50"] = {"facts": {"refs": [["acme/widget", 1]]}}
+        self.assertEqual(len(self.run_ticks(engine, discovery, (5,))), 1)
+        self.assertFalse(engine.awaiting_held_links)
 
     def stalled_world(self, count=2):
         self.asks = {1: list(range(1, count + 1))}

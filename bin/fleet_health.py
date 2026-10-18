@@ -810,6 +810,8 @@ def tick(ctx):
     problems, rows = _refresh_asks(ctx, state, now, rows)
     held, reminders = held_prs(ctx.state_dir), list(getattr(ctx, "reminders", None) or [])
     unresolved = list(getattr(ctx, "unresolved_held", None) or [])
+    if getattr(ctx, "notices_unread", 0):
+        unresolved.append("noticed PRs without facts")   # #796: a PR the notice reader skipped or could not read has no row to look at: its links are unknown
     ctx.links_complete = not unresolved
     hold_back = bool(getattr(ctx, "links_gate", False) and unresolved)   # #796: after a start, no alert while a human-tier held PR's links are not whole
     if audited is None:

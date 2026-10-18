@@ -10377,12 +10377,14 @@ def decisions_from_notices(engine, now):
     closed is not listed and is queued in engine.notice_effects for the daemon to forget; one that cannot be read
     keeps its last facts, marked stale, and is dropped (and logged) after PR_NOTICE_UNREADABLE_SECONDS."""
     engine.notice_effects = {"drop": set(), "unreadable": {}, "observed": {}, "left": set()}
+    engine.notice_unread = 0   # #796: how many noticed PRs this pass has no facts for (skipped by the time budget, or unreadable): the load alert waits while it is above 0
     state_dir = getattr(engine, "state_dir", None)
     if state_dir is None:
         return [], []
     try:
         items = read_pr_notices(state_dir)
     except NoticeError as err:
+        engine.notice_unread = 1   # the notices themselves could not be read: nothing is known about them
         return [], [str(err)]
     hold = engine.config.get("pr_notice_hold_minutes") or 0
     escalated = read_escalated(state_dir)
@@ -10400,6 +10402,8 @@ def decisions_from_notices(engine, now):
         key = "%s#%d" % (repo, number)
         held = notice_facts(engine, repo, number, now, budget)
         facts = held["facts"]
+        if held.get("skipped") or facts is None:
+            engine.notice_unread += 1
         if facts is not None and facts["state"] in ("merged", "closed"):
             engine.notice_effects["drop"].add(key)
             engine.notice_effects["left"].add(key)   # read as merged or closed: evidence for the escalation prune
@@ -26260,7 +26264,7 @@ def load_tick(engine, discovery):
     budget = SourceBudget(source_budget_seconds(engine.config, "load_alert"), engine.now)   # #494: the reads stop between calls when this pass's time is spent
     pending = []
     context = health.Context(now=now, state_dir=engine.state_dir, cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, read_charters=read_charters, read_parent=read_parent, cos=cos, wake=wake,
-                                      time_up=budget.spent, pending=pending, reminders=reminders, pr_refs=pr_refs, links_gate=links_gate, **meter)
+                                      time_up=budget.spent, pending=pending, reminders=reminders, pr_refs=pr_refs, links_gate=links_gate, notices_unread=getattr(engine, "notice_unread", 0), **meter)
     sent = health.tick(context)
     if getattr(context, "links_complete", False):
         engine.awaiting_held_links = False   # #796: one pass with every human-tier held PR's links whole: the alert may judge from now on
