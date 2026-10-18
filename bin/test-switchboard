@@ -40724,6 +40724,21 @@ class TestRequestTiers(TierWorld):
         self.pass_()
         self.assertEqual(sb.read_escalated(self.world.state), {})
 
+    def test_the_daemon_keeps_an_escalation_while_a_worker_could_not_be_read(self):
+        ask = self.block_(timed=True)
+        key = "%s:%s" % (self.world.sessions["api-coder"], ask["id"])
+        sb.mark_escalated(self.world.state, key, self.world.clock.now())
+        self.pass_()
+        self.assertEqual(sb.whole(self.world.engine, "requests"), (True, ""))
+        with mock.patch.object(sb.WorkerFacts, "blocked", side_effect=sb.V2Error("session unreadable")):
+            self.pass_()
+        self.assertEqual(sb.whole(self.world.engine, "requests")[0], False)
+        self.assertIn(key, sb.read_escalated(self.world.state))                      # kept: its worker was not read
+        self.assertIn("whole.skipped", [e["event"] for e in self.world.audit()])
+        self.world.v2.answer_permissions(self.world.sessions["api-coder"])
+        self.pass_()
+        self.assertEqual(sb.read_escalated(self.world.state), {})                    # a whole pass without the request: forgotten
+
     def test_the_audit_log_is_never_read_by_the_derivation(self):
         self.assertNotIn("audit", class_source_fn("decisions_from_requests"))
         self.assertNotIn("audit.jsonl", class_source_fn("derive_decisions"))

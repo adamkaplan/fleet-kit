@@ -8519,17 +8519,23 @@ class WorkerFacts:
         if engine is None or discovery is None or fault("no-worker-source"):
             return []
         horizon = worker_horizon(engine.config, engine.now())
-        facts = []
+        facts, skipped = [], []
         for observation in sorted(discovery.agents.values(), key=lambda o: o.name):
             boss = boss_name(discovery, observation)  # #102: the stop triage looks the boss up by its registered name
             if observation.conflict or observation.problem:
+                skipped.append(observation.name)
                 continue
             try:
                 if boss is not None:
                     facts.extend(self.finished(observation, boss, horizon))
                 facts.extend(self.blocked(observation, boss))
             except V2Error as err:  # one worker's trouble never hides the others
+                skipped.append(observation.name)
                 engine._note("source.error", "worker_facts:" + observation.name, {"error": _one_line(str(err))})
+        # #805: the pending requests are whole only when every worker was read: an unread worker's requests are absent, not gone
+        problems = list(getattr(discovery, "problems", None) or [])
+        why = "the fleet could not be read whole" if problems else ("%d worker(s) not read: %s" % (len(skipped), ", ".join(skipped[:3])) if skipped else "")
+        read_mark(engine, "requests", not problems and not skipped, why, engine.now())
         return facts
 
     def finished(self, observation, boss, horizon):
@@ -9464,6 +9470,8 @@ def prune_escalations_pass(engine, store, now):
     keep = captain_escalations_to_keep(engine)
     if keep is None or engine.request_keys is None:
         return
+    if whole_skipped(engine, "escalation.prune", "requests"):
+        return   # #805: a worker that could not be read has no requests listed, which is no evidence they are gone
     escalated = read_escalated(engine.state_dir)
     leaves = captain_escalation_leaves(engine, escalated, now)
     captains = {k for k in escalated if k.startswith("captain:")}
