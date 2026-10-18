@@ -21415,6 +21415,118 @@ class ReportBase(PR4Base):
         return self.world.engine.run_pass()
 
 
+class TestIdleAtASeam(ReportBase):
+    """#773: idle 20 minutes or more, an OPEN assignment, a last report of `working`: ONE nudge, ONE wake, once per idle stretch."""
+
+    def setUp(self):
+        super().setUp()
+        self.world.engine.state_dir = self.world.state
+
+    def seam(self, facts):
+        return sorted((f.kind, f.recipient, f.rider) for f in facts if ":seam:" in f.key)
+
+    def idle_after(self, state, seconds=1300):
+        self.stop("all quiet")
+        self.world.tick(1)
+        self.report(state, "migrating the tables")
+        self.world.tick(seconds)
+
+    def test_idle_20_minutes_after_a_working_report_nudges_the_worker_and_wakes_the_boss_once(self):
+        self.idle_after("working")
+        found = self.derive()
+        self.assertEqual(self.seam(found), [("nudge", "coder", False), ("worker.idle", "platform", False)])
+        nudge = next(f for f in found if f.kind == "nudge")
+        wake = next(f for f in found if ":seam:" in f.key and f.kind == "worker.idle")
+        self.assertEqual(nudge.summary, "you went idle after reporting working on #2: report done, blocked or question, or continue")
+        self.assertEqual(wake.summary, "idle without a closing report: #2 (worker coder, last report: migrating the tables)")
+        self.assertEqual([f.key for f in self.derive() if ":seam:" in f.key], [f.key for f in found if ":seam:" in f.key], "the same stretch has the same keys")
+
+    def test_a_worker_idle_under_20_minutes_triggers_nothing(self):
+        self.idle_after("working", seconds=sb.SEAM_IDLE_SECONDS - 60)
+        self.assertEqual(self.seam(self.derive()), [])
+        self.world.tick(120)
+        self.assertEqual(len(self.seam(self.derive())), 2, "the boundary: 20 minutes passed")
+
+    def test_the_stretch_is_delivered_once_over_many_passes(self):
+        self.idle_after("working")
+        for _ in range(3):
+            self.world.engine.run_pass()
+            self.world.tick(30)
+        keys = [k for name in ("coder", "platform") for a in self.world.admissions(name) for k in a["keys"] if ":seam:" in k]
+        self.assertEqual(len(keys), 2, keys)
+        self.assertEqual(len(set(keys)), 2)
+
+    def test_the_four_combinations_of_closing_kind_and_open_or_closed_issue(self):
+        for state in ("done", "blocked", "question", "failed", "paused"):
+            with self.subTest(state=state):
+                self.idle_after(state)
+                self.assertEqual(self.seam(self.derive()), [], "a last report that is not `working` is not this case")
+                self.setUp()
+        self.idle_after("working")
+        self.world.engine.hub = types.SimpleNamespace(closed_issue_snapshot=lambda: {"%s#2" % self.world.engine.config.get("intent_repo", "acme/widget-service"): {"labels": [], "at": 1}})
+        self.world.engine.config["intent_repo"] = self.world.engine.config.get("intent_repo") or "acme/widget-service"
+        self.assertEqual(self.seam(self.derive()), [], "a closed assignment")
+
+    def test_the_closed_issue_check_reads_no_gh(self):
+        self.idle_after("working")
+        calls = []
+        self.world.engine.gh_runner = lambda *a, **k: calls.append(a) or (_ for _ in ()).throw(AssertionError("gh called"))
+        self.assertEqual(len(self.seam(self.derive())), 2)
+        self.assertEqual(calls, [])
+
+    def test_a_worker_with_no_report_at_all_is_left_to_the_stop_triage(self):
+        self.stop("all quiet")
+        self.world.tick(1300)
+        self.assertEqual(self.seam(self.derive()), [])
+
+    def test_a_retired_worker_gets_nothing_and_another_name_does_not_silence_it(self):
+        self.idle_after("working")
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {"other": {"at": 1, "by": "x", "reason": "y", "session": None, "auto": False}})
+        self.assertEqual(len(self.seam(self.derive())), 2)
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {"coder": {"at": 1, "by": "x", "reason": "y", "session": self.world.sessions["coder"], "auto": False}})
+        self.assertEqual(self.seam(self.derive()), [])
+
+    def test_a_worker_that_resumes_and_idles_again_starts_a_new_stretch_with_its_own_clock(self):
+        self.idle_after("working")
+        first = [f.key for f in self.derive() if ":seam:" in f.key]
+        self.stop("again", lasts=5)
+        self.world.tick(60)
+        self.assertEqual(self.seam(self.derive()), [], "the new stretch is 60 seconds old")
+        self.world.tick(1300)
+        again = [f.key for f in self.derive() if ":seam:" in f.key]
+        self.assertTrue(again and not set(again) & set(first), (first, again))
+
+    def test_a_headless_worker_with_no_pane_is_treated_exactly_like_a_terminal_worker(self):
+        self.stop("all quiet")
+        self.world.tick(1)
+        self.report("working", "migrating the tables")
+        self.world.herdr.panes.pop(self.world.panes["coder"])      # no terminal: only the service record shows it
+        sb.load_agent_presence().save_record(self.world.state, "coder", self.coder, "http://127.0.0.1:49374", now=self.world.clock.now())
+        self.world.tick(1300)
+        self.world.engine.discover(self.world.clock.now())
+        self.assertTrue(self.world.engine.discovery.agents["coder"].headless)
+        self.assertEqual(self.seam(self.derive()), [("nudge", "coder", False), ("worker.idle", "platform", False)])
+
+    def test_three_idle_workers_make_no_gh_call_and_no_new_source(self):
+        for n in (2, 3):
+            self.world.add_agent("coder%d" % n, fleet={"role": "coder", "reports_to": "platform", "issue": 10 + n})
+        for name in ("coder", "coder2", "coder3"):
+            self.stop("all quiet", name=name)
+            self.world.tick(1)
+            self.report("working", "going on", sender=name)
+        self.world.tick(1300)
+        calls = []
+        self.world.engine.gh_runner = lambda *a, **k: calls.append(a) or (_ for _ in ()).throw(AssertionError("gh called"))
+        sources = len(self.world.engine.sources)
+        self.assertEqual(len([f for f in self.derive() if ":seam:" in f.key]), 6)
+        self.assertEqual((calls, len(self.world.engine.sources)), ([], sources))
+        self.assertEqual(sorted(type(s).__name__ for s in self.world.engine.sources if "Seam" in type(s).__name__ or "Idle" in type(s).__name__), [])
+
+    def test_the_last_report_line_is_kept_with_the_report(self):
+        self.report("working", "on the second step")
+        self.assertEqual(sb._read_small(self.world.state, sb.LAST_REPORT_FILE)["coder"]["text"], "on the second step")
+
+
 # ======================================================================
 # #96: a worker.stopped that would wake the Chief of Staff alone is judged: "does this tell the person anything new?"
 # ======================================================================
