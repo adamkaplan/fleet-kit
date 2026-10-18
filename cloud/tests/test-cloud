@@ -575,7 +575,7 @@ elif docker info >/dev/null 2>&1; then
   }
   grep -q '^FROM worker AS scan$' "$here/worker/Dockerfile" && [ -n "$base" ] || bad "Dockerfile stages not found for the build-scan cases"
   out=$(bbuild 'COPY plant.txt /opt/plant.txt' planted); rc=$?
-  hits=$(echo "$out" | grep -oE '[^ ]+: [a-z-]+$' | sort -u | wc -l | tr -d ' ')   # docker prints a step's output twice
+  hits=$(echo "$out" | grep -v 'allowlisted: ' | grep -oE '[^ ]+: [a-z-]+$' | sort -u | wc -l | tr -d ' ')   # docker prints a step's output twice
   [ "$rc" = 1 ] && [ "$hits" = 1 ] && echo "$out" | grep -q 'opt/plant.txt: github-token$' && ! echo "$out" | grep -q "$ptok" \
     && ok "build scan: planted token fails the build (exit 1), 1 path 1 pattern, no value" || bad "build scan planted rc=$rc hits=$hits"
   docker image inspect cw-bscan-planted >/dev/null 2>&1 && bad "build scan: an image was produced despite a hit" || ok "build scan: no image after a hit"
