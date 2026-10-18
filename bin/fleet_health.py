@@ -481,6 +481,20 @@ def _write_state(state_dir, data):
     os.replace(str(temp), str(path))
 
 
+WAITING_LINE = "load: waiting for the first full pass"
+
+
+def mark_waiting(state_dir):
+    """#796: the daemon has started and not finished its first full pass: record it for `status`, touching nothing else (figures, episodes). Never raises."""
+    try:
+        state = _read_state(state_dir)
+        if not state.get("warming"):
+            state["warming"] = True
+            _write_state(state_dir, state)
+    except OSError:
+        pass
+
+
 PR_KINDS = ("notice", "captain")   # the entries of decisions.json that are information about a pull request, not a wait
 DECISIONS_MAX = 1000             # entries of decisions.json looked at in one pass (the rest are ignored)
 _REPO_SHAPE = re.compile(r"[A-Za-z0-9_.-]{1,100}(/[A-Za-z0-9_.-]{1,100})?\Z")
@@ -836,6 +850,7 @@ def tick(ctx):
     if unchartered:   # no charter issue is recorded in its fleet metadata: its asks cannot be found, said once for all of them
         problems.append("no charter recorded for %s" % ", ".join(unchartered[:6]) + (" and %d more" % (len(unchartered) - 6) if len(unchartered) > 6 else ""))
     state.pop("at", None)
+    state.pop("warming", None)
     state.update({"series": {n: series[n] for n in latest}, "episodes": {n: episodes.get(n) for n in latest},
                   "latest": latest, "problems": problems, "alert": bool(ctx.cfg["enabled"])})
     if state != before_state:   # an idle pass rewrites nothing
@@ -848,10 +863,11 @@ def status_lines(state_dir, now):
     """The `status` lines: one per orchestrator, then what could not be read. Empty until the daemon has made a pass."""
     state = _read_state(state_dir)
     latest = state.get("latest")
+    waiting = [WAITING_LINE] if state.get("warming") is True else []
     if not isinstance(latest, dict) or not latest:
-        return []
+        return waiting
     num = lambda value: "not recorded" if value is None else str(value)
-    out = ["load        %d orchestrator(s); alert %s" % (len(latest), "on" if state.get("alert") else "off")]
+    out = waiting + ["load        %d orchestrator(s); alert %s" % (len(latest), "on" if state.get("alert") else "off")]
     for name in sorted(latest):
         f = latest[name]
         out.append("  %-12s asks %s, stalled %s, waiting on owner %s, parked %s, waiting on cos %s, waiting live %s, oldest stall %s h, moved 1h %s, charter moves 1h %s; waiting %d msg %s dec; coders %d busy %d idle" % (

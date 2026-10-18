@@ -4222,6 +4222,7 @@ class Switchboard:
         self.gh_runner = None           # PR notices: the runner for `gh pr view` (None: subprocess.run)
         self.stopped_news_errors = set()  # reasons already audited: one line per distinct failure
         self.stopped_news = {}          # #96: worker.stopped key -> judged clearly no news (decided once per note)
+        self.awaiting_first_full_pass = True   # #796: set False once a pass has published a non-provisional decisions file; the load tick judges nothing before
         self.notice_facts = {}          # PR notices: "owner/repo#N" -> {at, facts, stale, error}; memory only
         self.notice_effects = {"drop": set(), "unreadable": {}}  # what the last derivation asks the daemon to record
         self.synthetic_cache = {}       # PR 14: session -> (newest synthetic id, since, lines), a cache for the decisions
@@ -11384,7 +11385,9 @@ def publish_decisions(engine):
         pass  # a disposable file: a failed prune is tried again next pass
     errors = errors + sync_external(engine, decisions, errors, now)  # [] unless external_decisions is enabled
     work_sync_external(engine, now)  # nothing unless external_decisions.work_items is on
-    return store.publish(decisions, errors, now)
+    published = store.publish(decisions, errors, now)
+    engine.awaiting_first_full_pass = False   # #796: a full, non-provisional list is out; the load tick may judge from the next one
+    return published
 
 
 def decisions_report(state_dir, now):
@@ -26173,6 +26176,9 @@ def load_tick(engine, discovery):
     """The end of a pass: the load figures per orchestrator, and the alert to the Chief of Staff when a threshold is crossed. Reads no v2 and
     makes at most a bounded number of GitHub reads an hour; a source it cannot read means no wake. Returns what was sent."""
     if discovery is None or engine.state_dir is None:
+        return []
+    if getattr(engine, "awaiting_first_full_pass", False):   # #796: the held-PR links come from the first full decisions pass; judging before it reads waiting-on-owner as 0
+        load_fleet_health().mark_waiting(engine.state_dir)   # status says so; the figures, the episodes and the alert are left exactly as they were
         return []
     health, now = load_fleet_health(), engine.now()
     cfg = engine.config.get("load_alert") or dict(health.DEFAULTS)

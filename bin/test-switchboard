@@ -60121,6 +60121,56 @@ class TestLoadAlert(Base):
         report["load"] = []
         return report
 
+    # ---- #796: no alert before the first full pass after a start
+    def first_pass_world(self, awaiting=True, held=False):
+        """An engine as the daemon makes it at a start (`awaiting_first_full_pass`), one orchestrator with two asks nobody moves; `self.clock` is its time."""
+        self.clock = [self.T0]
+        issues = [types.SimpleNamespace(repo="acme/widget", number=n, labels=(), parked_until=None) for n in (1, 2)]
+        intents = types.SimpleNamespace(repo="acme/widget", open_asks=lambda charter, repo: issues, _api=lambda path, repo: [])
+        facts = {"acme/widget#50": {"facts": {"refs": [["acme/widget", 1]]}}} if held else {}
+        engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.clock[0], audit=None, actor="daemon", intents=intents, notice_facts=facts,
+                                       awaiting_first_full_pass=awaiting, config={"load_alert": self.health.validate({"enabled": True}, "x")})
+        agents = {"o": types.SimpleNamespace(name="o", session_id="s", status="idle", fleet={"role": "orchestrator", "charter": 1, "repo": "acme/widget"}),
+                  "cos": types.SimpleNamespace(name="cos", session_id="c", status="idle", fleet={"role": "chief-of-staff"})}
+        return engine, types.SimpleNamespace(agents=agents)
+
+    def run_ticks(self, engine, discovery, hours):
+        for hour in hours:
+            self.clock[0] = self.T0 + hour * 3600
+            sb.load_tick(engine, discovery)
+        return [r for r in sb.read_reminders(str(self.state_dir)) if "overloaded" in str(r.get("text"))]
+
+    def test_a_fresh_start_raises_no_alert_and_says_it_is_waiting(self):   # S1 S2
+        engine, discovery = self.first_pass_world()
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [], "provisional": True}))
+        self.assertEqual(self.run_ticks(engine, discovery, (0, 3, 4)), [])
+        self.assertIn("load: waiting for the first full pass", self.health.status_lines(str(self.state_dir), self.T0))
+
+    def test_after_the_first_full_pass_the_same_stalled_state_alerts_once(self):   # S3
+        engine, discovery = self.first_pass_world()
+        self.run_ticks(engine, discovery, (0, 3))
+        engine.awaiting_first_full_pass = False
+        self.assertEqual(len(self.run_ticks(engine, discovery, (4, 7))), 1)
+        self.assertNotIn("load: waiting for the first full pass", self.health.status_lines(str(self.state_dir), self.T0))
+
+    def test_a_restart_does_not_re_arm_the_alert(self):   # S4
+        engine, discovery = self.first_pass_world(awaiting=False)
+        self.assertEqual(len(self.run_ticks(engine, discovery, (0, 3))), 1)
+        engine, discovery = self.first_pass_world()   # restart: a new engine, the same state directory
+        self.clock[0] = self.T0 + 3 * 3600
+        self.assertEqual(len(self.run_ticks(engine, discovery, (4, 5))), 1)
+        engine.awaiting_first_full_pass = False
+        self.assertEqual(len(self.run_ticks(engine, discovery, (6, 7))), 1)
+
+    def test_a_held_pr_that_appears_in_the_first_full_pass_is_counted_before_any_alert(self):   # S5
+        engine, discovery = self.first_pass_world(held=True)
+        self.assertEqual(self.run_ticks(engine, discovery, (0, 3)), [])
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [{"kind": "captain", "repo": "acme/widget", "number": 50, "tier": "human",
+                                                                                   "since": "2026-10-14T10:00:00Z"}]}))
+        engine.awaiting_first_full_pass = False
+        self.assertEqual(self.run_ticks(engine, discovery, (3.1, 3.2)), [])
+        self.assertEqual(self.latest()["o"]["waiting_owner_pr"], 1)
+
     def stalled_world(self, count=2):
         self.asks = {1: list(range(1, count + 1))}
         self.tick(self.T0, {"o": self.orch(idle=1, charter=1)})
