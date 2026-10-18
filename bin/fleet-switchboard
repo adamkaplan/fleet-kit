@@ -13412,7 +13412,7 @@ def plan_wake_pass(engine, state, repos, now):
     if discovery is None or discovery.problems:
         return
     chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff")
-    consensus, listed, changed = None, [], False
+    consensus, sends, listed, changed = None, None, [], False
     for repo in repos:
         issues_unit, comments_unit = state.units.get((repo, "issues")), state.units.get((repo, "comments"))
         if issues_unit is None or comments_unit is None:
@@ -13445,6 +13445,10 @@ def plan_wake_pass(engine, state, repos, now):
                 consensus = plan_wake_consensus(engine)
             if (plan_hash in consensus or module.approved_by_comment(plan, plan_hash, by_issue.get(number, []), signed_by_fleet)
                     or module.cited_by_pr(repo, number, plan, pulls, parse_iso)):
+                continue
+            if sends is None:
+                sends = _audit_tail(engine.state_dir)   # #790: the sends the audit already holds, read once per pass and only for a plan no other form approved
+            if module.approved_by_send(plan, plan_hash, sends, signed_by_fleet):
                 continue
             url = module.plan_url(repo, number, plan["id"])
             key = "%s#%d:%s" % (repo, number, plan_hash)

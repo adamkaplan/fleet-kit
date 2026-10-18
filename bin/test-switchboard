@@ -25258,6 +25258,80 @@ class TestPlanWake(Base):
         self.assertEqual(summary["plans_unapproved_more"], 3)
         self.assertIn("(+3 more)", [l for l in sb.triage_status_lines(summary) if "no PR citing it" in l][0])
 
+    # ---- #790: an approval sent as a message is a fourth approval form, read from the audit's recorded sends
+
+    def send(self, text, sender="cos", tag="#3", keys=None, event="v2.synthetic", desc=None):
+        description = desc if desc is not None else "switchboard: %s message on %s: %s" % (sender, tag, text[:100])
+        entry = {"actor": "cli", "event": event, "subject": "x", "ts": "2026-10-18T13:36:08.283Z",
+                 "detail": {"description": description, "keys": keys if keys is not None else ["send:%s:e13952497a9e47f9" % sender]}}
+        with open(str(Path(self.engine.state_dir) / "audit.jsonl"), "a") as handle:
+            handle.write(json.dumps(entry) + "\n")
+
+    def full(self, record):
+        return sb.plan_check.plan_hash(record["body"]).split(":")[1]
+
+    def test_a_cos_send_with_the_full_hash_quiets_the_note_and_the_sweep_line_for_that_hash_only(self):
+        record = self.post(3, self.plan(), agent="coder", minutes_ago=40)
+        self.send("Approved at sha256:%s. Read-time void" % self.full(record))
+        self.go(3)
+        self.assertEqual(self.to("orch"), [])
+        self.assertEqual(self.engine.plan_wake.unapproved, [])
+        record["body"] += "\nedited"                                  # an old approval does not approve the edited plan
+        record["updated_at"] = sb.iso(self.world.clock.now() - 40 * 60)
+        self.go()
+        self.assertEqual(len(self.to("orch")), 1)
+        self.assertEqual(self.engine.plan_wake.unapproved, ["#3"])
+
+    def test_the_same_plan_without_the_send_is_announced(self):
+        self.post(3, self.plan(), agent="coder", minutes_ago=40)
+        self.go()
+        self.assertEqual(len(self.to("orch")), 1)
+
+    def test_a_send_for_another_hash_or_by_the_plans_own_signer_does_not_approve(self):
+        record = self.post(3, self.plan(), agent="coder", minutes_ago=40)
+        self.send("Approved at sha256:%s" % ("ab" * 32))
+        self.send("Approved at sha256:%s" % self.full(record), sender="coder", keys=["send:coder:1111111111111111"])
+        self.go()
+        self.assertEqual(len(self.to("orch")), 1)
+        self.assertEqual(self.engine.plan_wake.unapproved, ["#3"])
+
+    def test_the_containing_form_counts_and_hostile_texts_do_not(self):
+        record = self.post(3, self.plan(), agent="coder", minutes_ago=40)
+        h = self.full(record)
+        for text in ("> Approved at sha256:%s" % h, "> cos approved %s" % h, "Not approved at sha256:%s" % h, "Approved at sha256:%s" % h[:8],
+                     "approved sha256:%s" % h[:63], "approved sha256:%sa" % h, "approved %s" % ("cd" * 32), "mentions %s only" % h):
+            self.send(text)
+        self.send("Approved at sha256:%s" % h, event="v2.other")                                  # not a send record
+        self.send("Approved at sha256:%s" % h, keys=["send:cos:1", "send:orch:2"])                  # two senders
+        self.send("Approved at sha256:%s" % h, desc="switchboard: orch message on #3: Approved at sha256:%s" % h)   # the description's sender is not the key's
+        self.send("Approved at sha256:%s" % h, keys=["report:cos:1"])                              # not a send key
+        self.send("Approved at sha256:%s" % h, desc="switchboard: 2 items for orch: Approved at sha256:%s" % h)   # a batch is not recognised
+        self.go()
+        self.assertEqual(len(self.to("orch")), 1)
+        self.assertEqual(self.engine.plan_wake.unapproved, ["#3"])
+        self.send("I have approved plan sha256:%s now" % h, sender="cos")
+        self.go()
+        self.assertEqual(self.engine.plan_wake.unapproved, [])
+
+    def test_the_four_plans_named_in_the_ask_are_quiet_with_audit_lines_shaped_like_the_real_ones(self):
+        records = [self.post(10 + i, self.plan("\nplan %d" % i), agent="coder", minutes_ago=40) for i in range(4)]
+        for i in range(4):
+            self.add(10 + i, parent=2)
+        for record in records:
+            self.send("Approved at sha256:%s. Read-time void" % self.full(record), tag="fleet-kit#770", desc="switchboard: cos message on fleet-kit#770: Approved at sha256:%s. Read-time void\u2026" % self.full(record))
+        self.go(2)
+        self.assertEqual(self.to("orch"), [])
+        self.assertEqual(self.engine.plan_wake.unapproved, [])
+
+    def test_reading_the_sends_writes_nothing_to_the_audit(self):
+        record = self.post(3, self.plan(), agent="coder", minutes_ago=40)
+        self.send("Approved at sha256:%s" % self.full(record))
+        path = Path(self.engine.state_dir) / "audit.jsonl"
+        before = path.read_bytes()
+        self.go(2)
+        self.assertEqual(self.engine.plan_wake.unapproved, [])
+        self.assertEqual(path.read_bytes()[:len(before)], before)   # lines are only ever appended after it; the send's own line is untouched
+
     def test_an_announced_key_older_than_fourteen_days_is_forgotten(self):
         self.post(3, self.plan())
         self.go()
