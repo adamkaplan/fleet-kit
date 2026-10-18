@@ -8547,6 +8547,23 @@ class WorkerFacts:
             found = found + self.seam_facts(observation, boss, idle_ms)
         return found
 
+    def seam_applies(self, observation, issue):
+        """#793: the idle-at-a-seam rule is for a worker whose launch-record role is `coder` or `tester` and whose issue is not a charter.
+        A charter is known from memory only (no new read): the issue is the `charter` of this worker's own record or of any discovered
+        agent's. (A closed charter is already closed.) A role that cannot be read is not a coder or tester."""
+        fleet = observation.fleet if isinstance(observation.fleet, dict) else {}
+        if fleet.get("role") not in ("coder", "tester") or not isinstance(fleet.get("role"), str):
+            return False
+        engine = self.engine
+        repo = _fleet_repo(fleet, engine.config) or engine.config.get("intent_repo")
+        discovery = getattr(engine, "discovery", None)
+        for agent in ([observation] + (list(discovery.agents.values()) if discovery is not None else [])):
+            other = agent.fleet if isinstance(agent.fleet, dict) else {}
+            if other.get("charter") == issue and not isinstance(other.get("charter"), bool):
+                if agent is observation or _fleet_repo(other, engine.config) in (repo, None) or other.get("repo") == repo:
+                    return False
+        return True
+
     def seam_facts(self, observation, boss, idle_ms):
         """#773: idle SEAM_IDLE_SECONDS or more, an OPEN assignment, and a last report of `working`: ONE nudge for the worker and ONE wake
         for its boss, each keyed by this idle stretch (`idle_at`), so neither is sent twice. Reads nothing new: the observation, the
@@ -8555,6 +8572,8 @@ class WorkerFacts:
         issue = _issue_of(observation.fleet)
         if state_dir is None or issue is None or engine.now() - observation.idle_at < SEAM_IDLE_SECONDS:
             return []
+        if not self.seam_applies(observation, issue):
+            return []   # #793: only a coder or tester on a work item or an ask; anything not readable fails toward not nudging
         kept = read_retired(state_dir).get(observation.name)
         if kept is not None and kept.get("session") in (None, observation.session_id):
             return []   # retired on purpose
