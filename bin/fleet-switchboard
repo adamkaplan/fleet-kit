@@ -6055,6 +6055,65 @@ def view_env(role, repo):
     return env
 
 
+AGENT_TMP_ENV = "FLEET_AGENT_TMPDIR"   # read by the private wrapper only: it becomes the agent's TMPDIR (#767)
+
+
+def agent_tmp_root(config):
+    """The profile's shared temp root when panes run through the private wrapper (the one that exports TMPDIR), else None (a shared profile or a test
+    has no wrapper, so there is nothing to override)."""
+    try:
+        data = _xdg("XDG_DATA_HOME", ".local/share") / PROG
+        if str(config.get("opencode") or "") != str(data / "bin" / WRAPPER_NAME):
+            return None
+        return data / "profile" / "tmp"
+    except Exception:
+        return None
+
+
+def agent_tmp_env(engine, name):
+    """{FLEET_AGENT_TMPDIR: dir} for a pane: a private directory (0700) named from the agent, made now under the profile's temp root. {} when panes
+    have no wrapper. A directory that cannot be made fails the launch (LaunchError): the agent is never started on the shared directory."""
+    root = agent_tmp_root(engine.config)
+    if root is None:
+        return {}
+    if not NAME_RE.match(name or ""):
+        raise LaunchError("no private temp directory for %r: not a valid agent name" % (name,))
+    path = root / name
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        try:
+            path.mkdir(mode=0o700)
+        except FileExistsError:
+            pass   # a resume or a second launch of the name: the same directory, checked below
+        info = os.lstat(str(path))
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise OSError("exists and is not a directory of ours")
+        os.chmod(str(path), 0o700)
+    except OSError as err:
+        raise LaunchError("cannot make the private temp directory %s (%s): %s was not started (it never runs on the shared temp directory)" % (path, err.strerror or err, name)) from None
+    return {AGENT_TMP_ENV: str(path)}
+
+
+def reclaim_agent_tmp(engine, name):
+    """At retire: the agent's private TMPDIR is removed when it is EMPTY, else kept and the reason said. Never forced, never recursive. Returns lines."""
+    root = agent_tmp_root(engine.config)
+    if root is None or not NAME_RE.match(name or ""):
+        return []
+    path = root / name
+    if not os.path.lexists(str(path)):
+        return []
+    try:
+        if path.is_symlink() or not path.is_dir():
+            return ["%s: kept (not a plain directory)" % path]
+        left = len(os.listdir(str(path)))
+        if left:
+            return ["%s: kept (%d file(s) still in it; remove them by hand or leave them to the temp janitor)" % (path, left)]
+        os.rmdir(str(path))
+        return ["%s: removed (empty)" % path]
+    except OSError as err:
+        return ["%s: kept (%s)" % (path, err.strerror or err)]
+
+
 def launch_agent(engine, name, agent, directory, workspace, role=None, reports_to=None, issue=None,
                  brief=None, patience=LAUNCH_PATIENCE, sleep=time.sleep, charter=None, repo=None, launched_by=None):
     """Create a fleet agent: a v2 session, its own herdr tab, the brief.
@@ -6074,6 +6133,7 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
     fleet = fleet_record(name, role, reports_to, issue, charter, repo, launched_by)
     env = dict(engine.config["opencode_env"], **engine.config["launch_env"])
     env.update(view_env(role, repo or (engine.config.get("intent_repo") if charter else None)))  # PR 18
+    env.update(agent_tmp_env(engine, name))   # #767: before the session exists, so a failure leaves nothing started
     accounts = getattr(engine, "accounts", None)
     if repo and accounts is not None:  # PR 15: the agent works as its repo's gh account, and as nobody else
         problem = launch_account_problem(engine.config, accounts, repo)
@@ -6324,6 +6384,7 @@ def resume_agent(engine, name, session_id, workspace, patience=LAUNCH_PATIENCE, 
     # repo, role, charter and gh account (a caller-given --repo that differs was refused by the command).
     repo = fleet.get("repo") or (engine.config.get("intent_repo") if fleet.get("charter") else None)
     env.update(view_env(fleet.get("role"), repo))  # PR 18
+    env.update(agent_tmp_env(engine, name))   # #767
     accounts = getattr(engine, "accounts", None)
     if fleet.get("repo") and accounts is not None:
         try:
@@ -7301,6 +7362,11 @@ def cmd_retire(args, runner, now):
             print("worktree: " + line)
     except Exception as err:   # the retirement above is already written: a reclaim problem is said, never a traceback
         sys.stderr.write("%s: worktree reclaim failed (%s): the agent is retired; run `%s disk reclaim-worktrees --apply` to retry\n" % (PROG, _one_line(str(err), 100), PROG))
+    try:
+        for line in reclaim_agent_tmp(engine, name):   # its private TMPDIR (#767): removed when empty, else kept with the reason
+            print("tmpdir: " + line)
+    except Exception:
+        pass
     return EXIT_OK
 
 
@@ -26989,7 +27055,7 @@ GH_FOR_AGENTS=$(GH_CONFIG_DIR={gh_config} {gh} auth token {gh_user_flag} 2>/dev/
 PROFILE={profile}
 export XDG_CONFIG_HOME="$PROFILE/config" XDG_DATA_HOME="$PROFILE/data"
 export XDG_STATE_HOME="$PROFILE/state" XDG_CACHE_HOME="$PROFILE/cache"
-export TMPDIR="$PROFILE/tmp"
+export TMPDIR="${{FLEET_AGENT_TMPDIR:-$PROFILE/tmp}}"
 # XDG alone leaves `home` live: v2 would load your skills. herdr's OpenCode integration is written under
 # $HOME/.config/opencode, which install links to this profile's opencode directory.
 export HOME="$PROFILE/home"
