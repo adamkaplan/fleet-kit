@@ -13,6 +13,7 @@ The last line printed is `RESULT: PASS` or `RESULT: FAIL`, and the exit code
 is non-zero on failure.
 """
 import ast
+import traceback
 import base64
 import calendar
 import collections
@@ -25330,6 +25331,104 @@ class TestPlanWake(Base):
         self.assertEqual(self.to("orch"), [])
         self.assertEqual(len(self.to("cos")), 1)
         self.assertTrue(self.to("cos")[0].endswith("plan check FAIL"))
+
+    def watch_reads(self):
+        """The single-issue reads made from inside the plan wake pass (other triage rules read issues too), as (path, fresh).
+        Like the real hub, a read that is not fresh answers with the CACHED record, a fresh one with the live record."""
+        self.reads_made = []
+        original = self.hub._read_one
+        def counting(repo, path, now, fresh=False):
+            if any(f.name == "plan_wake_pass" for f in traceback.extract_stack()):
+                self.reads_made.append((path, fresh))
+            if not fresh:
+                number = int(path.rsplit("/", 1)[1])
+                if number in self.hub.open.get(repo, {}):
+                    return dict(self.hub.open[repo][number])
+            return original(repo, path, now, fresh)
+        self.hub._read_one = counting
+
+    def stale_ask(self, fresh=True):
+        self.watch_reads()
+        """#802: the cached ask body holds an old Done-when; `live` holds the current one (or nothing)."""
+        self.hub.open["acme/api"][2]["body"] = "## Intent\nx\nDone when: (1) an old clause."
+        if fresh:
+            self.hub.live.setdefault("acme/api", {})[2] = dict(self.hub.open["acme/api"][2], body="## Intent\nx\nDone when: " + GOOD_DONE_WHEN)
+
+    def reads(self):
+        return [c for c in self.reads_made]
+
+    def test_a_cached_mismatch_is_confirmed_against_one_fresh_read_and_reports_the_fresh_pass(self):
+        record = self.post(3, self.plan())
+        self.stale_ask()
+        self.go()
+        h = sb.plan_check.plan_hash(record["body"])
+        self.assertEqual(self.to("orch"), ["plan posted on #3: https://github.com/acme/api/issues/3#issuecomment-%d %s, plan check PASS" % (record["id"], h)])
+        self.assertEqual(self.reads(), [("issues/2", True)])   # once, fresh, for the ask that supplied the Done-when
+
+    def test_a_fresh_body_that_still_mismatches_says_fail_and_audits_the_defect(self):
+        notes = []
+        original = self.engine._note
+        self.engine._note = lambda kind, ref, detail=None: (notes.append((kind, detail)), original(kind, ref, detail))[1]
+        self.post(3, self.plan())
+        self.stale_ask(fresh=False)
+        self.go()
+        self.assertTrue(self.to("orch")[0].endswith("plan check FAIL"))
+        self.assertEqual(len(self.reads()), 1)
+        detail = [d for k, d in notes if k == "plan_wake.announced"][0]
+        self.assertTrue(detail["defect"])
+        self.assertFalse(detail["stale"])
+
+    def test_a_failed_re_read_says_the_check_may_be_stale(self):
+        self.post(3, self.plan())
+        self.stale_ask()
+        def failing(repo, path, now, fresh=False):
+            raise sb.GitHubUnavailable("HTTP 500")
+        self.hub._read_one = failing
+        self.go()
+        self.assertTrue(self.to("orch")[0].endswith("plan check FAIL (issue body not re-read: may be stale; run plan check)"))
+
+    def test_a_spent_budget_says_the_check_may_be_stale_and_reads_nothing(self):
+        self.post(3, self.plan())
+        self.stale_ask()
+        self.go()
+        self.engine.plan_wake.facts.clear()
+        self.engine.plan_wake.announced.clear()
+        self.reads_made.clear()
+        sb.plan_wake_pass(self.engine, self.engine.triage, ["acme/api"], self.world.clock.now(), [0])
+        self.assertEqual(self.reads(), [])
+        self.assertTrue(self.to("orch")[0].endswith("may be stale; run plan check)"))
+
+    def test_the_re_read_is_charged_to_the_budget_once_per_plan(self):
+        self.add(4, parent=2)
+        self.post(3, self.plan())
+        self.post(4, self.plan())
+        self.stale_ask()
+        self.go()                                  # builds the units and announces both plans
+        self.engine.plan_wake.facts.clear()
+        self.engine.plan_wake.announced.clear()
+        self.reads_made.clear()
+        budget = [1]
+        sb.plan_wake_pass(self.engine, self.engine.triage, ["acme/api"], self.world.clock.now(), budget)
+        self.assertEqual(budget, [0])
+        self.assertEqual(self.reads(), [("issues/2", True)])           # the second plan finds the budget spent: no read
+        texts = sorted(self.to("orch"))
+        self.assertEqual(sum(x.endswith("plan check PASS") for x in texts), 1)
+        self.assertEqual(sum(x.endswith("may be stale; run plan check)") for x in texts), 1)
+
+    def test_a_passing_first_check_makes_no_re_read(self):
+        self.watch_reads()
+        self.post(3, self.plan())
+        self.go(2)
+        self.assertEqual(self.reads(), [])
+
+    def test_two_recipients_cost_one_re_read(self):
+        self.world.add_agent("orch2", fleet={"role": "orchestrator", "charter": 1, "repo": "acme/api"})
+        self.engine.discover(self.world.clock.now())
+        self.post(3, self.plan())
+        self.stale_ask()
+        self.go()
+        self.assertEqual(len(self.reads()), 1)
+        self.assertEqual(len(self.to("orch")) + len(self.to("orch2")), 2)
 
     def test_nothing_is_sent_for_a_comment_that_is_not_a_plan_a_non_sub_issue_or_a_charter_chain_it_does_not_reach(self):
         self.post(3, "a plan is coming, see ## Plan (scenarios) later")

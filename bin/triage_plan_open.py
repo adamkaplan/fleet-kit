@@ -229,9 +229,10 @@ def plan_url(repo, number, comment_id):
     return "https://github.com/%s/issues/%d#issuecomment-%d" % (repo, number, comment_id)
 
 
-def line(number, url, plan_hash, passed):
+def line(number, url, plan_hash, passed, stale=False):
     """The one line the approver reads: the issue, the url, the hash and the check result. Nothing from the plan's own text."""
-    return "plan posted on #%d: %s %s, plan check %s" % (number, url, plan_hash, "PASS" if passed else "FAIL")
+    result = "PASS" if passed else "FAIL (issue body not re-read: may be stale; run plan check)" if stale else "FAIL"
+    return "plan posted on #%d: %s %s, plan check %s" % (number, url, plan_hash, result)
 
 
 def unapproved_line(refs, extra=0):

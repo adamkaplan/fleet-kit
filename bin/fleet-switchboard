@@ -13204,7 +13204,7 @@ def triage_pass(engine, decisions, now, errors=()):
     triage_read_live(engine, state, repos, now, budget, max(1, cfg.get("calls_per_pass", TRIAGE_CALLS_PER_PASS) // 3), seconds)
     triage_refresh_ownerless(engine, state, cfg, now, budget, seconds)   # #605: the team repositories' whole lists, after the shared units
     try:
-        plan_wake_pass(engine, state, repos, now)   # #765: the plans posted or edited, from the units just held
+        plan_wake_pass(engine, state, repos, now, budget)   # #765: the plans posted or edited, from the units just held
     except Exception as err:
         engine._note("plan_wake.error", "", {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
     candidates, unchecked_units, truncated = triage_findings(engine, state, repos, decisions, cfg, now, errors)
@@ -13483,7 +13483,7 @@ def plan_wake_route(number, items, ctx, discovery, chiefs):
     return None
 
 
-def plan_wake_pass(engine, state, repos, now):
+def plan_wake_pass(engine, state, repos, now, budget=None):
     """Announce each new plan hash to its approver once, and list the plans that look unapproved. Never raises; reads nothing from GitHub."""
     wake = plan_wake_state(engine)
     module, check_module = load_triage_plan_open(), load_plan_check()
@@ -13534,20 +13534,44 @@ def plan_wake_pass(engine, state, repos, now):
             names = route[0]
             if key not in wake.announced and names:
                 own = raw[number][1]
+                source = number
                 done_when = parse_intent(own.get("body"))[1]
                 if route[1] == "work item":
                     parent_record = (raw.get((items[number] or {}).get("parent")) or (None, {}))[1]
-                    done_when = parse_intent(parent_record.get("body"))[1] or done_when
+                    if parse_intent(parent_record.get("body"))[1]:
+                        source, done_when = items[number]["parent"], parse_intent(parent_record.get("body"))[1]
+                stale, defect = False, ""
                 try:
-                    passed = check_module.check(body, done_when, None)["result"] == "pass"
+                    result = check_module.check(body, done_when, None)
+                    passed = result["result"] == "pass"
+                    defect = _one_line(str((result.get("defects") or [""])[0]), 160)
                 except Exception:
                     passed = False
-                text = module.line(number, url, plan_hash, passed)
+                if not passed:   # #802: a FAIL is confirmed against ONE fresh read of the issue that supplied the Done-when, never the cached body
+                    stale = True
+                    hub = getattr(engine, "hub", None)
+                    if hub is not None and (budget is None or budget[0] >= 1):
+                        if budget is not None:
+                            budget[0] -= 1
+                        try:
+                            fresh = hub._read_one(repo, "issues/%d" % source, now, fresh=True)
+                            fresh_done = parse_intent(fresh.get("body"))[1] if isinstance(fresh, dict) else None
+                        except Exception:
+                            fresh_done = None
+                        if fresh_done:
+                            stale = False
+                            try:
+                                result = check_module.check(body, fresh_done, None)
+                                passed = result["result"] == "pass"
+                                defect = _one_line(str((result.get("defects") or [""])[0]), 160)
+                            except Exception:
+                                passed = False
+                text = module.line(number, url, plan_hash, passed, stale and not passed)
                 for name in names:
                     wake.facts["plan:%s:%s" % (key, name)] = (text, now, name, repo, number)
                 wake.announced[key] = now
                 changed = True
-                engine._note("plan_wake.announced", "%s#%d" % (repo, number), {"hash": plan_hash, "to": names, "route": route[1], "check": "PASS" if passed else "FAIL"})
+                engine._note("plan_wake.announced", "%s#%d" % (repo, number), {"hash": plan_hash, "to": names, "route": route[1], "check": "PASS" if passed else "FAIL", "stale": bool(stale and not passed), "defect": "" if passed else defect})
             if now - posted >= module.UNAPPROVED_SECONDS:
                 listed.append("%s#%d" % (repo, number) if len(repos) > 1 else "#%d" % number)
     wake.unapproved = sorted(listed)
