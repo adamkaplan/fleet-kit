@@ -39922,6 +39922,7 @@ class TestOrdersDelivery(OrdersDeliveryCase):
 
     def test_the_charter_is_read_once_per_cache_lifetime_not_once_per_pass(self):
         self.run_pass()
+        self.run_pass()   # #796: the load line reads nothing in the first pass after a start; its reads begin with the second
         first = self.gh_gets()
         loads = self.load_gets()
         for _ in range(6):
