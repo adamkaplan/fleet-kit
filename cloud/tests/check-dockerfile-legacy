@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Fail when a Dockerfile uses syntax only BuildKit understands (the registry's legacy builder rejects it).
+
+usage: check-dockerfile-legacy <Dockerfile>   exit 0 clean, 1 findings (printed as "line N: reason"), 2 unreadable.
+Rules: a "# syntax=" or "# check=" parser directive (any case, first lines only); a heredoc "<<" anywhere in a RUN, ADD
+or COPY; any leading --flag on RUN (none are legacy) or on ADD/COPY other than --from and --chown (an allow-list).
+Backslash-continued lines are joined first; comment lines are dropped (a directive is read before that).
+"""
+import re
+import sys
+
+ALLOWED = {"COPY": {"--from", "--chown"}, "ADD": {"--chown"}, "RUN": set()}
+
+
+def check(text):
+    found = []
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):  # parser directives: only at the very top, before any instruction or blank line
+        m = re.match(r"^\s*#\s*([A-Za-z]+)\s*=", lines[i])
+        if not m:
+            break
+        if m.group(1).lower() in ("syntax", "check"):
+            found.append((i + 1, "parser directive '%s=' is BuildKit-only" % m.group(1).lower()))
+        i += 1
+    logical, cur, start = [], "", 0
+    for n, raw in enumerate(lines, 1):
+        if raw.lstrip().startswith("#"):
+            continue
+        if not cur:
+            if not raw.strip():
+                continue
+            start = n
+        if raw.rstrip().endswith("\\"):
+            cur += raw.rstrip()[:-1] + " "
+        else:
+            logical.append((start, cur + raw))
+            cur = ""
+    if cur:
+        logical.append((start, cur))
+    for n, ins in logical:
+        toks = ins.split()
+        op = toks[0].upper()
+        if op not in ALLOWED:
+            continue
+        if "<<" in ins:
+            found.append((n, "heredoc '<<' in %s is BuildKit-only" % op))
+        for t in toks[1:]:
+            if not t.startswith("--"):
+                break
+            name = t.split("=", 1)[0].lower()
+            if name not in ALLOWED[op]:
+                found.append((n, "flag '%s' on %s is not known to the legacy builder" % (name, op)))
+    return found
+
+
+def main():
+    if len(sys.argv) != 2:
+        print(__doc__, file=sys.stderr)
+        return 2
+    try:
+        text = open(sys.argv[1], encoding="utf-8").read()
+    except OSError as e:
+        print("cannot read: %s" % e, file=sys.stderr)
+        return 2
+    found = check(text)
+    for n, why in found:
+        print("line %d: %s" % (n, why))
+    return 1 if found else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
