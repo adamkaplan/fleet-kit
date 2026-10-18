@@ -8550,7 +8550,7 @@ class WorkerFacts:
     def seam_applies(self, observation, issue):
         """#793: the idle-at-a-seam rule is for a worker whose launch-record role is `coder` or `tester` and whose issue is not a charter.
         A charter is known from memory only (no new read): the issue is the `charter` of this worker's own record or of any discovered
-        agent's, or the hub holds it closed with a `:orchestrator` label. A role that cannot be read is not a coder or tester."""
+        agent's. (A closed charter is already closed.) A role that cannot be read is not a coder or tester."""
         fleet = observation.fleet if isinstance(observation.fleet, dict) else {}
         if fleet.get("role") not in ("coder", "tester") or not isinstance(fleet.get("role"), str):
             return False
@@ -8562,11 +8562,6 @@ class WorkerFacts:
             if other.get("charter") == issue and not isinstance(other.get("charter"), bool):
                 if agent is observation or _fleet_repo(other, engine.config) in (repo, None) or other.get("repo") == repo:
                     return False
-        hub = getattr(engine, "hub", None)
-        closed = hub.closed_issue_snapshot() if hub is not None and hasattr(hub, "closed_issue_snapshot") else {}
-        entry = closed.get("%s#%d" % (plan_ledger.normal_repo(repo), issue)) if repo else None
-        if isinstance(entry, dict) and any(str(l).endswith(":orchestrator") for l in entry.get("labels") or []):
-            return False
         return True
 
     def seam_facts(self, observation, boss, idle_ms):

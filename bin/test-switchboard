@@ -21677,14 +21677,11 @@ class TestIdleAtASeam(ReportBase):
         self.idle_worker("lead", {"role": "orchestrator", "reports_to": "platform", "issue": 50, "charter": 41})
         self.idle_worker("lab", {"role": "coder", "reports_to": "platform", "issue": 42})
         self.world.engine.config["intent_repo"] = self.world.engine.config.get("intent_repo") or "acme/widget-service"
-        repo = self.world.engine.config["intent_repo"]
         self.world.engine.hub = types.SimpleNamespace(closed_issue_snapshot=lambda: {})
         self.world.tick(1300)
         found = [f for f in self.derive() if ":seam:" in f.key]
         self.assertEqual([f for f in found if f.recipient in ("own", "orch2", "lead") or any("worker %s," % n in f.summary for n in ("own", "orch2", "lead"))], [])
         self.assertEqual(len([f for f in found if f.recipient == "lab"]), 1, "a work item with no charter signal is nudged")
-        self.world.engine.hub = types.SimpleNamespace(closed_issue_snapshot=lambda: {"%s#42" % sb.plan_ledger.normal_repo(repo): {"labels": ["someone:orchestrator"], "at": 1}})
-        self.assertEqual([f for f in self.derive() if ":seam:" in f.key and f.recipient == "lab"], [], "a closed charter entry")
 
     def test_793_an_orchestrator_idle_after_working_gets_no_nudge_and_no_wake(self):
         self.world.engine.discovery  # the fixture's agents are discovered by derive()
