@@ -4203,6 +4203,16 @@ tester records is audited with the launch record it relied on (`launch_record` i
 source (`config` or `launch record`). If the running agents or the retired list cannot be read, no launched tester counts (only the configured list does): a missing `retired.json` means nobody is retired, but a corrupt, empty or non-map one disables every launched tester, audited as `testers.retired_unreadable` and said in `status` ("retired file unreadable: launch-record testers disabled").
 The rules are `bin/launch_testers.py`.
 
+**Verdicts for a work item with no pull request (#770).** A work item that is an ISSUE (a production-operations item) gets tester and CI verdicts from an independent registered tester. The rules are `bin/item_verdicts.py`; no pull request rule changes (a pull request number on this path is refused).
+
+- **Registration.** `launch --role tester --repo R --reports-to <orchestrator> --issue N`, run by that orchestrator (identified by its own pane) for an open issue whose parent chain reaches the orchestrator's charter, makes the switchboard write one ledger entry (`item_tester`: item, tester, session, orchestrator, reference commit) and one audit line `plan.item.register`. A hand-made session record with no such entry registers nothing; the entry lasts 24 hours and one session.
+- **Reference commit.** The tip of the default branch when the registration was made, stored in it and never read again. A new registration moves it and voids the verdicts at the old one, as a push does for a pull request.
+- **Commands.** `prove S1 --item R#N`, `verdict S1|--all --item R#N --as tester`, `gates item R#N`, `gates item-ci-record R#N`. The plan is the one the issue body links with `PLAN:`; an item claims only scenarios `claim_of` reads as `pr` (never an epic one), and in a plan that is not its own only those marked `slice: #N`.
+- **Who is refused.** The issue's GitHub author, every agent that recorded an item proof, the registering orchestrator, every non-tester agent working the item or its ask or reporting to that orchestrator, and any agent in one of their sessions. `gates item` reads the writers again, so a tester that later proves for the item loses its verdicts.
+- **CI.** Only the repository's own checks, listed as `{name, app}` under `plan_gates.repos.<repo>.item_checks` (default: none, so nothing is accepted), read from the Checks API at the reference commit, which must be on the default branch. `gates item-ci-record` records it as the switchboard; an agent cannot type a `ci` verdict.
+- **Audit.** `plan.item.register`, `plan.item.proof`, `plan.item.verdict`, `plan.item.refused`, `plan.item.ci_record`: item, writer and reference commit.
+- **Trust.** The caller identity is the pane identity the pull request path already trusts, every agent shares one GitHub account (so GitHub cannot tell two agents apart), and the ledger and the audit are the only writer record: a guardrail, not a boundary.
+
 **`gates`** prints one line per gate G0a to G8 with its status (`ok`, `missing`, `waiting`, `untracked`, `n/a`), who decides
 it, and what is missing, and exits 0 when every gate it tracks and that applies to a PR is satisfied, 1 when something is
 missing, 2 when it cannot run. Tracked now: **G0a** (the plan passes `plan check`), **G1** (every per-PR scenario has a passing

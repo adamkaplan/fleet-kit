@@ -64272,6 +64272,417 @@ class TestPreflightPr(unittest.TestCase):
             self.assertEqual(table.count('("%s",' % name), 1)
 
 
+class TestItemVerdicts(unittest.TestCase):
+    """#770 (plan fleet-kit#777): verdicts for a work item that has no pull request. Temp dirs and fakes only. Each attack has a test and a mutant: the
+    mutant is the weakened defence swapped in with mock.patch, and the same attack then SUCCEEDS (the test would fail on it)."""
+
+    REPO, N, ITEM = "acme-org/widget-service", 777, "acme-org/widget-service#777"
+    PIN, MOVED = "a" * 40, "b" * 40
+    T0 = 1_000_000
+
+    def setUp(self):
+        self.iv = sb.load_module("item_verdicts")
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.state = Path(self.dir)
+        self.clock = [self.T0]
+        self.audit = []
+        self.sessions = {"orch": "ses_o", "t1": "ses_t1", "t2": "ses_t2", "c1": "ses_c1", "n1": "ses_n1"}
+        self.fleets = {"orch": {"role": "orchestrator", "repo": self.REPO, "charter": 587},
+                       "t1": {"role": "tester", "repo": self.REPO, "reports_to": "orch", "launched_by": "orch", "issue": self.N},
+                       "t2": {"role": "tester", "repo": self.REPO, "reports_to": "orch", "launched_by": "orch", "issue": 778},
+                       "c1": {"role": "coder", "repo": self.REPO, "reports_to": "orch", "launched_by": "orch", "issue": self.N},
+                       "n1": {"role": "coder", "repo": self.REPO, "reports_to": "orch", "launched_by": "orch", "issue": 700}}
+        self.scenarios = [{"id": "S1", "evaluator": "tester", "proof": "live", "claim": "pr"},
+                          {"id": "S2", "evaluator": "ci", "proof": "test", "claim": "pr"},
+                          {"id": "S3", "evaluator": "tester", "proof": "measure", "claim": "epic"},
+                          {"id": "S4", "evaluator": "tester", "proof": "measure"}]
+        self.plan = {"result": "pass", "defects": [], "scenarios_parsed": self.scenarios, "plan_hash": "sha256:p", "text": "", "source": "plan"}
+        self.pages = {}
+
+    def now(self):
+        return self.clock[0]
+
+    def entries(self):
+        return sb.plan_ledger.read_ledger(self.state)[0]
+
+    def register(self, tester="t1", item=None, head=None, orch="orch", session=None):
+        item = item or self.ITEM
+        return sb.plan_ledger.append_entry(self.state, {"kind": "item_tester", "pr": item, "item": item, "tester": tester, "session": session or self.sessions.get(tester),
+                                                         "orchestrator": orch, "head": head or self.PIN, "plan_ref": None, "by": orch}, self.now())
+
+    def ctx(self, author="human", own=True, item=None):
+        item = item or self.ITEM
+        number = int(item.rsplit("#", 1)[1])
+
+        class Audit:
+            def append(inner, actor, event, subject=None, detail=None, **extra):
+                self.audit.append((event, subject, detail))
+        intents = types.SimpleNamespace(_api=lambda path, repo=None: self.pages[path] if path in self.pages else (_ for _ in ()).throw(sb.IntentError("not_found", path)))
+        engine = types.SimpleNamespace(intents=intents, audit=Audit(), actor="t", herdr=None, v2=None)
+        return types.SimpleNamespace(engine=engine, state=self.state, config={"plan_gates": {"repos": {self.REPO: {"item_checks": [{"name": "build", "app": "github-actions"}]}}}},
+                                     repo=self.REPO, number=number, pr=item, item=item, entries=self.entries(), problem=None, facts={}, unreadable=None, source="plan",
+                                     plan=self.plan, plan_problem=None, issue={"author": author, "body": "", "state": "open", "parent": None}, plan_own=own)
+
+    def args(self, **kw):
+        base = dict(item=self.ITEM, pr=None, plan=None, ask=None, head=None, scenario="S1", all_scenarios=False, evaluator="tester", result="pass", evidence="ran it", command=None)
+        base.update(kw)
+        return types.SimpleNamespace(**base)
+
+    def verdict(self, caller, retired=None, **kw):
+        """Run the real cmd_item_verdict as `caller`; (exit, why) where why is the refusal sentence or None."""
+        launch = sb.load_launch_testers().launched(self.fleets, self.sessions, self.REPO, lambda f: f.get("repo"), retired or {})
+        item = kw.get("item_key") or self.ITEM
+        with mock.patch.object(sb, "item_context", lambda a, r, n, w: self.ctx(item=item)), mock.patch.object(sb, "identify_caller", lambda *a: caller), \
+                mock.patch.object(sb, "launched_testers_for", lambda c: (launch, self.sessions, self.fleets)):
+            try:
+                return sb.cmd_item_verdict(self.args(**{k: v for k, v in kw.items() if k != "item_key"}), None, self.now), None
+            except sb.LedgerCommandError as err:
+                return None, str(err)
+
+    def verdicts(self):
+        return [e for e in self.entries() if e.get("kind") == "verdict"]
+
+    # ---- S1 / DW-1: the registration and the verdict
+    def test_s1_a_registered_tester_records_a_verdict_for_its_item(self):
+        self.register()
+        code, why = self.verdict("t1")
+        self.assertEqual((code, why), (sb.EXIT_OK, None))
+        got = self.verdicts()
+        self.assertEqual([(v["pr"], v["by"], v["head"], v["evaluator"]) for v in got], [(self.ITEM, "t1", self.PIN, "tester")])
+
+    def test_s1_launch_registers_the_tester_for_that_item_by_the_switchboard(self):
+        self.pages.update({"repos/%s/issues/777" % self.REPO: {"user": {"login": "human"}, "body": "PLAN: https://github.com/acme-org/widget-service/issues/777#issuecomment-1",
+                                                               "state": "open", "parent_issue_url": "https://api.github.com/repos/acme-org/widget-service/issues/770"},
+                           "repos/%s/issues/770" % self.REPO: {"parent_issue_url": "https://api.github.com/repos/acme-org/widget-service/issues/587"},
+                           "repos/%s" % self.REPO: {"default_branch": "main"}, "repos/%s/commits/main" % self.REPO: {"sha": self.PIN}})
+        agents = {n: types.SimpleNamespace(fleet=f) for n, f in self.fleets.items()}
+        ctx = self.ctx()
+        ctx.engine.discover = lambda now: types.SimpleNamespace(agents=agents)
+        ctx.engine.now = lambda: self.now()
+        ctx.engine.config = {}
+        args = types.SimpleNamespace(role="tester", issue=777, name="t1", reports_to="orch")
+        sb.register_item_tester(ctx.engine, self.state, args, self.REPO, "orch", {"session": "ses_t1"}, self.now)
+        reg = self.iv.registrations(self.entries(), self.ITEM)
+        self.assertEqual([(e["tester"], e["session"], e["orchestrator"], e["head"]) for e in reg], [("t1", "ses_t1", "orch", self.PIN)])
+        self.assertEqual([a[0] for a in self.audit], ["plan.item.register"])
+        # a launch run by a coder (not the orchestrator) registers nothing, and says why
+        sb.register_item_tester(ctx.engine, self.state, args, self.REPO, "c1", {"session": "ses_t1"}, self.now)
+        self.assertEqual(len(self.iv.registrations(self.entries(), self.ITEM)), 1)
+        self.assertEqual(self.audit[-1][0], "plan.item.refused")
+
+    def test_s2_a_tester_registered_for_item_a_cannot_write_for_item_b(self):
+        self.register("t1")
+        other = "acme-org/widget-service#778"
+        code, why = self.verdict("t1", item_key=other)
+        self.assertIsNone(code)
+        self.assertIn("not registered", why)
+        self.assertEqual(self.verdicts(), [])
+        self.register("t2", item=other)
+        self.assertEqual(self.verdict("t1", item_key=other)[0], None)     # t2 is registered for B; t1 still is not
+
+    def test_s2_mutant_matching_on_role_and_repo_only_lets_it_through(self):
+        self.register("t1")
+        other = "acme-org/widget-service#778"
+        with mock.patch.object(self.iv, "registration_problem", lambda *a: None), mock.patch.object(self.iv, "pinned", lambda e, i: self.PIN):
+            code, why = self.verdict("t1", item_key=other)
+        self.assertEqual(code, sb.EXIT_OK, "the mutant (no per-item registration) records a verdict for item B")
+
+    # ---- S10: a forged or handmade launch record
+    def test_s10_a_handmade_launch_record_with_no_switchboard_entry_registers_nothing(self):
+        code, why = self.verdict("t1")          # the launch record is perfect (launched_by the orchestrator) but no ledger entry exists
+        self.assertIsNone(code)
+        self.assertIn("not registered", why)
+        self.assertEqual(self.verdicts(), [])
+
+    def test_s10_mutant_trusting_the_launch_record_alone_accepts_it(self):
+        with mock.patch.object(self.iv, "registration_problem", lambda *a: None), mock.patch.object(self.iv, "pinned", lambda e, i: self.PIN):
+            self.assertEqual(self.verdict("t1")[0], sb.EXIT_OK)
+
+    def test_s10_a_coder_launching_its_own_tester_is_refused_by_the_launch_record_and_writes_no_registration(self):
+        self.fleets["t1"]["launched_by"] = "c1"; self.fleets["t1"]["reports_to"] = "c1"
+        self.register("t1", orch="c1")      # even a ledger entry naming the coder as the orchestrator cannot make it a launched tester
+        code, why = self.verdict("t1")
+        self.assertIsNone(code)
+        self.assertIn("not a tester launched", why)
+
+    def test_s10_a_replayed_ledger_line_breaks_the_chain(self):
+        self.register()
+        self.verdict("t1")
+        path = self.state / sb.plan_ledger.LEDGER_FILE
+        lines = path.read_text().splitlines()
+        path.write_text("\n".join(lines + [lines[-1]]) + "\n")      # the verdict line copied once more
+        self.assertIsNotNone(sb.plan_ledger.read_ledger(self.state)[1])
+
+    # ---- S5: the reference commit does not move under the verdict
+    def test_s5_a_verdict_names_the_pinned_commit_and_no_other(self):
+        self.register()
+        code, why = self.verdict("t1", head=self.MOVED)
+        self.assertIsNone(code)
+        self.assertIn("reference commit", why)
+        self.assertEqual(self.verdicts(), [])
+        self.assertEqual(self.verdict("t1", head=self.PIN)[0], sb.EXIT_OK)
+        self.assertEqual(self.verdicts()[0]["head"], self.PIN)
+
+    def test_s5_mutant_reading_the_tip_at_verdict_time_accepts_a_moved_commit(self):
+        self.register()
+        with mock.patch.object(self.iv, "pinned", lambda e, i: self.MOVED):
+            code, why = self.verdict("t1", head=self.MOVED)
+        self.assertEqual(code, sb.EXIT_OK, "the mutant stamps whatever the tip is now")
+
+    def test_s5_a_new_registration_voids_the_verdicts_at_the_old_commit(self):
+        self.register()
+        self.verdict("t1")
+        self.clock[0] += 60
+        self.register("t1", head=self.MOVED)
+        report = sb.item_gates_report(self.ctx(), set())
+        row = next(r for r in report["scenarios"] if r["id"] == "S1")
+        self.assertEqual(row["status"], "missing")
+        self.assertTrue(any("head moved" in v for v in row["void"]))
+
+    # ---- S3/S4: CI verdicts of the repository's own checks
+    RUN = {"name": "build", "status": "completed", "conclusion": "success", "app": {"slug": "github-actions"}}
+
+    def ci(self, runs, on_branch=True, checks=True):
+        self.register()
+        self.pages.update({"repos/%s" % self.REPO: {"default_branch": "main"},
+                           "repos/%s/compare/main...%s" % (self.REPO, self.PIN): {"status": "identical" if on_branch else "diverged"},
+                           "repos/%s/commits/%s/check-runs?per_page=100" % (self.REPO, self.PIN): {"check_runs": runs}})
+        ctx = self.ctx()
+        if not checks:
+            ctx.config = {"plan_gates": {"repos": {self.REPO: {}}}}
+        with mock.patch.object(sb, "item_context", lambda a, r, n, w: ctx):
+            try:
+                return sb.cmd_item_ci_record(types.SimpleNamespace(rest=[self.ITEM], plan=None, ask=None), None, self.now), None
+            except sb.LedgerCommandError as err:
+                return None, str(err)
+
+    def test_s3_every_listed_check_green_at_the_reference_commit_records_one_ci_verdict_by_the_recorder(self):
+        self.assertEqual(self.ci([self.RUN])[0], sb.EXIT_OK)
+        got = self.verdicts()
+        self.assertEqual([(v["scenario"], v["by"], v["head"], v["evaluator"]) for v in got], [("S2", sb.plan_ledger.CI_RECORDER, self.PIN, "ci")])
+        self.assertEqual([a[0] for a in self.audit if a[0] == "plan.item.ci_record"], ["plan.item.ci_record"])
+
+    def test_s3_an_agent_cannot_type_a_ci_verdict_for_an_item(self):
+        self.register()
+        code, why = self.verdict("t1", scenario="S2", evaluator="ci")
+        self.assertIsNone(code)
+        self.assertIn("ci", why)
+        self.assertEqual(self.verdicts(), [])
+
+    def test_s4_nothing_configured_a_same_named_check_of_another_app_or_a_commit_off_the_branch_records_nothing(self):
+        other = dict(self.RUN, app={"slug": "evil-workflow"})
+        for runs, kwargs in (([self.RUN], {"checks": False}), ([other], {}), ([self.RUN], {"on_branch": False}), ([dict(self.RUN, conclusion="failure")], {}),
+                             ([dict(self.RUN, status="in_progress", conclusion=None)], {})):
+            self.setUp()
+            code, why = self.ci(runs, **kwargs)
+            self.assertIsNone(code, (runs, kwargs))
+            self.assertEqual(self.verdicts(), [], (runs, kwargs))
+
+    def test_s4_mutant_matching_a_check_by_name_alone_records_the_faked_one(self):
+        other = dict(self.RUN, app={"slug": "evil-workflow"})
+        real = self.iv.ci_decision
+        by_name = lambda runs, checks: real(runs, [dict(c, app=r["app"]["slug"]) for c in checks for r in runs[:1]] if runs else checks)
+        with mock.patch.object(self.iv, "ci_decision", by_name):
+            self.assertEqual(self.ci([other])[0], sb.EXIT_OK, "the mutant accepts the same-named run of another app")
+
+    def test_s4_the_item_checks_key_is_validated_by_its_own_module_and_defaults_to_none(self):
+        self.assertEqual(self.iv.validate_item_checks(None, "c"), [])
+        self.assertEqual(self.iv.validate_item_checks([{"name": "build", "app": "github-actions"}], "c"), [{"name": "build", "app": "github-actions"}])
+        for bad in ("build", [{"name": "build"}], [{"name": "", "app": "x"}], [{"name": "a", "app": "b", "x": 1}], [{"name": "a", "app": "b"}] * 2):
+            with self.assertRaises(ValueError):
+                self.iv.validate_item_checks(bad, "c")
+        raw = {"repos": {self.REPO: {"item_checks": [{"name": "build", "app": "github-actions"}]}}}
+        self.assertEqual(sb.plan_ledger.validate_plan_gates(raw, "c")["repos"][self.REPO]["item_checks"], raw["repos"][self.REPO]["item_checks"])
+        self.assertNotIn("item_checks", sb.plan_ledger.validate_plan_gates({"repos": {self.REPO: {}}}, "c")["repos"][self.REPO])
+
+    # ---- S6/S7: the item-level claim
+    def test_s6_an_item_claims_only_pr_scenarios_never_an_ask_level_live_one(self):
+        self.register()
+        code, why = self.verdict("t1", all_scenarios=True, scenario=None, head=self.PIN)
+        self.assertEqual(code, sb.EXIT_OK)
+        self.assertEqual([v["scenario"] for v in self.verdicts()], ["S1"])        # S3 is claim: epic, S4 is tester + measure with no claim (read as epic)
+        for sid in ("S3", "S4"):
+            code, why = self.verdict("t1", scenario=sid)
+            self.assertIsNone(code)
+            self.assertIn("epic", why)
+        self.assertEqual(len(self.verdicts()), 1)
+
+    def test_s6_mutant_giving_the_item_every_scenario_claims_the_live_one(self):
+        self.register()
+        with mock.patch.object(sb.plan_ledger, "claim_of", lambda s: "pr"):
+            self.verdict("t1", all_scenarios=True, scenario=None, head=self.PIN)
+        self.assertIn("S3", [v["scenario"] for v in self.verdicts()])
+
+    def test_s7_an_item_that_links_the_asks_plan_claims_only_what_is_sliced_to_it(self):
+        self.register()
+        self.scenarios[0]["slice"] = "#778"
+        self.scenarios.append({"id": "S5", "evaluator": "tester", "proof": "live", "claim": "pr", "slice": "#777"})
+        launch = sb.load_launch_testers().launched(self.fleets, self.sessions, self.REPO, lambda f: f.get("repo"), {})
+        results = {}
+        for sid in ("S1", "S5"):
+            with mock.patch.object(sb, "item_context", lambda a, r, n, w: self.ctx(own=False)), mock.patch.object(sb, "identify_caller", lambda *a: "t1"), \
+                    mock.patch.object(sb, "launched_testers_for", lambda c: (launch, self.sessions, self.fleets)):
+                try:
+                    results[sid] = sb.cmd_item_verdict(self.args(scenario=sid), None, self.now)
+                except sb.LedgerCommandError as err:
+                    results[sid] = str(err)
+        self.assertIn("not sliced", results["S1"])
+        self.assertEqual(results["S5"], sb.EXIT_OK)
+        self.assertEqual([v["scenario"] for v in self.verdicts()], ["S5"])
+
+    # ---- S8: independence
+    def test_s8_the_author_notifier_orchestrator_the_orchestrators_coder_and_a_coders_session_are_refused(self):
+        self.register()
+        self.fleets["nt"] = {"role": "tester", "repo": self.REPO, "reports_to": "orch", "launched_by": "orch", "issue": self.N}
+        self.sessions["nt"] = self.sessions["c1"]            # a tester running in the session of the item's coder
+        self.register("nt")
+        self.fleets["human"] = {"role": "tester", "repo": self.REPO, "reports_to": "orch", "launched_by": "orch", "issue": self.N}
+        self.sessions["human"] = "ses_h"
+        self.register("human")                                # a tester that is also the issue's GitHub author
+        self.fleets["wk"] = {"role": "coder", "repo": self.REPO, "reports_to": "orch", "launched_by": "orch", "issue": 700}   # the orchestrator's coder on ANOTHER item (the notifier)
+        self.sessions["wk"] = "ses_wk"
+        refused = 0
+        for who in ("human", "c1", "wk", "nt"):
+            if who in ("c1", "wk"):
+                self.register(who)
+            code, why = self.verdict(who)
+            refused += code is None
+        self.assertEqual(refused, 4)
+        self.assertEqual(self.verdicts(), [])
+        self.assertIn("orch", self.iv.excluded(self.ITEM, self.N, None, "human", self.entries(), self.fleets, self.sessions))
+
+    def test_s8_mutant_excluding_only_the_issue_author_records_the_others(self):
+        for who in ("c1", "wk"):
+            self.fleets[who] = dict(self.fleets.get(who, {}), role="tester", repo=self.REPO, reports_to="orch", launched_by="orch", issue=self.N)
+            self.sessions.setdefault(who, "ses_" + who)
+            self.register(who)
+        with mock.patch.object(self.iv, "excluded", lambda item, number, ask, author, entries, fleets, sessions: {author}):
+            codes = [self.verdict(who)[0] for who in ("c1",)]
+        self.assertEqual(codes, [sb.EXIT_OK], "the mutant lets the orchestrator's other worker record")
+
+    def test_s9_a_tester_that_later_proves_for_the_item_loses_its_verdicts_at_read_time(self):
+        self.register()
+        self.verdict("t1")
+        before = sb.item_gates_report(self.ctx(), self.iv.excluded(self.ITEM, self.N, None, "human", self.entries(), self.fleets, self.sessions))
+        self.assertEqual(next(r for r in before["scenarios"] if r["id"] == "S1")["verdict"]["by"], "t1")
+        sb.plan_ledger.append_entry(self.state, {"kind": "proof", "pr": self.ITEM, "scenario": "S1", "plan_hash": "sha256:p", "head": self.PIN, "result": "pass", "by": "t1"}, self.now())
+        after = sb.item_gates_report(self.ctx(), self.iv.excluded(self.ITEM, self.N, None, "human", self.entries(), self.fleets, self.sessions))
+        row = next(r for r in after["scenarios"] if r["id"] == "S1")
+        self.assertEqual(row["status"], "missing")
+        self.assertTrue(any("author" in m for m in row["missing"]))
+
+    def test_s9_mutant_computing_the_writers_at_write_time_only_still_reads_ok(self):
+        self.register()
+        self.verdict("t1")
+        sb.plan_ledger.append_entry(self.state, {"kind": "proof", "pr": self.ITEM, "scenario": "S1", "plan_hash": "sha256:p", "head": self.PIN, "result": "pass", "by": "t1"}, self.now())
+        report = sb.item_gates_report(self.ctx(), set())          # the mutant reads with no writers
+        self.assertEqual(next(r for r in report["scenarios"] if r["id"] == "S1")["status"], "ok")
+
+    def test_s17_a_registered_tester_that_reports_done_keeps_its_verdict_and_a_coders_report_excludes_the_coder(self):
+        self.register()
+        sb.plan_ledger.append_entry(self.state, {"kind": "proof", "pr": self.ITEM, "scenario": "S1", "plan_hash": "sha256:p", "head": self.PIN, "result": "pass", "by": "c1"}, self.now())
+        self.assertEqual(self.verdict("t1")[0], sb.EXIT_OK)
+        writers = self.iv.excluded(self.ITEM, self.N, None, "human", self.entries(), self.fleets, self.sessions)   # a report by t1 adds nobody: reports are not read
+        self.assertNotIn("t1", writers)
+        self.assertIn("c1", writers)
+        report = sb.item_gates_report(self.ctx(), writers)
+        self.assertEqual(next(r for r in report["scenarios"] if r["id"] == "S1")["status"], "ok")
+        self.register("c1")
+        self.assertIsNone(self.verdict("c1")[0])
+
+    def test_s18_a_registration_expires_after_24_hours_and_ends_with_the_session_or_retirement(self):
+        self.register()
+        self.clock[0] += 23 * 3600
+        self.assertEqual(self.verdict("t1")[0], sb.EXIT_OK)
+        self.clock[0] += 2 * 3600
+        code, why = self.verdict("t1")
+        self.assertIsNone(code)
+        self.assertIn("registration expired", why)
+        self.sessions["t1"] = "ses_other"                    # a tester moved to another session
+        self.register()
+        self.sessions["t1"] = "ses_t1"
+        self.assertIsNone(self.verdict("t1")[0])
+        self.sessions["t1"] = "ses_t1"
+        self.register()
+        self.assertIsNone(self.verdict("t1", retired={"t1": {"session": None}})[0])
+
+    def test_s18_mutant_never_expiring_records_at_25_hours(self):
+        self.register()
+        self.clock[0] += 25 * 3600
+        with mock.patch.object(self.iv, "TTL", 10 ** 9):
+            self.assertEqual(self.verdict("t1")[0], sb.EXIT_OK)
+
+    def test_a_replayed_verdict_at_an_old_commit_is_refused_after_a_repin(self):
+        self.register()
+        self.clock[0] += 60
+        self.register("t1", head=self.MOVED)
+        code, why = self.verdict("t1", head=self.PIN)
+        self.assertIsNone(code)
+        self.assertIn("reference commit", why)
+
+    # ---- S12: audit
+    def test_s12_a_registration_a_verdict_and_a_refusal_are_audited_with_the_item_the_writer_and_the_reference_commit(self):
+        self.register()
+        self.verdict("t1")
+        self.verdict("c1")
+        self.verdict("t1", head=self.MOVED)
+        events = {e: d for e, s, d in self.audit}
+        self.assertEqual(events["plan.item.verdict"]["by"], "t1")
+        self.assertEqual((events["plan.item.verdict"]["item"], events["plan.item.verdict"]["reference_commit"]), (self.ITEM, self.PIN))
+        refused = [d for e, s, d in self.audit if e == "plan.item.refused"]
+        self.assertEqual([r["item"] for r in refused], [self.ITEM] * 2)
+        self.assertEqual(sorted(r["by"] for r in refused), ["c1", "t1"])
+        self.assertTrue(all(r["reference_commit"] == self.PIN for r in refused))
+
+    # ---- S13 to S15: the draft line
+    def g4(self, **facts):
+        report = sb.plan_ledger.evaluate_gates(None, [], None, dict({"head": "a" * 40}, **facts), "acme-org/widget-service#9")
+        return next(r for r in report["gates"] if r["gate"] == "G4")["missing"]
+
+    def test_s13_a_draft_pr_with_no_ci_says_the_draft_line(self):
+        self.assertEqual(self.g4(ci="none", draft=True), ["draft: no CI run seen; this repo's workflow may skip drafts; mark ready, then wait"])
+
+    def test_s14_a_ready_pr_with_a_failing_check_or_an_unknown_draft_flag_keeps_the_failing_line(self):
+        line = ["CI is failing (needs green at the head, or a second agent's re-run)"]
+        self.assertEqual(self.g4(ci="failing", draft=False), line)
+        self.assertEqual(self.g4(ci="failing", draft=True), line)      # a draft that HAS runs and a failing check: the failing line
+        self.assertEqual(self.g4(ci="failing"), line)
+        self.assertEqual(self.g4(ci="failing", draft=None), line)
+
+    def test_s15_the_draft_flag_comes_from_isdraft_not_from_the_title(self):
+        data = {"title": "draft: x", "state": "OPEN", "headRefOid": "a" * 40, "isDraft": False}
+        self.assertIs(sb.pr_facts_from(data)["draft"], False)
+        self.assertIs(sb.pr_facts_from(dict(data, title="x", isDraft=True))["draft"], True)
+        self.assertIn("isDraft", sb.PR_VIEW_FIELDS.split(","))
+
+    # ---- U2 / U3
+    def test_u2_a_pull_request_number_is_refused_on_the_item_path_and_nothing_changes_for_pr(self):
+        self.pages["repos/%s/issues/9" % self.REPO] = {"pull_request": {"url": "x"}, "user": {"login": "a"}}
+        engine = self.ctx().engine
+        with self.assertRaises(sb.LedgerCommandError) as raised:
+            sb.item_issue(engine, self.REPO, 9)
+        self.assertIn("is a pull request", str(raised.exception))
+        self.assertEqual(sb.plan_ledger.KINDS[:13], ("proof", "verdict", "consensus", "waiver", "round", "lane_session", "lane", "response", "escalation", "decision", "abandoned", "reminder", "review_record"))
+
+    def test_u3_a_ledger_with_item_entries_reads_with_the_chain_intact_and_read_ledger_never_looks_at_kinds(self):
+        self.register()
+        self.verdict("t1")
+        self.assertEqual(sb.plan_ledger.read_ledger(self.state)[1], None)
+        tree = ast.parse(Path(sb.plan_ledger.__file__).read_text())
+        func = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "read_ledger")
+        names = {n.id for n in ast.walk(func) if isinstance(n, ast.Name)}
+        self.assertFalse(names & {"KINDS", "ITEM_KINDS", "EVIDENCE_KINDS"}, "read_ledger must not judge kinds: an older build must read a ledger with item entries")
+
+    def test_u1_the_pull_request_rules_are_untouched(self):
+        import subprocess as sp
+        for name in ("may_record_verdict", "scenario_state", "authors_of"):
+            self.assertTrue(callable(getattr(sb.plan_ledger, name)))
+        text = Path(sb.__file__ if hasattr(sb, "__file__") else SWITCHBOARD).read_text() if False else SWITCHBOARD.read_text()
+        for name in ("ci_record_core", "launched_testers_for"):
+            self.assertEqual(text.count("def %s(" % name), 1)
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.

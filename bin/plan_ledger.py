@@ -24,7 +24,8 @@ HEAD_FILE = "plan-ledger.head"   # {"seq", "hash"} of the newest entry: a second
 GENESIS = "0" * 64
 EVIDENCE_KINDS = ("proof", "verdict", "consensus", "waiver")   # a consensus entry is written by the plan review engine (a later slice)
 REVIEW_KINDS = ("round", "lane_session", "lane", "response", "escalation", "decision", "abandoned", "reminder", "review_record")   # the plan review engine's records (#109)
-KINDS = EVIDENCE_KINDS + REVIEW_KINDS
+ITEM_KINDS = ("item_tester",)   # #770: the registration of a tester for a work item that has no pull request; written by `launch` only (bin/item_verdicts.py)
+KINDS = EVIDENCE_KINDS + REVIEW_KINDS + ITEM_KINDS
 RESULTS = ("pass", "fail")
 EVIDENCE_LIMIT = 500
 FIELD_LIMIT = 200
@@ -393,6 +394,8 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             ci = (facts or {}).get("ci")
             if ci in ("green", "passing"):
                 row.update(status="ok", detail="CI %s at %s" % (ci, (head or "?")[:8]))
+            elif (facts or {}).get("draft") is True and ci == "none":   # #770: a draft whose workflow skips drafts has no run at all, and "CI is failing" sends the author the wrong way; a draft WITH runs keeps the failing line
+                row.update(status="missing", missing=["draft: no CI run seen; this repo's workflow may skip drafts; mark ready, then wait"])
             else:
                 row.update(status="missing", missing=["CI is %s (needs green at the head, or a second agent's re-run)" % (ci or "unknown")])
         elif gid == "G5":
@@ -535,7 +538,7 @@ def validate_plan_gates(raw, source):
         seen[normal_repo(name)] = name
         if not isinstance(entry, dict):
             raise ValueError("%s: 'plan_gates.repos.%s' must be an object" % (source, name))
-        extra = sorted(set(entry) - {"mode", "enabled", "budget_ms", "enforce_gates"})
+        extra = sorted(set(entry) - {"mode", "enabled", "budget_ms", "enforce_gates", "item_checks"})
         if extra:
             raise ValueError("%s: 'plan_gates.repos.%s' has key(s) this tool does not read: %s" % (source, name, ", ".join(extra)))
         mode = entry.get("mode", "shadow")
@@ -554,6 +557,8 @@ def validate_plan_gates(raw, source):
             raise ValueError("%s: 'plan_gates.repos.%s.enforce_gates' must be a non-empty list of distinct gates from %s "
                              "(default %s), got %r" % (source, name, ", ".join(ENFORCEABLE), ", ".join(DEFAULT_ENFORCED), gates))
         repos[name] = {"mode": mode, "enabled": enabled, "budget_ms": budget, "enforce_gates": [g for g in ENFORCEABLE if g in gates]}
+        if "item_checks" in entry:   # #770: declared and validated by bin/item_verdicts.py; carried here untouched, and absent when the repo does not list it
+            repos[name]["item_checks"] = entry["item_checks"]
     record = raw.get("ci_record") if raw.get("ci_record") is not None else {}
     if not isinstance(record, dict) or set(record) - {"enabled", "calls_per_pass", "pass_seconds"}:
         raise ValueError("%s: 'plan_gates.ci_record' must be an object with enabled, calls_per_pass and pass_seconds" % source)
