@@ -64334,7 +64334,7 @@ class TestItemVerdicts(unittest.TestCase):
         launch = sb.load_launch_testers().launched(self.fleets, self.sessions, self.REPO, lambda f: f.get("repo"), retired or {})
         item = kw.get("item_key") or self.ITEM
         with mock.patch.object(sb, "item_context", lambda a, r, n, w: self.ctx(item=item)), mock.patch.object(sb, "identify_caller", lambda *a: caller), \
-                mock.patch.object(sb, "launched_testers_for", lambda c: (launch, self.sessions, self.fleets)):
+                mock.patch.object(sb, "item_agents", lambda c: (launch, self.sessions, self.fleets)):
             try:
                 return sb.cmd_item_verdict(self.args(**{k: v for k, v in kw.items() if k != "item_key"}), None, self.now), None
             except sb.LedgerCommandError as err:
@@ -64523,7 +64523,7 @@ class TestItemVerdicts(unittest.TestCase):
         results = {}
         for sid in ("S1", "S5"):
             with mock.patch.object(sb, "item_context", lambda a, r, n, w: self.ctx(own=False)), mock.patch.object(sb, "identify_caller", lambda *a: "t1"), \
-                    mock.patch.object(sb, "launched_testers_for", lambda c: (launch, self.sessions, self.fleets)):
+                    mock.patch.object(sb, "item_agents", lambda c: (launch, self.sessions, self.fleets)):
                 try:
                     results[sid] = sb.cmd_item_verdict(self.args(scenario=sid), None, self.now)
                 except sb.LedgerCommandError as err:
@@ -64573,7 +64573,7 @@ class TestItemVerdicts(unittest.TestCase):
         self.verdict("t1")
         before = sb.item_gates_report(self.ctx(), self.iv.excluded(self.ITEM, self.N, None, "human", self.entries(), self.fleets, self.sessions))
         self.assertEqual(next(r for r in before["scenarios"] if r["id"] == "S1")["verdict"]["by"], "t1")
-        sb.plan_ledger.append_entry(self.state, {"kind": "proof", "pr": self.ITEM, "scenario": "S1", "plan_hash": "sha256:p", "head": self.PIN, "result": "pass", "by": "t1"}, self.now())
+        self.assertEqual(self.prove("t1")[0], sb.EXIT_OK)
         after = sb.item_gates_report(self.ctx(), self.iv.excluded(self.ITEM, self.N, None, "human", self.entries(), self.fleets, self.sessions))
         row = next(r for r in after["scenarios"] if r["id"] == "S1")
         self.assertEqual(row["status"], "missing")
@@ -64582,13 +64582,13 @@ class TestItemVerdicts(unittest.TestCase):
     def test_s9_mutant_computing_the_writers_at_write_time_only_still_reads_ok(self):
         self.register()
         self.verdict("t1")
-        sb.plan_ledger.append_entry(self.state, {"kind": "proof", "pr": self.ITEM, "scenario": "S1", "plan_hash": "sha256:p", "head": self.PIN, "result": "pass", "by": "t1"}, self.now())
+        self.assertEqual(self.prove("t1")[0], sb.EXIT_OK)
         report = sb.item_gates_report(self.ctx(), set())          # the mutant reads with no writers
         self.assertEqual(next(r for r in report["scenarios"] if r["id"] == "S1")["status"], "ok")
 
     def test_s17_a_registered_tester_that_reports_done_keeps_its_verdict_and_a_coders_report_excludes_the_coder(self):
         self.register()
-        sb.plan_ledger.append_entry(self.state, {"kind": "proof", "pr": self.ITEM, "scenario": "S1", "plan_hash": "sha256:p", "head": self.PIN, "result": "pass", "by": "c1"}, self.now())
+        self.assertEqual(self.prove("c1")[0], sb.EXIT_OK)
         self.assertEqual(self.verdict("t1")[0], sb.EXIT_OK)
         writers = self.iv.excluded(self.ITEM, self.N, None, "human", self.entries(), self.fleets, self.sessions)   # a report by t1 adds nobody: reports are not read
         self.assertNotIn("t1", writers)
@@ -64749,6 +64749,171 @@ class TestItemVerdicts(unittest.TestCase):
         self.assertTrue(self.iv.lane_ok([777, 770, 587], 587))
         self.assertFalse(self.iv.lane_ok([777, 770], 587))
         self.assertFalse(self.iv.lane_ok([777], None))
+
+    # ---- the pull request commands never write for an item; gates item reads only what the item path wrote; the read fails closed; the append re-checks
+    def pr_path(self, command, caller="t2", picture=(None, "PLAN: acme-org/widget-service#777", [], "no pull request found"), **kw):
+        """Run an ORDINARY pull request command (`prove`, `verdict`, `gates ci-record`, `waive`) with --pr naming the item's number."""
+        args = types.SimpleNamespace(pr=self.ITEM, plan=None, ask=None, head=self.PIN, scenario="S1", all_scenarios=False, evaluator="tester", result="pass", evidence="x",
+                                     command=None, gates="G1", reason="a long enough reason to waive")
+        for k, v in kw.items():
+            setattr(args, k, v)
+        ctx = self.ctx()
+        launch = sb.load_launch_testers().launched(self.fleets, self.sessions, self.REPO, lambda f: f.get("repo"), {})
+        with mock.patch.object(sb, "build_engine", lambda *a, **k: (ctx.engine, self.state, {"intent_repo": self.REPO})), mock.patch.object(sb, "pr_picture", lambda *a: picture), \
+                mock.patch.object(sb, "identify_caller", lambda *a: caller), mock.patch.object(sb, "checked_plan", lambda *a, **k: self.plan), \
+                mock.patch.object(sb, "launched_testers_for", lambda c: (launch, self.sessions, self.fleets)), mock.patch.object(sb, "gates_caller_kind", lambda *a: ("agent", "x", "chief-of-staff")):
+            try:
+                return getattr(sb, command)(args, None, self.now), None
+            except sb.LedgerCommandError as err:
+                return None, str(err)
+
+    def issue_page(self):
+        self.pages["repos/%s/issues/777" % self.REPO] = {"user": {"login": "human"}, "body": "", "state": "open"}
+
+    def test_a_pull_request_command_refuses_an_issue_number_and_writes_nothing(self):
+        self.issue_page()
+        self.register("t1")
+        self.register("t2", item="acme-org/widget-service#778", head=self.MOVED)
+        before = len(self.entries())
+        for command in ("cmd_prove", "cmd_verdict", "cmd_gates_ci_record", "cmd_waive"):
+            for caller in ("t2", "t1"):         # a tester registered for ANOTHER item, and the tester registered for this one
+                code, why = self.pr_path(command, caller=caller, scenario=["S1"] if command == "cmd_prove" else "S1", pr=self.ITEM)
+                self.assertIsNone(code, (command, caller))
+                self.assertTrue("work item" in why or "is an issue" in why, (command, caller, why))
+        self.assertEqual(len(self.entries()), before)           # nothing was written by any of them
+
+    def test_a_pull_request_command_refuses_an_issue_number_that_has_no_registration_too(self):
+        self.issue_page()
+        for command in ("cmd_verdict", "cmd_prove"):
+            code, why = self.pr_path(command, scenario=["S1"] if command == "cmd_prove" else "S1")
+            self.assertIsNone(code)
+            self.assertIn("is an issue, not a pull request", why)
+        self.assertEqual(self.entries(), [])
+
+    def test_mutant_without_the_refusal_the_pull_request_command_writes_the_item_verdict_around_every_defence(self):
+        self.issue_page()
+        sb.plan_ledger.append_entry(self.state, {"kind": "proof", "pr": self.ITEM, "scenario": "S9", "plan_hash": "sha256:p", "head": self.PIN, "result": "pass", "by": "c1"}, self.now())
+        with mock.patch.object(sb, "item_entry_refusal", lambda *a: None):
+            code, why = self.pr_path("cmd_verdict")              # t2 is registered for nothing, and there is no registration for the item
+        self.assertEqual(code, sb.EXIT_OK, why)
+        forged = [e for e in self.entries() if e.get("kind") == "verdict"]
+        self.assertEqual([(e["by"], e["pr"]) for e in forged], [("t2", self.ITEM)])
+        # and with the refusal in place the same call is refused (the real guard), while gates item would ignore the entry anyway
+        self.assertIsNone(self.pr_path("cmd_verdict")[0])
+
+    def test_a_real_pull_request_is_unaffected_by_the_refusal(self):
+        self.issue_page()
+        facts = {"head": self.PIN, "ci": "green"}
+        ctx = self.ctx()
+        ctx.engine.intents = types.SimpleNamespace(_api=lambda *a, **k: (_ for _ in ()).throw(AssertionError("a readable pull request must not be looked up as an issue")))
+        with mock.patch.object(sb, "pr_picture", lambda *a: (facts, "", [], None)):
+            args = types.SimpleNamespace(pr="acme-org/widget-service#9", plan=None, ask=None)
+            got = sb._ledger_context(args, None, self.now, True, parts=(ctx.engine, self.state, {"intent_repo": self.REPO}))
+        self.assertEqual((got.pr, got.facts["head"]), ("acme-org/widget-service#9", self.PIN))
+
+    def test_gates_item_ignores_an_entry_it_cannot_tie_to_the_item_path(self):
+        self.register("t1")
+        entry = {"plan_hash": "sha256:p", "head": self.PIN, "result": "pass", "pr": self.ITEM, "scenario": "S1"}
+        sb.plan_ledger.append_entry(self.state, dict(entry, kind="proof", by="c9"), self.now())
+        sb.plan_ledger.append_entry(self.state, dict(entry, kind="verdict", by="t2", evaluator="tester"), self.now())       # what the pull request path used to write
+        writers = self.iv.excluded(self.ITEM, self.N, None, "human", self.entries(), self.fleets, self.sessions)
+        report = sb.item_gates_report(self.ctx(), writers)
+        row = next(r for r in report["scenarios"] if r["id"] == "S1")
+        self.assertEqual(row["status"], "missing")
+        self.assertEqual((row["proof"], row["verdict"]), (None, None))
+        with mock.patch.object(self.iv, "visible", lambda entries, item, recorder: entries):         # mutant: no tie to the item path
+            row = next(r for r in sb.item_gates_report(self.ctx(), writers)["scenarios"] if r["id"] == "S1")
+        self.assertEqual(row["status"], "ok")
+
+    def test_a_tester_verdict_counts_only_for_a_tester_registered_when_it_wrote_it(self):
+        self.register("t1")
+        self.assertEqual(self.prove("c1")[0], sb.EXIT_OK)
+        self.assertEqual(self.verdict("t1")[0], sb.EXIT_OK)
+        good = next(e for e in self.entries() if e.get("kind") == "verdict")
+        self.assertTrue(self.iv.tied(good, self.entries(), sb.plan_ledger.CI_RECORDER))
+        self.clock[0] += 3 * 24 * 3600                                  # read long after the registration expired (a finished, retired tester keeps its verdicts)
+        self.assertTrue(self.iv.tied(good, self.entries(), sb.plan_ledger.CI_RECORDER))
+        for forged in (dict(good, session="ses_other"), dict(good, by="t2"), dict(good, via="pr"), dict(good, seq=1)):
+            self.assertFalse(self.iv.tied(forged, self.entries(), sb.plan_ledger.CI_RECORDER), forged)
+        stale = dict(good, ts=good["ts"] + self.iv.TTL + 1)             # written after the registration had expired
+        self.assertFalse(self.iv.tied(stale, self.entries(), sb.plan_ledger.CI_RECORDER))
+
+    def unreadable_world(self):
+        self.register("t1")
+        self.fleets["nt"] = {"role": "tester", "repo": self.REPO, "reports_to": "orch", "launched_by": "orch", "issue": self.N}
+        self.sessions["nt"] = self.sessions["c1"]                       # a tester in the session of the item's coder
+        self.register("nt")
+        self.assertEqual(self.prove("c1")[0], sb.EXIT_OK)
+        sb.plan_ledger.append_entry(self.state, {"kind": "verdict", "pr": self.ITEM, "scenario": "S1", "plan_ref": "plan", "plan_hash": "sha256:p", "head": self.PIN, "result": "pass",
+                                                 "by": "nt", "evaluator": "tester", "evidence": "x", "via": "item", "session": self.sessions["c1"]}, self.now())
+
+    def gates_item(self, agents):
+        ctx = self.ctx()
+        args = types.SimpleNamespace(rest=[self.ITEM], plan=None, ask=None, json=True, item=None)
+        out = io.StringIO()
+        with mock.patch.object(sb, "item_context", lambda a, r, n, w: ctx), mock.patch.object(sb, "item_agents", agents), contextlib.redirect_stdout(out):
+            code = sb.cmd_item_gates(args, None, self.now)
+        return code, json.loads(out.getvalue())
+
+    def test_gates_item_fails_closed_when_the_running_agents_cannot_be_read(self):
+        self.unreadable_world()
+        launch = sb.load_launch_testers().launched(self.fleets, self.sessions, self.REPO, lambda f: f.get("repo"), {})
+        code, report = self.gates_item(lambda c: (launch, self.sessions, self.fleets))
+        self.assertEqual(next(r for r in report["scenarios"] if r["id"] == "S1")["status"], "missing")      # agents read: the session-mate of a coder is excluded
+
+        def broken(ctx):
+            raise sb.ItemAgentsUnreadable("the running agents cannot be read (OSError: down)")
+        code, report = self.gates_item(broken)
+        self.assertEqual((code, report["ready"], report["scenarios"]), (sb.EXIT_ERROR, False, []))
+        self.assertIn("NOT READY", report["rows"][0]["missing"][0])
+        code, report = self.gates_item(lambda c: ({}, {}, {}))         # mutant: fail open, the writer set shrinks to the author, the proofs and the registrar
+        self.assertEqual(next(r for r in report["scenarios"] if r["id"] == "S1")["status"], "ok")
+
+    def test_item_agents_raises_when_discovery_or_the_retired_list_fails(self):
+        ctx = self.ctx()
+        ctx.engine.now = lambda: self.now()
+        ctx.engine.discover = lambda now: (_ for _ in ()).throw(OSError("herdr down"))
+        with self.assertRaises(sb.ItemAgentsUnreadable):
+            sb.item_agents(ctx)
+
+    def test_the_append_rechecks_the_ledger_under_the_lock_and_refuses_a_replaced_registration(self):
+        self.register()
+        real = sb.plan_ledger.append_many_checked
+
+        def racing(state, build, now):      # between the reads and the append another registration (a new pin) lands
+            sb.plan_ledger.append_entry(state, {"kind": "item_tester", "pr": self.ITEM, "item": self.ITEM, "tester": "t1", "session": "ses_t1", "orchestrator": "orch", "head": self.MOVED,
+                                                "plan_ref": None, "by": "orch"}, self.now())
+            return real(state, build, now)
+        with mock.patch.object(sb.plan_ledger, "append_many_checked", racing):
+            code, why = self.verdict("t1")
+        self.assertIsNone(code)
+        self.assertIn("reference commit", why)
+        self.assertEqual(self.verdicts(), [])
+        self.assertEqual([a for e, s, a in self.audit if e == "plan.item.refused"][-1]["stage"], "append")
+        self.audit.clear()
+        self.setUp()
+        self.register()
+
+        def unchecked(state, build, now):   # mutant: the check made on the snapshot from BEFORE the race (what the old append amounted to)
+            snapshot = sb.plan_ledger.read_ledger(state)[0]
+            sb.plan_ledger.append_entry(state, {"kind": "item_tester", "pr": self.ITEM, "item": self.ITEM, "tester": "t1", "session": "ses_t1", "orchestrator": "orch", "head": self.MOVED,
+                                                "plan_ref": None, "by": "orch"}, self.now())
+            return sb.plan_ledger.append_many(state, build(snapshot), now)
+        with mock.patch.object(sb.plan_ledger, "append_many_checked", unchecked):
+            self.assertEqual(self.verdict("t1")[0], sb.EXIT_OK)         # without the re-check the verdict at the old pin is written
+
+    def test_append_many_checked_refuses_with_the_ledger_unchanged(self):
+        self.register()
+        before = self.entries()
+
+        def refuse(entries):
+            raise sb.plan_ledger.LedgerError("no")
+        with self.assertRaises(sb.plan_ledger.LedgerError):
+            sb.plan_ledger.append_many_checked(self.state, refuse, self.now())
+        self.assertEqual(self.entries(), before)
+        got = sb.plan_ledger.append_many_checked(self.state, lambda have: [{"kind": "verdict", "pr": self.ITEM, "scenario": "S1", "result": "pass"}] * 2, self.now())
+        self.assertEqual([e["seq"] for e in got], [len(before) + 1, len(before) + 2])
+        self.assertIsNone(sb.plan_ledger.read_ledger(self.state)[1])
 
     def test_u1_the_pull_request_rules_are_untouched(self):
         import subprocess as sp

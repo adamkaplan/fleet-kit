@@ -144,3 +144,29 @@ def lane_ok(chain, charter):
 
 def sha_ok(text):
     return isinstance(text, str) and re.fullmatch(r"[0-9a-f]{40}", text) is not None
+
+
+def ledger_writers(item, number, issue_author, entries):
+    """The part of the writer set that lives in the ledger alone (the issue's author, the item's proof writers, its registering orchestrators): what `append_many_checked` can
+    re-check under the lock, with no agent read."""
+    return excluded(item, number, None, issue_author, entries, {}, {})
+
+
+def tied(entry, entries, recorder):
+    """True when a proof or verdict of an item can be tied to the ITEM path: written by `item-prove`, `item-verdict` or `item-ci-record` (they mark it `via: item`), and for a tester
+    verdict, by a tester that held a live registration for this item WHEN it wrote it (the registration entry before it, the same session, under TTL: a finished tester that has
+    retired keeps its verdicts). A pull request command cannot produce such an entry (it refuses an issue number), so an entry it did write earlier is ignored."""
+    if entry.get("via") != "item":
+        return False
+    if entry.get("kind") != "verdict" or entry.get("evaluator") != "tester":
+        return entry.get("kind") == "proof" or (entry.get("evaluator") == "ci" and entry.get("by") == recorder)
+    for reg in registrations(entries, entry.get("pr")):
+        if (reg.get("tester") == entry.get("by") and reg.get("session") == entry.get("session") and reg.get("seq", 0) < entry.get("seq", 0)
+                and isinstance(reg.get("ts"), (int, float)) and isinstance(entry.get("ts"), (int, float)) and 0 <= entry["ts"] - reg["ts"] <= TTL):
+            return True
+    return False
+
+
+def visible(entries, item, recorder):
+    """The ledger as `gates item` reads it: every entry, except a proof or verdict of this item that cannot be tied to the item path."""
+    return [e for e in entries if e.get("pr") != item or e.get("kind") not in ("proof", "verdict") or tied(e, entries, recorder)]

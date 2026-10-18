@@ -163,6 +163,38 @@ def append_many(state_dir, entries_in, now):
     return stored
 
 
+def append_many_checked(state_dir, build, now):
+    """`append_many` with the DECISION inside the exclusive lock (#770): `build(entries)` is called under the lock with the chain as it stands and returns the list of entries to
+    write, or raises LedgerError to refuse; all of them are chained and written with ONE write, or none. The slow reads (the running agents) are made BEFORE this, never under the
+    lock; only what lives in the ledger is re-checked here."""
+    path = Path(state_dir) / LEDGER_FILE
+    fd = os.open(str(path), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        have, problem = read_ledger(state_dir)
+        if problem:
+            raise LedgerError("the ledger is not trustworthy, nothing was recorded: %s" % problem)
+        entries_in = build(have)
+        for entry in entries_in:
+            if entry.get("kind") not in KINDS or (entry.get("kind") in EVIDENCE_KINDS and entry.get("result") not in RESULTS):
+                raise LedgerError("an entry is a proof, a verdict, a consensus or a waiver with a result of pass or fail, or a plan review record")
+        stored, prev = [], have[-1]["hash"] if have else GENESIS
+        for number, entry in enumerate(entries_in, start=len(have) + 1):
+            one = dict(entry, seq=number, ts=int(now), prev=prev)
+            one["hash"] = entry_hash(one)
+            stored.append(one)
+            prev = one["hash"]
+        if stored:
+            data = "".join(json.dumps(one, sort_keys=True, ensure_ascii=False) + "\n" for one in stored).encode("utf-8")
+            if os.write(fd, data) != len(data):
+                raise LedgerError("the ledger write was short: nothing was recorded")
+            os.fsync(fd)
+            _write_head(state_dir, stored[-1])
+    finally:
+        os.close(fd)
+    return stored
+
+
 # ----------------------------------------------------------------------------------- who may do what
 
 def evaluator_of(scenario):
