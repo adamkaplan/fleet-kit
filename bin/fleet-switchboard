@@ -19101,10 +19101,6 @@ def cmd_prove(args, runner, now):
     line: recorded (stdout), or already recorded at this head and plan hash (stdout, counts as recorded), or refused with its
     reason (stderr). Exit 0 when every named scenario is recorded; EXIT_PARTIAL when any was refused. What applies to the whole
     command (no plan, a failing plan check, no caller, no evidence, an unknown head) stays a usage error: nothing is recorded."""
-    if getattr(args, "item", None):   # #770: a work item with no pull request has its own rules (cmd_item_prove)
-        return cmd_item_prove(args, runner, now)
-    if not args.pr:
-        raise LedgerCommandError("name the pull request (--pr <repo#N>) or the work item (--item <repo#N>)")
     ctx = _ledger_context(args, runner, now, True)
     caller = identify_caller(ctx.engine.herdr, ctx.engine.v2, os.environ)
     _plan_usable(ctx)
@@ -19159,10 +19155,6 @@ def launched_testers_for(ctx):
 def cmd_verdict(args, runner, now):
     """`verdict <scenario> --pr <repo#N> --as <evaluator> --result ...`: record the evaluator's verdict for a scenario. Only
     the evaluator the scenario names, only by an agent registered for it (`plan_evaluators`), never by a writer of the PR."""
-    if getattr(args, "item", None):   # #770: a work item with no pull request has its own rules (cmd_item_verdict)
-        return cmd_item_verdict(args, runner, now)
-    if not args.pr:
-        raise LedgerCommandError("name the pull request (--pr <repo#N>) or the work item (--item <repo#N>)")
     ctx = _ledger_context(args, runner, now, True)
     every = bool(getattr(args, "all_scenarios", False))
     if every:   # `--all`: every per-PR scenario this evaluator judges, in one command; never another evaluator's
@@ -19496,6 +19488,10 @@ def cmd_item_verdict(args, runner, now):
                                                "chain": one["hash"], "registration_seq": reg.get("seq")})
         print("recorded tester verdict #%d: %s %s at %s (%s)" % (one["seq"], entry["scenario"], args.result, head[:8], ctx.item))
     return EXIT_OK
+
+
+cmd_item_prove.ledger = True      # state and GETs only; its own errors are usage errors
+cmd_item_verdict.ledger = True
 
 
 def item_gates_report(ctx, writers):
@@ -21254,8 +21250,7 @@ def add_ledger_parsers(sub):
     def common(p, scenario=True, multi=False):
         if scenario:
             p.add_argument("scenario", nargs="+" if multi else None, help="The scenario id in the plan (S1, U2, ...)")
-            p.add_argument("--pr", help="The pull request: owner/repo#N or its URL (or --item for a work item with no pull request)")
-            p.add_argument("--item", help="A work item with no pull request: owner/repo#N of an issue (its own rules: its orchestrator's registered tester; see plan fleet-kit#777)")
+            p.add_argument("--pr", required=True, help="The pull request: owner/repo#N or its URL")
         else:
             p.add_argument("pr", help="The pull request: owner/repo#N or its URL")
         p.add_argument("--plan", help="The plan: owner/repo#N or an issue URL (default: the one the PR's ledger entries "
@@ -21278,6 +21273,21 @@ def add_ledger_parsers(sub):
     verdict.add_argument("--as", dest="evaluator", required=True, choices=("ci", "tester", "reviewer", "owner"))
     verdict.add_argument("--result", choices=("pass", "fail"), required=True)
     verdict.add_argument("--evidence", required=True, help="A link, or the evaluator's own artefact")
+    # #770: a work item with no pull request has its own commands (the pull request commands above keep their exact surface)
+    iprove = sub.add_parser("item-prove", help="Record proof for a plan scenario of a work item that has no pull request, at its reference commit")
+    iverdict = sub.add_parser("item-verdict", help="A tester registered for a work item (by its orchestrator's launch) records its verdict, at the item's reference commit")
+    for p in (iprove, iverdict):
+        p.add_argument("scenario", nargs="+" if p is iprove else "?", default=None if p is iverdict else argparse.SUPPRESS, help="The scenario id in the item's plan (S1, U2, ...)")
+        p.add_argument("--item", required=True, help="The work item: owner/repo#N of an ISSUE (a pull request is refused: use prove/verdict --pr)")
+        p.add_argument("--plan", help="Only repeats the plan the issue body links with `PLAN:`")
+        p.add_argument("--ask", help="The ask whose Done-when the plan must cover")
+        p.add_argument("--head", help="The item's reference commit (default: the one pinned at registration)")
+        p.add_argument("--evidence", required=True, help="A link, or what you ran and saw")
+    iprove.add_argument("--result", choices=("pass", "fail"), default="pass")
+    iprove.add_argument("--command", help="The command you ran, if any")
+    iverdict.add_argument("--all", dest="all_scenarios", action="store_true", help="Every scenario of the plan this item may claim and the tester judges")
+    iverdict.add_argument("--as", dest="evaluator", default="tester", choices=("tester",), help="Only tester verdicts: `ci` is recorded by `gates item-ci-record`")
+    iverdict.add_argument("--result", choices=("pass", "fail"), required=True)
     waive = sub.add_parser("waive", help="The chief of staff's logged override of gates G0 to G5 for one PR at its head (a hotfix); "
                                          "never G6, G7 or G8, never by a writer of the PR",
                            description="Waive gates G0 to G5 for ONE PR at its CURRENT head, for a hotfix: the chief of staff (or a "
