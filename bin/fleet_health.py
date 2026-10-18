@@ -311,18 +311,33 @@ def held_prs(state_dir):
     return out
 
 
-PR_LINKS_MAX = 500
+PR_REFS_MAX = 10      # references kept for one pull request
+HELD_LINKS_MAX = 200  # held pull requests resolved in one pass
 
 
-def update_pr_links(state, rows, now):
-    """Remember, for each pull request a movement row names, the issues on its chain (its body's `Closes`, `Part of` and `PLAN:` references and their parents): a held pull request waits longer than the
-    movement rows are kept, so the link is kept in the load state. Newest 500 kept."""
-    links = state.setdefault("pr_links", {})
-    for row in rows:
-        if row.get("kind") in ("push", "pr_opened") and len(row.get("numbers") or []) > 1 and row.get("repo"):
-            links["%s#%d" % (str(row["repo"]).lower(), row["numbers"][0])] = {"at": row["at"], "numbers": list(row["numbers"][1:])}
-    while len(links) > PR_LINKS_MAX:
-        links.pop(min(links, key=lambda k: links[k]["at"]))
+def resolve_held_links(ctx, state, budget, held, now, problems):
+    """{"owner/repo#N" (lower case): {(repo, number), ...}}: for each held pull request, the issues it is linked to, from `ctx.pr_refs` (the strict references the daemon read from the CURRENT body of its notice facts:
+    its first-line `PLAN:` link and its `Closes` / `Part of` lines, never prose or a branch name) and each one's parents (the cached, budgeted parent reads the pass already makes). Rebuilt in full every pass, so a
+    reference removed from the body is gone at the next pass; the full `owner/repo` is compared, never the name alone."""
+    refs = getattr(ctx, "pr_refs", None) or {}
+    out = {}
+    for row in held[:HELD_LINKS_MAX]:
+        key = "%s#%d" % (row["repo"].lower(), row["number"])
+        found = set()
+        for ref in (refs.get(key) or [])[:PR_REFS_MAX]:
+            if not (isinstance(ref, (list, tuple)) and len(ref) == 2 and isinstance(ref[1], int) and not isinstance(ref[1], bool) and ref[1] > 0):
+                continue
+            repo = ref[0] if isinstance(ref[0], str) and _REPO_SHAPE.match(ref[0]) and "/" in ref[0] else row["repo"]
+            found.add((repo.lower(), ref[1]))
+            cur = ref[1]
+            for _ in range(PARENT_LEVELS):
+                parent, resolved = _parent_of(ctx, state, budget, repo, cur, now, problems)
+                if not resolved or not parent:
+                    break
+                found.add((repo.lower(), parent))
+                cur = parent
+        out[key] = found
+    return out
 
 
 def serving_waits(asks, held, links, reminders, names, now, stalled_hours):
@@ -333,7 +348,7 @@ def serving_waits(asks, held, links, reminders, names, now, stalled_hours):
         best = None
         for row in held:
             link = links.get("%s#%d" % (row["repo"].lower(), row["number"]))
-            if not link or ask["number"] not in link["numbers"] or not _same_repo(ask["repo"], row["repo"]):
+            if not link or (str(ask["repo"]).lower(), ask["number"]) not in {tuple(x) for x in link}:   # the full owner/repo and the number: the name of a repository alone is never enough
                 continue
             if row["tier"] == "human":
                 best = "owner_pr"
@@ -341,7 +356,7 @@ def serving_waits(asks, held, links, reminders, names, now, stalled_hours):
             if row["since"] is not None and now - row["since"] < stalled_hours * 3600:
                 best = "cos_pr"
         if best is None and any(r.get("issue") == ask["number"] and not isinstance(r.get("issue"), bool) and r.get("to") in names
-                                and isinstance(r.get("at"), (int, float)) and r["at"] > now and _same_repo(ask["repo"], r.get("repo")) for r in reminders):
+                                and isinstance(r.get("at"), (int, float)) and r["at"] > now and (not r.get("repo") or str(r["repo"]).lower() == str(ask["repo"]).lower()) for r in reminders):
             best = "time"
         if best:
             out[(ask["repo"], ask["number"])] = best
@@ -759,6 +774,8 @@ def _refresh_asks(ctx, state, now, rows=()):
     state["unattributed"] = unattributed
     counts, nobody, notices = attribute_decisions(ctx, state, budget, asks_by_name, charter_numbers, now, problems)
     state["decision_counts"], state["decisions_unattributed"], state["pr_notices"] = counts, nobody, notices
+    held = held_prs(ctx.state_dir)
+    state["held_links"] = {k: sorted(v) for k, v in resolve_held_links(ctx, state, budget, held, now, problems).items()}
     state["reads"] = budget.to_state()
     return problems, rows
 
@@ -771,7 +788,6 @@ def tick(ctx):
     audited = audit_moves(ctx.state_dir, now - 24 * 3600)
     rows += audited or []
     problems, rows = _refresh_asks(ctx, state, now, rows)
-    update_pr_links(state, rows, now)
     held, reminders = held_prs(ctx.state_dir), list(getattr(ctx, "reminders", None) or [])
     if audited is None:
         problems.append("movement: the audit log cannot be read")
@@ -794,7 +810,7 @@ def tick(ctx):
             unchartered.append(name)
         if asks:
             names = {name} | set(info.get("workers") or [])
-            serving = serving_waits(asks, held, state.get("pr_links") or {}, reminders, names, now, ctx.cfg["stalled_hours"])
+            serving = serving_waits(asks, held, state.get("held_links") or {}, reminders, names, now, ctx.cfg["stalled_hours"])
             asks = [dict(a, via_pr=serving[(a["repo"], a["number"])]) if serving.get((a["repo"], a["number"])) in ("owner_pr", "cos_pr")
                     else dict(a, timed=True) if serving.get((a["repo"], a["number"])) == "time" else a for a in asks]
         fig = figures(name, {"asks": asks, "busy": info["busy"], "idle": info["idle"], "messages": info["messages"],

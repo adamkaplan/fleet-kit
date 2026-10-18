@@ -58593,7 +58593,8 @@ class TestLoadAlert(Base):
                 raise RuntimeError("gh is down")
             return [{"repo": "acme/widget", "number": n} for n in self.asks[charter]]
         ctx = self.health.Context(now=at, state_dir=str(self.state_dir), cfg=dict(self.health.DEFAULTS, **dict({"enabled": True}, **cfg)), orchestrators=orchestrators,
-                                  read_asks=read_asks, cos="cos", wake=self.woken.append, reminders=list(getattr(self, "reminders", [])))
+                                  read_asks=read_asks, cos="cos", wake=self.woken.append, reminders=list(getattr(self, "reminders", [])), pr_refs=dict(getattr(self, "pr_refs", {})),
+                                  **({"read_parent": lambda repo, n: self.parents.get(n)} if getattr(self, "parents", None) is not None else {}))
         return self.health.tick(ctx)
 
     def latest(self):
@@ -58603,7 +58604,7 @@ class TestLoadAlert(Base):
         self.health.append_moves(str(self.state_dir), [{"at": at, "repo": "acme/widget", "numbers": [number], "kind": kind}])
 
     # ---- #757: an ask waiting on a held PR or on a set time is not stalled
-    def held_world(self, tier="human", since_ago=3600, link=True, pr=50, reminders=(), extra_asks=()):
+    def held_world(self, tier="human", since_ago=3600, link=True, pr=50, reminders=(), extra_asks=(), refs=None, pr_repo="acme/widget"):
         """Ask 1 (unmoved for 3 h at the second pass) and, when `link`, a held PR #pr whose body names it; returns the figures of orchestrator `o`."""
         self.asks = {1: [1] + list(extra_asks)}
         self.reminders = list(reminders)
@@ -58611,10 +58612,10 @@ class TestLoadAlert(Base):
         self.tick(self.T0, orchestrators)
         late = self.T0 + 3 * 3600
         if link:
-            self.health.append_moves(str(self.state_dir), [{"at": self.T0 + 60, "repo": "acme/widget", "numbers": [pr, 1], "refs": [1], "kind": "pr_opened"}])
+            self.pr_refs = {"%s#%d" % (pr_repo, pr): [["acme/widget", 1]] if refs is None else refs}   # what the daemon read from the current body of the notice
         if tier:
             since = _dt.datetime.fromtimestamp(late - since_ago, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [{"kind": "captain", "repo": "acme/widget", "number": pr, "tier": tier, "since": since}]}))
+            (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [{"kind": "captain", "repo": pr_repo, "number": pr, "tier": tier, "since": since}]}))
         self.tick(late, orchestrators)
         return self.latest()["o"]
 
@@ -58654,10 +58655,33 @@ class TestLoadAlert(Base):
         path.write_text(json.dumps({"decisions": [dict(good, number=True), dict(good, repo="bad repo!"), dict(good, tier="agent"), dict(good, kind="notice"), "x", dict(good, since="garbage"), good]}))
         self.assertEqual([(r["number"], r["since"] is None) for r in self.health.held_prs(str(self.state_dir))], [(5, True), (5, False)])
 
-    def test_the_pull_request_links_keep_the_newest_500(self):
-        state = {}
-        self.health.update_pr_links(state, [{"at": n, "repo": "acme/widget", "numbers": [n, 1], "kind": "push"} for n in range(1, 502)], 600)
-        self.assertEqual((len(state["pr_links"]), "acme/widget#1" in state["pr_links"], "acme/widget#501" in state["pr_links"]), (500, False, True))
+    def test_a_link_reaches_the_ask_through_its_work_item_and_is_gone_when_the_reference_is_removed(self):
+        self.parents = {7: 1}   # work item 7 sits under ask 1 (the cached parent read)
+        got = self.held_world("human", refs=[["acme/widget", 7]])
+        self.assertEqual((got["stalled"], got["waiting_owner_pr"]), (0, 1))
+        self.pr_refs = {"acme/widget#50": []}   # the body no longer names it: the link is rebuilt each pass, nothing stale is kept
+        self.tick(self.T0 + 3 * 3600 + 120, {"o": dict(self.orch(idle=1, charter=1), workers=["w1"])})
+        self.assertEqual((self.latest()["o"]["stalled"], self.latest()["o"]["waiting_owner_pr"]), (1, 0))
+
+    def test_a_reference_to_another_ask_or_another_owners_repository_leaves_the_ask_stalled(self):
+        self.assertEqual(self.held_world("human", refs=[["acme/widget", 300]])["stalled"], 1)     # a held PR that names another issue
+        got = self.held_world("human", refs=[["other-org/widget", 1]], pr=51)                      # the same number and repository name under another owner
+        self.assertEqual((got["stalled"], got["waiting_owner_pr"]), (1, 0))
+
+    def test_a_row_of_another_owners_repository_with_the_same_name_does_not_serve_the_ask(self):
+        got = self.held_world("human", refs=[[None, 1]], pr_repo="other-org/widget")   # a same-repo `#1` of the PR's own repository, which is not this ask's
+        self.assertEqual((got["stalled"], got["waiting_owner_pr"]), (1, 0))
+
+    def test_the_notice_facts_carry_the_strict_references_of_the_current_body(self):
+        self.assertEqual(sb.pr_facts_from({"state": "OPEN", "body": "Part of #3\nsee #300"})["refs"], [[None, 3]])
+        self.assertEqual(sb.pr_facts_from({"state": "OPEN", "body": "see #300"})["refs"], [])
+
+    def test_only_the_strict_forms_of_a_pull_request_body_are_references(self):
+        refs = lambda body: sb.pr_body_refs(body)
+        self.assertEqual(refs("PLAN: https://github.com/acme/widget/issues/757#issuecomment-5\n\nPart of #756.\nCloses acme/widget#3"), [["acme/widget", 757], [None, 756], ["acme/widget", 3]])
+        self.assertEqual(refs("PLAN: acme/widget#9"), [["acme/widget", 9]])
+        for body in ("see #300 for context", "fix-756-typo and #4 mentioned", "> Closes #5", "Closes #6 and more words", "intro\nPLAN: acme/widget#8", "PLAN: not a plan", None, 7):
+            self.assertEqual(refs(body), [], body)
 
     def test_a_closed_row_does_not_exempt_the_ask(self):
         self.assertEqual(self.held_world("human")["stalled"], 0)
