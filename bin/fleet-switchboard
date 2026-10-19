@@ -12702,7 +12702,9 @@ def sweep_decisions(engine, decisions, now, errors=()):
     day = int(now // 86400)
     due = [(k, r) for k, r in findings
            if cfg["enabled"] and now - state.alarmed.get((k, r), 0) >= cfg["realarm_hours"] * 3600]   # what is queued this pass
-    woken = set(due[:cfg["max_findings"]])   # the fact names at most this many: the rest are counted, not named
+    woken = sweep_queue_fact(state, due, now, cfg) if due else set()   # #849: "woken" = the pass's wake carried the finding: the pairs the queue function set the re-alarm memory for
+    if due:
+        sweep_alarmed_save(engine, state, now, cfg)
     for kind, ref in findings:
         once = (kind, ref, day)
         if once not in state.logged or ((kind, ref) in woken and once not in state.woken_logged):
@@ -12728,9 +12730,6 @@ def sweep_decisions(engine, decisions, now, errors=()):
                      "deferred": deferred, "unchecked": unchecked,
                      "unattributed": getattr(state, "unattributed", 0)}
     sweep_write(engine, state)
-    if due:
-        sweep_queue_fact(state, due, now, cfg)
-        sweep_alarmed_save(engine, state, now, cfg)
     return kept if cfg["enabled"] else decisions
 
 
@@ -12750,6 +12749,7 @@ def sweep_queue_fact(state, due, now, cfg):
     state.facts[key] = (summary, now)
     for old in [k for k, (_, at) in state.facts.items() if now - at > cfg["realarm_hours"] * 7200]:
         del state.facts[old]
+    return set(due)   # every due finding is carried (named, or counted in "+N more") and remembered
 
 
 def sweep_write(engine, state):
@@ -13788,6 +13788,7 @@ def triage_pass(engine, decisions, now, errors=()):
             engine._note("triage.rollup", None, {"text": rolled, "at": iso(now)})
             triage_digest.write_seen(engine.state_dir, state.seen, state.meta)
     if cfg["enabled"] and (due or invalid):   # never a wake solely for other-owner flags: they ride along when a wake happens anyway
+        state.carried = set()
         text = triage_queue_fact(state, due, now, cfg, len(flagged), invalid)
         triage_digest.cost_record(engine.state_dir, now, text)
         state.meta["last"] = now
@@ -13799,7 +13800,7 @@ def triage_pass(engine, decisions, now, errors=()):
             state.alarmed[pair] = now
         for rule, _ in due:
             state.day_counts[rule] = state.day_counts.get(rule, 0) + 1
-        woken = set(due[:cfg["max_findings"]]) | set(flagged)   # #849: what the one digest named, and the flags that rode along
+        woken = set(state.carried) | set(flagged)   # #849: what the digest carried, and the other-owner flags that rode along (counted in its text, remembered below)
     else:
         woken = set()
     for rule, ref, evidence in findings:   # #849: the audit line says what was done: woken only when this pass queued a wake for it
@@ -13899,6 +13900,7 @@ def triage_queue_fact(state, due, now, cfg, other_owner=0, invalid=()):
     state.facts[key] = (summary, now)
     for old in [k for k, (_, at) in state.facts.items() if now - at > cfg["realarm_hours"] * 7200 and "summary" not in k]:
         del state.facts[old]
+    state.carried = set(shown)   # #849: what this digest carried and remembered; an overflow beyond the cap stays due
     return summary
 
 

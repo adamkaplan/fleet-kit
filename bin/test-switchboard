@@ -23227,17 +23227,51 @@ class TestSweep(Base):
                     self.sweep_real([])
                     self.assertEqual([d["woken"] for d in self.lines(ref)], [False, True])
 
-    def test_849_only_the_findings_the_fact_names_read_woken(self):
+    def test_849_an_overflow_finding_carried_by_a_capped_fact_reads_woken_and_is_remembered(self):
         kinds = sorted(sb.SWEEP_KINDS)[:2]
         refs = ["acme/api#%d" % (60 + n) for n in range(2)]
         self.engine.config["sweep"]["max_findings"] = 1
         with mock.patch.multiple(sb, sweep_findings=lambda *a, **k: list(zip(kinds, refs)), sweep_verify=lambda *a, **k: True):
             self.sweep_real([])
-        self.assertEqual(sorted(sum(([d["woken"] for d in self.lines(r)] for r in refs), [])), [False, True])
         (summary, _), = self.engine.sweep.facts.values()
-        woken = [r for r in refs if self.lines(r)[0]["woken"]]
-        self.assertEqual(len(woken), 1)
-        self.assertIn(woken[0], summary)                                         # the one read woken is the one the fact names
+        self.assertIn("2 findings", summary)                                      # the fact counts both, names one ("+1 more")
+        self.assertIn("(+1 more)", summary)
+        for kind, ref in zip(kinds, refs):
+            self.assertEqual([d["woken"] for d in self.lines(ref)], [True])      # carried by the sent fact: woken
+            self.assertIn((kind, ref), self.engine.sweep.alarmed)                # and remembered, so not woken again
+
+    SWEEP_PATHS = ("due", "overflow", "not_due_later_day", "seeded_after_restart", "past_window_after_restart", "shadow")
+
+    def run_sweep_path(self, path, kind, ref):
+        """Drive one way a sweep finding is raised through the REAL pass; return (audit woken values, the (kind, ref) alarmed now)."""
+        with mock.patch.multiple(sb, sweep_findings=lambda *a, **k: [(kind, ref)] + ([(kind, ref + "0")] if path == "overflow" else []),
+                                 sweep_verify=lambda *a, **k: True):
+            if path == "overflow":
+                self.engine.config["sweep"]["max_findings"] = 1
+            if path == "shadow":
+                self.engine.config["sweep"]["enabled"] = False
+            self.world.tick(86400 - self.world.clock.now() % 86400 - 60)
+            self.sweep_real([])
+            if path in ("not_due_later_day",):
+                self.world.tick(120)
+                self.sweep_real([])
+            if path in ("seeded_after_restart", "past_window_after_restart"):
+                self.engine.sweep, self.engine._last = None, {}
+                self.world.tick(120 if path == "seeded_after_restart" else 7 * 3600)
+                self.sweep_real([])
+        return [d["woken"] for d in self.lines(ref)], (kind, ref) in self.engine.sweep.alarmed
+
+    def test_849_in_every_path_woken_says_whether_a_wake_carried_the_finding(self):
+        expected = {"due": [True], "overflow": [True], "not_due_later_day": [True, False], "seeded_after_restart": [True],
+                    "past_window_after_restart": [True, True], "shadow": [False]}
+        self.assertEqual(set(expected), set(self.SWEEP_PATHS))                  # completeness: every path has a case
+        for path in self.SWEEP_PATHS:
+            for kind in sorted(sb.SWEEP_KINDS):
+                with self.subTest(path=path, kind=kind):
+                    self.setUp()
+                    woken, alarmed = self.run_sweep_path(path, kind, "acme/api#%d" % (50 + sorted(sb.SWEEP_KINDS).index(kind)))
+                    self.assertEqual(woken, expected[path])
+                    self.assertEqual(alarmed, path != "shadow")                  # a wake carried it iff the re-alarm memory was set
 
     def test_849_shadow_mode_logs_woken_false_and_queues_nothing(self):
         for kind in sorted(sb.SWEEP_KINDS):
@@ -24467,19 +24501,55 @@ class TestTriage(Base):
                     self.pass_now()
                     self.assertEqual([d["woken"] for d in self.tlines(ref)], [False, True])
 
-    def test_849_only_the_findings_the_digest_names_read_woken(self):
-        rules = ["T1", "T2"]
-        refs = ["acme/api#%d" % (60 + n) for n in range(2)]
-        self.engine.config["triage"].update(enabled=True, max_findings=1)
+    def test_849_an_overflow_beyond_the_digest_cap_is_not_woken_and_stays_due(self):
+        rules, refs = ["T1", "T2"], ["acme/api#%d" % (60 + n) for n in range(2)]
+        self.engine.config["triage"].update(enabled=True, max_findings=1, digest_interval_minutes=0)
         with mock.patch.multiple(sb, triage_findings=lambda *a, **k: ([(r, ref, {}) for r, ref in zip(rules, refs)], {}, []),
                                  triage_verify=lambda *a, **k: True):
             self.pass_now()
-        named = [k for k in self.engine.triage.facts if k.startswith("triage:")]
-        (summary, _), = [self.engine.triage.facts[k] for k in named]
-        woken = [ref for ref in refs if self.tlines(ref)[0]["woken"]]
-        self.assertEqual(len(woken), 1)
-        self.assertIn(woken[0], summary)                                         # the one read woken is the one the digest names
-        self.assertEqual(sum(ref in summary for ref in refs), 1)
+            (summary, _), = [v for k, v in self.engine.triage.facts.items() if k.startswith("triage:")]
+            woken = [ref for ref in refs if self.tlines(ref)[0]["woken"]]
+            self.assertEqual(len(woken), 1)
+            self.assertIn(woken[0], summary)                                     # the one read woken is the one the digest named
+            self.assertEqual(sum(ref in summary for ref in refs), 1)             # the other is not carried at all
+            other = [ref for ref in refs if ref != woken[0]][0]
+            self.world.tick(120)                                                 # it stays due: the next digest carries it
+            self.pass_now()
+            self.assertEqual([d["woken"] for d in self.tlines(other)], [False, True])
+
+    def test_849_an_other_owner_flag_riding_along_with_a_wake_reads_woken_and_alone_reads_false(self):
+        ref_t, ref_oo = "acme/api#60", "acme/api#61"
+        self.engine.config["triage"]["enabled"] = True
+        with mock.patch.multiple(sb, triage_findings=lambda *a, **k: ([("OO", ref_oo, {})], {}, []), triage_verify=lambda *a, **k: True):
+            self.pass_now()
+            self.assertEqual([d["woken"] for d in self.tlines(ref_oo)], [False])   # never a wake of its own
+        self.setUp()
+        self.engine.config["triage"]["enabled"] = True
+        with mock.patch.multiple(sb, triage_findings=lambda *a, **k: ([("T1", ref_t, {}), ("OO", ref_oo, {})], {}, []), triage_verify=lambda *a, **k: True):
+            self.pass_now()
+            self.assertEqual([d["woken"] for d in self.tlines(ref_oo)], [True])    # counted in the digest's text and remembered
+            self.assertEqual([d["woken"] for d in self.tlines(ref_t)], [True])
+
+    def test_849_a_held_due_finding_is_not_suppressed_by_the_seed_and_is_logged_when_its_wake_goes(self):
+        for rule in sorted(set(sb.TRIAGE_KINDS) - {"OO", "T5"}):
+            with self.subTest(rule=rule):
+                self.setUp()
+                self.engine.config["triage"]["enabled"] = True                     # the 60 minute digest cadence holds the second digest
+                ref, patch = self.one_rule(rule)
+                with patch:
+                    self.aligned()
+                    self.pass_now()
+                    seen = Path(self.world.state) / sb.triage_digest.SEEN_FILE
+                    raw = json.loads(seen.read_text())
+                    raw["items"]["%s %s" % (rule, ref)]["sig"] = "an older state"   # changed while down: due, but the digest is held
+                    seen.write_text(json.dumps(raw))
+                    self.engine.triage, self.engine._last = None, {}
+                    self.world.tick(120)
+                    self.pass_now()
+                    self.assertEqual([d["woken"] for d in self.tlines(ref)], [True, False])   # due and held: logged, not woken
+                    self.world.tick(3600)
+                    self.pass_now()
+                    self.assertEqual([d["woken"] for d in self.tlines(ref)], [True, False, True])   # the wake goes: logged once more
 
     def test_849_shadow_mode_logs_woken_false_for_every_rule(self):
         for rule in sorted(sb.TRIAGE_KINDS):
