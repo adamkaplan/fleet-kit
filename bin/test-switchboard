@@ -24703,6 +24703,7 @@ class TestTriageRuleInputs(unittest.TestCase):
         kinds = set(sb.TRIAGE_KINDS)                                                 # every rule the triage can raise (a seen record is "<rule> <ref>")
         text = (REPO / "bin" / "triage_digest.py").read_text()
         kinds |= set(re.findall(r'"([A-Z][A-Z0-9]*) " \+', text))                    # the key prefixes the seen-memory writers build (PARKED, the T5 roll-up)
+        self.assertIn("PARKED", kinds)                                               # the regex must still find the writers' prefixes: it fails loudly if their shape changes
         for kind in sorted(kinds):
             self.assertIn(kind, sb.TRIAGE_RULE_INPUTS, "a record kind needs the inputs it judges: %s" % kind)
         for kind, needs in sb.TRIAGE_RULE_INPUTS.items():
