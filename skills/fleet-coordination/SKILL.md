@@ -82,6 +82,8 @@ orders or escalates it to the owner. Never apply `awaiting-user` yourself.
 
 A PR held for the owner carries the `<user>:merge-captain` label and a `<user>:hold-<reason>` label (`security`, `credential`, `contract`, `policy`, `prod-config` or `other-area`) and gets a `fleet-switchboard notice pr`; keep `MERGE: captain` as the first line of its body too, in repos whose own checks read it and until 2026-11-10, after which it is dropped. A held PR's body then opens (after those lines) with `## Why this needs you`, `## What changes for you` (a Before | After table), `## Example`, an optional real image, then `## Questions for you` (each with a Recommendation:); any Mermaid diagram goes below. Any other owner decision is a `report question` PLUS a `## Decision required` section at the top of the issue body (and the `<user>:awaiting-cos` label, never `awaiting-user`), never only words in a report: a report or comment saying something waits on the owner does not reach the panel; the section and label do. The switchboard sweep (#117) flags mismatches to cos. A deliberately deferred item carries `<user>:parked` and a `Parked until: <YYYY-MM-DD>` line in its body; it is exempt from the no-next-step flag until that date (never from an owner wait or a held PR).
 
+Where a repository has an `integration` branch, typical changes merge into it and reach the default branch in one daily batch pull request, opened and kept by the Chief of Staff's lane; the owner clears the batch. Urgent fixes and asks the owner makes alone go straight to the default branch. A held change is batched too, held and cleared on its own pull request by the matrix's rules, and the batch holds for the owner when any member touched a top-tier path until #835 lands, then only when a row is rated High. While the batch is out of draft (ready for the owner's clear), a freeze applies: nothing merges into `integration`. See `docs/switchboard.md`, "Batching".
+
 Related findings go up as one **batch**, never one question each: `fleet-switchboard decisions batch
 --title "<title>" --row "<repo#N> | <finding> | <recommendation>" ...` (or `--file`, or stdin) creates one
 `awaiting-cos` issue in your own repo with a row per issue. The Chief of Staff escalates it as one item,
@@ -129,9 +131,15 @@ fleet-switchboard launch <name> --agent coder --dir <worktree> --role coder \
   --reports-to <you> --issue <ask> --brief-file -     # the brief on stdin
 ```
 
-It creates the v2 session, opens the tab by argv in your workspace
-(`$HERDR_WORKSPACE_ID`), proves the pane runs that session, and only then sends the
-brief. It never types into a pane, and it runs the configured OpenCode, not whichever
+By default the worker is **headless**: a session in the OpenCode service with no
+terminal and no pane id (about 2 MB instead of 200 to 400 MB). To look at it run
+`fleet-switchboard watch NAME` (it opens a terminal on the same session; closing it leaves
+the worker running); `herdr agent read` and `send-keys` do not apply to it, so use `send`,
+`status` and `watch`. Add `--terminal` (or `--workspace`) for a tab, or the person sets
+`launch_default` to `terminal`. If the headless route is refused for a repo, `launch` opens
+a terminal instead and says so in one line; an explicit `--headless` refuses. With a terminal
+it opens the tab by argv in your workspace (`$HERDR_WORKSPACE_ID`), proves the pane runs
+that session, and only then sends the brief. It never types into a pane, and it runs the configured OpenCode, not whichever
 `opencode` is first on PATH. A worker started this way reports with
 `fleet-switchboard report`, and its report reaches you as a fact. Do **not** use the
 `herdr tab create` / `herdr agent start` / `herdr agent prompt` routes below for it:
