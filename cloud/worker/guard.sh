@@ -35,6 +35,7 @@
 #CFG refused | unset | unset user.x | the subcommand form
 #CFG refused | rename-section | rename-section a b | the subcommand form
 #CFG refused | remove-section | remove-section a | the subcommand form
+#CFG refused | a value that looks like an option | core.pager --default=x;touch/tmp/p | everything after the key is a value; a word after the key starting with - is refused, never trusted
 #CFG refused | KEY VALUE | user.x y | the plain write form (any key but the two identity keys below)
 #CFG refused | include.path | include.path /tmp/f | a value that makes git read another file
 #CFG refused | includeIf.<cond>.path | includeIf.gitdir:/a/.path /tmp/f | a value that makes git read another file
@@ -84,34 +85,44 @@ do_git() {
     esac
   done
   if [ "${1:-}" = config ]; then
-    # a read is exactly: config MODE [modifier ...] [one KEY or PATTERN]; any other shape is judged word by word below
-    shift; mode=0; pos=0; ok=1; wr=0; key=""
+    # PARSED LIKE GIT (2.46 and later): the options are only the words BEFORE the first word that is not an option; everything
+    # after it is a positional (a value), whatever it starts with. DEFAULT DENY: a command passes only as a read (exactly one
+    # read mode, or none, then the key words, the count matching that mode) or as the identity write; a word after the key that
+    # starts with '-' is refused (an older git would read it as an option, a newer one as a value: either way it is not a read).
+    shift; mode=""; pos=0; ok=1; wr=0; key=""; seen=0; skip=0
     for a in "$@"; do
+      if [ "$skip" = 1 ]; then skip=0; continue; fi   # the value of --type or --default (before the key)
+      if [ "$seen" = 1 ]; then
+        case "$a" in -*) ok=0 ;; esac
+        pos=$((pos + 1)); continue
+      fi
       case "$a" in
         --rename-section|--remove-section|-e|--edit|--add|--unset|--unset-all|--replace-all) wr=1 ;;
-        --get|--get-all|--get-regexp|--get-urlmatch|--list|-l|--get-color|--get-colorbool) if [ "$mode" = 0 ] && [ "$pos" = 0 ]; then mode=1; else ok=0; fi ;;
+        --get|--get-all|--get-regexp|--get-urlmatch|--list|-l|--get-color|--get-colorbool) if [ -z "$mode" ]; then mode=$a; else ok=0; fi ;;
         --global|--local|--system|--worktree|--show-origin|--show-scope|--name-only|-z|--includes|--no-includes) ;;
         --file|--file=*|-f|--blob|--blob=*) wr=1 ;;
-        --type=*|--bool|--int|--bool-or-int|--path|--expiry-date|--no-type|--null|--default|--default=*|--fixed-value) ;;   # read modifiers
+        --type|--default) skip=1 ;;
+        --type=*|--bool|--int|--bool-or-int|--path|--expiry-date|--no-type|--null|--default=*|--fixed-value) ;;   # read modifiers, before the key only
         -*) wr=1 ;;   # any other flag: git takes a unique prefix of a long option (--uns is --unset), so it is refused
-        *) pos=$((pos + 1))
-           if [ "$pos" = 1 ]; then
-             key=$(printf '%s' "$a" | tr 'A-Z' 'a-z')
-             case "$key" in
-               edit|set|unset|rename-section|remove-section) wr=1 ;;   # the subcommand forms
-               get|list) if [ "$mode" = 0 ]; then mode=1; pos=0; fi ;;   # the read subcommands (git 2.46 and later): as --get, --list
-             esac
-           fi ;;
+        *) seen=1; pos=1
+           key=$(printf '%s' "$a" | tr 'A-Z' 'a-z')
+           case "$key" in
+             edit|set|unset|rename-section|remove-section) wr=1 ;;   # the subcommand forms
+             get|list) if [ -z "$mode" ]; then mode=$key; pos=0; seen=1; fi ;;   # the read subcommands: as --get, --list
+           esac ;;
       esac
     done
-    [ "$wr" = 0 ] && [ "$ok" = 1 ] && [ "$mode" = 1 ] && [ "$pos" -le 1 ] && return 0   # a write flag anywhere (with any read mode, before or after the key) is never a read
+    n_ok=0
+    case "$mode" in
+      --get|--get-all|--get-regexp|get) [ "$pos" = 1 ] && n_ok=1 ;;
+      --list|-l|list) [ "$pos" = 0 ] && n_ok=1 ;;
+      --get-urlmatch|--get-color|--get-colorbool) [ "$pos" -ge 1 ] && [ "$pos" -le 2 ] && n_ok=1 ;;
+      "") if [ "$pos" = 1 ]; then n_ok=1; elif [ "$pos" = 2 ]; then case "$key" in user.name|user.email) n_ok=1 ;; esac; fi ;;
+    esac
+    [ "$wr" = 0 ] && [ "$ok" = 1 ] && [ "$n_ok" = 1 ] && return 0
     set -- config "$@"
     for a in "$@"; do bad_cfg "$a"; done
-    [ "$wr" = 1 ] && refuse "changing git configuration"
-    if [ "$mode" = 0 ] && [ "$pos" -ge 2 ]; then   # the plain KEY VALUE write (also include.path and includeIf.*.path)
-      case "$key" in user.name|user.email) [ "$pos" = 2 ] || refuse "changing git configuration" ;; *) refuse "changing git configuration" ;; esac
-    fi
-    return 0
+    refuse "changing git configuration"
   fi
   [ "${1:-}" = push ] || return 0
   shift

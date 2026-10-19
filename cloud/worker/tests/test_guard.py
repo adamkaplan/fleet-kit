@@ -472,7 +472,7 @@ class GuardConfigForms(unittest.TestCase):
                 self.assertEqual(len(hit), 1, name)
                 head, tail = lines[hit[0]].split(")", 1)
                 lines[hit[0]] = "|".join(t for t in head.split("|") if t.strip() != name) + ")" + tail
-                m = "\n".join(lines).replace("-*) wr=1 ;;", "-*) ok=0 ;;")   # the catch-all is off too: this member alone must hold
+                m = "\n".join(lines).replace("-*) wr=1 ;;", "-*) ;;")   # the catch-all is off too: this member alone must hold
                 p = os.path.join(self.d, "mut-%d.sh" % len(os.listdir(self.d)))
                 with open(p, "w") as f:
                     f.write(m)
@@ -493,9 +493,9 @@ class GuardConfigForms(unittest.TestCase):
                     parts.remove(name)
                     p = self.mutant("edit|set|unset|rename-section|remove-section) wr=1", "|".join(parts) + ") wr=1")
                     self.assertEqual(self.run_guard([name], p).returncode, 0)
-        p = self.mutant('[ "$mode" = 0 ] && [ "$pos" -ge 2 ]', '[ "$mode" = 0 ] && [ "$pos" -ge 99 ]')
+        p = self.mutant("user.name|user.email) n_ok=1", "*) n_ok=1")
         self.assertEqual(self.run_guard(["user.x", "y"], p).returncode, 0)
-        p = self.mutant("-*) wr=1 ;;", "-*) ok=0 ;;")
+        p = self.mutant("-*) wr=1 ;;", "-*) ;;")
         self.assertEqual(self.run_guard(["--uns", "user.x"], p).returncode, 0)
 
     def test_the_read_forms_and_their_modifiers_still_pass(self):
@@ -523,6 +523,94 @@ class GuardConfigForms(unittest.TestCase):
         self.assertEqual(self.run_guard(["--list", "--uns"], p).returncode, 0)
         self.assertEqual(self.run_guard(["--get", "--unset", "user.x"]).returncode, 3)
 
+    # ---- #705 review round: parse like git, default deny ----
+    REPRO = [   # reproduced against real git: the VALUE looks like a read modifier, everything after the key is a value
+        ["core.pager", "--default=x;touch/tmp/p"], ["core.fsmonitor", "--type=x;touch/tmp/p"], ["include.path", "--bool"],
+        ["user.x", "--global"], ["core.editor", "--path"], ["user.name", "--global"], ["user.email", "-x"],
+    ]
+
+    def test_flag_shaped_values_after_the_key_are_refused_by_name(self):
+        for args in self.REPRO:
+            with self.subTest(args=args):
+                r = self.run_guard(args)
+                self.assertEqual(r.returncode, 3)
+                self.assertEqual(r.stdout, "")
+
+    ARITY = {"--get": (1, 1), "--get-all": (1, 1), "--get-regexp": (1, 1), "--list": (0, 0), "-l": (0, 0),
+             "--get-urlmatch": (1, 2), "--get-color": (1, 2), "--get-colorbool": (1, 2)}
+    MODIFIERS = {"--global", "--local", "-z", "--show-origin", "--bool", "--path", "--type=x", "--default=x"}
+    WORDS = ["core.pager", "user.name", "include.path", "v", "--global", "--get", "--list", "-l", "--bool", "--default=x", "--unset"]
+
+    def oracle(self, words):
+        """the specification, written apart from the wrapper: True when the shape is a read or an identity write"""
+        i = 0
+        while i < len(words) and words[i].startswith("-"):
+            i += 1
+        opts, rest = words[:i], words[i:]
+        if any(w.startswith("-") for w in rest):
+            return False
+        modes = [o for o in opts if o in self.ARITY]
+        if len(modes) > 1 or any(o not in self.ARITY and o not in self.MODIFIERS for o in opts):
+            return False
+        if modes:
+            lo, hi = self.ARITY[modes[0]]
+            return lo <= len(rest) <= hi
+        return len(rest) == 1 or (len(rest) == 2 and rest[0] in ("user.name", "user.email"))
+
+    def shapes(self):
+        import itertools
+        out = []
+        for n in (1, 2, 3):
+            out += [list(p) for p in itertools.product(self.WORDS, repeat=n)]
+        small = ["user.name", "v", "--global", "--get", "--unset"]
+        out += [list(p) for p in itertools.product(small, repeat=4)]
+        return out
+
+    def test_every_shape_up_to_four_words_is_allowed_only_if_it_is_a_read_or_an_identity_write(self):
+        from concurrent.futures import ThreadPoolExecutor
+        shapes = self.shapes()
+        with ThreadPoolExecutor(8) as ex:
+            rcs = list(ex.map(lambda a: self.run_guard(a).returncode, shapes))
+        type(self).RCS = dict(zip(map(tuple, shapes), rcs))
+        bad = [(a, rc) for a, rc in zip(shapes, rcs) if (rc == 0) != self.oracle(a) or rc not in (0, 3)]
+        self.assertEqual(bad[:10], [])
+        self.assertTrue(any(rc == 0 for rc in rcs) and any(rc == 3 for rc in rcs))
+
+    def test_the_allowed_shapes_leave_the_configuration_of_real_git_unchanged(self):
+        git = shutil.which("git")
+        if not git:
+            self.skipTest("no git")
+        home = os.path.join(self.d, "home"); repo = os.path.join(self.d, "repo")
+        os.makedirs(home); os.makedirs(repo)
+        env = {"PATH": "/usr/bin:/bin", "HOME": home, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.path.join(home, ".gitconfig")}
+        subprocess.run([git, "init", "-q"], cwd=repo, env=env, check=True, capture_output=True)
+        subprocess.run([git, "config", "user.x", "1"], cwd=repo, env=env, check=True, capture_output=True)
+        files = [os.path.join(repo, ".git", "config"), os.path.join(home, ".gitconfig")]
+        before = [read(f) if os.path.exists(f) else None for f in files]
+        ran = 0
+        for args in self.shapes():
+            rc = self.RCS.get(tuple(args)) if hasattr(self, "RCS") else self.run_guard(args).returncode
+            i = 0
+            while i < len(args) and args[i].startswith("-"):
+                i += 1
+            if rc == 0 and len(args[i:]) != 2:   # (an identity write is allowed to change the configuration)
+                subprocess.run([git, "config"] + args, cwd=repo, env=env, capture_output=True, timeout=30)
+                ran += 1
+        self.assertGreater(ran, 20)
+        self.assertEqual(before, [read(f) if os.path.exists(f) else None for f in files])
+
+    def test_each_rule_of_the_parser_has_a_mutant_that_dies(self):
+        p = self.mutant('"") if [ "$pos" = 1 ]; then n_ok=1; elif', '"") if [ "$pos" -ge 1 ]; then n_ok=1; elif')   # the arity of the no-mode form dropped
+        self.assertEqual(self.run_guard(["core.pager", "v", "w"], p).returncode, 0)
+        p = self.mutant("--get|--get-all|--get-regexp|get) [ \"$pos\" = 1 ] && n_ok=1", "--get|--get-all|--get-regexp|get) n_ok=1")   # a read mode's arity dropped
+        self.assertEqual(self.run_guard(["--get", "a", "b"], p).returncode, 0)
+        p = self.mutant("case \"$a\" in -*) ok=0 ;; esac", "case \"$a\" in -*) ;; esac")   # options after the key accepted
+        self.assertEqual(self.run_guard(["user.name", "--global"], p).returncode, 0)
+        p = self.mutant("case \"$a\" in -*) ok=0 ;; esac", "case \"$a\" in --global|--bool|--path|--type=*|--default=*) continue ;; -*) ok=0 ;; esac")   # the old modifier list restored
+        for args in (["include.path", "--bool"], ["user.x", "--global"], ["core.editor", "--path"], ["core.pager", "--default=x;t"], ["core.fsmonitor", "--type=x;t"]):
+            self.assertEqual(self.run_guard(args, p).returncode, 0, args)
+            self.assertEqual(self.run_guard(args).returncode, 3, args)
+
     def test_a_mutant_that_widens_the_identity_exception_is_caught(self):
         p = self.mutant("user.name|user.email)", "user.*)")
         self.assertEqual(self.run_guard(["user.name.x", "v"], p).returncode, 0)   # the mutant passes it ...
@@ -538,7 +626,7 @@ class GuardConfigForms(unittest.TestCase):
             return re.fullmatch(".*".join(re.escape(x) for x in pat.split("*")), line, re.S) is not None
         for kind, name, args, _ in cfg_table():
             line = "git config " + " ".join(args)
-            if kind == "refused" and name not in ("KEY VALUE", "an unknown flag or abbreviation"):
+            if kind == "refused" and name not in ("KEY VALUE", "an unknown flag or abbreviation", "a value that looks like an option"):
                 with self.subTest(name=name):
                     self.assertTrue(any(match(p, line) for p in denies), line)
             if kind == "allowed":
