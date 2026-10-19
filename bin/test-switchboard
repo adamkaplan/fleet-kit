@@ -38387,6 +38387,310 @@ USE_COMMANDS = {
 }
 
 
+class TestDaemonCommand(Base):
+    """`daemon status | start | stop | restart` (#858), against FAKES: launchctl and ps are one fake runner, a signal is recorded (or, in one test, sent to a
+    dummy child this test owns), a daemon is a held lock plus the files a daemon writes. No real daemon, no real launchctl."""
+    OURS = "/usr/bin/python3 /k/bin/fleet-switchboard run"
+
+    def setUp(self):
+        super().setUp()
+        self.state = sb.ensure_state_dir()
+        self.fds, self.commands, self.calls, self.kills = {}, {}, [], []
+        self.job_loaded, self.job_pid = False, None
+        self.boots = iter(range(4200, 4300))
+        self.healthy_boot = True
+        self.ticks = [0.0]
+        for target, value in (("service_kind", lambda platform=None: "launchd"), ("daemon_sleep", self.sleep), ("daemon_clock", self.clock),
+                              ("daemon_signal", self.kill)):
+            patcher = mock.patch.object(sb, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.addCleanup(self.drop_all)
+
+    def clock(self):
+        self.ticks[0] += 0.05
+        return self.ticks[0]
+
+    def sleep(self, seconds):
+        self.ticks[0] += seconds
+
+    def drop_all(self):
+        for pid in list(self.fds):
+            self.drop(pid)
+
+    def hold(self, pid):
+        fd = os.open(str(self.state / "run.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.ftruncate(fd, 0)
+        os.write(fd, ("%d\n" % pid).encode())
+        self.fds[pid] = fd
+
+    def drop(self, pid):
+        fd = self.fds.pop(pid, None)
+        if fd is not None:
+            os.close(fd)
+
+    def record(self, pid, started=None):
+        (self.state / "daemon.json").write_text(json.dumps({"pid": pid, "started_at": sb.iso(started if started is not None else time.time() - 5)}))
+
+    def decisions(self, age=0):
+        path = self.state / "decisions.json"
+        path.write_text(json.dumps({"decisions": [], "errors": []}))
+        os.utime(path, (time.time() - age, time.time() - age))
+
+    def watches(self, pid, *watches):
+        (self.state / sb.WATCH_FILE).write_text(json.dumps({"pid": pid, "watches": list(watches)}))
+
+    def boot(self, pid=None, command=None, healthy=True):
+        """A daemon comes up: it holds the lock, writes its record and (when healthy) the decisions file."""
+        pid = pid or next(self.boots)
+        self.hold(pid)
+        self.commands[pid] = command or self.OURS
+        self.record(pid, time.time())
+        self.decisions(0 if healthy else 3600)
+        return pid
+
+    def spawn(self, argv, **kwargs):
+        self.calls.append(("spawn", argv))
+        self.boot(healthy=self.healthy_boot)
+
+    def kill(self, pid, sig):
+        self.kills.append((pid, sig))
+        self.drop(pid)
+
+    def runner(self, argv, **kwargs):
+        if argv[0] == "ps":
+            pid = int(argv[2])
+            return subprocess.CompletedProcess(argv, 0 if pid in self.commands else 1, self.commands.get(pid, "") + "\n", "")
+        self.calls.append(("launchctl", argv[1:]))
+        verb = argv[1]
+        if verb == "print":
+            if not self.job_loaded:
+                return subprocess.CompletedProcess(argv, 113, "", "Could not find service \"com.fleet-kit.switchboard\" in domain")
+            return subprocess.CompletedProcess(argv, 0, "gui/501/x = {\n\tstate = running\n\tpid = %s\n}\n" % self.job_pid, "")
+        if verb == "bootout":
+            self.job_loaded = False
+            self.drop(self.job_pid)
+        elif verb in ("bootstrap", "kickstart"):
+            self.job_loaded = True
+            self.job_pid = self.boot(healthy=self.healthy_boot)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    def install_plist(self):
+        path = sb.service_file_path("launchd")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("<plist/>")
+
+    def run_cmd(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = sb.main(["daemon", *argv], runner=self.runner, now=time.time, spawn=self.spawn)
+        return code, out.getvalue(), err.getvalue()
+
+    def launchctl_verbs(self):
+        return [c[1][0] for c in self.calls if c[0] == "launchctl"]
+
+    def running_ensure_daemon(self, pid=4242):
+        self.hold(pid)
+        self.commands[pid] = self.OURS
+        self.record(pid)
+        self.decisions()
+        self.watches(pid, {"repo": "acme/api", "mode": "forwarder", "started": sb.iso(time.time() - 60)})
+        return pid
+
+    def test_S1_status_of_a_healthy_ensure_daemon_gives_the_five_facts(self):
+        self.running_ensure_daemon()
+        code, out, err = self.run_cmd("status")
+        self.assertEqual(code, 0, out + err)
+        for fact in ("running", "(ensure)", "pid 4242", "since 20", "healthy"):
+            self.assertIn(fact, out)
+        self.assertNotIn("unhealthy", out)
+
+    def test_status_names_launchd_when_the_job_pid_is_the_lock_pid(self):
+        self.running_ensure_daemon()
+        self.job_loaded, self.job_pid = True, 4242
+        code, out, _ = self.run_cmd("status")
+        self.assertEqual(code, 0)
+        self.assertIn("(launchd)", out)
+        self.job_pid = 9999     # a loaded job that does not hold the lock did not start this daemon
+        self.assertIn("(ensure)", self.run_cmd("status")[1])
+
+    def test_status_with_no_daemon_exits_non_zero(self):
+        code, out, _ = self.run_cmd("status")
+        self.assertEqual((code, out.strip()), (1, "daemon: not running"))
+
+    def test_S2_a_stale_decisions_file_and_a_dead_forwarder_are_two_reasons(self):
+        self.running_ensure_daemon()
+        self.decisions(age=600)
+        self.watches(4242, {"repo": "acme/api", "mode": "down", "down_since": time.time() - 3600})
+        code, out, _ = self.run_cmd("status")
+        self.assertEqual(code, 1)
+        self.assertIn("unhealthy", out)
+        self.assertIn("decisions file is stale", out)
+        self.assertIn("forwarder for acme/api", out)
+
+    def test_S3_stop_ends_an_ensure_daemon_by_signal_and_a_launchd_daemon_by_bootout(self):
+        self.running_ensure_daemon()
+        code, out, err = self.run_cmd("stop")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.kills, [(4242, signal.SIGTERM)])
+        self.assertIn("SIGTERM to pid 4242", out)
+        self.assertFalse(sb.run_lock_held(self.state))
+        self.kills.clear()
+        self.install_plist()
+        self.job_loaded, self.job_pid = True, 4243
+        self.boot(4243)
+        code, out, err = self.run_cmd("stop")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.kills, [], "under launchd it is bootout, so launchd does not start it again")
+        self.assertIn("bootout", self.launchctl_verbs())
+        self.assertIn("unloaded the launchd job", out)
+        self.assertFalse(sb.run_lock_held(self.state))
+
+    def test_stop_sends_a_real_signal_only_to_the_dummy_child_this_test_owns(self):
+        child = subprocess.Popen([sys.executable, "-c", (
+            "import fcntl,os,sys,time\nfd=os.open(sys.argv[1],os.O_RDWR|os.O_CREAT)\nfcntl.flock(fd,fcntl.LOCK_EX)\n"
+            "os.ftruncate(fd,0)\nos.write(fd,(str(os.getpid())+'\\n').encode())\nprint('ready',flush=True)\ntime.sleep(60)\n"),
+            str(self.state / "run.lock")], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        self.assertEqual(child.stdout.readline().strip(), "ready")
+        self.commands[child.pid] = self.OURS
+        self.record(child.pid)
+        self.decisions()
+        with mock.patch.object(sb, "daemon_signal", os.kill), mock.patch.object(sb, "daemon_sleep", lambda s: time.sleep(0.05)), \
+                mock.patch.object(sb, "daemon_clock", time.monotonic):
+            code, out, err = self.run_cmd("stop")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(child.wait(10), -signal.SIGTERM)
+
+    def test_S4_start_with_no_job_uses_ensure_and_with_a_job_installed_uses_launchd(self):
+        code, out, err = self.run_cmd("start")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual([c for c in self.calls if c[0] == "spawn"].__len__(), 1)
+        self.assertNotIn("bootstrap", self.launchctl_verbs())
+        self.drop_all()
+        self.calls.clear()
+        self.install_plist()
+        code, out, err = self.run_cmd("start")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.launchctl_verbs().count("bootstrap"), 1)
+        self.assertEqual([c for c in self.calls if c[0] == "spawn"], [])
+        self.drop_all()
+        self.calls.clear()
+        self.job_loaded, self.job_pid = False, None
+        self.job_loaded = True       # a loaded job is kickstarted
+        self.job_pid = None
+        self.run_cmd("start")
+        self.assertIn("kickstart", self.launchctl_verbs())
+
+    def test_S5_restart_replaces_the_daemon_and_changes_no_state_file(self):
+        self.running_ensure_daemon()
+        files = {"escalated-requests.json": '{"k": 1}', "triage-memory.json": '{"t": [1, 2]}', "audit.log": "a\n", "sent-keys.json": "{}"}
+        for name, text in files.items():
+            (self.state / name).write_text(text)
+        before = {name: (self.state / name).read_bytes() for name in files}
+        code, out, err = self.run_cmd("restart")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual({name: (self.state / name).read_bytes() for name in files}, before)
+        self.assertEqual(self.kills, [(4242, signal.SIGTERM)])
+        self.assertEqual(len([c for c in self.calls if c[0] == "spawn"]), 1)
+        self.assertTrue(sb.run_lock_held(self.state))
+        self.assertRegex(out, r"\d+\.\d seconds")
+        self.assertIn("SIGTERM", out)
+        self.assertIn("healthy", out)
+
+    def test_S6_a_missing_launchd_job_is_one_plain_line_and_no_launchctl_words(self):
+        code, out, err = self.run_cmd("start")
+        self.assertEqual(code, 0, out + err)
+        said = [line for line in (out + err).splitlines() if "not installed" in line]
+        self.assertEqual(len(said), 1, out + err)
+        self.assertNotIn("Could not find", out + err)
+        self.assertNotIn("domain", out + err)
+        self.assertNotIn("launchctl bootstrap", out + err)
+
+    def test_S7_a_second_command_an_unhealthy_daemon_and_a_stale_lock_each_exit_non_zero_and_say_why(self):
+        fd = os.open(str(self.state / sb.DAEMON_COMMAND_LOCK), os.O_RDWR | os.O_CREAT)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        code, out, err = self.run_cmd("restart")
+        os.close(fd)
+        self.assertEqual(code, 1)
+        self.assertIn("another daemon command is running", err)
+        self.assertEqual(self.kills, [])
+        self.running_ensure_daemon()
+        self.decisions(age=600)
+        code, out, err = self.run_cmd("start")
+        self.assertEqual(code, 1)
+        self.assertIn("not healthy", out + err)
+        self.assertIn("decisions file is stale", out + err)
+        self.drop_all()
+        self.hold(777)                 # the lock is held, by something that is not a daemon, and the record is not its
+        self.commands[777] = "/usr/bin/tail -f x"
+        code, out, err = self.run_cmd("stop")
+        self.assertEqual(code, 1)
+        self.assertIn("nothing was signalled", err)
+        self.assertEqual(self.kills, [])
+
+    def test_a_lock_file_nobody_holds_is_not_a_daemon_and_nothing_is_signalled(self):
+        (self.state / "run.lock").write_text("4242\n")
+        self.commands[4242] = self.OURS
+        code, out, _ = self.run_cmd("stop")
+        self.assertEqual(self.kills, [])
+        self.assertIn("not running", out)
+
+    def test_S8_a_record_naming_another_program_a_recycled_pid_and_a_disagreeing_record_get_no_signal(self):
+        for command in ("/usr/bin/vim notes.txt", "/usr/bin/python3 /k/bin/fleet-switchboard status", "/usr/bin/python3 /x/other-tool run", ""):
+            with self.subTest(command=command):
+                self.hold(4242)
+                self.record(4242)
+                self.commands[4242] = command
+                code, out, err = self.run_cmd("stop")
+                self.assertEqual(code, 1)
+                self.assertIn("nothing was signalled", err)
+                self.assertEqual(self.kills, [])
+                self.drop(4242)
+        self.hold(4242)
+        self.commands[4242] = self.OURS
+        self.record(31337)                    # the record names a pid the lock does not
+        code, _, err = self.run_cmd("restart")
+        self.assertEqual((code, self.kills), (1, []))
+        self.assertIn("nothing was signalled", err)
+        (self.state / "daemon.json").unlink()   # no record at all
+        self.assertEqual((self.run_cmd("stop")[0], self.kills), (1, []))
+
+    def test_S9_a_daemon_that_never_becomes_healthy_is_given_up_on_at_the_bound(self):
+        self.healthy_boot = False
+        code, out, err = self.run_cmd("start")
+        self.assertEqual(code, 1)
+        self.assertIn("not healthy after %ds" % sb.DAEMON_HEALTH_WAIT, out + err)
+        self.assertLessEqual(self.ticks[0], sb.DAEMON_HEALTH_WAIT + 5)
+        self.assertGreaterEqual(self.ticks[0], sb.DAEMON_HEALTH_WAIT)
+
+    def test_a_daemon_that_never_lets_go_of_the_lock_is_given_up_on_at_the_bound_with_nothing_stronger_sent(self):
+        self.running_ensure_daemon()
+        with mock.patch.object(sb, "daemon_signal", lambda pid, sig: self.kills.append((pid, sig))):
+            code, out, err = self.run_cmd("stop")
+        self.assertEqual(code, 1)
+        self.assertIn("did not stop within %ds" % sb.DAEMON_STOP_WAIT, err)
+        self.assertEqual(self.kills, [(4242, signal.SIGTERM)])
+
+    def test_S11_with_no_job_installed_all_four_commands_use_the_ensure_path(self):
+        self.running_ensure_daemon()
+        for argv in (("status",), ("stop",), ("start",), ("restart",)):
+            with self.subTest(command=argv[0]):
+                code, out, err = self.run_cmd(*argv)
+                self.assertEqual(code, 0, out + err)
+        self.assertEqual([v for v in self.launchctl_verbs() if v in ("bootstrap", "bootout", "kickstart")], [])
+        self.assertEqual(self.kills, [(4242, signal.SIGTERM), (4200, signal.SIGTERM)])
+
+    def test_the_daemon_command_never_starts_a_daemon_on_its_own_account(self):
+        self.assertIs(sb.cmd_daemon.direct, True)
+
+    def test_U1_the_command_surface_gains_exactly_the_daemon_command(self):
+        self.assertTrue((TestSelfRegisteringCli.SURFACE_DIR / "daemon.json").is_file())
+        self.assertIn("daemon", TestSelfRegisteringCli.commands()[1])
+
+
 class TestEnsureOnUse(Base):
     def setUp(self):
         super().setUp()
