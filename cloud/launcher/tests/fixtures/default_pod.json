@@ -1,0 +1,290 @@
+{
+  "default": {
+    "apiVersion": "v1",
+    "kind": "Pod",
+    "metadata": {
+      "annotations": {
+        "cw/hard-deadline": "2026-10-14T14:00:00Z",
+        "cw/idle-seconds": "600",
+        "cw/max-hard": "2026-10-14T20:00:00Z",
+        "cw/shape": "S",
+        "cw/started": "2026-10-14T12:00:00Z",
+        "cw/worker": "coder7"
+      },
+      "labels": {
+        "app": "cw-worker",
+        "azure.workload.identity/use": "true",
+        "cw/worker": "coder7"
+      },
+      "name": "coder7-ffda"
+    },
+    "spec": {
+      "automountServiceAccountToken": false,
+      "containers": [
+        {
+          "env": [
+            {
+              "name": "CW_WORKER",
+              "value": "coder7"
+            },
+            {
+              "name": "CW_REPO",
+              "value": "acme-org/widget-service"
+            },
+            {
+              "name": "CW_BRANCH",
+              "value": "main"
+            },
+            {
+              "name": "CW_IDLE_SECONDS",
+              "value": "600"
+            },
+            {
+              "name": "CW_HARD_DEADLINE",
+              "value": "2026-10-14T14:00:00Z"
+            },
+            {
+              "name": "CW_AUDIT_RUNTIME_ID",
+              "value": "pod/coder7-ffda"
+            },
+            {
+              "name": "CW_TOKEN_ENDPOINT",
+              "value": "https://tokens.example.internal/mint"
+            }
+          ],
+          "image": "registry.example.internal/worker:1",
+          "name": "worker",
+          "readinessProbe": {
+            "tcpSocket": {
+              "port": 4096
+            }
+          },
+          "resources": {
+            "limits": {
+              "cpu": "2",
+              "memory": "4Gi"
+            }
+          },
+          "securityContext": {
+            "allowPrivilegeEscalation": false,
+            "capabilities": {
+              "drop": [
+                "ALL"
+              ]
+            }
+          },
+          "volumeMounts": [
+            {
+              "mountPath": "/run/cw",
+              "name": "pw",
+              "readOnly": true
+            },
+            {
+              "mountPath": "/run/cw-tmp",
+              "name": "tokens"
+            },
+            {
+              "mountPath": "/work",
+              "name": "scratch"
+            }
+          ]
+        }
+      ],
+      "restartPolicy": "Never",
+      "securityContext": {
+        "fsGroup": 1000,
+        "runAsGroup": 1000,
+        "runAsNonRoot": true,
+        "runAsUser": 1000,
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        }
+      },
+      "serviceAccountName": "cw-worker",
+      "volumes": [
+        {
+          "name": "pw",
+          "secret": {
+            "defaultMode": 384,
+            "items": [
+              {
+                "key": "password",
+                "path": "server-password"
+              }
+            ],
+            "secretName": "coder7-ffda-pw"
+          }
+        },
+        {
+          "emptyDir": {
+            "medium": "Memory"
+          },
+          "name": "tokens"
+        },
+        {
+          "emptyDir": {},
+          "name": "scratch"
+        }
+      ]
+    }
+  },
+  "shape_m_run_secrets_pull": {
+    "apiVersion": "v1",
+    "kind": "Pod",
+    "metadata": {
+      "annotations": {
+        "cw/hard-deadline": "2026-10-14T14:00:00Z",
+        "cw/idle-seconds": "600",
+        "cw/max-hard": "2026-10-14T20:00:00Z",
+        "cw/run-id": "abcdef0123456789",
+        "cw/shape": "M",
+        "cw/started": "2026-10-14T12:00:00Z",
+        "cw/worker": "coder7"
+      },
+      "labels": {
+        "app": "cw-worker",
+        "azure.workload.identity/use": "true",
+        "cw/worker": "coder7"
+      },
+      "name": "coder7-ffda"
+    },
+    "spec": {
+      "automountServiceAccountToken": false,
+      "containers": [
+        {
+          "env": [
+            {
+              "name": "CW_WORKER",
+              "value": "coder7"
+            },
+            {
+              "name": "CW_REPO",
+              "value": "acme-org/widget-service"
+            },
+            {
+              "name": "CW_BRANCH",
+              "value": "main"
+            },
+            {
+              "name": "CW_IDLE_SECONDS",
+              "value": "600"
+            },
+            {
+              "name": "CW_HARD_DEADLINE",
+              "value": "2026-10-14T14:00:00Z"
+            },
+            {
+              "name": "CW_AUDIT_RUNTIME_ID",
+              "value": "pod/coder7-ffda"
+            },
+            {
+              "name": "CW_TOKEN_ENDPOINT",
+              "value": "https://tokens.example.internal/mint"
+            }
+          ],
+          "image": "registry.example.internal/worker:1",
+          "name": "worker",
+          "readinessProbe": {
+            "tcpSocket": {
+              "port": 4096
+            }
+          },
+          "resources": {
+            "limits": {
+              "cpu": "4",
+              "memory": "8Gi"
+            }
+          },
+          "securityContext": {
+            "allowPrivilegeEscalation": false,
+            "capabilities": {
+              "drop": [
+                "ALL"
+              ]
+            }
+          },
+          "volumeMounts": [
+            {
+              "mountPath": "/run/cw",
+              "name": "pw",
+              "readOnly": true
+            },
+            {
+              "mountPath": "/run/cw-tmp",
+              "name": "tokens"
+            },
+            {
+              "mountPath": "/work",
+              "name": "scratch"
+            }
+          ]
+        }
+      ],
+      "imagePullSecrets": [
+        {
+          "name": "regcred"
+        }
+      ],
+      "restartPolicy": "Never",
+      "securityContext": {
+        "fsGroup": 1000,
+        "runAsGroup": 1000,
+        "runAsNonRoot": true,
+        "runAsUser": 1000,
+        "seccompProfile": {
+          "type": "RuntimeDefault"
+        }
+      },
+      "serviceAccountName": "cw-worker",
+      "volumes": [
+        {
+          "name": "pw",
+          "projected": {
+            "defaultMode": 384,
+            "sources": [
+              {
+                "secret": {
+                  "items": [
+                    {
+                      "key": "password",
+                      "mode": 384,
+                      "path": "server-password"
+                    }
+                  ],
+                  "name": "coder7-ffda-pw"
+                }
+              },
+              {
+                "secret": {
+                  "items": [
+                    {
+                      "key": "deploy-key",
+                      "mode": 256,
+                      "path": "deploy-key"
+                    },
+                    {
+                      "key": "npm-token-file",
+                      "mode": 256,
+                      "path": "npm-token-file"
+                    }
+                  ],
+                  "name": "coder7-ffda-run"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "emptyDir": {
+            "medium": "Memory"
+          },
+          "name": "tokens"
+        },
+        {
+          "emptyDir": {},
+          "name": "scratch"
+        }
+      ]
+    }
+  }
+}

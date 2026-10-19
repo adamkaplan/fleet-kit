@@ -253,6 +253,18 @@ been repaired by a person, reset BOTH files on the node, then delete the fix pod
 rm -f /etc/containerd/config.toml.sysbox-fix.failed /etc/containerd/config.toml.sysbox-fix.inprogress
 ```
 
+## A pod for a nested Docker stack (`create --stack`)
+
+`cloud-worker create ... --stack` builds the pod a worker needs to run a Docker stack of its own (for example a database
+and an app): the `sysbox-runc` runtime class, its own user namespace (`hostUsers: false`), the pool's `sysbox-install=yes`
+node selector, the non-root `worker` user, shape `S` (2 CPU, 4 GiB limits, never unlimited), and no privileged flag, host
+path, Docker socket or service-account token. Without `--stack` the pod is byte-for-byte what it was (a stored fixture
+pins it). The container's security context (`STACK_SECURITY_CONTEXT` in `cloud/launcher/cloud_worker.py`) was live-probed
+with the cluster default only: the smallest set that lets the daemon start is decided by the next live run, one variation
+at a time. A create that lands on a fresh node can hit the "handler sysbox-runc is not known" race; the launcher recreates the
+pod (not the Secrets) up to 3 times. Details: `docs/cloud-worker-interface.md`. The live runs are in
+"Live proof" below.
+
 ## Live proof (S10 runtime half and S12), run on a cluster
 
 Needs a cluster with one Ubuntu node whose containerd is 2.x, and `kubectl` pointed at it. Replace `<image>` with the
