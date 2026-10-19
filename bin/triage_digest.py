@@ -81,14 +81,18 @@ def load_meta(state_dir):
     raw = read_json(os.path.join(state_dir, SEEN_FILE)) if state_dir else None
     if raw is None or not isinstance(raw.get("items"), dict):
         return {"known": False, "swept": False, "last": None}
-    last = raw.get("last")
-    return {"known": True, "swept": bool(raw.get("swept", True)), "last": float(last) if _number(last) else None}
+    last, rolled = raw.get("last"), raw.get("rollup")
+    meta = {"known": True, "swept": bool(raw.get("swept", True)), "last": float(last) if _number(last) else None}
+    if _number(rolled):
+        meta["rollup"] = float(rolled)   # #766: only once a roll-up was sent; a file without one reads as before
+    return meta
 
 
 def write_seen(state_dir, seen, meta=None):
     if state_dir:
         meta = meta or {"swept": True, "last": None}
-        write_json(os.path.join(state_dir, SEEN_FILE), {"v": 1, "items": seen, "swept": bool(meta.get("swept")), "last": meta.get("last")})
+        write_json(os.path.join(state_dir, SEEN_FILE), {"v": 1, "items": seen, "swept": bool(meta.get("swept")), "last": meta.get("last"),
+                                                           **({"rollup": meta["rollup"]} if meta.get("rollup") is not None else {})})
 
 
 WARMUP_MAX_SECONDS = 1800   # a sweep that cannot finish (a list that never reads) ends its warm-up after this: the digest must never stay silent for good
@@ -160,9 +164,10 @@ def mute_command(state_dir, action, ref, now):
     return 0, text
 
 
-def select(seen, items, mutes, ours, now, backoff=True, alarmed=None, realarm_seconds=86400.0, parked_max_days=366):
+def select(seen, items, mutes, ours, now, backoff=True, alarmed=None, realarm_seconds=86400.0, parked_max_days=366, once=()):
     """([(rule, ref)] to show in this pass's digest, [ref] parked without a valid date and not flagged before).
-    `items` maps ref to {"updated", "labels", "state", "parked_until"}. `backoff` false is the fixed re-alarm."""
+    `items` maps ref to {"updated", "labels", "state", "parked_until"}. `backoff` false is the fixed re-alarm.
+    `once` holds the (rule, ref) pairs that are already at the owner's tier besides every T5: listed once, then only in the roll-up."""
     alarmed = alarmed or {}
     due, invalid = [], []
     for rule, ref in ours:
@@ -170,6 +175,8 @@ def select(seen, items, mutes, ours, now, backoff=True, alarmed=None, realarm_se
         if ref in mutes and (item is None or item["updated"] <= mutes[ref]):
             continue   # 'seen, leave': quiet until the item changes
         rec = seen.get("%s %s" % (rule, ref))
+        if rec is not None and (rule == "T5" or (rule, ref) in once):
+            continue   # #766: a decision already in the owner's tier (T5, and a T6 at that tier) is listed ONCE; after that only the daily roll-up names it
         if item is not None:
             until = item.get("parked_until")
             awaiting = any("awaiting" in str(l) for l in item["labels"])
@@ -205,10 +212,54 @@ def commit(seen, items, shown, invalid, now):
         del seen[key]
 
 
-def prune(seen, candidates):
-    """Forget items that are no longer findings: one that returns is new and surfaces once."""
+ROLLUP_SECONDS = 86400
+
+
+ROLLUP_ITEMS = 30   # the most items one roll-up line names (oldest listing first)
+ROLLUP_CHARS = 1500   # and the most characters it takes: far under the delivered-message cap, whatever the names
+
+
+def _ref_key(ref):
+    repo, _, number = ref.rpartition("#")
+    return (repo, int(number) if number.isdigit() else 0, ref)
+
+
+def rollup(seen, meta, t5_refs, now, limit=ROLLUP_ITEMS):
+    """The one daily roll-up line (#766), or None. It names the T5 items (and the T6 items at the owner's tier, given as ("T6", ref)
+    pairs) listed at least a day ago that are still findings now
+    (`t5_refs`: an item that left the owner's tier is not there, and `prune` has forgotten it). At most `limit` names, the oldest
+    listing first, then `... and M more`; the names carry the repository when more than one repository is among them. On a line,
+    `meta["rollup"]` is set and the caller writes the seen-file."""
+    last = meta.get("rollup")
+    if last is not None and now - last < ROLLUP_SECONDS:
+        return None
+    pairs = {(x if isinstance(x, tuple) else ("T5", x)) for x in t5_refs}
+    keyed = {ref: "%s %s" % (rule, ref) for rule, ref in sorted(pairs)}   # one rule per ref: a T5 and a T6 never share an item
+    refs = sorted({ref for ref, key in keyed.items() if key in seen and now - seen[key]["at"] >= ROLLUP_SECONDS},
+                  key=lambda r: (seen[keyed[r]]["at"], _ref_key(r)))
+    if not refs:
+        return None
+    meta["rollup"] = now
+    several = len({r.rpartition("#")[0] for r in refs}) > 1
+    name = lambda r: r if several or "#" not in r else "#" + r.rpartition("#")[2]
+    head = "%d items waiting on the owner for more than a day:" % len(refs)
+    shown = []
+    for ref in refs[:limit]:
+        more = len(refs) - len(shown) - 1
+        tail = " ... and %d more (fleet-switchboard decisions --tier all)" % (more + 1) if more >= 0 else ""
+        if len(head) + sum(len(name(r)) + 1 for r in shown) + len(name(ref)) + 1 + len(tail) > ROLLUP_CHARS:
+            break
+        shown.append(ref)
+    left = len(refs) - len(shown)
+    return head + "".join(" " + name(r) for r in shown) + (" ... and %d more (fleet-switchboard decisions --tier all)" % left if left else "")
+
+
+def prune(seen, candidates, keep=None):
+    """Forget items that are no longer findings: one that returns is new and surfaces once.
+    `keep(rule, ref)` is True for a record whose candidates could not be computed in this pass (its input was not whole):
+    that record is kept, since an absent candidate is then no evidence the item left the tier. `rule` is "PARKED" for the once-only flag."""
     live = {"%s %s" % pair for pair in candidates} | {"PARKED " + ref for _, ref in candidates}
-    for key in [k for k in seen if k not in live]:
+    for key in [k for k in seen if k not in live and not (keep and " " in k and keep(*k.split(" ", 1)))]:
         del seen[key]
 
 
