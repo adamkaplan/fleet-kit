@@ -29,6 +29,7 @@ MOVED = ('gate_floor_fact',
          'clear_lane',
          '_notify_clear_body',
          'notify_clear',
+         'authors_hold_labels',
          'impact_clear_core',
          'cmd_impact_clear',
          'delegated_clear_checks',
@@ -483,9 +484,20 @@ def notify_clear(engine, kind, repo, number, head, reason=None, body=None, previ
     return None
 
 
+def authors_hold_labels(names, raw, already):
+    """The fleet's own hold labels the PR in `raw` carries now and `already` does not name: `merge-captain` and every `hold-<reason>` of the fleet's prefix, by exact name. Nothing is
+    guessed from a substring or a prefix: only those exact names, only what the read shows (so the audit names what was really on the PR), never a label of another prefix. #742."""
+    ours = [name for key, name in names.items() if key == "merge-captain" or key.startswith("hold-")]   # the fleet's label KEYS (a test pins this set to CAPTAIN_HOLD_LABELS + merge-captain), each with the user prefix
+    live = raw.get("labels")
+    have = {(l.get("name") if isinstance(l, dict) else l) for l in live} if isinstance(live, list) else set()
+    return [label for label in ours if label in have and label not in already]
+
+
 def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, head=None, via=None, verify=None, under_order=None):
-    """The owner's clear: record it head-bound (the daemon does not re-add the hold for that head) and remove `hold-impact`, and
-    `merge-captain` too when the switchboard itself added it for this hold. Returns the lines to print.
+    """The owner's clear: record it head-bound (the daemon does not re-add the hold for that head) and remove `hold-impact`, plus (#742) every other
+    hold label of the fleet's prefix the PR carries at that head (`merge-captain` and each `hold-<reason>`, whoever added it). A DELEGATED clear (`under_order`)
+    keeps the narrower rule: only `hold-impact` and a `merge-captain` the switchboard added come off, and it is refused (audited, nothing written) when the PR
+    carries a `merge-captain` the switchboard did not add. Returns the lines to print.
 
     `remove` (the chat clear, #457) names the labels to take off instead: the caller has already read the PR and checked that each is an owner-tier hold label or the captain
     marker; here every one of them is checked again against the owner-tier set, so no other label can ever be removed. `head` is the head the owner was shown: the clear
@@ -518,6 +530,12 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
             remove = [names["hold-impact"]]
             if ours.get("merge_label_added"):
                 remove.append(names["merge-captain"])
+            if under_order is None:
+                remove += authors_hold_labels(names, raw, remove)   # #742: the OWNER's clear lifts the author's own hold with the floor's, from THIS read (the PR's labels at the cleared head)
+            elif names["merge-captain"] in authors_hold_labels(names, raw, remove):
+                why = "%s carries a %s label the switchboard did not add: it is a person's own hold, not the Chief of Staff's to lift under an order; the owner clears it" % (pr, names["merge-captain"])
+                engine.audit.append(engine.actor, "gate.hold_clear_refused", pr, {"head": current, "by": who, "under_order": under_order["number"], "why": _one_line(why, 300)})
+                raise NoticeError(why)   # nothing is written: the check runs before the clear is recorded
         else:
             remove = list(remove)
         head_now = current
