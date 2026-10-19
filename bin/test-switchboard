@@ -22915,6 +22915,24 @@ class TestTriage(Base):
         self.go(passes=3)
         self.assertEqual(self.only("T1"), ["acme/api#10"])               # the genuine finding
 
+    def test_t1_and_t11_records_survive_the_prune_while_the_fleet_is_not_whole_and_go_with_a_whole_pass(self):
+        self.charter()
+        self.add(10, created=2, labels=["kind"])
+        self.engine.discover(self.world.clock.now())
+        self.go(passes=3, enabled=True)
+        self.assertIn("T1 acme/api#10", self.engine.triage.seen)                     # listed once: the record exists
+        with mock.patch.object(self.engine.herdr, "agent_list", side_effect=sb.HerdrError("down")):
+            self.engine.discover(self.world.clock.now())
+        self.go(passes=3)
+        self.assertIn("T1 acme/api#10", self.engine.triage.seen)                     # its candidate was dropped, its record kept
+        self.engine.discover(self.world.clock.now())
+        self.go(passes=2)
+        self.assertIn("T1 acme/api#10", self.engine.triage.seen)                     # whole and still a finding: not new again
+        self.add(10, created=2, labels=["kind"], assignees=["bot"])                  # it is owned now
+        self.world.tick(sb.TRIAGE_TTL + 1)                                           # the cached list expires
+        self.go(passes=2)
+        self.assertNotIn("T1 acme/api#10", self.engine.triage.seen)                  # a whole pass without it: pruned
+
     def test_t1_owner_missing_both_ways_and_the_grace_day(self):
         self.charter()
         self.add(10, created=2, labels=["kind"])                         # no assignee, no chain, ours (bot): T1
@@ -24658,6 +24676,22 @@ class FakeOwnerlessHub(FakeTriageHub):
     def open_issues_count(self, repo):
         self.calls.append("repos/%s" % repo)
         return self.open_total.get(repo, len(self.open.get(repo, {})))
+
+
+class TestTriageRuleInputs(unittest.TestCase):
+    def test_every_triage_rule_has_an_input_entry_and_only_registry_names(self):
+        for rule in sb.TRIAGE_KINDS:
+            self.assertIn(rule, sb.TRIAGE_RULE_INPUTS, "a new rule needs the inputs it judges: %s" % rule)
+        for rule, needs in sb.TRIAGE_RULE_INPUTS.items():
+            self.assertTrue(needs and set(needs) <= {"agents", "decisions", "issues"}, rule)
+
+    def test_the_prune_keeps_the_records_of_a_rule_the_table_does_not_know(self):
+        engine = types.SimpleNamespace(read_whole={}, _note=lambda *a, **k: None)
+        sb.read_mark(engine, "issues:acme/api", True, "", 1.0)
+        keep = sb.triage_digest_keep(engine)
+        self.assertFalse(keep("T2", "acme/api#1"))
+        with mock.patch.dict(sb.TRIAGE_RULE_INPUTS, {}, clear=True):
+            self.assertTrue(keep("T2", "acme/api#1"))                                # unknown: kept
 
 
 class TestReadWholeAuditTable(unittest.TestCase):

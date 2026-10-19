@@ -12525,6 +12525,11 @@ TRIAGE_KINDS = {"T1": "owner missing", "T2": "required label missing", "T3": "no
                 "T5": "human-tier decision unanswered", "T6": "MERGE: captain PR waiting", "T7": "PR with no review",
                 "T8": "blocked ask", "T9": "ask with no activity", "T10": "closed but still labelled awaiting",
                 "T11": "orphan", "T12": "plan issue still open after its PR merged", "OO": "other-owner (flag only)"}
+# #805: the inputs each rule judges, in ONE table: the candidates a pass drops and the records the prune keeps are both read from it, so they cannot drift.
+# A name is a registry input; "issues" stands for the issue list of the item's own repository (`issues:<repo>`).
+TRIAGE_RULE_INPUTS = {"T1": ("agents", "issues"), "T2": ("issues",), "T3": ("issues",), "T5": ("decisions", "issues"), "T6": ("decisions", "issues"),
+                      "T7": ("issues",), "T8": ("issues",), "T9": ("issues",), "T10": ("issues",), "T11": ("agents", "issues"),
+                      "T12": ("issues",), "OO": ("issues",), "PARKED": ("issues",)}
 TRIAGE_T10_GRACE = 600         # seconds after a close in which a still-set awaiting label is not yet a finding
 TRIAGE_TTL = 900               # seconds a unit read is kept
 TRIAGE_CALLS_PER_PASS = TRIAGE_DEFAULTS["calls_per_pass"]   # default of `triage.calls_per_pass` (reads and fresh checks alike)
@@ -13007,9 +13012,9 @@ def triage_findings(engine, state, repos, decisions, cfg, now, errors):
                                        captain_skip=captain_skip, merged=links, pending=pending,
                                        live=live["info"] if live else None, live_days=live_days)
             if not agents_whole:   # #805: "no owner" is judged against the running agents: a fleet that was not read whole is no evidence of an absence
-                for rule in ("T1", "T11"):
-                    if found.pop(rule, None) is not None:
-                        whole_skipped(engine, "triage.owner_rules", "agents")
+                for rule in [r for r in found if "agents" in TRIAGE_RULE_INPUTS.get(r, ())]:
+                    found.pop(rule)
+                    whole_skipped(engine, "triage.owner_rules", "agents")
             if not found:
                 continue
             ref = "%s#%d" % (repo, number)
@@ -13490,10 +13495,12 @@ def triage_digest_memory(engine, state):
 def triage_digest_keep(engine):
     """keep(rule, ref) for the prune: True when the record's candidates could not be computed in this pass (#805)."""
     def keep(rule, ref):
-        if rule in ("T5", "T6") and whole_skipped(engine, "triage.prune", "decisions"):
-            return True
+        needs = TRIAGE_RULE_INPUTS.get(rule)
+        if needs is None:
+            return True   # a rule the table does not know: nothing about it is forgotten
         repo = ref.rpartition("#")[0]
-        return bool(repo) and whole_skipped(engine, "triage.prune", "issues:" + repo)
+        return any(whole_skipped(engine, "triage.prune", ("issues:" + repo) if name == "issues" else name)
+                   for name in needs if name != "issues" or repo)
     return keep
 
 
