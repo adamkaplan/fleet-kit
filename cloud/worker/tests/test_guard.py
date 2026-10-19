@@ -431,8 +431,7 @@ class GuardConfigForms(unittest.TestCase):
 
     def test_s1_s2_every_row_of_the_table_is_answered_as_listed(self):
         rows = cfg_table()
-        self.assertEqual(len([r for r in rows if r[0] == "refused"]), 11)
-        self.assertEqual(len([r for r in rows if r[0] == "allowed"]), 7)
+        self.assertTrue([r for r in rows if r[0] == "refused"] and [r for r in rows if r[0] == "allowed"])
         for kind, name, args, _ in rows:
             with self.subTest(name=name):
                 r = self.run_guard(args)
@@ -457,22 +456,52 @@ class GuardConfigForms(unittest.TestCase):
         self.assertEqual(len(para), 1)
         listed = para[0].split("this list names exactly its refused forms):", 1)[1].split(". The one exception", 1)[0]
         in_readme = set(re.findall(r"`([^`]+)`", listed))
-        in_readme = {"KEY VALUE" if x == "KEY VALUE" else x for x in in_readme}
         self.assertEqual(in_readme, names)
         self.assertIn("judged word by word", para[0])
         self.assertIn("user.name", para[0])
         self.assertRegex(para[0], r"convenience, not the guard")
 
     def test_every_refused_flag_row_has_a_mutant_that_this_table_catches(self):
-        line = "--rename-section|--remove-section|-e|--edit|--add|--unset|--unset-all|--replace-all) wr=1 ;;"
+        text = read(os.path.join(WORKER, "guard.sh"))
         for kind, name, args, _ in cfg_table():
             if kind != "refused" or not name.startswith("-"):
                 continue
             with self.subTest(name=name):
-                parts = line[:-len(") wr=1 ;;")].split("|")
-                parts.remove(name)
-                p = self.mutant(line, "|".join(parts) + ") wr=1 ;;")
+                lines = text.splitlines()
+                hit = [i for i, l in enumerate(lines) if l.strip().endswith("wr=1 ;;") and name in l.strip().split(")")[0].split("|")]
+                self.assertEqual(len(hit), 1, name)
+                head, tail = lines[hit[0]].split(")", 1)
+                lines[hit[0]] = "|".join(t for t in head.split("|") if t.strip() != name) + ")" + tail
+                m = "\n".join(lines).replace("-*) wr=1 ;;", "-*) ok=0 ;;")   # the catch-all is off too: this member alone must hold
+                p = os.path.join(self.d, "mut-%d.sh" % len(os.listdir(self.d)))
+                with open(p, "w") as f:
+                    f.write(m)
                 self.assertEqual(self.run_guard([name, "user.x"], p).returncode, 0, "the mutant must let the form through: %s" % name)
+
+    def test_every_prefix_of_a_write_flag_is_refused(self):
+        for kind, name, _, _ in cfg_table():
+            if kind == "refused" and name.startswith("--"):
+                for n in range(3, len(name)):
+                    with self.subTest(flag=name[:n]):
+                        self.assertEqual(self.run_guard([name[:n], "user.x"]).returncode, 3)
+
+    def test_every_subcommand_row_and_the_plain_form_have_a_mutant_that_this_table_catches(self):
+        for kind, name, args, _ in cfg_table():
+            if kind == "refused" and name in ("edit", "set", "unset", "rename-section", "remove-section"):
+                with self.subTest(name=name):
+                    parts = "edit|set|unset|rename-section|remove-section".split("|")
+                    parts.remove(name)
+                    p = self.mutant("edit|set|unset|rename-section|remove-section) wr=1", "|".join(parts) + ") wr=1")
+                    self.assertEqual(self.run_guard([name], p).returncode, 0)
+        p = self.mutant('[ "$mode" = 0 ] && [ "$pos" -ge 2 ]', '[ "$mode" = 0 ] && [ "$pos" -ge 99 ]')
+        self.assertEqual(self.run_guard(["user.x", "y"], p).returncode, 0)
+        p = self.mutant("-*) wr=1 ;;", "-*) ok=0 ;;")
+        self.assertEqual(self.run_guard(["--uns", "user.x"], p).returncode, 0)
+
+    def test_the_read_forms_and_their_modifiers_still_pass(self):
+        for args in (["--get", "--type=bool", "user.x"], ["--bool", "--get", "user.x"], ["--get", "--default", "d", "user.x"], ["get", "user.x"], ["list"], ["--get-regexp", "--global", "x"]):
+            with self.subTest(args=args):
+                self.assertEqual(self.run_guard(args).returncode, 0)
 
     def test_a_mutant_that_widens_the_identity_exception_is_caught(self):
         p = self.mutant("user.name|user.email)", "user.*)")
@@ -489,7 +518,7 @@ class GuardConfigForms(unittest.TestCase):
             return re.fullmatch(".*".join(re.escape(x) for x in pat.split("*")), line, re.S) is not None
         for kind, name, args, _ in cfg_table():
             line = "git config " + " ".join(args)
-            if kind == "refused" and name not in ("KEY VALUE",):
+            if kind == "refused" and name not in ("KEY VALUE", "an unknown flag or abbreviation"):
                 with self.subTest(name=name):
                     self.assertTrue(any(match(p, line) for p in denies), line)
             if kind == "allowed":

@@ -26,6 +26,15 @@
 #CFG refused | --unset | --unset user.x | writes configuration
 #CFG refused | --unset-all | --unset-all user.x | writes configuration
 #CFG refused | --replace-all | --replace-all user.x y | writes configuration
+#CFG refused | --file | --file=/tmp/f user.x | a write to (or read of) another file
+#CFG refused | -f | -f /tmp/f user.x | a write to (or read of) another file
+#CFG refused | --blob | --blob=x user.x | another source of configuration
+#CFG refused | an unknown flag or abbreviation | --uns user.x | git accepts a unique prefix of --unset; any flag not listed as a read or display flag is refused
+#CFG refused | edit | edit | the subcommand form (git 2.46 and later)
+#CFG refused | set | set user.x y | the subcommand form
+#CFG refused | unset | unset user.x | the subcommand form
+#CFG refused | rename-section | rename-section a b | the subcommand form
+#CFG refused | remove-section | remove-section a | the subcommand form
 #CFG refused | KEY VALUE | user.x y | the plain write form (any key but the two identity keys below)
 #CFG refused | include.path | include.path /tmp/f | a value that makes git read another file
 #CFG refused | includeIf.<cond>.path | includeIf.gitdir:/a/.path /tmp/f | a value that makes git read another file
@@ -82,8 +91,17 @@ do_git() {
         --rename-section|--remove-section|-e|--edit|--add|--unset|--unset-all|--replace-all) wr=1 ;;
         --get|--get-all|--get-regexp|--get-urlmatch|--list|-l|--get-color|--get-colorbool) if [ "$mode" = 0 ] && [ "$pos" = 0 ]; then mode=1; else ok=0; fi ;;
         --global|--local|--system|--worktree|--show-origin|--show-scope|--name-only|-z|--includes|--no-includes) ;;
-        -*) ok=0 ;;
-        *) pos=$((pos + 1)); [ "$pos" = 1 ] && key=$(printf '%s' "$a" | tr 'A-Z' 'a-z') ;;
+        --file|--file=*|-f|--blob|--blob=*) wr=1 ;;
+        --type=*|--bool|--int|--bool-or-int|--path|--expiry-date|--no-type|--null|--default|--default=*|--fixed-value) ;;   # read modifiers
+        -*) wr=1 ;;   # any other flag: git takes a unique prefix of a long option (--uns is --unset), so it is refused
+        *) pos=$((pos + 1))
+           if [ "$pos" = 1 ]; then
+             key=$(printf '%s' "$a" | tr 'A-Z' 'a-z')
+             case "$key" in
+               edit|set|unset|rename-section|remove-section) wr=1 ;;   # the subcommand forms
+               get|list) if [ "$mode" = 0 ]; then mode=1; pos=0; fi ;;   # the read subcommands (git 2.46 and later): as --get, --list
+             esac
+           fi ;;
       esac
     done
     [ "$ok" = 1 ] && [ "$mode" = 1 ] && [ "$pos" -le 1 ] && return 0
