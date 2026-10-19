@@ -65601,6 +65601,22 @@ class TestAdoption(LanesCase):
         self.assertEqual(self.rows(), [])
         self.assertEqual(sb.adopt_workers(engine, "pass", "x", discovery)[1][:20], "the agent list canno")
 
+    def test_a_boss_set_between_the_plan_and_the_write_is_never_overwritten(self):   # judged again under the lock
+        self.worker("w1", "gone", charter=1)
+        real = sb._read_strict_records
+        sid = self.world.sessions["w1"]
+
+        def concurrent_reassign(state):
+            records = real(state)
+            module = sb.load_module("reassign")
+            module.write_overrides(state, {"w1": {"boss": "orch-b", "was": "gone", "original": "gone", "session": sid, "by": "chief-of-staff", "at": float(self.world.clock.now())}})
+            return records
+
+        with mock.patch.object(sb, "_read_strict_records", concurrent_reassign):
+            self.daemon_pass()
+        self.assertEqual(self.boss("w1"), "orch-b", "the boss set in the gap stands")
+        self.assertEqual([r for r in self.rows() if r["detail"]["worker"] == "w1"], [])
+
     def retired_orphan(self, name="w1", boss="gone", charter=None):
         self.worker(name, boss, charter=charter)
         self.operator()
@@ -65712,7 +65728,8 @@ class TestAdoption(LanesCase):
                 self.world.tick(11 * 60)
                 code, out, err = self.main("close-pane", "w1:p90")
         if guard == "listed":
-            self.assertNotEqual(code, 0, "a pane herdr does not have cannot be closed by any build")
+            self.assertEqual((code, self.world.herdr.closed), (1, []), "a pane herdr does not have cannot be closed by any build")
+            self.assertIn("not inside a fleet worktree", err, "another guard (no cwd) is what refuses it")
         else:
             self.assertEqual((code, self.world.herdr.closed), (0, ["w1:p90"]), "without the %s guard it closes: %s" % (guard, err))
 
@@ -65760,27 +65777,65 @@ class TestAdoption(LanesCase):
                 self.assertIn("only the Chief of Staff", err)
         self.assertEqual(len(self.rows("fleetpane.close_refused")), 5, "each refusal is audited with the caller")
 
-    def test_every_path_in_the_table_has_a_caller_and_every_caller_names_a_path_in_the_table(self):   # the paths: one table, a completeness test
-        source = (REPO / "bin" / "fleet-switchboard").read_text() + (REPO / "bin" / "lanes.py").read_text()
-        called = set(re.findall(r'adopt_workers\(engine, "(\w+)"', source)) | set(re.findall(r'repoint_workers\(engine, [^,]+, [^,]+, "(\w+)"', source))
-        called |= set(re.findall(r'for path, bosses in \(\("(\w+)", \{args.name\}\), \("(\w+)", None\)\)', source)[0]) if re.search(r'for path, bosses in', source) else set()
-        self.assertEqual(called, set(sb.ADOPT_PATHS), "a path with no caller, or a caller with a path not in ADOPT_PATHS")
+    def test_every_path_in_the_table_is_taken_by_a_real_command_and_no_other_path_is(self):   # the paths table, proved by behaviour
+        seen = []
+        real_adopt, real_repoint = sb.adopt_workers, sb.repoint_workers
+        with mock.patch.object(sb, "adopt_workers", lambda engine, path, *a, **k: (seen.append(path), real_adopt(engine, path, *a, **k))[1]), \
+                mock.patch.object(sb, "repoint_workers", lambda engine, names, heir, path, by: (seen.append(path), real_repoint(engine, names, heir, path, by))[1]):
+            self.main("move", "2", "--to", "10")                                            # move
+            self.worker("w-pass", "gone", charter=10)
+            self.daemon_pass()                                                              # pass
+            self.main("retire", "orch-a")                                                   # retire
+            self.launch_orchestrator("orch-new")                                            # relaunch, replace
+            self.retired_orphan("w-close", "gone")
+            self.main("retire", "w-close", "--close")                                       # close
+        self.assertEqual(set(seen), set(sb.ADOPT_PATHS))
         with self.assertRaises(ValueError):
             sb.write_boss_records(self.world.new_engine(), None, [(None, None, "x", "y")], "invented", "x")
 
+    def test_a_boss_that_is_back_or_an_heir_that_is_gone_since_the_plan_stops_the_write(self):   # judged again under the lock
+        self.worker("w1", "orch-late", charter=1)
+        real = sb._read_strict_records
+
+        def boss_comes_back(state):
+            records = real(state)
+            self.world.add_agent("orch-late", fleet={"role": "orchestrator", "charter": 1})
+            return records
+
+        with mock.patch.object(sb, "_read_strict_records", boss_comes_back):
+            self.daemon_pass()
+        self.assertEqual(self.boss("w1"), "orch-late")
+        self.assertEqual([r for r in self.rows() if r["detail"]["worker"] == "w1"], [])
+
+    def test_a_damaged_record_stops_every_other_path_too_and_the_problem_is_said(self):   # S9 on retire, launch, move and close
+        self.worker("w1", "orch-a", charter=1)
+        self.world.herdr.panes[self.world.panes["worker"]]["status"] = "idle"
+        (Path(self.world.state) / "boss-overrides.json").write_bytes(b"{not json")
+        before = (Path(self.world.state) / "boss-overrides.json").read_bytes()
+        code, out, err = self.main("move", "2", "--to", "10")
+        self.assertIn("is not valid JSON: no worker was re-pointed", err)
+        self.assertEqual(self.boss("worker"), "orch-a")
+        code, out, err = self.main("retire", "orch-a")
+        self.assertIn("were not re-pointed", err)
+        self.assertEqual(self.boss("w1"), "orch-a", "orch-a is retired but its workers keep the record they had")
+        code, out, err = self.launch_orchestrator("orch-b2")
+        self.assertIn("were not re-pointed", err + out)
+        self.retired_orphan("w9", "gone")
+        code, out, err = self.main("retire", "w9", "--close")
+        self.assertEqual((code, self.world.herdr.closed), (1, []), err)
+        self.assertEqual((Path(self.world.state) / "boss-overrides.json").read_bytes(), before)
+        self.assertEqual(self.rows(), [])
+
     # ---- the family: every reader of a worker's boss
-    def sites(self):
+    @staticmethod
+    def scan(sources):
+        """{"file:function"} of every function in the given {file: source text} that reads `reports_to` raw (`.get("reports_to")` or `["reports_to"]`)."""
         import ast
         found = set()
-        for rel in ["bin/fleet-switchboard"] + sorted(str(p.relative_to(REPO)) for p in (REPO / "bin").glob("*.py")):
-            tree = ast.parse((REPO / rel).read_text())
-
+        for rel, text in sources.items():
             def walk(node, stack):
                 for child in ast.iter_child_nodes(node):
-                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        walk(child, stack + [child.name])
-                        continue
-                    if isinstance(child, ast.ClassDef):
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                         walk(child, stack + [child.name])
                         continue
                     if (isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute) and child.func.attr == "get" and child.args
@@ -65789,17 +65844,21 @@ class TestAdoption(LanesCase):
                                 and isinstance(child.ctx, ast.Load)):
                         found.add("%s:%s" % (rel, ".".join(stack[:1] if not stack or not stack[0][0].isupper() else stack[-1:])))
                     walk(child, stack)
-            walk(tree, [])
+            walk(ast.parse(text), [])
         return found
+
+    def sites(self):
+        names = ["bin/fleet-switchboard"] + sorted(str(p.relative_to(REPO)) for p in (REPO / "bin").glob("*.py"))
+        return self.scan({rel: (REPO / rel).read_text() for rel in names})
 
     def test_every_reader_of_a_workers_boss_is_in_the_table_and_the_table_has_no_stale_member(self):   # S15
         self.assertEqual(self.sites(), set(sb.BOSS_READ_SITES), "a new raw reader must go through boss_name, or be named in BOSS_READ_SITES with its reason")
 
-    def test_the_scan_finds_a_raw_reader_when_one_is_planted(self):   # S15 mutant: the completeness test is not blind
-        import ast
-        tree = ast.parse("def load_row(o):\n    return o.fleet.get('reports_to') == 'x'\n")
-        hits = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "get" and n.args[0].value == "reports_to"]
-        self.assertEqual(len(hits), 1)
+    def test_the_scan_finds_a_raw_reader_when_one_is_planted(self):   # S15 mutant: the real scan, fed a planted source, reports it
+        planted = {"bin/planted.py": "def load_row(o):\n    return o.fleet.get('reports_to') == 'x'\n\ndef other(o):\n    return o.fleet['reports_to']\n\ndef safe(o):\n    return boss_name(o)\n"}
+        self.assertEqual(self.scan(planted), {"bin/planted.py:load_row", "bin/planted.py:other"})
+        extended = self.sites() | self.scan(planted)
+        self.assertNotEqual(extended, set(sb.BOSS_READ_SITES), "the table test would fail on a planted reader")
 
     def test_an_adopted_worker_is_seen_under_its_heir_by_every_behavioural_reader(self):   # S15
         self.worker("w1", "gone", charter=1)

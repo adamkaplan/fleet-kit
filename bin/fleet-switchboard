@@ -7429,12 +7429,27 @@ def write_boss_records(engine, discovery, assignments, path, by):
             now = engine.now()
             reassign.prune(overrides, retired, now)
             done = []
+            fresh = engine.discover(engine.now())   # judged again under the lock, from a fresh look: the heir must still be a live agent, the worker's boss still gone
+            if fresh.problems:
+                return [], "the agent list cannot be read in full: no boss was changed"
+            kept = []
             for obs, was, heir, why in assignments:
+                now_obs, now_heir = fresh.agents.get(obs.name), fresh.agents.get(heir)
+                if now_obs is None or now_obs.session_id != obs.session_id or now_heir is None or not _heir_ok(fresh, retired, heir, now_heir):
+                    continue
+                if path != "move" and boss_name(fresh, now_obs) is not None and boss_is_present(fresh, retired, boss_name(fresh, now_obs)) and boss_name(fresh, now_obs) != heir:
+                    continue   # its boss is back (relaunched) since the plan: nothing to fill
                 held = reassign.matching(overrides, obs.name, obs.session_id)
+                if held is not None and held["boss"] != (was or "") and held["boss"] != heir:
+                    continue   # judged again under the lock: someone gave it another boss since the plan was made (a reassign, a move): never overwritten
+                kept.append((obs, was, heir, why))
                 original = (held or {}).get("original") or (obs.fleet or {}).get("reports_to") or ""
                 overrides[obs.name] = {"boss": heir, "was": str(was or ""), "original": original, "session": obs.session_id, "by": by, "at": float(now),
                                        "adopted": True}
                 done.append((obs.name, heir))
+            assignments = kept
+            if not kept:
+                return [], None
             with engine._external("boss.adopt", "agents", {"path": path, "workers": [n for n, _ in done], "by": by}):
                 reassign.write_overrides(state, overrides)
     except RecordUnreadable as err:
@@ -7490,7 +7505,7 @@ def repoint_workers(engine, names, heir, path, by):
     except RecordUnreadable as err:
         return [], "%s: no worker was re-pointed" % _one_line(str(err), 100)
     target = discovery.agents.get(heir)
-    if target is None or not _heir_ok(discovery, retired, heir, target) or (target.fleet or {}).get("role") not in ("orchestrator", "chief-of-staff"):
+    if target is None or not _heir_ok(discovery, retired, heir, target) or (target.fleet or {}).get("role") != "orchestrator":
         return [], "%s is not a live orchestrator: no worker was re-pointed" % heir
     plan = []
     for name in names:
@@ -8317,7 +8332,8 @@ def _guard_idle(ctx):
     seen, entry = ctx["seen"], ctx["entry"] or {}
     if seen is None or seen.get("revision") != entry.get("revision") or entry.get("revision") is None \
             or ctx["now"] - seen.get("since", ctx["now"]) < ctx["window"] * 60:
-        return "pane %s has not been seen idle for %d minutes (its revision is noted; run it again after that long without activity): nothing was closed" % (ctx["pane"], ctx["window"])
+        return "pane %s has not been seen idle for %d minutes (its revision is noted%s; run it again after that long without activity): nothing was closed" % (
+            ctx["pane"], ctx["window"], "" if not ctx.get("note_error") else ", BUT NOT WRITTEN: " + ctx["note_error"])
     return None
 
 
@@ -8358,14 +8374,15 @@ def read_pane_health_strict_agents(state_dir):
 
 
 def bare_pane_problem(engine, discovery, pane, now):
-    """None when every guard of the table passes, else the first why not. Reads only (the idle note is written by the command, before)."""
+    """None when every guard of the table passes, else the first why not. Reads, except that the idle guard first notes the pane's revision in `bare-panes.json`
+    (`note_bare_pane`); when that cannot be written the refusal says so."""
     try:
         ctx = bare_pane_context(engine, discovery, pane, now)
     except (HerdrError, OSError, ValueError) as err:
         return "pane %s cannot be read now (%s): nothing was closed" % (pane, _one_line(str(err), 100))
     for guard_id, guard in bare_pane_guards():
         if guard_id == "idle":   # only a pane that passed every other guard is remembered: a pane's idle time is how long herdr's revision of it stayed the same
-            note_bare_pane(engine, pane)
+            ctx["note_error"] = note_bare_pane(engine, pane)
             ctx["seen"] = _read_small(engine.state_dir, BARE_PANES_FILE).get(pane) or None
         why = guard(ctx)
         if why:
@@ -8374,19 +8391,21 @@ def bare_pane_problem(engine, discovery, pane, now):
 
 
 def note_bare_pane(engine, pane):
-    """Remember the revision a pane shows and since when (kept while it does not change). Best effort: a failure only means 'not yet seen idle'."""
+    """Remember the revision a pane shows and since when (kept while it does not change). None when noted, else a short reason it was not (the pane then
+    stays 'not yet seen idle': the close is never made on a note that was not written)."""
     try:
         entry = next((p for p in engine.herdr.pane_list() if isinstance(p, dict) and p.get("pane_id") == pane), None)
         if entry is None or entry.get("revision") is None:
-            return
+            return "herdr gives no revision for it"
         with agent_lock(engine.state_dir, "files"):
             data = _read_small(engine.state_dir, BARE_PANES_FILE)
             data = {k: v for k, v in data.items() if k == pane or k in {p.get("pane_id") for p in engine.herdr.pane_list() if isinstance(p, dict)}}
             if (data.get(pane) or {}).get("revision") != entry["revision"]:
                 data[pane] = {"revision": entry["revision"], "since": int(engine.now())}
             _write_small(engine.state_dir, BARE_PANES_FILE, data)
-    except Exception:
-        return
+        return None
+    except Exception as err:
+        return _one_line(str(err), 80)
 
 
 def cmd_close_pane(args, runner, now):
@@ -8408,19 +8427,27 @@ def cmd_close_pane(args, runner, now):
     except Exception:
         pass
     problem = bare_pane_problem(engine, engine.discover(engine.now()), pane, engine.now())
-    if problem is None:
-        problem = bare_pane_problem(engine, engine.discover(engine.now()), pane, engine.now())   # judged again just before the close
-    if problem is not None:
-        if engine.audit is not None:
-            engine.audit.append(engine.actor, "fleetpane.close_refused", "pane:%s" % pane, {"pane": pane, "by": who, "cwd": cwd, "why": _one_line(problem, 160)})
-        raise LaunchError("refused: %s" % problem)
     try:
-        with engine._external("herdr.pane.close", "pane:%s" % pane, {"pane": pane, "why": "close-pane"}):
-            engine.herdr.pane_close(pane)
+        if problem is None:
+            # The point of effect: under one lock (two close-panes cannot both act), the caller's role and EVERY guard are read again, then the close. Only
+            # the instant between that last look and herdr's close remains (herdr has no close-if-unchanged), as for `retire --close`.
+            with agent_lock(state, "close-pane"):
+                again = gates_caller_kind(runner, now)
+                if again[0] != "agent" or len(again) < 3 or again[2] != "chief-of-staff":
+                    problem = "the caller is no longer established as the Chief of Staff"
+                else:
+                    problem = bare_pane_problem(engine, engine.discover(engine.now()), pane, engine.now())
+                if problem is None:
+                    with engine._external("herdr.pane.close", "pane:%s" % pane, {"pane": pane, "why": "close-pane"}):
+                        engine.herdr.pane_close(pane)
     except Exception as err:
         if engine.audit is not None:
             engine.audit.append(engine.actor, "fleetpane.close_failed", "pane:%s" % pane, {"pane": pane, "by": who, "cwd": cwd, "why": _one_line(str(err), 120)})
         raise LaunchError("pane %s was not closed (%s)" % (pane, _one_line(str(err), 100))) from None
+    if problem is not None:
+        if engine.audit is not None:
+            engine.audit.append(engine.actor, "fleetpane.close_refused", "pane:%s" % pane, {"pane": pane, "by": who, "cwd": cwd, "why": _one_line(problem, 160)})
+        raise LaunchError("refused: %s" % problem)
     if engine.audit is not None:
         engine.audit.append(engine.actor, "fleetpane.closed", "pane:%s" % pane, {"pane": pane, "by": who, "cwd": cwd, "why": "no record names this pane (a bare shell in a fleet worktree, idle)"})
     print("closed pane %s (a bare shell no record names: its memory is released)" % pane)
