@@ -28537,6 +28537,50 @@ class TestPrSharesFiles(LedgerBase):
         self.open_prs = []
         self.assertNotIn("shares", self.gates()[1])
 
+    def held_report(self, stale=False):
+        t = 1_000_000
+        held = lambda n, since: {"id": "pr:app#%d" % n, "title": "t%d" % n, "kind": "captain", "tier": "human", "repo": "acme/app", "number": n, "since": sb.iso(since), "agent": None}
+        return {"stale": stale, "message": "stale" if stale else None, "age_seconds": 0, "written_at": sb.iso(t), "generation": None, "errors": [],
+                "decisions": [held(1, t + 500), held(2, t), held(3, t - 900)]}
+
+    def decisions_cli(self, *more, stale=False):
+        os.environ["HERDR_PANE_ID"] = self.world.panes["own"]
+        with captured() as (out, err), mock.patch.object(sb, "decisions_report", lambda *a, **k: self.held_report(stale)):
+            code = sb.main(["decisions", *more], runner=self.route, now=self.world.clock.now, wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_the_decisions_command_prints_the_merge_order_and_json_carries_it(self):
+        self.open_prs = [self.pr_of(1, "a"), self.pr_of(2, "a"), self.pr_of(3, "z")]
+        code, out, err = self.decisions_cli()
+        self.assertIn("merge order: #2, then #1 (shared files)", out.splitlines())
+        code, out, err = self.decisions_cli("--json")
+        self.assertEqual(json.loads(out)["merge_order"], ["merge order: #2, then #1 (shared files)"])
+        self.open_prs = [self.pr_of(1, "a"), self.pr_of(2, "b")]
+        self.assertNotIn("merge_order", json.loads(self.decisions_cli("--json")[1]))
+
+    def test_a_stale_decisions_report_makes_no_read_and_no_hint(self):
+        self.open_prs = [self.pr_of(1, "a"), self.pr_of(2, "a")]
+        code, out, err = self.decisions_cli(stale=True)
+        self.assertNotIn("merge order", out)
+        self.assertEqual(self.list_calls, [])
+
+    def test_merge_order_groups_transitively_caps_and_breaks_ties_by_number(self):
+        mod = sb.load_module("pr_overlap")
+        chain = {1: ["a"], 2: ["a", "b"], 3: ["b"], 7: ["x"], 8: ["x"], 9: ["q"]}   # 1-2-3 linked through 2; 7-8 another group; 9 alone
+        hints = mod.merge_order(chain, [(1, 50), (2, 40), (3, 30), (7, 10), (8, 10), (9, 1)])
+        self.assertEqual(hints, ["merge order: #3, then #2, then #1 (shared files)", "merge order: #7, then #8 (shared files)"])
+        many = {n: ["s"] for n in range(1, 9)}
+        (hint,) = mod.merge_order(many, [(n, 100 - n) for n in many])
+        self.assertEqual(hint.count("#"), 5)
+
+    def test_two_repos_prefix_each_hint_and_a_failed_read_gives_none(self):
+        held = lambda repo, n, s: {"kind": "captain", "repo": repo, "number": n, "since": sb.iso(s)}
+        ds = [held("acme/app", 1, 5), held("acme/app", 2, 6), held("acme/b", 3, 5)]
+        self.open_prs = [self.pr_of(1, "a"), self.pr_of(2, "a")]
+        self.assertEqual(sb.held_merge_order_hints(ds, self.route, self.world.clock.now), ["acme/app: merge order: #1, then #2 (shared files)"])
+        self.list_fails = True
+        self.assertEqual(sb.held_merge_order_hints(ds, self.route, self.world.clock.now), [])
+
     def test_S8_an_unreadable_own_list_gives_no_line(self):
         self.open_prs = [{"number": 9, "files": None, "changedFiles": 2}, self.pr_of(12, "a")]
         before = self.gates_text()
