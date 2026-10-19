@@ -314,7 +314,55 @@ def credential_texts(secret):
                 yield "%s=%s %s" % (key, sch, v)
 
 
+# The family of credential-free text the scrub must NOT touch, next to the family it must redact: both run through the real
+# shared function. A rule that loosens (userinfo leaving its own part) fails the first table; one that tightens fails the second.
+UNCHANGED = [
+    "https://registry.npmjs.org/@scope/pkg/-/pkg-1.0.0.tgz",       # a scoped package
+    "https://example.com/a/@user/profile",                          # an @user path
+    "https://example.com/page?email=bob@acme.org&x=1",              # an email in a query
+    "git@github.com:acme/widget.git",                               # SSH-style, no scheme
+    "contact bob@acme.org or ops@acme.org for access",              # emails and user@host prose in text
+    "https://host.example:8080/a/@scope/pkg",                       # a port, then an @ in the path
+    "https://host.example:8080?e=a@b.example",                      # a port, then an @ in the query
+    "https://example.com/p#frag@x",                                 # an @ in a fragment
+    "http://localhost:3000/@vite/client",
+    "see https://github.com/acme/widget.git and the authorization step that follows",
+    "ssh -o StrictHostKeyChecking=no git@github.com",
+]
+REDACTED = [   # (text, the credential that must not survive)
+    ("https://user:pa55word@github.com/acme/widget.git", "pa55word"),
+    ("https://us:p/a?b#c@host.example/x", "p/a?b#c"),               # an unencoded password with reserved characters
+    ("https://user:pass@host.example:8080/a/@x", "pass"),           # a port AFTER the credential
+    ("https://tok3nvalue99@host.example/x", "tok3nvalue99"),        # a user-only credential
+    ("ssh://git:s3cretpw@host.example/o/r", "s3cretpw"),
+    ("https://u:1234abcd@h.example/x", "1234abcd"),
+    ("Authorization: Bearer abcdefghijkl", "abcdefghijkl"),
+    ("Authorization:\n Bearer abcdefghijkl\nnext", "abcdefghijkl"),   # an obsolete folded header
+    ("Authorization:\r\n\tBasic dXNlcjpwYXNz\r\nnext", "dXNlcjpwYXNz"),
+]
+
+
 class ScrubShapes(unittest.TestCase):
+    def test_credential_free_text_is_never_touched(self):
+        for text in UNCHANGED:
+            with self.subTest(text=text):
+                self.assertEqual(cw.scrub(text, ()), text)
+
+    def test_every_credential_in_the_redacted_table_goes_and_the_text_after_it_stays(self):
+        for text, cred in REDACTED:
+            with self.subTest(text=text):
+                out = cw.scrub(text, ())
+                self.assertNotIn(cred, out)
+                self.assertIn("[redacted]", out)
+        self.assertTrue(cw.scrub("Authorization:\n Bearer abcdefghijkl\nnext", ()).endswith("next"))
+
+    def test_each_shape_of_the_one_scrub_has_a_case_in_each_table(self):
+        for pat, repl in cw.CREDENTIAL_SHAPES:
+            with self.subTest(shape=pat.pattern[:40]):
+                self.assertTrue(any(pat.search(t) for t, _ in REDACTED), "no redacted case reaches this shape")
+                self.assertFalse(any(pat.search(t) for t in UNCHANGED), "this shape touches credential-free text")
+
+
     def test_no_credential_shape_survives_in_any_scheme_case_spacing_or_encoding(self):
         n = 0
         for secret in SECRETS:

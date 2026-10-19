@@ -76,11 +76,16 @@ TOKEN_SHAPES = [re.compile(p) for p in (
 # also quoted as in JSON), and the user:password of a URL of any scheme (the password may be percent-encoded). Each is
 # replaced whole; they run BEFORE the token shapes so the surrounding text survives.
 CREDENTIAL_SHAPES = [(re.compile(p, re.I), r) for p, r in (
-    # the rest of the header line goes: a multi-parameter scheme (Digest user="u", response="...") is not cut at its first comma
-    (r"""\bauthorization["']?[ \t]*[:=][ \t]*[^\r\n]*""", "authorization: [redacted]"),
-    # every quantifier is bounded (the scheme 30, the userinfo 500) so pod-controlled text cannot make the scan quadratic;
-    # the userinfo runs to the LAST @ within its bound, so an unencoded / ? # in a password is covered too
-    (r"""\b([a-z][a-z0-9+.-]{0,30}://)[^\s'"<>]{0,500}@""", r"\1[redacted]@"))]
+    # the rest of the header line goes, and its folded continuation lines (a line that starts with a space or tab): a
+    # multi-parameter scheme (Digest user="u", response="...") is not cut at its first comma
+    (r"""\bauthorization["']?[ \t]*[:=][ \t]*[^\r\n]*(?:\r?\n[ \t]+[^\r\n]*)*""", "authorization: [redacted]"),
+    # URL userinfo stays INSIDE ITS OWN PART: the user holds no / ? # @ :, and a password holds none either, so
+    # host/path/query is never userinfo (a scoped package, an @user path, ?email=a@b, a port). Every quantifier is bounded
+    # (hostile text cannot make the scan quadratic).
+    (r"""\b([a-z][a-z0-9+.-]{0,30}://)[^\s/?#@:'"<>]{0,200}(?::[^\s/?#@'"<>]{0,500})?@""", r"\1[redacted]@"),
+    # An UNENCODED reserved character in a password (user:p/a?b#c@host): a ':' straight after the user, a password that is
+    # not just a port (digits then / ? # or the end), up to the last @ within the bound.
+    (r"""\b([a-z][a-z0-9+.-]{0,30}://)[^\s/?#@:'"<>]{0,200}:(?!\d+(?:[/?#\s'"<>]|$))[^\s'"<>]{0,500}@""", r"\1[redacted]@"))]
 SCRUB_INPUT_MAX = 200000
 SCRUB_OUTPUT_MAX = 2 * SCRUB_INPUT_MAX   # a limit above the input maximum: redaction lengthens text (8 characters become 10), and a cut there would be silent
 MIN_FRAGMENT = 8
