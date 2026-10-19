@@ -1,0 +1,4 @@
+{
+ "command": "daemon",
+ "help": "usage: fleet-switchboard daemon [-h] {status,start,stop,restart} ... One command for the daemon. `status` says whether it runs, how it was started, its pid, since when and whether it is healthy. `stop` ends it (SIGTERM, only to a pid the daemon record and run.lock agree on whose command is this program's `run`; `launchctl bootout` under a loaded launchd job). `start` begins it (launchd when its job exists, else the `ensure` path) and waits up to 120 seconds for it to be healthy. `restart` is stop then start. No state file is touched. positional arguments: {status,start,stop,restart} status running or not, how it was started, pid, since when, healthy or not (exit 1 when not running or unhealthy) start start the daemon and wait until it is healthy stop stop the daemon and wait for run.lock to clear restart stop then start; prints what it did and the seconds taken options: -h, --help show this help message and exit"
+}
