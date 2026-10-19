@@ -5879,6 +5879,10 @@ class TestLaunch(Base):
         self.health(1)
         agents = sb.read_pane_health(self.world.state)
         self.assertEqual(sorted(agents["agents"]), ["coder", "platform", "relaunch"])
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {"platform": self.retired_entry(None), "coder": self.retired_entry(None)})   # a record with NO session covers nothing
+        self.health(2)
+        self.assertEqual(sorted(sb.read_pane_health(self.world.state)["agents"]), ["coder", "platform", "relaunch"])
+        self.assertFalse(sb.retired_agent({"x": {"session": None}}, "x", None))
         self.assertNotIn("r1", agents["states"])
         self.assertEqual(agents["states"]["coder"]["state"], sb.PANE_DETACHED)
 
@@ -5914,15 +5918,24 @@ class TestLaunch(Base):
         self.assertNotIn("old", sb.read_pane_health(self.world.state)["agents"])
 
     def test_s8_a_pruned_retired_agent_is_still_found_by_the_retire_undo_reattach_and_the_boss_lookup(self):
-        os.environ["HERDR_WORKSPACE_ID"] = "w1"
+        for key in [k for k in os.environ if k.startswith(("HERDR_", "OPENCODE_")) and k != "HERDR_PANE_ID"]:
+            self.addCleanup(os.environ.__setitem__, key, os.environ[key])
+            del os.environ[key]                                           # a clean environment: nothing masks a record the prune dropped
+        self.addCleanup(os.environ.pop, "HERDR_WORKSPACE_ID", None)
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
         self.worker()
         self.health()
         session = self.world.sessions["worker"]
         self.as_("boss")
+        before = dict(sb.read_pane_health(self.world.state)["agents"]["worker"])
+        self.assertTrue(before.get("workspace"), "the pass records the workspace")
         code, out, err = self.run_cli("retire", "worker", "--reason", "done")
         self.assertEqual(code, 0, err)
         self.assertNotIn("worker", sb.read_pane_health(self.world.state)["agents"])     # pruned in the same step as the retire
+        kept = sb.known_agent(self.world.state, "worker")
+        for field in set(before) - {"seen"}:                              # every field of the pane record but `seen` survives the prune (a null one is the same as none)
+            self.assertEqual(kept.get(field), before[field], field)
+        self.assertEqual(set(before) - {"seen", "session"}, set(sb.RETIRED_RECORD_FIELDS), "a field the pass records that the retirement does not keep")
         self.assertEqual(sb.read_retired(self.world.state)["worker"]["session"], session)
         self.assertEqual(sb.known_session(self.world.state, "worker", {}), session)
         self.kill("worker")
@@ -5939,6 +5952,7 @@ class TestLaunch(Base):
         code, out, err = self.run_cli("reattach", "worker")
         self.assertEqual(code, 0, err)
         self.assertEqual(json.loads(out)["session"], session)
+        self.assertEqual(sb.read_pane_health(self.world.state)["agents"].get("worker", {}).get("workspace"), before["workspace"])   # --undo put the whole record back
 
     def test_reattach_by_a_dead_panes_remembered_record_and_it_refuses_when_the_session_is_gone(self):
         os.environ["HERDR_WORKSPACE_ID"] = "w1"

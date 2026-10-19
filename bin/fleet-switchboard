@@ -6676,12 +6676,31 @@ def prune_retired(retired, now):
 def retired_agent(retired, name, session):
     """True when `name` is retired for THIS session (a retirement with no session covers any); a relaunch under the same name is not."""
     entry = retired.get(name)
-    return isinstance(entry, dict) and entry.get("session") in (None, session)
+    return isinstance(entry, dict) and entry.get("session") is not None and entry.get("session") == session   # no session on the record: it covers nothing
+
+
+RETIRED_RECORD_FIELDS = ("pane", "role", "charter", "repo", "workspace", "cwd")   # what the pane record holds besides the session (and `seen`, which nothing reads)
+
+
+def pane_record_of(row):
+    """What a retirement keeps of a pane record (`record` in retired.json), so the prune loses nothing a reader needs."""
+    return {k: row[k] for k in RETIRED_RECORD_FIELDS if isinstance(row, dict) and row.get(k) is not None}
+
+
+def known_agent(state_dir, name, known=None):
+    """The pane record of a fleet agent: the live one, else (a retired agent is pruned from the pane record) the one kept in retired.json with its session.
+    {} when neither exists. The one lookup every reader of a possibly pruned agent uses."""
+    if known:
+        return known
+    entry = read_retired(state_dir).get(name)
+    if not isinstance(entry, dict) or entry.get("headless") or not entry.get("session"):
+        return {}
+    return dict(entry["record"] if isinstance(entry.get("record"), dict) else {}, session=entry["session"])
 
 
 def known_session(state_dir, name, known):
-    """The session of a fleet agent: the pane record's, else the retired record's (a retired agent is pruned from the pane record)."""
-    return (known or {}).get("session") or (read_retired(state_dir).get(name) or {}).get("session")
+    """The session of a fleet agent: the pane record's, else the retired record's."""
+    return known_agent(state_dir, name, known).get("session") or (read_retired(state_dir).get(name) or {}).get("session")
 
 
 def read_retired(state_dir):
@@ -6888,7 +6907,7 @@ def pane_health_pass(engine, now):
             if last.get("state") in ("done", "failed") and 0 <= now - (last.get("at") or 0) <= lookback:
                 # its boss closed the tab AFTER the worker's final `done`/`failed` report: finished on purpose, not dead
                 entry = {"at": int(now), "by": "the switchboard", "reason": "its pane closed after its final %s report" % last["state"],
-                         "session": agents[name].get("session"), "auto": True}
+                         "session": agents[name].get("session"), "auto": True, "record": pane_record_of(agents[name])}
                 try:
                     with agent_lock(engine.state_dir, "files", seconds=2):
                         current = prune_retired(read_retired(engine.state_dir), now)
@@ -7161,8 +7180,8 @@ def reattach_caller_problem(engine, runner, now, discovery, name, session=None, 
         return None
     if target is None:   # a dead agent is not discovered: its boss is in the session's STORED metadata
         try:
-            known = read_pane_health(engine.state_dir)["agents"].get(name) or {}
-            known_sid = session or known_session(engine.state_dir, name, known)
+            known = known_agent(engine.state_dir, name, read_pane_health(engine.state_dir)["agents"].get(name))
+            known_sid = session or known.get("session")
             stored = _fleet_meta(engine.v2.session_get(known_sid)) or {} if known_sid else {}
             stored = load_module("reassign").overlay(engine.state_dir, stored, known_sid) if stored else stored   # a reassigned worker's new boss, not the one it was launched with
             boss = resolve_boss(discovery, stored.get("reports_to")) if stored.get("reports_to") else None
@@ -7176,9 +7195,9 @@ def reattach_caller_problem(engine, runner, now, discovery, name, session=None, 
 
 
 def _reattach_locked(args, runner, now, engine, state, name, discovery):
-    known = read_pane_health(state)["agents"].get(name) or {}
+    known = known_agent(state, name, read_pane_health(state)["agents"].get(name))
     seen = discovery.agents.get(name)
-    session_id = args.session or (seen.session_id if seen else None) or known_session(state, name, known)
+    session_id = args.session or (seen.session_id if seen else None) or known.get("session")
     if not session_id:
         raise LaunchError("no session is known for %s: pass --session ses_... (the id of its OpenCode session)" % name)
     workspace = args.workspace or known.get("workspace") or os.environ.get("HERDR_WORKSPACE_ID")
@@ -7435,7 +7454,7 @@ def cmd_retire(args, runner, now):
         raise LaunchError("refused: %s" % who)
     reason = " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", args.reason or "").split())[:200]
     seen = discovery.agents.get(name)
-    known = read_pane_health(state)["agents"].get(name) or ({"session": known_session(state, name, None)} if not (read_retired(state).get(name) or {"headless": True}).get("headless") else {})   # a pruned retired agent is still known
+    known = known_agent(state, name, read_pane_health(state)["agents"].get(name))   # a pruned retired agent is still known
     close_pane, close_by, close_note, headless_kept = None, None, None, None
     if getattr(args, "close", False) and not args.undo and seen is not None and seen.headless:
         close_note = "headless: it has no terminal, so there is nothing to close"
@@ -7468,7 +7487,7 @@ def cmd_retire(args, runner, now):
             data["states"].pop(name, None)
             data["missing"].pop(name, None)
             if entry.get("session") and not entry.get("headless") and name not in data["agents"]:
-                data["agents"][name] = {"session": entry["session"]}   # the retire pruned its row: put back what reattach and the dead-pane check need
+                data["agents"][name] = dict(entry["record"] if isinstance(entry.get("record"), dict) else {}, session=entry["session"])   # the retire pruned its row: put back all of it
             try:
                 write_pane_health(state, data)
             except OSError:
@@ -7485,7 +7504,9 @@ def cmd_retire(args, runner, now):
             raise LaunchError("%s is not a fleet agent this switchboard has seen (see `%s status`)" % (name, PROG))
         prune_retired(retired, now())
         retired[name] = {"at": int(now()), "by": identify_who(engine, runner, now), "reason": reason or "finished",
-                         "session": (seen.session_id if seen else None) or known_session(state, name, known), "auto": False}
+                         "session": (seen.session_id if seen else None) or known.get("session"), "auto": False}
+        if known:
+            retired[name]["record"] = pane_record_of(known)   # the pane record is pruned below: keep what reattach and --undo read
         if headless_lost:
             retired[name]["session"] = headless_kept["session"]
         if headless_kept is not None:
