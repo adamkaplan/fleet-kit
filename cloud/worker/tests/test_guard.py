@@ -626,7 +626,7 @@ class GuardConfigForms(unittest.TestCase):
             return re.fullmatch(".*".join(re.escape(x) for x in pat.split("*")), line, re.S) is not None
         for kind, name, args, _ in cfg_table():
             line = "git config " + " ".join(args)
-            if kind == "refused" and name not in ("KEY VALUE", "an unknown flag or abbreviation", "a value that looks like an option"):
+            if kind == "refused" and name not in ("KEY VALUE", "an unknown flag or abbreviation", "a value that looks like an option", "a value word after a read mode's key", "an option after the get or list subcommand"):
                 with self.subTest(name=name):
                     self.assertTrue(any(match(p, line) for p in denies), line)
             if kind == "allowed":

@@ -36,6 +36,8 @@
 #CFG refused | rename-section | rename-section a b | the subcommand form
 #CFG refused | remove-section | remove-section a | the subcommand form
 #CFG refused | a value that looks like an option | core.pager --default=x;touch/tmp/p | everything after the key is a value; a word after the key starting with - is refused, never trusted
+#CFG refused | a value word after a read mode's key | --get-all core.x v | refused although git takes it as a read (--get K REGEX, --get-all K REGEX, --get-regexp P VALREGEX): the key count must match the mode
+#CFG refused | an option after the get or list subcommand | list --show-origin | refused although git takes it as a read (config list --show-origin, config get --all K): options come before the key
 #CFG refused | KEY VALUE | user.x y | the plain write form (any key but the two identity keys below)
 #CFG refused | include.path | include.path /tmp/f | a value that makes git read another file
 #CFG refused | includeIf.<cond>.path | includeIf.gitdir:/a/.path /tmp/f | a value that makes git read another file
