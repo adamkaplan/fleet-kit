@@ -15,6 +15,27 @@
 # started without a git-token gets no wrappers at all: then the OpenCode deny rules are the only pod-side layer.
 # Env: CW_REAL_GIT (the real git, used to read the current branch), CW_DEFAULT_BRANCH (extra default branch names,
 # space or comma separated). `main` and `master` and the branch origin/HEAD points to are always treated as default.
+# THE git config TABLE (the one place the forms are listed): `#CFG <refused|allowed> | <name> | <example args> | <why>`. The test
+# runs every row through the wrapper, and checks that the README paragraph names exactly these names. A row is a FAMILY member:
+# add the form here, in the code below and in cloud/README.md together.
+#CFG refused | --rename-section | --rename-section old new | writes configuration
+#CFG refused | --remove-section | --remove-section old | writes configuration
+#CFG refused | -e | -e | opens the file to edit
+#CFG refused | --edit | --edit | opens the file to edit
+#CFG refused | --add | --add user.x y | writes configuration
+#CFG refused | --unset | --unset user.x | writes configuration
+#CFG refused | --unset-all | --unset-all user.x | writes configuration
+#CFG refused | --replace-all | --replace-all user.x y | writes configuration
+#CFG refused | KEY VALUE | user.x y | the plain write form (any key but the two identity keys below)
+#CFG refused | include.path | include.path /tmp/f | a value that makes git read another file
+#CFG refused | includeIf.<cond>.path | includeIf.gitdir:/a/.path /tmp/f | a value that makes git read another file
+#CFG allowed | user.name | user.name x | identity, needed to commit (exactly this key; user.name.x is not it)
+#CFG allowed | user.email | user.email x@y | identity, needed to commit (exactly this key)
+#CFG allowed | --get | --get user.x | a read, at most one key
+#CFG allowed | --get-all | --get-all user.x | a read
+#CFG allowed | --get-regexp | --get-regexp user | a read
+#CFG allowed | --list | --list | a read
+#CFG allowed | --list --show-origin | --list --show-origin | a read
 tool=${1:-}; [ $# -gt 0 ] && shift
 tail_msg="the repository's rules are the guard; this wrapper is only a convenience"
 refuse() { echo "refused: $1: $tail_msg" >&2; exit 3; }
@@ -55,18 +76,23 @@ do_git() {
   done
   if [ "${1:-}" = config ]; then
     # a read is exactly: config MODE [modifier ...] [one KEY or PATTERN]; any other shape is judged word by word below
-    shift; mode=0; pos=0; ok=1
+    shift; mode=0; pos=0; ok=1; wr=0; key=""
     for a in "$@"; do
       case "$a" in
+        --rename-section|--remove-section|-e|--edit|--add|--unset|--unset-all|--replace-all) wr=1 ;;
         --get|--get-all|--get-regexp|--get-urlmatch|--list|-l|--get-color|--get-colorbool) if [ "$mode" = 0 ] && [ "$pos" = 0 ]; then mode=1; else ok=0; fi ;;
         --global|--local|--system|--worktree|--show-origin|--show-scope|--name-only|-z|--includes|--no-includes) ;;
         -*) ok=0 ;;
-        *) pos=$((pos + 1)) ;;
+        *) pos=$((pos + 1)); [ "$pos" = 1 ] && key=$(printf '%s' "$a" | tr 'A-Z' 'a-z') ;;
       esac
     done
     [ "$ok" = 1 ] && [ "$mode" = 1 ] && [ "$pos" -le 1 ] && return 0
     set -- config "$@"
     for a in "$@"; do bad_cfg "$a"; done
+    [ "$wr" = 1 ] && refuse "changing git configuration"
+    if [ "$mode" = 0 ] && [ "$pos" -ge 2 ]; then   # the plain KEY VALUE write (also include.path and includeIf.*.path)
+      case "$key" in user.name|user.email) [ "$pos" = 2 ] || refuse "changing git configuration" ;; *) refuse "changing git configuration" ;; esac
+    fi
     return 0
   fi
   [ "${1:-}" = push ] || return 0

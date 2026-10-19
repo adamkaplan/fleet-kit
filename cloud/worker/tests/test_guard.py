@@ -394,5 +394,107 @@ class Guard(unittest.TestCase):
             self.assertRegex(text, r"(?i)not the guard|only a convenience", path)
 
 
+def cfg_table():
+    """the git config table at the top of guard.sh: [(kind, name, args, why)]"""
+    rows = []
+    for line in read(os.path.join(WORKER, "guard.sh")).splitlines():
+        if line.startswith("#CFG "):
+            kind, name, args, why = [x.strip() for x in line[5:].split(" | ")]
+            rows.append((kind, name, args.split(), why))
+    return rows
+
+
+class GuardConfigForms(unittest.TestCase):
+    """#705: every git config write form is refused, from one table; the README names exactly the table's refused forms."""
+
+    @classmethod
+    def setUpClass(cls):
+        t = tempfile.TemporaryDirectory(dir=os.environ.get("CW_TMPDIR"))
+        cls.addClassCleanup(t.cleanup)
+        cls.d = os.path.realpath(t.name)
+        cls.stub = os.path.join(cls.d, "git")
+        with open(cls.stub, "w") as f:
+            f.write('#!/bin/sh\necho real git ran\n')
+        os.chmod(cls.stub, 0o755)
+
+    def run_guard(self, args, guard=None):
+        env = {"PATH": "/usr/bin:/bin", "CW_REAL_GIT": self.stub}
+        return subprocess.run(["sh", guard or os.path.join(WORKER, "guard.sh"), "git", "config"] + args, env=env, capture_output=True, text=True, timeout=30)
+
+    def mutant(self, old, new):
+        text = read(os.path.join(WORKER, "guard.sh"))
+        assert old in text, old
+        p = os.path.join(self.d, "mut-%d.sh" % len(os.listdir(self.d)))
+        with open(p, "w") as f:
+            f.write(text.replace(old, new, 1))
+        return p
+
+    def test_s1_s2_every_row_of_the_table_is_answered_as_listed(self):
+        rows = cfg_table()
+        self.assertEqual(len([r for r in rows if r[0] == "refused"]), 11)
+        self.assertEqual(len([r for r in rows if r[0] == "allowed"]), 7)
+        for kind, name, args, _ in rows:
+            with self.subTest(name=name):
+                r = self.run_guard(args)
+                if kind == "refused":
+                    self.assertEqual(r.returncode, 3, r.stdout)
+                    self.assertEqual(r.stderr, "refused: changing git configuration: %s\n" % TAIL)
+                else:
+                    self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_the_identity_exception_is_exactly_two_keys(self):
+        for args in (["user.name.x", "v"], ["user.nam", "v"], ["user.name", "a", "b"], ["USER.NAME.x", "v"], ["user.email.x", "v"]):
+            with self.subTest(args=args):
+                self.assertEqual(self.run_guard(args).returncode, 3)
+        for args in (["user.name", "/tmp/include.path"], ["user.email", "push --force"], ["--global", "USER.Name", "x"]):
+            with self.subTest(args=args):
+                self.assertEqual(self.run_guard(args).returncode, 0)   # a value is just a value
+        self.assertEqual(self.run_guard(["user.name", "x", "--add"]).returncode, 3)
+
+    def test_s3_the_readme_names_exactly_the_refused_forms_in_the_table(self):
+        names = {n for k, n, _, _ in cfg_table() if k == "refused"}
+        para = [l for l in read(os.path.join(WORKER, "..", "README.md")).splitlines() if l.startswith("- **`git config` writes are refused**")]
+        self.assertEqual(len(para), 1)
+        listed = para[0].split("this list names exactly its refused forms):", 1)[1].split(". The one exception", 1)[0]
+        in_readme = set(re.findall(r"`([^`]+)`", listed))
+        in_readme = {"KEY VALUE" if x == "KEY VALUE" else x for x in in_readme}
+        self.assertEqual(in_readme, names)
+        self.assertIn("judged word by word", para[0])
+        self.assertIn("user.name", para[0])
+        self.assertRegex(para[0], r"convenience, not the guard")
+
+    def test_every_refused_flag_row_has_a_mutant_that_this_table_catches(self):
+        line = "--rename-section|--remove-section|-e|--edit|--add|--unset|--unset-all|--replace-all) wr=1 ;;"
+        for kind, name, args, _ in cfg_table():
+            if kind != "refused" or not name.startswith("-"):
+                continue
+            with self.subTest(name=name):
+                parts = line[:-len(") wr=1 ;;")].split("|")
+                parts.remove(name)
+                p = self.mutant(line, "|".join(parts) + ") wr=1 ;;")
+                self.assertEqual(self.run_guard([name, "user.x"], p).returncode, 0, "the mutant must let the form through: %s" % name)
+
+    def test_a_mutant_that_widens_the_identity_exception_is_caught(self):
+        p = self.mutant("user.name|user.email)", "user.*)")
+        self.assertEqual(self.run_guard(["user.name.x", "v"], p).returncode, 0)   # the mutant passes it ...
+        self.assertEqual(self.run_guard(["user.name.x", "v"]).returncode, 3)      # ... the real wrapper does not
+
+    def test_the_agent_definition_and_config_name_the_same_forms(self):
+        text = read(os.path.join(WORKER, "agents", "worker.md"))
+        for phrase in ("--add", "--unset", "--edit", "--rename-section", "--remove-section", "include.path", "user.name", "user.email"):
+            self.assertIn(phrase, text)
+        conf = json.loads(read(os.path.join(WORKER, "opencode-worker.json")))
+        denies = [p for p, v in conf["permission"]["bash"].items() if v == "deny"]
+        def match(pat, line):
+            return re.fullmatch(".*".join(re.escape(x) for x in pat.split("*")), line, re.S) is not None
+        for kind, name, args, _ in cfg_table():
+            line = "git config " + " ".join(args)
+            if kind == "refused" and name not in ("KEY VALUE",):
+                with self.subTest(name=name):
+                    self.assertTrue(any(match(p, line) for p in denies), line)
+            if kind == "allowed":
+                self.assertFalse(any(match(p, line) for p in denies), line)
+
+
 if __name__ == "__main__":
     unittest.main()
