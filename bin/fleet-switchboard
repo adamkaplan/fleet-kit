@@ -28894,6 +28894,9 @@ def cmd_restart(args, runner, spawn=subprocess.Popen, kill=os.kill, sleep=time.s
         if pid is None:
             sys.stderr.write("%s: restart refused: the lock says a daemon runs but not which pid\n" % PROG)
             return EXIT_ERROR
+        if daemon_pid_refusal(pid):
+            sys.stderr.write("%s: restart refused: %s; nothing was signalled\n" % (PROG, daemon_pid_refusal(pid)))
+            return EXIT_ERROR
         ours, command = daemon_process_is_ours(runner, pid)   # ONE check of "is this pid our `run`", shared with `daemon stop`
         if not ours:
             sys.stderr.write("%s: restart refused: pid %d is not a %s daemon (it is: %s); nothing was signalled\n"
@@ -28977,11 +28980,30 @@ def daemon_process_is_ours(runner, pid):
         command = (done.stdout or "").strip() if done.returncode == 0 else ""
     except (OSError, subprocess.SubprocessError):
         command = ""
+    return daemon_argv_is_ours(command), command
+
+
+def daemon_argv_is_ours(command):
+    """The ONE shape that is this program's `run`: [python [-flags]] <path>/fleet-switchboard run [-flags or numbers]. A different program in front,
+    `run` not right after the program, `run` inside another word, another verb or an unreadable command line is not it."""
     words = command.split()
-    for index, word in enumerate(words[:-1]):
-        if os.path.basename(word) == PROG and words[index + 1] == "run":
-            return True, command
-    return False, command
+    index = 0
+    if words and re.fullmatch(r"python[0-9.]*", os.path.basename(words[0])):
+        index = 1
+        while index < len(words) and words[index].startswith("-"):
+            index += 1
+    if len(words) < index + 2 or os.path.basename(words[index]) != PROG or words[index + 1] != "run":
+        return False
+    return all(word.startswith("-") or word.isdigit() for word in words[index + 2:])
+
+
+def daemon_pid_refusal(pid):
+    """Why this pid is never signalled whatever the record says (pid 1 and below, this process, its parent), or None."""
+    if pid <= 1:
+        return "pid %d is not a daemon's" % pid
+    if pid in (os.getpid(), os.getppid()):
+        return "pid %d is this command or its parent" % pid
+    return None
 
 
 def daemon_snapshot(state_dir, runner, now, platform=None):
@@ -29023,7 +29045,11 @@ def daemon_snapshot(state_dir, runner, now, platform=None):
     except (OSError, ValueError):
         snapshot = {}
     if isinstance(snapshot, dict) and snapshot.get("pid") == info["pid"]:
-        for watch in snapshot.get("watches") or []:
+        watches = snapshot.get("watches") or []
+        if not isinstance(watches, list):
+            reasons.append("the forwarder snapshot is unreadable (watches is not a list)")
+            watches = []
+        for watch in watches:
             if isinstance(watch, dict):
                 alarm = forwarder_health(watch, current)["alarm"]
                 if alarm:
@@ -29067,6 +29093,8 @@ def daemon_stop(state_dir, runner, now, out):
     if info["record_pid"] != pid:
         raise DaemonCommandError("the lock names pid %d but the daemon record names %s; nothing was signalled"
                                  % (pid, info["record_pid"] if info["record_pid"] is not None else "no pid"))
+    if daemon_pid_refusal(pid):
+        raise DaemonCommandError("%s; nothing was signalled" % daemon_pid_refusal(pid))
     ours, command = daemon_process_is_ours(runner, pid)
     if not ours:
         raise DaemonCommandError("pid %d is not a %s daemon (%s); nothing was signalled"

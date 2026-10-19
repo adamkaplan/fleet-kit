@@ -38700,6 +38700,64 @@ class TestDaemonCommand(Base):
         self.assertEqual([v for v in self.launchctl_verbs() if v in ("bootstrap", "bootout", "kickstart")], [])
         self.assertEqual(self.kills, [(4242, signal.SIGTERM), (4200, signal.SIGTERM)])
 
+    ARGV_VARIANTS = (("/usr/bin/python3 /k/bin/fleet-switchboard run", True), ("/k/bin/fleet-switchboard run", True),
+                     ("/usr/bin/python3 -B /k/bin/fleet-switchboard run --standby", True), ("python3 fleet-switchboard run --poll 30", True),
+                     ("/usr/bin/python3 /k/bin/fleet-switchboard status run", False), ("/usr/bin/python3 /k/bin/fleet-switchboard --x run", False),
+                     ("/usr/bin/python3 /k/bin/fleet-switchboard prerun", False), ("/usr/bin/python3 /k/bin/fleet-switchboard run; id", False),
+                     ("/usr/bin/vim /k/bin/fleet-switchboard run", False), ("/usr/bin/python3 /k/bin/other-tool run", False),
+                     ("/usr/bin/python3 /k/bin/fleet-switchboard run notes.txt", False), ("/usr/bin/python3 /k/bin/not-fleet-switchboard run", False),
+                     ("fleet-switchboard", False), ("run", False), ("", False))
+
+    def test_every_place_that_decides_this_pid_is_the_daemon_takes_only_the_exact_argv_shape(self):
+        """The places: `daemon stop` (and so `daemon restart`'s stop), the old `restart`, and both through daemon_process_is_ours -> daemon_argv_is_ours.
+        status and the lock reader decide nothing by argv (they signal nothing); no other path signals."""
+        for command, accepted in self.ARGV_VARIANTS:
+            with self.subTest(place="daemon_argv_is_ours", command=command):
+                self.assertIs(sb.daemon_argv_is_ours(command), accepted)
+            for place in ("daemon stop", "restart", "daemon restart"):
+                with self.subTest(place=place, command=command):
+                    self.drop_all()
+                    self.kills.clear()
+                    self.hold(4242)
+                    self.record(4242)
+                    self.commands[4242] = command
+                    if place == "restart":
+                        out = io.StringIO()
+                        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()), \
+                                mock.patch.object(sb, "ensure_daemon", lambda s, sp: "started"):
+                            code = sb.cmd_restart(mock.Mock(), self.runner, spawn=mock.Mock(), kill=self.kill, sleep=lambda s: None)
+                    else:
+                        code = self.run_cmd(*place.split()[1:])[0]
+                    self.assertEqual(bool(self.kills), accepted)
+
+    def test_pid_one_this_process_and_its_parent_are_never_signalled(self):
+        for pid in (1, 0, os.getpid(), os.getppid()):
+            with self.subTest(pid=pid):
+                self.drop_all()
+                self.kills.clear()
+                (self.state / "run.lock").write_text("%d\n" % pid)
+                fd = os.open(str(self.state / "run.lock"), os.O_RDWR)
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.fds[pid] = fd
+                self.record(pid)
+                self.commands[pid] = self.OURS
+                code, out, err = self.run_cmd("stop")
+                self.assertEqual((code, self.kills), (1, []))
+                self.assertIn("nothing was signalled", err)
+                with contextlib.redirect_stderr(io.StringIO()):
+                    restarted = sb.cmd_restart(mock.Mock(), self.runner, spawn=mock.Mock(), kill=self.kill, sleep=lambda s: None)
+                self.assertEqual((restarted, self.kills), (1, []))
+
+    def test_a_watches_value_that_is_not_a_list_fails_soft_in_status(self):
+        self.running_ensure_daemon()
+        for bad in ("oops", {"a": 1}, 7):
+            with self.subTest(bad=bad):
+                (self.state / sb.WATCH_FILE).write_text(json.dumps({"pid": 4242, "watches": bad}))
+                code, out, err = self.run_cmd("status")
+                self.assertEqual(code, 1)
+                self.assertIn("watches is not a list", out)
+                self.assertEqual(err, "")
+
     def test_the_daemon_command_never_starts_a_daemon_on_its_own_account(self):
         self.assertIs(sb.cmd_daemon.direct, True)
 
