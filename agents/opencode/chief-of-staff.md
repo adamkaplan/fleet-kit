@@ -43,6 +43,7 @@ permissions:
   - {action: shell, resource: "fleet-switchboard reattach *", effect: allow}
   - {action: shell, resource: "fleet-switchboard relaunch *", effect: allow}
   - {action: shell, resource: "fleet-switchboard retire *", effect: allow}
+  - {action: shell, resource: "fleet-switchboard close-pane *", effect: allow}
   - {action: shell, resource: "fleet-switchboard disk *", effect: allow}
   - {action: shell, resource: "fleet-switchboard review measure *", effect: allow}
   - {action: shell, resource: "fleet-switchboard review laws *", effect: allow}

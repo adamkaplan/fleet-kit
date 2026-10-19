@@ -65793,6 +65793,14 @@ class TestAdoption(LanesCase):
         with self.assertRaises(ValueError):
             sb.write_boss_records(self.world.new_engine(), None, [(None, None, "x", "y")], "invented", "x")
 
+    def test_an_entry_the_boss_record_reader_would_drop_is_kept_when_a_boss_is_written(self):   # the strict table is the base of the write
+        self.worker("w1", "gone", charter=1)
+        path = self.record_path()
+        path.write_text(json.dumps({"overrides": {"stray": {"note": "not a boss entry"}}}))
+        self.daemon_pass()
+        self.assertEqual(self.boss("w1"), "orch-a")
+        self.assertIn("stray", json.loads(path.read_text())["overrides"])
+
     def test_a_boss_that_is_back_or_an_heir_that_is_gone_since_the_plan_stops_the_write(self):   # judged again under the lock
         self.worker("w1", "orch-late", charter=1)
         real = sb._read_strict_records
@@ -65857,8 +65865,8 @@ class TestAdoption(LanesCase):
     def test_the_scan_finds_a_raw_reader_when_one_is_planted(self):   # S15 mutant: the real scan, fed a planted source, reports it
         planted = {"bin/planted.py": "def load_row(o):\n    return o.fleet.get('reports_to') == 'x'\n\ndef other(o):\n    return o.fleet['reports_to']\n\ndef safe(o):\n    return boss_name(o)\n"}
         self.assertEqual(self.scan(planted), {"bin/planted.py:load_row", "bin/planted.py:other"})
-        extended = self.sites() | self.scan(planted)
-        self.assertNotEqual(extended, set(sb.BOSS_READ_SITES), "the table test would fail on a planted reader")
+        table = set(sb.BOSS_READ_SITES) | {"bin/planted.py:other"}      # a table that names only one of the two planted readers
+        self.assertNotEqual(self.sites() | self.scan(planted), table, "the table test fails on the planted reader the table does not name")
 
     def test_an_adopted_worker_is_seen_under_its_heir_by_every_behavioural_reader(self):   # S15
         self.worker("w1", "gone", charter=1)

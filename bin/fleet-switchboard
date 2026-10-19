@@ -7427,7 +7427,9 @@ def write_boss_records(engine, discovery, assignments, path, by):
             if problem:
                 return [], "the boss record cannot be read in full (%s): no boss was changed" % _one_line(problem, 100)
             now = engine.now()
+            before = set(overrides)
             reassign.prune(overrides, retired, now)
+            pruned = before - set(overrides)
             done = []
             fresh = engine.discover(engine.now())   # judged again under the lock, from a fresh look: the heir must still be a live agent, the worker's boss still gone
             if fresh.problems:
@@ -7451,7 +7453,9 @@ def write_boss_records(engine, discovery, assignments, path, by):
             if not kept:
                 return [], None
             with engine._external("boss.adopt", "agents", {"path": path, "workers": [n for n, _ in done], "by": by}):
-                reassign.write_overrides(state, overrides)
+                written = {k: v for k, v in records["boss-overrides.json"].items() if k not in pruned}   # the strict table is the base: an entry `_clean` would drop is never lost silently
+                written.update({name: overrides[name] for name, _ in done})
+                reassign.write_overrides(state, written)
     except RecordUnreadable as err:
         return [], "%s: no boss was changed" % _one_line(str(err), 100)
     except (OSError, ValueError) as err:
@@ -7526,7 +7530,7 @@ def adopt_before_close(engine, runner, now, name):
         discovery = engine.discover(engine.now())
         retired = _read_strict_records(engine.state_dir)[RETIRED_FILE]
     except Exception:
-        return
+        return   # fails closed: nothing is adopted, so the ordinary boss rule refuses the close (and says why)
     seen = discovery.agents.get(name)
     if seen is None or discovery.problems or not _retired_entry_applies(retired, name, seen):
         return
@@ -8426,7 +8430,8 @@ def cmd_close_pane(args, runner, now):
         cwd = next((p.get("cwd") for p in engine.herdr.pane_list() if isinstance(p, dict) and p.get("pane_id") == pane), None)
     except Exception:
         pass
-    problem = bare_pane_problem(engine, engine.discover(engine.now()), pane, engine.now())
+    discovery = engine.discover(engine.now())
+    problem = "the agent list cannot be read in full: nothing was closed" if discovery.problems else bare_pane_problem(engine, discovery, pane, engine.now())
     try:
         if problem is None:
             # The point of effect: under one lock (two close-panes cannot both act), the caller's role and EVERY guard are read again, then the close. Only
@@ -8436,7 +8441,8 @@ def cmd_close_pane(args, runner, now):
                 if again[0] != "agent" or len(again) < 3 or again[2] != "chief-of-staff":
                     problem = "the caller is no longer established as the Chief of Staff"
                 else:
-                    problem = bare_pane_problem(engine, engine.discover(engine.now()), pane, engine.now())
+                    fresh = engine.discover(engine.now())
+                    problem = "the agent list cannot be read in full: nothing was closed" if fresh.problems else bare_pane_problem(engine, fresh, pane, engine.now())
                 if problem is None:
                     with engine._external("herdr.pane.close", "pane:%s" % pane, {"pane": pane, "why": "close-pane"}):
                         engine.herdr.pane_close(pane)
