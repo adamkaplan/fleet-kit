@@ -32791,7 +32791,7 @@ class TestImpactHold(LedgerBase):
 
     def closure_check(self, head, diff):
         rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
-        return sb.load_module("delegated_clear").closure_refusals(self.real_source(), head, diff, rule["closure_roots"], set(rule["clear_entry_points"]))
+        return sb.load_module("delegated_clear").closure_refusals(self.real_source(), head, diff, sb.load_module("delegated_clear").daemon_roots(rule), set(rule["clear_entry_points"]))
 
     def test_the_five_functions_hunk_headers_missed_are_refused_by_the_ast_on_the_real_daemon_file(self):
         source = self.real_source()
@@ -33000,6 +33000,9 @@ class TestImpactHold(LedgerBase):
     def rate(self, severity, probability, reason="", role="reviewer", head=LEDGER_HEAD, pr="acme/app#9"):
         entry = {"kind": "review_record", "pr": pr, "head": head, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "by_role": role,
                  "impact_severity": severity, "impact_probability": probability, "impact_reason": reason}
+        cell = (sb.impact_floor.load_matrix()["cells"].get(severity) or {}).get(probability)
+        if cell:   # the action the reviewer would record for that cell (a record with no action rates nothing: #830's one reading)
+            entry["impact_action"] = {"H": "hold", "2": "second-review", ".": "none"}[cell["action"]]
         return sb.plan_ledger.append_entry(self.world.state, entry, self.world.clock.now())
 
     def cell_of(self, level):
@@ -33296,7 +33299,6 @@ class TestImpactHold(LedgerBase):
         state = sb.read_impact_state(self.world.state)[0]
         self.assertEqual(state["clears"]["acme/app#9"]["head"], LEDGER_HEAD)
         later = "9" * 40
-        self.review = (None, None)   # the fixture's stand-in for the old reader says "rated" for every head: here nothing is rated at the new head
         self.assertTrue(sb.rehold_reason(self.engine_cached, state, "acme/app", "acme/app#9", later), "held again at the new head")
         self.assertFalse(sb.rating_at(self.engine_cached, "acme/app#9", later)[0], "the rating of the first head is not one at the second")
         self.pr["headRefOid"] = later   # a clear started on a pull request that has moved: the head of the rating is not the head now
@@ -33305,6 +33307,94 @@ class TestImpactHold(LedgerBase):
         self.assertEqual(code, 2)
         self.assertIn("no independent impact rating at this head", err)
         self.assertEqual(self.deletes(), [])
+
+    # ---- #835 round 1: the rating's code is in the never-delegated closure, ONE reading of "rated at this head", the half-valid records
+
+    def test_a_change_to_the_code_that_writes_or_parses_the_rating_is_the_owners_own_clear_one_case_for_each_root_and_each_definition_that_touches_a_rating_field(self):
+        import ast
+        rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
+        module = sb.load_module("delegated_clear")
+        daemon = ast.parse(self.real_source())
+        fields = set(sb.IMPACT_RATING_FIELDS) | {"by_role"}
+        touching = sorted(n.name for n in daemon.body if isinstance(n, ast.FunctionDef) and any(isinstance(x, ast.Constant) and x.value in fields for x in ast.walk(n)))
+        self.assertTrue({"parse_review_block", "cmd_review", "impact_rating_entries"} <= set(touching), touching)
+        reach = module.closure(daemon, module.daemon_roots(rule))[0]
+        self.assertEqual([n for n in touching if n not in reach], [], "every definition that reads or writes a rating field is in the closure of what she can never clear (completeness: derived from the code)")
+        for name in sorted(set(touching) | set(rule["rating_roots"])):
+            with self.subTest(definition=name):
+                head, diff = self.edit_one_line_under(self.real_source(), name)
+                self.assertTrue(self.closure_check(head, diff), "a change to %s is refused a delegated clear" % name)
+        for name in rule["rating_roots"]:   # the mutant: the roots without the rating's code let the same change through
+            with self.subTest(mutant=name):
+                head, diff = self.edit_one_line_under(self.real_source(), name)
+                rest = dict(rule, rating_roots=[])
+                self.assertEqual(module.closure_refusals(self.real_source(), head, diff, module.daemon_roots(rest), set(rule["clear_entry_points"])), [], "without the rating roots the parser edit would pass: the roots are what refuse it")
+
+    def test_one_definition_of_rated_at_this_head_the_clear_and_every_other_reader_use_it(self):
+        import ast
+        hold = ast.parse((BIN / "impact_hold.py").read_text())
+        daemon = ast.parse(self.real_source())
+        calls = lambda node: {getattr(x.func, "id", None) for x in ast.walk(node) if isinstance(x, ast.Call)}
+        for name in ("delegated_clear_score", "delegated_clear_pr_checks"):
+            checks = next(n for n in hold.body if isinstance(n, ast.FunctionDef) and n.name == name)
+            self.assertEqual("rating_at" in calls(checks), name == "delegated_clear_score")
+            self.assertEqual(calls(checks) & {"impact_rating_entries", "impact_review_record", "impact_records", "read_ledger"}, set(), "the clear reads the ledger only through rating_at")
+        readers = sorted(n.name for tree in (hold, daemon) for n in tree.body if isinstance(n, ast.FunctionDef) and n.name != "rating_at" and "read_ledger" in {getattr(x.func, "attr", None) for x in ast.walk(n) if isinstance(x, ast.Call)}
+                         and any(isinstance(x, ast.Constant) and x.value == "impact" for x in ast.walk(n)))
+        self.assertEqual(readers, sorted(["cmd_review", "impact_rating_entries", "impact_records"]), "the only readers of the impact records: the one filter, the bulk map of the dry run, and the record command's own count")
+
+    def test_the_clear_reads_rated_at_this_head_like_every_other_reader_for_every_rating_state(self):
+        self.score_config()
+        self.scored_pr()
+        engine = self.engine_cached
+        module = sb.load_module("delegated_clear")
+        report = {"pr": "acme/app#9", "head": LEDGER_HEAD, "top_tier_hits": {}}
+        base = {"kind": "review_record", "pr": "acme/app#9", "head": LEDGER_HEAD, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "by_role": "reviewer"}
+        s, p = self.cell_of("Low")
+        for label, entry, rated in (("none", None, False), ("no action", dict(base), False), ("with action", dict(base, impact_action="none", impact_severity=s, impact_probability=p), True),
+                                    ("another head", dict(base, head="e" * 40, impact_action="none"), False)):
+            with self.subTest(state=label):
+                self.ledger_reset()
+                if entry:
+                    sb.plan_ledger.append_entry(self.world.state, entry, 1)
+                self.assertEqual(sb.rating_at(engine, "acme/app#9", LEDGER_HEAD)[0], rated)
+                scored = sb.delegated_clear_score(engine, module, report, "Serious")
+                self.assertEqual(any("no independent impact rating" in r for r in scored["reasons"]), not rated, "the clear reads the same answer as rating_at: %s" % scored)
+                self.assertEqual(bool(sb.rehold_reason(engine, {"clears": {"acme/app#9": {"head": "a" * 40}}, "carried": {}}, "acme/app", "acme/app#9", LEDGER_HEAD)), not rated, "the re-hold reads it too")
+
+    def test_a_half_valid_or_disagreeing_or_foreign_rating_record_refuses_the_clear_and_the_all_valid_one_clears(self):
+        low, high, serious = self.cell_of("Low"), self.cell_of("High"), self.cell_of("Serious")
+        rule = self.floor_rule("authority")
+        good = dict(sev=low[0], prob=low[1], reason="", role="reviewer", head=LEDGER_HEAD, pr="acme/app#9")
+        floor_good = dict(good, sev=serious[0], prob=serious[1], reason="applied " + rule)
+        cases = {   # label: (path, [records], refused, text the refusal says)
+            "control: the all-valid record": ("docs/notes.md", [good], False, None),
+            "control: the all-valid floor record": ("bin/reassign.py", [floor_good], False, None),
+            "good level, missing reason (floor path)": ("bin/reassign.py", [dict(floor_good, reason="")], True, "not named"),
+            "good reason, unknown level": ("bin/reassign.py", [dict(floor_good, sev="Huge")], True, "unknown"),
+            "good reason, unknown probability": ("bin/reassign.py", [dict(floor_good, prob="Sometimes")], True, "unknown"),
+            "two records disagree: low then high": ("docs/notes.md", [good, dict(good, sev=high[0], prob=high[1])], True, "High"),
+            "two records disagree: high then low": ("docs/notes.md", [dict(good, sev=high[0], prob=high[1]), good], True, "High"),
+            "a good record and an unreadable one at the same head": ("docs/notes.md", [good, dict(good, sev=None)], True, "unknown"),
+            "a record at another head only": ("docs/notes.md", [dict(good, head="d" * 40)], True, "no independent impact rating"),
+            "a record for another pull request only": ("docs/notes.md", [dict(good, pr="acme/app#10")], True, "no independent impact rating"),
+            "a record by the pull request's own author (a coder)": ("docs/notes.md", [dict(good, role="coder")], True, "no independent impact rating"),
+            "a record by the Chief of Staff": ("docs/notes.md", [dict(good, role="chief-of-staff")], True, "no independent impact rating"),
+            "the rule named only in the lower of two records": ("bin/reassign.py", [dict(floor_good, reason=""), dict(floor_good, sev=low[0], prob=low[1], reason="applied " + rule)], True, "not named"),
+        }
+        for label, (path, records, refused, text) in cases.items():
+            with self.subTest(label):
+                self.writes.clear()
+                self.ledger_reset()
+                self.score_config("Serious")
+                self.scored_pr(path)
+                for record in records:
+                    self.rate(record["sev"], record["prob"], reason=record["reason"], role=record["role"], head=record["head"], pr=record["pr"])
+                code, out, err = self.under()
+                self.assertEqual(code == 2, refused, err)
+                self.assertEqual(bool(self.deletes()), not refused)
+                if text:
+                    self.assertIn(text, err)
 
     def test_s20_s23_no_agent_command_writes_the_threshold_and_no_committed_file_sets_one(self):
         daemon = Path(sb.__file__).read_text()

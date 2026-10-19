@@ -37,6 +37,7 @@ MOVED = ('rating_at',
          'cmd_impact_delegated',
          'delegated_clear_checks',
          'delegated_clear_pr_checks',
+         'delegated_clear_score',
          'delegated_clear_map',
          '_gh_json',
          'impact_plan',
@@ -47,18 +48,19 @@ MOVED = ('rating_at',
 
 
 def rating_at(engine, pr, head):
-    """(rated, problem): THE one reading of "an impact rating is recorded at this head" (#830), for every reader of "is this pull request held": True only when the independent reviewer's
+    """(rated, problem, entries): THE one reading of "an impact rating is recorded at this head" (#830), for every reader of "is this pull request held": True only when the independent reviewer's
     newest record for EXACTLY this head carries an action (a record with no action rates nothing); `problem` is what is wrong when the ledger cannot be read (the rating is then unknown: not rated)."""
     if engine.state_dir is None or not head:
-        return False, None
-    record, problem = impact_review_record(engine.state_dir, pr, head)
-    return (not problem and record is not None and isinstance(record[0], str) and bool(record[0])), problem
+        return False, None, []
+    entries, problem = impact_rating_entries(engine.state_dir, pr, head)   # the ONE filter of "the independent reviewer's records of this pull request at exactly this head" (#835: the delegated clear reads the same `entries`)
+    newest = entries[-1] if entries and not problem else None
+    return (newest is not None and isinstance(newest.get("impact_action"), str) and bool(newest.get("impact_action"))), problem, ([] if problem else entries)
 
 
 def rehold_reason(engine, state, repo, pr, head):
     """(#830) THE one rule for "held again at a new head", read by every place that asks whether a pull request is held (the daemon's label pass, the release, the dry run, gate G6
     and G6b): the reason (a string) when a clear is recorded for ANOTHER head and none for this one, the clear is not CARRIED to this head (a pure merge of main) and no impact rating
-    exists at this head (`rating_at`: the one reading of that, whatever the caller); else None. A pull request with no recorded clear is None: this rule never holds what was never cleared. `state` is the impact state read whole
+    exists at this head (`rating_at`: the one reading of that, whatever the caller; it also returns the records, which the delegated clear (#835) scores); else None. A pull request with no recorded clear is None: this rule never holds what was never cleared. `state` is the impact state read whole
     (never an empty one made by a failed read: the callers check the problem first). An unreadable head (none) counts as another head."""
     cleared = (state.get("clears") or {}).get(pr)
     if not isinstance(cleared, dict) or not cleared.get("head") or (head and cleared.get("head") == head):
@@ -652,7 +654,7 @@ def delegated_clear_map(engine, runner, repo, item, base_sha, rule):
         if base is None or head is None or not isinstance(item.get("patch"), str):
             return None
         if item["filename"] == rule["daemon_file"]:
-            return module.closure_refusals(base, head, item["patch"], list(rule["closure_roots"]), set(rule["clear_entry_points"]))
+            return module.closure_refusals(base, head, item["patch"], module.daemon_roots(rule), set(rule["clear_entry_points"]))
         return module.closure_refusals(base, head, item["patch"], list((rule.get("module_roots") or {}).get(item["filename"]) or []), set(), True)   # any other module the clear loads: its import-time code and the functions the clear runs
     except Exception:
         return None
@@ -661,6 +663,22 @@ def delegated_clear_map(engine, runner, repo, item, base_sha, rule):
 def _gh_json(engine, runner, repo, path):
     done = _gh_write(engine, runner, repo, path, "GET")
     return json.loads(done.stdout or "null")
+
+
+def delegated_clear_score(engine, module, report, threshold):
+    """{"level", "reasons"} of the score rule for this pull request at the head of `report` (#835): the rating records come from `rating_at`, the ONE reading of "rated at this head" (#830), and are scored by the
+    matrix's block and cells (the running install's, never the head's: a change to the matrix file is refused as machinery). A matrix, ledger or rule that cannot be read: the score is unknown, never Low."""
+    try:
+        rated, problem, entries = rating_at(engine, report["pr"], report["head"])
+        if not rated and not problem:
+            problem = "no independent impact rating at this head"
+        block = module.score_block()
+        scored = module.judge(block, impact_floor.load_matrix().get("cells"), entries, report, threshold) if not problem and block is not None else None
+    except Exception as err:
+        scored, problem = None, "%s: %s" % (type(err).__name__, _one_line(str(err), 80))
+    if scored is None:
+        scored = {"level": None, "reasons": ["the independent rating cannot be read (%s): the score is unknown, refused" % (problem or "no score rule")]}
+    return scored
 
 
 def delegated_clear_pr_checks(engine, runner, repo, number, threshold=None, info=None):
@@ -700,18 +718,9 @@ def delegated_clear_pr_checks(engine, runner, repo, number, threshold=None, info
         for item in files:   # a changed file of the daemon's own: each changed LINE is mapped to its definition by the ast of the file it belongs to
             if isinstance(item.get("filename"), str) and impact_floor.matches(item["filename"], (rule or {}).get("closure_files") or []) and not impact_floor.matches(item["filename"], (rule or {}).get("clear_code_paths") or []) and item.get("status") == "modified":
                 closure[item["filename"]] = delegated_clear_map(engine, runner, repo, item, base_sha, rule)
-    scored = None
-    if threshold is not None:   # the score rule: the matrix's block and cells (the running install's, never the head's: a change to the matrix file is refused as machinery above)
-        try:
-            entries, problem = impact_rating_entries(engine.state_dir, report["pr"], report["head"]) if engine.state_dir is not None else ([], "no state directory")
-            block = module.score_block()
-            scored = module.judge(block, impact_floor.load_matrix().get("cells"), entries, report, threshold) if not problem and block is not None else None
-        except Exception as err:   # a matrix, ledger or rule that cannot be read: the score is unknown, never Low
-            scored, problem = None, "%s: %s" % (type(err).__name__, _one_line(str(err), 80))
-        if scored is None:
-            scored = {"level": None, "reasons": ["the independent rating cannot be read (%s): the score is unknown, refused" % (problem or "no score rule")]}
-        if info is not None:
-            info["score"] = scored["level"]
+    scored = delegated_clear_score(engine, module, report, threshold) if threshold is not None else None
+    if scored is not None and info is not None:
+        info["score"] = scored["level"]
     reasons = module.refusals(rule, report, files, impact_floor.matches, closure, scored)
     if reasons:
         return None, "; ".join(reasons)
@@ -800,9 +809,13 @@ def cmd_impact_delegated(args, runner, now):
     """`impact delegated [--json]` (#835): every clear the Chief of Staff made under an order of the owner's, newest last, from the audit: when, the pull request, the head, the score, the threshold, the order and her
     judgement line. A refusal (`gate.hold_clear_refused`) is not a clear and is never listed. Read-only; the owner's own clears are not listed."""
     if getattr(args, "check", False):   # the fleet doctor's check: every configured owner-file order must still be exactly one line of the owner's file (a vanished or changed line is seen now, not at the next clear)
-        engine, _, _ = build_engine(runner, now, "cli", writable=False)
+        try:
+            config = load_config()   # the configuration only (no engine: the doctor has no running fleet to open)
+        except ConfigError as err:
+            print("the configuration cannot be loaded: %s" % _one_line(str(err), 200))
+            return EXIT_ERROR
         module, bad, seen = load_module("delegated_clear"), [], 0
-        raw = (engine.config or {}).get(module.CONFIG_KEY)
+        raw = config.get(module.CONFIG_KEY)
         if raw:
             try:
                 module.validate(raw, "config")
@@ -814,7 +827,7 @@ def cmd_impact_delegated(args, runner, now):
                 continue
             seen += 1
             try:
-                found = module.file_order_line(cos_orders_text_of(read_cos_orders(engine.config)["raw"]), entry["sha256"])
+                found = module.file_order_line(cos_orders_text_of(read_cos_orders(config)["raw"]), entry["sha256"])
             except (CosOrdersError, OSError) as err:
                 found = None
                 bad.append("order %d: the owner's standing-orders file cannot be read (%s)" % (entry["number"], _one_line(str(err), 100)))

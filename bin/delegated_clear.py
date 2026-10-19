@@ -166,6 +166,11 @@ def judge(block, cells, entries, report, threshold):
     return {"level": level, "reasons": reasons}
 
 
+def daemon_roots(rule):
+    """The daemon file's roots of the clear closure: `closure_roots` (what the clear command runs) and `rating_roots` (the code that WRITES and PARSES the independent rating the score is read from, #835): a change to a definition reachable from any of them is the owner's own clear."""
+    return sorted(set(rule["closure_roots"]) | set(rule.get("rating_roots") or []))
+
+
 def refusals(rule, report, files, matches=None, closure=None, scored=None):
     """[reasons] a delegated clear is refused for this pull request; [] when none. `rule` is the matrix's `owner_hold.delegated_clear` block; `report` is the owner-hold report the
     daemon uses (`pr_floor_report`: its decision, its top tier path hits by class, the independent review's class, whether the file list is complete); `files` is the pull request's

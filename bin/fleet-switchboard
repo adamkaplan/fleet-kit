@@ -20810,32 +20810,20 @@ def impact_review_hold(state_dir, pr, head):
     --impact-action hold`): an input that can only ADD a hold, nothing it says lowers the floor. **Fail mode: toward hold.** When the ledger
     cannot be read or is not trustworthy the rating is UNKNOWN, and an unknown input holds (as an unreadable diff does, and as G1 already
     refuses on a bad ledger): `hold` is True and `problem` says why; the caller audits it (`impact.ledger_unreadable`)."""
-    try:
-        entries, problem = plan_ledger.read_ledger(state_dir)
-    except Exception as err:
-        entries, problem = [], "%s: %s" % (type(err).__name__, _one_line(str(err), 100))
+    entries, problem = impact_rating_entries(state_dir, pr, head)   # the one filter of the records at this head
     if problem:
         return True, "the ledger could not be read, so the independent rating is unknown: %s" % _one_line(str(problem), 120)
-    latest = None
-    for entry in entries:
-        if entry.get("kind") == "review_record" and entry.get("pr") == pr and entry.get("head") == head and entry.get("reviewer") == "impact":
-            latest = entry
+    latest = entries[-1] if entries else None
     return bool(latest and latest.get("impact_action") == "hold"), None
 
 
 def impact_review_record(state_dir, pr, head):
     """((action, class), problem): the independent impact reviewer's newest record for EXACTLY this head as (impact_action, impact_class) (None when there is
-    none), and what is wrong when the ledger cannot be read (the rating is then unknown: the owner decision reads it as a hold)."""
-    try:
-        entries, problem = plan_ledger.read_ledger(state_dir)
-    except Exception as err:
-        return None, "%s: %s" % (type(err).__name__, _one_line(str(err), 100))
+    none), and what is wrong when the ledger cannot be read (the rating is then unknown: the owner decision reads it as a hold). The records come from `impact_rating_entries`, the one filter."""
+    entries, problem = impact_rating_entries(state_dir, pr, head)
     if problem:
-        return None, _one_line(str(problem), 120)
-    latest = None
-    for entry in entries:
-        if entry.get("kind") == "review_record" and entry.get("pr") == pr and entry.get("head") == head and entry.get("reviewer") == "impact":
-            latest = entry
+        return None, problem
+    latest = entries[-1] if entries else None
     return ((latest.get("impact_action"), latest.get("impact_class")) if latest else None), None
 
 

@@ -288,5 +288,41 @@ def main(argv):
     return 0 if result.wasSuccessful() else 1
 
 
+class DelegatedOrderCheck(DoctorCase):
+    """#835: the doctor's `delegated-order` line runs the REAL `fleet-switchboard impact delegated --check` against a configuration in the scratch HOME: an order read from the owner's own file must still be exactly one line of it."""
+
+    LINE = "- The Chief of Staff may clear held pull requests whose rating at the head is Serious or lower, on her own judgement; High stays the owner's."
+
+    def run_with(self, text, line=None, configured=True):
+        import hashlib, json
+        tmp = tempfile.mkdtemp(prefix="test-fleet-doctor.")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        run = DoctorRun(tmp, {})
+        home = Path(tmp) / "home"
+        (home / ".config" / "fleet-switchboard").mkdir(parents=True)
+        orders = Path(tmp) / "standing-orders.md"
+        if text is not None:
+            orders.write_text(text)
+        config = {"cos_orders_file": str(orders)}
+        if configured:
+            config["delegated_clear"] = {"orders": [{"number": 3, "sha256": hashlib.sha256((line or self.LINE).encode()).hexdigest(), "source": "owner-file", "max_level": "Serious"}]}
+        (home / ".config" / "fleet-switchboard" / "config.json").write_text(json.dumps(config))
+        run.run()
+        return run
+
+    def test_the_line_present_exactly_once_passes_and_every_other_state_fails(self):
+        cases = {"exact": ("- a\n" + self.LINE + "\n", "ok"), "deleted": ("- a\n", "FAIL"), "edited": ("- a\n" + self.LINE.replace("Serious", "Serioux") + "\n", "FAIL"),
+                 "duplicated": (self.LINE + "\n" + self.LINE + "\n", "FAIL"), "case changed": (self.LINE.lower() + "\n", "FAIL"), "substring": (self.LINE + " not on Tuesdays\n", "FAIL"),
+                 "file missing": (None, "FAIL"), "too large": ("x" * 9000, "FAIL")}
+        for label, (text, status) in cases.items():
+            with self.subTest(label):
+                run = self.run_with(text)
+                self.assertTrue(self.only(run, "delegated-order").startswith(status + " "), run.output)
+
+    def test_no_owner_file_order_configured_is_ok(self):
+        run = self.run_with("- a\n", configured=False)
+        self.assertTrue(self.only(run, "delegated-order").startswith("ok "), run.output)
+
+
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))

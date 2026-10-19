@@ -408,6 +408,10 @@
           "validate"
         ]
       },
+      "rating_roots": [
+        "cmd_review",
+        "parse_review_block"
+      ],
       "closure_roots": [
         "CLEAR_NOTIFIED_FILE",
         "CLEAR_NOTIFIED_MAX",
@@ -454,6 +458,7 @@
         "impact_state_lock",
         "json",
         "label_names",
+        "load_config",
         "load_module",
         "notice_senders",
         "os",
