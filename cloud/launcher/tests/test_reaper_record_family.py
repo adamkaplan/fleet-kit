@@ -239,6 +239,12 @@ class RecordWriters(Quiet):
         self.assertTrue(os.path.exists(os.path.join(d, "run.json.part")))
         self.assertNotIn("run.json.part", run_record.RECORD_FILES)
 
+    def test_the_hook_view_never_raises_even_for_an_answer_that_is_not_a_dict(self):
+        L = cw.Launcher(cw.Kube(self.env), self.env, self.clock)
+        for bad in (None, [], "x", 5):
+            v = L._hook_view(bad)
+            self.assertEqual((v["pushed"], v["wip_branch"], v["skipped"]), (False, None, []))
+
     def test_the_second_write_is_atomic_not_in_place(self):
         d = os.path.join(self.tmp.name, "rec2")
         os.mkdir(d)
@@ -286,7 +292,7 @@ class OperatorStopIsPinned(Quiet):
         self.assertEqual(audit, want)
 
 
-SECRETS = ["hunter2hunter2", "p4ss:w0rd+with!odd", "x" * 64, "tok_" + "ab12" * 8, "s3cr3t"]
+SECRETS = ["hunter2hunter2", "p4ss:w0rd+with!odd", "p4ss/w0rd?with#odd", "x" * 64, "tok_" + "ab12" * 8, "s3cr3t"]
 ENCODINGS = [lambda s: s, lambda s: __import__("urllib.parse", fromlist=["quote"]).quote(s, safe=""),
              lambda s: __import__("urllib.parse", fromlist=["quote"]).quote(s, safe="") .replace("%", "%25")]
 URL_SCHEMES = ["https", "http", "ssh", "git", "ftp", "git+https", "ws"]
@@ -320,6 +326,21 @@ class ScrubShapes(unittest.TestCase):
                     self.assertNotIn(part, out, text)
                 self.assertIn("[redacted]", out, text)
         self.assertGreater(n, 1000)
+
+    def test_a_multi_parameter_authorization_header_goes_whole(self):
+        out = cw.scrub('Authorization: Digest username="u", response="abc123xyz", nonce="n1" tail', ())
+        for part in ("abc123xyz", "n1", "username"):
+            self.assertNotIn(part, out)
+
+    def test_pod_controlled_text_cannot_make_the_scan_slow(self):
+        import time
+        for n in ("a.a." * 50000, "authorization" * 15000, " " * 199987 + "authorization", "http://" * 28000, "x" * 199999 + "@"):
+            t = time.monotonic()
+            cw.scrub(n, limit=10)
+            self.assertLess(time.monotonic() - t, 5, n[:20])   # linear in practice (well under a second); quadratic would be minutes
+        for pat, _ in cw.CREDENTIAL_SHAPES:   # structural: no unbounded scheme or userinfo quantifier in a URL shape
+            if "://" in pat.pattern:
+                self.assertNotRegex(pat.pattern, r"\[a-z0-9\+\.\-\]\*|\[\^[^\]]*\]\*")
 
     def test_text_around_a_credential_and_plain_urls_survive(self):
         self.assertEqual(cw.scrub("see https://github.com/acme/widget.git and git@github.com:acme/widget.git", ()),
