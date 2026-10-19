@@ -8704,7 +8704,9 @@ class WorkerFacts:
             return []
         refs = {(key, issue)} | ({(key, number)} if number else set())
         for d in body["decisions"]:
-            ref = sweep_ref_of(d, repo) if isinstance(d, dict) else None
+            if not isinstance(d, dict):
+                continue
+            ref = sweep_ref_of(d, repo)
             if d.get("tier", "human") == "human" and ref and (plan_ledger.normal_repo(ref[0]), ref[1]) in refs:
                 return []   # it waits on the owner
         since = max(moved, last["work_since"])

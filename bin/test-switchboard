@@ -21958,6 +21958,18 @@ class TestStalledWorking(ReportBase):
         (wake,) = self.stalled()
         self.assertIn("1 working reports", wake.summary)
 
+    def test_an_unreadable_decision_file_or_reminder_file_and_a_past_reminder(self):
+        self.late()
+        sb.add_reminder(self.world.state, "coder", self.world.clock.now() - 60, self.world.clock.now() - 120, "look", issue=2)
+        self.assertEqual(len(self.stalled()), 1, "a reminder already past does not hide a stall")
+        (self.world.state / sb.DECISIONS_FILE).write_text(json.dumps({"decisions": ["junk"], "errors": []}))
+        self.assertEqual(len(self.stalled()), 1, "a malformed entry is skipped, not a crash")
+        (self.world.state / sb.DECISIONS_FILE).write_text("not json")
+        self.assertEqual(self.stalled(), [], "an unreadable decision list is no evidence")
+        (self.world.state / sb.DECISIONS_FILE).write_text(json.dumps({"decisions": [], "errors": []}))
+        (self.world.state / "reminders.json").write_text("{bad")
+        self.assertEqual(self.stalled(), [], "an unreadable reminder file is no evidence")
+
     def test_a_bad_threshold_is_refused(self):
         with self.assertRaises(sb.ConfigError):
             sb.validate_config({"stalled_working_hours": 0})
