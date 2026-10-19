@@ -38578,11 +38578,28 @@ class TestDaemonCommand(Base):
         self.assertEqual([c for c in self.calls if c[0] == "spawn"], [])
         self.drop_all()
         self.calls.clear()
-        self.job_loaded, self.job_pid = False, None
-        self.job_loaded = True       # a loaded job is kickstarted
-        self.job_pid = None
-        self.run_cmd("start")
-        self.assertIn("kickstart", self.launchctl_verbs())
+        self.job_loaded, self.job_pid = True, None      # a loaded job is kickstarted
+        code, out, err = self.run_cmd("start")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.launchctl_verbs().count("kickstart"), 1)
+
+    def test_a_launchd_refusal_is_said_plainly_and_the_daemon_is_left_running(self):
+        self.install_plist()
+        self.job_loaded, self.job_pid = True, 4243
+        self.boot(4243)
+        real = self.runner
+        refuse = lambda argv, **kw: subprocess.CompletedProcess(argv, 5, "", "raw launchctl words") if argv[:2] == ["launchctl", "bootout"] else real(argv, **kw)
+        with mock.patch.object(self, "runner", refuse):
+            code, out, err = self.run_cmd("stop")
+        self.assertEqual(code, 1)
+        self.assertIn("would not unload", err)
+        self.assertNotIn("raw launchctl words", out + err)
+        self.assertTrue(sb.run_lock_held(self.state))
+        self.drop(4243)
+        with mock.patch.object(self, "runner", lambda argv, **kw: subprocess.CompletedProcess(argv, 5, "", "raw") if argv[1] in ("kickstart", "bootstrap") else real(argv, **kw)):
+            code, out, err = self.run_cmd("start")
+        self.assertEqual(code, 1)
+        self.assertIn("would not start", err)
 
     def test_S5_restart_replaces_the_daemon_and_changes_no_state_file(self):
         self.running_ensure_daemon()
