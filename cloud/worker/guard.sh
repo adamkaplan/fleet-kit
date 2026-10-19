@@ -104,7 +104,7 @@ do_git() {
            fi ;;
       esac
     done
-    [ "$ok" = 1 ] && [ "$mode" = 1 ] && [ "$pos" -le 1 ] && return 0
+    [ "$wr" = 0 ] && [ "$ok" = 1 ] && [ "$mode" = 1 ] && [ "$pos" -le 1 ] && return 0   # a write flag anywhere (with any read mode, before or after the key) is never a read
     set -- config "$@"
     for a in "$@"; do bad_cfg "$a"; done
     [ "$wr" = 1 ] && refuse "changing git configuration"

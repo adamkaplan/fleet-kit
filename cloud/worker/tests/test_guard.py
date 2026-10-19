@@ -503,6 +503,26 @@ class GuardConfigForms(unittest.TestCase):
             with self.subTest(args=args):
                 self.assertEqual(self.run_guard(args).returncode, 0)
 
+    READ_MODES = ["--get", "--get-all", "--get-regexp", "--get-urlmatch", "--list", "-l", "--get-color", "--get-colorbool"]
+
+    def write_flags(self):
+        return [n for k, n, _, _ in cfg_table() if k == "refused" and n.startswith("-") and n != "an unknown flag or abbreviation"] + ["--uns", "-le", "-el"]
+
+    def test_a_write_flag_with_any_read_mode_is_refused_in_every_position(self):
+        flags = self.write_flags()
+        self.assertGreater(len(flags), 8)
+        for mode in self.READ_MODES:
+            for flag in flags:
+                for args in ([mode, flag, "user.x"], [flag, mode, "user.x"], [mode, "user.x", flag], [mode, flag], [flag, "user.x", mode]):
+                    with self.subTest(args=args):
+                        self.assertEqual(self.run_guard(args).returncode, 3)
+
+    def test_a_mutant_that_drops_the_write_flag_check_before_the_read_shortcut_fails_the_pair_test(self):
+        p = self.mutant('[ "$wr" = 0 ] && [ "$ok" = 1 ]', '[ "$ok" = 1 ]')
+        self.assertEqual(self.run_guard(["--get", "--unset", "user.x"], p).returncode, 0)
+        self.assertEqual(self.run_guard(["--list", "--uns"], p).returncode, 0)
+        self.assertEqual(self.run_guard(["--get", "--unset", "user.x"]).returncode, 3)
+
     def test_a_mutant_that_widens_the_identity_exception_is_caught(self):
         p = self.mutant("user.name|user.email)", "user.*)")
         self.assertEqual(self.run_guard(["user.name.x", "v"], p).returncode, 0)   # the mutant passes it ...
