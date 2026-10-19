@@ -394,5 +394,244 @@ class Guard(unittest.TestCase):
             self.assertRegex(text, r"(?i)not the guard|only a convenience", path)
 
 
+def cfg_table():
+    """the git config table at the top of guard.sh: [(kind, name, args, why)]"""
+    rows = []
+    for line in read(os.path.join(WORKER, "guard.sh")).splitlines():
+        if line.startswith("#CFG "):
+            kind, name, args, why = [x.strip() for x in line[5:].split(" | ")]
+            rows.append((kind, name, args.split(), why))
+    return rows
+
+
+class GuardConfigForms(unittest.TestCase):
+    """#705: every git config write form is refused, from one table; the README names exactly the table's refused forms."""
+
+    @classmethod
+    def setUpClass(cls):
+        t = tempfile.TemporaryDirectory(dir=os.environ.get("CW_TMPDIR"))
+        cls.addClassCleanup(t.cleanup)
+        cls.d = os.path.realpath(t.name)
+        cls.stub = os.path.join(cls.d, "git")
+        with open(cls.stub, "w") as f:
+            f.write('#!/bin/sh\necho real git ran\n')
+        os.chmod(cls.stub, 0o755)
+
+    def run_guard(self, args, guard=None):
+        env = {"PATH": "/usr/bin:/bin", "CW_REAL_GIT": self.stub}
+        return subprocess.run(["sh", guard or os.path.join(WORKER, "guard.sh"), "git", "config"] + args, env=env, capture_output=True, text=True, timeout=30)
+
+    def mutant(self, old, new):
+        text = read(os.path.join(WORKER, "guard.sh"))
+        assert old in text, old
+        p = os.path.join(self.d, "mut-%d.sh" % len(os.listdir(self.d)))
+        with open(p, "w") as f:
+            f.write(text.replace(old, new, 1))
+        return p
+
+    def test_s1_s2_every_row_of_the_table_is_answered_as_listed(self):
+        rows = cfg_table()
+        self.assertTrue([r for r in rows if r[0] == "refused"] and [r for r in rows if r[0] == "allowed"])
+        for kind, name, args, _ in rows:
+            with self.subTest(name=name):
+                r = self.run_guard(args)
+                if kind == "refused":
+                    self.assertEqual(r.returncode, 3, r.stdout)
+                    self.assertEqual(r.stderr, "refused: changing git configuration: %s\n" % TAIL)
+                else:
+                    self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_the_identity_exception_is_exactly_two_keys(self):
+        for args in (["user.name.x", "v"], ["user.nam", "v"], ["user.name", "a", "b"], ["USER.NAME.x", "v"], ["user.email.x", "v"]):
+            with self.subTest(args=args):
+                self.assertEqual(self.run_guard(args).returncode, 3)
+        for args in (["user.name", "/tmp/include.path"], ["user.email", "push --force"], ["--global", "USER.Name", "x"]):
+            with self.subTest(args=args):
+                self.assertEqual(self.run_guard(args).returncode, 0)   # a value is just a value
+        self.assertEqual(self.run_guard(["user.name", "x", "--add"]).returncode, 3)
+
+    def test_s3_the_readme_names_exactly_the_refused_forms_in_the_table(self):
+        names = {n for k, n, _, _ in cfg_table() if k == "refused"}
+        para = [l for l in read(os.path.join(WORKER, "..", "README.md")).splitlines() if l.startswith("- **`git config` writes are refused**")]
+        self.assertEqual(len(para), 1)
+        listed = para[0].split("this list names exactly its refused forms):", 1)[1].split(". The one exception", 1)[0]
+        in_readme = set(re.findall(r"`([^`]+)`", listed))
+        self.assertEqual(in_readme, names)
+        self.assertIn("judged word by word", para[0])
+        self.assertIn("user.name", para[0])
+        self.assertRegex(para[0], r"convenience, not the guard")
+
+    def test_every_refused_flag_row_has_a_mutant_that_this_table_catches(self):
+        text = read(os.path.join(WORKER, "guard.sh"))
+        for kind, name, args, _ in cfg_table():
+            if kind != "refused" or not name.startswith("-"):
+                continue
+            with self.subTest(name=name):
+                lines = text.splitlines()
+                hit = [i for i, l in enumerate(lines) if l.strip().endswith("wr=1 ;;") and name in l.strip().split(")")[0].split("|")]
+                self.assertEqual(len(hit), 1, name)
+                head, tail = lines[hit[0]].split(")", 1)
+                lines[hit[0]] = "|".join(t for t in head.split("|") if t.strip() != name) + ")" + tail
+                m = "\n".join(lines).replace("-*) wr=1 ;;", "-*) ;;")   # the catch-all is off too: this member alone must hold
+                p = os.path.join(self.d, "mut-%d.sh" % len(os.listdir(self.d)))
+                with open(p, "w") as f:
+                    f.write(m)
+                self.assertEqual(self.run_guard([name, "user.x"], p).returncode, 0, "the mutant must let the form through: %s" % name)
+
+    def test_every_prefix_of_a_write_flag_is_refused(self):
+        for kind, name, _, _ in cfg_table():
+            if kind == "refused" and name.startswith("--"):
+                for n in range(3, len(name)):
+                    with self.subTest(flag=name[:n]):
+                        self.assertEqual(self.run_guard([name[:n], "user.x"]).returncode, 3)
+
+    def test_every_subcommand_row_and_the_plain_form_have_a_mutant_that_this_table_catches(self):
+        for kind, name, args, _ in cfg_table():
+            if kind == "refused" and name in ("edit", "set", "unset", "rename-section", "remove-section"):
+                with self.subTest(name=name):
+                    parts = "edit|set|unset|rename-section|remove-section".split("|")
+                    parts.remove(name)
+                    p = self.mutant("edit|set|unset|rename-section|remove-section) wr=1", "|".join(parts) + ") wr=1")
+                    self.assertEqual(self.run_guard([name], p).returncode, 0)
+        p = self.mutant("user.name|user.email) n_ok=1", "*) n_ok=1")
+        self.assertEqual(self.run_guard(["user.x", "y"], p).returncode, 0)
+        p = self.mutant("-*) wr=1 ;;", "-*) ;;")
+        self.assertEqual(self.run_guard(["--uns", "user.x"], p).returncode, 0)
+
+    def test_the_read_forms_and_their_modifiers_still_pass(self):
+        for args in (["--get", "--type=bool", "user.x"], ["--bool", "--get", "user.x"], ["--get", "--default", "d", "user.x"], ["get", "user.x"], ["list"], ["--get-regexp", "--global", "x"]):
+            with self.subTest(args=args):
+                self.assertEqual(self.run_guard(args).returncode, 0)
+
+    READ_MODES = ["--get", "--get-all", "--get-regexp", "--get-urlmatch", "--list", "-l", "--get-color", "--get-colorbool"]
+
+    def write_flags(self):
+        return [n for k, n, _, _ in cfg_table() if k == "refused" and n.startswith("-") and n != "an unknown flag or abbreviation"] + ["--uns", "-le", "-el"]
+
+    def test_a_write_flag_with_any_read_mode_is_refused_in_every_position(self):
+        flags = self.write_flags()
+        self.assertGreater(len(flags), 8)
+        for mode in self.READ_MODES:
+            for flag in flags:
+                for args in ([mode, flag, "user.x"], [flag, mode, "user.x"], [mode, "user.x", flag], [mode, flag], [flag, "user.x", mode]):
+                    with self.subTest(args=args):
+                        self.assertEqual(self.run_guard(args).returncode, 3)
+
+    def test_a_mutant_that_drops_the_write_flag_check_before_the_read_shortcut_fails_the_pair_test(self):
+        p = self.mutant('[ "$wr" = 0 ] && [ "$ok" = 1 ]', '[ "$ok" = 1 ]')
+        self.assertEqual(self.run_guard(["--get", "--unset", "user.x"], p).returncode, 0)
+        self.assertEqual(self.run_guard(["--list", "--uns"], p).returncode, 0)
+        self.assertEqual(self.run_guard(["--get", "--unset", "user.x"]).returncode, 3)
+
+    # ---- #705 review round: parse like git, default deny ----
+    REPRO = [   # reproduced against real git: the VALUE looks like a read modifier, everything after the key is a value
+        ["core.pager", "--default=x;touch/tmp/p"], ["core.fsmonitor", "--type=x;touch/tmp/p"], ["include.path", "--bool"],
+        ["user.x", "--global"], ["core.editor", "--path"], ["user.name", "--global"], ["user.email", "-x"],
+    ]
+
+    def test_flag_shaped_values_after_the_key_are_refused_by_name(self):
+        for args in self.REPRO:
+            with self.subTest(args=args):
+                r = self.run_guard(args)
+                self.assertEqual(r.returncode, 3)
+                self.assertEqual(r.stdout, "")
+
+    ARITY = {"--get": (1, 1), "--get-all": (1, 1), "--get-regexp": (1, 1), "--list": (0, 0), "-l": (0, 0),
+             "--get-urlmatch": (1, 2), "--get-color": (1, 2), "--get-colorbool": (1, 2)}
+    MODIFIERS = {"--global", "--local", "-z", "--show-origin", "--bool", "--path", "--type=x", "--default=x"}
+    WORDS = ["core.pager", "user.name", "include.path", "v", "--global", "--get", "--list", "-l", "--bool", "--default=x", "--unset"]
+
+    def oracle(self, words):
+        """the specification, written apart from the wrapper: True when the shape is a read or an identity write"""
+        i = 0
+        while i < len(words) and words[i].startswith("-"):
+            i += 1
+        opts, rest = words[:i], words[i:]
+        if any(w.startswith("-") for w in rest):
+            return False
+        modes = [o for o in opts if o in self.ARITY]
+        if len(modes) > 1 or any(o not in self.ARITY and o not in self.MODIFIERS for o in opts):
+            return False
+        if modes:
+            lo, hi = self.ARITY[modes[0]]
+            return lo <= len(rest) <= hi
+        return len(rest) == 1 or (len(rest) == 2 and rest[0] in ("user.name", "user.email"))
+
+    def shapes(self):
+        import itertools
+        out = []
+        for n in (1, 2, 3):
+            out += [list(p) for p in itertools.product(self.WORDS, repeat=n)]
+        small = ["user.name", "v", "--global", "--get", "--unset"]
+        out += [list(p) for p in itertools.product(small, repeat=4)]
+        return out
+
+    def test_every_shape_up_to_four_words_is_allowed_only_if_it_is_a_read_or_an_identity_write(self):
+        from concurrent.futures import ThreadPoolExecutor
+        shapes = self.shapes()
+        with ThreadPoolExecutor(8) as ex:
+            rcs = list(ex.map(lambda a: self.run_guard(a).returncode, shapes))
+        type(self).RCS = dict(zip(map(tuple, shapes), rcs))
+        bad = [(a, rc) for a, rc in zip(shapes, rcs) if (rc == 0) != self.oracle(a) or rc not in (0, 3)]
+        self.assertEqual(bad[:10], [])
+        self.assertTrue(any(rc == 0 for rc in rcs) and any(rc == 3 for rc in rcs))
+
+    def test_the_allowed_shapes_leave_the_configuration_of_real_git_unchanged(self):
+        git = shutil.which("git")
+        if not git:
+            self.skipTest("no git")
+        home = os.path.join(self.d, "home"); repo = os.path.join(self.d, "repo")
+        os.makedirs(home); os.makedirs(repo)
+        env = {"PATH": "/usr/bin:/bin", "HOME": home, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.path.join(home, ".gitconfig")}
+        subprocess.run([git, "init", "-q"], cwd=repo, env=env, check=True, capture_output=True)
+        subprocess.run([git, "config", "user.x", "1"], cwd=repo, env=env, check=True, capture_output=True)
+        files = [os.path.join(repo, ".git", "config"), os.path.join(home, ".gitconfig")]
+        before = [read(f) if os.path.exists(f) else None for f in files]
+        ran = 0
+        for args in self.shapes():
+            rc = self.RCS.get(tuple(args)) if hasattr(self, "RCS") else self.run_guard(args).returncode
+            i = 0
+            while i < len(args) and args[i].startswith("-"):
+                i += 1
+            if rc == 0 and len(args[i:]) != 2:   # (an identity write is allowed to change the configuration)
+                subprocess.run([git, "config"] + args, cwd=repo, env=env, capture_output=True, timeout=30)
+                ran += 1
+        self.assertGreater(ran, 20)
+        self.assertEqual(before, [read(f) if os.path.exists(f) else None for f in files])
+
+    def test_each_rule_of_the_parser_has_a_mutant_that_dies(self):
+        p = self.mutant('"") if [ "$pos" = 1 ]; then n_ok=1; elif', '"") if [ "$pos" -ge 1 ]; then n_ok=1; elif')   # the arity of the no-mode form dropped
+        self.assertEqual(self.run_guard(["core.pager", "v", "w"], p).returncode, 0)
+        p = self.mutant("--get|--get-all|--get-regexp|get) [ \"$pos\" = 1 ] && n_ok=1", "--get|--get-all|--get-regexp|get) n_ok=1")   # a read mode's arity dropped
+        self.assertEqual(self.run_guard(["--get", "a", "b"], p).returncode, 0)
+        p = self.mutant("case \"$a\" in -*) ok=0 ;; esac", "case \"$a\" in -*) ;; esac")   # options after the key accepted
+        self.assertEqual(self.run_guard(["user.name", "--global"], p).returncode, 0)
+        p = self.mutant("case \"$a\" in -*) ok=0 ;; esac", "case \"$a\" in --global|--bool|--path|--type=*|--default=*) continue ;; -*) ok=0 ;; esac")   # the old modifier list restored
+        for args in (["include.path", "--bool"], ["user.x", "--global"], ["core.editor", "--path"], ["core.pager", "--default=x;t"], ["core.fsmonitor", "--type=x;t"]):
+            self.assertEqual(self.run_guard(args, p).returncode, 0, args)
+            self.assertEqual(self.run_guard(args).returncode, 3, args)
+
+    def test_a_mutant_that_widens_the_identity_exception_is_caught(self):
+        p = self.mutant("user.name|user.email)", "user.*)")
+        self.assertEqual(self.run_guard(["user.name.x", "v"], p).returncode, 0)   # the mutant passes it ...
+        self.assertEqual(self.run_guard(["user.name.x", "v"]).returncode, 3)      # ... the real wrapper does not
+
+    def test_the_agent_definition_and_config_name_the_same_forms(self):
+        text = read(os.path.join(WORKER, "agents", "worker.md"))
+        for phrase in ("--add", "--unset", "--edit", "--rename-section", "--remove-section", "include.path", "user.name", "user.email"):
+            self.assertIn(phrase, text)
+        conf = json.loads(read(os.path.join(WORKER, "opencode-worker.json")))
+        denies = [p for p, v in conf["permission"]["bash"].items() if v == "deny"]
+        def match(pat, line):
+            return re.fullmatch(".*".join(re.escape(x) for x in pat.split("*")), line, re.S) is not None
+        for kind, name, args, _ in cfg_table():
+            line = "git config " + " ".join(args)
+            if kind == "refused" and name not in ("KEY VALUE", "an unknown flag or abbreviation", "a value that looks like an option", "a value word after a read mode's key", "an option after the get or list subcommand"):
+                with self.subTest(name=name):
+                    self.assertTrue(any(match(p, line) for p in denies), line)
+            if kind == "allowed":
+                self.assertFalse(any(match(p, line) for p in denies), line)
+
+
 if __name__ == "__main__":
     unittest.main()
