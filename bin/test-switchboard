@@ -67138,6 +67138,53 @@ class TestAgentCredentialsDoc(unittest.TestCase):
         for cmd in ("gh auth login --with-token", "gh auth token <", "gh api -x post", "-x patch"):
             self.assertNotIn(cmd, low)
 
+    # #850: what #616 built and what stays the owner's, each stated exactly once (fails on 0 and on 2).
+    PINS = {
+        "built": "shim mint is built and merged (#616)",
+        "one repository": "mint an App installation token for one repository",
+        "short-lived": "short-lived (one hour at most)",
+        "fail closed": "and fail closed (a mint failure",
+        "role": "the Chief of Staff's recorded role (`whoami` carries the role",
+        "refusal": "a worker that names another mapped repository is refused",
+        "permissions": "`issues: write`, `checks: read`, `metadata: read`, and no Administration. The owner adds `issues: write` and `checks: read`.",
+        "owner key": "- The App's private key, kept only where the shim process reads it",
+        "owner map": "- The repository-to-installation map beside `gh_users`, with the installation ids",
+        "owner migration": "- The migration steps that take the owner's broad login out of the agents' reach",
+        "live proof": "Clause (4) of the ask, the live proof, is not done",
+        "status not done": "the owner's steps that put it to use are not done",
+    }
+
+    def test_each_built_statement_is_stated_exactly_once(self):
+        for name, phrase in self.PINS.items():
+            self.assertEqual(self.text.count(phrase), 1, name)
+
+    def test_status_and_what_c_needs_no_longer_call_the_mint_future(self):
+        status = self.text[self.text.index("Status:"):].split("\n\n")[0]
+        needs = [b for h, b in self.sections.items() if h.startswith("Recommendation")][0]
+        for old in ("separate top-tier work item", "A local mint in the", "until the shim work lands", "Until the shim work lands", "Needs shim code"):
+            self.assertNotIn(old, self.text)
+        self.assertNotIn("future", status.lower())
+        self.assertNotIn("future", needs.lower())
+
+    def test_545_is_stated_merged_and_live_never_open_or_conditional(self):
+        self.assertEqual(self.text.count("the permission check is in the launcher: #545, merged"), 1)
+        self.assertEqual(self.text.count("exact-permission check is merged and live (#545"), 1)
+        self.assertEqual(self.text.count("makes the cloud mint refuse every cloud token today"), 1)
+        for line in self.text.splitlines():
+            if "#545" in line:
+                self.assertIn("merged", line)
+        for old in ("open pull request #545", "if #545 is merged", "If and when it is merged", "is being added", "once #545 is merged", "is not on the main branch yet"):
+            self.assertNotIn(old, self.text)
+
+    def test_nothing_says_the_migration_or_live_proof_is_done(self):
+        low = self.text.lower()
+        for claim in ("migration is complete", "migration is done", "has been migrated", "live proof passed", "live proof is done", "live-proven", "is live"):
+            self.assertNotIn(claim, low)
+
+    def test_no_installation_id_or_key_value(self):
+        self.assertIsNone(re.search(r"(?i)installation[_ ]id\W{0,4}\d{3,}", self.text))
+        self.assertIsNone(re.search(r"(?i)app[_ ]id\W{0,4}\d{3,}", self.text))
+
     def test_no_token_like_string(self):
         for pattern in CRED_TOKEN_PATTERNS:
             self.assertIsNone(re.search(pattern, self.text), "token-like text matched pattern #%d" % CRED_TOKEN_PATTERNS.index(pattern))
