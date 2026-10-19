@@ -4968,9 +4968,9 @@ The batch pull request is opened daily at the hour the Chief of Staff's lane rec
 
 ### The freeze
 
-The freeze starts when the lane adds the label `batch-ready` to the batch pull request (and its first body line says `batch PR ready for the owner's clear`), and ends when that pull request merges or the lane removes the label. While it stands nothing merges into `integration`; new changes wait for the next batch and their pull requests stay open. Until a ruleset exists the freeze is a rule the lanes follow plus an audit report: a merge into `integration` while a pull request carries `batch-ready` is reported.
+The freeze starts when the batch pull request is taken out of draft (its title says `ready for the owner's clear`; no label is created), and ends when it merges or is returned to draft. While it stands nothing merges into `integration`; new changes wait for the next batch and their pull requests stay open. Until a ruleset enforces it, the freeze is a rule the lanes follow; a report of merges into `integration` while a batch is ready is a planned follow-up (not built).
 
-A merge during the freeze moves the batch's head and voids the owner's clear (it is head-bound). The lane then removes `batch-ready`, refreshes the table, tells the owner the clear is void, and marks it ready again; the change is kept, because reverting would be a second merge into `integration`. A sync (below) during the freeze is a merge too: it waits until the batch merges, unless an urgent fix made the batch conflict or go stale, in which case the lane ends the freeze, syncs, refreshes the table and marks it ready again, and the clear is void like any other.
+A merge during the freeze moves the batch's head and voids the owner's clear (it is head-bound). The lane then returns the batch to draft, refreshes the table, tells the owner the clear is void, and marks it ready again; the change is kept, because reverting would be a second merge into `integration`. A sync (below) during the freeze is a merge too: it waits until the batch merges, unless an urgent fix made the batch conflict or go stale, in which case the lane ends the freeze, syncs, refreshes the table and marks it ready again, and the clear is void like any other.
 
 ### The sync
 
@@ -4985,11 +4985,11 @@ Its ask stays open, with a comment naming the batch pull request. Its live-check
 ### The steps a lane follows
 
 1. A change is planned and reviewed as usual, and its pull request is opened into `integration` (`gh pr create --base integration`); CI runs on it. A top-tier change is held for the owner and cleared on its own pull request (`impact clear <repo#N> --reason ...`).
-2. After the independent review passes at the head and the gates read `gates <repo#N>`, the change merges into `integration` (`gh pr merge <N>`) unless a batch is `batch-ready`; then it waits.
+2. After the independent review passes at the head and the gates read `gates <repo#N>`, the change merges into `integration` (`gh pr merge <N>`) unless a batch is out of draft (ready); then it waits.
 3. After every direct merge to the default branch: `git fetch origin`, `git checkout integration`, `git merge origin/<default>` (never a rebase), push.
 4. At the day's hour the Chief of Staff's lane opens the batch pull request (`gh pr create --base <default> --head integration --draft`), with the body template below, one row per change.
-5. It re-syncs (step 3), refreshes the table, runs the independent review of the batch at its head, then marks it ready (`gh pr ready <N>`), adds `batch-ready` (`gh pr edit <N> --add-label batch-ready`) and tells the owner (`fleet-switchboard notice pr <repo#N>`).
-6. The owner clears at the exact head and the batch merges. The lane removes `batch-ready`, merges the default branch into `integration` (step 3), and the owning orchestrators close the asks that were carried.
+5. It re-syncs (step 3), refreshes the table, runs the independent review of the batch at its head, then marks it ready (`gh pr ready <N>`, and a title that says `ready for the owner's clear`) and tells the owner (`fleet-switchboard notice pr <repo#N>`).
+6. The owner clears at the exact head and the batch merges. The lane merges the default branch into `integration` (step 3), and the owning orchestrators close the asks that were carried.
 
 ### The batch pull request body (template)
 
@@ -5020,7 +5020,7 @@ The body is the owner v2 body plus one table with a row per change. Use neutral 
 
 Each decision was walked against the matrix (its owner-hold meaning and its rating table) and the commands (`impact clear`, `impact clear --under-order`, `gh pr`, `git merge`).
 
-- **D1** (decided: option A as a target, the Chief of Staff, 18:05Z, under the owner's standing order): changes into `integration` are rated and held as usual; today the owner clears a top-tier change on its own pull request, and the Chief of Staff's clear up to Serious applies once #835 is built and its order is configured; the batch pull request holds for the owner when any member touched a top-tier path until #835 lands, then only when a row is rated High. No floor path changes. Not chosen: the floor skips the per-change hold (stays an owner option if the pilot shows the per-change clears cost too much), and held changes not batched.
-- **D2**: enforce the freeze with a ruleset on `integration`. Recommendation: yes if the owner is willing; otherwise the audit report stays the control.
+- **D1**, the impact floor treatment of changes into the integration branch (decided: option A as a target, the Chief of Staff, 18:05Z, under the owner's standing order): changes into `integration` are rated and held as usual; today the owner clears a top-tier change on its own pull request, and the Chief of Staff's clear up to Serious applies once #835 is built and its order is configured; the batch pull request holds for the owner when any member touched a top-tier path until #835 lands, then only when a row is rated High. No floor path changes. Not chosen: the floor skips the per-change hold (stays an owner option if the pilot shows the per-change clears cost too much), and held changes not batched.
+- **D2**: enforce the freeze with a ruleset on `integration`. Recommendation: yes if the owner is willing; otherwise the lanes' rule stays the control.
 - **D3**: batch size against the review checkout's limits. Recommendation: cap a batch at what the checkout accepts, and split a larger one.
-- **Follow-up asks** (each its own ask): a script that renders the batch table; the daemon's treatment of an ask whose change is in a non-default branch (T12) and of reference runs for `integration` (and a `push` run of CI on `integration`; pull requests into it already run CI, as the workflow has no branch filter); the audit report for a merge during the freeze.
+- **Follow-up asks** (each its own ask): a script that renders the batch table; the daemon's treatment of an ask whose change is in a non-default branch (T12) and of reference runs for `integration` (and a `push` run of CI on `integration`; pull requests into it already run CI, as the workflow has no branch filter); a report of merges into `integration` while a batch is ready.

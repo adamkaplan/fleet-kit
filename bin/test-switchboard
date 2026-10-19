@@ -67066,7 +67066,7 @@ class TestBatchingDocs(unittest.TestCase):
         self.assertEqual(text.count(self.HEAD), 1)
         return text.split(self.HEAD, 1)[1]  # the last section of the file; its template holds "## " lines, so no split on them
 
-    def test_the_five_topics_are_each_a_heading_once(self):
+    def test_the_topics_are_each_a_heading_once(self):
         section = self.section()
         for topic in ("### What batches and what goes straight", "### The cadence and who keeps the batch", "### The freeze",
                       "### The sync", "### An ask whose change is only in `integration`", "### The steps a lane follows"):
@@ -67074,7 +67074,7 @@ class TestBatchingDocs(unittest.TestCase):
 
     def test_the_hold_rule_uses_the_matrix_terms_and_marks_the_delegation_a_target(self):
         section = self.section()
-        for phrase in ("`owner_hold`", "Target, after #835 lands", "`delegated_clear`", "aggregated diff",
+        for phrase in ("`owner_hold`", "Target, after #835 lands", "`delegated_clear`", "aggregated diff", "taken out of draft", "a planned follow-up (not built)",
                        "voids the owner's clear", "before the next change merges into `integration`", "delete head branch on merge"):
             self.assertEqual(section.count(phrase), 1, phrase)
 
@@ -67082,6 +67082,12 @@ class TestBatchingDocs(unittest.TestCase):
         sentence = "until #835 lands, then only when a row is rated High"
         self.assertEqual(self.section().count(sentence), 2)  # the hold rule and decision D1
         self.assertEqual((REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text().count(sentence), 1)
+
+    def test_no_label_and_no_existing_audit_report_are_claimed(self):
+        section = self.section()
+        self.assertNotIn("batch-ready", section)
+        self.assertNotIn("batch-ready", (REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text())
+        self.assertNotIn("audit report", section)
 
     def test_the_lane_steps_are_numbered_and_each_carries_a_command(self):
         steps = self.section().split("### The steps a lane follows", 1)[1].split("###", 1)[0].strip().splitlines()
