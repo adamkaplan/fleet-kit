@@ -26611,6 +26611,7 @@ class TestAlertWake(Base):
         self.engine.alert_wake = None      # a restart: only the kept file remains (and no input is whole until read again)
         self.engine.__dict__.pop("read_whole", None)
         self.engine.triage = None
+        self.engine.discover(self.world.clock.now())   # the first pass of the new process reads the roster whole
 
     def facts(self, name="orch"):
         return [f for f in self.source() if f.recipient == name]
@@ -26670,9 +26671,14 @@ class TestAlertWake(Base):
         self.assertEqual(len(self.engine.alert_wake.told), 1)
 
     def test_an_unreadable_memory_file_is_audited_and_costs_one_repeat_not_a_crash(self):
-        (Path(self.world.state) / sb.ALERT_WAKE_FILE).write_text("{not json")
         self.add(7)
         self.go()
+        self.assertEqual(len(self.lines()), 1)
+        (Path(self.world.state) / sb.ALERT_WAKE_FILE).write_text("{not json")
+        self.restart()
+        self.go()
+        self.assertEqual(len(self.lines()), 1)   # the one repeat: the memory was lost, the issue is told again, once
+        self.go(2)
         self.assertEqual(len(self.lines()), 1)
         self.assertIn("alert_wake.error", [e["event"] for e in self.world.audit()])
 
@@ -26696,6 +26702,28 @@ class TestAlertWake(Base):
         text = self.lines()[0]
         self.assertNotIn("\n", text)
         self.assertLessEqual(len(text), 200)
+
+    def test_a_title_with_control_characters_reaches_the_line_without_them(self):
+        for char in ("\x1b", "\x00", "\x07", "\x7f", "\x9b"):
+            with self.subTest(char=repr(char)):
+                self.engine.alert_wake = None
+                (Path(self.world.state) / sb.ALERT_WAKE_FILE).unlink(missing_ok=True)
+                self.hub.open[self.repo] = {}
+                self.add(7, title="disk full %s[31mred" % char)
+                self.go()
+                text = self.lines()[0]
+                self.assertEqual(sb.ALERT_CONTROL_RE.findall(text), [])
+                self.assertIn("disk full", text)
+
+    def test_a_malformed_key_in_the_memory_file_is_dropped_and_never_aborts_the_pass(self):
+        (Path(self.world.state) / sb.ALERT_WAKE_FILE).write_text(json.dumps({
+            "acme-org/widget-service#x ops-alert": {"at": 1}, "acme-org/widget-service#3 ops-alert": {"at": 1}, "junk": {"at": 1}}))
+        self.add(7)
+        self.go()
+        self.assertEqual(sorted(self.engine.alert_wake.told), ["acme-org/widget-service#7 ops-alert"])   # #3 is not open: forgotten on the whole read
+        self.assertNotIn("junk", self.engine.alert_wake.told)
+        self.assertNotIn("acme-org/widget-service#x ops-alert", self.engine.alert_wake.told)
+        self.assertEqual(len(self.lines()), 1)
 
     def test_a_read_that_is_not_whole_wakes_nothing_and_forgets_nothing(self):
         self.add(7)
@@ -26742,11 +26770,54 @@ class TestAlertWake(Base):
         self.assertIsNone(getattr(self.engine, "alert_wake", None))
 
     def test_no_repository_without_an_orchestrator_is_remembered_and_the_first_one_is_told_when_it_appears(self):
-        self.engine.config["triage"] = dict(sb.TRIAGE_DEFAULTS, repos=[self.repo], our_logins=["bot"], alert_labels={self.repo: ["ops-alert"]})
         self.add(7)
-        self.engine.discovery.agents = {n: a for n, a in self.engine.discovery.agents.items() if n != "orch"}
+        agents = self.engine.discovery.agents
+        gone = agents.pop("orch")
         self.go()
         self.assertEqual(self.engine.alert_wake.told, {})
+        self.assertEqual(self.lines(), [])
+        agents["orch"] = gone
+        self.go()
+        self.assertEqual(len(self.lines()), 1)
+        self.assertIn("#7", self.lines()[0])
+
+    def test_every_orchestrator_of_the_repository_is_told_and_nobody_else(self):
+        self.world.add_agent("orch2", fleet={"role": "orchestrator", "charter": 3, "repo": self.repo})
+        self.engine.discover(self.world.clock.now())
+        self.add(7)
+        self.go()
+        self.assertEqual(len(self.lines("orch")), 1)
+        self.assertEqual(len(self.lines("orch2")), 1)
+        self.assertEqual(self.lines("other"), [])
+        self.assertEqual(len(self.engine.alert_wake.told), 1)
+
+    def test_a_closed_issue_is_forgotten_on_a_whole_read_and_told_again_if_it_reopens(self):
+        self.add(7)
+        self.go()
+        del self.hub.open[self.repo][7]
+        self.go()
+        self.assertEqual(self.engine.alert_wake.told, {})
+        self.add(7)
+        self.engine.alert_wake.facts.clear()
+        self.go()
+        self.assertEqual(len(self.lines()), 1)
+
+    def test_malformed_entries_of_the_memory_file_are_dropped_whatever_their_shape(self):
+        good = "acme-org/widget-service#7 ops-alert"
+        (Path(self.world.state) / sb.ALERT_WAKE_FILE).write_text(json.dumps({good: {"at": 5}, "acme-org/widget-service#8 ops-alert": "x",
+                                                                           "acme-org/widget-service#9 ops-alert": {"at": "soon"}, "acme-org/widget-service#x ops-alert": {"at": 1}}))
+        self.assertEqual(sb.AlertWakeState(self.world.state).told, {good: 5})
+
+    def test_the_memory_is_bounded(self):
+        (Path(self.world.state) / sb.ALERT_WAKE_FILE).write_text(json.dumps({"acme-org/widget-service#%d ops-alert" % n: {"at": n} for n in range(1, sb.ALERT_MEMORY_MAX + 50)}))
+        self.assertEqual(len(sb.AlertWakeState(self.world.state).told), sb.ALERT_MEMORY_MAX)
+
+    def test_a_burst_summary_is_one_line_per_repository_not_one_per_pass(self):
+        for n in range(1, 18):
+            self.add(n)
+        self.go()
+        self.go()
+        self.assertEqual(len([f for f in self.facts() if ":more:" in f.key]), 1)
 
     def test_the_alert_adds_no_github_read_of_its_own(self):
         self.go()
@@ -26788,6 +26859,9 @@ class TestAlertConfig(unittest.TestCase):
     def test_each_row_is_the_only_thing_that_rejects_its_sample(self):
         for code, _ in list(sb.ALERT_SHAPE_CHECKS):   # the mutant of each member: that row never fires, so its sample goes through
             with self.subTest(code=code):
+                section = dict(sb.TRIAGE_DEFAULTS, **ALERT_BAD_SHAPES[code])
+                fired = [c for c, f in sb.ALERT_SHAPE_CHECKS if f(section["alert_labels"], section["repos"])]
+                self.assertEqual(fired, [code])   # no other row rejects this sample
                 mutant = [(c, (lambda *a: None) if c == code else f) for c, f in sb.ALERT_SHAPE_CHECKS]
                 with mock.patch.object(sb, "ALERT_SHAPE_CHECKS", mutant):
                     sb.validate_triage_config({"triage": ALERT_BAD_SHAPES[code]}, "cfg")

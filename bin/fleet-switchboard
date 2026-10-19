@@ -14150,19 +14150,22 @@ ALERT_WAKES_PER_PASS = 5              # a burst is told in steps of this many is
 ALERT_TITLE_CHARS = 100
 ALERT_FACT_KEEP = 2 * 86400
 ALERT_MEMORY_MAX = 5000
+ALERT_KEY_RE = re.compile(r"^[^#\s]+#[0-9]+ \S.*$")
+ALERT_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
 class AlertWakeState:
     def __init__(self, state_dir):
         self.told, self.facts, self.problem = {}, {}, None
         try:
-            raw = json.loads((Path(state_dir) / ALERT_WAKE_FILE).read_text())
+            with open(str(Path(state_dir) / ALERT_WAKE_FILE), "rb") as handle:
+                raw = json.loads(handle.read(1000001).decode("utf-8"))   # a bounded read: the file is ours, but a runaway one must not be loaded whole
             if isinstance(raw, dict):
                 self.told = {k: v["at"] for k, v in list(raw.items())[:ALERT_MEMORY_MAX]
-                             if isinstance(k, str) and isinstance(v, dict) and _is_number(v.get("at"))}
+                             if isinstance(k, str) and ALERT_KEY_RE.match(k) and isinstance(v, dict) and _is_number(v.get("at"))}   # a malformed key is dropped, never parsed later
         except FileNotFoundError:
             pass
-        except (OSError, ValueError) as err:
+        except (OSError, ValueError, UnicodeError) as err:
             self.problem = "alert-wake.json cannot be read, so alert issues may be told again: %s" % _one_line(type(err).__name__, 40)
 
 
@@ -14177,7 +14180,7 @@ def alert_wake_state(engine):
 
 def alert_line(repo, number, title, label):
     """The one line the orchestrator reads. The title is the issue author's text: one line, bounded, quoted, and data (never an instruction)."""
-    return "alert issue %s#%d \"%s\" carries label %s" % (repo, number, _one_line(title, ALERT_TITLE_CHARS).replace('"', "'"), label)
+    return "alert issue %s#%d \"%s\" carries label %s" % (repo, number, _one_line(ALERT_CONTROL_RE.sub(" ", title), ALERT_TITLE_CHARS).replace('"', "'"), label)
 
 
 def alert_wake_pass(engine, state, cfg, now):
@@ -14221,6 +14224,8 @@ def alert_wake_pass(engine, state, cfg, now):
             rest = pending[ALERT_WAKES_PER_PASS:]
             if rest:
                 digest = hashlib.sha256("\n".join(p[2] for p in rest).encode()).hexdigest()[:12]
+                for old in [k for k in wake.facts if k.startswith("alert:%s:more:" % repo)]:
+                    del wake.facts[old]   # one summary line per repository: a newer count replaces one not yet delivered
                 for name in names:
                     wake.facts["alert:%s:more:%s:%s" % (repo, digest, name)] = (
                         "%d more alert issue(s) of %s will be told on the next passes" % (len(rest), repo), now, name, repo, None)
