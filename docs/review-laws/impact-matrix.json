@@ -395,9 +395,18 @@
         ]
       },
       "closure_roots": [
+        "CLEAR_NOTICE_ATTEMPTS",
+        "CLEAR_NOTICE_CLAIM_SECONDS",
+        "CLEAR_NOTICE_KINDS",
+        "CLEAR_NOTICE_PASS_MAX",
         "CLEAR_NOTIFIED_FILE",
         "CLEAR_NOTIFIED_MAX",
+        "CLEAR_PENDING_BODY_MAX",
+        "CLEAR_PENDING_FILE",
+        "CLEAR_PENDING_MAX",
+        "CLEAR_REMINDED_FILE",
         "ConfigError",
+        "DEFAULTS",
         "EXIT_ERROR",
         "EXIT_OK",
         "EXIT_USAGE",
@@ -413,6 +422,7 @@
         "Path",
         "_PLAN_ISSUE_RE",
         "_PLAN_REF_SHORT",
+        "_finite",
         "_gh_write",
         "_intent_reader",
         "_is_orchestrator",
@@ -450,7 +460,8 @@
         "subprocess",
         "sys",
         "threading",
-        "types"
+        "types",
+        "whole_skipped"
       ],
       "clear_entry_points": [
         "impact_clear_core",
