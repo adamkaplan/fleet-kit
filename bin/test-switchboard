@@ -31470,7 +31470,7 @@ class TestImpactHold(LedgerBase):
                 if isinstance(node, ast.FunctionDef) and any(isinstance(x, ast.Call) and getattr(x.func, "id", "") == "rehold_reason" for x in ast.walk(node)):
                     callers.add(node.name)
         engine = self.world.new_engine("daemon")
-        self.assertEqual(callers - {"_impact_rehold_now"} | {"_impact_rehold_now"}, set(self.readers(engine)) - {"rehold_reason", "G6", "G6b"})
+        self.assertEqual(callers, set(self.readers(engine)) - {"rehold_reason", "G6", "G6b"})
         plan_code = (BIN / "plan_ledger.py").read_text()
         self.assertEqual(plan_code.count('floor.get("rehold")'), 2, "G6 and G6b each read the gate fact's re-hold")
 
@@ -31505,6 +31505,11 @@ class TestImpactHold(LedgerBase):
             self.floor_pr(path="src/app.py", head="c" * 40)   # a third head: judged afresh
             self.passes(records=[self.listed(head="c" * 40)], advance=4000)
         self.assertTrue(self.events("impact.error"), "a failed write is said and retried, never marked done")
+        self.writes.clear()
+        self.passes(records=[self.listed(head="c" * 40)], advance=10)   # inside the back-off: nothing is tried
+        self.assertEqual(self.label_writes(), [])
+        self.passes(records=[self.listed(head="c" * 40)], advance=2 * sb.IMPACT_RETRY_SECONDS)   # after it: the write is retried and lands
+        self.assertEqual(len(self.label_writes()), 1)
 
     def test_not_whole_input_changes_nothing_and_an_unreadable_head_is_held(self):
         self.cleared_at_a_then_pushed_to_b()
@@ -31512,7 +31517,6 @@ class TestImpactHold(LedgerBase):
         engine.config, engine.state_dir, engine.gh_runner = sb.load_config(), self.world.state, self.route
         state = sb.read_impact_state(self.world.state)[0]
         self.assertTrue(sb.rehold_reason(engine, state, "acme/app", self.PR, None), "an unreadable head is held")
-        self.assertTrue(sb.rehold_reason(engine, state, "acme/app", self.PR, None), "a rating cannot rate an unreadable head")
         self.assertIsNone(sb.rehold_reason(engine, {"clears": {}, "applied": {}}, "acme/app", self.PR, None), "no recorded clear: this rule holds nothing")
         (self.world.state / "impact-hold.json").write_text("{not json")   # a corrupt state: no change from the re-hold, never a clear
         self.assertFalse(sb._impact_rehold_now(engine, "acme/app", 9, self.PR, {"head": LEDGER_NEW_HEAD}, {}))

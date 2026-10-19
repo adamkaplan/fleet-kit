@@ -20524,14 +20524,14 @@ def _impact_rehold_now(engine, repo, number, pr, report, record):
 
 
 def _impact_rehold_try(engine, repo, number, pr, report, record, now, seen):
-    """(#830) `_impact_rehold_now` for the pass: a failed write is said (`impact.error`), the retry time is set like the hold branch's, and True is returned (it IS held again, so the
-    caller never releases it)."""
+    """(#830) `_impact_rehold_now` for the pass: a failed write is said (`impact.error`), the retry time is set like the hold branch's, and "failed" is returned (it IS held again, so the
+    caller never releases it); True when the hold stands or was written, False when it is not held again."""
     try:
         return _impact_rehold_now(engine, repo, number, pr, report, record)
     except Exception as err:
         seen[(repo, number, "retry")] = now + IMPACT_RETRY_SECONDS
         engine._note("impact.error", pr, {"error": _one_line(str(err), 160), "write": True})
-        return True
+        return "failed"
 
 
 def _impact_cos(engine):
@@ -20882,8 +20882,8 @@ def impact_would_hold_pass(engine, now):
                         engine._note("impact.error", pr, {"error": _one_line(str(err), 160), "write": True})
                         unjudged += 1
                         continue
-            elif enforce and _impact_rehold_try(engine, key, number, pr, report, record, now, seen):   # (#830) cleared at an earlier head, none here: held again, never released
-                if seen.get((key, number, "retry")) == now + IMPACT_RETRY_SECONDS:   # the write failed: retried later, never marked done
+            elif enforce and (rehold := _impact_rehold_try(engine, key, number, pr, report, record, now, seen)):   # (#830) cleared at an earlier head, none here: held again, never released
+                if rehold == "failed":   # the write failed: retried later, never marked done
                     unjudged += 1
                     continue
                 budget -= 1
