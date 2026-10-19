@@ -5908,7 +5908,7 @@ class TestLaunch(Base):
                     if isinstance(node, ast.Attribute) and node.attr == "pane_close":
                         callers.add(function.name)
         # two closers, each narrow: the pane a launch opened itself, and `retire --close` (re-reads the pane, matches the agent's session, boss only)
-        self.assertEqual(callers, {"close_own_pane", "retire_close_pane"})
+        self.assertEqual(callers, {"close_own_pane", "retire_close_pane", "cmd_close_pane"})   # #838: and `close-pane` (the Chief of Staff alone, a bare shell no record names, six guards)
         for function in ast.walk(tree):
             if isinstance(function, ast.FunctionDef) and function.name == "launch_agent":
                 calls = [n.func.id for n in ast.walk(function) if isinstance(n, ast.Call)
@@ -50769,6 +50769,7 @@ class TestExternalDecisionSync(ExternalWorld):
         self.run_pass()
         self.assertEqual(self.fake.items[self.ext_of("issue")]["state"], "withdrawn")
 
+    @mock.patch.object(sb, "adoption_pass", new=lambda *a, **k: None)   # #838: a boss that is gone is replaced by an adoption within a pass; this test is about the pass that sees it unreadable first (adoption is TestAdoption's)
     def test_an_unreadable_boss_does_not_stop_an_answered_report_of_another_boss_leaving(self):
         """#80: web-orch is gone (its reports cannot be read); api-coder's answered question still leaves."""
         self.turn_on(repos=[API, WEB])

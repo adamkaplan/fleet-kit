@@ -8288,7 +8288,7 @@ BARE_PANES_FILE = "bare-panes.json"   # {pane: {"revision", "since"}}: when herd
 BARE_IDLE_DEFAULT_MINUTES = 10
 
 
-def _under(path, roots):
+def _within_any(path, roots):
     try:
         real = os.path.realpath(path)
     except (OSError, ValueError, TypeError):
@@ -8327,7 +8327,7 @@ def _guard_bare_shell(ctx):
 def _guard_worktree(ctx):
     entry = ctx["entry"] or {}
     cwds = [c for c in (entry.get("cwd"), entry.get("foreground_cwd")) if isinstance(c, str) and c]
-    if not cwds or not all(_under(c, ctx["worktrees"]) for c in cwds):
+    if not cwds or not all(_within_any(c, ctx["worktrees"]) for c in cwds):
         return "pane %s is not inside a fleet worktree (%s): never an owner's own shell" % (ctx["pane"], _one_line(", ".join(cwds) or "no cwd", 80))
     return None
 
