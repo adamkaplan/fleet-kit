@@ -22933,6 +22933,24 @@ class TestTriage(Base):
         self.go(passes=2)
         self.assertNotIn("T1 acme/api#10", self.engine.triage.seen)                  # a whole pass without it: pruned
 
+    def test_the_per_repository_marks_follow_the_real_unit_reads_and_the_records_wait_for_all_of_them(self):
+        self.charter()
+        self.add(10, created=2, labels=["kind"])
+        self.engine.discover(self.world.clock.now())
+        self.go(passes=3, enabled=True)
+        names = ["issues", "comments", "merged", "closed"]
+        self.assertEqual([sb.whole(self.engine, "%s:acme/api" % n)[0] for n in names], [True] * 4)
+        self.assertIn("T1 acme/api#10", self.engine.triage.seen)
+        self.hub.unreadable.add("acme/api")                                          # every read of the repository fails now
+        self.world.tick(sb.TRIAGE_TTL + 1)
+        self.go(passes=2)
+        self.assertEqual([sb.whole(self.engine, "%s:acme/api" % n)[0] for n in names], [False] * 4)
+        self.assertIn("T1 acme/api#10", self.engine.triage.seen)                     # kept
+        self.hub.unreadable.discard("acme/api")
+        self.world.tick(sb.TRIAGE_TTL + 1)
+        self.go(passes=3)
+        self.assertEqual([sb.whole(self.engine, "%s:acme/api" % n)[0] for n in names], [True] * 4)
+
     def test_t1_owner_missing_both_ways_and_the_grace_day(self):
         self.charter()
         self.add(10, created=2, labels=["kind"])                         # no assignee, no chain, ours (bot): T1
@@ -24679,19 +24697,44 @@ class FakeOwnerlessHub(FakeTriageHub):
 
 
 class TestTriageRuleInputs(unittest.TestCase):
-    def test_every_triage_rule_has_an_input_entry_and_only_registry_names(self):
-        for rule in sb.TRIAGE_KINDS:
-            self.assertIn(rule, sb.TRIAGE_RULE_INPUTS, "a new rule needs the inputs it judges: %s" % rule)
-        for rule, needs in sb.TRIAGE_RULE_INPUTS.items():
-            self.assertTrue(needs and set(needs) <= {"agents", "decisions", "issues"}, rule)
+    NAMES = {"agents", "decisions", "issues", "comments", "merged", "closed"}
+
+    def test_every_record_kind_the_writers_can_produce_has_an_input_entry(self):
+        kinds = set(sb.TRIAGE_KINDS)                                                 # every rule the triage can raise (a seen record is "<rule> <ref>")
+        text = (REPO / "bin" / "triage_digest.py").read_text()
+        kinds |= set(re.findall(r'"([A-Z][A-Z0-9]*) " \+', text))                    # the key prefixes the seen-memory writers build (PARKED, the T5 roll-up)
+        for kind in sorted(kinds):
+            self.assertIn(kind, sb.TRIAGE_RULE_INPUTS, "a record kind needs the inputs it judges: %s" % kind)
+        for kind, needs in sb.TRIAGE_RULE_INPUTS.items():
+            self.assertTrue(needs and set(needs) <= self.NAMES, kind)
+        for kind in sb.TRIAGE_KINDS:                                                 # a rule that judges ours-or-not reads the running agents
+            if kind not in ("T5", "T6", "T10"):
+                self.assertIn("agents", sb.TRIAGE_RULE_INPUTS[kind], kind)
+
+    def keep_engine(self, **marks):
+        engine = types.SimpleNamespace(read_whole={}, _note=lambda *a, **k: None)
+        for name, ok in marks.items():
+            sb.read_mark(engine, name.replace("__", ":").replace("acme_api", "acme/api"), ok, "" if ok else "why", 1.0)
+        return engine
 
     def test_the_prune_keeps_the_records_of_a_rule_the_table_does_not_know(self):
-        engine = types.SimpleNamespace(read_whole={}, _note=lambda *a, **k: None)
-        sb.read_mark(engine, "issues:acme/api", True, "", 1.0)
-        keep = sb.triage_digest_keep(engine)
+        keep = sb.triage_digest_keep(self.keep_engine(agents=True, issues__acme_api=True))
         self.assertFalse(keep("T2", "acme/api#1"))
         with mock.patch.dict(sb.TRIAGE_RULE_INPUTS, {}, clear=True):
             self.assertTrue(keep("T2", "acme/api#1"))                                # unknown: kept
+
+    def test_the_other_owner_flag_and_each_rule_are_kept_while_an_input_it_judges_is_not_whole(self):
+        for kind, needs in sorted(sb.TRIAGE_RULE_INPUTS.items()):
+            for bad in needs:
+                with self.subTest(kind=kind, bad=bad):
+                    engine = types.SimpleNamespace(read_whole={}, _note=lambda *a, **k: None)
+                    for name in needs:
+                        key = name if name in ("agents", "decisions") else "%s:acme/api" % name
+                        sb.read_mark(engine, key, name != bad, "" if name != bad else "why", 1.0)
+                    self.assertTrue(sb.triage_digest_keep(engine)(kind, "acme/api#1"))   # the not-whole input keeps it
+                    for name in needs:
+                        sb.read_mark(engine, name if name in ("agents", "decisions") else "%s:acme/api" % name, True, "", 2.0)
+                    self.assertFalse(sb.triage_digest_keep(engine)(kind, "acme/api#1"))  # all whole: it may be pruned
 
 
 class TestReadWholeAuditTable(unittest.TestCase):

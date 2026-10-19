@@ -12526,10 +12526,11 @@ TRIAGE_KINDS = {"T1": "owner missing", "T2": "required label missing", "T3": "no
                 "T8": "blocked ask", "T9": "ask with no activity", "T10": "closed but still labelled awaiting",
                 "T11": "orphan", "T12": "plan issue still open after its PR merged", "OO": "other-owner (flag only)"}
 # #805: the inputs each rule judges, in ONE table: the candidates a pass drops and the records the prune keeps are both read from it, so they cannot drift.
-# A name is a registry input; "issues" stands for the issue list of the item's own repository (`issues:<repo>`).
-TRIAGE_RULE_INPUTS = {"T1": ("agents", "issues"), "T2": ("issues",), "T3": ("issues",), "T5": ("decisions", "issues"), "T6": ("decisions", "issues"),
-                      "T7": ("issues",), "T8": ("issues",), "T9": ("issues",), "T10": ("issues",), "T11": ("agents", "issues"),
-                      "T12": ("issues",), "OO": ("issues",), "PARKED": ("issues",)}
+# A rule that judges whether an item is OURS (every one but T5, T6 and T10) also needs `agents`: ownership comes from the running agents.
+TRIAGE_RULE_INPUTS = {"T1": ("agents", "issues"), "T2": ("agents", "issues"), "T3": ("agents", "issues", "comments"), "T5": ("decisions", "issues"),
+                      "T6": ("decisions", "issues"), "T7": ("agents", "issues", "comments"), "T8": ("agents", "issues"), "T9": ("agents", "issues"),
+                      "T10": ("closed",), "T11": ("agents", "issues"), "T12": ("agents", "issues", "merged"), "OO": ("agents", "issues"),
+                      "PARKED": ("issues",)}   # "agents" and "decisions" are global; the others are per repository (`<name>:<repo>`)
 TRIAGE_T10_GRACE = 600         # seconds after a close in which a still-set awaiting label is not yet a finding
 TRIAGE_TTL = 900               # seconds a unit read is kept
 TRIAGE_CALLS_PER_PASS = TRIAGE_DEFAULTS["calls_per_pass"]   # default of `triage.calls_per_pass` (reads and fresh checks alike)
@@ -13304,19 +13305,31 @@ def mark_decisions_read(engine, errors, now):
     read_mark(engine, "decisions", not errors and notices, why, now)
 
 
+def triage_mark_unit(engine, state, name, repo, units, now):
+    """Mark `<name>:<repo>` from the held units of that kind: whole only when every one is held, without error and not cut."""
+    bad = None
+    for unit_name in units:
+        unit = state.units.get((repo, unit_name))   # a unit never read, a failed read or a cut list is no evidence of an absence
+        if unit is None:
+            bad = "%s not read yet" % unit_name
+        elif unit.get("error"):
+            bad = "the last read of %s failed: %s" % (unit_name, unit["error"])
+        elif unit.get("truncated"):
+            bad = "the %s list was cut" % unit_name
+        if bad:
+            break
+    read_mark(engine, "%s:%s" % (name, repo), bad is None, bad or "", now)
+
+
 def triage_mark_reads(engine, state, repos, errors, now):
     """The inputs the triage rules judge, marked from the reads this pass already made (no new read)."""
     mark_decisions_read(engine, errors, now)
+    closed = ["closed:" + l for l in sorted(triage_awaiting_labels(engine))]
     for repo in repos:
-        unit = state.units.get((repo, "issues"))
-        if unit is None:
-            read_mark(engine, "issues:" + repo, False, "not read yet", now)
-        elif unit.get("error"):
-            read_mark(engine, "issues:" + repo, False, "the last read failed: %s" % unit["error"], now)
-        elif unit.get("truncated"):
-            read_mark(engine, "issues:" + repo, False, "the list was cut", now)
-        else:
-            read_mark(engine, "issues:" + repo, True, "", now)
+        triage_mark_unit(engine, state, "issues", repo, ["issues"], now)
+        triage_mark_unit(engine, state, "comments", repo, ["comments"], now)
+        triage_mark_unit(engine, state, "merged", repo, ["merged"], now)
+        triage_mark_unit(engine, state, "closed", repo, closed, now)
 
 
 def triage_owner_tier_t6(engine, decisions):
@@ -13499,8 +13512,8 @@ def triage_digest_keep(engine):
         if needs is None:
             return True   # a rule the table does not know: nothing about it is forgotten
         repo = ref.rpartition("#")[0]
-        return any(whole_skipped(engine, "triage.prune", ("issues:" + repo) if name == "issues" else name)
-                   for name in needs if name != "issues" or repo)
+        return any(whole_skipped(engine, "triage.prune", name if name in ("agents", "decisions") else "%s:%s" % (name, repo))
+                   for name in needs if name in ("agents", "decisions") or repo)
     return keep
 
 
