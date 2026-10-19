@@ -852,12 +852,10 @@ class Launcher:
                 res = self.run_hook(name)
             except CloudError as e:
                 res = {"pushed": False, "wip_branch": None, "error": str(e)}
-            try:  # the hook's answer reaches the record (a second atomic write), before the pod is kept or deleted
-                self._hook_record(info, {"ran": True, "pushed": bool(res.get("pushed")), "wip_branch": res.get("wip_branch"),
-                                         "skipped": [self.kube.scrub(x, 200) for x in res["skipped"]][:50] if isinstance(res.get("skipped"), list) else [],
-                                         "note": self.kube.scrub(res.get("note") or ""), "error": self.kube.scrub(res.get("error") or "")})
-            except Exception:
-                pass
+            self.last_hook = {"pushed": bool(res.get("pushed")), "wip_branch": res.get("wip_branch"), "error": self.kube.scrub(res.get("error") or "")}
+            self._hook_record(info, {"ran": True, "pushed": bool(res.get("pushed")), "wip_branch": res.get("wip_branch"),
+                                     "skipped": [self.kube.scrub(x, 200) for x in res["skipped"]][:50] if isinstance(res.get("skipped"), list) else [],
+                                     "note": self.kube.scrub(res.get("note") or ""), "error": self.last_hook["error"]})
             if res.get("error"):
                 self.kube.annotate(name, kept="true")  # the pod is kept: the commit is not safe yet
                 raise CloudError("end hook could not push, pod kept: %s" % res["error"], EXIT_HOOK)
@@ -901,7 +899,10 @@ class Launcher:
 
     def _hook_record(self, info, hook):
         if info.get("record"):
-            self.recorder.add_hook(info["record"], hook)
+            try:
+                self.recorder.add_hook(info["record"], hook)
+            except Exception:   # add_hook never raises; a stop is never held back by the record
+                pass
 
     def prune_records(self, a):
         """Remove run records older than --days (default CW_RECORD_KEEP_DAYS, else 30): only this tool's per-run directories."""
@@ -1021,7 +1022,7 @@ class Launcher:
     def reap(self):
         """One pass: stop every pod past its hard deadline or idle too long. Returns [(worker, reason, exit)]."""
         out, now = [], self.clock()
-        self.reap_results = {}
+        self.reap_results, self.last_hook = {}, None
         for pod in self.kube.list_pods():
             worker = ann(pod, "worker")
             reason = None
@@ -1042,11 +1043,13 @@ class Launcher:
                 if act and not act[0] and act[1] is not None and (now - act[1]).total_seconds() >= int(ann(pod, "idle-seconds", "600")):
                     reason = "idle"
             if reason:
+                self.last_hook = None
                 try:
                     res = self.stop(argparse.Namespace(worker=worker, reason=reason), reason)
                     self.reap_results[worker] = {k: res.get(k) for k in ("pushed", "wip_branch", "skipped", "record")}
                     out.append((worker, reason, 0))
                 except CloudError as e:
+                    self.reap_results[worker] = dict(self.last_hook or {})
                     out.append((worker, reason, e.code))
         return out
 

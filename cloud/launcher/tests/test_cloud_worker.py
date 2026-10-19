@@ -487,12 +487,48 @@ class S5EndHook(Base):
         work, _ = make_repo(self.tmp.name, "r", dirty=True)
         self.patch_state(hook_env={"CW_WORKDIR": work, "CW_WORKER": "coder7"})
         self.create("coder7")
-        orig = cw.run_record.Recorder.add_hook
+        orig = cw.run_record.Recorder.__dict__["add_hook"]
         cw.run_record.Recorder.add_hook = staticmethod(lambda d, h: (_ for _ in ()).throw(OSError("full")))
         self.addCleanup(setattr, cw.run_record.Recorder, "add_hook", orig)
         code, out, _ = self.run_cli("stop", "coder7")
         self.assertEqual((code, json.loads(out)["pushed"]), (0, True))
         self.assertIsNone(self.pod())
+
+    def test_a_failed_reaper_stop_still_prints_what_the_hook_said(self):
+        work, _ = make_repo(self.tmp.name, "r", dirty=True)
+        subprocess.run(["git", "-C", work, "remote", "set-url", "origin", os.path.join(self.tmp.name, "gone.git")], check=True)
+        self.patch_state(hook_env={"CW_WORKDIR": work, "CW_WORKER": "coder7"})
+        self.create("coder7", "--hard", "1h")
+        self.set_activity("coder7", True, T0)
+        self.clock.advance(hours=2)
+        row = json.loads(self.run_cli("reap")[1])[0]
+        self.assertEqual((row["exit"], row["pushed"], bool(row["error"])), (1, False, True))
+
+    def test_a_record_update_that_fails_says_so_once(self):
+        err = io.StringIO()
+        with redirect_stderr(err):
+            cw.run_record.Recorder.add_hook(os.path.join(self.tmp.name, "absent"), {"ran": True})
+        self.assertEqual(err.getvalue().count("run record not updated with the end hook result"), 1)
+
+    def test_no_record_means_no_end_hook_write(self):
+        work, _ = make_repo(self.tmp.name, "r", dirty=True)
+        self.patch_state(hook_env={"CW_WORKDIR": work, "CW_WORKER": "coder7"})
+        self.create("coder7")
+        code, out, _ = self.run_cli("stop", "coder7", "--no-record")
+        self.assertEqual((code, json.loads(out)["pushed"]), (0, True))
+        self.assertFalse(os.path.isdir(os.path.join(os.path.dirname(self.env["CW_CLOUD_AUDIT"]), "runs")))
+
+    def test_the_reaper_says_why_it_exits_once_on_a_plain_error(self):
+        orig = cw.Launcher.reap
+        cw.Launcher.reap = lambda self_: (_ for _ in ()).throw(RuntimeError("boom"))
+        self.addCleanup(setattr, cw.Launcher, "reap", orig)
+        with self.assertRaises(RuntimeError):
+            self.run_cli("reap")
+        # the line is written by the finally block; run_cli's stderr is discarded on a raise, so call directly
+        err = io.StringIO()
+        with redirect_stderr(err), redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
+            cw.main(["reap"], self.env, self.clock, lambda s: None)
+        self.assertEqual(err.getvalue().count("reaper exiting: error: boom"), 1)
 
     def test_the_reaper_says_why_it_exits_once(self):
         code, _, err = self.run_cli("reap")

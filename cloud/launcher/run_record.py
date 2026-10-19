@@ -30,6 +30,7 @@ import shutil
 import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -363,8 +364,8 @@ class Recorder:
                 info = json.load(f)
             info["end_hook"] = hook
             write_private(directory, "run.json", json.dumps(info, sort_keys=True) + "\n")
-        except Exception:
-            pass
+        except Exception as e:   # the stop goes on, but the gap is said once
+            print("cloud-worker: run record not updated with the end hook result: %s" % type(e).__name__, file=sys.stderr)
 
     def _write_transcript(self, directory, msgs, info):
         cap = int(self.env.get("CW_RECORD_MAX_BYTES") or TRANSCRIPT_CAP)
