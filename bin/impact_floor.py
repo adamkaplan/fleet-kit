@@ -545,6 +545,16 @@ def validate_hold_config(raw):
             raise ValueError("'impact_hold.repos.%s' must be {\"enabled\": true|false}" % name)
 
 
+CARRY_NEVER_PATHS = (   # (#815) the clear's own code and the impact matrix: a clear is NEVER carried over a conflict-resolving merge that touches one, nor for a pull request that changes one.
+    "bin/chat_clear.py",                      # ONE table: the carry reads it, and a test checks it against the matrix's `clear_code_paths` and against every bin/ file named for the clear or the hold
+    "bin/clear_carry.py",
+    "bin/delegated_clear.py",
+    "bin/impact_floor.py",
+    "bin/impact_hold.py",
+    "docs/review-laws/impact-matrix.json",
+)
+
+
 def carry_enabled(config, repo):
     """True only when the owner turned `impact_hold.carry_clear` on (the default is OFF) and the hold itself is enforced for `repo`: an owner's clear then carries over a pure merge
     of main (see bin/clear_carry.py). Anything else, a string or 1 included, is off."""

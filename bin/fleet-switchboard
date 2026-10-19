@@ -20648,6 +20648,22 @@ def impact_records(state_dir):
     return found, None
 
 
+def impact_carry_marks(state_dir):
+    """({(pr, head): n}, problem): how many reviewer records at each pull request and head carry a confirmation for a conflict-resolving carry (#815). Read with the ledger, whole or not at
+    all; it only decides when the carry is tried again, never whether it holds (the carry reads the ledger itself)."""
+    try:
+        entries, problem = plan_ledger.read_ledger(state_dir)
+    except Exception as err:
+        return {}, "%s: %s" % (type(err).__name__, _one_line(str(err), 100))
+    if problem:
+        return {}, _one_line(str(problem), 120)
+    found = {}
+    for entry in entries:
+        if entry.get("kind") == "review_record" and entry.get("carry_confirmed") is True:
+            found[(entry.get("pr"), entry.get("head"))] = found.get((entry.get("pr"), entry.get("head")), 0) + 1
+    return found, None
+
+
 def _impact_cos(engine):
     discovery = getattr(engine, "discovery", None)
     agents = getattr(discovery, "agents", None) or {}
@@ -20927,6 +20943,7 @@ def impact_would_hold_pass(engine, now):
     hold_cfg = (engine.config.get("impact_hold") or {}) if isinstance(engine.config, dict) else {}
     budget = hold_cfg.get("calls_per_pass", cfg.get("calls_per_pass", IMPACT_PASS_CALLS))   # `impact_hold.calls_per_pass` wins when set
     records, records_problem = impact_records(engine.state_dir)
+    marks = impact_carry_marks(engine.state_dir)[0]
     unjudged, live = 0, set()
     for key, (_, listed) in sorted(state.lists.items()):
         for record in listed:
@@ -20964,7 +20981,7 @@ def impact_would_hold_pass(engine, now):
                 return
             if not globs:
                 continue
-            signature = (head, rule, "unreadable" if records_problem else records.get((pr, head)))
+            signature = (head, rule, "unreadable" if records_problem else records.get((pr, head))) + ((marks[(pr, head)],) if (pr, head) in marks else ())   # (#815) a new confirmation re-judges
             if seen.get((key, number)) == signature:
                 continue
             if budget <= 0:
@@ -21007,7 +21024,7 @@ def impact_would_hold_pass(engine, now):
                     engine._note("impact.error", pr, {"error": _one_line(str(err), 160), "write": True})
                     unjudged += 1
                     continue
-            seen[(key, number)] = (report["head"] or head, rule, "unreadable" if records_problem else records.get((pr, report["head"] or head)))
+            seen[(key, number)] = (report["head"] or head, rule, "unreadable" if records_problem else records.get((pr, report["head"] or head))) + ((marks[(pr, report["head"] or head)],) if (pr, report["head"] or head) in marks else ())
             reports[(key, number)] = report
     _impact_matrix_recovered(engine, now)   # the file and the floor of every repo were read this pass: a standing episode is over
     if not unjudged and not records_problem and any(impact_floor.hold_mode(engine.config, key) == "enforce" for key, _ in live):
@@ -22215,6 +22232,8 @@ def cmd_review(args, runner, now):
             raise ReviewError("an approve cannot carry blocking findings (%d given)" % args.blocks)
         if args.verdict == "request-changes" and not args.blocks:
             raise ReviewError("request-changes needs at least 1 blocking finding (a finding that cites no rule never blocks)")
+        if getattr(args, "confirms_carry", False) and args.verdict != "approve":
+            raise ReviewError("--confirms-carry belongs to an approve: a reviewer who found a change to the pull request's own lines does not confirm it")
         if args.impact_action and args.reviewer != "impact":
             raise ReviewError("--impact-action belongs to the impact reviewer")
         impact_class = (getattr(args, "impact_class", None) or "").strip().lower() or None
@@ -22246,6 +22265,8 @@ def cmd_review(args, runner, now):
         entry = {"kind": "review_record", "pr": ref, "head": head, "reviewer": args.reviewer, "verdict": args.verdict,
                  "blocks": args.blocks, "notes": args.notes, "by": by,
                  "summary": plan_ledger.clip(redact_command_text(args.summary or ""), 200)}
+        if getattr(args, "confirms_carry", False):
+            entry["carry_confirmed"] = True   # (#815) read by `impact_hold.carry_confirmer`: only a reviewer's own record at the head it judged
         if args.impact_action:
             entry["impact_action"] = args.impact_action
         if impact_class:
@@ -22475,6 +22496,8 @@ def add_review_parsers(sub):
     record.add_argument("--impact-action", dest="impact_action", choices=("hold", "second-review", "none"),
                         help="The impact reviewer's action from the matrix")
     record.add_argument("--impact-class", dest="impact_class", help="The class of the impact that drives the action (a class of the matrix file's owner_hold block)")
+    record.add_argument("--confirms-carry", dest="confirms_carry", action="store_true",
+                        help="(#815) With an approve: the resolution of a conflict in a merge of main touched no line this pull request adds or removes, so the owner's clear may carry to this head")
     record.add_argument("--summary", help="One line (at most 200 characters)")
     checkout = rsub.add_parser("checkout", help="Write the PR's exact head tree, its diff and the base copies of the touched files into .review/<head sha> here, read-only, and print the path; --remove <dir> removes one")
     checkout.add_argument("pr", nargs="?", help="owner/repo#N or the PR's URL")

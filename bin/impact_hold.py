@@ -22,6 +22,7 @@ MOVED = ('gate_floor_fact',
          '_labels_ours',
          '_apply_impact_hold_locked',
          'clear_fingerprint',
+         'carry_confirmer',
          'marker_edit',
          'neutralise_marker',
          '_plan_issue_of',
@@ -77,7 +78,7 @@ def read_impact_state(state_dir):
     if not isinstance(raw, dict):
         return empty, "%s is not an object" % IMPACT_STATE_FILE
     found = {k: raw[k] if isinstance(raw.get(k), dict) else {} for k in ("clears", "applied")}
-    for extra in ("posted", "matrix_error", "carried", "carry_void"):   # only when the file has them: a state file that never had them reads exactly as it always did
+    for extra in ("posted", "matrix_error", "carried", "carry_void", "carry_wait"):   # only when the file has them: a state file that never had them reads exactly as it always did
         if isinstance(raw.get(extra), dict):
             found[extra] = raw[extra]   # posted, matrix_error: slice 3 (#451); carried, carry_void: the carry (#510)
     return found, None
@@ -131,7 +132,11 @@ def impact_carry_decision(engine, repo, number, head):
         if (state.get("carried", {}).get(pr) or {}).get("head") == head or (state.get("carry_void", {}).get(pr) or {}).get("head") == head:
             return None   # decided once per new head: no repeated reads and no repeated audit lines
         runner = getattr(engine, "gh_runner", None) or subprocess.run
-        return load_module("clear_carry").decide(impact_carry_get(engine, runner, repo), repo, number, cleared["head"], cleared.get("fingerprint"), head)
+        waiting = state.get("carry_wait", {}).get(pr) or {}
+        if waiting.get("head") == head and (impact_carry_marks(engine.state_dir)[0].get((pr, head)) or 0) <= waiting.get("marks", 0):
+            return None   # waiting for a reviewer's confirmation at this head, and none is recorded: nothing to read yet (a new record at this head wakes it)
+        return load_module("clear_carry").decide(impact_carry_get(engine, runner, repo), repo, number, cleared["head"], cleared.get("fingerprint"), head,
+                                                 lines_fingerprint=cleared.get("lines_fingerprint"), confirm=carry_confirmer(engine, repo, number), protected=impact_floor.CARRY_NEVER_PATHS)
     except Exception as err:
         engine._note("impact.carry_error", "%s#%d" % (repo, number), {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
         return None
@@ -194,16 +199,36 @@ def _apply_impact_hold_locked(engine, repo, number, report, record, carry=None):
         return 0   # carried already for this head (and the owner has not switched the carry off since)
     if carry is not None and cleared.get("head") == carry["from"]:
         if carry["carried"]:
-            state.setdefault("carried", {})[pr] = {"head": head, "from": carry["from"], "fingerprint": carry["fingerprint"], "at": int(engine.now())}
+            record_carried = {"head": head, "from": carry["from"], "fingerprint": carry["fingerprint"], "at": int(engine.now())}
+            detail = {"head": head, "from": carry["from"], "fingerprint": carry["fingerprint"], "why": "only main was merged in: the pull request's own change is the one the owner cleared"}
+            if carry.get("route") == "lines":   # (#815) a conflict was resolved by hand: the audit names both heads, the fingerprints and the reviewer's confirmation
+                extra = {"route": "lines", "lines_fingerprint": carry["lines_fingerprint"], "confirmation": carry["confirmation"]}
+                record_carried.update(extra)
+                detail.update(extra, why="a conflict with main was resolved by hand: the lines the pull request adds and removes are the ones the owner cleared, and an independent reviewer confirmed the resolution touched none of them")
+            names = label_names(engine.config)
+            lifted = _labels_ours(names, state, pr)   # the labels this daemon put on this head while the confirmation was missing (none on a pure merge)
+            state.setdefault("carried", {})[pr] = record_carried
             state.setdefault("carry_void", {}).pop(pr, None)
+            state.setdefault("carry_wait", {}).pop(pr, None)
+            state["applied"].pop(pr, None)
             write_impact_state(engine.state_dir, state)
-            engine.audit.append(engine.actor, "gate.clear_carried", pr, {"head": head, "from": carry["from"], "fingerprint": carry["fingerprint"],
-                                                                         "why": "only main was merged in: the pull request's own change is the one the owner cleared"})
+            engine.audit.append(engine.actor, "gate.clear_carried", pr, detail)
+            if lifted:
+                live = read_pr_json(engine, repo, number).get("labels")
+                have = {(l.get("name") if isinstance(l, dict) else l) for l in (live if isinstance(live, list) else [])}
+                remove = [l for l in lifted if l in have]
+                if remove:
+                    change_issue_labels(engine, getattr(engine, "gh_runner", None) or subprocess.run, repo, number, remove=remove)
+                    engine.audit.append(engine.actor, "gate.hold_released", pr, {"head": head, "removed": remove, "reasons": ["the owner's clear carried to this head"]})
             return 0
-        state.setdefault("carry_void", {})[pr] = {"head": head, "reason": _one_line(carry["reason"] or "", 200)}
-        _consume_record(state, pr, cleared)   # the clear took the daemon's labels off: an older record of them is no longer a claim
-        write_impact_state(engine.state_dir, state)
-        engine.audit.append(engine.actor, "gate.clear_carry_void", pr, {"head": head, "from": carry["from"], "reason": _one_line(carry["reason"] or "", 200)})
+        if carry.get("waiting"):   # (#815) only the reviewer's confirmation is missing at this head: not a void (it may still arrive), and the hold below stands meanwhile
+            state.setdefault("carry_wait", {})[pr] = {"head": head, "marks": impact_carry_marks(engine.state_dir)[0].get((pr, head)) or 0, "reason": _one_line(carry["reason"] or "", 200)}
+            write_impact_state(engine.state_dir, state)
+        else:
+            state.setdefault("carry_void", {})[pr] = {"head": head, "reason": _one_line(carry["reason"] or "", 200)}
+            _consume_record(state, pr, cleared)   # the clear took the daemon's labels off: an older record of them is no longer a claim
+            write_impact_state(engine.state_dir, state)
+            engine.audit.append(engine.actor, "gate.clear_carry_void", pr, {"head": head, "from": carry["from"], "reason": _one_line(carry["reason"] or "", 200)})
     names = label_names(engine.config)
     raw = read_pr_json(engine, repo, number)   # the labels NOW, under the lock: the record claims only what this write adds, never a label that was already there
     live = raw.get("labels")
@@ -232,21 +257,59 @@ def _apply_impact_hold_locked(engine, repo, number, report, record, carry=None):
 
 
 def clear_fingerprint(engine, runner, repo, number, head):
-    """(fingerprint, problem): the fingerprint of the pull request's own change at `head`, stored WITH a clear so a later pure merge of main can carry it (bin/clear_carry.py).
-    Only when `impact_hold.carry_clear` is on (the default is off: a clear then records nothing new). The ONE function `clear_carry.own_change_fingerprint` computes it, here and at the
-    carry. A change that cannot be read in full, or a head that moved while it was read, records NO fingerprint (so nothing carries) and never stops the clear."""
+    """(fingerprint, problem, lines_fingerprint): the fingerprints of the pull request's own change at `head`, stored WITH a clear so a later merge of main can carry it (bin/clear_carry.py): the full
+    one (a pure merge of main) and the lines-only one (a merge that resolved a conflict, #815). Only when `impact_hold.carry_clear` is on (the default is off: a clear then records nothing new).
+    The ONE function `clear_carry.own_change_fingerprint` computes both, here and at the carry. A change that cannot be read in full, or a head that moved while it was read, records NO
+    fingerprint (so nothing carries) and never stops the clear; a lines-only fingerprint that cannot be read leaves the full one in place."""
     if not impact_floor.carry_enabled(engine.config, repo):
-        return None, None
+        return None, None, None
     cc = load_module("clear_carry")
+    get = impact_carry_get(engine, runner, repo)
     try:
-        fingerprint, fp_head, _ = cc.own_change_fingerprint(impact_carry_get(engine, runner, repo), repo, number)
+        fingerprint, fp_head, _ = cc.own_change_fingerprint(get, repo, number)
     except cc.CarryVoid as err:
-        return None, _one_line(str(err), 200)
+        return None, _one_line(str(err), 200), None
     except Exception as err:
-        return None, _one_line("%s: %s" % (type(err).__name__, err), 200)
+        return None, _one_line("%s: %s" % (type(err).__name__, err), 200), None
     if fp_head != head:
-        return None, "the head moved while its change was being read"
-    return fingerprint, None
+        return None, "the head moved while its change was being read", None
+    try:
+        lines_fingerprint, lines_head, _ = cc.own_change_fingerprint(get, repo, number, lines=True)
+    except Exception:   # CarryVoid or any other trouble: the conflict-resolving carry has nothing to compare against, the pure carry is unaffected
+        return fingerprint, None, None
+    return fingerprint, None, lines_fingerprint if lines_head == head else None
+
+
+def carry_confirmer(engine, repo, number):
+    """`confirm(head)` for `clear_carry.decide` (#815): the reference (`ledger entry <seq> <hash prefix> by <name>`) of the independent reviewer's confirmation recorded for EXACTLY `head`,
+    else CarryVoid. A confirmation is a `review_record` of this pull request with `carry_confirmed` and an `approve` verdict, at this head (the ledger binds a record to the head it
+    judged, so a record from before this head existed, or for another head, never matches), and it counts only when the newest record of its writer for that role at that head still
+    is one, its writer is registered under `plan_evaluators.reviewer`, is a named agent (never the person's own terminal) and is not a writer of the pull request (the author GitHub
+    reports, whoever recorded a proof for it, the senders of its notice). Nothing in a comment, a label or a body counts."""
+    cc = load_module("clear_carry")
+
+    def confirm(head):
+        pr = "%s#%d" % (repo, number)
+        entries, problem = plan_ledger.read_ledger(engine.state_dir)
+        if problem:
+            raise cc.CarryVoid("the ledger cannot be read in full (%s)" % _one_line(str(problem), 80))
+        newest = {}
+        for entry in entries:
+            if entry.get("kind") == "review_record" and entry.get("pr") == pr and entry.get("head") == head:
+                newest[(entry.get("by"), entry.get("reviewer"))] = entry
+        found = [e for e in newest.values() if e.get("carry_confirmed") is True and e.get("verdict") == "approve"]
+        if not found:
+            raise cc.CarryVoid("no confirmation at this head")
+        raw = read_pr_json(engine, repo, number)
+        item = next((i for i in read_pr_notices(engine.state_dir) if i["repo"] == repo and i["number"] == number), None)
+        authors = plan_ledger.authors_of(entries, pr, notice_senders(item) if item else [], pr_facts_from(raw).get("author"))
+        registered = ((engine.config.get("plan_evaluators") or {}).get("reviewer") or []) if isinstance(engine.config, dict) else []
+        for entry in sorted(found, key=lambda e: e["seq"], reverse=True):
+            by = entry.get("by")
+            if isinstance(by, str) and by and by != "person" and by in registered and by not in authors:
+                return "ledger entry %d %s by %s" % (entry["seq"], str(entry.get("hash"))[:12], by)
+        raise cc.CarryVoid("no confirmation at this head by a registered reviewer who is not a writer of the pull request")
+    return confirm
 
 
 def marker_edit(body):
@@ -515,7 +578,7 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
         raise NoticeError("the PR's head moved since the owner was shown it (%s, not %s): nothing was cleared" % (current[:8], head[:8]))
     if verify is not None:
         verify(raw)
-    fingerprint, fingerprint_problem = clear_fingerprint(engine, runner, repo, number, current)
+    fingerprint, fingerprint_problem, lines_fingerprint = clear_fingerprint(engine, runner, repo, number, current)
     names = label_names(engine.config)
     if remove is not None:
         cc = load_module("chat_clear")
@@ -545,6 +608,8 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
         state.get("carry_void", {}).pop(pr, None)
         if fingerprint is not None:
             state["clears"][pr]["fingerprint"] = fingerprint
+            if lines_fingerprint is not None:
+                state["clears"][pr]["lines_fingerprint"] = lines_fingerprint
         elif fingerprint_problem:
             state["clears"][pr]["fingerprint_problem"] = fingerprint_problem
         write_impact_state(engine.state_dir, state)   # the clear first: a failed removal never leaves a hold the daemon would re-add
