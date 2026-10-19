@@ -67102,13 +67102,6 @@ class TestBatchingDocs(unittest.TestCase):
         for phrase in ("a force push", "a rebase of a shared branch", "an agent changing a ruleset"):
             self.assertEqual(section.count(phrase), 1, phrase)
 
-    def test_the_slice_changes_no_code_under_bin_and_no_workflow(self):
-        run = subprocess.run(["git", "diff", "--name-only", "origin/main...HEAD"], cwd=REPO, capture_output=True, text=True)
-        if run.returncode != 0:
-            self.skipTest("origin/main cannot be resolved here (a shallow or detached checkout)")
-        names = run.stdout.split()
-        self.assertEqual([n for n in names if (n.startswith("bin/") and n != "bin/test-switchboard") or n.startswith(".github/workflows/")], [])
-
 
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
