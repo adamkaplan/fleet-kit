@@ -17,11 +17,13 @@ OLDEST = 5
 REASONS = ("call budget", "failed read", "not read yet")
 
 
-def is_claimed(item, ctx):
+def is_claimed(item, ctx, lanes=None):
     """The ONE definition of an issue with an owner that T1 and this summary share: assigned, below a charter, named by an `Owner:` line, owned by a running agent, or
-    whose owner cannot be told yet (its parent chain leaves the issues read). `ctx` is the triage context of the repository."""
+    whose owner cannot be told yet (its parent chain leaves the issues read). `ctx` is the triage context of the repository. `lanes` (None for T1 and for a repository with no
+    label map) makes the `Owner:` line count only when its first name is one of those known lanes."""
     number = item["number"]
-    return bool(item["assignees"] or number in ctx["chain"] or item.get("owner_body", False) or number in ctx["owned"] or number in ctx["unresolved"])
+    named = item.get("owner_body", False) if lanes is None else lane_named(item, lanes)
+    return bool(item["assignees"] or number in ctx["chain"] or named or number in ctx["owned"] or number in ctx["unresolved"])
 
 
 def claim_label(labels, patterns):
@@ -49,10 +51,9 @@ def ownerless_stale(items, ctx, ours_logins, patterns, now, days=DEFAULT_DAYS, l
     for number, item in items.items():
         if item.get("pr") or item.get("state") != "open":
             continue
-        if strict and (label_owned(item["labels"], label_owners) or lane_named(item, lanes)):
+        if strict and label_owned(item["labels"], label_owners):
             continue
-        claimed = is_claimed(dict(item, owner_body=False), ctx) if strict else is_claimed(item, ctx)
-        if claimed or claim_label(item["labels"], patterns) or item["author"] in ours_logins:
+        if is_claimed(item, ctx, lanes if strict else None) or claim_label(item["labels"], patterns) or item["author"] in ours_logins:
             continue
         quiet = (now - item["updated"]) / 86400.0
         if quiet >= days:

@@ -25116,6 +25116,16 @@ class TestOwnerlessSummary(Base):
             self.world.tick(86400 + 10)
             sb.triage_state(self.engine).units.pop((self.TEAM, "ownerless"), None)
 
+    def test_label_and_lane_match_ignore_case_and_leading_punctuation(self):
+        self.with_map({"Lane:Alpha": "alpha-lane"})
+        self.add(20, created=10, author="alice", labels=["lane:alpha"])
+        self.add(21, created=10, author="alice", body="Owner: @Orch-Web-1 (primary)\n")
+        self.add(22, created=10, author="alice")
+        self.go(1)
+        (line,) = self.lines("cos")
+        self.assertEqual(self.count_in(line), 1)
+        self.assertIn("/issues/22", line)
+
     def test_a_bad_label_owners_shape_is_a_named_error(self):
         for bad in ({"repos": {"acme/web": {"label_owners": ["x"]}}}, {"repos": {"acme/web": {"label_owners": {"x": 3}}}},
                     {"repos": {"acme/web": {"label_owners": {"": "lane"}}}}, {"repos": {"acme/web": {"nope": {}}}}, {"repos": {"not a repo": {}}}):
