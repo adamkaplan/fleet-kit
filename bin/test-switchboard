@@ -25087,8 +25087,11 @@ class TestIdentityCheck(ReportBase):
     def test_an_unexpected_error_on_a_read_repository_call_refuses_and_the_same_error_without_one_is_as_before(self):
         """#618 PC-2: for a call that carries a read_repo, ANY unexpected exception in account_env refuses (never the inherited or stored token), one line naming the
         cause class; the same exception on a call without read_repo keeps today's answer (None). One case per distinct failing step of the read route."""
-        saved = os.environ.pop("FLEET_SWITCHBOARD_OWN_GH", None)   # sb.main sets the switchboard's own-gh marker in-process and earlier tests leave it set: with it the shim (by design) leaves a call alone
-        self.addCleanup(lambda: os.environ.__setitem__("FLEET_SWITCHBOARD_OWN_GH", saved) if saved is not None else None)
+        patcher = mock.patch.dict(os.environ)   # restores the whole environment afterwards
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name in ("FLEET_SWITCHBOARD_OWN_GH", "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN"):
+            os.environ.pop(name, None)   # sb.main sets the switchboard's own-gh marker in-process and earlier tests leave it set: with it the shim (by design) leaves a call alone
 
         class Boom(Exception):
             pass
