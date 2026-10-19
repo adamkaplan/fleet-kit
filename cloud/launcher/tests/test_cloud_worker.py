@@ -540,6 +540,21 @@ class S5EndHook(Base):
         self.assertEqual(err.getvalue().count("reaper exiting: error: boom"), 1)
         self.assertRegex(err.getvalue(), r"cloud-worker: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ reaper exiting: error: boom")
 
+    def test_every_exit_reason_the_code_writes_carries_the_time(self):
+        import ast
+        src = open(os.path.join(os.path.dirname(os.path.abspath(cw.__file__)), "cloud_worker.py")).read()
+        fn = [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.FunctionDef) and n.name == "_reap_main"][0]
+        whys = sorted({ast.unparse(a.value)[:20] for a in ast.walk(fn) if isinstance(a, ast.Assign) and any(getattr(t, "id", "") == "why" for t in a.targets)})
+        self.assertEqual(len(whys), 3, whys)   # end of its pass, stopped by (a signal or an interrupt), an error: a form added needs its case
+        shape = r"cloud-worker: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ reaper exiting: "
+        orig = cw.Launcher.reap
+        self.addCleanup(setattr, cw.Launcher, "reap", orig)
+        cw.Launcher.reap = lambda self_: (_ for _ in ()).throw(KeyboardInterrupt())
+        code, _, err = self.run_cli("reap", "--loop", "5")
+        self.assertEqual(code, cw.EXIT_INTERRUPTED)
+        self.assertRegex(err, shape + "stopped by interrupt")
+        self.assertEqual(err.count("reaper exiting:"), 1)
+
     def test_the_reaper_says_why_it_exits_once(self):
         code, _, err = self.run_cli("reap")
         self.assertEqual(code, 0)
