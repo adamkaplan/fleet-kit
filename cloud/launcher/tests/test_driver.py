@@ -18,6 +18,7 @@ import test_cloud_worker as base  # noqa: E402
 cw = base.cw
 
 DRIVER = os.path.join(os.path.dirname(HERE), "run_task.py")
+FAKE_PREFLIGHT_DRIVER = os.path.join(HERE, "fake_preflight", "run_task.py")   # the driver with a passing fake preflight (#665): the real one cannot run offline
 REPO = "acme-org/widget-service"
 MODEL_VALUES = ["ab12CD34e", "modelvalue-Qx7Lm2Qx7Lm2Qx7Lm2", "m" * 7 + "-" + "Zk9Wp3" * 12]   # short, medium, long
 OTHER = "othervalue-Zk9Wp3Zk9Wp3Zk9Wp3Zk9Wp3"   # another provider in the same auth file: never read out
@@ -58,7 +59,7 @@ class Driver(base.Base):
                          STUB_LOG=self.stub_log, CW_POLL_SECONDS="0.2", CW_HEALTH_TIMEOUT="3", CW_RUN_TIMEOUT="60", CW_CREATE_TIMEOUT="60")
 
     def args(self, worker="coder7", repo=REPO, brief=None):
-        return [sys.executable, DRIVER, worker, repo, "main", brief or self.brief, "--pull-secret", "cw-pull", "--image", "registry.example.internal/cw-worker:1"]
+        return [sys.executable, FAKE_PREFLIGHT_DRIVER, worker, repo, "main", brief or self.brief, "--pull-secret", "cw-pull", "--image", "registry.example.internal/cw-worker:1"]
 
     def run_driver(self, **env):
         p = subprocess.run(self.args(), env=dict(self.denv, **env), capture_output=True, text=True, timeout=120)

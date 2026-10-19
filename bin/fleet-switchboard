@@ -337,6 +337,7 @@ DEFAULTS = {
     "batch_seconds": 90,
     "send_to_working": "steer",     # a boss's `send` to a working agent: "steer" (its next safe point) or "queue" (after its turn)
     "engaged_minutes": 10,
+    "retire_idle_minutes": 10,     # `retire --close`: a pane herdr reads as working is closed without --force only when its session has had no turn and no activity this long
     "call_timeout_seconds": 20,
     "send_timeout_seconds": 60,    # `send` as a whole (the sum of its v2 and herdr calls): past it, a clear failure line, never a silent minutes-long wait
     "poll_seconds": 5,
@@ -353,6 +354,7 @@ DEFAULTS = {
     "v2_cache_seconds": 120,       # a session's record, its inbox: re-read after this long, or at once when herdr says its state changed (0: never remembered)
     "v2_reads_per_pass": 8,        # background reads (cache fills) one pass may make; the rest wait for the next pass (stalest first)
     "v2_reads_per_minute": 90,     # and in any minute: past it the daemon keeps what it has (a read nobody has made yet is still made)
+    "stalled_working_hours": 2,   # #811: a coder or tester that only reports `working` while nothing it owns moves wakes its boss once after this long
     "worker_lookback_hours": 24,  # how far back a worker's finished turn still counts (PR 4)
     "rider_max_age_seconds": 3600,  # PR 13: a rider older than this is dropped, and an older stop is not triaged
     "report_triage": None,          # PR 13: None means REPORT_TRIAGE_DEFAULTS (the `report_owed` question's settings)
@@ -417,13 +419,21 @@ def state_dir_path():
     return _xdg("XDG_STATE_HOME", ".local/state") / PROG
 
 
+RETIRE_IDLE_MIN, RETIRE_IDLE_MAX = 1, 10080   # minutes: `retire_idle_minutes` is a finite number in this range (a week at most)
+
+
+def retire_idle_window_ok(value):
+    """True for a usable `retire_idle_minutes`: a real number (never a bool), finite, from RETIRE_IDLE_MIN to RETIRE_IDLE_MAX. Checked at load AND at use."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and RETIRE_IDLE_MIN <= value <= RETIRE_IDLE_MAX
+
+
 def _is_number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
 _WARNED_CONFIG = set()
 UNKNOWN_CONFIG = {}   # (section, key) -> the nearest known key or None: what `status` shows, kept for the life of the process
-TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_hold", "load_alert", "source_budgets", "hold_labels"}
+TOP_LEVEL_EXTRA_KEYS = {"worktree_reclaim", "orphan_reaper", "order_notice_burst_minutes", "external_decisions", "friction_wake", "sweep", "triage", "plan_evaluators", "plan_gates", "plan_review", "impact_hold", "load_alert", "source_budgets", "hold_labels", "app_installations", "app_key_path", "app_key_command", "app_permissions", "app_api_base"}
 
 
 CONFIG_DECLARATION_TEXT = re.compile(rb'^[ \t]*CONFIG_KEY[ \t]*(?::[^=\n]*)?=[ \t]*[\'"]([^\'"\n]*)[\'"]', re.M)   # only the fallback for a file that does not parse
@@ -626,9 +636,11 @@ def validate_config(raw, source="config"):
         if not isinstance(config[key], int) or isinstance(config[key], bool) or config[key] < 0:
             raise ConfigError("%r must be a whole number of at least 0, got %r" % (key, config[key]))
     for key in ("batch_seconds", "engaged_minutes", "call_timeout_seconds", "send_timeout_seconds", "poll_seconds",
-                "worker_lookback_hours", "rider_max_age_seconds"):
+                "worker_lookback_hours", "stalled_working_hours", "rider_max_age_seconds"):
         if not _is_number(config[key]) or config[key] <= 0:
             raise ConfigError("%s: %r must be a positive number, got %r" % (source, key, config[key]))
+    if not retire_idle_window_ok(config["retire_idle_minutes"]):
+        raise ConfigError("%s: 'retire_idle_minutes' must be a finite number from %d to %d, got %r" % (source, RETIRE_IDLE_MIN, RETIRE_IDLE_MAX, config["retire_idle_minutes"]))
     validate_intent_config(config, source)
     validate_v1_move_config(config, source)  # PR 10
     _validate_github(config, source)
@@ -656,6 +668,7 @@ def validate_config(raw, source="config"):
     validate_plan_gates_config(config, source)  # #107 slice 3a
     validate_plan_review_config(config, source)  # #109 part 2, R2
     validate_hold_labels_config(config, source)  # #376
+    validate_app_config(config, source)  # #609
     return config
 
 
@@ -702,6 +715,25 @@ def validate_hold_labels_config(config, source):
     try:
         module.validate_config(config["hold_labels"])
     except ValueError as err:
+        raise ConfigError("%s: %s" % (source, err)) from None
+
+
+def validate_app_config(config, source):
+    """`app_installations` and its key, permission and endpoint settings: the repositories whose gh and git calls use a GitHub App installation token (shims/app_mint.py
+    reads them live from this file). The shim's own loader judges them, so a config the shim would refuse is refused here: this kit's own repository, a wildcard, a
+    permission beyond the allowed set, no key source. All absent means the feature is off."""
+    keys = ("app_installations", "app_key_path", "app_key_command", "app_permissions", "app_api_base")
+    if all(config.get(k) is None for k in keys):
+        for key in keys:
+            config.pop(key, None)
+        return
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "shims", "app_mint.py")
+    spec = importlib.util.spec_from_file_location("app_mint_check", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    try:
+        module.load_config(config)
+    except module.ConfigError as err:
         raise ConfigError("%s: %s" % (source, err)) from None
 
 
@@ -4211,6 +4243,8 @@ class Switchboard:
         self.gh_runner = None           # PR notices: the runner for `gh pr view` (None: subprocess.run)
         self.stopped_news_errors = set()  # reasons already audited: one line per distinct failure
         self.stopped_news = {}          # #96: worker.stopped key -> judged clearly no news (decided once per note)
+        self.awaiting_held_links = True        # #796: cleared by the first load tick whose held-PR links were all whole (it lapses after HELD_LINKS_WAIT_SECONDS)
+        self.awaiting_first_full_pass = True   # #796: set False once a pass has published a non-provisional decisions file; the load tick judges nothing before
         self.notice_facts = {}          # PR notices: "owner/repo#N" -> {at, facts, stale, error}; memory only
         self.notice_effects = {"drop": set(), "unreadable": {}}  # what the last derivation asks the daemon to record
         self.synthetic_cache = {}       # PR 14: session -> (newest synthetic id, since, lines), a cache for the decisions
@@ -4323,7 +4357,15 @@ class Switchboard:
                 _one_line("; ".join(str(c) for c in programs), 120) or "nothing")
 
     def discover(self, now, entries=None):
-        """Every fleet agent: a herdr agent whose v2 session carries `metadata.fleet.name`."""
+        """Every fleet agent: a herdr agent whose v2 session carries `metadata.fleet.name`. Also marks the `agents` input (#805): not whole when
+        it starts, whole only when it finished with no problem, so a discovery that raised or was partial leaves it not whole."""
+        read_mark(self, "agents", False, "the discovery did not finish", now)
+        found = self._discover(now, entries)
+        problems = list(found.problems or ())
+        read_mark(self, "agents", not problems, "the fleet could not be read whole: %s" % _one_line(problems[0], 80) if problems else "", now)
+        return found
+
+    def _discover(self, now, entries=None):
         found = Discovery()
         self.discovery = found
         if entries is None:
@@ -6596,6 +6638,11 @@ def record_last_report(state_dir, sender, state, now, text=None):
         with agent_lock(state_dir, "files", seconds=2):
             data = _read_small(state_dir, LAST_REPORT_FILE)
             entry = {"state": state, "at": int(now)}
+            before = data.get(sender) or {}
+            if state == "working":   # #811: the run of consecutive `working` reports; any other kind ends it
+                run = before.get("state") == "working" and _is_number(before.get("work_since")) and isinstance(before.get("work_n"), int)
+                entry["work_n"] = before["work_n"] + 1 if run else 1
+                entry["work_since"] = before["work_since"] if run else int(now)
             if isinstance(text, str) and text:
                 entry["text"] = _one_line(redact_command_text(text), REPORT_MAX)   # untrusted text: redacted before it is stored (#773)   # the one line, for the idle-at-a-seam wake (#773)
             if isinstance((data.get(sender) or {}).get("send_to"), dict):
@@ -7097,11 +7144,42 @@ def cmd_reattach_all(args, runner, now, socket_call=None):
     return EXIT_ERROR if failed else EXIT_OK
 
 
+def _idle_span_text(seconds):
+    """'27 min', '3 h' or '1 d 3 h' for the evidence line."""
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return "%d min" % minutes
+    hours = minutes // 60
+    return "%d h" % hours if hours < 24 else "%d d %d h" % (hours // 24, hours % 24)
+
+
+def retire_idle_evidence(engine, now, name, seen, herdr_status):
+    """The evidence line when the session's OWN state shows a pane herdr reads as `working` is idle, else None (fail toward keeping).
+    Idle means: herdr says working (a blocked pane is never idle), `session.active` (ONE read per judgment: a retire judges twice, so a closed agent costs 2, one refused at the first costs at most 1) has no entry for the session (no turn, so no pending permission or question), and
+    the last turn's end (`time.idle` of the discovery's own session record) is at least `retire_idle_minutes` ago. Anything unreadable,
+    missing or in the future is None."""
+    if herdr_status != "working" or seen is None or not seen.session_id or seen.idle_at is None:
+        return None
+    try:
+        active = engine.v2.session_active()   # read at every judgment: the final one before the close must see a turn that began since the first
+    except Exception:
+        return None
+    if not isinstance(active, dict) or seen.session_id in active:   # `session.active` lists only sessions with a turn: an entry of ANY shape ({}, null) is not proof of idleness
+        return None
+    window = engine.config.get("retire_idle_minutes")
+    if not retire_idle_window_ok(window) or not _is_number(seen.idle_at) or not math.isfinite(seen.idle_at):
+        return None   # a window or a last-turn time that cannot be read means unknown, never idle
+    idle_for = now() - seen.idle_at
+    if idle_for < window * 60:
+        return None
+    return "herdr says working; the session has been idle %s and has no turn: treated as idle" % _idle_span_text(idle_for)
+
+
 def retire_close_problem(engine, runner, now, discovery, name, seen, force):
     """(pane, None) when `retire --close` may close `name`'s pane now, else (None, why not). Judged BEFORE the retirement, so a refusal changes nothing.
     Who: the operator at their own terminal (any agent), the agent's recorded boss, or the Chief of Staff for an agent that reports to it DIRECTLY;
     never the caller's own pane or session. What: the pane the switchboard has for the agent, read again live, must still hold THAT agent's session
-    (a stored pane id can name another terminal after a herdr restart). A working agent needs --force, which is refused while a registered worktree of
+    (a stored pane id can name another terminal after a herdr restart). A pane herdr reads as working needs --force unless the session's own state shows it idle (`retire_idle_evidence`); --force is refused while a registered worktree of
     the agent holds uncommitted or unpushed work."""
     kind = gates_caller_kind(runner, now)
     if kind[0] == "person":
@@ -7125,9 +7203,15 @@ def retire_close_problem(engine, runner, now, discovery, name, seen, force):
         return None, "pane %s cannot be read now (%s): nothing was closed" % (pane, _one_line(str(err), 80))
     if agent_session(live) != seen.session_id:
         return None, "pane %s no longer holds %s's session: nothing was closed" % (pane, name)
-    if live.get("agent_status") in ("working", "blocked") and not force:
-        return None, "%s is %s: pass --force to close it anyway" % (name, live.get("agent_status"))
-    if force and live.get("agent_status") in ("working", "blocked") and engine.state_dir is not None:
+    busy = live.get("agent_status") in ("working", "blocked")
+    idle_evidence = None
+    if busy and not force:
+        idle_evidence = retire_idle_evidence(engine, now, name, seen, live.get("agent_status"))
+        if idle_evidence is None:
+            unknown = " (session state unknown or not idle: nothing confirms it is idle)" if live.get("agent_status") == "working" else ""
+            return None, "%s is %s: pass --force to close it anyway%s" % (name, live.get("agent_status"), unknown)
+        engine.__dict__.setdefault("retire_idle_seen", {})[name] = idle_evidence
+    if busy and (force or idle_evidence) and engine.state_dir is not None:
         for path, entry in sorted(read_worktrees(engine.state_dir).items()):
             if isinstance(entry, dict) and entry.get("agent") == name:
                 facts = worktree_facts(runner, path)
@@ -7140,6 +7224,7 @@ def retire_close_pane(engine, runner, now, name, pane, caller, force):
     """Close `pane` after judging EVERYTHING again from a fresh discovery (the first judgment was before the retirement lock and the worktree reclaim):
     who may, which pane, its session, its status and the worktree guard. Audited whether it closes or not. (status line, ok)"""
     detail = {"pane": pane, "by": caller}
+    engine.__dict__.setdefault("retire_idle_seen", {}).pop(name, None)
     try:
         fresh = engine.discover(engine.now())
         again, why = retire_close_problem(engine, runner, now, fresh, name, fresh.agents.get(name), force)
@@ -7153,9 +7238,12 @@ def retire_close_pane(engine, runner, now, name, pane, caller, force):
         if engine.audit is not None:
             engine.audit.append(engine.actor, "fleetpane.close_failed", name, dict(detail, why=_one_line(str(err), 120)))
         return "pane %s was not closed (%s): the agent is retired" % (pane, _one_line(str(err), 100)), False
+    evidence = engine.__dict__.get("retire_idle_seen", {}).get(name)
+    if evidence:
+        detail["evidence"] = evidence
     if engine.audit is not None:
         engine.audit.append(engine.actor, "fleetpane.closed", name, detail)
-    return "closed pane %s (the agent's terminal: its memory is released)" % pane, True
+    return "closed pane %s (the agent's terminal: its memory is released%s)" % (pane, "; " + evidence if evidence else ""), True
 
 
 def headless_record_to_free(state, name):
@@ -8331,7 +8419,7 @@ def cmd_whoami(args, runner, now):
         own = repo or _fleet_repo(fleet, config)
         # `own` is false when the repo is only the config's `intent_repo` default: an agent with no repo of its own (the Chief of Staff) has no account of
         # its own to keep, so the gh shim may use the account of the repo a command names
-        who = {"name": fleet["name"], "repo": own or config.get("intent_repo") or None, "own": bool(own)}
+        who = {"name": fleet["name"], "repo": own or config.get("intent_repo") or None, "own": bool(own), "role": fleet.get("role") if isinstance(fleet.get("role"), str) else None}   # the RECORDED role: the gh shim gives only the Chief of Staff the named repository's App token
         if "read_repo" in fleet:   # #618: only a worker launched with --read-repo has the key, so every other answer is as it was; one that cannot be read says so (the shim refuses)
             who["read_repo"] = fleet["read_repo"] if isinstance(fleet["read_repo"], str) and GhAccounts.normal_repo(fleet["read_repo"]) == fleet["read_repo"] \
                 and re.fullmatch(r"[a-z0-9_.-]+/[a-z0-9_.-]+", fleet["read_repo"]) else False
@@ -8388,6 +8476,15 @@ REPORT_ATTENTION = ("done", "failed", "blocked", "question")  # wake the boss wh
 REPORT_PROGRESS = ("working", "paused", "withdrawn")          # riders: carried, never the reason for a message
 REPORT_STATES = REPORT_ATTENTION + REPORT_PROGRESS
 WITHDRAW_ALL = decision_core.WITHDRAW_ALL  # leads a `withdrawn` report made with --all: it clears every open question of the worker
+STALLED_LIST_MAX_AGE = 1200   # #811: seconds; an open-PR list read longer ago than this is not judged (the pass re-reads it every few minutes)
+STALLED_RUNNING_CHECKS = ("in_progress", "queued", "pending", "waiting", "requested", "expected")   # #811: a check word that is not finished
+
+
+def _stalled_age(seconds):
+    hours = seconds / 3600.0
+    return "%dm" % (seconds // 60) if hours < 1 else "%.1fh" % hours
+
+
 SEAM_IDLE_SECONDS = 1200   # #773: an idle worker whose last report was `working` is noticed after this long
 REPORT_MAX = 300  # characters: a report is a sentence; detail goes on GitHub
 SUMMARY_CAP = 600  # characters of a worker's last reply in its fact
@@ -8454,6 +8551,7 @@ class WorkerFacts:
         self.requests = []       # PR 14: the pending requests of every blocked agent in the last call (decisions)
         self._summaries = {}     # (session, idle ms) -> text; a cache, rebuilt after a restart
         self._stops = {}         # (session, idle ms) -> the facts of that stop (PR 13); a cache, rebuilt likewise
+        self._heads = {}         # #811: worker -> (the pull request head last seen, when a change of it was seen); memory only
         self._no_forms = False   # v2 does not know the form operation (UNVERIFIED name)
 
     def bind(self, engine):
@@ -8467,19 +8565,29 @@ class WorkerFacts:
         engine = self.engine
         discovery = getattr(engine, "discovery", None)
         if engine is None or discovery is None or fault("no-worker-source"):
+            if engine is not None:
+                read_mark(engine, "requests", False, "no worker source was read", engine.now())   # #805: an earlier whole mark is not this pass's
             return []
+        read_mark(engine, "requests", False, "the worker read did not finish", engine.now())   # #805: never inherited: whole only at the end of a read that completed
         horizon = worker_horizon(engine.config, engine.now())
-        facts = []
+        facts, skipped = [], []
         for observation in sorted(discovery.agents.values(), key=lambda o: o.name):
             boss = boss_name(discovery, observation)  # #102: the stop triage looks the boss up by its registered name
             if observation.conflict or observation.problem:
+                skipped.append(observation.name)
                 continue
             try:
                 if boss is not None:
                     facts.extend(self.finished(observation, boss, horizon))
+                    facts.extend(self.stalled_facts(observation, boss))
                 facts.extend(self.blocked(observation, boss))
             except V2Error as err:  # one worker's trouble never hides the others
+                skipped.append(observation.name)
                 engine._note("source.error", "worker_facts:" + observation.name, {"error": _one_line(str(err))})
+        # #805: the pending requests are whole only when every worker was read: an unread worker's requests are absent, not gone
+        problems = list(getattr(discovery, "problems", None) or [])
+        why = "the fleet could not be read whole" if problems else ("%d worker(s) not read: %s" % (len(skipped), ", ".join(skipped[:3])) if skipped else "")
+        read_mark(engine, "requests", not problems and not skipped, why, engine.now())
         return facts
 
     def finished(self, observation, boss, horizon):
@@ -8499,6 +8607,23 @@ class WorkerFacts:
             found = found + self.seam_facts(observation, boss, idle_ms)
         return found
 
+    def seam_applies(self, observation, issue):
+        """#793: the idle-at-a-seam rule is for a worker whose launch-record role is `coder` or `tester` and whose issue is not a charter.
+        A charter is known from memory only (no new read): the issue is the `charter` of this worker's own record or of any discovered
+        agent's. (A closed charter is already closed.) A role that cannot be read is not a coder or tester."""
+        fleet = observation.fleet if isinstance(observation.fleet, dict) else {}
+        if fleet.get("role") not in ("coder", "tester") or not isinstance(fleet.get("role"), str):
+            return False
+        engine = self.engine
+        repo = _fleet_repo(fleet, engine.config) or engine.config.get("intent_repo")
+        discovery = getattr(engine, "discovery", None)
+        for agent in ([observation] + (list(discovery.agents.values()) if discovery is not None else [])):
+            other = agent.fleet if isinstance(agent.fleet, dict) else {}
+            if other.get("charter") == issue and not isinstance(other.get("charter"), bool):
+                if agent is observation or _fleet_repo(other, engine.config) in (repo, None) or other.get("repo") == repo:
+                    return False
+        return True
+
     def seam_facts(self, observation, boss, idle_ms):
         """#773: idle SEAM_IDLE_SECONDS or more, an OPEN assignment, and a last report of `working`: ONE nudge for the worker and ONE wake
         for its boss, each keyed by this idle stretch (`idle_at`), so neither is sent twice. Reads nothing new: the observation, the
@@ -8507,6 +8632,8 @@ class WorkerFacts:
         issue = _issue_of(observation.fleet)
         if state_dir is None or issue is None or engine.now() - observation.idle_at < SEAM_IDLE_SECONDS:
             return []
+        if not self.seam_applies(observation, issue):
+            return []   # #793: only a coder or tester on a work item or an ask; anything not readable fails toward not nudging
         kept = read_retired(state_dir).get(observation.name)
         if kept is not None and kept.get("session") in (None, observation.session_id):
             return []   # retired on purpose
@@ -8528,6 +8655,100 @@ class WorkerFacts:
                     "idle without a closing report: #%d (worker %s, last report: %s)" % (issue, observation.name, _one_line(redact_command_text(line), 160) or "none recorded"),
                     observation.idle_at, issue=issue, batch=False, sender=observation.name, repo=repo)
         return [nudge, wake]
+
+    def stalled_facts(self, observation, boss):
+        """#811: a coder or tester whose last reports were all `working` for `stalled_working_hours` while nothing it owns moved (the pull
+        request's head and updated time, the issue's updated time) wakes its boss ONCE per stretch; the worker is never nagged. Reads only
+        what the daemon holds (the report record, the lists, the check summaries, the reminders, the decision list), never GitHub, and
+        judges only when each of them was read whole. Anything not readable fails toward no wake."""
+        engine, state_dir = self.engine, self.engine.state_dir
+        issue = _issue_of(observation.fleet)
+        now, window = engine.now(), engine.config.get("stalled_working_hours", 2) * 3600
+        if state_dir is None or issue is None or not self.seam_applies(observation, issue):
+            return []
+        if observation.status == "idle" and observation.idle_at is not None:
+            return []   # an idle worker is the idle-at-a-seam rule's (one wake for it, not a second under another key)
+        last = _read_small(state_dir, LAST_REPORT_FILE).get(observation.name)
+        if not isinstance(last, dict) or last.get("state") != "working" or not _is_number(last.get("work_since")) or not isinstance(last.get("work_n"), int):
+            return []   # a blocked, question or closing report (or none) is not this case
+        kept = read_retired(state_dir).get(observation.name)
+        if kept is not None and kept.get("session") in (None, observation.session_id):
+            return []
+        repo = _fleet_repo(observation.fleet, engine.config) or engine.config.get("intent_repo")
+        if not repo:
+            return []
+        key = plan_ledger.normal_repo(repo)
+        hub = getattr(engine, "hub", None)
+        closed = hub.closed_issue_snapshot() if hub is not None and hasattr(hub, "closed_issue_snapshot") else {}
+        if "%s#%d" % (key, issue) in closed:
+            return []
+        # the inputs, each whole or no wake
+        wanted = ["issues:" + repo, "decisions", "pulls:" + key]
+        if any(not whole(engine, name)[0] for name in wanted):
+            return []
+        listed_at = engine.read_whole["pulls:" + key].get("at")
+        if not _is_number(listed_at) or now - listed_at > STALLED_LIST_MAX_AGE:
+            return []   # an open-PR list that is not being re-read is no evidence of "no movement"
+        units = getattr(getattr(engine, "triage", None), "units", None) or {}
+        records = (units.get((repo, "issues")) or {}).get("data") or []
+        item = next((r for r in records if isinstance(r, dict) and r.get("number") == issue and "pull_request" not in r), None)
+        issue_at = parse_iso(item.get("updated_at")) if item else None
+        if item is None or issue_at is None:
+            return []
+        labels = {(l.get("name") if isinstance(l, dict) else l) for l in (item.get("labels") or [])}
+        awaiting = triage_awaiting_labels(engine)
+        if labels & awaiting:
+            return []
+        state = getattr(engine, "ci_record_state", None)
+        pulls = ((getattr(state, "lists", None) or {}).get(key) or (0, []))[1]
+        mine = [r for r in pulls if isinstance(r, dict) and isinstance(r.get("number"), int)
+                and any(isinstance(ref, list) and ref[1] == issue and plan_ledger.normal_repo(ref[0] or repo) == key
+                        for ref in pr_body_refs(r.get("body")))]
+        pr = max(mine, key=lambda r: parse_iso(r.get("updated_at")) or 0, default=None)   # the newest-moved one when several name the issue
+        moved, head, number = issue_at, None, None
+        if pr is not None:
+            number = pr["number"]
+            head = (pr.get("head") or {}).get("sha") if isinstance(pr.get("head"), dict) else None
+            pr_at = parse_iso(pr.get("updated_at"))
+            if not isinstance(head, str) or pr_at is None:
+                return []
+            moved = max(moved, pr_at)
+            seen = self._heads.get(observation.name)   # a head this process saw change is movement now, whatever GitHub's clock says
+            if seen is None or seen[0] != head:
+                self._heads[observation.name] = (head, now if seen is not None else 0)
+            moved = max(moved, self._heads[observation.name][1])
+            pr_labels = {(l.get("name") if isinstance(l, dict) else l) for l in (pr.get("labels") or [])}
+            if pr_labels & awaiting:
+                return []
+            held = (getattr(state, "pr_state", None) or {}).get("%s#%d" % (key, number)) or {}
+            if held.get("head") == head and any(isinstance(c, dict) and str(c.get("conclusion") or "").lower() in STALLED_RUNNING_CHECKS
+                                                for c in (held.get("checks") or []) if held.get("examined_head") == head):
+                return []   # a check at this head is still running
+        try:
+            for reminder in read_reminders(state_dir):
+                if reminder.get("to") == observation.name and reminder.get("issue") == issue and reminder["at"] > now:
+                    return []   # it said when it will look again
+        except ReminderError:
+            return []
+        body = read_decisions_file(state_dir / DECISIONS_FILE)
+        if body is None:
+            return []
+        refs = {(key, issue)} | ({(key, number)} if number else set())
+        for d in body["decisions"]:
+            if not isinstance(d, dict):
+                continue
+            ref = sweep_ref_of(d, repo)
+            if d.get("tier", "human") == "human" and ref and (plan_ledger.normal_repo(ref[0]), ref[1]) in refs:
+                return []   # it waits on the owner
+        since = max(moved, last["work_since"])
+        if now - since < window:
+            return []
+        ref = "%s#%d" % (repo, number or issue)
+        line = last.get("text") if isinstance(last.get("text"), str) else ""
+        stretch = "stalled:%s:%d:%s:%d" % (observation.session_id, issue, head or "-", int(moved))
+        text = "no movement for %s on %s (worker %s, %d working reports; last: %s)" % (
+            _stalled_age(now - since), ref, observation.name, last["work_n"], _one_line(redact_command_text(line), 160) or "none recorded")
+        return [Fact("%s:%s" % (WORKER_IDLE, stretch), boss, WORKER_IDLE, text, now, issue=issue, batch=False, sender=observation.name, repo=repo)]
 
     def stop_facts(self, observation, boss, idle_ms, idle, reply):
         """The facts for one stop, worked out once (a stop is asked about once; the cache is rebuilt after a
@@ -9395,6 +9616,9 @@ def prune_escalations_pass(engine, store, now):
     keep = captain_escalations_to_keep(engine)
     if keep is None or engine.request_keys is None:
         return
+    for name in ("requests", "notices"):
+        if whole_skipped(engine, "escalation.prune", name):
+            return   # #805: a worker or a notice that could not be read lists nothing, which is no evidence a request is gone
     escalated = read_escalated(engine.state_dir)
     leaves = captain_escalation_leaves(engine, escalated, now)
     captains = {k for k in escalated if k.startswith("captain:")}
@@ -10308,12 +10532,17 @@ def decisions_from_notices(engine, now):
     closed is not listed and is queued in engine.notice_effects for the daemon to forget; one that cannot be read
     keeps its last facts, marked stale, and is dropped (and logged) after PR_NOTICE_UNREADABLE_SECONDS."""
     engine.notice_effects = {"drop": set(), "unreadable": {}, "observed": {}, "left": set()}
+    engine.notice_unread = 0   # #796: how many noticed PRs this pass has no facts for (skipped by the time budget, or unreadable): the load alert waits while it is above 0
+    read_mark(engine, "notices", False, "the notice read did not finish", now)   # #805: never inherited: whole only at the end of a read that completed
     state_dir = getattr(engine, "state_dir", None)
     if state_dir is None:
+        read_mark(engine, "notices", True, "", now)
         return [], []
     try:
         items = read_pr_notices(state_dir)
     except NoticeError as err:
+        engine.notice_unread = 1   # the notices themselves could not be read: nothing is known about them
+        read_mark(engine, "notices", False, "the notices could not be read", now)
         return [], [str(err)]
     hold = engine.config.get("pr_notice_hold_minutes") or 0
     escalated = read_escalated(state_dir)
@@ -10331,6 +10560,8 @@ def decisions_from_notices(engine, now):
         key = "%s#%d" % (repo, number)
         held = notice_facts(engine, repo, number, now, budget)
         facts = held["facts"]
+        if held.get("skipped") or facts is None:
+            engine.notice_unread += 1
         if facts is not None and facts["state"] in ("merged", "closed"):
             engine.notice_effects["drop"].add(key)
             engine.notice_effects["left"].add(key)   # read as merged or closed: evidence for the escalation prune
@@ -10391,6 +10622,7 @@ def decisions_from_notices(engine, now):
             engine._note("notice.dropped", key, {"reason": "unreadable for %d minutes of observed time" % (PR_NOTICE_UNREADABLE_SECONDS // 60),
                                                  "error": held["error"]})
             dropped.add(key)
+    read_mark(engine, "notices", not engine.notice_unread, "%d notices unread" % engine.notice_unread, now)
     return [entry for _, entry, key in sorted(entries, key=lambda row: row[0]) if key not in dropped], []
 
 
@@ -11317,7 +11549,9 @@ def publish_decisions(engine):
         pass  # a disposable file: a failed prune is tried again next pass
     errors = errors + sync_external(engine, decisions, errors, now)  # [] unless external_decisions is enabled
     work_sync_external(engine, now)  # nothing unless external_decisions.work_items is on
-    return store.publish(decisions, errors, now)
+    published = store.publish(decisions, errors, now)
+    engine.awaiting_first_full_pass = False   # #796: a full, non-provisional list is out; the load tick may judge from the next one
+    return published
 
 
 def decisions_report(state_dir, now):
@@ -11479,6 +11713,28 @@ def decisions_caller(args, runner, now):
         return {}  # a person's own shell inside herdr has a pane and no agent: the human's view, never a crash
 
 
+def held_merge_order_hints(decisions, runner, now):
+    """#818: advisory `merge order: #A, then #B (shared files)` lines among the HELD pull requests of the listed decisions (kind `captain`) that share files, the one
+    that has waited longest first. ONE bounded read per repo that has two or more held pull requests (CLI only, never the daemon); any failure gives no hint."""
+    by_repo = {}
+    for d in decisions:
+        since = parse_iso(d.get("since"))
+        if d.get("kind") == "captain" and d.get("repo") and isinstance(d.get("number"), int) and since is not None:
+            by_repo.setdefault(d["repo"], {})[d["number"]] = since
+    hints = []
+    for repo, waited in sorted(by_repo.items()):
+        if len(waited) < 2:
+            continue
+        try:
+            engine = build_engine(runner, now, "cli", writable=False)[0]
+            listing = read_open_overlap(engine, repo, runner)
+            if listing:
+                hints.extend(("%s: " % repo if len(by_repo) > 1 else "") + h for h in overlap_waiting_order(listing, sorted(waited.items())))
+        except Exception:
+            continue
+    return hints
+
+
 def cmd_decisions(args, runner, now):
     action = getattr(args, "decisions_action", None) or "list"
     if action != "list":
@@ -11505,11 +11761,16 @@ def cmd_decisions(args, runner, now):
     report = fresh_decisions(runner, now) if args.fresh else decisions_report(state, now())
     shown = dict(report, decisions=select_decisions(report["decisions"], view))
     external = external_status_line(config, state, now()) if config else None
+    hints = [] if report["stale"] else held_merge_order_hints(shown["decisions"], runner, now)
     if args.json:
         extra = {"external": external} if external is not None else {}
+        if hints:
+            extra["merge_order"] = hints
         print(json.dumps(dict(shown, message=report["message"] or None, view=view, **extra), indent=2, sort_keys=True))
     else:
         print(format_decisions(shown, now(), view))
+        for hint in hints:
+            print(hint)
         if external is not None:
             print("(%s)" % external)
     return EXIT_ERROR if report["stale"] else EXIT_OK
@@ -11693,6 +11954,7 @@ SWEEP_PASS_SECONDS = 8        # no new read is started once the sweep has spent 
 SWEEP_LIST_PAGES = 2          # pages one list read follows (200 records); more is shown as capped
 SWEEP_PR_COMMENTS = 5         # the last comments of an item that are searched for the phrases
 SWEEP_FILE = "sweep.json"
+SWEEP_ALARMED_FILE = "sweep-alarmed.json"   # #805: when each finding was last raised, so the re-alarm window survives a restart
 SWEEP_KINDS = {"S6a": "first-line marker without the merge-captain label (our PR)", "S6b": "merge label and first-line marker disagree",
                "S1a": "decision section without an awaiting label", "S1b": "awaiting label without a decision section",
                "S2": "held for the person but not marked as a captain PR (no merge-captain label)", "S3": "said to wait on the person, not in their tier",
@@ -11772,7 +12034,7 @@ SWEEP_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+|\n")
 SWEEP_REF_RE = re.compile(r"(?<![\w/&#])(?:([\w.-]+/[\w.-]+)|([\w.-]+))?#(\d+)\b")
 
 
-def sweep_strong_statement(strong, text, default_repo, repos):
+def sweep_strong_statement(strong, text, default_repo, repos, matched=None):
     """(fires, refs): whether `text` states, in a strong form that no hedge or negation cancels, that something waits on the
     person, and the refs `[(repo, number)]` its sentence(s) NAME (`#N`, `repo#N`, `owner/repo#N`; a bare `#N` is in
     `default_repo`, a short `repo#N` among `repos`). A sentence ends at `.`, `!` or `?` followed by a space, or a line end,
@@ -11790,6 +12052,8 @@ def sweep_strong_statement(strong, text, default_repo, repos):
                 text[max(0, match.start() - 30):match.start()]) or SWEEP_FUTURE_AFTER_RE.search(text[match.end():sentence_end]):
             continue
         fires = True
+        if matched is not None:
+            matched[:] = [_one_line(match.group(0), 80)]   # the phrase that fired, for the audit
         for full, short, number in SWEEP_REF_RE.findall(text[start:sentence_end]):
             repo = full or ((decision_core.repo_of_tag(short, repos) or short) if short else default_repo)  # unresolved: kept as named
             if repo and (repo, int(number)) not in refs:
@@ -11866,9 +12130,32 @@ class SweepState:
         self.deferred_since = {}  # repo or "*" -> when S3 was first deferred for it
         self.confirmed = {}      # (kind, ref) -> when a fresh read last bore the finding out
         self.attempted = {}      # (kind, ref) -> when it was last tried (the oldest is tried first)
+        self.sources = {}        # (kind, ref) -> what raised it, for the audit line
         self.current = {}        # the last run's counts
         self.strong = sweep_strong_re(SWEEP_DEFAULTS["person_names"])
         self.started = 0         # when this pass's sweep began (the time budget)
+
+
+def sweep_alarmed_load(engine, state, now, cfg):
+    """Once per process: the raise times of the last run, within the re-alarm window (older ones are forgotten)."""
+    if getattr(state, "alarmed_loaded", False) or engine.state_dir is None:
+        return
+    state.alarmed_loaded = True
+    for key, record in list(_read_small(engine.state_dir, SWEEP_ALARMED_FILE).items())[:5000]:   # only this code writes it: a bound anyway
+        kind, _, ref = key.partition(" ")
+        at = record.get("at")
+        if kind in SWEEP_KINDS and isinstance(at, (int, float)) and not isinstance(at, bool) and now - at < cfg["realarm_hours"] * 3600:
+            state.alarmed.setdefault((kind, ref), at)
+
+
+def sweep_alarmed_save(engine, state, now, cfg):
+    if engine.state_dir is None:
+        return
+    keep = {"%s %s" % pair: {"at": at} for pair, at in sorted(state.alarmed.items()) if now - at < cfg["realarm_hours"] * 3600}
+    try:
+        _write_small(engine.state_dir, SWEEP_ALARMED_FILE, keep)
+    except OSError:
+        pass   # a disposable file: a failed write costs one repeated finding after a restart
 
 
 def sweep_state(engine):
@@ -11904,8 +12191,8 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
                          "author": (pr_login(record.get("user")) or "").lower(),
                          "created": parse_iso(record.get("created_at")), "updated": parse_iso(record.get("updated_at")),
                          "assignees": [(pr_login(a) or "").lower() for a in record.get("assignees") or [] if isinstance(a, dict)],
-                         "body_waits": sweep_says_waiting(regex, body), "comments": [],
-                         "latest_strong": False, "latest_refs": []}
+                         "body_waits": sweep_says_waiting(regex, body), "comments": [], "comment_ids": [],
+                         "latest_strong": False, "latest_refs": [], "latest_source": None}
     closed_holds = {}   # S9: the most recent closed (or merged) PRs that still carry a merge or hold label
     recent, cut = hub.read_pages("repos/%s/issues?state=closed&sort=updated&direction=desc&per_page=50" % repo, cap=1)
     budget[0] -= sweep_pages_used(recent, cut)
@@ -11922,8 +12209,11 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
         number = _url_number(comment.get("issue_url"))
         if number in items and isinstance(comment.get("created_at"), str) and comment["created_at"] >= since:
             items[number]["comments"].append(sweep_says_waiting(regex, comment.get("body")))
-            fires, refs = sweep_strong_statement(strong, comment.get("body"), repo, [repo])  # the last one wins
+            items[number]["comment_ids"].append(comment.get("id"))
+            matched = []
+            fires, refs = sweep_strong_statement(strong, comment.get("body"), repo, [repo], matched)  # the last one wins
             items[number]["latest_strong"], items[number]["latest_refs"] = fires, refs
+            items[number]["latest_source"] = {"source": "comment:%s" % comment.get("id"), "match": matched[0] if matched else ""} if fires else None
     return {"at": now, "items": items, "truncated": truncated, "error": None, "closed_holds": closed_holds}
 
 
@@ -12024,12 +12314,13 @@ def sweep_within(when, now, seconds):
     return isinstance(when, (int, float)) and 0 <= now - when < seconds
 
 
-def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
+def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=(), decisions_whole=True):
     """The S1, S2, S3 and S5 findings: [(kind, "repo#n")], sorted. Reads nothing: it works on what the refresh kept.
     `defer` holds the repos (or "*": all) whose human-tier decisions are not all known this pass (their source failed or
     is still unread): S3, the only kind that a missing decision can raise falsely, is not judged for them. S1 reads only
     labels and bodies, S5 only the cos-tier decisions that ARE listed: neither waits."""
     found = set()
+    state.sources = {}   # (kind, ref) -> what raised it: {"source": "comment:<id>" | "report:<id>" | "body", "match": the phrase}
     awaiting = {awaiting_label(engine.config), awaiting_cos_label(engine.config)}
     human = {sweep_ref_of(d, home) for d in decisions if d.get("tier", "human") == "human" and d.get("kind") != "notice"}
 
@@ -12052,6 +12343,11 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
             elif not item["captain"] and (item["body_waits"] or any(item["comments"][-SWEEP_PR_COMMENTS:])):
                 found.add(("S2", ref_text(repo, number)))
                 s2.add((repo, number))
+                waiting = [i for i, w in enumerate(item["comments"][-SWEEP_PR_COMMENTS:]) if w]
+                ids = item.get("comment_ids", [])[-SWEEP_PR_COMMENTS:]
+                state.sources[("S2", ref_text(repo, number))] = (
+                    {"source": "body", "match": "the PR body says it waits"} if item["body_waits"] else
+                    {"source": "comment:%s" % (ids[waiting[-1]] if waiting and waiting[-1] < len(ids) else "?"), "match": "a recent comment says it waits"})
             if item["pr"]:   # #133: the label is the truth; the first-line marker is read only in the transition window
                 if "marker-without-label" in item["captain_findings"] and not sweep_within(
                         item.get("created"), now, SWEEP_S6A_GRACE) and sweep_ours(
@@ -12074,6 +12370,7 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
             for target in targets:
                 if target not in s2 and target not in human and target[1] in (state.repos[target[0]]["items"]):
                     found.add(("S3", ref_text(*target)))
+                    state.sources[("S3", ref_text(*target))] = item.get("latest_source") or {"source": "comment:?", "match": ""}
     repos_known = list(state.repos) + ([home] if home else [])
     human_keys = set()
     for d in decisions:   # everything the owner's tier already holds, however its ref is spelled
@@ -12082,15 +12379,17 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
     for d in decisions:
         ref = sweep_ref_of(d, home)
         # a report is about the refs its sentence names, never assumed to be about its own ask
-        fires, refs = (sweep_strong_statement(state.strong, d.get("title"), ref[0], list(state.repos))
+        matched = []
+        fires, refs = (sweep_strong_statement(state.strong, d.get("title"), ref[0], list(state.repos), matched)
                        if d.get("kind") == "report" and ref and ref[0] else (False, []))
         for target in (refs if fires else ()):
             if (target[0] in defer or "*" in defer or target in human or target in s2 or target[0] not in state.repos
                     or target[1] not in state.repos[target[0]]["items"]):
                 continue
             found.add(("S3", ref_text(*target)))
+            state.sources[("S3", ref_text(*target))] = {"source": "report:%s" % d.get("id"), "match": matched[0] if matched else ""}
         since = parse_iso(d.get("since"))
-        if (d.get("tier") == "cos" and d.get("kind") != "notice" and since is not None
+        if (decisions_whole and d.get("tier") == "cos" and d.get("kind") != "notice" and since is not None
                 and now - since >= cfg["aged_cos_hours"] * 3600
                 and not (sweep_ref_keys(d, home, repos_known) & human_keys)):   # already the owner's: not stale for cos
             found.add(("S5", d.get("id") or ref_text(*(ref or ("?", 0)))))
@@ -12213,7 +12512,7 @@ def sweep_deferrals(state, errors, repos, now):
             named = [r for r in repos if r in text]
             for key in named or ["*"]:
                 reasons.setdefault(key, text)
-        elif source in ("v2", "reports"):
+        elif source in ("v2", "reports", "registry"):
             reasons.setdefault("*", "%s: %s" % (source, text))
     state.deferred_since = {k: v for k, v in getattr(state, "deferred_since", {}).items() if k in reasons}
     deferred, defer = [], set()
@@ -12234,6 +12533,7 @@ def sweep_decisions(engine, decisions, now, errors=()):
         return decisions  # `sweep: false`: fully off, reads nothing, writes nothing
     state = sweep_state(engine)
     state.started = engine.now()
+    sweep_alarmed_load(engine, state, now, cfg)
     repos = decision_repos(engine)
     watched = [d for d in decisions]
     home = engine.config.get("intent_repo") or (repos[0] if len(repos) == 1 else None)
@@ -12253,8 +12553,11 @@ def sweep_decisions(engine, decisions, now, errors=()):
             state.withdrawn.add(text)
             engine._note("sweep.withdrawn" if cfg["enabled"] else "sweep.finding", text,
                          {"kind": "S4", "ref": text, "applied": cfg["enabled"], "why": "its issue or PR is closed"})
+    notices_whole, why = whole(engine, "notices")   # #805: the owner-tier rows of held PRs come from the notice read: S3 and S5 judge by them, and a read that is not whole is no evidence of an absence
+    if not notices_whole:
+        errors = list(errors or ()) + [{"source": "registry", "error": "the notice read is not whole: %s" % why}]
     defer, deferred = sweep_deferrals(state, errors, repos, now)
-    candidates = sweep_findings(engine, state, kept, home, now, cfg, regex, defer)
+    candidates = sweep_findings(engine, state, kept, home, now, cfg, regex, defer, notices_whole or "*" not in defer)
     findings, unchecked = [], 0
     attempts = sorted(candidates, key=lambda c: (state.attempted.get(c, 0), c))  # the longest untried first
     for pair in attempts:
@@ -12284,8 +12587,11 @@ def sweep_decisions(engine, decisions, now, errors=()):
             if len(state.logged) > 5000:
                 state.logged.clear()
             state.logged.add((kind, ref, day))
-            engine._note("sweep.finding", ref, {"kind": kind, "ref": ref, "what": SWEEP_KINDS[kind],
-                                                "woken": cfg["enabled"]})
+            detail = {"kind": kind, "ref": ref, "what": SWEEP_KINDS[kind], "woken": cfg["enabled"]}
+            if (kind, ref) in state.sources:
+                detail["source"] = state.sources[(kind, ref)]["source"]   # #805: what raised it, so the reason is readable from the audit
+                detail["match"] = _one_line(state.sources[(kind, ref)]["match"], 80)
+            engine._note("sweep.finding", ref, detail)
     counts = {}
     for kind, _ in findings:
         counts[kind] = counts.get(kind, 0) + 1
@@ -12302,6 +12608,7 @@ def sweep_decisions(engine, decisions, now, errors=()):
                if now - state.alarmed.get((k, r), 0) >= cfg["realarm_hours"] * 3600]
         if due:
             sweep_queue_fact(state, due, now, cfg)
+            sweep_alarmed_save(engine, state, now, cfg)
     return kept if cfg["enabled"] else decisions
 
 
@@ -12380,6 +12687,25 @@ TRIAGE_KINDS = {"T1": "owner missing", "T2": "required label missing", "T3": "no
                 "T5": "human-tier decision unanswered", "T6": "MERGE: captain PR waiting", "T7": "PR with no review",
                 "T8": "blocked ask", "T9": "ask with no activity", "T10": "closed but still labelled awaiting",
                 "T11": "orphan", "T12": "plan issue still open after its PR merged", "OO": "other-owner (flag only)"}
+# #805: the inputs each rule judges, in ONE table: the candidates a pass drops and the records the prune keeps are both read from it, so they cannot drift.
+# A rule that judges whether an item is OURS (every one but T5, T6 and T10) also needs `agents`: ownership comes from the running agents.
+TRIAGE_RULE_INPUTS = {"T1": ("agents", "issues", "merged"), "T2": ("agents", "issues"), "T3": ("agents", "issues", "comments"), "T5": ("decisions", "issues"),
+                      "T6": ("decisions", "issues"), "T7": ("agents", "issues", "comments", "decisions"), "T8": ("agents", "issues"),
+                      "T9": ("agents", "issues", "comments"), "T10": ("closed",), "T11": ("agents", "issues", "merged"), "T12": ("agents", "issues", "merged")}
+# "agents" and "decisions" are global; the others are per repository (`<name>:<repo>`). T7 also reads the decision list (a captain PR listed there is T6's);
+# T1 and T11 give way to T12 when a merged PR links the item (so they read `merged`), and T9 gives way to T3 (so it reads `comments`).
+# The records of the OTHER kinds are kept whenever ANY input of ANY rule is not whole: the other-owner flag stands for whichever rule would have fired, and the
+# invalid-park flag is raised from the digest of all of them. Their set is derived from the table, so a new rule's input is included at once.
+TRIAGE_UNION_KINDS = ("OO", "PARKED")
+
+
+def triage_inputs(kind):
+    """The inputs the records of `kind` judge, or None for a kind the table does not know (its records are then all kept)."""
+    if kind in TRIAGE_UNION_KINDS:
+        return tuple(sorted({name for needs in TRIAGE_RULE_INPUTS.values() for name in needs}))
+    return TRIAGE_RULE_INPUTS.get(kind)
+
+
 TRIAGE_T10_GRACE = 600         # seconds after a close in which a still-set awaiting label is not yet a finding
 TRIAGE_TTL = 900               # seconds a unit read is kept
 TRIAGE_CALLS_PER_PASS = TRIAGE_DEFAULTS["calls_per_pass"]   # default of `triage.calls_per_pass` (reads and fresh checks alike)
@@ -12430,6 +12756,16 @@ def triage_names_owner(body):
     return any(not TRIAGE_OWNER_PLACEHOLDER_RE.match(m.group(1)) for m in TRIAGE_OWNER_RE.finditer(SWEEP_QUOTED_RE.sub(" ", body)))
 
 
+def triage_owner_name(body):
+    """The name on the FIRST `Owner:` line of the body (outside code and quotes): its first word, or None. Only that one word is kept."""
+    if not isinstance(body, str):
+        return None
+    for m in TRIAGE_OWNER_RE.finditer(SWEEP_QUOTED_RE.sub(" ", body)):
+        word = re.match(r"[\W_]*([A-Za-z0-9][A-Za-z0-9._-]*)", m.group(1))
+        return word.group(1) if word and not TRIAGE_OWNER_PLACEHOLDER_RE.match(m.group(1)) else None
+    return None
+
+
 def validate_triage_config(config, source):
     """`triage`: absent, null or {} runs in shadow (findings audited, nobody woken); `enabled` true adds only the wake of
     the Chief of Staff; `false` turns it fully off. Nothing here can make it write to GitHub: there is no such code."""
@@ -12465,8 +12801,18 @@ def validate_triage_config(config, source):
     if own is not None:
         if not isinstance(own, dict) or set(own) - {"repos", "days", "limit", "owner_labels"}:
             raise ConfigError("%s.ownerless' must be null or {repos, days, limit, owner_labels}, got %r" % (where, own))
-        if not (isinstance(own.get("repos"), list) and own["repos"] and all(isinstance(r, str) and REPO_RE.match(r) for r in own["repos"])):
-            raise ConfigError("%s.ownerless.repos' must be a non-empty list of OWNER/REPO names, got %r" % (where, own.get("repos")))
+        repos = own.get("repos")
+        if isinstance(repos, dict):   # a map of OWNER/REPO to {label_owners: {label: lane}}
+            if not repos or not all(isinstance(r, str) and REPO_RE.match(r) for r in repos):
+                raise ConfigError("%s.ownerless.repos' must be a non-empty list or map of OWNER/REPO names, got %r" % (where, list(repos)))
+            for repo, entry in repos.items():
+                if not isinstance(entry, dict) or set(entry) - {"label_owners"}:
+                    raise ConfigError("%s.ownerless.repos.%s' must be {label_owners: {label: lane}}, got %r" % (where, repo, entry))
+                lo = entry.get("label_owners", {})
+                if not isinstance(lo, dict) or not all(isinstance(k, str) and k.strip() and isinstance(v, str) and v.strip() for k, v in lo.items()):
+                    raise ConfigError("%s.ownerless.repos.%s.label_owners' must be a map of non-empty label to non-empty lane name, got %r" % (where, repo, lo))
+        elif not (isinstance(repos, list) and repos and all(isinstance(r, str) and REPO_RE.match(r) for r in repos)):
+            raise ConfigError("%s.ownerless.repos' must be a non-empty list or map of OWNER/REPO names, got %r" % (where, repos))
         if "days" in own and (not _is_number(own["days"]) or own["days"] <= 0):
             raise ConfigError("%s.ownerless.days' must be a positive number of days, got %r" % (where, own["days"]))
         if "limit" in own and (not isinstance(own["limit"], int) or isinstance(own["limit"], bool) or not 100 <= own["limit"] <= 2000):
@@ -12585,7 +12931,7 @@ def triage_norm(issue):
             "section": sweep_has_section(body), "next_body": bool(isinstance(body, str) and TRIAGE_NEXT_RE.search(
                 SWEEP_QUOTED_RE.sub(" ", body))), "parent": parent_of(issue),
             "parked_until": parked_until(body, {(l.get("name") if isinstance(l, dict) else l) for l in issue.get("labels") or []}),
-            "owner_body": triage_names_owner(body),
+            "owner_body": triage_names_owner(body), "owner_name": triage_owner_name(body),
             "open_sub": isinstance(total, int) and isinstance(done, int) and total > done,
             "pending_text": load_triage_plan_open().pending_text(body),   # #410: its own text says work is left
             "captain": is_captain({"labels": {(l.get("name") if isinstance(l, dict) else l) for l in issue.get("labels") or []},
@@ -12825,6 +13171,7 @@ def triage_findings(engine, state, repos, decisions, cfg, now, errors):
     except (NoticeError, OSError, TypeError):
         pass
     out, unchecked, truncated = [], {}, []
+    agents_whole = whole(engine, "agents")[0]
     live_days = load_module("awaiting_live").days_of(engine.config)
     captain_listed = {sweep_ref_of(d, engine.config.get("intent_repo")) for d in decisions if d.get("kind") == "captain"}
     for repo in repos:
@@ -12860,6 +13207,10 @@ def triage_findings(engine, state, repos, decisions, cfg, now, errors):
             found, ours = triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs.get(repo, set()),
                                        captain_skip=captain_skip, merged=links, pending=pending,
                                        live=live["info"] if live else None, live_days=live_days)
+            if not agents_whole:   # #805: "no owner" is judged against the running agents: a fleet that was not read whole is no evidence of an absence
+                for rule in [r for r in found if "agents" in (triage_inputs(r) or ())]:
+                    found.pop(rule)
+                    whole_skipped(engine, "triage.owner_rules", "agents")
             if not found:
                 continue
             ref = "%s#%d" % (repo, number)
@@ -13022,7 +13373,8 @@ def triage_ownerless_options(cfg):
     if not isinstance(own, dict) or not own.get("repos"):
         return None
     module = load_module("triage_ownerless")
-    return {"repos": list(own["repos"]), "days": own.get("days", module.DEFAULT_DAYS), "limit": own.get("limit", module.DEFAULT_LIMIT),
+    return {"repos": list(own["repos"]), "label_owners": {r: dict((e or {}).get("label_owners") or {}) for r, e in own["repos"].items()} if isinstance(own["repos"], dict) else {},
+            "days": own.get("days", module.DEFAULT_DAYS), "limit": own.get("limit", module.DEFAULT_LIMIT),
             "owner_labels": list(own.get("owner_labels") or module.DEFAULT_OWNER_LABELS)}
 
 
@@ -13072,6 +13424,8 @@ def triage_ownerless_pass(engine, state, cfg, now):
     options = triage_ownerless_options(cfg)
     if options is None or engine.state_dir is None:
         return {}
+    if whole_skipped(engine, "triage.ownerless", "agents"):
+        return {}   # #805: an issue is ownerless when no running agent owns it: a fleet that was not read whole is no evidence of that
     module, shown = load_module("triage_ownerless"), {}
     try:
         discovery, ours = getattr(engine, "discovery", None), triage_our_logins(engine, cfg)
@@ -13084,7 +13438,10 @@ def triage_ownerless_pass(engine, state, cfg, now):
                 item = triage_norm(record)
                 if item is not None and item["state"] == "open":
                     items[item["number"]] = item
-            rows = module.ownerless_stale(items, triage_context(engine, repo, items, discovery), ours, options["owner_labels"], now, options["days"])
+            lanes = {name.lower() for name, agent in (discovery.agents.items() if discovery else [])   # a known lane: an orchestrator the daemon holds for the repository
+                     if (agent.fleet or {}).get("role") == "orchestrator" and (_fleet_repo(agent.fleet or {}, engine.config) == repo or (agent.fleet or {}).get("repo") == repo)}
+            rows = module.ownerless_stale(items, triage_context(engine, repo, items, discovery), ours, options["owner_labels"], now, options["days"],
+                                          options["label_owners"].get(repo), lanes)
             read, total = len(unit["data"]), unit.get("total")
             shown[repo] = {"count": len(rows), "read": read, "total": total, "oldest_days": int(rows[0][1]) if rows else None}
             if not rows:
@@ -13111,6 +13468,80 @@ def triage_ownerless_pass(engine, state, cfg, now):
     return shown
 
 
+def read_mark(engine, name, whole, reason, now):
+    """Record that the input `name` was (or was not) read whole in this pass: no error, not cut by a budget, not provisional.
+    The record lives in memory only, so a restart leaves every input not whole until its first whole read (#805)."""
+    reads = engine.__dict__.setdefault("read_whole", {})
+    reads[name] = {"whole": bool(whole), "reason": "" if whole else (reason or "not read whole"), "at": now}
+
+
+def whole(engine, name):
+    """(True, "") when `name` was read whole in the latest pass, else (False, why). Never read yet in this process is not whole."""
+    held = getattr(engine, "read_whole", {}).get(name)
+    if held is None:
+        return False, "not read yet in this process"
+    return held["whole"], held["reason"]
+
+
+def whole_skipped(engine, consumer, name):
+    """One debug audit line, at most once per pass and consumer, saying a destructive step was skipped because `name` was not whole."""
+    ok, why = whole(engine, name)
+    if ok:
+        return False
+    at = engine.read_whole.get(name, {}).get("at") if getattr(engine, "read_whole", None) else None
+    said = engine.__dict__.setdefault("read_whole_said", {})
+    if said.get((consumer, name)) != at:
+        said[(consumer, name)] = at
+        engine._note("whole.skipped", None, {"consumer": consumer, "input": name, "why": why})
+    return True
+
+
+def mark_decisions_read(engine, errors, now):
+    """The decision list is whole only with no error and a notice read that finished whole: a noticed PR the reader has no facts for
+    derives no held-PR row, so its absence is no evidence it left. Never inherited: an input no read marked, or whose read raised, is not whole."""
+    notices, notices_why = whole(engine, "notices")
+    why = "the decision list had errors" if errors else ("" if notices else notices_why)
+    read_mark(engine, "decisions", not errors and notices, why, now)
+
+
+def triage_mark_unit(engine, state, name, repo, units, now):
+    """Mark `<name>:<repo>` from the held units of that kind: whole only when every one is held, without error and not cut."""
+    bad = None
+    for unit_name in units:
+        unit = state.units.get((repo, unit_name))   # a unit never read, a failed read or a cut list is no evidence of an absence
+        if unit is None:
+            bad = "%s not read yet" % unit_name
+        elif unit.get("error"):
+            bad = "the last read of %s failed: %s" % (unit_name, unit["error"])
+        elif unit.get("truncated"):
+            bad = "the %s list was cut" % unit_name
+        if bad:
+            break
+    read_mark(engine, "%s:%s" % (name, repo), bad is None, bad or "", now)
+
+
+def triage_mark_reads(engine, state, repos, errors, now):
+    """The inputs the triage rules judge, marked from the reads this pass already made (no new read)."""
+    mark_decisions_read(engine, errors, now)
+    closed = ["closed:" + l for l in sorted(triage_awaiting_labels(engine))]
+    for repo in repos:
+        triage_mark_unit(engine, state, "issues", repo, ["issues"], now)
+        triage_mark_unit(engine, state, "comments", repo, ["comments"], now)
+        triage_mark_unit(engine, state, "merged", repo, ["merged"], now)
+        triage_mark_unit(engine, state, "closed", repo, closed, now)
+
+
+def triage_owner_tier_t6(engine, decisions):
+    """{("T6", ref)} for the merge-held PR decisions already at the owner's tier."""
+    out = set()
+    for d in decisions:
+        if d.get("kind") == "captain" and d.get("tier") == "human":
+            ref = sweep_ref_of(d, engine.config.get("intent_repo"))
+            if ref and ref[0]:
+                out.add(("T6", "%s#%d" % ref))
+    return out
+
+
 def triage_pass(engine, decisions, now, errors=()):
     """The triage's whole pass: refresh a few units, judge, re-check each candidate against a fresh read, audit, count,
     and (only when enabled) queue ONE batched fact for the Chief of Staff and the daily summary. Writes nothing to GitHub."""
@@ -13129,9 +13560,10 @@ def triage_pass(engine, decisions, now, errors=()):
     triage_read_live(engine, state, repos, now, budget, max(1, cfg.get("calls_per_pass", TRIAGE_CALLS_PER_PASS) // 3), seconds)
     triage_refresh_ownerless(engine, state, cfg, now, budget, seconds)   # #605: the team repositories' whole lists, after the shared units
     try:
-        plan_wake_pass(engine, state, repos, now)   # #765: the plans posted or edited, from the units just held
+        plan_wake_pass(engine, state, repos, now, budget)   # #765: the plans posted or edited, from the units just held
     except Exception as err:
         engine._note("plan_wake.error", "", {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
+    triage_mark_reads(engine, state, repos, errors, now)
     candidates, unchecked_units, truncated = triage_findings(engine, state, repos, decisions, cfg, now, errors)
     findings, unchecked, unchecked_other, oldest = [], 0, 0, 0.0
     why = {}   # #605: repo -> {reason: count}, and its other-owner share and oldest age, for the report
@@ -13214,8 +13646,9 @@ def triage_pass(engine, decisions, now, errors=()):
         state.current["plans_unapproved_more"] = max(0, len(held.unapproved) - load_triage_plan_open().MAX_LISTED)
     triage_write(engine, state)
     flagged = [(r, ref) for r, ref, _ in findings if r == "OO" and now - state.alarmed.get((r, ref), 0) >= cfg["realarm_hours"] * 3600]
+    owner_t6 = triage_owner_tier_t6(engine, decisions)
     due, invalid = triage_digest_due(engine, state, [(r, ref) for r, ref, _ in findings if r != "OO"],
-                                     [(r, ref) for r, ref, _ in candidates if r != "OO"], cfg, now)
+                                     [(r, ref) for r, ref, _ in candidates if r != "OO"], cfg, now, owner_t6)
     if cfg["enabled"] and cfg.get("backoff", True):   # #406: warm up first, then at most one digest per interval; a held digest keeps its memory untouched
         before = state.meta["swept"]
         open_units = sum(len(u) for u in unchecked_units.values()) + sum(1 for r in repos if (r, "issues") not in state.units and r not in state.unreadable)   # a list not read yet is a finding not checked
@@ -13231,7 +13664,7 @@ def triage_pass(engine, decisions, now, errors=()):
             due, invalid = [], []
     rolled = None
     if cfg["enabled"] and state.meta is not None:   # #766: the one daily line for T5 items listed before and still in the owner's tier
-        rolled = triage_digest.rollup(state.seen, state.meta, [ref for r, ref, _ in findings if r == "T5"], now)
+        rolled = triage_digest.rollup(state.seen, state.meta, [(r, ref) for r, ref, _ in findings if r == "T5" or (r, ref) in owner_t6], now)
         if rolled:
             state.facts["triage.rollup:%d" % int(now)] = (rolled, now)
             triage_digest.cost_record(engine.state_dir, now, rolled)
@@ -13271,13 +13704,25 @@ def triage_digest_memory(engine, state):
         state.meta = triage_digest.load_meta(engine.state_dir)
 
 
-def triage_digest_due(engine, state, ours, candidates, cfg, now):
+def triage_digest_keep(engine):
+    """keep(rule, ref) for the prune: True when the record's candidates could not be computed in this pass (#805)."""
+    def keep(rule, ref):
+        needs = triage_inputs(rule)
+        if needs is None:
+            return True   # a rule the table does not know: nothing about it is forgotten
+        repo = ref.rpartition("#")[0]
+        return any(whole_skipped(engine, "triage.prune", name if name in ("agents", "decisions") else "%s:%s" % (name, repo))
+                   for name in needs if name in ("agents", "decisions") or repo)
+    return keep
+
+
+def triage_digest_due(engine, state, ours, candidates, cfg, now, owner_t6=()):
     """([(rule, ref)] for this pass's one digest, [ref] with an invalid parked label); see bin/triage_digest.py."""
     triage_digest_memory(engine, state)
-    triage_digest.prune(state.seen, candidates)
+    triage_digest.prune(state.seen, candidates, triage_digest_keep(engine))
     mutes = triage_digest.load_mutes(engine.state_dir) if engine.state_dir else {}
     return triage_digest.select(state.seen, triage_digest_items(state), mutes, ours, now, cfg.get("backoff", True), state.alarmed,
-                                cfg["realarm_hours"] * 3600, PARKED_MAX_DAYS)
+                                cfg["realarm_hours"] * 3600, PARKED_MAX_DAYS, owner_t6)
 
 
 def triage_digest_commit(engine, state, shown, invalid, now):
@@ -13408,7 +13853,7 @@ def plan_wake_route(number, items, ctx, discovery, chiefs):
     return None
 
 
-def plan_wake_pass(engine, state, repos, now):
+def plan_wake_pass(engine, state, repos, now, budget=None):
     """Announce each new plan hash to its approver once, and list the plans that look unapproved. Never raises; reads nothing from GitHub."""
     wake = plan_wake_state(engine)
     module, check_module = load_triage_plan_open(), load_plan_check()
@@ -13416,7 +13861,7 @@ def plan_wake_pass(engine, state, repos, now):
     if discovery is None or discovery.problems:
         return
     chiefs = sorted(n for n, o in discovery.agents.items() if (o.fleet or {}).get("role") == "chief-of-staff")
-    consensus, listed, changed = None, [], False
+    consensus, sends, listed, changed = None, None, [], False
     for repo in repos:
         issues_unit, comments_unit = state.units.get((repo, "issues")), state.units.get((repo, "comments"))
         if issues_unit is None or comments_unit is None:
@@ -13450,25 +13895,53 @@ def plan_wake_pass(engine, state, repos, now):
             if (plan_hash in consensus or module.approved_by_comment(plan, plan_hash, by_issue.get(number, []), signed_by_fleet)
                     or module.cited_by_pr(repo, number, plan, pulls, parse_iso)):
                 continue
+            if sends is None:
+                sends = _audit_tail(engine.state_dir)   # #790: the sends the audit already holds, read once per pass and only for a plan no other form approved
+            if module.approved_by_send(plan, plan_hash, sends, signed_by_fleet):
+                continue
             url = module.plan_url(repo, number, plan["id"])
             key = "%s#%d:%s" % (repo, number, plan_hash)
             names = route[0]
             if key not in wake.announced and names:
                 own = raw[number][1]
+                source = number
                 done_when = parse_intent(own.get("body"))[1]
                 if route[1] == "work item":
                     parent_record = (raw.get((items[number] or {}).get("parent")) or (None, {}))[1]
-                    done_when = parse_intent(parent_record.get("body"))[1] or done_when
+                    if parse_intent(parent_record.get("body"))[1]:
+                        source, done_when = items[number]["parent"], parse_intent(parent_record.get("body"))[1]
+                stale, defect = False, ""
                 try:
-                    passed = check_module.check(body, done_when, None)["result"] == "pass"
+                    result = check_module.check(body, done_when, None)
+                    passed = result["result"] == "pass"
+                    defect = _one_line(str((result.get("defects") or [""])[0]), 160)
                 except Exception:
                     passed = False
-                text = module.line(number, url, plan_hash, passed)
+                if not passed:   # #802: a FAIL is confirmed against ONE fresh read of the issue that supplied the Done-when, never the cached body
+                    stale = True
+                    hub = getattr(engine, "hub", None)
+                    if hub is not None and (budget is None or budget[0] >= 1):
+                        if budget is not None:
+                            budget[0] -= 1
+                        try:
+                            fresh = hub._read_one(repo, "issues/%d" % source, now, fresh=True)
+                            fresh_done = parse_intent(fresh.get("body"))[1] if isinstance(fresh, dict) else None
+                        except Exception:
+                            fresh_done = None
+                        if fresh_done:
+                            stale = False
+                            try:
+                                result = check_module.check(body, fresh_done, None)
+                                passed = result["result"] == "pass"
+                                defect = _one_line(str((result.get("defects") or [""])[0]), 160)
+                            except Exception:
+                                passed = False
+                text = module.line(number, url, plan_hash, passed, stale and not passed)
                 for name in names:
                     wake.facts["plan:%s:%s" % (key, name)] = (text, now, name, repo, number)
                 wake.announced[key] = now
                 changed = True
-                engine._note("plan_wake.announced", "%s#%d" % (repo, number), {"hash": plan_hash, "to": names, "route": route[1], "check": "PASS" if passed else "FAIL"})
+                engine._note("plan_wake.announced", "%s#%d" % (repo, number), {"hash": plan_hash, "to": names, "route": route[1], "check": "PASS" if passed else "FAIL", "stale": bool(stale and not passed), "defect": "" if passed else defect})
             if now - posted >= module.UNAPPROVED_SECONDS:
                 listed.append("%s#%d" % (repo, number) if len(repos) > 1 else "#%d" % number)
     wake.unapproved = sorted(listed)
@@ -19590,6 +20063,93 @@ def cmd_waive(args, runner, now):
 cmd_waive.ledger = True   # state and GETs only; its own errors are usage errors
 
 
+# ---- #818: which open pull requests change the same files. Read-only information, never a block. Pure parsing and the two texts; the one bounded read is `read_open_overlap`.
+OVERLAP_LIST_CAP = 50    # the most open pull requests read, in one call
+OVERLAP_FILES_CAP = 100  # the most files of one pull request used; a pull request with more changed files is left out
+OVERLAP_SHOW_FILES = 3   # files named in a `shares` line
+OVERLAP_PATH_MAX = 300  # a longer path, or one with a control character, is not printed: the pull request is left out
+OVERLAP_SHOW_PRS = 5     # pull requests named in a `shares` line or a merge order
+
+
+def overlap_parse_listing(raw):
+    """{number: [paths]} of the pull requests whose whole file list was read. Anything else is left out, never guessed."""
+    out = {}
+    if not isinstance(raw, list):
+        return out
+    for item in raw[:OVERLAP_LIST_CAP]:
+        if not isinstance(item, dict) or isinstance(item.get("number"), bool) or not isinstance(item.get("number"), int):
+            continue
+        files, total = item.get("files"), item.get("changedFiles")
+        if not isinstance(files, list) or isinstance(total, bool) or not isinstance(total, int):
+            continue
+        if total > OVERLAP_FILES_CAP or len(files) != total:
+            continue   # truncated or over the cap: not the whole list
+        paths = [f.get("path") for f in files if isinstance(f, dict)]
+        if len(paths) != total or not all(isinstance(p, str) and 0 < len(p) <= OVERLAP_PATH_MAX and p.isprintable() for p in paths):
+            continue
+        out[item["number"]] = sorted(set(paths))
+    return out
+
+
+def overlap_shared(listing, number, other):
+    return sorted(set(listing.get(number) or ()) & set(listing.get(other) or ()))
+
+
+def overlap_shares_line(listing, number):
+    """`shares <file>, <file> with #N, #M`, or None. Files: the first OVERLAP_SHOW_FILES (sorted) changed by this pull request AND another listed one;
+    pull requests: the first OVERLAP_SHOW_PRS by number. None when this pull request's own list was not read or nothing overlaps."""
+    if not isinstance(listing, dict) or number not in listing:
+        return None
+    others = sorted(n for n in listing if n != number and overlap_shared(listing, number, n))
+    if not others:
+        return None
+    files = sorted({p for n in others for p in overlap_shared(listing, number, n)})
+    return "shares %s with %s" % (", ".join(files[:OVERLAP_SHOW_FILES]), ", ".join("#%d" % n for n in others[:OVERLAP_SHOW_PRS]))
+
+
+def overlap_waiting_order(listing, waited):
+    """Hints among held pull requests that share files. `waited` is [(number, since)] of the held ones (since: epoch seconds, smaller waited longer).
+    One hint per group of held pull requests linked by shared files, the one that has waited longest first: `merge order: #748, then #736 (shared files)`."""
+    held = {n: s for n, s in waited if n in (listing or {})}
+    seen, hints = set(), []
+    for start in sorted(held):
+        if start in seen:
+            continue
+        group, todo = set(), [start]
+        while todo:
+            n = todo.pop()
+            if n in group:
+                continue
+            group.add(n)
+            todo.extend(m for m in held if m not in group and overlap_shared(listing, n, m))
+        seen |= group
+        if len(group) > 1:
+            ordered = sorted(group, key=lambda n: (held[n], n))[:OVERLAP_SHOW_PRS]
+            hints.append("merge order: %s (shared files)" % ", then ".join("#%d" % n for n in ordered))
+    return hints
+
+
+def read_open_overlap(engine, repo, runner):
+    """{number: [paths]} of the open pull requests of `repo` whose whole file list was read , or None when it cannot be read. ONE bounded
+    `gh pr list` (at most OVERLAP_LIST_CAP pull requests, OVERLAP_FILES_CAP files each), cached on the engine for the call. CLI only: the daemon never calls it (#818)."""
+    cache = engine.__dict__.setdefault("_overlap_cache", {})
+    if repo in cache:
+        return cache[repo]
+    cache[repo] = None
+    try:
+        accounts = getattr(engine, "accounts", None) or GhAccounts(engine.config, engine.gh_runner or runner, engine.now)
+        refuse_excluded(engine.config, repo)
+        env = accounts.env_for(repo)
+        argv = [engine.config["gh"], "pr", "list", "--repo", repo, "--state", "open", "--limit", str(OVERLAP_LIST_CAP), "--json", "number,files,changedFiles"]
+        done = (engine.gh_runner or runner)(argv, capture_output=True, text=True, timeout=min(engine.config["call_timeout_seconds"], GITHUB_ROUTE_READ_TIMEOUT),
+                                            stdin=subprocess.DEVNULL, **({"env": env} if env is not None else {}))
+        if done.returncode == 0:
+            cache[repo] = overlap_parse_listing(json.loads(done.stdout or "[]"))
+    except Exception:   # advisory: whatever goes wrong, there is no line (never a wrong one) and nothing else changes
+        cache[repo] = None
+    return cache[repo]
+
+
 def cmd_gates(args, runner, now):
     """`gates <repo#N>`: read-only. One line per gate G0a to G8: status, who decides it, what is missing. Exit 0 when every
     tracked gate that applies to a PR is satisfied, 1 when something is missing, 2 when it cannot be read. Enforces nothing."""
@@ -19615,10 +20175,15 @@ def cmd_gates(args, runner, now):
     report["plan_source"] = ctx.source
     if first and ctx.source and not _same_plan(first, ctx.source, ctx.config.get("intent_repo")):
         report["plan_changed"] = "the PR's plan is now %s; its entries were recorded against %s (they are void)" % (ctx.source, first)
+    shares = overlap_shares_line(read_open_overlap(ctx.engine, ctx.repo, runner), ctx.number) if not ctx.unreadable else None   # #818: information only
     if args.json:
+        if shares:
+            report["shares"] = shares
         print(json.dumps(report, sort_keys=True))
     else:
         lines = plan_ledger.render_gates(report, ctx.pr)
+        if shares:
+            lines.append(shares)
         if ctx.unreadable:
             lines.append("PR not read: %s" % ctx.unreadable)
         if ctx.plan_problem:
@@ -20125,6 +20690,8 @@ def _chat_clear_pass(engine, decisions, now):
         engine.__dict__["chat_clear_mode"] = mode
         if previous is not None or why:
             engine.audit.append(engine.actor, "chat_clear.mode", "chat_clear", {"mode": mode, "was": previous, "why": why})
+    if whole_skipped(engine, "chat_clear.offers", "notices"):
+        return   # #805: a held PR whose notice was not read is absent from the holds: its offer (the head the person was shown) must not be forgotten and re-recorded
     cc = load_module("chat_clear")
     names = label_names(engine.config)
     holds = chat_clear_holds(decisions, names)
@@ -20886,8 +21453,10 @@ def ci_record_pass(engine, now):
             budget[0] -= sweep_pages_used(records, cut)
             state.lists[key] = (now, records)
             state.good[key] = (now, records, bool(cut) or len(records) >= LABEL_HOLD_LIST_CUT)
+            read_mark(engine, "pulls:" + key, not cut, "the open pull request list was cut", now)   # #811
         except GitHubUnavailable as err:
             budget[0] -= 1
+            read_mark(engine, "pulls:" + key, False, "the open pull request list could not be read", now)
             state.good.pop(key, None)   # a failed read is no evidence: the old list stays for the rows, never for a prune
             state.lists[key] = (now, state.lists.get(key, (0, []))[1])   # keep the old list and try again after the TTL
             engine._note("ci_record.unreadable", repo, {"repo": repo, "reason": _one_line(str(err), 160)})
@@ -21285,7 +21854,8 @@ def add_ledger_parsers(sub):
     waive.add_argument("--head", help="The PR head sha (default: read from GitHub)")
     gates = sub.add_parser("gates", help="Read-only: the plan's gates G0a to G8 for a PR, what each needs and who decides it. "
                                          "Also `gates mode <repo> shadow|enforce|off`, `gates off|on` (the global kill file) and "
-                                         "`gates preflight <repo>`")
+                                         "`gates preflight <repo>`. May add one `shares <file> with #N` line when another open PR changes the same files "
+                                         "(one read of at most 50 open PRs and 100 files each; information only)")
     common(gates, scenario=False)
     gates.add_argument("rest", nargs="*", help="With `mode`: <owner/repo> <shadow|enforce|off>")
     gates.add_argument("--json", action="store_true")
@@ -26130,12 +26700,20 @@ def coder_finished(obs, retired, last_reports):
     return (last_reports.get(name) or {}).get("state") in ("done", "failed")
 
 
+HELD_LINKS_WAIT_SECONDS = 900   # #796: after a start the alert waits at most this long for every human-tier held PR's links, so an unreadable one cannot silence it for ever
+
+
 def load_tick(engine, discovery):
     """The end of a pass: the load figures per orchestrator, and the alert to the Chief of Staff when a threshold is crossed. Reads no v2 and
     makes at most a bounded number of GitHub reads an hour; a source it cannot read means no wake. Returns what was sent."""
     if discovery is None or engine.state_dir is None:
         return []
+    if getattr(engine, "awaiting_first_full_pass", False):   # #796: the held-PR links come from the first full decisions pass; judging before it reads waiting-on-owner as 0
+        load_fleet_health().mark_waiting(engine.state_dir)   # status says so; the figures, the episodes and the alert are left exactly as they were
+        return []
     health, now = load_fleet_health(), engine.now()
+    waited = engine.__dict__.setdefault("links_wait_since", now) if hasattr(engine, "__dict__") else now
+    links_gate = getattr(engine, "awaiting_held_links", False) and now - waited < HELD_LINKS_WAIT_SECONDS   # #796: a start's held-PR links must be whole before the first alert; it lapses after a bound
     cfg = engine.config.get("load_alert") or dict(health.DEFAULTS)
     reminders = read_reminders(engine.state_dir)
     retired, last_reports = read_retired(engine.state_dir), _read_small(engine.state_dir, LAST_REPORT_FILE)
@@ -26208,8 +26786,11 @@ def load_tick(engine, discovery):
                  "begin_read": begin_read, "read_cost": read_cost}
     budget = SourceBudget(source_budget_seconds(engine.config, "load_alert"), engine.now)   # #494: the reads stop between calls when this pass's time is spent
     pending = []
-    sent = health.tick(health.Context(now=now, state_dir=engine.state_dir, cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, read_charters=read_charters, read_parent=read_parent, cos=cos, wake=wake,
-                                      time_up=budget.spent, pending=pending, reminders=reminders, pr_refs=pr_refs, **meter))
+    context = health.Context(now=now, state_dir=engine.state_dir, cfg=cfg, orchestrators=orchestrators, read_asks=read_asks, read_charters=read_charters, read_parent=read_parent, cos=cos, wake=wake,
+                                      time_up=budget.spent, pending=pending, reminders=reminders, pr_refs=pr_refs, links_gate=links_gate, notices_unread=getattr(engine, "notice_unread", 0), **meter)
+    sent = health.tick(context)
+    if getattr(context, "links_complete", False):
+        engine.awaiting_held_links = False   # #796: one pass with every human-tier held PR's links whole: the alert may judge from now on
     set_source_state(engine, "load_alert", pending)
     return sent
 

@@ -17,6 +17,8 @@ import importlib.util
 import json
 import os
 import re
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -38,6 +40,8 @@ CALLS_SPOOL = "agent-calls.jsonl"
 CALLS_LIMIT = 262144
 CALLS_ON = "agent-calls-hours.json"   # the daemon makes this file: counting is on only while a daemon folds the spool
 NO_NETWORK_GROUPS = ("auth", "config", "alias", "completion", "extension", "help", "version")
+
+APP_SKIP_GROUPS = ("config", "completion", "help", "version")   # only the groups that provably make no call skip the App path: `extension` and `alias` can run programs that call out, `auth` handles tokens
 
 
 def call_endpoint(args):
@@ -164,7 +168,8 @@ class Lookup:
             name, repo = data.get("name"), data.get("repo")
             self._ident = {"name": name if isinstance(name, str) and NAME_RE.match(name) else None,
                            "repo": repo if isinstance(repo, str) and REPO_RE.match(repo) else None,
-                           "own": data.get("own") is not False}   # False: the repo is only the default (`intent_repo`), the caller has none of its own
+                           "own": data.get("own") is not False,
+                           "role": data.get("role") if isinstance(data.get("role"), str) else None}   # False: the repo is only the default (`intent_repo`), the caller has none of its own
             if "read_repo" in data:   # #618: the one extra repository the worker may READ; present but not an exact `owner/name` is False (unreadable: the guard refuses)
                 extra = data["read_repo"]
                 self._ident["read_repo"] = extra if isinstance(extra, str) and READ_REPO_RE.fullmatch(extra) else False
@@ -184,6 +189,11 @@ class NoAccountMapped(Exception):
 class NoOwnRepository(NoAccountMapped):
     """The credential route for a caller with no repository of its own: only the configured DEFAULT repository is known for it, and the default repository's account
     is never a guess git may use (#473). The launcher records a worker's repository from its working directory; a worker with none is refused here."""
+
+
+class AppMintRefused(Exception):
+    """A repository is mapped to the GitHub App (`app_installations`) and its installation token could not be had, or the App configuration cannot be trusted:
+    the call is refused, and the stored login is never used instead (shims/app_mint.py)."""
 
 
 class AccountLookupFailed(Exception):
@@ -427,23 +437,101 @@ def read_account_env(gh, lookup, extra):
     return dict(os.environ, GH_TOKEN=token)
 
 
+APP_MODULE = [None, False]   # (module, tried): app_mint.py beside this file, loaded by path
+APP_CHILD = []                # the real gh child while a token file exists: a killed shim stops it too
+APP_DIRS = []                 # private directories holding a token for the real gh (hosts.yml); removed when the call ends
+
+
+def load_app():
+    if not APP_MODULE[1]:
+        APP_MODULE[1] = True
+        try:
+            path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "app_mint.py")
+            spec = importlib.util.spec_from_file_location("app_mint", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            APP_MODULE[0] = module
+        except Exception:
+            APP_MODULE[0] = None
+    return APP_MODULE[0]
+
+
+def app_config():
+    """(module, Config) when the owner maps any repository to the App, else None (the feature is off and nothing here runs). A config that names the App but cannot
+    be trusted, or a module that cannot be loaded, refuses (AppMintRefused): never the stored login."""
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    try:
+        with open(os.path.join(base, "fleet-switchboard", "config.json")) as handle:
+            named = "app_installations" in handle.read()
+    except FileNotFoundError:
+        return None
+    except Exception:
+        named = True   # a config that cannot be read is not known to name no App mapping
+    if not named:
+        return None
+    module = load_app()
+    if module is None:
+        raise AppMintRefused("gh: refused: the GitHub App module could not be loaded, so no call is made with the stored login")
+    try:
+        config = module.read_config()
+    except module.ConfigError as err:
+        raise AppMintRefused("gh: refused: the GitHub App configuration cannot be used (%s)" % _clean_reason(str(err)))
+    return (module, config) if config is not None else None
+
+
+def app_terminated(number, frame):
+    for child in APP_CHILD:
+        try:
+            child.terminate()
+        except OSError:
+            pass
+    sys.exit(128 + number)
+
+
+def app_cleanup():
+    while APP_DIRS:
+        shutil.rmtree(APP_DIRS.pop(), ignore_errors=True)
+
+
+def app_env(app, repo):
+    """The environment for the real gh when `repo` is mapped to the App: the installation token as a private hosts.yml in GH_CONFIG_DIR (neither argv nor an
+    environment value), every token variable removed. None when `repo` is not mapped. AppMintRefused when it is and no acceptable token can be had."""
+    module, config = app
+    if config.entry(repo) is None:
+        return None
+    try:
+        token = module.token_for(config, repo)
+        directory = module.write_hosts_dir(token)
+    except (module.MintRefused, OSError) as err:
+        raise AppMintRefused("gh: refused: no GitHub App token for %s (%s); the stored login is not used" % (_clean_reason(str(repo)), _clean_reason(str(err))))
+    APP_DIRS.append(directory)
+    for number in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(number, app_terminated)   # a killed shim still removes its token file (the finally in main)
+    return module.child_env(directory)
+
+
 def account_env(gh, lookup=None, strict=False, credential=False, args=None, read_repo=None):
     """The environment for the real gh with GH_TOKEN of the account that `gh_users` maps to the repo of the caller's RESOLVED
     identity (`fleet-switchboard whoami --json`: its session, never an inherited variable), the same map and the same
     `gh auth token --user` the daemon uses; so an inherited token never decides who an agent acts as. None leaves the
     environment as it is: no mapping, no switchboard (or one too old to answer), no repo, no token, the lookup deadline
     spent, any trouble. The token is only put in the child's environment: never printed, logged or put in argv."""
+    app = None
     try:
         if read_repo:
             return read_account_env(gh, lookup, read_repo)
         if os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1":
             return None   # the switchboard's own call (the daemon's, or a command's): it named its account; never re-identified
         users = config_users()
-        if not users:
+        words = command_words(args or [])
+        app = app_config() if (credential or not words or words[0] not in APP_SKIP_GROUPS) and not (args and not words) else None   # `gh --version` makes no call
+        if not users and app is None:
             return None   # no per-repository accounts are configured: nothing to bind to, whatever the caller is
         if not switchboard_binary():
             if credential:
                 raise NoAccountMapped("this shell (no switchboard to say which repository it is)")
+            if app is not None:
+                raise AppMintRefused("gh: refused: the App is configured and no switchboard can say which repository this is, so the stored login is not used")
             return None
         lookup = lookup or Lookup()
         ident = lookup.identity()
@@ -461,15 +549,31 @@ def account_env(gh, lookup=None, strict=False, credential=False, args=None, read
                 raise AccountLookupFailed("identity")
             if credential:
                 raise NoAccountMapped("this shell (it has no repository identity)")
+            if app is not None:
+                raise AppMintRefused("gh: refused: the App is configured and this shell has no repository identity, so the stored login is not used")
             return None
         matcher = load_matcher()
         if matcher is None or matcher.normal_repo(repo) is None:
             if credential or strict:
                 raise NoAccountMapped("repository %s" % _clean_reason(str(repo)))   # a repository that cannot be read is unmatched and refused, never defaulted
             return None
+        if app is not None:
+            if ident.get("own") is False and ident.get("role") != "chief-of-staff" and app[1].entry(repo) is not None:
+                # no repository of its own AND not the Chief of Staff (by the RECORDED role; a missing role counts as not): the repository above is the default or the one the
+                # command names, and neither is this caller's to write in
+                raise AppMintRefused("gh: refused: only the Chief of Staff, by its recorded role, may act for a repository it does not own: %s is mapped to the App and this caller has no repository of its own" % _clean_reason(str(repo)))
+            if ident.get("own") is not False:   # a caller WITH its own repository never gets another mapped repository's token by naming it (-R, a URL): refused, naming both
+                named = explicit_repo(args or [])
+                if named and matcher.normal_repo(named) is not None and matcher.normal_repo(named) != matcher.normal_repo(repo) and app[1].entry(named) is not None:
+                    raise AppMintRefused("gh: refused: this worker's repository is %s and the command names %s, which is mapped to the App: a worker acts only for its own repository" % (_clean_reason(str(repo)), _clean_reason(str(named))))
+            target = repo   # a caller with no repository of its own already has `repo` = the repository the command names (above)
+            got_env = app_env(app, target)   # a repository mapped to the App uses its installation token and nothing else
+            if got_env is not None:
+                COUNT_ACCOUNT[0] = "app"
+                return got_env
         account = matcher.account_for(users, repo)
         if not isinstance(account, str) or not account:
-            if credential:
+            if credential and users:
                 raise NoAccountMapped("repository %s" % repo)
             return None
         COUNT_ACCOUNT[0] = account   # for the call counter: the account's NAME only
@@ -479,11 +583,13 @@ def account_env(gh, lookup=None, strict=False, credential=False, args=None, read
         if not token and strict:
             raise AccountLookupFailed("token")
         return dict(os.environ, GH_TOKEN=token) if token else None
-    except (AccountLookupFailed, NoAccountMapped):
+    except (AccountLookupFailed, NoAccountMapped, AppMintRefused):
         raise
     except Exception:
         if credential:
             raise NoAccountMapped("this shell (its account could not be worked out)")   # the credential route never guesses: any trouble refuses
+        if app is not None:
+            raise AppMintRefused("gh: refused: the App is configured and the account could not be worked out, so the stored login is not used")
         return None
 
 
@@ -831,6 +937,8 @@ def review_probe(args, found, reason, lookup, gh):
         env = None
         try:
             env = account_env(gh, lookup)
+        except AppMintRefused as err:
+            return str(err)   # mapped to the App and no token: refused, the stored login is never used for the read
         except Exception:
             env = None
         repo, number = gate_resolve(parsed, gh, env, deadline)
@@ -901,6 +1009,8 @@ def gate_probe(args, lookup, gh=None):
         if gh is not None:
             try:
                 env = account_env(gh, lookup)
+            except AppMintRefused as err:
+                return ("refuse", str(err))
             except Exception:
                 env = None
         repo, number = gate_resolve(parsed, gh, env, deadline)
@@ -1012,6 +1122,8 @@ def hold_probe(args, lookup, gh, write):
         env = None
         try:
             env = account_env(gh, lookup, args=args)
+        except AppMintRefused as err:
+            return str(err), None, None
         except Exception:
             env = None
         got = module.check(args, module.Ctx(gh, env, lambda: lookup.identity().get("name"), write))
@@ -1042,6 +1154,13 @@ def refusal_text(err):
 
 
 def main(args):
+    try:
+        return run(args)
+    finally:
+        app_cleanup()   # a token file made for this call never outlives it
+
+
+def run(args):
     gh = real_gh()
     if gh is None:
         sys.stderr.write("gh: not found on PATH (the fleet shim found no real gh behind it)\n")
@@ -1085,11 +1204,18 @@ def main(args):
     except NoAccountMapped as err:
         sys.stderr.write(refusal_text(err))
         return 1
+    except AppMintRefused as err:
+        sys.stderr.write(str(err) + "\n")
+        audit_write(args, lookup, "refused", write, hold_repo, hold_number)
+        return 1
     except AccountLookupFailed:
         try:
             env = account_env(gh, Lookup(write=True), strict=True, args=args, **extra)   # retry the lookup ONCE with a fresh deadline
         except NoAccountMapped as err:
             sys.stderr.write(refusal_text(err))
+            return 1
+        except AppMintRefused as err:
+            sys.stderr.write(str(err) + "\n")
             return 1
         except AccountLookupFailed:
             sys.stderr.write("gh: account lookup failed, retry (the fleet shim could not find which GitHub account this write is for, and will not "
@@ -1099,6 +1225,10 @@ def main(args):
     audit_write(args, lookup, "passed", write, hold_repo, hold_number)
     count_call(args)
     if plan is None:
+        if APP_DIRS:   # a token file has to be removed after the call: gh runs as a child, not in place of this process
+            child = subprocess.Popen([gh] + args, env=env)
+            APP_CHILD.append(child)
+            return child.wait()
         if env is not None:
             os.execve(gh, [gh] + args, env)
         os.execv(gh, [gh] + args)
