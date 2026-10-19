@@ -335,6 +335,8 @@ REDACTED = [   # (text, the credential that must not survive)
     ("https://user:pass@host.example:8080/a/@x", "pass"),           # a port AFTER the credential
     ("https://tok3nvalue99@host.example/x", "tok3nvalue99"),        # a user-only credential
     ("ssh://git:s3cretpw@host.example/o/r", "s3cretpw"),
+    ("https://u:p@ss@host.example/x", "ss@"),                       # a raw @ in the password: its tail goes too
+    ("https://u:p@ss:w0rd@host.example:8443/x/@y", "w0rd"),
     ("https://u:1234abcd@h.example/x", "1234abcd"),
     ("Authorization: Bearer abcdefghijkl", "abcdefghijkl"),
     ("Authorization:\n Bearer abcdefghijkl\nnext", "abcdefghijkl"),   # an obsolete folded header
