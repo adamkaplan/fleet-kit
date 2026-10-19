@@ -139,6 +139,59 @@ class StopNonce(base.Base):
         self.assertEqual(code, 0, err)
         self.assertEqual(self.st(), before)
 
+    # The Secrets are judged by their own label (_mine), on EVERY path that deletes: a running pod's stop, a Failed pod's stop, and a stop with no pod.
+    LOOKALIKES = {"a longer nonce that starts with it": A + "00", "a shorter nonce that it starts with": A[:8], "another run's": B, "none": None}
+    PATHS = {"running pod": "Running", "failed pod": "Failed", "no pod": None}
+
+    def test_the_secrets_are_matched_exactly_on_every_path_that_deletes(self):
+        for path, phase in self.PATHS.items():
+            for which in ("secret", "run"):
+                for what, label in self.LOOKALIKES.items():
+                    with self.subTest(path=path, secret=which, label=what):
+                        self.write_state({"pods": {}, "hook_result": {"pushed": True, "wip_branch": "w"}})
+                        self.plant(A, ("secret", "run") + (("pod",) if phase else ()))
+                        st = self.st()
+                        if phase:
+                            st["pods"][self.name]["status"]["phase"] = phase
+                        n = self.name + ("-pw" if which == "secret" else "-run")
+                        if label is None:
+                            st["secret_labels"][n] = {}
+                        else:
+                            st["secret_labels"][n] = {"cw/run-id": label}
+                        self.write_state(st)
+                        code, out, err = self.stop("--run-id", A)
+                        after = self.st()
+                        self.assertEqual(code, 0, err)
+                        self.assertIn(n, after["secrets"])   # the look-alike's Secret is left whole, still labelled as it was
+                        self.assertEqual(after["secret_labels"][n], {} if label is None else {"cw/run-id": label})
+                        other = self.name + ("-run" if which == "secret" else "-pw")
+                        self.assertNotIn(other, after["secrets"])   # this run's own other Secret did go
+                        self.assertNotIn(self.name, after["pods"])
+
+    def test_a_failed_pod_of_this_run_is_deleted_by_the_nonce_with_its_own_secrets(self):
+        self.plant(A)
+        st = self.st()
+        st["pods"][self.name]["status"]["phase"] = "Failed"
+        self.write_state(st)
+        code, out, err = self.stop("--run-id", A)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.objects(), [])
+
+    def test_a_mismatch_writes_no_run_record(self):
+        self.plant(A)
+        rec = os.path.join(self.tmp.name, "records")
+        code, out, err = self.run_cli("stop", "coder7", "--run-id", B, "--record-dir", rec)
+        self.assertEqual(code, cw.EXIT_REFUSED)
+        self.assertFalse(os.path.exists(rec))
+
+    # U1 (the no-pod case)
+    def test_u1_a_stop_without_a_nonce_and_without_a_pod_deletes_nothing_and_exits_0(self):
+        self.plant(A, ("secret", "run"))
+        before = self.st()
+        code, out, err = self.stop()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.st(), before)
+
     # U1
     def test_u1_a_stop_without_a_nonce_acts_by_name_as_before(self):
         self.plant(B)
