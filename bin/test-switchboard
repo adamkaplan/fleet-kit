@@ -24696,6 +24696,47 @@ class TestIdentityCheck(ReportBase):
         self.assertEqual(done.returncode, 1, "no token for the read repository's account: refused")
         self.assertIsNone(seen)
 
+    def test_an_unexpected_error_on_a_read_repository_call_refuses_and_the_same_error_without_one_is_as_before(self):
+        """#618 PC-2: for a call that carries a read_repo, ANY unexpected exception in account_env refuses (never the inherited or stored token), one line naming the
+        cause class; the same exception on a call without read_repo keeps today's answer (None). One case per distinct failing step of the read route."""
+        class Boom(Exception):
+            pass
+
+        def raiser(*a, **k):
+            raise Boom("secret-looking detail")
+
+        def matcher(account_for):
+            return type("M", (), {"account_for": staticmethod(account_for), "normal_repo": staticmethod(lambda r: r)})
+
+        class Lk:
+            failed = False
+
+            def __init__(self, run):
+                self.run = run
+
+            def identity(self):
+                return {"name": "api", "repo": "acme-org/widget-service", "own": True}
+
+        users = lambda: dict(self.READ_USERS)
+        steps = {   # step: (config_users, load_matcher, Lookup.run)
+            "config": (raiser, lambda: matcher(lambda u, r: "acme-bot"), lambda *a, **k: None),
+            "matcher": (users, lambda: matcher(raiser), lambda *a, **k: None),
+            "token": (users, lambda: matcher(lambda u, r: "acme-bot"), raiser),
+        }
+        for step, (cfg, load, run) in steps.items():
+            for label, extra in (("read", {"read_repo": "acme-org/widget-api"}), ("plain", {})):
+                with self.subTest(step=step, call=label):
+                    shim = self.shim()
+                    shim.config_users, shim.load_matcher, shim.switchboard_binary = cfg, load, lambda: "sb"
+                    args = ["issue", "view", "5"] + (["-R", "acme-org/widget-api"] if extra else [])
+                    if extra:
+                        with self.assertRaises(shim.AppMintRefused) as ctx:
+                            shim.account_env("gh", Lk(run), args=args, **extra)
+                        self.assertIn("Boom", str(ctx.exception))
+                        self.assertNotIn("secret-looking", str(ctx.exception))
+                    else:
+                        self.assertIsNone(shim.account_env("gh", Lk(run), args=args))
+
     def test_groups_that_reach_any_repository_without_naming_one_and_attached_or_missing_flag_values_are_refused(self):
         for args in (("search", "code", "x"), ("search", "issues", "x", "--owner", "acme-org"), ("gist", "view", "abc"), ("status",), ("alias", "list"),
                      ("issue", "view", "5", "-Racme-org/other"), ("issue", "view", "5", "-R"), ("issue", "view", "5", "-R", "")):

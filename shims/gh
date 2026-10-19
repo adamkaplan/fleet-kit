@@ -585,7 +585,9 @@ def account_env(gh, lookup=None, strict=False, credential=False, args=None, read
         return dict(os.environ, GH_TOKEN=token) if token else None
     except (AccountLookupFailed, NoAccountMapped, AppMintRefused):
         raise
-    except Exception:
+    except Exception as err:
+        if read_repo:
+            raise AppMintRefused("gh: refused: the account for reading %s could not be worked out (%s), so the fleet shim will not run it with the inherited or stored token" % (_clean_reason(str(read_repo)), type(err).__name__))   # #618: a read-only extra repository never falls through to any other token
         if credential:
             raise NoAccountMapped("this shell (its account could not be worked out)")   # the credential route never guesses: any trouble refuses
         if app is not None:
