@@ -4956,7 +4956,7 @@ Typical work reaches the default branch in batches, so the owner clears one pull
 
 ### What batches and what goes straight
 
-Every change with an approved plan and a passing independent review merges into the repository's `integration` branch. Two kinds go straight to the default branch: an urgent fix (the Chief of Staff's waiver, logged) and anything the owner asks for alone. A change the impact floor holds is batched like any other: it is rated as usual on its own pull request into `integration` and cleared there, by the Chief of Staff up to Serious (the owner's standing order) and by the owner when it is High. So the batch pull request holds for the owner only if a row is High (decision D1, below).
+Every change with an approved plan and a passing independent review merges into the repository's `integration` branch. Two kinds go straight to the default branch: an urgent fix (the Chief of Staff's waiver, logged) and anything the owner asks for alone. A change the impact floor holds is batched like any other: it is rated as usual on its own pull request into `integration` and cleared there, by the Chief of Staff up to Serious (the owner's standing order, recorded on #834 as decision D1) and by the owner when it is High. So the batch pull request holds for the owner only if a row is High (decision D1, below).
 
 ### The cadence and who keeps the batch
 
@@ -4968,7 +4968,9 @@ From the moment the batch pull request is marked "batch PR ready for the owner's
 
 ### The sync
 
-The default branch is merged into `integration` by a true merge after every direct merge to the default branch (an urgent fix, a change the owner asked for alone) and before the batch pull request is marked ready. After a squash-merged batch, the default branch is merged into `integration` again (the content is the same, so the merge is trivial). None of these is ever part of the procedure: a force push, a rebase of a shared branch, an agent changing a ruleset.
+The default branch is merged into `integration` by a true merge after every direct merge to the default branch (an urgent fix, a change the owner asked for alone) and before the batch pull request is marked ready. After a squash-merged batch, the default branch is merged into `integration` again (the content is the same, so the merge is trivial).
+
+None of these is ever part of the procedure: a force push, a rebase of a shared branch, an agent changing a ruleset.
 
 ### An ask whose change is only in `integration`
 
@@ -4993,7 +4995,7 @@ The body is the owner v2 body plus one table with a row per change. Use neutral 
 ## Changes in this batch
 | Change | Impact | Hold reasons and who cleared them | Evidence |
 |---|---|---|---|
-| acme-org/widget-service#123: add a retry to the export job | Moderate | none | plan: acme-org/widget-service#120 comment; review: pass at its head; CI: green |
+| acme-org/widget-service#123: add a retry to the export job | Marginal | none | plan: acme-org/widget-service#120 comment; review: pass at its head; CI: green |
 
 ## Questions for you
 1. <a question>. Recommendation: <the answer you recommend>.
