@@ -28363,6 +28363,7 @@ scenarios:
 ```
 """
 LEDGER_HEAD = "a" * 40
+KEEP_OUT = object()   # a field a raw test record leaves out
 LEDGER_NEW_HEAD = "b" * 40
 
 
@@ -32997,12 +32998,15 @@ class TestImpactHold(LedgerBase):
         for name in (sb.plan_ledger.LEDGER_FILE, sb.plan_ledger.HEAD_FILE):
             self.world.state.joinpath(name).unlink(missing_ok=True)
 
-    def rate(self, severity, probability, reason="", role="reviewer", head=LEDGER_HEAD, pr="acme/app#9"):
+    def rate(self, severity, probability, reason="", role="reviewer", head=LEDGER_HEAD, pr="acme/app#9", action="auto"):
+        """Record a rating. `action` "auto" is the action of the cell (a helper that only emits VALID shapes: it hides a bad state, so every bad-shape test passes an explicit action or builds the raw record), None omits it."""
         entry = {"kind": "review_record", "pr": pr, "head": head, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "by_role": role,
                  "impact_severity": severity, "impact_probability": probability, "impact_reason": reason}
         cell = (sb.impact_floor.load_matrix()["cells"].get(severity) or {}).get(probability)
-        if cell:   # the action the reviewer would record for that cell (a record with no action rates nothing: #830's one reading)
+        if action == "auto" and cell:   # the action the reviewer would record for that cell (a record with no action rates nothing: #830's one reading)
             entry["impact_action"] = {"H": "hold", "2": "second-review", ".": "none"}[cell["action"]]
+        elif action != "auto" and action is not None:
+            entry["impact_action"] = action
         return sb.plan_ledger.append_entry(self.world.state, entry, self.world.clock.now())
 
     def cell_of(self, level):
@@ -33316,21 +33320,39 @@ class TestImpactHold(LedgerBase):
         module = sb.load_module("delegated_clear")
         daemon = ast.parse(self.real_source())
         fields = set(sb.IMPACT_RATING_FIELDS) | {"by_role"}
-        touching = sorted(n.name for n in daemon.body if isinstance(n, ast.FunctionDef) and any(isinstance(x, ast.Constant) and x.value in fields for x in ast.walk(n)))
-        self.assertTrue({"parse_review_block", "cmd_review"} <= set(touching), touching)
+        names = {"IMPACT_RATING_FIELDS", "IMPACT_CLASS_RE"}
+        def touches(node):   # a definition that builds, parses, defaults, fills or REGISTERS (an argparse flag or its default) a rating field
+            return any((isinstance(x, ast.Constant) and (x.value in fields or (isinstance(x.value, str) and re.fullmatch(r"--impact-(severity|probability|reason|class|action)", x.value)))) or (isinstance(x, ast.Name) and x.id in names) for x in ast.walk(node))
+        touching = sorted(n.name for n in daemon.body if isinstance(n, ast.FunctionDef) and touches(n))
+        self.assertTrue({"parse_review_block", "cmd_review", "add_review_parsers"} <= set(touching), touching)
         reach = module.closure(daemon, module.daemon_roots(rule))[0]
         self.assertIn("impact_rating_entries", reach)
-        self.assertEqual([n for n in touching if n not in reach], [], "every definition that reads or writes a rating field is in the closure of what she can never clear (completeness: derived from the code)")
+        self.assertEqual([n for n in touching if n not in reach], [], "every definition that reads, writes, defaults or registers a rating field is in the closure of what she can never clear (completeness: derived from the code)")
         for name in sorted(set(touching) | set(rule["rating_roots"])):
             with self.subTest(definition=name):
                 head, diff = self.edit_one_line_under(self.real_source(), name)
                 self.assertTrue(self.closure_check(head, diff), "a change to %s is refused a delegated clear" % name)
-        passed = []   # the mutant: the roots without the rating's code. A root another rule already refuses (cmd_review refers to a clear entry point) stays refused; the PARSER is the one only the roots refuse
+        import difflib
+        lines = self.real_source().split("\n")
+        flag_line = next(i for i, l in enumerate(lines) if "for flag in IMPACT_RATING_FIELDS:" in l)
+        argument_line = flag_line + 1
+        edits = {"a default on the rating flags": {argument_line: lines[argument_line].replace("dest=flag,", "dest=flag, default='Negligible',")},
+                 "the loop that registers the rating flags turned off": {flag_line: lines[flag_line].replace("in IMPACT_RATING_FIELDS:", "in ():")}}
+        passed = []   # the mutant: the roots without the rating's code. A root another rule already refuses (cmd_review refers to a clear entry point) stays refused; the parser and the flag registration are the ones only the roots refuse
+        for label, changed in edits.items():
+            with self.subTest(edit=label):
+                head = [changed.get(i, l) for i, l in enumerate(lines)]
+                self.assertNotEqual(head, lines)
+                diff = "\n".join(list(difflib.unified_diff(lines, head, lineterm="", n=3))[2:])
+                self.assertTrue(self.closure_check("\n".join(head), diff), "%s is refused a delegated clear" % label)
+                if not module.closure_refusals(self.real_source(), "\n".join(head), diff, module.daemon_roots(dict(rule, rating_roots=[])), set(rule["clear_entry_points"])):
+                    passed.append(label)
         for name in rule["rating_roots"]:
             head, diff = self.edit_one_line_under(self.real_source(), name)
             if not module.closure_refusals(self.real_source(), head, diff, module.daemon_roots(dict(rule, rating_roots=[])), set(rule["clear_entry_points"])):
                 passed.append(name)
-        self.assertIn("parse_review_block", passed, "without the rating roots a change to the parser passes: the roots are what refuse it")
+        for needle in ("parse_review_block", "add_review_parsers", "a default on the rating flags", "the loop that registers the rating flags turned off"):
+            self.assertIn(needle, passed, "without the rating roots a change to %s passes: the roots are what refuse it" % needle)
 
     def test_one_definition_of_rated_at_this_head_the_clear_and_every_other_reader_use_it(self):
         import ast
@@ -33391,12 +33413,59 @@ class TestImpactHold(LedgerBase):
                 self.score_config("Serious")
                 self.scored_pr(path)
                 for record in records:
-                    self.rate(record["sev"], record["prob"], reason=record["reason"], role=record["role"], head=record["head"], pr=record["pr"])
+                    self.rate(record["sev"], record["prob"], reason=record["reason"], role=record["role"], head=record["head"], pr=record["pr"], action="second-review")   # an explicit action: every record is "rated" under #830, so a bad shape reaches the judge
                 code, out, err = self.under()
                 self.assertEqual(code == 2, refused, err)
                 self.assertEqual(bool(self.deletes()), not refused)
                 if text:
                     self.assertIn(text, err)
+
+    def test_s21_every_spelling_of_a_floor_path_gets_the_same_floor_as_the_plain_path(self):
+        plain = "bin/reassign.py"
+        for spelling in (plain, "./bin/reassign.py", "bin//reassign.py", "BIN/REASSIGN.PY", "docs/../bin/reassign.py", "bin/./reassign.py"):
+            for level, refused in (("Low", True), ("Serious", False)):   # Low is below the floor on every spelling; Serious with the rule named clears on every spelling
+                with self.subTest(path=spelling, level=level):
+                    self.writes.clear()
+                    self.ledger_reset()
+                    self.score_config("Serious")
+                    self.scored_pr(spelling)
+                    self.rate(*self.cell_of(level), reason="applied " + self.floor_rule("authority"))
+                    code, out, err = self.under()
+                    self.assertEqual(code == 2, refused, (spelling, err))
+                    if refused:
+                        self.assertIn("below the floor", err)
+
+    def raw_record(self, **fields):
+        """A ledger record built WITHOUT the helper: any shape, including those the record command refuses (an older record with an action and no severity or probability)."""
+        entry = {"kind": "review_record", "pr": "acme/app#9", "head": LEDGER_HEAD, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "by_role": "reviewer"}
+        entry.update(fields)
+        return sb.plan_ledger.append_entry(self.world.state, {k: v for k, v in entry.items() if v is not KEEP_OUT}, self.world.clock.now())
+
+    def test_raw_mixed_records_reach_the_real_judge_and_the_bad_one_refuses_in_either_order(self):
+        low, high = self.cell_of("Low"), self.cell_of("High")
+        valid = dict(impact_action="none", impact_severity=low[0], impact_probability=low[1])
+        older = dict(impact_action="hold", impact_class="authority")   # every record made before this change: an action, no severity, no probability
+        shapes = {"an action and no severity or probability, after a valid Low": [valid, older], "the same, before it": [older, valid], "an action with an unknown severity": [valid, dict(valid, impact_severity="Huge")],
+                  "a good severity with no probability": [valid, dict(valid, impact_probability=KEEP_OUT)], "a good probability with no severity": [valid, dict(valid, impact_severity=KEEP_OUT)],
+                  "two records that disagree, low first": [valid, dict(valid, impact_severity=high[0], impact_probability=high[1], impact_action="hold")],
+                  "the author's record with an action": [dict(valid, by_role="coder")], "another head's record with an action": [dict(valid, head="d" * 40)]}
+        for label, records in shapes.items():
+            with self.subTest(label):
+                self.writes.clear()
+                self.ledger_reset()
+                self.score_config("Serious")
+                self.scored_pr()
+                for record in records:
+                    self.raw_record(**record)
+                code, out, err = self.under()
+                self.assertEqual(code, 2, err)
+                self.assertEqual(self.deletes(), [])
+                self.assertTrue(any(t in err for t in ("no severity and probability", "High", "no independent impact rating")), err)
+        self.ledger_reset()   # the control: the valid record alone clears
+        self.score_config("Serious")
+        self.scored_pr()
+        self.raw_record(**valid)
+        self.assertEqual(self.under()[0], 0)
 
     def test_s20_s23_no_agent_command_writes_the_threshold_and_no_committed_file_sets_one(self):
         daemon = Path(sb.__file__).read_text()

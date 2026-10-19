@@ -409,6 +409,7 @@
         ]
       },
       "rating_roots": [
+        "add_review_parsers",
         "cmd_review",
         "parse_review_block"
       ],

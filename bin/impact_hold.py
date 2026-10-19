@@ -829,7 +829,6 @@ def cmd_impact_delegated(args, runner, now):
             try:
                 found = module.file_order_line(cos_orders_text_of(read_cos_orders(config)["raw"]), entry["sha256"])
             except (CosOrdersError, OSError) as err:
-                found = None
                 bad.append("order %d: the owner's standing-orders file cannot be read (%s)" % (entry["number"], _one_line(str(err), 100)))
                 continue
             if found is None:

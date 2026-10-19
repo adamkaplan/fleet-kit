@@ -324,5 +324,17 @@ class DelegatedOrderCheck(DoctorCase):
         self.assertTrue(self.only(run, "delegated-order").startswith("ok "), run.output)
 
 
+    def test_a_malformed_delegated_clear_or_an_unloadable_configuration_fails(self):
+        for label, config in (("malformed", {"delegated_clear": {"orders": [{"number": 3, "sha256": "a" * 64, "source": "owner-file", "max_level": "High"}]}}), ("unloadable", None)):
+            with self.subTest(label):
+                tmp = tempfile.mkdtemp(prefix="test-fleet-doctor.")
+                self.addCleanup(shutil.rmtree, tmp, True)
+                run = DoctorRun(tmp, {})
+                home = Path(tmp) / "home"
+                (home / ".config" / "fleet-switchboard").mkdir(parents=True)
+                (home / ".config" / "fleet-switchboard" / "config.json").write_text(__import__("json").dumps(config) if config is not None else "{not json")
+                run.run()
+                self.assertTrue(self.only(run, "delegated-order").startswith("FAIL "), run.output)
+
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
