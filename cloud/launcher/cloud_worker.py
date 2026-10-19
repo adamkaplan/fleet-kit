@@ -72,6 +72,12 @@ def _raise_interrupted(signum, frame):
 TOKEN_SHAPES = [re.compile(p) for p in (
     r"gh[pousr]_[A-Za-z0-9]{6,}", r"github_pat_[A-Za-z0-9_]{6,}", r"eyJ[A-Za-z0-9_-]{6,}(?:\.[A-Za-z0-9_-]*)*",
     r"[A-Za-z0-9+/]{40,}={0,2}", r"[A-Za-z0-9_-]{40,}", r"[0-9a-fA-F]{40,}")]  # standard and URL-safe base64, hex
+# Credentials by SHAPE (a push error that echoes a request): an Authorization header of any scheme (any case and spacing,
+# also quoted as in JSON), and the user:password of a URL of any scheme (the password may be percent-encoded). Each is
+# replaced whole; they run BEFORE the token shapes so the surrounding text survives.
+CREDENTIAL_SHAPES = [(re.compile(p, re.I), r) for p, r in (
+    (r"""\bauthorization["']?[ \t]*[:=][ \t]*["']?[ \t]*(?:[a-z][\w.+-]*[ \t]+)?[^\s,;"']+""", "authorization: [redacted]"),
+    (r"""\b([a-z][a-z0-9+.-]*://)[^\s/?#@]*@""", r"\1[redacted]@"))]
 SCRUB_INPUT_MAX = 200000
 SCRUB_OUTPUT_MAX = 2 * SCRUB_INPUT_MAX   # a limit above the input maximum: redaction lengthens text (8 characters become 10), and a cut there would be silent
 MIN_FRAGMENT = 8
@@ -98,6 +104,8 @@ def scrub(text, secrets_known=(), limit=300):
                 out.append(text[i])
                 i += 1
         text = "".join(out)
+    for pat, repl in CREDENTIAL_SHAPES:
+        text = pat.sub(repl, text)
     for pat in TOKEN_SHAPES:
         text = pat.sub("[redacted]", text)
     return re.sub(r"[^\x20-\x7e]", "?", text)[:limit]
@@ -855,9 +863,9 @@ class Launcher:
             view = self._hook_view(res)   # every field text from the pod: a string, scrubbed, short
             self.last_hook = {k: view[k] for k in ("pushed", "wip_branch", "error")}
             self._hook_record(info, dict(view, ran=True))
-            if res.get("error"):
+            if view["error"]:
                 self.kube.annotate(name, kept="true")  # the pod is kept: the commit is not safe yet
-                raise CloudError("end hook could not push, pod kept: %s" % res["error"], EXIT_HOOK)
+                raise CloudError("end hook could not push, pod kept: %s" % view["error"], EXIT_HOOK)
             try:
                 self.kube.annotate(name, hook_ran="true")
             finally:
@@ -905,7 +913,7 @@ class Launcher:
             raw = res.get("skipped")
             return {"pushed": bool(res.get("pushed")), "wip_branch": text(res.get("wip_branch"), 200) or None,
                     "skipped": [text(x, 200) for x in raw if isinstance(x, str)][:50] if isinstance(raw, list) else [],
-                    "note": text(res.get("note")), "error": text(res.get("error"))}
+                    "note": text(res.get("note")), "error": text(res.get("error")) or ("end hook gave an unreadable error" if res.get("error") else "")}
         except Exception:
             return {"pushed": bool(res.get("pushed")), "wip_branch": None, "skipped": [], "note": "", "error": "end hook answer unreadable"}
 
