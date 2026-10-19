@@ -28498,8 +28498,7 @@ class TestPrSharesFiles(LedgerBase):
         self.assertEqual(self.shares(loud[1]), ["shares a with #12"])
         self.assertEqual(loud[0], quiet[0])
         self.assertNotIn("conflict", loud[1].lower())
-        mod = (BIN / "pr_overlap.py").read_text().lower()
-        self.assertNotIn("conflict", mod)
+        self.assertNotIn("conflict", "".join(inspect.getsource(f) for f in (sb.overlap_shares_line, sb.overlap_waiting_order)).lower())
         hints = sb.held_merge_order_hints([{"kind": "captain", "repo": "acme/app", "number": n, "since": sb.iso(n)} for n in (9, 12)], self.route, self.world.clock.now)
         self.assertTrue(hints and "conflict" not in hints[0].lower())
 
@@ -28565,12 +28564,11 @@ class TestPrSharesFiles(LedgerBase):
         self.assertEqual(self.list_calls, [])
 
     def test_merge_order_groups_transitively_caps_and_breaks_ties_by_number(self):
-        mod = sb.load_module("pr_overlap")
         chain = {1: ["a"], 2: ["a", "b"], 3: ["b"], 7: ["x"], 8: ["x"], 9: ["q"]}   # 1-2-3 linked through 2; 7-8 another group; 9 alone
-        hints = mod.merge_order(chain, [(1, 50), (2, 40), (3, 30), (7, 10), (8, 10), (9, 1)])
+        hints = sb.overlap_waiting_order(chain, [(1, 50), (2, 40), (3, 30), (7, 10), (8, 10), (9, 1)])
         self.assertEqual(hints, ["merge order: #3, then #2, then #1 (shared files)", "merge order: #7, then #8 (shared files)"])
         many = {n: ["s"] for n in range(1, 9)}
-        (hint,) = mod.merge_order(many, [(n, 100 - n) for n in many])
+        (hint,) = sb.overlap_waiting_order(many, [(n, 100 - n) for n in many])
         self.assertEqual(hint.count("#"), 5)
 
     def test_two_repos_prefix_each_hint_and_a_failed_read_gives_none(self):
