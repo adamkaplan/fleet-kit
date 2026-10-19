@@ -751,6 +751,9 @@ def validate_plan_gates_config(config, source):
         return
     try:
         config["plan_gates"] = plan_ledger.validate_plan_gates(config["plan_gates"], source)
+        for name, entry in config["plan_gates"]["repos"].items():   # #770: `item_checks` is declared by its own module; absent means none accepted
+            if "item_checks" in entry:
+                entry["item_checks"] = load_module("item_verdicts").validate_item_checks(entry["item_checks"], "%s: 'plan_gates.repos.%s'" % (source, name))
     except ValueError as err:
         raise ConfigError(str(err)) from None
 
@@ -10040,7 +10043,7 @@ PR_NOTICE_PASS_BUDGET = 15        # seconds one pass may spend reading notices' 
 PR_OPEN_CONFIRM_SECONDS = 300     # a PR last SEEN open longer ago than this, and not readable now, is not listed (its notice is kept; it returns when it can be read)
 PR_NOTICE_UNREADABLE_SECONDS = 3600  # a notice whose PR cannot be read for this long (OBSERVED: see decisions_from_notices) is dropped (was 7 days)
 PR_NOTICE_OBSERVE_MAX = 600          # the most one pass may add to that count: a suspended machine or a long gap is not observed time
-PR_VIEW_FIELDS = "title,state,additions,deletions,changedFiles,statusCheckRollup,reviewDecision,mergeable,headRefOid,body,author,reviews,comments,labels"
+PR_VIEW_FIELDS = "title,state,additions,deletions,changedFiles,statusCheckRollup,reviewDecision,mergeable,headRefOid,body,author,reviews,comments,labels,isDraft"
 _PR_SHORT = re.compile(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)$")
 _PR_URL = re.compile(r"^https?://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(pull|issues)/([0-9]+)(?:[/?#].*)?$")
 
@@ -10486,7 +10489,8 @@ def pr_facts_from(data):
             # commit is what makes it one event per push
             "mergeable": str(data.get("mergeable") or "").upper() or None,
             "checks": pr_checks_of(data.get("statusCheckRollup")),
-            "head": head, "refs": pr_body_refs(data.get("body"))}
+            "head": head, "refs": pr_body_refs(data.get("body")),
+            "draft": data.get("isDraft") is True}   # #770: gate G4 says a draft runs no tests
 
 
 def read_pr_facts(engine, repo, number, extra_fields=""):
@@ -17430,6 +17434,7 @@ def cmd_launch(args, runner, now, socket_call=None):
     print(json.dumps(done, sort_keys=True))
     if done.get("identity"):
         sys.stderr.write("%s: %s\n" % (PROG, done["identity"]))
+    register_item_tester(engine, state, args, repo, launched_by, done, now)   # #770: a tester launched for a work item with no pull request is registered for that item only
     boss = args.reports_to
     if boss is None and (brief or getattr(args, "checkpoint", None) or getattr(args, "overdue", None)):
         try:  # a launch with no --reports-to: the launching agent is who an overdue checkpoint should wake (the worker's metadata is unchanged)
@@ -19954,6 +19959,11 @@ def _ledger_context(args, runner, now, writable, parts=None, floor=False):
     repo, number, pr = _ledger_pr(args)
     entries, problem = plan_ledger.read_ledger(state)
     facts, body, senders, unreadable = pr_picture(engine, repo, number, state)
+    if writable:   # #770: an item's entries are written only by the item commands
+        why = item_entry_refusal(engine, repo, number, entries, unreadable)
+        if why:
+            _gates_audit(engine, "plan.item.refused", pr, {"item": pr, "why": why, "stage": "pull request command"})
+            raise LedgerCommandError("refused: %s" % why)
     facts = dict(facts or {}, body=body, notice_senders=senders, held_check=lambda: held_defects(body))
     if floor and facts.get("head"):
         facts["floor"] = gate_floor_fact(engine, state, repo, number, facts["head"])
@@ -20173,6 +20183,10 @@ def cmd_waive(args, runner, now):
         _gates_audit(engine, "gate.waiver.refused", pr, {"by": who, "why": "the ledger is not trustworthy"})
         raise LedgerCommandError("refused: the ledger is not trustworthy, nothing was recorded: %s" % problem)
     facts, body, senders, unreadable = pr_picture(engine, repo, number, state)
+    why = item_entry_refusal(engine, repo, number, entries, unreadable)   # #770: a work item's gates are not waived through the pull request command
+    if why:
+        _gates_audit(engine, "plan.item.refused", pr, {"item": pr, "why": why, "stage": "waive"})
+        raise LedgerCommandError("refused: %s" % why)
     ctx = types.SimpleNamespace(facts=dict(facts or {}, body=body, notice_senders=senders), unreadable=unreadable)
     head = _head_of(ctx, args)
     writers = plan_ledger.authors_of(entries, pr, senders, (facts or {}).get("author"))
@@ -20289,6 +20303,10 @@ def cmd_gates(args, runner, now):
     if args.pr == "ci-record":
         args.pr = args.rest[0] if args.rest else ""
         return cmd_gates_ci_record(args, runner, now)
+    if args.pr == "item":   # #770: `gates item <repo#N>` is a work item with no pull request
+        return cmd_item_gates(args, runner, now)
+    if args.pr == "item-ci-record":
+        return cmd_item_ci_record(args, runner, now)
     if args.pr == "preflight":
         args.pr = args.rest[0] if args.rest else ""
         return cmd_gates_preflight(args, runner, now)
@@ -20327,6 +20345,375 @@ def cmd_gates(args, runner, now):
 
 
 cmd_gates.ledger = True   # state and GETs only; its own errors are usage errors
+
+
+# ---------------------------------------------------------------- verdicts for a work item with no pull request (#770, plan fleet-kit#777)
+# The rules are bin/item_verdicts.py. This is the reading (GET only) and the writing (the ledger and the audit). The pull request RULES (`launched_testers_for`,
+# `plan_ledger.may_record_verdict`, `ci_record_core`) are untouched, and the ordinary pull request COMMANDS refuse an item (an issue number or a number with an item
+# registration: `item_entry_refusal`), so an item's entries are written only here. An item key is `owner/repo#N` of an ISSUE.
+
+def _item_of(args):
+    try:
+        repo, number, comment = parse_plan_source(args.item, None)
+    except PlanInputError:
+        raise LedgerCommandError("%r is not a work item: write owner/repo#N of an issue" % args.item) from None
+    if comment is not None or not repo:
+        raise LedgerCommandError("%r is not a work item: write owner/repo#N of an issue" % args.item)
+    return repo, number, load_module("item_verdicts").item_ref(repo, number)
+
+
+def item_issue(engine, repo, number):
+    """{"author", "body", "state", "parent"} of the ISSUE `repo#number`. A pull request is refused (its rules are the pull request's: use --pr)."""
+    try:
+        data = engine.intents._api("repos/%s/issues/%d" % (repo, number), repo)
+    except (IntentError, AttributeError) as err:
+        raise LedgerCommandError("%s#%d could not be read: %s" % (repo, number, _one_line(str(err), 160))) from None
+    if not isinstance(data, dict):
+        raise LedgerCommandError("%s#%d could not be read" % (repo, number))
+    if data.get("pull_request"):
+        raise LedgerCommandError("%s#%d is a pull request: use --pr (the pull request rules apply to it, not the work item rules)" % (repo, number))
+    user = data.get("user") if isinstance(data.get("user"), dict) else {}
+    return {"author": user.get("login") if isinstance(user.get("login"), str) else None, "body": data.get("body") if isinstance(data.get("body"), str) else "",
+            "state": data.get("state"), "parent": parent_of(data)}
+
+
+def item_chain(engine, repo, number, parent, limit=4):
+    """The issue numbers from the item up through its sub-issue parents (the ask, the charter): [item, ask, charter...]. An unreadable link ends the chain (fail closed)."""
+    chain, current = [number], parent
+    for _ in range(limit):
+        if not current or current in chain:
+            break
+        chain.append(current)
+        try:
+            current = parent_of(engine.intents._api("repos/%s/issues/%d" % (repo, current), repo))
+        except (IntentError, AttributeError):
+            break
+    return chain
+
+
+def item_context(args, runner, now, writable):
+    """The item's picture: engine, state, config, ledger, the issue, its plan (the PLAN: line of the issue body, never `--plan`, as for a pull request)."""
+    engine, state, config = build_engine(runner, now, "cli", writable=writable)
+    repo, number, item = _item_of(args)
+    entries, problem = plan_ledger.read_ledger(state)
+    if problem:
+        raise LedgerCommandError("the ledger is not trustworthy, nothing was recorded: %s" % problem)
+    issue = item_issue(engine, repo, number)
+    source = plan_source_for(getattr(args, "plan", None), entries, item, issue["body"], config.get("intent_repo"))
+    plan, plan_problem = None, None
+    if source:
+        try:
+            plan = checked_plan(config, source, getattr(args, "ask", None), runner, now)
+        except (PlanInputError, ValueError, ConfigError, IntentError) as err:
+            plan_problem = _one_line(str(err), 200)
+    own = False
+    if source:
+        try:
+            own = parse_plan_source(source, config.get("intent_repo"))[:2] == (repo, number)
+        except PlanInputError:
+            own = False
+    return types.SimpleNamespace(engine=engine, state=state, config=config, repo=repo, number=number, pr=item, item=item, entries=entries, problem=problem, facts={},
+                                 unreadable=None, source=source, plan=plan, plan_problem=plan_problem, issue=issue, plan_own=own)
+
+
+def _item_scenario(ctx, sid):
+    """The scenario an item may claim: one `claim_of` reads as `pr` (so never an epic or ask-level live one) and, in a shared plan, one sliced to this item."""
+    scenario = _scenario_of(ctx, sid)
+    why = load_module("item_verdicts").claim_problem(scenario, ctx.number, ctx.plan_own)
+    if why:
+        raise LedgerCommandError(why)
+    return scenario
+
+
+class ItemAgentsUnreadable(Exception):
+    """The running agents (or the retired list) could not be read: nothing about who wrote the item can be said, so a write refuses and a read says NOT READY."""
+
+
+def item_agents(ctx):
+    """({name: launch record}, {name: session}, {name: metadata.fleet}) like `launched_testers_for`, but a failure RAISES ItemAgentsUnreadable (fail closed at the read too)."""
+    try:
+        agents = ctx.engine.discover(ctx.engine.now()).agents
+        fleets = {name: (seen.fleet or {}) for name, seen in agents.items()}
+        sessions = {name: seen.session_id for name, seen in agents.items()}
+        state_dir = getattr(ctx.engine, "state_dir", None)
+        retired = read_retired_strict(state_dir) if state_dir is not None else {}
+    except Exception as err:
+        raise ItemAgentsUnreadable("the running agents cannot be read (%s: %s)" % (type(err).__name__, _one_line(str(err), 120))) from None
+    return load_launch_testers().launched(fleets, sessions, ctx.repo, lambda fleet: _fleet_repo(fleet, ctx.config), retired), sessions, fleets
+
+
+def item_entry_refusal(engine, repo, number, entries, unreadable):
+    """Why the ORDINARY pull request commands (prove, verdict, gates ci-record, waive) must not write for `repo#number`, or None. They refuse a number that is an ISSUE (the pull request
+    could not be read and GitHub says it is an issue) and a number that has an item registration: an item's entries are written only by item-prove, item-verdict and item-ci-record.
+    A real pull request is never affected (it is read, and has no registration)."""
+    ref = "%s#%d" % (repo, number)
+    if load_module("item_verdicts").registrations(entries, ref):
+        return "%s is a work item (a tester is registered for it): its proofs and verdicts are written only by item-prove, item-verdict and gates item-ci-record" % ref
+    if unreadable:
+        try:
+            item_issue(engine, repo, number)
+        except LedgerCommandError:
+            return None   # a pull request, or not readable at all: the pull request rules apply as they always did
+        return "%s is an issue, not a pull request: use item-prove or item-verdict for a work item" % ref
+    return None
+
+
+def _item_audit(ctx, event, detail):
+    _gates_audit(ctx.engine, event, ctx.item, dict(detail, item=ctx.item))
+
+
+def _item_writers(ctx, sessions=None, fleets=None):
+    """(writers, launch, sessions, fleets): the excluded set of the item and the launched testers, from ONE read of the running agents."""
+    launch, sessions, fleets = item_agents(ctx)
+    chain = item_chain(ctx.engine, ctx.repo, ctx.number, ctx.issue["parent"])
+    ask = chain[1] if len(chain) > 1 else None
+    return load_module("item_verdicts").excluded(ctx.item, ctx.number, ask, ctx.issue["author"], ctx.entries, fleets, sessions), launch, sessions, fleets
+
+
+def cmd_item_prove(args, runner, now):
+    """`prove <scenario>... --item <repo#N> --evidence ...`: the same proof as for a pull request, for a work item, at the item's reference commit."""
+    iv = load_module("item_verdicts")
+    ctx = item_context(args, runner, now, True)
+    caller = identify_caller(ctx.engine.herdr, ctx.engine.v2, os.environ)
+    if not caller:
+        raise LedgerCommandError("refused: a proof names who recorded it: run this as a fleet agent")
+    _plan_usable(ctx)
+    pin = iv.pinned(ctx.entries, ctx.item)
+    if not pin:
+        raise LedgerCommandError("%s has no reference commit yet: its orchestrator launches a tester with --issue for it first (that registration pins the commit)" % ctx.item)
+    refused = 0
+    for sid in dict.fromkeys(args.scenario):
+        try:
+            _item_scenario(ctx, sid)
+        except LedgerCommandError as err:
+            print("not recorded: %s: %s" % (sid, err), file=sys.stderr)
+            refused += 1
+            continue
+        evidence = _evidence(args)
+        found = _already_proven(ctx, sid, ctx.plan["plan_hash"], pin, args.result)
+        if found:
+            print("already recorded proof #%d: %s %s at %s (%s)" % (found["seq"], sid, args.result, pin[:8], ctx.item))
+            continue
+        entry = {"kind": "proof", "pr": ctx.item, "scenario": sid, "plan_ref": ctx.source, "plan_hash": ctx.plan["plan_hash"], "head": pin, "result": args.result,
+                 "by": caller, "evidence": evidence, "command": plan_ledger.clip(redact_command_text(args.command or "")), "via": "item",
+                 "env": "%s %s" % (sys.platform, "python%d.%d" % sys.version_info[:2])}
+        stored = plan_ledger.append_entry(ctx.state, entry, now())
+        _item_audit(ctx, "plan.item.proof", {"scenario": sid, "result": args.result, "by": caller, "reference_commit": pin, "seq": stored["seq"]})
+        print("recorded proof #%d: %s %s at %s (%s)" % (stored["seq"], sid, args.result, pin[:8], ctx.item))
+    return EXIT_PARTIAL if refused else EXIT_OK
+
+
+def cmd_item_verdict(args, runner, now):
+    """`verdict <scenario>|--all --item <repo#N> --as tester ...`: a tester registered for THIS item (by its orchestrator's launch) records a verdict at the item's
+    reference commit. `ci` is never typed: `gates item-ci-record` records it from the Checks API."""
+    iv = load_module("item_verdicts")
+    ctx = item_context(args, runner, now, True)
+    if args.evaluator != "tester":
+        raise LedgerCommandError("a work item takes `tester` verdicts from its registered tester (`ci` is recorded by `gates item-ci-record`; reviewer and owner verdicts are for pull requests): nothing was recorded")
+    caller = identify_caller(ctx.engine.herdr, ctx.engine.v2, os.environ)
+    _plan_usable(ctx)
+    if getattr(args, "all_scenarios", False):
+        if args.scenario:
+            raise LedgerCommandError("--all takes no scenario id")
+        targets = [x for x in ctx.plan["scenarios_parsed"] if plan_ledger.claim_of(x) == "pr" and plan_ledger.evaluator_of(x) == "tester"
+                   and iv.claim_problem(x, ctx.number, ctx.plan_own) is None]
+        if not targets:
+            raise LedgerCommandError("no scenario of this plan that this item may claim is judged by tester: nothing was recorded")
+        if not args.head:
+            raise LedgerCommandError("--all needs --head <sha> (the item's reference commit): a batch is never stamped with a guess")
+    else:
+        if not args.scenario:
+            raise LedgerCommandError("name the scenario (`verdict S1 --item ...`), or use --all")
+        scenario = _item_scenario(ctx, args.scenario)
+        if plan_ledger.evaluator_of(scenario) != "tester":
+            raise LedgerCommandError("scenario %s is judged by %s, not tester: nothing was recorded" % (args.scenario, plan_ledger.evaluator_of(scenario)))
+        targets = [scenario]
+    pin = iv.pinned(ctx.entries, ctx.item)
+    head = args.head or pin
+    try:
+        writers, launch, sessions, fleets = _item_writers(ctx)
+    except ItemAgentsUnreadable as err:
+        _item_audit(ctx, "plan.item.refused", {"scenario": args.scenario or "--all", "by": caller, "evaluator": "tester", "reference_commit": pin, "why": str(err)})
+        raise LedgerCommandError("refused: %s" % err) from None
+    why = None
+    if caller not in launch:
+        why = "%s is not a tester launched by an orchestrator of %s: only a registered tester of the lane may record a work item's verdict" % (caller, ctx.repo)
+    if why is None:
+        why = iv.verdict_problem(ctx.item, caller, ctx.entries, writers, sessions.get(caller), now(), head)
+    if why is None:
+        why = load_launch_testers().lane_refusal(caller, launch, writers, sessions, fleets)
+    if why:
+        _item_audit(ctx, "plan.item.refused", {"scenario": args.scenario or "--all", "by": caller, "evaluator": "tester", "reference_commit": pin, "why": why})
+        raise LedgerCommandError("refused: %s" % why)
+    evidence = _evidence(args)
+    regs = iv.registrations(ctx.entries, ctx.item)
+    reg = regs[-1] if regs else {}
+    entries = [{"kind": "verdict", "pr": ctx.item, "scenario": t["id"], "plan_ref": ctx.source, "plan_hash": ctx.plan["plan_hash"], "head": head, "result": args.result,
+                "by": caller, "evaluator": "tester", "evidence": evidence, "via": "item", "session": sessions.get(caller)} for t in targets]
+
+    def recheck(fresh):   # under the ledger's exclusive lock: only what lives in the ledger is re-read (the agents were read above, never under the lock)
+        problem = iv.verdict_problem(ctx.item, caller, fresh, writers | iv.ledger_writers(ctx.item, ctx.number, ctx.issue["author"], fresh), sessions.get(caller), now(), head)
+        if problem:
+            raise plan_ledger.LedgerError(problem)
+        return entries
+    try:
+        stored = plan_ledger.append_many_checked(ctx.state, recheck, now())
+    except plan_ledger.LedgerError as err:
+        _item_audit(ctx, "plan.item.refused", {"scenario": args.scenario or "--all", "by": caller, "evaluator": "tester", "reference_commit": pin, "why": str(err), "stage": "append"})
+        raise LedgerCommandError("refused: %s" % err) from None
+    for entry, one in zip(entries, stored):
+        _item_audit(ctx, "plan.item.verdict", {"scenario": entry["scenario"], "result": entry["result"], "by": caller, "reference_commit": head, "seq": one["seq"],
+                                               "chain": one["hash"], "registration_seq": reg.get("seq")})
+        print("recorded tester verdict #%d: %s %s at %s (%s)" % (one["seq"], entry["scenario"], args.result, head[:8], ctx.item))
+    return EXIT_OK
+
+
+cmd_item_prove.ledger = True      # state and GETs only; its own errors are usage errors
+cmd_item_verdict.ledger = True
+
+
+def item_gates_report(ctx, writers):
+    """{"item", "head", "plan_hash", "ready", "rows"}: G0a (the plan) and G1 (every scenario the item claims: proof and verdict at the reference commit, by a writer that is not excluded)."""
+    iv = load_module("item_verdicts")
+    pin = iv.pinned(ctx.entries, ctx.item)
+    seen = iv.visible(ctx.entries, ctx.item, plan_ledger.CI_RECORDER)   # an entry that cannot be tied to the item path (a pull request command wrote it) counts for nothing
+    rows = []
+    if ctx.plan is None:
+        rows.append({"gate": "G0a", "status": "missing", "missing": ["no plan found: put `PLAN: <link>` in the item's body"]})
+    elif ctx.plan["result"] != "pass":
+        rows.append({"gate": "G0a", "status": "missing", "missing": ["plan check fails: %d defect(s)" % len(ctx.plan["defects"])]})
+    else:
+        rows.append({"gate": "G0a", "status": "ok", "missing": [], "detail": "plan hash %s" % ctx.plan["plan_hash"]})
+    scen = []
+    if ctx.plan is not None and ctx.plan["result"] == "pass" and pin:
+        claimed = [s for s in ctx.plan["scenarios_parsed"] if plan_ledger.claim_of(s) == "pr" and iv.claim_problem(s, ctx.number, ctx.plan_own) is None]
+        scen = [plan_ledger.scenario_state(s, seen, ctx.item, ctx.plan["plan_hash"], pin, writers) for s in claimed]
+        bad = [s for s in scen if s["status"] != "ok"]
+        rows.append({"gate": "G1", "status": "missing" if bad or not scen else "ok", "missing": ["%s: %s" % (s["id"], "; ".join(s["missing"])) for s in bad] or ([] if scen else ["no scenario is claimed by this item"]),
+                     "detail": "%d of %d claimed scenarios proven and judged at %s" % (len(scen) - len(bad), len(scen), pin[:8])})
+    else:
+        rows.append({"gate": "G1", "status": "missing", "missing": ["no reference commit yet: its orchestrator launches a tester with --issue for it" if not pin else "needs a plan that passes G0a"]})
+    return {"item": ctx.item, "head": pin, "plan_hash": ctx.plan["plan_hash"] if ctx.plan else None, "scenarios": scen, "rows": rows,
+            "ready": all(r["status"] == "ok" for r in rows)}
+
+
+def cmd_item_gates(args, runner, now):
+    """`gates item <repo#N>`: read-only. G0a and G1 for a work item, at its reference commit, with the writers excluded NOW (a tester that later wrote loses its verdicts)."""
+    args.item = args.rest[0] if args.rest else ""
+    ctx = item_context(args, runner, now, False)
+    try:
+        writers = _item_writers(ctx)[0]
+        report = item_gates_report(ctx, writers)
+    except ItemAgentsUnreadable as err:   # fail CLOSED: with the agents unreadable the writer set shrinks, so nothing is read as accepted
+        report = {"item": ctx.item, "head": load_module("item_verdicts").pinned(ctx.entries, ctx.item), "plan_hash": ctx.plan["plan_hash"] if ctx.plan else None, "scenarios": [],
+                  "rows": [{"gate": "G1", "status": "missing", "missing": ["NOT READY: %s, so the writers of the item cannot be excluded" % err]}], "ready": False}
+    if args.json:
+        print(json.dumps(report, sort_keys=True))
+    else:
+        print("gates for %s at %s: %s" % (ctx.item, (report["head"] or "no reference commit")[:8], "READY" if report["ready"] else "NOT READY"))
+        print("plan hash: %s" % (report["plan_hash"] or "none"))
+        for row in report["rows"]:
+            print("%-4s %-8s %s" % (row["gate"], row["status"], "; ".join(row["missing"]) or row.get("detail", "")))
+    return EXIT_OK if report["ready"] else EXIT_ERROR
+
+
+def cmd_item_ci_record(args, runner, now):
+    """`gates item-ci-record <repo#N>`: the switchboard records the `ci` verdict of a work item from the Checks API at its reference commit. Any caller may run it: it
+    says only what the repository's own checks (`plan_gates.repos.<repo>.item_checks`, name AND app) say. An agent never types a ci verdict."""
+    iv = load_module("item_verdicts")
+    args.item = args.rest[0] if args.rest else ""
+    ctx = item_context(args, runner, now, True)
+    _plan_usable(ctx)
+    pin = iv.pinned(ctx.entries, ctx.item)
+    if not pin:
+        raise LedgerCommandError("%s has no reference commit: nothing was recorded" % ctx.item)
+    setting = plan_ledger.repo_setting(ctx.config, ctx.repo)
+    checks = (setting or {}).get("item_checks") or []
+    audit = {"scenarios": [], "recorded": [], "reference_commit": pin}
+    try:
+        runs, on_branch = [], False
+        if checks:
+            reader = ctx.engine.intents
+            default = (reader._api("repos/%s" % ctx.repo, ctx.repo) or {}).get("default_branch")
+            if isinstance(default, str) and default:
+                compare = reader._api("repos/%s/compare/%s...%s" % (ctx.repo, urllib.parse.quote(default, safe=""), pin), ctx.repo)
+                on_branch = isinstance(compare, dict) and compare.get("status") in ("identical", "behind")
+            data = reader._api("repos/%s/commits/%s/check-runs?per_page=100" % (ctx.repo, pin), ctx.repo)
+            runs = data.get("check_runs") if isinstance(data, dict) and isinstance(data.get("check_runs"), list) else []
+    except (IntentError, AttributeError) as err:
+        _item_audit(ctx, "plan.item.ci_record", dict(audit, ok=False, why="the checks could not be read: %s" % _one_line(str(err), 120)))
+        raise LedgerCommandError("the checks at %s could not be read: nothing was recorded" % pin[:8]) from None
+    ok, seen, why = iv.ci_decision(runs, checks)
+    if ok and not on_branch:
+        ok, why = False, "the reference commit %s is not on the default branch: its workflow files were not reviewed" % pin[:8]
+    audit.update(checks=seen, ok=ok)
+    if not ok:
+        _item_audit(ctx, "plan.item.ci_record", dict(audit, why=why))
+        raise LedgerCommandError("%s: nothing was recorded" % why)
+    wanted = [x for x in ctx.plan["scenarios_parsed"] if plan_ledger.claim_of(x) == "pr" and plan_ledger.evaluator_of(x) == "ci" and iv.claim_problem(x, ctx.number, ctx.plan_own) is None]
+    audit["scenarios"] = [x["id"] for x in wanted]
+    for scenario in wanted:
+        fresh = [e for e in ctx.entries if e.get("pr") == ctx.item and e.get("scenario") == scenario["id"] and e.get("kind") == "verdict" and e.get("evaluator") == "ci"
+                 and e.get("plan_hash") == ctx.plan["plan_hash"] and e.get("head") == pin and e.get("result") == "pass" and e.get("by") == plan_ledger.CI_RECORDER]
+        if not fresh:
+            plan_ledger.append_entry(ctx.state, {"kind": "verdict", "pr": ctx.item, "scenario": scenario["id"], "plan_ref": ctx.source, "plan_hash": ctx.plan["plan_hash"],
+                                                 "head": pin, "result": "pass", "by": plan_ledger.CI_RECORDER, "evaluator": "ci", "via": "item",
+                                                 "evidence": "the repository's checks passed at %s: %s" % (pin[:12], ", ".join(c["name"] for c in checks))}, now())
+            audit["recorded"].append(scenario["id"])
+    _item_audit(ctx, "plan.item.ci_record", audit)
+    print("CI is green at %s for %s: recorded %s" % (pin[:8], ctx.item, ", ".join(audit["recorded"]) or "nothing new"))
+    return EXIT_OK
+
+
+def register_item_tester(engine, state, args, repo, launched_by, done, now):
+    """After a `launch --role tester --issue N` of an ISSUE with no pull request: the switchboard itself writes the registration (a ledger entry and an audit line) when,
+    and only when, the caller (identified by its own pane) is the orchestrator of this repo that the tester reports to, the item is an open issue of this repo, and the
+    orchestrator's charter is in the item's parent chain. It never fails the launch: an unregistered tester can record nothing (fail closed)."""
+    if args.role != "tester" or args.issue is None or not repo:
+        return
+    item, why = "%s#%d" % (repo, int(args.issue)), None
+    try:
+        issue = item_issue(engine, repo, int(args.issue))
+    except LedgerCommandError as err:
+        if "is a pull request" in str(err):
+            return   # a pull request's tester registers as before: this path does not apply
+        why = str(err)
+        issue = None
+    try:
+        if why is None:
+            fleets = {n: (s.fleet or {}) for n, s in engine.discover(engine.now()).agents.items()}
+            boss = fleets.get(launched_by) if launched_by else None
+            iv = load_module("item_verdicts")
+            if not isinstance(boss, dict) or boss.get("role") != "orchestrator" or _fleet_repo(boss, engine.config) != repo:
+                why = "the launch was not run by an orchestrator of %s" % repo
+            elif args.reports_to != launched_by:
+                why = "the tester must report to the orchestrator that launches it"
+            elif issue["state"] != "open":
+                why = "%s is not open" % item
+            else:
+                chain = item_chain(engine, repo, int(args.issue), issue["parent"])
+                charter = boss.get("charter")
+                charter = int(charter) if isinstance(charter, (int, str)) and not isinstance(charter, bool) and str(charter).isdigit() else None
+                if not iv.lane_ok(chain, charter):
+                    why = "%s is not in the lane of %s: its parent chain %s does not reach the orchestrator's charter" % (item, launched_by, chain)
+        pin = None
+        if why is None:
+            default = (engine.intents._api("repos/%s" % repo, repo) or {}).get("default_branch")
+            tip = engine.intents._api("repos/%s/commits/%s" % (repo, urllib.parse.quote(str(default), safe="")), repo) if default else None
+            pin = tip.get("sha") if isinstance(tip, dict) else None
+            if not load_module("item_verdicts").sha_ok(pin):
+                why = "the default branch tip of %s could not be read" % repo
+        if why is None:
+            link = PLAN_LINE_RE.search(issue["body"] or "")
+            stored = plan_ledger.append_entry(state, {"kind": "item_tester", "pr": item, "item": item, "tester": args.name, "session": done.get("session"),
+                                                      "orchestrator": launched_by, "head": pin, "plan_ref": link.group(1).strip("<>.,") if link else None, "by": launched_by}, now())
+            _gates_audit(engine, "plan.item.register", item, {"item": item, "tester": args.name, "session": done.get("session"), "orchestrator": launched_by,
+                                                              "reference_commit": pin, "seq": stored["seq"], "chain": stored["hash"]})
+            return
+    except Exception as err:   # the launch has happened: say why nothing is registered, never raise
+        why = "%s: %s" % (type(err).__name__, _one_line(str(err), 160))
+    _gates_audit(engine, "plan.item.refused", item, {"item": item, "tester": args.name, "orchestrator": launched_by, "why": why, "stage": "registration"})
+    sys.stderr.write("%s: %s is NOT registered as a tester of %s: %s\n" % (PROG, args.name, item, _one_line(why, 200)))
 
 
 def gates_stats_core(entries, merged_at, limit=10):
@@ -20445,7 +20832,7 @@ def agent_block_states(engine, repo, matrix, paths, base, head):
 def pr_floor_report(engine, repo, number, rated_pairs=()):
     """Read one PR's files and decide: {"pr", "head", "floor_paths", "complete", "rated", "decision", "reasons", "globs"}. Reads only (one
     `gh pr view`). `rated_pairs` is the independent rating's (severity, probability) list, an input that can only ADD a hold."""
-    raw = read_pr_json(engine, repo, number, "files,baseRefOid,isDraft")
+    raw = read_pr_json(engine, repo, number, "files,baseRefOid")
     files = [f for f in (raw.get("files") if isinstance(raw.get("files"), list) else []) if isinstance(f, dict)]
     globs, exclude, force = impact_floor.floor_for(repo, engine.config)
     paths, renamed = [], []
@@ -20677,6 +21064,33 @@ def impact_records(state_dir):
         if entry.get("kind") == "review_record" and entry.get("reviewer") == "impact":
             found[(entry.get("pr"), entry.get("head"))] = (entry.get("impact_action"), entry.get("impact_class"))
     return found, None
+
+
+def _impact_rehold_now(engine, repo, number, pr, report, record):
+    """(#830) True when this judged pull request is HELD AGAIN at its head (a clear recorded for another head, none for this one, no rating here) and the hold was applied (or already
+    stands). Only on a whole read: an unreadable state or ledger returns False and changes nothing here (the caller then releases nothing either: `records_problem`). Raises on a failed
+    write, like the hold branch, so the caller backs off."""
+    state, problem = read_impact_state(engine.state_dir)
+    if problem or not report.get("head"):
+        return False
+    if rating_at(engine, pr, report["head"])[1]:
+        return False   # the ledger cannot be read: no change here, and the caller releases nothing either
+    why = rehold_reason(engine, state, repo, pr, report["head"])
+    if not why:
+        return False
+    apply_impact_hold(engine, repo, number, dict(report, reasons=[why], rehold=why, owner_decision="hold"), record)
+    return True
+
+
+def _impact_rehold_try(engine, repo, number, pr, report, record, now, seen):
+    """(#830) `_impact_rehold_now` for the pass: a failed write is said (`impact.error`), the retry time is set like the hold branch's, and "failed" is returned (it IS held again, so the
+    caller never releases it); True when the hold stands or was written, False when it is not held again."""
+    try:
+        return _impact_rehold_now(engine, repo, number, pr, report, record)
+    except Exception as err:
+        seen[(repo, number, "retry")] = now + IMPACT_RETRY_SECONDS
+        engine._note("impact.error", pr, {"error": _one_line(str(err), 160), "write": True})
+        return "failed"
 
 
 def _impact_cos(engine):
@@ -20970,7 +21384,7 @@ def impact_would_hold_pass(engine, now):
             enforce = impact_floor.hold_mode(engine.config, key) == "enforce"
             earlier = reports.get((key, number))
             backoff = seen.get((key, number, "retry"))
-            if earlier is not None and earlier["head"] == head and earlier.get("rule") == rule and earlier.get("owner_decision") != "hold" and enforce \
+            if earlier is not None and earlier["head"] == head and earlier.get("rule") == rule and earlier.get("owner_decision") != "hold" and enforce and not earlier.get("rehold") \
                     and not (backoff and now < backoff) and not records_problem and (pr, head) in records and seen.get((key, number)) != (head, rule, records[(pr, head)]):
                 # an impact review record that is new since this head was judged, on a pull request that holds nothing: no gh read (the paths are unchanged).
                 # A `hold` of a top tier, missing or unknown class can only ADD a hold; anything else changes nothing, so it is only noted as seen.
@@ -21027,6 +21441,12 @@ def impact_would_hold_pass(engine, now):
                         engine._note("impact.error", pr, {"error": _one_line(str(err), 160), "write": True})
                         unjudged += 1
                         continue
+            elif enforce and (rehold := _impact_rehold_try(engine, key, number, pr, report, record, now, seen)):   # (#830) cleared at an earlier head, none here: held again, never released
+                if rehold == "failed":   # the write failed: retried later, never marked done
+                    unjudged += 1
+                    continue
+                budget -= 1
+                report = dict(report, rehold=True)
             elif enforce and not records_problem:   # a release is a LOOSENING: only on a decision made from every input, never on a failed read
                 try:
                     removed = release_impact_hold(engine, key, number, report, record)
@@ -21981,6 +22401,21 @@ def add_ledger_parsers(sub):
     verdict.add_argument("--as", dest="evaluator", required=True, choices=("ci", "tester", "reviewer", "owner"))
     verdict.add_argument("--result", choices=("pass", "fail"), required=True)
     verdict.add_argument("--evidence", required=True, help="A link, or the evaluator's own artefact")
+    # #770: a work item with no pull request has its own commands (the pull request commands above keep their exact surface)
+    iprove = sub.add_parser("item-prove", help="Record proof for a plan scenario of a work item that has no pull request, at its reference commit")
+    iverdict = sub.add_parser("item-verdict", help="A tester registered for a work item (by its orchestrator's launch) records its verdict, at the item's reference commit")
+    for p in (iprove, iverdict):
+        p.add_argument("scenario", nargs="+" if p is iprove else "?", default=None if p is iverdict else argparse.SUPPRESS, help="The scenario id in the item's plan (S1, U2, ...)")
+        p.add_argument("--item", required=True, help="The work item: owner/repo#N of an ISSUE (a pull request is refused: use prove/verdict --pr)")
+        p.add_argument("--plan", help="Only repeats the plan the issue body links with `PLAN:`")
+        p.add_argument("--ask", help="The ask whose Done-when the plan must cover")
+        p.add_argument("--head", help="The item's reference commit (default: the one pinned at registration)")
+        p.add_argument("--evidence", required=True, help="A link, or what you ran and saw")
+    iprove.add_argument("--result", choices=("pass", "fail"), default="pass")
+    iprove.add_argument("--command", help="The command you ran, if any")
+    iverdict.add_argument("--all", dest="all_scenarios", action="store_true", help="Every scenario of the plan this item may claim and the tester judges")
+    iverdict.add_argument("--as", dest="evaluator", default="tester", choices=("tester",), help="Only tester verdicts: `ci` is recorded by `gates item-ci-record`")
+    iverdict.add_argument("--result", choices=("pass", "fail"), required=True)
     waive = sub.add_parser("waive", help="The chief of staff's logged override of gates G0 to G5 for one PR at its head (a hotfix); "
                                          "never G6, G7 or G8, never by a writer of the PR",
                            description="Waive gates G0 to G5 for ONE PR at its CURRENT head, for a hotfix: the chief of staff (or a "
