@@ -11039,17 +11039,17 @@ class TestAgentShellCalls(Base):
         self.shim("api", "repos/acme/app/issues/6")
         self.users({"acme/app": "acme-b"})
         self.shim("pr", "view", "3", env={"FLEET_SWITCHBOARD_BIN": "/nonexistent"})          # no identity and no role: unknown
-        self.shim("pr", "view", "3", env={"FLEET_SWITCHBOARD_BIN": "/nonexistent", "FLEET_SWITCHBOARD_ROLE": "tester"})
-        self.assertEqual([json.loads(l).get("lane") for l in (self.state / "agent-calls.jsonl").read_text().splitlines()], ["worker", "worker", "unknown", "tester"])
+        self.shim("pr", "view", "3", env={"FLEET_SWITCHBOARD_BIN": "/nonexistent", "FLEET_SWITCHBOARD_ROLE": "tester"})   # a caller's variable never names its lane
+        self.assertEqual([json.loads(l).get("lane") for l in (self.state / "agent-calls.jsonl").read_text().splitlines()], ["worker", "worker", "unknown", "unknown"])
         sb.agent_calls.fold(str(self.state), time.time(), {"acme-a": {"issues/#": 2}})
         hours, _ = sb.agent_calls.load_hours(str(self.state))
         lanes = {}
         for row in hours.values():
             for lane, accounts in row.get("lanes", {}).items():
                 lanes[lane] = sum(sum(e.values()) for e in accounts.values())
-        self.assertEqual(lanes, {"worker": 2, "tester": 1, "unknown": 1, "daemon": 2})
+        self.assertEqual(lanes, {"worker": 2, "unknown": 2, "daemon": 2})
         text = "\n".join(sb.agent_calls.status_lines(str(self.state), time.time()))
-        self.assertIn("this hour per lane: daemon 2, worker 2, tester 1, unknown 1", text)
+        self.assertIn("this hour per lane: daemon 2, unknown 2, worker 2", text)
         self.assertIn("lane worker: acme-a 2 (api issues/# 2)", text)
 
     def test_lane_an_old_spool_line_without_a_lane_is_read_as_unknown_and_a_hostile_lane_is_cleaned(self):
@@ -11068,6 +11068,11 @@ class TestAgentShellCalls(Base):
         record = (self.state / "agent-calls-hours.json").read_text()
         for leak in ("secrettoken", "secretbody", "queryvalue", "acme/app"):
             self.assertNotIn(leak, record)
+
+    def test_lane_a_failed_write_leaves_no_temp_file(self):
+        with mock.patch.object(sb.agent_calls.os, "replace", side_effect=OSError("no")):
+            self.assertFalse(sb.agent_calls._write_json(str(self.state / "x.json"), {"a": 1}))
+        self.assertEqual([f.name for f in self.state.iterdir() if f.name.startswith(".agent-calls-")], [])
 
     def test_lane_lanes_are_bounded_per_hour(self):
         lanes = "\n".join(json.dumps({"ts": int(time.time()), "account": "a", "endpoint": "pr view", "lane": "l%d" % i}) for i in range(60))

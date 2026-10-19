@@ -105,12 +105,10 @@ def call_endpoint(args):
 
 
 def call_lane():
-    """The lane of this call: the agent's fleet name when the identity lookup already found it, else its role (`FLEET_SWITCHBOARD_ROLE`), else `unknown`.
-    A name or a role only: never a value of an argument."""
-    for candidate in (COUNT_LANE[0], os.environ.get("FLEET_SWITCHBOARD_ROLE")):
-        if isinstance(candidate, str) and LANE_RE.match(candidate):
-            return candidate
-    return "unknown"
+    """The lane of this call: the fleet name (else the role) from the SAME identity answer the shim already fetched, else `unknown`. The caller's environment is never
+    read for it (a caller could name any lane). A name or a role only: never a value of an argument."""
+    candidate = COUNT_LANE[0]
+    return candidate if isinstance(candidate, str) and LANE_RE.match(candidate) else "unknown"
 
 
 def count_call(args):

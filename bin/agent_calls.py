@@ -112,6 +112,7 @@ def _read_json(path):
 
 
 def _write_json(path, body):
+    tmp = None
     try:
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=".agent-calls-")
         with os.fdopen(fd, "w") as handle:
@@ -119,7 +120,12 @@ def _write_json(path, body):
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
         return True
-    except OSError:
+    except (OSError, ValueError, TypeError):
+        if tmp:
+            try:
+                os.unlink(tmp)   # a failure after the temp file was made leaves nothing behind
+            except OSError:
+                pass
         return False
 
 
