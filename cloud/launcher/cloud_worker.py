@@ -1155,7 +1155,7 @@ def _reap_main(L, a, sleep):
         raise
     finally:
         L._restore_signals(old)
-        print("cloud-worker: reaper exiting: %s" % why, file=sys.stderr)
+        print("cloud-worker: %s reaper exiting: %s" % (iso(L.clock()), why), file=sys.stderr)   # reason and UTC time, once
 
 
 def main(argv=None, env=None, clock=None, sleep=time.sleep):

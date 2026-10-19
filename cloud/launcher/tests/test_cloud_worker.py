@@ -538,12 +538,14 @@ class S5EndHook(Base):
         with redirect_stderr(err), redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
             cw.main(["reap"], self.env, self.clock, lambda s: None)
         self.assertEqual(err.getvalue().count("reaper exiting: error: boom"), 1)
+        self.assertRegex(err.getvalue(), r"cloud-worker: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ reaper exiting: error: boom")
 
     def test_the_reaper_says_why_it_exits_once(self):
         code, _, err = self.run_cli("reap")
         self.assertEqual(code, 0)
         self.assertEqual(err.count("reaper exiting:"), 1)
         self.assertIn("end of its pass", err)
+        self.assertRegex(err, r"cloud-worker: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ reaper exiting: end of its pass")
 
         def boom(self_):
             raise cw.Interrupted("signal 15")
@@ -554,6 +556,7 @@ class S5EndHook(Base):
         self.assertEqual(code, cw.EXIT_INTERRUPTED)
         self.assertEqual(err.count("reaper exiting:"), 1)
         self.assertIn("signal 15", err)
+        self.assertRegex(err, r"cloud-worker: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ reaper exiting: stopped by signal 15")
 
     def test_reaper_keeps_a_pod_whose_push_failed(self):
         work, _ = make_repo(self.tmp.name, "r", dirty=True)
