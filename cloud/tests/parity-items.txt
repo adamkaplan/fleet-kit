@@ -4,7 +4,6 @@
 # Format: `open N` or `closed N` (an issue or a pull request number), one per line.
 open 543
 open 705
-open 829
 closed 370
 closed 371
 closed 539
@@ -20,6 +19,7 @@ closed 659
 closed 665
 closed 691
 closed 832
+closed 829
 closed 651
 closed 747
 closed 755
