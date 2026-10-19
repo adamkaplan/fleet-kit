@@ -12,6 +12,7 @@ anything.
 The last line printed is `RESULT: PASS` or `RESULT: FAIL`, and the exit code
 is non-zero on failure.
 """
+import argparse
 import ast
 import traceback
 import base64
@@ -33393,7 +33394,7 @@ class TestImpactHold(LedgerBase):
                     if called in ("globals", "vars", "locals", "__import__", "import_module", "eval", "exec", "setattr") or (called == "getattr" and not (len(x.args) > 1 and isinstance(x.args[1], ast.Constant))):
                         found.setdefault(name, set()).add(called)
         followed = {"resolve_command": {"globals"}, "command_registrars": {"globals"}}   # the walker follows these: the literal "cmd_" and REGISTRAR_NAME_RE are edges for the named actions
-        inside_a_root = {"cmd_review": {"setattr", "getattr"}}   # the loop over the rating field table: a root itself, nothing leaves it
+        inside_a_root = {"main": {"globals"}, "rating_inputs": {"vars"}}   # `main`'s own tripwire reads (a root itself) and the private parser's own namespace (reached from cmd_review, a root): nothing leaves them
         self.assertEqual(found, {k: v for k, v in dict(followed, **inside_a_root).items() if k in found}, "a NEW dynamic edge on the path to the rating code is a decision: follow it in the walker or list it here with its reason")
         # the two string edges are really followed: without the dynamic actions the resolver does not reach cmd_review
         plain = module.closure(daemon, ["resolve_command"], ())[0]
@@ -33530,6 +33531,196 @@ class TestImpactHold(LedgerBase):
         self.scored_pr()
         self.raw_record(**valid)
         self.assertEqual(self.under()[0], 0)
+
+    # ---- #835 round 4: the rating's inputs are immune to the shared parser (a registrar's defaults, a replaced parser, a wrapper), at the point of use
+
+    RATING_FLAGS = ("--reviewer", "impact", "--verdict", "approve")
+    HOSTILE_DEFAULTS = {"impact_severity": "Negligible", "impact_probability": "Improbable", "impact_reason": "floor-authority", "impact_action": "none", "impact_class": "data", "block": "/nonexistent/block.txt"}
+
+    def record_run(self, flags=(), registrars=(), argv=None):
+        """Run the REAL `review record` as the reviewer role with hostile registrars injected into the module's globals before the real `build_parser()` runs. (code, stderr, the entry written without its chain fields or None)."""
+        self.world.add_agent("rev", fleet={"role": "reviewer"}) if "rev" not in self.world.sessions else None
+        self.ledger_reset()
+        patchers = [mock.patch.object(sb, name, fn, create=True) for name, fn in registrars]
+        for patcher in patchers:
+            patcher.start()
+        try:
+            if argv is None:
+                code, out, err = self.run_as("rev", "review", "record", self.PR, *self.RATING_FLAGS, *flags)
+            else:
+                os.environ["HERDR_PANE_ID"] = self.world.panes["rev"]
+                with captured() as (o, e), mock.patch.object(sys, "argv", ["fleet-switchboard"] + list(argv)), mock.patch.object(sb, "owner_terminal_problem", lambda *a, **k: self.terminal_problem):
+                    code = sb.main(None, runner=self.route, now=self.world.clock.now, wait=lambda sock, seconds: False, socket_call=self.world.herdr.socket)
+                err = e.getvalue()
+        finally:
+            for patcher in patchers:
+                patcher.stop()
+        entries = [e for e in sb.plan_ledger.read_ledger(self.world.state)[0] if e["kind"] == "review_record"]
+        return code, err, ({k: v for k, v in entries[-1].items() if k not in ("seq", "ts", "prev", "hash")} if entries else None)
+
+    EXPLICIT = ("--impact-severity", "Critical", "--impact-probability", "Improbable", "--impact-reason", "applied floor-authority", "--impact-action", "second-review", "--impact-class", "data")
+
+    def record_pr_setup(self):
+        self.score_config()
+        self.scored_pr()
+
+    def hostile_registrars(self):
+        """Each hostile registrar, as (label, [(name, add_*_parsers function)]). They are REAL registrars: the real discovery loop calls them."""
+        def record_parser(sub):
+            review = sub.choices["review"]
+            return review, review._subparsers._group_actions[0].choices["record"]
+
+        def defaults_on(dest, where):
+            def registrar(sub):
+                review, record = record_parser(sub)
+                (review if where == "review" else record).set_defaults(**{dest: self.HOSTILE_DEFAULTS[dest]})
+            return registrar
+
+        def replaced(sub):
+            fresh = argparse.ArgumentParser().add_subparsers(dest="action")
+            sb.add_review_parsers(fresh)
+            record = fresh.choices["review"]._subparsers._group_actions[0].choices["record"]
+            record.set_defaults(**self.HOSTILE_DEFAULTS)
+            sub.choices["review"] = fresh.choices["review"]
+            sub._name_parser_map["review"] = fresh.choices["review"]
+
+        def same_dest(sub):
+            record_parser(sub)[1].add_argument("--zz", dest="impact_severity", default="Negligible")
+
+        class Setter(argparse.Action):
+            def __call__(self, parser, namespace, values, option_string=None):
+                namespace.impact_severity = "Negligible"
+                namespace.impact_probability = "Improbable"
+                namespace.impact_action = "none"
+
+        def action_sets(sub):
+            record_parser(sub)[1].add_argument("--zz", action=Setter, nargs="?")
+
+        def wraps_parse(sub):
+            record = record_parser(sub)[1]
+            original = record.parse_known_args
+
+            def wrapper(args=None, namespace=None):
+                result = original(args, namespace)
+                for key, value in self.HOSTILE_DEFAULTS.items():
+                    setattr(result[0], key, value)
+                return result
+            record.parse_known_args = wrapper
+
+        def rewrites_argv(sub):
+            sys.argv[1:] = ["version"]
+
+        cases = [("set_defaults(%s) on %s" % (dest, where), [("add_zzz_parsers", defaults_on(dest, where))]) for dest in self.HOSTILE_DEFAULTS for where in ("review", "record")]
+        cases += [("a replaced review parser", [("add_zzz_parsers", replaced)]), ("a same-dest argument with a default", [("add_zzz_parsers", same_dest)]), ("a custom Action", [("add_zzz_parsers", action_sets)]),
+                  ("a wrapped parse", [("add_zzz_parsers", wraps_parse)]), ("an existing registrar that runs after review's (add_watch_parsers, replaced)", [("add_watch_parsers", defaults_on("impact_severity", "record"))])]
+        return cases, rewrites_argv
+
+    def test_a_registrar_that_changes_the_shared_parser_changes_nothing_in_the_recorded_rating_with_flags_and_without(self):
+        self.record_pr_setup()
+        cases, rewrites_argv = self.hostile_registrars()
+        for flags_label, flags in (("explicit flags", self.EXPLICIT), ("no flags", ())):
+            clean_code, clean_err, clean = self.record_run(flags)
+            self.assertEqual(clean_code, 0, clean_err)
+            self.assertEqual(("impact_severity" in clean), bool(flags), "a clean run records the rating only when given")
+            if flags:
+                self.assertEqual((clean["impact_severity"], clean["impact_probability"], clean["impact_reason"], clean["impact_action"], clean["impact_class"]), ("Critical", "Improbable", "applied floor-authority", "second-review", "data"))
+            for label, registrars in cases:
+                with self.subTest(flags=flags_label, registrar=label):
+                    code, err, entry = self.record_run(flags, registrars)
+                    self.assertEqual((code, entry), (0, clean), err)
+        with self.subTest("a registrar that rewrites sys.argv"):   # the raw tuple was captured before the registrars ran
+            code, err, entry = self.record_run(argv=["review", "record", self.PR, *self.RATING_FLAGS, *self.EXPLICIT], registrars=[("add_zzz_parsers", rewrites_argv)])
+            self.assertEqual(code, 0, err)
+            clean_code, clean_err, clean = self.record_run(self.EXPLICIT)
+            self.assertEqual(entry, clean)
+
+    def test_a_registrar_that_reassigns_a_function_of_the_rating_path_stops_the_record(self):
+        self.record_pr_setup()
+        for name in sb.RATING_PATH_FUNCTIONS:
+            with self.subTest(function=name):
+                def registrar(sub, name=name):
+                    setattr(sb, name, lambda *a, **k: 0)
+                original = getattr(sb, name)
+                self.addCleanup(setattr, sb, name, original)   # the hostile registrar replaced it for real: put it back whatever happens
+                try:
+                    code, err, entry = self.record_run(self.EXPLICIT, [("add_zzz_parsers", registrar)])
+                finally:
+                    setattr(sb, name, original)
+                self.assertEqual((code, entry), (1, None), err)
+                self.assertIn("a command registrar replaced code on the rating path", err)
+
+    def test_a_direct_call_with_no_raw_argv_records_no_rating_whatever_the_namespace_carries(self):
+        self.record_pr_setup()
+        self.world.add_agent("rev", fleet={"role": "reviewer"}) if "rev" not in self.world.sessions else None
+        self.ledger_reset()
+        args, extra = sb.build_parser().parse_known_args(["review", "record", self.PR, *self.RATING_FLAGS, *self.EXPLICIT])
+        self.assertEqual(args.impact_severity, "Critical", "the shared namespace does carry the value")
+        os.environ["HERDR_PANE_ID"] = self.world.panes["rev"]
+        with captured() as (o, e), mock.patch.object(sb, "owner_terminal_problem", lambda *a, **k: self.terminal_problem):
+            self.assertEqual(sb.cmd_review(args, self.route, self.world.clock.now), 0, e.getvalue())
+        entry = [x for x in sb.plan_ledger.read_ledger(self.world.state)[0] if x["kind"] == "review_record"][-1]
+        self.assertEqual([k for k in entry if k.startswith("impact_")], [], "no rating, never one from the namespace")
+
+    def test_the_private_parser_reads_the_edge_cases_of_a_command_line_as_the_shared_parser_does(self):
+        base = ["review", "record", "acme/app#9", "--reviewer", "impact", "--verdict", "approve"]
+        given = lambda *more: sb.rating_inputs(tuple(base + list(more)))
+        self.assertEqual(given("--impact-severity", "review"), {"impact_severity": "review"})
+        self.assertEqual(given("--impact-reason", "record"), {"impact_reason": "record"})
+        self.assertEqual(given("--impact-severity=Critical"), {"impact_severity": "Critical"})
+        self.assertEqual(sb.rating_inputs(("--zz", "--impact-class", "data") + tuple(base)), {"impact_class": "data"}, "an option before the subcommand")
+        self.assertEqual(sb.rating_inputs(tuple(base[:2]) + ("--", "acme/app#9")), {}, "`--` before a positional")
+        self.assertEqual(given("--impact-sev", "x"), {}, "an abbreviation gives nothing")
+        self.assertEqual(sb.rating_inputs(tuple(base) + ("--impact-severity",)), {}, "a flag with no value gives nothing")
+        self.assertEqual(sb.rating_inputs(None), {})
+        self.assertEqual(sb.rating_inputs(("a", 3)), {})
+        self.record_pr_setup()
+        self.world.add_agent("rev", fleet={"role": "reviewer"}) if "rev" not in self.world.sessions else None
+        self.ledger_reset()
+        code, out, err = self.run_as("rev", *base, "--impact-sev", "Critical")
+        self.assertEqual(code, 2, "the shared parser refuses what the private one would not read")
+        self.assertEqual([x for x in sb.plan_ledger.read_ledger(self.world.state)[0] if x["kind"] == "review_record"], [])
+
+    def test_the_rating_input_table_the_drift_guard_and_the_scan_of_the_shared_namespace(self):
+        import ast
+        self.assertEqual(sb.RATING_INPUTS, sb.IMPACT_RATING_FIELDS + ("impact_action", "impact_class", "block"))
+        parser = sb.build_parser()
+        (top,) = [a for a in parser._actions if a.__class__.__name__ == "_SubParsersAction"]
+        record = top.choices["review"]._subparsers._group_actions[0].choices["record"]
+        shared = {a.dest: (tuple(a.option_strings), a.nargs) for a in record._actions if a.dest in sb.RATING_INPUTS}
+        private = argparse.ArgumentParser(add_help=False)
+        for name in sb.RATING_INPUTS:
+            private.add_argument("--" + name.replace("_", "-"), dest=name)
+        wanted = {a.dest: (tuple(a.option_strings), a.nargs) for a in private._actions if a.dest in sb.RATING_INPUTS}
+        self.assertEqual(shared, wanted, "the flags of the shared record parser equal the private parser's (names and arity): they cannot drift")
+        self.assertFalse(record.allow_abbrev)
+        daemon = ast.parse(self.real_source())
+        for name in ("cmd_review", "parse_review_block"):
+            node = next(n for n in daemon.body if isinstance(n, ast.FunctionDef) and n.name == name)
+            reads = sorted({"args.%s" % x.attr for x in ast.walk(node) if isinstance(x, ast.Attribute) and isinstance(x.value, ast.Name) and x.value.id == "args" and x.attr in sb.RATING_INPUTS}
+                           | {"getattr(args, ...)" for x in ast.walk(node) if isinstance(x, ast.Call) and getattr(x.func, "id", "") == "getattr" and x.args and isinstance(x.args[0], ast.Name) and x.args[0].id == "args"
+                              and not (len(x.args) > 1 and isinstance(x.args[1], ast.Constant) and x.args[1].value == "raw_argv")}
+                           | {"setattr(args, ...)" for x in ast.walk(node) if isinstance(x, ast.Call) and getattr(x.func, "id", "") == "setattr"})
+            self.assertEqual(reads, [], "%s reads no rating input from the shared namespace" % name)
+
+    def test_no_command_registrar_reaches_into_the_shared_parser_beyond_its_own_commands(self):
+        """Defence in depth (not the closure): the vocabulary a registrar may use is its own `sub.add_parser`, `add_argument`, `add_subparsers` and `set_defaults` on a parser it made. A NEW use of the rest fails here."""
+        import ast
+        found = {}
+        for node in ast.parse(self.real_source()).body:
+            if not (isinstance(node, ast.FunctionDef) and re.fullmatch(r"add_[a-z0-9_]+_parsers", node.name)):
+                continue
+            for x in ast.walk(node):
+                if isinstance(x, ast.Attribute) and x.attr in ("choices", "_name_parser_map", "_actions", "_subparsers"):
+                    found.setdefault(node.name, set()).add("attribute " + x.attr)
+                if isinstance(x, ast.Call) and getattr(x.func, "id", getattr(x.func, "attr", None)) in ("globals", "setattr", "exec", "eval", "__import__", "import_module", "getattr", "vars"):
+                    found.setdefault(node.name, set()).add("call " + getattr(x.func, "id", getattr(x.func, "attr", None)))
+                if isinstance(x, ast.Constant) and x.value == "review" and node.name != "add_review_parsers":
+                    found.setdefault(node.name, set()).add('the string "review"')
+                if isinstance(x, (ast.Assign, ast.AugAssign)) and any(ast.unparse(t).startswith(("sys.argv", "os.environ", "argparse.")) for t in (x.targets if isinstance(x, ast.Assign) else [x.target])):
+                    found.setdefault(node.name, set()).add("an assignment to argv, the environment or argparse")
+        known = {"add_ledger_parsers": {"attribute _actions"},   # reads the actions of ITS OWN `verdict` parser to find its flags
+                 "add_plan_parsers": {'the string "review"'}}   # its own `plan review` subcommand and a positional named review
+        self.assertEqual(found, known, "a registrar uses the shared parser beyond its own commands: a NEW finding is a decision (the rating is immune to it, but the reviewer must look)")
 
     def test_s20_s23_no_agent_command_writes_the_threshold_and_no_committed_file_sets_one(self):
         daemon = Path(sb.__file__).read_text()

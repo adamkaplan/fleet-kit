@@ -22680,6 +22680,23 @@ def parse_review_block(text):
 
 IMPACT_CLASS_RE = re.compile(r"[a-z][a-z-]{0,31}")
 IMPACT_RATING_FIELDS = ("impact_severity", "impact_probability", "impact_reason")   # the record's rating fields: the code's one table (parse, record, flags)
+RATING_INPUTS = IMPACT_RATING_FIELDS + ("impact_action", "impact_class", "block")   # every input of `review record` that decides the rating: read ONLY by `rating_inputs`, from the raw argv
+
+
+def rating_inputs(raw_argv):
+    """{dest: value} of the rating inputs GIVEN in `raw_argv` (a tuple of strings: the command line `main` captured before it built the shared parser), parsed by a PRIVATE minimal parser: the six flags of
+    RATING_INPUTS only, no abbreviation, no default (an absent flag is absent), nothing shared with `build_parser`. A registrar's `set_defaults`, a replaced or re-parsed subparser, a same-dest argument or a
+    wrapper on the namespace cannot change what this returns. A raw argv that is not a tuple or list of strings gives nothing (no rating). #835."""
+    if not isinstance(raw_argv, (tuple, list)) or not all(isinstance(x, str) for x in raw_argv):
+        return {}
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False, argument_default=argparse.SUPPRESS, exit_on_error=False)
+    for name in RATING_INPUTS:
+        parser.add_argument("--" + name.replace("_", "-"), dest=name)
+    try:
+        parsed, _ = parser.parse_known_args(list(raw_argv))
+    except (argparse.ArgumentError, SystemExit):
+        return {}
+    return dict(vars(parsed))
 
 
 def cmd_review(args, runner, now):
@@ -22720,33 +22737,35 @@ def cmd_review(args, runner, now):
             return EXIT_OK
         if args.reviewer not in plan_ledger.REVIEWERS:
             raise ReviewError("--reviewer must be one of %s" % ", ".join(plan_ledger.REVIEWERS))
-        if args.block is not None:   # the reviewer's returned text: the coder session records it
-            if args.verdict or args.head or args.blocks or args.notes or args.impact_action:
+        given = rating_inputs(getattr(args, "raw_argv", ()))   # #835: the rating's inputs come from the raw argv through a private parser, never from the shared namespace (a registrar's set_defaults, a replaced parser or a wrapper cannot reach them); a missing raw argv gives no rating
+        action, klass = given.get("impact_action"), given.get("impact_class")
+        rating_in = {name: given.get(name) for name in IMPACT_RATING_FIELDS}
+        if given.get("block") is not None:   # the reviewer's returned text: the coder session records it
+            if args.verdict or args.head or args.blocks or args.notes or action:
                 raise ReviewError("--block carries the verdict, head, counts and impact action itself: give nothing else")
-            fields, why = parse_review_block(_read_capped(args.block, REVIEW_TABLE_MAX))
+            fields, why = parse_review_block(_read_capped(given["block"], REVIEW_TABLE_MAX))
             if fields is None:
                 raise ReviewError("refused: %s" % why)
-            args.verdict, args.head, args.blocks, args.notes, args.impact_action = (fields["verdict"], fields["head"], fields["blocks"],
-                                                                                    fields["notes"], fields["impact_action"])
-            args.impact_class = args.impact_class or fields["impact_class"]
-            for name in IMPACT_RATING_FIELDS:   # #835: the rating's severity and probability (the score is derived from the matrix's cell), and the reason that names a floor rule
-                if getattr(args, name, None) is None:
-                    setattr(args, name, fields[name])
+            args.verdict, args.head, args.blocks, args.notes, action = (fields["verdict"], fields["head"], fields["blocks"], fields["notes"], fields["impact_action"])
+            klass = klass or fields["impact_class"]
+            for name in IMPACT_RATING_FIELDS:   # the rating's severity and probability (the score is derived from the matrix's cell), and the reason that names a floor rule
+                if rating_in[name] is None:
+                    rating_in[name] = fields[name]
         if args.verdict not in plan_ledger.REVIEW_VERDICTS:
             raise ReviewError("--verdict must be one of %s (or give --block with the reviewer's returned text)" % ", ".join(plan_ledger.REVIEW_VERDICTS))
-        for name in ("blocks", "notes"):
-            if getattr(args, name) < 0 or getattr(args, name) > 200:
+        for name, count in (("blocks", args.blocks), ("notes", args.notes)):
+            if count < 0 or count > 200:
                 raise ReviewError("--%s must be a number from 0 to 200" % name)
         if args.verdict == "approve" and args.blocks:
             raise ReviewError("an approve cannot carry blocking findings (%d given)" % args.blocks)
         if args.verdict == "request-changes" and not args.blocks:
             raise ReviewError("request-changes needs at least 1 blocking finding (a finding that cites no rule never blocks)")
-        if args.impact_action and args.reviewer != "impact":
+        if action and args.reviewer != "impact":
             raise ReviewError("--impact-action belongs to the impact reviewer")
-        impact_class = (getattr(args, "impact_class", None) or "").strip().lower() or None
+        impact_class = (klass or "").strip().lower() or None
         if impact_class is not None and args.reviewer != "impact":
             raise ReviewError("--impact-class belongs to the impact reviewer")
-        rating = {name: (getattr(args, name, None) or "").strip() or None for name in IMPACT_RATING_FIELDS}
+        rating = {name: (rating_in[name] or "").strip() or None for name in IMPACT_RATING_FIELDS}
         if any(rating.values()) and args.reviewer != "impact":
             raise ReviewError("--impact-severity, --impact-probability and --impact-reason belong to the impact reviewer")
         if rating["impact_severity"] or rating["impact_probability"]:
@@ -22759,9 +22778,9 @@ def cmd_review(args, runner, now):
                 raise ReviewError("the rating %r / %r is not a cell of the matrix (nothing was recorded)" % (str(rating["impact_severity"])[:30], str(rating["impact_probability"])[:30]))
         if impact_class is not None and not IMPACT_CLASS_RE.fullmatch(impact_class):
             raise ReviewError("impact-class must be one lower-case word naming the class of the impact (see the matrix file's classes), got %r" % impact_class[:40])
-        if args.impact_action == "hold" and impact_class is None:
+        if action == "hold" and impact_class is None:
             raise ReviewError("an impact hold must name its class (--impact-class or an `impact-class:` line): run the review again (nothing was recorded)")
-        if args.impact_action == "hold":   # #692: the class must be one the matrix file names (read now, never a list of our own)
+        if action == "hold":   # #692: the class must be one the matrix file names (read now, never a list of our own)
             try:
                 rule = impact_floor.owner_hold_rule(impact_floor._matrix_cached())
             except impact_floor.MatrixError as err:
@@ -22783,8 +22802,8 @@ def cmd_review(args, runner, now):
         entry = {"kind": "review_record", "pr": ref, "head": head, "reviewer": args.reviewer, "verdict": args.verdict,
                  "blocks": args.blocks, "notes": args.notes, "by": by,
                  "summary": plan_ledger.clip(redact_command_text(args.summary or ""), 200)}
-        if args.impact_action:
-            entry["impact_action"] = args.impact_action
+        if action:
+            entry["impact_action"] = action
         if args.reviewer == "impact":
             entry["by_role"] = kind[2] if kind[0] == "agent" and len(kind) > 2 and isinstance(kind[2], str) else None   # #835: the RECORDED role of the session that made the record (never a flag or a text): only the independent reviewer's rating counts
         for name in IMPACT_RATING_FIELDS:
@@ -23006,7 +23025,7 @@ def add_review_parsers(sub):
     blockers = rsub.add_parser("blockers", help="Read-only: the reviewers whose LATEST recorded result at the PR's head is request-changes (one line each)")
     blockers.add_argument("pr", help="owner/repo#N or the PR's URL")
     blockers.add_argument("--head", help="The commit to look at (default: the PR's head)")
-    record = rsub.add_parser("record", help="Record a reviewer's result for the PR's current head (the coder session records what the reviewer returned)")
+    record = rsub.add_parser("record", allow_abbrev=False, help="Record a reviewer's result for the PR's current head (the coder session records what the reviewer returned)")
     record.add_argument("pr", help="owner/repo#N or the PR's URL")
     record.add_argument("--reviewer", required=True, help="code | architecture | security | impact | test")
     record.add_argument("--head", help="The commit judged (default: the PR's head; a different one is refused)")
@@ -27599,6 +27618,7 @@ except Exception as _err:
 # those attributes, derived once everything is defined (see `derive_action_groups`), never lists to edit; `dispatch` asks the view AND the attribute
 # (a test that swaps a command's function for a recorder keeps the group the module defined).
 
+RATING_PATH_FUNCTIONS = ("cmd_review", "parse_review_block", "rating_inputs", "resolve_command", "dispatch", "call_command")   # `main` checks these are the same objects after the registrars ran (#835)
 COMMAND_NAME_RE = re.compile(r"[a-z][a-z0-9-]*")
 REGISTRAR_NAME_RE = re.compile(r"add_[a-z0-9_]+_parsers")
 COMMAND_ARGUMENTS = ("args", "runner", "now", "spawn", "socket_call", "wait")   # what a command function may ask for, by parameter name
@@ -27675,15 +27695,21 @@ def dispatch(args, known, runner=subprocess.run, now=time.time, wait=None, spawn
 def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subprocess.Popen,
          socket_call=None):
     os.environ.setdefault(OWN_GH_ENV, "1")   # the gh calls of this process are the switchboard's own: never re-identified
+    raw = tuple(argv if argv is not None else sys.argv[1:])   # #835: the command line as typed, captured BEFORE any registrar runs: `review record` reads its rating inputs from this, never from the shared parser
+    held = {name: (globals()[name], globals()[name].__code__) for name in RATING_PATH_FUNCTIONS if name in globals()}
     parser = build_parser()
     try:
-        args, extra = parser.parse_known_args(argv)
+        args, extra = parser.parse_known_args(list(raw))
+        args.raw_argv = raw   # set here, after the parse: no registrar default, Action or wrapper can set it first
         if extra and args.action == "remind" and not (args.list_mine or args.cancel) and not any(word.startswith("-") for word in extra):
             args.text = list(args.text or []) + extra   # words after an option (`remind a 1h --issue 3 the text`): argparse lets an optional positional end early
         elif extra:
             parser.error("unrecognized arguments: %s" % " ".join(extra))
     except SystemExit as exit_:
         return EXIT_USAGE if exit_.code not in (0, None) else EXIT_OK
+    if getattr(args, "action", None) == "review" and (set(held) != set(RATING_PATH_FUNCTIONS) or any(globals().get(name) is not fn or fn.__code__ is not code for name, (fn, code) in held.items())):
+        sys.stderr.write("%s: review: a command registrar replaced code on the rating path: nothing was recorded\n" % PROG)   # a registrar reassigned one of the functions the rating is read and recorded by
+        return EXIT_ERROR
     return dispatch(args, parser.commands, runner=runner, now=now, wait=wait, spawn=spawn, socket_call=socket_call)
 
 
