@@ -17,11 +17,13 @@ OLDEST = 5
 REASONS = ("call budget", "failed read", "not read yet")
 
 
-def is_claimed(item, ctx):
+def is_claimed(item, ctx, lanes=None):
     """The ONE definition of an issue with an owner that T1 and this summary share: assigned, below a charter, named by an `Owner:` line, owned by a running agent, or
-    whose owner cannot be told yet (its parent chain leaves the issues read). `ctx` is the triage context of the repository."""
+    whose owner cannot be told yet (its parent chain leaves the issues read). `ctx` is the triage context of the repository. `lanes` (None for T1 and for a repository with no
+    label map) makes the `Owner:` line count only when its first name is one of those known lanes."""
     number = item["number"]
-    return bool(item["assignees"] or number in ctx["chain"] or item.get("owner_body", False) or number in ctx["owned"] or number in ctx["unresolved"])
+    named = item.get("owner_body", False) if lanes is None else lane_named(item, lanes)
+    return bool(item["assignees"] or number in ctx["chain"] or named or number in ctx["owned"] or number in ctx["unresolved"])
 
 
 def claim_label(labels, patterns):
@@ -29,14 +31,29 @@ def claim_label(labels, patterns):
     return any(fnmatch.fnmatchcase(str(label).lower(), str(pattern).lower()) for label in labels for pattern in patterns)
 
 
-def ownerless_stale(items, ctx, ours_logins, patterns, now, days=DEFAULT_DAYS):
+def label_owned(labels, label_owners):
+    """True when a label of the issue is a key of the repository's `label_owners` map (a lane carries it)."""
+    keys = {str(k).lower() for k in (label_owners or {})}
+    return any(str(label).lower() in keys for label in labels)
+
+
+def lane_named(item, lanes):
+    """True when the first `Owner:` line of the body names a known lane (`lanes`: lower-case orchestrator names)."""
+    name = item.get("owner_name")
+    return bool(name) and name.lower() in lanes
+
+
+def ownerless_stale(items, ctx, ours_logins, patterns, now, days=DEFAULT_DAYS, label_owners=None, lanes=()):
     """[(number, quiet_days)] of the open ISSUES (not pull requests) that have no owner, no owner label, were not written by one of `ours_logins`, and were last touched `days`
-    or more days ago; the oldest first."""
-    found = []
+    or more days ago; the oldest first. With a non-empty `label_owners` map for the repository, a label of the map owns the issue and an `Owner:` line owns it
+    only when it names one of `lanes`; with none, the rule is the one before the map existed."""
+    found, strict = [], bool(label_owners)
     for number, item in items.items():
         if item.get("pr") or item.get("state") != "open":
             continue
-        if is_claimed(item, ctx) or claim_label(item["labels"], patterns) or item["author"] in ours_logins:
+        if strict and label_owned(item["labels"], label_owners):
+            continue
+        if is_claimed(item, ctx, lanes if strict else None) or claim_label(item["labels"], patterns) or item["author"] in ours_logins:
             continue
         quiet = (now - item["updated"]) / 86400.0
         if quiet >= days:
