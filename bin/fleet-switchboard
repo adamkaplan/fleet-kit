@@ -3416,7 +3416,7 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
     facts = sorted(facts, key=lambda fact: (fact.created, fact.key))
     if not facts:
         raise ValueError("nothing to compose")
-    if facts[0].orders:  # PR 17: the orders note, whole: up to twenty orders of 300 characters
+    if facts[0].orders:  # PR 17: the orders note, whole: every order
         return orders_note(recipient, facts[0], repos), facts[:1]
 
     replaced = {}

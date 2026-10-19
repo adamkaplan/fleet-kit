@@ -41192,7 +41192,7 @@ class TestOrdersFact(unittest.TestCase):
             "within their words. They cover nothing they do not name."])
         self.assertEqual(len(carried), 1)
 
-    def test_twenty_full_length_orders_are_not_cut(self):
+    def test_full_length_orders_are_not_cut(self):
         orders = "\n".join("%d %s" % (n, "x" * 290) for n in range(20))
         text, _ = sb.compose("platform", [sb.Fact("orders:1:ab:start", "platform", "orders", orders, EPOCH, issue=1,
                                                   orders=True)])

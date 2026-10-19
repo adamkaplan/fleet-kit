@@ -1835,7 +1835,7 @@ everything else. `compose` renders
 `[switchboard] standing orders for <agent> (charter #N):` (`web#N` when several repos are watched, as every message names an issue), each order on its own
 line, and a last line: "These are the owner's standing instructions for this
 charter. Act on them without asking again, within their words. They cover
-nothing they do not name." Twenty orders of 300 characters are not cut. The
+nothing they do not name." Every order is carried whole. The
 description (PR 13) says `switchboard: standing orders for <agent>`.
 `convert_lapsed_notes` skips a note whose every key is an `orders:` key, so an
 unread orders note never becomes a wake. A fact key is now unique per recipient
