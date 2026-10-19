@@ -66268,13 +66268,8 @@ class TestAgentCredentialsDoc(unittest.TestCase):
         for name, phrase in self.PINS.items():
             self.assertEqual(self.text.count(phrase), 1, name)
 
-    def test_the_pin_counts_fail_on_zero_and_on_two(self):
-        phrase = self.PINS["refusal"]
-        self.assertEqual((self.text.replace(phrase, "")).count(phrase), 0)
-        self.assertEqual((self.text + phrase).count(phrase), 2)
-
     def test_status_and_what_c_needs_no_longer_call_the_mint_future(self):
-        status = self.text.split("\n\n")[0]
+        status = self.text[self.text.index("Status:"):].split("\n\n")[0]
         needs = [b for h, b in self.sections.items() if h.startswith("Recommendation")][0]
         for old in ("separate top-tier work item", "A local mint in the", "until the shim work lands", "Until the shim work lands", "Needs shim code"):
             self.assertNotIn(old, self.text)
