@@ -23234,6 +23234,10 @@ class TestSweep(Base):
         with mock.patch.multiple(sb, sweep_findings=lambda *a, **k: list(zip(kinds, refs)), sweep_verify=lambda *a, **k: True):
             self.sweep_real([])
         self.assertEqual(sorted(sum(([d["woken"] for d in self.lines(r)] for r in refs), [])), [False, True])
+        (summary, _), = self.engine.sweep.facts.values()
+        woken = [r for r in refs if self.lines(r)[0]["woken"]]
+        self.assertEqual(len(woken), 1)
+        self.assertIn(woken[0], summary)                                         # the one read woken is the one the fact names
 
     def test_849_shadow_mode_logs_woken_false_and_queues_nothing(self):
         for kind in sorted(sb.SWEEP_KINDS):
@@ -24462,6 +24466,20 @@ class TestTriage(Base):
                     self.pass_now()
                     self.pass_now()
                     self.assertEqual([d["woken"] for d in self.tlines(ref)], [False, True])
+
+    def test_849_only_the_findings_the_digest_names_read_woken(self):
+        rules = ["T1", "T2"]
+        refs = ["acme/api#%d" % (60 + n) for n in range(2)]
+        self.engine.config["triage"].update(enabled=True, max_findings=1)
+        with mock.patch.multiple(sb, triage_findings=lambda *a, **k: ([(r, ref, {}) for r, ref in zip(rules, refs)], {}, []),
+                                 triage_verify=lambda *a, **k: True):
+            self.pass_now()
+        named = [k for k in self.engine.triage.facts if k.startswith("triage:")]
+        (summary, _), = [self.engine.triage.facts[k] for k in named]
+        woken = [ref for ref in refs if self.tlines(ref)[0]["woken"]]
+        self.assertEqual(len(woken), 1)
+        self.assertIn(woken[0], summary)                                         # the one read woken is the one the digest names
+        self.assertEqual(sum(ref in summary for ref in refs), 1)
 
     def test_849_shadow_mode_logs_woken_false_for_every_rule(self):
         for rule in sorted(sb.TRIAGE_KINDS):
