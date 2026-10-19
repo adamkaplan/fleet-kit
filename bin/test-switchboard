@@ -5942,12 +5942,12 @@ class TestLaunch(Base):
                            now=self.world.clock.now, socket_call=self.world.herdr.socket)
         return code, out.getvalue(), err.getvalue()
 
-    def launch_read(self, *extra, users=None, name="reader"):
+    def launch_read(self, *extra, users=None, name="reader", terminal=True):   # a plain launch is headless by default (#433): these tests are of the terminal launch, and say so
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR,
                            "gh_users": users or {"acme-org/widget-service": "acme-dev", "acme-org/widget-api": "acme-bot"}})
         os.environ["HERDR_WORKSPACE_ID"] = "w1"
         with captured() as (out, err):
-            code = sb.main(["launch", name, "--agent", "coder", "--dir", str(self.work), "--repo", "acme-org/widget-service"] + list(extra),
+            code = sb.main(["launch", name, "--agent", "coder", "--dir", str(self.work), "--repo", "acme-org/widget-service"] + (["--terminal"] if terminal and "--headless" not in extra and "--terminal" not in extra else []) + list(extra),
                            runner=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "tok\n", "") if argv[1:3] == ["auth", "token"] else self.world.route(argv, **kw),
                            now=self.world.clock.now, socket_call=self.world.herdr.socket)
         return code, out.getvalue(), err.getvalue()
@@ -5965,6 +5965,19 @@ class TestLaunch(Base):
         self.assertEqual(sorted(json.loads(out)), ["name", "pane", "session", "tab"])
         self.assertNotIn("read_repo", self.world.v2.sessions[json.loads(out)["session"]]["metadata"]["fleet"])
         self.assertNotIn("read only", out + err)
+
+    def test_the_read_repo_is_recorded_for_a_terminal_launch_and_refused_for_a_headless_one_plain_or_named(self):
+        code, out, err = self.launch_read("--read-repo", "acme-org/widget-api", "--terminal")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.world.v2.sessions[json.loads(out)["session"]]["metadata"]["fleet"]["read_repo"], "acme-org/widget-api")
+        self.assertEqual(len([l for l in (out + err).splitlines() if "acme-org/widget-api" in l and "read only" in l]), 1)
+        for extra in ((), ("--headless",)):   # a plain launch is headless by default: refused naming --terminal, nothing created
+            with self.subTest(extra=extra):
+                before = len(self.world.v2.sessions)
+                code, out, err = self.launch_read("--read-repo", "acme-org/widget-api", *extra, name="reader-b", terminal=False)
+                self.assertEqual(code, 1)
+                self.assertIn("--read-repo needs a terminal launch", err)
+                self.assertEqual(len(self.world.v2.sessions), before)
 
     def test_a_launch_refuses_a_read_repo_it_cannot_state_exactly_or_cannot_map_and_creates_nothing(self):
         sessions = len(self.world.v2.sessions)
