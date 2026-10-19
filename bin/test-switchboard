@@ -41093,6 +41093,60 @@ class TestJudgeSeesTheOrders(PolicyCase):
         self.assertTrue(any("approve deploys here" in text for text in seen), seen)
 
 
+class OrdersReachTheJudgeWhole:
+    """Every path an orders text takes to the judge's input: a charter's (resolve_policy_context), the Chief of Staff's
+    file (context_of) and an owner's agent's inbound answer (judge_inbound_answer). Each is driven through its real code
+    with 30 long orders; the last order must be in the judge's input, whole."""
+
+    @staticmethod
+    def long_orders(prefix, count=30, width=250):
+        return ["%s %02d %s end-%s-%02d" % (prefix, n, "x" * width, prefix, n) for n in range(count)]
+
+    class Spy:
+        def __init__(self):
+            self.seen = []
+
+        def decide(self, state, questions):
+            self.seen.append(state)
+            raise sb.JevError("unreachable", "spy")
+
+
+class TestEveryPathOrdersTakeToTheJudge(PolicyCase, OrdersReachTheJudgeWhole):
+    def test_the_charter_path_hands_the_judge_every_order_whole(self):
+        orders = self.long_orders("charter")
+        body = ORDERS_CHARTER_BODY
+        for text in orders:
+            body = sb.add_order_to_body(body, text, "alice", "2027-01-05")
+        self.gh.bodies = {1: body}
+        spy = self.Spy()
+        self.direct_judge(spy).decide({"session": self.orch, "tool": "shell", "arguments": "gh pr view 1", "configured": "allow"})
+        seen = spy.seen[0]["standing_authority"]
+        self.assertIn("end-charter-29 (ordered by alice, 2027-01-05)", seen)
+        self.assertEqual(seen.count("end-charter-"), 30)
+        self.assertNotIn("\u2026", seen)
+
+    def test_the_chief_of_staffs_file_path_hands_the_judge_every_order_whole(self):
+        orders = self.long_orders("file", count=30, width=240)
+        put_cos_orders(self, "\n".join(orders))
+        spy = self.Spy()
+        self.direct_judge(spy).decide({"session": self.cos, "tool": "shell", "arguments": "gh pr view 1", "configured": "allow"})
+        seen = spy.seen[0]["standing_authority"]
+        self.assertEqual(seen, "\n".join(orders))
+        self.assertTrue(seen.endswith("end-file-29"))
+
+    def test_the_inbound_answer_path_hands_the_judge_every_order_whole(self):
+        orders = self.long_orders("inbound", count=30, width=240)
+        put_cos_orders(self, "\n".join(orders))
+        config = policy_raw_config()
+        config["cos_orders_file"] = str(cos_orders_file(self))
+        spy = self.Spy()
+        decision = {"id": "d1", "kind": "question", "agent": "orch", "tier": "cos", "title": "Which cache?"}
+        with mock.patch.object(sb, "build_jev", return_value=spy):
+            sb.judge_inbound_answer(types.SimpleNamespace(config=config), decision, {"text": "use redis"}, "owner_agent")
+        self.assertEqual(spy.seen[0]["standing_authority"], "\n".join(orders))
+        self.assertTrue(spy.seen[0]["standing_authority"].endswith("end-inbound-29"))
+
+
 def apply_orders_step(run, step):
     """`orders`: the cast member runs `fleet-switchboard orders add|remove`, as its model would (the role
     check, the PATCH and the audit all run). Output is not kept: the oracles read GitHub and the audit."""
