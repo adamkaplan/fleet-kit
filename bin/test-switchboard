@@ -22170,6 +22170,24 @@ class TestLegitimateWaiting(WaitingInputs, ReportBase):
                 self.apply()
                 self.assertEqual(self.predicate().state, "clear", "released")
 
+    GUARD_CODE = {"ci in progress": "ci", "ci queued": "ci", "review requested": "review-requested", "review requested of a team": "review-requested",
+                  "younger than the review window": "review-window", "reminder due later": "reminder", "issue awaiting label": "awaiting-issue",
+                  "pull request awaiting label": "awaiting-pr", "human decision": "decision"}
+
+    def test_every_guard_of_the_production_table_is_tested_alone_and_names_its_code(self):
+        self.assertEqual(set(self.GUARD_CODE.values()) | {"last-report"}, set(sb.WAITING_GUARDS), "a guard in the table with no test, or a test of none")
+        self.assertEqual(set(self.GUARD_CODE), set(self.guards()))
+        for name, (arrange, release) in self.guards().items():
+            with self.subTest(name):
+                arrange()
+                self.apply()
+                self.assertEqual(self.predicate().codes, [self.GUARD_CODE[name]])
+                release()
+                self.apply()
+        for kind in ("blocked", "question"):
+            self.report(kind, "x")
+            self.assertEqual(self.predicate().codes, ["last-report"])
+
     def test_a_blocked_or_question_report_is_waiting_without_any_input(self):
         for kind in ("blocked", "question"):
             self.report(kind, "which one?")
