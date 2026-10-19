@@ -557,7 +557,7 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
         "name": name, "labels": {"app": LABEL, "cw/worker": worker, "azure.workload.identity/use": "true"},
         "annotations": {"cw/worker": worker, "cw/started": iso(now), "cw/hard-deadline": iso(hard),
                         "cw/idle-seconds": e["CW_IDLE_SECONDS"], "cw/shape": a.shape,
-                        "cw/max-hard": iso(now + dt.timedelta(seconds=parse_duration(a.max_hard))),
+                        "cw/max-hard": iso(now + dt.timedelta(seconds=parse_duration(a.max_hard or DEFAULT_MAX_HARD))),
                         **({"cw/run-id": a.run_id} if getattr(a, "run_id", None) else {})}},
         "spec": {"restartPolicy": "Never", "activeDeadlineSeconds": pod_deadline_floor(a.max_hard),
                  "serviceAccountName": env.get("CW_CLOUD_SERVICE_ACCOUNT", "cw-worker"),

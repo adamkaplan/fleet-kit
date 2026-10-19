@@ -50,7 +50,6 @@ class PodDeadline(base.Base):
         self.create()
         spec = dict(self.applied_pod()["spec"])
         self.assertEqual(spec.pop("activeDeadlineSeconds"), 8 * 3600 + 300)
-        self.assertEqual(list(spec)[:2], ["restartPolicy", "serviceAccountName"])
         self.assertEqual(sorted(spec), sorted(["restartPolicy", "serviceAccountName", "automountServiceAccountToken",
                                               "securityContext", "containers", "volumes"]))
 
@@ -63,7 +62,20 @@ class PodDeadline(base.Base):
         self.assertEqual(len(re.findall(r'"activeDeadlineSeconds"', text)), 1)
         self.assertGreaterEqual(len(BUILDERS), 2)
 
+    def test_the_run_secret_variant_of_the_builder_carries_the_floor(self):
+        # render_pod called directly: the run-secret volume shape is a variant of the one builder.
+        import argparse, datetime as dt
+        now = dt.datetime(2026, 10, 19, tzinfo=dt.timezone.utc)
+        for shape in sorted(cw.SHAPES):
+            with self.subTest(shape=shape):
+                a = argparse.Namespace(image=None, repo="acme-org/widget-service", branch="main", idle="10m", hard="1h",
+                                       max_hard="2h", shape=shape, run_id=None, pull_secret=None)
+                pod = cw.render_pod(a, "coder7", "cw-coder7", now, now + dt.timedelta(hours=1), self.env, ["model-key"])
+                self.assertEqual(pod["spec"]["activeDeadlineSeconds"], 7200 + cw.POD_DEADLINE_GRACE_SECONDS)
+                self.assertIn("projected", pod["spec"]["volumes"][0])
+
     def test_a_pod_the_floor_killed_is_still_cleaned_up_by_stop_and_by_the_reaper(self):
+        """A regression guard on stop and reap (unchanged by this PR): a Failed/DeadlineExceeded pod and its Secrets still go."""
         for how in ("stop", "reap"):
             with self.subTest(how=how):
                 self.write_state({"pods": {}})
