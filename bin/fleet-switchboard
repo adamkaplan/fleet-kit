@@ -12528,9 +12528,21 @@ TRIAGE_KINDS = {"T1": "owner missing", "T2": "required label missing", "T3": "no
 # #805: the inputs each rule judges, in ONE table: the candidates a pass drops and the records the prune keeps are both read from it, so they cannot drift.
 # A rule that judges whether an item is OURS (every one but T5, T6 and T10) also needs `agents`: ownership comes from the running agents.
 TRIAGE_RULE_INPUTS = {"T1": ("agents", "issues"), "T2": ("agents", "issues"), "T3": ("agents", "issues", "comments"), "T5": ("decisions", "issues"),
-                      "T6": ("decisions", "issues"), "T7": ("agents", "issues", "comments"), "T8": ("agents", "issues"), "T9": ("agents", "issues"),
-                      "T10": ("closed",), "T11": ("agents", "issues"), "T12": ("agents", "issues", "merged"), "OO": ("agents", "issues"),
-                      "PARKED": ("agents", "issues")}   # "agents" and "decisions" are global; the others are per repository (`<name>:<repo>`)
+                      "T6": ("decisions", "issues"), "T7": ("agents", "issues", "comments", "decisions"), "T8": ("agents", "issues"),
+                      "T9": ("agents", "issues"), "T10": ("closed",), "T11": ("agents", "issues"), "T12": ("agents", "issues", "merged")}
+# "agents" and "decisions" are global; the others are per repository (`<name>:<repo>`). T7 also reads the decision list (a captain PR listed there is T6's).
+# The records of the OTHER kinds are kept whenever ANY input of ANY rule is not whole: the other-owner flag stands for whichever rule would have fired, and the
+# invalid-park flag is raised from the digest of all of them. Their set is derived from the table, so a new rule's input is included at once.
+TRIAGE_UNION_KINDS = ("OO", "PARKED")
+
+
+def triage_inputs(kind):
+    """The inputs the records of `kind` judge, or None for a kind the table does not know (its records are then all kept)."""
+    if kind in TRIAGE_UNION_KINDS:
+        return tuple(sorted({name for needs in TRIAGE_RULE_INPUTS.values() for name in needs}))
+    return TRIAGE_RULE_INPUTS.get(kind)
+
+
 TRIAGE_T10_GRACE = 600         # seconds after a close in which a still-set awaiting label is not yet a finding
 TRIAGE_TTL = 900               # seconds a unit read is kept
 TRIAGE_CALLS_PER_PASS = TRIAGE_DEFAULTS["calls_per_pass"]   # default of `triage.calls_per_pass` (reads and fresh checks alike)
@@ -13013,7 +13025,7 @@ def triage_findings(engine, state, repos, decisions, cfg, now, errors):
                                        captain_skip=captain_skip, merged=links, pending=pending,
                                        live=live["info"] if live else None, live_days=live_days)
             if not agents_whole:   # #805: "no owner" is judged against the running agents: a fleet that was not read whole is no evidence of an absence
-                for rule in [r for r in found if "agents" in TRIAGE_RULE_INPUTS.get(r, ())]:
+                for rule in [r for r in found if "agents" in (triage_inputs(r) or ())]:
                     found.pop(rule)
                     whole_skipped(engine, "triage.owner_rules", "agents")
             if not found:
@@ -13508,7 +13520,7 @@ def triage_digest_memory(engine, state):
 def triage_digest_keep(engine):
     """keep(rule, ref) for the prune: True when the record's candidates could not be computed in this pass (#805)."""
     def keep(rule, ref):
-        needs = TRIAGE_RULE_INPUTS.get(rule)
+        needs = triage_inputs(rule)
         if needs is None:
             return True   # a rule the table does not know: nothing about it is forgotten
         repo = ref.rpartition("#")[0]

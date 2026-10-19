@@ -22892,6 +22892,7 @@ class TestTriage(Base):
         self.engine.config["triage"].update(cfg)
         for _ in range(passes):
             self.world.tick(1)
+            sb.decisions_from_notices(self.engine, self.world.clock.now())               # the REAL notice reader marks its input, as in every pass
             sb.triage_pass(self.engine, list(decisions), self.world.clock.now(), errors)
 
     def found(self):
@@ -22967,8 +22968,8 @@ class TestTriage(Base):
         self.assertIn("PARKED acme/api#152", self.engine.triage.seen)                # the issue list was not whole: kept
         self.hub.unreadable.discard("acme/api")
         del self.hub.open["acme/api"][152]                                           # it left: a whole pass without it
-        self.world.tick(sb.TRIAGE_TTL + 1)
-        self.go(passes=3)
+        self.world.tick(max(sb.TRIAGE_TTL, sb.TRIAGE_UNREADABLE_RETRY) + 1)
+        self.go(passes=10)                                                           # every input is read whole again
         self.assertNotIn("PARKED acme/api#152", self.engine.triage.seen)
 
     def test_each_rules_input_value_is_the_unit_its_candidates_are_read_from(self):
@@ -23112,6 +23113,19 @@ class TestTriage(Base):
         self.go()
         self.assertEqual(self.only("T7"), ["acme/api#70"])
         self.assertEqual((self.only("OO"), [f for f in self.found() if f[1] == "acme/api#75"]), ([], []))   # not even a flag
+
+    def test_the_t7_record_of_a_captain_pr_survives_while_the_decision_list_is_not_whole(self):
+        self.charter()
+        self.add(300, created=0.4, pr=True, body="MERGE: captain\nland it")         # ours, past the SLA, not in the decision list: T7
+        self.describe_pr(300)
+        sb.record_pr_notice(self.world.state, "acme/api", 300, "orch", "", self.now)
+        self.engine.discover(self.world.clock.now())
+        self.go(passes=3, enabled=True)
+        self.assertIn("T7 acme/api#300", self.engine.triage.seen)
+        self.go(passes=3, errors=[{"source": "github", "error": "not read yet"}])    # the list is not whole: a captain PR waits (never judged)
+        self.assertEqual(self.only("T7"), ["acme/api#300"])                          # (the earlier finding)
+        self.assertIn("T7 acme/api#300", self.engine.triage.seen)                    # its record is kept
+        self.go(passes=3)                                                            # a whole list that still lacks it: still T7, not new
 
     def test_t7_shapes_formal_review_signed_comment_old_head_captain_and_plain(self):
         self.charter()
@@ -24749,43 +24763,49 @@ class FakeOwnerlessHub(FakeTriageHub):
 class TestTriageRuleInputs(unittest.TestCase):
     NAMES = {"agents", "decisions", "issues", "comments", "merged", "closed"}
 
-    def test_every_record_kind_the_writers_can_produce_has_an_input_entry(self):
+    def kinds(self):
         kinds = set(sb.TRIAGE_KINDS)                                                 # every rule the triage can raise (a seen record is "<rule> <ref>")
-        text = (REPO / "bin" / "triage_digest.py").read_text()
-        kinds |= set(re.findall(r'"([A-Z][A-Z0-9]*) " \+', text))                    # the key prefixes the seen-memory writers build (PARKED, the T5 roll-up)
-        self.assertIn("PARKED", kinds)                                               # the regex must still find the writers' prefixes: it fails loudly if their shape changes
-        for kind in sorted(kinds):
-            self.assertIn(kind, sb.TRIAGE_RULE_INPUTS, "a record kind needs the inputs it judges: %s" % kind)
-        for kind, needs in sb.TRIAGE_RULE_INPUTS.items():
-            self.assertTrue(needs and set(needs) <= self.NAMES, kind)
-        for kind in sorted(kinds):                                                   # a kind that judges ours-or-not reads the running agents (the PARKED flag is raised for our items)
-            if kind not in ("T5", "T6", "T10"):
-                self.assertIn("agents", sb.TRIAGE_RULE_INPUTS[kind], kind)
+        kinds |= set(re.findall(r'"([A-Z][A-Z0-9]*) " \+', (REPO / "bin" / "triage_digest.py").read_text()))   # the key prefixes the seen-memory writers build
+        return kinds
 
-    def keep_engine(self, **marks):
+    def test_every_record_kind_the_writers_can_produce_has_an_input_set_of_registry_names(self):
+        kinds = self.kinds()
+        self.assertIn("PARKED", kinds)                                               # the regex must still find the writers' prefixes
+        for kind in sorted(kinds):
+            needs = sb.triage_inputs(kind)
+            self.assertIsNotNone(needs, "a record kind needs the inputs it judges: %s" % kind)
+            self.assertTrue(needs and set(needs) <= self.NAMES, kind)
+            if kind not in ("T5", "T6", "T10"):                                      # a kind that judges ours-or-not reads the running agents
+                self.assertIn("agents", needs, kind)
+
+    def test_the_other_owner_and_invalid_park_kinds_judge_the_union_of_every_rules_inputs(self):
+        union = {name for needs in sb.TRIAGE_RULE_INPUTS.values() for name in needs}
+        for kind in sb.TRIAGE_UNION_KINDS:
+            self.assertEqual(set(sb.triage_inputs(kind)), union, kind)               # derived from the table, never a second hand list
+        with mock.patch.dict(sb.TRIAGE_RULE_INPUTS, {"T99": ("newinput",)}):
+            self.assertIn("newinput", sb.triage_inputs("PARKED"))                    # a new rule's input is included at once
+
+    def marks(self, needs, bad=None, repo="acme/api"):
         engine = types.SimpleNamespace(read_whole={}, _note=lambda *a, **k: None)
-        for name, ok in marks.items():
-            sb.read_mark(engine, name.replace("__", ":").replace("acme_api", "acme/api"), ok, "" if ok else "why", 1.0)
+        for name in self.NAMES | set(needs):
+            key = name if name in ("agents", "decisions") else "%s:%s" % (name, repo)
+            sb.read_mark(engine, key, name != bad, "" if name != bad else "why", 1.0)
         return engine
 
+    def test_each_kind_is_kept_while_any_one_input_it_judges_is_not_whole_and_released_when_all_are(self):
+        for kind in sorted(self.kinds()):
+            needs = sb.triage_inputs(kind)
+            for bad in needs:
+                with self.subTest(kind=kind, bad=bad):
+                    self.assertTrue(sb.triage_digest_keep(self.marks(needs, bad))(kind, "acme/api#1"))   # that one input alone is not whole
+            with self.subTest(kind=kind, all="whole"):
+                self.assertFalse(sb.triage_digest_keep(self.marks(needs))(kind, "acme/api#1"))
+
     def test_the_prune_keeps_the_records_of_a_rule_the_table_does_not_know(self):
-        keep = sb.triage_digest_keep(self.keep_engine(agents=True, issues__acme_api=True))
+        keep = sb.triage_digest_keep(self.marks(("agents", "issues")))
         self.assertFalse(keep("T2", "acme/api#1"))
         with mock.patch.dict(sb.TRIAGE_RULE_INPUTS, {}, clear=True):
             self.assertTrue(keep("T2", "acme/api#1"))                                # unknown: kept
-
-    def test_the_other_owner_flag_and_each_rule_are_kept_while_an_input_it_judges_is_not_whole(self):
-        for kind, needs in sorted(sb.TRIAGE_RULE_INPUTS.items()):
-            for bad in needs:
-                with self.subTest(kind=kind, bad=bad):
-                    engine = types.SimpleNamespace(read_whole={}, _note=lambda *a, **k: None)
-                    for name in needs:
-                        key = name if name in ("agents", "decisions") else "%s:acme/api" % name
-                        sb.read_mark(engine, key, name != bad, "" if name != bad else "why", 1.0)
-                    self.assertTrue(sb.triage_digest_keep(engine)(kind, "acme/api#1"))   # the not-whole input keeps it
-                    for name in needs:
-                        sb.read_mark(engine, name if name in ("agents", "decisions") else "%s:acme/api" % name, True, "", 2.0)
-                    self.assertFalse(sb.triage_digest_keep(engine)(kind, "acme/api#1"))  # all whole: it may be pruned
 
 
 class TestReadWholeAuditTable(unittest.TestCase):
