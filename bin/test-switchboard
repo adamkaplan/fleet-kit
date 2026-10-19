@@ -11139,11 +11139,54 @@ class TestAgentShellCalls(Base):
         self.assertIn("(read 15 min ago)", "\n".join(sb.agent_calls.usage_lines(str(self.state), time.time())))
 
     def test_lane_endpoint_classes_per_lane_and_account_are_bounded(self):
-        rows = "\n".join(json.dumps({"ts": int(time.time()), "account": "a", "endpoint": "api x%d" % i, "lane": "w"}) for i in range(40))
+        rows = "\n".join(json.dumps({"ts": int(time.time()), "account": "a", "endpoint": "api " + sorted(sb.agent_calls.API_SUB)[i], "lane": "w"}) for i in range(40))
         (self.state / "agent-calls.jsonl").write_text(rows + "\n")
         sb.agent_calls.fold(str(self.state), time.time())
         cell = list(sb.agent_calls.load_hours(str(self.state))[0].values())[0]["lanes"]["w"]["a"]
         self.assertEqual((len(cell), sum(cell.values()), cell["other"]), (sb.agent_calls.ENDPOINTS_PER_CELL + 1, 40, 10))
+
+    def shim_module(self):
+        import importlib.machinery
+        loader = importlib.machinery.SourceFileLoader("gh_shim_endpoint", str(SHIM))
+        spec = importlib.util.spec_from_loader("gh_shim_endpoint", loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        return module
+
+    def test_endpoint_class_s7_no_name_reaches_any_record_from_any_call_shape(self):
+        """PC-1 as a class: an allow-list, so a name-bearing and a name-free variant of every gh shape records no name token (shim, spool, fold, status)."""
+        shim = self.shim_module()
+        name = "zzname"
+        shapes = [["api", "https://api.github.com/repos/acme-%s/app-%s/pulls/5" % (name, name)], ["api", "repos/acme-%s/app-%s/issues/5?q=%s" % (name, name, name)],
+                  ["api", "/repos/o-%s/n-%s/contents/dir-%s/file-%s.py" % (name, name, name, name)], ["api", "orgs/acme-%s/members" % name], ["api", "users/bob-%s/repos" % name],
+                  ["api", "teams/t-%s" % name], ["api", "search/issues?q=repo:acme-%s/app" % name], ["api", "user/repos"], ["api", "graphql"], ["api", "rate_limit"],
+                  ["api", "repos/o/n/git/ref/heads/feature-%s" % name], ["api", "http://host-%s.example/repos/o/n/issues/1" % name],
+                  ["browse", "acme-%s/app" % name], ["repo", "clone", "acme-%s/app" % name], ["repo", "view", "acme-%s/app" % name], ["pr", "view", "5", "-R", "acme-%s/app" % name],
+                  ["pr", "list"], ["issue", "list"], ["issue", "view", "acme-%s" % name], ["release", "view", "v-%s" % name], ["run", "view", "123"], ["workflow", "run", "ci-%s.yml" % name],
+                  ["gist", "view", "g-%s" % name], ["search", "prs", name], ["auth", "status"], ["label", "list"], ["ruleset", "view", "r-%s" % name],
+                  ["frobnicate-%s" % name, "x"], ["pr", "wibble-%s" % name]]
+        for args in shapes:
+            got = shim.call_endpoint(args)
+            self.assertNotIn(name, got, args)
+            self.assertNotIn("acme", got)
+            self.assertEqual(got, sb.agent_calls.reduce_endpoint(got), "idempotent")                     # the daemon side reduces again to the same
+            self.assertEqual(sb.agent_calls.reduce_endpoint(" ".join(shim.command_words(args)[:2])), got, "the shim and the daemon side are one rule")
+            self.assertNotIn(name, sb.agent_calls._endpoint("api https://api.github.com/repos/acme/app-%s/x" % name))
+        self.assertEqual(shim.call_endpoint(["api", "https://api.github.com/repos/acme/app/pulls/5"]), "api pulls/#")
+        self.assertEqual((shim.call_endpoint(["api", "orgs/acme-org/members"]), shim.call_endpoint(["browse", "acme/app"])), ("api orgs", "browse"))
+        self.assertEqual(shim.call_endpoint(["pr", "wibble"]), "pr")
+        self.assertEqual(shim.call_endpoint(["frob", "x"]), "other")
+
+    def test_endpoint_class_an_old_or_hostile_spool_line_cannot_carry_a_name_in(self):
+        (self.state / "agent-calls.jsonl").write_text(json.dumps({"ts": int(time.time()), "account": "a", "lane": "w", "endpoint": "api https://api.github.com/repos/acme/app-zzname/pulls/#"}) + "\n"
+                                                      + json.dumps({"ts": int(time.time()), "account": "a", "lane": "w", "endpoint": "browse acme/zzname"}) + "\n")
+        sb.agent_calls.fold(str(self.state), time.time())
+        self.assertNotIn("zzname", (self.state / "agent-calls-hours.json").read_text())
+        self.assertNotIn("zzname", "\n".join(sb.agent_calls.status_lines(str(self.state), time.time())))
+
+    def test_endpoint_class_the_daemons_own_record_is_reduced_too(self):
+        self.assertEqual(sb._endpoint_of("orgs/acme-org/members?x=1"), "orgs")
+        self.assertEqual(sb._endpoint_of("repos/acme/app/issues/12/parent"), "issues/#/parent")
 
     def test_the_fold_moves_the_spool_into_the_hours_and_loses_no_line(self):
         for _ in range(2):

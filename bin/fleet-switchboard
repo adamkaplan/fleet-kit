@@ -17999,8 +17999,7 @@ def _says_rate_limited(*texts):
 
 def _endpoint_of(path):
     """A path as the counter groups it: no repo, no query, numbers as `#` (`repos/o/r/issues/12/parent` -> `issues/#/parent`)."""
-    bare = re.sub(r"^repos/[^/]+/[^/]+/?", "", path.split("?")[0])
-    return re.sub(r"\d+", "#", bare) or "repo"
+    return agent_calls.reduce_endpoint("api " + path)[4:]   # the allow-listed class: no repository, owner or name (#867)
 
 
 class RepoExcluded(AccountError):

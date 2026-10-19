@@ -29,7 +29,57 @@ UNKNOWN_LANE = "unknown"  # a spool line from before lanes were recorded, or who
 USAGE_FILE = "github-usage.json"
 _SAFE = re.compile(r"[^A-Za-z0-9._@-]")
 _LANE_SAFE = re.compile(r"[^A-Za-z0-9_-]")
-_ENDPOINT_SAFE = re.compile(r"[^A-Za-z0-9 #/._-]")
+
+
+# ---- the endpoint class: an ALLOW-LIST, never a filter of what is there (#867). Only the words below can appear in it: a name (repository, owner, user,
+# team, branch, file) is not on any list, so it cannot be recorded. The same code is in shims/gh (`reduce_endpoint`) and bin/agent_calls.py: a test runs both.
+GROUPS = frozenset("api pr issue repo browse release run workflow gist search auth label ruleset status project cache codespace secret variable ssh-key "
+                   "gpg-key org extension alias config completion help version attestation agent-task copilot preview skill".split())
+VERBS = frozenset("view list create edit close reopen merge comment review checks diff status checkout ready delete download watch clone fork sync rerun "
+                  "cancel enable disable get set remove lock unlock transfer pin unpin develop archive unarchive rename upload verify trusted-root login logout "
+                  "refresh token setup-git switch import export".split())
+API_TOP = frozenset("orgs users user teams search gists notifications rate_limit graphql installation app repositories enterprises marketplace_listing "
+                    "emojis meta licenses gitignore codes_of_conduct events feeds octocat zen versions applications authorizations assignments classrooms".split())
+API_SUB = frozenset("issues pulls comments commits contents git refs trees blobs tags branches releases assets labels milestones events actions runs jobs "
+                    "workflows artifacts check-runs check-suites statuses status reviews files requested_reviewers timeline parent sub_issues reactions collaborators "
+                    "hooks deployments environments rulesets protection merge compare readme languages contributors forks stargazers subscribers pages dependabot "
+                    "code-scanning secret-scanning teams topics traffic license rate_limit logs attempts rerun cancel dispatches installation subscription "
+                    "assignees invitations keys comments pending_deployments approvals dependencies blocked_by blocking copilot".split())
+
+
+def reduce_endpoint(text):
+    """`api issues/#` for a call whatever its form (a URL with a host, a leading slash, a query, a repository path, a name anywhere): only allow-listed words
+    survive. `api <top word>` for orgs, users, teams, search and the like (the name after it is dropped); a repository path keeps its own words after
+    `repos/<owner>/<name>/`, numbers as `#`, and stops at the first word not on the list. A command that is not `api` keeps its first word and a second one only when
+    that is a known verb. Anything unknown is the first word alone, or `other`. Idempotent."""
+    words = str(text).split()
+    if not words:
+        return "other"
+    first = re.sub(r"[^a-z0-9_-]", "", words[0].lower())
+    if first not in GROUPS:
+        return "other"
+    if first != "api":
+        second = re.sub(r"[^a-z0-9_-]", "", words[1].lower()) if len(words) > 1 else ""
+        return first + (" " + second if second in VERBS else "")
+    if len(words) < 2:
+        return "api"
+    path = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]*", "", words[1].split("?")[0].split("#")[0] if "://" in words[1] else words[1].split("?")[0])
+    segs = [s for s in path.split("/") if s]
+    if not segs:
+        return "api repo"
+    if segs[0] == "repos":
+        segs = segs[3:]
+    elif segs[0] in API_TOP:
+        return "api " + segs[0]
+    kept = []
+    for seg in segs[:12]:
+        if re.fullmatch(r"[0-9]+|#", seg):
+            kept.append("#")
+        elif seg in API_SUB:
+            kept.append(seg)
+        else:
+            break
+    return "api " + ("/".join(kept) or "repo")
 
 
 def _number(value):
@@ -45,7 +95,7 @@ def _lane(value):
 
 
 def _endpoint(value):
-    return (_ENDPOINT_SAFE.sub("?", value)[:60] or "other") if isinstance(value, str) else "other"
+    return reduce_endpoint(value) if isinstance(value, str) else "other"
 
 
 def _hour(ts):
