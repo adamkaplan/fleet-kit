@@ -852,10 +852,9 @@ class Launcher:
                 res = self.run_hook(name)
             except CloudError as e:
                 res = {"pushed": False, "wip_branch": None, "error": str(e)}
-            self.last_hook = {"pushed": bool(res.get("pushed")), "wip_branch": res.get("wip_branch"), "error": self.kube.scrub(res.get("error") or "")}
-            self._hook_record(info, {"ran": True, "pushed": bool(res.get("pushed")), "wip_branch": res.get("wip_branch"),
-                                     "skipped": [self.kube.scrub(x, 200) for x in res["skipped"]][:50] if isinstance(res.get("skipped"), list) else [],
-                                     "note": self.kube.scrub(res.get("note") or ""), "error": self.last_hook["error"]})
+            view = self._hook_view(res)   # every field text from the pod: a string, scrubbed, short
+            self.last_hook = {k: view[k] for k in ("pushed", "wip_branch", "error")}
+            self._hook_record(info, dict(view, ran=True))
             if res.get("error"):
                 self.kube.annotate(name, kept="true")  # the pod is kept: the commit is not safe yet
                 raise CloudError("end hook could not push, pod kept: %s" % res["error"], EXIT_HOOK)
@@ -875,7 +874,7 @@ class Launcher:
             if skipped:  # these files were not pushed and went with the pod: say so, loudly
                 print("cloud-worker: WARNING: not saved (secret-looking names): %s" % ", ".join(skipped), file=sys.stderr)
             return {"worker": worker, "runtime_id": "pod/" + name, "pushed": bool(res.get("pushed")),
-                    "wip_branch": res.get("wip_branch"), "skipped": skipped, "record": info.get("record", "")}
+                    "wip_branch": view["wip_branch"], "skipped": skipped, "record": info.get("record", "")}
         return self._audited(worker, "stop", go, audit_reason)
 
     def _remove(self, name, nonce):
@@ -896,6 +895,19 @@ class Launcher:
                 left.append(label)
         if left:
             raise CloudError("delete incomplete; REMAINS: %s; delete each with: %s" % (", ".join(left), "; ".join(self._delete_cmd(l) for l in left)))
+
+    def _hook_view(self, res):
+        """The end hook's answer as it may be shown or kept: pushed a bool, wip_branch a scrubbed string or None, the
+        skipped names strings (at most 50), note and error scrubbed. Never raises."""
+        def text(v, limit=300):
+            return self.kube.scrub(v, limit) if isinstance(v, str) and v else ""
+        try:
+            raw = res.get("skipped")
+            return {"pushed": bool(res.get("pushed")), "wip_branch": text(res.get("wip_branch"), 200) or None,
+                    "skipped": [text(x, 200) for x in raw if isinstance(x, str)][:50] if isinstance(raw, list) else [],
+                    "note": text(res.get("note")), "error": text(res.get("error"))}
+        except Exception:
+            return {"pushed": bool(res.get("pushed")), "wip_branch": None, "skipped": [], "note": "", "error": "end hook answer unreadable"}
 
     def _hook_record(self, info, hook):
         if info.get("record"):

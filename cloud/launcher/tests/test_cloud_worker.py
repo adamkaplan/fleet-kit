@@ -510,6 +510,17 @@ class S5EndHook(Base):
             cw.run_record.Recorder.add_hook(os.path.join(self.tmp.name, "absent"), {"ran": True})
         self.assertEqual(err.getvalue().count("run record not updated with the end hook result"), 1)
 
+    def test_the_hook_answer_is_typed_scrubbed_and_short_before_it_is_kept(self):
+        L = cw.Launcher(cw.Kube(self.env), self.env, self.clock)
+        L.kube.add_secrets("s3cr3t-value-123456")
+        v = L._hook_view({"pushed": 1, "wip_branch": "b/s3cr3t-value-123456" + "x" * 500, "skipped": [".env", 7, None] + ["f"] * 80,
+                          "note": {"a": 1}, "error": "\x1b[31mboom"})
+        self.assertNotIn("s3cr3t-value-123456", json.dumps(v))
+        self.assertLessEqual(len(v["wip_branch"]), 200)
+        self.assertEqual((v["pushed"], v["note"]), (True, ""))
+        self.assertTrue(all(isinstance(x, str) for x in v["skipped"]) and len(v["skipped"]) <= 50)
+        self.assertEqual(L._hook_view({"wip_branch": 5})["wip_branch"], None)
+
     def test_no_record_means_no_end_hook_write(self):
         work, _ = make_repo(self.tmp.name, "r", dirty=True)
         self.patch_state(hook_env={"CW_WORKDIR": work, "CW_WORKER": "coder7"})
@@ -522,9 +533,7 @@ class S5EndHook(Base):
         orig = cw.Launcher.reap
         cw.Launcher.reap = lambda self_: (_ for _ in ()).throw(RuntimeError("boom"))
         self.addCleanup(setattr, cw.Launcher, "reap", orig)
-        with self.assertRaises(RuntimeError):
-            self.run_cli("reap")
-        # the line is written by the finally block; run_cli's stderr is discarded on a raise, so call directly
+        # the line is written by the finally block; run_cli's stderr is discarded on a raise, so call main directly
         err = io.StringIO()
         with redirect_stderr(err), redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
             cw.main(["reap"], self.env, self.clock, lambda s: None)
