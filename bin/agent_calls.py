@@ -211,7 +211,10 @@ def fold(state_dir, now, daemon_delta=None):
     delta, detail = {}, {}
     for a, n in (daemon_delta or {}).items():
         if isinstance(n, dict):
-            parts = {_endpoint(e): int(c) for e, c in n.items() if _number(c) and c > 0}
+            parts = {}
+            for e, c in n.items():
+                if _number(c) and c > 0:
+                    parts[_endpoint(e)] = parts.get(_endpoint(e), 0) + int(c)   # classes that reduce to one word ADD, never overwrite
             if parts:
                 detail[_account(a)] = parts
                 delta[_account(a)] = sum(parts.values())

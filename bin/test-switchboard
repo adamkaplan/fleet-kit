@@ -11069,6 +11069,26 @@ class TestAgentShellCalls(Base):
         for leak in ("secrettoken", "secretbody", "queryvalue", "acme/app"):
             self.assertNotIn(leak, record)
 
+    def test_daemon_classes_keep_their_class_and_two_that_reduce_alike_add(self):
+        now = time.time()
+        sb.agent_calls.fold(str(self.state), now, {"acme-a": {"api issues/#": 2, "api pulls/#": 1, "api graphql": 1}})
+        sb.agent_calls.fold(str(self.state), now, {"acme-b": {"api zz-one": 2, "api zz-two": 1, "browse x": 1}})   # three classes that all reduce to `other`/`api repo`/`browse`
+        hours, _ = sb.agent_calls.load_hours(str(self.state))
+        row = list(hours.values())[-1]
+        self.assertEqual(row["daemon"], {"acme-a": 4, "acme-b": 4})
+        cells = row["lanes"]["daemon"]
+        self.assertEqual(cells["acme-a"], {"api issues/#": 2, "api pulls/#": 1, "api graphql": 1})
+        self.assertEqual(sum(cells["acme-b"].values()), 4)
+        self.assertEqual(cells["acme-b"]["api repo"], 3)                                  # two classes reduced to one word: 2 + 1, not the last one
+        accounts = sb.GhAccounts({"gh": FAKE_GH, "call_timeout_seconds": 5, "gh_users": {}}, lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "{}", ""), time.time, environ={})
+        engine = types.SimpleNamespace(accounts=accounts, state_dir=self.state, now=time.time, _note=lambda *a, **k: None)
+        for path in ("repos/acme/app/issues/1", "repos/acme/app/pulls/2", "graphql"):
+            accounts.read(accounts.runner, path, "acme/app", 5)
+        sb.record_github_calls(engine)
+        hours, _ = sb.agent_calls.load_hours(str(self.state))
+        mine = list(hours.values())[-1]["lanes"]["daemon"]["default"]
+        self.assertEqual(mine, {"api issues/#": 1, "api pulls/#": 1, "api graphql": 1})   # the daemon's own classes survive the fold
+
     def test_lane_a_failed_write_leaves_no_temp_file(self):
         with mock.patch.object(sb.agent_calls.os, "replace", side_effect=OSError("no")):
             self.assertFalse(sb.agent_calls._write_json(str(self.state / "x.json"), {"a": 1}))

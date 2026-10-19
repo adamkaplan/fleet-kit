@@ -11504,7 +11504,8 @@ def record_github_calls(engine):
             for at, account, endpoint, _ in accounts.calls:
                 if cursor is None or at > cursor:
                     fresh.setdefault(account, {})
-                    fresh[account][endpoint] = fresh[account].get(endpoint, 0) + 1   # the daemon is the lane "daemon"; its calls carry their endpoint class
+                    key = "api " + endpoint   # the form the shim writes (a command), so the one reduction reads it
+                    fresh[account][key] = fresh[account].get(key, 0) + 1   # the daemon is the lane "daemon"; its calls carry their endpoint class
         if agent_calls.fold(str(engine.state_dir), engine.now(), fresh) or not fresh:
             engine.agent_calls_cursor = engine.now()   # advanced only once the calls are written: a failed write is counted at the next pass
         last_usage = getattr(engine, "usage_read_at", None)
