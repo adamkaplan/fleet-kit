@@ -12970,6 +12970,7 @@ def triage_findings(engine, state, repos, decisions, cfg, now, errors):
     except (NoticeError, OSError, TypeError):
         pass
     out, unchecked, truncated = [], {}, []
+    agents_whole = whole(engine, "agents")[0]
     live_days = load_module("awaiting_live").days_of(engine.config)
     captain_listed = {sweep_ref_of(d, engine.config.get("intent_repo")) for d in decisions if d.get("kind") == "captain"}
     for repo in repos:
@@ -13005,6 +13006,10 @@ def triage_findings(engine, state, repos, decisions, cfg, now, errors):
             found, ours = triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs.get(repo, set()),
                                        captain_skip=captain_skip, merged=links, pending=pending,
                                        live=live["info"] if live else None, live_days=live_days)
+            if not agents_whole:   # #805: "no owner" is judged against the running agents: a fleet that was not read whole is no evidence of an absence
+                for rule in ("T1", "T11"):
+                    if found.pop(rule, None) is not None:
+                        whole_skipped(engine, "triage.owner_rules", "agents")
             if not found:
                 continue
             ref = "%s#%d" % (repo, number)

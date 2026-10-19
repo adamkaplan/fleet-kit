@@ -22902,6 +22902,19 @@ class TestTriage(Base):
         self.add(1, created=30, updated=0.1, labels=["x:orchestrator", "kind"], assignees=["bot"], body="## Decision required\nx")
         self.add(2, created=20, updated=0.1, parent=1, labels=["kind"], body="Next: go")
 
+    def test_t1_and_t11_wait_while_the_fleet_was_not_read_whole_and_come_back_with_a_whole_one(self):
+        self.charter()
+        self.add(10, created=2, labels=["kind"])                         # no assignee, no chain: T1 once the fleet is known
+        with mock.patch.object(self.engine.herdr, "agent_list", side_effect=sb.HerdrError("down")):
+            self.engine.discover(self.world.clock.now())                 # the REAL discovery, herdr unreachable
+        self.assertFalse(sb.whole(self.engine, "agents")[0])
+        self.go(passes=3)
+        self.assertEqual(self.only("T1"), [])                            # no owner is no evidence from a partial fleet
+        self.assertIn("whole.skipped", [e["event"] for e in self.world.audit()])
+        self.engine.discover(self.world.clock.now())
+        self.go(passes=3)
+        self.assertEqual(self.only("T1"), ["acme/api#10"])               # the genuine finding
+
     def test_t1_owner_missing_both_ways_and_the_grace_day(self):
         self.charter()
         self.add(10, created=2, labels=["kind"])                         # no assignee, no chain, ours (bot): T1
@@ -24651,7 +24664,7 @@ class TestReadWholeAuditTable(unittest.TestCase):
     """#805: the docs audit lists every absence-driven consumer with its input, whether it checked before, and its fix or how it is guarded."""
     NAMED = ("escalation-key prune", "triage seen-memory prune", "T5 and T6", "load alert", "stalled count", "sweep S2", "once-only memory",
              "closed-label", "merged-label", "reminders prune", "temp janitor", "worktree reclaim", "container reaper", "retire", "auto-retire",
-             "delivered-message", "cursor prunes", "ownerless", "stale-ask", "chat-clear offers", "notice expiry")
+             "delivered-message", "cursor prunes", "ownerless", "T1 and T11", "chat-clear offers", "notice expiry")
 
     def rows(self):
         text = (REPO / "docs" / "switchboard.md").read_text()
