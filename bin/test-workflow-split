@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""test-workflow-split: pins the shape of .github/workflows/test.yml after the cloud suites moved to their own job (ask #868). Offline.
+
+    bin/test-workflow-split
+
+The last line printed is `RESULT: PASS` or `RESULT: FAIL`.
+
+The workflow is read as data by a small tolerant parser (the runners are not guaranteed to have PyYAML, and no other test in bin/ reads YAML):
+it handles exactly the shapes this file uses (mappings, lists of mappings, inline `[a, b]` lists, `|` block scalars, comments, quoted scalars).
+Each test pins one scenario of the plan; `Mutants` makes a one-line edit to the text per scenario and requires the pins to fail."""
+import re
+import sys
+import unittest
+from pathlib import Path
+
+WORKFLOW = Path(__file__).resolve().parent.parent / ".github" / "workflows" / "test.yml"
+GREP = "grep -qx 'RESULT: PASS' \"$RUNNER_TEMP/out%s.txt\""
+
+
+def _scalar(text):
+    text = text.strip()
+    if text.startswith("[") and text.endswith("]"):
+        return [_scalar(x) for x in text[1:-1].split(",") if x.strip()]
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        return text[1:-1]
+    return text
+
+
+def _strip_comment(line):
+    """Drop a trailing ` # note` unless the value is quoted."""
+    return line if line.lstrip()[:1] in "\"'" else re.sub(r"\s+#\s.*$", "", line)
+
+
+def parse(text):
+    """Return the workflow as nested dicts/lists. Block scalars (`|`) come back as one string."""
+    lines = [l.rstrip("\n") for l in text.splitlines()]
+    pos = [0]
+
+    def indent(l):
+        return len(l) - len(l.lstrip(" "))
+
+    def skip():
+        while pos[0] < len(lines) and (not lines[pos[0]].strip() or lines[pos[0]].lstrip().startswith("#")):
+            pos[0] += 1
+
+    def block(min_indent):
+        skip()
+        if pos[0] >= len(lines) or indent(lines[pos[0]]) < min_indent:
+            return None
+        base = indent(lines[pos[0]])
+        if lines[pos[0]].lstrip().startswith("- "):
+            out = []
+            while True:
+                skip()
+                if pos[0] >= len(lines) or indent(lines[pos[0]]) != base or not lines[pos[0]].lstrip().startswith("- "):
+                    return out
+                lines[pos[0]] = " " * (base + 2) + lines[pos[0]].lstrip()[2:]   # the item's first key becomes a plain mapping line
+                out.append(mapping(base + 2))
+        return mapping(base)
+
+    def mapping(base):
+        out = {}
+        while True:
+            skip()
+            if pos[0] >= len(lines) or indent(lines[pos[0]]) != base:
+                return out
+            line = lines[pos[0]].strip()
+            m = re.match(r"([^:]+?):(?:\s+(.*))?$", line)
+            if not m:
+                raise ValueError("unreadable line: %r" % line)
+            key, rest = m.group(1), (m.group(2) or "").strip()
+            pos[0] += 1
+            if rest in ("|", ">"):
+                body = []
+                while pos[0] < len(lines) and (not lines[pos[0]].strip() or indent(lines[pos[0]]) > base):
+                    body.append(lines[pos[0]].strip())
+                    pos[0] += 1
+                out[key] = "\n".join(body).strip("\n")
+            elif rest:
+                out[key] = _scalar(_strip_comment(rest))
+            else:
+                out[key] = block(base + 1)
+
+    return mapping(0)
+
+
+def load(text=None):
+    return parse(WORKFLOW.read_text() if text is None else text)
+
+
+def checks(job, jid):
+    """The check names GitHub shows: the job's name (else its id), then the matrix value in parentheses."""
+    return ["%s (%s)" % (job.get("name", jid), os_) for os_ in job["strategy"]["matrix"]["os"]]
+
+
+def commands(job):
+    return [(s.get("name"), s.get("run"), s.get("timeout-minutes")) for s in job["steps"] if "run" in s and s.get("name", "").startswith(("bin/", "cloud/"))]
+
+
+def run_of(name, out=""):
+    return "%s 2>&1 | tee \"$RUNNER_TEMP/out%s.txt\"\n%s" % (name, out, GREP % out)
+
+
+def suite(name, out="", timeout=None):
+    return (name, run_of(name, out), timeout)
+
+
+# The old job's suite steps in the order of the workflow before the split, minus the two that moved (U1).
+OLD_JOB = [("bin/check-public-names", "python3 bin/check-public-names", None),
+           suite("bin/test-heartbeat"), suite("bin/test-health-records"), suite("bin/test-fleet-doctor"),
+           suite("bin/test-fleet-doctor-config"), suite("bin/test-fleet-doctor-heartbeat"), suite("bin/test-switchboard"),
+           suite("bin/test-workflow-split"), suite("bin/test-gh-hold", "-hold"), suite("bin/test-app-mint", "-app"),
+           suite("bin/test-cloud-neutral-names"), suite("cloud/tests/test-cloud", "", "5"),
+           ("bin/fleet-scenario validate", "bin/fleet-scenario validate", None),
+           ("bin/fleet-scenario coverage", "bin/fleet-scenario coverage --enforce --through-pr 4", None)]
+NEW_JOB = [suite("bin/test-cloud-worker"), suite("bin/test-cloud-launcher", "", "30")]
+MOVED = [n for n, _, _ in NEW_JOB]
+OLD_CHECKS = ["test (ubuntu-latest)", "test (macos-latest)"]
+CONCURRENCY = {"group": "test-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}",
+               "cancel-in-progress": "${{ github.event_name == 'pull_request' }}"}
+TRIGGERS = ["pull_request", "push", "workflow_dispatch"]
+MATRIX = ["ubuntu-latest", "macos-latest"]
+
+
+def only_suites(table):
+    return [row for row in table if row[0] not in ("bin/check-public-names", "bin/fleet-scenario validate", "bin/fleet-scenario coverage")]
+
+
+class Pins(unittest.TestCase):
+    """The plan's scenarios, read from `self.wf` (the real file by default; `Mutants` swaps in an edited copy)."""
+
+    wf = None
+
+    def setUp(self):
+        self.wf = self.wf or load()
+
+    def jobs(self):
+        return self.wf["jobs"]
+
+    def test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems(self):
+        jobs = self.jobs()
+        self.assertEqual(sorted(jobs), ["test", "test-cloud"])
+        for jid, job in jobs.items():
+            self.assertEqual(job["strategy"]["matrix"]["os"], MATRIX, jid)
+            self.assertNotIn("needs", job, jid)
+        self.assertEqual([c for c in commands(jobs["test-cloud"])], NEW_JOB)
+        for name in MOVED:
+            self.assertNotIn(name, [n for n, _, _ in commands(jobs["test"])])
+        launcher = [s for s in jobs["test-cloud"]["steps"] if s.get("name") == "bin/test-cloud-launcher"]
+        self.assertEqual([s.get("timeout-minutes") for s in launcher], ["30"])
+
+    def test_s7_the_old_job_keeps_its_id_and_check_names(self):
+        job = self.jobs()["test"]
+        self.assertNotIn("name", job)
+        self.assertEqual(checks(job, "test"), OLD_CHECKS)
+
+    def test_u3_the_old_job_keeps_its_matrix_runner_and_shell(self):
+        job = self.jobs()["test"]
+        self.assertEqual(job["strategy"]["matrix"]["os"], MATRIX)
+        self.assertEqual(job["runs-on"], "${{ matrix.os }}")
+        self.assertEqual(job["defaults"]["run"]["shell"], "bash")
+        self.assertEqual(self.jobs()["test-cloud"]["runs-on"], "${{ matrix.os }}")
+        self.assertEqual(self.jobs()["test-cloud"]["defaults"]["run"]["shell"], "bash")
+
+    def test_u1_every_suite_command_appears_once_in_its_original_order_with_the_result_grep(self):
+        got = commands(self.jobs()["test"])
+        self.assertEqual(got, OLD_JOB)
+        self.assertEqual(commands(self.jobs()["test-cloud"]), NEW_JOB)
+        both = [n for n, _, _ in got + commands(self.jobs()["test-cloud"])]
+        for name in MOVED + [n for n, _, _ in only_suites(OLD_JOB)]:
+            self.assertEqual(both.count(name), 1, name)
+        for _, run, _ in only_suites(got) + commands(self.jobs()["test-cloud"]):
+            self.assertIn("grep -qx 'RESULT: PASS'", run)
+
+    def test_s6_the_concurrency_block_is_the_current_one_and_no_job_has_its_own(self):
+        self.assertEqual(self.wf["concurrency"], CONCURRENCY)
+        for jid, job in self.jobs().items():
+            self.assertNotIn("concurrency", job, jid)
+
+    def test_u2_three_triggers_no_job_level_if_and_the_image_suite_limit(self):
+        self.assertEqual(sorted(self.wf["on"]), sorted(TRIGGERS))
+        self.assertEqual(self.wf["on"]["push"], {"branches": ["main"]})
+        for jid, job in self.jobs().items():
+            self.assertNotIn("if", job, jid)
+        image = [s for s in self.jobs()["test"]["steps"] if s.get("name") == "cloud/tests/test-cloud"]
+        self.assertEqual([s.get("timeout-minutes") for s in image], ["5"])
+
+
+def mutate(text, old, new):
+    assert text.count(old) >= 1, old
+    return text.replace(old, new, 1)
+
+
+class Mutants(unittest.TestCase):
+    """One mutant per scenario (and per member class of the check-name family): each edit must make the matching pin fail."""
+
+    def fails(self, old, new, *tests):
+        wf = load(mutate(WORKFLOW.read_text(), old, new))
+        for t in tests:
+            case = Pins(t)
+            case.wf = wf
+            result = unittest.TestResult()
+            case.run(result)
+            self.assertTrue(result.failures or result.errors, "mutant %r -> %r passed %s" % (old, new, t))
+
+    def test_the_unmutated_file_passes_every_pin(self):
+        result = unittest.TestResult()
+        unittest.defaultTestLoader.loadTestsFromTestCase(Pins).run(result)
+        self.assertEqual((result.failures, result.errors), ([], []))
+
+    def test_s1_needs_added(self):
+        self.fails("  test-cloud:\n", "  test-cloud:\n    needs: test\n", "test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems")
+
+    def test_s1_macos_dropped_from_the_new_job(self):
+        text = WORKFLOW.read_text()
+        i = text.index("  test-cloud:")
+        wf = load(text[:i] + text[i:].replace("[ubuntu-latest, macos-latest]", "[ubuntu-latest]", 1))
+        case = Pins("test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems")
+        case.wf = wf
+        result = unittest.TestResult()
+        case.run(result)
+        self.assertTrue(result.failures or result.errors)
+
+    def test_s1_launcher_limit_changed(self):
+        self.fails("timeout-minutes: 30", "timeout-minutes: 20", "test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems", "test_u1_every_suite_command_appears_once_in_its_original_order_with_the_result_grep")
+
+    def test_s7_old_job_given_a_name(self):
+        self.fails("  test:\n    strategy:", "  test:\n    name: unit\n    strategy:", "test_s7_the_old_job_keeps_its_id_and_check_names")
+
+    def test_s7_old_job_renamed(self):
+        wf = load(mutate(WORKFLOW.read_text(), "  test:\n    strategy:", "  unit:\n    strategy:"))
+        case = Pins("test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems")
+        case.wf = wf
+        result = unittest.TestResult()
+        case.run(result)
+        self.assertTrue(result.failures or result.errors)
+
+    def test_u3_old_matrix_loses_macos(self):
+        text = WORKFLOW.read_text()
+        wf = load(text.replace("[ubuntu-latest, macos-latest]", "[ubuntu-latest]", 1))
+        case = Pins("test_u3_the_old_job_keeps_its_matrix_runner_and_shell")
+        case.wf = wf
+        result = unittest.TestResult()
+        case.run(result)
+        self.assertTrue(result.failures or result.errors)
+
+    def test_u1_a_command_edited(self):
+        self.fails("bin/test-heartbeat 2>&1", "bin/test-heartbeat -q 2>&1", "test_u1_every_suite_command_appears_once_in_its_original_order_with_the_result_grep")
+
+    def test_u1_the_grep_dropped(self):
+        self.fails("          grep -qx 'RESULT: PASS' \"$RUNNER_TEMP/out.txt\"\n\n      - name: bin/test-health-records", "          true\n\n      - name: bin/test-health-records", "test_u1_every_suite_command_appears_once_in_its_original_order_with_the_result_grep")
+
+    def test_u1_launcher_left_in_the_old_job(self):
+        text = WORKFLOW.read_text()
+        step = "      - name: bin/test-cloud-launcher\n        if: ${{ !cancelled() }}\n        timeout-minutes: 30\n        run: |\n          bin/test-cloud-launcher 2>&1 | tee \"$RUNNER_TEMP/out.txt\"\n          grep -qx 'RESULT: PASS' \"$RUNNER_TEMP/out.txt\"\n"
+        self.assertIn(step, text)
+        text = text.replace(step, "") .replace("      - name: bin/test-switchboard\n", step + "\n      - name: bin/test-switchboard\n", 1)
+        for t in ("test_s1_a_second_job_runs_the_cloud_suites_in_parallel_on_both_systems", "test_u1_every_suite_command_appears_once_in_its_original_order_with_the_result_grep"):
+            case = Pins(t)
+            case.wf = load(text)
+            result = unittest.TestResult()
+            case.run(result)
+            self.assertTrue(result.failures or result.errors, t)
+
+    def test_s6_concurrency_group_changed(self):
+        self.fails("github.event.pull_request.number || github.sha }}", "github.sha }}", "test_s6_the_concurrency_block_is_the_current_one_and_no_job_has_its_own")
+
+    def test_s6_cancel_in_progress_always_true(self):
+        self.fails("${{ github.event_name == 'pull_request' }}", "true", "test_s6_the_concurrency_block_is_the_current_one_and_no_job_has_its_own")
+
+    def test_s6_a_job_level_concurrency_block(self):
+        self.fails("  test-cloud:\n", "  test-cloud:\n    concurrency:\n      group: x\n", "test_s6_the_concurrency_block_is_the_current_one_and_no_job_has_its_own")
+
+    def test_u2_a_job_level_if(self):
+        self.fails("  test-cloud:\n", "  test-cloud:\n    if: github.event_name == 'pull_request'\n", "test_u2_three_triggers_no_job_level_if_and_the_image_suite_limit")
+
+    def test_u2_a_trigger_dropped(self):
+        self.fails("  workflow_dispatch:\n", "", "test_u2_three_triggers_no_job_level_if_and_the_image_suite_limit")
+
+    def test_u2_image_limit_changed(self):
+        self.fails("timeout-minutes: 5", "timeout-minutes: 10", "test_u2_three_triggers_no_job_level_if_and_the_image_suite_limit", "test_u1_every_suite_command_appears_once_in_its_original_order_with_the_result_grep")
+
+
+if __name__ == "__main__":
+    loader = unittest.defaultTestLoader
+    result = unittest.TextTestRunner(verbosity=1).run(unittest.TestSuite([loader.loadTestsFromTestCase(Pins), loader.loadTestsFromTestCase(Mutants)]))
+    print("RESULT: PASS" if result.wasSuccessful() else "RESULT: FAIL")
+    sys.exit(0 if result.wasSuccessful() else 1)
