@@ -4982,11 +4982,11 @@ Typical work reaches the default branch in batches, so the owner clears one pull
 
 Every change with an approved plan and a passing independent review merges into `integration`. Two kinds go straight to the default branch: an urgent fix (the Chief of Staff's waiver, logged) and anything the owner asks for alone. A change the impact floor holds is batched like any other, and the holds are the matrix's own. Only a change to credentials, identity or who may do what holds for the owner (`owner_hold` in `impact-matrix.json`); every other floor path or rating asks for a second independent review and the usual checks decide. So:
 
-Keep `integration` fast-forwarded to the default branch before a pull request opens into it; a stale `integration` makes the diff and the impact floor read the whole difference.
-
 - **Today.** A pull request into `integration` is rated and held on its own diff like any other, and a held one is cleared by the owner on that pull request (`impact clear <repo#N> --reason ...` in the owner's terminal).
 - **Target, after #835 lands.** The Chief of Staff's delegated clear (`impact clear --under-order N`, Serious and below) applies to such a pull request. It stays OFF until a numbered line of the owner's own standing-orders file is listed under `delegated_clear` in the configuration and matched by its hash (a comment on an issue is not that), and it refuses a change to credentials or identity, a top-tier review class, or a pull request with no review recorded at its head.
 - **The batch pull request** is judged by the floor on its own aggregated diff into the default branch, so it holds for the owner when any member touched a top-tier path until #835 lands, then only when a row is rated High (otherwise almost every batch would hold), whoever cleared that member earlier.
+
+Keep `integration` current with the default branch before a pull request opens into it: fast-forward it, or merge the default branch into it when it holds unbatched members; a stale `integration` makes the diff and the impact floor read the whole difference.
 
 ### The cadence and who keeps the batch
 
