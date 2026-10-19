@@ -2069,7 +2069,8 @@ class FakeHerdr:
         panes = []
         for pane in sorted(self.panes):
             entry = self.panes[pane]
-            panes.append({"pane_id": pane, "cwd": entry.get("cwd") or "/tmp", "foreground_cwd": entry.get("foreground_cwd") or entry.get("cwd") or "/tmp"})
+            panes.append({"pane_id": pane, "cwd": entry.get("cwd") or "/tmp", "foreground_cwd": entry.get("foreground_cwd") or entry.get("cwd") or "/tmp",
+                          **({"revision": entry["revision"]} if "revision" in entry else {})})
         panes.extend(getattr(self, "plain_terminals", []))
         return {"result": {"type": "pane_list", "panes": panes}}
 
@@ -2136,6 +2137,8 @@ class FakeHerdr:
         if positional or len(flags.get("--pane", [])) != 1:
             raise ValueError("pane process-info takes --pane <ID>")
         plain = self._plain(flags["--pane"][0])
+        if plain is not None and plain.get("process_fails"):
+            raise LookupError("process info of %s cannot be read" % plain["pane_id"])
         if plain is not None:   # a terminal with no agent: its foreground processes are what the test says (default: a bare shell)
             return {"result": {"type": "pane_process_info", "process_info": {"pane_id": plain["pane_id"], "shell_pid": 1,
                                                                               "foreground_processes": [{"cmdline": n, "name": n, "pid": 1} for n in plain.get("processes", ["zsh"])]}}}
@@ -66065,6 +66068,8 @@ class TestAdoption(LanesCase):
         sb.register_worktree(self.world.state, str(wt), "worker", None, "wt-bare", 1)
         base = {"pane_id": "w1:p90", "cwd": str(wt), "foreground_cwd": str(wt), "revision": 7, "processes": ["zsh"]}
         base.update(entry)
+        (Path(self.world.state) / sb.BARE_PANES_FILE).unlink(missing_ok=True)      # nothing remembered of any pane: every case starts as a first run
+        self.world.herdr.closed.clear()
         self.world.herdr.plain_terminals = [base]
         return base
 
@@ -66082,39 +66087,63 @@ class TestAdoption(LanesCase):
         self.assertTrue(row["detail"]["cwd"].endswith("wt-bare"))
         self.assertNotIn("command", json.dumps(row))
 
-    def break_guard(self, guard):
-        """The one fact that makes exactly `guard` fail on an otherwise closable pane. Returns the refusal marker."""
-        entry = self.bare_world()
+    # (guard, variant) -> (marker the refusal names, what a build WITHOUT the guard does: "closes" or None when another check refuses first)
+    GUARD_CASES = {
+        ("own-pane", "env"): ("the one you are in", "closes"),
+        ("listed", "absent"): ("is not listed", None),
+        ("unnamed", "pane-health record only"): ("is named by an agent record", "closes"),
+        ("unnamed", "herdr agent list only"): ("is named by an agent record", "closes"),
+        ("bare-shell", "a job runs"): ("has a foreground job", "closes"),
+        ("bare-shell", "no process reported"): ("has a foreground job", "closes"),
+        ("worktree", "outside any worktree"): ("not inside a fleet worktree", "closes"),
+        ("worktree", "below an agent's own cwd"): ("not inside a fleet worktree", "closes"),
+        ("idle", "first run"): ("not been seen idle", "closes"),
+    }
+
+    def break_guard(self, guard, variant):
+        """The one fact that makes exactly `guard` fail, in the way `variant` says, on an otherwise closable pane. Returns the pane id."""
+        self.bare_world()
         plain = self.world.herdr.plain_terminals[0]
+        pane = "w1:p90"
         if guard == "own-pane":
-            os.environ["HERDR_PANE_ID"] = "w1:p90"
+            os.environ["HERDR_PANE_ID"] = pane
             os.environ[sb.SESSION_ENV] = self.world.sessions["chief-of-staff"]
-            return "the one you are in"
-        if guard == "listed":
+        elif guard == "listed":
             self.world.herdr.plain_terminals = []
-            return "is not listed"
-        if guard == "unnamed":
-            health = Path(self.world.state) / sb.PANE_HEALTH_FILE
-            health.write_text(json.dumps({"agents": {"ghost": {"pane": "w1:p90", "session": "ses_x"}}, "states": {}, "missing": {}}))
-            return "is named by an agent record"
-        if guard == "bare-shell":
+        elif guard == "unnamed" and variant == "pane-health record only":
+            (Path(self.world.state) / sb.PANE_HEALTH_FILE).write_text(json.dumps({"agents": {"ghost": {"pane": pane, "session": "ses_x"}}, "states": {}, "missing": {}}))
+        elif guard == "unnamed":   # herdr's own agent list names a pane that is no fleet agent (a session with no fleet metadata)
+            self.world.herdr.plain_terminals = []
+            session = self.world.v2.create_session({})
+            pane = self.world.herdr.new_pane_id()
+            self.world.herdr.add(pane, session, "idle", program="zsh")
+            self.world.herdr.panes[pane].update({"cwd": plain["cwd"], "foreground_cwd": plain["cwd"], "revision": 7})
+        elif guard == "bare-shell" and variant == "a job runs":
             plain["processes"] = ["vim"]
-            return "foreground job"
-        if guard == "worktree":
+        elif guard == "bare-shell":
+            plain["processes"] = []
+        elif guard == "worktree" and variant == "outside any worktree":
             plain["cwd"] = plain["foreground_cwd"] = "/tmp"
-            return "not inside a fleet worktree"
-        if guard == "idle":
-            return "not been seen idle"
-        raise AssertionError("a guard with no case: %s" % guard)
+        elif guard == "worktree":   # the owner's shell in a directory below an agent's own cwd (a repository root), not in a registered worktree
+            root = self.home / "repo-root"
+            (root / "docs").mkdir(parents=True, exist_ok=True)
+            (Path(self.world.state) / sb.PANE_HEALTH_FILE).write_text(json.dumps({"agents": {"orch": {"pane": "w9:p9", "session": "ses_y", "cwd": str(root)}}, "states": {}, "missing": {}}))
+            plain["cwd"] = plain["foreground_cwd"] = str(root / "docs")
+        elif guard == "idle":
+            pass
+        else:
+            raise AssertionError("a case with no setup: %s / %s" % (guard, variant))
+        return pane
 
-    def run_close_pane_twice(self):
-        self.main("close-pane", "w1:p90")
+    def close_pane_twice(self, pane):
+        self.main("close-pane", pane)
         self.world.tick(11 * 60)
-        return self.main("close-pane", "w1:p90")
+        return self.main("close-pane", pane)
 
-    def check_guard(self, guard):
-        marker = self.break_guard(guard)
-        code, out, err = self.run_close_pane_twice() if guard != "idle" else self.main("close-pane", "w1:p90")
+    def check_guard(self, guard, variant):
+        marker, without = self.GUARD_CASES[(guard, variant)]
+        pane = self.break_guard(guard, variant)
+        code, out, err = self.main("close-pane", pane) if guard == "idle" else self.close_pane_twice(pane)
         self.assertEqual((code, self.world.herdr.closed), (1, []), err)
         self.assertIn(marker, err)
         refused = self.rows("fleetpane.close_refused")[-1]
@@ -66122,20 +66151,55 @@ class TestAdoption(LanesCase):
         self.assertIn("cwd", refused["detail"])
         mutant = tuple(g for g in sb.BARE_PANE_GUARDS if g[0] != guard)      # the same case on a build without this guard
         with mock.patch.object(sb, "BARE_PANE_GUARDS", mutant):
-            code, out, err = self.main("close-pane", "w1:p90")          # the first run notes the revision (and closes, when the idle guard is the one removed)
+            code, out, err = self.main("close-pane", pane)          # the first run notes the revision (and closes, when the idle guard is the one removed)
             if not self.world.herdr.closed:
                 self.world.tick(11 * 60)
-                code, out, err = self.main("close-pane", "w1:p90")
-        if guard == "listed":
-            self.assertEqual((code, self.world.herdr.closed), (1, []), "a pane herdr does not have cannot be closed by any build")
-            self.assertIn("not inside a fleet worktree", err, "another guard (no cwd) is what refuses it")
+                code, out, err = self.main("close-pane", pane)
+        if without == "closes":
+            self.assertEqual((code, self.world.herdr.closed), (0, [pane]), "without the %s guard (%s) it closes: %s" % (guard, variant, err))
         else:
-            self.assertEqual((code, self.world.herdr.closed), (0, ["w1:p90"]), "without the %s guard it closes: %s" % (guard, err))
+            self.assertEqual((code, self.world.herdr.closed), (1, []), "a pane herdr does not have cannot be closed by any build")
 
     def test_the_guard_table_is_whole_and_every_guard_has_a_case(self):   # S11a completeness
         guards = [g for g, _ in sb.bare_pane_guards()]
         self.assertEqual(guards, ["own-pane", "listed", "unnamed", "bare-shell", "worktree", "idle"])
-        self.assertEqual(guards, [g for g in guards if getattr(type(self), "test_guard_" + g.replace("-", "_"), None)], "one generated test per guard")
+        self.assertEqual({g for g, _ in self.GUARD_CASES}, set(guards), "every guard has at least one case, and no case names a guard that is not in the table")
+        for guard, variant in self.GUARD_CASES:
+            self.assertTrue(getattr(type(self), "test_guard_%s__%s" % (guard.replace("-", "_"), re.sub(r"\W+", "_", variant)), None), (guard, variant))
+
+    def test_every_guard_denies_by_default_on_a_missing_empty_or_unreadable_input(self):   # the default-deny table: one row per guard
+        base = {"pane": "w1:p90", "entry": {"cwd": "/x", "foreground_cwd": "/x", "revision": 3}, "held": [], "processes": [{"name": "zsh"}], "worktrees": {"/x"},
+                "discovery": types.SimpleNamespace(agents={}), "health": {"agents": {}}, "window": 10, "now": 10 ** 6, "seen": {"revision": 3, "since": 0}}
+        self.assertEqual([g(base) for _, g in sb.bare_pane_guards()], [None] * 6, "the base case passes every guard")
+        denies = {"listed": {"entry": None}, "bare-shell": {"processes": []}, "worktree": {"entry": {}}, "idle": {"seen": None}}
+        not_input_guards = {"own-pane": "reads the caller's environment, which has nothing to be missing", "unnamed": "absence of a name IS the pass; its unreadable inputs raise before the guards (tested through the command)"}
+        self.assertEqual(set(denies) | set(not_input_guards), {g for g, _ in sb.bare_pane_guards()})
+        for guard, change in denies.items():
+            for label, ctx in ((guard, dict(base, **change)),):
+                self.assertTrue(dict(sb.bare_pane_guards())[guard](ctx), "%s denies on %s" % (guard, change))
+        for guard, change in (("worktree", {"entry": {"cwd": "", "foreground_cwd": None}}), ("idle", {"entry": {"cwd": "/x", "foreground_cwd": "/x"}}), ("worktree", {"worktrees": set()})):
+            self.assertTrue(dict(sb.bare_pane_guards())[guard](dict(base, **change)), (guard, change))
+
+    def test_an_unreadable_input_of_the_context_refuses_the_close(self):   # unreadable: herdr's pane list, agent list, process list, the pane-health record
+        for label, patch in (("pane list", mock.patch.object(sb.HerdrClient, "pane_list", side_effect=sb.HerdrError("down", "herdr is down"))),
+                             ("agent list", mock.patch.object(sb.HerdrClient, "agent_list", side_effect=sb.HerdrError("down", "herdr is down"))),
+                             ("process list", mock.patch.object(sb.HerdrClient, "pane_process_info", side_effect=sb.HerdrError("down", "herdr is down")))):
+            with self.subTest(label):
+                self.bare_world()
+                self.main("close-pane", "w1:p90")
+                self.assertEqual(self.world.herdr.closed, [], "the first run only notes it")
+                self.world.tick(11 * 60)
+                with patch:
+                    code, out, err = self.main("close-pane", "w1:p90")
+                self.assertEqual((code, self.world.herdr.closed), (1, []), err)
+                self.assertIn("cannot be read", err)
+        self.bare_world()
+        self.main("close-pane", "w1:p90")
+        self.world.tick(11 * 60)
+        (Path(self.world.state) / sb.PANE_HEALTH_FILE).write_bytes(b"{not json")
+        code, out, err = self.main("close-pane", "w1:p90")
+        self.assertEqual((code, self.world.herdr.closed), (1, []), err)
+        self.assertIn("cannot be read", err)
 
     def test_a_pane_an_agent_holds_changed_between_looks_or_unreadable_is_never_closed(self):   # S11b
         self.bare_world()
@@ -66233,6 +66297,57 @@ class TestAdoption(LanesCase):
         self.assertEqual((Path(self.world.state) / "boss-overrides.json").read_bytes(), before)
         self.assertEqual(self.rows(), [])
 
+    def test_a_live_boss_whose_retired_record_names_no_session_keeps_its_worker(self):   # S8: a retirement covers only the session it names
+        self.worker("w1", "orch-a", charter=1)
+        for label, record in (("no session", {"at": 1, "by": "x", "reason": "r", "session": None}), ("another session", {"at": 1, "by": "x", "reason": "r", "session": "ses_old"}),
+                              ("an empty session", {"at": 1, "by": "x", "reason": "r", "session": ""})):
+            with self.subTest(label):
+                sb._write_small(self.world.state, sb.RETIRED_FILE, {"orch-a": record})
+                self.daemon_pass()
+                self.assertEqual(self.boss("w1"), "orch-a", "orch-a is live: nothing to fill")
+                self.assertEqual([r for r in self.rows() if r["detail"]["worker"] == "w1"], [])
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {"orch-a": {"at": 1, "by": "x", "reason": "r", "session": self.world.sessions["orch-a"]}})
+        self.daemon_pass()
+        self.assertEqual(self.boss("w1"), "chief-of-staff", "a retirement that names this session does count (charter 1 has no other orchestrator)")
+
+    def test_a_live_heir_whose_retired_record_names_no_session_is_still_an_heir(self):   # S8: the heir side of the same rule
+        self.worker("w1", "gone", charter=1)
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {"orch-a": {"at": 1, "by": "x", "reason": "r", "session": None}})
+        self.daemon_pass()
+        self.assertEqual(self.boss("w1"), "orch-a")
+
+    def test_the_caller_is_judged_by_role_not_by_name(self):   # U3 S11c: a real Chief of Staff under another name is allowed, an agent named for the role without it is refused
+        self.bare_world()
+        sid = self.world.sessions["chief-of-staff"]
+        self.world.v2.sessions[sid]["metadata"]["fleet"]["role"] = "coder"            # the agent NAMED chief-of-staff has no role now
+        self.world.add_agent("deputy", fleet={"role": "chief-of-staff"})
+        self.as_agent("chief-of-staff")
+        code, out, err = self.main("close-pane", "w1:p90")
+        self.assertEqual((code, self.world.herdr.closed), (1, []))
+        self.assertIn("only the Chief of Staff", err)
+        self.as_agent("deputy")
+        self.main("close-pane", "w1:p90")
+        self.world.tick(11 * 60)
+        code, out, err = self.main("close-pane", "w1:p90")
+        self.assertEqual((code, self.world.herdr.closed), (0, ["w1:p90"]), err)
+
+    def test_only_the_heir_adopts_before_a_close_and_another_caller_adopts_nothing(self):   # S12: adopt_before_close for any caller would pass the other tests
+        self.retired_orphan("w1", "gone", charter=1)                       # its heir is orch-a (charter 1), not the Chief of Staff
+        before = {f: ((Path(self.world.state) / f).read_bytes() if (Path(self.world.state) / f).exists() else None) for f in (sb.RETIRED_FILE, "boss-overrides.json")}
+        self.as_agent("chief-of-staff")
+        code, out, err = self.main("retire", "w1", "--close")
+        self.assertEqual((code, self.world.herdr.closed), (1, []), err)
+        self.assertIn("may not close w1's pane", err)
+        self.assertEqual([r for r in self.rows() if r["detail"]["worker"] == "w1"], [], "the Chief of Staff is not its heir: 0 adoption rows")
+        self.assertEqual({f: ((Path(self.world.state) / f).read_bytes() if (Path(self.world.state) / f).exists() else None) for f in before}, before)
+        self.daemon_pass()                                                   # the next pass gives it to its heir, who then closes it as its boss
+        self.as_agent("orch-a")
+        code, out, err = self.main("retire", "w1", "--close")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.world.herdr.closed, [self.world.panes["w1"]])
+        (row,) = [r for r in self.rows() if r["detail"]["worker"] == "w1"]
+        self.assertEqual((row["detail"]["heir"], row["detail"]["path"], row["detail"]["by"]), ("orch-a", "pass", sb.ADOPT_BY_DAEMON))
+
     # ---- the family: every reader of a worker's boss
     @staticmethod
     def scan(sources):
@@ -66284,8 +66399,8 @@ class TestAdoption(LanesCase):
                 self.assertEqual(read(), "orch-a")
 
 
-for _guard, _ in sb.bare_pane_guards():   # S11a: one case (and its mutant) per guard of the table the command loops over
-    setattr(TestAdoption, "test_guard_" + _guard.replace("-", "_"), (lambda g: lambda self: self.check_guard(g))(_guard))
+for _guard, _variant in TestAdoption.GUARD_CASES:   # S11a: one case (and its mutant) per guard of the table the command loops over, per way it can fail
+    setattr(TestAdoption, "test_guard_%s__%s" % (_guard.replace("-", "_"), re.sub(r"\W+", "_", _variant)), (lambda g, v: lambda self: self.check_guard(g, v))(_guard, _variant))
 
 
 class TestMoveAnAsk(LanesCase):

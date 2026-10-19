@@ -7333,8 +7333,10 @@ def _read_strict_records(state):
 
 
 def _retired_entry_applies(retired, name, obs):
+    """True only when a retirement of `name` names THIS agent's session. A record with no session covers NOTHING (a live agent is never taken for a retired one on a
+    record that does not say which session was retired); the same rule as #870's, to be replaced by its one helper once that is on main."""
     entry = retired.get(name)
-    return isinstance(entry, dict) and entry.get("session") in (None, obs.session_id)
+    return isinstance(entry, dict) and isinstance(entry.get("session"), str) and bool(entry["session"]) and entry["session"] == obs.session_id
 
 
 def boss_is_present(discovery, retired, boss):
@@ -8319,7 +8321,7 @@ def _guard_unnamed(ctx):
 
 def _guard_bare_shell(ctx):
     names = [str(p.get("name") or "").lstrip("-") for p in ctx["processes"]]
-    if any(n not in BARE_SHELLS for n in names):
+    if not names or any(n not in BARE_SHELLS for n in names):   # default deny: a pane that reports NO foreground process is not known to be a shell
         return "pane %s has a foreground job (%s), not a bare shell: nothing was closed" % (ctx["pane"], _one_line(", ".join(n or "?" for n in names), 60))
     return None
 
@@ -8351,8 +8353,7 @@ def bare_pane_context(engine, discovery, pane, now):
     held = [a for a in engine.herdr.agent_list() if isinstance(a, dict) and a.get("pane_id") == pane]
     processes = engine.herdr.pane_process_info(pane) if entry is not None else []
     health = read_pane_health_strict_agents(engine.state_dir)
-    worktrees = {os.path.realpath(p) for p in read_worktrees(engine.state_dir)} | {os.path.realpath(v["cwd"]) for v in health["agents"].values()
-                                                                                 if isinstance(v, dict) and isinstance(v.get("cwd"), str) and v["cwd"]}
+    worktrees = {os.path.realpath(p) for p in read_worktrees(engine.state_dir)}   # the REGISTERED worktrees only: an agent's own cwd is often the repo root the owner works in too
     window = engine.config.get("retire_idle_minutes")
     window = window if retire_idle_window_ok(window) else BARE_IDLE_DEFAULT_MINUTES
     return {"pane": pane, "entry": entry, "held": held, "processes": processes, "discovery": discovery, "health": health, "worktrees": worktrees,
