@@ -4960,7 +4960,7 @@ Every change with an approved plan and a passing independent review merges into 
 
 - **Today.** A pull request into `integration` is rated and held on its own diff like any other, and a held one is cleared by the owner on that pull request (`impact clear <repo#N> --reason ...` in the owner's terminal).
 - **Target, after #835 lands.** The Chief of Staff's delegated clear (`impact clear --under-order N`, Serious and below) applies to such a pull request. It stays OFF until a numbered line of the owner's own standing-orders file is listed under `delegated_clear` in the configuration and matched by its hash (a comment on an issue is not that), and it refuses a change to credentials or identity, a top-tier review class, or a pull request with no review recorded at its head.
-- **The batch pull request** is judged by the floor on its own aggregated diff into the default branch, so it holds for the owner when any member touched a top-tier path, whoever cleared that member earlier.
+- **The batch pull request** is judged by the floor on its own aggregated diff into the default branch, so it holds for the owner when any member touched a top-tier path until #835 lands, then only when a row is rated High (otherwise almost every batch would hold), whoever cleared that member earlier.
 
 ### The cadence and who keeps the batch
 
@@ -5020,7 +5020,7 @@ The body is the owner v2 body plus one table with a row per change. Use neutral 
 
 Each decision was walked against the matrix (its owner-hold meaning and its rating table) and the commands (`impact clear`, `impact clear --under-order`, `gh pr`, `git merge`).
 
-- **D1** (decided: option A as a target, the Chief of Staff, 18:05Z, under the owner's standing order): changes into `integration` are rated and held as usual; today the owner clears a top-tier change on its own pull request, and the Chief of Staff's clear up to Serious applies once #835 is built and its order is configured; the batch pull request holds for the owner when any member touched a top-tier path. No floor path changes. Not chosen: the floor skips the per-change hold (stays an owner option if the pilot shows the per-change clears cost too much), and held changes not batched.
+- **D1** (decided: option A as a target, the Chief of Staff, 18:05Z, under the owner's standing order): changes into `integration` are rated and held as usual; today the owner clears a top-tier change on its own pull request, and the Chief of Staff's clear up to Serious applies once #835 is built and its order is configured; the batch pull request holds for the owner when any member touched a top-tier path until #835 lands, then only when a row is rated High. No floor path changes. Not chosen: the floor skips the per-change hold (stays an owner option if the pilot shows the per-change clears cost too much), and held changes not batched.
 - **D2**: enforce the freeze with a ruleset on `integration`. Recommendation: yes if the owner is willing; otherwise the audit report stays the control.
 - **D3**: batch size against the review checkout's limits. Recommendation: cap a batch at what the checkout accepts, and split a larger one.
 - **Follow-up asks** (each its own ask): a script that renders the batch table; the daemon's treatment of an ask whose change is in a non-default branch (T12) and of reference runs for `integration` (and a `push` run of CI on `integration`; pull requests into it already run CI, as the workflow has no branch filter); the audit report for a merge during the freeze.
