@@ -67,6 +67,7 @@ class S5Names(base.Base):
         self.assertEqual(bad, [])
 
     def test_table_maps_only_to_cw_names(self):
+        self.assertTrue(False, "s3 deliberate red")
         for old, new in NAMES.items():
             self.assertTrue(new.lower().startswith("cw") and not OLD.search(new), new)
 
