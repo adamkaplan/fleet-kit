@@ -151,6 +151,7 @@ class FakeRunner:
 
 
 SAFE_PATH = "/usr/bin:/bin"
+REAL_NODE = shutil.which("node")   # looked up at import, before a test narrows PATH (the plugin cross-check needs it)
 
 
 def remove_tree_patiently(tmp, tries=20, pause=0.1):
@@ -14930,6 +14931,21 @@ class TestHeadlessPresence(Base):
         self.assertIn("the same repo, with different accounts", str(raised.exception))
         accounts = self.engine.accounts
         self.assertEqual([accounts.account_for(r) for r in ("ACME/Widget", "acme/widget.git", "x/y", None, 5)], ["acct-ops", "acct-ops", None, None, None])
+
+    def test_the_plugin_and_the_switchboard_agree_on_the_headless_temp_root_and_name_rule(self):
+        node = REAL_NODE
+        if node is None:
+            self.skipTest("no node")
+        plugin = Path(__file__).resolve().parent.parent / "plugins" / "fleet-hooks" / "index.js"
+        data = self.home / "xdg-data-cross"
+        script = 'import(%r).then(m => { console.log(JSON.stringify([m.tmpRootOf({XDG_DATA_HOME: %r}, "/h"), m.AGENT_NAME_RE.source])); })' % (plugin.as_uri(), str(data))
+        out = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        root, source = json.loads(out.stdout)
+        with mock.patch.dict(os.environ, {"XDG_DATA_HOME": str(data)}):
+            self.assertEqual(root, str(sb.headless_tmp_root()))
+        self.assertEqual(source, sb.NAME_RE.pattern)
+        self.assertIsNone(sb.reclaim_agent_tmp(self.engine, "coder\n", headless=True) or None)   # a trailing newline is not a name
 
     def test_s5_retire_of_a_headless_worker_handles_its_private_tmpdir_from_the_plugin(self):
         data = self.home / "xdg-data-846b"

@@ -471,7 +471,12 @@ function readRecord(base, file, fsm) {
 export function headlessNameOf(stateDir, sessionID, fsm = fs) {
   if (typeof sessionID !== "string" || !SESSION_RE.test(sessionID)) return null;
   const base = path.join(stateDir, "headless");
-  const info = fsm.lstatSync(base);
+  let info;
+  try {
+    info = fsm.lstatSync(base);
+  } catch {
+    return null; // no headless worker was ever launched
+  }
   if (info.isSymbolicLink() || !info.isDirectory() || info.uid !== process.getuid()) return null;
   const files = fsm.readdirSync(base).filter((f) => f.endsWith(".json") && RECORD_NAME_RE.test(f.slice(0, -5))).sort().slice(0, MAX_RECORDS);
   for (const file of files) {
@@ -487,7 +492,7 @@ export function headlessNameOf(stateDir, sessionID, fsm = fs) {
 // (env) -> the private TMPDIR for the session named in env, or null for "no change". Never throws: a directory that cannot be made says so once on
 // stderr (per session and path) and the command runs on the shared directory.
 export function makeTmpResolver({ stateDir, root, now = Date.now, fsm = fs, warn = (line) => process.stderr.write(line + "\n") }) {
-  const known = new Map(); // session -> name (a record is not taken back while the plugin runs; the directory is re-checked on every use)
+  const known = new Map(); // session -> name (the record's file and the directory are re-checked on every use)
   const absent = new Map(); // session -> time until which "no record" stands
   const said = new Set();
   return function tmpFor(env) {
@@ -496,6 +501,16 @@ export function makeTmpResolver({ stateDir, root, now = Date.now, fsm = fs, warn
       const session = env.OPENCODE_SESSION_ID;
       if (typeof session !== "string" || !SESSION_RE.test(session)) return null;
       let name = known.get(session);
+      if (name !== undefined) {
+        try {
+          fsm.lstatSync(path.join(stateDir, "headless", name + ".json")); // a retired worker's record is gone: its directory is not made again
+        } catch {
+          known.delete(session);
+          name = undefined;
+          absent.set(session, now() + NEGATIVE_TTL_MS);
+          return null;
+        }
+      }
       if (name === undefined) {
         if (now() < (absent.get(session) || 0)) return null;
         name = headlessNameOf(stateDir, session, fsm);
@@ -504,6 +519,7 @@ export function makeTmpResolver({ stateDir, root, now = Date.now, fsm = fs, warn
           if (absent.size > 500) absent.delete(absent.keys().next().value);
           return null;
         }
+        if (known.size >= 500) known.delete(known.keys().next().value);
         known.set(session, name);
       }
       if (name === "cos" || name.startsWith(LANE_PREFIX)) return null;

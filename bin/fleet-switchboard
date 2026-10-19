@@ -6165,7 +6165,7 @@ def reclaim_agent_tmp(engine, name, headless=False):
     """At retire: the agent's private TMPDIR is removed when it is EMPTY, else kept and the reason said. Never forced, never recursive. Returns lines.
     A headless worker's directory (#846, made by the plugin) is under the same root and goes by the same rule."""
     root = agent_tmp_root(engine.config) or (headless_tmp_root() if headless else None)
-    if root is None or not NAME_RE.match(name or "") or agent_tmp_shared_name(name):
+    if root is None or not NAME_RE.fullmatch(name or "") or agent_tmp_shared_name(name):
         return []
     path = root / name
     if not os.path.lexists(str(path)):

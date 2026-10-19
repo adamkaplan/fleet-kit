@@ -421,7 +421,7 @@ test("S3 and S7: a directory that cannot be made, or a symlink at the path, keep
   const elsewhere = fs.mkdtempSync(path.join(w.base, "elsewhere-"));
   fs.symlinkSync(elsewhere, path.join(w.root, "beta"));
   const spec = { command: "true", env: baseEnv("ses_bbb2") };
-  assert.doesNotThrow(() => w.tmpFor && makeShellHook("/kit/shims", w.tmpFor)(spec));
+  assert.doesNotThrow(() => makeShellHook("/kit/shims", w.tmpFor)(spec));
   assert.equal(spec.env.TMPDIR, "/var/shared");
   assert.match(spec.env.PATH, /^\/kit\/shims/); // the command still runs, with its shims
   assert.equal(w.lines.length, 2);
@@ -474,4 +474,39 @@ test("U1: the plugin wires the shell hook with the resolver, and an api-less res
   const off = { env: baseEnv("ses_aaa1") };
   makeShellHook("/kit/shims")(off); // no resolver: the old behaviour, byte for byte
   assert.deepEqual(off.env, { ...baseEnv("ses_aaa1"), PATH: "/kit/shims:/usr/bin" });
+});
+
+test("#846: a retired worker's directory is not made again, a loose directory is repaired, and bad records are not launch records", () => {
+  const w = tmpWorld({ alpha: "ses_aaa1", cos: "ses_ccc3" });
+  const dir = path.join(w.root, "alpha");
+  fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
+  fs.chmodSync(dir, 0o755);
+  assert.equal(w.run(baseEnv("ses_aaa1")).TMPDIR, dir);
+  assert.equal(fs.statSync(dir).mode & 0o777, 0o700); // repaired
+  fs.rmdirSync(dir);
+  fs.unlinkSync(path.join(w.stateDir, "headless", "alpha.json")); // what retire does
+  assert.equal(w.run(baseEnv("ses_aaa1")).TMPDIR, "/var/shared");
+  assert.equal(fs.existsSync(dir), false);
+  assert.equal(w.run(baseEnv("ses_ccc3")).TMPDIR, "/var/shared"); // the Chief of Staff keeps the shared directory
+  assert.equal(fs.existsSync(path.join(w.root, "cos")), false);
+  fs.writeFileSync(path.join(w.stateDir, "headless", "big.json"), JSON.stringify({ worker: "big", session: "ses_big1", kind: "local", pad: "x".repeat(9000) }), { mode: 0o600 });
+  assert.equal(headlessNameOf(w.stateDir, "ses_big1"), null);
+  const link = tmpWorld();
+  const real = path.join(link.base, "real-headless");
+  fs.renameSync(path.join(link.stateDir, "headless"), real);
+  fs.symlinkSync(real, path.join(link.stateDir, "headless"));
+  fs.writeFileSync(path.join(real, "sly.json"), JSON.stringify({ worker: "sly", session: "ses_sly1", kind: "local" }), { mode: 0o600 });
+  assert.equal(headlessNameOf(link.stateDir, "ses_sly1"), null);
+});
+
+test("#846: a session with no record is looked up again only after the negative window", () => {
+  const w = tmpWorld();
+  let t = 1000;
+  const lines = [];
+  const tmpFor = makeTmpResolver({ stateDir: w.stateDir, root: w.root, now: () => t, warn: (l) => lines.push(l) });
+  assert.equal(tmpFor({ OPENCODE_SESSION_ID: "ses_late1" }), null);
+  fs.writeFileSync(path.join(w.stateDir, "headless", "late.json"), JSON.stringify({ worker: "late", session: "ses_late1", kind: "local" }), { mode: 0o600 });
+  assert.equal(tmpFor({ OPENCODE_SESSION_ID: "ses_late1" }), null); // inside the window
+  t += 11000;
+  assert.equal(tmpFor({ OPENCODE_SESSION_ID: "ses_late1" }), path.join(w.root, "late"));
 });
