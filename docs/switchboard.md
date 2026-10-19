@@ -4986,6 +4986,8 @@ Every change with an approved plan and a passing independent review merges into 
 - **Target, after #835 lands.** The Chief of Staff's delegated clear (`impact clear --under-order N`, Serious and below) applies to such a pull request. It stays OFF until a numbered line of the owner's own standing-orders file is listed under `delegated_clear` in the configuration and matched by its hash (a comment on an issue is not that), and it refuses a change to credentials or identity, a top-tier review class, or a pull request with no review recorded at its head.
 - **The batch pull request** is judged by the floor on its own aggregated diff into the default branch, so it holds for the owner when any member touched a top-tier path until #835 lands, then only when a row is rated High (otherwise almost every batch would hold), whoever cleared that member earlier.
 
+Keep `integration` current with the default branch before a pull request opens into it: fast-forward it, or merge the default branch into it when it holds unbatched members; a stale `integration` makes the diff and the impact floor read the whole difference.
+
 ### The cadence and who keeps the batch
 
 The batch pull request is opened daily at the hour the Chief of Staff's lane records in the charter's queue (one hour per repository); a day with no change opens none. The Chief of Staff's lane opens it, keeps its table current until the freeze, and tells the owner when it is ready. After the batch merges, the owning orchestrator closes each work item and ask whose change it carried (a pull request's `Closes #N` is honoured only on the default branch, so it does not close them).
