@@ -11578,6 +11578,29 @@ def decisions_caller(args, runner, now):
         return {}  # a person's own shell inside herdr has a pane and no agent: the human's view, never a crash
 
 
+def held_merge_order_hints(decisions, runner, now):
+    """#818: advisory `merge order: #A, then #B (shared files)` lines among the HELD pull requests of the listed decisions (kind `captain`) that share files, the one
+    that has waited longest first. ONE bounded read per repo that has two or more held pull requests (CLI only, never the daemon); any failure gives no hint."""
+    by_repo = {}
+    for d in decisions:
+        since = parse_iso(d.get("since"))
+        if d.get("kind") == "captain" and d.get("repo") and isinstance(d.get("number"), int) and since is not None:
+            by_repo.setdefault(d["repo"], {})[d["number"]] = since
+    hints = []
+    mod = load_module("pr_overlap")
+    for repo, waited in sorted(by_repo.items()):
+        if len(waited) < 2:
+            continue
+        try:
+            engine = build_engine(runner, now, "cli", writable=False)[0]
+            listing = read_open_overlap(engine, repo, runner)
+            if listing:
+                hints.extend(("%s: " % repo if len(by_repo) > 1 else "") + h for h in mod.merge_order(listing, sorted(waited.items())))
+        except Exception:
+            continue
+    return hints
+
+
 def cmd_decisions(args, runner, now):
     action = getattr(args, "decisions_action", None) or "list"
     if action != "list":
@@ -11604,11 +11627,16 @@ def cmd_decisions(args, runner, now):
     report = fresh_decisions(runner, now) if args.fresh else decisions_report(state, now())
     shown = dict(report, decisions=select_decisions(report["decisions"], view))
     external = external_status_line(config, state, now()) if config else None
+    hints = [] if report["stale"] else held_merge_order_hints(shown["decisions"], runner, now)
     if args.json:
         extra = {"external": external} if external is not None else {}
+        if hints:
+            extra["merge_order"] = hints
         print(json.dumps(dict(shown, message=report["message"] or None, view=view, **extra), indent=2, sort_keys=True))
     else:
         print(format_decisions(shown, now(), view))
+        for hint in hints:
+            print(hint)
         if external is not None:
             print("(%s)" % external)
     return EXIT_ERROR if report["stale"] else EXIT_OK
@@ -19848,6 +19876,28 @@ def cmd_waive(args, runner, now):
 cmd_waive.ledger = True   # state and GETs only; its own errors are usage errors
 
 
+def read_open_overlap(engine, repo, runner):
+    """{number: [paths]} of the open pull requests of `repo` whose whole file list was read (bin/pr_overlap.py), or None when it cannot be read. ONE bounded
+    `gh pr list` (at most pr_overlap.LIST_CAP pull requests, FILES_CAP files each), cached on the engine for the call. CLI only: the daemon never calls it (#818)."""
+    cache = engine.__dict__.setdefault("_overlap_cache", {})
+    if repo in cache:
+        return cache[repo]
+    cache[repo] = None
+    mod = load_module("pr_overlap")
+    try:
+        accounts = getattr(engine, "accounts", None) or GhAccounts(engine.config, engine.gh_runner or runner, engine.now)
+        refuse_excluded(engine.config, repo)
+        env = accounts.env_for(repo)
+        argv = [engine.config["gh"], "pr", "list", "--repo", repo, "--state", "open", "--limit", str(mod.LIST_CAP), "--json", "number,files,changedFiles"]
+        done = (engine.gh_runner or runner)(argv, capture_output=True, text=True, timeout=min(engine.config["call_timeout_seconds"], GITHUB_ROUTE_READ_TIMEOUT),
+                                            stdin=subprocess.DEVNULL, **({"env": env} if env is not None else {}))
+        if done.returncode == 0:
+            cache[repo] = mod.parse_listing(json.loads(done.stdout or "[]"))
+    except Exception:   # advisory: whatever goes wrong, there is no line (never a wrong one) and nothing else changes
+        cache[repo] = None
+    return cache[repo]
+
+
 def cmd_gates(args, runner, now):
     """`gates <repo#N>`: read-only. One line per gate G0a to G8: status, who decides it, what is missing. Exit 0 when every
     tracked gate that applies to a PR is satisfied, 1 when something is missing, 2 when it cannot be read. Enforces nothing."""
@@ -19873,10 +19923,15 @@ def cmd_gates(args, runner, now):
     report["plan_source"] = ctx.source
     if first and ctx.source and not _same_plan(first, ctx.source, ctx.config.get("intent_repo")):
         report["plan_changed"] = "the PR's plan is now %s; its entries were recorded against %s (they are void)" % (ctx.source, first)
+    shares = load_module("pr_overlap").shares_line(read_open_overlap(ctx.engine, ctx.repo, runner), ctx.number) if not ctx.unreadable else None   # #818: information only
     if args.json:
+        if shares:
+            report["shares"] = shares
         print(json.dumps(report, sort_keys=True))
     else:
         lines = plan_ledger.render_gates(report, ctx.pr)
+        if shares:
+            lines.append(shares)
         if ctx.unreadable:
             lines.append("PR not read: %s" % ctx.unreadable)
         if ctx.plan_problem:
@@ -21545,7 +21600,8 @@ def add_ledger_parsers(sub):
     waive.add_argument("--head", help="The PR head sha (default: read from GitHub)")
     gates = sub.add_parser("gates", help="Read-only: the plan's gates G0a to G8 for a PR, what each needs and who decides it. "
                                          "Also `gates mode <repo> shadow|enforce|off`, `gates off|on` (the global kill file) and "
-                                         "`gates preflight <repo>`")
+                                         "`gates preflight <repo>`. May add one `shares <file> with #N` line when another open PR changes the same files "
+                                         "(one read of at most 50 open PRs and 100 files each; information only)")
     common(gates, scenario=False)
     gates.add_argument("rest", nargs="*", help="With `mode`: <owner/repo> <shadow|enforce|off>")
     gates.add_argument("--json", action="store_true")
