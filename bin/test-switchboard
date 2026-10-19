@@ -5437,6 +5437,185 @@ class TestLaunch(Base):
         self.assertEqual(self.run_cli("retire", "worker", "--close")[0], 0, "the operator may close any")
         self.assertEqual(len(self.close_audit("fleetpane.closed")), 3)
 
+    # ---- #838: the Chief of Staff closes the pane of an ALREADY retired worker whose boss is not a live agent
+    def retired_world(self, reports_to="boss", retire=True):
+        """A worker reporting to `reports_to`, idle, retired by the operator WITHOUT closing (its pane stays open), and the callers of the tests."""
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.worker(reports_to=reports_to)
+        self.world.add_agent("other-orch", fleet={"role": "orchestrator"})
+        self.world.add_agent("cos", fleet={"role": "chief-of-staff"})
+        self.world.herdr.panes[self.world.panes["worker"]]["status"] = "idle"
+        self.health()
+        if retire:
+            os.environ.pop("HERDR_PANE_ID", None)
+            self.assertEqual(self.run_cli("retire", "worker")[0], 0)
+            self.health()
+        self.world.herdr.closed.clear()
+
+    def state_bytes(self):
+        return {f: (Path(self.world.state) / f).read_bytes() for f in (sb.RETIRED_FILE, sb.PANE_HEALTH_FILE)}
+
+    def cos_close(self, who="cos"):
+        self.as_(who)
+        return self.run_cli("retire", "worker", "--close")
+
+    def assert_refused_untouched(self, who="cos", contains=None):
+        before = self.state_bytes()
+        code, out, err = self.cos_close(who)
+        self.assertEqual((code, self.world.herdr.closed), (1, []), (out, err))
+        self.assertEqual(self.state_bytes(), before, "a refused close changes nothing")
+        if contains:
+            self.assertIn(contains, err)
+        return err
+
+    TODAYS_REFUSAL = "cos may not close worker's pane: only the operator, or the agent's own boss (the Chief of Staff for a direct report), may"
+
+    def test_the_chief_of_staff_closes_an_already_retired_workers_pane_when_its_boss_is_not_a_live_agent(self):   # S1 S5
+        for label, reports_to in (("no boss recorded", None), ("boss not live", "gone-boss")):
+            with self.subTest(label):
+                self.retired_world(reports_to=reports_to)
+                pane = self.world.panes["worker"]
+                retired_before = sb.read_retired(self.world.state)["worker"]
+                code, out, err = self.cos_close()
+                self.assertEqual(code, 0, err)
+                self.assertIn("closed pane %s" % pane, out)
+                self.assertEqual(self.world.herdr.closed, [pane], "exactly one pane close, for that pane")
+                self.assertEqual(sb.read_retired(self.world.state)["worker"], retired_before, "the retirement is not rewritten")
+                (row,) = self.close_audit("fleetpane.closed")
+                self.assertEqual((row["subject"], row["detail"]["pane"], row["detail"]["by"]), ("worker", pane, "cos"))
+                self.assertIn(label, row["detail"]["boss_rule"])
+                self.assertNotIn("command", json.dumps(row))
+                self.tearDown()
+                self.setUp()
+
+    def test_a_retired_boss_that_still_has_a_pane_is_not_a_live_boss(self):   # S1 (the third way a boss is not live)
+        self.retired_world()
+        os.environ.pop("HERDR_PANE_ID", None)
+        self.assertEqual(self.run_cli("retire", "boss")[0], 0)
+        self.health()
+        self.world.herdr.closed.clear()
+        code, out, err = self.cos_close()
+        self.assertEqual(code, 0, err)
+        (row,) = self.close_audit("fleetpane.closed")
+        self.assertIn("boss not live", row["detail"]["boss_rule"])
+
+    def test_only_the_chief_of_staff_has_the_new_way_in(self):   # S2
+        self.retired_world(reports_to=None)
+        self.assert_refused_untouched("other-orch", "may not reattach worker")      # another orchestrator: the retire caller rule, as today
+        self.as_("cos")
+        with mock.patch.object(sb, "gates_caller_kind", return_value=("unknown", "unknown identity")):
+            code, out, err = self.run_cli("retire", "worker", "--close")
+        self.assertEqual((code, self.world.herdr.closed), (1, []), err)
+        # a Chief-of-Staff-named agent without the role is not the Chief of Staff: the role decides, never the name
+        with mock.patch.object(sb, "gates_caller_kind", return_value=("agent", "cos", "orchestrator")):
+            pane, why = sb.retire_close_problem(self.engine, subprocess.run, self.world.clock.now, self.engine.discover(self.world.clock.now()), "worker",
+                                                self.engine.discover(self.world.clock.now()).agents["worker"], False)
+        self.assertEqual((pane, why), (None, self.TODAYS_REFUSAL))
+
+    def test_a_worker_that_is_not_retired_is_refused_with_todays_text_and_not_retired(self):   # S3
+        self.retired_world(reports_to=None, retire=False)
+        self.assertIn(self.TODAYS_REFUSAL, self.assert_refused_untouched())
+        self.assertNotIn("worker", sb.read_retired(self.world.state))
+
+    def test_a_worker_with_a_live_boss_is_refused_for_the_chief_of_staff_even_when_retired(self):   # S4
+        for label, reports_to in (("a live orchestrator", "boss"), ("a forged name of a live agent", "other-orch")):
+            with self.subTest(label):
+                self.retired_world(reports_to=reports_to)
+                self.assertIn(self.TODAYS_REFUSAL, self.assert_refused_untouched())
+                self.tearDown()
+                self.setUp()
+
+    def test_a_pane_that_cannot_be_identified_or_now_belongs_to_another_agent_is_never_closed(self):   # S6
+        stale = None
+        # (a) the stored pane id now holds another agent's session
+        self.retired_world(reports_to=None)
+        other = self.world.add_agent("newcomer", fleet={"role": "coder"})
+        stale = self.world.panes["worker"]
+        discovery = self.engine.discover(self.world.clock.now())
+        self.world.herdr.panes[stale]["session"] = other
+        with mock.patch.object(sb.Switchboard, "discover", return_value=discovery):
+            self.assert_refused_untouched(contains="no longer holds worker's session")
+        self.assertEqual(self.close_audit("fleetpane.close_refused")[-1]["detail"]["pane"], stale)
+        # (b) the pane cannot be read
+        self.world.herdr.panes[stale]["session"] = self.world.sessions["worker"]
+        with mock.patch.object(sb.HerdrClient, "agent_get", side_effect=sb.HerdrError("down", "herdr is down")):
+            self.assert_refused_untouched(contains="cannot be read now")
+        # (c) the retirement records no session
+        retired = sb.read_retired(self.world.state)
+        retired["worker"]["session"] = None
+        sb._write_small(self.world.state, sb.RETIRED_FILE, retired)
+        self.assert_refused_untouched(contains="does not name the session")
+        # (d) the pane changes owner between the first judgment and the close
+        retired["worker"]["session"] = self.world.sessions["worker"]
+        sb._write_small(self.world.state, sb.RETIRED_FILE, retired)
+        real, calls = sb.retire_close_problem, []
+
+        def owner_changes(engine, runner, now, discovery, name, seen, force):
+            calls.append(1)
+            if len(calls) == 2:
+                self.world.herdr.panes[stale]["session"] = other
+            return real(engine, runner, now, discovery, name, seen, force)
+
+        self.as_("cos")
+        with mock.patch.object(sb, "retire_close_problem", owner_changes):
+            code, out, err = self.run_cli("retire", "worker", "--close")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.world.herdr.closed, [], out)
+        self.assertIn("was not closed", out)
+        self.assertEqual(len(self.close_audit("fleetpane.close_failed")), 1)
+
+    DAMAGED = {
+        "corrupt": lambda f, name: b"{not json",
+        "truncated": lambda f, name: (b'{"' + name + b'": {"session": "ses_', None)[0],
+        "a list": lambda f, name: b"[]",
+        "a record that is not an object": lambda f, name: (b'{"worker": 5}' if f == sb.RETIRED_FILE else b'{"agents": {"worker": 5}, "states": {}, "missing": {}}'),
+    }
+
+    def test_a_record_that_cannot_be_read_in_full_refuses_the_close_for_every_strict_record(self):   # S7 (one case per member of CLOSE_STRICT_RECORDS)
+        for file, reader, failure in sb.CLOSE_STRICT_RECORDS:
+            shapes = dict(self.DAMAGED, **{"missing": None, "unreadable (a directory)": "dir"})
+            for label, shape in shapes.items():
+                if file == sb.RETIRED_FILE and label == "missing":
+                    continue   # no retired.json is an empty map: nobody is retired, today's text (covered by S3)
+                with self.subTest(file=file, shape=label):
+                    self.retired_world(reports_to=None)
+                    path = Path(self.world.state) / file
+                    path.unlink()
+                    if shape == "dir":
+                        path.mkdir()
+                    elif shape is not None:
+                        path.write_bytes(shape(file, b"worker"))
+                    before = self.state_bytes() if shape != "dir" and shape is not None and False else None
+                    code, out, err = self.cos_close()
+                    self.assertEqual((code, self.world.herdr.closed), (1, []), err)
+                    self.assertIn("%s could not be read" % file, err)
+                    self.tearDown()
+                    self.setUp()
+
+    def test_the_boss_lookup_that_fails_refuses_the_close(self):   # S7 (the third record: the fleet read the boss is found in)
+        self.retired_world(reports_to=None)
+        discovery = self.engine.discover(self.world.clock.now())
+        discovery.problems.append("session list failed")
+        with mock.patch.object(sb.Switchboard, "discover", return_value=discovery):
+            self.assert_refused_untouched(contains="boss lookup failed")
+
+    def test_every_strict_record_is_read_by_the_close_and_the_table_is_complete(self):   # completeness: the code loops over the table
+        self.assertEqual({f for f, _, _ in sb.CLOSE_STRICT_RECORDS}, {sb.RETIRED_FILE, sb.PANE_HEALTH_FILE})
+        self.retired_world(reports_to=None)
+        for index, (file, reader, failure) in enumerate(sb.CLOSE_STRICT_RECORDS):
+            with self.subTest(file=file):
+                table = tuple(sb.CLOSE_STRICT_RECORDS[:index]) + ((file, mock.Mock(side_effect=failure("boom")), failure),) + tuple(sb.CLOSE_STRICT_RECORDS[index + 1:])
+                with mock.patch.object(sb, "CLOSE_STRICT_RECORDS", table):
+                    self.assert_refused_untouched(contains="%s could not be read" % file)
+        code, out, err = self.cos_close()
+        self.assertEqual(code, 0, err)
+
+    def test_a_refused_close_by_the_chief_of_staff_writes_one_refused_row_and_nothing_else(self):   # U2
+        self.retired_world(reports_to="boss")
+        self.assert_refused_untouched()
+        self.assertEqual(len(self.close_audit("fleetpane.close_refused")), 1)
+        self.assertEqual(self.close_audit("fleetpane.closed"), [])
+
     def test_a_working_agent_needs_force_and_force_is_refused_with_unpushed_work(self):
         self.close_world(status="working")
         self.make_repo()

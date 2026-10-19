@@ -6705,6 +6705,29 @@ def read_pane_health(state_dir):
     return {k: raw[k] if isinstance(raw.get(k), dict) else {} for k in ("agents", "states", "missing")}
 
 
+class PaneHealthUnreadable(Exception):
+    """pane-health.json cannot be read in full as the object of objects it is (#838): for `retire --close` that is NOT the same as empty."""
+
+
+def read_pane_health_strict(state_dir):
+    """The pane-health record, or PaneHealthUnreadable. Unlike `read_pane_health` (a damaged file reads as empty, right for a display), a MISSING file, a
+    corrupt or truncated one, a list, a table that is not an object, or an agent record that is not an object all raise: the Chief of Staff's close of a retired
+    worker's pane never reads a damaged file as permission."""
+    try:
+        with open(str(Path(state_dir) / PANE_HEALTH_FILE), "rb") as handle:
+            raw = handle.read(1000001)
+    except OSError as err:
+        raise PaneHealthUnreadable("%s cannot be read: %s" % (PANE_HEALTH_FILE, getattr(err, "strerror", None) or type(err).__name__)) from None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeError):
+        raise PaneHealthUnreadable("%s is not valid JSON" % PANE_HEALTH_FILE) from None
+    if not isinstance(data, dict) or len(raw) > 1000000 or not all(isinstance(data.get(k), dict) for k in ("agents", "states", "missing")) \
+            or not all(isinstance(v, dict) for v in data["agents"].values()):
+        raise PaneHealthUnreadable("%s is not a pane-health record" % PANE_HEALTH_FILE)
+    return data
+
+
 def write_pane_health(state_dir, data):
     """pane-health.json, only when it changed (its `at`, each agent's `seen` and a live pane's `at` do not count), and at least every HEARTBEAT_HEALTH seconds (8 minutes)."""
     stable = {k: v for k, v in data.items() if k != "at"}
@@ -7196,6 +7219,50 @@ def retire_idle_evidence(engine, now, name, seen, herdr_status):
     return "herdr says working; the session has been idle %s and has no turn: treated as idle" % _idle_span_text(idle_for)
 
 
+# The records the Chief of Staff's close of an already retired worker's pane reads, each STRICTLY (#838): one table, the code loops over it,
+# and a record that cannot be read in full refuses the close (never "no boss recorded").
+CLOSE_STRICT_RECORDS = (
+    (RETIRED_FILE, read_retired_strict, RetiredUnreadable),
+    (PANE_HEALTH_FILE, read_pane_health_strict, PaneHealthUnreadable),
+)
+
+
+def retire_close_cos_route(engine, discovery, name, seen):
+    """(boss_rule, None) when the Chief of Staff may close `name`'s pane although it is not the worker's boss: the worker is ALREADY retired and its boss is not a
+    live agent (none recorded, or one that is not discovered or is itself retired). Else (None, why not). The caller has already checked the caller is the
+    Chief of Staff and that `seen` is not None. Every record is read strictly: damaged means refuse. Reads only."""
+    if discovery is None or discovery.problems or seen.problem:
+        return None, "the fleet cannot be read in full (the boss lookup failed): nothing was closed"
+    boss = boss_name(discovery, seen)
+    if boss is not None and boss in discovery.agents and boss != name:
+        live_boss = True
+    else:
+        live_boss = False
+    records = {}
+    for file, reader, failure in CLOSE_STRICT_RECORDS:
+        if engine.state_dir is None:
+            return None, "%s could not be read: nothing was closed" % file
+        try:
+            records[file] = reader(engine.state_dir)
+        except failure as err:
+            return None, "%s could not be read in full (%s): nothing was closed" % (file, _one_line(str(err), 80))
+    retired = records[RETIRED_FILE]
+    if live_boss and boss not in retired:
+        return None, None   # today's refusal text: the boss rule stands
+    entry = retired.get(name)
+    if entry is None:
+        return None, None   # not retired: today's refusal text
+    session = entry.get("session")
+    if not isinstance(session, str) or not session or session != seen.session_id:
+        return None, "%s's retirement does not name the session in pane %s: nothing was closed" % (name, seen.pane)
+    known = records[PANE_HEALTH_FILE]["agents"].get(name)
+    if not isinstance(known, dict) or known.get("session") not in (None, session):
+        return None, "%s has no pane record that matches its retirement: nothing was closed" % name
+    if boss is None:
+        return "no boss recorded", None
+    return ("boss not live: %s is retired" if live_boss else "boss not live: %s is not a running agent") % boss, None
+
+
 def retire_close_problem(engine, runner, now, discovery, name, seen, force):
     """(pane, None) when `retire --close` may close `name`'s pane now, else (None, why not). Judged BEFORE the retirement, so a refusal changes nothing.
     Who: the operator at their own terminal (any agent), the agent's recorded boss, or the Chief of Staff for an agent that reports to it DIRECTLY;
@@ -7210,7 +7277,15 @@ def retire_close_problem(engine, runner, now, discovery, name, seen, force):
         if who == name:
             return None, "an agent cannot close its own pane"
         if seen is None or boss_name(discovery, seen) != who:
-            return None, "%s may not close %s's pane: only the operator, or the agent's own boss (the Chief of Staff for a direct report), may" % (who, name)
+            refusal = "%s may not close %s's pane: only the operator, or the agent's own boss (the Chief of Staff for a direct report), may" % (who, name)
+            if seen is None or len(kind) < 3 or kind[2] != "chief-of-staff":
+                return None, refusal
+            rule, problem = retire_close_cos_route(engine, discovery, name, seen)   # #838: the Chief of Staff, for an already retired worker with no live boss
+            if problem:
+                return None, problem
+            if rule is None:
+                return None, refusal
+            engine.__dict__.setdefault("retire_close_route", {})[name] = rule
     else:
         return None, "%s: only the operator or the agent's own boss may close a pane" % kind[1]
     if seen is None or not seen.pane or not seen.session_id:
@@ -7246,6 +7321,7 @@ def retire_close_pane(engine, runner, now, name, pane, caller, force):
     who may, which pane, its session, its status and the worktree guard. Audited whether it closes or not. (status line, ok)"""
     detail = {"pane": pane, "by": caller}
     engine.__dict__.setdefault("retire_idle_seen", {}).pop(name, None)
+    engine.__dict__.setdefault("retire_close_route", {}).pop(name, None)
     try:
         fresh = engine.discover(engine.now())
         again, why = retire_close_problem(engine, runner, now, fresh, name, fresh.agents.get(name), force)
@@ -7262,6 +7338,9 @@ def retire_close_pane(engine, runner, now, name, pane, caller, force):
     evidence = engine.__dict__.get("retire_idle_seen", {}).get(name)
     if evidence:
         detail["evidence"] = evidence
+    route = engine.__dict__.get("retire_close_route", {}).get(name)
+    if route:
+        detail["boss_rule"] = route   # why the boss rule did not apply (#838)
     if engine.audit is not None:
         engine.audit.append(engine.actor, "fleetpane.closed", name, detail)
     return "closed pane %s (the agent's terminal: its memory is released%s)" % (pane, "; " + evidence if evidence else ""), True
@@ -7345,6 +7424,10 @@ def cmd_retire(args, runner, now):
             if engine.audit is not None:
                 engine.audit.append(engine.actor, "fleetpane.close_refused", name, {"pane": seen.pane if seen is not None else None, "by": close_by, "why": _one_line(why, 160)})
             raise LaunchError("refused: %s (nothing was retired or closed)" % why)
+        if name in engine.__dict__.get("retire_close_route", {}):   # #838: already retired: nothing to retire, only the pane to close (judged again inside)
+            line, _ = retire_close_pane(engine, runner, now, name, close_pane, close_by, getattr(args, "force", False))
+            print("%s was already retired; %s" % (name, line))
+            return EXIT_OK
     with agent_lock(state, "files"):
         who = reattach_caller_problem(engine, runner, now, discovery, name, hint, lost_headless=not args.undo)   # judged again inside the lock: check and write are one step
         if who:
