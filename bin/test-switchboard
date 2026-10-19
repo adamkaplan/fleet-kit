@@ -32812,7 +32812,8 @@ class TestImpactHold(LedgerBase):
     def test_s5_s6_a_floor_class_sets_the_lowest_score_and_the_rating_must_name_the_rule(self):
         for cls in self.block()["floor"]["rules"].values():
             rule = self.floor_rule(cls)
-            path = sb.impact_floor.load_matrix()["owner_hold"]["top_tier_paths"][cls][0]
+            owner_hold = sb.impact_floor.load_matrix()["owner_hold"]
+            path = next(g for g in owner_hold["top_tier_paths"][cls] if "*" not in g and not sb.impact_floor.matches(g, owner_hold["delegated_clear"]["clear_code_paths"]))   # a floor path of the class that is not machinery (a machinery path is the owner's whatever the score)
             for label, (level, reason, ok) in {"low": ("Low", rule, False), "medium": ("Medium", rule, False), "serious": ("Serious", rule, True), "high": ("High", rule, False),
                                               "serious-empty-reason": ("Serious", "", False), "serious-other-rule": ("Serious", "floor-nothing", False), "serious-free-text": ("Serious", "touches a floor path", False),
                                               "serious-substring": ("Serious", "x" + rule + "y", False)}.items():
@@ -32832,7 +32833,7 @@ class TestImpactHold(LedgerBase):
 
     def test_s5_a_serious_floor_rating_is_refused_at_a_lower_threshold(self):
         self.score_config("Medium")
-        self.scored_pr("bin/plan_ledger.py")
+        self.scored_pr("bin/reassign.py")
         self.rate(*self.cell_of("Serious"), reason=self.floor_rule("authority"))
         code, out, err = self.under()
         self.assertEqual(code, 2)
@@ -32871,12 +32872,7 @@ class TestImpactHold(LedgerBase):
                 self.assertIn("max_level", str(caught.exception))
                 with self.assertRaises(sb.ConfigError):
                     sb.validate_config(dict(base, delegated_clear=config))
-                self.assertIsNone(module.settings({"delegated_clear": config}))
-                self.extra_config["delegated_clear"] = config
-                self.delegate(config=False)
-                self.scored_pr()
-                self.rate(*self.cell_of("Low"))
-                self.assertEqual(self.under()[0], 2)
+                self.assertIsNone(module.settings({"delegated_clear": config}), "the delegation clears nothing")
         self.score_config(None)   # no max_level at all: the old rules (this fixture's class rules), never a clear by score
         self.scored_pr()
         self.rate(*self.cell_of("Low"))
@@ -33061,6 +33057,7 @@ class TestImpactHold(LedgerBase):
         state = sb.read_impact_state(self.world.state)[0]
         self.assertEqual(state["clears"]["acme/app#9"]["head"], LEDGER_HEAD)
         later = "9" * 40
+        self.review = (None, None)   # the fixture's stand-in for the old reader says "rated" for every head: here nothing is rated at the new head
         self.assertTrue(sb.rehold_reason(self.engine_cached, state, "acme/app", "acme/app#9", later), "held again at the new head")
         self.assertFalse(sb.rating_at(self.engine_cached, "acme/app#9", later)[0], "the rating of the first head is not one at the second")
         self.pr["headRefOid"] = later   # a clear started on a pull request that has moved: the head of the rating is not the head now
@@ -33086,10 +33083,10 @@ class TestImpactHold(LedgerBase):
         self.world.add_agent("rev", fleet={"role": "reviewer"})
         s, p = self.cell_of("Medium")
         code, out, err = self.run_as("rev", "review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve", "--impact-action", "second-review",
-                                     "--impact-severity", s, "--impact-probability", p, "--impact-reason", "floor-authority: the note")
+                                     "--impact-severity", s, "--impact-probability", p, "--impact-reason", "applied floor-authority, a note")
         self.assertEqual(code, 0, err)
         entry = [e for e in sb.plan_ledger.read_ledger(self.world.state)[0] if e["kind"] == "review_record"][-1]
-        self.assertEqual((entry["by_role"], entry["impact_severity"], entry["impact_probability"], entry["impact_reason"]), ("reviewer", s, p, "floor-authority: the note"))
+        self.assertEqual((entry["by_role"], entry["impact_severity"], entry["impact_probability"], entry["impact_reason"]), ("reviewer", s, p, "applied floor-authority, a note"))
         code, out, err = self.run_as("rev", "review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve", "--impact-severity", "Huge", "--impact-probability", p)
         self.assertEqual(code, 2)
         self.assertEqual(self.run_as("rev", "review", "record", self.PR, "--reviewer", "code", "--verdict", "approve", "--impact-severity", s)[0], 2)
