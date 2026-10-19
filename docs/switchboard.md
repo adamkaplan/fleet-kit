@@ -4951,3 +4951,78 @@ Agents leave scratch in the opencode temp directory (the system temp directory's
 **An external key command names its subscription.** When `external_decisions` is on and its mapping file's `key_source` is a command that starts with `az` and has no `--subscription`, loading the configuration warns once on stderr: it names the key and the fix (`--subscription <id>`) and **never prints the command's other arguments** (a vault and a secret name stay out). Without the option the command used whichever subscription was active and failed when that changed.
 
 **Working reports with no movement (#811).** A coder or tester (never on a charter) whose last consecutive reports were all `working` for `stalled_working_hours` (default 2) while nothing it owns moved wakes its boss once, with `no movement for <time> on <ref> (worker <name>, <N> working reports; last: <line>)`; the worker is never nagged. Movement is the pull request's head and updated time and the issue's updated time, as the daemon already holds them (no GitHub call). No wake while a reminder naming the issue is due later, a check at the head is running, the ask or the pull request carries an awaiting label, the last report is `blocked` or `question`, or a human decision for the pull request exists. It judges only when the open-PR list, the issue list and the decision list were read whole. One wake per stretch; a second only after the head or an updated time moves and it stalls again. Limits, stated: the rule is inert for a repository outside `plan_gates` (that is what keeps the open-PR list, marked `pulls:<repo>` in the read-whole registry only by that pass) and when the triage issue list is off; an open-PR list read more than 20 minutes ago is not judged; the check-running guard sees checks only for a pull request the daemon examined, which is one with a `PLAN:` link; when several open pull requests name the issue, the newest-moved one is judged; an idle worker is the idle-at-a-seam rule's alone (never woken a second time here); a daemon restart forgets which head it saw change, so one repeat wake is possible after a restart.
+
+## Batching: the integration branch and the batch pull request (#834)
+
+Typical work reaches the default branch in batches, so the owner clears one pull request per repository and can test a whole batch in one stack. This section is the procedure; it changes no gate, no hold and no workflow. It applies only to a repository that has an `integration` branch: batching is opt-in per repository, the Chief of Staff's lane creates the branch (`git push origin origin/<default>:refs/heads/integration`, once, with the owner's word), and a repository without it merges as today.
+
+### What batches and what goes straight
+
+Every change with an approved plan and a passing independent review merges into `integration`. Two kinds go straight to the default branch: an urgent fix (the Chief of Staff's waiver, logged) and anything the owner asks for alone. A change the impact floor holds is batched like any other, and the holds are the matrix's own. Only a change to credentials, identity or who may do what holds for the owner (`owner_hold` in `impact-matrix.json`); every other floor path or rating asks for a second independent review and the usual checks decide. So:
+
+- **Today.** A pull request into `integration` is rated and held on its own diff like any other, and a held one is cleared by the owner on that pull request (`impact clear <repo#N> --reason ...` in the owner's terminal).
+- **Target, after #835 lands.** The Chief of Staff's delegated clear (`impact clear --under-order N`, Serious and below) applies to such a pull request. It stays OFF until a numbered line of the owner's own standing-orders file is listed under `delegated_clear` in the configuration and matched by its hash (a comment on an issue is not that), and it refuses a change to credentials or identity, a top-tier review class, or a pull request with no review recorded at its head.
+- **The batch pull request** is judged by the floor on its own aggregated diff into the default branch, so it holds for the owner when any member touched a top-tier path until #835 lands, then only when a row is rated High (otherwise almost every batch would hold), whoever cleared that member earlier.
+
+### The cadence and who keeps the batch
+
+The batch pull request is opened daily at the hour the Chief of Staff's lane records in the charter's queue (one hour per repository); a day with no change opens none. The Chief of Staff's lane opens it, keeps its table current until the freeze, and tells the owner when it is ready. After the batch merges, the owning orchestrator closes each work item and ask whose change it carried (a pull request's `Closes #N` is honoured only on the default branch, so it does not close them).
+
+### The freeze
+
+The freeze starts when the batch pull request is taken out of draft (its title says `ready for the owner's clear`; no label is created), and ends when it merges or is returned to draft. While it stands nothing merges into `integration`; new changes wait for the next batch and their pull requests stay open. Until a ruleset enforces it, the freeze is a rule the lanes follow; a report of merges into `integration` while a batch is ready is a planned follow-up (not built).
+
+A merge during the freeze moves the batch's head and voids the owner's clear (it is head-bound). The lane then returns the batch to draft, refreshes the table, tells the owner the clear is void, and marks it ready again; the change is kept, because reverting would be a second merge into `integration`. A sync (below) during the freeze is a merge too: it waits until the batch merges, unless an urgent fix made the batch conflict or go stale, in which case the lane ends the freeze, syncs, refreshes the table and marks it ready again, and the clear is void like any other.
+
+### The sync
+
+The default branch is merged into `integration` by a true merge after every direct merge to the default branch (an urgent fix, a change the owner asked for alone) and before the batch pull request is marked ready. If that merge conflicts with pending changes, the Chief of Staff's lane resolves it in a pull request into `integration` (a branch off `integration` that merges the default branch), reviewed like any change. After a squash-merged batch, the default branch is merged into `integration` again before the next change merges into `integration` (the content is the same, so the merge is trivial; skipped, the next change and the next batch diff carry the already-merged content). The repository's "delete head branch on merge" setting must be off for `integration`, or the branch protected, since the batch's head is `integration`.
+
+None of these is ever part of the procedure: a force push, a rebase of a shared branch, an agent changing a ruleset.
+
+### An ask whose change is only in `integration`
+
+Its ask stays open, with a comment naming the batch pull request. Its live-check clock starts when the batch merges. The sweep's "ask open though its pull request merged" warning (T12) is expected for such an ask until the follow-up below teaches the daemon; the Chief of Staff's lane ignores it meanwhile and the owner is not asked about it.
+
+### The steps a lane follows
+
+1. A change is planned and reviewed as usual, and its pull request is opened into `integration` (`gh pr create --base integration`); CI runs on it. A top-tier change is held for the owner and cleared on its own pull request (`impact clear <repo#N> --reason ...`).
+2. After the independent review passes at the head and the gates read `gates <repo#N>`, the change merges into `integration` (`gh pr merge <N>`) unless a batch is out of draft (ready); then it waits.
+3. After every direct merge to the default branch: `git fetch origin`, `git checkout integration`, `git merge origin/<default>` (never a rebase), push.
+4. At the day's hour the Chief of Staff's lane opens the batch pull request (`gh pr create --base <default> --head integration --draft`), with the body template below, one row per change.
+5. It re-syncs (step 3), refreshes the table, runs the independent review of the batch at its head, then marks it ready (`gh pr ready <N>`, and a title that says `ready for the owner's clear`) and tells the owner (`fleet-switchboard notice pr <repo#N>`).
+6. The owner clears at the exact head and the batch merges. The lane merges the default branch into `integration` (step 3), and the owning orchestrators close the asks that were carried.
+
+### The batch pull request body (template)
+
+The body is the owner v2 body plus one table with a row per change. Use neutral names as in the example.
+
+```markdown
+## Why this needs you
+<1 to 3 sentences: what the batch is and why the owner's clear is needed.>
+
+## What changes for you
+| Before | After |
+|---|---|
+| Each change waited for your clear. | One batch, cleared once. |
+
+## Example
+<a concrete example of one thing that behaves differently>
+
+## Changes in this batch
+| Change | Impact | Hold reasons and who cleared them | Evidence |
+|---|---|---|---|
+| acme-org/widget-service#123: add a retry to the export job | Marginal | none | plan: acme-org/widget-service#120 comment; review: pass at its head; CI: green |
+
+## Questions for you
+1. <a question>. Recommendation: <the answer you recommend>.
+```
+
+### Owner decisions and follow-up asks
+
+Each decision was walked against the matrix (its owner-hold meaning and its rating table) and the commands (`impact clear`, `impact clear --under-order`, `gh pr`, `git merge`).
+
+- **D1**, the impact floor treatment of changes into the integration branch (decided: option A as a target, the Chief of Staff, 18:05Z, under the owner's standing order): changes into `integration` are rated and held as usual; today the owner clears a top-tier change on its own pull request, and the Chief of Staff's clear up to Serious applies once #835 is built and its order is configured; the batch pull request holds for the owner when any member touched a top-tier path until #835 lands, then only when a row is rated High. No floor path changes. Not chosen: the floor skips the per-change hold (stays an owner option if the pilot shows the per-change clears cost too much), and held changes not batched.
+- **D2**: enforce the freeze with a ruleset on `integration`. Recommendation: yes if the owner is willing; otherwise the lanes' rule stays the control.
+- **D3**: batch size against the review checkout's limits. Recommendation: cap a batch at what the checkout accepts, and split a larger one.
+- **Follow-up asks** (each its own ask): a script that renders the batch table; the daemon's treatment of an ask whose change is in a non-default branch (T12) and of reference runs for `integration` (and a `push` run of CI on `integration`; pull requests into it already run CI, as the workflow has no branch filter); a report of merges into `integration` while a batch is ready.
