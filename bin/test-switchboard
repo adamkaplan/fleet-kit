@@ -26596,7 +26596,7 @@ class TestAlertWake(Base):
         self.hub.open[self.repo] = {}
         self.source = sb.AlertWakeFacts()
         self.source.bind(self.engine)
-        self.inbox = set()   # the keys the recipient already has
+        self.inbox = {}   # key -> when it was delivered: the keys the recipient already has
 
     def configure(self, labels):
         self.engine.config["triage"] = dict(sb.TRIAGE_DEFAULTS, repos=[self.repo], our_logins=["bot"], alert_labels={self.repo: list(labels)})
@@ -26618,13 +26618,23 @@ class TestAlertWake(Base):
         self.engine.discover(self.world.clock.now())   # the first pass of the new process reads the roster whole
 
     def deliver(self, name="orch"):
-        """What the recipient would be sent now, through the real collection and the real inbox dedupe (`_undelivered`), with a transcript that holds
-        the keys already delivered: the lines of issues, not the summary line. Delivery is then recorded."""
+        """What the recipient would be sent now, through the real collection and the real inbox dedupe (`_undelivered`). The transcript is a map of key to
+        the time it was delivered and, like the real inbox read, answers only for keys delivered at or after the `since` it is asked about (the real read
+        stops there too): a line delivered before a look-back that starts later is NOT seen. Delivery is then recorded at the clock's time. Returns the
+        lines of issues, not the summary line."""
         self.engine.sources = [self.source]
         facts = [f for f in self.engine.collect_facts()[0] if f.recipient == name]
-        with mock.patch.object(self.engine, "delivered_keys", return_value=(set(self.inbox), True)):
+        asked = []
+
+        def inbox(session_id, since):
+            asked.append(since)
+            return {k for k, at in self.inbox.items() if at >= since}, True
+
+        with mock.patch.object(self.engine, "delivered_keys", side_effect=inbox):
             sent = self.engine._undelivered(name, facts, self.engine.discovery) if facts else []
-        self.inbox |= {f.key for f in sent}
+        self.asked = asked
+        for f in sent:
+            self.inbox[f.key] = self.world.clock.now()
         return [f.summary for f in sent if ":more:" not in f.key]
 
     def facts(self, name="orch"):
@@ -26694,6 +26704,46 @@ class TestAlertWake(Base):
         self.restart()                   # and a second restart after that delivery tells nothing more
         self.go(2)
         self.assertEqual(self.deliver(), [])
+
+    def test_a_restart_long_after_delivery_does_not_repeat_it_because_the_look_back_starts_at_the_first_queueing(self):
+        self.add(7)
+        self.go()
+        self.assertEqual(len(self.deliver()), 1)
+        self.world.tick(sb.SINCE_SLACK + 3600)           # the delivery is now OLDER than a look-back that starts at the restart's own time
+        self.restart()
+        self.go()
+        self.assertEqual(self.deliver(), [])
+        first = self.engine.alert_wake.told["acme-org/widget-service#7 ops-alert"]
+        self.assertEqual(self.asked, [first - sb.SINCE_SLACK])   # the look-back reaches back to when the line was first queued
+
+    def test_an_inbox_that_cannot_be_read_gives_the_line_again_once_per_look_never_a_crash(self):
+        self.add(7)
+        self.go()
+        self.assertEqual(len(self.deliver()), 1)
+        self.engine.sources = [self.source]
+        facts = [f for f in self.engine.collect_facts()[0] if f.recipient == "orch"]
+        with mock.patch.object(self.engine, "delivered_keys", side_effect=sb.V2Error("down")):
+            self.assertEqual(len(self.engine._undelivered("orch", facts, self.engine.discovery)), 1)   # the shared dedupe fails open
+
+    def test_a_burst_is_told_in_number_order_whatever_order_the_list_comes_in(self):
+        for n in (9, 3, 12, 1, 7, 5, 11, 2):
+            self.add(n)
+        self.go()
+        told = sorted(int(k.split("#")[1].split(" ")[0]) for k in self.engine.alert_wake.told)
+        self.assertEqual(told, [1, 2, 3, 5, 7])
+
+    def test_a_label_is_matched_exactly_not_by_case(self):
+        self.add(7, labels=["Ops-Alert"])
+        self.go()
+        self.assertEqual(self.lines(), [])
+
+    def test_a_clock_earlier_than_the_saved_time_and_a_leftover_temp_file_do_not_matter(self):
+        self.add(7)
+        self.go()
+        at = self.engine.alert_wake.told["acme-org/widget-service#7 ops-alert"]
+        self.assertEqual(len(sb.AlertWakeState(self.world.state, at - 1000).facts), 1)
+        (Path(self.world.state) / (sb.ALERT_WAKE_FILE + ".999.tmp")).write_text("{partial")   # a crash mid-write leaves this behind
+        self.assertEqual(len(sb.AlertWakeState(self.world.state, at + 1).facts), 1)
 
     def test_a_pending_line_older_than_the_keep_window_is_not_loaded(self):
         self.add(7)
