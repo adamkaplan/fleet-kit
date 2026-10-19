@@ -3422,7 +3422,7 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
     facts = sorted(facts, key=lambda fact: (fact.created, fact.key))
     if not facts:
         raise ValueError("nothing to compose")
-    if facts[0].orders:  # PR 17: the orders note, whole: up to twenty orders of 300 characters
+    if facts[0].orders:  # PR 17: the orders note, whole: every order
         return orders_note(recipient, facts[0], repos), facts[:1]
 
     replaced = {}
@@ -5614,9 +5614,9 @@ def policy_questions():
             for name, (text, yes, no) in POLICY_QUESTIONS.items()}
 
 
-def policy_state(role, intent, done_when, authority, tool, arguments, authority_clip=None):
+def policy_state(role, intent, done_when, authority, tool, arguments):
     return {"role": role, "intent": _clip(intent, 600), "done_when": _clip(done_when, 400),
-            "standing_authority": _clip(authority, authority_clip or ORDERS_STATE_CLIP), "tool": tool,
+            "standing_authority": authority, "tool": tool,
             "arguments": _clip(_canonical(arguments) if not isinstance(arguments, str) else arguments, 1500)}
 
 
@@ -11182,8 +11182,7 @@ def judge_inbound_answer(engine, decision, answer, role):
         PROG, decision["id"], chosen, json.dumps(text), decision.get("kind"), decision.get("agent"),
         decision.get("tier"), _one_line(decision.get("title"), 300))
     arguments = redact_command_text(arguments, jev_secrets(config, os.environ))
-    state = policy_state("chief-of-staff", "not stated: no ask is recorded", "not stated", orders, "shell", arguments,
-                         COS_ORDERS_STATE_CLIP)
+    state = policy_state("chief-of-staff", "not stated: no ask is recorded", "not stated", orders, "shell", arguments)
     thresholds = dict(config["policy"]["thresholds"])
     thresholds["outside_intent"] = thresholds["outside_scope"] = 2.0   # the Chief of Staff has no ask: as in the judge
     try:
@@ -24971,9 +24970,7 @@ _STANDING_AUTHORITY = re.compile(r"^(?:[-*]\s+)?\**standing authority\**\s*:\s*\
 # `- <text> (ordered by <name>, <YYYY-MM-DD>)`; the one-line `Standing authority:` stays valid and
 # counts as one more order. `parse_orders` is the one parser.
 ORDERS_HEADING = "## Standing orders"
-ORDERS_MAX = 20          # orders a charter may carry
 ORDER_MAX_CHARS = 300    # characters of one order's text
-ORDERS_STATE_CLIP = 1200  # characters of the joined orders the judge's model sees (issue 87: 600 cut the merge and message orders off a long charter)
 _ORDERS_HEADING = re.compile(r"^#{1,6}\s+standing orders\s*$", re.IGNORECASE)
 _ANY_HEADING = re.compile(r"^#{1,6}\s")
 _ORDER_BULLET = re.compile(r"^[-*]\s+(\S.*?)\s*$")
@@ -25055,7 +25052,7 @@ def _eol_of(body):
 def add_order_to_body(body, text, by, date):
     """`body` with one more order, `- <text> (ordered by <by>, <date>)`, added to the section (made at the
     end of the body when there is none). Every byte outside the section is kept. OrdersError for a text
-    that is empty, longer than ORDER_MAX_CHARS or on more than one line, and for a twenty-first order."""
+    that is empty, longer than ORDER_MAX_CHARS or on more than one line."""
     body = body or ""
     text = (text or "").strip()
     by = " ".join(str(by or "").split())[:60]
@@ -25071,9 +25068,6 @@ def add_order_to_body(body, text, by, date):
     bullet = "- %s (ordered by %s, %s)" % (text, by, date)
     found = _orders_section(body)
     if found is not None:
-        if len(found["bullets"]) >= ORDERS_MAX:
-            raise OrdersError("this charter already has %d standing orders, the most it carries; remove one first"
-                              % ORDERS_MAX)
         if found["bullets"]:
             at = found["bullets"][-1][1]
             lead = "" if body[:at].endswith(("\n", "\r")) else eol
@@ -25591,8 +25585,7 @@ class PolicyJudge:
     def state_of(self, request, fleet, context):
         return policy_state(fleet.get("role") or "unknown", context["intent"] or "not stated: no ask is recorded",
                             context["done_when"] or "not stated", context["authority"] or NO_STANDING_AUTHORITY,
-                            request["tool"], request["arguments"],
-                            COS_ORDERS_STATE_CLIP if fleet.get("role") == "chief-of-staff" else None)
+                            request["tool"], request["arguments"])
 
     def reply_of(self, combined, cached, fleet, context, request):
         outcome = combined["outcome"]
@@ -29736,7 +29729,6 @@ def add_orders_parsers(sub):
 
 COS_ORDERS_NAME = "standing-orders.md"
 COS_ORDERS_MAX_BYTES = 8192
-COS_ORDERS_STATE_CLIP = 1200  # characters of the Chief of Staff's orders the judge's model sees (a charter's: ORDERS_STATE_CLIP)
 COS_ORDERS_TEMPLATE = """<!--
 The Chief of Staff's standing orders: what it may decide for you, in your own words.
 

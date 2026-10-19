@@ -40906,13 +40906,11 @@ class TestOrdersBodyEdits(unittest.TestCase):
                     sb.add_order_to_body(ORDERS_CHARTER_BODY, text, "alice", "2027-01-05")
         sb.add_order_to_body(ORDERS_CHARTER_BODY, "x" * 300, "alice", "2027-01-05")
 
-    def test_at_most_twenty_orders(self):
+    def test_a_charter_carries_any_number_of_orders(self):
         body = ORDERS_CHARTER_BODY
-        for n in range(sb.ORDERS_MAX):
+        for n in range(32):
             body = sb.add_order_to_body(body, "order %d" % n, "alice", "2027-01-05")
-        with self.assertRaises(sb.OrdersError) as raised:
-            sb.add_order_to_body(body, "one more", "alice", "2027-01-05")
-        self.assertIn("20", str(raised.exception))
+        self.assertEqual(body.count("(ordered by alice, 2027-01-05)"), 32)
 
 
 class OrdersCase(IntentCase):
@@ -41107,13 +41105,12 @@ class TestOrdersCopy(OrdersCase):
         self.assertIn("the orders stand, but the comment on the charter failed", err)
         self.assertEqual(self.target(), self.sources)
 
-    def test_a_target_at_the_limit_reports_the_overflow_as_failures(self):
+    def test_a_target_already_holding_eighteen_orders_takes_every_copy(self):
         self.gh.bodies[20] = charter_with(["other order %d (ordered by bob, 2026-10-01)" % i for i in range(1, 19)])
         code, out, err = self.main("orders", "copy", "--source", "1", "--charter", "20")
-        self.assertEqual(code, 1)
-        self.assertEqual(len(self.target()), sb.ORDERS_MAX)
-        self.assertIn("17 of 19 orders did not copy", err)
-        self.assertIn("2 copied", out)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.target()), 18 + len(self.sources))
+        self.assertNotIn("did not copy", err)
 
 
 class TestOrdersCLI(OrdersCase):
@@ -41540,9 +41537,12 @@ class TestJudgeSeesTheOrders(PolicyCase):
                                                "self-certify (ordered by alice, 2027-01-06)")
         self.assertEqual((context["charter"], len(context["orders"])), (1, 2))
 
-    def test_the_state_the_model_sees_holds_the_orders_clipped_to_1200(self):  # 600 until issue 87
-        state = sb.policy_state("orchestrator", "i", "d", "o" * 1500, "shell", "ls")
-        self.assertEqual(len(state["standing_authority"]), 1200)
+    def test_the_state_the_model_sees_holds_the_orders_whole(self):
+        orders = "; ".join("order %d %s https://example.com/a?b=c;d \u00e9\u2026" % (n, "x" * 250) for n in range(30))
+        state = sb.policy_state("orchestrator", "i", "d", orders, "shell", "ls")
+        self.assertEqual(state["standing_authority"], orders)
+        self.assertTrue(state["standing_authority"].endswith("\u00e9\u2026"))
+        self.assertEqual(state["standing_authority"].count("\u2026"), 30, "no ellipsis added")
         self.assertEqual(sb.policy_state("orchestrator", "i", "d", "o" * 500, "shell", "ls")["standing_authority"],
                          "o" * 500)
 
@@ -41558,6 +41558,60 @@ class TestJudgeSeesTheOrders(PolicyCase):
         self.direct_judge(Spy()).decide({"session": self.orch, "tool": "shell", "arguments": "gh pr view 1",
                                          "configured": "allow"})
         self.assertTrue(any("approve deploys here" in text for text in seen), seen)
+
+
+class OrdersReachTheJudgeWhole:
+    """Every path an orders text takes to the judge's input: a charter's (resolve_policy_context), the Chief of Staff's
+    file (context_of) and an owner's agent's inbound answer (judge_inbound_answer). Each is driven through its real code
+    with 30 long orders; the last order must be in the judge's input, whole."""
+
+    @staticmethod
+    def long_orders(prefix, count=30, width=250):
+        return ["%s %02d %s end-%s-%02d" % (prefix, n, "x" * width, prefix, n) for n in range(count)]
+
+    class Spy:
+        def __init__(self):
+            self.seen = []
+
+        def decide(self, state, questions):
+            self.seen.append(state)
+            raise sb.JevError("unreachable", "spy")
+
+
+class TestEveryPathOrdersTakeToTheJudge(PolicyCase, OrdersReachTheJudgeWhole):
+    def test_the_charter_path_hands_the_judge_every_order_whole(self):
+        orders = self.long_orders("charter")
+        body = ORDERS_CHARTER_BODY
+        for text in orders:
+            body = sb.add_order_to_body(body, text, "alice", "2027-01-05")
+        self.gh.bodies = {1: body}
+        spy = self.Spy()
+        self.direct_judge(spy).decide({"session": self.orch, "tool": "shell", "arguments": "gh pr view 1", "configured": "allow"})
+        seen = spy.seen[0]["standing_authority"]
+        self.assertIn("end-charter-29 (ordered by alice, 2027-01-05)", seen)
+        self.assertEqual(seen.count("end-charter-"), 30)
+        self.assertNotIn("\u2026", seen)
+
+    def test_the_chief_of_staffs_file_path_hands_the_judge_every_order_whole(self):
+        orders = self.long_orders("file", count=30, width=240)
+        put_cos_orders(self, "\n".join(orders))
+        spy = self.Spy()
+        self.direct_judge(spy).decide({"session": self.cos, "tool": "shell", "arguments": "gh pr view 1", "configured": "allow"})
+        seen = spy.seen[0]["standing_authority"]
+        self.assertEqual(seen, "\n".join(orders))
+        self.assertTrue(seen.endswith("end-file-29"))
+
+    def test_the_inbound_answer_path_hands_the_judge_every_order_whole(self):
+        orders = self.long_orders("inbound", count=30, width=240)
+        put_cos_orders(self, "\n".join(orders))
+        config = policy_raw_config()
+        config["cos_orders_file"] = str(cos_orders_file(self))
+        spy = self.Spy()
+        decision = {"id": "d1", "kind": "question", "agent": "orch", "tier": "cos", "title": "Which cache?"}
+        with mock.patch.object(sb, "build_jev", return_value=spy):
+            sb.judge_inbound_answer(types.SimpleNamespace(config=config), decision, {"text": "use redis"}, "owner_agent")
+        self.assertEqual(spy.seen[0]["standing_authority"], "\n".join(orders))
+        self.assertTrue(spy.seen[0]["standing_authority"].endswith("end-inbound-29"))
 
 
 def apply_orders_step(run, step):
@@ -41659,7 +41713,7 @@ class TestOrdersFact(unittest.TestCase):
             "within their words. They cover nothing they do not name."])
         self.assertEqual(len(carried), 1)
 
-    def test_twenty_full_length_orders_are_not_cut(self):
+    def test_full_length_orders_are_not_cut(self):
         orders = "\n".join("%d %s" % (n, "x" * 290) for n in range(20))
         text, _ = sb.compose("platform", [sb.Fact("orders:1:ab:start", "platform", "orders", orders, EPOCH, issue=1,
                                                   orders=True)])
@@ -44439,13 +44493,11 @@ class TestJudgeCosOrders(PolicyCase):
         context = self.direct_judge(None).context_of({"name": "orch", "role": "orchestrator", "charter": 1, "issue": 2})
         self.assertEqual(context["authority"], "may merge green PRs")
 
-    def test_the_state_the_model_sees_clips_the_chief_of_staffs_orders_and_a_charters_to_1200(self):
-        self.assertEqual(len(sb.policy_state("chief-of-staff", "i", "d", "o" * 2000, "shell", "ls",
-                                             sb.COS_ORDERS_STATE_CLIP)["standing_authority"]), 1200)
-        self.assertEqual(len(sb.policy_state("orchestrator", "i", "d", "o" * 2000, "shell", "ls")["standing_authority"]), 1200)
+    def test_the_state_the_model_sees_holds_the_chief_of_staffs_orders_and_a_charters_whole(self):
+        self.assertEqual(sb.policy_state("chief-of-staff", "i", "d", "o" * 8000, "shell", "ls")["standing_authority"], "o" * 8000)
         late = "Orchestrators may message each other and merge green PRs."
-        seen_text = sb.policy_state("orchestrator", "i", "d", "; ".join(["x" * 100] * 9 + [late]), "shell", "ls")["standing_authority"]
-        self.assertIn(late[:20], seen_text, "an order near the end of a long charter still reaches speaks_for_you and hard_to_reverse")
+        text = "; ".join(["x" * 300] * 29 + [late])
+        self.assertEqual(sb.policy_state("orchestrator", "i", "d", text, "shell", "ls")["standing_authority"], text)
         seen = []
 
         class Spy:
@@ -44453,9 +44505,9 @@ class TestJudgeCosOrders(PolicyCase):
                 seen.append(state)
                 raise sb.JevError("unreachable", "spy")
 
-        put_cos_orders(self, "o" * 2000)
+        put_cos_orders(self, "o" * 8000)
         self.direct_judge(Spy()).decide({"session": self.cos, "tool": "shell", "arguments": "gh pr view 1", "configured": "allow"})
-        self.assertEqual(len(seen[0]["standing_authority"]), 1200)
+        self.assertEqual(seen[0]["standing_authority"], "o" * 8000)
 
     def test_the_judge_reads_the_file_for_speaks_for_you_and_sees_an_edit_at_the_next_call(self):
         self.configure([{"contains": "echo commands", "noul": LOW},
