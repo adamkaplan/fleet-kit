@@ -12527,10 +12527,11 @@ TRIAGE_KINDS = {"T1": "owner missing", "T2": "required label missing", "T3": "no
                 "T11": "orphan", "T12": "plan issue still open after its PR merged", "OO": "other-owner (flag only)"}
 # #805: the inputs each rule judges, in ONE table: the candidates a pass drops and the records the prune keeps are both read from it, so they cannot drift.
 # A rule that judges whether an item is OURS (every one but T5, T6 and T10) also needs `agents`: ownership comes from the running agents.
-TRIAGE_RULE_INPUTS = {"T1": ("agents", "issues"), "T2": ("agents", "issues"), "T3": ("agents", "issues", "comments"), "T5": ("decisions", "issues"),
+TRIAGE_RULE_INPUTS = {"T1": ("agents", "issues", "merged"), "T2": ("agents", "issues"), "T3": ("agents", "issues", "comments"), "T5": ("decisions", "issues"),
                       "T6": ("decisions", "issues"), "T7": ("agents", "issues", "comments", "decisions"), "T8": ("agents", "issues"),
-                      "T9": ("agents", "issues"), "T10": ("closed",), "T11": ("agents", "issues"), "T12": ("agents", "issues", "merged")}
-# "agents" and "decisions" are global; the others are per repository (`<name>:<repo>`). T7 also reads the decision list (a captain PR listed there is T6's).
+                      "T9": ("agents", "issues", "comments"), "T10": ("closed",), "T11": ("agents", "issues", "merged"), "T12": ("agents", "issues", "merged")}
+# "agents" and "decisions" are global; the others are per repository (`<name>:<repo>`). T7 also reads the decision list (a captain PR listed there is T6's);
+# T1 and T11 give way to T12 when a merged PR links the item (so they read `merged`), and T9 gives way to T3 (so it reads `comments`).
 # The records of the OTHER kinds are kept whenever ANY input of ANY rule is not whole: the other-owner flag stands for whichever rule would have fired, and the
 # invalid-park flag is raised from the digest of all of them. Their set is derived from the table, so a new rule's input is included at once.
 TRIAGE_UNION_KINDS = ("OO", "PARKED")
