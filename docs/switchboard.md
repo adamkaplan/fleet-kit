@@ -4350,6 +4350,8 @@ through consensus (E4 of [docs/plan-gate-engine-design.md](plan-gate-engine-desi
 refuses**, in every mode, including a repo set to `enforce`: refusing needs the plan review engine that writes the consensus
 record, which is a later slice. The launch always goes on.
 
+Exempt when enforced: a launch of the reviewer role (a standing independent reviewer has no plan); every other role still needs a readable `PLAN:` line. The exemption is keyed by the role the launch itself records (never by a name, nor by a line a worker writes in a brief), and it is a launch-time exemption only: a reviewer's verdicts still bind to a pull request's head.
+
 The check reads the brief's `PLAN: <link>` line, fetches that plan, runs `plan check` on it (G0a) and looks in the ledger for a
 `consensus` entry that passed at the plan's **current plan hash** (G0b); editing the plan, even a constraint, voids it. Nothing writes
 a `consensus` entry yet, so while only this slice exists every launch under a plan in an opted-in repo records a `would_refuse`:
