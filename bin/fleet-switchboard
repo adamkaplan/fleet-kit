@@ -12594,6 +12594,16 @@ def triage_names_owner(body):
     return any(not TRIAGE_OWNER_PLACEHOLDER_RE.match(m.group(1)) for m in TRIAGE_OWNER_RE.finditer(SWEEP_QUOTED_RE.sub(" ", body)))
 
 
+def triage_owner_name(body):
+    """The name on the FIRST `Owner:` line of the body (outside code and quotes): its first word, or None. Only that one word is kept."""
+    if not isinstance(body, str):
+        return None
+    for m in TRIAGE_OWNER_RE.finditer(SWEEP_QUOTED_RE.sub(" ", body)):
+        word = re.match(r"[\W_]*([A-Za-z0-9][A-Za-z0-9._-]*)", m.group(1))
+        return word.group(1) if word and not TRIAGE_OWNER_PLACEHOLDER_RE.match(m.group(1)) else None
+    return None
+
+
 def validate_triage_config(config, source):
     """`triage`: absent, null or {} runs in shadow (findings audited, nobody woken); `enabled` true adds only the wake of
     the Chief of Staff; `false` turns it fully off. Nothing here can make it write to GitHub: there is no such code."""
@@ -12629,8 +12639,18 @@ def validate_triage_config(config, source):
     if own is not None:
         if not isinstance(own, dict) or set(own) - {"repos", "days", "limit", "owner_labels"}:
             raise ConfigError("%s.ownerless' must be null or {repos, days, limit, owner_labels}, got %r" % (where, own))
-        if not (isinstance(own.get("repos"), list) and own["repos"] and all(isinstance(r, str) and REPO_RE.match(r) for r in own["repos"])):
-            raise ConfigError("%s.ownerless.repos' must be a non-empty list of OWNER/REPO names, got %r" % (where, own.get("repos")))
+        repos = own.get("repos")
+        if isinstance(repos, dict):   # a map of OWNER/REPO to {label_owners: {label: lane}}
+            if not repos or not all(isinstance(r, str) and REPO_RE.match(r) for r in repos):
+                raise ConfigError("%s.ownerless.repos' must be a non-empty list or map of OWNER/REPO names, got %r" % (where, list(repos)))
+            for repo, entry in repos.items():
+                if not isinstance(entry, dict) or set(entry) - {"label_owners"}:
+                    raise ConfigError("%s.ownerless.repos.%s' must be {label_owners: {label: lane}}, got %r" % (where, repo, entry))
+                lo = entry.get("label_owners", {})
+                if not isinstance(lo, dict) or not all(isinstance(k, str) and k.strip() and isinstance(v, str) and v.strip() for k, v in lo.items()):
+                    raise ConfigError("%s.ownerless.repos.%s.label_owners' must be a map of non-empty label to non-empty lane name, got %r" % (where, repo, lo))
+        elif not (isinstance(repos, list) and repos and all(isinstance(r, str) and REPO_RE.match(r) for r in repos)):
+            raise ConfigError("%s.ownerless.repos' must be a non-empty list or map of OWNER/REPO names, got %r" % (where, repos))
         if "days" in own and (not _is_number(own["days"]) or own["days"] <= 0):
             raise ConfigError("%s.ownerless.days' must be a positive number of days, got %r" % (where, own["days"]))
         if "limit" in own and (not isinstance(own["limit"], int) or isinstance(own["limit"], bool) or not 100 <= own["limit"] <= 2000):
@@ -12749,7 +12769,7 @@ def triage_norm(issue):
             "section": sweep_has_section(body), "next_body": bool(isinstance(body, str) and TRIAGE_NEXT_RE.search(
                 SWEEP_QUOTED_RE.sub(" ", body))), "parent": parent_of(issue),
             "parked_until": parked_until(body, {(l.get("name") if isinstance(l, dict) else l) for l in issue.get("labels") or []}),
-            "owner_body": triage_names_owner(body),
+            "owner_body": triage_names_owner(body), "owner_name": triage_owner_name(body),
             "open_sub": isinstance(total, int) and isinstance(done, int) and total > done,
             "pending_text": load_triage_plan_open().pending_text(body),   # #410: its own text says work is left
             "captain": is_captain({"labels": {(l.get("name") if isinstance(l, dict) else l) for l in issue.get("labels") or []},
@@ -13191,7 +13211,8 @@ def triage_ownerless_options(cfg):
     if not isinstance(own, dict) or not own.get("repos"):
         return None
     module = load_module("triage_ownerless")
-    return {"repos": list(own["repos"]), "days": own.get("days", module.DEFAULT_DAYS), "limit": own.get("limit", module.DEFAULT_LIMIT),
+    return {"repos": list(own["repos"]), "label_owners": {r: dict((e or {}).get("label_owners") or {}) for r, e in own["repos"].items()} if isinstance(own["repos"], dict) else {},
+            "days": own.get("days", module.DEFAULT_DAYS), "limit": own.get("limit", module.DEFAULT_LIMIT),
             "owner_labels": list(own.get("owner_labels") or module.DEFAULT_OWNER_LABELS)}
 
 
@@ -13255,7 +13276,10 @@ def triage_ownerless_pass(engine, state, cfg, now):
                 item = triage_norm(record)
                 if item is not None and item["state"] == "open":
                     items[item["number"]] = item
-            rows = module.ownerless_stale(items, triage_context(engine, repo, items, discovery), ours, options["owner_labels"], now, options["days"])
+            lanes = {name.lower() for name, agent in (discovery.agents.items() if discovery else [])   # a known lane: an orchestrator the daemon holds for the repository
+                     if (agent.fleet or {}).get("role") == "orchestrator" and (_fleet_repo(agent.fleet or {}, engine.config) == repo or (agent.fleet or {}).get("repo") == repo)}
+            rows = module.ownerless_stale(items, triage_context(engine, repo, items, discovery), ours, options["owner_labels"], now, options["days"],
+                                          options["label_owners"].get(repo), lanes)
             read, total = len(unit["data"]), unit.get("total")
             shown[repo] = {"count": len(rows), "read": read, "total": total, "oldest_days": int(rows[0][1]) if rows else None}
             if not rows:

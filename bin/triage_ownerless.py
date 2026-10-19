@@ -29,14 +29,30 @@ def claim_label(labels, patterns):
     return any(fnmatch.fnmatchcase(str(label).lower(), str(pattern).lower()) for label in labels for pattern in patterns)
 
 
-def ownerless_stale(items, ctx, ours_logins, patterns, now, days=DEFAULT_DAYS):
+def label_owned(labels, label_owners):
+    """True when a label of the issue is a key of the repository's `label_owners` map (a lane carries it)."""
+    keys = {str(k).lower() for k in (label_owners or {})}
+    return any(str(label).lower() in keys for label in labels)
+
+
+def lane_named(item, lanes):
+    """True when the first `Owner:` line of the body names a known lane (`lanes`: lower-case orchestrator names)."""
+    name = item.get("owner_name")
+    return bool(name) and name.lower() in lanes
+
+
+def ownerless_stale(items, ctx, ours_logins, patterns, now, days=DEFAULT_DAYS, label_owners=None, lanes=()):
     """[(number, quiet_days)] of the open ISSUES (not pull requests) that have no owner, no owner label, were not written by one of `ours_logins`, and were last touched `days`
-    or more days ago; the oldest first."""
-    found = []
+    or more days ago; the oldest first. With a non-empty `label_owners` map for the repository, a label of the map owns the issue and an `Owner:` line owns it
+    only when it names one of `lanes`; with none, the rule is the one before the map existed."""
+    found, strict = [], bool(label_owners)
     for number, item in items.items():
         if item.get("pr") or item.get("state") != "open":
             continue
-        if is_claimed(item, ctx) or claim_label(item["labels"], patterns) or item["author"] in ours_logins:
+        if strict and (label_owned(item["labels"], label_owners) or lane_named(item, lanes)):
+            continue
+        claimed = is_claimed(dict(item, owner_body=False), ctx) if strict else is_claimed(item, ctx)
+        if claimed or claim_label(item["labels"], patterns) or item["author"] in ours_logins:
             continue
         quiet = (now - item["updated"]) / 86400.0
         if quiet >= days:
