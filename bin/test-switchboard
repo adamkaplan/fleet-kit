@@ -21813,9 +21813,23 @@ STOPPED_NEWS_RULES = [
 
 
 
+class StalledHub:
+    """The one list the stalled rule's open-PR input comes from: what `ci_record_pass` reads through `hub.read_pages`."""
+
+    def __init__(self):
+        self.records, self.cut, self.fail = [], False, False
+        self.paths = []
+
+    def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
+        self.paths.append(path)
+        if self.fail:
+            raise sb.GitHubUnavailable("the list could not be read")
+        return list(self.records), self.cut
+
+
 class TestStalledWorking(ReportBase):
     """#811: a coder whose reports are all `working` for `stalled_working_hours` while nothing it owns moves wakes its boss ONCE. Real path:
-    the report record is written by `report`, the lists and marks are the ones the daemon keeps."""
+    the report record is written by `report`, the open-PR list and its read-whole mark come from `ci_record_pass` over a fake hub."""
     REPO = "acme/widget-service"
 
     def setUp(self):
@@ -21823,35 +21837,48 @@ class TestStalledWorking(ReportBase):
         engine = self.world.engine
         engine.state_dir = self.world.state
         engine.config["intent_repo"] = self.REPO
+        engine.config["plan_gates"] = {"repos": {self.REPO: {"mode": "shadow"}}}
+        engine.gh_runner = lambda *a, **k: (_ for _ in ()).throw(AssertionError("gh called"))   # no call is made to judge movement
+        self.hub = engine.hub = StalledHub()
         self.t0 = self.world.clock.now()
-        self.head = "a" * 40
-        self.set_lists()
-        for name in ("issues:" + self.REPO, "decisions", "pulls:" + self.REPO):
-            sb.read_mark(engine, name, True, "", self.t0)
+        self.params = {"head": "a" * 40, "issue_labels": (), "pr_labels": (), "checks": None, "pr": True, "at": self.t0}
+        self.apply()
         (self.world.state / sb.DECISIONS_FILE).write_text(json.dumps({"decisions": [], "errors": []}))
         self.world.tick(1)
         for _ in range(5):
             self.report("working", "migrating the tables")
         self.world.tick(1)
 
-    def set_lists(self, head=None, issue_labels=(), pr_labels=(), checks=None, pr=True, at=None):
-        engine, at = self.world.engine, sb.iso(self.t0 if at is None else at)
+    def apply(self):
+        """Read the lists as the daemon does: the issue list is the triage's (marked by hand: not this change's code), the PR list is `ci_record_pass`'s."""
+        engine, prm = self.world.engine, self.params
+        at, now = sb.iso(prm["at"]), self.world.clock.now()
         engine.triage = sb.TriageState()
-        engine.triage.units[(self.REPO, "issues")] = {"at": 0, "data": [
-            {"number": 2, "updated_at": at, "created_at": at, "labels": [{"name": n} for n in issue_labels]}], "truncated": False, "error": None}
-        state = engine.__dict__["ci_record_state"] = sb.CiRecordState()
-        head = head or self.head
-        records = [{"number": 9, "body": "PLAN: https://github.com/%s/issues/2\n" % self.REPO, "updated_at": at, "head": {"sha": head},
-                    "labels": [{"name": n} for n in pr_labels]}] if pr else []
-        state.lists[self.REPO] = (self.t0, records)
-        if pr and checks is not None:
-            state.pr_state["%s#9" % self.REPO] = {"head": head, "examined_head": head, "checks": [{"name": "ci", "conclusion": c} for c in checks]}
+        engine.triage.units[(self.REPO, "issues")] = {"at": now, "data": [
+            {"number": 2, "updated_at": at, "created_at": at, "labels": [{"name": n} for n in prm["issue_labels"]]}], "truncated": False, "error": None}
+        sb.read_mark(engine, "issues:" + self.REPO, True, "", now)
+        sb.read_mark(engine, "decisions", True, "", now)
+        self.hub.records = [{"number": 9, "body": "PLAN: https://github.com/%s/issues/2\n" % self.REPO, "updated_at": at, "head": {"sha": prm["head"]},
+                             "labels": [{"name": n} for n in prm["pr_labels"]]}] if prm["pr"] else []
+        engine.__dict__.pop("ci_record_state", None)
+        engine.__dict__.get("read_whole", {}).pop("pulls:" + self.REPO, None)
+        sb.ci_record_pass(engine, now)
+        if prm["pr"] and prm["checks"] is not None:
+            engine.ci_record_state.pr_state["%s#9" % self.REPO].update(
+                {"examined_head": prm["head"], "checks": [{"name": "ci", "conclusion": c} for c in prm["checks"]]})
+
+    def set_lists(self, **changes):
+        self.params.update(changes)
+        self.apply()
 
     def stalled(self):
         return [f for f in self.derive() if ":stalled:" in f.key]
 
     def late(self, hours=2.5):
-        self.world.tick(int(hours * 3600))
+        """Time passes and the daemon's passes keep reading (so every list is fresh)."""
+        self.world.tick(int(hours * 3600) - 60)
+        self.apply()
+        self.world.tick(60)
 
     def test_stalled_working_with_no_movement_wakes_the_boss_once(self):
         self.late()
@@ -21880,7 +21907,7 @@ class TestStalledWorking(ReportBase):
         self.stalled()   # the head is first seen
         self.late()
         self.assertEqual(len(self.stalled()), 1)
-        self.set_lists(head="c" * 40, at=self.t0)
+        self.set_lists(head="c" * 40)
         self.assertEqual(self.stalled(), [])
         self.late()
         self.assertEqual(len(self.stalled()), 1)
@@ -21901,7 +21928,7 @@ class TestStalledWorking(ReportBase):
         self.assertEqual(len(self.stalled()), 1)
         self.set_lists(at=self.world.clock.now() - 60)
         self.assertEqual(self.stalled(), [])
-        self.set_lists(pr=False)
+        self.set_lists(pr=False, at=self.t0)
         (wake,) = self.stalled()
         self.assertIn("on acme/widget-service#2", wake.summary, "no pull request yet: the issue is the reference and its time the signal")
 
@@ -21933,14 +21960,68 @@ class TestStalledWorking(ReportBase):
         self.world.engine.hub = types.SimpleNamespace(closed_issue_snapshot=lambda: {"%s#2" % self.REPO: {"labels": [], "at": 1}})
         self.assertEqual(self.stalled(), [])
 
+    def test_a_retired_worker_gets_none(self):
+        self.late()
+        self.assertEqual(len(self.stalled()), 1)
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {"coder": {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": self.world.sessions["coder"], "auto": False}})
+        self.assertEqual(self.stalled(), [])
+
+    def test_an_idle_worker_is_the_seam_rules_alone(self):
+        self.stop("all quiet")
+        self.world.tick(1)
+        self.late()
+        self.assertEqual(self.stalled(), [], "an idle worker is woken by the idle-at-a-seam rule only, never a second time")
+
     def test_a_not_whole_input_gives_none(self):
         self.late()
         for name in ("issues:" + self.REPO, "decisions", "pulls:" + self.REPO):
             with self.subTest(name):
+                held = dict(self.world.engine.read_whole[name])
                 sb.read_mark(self.world.engine, name, False, "cut", self.world.clock.now())
                 self.assertEqual(self.stalled(), [])
-                sb.read_mark(self.world.engine, name, True, "", self.world.clock.now())
+                self.world.engine.read_whole[name] = held
         self.assertEqual(len(self.stalled()), 1)
+
+    def test_the_pulls_mark_comes_from_ci_record_pass_and_is_not_whole_when_the_list_is_cut_or_fails(self):
+        engine = self.world.engine
+        self.late()
+        self.assertEqual(len(self.stalled()), 1, "(a) a clean list is whole and the stall wakes")
+        self.hub.fail = True
+        self.world.tick(sb.CI_RECORD_LIST_TTL + 1)
+        sb.ci_record_pass(engine, self.world.clock.now())
+        self.assertEqual(sb.whole(engine, "pulls:" + self.REPO)[0], False)
+        self.assertEqual(self.stalled(), [], "(c) a failing read is not whole")
+        self.hub.fail = False
+        self.world.tick(sb.CI_RECORD_LIST_TTL + 1)
+        sb.ci_record_pass(engine, self.world.clock.now())
+        self.assertTrue(sb.whole(engine, "pulls:" + self.REPO)[0])
+        self.assertEqual(len(self.stalled()), 1, "and a clean read is whole again")
+        self.hub.cut = True
+        self.world.tick(sb.CI_RECORD_LIST_TTL + 1)
+        sb.ci_record_pass(engine, self.world.clock.now())
+        self.assertEqual(self.stalled(), [], "(b) a list cut at the page cap is not whole")
+
+    def test_the_pulls_mark_is_not_whole_in_a_process_that_never_ran_the_pass(self):
+        self.late()
+        self.world.engine.read_whole.pop("pulls:" + self.REPO)
+        self.assertFalse(sb.whole(self.world.engine, "pulls:" + self.REPO)[0])
+        self.assertEqual(self.stalled(), [])
+
+    def test_a_list_not_re_read_for_20_minutes_is_not_judged(self):
+        self.late()
+        self.assertEqual(len(self.stalled()), 1)
+        self.world.tick(sb.STALLED_LIST_MAX_AGE - 1000)
+        self.assertEqual(len(self.stalled()), 1, "the list is still young enough")
+        self.world.tick(1100)
+        self.assertEqual(self.stalled(), [], "the pass stopped re-reading: no judgement on an old list")
+
+    def test_the_newest_moved_pull_request_is_the_one_judged(self):
+        self.late()
+        at = sb.iso(self.world.clock.now() - 30)
+        self.hub.records.append({"number": 12, "body": "PLAN: https://github.com/%s/issues/2\n" % self.REPO, "updated_at": at, "head": {"sha": "d" * 40}, "labels": []})
+        self.world.engine.__dict__.pop("ci_record_state")
+        sb.ci_record_pass(self.world.engine, self.world.clock.now())
+        self.assertEqual(self.stalled(), [], "the second open pull request moved 30 seconds ago")
 
     def test_the_rule_reads_no_gh(self):
         self.late()
@@ -21970,14 +22051,33 @@ class TestStalledWorking(ReportBase):
         (self.world.state / "reminders.json").write_text("{bad")
         self.assertEqual(self.stalled(), [], "an unreadable reminder file is no evidence")
 
+    def test_a_legacy_report_record_with_no_streak_gives_none(self):
+        self.late()
+        path = self.world.state / sb.LAST_REPORT_FILE
+        data = json.loads(path.read_text())
+        for key in ("work_n", "work_since"):
+            data["coder"].pop(key)
+        path.write_text(json.dumps(data))
+        self.assertEqual(self.stalled(), [])
+
     def test_a_bad_threshold_is_refused(self):
         with self.assertRaises(sb.ConfigError):
             sb.validate_config({"stalled_working_hours": 0})
 
-    def test_a_token_in_the_last_report_is_redacted(self):
+    def test_the_wake_redacts_a_line_an_older_file_holds_raw(self):
+        self.late()
+        path = self.world.state / sb.LAST_REPORT_FILE
+        data = json.loads(path.read_text())
+        data["coder"]["text"] = "using ghp_" + "a" * 36
+        path.write_text(json.dumps(data))
+        self.assertNotIn("ghp_", self.stalled()[0].summary)
+
+    def test_a_token_in_the_last_report_is_redacted_when_stored(self):
         self.report("working", "using ghp_" + "a" * 36)
         self.late()
         self.assertNotIn("ghp_", self.stalled()[0].summary)
+        self.assertNotIn("ghp_", (self.world.state / sb.LAST_REPORT_FILE).read_text())
+
 
 class TestStoppedNews(PR4Base):
     def make_world(self, mode="on", **kwargs):
