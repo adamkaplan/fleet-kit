@@ -69,7 +69,7 @@ class StopNonce(base.Base):
         for other in (B, A[:8], A + "00", "cccccccc33333333"):
             with self.subTest(other=other):
                 code, out, err = self.stop("--run-id", other)
-                self.assertNotEqual(code, 0)
+                self.assertEqual(code, cw.EXIT_REFUSED)
                 self.assertEqual(err.count("does not match"), 1, err)
                 self.assertEqual(self.st(), before)   # 0 objects deleted, nothing annotated, no hook run
         lines = [l for l in self.audit_lines() if l["action"] == "stop"]
@@ -82,7 +82,7 @@ class StopNonce(base.Base):
         self.write_state(st)
         before = self.st()
         code, out, err = self.stop("--run-id", A)
-        self.assertNotEqual(code, 0)
+        self.assertEqual(code, cw.EXIT_REFUSED)
         self.assertIn("does not match", err)
         self.assertEqual(self.st(), before)
 
@@ -106,7 +106,6 @@ class StopNonce(base.Base):
                     taken = set(theirs)
                     self.plant(A, tuple(p for p in own if p not in taken))
                     st = self.st()
-                    mine = {self.name + ("-pw" if p == "secret" else "-run") if p != "pod" else self.name for p in own if p not in taken}
                     st["marker"] = "record"
                     self.write_state(st)
                     foreign = {self.name + ("-pw" if p == "secret" else "-run") if p != "pod" else self.name for p in theirs}
@@ -120,7 +119,7 @@ class StopNonce(base.Base):
                             self.assertEqual(labels, {"cw/run-id": B})
                     if "pod" in theirs:
                         self.assertEqual(after["pods"][self.name]["metadata"]["annotations"]["cw/run-id"], B)
-                        self.assertNotEqual(code, 0)
+                        self.assertEqual(code, cw.EXIT_REFUSED)
                     self.assertFalse(any(a for a in after.get("annotated", [])))
                     self.assertEqual(after["marker"], "record")
 
