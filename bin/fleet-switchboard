@@ -29371,13 +29371,11 @@ def cmd_restart(args, runner, spawn=subprocess.Popen, kill=os.kill, sleep=time.s
         if pid is None:
             sys.stderr.write("%s: restart refused: the lock says a daemon runs but not which pid\n" % PROG)
             return EXIT_ERROR
-        try:
-            done = runner(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True, timeout=10,
-                          stdin=subprocess.DEVNULL)
-            command = (done.stdout or "").strip()
-        except (OSError, subprocess.SubprocessError):
-            command = ""
-        if PROG not in command or not re.search(r"\brun\b", command):
+        if daemon_pid_refusal(pid):
+            sys.stderr.write("%s: restart refused: %s; nothing was signalled\n" % (PROG, daemon_pid_refusal(pid)))
+            return EXIT_ERROR
+        ours, command = daemon_process_is_ours(runner, pid)   # ONE check of "is this pid our `run`", shared with `daemon stop`
+        if not ours:
             sys.stderr.write("%s: restart refused: pid %d is not a %s daemon (it is: %s); nothing was signalled\n"
                              % (PROG, pid, PROG, _one_line(command, 80) or "not running or unreadable"))
             return EXIT_ERROR
@@ -29398,6 +29396,281 @@ def cmd_restart(args, runner, spawn=subprocess.Popen, kill=os.kill, sleep=time.s
             waited += 0.1
     print("daemon %s" % ensure_daemon(state, spawn))
     return EXIT_OK
+
+
+# ---------------------------------------------------------------- `daemon status | start | stop | restart` (#858)
+#
+# One command for the daemon, however it was started (a launchd job, or `ensure`). It touches no state file: it ends or begins a
+# process, and reads daemon.json, run.lock, decisions.json and github-watch.json. The one file it makes is its own command lock.
+# docs/switchboard.md, "The daemon command".
+
+DAEMON_HEALTH_WAIT = 120     # seconds `start` and `restart` wait for a healthy daemon
+DAEMON_STOP_WAIT = RESTART_PATIENCE   # seconds a stopping daemon has to let go of run.lock: one bound for `restart` and `daemon stop`
+DAEMON_STEP = 0.2            # seconds between two looks inside a wait
+DAEMON_CALL_TIMEOUT = 30     # seconds one launchctl or ps call may take
+DAEMON_COMMAND_LOCK = "daemon-command.lock"
+daemon_sleep = time.sleep    # a test replaces these three; production never does
+daemon_clock = time.monotonic
+daemon_signal = os.kill
+
+
+class DaemonCommandError(Exception):
+    """A daemon command that did not do what it was asked, in one plain line."""
+
+
+@contextmanager
+def daemon_command_lock(state_dir):
+    """One daemon command at a time: a second one is refused at once, never queued."""
+    fd = os.open(str(Path(state_dir) / DAEMON_COMMAND_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise DaemonCommandError("another daemon command is running; wait for it to finish") from None
+        yield
+    finally:
+        os.close(fd)
+
+
+def launchd_job(runner, platform=None):
+    """(state, pid) of the daemon's launchd job: "loaded" (and its pid, or None), "installed" (the plist is there, the job is not loaded),
+    or "none" (no job, or not launchd). launchctl's own words are never kept: the answer is the exit status."""
+    if service_kind(platform) != "launchd":
+        return "none", None
+    try:
+        done = runner(["launchctl", "print", "gui/%d/%s" % (os.getuid(), SERVICE_LABEL)], capture_output=True, text=True,
+                      timeout=DAEMON_CALL_TIMEOUT, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        done = None
+    if done is not None and done.returncode == 0:
+        found = re.search(r"(?m)^\s*pid = (\d+)\s*$", done.stdout or "")
+        return "loaded", int(found.group(1)) if found else None
+    path = service_file_path("launchd")
+    return ("installed" if path is not None and path.is_file() else "none"), None
+
+
+def daemon_process_is_ours(runner, pid):
+    """(True, command) when `pid` runs THIS program's `run`: a program named fleet-switchboard whose next word is `run`."""
+    try:
+        done = runner(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True, timeout=DAEMON_CALL_TIMEOUT,
+                      stdin=subprocess.DEVNULL)
+        command = (done.stdout or "").strip() if done.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        command = ""
+    return daemon_argv_is_ours(command), command
+
+
+def daemon_argv_is_ours(command):
+    """The ONE shape that is this program's `run`, by argument shape and not by which interpreter it is: [a Python interpreter (any case: python,
+    python3.13, Python, pythonw, the macOS framework Python.app) with its own leading -flags, or nothing for a shebang-launched script]
+    <path>/fleet-switchboard run [--standby]. Nothing else: a different program, `run` not right after the program, `run` inside another
+    word, another flag or an unreadable command line is not it. (`--standby` is the one flag the service's own command line carries.)"""
+    words = command.split()
+    index = 0
+    if words and re.fullmatch(r"pythonw?[0-9.]*", os.path.basename(words[0]), re.IGNORECASE):
+        index = 1
+        while index < len(words) and words[index].startswith("-"):
+            index += 1
+    rest = words[index:]
+    return len(rest) >= 2 and os.path.basename(rest[0]) == PROG and rest[1:] in (["run"], ["run", "--standby"])
+
+
+def daemon_pid_refusal(pid):
+    """Why this pid is never signalled whatever the record says (pid 1 and below, this process, its parent), or None."""
+    if pid <= 1:
+        return "pid %d is not a daemon's" % pid
+    if pid in (os.getpid(), os.getppid()):
+        return "pid %d is this command or its parent" % pid
+    return None
+
+
+def daemon_snapshot(state_dir, runner, now, platform=None):
+    """What is true of the daemon now: running, pid, how it was started, since when, and the reasons it is not healthy ([] = healthy)."""
+    state_dir = Path(state_dir)
+    info = {"running": False, "pid": None, "how": None, "since": None, "reasons": [], "healthy": False, "record_pid": None, "job": "none"}
+    if not state_dir.is_dir() or not run_lock_held(state_dir):
+        return info
+    info["running"] = True
+    try:
+        info["pid"] = int((state_dir / "run.lock").read_text().strip())
+    except (OSError, ValueError):
+        pass
+    try:
+        record = json.loads((state_dir / DAEMON_RECORD).read_text())
+    except (OSError, ValueError):
+        record = {}
+    record = record if isinstance(record, dict) else {}
+    info["record_pid"] = record.get("pid") if isinstance(record.get("pid"), int) else None
+    mine = info["pid"] is not None and info["record_pid"] == info["pid"]
+    started = parse_iso(record["started_at"]) if mine and isinstance(record.get("started_at"), str) else None
+    info["since"] = record["started_at"] if started is not None else None
+    state, job_pid = launchd_job(runner, platform)
+    info["job"] = state
+    info["how"] = "launchd" if state == "loaded" and job_pid is not None and job_pid == info["pid"] else "ensure"
+    current = now()
+    reasons = info["reasons"]
+    decisions = decisions_report(state_dir, current)
+    if decisions["stale"]:
+        reasons.append("the decisions file is stale: %s" % (decisions["message"] or "not current"))
+    else:
+        try:
+            if started is not None and (state_dir / DECISIONS_FILE).stat().st_mtime < started - 1:
+                reasons.append("the decisions file has not been written since this daemon started")
+        except OSError:
+            pass
+    try:
+        snapshot = json.loads((state_dir / WATCH_FILE).read_text())
+    except (OSError, ValueError):
+        snapshot = {}
+    if isinstance(snapshot, dict) and snapshot.get("pid") == info["pid"]:
+        watches = snapshot.get("watches") or []
+        if not isinstance(watches, list):
+            reasons.append("the forwarder snapshot is unreadable (watches is not a list)")
+            watches = []
+        for watch in watches:
+            if isinstance(watch, dict):
+                alarm = forwarder_health(watch, current)["alarm"]
+                if alarm:
+                    reasons.append("the forwarder for %s is unhealthy: %s" % (watch.get("repo"), alarm))
+    info["healthy"] = not reasons
+    return info
+
+
+def daemon_status_text(info):
+    if not info["running"]:
+        return "daemon: not running"
+    lines = ["daemon: running (%s), pid %s, since %s" % (info["how"], info["pid"] if info["pid"] is not None else "unknown",
+                                                           info["since"] or "unknown")]
+    lines.append("daemon: healthy" if info["healthy"] else "daemon: unhealthy")
+    lines.extend("  - %s" % reason for reason in info["reasons"])
+    return "\n".join(lines)
+
+
+def daemon_wait_healthy(state_dir, runner, now, out):
+    """Wait, bounded, until the daemon is healthy. True when it is; else prints what it saw and returns False."""
+    deadline = daemon_clock() + DAEMON_HEALTH_WAIT
+    while True:
+        info = daemon_snapshot(state_dir, runner, now)
+        if info["running"] and info["healthy"]:
+            return True
+        if daemon_clock() >= deadline:
+            out.write("daemon: not healthy after %ds: %s\n" % (DAEMON_HEALTH_WAIT, "not running" if not info["running"]
+                                                              else "; ".join(info["reasons"]) or "unknown"))
+            return False
+        daemon_sleep(DAEMON_STEP)
+
+
+def daemon_stop(state_dir, runner, now, out):
+    """Stop the daemon. Returns what was done; raises DaemonCommandError when nothing may be signalled or it did not stop."""
+    info = daemon_snapshot(state_dir, runner, now)
+    if not info["running"]:
+        return "not running: nothing to stop"
+    pid = info["pid"]
+    if pid is None:
+        raise DaemonCommandError("the lock is held but names no pid; nothing was signalled")
+    if info["record_pid"] != pid:
+        raise DaemonCommandError("the lock names pid %d but the daemon record names %s; nothing was signalled"
+                                 % (pid, info["record_pid"] if info["record_pid"] is not None else "no pid"))
+    if daemon_pid_refusal(pid):
+        raise DaemonCommandError("%s; nothing was signalled" % daemon_pid_refusal(pid))
+    ours, command = daemon_process_is_ours(runner, pid)
+    if not ours:
+        raise DaemonCommandError("pid %d is not a %s daemon (%s); nothing was signalled"
+                                 % (pid, PROG, _one_line(command, 80) or "not running or unreadable"))
+    if info["how"] == "launchd":
+        try:
+            done = runner(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), SERVICE_LABEL)], capture_output=True, text=True,
+                          timeout=DAEMON_CALL_TIMEOUT, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            done = None
+        if done is None or done.returncode != 0:
+            raise DaemonCommandError("launchd would not unload the job; pid %d was left running" % pid)
+        what = "unloaded the launchd job (pid %d)" % pid
+    else:
+        if not run_lock_held(state_dir):
+            return "the daemon stopped by itself; nothing was signalled"
+        try:
+            daemon_signal(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError as err:
+            raise DaemonCommandError("could not signal pid %d: %s" % (pid, err.strerror or err)) from None
+        what = "sent SIGTERM to pid %d" % pid
+        if info["job"] == "loaded":
+            what += " (the launchd job is loaded and may start it again)"
+    deadline = daemon_clock() + DAEMON_STOP_WAIT
+    while run_lock_held(state_dir):
+        if daemon_clock() >= deadline:
+            raise DaemonCommandError("pid %d did not stop within %ds; it was asked to, and nothing stronger was sent" % (pid, DAEMON_STOP_WAIT))
+        daemon_sleep(DAEMON_STEP)
+    return "%s; run.lock is clear" % what
+
+
+def daemon_start(state_dir, runner, now, spawn, out):
+    """Begin a daemon (launchd when its job exists, else the `ensure` path) and wait for it to be healthy."""
+    state, _ = launchd_job(runner)
+    if run_lock_held(state_dir):
+        how = "already running"
+    elif state == "none":
+        out.write("the launchd job is not installed: starting the daemon the way `%s ensure` does\n" % PROG)
+        ensure_daemon(state_dir, spawn)
+        how = "started by ensure"
+    else:
+        argv = (["launchctl", "kickstart", "gui/%d/%s" % (os.getuid(), SERVICE_LABEL)] if state == "loaded"
+                else ["launchctl", "bootstrap", "gui/%d" % os.getuid(), str(service_file_path("launchd"))])
+        try:
+            done = runner(argv, capture_output=True, text=True, timeout=DAEMON_CALL_TIMEOUT, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            done = None
+        if done is None or done.returncode != 0:
+            raise DaemonCommandError("launchd would not start the job (%s)" % argv[1])
+        how = "started through launchd (%s)" % argv[1]
+    if not daemon_wait_healthy(state_dir, runner, now, out):
+        raise DaemonCommandError("the daemon was %s but is not healthy" % how)
+    return "%s; healthy" % how
+
+
+def cmd_daemon(args, runner, now, spawn=subprocess.Popen):
+    """`daemon status | start | stop | restart`. Direct: it never starts a daemon on its own account."""
+    state = state_dir_path()
+    out = sys.stdout
+    action = args.daemon_action
+    try:
+        if action == "status":
+            info = daemon_snapshot(state, runner, now)
+            print(daemon_status_text(info))
+            return EXIT_OK if info["running"] and info["healthy"] else EXIT_ERROR
+        state = ensure_state_dir()
+        with daemon_command_lock(state):
+            started = daemon_clock()
+            if action == "stop":
+                print("daemon stop: %s" % daemon_stop(state, runner, now, out))
+            elif action == "start":
+                print("daemon start: %s" % daemon_start(state, runner, now, spawn, out))
+            else:
+                first = daemon_stop(state, runner, now, out)
+                second = daemon_start(state, runner, now, spawn, out)
+                print("daemon restart: %s; %s; %.1f seconds" % (first, second, daemon_clock() - started))
+        return EXIT_OK
+    except (DaemonCommandError, LockError) as err:
+        sys.stderr.write("%s: daemon %s: %s\n" % (PROG, action, _one_line(str(err))))
+        return EXIT_ERROR
+
+
+cmd_daemon.direct = True   # no daemon start, no error mapping
+
+
+def add_daemon_parsers(sub):
+    daemon = sub.add_parser("daemon", allow_abbrev=False, help="Manage the daemon however it was started (launchd or `ensure`): `daemon status | start | stop | restart`",
+                            description="One command for the daemon. `status` says whether it runs, how it was started, its pid, since when and whether it is healthy. "
+                                        "`stop` ends it (SIGTERM, only to a pid the daemon record and run.lock agree on whose command is this program's `run`; "
+                                        "`launchctl bootout` under a loaded launchd job). `start` begins it (launchd when its job exists, else the `ensure` path) and waits up to "
+                                        "%d seconds for it to be healthy. `restart` is stop then start. No state file is touched." % DAEMON_HEALTH_WAIT)
+    actions = daemon.add_subparsers(dest="daemon_action", required=True)
+    for name, text in (("status", "running or not, how it was started, pid, since when, healthy or not (exit 1 when not running or unhealthy)"),
+                       ("start", "start the daemon and wait until it is healthy"), ("stop", "stop the daemon and wait for run.lock to clear"),
+                       ("restart", "stop then start; prints what it did and the seconds taken")):
+        actions.add_parser(name, allow_abbrev=False, help=text)
 
 
 INSTALL_COMMANDS = {"key": cmd_key}
