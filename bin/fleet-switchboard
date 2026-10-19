@@ -14155,14 +14155,27 @@ ALERT_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
 class AlertWakeState:
-    def __init__(self, state_dir):
-        self.told, self.facts, self.problem = {}, {}, None
+    """What was told (`told`: key -> when) and the lines still waiting (`lines`: key -> {recipient: text}), both kept in ALERT_WAKE_FILE: a line is kept there
+    until it is old enough (ALERT_FACT_KEEP) and loaded back as a fact at start, so a daemon that stops between queueing and delivery still delivers it. The
+    fact key is stable, and a key already in the recipient's inbox is never delivered again, so re-queueing cannot repeat a delivered wake."""
+
+    def __init__(self, state_dir, now=None):
+        self.told, self.lines, self.facts, self.problem = {}, {}, {}, None
         try:
             with open(str(Path(state_dir) / ALERT_WAKE_FILE), "rb") as handle:
                 raw = json.loads(handle.read(1000001).decode("utf-8"))   # a bounded read: the file is ours, but a runaway one must not be loaded whole
             if isinstance(raw, dict):
-                self.told = {k: v["at"] for k, v in list(raw.items())[:ALERT_MEMORY_MAX]
-                             if isinstance(k, str) and ALERT_KEY_RE.match(k) and isinstance(v, dict) and _is_number(v.get("at"))}   # a malformed key is dropped, never parsed later
+                for key, value in list(raw.items())[:ALERT_MEMORY_MAX]:
+                    if not (isinstance(key, str) and ALERT_KEY_RE.match(key) and isinstance(value, dict) and _is_number(value.get("at"))):
+                        continue   # a malformed key is dropped, never parsed later
+                    self.told[key] = value["at"]
+                    lines = value.get("lines")
+                    if now is not None and isinstance(lines, dict) and now - value["at"] < ALERT_FACT_KEEP:
+                        repo, _, rest = key.partition("#")
+                        number = int(rest.split(" ", 1)[0])
+                        self.lines[key] = {n: l for n, l in lines.items() if isinstance(n, str) and isinstance(l, str)}
+                        for name, text in self.lines[key].items():
+                            self.facts["alert:%s:%s" % (key, name)] = (text, value["at"], name, repo, number)
         except FileNotFoundError:
             pass
         except (OSError, ValueError, UnicodeError) as err:
@@ -14172,7 +14185,7 @@ class AlertWakeState:
 def alert_wake_state(engine):
     state = getattr(engine, "alert_wake", None)
     if state is None:
-        state = engine.alert_wake = AlertWakeState(engine.state_dir)
+        state = engine.alert_wake = AlertWakeState(engine.state_dir, engine.now())
         if state.problem:
             engine._note("alert_wake.error", "", {"error": state.problem})
     return state
@@ -14218,6 +14231,7 @@ def alert_wake_pass(engine, state, cfg, now):
             for number, label, key, title in pending[:ALERT_WAKES_PER_PASS]:
                 for name in names:
                     wake.facts["alert:%s:%s" % (key, name)] = (alert_line(repo, number, title, label), now, name, repo, number)
+                wake.lines[key] = {name: wake.facts["alert:%s:%s" % (key, name)][0] for name in names}
                 wake.told[key] = now
                 changed = True
                 engine._note("alert_wake.sent", "%s#%d" % (repo, number), {"label": label, "to": names})
@@ -14231,9 +14245,11 @@ def alert_wake_pass(engine, state, cfg, now):
                         "%d more alert issue(s) of %s will be told on the next passes" % (len(rest), repo), now, name, repo, None)
         for key in [k for k in wake.told if k.startswith(repo + "#") and int(k[len(repo) + 1:].split(" ", 1)[0]) not in open_numbers]:
             del wake.told[key]   # a closed issue is forgotten, on a whole read only
+            wake.lines.pop(key, None)
             changed = True
     if changed:
-        keep = {k: {"at": at} for k, at in sorted(wake.told.items(), key=lambda kv: kv[1])[-ALERT_MEMORY_MAX:]}
+        keep = {k: dict({"at": at}, **({"lines": wake.lines[k]} if k in wake.lines and now - at < ALERT_FACT_KEEP else {}))
+                for k, at in sorted(wake.told.items(), key=lambda kv: kv[1])[-ALERT_MEMORY_MAX:]}
         try:
             _write_small(engine.state_dir, ALERT_WAKE_FILE, keep)
         except OSError as err:
