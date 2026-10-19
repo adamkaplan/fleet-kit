@@ -405,6 +405,9 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             elif isinstance(floor, dict) and (floor.get("unreadable") or floor.get("decision") is None):
                 row.update(status="waiting", missing=["the impact floor could not be read for this head (%s): the owner decides, through cos"
                                                       % (floor.get("unreadable") or "no decision")])
+            elif isinstance(floor, dict) and floor.get("rehold"):   # (#830) a clear was recorded for ANOTHER head, none for this one, no rating here: held again, whatever the labels say
+                row.update(status="waiting", missing=["held again for the owner at this head: %s; the owner clears this head, or the impact rating at this head says not held"
+                                                      % floor["rehold"]])
             elif isinstance(floor, dict) and floor.get("decision") == "hold" and not floor.get("cleared"):
                 row.update(status="waiting", missing=["held for the owner (impact floor, read at this head): %s; the owner clears it for this head"
                                                       % ("; ".join(floor.get("reasons") or []) or "hold")])
@@ -414,7 +417,7 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             floor = (facts or {}).get("floor")
             # held = the same reading as `pr-explain --check`: a hold label, the merge-captain label or marker, or an uncleared floor hold; a missing
             # `held_check` on a held PR fails closed (missing)
-            held = bool((facts or {}).get("captain")) or bool((facts or {}).get("holds")) or (isinstance(floor, dict) and floor.get("decision") == "hold" and not floor.get("cleared"))
+            held = bool((facts or {}).get("captain")) or bool((facts or {}).get("holds")) or (isinstance(floor, dict) and (bool(floor.get("rehold")) or (floor.get("decision") == "hold" and not floor.get("cleared"))))
             check = (facts or {}).get("held_check")   # the ONE check (`held_defects` in the switchboard), called only for a held PR
             if not held:
                 row.update(status="n/a", detail="not a held PR")
