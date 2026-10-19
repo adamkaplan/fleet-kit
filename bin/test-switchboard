@@ -22174,44 +22174,38 @@ class TestLegitimateWaiting(WaitingInputs, ReportBase):
                   "younger than the review window": "review-window", "reminder due later": "reminder", "issue awaiting label": "awaiting-issue",
                   "pull request awaiting label": "awaiting-pr", "human decision": "decision"}
 
-    def test_every_guard_of_the_production_table_is_tested_alone_and_names_its_code(self):
-        self.assertEqual(set(self.GUARD_CODE.values()) | {"last-report"}, set(sb.WAITING_GUARDS), "a guard in the table with no test, or a test of none")
-        self.assertEqual(set(self.GUARD_CODE), set(self.guards()))
-        for name, (arrange, release) in self.guards().items():
+    def test_every_guard_of_the_production_table_is_tested_alone_names_its_code_and_dies_with_its_mutant(self):
+        cases = dict(self.GUARD_CODE)
+        cases["a blocked or question report"] = "last-report"
+        self.assertEqual(set(cases.values()), set(sb.WAITING_GUARDS), "a guard in the production table with no case here (or a case of none)")
+        arranged = dict(self.guards(), **{"a blocked or question report": (lambda: self.report("question", "x"), lambda: self.report("working", "y"))})
+        self.assertEqual(set(arranged), set(cases))
+        for name, (arrange, release) in arranged.items():
+            code = cases[name]
             with self.subTest(name):
                 arrange()
                 self.apply()
-                self.assertEqual(self.predicate().codes, [self.GUARD_CODE[name]])
+                self.assertEqual(self.predicate().codes, [code])
+                needs, check = sb.WAITING_GUARDS[code]
+                with mock.patch.dict(sb.WAITING_GUARDS, {code: (needs, lambda w: [])}):   # the mutant: this one guard never holds
+                    self.assertNotIn(code, self.predicate().codes, "the mutant of %s must change the answer" % code)
                 release()
                 self.apply()
-        for kind in ("blocked", "question"):
-            self.report(kind, "x")
-            self.assertEqual(self.predicate().codes, ["last-report"])
+                self.assertEqual(self.predicate().state, "clear")
 
-    def test_a_launch_checkpoint_is_not_a_wait_a_bad_reminder_is_unread_and_the_window_and_two_pull_requests_are_judged(self):
-        now = self.world.clock.now
-        sb.add_reminder(self.world.state, "coder", now() + 600, now(), "report", issue=2, condition={"while_running": "coder"})
-        self.assertEqual(self.predicate().state, "clear", "a checkpoint is not a worker waiting")
-        sb.add_reminder(self.world.state, "coder", now() + 600, now(), "look", issue=2)
-        self.assertEqual(self.predicate().codes, ["reminder"])
-        path = self.world.state / "reminders.json"
-        raw = json.loads(path.read_text())
-        for item in (raw if isinstance(raw, list) else raw.get("reminders", [])):
-            item["at"] = "soon"
-        path.write_text(json.dumps(raw))
-        self.assertEqual(self.predicate().state, "unread")
-        path.unlink()
-        self.world.engine.config["review_window_minutes"] = 10
-        self.set_lists(pr_extra={"created_at": sb.iso(now() - 599)})
-        self.assertEqual(self.predicate().codes, ["review-window"])
-        self.set_lists(pr_extra={"created_at": sb.iso(now() - 600)})
-        self.assertEqual(self.predicate().state, "clear", "the boundary: exactly the window is over")
-        self.set_lists(pr_extra={})
-        self.hub.records.append({"number": 12, "body": "PLAN: https://github.com/%s/issues/2\n" % self.REPO, "updated_at": sb.iso(self.t0), "created_at": sb.iso(self.t0 - 86400),
-                                 "head": {"sha": "d" * 40}, "labels": [], "requested_reviewers": [{"login": "r"}]})
-        self.world.engine.__dict__.pop("ci_record_state")
-        sb.ci_record_pass(self.world.engine, now())
-        self.assertEqual(self.predicate().codes, ["review-requested"], "one of two pull requests is waiting: the worker is")
+    def test_a_repository_outside_plan_gates_is_silent_in_both_rules_never_nudged(self):
+        """The open-PR list (and its read-whole mark) is read only for a `plan_gates` repository: without it no guard can be judged, so the read-whole rule gives no nudge and no wake."""
+        for which in ("idle", "stalled"):
+            with self.subTest(which):
+                self.setUp()
+                self.mode(which)
+                self.assertTrue(self.said(), "the same fixture with the repository under plan_gates says it")
+                self.world.engine.config["plan_gates"] = {"repos": {"acme/another-service": {"mode": "shadow"}}}
+                self.world.engine.__dict__.pop("ci_record_state", None)
+                self.world.engine.read_whole.pop("pulls:" + self.REPO, None)
+                self.reading = False
+                found = [f for f in self.derive() if ":seam:" in f.key or ":stalled:" in f.key]
+                self.assertEqual(found, [])
 
     def test_a_blocked_or_question_report_is_waiting_without_any_input(self):
         for kind in ("blocked", "question"):

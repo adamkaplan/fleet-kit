@@ -8462,95 +8462,149 @@ def _stalled_age(seconds):
     return "%dm" % (seconds // 60) if hours < 1 else "%.1fh" % hours
 
 
-WAITING_GUARDS = ("last-report", "awaiting-issue", "awaiting-pr", "ci", "review-requested", "review-window", "reminder", "decision")   # #816: every guard the predicate knows; `codes` of its answer are drawn from here
+class _Unread(Exception):
+    """A guard's input could not be read: the predicate answers "unread" and the caller says nothing."""
+
+
+def _guard_last_report(w):
+    if isinstance(w.last, dict) and w.last.get("state") in ("blocked", "question"):
+        return ["its last report is %s" % w.last["state"]]
+    return []
+
+
+def _guard_awaiting_issue(w):
+    return ["an awaiting label on the issue"] if w.issue_labels & w.awaiting else []
+
+
+def _guard_awaiting_pr(w):
+    return ["an awaiting label on pull request #%d" % r["number"] for r in w.mine
+            if {(l.get("name") if isinstance(l, dict) else l) for l in (r.get("labels") or [])} & w.awaiting]
+
+
+def _guard_ci(w):
+    found = []
+    for r in w.mine:
+        number, head = r["number"], (r.get("head") or {}).get("sha") if isinstance(r.get("head"), dict) else None
+        held = (getattr(w.state, "pr_state", None) or {}).get("%s#%d" % (w.key, number)) or {}
+        if held.get("head") == head and held.get("examined_head") == head and any(
+                isinstance(c, dict) and str(c.get("conclusion") or "").lower() in STALLED_RUNNING_CHECKS for c in (held.get("checks") or [])):
+            found.append("CI is running at the head of #%d" % number)
+    return found
+
+
+def _guard_review_requested(w):
+    return ["a review is requested on #%d" % r["number"] for r in w.mine if not r.get("draft") and (r.get("requested_reviewers") or r.get("requested_teams"))]
+
+
+def _guard_review_window(w):
+    found = []
+    for r in w.mine:
+        if r.get("draft") or r.get("requested_reviewers") or r.get("requested_teams"):
+            continue   # a draft awaits no review; a requested one is the guard above
+        created = parse_iso(r.get("created_at"))
+        if created is None:
+            raise _Unread()   # the age of the pull request cannot be told: fails toward saying nothing
+        if w.now - created < w.window:
+            found.append("#%d is younger than the review window" % r["number"])
+    return found
+
+
+def _guard_reminder(w):
+    try:
+        reminders = read_reminders(w.engine.state_dir)
+    except ReminderError:
+        raise _Unread() from None
+    for reminder in reminders:
+        at = reminder.get("at")
+        if not _is_number(at):
+            raise _Unread()   # a reminder whose time cannot be read: fails toward saying nothing
+        if (reminder.get("to") == w.observation.name and reminder.get("issue") == w.issue and at > w.now
+                and "while_running" not in (reminder.get("condition") or {})):   # the checkpoint `launch` sets is the boss's, not the worker waiting
+            return ["it set a reminder for later"]
+    return []
+
+
+def _guard_decision(w):
+    body = read_decisions_file(w.engine.state_dir / DECISIONS_FILE)
+    if body is None:
+        raise _Unread()
+    refs = {(w.key, w.issue)} | {(w.key, r["number"]) for r in w.mine}
+    for d in body["decisions"]:
+        if not isinstance(d, dict):
+            continue
+        ref = sweep_ref_of(d, w.repo)
+        if d.get("tier", "human") == "human" and ref and (plan_ledger.normal_repo(ref[0]), ref[1]) in refs:
+            return ["a decision waits on the owner"]
+    return []
+
+
+# #816: THE table of waiting guards: name -> (needs the daemon's lists, check). The predicate LOOPS OVER it, so a guard cannot exist in code and
+# not here, and the tests are parametrised over it (a new row fails the completeness test until its case is added).
+WAITING_GUARDS = {
+    "last-report": (False, _guard_last_report),
+    "awaiting-issue": (True, _guard_awaiting_issue),
+    "awaiting-pr": (True, _guard_awaiting_pr),
+    "ci": (True, _guard_ci),
+    "review-requested": (True, _guard_review_requested),
+    "review-window": (True, _guard_review_window),
+    "reminder": (True, _guard_reminder),
+    "decision": (True, _guard_decision),
+}
 
 
 def legitimately_waiting(engine, observation, issue, repo, last):
     """#816: THE shared predicate of the idle-at-a-seam rule and the stalled-working rule. Reads only what the daemon already holds (the last
     report record, the issue list, the open-PR list and its cached check state, the reminders, the decision list), never GitHub.
-    Returns a namespace: `state` is "unread" (an input was not read whole or not readable: the caller says nothing), "waiting" (`reason` names
-    the guard: it is legitimately waiting, the caller says nothing and the stretch is NOT consumed because nothing is stored) or "clear";
-    `issue_at`, `pr`, `number`, `head`, `pr_at` describe what it found for the caller's movement judgement. Guards: its last report is blocked
-    or question; an awaiting label on the issue or its pull request; CI running or queued at the head of a pull request naming the issue; a
-    review requested on a non-draft pull request, or one younger than `review_window_minutes` (the list holds no reviews, so "no review yet" is
-    the window; a draft awaits no review); a reminder due later naming the issue (not the checkpoint `launch` sets); a human-tier decision for the issue or its
-    pull request."""
+    Returns a namespace: `state` is "unread" (an input was not read whole or not readable: the caller says nothing), "waiting" (`codes` names the
+    guards from WAITING_GUARDS that hold, `reason` says why: the caller says nothing and the stretch is NOT consumed because nothing is stored)
+    or "clear"; `issue_at`, `pr`, `number`, `head`, `pr_at` describe what it found for the caller's movement judgement. A review is pending when
+    one is requested on a non-draft pull request, or such a pull request is younger than `review_window_minutes` (the list holds no reviews, so
+    "no review yet" is the window). Without the daemon's whole lists (a repository outside `plan_gates` never gets its open-PR list read) the
+    answer is "unread": both rules are silent there, by the read-whole rule."""
     out = types.SimpleNamespace(state="unread", reason="", codes=[], issue_at=None, pr=None, number=None, head=None, pr_at=None)
-    now = engine.now()
-    if isinstance(last, dict) and last.get("state") in ("blocked", "question"):
-        out.state, out.reason, out.codes = "waiting", "its last report is %s" % last["state"], ["last-report"]
-        return out
-    key = plan_ledger.normal_repo(repo)
-    wanted = ["issues:" + repo, "decisions", "pulls:" + key]
-    if any(not whole(engine, name)[0] for name in wanted):
-        return out
-    listed_at = engine.read_whole["pulls:" + key].get("at")
-    if not _is_number(listed_at) or now - listed_at > STALLED_LIST_MAX_AGE:
-        return out   # an open-PR list that is not being re-read is no evidence
-    units = getattr(getattr(engine, "triage", None), "units", None) or {}
-    records = (units.get((repo, "issues")) or {}).get("data") or []
-    item = next((r for r in records if isinstance(r, dict) and r.get("number") == issue and "pull_request" not in r), None)
-    out.issue_at = parse_iso(item.get("updated_at")) if item else None
-    if item is None or out.issue_at is None:
-        return out
-    state = getattr(engine, "ci_record_state", None)
-    pulls = ((getattr(state, "lists", None) or {}).get(key) or (0, []))[1]
-    mine = [r for r in pulls if isinstance(r, dict) and isinstance(r.get("number"), int)
-            and any(isinstance(ref, list) and ref[1] == issue and plan_ledger.normal_repo(ref[0] or repo) == key
-                    for ref in pr_body_refs(r.get("body")))]
-    pr = max(mine, key=lambda r: parse_iso(r.get("updated_at")) or 0, default=None)   # the newest-moved one when several name the issue
-    if pr is not None:
-        out.pr, out.number = pr, pr["number"]
-        out.head = (pr.get("head") or {}).get("sha") if isinstance(pr.get("head"), dict) else None
-        out.pr_at = parse_iso(pr.get("updated_at"))
-        if not isinstance(out.head, str) or out.pr_at is None:
-            return out
-    window = engine.config.get("review_window_minutes", 60) * 60
-    reasons = []
-    awaiting = triage_awaiting_labels(engine)
-    labels = {(l.get("name") if isinstance(l, dict) else l) for l in (item.get("labels") or [])}
-    if labels & awaiting:
-        reasons.append(("awaiting-issue", "an awaiting label on the issue"))
-    for r in mine:
-        number, head = r["number"], (r.get("head") or {}).get("sha") if isinstance(r.get("head"), dict) else None
-        if {(l.get("name") if isinstance(l, dict) else l) for l in (r.get("labels") or [])} & awaiting:
-            reasons.append(("awaiting-pr", "an awaiting label on pull request #%d" % number))
-        held = (getattr(state, "pr_state", None) or {}).get("%s#%d" % (key, number)) or {}
-        if held.get("head") == head and held.get("examined_head") == head and any(
-                isinstance(c, dict) and str(c.get("conclusion") or "").lower() in STALLED_RUNNING_CHECKS for c in (held.get("checks") or [])):
-            reasons.append(("ci", "CI is running at the head of #%d" % number))
-        if not r.get("draft"):
-            if r.get("requested_reviewers") or r.get("requested_teams"):
-                reasons.append(("review-requested", "a review is requested on #%d" % number))
-            else:
-                created = parse_iso(r.get("created_at"))
-                if created is None:
-                    return out   # the age of the pull request cannot be told: fails toward saying nothing
-                if now - created < window:
-                    reasons.append(("review-window", "#%d is younger than the review window" % number))
+    now, key = engine.now(), plan_ledger.normal_repo(repo)
+    w = types.SimpleNamespace(engine=engine, observation=observation, issue=issue, repo=repo, key=key, last=last, now=now, mine=[], issue_labels=set(),
+                              awaiting=set(), state=getattr(engine, "ci_record_state", None), window=engine.config.get("review_window_minutes", 60) * 60)
+    found = []
+    def run(early):
+        for name, (needs, check) in WAITING_GUARDS.items():
+            if needs != (not early):
+                continue
+            for text in check(w):
+                found.append((name, text))
     try:
-        for reminder in read_reminders(engine.state_dir):
-            at = reminder.get("at")
-            if not _is_number(at):
-                return out   # a reminder whose time cannot be read: fails toward saying nothing
-            if (reminder.get("to") == observation.name and reminder.get("issue") == issue and at > now
-                    and "while_running" not in (reminder.get("condition") or {})):   # the checkpoint `launch` sets is the boss's, not the worker waiting
-                reasons.append(("reminder", "it set a reminder for later"))
-                break
-    except ReminderError:
+        run(True)
+        if found:
+            out.state, out.codes, out.reason = "waiting", [n for n, _ in found], "; ".join(t for _, t in found)
+            return out
+        if any(not whole(engine, name)[0] for name in ("issues:" + repo, "decisions", "pulls:" + key)):
+            return out
+        listed_at = engine.read_whole["pulls:" + key].get("at")
+        if not _is_number(listed_at) or now - listed_at > STALLED_LIST_MAX_AGE:
+            return out   # an open-PR list that is not being re-read is no evidence
+        units = getattr(getattr(engine, "triage", None), "units", None) or {}
+        records = (units.get((repo, "issues")) or {}).get("data") or []
+        item = next((r for r in records if isinstance(r, dict) and r.get("number") == issue and "pull_request" not in r), None)
+        out.issue_at = parse_iso(item.get("updated_at")) if item else None
+        if item is None or out.issue_at is None:
+            return out
+        pulls = ((getattr(w.state, "lists", None) or {}).get(key) or (0, []))[1]
+        w.mine = [r for r in pulls if isinstance(r, dict) and isinstance(r.get("number"), int)
+                  and any(isinstance(ref, list) and ref[1] == issue and plan_ledger.normal_repo(ref[0] or repo) == key for ref in pr_body_refs(r.get("body")))]
+        pr = max(w.mine, key=lambda r: parse_iso(r.get("updated_at")) or 0, default=None)   # the newest-moved one when several name the issue
+        if pr is not None:
+            out.pr, out.number = pr, pr["number"]
+            out.head = (pr.get("head") or {}).get("sha") if isinstance(pr.get("head"), dict) else None
+            out.pr_at = parse_iso(pr.get("updated_at"))
+            if not isinstance(out.head, str) or out.pr_at is None:
+                return out
+        w.awaiting = triage_awaiting_labels(engine)
+        w.issue_labels = {(l.get("name") if isinstance(l, dict) else l) for l in (item.get("labels") or [])}
+        run(False)
+    except _Unread:
+        out.state = "unread"
         return out
-    body = read_decisions_file(engine.state_dir / DECISIONS_FILE)
-    if body is None:
-        return out
-    refs = {(key, issue)} | {(key, r["number"]) for r in mine}
-    for d in body["decisions"]:
-        if not isinstance(d, dict):
-            continue
-        ref = sweep_ref_of(d, repo)
-        if d.get("tier", "human") == "human" and ref and (plan_ledger.normal_repo(ref[0]), ref[1]) in refs:
-            reasons.append(("decision", "a decision waits on the owner"))
-            break
-    out.state, out.reason, out.codes = ("waiting", "; ".join(t for _, t in reasons), [c for c, _ in reasons]) if reasons else ("clear", "", [])
+    out.state, out.codes, out.reason = ("waiting", [n for n, _ in found], "; ".join(t for _, t in found)) if found else ("clear", [], "")
     return out
 
 
