@@ -23168,6 +23168,62 @@ class TestSweep(Base):
         self.sweep_real([])
         self.assertEqual(len(pending()), 1)                                          # past the window: once
 
+    # #849: `woken` says a wake was queued; a restart does not re-log. Driven through the REAL sweep_decisions, with the
+    # finding source (sweep_findings) and its fresh re-read (sweep_verify) fixed to one finding of the kind under test,
+    # so every member of SWEEP_KINDS (the table the code loops over) gets the same cases.
+    def one_finding(self, kind):
+        ref = "acme/api#%d" % (abs(hash(kind)) % 900 + 50)
+        return ref, mock.patch.multiple(sb, sweep_findings=lambda *a, **k: [(kind, ref)], sweep_verify=lambda *a, **k: True)
+
+    def lines(self, ref):
+        return [e["detail"] for e in self.world.audit() if e["event"] == "sweep.finding" and e["detail"]["ref"] == ref]
+
+    def test_849_a_due_finding_is_logged_once_woken_and_a_not_due_one_reads_woken_false(self):
+        for kind in sorted(sb.SWEEP_KINDS):
+            with self.subTest(kind=kind):
+                self.setUp()
+                ref, patch = self.one_finding(kind)
+                with patch:
+                    self.world.tick(86400 - self.world.clock.now() % 86400 - 60)    # one minute before UTC midnight
+                    self.sweep_real([])
+                    self.sweep_real([])                                              # same day: once
+                    self.assertEqual([d["woken"] for d in self.lines(ref)], [True])
+                    self.assertEqual(len(self.engine.sweep.facts), 1)
+                    self.world.tick(120)                                             # the next day, inside the re-alarm window
+                    self.sweep_real([])
+                    self.assertEqual([d["woken"] for d in self.lines(ref)], [True, False])   # logged, not due: nothing woken
+                    self.assertEqual(len(self.engine.sweep.facts), 1)
+
+    def test_849_a_finding_raised_before_a_restart_is_not_logged_or_woken_again(self):
+        for kind in sorted(sb.SWEEP_KINDS):
+            with self.subTest(kind=kind):
+                self.setUp()
+                ref, patch = self.one_finding(kind)
+                with patch:
+                    self.world.tick(1)
+                    self.sweep_real([])
+                    self.assertEqual(len(self.lines(ref)), 1)
+                    self.engine.sweep = None                                          # the daemon restarts
+                    self.world.tick(3600)
+                    self.sweep_real([])
+                    self.assertEqual(len(self.lines(ref)), 1)                         # not logged again
+                    self.assertEqual(self.engine.sweep.facts, {})                     # not woken
+                    self.engine.sweep = None
+                    self.world.tick(7 * 3600)                                         # past the window: woken again
+                    self.sweep_real([])
+                    self.assertEqual(len(self.engine.sweep.facts), 1)
+
+    def test_849_shadow_mode_logs_woken_false_and_queues_nothing(self):
+        for kind in sorted(sb.SWEEP_KINDS):
+            with self.subTest(kind=kind):
+                self.setUp()
+                self.engine.config["sweep"]["enabled"] = False
+                ref, patch = self.one_finding(kind)
+                with patch:
+                    self.sweep_real([])
+                    self.assertEqual([d["woken"] for d in self.lines(ref)], [False])
+                    self.assertEqual(self.engine.sweep.facts, {})
+
     def test_s14_an_s2_finding_names_the_body_or_the_comment_that_raised_it(self):
         self.engine.config["triage"] = {"our_logins": ["bot"]}
         self.hub.open = {10: sweep_issue(10, "Held for Alex", pr=True), 12: sweep_issue(12, "fine", pr=True)}
@@ -24298,6 +24354,67 @@ class TestTriage(Base):
         self.assertEqual([f for f in self.found() if f[1] == "acme/api#120"], [("OO", "acme/api#120")])
         row = [e for e in self.world.audit() if e["event"] == "triage.finding" and e["detail"]["rule"] == "OO"][0]
         self.assertEqual(row["detail"]["evidence"]["would_be"], ["T1", "T2", "T3"])
+
+    # #849: `woken` says a wake was queued; a restart does not re-log. Driven through the REAL triage_pass, with the finding
+    # source (triage_findings) and its fresh re-read (triage_verify) fixed to one finding of the rule under test, so every
+    # member of TRIAGE_KINDS (the table the code loops over) gets the same cases. An OO flag is never a wake of its own.
+    def one_rule(self, rule):
+        ref = "acme/api#%d" % (abs(hash(rule)) % 900 + 50)
+        return ref, mock.patch.multiple(sb, triage_findings=lambda *a, **k: ([(rule, ref, {})], {}, []),
+                                        triage_verify=lambda *a, **k: True)
+
+    def tlines(self, ref):
+        return [e["detail"] for e in self.world.audit() if e["event"] == "triage.finding" and e["detail"]["ref"] == ref]
+
+    def pass_now(self):
+        sb.triage_pass(self.engine, [], self.world.clock.now(), ())
+
+    def aligned(self):
+        """Tick to one minute before UTC midnight: a pass now and one two minutes later are on different days, inside the window."""
+        self.world.tick(86400 - self.world.clock.now() % 86400 - 60)
+
+    def test_849_the_audit_cases_run_over_every_rule_of_the_table(self):
+        self.assertEqual(set(sb.TRIAGE_KINDS), {"T%d" % n for n in (1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12)} | {"OO"})
+
+    def test_849_a_due_finding_is_woken_and_a_logged_one_not_due_reads_woken_false(self):
+        for rule in sorted(sb.TRIAGE_KINDS):
+            with self.subTest(rule=rule):
+                self.setUp()
+                self.engine.config["triage"]["enabled"] = True
+                ref, patch = self.one_rule(rule)
+                with patch:
+                    self.aligned()
+                    self.pass_now()
+                    self.world.tick(120)                                             # the next day, inside the window
+                    self.pass_now()
+                    # an OO flag is never woken, so its second line is the first one again (the audit writes a repeat once)
+                    self.assertEqual([d["woken"] for d in self.tlines(ref)], [False] if rule == "OO" else [True, False])
+                    self.assertEqual(len([k for k in self.engine.triage.facts if k.startswith("triage:")]), 0 if rule == "OO" else 1)
+
+    def test_849_a_finding_listed_before_a_restart_is_not_logged_again(self):
+        for rule in sorted(set(sb.TRIAGE_KINDS) - {"OO"}):   # an OO flag is never listed in the memory
+            with self.subTest(rule=rule):
+                self.setUp()
+                self.engine.config["triage"]["enabled"] = True
+                ref, patch = self.one_rule(rule)
+                with patch:
+                    self.aligned()
+                    self.pass_now()
+                    self.assertEqual([d["woken"] for d in self.tlines(ref)], [True])
+                    self.engine.triage = None                                        # the daemon restarts
+                    self.world.tick(120)
+                    self.pass_now()
+                    self.assertEqual(len(self.tlines(ref)), 1)                       # not logged again
+
+    def test_849_shadow_mode_logs_woken_false_for_every_rule(self):
+        for rule in sorted(sb.TRIAGE_KINDS):
+            with self.subTest(rule=rule):
+                self.setUp()
+                ref, patch = self.one_rule(rule)
+                with patch:
+                    self.pass_now()
+                    self.assertEqual([d["woken"] for d in self.tlines(ref)], [False])
+                    self.assertEqual(self.engine.triage.facts, {})
 
     def merged_pr(self, number, body, hours_ago=2.0, merged=True, author="bot"):
         record = {"number": number, "body": body, "user": {"login": author}, "html_url": "https://evil.example/\x1b[31m%d" % number,
