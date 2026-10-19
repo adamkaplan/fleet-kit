@@ -38700,13 +38700,32 @@ class TestDaemonCommand(Base):
         self.assertEqual([v for v in self.launchctl_verbs() if v in ("bootstrap", "bootout", "kickstart")], [])
         self.assertEqual(self.kills, [(4242, signal.SIGTERM), (4200, signal.SIGTERM)])
 
-    ARGV_VARIANTS = (("/usr/bin/python3 /k/bin/fleet-switchboard run", True), ("/k/bin/fleet-switchboard run", True),
-                     ("/usr/bin/python3 -B /k/bin/fleet-switchboard run --standby", True), ("python3 fleet-switchboard run --poll 30", True),
+    FRAMEWORK = "/Library/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python"
+    # (argv as `ps` prints it, accepted): a future real shape is one row
+    ARGV_VARIANTS = ((FRAMEWORK + " /home/user/Code/fleet-kit/bin/fleet-switchboard run", True),
+                     (FRAMEWORK + " -B /home/user/Code/fleet-kit/bin/fleet-switchboard run --standby", True),
+                     ("/home/user/venv/bin/python /k/bin/fleet-switchboard run", True), ("/usr/bin/python3 /k/bin/fleet-switchboard run", True),
+                     ("python3.13 /k/bin/fleet-switchboard run", True), ("/usr/bin/pythonw /k/bin/fleet-switchboard run", True),
+                     ("/k/bin/fleet-switchboard run", True), ("fleet-switchboard run", True),
+                     ("/usr/bin/python3 -B /k/bin/fleet-switchboard run --standby", True),
                      ("/usr/bin/python3 /k/bin/fleet-switchboard status run", False), ("/usr/bin/python3 /k/bin/fleet-switchboard --x run", False),
                      ("/usr/bin/python3 /k/bin/fleet-switchboard prerun", False), ("/usr/bin/python3 /k/bin/fleet-switchboard run; id", False),
+                     ("/usr/bin/python3 /k/bin/fleet-switchboard run --poll 30", False), ("/usr/bin/python3 /k/bin/fleet-switchboard run --once", False),
                      ("/usr/bin/vim /k/bin/fleet-switchboard run", False), ("/usr/bin/python3 /k/bin/other-tool run", False),
                      ("/usr/bin/python3 /k/bin/fleet-switchboard run notes.txt", False), ("/usr/bin/python3 /k/bin/not-fleet-switchboard run", False),
-                     ("fleet-switchboard", False), ("run", False), ("", False))
+                     ("/usr/bin/python3 /k/bin/fleet-switchboard", False), ("fleet-switchboard", False), ("run", False), ("", False))
+
+    def test_the_real_check_accepts_a_throwaway_daemon_shaped_process_and_refuses_its_lookalike(self):
+        """Against REAL `ps` and a real child this test owns (never the live daemon): a script named fleet-switchboard, launched by shebang."""
+        script_dir = Path(tempfile.mkdtemp(dir=str(self.home)))
+        script = script_dir / "fleet-switchboard"
+        script.write_text("#!%s\nimport time\ntime.sleep(30)\n" % sys.executable)
+        script.chmod(0o755)
+        children = [subprocess.Popen([str(script), arg]) for arg in ("run", "status")]
+        self.addCleanup(lambda: [(c.kill(), c.wait()) for c in children])
+        time.sleep(0.5)
+        verdicts = [sb.daemon_process_is_ours(subprocess.run, c.pid)[0] for c in children]
+        self.assertEqual(verdicts, [True, False])
 
     def test_every_place_that_decides_this_pid_is_the_daemon_takes_only_the_exact_argv_shape(self):
         """The places: `daemon stop` (and so `daemon restart`'s stop), the old `restart`, and both through daemon_process_is_ours -> daemon_argv_is_ours.

@@ -28984,17 +28984,18 @@ def daemon_process_is_ours(runner, pid):
 
 
 def daemon_argv_is_ours(command):
-    """The ONE shape that is this program's `run`: [python [-flags]] <path>/fleet-switchboard run [-flags or numbers]. A different program in front,
-    `run` not right after the program, `run` inside another word, another verb or an unreadable command line is not it."""
+    """The ONE shape that is this program's `run`, by argument shape and not by which interpreter it is: [a Python interpreter (any case: python,
+    python3.13, Python, pythonw, the macOS framework Python.app) with its own leading -flags, or nothing for a shebang-launched script]
+    <path>/fleet-switchboard run [--standby]. Nothing else: a different program, `run` not right after the program, `run` inside another
+    word, another flag or an unreadable command line is not it. (`--standby` is the one flag the service's own command line carries.)"""
     words = command.split()
     index = 0
-    if words and re.fullmatch(r"python[0-9.]*", os.path.basename(words[0])):
+    if words and re.fullmatch(r"pythonw?[0-9.]*", os.path.basename(words[0]), re.IGNORECASE):
         index = 1
         while index < len(words) and words[index].startswith("-"):
             index += 1
-    if len(words) < index + 2 or os.path.basename(words[index]) != PROG or words[index + 1] != "run":
-        return False
-    return all(word.startswith("-") or word.isdigit() for word in words[index + 2:])
+    rest = words[index:]
+    return len(rest) >= 2 and os.path.basename(rest[0]) == PROG and rest[1:] in (["run"], ["run", "--standby"])
 
 
 def daemon_pid_refusal(pid):
