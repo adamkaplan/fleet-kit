@@ -103,13 +103,15 @@ def _m_users(p): p["spec"]["hostUsers"] = True
 def _m_caps(p): p["spec"]["containers"][0]["securityContext"]["capabilities"]["add"] = ["SYS_ADMIN"]
 def _m_ctx(p): p["spec"]["containers"][0]["securityContext"]["capabilities"]["add"] = ["NET_RAW"]
 def _m_shape(p): p["spec"]["runtimeClassName"] = "runc"
+def _m_rest(p): p["spec"]["nodeName"] = "node-1"
 def _m_token(p): p["spec"]["automountServiceAccountToken"] = True
 
 
+REST = "stack pod has a field or object outside the stack allow-list"
 MUTANTS = {"hostPath": _m_hostpath, "docker.sock": _m_sock, "privileged": _m_priv, "hostNetwork": _m_net, "hostPID": _m_pid,
            "hostIPC": _m_ipc, "hostUsers true": _m_users, "capabilities add SYS_ADMIN/ALL": _m_caps, "service-account token": _m_token,
-           "stack security context differs from STACK_SECURITY_CONTEXT": _m_ctx, "stack pod shape differs": _m_shape}
-STACK_ONLY = {"stack security context differs from STACK_SECURITY_CONTEXT", "stack pod shape differs"}
+           "stack security context differs from STACK_SECURITY_CONTEXT": _m_ctx, "stack pod shape differs": _m_shape, REST: _m_rest}
+STACK_ONLY = {"stack security context differs from STACK_SECURITY_CONTEXT", "stack pod shape differs", REST}
 ALLOW = sorted(STACK_ONLY)
 
 
@@ -141,7 +143,7 @@ class ForbiddenFieldsTable(unittest.TestCase):
         self.assertIn("capabilities add SYS_ADMIN/ALL", cw.forbidden_pod_fields(pod))
         pod = build(_args(stack=True))
         pod["spec"]["volumes"].append({"name": "t", "projected": {"sources": [{"serviceAccountToken": {"path": "t"}}]}})
-        self.assertEqual(cw.forbidden_pod_fields(pod), ["service-account token"])
+        self.assertIn("service-account token", cw.forbidden_pod_fields(pod))   # (the extra volume also trips the allow-list row)
 
     def test_render_refuses_a_stack_context_that_adds_a_member(self):   # kills: the check in render_pod removed
         for add in (["SYS_ADMIN"], ["ALL"]):
@@ -357,6 +359,144 @@ class StackShapeFamily(unittest.TestCase):
         pod = build(_args(stack=False))
         pod["spec"]["runtimeClassName"] = "sysbox-runc"
         self.assertIn(self.ROW, cw.forbidden_pod_fields(pod))
+
+
+def _freeze(pod):
+    return json.dumps(pod, indent=2, sort_keys=True)
+
+
+STACK_CASES = {"stack": (_args(stack=True), ()),
+               "stack_shape_m_run_secrets_pull": (_args(stack=True, shape="M", run_id="abcdef0123456789", pull_secret="regcred"), ("deploy-key", "npm-token-file"))}
+
+
+class StackPodFrozen(unittest.TestCase):
+    """The pod `create --stack` builds is pinned like the default pod: ANY added container, field, volume or env fails here.
+    A deliberate change to the stack pod updates tests/fixtures/stack_pod.json (regenerate with the command in the README)
+    in the same commit as the constant or builder edit. An image by TAG is accepted by design: the operator picks the image."""
+    PATH = os.path.join(HERE, "fixtures", "stack_pod.json")
+
+    def built(self):
+        return {k: build(a, n) for k, (a, n) in STACK_CASES.items()}
+
+    def test_the_stack_pod_equals_the_frozen_fixture(self):
+        if os.environ.get("CW_WRITE_STACK_FIXTURE"):
+            with open(self.PATH, "w") as f:
+                f.write(json.dumps(self.built(), indent=2, sort_keys=True) + "\n")
+        with open(self.PATH) as f:
+            stored = f.read()
+        self.assertEqual(json.dumps(self.built(), indent=2, sort_keys=True) + "\n", stored)
+
+    def test_the_fixture_is_clean_and_is_a_stack_pod(self):   # the frozen file itself is never a forbidden pod
+        with open(self.PATH) as f:
+            for k, pod in json.load(f).items():
+                with self.subTest(case=k):
+                    self.assertEqual(cw.forbidden_pod_fields(pod), [])
+                    self.assertEqual(pod["spec"]["runtimeClassName"], "sysbox-runc")
+
+
+def _sidecar(p): p["spec"]["containers"].append(copy.deepcopy(p["spec"]["containers"][0]) | {"name": "side"})
+def _renamed(p): p["spec"]["containers"][0]["name"] = "other"
+def _init(p): p["spec"]["initContainers"] = [{"name": "i", "image": "x", "securityContext": copy.deepcopy(cw.STACK_SECURITY_CONTEXT)}]
+def _ephemeral(p): p["spec"]["ephemeralContainers"] = [{"name": "e", "image": "x", "securityContext": copy.deepcopy(cw.STACK_SECURITY_CONTEXT)}]
+def _psc(key, val): return lambda p: p["spec"]["securityContext"].__setitem__(key, val)
+def _spec(key, val): return lambda p: p["spec"].__setitem__(key, val)
+def _ctr(key, val): return lambda p: p["spec"]["containers"][0].__setitem__(key, val)
+def _env(e): return lambda p: p["spec"]["containers"][0]["env"].append(e)
+def _vol(v): return lambda p: p["spec"]["volumes"].append(v)
+def _meta(key, val): return lambda p: p["metadata"].__setitem__(key, val)
+def _unlimit(p): del p["spec"]["containers"][0]["resources"]["limits"]["memory"]
+def _tokens_disk(p): [v for v in p["spec"]["volumes"] if v["name"] == "tokens"][0]["emptyDir"] = {}
+def _mount(p): p["spec"]["containers"][0]["volumeMounts"].append({"name": "scratch", "mountPath": "/etc"})
+def _pw_gone(p): p["spec"]["volumes"] = [v for v in p["spec"]["volumes"] if v["name"] != "pw"]
+def _pw_host(p): [v for v in p["spec"]["volumes"] if v["name"] == "pw"][0]["configMap"] = {"name": "c"}
+def _pw_swapped(p): p["spec"]["volumes"] = [{"name": "pw", "configMap": {"name": "c"}} if v["name"] == "pw" else v for v in p["spec"]["volumes"]]
+def _no_probe(p): del p["spec"]["containers"][0]["readinessProbe"]
+def _no_sa(p): p["spec"]["serviceAccountName"] = ""
+def _restart(p): p["spec"]["restartPolicy"] = "Always"
+def _empty_image(p): p["spec"]["containers"][0]["image"] = ""
+
+
+# one case per field the reviewers named (and its sibling): each must put the pod in the allow-list row or the pod-shape row
+REST_CASES = {
+    "second container": _sidecar, "container renamed": _renamed, "init container": _init, "ephemeral container": _ephemeral,
+    "fsGroup 0": _psc("fsGroup", 0), "runAsGroup 0": _psc("runAsGroup", 0), "supplementalGroups [0]": _psc("supplementalGroups", [0]),
+    "sysctls": _psc("sysctls", [{"name": "kernel.shm_rmid_forced", "value": "1"}]), "seLinuxOptions": _psc("seLinuxOptions", {"type": "spc_t"}),
+    "nodeName": _spec("nodeName", "n1"), "serviceAccountName removed": _no_sa, "hostAliases": _spec("hostAliases", [{"ip": "1.2.3.4", "hostnames": ["x"]}]),
+    "tolerations": _spec("tolerations", [{"operator": "Exists"}]), "shareProcessNamespace": _spec("shareProcessNamespace", True),
+    "dnsPolicy": _spec("dnsPolicy", "None"), "dnsConfig": _spec("dnsConfig", {"nameservers": ["1.1.1.1"]}),
+    "priorityClassName": _spec("priorityClassName", "system-node-critical"), "hostname": _spec("hostname", "h"),
+    "restartPolicy": _restart, "extra emptyDir": _vol({"name": "x", "emptyDir": {}}), "extra secret volume": _vol({"name": "x", "secret": {"secretName": "s"}}),
+    "extra configMap volume": _vol({"name": "x", "configMap": {"name": "c"}}), "pw volume gone": _pw_gone, "pw volume with a configMap": _pw_host, "pw volume swapped for a configMap": _pw_swapped,
+    "tokens volume on disk": _tokens_disk, "secretKeyRef env": _env({"name": "K", "valueFrom": {"secretKeyRef": {"name": "s", "key": "k"}}}),
+    "envFrom a secret": _ctr("envFrom", [{"secretRef": {"name": "s"}}]), "hostPort": _ctr("ports", [{"containerPort": 1, "hostPort": 1}]),
+    "command changed": _ctr("command", ["sh"]), "args": _ctr("args", ["-c"]), "limits removed": _unlimit, "resources removed": _ctr("resources", {}),
+    "readiness probe removed": _no_probe, "mount path": _mount, "empty image": _empty_image, "workingDir": _ctr("workingDir", "/"),
+    "lifecycle": _ctr("lifecycle", {"postStart": {}}), "extra metadata key": _meta("ownerReferences", []),
+}
+
+
+class StackRestAllowList(unittest.TestCase):
+    def test_every_named_field_is_refused(self):   # kills: any part of _stack_rest_differs / the whole-context equality dropped
+        for name, mutate in REST_CASES.items():
+            with self.subTest(field=name):
+                pod = build(_args(stack=True))
+                mutate(pod)
+                self.assertTrue({cw_row for cw_row in cw.forbidden_pod_fields(pod)} & {REST, "stack pod shape differs", "stack security context differs from STACK_SECURITY_CONTEXT"}, name)
+
+    def test_the_same_pod_is_fine_without_the_stack(self):   # the rows are for stack pods only (the default pod is pinned by U1)
+        pod = build(_args(stack=False))
+        _spec("tolerations", [{"operator": "Exists"}])(pod)
+        self.assertEqual(cw.forbidden_pod_fields(pod), [])
+
+    def test_render_refuses_a_stack_builder_that_sets_an_unlisted_key(self):   # kills: the check in render_pod removed (the real path)
+        orig = cw.STACK_SPEC_KEYS
+        try:
+            cw.STACK_SPEC_KEYS = orig - {"nodeSelector"}   # the builder sets a key the allow-list no longer allows
+            with self.assertRaises(cw.CloudError):
+                build(_args(stack=True))
+        finally:
+            cw.STACK_SPEC_KEYS = orig
+
+
+class StackCreateObjects(FreshNodeRace):
+    """The objects a create makes BESIDES the pod (listed from `go`: the password Secret `<pod>-pw`, the run Secret `<pod>-run`
+    with its labels, and the run record, which `stop` writes under the operator's own record dir and is not stack-specific)
+    are the same for a stack create and a default create: pinned by equality, and to the frozen fixture."""
+    PATH = os.path.join(HERE, "fixtures", "stack_create_objects.json")
+
+    def objects(self, *extra):
+        import os as _os
+        fds = []
+        for v in ("model-value-0123456789", "git-value-0123456789"):
+            r, w = _os.pipe(); _os.write(w, v.encode()); _os.close(w); fds.append(r)
+        try:
+            c, _, err = self.run_cli("create", "coder7", "--repo", "acme-org/widget-service", "--branch", "main", "--run-id", self.RUN_ID,
+                                     "--pull-secret", "regcred", "--run-secret-fd", "model-key=%d" % fds[0], "--run-secret-fd", "git-key=%d" % fds[1], *extra)
+        finally:
+            for f in fds:
+                try: _os.close(f)
+                except OSError: pass
+        self.assertEqual(c, 0, err)
+        st = self.st()
+        applied = [o for o in st["applied"] if o["kind"] != "Pod"]
+        for o in applied:
+            if "stringData" in o:
+                o["stringData"] = {k: "<password>" for k in o["stringData"]}
+        return {"applied": applied, "secrets": sorted(st.get("secrets", {})), "secret_labels": st.get("secret_labels", {}),
+                "secret_key_names": {k: sorted(v) for k, v in st.get("secret_keys", {}).items()}}
+
+    def test_a_stack_create_makes_the_same_other_objects_as_a_default_create(self):
+        stack = self.objects("--stack")
+        self.write_state({"pods": {}})
+        self.assertEqual(stack, self.objects())
+
+    def test_the_other_objects_equal_the_frozen_fixture(self):
+        got = json.dumps(self.objects("--stack"), indent=2, sort_keys=True) + "\n"
+        if os.environ.get("CW_WRITE_STACK_FIXTURE"):
+            with open(self.PATH, "w") as f:
+                f.write(got)
+        with open(self.PATH) as f:
+            self.assertEqual(got, f.read())
 
 
 if __name__ == "__main__":

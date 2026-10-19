@@ -77,13 +77,44 @@ def _stack_context_differs(pod):
 
 def _stack_shape_differs(pod):
     spec = pod.get("spec", {})
-    psc = spec.get("securityContext") or {}
     return _is_stack(pod) and not (
         spec.get("runtimeClassName") == STACK_RUNTIME_CLASS and spec.get("hostUsers") is False
         and spec.get("nodeSelector") == STACK_NODE_SELECTOR
         and (pod.get("metadata", {}).get("annotations") or {}).get("cw/stack") == "true"
-        and psc.get("runAsNonRoot") is True and psc.get("runAsUser") == SERVER_UID
-        and (psc.get("seccompProfile") or {}).get("type") == "RuntimeDefault")
+        and spec.get("securityContext") == POD_SECURITY_CONTEXT)   # the WHOLE pod-level context: fsGroup, runAsGroup, supplementalGroups, sysctls, seLinuxOptions...
+
+
+# The allow-list of a stack pod's REST: a key outside these sets fails, so nodeName, tolerations, hostAliases, shareProcessNamespace,
+# dnsPolicy/dnsConfig, priorityClassName, hostname, an init or ephemeral container, a hostPort... are refused until a deliberate edit
+# here (and to the frozen fixture tests/fixtures/stack_pod.json) allows them.
+STACK_METADATA_KEYS = {"name", "labels", "annotations"}
+STACK_SPEC_KEYS = {"restartPolicy", "serviceAccountName", "automountServiceAccountToken", "securityContext", "containers", "volumes",
+                   "imagePullSecrets", "runtimeClassName", "hostUsers", "nodeSelector"}
+STACK_CONTAINER_KEYS = {"name", "image", "securityContext", "env", "resources", "readinessProbe", "volumeMounts"}
+STACK_VOLUMES = {"tokens": {"name": "tokens", "emptyDir": {"medium": "Memory"}}, "scratch": {"name": "scratch", "emptyDir": {}}}
+STACK_MOUNT_PATHS = {"pw": "/run/cw", "tokens": "/run/cw-tmp", "scratch": "/work"}
+
+
+def _stack_rest_differs(pod):
+    if not _is_stack(pod):
+        return False
+    spec, ks = pod.get("spec", {}), pod.get("spec", {}).get("containers", [])
+    vols = spec.get("volumes", [])
+    pw = [v for v in vols if v.get("name") == "pw"]
+    return (
+        not set(pod.get("metadata", {})) <= STACK_METADATA_KEYS
+        or not set(spec) <= STACK_SPEC_KEYS
+        or spec.get("restartPolicy") != "Never" or not isinstance(spec.get("serviceAccountName"), str) or not spec.get("serviceAccountName")
+        or len(ks) != 1 or [k.get("name") for k in ks] != ["worker"]   # one container, named worker: no sidecar, even one with the stack context
+        or any(not set(k) <= STACK_CONTAINER_KEYS or not isinstance(k.get("image"), str) or not k.get("image") for k in ks)
+        or any(set(e) != {"name", "value"} for k in ks for e in k.get("env", []))   # no valueFrom / secretKeyRef; no envFrom (key allow-list)
+        or any(set((k.get("resources") or {})) != {"limits"} or set(k["resources"]["limits"]) != {"cpu", "memory"} for k in ks)   # limits stay
+        or any(k.get("readinessProbe") != {"tcpSocket": {"port": 4096}} for k in ks)
+        or any(set(m) - {"name", "mountPath", "readOnly"} or STACK_MOUNT_PATHS.get(m.get("name")) != m.get("mountPath")
+               for k in ks for m in k.get("volumeMounts", []))
+        or sorted(v.get("name") for v in vols) != ["pw", "scratch", "tokens"]   # no extra emptyDir, secret or configMap volume
+        or any(v != STACK_VOLUMES[v["name"]] for v in vols if v.get("name") in STACK_VOLUMES)
+        or len(pw) != 1 or len(set(pw[0]) - {"name"}) != 1 or not set(pw[0]) - {"name"} <= {"secret", "projected"})
 
 
 # The forbidden pod fields: ONE table (name -> does this pod have it). render_pod refuses a pod that has any of them (every
@@ -99,6 +130,7 @@ FORBIDDEN_POD_FIELDS = {
     "capabilities add SYS_ADMIN/ALL": lambda p: _caps_add(p, ("SYS_ADMIN", "ALL")),
     "stack security context differs from STACK_SECURITY_CONTEXT": _stack_context_differs,
     "stack pod shape differs": _stack_shape_differs,
+    "stack pod has a field or object outside the stack allow-list": _stack_rest_differs,
     "service-account token": lambda p: p.get("spec", {}).get("automountServiceAccountToken") is not False
         or any("serviceAccountToken" in (s or {}) for v in p.get("spec", {}).get("volumes", []) for s in (v.get("projected") or {}).get("sources", [])),
 }
@@ -575,6 +607,9 @@ def ann(pod, key, default=None):
 RUN_SECRET_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 RESERVED_RUN_NAMES = {"server-password"}
 SERVER_UID = 1000  # the image's non-root user
+# The pod-level security context of EVERY worker pod (the builder copies it; a stack pod must EQUAL it, whole).
+POD_SECURITY_CONTEXT = {"runAsNonRoot": True, "runAsUser": SERVER_UID, "runAsGroup": SERVER_UID, "fsGroup": SERVER_UID,
+                        "seccompProfile": {"type": "RuntimeDefault"}}
 MAX_RUN_SECRET_BYTES = 1024 * 1024  # a Kubernetes Secret holds about 1 MiB in all
 MAX_RUN_SECRETS = 8
 
@@ -637,8 +672,7 @@ def render_pod(a, worker, name, now, hard, env, run_names=()):
                         **({"cw/run-id": a.run_id} if getattr(a, "run_id", None) else {})}},
         "spec": {"restartPolicy": "Never", "serviceAccountName": env.get("CW_CLOUD_SERVICE_ACCOUNT", "cw-worker"),
                   "automountServiceAccountToken": False,
-                  "securityContext": {"runAsNonRoot": True, "runAsUser": SERVER_UID, "runAsGroup": SERVER_UID,
-                                      "fsGroup": SERVER_UID, "seccompProfile": {"type": "RuntimeDefault"}},
+                  "securityContext": copy.deepcopy(POD_SECURITY_CONTEXT),
                  "containers": [{"name": "worker", "image": image,
                                  "securityContext": {"allowPrivilegeEscalation": False, "capabilities": {"drop": ["ALL"]}}, "env": [{"name": k, "value": v} for k, v in e.items()],
                                  "resources": {"limits": {"cpu": shape["cpu"], "memory": shape["memory"]}},
