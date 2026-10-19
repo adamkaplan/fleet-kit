@@ -21812,6 +21812,157 @@ STOPPED_NEWS_RULES = [
 ]
 
 
+
+class TestStalledWorking(ReportBase):
+    """#811: a coder whose reports are all `working` for `stalled_working_hours` while nothing it owns moves wakes its boss ONCE. Real path:
+    the report record is written by `report`, the lists and marks are the ones the daemon keeps."""
+    REPO = "acme/widget-service"
+
+    def setUp(self):
+        super().setUp()
+        engine = self.world.engine
+        engine.state_dir = self.world.state
+        engine.config["intent_repo"] = self.REPO
+        self.t0 = self.world.clock.now()
+        self.head = "a" * 40
+        self.set_lists()
+        for name in ("issues:" + self.REPO, "decisions", "pulls:" + self.REPO):
+            sb.read_mark(engine, name, True, "", self.t0)
+        (self.world.state / sb.DECISIONS_FILE).write_text(json.dumps({"decisions": [], "errors": []}))
+        self.world.tick(1)
+        for _ in range(5):
+            self.report("working", "migrating the tables")
+        self.world.tick(1)
+
+    def set_lists(self, head=None, issue_labels=(), pr_labels=(), checks=None, pr=True, at=None):
+        engine, at = self.world.engine, sb.iso(self.t0 if at is None else at)
+        engine.triage = sb.TriageState()
+        engine.triage.units[(self.REPO, "issues")] = {"at": 0, "data": [
+            {"number": 2, "updated_at": at, "created_at": at, "labels": [{"name": n} for n in issue_labels]}], "truncated": False, "error": None}
+        state = engine.__dict__["ci_record_state"] = sb.CiRecordState()
+        head = head or self.head
+        records = [{"number": 9, "body": "PLAN: https://github.com/%s/issues/2\n" % self.REPO, "updated_at": at, "head": {"sha": head},
+                    "labels": [{"name": n} for n in pr_labels]}] if pr else []
+        state.lists[self.REPO] = (self.t0, records)
+        if pr and checks is not None:
+            state.pr_state["%s#9" % self.REPO] = {"head": head, "examined_head": head, "checks": [{"name": "ci", "conclusion": c} for c in checks]}
+
+    def stalled(self):
+        return [f for f in self.derive() if ":stalled:" in f.key]
+
+    def late(self, hours=2.5):
+        self.world.tick(int(hours * 3600))
+
+    def test_stalled_working_with_no_movement_wakes_the_boss_once(self):
+        self.late()
+        (wake,) = self.stalled()
+        self.assertEqual((wake.recipient, wake.kind), ("platform", "worker.idle"))
+        self.assertRegex(wake.summary, r"^no movement for 2\.5h on acme/widget-service#9 \(worker coder, 5 working reports; last: migrating the tables\)$")
+        self.assertEqual([f for f in self.derive() if f.recipient == "coder"], [], "the worker is never nagged")
+        self.world.tick(30)
+        self.assertEqual([f.key for f in self.stalled()], [wake.key], "the same stretch keeps its key")
+
+    def test_the_stretch_is_delivered_once_over_many_passes_and_again_after_a_head_move(self):
+        self.late()
+        first = [f.key for f in self.stalled()]
+        for _ in range(3):
+            self.world.engine.run_pass()
+            self.world.tick(30)
+        keys = [k for a in self.world.admissions("platform") for k in a["keys"] if ":stalled:" in k]
+        self.assertEqual(keys, first)
+        self.set_lists(head="b" * 40, at=self.world.clock.now())
+        self.assertEqual(self.stalled(), [], "a moved head is movement")
+        self.late()
+        (again,) = self.stalled()
+        self.assertNotEqual(again.key, first[0], "a second wake after the stall again, under a new key")
+
+    def test_a_head_that_changes_under_an_old_updated_time_is_movement(self):
+        self.stalled()   # the head is first seen
+        self.late()
+        self.assertEqual(len(self.stalled()), 1)
+        self.set_lists(head="c" * 40, at=self.t0)
+        self.assertEqual(self.stalled(), [])
+        self.late()
+        self.assertEqual(len(self.stalled()), 1)
+
+    def test_an_issue_touched_after_a_wake_makes_a_new_stretch_when_it_stalls_again(self):
+        self.late()
+        (first,) = self.stalled()
+        self.set_lists(at=self.world.clock.now())
+        self.assertEqual(self.stalled(), [])
+        self.late()
+        (second,) = self.stalled()
+        self.assertNotEqual(first.key, second.key)
+
+    def test_a_moved_head_issue_or_too_early_gives_none(self):
+        self.late(1.5)
+        self.assertEqual(self.stalled(), [])
+        self.late(1)
+        self.assertEqual(len(self.stalled()), 1)
+        self.set_lists(at=self.world.clock.now() - 60)
+        self.assertEqual(self.stalled(), [])
+        self.set_lists(pr=False)
+        (wake,) = self.stalled()
+        self.assertIn("on acme/widget-service#2", wake.summary, "no pull request yet: the issue is the reference and its time the signal")
+
+    def test_each_guard_gives_none(self):
+        self.late()
+        self.assertEqual(len(self.stalled()), 1, "the same fixture with no guard wakes")
+        cfg = self.world.engine.config
+        for name, arrange in (
+                ("in progress", lambda: self.set_lists(checks=["success", "in_progress"])),
+                ("queued", lambda: self.set_lists(checks=["queued"])),
+                ("pr awaiting label", lambda: self.set_lists(pr_labels=[sb.awaiting_label(cfg)])),
+                ("issue awaiting label", lambda: self.set_lists(issue_labels=[sb.awaiting_cos_label(cfg)])),
+                ("reminder", lambda: sb.add_reminder(self.world.state, "coder", self.world.clock.now() + 600, self.world.clock.now(), "look", issue=2)),
+                ("question", lambda: self.report("question", "which one?")),
+                ("decision", lambda: (self.world.state / sb.DECISIONS_FILE).write_text(json.dumps({"decisions": [
+                    {"tier": "human", "kind": "captain", "repo": self.REPO, "number": 9}], "errors": []})))):
+            with self.subTest(name):
+                self.setUp()
+                self.late()
+                arrange()
+                self.assertEqual(self.stalled(), [])
+
+    def test_a_closing_report_and_a_closed_assignment_get_none(self):
+        self.late()
+        self.report("done", "finished")
+        self.assertEqual(self.stalled(), [])
+        self.setUp()
+        self.late()
+        self.world.engine.hub = types.SimpleNamespace(closed_issue_snapshot=lambda: {"%s#2" % self.REPO: {"labels": [], "at": 1}})
+        self.assertEqual(self.stalled(), [])
+
+    def test_a_not_whole_input_gives_none(self):
+        self.late()
+        for name in ("issues:" + self.REPO, "decisions", "pulls:" + self.REPO):
+            with self.subTest(name):
+                sb.read_mark(self.world.engine, name, False, "cut", self.world.clock.now())
+                self.assertEqual(self.stalled(), [])
+                sb.read_mark(self.world.engine, name, True, "", self.world.clock.now())
+        self.assertEqual(len(self.stalled()), 1)
+
+    def test_the_rule_reads_no_gh(self):
+        self.late()
+        calls = []
+        self.world.engine.gh_runner = lambda *a, **k: calls.append(a) or (_ for _ in ()).throw(AssertionError("gh called"))
+        self.assertEqual(len(self.stalled()), 1)
+        self.assertEqual(calls, [])
+
+    def test_the_streak_is_ended_by_another_kind_and_the_threshold_is_config(self):
+        self.report("blocked", "x")
+        self.report("working", "y")
+        self.late(1.5)
+        self.assertEqual(self.stalled(), [])
+        self.world.engine.config["stalled_working_hours"] = 1
+        (wake,) = self.stalled()
+        self.assertIn("1 working reports", wake.summary)
+
+    def test_a_token_in_the_last_report_is_redacted(self):
+        self.report("working", "using ghp_" + "a" * 36)
+        self.late()
+        self.assertNotIn("ghp_", self.stalled()[0].summary)
+
 class TestStoppedNews(PR4Base):
     def make_world(self, mode="on", **kwargs):
         config = {"jev": {"replay": write_report_replay(self.home, STOPPED_NEWS_RULES)},
