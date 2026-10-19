@@ -101,11 +101,16 @@ def _m_pid(p): p["spec"]["hostPID"] = True
 def _m_ipc(p): p["spec"]["hostIPC"] = True
 def _m_users(p): p["spec"]["hostUsers"] = True
 def _m_caps(p): p["spec"]["containers"][0]["securityContext"]["capabilities"]["add"] = ["SYS_ADMIN"]
+def _m_ctx(p): p["spec"]["containers"][0]["securityContext"]["capabilities"]["add"] = ["NET_RAW"]
+def _m_shape(p): p["spec"]["runtimeClassName"] = "runc"
 def _m_token(p): p["spec"]["automountServiceAccountToken"] = True
 
 
 MUTANTS = {"hostPath": _m_hostpath, "docker.sock": _m_sock, "privileged": _m_priv, "hostNetwork": _m_net, "hostPID": _m_pid,
-           "hostIPC": _m_ipc, "hostUsers true": _m_users, "capabilities add SYS_ADMIN/ALL": _m_caps, "service-account token": _m_token}
+           "hostIPC": _m_ipc, "hostUsers true": _m_users, "capabilities add SYS_ADMIN/ALL": _m_caps, "service-account token": _m_token,
+           "stack security context differs from STACK_SECURITY_CONTEXT": _m_ctx, "stack pod shape differs": _m_shape}
+STACK_ONLY = {"stack security context differs from STACK_SECURITY_CONTEXT", "stack pod shape differs"}
+ALLOW = sorted(STACK_ONLY)
 
 
 class ForbiddenFieldsTable(unittest.TestCase):
@@ -122,12 +127,18 @@ class ForbiddenFieldsTable(unittest.TestCase):
                 with self.subTest(member=name, stack=stack):
                     pod = build(_args(stack=stack))
                     mutate(pod)
-                    self.assertEqual(cw.forbidden_pod_fields(pod), [name])
+                    found = cw.forbidden_pod_fields(pod)
+                    if name in STACK_ONLY and not stack:
+                        continue   # the allow-list rows apply to a stack pod only (a runtimeClassName makes it one, see below)
+                    # on a stack pod the allow-list may also fire for a mutation of the container context
+                    self.assertEqual([f for f in found if f not in STACK_ONLY], [] if name in STACK_ONLY else [name])
+                    if name in STACK_ONLY:
+                        self.assertIn(name, found)
 
     def test_caps_all_and_a_token_volume_are_found(self):
         pod = build(_args(stack=True))
         pod["spec"]["containers"][0]["securityContext"]["capabilities"]["add"] = ["ALL"]
-        self.assertEqual(cw.forbidden_pod_fields(pod), ["capabilities add SYS_ADMIN/ALL"])
+        self.assertIn("capabilities add SYS_ADMIN/ALL", cw.forbidden_pod_fields(pod))
         pod = build(_args(stack=True))
         pod["spec"]["volumes"].append({"name": "t", "projected": {"sources": [{"serviceAccountToken": {"path": "t"}}]}})
         self.assertEqual(cw.forbidden_pod_fields(pod), ["service-account token"])
@@ -261,6 +272,91 @@ class FreshNodeRace(Base):
     def test_the_stack_create_ends_with_the_stack_pod(self):
         self.stack("--stack")
         self.assertEqual(self.pod()["spec"]["runtimeClassName"], "sysbox-runc")
+
+
+def _with_caps(stack, caps, where="containers"):
+    pod = build(_args(stack=stack))
+    k = copy.deepcopy(pod["spec"]["containers"][0])
+    k["securityContext"].setdefault("capabilities", {})["add"] = list(caps)
+    if where == "containers":
+        pod["spec"]["containers"][0] = k
+    else:
+        pod["spec"][where] = [k]
+    return pod
+
+
+class CapabilityNames(unittest.TestCase):
+    NAMED = "capabilities add SYS_ADMIN/ALL"
+    ALLOW_ROW = "stack security context differs from STACK_SECURITY_CONTEXT"
+
+    def test_spellings_of_the_worst_are_refused_by_name(self):   # kills: the normalisation dropped
+        for caps in (["SYS_ADMIN"], ["sys_admin"], ["CAP_SYS_ADMIN"], ["cap_sys_admin"], ["ALL"], ["all"], ["CAP_ALL"], ["Sys_Admin"]):
+            for stack in (True, False):
+                for where in ("containers", "initContainers", "ephemeralContainers"):
+                    with self.subTest(caps=caps, stack=stack, where=where):
+                        self.assertIn(self.NAMED, cw.forbidden_pod_fields(_with_caps(stack, caps, where)))
+
+    def test_any_other_capability_is_refused_on_a_stack_pod(self):   # kills: the allow-list dropped
+        for cap in ("NET_RAW", "SYS_PTRACE", "SYS_MODULE", "NET_ADMIN", "BPF", "DAC_READ_SEARCH", "SYS_RAWIO", "SETUID", "net_raw", "CAP_NET_RAW"):
+            for where in ("containers", "initContainers", "ephemeralContainers"):
+                with self.subTest(cap=cap, where=where):
+                    self.assertIn(self.ALLOW_ROW, cw.forbidden_pod_fields(_with_caps(True, [cap], where)))
+
+    def test_render_refuses_them_end_to_end(self):
+        for add in (["CAP_SYS_ADMIN"], ["all"]):   # NET_RAW in the constant itself is caught by test_security_context_constant_pins
+            bad = copy.deepcopy(cw.STACK_SECURITY_CONTEXT)
+            bad["capabilities"]["add"] = add
+            old, cw.STACK_SECURITY_CONTEXT = cw.STACK_SECURITY_CONTEXT, bad
+            try:
+                with self.subTest(add=add), self.assertRaises(cw.CloudError):
+                    build(_args(stack=True))
+            finally:
+                cw.STACK_SECURITY_CONTEXT = old
+
+    def test_an_init_or_ephemeral_container_without_the_context_is_refused(self):
+        for where in ("initContainers", "ephemeralContainers"):
+            pod = build(_args(stack=True))
+            pod["spec"][where] = [{"name": "x", "image": "i"}]
+            with self.subTest(where=where):
+                self.assertIn(self.ALLOW_ROW, cw.forbidden_pod_fields(pod))
+
+
+class StackShapeFamily(unittest.TestCase):
+    """Every field the table compares by exact value on a stack pod; each variant spelling is refused (equality, not a list)."""
+    ROW = "stack pod shape differs"
+    VARIANTS = {
+        "runtimeClassName": [("spec", "runtimeClassName", v) for v in ("Sysbox-runc", "SYSBOX-RUNC", "sysbox-runc ", "runc", "")],
+        "nodeSelector": [("spec", "nodeSelector", v) for v in ({"sysbox-install": "Yes"}, {"sysbox-install": "true"}, {"Sysbox-install": "yes"}, {"sysbox-runtime": "running"}, {})],
+        "hostUsers": [("spec", "hostUsers", v) for v in ("false", None, 0, True)],
+        "annotation": [("annotations", "cw/stack", v) for v in ("True", "TRUE", "1", "yes", "")],
+        "securityContext": [("spec", "securityContext", v) for v in (
+            {"runAsNonRoot": True, "runAsUser": 0, "seccompProfile": {"type": "RuntimeDefault"}},
+            {"runAsNonRoot": True, "runAsUser": 1000, "seccompProfile": {"type": "Unconfined"}},
+            {"runAsNonRoot": True, "runAsUser": 1000, "seccompProfile": {"type": "runtimedefault"}},
+            {"runAsNonRoot": False, "runAsUser": 1000, "seccompProfile": {"type": "RuntimeDefault"}},
+            {"runAsNonRoot": True, "runAsUser": "1000", "seccompProfile": {"type": "RuntimeDefault"}},
+            {"runAsNonRoot": True, "runAsUser": 1000})],
+    }
+
+    def test_every_variant_is_refused(self):   # kills: one comparison of the row dropped (each member has its own cases)
+        for member, cases in self.VARIANTS.items():
+            for where, key, v in cases:
+                with self.subTest(member=member, value=v):
+                    pod = build(_args(stack=True))
+                    (pod["metadata"]["annotations"] if where == "annotations" else pod["spec"])[key] = v
+                    self.assertIn(self.ROW, cw.forbidden_pod_fields(pod))
+
+    def test_the_docker_socket_in_any_case_is_refused(self):
+        for path in ("/var/run/Docker.sock", "/run/DOCKER.SOCK"):
+            pod = build(_args(stack=True))
+            pod["spec"]["containers"][0]["volumeMounts"].append({"name": "s", "mountPath": path})
+            with self.subTest(path=path):
+                self.assertIn("docker.sock", cw.forbidden_pod_fields(pod))
+
+    def test_a_runtime_class_alone_makes_it_a_stack_pod(self):   # kills: stack detected by the annotation only
+        pod = build(_args(stack=False))
+        pod["spec"]["runtimeClassName"] = "sysbox-runc"
+        self.assertIn(self.ROW, cw.forbidden_pod_fields(pod))
 
 
 if __name__ == "__main__":

@@ -52,24 +52,53 @@ STACK_RACE_RE = re.compile(r"RuntimeClass handler \S+ does not support user name
 
 def _containers(pod):
     spec = pod.get("spec", {})
-    return list(spec.get("containers", [])) + list(spec.get("initContainers", []))
+    return [k for key in ("containers", "initContainers", "ephemeralContainers") for k in spec.get(key, [])]
+
+
+def _cap(name):
+    """A capability name as the container runtime reads it: case-insensitive, with or without a leading CAP_."""
+    n = str(name).upper()
+    return n[4:] if n.startswith("CAP_") else n
 
 
 def _caps_add(pod, wanted):
-    return any(c in wanted for k in _containers(pod) for c in ((k.get("securityContext") or {}).get("capabilities") or {}).get("add", []))
+    return any(_cap(c) in wanted for k in _containers(pod) for c in ((k.get("securityContext") or {}).get("capabilities") or {}).get("add") or [])
+
+
+def _is_stack(pod):
+    return "cw/stack" in (pod.get("metadata", {}).get("annotations") or {}) or "runtimeClassName" in pod.get("spec", {})
+
+
+def _stack_context_differs(pod):
+    """Allow-list: on a stack pod EVERY container's securityContext (init and ephemeral too) must equal STACK_SECURITY_CONTEXT,
+    so any other capability, a Unconfined profile, procMount, a root runAsUser... fails until the constant and its test change together."""
+    return _is_stack(pod) and any((k.get("securityContext") or {}) != STACK_SECURITY_CONTEXT for k in _containers(pod))
+
+
+def _stack_shape_differs(pod):
+    spec = pod.get("spec", {})
+    psc = spec.get("securityContext") or {}
+    return _is_stack(pod) and not (
+        spec.get("runtimeClassName") == STACK_RUNTIME_CLASS and spec.get("hostUsers") is False
+        and spec.get("nodeSelector") == STACK_NODE_SELECTOR
+        and (pod.get("metadata", {}).get("annotations") or {}).get("cw/stack") == "true"
+        and psc.get("runAsNonRoot") is True and psc.get("runAsUser") == SERVER_UID
+        and (psc.get("seccompProfile") or {}).get("type") == "RuntimeDefault")
 
 
 # The forbidden pod fields: ONE table (name -> does this pod have it). render_pod refuses a pod that has any of them (every
 # pod, stack or not); the tests parametrise over this table, so a member added here is tested without another edit.
 FORBIDDEN_POD_FIELDS = {
     "hostPath": lambda p: any("hostPath" in v for v in p.get("spec", {}).get("volumes", [])),
-    "docker.sock": lambda p: "docker.sock" in json.dumps(p.get("spec", {})),
+    "docker.sock": lambda p: "docker.sock" in json.dumps(p.get("spec", {})).lower(),
     "privileged": lambda p: any((k.get("securityContext") or {}).get("privileged") for k in _containers(p)),
     "hostNetwork": lambda p: bool(p.get("spec", {}).get("hostNetwork")),
     "hostPID": lambda p: bool(p.get("spec", {}).get("hostPID")),
     "hostIPC": lambda p: bool(p.get("spec", {}).get("hostIPC")),
     "hostUsers true": lambda p: p.get("spec", {}).get("hostUsers") is True,
     "capabilities add SYS_ADMIN/ALL": lambda p: _caps_add(p, ("SYS_ADMIN", "ALL")),
+    "stack security context differs from STACK_SECURITY_CONTEXT": _stack_context_differs,
+    "stack pod shape differs": _stack_shape_differs,
     "service-account token": lambda p: p.get("spec", {}).get("automountServiceAccountToken") is not False
         or any("serviceAccountToken" in (s or {}) for v in p.get("spec", {}).get("volumes", []) for s in (v.get("projected") or {}).get("sources", [])),
 }
