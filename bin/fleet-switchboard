@@ -20514,14 +20514,24 @@ def _impact_rehold_now(engine, repo, number, pr, report, record):
     state, problem = read_impact_state(engine.state_dir)
     if problem or not report.get("head"):
         return False
-    records, records_problem = impact_records(engine.state_dir)
-    if records_problem:
-        return False
-    why = rehold_reason(engine, state, repo, pr, report["head"], (pr, report["head"]) in records)
+    if rating_at(engine, pr, report["head"])[1]:
+        return False   # the ledger cannot be read: no change here, and the caller releases nothing either
+    why = rehold_reason(engine, state, repo, pr, report["head"])
     if not why:
         return False
     apply_impact_hold(engine, repo, number, dict(report, reasons=[why], rehold=why, owner_decision="hold"), record)
     return True
+
+
+def _impact_rehold_try(engine, repo, number, pr, report, record, now, seen):
+    """(#830) `_impact_rehold_now` for the pass: a failed write is said (`impact.error`), the retry time is set like the hold branch's, and True is returned (it IS held again, so the
+    caller never releases it)."""
+    try:
+        return _impact_rehold_now(engine, repo, number, pr, report, record)
+    except Exception as err:
+        seen[(repo, number, "retry")] = now + IMPACT_RETRY_SECONDS
+        engine._note("impact.error", pr, {"error": _one_line(str(err), 160), "write": True})
+        return True
 
 
 def _impact_cos(engine):
@@ -20872,7 +20882,10 @@ def impact_would_hold_pass(engine, now):
                         engine._note("impact.error", pr, {"error": _one_line(str(err), 160), "write": True})
                         unjudged += 1
                         continue
-            elif enforce and _impact_rehold_now(engine, key, number, pr, report, record):   # (#830) cleared at an earlier head, none here: held again, never released
+            elif enforce and _impact_rehold_try(engine, key, number, pr, report, record, now, seen):   # (#830) cleared at an earlier head, none here: held again, never released
+                if seen.get((key, number, "retry")) == now + IMPACT_RETRY_SECONDS:   # the write failed: retried later, never marked done
+                    unjudged += 1
+                    continue
                 budget -= 1
                 report = dict(report, rehold=True)
             elif enforce and not records_problem:   # a release is a LOOSENING: only on a decision made from every input, never on a failed read
