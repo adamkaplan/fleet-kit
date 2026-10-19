@@ -928,10 +928,18 @@ class Launcher:
     def stop(self, a, reason=None):
         worker, name = a.worker, pod_name(a.worker)
         reason = reason if reason is not None else (a.reason or "")
+        nonce = getattr(a, "run_id", None)   # the run's own nonce (what create recorded): acts only on what carries it; none: by name, as before
+        audit_reason = ("%s; " % reason if reason else "") + "run-id=" + nonce if nonce else reason   # the record keeps the plain reason
 
         def go(info):
             pod = self._need(worker)
+            if nonce and pod:
+                info["rid"] = "pod/" + name
+                if ann(pod, "run-id") != nonce:   # another run's (or an unlabelled) worker of this name: nothing is changed
+                    raise CloudError("worker %s does not match run id %s; nothing was stopped or deleted" % (worker, nonce), EXIT_REFUSED)
             if not pod:
+                if nonce:   # no pod: this run's own Secrets (carrying the nonce) may remain from a cut-off create; another's are left whole
+                    self._remove(name, nonce)
                 return {"worker": worker, "runtime_id": "", "pushed": False, "wip_branch": None}
             info["rid"], info["cost"] = "pod/" + name, self.cost(pod)
             if not getattr(a, "no_record", False):   # BEFORE the hook and the delete; never raises, never holds the stop back
@@ -944,7 +952,7 @@ class Launcher:
             if phase in ("Failed", "Succeeded") and ann(pod, "kept") != "true":  # a pod kept for unpushed work is never deleted here
                 # No container is running, so no hook can run and a kept pod would only linger: delete it and its
                 # Secrets, and say so.
-                self.kube.delete(name)
+                self._remove(name, nonce)
                 print("cloud-worker: pod was %s; end hook not run; deleted" % phase, file=sys.stderr)
                 return {"worker": worker, "runtime_id": "pod/" + name, "pushed": False, "wip_branch": None,
                         "skipped": [], "note": "pod was %s; end hook not run" % phase, "record": info.get("record", "")}
@@ -958,7 +966,7 @@ class Launcher:
             try:
                 self.kube.annotate(name, hook_ran="true")
             finally:
-                self.kube.delete(name)  # the hook succeeded: whatever happens next, the pod and its Secrets go
+                self._remove(name, nonce)  # the hook succeeded: whatever happens next, the pod and its Secrets go
             skipped, note = [], ""
             try:
                 raw = res.get("skipped")
@@ -972,7 +980,26 @@ class Launcher:
                 print("cloud-worker: WARNING: not saved (secret-looking names): %s" % ", ".join(skipped), file=sys.stderr)
             return {"worker": worker, "runtime_id": "pod/" + name, "pushed": bool(res.get("pushed")),
                     "wip_branch": res.get("wip_branch"), "skipped": skipped, "record": info.get("record", "")}
-        return self._audited(worker, "stop", go, reason)
+        return self._audited(worker, "stop", go, audit_reason)
+
+    def _remove(self, name, nonce):
+        """Delete the pod and both Secrets (as `delete` does); with a nonce, only those that carry it (the pod, when there, matched already)."""
+        if not nonce:
+            return self.kube.delete(name)
+        self.run_id = nonce
+        left = []
+        for kind, label, fn in (("pod", "pod/" + name, self.kube.delete_pod), ("secret", "secret/%s-pw" % name, self.kube.delete_secret),
+                                ("run", "secret/%s-run" % name, self.kube.delete_run_secret)):
+            try:
+                mine = self._mine(kind, name)
+                if mine:
+                    fn(name)
+                elif mine is False:
+                    print("cloud-worker: %s is not this run's (its run id does not match); left whole" % label, file=sys.stderr)
+            except CloudError:
+                left.append(label)
+        if left:
+            raise CloudError("delete incomplete; REMAINS: %s; delete each with: %s" % (", ".join(left), "; ".join(self._delete_cmd(l) for l in left)))
 
     def prune_records(self, a):
         """Remove run records older than --days (default CW_RECORD_KEEP_DAYS, else 30): only this tool's per-run directories."""
@@ -1149,6 +1176,8 @@ def build_parser():
     c.add_argument("--password-fd", type=int, help="a file descriptor the caller holds; the password is written there once")
     s = cmd("stop")
     s.add_argument("--reason", default="")
+    s.add_argument("--run-id", type=_run_id,
+                   help="the nonce create recorded: stop acts only when the pod carries it (another run's worker of the same name is left whole, exit 6); without it stop acts by name")
     s.add_argument("--record-dir", help="where the run record goes (default: $CW_RUN_RECORD_DIR, else runs/ beside the audit file)")
     s.add_argument("--no-record", action="store_true", help="write no run record (a record is the default: every stop makes one)")
     e = cmd("extend")
