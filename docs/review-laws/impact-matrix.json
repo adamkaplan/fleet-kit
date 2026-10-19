@@ -154,6 +154,7 @@
         "bin/chat_clear.py",
         "bin/clear_carry.py",
         "bin/reassign.py",
+        "bin/item_verdicts.py",
         "bin/launch_testers.py",
         "bin/plan_review.py",
         "bin/decision_core.py",
@@ -196,6 +197,7 @@
           "bin/chat_clear.py",
           "bin/clear_carry.py",
           "bin/reassign.py",
+          "bin/item_verdicts.py",
           "bin/launch_testers.py",
           "bin/plan_review.py",
           "bin/decision_core.py",
@@ -346,6 +348,7 @@
         "bin/disk_janitor.py",
         "bin/fleet_health.py",
         "bin/heavy_slots.py",
+        "bin/item_verdicts.py",
         "bin/plan_review.py",
         "bin/pr_events.py",
         "bin/queue_ejections.py",
@@ -383,6 +386,10 @@
         ],
         "bin/heavy_slots.py": [
           "settings"
+        ],
+        "bin/item_verdicts.py": [
+          "registrations",
+          "validate_item_checks"
         ],
         "bin/queue_ejections.py": [
           "validate"
