@@ -151,6 +151,7 @@ class FakeRunner:
 
 
 SAFE_PATH = "/usr/bin:/bin"
+REAL_NODE = shutil.which("node")   # looked up at import, before a test narrows PATH (the plugin cross-check needs it)
 
 
 def remove_tree_patiently(tmp, tries=20, pause=0.1):
@@ -4055,6 +4056,108 @@ class TestLaunch(Base):
             with self.subTest(charter=bad), self.assertRaises(sb.LaunchError):
                 self.launch(name="orch", role="orchestrator", charter=bad)
 
+    # --- #767: each launched agent has its own private TMPDIR
+    def wrapper_world(self):
+        """Panes 'run through the wrapper': the temp root is a directory of this test (the fake v2 checks the program path, so the config is not changed)."""
+        root = self.home / "profile-tmp"
+        patch = mock.patch.object(sb, "agent_tmp_root", lambda config: root)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return root
+
+    def test_s1_two_agents_on_one_profile_get_two_private_directories(self):
+        root = self.wrapper_world()
+        first, second = self.launch(name="coder"), self.launch(name="coder2")
+        seen = []
+        for done, name in ((first, "coder"), (second, "coder2")):
+            env = [c[1]["root"]["env"] for c in self.world.herdr.socket_calls if c[1]["root"]["label"] == name][0]
+            seen.append(env["FLEET_AGENT_TMPDIR"])
+        self.assertEqual(seen, [str(root / "coder"), str(root / "coder2")])
+        self.assertNotEqual(seen[0], seen[1])
+        for path in seen:
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o700)
+
+    def test_s2_a_directory_that_cannot_be_made_fails_the_launch_and_starts_nothing(self):
+        root = self.wrapper_world()
+        root.write_text("a file where the temp root should be")   # mkdir under it fails
+        before = set(self.world.v2.sessions)
+        with self.assertRaises(sb.LaunchError) as caught:
+            self.launch()
+        self.assertIn(str(root / "coder"), str(caught.exception))
+        self.assertEqual(self.world.herdr.socket_calls, [])
+        self.assertEqual(set(self.world.v2.sessions), before)
+
+    def test_the_chief_of_staff_and_review_lanes_keep_the_shared_directory(self):
+        root = self.wrapper_world()
+        for name in ("cos", "planrev-a"):
+            self.assertEqual(sb.agent_tmp_env(self.engine, name), {})
+        self.assertFalse(root.exists())
+        with self.assertRaises(sb.LaunchError):
+            sb.agent_tmp_env(self.engine, "Bad/Name")
+
+    def test_a_path_that_is_not_our_directory_fails_the_launch(self):
+        root = self.wrapper_world()
+        root.mkdir(parents=True)
+        (root / "coder").symlink_to(self.home)
+        with self.assertRaises(sb.LaunchError):
+            self.launch()
+        self.assertIn("not a plain directory", sb.reclaim_agent_tmp(self.engine, "coder")[0])
+
+    def test_the_launch_environment_is_otherwise_unchanged(self):
+        self.wrapper_world()
+        self.launch()
+        env = dict(self.world.herdr.socket_calls[0][1]["root"]["env"])
+        del env["FLEET_AGENT_TMPDIR"]
+        self.assertEqual(env, {"XDG_CONFIG_HOME": "/lab/config", "FLEET_SWITCHBOARD_LAB_PANE": "1", "FLEET_SWITCHBOARD_ROLE": "coder", "FLEET_SWITCHBOARD_OWN_GH": ""})
+
+    def test_retire_removes_an_empty_private_directory_and_keeps_one_with_files(self):
+        root = self.wrapper_world()
+        self.launch(name="coder")
+        self.launch(name="coder2")
+        (root / "coder2" / "body.md").write_text("x")
+        self.assertEqual(sb.reclaim_agent_tmp(self.engine, "coder"), ["%s: removed (empty)" % (root / "coder")])
+        self.assertFalse((root / "coder").exists())
+        line = sb.reclaim_agent_tmp(self.engine, "coder2")[0]
+        self.assertIn("kept (1 file(s)", line)
+        self.assertTrue((root / "coder2" / "body.md").exists())
+
+    # --- #846: a headless worker's private TMPDIR (made by the fleet-hooks plugin) is retired by the same rule
+    def test_s5_retire_of_a_headless_workers_directory_removes_only_an_empty_one_inside_the_root(self):
+        data = self.home / "xdg-data-846"
+        root = data / sb.PROG / "profile" / "tmp"
+        with mock.patch.dict(os.environ, {"XDG_DATA_HOME": str(data)}):
+            self.assertEqual(sb.headless_tmp_root(), root)
+            self.assertEqual(sb.reclaim_agent_tmp(self.engine, "coder"), [])   # a pane agent on a shared profile: not touched
+            self.assertEqual(sb.reclaim_agent_tmp(self.engine, "coder", headless=True), [])   # no directory: nothing to say
+            (root / "empty").mkdir(parents=True)
+            (root / "full").mkdir()
+            (root / "full" / "keep.txt").write_text("x")
+            outside = self.home / "outside-846"
+            outside.mkdir()
+            (outside / "f").write_text("x")
+            (root / "link").symlink_to(outside)
+            self.assertEqual(sb.reclaim_agent_tmp(self.engine, "empty", headless=True), ["%s: removed (empty)" % (root / "empty")])
+            self.assertFalse((root / "empty").exists())
+            line = sb.reclaim_agent_tmp(self.engine, "full", headless=True)[0]
+            self.assertIn("kept (1 file(s)", line)
+            self.assertTrue((root / "full" / "keep.txt").exists())
+            self.assertIn("not a plain directory", sb.reclaim_agent_tmp(self.engine, "link", headless=True)[0])
+            self.assertTrue((outside / "f").exists())
+            for hostile in ("../outside-846", "a/b", "..", "A\x00b", "x" * 80, "cos", "planrev-a"):
+                self.assertEqual(sb.reclaim_agent_tmp(self.engine, hostile, headless=True), [], hostile)
+            self.assertTrue(outside.exists())
+
+    def test_the_temp_root_is_the_profiles_only_when_panes_run_through_the_wrapper(self):
+        data = self.home / "xdg-data"
+        with mock.patch.dict(os.environ, {"XDG_DATA_HOME": str(data)}):
+            wrapper = str(data / sb.PROG / "bin" / sb.WRAPPER_NAME)
+            self.assertEqual(sb.agent_tmp_root({"opencode": wrapper}), data / sb.PROG / "profile" / "tmp")
+            self.assertIsNone(sb.agent_tmp_root({"opencode": "/some/other/opencode"}))
+
+    def test_the_wrapper_takes_its_agents_directory(self):
+        self.assertIn('export TMPDIR="${{FLEET_AGENT_TMPDIR:-$PROFILE/tmp}}"', sb.PRIVATE_WRAPPER_TEXT)
+        self.assertIn('export TMPDIR="${FLEET_AGENT_TMPDIR:-$PROFILE/tmp}"', sb.PRIVATE_WRAPPER_TEXT.format(**{k: "x" for k in ("profile", "gh_config", "gh", "gh_user_flag", "fleet_bin", "state", "shims", "kit_bin", "key_pattern", "pane_env", "v2")}))
+
     def test_nothing_is_typed_and_focus_is_never_asked_for(self):
         self.launch()
         self.assertEqual(self.world.herdr.typing_attempts, [])
@@ -4879,6 +4982,32 @@ class TestLaunch(Base):
         code, out, err = self.run_cli("retire", "worker", "--close")
         self.assertEqual(code, 0, err)
         return wt, out
+
+    def test_retire_reports_the_private_tmpdir_removed_or_kept_and_survives_a_failure(self):
+        root = self.home / "profile-tmp"
+        for kept in (False, True):
+            with self.subTest(kept=kept):
+                self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+                self.worker()
+                (root / "worker").mkdir(parents=True, exist_ok=True)
+                if kept:
+                    (root / "worker" / "f").write_text("x")
+                self.world.herdr.panes[self.world.panes["worker"]]["status"] = "idle"
+                os.environ.pop("HERDR_PANE_ID", None)
+                with mock.patch.object(sb, "agent_tmp_root", lambda config: root):
+                    code, out, err = self.run_cli("retire", "worker")
+                self.assertEqual(code, 0, err)
+                if kept:
+                    self.assertRegex(out, r"tmpdir: .*worker: kept \(1 file\(s\)")
+                    self.assertTrue((root / "worker" / "f").exists())
+                else:
+                    self.assertRegex(out, r"tmpdir: .*worker: removed \(empty\)")
+                    self.assertFalse((root / "worker").exists())
+                self.run_cli("retire", "--undo", "worker")
+        with mock.patch.object(sb, "reclaim_agent_tmp", side_effect=RuntimeError("boom")):
+            code, out, err = self.run_cli("retire", "worker")
+        self.assertEqual(code, 0)
+        self.assertIn("private temp directory not handled", err)
 
     def test_retire_close_keeps_a_worktree_with_an_unpushed_commit_and_says_so(self):
         wt, out = self.retire_close_with_worktree(lambda: self.add_worktree("w-unpushed-close", unpushed=True))
@@ -5801,6 +5930,16 @@ class TestLaunch(Base):
         found = self.engine.discover(self.world.clock.now()).agents["platform"]
         self.assertEqual((found.session_id, found.pane), (session, done["pane"]))
         self.assertEqual(self.world.herdr.typing_attempts, [])
+
+    def test_resume_gives_the_agent_its_private_tmpdir_and_reuses_an_existing_one(self):
+        root = self.home / "profile-tmp"
+        (root / "platform").mkdir(parents=True)
+        session = self.gone()
+        with mock.patch.object(sb, "agent_tmp_root", lambda config: root):
+            sb.resume_agent(self.engine, "platform", session, "w1", patience=5, sleep=self.sleep)
+        env = self.world.herdr.socket_calls[-1][1]["root"]["env"]
+        self.assertEqual(env["FLEET_AGENT_TMPDIR"], str(root / "platform"))
+        self.assertEqual(stat.S_IMODE(os.stat(str(root / "platform")).st_mode), 0o700)
 
     def test_resume_refuses_a_session_that_belongs_to_someone_else(self):
         other = self.world.add_agent("coder3", fleet={"role": "coder"})
@@ -13939,6 +14078,22 @@ class TestClearCarryInTheDaemon(Base):
         self.assertEqual(([w for w in self.writes if w[1].endswith("/pulls/7")], self.body), ([], before))
         self.assertFalse(sb.pr_marker_state([], self.body, now=0)["captain"], "the gate reads no hold from the text")
 
+    def test_830_a_pure_merge_carry_is_not_held_again_and_a_changed_pull_request_is(self):
+        self.clear()
+        new = self.merge_main()
+        report = {"pr": self.PR, "head": new, "reasons": [], "floor_paths": [], "globs": []}
+        self.assertTrue(sb._impact_rehold_now(self.engine, self.REPO, 7, self.PR, report, {"labels": []}))
+        self.assertEqual(self.adds(), [], "the pure merge carries: no hold written")
+        state = sb.read_impact_state(self.world.state)[0]
+        self.assertEqual(state["carried"][self.PR]["head"], new)
+        self.assertIsNone(sb.rehold_reason(self.engine, state, self.REPO, self.PR, new))
+        self.build(carry=False)
+        self.clear()
+        new = self.merge_main("m2.txt")
+        self.writes.clear()
+        self.assertTrue(sb._impact_rehold_now(self.engine, self.REPO, 7, self.PR, dict(report, head=new), {"labels": []}))
+        self.assertEqual(len(self.adds()), 1, "with the carry off every new head is held again")
+
     def test_s4_a_carried_clear_tells_the_chief_of_staff_once_with_both_heads(self):
         cleared = self.clear()
         new = self.merge_main()
@@ -14792,6 +14947,39 @@ class TestHeadlessPresence(Base):
         self.assertIn("the same repo, with different accounts", str(raised.exception))
         accounts = self.engine.accounts
         self.assertEqual([accounts.account_for(r) for r in ("ACME/Widget", "acme/widget.git", "x/y", None, 5)], ["acct-ops", "acct-ops", None, None, None])
+
+    def test_the_plugin_and_the_switchboard_agree_on_the_headless_temp_root_and_name_rule(self):
+        node = REAL_NODE
+        if node is None:
+            self.skipTest("no node")
+        plugin = Path(__file__).resolve().parent.parent / "plugins" / "fleet-hooks" / "index.js"
+        data = self.home / "xdg-data-cross"
+        script = 'import(%r).then(m => { console.log(JSON.stringify([m.tmpRootOf({XDG_DATA_HOME: %r}, "/h"), m.AGENT_NAME_RE.source, m.LANE_PREFIX, m.RECORD_NAME_RE.source, m.RECORD_MAX])); })' % (plugin.as_uri(), str(data))
+        out = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        root, source, lane, record_name, record_max = json.loads(out.stdout)
+        with mock.patch.dict(os.environ, {"XDG_DATA_HOME": str(data)}):
+            self.assertEqual(root, str(sb.headless_tmp_root()))
+        self.assertEqual(source, sb.NAME_RE.pattern)
+        self.assertEqual(lane, sb.LANE_NAME_PREFIX)
+        self.assertTrue(sb.agent_tmp_shared_name("cos") and sb.agent_tmp_shared_name(lane + "x") and not sb.agent_tmp_shared_name("coder"))
+        presence = self.ap
+        self.assertEqual(record_name, presence.NAME_RE.pattern)
+        self.assertEqual(record_max, presence.RECORD_MAX)
+        self.assertIsNone(sb.reclaim_agent_tmp(self.engine, "coder\n", headless=True) or None)   # a trailing newline is not a name
+
+    def test_s5_retire_of_a_headless_worker_handles_its_private_tmpdir_from_the_plugin(self):
+        data = self.home / "xdg-data-846b"
+        root = data / sb.PROG / "profile" / "tmp"
+        self.launch_hl()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]
+        (root / "hw").mkdir(parents=True)
+        with mock.patch.dict(os.environ, {"XDG_DATA_HOME": str(data)}):
+            code, out, err = self.run_cli("retire", "hw")
+        self.assertEqual(code, 0, err)
+        self.assertRegex(out, r"tmpdir: .*hw: removed \(empty\)")
+        self.assertFalse((root / "hw").exists())
 
     def test_retire_frees_the_name_of_a_headless_worker_and_undo_restores_the_record_unless_the_name_was_taken(self):
         done = self.launch_hl()
@@ -17745,6 +17933,73 @@ class TestGhShim(Base):
         link = self.home / ".local" / "bin"
         link.mkdir(parents=True, exist_ok=True)
         (link / "fleet-switchboard").symlink_to(self.home / "gone" if dangling else (target or self.who))
+
+    # --- #767: a body file directly in a shared temp directory is warned about, never refused
+    def shim_warnings(self, *args, env=None):
+        done, seen = self.run_shim(*args, env=env)
+        return done, seen, [l for l in done.stderr.splitlines() if "shared temp directory" in l]
+
+    def test_s3_a_body_file_in_a_shared_temp_directory_warns_once_and_runs_unchanged(self):
+        root = self.home / "profile-tmp"
+        env = {"FLEET_AGENT_TMPDIR": str(root / "coder")}
+        for flag, path in (("--body-file", "/tmp/x.md"), ("-F", "/private/tmp/y.md"), ("--body-file", str(root / "z.md"))):
+            with self.subTest(path=path):
+                done, seen, lines = self.shim_warnings("issue", "comment", "2", flag, path, env=env)
+                self.assertEqual((done.returncode, len(lines)), (0, 1))
+                self.assertIn("$TMPDIR", lines[0])
+                self.assertEqual(seen["argv"][:3], ["issue", "comment", "2"])
+        done, seen, lines = self.shim_warnings("pr", "create", "--body-file=/tmp/a.md", env=env)
+        self.assertEqual(len(lines), 1)
+        done, seen, lines = self.shim_warnings("pr", "create", "-F/tmp/a.md", env=env)
+        self.assertEqual(len(lines), 1)
+        done, seen, lines = self.shim_warnings("issue", "comment", "2", "--body-file", "/tmp/../tmp/q.md", env=env)
+        self.assertEqual(len(lines), 1)
+        done, seen, lines = self.shim_warnings("issue", "comment", "2", "--body-file", "/tmp/sub/../x.md", env=env)
+        self.assertEqual(len(lines), 1)   # folded lexically to /tmp/x.md
+
+    def test_s4_an_own_directory_a_mktemp_subdirectory_and_a_relative_path_give_no_warning(self):
+        root = self.home / "profile-tmp"
+        env = {"FLEET_AGENT_TMPDIR": str(root / "coder")}
+        for path in (str(root / "coder" / "x.md"), "/tmp/tmp.AbC123/x.md", "body.md", "./body.md", "/tmp/sub/../tmp.d/x.md"):
+            with self.subTest(path=path):
+                done, seen, lines = self.shim_warnings("issue", "comment", "2", "--body-file", path, env=env)
+                self.assertEqual((done.returncode, lines), (0, []))
+
+    def test_s5_the_path_is_never_opened_stat_ed_or_read(self):
+        spec = importlib.util.spec_from_loader("gh_shim_767", importlib.machinery.SourceFileLoader("gh_shim_767", str(SHIM)))
+        shim = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(shim)
+        fifo = self.home / "pipe"
+        os.mkfifo(str(fifo))
+        locked = self.home / "locked.md"
+        locked.write_text("x")
+        locked.chmod(0)
+        paths = ["/tmp/%s" % fifo.name, "/tmp/missing-767.md", "/tmp/%s" % locked.name]
+        calls = []
+
+        def boom(*a, **k):
+            calls.append(a)
+            raise AssertionError("touched the filesystem")
+        with mock.patch.multiple(os, stat=boom, lstat=boom, open=boom, listdir=boom, access=boom), \
+                mock.patch.multiple(os.path, exists=boom, isfile=boom, isdir=boom, islink=boom, realpath=boom), \
+                mock.patch("builtins.open", boom):
+            for path in paths:
+                self.assertEqual(shim.shared_body_file(["issue", "comment", "2", "--body-file", path], {}), path)
+        self.assertEqual(calls, [])
+        done, seen, lines = self.shim_warnings("issue", "comment", "2", "--body-file", paths[1])
+        self.assertEqual((done.returncode, len(lines)), (0, 1))
+
+    def test_the_warning_shows_no_control_characters(self):
+        done, seen, lines = self.shim_warnings("issue", "comment", "2", "--body-file", "/tmp/a\x1b[31m\rb.md")
+        self.assertEqual(len(lines), 1)
+        self.assertNotIn("\x1b", done.stderr.split("real gh")[0])
+        self.assertNotIn("\r", done.stderr)
+
+    def test_the_unchanged_exit_code_and_gh_api_fields(self):
+        done, seen, lines = self.shim_warnings("issue", "comment", "2", "--body-file", "/tmp/x.md", env={"FAKE_GH_EXIT": "3"})
+        self.assertEqual((done.returncode, len(lines)), (3, 1))
+        done, seen, lines = self.shim_warnings("api", "x", "-F", "/tmp/x.md")
+        self.assertEqual(lines, [])
 
     def test_unset_env_falls_back_to_the_linked_switchboard(self):
         self.link_switchboard()
@@ -31696,6 +31951,191 @@ class TestImpactHold(LedgerBase):
         self.passes(records=[self.listed(head=LEDGER_NEW_HEAD)], advance=8000)
         self.assertEqual(len(self.label_writes()), before + 1, "a new head is held again")
 
+    # -- #830: a cleared pull request is held again at a new head
+
+    def cleared_at_a_then_pushed_to_b(self, path="src/app.py"):
+        """The owner clears the floor hold at head A; the pull request is then pushed to head B, which no floor path holds and no rating rates. Returns the clear state."""
+        self.passes()
+        self.assertEqual(self.run_as(None, "impact", "clear", self.PR, "--reason", "a false hold: the file is a fixture")[0], 0)
+        self.writes.clear()
+        self.floor_pr(path=path, head=LEDGER_NEW_HEAD)
+        state = sb.read_impact_state(self.world.state)[0]
+        state["clears"][self.PR]["at"] = 1   # the fake world's clock is far in the future of the passes' own: the clear is older than the daemon's later records, as in life
+        sb.write_impact_state(self.world.state, state)
+        return state["clears"]
+
+    def labelled(self):
+        return [self.names["merge-captain"], self.names["hold-impact"]]
+
+    def test_s1_a_clear_at_head_a_and_a_push_to_head_b_is_held_again_once_and_never_a_clear(self):
+        before = self.cleared_at_a_then_pushed_to_b()
+        self.passes(records=[self.listed(head=LEDGER_NEW_HEAD)], advance=2000)
+        (write,) = self.label_writes()
+        self.assertEqual(sorted(write[2]["labels"]), sorted(self.labelled()))
+        self.passes(records=[self.listed(head=LEDGER_NEW_HEAD, labels=self.labelled())], advance=4000)
+        self.passes(records=[self.listed(head=LEDGER_NEW_HEAD, labels=self.labelled())], advance=8000)
+        self.assertEqual(len(self.label_writes()), 1, "once")
+        (event,) = self.events("gate.hold_reapplied")
+        self.assertEqual((event["detail"]["head"], event["detail"]["cleared_head"]), (LEDGER_NEW_HEAD, LEDGER_HEAD))
+        self.assertEqual(sb.read_impact_state(self.world.state)[0]["clears"], before, "a hold is never a clear: the owner's record is untouched")
+        self.assertEqual(len(self.events("gate.hold_cleared")), 1)
+        self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [], "nothing is released")
+
+    def test_the_hold_labels_the_clear_took_off_are_put_back(self):
+        self.passes(records=[self.listed(labels=[self.names["hold-credential"]])])
+        self.assertEqual(self.run_as(None, "impact", "clear", self.PR, "--reason", "a false hold: the file is a fixture")[0], 0)
+        self.writes.clear()
+        self.floor_pr(path="src/app.py", head=LEDGER_NEW_HEAD)
+        self.passes(records=[self.listed(head=LEDGER_NEW_HEAD)], advance=2000)
+        (write,) = self.label_writes()
+        self.assertEqual(sorted(write[2]["labels"]), sorted(self.labelled() + [self.names["hold-credential"]]))
+
+    def test_a_clear_at_b_a_rating_at_b_and_a_never_cleared_pull_request_are_not_held_again(self):
+        self.cleared_at_a_then_pushed_to_b()
+        self.assertEqual(self.run_as(None, "impact", "clear", self.PR, "--reason", "a false hold: the file is a fixture")[0], 0)   # the owner clears head B too
+        self.writes.clear()
+        self.passes(records=[self.listed(head=LEDGER_NEW_HEAD)], advance=2000)
+        self.assertEqual(self.label_writes(), [], "a clear at this head")
+        self.assertEqual(self.events("gate.hold_reapplied"), [])
+
+    def test_a_rating_at_the_new_head_recorded_as_not_held_ends_the_hold_again_and_releases_only_what_the_daemon_added(self):
+        self.cleared_at_a_then_pushed_to_b()
+        self.passes(records=[self.listed(head=LEDGER_NEW_HEAD)], advance=2000)
+        self.assertEqual(len(self.label_writes()), 1)
+        sb.plan_ledger.append_entry(self.world.state, {"kind": "review_record", "pr": self.PR, "head": LEDGER_NEW_HEAD, "reviewer": "impact", "verdict": "approve",
+                                                       "blocks": 0, "notes": 0, "by": "rev", "impact_action": "second-review", "summary": "x"}, 1)
+        self.passes(records=[self.listed(head=LEDGER_NEW_HEAD, labels=self.labelled())], advance=4000)
+        self.assertEqual(sorted(w[1].rsplit("/", 1)[1] for w in self.writes if w[0] == "DELETE"), sorted(n.replace(":", "%3A") for n in self.labelled()))
+
+    def test_a_pull_request_never_cleared_and_never_rated_is_unchanged(self):
+        self.floor_pr(path="src/app.py")
+        self.passes()
+        self.floor_pr(path="src/app.py", head=LEDGER_NEW_HEAD)
+        self.passes(records=[self.listed(head=LEDGER_NEW_HEAD)], advance=2000)
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.events("gate.hold_reapplied"), [])
+
+    HELD_BODY = ("PLAN: acme/app#7\nMERGE: captain\ncanon: n/a internal rule\n\n## Why this needs you\nThis changes the hold rule, so it holds for you.\n\n"
+                 "## What changes for you\n| Before | After |\n|---|---|\n| the hold lapsed at a new head | the hold stands at a new head |\n| a clear stood anywhere | a clear stands for its head |\n\n"
+                 "## Example\nYou clear head one; a new commit lands; the labels come back.\n\n## Questions for you\n1. Is this wanted? Recommendation: yes.\n")
+
+    def rating_record(self, kind):
+        """The impact reviewer's record at head B: none, one with NO action, or one with an action that is not a hold."""
+        if kind == "none":
+            return
+        entry = {"kind": "review_record", "pr": self.PR, "head": LEDGER_NEW_HEAD, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "summary": "x"}
+        if kind == "with action":
+            entry["impact_action"] = "second-review"
+        sb.plan_ledger.append_entry(self.world.state, entry, 1)
+
+    def readers(self, engine):
+        """Every reader of "is this pull request held at head B", one callable each returning True when it reads HELD. Derived from the code by `test_the_reader_table_is_complete`."""
+        def label_pass():
+            self.pr["labels"] = []
+            self.writes.clear()
+            self.passes(records=[self.listed(head=LEDGER_NEW_HEAD)], advance=3000)
+            return bool(self.label_writes())
+
+        def release():
+            state = sb.read_impact_state(self.world.state)[0]
+            state["applied"][self.PR] = {"head": LEDGER_NEW_HEAD, "merge_label_added": True, "added": self.labelled(), "at": 2}
+            sb.write_impact_state(self.world.state, state)
+            self.pr["labels"] = [{"name": n} for n in self.labelled()]
+            self.writes.clear()
+            sb.release_impact_hold(engine, "acme/app", 9, sb.pr_floor_report(engine, "acme/app", 9), {})
+            return not [w for w in self.writes if w[0] == "DELETE"]
+
+        def gate(row):
+            self.pr["labels"] = []
+            self.pr["body"] = "PLAN: acme/app#7\n"
+            return self.row(self.gates()[1], row)
+
+        state = lambda: sb.read_impact_state(self.world.state)[0]
+        return {
+            "rehold_reason": lambda: bool(sb.rehold_reason(engine, state(), "acme/app", self.PR, LEDGER_NEW_HEAD)),
+            "gate_floor_fact": lambda: bool(sb.gate_floor_fact(engine, self.world.state, "acme/app", 9, LEDGER_NEW_HEAD)["rehold"]),
+            "impact_plan": lambda: sb.impact_plan(engine, sb.pr_floor_report(engine, "acme/app", 9), [], state(), {}, None)[0] in ("add", "held"),
+            "release_impact_hold": release,
+            "_impact_rehold_now": label_pass,
+            "G6": lambda: gate("G6")["status"] == "waiting",
+            "G6b": lambda: gate("G6b")["status"] != "n/a",
+        }
+
+    def test_every_reader_of_is_it_held_agrees_for_every_rating_state_at_head_b(self):
+        for rating, held in (("none", True), ("no action", True), ("with action", False)):
+            with self.subTest(rating=rating):
+                self.setUp()
+                self.cleared_at_a_then_pushed_to_b()
+                self.rating_record(rating)
+                engine = self.world.new_engine("daemon")
+                engine.config, engine.state_dir, engine.gh_runner = sb.load_config(), self.world.state, self.route
+                before = sb.read_impact_state(self.world.state)[0]["clears"]
+                for name, reader in self.readers(engine).items():
+                    with self.subTest(reader=name):
+                        self.assertEqual(reader(), held, "%s reads %s for a rating state of %r" % (name, "held" if not held else "not held", rating))
+                self.assertEqual(sb.read_impact_state(self.world.state)[0]["clears"], before, "no reader records a clear")
+
+    def test_the_reader_table_is_complete(self):
+        """The readers are DERIVED from the code: every function that calls `rehold_reason` (the one rule) is in the table, and the table holds nothing else but the two gate rows."""
+        import ast
+        callers = set()
+        for path in (BIN / "fleet-switchboard", BIN / "impact_hold.py"):
+            for node in ast.parse(path.read_text()).body:
+                if isinstance(node, ast.FunctionDef) and any(isinstance(x, ast.Call) and getattr(x.func, "id", "") == "rehold_reason" for x in ast.walk(node)):
+                    callers.add(node.name)
+        engine = self.world.new_engine("daemon")
+        self.assertEqual(callers, set(self.readers(engine)) - {"rehold_reason", "G6", "G6b"})
+        plan_code = (BIN / "plan_ledger.py").read_text()
+        self.assertEqual(plan_code.count('floor.get("rehold")'), 2, "G6 and G6b each read the gate fact's re-hold")
+
+    def test_a_held_again_pull_request_must_still_explain_itself_in_gate_g6b(self):
+        self.cleared_at_a_then_pushed_to_b()
+        self.pr["labels"] = []
+        self.pr["body"] = "PLAN: acme/app#7\n"
+        row = self.row(self.gates()[1], "G6b")
+        self.assertEqual(row["status"], "missing", "held again by the rule alone: the v2 body is checked")
+        self.pr["body"] = self.HELD_BODY
+        self.assertEqual(self.row(self.gates()[1], "G6b")["status"], "ok")
+
+    def test_the_ledger_cannot_be_read_changes_nothing_and_the_gate_holds(self):
+        self.cleared_at_a_then_pushed_to_b()
+        engine = self.world.new_engine("daemon")
+        engine.config, engine.state_dir, engine.gh_runner = sb.load_config(), self.world.state, self.route
+        with mock.patch.object(sb.plan_ledger, "read_ledger", return_value=([], "the ledger is not valid JSON")):
+            self.assertFalse(sb._impact_rehold_now(engine, "acme/app", 9, self.PR, {"head": LEDGER_NEW_HEAD}, {}), "no change from the pass")
+            self.assertEqual(self.writes, [])
+            self.assertTrue(sb.rehold_reason(engine, sb.read_impact_state(self.world.state)[0], "acme/app", self.PR, LEDGER_NEW_HEAD), "an unknown rating holds")
+
+    def test_only_the_fleets_own_hold_labels_the_clear_removed_are_put_back_and_a_failed_write_backs_off(self):
+        self.cleared_at_a_then_pushed_to_b()
+        state = sb.read_impact_state(self.world.state)[0]
+        state["clears"][self.PR]["removed"] = [self.names["hold-credential"], "bug", "other:hold-policy"]
+        sb.write_impact_state(self.world.state, state)
+        self.passes(records=[self.listed(head=LEDGER_NEW_HEAD)], advance=2000)
+        (write,) = self.label_writes()
+        self.assertEqual(sorted(write[2]["labels"]), sorted(self.labelled() + [self.names["hold-credential"]]), "a foreign label is never added")
+        self.writes.clear()
+        with mock.patch.object(sb, "change_issue_labels", side_effect=RuntimeError("gh: down")):
+            self.floor_pr(path="src/app.py", head="c" * 40)   # a third head: judged afresh
+            self.passes(records=[self.listed(head="c" * 40)], advance=4000)
+        self.assertTrue(self.events("impact.error"), "a failed write is said and retried, never marked done")
+        self.writes.clear()
+        self.passes(records=[self.listed(head="c" * 40)], advance=10)   # inside the back-off: nothing is tried
+        self.assertEqual(self.label_writes(), [])
+        self.passes(records=[self.listed(head="c" * 40)], advance=2 * sb.IMPACT_RETRY_SECONDS)   # after it: the write is retried and lands
+        self.assertEqual(len(self.label_writes()), 1)
+
+    def test_not_whole_input_changes_nothing_and_an_unreadable_head_is_held(self):
+        self.cleared_at_a_then_pushed_to_b()
+        engine = self.world.new_engine("daemon")
+        engine.config, engine.state_dir, engine.gh_runner = sb.load_config(), self.world.state, self.route
+        state = sb.read_impact_state(self.world.state)[0]
+        self.assertTrue(sb.rehold_reason(engine, state, "acme/app", self.PR, None), "an unreadable head is held")
+        self.assertIsNone(sb.rehold_reason(engine, {"clears": {}, "applied": {}}, "acme/app", self.PR, None), "no recorded clear: this rule holds nothing")
+        (self.world.state / "impact-hold.json").write_text("{not json")   # a corrupt state: no change from the re-hold, never a clear
+        self.assertFalse(sb._impact_rehold_now(engine, "acme/app", 9, self.PR, {"head": LEDGER_NEW_HEAD}, {}))
+        self.assertEqual(self.writes, [])
+
     def test_a_clear_also_takes_off_a_merge_captain_label_the_switchboard_did_not_add(self):   # #742: it was `..._keeps_...` (#179 L4: only the labels the switchboard added came off)
         self.passes(records=[self.listed(labels=[self.names["merge-captain"]])])
         self.assertEqual(self.run_as(None, "impact", "clear", self.PR, "--reason", "a false hold: the file is a fixture")[0], 0)
@@ -40705,13 +41145,11 @@ class TestOrdersBodyEdits(unittest.TestCase):
                     sb.add_order_to_body(ORDERS_CHARTER_BODY, text, "alice", "2027-01-05")
         sb.add_order_to_body(ORDERS_CHARTER_BODY, "x" * 300, "alice", "2027-01-05")
 
-    def test_at_most_twenty_orders(self):
+    def test_a_charter_carries_any_number_of_orders(self):
         body = ORDERS_CHARTER_BODY
-        for n in range(sb.ORDERS_MAX):
+        for n in range(32):
             body = sb.add_order_to_body(body, "order %d" % n, "alice", "2027-01-05")
-        with self.assertRaises(sb.OrdersError) as raised:
-            sb.add_order_to_body(body, "one more", "alice", "2027-01-05")
-        self.assertIn("20", str(raised.exception))
+        self.assertEqual(body.count("(ordered by alice, 2027-01-05)"), 32)
 
 
 class OrdersCase(IntentCase):
@@ -40906,13 +41344,12 @@ class TestOrdersCopy(OrdersCase):
         self.assertIn("the orders stand, but the comment on the charter failed", err)
         self.assertEqual(self.target(), self.sources)
 
-    def test_a_target_at_the_limit_reports_the_overflow_as_failures(self):
+    def test_a_target_already_holding_eighteen_orders_takes_every_copy(self):
         self.gh.bodies[20] = charter_with(["other order %d (ordered by bob, 2026-10-01)" % i for i in range(1, 19)])
         code, out, err = self.main("orders", "copy", "--source", "1", "--charter", "20")
-        self.assertEqual(code, 1)
-        self.assertEqual(len(self.target()), sb.ORDERS_MAX)
-        self.assertIn("17 of 19 orders did not copy", err)
-        self.assertIn("2 copied", out)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self.target()), 18 + len(self.sources))
+        self.assertNotIn("did not copy", err)
 
 
 class TestOrdersCLI(OrdersCase):
@@ -41339,9 +41776,12 @@ class TestJudgeSeesTheOrders(PolicyCase):
                                                "self-certify (ordered by alice, 2027-01-06)")
         self.assertEqual((context["charter"], len(context["orders"])), (1, 2))
 
-    def test_the_state_the_model_sees_holds_the_orders_clipped_to_1200(self):  # 600 until issue 87
-        state = sb.policy_state("orchestrator", "i", "d", "o" * 1500, "shell", "ls")
-        self.assertEqual(len(state["standing_authority"]), 1200)
+    def test_the_state_the_model_sees_holds_the_orders_whole(self):
+        orders = "; ".join("order %d %s https://example.com/a?b=c;d \u00e9\u2026" % (n, "x" * 250) for n in range(30))
+        state = sb.policy_state("orchestrator", "i", "d", orders, "shell", "ls")
+        self.assertEqual(state["standing_authority"], orders)
+        self.assertTrue(state["standing_authority"].endswith("\u00e9\u2026"))
+        self.assertEqual(state["standing_authority"].count("\u2026"), 30, "no ellipsis added")
         self.assertEqual(sb.policy_state("orchestrator", "i", "d", "o" * 500, "shell", "ls")["standing_authority"],
                          "o" * 500)
 
@@ -41357,6 +41797,60 @@ class TestJudgeSeesTheOrders(PolicyCase):
         self.direct_judge(Spy()).decide({"session": self.orch, "tool": "shell", "arguments": "gh pr view 1",
                                          "configured": "allow"})
         self.assertTrue(any("approve deploys here" in text for text in seen), seen)
+
+
+class OrdersReachTheJudgeWhole:
+    """Every path an orders text takes to the judge's input: a charter's (resolve_policy_context), the Chief of Staff's
+    file (context_of) and an owner's agent's inbound answer (judge_inbound_answer). Each is driven through its real code
+    with 30 long orders; the last order must be in the judge's input, whole."""
+
+    @staticmethod
+    def long_orders(prefix, count=30, width=250):
+        return ["%s %02d %s end-%s-%02d" % (prefix, n, "x" * width, prefix, n) for n in range(count)]
+
+    class Spy:
+        def __init__(self):
+            self.seen = []
+
+        def decide(self, state, questions):
+            self.seen.append(state)
+            raise sb.JevError("unreachable", "spy")
+
+
+class TestEveryPathOrdersTakeToTheJudge(PolicyCase, OrdersReachTheJudgeWhole):
+    def test_the_charter_path_hands_the_judge_every_order_whole(self):
+        orders = self.long_orders("charter")
+        body = ORDERS_CHARTER_BODY
+        for text in orders:
+            body = sb.add_order_to_body(body, text, "alice", "2027-01-05")
+        self.gh.bodies = {1: body}
+        spy = self.Spy()
+        self.direct_judge(spy).decide({"session": self.orch, "tool": "shell", "arguments": "gh pr view 1", "configured": "allow"})
+        seen = spy.seen[0]["standing_authority"]
+        self.assertIn("end-charter-29 (ordered by alice, 2027-01-05)", seen)
+        self.assertEqual(seen.count("end-charter-"), 30)
+        self.assertNotIn("\u2026", seen)
+
+    def test_the_chief_of_staffs_file_path_hands_the_judge_every_order_whole(self):
+        orders = self.long_orders("file", count=30, width=240)
+        put_cos_orders(self, "\n".join(orders))
+        spy = self.Spy()
+        self.direct_judge(spy).decide({"session": self.cos, "tool": "shell", "arguments": "gh pr view 1", "configured": "allow"})
+        seen = spy.seen[0]["standing_authority"]
+        self.assertEqual(seen, "\n".join(orders))
+        self.assertTrue(seen.endswith("end-file-29"))
+
+    def test_the_inbound_answer_path_hands_the_judge_every_order_whole(self):
+        orders = self.long_orders("inbound", count=30, width=240)
+        put_cos_orders(self, "\n".join(orders))
+        config = policy_raw_config()
+        config["cos_orders_file"] = str(cos_orders_file(self))
+        spy = self.Spy()
+        decision = {"id": "d1", "kind": "question", "agent": "orch", "tier": "cos", "title": "Which cache?"}
+        with mock.patch.object(sb, "build_jev", return_value=spy):
+            sb.judge_inbound_answer(types.SimpleNamespace(config=config), decision, {"text": "use redis"}, "owner_agent")
+        self.assertEqual(spy.seen[0]["standing_authority"], "\n".join(orders))
+        self.assertTrue(spy.seen[0]["standing_authority"].endswith("end-inbound-29"))
 
 
 def apply_orders_step(run, step):
@@ -41458,7 +41952,7 @@ class TestOrdersFact(unittest.TestCase):
             "within their words. They cover nothing they do not name."])
         self.assertEqual(len(carried), 1)
 
-    def test_twenty_full_length_orders_are_not_cut(self):
+    def test_full_length_orders_are_not_cut(self):
         orders = "\n".join("%d %s" % (n, "x" * 290) for n in range(20))
         text, _ = sb.compose("platform", [sb.Fact("orders:1:ab:start", "platform", "orders", orders, EPOCH, issue=1,
                                                   orders=True)])
@@ -44238,13 +44732,11 @@ class TestJudgeCosOrders(PolicyCase):
         context = self.direct_judge(None).context_of({"name": "orch", "role": "orchestrator", "charter": 1, "issue": 2})
         self.assertEqual(context["authority"], "may merge green PRs")
 
-    def test_the_state_the_model_sees_clips_the_chief_of_staffs_orders_and_a_charters_to_1200(self):
-        self.assertEqual(len(sb.policy_state("chief-of-staff", "i", "d", "o" * 2000, "shell", "ls",
-                                             sb.COS_ORDERS_STATE_CLIP)["standing_authority"]), 1200)
-        self.assertEqual(len(sb.policy_state("orchestrator", "i", "d", "o" * 2000, "shell", "ls")["standing_authority"]), 1200)
+    def test_the_state_the_model_sees_holds_the_chief_of_staffs_orders_and_a_charters_whole(self):
+        self.assertEqual(sb.policy_state("chief-of-staff", "i", "d", "o" * 8000, "shell", "ls")["standing_authority"], "o" * 8000)
         late = "Orchestrators may message each other and merge green PRs."
-        seen_text = sb.policy_state("orchestrator", "i", "d", "; ".join(["x" * 100] * 9 + [late]), "shell", "ls")["standing_authority"]
-        self.assertIn(late[:20], seen_text, "an order near the end of a long charter still reaches speaks_for_you and hard_to_reverse")
+        text = "; ".join(["x" * 300] * 29 + [late])
+        self.assertEqual(sb.policy_state("orchestrator", "i", "d", text, "shell", "ls")["standing_authority"], text)
         seen = []
 
         class Spy:
@@ -44252,9 +44744,9 @@ class TestJudgeCosOrders(PolicyCase):
                 seen.append(state)
                 raise sb.JevError("unreachable", "spy")
 
-        put_cos_orders(self, "o" * 2000)
+        put_cos_orders(self, "o" * 8000)
         self.direct_judge(Spy()).decide({"session": self.cos, "tool": "shell", "arguments": "gh pr view 1", "configured": "allow"})
-        self.assertEqual(len(seen[0]["standing_authority"]), 1200)
+        self.assertEqual(seen[0]["standing_authority"], "o" * 8000)
 
     def test_the_judge_reads_the_file_for_speaks_for_you_and_sees_an_edit_at_the_next_call(self):
         self.configure([{"contains": "echo commands", "noul": LOW},
@@ -67321,6 +67813,658 @@ class TestPreflightPr(unittest.TestCase):
         self.assertEqual(len(names), 4)
         for name in names:
             self.assertEqual(table.count('("%s",' % name), 1)
+
+
+class TestItemVerdicts(unittest.TestCase):
+    """#770 (plan fleet-kit#777): verdicts for a work item that has no pull request. Temp dirs and fakes only. Each attack has a test and a mutant: the
+    mutant is the weakened defence swapped in with mock.patch, and the same attack then SUCCEEDS (the test would fail on it)."""
+
+    REPO, N, ITEM = "acme-org/widget-service", 777, "acme-org/widget-service#777"
+    PIN, MOVED = "a" * 40, "b" * 40
+    T0 = 1_000_000
+
+    def setUp(self):
+        self.iv = sb.load_module("item_verdicts")
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.state = Path(self.dir)
+        self.clock = [self.T0]
+        self.audit = []
+        self.sessions = {"orch": "ses_o", "t1": "ses_t1", "t2": "ses_t2", "c1": "ses_c1", "n1": "ses_n1"}
+        self.fleets = {"orch": {"role": "orchestrator", "repo": self.REPO, "charter": 587},
+                       "t1": {"role": "tester", "repo": self.REPO, "reports_to": "orch", "launched_by": "orch", "issue": self.N},
+                       "t2": {"role": "tester", "repo": self.REPO, "reports_to": "orch", "launched_by": "orch", "issue": 778},
+                       "c1": {"role": "coder", "repo": self.REPO, "reports_to": "orch", "launched_by": "orch", "issue": self.N},
+                       "n1": {"role": "coder", "repo": self.REPO, "reports_to": "orch", "launched_by": "orch", "issue": 700}}
+        self.scenarios = [{"id": "S1", "evaluator": "tester", "proof": "live", "claim": "pr"},
+                          {"id": "S2", "evaluator": "ci", "proof": "test", "claim": "pr"},
+                          {"id": "S3", "evaluator": "tester", "proof": "measure", "claim": "epic"},
+                          {"id": "S4", "evaluator": "tester", "proof": "measure"}]
+        self.plan = {"result": "pass", "defects": [], "scenarios_parsed": self.scenarios, "plan_hash": "sha256:p", "text": "", "source": "plan"}
+        self.pages = {}
+
+    def now(self):
+        return self.clock[0]
+
+    def entries(self):
+        return sb.plan_ledger.read_ledger(self.state)[0]
+
+    def register(self, tester="t1", item=None, head=None, orch="orch", session=None):
+        item = item or self.ITEM
+        return sb.plan_ledger.append_entry(self.state, {"kind": "item_tester", "pr": item, "item": item, "tester": tester, "session": session or self.sessions.get(tester),
+                                                         "orchestrator": orch, "head": head or self.PIN, "plan_ref": None, "by": orch}, self.now())
+
+    def ctx(self, author="human", own=True, item=None):
+        item = item or self.ITEM
+        number = int(item.rsplit("#", 1)[1])
+
+        class Audit:
+            def append(inner, actor, event, subject=None, detail=None, **extra):
+                self.audit.append((event, subject, detail))
+        intents = types.SimpleNamespace(_api=lambda path, repo=None: self.pages[path] if path in self.pages else (_ for _ in ()).throw(sb.IntentError("not_found", path)))
+        engine = types.SimpleNamespace(intents=intents, audit=Audit(), actor="t", herdr=None, v2=None)
+        return types.SimpleNamespace(engine=engine, state=self.state, config={"plan_gates": {"repos": {self.REPO: {"item_checks": [{"name": "build", "app": "github-actions"}]}}}},
+                                     repo=self.REPO, number=number, pr=item, item=item, entries=self.entries(), problem=None, facts={}, unreadable=None, source="plan",
+                                     plan=self.plan, plan_problem=None, issue={"author": author, "body": "", "state": "open", "parent": None}, plan_own=own)
+
+    def args(self, **kw):
+        base = dict(item=self.ITEM, pr=None, plan=None, ask=None, head=None, scenario="S1", all_scenarios=False, evaluator="tester", result="pass", evidence="ran it", command=None)
+        base.update(kw)
+        return types.SimpleNamespace(**base)
+
+    def verdict(self, caller, retired=None, **kw):
+        """Run the real cmd_item_verdict as `caller`; (exit, why) where why is the refusal sentence or None."""
+        launch = sb.load_launch_testers().launched(self.fleets, self.sessions, self.REPO, lambda f: f.get("repo"), retired or {})
+        item = kw.get("item_key") or self.ITEM
+        with mock.patch.object(sb, "item_context", lambda a, r, n, w: self.ctx(item=item)), mock.patch.object(sb, "identify_caller", lambda *a: caller), \
+                mock.patch.object(sb, "item_agents", lambda c: (launch, self.sessions, self.fleets)):
+            try:
+                return sb.cmd_item_verdict(self.args(**{k: v for k, v in kw.items() if k != "item_key"}), None, self.now), None
+            except sb.LedgerCommandError as err:
+                return None, str(err)
+
+    def verdicts(self):
+        return [e for e in self.entries() if e.get("kind") == "verdict"]
+
+    # ---- S1 / DW-1: the registration and the verdict
+    def test_s1_a_registered_tester_records_a_verdict_for_its_item(self):
+        self.register()
+        code, why = self.verdict("t1")
+        self.assertEqual((code, why), (sb.EXIT_OK, None))
+        got = self.verdicts()
+        self.assertEqual([(v["pr"], v["by"], v["head"], v["evaluator"]) for v in got], [(self.ITEM, "t1", self.PIN, "tester")])
+
+    def test_s1_launch_registers_the_tester_for_that_item_by_the_switchboard(self):
+        self.pages.update({"repos/%s/issues/777" % self.REPO: {"user": {"login": "human"}, "body": "PLAN: https://github.com/acme-org/widget-service/issues/777#issuecomment-1",
+                                                               "state": "open", "parent_issue_url": "https://api.github.com/repos/acme-org/widget-service/issues/770"},
+                           "repos/%s/issues/770" % self.REPO: {"parent_issue_url": "https://api.github.com/repos/acme-org/widget-service/issues/587"},
+                           "repos/%s" % self.REPO: {"default_branch": "main"}, "repos/%s/commits/main" % self.REPO: {"sha": self.PIN}})
+        agents = {n: types.SimpleNamespace(fleet=f) for n, f in self.fleets.items()}
+        ctx = self.ctx()
+        ctx.engine.discover = lambda now: types.SimpleNamespace(agents=agents)
+        ctx.engine.now = lambda: self.now()
+        ctx.engine.config = {}
+        args = types.SimpleNamespace(role="tester", issue=777, name="t1", reports_to="orch")
+        sb.register_item_tester(ctx.engine, self.state, args, self.REPO, "orch", {"session": "ses_t1"}, self.now)
+        reg = self.iv.registrations(self.entries(), self.ITEM)
+        self.assertEqual([(e["tester"], e["session"], e["orchestrator"], e["head"]) for e in reg], [("t1", "ses_t1", "orch", self.PIN)])
+        self.assertEqual([a[0] for a in self.audit], ["plan.item.register"])
+        # a launch run by a coder (not the orchestrator) registers nothing, and says why
+        sb.register_item_tester(ctx.engine, self.state, args, self.REPO, "c1", {"session": "ses_t1"}, self.now)
+        self.assertEqual(len(self.iv.registrations(self.entries(), self.ITEM)), 1)
+        self.assertEqual(self.audit[-1][0], "plan.item.refused")
+
+    def test_s2_a_tester_registered_for_item_a_cannot_write_for_item_b(self):
+        self.register("t1")
+        other = "acme-org/widget-service#778"
+        code, why = self.verdict("t1", item_key=other)
+        self.assertIsNone(code)
+        self.assertIn("not registered", why)
+        self.assertEqual(self.verdicts(), [])
+        self.register("t2", item=other)
+        self.assertEqual(self.verdict("t1", item_key=other)[0], None)     # t2 is registered for B; t1 still is not
+
+    def test_s2_mutant_matching_on_role_and_repo_only_lets_it_through(self):
+        self.register("t1")
+        other = "acme-org/widget-service#778"
+        with mock.patch.object(self.iv, "registration_problem", lambda *a: None), mock.patch.object(self.iv, "pinned", lambda e, i: self.PIN):
+            code, why = self.verdict("t1", item_key=other)
+        self.assertEqual(code, sb.EXIT_OK, "the mutant (no per-item registration) records a verdict for item B")
+
+    # ---- S10: a forged or handmade launch record
+    def test_s10_a_handmade_launch_record_with_no_switchboard_entry_registers_nothing(self):
+        code, why = self.verdict("t1")          # the launch record is perfect (launched_by the orchestrator) but no ledger entry exists
+        self.assertIsNone(code)
+        self.assertIn("not registered", why)
+        self.assertEqual(self.verdicts(), [])
+
+    def test_s10_mutant_trusting_the_launch_record_alone_accepts_it(self):
+        with mock.patch.object(self.iv, "registration_problem", lambda *a: None), mock.patch.object(self.iv, "pinned", lambda e, i: self.PIN):
+            self.assertEqual(self.verdict("t1")[0], sb.EXIT_OK)
+
+    def test_s10_a_coder_launching_its_own_tester_is_refused_by_the_launch_record_and_writes_no_registration(self):
+        self.fleets["t1"]["launched_by"] = "c1"; self.fleets["t1"]["reports_to"] = "c1"
+        self.register("t1", orch="c1")      # even a ledger entry naming the coder as the orchestrator cannot make it a launched tester
+        code, why = self.verdict("t1")
+        self.assertIsNone(code)
+        self.assertIn("not a tester launched", why)
+
+    def test_s10_a_replayed_ledger_line_breaks_the_chain(self):
+        self.register()
+        self.verdict("t1")
+        path = self.state / sb.plan_ledger.LEDGER_FILE
+        lines = path.read_text().splitlines()
+        path.write_text("\n".join(lines + [lines[-1]]) + "\n")      # the verdict line copied once more
+        self.assertIsNotNone(sb.plan_ledger.read_ledger(self.state)[1])
+
+    # ---- S5: the reference commit does not move under the verdict
+    def test_s5_a_verdict_names_the_pinned_commit_and_no_other(self):
+        self.register()
+        code, why = self.verdict("t1", head=self.MOVED)
+        self.assertIsNone(code)
+        self.assertIn("reference commit", why)
+        self.assertEqual(self.verdicts(), [])
+        self.assertEqual(self.verdict("t1", head=self.PIN)[0], sb.EXIT_OK)
+        self.assertEqual(self.verdicts()[0]["head"], self.PIN)
+
+    def test_s5_mutant_reading_the_tip_at_verdict_time_accepts_a_moved_commit(self):
+        self.register()
+        with mock.patch.object(self.iv, "pinned", lambda e, i: self.MOVED):
+            code, why = self.verdict("t1", head=self.MOVED)
+        self.assertEqual(code, sb.EXIT_OK, "the mutant stamps whatever the tip is now")
+
+    def test_s5_a_new_registration_voids_the_verdicts_at_the_old_commit(self):
+        self.register()
+        self.verdict("t1")
+        self.clock[0] += 60
+        self.register("t1", head=self.MOVED)
+        report = sb.item_gates_report(self.ctx(), set())
+        row = next(r for r in report["scenarios"] if r["id"] == "S1")
+        self.assertEqual(row["status"], "missing")
+        self.assertTrue(any("head moved" in v for v in row["void"]))
+
+    # ---- S3/S4: CI verdicts of the repository's own checks
+    RUN = {"name": "build", "status": "completed", "conclusion": "success", "app": {"slug": "github-actions"}}
+
+    def ci(self, runs, on_branch=True, checks=True):
+        self.register()
+        self.pages.update({"repos/%s" % self.REPO: {"default_branch": "main"},
+                           "repos/%s/compare/main...%s" % (self.REPO, self.PIN): {"status": "identical" if on_branch else "diverged"},
+                           "repos/%s/commits/%s/check-runs?per_page=100" % (self.REPO, self.PIN): {"check_runs": runs}})
+        ctx = self.ctx()
+        if not checks:
+            ctx.config = {"plan_gates": {"repos": {self.REPO: {}}}}
+        with mock.patch.object(sb, "item_context", lambda a, r, n, w: ctx):
+            try:
+                return sb.cmd_item_ci_record(types.SimpleNamespace(rest=[self.ITEM], plan=None, ask=None), None, self.now), None
+            except sb.LedgerCommandError as err:
+                return None, str(err)
+
+    def test_s3_every_listed_check_green_at_the_reference_commit_records_one_ci_verdict_by_the_recorder(self):
+        self.assertEqual(self.ci([self.RUN])[0], sb.EXIT_OK)
+        got = self.verdicts()
+        self.assertEqual([(v["scenario"], v["by"], v["head"], v["evaluator"]) for v in got], [("S2", sb.plan_ledger.CI_RECORDER, self.PIN, "ci")])
+        self.assertEqual([a[0] for a in self.audit if a[0] == "plan.item.ci_record"], ["plan.item.ci_record"])
+
+    def test_s3_an_agent_cannot_type_a_ci_verdict_for_an_item(self):
+        self.register()
+        code, why = self.verdict("t1", scenario="S2", evaluator="ci")
+        self.assertIsNone(code)
+        self.assertIn("ci", why)
+        self.assertEqual(self.verdicts(), [])
+
+    def test_s4_nothing_configured_a_same_named_check_of_another_app_or_a_commit_off_the_branch_records_nothing(self):
+        other = dict(self.RUN, app={"slug": "evil-workflow"})
+        for runs, kwargs, reason in (([self.RUN], {"checks": False}, "no item_checks"), ([other], {}, "no run of build by github-actions"), ([self.RUN], {"on_branch": False}, "not on the default branch"),
+                                     ([dict(self.RUN, conclusion="failure")], {}, "did not succeed"), ([dict(self.RUN, status="in_progress", conclusion=None)], {}, "not complete")):
+            self.setUp()
+            code, why = self.ci(runs, **kwargs)
+            self.assertIsNone(code, (runs, kwargs))
+            self.assertIn(reason, why)
+            self.assertEqual(self.verdicts(), [], (runs, kwargs))
+
+    def test_s4_mutant_matching_a_check_by_name_alone_records_the_faked_one(self):
+        other = dict(self.RUN, app={"slug": "evil-workflow"})
+        real = self.iv.ci_decision
+        by_name = lambda runs, checks: real(runs, [dict(c, app=r["app"]["slug"]) for c in checks for r in runs[:1]] if runs else checks)
+        with mock.patch.object(self.iv, "ci_decision", by_name):
+            self.assertEqual(self.ci([other])[0], sb.EXIT_OK, "the mutant accepts the same-named run of another app")
+
+    def test_s4_the_item_checks_key_is_validated_by_its_own_module_and_defaults_to_none(self):
+        self.assertEqual(self.iv.validate_item_checks(None, "c"), [])
+        self.assertEqual(self.iv.validate_item_checks([{"name": "build", "app": "github-actions"}], "c"), [{"name": "build", "app": "github-actions"}])
+        for bad in ("build", [{"name": "build"}], [{"name": "", "app": "x"}], [{"name": "a", "app": "b", "x": 1}], [{"name": "a", "app": "b"}] * 2):
+            with self.assertRaises(ValueError):
+                self.iv.validate_item_checks(bad, "c")
+        raw = {"repos": {self.REPO: {"item_checks": [{"name": "build", "app": "github-actions"}]}}}
+        self.assertEqual(sb.plan_ledger.validate_plan_gates(raw, "c")["repos"][self.REPO]["item_checks"], raw["repos"][self.REPO]["item_checks"])
+        self.assertNotIn("item_checks", sb.plan_ledger.validate_plan_gates({"repos": {self.REPO: {}}}, "c")["repos"][self.REPO])
+
+    # ---- S6/S7: the item-level claim
+    def test_s6_an_item_claims_only_pr_scenarios_never_an_ask_level_live_one(self):
+        self.register()
+        code, why = self.verdict("t1", all_scenarios=True, scenario=None, head=self.PIN)
+        self.assertEqual(code, sb.EXIT_OK)
+        self.assertEqual([v["scenario"] for v in self.verdicts()], ["S1"])        # S3 is claim: epic, S4 is tester + measure with no claim (read as epic)
+        for sid in ("S3", "S4"):
+            code, why = self.verdict("t1", scenario=sid)
+            self.assertIsNone(code)
+            self.assertIn("epic", why)
+        self.assertEqual(len(self.verdicts()), 1)
+
+    def test_s6_mutant_giving_the_item_every_scenario_claims_the_live_one(self):
+        self.register()
+        with mock.patch.object(sb.plan_ledger, "claim_of", lambda s: "pr"):
+            self.verdict("t1", all_scenarios=True, scenario=None, head=self.PIN)
+        self.assertIn("S3", [v["scenario"] for v in self.verdicts()])
+
+    def test_s7_an_item_that_links_the_asks_plan_claims_only_what_is_sliced_to_it(self):
+        self.register()
+        self.scenarios[0]["slice"] = "#778"
+        self.scenarios.append({"id": "S5", "evaluator": "tester", "proof": "live", "claim": "pr", "slice": "#777"})
+        launch = sb.load_launch_testers().launched(self.fleets, self.sessions, self.REPO, lambda f: f.get("repo"), {})
+        results = {}
+        for sid in ("S1", "S5"):
+            with mock.patch.object(sb, "item_context", lambda a, r, n, w: self.ctx(own=False)), mock.patch.object(sb, "identify_caller", lambda *a: "t1"), \
+                    mock.patch.object(sb, "item_agents", lambda c: (launch, self.sessions, self.fleets)):
+                try:
+                    results[sid] = sb.cmd_item_verdict(self.args(scenario=sid), None, self.now)
+                except sb.LedgerCommandError as err:
+                    results[sid] = str(err)
+        self.assertIn("not sliced", results["S1"])
+        self.assertEqual(results["S5"], sb.EXIT_OK)
+        self.assertEqual([v["scenario"] for v in self.verdicts()], ["S5"])
+
+    # ---- S8: independence
+    def test_s8_the_author_notifier_orchestrator_the_orchestrators_coder_and_a_coders_session_are_refused(self):
+        self.register()
+        self.fleets["nt"] = {"role": "tester", "repo": self.REPO, "reports_to": "orch", "launched_by": "orch", "issue": self.N}
+        self.sessions["nt"] = self.sessions["c1"]            # a tester running in the session of the item's coder
+        self.register("nt")
+        self.fleets["human"] = {"role": "tester", "repo": self.REPO, "reports_to": "orch", "launched_by": "orch", "issue": self.N}
+        self.sessions["human"] = "ses_h"
+        self.register("human")                                # a tester that is also the issue's GitHub author
+        self.fleets["wk"] = {"role": "coder", "repo": self.REPO, "reports_to": "orch", "launched_by": "orch", "issue": 700}   # the orchestrator's coder on ANOTHER item (the notifier)
+        self.sessions["wk"] = "ses_wk"
+        reasons = {}
+        for who in ("human", "c1", "wk", "nt"):
+            if who in ("c1", "wk"):
+                self.register(who)
+            code, why = self.verdict(who)
+            self.assertIsNone(code, who)
+            reasons[who] = why
+        self.assertIn("wrote or runs", reasons["human"])        # the issue's author, a launched tester
+        self.assertIn("wrote or runs", reasons["nt"])           # a launched tester in the session of the item's coder
+        self.assertIn("not a tester launched", reasons["c1"])   # the coders are no launched testers at all
+        self.assertIn("not a tester launched", reasons["wk"])
+        self.assertEqual(self.verdicts(), [])
+        writers = self.iv.excluded(self.ITEM, self.N, None, "human", self.entries(), self.fleets, self.sessions)
+        self.assertTrue({"orch", "c1", "wk", "human", "nt"} <= writers)       # the exclusion itself, whatever else refuses first
+        self.assertEqual(self.iv.verdict_problem(self.ITEM, "wk", self.entries(), writers, "ses_wk", self.now(), self.PIN)[:2], "wk")
+
+    def test_s8_mutant_excluding_only_the_issue_author_records_the_others(self):
+        for who in ("c1", "wk"):
+            self.fleets[who] = dict(self.fleets.get(who, {}), role="tester", repo=self.REPO, reports_to="orch", launched_by="orch", issue=self.N)
+            self.sessions.setdefault(who, "ses_" + who)
+            self.register(who)
+        with mock.patch.object(self.iv, "excluded", lambda item, number, ask, author, entries, fleets, sessions: {author}):
+            codes = [self.verdict(who)[0] for who in ("c1",)]
+        self.assertEqual(codes, [sb.EXIT_OK], "the mutant lets the orchestrator's other worker record")
+
+    def test_s9_a_tester_that_later_proves_for_the_item_loses_its_verdicts_at_read_time(self):
+        self.register()
+        self.verdict("t1")
+        before = sb.item_gates_report(self.ctx(), self.iv.excluded(self.ITEM, self.N, None, "human", self.entries(), self.fleets, self.sessions))
+        self.assertEqual(next(r for r in before["scenarios"] if r["id"] == "S1")["verdict"]["by"], "t1")
+        self.assertEqual(self.prove("t1")[0], sb.EXIT_OK)
+        after = sb.item_gates_report(self.ctx(), self.iv.excluded(self.ITEM, self.N, None, "human", self.entries(), self.fleets, self.sessions))
+        row = next(r for r in after["scenarios"] if r["id"] == "S1")
+        self.assertEqual(row["status"], "missing")
+        self.assertTrue(any("author" in m for m in row["missing"]))
+
+    def test_s9_mutant_computing_the_writers_at_write_time_only_still_reads_ok(self):
+        self.register()
+        self.verdict("t1")
+        self.assertEqual(self.prove("t1")[0], sb.EXIT_OK)
+        report = sb.item_gates_report(self.ctx(), set())          # the mutant reads with no writers
+        self.assertEqual(next(r for r in report["scenarios"] if r["id"] == "S1")["status"], "ok")
+
+    def test_s17_a_registered_tester_that_reports_done_keeps_its_verdict_and_a_coders_report_excludes_the_coder(self):
+        self.register()
+        self.assertEqual(self.prove("c1")[0], sb.EXIT_OK)
+        self.assertEqual(self.verdict("t1")[0], sb.EXIT_OK)
+        writers = self.iv.excluded(self.ITEM, self.N, None, "human", self.entries(), self.fleets, self.sessions)   # a report by t1 adds nobody: reports are not read
+        self.assertNotIn("t1", writers)
+        self.assertIn("c1", writers)
+        report = sb.item_gates_report(self.ctx(), writers)
+        self.assertEqual(next(r for r in report["scenarios"] if r["id"] == "S1")["status"], "ok")
+        self.register("c1")
+        self.assertIsNone(self.verdict("c1")[0])
+
+    def test_s18_a_registration_expires_after_24_hours_and_ends_with_the_session_or_retirement(self):
+        self.register()
+        self.clock[0] += 23 * 3600
+        self.assertEqual(self.verdict("t1")[0], sb.EXIT_OK)
+        self.clock[0] += 2 * 3600
+        code, why = self.verdict("t1")
+        self.assertIsNone(code)
+        self.assertIn("registration expired", why)
+        self.register()                                      # a fresh registration for ses_t1
+        self.sessions["t1"] = "ses_other"                    # the tester now runs in another session
+        code, why = self.verdict("t1")
+        self.assertIsNone(code)
+        self.assertIn("another session", why)
+        self.sessions["t1"] = "ses_t1"
+        code, why = self.verdict("t1", retired={"t1": {"session": None}})
+        self.assertIsNone(code)
+        self.assertIn("not a tester launched", why)
+
+    def test_s18_mutant_never_expiring_records_at_25_hours(self):
+        self.register()
+        self.clock[0] += 25 * 3600
+        with mock.patch.object(self.iv, "TTL", 10 ** 9):
+            self.assertEqual(self.verdict("t1")[0], sb.EXIT_OK)
+
+    def test_a_replayed_verdict_at_an_old_commit_is_refused_after_a_repin(self):
+        self.register()
+        self.clock[0] += 60
+        self.register("t1", head=self.MOVED)
+        code, why = self.verdict("t1", head=self.PIN)
+        self.assertIsNone(code)
+        self.assertIn("reference commit", why)
+
+    # ---- S12: audit
+    def test_s12_a_registration_a_verdict_and_a_refusal_are_audited_with_the_item_the_writer_and_the_reference_commit(self):
+        self.register()
+        self.verdict("t1")
+        self.verdict("c1")
+        self.verdict("t1", head=self.MOVED)
+        events = {e: d for e, s, d in self.audit}
+        self.assertEqual(events["plan.item.verdict"]["by"], "t1")
+        self.assertEqual((events["plan.item.verdict"]["item"], events["plan.item.verdict"]["reference_commit"]), (self.ITEM, self.PIN))
+        refused = [d for e, s, d in self.audit if e == "plan.item.refused"]
+        self.assertEqual([r["item"] for r in refused], [self.ITEM] * 2)
+        self.assertEqual(sorted(r["by"] for r in refused), ["c1", "t1"])
+        self.assertTrue(all(r["reference_commit"] == self.PIN for r in refused))
+
+    # ---- S13 to S15: the draft line
+    def g4(self, **facts):
+        report = sb.plan_ledger.evaluate_gates(None, [], None, dict({"head": "a" * 40}, **facts), "acme-org/widget-service#9")
+        return next(r for r in report["gates"] if r["gate"] == "G4")["missing"]
+
+    def test_s13_a_draft_pr_with_no_ci_says_the_draft_line(self):
+        self.assertEqual(self.g4(ci="none", draft=True), ["draft: no CI run seen; this repo's workflow may skip drafts; mark ready, then wait"])
+
+    def test_s14_a_ready_pr_with_a_failing_check_or_an_unknown_draft_flag_keeps_the_failing_line(self):
+        line = ["CI is failing (needs green at the head, or a second agent's re-run)"]
+        self.assertEqual(self.g4(ci="failing", draft=False), line)
+        self.assertEqual(self.g4(ci="failing", draft=True), line)      # a draft that HAS runs and a failing check: the failing line
+        self.assertEqual(self.g4(ci="failing"), line)
+        self.assertEqual(self.g4(ci="failing", draft=None), line)
+
+    def test_s15_the_draft_flag_comes_from_isdraft_not_from_the_title(self):
+        data = {"title": "draft: x", "state": "OPEN", "headRefOid": "a" * 40, "isDraft": False}
+        self.assertIs(sb.pr_facts_from(data)["draft"], False)
+        self.assertIs(sb.pr_facts_from(dict(data, title="x", isDraft=True))["draft"], True)
+        self.assertIn("isDraft", sb.PR_VIEW_FIELDS.split(","))
+
+    # ---- U2 / U3
+    def test_u2_a_pull_request_number_is_refused_on_the_item_path_and_nothing_changes_for_pr(self):
+        self.pages["repos/%s/issues/9" % self.REPO] = {"pull_request": {"url": "x"}, "user": {"login": "a"}}
+        engine = self.ctx().engine
+        with self.assertRaises(sb.LedgerCommandError) as raised:
+            sb.item_issue(engine, self.REPO, 9)
+        self.assertIn("is a pull request", str(raised.exception))
+        self.assertEqual(sb.plan_ledger.KINDS[:13], ("proof", "verdict", "consensus", "waiver", "round", "lane_session", "lane", "response", "escalation", "decision", "abandoned", "reminder", "review_record"))
+
+    def test_u3_a_ledger_with_item_entries_reads_with_the_chain_intact_and_read_ledger_never_looks_at_kinds(self):
+        self.register()
+        self.verdict("t1")
+        self.assertEqual(sb.plan_ledger.read_ledger(self.state)[1], None)
+        tree = ast.parse(Path(sb.plan_ledger.__file__).read_text())
+        func = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "read_ledger")
+        names = {n.id for n in ast.walk(func) if isinstance(n, ast.Name)}
+        self.assertFalse(names & {"KINDS", "ITEM_KINDS", "EVIDENCE_KINDS"}, "read_ledger must not judge kinds: an older build must read a ledger with item entries")
+
+    # ---- item-prove and the refusals of the registration
+    def prove(self, caller, sid="S1", item_key=None):
+        args = types.SimpleNamespace(item=item_key or self.ITEM, scenario=[sid], plan=None, ask=None, head=None, evidence="ran it", result="pass", command=None)
+        with mock.patch.object(sb, "item_context", lambda a, r, n, w: self.ctx()), mock.patch.object(sb, "identify_caller", lambda *a: caller):
+            try:
+                return sb.cmd_item_prove(args, None, self.now), None
+            except sb.LedgerCommandError as err:
+                return None, str(err)
+
+    def test_item_prove_records_at_the_reference_commit_audits_it_and_makes_its_author_an_excluded_writer(self):
+        code, why = self.prove("c1")
+        self.assertIsNone(code)
+        self.assertIn("no reference commit", why)              # nothing is registered yet
+        self.register()
+        self.assertEqual(self.prove("c1")[0], sb.EXIT_OK)
+        proofs = [e for e in self.entries() if e.get("kind") == "proof"]
+        self.assertEqual([(e["pr"], e["by"], e["head"], e["scenario"]) for e in proofs], [(self.ITEM, "c1", self.PIN, "S1")])
+        self.assertIn("plan.item.proof", [a[0] for a in self.audit])
+        self.assertEqual(self.prove("t1", sid="S2")[0], sb.EXIT_OK)      # a tester that proves becomes an author: its verdict is then refused
+        code, why = self.verdict("t1")
+        self.assertIsNone(code)
+        self.assertIn("wrote or runs", why)
+        self.assertEqual(self.prove("c1", sid="S3")[0], sb.EXIT_PARTIAL)   # an epic-claimed scenario is not claimed by an item
+        self.assertEqual(len([e for e in self.entries() if e.get("kind") == "proof"]), 2)    # c1's S1 and t1's S2; S3 recorded nothing
+
+    def register_world(self, **page_changes):
+        self.pages.update({"repos/%s/issues/777" % self.REPO: {"user": {"login": "human"}, "body": "", "state": "open", "parent_issue_url": "https://api.github.com/repos/acme-org/widget-service/issues/770"},
+                           "repos/%s/issues/770" % self.REPO: {"parent_issue_url": "https://api.github.com/repos/acme-org/widget-service/issues/587"},
+                           "repos/%s" % self.REPO: {"default_branch": "main"}, "repos/%s/commits/main" % self.REPO: {"sha": self.PIN}})
+        self.pages.update(page_changes)
+        agents = {n: types.SimpleNamespace(fleet=f) for n, f in self.fleets.items()}
+        ctx = self.ctx()
+        ctx.engine.discover = lambda now: types.SimpleNamespace(agents=agents)
+        ctx.engine.now = lambda: self.now()
+        ctx.engine.config = {}
+        return ctx.engine
+
+    def register_try(self, engine, launched_by="orch", reports_to="orch"):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            sb.register_item_tester(engine, self.state, types.SimpleNamespace(role="tester", issue=777, name="t1", reports_to=reports_to), self.REPO, launched_by,
+                                    {"session": "ses_t1"}, self.now)
+        return len(self.iv.registrations(self.entries(), self.ITEM)), [a for a in self.audit if a[0].startswith("plan.item.")]
+
+    def test_every_refusal_of_a_registration_writes_no_entry_and_audits_why(self):
+        issue = "repos/%s/issues/777" % self.REPO
+        base = {"user": {"login": "human"}, "body": "", "state": "open", "parent_issue_url": "https://api.github.com/repos/acme-org/widget-service/issues/770"}
+        cases = (("is not open", dict(self.pages, **{issue: dict(base, state="closed")}), {}),
+                 ("does not reach", {}, {"orch_charter": 999}),
+                 ("could not be read", {"repos/%s/commits/main" % self.REPO: {"sha": "xyz"}}, {}),
+                 ("not run by an orchestrator", {}, {"launched_by": "c1"}),
+                 ("report to the orchestrator", {}, {"reports_to": "c1"}))
+        for reason, changes, extra in cases:
+            self.setUp()
+            self.fleets["orch"]["charter"] = extra.get("orch_charter", 587)
+            engine = self.register_world(**({issue: dict(base, state="closed")} if reason == "is not open" else changes))
+            count, audit = self.register_try(engine, launched_by=extra.get("launched_by", "orch"), reports_to=extra.get("reports_to", "orch"))
+            self.assertEqual(count, 0, reason)
+            self.assertEqual([a[0] for a in audit], ["plan.item.refused"], reason)
+            self.assertIn(reason, audit[0][2]["why"])
+        self.setUp()                                           # a pull request number: this path does not apply, and says nothing
+        engine = self.register_world(**{issue: {"pull_request": {"url": "x"}, "user": {"login": "a"}}})
+        self.assertEqual(self.register_try(engine), (0, []))
+        self.assertTrue(self.iv.lane_ok([777, 770, 587], 587))
+        self.assertFalse(self.iv.lane_ok([777, 770], 587))
+        self.assertFalse(self.iv.lane_ok([777], None))
+
+    # ---- the pull request commands never write for an item; gates item reads only what the item path wrote; the read fails closed; the append re-checks
+    def pr_path(self, command, caller="t2", picture=(None, "PLAN: acme-org/widget-service#777", [], "no pull request found"), **kw):
+        """Run an ORDINARY pull request command (`prove`, `verdict`, `gates ci-record`, `waive`) with --pr naming the item's number."""
+        args = types.SimpleNamespace(pr=self.ITEM, plan=None, ask=None, head=self.PIN, scenario="S1", all_scenarios=False, evaluator="tester", result="pass", evidence="x",
+                                     command=None, gates="G1", reason="a long enough reason to waive")
+        for k, v in kw.items():
+            setattr(args, k, v)
+        ctx = self.ctx()
+        launch = sb.load_launch_testers().launched(self.fleets, self.sessions, self.REPO, lambda f: f.get("repo"), {})
+        with mock.patch.object(sb, "build_engine", lambda *a, **k: (ctx.engine, self.state, {"intent_repo": self.REPO})), mock.patch.object(sb, "pr_picture", lambda *a: picture), \
+                mock.patch.object(sb, "identify_caller", lambda *a: caller), mock.patch.object(sb, "checked_plan", lambda *a, **k: self.plan), \
+                mock.patch.object(sb, "launched_testers_for", lambda c: (launch, self.sessions, self.fleets)), mock.patch.object(sb, "gates_caller_kind", lambda *a: ("agent", "x", "chief-of-staff")):
+            try:
+                return getattr(sb, command)(args, None, self.now), None
+            except sb.LedgerCommandError as err:
+                return None, str(err)
+
+    def issue_page(self):
+        self.pages["repos/%s/issues/777" % self.REPO] = {"user": {"login": "human"}, "body": "", "state": "open"}
+
+    def test_a_pull_request_command_refuses_an_issue_number_and_writes_nothing(self):
+        self.issue_page()
+        self.register("t1")
+        self.register("t2", item="acme-org/widget-service#778", head=self.MOVED)
+        before = len(self.entries())
+        for command in ("cmd_prove", "cmd_verdict", "cmd_gates_ci_record", "cmd_waive"):
+            for caller in ("t2", "t1"):         # a tester registered for ANOTHER item, and the tester registered for this one
+                code, why = self.pr_path(command, caller=caller, scenario=["S1"] if command == "cmd_prove" else "S1", pr=self.ITEM)
+                self.assertIsNone(code, (command, caller))
+                self.assertTrue("work item" in why or "is an issue" in why, (command, caller, why))
+        self.assertEqual(len(self.entries()), before)           # nothing was written by any of them
+
+    def test_a_pull_request_command_refuses_an_issue_number_that_has_no_registration_too(self):
+        self.issue_page()
+        for command in ("cmd_verdict", "cmd_prove"):
+            code, why = self.pr_path(command, scenario=["S1"] if command == "cmd_prove" else "S1")
+            self.assertIsNone(code)
+            self.assertIn("is an issue, not a pull request", why)
+        self.assertEqual(self.entries(), [])
+
+    def test_mutant_without_the_refusal_the_pull_request_command_writes_the_item_verdict_around_every_defence(self):
+        self.issue_page()
+        sb.plan_ledger.append_entry(self.state, {"kind": "proof", "pr": self.ITEM, "scenario": "S9", "plan_hash": "sha256:p", "head": self.PIN, "result": "pass", "by": "c1"}, self.now())
+        with mock.patch.object(sb, "item_entry_refusal", lambda *a: None):
+            code, why = self.pr_path("cmd_verdict")              # t2 is registered for nothing, and there is no registration for the item
+        self.assertEqual(code, sb.EXIT_OK, why)
+        forged = [e for e in self.entries() if e.get("kind") == "verdict"]
+        self.assertEqual([(e["by"], e["pr"]) for e in forged], [("t2", self.ITEM)])
+        # and with the refusal in place the same call is refused (the real guard), while gates item would ignore the entry anyway
+        self.assertIsNone(self.pr_path("cmd_verdict")[0])
+
+    def test_a_real_pull_request_is_unaffected_by_the_refusal(self):
+        self.issue_page()
+        facts = {"head": self.PIN, "ci": "green"}
+        ctx = self.ctx()
+        ctx.engine.intents = types.SimpleNamespace(_api=lambda *a, **k: (_ for _ in ()).throw(AssertionError("a readable pull request must not be looked up as an issue")))
+        with mock.patch.object(sb, "pr_picture", lambda *a: (facts, "", [], None)):
+            args = types.SimpleNamespace(pr="acme-org/widget-service#9", plan=None, ask=None)
+            got = sb._ledger_context(args, None, self.now, True, parts=(ctx.engine, self.state, {"intent_repo": self.REPO}))
+        self.assertEqual((got.pr, got.facts["head"]), ("acme-org/widget-service#9", self.PIN))
+
+    def test_gates_item_ignores_an_entry_it_cannot_tie_to_the_item_path(self):
+        self.register("t1")
+        entry = {"plan_hash": "sha256:p", "head": self.PIN, "result": "pass", "pr": self.ITEM, "scenario": "S1"}
+        sb.plan_ledger.append_entry(self.state, dict(entry, kind="proof", by="c9"), self.now())
+        sb.plan_ledger.append_entry(self.state, dict(entry, kind="verdict", by="t2", evaluator="tester"), self.now())       # what the pull request path used to write
+        writers = self.iv.excluded(self.ITEM, self.N, None, "human", self.entries(), self.fleets, self.sessions)
+        report = sb.item_gates_report(self.ctx(), writers)
+        row = next(r for r in report["scenarios"] if r["id"] == "S1")
+        self.assertEqual(row["status"], "missing")
+        self.assertEqual((row["proof"], row["verdict"]), (None, None))
+        with mock.patch.object(self.iv, "visible", lambda entries, item, recorder: entries):         # mutant: no tie to the item path
+            row = next(r for r in sb.item_gates_report(self.ctx(), writers)["scenarios"] if r["id"] == "S1")
+        self.assertEqual(row["status"], "ok")
+
+    def test_a_tester_verdict_counts_only_for_a_tester_registered_when_it_wrote_it(self):
+        self.register("t1")
+        self.assertEqual(self.prove("c1")[0], sb.EXIT_OK)
+        self.assertEqual(self.verdict("t1")[0], sb.EXIT_OK)
+        good = next(e for e in self.entries() if e.get("kind") == "verdict")
+        self.assertTrue(self.iv.tied(good, self.entries(), sb.plan_ledger.CI_RECORDER))
+        self.clock[0] += 3 * 24 * 3600                                  # read long after the registration expired (a finished, retired tester keeps its verdicts)
+        self.assertTrue(self.iv.tied(good, self.entries(), sb.plan_ledger.CI_RECORDER))
+        for forged in (dict(good, session="ses_other"), dict(good, by="t2"), dict(good, via="pr"), dict(good, seq=1)):
+            self.assertFalse(self.iv.tied(forged, self.entries(), sb.plan_ledger.CI_RECORDER), forged)
+        stale = dict(good, ts=good["ts"] + self.iv.TTL + 1)             # written after the registration had expired
+        self.assertFalse(self.iv.tied(stale, self.entries(), sb.plan_ledger.CI_RECORDER))
+
+    def unreadable_world(self):
+        self.register("t1")
+        self.fleets["nt"] = {"role": "tester", "repo": self.REPO, "reports_to": "orch", "launched_by": "orch", "issue": self.N}
+        self.sessions["nt"] = self.sessions["c1"]                       # a tester in the session of the item's coder
+        self.register("nt")
+        self.assertEqual(self.prove("c1")[0], sb.EXIT_OK)
+        sb.plan_ledger.append_entry(self.state, {"kind": "verdict", "pr": self.ITEM, "scenario": "S1", "plan_ref": "plan", "plan_hash": "sha256:p", "head": self.PIN, "result": "pass",
+                                                 "by": "nt", "evaluator": "tester", "evidence": "x", "via": "item", "session": self.sessions["c1"]}, self.now())
+
+    def gates_item(self, agents):
+        ctx = self.ctx()
+        args = types.SimpleNamespace(rest=[self.ITEM], plan=None, ask=None, json=True, item=None)
+        out = io.StringIO()
+        with mock.patch.object(sb, "item_context", lambda a, r, n, w: ctx), mock.patch.object(sb, "item_agents", agents), contextlib.redirect_stdout(out):
+            code = sb.cmd_item_gates(args, None, self.now)
+        return code, json.loads(out.getvalue())
+
+    def test_gates_item_fails_closed_when_the_running_agents_cannot_be_read(self):
+        self.unreadable_world()
+        launch = sb.load_launch_testers().launched(self.fleets, self.sessions, self.REPO, lambda f: f.get("repo"), {})
+        code, report = self.gates_item(lambda c: (launch, self.sessions, self.fleets))
+        self.assertEqual(next(r for r in report["scenarios"] if r["id"] == "S1")["status"], "missing")      # agents read: the session-mate of a coder is excluded
+
+        def broken(ctx):
+            raise sb.ItemAgentsUnreadable("the running agents cannot be read (OSError: down)")
+        code, report = self.gates_item(broken)
+        self.assertEqual((code, report["ready"], report["scenarios"]), (sb.EXIT_ERROR, False, []))
+        self.assertIn("NOT READY", report["rows"][0]["missing"][0])
+        code, report = self.gates_item(lambda c: ({}, {}, {}))         # mutant: fail open, the writer set shrinks to the author, the proofs and the registrar
+        self.assertEqual(next(r for r in report["scenarios"] if r["id"] == "S1")["status"], "ok")
+
+    def test_item_agents_raises_when_discovery_or_the_retired_list_fails(self):
+        ctx = self.ctx()
+        ctx.engine.now = lambda: self.now()
+        ctx.engine.discover = lambda now: (_ for _ in ()).throw(OSError("herdr down"))
+        with self.assertRaises(sb.ItemAgentsUnreadable):
+            sb.item_agents(ctx)
+
+    def test_the_append_rechecks_the_ledger_under_the_lock_and_refuses_a_replaced_registration(self):
+        self.register()
+        real = sb.plan_ledger.append_many_checked
+
+        def racing(state, build, now):      # between the reads and the append another registration (a new pin) lands
+            sb.plan_ledger.append_entry(state, {"kind": "item_tester", "pr": self.ITEM, "item": self.ITEM, "tester": "t1", "session": "ses_t1", "orchestrator": "orch", "head": self.MOVED,
+                                                "plan_ref": None, "by": "orch"}, self.now())
+            return real(state, build, now)
+        with mock.patch.object(sb.plan_ledger, "append_many_checked", racing):
+            code, why = self.verdict("t1")
+        self.assertIsNone(code)
+        self.assertIn("reference commit", why)
+        self.assertEqual(self.verdicts(), [])
+        self.assertEqual([a for e, s, a in self.audit if e == "plan.item.refused"][-1]["stage"], "append")
+        self.audit.clear()
+        self.setUp()
+        self.register()
+
+        def unchecked(state, build, now):   # mutant: the check made on the snapshot from BEFORE the race (what the old append amounted to)
+            snapshot = sb.plan_ledger.read_ledger(state)[0]
+            sb.plan_ledger.append_entry(state, {"kind": "item_tester", "pr": self.ITEM, "item": self.ITEM, "tester": "t1", "session": "ses_t1", "orchestrator": "orch", "head": self.MOVED,
+                                                "plan_ref": None, "by": "orch"}, self.now())
+            return sb.plan_ledger.append_many(state, build(snapshot), now)
+        with mock.patch.object(sb.plan_ledger, "append_many_checked", unchecked):
+            self.assertEqual(self.verdict("t1")[0], sb.EXIT_OK)         # without the re-check the verdict at the old pin is written
+
+    def test_append_many_checked_refuses_with_the_ledger_unchanged(self):
+        self.register()
+        before = self.entries()
+
+        def refuse(entries):
+            raise sb.plan_ledger.LedgerError("no")
+        with self.assertRaises(sb.plan_ledger.LedgerError):
+            sb.plan_ledger.append_many_checked(self.state, refuse, self.now())
+        self.assertEqual(self.entries(), before)
+        got = sb.plan_ledger.append_many_checked(self.state, lambda have: [{"kind": "verdict", "pr": self.ITEM, "scenario": "S1", "result": "pass"}] * 2, self.now())
+        self.assertEqual([e["seq"] for e in got], [len(before) + 1, len(before) + 2])
+        self.assertIsNone(sb.plan_ledger.read_ledger(self.state)[1])
+
+    def test_u1_the_pull_request_rules_are_untouched(self):
+        import subprocess as sp
+        for name in ("may_record_verdict", "scenario_state", "authors_of"):
+            self.assertTrue(callable(getattr(sb.plan_ledger, name)))
+        text = SWITCHBOARD.read_text()
+        for name in ("ci_record_core", "launched_testers_for"):
+            self.assertEqual(text.count("def %s(" % name), 1)
 
 
 class TestBatchingDocs(unittest.TestCase):

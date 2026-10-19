@@ -24,7 +24,8 @@ HEAD_FILE = "plan-ledger.head"   # {"seq", "hash"} of the newest entry: a second
 GENESIS = "0" * 64
 EVIDENCE_KINDS = ("proof", "verdict", "consensus", "waiver")   # a consensus entry is written by the plan review engine (a later slice)
 REVIEW_KINDS = ("round", "lane_session", "lane", "response", "escalation", "decision", "abandoned", "reminder", "review_record")   # the plan review engine's records (#109)
-KINDS = EVIDENCE_KINDS + REVIEW_KINDS
+ITEM_KINDS = ("item_tester",)   # #770: the registration of a tester for a work item that has no pull request; written by `launch` only (bin/item_verdicts.py)
+KINDS = EVIDENCE_KINDS + REVIEW_KINDS + ITEM_KINDS
 RESULTS = ("pass", "fail")
 EVIDENCE_LIMIT = 500
 FIELD_LIMIT = 200
@@ -145,6 +146,38 @@ def append_many(state_dir, entries_in, now):
         have, problem = read_ledger(state_dir)
         if problem:
             raise LedgerError("the ledger is not trustworthy, nothing was recorded: %s" % problem)
+        stored, prev = [], have[-1]["hash"] if have else GENESIS
+        for number, entry in enumerate(entries_in, start=len(have) + 1):
+            one = dict(entry, seq=number, ts=int(now), prev=prev)
+            one["hash"] = entry_hash(one)
+            stored.append(one)
+            prev = one["hash"]
+        if stored:
+            data = "".join(json.dumps(one, sort_keys=True, ensure_ascii=False) + "\n" for one in stored).encode("utf-8")
+            if os.write(fd, data) != len(data):
+                raise LedgerError("the ledger write was short: nothing was recorded")
+            os.fsync(fd)
+            _write_head(state_dir, stored[-1])
+    finally:
+        os.close(fd)
+    return stored
+
+
+def append_many_checked(state_dir, build, now):
+    """`append_many` with the DECISION inside the exclusive lock (#770): `build(entries)` is called under the lock with the chain as it stands and returns the list of entries to
+    write, or raises LedgerError to refuse; all of them are chained and written with ONE write, or none. The slow reads (the running agents) are made BEFORE this, never under the
+    lock; only what lives in the ledger is re-checked here."""
+    path = Path(state_dir) / LEDGER_FILE
+    fd = os.open(str(path), os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        have, problem = read_ledger(state_dir)
+        if problem:
+            raise LedgerError("the ledger is not trustworthy, nothing was recorded: %s" % problem)
+        entries_in = build(have)
+        for entry in entries_in:
+            if entry.get("kind") not in KINDS or (entry.get("kind") in EVIDENCE_KINDS and entry.get("result") not in RESULTS):
+                raise LedgerError("an entry is a proof, a verdict, a consensus or a waiver with a result of pass or fail, or a plan review record")
         stored, prev = [], have[-1]["hash"] if have else GENESIS
         for number, entry in enumerate(entries_in, start=len(have) + 1):
             one = dict(entry, seq=number, ts=int(now), prev=prev)
@@ -393,6 +426,8 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             ci = (facts or {}).get("ci")
             if ci in ("green", "passing"):
                 row.update(status="ok", detail="CI %s at %s" % (ci, (head or "?")[:8]))
+            elif (facts or {}).get("draft") is True and ci == "none":   # #770: a draft whose workflow skips drafts has no run at all, and "CI is failing" sends the author the wrong way; a draft WITH runs keeps the failing line
+                row.update(status="missing", missing=["draft: no CI run seen; this repo's workflow may skip drafts; mark ready, then wait"])
             else:
                 row.update(status="missing", missing=["CI is %s (needs green at the head, or a second agent's re-run)" % (ci or "unknown")])
         elif gid == "G5":
@@ -405,6 +440,9 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             elif isinstance(floor, dict) and (floor.get("unreadable") or floor.get("decision") is None):
                 row.update(status="waiting", missing=["the impact floor could not be read for this head (%s): the owner decides, through cos"
                                                       % (floor.get("unreadable") or "no decision")])
+            elif isinstance(floor, dict) and floor.get("rehold"):   # (#830) a clear was recorded for ANOTHER head, none for this one, no rating here: held again, whatever the labels say
+                row.update(status="waiting", missing=["held again for the owner at this head: %s; the owner clears this head, or the impact rating at this head says not held"
+                                                      % floor["rehold"]])
             elif isinstance(floor, dict) and floor.get("decision") == "hold" and not floor.get("cleared"):
                 row.update(status="waiting", missing=["held for the owner (impact floor, read at this head): %s; the owner clears it for this head"
                                                       % ("; ".join(floor.get("reasons") or []) or "hold")])
@@ -414,7 +452,7 @@ def evaluate_gates(plan, entries, ledger_problem, facts, pr, now=None):
             floor = (facts or {}).get("floor")
             # held = the same reading as `pr-explain --check`: a hold label, the merge-captain label or marker, or an uncleared floor hold; a missing
             # `held_check` on a held PR fails closed (missing)
-            held = bool((facts or {}).get("captain")) or bool((facts or {}).get("holds")) or (isinstance(floor, dict) and floor.get("decision") == "hold" and not floor.get("cleared"))
+            held = bool((facts or {}).get("captain")) or bool((facts or {}).get("holds")) or (isinstance(floor, dict) and (bool(floor.get("rehold")) or (floor.get("decision") == "hold" and not floor.get("cleared"))))
             check = (facts or {}).get("held_check")   # the ONE check (`held_defects` in the switchboard), called only for a held PR
             if not held:
                 row.update(status="n/a", detail="not a held PR")
@@ -535,7 +573,7 @@ def validate_plan_gates(raw, source):
         seen[normal_repo(name)] = name
         if not isinstance(entry, dict):
             raise ValueError("%s: 'plan_gates.repos.%s' must be an object" % (source, name))
-        extra = sorted(set(entry) - {"mode", "enabled", "budget_ms", "enforce_gates"})
+        extra = sorted(set(entry) - {"mode", "enabled", "budget_ms", "enforce_gates", "item_checks"})
         if extra:
             raise ValueError("%s: 'plan_gates.repos.%s' has key(s) this tool does not read: %s" % (source, name, ", ".join(extra)))
         mode = entry.get("mode", "shadow")
@@ -554,6 +592,8 @@ def validate_plan_gates(raw, source):
             raise ValueError("%s: 'plan_gates.repos.%s.enforce_gates' must be a non-empty list of distinct gates from %s "
                              "(default %s), got %r" % (source, name, ", ".join(ENFORCEABLE), ", ".join(DEFAULT_ENFORCED), gates))
         repos[name] = {"mode": mode, "enabled": enabled, "budget_ms": budget, "enforce_gates": [g for g in ENFORCEABLE if g in gates]}
+        if "item_checks" in entry:   # #770: declared and validated by bin/item_verdicts.py; carried here untouched, and absent when the repo does not list it
+            repos[name]["item_checks"] = entry["item_checks"]
     record = raw.get("ci_record") if raw.get("ci_record") is not None else {}
     if not isinstance(record, dict) or set(record) - {"enabled", "calls_per_pass", "pass_seconds"}:
         raise ValueError("%s: 'plan_gates.ci_record' must be an object with enabled, calls_per_pass and pass_seconds" % source)
