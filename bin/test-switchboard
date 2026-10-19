@@ -66250,7 +66250,7 @@ class TestAgentCredentialsDoc(unittest.TestCase):
 
     # #850: what #616 built and what stays the owner's, each stated exactly once (fails on 0 and on 2).
     PINS = {
-        "built": "the shim mint is built and merged (#616)",
+        "built": "shim mint is built and merged (#616)",
         "one repository": "mint an App installation token for one repository",
         "short-lived": "short-lived (one hour at most)",
         "fail closed": "and fail closed (a mint failure",
