@@ -390,7 +390,7 @@ def restore_marker(engine, runner, repo, number, head, first):
         again = read_pr_json(engine, repo, number)
         if again.get("body") != first.get("body") or again.get("headRefOid") != head:
             return {"error": "the body or the head changed while it was being edited: nothing was written"}
-        _gh_write(engine, runner, repo, "repos/%s/pulls/%d" % (repo, number), "PATCH", {"body": new_body})
+        _gh_write(engine, runner, repo, "repos/%s/pulls/%d" % (repo, number), "PATCH", {"body": new_body})   # no conditional write exists: an edit landing after the read above is the accepted window (the rewrite only moves toward the hold)
         if read_pr_json(engine, repo, number).get("body") != new_body:
             return {"error": "the body read back is not the one written"}
         clean = lambda t: re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", t)
