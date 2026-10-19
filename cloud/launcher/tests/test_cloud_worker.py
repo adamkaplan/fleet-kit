@@ -453,6 +453,63 @@ class S5EndHook(Base):
         work, _ = make_repo(self.tmp.name, "r", dirty=True)
         self.assertEqual(end_hook.run(work, "coder7")["skipped"], [".env"])
 
+    def _record_json(self):
+        d = os.path.join(os.path.dirname(self.env["CW_CLOUD_AUDIT"]), "runs")
+        names = os.listdir(d)
+        self.assertEqual(len(names), 1)
+        with open(os.path.join(d, names[0], "run.json")) as f:
+            return json.load(f)
+
+    def test_a_reaper_stop_records_and_prints_the_hook_result(self):
+        work, _ = make_repo(self.tmp.name, "r", dirty=True)
+        self.patch_state(hook_env={"CW_WORKDIR": work, "CW_WORKER": "coder7"})
+        self.create("coder7", "--hard", "1h")
+        self.set_activity("coder7", True, T0)
+        self.clock.advance(hours=2)
+        code, out, err = self.run_cli("reap")
+        self.assertEqual(code, 0, err)
+        row = json.loads(out)[0]
+        self.assertEqual((row["pushed"], row["wip_branch"], row["skipped"]), (True, "coder7/wip", [".env"]))
+        hook = self._record_json()["end_hook"]
+        self.assertEqual((hook["pushed"], hook["wip_branch"], hook["skipped"]), (True, "coder7/wip", [".env"]))
+
+    def test_a_failed_push_is_in_the_record_and_the_pod_is_kept(self):
+        work, _ = make_repo(self.tmp.name, "r", dirty=True)
+        subprocess.run(["git", "-C", work, "remote", "set-url", "origin", os.path.join(self.tmp.name, "gone.git")], check=True)
+        self.patch_state(hook_env={"CW_WORKDIR": work, "CW_WORKER": "coder7"})
+        self.create("coder7")
+        self.assertEqual(self.run_cli("stop", "coder7")[0], 1)
+        hook = self._record_json()["end_hook"]
+        self.assertEqual((hook["pushed"], bool(hook["error"])), (False, True))
+        self.assertIsNotNone(self.pod())
+
+    def test_a_record_that_cannot_be_updated_never_blocks_the_stop(self):
+        work, _ = make_repo(self.tmp.name, "r", dirty=True)
+        self.patch_state(hook_env={"CW_WORKDIR": work, "CW_WORKER": "coder7"})
+        self.create("coder7")
+        orig = cw.run_record.Recorder.add_hook
+        cw.run_record.Recorder.add_hook = staticmethod(lambda d, h: (_ for _ in ()).throw(OSError("full")))
+        self.addCleanup(setattr, cw.run_record.Recorder, "add_hook", orig)
+        code, out, _ = self.run_cli("stop", "coder7")
+        self.assertEqual((code, json.loads(out)["pushed"]), (0, True))
+        self.assertIsNone(self.pod())
+
+    def test_the_reaper_says_why_it_exits_once(self):
+        code, _, err = self.run_cli("reap")
+        self.assertEqual(code, 0)
+        self.assertEqual(err.count("reaper exiting:"), 1)
+        self.assertIn("end of its pass", err)
+
+        def boom(self_):
+            raise cw.Interrupted("signal 15")
+        orig = cw.Launcher.reap
+        cw.Launcher.reap = boom
+        self.addCleanup(setattr, cw.Launcher, "reap", orig)
+        code, _, err = self.run_cli("reap", "--loop", "5")
+        self.assertEqual(code, cw.EXIT_INTERRUPTED)
+        self.assertEqual(err.count("reaper exiting:"), 1)
+        self.assertIn("signal 15", err)
+
     def test_reaper_keeps_a_pod_whose_push_failed(self):
         work, _ = make_repo(self.tmp.name, "r", dirty=True)
         subprocess.run(["git", "-C", work, "remote", "set-url", "origin", os.path.join(self.tmp.name, "gone.git")], check=True)

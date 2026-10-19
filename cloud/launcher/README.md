@@ -45,7 +45,7 @@ the pod's own mounts, opens its own loopback port-forward, reads the session's m
 cut with a `TRANSCRIPT CUT` marker line; `CW_RECORD_MAX_BYTES` lowers it; the whole record phase has one deadline, `CW_RECORD_SECONDS`, default 90 s, maximum 240 s: past it the record says `transcript: unavailable (record timed out)` and the stop still deletes), `tally.json` (tool calls by tool name, turns; no content) and
 `run.json` (worker, repository, start, end, exit reason, head sha when known; `transcript: unavailable` plus a reason when the server could
 not be read, or its answer was over 8 MiB or nested deeper than 100 levels: checked before parsing). A failing record never holds the stop
-back and a failing stop never deletes it; `--no-record` skips it. `stop` prints `run record: DIR` once and the audit reason names it.
+back and a failing stop never deletes it; `--no-record` skips it. `stop` prints `run record: DIR` once and the audit reason names it. Once the end hook answers, `run.json` is rewritten atomically with `end_hook` (pushed, wip_branch, skipped, note, error); this holds for the reaper's stops too, whose pass output carries the same fields. A `reap` process writes one line `reaper exiting: WHY` when it ends.
 Full contract: `docs/cloud-worker-interface.md`.
 
 **What the scrub covers (and not).** Removed: a secret's whole value, base64, base64url, hex, percent-encoding and JSON escapes of the whole

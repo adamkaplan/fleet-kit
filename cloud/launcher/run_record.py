@@ -353,6 +353,19 @@ class Recorder:
                     pass
         return directory
 
+    @staticmethod
+    def add_hook(directory, hook):
+        """A second atomic write of run.json once the end hook has answered (#829): adds `end_hook` (pushed, wip_branch,
+        skipped, note, error, or why it did not run). Never raises; a record that cannot be updated keeps what it had."""
+        try:
+            path = os.path.join(directory, "run.json")
+            with open(path) as f:
+                info = json.load(f)
+            info["end_hook"] = hook
+            write_private(directory, "run.json", json.dumps(info, sort_keys=True) + "\n")
+        except Exception:
+            pass
+
     def _write_transcript(self, directory, msgs, info):
         cap = int(self.env.get("CW_RECORD_MAX_BYTES") or TRANSCRIPT_CAP)
         scrub = lambda s: self.kube.scrub(s, limit=2 * LINE_MAX * 2)   # above the input maximum: redaction growth is never cut

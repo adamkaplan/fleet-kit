@@ -837,12 +837,19 @@ class Launcher:
                 # Secrets, and say so.
                 self.kube.delete(name)
                 print("cloud-worker: pod was %s; end hook not run; deleted" % phase, file=sys.stderr)
+                self._hook_record(info, {"ran": False, "pushed": False, "wip_branch": None, "skipped": [], "note": "pod was %s; end hook not run" % phase})
                 return {"worker": worker, "runtime_id": "pod/" + name, "pushed": False, "wip_branch": None,
                         "skipped": [], "note": "pod was %s; end hook not run" % phase, "record": info.get("record", "")}
             try:
                 res = self.run_hook(name)
             except CloudError as e:
                 res = {"pushed": False, "wip_branch": None, "error": str(e)}
+            try:  # the hook's answer reaches the record (a second atomic write), before the pod is kept or deleted
+                self._hook_record(info, {"ran": True, "pushed": bool(res.get("pushed")), "wip_branch": res.get("wip_branch"),
+                                         "skipped": [self.kube.scrub(x, 200) for x in res["skipped"]][:50] if isinstance(res.get("skipped"), list) else [],
+                                         "note": self.kube.scrub(res.get("note") or ""), "error": self.kube.scrub(res.get("error") or "")})
+            except Exception:
+                pass
             if res.get("error"):
                 self.kube.annotate(name, kept="true")  # the pod is kept: the commit is not safe yet
                 raise CloudError("end hook could not push, pod kept: %s" % res["error"], EXIT_HOOK)
@@ -864,6 +871,10 @@ class Launcher:
             return {"worker": worker, "runtime_id": "pod/" + name, "pushed": bool(res.get("pushed")),
                     "wip_branch": res.get("wip_branch"), "skipped": skipped, "record": info.get("record", "")}
         return self._audited(worker, "stop", go, reason)
+
+    def _hook_record(self, info, hook):
+        if info.get("record"):
+            self.recorder.add_hook(info["record"], hook)
 
     def prune_records(self, a):
         """Remove run records older than --days (default CW_RECORD_KEEP_DAYS, else 30): only this tool's per-run directories."""
@@ -983,6 +994,7 @@ class Launcher:
     def reap(self):
         """One pass: stop every pod past its hard deadline or idle too long. Returns [(worker, reason, exit)]."""
         out, now = [], self.clock()
+        self.reap_results = {}
         for pod in self.kube.list_pods():
             worker = ann(pod, "worker")
             reason = None
@@ -1004,7 +1016,8 @@ class Launcher:
                     reason = "idle"
             if reason:
                 try:
-                    self.stop(argparse.Namespace(worker=worker, reason=reason), reason)
+                    res = self.stop(argparse.Namespace(worker=worker, reason=reason), reason)
+                    self.reap_results[worker] = {k: res.get(k) for k in ("pushed", "wip_branch", "skipped", "record")}
                     out.append((worker, reason, 0))
                 except CloudError as e:
                     out.append((worker, reason, e.code))
@@ -1063,6 +1076,28 @@ def _run_id(v):
     return v
 
 
+def _reap_main(L, a, sleep):
+    """The reaper's loop. Whatever ends it writes ONE line saying why (signal, error, or the end of the loop)."""
+    old, why = L._catch_signals(), None
+    try:
+        while True:
+            res = L.reap()
+            print(json.dumps([dict({"worker": w, "reason": r, "exit": c}, **L.reap_results.get(w, {})) for w, r, c in res]))
+            if not a.loop:
+                why = "end of its pass"
+                return EXIT_HOOK if any(c for _, _, c in res) else 0
+            sleep(min(a.loop, 60))  # never slower than the contract's once a minute
+    except (Interrupted, KeyboardInterrupt) as e:
+        why = "stopped by %s" % (e if isinstance(e, Interrupted) else "interrupt")
+        raise
+    except BaseException as e:
+        why = "error: %s" % L.kube.scrub(e, 200)
+        raise
+    finally:
+        L._restore_signals(old)
+        print("cloud-worker: reaper exiting: %s" % why, file=sys.stderr)
+
+
 def main(argv=None, env=None, clock=None, sleep=time.sleep):
     env = os.environ if env is None else env
     try:
@@ -1077,12 +1112,7 @@ def main(argv=None, env=None, clock=None, sleep=time.sleep):
         kube = Kube(env)
         L = Launcher(kube, env, clock, sleep)
         if a.cmd == "reap":
-            while True:
-                res = L.reap()
-                print(json.dumps([{"worker": w, "reason": r, "exit": c} for w, r, c in res]))
-                if not a.loop:
-                    return EXIT_HOOK if any(c for _, _, c in res) else 0
-                sleep(min(a.loop, 60))  # never slower than the contract's once a minute
+            return _reap_main(L, a, sleep)
         result = getattr(L, a.cmd.replace("-", "_"))(a)
         print(result["report"] if a.cmd == "report" and not a.json else json.dumps(result, sort_keys=True))
         return 0
