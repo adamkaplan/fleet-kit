@@ -652,6 +652,8 @@ def clear_notice_pass(engine, now):
 def whole_skipped_note(engine, key, err):
     """One line, once per notice and error text, saying a pending notice could not be judged (its pull request was not read): it is kept."""
     said = engine.__dict__.setdefault("clear_notice_said", set())
+    if len(said) >= 500:
+        said.clear()   # bounded: a long-lived daemon says it again at worst
     if (key, str(err)) not in said:
         said.add((key, str(err)))
         engine._note("gate.clear_notice_unread", key, {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
@@ -697,20 +699,27 @@ def clear_remind_pass(engine, now):
         except Exception as err:
             whole_skipped_note(engine, mark, err)
             continue
-        entry = {"at": int(now), "attempts": int((reminded.get(mark) or {}).get("attempts", 0)) + 1, "done": False}
+        earlier = reminded.get(mark) or {}
+        if now - earlier.get("at", 0) < CLEAR_NOTICE_CLAIM_SECONDS and earlier.get("attempts"):
+            continue   # a failed send is not tried again within the claim time: the attempts are not all spent in a few passes
+        entry = {"at": int(now), "attempts": int(earlier.get("attempts", 0)) + 1, "done": False}
         if not lane:
             entry["done"] = True
             engine.audit.append(engine.actor, "gate.clear_remind_skipped", pr, {"head": head, "why": "lane unknown: nobody is guessed"})
         else:
+            failure = None
             try:
                 outcome = engine.send("switchboard", lane, "%s is cleared by the owner at %s, mergeable and its gates are READY: cleared, merge it" % (pr, head[:8]))
-                entry["done"] = not (isinstance(outcome, dict) and outcome.get("sent") is False)
-            except Exception:
-                entry["done"] = False
-            if entry["attempts"] >= CLEAR_NOTICE_ATTEMPTS:
+                if isinstance(outcome, dict) and outcome.get("sent") is False:
+                    failure = _one_line(str(outcome.get("reason") or outcome.get("action") or "not delivered"), 100)
+            except Exception as err:
+                failure = _one_line("%s: %s" % (type(err).__name__, err), 100)
+            if failure is None:
                 entry["done"] = True
-            if entry["done"]:
-                engine.audit.append(engine.actor, "gate.clear_reminded", pr, {"head": head, "lane": lane, "attempts": entry["attempts"]})
+                engine.audit.append(engine.actor, "gate.clear_reminded", pr, {"head": head, "lane": lane, "attempts": entry["attempts"]})   # only a reminder that was SENT
+            elif entry["attempts"] >= CLEAR_NOTICE_ATTEMPTS:
+                entry["done"] = True   # given up, loudly and as what it is: never recorded as sent
+                engine.audit.append(engine.actor, "gate.clear_remind_abandoned", pr, {"head": head, "lane": lane, "attempts": entry["attempts"], "error": failure})
         with impact_state_lock(engine.state_dir):
             reminded = _read_small(engine.state_dir, CLEAR_REMINDED_FILE)
             reminded[mark] = entry

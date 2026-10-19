@@ -14042,6 +14042,30 @@ class TestClearNotice(Base):
         self.pass_()
         self.assertEqual(len(self.reminders()), 2)
 
+    def test_a_reminder_send_that_always_fails_is_tried_a_bounded_number_of_times_spaced_by_the_claim_time_and_never_recorded_as_sent(self):
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now(), boss="orch-a")
+        self.clear()
+        self.ready_pr()
+        calls = []
+        real = self.engine.send
+
+        def down(sender, recipient, text, **kw):
+            if "cleared, merge it" in text:
+                calls.append(1)
+                return {"sent": False, "reason": "down"}
+            return real(sender, recipient, text, **kw)
+        self.engine.send = down
+        self.pass_(15 * 60)
+        self.pass_(5)
+        self.pass_(5)
+        self.assertEqual(len(calls), 1, "passes inside the claim time do not spend the attempts")
+        for _ in range(sb.CLEAR_NOTICE_ATTEMPTS + 3):
+            self.pass_()
+        self.assertEqual(len(calls), sb.CLEAR_NOTICE_ATTEMPTS)
+        self.assertEqual(self.events("gate.clear_reminded"), [], "a reminder that was never delivered is not recorded as sent")
+        (event,) = self.events("gate.clear_remind_abandoned")
+        self.assertEqual((event["detail"]["attempts"], "down" in event["detail"]["error"]), (sb.CLEAR_NOTICE_ATTEMPTS, True))
+
     def test_s7_no_reminder_when_not_mergeable_not_ready_not_open_at_the_cleared_head_or_not_examined_there(self):
         cases = {"conflicting": dict(mergeable="CONFLICTING"), "gates not ready": dict(ready=False), "draft": dict(state="draft"), "gone": dict(state="gone"),
                  "head moved": dict(head="d" * 40, examined="d" * 40), "not examined at the head": dict(examined="d" * 40)}
