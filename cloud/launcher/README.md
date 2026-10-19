@@ -34,7 +34,7 @@ The Secret goes with the pod at `stop`, `delete` and a failed or interrupted `cr
 
 Accepted scope of the role: `cw-operator` can get and list every secret in the workers namespace (a Role cannot limit `list` by label), so the namespace must hold only worker pods and their per-pod secrets; that is enforced in the deployment repository, not here.
 
-Everything that renders `kubectl` output (errors, the end hook's text, audit reasons) passes through one `scrub()`: this run's secret values and any 8+ character piece of one, token-shaped strings and long base64/hex runs are removed, then the text is cut. A failed `create`, `stop` or `delete` that leaves a per-run Secret says so once (audit and stderr) with its name and the exact `kubectl ... delete secret NAME` command, never a value.
+Everything that renders `kubectl` output (errors, the end hook's text, audit reasons) passes through one `scrub()`: this run's secret values and any 8+ character piece of one, token-shaped strings, long base64/hex runs, an `Authorization` header of any scheme (any case and spacing) and the `user:password@` of a URL of any scheme are removed, then the text is cut (the launcher, the run record and the driver all use this one function). A failed `create`, `stop` or `delete` that leaves a per-run Secret says so once (audit and stderr) with its name and the exact `kubectl ... delete secret NAME` command, never a value.
 
 ## The run record and the report (slice 3)
 The record is the launcher's `stop`'s, so every end gets one: `run-task` (normal end, failure, interrupt), the switchboard's `retire`
