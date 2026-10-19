@@ -3425,7 +3425,7 @@ def compose(recipient, facts, cap=MESSAGE_CAP, section=None, repos=None, deliver
     facts = sorted(facts, key=lambda fact: (fact.created, fact.key))
     if not facts:
         raise ValueError("nothing to compose")
-    if facts[0].orders:  # PR 17: the orders note, whole: up to twenty orders of 300 characters
+    if facts[0].orders:  # PR 17: the orders note, whole: every order
         return orders_note(recipient, facts[0], repos), facts[:1]
 
     replaced = {}
@@ -5617,9 +5617,9 @@ def policy_questions():
             for name, (text, yes, no) in POLICY_QUESTIONS.items()}
 
 
-def policy_state(role, intent, done_when, authority, tool, arguments, authority_clip=None):
+def policy_state(role, intent, done_when, authority, tool, arguments):
     return {"role": role, "intent": _clip(intent, 600), "done_when": _clip(done_when, 400),
-            "standing_authority": _clip(authority, authority_clip or ORDERS_STATE_CLIP), "tool": tool,
+            "standing_authority": authority, "tool": tool,
             "arguments": _clip(_canonical(arguments) if not isinstance(arguments, str) else arguments, 1500)}
 
 
@@ -6113,6 +6113,81 @@ def view_env(role, repo):
     return env
 
 
+AGENT_TMP_ENV = "FLEET_AGENT_TMPDIR"   # read by the private wrapper only: it becomes the agent's TMPDIR (#767)
+
+
+def headless_tmp_root():
+    """The temp root the fleet-hooks plugin makes a headless worker's private directory under (#846): the same path the pane wrapper's profile uses.
+    The plugin has no config to read, so unlike a pane's, it does not depend on the wrapper."""
+    return _xdg("XDG_DATA_HOME", ".local/share") / PROG / "profile" / "tmp"
+
+
+def agent_tmp_root(config):
+    """The profile's shared temp root when panes run through the private wrapper (the one that exports TMPDIR), else None (a shared profile or a test
+    has no wrapper, so there is nothing to override)."""
+    try:
+        data = _xdg("XDG_DATA_HOME", ".local/share") / PROG
+        if str(config.get("opencode") or "") != str(data / "bin" / WRAPPER_NAME):
+            return None
+        return data / "profile" / "tmp"
+    except Exception:
+        return None
+
+
+def agent_tmp_shared_name(name):
+    """The Chief of Staff and the plan review lanes keep the shared temp directory (unchanged by #767)."""
+    return name == "cos" or (name or "").startswith(LANE_NAME_PREFIX)
+
+
+def agent_tmp_env(engine, name):
+    """{FLEET_AGENT_TMPDIR: dir} for a pane: a private directory (0700) named from the agent, made now under the profile's temp root. {} when panes
+    have no wrapper. A directory that cannot be made fails the launch (LaunchError): the agent is never started on the shared directory."""
+    root = agent_tmp_root(engine.config)
+    if root is None or agent_tmp_shared_name(name):
+        return {}
+    if not NAME_RE.fullmatch(name or ""):
+        raise LaunchError("no private temp directory for %r: not a valid agent name" % (name,))
+    path = root / name
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        try:
+            path.mkdir(mode=0o700)
+        except FileExistsError:
+            pass   # a resume or a second launch of the name: the same directory, checked below
+        info = os.lstat(str(path))
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise OSError("exists and is not a directory of ours")
+        fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)   # no symlink swapped in after the check
+        try:
+            os.fchmod(fd, 0o700)
+        finally:
+            os.close(fd)
+    except OSError as err:
+        raise LaunchError("cannot make the private temp directory %s (%s): %s was not started (it never runs on the shared temp directory)" % (path, err.strerror or err, name)) from None
+    return {AGENT_TMP_ENV: str(path)}
+
+
+def reclaim_agent_tmp(engine, name, headless=False):
+    """At retire: the agent's private TMPDIR is removed when it is EMPTY, else kept and the reason said. Never forced, never recursive. Returns lines.
+    A headless worker's directory (#846, made by the plugin) is under the same root and goes by the same rule."""
+    root = agent_tmp_root(engine.config) or (headless_tmp_root() if headless else None)
+    if root is None or not NAME_RE.fullmatch(name or "") or agent_tmp_shared_name(name):
+        return []
+    path = root / name
+    if not os.path.lexists(str(path)):
+        return []
+    try:
+        if path.is_symlink() or not path.is_dir():
+            return ["%s: kept (not a plain directory)" % path]
+        left = len(os.listdir(str(path)))
+        if left:
+            return ["%s: kept (%d file(s) still in it; remove them by hand)" % (path, left)]
+        os.rmdir(str(path))
+        return ["%s: removed (empty)" % path]
+    except OSError as err:
+        return ["%s: kept (%s)" % (path, err.strerror or err)]
+
+
 def launch_agent(engine, name, agent, directory, workspace, role=None, reports_to=None, issue=None,
                  brief=None, patience=LAUNCH_PATIENCE, sleep=time.sleep, charter=None, repo=None, launched_by=None):
     """Create a fleet agent: a v2 session, its own herdr tab, the brief.
@@ -6132,6 +6207,7 @@ def launch_agent(engine, name, agent, directory, workspace, role=None, reports_t
     fleet = fleet_record(name, role, reports_to, issue, charter, repo, launched_by)
     env = dict(engine.config["opencode_env"], **engine.config["launch_env"])
     env.update(view_env(role, repo or (engine.config.get("intent_repo") if charter else None)))  # PR 18
+    env.update(agent_tmp_env(engine, name))   # #767: before the session exists, so a failure leaves nothing started
     accounts = getattr(engine, "accounts", None)
     if repo and accounts is not None:  # PR 15: the agent works as its repo's gh account, and as nobody else
         problem = launch_account_problem(engine.config, accounts, repo)
@@ -6394,6 +6470,7 @@ def resume_agent(engine, name, session_id, workspace, patience=LAUNCH_PATIENCE, 
     # repo, role, charter and gh account (a caller-given --repo that differs was refused by the command).
     repo = fleet.get("repo") or (engine.config.get("intent_repo") if fleet.get("charter") else None)
     env.update(view_env(fleet.get("role"), repo))  # PR 18
+    env.update(agent_tmp_env(engine, name))   # #767
     accounts = getattr(engine, "accounts", None)
     if fleet.get("repo") and accounts is not None:
         try:
@@ -7419,6 +7496,11 @@ def cmd_retire(args, runner, now):
             print("worktree: " + line)
     except Exception as err:   # the retirement above is already written: a reclaim problem is said, never a traceback
         sys.stderr.write("%s: worktree reclaim failed (%s): the agent is retired; run `%s disk reclaim-worktrees --apply` to retry\n" % (PROG, _one_line(str(err), 100), PROG))
+    try:
+        for line in reclaim_agent_tmp(engine, name, headless=headless_kept is not None):   # its private TMPDIR (#767): removed when empty, else kept with the reason
+            print("tmpdir: " + line)
+    except Exception as err:   # the retirement is already written: said, never a traceback
+        sys.stderr.write("%s: private temp directory not handled (%s): the agent is retired; remove it by hand\n" % (PROG, _one_line(str(err), 100)))
     return EXIT_OK
 
 
@@ -11201,8 +11283,7 @@ def judge_inbound_answer(engine, decision, answer, role):
         PROG, decision["id"], chosen, json.dumps(text), decision.get("kind"), decision.get("agent"),
         decision.get("tier"), _one_line(decision.get("title"), 300))
     arguments = redact_command_text(arguments, jev_secrets(config, os.environ))
-    state = policy_state("chief-of-staff", "not stated: no ask is recorded", "not stated", orders, "shell", arguments,
-                         COS_ORDERS_STATE_CLIP)
+    state = policy_state("chief-of-staff", "not stated: no ask is recorded", "not stated", orders, "shell", arguments)
     thresholds = dict(config["policy"]["thresholds"])
     thresholds["outside_intent"] = thresholds["outside_scope"] = 2.0   # the Chief of Staff has no ask: as in the judge
     try:
@@ -25002,9 +25083,7 @@ _STANDING_AUTHORITY = re.compile(r"^(?:[-*]\s+)?\**standing authority\**\s*:\s*\
 # `- <text> (ordered by <name>, <YYYY-MM-DD>)`; the one-line `Standing authority:` stays valid and
 # counts as one more order. `parse_orders` is the one parser.
 ORDERS_HEADING = "## Standing orders"
-ORDERS_MAX = 20          # orders a charter may carry
 ORDER_MAX_CHARS = 300    # characters of one order's text
-ORDERS_STATE_CLIP = 1200  # characters of the joined orders the judge's model sees (issue 87: 600 cut the merge and message orders off a long charter)
 _ORDERS_HEADING = re.compile(r"^#{1,6}\s+standing orders\s*$", re.IGNORECASE)
 _ANY_HEADING = re.compile(r"^#{1,6}\s")
 _ORDER_BULLET = re.compile(r"^[-*]\s+(\S.*?)\s*$")
@@ -25086,7 +25165,7 @@ def _eol_of(body):
 def add_order_to_body(body, text, by, date):
     """`body` with one more order, `- <text> (ordered by <by>, <date>)`, added to the section (made at the
     end of the body when there is none). Every byte outside the section is kept. OrdersError for a text
-    that is empty, longer than ORDER_MAX_CHARS or on more than one line, and for a twenty-first order."""
+    that is empty, longer than ORDER_MAX_CHARS or on more than one line."""
     body = body or ""
     text = (text or "").strip()
     by = " ".join(str(by or "").split())[:60]
@@ -25102,9 +25181,6 @@ def add_order_to_body(body, text, by, date):
     bullet = "- %s (ordered by %s, %s)" % (text, by, date)
     found = _orders_section(body)
     if found is not None:
-        if len(found["bullets"]) >= ORDERS_MAX:
-            raise OrdersError("this charter already has %d standing orders, the most it carries; remove one first"
-                              % ORDERS_MAX)
         if found["bullets"]:
             at = found["bullets"][-1][1]
             lead = "" if body[:at].endswith(("\n", "\r")) else eol
@@ -25622,8 +25698,7 @@ class PolicyJudge:
     def state_of(self, request, fleet, context):
         return policy_state(fleet.get("role") or "unknown", context["intent"] or "not stated: no ask is recorded",
                             context["done_when"] or "not stated", context["authority"] or NO_STANDING_AUTHORITY,
-                            request["tool"], request["arguments"],
-                            COS_ORDERS_STATE_CLIP if fleet.get("role") == "chief-of-staff" else None)
+                            request["tool"], request["arguments"])
 
     def reply_of(self, combined, cached, fleet, context, request):
         outcome = combined["outcome"]
@@ -28475,7 +28550,7 @@ GH_FOR_AGENTS=$(GH_CONFIG_DIR={gh_config} {gh} auth token {gh_user_flag} 2>/dev/
 PROFILE={profile}
 export XDG_CONFIG_HOME="$PROFILE/config" XDG_DATA_HOME="$PROFILE/data"
 export XDG_STATE_HOME="$PROFILE/state" XDG_CACHE_HOME="$PROFILE/cache"
-export TMPDIR="$PROFILE/tmp"
+export TMPDIR="${{FLEET_AGENT_TMPDIR:-$PROFILE/tmp}}"
 # XDG alone leaves `home` live: v2 would load your skills. herdr's OpenCode integration is written under
 # $HOME/.config/opencode, which install links to this profile's opencode directory.
 export HOME="$PROFILE/home"
@@ -29767,7 +29842,6 @@ def add_orders_parsers(sub):
 
 COS_ORDERS_NAME = "standing-orders.md"
 COS_ORDERS_MAX_BYTES = 8192
-COS_ORDERS_STATE_CLIP = 1200  # characters of the Chief of Staff's orders the judge's model sees (a charter's: ORDERS_STATE_CLIP)
 COS_ORDERS_TEMPLATE = """<!--
 The Chief of Staff's standing orders: what it may decide for you, in your own words.
 
