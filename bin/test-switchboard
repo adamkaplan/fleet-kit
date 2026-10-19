@@ -248,7 +248,7 @@ class TestConfig(Base):
         self.assertEqual(sb.load_config(), {
             "opencode": None, "opencode_env": {}, "opencode_executable": None, "launch_env": {},
             "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "retire_idle_minutes": 10, "call_timeout_seconds": 20, "send_timeout_seconds": 60, "poll_seconds": 5,
-            "worker_lookback_hours": 24, "stalled_working_hours": 2, "send_to_working": "steer",
+            "worker_lookback_hours": 24, "stalled_working_hours": 2, "review_window_minutes": 60, "send_to_working": "steer",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
             "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_plugin_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "reds": None, "heavy": None, "docker_reaper": True,
@@ -21798,12 +21798,73 @@ class ReportBase(PR4Base):
         return self.world.engine.run_pass()
 
 
-class TestIdleAtASeam(ReportBase):
+class StalledHub:
+    """The one list the stalled rule's open-PR input comes from: what `ci_record_pass` reads through `hub.read_pages`."""
+
+    def __init__(self):
+        self.records, self.cut, self.fail = [], False, False
+        self.paths = []
+
+    def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
+        self.paths.append(path)
+        if self.fail:
+            raise sb.GitHubUnavailable("the list could not be read")
+        return list(self.records), self.cut
+
+
+class WaitingInputs:
+    """#816: the inputs the shared waiting predicate reads, wired the way the daemon fills them (the PR list and its read-whole mark come from
+    `ci_record_pass` over a fake hub; the issue list is the triage's, marked by hand). Used by the stalled rule's and the idle rule's tests."""
+    REPO = "acme/widget-service"
+
+    def wire_inputs(self):
+        engine = self.world.engine
+        engine.state_dir = self.world.state
+        engine.config["intent_repo"] = self.REPO
+        engine.config["plan_gates"] = {"repos": {self.REPO: {"mode": "shadow"}}}
+        engine.gh_runner = lambda *a, **k: (_ for _ in ()).throw(AssertionError("gh called"))   # no call is made to judge a worker
+        self.hub = engine.hub = StalledHub()
+        self.t0 = self.world.clock.now()
+        self.params = {"head": "a" * 40, "issue_labels": (), "pr_labels": (), "checks": None, "pr": True, "at": self.t0}
+        self.apply()
+        (self.world.state / sb.DECISIONS_FILE).write_text(json.dumps({"decisions": [], "errors": []}))
+
+    def apply(self):
+        """Read the lists as the daemon does: the issue list is the triage's (marked by hand: not this change's code), the PR list is `ci_record_pass`'s."""
+        engine, prm = self.world.engine, self.params
+        at, now = sb.iso(prm["at"]), self.world.clock.now()
+        engine.triage = sb.TriageState()
+        engine.triage.units[(self.REPO, "issues")] = {"at": now, "data": [
+            {"number": n, "updated_at": at, "created_at": at, "labels": [{"name": l} for l in (prm["issue_labels"] if n == 2 else ())]}
+            for n in range(1, 100)], "truncated": False, "error": None}
+        sb.read_mark(engine, "issues:" + self.REPO, True, "", now)
+        sb.read_mark(engine, "decisions", True, "", now)
+        self.hub.records = [{"number": 9, "body": "PLAN: https://github.com/%s/issues/2\n" % self.REPO, "updated_at": at, "created_at": sb.iso(prm["at"] - 86400), "head": {"sha": prm["head"]},
+                             "labels": [{"name": n} for n in prm["pr_labels"]], **prm.get("pr_extra", {})}] if prm["pr"] else []
+        engine.__dict__.pop("ci_record_state", None)
+        engine.__dict__.get("read_whole", {}).pop("pulls:" + self.REPO, None)
+        sb.ci_record_pass(engine, now)
+        if prm["pr"] and prm["checks"] is not None:
+            engine.ci_record_state.pr_state["%s#9" % self.REPO].update(
+                {"examined_head": prm["head"], "checks": [{"name": "ci", "conclusion": c} for c in prm["checks"]]})
+
+    def set_lists(self, **changes):
+        self.params.update(changes)
+        self.apply()
+
+
+class TestIdleAtASeam(WaitingInputs, ReportBase):
     """#773: idle 20 minutes or more, an OPEN assignment, a last report of `working`: ONE nudge, ONE wake, once per idle stretch."""
 
     def setUp(self):
         super().setUp()
-        self.world.engine.state_dir = self.world.state
+        self.reading = True
+        self.wire_inputs()   # #816: the rule judges only from the daemon's whole inputs
+
+    def derive(self, world=None):
+        if getattr(self, "reading", True):   # the daemon's pass re-reads the lists every few minutes: a test that lets time pass sees fresh lists
+            self.apply()
+        return super().derive(world)
 
     def seam(self, facts):
         return sorted((f.kind, f.recipient, f.rider) for f in facts if ":seam:" in f.key)
@@ -21847,12 +21908,16 @@ class TestIdleAtASeam(ReportBase):
                 self.assertEqual(self.seam(self.derive()), [], "a last report that is not `working` is not this case")
                 self.setUp()
         self.idle_after("working")
+        self.apply()
+        self.reading = False
         self.world.engine.hub = types.SimpleNamespace(closed_issue_snapshot=lambda: {"%s#2" % self.world.engine.config.get("intent_repo", "acme/widget-service"): {"labels": [], "at": 1}})
         self.world.engine.config["intent_repo"] = self.world.engine.config.get("intent_repo") or "acme/widget-service"
         self.assertEqual(self.seam(self.derive()), [], "a closed assignment")
 
     def test_the_closed_issue_check_reads_no_gh(self):
         self.idle_after("working")
+        self.apply()
+        self.reading = False   # the lists were just read (by the pass); the judgement itself reads nothing
         calls = []
         self.world.engine.gh_runner = lambda *a, **k: calls.append(a) or (_ for _ in ()).throw(AssertionError("gh called"))
         self.assertEqual(len(self.seam(self.derive())), 2)
@@ -21942,6 +22007,8 @@ class TestIdleAtASeam(ReportBase):
             self.world.tick(1)
             self.report("working", "going on", sender=name)
         self.world.tick(1300)
+        self.apply()
+        self.reading = False
         calls = []
         self.world.engine.gh_runner = lambda *a, **k: calls.append(a) or (_ for _ in ()).throw(AssertionError("gh called"))
         sources = len(self.world.engine.sources)
@@ -22002,63 +22069,18 @@ STOPPED_NEWS_RULES = [
 
 
 
-class StalledHub:
-    """The one list the stalled rule's open-PR input comes from: what `ci_record_pass` reads through `hub.read_pages`."""
-
-    def __init__(self):
-        self.records, self.cut, self.fail = [], False, False
-        self.paths = []
-
-    def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
-        self.paths.append(path)
-        if self.fail:
-            raise sb.GitHubUnavailable("the list could not be read")
-        return list(self.records), self.cut
-
-
-class TestStalledWorking(ReportBase):
+class TestStalledWorking(WaitingInputs, ReportBase):
     """#811: a coder whose reports are all `working` for `stalled_working_hours` while nothing it owns moves wakes its boss ONCE. Real path:
     the report record is written by `report`, the open-PR list and its read-whole mark come from `ci_record_pass` over a fake hub."""
     REPO = "acme/widget-service"
 
     def setUp(self):
         super().setUp()
-        engine = self.world.engine
-        engine.state_dir = self.world.state
-        engine.config["intent_repo"] = self.REPO
-        engine.config["plan_gates"] = {"repos": {self.REPO: {"mode": "shadow"}}}
-        engine.gh_runner = lambda *a, **k: (_ for _ in ()).throw(AssertionError("gh called"))   # no call is made to judge movement
-        self.hub = engine.hub = StalledHub()
-        self.t0 = self.world.clock.now()
-        self.params = {"head": "a" * 40, "issue_labels": (), "pr_labels": (), "checks": None, "pr": True, "at": self.t0}
-        self.apply()
-        (self.world.state / sb.DECISIONS_FILE).write_text(json.dumps({"decisions": [], "errors": []}))
+        self.wire_inputs()
         self.world.tick(1)
         for _ in range(5):
             self.report("working", "migrating the tables")
         self.world.tick(1)
-
-    def apply(self):
-        """Read the lists as the daemon does: the issue list is the triage's (marked by hand: not this change's code), the PR list is `ci_record_pass`'s."""
-        engine, prm = self.world.engine, self.params
-        at, now = sb.iso(prm["at"]), self.world.clock.now()
-        engine.triage = sb.TriageState()
-        engine.triage.units[(self.REPO, "issues")] = {"at": now, "data": [
-            {"number": 2, "updated_at": at, "created_at": at, "labels": [{"name": n} for n in prm["issue_labels"]]}], "truncated": False, "error": None}
-        sb.read_mark(engine, "issues:" + self.REPO, True, "", now)
-        sb.read_mark(engine, "decisions", True, "", now)
-        self.hub.records = [{"number": 9, "body": "PLAN: https://github.com/%s/issues/2\n" % self.REPO, "updated_at": at, "head": {"sha": prm["head"]},
-                             "labels": [{"name": n} for n in prm["pr_labels"]]}] if prm["pr"] else []
-        engine.__dict__.pop("ci_record_state", None)
-        engine.__dict__.get("read_whole", {}).pop("pulls:" + self.REPO, None)
-        sb.ci_record_pass(engine, now)
-        if prm["pr"] and prm["checks"] is not None:
-            engine.ci_record_state.pr_state["%s#9" % self.REPO].update(
-                {"examined_head": prm["head"], "checks": [{"name": "ci", "conclusion": c} for c in prm["checks"]]})
-
-    def set_lists(self, **changes):
-        self.params.update(changes)
-        self.apply()
 
     def stalled(self):
         return [f for f in self.derive() if ":stalled:" in f.key]
@@ -22207,7 +22229,7 @@ class TestStalledWorking(ReportBase):
     def test_the_newest_moved_pull_request_is_the_one_judged(self):
         self.late()
         at = sb.iso(self.world.clock.now() - 30)
-        self.hub.records.append({"number": 12, "body": "PLAN: https://github.com/%s/issues/2\n" % self.REPO, "updated_at": at, "head": {"sha": "d" * 40}, "labels": []})
+        self.hub.records.append({"number": 12, "body": "PLAN: https://github.com/%s/issues/2\n" % self.REPO, "updated_at": at, "created_at": sb.iso(self.t0 - 86400), "head": {"sha": "d" * 40}, "labels": []})
         self.world.engine.__dict__.pop("ci_record_state")
         sb.ci_record_pass(self.world.engine, self.world.clock.now())
         self.assertEqual(self.stalled(), [], "the second open pull request moved 30 seconds ago")
@@ -22266,6 +22288,272 @@ class TestStalledWorking(ReportBase):
         self.late()
         self.assertNotIn("ghp_", self.stalled()[0].summary)
         self.assertNotIn("ghp_", (self.world.state / sb.LAST_REPORT_FILE).read_text())
+
+
+class TestLegitimateWaiting(WaitingInputs, ReportBase):
+    """#816: the one shared predicate `legitimately_waiting`, tested once directly; and each guard alone through the REAL path of both rules
+    (the idle-at-a-seam rule and the stalled-working rule): no nudge and no wake while it holds, exactly one once it ends."""
+
+    def setUp(self):
+        super().setUp()
+        self.wire_inputs()
+        self.world.tick(1)
+        for _ in range(5):
+            self.report("working", "migrating the tables")
+        self.world.tick(1)
+
+    def observation(self):
+        self.world.engine.discover(self.world.clock.now())
+        return self.world.engine.discovery.agents["coder"]
+
+    def predicate(self):
+        last = sb._read_small(self.world.state, sb.LAST_REPORT_FILE).get("coder")
+        return sb.legitimately_waiting(self.world.engine, self.observation(), 2, self.REPO, last)
+
+    def mode(self, which):
+        """Put the worker where one rule judges it: idle past the seam window, or still working past the stalled window."""
+        self.which = which
+        if which == "idle":
+            self.stop("all quiet")
+            self.world.tick(sb.SEAM_IDLE_SECONDS + 100)
+        else:
+            self.world.tick(int(2.5 * 3600) - 60)
+        self.apply()
+        self.world.tick(60 if which == "stalled" else 0)
+
+    def said(self):
+        self.apply()
+        found = self.derive()
+        return [f for f in found if (":seam:" in f.key if self.which == "idle" else ":stalled:" in f.key)]
+
+    def guards(self):
+        cfg, now = self.world.engine.config, self.world.clock.now
+        reminder = lambda: sb.add_reminder(self.world.state, "coder", now() + 600, now(), "look", issue=2)
+        def decision(on):
+            rows = [{"tier": "human", "kind": "captain", "repo": self.REPO, "number": 9}] if on else []
+            (self.world.state / sb.DECISIONS_FILE).write_text(json.dumps({"decisions": rows, "errors": []}))
+        def drop_reminders():
+            self.world.tick(700)
+        return {
+            "ci in progress": (lambda: self.set_lists(checks=["success", "in_progress"]), lambda: self.set_lists(checks=["success"])),
+            "ci queued": (lambda: self.set_lists(checks=["queued"]), lambda: self.set_lists(checks=["success"])),
+            "review requested": (lambda: self.set_lists(pr_extra={"requested_reviewers": [{"login": "reviewer-one"}]}), lambda: self.set_lists(pr_extra={})),
+            "review requested of a team": (lambda: self.set_lists(pr_extra={"requested_teams": [{"slug": "maintainers"}]}), lambda: self.set_lists(pr_extra={})),
+            "younger than the review window": (lambda: self.set_lists(pr_extra={"created_at": sb.iso(now() - 600)}), lambda: self.world.tick(3600)),
+            "reminder due later": (reminder, drop_reminders),
+            "issue awaiting label": (lambda: self.set_lists(issue_labels=[sb.awaiting_cos_label(cfg)]), lambda: self.set_lists(issue_labels=[])),
+            "pull request awaiting label": (lambda: self.set_lists(pr_labels=[sb.awaiting_label(cfg)]), lambda: self.set_lists(pr_labels=[])),
+            "human decision": (lambda: decision(True), lambda: decision(False)),
+        }
+
+    def test_the_predicate_names_each_guard_and_is_clear_with_none(self):
+        self.assertEqual(self.predicate().state, "clear")
+        for name, (arrange, release) in self.guards().items():
+            with self.subTest(name):
+                arrange()
+                self.apply()
+                got = self.predicate()
+                self.assertEqual(got.state, "waiting", name)
+                self.assertTrue(got.reason)
+                release()
+                self.apply()
+                self.assertEqual(self.predicate().state, "clear", "released")
+
+    GUARD_CODE = {"ci in progress": "ci", "ci queued": "ci", "review requested": "review-requested", "review requested of a team": "review-requested",
+                  "younger than the review window": "review-window", "reminder due later": "reminder", "issue awaiting label": "awaiting-issue",
+                  "pull request awaiting label": "awaiting-pr", "human decision": "decision"}
+
+    def test_every_guard_of_the_production_table_is_tested_alone_names_its_code_and_dies_with_its_mutant(self):
+        cases = dict(self.GUARD_CODE)
+        cases["a blocked or question report"] = "last-report"
+        self.assertEqual(set(cases.values()), set(sb.WAITING_GUARDS), "a guard in the production table with no case here (or a case of none)")
+        arranged = dict(self.guards(), **{"a blocked or question report": (lambda: self.report("question", "x"), lambda: self.report("working", "y"))})
+        self.assertEqual(set(arranged), set(cases))
+        for name, (arrange, release) in arranged.items():
+            code = cases[name]
+            with self.subTest(name):
+                arrange()
+                self.apply()
+                self.assertEqual(self.predicate().codes, [code])
+                needs, check = sb.WAITING_GUARDS[code]
+                with mock.patch.dict(sb.WAITING_GUARDS, {code: (needs, lambda w: [])}):   # the mutant: this one guard never holds
+                    self.assertNotIn(code, self.predicate().codes, "the mutant of %s must change the answer" % code)
+                release()
+                self.apply()
+                self.assertEqual(self.predicate().state, "clear")
+
+    def test_a_launch_checkpoint_reminder_is_not_a_wait_and_a_workers_own_reminder_is(self):
+        now = self.world.clock.now
+        sb.add_reminder(self.world.state, "coder", now() + 600, now(), "report", issue=2, condition={"while_running": "coder"})
+        self.assertEqual((self.predicate().state, self.predicate().codes), ("clear", []), "the boss's checkpoint is not the worker waiting")
+        for which in ("idle", "stalled"):
+            self.setUp()
+            self.mode(which)
+            sb.add_reminder(self.world.state, "coder", self.world.clock.now() + 600, self.world.clock.now(), "report", issue=2, condition={"while_running": "coder"})
+            self.assertTrue(self.said(), "%s: with only the checkpoint, the rule still speaks" % which)
+        self.setUp()
+        sb.add_reminder(self.world.state, "coder", now() + 600, now(), "look", issue=2)
+        self.assertEqual(self.predicate().codes, ["reminder"])
+
+    def test_a_reminder_whose_time_cannot_be_read_is_unread_toward_silence_in_both_rules(self):
+        """It fails toward SAYING NOTHING (state unread), by the read-whole rule: an input that cannot be read is no evidence either way."""
+        for which in ("idle", "stalled"):
+            for bad in ("soon", None, [1]):
+                with self.subTest(which=which, at=bad):
+                    self.setUp()
+                    self.mode(which)
+                    now = self.world.clock.now
+                    sb.add_reminder(self.world.state, "coder", now() + 600, now(), "look", issue=2)
+                    items = sb.read_reminders(self.world.state)
+                    items[0]["at"] = bad
+                    sb.write_reminders(self.world.state, items)
+                    self.assertEqual(self.predicate().state, "unread")
+                    self.assertEqual(self.said(), [])
+
+    def test_the_review_window_boundary_is_judged_at_limit_minus_one_exact_and_plus_one_second(self):
+        for minutes in (10, 60):
+            limit = minutes * 60
+            for age, want in ((limit - 1, "waiting"), (limit, "clear"), (limit + 1, "clear")):
+                with self.subTest(minutes=minutes, age=age):
+                    self.world.engine.config["review_window_minutes"] = minutes
+                    self.set_lists(pr_extra={"created_at": sb.iso(self.world.clock.now() - age)})
+                    got = self.predicate()
+                    self.assertEqual(got.state, want)
+                    self.assertEqual(got.codes, ["review-window"] if want == "waiting" else [])
+
+    def test_two_open_pull_requests_for_one_worker_it_waits_when_any_one_does(self):
+        """The stated choice: every pull request that names the issue is judged, and one wait is enough (a worker with two pull requests waits on either)."""
+        now = self.world.clock.now
+        def second(**extra):
+            self.set_lists(pr_extra={})
+            self.hub.records.append({"number": 12, "body": "PLAN: https://github.com/%s/issues/2\n" % self.REPO, "updated_at": sb.iso(self.t0),
+                                     "created_at": sb.iso(self.t0 - 86400), "head": {"sha": "d" * 40}, "labels": [], **extra})
+            self.world.engine.__dict__.pop("ci_record_state")
+            sb.ci_record_pass(self.world.engine, now())
+        second()
+        self.assertEqual(self.predicate().state, "clear", "two old pull requests with nothing pending")
+        second(requested_reviewers=[{"login": "r"}])
+        self.assertEqual(self.predicate().codes, ["review-requested"], "the second waits: the worker waits")
+        second(created_at=sb.iso(now() - 60))
+        self.assertEqual(self.predicate().codes, ["review-window"], "the second is young: the worker waits")
+        self.set_lists(pr_extra={"requested_reviewers": [{"login": "r"}]})
+        self.hub.records.append({"number": 12, "body": "PLAN: https://github.com/%s/issues/2\n" % self.REPO, "updated_at": sb.iso(self.t0), "created_at": sb.iso(self.t0 - 86400),
+                                 "head": {"sha": "d" * 40}, "labels": []})
+        self.world.engine.__dict__.pop("ci_record_state")
+        sb.ci_record_pass(self.world.engine, now())
+        self.assertEqual(self.predicate().codes, ["review-requested"], "the first waits, the second is clear: the worker waits")
+
+    def test_a_repository_outside_plan_gates_is_silent_in_both_rules_never_nudged(self):
+        """The open-PR list (and its read-whole mark) is read only for a `plan_gates` repository: without it no guard can be judged, so the read-whole rule gives no nudge and no wake."""
+        for which in ("idle", "stalled"):
+            with self.subTest(which):
+                self.setUp()
+                self.mode(which)
+                self.assertTrue(self.said(), "the same fixture with the repository under plan_gates says it")
+                self.world.engine.config["plan_gates"] = {"repos": {"acme/another-service": {"mode": "shadow"}}}
+                self.world.engine.__dict__.pop("ci_record_state", None)
+                self.world.engine.read_whole.pop("pulls:" + self.REPO, None)
+                sb.ci_record_pass(self.world.engine, self.world.clock.now())   # the daemon's own pass: it never reads this repository's list
+                self.assertNotIn("pulls:" + self.REPO, self.world.engine.read_whole)
+                self.assertFalse(sb.whole(self.world.engine, "pulls:" + self.REPO)[0])
+                found = [f for f in self.derive() if ":seam:" in f.key or ":stalled:" in f.key]
+                self.assertEqual(found, [])
+
+    def test_a_blocked_or_question_report_is_waiting_without_any_input(self):
+        for kind in ("blocked", "question"):
+            self.report(kind, "which one?")
+            self.world.engine.read_whole.clear()   # not one input read: this guard needs none
+            got = self.predicate()
+            self.assertEqual((got.state, got.reason), ("waiting", "its last report is %s" % kind))
+
+    def test_a_draft_awaits_no_review_and_an_old_unrequested_pull_request_is_clear(self):
+        self.set_lists(pr_extra={"draft": True, "created_at": sb.iso(self.world.clock.now() - 60), "requested_reviewers": [{"login": "r"}]})
+        self.assertEqual(self.predicate().state, "clear")
+        self.set_lists(pr_extra={})
+        self.assertEqual(self.predicate().state, "clear")
+
+    def test_a_not_whole_or_unreadable_input_is_unread(self):
+        for name in ("issues:" + self.REPO, "decisions", "pulls:" + self.REPO):
+            with self.subTest(name):
+                held = dict(self.world.engine.read_whole[name])
+                sb.read_mark(self.world.engine, name, False, "cut", self.world.clock.now())
+                self.assertEqual(self.predicate().state, "unread")
+                self.world.engine.read_whole[name] = held
+        self.set_lists(pr_extra={"created_at": "garbage"})
+        self.assertEqual(self.predicate().state, "unread", "a pull request whose age cannot be told")
+        self.set_lists(pr_extra={})
+        (self.world.state / sb.DECISIONS_FILE).write_text("not json")
+        self.assertEqual(self.predicate().state, "unread")
+        (self.world.state / sb.DECISIONS_FILE).write_text(json.dumps({"decisions": [], "errors": []}))
+        (self.world.state / "reminders.json").write_text("{bad")
+        self.assertEqual(self.predicate().state, "unread")
+
+    def test_each_guard_alone_gives_no_nudge_and_no_wake_and_its_end_gives_one_in_both_rules(self):
+        for which, count in (("idle", 2), ("stalled", 1)):
+            for name in self.guards():
+                with self.subTest(which=which, guard=name):
+                    self.setUp()
+                    self.mode(which)
+                    self.assertEqual(len(self.said()), count, "the same fixture with no guard says it")
+                    self.setUp()
+                    self.mode(which)
+                    arrange, release = self.guards()[name]   # bound to THIS world, not the one before setUp
+                    arrange()
+                    self.assertEqual(self.said(), [], "no nudge and no wake while it holds")
+                    release()
+                    self.assertEqual(len(self.said()), count, "the stretch was not consumed: it is said when the guard ends")
+
+    def test_a_blocked_or_question_report_holds_the_idle_rule_and_the_stalled_rule(self):
+        for which in ("idle", "stalled"):
+            for kind in ("blocked", "question"):
+                with self.subTest(which=which, kind=kind):
+                    self.setUp()
+                    self.mode(which)
+                    self.report(kind, "which one?")
+                    self.assertEqual(self.said(), [])
+
+    def test_the_stretch_said_after_a_guard_is_delivered_once_over_many_passes(self):
+        self.mode("idle")
+        self.set_lists(checks=["in_progress"])
+        for _ in range(2):
+            self.world.engine.run_pass()
+            self.world.tick(30)
+        self.assertEqual([k for n in ("coder", "platform") for a in self.world.admissions(n) for k in a["keys"] if ":seam:" in k], [])
+        self.set_lists(checks=["success"])
+        for _ in range(3):
+            self.world.engine.run_pass()
+            self.world.tick(30)
+        keys = [k for n in ("coder", "platform") for a in self.world.admissions(n) for k in a["keys"] if ":seam:" in k]
+        self.assertEqual(len(keys), 2, keys)
+
+    def test_a_not_whole_input_gives_no_nudge_and_no_wake_in_either_rule(self):
+        for which in ("idle", "stalled"):
+            for name in ("issues:" + self.REPO, "decisions", "pulls:" + self.REPO):
+                with self.subTest(which=which, input=name):
+                    self.setUp()
+                    self.mode(which)
+                    self.apply()
+                    sb.read_mark(self.world.engine, name, False, "cut", self.world.clock.now())
+                    found = [f for f in self.derive() if ":seam:" in f.key or ":stalled:" in f.key]
+                    self.assertEqual(found, [])
+
+    def test_a_mark_from_an_earlier_pass_is_not_inherited(self):
+        self.mode("idle")
+        self.assertEqual(len(self.said()), 2)
+        self.world.engine.read_whole.clear()   # a restart: nothing is whole until it is read again
+        self.assertEqual([f for f in self.derive() if ":seam:" in f.key], [])
+
+    def test_an_idle_worker_the_seam_rule_covers_is_not_also_stalled(self):
+        self.mode("idle")
+        self.world.tick(3 * 3600)
+        self.apply()
+        found = self.derive()
+        self.assertEqual(len([f for f in found if ":seam:" in f.key]), 2)
+        self.assertEqual([f for f in found if ":stalled:" in f.key], [])
+
+    def test_a_bad_review_window_is_refused(self):
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"review_window_minutes": 0})
 
 
 class TestStoppedNews(PR4Base):
