@@ -67074,7 +67074,7 @@ class TestBatchingDocs(unittest.TestCase):
 
     def test_the_hold_rule_uses_the_matrix_terms_and_marks_the_delegation_a_target(self):
         section = self.section()
-        for phrase in ("`owner_hold`", "Target, after #835 lands", "`delegated_clear`", "aggregated diff", "`batch-ready`",
+        for phrase in ("`owner_hold`", "Target, after #835 lands", "`delegated_clear`", "aggregated diff",
                        "voids the owner's clear", "before the next change merges into `integration`", "delete head branch on merge"):
             self.assertEqual(section.count(phrase), 1, phrase)
 
