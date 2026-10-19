@@ -335,6 +335,7 @@ DEFAULTS = {
     "launch_env": {},
     "herdr": "herdr",
     "batch_seconds": 90,
+    "launch_default": "headless",   # #433: what a plain `launch` starts: "headless" (no terminal) or "terminal" (a herdr tab)
     "send_to_working": "steer",     # a boss's `send` to a working agent: "steer" (its next safe point) or "queue" (after its turn)
     "engaged_minutes": 10,
     "retire_idle_minutes": 10,     # `retire --close`: a pane herdr reads as working is closed without --force only when its session has had no turn and no activity this long
@@ -354,6 +355,7 @@ DEFAULTS = {
     "v2_cache_seconds": 120,       # a session's record, its inbox: re-read after this long, or at once when herdr says its state changed (0: never remembered)
     "v2_reads_per_pass": 8,        # background reads (cache fills) one pass may make; the rest wait for the next pass (stalest first)
     "v2_reads_per_minute": 90,     # and in any minute: past it the daemon keeps what it has (a read nobody has made yet is still made)
+    "review_window_minutes": 60,  # #816: an open pull request younger than this, or one with a review requested, is a worker legitimately waiting
     "stalled_working_hours": 2,   # #811: a coder or tester that only reports `working` while nothing it owns moves wakes its boss once after this long
     "worker_lookback_hours": 24,  # how far back a worker's finished turn still counts (PR 4)
     "rider_max_age_seconds": 3600,  # PR 13: a rider older than this is dropped, and an older stop is not triaged
@@ -583,6 +585,8 @@ def validate_config(raw, source="config"):
     if config["send_to_working"] not in ("steer", "queue"):
         raise ConfigError("%s: 'send_to_working' must be \"steer\" or \"queue\", got %r"
                           % (source, config["send_to_working"]))
+    if config["launch_default"] not in ("headless", "terminal"):
+        raise ConfigError("%s: 'launch_default' must be \"headless\" or \"terminal\", got %r" % (source, config["launch_default"]))
     executable = config["opencode_executable"]
     if executable is not None and (not isinstance(executable, str) or not os.path.isabs(executable)):
         raise ConfigError("%s: 'opencode_executable' must be an absolute path, got %r" % (source, executable))
@@ -636,7 +640,7 @@ def validate_config(raw, source="config"):
         if not isinstance(config[key], int) or isinstance(config[key], bool) or config[key] < 0:
             raise ConfigError("%r must be a whole number of at least 0, got %r" % (key, config[key]))
     for key in ("batch_seconds", "engaged_minutes", "call_timeout_seconds", "send_timeout_seconds", "poll_seconds",
-                "worker_lookback_hours", "stalled_working_hours", "rider_max_age_seconds"):
+                "worker_lookback_hours", "stalled_working_hours", "review_window_minutes", "rider_max_age_seconds"):
         if not _is_number(config[key]) or config[key] <= 0:
             raise ConfigError("%s: %r must be a positive number, got %r" % (source, key, config[key]))
     if not retire_idle_window_ok(config["retire_idle_minutes"]):
@@ -5972,6 +5976,11 @@ class LaunchError(Exception):
     """A launch that did not finish, and what it left behind."""
 
 
+class HeadlessRefused(LaunchError):
+    """The headless ROUTE was refused for this launch (the account route, the service, the record), as opposed to a bad name or an existing worker (#433).
+    A plain `launch` that took headless from its default falls back to a terminal on this; an explicit `--headless` shows it as the refusal it is."""
+
+
 RESERVED_AGENT_NAMES = ("fleet-switchboard", "switchboard", "plan-review", "owner")   # names the switchboard itself acts under: no agent may take one
 LANE_NAME_PREFIX = "planrev-"   # the plan review engine names its reviewer lanes: only it launches them
 
@@ -6195,9 +6204,15 @@ def launch_headless(engine, name, agent, directory, role=None, reports_to=None, 
             account = engine.accounts.account_for(repo) if repo and getattr(engine, "accounts", None) is not None else None
             fleet = fleet_record(name, role, reports_to, issue, charter, repo, launched_by)
             fleet["headless"] = True
-            with engine._external("v2.session.create", name, {"agent": agent, "directory": directory, "fleet": fleet, "headless": True}) as result:
-                session_id = engine.v2.session_create(agent, name, directory, {"fleet": fleet})["id"]
-                result["session"] = session_id
+            try:
+                with engine._external("v2.session.create", name, {"agent": agent, "directory": directory, "fleet": fleet, "headless": True}) as result:
+                    session_id = engine.v2.session_create(agent, name, directory, {"fleet": fleet})["id"]
+                    result["session"] = session_id
+            except LaunchError:
+                raise
+            except Exception as err:   # the service did not answer or refused: a route problem, not a mistake in the arguments
+                raise HeadlessRefused("the OpenCode service could not create the session (%s)" % _one_line(str(err), 120)) from err
+            brief_started = False
             try:
                 ap.save_record(engine.state_dir, name, session_id, engine.v2.service_url(), now=engine.now())
                 info = engine.v2.session_get(session_id) or {}
@@ -6206,12 +6221,16 @@ def launch_headless(engine, name, agent, directory, role=None, reports_to=None, 
                 if account:
                     identity = prove_headless_route(engine, session_id, name, repo, account)   # before the brief: nothing runs as a wrong account
                 if brief:
+                    brief_started = True   # from here a failure may have delivered the brief: it is never a reason to start the worker a second time
                     send_brief(engine, name, session_id, brief)
                 if engine.audit is not None:
                     engine.audit.append(engine.actor, "headless.launched", name, {"session": session_id, "agent": agent, "directory": _one_line(directory, 160), "brief_chars": len(brief or ""), "account": account or None, "repo": repo, "route": "shims+record" if account else None})
             except Exception as err:
-                cleaned = undo_headless_launch(engine, ap, name, session_id)
-                raise LaunchError("%s (%s)" % (_one_line(str(err)), cleaned)) from err
+                remains = []
+                cleaned = undo_headless_launch(engine, ap, name, session_id, remains)
+                # only a route problem found BEFORE the brief, with nothing left behind, may be answered by a terminal (#433): else a second worker would start beside the first
+                refused = (isinstance(err, HeadlessRefused) or not isinstance(err, LaunchError)) and not brief_started and not remains
+                raise (HeadlessRefused if refused else LaunchError)("%s (%s)" % (_one_line(str(err)), cleaned)) from err
     except ImpactStateBusy:
         raise LaunchError("another launch or reattach of %s is running: wait for it" % name) from None
     register_launch_worktree(engine, name, directory, repo)
@@ -6229,23 +6248,23 @@ def headless_identity(engine, repo):
     it is refused, as before. Any other worker acts as the account of the service's environment, and says so."""
     accounts = getattr(engine, "accounts", None)
     if repo and accounts is None:   # fail closed: with no account map nothing says which account this repo uses
-        raise LaunchError("cannot tell which gh account %s uses (no account map): a headless worker is refused" % repo)
+        raise HeadlessRefused("cannot tell which gh account %s uses (no account map): a headless worker is refused" % repo)
     if repo:
         account = accounts.account_for(repo)
         if account:
             if getattr(engine, "route_check", None) is None:
-                raise LaunchError("a headless worker cannot work as the gh account %s that gh_users maps %s to: its tools run in the OpenCode service's environment, "
+                raise HeadlessRefused("a headless worker cannot work as the gh account %s that gh_users maps %s to: its tools run in the OpenCode service's environment, "
                                   "which cannot be pinned to an account (a service restart drops any per-session setting), so it would act as the service's own "
                                   "default account. Use a terminal launch (omit --headless)" % (account, repo))
             problem = engine.route_check()   # the shims the service puts first on PATH exist: a text, or None
             if problem:
-                raise LaunchError("a headless worker cannot work as the gh account %s that gh_users maps %s to: its tools run in the OpenCode service's environment, "
+                raise HeadlessRefused("a headless worker cannot work as the gh account %s that gh_users maps %s to: its tools run in the OpenCode service's environment, "
                                   "which cannot be pinned to an account, and the per-command route that would choose it cannot be proved (%s). "
                                   "Use a terminal launch (omit --headless)" % (account, repo, problem))
             return "this headless worker is set up to act as the gh account %s for %s (the gh and git shims choose it per command; the service side is not checked yet)" % (account, repo)
         problem = launch_account_problem(engine.config, accounts, repo)
         if problem:
-            raise LaunchError(problem)
+            raise HeadlessRefused(problem)
         return "this headless worker acts as the OpenCode service environment's own gh account (gh_users has no entry for %s)" % repo
     return "this headless worker acts as the OpenCode service environment's own gh account (it has no repo)"
 
@@ -6289,17 +6308,17 @@ def prove_headless_route(engine, session_id, name, repo, account):
     try:
         fleet = session_identity(engine.herdr, engine.v2, {SESSION_ENV: session_id})
     except (V2Error, CallerError, IdentityUncertain) as err:
-        raise LaunchError("a headless worker cannot be proved to act as the gh account %s for %s: the session lookup failed (%s)" % (account, repo, _one_line(str(err)))) from err
+        raise HeadlessRefused("a headless worker cannot be proved to act as the gh account %s for %s: the session lookup failed (%s)" % (account, repo, _one_line(str(err)))) from err
     seen = (fleet or {}).get("repo")
     if (fleet or {}).get("name") != name or seen != repo or engine.accounts.account_for(seen) != account:
-        raise LaunchError("a headless worker cannot be proved to act as the gh account %s for %s: the service's record of the session names %s as its repo" % (account, repo, seen or "none"))
+        raise HeadlessRefused("a headless worker cannot be proved to act as the gh account %s for %s: the service's record of the session names %s as its repo" % (account, repo, seen or "none"))
     return ("this headless worker is set up to act as the gh account %s for %s: the shims and the installed plugin file are in place on the launcher's side and the session record resolves to that repo. "
             "NOT checked: that the OpenCode service runs the plugin it was started with (the installed plugin file is checked, not the running service; it cannot be probed "
             "without a model turn). This is a mistake-guard, not a boundary: a command can name another session, and a tool that reads a token from its own environment "
             "bypasses the shims. A terminal launch pins the account in the pane's environment" % (account, repo))
 
 
-def undo_headless_launch(engine, ap, name, session_id):
+def undo_headless_launch(engine, ap, name, session_id, remains=None):
     """Best effort after a headless launch failed past `session.create`: stop whatever the brief started, delete the session, then remove the record.
     Returns one sentence saying exactly what was cleaned and what remains. The record is removed only when the session is gone: a session that is
     still there keeps its record, so `status` shows it and it is not invisible."""
@@ -6340,6 +6359,8 @@ def undo_headless_launch(engine, ap, name, session_id):
             engine.audit.append(engine.actor, "headless.launch_undone", name, {"session": session_id, "cleaned": done, "remains": left})
     except Exception:
         pass   # the sentence below is the report; a failing audit sink must not hide it
+    if remains is not None:
+        remains.extend(left)   # the caller learns whether anything was left behind without reading the sentence
     return "launch failed; " + "; ".join(done + left if (done or left) else ["nothing was created"])
 
 
@@ -8485,6 +8506,149 @@ def _stalled_age(seconds):
     return "%dm" % (seconds // 60) if hours < 1 else "%.1fh" % hours
 
 
+class _Unread(Exception):
+    """A guard's input could not be read: the predicate answers "unread" and the caller says nothing."""
+
+
+def _guard_last_report(w):
+    if isinstance(w.last, dict) and w.last.get("state") in ("blocked", "question"):
+        return ["its last report is %s" % w.last["state"]]
+    return []
+
+
+def _guard_awaiting_issue(w):
+    return ["an awaiting label on the issue"] if w.issue_labels & w.awaiting else []
+
+
+def _guard_awaiting_pr(w):
+    return ["an awaiting label on pull request #%d" % r["number"] for r in w.mine
+            if {(l.get("name") if isinstance(l, dict) else l) for l in (r.get("labels") or [])} & w.awaiting]
+
+
+def _guard_ci(w):
+    found = []
+    for r in w.mine:
+        number, head = r["number"], (r.get("head") or {}).get("sha") if isinstance(r.get("head"), dict) else None
+        held = (getattr(w.state, "pr_state", None) or {}).get("%s#%d" % (w.key, number)) or {}
+        if held.get("head") == head and held.get("examined_head") == head and any(
+                isinstance(c, dict) and str(c.get("conclusion") or "").lower() in STALLED_RUNNING_CHECKS for c in (held.get("checks") or [])):
+            found.append("CI is running at the head of #%d" % number)
+    return found
+
+
+def _guard_review_requested(w):
+    return ["a review is requested on #%d" % r["number"] for r in w.mine if not r.get("draft") and (r.get("requested_reviewers") or r.get("requested_teams"))]
+
+
+def _guard_review_window(w):
+    found = []
+    for r in w.mine:
+        if r.get("draft") or r.get("requested_reviewers") or r.get("requested_teams"):
+            continue   # a draft awaits no review; a requested one is the guard above
+        created = parse_iso(r.get("created_at"))
+        if created is None:
+            raise _Unread()   # the age of the pull request cannot be told: fails toward saying nothing
+        if w.now - created < w.window:
+            found.append("#%d is younger than the review window" % r["number"])
+    return found
+
+
+def _guard_reminder(w):
+    try:
+        reminders = read_reminders(w.engine.state_dir)
+    except ReminderError:
+        raise _Unread() from None   # an unreadable file, or a reminder with no readable time (read_reminders refuses it): fails toward saying nothing
+    for reminder in reminders:
+        if (reminder.get("to") == w.observation.name and reminder.get("issue") == w.issue and reminder["at"] > w.now
+                and "while_running" not in (reminder.get("condition") or {})):   # the checkpoint `launch` sets is the boss's, not the worker waiting
+            return ["it set a reminder for later"]
+    return []
+
+
+def _guard_decision(w):
+    body = read_decisions_file(w.engine.state_dir / DECISIONS_FILE)
+    if body is None:
+        raise _Unread()
+    refs = {(w.key, w.issue)} | {(w.key, r["number"]) for r in w.mine}
+    for d in body["decisions"]:
+        if not isinstance(d, dict):
+            continue
+        ref = sweep_ref_of(d, w.repo)
+        if d.get("tier", "human") == "human" and ref and (plan_ledger.normal_repo(ref[0]), ref[1]) in refs:
+            return ["a decision waits on the owner"]
+    return []
+
+
+# #816: THE table of waiting guards: name -> (needs the daemon's lists, check). The predicate LOOPS OVER it, so a guard cannot exist in code and
+# not here, and the tests are parametrised over it (a new row fails the completeness test until its case is added).
+WAITING_GUARDS = {
+    "last-report": (False, _guard_last_report),
+    "awaiting-issue": (True, _guard_awaiting_issue),
+    "awaiting-pr": (True, _guard_awaiting_pr),
+    "ci": (True, _guard_ci),
+    "review-requested": (True, _guard_review_requested),
+    "review-window": (True, _guard_review_window),
+    "reminder": (True, _guard_reminder),
+    "decision": (True, _guard_decision),
+}
+
+
+def legitimately_waiting(engine, observation, issue, repo, last):
+    """#816: THE shared predicate of the idle-at-a-seam rule and the stalled-working rule. Reads only what the daemon already holds (the last
+    report record, the issue list, the open-PR list and its cached check state, the reminders, the decision list), never GitHub.
+    Returns a namespace: `state` is "unread" (an input was not read whole or not readable: the caller says nothing), "waiting" (`codes` names the
+    guards from WAITING_GUARDS that hold, `reason` says why: the caller says nothing and the stretch is NOT consumed because nothing is stored)
+    or "clear"; `issue_at`, `pr`, `number`, `head`, `pr_at` describe what it found for the caller's movement judgement. A review is pending when
+    one is requested on a non-draft pull request, or such a pull request is younger than `review_window_minutes` (the list holds no reviews, so
+    "no review yet" is the window). Without the daemon's whole lists (a repository outside `plan_gates` never gets its open-PR list read) the
+    answer is "unread": both rules are silent there, by the read-whole rule."""
+    out = types.SimpleNamespace(state="unread", reason="", codes=[], issue_at=None, pr=None, number=None, head=None, pr_at=None)
+    now, key = engine.now(), plan_ledger.normal_repo(repo)
+    w = types.SimpleNamespace(engine=engine, observation=observation, issue=issue, repo=repo, key=key, last=last, now=now, mine=[], issue_labels=set(),
+                              awaiting=set(), state=getattr(engine, "ci_record_state", None), window=engine.config.get("review_window_minutes", 60) * 60)
+    found = []
+    def run(early):
+        for name, (needs, check) in WAITING_GUARDS.items():
+            if needs != (not early):
+                continue
+            for text in check(w):
+                found.append((name, text))
+    try:
+        run(True)
+        if found:
+            out.state, out.codes, out.reason = "waiting", [n for n, _ in found], "; ".join(t for _, t in found)
+            return out
+        if any(not whole(engine, name)[0] for name in ("issues:" + repo, "decisions", "pulls:" + key)):
+            return out
+        listed_at = engine.read_whole["pulls:" + key].get("at")
+        if not _is_number(listed_at) or now - listed_at > STALLED_LIST_MAX_AGE:
+            return out   # an open-PR list that is not being re-read is no evidence
+        units = getattr(getattr(engine, "triage", None), "units", None) or {}
+        records = (units.get((repo, "issues")) or {}).get("data") or []
+        item = next((r for r in records if isinstance(r, dict) and r.get("number") == issue and "pull_request" not in r), None)
+        out.issue_at = parse_iso(item.get("updated_at")) if item else None
+        if item is None or out.issue_at is None:
+            return out
+        pulls = ((getattr(w.state, "lists", None) or {}).get(key) or (0, []))[1]
+        w.mine = [r for r in pulls if isinstance(r, dict) and isinstance(r.get("number"), int)
+                  and any(isinstance(ref, list) and ref[1] == issue and plan_ledger.normal_repo(ref[0] or repo) == key for ref in pr_body_refs(r.get("body")))]
+        pr = max(w.mine, key=lambda r: parse_iso(r.get("updated_at")) or 0, default=None)   # the newest-moved one when several name the issue
+        if pr is not None:
+            out.pr, out.number = pr, pr["number"]
+            out.head = (pr.get("head") or {}).get("sha") if isinstance(pr.get("head"), dict) else None
+            out.pr_at = parse_iso(pr.get("updated_at"))
+            if not isinstance(out.head, str) or out.pr_at is None:
+                return out
+        w.awaiting = triage_awaiting_labels(engine)
+        w.issue_labels = {(l.get("name") if isinstance(l, dict) else l) for l in (item.get("labels") or [])}
+        run(False)
+    except _Unread:
+        out.state = "unread"
+        return out
+    out.state, out.codes, out.reason = ("waiting", [n for n, _ in found], "; ".join(t for _, t in found)) if found else ("clear", [], "")
+    return out
+
+
 SEAM_IDLE_SECONDS = 1200   # #773: an idle worker whose last report was `working` is noticed after this long
 REPORT_MAX = 300  # characters: a report is a sentence; detail goes on GitHub
 SUMMARY_CAP = 600  # characters of a worker's last reply in its fact
@@ -8646,6 +8810,8 @@ class WorkerFacts:
         closed = hub.closed_issue_snapshot() if hub is not None and hasattr(hub, "closed_issue_snapshot") else {}
         if repo and "%s#%d" % (plan_ledger.normal_repo(repo), issue) in closed:
             return []   # its assignment is closed
+        if not repo or legitimately_waiting(engine, observation, issue, repo, last).state != "clear":
+            return []   # #816: waiting legitimately (or an input not read whole): nothing is stored, so a later pass says it if it is still idle
         stretch = "%s:%s:%d" % ("seam", observation.session_id, int(round(observation.idle_at * 1000)))
         line = last.get("text") if isinstance(last.get("text"), str) else ""
         nudge = Fact("%s:%s" % (NUDGE, stretch), observation.name, NUDGE,
@@ -8682,64 +8848,18 @@ class WorkerFacts:
         closed = hub.closed_issue_snapshot() if hub is not None and hasattr(hub, "closed_issue_snapshot") else {}
         if "%s#%d" % (key, issue) in closed:
             return []
-        # the inputs, each whole or no wake
-        wanted = ["issues:" + repo, "decisions", "pulls:" + key]
-        if any(not whole(engine, name)[0] for name in wanted):
+        ctx = legitimately_waiting(engine, observation, issue, repo, last)
+        moved, head, number = ctx.issue_at, ctx.head, ctx.number
+        if ctx.state == "unread":
             return []
-        listed_at = engine.read_whole["pulls:" + key].get("at")
-        if not _is_number(listed_at) or now - listed_at > STALLED_LIST_MAX_AGE:
-            return []   # an open-PR list that is not being re-read is no evidence of "no movement"
-        units = getattr(getattr(engine, "triage", None), "units", None) or {}
-        records = (units.get((repo, "issues")) or {}).get("data") or []
-        item = next((r for r in records if isinstance(r, dict) and r.get("number") == issue and "pull_request" not in r), None)
-        issue_at = parse_iso(item.get("updated_at")) if item else None
-        if item is None or issue_at is None:
-            return []
-        labels = {(l.get("name") if isinstance(l, dict) else l) for l in (item.get("labels") or [])}
-        awaiting = triage_awaiting_labels(engine)
-        if labels & awaiting:
-            return []
-        state = getattr(engine, "ci_record_state", None)
-        pulls = ((getattr(state, "lists", None) or {}).get(key) or (0, []))[1]
-        mine = [r for r in pulls if isinstance(r, dict) and isinstance(r.get("number"), int)
-                and any(isinstance(ref, list) and ref[1] == issue and plan_ledger.normal_repo(ref[0] or repo) == key
-                        for ref in pr_body_refs(r.get("body")))]
-        pr = max(mine, key=lambda r: parse_iso(r.get("updated_at")) or 0, default=None)   # the newest-moved one when several name the issue
-        moved, head, number = issue_at, None, None
-        if pr is not None:
-            number = pr["number"]
-            head = (pr.get("head") or {}).get("sha") if isinstance(pr.get("head"), dict) else None
-            pr_at = parse_iso(pr.get("updated_at"))
-            if not isinstance(head, str) or pr_at is None:
-                return []
-            moved = max(moved, pr_at)
+        if ctx.pr is not None:
+            moved = max(moved, ctx.pr_at)
             seen = self._heads.get(observation.name)   # a head this process saw change is movement now, whatever GitHub's clock says
-            if seen is None or seen[0] != head:
+            if seen is None or seen[0] != head:        # recorded BEFORE the waiting verdict is used: a head that moved during a guard is still movement
                 self._heads[observation.name] = (head, now if seen is not None else 0)
             moved = max(moved, self._heads[observation.name][1])
-            pr_labels = {(l.get("name") if isinstance(l, dict) else l) for l in (pr.get("labels") or [])}
-            if pr_labels & awaiting:
-                return []
-            held = (getattr(state, "pr_state", None) or {}).get("%s#%d" % (key, number)) or {}
-            if held.get("head") == head and any(isinstance(c, dict) and str(c.get("conclusion") or "").lower() in STALLED_RUNNING_CHECKS
-                                                for c in (held.get("checks") or []) if held.get("examined_head") == head):
-                return []   # a check at this head is still running
-        try:
-            for reminder in read_reminders(state_dir):
-                if reminder.get("to") == observation.name and reminder.get("issue") == issue and reminder["at"] > now:
-                    return []   # it said when it will look again
-        except ReminderError:
+        if ctx.state == "waiting":
             return []
-        body = read_decisions_file(state_dir / DECISIONS_FILE)
-        if body is None:
-            return []
-        refs = {(key, issue)} | ({(key, number)} if number else set())
-        for d in body["decisions"]:
-            if not isinstance(d, dict):
-                continue
-            ref = sweep_ref_of(d, repo)
-            if d.get("tier", "human") == "human" and ref and (plan_ledger.normal_repo(ref[0]), ref[1]) in refs:
-                return []   # it waits on the owner
         since = max(moved, last["work_since"])
         if now - since < window:
             return []
@@ -17176,7 +17296,12 @@ def cmd_launch(args, runner, now, socket_call=None):
         return run_cloud("cmd_launch", args, runner, now)
     refuse_cloud_name(args.name)   # a name that has a cloud record is not launched locally (#640)
     engine, state, _ = build_engine(runner, now, "cli", socket_call=socket_call)
-    workspace = args.workspace if (args.workspace or getattr(args, "new_workspace", None) or getattr(args, "headless", False)) \
+    if getattr(args, "terminal", False) and getattr(args, "headless", False):
+        raise LaunchError("--terminal and --headless contradict each other: pick one")
+    # #433: a plain launch takes its mode from `launch_default` (shipped: headless). A terminal is asked for by --terminal, or implied by --workspace/--new-workspace.
+    by_default = not (args.resume or getattr(args, "headless", False) or getattr(args, "terminal", False) or args.workspace or getattr(args, "new_workspace", None))
+    use_headless = bool(getattr(args, "headless", False)) or (by_default and engine.config.get("launch_default", "headless") == "headless")
+    workspace = args.workspace if (args.workspace or getattr(args, "new_workspace", None) or use_headless) \
         else caller_workspace(engine, None)   # a workspace made now, or none at all, needs no look at the caller's own
     if args.resume:
         given = getattr(args, "repo", None)
@@ -17258,11 +17383,27 @@ def cmd_launch(args, runner, now, socket_call=None):
         launcher = None   # an identity failure records nobody, on purpose: that agent never counts as a launched tester (fail closed)
     launched_by = launcher if isinstance(launcher, str) and launcher else None
     try:
-        if getattr(args, "headless", False):
-            done = launch_headless(engine, args.name, args.agent, args.dir, args.role, args.reports_to,
-                                   None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo,
-                                   launched_by=launched_by)
-        else:
+        done = None
+        if use_headless:
+            try:
+                done = launch_headless(engine, args.name, args.agent, args.dir, args.role, args.reports_to,
+                                       None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo,
+                                       launched_by=launched_by)
+            except HeadlessRefused as err:
+                if getattr(args, "headless", False):
+                    raise   # asked for by name: the refusal is the answer
+                reason = _one_line(str(err), 200)
+                sys.stderr.write("%s: launch: headless refused for %s (%s); opened a terminal instead\n" % (PROG, args.name, reason))
+                try:
+                    if engine.audit is not None:
+                        engine.audit.append(engine.actor, "launch.fallback_terminal", args.name, {"why": reason, "repo": repo})
+                except Exception as aerr:   # the line above is the report; a failing audit sink must not turn a safe fallback into a failed launch
+                    sys.stderr.write("%s: launch: the fallback could not be audited (%s)\n" % (PROG, _one_line(str(aerr), 100)))
+                try:
+                    workspace = caller_workspace(engine, None)
+                except Exception as werr:
+                    raise LaunchError("headless refused (%s) and no terminal workspace could be found (%s)" % (reason, _one_line(str(werr), 120))) from werr
+        if done is None:
             done = launch_agent(engine, args.name, args.agent, args.dir, workspace, args.role, args.reports_to,
                                 None if args.issue is None else int(args.issue), brief, charter=args.charter, repo=repo,
                                 launched_by=launched_by, read_repo=read_repo)
@@ -26571,14 +26712,17 @@ def build_parser():
     notice.add_argument("--from", dest="sender", help="Lab only: the sender's fleet name")
     sub.add_parser("ensure", help="Start the daemon unless it runs (herdr's startup hook calls this)")
     sub.add_parser("poke", help="Ask the daemon for a pass now; silent, never blocks (herdr's event hooks call this)")
-    launch = sub.add_parser("launch", help="Start a fleet agent in a new herdr tab, without typing", description="Start a fleet agent in a new herdr tab, without typing. A NEW launch (not a resume or --cloud) first runs the memory test: this is the lanes' safety check, not the owner's rule (there are no caps on coders), and `--memory-ok <reason>` overrides it. A refusal exits 5.")
+    launch = sub.add_parser("launch", help="Start a fleet agent (headless by default, or in a new herdr tab with --terminal), without typing", description="Start a fleet agent (headless by default, or in a new herdr tab with --terminal), without typing. A NEW launch (not a resume or --cloud) first runs the memory test: this is the lanes' safety check, not the owner's rule (there are no caps on coders), and `--memory-ok <reason>` overrides it. A refusal exits 5.")
     launch.add_argument("name", help="The agent's fleet name (lower case, digits, - and _)")
     launch.add_argument("--agent", help="The OpenCode agent definition, such as coder")
     launch.add_argument("--dir", help="The agent's working directory (absolute)")
     launch.add_argument("--resume", metavar="SESSION", help="Open a tab on this existing session of NAME instead "
                                                            "of creating one (a restart that keeps the conversation)")
     launch.add_argument("--headless", action="store_true", help="Start the worker with NO terminal: a session in the OpenCode service, the brief sent through "
-                        "the API (about 2 MB instead of a terminal's 200 to 400 MB). Its tools run in the service's environment; opt in")
+                        "the API (about 2 MB instead of a terminal's 200 to 400 MB). Its tools run in the service's environment. The default of a plain launch (see --terminal); "
+                        "unlike the default, an explicit --headless never falls back to a terminal")
+    launch.add_argument("--terminal", action="store_true", help="Open a herdr tab for the worker (a plain launch is headless unless the configuration key "
+                        "launch_default is terminal). Cannot be combined with --headless; --workspace and --new-workspace imply it")
     launch.add_argument("--workspace", help="The herdr workspace for the new tab (default: the workspace of this session, else $HERDR_WORKSPACE_ID)")
     launch.add_argument("--role", help="metadata.fleet.role")
     launch.add_argument("--reports-to", dest="reports_to", help="metadata.fleet.reports_to")
