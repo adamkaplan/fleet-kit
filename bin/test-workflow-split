@@ -133,6 +133,43 @@ PERMISSIONS = {"contents": "read"}
 WORKFLOW_KEYS = ["concurrency", "jobs", "name", "on", "permissions"]
 
 
+# The expected STEP LISTS, written out in full and in order: every step is compared as the whole parsed mapping (key set and values), so a step,
+# or a key of a step, that is not listed fails. Nothing here is derived from the workflow it pins.
+NOT_CANCELLED = "${{ !cancelled() }}"
+CHECKOUT = {"uses": "actions/checkout@v5", "with": {"fetch-depth": "0"}}
+PYTHON = {"run": "python3 --version"}
+
+
+def step(name, out="", always=True, **more):
+    out_ = {"name": name, "run": run_of(name, out)}
+    if always:
+        out_["if"] = NOT_CANCELLED
+    out_.update(more)
+    return out_
+
+
+def plain(name, run):
+    return {"name": name, "if": NOT_CANCELLED, "run": run}
+
+
+TEST_STEPS = [CHECKOUT, PYTHON,
+              {"name": "bin/check-public-names", "env": {"FLEET_PRIVATE_NAMES": "${{ secrets.PRIVATE_NAMES }}"}, "run": "python3 bin/check-public-names"},
+              step("bin/test-heartbeat", always=False), step("bin/test-health-records"), step("bin/test-fleet-doctor"),
+              step("bin/test-fleet-doctor-config"), step("bin/test-fleet-doctor-heartbeat"), step("bin/test-switchboard"),
+              step("bin/test-workflow-split"), step("bin/test-gh-hold", "-hold"), step("bin/test-app-mint", "-app"),
+              step("bin/test-cloud-neutral-names"),
+              step("cloud/tests/test-cloud", **{"timeout-minutes": "5", "env": {"CLOUD_TEST_SKIP_DOCKER": "1"}}),
+              plain("node --test plugins/fleet-decisions-tui/health.test.mjs", "node --test plugins/fleet-decisions-tui/health.test.mjs"),
+              plain("bin/fleet-scenario validate", "bin/fleet-scenario validate"),
+              plain("bin/fleet-scenario coverage", "bin/fleet-scenario coverage --enforce --through-pr 4")]
+CLOUD_STEPS = [CHECKOUT, PYTHON, step("bin/test-cloud-worker"), step("bin/test-cloud-launcher", **{"timeout-minutes": "30"})]
+STEP_LISTS = {"test": TEST_STEPS, "test-cloud": CLOUD_STEPS}
+# The step schema of GitHub Actions: every key class that can skip, soften, redirect or widen a step.
+STEP_KEYS = {"id": "id: x", "name": "name: x", "if": "if: false", "uses": "uses: x/y@z", "run": "run: echo x", "shell": "shell: sh",
+             "with": "with:\n          a: b", "env": "env:\n          A: b", "continue-on-error": "continue-on-error: true",
+             "timeout-minutes": "timeout-minutes: 5", "working-directory": "working-directory: /tmp"}
+
+
 def only_suites(table):
     return [row for row in table if row[0] not in ("bin/check-public-names", "bin/fleet-scenario validate", "bin/fleet-scenario coverage")]
 
@@ -208,6 +245,10 @@ class Pins(unittest.TestCase):
             self.assertEqual(job["strategy"], STRATEGY, jid)
             self.assertEqual(job["runs-on"], "${{ matrix.os }}", jid)
             self.assertEqual(job["defaults"], DEFAULTS, jid)
+
+    def test_steps_both_jobs_have_exactly_the_expected_step_lists(self):
+        for jid, expected in STEP_LISTS.items():
+            self.assertEqual(self.jobs()[jid]["steps"], expected, jid)
 
 
 # Every key class of the workflow schema that can hide, skip, soften or widen a job, each with a value that parses.
@@ -350,6 +391,52 @@ class Mutants(unittest.TestCase):
         for key, line in WORKFLOW_LEVEL.items():
             with self.subTest(key=key):
                 self.killed(mutate(text, "\njobs:\n", "\n" + line + "\n\njobs:\n"), self.SHAPE)
+
+    STEPS = "test_steps_both_jobs_have_exactly_the_expected_step_lists"
+
+    @staticmethod
+    def anchor(jid, step_):
+        """The text of the step's first line (`      - name: X` or `      - uses: ...`), searched from the job's own line."""
+        first = "name" if "name" in step_ else ("uses" if "uses" in step_ else "run")
+        return "      - %s: %s\n" % (first, step_[first])
+
+    def test_steps_the_reviewers_named_each_fail(self):
+        text = WORKFLOW.read_text()
+        i = text.index("  test-cloud:")
+        launcher = "      - name: bin/test-cloud-launcher\n"
+        cases = [text.replace(launcher + "        if: ${{ !cancelled() }}\n", launcher + "        if: false\n", 1),
+                 text.replace(launcher + "        if: ${{ !cancelled() }}\n", launcher, 1),
+                 mutate(text, launcher, launcher + "        continue-on-error: true\n"),
+                 mutate(text, launcher, launcher + "        shell: sh\n"),
+                 mutate(text, launcher, launcher + "        working-directory: /tmp\n"),
+                 mutate(text, launcher, launcher + "        env:\n          A: b\n"),
+                 text[:i] + text[i:].replace("fetch-depth: 0", "fetch-depth: 1", 1),
+                 text[:i] + text[i:].replace("      - run: python3 --version\n", "", 1),
+                 text[:i] + text[i:].replace("      - uses: actions/checkout@v5\n        with:\n          # Full history: test-fleet-doctor-heartbeat compares against a baseline commit.\n          fetch-depth: 0\n", "", 1),
+                 text.rstrip("\n") + "\n\n      - run: echo extra\n",
+                 text[:i] + text[i:].replace("    steps:\n", "    steps:\n      - run: echo first\n", 1)]
+        for n, mutated in enumerate(cases):
+            with self.subTest(case=n):
+                self.assertNotEqual(mutated, text)
+                self.killed(mutated, self.STEPS)
+
+    def test_steps_every_step_key_class_on_every_step_of_both_jobs_is_refused(self):
+        text = WORKFLOW.read_text()
+        for jid, steps in STEP_LISTS.items():
+            start = text.index("\n  %s:\n" % jid)
+            for n, step_ in enumerate(steps):
+                a = self.anchor(jid, step_)
+                at = text.index(a, start) + len(a)
+                for key, line in STEP_KEYS.items():
+                    if key in step_ or (key == "name" and "name" in step_):
+                        continue      # a key the step already has is covered by the value pins and the named mutants above
+                    with self.subTest(job=jid, step=n, key=key):
+                        self.killed(text[:at] + "        " + line + "\n" + text[at:], self.STEPS)
+
+    def test_steps_an_extra_step_at_the_start_or_end_of_the_old_job(self):
+        text = WORKFLOW.read_text()
+        self.killed(mutate(text, "  test:\n", "  test:\n").replace("    steps:\n", "    steps:\n      - run: echo x\n", 1), self.STEPS)
+        self.killed(mutate(text, "\n  # The cloud suites run beside", "\n      - run: echo x\n\n  # The cloud suites run beside"), self.STEPS)
 
     def test_shape_job_permissions_write_all(self):
         self.killed(mutate(WORKFLOW.read_text(), "  test-cloud:\n", "  test-cloud:\n    permissions: write-all\n"), self.SHAPE)
