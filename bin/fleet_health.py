@@ -320,10 +320,12 @@ def resolve_held_links(ctx, state, budget, held, now, problems):
     its first-line `PLAN:` link and its `Closes` / `Part of` lines, never prose or a branch name) and each one's parents (the cached, budgeted parent reads the pass already makes). Rebuilt in full every pass, so a
     reference removed from the body is gone at the next pass; the full `owner/repo` is compared, never the name alone."""
     refs = getattr(ctx, "pr_refs", None) or {}
-    out = {}
+    out, unresolved = {}, []
     for row in held[:HELD_LINKS_MAX]:
         key = "%s#%d" % (row["repo"].lower(), row["number"])
         found = set()
+        if row["tier"] == "human" and key not in refs:
+            unresolved.append(key)   # #796: its body's references were not read yet
         for ref in (refs.get(key) or [])[:PR_REFS_MAX]:
             if not (isinstance(ref, (list, tuple)) and len(ref) == 2 and isinstance(ref[1], int) and not isinstance(ref[1], bool) and ref[1] > 0):
                 continue
@@ -332,11 +334,14 @@ def resolve_held_links(ctx, state, budget, held, now, problems):
             cur = ref[1]
             for _ in range(PARENT_LEVELS):
                 parent, resolved = _parent_of(ctx, state, budget, repo, cur, now, problems)
+                if not resolved and row["tier"] == "human" and key not in unresolved:
+                    unresolved.append(key)   # #796: a parent read the budget (or a failure) cut: the link to the ask may be missing
                 if not resolved or not parent:
                     break
                 found.add((repo.lower(), parent))
                 cur = parent
         out[key] = found
+    ctx.unresolved_held = unresolved   # #796: the human-tier held pull requests whose links are not whole; `tick` reads it
     return out
 
 
@@ -479,6 +484,21 @@ def _write_state(state_dir, data):
         json.dump(data, handle, sort_keys=True, indent=1)
         handle.write("\n")
     os.replace(str(temp), str(path))
+
+
+WAITING_LINE = "load: waiting for the first full pass"
+WAITING_LINKS = "load: waiting for held PR links"
+
+
+def mark_waiting(state_dir):
+    """#796: the daemon has started and not finished its first full pass: record it for `status`, touching nothing else (figures, episodes). Never raises."""
+    try:
+        state = _read_state(state_dir)
+        if state.get("warming") != WAITING_LINE:
+            state["warming"] = WAITING_LINE
+            _write_state(state_dir, state)
+    except OSError:
+        pass
 
 
 PR_KINDS = ("notice", "captain")   # the entries of decisions.json that are information about a pull request, not a wait
@@ -789,6 +809,11 @@ def tick(ctx):
     rows += audited or []
     problems, rows = _refresh_asks(ctx, state, now, rows)
     held, reminders = held_prs(ctx.state_dir), list(getattr(ctx, "reminders", None) or [])
+    unresolved = list(getattr(ctx, "unresolved_held", None) or [])
+    if getattr(ctx, "notices_unread", 0):
+        unresolved.append("noticed PRs without facts")   # #796: a PR the notice reader skipped or could not read has no row to look at: its links are unknown
+    ctx.links_complete = not unresolved
+    hold_back = bool(getattr(ctx, "links_gate", False) and unresolved)   # #796: after a start, no alert while a human-tier held PR's links are not whole
     if audited is None:
         problems.append("movement: the audit log cannot be read")
     waiting = state.get("decision_counts")
@@ -828,6 +853,8 @@ def tick(ctx):
         series[name] = mine
         before = episodes.get(name)
         text, episodes[name] = judge(fig, ctx.cfg, before)
+        if hold_back:
+            text, episodes[name] = None, before   # nothing judged: the episode memory is exactly as it was
         if text and ctx.cfg["enabled"] and ctx.cos:
             ctx.wake(text)
             sent.append((name, text))
@@ -836,6 +863,10 @@ def tick(ctx):
     if unchartered:   # no charter issue is recorded in its fleet metadata: its asks cannot be found, said once for all of them
         problems.append("no charter recorded for %s" % ", ".join(unchartered[:6]) + (" and %d more" % (len(unchartered) - 6) if len(unchartered) > 6 else ""))
     state.pop("at", None)
+    if hold_back:
+        state["warming"] = WAITING_LINKS
+    else:
+        state.pop("warming", None)
     state.update({"series": {n: series[n] for n in latest}, "episodes": {n: episodes.get(n) for n in latest},
                   "latest": latest, "problems": problems, "alert": bool(ctx.cfg["enabled"])})
     if state != before_state:   # an idle pass rewrites nothing
@@ -848,10 +879,11 @@ def status_lines(state_dir, now):
     """The `status` lines: one per orchestrator, then what could not be read. Empty until the daemon has made a pass."""
     state = _read_state(state_dir)
     latest = state.get("latest")
+    waiting = [state["warming"]] if state.get("warming") in (WAITING_LINE, WAITING_LINKS) else []
     if not isinstance(latest, dict) or not latest:
-        return []
+        return waiting
     num = lambda value: "not recorded" if value is None else str(value)
-    out = ["load        %d orchestrator(s); alert %s" % (len(latest), "on" if state.get("alert") else "off")]
+    out = waiting + ["load        %d orchestrator(s); alert %s" % (len(latest), "on" if state.get("alert") else "off")]
     for name in sorted(latest):
         f = latest[name]
         out.append("  %-12s asks %s, stalled %s, waiting on owner %s, parked %s, waiting on cos %s, waiting live %s, oldest stall %s h, moved 1h %s, charter moves 1h %s; waiting %d msg %s dec; coders %d busy %d idle" % (
