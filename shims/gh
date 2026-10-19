@@ -35,6 +35,8 @@ TOKEN_ENV_NAMES = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_EN
 
 
 COUNT_ACCOUNT = [None]
+COUNT_LANE = [None]   # the caller's fleet name (else its role), set when the identity lookup ran for the call: nothing is looked up for the counter
+LANE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 CALLS_SPOOL = "agent-calls.jsonl"
 CALLS_LIMIT = 262144
 CALLS_ON = "agent-calls-hours.json"   # the daemon makes this file: counting is on only while a daemon folds the spool
@@ -54,6 +56,15 @@ def call_endpoint(args):
     return " ".join(words[:2])[:40]
 
 
+def call_lane():
+    """The lane of this call: the agent's fleet name when the identity lookup already found it, else its role (`FLEET_SWITCHBOARD_ROLE`), else `unknown`.
+    A name or a role only: never a value of an argument."""
+    for candidate in (COUNT_LANE[0], os.environ.get("FLEET_SWITCHBOARD_ROLE")):
+        if isinstance(candidate, str) and LANE_RE.match(candidate):
+            return candidate
+    return "unknown"
+
+
 def count_call(args):
     """Best effort, never fails or delays the command: one line (time, account name, endpoint class) for the daemon's hourly count. The switchboard's
     own calls are counted by the daemon, not here. Nothing else is recorded: no token, no argument, no body, no repo."""
@@ -68,7 +79,7 @@ def count_call(args):
             os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state"), "fleet-switchboard")
         path = os.path.join(state, CALLS_SPOOL)
         if endpoint and os.path.exists(os.path.join(state, CALLS_ON)) and (not os.path.exists(path) or os.path.getsize(path) < CALLS_LIMIT):
-            line = json.dumps({"ts": int(time.time()), "account": COUNT_ACCOUNT[0] or "default", "endpoint": endpoint}, sort_keys=True)
+            line = json.dumps({"ts": int(time.time()), "account": COUNT_ACCOUNT[0] or "default", "endpoint": endpoint, "lane": call_lane()}, sort_keys=True)
             fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
             with os.fdopen(fd, "a") as out:
                 out.write(line + "\n")
@@ -165,6 +176,7 @@ class Lookup:
             data = None
         if isinstance(data, dict):
             name, repo = data.get("name"), data.get("repo")
+            COUNT_LANE[0] = name if isinstance(name, str) and NAME_RE.match(name) else (data.get("role") if isinstance(data.get("role"), str) else None)
             self._ident = {"name": name if isinstance(name, str) and NAME_RE.match(name) else None,
                            "repo": repo if isinstance(repo, str) and REPO_RE.match(repo) else None,
                            "own": data.get("own") is not False,
@@ -175,6 +187,7 @@ class Lookup:
             self.failed = True                 # neither form answered: a failure, not an old switchboard
         name = plain.stdout.strip() if plain is not None and plain.returncode == 0 else ""
         self._ident = {"name": name if NAME_RE.match(name) else None, "repo": None}
+        COUNT_LANE[0] = self._ident["name"]
         return self._ident
 
 
