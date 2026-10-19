@@ -20507,6 +20507,23 @@ def impact_records(state_dir):
     return found, None
 
 
+def _impact_rehold_now(engine, repo, number, pr, report, record):
+    """(#830) True when this judged pull request is HELD AGAIN at its head (a clear recorded for another head, none for this one, no rating here) and the hold was applied (or already
+    stands). Only on a whole read: an unreadable state or ledger returns False and changes nothing here (the caller then releases nothing either: `records_problem`). Raises on a failed
+    write, like the hold branch, so the caller backs off."""
+    state, problem = read_impact_state(engine.state_dir)
+    if problem or not report.get("head"):
+        return False
+    records, records_problem = impact_records(engine.state_dir)
+    if records_problem:
+        return False
+    why = rehold_reason(engine, state, repo, pr, report["head"], (pr, report["head"]) in records)
+    if not why:
+        return False
+    apply_impact_hold(engine, repo, number, dict(report, reasons=[why], rehold=why, owner_decision="hold"), record)
+    return True
+
+
 def _impact_cos(engine):
     discovery = getattr(engine, "discovery", None)
     agents = getattr(discovery, "agents", None) or {}
@@ -20798,7 +20815,7 @@ def impact_would_hold_pass(engine, now):
             enforce = impact_floor.hold_mode(engine.config, key) == "enforce"
             earlier = reports.get((key, number))
             backoff = seen.get((key, number, "retry"))
-            if earlier is not None and earlier["head"] == head and earlier.get("rule") == rule and earlier.get("owner_decision") != "hold" and enforce \
+            if earlier is not None and earlier["head"] == head and earlier.get("rule") == rule and earlier.get("owner_decision") != "hold" and enforce and not earlier.get("rehold") \
                     and not (backoff and now < backoff) and not records_problem and (pr, head) in records and seen.get((key, number)) != (head, rule, records[(pr, head)]):
                 # an impact review record that is new since this head was judged, on a pull request that holds nothing: no gh read (the paths are unchanged).
                 # A `hold` of a top tier, missing or unknown class can only ADD a hold; anything else changes nothing, so it is only noted as seen.
@@ -20855,6 +20872,9 @@ def impact_would_hold_pass(engine, now):
                         engine._note("impact.error", pr, {"error": _one_line(str(err), 160), "write": True})
                         unjudged += 1
                         continue
+            elif enforce and _impact_rehold_now(engine, key, number, pr, report, record):   # (#830) cleared at an earlier head, none here: held again, never released
+                budget -= 1
+                report = dict(report, rehold=True)
             elif enforce and not records_problem:   # a release is a LOOSENING: only on a decision made from every input, never on a failed read
                 try:
                     removed = release_impact_hold(engine, key, number, report, record)

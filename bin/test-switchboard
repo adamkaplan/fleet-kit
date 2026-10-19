@@ -13939,6 +13939,22 @@ class TestClearCarryInTheDaemon(Base):
         self.assertEqual(([w for w in self.writes if w[1].endswith("/pulls/7")], self.body), ([], before))
         self.assertFalse(sb.pr_marker_state([], self.body, now=0)["captain"], "the gate reads no hold from the text")
 
+    def test_830_a_pure_merge_carry_is_not_held_again_and_a_changed_pull_request_is(self):
+        self.clear()
+        new = self.merge_main()
+        report = {"pr": self.PR, "head": new, "reasons": [], "floor_paths": [], "globs": []}
+        self.assertTrue(sb._impact_rehold_now(self.engine, self.REPO, 7, self.PR, report, {"labels": []}))
+        self.assertEqual(self.adds(), [], "the pure merge carries: no hold written")
+        state = sb.read_impact_state(self.world.state)[0]
+        self.assertEqual(state["carried"][self.PR]["head"], new)
+        self.assertIsNone(sb.rehold_reason(self.engine, state, self.REPO, self.PR, new, False))
+        self.build(carry=False)
+        self.clear()
+        new = self.merge_main("m2.txt")
+        self.writes.clear()
+        self.assertTrue(sb._impact_rehold_now(self.engine, self.REPO, 7, self.PR, dict(report, head=new), {"labels": []}))
+        self.assertEqual(len(self.adds()), 1, "with the carry off every new head is held again")
+
     def test_s4_a_carried_clear_tells_the_chief_of_staff_once_with_both_heads(self):
         cleared = self.clear()
         new = self.merge_main()
@@ -31320,6 +31336,108 @@ class TestImpactHold(LedgerBase):
         self.floor_pr(head=LEDGER_NEW_HEAD)
         self.passes(records=[self.listed(head=LEDGER_NEW_HEAD)], advance=8000)
         self.assertEqual(len(self.label_writes()), before + 1, "a new head is held again")
+
+    # -- #830: a cleared pull request is held again at a new head
+
+    def cleared_at_a_then_pushed_to_b(self, path="src/app.py"):
+        """The owner clears the floor hold at head A; the pull request is then pushed to head B, which no floor path holds and no rating rates. Returns the clear state."""
+        self.passes()
+        self.assertEqual(self.run_as(None, "impact", "clear", self.PR, "--reason", "a false hold: the file is a fixture")[0], 0)
+        self.writes.clear()
+        self.floor_pr(path=path, head=LEDGER_NEW_HEAD)
+        state = sb.read_impact_state(self.world.state)[0]
+        state["clears"][self.PR]["at"] = 1   # the fake world's clock is far in the future of the passes' own: the clear is older than the daemon's later records, as in life
+        sb.write_impact_state(self.world.state, state)
+        return state["clears"]
+
+    def labelled(self):
+        return [self.names["merge-captain"], self.names["hold-impact"]]
+
+    def test_s1_a_clear_at_head_a_and_a_push_to_head_b_is_held_again_once_and_never_a_clear(self):
+        before = self.cleared_at_a_then_pushed_to_b()
+        self.passes(records=[self.listed(head=LEDGER_NEW_HEAD)], advance=2000)
+        (write,) = self.label_writes()
+        self.assertEqual(sorted(write[2]["labels"]), sorted(self.labelled()))
+        self.passes(records=[self.listed(head=LEDGER_NEW_HEAD, labels=self.labelled())], advance=4000)
+        self.passes(records=[self.listed(head=LEDGER_NEW_HEAD, labels=self.labelled())], advance=8000)
+        self.assertEqual(len(self.label_writes()), 1, "once")
+        (event,) = self.events("gate.hold_reapplied")
+        self.assertEqual((event["detail"]["head"], event["detail"]["cleared_head"]), (LEDGER_NEW_HEAD, LEDGER_HEAD))
+        self.assertEqual(sb.read_impact_state(self.world.state)[0]["clears"], before, "a hold is never a clear: the owner's record is untouched")
+        self.assertEqual(len(self.events("gate.hold_cleared")), 1)
+        self.assertEqual([w for w in self.writes if w[0] == "DELETE"], [], "nothing is released")
+
+    def test_the_hold_labels_the_clear_took_off_are_put_back(self):
+        self.passes(records=[self.listed(labels=[self.names["hold-credential"]])])
+        self.assertEqual(self.run_as(None, "impact", "clear", self.PR, "--reason", "a false hold: the file is a fixture")[0], 0)
+        self.writes.clear()
+        self.floor_pr(path="src/app.py", head=LEDGER_NEW_HEAD)
+        self.passes(records=[self.listed(head=LEDGER_NEW_HEAD)], advance=2000)
+        (write,) = self.label_writes()
+        self.assertEqual(sorted(write[2]["labels"]), sorted(self.labelled() + [self.names["hold-credential"]]))
+
+    def test_a_clear_at_b_a_rating_at_b_and_a_never_cleared_pull_request_are_not_held_again(self):
+        self.cleared_at_a_then_pushed_to_b()
+        self.assertEqual(self.run_as(None, "impact", "clear", self.PR, "--reason", "a false hold: the file is a fixture")[0], 0)   # the owner clears head B too
+        self.writes.clear()
+        self.passes(records=[self.listed(head=LEDGER_NEW_HEAD)], advance=2000)
+        self.assertEqual(self.label_writes(), [], "a clear at this head")
+        self.assertEqual(self.events("gate.hold_reapplied"), [])
+
+    def test_a_rating_at_the_new_head_recorded_as_not_held_ends_the_hold_again_and_releases_only_what_the_daemon_added(self):
+        self.cleared_at_a_then_pushed_to_b()
+        self.passes(records=[self.listed(head=LEDGER_NEW_HEAD)], advance=2000)
+        self.assertEqual(len(self.label_writes()), 1)
+        sb.plan_ledger.append_entry(self.world.state, {"kind": "review_record", "pr": self.PR, "head": LEDGER_NEW_HEAD, "reviewer": "impact", "verdict": "approve",
+                                                       "blocks": 0, "notes": 0, "by": "rev", "impact_action": "second-review", "summary": "x"}, 1)
+        self.passes(records=[self.listed(head=LEDGER_NEW_HEAD, labels=self.labelled())], advance=4000)
+        self.assertEqual(sorted(w[1].rsplit("/", 1)[1] for w in self.writes if w[0] == "DELETE"), sorted(n.replace(":", "%3A") for n in self.labelled()))
+
+    def test_a_pull_request_never_cleared_and_never_rated_is_unchanged(self):
+        self.floor_pr(path="src/app.py")
+        self.passes()
+        self.floor_pr(path="src/app.py", head=LEDGER_NEW_HEAD)
+        self.passes(records=[self.listed(head=LEDGER_NEW_HEAD)], advance=2000)
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.events("gate.hold_reapplied"), [])
+
+    def test_every_reader_of_is_it_held_agrees_after_a_clear_at_head_a_and_a_push_to_head_b(self):
+        before = self.cleared_at_a_then_pushed_to_b()
+        state = sb.read_impact_state(self.world.state)[0]
+        engine = self.world.new_engine("daemon")
+        engine.config, engine.state_dir, engine.gh_runner = sb.load_config(), self.world.state, self.route
+        report = sb.pr_floor_report(engine, "acme/app", 9)
+        self.assertEqual(report["owner_decision"], "none", "the floor alone does not hold head B: only the clear does")
+        readers = {
+            "the rule": lambda: bool(sb.rehold_reason(engine, state, "acme/app", self.PR, LEDGER_NEW_HEAD, False)),
+            "the gate fact": lambda: bool(sb.gate_floor_fact(engine, self.world.state, "acme/app", 9, LEDGER_NEW_HEAD)["rehold"]),
+            "gate G6": lambda: self.row(self.gates()[1], "G6")["status"] == "waiting",
+            "gate G6b": lambda: self.row(self.gates()[1], "G6b")["status"] != "n/a",
+            "the dry run": lambda: sb.impact_plan(engine, report, [], state, {}, None)[0] in ("add", "held"),
+            "the release": lambda: sb.release_impact_hold(engine, "acme/app", 9, report, {}) == 0 and not [w for w in self.writes if w[0] == "DELETE"],
+        }
+        self.pr["headRefOid"] = LEDGER_NEW_HEAD
+        self.pr["labels"] = [{"name": n} for n in self.labelled()]
+        state["applied"][self.PR] = {"head": LEDGER_NEW_HEAD, "merge_label_added": True, "added": self.labelled(), "at": 1}
+        sb.write_impact_state(self.world.state, state)
+        for name, held in readers.items():
+            with self.subTest(reader=name):
+                self.assertTrue(held())
+        self.assertEqual(sb.read_impact_state(self.world.state)[0]["clears"], before)
+        self.pr["labels"] = []   # with the labels gone the gate still waits (whatever the labels say)
+        self.assertEqual(self.row(self.gates()[1], "G6")["status"], "waiting")
+
+    def test_not_whole_input_changes_nothing_and_an_unreadable_head_is_held(self):
+        self.cleared_at_a_then_pushed_to_b()
+        engine = self.world.new_engine("daemon")
+        engine.config, engine.state_dir, engine.gh_runner = sb.load_config(), self.world.state, self.route
+        state = sb.read_impact_state(self.world.state)[0]
+        self.assertTrue(sb.rehold_reason(engine, state, "acme/app", self.PR, None, False), "an unreadable head is held")
+        self.assertTrue(sb.rehold_reason(engine, state, "acme/app", self.PR, None, True), "a rating cannot rate an unreadable head")
+        self.assertIsNone(sb.rehold_reason(engine, {"clears": {}, "applied": {}}, "acme/app", self.PR, None, False), "no recorded clear: this rule holds nothing")
+        (self.world.state / "impact-hold.json").write_text("{not json")   # a corrupt state: no change from the re-hold, never a clear
+        self.assertFalse(sb._impact_rehold_now(engine, "acme/app", 9, self.PR, {"head": LEDGER_NEW_HEAD}, {}))
+        self.assertEqual(self.writes, [])
 
     def test_a_clear_also_takes_off_a_merge_captain_label_the_switchboard_did_not_add(self):   # #742: it was `..._keeps_...` (#179 L4: only the labels the switchboard added came off)
         self.passes(records=[self.listed(labels=[self.names["merge-captain"]])])
