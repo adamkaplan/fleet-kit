@@ -300,19 +300,24 @@ def clear_fingerprint(engine, runner, repo, number, head):
         return None, None, None
     cc = load_module("clear_carry")
     get = impact_carry_get(engine, runner, repo)
-    try:
-        fingerprint, fp_head, _ = cc.own_change_fingerprint(get, repo, number)
-    except cc.CarryVoid as err:
-        return None, _one_line(str(err), 200), None
-    except Exception as err:
-        return None, _one_line("%s: %s" % (type(err).__name__, err), 200), None
-    if fp_head != head:
-        return None, "the head moved while its change was being read", None
-    try:
-        lines_fingerprint, lines_head, _ = cc.own_change_fingerprint(get, repo, number, lines=True)
-    except Exception:   # CarryVoid or any other trouble: the conflict-resolving carry has nothing to compare against, the pure carry is unaffected
-        return fingerprint, None, None
-    return fingerprint, None, lines_fingerprint if lines_head == head else None
+    found = []
+    for lines in (False, True):   # the full one first: without it nothing is stored; the lines-only one is only for the conflict-resolving carry
+        try:
+            fingerprint, fp_head, _ = cc.own_change_fingerprint(get, repo, number, lines=lines)
+        except cc.CarryVoid as err:
+            if not found:
+                return None, _one_line(str(err), 200), None
+            break
+        except Exception as err:
+            if not found:
+                return None, _one_line("%s: %s" % (type(err).__name__, err), 200), None
+            break
+        if fp_head != head:
+            if not found:
+                return None, "the head moved while its change was being read", None
+            break
+        found.append(fingerprint)
+    return found[0], None, (found[1] if len(found) == 2 else None)
 
 
 def carry_confirmer(engine, repo, number):
