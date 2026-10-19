@@ -5907,12 +5907,11 @@ class TestLaunch(Base):
         discovery.problems = ["list not whole"]                         # the agent list is a half-read
         sb.pane_health_pass(self.engine, self.world.clock.now() + 1)
         self.assertEqual(path.read_bytes(), before)
-        (self.world.state / sb.RETIRED_FILE).write_text("{not json")     # the retired list is a half-read
-        self.health(2)
+        with mock.patch.object(sb, "read_retired_strict", side_effect=sb.RetiredUnreadable("half")):   # the retired list is a half-read, yet `read_retired` still names "old"
+            self.health(2)
         self.assertIn("old", sb.read_pane_health(self.world.state)["agents"])
-        (self.world.state / sb.RETIRED_FILE).write_text("[]")
-        self.health(3)
-        self.assertIn("old", sb.read_pane_health(self.world.state)["agents"])
+        self.health(3)                                                   # a whole read prunes it
+        self.assertNotIn("old", sb.read_pane_health(self.world.state)["agents"])
 
     def test_s8_a_pruned_retired_agent_is_still_found_by_the_retire_undo_reattach_and_the_boss_lookup(self):
         os.environ["HERDR_WORKSPACE_ID"] = "w1"

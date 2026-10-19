@@ -7435,7 +7435,7 @@ def cmd_retire(args, runner, now):
         raise LaunchError("refused: %s" % who)
     reason = " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", args.reason or "").split())[:200]
     seen = discovery.agents.get(name)
-    known = read_pane_health(state)["agents"].get(name) or ({"session": known_session(state, name, None)} if name in read_retired(state) and not read_retired(state)[name].get("headless") else {})   # a pruned retired agent is still known
+    known = read_pane_health(state)["agents"].get(name) or ({"session": known_session(state, name, None)} if not (read_retired(state).get(name) or {"headless": True}).get("headless") else {})   # a pruned retired agent is still known
     close_pane, close_by, close_note, headless_kept = None, None, None, None
     if getattr(args, "close", False) and not args.undo and seen is not None and seen.headless:
         close_note = "headless: it has no terminal, so there is nothing to close"
