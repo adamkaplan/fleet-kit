@@ -22203,7 +22203,9 @@ class TestLegitimateWaiting(WaitingInputs, ReportBase):
                 self.world.engine.config["plan_gates"] = {"repos": {"acme/another-service": {"mode": "shadow"}}}
                 self.world.engine.__dict__.pop("ci_record_state", None)
                 self.world.engine.read_whole.pop("pulls:" + self.REPO, None)
-                self.reading = False
+                sb.ci_record_pass(self.world.engine, self.world.clock.now())   # the daemon's own pass: it never reads this repository's list
+                self.assertNotIn("pulls:" + self.REPO, self.world.engine.read_whole)
+                self.assertFalse(sb.whole(self.world.engine, "pulls:" + self.REPO)[0])
                 found = [f for f in self.derive() if ":seam:" in f.key or ":stalled:" in f.key]
                 self.assertEqual(found, [])
 
