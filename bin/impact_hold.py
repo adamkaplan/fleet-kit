@@ -689,6 +689,7 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
         _consume_record(state, pr)   # the labels it took off were the daemon's record: consumed with the clear, in this write
         state.get("carried", {}).pop(pr, None)   # a new clear starts from this head: an earlier carry is not part of it
         state.get("carry_void", {}).pop(pr, None)
+        state.get("carry_wait", {}).pop(pr, None)   # (#815) a waiting carry belongs to the clear it was for
         if fingerprint is not None:
             state["clears"][pr]["fingerprint"] = fingerprint
             if lines_fingerprint is not None:
@@ -845,6 +846,7 @@ def cmd_impact_clear(args, runner, now):
                 had = state["clears"].pop(pr, None)
                 carried = state.get("carried", {}).pop(pr, None)
                 state.get("carry_void", {}).pop(pr, None)
+                state.get("carry_wait", {}).pop(pr, None)
                 if had is not None:
                     _consume_record(state, pr, had)   # an older record of the daemon's labels is stale (a newer one, applied after the clear, is kept)
                 if had is not None or carried is not None:   # nothing to take back: nothing is written

@@ -14476,6 +14476,23 @@ class TestConflictCarryInTheDaemon(Base):
                 self.assertEqual(self.hold(new), 0, path)
                 self.assertEqual(self.held_state()["carried"][self.PR]["from"], cleared)
 
+    def test_a_new_clear_and_a_revoke_both_forget_a_waiting_carry(self):
+        self.clear()
+        new = self.conflict_merge()
+        self.assertGreater(self.hold(new), 0)
+        self.assertIn(self.PR, self.held_state()["carry_wait"])
+        self.labels = [self.names["merge-captain"], self.names["hold-impact"]]
+        sb.impact_clear_core(self.engine, self.route, self.REPO, 7, "owner", "cleared again at the new head: a fixture")
+        self.assertNotIn(self.PR, self.held_state().get("carry_wait", {}), "a new clear")
+        self.assertEqual(self.held_state()["clears"][self.PR]["head"], new)
+        state = self.held_state()
+        state["carry_wait"] = {self.PR: {"head": "c" * 40, "marks": 0, "reason": "waiting again, for the new clear"}}
+        sb.write_impact_state(self.world.state, state)
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR, "gh": FAKE_GH, "impact_hold": {"enabled": True, "carry_clear": True}})
+        with mock.patch.object(sb, "gates_caller_kind", return_value=("person", "owner")):
+            self.assertEqual(sb.cmd_impact_clear(types.SimpleNamespace(pr=self.PR, reason="take the clear back, it was a mistake", revoke=True), self.route, self.world.clock.now), 0)
+        self.assertNotIn(self.PR, self.held_state().get("carry_wait", {}), "a revoke")
+
     def test_s8_with_the_switch_off_nothing_new_is_stored_and_no_conflict_carry_is_made(self):
         self.build(carry=None)
         gets = self.api_gets
