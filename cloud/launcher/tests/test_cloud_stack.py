@@ -1,7 +1,7 @@
 """Offline tests for the stack pod shape (#567 slice 3): S2 (the stack pod), U1 (the default pod is unchanged), and the
 fresh-node race. No cloud: kubectl is the fake beside this file; time is a fake clock.
 
-The fixture fixtures/default_pod.json was built by the launcher's code on main BEFORE this change, with:
+The fixture fixtures/default_pod.json was built by the launcher's code on main (commit f5d6f98) BEFORE this change, with:
     python3 gen.py > cloud/launcher/tests/fixtures/default_pod.json
 where gen.py calls cloud_worker.render_pod for the two cases named in the fixture (the inputs are in `_args` / CASES below).
 """
@@ -188,6 +188,19 @@ class FreshNodeRace(Base):
         self.assertIsNotNone(self.pod())
         self.assertEqual(self.audit_lines()[-1]["action"], "create"); self.assertTrue(self.audit_lines()[-1]["ok"])
 
+    def test_the_window_bounds_the_retries(self):   # kills: the deadline check in _start_stack_pod removed
+        self.patch_state(race_creates=2)
+        old, cw.STACK_RACE_WINDOW_SECONDS = cw.STACK_RACE_WINDOW_SECONDS, 0
+        try:
+            out, err = self.stack("--stack", code=cw.EXIT_CLOUD)
+        finally:
+            cw.STACK_RACE_WINDOW_SECONDS = old
+        self.assertIn("fresh-node race", err)
+        a = self.attempts()
+        self.assertEqual(len(a), 1)
+        self.assertIn("giving up", a[0]["reason"])
+        self.assertEqual(len([o for o in self.st()["applied"] if o["kind"] == "Pod"]), 1)
+
     def test_the_message_three_times_fails_and_leaves_nothing(self):
         self.patch_state(race_creates=3)
         out, err = self.stack("--stack", code=cw.EXIT_CLOUD)
@@ -227,7 +240,9 @@ class FreshNodeRace(Base):
             self.stack("--stack", code=cw.EXIT_CLOUD)
         finally:
             cw.Launcher._mine = real
-        self.assertEqual(len([o for o in self.st()["applied"] if o["kind"] == "Pod"]), 1)   # no delete, no second create
+        self.assertEqual(len([o for o in self.st()["applied"] if o["kind"] == "Pod"]), 1)   # no second create
+        self.assertEqual([c for c in self.calls("delete") if "pod" in c and "--wait=true" in c], [])   # and no delete of the pod
+        self.assertIn(cw.pod_name("coder7"), self.st()["pods"])   # left whole
 
     def test_events_of_an_earlier_pod_do_not_count(self):
         # an old pod's event under the same name must not trigger a retry of a healthy new pod
