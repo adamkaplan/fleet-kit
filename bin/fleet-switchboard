@@ -354,6 +354,7 @@ DEFAULTS = {
     "v2_cache_seconds": 120,       # a session's record, its inbox: re-read after this long, or at once when herdr says its state changed (0: never remembered)
     "v2_reads_per_pass": 8,        # background reads (cache fills) one pass may make; the rest wait for the next pass (stalest first)
     "v2_reads_per_minute": 90,     # and in any minute: past it the daemon keeps what it has (a read nobody has made yet is still made)
+    "stalled_working_hours": 2,   # #811: a coder or tester that only reports `working` while nothing it owns moves wakes its boss once after this long
     "worker_lookback_hours": 24,  # how far back a worker's finished turn still counts (PR 4)
     "rider_max_age_seconds": 3600,  # PR 13: a rider older than this is dropped, and an older stop is not triaged
     "report_triage": None,          # PR 13: None means REPORT_TRIAGE_DEFAULTS (the `report_owed` question's settings)
@@ -635,7 +636,7 @@ def validate_config(raw, source="config"):
         if not isinstance(config[key], int) or isinstance(config[key], bool) or config[key] < 0:
             raise ConfigError("%r must be a whole number of at least 0, got %r" % (key, config[key]))
     for key in ("batch_seconds", "engaged_minutes", "call_timeout_seconds", "send_timeout_seconds", "poll_seconds",
-                "worker_lookback_hours", "rider_max_age_seconds"):
+                "worker_lookback_hours", "stalled_working_hours", "rider_max_age_seconds"):
         if not _is_number(config[key]) or config[key] <= 0:
             raise ConfigError("%s: %r must be a positive number, got %r" % (source, key, config[key]))
     if not retire_idle_window_ok(config["retire_idle_minutes"]):
@@ -6617,6 +6618,11 @@ def record_last_report(state_dir, sender, state, now, text=None):
         with agent_lock(state_dir, "files", seconds=2):
             data = _read_small(state_dir, LAST_REPORT_FILE)
             entry = {"state": state, "at": int(now)}
+            before = data.get(sender) or {}
+            if state == "working":   # #811: the run of consecutive `working` reports; any other kind ends it
+                run = before.get("state") == "working" and _is_number(before.get("work_since")) and isinstance(before.get("work_n"), int)
+                entry["work_n"] = before["work_n"] + 1 if run else 1
+                entry["work_since"] = before["work_since"] if run else int(now)
             if isinstance(text, str) and text:
                 entry["text"] = _one_line(redact_command_text(text), REPORT_MAX)   # untrusted text: redacted before it is stored (#773)   # the one line, for the idle-at-a-seam wake (#773)
             if isinstance((data.get(sender) or {}).get("send_to"), dict):
@@ -8446,6 +8452,15 @@ REPORT_ATTENTION = ("done", "failed", "blocked", "question")  # wake the boss wh
 REPORT_PROGRESS = ("working", "paused", "withdrawn")          # riders: carried, never the reason for a message
 REPORT_STATES = REPORT_ATTENTION + REPORT_PROGRESS
 WITHDRAW_ALL = decision_core.WITHDRAW_ALL  # leads a `withdrawn` report made with --all: it clears every open question of the worker
+STALLED_LIST_MAX_AGE = 1200   # #811: seconds; an open-PR list read longer ago than this is not judged (the pass re-reads it every few minutes)
+STALLED_RUNNING_CHECKS = ("in_progress", "queued", "pending", "waiting", "requested", "expected")   # #811: a check word that is not finished
+
+
+def _stalled_age(seconds):
+    hours = seconds / 3600.0
+    return "%dm" % (seconds // 60) if hours < 1 else "%.1fh" % hours
+
+
 SEAM_IDLE_SECONDS = 1200   # #773: an idle worker whose last report was `working` is noticed after this long
 REPORT_MAX = 300  # characters: a report is a sentence; detail goes on GitHub
 SUMMARY_CAP = 600  # characters of a worker's last reply in its fact
@@ -8512,6 +8527,7 @@ class WorkerFacts:
         self.requests = []       # PR 14: the pending requests of every blocked agent in the last call (decisions)
         self._summaries = {}     # (session, idle ms) -> text; a cache, rebuilt after a restart
         self._stops = {}         # (session, idle ms) -> the facts of that stop (PR 13); a cache, rebuilt likewise
+        self._heads = {}         # #811: worker -> (the pull request head last seen, when a change of it was seen); memory only
         self._no_forms = False   # v2 does not know the form operation (UNVERIFIED name)
 
     def bind(self, engine):
@@ -8539,6 +8555,7 @@ class WorkerFacts:
             try:
                 if boss is not None:
                     facts.extend(self.finished(observation, boss, horizon))
+                    facts.extend(self.stalled_facts(observation, boss))
                 facts.extend(self.blocked(observation, boss))
             except V2Error as err:  # one worker's trouble never hides the others
                 skipped.append(observation.name)
@@ -8614,6 +8631,100 @@ class WorkerFacts:
                     "idle without a closing report: #%d (worker %s, last report: %s)" % (issue, observation.name, _one_line(redact_command_text(line), 160) or "none recorded"),
                     observation.idle_at, issue=issue, batch=False, sender=observation.name, repo=repo)
         return [nudge, wake]
+
+    def stalled_facts(self, observation, boss):
+        """#811: a coder or tester whose last reports were all `working` for `stalled_working_hours` while nothing it owns moved (the pull
+        request's head and updated time, the issue's updated time) wakes its boss ONCE per stretch; the worker is never nagged. Reads only
+        what the daemon holds (the report record, the lists, the check summaries, the reminders, the decision list), never GitHub, and
+        judges only when each of them was read whole. Anything not readable fails toward no wake."""
+        engine, state_dir = self.engine, self.engine.state_dir
+        issue = _issue_of(observation.fleet)
+        now, window = engine.now(), engine.config.get("stalled_working_hours", 2) * 3600
+        if state_dir is None or issue is None or not self.seam_applies(observation, issue):
+            return []
+        if observation.status == "idle" and observation.idle_at is not None:
+            return []   # an idle worker is the idle-at-a-seam rule's (one wake for it, not a second under another key)
+        last = _read_small(state_dir, LAST_REPORT_FILE).get(observation.name)
+        if not isinstance(last, dict) or last.get("state") != "working" or not _is_number(last.get("work_since")) or not isinstance(last.get("work_n"), int):
+            return []   # a blocked, question or closing report (or none) is not this case
+        kept = read_retired(state_dir).get(observation.name)
+        if kept is not None and kept.get("session") in (None, observation.session_id):
+            return []
+        repo = _fleet_repo(observation.fleet, engine.config) or engine.config.get("intent_repo")
+        if not repo:
+            return []
+        key = plan_ledger.normal_repo(repo)
+        hub = getattr(engine, "hub", None)
+        closed = hub.closed_issue_snapshot() if hub is not None and hasattr(hub, "closed_issue_snapshot") else {}
+        if "%s#%d" % (key, issue) in closed:
+            return []
+        # the inputs, each whole or no wake
+        wanted = ["issues:" + repo, "decisions", "pulls:" + key]
+        if any(not whole(engine, name)[0] for name in wanted):
+            return []
+        listed_at = engine.read_whole["pulls:" + key].get("at")
+        if not _is_number(listed_at) or now - listed_at > STALLED_LIST_MAX_AGE:
+            return []   # an open-PR list that is not being re-read is no evidence of "no movement"
+        units = getattr(getattr(engine, "triage", None), "units", None) or {}
+        records = (units.get((repo, "issues")) or {}).get("data") or []
+        item = next((r for r in records if isinstance(r, dict) and r.get("number") == issue and "pull_request" not in r), None)
+        issue_at = parse_iso(item.get("updated_at")) if item else None
+        if item is None or issue_at is None:
+            return []
+        labels = {(l.get("name") if isinstance(l, dict) else l) for l in (item.get("labels") or [])}
+        awaiting = triage_awaiting_labels(engine)
+        if labels & awaiting:
+            return []
+        state = getattr(engine, "ci_record_state", None)
+        pulls = ((getattr(state, "lists", None) or {}).get(key) or (0, []))[1]
+        mine = [r for r in pulls if isinstance(r, dict) and isinstance(r.get("number"), int)
+                and any(isinstance(ref, list) and ref[1] == issue and plan_ledger.normal_repo(ref[0] or repo) == key
+                        for ref in pr_body_refs(r.get("body")))]
+        pr = max(mine, key=lambda r: parse_iso(r.get("updated_at")) or 0, default=None)   # the newest-moved one when several name the issue
+        moved, head, number = issue_at, None, None
+        if pr is not None:
+            number = pr["number"]
+            head = (pr.get("head") or {}).get("sha") if isinstance(pr.get("head"), dict) else None
+            pr_at = parse_iso(pr.get("updated_at"))
+            if not isinstance(head, str) or pr_at is None:
+                return []
+            moved = max(moved, pr_at)
+            seen = self._heads.get(observation.name)   # a head this process saw change is movement now, whatever GitHub's clock says
+            if seen is None or seen[0] != head:
+                self._heads[observation.name] = (head, now if seen is not None else 0)
+            moved = max(moved, self._heads[observation.name][1])
+            pr_labels = {(l.get("name") if isinstance(l, dict) else l) for l in (pr.get("labels") or [])}
+            if pr_labels & awaiting:
+                return []
+            held = (getattr(state, "pr_state", None) or {}).get("%s#%d" % (key, number)) or {}
+            if held.get("head") == head and any(isinstance(c, dict) and str(c.get("conclusion") or "").lower() in STALLED_RUNNING_CHECKS
+                                                for c in (held.get("checks") or []) if held.get("examined_head") == head):
+                return []   # a check at this head is still running
+        try:
+            for reminder in read_reminders(state_dir):
+                if reminder.get("to") == observation.name and reminder.get("issue") == issue and reminder["at"] > now:
+                    return []   # it said when it will look again
+        except ReminderError:
+            return []
+        body = read_decisions_file(state_dir / DECISIONS_FILE)
+        if body is None:
+            return []
+        refs = {(key, issue)} | ({(key, number)} if number else set())
+        for d in body["decisions"]:
+            if not isinstance(d, dict):
+                continue
+            ref = sweep_ref_of(d, repo)
+            if d.get("tier", "human") == "human" and ref and (plan_ledger.normal_repo(ref[0]), ref[1]) in refs:
+                return []   # it waits on the owner
+        since = max(moved, last["work_since"])
+        if now - since < window:
+            return []
+        ref = "%s#%d" % (repo, number or issue)
+        line = last.get("text") if isinstance(last.get("text"), str) else ""
+        stretch = "stalled:%s:%d:%s:%d" % (observation.session_id, issue, head or "-", int(moved))
+        text = "no movement for %s on %s (worker %s, %d working reports; last: %s)" % (
+            _stalled_age(now - since), ref, observation.name, last["work_n"], _one_line(redact_command_text(line), 160) or "none recorded")
+        return [Fact("%s:%s" % (WORKER_IDLE, stretch), boss, WORKER_IDLE, text, now, issue=issue, batch=False, sender=observation.name, repo=repo)]
 
     def stop_facts(self, observation, boss, idle_ms, idle, reply):
         """The facts for one stop, worked out once (a stop is asked about once; the cache is rebuilt after a
@@ -21146,8 +21257,10 @@ def ci_record_pass(engine, now):
             budget[0] -= sweep_pages_used(records, cut)
             state.lists[key] = (now, records)
             state.good[key] = (now, records, bool(cut) or len(records) >= LABEL_HOLD_LIST_CUT)
+            read_mark(engine, "pulls:" + key, not cut, "the open pull request list was cut", now)   # #811
         except GitHubUnavailable as err:
             budget[0] -= 1
+            read_mark(engine, "pulls:" + key, False, "the open pull request list could not be read", now)
             state.good.pop(key, None)   # a failed read is no evidence: the old list stays for the rows, never for a prune
             state.lists[key] = (now, state.lists.get(key, (0, []))[1])   # keep the old list and try again after the TTL
             engine._note("ci_record.unreadable", repo, {"repo": repo, "reason": _one_line(str(err), 160)})
