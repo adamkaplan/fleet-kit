@@ -732,5 +732,8 @@ done
 planted "a GAP naming no open item" "${row}s/| covered |\$/| GAP (owner: x; item: a follow-up) |/"
 planted "a GAP naming an item in neither list" "${row}s/| covered |\$/| GAP (owner: x; item: #99999) |/"
 printf 'open 543\nopen 2\nclosed 2\n' > "$tmp/bad-items.txt"; "$chk" "$tbl" "$here/../docs/cloud-guard-law-ids.md" "$tmp/bad-items.txt" >/dev/null 2>&1; [ $? = 1 ] && ok "parity table: a number in both lists fails" || bad "parity table: a number in both lists"
+"$chk" "$tbl" "$here/../docs/cloud-guard-law-ids.md" "$tmp/no-such-items.txt" >/dev/null 2>&1; [ $? = 1 ] && ok "parity table: a missing item-lists file fails" || bad "parity table: a missing item-lists file"
+printf 'open 543\n' > "$tmp/one-sided.txt"; "$chk" "$tbl" "$here/../docs/cloud-guard-law-ids.md" "$tmp/one-sided.txt" >/dev/null 2>&1; [ $? = 1 ] && ok "parity table: lists with no closed item fail" || bad "parity table: lists with no closed item"
+printf 'closed 639\n' > "$tmp/one-sided.txt"; "$chk" "$tbl" "$here/../docs/cloud-guard-law-ids.md" "$tmp/one-sided.txt" >/dev/null 2>&1; [ $? = 1 ] && ok "parity table: lists with no open item fail" || bad "parity table: lists with no open item"
 printf '# empty\n' > "$tmp/e.md"; "$chk" "$tmp/e.md" >/dev/null 2>&1; [ $? = 1 ] && ok "parity table: no rows exits 1" || bad "parity table: no rows"
 [ $fail = 0 ] && echo "RESULT: PASS" || { echo "RESULT: FAIL"; exit 1; }
