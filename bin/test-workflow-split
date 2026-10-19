@@ -70,6 +70,8 @@ def parse(text):
                 raise ValueError("unreadable line: %r" % line)
             key, rest = m.group(1), (m.group(2) or "").strip()
             pos[0] += 1
+            if key in out:
+                raise ValueError("duplicate key: %r" % key)
             if rest in ("|", ">"):
                 body = []
                 while pos[0] < len(lines) and (not lines[pos[0]].strip() or indent(lines[pos[0]]) > base):
@@ -120,6 +122,15 @@ CONCURRENCY = {"group": "test-${{ github.workflow }}-${{ github.event.pull_reque
                "cancel-in-progress": "${{ github.event_name == 'pull_request' }}"}
 TRIGGERS = ["pull_request", "push", "workflow_dispatch"]
 MATRIX = ["ubuntu-latest", "macos-latest"]
+
+
+# The expected STRUCTURE (the shape, not pieces): a key that is not listed fails, whatever its value (ask #868, review Medium).
+JOB_KEYS = ["defaults", "runs-on", "steps", "strategy"]
+STRATEGY = {"fail-fast": "false", "matrix": {"os": MATRIX}}
+DEFAULTS = {"run": {"shell": "bash"}}
+ON = {"pull_request": None, "push": {"branches": ["main"]}, "workflow_dispatch": None}
+PERMISSIONS = {"contents": "read"}
+WORKFLOW_KEYS = ["concurrency", "jobs", "name", "on", "permissions"]
 
 
 def only_suites(table):
@@ -184,6 +195,28 @@ class Pins(unittest.TestCase):
             self.assertNotIn("if", job, jid)
         image = [s for s in self.jobs()["test"]["steps"] if s.get("name") == "cloud/tests/test-cloud"]
         self.assertEqual([s.get("timeout-minutes") for s in image], ["5"])
+
+
+    def test_shape_the_workflow_and_both_jobs_have_exactly_the_expected_keys_and_values(self):
+        self.assertEqual(sorted(self.wf), WORKFLOW_KEYS)
+        self.assertEqual(self.wf["name"], "test")
+        self.assertEqual(self.wf["on"], ON)
+        self.assertEqual(self.wf["permissions"], PERMISSIONS)
+        self.assertEqual(self.wf["concurrency"], CONCURRENCY)
+        for jid, job in self.jobs().items():
+            self.assertEqual(sorted(job), JOB_KEYS, jid)
+            self.assertEqual(job["strategy"], STRATEGY, jid)
+            self.assertEqual(job["runs-on"], "${{ matrix.os }}", jid)
+            self.assertEqual(job["defaults"], DEFAULTS, jid)
+
+
+# Every key class of the workflow schema that can hide, skip, soften or widen a job, each with a value that parses.
+JOB_LEVEL = {"if": "if: github.event_name == 'push'", "continue-on-error": "continue-on-error: true", "needs": "needs: test",
+             "timeout-minutes": "timeout-minutes: 5", "container": "container: ubuntu", "services": "services:\n      db:\n        image: x",
+             "env": "env:\n      A: b", "secrets": "secrets: inherit", "outputs": "outputs:\n      a: b", "permissions": "permissions: write-all",
+             "concurrency": "concurrency: x", "environment": "environment: x", "name": "name: x", "uses": "uses: x/y@z", "with": "with:\n      a: b"}
+TRIGGER_LEVEL = ["paths: [x]", "paths-ignore: [x]", "branches: [x]", "branches-ignore: [x]", "tags: [x]", "types: [opened]"]
+WORKFLOW_LEVEL = {"defaults": "defaults:\n  run:\n    shell: sh", "env": "env:\n  A: b", "run-name": "run-name: x"}
 
 
 def mutate(text, old, new):
@@ -279,6 +312,62 @@ class Mutants(unittest.TestCase):
 
     def test_u2_image_limit_changed(self):
         self.fails("timeout-minutes: 5", "timeout-minutes: 10", "test_u2_three_triggers_no_job_level_if_and_the_image_suite_limit", "test_u1_every_suite_command_appears_once_in_its_original_order_with_the_result_grep")
+
+    SHAPE = "test_shape_the_workflow_and_both_jobs_have_exactly_the_expected_keys_and_values"
+
+    def killed(self, text, *tests):
+        try:
+            wf = load(text)
+        except ValueError:
+            return          # the parser refuses it (a duplicate key): the file cannot be read, so the pin cannot pass
+        for t in tests:
+            case = Pins(t)
+            case.wf = wf
+            result = unittest.TestResult()
+            case.run(result)
+            self.assertTrue(result.failures or result.errors, "survived %s" % t)
+
+    def test_shape_every_job_level_key_class_on_either_job_is_refused(self):
+        text = WORKFLOW.read_text()
+        for key, line in JOB_LEVEL.items():
+            for head in ("  test-cloud:\n", "  test:\n"):
+                with self.subTest(key=key, job=head.strip()):
+                    self.killed(mutate(text, head, head + "    " + line + "\n"), self.SHAPE)
+
+    def test_shape_a_job_continue_on_error_a_red_launcher_job_cannot_read_green(self):
+        self.killed(mutate(WORKFLOW.read_text(), "  test-cloud:\n", "  test-cloud:\n    continue-on-error: true\n"), self.SHAPE)
+
+    def test_shape_every_trigger_filter_is_refused(self):
+        text = WORKFLOW.read_text()
+        for line in TRIGGER_LEVEL:
+            with self.subTest(trigger="pull_request", filter=line):
+                self.killed(mutate(text, "  pull_request:\n", "  pull_request:\n    " + line + "\n"), self.SHAPE)
+            with self.subTest(trigger="push", filter=line):
+                self.killed(mutate(text, "    branches: [main]\n", "    branches: [main]\n    " + line.replace("branches:", "x:", 1) + "\n"), self.SHAPE)
+
+    def test_shape_every_workflow_level_key_is_refused(self):
+        text = WORKFLOW.read_text()
+        for key, line in WORKFLOW_LEVEL.items():
+            with self.subTest(key=key):
+                self.killed(mutate(text, "\njobs:\n", "\n" + line + "\n\njobs:\n"), self.SHAPE)
+
+    def test_shape_job_permissions_write_all(self):
+        self.killed(mutate(WORKFLOW.read_text(), "  test-cloud:\n", "  test-cloud:\n    permissions: write-all\n"), self.SHAPE)
+
+    def test_shape_fail_fast_true_on_the_new_job(self):
+        text = WORKFLOW.read_text()
+        i = text.index("  test-cloud:")
+        self.killed(text[:i] + text[i:].replace("fail-fast: false", "fail-fast: true", 1), self.SHAPE)
+
+    def test_shape_a_second_runs_on(self):
+        text = WORKFLOW.read_text()
+        i = text.index("  test-cloud:")
+        self.killed(text[:i] + text[i:].replace("    runs-on: ${{ matrix.os }}\n", "    runs-on: ${{ matrix.os }}\n    runs-on: macos-latest\n", 1), self.SHAPE)
+
+    def test_shape_a_matrix_include_or_a_third_os(self):
+        text = WORKFLOW.read_text()
+        i = text.index("  test-cloud:")
+        self.killed(text[:i] + text[i:].replace("[ubuntu-latest, macos-latest]", "[ubuntu-latest, macos-latest, windows-latest]", 1), self.SHAPE)
 
 
 if __name__ == "__main__":

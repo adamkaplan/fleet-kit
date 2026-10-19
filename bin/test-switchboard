@@ -8771,7 +8771,8 @@ class TestHygiene(unittest.TestCase):
         self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", top)
         self.assertNotIn("cancel-in-progress: true", workflow, "an unconditional cancel would cancel a push to main")
         self.assertNotIn("github.ref }}", top, "a push to main must not share a group: GitHub drops a PENDING run of a shared group even without cancel-in-progress")
-        self.assertEqual(workflow.count("macos-latest"), 2, "one macOS job per job of the run (the two jobs `test` and `test-cloud`, ask #868): a single matrix entry in each")
+        entries = [e.strip() for line in jobs.splitlines() for m in [re.match(r"\s+os:\s*\[(.*?)\]\s*(?:#.*)?$", line)] if m for e in m.group(1).split(",")]
+        self.assertEqual(entries.count("macos-latest"), 2, "one macOS job per job of the run (the two jobs `test` and `test-cloud`, ask #868): a single matrix entry in each")
         on = top.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
         self.assertIn("\n  workflow_dispatch:\n", on, "a head can be re-run without a push")
         self.assertNotIn("inputs:", workflow, "a dispatch takes no inputs")
