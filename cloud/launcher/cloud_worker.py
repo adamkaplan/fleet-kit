@@ -20,6 +20,7 @@ import math
 import secrets
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1037,6 +1038,165 @@ class Launcher:
                     out.append((worker, reason, e.code))
         return out
 
+# ---------------------------------------------------------------- the settings file
+# ONE private file holds the operator's settings. `apply_settings` is the only reader: `launch --cloud` (bin/cloud_worker.py) and this driver's
+# `main` both call it. When the file exists it is the only source (the environment is read ONLY when there is no file); a key set in BOTH with a
+# different value is refused, naming both sources and never a value. Nothing is run or expanded on read, and a value that looks like a secret is refused.
+SETTINGS_FILE_NAME = "cloud.env"
+CONFIG_DIR_NAME = "fl" + "eet-switchboard"   # the switchboard's own config directory (written in two parts: the names check keeps the retired prefix out of cloud/)
+SETTINGS_PATH = None        # a test hook (a module attribute, no environment variable): None means the real path
+SETTINGS_FILE_MAX = 65536
+# The one table of settings: name, required (in the file), kind. Kinds: name (a plain name, list or address), path, command (run as given: a
+# command, never a value), digest-ref (an image reference that ends in @sha256:<64 hex>), number.
+SETTINGS = (
+    ("CW_ALLOWED_REPOS", True, "name"),            # comma-separated OWNER/NAME
+    ("CW_TOOLING_REPO", False, "name"),
+    ("CW_CLOUD_IMAGE", True, "digest-ref"),
+    ("CW_CLOUD_SERVER", True, "name"),             # the cluster API address
+    ("CW_CLOUD_CA_FILE", False, "path"),
+    ("CW_PULL_SECRET", False, "name"),             # the NAME of a Secret, never its content
+    ("CW_VAULT_SUBSCRIPTION", True, "name"),
+    ("CW_VAULT_NAME", True, "name"),
+    ("CW_CLOUD_NAMESPACE", True, "name"),
+    ("CW_KUBECTL", False, "path"),
+    ("CW_MODEL_AUTH_FILE", False, "path"),
+    ("CW_RUN_RECORD_DIR", False, "path"),
+    ("CW_CLOUD_SPEND_CAP_USD", False, "number"),
+    ("CW_CLUSTER_TOKEN_CMD", False, "command"),
+    ("CW_CLUSTER_ADMIN_CMD", False, "command"),
+    ("CW_GIT_TOKEN_CMD", False, "command"),
+    ("CW_APP_ID_CMD", False, "command"),
+    ("CW_APP_INSTALLATION_CMD", False, "command"),
+    ("CW_APP_KEY_CMD", False, "command"),
+    ("CW_VAULT_CHECK_DIR", False, "path"),         # reserved for the vault pre-check's checkout path: read and validated, not used yet
+)
+SETTING_KINDS = {name: kind for name, _, kind in SETTINGS}
+SETTING_REQUIRED = tuple(name for name, required, _ in SETTINGS if required)
+# The secret shapes a value is refused for: (shape name, pattern, kinds it applies to; None = every kind). One row per shape.
+_PREFIXES = ("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "glpat-", "sk-", "xoxb-", "xoxp-", "xoxa-", "AKIA", "AIza", "Bearer ")
+SECRET_SHAPES = tuple(
+    ("token prefix " + prefix.strip(), re.compile(r"(?<![A-Za-z0-9])" + re.escape(prefix) + r"[A-Za-z0-9._~+/=-]{8,}"), None) for prefix in _PREFIXES
+) + (
+    ("a JWT", re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}"), None),
+    ("a PEM header", re.compile(r"-----BEGIN "), None),
+    ("a URL with a password", re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]*:[^/\s@]+@"), None),
+    ("a 40-character hex string", re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{40}(?![0-9A-Fa-f])"), ("command",)),
+)
+DIGEST_REF = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}")
+_SETTING_LINE = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
+_NUMBER = re.compile(r"[0-9]+(?:\.[0-9]+)?")
+
+
+def settings_path(env=None):
+    """Where the file is: $XDG_CONFIG_HOME (default ~/.config) / <the switchboard's config directory> / cloud.env, beside the switchboard's own config."""
+    if SETTINGS_PATH is not None:
+        return str(SETTINGS_PATH)
+    env = os.environ if env is None else env
+    base = env.get("XDG_CONFIG_HOME") or os.path.join(env.get("HOME") or os.path.expanduser("~"), ".config")
+    return os.path.join(base, CONFIG_DIR_NAME, SETTINGS_FILE_NAME)
+
+
+def _bad(path, why):
+    return CloudError("refused: the settings file %s %s; nothing was called" % (path, why), EXIT_USAGE)
+
+
+def _read_settings_file(path):
+    """The file's text, or None when there is none. Refuses (CloudError, exit 2) a symlink, a file that is not a regular file, one owned by
+    another user, one with any group or other permission bit, and one in a directory that is group- or world-writable or owned by another user.
+    The checks are on the opened descriptor, so the file cannot change between the check and the read."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as err:
+        raise _bad(path, "cannot be examined (%s)" % type(err).__name__) from None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+    except OSError as err:
+        raise _bad(path, "is a symlink or cannot be opened (%s): it must be a regular file" % type(err).__name__) from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise _bad(path, "is not a regular file")
+        if st.st_uid != os.geteuid():
+            raise _bad(path, "is owned by another user")
+        if stat.S_IMODE(st.st_mode) & 0o177:
+            raise _bad(path, "has mode %04o: it must be 0600 (nobody else may read or write it)" % stat.S_IMODE(st.st_mode))
+        parent = os.stat(os.path.dirname(os.path.abspath(path)))
+        if parent.st_uid != os.geteuid():
+            raise _bad(path, "is in a directory owned by another user")
+        if stat.S_IMODE(parent.st_mode) & 0o022:
+            raise _bad(path, "is in a directory that is group- or world-writable (mode %04o)" % stat.S_IMODE(parent.st_mode))
+        if st.st_size > SETTINGS_FILE_MAX:
+            raise _bad(path, "is over %d bytes" % SETTINGS_FILE_MAX)
+        raw = b""
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            raw = f.read(SETTINGS_FILE_MAX + 1)
+    finally:
+        os.close(fd)
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise _bad(path, "is not UTF-8 text") from None
+
+
+def parse_settings(text, path="the settings file"):
+    """KEY=VALUE lines into {key: value}. `#` starts a comment line and blank lines are skipped. The value is the rest of the line, verbatim:
+    no quoting, no expansion, nothing is run. A bad line, an unknown or repeated key, a quoted value, and a secret-shaped value are refused naming the
+    line number and the key, never the value. An empty value counts as not set."""
+    values = {}
+    for number, line in enumerate(text.splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        m = _SETTING_LINE.fullmatch(line.strip())
+        if not m:
+            raise _bad(path, "line %d is not KEY=VALUE" % number)
+        key, value = m.group(1), m.group(2).strip()
+        kind = SETTING_KINDS.get(key)
+        if kind is None:
+            raise _bad(path, "line %d: %s is not a setting this launcher knows" % (number, key))
+        if key in values:
+            raise _bad(path, "line %d: %s is set twice" % (number, key))
+        if value[:1] in "\"'" and value[-1:] == value[:1] and len(value) > 1:
+            raise _bad(path, "line %d: %s is quoted (the value is taken as written, with no quotes)" % (number, key))
+        for shape, pattern, kinds in SECRET_SHAPES:
+            if (kinds is None or kind in kinds) and pattern.search(value):
+                raise _bad(path, "line %d: the value of %s looks like a secret (%s); the file holds no secret" % (number, key, shape))
+        if value:
+            values[key] = value
+    missing = [name for name in SETTING_REQUIRED if name not in values]
+    if missing:
+        raise _bad(path, "lacks the required setting%s %s" % ("s" if len(missing) > 1 else "", ", ".join(missing)))
+    for key, value in values.items():
+        kind = SETTING_KINDS[key]
+        if kind == "digest-ref" and not DIGEST_REF.fullmatch(value):
+            raise _bad(path, "%s must name the image by digest (name@sha256:<64 hex>), not by a tag" % key)
+        if kind == "number" and not _NUMBER.fullmatch(value):
+            raise _bad(path, "%s must be a number" % key)
+        if kind == "path" and not os.path.isabs(value) and key != "CW_KUBECTL":
+            raise _bad(path, "%s must be an absolute path" % key)
+    return values
+
+
+def apply_settings(env=None, path=None):
+    """THE reader of the operator's settings. Returns the source used: the file's path when it exists (its values then replace every setting of
+    the table in `env`, which defaults to the process environment), else "environment" (nothing changes). A setting that the file and the
+    environment BOTH set to different values is refused, naming both sources and no value."""
+    env = os.environ if env is None else env
+    path = path or settings_path(env)
+    text = _read_settings_file(path)
+    if text is None:
+        return "environment"
+    values = parse_settings(text, path)
+    clash = [name for name, _, _ in SETTINGS if env.get(name) and name in values and env[name].strip() != values[name]]
+    if clash:
+        raise CloudError("refused: %s is set differently in the file %s and in the environment: unset one (the file is the one source when it exists); "
+                         "nothing was called" % (", ".join(clash), path), EXIT_USAGE)
+    for name, _, _ in SETTINGS:
+        env.pop(name, None)
+    env.update(values)
+    return path
+
 
 def build_parser():
     p = argparse.ArgumentParser(prog="cloud-worker")
@@ -1093,11 +1253,18 @@ def _run_id(v):
 
 
 def main(argv=None, env=None, clock=None, sleep=time.sleep):
+    explicit = env is not None
     env = os.environ if env is None else env
     try:
         a = build_parser().parse_args(argv)
     except SystemExit as e:
         return EXIT_USAGE if e.code else 0
+    if not explicit:   # the real process reads the settings file; a caller that passes its own environment has made its own choice
+        try:
+            apply_settings(env)
+        except CloudError as e:
+            print("cloud-worker: %s" % e, file=sys.stderr)
+            return e.code
     if not token_mode(env) and not (env.get("CW_KUBE_CONTEXT") or "").strip():
         print("cloud-worker: CW_KUBE_CONTEXT is not set; refusing to run (the active kubectl context is never used)", file=sys.stderr)
         return EXIT_USAGE

@@ -13,6 +13,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import stat
 import signal
 import subprocess
@@ -1262,6 +1263,198 @@ class TestLaunchRunsThePreflight(Base):
         self.assertEqual(code, 2, err)
         self.assertFalse(mark.exists(), "the preflight was called")
         self.nothing_made()
+
+
+class TestSettingsFile(Base):
+    """#876 slice 1: `launch --cloud` and the other cloud commands read ONE private settings file when it exists (S1-S5, U1, U2)."""
+
+    DIGEST = "registry.example.internal/acme/worker@sha256:" + "cd34" * 16
+    TABLE_KEYS = None
+
+    def setUp(self):
+        super().setUp()
+        self.cfg = self.home / "settings"
+        self.cfg.mkdir(mode=0o700)
+        self.file = self.cfg / "cloud.env"
+        hook = mock.patch.object(self.lib, "SETTINGS_PATH", str(self.file))
+        hook.start()
+        self.addCleanup(hook.stop)
+        for key in self.table_keys():
+            os.environ.pop(key, None)   # an EMPTY environment: every setting comes from the file
+        self.values = {"CW_ALLOWED_REPOS": "acme-org/widget-service", "CW_CLOUD_IMAGE": self.DIGEST, "CW_CLOUD_SERVER": "https://cluster.example.internal:6443",
+                       "CW_VAULT_SUBSCRIPTION": "sub-example", "CW_VAULT_NAME": "vault-example", "CW_CLOUD_NAMESPACE": "cw",
+                       "CW_KUBECTL": str(self.stub_dir / "kubectl"), "CW_GIT_TOKEN_CMD": "cat %s" % (self.stub_dir / "git_token"),
+                       "CW_MODEL_AUTH_FILE": str(self.home / "auth.json")}
+
+    @property
+    def lib(self):
+        return sb.load_module("cloud_worker").bind(sb.__dict__)._lib()
+
+    def table_keys(self):
+        return [name for name, _, _ in self.lib.SETTINGS]
+
+    def write(self, values=None, mode=0o600, text=None):
+        values = self.values if values is None else values
+        self.file.write_text(text if text is not None else "# settings\n" + "".join("%s=%s\n" % kv for kv in values.items()))
+        self.file.chmod(mode)
+
+    def nothing_was_called(self):
+        self.assertEqual(self.stub_calls(), [])
+        self.assertEqual(self.jsonl("kubectl.log"), [])
+        self.assertEqual(self.jsonl("login.log"), [])
+
+    def test_s1_a_file_with_every_setting_and_an_empty_environment_launches(self):
+        self.write()
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        create = [e for e in self.jsonl("login.log") if e["command"] == "create"][0]
+        self.assertEqual(create["env"]["CW_CLOUD_IMAGE"], self.DIGEST)   # the launcher's own environment carries the file's values
+        self.assertEqual(create["env"]["CW_CLOUD_NAMESPACE"], "cw")
+        self.assertEqual(err.count("cloud settings from"), 1)
+        self.assertIn("cloud settings from %s" % self.file, err)
+
+    def test_s1_the_other_commands_log_in_from_the_file_too(self):
+        self.write()
+        self.assertEqual(self.launch()[0], 0)
+        for argv in (("send", "coder7", "hi"), ("read", "coder7"), ("retire", "coder7")):
+            code, out, err = self.main(*argv)
+            self.assertEqual(code, 0, (argv, err))
+            self.assertNotIn("cloud settings from", err)   # said once, by launch
+
+    def test_u1_no_file_launches_as_before_and_says_environment_once(self):
+        os.environ.update({"CW_ALLOWED_REPOS": "acme-org/widget-service", "CW_CLOUD_SERVER": "https://cluster.example.internal:6443",
+                           "CW_KUBECTL": str(self.stub_dir / "kubectl"), "CW_VAULT_SUBSCRIPTION": "sub-example", "CW_VAULT_NAME": "vault-example",
+                           "CW_GIT_TOKEN_CMD": "cat %s" % (self.stub_dir / "git_token"), "CW_MODEL_AUTH_FILE": str(self.home / "auth.json")})
+        self.assertFalse(self.file.exists())
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err.count("cloud settings from environment"), 1)
+        argv = [a for a in self.stub_calls()[0]]
+        run_id = argv[argv.index("--run-id") + 1]
+        shaped = ["<run-id>" if a == run_id else re.sub(r"=\d+$", "=<fd>", a) if re.match(r"(model-auth|git-token)=\d+$", a) else
+                  "<fd>" if argv[max(i - 1, 0)] in ("--password-fd", "--run-secret-fd") and a.isdigit() else a for i, a in enumerate(argv)]
+        expected = json.loads((BIN.parent / "cloud" / "tests" / "fixtures" / "launch-create-argv.json").read_text())
+        self.assertEqual(shaped, expected)
+
+    def test_environment_alone_needs_no_new_setting(self):
+        for key in ("CW_CLOUD_IMAGE", "CW_CLOUD_NAMESPACE"):
+            self.assertNotIn(key, os.environ)   # the environment route never required the image or the namespace for launch
+        os.environ.update({"CW_ALLOWED_REPOS": "acme-org/widget-service", "CW_CLOUD_SERVER": "https://cluster.example.internal:6443",
+                           "CW_KUBECTL": str(self.stub_dir / "kubectl"), "CW_VAULT_SUBSCRIPTION": "sub-example", "CW_VAULT_NAME": "vault-example",
+                           "CW_GIT_TOKEN_CMD": "cat %s" % (self.stub_dir / "git_token"), "CW_MODEL_AUTH_FILE": str(self.home / "auth.json")})
+        self.assertEqual(self.launch()[0], 0)
+
+    def test_the_test_hook_is_not_an_environment_variable(self):
+        self.write()
+        with mock.patch.object(self.lib, "SETTINGS_PATH", None), mock.patch.dict(os.environ, {"FLEET_CLOUD_SETTINGS": str(self.file), "CW_CLOUD_SETTINGS": str(self.file)}):
+            code, out, err = self.launch()
+        self.assertIn("cloud settings from environment", err)   # the variable moved nothing
+        self.assertNotEqual(code, 0)
+
+    def test_s2_a_file_others_can_read_or_write_is_refused_before_any_call(self):
+        for mode in (0o640, 0o604, 0o666, 0o644, 0o660):
+            with self.subTest(mode=oct(mode)):
+                self.write(mode=mode)
+                code, out, err = self.launch()
+                self.assertEqual(code, 2)
+                self.assertIn(str(self.file), err)
+                self.assertIn("%04o" % mode, err)
+                self.nothing_was_called()
+
+    def test_s2_a_symlink_a_writable_directory_and_another_owner_are_refused_before_any_call(self):
+        real = self.cfg / "real.env"
+        real.write_text("x\n")
+        real.chmod(0o600)
+        self.file.symlink_to(real)
+        self.assertIn("symlink", self.launch()[2])
+        self.nothing_was_called()
+        self.file.unlink()
+        self.write()
+        self.cfg.chmod(0o770)
+        try:
+            self.assertIn("writable", self.launch()[2])
+        finally:
+            self.cfg.chmod(0o700)
+        with mock.patch.object(self.lib.os, "geteuid", return_value=os.geteuid() + 1):
+            self.assertIn("another user", self.launch()[2])
+        self.nothing_was_called()
+
+    def test_s3_a_secret_shaped_value_is_refused_for_every_shape_and_never_printed(self):
+        lib = self.lib
+        samples = {"a JWT": "eyJhbGciOiJIUzI1.eyJzdWIiOiJ4eHh4", "a PEM header": "-----BEGIN PRIVATE KEY-----",
+                   "a URL with a password": "https://user:hunter2pass@host.example/x", "a 40-character hex string": "x 0123456789abcdef0123456789abcdef01234567"}
+        samples.update({"token prefix " + p.strip(): "x " + p + "A1b2C3d4E5f6G7h8" for p in lib._PREFIXES})
+        self.assertEqual(set(samples), {name for name, _, _ in lib.SECRET_SHAPES})   # every member of the family has a case
+        for shape, value in samples.items():
+            with self.subTest(shape):
+                self.write(dict(self.values, CW_GIT_TOKEN_CMD=value))
+                code, out, err = self.launch()
+                self.assertEqual(code, 2)
+                self.assertIn("CW_GIT_TOKEN_CMD", err)
+                for text in (out, err):
+                    self.assertNotIn(value, text)
+                    self.assertNotIn(value.split()[-1], text)
+                self.nothing_was_called()
+
+    def test_s4_each_required_key_missing_is_named_and_only_it(self):
+        required = [name for name, needed, _ in self.lib.SETTINGS if needed]
+        self.assertTrue(required)
+        for key in required:
+            with self.subTest(key):
+                self.write({k: v for k, v in self.values.items() if k != key})
+                code, out, err = self.launch()
+                self.assertEqual(code, 2)
+                self.assertIn(key, err)
+                for other in required:
+                    if other != key:
+                        self.assertNotIn(other, err)
+                self.nothing_was_called()
+
+    def test_s4_all_missing_ones_are_listed(self):
+        self.write({k: v for k, v in self.values.items() if k not in ("CW_VAULT_NAME", "CW_CLOUD_NAMESPACE")})
+        err = self.launch()[2]
+        self.assertIn("CW_VAULT_NAME", err)
+        self.assertIn("CW_CLOUD_NAMESPACE", err)
+
+    def test_s5_a_tag_is_refused_and_a_digest_launches(self):
+        self.write(dict(self.values, CW_CLOUD_IMAGE="registry.example.internal/acme/worker:1.2"))
+        code, out, err = self.launch()
+        self.assertEqual(code, 2)
+        self.assertIn("CW_CLOUD_IMAGE", err)
+        self.nothing_was_called()
+        self.write()
+        self.assertEqual(self.launch()[0], 0)
+
+    def test_a_clash_between_the_file_and_the_environment_is_refused_naming_both_and_no_value(self):
+        self.write()
+        os.environ["CW_CLOUD_NAMESPACE"] = "other-ns-zz"
+        code, out, err = self.launch()
+        self.assertEqual(code, 2)
+        self.assertIn("CW_CLOUD_NAMESPACE", err)
+        self.assertIn(str(self.file), err)
+        self.assertIn("environment", err)
+        self.assertNotIn("other-ns-zz", err)
+        self.nothing_was_called()
+
+    def test_with_a_file_the_environment_is_not_read(self):
+        self.write()
+        os.environ["CW_TOOLING_REPO"] = "acme-org/widget-service"   # a table key the file does not set: it would refuse this repository
+        self.assertEqual(self.launch()[0], 0)
+
+    def test_u2_no_value_from_the_file_or_the_token_mint_shows_in_any_output_state_or_argument(self):
+        marker = "vault-marker-zz9"
+        self.write(dict(self.values, CW_VAULT_NAME=marker))
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        planted = [GIT_TOKEN, CLUSTER_TOKEN, PASSWORD, marker]
+        captures = [out, err] + list(self.everything_written().values())
+        for entry in self.jsonl("login.log"):
+            captures.append(json.dumps(entry["argv"]))
+        for entry in self.jsonl("kubectl.log"):
+            captures.append(json.dumps(entry["args"]))
+        for text in captures:
+            for value in planted:
+                self.assertNotIn(value, text)
 
 
 if __name__ == "__main__":
