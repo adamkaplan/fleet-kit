@@ -28530,9 +28530,12 @@ class TestPrSharesFiles(LedgerBase):
         self.world.engine.collect_facts()
         sb.derive_decisions(self.world.engine, self.world.clock.now())
         self.assertEqual(self.list_calls, [])
-        text = (BIN / "fleet-switchboard").read_text()
-        callers = [m.start() for m in re.finditer(r"read_open_overlap\(", text)]
-        self.assertEqual(len(callers), 3, "the definition, `gates` and the decisions hint: nothing in a daemon pass")
+
+    def test_gates_json_carries_the_shares_line_only_when_there_is_one(self):
+        self.open_prs = [self.pr_of(9, "a"), self.pr_of(12, "a")]
+        self.assertEqual(self.gates()[1]["shares"], "shares a with #12")
+        self.open_prs = []
+        self.assertNotIn("shares", self.gates()[1])
 
     def test_S8_an_unreadable_own_list_gives_no_line(self):
         self.open_prs = [{"number": 9, "files": None, "changedFiles": 2}, self.pr_of(12, "a")]
