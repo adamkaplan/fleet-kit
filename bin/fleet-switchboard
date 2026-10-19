@@ -11784,6 +11784,7 @@ SWEEP_PASS_SECONDS = 8        # no new read is started once the sweep has spent 
 SWEEP_LIST_PAGES = 2          # pages one list read follows (200 records); more is shown as capped
 SWEEP_PR_COMMENTS = 5         # the last comments of an item that are searched for the phrases
 SWEEP_FILE = "sweep.json"
+SWEEP_ALARMED_FILE = "sweep-alarmed.json"   # #805: when each finding was last raised, so the re-alarm window survives a restart
 SWEEP_KINDS = {"S6a": "first-line marker without the merge-captain label (our PR)", "S6b": "merge label and first-line marker disagree",
                "S1a": "decision section without an awaiting label", "S1b": "awaiting label without a decision section",
                "S2": "held for the person but not marked as a captain PR (no merge-captain label)", "S3": "said to wait on the person, not in their tier",
@@ -11863,7 +11864,7 @@ SWEEP_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+|\n")
 SWEEP_REF_RE = re.compile(r"(?<![\w/&#])(?:([\w.-]+/[\w.-]+)|([\w.-]+))?#(\d+)\b")
 
 
-def sweep_strong_statement(strong, text, default_repo, repos):
+def sweep_strong_statement(strong, text, default_repo, repos, matched=None):
     """(fires, refs): whether `text` states, in a strong form that no hedge or negation cancels, that something waits on the
     person, and the refs `[(repo, number)]` its sentence(s) NAME (`#N`, `repo#N`, `owner/repo#N`; a bare `#N` is in
     `default_repo`, a short `repo#N` among `repos`). A sentence ends at `.`, `!` or `?` followed by a space, or a line end,
@@ -11881,6 +11882,8 @@ def sweep_strong_statement(strong, text, default_repo, repos):
                 text[max(0, match.start() - 30):match.start()]) or SWEEP_FUTURE_AFTER_RE.search(text[match.end():sentence_end]):
             continue
         fires = True
+        if matched is not None:
+            matched[:] = [_one_line(match.group(0), 80)]   # the phrase that fired, for the audit
         for full, short, number in SWEEP_REF_RE.findall(text[start:sentence_end]):
             repo = full or ((decision_core.repo_of_tag(short, repos) or short) if short else default_repo)  # unresolved: kept as named
             if repo and (repo, int(number)) not in refs:
@@ -11957,9 +11960,32 @@ class SweepState:
         self.deferred_since = {}  # repo or "*" -> when S3 was first deferred for it
         self.confirmed = {}      # (kind, ref) -> when a fresh read last bore the finding out
         self.attempted = {}      # (kind, ref) -> when it was last tried (the oldest is tried first)
+        self.sources = {}        # (kind, ref) -> what raised it, for the audit line
         self.current = {}        # the last run's counts
         self.strong = sweep_strong_re(SWEEP_DEFAULTS["person_names"])
         self.started = 0         # when this pass's sweep began (the time budget)
+
+
+def sweep_alarmed_load(engine, state, now, cfg):
+    """Once per process: the raise times of the last run, within the re-alarm window (older ones are forgotten)."""
+    if getattr(state, "alarmed_loaded", False) or engine.state_dir is None:
+        return
+    state.alarmed_loaded = True
+    for key, record in list(_read_small(engine.state_dir, SWEEP_ALARMED_FILE).items())[:5000]:   # only this code writes it: a bound anyway
+        kind, _, ref = key.partition(" ")
+        at = record.get("at")
+        if kind in SWEEP_KINDS and isinstance(at, (int, float)) and not isinstance(at, bool) and now - at < cfg["realarm_hours"] * 3600:
+            state.alarmed.setdefault((kind, ref), at)
+
+
+def sweep_alarmed_save(engine, state, now, cfg):
+    if engine.state_dir is None:
+        return
+    keep = {"%s %s" % pair: {"at": at} for pair, at in sorted(state.alarmed.items()) if now - at < cfg["realarm_hours"] * 3600}
+    try:
+        _write_small(engine.state_dir, SWEEP_ALARMED_FILE, keep)
+    except OSError:
+        pass   # a disposable file: a failed write costs one repeated finding after a restart
 
 
 def sweep_state(engine):
@@ -11995,8 +12021,8 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
                          "author": (pr_login(record.get("user")) or "").lower(),
                          "created": parse_iso(record.get("created_at")), "updated": parse_iso(record.get("updated_at")),
                          "assignees": [(pr_login(a) or "").lower() for a in record.get("assignees") or [] if isinstance(a, dict)],
-                         "body_waits": sweep_says_waiting(regex, body), "comments": [],
-                         "latest_strong": False, "latest_refs": []}
+                         "body_waits": sweep_says_waiting(regex, body), "comments": [], "comment_ids": [],
+                         "latest_strong": False, "latest_refs": [], "latest_source": None}
     closed_holds = {}   # S9: the most recent closed (or merged) PRs that still carry a merge or hold label
     recent, cut = hub.read_pages("repos/%s/issues?state=closed&sort=updated&direction=desc&per_page=50" % repo, cap=1)
     budget[0] -= sweep_pages_used(recent, cut)
@@ -12013,8 +12039,11 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
         number = _url_number(comment.get("issue_url"))
         if number in items and isinstance(comment.get("created_at"), str) and comment["created_at"] >= since:
             items[number]["comments"].append(sweep_says_waiting(regex, comment.get("body")))
-            fires, refs = sweep_strong_statement(strong, comment.get("body"), repo, [repo])  # the last one wins
+            items[number]["comment_ids"].append(comment.get("id"))
+            matched = []
+            fires, refs = sweep_strong_statement(strong, comment.get("body"), repo, [repo], matched)  # the last one wins
             items[number]["latest_strong"], items[number]["latest_refs"] = fires, refs
+            items[number]["latest_source"] = {"source": "comment:%s" % comment.get("id"), "match": matched[0] if matched else ""} if fires else None
     return {"at": now, "items": items, "truncated": truncated, "error": None, "closed_holds": closed_holds}
 
 
@@ -12115,12 +12144,13 @@ def sweep_within(when, now, seconds):
     return isinstance(when, (int, float)) and 0 <= now - when < seconds
 
 
-def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
+def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=(), decisions_whole=True):
     """The S1, S2, S3 and S5 findings: [(kind, "repo#n")], sorted. Reads nothing: it works on what the refresh kept.
     `defer` holds the repos (or "*": all) whose human-tier decisions are not all known this pass (their source failed or
     is still unread): S3, the only kind that a missing decision can raise falsely, is not judged for them. S1 reads only
     labels and bodies, S5 only the cos-tier decisions that ARE listed: neither waits."""
     found = set()
+    state.sources = {}   # (kind, ref) -> what raised it: {"source": "comment:<id>" | "report:<id>" | "body", "match": the phrase}
     awaiting = {awaiting_label(engine.config), awaiting_cos_label(engine.config)}
     human = {sweep_ref_of(d, home) for d in decisions if d.get("tier", "human") == "human" and d.get("kind") != "notice"}
 
@@ -12143,6 +12173,11 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
             elif not item["captain"] and (item["body_waits"] or any(item["comments"][-SWEEP_PR_COMMENTS:])):
                 found.add(("S2", ref_text(repo, number)))
                 s2.add((repo, number))
+                waiting = [i for i, w in enumerate(item["comments"][-SWEEP_PR_COMMENTS:]) if w]
+                ids = item.get("comment_ids", [])[-SWEEP_PR_COMMENTS:]
+                state.sources[("S2", ref_text(repo, number))] = (
+                    {"source": "body", "match": "the PR body says it waits"} if item["body_waits"] else
+                    {"source": "comment:%s" % (ids[waiting[-1]] if waiting and waiting[-1] < len(ids) else "?"), "match": "a recent comment says it waits"})
             if item["pr"]:   # #133: the label is the truth; the first-line marker is read only in the transition window
                 if "marker-without-label" in item["captain_findings"] and not sweep_within(
                         item.get("created"), now, SWEEP_S6A_GRACE) and sweep_ours(
@@ -12165,6 +12200,7 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
             for target in targets:
                 if target not in s2 and target not in human and target[1] in (state.repos[target[0]]["items"]):
                     found.add(("S3", ref_text(*target)))
+                    state.sources[("S3", ref_text(*target))] = item.get("latest_source") or {"source": "comment:?", "match": ""}
     repos_known = list(state.repos) + ([home] if home else [])
     human_keys = set()
     for d in decisions:   # everything the owner's tier already holds, however its ref is spelled
@@ -12173,15 +12209,17 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=()):
     for d in decisions:
         ref = sweep_ref_of(d, home)
         # a report is about the refs its sentence names, never assumed to be about its own ask
-        fires, refs = (sweep_strong_statement(state.strong, d.get("title"), ref[0], list(state.repos))
+        matched = []
+        fires, refs = (sweep_strong_statement(state.strong, d.get("title"), ref[0], list(state.repos), matched)
                        if d.get("kind") == "report" and ref and ref[0] else (False, []))
         for target in (refs if fires else ()):
             if (target[0] in defer or "*" in defer or target in human or target in s2 or target[0] not in state.repos
                     or target[1] not in state.repos[target[0]]["items"]):
                 continue
             found.add(("S3", ref_text(*target)))
+            state.sources[("S3", ref_text(*target))] = {"source": "report:%s" % d.get("id"), "match": matched[0] if matched else ""}
         since = parse_iso(d.get("since"))
-        if (d.get("tier") == "cos" and d.get("kind") != "notice" and since is not None
+        if (decisions_whole and d.get("tier") == "cos" and d.get("kind") != "notice" and since is not None
                 and now - since >= cfg["aged_cos_hours"] * 3600
                 and not (sweep_ref_keys(d, home, repos_known) & human_keys)):   # already the owner's: not stale for cos
             found.add(("S5", d.get("id") or ref_text(*(ref or ("?", 0)))))
@@ -12304,7 +12342,7 @@ def sweep_deferrals(state, errors, repos, now):
             named = [r for r in repos if r in text]
             for key in named or ["*"]:
                 reasons.setdefault(key, text)
-        elif source in ("v2", "reports"):
+        elif source in ("v2", "reports", "registry"):
             reasons.setdefault("*", "%s: %s" % (source, text))
     state.deferred_since = {k: v for k, v in getattr(state, "deferred_since", {}).items() if k in reasons}
     deferred, defer = [], set()
@@ -12325,6 +12363,7 @@ def sweep_decisions(engine, decisions, now, errors=()):
         return decisions  # `sweep: false`: fully off, reads nothing, writes nothing
     state = sweep_state(engine)
     state.started = engine.now()
+    sweep_alarmed_load(engine, state, now, cfg)
     repos = decision_repos(engine)
     watched = [d for d in decisions]
     home = engine.config.get("intent_repo") or (repos[0] if len(repos) == 1 else None)
@@ -12344,8 +12383,11 @@ def sweep_decisions(engine, decisions, now, errors=()):
             state.withdrawn.add(text)
             engine._note("sweep.withdrawn" if cfg["enabled"] else "sweep.finding", text,
                          {"kind": "S4", "ref": text, "applied": cfg["enabled"], "why": "its issue or PR is closed"})
+    notices_whole, why = whole(engine, "notices")   # #805: the owner-tier rows of held PRs come from the notice read: S3 and S5 judge by them, and a read that is not whole is no evidence of an absence
+    if not notices_whole:
+        errors = list(errors or ()) + [{"source": "registry", "error": "the notice read is not whole: %s" % why}]
     defer, deferred = sweep_deferrals(state, errors, repos, now)
-    candidates = sweep_findings(engine, state, kept, home, now, cfg, regex, defer)
+    candidates = sweep_findings(engine, state, kept, home, now, cfg, regex, defer, notices_whole or "*" not in defer)
     findings, unchecked = [], 0
     attempts = sorted(candidates, key=lambda c: (state.attempted.get(c, 0), c))  # the longest untried first
     for pair in attempts:
@@ -12375,8 +12417,11 @@ def sweep_decisions(engine, decisions, now, errors=()):
             if len(state.logged) > 5000:
                 state.logged.clear()
             state.logged.add((kind, ref, day))
-            engine._note("sweep.finding", ref, {"kind": kind, "ref": ref, "what": SWEEP_KINDS[kind],
-                                                "woken": cfg["enabled"]})
+            detail = {"kind": kind, "ref": ref, "what": SWEEP_KINDS[kind], "woken": cfg["enabled"]}
+            if (kind, ref) in state.sources:
+                detail["source"] = state.sources[(kind, ref)]["source"]   # #805: what raised it, so the reason is readable from the audit
+                detail["match"] = _one_line(state.sources[(kind, ref)]["match"], 80)
+            engine._note("sweep.finding", ref, detail)
     counts = {}
     for kind, _ in findings:
         counts[kind] = counts.get(kind, 0) + 1
@@ -12393,6 +12438,7 @@ def sweep_decisions(engine, decisions, now, errors=()):
                if now - state.alarmed.get((k, r), 0) >= cfg["realarm_hours"] * 3600]
         if due:
             sweep_queue_fact(state, due, now, cfg)
+            sweep_alarmed_save(engine, state, now, cfg)
     return kept if cfg["enabled"] else decisions
 
 

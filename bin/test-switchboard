@@ -22092,8 +22092,11 @@ def sweep_issue(number, body="", labels=(), pr=False, author=None, created=None,
     return record
 
 
-def sweep_comment(number, body, at):
-    return {"issue_url": "https://api.github.com/repos/acme/api/issues/%d" % number, "body": body, "created_at": at}
+def sweep_comment(number, body, at, cid=None):
+    out = {"issue_url": "https://api.github.com/repos/acme/api/issues/%d" % number, "body": body, "created_at": at}
+    if cid is not None:
+        out["id"] = cid
+    return out
 
 
 class TestSweep(Base):
@@ -22113,9 +22116,15 @@ class TestSweep(Base):
     def at(self, ago_days=0):
         return sb.iso(self.world.clock.now() - ago_days * 86400)
 
+    def sweep_real(self, decisions, errors=()):
+        """The REAL notice reader, then the REAL sweep (production runs them in this order in every pass)."""
+        now = self.world.clock.now()
+        sb.decisions_from_notices(self.engine, now)
+        return sb.sweep_decisions(self.engine, list(decisions), now, errors)
+
     def sweep(self, decisions=(), **cfg):
         self.engine.config["sweep"].update(cfg)
-        return sb.sweep_decisions(self.engine, list(decisions), self.world.clock.now())
+        return self.sweep_real(decisions)
 
     def found(self):
         return sorted((e["detail"]["kind"], e["detail"]["ref"]) for e in self.world.audit() if e["event"] == "sweep.finding"
@@ -22249,23 +22258,101 @@ class TestSweep(Base):
         self.hub.comments = [sweep_comment(2, "waiting on Alex", self.at(1))]
         old = dict(self.human(40), tier="cos", since=sb.iso(self.world.clock.now() - 3 * 3600))
         errors = [{"source": "github", "error": "issues of acme/api that wait on you are not read yet"}]
-        sb.sweep_decisions(self.engine, [old], self.world.clock.now(), errors)
+        self.sweep_real([old], errors)
         self.assertEqual(self.found(), [("S1a", "acme/api#1"), ("S2", "acme/api#10"), ("S5", "d40")])   # S3 waits
         current = sb.sweep_summary(self.world.state)
         self.assertEqual([(d["for"], d["overdue"]) for d in current["deferred"]], [("acme/api", False)])
         self.world.tick(1)
-        sb.sweep_decisions(self.engine, [old], self.world.clock.now(), [])
+        self.sweep_real([old])
         self.assertIn(("S3", "acme/api#2"), self.found())
         self.assertEqual(sb.sweep_summary(self.world.state)["deferred"], [])
+
+    def real_pass(self, decisions, tick=1):
+        """One pass through the REAL notice reader and the REAL sweep: the sweep gets the list the notice reader marked."""
+        self.world.tick(tick)
+        now = self.world.clock.now()
+        entries, errors = sb.decisions_from_notices(self.engine, now)
+        sb.sweep_decisions(self.engine, list(decisions), now, errors)
+
+    def test_s13_a_first_pass_whose_notice_read_is_not_whole_raises_no_s3_and_the_next_whole_pass_raises_the_genuine_one(self):
+        self.hub.open = {2: sweep_issue(2, "x")}
+        report = {"id": "r1", "kind": "report", "tier": "cos", "repo": "acme/api", "ask": 9, "since": self.at(), "title": "waiting on Alex for #2"}
+        aged = dict(self.human(40), tier="cos", since=sb.iso(self.world.clock.now() - 3 * 3600))   # S5: stale for cos unless the owner's tier holds it
+        sb.record_pr_notice(self.world.state, "acme/api", 50, "platform", "", self.world.clock.now())
+        self.gh = FakeGhPr({50: (1, "", "HTTP 502")})                               # a restart's first pass: the noticed PR cannot be read
+        self.engine.gh_runner = self.gh
+        self.real_pass([report, aged])
+        self.assertEqual(sb.whole(self.engine, "notices")[0], False)
+        self.assertEqual(self.found(), [])                                           # no S3 (nor S2, S5) from a list that is not whole
+        self.assertEqual([e for e in self.world.audit() if e["event"] == "sweep.withdrawn"], [])
+        self.gh.answers[50] = (0, pr_view_json(), "")
+        self.real_pass([report, aged], sb.PR_FACTS_TTL + 1)
+        self.assertEqual(sb.whole(self.engine, "notices")[0], True)
+        self.assertEqual(self.found(), [("S3", "acme/api#2"), ("S5", "d40")])      # the genuine ones, once
+
+    def finding_lines(self, kind):
+        return [e["detail"] for e in self.world.audit() if e["event"] == "sweep.finding" and e["detail"].get("kind") == kind]
+
+    def test_s14_a_finding_names_what_raised_it_a_comment_or_a_report_and_the_phrase(self):
+        self.hub.open = {2: sweep_issue(2, "x"), 3: sweep_issue(3, "x")}
+        self.hub.comments = [sweep_comment(2, "ok\nwaiting on Alex for a yes", self.at(1), cid=777)]
+        report = {"id": "r1", "kind": "report", "tier": "cos", "repo": "acme/api", "ask": 9, "since": self.at(), "title": "held for Alex on #3"}
+        self.sweep([report])
+        by_ref = {d["ref"]: d for d in self.finding_lines("S3")}
+        self.assertEqual((by_ref["acme/api#2"]["source"], by_ref["acme/api#2"]["match"]), ("comment:777", "waiting on Alex"))
+        self.assertEqual((by_ref["acme/api#3"]["source"], by_ref["acme/api#3"]["match"]), ("report:r1", "held for Alex"))
+        self.assertLessEqual(max(len(d["match"]) for d in by_ref.values()), 80)
+
+    def test_s15_the_re_alarm_window_survives_a_restart(self):
+        self.hub.open = {2: sweep_issue(2, "x")}
+        self.hub.comments = [sweep_comment(2, "waiting on Alex", self.at(1), cid=5)]
+        pending = lambda: [k for k in self.engine.sweep.facts]
+        self.world.tick(1)
+        self.sweep_real([])
+        self.assertEqual(len(pending()), 1)                                          # raised once
+        self.engine.sweep = None                                                     # the daemon restarts: memory only is gone
+        self.world.tick(3600)
+        self.sweep_real([])
+        self.assertEqual(pending(), [])                                              # inside the window: not raised again
+        self.engine.sweep = None
+        self.world.tick(7 * 3600)
+        self.sweep_real([])
+        self.assertEqual(len(pending()), 1)                                          # past the window: once
+
+    def test_s14_an_s2_finding_names_the_body_or_the_comment_that_raised_it(self):
+        self.engine.config["triage"] = {"our_logins": ["bot"]}
+        self.hub.open = {10: sweep_issue(10, "Held for Alex", pr=True), 12: sweep_issue(12, "fine", pr=True)}
+        self.hub.comments = [sweep_comment(12, "waiting on alex", self.at(1), cid=4242)]
+        self.sweep()
+        by_ref = {d["ref"]: d for d in self.finding_lines("S2")}
+        self.assertEqual(by_ref["acme/api#10"]["source"], "body")
+        self.assertEqual(by_ref["acme/api#12"]["source"], "comment:4242")
+
+    def test_s15_a_corrupt_or_odd_alarm_memory_is_ignored_and_the_sweep_still_raises(self):
+        self.hub.open = {2: sweep_issue(2, "x")}
+        self.hub.comments = [sweep_comment(2, "waiting on Alex", self.at(1), cid=5)]
+        path = self.world.state / sb.SWEEP_ALARMED_FILE
+        for text in ("{nope", "[]", json.dumps({"S3 acme/api#2": {"at": "x"}, "ZZ a#1": {"at": 1}, "S3": {"at": True}})):
+            with self.subTest(text=text):
+                path.write_text(text)
+                self.engine.sweep = None
+                self.world.tick(1)
+                self.sweep_real([])
+                self.assertEqual(len(self.engine.sweep.facts), 1)                    # raised: nothing trustworthy was remembered
+        with mock.patch.object(sb, "_write_small", side_effect=OSError("disk full")):
+            self.engine.sweep = None
+            self.world.tick(7 * 3600)
+            self.sweep_real([])                                                      # a failed save is tolerated
+        self.assertEqual(len(self.engine.sweep.facts), 1)
 
     def test_a_deferral_that_never_ends_is_bounded_and_shown_as_overdue(self):
         self.hub.open = {2: sweep_issue(2, "x")}
         self.hub.comments = [sweep_comment(2, "waiting on Alex", self.at(1))]
         errors = [{"source": "reports", "error": "cannot read the boss transcript"}]
-        sb.sweep_decisions(self.engine, [], self.world.clock.now(), errors)
+        self.sweep_real([], errors)
         self.assertEqual(self.found(), [])
         self.world.tick(sb.SWEEP_DEFER_SECONDS + 1)
-        sb.sweep_decisions(self.engine, [], self.world.clock.now(), errors)
+        self.sweep_real([], errors)
         self.assertEqual(self.found(), [("S3", "acme/api#2")])    # runs after the bound, the fresh check still guards it
         (item,) = sb.sweep_summary(self.world.state)["deferred"]
         self.assertEqual((item["for"], item["overdue"]), ("*", True))
@@ -22602,7 +22689,7 @@ class TestSweep(Base):
         del self.engine.config["sweep"]
         self.hub.open = {1: sweep_issue(1, "## Decision required\nx")}
         self.hub.closed = {30}
-        kept = sb.sweep_decisions(self.engine, [self.human(30)], self.world.clock.now())
+        kept = self.sweep_real([self.human(30)])
         self.assertEqual(len(kept), 1)                                   # nothing withdrawn
         self.assertEqual(self.found(), [("S1a", "acme/api#1")])         # findings audited
         self.assertEqual((self.engine.sweep.facts, self.bound()()), ({}, []))   # nobody woken
@@ -22619,7 +22706,7 @@ class TestSweep(Base):
     def test_sweep_false_turns_it_fully_off(self):
         self.engine.config["sweep"] = False
         self.hub.open = {1: sweep_issue(1, "## Decision required\nx")}
-        kept = sb.sweep_decisions(self.engine, [self.human(1)], self.world.clock.now())
+        kept = self.sweep_real([self.human(1)])
         self.assertEqual((len(kept), self.hub.reads, self.hub.single, self.found()), (1, [], [], []))
         self.assertIsNone(sb.sweep_summary(self.world.state))
         self.assertIs(sb.validate_config({"opencode": FAKE_OPENCODE, "sweep": False})["sweep"], False)
