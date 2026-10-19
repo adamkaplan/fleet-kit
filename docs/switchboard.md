@@ -4570,6 +4570,16 @@ These stay the owner's own clear. The list is data in the matrix file, and a com
 
 Every delegated clear is audited with the score, the threshold, the head and her one-line judgement, and the panel notice shows the same four. A refusal is audited (`gate.hold_clear_refused`) with the reason and the score read, and is never listed as a clear. The owner lists delegated clears with a listing command, one row per clear with those four fields. She may also raise a pull request to the owner instead of clearing it.
 
+#### Where it lives
+
+- `bin/delegated_clear.py` holds the judgement: the score block (`score_block`), the order-line hash and file match (`line_hash`, `file_order_line`, `entry_of`), the decision (`judge`) and the validation and refusals. It holds no path, class or rule name of its own.
+- `bin/impact_hold.py` runs the clear (`cmd_impact_delegated`) and its checks (`delegated_clear_checks`, `pr_checks`).
+- `bin/fleet-switchboard` reads the rating from the ledger (`impact_rating_entries`, with the fields in `IMPACT_RATING_FIELDS`) and carries the command parser.
+- `docs/review-laws/impact-matrix.json` holds the score block (levels, delegable levels, floor rules) and the machinery roots (`closure_roots`).
+- `agents/reviewers/reviewer-impact.md` tells the rater to name the floor rule's id and never rate a floor path below `Serious`.
+- `bin/fleet-doctor` has the delegated-order check: it fails when a configured file-sourced entry no longer matches the owner's line exactly once.
+- `bin/test-switchboard` holds the scenarios, including the attacker's view (forged, stale or other-head rating, threshold edit, path tricks).
+
 #### Heads
 
 A head change voids the rating and the clear: the hold is back at the new head (#830), and the rating is per head. A rating recorded at another head, or a clear started after the head moved, is refused. A pure merge carry stays as it is; #815 widens it separately.
