@@ -1612,6 +1612,18 @@ Now each pass the daemon compares the config file's mtime and size with what it 
 - **`fleet-switchboard restart`** stops the daemon by its recorded pid (SIGTERM, and nothing stronger) and runs
   `ensure`, so nobody has to `kill` a pid by hand. It looks at the process first and refuses a pid that is not a
   switchboard `run`. Under a service, the service starts the new daemon and `ensure` says it runs.
+- **The daemon command.** `fleet-switchboard daemon status | start | stop | restart` replaces the manual routine (signal the
+  process, wait for `run.lock` to clear, run `ensure`, check the decisions file and the forwarders), whether the daemon was
+  started by a launchd job or by `ensure`. `status` says whether it runs, how it was started (launchd when the loaded job's pid
+  is the lock's pid), its pid, since when (`daemon.json`) and whether it is healthy (the decisions file is fresh and written since
+  the start, no forwarder alarms); it exits 1 when not running or unhealthy. `stop` sends SIGTERM only to a pid that `daemon.json`
+  and `run.lock` agree on and whose command line is this program's `run` (else it says so and signals nothing), or unloads the
+  launchd job with `launchctl bootout` so launchd does not respawn it, and waits up to 15 s for the lock to clear. `start` loads or
+  kickstarts the launchd job when the plist exists, else uses the `ensure` path and says so in one line (no `launchctl` error is
+  shown), then waits up to 120 s for a healthy daemon. `restart` is `stop` then `start` and prints what it did and the seconds
+  taken. No state file is touched; one command at a time (a second says so and exits 1); every wait is bounded. The older
+  `restart` command (above) remains, and uses the same process check and stop wait.
+  The process check is a same-user guardrail (the lock and the record are files that user can write), not a boundary.
 
 The one thing a reload cannot do is recover from a file that was valid when it was checked and is invalid when
 the new process reads it a moment later (two checks, milliseconds apart): the new daemon then exits like any
