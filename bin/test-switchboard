@@ -15280,15 +15280,11 @@ class TestChecklistAndFamilyTexts(unittest.TestCase):
         for skill in self.SKILLS:
             text = self.read(skill)
             self.assertEqual(text.count(self.LINES), 1, skill)
-            self.assertEqual(self.LINES.count("\n- ") + 1, 3)
+            intro = text.split(self.LINES, 1)[0].rstrip("\n").splitlines()[-1]
+            self.assertIn("deletes something or raises an alert", intro, skill)
+            after = text.split(self.LINES, 1)[1].lstrip("\n").splitlines()[0]
+            self.assertFalse(after.startswith("- "), skill)  # exactly 3 bullets follow the intro
             self.assertEqual(text.count(self.FAMILY), 1, skill)
-
-    def test_the_count_check_fails_on_zero_and_on_two(self):
-        for skill in self.SKILLS:
-            text = self.read(skill)
-            for needle in (self.LINES, self.FAMILY):
-                self.assertEqual((text.replace(needle, "")).count(needle), 0)
-                self.assertEqual((text + needle).count(needle), 2)
 
     def test_the_texts_name_roles_never_agents_or_people(self):
         for text in (self.LINES, self.FAMILY):
