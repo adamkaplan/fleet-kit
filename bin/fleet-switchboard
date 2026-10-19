@@ -24576,7 +24576,7 @@ def _eol_of(body):
 def add_order_to_body(body, text, by, date):
     """`body` with one more order, `- <text> (ordered by <by>, <date>)`, added to the section (made at the
     end of the body when there is none). Every byte outside the section is kept. OrdersError for a text
-    that is empty, longer than ORDER_MAX_CHARS or on more than one line, and for a twenty-first order."""
+    that is empty, longer than ORDER_MAX_CHARS or on more than one line."""
     body = body or ""
     text = (text or "").strip()
     by = " ".join(str(by or "").split())[:60]
