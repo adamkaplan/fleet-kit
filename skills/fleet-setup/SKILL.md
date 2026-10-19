@@ -89,6 +89,7 @@ DO:      Launch the orchestrator into a new workspace, with a brief on stdin:
            fleet-switchboard launch <name> --agent orchestrator --role orchestrator \
              --dir <checkout> --new-workspace "<label>" --repo <owner>/<repo> \
              --reports-to chief-of-staff --brief-file -
+         (`--new-workspace` makes it a terminal launch; a plain `launch` is headless.)
          The brief says, in this order:
            1. Create <owner>/<repo> as a private repo, as the account you were given
               (gh repo create <owner>/<repo> --private). The judge will ask the person

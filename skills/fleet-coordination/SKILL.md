@@ -34,6 +34,8 @@ AUTH:       <the authority already granted, explicitly>
 CHECKPOINT: <a UTC time or an agreed event, with an overdue time>
 ```
 
+A coder that posts a plan also reports `working: plan posted <hash> <url>` (a report arrives even when a send is lost).
+
 A brief for a credential, permission or privileged-script change links `docs/adversarial-checklist.md`.
 The pull request body answers each item of it in one line. A Mermaid diagram appears only where it shows data flow, system design or component design, never at the top of a body and never as a summary of what changes, what it touches, what is irreversible and the risk.
 
@@ -43,6 +45,16 @@ Before the coder's first push, it runs both focused (a push voids proofs):
 bin/test-switchboard -k test_the_role_files_do_not_grow   # the role-file byte cap
 bin/test-switchboard -k TestHygiene                       # shebang, stdlib-only, executable bits
 ```
+
+A change that deletes something or raises an alert is checked against three lines before its first push:
+
+- Drive the real code path in the tests, never a copied helper.
+- Derive every set of kinds from one table, with a completeness test that fails when a kind is missing from it.
+- Read the sibling kinds and the consumers yourself.
+
+When a review finding names a gap in one member of a table, list, set or rule family (a row, a kind, an input, a rule), the fix covers every member in the same head: derive the set from the code, never a hand-listed copy, parametrise the tests over it with one mutant per member, and say in the PR body which members were checked; reviewers name the class, not only the instance.
+
+Some repositories' workflows skip draft pull requests (a coder lost four hours reading that as a failing CI): when a draft shows no CI runs, look at the workflow's draft filter and mark the PR ready before waiting for CI (if there is no filter, the cause is elsewhere).
 
 Before marking the pull request ready, `fleet-switchboard preflight-pr` runs the CI-critical focused classes you otherwise skip (command surface, hygiene, public names, and the cloud suites when `cloud/` changed) and prints one PASS or FAIL line each.
 
@@ -69,6 +81,8 @@ the Chief of Staff (with the issue's `<user>:awaiting-cos` label), which resolve
 orders or escalates it to the owner. Never apply `awaiting-user` yourself.
 
 A PR held for the owner carries the `<user>:merge-captain` label and a `<user>:hold-<reason>` label (`security`, `credential`, `contract`, `policy`, `prod-config` or `other-area`) and gets a `fleet-switchboard notice pr`; keep `MERGE: captain` as the first line of its body too, in repos whose own checks read it and until 2026-11-10, after which it is dropped. A held PR's body then opens (after those lines) with `## Why this needs you`, `## What changes for you` (a Before | After table), `## Example`, an optional real image, then `## Questions for you` (each with a Recommendation:); any Mermaid diagram goes below. Any other owner decision is a `report question` PLUS a `## Decision required` section at the top of the issue body (and the `<user>:awaiting-cos` label, never `awaiting-user`), never only words in a report: a report or comment saying something waits on the owner does not reach the panel; the section and label do. The switchboard sweep (#117) flags mismatches to cos. A deliberately deferred item carries `<user>:parked` and a `Parked until: <YYYY-MM-DD>` line in its body; it is exempt from the no-next-step flag until that date (never from an owner wait or a held PR).
+
+Where a repository has an `integration` branch, typical changes merge into it and reach the default branch in one daily batch pull request, opened and kept by the Chief of Staff's lane; the owner clears the batch. Urgent fixes and asks the owner makes alone go straight to the default branch. A held change is batched too, held and cleared on its own pull request by the matrix's rules, and the batch holds for the owner when any member touched a top-tier path until #835 lands, then only when a row is rated High. While the batch is out of draft (ready for the owner's clear), a freeze applies: nothing merges into `integration`. See `docs/switchboard.md`, "Batching".
 
 Related findings go up as one **batch**, never one question each: `fleet-switchboard decisions batch
 --title "<title>" --row "<repo#N> | <finding> | <recommendation>" ...` (or `--file`, or stdin) creates one
@@ -106,6 +120,8 @@ The daemon records the `ci` verdict itself about five minutes after CI is green 
 
 ## Starting a named agent in a pane
 
+Launch a new worker or tester only when `memory_pressure` reports a free percentage of at least 40 and the `Swapouts` counter of `vm_stat` is unchanged between two reads 30 seconds apart (swap used is sticky on macOS and is not the test); launch applies it itself; `--memory-ok <reason>` overrides.
+
 **Under the switchboard, use one command and stop reading this section.** If
 `fleet-switchboard` is on your PATH (a message from the switchboard reached you),
 start a worker with
@@ -115,9 +131,15 @@ fleet-switchboard launch <name> --agent coder --dir <worktree> --role coder \
   --reports-to <you> --issue <ask> --brief-file -     # the brief on stdin
 ```
 
-It creates the v2 session, opens the tab by argv in your workspace
-(`$HERDR_WORKSPACE_ID`), proves the pane runs that session, and only then sends the
-brief. It never types into a pane, and it runs the configured OpenCode, not whichever
+By default the worker is **headless**: a session in the OpenCode service with no
+terminal and no pane id (about 2 MB instead of 200 to 400 MB). To look at it run
+`fleet-switchboard watch NAME` (it opens a terminal on the same session; closing it leaves
+the worker running); `herdr agent read` and `send-keys` do not apply to it, so use `send`,
+`status` and `watch`. Add `--terminal` (or `--workspace`) for a tab, or the person sets
+`launch_default` to `terminal`. If the headless route is refused for a repo, `launch` opens
+a terminal instead and says so in one line; an explicit `--headless` refuses. With a terminal
+it opens the tab by argv in your workspace (`$HERDR_WORKSPACE_ID`), proves the pane runs
+that session, and only then sends the brief. It never types into a pane, and it runs the configured OpenCode, not whichever
 `opencode` is first on PATH. A worker started this way reports with
 `fleet-switchboard report`, and its report reaches you as a fact. Do **not** use the
 `herdr tab create` / `herdr agent start` / `herdr agent prompt` routes below for it:
@@ -316,6 +338,8 @@ get to carry forward. `DONE` means the assigned artifact and its evidence are
 complete — it does not mean deployed, and it does not mean runtime behaviour has
 been proved.
 
+`gh run rerun --failed` reuses the run's old merge ref, so a fix that landed on the base branch afterwards does not reach the pull request; closing and reopening it (head unchanged) recomputes the merge ref and starts fresh CI, and for a held pull request the orchestrator that owns it says so first, because the owner's clear is bound to the head, which does not change. A run's logs may be readable while it is in progress, once a job has uploaded its logs, through the jobs logs API (`gh api repos/<repo>/actions/jobs/<id>/logs`, add `--allow-escape-sequences`; it answers 404 before that), because `gh run view --log-failed` waits for the run to end.
+
 ## Two failures and you stop
 
 If the same approach fails twice, stop and report. Do not try a third variation
@@ -350,7 +374,7 @@ Formal approval means the required reviewer approved the full current commit SHA
 A pending review, a comment, or an approval against a stale head is not approval.
 If the head moved, the approval did not move with it.
 
-A reviewer or tester records the verdict as the last step of the review or test run it already does, in ONE command: `fleet-switchboard verdict --all --pr <repo#N> --as reviewer|tester --result pass|fail --head <full head sha> --evidence "<review url or what you ran>"`. (`--all` is available; the per-scenario form remains valid for recording a single scenario: `fleet-switchboard verdict <scenario> --pr <repo#N> --as reviewer|tester --result pass|fail --head <full head sha> --evidence "<what you ran>"`.) Say it only when it is true: an approval or a run at head H. A push voids it: re-record after the delta review. Never record a verdict on a PR you wrote (the switchboard refuses it, and it would be grading your own work).
+A reviewer or tester records the verdict as the last step of the review or test run it already does, in ONE command: `fleet-switchboard verdict --all --pr <repo#N> --as reviewer|tester --result pass|fail --head <full head sha> --evidence "<review url or what you ran>"`. (`--all` is available; the per-scenario form remains valid for recording a single scenario: `fleet-switchboard verdict <scenario> --pr <repo#N> --as reviewer|tester --result pass|fail --head <full head sha> --evidence "<what you ran>"`.) Say it only when it is true: an approval or a run at head H. A push voids it: re-record after the delta review. Never record a verdict on a PR you wrote (the switchboard refuses it, and it would be grading your own work). For a PR into an integration branch, link the epic's plan or a plan of its own with at least one scenario judged by `reviewer` (a scenario with no `claim` is per pull request), or put the line `per-pr scenarios: none because <reason of at least 20 characters>` in the plan (then G1 reads n/a and there is no reviewer verdict to record).
 
 A tester records verdicts only and never runs `prove`: a proof makes it an author of the PR, and its verdicts are then refused.
 

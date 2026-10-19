@@ -5,6 +5,9 @@ the PR merges; `Part of` and `PLAN:` do not, so the issue stays open with nobody
 closed pull requests per repo, and this module says which open issues they name.
 
 Pure: it reads plain records and returns plain values; it touches no file, GitHub or agent.
+
+The same module holds the rules of a posted or edited plan telling its approver (#765, the section "A posted or edited plan" below): the daemon's triage pass
+reads the units it already holds and asks these rules who approved what. Nothing the delegated clear runs loads it.
 """
 import re
 
@@ -87,3 +90,154 @@ def ledger_pending(entries, repo, pr):
 def pending_issues(links, entries, repo):
     """The issue numbers of `links` whose linked merged pull request still has a proof not passed in the ledger."""
     return {issue for issue, link in links.items() if ledger_pending(entries, repo, link["pr"])}
+
+
+# ---- #765: a posted or edited plan tells its approver once per hash. Approved means ANY of: (1) a comment on the plan's issue by a different SIGNER than the plan
+# comment's (the `from=` marker, else the login) that says "approved" with the first 8 hex characters of the plan hash; (2) a pull request opened at or after the
+# plan's last edit whose body's first line is `PLAN: <the plan comment's url>`; (3) a consensus pass in the ledger for that exact hash. (1) and (2) are a
+# notification HINT, never an approval gate (a marker is plain text): G0c stays the real approval.
+
+ANNOUNCE_SECONDS = 24 * 3600     # a plan last posted or edited longer ago than this is neither announced nor listed (an old plan is not news)
+UNAPPROVED_SECONDS = 30 * 60     # a plan with no approval seen this long after it was posted is listed on the sweep line
+MAX_LISTED = 10
+
+_APPROVED_RE = re.compile(r"\bapproved\b", re.I)
+_NEGATED_RE = re.compile(r"(?:\bnot|\bnever|n't)\s+approved\b|\bunapproved\b", re.I)
+_PLAN_CITE_RE = re.compile(r"^\s*PLAN:\s*<?https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/([0-9]{1,9})#issuecomment-([0-9]{1,15})", re.I)
+WINDOWS = "windows: 14 days of comments, 2 pages of issues, 50 merged PRs"
+
+
+def signer(comment, signed_by):
+    """Who wrote a comment: the agent its hidden marker names (`signed_by` is the daemon's own parser), else its login. Every fleet agent writes through
+    the same login, so the marker is what tells them apart."""
+    body = comment.get("body") if isinstance(comment, dict) else None
+    mark = signed_by(body) if isinstance(body, str) else None
+    if mark:
+        return "agent:" + mark.lower()
+    user = comment.get("user") if isinstance(comment, dict) else None
+    login = user.get("login") if isinstance(user, dict) else None
+    return "login:" + login.lower() if isinstance(login, str) and login else None
+
+
+def latest_plans(comments, heading_re, number_of):
+    """{issue number: the latest comment whose first non-empty line is a plan heading} (the latest by creation time, then id: the plan check's rule)."""
+    found = {}
+    for comment in comments or []:
+        body = comment.get("body") if isinstance(comment, dict) else None
+        number = number_of(comment.get("issue_url")) if isinstance(comment, dict) else None
+        if not isinstance(body, str) or number is None or not isinstance(comment.get("id"), int):
+            continue
+        first = next((line for line in body.splitlines() if line.strip()), "")
+        if not heading_re.match(first):
+            continue
+        key = (str(comment.get("created_at") or ""), comment["id"])
+        if number not in found or key > found[number][0]:
+            found[number] = (key, comment)
+    return {number: comment for number, (_, comment) in found.items()}
+
+
+def hex8(plan_hash):
+    return plan_hash.split(":", 1)[-1].lower()[:8]
+
+
+def approved_by_comment(plan, plan_hash, issue_comments, signed_by):
+    """True when another signer's comment says `approved` (not negated) with the first 8 hex characters of `plan_hash`."""
+    mine = signer(plan, signed_by)
+    token = re.compile(r"(?<![0-9a-f])%s" % re.escape(hex8(plan_hash)), re.I)
+    for comment in issue_comments or []:
+        if not isinstance(comment, dict) or comment.get("id") == plan.get("id") or not isinstance(comment.get("body"), str):
+            continue
+        who = signer(comment, signed_by)
+        if who is None or who == mine:
+            continue
+        text = comment["body"][:20000]
+        if token.search(text) and _APPROVED_RE.search(text) and not _NEGATED_RE.search(text):
+            return True
+    return False
+
+
+# ---- #790: a fourth approval form, an approval SENT as a message. The audit records a delivered send as a `v2.synthetic` entry: `detail.keys` holds
+# `send:<sender>:<id>` and `detail.description` is `switchboard: <sender> message on <issue tag>: <first 100 characters of the text>` (200 in all), so
+# `Approved at sha256:` + 64 hex (83 characters) fits. A message batched with others (`N items for ...`) is not recognised: the note then fires, as before.
+
+DAEMON_SENDERS = ("switchboard", "fleet-switchboard", "fleet-daemon")   # the daemon's own lines quote other people; they are never an approver
+MAX_SENDS = 50000       # audit entries scanned per pass
+MAX_DESCRIPTION = 400   # the daemon writes at most 200 characters
+_SEND_DESC_RE = re.compile(r"^switchboard: ([A-Za-z0-9_.-]{1,64}) message on [^\s:]{1,120}: (.*)$", re.S)
+_QUOTED_LINE_RE = re.compile(r"(?:^|[\r\n])\s*>")
+
+
+def _send_sender(detail):
+    """The sender of a single audited send: the one `send:<sender>:<id>` key, agreeing with the description's own sender; else None."""
+    keys = detail.get("keys")
+    if not isinstance(keys, list) or not keys:
+        return None
+    senders = set()
+    for key in keys:
+        parts = key.split(":") if isinstance(key, str) else []
+        if len(parts) != 3 or parts[0] != "send" or not parts[1]:
+            return None
+        senders.add(parts[1].lower())
+    return senders.pop() if len(senders) == 1 else None
+
+
+def approved_by_send(plan, plan_hash, entries, signed_by):
+    """True when an audited send by someone other than the plan comment's signer starts `Approved at sha256:<hash>`, or says `approved` (not negated,
+    not a quoted line) and holds the plan's FULL 64-hex hash at a hex boundary. A prefix or another hash never counts. A hint, as the other forms are."""
+    mine = signer(plan, signed_by)
+    full = plan_hash.split(":", 1)[-1].lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", full):
+        return False
+    token = re.compile(r"(?<![0-9a-f])%s(?![0-9a-f])" % full)
+    starts = re.compile(r"^Approved at sha256:%s(?![0-9a-f])" % full, re.I)
+    for entry in (entries or [])[-MAX_SENDS:]:   # bounded: the caller's audit tail is 8 MiB, and only the newest entries are read; a failure to match is only the old note
+        detail = entry.get("detail") if isinstance(entry, dict) else None
+        if (not isinstance(detail, dict) or entry.get("event") != "v2.synthetic" or not isinstance(detail.get("description"), str)
+                or len(detail["description"]) > MAX_DESCRIPTION):
+            continue
+        sender = _send_sender(detail)
+        found = _SEND_DESC_RE.match(detail["description"])
+        if sender is None or found is None or found.group(1).lower() != sender or sender in DAEMON_SENDERS or "agent:" + sender == mine:
+            continue
+        text = found.group(2)
+        if starts.match(text):
+            return True
+        if token.search(text.lower()) and _APPROVED_RE.search(text) and not _NEGATED_RE.search(text) and not _QUOTED_LINE_RE.search(text):
+            return True
+    return False
+
+
+def cited_by_pr(repo, number, plan, pulls, parse_time):
+    """True when a pull request opened at or after the plan's last edit has `PLAN: <this plan comment's url>` as the first line of its body."""
+    edited = parse_time(plan.get("updated_at") or plan.get("created_at"))
+    for pr in pulls or []:
+        body = pr.get("body") if isinstance(pr, dict) else None
+        if not isinstance(body, str):
+            continue
+        first = next((ln for ln in body[:5000].splitlines() if ln.strip()), "")
+        found = _PLAN_CITE_RE.match(first)
+        if not found or found.group(1).lower() != repo.lower() or int(found.group(2)) != number or int(found.group(3)) != plan.get("id"):
+            continue
+        opened = parse_time(pr.get("created_at"))
+        if edited is None or opened is None or opened >= edited:
+            return True
+    return False
+
+
+def plan_url(repo, number, comment_id):
+    """The url of the plan comment, rebuilt from the repository, the number and the id: no text of the comment is ever put into it."""
+    return "https://github.com/%s/issues/%d#issuecomment-%d" % (repo, number, comment_id)
+
+
+def line(number, url, plan_hash, passed, stale=False):
+    """The one line the approver reads: the issue, the url, the hash and the check result. Nothing from the plan's own text."""
+    result = "PASS" if passed else "FAIL (issue body not re-read: may be stale; run plan check)" if stale else "FAIL"
+    return "plan posted on #%d: %s %s, plan check %s" % (number, url, plan_hash, result)
+
+
+def unapproved_line(refs, extra=0):
+    """The one sweep line, or None when there is none."""
+    if not refs:
+        return None
+    return "plans posted over 30 min ago, no approval comment, no PR citing it, no consensus seen (%s): %s%s" % (
+        WINDOWS, ", ".join(refs), " (+%d more)" % extra if extra else "")

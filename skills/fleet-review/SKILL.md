@@ -26,6 +26,14 @@ Each reviewer:
 - reads the change and judges it; it **never builds, runs or tests** anything, writes nothing and holds no write command; it has at most 50 turns and answers `verdict: incomplete` rather than ending in silence;
 - **returns its verdict as text** (a `verdict:` block with `head:` and one line per finding).
 
+Each reviewer also checks a change that deletes something or raises an alert against three lines:
+
+- Drive the real code path in the tests, never a copied helper.
+- Derive every set of kinds from one table, with a completeness test that fails when a kind is missing from it.
+- Read the sibling kinds and the consumers yourself.
+
+When a review finding names a gap in one member of a table, list, set or rule family (a row, a kind, an input, a rule), the fix covers every member in the same head: derive the set from the code, never a hand-listed copy, parametrise the tests over it with one mutant per member, and say in the PR body which members were checked; reviewers name the class, not only the instance.
+
 **For testers and workers who run checks.** An agent that is asked to run a mutation or fault-injection check (a tester or the orchestrator's own worker, never a reviewer, who runs nothing) runs each run through `fleet-switchboard heavy` with a time limit (`heavy -- timeout N <command>`), in its own process group which it stops as a whole when the limit is hit, and runs in the background only as a named job with a time limit and a job record (the job-start rule), never as a loose background process. The wrapper also stops a tree that passes its ceiling, but do not rely on that for a mutant that can loop.
 
 **You record what they returned**, one record per reviewer per head: put the returned block in a file (or pipe it) and run
