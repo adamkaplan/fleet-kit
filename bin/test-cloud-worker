@@ -686,6 +686,35 @@ class TestWiring(Base):
             self.main("retire", "coder7")
         self.assertNothingKept()
 
+    def test_u3_a_signal_right_after_the_tunnel_spawn_still_stops_the_tunnel(self):
+        """Deterministic: the signal is raised the moment the real spawn returns, before the tunnel could be registered."""
+        self.assertEqual(self.launch()[0], 0)
+        (self.stub_dir / "pf_hang").write_text("")
+        spawned, in_spawn, real = [], [], subprocess.Popen
+
+        def spawn_then_signal(*args, **kwargs):
+            child = real(*args, **kwargs)
+            if "port-forward" in args[0]:
+                spawned.append(child)
+                try:
+                    signal.pthread_kill(threading.get_ident(), signal.SIGINT)   # at this thread: a process-wide signal may land on another one
+                    time.sleep(0.2)   # a handler that may run now runs now
+                except KeyboardInterrupt:
+                    in_spawn.append(True)   # delivered before the tunnel was registered: the handler could not stop it
+                    raise
+            return child
+        with mock.patch.object(subprocess, "Popen", spawn_then_signal):
+            with self.assertRaises(KeyboardInterrupt):
+                self.main("read", "coder7")
+        self.assertEqual(in_spawn, [], "the signal was delivered between the spawn and the registration of the tunnel")
+        self.assertEqual(len(spawned), 1)
+        deadline = time.time() + 20
+        while spawned[0].poll() is None and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertIsNotNone(spawned[0].poll(), "the tunnel was left running")
+        spawned[0].poll()
+        self.assertEqual(self.leftovers(), [])
+
     def _signalled(self, signum):
         self.assertEqual(self.launch()[0], 0)
         (self.stub_dir / "pf_hang").write_text("")
