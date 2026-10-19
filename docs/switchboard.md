@@ -4521,6 +4521,69 @@ A pull request held for the owner (`merge-captain` or a `hold-*` label) is a row
   The head read after the file list must still be the head the decision read. A repeated order number in the configuration makes the whole feature off. `--revoke` removes any clear, including one made under an order. The order is read from the same repository and config the same user controls, so the hash binds the text, not the author.
 - **What it does.** The clear is bound to the head the checks read, removes the same labels, wakes the same clear notice (`<name> cleared <repo#N> at <head8> under the owner's standing order N: "<reason>"; <lane> merges it`) and is audited as `gate.hold_cleared` with `by` (her name), `under_order`, `order` (the order's text) and `reason`; a refusal is `gate.hold_clear_refused`. `--revoke` under an order works too, and it removes ANY clear of the pull request, the owner's own included (it fails toward safe: the hold returns; `gate.clear_revoked` records `under_order`).
 
+### The delegated clear by impact score (#835)
+
+The Chief of Staff may clear a held pull request on her own judgement when its independent impact rating, at the head as it is now, is at or below a level the owner sets. It works in any watched repository. The owner is asked only for the changes that rate above it.
+
+This replaces the path-class refusal of the section above only when the level is set. With no `max_level`, the earlier behaviour is unchanged.
+
+#### The threshold
+
+- The score is a level of the impact matrix, in the order `Low < Medium < Serious < High`. The code derives it from the severity and probability the independent impact reviewer recorded, through the matrix cells. The reviewer's own words for a level are never the score. A record without both fields has no score and clears nothing.
+- The owner's target is `Serious`: she may clear `Serious` and below. `High` is always the owner's, whatever the path or her judgement. The matrix file lists the delegable levels (`Low`, `Medium`, `Serious`), so `High` is never accepted as a threshold.
+- The key is `max_level`, written beside each listed order under `delegated_clear` in the owner's configuration. Absent, empty or malformed means "clear nothing". It is never set in a committed file.
+
+#### When the key turns on
+
+The key turns on only when the owner's own standing-orders line is matched by hash. The entry names the owner's standing-orders file (the one `fleet-switchboard orders --cos` prints) as its source, with the sha256 of the order's exact line.
+
+- The code reads that file read-only and never writes it. No command of the fleet writes it.
+- The match is exact: one line, trimmed of its line end only, whose sha256 equals the bound hash. No case folding, no substring, no fuzzy match.
+- Zero lines, more than one, an edited line, or a file that cannot be read in full (missing, unreadable, over its size cap) all mean the order is absent. The key then refuses to turn on and "clear nothing" stays.
+- The fleet doctor check fails when a configured entry no longer matches, so a vanished or edited line is seen at once.
+- A charter-numbered entry works as before.
+
+#### How a floor path raises the score
+
+A path of the credential, identity or authority classes is an input to the rating, not a separate hold.
+
+- A floor path makes `Serious` the LOWEST score the change can get, never `Low` or `Medium`.
+- The independent rater rates `High` when the change really alters credential issuance, a login, a token's scope or who may do what. A warn-only shim change or a CI timeout on a floor path stays `Serious`, which she may clear.
+- The rating's reason must name the path rule's id from the matrix file. A rating on a floor path that does not name it does not count, and the clear is refused.
+- A rating below `Serious` on a floor path is refused at read time ("below the floor"), whatever the rater wrote. It is never raised to `Serious` and cleared.
+- Path forms the floor reads as one file (`./x`, `a//b`, case, a `..`, a rename's source) get the same floor. A changed-file list that cannot be read in full has no score.
+- The floor data lives in the matrix file; the clear code holds none.
+
+#### Whose rating counts
+
+Only a record by the independent impact reviewer at exactly this head counts, never one by the author or the Chief of Staff. The highest level of any such record at this head is the rating, so a later lower record cannot lower it. An unreadable ledger, a broken chain, no record, or a record with no severity or probability is refused, never read as `Low`.
+
+#### Never delegated, whatever the score
+
+- The clear and hold machinery, and the files the daemon loads.
+- The impact matrix file, including its floor rules and delegable levels (the levels in force are the base's, not the head's).
+- The standing order, and the code that reads or validates the order, the threshold or the rating.
+
+These stay the owner's own clear. The list is data in the matrix file, and a completeness test derives it from what the clear loads.
+
+#### Audit and listing
+
+Every delegated clear is audited with the score, the threshold, the head and her one-line judgement, and the panel notice shows the same four. A refusal is audited (`gate.hold_clear_refused`) with the reason and the score read, and is never listed as a clear. The owner lists delegated clears with a listing command, one row per clear with those four fields. She may also raise a pull request to the owner instead of clearing it.
+
+#### Where it lives
+
+- `bin/delegated_clear.py` holds the judgement: the score block (`score_block`), the order-line hash and file match (`line_hash`, `file_order_line`, `entry_of`), the decision (`judge`) and the validation and refusals. It holds no path, class or rule name of its own.
+- `bin/impact_hold.py` runs the clear (`cmd_impact_delegated`) and its checks (`delegated_clear_checks`, `pr_checks`).
+- `bin/fleet-switchboard` reads the rating from the ledger (`impact_rating_entries`, with the fields in `IMPACT_RATING_FIELDS`) and carries the command parser.
+- `docs/review-laws/impact-matrix.json` holds the score block (levels, delegable levels, floor rules) and the machinery roots (`closure_roots`).
+- `agents/reviewers/reviewer-impact.md` tells the rater to name the floor rule's id and never rate a floor path below `Serious`.
+- `bin/fleet-doctor` has the delegated-order check: it fails when a configured file-sourced entry no longer matches the owner's line exactly once.
+- `bin/test-switchboard` holds the scenarios, including the attacker's view (forged, stale or other-head rating, threshold edit, path tricks).
+
+#### Heads
+
+A head change voids the rating and the clear: the hold is back at the new head (#830), and the rating is per head. A rating recorded at another head, or a clear started after the head moved, is refused. A pure merge carry stays as it is; #815 widens it separately.
+
 ### Clearing a hold by saying so in the chat (#457)
 
 The owner clears a held PR by writing so to the Chief of Staff ("366 is good to go") instead of running `impact clear`. **It is in SHADOW until the owner turns it live**: the daemon judges his messages and logs what it would do, and writes nothing to GitHub and sends nothing, until his own config says `"chat_clear": {"live": true}` (`"enabled": false` switches the hook off). Nothing in the fleet sets that key. **It is live only while every pass confirms it:** the CURRENT config file is read afresh each pass and must be valid and say `live` (the daemon keeps its last good config when a reload fails, so an invalid file means SHADOW at once, with the audit line `chat_clear.mode` = `shadow (config invalid)`), and the owner's panic stop is a file: `chat-clear.off` in the state directory forces shadow for as long as it exists (`touch`, and `rm` to return to the config's value). Every change of mode is one `chat_clear.mode` audit line. Built in four slices: offers and checks (slice 1), the judge's question and the decision (slice 2), the clear and the daemon hook (slice 3), the shadow run on his real messages and the live check (slice 4).
