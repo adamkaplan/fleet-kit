@@ -13,6 +13,7 @@ The last line printed is `RESULT: PASS` or `RESULT: FAIL`, and the exit code
 is non-zero on failure.
 """
 import ast
+import traceback
 import base64
 import calendar
 import collections
@@ -247,7 +248,7 @@ class TestConfig(Base):
         self.assertEqual(sb.load_config(), {
             "opencode": None, "opencode_env": {}, "opencode_executable": None, "launch_env": {},
             "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "retire_idle_minutes": 10, "call_timeout_seconds": 20, "send_timeout_seconds": 60, "poll_seconds": 5,
-            "worker_lookback_hours": 24, "send_to_working": "steer",
+            "worker_lookback_hours": 24, "stalled_working_hours": 2, "send_to_working": "steer",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
             "owner_logins": [], "v2_light": False, "v2_cache_seconds": 120, "v2_reads_per_pass": 8, "v2_reads_per_minute": 90, "v2_events": "auto", "v2_plugin_events": "auto", "v2_transport": "auto", "cpu_guard": None, "disk_guard": None, "reds": None, "heavy": None, "docker_reaper": True,
@@ -12340,7 +12341,25 @@ class TestChatClearHook(Base):
 
     def hook(self, decisions=None):
         self.engine.discover(self.world.clock.now())
+        sb.decisions_from_notices(self.engine, self.world.clock.now())               # the REAL notice reader marks the input, as in every pass
         sb.chat_clear_pass(self.engine, self.decisions() if decisions is None else decisions, self.world.clock.now())
+
+    def test_the_offers_are_kept_while_the_notice_read_is_not_whole_and_dropped_only_by_a_whole_pass(self):
+        self.hook()                                                                  # the PR is held: its offer records the head shown
+        cc = sb.load_module("chat_clear")
+        before = cc.read_offers(self.world.state)
+        self.assertEqual(len(before), 1)
+        now = self.world.clock.now()
+        item = {"repo": "acme/api", "number": 99, "created": now, "note": None, "from": "platform"}
+        skipped = {"at": 0, "facts": None, "stale": True, "skipped": True, "confirmed": None, "error": "budget"}
+        with mock.patch.object(sb, "read_pr_notices", return_value=[item]), mock.patch.object(sb, "notice_facts", return_value=skipped):
+            sb.decisions_from_notices(self.engine, now)                              # the REAL reader: one noticed PR unread
+        self.assertFalse(sb.whole(self.engine, "notices")[0])
+        sb.chat_clear_pass(self.engine, [], now)                                     # the held PR is absent from this list: no evidence it left
+        self.assertEqual(cc.read_offers(self.world.state), before)                   # the head the person was shown is kept
+        self.assertIn("whole.skipped", [e["event"] for e in self.world.audit()])
+        self.hook(decisions=[])                                                      # a whole pass without the PR: its offer goes
+        self.assertEqual(cc.read_offers(self.world.state), {})
 
     def say(self, text, lasts=0, **kw):
         self.world.tick(5)
@@ -15241,6 +15260,34 @@ class TestWorkerRulesInSkills(unittest.TestCase):
 
     def test_the_texts_name_roles_never_agents_or_people(self):
         for text in (self.CAP, self.CI, self.LIST) + self.SHAPES:
+            self.assertNotRegex(text, r"(?i)\b(coder\d|cos\b|fleet-upkeep|adam\b)")
+
+
+class TestChecklistAndFamilyTexts(unittest.TestCase):
+    """#814: the deleter/alert checklist and the whole-family sentence, each said once in each of two skills."""
+    LINES = ("- Drive the real code path in the tests, never a copied helper.\n"
+             "- Derive every set of kinds from one table, with a completeness test that fails when a kind is missing from it.\n"
+             "- Read the sibling kinds and the consumers yourself.\n")
+    FAMILY = ("When a review finding names a gap in one member of a table, list, set or rule family (a row, a kind, an input, a rule), the fix covers every member in the same head: "
+              "derive the set from the code, never a hand-listed copy, parametrise the tests over it with one mutant per member, and say in the PR body which members were checked; "
+              "reviewers name the class, not only the instance.")
+    SKILLS = ("fleet-coordination", "fleet-review")
+
+    def read(self, skill):
+        return (REPO / "skills" / skill / "SKILL.md").read_text()
+
+    def test_each_text_is_in_each_skill_exactly_once_and_the_checklist_has_three_lines(self):
+        for skill in self.SKILLS:
+            text = self.read(skill)
+            self.assertEqual(text.count(self.LINES), 1, skill)
+            intro = text.split(self.LINES, 1)[0].rstrip("\n").splitlines()[-1]
+            self.assertIn("deletes something or raises an alert", intro, skill)
+            after = text.split(self.LINES, 1)[1].lstrip("\n").splitlines()[0]
+            self.assertFalse(after.startswith("- "), skill)  # exactly 3 bullets follow the intro
+            self.assertEqual(text.count(self.FAMILY), 1, skill)
+
+    def test_the_texts_name_roles_never_agents_or_people(self):
+        for text in (self.LINES, self.FAMILY):
             self.assertNotRegex(text, r"(?i)\b(coder\d|cos\b|fleet-upkeep|adam\b)")
 
 
@@ -21793,6 +21840,273 @@ STOPPED_NEWS_RULES = [
 ]
 
 
+
+class StalledHub:
+    """The one list the stalled rule's open-PR input comes from: what `ci_record_pass` reads through `hub.read_pages`."""
+
+    def __init__(self):
+        self.records, self.cut, self.fail = [], False, False
+        self.paths = []
+
+    def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
+        self.paths.append(path)
+        if self.fail:
+            raise sb.GitHubUnavailable("the list could not be read")
+        return list(self.records), self.cut
+
+
+class TestStalledWorking(ReportBase):
+    """#811: a coder whose reports are all `working` for `stalled_working_hours` while nothing it owns moves wakes its boss ONCE. Real path:
+    the report record is written by `report`, the open-PR list and its read-whole mark come from `ci_record_pass` over a fake hub."""
+    REPO = "acme/widget-service"
+
+    def setUp(self):
+        super().setUp()
+        engine = self.world.engine
+        engine.state_dir = self.world.state
+        engine.config["intent_repo"] = self.REPO
+        engine.config["plan_gates"] = {"repos": {self.REPO: {"mode": "shadow"}}}
+        engine.gh_runner = lambda *a, **k: (_ for _ in ()).throw(AssertionError("gh called"))   # no call is made to judge movement
+        self.hub = engine.hub = StalledHub()
+        self.t0 = self.world.clock.now()
+        self.params = {"head": "a" * 40, "issue_labels": (), "pr_labels": (), "checks": None, "pr": True, "at": self.t0}
+        self.apply()
+        (self.world.state / sb.DECISIONS_FILE).write_text(json.dumps({"decisions": [], "errors": []}))
+        self.world.tick(1)
+        for _ in range(5):
+            self.report("working", "migrating the tables")
+        self.world.tick(1)
+
+    def apply(self):
+        """Read the lists as the daemon does: the issue list is the triage's (marked by hand: not this change's code), the PR list is `ci_record_pass`'s."""
+        engine, prm = self.world.engine, self.params
+        at, now = sb.iso(prm["at"]), self.world.clock.now()
+        engine.triage = sb.TriageState()
+        engine.triage.units[(self.REPO, "issues")] = {"at": now, "data": [
+            {"number": 2, "updated_at": at, "created_at": at, "labels": [{"name": n} for n in prm["issue_labels"]]}], "truncated": False, "error": None}
+        sb.read_mark(engine, "issues:" + self.REPO, True, "", now)
+        sb.read_mark(engine, "decisions", True, "", now)
+        self.hub.records = [{"number": 9, "body": "PLAN: https://github.com/%s/issues/2\n" % self.REPO, "updated_at": at, "head": {"sha": prm["head"]},
+                             "labels": [{"name": n} for n in prm["pr_labels"]]}] if prm["pr"] else []
+        engine.__dict__.pop("ci_record_state", None)
+        engine.__dict__.get("read_whole", {}).pop("pulls:" + self.REPO, None)
+        sb.ci_record_pass(engine, now)
+        if prm["pr"] and prm["checks"] is not None:
+            engine.ci_record_state.pr_state["%s#9" % self.REPO].update(
+                {"examined_head": prm["head"], "checks": [{"name": "ci", "conclusion": c} for c in prm["checks"]]})
+
+    def set_lists(self, **changes):
+        self.params.update(changes)
+        self.apply()
+
+    def stalled(self):
+        return [f for f in self.derive() if ":stalled:" in f.key]
+
+    def late(self, hours=2.5):
+        """Time passes and the daemon's passes keep reading (so every list is fresh)."""
+        self.world.tick(int(hours * 3600) - 60)
+        self.apply()
+        self.world.tick(60)
+
+    def test_stalled_working_with_no_movement_wakes_the_boss_once(self):
+        self.late()
+        (wake,) = self.stalled()
+        self.assertEqual((wake.recipient, wake.kind), ("platform", "worker.idle"))
+        self.assertRegex(wake.summary, r"^no movement for 2\.5h on acme/widget-service#9 \(worker coder, 5 working reports; last: migrating the tables\)$")
+        self.assertEqual([f for f in self.derive() if f.recipient == "coder"], [], "the worker is never nagged")
+        self.world.tick(30)
+        self.assertEqual([f.key for f in self.stalled()], [wake.key], "the same stretch keeps its key")
+
+    def test_the_stretch_is_delivered_once_over_many_passes_and_again_after_a_head_move(self):
+        self.late()
+        first = [f.key for f in self.stalled()]
+        for _ in range(3):
+            self.world.engine.run_pass()
+            self.world.tick(30)
+        keys = [k for a in self.world.admissions("platform") for k in a["keys"] if ":stalled:" in k]
+        self.assertEqual(keys, first)
+        self.set_lists(head="b" * 40, at=self.world.clock.now())
+        self.assertEqual(self.stalled(), [], "a moved head is movement")
+        self.late()
+        (again,) = self.stalled()
+        self.assertNotEqual(again.key, first[0], "a second wake after the stall again, under a new key")
+
+    def test_a_head_that_changes_under_an_old_updated_time_is_movement(self):
+        self.stalled()   # the head is first seen
+        self.late()
+        self.assertEqual(len(self.stalled()), 1)
+        self.set_lists(head="c" * 40)
+        self.assertEqual(self.stalled(), [])
+        self.late()
+        self.assertEqual(len(self.stalled()), 1)
+
+    def test_an_issue_touched_after_a_wake_makes_a_new_stretch_when_it_stalls_again(self):
+        self.late()
+        (first,) = self.stalled()
+        self.set_lists(at=self.world.clock.now())
+        self.assertEqual(self.stalled(), [])
+        self.late()
+        (second,) = self.stalled()
+        self.assertNotEqual(first.key, second.key)
+
+    def test_a_moved_head_issue_or_too_early_gives_none(self):
+        self.late(1.5)
+        self.assertEqual(self.stalled(), [])
+        self.late(1)
+        self.assertEqual(len(self.stalled()), 1)
+        self.set_lists(at=self.world.clock.now() - 60)
+        self.assertEqual(self.stalled(), [])
+        self.set_lists(pr=False, at=self.t0)
+        (wake,) = self.stalled()
+        self.assertIn("on acme/widget-service#2", wake.summary, "no pull request yet: the issue is the reference and its time the signal")
+
+    def test_each_guard_gives_none(self):
+        self.late()
+        self.assertEqual(len(self.stalled()), 1, "the same fixture with no guard wakes")
+        cfg = self.world.engine.config
+        for name, arrange in (
+                ("in progress", lambda: self.set_lists(checks=["success", "in_progress"])),
+                ("queued", lambda: self.set_lists(checks=["queued"])),
+                ("pr awaiting label", lambda: self.set_lists(pr_labels=[sb.awaiting_label(cfg)])),
+                ("issue awaiting label", lambda: self.set_lists(issue_labels=[sb.awaiting_cos_label(cfg)])),
+                ("reminder", lambda: sb.add_reminder(self.world.state, "coder", self.world.clock.now() + 600, self.world.clock.now(), "look", issue=2)),
+                ("question", lambda: self.report("question", "which one?")),
+                ("decision", lambda: (self.world.state / sb.DECISIONS_FILE).write_text(json.dumps({"decisions": [
+                    {"tier": "human", "kind": "captain", "repo": self.REPO, "number": 9}], "errors": []})))):
+            with self.subTest(name):
+                self.setUp()
+                self.late()
+                arrange()
+                self.assertEqual(self.stalled(), [])
+
+    def test_a_closing_report_and_a_closed_assignment_get_none(self):
+        self.late()
+        self.report("done", "finished")
+        self.assertEqual(self.stalled(), [])
+        self.setUp()
+        self.late()
+        self.world.engine.hub = types.SimpleNamespace(closed_issue_snapshot=lambda: {"%s#2" % self.REPO: {"labels": [], "at": 1}})
+        self.assertEqual(self.stalled(), [])
+
+    def test_a_retired_worker_gets_none(self):
+        self.late()
+        self.assertEqual(len(self.stalled()), 1)
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {"coder": {"at": int(self.world.clock.now()), "by": "x", "reason": "y", "session": self.world.sessions["coder"], "auto": False}})
+        self.assertEqual(self.stalled(), [])
+
+    def test_an_idle_worker_is_the_seam_rules_alone(self):
+        self.stop("all quiet")
+        self.world.tick(1)
+        self.late()
+        self.assertEqual(self.stalled(), [], "an idle worker is woken by the idle-at-a-seam rule only, never a second time")
+
+    def test_a_not_whole_input_gives_none(self):
+        self.late()
+        for name in ("issues:" + self.REPO, "decisions", "pulls:" + self.REPO):
+            with self.subTest(name):
+                held = dict(self.world.engine.read_whole[name])
+                sb.read_mark(self.world.engine, name, False, "cut", self.world.clock.now())
+                self.assertEqual(self.stalled(), [])
+                self.world.engine.read_whole[name] = held
+        self.assertEqual(len(self.stalled()), 1)
+
+    def test_the_pulls_mark_comes_from_ci_record_pass_and_is_not_whole_when_the_list_is_cut_or_fails(self):
+        engine = self.world.engine
+        self.late()
+        self.assertEqual(len(self.stalled()), 1, "(a) a clean list is whole and the stall wakes")
+        self.hub.fail = True
+        self.world.tick(sb.CI_RECORD_LIST_TTL + 1)
+        sb.ci_record_pass(engine, self.world.clock.now())
+        self.assertEqual(sb.whole(engine, "pulls:" + self.REPO)[0], False)
+        self.assertEqual(self.stalled(), [], "(c) a failing read is not whole")
+        self.hub.fail = False
+        self.world.tick(sb.CI_RECORD_LIST_TTL + 1)
+        sb.ci_record_pass(engine, self.world.clock.now())
+        self.assertTrue(sb.whole(engine, "pulls:" + self.REPO)[0])
+        self.assertEqual(len(self.stalled()), 1, "and a clean read is whole again")
+        self.hub.cut = True
+        self.world.tick(sb.CI_RECORD_LIST_TTL + 1)
+        sb.ci_record_pass(engine, self.world.clock.now())
+        self.assertEqual(self.stalled(), [], "(b) a list cut at the page cap is not whole")
+
+    def test_the_pulls_mark_is_not_whole_in_a_process_that_never_ran_the_pass(self):
+        self.late()
+        self.world.engine.read_whole.pop("pulls:" + self.REPO)
+        self.assertFalse(sb.whole(self.world.engine, "pulls:" + self.REPO)[0])
+        self.assertEqual(self.stalled(), [])
+
+    def test_a_list_not_re_read_for_20_minutes_is_not_judged(self):
+        self.late()
+        self.assertEqual(len(self.stalled()), 1)
+        self.world.tick(sb.STALLED_LIST_MAX_AGE - 1000)
+        self.assertEqual(len(self.stalled()), 1, "the list is still young enough")
+        self.world.tick(1100)
+        self.assertEqual(self.stalled(), [], "the pass stopped re-reading: no judgement on an old list")
+
+    def test_the_newest_moved_pull_request_is_the_one_judged(self):
+        self.late()
+        at = sb.iso(self.world.clock.now() - 30)
+        self.hub.records.append({"number": 12, "body": "PLAN: https://github.com/%s/issues/2\n" % self.REPO, "updated_at": at, "head": {"sha": "d" * 40}, "labels": []})
+        self.world.engine.__dict__.pop("ci_record_state")
+        sb.ci_record_pass(self.world.engine, self.world.clock.now())
+        self.assertEqual(self.stalled(), [], "the second open pull request moved 30 seconds ago")
+
+    def test_the_rule_reads_no_gh(self):
+        self.late()
+        calls = []
+        self.world.engine.gh_runner = lambda *a, **k: calls.append(a) or (_ for _ in ()).throw(AssertionError("gh called"))
+        self.assertEqual(len(self.stalled()), 1)
+        self.assertEqual(calls, [])
+
+    def test_the_streak_is_ended_by_another_kind_and_the_threshold_is_config(self):
+        self.report("blocked", "x")
+        self.report("working", "y")
+        self.late(1.5)
+        self.assertEqual(self.stalled(), [])
+        self.world.engine.config["stalled_working_hours"] = 1
+        (wake,) = self.stalled()
+        self.assertIn("1 working reports", wake.summary)
+
+    def test_an_unreadable_decision_file_or_reminder_file_and_a_past_reminder(self):
+        self.late()
+        sb.add_reminder(self.world.state, "coder", self.world.clock.now() - 60, self.world.clock.now() - 120, "look", issue=2)
+        self.assertEqual(len(self.stalled()), 1, "a reminder already past does not hide a stall")
+        (self.world.state / sb.DECISIONS_FILE).write_text(json.dumps({"decisions": ["junk"], "errors": []}))
+        self.assertEqual(len(self.stalled()), 1, "a malformed entry is skipped, not a crash")
+        (self.world.state / sb.DECISIONS_FILE).write_text("not json")
+        self.assertEqual(self.stalled(), [], "an unreadable decision list is no evidence")
+        (self.world.state / sb.DECISIONS_FILE).write_text(json.dumps({"decisions": [], "errors": []}))
+        (self.world.state / "reminders.json").write_text("{bad")
+        self.assertEqual(self.stalled(), [], "an unreadable reminder file is no evidence")
+
+    def test_a_legacy_report_record_with_no_streak_gives_none(self):
+        self.late()
+        path = self.world.state / sb.LAST_REPORT_FILE
+        data = json.loads(path.read_text())
+        for key in ("work_n", "work_since"):
+            data["coder"].pop(key)
+        path.write_text(json.dumps(data))
+        self.assertEqual(self.stalled(), [])
+
+    def test_a_bad_threshold_is_refused(self):
+        with self.assertRaises(sb.ConfigError):
+            sb.validate_config({"stalled_working_hours": 0})
+
+    def test_the_wake_redacts_a_line_an_older_file_holds_raw(self):
+        self.late()
+        path = self.world.state / sb.LAST_REPORT_FILE
+        data = json.loads(path.read_text())
+        data["coder"]["text"] = "using ghp_" + "a" * 36
+        path.write_text(json.dumps(data))
+        self.assertNotIn("ghp_", self.stalled()[0].summary)
+
+    def test_a_token_in_the_last_report_is_redacted_when_stored(self):
+        self.report("working", "using ghp_" + "a" * 36)
+        self.late()
+        self.assertNotIn("ghp_", self.stalled()[0].summary)
+        self.assertNotIn("ghp_", (self.world.state / sb.LAST_REPORT_FILE).read_text())
+
+
 class TestStoppedNews(PR4Base):
     def make_world(self, mode="on", **kwargs):
         config = {"jev": {"replay": write_report_replay(self.home, STOPPED_NEWS_RULES)},
@@ -22091,8 +22405,11 @@ def sweep_issue(number, body="", labels=(), pr=False, author=None, created=None,
     return record
 
 
-def sweep_comment(number, body, at):
-    return {"issue_url": "https://api.github.com/repos/acme/api/issues/%d" % number, "body": body, "created_at": at}
+def sweep_comment(number, body, at, cid=None):
+    out = {"issue_url": "https://api.github.com/repos/acme/api/issues/%d" % number, "body": body, "created_at": at}
+    if cid is not None:
+        out["id"] = cid
+    return out
 
 
 class TestSweep(Base):
@@ -22112,9 +22429,15 @@ class TestSweep(Base):
     def at(self, ago_days=0):
         return sb.iso(self.world.clock.now() - ago_days * 86400)
 
+    def sweep_real(self, decisions, errors=()):
+        """The REAL notice reader, then the REAL sweep (production runs them in this order in every pass)."""
+        now = self.world.clock.now()
+        sb.decisions_from_notices(self.engine, now)
+        return sb.sweep_decisions(self.engine, list(decisions), now, errors)
+
     def sweep(self, decisions=(), **cfg):
         self.engine.config["sweep"].update(cfg)
-        return sb.sweep_decisions(self.engine, list(decisions), self.world.clock.now())
+        return self.sweep_real(decisions)
 
     def found(self):
         return sorted((e["detail"]["kind"], e["detail"]["ref"]) for e in self.world.audit() if e["event"] == "sweep.finding"
@@ -22248,23 +22571,101 @@ class TestSweep(Base):
         self.hub.comments = [sweep_comment(2, "waiting on Alex", self.at(1))]
         old = dict(self.human(40), tier="cos", since=sb.iso(self.world.clock.now() - 3 * 3600))
         errors = [{"source": "github", "error": "issues of acme/api that wait on you are not read yet"}]
-        sb.sweep_decisions(self.engine, [old], self.world.clock.now(), errors)
+        self.sweep_real([old], errors)
         self.assertEqual(self.found(), [("S1a", "acme/api#1"), ("S2", "acme/api#10"), ("S5", "d40")])   # S3 waits
         current = sb.sweep_summary(self.world.state)
         self.assertEqual([(d["for"], d["overdue"]) for d in current["deferred"]], [("acme/api", False)])
         self.world.tick(1)
-        sb.sweep_decisions(self.engine, [old], self.world.clock.now(), [])
+        self.sweep_real([old])
         self.assertIn(("S3", "acme/api#2"), self.found())
         self.assertEqual(sb.sweep_summary(self.world.state)["deferred"], [])
+
+    def real_pass(self, decisions, tick=1):
+        """One pass through the REAL notice reader and the REAL sweep: the sweep gets the list the notice reader marked."""
+        self.world.tick(tick)
+        now = self.world.clock.now()
+        entries, errors = sb.decisions_from_notices(self.engine, now)
+        sb.sweep_decisions(self.engine, list(decisions), now, errors)
+
+    def test_s13_a_first_pass_whose_notice_read_is_not_whole_raises_no_s3_and_the_next_whole_pass_raises_the_genuine_one(self):
+        self.hub.open = {2: sweep_issue(2, "x")}
+        report = {"id": "r1", "kind": "report", "tier": "cos", "repo": "acme/api", "ask": 9, "since": self.at(), "title": "waiting on Alex for #2"}
+        aged = dict(self.human(40), tier="cos", since=sb.iso(self.world.clock.now() - 3 * 3600))   # S5: stale for cos unless the owner's tier holds it
+        sb.record_pr_notice(self.world.state, "acme/api", 50, "platform", "", self.world.clock.now())
+        self.gh = FakeGhPr({50: (1, "", "HTTP 502")})                               # a restart's first pass: the noticed PR cannot be read
+        self.engine.gh_runner = self.gh
+        self.real_pass([report, aged])
+        self.assertEqual(sb.whole(self.engine, "notices")[0], False)
+        self.assertEqual(self.found(), [])                                           # no S3 (nor S2, S5) from a list that is not whole
+        self.assertEqual([e for e in self.world.audit() if e["event"] == "sweep.withdrawn"], [])
+        self.gh.answers[50] = (0, pr_view_json(), "")
+        self.real_pass([report, aged], sb.PR_FACTS_TTL + 1)
+        self.assertEqual(sb.whole(self.engine, "notices")[0], True)
+        self.assertEqual(self.found(), [("S3", "acme/api#2"), ("S5", "d40")])      # the genuine ones, once
+
+    def finding_lines(self, kind):
+        return [e["detail"] for e in self.world.audit() if e["event"] == "sweep.finding" and e["detail"].get("kind") == kind]
+
+    def test_s14_a_finding_names_what_raised_it_a_comment_or_a_report_and_the_phrase(self):
+        self.hub.open = {2: sweep_issue(2, "x"), 3: sweep_issue(3, "x")}
+        self.hub.comments = [sweep_comment(2, "ok\nwaiting on Alex for a yes", self.at(1), cid=777)]
+        report = {"id": "r1", "kind": "report", "tier": "cos", "repo": "acme/api", "ask": 9, "since": self.at(), "title": "held for Alex on #3"}
+        self.sweep([report])
+        by_ref = {d["ref"]: d for d in self.finding_lines("S3")}
+        self.assertEqual((by_ref["acme/api#2"]["source"], by_ref["acme/api#2"]["match"]), ("comment:777", "waiting on Alex"))
+        self.assertEqual((by_ref["acme/api#3"]["source"], by_ref["acme/api#3"]["match"]), ("report:r1", "held for Alex"))
+        self.assertLessEqual(max(len(d["match"]) for d in by_ref.values()), 80)
+
+    def test_s15_the_re_alarm_window_survives_a_restart(self):
+        self.hub.open = {2: sweep_issue(2, "x")}
+        self.hub.comments = [sweep_comment(2, "waiting on Alex", self.at(1), cid=5)]
+        pending = lambda: [k for k in self.engine.sweep.facts]
+        self.world.tick(1)
+        self.sweep_real([])
+        self.assertEqual(len(pending()), 1)                                          # raised once
+        self.engine.sweep = None                                                     # the daemon restarts: memory only is gone
+        self.world.tick(3600)
+        self.sweep_real([])
+        self.assertEqual(pending(), [])                                              # inside the window: not raised again
+        self.engine.sweep = None
+        self.world.tick(7 * 3600)
+        self.sweep_real([])
+        self.assertEqual(len(pending()), 1)                                          # past the window: once
+
+    def test_s14_an_s2_finding_names_the_body_or_the_comment_that_raised_it(self):
+        self.engine.config["triage"] = {"our_logins": ["bot"]}
+        self.hub.open = {10: sweep_issue(10, "Held for Alex", pr=True), 12: sweep_issue(12, "fine", pr=True)}
+        self.hub.comments = [sweep_comment(12, "waiting on alex", self.at(1), cid=4242)]
+        self.sweep()
+        by_ref = {d["ref"]: d for d in self.finding_lines("S2")}
+        self.assertEqual(by_ref["acme/api#10"]["source"], "body")
+        self.assertEqual(by_ref["acme/api#12"]["source"], "comment:4242")
+
+    def test_s15_a_corrupt_or_odd_alarm_memory_is_ignored_and_the_sweep_still_raises(self):
+        self.hub.open = {2: sweep_issue(2, "x")}
+        self.hub.comments = [sweep_comment(2, "waiting on Alex", self.at(1), cid=5)]
+        path = self.world.state / sb.SWEEP_ALARMED_FILE
+        for text in ("{nope", "[]", json.dumps({"S3 acme/api#2": {"at": "x"}, "ZZ a#1": {"at": 1}, "S3": {"at": True}})):
+            with self.subTest(text=text):
+                path.write_text(text)
+                self.engine.sweep = None
+                self.world.tick(1)
+                self.sweep_real([])
+                self.assertEqual(len(self.engine.sweep.facts), 1)                    # raised: nothing trustworthy was remembered
+        with mock.patch.object(sb, "_write_small", side_effect=OSError("disk full")):
+            self.engine.sweep = None
+            self.world.tick(7 * 3600)
+            self.sweep_real([])                                                      # a failed save is tolerated
+        self.assertEqual(len(self.engine.sweep.facts), 1)
 
     def test_a_deferral_that_never_ends_is_bounded_and_shown_as_overdue(self):
         self.hub.open = {2: sweep_issue(2, "x")}
         self.hub.comments = [sweep_comment(2, "waiting on Alex", self.at(1))]
         errors = [{"source": "reports", "error": "cannot read the boss transcript"}]
-        sb.sweep_decisions(self.engine, [], self.world.clock.now(), errors)
+        self.sweep_real([], errors)
         self.assertEqual(self.found(), [])
         self.world.tick(sb.SWEEP_DEFER_SECONDS + 1)
-        sb.sweep_decisions(self.engine, [], self.world.clock.now(), errors)
+        self.sweep_real([], errors)
         self.assertEqual(self.found(), [("S3", "acme/api#2")])    # runs after the bound, the fresh check still guards it
         (item,) = sb.sweep_summary(self.world.state)["deferred"]
         self.assertEqual((item["for"], item["overdue"]), ("*", True))
@@ -22601,7 +23002,7 @@ class TestSweep(Base):
         del self.engine.config["sweep"]
         self.hub.open = {1: sweep_issue(1, "## Decision required\nx")}
         self.hub.closed = {30}
-        kept = sb.sweep_decisions(self.engine, [self.human(30)], self.world.clock.now())
+        kept = self.sweep_real([self.human(30)])
         self.assertEqual(len(kept), 1)                                   # nothing withdrawn
         self.assertEqual(self.found(), [("S1a", "acme/api#1")])         # findings audited
         self.assertEqual((self.engine.sweep.facts, self.bound()()), ({}, []))   # nobody woken
@@ -22618,7 +23019,7 @@ class TestSweep(Base):
     def test_sweep_false_turns_it_fully_off(self):
         self.engine.config["sweep"] = False
         self.hub.open = {1: sweep_issue(1, "## Decision required\nx")}
-        kept = sb.sweep_decisions(self.engine, [self.human(1)], self.world.clock.now())
+        kept = self.sweep_real([self.human(1)])
         self.assertEqual((len(kept), self.hub.reads, self.hub.single, self.found()), (1, [], [], []))
         self.assertIsNone(sb.sweep_summary(self.world.state))
         self.assertIs(sb.validate_config({"opencode": FAKE_OPENCODE, "sweep": False})["sweep"], False)
@@ -22667,10 +23068,13 @@ class FakeTriageHub:
         self.open, self.comments, self.closed, self.live = {}, {}, {}, {}   # per repo: open {n: rec}; comments [rec]; closed {label: [rec]}
         self.pulls = {}   # per repo: [recently closed pull request records] (#384)
         self.calls, self.unreadable = [], set()
+        self.fail = []   # path fragments whose list reads fail (one kind of unit at a time)
         self.timelines, self.cut = {}, set()   # (repo, number) -> [timeline events] (#576); numbers whose timeline page is not the whole timeline
 
     def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
         self.calls.append(path)
+        if any(f in path for f in self.fail):
+            raise sb.GitHubUnavailable("HTTP 502: a partial restart read")
         repo = re.search(r"repos/([^/]+/[^/]+)/", path).group(1)
         if repo in self.unreadable:
             raise sb.GitHubUnavailable("HTTP 404: Not Found")
@@ -22783,6 +23187,7 @@ class TestTriage(Base):
         self.engine.config["triage"].update(cfg)
         for _ in range(passes):
             self.world.tick(1)
+            sb.decisions_from_notices(self.engine, self.world.clock.now())               # the REAL notice reader marks its input, as in every pass
             sb.triage_pass(self.engine, list(decisions), self.world.clock.now(), errors)
 
     def found(self):
@@ -22795,6 +23200,102 @@ class TestTriage(Base):
     def charter(self):
         self.add(1, created=30, updated=0.1, labels=["x:orchestrator", "kind"], assignees=["bot"], body="## Decision required\nx")
         self.add(2, created=20, updated=0.1, parent=1, labels=["kind"], body="Next: go")
+
+    def test_t1_and_t11_wait_while_the_fleet_was_not_read_whole_and_come_back_with_a_whole_one(self):
+        self.charter()
+        self.add(10, created=2, labels=["kind"])                         # no assignee, no chain: T1 once the fleet is known
+        with mock.patch.object(self.engine.herdr, "agent_list", side_effect=sb.HerdrError("down")):
+            self.engine.discover(self.world.clock.now())                 # the REAL discovery, herdr unreachable
+        self.assertFalse(sb.whole(self.engine, "agents")[0])
+        self.go(passes=3)
+        self.assertEqual(self.only("T1"), [])                            # no owner is no evidence from a partial fleet
+        self.assertIn("whole.skipped", [e["event"] for e in self.world.audit()])
+        self.engine.discover(self.world.clock.now())
+        self.go(passes=3)
+        self.assertEqual(self.only("T1"), ["acme/api#10"])               # the genuine finding
+
+    def test_t1_and_t11_records_survive_the_prune_while_the_fleet_is_not_whole_and_go_with_a_whole_pass(self):
+        self.charter()
+        self.add(10, created=2, labels=["kind"])
+        self.engine.discover(self.world.clock.now())
+        self.go(passes=3, enabled=True)
+        self.assertIn("T1 acme/api#10", self.engine.triage.seen)                     # listed once: the record exists
+        with mock.patch.object(self.engine.herdr, "agent_list", side_effect=sb.HerdrError("down")):
+            self.engine.discover(self.world.clock.now())
+        self.go(passes=3)
+        self.assertIn("T1 acme/api#10", self.engine.triage.seen)                     # its candidate was dropped, its record kept
+        self.engine.discover(self.world.clock.now())
+        self.go(passes=2)
+        self.assertIn("T1 acme/api#10", self.engine.triage.seen)                     # whole and still a finding: not new again
+        self.add(10, created=2, labels=["kind"], assignees=["bot"])                  # it is owned now
+        self.world.tick(sb.TRIAGE_TTL + 1)                                           # the cached list expires
+        self.go(passes=2)
+        self.assertNotIn("T1 acme/api#10", self.engine.triage.seen)                  # a whole pass without it: pruned
+
+    def test_the_per_repository_marks_follow_the_real_unit_reads_and_the_records_wait_for_all_of_them(self):
+        self.charter()
+        self.add(10, created=2, labels=["kind"])
+        self.engine.discover(self.world.clock.now())
+        self.go(passes=3, enabled=True)
+        names = ["issues", "comments", "merged", "closed"]
+        self.assertEqual([sb.whole(self.engine, "%s:acme/api" % n)[0] for n in names], [True] * 4)
+        self.assertIn("T1 acme/api#10", self.engine.triage.seen)
+        self.hub.unreadable.add("acme/api")                                          # every read of the repository fails now
+        self.world.tick(sb.TRIAGE_TTL + 1)
+        self.go(passes=2)
+        self.assertEqual([sb.whole(self.engine, "%s:acme/api" % n)[0] for n in names], [False] * 4)
+        self.assertIn("T1 acme/api#10", self.engine.triage.seen)                     # kept
+        self.hub.unreadable.discard("acme/api")
+        self.world.tick(sb.TRIAGE_TTL + 1)
+        self.go(passes=3)
+        self.assertEqual([sb.whole(self.engine, "%s:acme/api" % n)[0] for n in names], [True] * 4)
+
+    def test_the_once_only_parked_flag_survives_the_prune_while_the_issue_list_is_not_whole_and_goes_with_a_whole_pass(self):
+        self.charter()
+        self.add(152, created=5, updated=4, labels=["osuser:parked"], body="parked, see later")   # a park with no valid date
+        self.engine.discover(self.world.clock.now())
+        self.go(passes=3, enabled=True)
+        self.assertIn("PARKED acme/api#152", self.engine.triage.seen)                # flagged once: the record exists
+        self.hub.unreadable.add("acme/api")
+        self.world.tick(sb.TRIAGE_TTL + 1)
+        self.go(passes=2)
+        self.assertFalse(sb.whole(self.engine, "issues:acme/api")[0])
+        self.assertIn("PARKED acme/api#152", self.engine.triage.seen)                # the issue list was not whole: kept
+        self.hub.unreadable.discard("acme/api")
+        del self.hub.open["acme/api"][152]                                           # it left: a whole pass without it
+        self.world.tick(max(sb.TRIAGE_TTL, sb.TRIAGE_UNREADABLE_RETRY) + 1)
+        self.go(passes=10)                                                           # every input is read whole again
+        self.assertNotIn("PARKED acme/api#152", self.engine.triage.seen)
+
+    def test_each_rules_input_value_is_the_unit_its_candidates_are_read_from(self):
+        """A restart whose partial reads miss ONE kind of unit: the records of the rules that read that unit are kept, so the table's
+        values cannot drift from the reads (changing one rule's input makes its record be forgotten here)."""
+        self.charter()
+        self.add(30, created=9, updated=1.5, parent=1, labels=["kind"])                      # T3: an ask, quiet, no next step (reads comments)
+        self.add(130, created=60, labels=["kind"])
+        self.merged_pr(200, "Part of #130.")                                                 # T12 (reads merged)
+        closed = tri_issue(self.now, 100, created=9, labels=[self.USER, "kind"], state="closed")
+        self.hub.closed["acme/api"] = {self.USER: [closed]}                                  # T10 (reads closed)
+        self.engine.discover(self.world.clock.now())
+        self.go(passes=3, enabled=True)
+        for key in ("T3 acme/api#30", "T12 acme/api#130", "T10 acme/api#100"):
+            self.assertIn(key, self.engine.triage.seen, key)
+        cases = [("T3 acme/api#30", "comments", "issues/comments", ["comments"]),
+                 ("T12 acme/api#130", "merged", "/pulls?", ["merged"]),
+                 ("T10 acme/api#100", "closed", "state=closed&labels", ["closed:" + self.USER, "closed:" + self.COS])]
+        for key, name, fragment, units in cases:
+            with self.subTest(key=key):
+                for unit in units:
+                    self.engine.triage.units.pop(("acme/api", unit), None)                    # not yet read in this process
+                self.hub.fail = [fragment]
+                self.world.tick(sb.TRIAGE_TTL + 1)
+                self.go(passes=2)
+                self.assertFalse(sb.whole(self.engine, "%s:acme/api" % name)[0])
+                self.assertIn(key, self.engine.triage.seen)                                  # kept: its own unit was not read
+                self.hub.fail = []
+                self.world.tick(max(sb.TRIAGE_TTL, sb.TRIAGE_UNREADABLE_RETRY) + 1)
+                self.go(passes=10)
+                self.assertTrue(sb.whole(self.engine, "%s:acme/api" % name)[0])
 
     def test_t1_owner_missing_both_ways_and_the_grace_day(self):
         self.charter()
@@ -22907,6 +23408,19 @@ class TestTriage(Base):
         self.go()
         self.assertEqual(self.only("T7"), ["acme/api#70"])
         self.assertEqual((self.only("OO"), [f for f in self.found() if f[1] == "acme/api#75"]), ([], []))   # not even a flag
+
+    def test_the_t7_record_of_a_captain_pr_survives_while_the_decision_list_is_not_whole(self):
+        self.charter()
+        self.add(300, created=0.4, pr=True, body="MERGE: captain\nland it")         # ours, past the SLA, not in the decision list: T7
+        self.describe_pr(300)
+        sb.record_pr_notice(self.world.state, "acme/api", 300, "orch", "", self.now)
+        self.engine.discover(self.world.clock.now())
+        self.go(passes=3, enabled=True)
+        self.assertIn("T7 acme/api#300", self.engine.triage.seen)
+        self.go(passes=3, errors=[{"source": "github", "error": "not read yet"}])    # the list is not whole: a captain PR waits (never judged)
+        self.assertEqual(self.only("T7"), ["acme/api#300"])                          # (the earlier finding)
+        self.assertIn("T7 acme/api#300", self.engine.triage.seen)                    # its record is kept
+        self.go(passes=3)                                                            # a whole list that still lacks it: still T7, not new
 
     def test_t7_shapes_formal_review_signed_comment_old_head_captain_and_plain(self):
         self.charter()
@@ -24541,6 +25055,77 @@ class FakeOwnerlessHub(FakeTriageHub):
         return self.open_total.get(repo, len(self.open.get(repo, {})))
 
 
+class TestTriageRuleInputs(unittest.TestCase):
+    NAMES = {"agents", "decisions", "issues", "comments", "merged", "closed"}
+
+    def kinds(self):
+        kinds = set(sb.TRIAGE_KINDS)                                                 # every rule the triage can raise (a seen record is "<rule> <ref>")
+        kinds |= set(re.findall(r'"([A-Z][A-Z0-9]*) " \+', (REPO / "bin" / "triage_digest.py").read_text()))   # the key prefixes the seen-memory writers build
+        return kinds
+
+    def test_every_record_kind_the_writers_can_produce_has_an_input_set_of_registry_names(self):
+        kinds = self.kinds()
+        self.assertIn("PARKED", kinds)                                               # the regex must still find the writers' prefixes
+        for kind in sorted(kinds):
+            needs = sb.triage_inputs(kind)
+            self.assertIsNotNone(needs, "a record kind needs the inputs it judges: %s" % kind)
+            self.assertTrue(needs and set(needs) <= self.NAMES, kind)
+            if kind not in ("T5", "T6", "T10"):                                      # a kind that judges ours-or-not reads the running agents
+                self.assertIn("agents", needs, kind)
+
+    def test_the_other_owner_and_invalid_park_kinds_judge_the_union_of_every_rules_inputs(self):
+        union = {name for needs in sb.TRIAGE_RULE_INPUTS.values() for name in needs}
+        for kind in sb.TRIAGE_UNION_KINDS:
+            self.assertEqual(set(sb.triage_inputs(kind)), union, kind)               # derived from the table, never a second hand list
+        with mock.patch.dict(sb.TRIAGE_RULE_INPUTS, {"T99": ("newinput",)}):
+            self.assertIn("newinput", sb.triage_inputs("PARKED"))                    # a new rule's input is included at once
+
+    def marks(self, needs, bad=None, repo="acme/api"):
+        engine = types.SimpleNamespace(read_whole={}, _note=lambda *a, **k: None)
+        for name in self.NAMES | set(needs):
+            key = name if name in ("agents", "decisions") else "%s:%s" % (name, repo)
+            sb.read_mark(engine, key, name != bad, "" if name != bad else "why", 1.0)
+        return engine
+
+    def test_each_kind_is_kept_while_any_one_input_it_judges_is_not_whole_and_released_when_all_are(self):
+        for kind in sorted(self.kinds()):
+            needs = sb.triage_inputs(kind)
+            for bad in needs:
+                with self.subTest(kind=kind, bad=bad):
+                    self.assertTrue(sb.triage_digest_keep(self.marks(needs, bad))(kind, "acme/api#1"))   # that one input alone is not whole
+            with self.subTest(kind=kind, all="whole"):
+                self.assertFalse(sb.triage_digest_keep(self.marks(needs))(kind, "acme/api#1"))
+
+    def test_the_prune_keeps_the_records_of_a_rule_the_table_does_not_know(self):
+        keep = sb.triage_digest_keep(self.marks(("agents", "issues")))
+        self.assertFalse(keep("T2", "acme/api#1"))
+        with mock.patch.dict(sb.TRIAGE_RULE_INPUTS, {}, clear=True):
+            self.assertTrue(keep("T2", "acme/api#1"))                                # unknown: kept
+
+
+class TestReadWholeAuditTable(unittest.TestCase):
+    """#805: the docs audit lists every absence-driven consumer with its input, whether it checked before, and its fix or how it is guarded."""
+    NAMED = ("escalation-key prune", "triage seen-memory prune", "T5 and T6", "load alert", "stalled count", "sweep S2", "once-only memory",
+             "closed-label", "merged-label", "reminders prune", "temp janitor", "worktree reclaim", "container reaper", "retire", "auto-retire",
+             "delivered-message", "cursor prunes", "ownerless", "T1 and T11", "chat-clear offers", "notice expiry")
+
+    def rows(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        start = text.index("**Reads that are not whole: the audit of every absence-driven consumer (#805).**")
+        block = text[start:text.index("**The stale digest (#349).**", start)]
+        return [[c.strip() for c in line.strip().strip("|").split("|")] for line in block.splitlines() if line.startswith("| ") and not line.startswith("| ---") and not line.startswith("| Consumer")]
+
+    def test_every_named_consumer_has_a_row_with_all_four_columns_filled(self):
+        rows = self.rows()
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertEqual(len(row), 4, row)
+            self.assertTrue(all(row), row)
+        joined = " ".join(" ".join(r) for r in rows).lower()
+        for name in self.NAMED:
+            self.assertIn(name.lower(), joined, name)
+
+
 class TestOwnerlessSummary(Base):
     """#605: ownerless, quiet issues of a team repository are one daily line to the Chief of Staff and the repository's orchestrators; nothing is written to any issue."""
 
@@ -24588,6 +25173,26 @@ class TestOwnerlessSummary(Base):
             self.add(n, created=10, author="alice", labels=["agent:other-crew"])                # another crew's owner label: owned
         for n in range(200, 205):
             self.add(n, created=10, updated=1, author="alice")                                   # touched yesterday
+
+    def test_a_fleet_that_was_not_read_whole_raises_no_ownerless_line_and_the_next_whole_pass_raises_it(self):
+        self.populate()
+        with mock.patch.object(self.engine.herdr, "agent_list", side_effect=sb.HerdrError("down")):
+            self.engine.discover(self.world.clock.now())                             # the REAL discovery: herdr unreachable
+        self.assertFalse(sb.whole(self.engine, "agents")[0])
+        self.go()
+        self.assertEqual(self.told("cos"), [])                                       # nothing is ownerless on evidence from a partial fleet
+        self.engine.discover(self.world.clock.now())
+        self.assertEqual(sb.whole(self.engine, "agents"), (True, ""))
+        self.go()
+        self.assertEqual(len(self.lines("cos")), 1)                                  # the genuine line, once
+
+    def test_the_agents_mark_is_not_whole_when_the_discovery_raises_and_never_inherited(self):
+        self.engine.discover(self.world.clock.now())
+        self.assertTrue(sb.whole(self.engine, "agents")[0])
+        with mock.patch.object(self.engine.herdr, "agent_list", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                self.engine.discover(self.world.clock.now())
+        self.assertFalse(sb.whole(self.engine, "agents")[0])
 
     def test_s1_s2_one_line_with_the_count_the_oldest_age_and_five_links_and_nothing_per_issue(self):
         self.populate()
@@ -24761,6 +25366,72 @@ class TestOwnerlessSummary(Base):
         for bad in ({"repos": []}, {"repos": ["acme/web"], "days": 0}, {"repos": ["acme/web"], "limit": 5}, {"repos": ["acme/web"], "owner_labels": "agent:*"}, {"repos": ["acme/web"], "nope": 1}):
             with self.assertRaises(sb.ConfigError, msg=str(bad)):
                 sb.validate_triage_config({"triage": {"ownerless": bad}}, "config")
+
+    def with_map(self, mapping):
+        self.engine.config["triage"]["ownerless"]["repos"] = {self.TEAM: {"label_owners": mapping}, "acme/api": {}}
+
+    def count_in(self, line):
+        return int(re.search(r" (\d+) open issue\(s\) with no owner", line).group(1))
+
+    def test_label_owners_a_labelled_issue_is_owned_and_a_plain_one_is_not(self):
+        self.with_map({"lane:alpha": "alpha-lane"})
+        self.add(20, created=10, author="alice", labels=["lane:alpha"])
+        self.add(21, created=10, author="alice")
+        self.go(1)
+        (line,) = self.lines("cos")
+        self.assertEqual(self.count_in(line), 1)
+        self.assertIn("/issues/21", line)
+        self.assertNotIn("/issues/20", line)
+
+    def test_label_owners_an_owner_line_naming_a_known_orchestrator_is_owned(self):
+        self.with_map({"lane:alpha": "alpha-lane"})
+        self.add(20, created=10, author="alice", body="Intro\nOwner: orch-web-1\n")
+        self.add(21, created=10, author="alice")
+        self.go(1)
+        (line,) = self.lines("cos")
+        self.assertEqual(self.count_in(line), 1)
+        self.assertNotIn("/issues/20", line)
+
+    def test_label_owners_an_unknown_name_or_a_later_owner_line_stays_ownerless(self):
+        self.with_map({"lane:alpha": "alpha-lane"})
+        self.add(20, created=10, author="alice", body="Owner: nobody-holds-this-name\n")
+        self.add(21, created=10, author="alice", body="Owner: stranger\nOwner: orch-web-1\n")
+        self.go(1)
+        (line,) = self.lines("cos")
+        self.assertEqual(self.count_in(line), 2)
+
+    def test_an_empty_map_or_a_list_is_todays_behaviour(self):
+        for repos in ([self.TEAM, "acme/api"], {self.TEAM: {"label_owners": {}}, "acme/api": {}}, {self.TEAM: {}, "acme/api": {}}):
+            self.engine.config["triage"]["ownerless"]["repos"] = repos
+            self.hub.open[self.TEAM] = {}
+            self.add(20, created=10, author="alice", body="Owner: some-unknown-name\n")   # today any real name is an owner
+            self.add(21, created=10, author="alice")
+            self.go(1)
+            self.assertEqual(self.count_in(self.lines("cos")[-1]), 1, repos)
+            self.world.tick(86400 + 10)
+            sb.triage_state(self.engine).units.pop((self.TEAM, "ownerless"), None)
+
+    def test_label_and_lane_match_ignore_case_and_leading_punctuation(self):
+        self.with_map({"Lane:Alpha": "alpha-lane"})
+        self.add(20, created=10, author="alice", labels=["lane:alpha"])
+        self.add(21, created=10, author="alice", body="Owner: @Orch-Web-1 (primary)\n")
+        self.add(22, created=10, author="alice")
+        self.go(1)
+        (line,) = self.lines("cos")
+        self.assertEqual(self.count_in(line), 1)
+        self.assertIn("/issues/22", line)
+
+    def test_a_bad_label_owners_shape_is_a_named_error(self):
+        for bad in ({"repos": {"acme/web": {"label_owners": ["x"]}}}, {"repos": {"acme/web": {"label_owners": {"x": 3}}}},
+                    {"repos": {"acme/web": {"label_owners": {"": "lane"}}}}, {"repos": {"acme/web": {"nope": {}}}}, {"repos": {"not a repo": {}}}):
+            with self.assertRaises(sb.ConfigError, msg=str(bad)) as caught:
+                sb.validate_triage_config({"triage": {"ownerless": bad}}, "config")
+            self.assertIn("ownerless", str(caught.exception))
+        sb.validate_triage_config({"triage": {"ownerless": {"repos": {"acme/web": {"label_owners": {"lane:alpha": "alpha-lane"}}}}}}, "config")
+
+    def test_the_docs_describe_label_owners(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        self.assertIn("label_owners", text[text.index("**Ownerless, quiet issues"):text.index("**Ownerless, quiet issues") + 9000])
 
     def test_one_definition_of_has_an_owner_is_shared_with_t1(self):
         import inspect
@@ -25055,17 +25726,29 @@ class TestTriageT5Rollup(Base):
         d["number" if kind == "captain" else "ask"] = n
         return d
 
-    def run_pass(self, decisions, tick=1):
+    def read_notices(self):
+        """Run the production notice reader; `self.notices_cut` makes one noticed PR unread (the reader's own budget skip)."""
+        now = self.world.clock.now()
+        if getattr(self, "notices_cut", False):
+            item = {"repo": "acme/api", "number": 99, "created": now, "note": None, "from": "platform"}
+            skipped = {"at": 0, "facts": None, "stale": True, "skipped": True, "confirmed": None, "error": "budget"}
+            with mock.patch.object(sb, "read_pr_notices", return_value=[item]), mock.patch.object(sb, "notice_facts", return_value=skipped):
+                sb.decisions_from_notices(self.engine, now)
+        else:
+            sb.decisions_from_notices(self.engine, now)
+
+    def run_pass(self, decisions, tick=1, errors=()):
         """One pass; returns (T5 refs in the digest, the roll-up lines queued)."""
         self.world.tick(tick)
         seen_before = set(getattr(self.engine, "triage", None).facts) if getattr(self.engine, "triage", None) else set()
         shown = []
         real = sb.triage_queue_fact
         def spy(state, due, *a, **k):
-            shown.extend(ref for rule, ref in due if rule == "T5")
+            shown.extend(ref for rule, ref in due if rule in ("T5", "T6"))
             return real(state, due, *a, **k)
         with mock.patch.object(sb, "triage_queue_fact", spy):
-            sb.triage_pass(self.engine, decisions, self.world.clock.now(), ())
+            self.read_notices()                                                      # the REAL notice reader marks the input
+            sb.triage_pass(self.engine, decisions, self.world.clock.now(), errors)
         lines = [v[0] for k, v in self.engine.triage.facts.items() if k.startswith("triage.rollup") and k not in seen_before]
         return shown, lines
 
@@ -25126,16 +25809,112 @@ class TestTriageT5Rollup(Base):
         self.assertEqual(self.run_pass(ds, 3600)[0], ["acme/api#7"])
         self.assertEqual(self.run_pass(ds, 3600)[0], [])
 
-    def test_s6_t6_is_not_rolled_up_and_keeps_its_backoff(self):
-        ds = [self.decision(51, hours=72, kind="captain")]
-        listed = []
+    def seen_keys(self):
+        return sorted(self.engine.triage.seen)
+
+    def test_s6_an_owner_tier_t6_is_listed_once_then_only_in_the_roll_up_with_t5(self):
+        ds = [self.decision(51, hours=72, kind="captain"), self.decision(7)]
+        shown, _ = self.run_pass(ds)
+        self.assertEqual(sorted(shown), ["acme/api#51", "acme/api#7"])
         for _ in range(3):
-            real = sb.triage_queue_fact
-            with mock.patch.object(sb, "triage_queue_fact", lambda s, due, *a, **k: (listed.extend(due), real(s, due, *a, **k))[1]):
-                self.world.tick(1)
-                sb.triage_pass(self.engine, ds, self.world.clock.now(), ())
-        self.assertEqual(listed, [("T6", "acme/api#51")])                            # shown once, then the day's backoff
-        self.assertFalse([k for k in self.engine.triage.facts if k.startswith("triage.rollup")])
+            self.assertEqual(self.run_pass(ds, 3600)[0], [])                         # not again, backoff or no backoff
+        lines = self.run_pass(ds, self.DAY)[1]
+        self.assertEqual(lines, ["2 items waiting on the owner for more than a day: #7 #51"])
+
+    def test_s6b_a_t6_not_at_the_owners_tier_keeps_its_backoff_and_stays_out_of_the_roll_up(self):
+        ds = [self.decision(51, hours=72, kind="captain")]
+        self.run_pass(ds)
+        pair = ("T6", "acme/api#51")
+        seen = self.engine.triage.seen
+        self.assertIn("T6 acme/api#51", seen)
+        due, _ = sb.triage_digest.select(seen, {}, {}, [pair], self.now + 3 * self.DAY, True, None, 86400.0, 366, ())
+        self.assertEqual(due, [pair])                                                # not in `once`: the day's backoff lists it again
+        self.assertIsNone(sb.triage_digest.rollup(seen, {}, [], self.now + 3 * self.DAY))
+
+    def test_a_not_whole_pass_keeps_the_t5_and_t6_records_and_a_whole_pass_without_an_item_prunes_it(self):
+        ds = [self.decision(7), self.decision(51, hours=72, kind="captain")]
+        self.run_pass(ds)
+        self.assertEqual(self.seen_keys(), ["T5 acme/api#7", "T6 acme/api#51"])
+        self.run_pass([], 3600, errors=[{"source": "github", "error": "not read yet"}])
+        self.assertEqual(self.seen_keys(), ["T5 acme/api#7", "T6 acme/api#51"])      # kept: the list was not whole
+        self.assertEqual(sb.whole(self.engine, "decisions")[0], False)
+        self.assertIn("whole.skipped", [e["event"] for e in self.world.audit()])
+        self.run_pass(ds[1:], 3600)
+        self.assertEqual(self.seen_keys(), ["T6 acme/api#51"])                       # a whole pass without #7: forgotten
+        self.run_pass([], 3600)
+        self.assertEqual(self.seen_keys(), [])
+
+    def test_a_returning_item_after_a_whole_absence_is_new_once(self):
+        ds = [self.decision(51, hours=72, kind="captain")]
+        self.run_pass(ds)
+        self.run_pass([], 3600)
+        self.assertEqual(self.run_pass(ds, 3600)[0], ["acme/api#51"])
+        self.assertEqual(self.run_pass(ds, 3600)[0], [])
+
+    def test_a_restart_with_a_first_pass_that_is_not_whole_then_a_whole_pass_lists_nothing_already_listed(self):
+        ds = [self.decision(7), self.decision(51, hours=72, kind="captain")]
+        self.run_pass(ds)
+        self.engine.triage.seen = self.engine.triage.meta = None                     # a restart: memory in the engine is gone
+        self.engine.__dict__.pop("read_whole", None)
+        self.assertEqual(sb.whole(self.engine, "decisions"), (False, "not read yet in this process"))
+        self.assertEqual(self.run_pass([], 3600, errors=[{"source": "github", "error": "not read yet"}])[0], [])
+        self.assertEqual(self.run_pass(ds, 3600)[0], [])                             # nothing listed again
+        self.assertEqual(self.seen_keys(), ["T5 acme/api#7", "T6 acme/api#51"])
+
+    def test_the_records_of_a_repository_whose_issue_list_was_not_read_whole_are_kept(self):
+        for damage in ({"error": "rate limited"}, {"truncated": True}):
+            with self.subTest(damage=damage):
+                self.run_pass([self.decision(7)], 3600)                              # past the digest hour: it is listed
+                unit = self.engine.triage.units[("acme/api", "issues")]
+                self.engine.triage.units[("acme/api", "issues")] = dict(unit, **damage)
+                self.run_pass([], 60)                                                # the decision list is whole and has no #7
+                self.assertEqual(sb.whole(self.engine, "decisions")[0], True)
+                self.assertEqual(sb.whole(self.engine, "issues:acme/api")[0], False)
+                self.assertEqual(self.seen_keys(), ["T5 acme/api#7"])                # kept: its repository's list was not whole
+                self.engine.triage.units[("acme/api", "issues")] = unit
+                self.run_pass([], 60)                                                # a whole pass without it: forgotten
+                self.assertEqual(self.seen_keys(), [])
+
+    def test_a_skipped_prune_says_so_once_per_pass_and_input(self):
+        self.run_pass([self.decision(7)])
+        self.run_pass([], 3600, errors=[{"source": "github", "error": "not read yet"}])
+        keep = sb.triage_digest_keep(self.engine)
+        self.assertTrue(keep("T5", "acme/api#7") and keep("T6", "acme/api#9"))      # two prunes in one pass
+        lines = [e for e in self.world.audit() if e["event"] == "whole.skipped" and e["detail"]["input"] == "decisions"]
+        self.assertEqual(len(lines), 1)
+
+    def test_a_pass_with_unread_notices_is_not_whole_and_keeps_the_t6_records(self):
+        ds = [self.decision(51, hours=72, kind="captain"), self.decision(7)]
+        self.run_pass(ds)
+        self.assertEqual(self.seen_keys(), ["T5 acme/api#7", "T6 acme/api#51"])
+        self.notices_cut = True                                                       # no error, but the real notice reader skips a noticed PR
+        self.run_pass([], 3600)
+        self.assertEqual(sb.whole(self.engine, "decisions"), (False, "1 notices unread"))
+        self.assertEqual(self.seen_keys(), ["T5 acme/api#7", "T6 acme/api#51"])      # kept
+        self.notices_cut = False
+        self.assertEqual(self.run_pass(ds, 3600)[0], [])                             # nothing already listed is listed again
+        self.assertEqual(sb.whole(self.engine, "decisions"), (True, ""))
+        self.run_pass(ds[:1], 3600)
+        self.assertEqual(self.seen_keys(), ["T6 acme/api#51"])                       # a whole pass without #7 prunes it
+
+    def test_the_registry_adds_no_read_to_a_pass(self):
+        ds = [self.decision(7)]
+        self.run_pass(ds, 3600)
+        before = len(self.hub.calls)
+        self.run_pass(ds, 3600)
+        with_registry = len(self.hub.calls) - before
+        with mock.patch.object(sb, "read_mark", lambda *a, **k: None):             # the same pass with the registry switched off
+            before = len(self.hub.calls)
+            self.run_pass(ds, 3600)
+            without = len(self.hub.calls) - before
+        self.assertEqual(with_registry, without)
+
+    def test_the_registry_marks_an_input_whole_only_after_a_clean_read_and_a_restart_clears_it(self):
+        self.assertEqual(sb.whole(self.engine, "decisions"), (False, "not read yet in this process"))
+        sb.read_mark(self.engine, "decisions", False, "errors", 1.0)
+        self.assertEqual(sb.whole(self.engine, "decisions"), (False, "errors"))
+        sb.read_mark(self.engine, "decisions", True, "", 2.0)
+        self.assertEqual(sb.whole(self.engine, "decisions"), (True, ""))
 
     def test_s7_the_memory_is_in_the_seen_file_of_the_state_dir(self):
         self.run_pass([self.decision(7)])
@@ -25330,6 +26109,104 @@ class TestPlanWake(Base):
         self.assertEqual(self.to("orch"), [])
         self.assertEqual(len(self.to("cos")), 1)
         self.assertTrue(self.to("cos")[0].endswith("plan check FAIL"))
+
+    def watch_reads(self):
+        """The single-issue reads made from inside the plan wake pass (other triage rules read issues too), as (path, fresh).
+        Like the real hub, a read that is not fresh answers with the CACHED record, a fresh one with the live record."""
+        self.reads_made = []
+        original = self.hub._read_one
+        def counting(repo, path, now, fresh=False):
+            if any(f.name == "plan_wake_pass" for f in traceback.extract_stack()):
+                self.reads_made.append((path, fresh))
+            if not fresh:
+                number = int(path.rsplit("/", 1)[1])
+                if number in self.hub.open.get(repo, {}):
+                    return dict(self.hub.open[repo][number])
+            return original(repo, path, now, fresh)
+        self.hub._read_one = counting
+
+    def stale_ask(self, fresh=True):
+        self.watch_reads()
+        """#802: the cached ask body holds an old Done-when; `live` holds the current one (or nothing)."""
+        self.hub.open["acme/api"][2]["body"] = "## Intent\nx\nDone when: (1) an old clause."
+        if fresh:
+            self.hub.live.setdefault("acme/api", {})[2] = dict(self.hub.open["acme/api"][2], body="## Intent\nx\nDone when: " + GOOD_DONE_WHEN)
+
+    def reads(self):
+        return [c for c in self.reads_made]
+
+    def test_a_cached_mismatch_is_confirmed_against_one_fresh_read_and_reports_the_fresh_pass(self):
+        record = self.post(3, self.plan())
+        self.stale_ask()
+        self.go()
+        h = sb.plan_check.plan_hash(record["body"])
+        self.assertEqual(self.to("orch"), ["plan posted on #3: https://github.com/acme/api/issues/3#issuecomment-%d %s, plan check PASS" % (record["id"], h)])
+        self.assertEqual(self.reads(), [("issues/2", True)])   # once, fresh, for the ask that supplied the Done-when
+
+    def test_a_fresh_body_that_still_mismatches_says_fail_and_audits_the_defect(self):
+        notes = []
+        original = self.engine._note
+        self.engine._note = lambda kind, ref, detail=None: (notes.append((kind, detail)), original(kind, ref, detail))[1]
+        self.post(3, self.plan())
+        self.stale_ask(fresh=False)
+        self.go()
+        self.assertTrue(self.to("orch")[0].endswith("plan check FAIL"))
+        self.assertEqual(len(self.reads()), 1)
+        detail = [d for k, d in notes if k == "plan_wake.announced"][0]
+        self.assertTrue(detail["defect"])
+        self.assertFalse(detail["stale"])
+
+    def test_a_failed_re_read_says_the_check_may_be_stale(self):
+        self.post(3, self.plan())
+        self.stale_ask()
+        def failing(repo, path, now, fresh=False):
+            raise sb.GitHubUnavailable("HTTP 500")
+        self.hub._read_one = failing
+        self.go()
+        self.assertTrue(self.to("orch")[0].endswith("plan check FAIL (issue body not re-read: may be stale; run plan check)"))
+
+    def test_a_spent_budget_says_the_check_may_be_stale_and_reads_nothing(self):
+        self.post(3, self.plan())
+        self.stale_ask()
+        self.go()
+        self.engine.plan_wake.facts.clear()
+        self.engine.plan_wake.announced.clear()
+        self.reads_made.clear()
+        sb.plan_wake_pass(self.engine, self.engine.triage, ["acme/api"], self.world.clock.now(), [0])
+        self.assertEqual(self.reads(), [])
+        self.assertTrue(self.to("orch")[0].endswith("may be stale; run plan check)"))
+
+    def test_the_re_read_is_charged_to_the_budget_once_per_plan(self):
+        self.add(4, parent=2)
+        self.post(3, self.plan())
+        self.post(4, self.plan())
+        self.stale_ask()
+        self.go()                                  # builds the units and announces both plans
+        self.engine.plan_wake.facts.clear()
+        self.engine.plan_wake.announced.clear()
+        self.reads_made.clear()
+        budget = [1]
+        sb.plan_wake_pass(self.engine, self.engine.triage, ["acme/api"], self.world.clock.now(), budget)
+        self.assertEqual(budget, [0])
+        self.assertEqual(self.reads(), [("issues/2", True)])           # the second plan finds the budget spent: no read
+        texts = sorted(self.to("orch"))
+        self.assertEqual(sum(x.endswith("plan check PASS") for x in texts), 1)
+        self.assertEqual(sum(x.endswith("may be stale; run plan check)") for x in texts), 1)
+
+    def test_a_passing_first_check_makes_no_re_read(self):
+        self.watch_reads()
+        self.post(3, self.plan())
+        self.go(2)
+        self.assertEqual(self.reads(), [])
+
+    def test_two_recipients_cost_one_re_read(self):
+        self.world.add_agent("orch2", fleet={"role": "orchestrator", "charter": 1, "repo": "acme/api"})
+        self.engine.discover(self.world.clock.now())
+        self.post(3, self.plan())
+        self.stale_ask()
+        self.go()
+        self.assertEqual(len(self.reads()), 1)
+        self.assertEqual(len(self.to("orch")) + len(self.to("orch2")), 2)
 
     def test_nothing_is_sent_for_a_comment_that_is_not_a_plan_a_non_sub_issue_or_a_charter_chain_it_does_not_reach(self):
         self.post(3, "a plan is coming, see ## Plan (scenarios) later")
@@ -39848,6 +40725,18 @@ class TestOrdersDelivery(OrdersDeliveryCase):
             self.run_pass()
         self.assertEqual(len(self.order_messages("orch")), 1)
 
+    def test_the_first_full_pass_clears_the_load_tick_gate_and_not_before(self):   # #796 S6
+        engine = self.world.engine
+        self.assertTrue(engine.awaiting_first_full_pass)
+        self.run_pass()
+        self.assertFalse(engine.awaiting_first_full_pass)
+
+    def test_a_pass_that_publishes_nothing_leaves_the_gate_set(self):   # #796 (a Low of the review)
+        engine = self.world.engine
+        with mock.patch.object(sb, "fault", lambda name: name == "no-decisions-file"):
+            self.run_pass()
+        self.assertTrue(engine.awaiting_first_full_pass)
+
     def test_a_restart_repeats_nothing(self):
         self.run_pass()
         self.world.engine = self.world.new_engine()
@@ -39922,6 +40811,7 @@ class TestOrdersDelivery(OrdersDeliveryCase):
 
     def test_the_charter_is_read_once_per_cache_lifetime_not_once_per_pass(self):
         self.run_pass()
+        self.run_pass()   # #796: the load line reads nothing in the first pass after a start; its reads begin with the second
         first = self.gh_gets()
         loads = self.load_gets()
         for _ in range(6):
@@ -40515,6 +41405,78 @@ class TestRequestTiers(TierWorld):
         self.world.v2.answer_permissions(self.world.sessions["api-coder"])
         self.pass_()
         self.assertEqual(sb.read_escalated(self.world.state), {})
+
+    def test_the_daemon_keeps_an_escalation_while_a_worker_could_not_be_read(self):
+        ask = self.block_(timed=True)
+        key = "%s:%s" % (self.world.sessions["api-coder"], ask["id"])
+        sb.mark_escalated(self.world.state, key, self.world.clock.now())
+        self.pass_()
+        self.assertEqual(sb.whole(self.world.engine, "requests"), (True, ""))
+        with mock.patch.object(sb.WorkerFacts, "blocked", side_effect=sb.V2Error("session unreadable")):
+            self.pass_()
+        self.assertEqual(sb.whole(self.world.engine, "requests")[0], False)
+        self.assertIn(key, sb.read_escalated(self.world.state))                      # kept: its worker was not read
+        self.assertIn("whole.skipped", [e["event"] for e in self.world.audit()])
+        self.world.v2.answer_permissions(self.world.sessions["api-coder"])
+        self.pass_()
+        self.assertEqual(sb.read_escalated(self.world.state), {})                    # a whole pass without the request: forgotten
+
+    def test_the_requests_are_not_whole_for_a_problem_worker_a_fleet_problem_or_no_worker_source(self):
+        self.block_(timed=True)
+        self.pass_()
+        engine = self.world.engine
+        self.assertEqual(sb.whole(engine, "requests"), (True, ""))
+        observation = engine.discovery.agents["api-coder"]
+        worker = next(x for x in engine.sources if isinstance(x, sb.WorkerFacts))
+        with mock.patch.object(observation, "problem", "unreadable", create=True):
+            worker()                                                                 # the source is called on the held discovery
+        self.assertFalse(sb.whole(engine, "requests")[0])
+        self.pass_()
+        self.assertTrue(sb.whole(engine, "requests")[0])
+        with mock.patch.object(engine.discovery, "problems", ["herdr down"], create=True):
+            worker()
+        self.assertEqual(sb.whole(engine, "requests"), (False, "the fleet could not be read whole"))
+        self.pass_()
+        self.assertTrue(sb.whole(engine, "requests")[0])
+        with mock.patch.object(sb, "fault", lambda name: name == "no-worker-source"):
+            self.pass_()
+        self.assertFalse(sb.whole(engine, "requests")[0])                            # not a stale whole mark from before
+
+    def test_an_exception_of_any_class_in_the_worker_read_leaves_the_requests_not_whole_and_the_escalation_kept(self):
+        ask = self.block_(timed=True)
+        key = "%s:%s" % (self.world.sessions["api-coder"], ask["id"])
+        sb.mark_escalated(self.world.state, key, self.world.clock.now())
+        self.pass_()
+        self.assertEqual(sb.whole(self.world.engine, "requests"), (True, ""))
+        self.world.v2.answer_permissions(self.world.sessions["api-coder"])           # the request is gone
+        for error in (RuntimeError("boom"), KeyError("k"), ValueError("v")):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(sb.WorkerFacts, "blocked", side_effect=error):
+                    try:
+                        self.pass_()
+                    except Exception:
+                        pass                                                         # the engine may or may not absorb it: the mark must hold either way
+                self.assertFalse(sb.whole(self.world.engine, "requests")[0])         # never the previous pass's value
+                self.assertIn(key, sb.read_escalated(self.world.state))
+        self.pass_()
+        self.assertTrue(sb.whole(self.world.engine, "requests")[0])                  # the next clean read
+        self.assertEqual(sb.read_escalated(self.world.state), {})
+
+    def test_a_notice_read_that_raises_leaves_the_decision_list_not_whole(self):
+        engine = self.world.engine
+        self.pass_()
+        self.assertTrue(sb.whole(engine, "notices")[0])
+        with mock.patch.object(sb, "read_pr_notices", side_effect=RuntimeError("boom")):
+            try:
+                sb.decisions_from_notices(engine, engine.now())
+            except RuntimeError:
+                pass
+        self.assertFalse(sb.whole(engine, "notices")[0])
+        sb.mark_decisions_read(engine, [], engine.now())
+        self.assertFalse(sb.whole(engine, "decisions")[0])
+        sb.decisions_from_notices(engine, engine.now())
+        sb.mark_decisions_read(engine, [], engine.now())
+        self.assertTrue(sb.whole(engine, "decisions")[0])
 
     def test_the_audit_log_is_never_read_by_the_derivation(self):
         self.assertNotIn("audit", class_source_fn("decisions_from_requests"))
@@ -44528,6 +45490,50 @@ class TestPrNotices(DecisionsBase):
         self.pass_()
         self.assertNotIn("unreadable_since", sb.read_pr_notices(self.world.state)[0])
 
+    def keep_check(self):
+        """An escalation key no request or captain row holds: the prune forgets it only when every input it reads is whole."""
+        key = "ses_x:per_x"
+        sb.mark_escalated(self.world.state, key, self.world.clock.now())
+        engine = self.world.engine
+        engine.request_keys = set()
+        sb.read_mark(engine, "requests", True, "", engine.now())
+        sb.prune_escalations_pass(engine, sb.decision_store(engine), engine.now())
+        return key in sb.read_escalated(self.world.state)
+
+    def test_the_real_notice_read_marks_whole_at_its_end_not_whole_when_cut_or_raising(self):
+        engine = self.world.engine
+        self.notify()
+        self.assertEqual(sb.whole(engine, "notices"), (False, "not read yet in this process"))
+        self.notices()                                                               # (a) a clean read to the end
+        self.assertEqual(sb.whole(engine, "notices"), (True, ""))
+        self.assertFalse(self.keep_check())                                          # whole: the unheld key is forgotten
+        hang = subprocess.TimeoutExpired(["gh"], 8)                                  # (b) cut by its budget
+        runner = FakeGhPr({n: hang for n in range(1, 7)})
+        engine.gh_runner = lambda argv, **kw: (setattr(self.world.clock, "t", self.world.clock.t + 8), runner(argv, **kw))[1]
+        for n in range(1, 7):
+            self.notify(number=n, at=EPOCH + n)
+        self.world.tick(sb.PR_FACTS_TTL + 1)
+        self.notices()
+        self.assertEqual(sb.whole(engine, "notices")[0], False)
+        self.assertEqual(sb.whole(engine, "notices")[1], "%d notices unread" % engine.notice_unread)
+        self.assertTrue(self.keep_check())                                           # not whole: the key is kept
+        engine.gh_runner = self.gh
+        for n in range(1, 7):
+            self.gh.answers[n] = (0, pr_view_json(), "")
+        self.world.tick(sb.PR_FACTS_TTL + 1)
+        self.notices()
+        self.world.tick(sb.PR_FACTS_TTL + 1)
+        self.notices()
+        self.assertEqual(sb.whole(engine, "notices"), (True, ""))                    # the next clean read
+        self.world.tick(sb.PR_FACTS_TTL + 1)
+        with mock.patch.object(sb, "notice_facts", side_effect=RuntimeError("boom")):    # (c) an exception mid-read
+            try:
+                self.notices()
+            except RuntimeError:
+                pass                                                                 # absorbed or not: the mark must hold either way
+        self.assertEqual(sb.whole(engine, "notices")[0], False)
+        self.assertTrue(self.keep_check())
+
     def test_a_read_only_derivation_forgets_nothing(self):
         self.notify()
         self.gh.answers[7] = (0, pr_view_json(state="MERGED"), "")
@@ -44582,6 +45588,23 @@ class TestPrNotices(DecisionsBase):
         self.world.tick(61)  # the cached ones expire; the next pass reads the skipped ones first
         self.notices()
         self.assertEqual([c[0][3] for c in runner.calls[reads:]], ["3", "4"])
+
+    def test_the_pass_counts_the_noticed_prs_it_has_no_facts_for(self):   # #796 S8
+        hang = subprocess.TimeoutExpired(["gh"], 8)
+        runner = FakeGhPr({n: hang for n in range(1, 7)})
+        slow = lambda argv, **kw: (setattr(self.world.clock, "t", self.world.clock.t + 8), runner(argv, **kw))[1]
+        self.world.engine.gh_runner = slow
+        for n in range(1, 7):
+            self.notify(number=n, at=EPOCH + n)
+        self.notices()
+        self.assertEqual(self.world.engine.notice_unread, 6)   # two were tried and failed, four were skipped by the budget: none has facts
+        self.world.engine.gh_runner = None
+        self.world.tick(61)
+
+    def test_a_pass_that_reads_every_notice_counts_none_unread(self):   # #796 S8
+        self.notify()
+        self.notices()
+        self.assertEqual(self.world.engine.notice_unread, 0)
 
     def test_resolve_and_answer_on_a_pr_notice_say_it_is_information(self):
         self.notify()
@@ -60119,6 +61142,109 @@ class TestLoadAlert(Base):
         report = sb.collect_status(runner=lambda *a, **k: types.SimpleNamespace(returncode=1, stdout="", stderr=""), now=lambda: self.T0)
         report["load"] = []
         return report
+
+    # ---- #796: no alert before the first full pass after a start
+    def first_pass_world(self, awaiting=True, held=False, links=False, numbers=(1, 2)):
+        """An engine as the daemon makes it at a start (`awaiting_first_full_pass`), one orchestrator with two asks nobody moves; `self.clock` is its time."""
+        self.clock = [self.T0]
+        issues = [types.SimpleNamespace(repo="acme/widget", number=n, labels=(), parked_until=None) for n in numbers]
+        self.parent_fails = True
+
+        def api(path, repo):
+            if self.parent_fails:
+                raise RuntimeError("the read was cut")
+            return []
+        intents = types.SimpleNamespace(repo="acme/widget", open_asks=lambda charter, repo: issues, _api=api)
+        facts = {"acme/widget#50": {"facts": {"refs": [["acme/widget", 1]]}}} if held else {}
+        engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.clock[0], audit=None, actor="daemon", intents=intents, notice_facts=facts,
+                                       awaiting_first_full_pass=awaiting, awaiting_held_links=links, config={"load_alert": self.health.validate({"enabled": True}, "x")})
+        agents = {"o": types.SimpleNamespace(name="o", session_id="s", status="idle", fleet={"role": "orchestrator", "charter": 1, "repo": "acme/widget"}),
+                  "cos": types.SimpleNamespace(name="cos", session_id="c", status="idle", fleet={"role": "chief-of-staff"})}
+        return engine, types.SimpleNamespace(agents=agents)
+
+    def run_ticks(self, engine, discovery, hours):
+        for hour in hours:
+            self.clock[0] = self.T0 + hour * 3600
+            sb.load_tick(engine, discovery)
+        return [r for r in sb.read_reminders(str(self.state_dir)) if "overloaded" in str(r.get("text"))]
+
+    def test_a_fresh_start_raises_no_alert_and_says_it_is_waiting(self):   # S1 S2
+        engine, discovery = self.first_pass_world()
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [], "provisional": True}))
+        self.assertEqual(self.run_ticks(engine, discovery, (0, 3, 4)), [])
+        self.assertIn("load: waiting for the first full pass", self.health.status_lines(str(self.state_dir), self.T0))
+
+    def test_after_the_first_full_pass_the_same_stalled_state_alerts_once(self):   # S3
+        engine, discovery = self.first_pass_world()
+        self.run_ticks(engine, discovery, (0, 3))
+        engine.awaiting_first_full_pass = False
+        self.assertEqual(len(self.run_ticks(engine, discovery, (4, 7))), 1)
+        self.assertNotIn("load: waiting for the first full pass", self.health.status_lines(str(self.state_dir), self.T0))
+
+    def test_a_restart_does_not_re_arm_the_alert(self):   # S4
+        engine, discovery = self.first_pass_world(awaiting=False)
+        self.assertEqual(len(self.run_ticks(engine, discovery, (0, 3))), 1)
+        engine, discovery = self.first_pass_world()   # restart: a new engine, the same state directory
+        self.clock[0] = self.T0 + 3 * 3600
+        self.assertEqual(len(self.run_ticks(engine, discovery, (4, 5))), 1)
+        engine.awaiting_first_full_pass = False
+        self.assertEqual(len(self.run_ticks(engine, discovery, (6, 7))), 1)
+
+    def test_a_held_pr_that_appears_in_the_first_full_pass_is_counted_before_any_alert(self):   # S5
+        engine, discovery = self.first_pass_world(held=True)
+        self.assertEqual(self.run_ticks(engine, discovery, (0, 3)), [])
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [{"kind": "captain", "repo": "acme/widget", "number": 50, "tier": "human",
+                                                                                   "since": "2026-10-14T10:00:00Z"}]}))
+        engine.awaiting_first_full_pass = False
+        self.assertEqual(self.run_ticks(engine, discovery, (3.1, 3.2)), [])
+        self.assertEqual(self.latest()["o"]["waiting_owner_pr"], 1)
+
+    @mock.patch.object(sb, "HELD_LINKS_WAIT_SECONDS", 20 * 3600)   # the passes below are hours apart: the bound is not what this test is about
+    def test_a_held_pr_whose_links_are_cut_keeps_the_alert_quiet_until_a_pass_with_them_whole(self):   # S7
+        engine, discovery = self.first_pass_world(awaiting=False, held=True, links=True, numbers=(1, 2, 3))
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [{"kind": "captain", "repo": "acme/widget", "number": 50, "tier": "human",
+                                                                                   "since": "2026-10-14T10:00:00Z"}]}))
+        self.assertEqual(self.run_ticks(engine, discovery, (0, 3, 4)), [])   # the parent read is cut every time: three asks look stalled, none is judged
+        self.assertTrue(engine.awaiting_held_links)
+        self.assertIn("load: waiting for held PR links", self.health.status_lines(str(self.state_dir), self.T0))
+        self.parent_fails = False
+        self.assertEqual(len(self.run_ticks(engine, discovery, (5,))), 1)   # the first pass with the links whole: ask 1 is the owner's wait, 2 and 3 are truly stalled: it alerts now
+        self.assertFalse(engine.awaiting_held_links)
+        self.assertNotIn("load: waiting for held PR links", self.health.status_lines(str(self.state_dir), self.T0))
+
+    def test_the_wait_for_held_pr_links_lapses_after_its_bound(self):   # S7
+        engine, discovery = self.first_pass_world(awaiting=False, held=True, links=True, numbers=(1, 2, 3))
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [{"kind": "captain", "repo": "acme/widget", "number": 50, "tier": "human",
+                                                                                   "since": "2026-10-14T10:00:00Z"}]}))
+        self.assertEqual(self.run_ticks(engine, discovery, (0, 0.1)), [])   # inside the bound
+        self.assertEqual(len(self.run_ticks(engine, discovery, (3,))), 1)   # more than 900 s of unreadable links: the alert is not silenced for ever
+
+    def held_row(self, number=50):
+        (self.state_dir / "decisions.json").write_text(json.dumps({"decisions": [{"kind": "captain", "repo": "acme/widget", "number": number, "tier": "human",
+                                                                                   "since": "2026-10-14T10:00:00Z"}]}))
+
+    @mock.patch.object(sb, "HELD_LINKS_WAIT_SECONDS", 20 * 3600)
+    def test_noticed_prs_the_reader_could_not_read_keep_the_alert_quiet_until_a_pass_reads_them(self):   # S8
+        engine, discovery = self.first_pass_world(awaiting=False, links=True, numbers=(1, 2, 3))
+        self.parent_fails = False
+        engine.notice_unread = 2
+        self.assertEqual(self.run_ticks(engine, discovery, (0, 3, 4)), [])   # three asks look stalled; the notice reads were cut: nothing is judged
+        self.assertTrue(engine.awaiting_held_links)
+        self.assertIn("load: waiting for held PR links", self.health.status_lines(str(self.state_dir), self.T0))
+        engine.notice_unread = 0   # the next uncut pass read them all
+        self.assertEqual(len(self.run_ticks(engine, discovery, (5,))), 1)
+        self.assertFalse(engine.awaiting_held_links)
+
+    @mock.patch.object(sb, "HELD_LINKS_WAIT_SECONDS", 20 * 3600)
+    def test_a_human_tier_held_pr_with_no_read_references_keeps_the_alert_quiet(self):   # S8: the key-not-in-refs rule
+        engine, discovery = self.first_pass_world(awaiting=False, links=True, numbers=(1, 2, 3))
+        self.parent_fails = False
+        self.held_row()   # a held PR with no entry in the notice facts: its references were never read
+        self.assertEqual(self.run_ticks(engine, discovery, (0, 3, 4)), [])
+        self.assertTrue(engine.awaiting_held_links)
+        engine.notice_facts["acme/widget#50"] = {"facts": {"refs": [["acme/widget", 1]]}}
+        self.assertEqual(len(self.run_ticks(engine, discovery, (5,))), 1)
+        self.assertFalse(engine.awaiting_held_links)
 
     def stalled_world(self, count=2):
         self.asks = {1: list(range(1, count + 1))}
