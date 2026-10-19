@@ -25,6 +25,8 @@ MOVED = ('rating_at',
          '_apply_impact_hold_locked',
          'clear_fingerprint',
          'carry_confirmer',
+         'restore_marker',
+         'impact_rehold_open',
          'marker_edit',
          'neutralise_marker',
          '_plan_issue_of',
@@ -166,7 +168,7 @@ def impact_carry_decision(engine, repo, number, head):
         if waiting.get("head") == head and (impact_carry_marks(engine.state_dir)[0].get((pr, head)) or 0) <= waiting.get("marks", 0):
             return None   # waiting for a reviewer's confirmation at this head, and none is recorded: nothing to read yet (a new record at this head wakes it)
         return load_module("clear_carry").decide(impact_carry_get(engine, runner, repo), repo, number, cleared["head"], cleared.get("fingerprint"), head,
-                                                 lines_fingerprint=cleared.get("lines_fingerprint"), confirm=carry_confirmer(engine, repo, number), protected=impact_floor.CARRY_NEVER_PATHS)
+                                                 lines_fingerprint=cleared.get("lines_fingerprint"), confirm=carry_confirmer(engine, repo, number), protected=impact_floor.carry_never_paths())
     except Exception as err:
         engine._note("impact.carry_error", "%s#%d" % (repo, number), {"error": _one_line("%s: %s" % (type(err).__name__, err), 160)})
         return None
@@ -283,11 +285,17 @@ def _apply_impact_hold_locked(engine, repo, number, report, record, carry=None):
     spent += 1
     added = sorted(set(_labels_ours(names, state, pr)) | set(missing))   # a re-apply MERGES into what an earlier apply added: it never forgets one
     state["applied"][pr] = {"head": head, "merge_label_added": names["merge-captain"] in added, "added": added, "at": int(engine.now())}
+    if report.get("rehold"):
+        state["applied"][pr]["rehold"] = True   # (#815) the sweep reads it: a held-again pull request is not a disagreement
     write_impact_state(engine.state_dir, state)
     engine.audit.append(engine.actor, "gate.hold_applied", pr, {"head": head, "labels": missing, "reasons": report["reasons"],
                                                                  "floor_paths": report["floor_paths"][:20], "globs": report["globs"][:20]})
     if report.get("rehold"):   # said once per head: the labels were missing, so this is the pass that put them back
-        engine.audit.append(engine.actor, "gate.hold_reapplied", pr, {"head": head, "cleared_head": cleared.get("head"), "labels": missing, "why": report["rehold"]})
+        detail = {"head": head, "cleared_head": cleared.get("head"), "labels": missing, "why": report["rehold"]}
+        marker = restore_marker(engine, runner, repo, number, head, raw)   # (#815) the clear set the first line to `MERGE: automatic`: it says captain again, once, in this pass
+        if marker is not None:
+            detail["marker"] = marker
+        engine.audit.append(engine.actor, "gate.hold_reapplied", pr, detail)
     return spent
 
 
@@ -352,18 +360,53 @@ def carry_confirmer(engine, repo, number):
     return confirm
 
 
-def marker_edit(body):
-    """(new body, line before, line after) when the body's FIRST non-empty line says `MERGE: captain` (the very rule `pr_marker` reads), with ONLY that marker changed to
-    `MERGE: automatic` and every other byte of the body (the rest of the line and its ending included) as it was. None when the first line is anything else."""
-    if pr_marker(body) != "captain":
+def marker_edit(body, source="captain", target="automatic"):
+    """(new body, line before, line after) when the body's FIRST non-empty line says `MERGE: <source>` (the very rule `pr_marker` reads), with ONLY that marker changed to
+    `MERGE: <target>` (the clear: captain to automatic; a re-hold, #815: automatic back to captain) and every other byte of the body (the rest of the line and its ending included) as
+    it was. None when the first line is anything else."""
+    if pr_marker(body) != source:
         return None
     lines = body.splitlines(keepends=True)
     index = next(i for i, line in enumerate(lines) if line.strip())
     line = lines[index]
-    at = line.index("MERGE: captain")
-    edited = line[:at] + "MERGE: automatic" + line[at + len("MERGE: captain"):]
+    at = line.index("MERGE: " + source)
+    edited = line[:at] + "MERGE: " + target + line[at + len("MERGE: " + source):]
     lines[index] = edited
     return "".join(lines), line.rstrip("\r\n"), edited.rstrip("\r\n")
+
+
+def restore_marker(engine, runner, repo, number, head, first):
+    """(#815) {"before", "after"} when this pull request's body was rewritten from `MERGE: automatic` back to `MERGE: captain` (the owner's clear had set it; the pull request is HELD AGAIN at
+    `head`, so the sweep must not read the two as disagreeing); {"error": why} when it could not be (nothing was written); None when there is nothing to do (no MERGE line, or it already says
+    captain). `first` is the read the caller made a moment ago; the body is read again right before the write and written only when it is the same, for this head only, then read back. One body
+    edit through the daemon's own route; best effort: the hold labels have already been written and stand either way. Never raises."""
+    try:
+        if not isinstance(first, dict) or first.get("headRefOid") != head:
+            return {"error": "the head moved: nothing was written"}
+        edit = marker_edit(first.get("body"), "automatic", "captain")
+        if edit is None:
+            return None
+        new_body, before, after = edit
+        again = read_pr_json(engine, repo, number)
+        if again.get("body") != first.get("body") or again.get("headRefOid") != head:
+            return {"error": "the body or the head changed while it was being edited: nothing was written"}
+        _gh_write(engine, runner, repo, "repos/%s/pulls/%d" % (repo, number), "PATCH", {"body": new_body})
+        if read_pr_json(engine, repo, number).get("body") != new_body:
+            return {"error": "the body read back is not the one written"}
+        clean = lambda t: re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", t)
+        return {"before": _one_line(clean(before), 80), "after": _one_line(clean(after), 80)}
+    except Exception as err:
+        return {"error": _one_line("%s: %s" % (type(err).__name__, err), 120)}
+
+
+def impact_rehold_open(state_dir, repo, number):
+    """(#815) True when the daemon's record of this pull request says its hold is a RE-HOLD (`applied.rehold`): the owner cleared an earlier head and it is held again. The sweep reads it so a
+    body line that still says `MERGE: automatic` beside the hold labels is not reported as a disagreement. An unreadable state is False (the sweep then says what it always said)."""
+    try:
+        state, problem = read_impact_state(state_dir)
+        return not problem and (state["applied"].get("%s#%d" % (repo, number)) or {}).get("rehold") is True
+    except Exception:
+        return False
 
 
 def neutralise_marker(engine, runner, repo, number, head, first=None):

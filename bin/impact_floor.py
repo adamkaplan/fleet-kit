@@ -545,14 +545,18 @@ def validate_hold_config(raw):
             raise ValueError("'impact_hold.repos.%s' must be {\"enabled\": true|false}" % name)
 
 
-CARRY_NEVER_PATHS = (   # (#815) the clear's own code and the impact matrix: a clear is NEVER carried over a conflict-resolving merge that touches one, nor for a pull request that changes one.
-    "bin/chat_clear.py",                      # ONE table: the carry reads it, and a test checks it against the matrix's `clear_code_paths` and against every bin/ file named for the clear or the hold
-    "bin/clear_carry.py",
-    "bin/delegated_clear.py",
-    "bin/impact_floor.py",
-    "bin/impact_hold.py",
-    "docs/review-laws/impact-matrix.json",
-)
+def carry_never_paths(matrix=None):
+    """(#815) The paths whose touch refuses the conflict-resolving carry of an owner's clear: the matrix file's `owner_hold.never_carried_paths` (the clear's own code and the matrix itself), as a
+    tuple. ONE table, in the data: this code names no path. () when the block is missing or malformed: the carry is then refused (an empty table protects nothing, so the carry refuses it)."""
+    try:
+        matrix = _matrix_cached() if matrix is None else matrix
+    except MatrixError:
+        return ()
+    block = matrix.get("owner_hold") if isinstance(matrix, dict) else None
+    listed = block.get("never_carried_paths") if isinstance(block, dict) else None
+    if not isinstance(listed, list) or not listed or not all(isinstance(x, str) and x.strip() for x in listed):
+        return ()
+    return tuple(listed)
 
 
 def carry_enabled(config, repo):

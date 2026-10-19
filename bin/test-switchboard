@@ -13265,7 +13265,7 @@ class TestConflictCarry(unittest.TestCase):
 
     def decide(self, new, confirm=lambda head: "ledger entry 1", protected="table", lines=True):
         return self.cc.decide(self.api.get, self.REPO, 7, self.cleared, self.fp, new, lines_fingerprint=self.lfp if lines else None, confirm=confirm,
-                              protected=sb.impact_floor.CARRY_NEVER_PATHS if protected == "table" else protected)
+                              protected=sb.impact_floor.carry_never_paths() if protected == "table" else protected)
 
     def test_s1_a_conflict_resolved_by_hand_with_the_lines_unchanged_carries_only_through_the_lines_route(self):
         new = self.conflict_merge()
@@ -13318,7 +13318,7 @@ class TestConflictCarry(unittest.TestCase):
         self.assertIn("commit of the pull request's own", verdict["reason"])
 
     def test_s3_every_member_of_the_table_is_refused_when_a_merge_touches_it_or_the_pull_request_changes_it(self):
-        table = sb.impact_floor.CARRY_NEVER_PATHS
+        table = sb.impact_floor.carry_never_paths()
         self.assertGreaterEqual(len(table), 4)
         for path in table:
             for how in ("a merge touches it", "the pull request's own change touches it"):
@@ -13345,7 +13345,7 @@ class TestConflictCarry(unittest.TestCase):
         self.assertEqual(self.cc._norm(".github/x"), ".github/x", "a leading dot of a name is not a ./ prefix")
 
     def test_the_table_is_the_clear_code_the_matrix_names_and_every_clear_or_hold_module(self):
-        table = set(sb.impact_floor.CARRY_NEVER_PATHS)
+        table = set(sb.impact_floor.carry_never_paths())
         root = Path(sb.__file__).resolve().parent.parent
         matrix = json.loads((root / "docs/review-laws/impact-matrix.json").read_text())
         listed = set(matrix["owner_hold"]["delegated_clear"]["clear_code_paths"]) if "owner_hold" in matrix else set(matrix["delegated_clear"]["clear_code_paths"])
@@ -14505,6 +14505,108 @@ class TestConflictCarryInTheDaemon(Base):
         self.assertEqual(self.hold(new), 0)
         (carried,) = self.events("gate.clear_carried")
         self.assertNotIn("route", carried["detail"], "the pure carry's audit line reads as before")
+
+    # -- clause (7): a re-hold puts the body's first line back to `MERGE: captain`
+
+    def own_commit(self):
+        g = self.api.git
+        (Path(self.dir) / "d.txt").write_text("own\n")
+        g("add", "-A")
+        g("commit", "-q", "-m", "own commit")
+        return self.api.rev("feature")
+
+    def rehold(self, head):
+        report = {"pr": self.PR, "head": head, "reasons": ["held again"], "floor_paths": [], "globs": [], "rehold": "held again"}
+        return sb.apply_impact_hold(self.engine, self.REPO, 7, report, {"labels": []})
+
+    def body_patches(self):
+        return [w for w in self.writes if w[0] == "PATCH" and w[1].endswith("/pulls/7")]
+
+    def test_s9_a_re_hold_rewrites_the_first_line_to_captain_once_per_head_and_audits_it_in_the_reapplied_line(self):
+        self.body = "MERGE: captain\n\nthe change\n"
+        self.clear()
+        self.assertEqual(self.body, "MERGE: automatic\n\nthe change\n")
+        self.writes.clear()
+        new = self.own_commit()
+        self.assertGreater(self.rehold(new), 0)
+        self.assertEqual(self.body, "MERGE: captain\n\nthe change\n", "only the marker changed")
+        self.assertEqual(len(self.body_patches()), 1)
+        (done,) = self.events("gate.hold_reapplied")
+        self.assertEqual(done["detail"]["marker"], {"before": "MERGE: automatic", "after": "MERGE: captain"})
+        self.labels = [l for w in self.adds() for l in w[2]["labels"]]
+        for _ in range(3):
+            self.rehold(new)
+        self.assertEqual((len(self.body_patches()), len(self.events("gate.hold_reapplied"))), (1, 1), "once per head")
+        self.assertTrue(sb.impact_rehold_open(self.world.state, self.REPO, 7))
+
+    def test_s10_a_carried_clear_never_rewrites_the_body_and_marks_no_re_hold(self):
+        self.body = "MERGE: captain\n\nthe change\n"
+        self.clear()
+        self.writes.clear()
+        new = self.conflict_merge()
+        self.confirm(new)
+        self.assertEqual(self.hold(new), 0)
+        self.assertEqual((self.body_patches(), self.body), ([], "MERGE: automatic\n\nthe change\n"))
+        self.assertFalse(sb.impact_rehold_open(self.world.state, self.REPO, 7))
+
+    def test_s11_a_body_with_no_merge_line_or_one_that_already_says_captain_is_left_alone(self):
+        for label, body in (("no MERGE line", "just text\nMERGE: automatic\n"), ("already captain", "MERGE: captain\nx\n"), ("empty", ""), ("a MERGE word inside", "see MERGE: automatic below\n")):
+            with self.subTest(label):
+                self.build(carry=True)
+                g = self.api.git
+                g("checkout", "-q", "-B", "feature", "main")
+                self.writes.clear()
+                self.labels = []
+                self.body = body
+                self.clear()
+                self.writes.clear()
+                self.labels = []
+                self.body = body   # whatever the clear left, the body now reads as the case says
+                before = self.body
+                (Path(self.dir) / ("e_%d.txt" % len(label))).write_text("own\n")
+                g("add", "-A")
+                g("commit", "-q", "-m", "own commit")
+                self.assertGreater(self.rehold(self.api.rev("feature")), 0)
+                self.assertEqual((self.body_patches(), self.body), ([], before))
+                (done,) = self.events("gate.hold_reapplied")[-1:]
+                self.assertNotIn("marker", done["detail"], label)
+
+    def test_s12_an_unreadable_body_writes_nothing_and_the_labels_still_stand(self):
+        self.body = "MERGE: captain\n\nthe change\n"
+        self.clear()
+        self.writes.clear()
+        new = self.own_commit()
+        reads, real = [], self.route
+
+        def route(argv, **kwargs):
+            if argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"]:
+                reads.append(1)
+                if len(reads) == 2:   # the read right before the write
+                    return subprocess.CompletedProcess(argv, 1, "", "gh: HTTP 502")
+            return real(argv, **kwargs)
+        self.engine.gh_runner = route
+        self.assertGreater(self.rehold(new), 0)
+        self.assertEqual((self.body_patches(), self.body), ([], "MERGE: automatic\n\nthe change\n"))
+        self.assertEqual(len(self.adds()), 1, "the hold labels are written all the same")
+        (done,) = self.events("gate.hold_reapplied")
+        self.assertIn("error", done["detail"]["marker"])
+
+    def test_s13_a_body_that_changed_while_it_was_being_edited_is_not_written(self):
+        self.body = "MERGE: captain\n\nthe change\n"
+        self.clear()
+        self.writes.clear()
+        new = self.own_commit()
+        reads, real = [], self.route
+
+        def route(argv, **kwargs):
+            if argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"]:
+                reads.append(1)
+                if len(reads) == 2:
+                    self.body = "MERGE: automatic\n\nthe author edited this\n"
+            return real(argv, **kwargs)
+        self.engine.gh_runner = route
+        self.rehold(new)
+        self.assertEqual((self.body_patches(), self.body), ([], "MERGE: automatic\n\nthe author edited this\n"))
 
     def test_a_conflict_merge_after_a_rewritten_history_or_with_a_changed_line_is_void_not_waiting(self):
         self.clear()
@@ -25854,6 +25956,14 @@ class TestCaptainSweepFindings(TestSweep):
         self.sweep()
         self.sweep()
         self.assertEqual(self.found(), [("S6a", "acme/api#40"), ("S6b", "acme/api#41"), ("S6b", "acme/api#42")])
+
+    def test_815_a_re_hold_at_this_head_is_not_a_disagreement_and_only_a_re_hold_is_exempt(self):
+        captain = self.USER.replace("awaiting-user", "merge-captain")
+        self.hub.open = {42: sweep_issue(42, "MERGE: automatic\nx", [captain], pr=True), 45: sweep_issue(45, "MERGE: automatic\nx", [captain], pr=True)}
+        sb.write_impact_state(self.engine.state_dir, {"clears": {}, "applied": {"acme/api#42": {"head": "a" * 40, "added": [], "at": 1, "rehold": True}, "acme/api#45": {"head": "b" * 40, "added": [], "at": 1}}})
+        self.sweep()
+        self.sweep()
+        self.assertEqual(self.found(), [("S6b", "acme/api#45")], "a plain disagreement is still said; a re-hold's is not")
 
     def test_s9_a_merge_or_hold_label_left_on_a_merged_or_closed_pr_is_flagged_and_nothing_is_removed(self):
         captain = self.USER.replace("awaiting-user", "merge-captain")
