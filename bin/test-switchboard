@@ -28510,6 +28510,10 @@ class TestPrSharesFiles(LedgerBase):
         code, out = self.gates_text()
         self.assertEqual(self.shares(out), ["shares a with #12"])
 
+    def test_a_path_with_a_control_character_or_over_300_characters_leaves_that_pull_request_out(self):
+        self.open_prs = [self.pr_of(9, "a"), self.pr_of(12, "a", "b\x1b[2Jc"), self.pr_of(13, "a", "x" * 301), self.pr_of(14, "a")]
+        self.assertEqual(self.shares(self.gates_text()[1]), ["shares a with #14"])
+
     def test_S6_a_failed_or_garbled_read_gives_no_line_and_the_same_exit_status(self):
         self.open_prs = [self.pr_of(9, "a"), self.pr_of(12, "a")]
         want = self.gates_text()[0]

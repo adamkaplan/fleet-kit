@@ -9,6 +9,7 @@ Python 3.9 standard library only.
 LIST_CAP = 50    # the most open pull requests read, in one call
 FILES_CAP = 100  # the most files of one pull request used; a pull request with more changed files is left out
 SHOW_FILES = 3   # files named in a `shares` line
+PATH_MAX = 300  # a longer path, or one with a control character, is not printed: the pull request is left out
 SHOW_PRS = 5     # pull requests named in a `shares` line or a merge order
 
 
@@ -26,7 +27,7 @@ def parse_listing(raw):
         if total > FILES_CAP or len(files) != total:
             continue   # truncated or over the cap: not the whole list
         paths = [f.get("path") for f in files if isinstance(f, dict)]
-        if len(paths) != total or not all(isinstance(p, str) and p for p in paths):
+        if len(paths) != total or not all(isinstance(p, str) and 0 < len(p) <= PATH_MAX and p.isprintable() for p in paths):
             continue
         out[item["number"]] = sorted(set(paths))
     return out
