@@ -654,7 +654,7 @@ def delegated_clear_map(engine, runner, repo, item, base_sha, rule):
         if base is None or head is None or not isinstance(item.get("patch"), str):
             return None
         if item["filename"] == rule["daemon_file"]:
-            return module.closure_refusals(base, head, item["patch"], module.daemon_roots(rule), set(rule["clear_entry_points"]))
+            return module.closure_refusals(base, head, item["patch"], module.daemon_roots(rule), set(rule["clear_entry_points"]), False, list(rule.get("dynamic_actions") or []))
         return module.closure_refusals(base, head, item["patch"], list((rule.get("module_roots") or {}).get(item["filename"]) or []), set(), True)   # any other module the clear loads: its import-time code and the functions the clear runs
     except Exception:
         return None

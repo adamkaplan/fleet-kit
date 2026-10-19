@@ -408,9 +408,18 @@
           "validate"
         ]
       },
+      "dynamic_actions": [
+        "review"
+      ],
       "rating_roots": [
         "add_review_parsers",
+        "build_parser",
+        "call_command",
         "cmd_review",
+        "command_registrars",
+        "dispatch",
+        "main",
+        "resolve_command",
         "parse_review_block"
       ],
       "closure_roots": [

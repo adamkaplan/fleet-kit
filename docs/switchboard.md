@@ -4580,6 +4580,10 @@ These stay the owner's own clear. The list is data in the matrix file, and a com
 
 Every delegated clear is audited with the score, the threshold, the head and her one-line judgement, and the panel notice shows the same four. A refusal is audited (`gate.hold_clear_refused`) with the reason and the score read, and is never listed as a clear. The owner lists delegated clears with a listing command, one row per clear with those four fields. She may also raise a pull request to the owner instead of clearing it.
 
+#### The closure and the dynamic edges (#835)
+
+What the Chief of Staff can never clear is computed from the code by name: every definition reachable from `closure_roots` and `rating_roots` of the matrix file. Two string edges are followed, for the actions in `dynamic_actions` (`review`): the dispatcher's `"cmd_" + action` (to `cmd_review`) and the parser's `add_*_parsers` name pattern (to `add_review_parsers`). Any OTHER dynamic edge (`getattr` with a computed name, `globals()`, `importlib`, `eval`) is a stated limit, and a test lists the ones on the call path from `main` to the rating code: a new one fails it until it is followed or listed with its reason.
+
 #### Where it lives
 
 - `bin/delegated_clear.py` holds the judgement: the score block (`score_block`), the order-line hash and file match (`line_hash`, `file_order_line`, `entry_of`), the decision (`judge`) and the validation and refusals. It holds no path, class or rule name of its own.

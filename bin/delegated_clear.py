@@ -289,11 +289,13 @@ def _is_dunder(name):
     return name.startswith("__") and name.endswith("__")
 
 
-def closure(tree, roots):
+def closure(tree, roots, dynamic_actions=()):
     """(def names, global names, referenced names, {class: methods}) reachable from `roots` by NAME: every module-level definition a closure definition refers to (a call, a value, a default, a
     decorator, a base class) and every module-level binding it reads (its right-hand side, to a fixed point). A CLASS the closure refers to brings its own statements (bases, decorators, class
     body) and only those methods whose name the closure reads (as a name or an attribute) or that are special methods (`__init__`, `__getattr__`, `__call__`...): a method nothing reads is not run.
-    Over-approximate by name on purpose (any attribute of that name); dynamic dispatch by string is not followed (a stated limit)."""
+    Over-approximate by name on purpose (any attribute of that name). Dynamic dispatch by string is followed ONLY for the daemon's command table, for the actions in `dynamic_actions` (the rating's
+    path, #835): the literal `"cmd_"` (the dispatcher builds `"cmd_" + action`) is an edge to `cmd_<action>` and the name `REGISTRAR_NAME_RE` (the parser collects every `add_<x>_parsers`) is an edge to
+    `add_<action>_parsers`. Any OTHER dynamic edge (getattr, globals(), importlib, eval...) is a stated limit: a test lists the ones on the path from `main`."""
     defs, binds = _index(tree)
     roots = list(defs) if "*" in roots else list(roots)   # `*`: every function of the module (a module the clear runs and no recording says which)
     seen, globals_, refs, members, todo = set(), set(), set(), {}, list(roots)
@@ -310,6 +312,10 @@ def closure(tree, roots):
                         nodes.extend(binds[x.id])
                 elif isinstance(x, ast.Attribute):
                     refs.add(x.attr)
+                elif isinstance(x, ast.Constant) and x.value == "cmd_":
+                    todo.extend("cmd_" + a.replace("-", "_") for a in dynamic_actions)
+                if isinstance(x, ast.Name) and x.id == "REGISTRAR_NAME_RE":
+                    todo.extend("add_%s_parsers" % a.replace("-", "_") for a in dynamic_actions)
 
     walk([n for r in roots if r in binds and r not in globals_ and not globals_.add(r) for n in binds[r]])   # a root that is a binding is read too
     while True:
@@ -361,7 +367,7 @@ def changed_lines(patch):
     return old, new
 
 
-def closure_refusals(base_src, head_src, patch, roots, entry_points, module_level=False):
+def closure_refusals(base_src, head_src, patch, roots, entry_points, module_level=False, dynamic_actions=()):
     """[reasons] a change to the daemon file touches the clear closure. `base_src` and `head_src` are the file before and after, `patch` the diff of it, `roots` the clear command's entry points and
     `entry_points` the names a NEW caller of is refused. The closure is computed on BOTH files and united (a pull request that ADDS a call into it counts). The changed lines are mapped to the
     top-level definition they are in by the ast of the file they belong to (removed lines against the base, added lines against the head). Refused: a closure definition changed; a module-level
@@ -373,7 +379,7 @@ def closure_refusals(base_src, head_src, patch, roots, entry_points, module_leve
         base, head = ast.parse(base_src), ast.parse(head_src)
     except (SyntaxError, ValueError):
         return ["the daemon file does not parse before or after the change: refused"]
-    base_closure, head_closure = closure(base, roots), closure(head, roots)
+    base_closure, head_closure = closure(base, roots, dynamic_actions), closure(head, roots, dynamic_actions)
     in_defs, in_globals, in_refs = (base_closure[0] | head_closure[0]), (base_closure[1] | head_closure[1]), (base_closure[2] | head_closure[2])
     in_members = {k: base_closure[3].get(k, set()) | head_closure[3].get(k, set()) for k in set(base_closure[3]) | set(head_closure[3])}
     reasons = []
