@@ -12,7 +12,9 @@ daemon's globals and are not meant to be called from this module's own namespace
 """
 import types
 
-MOVED = ('gate_floor_fact',
+MOVED = ('rating_at',
+         'rehold_reason',
+         'gate_floor_fact',
          'read_impact_state',
          'write_impact_state',
          '_impact_state_noted',
@@ -42,6 +44,33 @@ MOVED = ('gate_floor_fact',
          'release_impact_hold',)
 
 
+
+
+def rating_at(engine, pr, head):
+    """(rated, problem): THE one reading of "an impact rating is recorded at this head" (#830), for every reader of "is this pull request held": True only when the independent reviewer's
+    newest record for EXACTLY this head carries an action (a record with no action rates nothing); `problem` is what is wrong when the ledger cannot be read (the rating is then unknown: not rated)."""
+    if engine.state_dir is None or not head:
+        return False, None
+    record, problem = impact_review_record(engine.state_dir, pr, head)
+    return (not problem and record is not None and isinstance(record[0], str) and bool(record[0])), problem
+
+
+def rehold_reason(engine, state, repo, pr, head):
+    """(#830) THE one rule for "held again at a new head", read by every place that asks whether a pull request is held (the daemon's label pass, the release, the dry run, gate G6
+    and G6b): the reason (a string) when a clear is recorded for ANOTHER head and none for this one, the clear is not CARRIED to this head (a pure merge of main) and no impact rating
+    exists at this head (`rating_at`: the one reading of that, whatever the caller); else None. A pull request with no recorded clear is None: this rule never holds what was never cleared. `state` is the impact state read whole
+    (never an empty one made by a failed read: the callers check the problem first). An unreadable head (none) counts as another head."""
+    cleared = (state.get("clears") or {}).get(pr)
+    if not isinstance(cleared, dict) or not cleared.get("head") or (head and cleared.get("head") == head):
+        return None
+    carried = (state.get("carried") or {}).get(pr) or {}
+    if head and carried.get("head") == head and carried.get("from") == cleared.get("head") and impact_floor.carry_enabled(engine.config, repo):
+        return None
+    if head and rating_at(engine, pr, head)[0]:
+        return None
+    return "the owner's clear was recorded for an earlier head and nothing at this head clears or rates it: held again"   # a literal: the moved functions see only the daemon's globals
+
+
 def gate_floor_fact(engine, state, repo, number, head):
     """The impact floor read FRESH for this head, for gate G6 (#488): {"decision", "reasons", "cleared", "unreadable"}. The SAME function the
     daemon uses (`pr_floor_report`), one PR read; the owner's clear counts only for this exact head. Any failure is `unreadable`, never
@@ -52,9 +81,10 @@ def gate_floor_fact(engine, state, repo, number, head):
             raise ValueError("the pull request moved while its floor was read (%s, then %s)" % ((head or "?")[:8], (report.get("head") or "?")[:8]))
         clears, problem = read_impact_state(state)
         cleared = (clears["clears"].get(report["pr"]) or {}).get("head") == head
-        return {"decision": report["owner_decision"], "reasons": list(report["owner_reasons"]), "cleared": cleared, "unreadable": problem}   # the OWNER-HOLD decision: the one the daemon's labels follow (#451)
+        return {"decision": report["owner_decision"], "reasons": list(report["owner_reasons"]), "cleared": cleared, "unreadable": problem,
+                "rehold": None if problem else rehold_reason(engine, clears, repo, report["pr"], head)}   # the OWNER-HOLD decision: the one the daemon's labels follow (#451)
     except Exception as err:   # an unreadable diff, a matrix error, a missing file: all the same answer
-        return {"decision": None, "reasons": [], "cleared": False, "unreadable": _one_line("%s: %s" % (type(err).__name__, err), 150)}
+        return {"decision": None, "reasons": [], "cleared": False, "rehold": None, "unreadable": _one_line("%s: %s" % (type(err).__name__, err), 150)}
 
 
 def read_impact_state(state_dir):
@@ -212,6 +242,9 @@ def _apply_impact_hold_locked(engine, repo, number, report, record, carry=None):
         raise NoticeError("the pull request's labels cannot be read")
     have = {(l.get("name") if isinstance(l, dict) else l) for l in live}
     want = [names["merge-captain"], names["hold-impact"]]
+    if report.get("rehold"):   # the hold labels the owner's clear took off (#830): each is put back, and only an owner-tier hold label of the fleet
+        allowed = {name for key, name in names.items() if key.startswith("hold-")}
+        want += [l for l in (cleared.get("removed") or []) if l in allowed and l not in want]
     missing = [l for l in want if l not in have]
     if not missing:
         return 1
@@ -229,6 +262,8 @@ def _apply_impact_hold_locked(engine, repo, number, report, record, carry=None):
     write_impact_state(engine.state_dir, state)
     engine.audit.append(engine.actor, "gate.hold_applied", pr, {"head": head, "labels": missing, "reasons": report["reasons"],
                                                                  "floor_paths": report["floor_paths"][:20], "globs": report["globs"][:20]})
+    if report.get("rehold"):   # said once per head: the labels were missing, so this is the pass that put them back
+        engine.audit.append(engine.actor, "gate.hold_reapplied", pr, {"head": head, "cleared_head": cleared.get("head"), "labels": missing, "why": report["rehold"]})
     return spent
 
 
@@ -541,7 +576,7 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
         else:
             remove = list(remove)
         head_now = current
-        state["clears"][pr] = {"head": head_now, "reason": reason, "by": who, "at": int(engine.now())}
+        state["clears"][pr] = {"head": head_now, "reason": reason, "by": who, "at": int(engine.now()), "removed": sorted(remove)}   # `removed`: the labels a re-hold at a new head puts back (#830)
         _consume_record(state, pr)   # the labels it took off were the daemon's record: consumed with the clear, in this write
         state.get("carried", {}).pop(pr, None)   # a new clear starts from this head: an earlier carry is not part of it
         state.get("carry_void", {}).pop(pr, None)
@@ -821,6 +856,9 @@ def impact_plan(engine, report, labels, state, records, records_problem):
             return "cleared", []
         missing = [l for l in (names["merge-captain"], names["hold-impact"]) if l not in have]
         return ("add", missing) if missing else ("held", [])
+    if not records_problem and rehold_reason(engine, state, pr.rpartition("#")[0], pr, report.get("head")):   # (#830) held again at a new head
+        missing = [l for l in (names["merge-captain"], names["hold-impact"]) if l not in have]
+        return ("add", missing) if missing else ("held", [])
     if records_problem or not isinstance(state["applied"].get(pr), dict):
         return "none", []
     return "release", [l for l in _labels_ours(names, state, pr) if l in have]
@@ -889,6 +927,8 @@ def release_impact_hold(engine, repo, number, report, record):
             return 0
         ours = _labels_ours(names, state, pr)
         rating, rating_problem = impact_review_record(engine.state_dir, pr, report["head"])
+        if rehold_reason(engine, state, repo, pr, report["head"]):
+            return 0   # held again at a new head (#830): a hold the owner has not cleared at this head is never released
         if rating_problem or (rating and rating[0] == "hold" and impact_floor.class_is_top_tier(impact_floor._matrix_cached(), rating[1])):
             return 0   # an independent hold arrived (or cannot be read) since the decision: it stays
         raw = read_pr_json(engine, repo, number)   # FAILS CLOSED: a failed read raises, nothing is removed and the caller backs off
