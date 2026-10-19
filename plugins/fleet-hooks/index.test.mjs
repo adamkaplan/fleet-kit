@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import plugin, { derivedPaths, resolveSettings } from "./index.js";
+import plugin, { derivedPaths, resolveSettings, makeShellHook, makeTmpResolver, ensureAgentTmp, headlessNameOf, tmpRootOf } from "./index.js";
 
 // A fake home with ~/.local/bin/fleet-switchboard -> <checkout>/bin/fleet-switchboard and <checkout>/shims.
 function fakeHome() {
@@ -364,4 +364,114 @@ test("setup with an api that offers none of it, or with events switched off, reg
   let hooked = 0;
   await plugin.setup({ session: { hook: () => { hooked += 1; } }, shell: { hook() {} }, permission: { hook() {} } }, { FLEET_SWITCHBOARD_PLUGIN_EVENTS: "off" }, { home, sender });
   assert.equal(hooked, 0);
+});
+
+// ---- #846: a private TMPDIR for a launched headless worker, through the shell environment
+function tmpWorld(workers = {}) {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fleet-hooks-tmp-")));
+  const stateDir = path.join(base, "state");
+  const root = path.join(base, "tmp-root");
+  fs.mkdirSync(path.join(stateDir, "headless"), { recursive: true, mode: 0o700 });
+  for (const [name, session] of Object.entries(workers)) {
+    fs.writeFileSync(path.join(stateDir, "headless", name + ".json"), JSON.stringify({ worker: name, session, kind: "local", url: null, created: 1 }), { mode: 0o600 });
+  }
+  const lines = [];
+  const tmpFor = makeTmpResolver({ stateDir, root, warn: (l) => lines.push(l) });
+  const hook = makeShellHook("/kit/shims", tmpFor);
+  const run = (env) => { const spec = { command: "true", env }; hook(spec); return spec.env; };
+  return { base, stateDir, root, lines, run, tmpFor };
+}
+const baseEnv = (session) => ({ PATH: "/usr/bin", HOME: "/home/user", TMPDIR: "/var/shared", LANG: "C", ...(session ? { OPENCODE_SESSION_ID: session } : {}) });
+
+test("S1: two launched headless workers get two different private directories, mode 0700", () => {
+  const w = tmpWorld({ alpha: "ses_aaa1", beta: "ses_bbb2" });
+  const a = w.run(baseEnv("ses_aaa1")).TMPDIR;
+  const b = w.run(baseEnv("ses_bbb2")).TMPDIR;
+  assert.equal(a, path.join(w.root, "alpha"));
+  assert.equal(b, path.join(w.root, "beta"));
+  assert.notEqual(a, b);
+  for (const d of [a, b]) assert.equal(fs.statSync(d).mode & 0o777, 0o700);
+  assert.equal(w.run(baseEnv("ses_aaa1")).TMPDIR, a); // a second command: the same directory
+  assert.deepEqual(w.lines, []);
+});
+
+test("S2: a terminal worker, an unlaunched session and every other variable are unchanged", () => {
+  const w = tmpWorld({ alpha: "ses_aaa1" });
+  const withShims = (env) => ({ ...env, PATH: "/kit/shims:/usr/bin" });
+  const terminal = { ...baseEnv("ses_aaa1"), FLEET_AGENT_TMPDIR: "/own/dir" }; // has a record, but the pane's own TMPDIR wins
+  assert.deepEqual(w.run(terminal), withShims(terminal));
+  const stranger = baseEnv("ses_zzz9");
+  assert.deepEqual(w.run(stranger), withShims(stranger));
+  const none = baseEnv(null);
+  assert.deepEqual(w.run(none), withShims(none));
+  const headless = w.run({ ...baseEnv("ses_aaa1"), EXTRA: "x" });
+  const expected = { ...baseEnv("ses_aaa1"), EXTRA: "x", PATH: "/kit/shims:/usr/bin", TMPDIR: path.join(w.root, "alpha") };
+  assert.deepEqual(headless, expected); // only TMPDIR differs from the shims-only environment
+});
+
+test("S3 and S7: a directory that cannot be made, or a symlink at the path, keeps the shared TMPDIR, says it once, never throws", () => {
+  const w = tmpWorld({ alpha: "ses_aaa1", beta: "ses_bbb2" });
+  fs.writeFileSync(w.root, "a file where the root should be"); // mkdir under it fails
+  assert.equal(w.run(baseEnv("ses_aaa1")).TMPDIR, "/var/shared");
+  assert.equal(w.run(baseEnv("ses_aaa1")).TMPDIR, "/var/shared");
+  assert.equal(w.lines.length, 1); // one line per session, not one per command
+  assert.match(w.lines[0], /shared temp directory/);
+  fs.unlinkSync(w.root);
+  fs.mkdirSync(w.root);
+  const elsewhere = fs.mkdtempSync(path.join(w.base, "elsewhere-"));
+  fs.symlinkSync(elsewhere, path.join(w.root, "beta"));
+  const spec = { command: "true", env: baseEnv("ses_bbb2") };
+  assert.doesNotThrow(() => w.tmpFor && makeShellHook("/kit/shims", w.tmpFor)(spec));
+  assert.equal(spec.env.TMPDIR, "/var/shared");
+  assert.match(spec.env.PATH, /^\/kit\/shims/); // the command still runs, with its shims
+  assert.equal(w.lines.length, 2);
+  assert.deepEqual(fs.readdirSync(elsewhere), []); // nothing written through the link
+  assert.ok(fs.lstatSync(path.join(w.root, "beta")).isSymbolicLink());
+});
+
+test("S4: a hostile agent name is refused and creates nothing", () => {
+  const w = tmpWorld();
+  for (const name of ["a/b", "../evil", "..", ".", "a\0b", "a".repeat(200), "", "Upper", "cos", "planrev-x"]) {
+    assert.throws(() => ensureAgentTmp(w.root, name), undefined, JSON.stringify(name));
+  }
+  assert.equal(fs.existsSync(w.root) ? fs.readdirSync(w.root).length : 0, 0);
+  assert.equal(fs.existsSync(path.join(w.base, "evil")), false);
+  // a record file or a record's content cannot smuggle a name either
+  fs.writeFileSync(path.join(w.stateDir, "headless", "bad.json"), JSON.stringify({ worker: "../evil", session: "ses_x1", kind: "local" }), { mode: 0o600 });
+  assert.equal(headlessNameOf(w.stateDir, "ses_x1"), null);
+});
+
+test("S7: a command through the hook completes with its own environment even when the directory fails", () => {
+  const w = tmpWorld({ alpha: "ses_aaa1" });
+  fs.writeFileSync(w.root, "x");
+  const spec = { command: "exit 3", cwd: "/", env: baseEnv("ses_aaa1") };
+  makeShellHook("/kit/shims", w.tmpFor)(spec);
+  assert.equal(spec.command, "exit 3"); // nothing is blocked or rewritten
+  assert.equal(spec.env.TMPDIR, "/var/shared");
+});
+
+test("S8: a session the switchboard did not launch creates no directory and keeps TMPDIR", () => {
+  const w = tmpWorld({ alpha: "ses_aaa1" });
+  const env = baseEnv("ses_other");
+  assert.equal(w.run(env).TMPDIR, "/var/shared");
+  assert.equal(fs.existsSync(w.root), false);
+  // a record that is not private, not ours-by-name or a symlink is not a launch record
+  fs.chmodSync(path.join(w.stateDir, "headless", "alpha.json"), 0o644);
+  assert.equal(w.run(baseEnv("ses_aaa1")).TMPDIR, "/var/shared");
+  assert.equal(fs.existsSync(w.root), false);
+});
+
+test("U1: the plugin wires the shell hook with the resolver, and an api-less resolver leaves PATH handling as before", async () => {
+  const hooks = {};
+  const w = tmpWorld({ alpha: "ses_aaa1" });
+  await plugin.setup({ shell: { hook: (n, f) => { hooks[n] = f; } }, permission: { hook() {} } }, { FLEET_SWITCHBOARD_SHIMS: "/kit/shims" }, { home: w.base, sender: null, tmpFor: w.tmpFor });
+  const spec = { env: baseEnv("ses_aaa1") };
+  hooks["create.before"](spec);
+  assert.equal(spec.env.TMPDIR, path.join(w.root, "alpha"));
+  assert.equal(spec.env.PATH, "/kit/shims:/usr/bin");
+  assert.equal(tmpRootOf({ XDG_DATA_HOME: "/data" }, "/h"), "/data/fleet-switchboard/profile/tmp");
+  assert.equal(tmpRootOf({}, "/h"), "/h/.local/share/fleet-switchboard/profile/tmp");
+  const off = { env: baseEnv("ses_aaa1") };
+  makeShellHook("/kit/shims")(off); // no resolver: the old behaviour, byte for byte
+  assert.deepEqual(off.env, { ...baseEnv("ses_aaa1"), PATH: "/kit/shims:/usr/bin" });
 });

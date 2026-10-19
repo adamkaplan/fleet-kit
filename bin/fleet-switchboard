@@ -6110,6 +6110,12 @@ def view_env(role, repo):
 AGENT_TMP_ENV = "FLEET_AGENT_TMPDIR"   # read by the private wrapper only: it becomes the agent's TMPDIR (#767)
 
 
+def headless_tmp_root():
+    """The temp root the fleet-hooks plugin makes a headless worker's private directory under (#846): the same path the pane wrapper's profile uses.
+    The plugin has no config to read, so unlike a pane's, it does not depend on the wrapper."""
+    return _xdg("XDG_DATA_HOME", ".local/share") / PROG / "profile" / "tmp"
+
+
 def agent_tmp_root(config):
     """The profile's shared temp root when panes run through the private wrapper (the one that exports TMPDIR), else None (a shared profile or a test
     has no wrapper, so there is nothing to override)."""
@@ -6155,9 +6161,10 @@ def agent_tmp_env(engine, name):
     return {AGENT_TMP_ENV: str(path)}
 
 
-def reclaim_agent_tmp(engine, name):
-    """At retire: the agent's private TMPDIR is removed when it is EMPTY, else kept and the reason said. Never forced, never recursive. Returns lines."""
-    root = agent_tmp_root(engine.config)
+def reclaim_agent_tmp(engine, name, headless=False):
+    """At retire: the agent's private TMPDIR is removed when it is EMPTY, else kept and the reason said. Never forced, never recursive. Returns lines.
+    A headless worker's directory (#846, made by the plugin) is under the same root and goes by the same rule."""
+    root = agent_tmp_root(engine.config) or (headless_tmp_root() if headless else None)
     if root is None or not NAME_RE.match(name or "") or agent_tmp_shared_name(name):
         return []
     path = root / name
@@ -7484,7 +7491,7 @@ def cmd_retire(args, runner, now):
     except Exception as err:   # the retirement above is already written: a reclaim problem is said, never a traceback
         sys.stderr.write("%s: worktree reclaim failed (%s): the agent is retired; run `%s disk reclaim-worktrees --apply` to retry\n" % (PROG, _one_line(str(err), 100), PROG))
     try:
-        for line in reclaim_agent_tmp(engine, name):   # its private TMPDIR (#767): removed when empty, else kept with the reason
+        for line in reclaim_agent_tmp(engine, name, headless=headless_kept is not None):   # its private TMPDIR (#767): removed when empty, else kept with the reason
             print("tmpdir: " + line)
     except Exception as err:   # the retirement is already written: said, never a traceback
         sys.stderr.write("%s: private temp directory not handled (%s): the agent is retired; remove it by hand\n" % (PROG, _one_line(str(err), 100)))

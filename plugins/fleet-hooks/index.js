@@ -402,13 +402,142 @@ export function shimsOf(env = process.env) {
   return dir && path.isAbsolute(dir) ? dir : null; // an unset or relative path turns the shell hook off
 }
 
-export function makeShellHook(dir) {
+// #846: a launched HEADLESS worker (no pane, so no pane environment) gets its own private TMPDIR here, the same design as the pane's (#767):
+// <profile>/tmp/<agent name>, mode 0700, the name validated by the same pattern, never the shared directory by fallback in silence. The session is
+// told from the launch record the switchboard writes for a headless worker (state-dir/headless/<name>.json: {worker, session, kind: "local"}), read
+// here the way agent_presence.py reads it (a real directory of ours, no symlink, a private regular file, 8 KB at most). The session id is the
+// OPENCODE_SESSION_ID the service sets in the tool's environment (the id the gh shim already goes by): UNVERIFIED in the shell spec until the
+// plugin is loaded. A session with no record (a terminal worker, the Chief of Staff, a person) gets no change.
+export const AGENT_NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/; // herdr's pattern, as NAME_RE in bin/fleet-switchboard
+const RECORD_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/; // agent_presence.valid_name
+const RECORD_MAX = 8192;
+const MAX_RECORDS = 200;
+const NEGATIVE_TTL_MS = 10000; // a session with no record is looked up again after this, so a command costs no scan
+const LANE_PREFIX = "planrev-"; // the plan review lanes and the Chief of Staff keep the shared directory (agent_tmp_shared_name)
+
+export function dataDirOf(env = process.env, home = os.homedir()) {
+  const base = env.XDG_DATA_HOME && path.isAbsolute(env.XDG_DATA_HOME) ? env.XDG_DATA_HOME : path.join(home, ".local", "share");
+  return path.join(base, "fleet-switchboard");
+}
+
+export function tmpRootOf(env = process.env, home = os.homedir()) {
+  return path.join(dataDirOf(env, home), "profile", "tmp");
+}
+
+function oneLine(text) {
+  return String(text).replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").slice(0, 200);
+}
+
+// The agent's private directory, made now (0700) under root; returns its path. Throws when the name is not valid or the path is not our own
+// directory. Never recursive below the root, never follows a symlink at the path.
+export function ensureAgentTmp(root, name, fsm = fs) {
+  if (typeof name !== "string" || !AGENT_NAME_RE.test(name) || name === "cos" || name.startsWith(LANE_PREFIX)) throw new Error("not a valid agent name");
+  const dir = path.join(root, name);
+  if (path.dirname(dir) !== root) throw new Error("outside the temp root");
+  fsm.mkdirSync(root, { recursive: true });
+  try {
+    fsm.mkdirSync(dir, { mode: 0o700 });
+  } catch (err) {
+    if (!err || err.code !== "EEXIST") throw err;
+  }
+  const info = fsm.lstatSync(dir);
+  if (!info.isDirectory() || info.uid !== process.getuid()) throw new Error("exists and is not a directory of ours");
+  const fd = fsm.openSync(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW); // no symlink swapped in after the check
+  try {
+    fsm.fchmodSync(fd, 0o700);
+  } finally {
+    fsm.closeSync(fd);
+  }
+  return dir;
+}
+
+function readRecord(base, file, fsm) {
+  const name = file.slice(0, -5);
+  const fd = fsm.openSync(path.join(base, file), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    const info = fsm.fstatSync(fd);
+    if (!info.isFile() || info.uid !== process.getuid() || (info.mode & 0o077) !== 0 || info.size > RECORD_MAX) return null;
+    const buf = Buffer.alloc(info.size);
+    fsm.readSync(fd, buf, 0, info.size, 0);
+    const record = JSON.parse(buf.toString("utf8"));
+    if (!record || record.kind !== "local" || record.worker !== name || typeof record.session !== "string") return null;
+    return record.session;
+  } finally {
+    fsm.closeSync(fd);
+  }
+}
+
+// The launched headless worker's name for a session id, or null. Reads only.
+export function headlessNameOf(stateDir, sessionID, fsm = fs) {
+  if (typeof sessionID !== "string" || !SESSION_RE.test(sessionID)) return null;
+  const base = path.join(stateDir, "headless");
+  const info = fsm.lstatSync(base);
+  if (info.isSymbolicLink() || !info.isDirectory() || info.uid !== process.getuid()) return null;
+  const files = fsm.readdirSync(base).filter((f) => f.endsWith(".json") && RECORD_NAME_RE.test(f.slice(0, -5))).sort().slice(0, MAX_RECORDS);
+  for (const file of files) {
+    try {
+      if (readRecord(base, file, fsm) === sessionID) return file.slice(0, -5);
+    } catch {
+      // one unreadable record is not the session's
+    }
+  }
+  return null;
+}
+
+// (env) -> the private TMPDIR for the session named in env, or null for "no change". Never throws: a directory that cannot be made says so once on
+// stderr (per session and path) and the command runs on the shared directory.
+export function makeTmpResolver({ stateDir, root, now = Date.now, fsm = fs, warn = (line) => process.stderr.write(line + "\n") }) {
+  const known = new Map(); // session -> name (a record is not taken back while the plugin runs; the directory is re-checked on every use)
+  const absent = new Map(); // session -> time until which "no record" stands
+  const said = new Set();
+  return function tmpFor(env) {
+    try {
+      if (!env || typeof env !== "object" || env.FLEET_AGENT_TMPDIR) return null; // a terminal worker has its own since #767
+      const session = env.OPENCODE_SESSION_ID;
+      if (typeof session !== "string" || !SESSION_RE.test(session)) return null;
+      let name = known.get(session);
+      if (name === undefined) {
+        if (now() < (absent.get(session) || 0)) return null;
+        name = headlessNameOf(stateDir, session, fsm);
+        if (name === null) {
+          absent.set(session, now() + NEGATIVE_TTL_MS);
+          if (absent.size > 500) absent.delete(absent.keys().next().value);
+          return null;
+        }
+        known.set(session, name);
+      }
+      if (name === "cos" || name.startsWith(LANE_PREFIX)) return null;
+      try {
+        return ensureAgentTmp(root, name, fsm);
+      } catch (err) {
+        const key = session + "|" + name;
+        if (!said.has(key)) {
+          said.add(key);
+          try {
+            warn(`fleet-hooks: no private TMPDIR for ${oneLine(name)} (${oneLine(err && (err.code || err.message) || "error")}): its commands run on the shared temp directory`);
+          } catch {
+            // stderr gone: nothing to say it on
+          }
+        }
+        return null;
+      }
+    } catch {
+      return null; // the command runs as it was
+    }
+  };
+}
+
+export function makeShellHook(dir, tmpFor = null) {
   return function createBefore(spec) {
     try {
       if (!spec || typeof spec !== "object") return;
       const env = Object.assign({}, spec.env);
       const rest = String(env.PATH || "").split(path.delimiter).filter((p) => p && p !== dir);
       env.PATH = [dir, ...rest].join(path.delimiter);
+      if (tmpFor) {
+        const tmp = tmpFor(spec.env);
+        if (tmp) env.TMPDIR = tmp;
+      }
       spec.env = env;
     } catch {
       // Whatever goes wrong, the command runs as it was.
@@ -453,7 +582,10 @@ export default {
       const sender = deps.sender === undefined ? makeEventSender({ dir: stateDirOf(env, deps.home) }) : deps.sender;
       if (sender) wireEvents(api, sender); // each part is wired only if the service offers it; never any effect on a tool call
     }
-    if (shims && api.shell && typeof api.shell.hook === "function") api.shell.hook("create.before", makeShellHook(shims));
+    if (shims && api.shell && typeof api.shell.hook === "function") {
+      const tmpFor = deps.tmpFor === undefined ? makeTmpResolver({ stateDir: stateDirOf(env, deps.home), root: tmpRootOf(env, deps.home) }) : deps.tmpFor;
+      api.shell.hook("create.before", makeShellHook(shims, tmpFor));
+    }
     if (!bin) return; // not configured: tool calls follow the configured rules alone (and none is counted)
     const tally = deps.tally === undefined ? makeTally({ dir: stateDirOf(env, deps.home) }) : deps.tally;
     if (tally) {

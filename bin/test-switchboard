@@ -4120,6 +4120,32 @@ class TestLaunch(Base):
         self.assertIn("kept (1 file(s)", line)
         self.assertTrue((root / "coder2" / "body.md").exists())
 
+    # --- #846: a headless worker's private TMPDIR (made by the fleet-hooks plugin) is retired by the same rule
+    def test_s5_retire_of_a_headless_workers_directory_removes_only_an_empty_one_inside_the_root(self):
+        data = self.home / "xdg-data-846"
+        root = data / sb.PROG / "profile" / "tmp"
+        with mock.patch.dict(os.environ, {"XDG_DATA_HOME": str(data)}):
+            self.assertEqual(sb.headless_tmp_root(), root)
+            self.assertEqual(sb.reclaim_agent_tmp(self.engine, "coder"), [])   # a pane agent on a shared profile: not touched
+            self.assertEqual(sb.reclaim_agent_tmp(self.engine, "coder", headless=True), [])   # no directory: nothing to say
+            (root / "empty").mkdir(parents=True)
+            (root / "full").mkdir()
+            (root / "full" / "keep.txt").write_text("x")
+            outside = self.home / "outside-846"
+            outside.mkdir()
+            (outside / "f").write_text("x")
+            (root / "link").symlink_to(outside)
+            self.assertEqual(sb.reclaim_agent_tmp(self.engine, "empty", headless=True), ["%s: removed (empty)" % (root / "empty")])
+            self.assertFalse((root / "empty").exists())
+            line = sb.reclaim_agent_tmp(self.engine, "full", headless=True)[0]
+            self.assertIn("kept (1 file(s)", line)
+            self.assertTrue((root / "full" / "keep.txt").exists())
+            self.assertIn("not a plain directory", sb.reclaim_agent_tmp(self.engine, "link", headless=True)[0])
+            self.assertTrue((outside / "f").exists())
+            for hostile in ("../outside-846", "a/b", "..", "A\x00b", "x" * 80, "cos", "planrev-a"):
+                self.assertEqual(sb.reclaim_agent_tmp(self.engine, hostile, headless=True), [], hostile)
+            self.assertTrue(outside.exists())
+
     def test_the_temp_root_is_the_profiles_only_when_panes_run_through_the_wrapper(self):
         data = self.home / "xdg-data"
         with mock.patch.dict(os.environ, {"XDG_DATA_HOME": str(data)}):
@@ -14904,6 +14930,19 @@ class TestHeadlessPresence(Base):
         self.assertIn("the same repo, with different accounts", str(raised.exception))
         accounts = self.engine.accounts
         self.assertEqual([accounts.account_for(r) for r in ("ACME/Widget", "acme/widget.git", "x/y", None, 5)], ["acct-ops", "acct-ops", None, None, None])
+
+    def test_s5_retire_of_a_headless_worker_handles_its_private_tmpdir_from_the_plugin(self):
+        data = self.home / "xdg-data-846b"
+        root = data / sb.PROG / "profile" / "tmp"
+        self.launch_hl()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        os.environ["HERDR_PANE_ID"] = self.world.panes["boss"]
+        (root / "hw").mkdir(parents=True)
+        with mock.patch.dict(os.environ, {"XDG_DATA_HOME": str(data)}):
+            code, out, err = self.run_cli("retire", "hw")
+        self.assertEqual(code, 0, err)
+        self.assertRegex(out, r"tmpdir: .*hw: removed \(empty\)")
+        self.assertFalse((root / "hw").exists())
 
     def test_retire_frees_the_name_of_a_headless_worker_and_undo_restores_the_record_unless_the_name_was_taken(self):
         done = self.launch_hl()
