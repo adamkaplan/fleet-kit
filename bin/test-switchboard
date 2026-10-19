@@ -33053,6 +33053,23 @@ class TestImpactHold(LedgerBase):
         self.assertEqual([(r["pr"], r["head"], r["score"], r["threshold"]) for r in rows], [("acme/app#9", LEDGER_HEAD, "Medium", "Serious")])
         self.assertIn("Medium", self.run_as("cos", "impact", "delegated")[1])
 
+    def test_s10_s11_a_delegated_clear_at_one_head_is_a_hold_again_at_the_next_and_the_rating_of_the_first_does_not_count(self):
+        self.score_config()
+        self.scored_pr()
+        self.rate(*self.cell_of("Low"))
+        self.assertEqual(self.under()[0], 0)
+        state = sb.read_impact_state(self.world.state)[0]
+        self.assertEqual(state["clears"]["acme/app#9"]["head"], LEDGER_HEAD)
+        later = "9" * 40
+        self.assertTrue(sb.rehold_reason(self.engine_cached, state, "acme/app", "acme/app#9", later), "held again at the new head")
+        self.assertFalse(sb.rating_at(self.engine_cached, "acme/app#9", later)[0], "the rating of the first head is not one at the second")
+        self.pr["headRefOid"] = later   # a clear started on a pull request that has moved: the head of the rating is not the head now
+        self.writes.clear()
+        code, out, err = self.under()
+        self.assertEqual(code, 2)
+        self.assertIn("no independent impact rating at this head", err)
+        self.assertEqual(self.deletes(), [])
+
     def test_s20_s23_no_agent_command_writes_the_threshold_and_no_committed_file_sets_one(self):
         daemon = Path(sb.__file__).read_text()
         self.assertEqual(daemon.count("max_level"), 0)
