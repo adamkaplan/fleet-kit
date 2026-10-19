@@ -67069,8 +67069,21 @@ class TestBatchingDocs(unittest.TestCase):
     def test_the_five_topics_are_each_a_heading_once(self):
         section = self.section()
         for topic in ("### What batches and what goes straight", "### The cadence and who keeps the batch", "### The freeze",
-                      "### The sync", "### An ask whose change is only in `integration`"):
+                      "### The sync", "### An ask whose change is only in `integration`", "### The steps a lane follows"):
             self.assertEqual(section.count(topic), 1, topic)
+
+    def test_the_hold_rule_uses_the_matrix_terms_and_marks_the_delegation_a_target(self):
+        section = self.section()
+        for phrase in ("`owner_hold`", "Target, after #835 lands", "`delegated_clear`", "aggregated diff", "`batch-ready`",
+                       "voids the owner's clear", "before the next change merges into `integration`", "delete head branch on merge"):
+            self.assertEqual(section.count(phrase), 1, phrase)
+
+    def test_the_lane_steps_are_numbered_and_each_carries_a_command(self):
+        steps = self.section().split("### The steps a lane follows", 1)[1].split("###", 1)[0].strip().splitlines()
+        numbered = [l for l in steps if l[:2] in ("1.", "2.", "3.", "4.", "5.", "6.")]
+        self.assertEqual(len(numbered), 6)
+        for line in numbered:
+            self.assertIn("`", line)
 
     def test_the_skill_names_the_batching_rules_in_one_paragraph(self):
         text = (REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text()
