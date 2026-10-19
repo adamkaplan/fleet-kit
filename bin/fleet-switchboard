@@ -11689,6 +11689,28 @@ def decisions_caller(args, runner, now):
         return {}  # a person's own shell inside herdr has a pane and no agent: the human's view, never a crash
 
 
+def held_merge_order_hints(decisions, runner, now):
+    """#818: advisory `merge order: #A, then #B (shared files)` lines among the HELD pull requests of the listed decisions (kind `captain`) that share files, the one
+    that has waited longest first. ONE bounded read per repo that has two or more held pull requests (CLI only, never the daemon); any failure gives no hint."""
+    by_repo = {}
+    for d in decisions:
+        since = parse_iso(d.get("since"))
+        if d.get("kind") == "captain" and d.get("repo") and isinstance(d.get("number"), int) and since is not None:
+            by_repo.setdefault(d["repo"], {})[d["number"]] = since
+    hints = []
+    for repo, waited in sorted(by_repo.items()):
+        if len(waited) < 2:
+            continue
+        try:
+            engine = build_engine(runner, now, "cli", writable=False)[0]
+            listing = read_open_overlap(engine, repo, runner)
+            if listing:
+                hints.extend(("%s: " % repo if len(by_repo) > 1 else "") + h for h in overlap_waiting_order(listing, sorted(waited.items())))
+        except Exception:
+            continue
+    return hints
+
+
 def cmd_decisions(args, runner, now):
     action = getattr(args, "decisions_action", None) or "list"
     if action != "list":
@@ -11715,11 +11737,16 @@ def cmd_decisions(args, runner, now):
     report = fresh_decisions(runner, now) if args.fresh else decisions_report(state, now())
     shown = dict(report, decisions=select_decisions(report["decisions"], view))
     external = external_status_line(config, state, now()) if config else None
+    hints = [] if report["stale"] else held_merge_order_hints(shown["decisions"], runner, now)
     if args.json:
         extra = {"external": external} if external is not None else {}
+        if hints:
+            extra["merge_order"] = hints
         print(json.dumps(dict(shown, message=report["message"] or None, view=view, **extra), indent=2, sort_keys=True))
     else:
         print(format_decisions(shown, now(), view))
+        for hint in hints:
+            print(hint)
         if external is not None:
             print("(%s)" % external)
     return EXIT_ERROR if report["stale"] else EXIT_OK
@@ -19983,6 +20010,93 @@ def cmd_waive(args, runner, now):
 cmd_waive.ledger = True   # state and GETs only; its own errors are usage errors
 
 
+# ---- #818: which open pull requests change the same files. Read-only information, never a block. Pure parsing and the two texts; the one bounded read is `read_open_overlap`.
+OVERLAP_LIST_CAP = 50    # the most open pull requests read, in one call
+OVERLAP_FILES_CAP = 100  # the most files of one pull request used; a pull request with more changed files is left out
+OVERLAP_SHOW_FILES = 3   # files named in a `shares` line
+OVERLAP_PATH_MAX = 300  # a longer path, or one with a control character, is not printed: the pull request is left out
+OVERLAP_SHOW_PRS = 5     # pull requests named in a `shares` line or a merge order
+
+
+def overlap_parse_listing(raw):
+    """{number: [paths]} of the pull requests whose whole file list was read. Anything else is left out, never guessed."""
+    out = {}
+    if not isinstance(raw, list):
+        return out
+    for item in raw[:OVERLAP_LIST_CAP]:
+        if not isinstance(item, dict) or isinstance(item.get("number"), bool) or not isinstance(item.get("number"), int):
+            continue
+        files, total = item.get("files"), item.get("changedFiles")
+        if not isinstance(files, list) or isinstance(total, bool) or not isinstance(total, int):
+            continue
+        if total > OVERLAP_FILES_CAP or len(files) != total:
+            continue   # truncated or over the cap: not the whole list
+        paths = [f.get("path") for f in files if isinstance(f, dict)]
+        if len(paths) != total or not all(isinstance(p, str) and 0 < len(p) <= OVERLAP_PATH_MAX and p.isprintable() for p in paths):
+            continue
+        out[item["number"]] = sorted(set(paths))
+    return out
+
+
+def overlap_shared(listing, number, other):
+    return sorted(set(listing.get(number) or ()) & set(listing.get(other) or ()))
+
+
+def overlap_shares_line(listing, number):
+    """`shares <file>, <file> with #N, #M`, or None. Files: the first OVERLAP_SHOW_FILES (sorted) changed by this pull request AND another listed one;
+    pull requests: the first OVERLAP_SHOW_PRS by number. None when this pull request's own list was not read or nothing overlaps."""
+    if not isinstance(listing, dict) or number not in listing:
+        return None
+    others = sorted(n for n in listing if n != number and overlap_shared(listing, number, n))
+    if not others:
+        return None
+    files = sorted({p for n in others for p in overlap_shared(listing, number, n)})
+    return "shares %s with %s" % (", ".join(files[:OVERLAP_SHOW_FILES]), ", ".join("#%d" % n for n in others[:OVERLAP_SHOW_PRS]))
+
+
+def overlap_waiting_order(listing, waited):
+    """Hints among held pull requests that share files. `waited` is [(number, since)] of the held ones (since: epoch seconds, smaller waited longer).
+    One hint per group of held pull requests linked by shared files, the one that has waited longest first: `merge order: #748, then #736 (shared files)`."""
+    held = {n: s for n, s in waited if n in (listing or {})}
+    seen, hints = set(), []
+    for start in sorted(held):
+        if start in seen:
+            continue
+        group, todo = set(), [start]
+        while todo:
+            n = todo.pop()
+            if n in group:
+                continue
+            group.add(n)
+            todo.extend(m for m in held if m not in group and overlap_shared(listing, n, m))
+        seen |= group
+        if len(group) > 1:
+            ordered = sorted(group, key=lambda n: (held[n], n))[:OVERLAP_SHOW_PRS]
+            hints.append("merge order: %s (shared files)" % ", then ".join("#%d" % n for n in ordered))
+    return hints
+
+
+def read_open_overlap(engine, repo, runner):
+    """{number: [paths]} of the open pull requests of `repo` whose whole file list was read , or None when it cannot be read. ONE bounded
+    `gh pr list` (at most OVERLAP_LIST_CAP pull requests, OVERLAP_FILES_CAP files each), cached on the engine for the call. CLI only: the daemon never calls it (#818)."""
+    cache = engine.__dict__.setdefault("_overlap_cache", {})
+    if repo in cache:
+        return cache[repo]
+    cache[repo] = None
+    try:
+        accounts = getattr(engine, "accounts", None) or GhAccounts(engine.config, engine.gh_runner or runner, engine.now)
+        refuse_excluded(engine.config, repo)
+        env = accounts.env_for(repo)
+        argv = [engine.config["gh"], "pr", "list", "--repo", repo, "--state", "open", "--limit", str(OVERLAP_LIST_CAP), "--json", "number,files,changedFiles"]
+        done = (engine.gh_runner or runner)(argv, capture_output=True, text=True, timeout=min(engine.config["call_timeout_seconds"], GITHUB_ROUTE_READ_TIMEOUT),
+                                            stdin=subprocess.DEVNULL, **({"env": env} if env is not None else {}))
+        if done.returncode == 0:
+            cache[repo] = overlap_parse_listing(json.loads(done.stdout or "[]"))
+    except Exception:   # advisory: whatever goes wrong, there is no line (never a wrong one) and nothing else changes
+        cache[repo] = None
+    return cache[repo]
+
+
 def cmd_gates(args, runner, now):
     """`gates <repo#N>`: read-only. One line per gate G0a to G8: status, who decides it, what is missing. Exit 0 when every
     tracked gate that applies to a PR is satisfied, 1 when something is missing, 2 when it cannot be read. Enforces nothing."""
@@ -20008,10 +20122,15 @@ def cmd_gates(args, runner, now):
     report["plan_source"] = ctx.source
     if first and ctx.source and not _same_plan(first, ctx.source, ctx.config.get("intent_repo")):
         report["plan_changed"] = "the PR's plan is now %s; its entries were recorded against %s (they are void)" % (ctx.source, first)
+    shares = overlap_shares_line(read_open_overlap(ctx.engine, ctx.repo, runner), ctx.number) if not ctx.unreadable else None   # #818: information only
     if args.json:
+        if shares:
+            report["shares"] = shares
         print(json.dumps(report, sort_keys=True))
     else:
         lines = plan_ledger.render_gates(report, ctx.pr)
+        if shares:
+            lines.append(shares)
         if ctx.unreadable:
             lines.append("PR not read: %s" % ctx.unreadable)
         if ctx.plan_problem:
@@ -21682,7 +21801,8 @@ def add_ledger_parsers(sub):
     waive.add_argument("--head", help="The PR head sha (default: read from GitHub)")
     gates = sub.add_parser("gates", help="Read-only: the plan's gates G0a to G8 for a PR, what each needs and who decides it. "
                                          "Also `gates mode <repo> shadow|enforce|off`, `gates off|on` (the global kill file) and "
-                                         "`gates preflight <repo>`")
+                                         "`gates preflight <repo>`. May add one `shares <file> with #N` line when another open PR changes the same files "
+                                         "(one read of at most 50 open PRs and 100 files each; information only)")
     common(gates, scenario=False)
     gates.add_argument("rest", nargs="*", help="With `mode`: <owner/repo> <shadow|enforce|off>")
     gates.add_argument("--json", action="store_true")
