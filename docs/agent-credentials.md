@@ -1,6 +1,6 @@
 # Agent credentials for GitHub: inventory, design and migration
 
-Status: design for decision, corrected to the owner's standing order (#568, under the least-privilege law #540). Nothing here changes a shim, a configuration or a credential. Clause (4) of the ask, the live proof, runs after the owner migrates and is not part of this document.
+Status: the per-repository App installation token in the `gh` and `git` shims is built and merged (#616); the owner's steps that put it to use are not done (#568, under the least-privilege law #540). This document changes no shim, configuration or credential. Clause (4) of the ask, the live proof, is not done: it runs after the owner migrates and is not part of this document.
 
 **The intent.** An agent's GitHub credential for a repository cannot change that repository's settings, rulesets, branch protection or collaborators, nor merge around the ruleset. Only the owner's own login can.
 
@@ -78,8 +78,8 @@ The same kind of GitHub App as the cloud path, installed on the organisation's r
 
 | Criterion | Assessment |
 |-----------|------------|
-| Cost | No new account and no seat; the App already exists. Needs shim code (see "What C needs"), a top-tier work item of size L. The App's private key must live on the machine, a stronger secret than a token |
-| What breaks | Until the shim work lands nothing changes. After it, the failure modes are a mint outage, an unreadable key and clock skew, all of which fail closed. A repository with no installation is refused |
+| Cost | No new account and no seat; the App already exists. The shim code is built and merged (see "What C needs"). The App's private key must live on the machine, a stronger secret than a token |
+| What breaks | Until the owner maps a repository and supplies the key, nothing changes for it. After that, the failure modes are a mint outage, an unreadable key and clock skew, all of which fail closed. A repository with no installation is refused |
 | Rotation | Best of the three: tokens live an hour and need no manual step. The owner rotates the private key on a schedule in the App's settings |
 | Who merges | The owner's login merges and clears holds. The App's pull requests carry a bot identity, so the owner can approve them. The App has no bypass of the ruleset and no Administration permission |
 
@@ -93,16 +93,17 @@ Why:
 - The token lives an hour and is bound to one repository, with no manual rotation and no new account.
 - It reuses the App and the permission model the cloud path already runs on.
 
-### What C needs on top of the App
+### What is built, and what C still needs on top of the App
 
-- A local mint in the `gh` and `git` shims. The private key is meant to be read only by the shim process, never by an agent's shell or environment. A file mode is a convenience, not a guarantee, against an agent running as the same user; the real guard is that the key sits outside the agent's reach, for example under a different user or behind a vault call.
-- A one-hour per-repository token, cached with its expiry and renewed before it ends.
-- Fail closed: a mint failure, or a repository with no installation, refuses the call with one clear line. It never falls back to another login.
-- A repository-to-installation map extending `gh_users`.
+**What is built.** The shim mint is built and merged (#616): the `gh` and `git` shims mint an App installation token for one repository, short-lived (one hour at most), and fail closed (a mint failure, an unreadable key or a repository with no installation refuses the call and never falls back to another login). The token for a named repository is used only for the Chief of Staff's recorded role (`whoami` carries the role; a missing role counts as not), and a worker that names another mapped repository is refused. It acts only where the owner has mapped a repository; the live proof of it is not done.
+
+What still has to exist for C to protect anything, all of it the owner's:
+
+- The App's private key, kept only where the shim process reads it, never in an agent's shell or environment. A file mode is a convenience, not a guarantee, against an agent running as the same user; the real guard is that the key sits outside the agent's reach, for example under a different user or behind a vault call.
+- The repository-to-installation map beside `gh_users`, with the installation ids (kept in the owner's configuration, never in this repository).
 - App permissions: `contents: write`, `pull_requests: write`, `issues: write`, `checks: read`, `metadata: read`, and no Administration. The owner adds `issues: write` and `checks: read`.
+- The migration steps that take the owner's broad login out of the agents' reach (see "Migration").
 - The owner's own login keeps merging and clearing holds.
-
-That shim work is a separate top-tier work item, size L, with the owner's clear. This document changes no shim.
 
 ### Out of scope, unchanged
 
@@ -118,8 +119,8 @@ Who merges after the change, in scope:
 Every step that creates or changes a credential is the owner's (see "The owner's own steps"). Agents run none of them and run no command that creates a credential. Steps apply only to the organisation's repositories where the App is installed.
 
 1. The owner confirms the App's installation on each in-scope repository.
-2. The shim work item lands separately (top tier, size L, owner's clear), with the mint, cache and fail-closed behaviour above. The cloud mint's exact-permission check is being added by the open pull request #545. If and when it is merged, it refuses every cloud token whose permissions differ from its expected map, so that map must be changed to the new set, a top-tier credential change with its own review and the owner's clear, before the App is widened or together with it.
-3. Only after that is merged, the owner adds `issues: write` and `checks: read` to the App's permissions and confirms there is no Administration permission. Widening the App earlier would make the cloud mint (once #545 is merged) refuse every cloud token, because the permissions no longer match its exact check. If that happens, narrow the App back to its previous permissions.
+2. The shim work is merged (#616): the mint, cache and fail-closed behaviour above. Not done: the change to the cloud mint's expected permissions, below. The cloud mint's exact-permission check is being added by the open pull request #545. If and when it is merged, it refuses every cloud token whose permissions differ from its expected map, so that map must be changed to the new set, a top-tier credential change with its own review and the owner's clear, before the App is widened or together with it.
+3. Only after that change is merged, the owner adds `issues: write` and `checks: read` to the App's permissions and confirms there is no Administration permission. Widening the App earlier would make the cloud mint (once #545 is merged) refuse every cloud token, because the permissions no longer match its exact check. If that happens, narrow the App back to its previous permissions.
 4. The owner stores the App key where only the shim process reads it, and adds the repository-to-installation map beside `gh_users` in `~/.config/fleet-switchboard/config.json`.
 5. The owner removes the broad token from the agents' environment for in-scope repositories, so there is nothing broader to fall back on.
 6. An agent, with the owner present, runs the live proof of clause (4): an admin call is refused (403 or 404) and a branch push, pull request, label, comment and a merge through the ruleset still work. The same proof checks that the fleet-kit repository itself is unchanged.
@@ -139,11 +140,11 @@ Rollback returns to today's behaviour, including admin reach for agents on that 
 
 These are the only credential-creating or credential-changing steps. No command here belongs in a script an agent runs.
 
-1. Only after the shim change and, if #545 is merged, the change to the cloud mint's expected permission map (see Migration, steps 2 and 3), in the App's settings set the permissions to `contents: write`, `pull_requests: write`, `issues: write`, `checks: read`, `metadata: read`, and no Administration.
+1. Only after, if #545 is merged, the change to the cloud mint's expected permission map (see Migration, steps 2 and 3), in the App's settings set the permissions to `contents: write`, `pull_requests: write`, `issues: write`, `checks: read`, `metadata: read`, and no Administration.
 2. Confirm the App is installed on each in-scope repository (for example `acme-org/widget-api` and `acme-org/widget-web`), and on nothing else.
 3. Generate or keep the App's private key; store it outside the agent's reach (a different user, or a vault call the shim makes), never in a file an agent's shell reads, an issue or a message. A file mode alone is not a boundary against the same user.
 4. Review each in-scope ruleset: its required checks and approvals are what agents are held to, and the App is not in a bypass list.
-5. Add the repository-to-installation map to the configuration once the shim work has landed.
+5. Add the repository-to-installation map (with the installation ids) to the configuration.
 6. Remove the broad inherited token from the agents' shells for in-scope repositories.
 7. Put the key's rotation date in a calendar; at rotation, generate a new key in the App's settings and replace the stored one.
 8. Leave the fleet-kit repository itself and any repository without the App alone.
