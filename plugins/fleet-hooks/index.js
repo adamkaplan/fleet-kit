@@ -409,11 +409,11 @@ export function shimsOf(env = process.env) {
 // OPENCODE_SESSION_ID the service sets in the tool's environment (the id the gh shim already goes by): UNVERIFIED in the shell spec until the
 // plugin is loaded. A session with no record (a terminal worker, the Chief of Staff, a person) gets no change.
 export const AGENT_NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/; // herdr's pattern, as NAME_RE in bin/fleet-switchboard
-const RECORD_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/; // agent_presence.valid_name
-const RECORD_MAX = 8192;
+export const RECORD_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/; // agent_presence.valid_name
+export const RECORD_MAX = 8192;
 const MAX_RECORDS = 200;
 const NEGATIVE_TTL_MS = 10000; // a session with no record is looked up again after this, so a command costs no scan
-const LANE_PREFIX = "planrev-"; // the plan review lanes and the Chief of Staff keep the shared directory (agent_tmp_shared_name)
+export const LANE_PREFIX = "planrev-"; // the plan review lanes and the Chief of Staff keep the shared directory (agent_tmp_shared_name)
 
 export function dataDirOf(env = process.env, home = os.homedir()) {
   const base = env.XDG_DATA_HOME && path.isAbsolute(env.XDG_DATA_HOME) ? env.XDG_DATA_HOME : path.join(home, ".local", "share");
@@ -528,6 +528,7 @@ export function makeTmpResolver({ stateDir, root, now = Date.now, fsm = fs, warn
       } catch (err) {
         const key = session + "|" + name;
         if (!said.has(key)) {
+          if (said.size >= 500) said.delete(said.values().next().value);
           said.add(key);
           try {
             warn(`fleet-hooks: no private TMPDIR for ${oneLine(name)} (${oneLine(err && (err.code || err.message) || "error")}): its commands run on the shared temp directory`);
