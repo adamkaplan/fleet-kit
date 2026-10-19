@@ -66276,6 +66276,16 @@ class TestAgentCredentialsDoc(unittest.TestCase):
         self.assertNotIn("future", status.lower())
         self.assertNotIn("future", needs.lower())
 
+    def test_545_is_stated_merged_and_live_never_open_or_conditional(self):
+        self.assertEqual(self.text.count("the permission check is in the launcher: #545, merged"), 1)
+        self.assertEqual(self.text.count("exact-permission check is merged and live (#545"), 1)
+        self.assertEqual(self.text.count("makes the cloud mint refuse every cloud token today"), 1)
+        for line in self.text.splitlines():
+            if "#545" in line:
+                self.assertIn("merged", line)
+        for old in ("open pull request #545", "if #545 is merged", "If and when it is merged", "is being added", "once #545 is merged", "is not on the main branch yet"):
+            self.assertNotIn(old, self.text)
+
     def test_nothing_says_the_migration_or_live_proof_is_done(self):
         low = self.text.lower()
         for claim in ("migration is complete", "migration is done", "has been migrated", "live proof passed", "live proof is done", "live-proven", "is live"):
