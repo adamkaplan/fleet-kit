@@ -23203,15 +23203,16 @@ class TestSweep(Base):
                     self.world.tick(1)
                     self.sweep_real([])
                     self.assertEqual(len(self.lines(ref)), 1)
-                    self.engine.sweep = None                                          # the daemon restarts
+                    self.engine.sweep, self.engine._last = None, {}                   # the daemon restarts: memory only is gone, the audit's repeat filter too
                     self.world.tick(3600)
                     self.sweep_real([])
                     self.assertEqual(len(self.lines(ref)), 1)                         # not logged again
                     self.assertEqual(self.engine.sweep.facts, {})                     # not woken
-                    self.engine.sweep = None
-                    self.world.tick(7 * 3600)                                         # past the window: woken again
+                    self.engine.sweep, self.engine._last = None, {}
+                    self.world.tick(7 * 3600)                                         # past the window: logged once more, woken
                     self.sweep_real([])
                     self.assertEqual(len(self.engine.sweep.facts), 1)
+                    self.assertEqual([d["woken"] for d in self.lines(ref)], [True, True])
 
     def test_849_shadow_mode_logs_woken_false_and_queues_nothing(self):
         for kind in sorted(sb.SWEEP_KINDS):
@@ -24401,10 +24402,33 @@ class TestTriage(Base):
                     self.aligned()
                     self.pass_now()
                     self.assertEqual([d["woken"] for d in self.tlines(ref)], [True])
-                    self.engine.triage = None                                        # the daemon restarts
+                    self.engine.triage, self.engine._last = None, {}                 # the daemon restarts: memory only is gone, the audit's repeat filter too
                     self.world.tick(120)
                     self.pass_now()
                     self.assertEqual(len(self.tlines(ref)), 1)                       # not logged again
+                    self.engine.triage, self.engine._last = None, {}
+                    self.world.tick(2 * 86400)                                       # past the back-off: due again, logged once more, woken
+                    self.pass_now()
+                    self.assertEqual([d["woken"] for d in self.tlines(ref)], [True, rule != "T5"])   # a T5 is listed once, then only rolled up
+
+    def test_849_a_finding_changed_since_the_restart_is_due_and_logged_woken(self):
+        for rule in sorted(set(sb.TRIAGE_KINDS) - {"OO", "T5"}):
+            with self.subTest(rule=rule):
+                self.setUp()
+                self.engine.config["triage"]["enabled"] = True
+                self.engine.config["triage"]["digest_interval_minutes"] = 0
+                ref, patch = self.one_rule(rule)
+                with patch:
+                    self.aligned()
+                    self.pass_now()
+                    seen = Path(self.world.state) / sb.triage_digest.SEEN_FILE
+                    raw = json.loads(seen.read_text())
+                    raw["items"]["%s %s" % (rule, ref)]["sig"] = "an older state"   # the item changed while the daemon was down
+                    seen.write_text(json.dumps(raw))
+                    self.engine.triage, self.engine._last = None, {}
+                    self.world.tick(120)
+                    self.pass_now()
+                    self.assertEqual([d["woken"] for d in self.tlines(ref)], [True, True])
 
     def test_849_shadow_mode_logs_woken_false_for_every_rule(self):
         for rule in sorted(sb.TRIAGE_KINDS):
