@@ -32,6 +32,7 @@ MOVED = ('gate_floor_fact',
          'authors_hold_labels',
          'impact_clear_core',
          'cmd_impact_clear',
+         'cmd_impact_delegated',
          'delegated_clear_checks',
          'delegated_clear_pr_checks',
          'delegated_clear_map',
@@ -424,7 +425,8 @@ def _notify_clear_body(engine, abandoned, kind, repo, number, head, reason=None,
             flat = re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", re.sub(r"[\n\r\t]", " ", reason or ""))   # line breaks become spaces, other control characters vanish BEFORE the redaction: a token cannot hide behind one
             words = " ".join(redact_command_text(flat).split())
             if under_order:   # #661: the same line, naming the Chief of Staff as the clearer and the owner's order
-                line = "%s cleared %s at %s under the owner's standing order %s: \"%s\"; %s" % (under_order.get("by") or "the chief of staff", pr, head[:8], under_order["number"], plan_ledger.clip(words, 300), "%s merges it" % lane if lane else unknown)
+                scored = " (score %s, threshold %s)" % (under_order.get("score"), under_order["threshold"]) if under_order.get("threshold") else ""
+                line = "%s cleared %s at %s under the owner's standing order %s%s: \"%s\"; %s" % (under_order.get("by") or "the chief of staff", pr, head[:8], under_order["number"], scored, plan_ledger.clip(words, 300), "%s merges it" % lane if lane else unknown)
             else:
                 line = "owner cleared %s at %s: \"%s\"; %s" % (pr, head[:8], plan_ledger.clip(words, 300), "%s merges it" % lane if lane else unknown)
         sent, failed = [], []
@@ -555,6 +557,8 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
         if under_order:   # #661: the Chief of Staff's clear under the owner's standing order: recorded as HER act under that order, never as the owner's
             detail["under_order"] = under_order["number"]
             detail["order"] = plan_ledger.clip(under_order["text"], 300)
+            if under_order.get("threshold"):   # #835: a clear by score shows the score and the threshold it was made under
+                detail["score"], detail["threshold"] = under_order.get("score"), under_order["threshold"]
         if fingerprint is not None:
             detail["fingerprint"] = fingerprint
         engine.audit.append(engine.actor, "gate.hold_cleared", pr, detail)   # inside the lock
@@ -575,6 +579,16 @@ def delegated_clear_checks(engine, runner, now, kind, number):
     orders, charter = configured
     if number not in orders:
         return None, "order %d is not listed as a delegated clear" % number
+    entry = module.entry_of(engine.config, number) or {}
+    threshold = entry.get("max_level")   # #835: the highest level she may clear by score; absent = the path-class rules above all
+    if entry.get("source") == module.OWNER_FILE:   # the owner's own standing-orders file, read-only: ONE line whose exact text is the bound hash
+        try:
+            line = module.file_order_line(cos_orders_text_of(read_cos_orders(engine.config)["raw"]), orders[number])
+        except (CosOrdersError, OSError) as err:
+            return None, "the owner's standing-orders file cannot be read (%s): refused" % _one_line(str(err), 120)
+        if line is None:
+            return None, "the owner's standing-orders file has no single line that is the text order %d is bound to (it was edited, removed or repeated): refused" % number
+        return {"number": number, "text": re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", line), "threshold": threshold, "source": module.OWNER_FILE}, None
     try:
         reader = _intent_reader(runner, now)
         text = module.order_text(fetch_orders(reader, charter, engine.config.get("intent_repo")), number)
@@ -584,7 +598,7 @@ def delegated_clear_checks(engine, runner, now, kind, number):
         return None, "order %d does not exist on charter #%d" % (number, charter)
     if module.order_hash(text) != orders[number]:   # the order numbers are POSITIONS: the text bound in the configuration must still be the text at that number
         return None, "the text of order %d is no longer the one the configuration is bound to (an order was edited, inserted or removed): the owner re-binds it" % number
-    return {"number": number, "text": re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", text)}, None
+    return {"number": number, "text": re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", text), "threshold": threshold}, None
 
 
 def delegated_clear_map(engine, runner, repo, item, base_sha, rule):
@@ -614,9 +628,10 @@ def _gh_json(engine, runner, repo, path):
     return json.loads(done.stdout or "null")
 
 
-def delegated_clear_pr_checks(engine, runner, repo, number):
+def delegated_clear_pr_checks(engine, runner, repo, number, threshold=None, info=None):
     """(report, None) when this pull request may be cleared under an order, else (None, why). The owner-hold decision is the daemon's own (`pr_floor_report`: no second rule), the rule (the classes
-    never delegated and the clear code) is the matrix's `owner_hold.delegated_clear`; anything unreadable is refused. #661."""
+    never delegated and the clear code) is the matrix's `owner_hold.delegated_clear`; anything unreadable is refused. #661. With a `threshold` (the order's max_level, #835) the SCORE of the
+    independent rating at this head is the rule about the pull request's classes; `info` (a dict) gets the score it read, for the audit of a refusal too."""
     try:
         report = pr_floor_report(engine, repo, number)
         rule = (impact_floor.load_matrix().get("owner_hold") or {}).get("delegated_clear")
@@ -650,7 +665,19 @@ def delegated_clear_pr_checks(engine, runner, repo, number):
         for item in files:   # a changed file of the daemon's own: each changed LINE is mapped to its definition by the ast of the file it belongs to
             if isinstance(item.get("filename"), str) and impact_floor.matches(item["filename"], (rule or {}).get("closure_files") or []) and not impact_floor.matches(item["filename"], (rule or {}).get("clear_code_paths") or []) and item.get("status") == "modified":
                 closure[item["filename"]] = delegated_clear_map(engine, runner, repo, item, base_sha, rule)
-    reasons = module.refusals(rule, report, files, impact_floor.matches, closure)
+    scored = None
+    if threshold is not None:   # the score rule: the matrix's block and cells (the running install's, never the head's: a change to the matrix file is refused as machinery above)
+        try:
+            entries, problem = impact_rating_entries(engine.state_dir, report["pr"], report["head"]) if engine.state_dir is not None else ([], "no state directory")
+            block = module.score_block()
+            scored = module.judge(block, impact_floor.load_matrix().get("cells"), entries, report, threshold) if not problem and block is not None else None
+        except Exception as err:   # a matrix, ledger or rule that cannot be read: the score is unknown, never Low
+            scored, problem = None, "%s: %s" % (type(err).__name__, _one_line(str(err), 80))
+        if scored is None:
+            scored = {"level": None, "reasons": ["the independent rating cannot be read (%s): the score is unknown, refused" % (problem or "no score rule")]}
+        if info is not None:
+            info["score"] = scored["level"]
+    reasons = module.refusals(rule, report, files, impact_floor.matches, closure, scored)
     if reasons:
         return None, "; ".join(reasons)
     return report, None
@@ -712,13 +739,14 @@ def cmd_impact_clear(args, runner, now):
     try:
         extra = {}
         if delegated:   # #661: the checks of THIS pull request, at the head they read, and the clear bound to that head
-            report, why = delegated_clear_pr_checks(engine, runner, repo, number)
+            info = {}
+            report, why = delegated_clear_pr_checks(engine, runner, repo, number, delegated.get("threshold"), info)
             if why:
                 if engine.audit is not None:
-                    engine.audit.append(engine.actor, "gate.hold_clear_refused", "%s#%d" % (repo, number), {"by": kind[1], "under_order": delegated["number"], "why": _one_line(why, 300)})
+                    engine.audit.append(engine.actor, "gate.hold_clear_refused", "%s#%d" % (repo, number), dict({"by": kind[1], "under_order": delegated["number"], "why": _one_line(why, 300)}, **({"score": info.get("score"), "threshold": delegated["threshold"]} if delegated.get("threshold") else {})))
                 sys.stderr.write("%s: impact clear: refused: %s\n" % (PROG, _one_line(why, 600)))
                 return EXIT_USAGE
-            extra = {"head": report["head"], "via": "order:%d" % delegated["number"], "under_order": delegated}
+            extra = {"head": report["head"], "via": "order:%d" % delegated["number"], "under_order": dict(delegated, score=info.get("score"))}
         for line in impact_clear_core(engine, runner, repo, number, kind[1], plan_ledger.clip(redact_command_text(reason), 300), **extra):
             print(line)
     except (NoticeError, IntentError) as err:
@@ -730,6 +758,51 @@ def cmd_impact_clear(args, runner, now):
     except RuntimeError as err:      # no audit sink, or the corrupt state file could not be set aside: retrying does not help until it is fixed
         sys.stderr.write("%s: impact clear: refused: %s; nothing was changed\n" % (PROG, _one_line(str(err), 200)))
         return EXIT_ERROR
+    return EXIT_OK
+
+
+def cmd_impact_delegated(args, runner, now):
+    """`impact delegated [--json]` (#835): every clear the Chief of Staff made under an order of the owner's, newest last, from the audit: when, the pull request, the head, the score, the threshold, the order and her
+    judgement line. A refusal (`gate.hold_clear_refused`) is not a clear and is never listed. Read-only; the owner's own clears are not listed."""
+    if getattr(args, "check", False):   # the fleet doctor's check: every configured owner-file order must still be exactly one line of the owner's file (a vanished or changed line is seen now, not at the next clear)
+        engine, _, _ = build_engine(runner, now, "cli", writable=False)
+        module, bad, seen = load_module("delegated_clear"), [], 0
+        raw = (engine.config or {}).get(module.CONFIG_KEY)
+        if raw:
+            try:
+                module.validate(raw, "config")
+            except ValueError as err:
+                print("delegated_clear is malformed: %s" % _one_line(str(err), 200))
+                return EXIT_ERROR
+        for entry in (raw or {}).get("orders", []) if isinstance(raw, dict) else []:
+            if entry.get("source") != module.OWNER_FILE:
+                continue
+            seen += 1
+            try:
+                found = module.file_order_line(cos_orders_text_of(read_cos_orders(engine.config)["raw"]), entry["sha256"])
+            except (CosOrdersError, OSError) as err:
+                found = None
+                bad.append("order %d: the owner's standing-orders file cannot be read (%s)" % (entry["number"], _one_line(str(err), 100)))
+                continue
+            if found is None:
+                bad.append("order %d: no single line of the owner's standing-orders file matches its bound text: the delegation clears nothing" % entry["number"])
+        if bad:
+            print("; ".join(bad))
+            return EXIT_ERROR
+        print("%d owner-file order(s) match their bound line" % seen if seen else "no owner-file order is configured")
+        return EXIT_OK
+    rows = []
+    for entry in _audit_tail(ensure_state_dir()):
+        detail = entry.get("detail") if isinstance(entry.get("detail"), dict) else {}
+        if entry.get("event") == "gate.hold_cleared" and detail.get("under_order") is not None:
+            rows.append({"at": entry.get("ts"), "pr": entry.get("subject"), "head": detail.get("head"), "score": detail.get("score"), "threshold": detail.get("threshold"),
+                         "order": detail.get("under_order"), "by": detail.get("by"), "judgement": detail.get("reason")})
+    if getattr(args, "json", False):
+        print(json.dumps(rows, indent=1, sort_keys=True))
+    for row in rows if not getattr(args, "json", False) else ():
+        print("%s %s at %s: score %s, threshold %s, order %s, by %s: \"%s\"" % (row["at"], row["pr"], str(row["head"])[:8], row["score"] or "-", row["threshold"] or "-", row["order"], row["by"], _one_line(str(row["judgement"]), 200)))
+    if not rows and not getattr(args, "json", False):
+        print("no clear was made under an order of the owner's")
     return EXIT_OK
 
 

@@ -82,6 +82,8 @@ When the action is `hold`, also name the class of the impact that drives it in t
 independent review and the usual checks decide). A rating whose action is hold always names its class. If your hold-level impacts are in several classes, or you are
 unsure of the class, name a top tier one. A hold without a class is rejected and the review is run again. The switchboard keeps the class with your record for that head.
 
+When a changed file matches a floor path rule of the matrix (`owner_hold.delegated_clear.score.floor`), name that rule's id in your `impact-reason:`, never rate below Serious, and rate High when the change alters credential issuance, a login, a token's scope or who may do what. The switchboard derives the score from the cell of your severity and probability, never from your words.
+
 ## Verdict block
 
 ```
@@ -89,6 +91,9 @@ verdict: approve | request-changes | comment | incomplete
 head: <the commit judged>
 impact-action: hold | second-review | none
 impact-class: <class of the hold: required when the action is hold, else omit>
+impact-severity: <the severity of your highest impact>
+impact-probability: <its probability>
+impact-reason: <one sentence; name the matrix's floor rule id (floor-credentials, floor-identity, floor-authority) when a changed file matches it>
 findings:
 - <rule id> | block | <file:line> | <why it matters, one sentence> | <what would resolve it>
 - <rule id> | note | <file:line> | <why> | <what would resolve it>

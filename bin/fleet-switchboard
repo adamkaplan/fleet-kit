@@ -20371,6 +20371,18 @@ def impact_review_record(state_dir, pr, head):
     return ((latest.get("impact_action"), latest.get("impact_class")) if latest else None), None
 
 
+def impact_rating_entries(state_dir, pr, head):
+    """([ledger entries], problem): every impact reviewer record of EXACTLY this pull request and head (the delegated clear's score is the highest of those whose recorded role counts: `delegated_clear.judge` decides which).
+    A ledger that cannot be read, or whose chain is broken, gives ([], why): the score is then unknown. #835."""
+    try:
+        entries, problem = plan_ledger.read_ledger(state_dir)
+    except Exception as err:
+        return [], "%s: %s" % (type(err).__name__, _one_line(str(err), 100))
+    if problem:
+        return [], _one_line(str(problem), 120)
+    return [e for e in entries if e.get("kind") == "review_record" and e.get("reviewer") == "impact" and e.get("pr") == pr and e.get("head") == head], None
+
+
 def _file_text_at(engine, repo, path, ref):
     """The text of `path` at `ref`: the string, "" is a real empty file, or None when the path does not exist there (a 404). Raises IntentError for any
     other failure (the caller says unreadable and holds)."""
@@ -20471,7 +20483,7 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
 
 def cmd_impact(args, runner, now):
     """`impact floor|hold|clear`."""
-    return {"floor": cmd_impact_floor, "hold": cmd_impact_hold, "clear": cmd_impact_clear}[args.impact_action](args, runner, now)
+    return {"floor": cmd_impact_floor, "hold": cmd_impact_hold, "clear": cmd_impact_clear, "delegated": cmd_impact_delegated}[args.impact_action](args, runner, now)
 
 
 cmd_impact.direct = True   # no error mapping, no daemon start
@@ -22121,7 +22133,7 @@ def parse_review_block(text):
     if not isinstance(text, str) or not text.strip():
         return None, "no verdict block"
     lines = [l.strip() for l in text.splitlines()]
-    fields = {"verdict": None, "head": None, "impact_action": None, "impact_class": None, "blocks": 0, "notes": 0, "findings": 0}
+    fields = {"verdict": None, "head": None, "impact_action": None, "impact_class": None, "impact_severity": None, "impact_probability": None, "impact_reason": None, "blocks": 0, "notes": 0, "findings": 0}
     started = False
     for line in lines:
         if line.startswith("verdict:") and not started:
@@ -22132,6 +22144,12 @@ def parse_review_block(text):
             fields["impact_action"] = line.split(":", 1)[1].strip()
         elif started and line.startswith("impact-class:"):
             fields["impact_class"] = line.split(":", 1)[1].strip().lower()
+        elif started and line.startswith("impact-severity:"):
+            fields["impact_severity"] = line.split(":", 1)[1].strip()
+        elif started and line.startswith("impact-probability:"):
+            fields["impact_probability"] = line.split(":", 1)[1].strip()
+        elif started and line.startswith("impact-reason:"):
+            fields["impact_reason"] = line.split(":", 1)[1].strip()
         elif started and line.startswith("- "):
             parts = [p.strip() for p in line[2:].split("|")]
             if len(parts) >= 2 and parts[1] in ("block", "note"):
@@ -22157,6 +22175,7 @@ def parse_review_block(text):
 
 
 IMPACT_CLASS_RE = re.compile(r"[a-z][a-z-]{0,31}")
+IMPACT_RATING_FIELDS = ("impact_severity", "impact_probability", "impact_reason")   # the record's rating fields: the code's one table (parse, record, flags)
 
 
 def cmd_review(args, runner, now):
@@ -22206,6 +22225,9 @@ def cmd_review(args, runner, now):
             args.verdict, args.head, args.blocks, args.notes, args.impact_action = (fields["verdict"], fields["head"], fields["blocks"],
                                                                                     fields["notes"], fields["impact_action"])
             args.impact_class = args.impact_class or fields["impact_class"]
+            for name in IMPACT_RATING_FIELDS:   # #835: the rating's severity and probability (the score is derived from the matrix's cell), and the reason that names a floor rule
+                if getattr(args, name, None) is None:
+                    setattr(args, name, fields[name])
         if args.verdict not in plan_ledger.REVIEW_VERDICTS:
             raise ReviewError("--verdict must be one of %s (or give --block with the reviewer's returned text)" % ", ".join(plan_ledger.REVIEW_VERDICTS))
         for name in ("blocks", "notes"):
@@ -22220,6 +22242,17 @@ def cmd_review(args, runner, now):
         impact_class = (getattr(args, "impact_class", None) or "").strip().lower() or None
         if impact_class is not None and args.reviewer != "impact":
             raise ReviewError("--impact-class belongs to the impact reviewer")
+        rating = {name: (getattr(args, name, None) or "").strip() or None for name in IMPACT_RATING_FIELDS}
+        if any(rating.values()) and args.reviewer != "impact":
+            raise ReviewError("--impact-severity, --impact-probability and --impact-reason belong to the impact reviewer")
+        if rating["impact_severity"] or rating["impact_probability"]:
+            try:
+                cells = impact_floor._matrix_cached()["cells"]
+                known = isinstance(cells.get(rating["impact_severity"]), dict) and rating["impact_probability"] in cells[rating["impact_severity"]]
+            except (impact_floor.MatrixError, KeyError, TypeError, AttributeError):
+                raise ReviewError("refused: the impact matrix file cannot be read, so the rating cannot be checked (nothing was recorded)") from None
+            if not known:
+                raise ReviewError("the rating %r / %r is not a cell of the matrix (nothing was recorded)" % (str(rating["impact_severity"])[:30], str(rating["impact_probability"])[:30]))
         if impact_class is not None and not IMPACT_CLASS_RE.fullmatch(impact_class):
             raise ReviewError("impact-class must be one lower-case word naming the class of the impact (see the matrix file's classes), got %r" % impact_class[:40])
         if args.impact_action == "hold" and impact_class is None:
@@ -22248,6 +22281,11 @@ def cmd_review(args, runner, now):
                  "summary": plan_ledger.clip(redact_command_text(args.summary or ""), 200)}
         if args.impact_action:
             entry["impact_action"] = args.impact_action
+        if args.reviewer == "impact":
+            entry["by_role"] = kind[2] if kind[0] == "agent" and len(kind) > 2 and isinstance(kind[2], str) else None   # #835: the RECORDED role of the session that made the record (never a flag or a text): only the independent reviewer's rating counts
+        for name in IMPACT_RATING_FIELDS:
+            if rating[name]:
+                entry[name] = plan_ledger.clip(redact_command_text(rating[name]), 200)
         if impact_class:
             entry["impact_class"] = impact_class   # #451 slice 2: the class of the impact that drives the action; a missing one holds for the owner
         stored = plan_ledger.append_entry(state, entry, now())
@@ -22474,6 +22512,8 @@ def add_review_parsers(sub):
     record.add_argument("--notes", type=int, default=0, help="Notes and proposals")
     record.add_argument("--impact-action", dest="impact_action", choices=("hold", "second-review", "none"),
                         help="The impact reviewer's action from the matrix")
+    for flag in IMPACT_RATING_FIELDS:
+        record.add_argument("--" + flag.replace("_", "-"), dest=flag, help="#835: the impact reviewer's rating (%s): the severity and the probability name a cell of the matrix, the reason names the floor rule it applied" % flag.split("_", 1)[1])
     record.add_argument("--impact-class", dest="impact_class", help="The class of the impact that drives the action (a class of the matrix file's owner_hold block)")
     record.add_argument("--summary", help="One line (at most 200 characters)")
     checkout = rsub.add_parser("checkout", help="Write the PR's exact head tree, its diff and the base copies of the touched files into .review/<head sha> here, read-only, and print the path; --remove <dir> removes one")
@@ -22937,6 +22977,9 @@ def add_impact_parsers(sub):
     hold = impact_sub.add_parser("hold", help="What the daemon would label as held right now (read-only dry run; the daemon writes the labels)")
     hold.add_argument("--dry-run", action="store_true", dest="dry_run")
     hold.add_argument("--repo", help="One repo (OWNER/REPO); default: every repo under plan_gates")
+    delegated = impact_sub.add_parser("delegated", help="List every clear the Chief of Staff made under an order of the owner's: the pull request, head, score, threshold and her judgement (read-only)")
+    delegated.add_argument("--json", action="store_true")
+    delegated.add_argument("--check", action="store_true", help="The fleet doctor's check: fail when a configured owner-file order no longer matches exactly one line of the owner's standing-orders file")
     clear = impact_sub.add_parser("clear", help="The owner's own terminal: clear a false impact hold for this head, with a reason (the Chief of Staff only under a standing order of the owner's, with --under-order)")
     clear.add_argument("pr", help="The pull request: owner/repo#N or its URL")
     clear.add_argument("--under-order", type=int, dest="under_order", metavar="N", help="The Chief of Staff only: clear under the owner's standing order N (it must be listed under delegated_clear in the configuration); recorded as her act under that order")

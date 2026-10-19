@@ -32546,6 +32546,336 @@ class TestImpactHold(LedgerBase):
         texts = [a["text"] for name in ("cos", "orch-a") for a in self.world.admissions(name) if "standing order 17" in a["text"]]
         self.assertTrue(texts and all("cos cleared acme/app#9" in t for t in texts), texts)
 
+    # ---- #835: the Chief of Staff clears by the SCORE of the independent rating, up to the owner's max_level
+
+    def score_config(self, level="Serious", number=17, extra=None):
+        entry = dict(self.bound(number), max_level=level) if level is not None else self.bound(number)
+        self.extra_config["delegated_clear"] = {"orders": [dict(entry, **(extra or {}))], "charter": 40}
+        self.delegate(config=False)
+
+    def ledger_reset(self):
+        for name in (sb.plan_ledger.LEDGER_FILE, sb.plan_ledger.HEAD_FILE):
+            self.world.state.joinpath(name).unlink(missing_ok=True)
+
+    def rate(self, severity, probability, reason="", role="reviewer", head=LEDGER_HEAD, pr="acme/app#9"):
+        entry = {"kind": "review_record", "pr": pr, "head": head, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "by_role": role,
+                 "impact_severity": severity, "impact_probability": probability, "impact_reason": reason}
+        return sb.plan_ledger.append_entry(self.world.state, entry, self.world.clock.now())
+
+    def cell_of(self, level):
+        cells = sb.impact_floor.load_matrix()["cells"]
+        return next((s, p) for s in cells for p in cells[s] if cells[s][p]["level"] == level)
+
+    def scored_pr(self, path="docs/notes.md"):
+        self.floor_pr(path=path)
+        self.files_of_pr(path)
+        self.passes()
+
+    def deletes(self):
+        return [w for w in self.writes if w[0] == "DELETE"]
+
+    def block(self):
+        return sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]["score"]
+
+    def floor_rule(self, cls):
+        return next(r for r, c in self.block()["floor"]["rules"].items() if c == cls)
+
+    def test_s1_s3_every_level_of_the_ladder_clears_at_or_below_the_threshold_and_high_never(self):
+        ladder = self.block()["ladder"]
+        for threshold in self.block()["delegable_levels"]:
+            for level in ladder:
+                with self.subTest(threshold=threshold, level=level):
+                    self.writes.clear()
+                    self.score_config(threshold)
+                    self.scored_pr()
+                    self.rate(*self.cell_of(level), role="reviewer")
+                    code, out, err = self.under()
+                    if level == "High" or ladder.index(level) > ladder.index(threshold):
+                        self.assertEqual(code, 2, (level, threshold))
+                        self.assertEqual(self.deletes(), [])
+                        self.assertIn(level, err)
+                        self.assertTrue(("owner's" in err) if level == "High" else (threshold in err), err)
+                    else:
+                        self.assertEqual(code, 0, err)
+                        self.assertTrue(self.deletes())
+                    self.ledger_reset()
+
+    def test_s4_a_judgement_under_ten_characters_is_refused_and_nothing_is_written(self):
+        self.score_config()
+        self.scored_pr()
+        self.rate(*self.cell_of("Low"))
+        code, out, err = self.under(reason="too short")
+        self.assertEqual(code, 2)
+        self.assertEqual((self.deletes(), self.events("gate.hold_cleared")), ([], []))
+
+    def test_s5_s6_a_floor_class_sets_the_lowest_score_and_the_rating_must_name_the_rule(self):
+        for cls in self.block()["floor"]["rules"].values():
+            rule = self.floor_rule(cls)
+            path = sb.impact_floor.load_matrix()["owner_hold"]["top_tier_paths"][cls][0]
+            for label, (level, reason, ok) in {"low": ("Low", rule, False), "medium": ("Medium", rule, False), "serious": ("Serious", rule, True), "high": ("High", rule, False),
+                                              "serious-empty-reason": ("Serious", "", False), "serious-other-rule": ("Serious", "floor-nothing", False), "serious-free-text": ("Serious", "touches a floor path", False),
+                                              "serious-substring": ("Serious", "x" + rule + "y", False)}.items():
+                with self.subTest(cls=cls, case=label):
+                    self.writes.clear()
+                    self.score_config("Serious")
+                    self.scored_pr(path)
+                    self.rate(*self.cell_of(level), reason=reason)
+                    code, out, err = self.under()
+                    self.assertEqual(code == 0, ok, err)
+                    if label in ("low", "medium"):
+                        self.assertIn("below the floor", err)
+                        self.assertNotIn("score Serious", err)
+                    if label.startswith("serious-") and not ok:
+                        self.assertIn("not named", err)
+                    self.ledger_reset()
+
+    def test_s5_a_serious_floor_rating_is_refused_at_a_lower_threshold(self):
+        self.score_config("Medium")
+        self.scored_pr("bin/plan_ledger.py")
+        self.rate(*self.cell_of("Serious"), reason=self.floor_rule("authority"))
+        code, out, err = self.under()
+        self.assertEqual(code, 2)
+        self.assertIn("above the threshold Medium", err)
+
+    def test_s7_the_floor_is_data_the_clear_module_holds_none_and_the_brief_and_matrix_agree(self):
+        matrix = sb.impact_floor.load_matrix()["owner_hold"]
+        rules = self.block()["floor"]["rules"]
+        self.assertEqual(sorted(rules.values()), sorted(matrix["top_tier_classes"]), "every top tier class has exactly one rule id")
+        source = (Path(sb.__file__).parent / "delegated_clear.py").read_text()
+        brief = (Path(sb.__file__).parent.parent / "agents" / "reviewers" / "reviewer-impact.md").read_text()
+        for rule_id, cls in rules.items():
+            self.assertNotIn(rule_id, source, "the clear module holds no rule id")
+            self.assertIn(rule_id, brief, "the rater's brief names the rule id")
+            self.assertNotIn('"%s"' % cls, source, "the clear module holds no class")
+        self.assertNotIn("Serious", source)
+        self.assertIn("never rate below Serious", brief)
+        for removed in rules:   # one mutant for each rule: with the rule gone from the data, the floor class no longer needs its id and the code reads that from the data only
+            block = json.loads(json.dumps(self.block()))
+            del block["floor"]["rules"][removed]
+            cls = rules[removed]
+            report = {"pr": "acme/app#9", "head": LEDGER_HEAD, "top_tier_hits": {cls: ["x"]}}
+            entries = [{"kind": "review_record", "pr": "acme/app#9", "head": LEDGER_HEAD, "reviewer": "impact", "by_role": "reviewer", "impact_severity": self.cell_of("Medium")[0], "impact_probability": self.cell_of("Medium")[1]}]
+            mod = sb.load_module("delegated_clear")
+            self.assertEqual(mod.judge(block, sb.impact_floor.load_matrix()["cells"], entries, report, "Serious")["reasons"], [], "the floor of %s lives in the data only" % cls)
+            self.assertTrue(mod.judge(self.block(), sb.impact_floor.load_matrix()["cells"], entries, report, "Serious")["reasons"])
+
+    def test_s8_a_missing_empty_or_malformed_max_level_clears_nothing_and_the_validation_names_the_key(self):
+        module = sb.load_module("delegated_clear")
+        base = {"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR}
+        for bad in (5, "high", "Critical", "High", ["Serious"], "", None, True, "serious "):
+            with self.subTest(bad=bad):
+                config = {"orders": [dict(self.bound(17), max_level=bad)], "charter": 40}
+                with self.assertRaises(ValueError) as caught:
+                    module.validate(config, "config")
+                self.assertIn("max_level", str(caught.exception))
+                with self.assertRaises(sb.ConfigError):
+                    sb.validate_config(dict(base, delegated_clear=config))
+                self.assertIsNone(module.settings({"delegated_clear": config}))
+                self.extra_config["delegated_clear"] = config
+                self.delegate(config=False)
+                self.scored_pr()
+                self.rate(*self.cell_of("Low"))
+                self.assertEqual(self.under()[0], 2)
+        self.score_config(None)   # no max_level at all: the old rules (this fixture's class rules), never a clear by score
+        self.scored_pr()
+        self.rate(*self.cell_of("Low"))
+        sb.validate_config(dict(base, delegated_clear={"orders": [self.bound(17)], "charter": 40}))
+        self.assertEqual(self.deletes(), [])
+
+    def test_s9_a_threshold_in_the_repository_or_the_environment_is_never_read(self):
+        self.score_config(None)
+        self.scored_pr()
+        self.rate(*self.cell_of("Low"))
+        with mock.patch.dict(os.environ, {"MAX_LEVEL": "Medium", "FLEET_MAX_LEVEL": "Medium", "DELEGATED_CLEAR_MAX_LEVEL": "Medium"}):
+            self.listing_extra = None
+            code, out, err = self.under()
+        self.assertEqual(self.deletes() != [], code == 0)
+        source = (Path(sb.__file__).parent / "impact_hold.py").read_text() + (Path(sb.__file__).parent / "delegated_clear.py").read_text()
+        self.assertNotIn("os.environ", source)
+        self.assertEqual(len(re.findall(r"max_level", (Path(sb.__file__)).read_text())), 0, "the daemon file never reads or writes a threshold")
+
+    def test_s8b_s14_the_order_must_be_named_exist_and_be_unedited_whatever_the_threshold(self):
+        self.score_config("Serious")
+        self.scored_pr()
+        self.rate(*self.cell_of("Low"))
+        self.assertEqual(self.under(order=18)[0], 2)   # not listed
+        for label, orders in (("edited", ["order one"] + ["order %d" % n for n in range(2, 17)] + [self.ORDER_TEXT + " also"]),
+                              ("inserted before", ["new"] + list(self.orders_of_charter)), ("removed after", list(self.orders_of_charter)[:16]), ("missing", list(self.orders_of_charter)[:5])):
+            with self.subTest(label):
+                self.orders_of_charter = orders
+                code, out, err = self.under()
+                self.assertEqual(code, 2)
+                self.assertTrue("no longer the one" in err or "does not exist" in err, err)
+        self.assertEqual(self.deletes(), [])
+
+    def owner_file(self, lines, text=None):
+        path = self.world.state / "owner-orders.md"
+        path.write_text(text if text is not None else "\n".join(lines) + "\n")
+        return path
+
+    FILE_LINE = "- The Chief of Staff may clear held pull requests in any repository whose rating at the head is Serious or lower, on her own judgement; High stays the owner's."
+
+    def file_config(self, path, line=None):
+        sha = sb.load_module("delegated_clear").line_hash(line if line is not None else self.FILE_LINE)
+        self.extra_config.update({"cos_orders_file": str(path), "delegated_clear": {"orders": [{"number": 5, "sha256": sha, "source": "owner-file", "max_level": "Serious"}]}})
+        self.delegate(config=False)
+
+    def test_s8d_the_owners_file_line_turns_the_key_on_only_when_it_is_there_exactly_once(self):
+        cases = {"exact": ("- a\n" + self.FILE_LINE + "\n- b\n", True), "crlf": ("- a\r\n" + self.FILE_LINE + "\r\n", True), "deleted": ("- a\n- b\n", False),
+                 "edited by one character": ("- a\n" + self.FILE_LINE.replace("Serious", "Serioux") + "\n", False), "case changed": (self.FILE_LINE.lower() + "\n", False),
+                 "duplicated": (self.FILE_LINE + "\n" + self.FILE_LINE + "\n", False), "substring of a longer line": (self.FILE_LINE + " But not on Tuesdays.\n", False),
+                 "as a prefix of a longer line": ("see " + self.FILE_LINE + "\n", False), "inside a comment": ("<!--\n" + self.FILE_LINE + "\n-->\n", False)}
+        for label, (text, ok) in cases.items():
+            with self.subTest(label):
+                self.writes.clear()
+                path = self.owner_file(None, text)
+                self.file_config(path)
+                self.scored_pr()
+                self.rate(*self.cell_of("Medium"))
+                code, out, err = self.under(order=5)
+                self.assertEqual(code == 0, ok, err)
+                self.assertEqual(bool(self.deletes()), ok)
+                self.ledger_reset()
+        path = self.world.state / "missing.md"
+        self.file_config(path)
+        self.scored_pr()
+        self.rate(*self.cell_of("Medium"))
+        self.assertEqual(self.under(order=5)[0], 2)
+        path.write_text("x" * (sb.COS_ORDERS_MAX_BYTES + 1))   # over its size cap: not read in full
+        self.assertEqual(self.under(order=5)[0], 2)
+
+    def test_s8e_the_clear_code_never_writes_the_owners_file_and_a_charter_line_is_not_a_file_line(self):
+        for name in ("impact_hold.py", "delegated_clear.py"):
+            source = (Path(sb.__file__).parent / name).read_text()
+            self.assertFalse(re.search(r"cos_orders_path|COS_ORDERS_NAME|write_text|open\([^)]*orders", source), name)
+        self.score_config("Serious")   # an entry bound to charter text is read from the charter, never from the owner's file even when a line of it matches
+        path = self.owner_file(None, self.ORDER_TEXT + "\n")
+        self.extra_config["cos_orders_file"] = str(path)
+        self.orders_of_charter = ["x"] * 16 + ["something else"]
+        self.scored_pr()
+        self.rate(*self.cell_of("Low"))
+        self.assertEqual(self.under()[0], 2)
+
+    def test_s10_s19_a_rating_at_another_head_never_counts_and_a_moved_head_is_refused(self):
+        self.score_config()
+        self.scored_pr()
+        other = "f" * 40
+        for head in (other, LEDGER_HEAD[:7], LEDGER_HEAD[:-1] + ("0" if LEDGER_HEAD[-1] != "0" else "1")):
+            self.rate(*self.cell_of("Low"), head=head)
+        self.rate(*self.cell_of("Low"), pr="acme/app#10")
+        code, out, err = self.under()
+        self.assertEqual(code, 2)
+        self.assertIn("no independent impact rating at this head", err)
+        self.assertEqual(self.deletes(), [])
+
+    def test_s17_a_forged_record_of_the_author_the_chief_of_staff_or_another_role_does_not_count(self):
+        self.score_config()
+        self.scored_pr()
+        for role in ("coder", "chief-of-staff", "orchestrator", "tester", None, "REVIEWER", "reviewer "):
+            self.rate(*self.cell_of("Low"), role=role)
+        code, out, err = self.under()
+        self.assertEqual(code, 2)
+        self.assertIn("no independent impact rating", err)
+        self.assertEqual(self.deletes(), [])
+
+    def test_s18_the_highest_rating_at_the_head_counts_and_a_tampered_chain_is_refused(self):
+        self.score_config()
+        self.scored_pr()
+        self.rate(*self.cell_of("High"))
+        self.rate(*self.cell_of("Low"))   # later and lower: never lowers it
+        code, out, err = self.under()
+        self.assertEqual(code, 2)
+        self.assertIn("High", err)
+        self.ledger_reset()
+        self.rate(*self.cell_of("Low"))
+        path = self.world.state / sb.plan_ledger.LEDGER_FILE
+        path.write_text(path.read_text().replace(self.cell_of("Low")[0], self.cell_of("Medium")[0]))
+        code, out, err = self.under()
+        self.assertEqual(code, 2)
+        self.assertIn("cannot be read", err)
+        self.assertEqual(self.deletes(), [])
+
+    def test_s22_a_rating_that_cannot_be_read_is_unknown_never_low(self):
+        self.score_config()
+        self.scored_pr()
+        cells = sb.impact_floor.load_matrix()["cells"]
+        s, p = self.cell_of("Low")
+        eliminated = sb.impact_floor.load_matrix()["not_rated"][0]
+        for label, (sev, prob) in {"no severity": (None, p), "no probability": (s, None), "unknown severity": ("Huge", p), "unknown probability": (s, "Sometimes"), "eliminated": (s, eliminated)}.items():
+            with self.subTest(label):
+                self.ledger_reset()
+                entry = {"kind": "review_record", "pr": "acme/app#9", "head": LEDGER_HEAD, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "by_role": "reviewer"}
+                entry.update({k: v for k, v in (("impact_severity", sev), ("impact_probability", prob)) if v is not None})
+                sb.plan_ledger.append_entry(self.world.state, entry, self.world.clock.now())
+                code, out, err = self.under()
+                self.assertEqual(code, 2)
+                self.assertIn("unknown", err)
+        with mock.patch.object(sb.impact_floor, "load_matrix", lambda path=None: (_ for _ in ()).throw(sb.impact_floor.MatrixError("bad"))):
+            self.assertEqual(self.under()[0], 2)
+        self.assertEqual(self.deletes(), [])
+
+    def test_s12_s13_a_low_rating_never_outranks_the_machinery_list_one_case_for_each_listed_file(self):
+        rule = sb.impact_floor.load_matrix()["owner_hold"]["delegated_clear"]
+        paths = [g for g in rule["clear_code_paths"]]
+        self.assertIn("docs/review-laws/impact-matrix.json", paths)
+        for glob in paths:
+            path = glob.replace("**", "x.txt").replace("*", "x") if "*" in glob else glob
+            with self.subTest(path=path):
+                self.score_config("Serious")
+                self.scored_pr(path)
+                self.rate(*self.cell_of("Low"), reason=" ".join(self.block()["floor"]["rules"]))
+                code, out, err = self.under()
+                self.assertEqual(code, 2)
+                self.assertIn("clear or hold machinery", err)
+                self.assertEqual(self.deletes(), [])
+                self.ledger_reset()
+
+    def test_s15_s16_a_delegated_clear_shows_score_threshold_head_and_judgement_and_is_listed_and_a_refusal_is_not(self):
+        self.score_config("Serious")
+        self.scored_pr()
+        self.rate(*self.cell_of("High"))
+        self.assertEqual(self.under()[0], 2)
+        (refused,) = self.events("gate.hold_clear_refused")
+        self.assertEqual((refused["detail"]["score"], refused["detail"]["threshold"]), ("High", "Serious"))
+        code, out, err = self.run_as("cos", "impact", "delegated", "--json")
+        self.assertEqual((code, json.loads(out)), (0, []))
+        self.ledger_reset()
+        self.rate(*self.cell_of("Medium"))
+        self.assertEqual(self.under(reason="the review is clean and the change is a note")[0], 0)
+        (cleared,) = self.events("gate.hold_cleared")
+        self.assertEqual((cleared["detail"]["score"], cleared["detail"]["threshold"], cleared["detail"]["head"]), ("Medium", "Serious", LEDGER_HEAD))
+        self.assertIn("the review is clean", cleared["detail"]["reason"])
+        texts = [a["text"] for a in self.world.admissions("cos") if "standing order 17" in a["text"]]
+        self.assertTrue(texts and all("score Medium, threshold Serious" in t and LEDGER_HEAD[:8] in t and "the review is clean" in t for t in texts), texts)
+        code, out, err = self.run_as("cos", "impact", "delegated", "--json")
+        rows = json.loads(out)
+        self.assertEqual([(r["pr"], r["head"], r["score"], r["threshold"]) for r in rows], [("acme/app#9", LEDGER_HEAD, "Medium", "Serious")])
+        self.assertIn("Medium", self.run_as("cos", "impact", "delegated")[1])
+
+    def test_s20_s23_no_agent_command_writes_the_threshold_and_no_committed_file_sets_one(self):
+        daemon = Path(sb.__file__).read_text()
+        self.assertEqual(daemon.count("max_level"), 0)
+        root = Path(sb.__file__).parent.parent
+        listed = subprocess.run(["git", "-C", str(root), "ls-files"], capture_output=True, text=True).stdout.split()
+        for name in listed:
+            if name == "bin/test-switchboard" or not (root / name).is_file():
+                continue
+            text = (root / name).read_text(errors="ignore")
+            if name.endswith((".json", ".toml", ".yml", ".yaml", ".cfg", ".conf")):
+                self.assertFalse(re.search(r"\"max_level\"\s*:\s*\"", text), name)
+
+    def test_the_record_command_keeps_the_rating_and_the_recorded_role_and_refuses_a_cell_the_matrix_lacks(self):
+        self.world.add_agent("rev", fleet={"role": "reviewer"})
+        s, p = self.cell_of("Medium")
+        code, out, err = self.run_as("rev", "review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve", "--impact-action", "second-review",
+                                     "--impact-severity", s, "--impact-probability", p, "--impact-reason", "floor-authority: the note")
+        self.assertEqual(code, 0, err)
+        entry = [e for e in sb.plan_ledger.read_ledger(self.world.state)[0] if e["kind"] == "review_record"][-1]
+        self.assertEqual((entry["by_role"], entry["impact_severity"], entry["impact_probability"], entry["impact_reason"]), ("reviewer", s, p, "floor-authority: the note"))
+        code, out, err = self.run_as("rev", "review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve", "--impact-severity", "Huge", "--impact-probability", p)
+        self.assertEqual(code, 2)
+        self.assertEqual(self.run_as("rev", "review", "record", self.PR, "--reviewer", "code", "--verdict", "approve", "--impact-severity", s)[0], 2)
+
 
 class TestCiRecordPass(LedgerBase):
     """The daemon pass of the ci recorder: open PRs under a plan, in repos listed in `plan_gates`, get their `ci` verdict when the

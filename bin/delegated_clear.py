@@ -12,11 +12,29 @@ Pure: plain values in, a list of reasons out (empty means allowed). The classes 
 import ast
 import base64
 import hashlib
+import json
 import re
+from pathlib import Path
 
 CONFIG_KEY = "delegated_clear"   # the module declares its own configuration key (bin/fleet-switchboard config_declarations)
 CONFIG_DEFAULT = None            # None: no default is added; absent = off
 MAX_ORDERS = 20
+
+
+MATRIX_FILE = Path(__file__).resolve().parent.parent / "docs" / "review-laws" / "impact-matrix.json"
+OWNER_FILE = "owner-file"   # an order's `source` when its text is a line of the owner's own standing-orders file (never written by the fleet), not an order of a charter
+
+
+def score_block():
+    """The matrix file's `owner_hold.delegated_clear.score` block (the ladder, the delegable levels, the floor's rule ids and lowest level, the roles whose rating counts), or None when it cannot be read. #835."""
+    try:
+        block = json.loads(MATRIX_FILE.read_text())["owner_hold"]["delegated_clear"]["score"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    ok = (isinstance(block, dict) and all(isinstance(block.get(k), list) and block[k] and all(isinstance(x, str) for x in block[k]) for k in ("ladder", "delegable_levels", "rating_roles"))
+          and isinstance(block.get("floor"), dict) and isinstance(block["floor"].get("lowest_level"), str) and isinstance(block["floor"].get("rules"), dict)
+          and all(isinstance(k, str) and isinstance(v, str) for k, v in block["floor"]["rules"].items()))
+    return block if ok else None
 
 
 def order_hash(text):
@@ -24,22 +42,55 @@ def order_hash(text):
     return hashlib.sha256(str(text).strip().encode("utf-8")).hexdigest()
 
 
+def line_hash(line):
+    """The hash a file-sourced order is bound to: sha256 of its EXACT line, trimmed of its line end only (no case folding, no other trimming)."""
+    return hashlib.sha256(str(line).rstrip("\r\n").encode("utf-8")).hexdigest()
+
+
+def file_order_line(text, sha):
+    """The ONE line of the owner's standing-orders text whose line_hash is `sha`, or None: zero lines or more than one match, or a blank line, is None (the order is absent). No fuzzy, substring or case-folded match."""
+    if not isinstance(text, str):
+        return None
+    found = [line.rstrip("\r\n") for line in text.split("\n") if line.strip() and line_hash(line) == sha]
+    return found[0] if len(found) == 1 else None
+
+
 def _entry_ok(entry):
-    return (isinstance(entry, dict) and set(entry) == {"number", "sha256"} and isinstance(entry["number"], int) and not isinstance(entry["number"], bool) and entry["number"] >= 1
-            and isinstance(entry["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) is not None)
+    return (isinstance(entry, dict) and set(entry) <= {"number", "sha256", "max_level", "source"} and {"number", "sha256"} <= set(entry)
+            and isinstance(entry["number"], int) and not isinstance(entry["number"], bool) and entry["number"] >= 1
+            and isinstance(entry["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) is not None
+            and entry.get("source", OWNER_FILE) == OWNER_FILE)
+
+
+def _level_problem(entry):
+    """What is wrong with an entry's `max_level` (None when it is absent: clear nothing by score, or valid): a level the matrix does not list as delegable (High never is) is refused by name."""
+    if "max_level" not in entry:
+        return None
+    block = score_block()
+    if block is None:
+        return "the matrix file's score block cannot be read"
+    if not isinstance(entry["max_level"], str) or entry["max_level"] not in block["delegable_levels"]:
+        return "must be one of %s (High is always the owner's), got %r" % (", ".join(block["delegable_levels"]), entry["max_level"])
+    return None
 
 
 def validate(raw, source):
-    """`delegated_clear`: absent, null or false = off; else {"orders": [{"number": N, "sha256": "<hash of the order's text>"}, ...], "charter": the charter issue number that holds them}. An empty
-    list is off. Raises ValueError naming the key."""
+    """`delegated_clear`: absent, null or false = off; else {"orders": [{"number": N, "sha256": "<hash of the order's text>", "max_level": "<highest level she may clear>"?, "source": "owner-file"?}, ...], "charter": the
+    charter issue number that holds the charter-sourced orders (not needed when every order is `owner-file`)}. An empty list is off. `max_level` absent = the old rules (nothing is cleared by score). Raises ValueError naming the key."""
     if raw is None or raw is False:
         return
     if not isinstance(raw, dict) or set(raw) - {"orders", "charter"}:
         raise ValueError("%s: 'delegated_clear' must be false or an object with only orders and charter, got %r" % (source, raw))
     orders, charter = raw.get("orders"), raw.get("charter")
     if not (isinstance(orders, list) and len(orders) <= MAX_ORDERS and all(_entry_ok(e) for e in orders)) or len({e["number"] for e in orders}) != len(orders):
-        raise ValueError("%s: delegated_clear.orders must be a list of {\"number\": N, \"sha256\": <64 hex of the order's text>} (an empty list is off; a number may appear once)" % source)
-    if not (isinstance(charter, int) and not isinstance(charter, bool) and charter >= 1):
+        raise ValueError("%s: delegated_clear.orders must be a list of {\"number\": N, \"sha256\": <64 hex of the order's text>, \"max_level\"?, \"source\"?: \"owner-file\"} (an empty list is off; a number may appear once)" % source)
+    for entry in orders:
+        problem = _level_problem(entry)
+        if problem:
+            raise ValueError("%s: delegated_clear.orders max_level of order %d: %s" % (source, entry["number"], problem))
+    if any("source" not in e for e in orders) and not (isinstance(charter, int) and not isinstance(charter, bool) and charter >= 1):
+        raise ValueError("%s: delegated_clear.charter must be the charter's issue number" % source)
+    if charter is not None and not (isinstance(charter, int) and not isinstance(charter, bool) and charter >= 1):
         raise ValueError("%s: delegated_clear.charter must be the charter's issue number" % source)
 
 
@@ -50,7 +101,14 @@ def settings(config):
         validate(raw, "config")
     except ValueError:
         return None
-    return ({e["number"]: e["sha256"] for e in raw["orders"]}, raw["charter"]) if isinstance(raw, dict) and raw["orders"] else None
+    return ({e["number"]: e["sha256"] for e in raw["orders"]}, raw.get("charter")) if isinstance(raw, dict) and raw["orders"] else None
+
+
+def entry_of(config, number):
+    """The configured order entry `number` ({"number", "sha256", "max_level"?, "source"?}) when the delegated clear is enabled and well formed, else None."""
+    if settings(config) is None:
+        return None
+    return next((e for e in config[CONFIG_KEY]["orders"] if e["number"] == number), None)
 
 
 def caller_is_chief(kind):
@@ -65,12 +123,56 @@ def order_text(orders, number):
     return None
 
 
-def refusals(rule, report, files, matches=None, closure=None):
+def judge(block, cells, entries, report, threshold):
+    """{"level": the score or None, "reasons": [why refused]} (no reasons: the score is at or below `threshold`, so the clear may go on). `block` is the matrix's score block, `cells` its `cells` (severity ->
+    probability -> {"level"}), `entries` the ledger's entries (the caller filtered nothing: this checks kind, reviewer, pr, EXACT head and the recorded role again), `report` the owner-hold report (`pr`, `head`,
+    `top_tier_hits` {class: [paths]}). The score is the HIGHEST level of the counted records (a later, lower one never lowers it), taken from the matrix cell of the recorded severity and probability, never from
+    a word of the reviewer's. A floor class hit makes `floor.lowest_level` the lowest score allowed, and the rating's reason must name that class's rule id. Anything it cannot read is refused, never Low. #835."""
+    if not isinstance(block, dict) or not isinstance(cells, dict) or not isinstance(report, dict):
+        return {"level": None, "reasons": ["the score rule or the rating is unknown: refused"]}
+    ladder = block["ladder"]
+    if threshold not in block["delegable_levels"] or threshold not in ladder:
+        return {"level": None, "reasons": ["the threshold %r is unknown: refused" % (threshold,)]}
+    counted, bad = [], 0
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict) or entry.get("kind") != "review_record" or entry.get("reviewer") != "impact" or entry.get("pr") != report.get("pr") or entry.get("head") != report.get("head") or not report.get("head"):
+            continue
+        if entry.get("by_role") not in block["rating_roles"]:
+            continue   # the pull request's author, the Chief of Staff, any other role (or a record made before roles were kept) is not the independent rating
+        level = ((cells.get(entry.get("impact_severity")) or {}).get(entry.get("impact_probability")) or {}).get("level") if isinstance(entry.get("impact_severity"), str) and isinstance(entry.get("impact_probability"), str) else None
+        if level not in ladder:
+            bad += 1
+        else:
+            counted.append((ladder.index(level), level, entry))
+    if bad:
+        return {"level": None, "reasons": ["a rating at this head has no severity and probability the matrix knows: the score is unknown, refused"]}
+    if not counted:
+        return {"level": None, "reasons": ["there is no independent impact rating at this head: the score is unknown, refused"]}
+    top = max(i for i, _, _ in counted)
+    level = ladder[top]
+    reasons = []
+    hits = report.get("top_tier_hits") or {}
+    for rule_id, cls in sorted(block["floor"]["rules"].items()):
+        if not hits.get(cls):
+            continue
+        if top < ladder.index(block["floor"]["lowest_level"]):
+            reasons.append("it changes a %s path and the rating %s is below the floor %s: refused" % (cls, level, block["floor"]["lowest_level"]))
+        elif not any(i == top and re.search(r"(?<![\w-])%s(?![\w-])" % re.escape(rule_id), str(e.get("impact_reason") or "")) for i, _, e in counted):
+            reasons.append("it changes a %s path and the rating's reason does not name the rule %s: the rule is not named, the rating does not count" % (cls, rule_id))
+    if level not in block["delegable_levels"]:
+        reasons.append("the score is %s: %s is the owner's" % (level, level))
+    elif ladder.index(level) > ladder.index(threshold):
+        reasons.append("the score %s is above the threshold %s" % (level, threshold))
+    return {"level": level, "reasons": reasons}
+
+
+def refusals(rule, report, files, matches=None, closure=None, scored=None):
     """[reasons] a delegated clear is refused for this pull request; [] when none. `rule` is the matrix's `owner_hold.delegated_clear` block; `report` is the owner-hold report the
     daemon uses (`pr_floor_report`: its decision, its top tier path hits by class, the independent review's class, whether the file list is complete); `files` is the pull request's
     changed files ([{"filename", "previous_filename", "status"}]) or None when they could not be read. `matches(path, globs)` is the owner-hold floor's OWN path matcher (case-,
     normalisation- and spelling-insensitive: `./bin/x`, `bin//x`, `BIN/X`, a `..`, a rename's source all read as the file they name): the caller passes it, this module holds no second one.
-    `closure` is {file name: [reasons] or None}: what `closure_refusals` said for each changed file of `closure_files` (None: it could not be mapped)."""
+    `closure` is {file name: [reasons] or None}: what `closure_refusals` said for each changed file of `closure_files` (None: it could not be mapped). `scored` is `judge`'s answer for an order with a
+    max_level: then the score is the only rule about the pull request's classes (the path-class and review-class refusals below are not made), and the machinery refusals stay."""
     if not isinstance(rule, dict) or not isinstance(report, dict) or matches is None:
         return ["the delegated-clear rule or the owner-hold decision cannot be read"]
     for key in ("never_path_classes", "top_tier_review_classes", "clear_code_paths", "new_file_globs", "closure_files"):
@@ -80,17 +182,17 @@ def refusals(rule, report, files, matches=None, closure=None):
         return ["the owner-hold decision cannot be read"]
     if report.get("complete") is not True or report.get("unknown") or report.get("renamed_no_source"):
         return ["the pull request's changes cannot be read in full (%s)" % (report.get("unknown") or "the file list is cut")]
-    reasons = []
+    reasons = list(scored["reasons"]) if isinstance(scored, dict) else []
     hits = report.get("top_tier_hits") or {}
-    for cls in sorted(hits):
+    for cls in sorted(hits) if scored is None else ():
         if cls.lower() in {c.lower() for c in rule["never_path_classes"]}:
             reasons.append("it changes a %s path (%s): that stays the owner's own clear" % (cls, ", ".join(hits[cls][:3])))
-    if report.get("review_action") is None:
+    if report.get("review_action") is None and scored is None:
         reasons.append("no independent review is recorded at this head: unknown is refused")
     review = report.get("review_class")
-    if review is None and report.get("review_action") == "hold":
+    if review is None and report.get("review_action") == "hold" and scored is None:
         reasons.append("the independent review holds it with no class named: unknown is refused")
-    if isinstance(review, str) and review.lower() in {c.lower() for c in rule["top_tier_review_classes"]}:
+    if isinstance(review, str) and review.lower() in {c.lower() for c in rule["top_tier_review_classes"]} and scored is None:
         reasons.append("the independent review's class is %s, a top tier class: that stays the owner's own clear" % review)
     if files is None:
         reasons.append("the changed files cannot be read, so a change to the clear code cannot be ruled out")
