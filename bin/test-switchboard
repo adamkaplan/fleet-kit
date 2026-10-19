@@ -33317,18 +33317,20 @@ class TestImpactHold(LedgerBase):
         daemon = ast.parse(self.real_source())
         fields = set(sb.IMPACT_RATING_FIELDS) | {"by_role"}
         touching = sorted(n.name for n in daemon.body if isinstance(n, ast.FunctionDef) and any(isinstance(x, ast.Constant) and x.value in fields for x in ast.walk(n)))
-        self.assertTrue({"parse_review_block", "cmd_review", "impact_rating_entries"} <= set(touching), touching)
+        self.assertTrue({"parse_review_block", "cmd_review"} <= set(touching), touching)
         reach = module.closure(daemon, module.daemon_roots(rule))[0]
+        self.assertIn("impact_rating_entries", reach)
         self.assertEqual([n for n in touching if n not in reach], [], "every definition that reads or writes a rating field is in the closure of what she can never clear (completeness: derived from the code)")
         for name in sorted(set(touching) | set(rule["rating_roots"])):
             with self.subTest(definition=name):
                 head, diff = self.edit_one_line_under(self.real_source(), name)
                 self.assertTrue(self.closure_check(head, diff), "a change to %s is refused a delegated clear" % name)
-        for name in rule["rating_roots"]:   # the mutant: the roots without the rating's code let the same change through
-            with self.subTest(mutant=name):
-                head, diff = self.edit_one_line_under(self.real_source(), name)
-                rest = dict(rule, rating_roots=[])
-                self.assertEqual(module.closure_refusals(self.real_source(), head, diff, module.daemon_roots(rest), set(rule["clear_entry_points"])), [], "without the rating roots the parser edit would pass: the roots are what refuse it")
+        passed = []   # the mutant: the roots without the rating's code. A root another rule already refuses (cmd_review refers to a clear entry point) stays refused; the PARSER is the one only the roots refuse
+        for name in rule["rating_roots"]:
+            head, diff = self.edit_one_line_under(self.real_source(), name)
+            if not module.closure_refusals(self.real_source(), head, diff, module.daemon_roots(dict(rule, rating_roots=[])), set(rule["clear_entry_points"])):
+                passed.append(name)
+        self.assertIn("parse_review_block", passed, "without the rating roots a change to the parser passes: the roots are what refuse it")
 
     def test_one_definition_of_rated_at_this_head_the_clear_and_every_other_reader_use_it(self):
         import ast
@@ -33360,7 +33362,7 @@ class TestImpactHold(LedgerBase):
                 self.assertEqual(sb.rating_at(engine, "acme/app#9", LEDGER_HEAD)[0], rated)
                 scored = sb.delegated_clear_score(engine, module, report, "Serious")
                 self.assertEqual(any("no independent impact rating" in r for r in scored["reasons"]), not rated, "the clear reads the same answer as rating_at: %s" % scored)
-                self.assertEqual(bool(sb.rehold_reason(engine, {"clears": {"acme/app#9": {"head": "a" * 40}}, "carried": {}}, "acme/app", "acme/app#9", LEDGER_HEAD)), not rated, "the re-hold reads it too")
+                self.assertEqual(bool(sb.rehold_reason(engine, {"clears": {"acme/app#9": {"head": "c" * 40}}, "carried": {}}, "acme/app", "acme/app#9", LEDGER_HEAD)), not rated, "the re-hold reads it too")
 
     def test_a_half_valid_or_disagreeing_or_foreign_rating_record_refuses_the_clear_and_the_all_valid_one_clears(self):
         low, high, serious = self.cell_of("Low"), self.cell_of("High"), self.cell_of("Serious")
