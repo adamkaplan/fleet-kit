@@ -13716,7 +13716,13 @@ class TestClearNotice(Base):
         release = threading.Event()
         self.addCleanup(release.set)
         self.real_send = self.engine.send
-        self.engine.send = lambda *a, **k: (release.wait(2), self.real_send(*a, **k))[1]
+        self.send_returned = []
+
+        def slow(*a, **k):
+            release.wait(30)   # only a safety: the tests release it themselves
+            self.send_returned.append(1)
+            return self.real_send(*a, **k)
+        self.engine.send = slow
         return release
 
     def settle(self):
@@ -13726,10 +13732,8 @@ class TestClearNotice(Base):
     def test_s2_a_notice_that_times_out_is_pending_the_command_says_queued_and_the_next_pass_delivers_it_exactly_once(self):
         release = self.block_sends()
         with mock.patch.object(sb, "NOTIFY_CLEAR_DEADLINE_SECONDS", 0.05):
-            began = time.monotonic()
             lines = self.clear()
-            elapsed = time.monotonic() - began
-        self.assertLess(elapsed, 1.0)
+        self.assertEqual((release.is_set(), self.send_returned), (False, []), "the command returned while the send was still blocked: it did not wait for it (no clock)")
         self.assertTrue(any("queued for delivery" in l for l in lines), lines)
         key = sb._clear_notice_key(self.REPO, 7, self.HEAD, "clear")
         self.assertIn(key, self.pending())
@@ -13781,49 +13785,81 @@ class TestClearNotice(Base):
         self.assertIn("gave up", event["detail"]["why"])
         self.assertEqual(self.told("cos"), [])
 
-    def test_s4_a_pull_request_merged_or_closed_or_with_a_new_head_drops_the_pending_record_and_sends_nothing(self):
-        for label, state, head in (("merged", "MERGED", self.HEAD), ("closed", "CLOSED", self.HEAD), ("head changed", "OPEN", "b" * 40)):
-            with self.subTest(label):
-                self.setUp()
-                self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
-                self.clear()
-                self.assertEqual(len(self.pending()), 1)
-                self.engine.send = self.world.new_engine("daemon").send
-                self.pr_state, self.head = state, head
-                self.pass_()
-                self.assertEqual(self.pending(), {})
-                self.assertEqual(self.told("cos"), [])
-                (event,) = self.events("gate.clear_notice_dropped")
-                self.assertTrue(event["detail"]["why"], label)
-
-    def test_s8_a_pull_request_that_cannot_be_read_whole_keeps_the_record_and_sends_nothing(self):
+    def make_pending(self, kind):
+        """One pending notice of `kind`, made by the real `notify_clear` with a send that fails; every kind of `sb.CLEAR_NOTICE_KINDS` has its own call."""
         self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
-        self.clear()
+        extra = {"clear": dict(reason="a fixture"), "carry": dict(previous="f" * 40)}[kind]
+        sb.notify_clear(self.engine, kind, self.REPO, 7, self.HEAD, body="", **extra)
+        self.assertEqual(list(self.pending()), [sb._clear_notice_key(self.REPO, 7, self.HEAD, kind)])
         self.engine.send = self.world.new_engine("daemon").send
-        self.unreadable = True
-        self.pass_()
-        self.assertEqual(len(self.pending()), 1)
-        self.assertEqual((self.told("cos"), self.events("gate.clear_notice_dropped")), ([], []))
-        self.unreadable = False
-        self.pass_()
-        self.assertEqual((len(self.told("cos")), self.pending()), (1, {}))
 
-    def test_s2_every_notice_path_leaves_a_pending_record_on_failure_and_is_delivered_by_the_pass(self):
+    def test_the_kinds_table_is_complete_derived_from_the_callers(self):
+        import ast
+        seen = set()
+        for path in (BIN / "fleet-switchboard", BIN / "impact_hold.py"):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "notify_clear" and len(node.args) > 1 and isinstance(node.args[1], ast.Constant):
+                    seen.add(node.args[1].value)
+        self.assertEqual(seen, set(sb.CLEAR_NOTICE_KINDS), "every kind a caller notifies is in the table, and the table holds no other")
+        sb.clear_notice_record(self.engine, "nonsense", self.REPO, 7, self.HEAD)
+        self.assertEqual(self.pending(), {}, "a kind outside the table is never recorded")
+
+    def test_s4_for_every_kind_a_pull_request_merged_or_closed_or_with_a_new_head_drops_the_pending_record_and_sends_nothing(self):
+        for kind in sb.CLEAR_NOTICE_KINDS:
+            for label, state, head in (("merged", "MERGED", self.HEAD), ("closed", "CLOSED", self.HEAD), ("head changed", "OPEN", "b" * 40)):
+                with self.subTest(kind=kind, why=label):
+                    self.setUp()
+                    self.make_pending(kind)
+                    self.pr_state, self.head = state, head
+                    self.pass_()
+                    self.assertEqual(self.pending(), {})
+                    self.assertEqual(self.world.admissions("cos"), [])
+                    (event,) = self.events("gate.clear_notice_dropped")
+                    self.assertTrue(event["detail"]["why"], label)
+
+    def test_s8_for_every_kind_a_pull_request_that_cannot_be_read_whole_keeps_the_record_and_sends_nothing(self):
+        for kind in sb.CLEAR_NOTICE_KINDS:
+            with self.subTest(kind=kind):
+                self.setUp()
+                self.make_pending(kind)
+                self.unreadable = True
+                self.pass_()
+                self.assertEqual(len(self.pending()), 1)
+                self.assertEqual((self.world.admissions("cos"), self.events("gate.clear_notice_dropped")), ([], []))
+                self.unreadable = False
+                self.pass_()
+                self.assertEqual((len(self.world.admissions("cos")), self.pending()), (1, {}))
+
+    def test_s3_for_every_kind_a_send_that_always_fails_is_tried_a_bounded_number_of_times_then_given_up_loudly(self):
+        for kind in sb.CLEAR_NOTICE_KINDS:
+            with self.subTest(kind=kind):
+                self.setUp()
+                self.make_pending(kind)
+                self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+                for _ in range(sb.CLEAR_NOTICE_ATTEMPTS + 3):
+                    self.pass_()
+                self.assertEqual(self.pending(), {})
+                (event,) = self.events("gate.clear_notice_abandoned")
+                self.assertIn("gave up", event["detail"]["why"])
+                self.assertEqual(self.world.admissions("cos"), [])
+
+    def test_s2_for_every_kind_and_the_standing_order_variant_a_failed_notice_is_pending_and_the_pass_delivers_it_once(self):
         order = {"number": 5, "text": "clear fixtures", "by": "cos"}
-        paths = {"clear": dict(kind="clear", reason="a fixture"), "carry": dict(kind="carry", previous="f" * 40),
-                 "clear under order": dict(kind="clear", reason="a fixture", under_order=order)}
-        for label, kw in paths.items():
-            with self.subTest(label):
+        paths = [(kind, {}) for kind in sb.CLEAR_NOTICE_KINDS] + [("clear", {"under_order": order})]
+        for kind, extra in paths:
+            with self.subTest(kind=kind, extra=sorted(extra)):
                 self.setUp()
                 self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
-                kind = kw.pop("kind")
+                kw = dict(extra, **({"previous": "f" * 40} if kind == "carry" else {"reason": "a fixture"}))
                 sb.notify_clear(self.engine, kind, self.REPO, 7, self.HEAD, body="", **kw)
                 self.assertIn(sb._clear_notice_key(self.REPO, 7, self.HEAD, kind), self.pending())
                 self.engine.send = self.world.new_engine("daemon").send
                 self.pass_()
-                (line,) = self.told("cos") if kind == "clear" and "under_order" not in kw else [self.world.admissions("cos")[-1]["text"]]
+                self.pass_()
+                (told,) = self.world.admissions("cos")
                 self.assertEqual(self.pending(), {})
-                self.assertIn(self.HEAD[:8], line)
+                self.assertIn(self.HEAD[:8], told["text"])
+                self.assertEqual(("under the owner's standing order" in told["text"], "carried" in told["text"]), (bool(extra), kind == "carry"))
 
     def test_the_notice_wording_is_the_same_whether_the_command_or_the_pass_sends_it(self):
         self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}

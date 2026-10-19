@@ -422,6 +422,8 @@ def clear_notice_record(engine, kind, repo, number, head, reason=None, body=None
     try:
         if engine.state_dir is None:
             return
+        if kind not in CLEAR_NOTICE_KINDS:
+            raise ValueError("unknown notice kind %r" % (kind,))
         key = _clear_notice_key(repo, number, head, kind)
         with impact_state_lock(engine.state_dir):
             if key in _read_small(engine.state_dir, CLEAR_NOTIFIED_FILE):
@@ -473,6 +475,8 @@ def _notify_clear_body(engine, abandoned, kind, repo, number, head, reason=None,
         unknown = ("lane unclear: plan lane %s, notice by %s" % tuple(extra["unclear"]) if extra.get("unclear") else "lane unknown") + (": charter #%s has %d orchestrators: %s" % (extra.get("charter"), len(extra["candidates"]), ", ".join(extra["candidates"])) if extra.get("candidates") else "")
         if kind == "carry":
             line = "owner's clear carried %s from %s to %s; %s" % (pr, (previous or "?")[:8], head[:8], "%s merges it" % lane if lane else unknown)
+        elif kind != "clear":
+            raise ValueError("unknown notice kind %r" % (kind,))   # a kind of the table with no wording is a defect, never a silent send
         elif under_order:   # #661: the same line, naming the Chief of Staff as the clearer and the owner's order
             line = "%s cleared %s at %s under the owner's standing order %s: \"%s\"; %s" % (under_order.get("by") or "the chief of staff", pr, head[:8], under_order["number"], words, "%s merges it" % lane if lane else unknown)
         else:
@@ -580,7 +584,7 @@ def clear_notice_pass(engine, now):
             if done >= CLEAR_NOTICE_PASS_MAX:
                 break
             repo, number, head = entry.get("repo"), entry.get("number"), entry.get("head")
-            if not (isinstance(repo, str) and isinstance(number, int) and not isinstance(number, bool) and isinstance(head, str) and entry.get("kind") in ("clear", "carry")):
+            if not (isinstance(repo, str) and isinstance(number, int) and not isinstance(number, bool) and isinstance(head, str) and entry.get("kind") in CLEAR_NOTICE_KINDS):
                 _clear_notice_drop(engine, key, "the record is not a notice")
                 continue
             if now - entry.get("claimed", 0) < CLEAR_NOTICE_CLAIM_SECONDS:

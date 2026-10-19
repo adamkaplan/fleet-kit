@@ -20645,6 +20645,7 @@ CLEAR_NOTIFIED_MAX = 400
 CLEAR_PENDING_FILE = "clear-notice-pending.json"   # #827: the notices of owner clears not yet delivered to everyone they are for
 CLEAR_PENDING_MAX = 100
 CLEAR_PENDING_BODY_MAX = 4000   # the pull request body as far as the lane lookup needs it (its PLAN line)
+CLEAR_NOTICE_KINDS = ("clear", "carry")   # THE one table of notice kinds: the record, the delivery and the pass accept these and no other; a test derives the callers from the code and fails on a kind missing here
 CLEAR_NOTICE_ATTEMPTS = 5       # deliveries tried before a pending notice is given up and audited
 CLEAR_NOTICE_CLAIM_SECONDS = 90   # a delivery in flight is not started again within this (longer than a send is allowed to take)
 CLEAR_NOTICE_PASS_MAX = 3       # deliveries one daemon pass makes
