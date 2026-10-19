@@ -9473,8 +9473,9 @@ def prune_escalations_pass(engine, store, now):
     keep = captain_escalations_to_keep(engine)
     if keep is None or engine.request_keys is None:
         return
-    if whole_skipped(engine, "escalation.prune", "requests"):
-        return   # #805: a worker that could not be read has no requests listed, which is no evidence they are gone
+    for name in ("requests", "notices"):
+        if whole_skipped(engine, "escalation.prune", name):
+            return   # #805: a worker or a notice that could not be read lists nothing, which is no evidence a request is gone
     escalated = read_escalated(engine.state_dir)
     leaves = captain_escalation_leaves(engine, escalated, now)
     captains = {k for k in escalated if k.startswith("captain:")}
