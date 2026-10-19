@@ -67057,6 +67057,56 @@ class TestPreflightPr(unittest.TestCase):
             self.assertEqual(table.count('("%s",' % name), 1)
 
 
+class TestBatchingDocs(unittest.TestCase):
+    """#834 slice 1: the batching procedure, its body template and its owner decisions, each said once."""
+    HEAD = "## Batching: the integration branch and the batch pull request (#834)"
+
+    def section(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        self.assertEqual(text.count(self.HEAD), 1)
+        return text.split(self.HEAD, 1)[1]  # the last section of the file; its template holds "## " lines, so no split on them
+
+    def test_the_five_topics_are_each_a_heading_once(self):
+        section = self.section()
+        for topic in ("### What batches and what goes straight", "### The cadence and who keeps the batch", "### The freeze",
+                      "### The sync", "### An ask whose change is only in `integration`"):
+            self.assertEqual(section.count(topic), 1, topic)
+
+    def test_the_skill_names_the_batching_rules_in_one_paragraph(self):
+        text = (REPO / "skills" / "fleet-coordination" / "SKILL.md").read_text()
+        paragraphs = [p for p in text.split("\n\n") if "`integration` branch" in p]
+        self.assertEqual(len(paragraphs), 1)
+        for word in ("batch pull request", "freeze", "held"):
+            self.assertIn(word, paragraphs[0])
+
+    def test_the_template_has_four_columns_and_one_example_row(self):
+        block = self.section().split("```markdown\n", 1)[1].split("```", 1)[0]
+        for heading in ("## Why this needs you", "## What changes for you", "## Example", "## Questions for you"):
+            self.assertEqual(block.count(heading), 1, heading)
+        self.assertIn("Recommendation:", block)
+        rows = [l for l in block.splitlines() if l.startswith("| Change |")]
+        self.assertEqual(rows, ["| Change | Impact | Hold reasons and who cleared them | Evidence |"])
+        after = block.split(rows[0], 1)[1].split("\n\n", 1)[0].strip().splitlines()
+        self.assertEqual(len(after), 2)  # the separator and one example row
+        self.assertEqual(after[1].count("|"), 5)
+
+    def test_each_owner_decision_is_once_with_its_recommendation_or_decision(self):
+        decisions = self.section().split("### Owner decisions and follow-up asks", 1)[1]
+        for key, word in (("**D1**", "decided"), ("**D2**", "Recommendation"), ("**D3**", "Recommendation")):
+            lines = [l for l in decisions.splitlines() if l.startswith("- " + key)]
+            self.assertEqual(len(lines), 1, key)
+            self.assertIn(word, lines[0])
+
+    def test_the_three_prohibitions_are_said_once_each(self):
+        section = self.section()
+        for phrase in ("a force push", "a rebase of a shared branch", "an agent changing a ruleset"):
+            self.assertEqual(section.count(phrase), 1, phrase)
+
+    def test_the_slice_changes_no_code_under_bin_and_no_workflow(self):
+        names = subprocess.run(["git", "diff", "--name-only", "origin/main...HEAD"], cwd=REPO, capture_output=True, text=True).stdout.split()
+        self.assertEqual([n for n in names if (n.startswith("bin/") and n != "bin/test-switchboard") or n.startswith(".github/workflows/")], [])
+
+
 if __name__ == "__main__":
     # Run directly, the suite takes a CPU slot (`fleet-switchboard heavy`): several full suites at once starve the machine. FLEET_HEAVY=off, a CI run, a run
     # already in a slot, or a state directory that cannot be written run it as it is.

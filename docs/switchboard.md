@@ -4949,3 +4949,59 @@ Agents leave scratch in the opencode temp directory (the system temp directory's
 **An external key command names its subscription.** When `external_decisions` is on and its mapping file's `key_source` is a command that starts with `az` and has no `--subscription`, loading the configuration warns once on stderr: it names the key and the fix (`--subscription <id>`) and **never prints the command's other arguments** (a vault and a secret name stay out). Without the option the command used whichever subscription was active and failed when that changed.
 
 **Working reports with no movement (#811).** A coder or tester (never on a charter) whose last consecutive reports were all `working` for `stalled_working_hours` (default 2) while nothing it owns moved wakes its boss once, with `no movement for <time> on <ref> (worker <name>, <N> working reports; last: <line>)`; the worker is never nagged. Movement is the pull request's head and updated time and the issue's updated time, as the daemon already holds them (no GitHub call). No wake while a reminder naming the issue is due later, a check at the head is running, the ask or the pull request carries an awaiting label, the last report is `blocked` or `question`, or a human decision for the pull request exists. It judges only when the open-PR list, the issue list and the decision list were read whole. One wake per stretch; a second only after the head or an updated time moves and it stalls again. Limits, stated: the rule is inert for a repository outside `plan_gates` (that is what keeps the open-PR list, marked `pulls:<repo>` in the read-whole registry only by that pass) and when the triage issue list is off; an open-PR list read more than 20 minutes ago is not judged; the check-running guard sees checks only for a pull request the daemon examined, which is one with a `PLAN:` link; when several open pull requests name the issue, the newest-moved one is judged; an idle worker is the idle-at-a-seam rule's alone (never woken a second time here); a daemon restart forgets which head it saw change, so one repeat wake is possible after a restart.
+
+## Batching: the integration branch and the batch pull request (#834)
+
+Typical work reaches the default branch in batches, so the owner clears one pull request per repository and can test a whole batch in one stack. This section is the procedure; it changes no gate, no hold and no workflow.
+
+### What batches and what goes straight
+
+Every change with an approved plan and a passing independent review merges into the repository's `integration` branch. Two kinds go straight to the default branch: an urgent fix (the Chief of Staff's waiver, logged) and anything the owner asks for alone. A change the impact floor holds is batched like any other: it is rated as usual on its own pull request into `integration` and cleared there, by the Chief of Staff up to Serious (the owner's standing order) and by the owner when it is High. So the batch pull request holds for the owner only if a row is High (decision D1, below).
+
+### The cadence and who keeps the batch
+
+The batch pull request is opened daily at a fixed hour, from `integration` into the default branch; a day with no change opens none. The Chief of Staff's lane opens it, keeps its table current until the freeze, and tells the owner when it is ready.
+
+### The freeze
+
+From the moment the batch pull request is marked "batch PR ready for the owner's clear" until it merges, nothing merges into `integration`; new changes wait for the next batch and their pull requests stay open. Until a ruleset exists the freeze is a rule the lanes follow plus an audit report: a merge into `integration` while a ready batch pull request is open is reported.
+
+### The sync
+
+The default branch is merged into `integration` by a true merge after every direct merge to the default branch (an urgent fix, a change the owner asked for alone) and before the batch pull request is marked ready. After a squash-merged batch, the default branch is merged into `integration` again (the content is the same, so the merge is trivial). None of these is ever part of the procedure: a force push, a rebase of a shared branch, an agent changing a ruleset.
+
+### An ask whose change is only in `integration`
+
+Its ask stays open, with a comment naming the batch pull request. Its live-check clock starts when the batch merges. The sweep's "ask open though its pull request merged" warning (T12) is expected for such an ask until the follow-up below teaches the daemon.
+
+### The batch pull request body (template)
+
+The body is the owner v2 body plus one table with a row per change. Use neutral names as in the example.
+
+```markdown
+## Why this needs you
+<1 to 3 sentences: what the batch is and why the owner's clear is needed.>
+
+## What changes for you
+| Before | After |
+|---|---|
+| Each change waited for your clear. | One batch, cleared once. |
+
+## Example
+<a concrete example of one thing that behaves differently>
+
+## Changes in this batch
+| Change | Impact | Hold reasons and who cleared them | Evidence |
+|---|---|---|---|
+| acme-org/widget-service#123: add a retry to the export job | Moderate | none | plan: acme-org/widget-service#120 comment; review: pass at its head; CI: green |
+
+## Questions for you
+1. <a question>. Recommendation: <the answer you recommend>.
+```
+
+### Owner decisions and follow-up asks
+
+- **D1** (decided: option A, the Chief of Staff, 18:05Z, under the owner's standing order): changes into `integration` are rated and held as usual and cleared by the Chief of Staff up to Serious; the batch pull request holds for the owner only if a row is High. No floor path changes. Not chosen: the floor skips the per-change hold (stays an owner option if the pilot shows the per-change clears cost too much), and held changes not batched.
+- **D2**: enforce the freeze with a ruleset on `integration`. Recommendation: yes if the owner is willing; otherwise the audit report stays the control.
+- **D3**: batch size against the review checkout's limits. Recommendation: cap a batch at what the checkout accepts, and split a larger one.
+- **Follow-up asks** (each its own ask): a script that renders the batch table; the daemon's treatment of an ask whose change is in a non-default branch (T12) and of reference runs for `integration`; the workflow edit so CI runs on pull requests into `integration` (held for the owner once).
