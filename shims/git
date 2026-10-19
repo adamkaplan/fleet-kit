@@ -35,8 +35,27 @@ def routing_wanted():
         with open(os.path.join(base, "fleet-switchboard", "config.json")) as handle:
             users = json.load(handle).get("gh_users")
     except (OSError, ValueError, AttributeError):
+        return app_mapped(base)
+    return (isinstance(users, dict) and bool(users)) or app_mapped(base)
+
+
+def app_mapped(base):
+    """True when any repository is mapped to the GitHub App (`app_installations`), so its credential comes from the gh shim as well (shims/app_mint.py). A config
+    that names the key but cannot be read as JSON counts as mapped: the gh shim then refuses, and git never falls back to its own stored login."""
+    try:
+        with open(os.path.join(base, "fleet-switchboard", "config.json")) as handle:
+            text = handle.read()
+    except FileNotFoundError:
         return False
-    return isinstance(users, dict) and bool(users)
+    except OSError:
+        return True
+    if "app_installations" not in text:
+        return False
+    try:
+        mapped = json.loads(text).get("app_installations")
+    except (ValueError, AttributeError):
+        return True
+    return bool(mapped)   # null and {} map nothing; anything else (even a malformed value) counts, and the gh shim refuses it
 
 
 def real_git():
