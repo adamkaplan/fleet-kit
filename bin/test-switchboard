@@ -22319,6 +22319,32 @@ class TestSweep(Base):
         self.sweep_real([])
         self.assertEqual(len(pending()), 1)                                          # past the window: once
 
+    def test_s14_an_s2_finding_names_the_body_or_the_comment_that_raised_it(self):
+        self.engine.config["triage"] = {"our_logins": ["bot"]}
+        self.hub.open = {10: sweep_issue(10, "Held for Alex", pr=True), 12: sweep_issue(12, "fine", pr=True)}
+        self.hub.comments = [sweep_comment(12, "waiting on alex", self.at(1), cid=4242)]
+        self.sweep()
+        by_ref = {d["ref"]: d for d in self.finding_lines("S2")}
+        self.assertEqual(by_ref["acme/api#10"]["source"], "body")
+        self.assertEqual(by_ref["acme/api#12"]["source"], "comment:4242")
+
+    def test_s15_a_corrupt_or_odd_alarm_memory_is_ignored_and_the_sweep_still_raises(self):
+        self.hub.open = {2: sweep_issue(2, "x")}
+        self.hub.comments = [sweep_comment(2, "waiting on Alex", self.at(1), cid=5)]
+        path = self.world.state / sb.SWEEP_ALARMED_FILE
+        for text in ("{nope", "[]", json.dumps({"S3 acme/api#2": {"at": "x"}, "ZZ a#1": {"at": 1}, "S3": {"at": True}})):
+            with self.subTest(text=text):
+                path.write_text(text)
+                self.engine.sweep = None
+                self.world.tick(1)
+                self.sweep_real([])
+                self.assertEqual(len(self.engine.sweep.facts), 1)                    # raised: nothing trustworthy was remembered
+        with mock.patch.object(sb, "_write_small", side_effect=OSError("disk full")):
+            self.engine.sweep = None
+            self.world.tick(7 * 3600)
+            self.sweep_real([])                                                      # a failed save is tolerated
+        self.assertEqual(len(self.engine.sweep.facts), 1)
+
     def test_a_deferral_that_never_ends_is_bounded_and_shown_as_overdue(self):
         self.hub.open = {2: sweep_issue(2, "x")}
         self.hub.comments = [sweep_comment(2, "waiting on Alex", self.at(1))]

@@ -11971,7 +11971,7 @@ def sweep_alarmed_load(engine, state, now, cfg):
     if getattr(state, "alarmed_loaded", False) or engine.state_dir is None:
         return
     state.alarmed_loaded = True
-    for key, record in _read_small(engine.state_dir, SWEEP_ALARMED_FILE).items():
+    for key, record in list(_read_small(engine.state_dir, SWEEP_ALARMED_FILE).items())[:5000]:   # only this code writes it: a bound anyway
         kind, _, ref = key.partition(" ")
         at = record.get("at")
         if kind in SWEEP_KINDS and isinstance(at, (int, float)) and not isinstance(at, bool) and now - at < cfg["realarm_hours"] * 3600:
