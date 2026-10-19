@@ -12530,7 +12530,7 @@ TRIAGE_KINDS = {"T1": "owner missing", "T2": "required label missing", "T3": "no
 TRIAGE_RULE_INPUTS = {"T1": ("agents", "issues"), "T2": ("agents", "issues"), "T3": ("agents", "issues", "comments"), "T5": ("decisions", "issues"),
                       "T6": ("decisions", "issues"), "T7": ("agents", "issues", "comments"), "T8": ("agents", "issues"), "T9": ("agents", "issues"),
                       "T10": ("closed",), "T11": ("agents", "issues"), "T12": ("agents", "issues", "merged"), "OO": ("agents", "issues"),
-                      "PARKED": ("issues",)}   # "agents" and "decisions" are global; the others are per repository (`<name>:<repo>`)
+                      "PARKED": ("agents", "issues")}   # "agents" and "decisions" are global; the others are per repository (`<name>:<repo>`)
 TRIAGE_T10_GRACE = 600         # seconds after a close in which a still-set awaiting label is not yet a finding
 TRIAGE_TTL = 900               # seconds a unit read is kept
 TRIAGE_CALLS_PER_PASS = TRIAGE_DEFAULTS["calls_per_pass"]   # default of `triage.calls_per_pass` (reads and fresh checks alike)

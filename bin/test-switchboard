@@ -22773,10 +22773,13 @@ class FakeTriageHub:
         self.open, self.comments, self.closed, self.live = {}, {}, {}, {}   # per repo: open {n: rec}; comments [rec]; closed {label: [rec]}
         self.pulls = {}   # per repo: [recently closed pull request records] (#384)
         self.calls, self.unreadable = [], set()
+        self.fail = []   # path fragments whose list reads fail (one kind of unit at a time)
         self.timelines, self.cut = {}, set()   # (repo, number) -> [timeline events] (#576); numbers whose timeline page is not the whole timeline
 
     def read_pages(self, path, key=None, timeout=None, older=None, cap=None):
         self.calls.append(path)
+        if any(f in path for f in self.fail):
+            raise sb.GitHubUnavailable("HTTP 502: a partial restart read")
         repo = re.search(r"repos/([^/]+/[^/]+)/", path).group(1)
         if repo in self.unreadable:
             raise sb.GitHubUnavailable("HTTP 404: Not Found")
@@ -22950,6 +22953,53 @@ class TestTriage(Base):
         self.world.tick(sb.TRIAGE_TTL + 1)
         self.go(passes=3)
         self.assertEqual([sb.whole(self.engine, "%s:acme/api" % n)[0] for n in names], [True] * 4)
+
+    def test_the_once_only_parked_flag_survives_the_prune_while_the_issue_list_is_not_whole_and_goes_with_a_whole_pass(self):
+        self.charter()
+        self.add(152, created=5, updated=4, labels=["osuser:parked"], body="parked, see later")   # a park with no valid date
+        self.engine.discover(self.world.clock.now())
+        self.go(passes=3, enabled=True)
+        self.assertIn("PARKED acme/api#152", self.engine.triage.seen)                # flagged once: the record exists
+        self.hub.unreadable.add("acme/api")
+        self.world.tick(sb.TRIAGE_TTL + 1)
+        self.go(passes=2)
+        self.assertFalse(sb.whole(self.engine, "issues:acme/api")[0])
+        self.assertIn("PARKED acme/api#152", self.engine.triage.seen)                # the issue list was not whole: kept
+        self.hub.unreadable.discard("acme/api")
+        del self.hub.open["acme/api"][152]                                           # it left: a whole pass without it
+        self.world.tick(sb.TRIAGE_TTL + 1)
+        self.go(passes=3)
+        self.assertNotIn("PARKED acme/api#152", self.engine.triage.seen)
+
+    def test_each_rules_input_value_is_the_unit_its_candidates_are_read_from(self):
+        """A restart whose partial reads miss ONE kind of unit: the records of the rules that read that unit are kept, so the table's
+        values cannot drift from the reads (changing one rule's input makes its record be forgotten here)."""
+        self.charter()
+        self.add(30, created=9, updated=1.5, parent=1, labels=["kind"])                      # T3: an ask, quiet, no next step (reads comments)
+        self.add(130, created=60, labels=["kind"])
+        self.merged_pr(200, "Part of #130.")                                                 # T12 (reads merged)
+        closed = tri_issue(self.now, 100, created=9, labels=[self.USER, "kind"], state="closed")
+        self.hub.closed["acme/api"] = {self.USER: [closed]}                                  # T10 (reads closed)
+        self.engine.discover(self.world.clock.now())
+        self.go(passes=3, enabled=True)
+        for key in ("T3 acme/api#30", "T12 acme/api#130", "T10 acme/api#100"):
+            self.assertIn(key, self.engine.triage.seen, key)
+        cases = [("T3 acme/api#30", "comments", "issues/comments", ["comments"]),
+                 ("T12 acme/api#130", "merged", "/pulls?", ["merged"]),
+                 ("T10 acme/api#100", "closed", "state=closed&labels", ["closed:" + self.USER, "closed:" + self.COS])]
+        for key, name, fragment, units in cases:
+            with self.subTest(key=key):
+                for unit in units:
+                    self.engine.triage.units.pop(("acme/api", unit), None)                    # not yet read in this process
+                self.hub.fail = [fragment]
+                self.world.tick(sb.TRIAGE_TTL + 1)
+                self.go(passes=2)
+                self.assertFalse(sb.whole(self.engine, "%s:acme/api" % name)[0])
+                self.assertIn(key, self.engine.triage.seen)                                  # kept: its own unit was not read
+                self.hub.fail = []
+                self.world.tick(max(sb.TRIAGE_TTL, sb.TRIAGE_UNREADABLE_RETRY) + 1)
+                self.go(passes=10)
+                self.assertTrue(sb.whole(self.engine, "%s:acme/api" % name)[0])
 
     def test_t1_owner_missing_both_ways_and_the_grace_day(self):
         self.charter()
@@ -24708,7 +24758,7 @@ class TestTriageRuleInputs(unittest.TestCase):
             self.assertIn(kind, sb.TRIAGE_RULE_INPUTS, "a record kind needs the inputs it judges: %s" % kind)
         for kind, needs in sb.TRIAGE_RULE_INPUTS.items():
             self.assertTrue(needs and set(needs) <= self.NAMES, kind)
-        for kind in sb.TRIAGE_KINDS:                                                 # a rule that judges ours-or-not reads the running agents
+        for kind in sorted(kinds):                                                   # a kind that judges ours-or-not reads the running agents (the PARKED flag is raised for our items)
             if kind not in ("T5", "T6", "T10"):
                 self.assertIn("agents", sb.TRIAGE_RULE_INPUTS[kind], kind)
 
