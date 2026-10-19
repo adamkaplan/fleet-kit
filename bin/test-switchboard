@@ -22193,6 +22193,67 @@ class TestLegitimateWaiting(WaitingInputs, ReportBase):
                 self.apply()
                 self.assertEqual(self.predicate().state, "clear")
 
+    def test_a_launch_checkpoint_reminder_is_not_a_wait_and_a_workers_own_reminder_is(self):
+        now = self.world.clock.now
+        sb.add_reminder(self.world.state, "coder", now() + 600, now(), "report", issue=2, condition={"while_running": "coder"})
+        self.assertEqual((self.predicate().state, self.predicate().codes), ("clear", []), "the boss's checkpoint is not the worker waiting")
+        for which in ("idle", "stalled"):
+            self.setUp()
+            self.mode(which)
+            sb.add_reminder(self.world.state, "coder", self.world.clock.now() + 600, self.world.clock.now(), "report", issue=2, condition={"while_running": "coder"})
+            self.assertTrue(self.said(), "%s: with only the checkpoint, the rule still speaks" % which)
+        self.setUp()
+        sb.add_reminder(self.world.state, "coder", now() + 600, now(), "look", issue=2)
+        self.assertEqual(self.predicate().codes, ["reminder"])
+
+    def test_a_reminder_whose_time_cannot_be_read_is_unread_toward_silence_in_both_rules(self):
+        """It fails toward SAYING NOTHING (state unread), by the read-whole rule: an input that cannot be read is no evidence either way."""
+        for which in ("idle", "stalled"):
+            for bad in ("soon", None, [1]):
+                with self.subTest(which=which, at=bad):
+                    self.setUp()
+                    self.mode(which)
+                    now = self.world.clock.now
+                    sb.add_reminder(self.world.state, "coder", now() + 600, now(), "look", issue=2)
+                    items = sb.read_reminders(self.world.state)
+                    items[0]["at"] = bad
+                    sb.write_reminders(self.world.state, items)
+                    self.assertEqual(self.predicate().state, "unread")
+                    self.assertEqual(self.said(), [])
+
+    def test_the_review_window_boundary_is_judged_at_limit_minus_one_exact_and_plus_one_second(self):
+        for minutes in (10, 60):
+            limit = minutes * 60
+            for age, want in ((limit - 1, "waiting"), (limit, "clear"), (limit + 1, "clear")):
+                with self.subTest(minutes=minutes, age=age):
+                    self.world.engine.config["review_window_minutes"] = minutes
+                    self.set_lists(pr_extra={"created_at": sb.iso(self.world.clock.now() - age)})
+                    got = self.predicate()
+                    self.assertEqual(got.state, want)
+                    self.assertEqual(got.codes, ["review-window"] if want == "waiting" else [])
+
+    def test_two_open_pull_requests_for_one_worker_it_waits_when_any_one_does(self):
+        """The stated choice: every pull request that names the issue is judged, and one wait is enough (a worker with two pull requests waits on either)."""
+        now = self.world.clock.now
+        def second(**extra):
+            self.set_lists(pr_extra={})
+            self.hub.records.append({"number": 12, "body": "PLAN: https://github.com/%s/issues/2\n" % self.REPO, "updated_at": sb.iso(self.t0),
+                                     "created_at": sb.iso(self.t0 - 86400), "head": {"sha": "d" * 40}, "labels": [], **extra})
+            self.world.engine.__dict__.pop("ci_record_state")
+            sb.ci_record_pass(self.world.engine, now())
+        second()
+        self.assertEqual(self.predicate().state, "clear", "two old pull requests with nothing pending")
+        second(requested_reviewers=[{"login": "r"}])
+        self.assertEqual(self.predicate().codes, ["review-requested"], "the second waits: the worker waits")
+        second(created_at=sb.iso(now() - 60))
+        self.assertEqual(self.predicate().codes, ["review-window"], "the second is young: the worker waits")
+        self.set_lists(pr_extra={"requested_reviewers": [{"login": "r"}]})
+        self.hub.records.append({"number": 12, "body": "PLAN: https://github.com/%s/issues/2\n" % self.REPO, "updated_at": sb.iso(self.t0), "created_at": sb.iso(self.t0 - 86400),
+                                 "head": {"sha": "d" * 40}, "labels": []})
+        self.world.engine.__dict__.pop("ci_record_state")
+        sb.ci_record_pass(self.world.engine, now())
+        self.assertEqual(self.predicate().codes, ["review-requested"], "the first waits, the second is clear: the worker waits")
+
     def test_a_repository_outside_plan_gates_is_silent_in_both_rules_never_nudged(self):
         """The open-PR list (and its read-whole mark) is read only for a `plan_gates` repository: without it no guard can be judged, so the read-whole rule gives no nudge and no wake."""
         for which in ("idle", "stalled"):

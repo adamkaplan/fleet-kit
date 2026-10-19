@@ -8513,12 +8513,9 @@ def _guard_reminder(w):
     try:
         reminders = read_reminders(w.engine.state_dir)
     except ReminderError:
-        raise _Unread() from None
+        raise _Unread() from None   # an unreadable file, or a reminder with no readable time (read_reminders refuses it): fails toward saying nothing
     for reminder in reminders:
-        at = reminder.get("at")
-        if not _is_number(at):
-            raise _Unread()   # a reminder whose time cannot be read: fails toward saying nothing
-        if (reminder.get("to") == w.observation.name and reminder.get("issue") == w.issue and at > w.now
+        if (reminder.get("to") == w.observation.name and reminder.get("issue") == w.issue and reminder["at"] > w.now
                 and "while_running" not in (reminder.get("condition") or {})):   # the checkpoint `launch` sets is the boss's, not the worker waiting
             return ["it set a reminder for later"]
     return []
