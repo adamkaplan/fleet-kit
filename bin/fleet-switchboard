@@ -4336,7 +4336,15 @@ class Switchboard:
                 _one_line("; ".join(str(c) for c in programs), 120) or "nothing")
 
     def discover(self, now, entries=None):
-        """Every fleet agent: a herdr agent whose v2 session carries `metadata.fleet.name`."""
+        """Every fleet agent: a herdr agent whose v2 session carries `metadata.fleet.name`. Also marks the `agents` input (#805): not whole when
+        it starts, whole only when it finished with no problem, so a discovery that raised or was partial leaves it not whole."""
+        read_mark(self, "agents", False, "the discovery did not finish", now)
+        found = self._discover(now, entries)
+        problems = list(found.problems or ())
+        read_mark(self, "agents", not problems, "the fleet could not be read whole: %s" % _one_line(problems[0], 80) if problems else "", now)
+        return found
+
+    def _discover(self, now, entries=None):
         found = Discovery()
         self.discovery = found
         if entries is None:
@@ -12517,6 +12525,25 @@ TRIAGE_KINDS = {"T1": "owner missing", "T2": "required label missing", "T3": "no
                 "T5": "human-tier decision unanswered", "T6": "MERGE: captain PR waiting", "T7": "PR with no review",
                 "T8": "blocked ask", "T9": "ask with no activity", "T10": "closed but still labelled awaiting",
                 "T11": "orphan", "T12": "plan issue still open after its PR merged", "OO": "other-owner (flag only)"}
+# #805: the inputs each rule judges, in ONE table: the candidates a pass drops and the records the prune keeps are both read from it, so they cannot drift.
+# A rule that judges whether an item is OURS (every one but T5, T6 and T10) also needs `agents`: ownership comes from the running agents.
+TRIAGE_RULE_INPUTS = {"T1": ("agents", "issues", "merged"), "T2": ("agents", "issues"), "T3": ("agents", "issues", "comments"), "T5": ("decisions", "issues"),
+                      "T6": ("decisions", "issues"), "T7": ("agents", "issues", "comments", "decisions"), "T8": ("agents", "issues"),
+                      "T9": ("agents", "issues", "comments"), "T10": ("closed",), "T11": ("agents", "issues", "merged"), "T12": ("agents", "issues", "merged")}
+# "agents" and "decisions" are global; the others are per repository (`<name>:<repo>`). T7 also reads the decision list (a captain PR listed there is T6's);
+# T1 and T11 give way to T12 when a merged PR links the item (so they read `merged`), and T9 gives way to T3 (so it reads `comments`).
+# The records of the OTHER kinds are kept whenever ANY input of ANY rule is not whole: the other-owner flag stands for whichever rule would have fired, and the
+# invalid-park flag is raised from the digest of all of them. Their set is derived from the table, so a new rule's input is included at once.
+TRIAGE_UNION_KINDS = ("OO", "PARKED")
+
+
+def triage_inputs(kind):
+    """The inputs the records of `kind` judge, or None for a kind the table does not know (its records are then all kept)."""
+    if kind in TRIAGE_UNION_KINDS:
+        return tuple(sorted({name for needs in TRIAGE_RULE_INPUTS.values() for name in needs}))
+    return TRIAGE_RULE_INPUTS.get(kind)
+
+
 TRIAGE_T10_GRACE = 600         # seconds after a close in which a still-set awaiting label is not yet a finding
 TRIAGE_TTL = 900               # seconds a unit read is kept
 TRIAGE_CALLS_PER_PASS = TRIAGE_DEFAULTS["calls_per_pass"]   # default of `triage.calls_per_pass` (reads and fresh checks alike)
@@ -12962,6 +12989,7 @@ def triage_findings(engine, state, repos, decisions, cfg, now, errors):
     except (NoticeError, OSError, TypeError):
         pass
     out, unchecked, truncated = [], {}, []
+    agents_whole = whole(engine, "agents")[0]
     live_days = load_module("awaiting_live").days_of(engine.config)
     captain_listed = {sweep_ref_of(d, engine.config.get("intent_repo")) for d in decisions if d.get("kind") == "captain"}
     for repo in repos:
@@ -12997,6 +13025,10 @@ def triage_findings(engine, state, repos, decisions, cfg, now, errors):
             found, ours = triage_rules(item, comments, ctx, sla, now, ours_logins, required, notice_prs.get(repo, set()),
                                        captain_skip=captain_skip, merged=links, pending=pending,
                                        live=live["info"] if live else None, live_days=live_days)
+            if not agents_whole:   # #805: "no owner" is judged against the running agents: a fleet that was not read whole is no evidence of an absence
+                for rule in [r for r in found if "agents" in (triage_inputs(r) or ())]:
+                    found.pop(rule)
+                    whole_skipped(engine, "triage.owner_rules", "agents")
             if not found:
                 continue
             ref = "%s#%d" % (repo, number)
@@ -13209,6 +13241,8 @@ def triage_ownerless_pass(engine, state, cfg, now):
     options = triage_ownerless_options(cfg)
     if options is None or engine.state_dir is None:
         return {}
+    if whole_skipped(engine, "triage.ownerless", "agents"):
+        return {}   # #805: an issue is ownerless when no running agent owns it: a fleet that was not read whole is no evidence of that
     module, shown = load_module("triage_ownerless"), {}
     try:
         discovery, ours = getattr(engine, "discovery", None), triage_our_logins(engine, cfg)
@@ -13284,19 +13318,31 @@ def mark_decisions_read(engine, errors, now):
     read_mark(engine, "decisions", not errors and notices, why, now)
 
 
+def triage_mark_unit(engine, state, name, repo, units, now):
+    """Mark `<name>:<repo>` from the held units of that kind: whole only when every one is held, without error and not cut."""
+    bad = None
+    for unit_name in units:
+        unit = state.units.get((repo, unit_name))   # a unit never read, a failed read or a cut list is no evidence of an absence
+        if unit is None:
+            bad = "%s not read yet" % unit_name
+        elif unit.get("error"):
+            bad = "the last read of %s failed: %s" % (unit_name, unit["error"])
+        elif unit.get("truncated"):
+            bad = "the %s list was cut" % unit_name
+        if bad:
+            break
+    read_mark(engine, "%s:%s" % (name, repo), bad is None, bad or "", now)
+
+
 def triage_mark_reads(engine, state, repos, errors, now):
     """The inputs the triage rules judge, marked from the reads this pass already made (no new read)."""
     mark_decisions_read(engine, errors, now)
+    closed = ["closed:" + l for l in sorted(triage_awaiting_labels(engine))]
     for repo in repos:
-        unit = state.units.get((repo, "issues"))
-        if unit is None:
-            read_mark(engine, "issues:" + repo, False, "not read yet", now)
-        elif unit.get("error"):
-            read_mark(engine, "issues:" + repo, False, "the last read failed: %s" % unit["error"], now)
-        elif unit.get("truncated"):
-            read_mark(engine, "issues:" + repo, False, "the list was cut", now)
-        else:
-            read_mark(engine, "issues:" + repo, True, "", now)
+        triage_mark_unit(engine, state, "issues", repo, ["issues"], now)
+        triage_mark_unit(engine, state, "comments", repo, ["comments"], now)
+        triage_mark_unit(engine, state, "merged", repo, ["merged"], now)
+        triage_mark_unit(engine, state, "closed", repo, closed, now)
 
 
 def triage_owner_tier_t6(engine, decisions):
@@ -13475,10 +13521,12 @@ def triage_digest_memory(engine, state):
 def triage_digest_keep(engine):
     """keep(rule, ref) for the prune: True when the record's candidates could not be computed in this pass (#805)."""
     def keep(rule, ref):
-        if rule in ("T5", "T6") and whole_skipped(engine, "triage.prune", "decisions"):
-            return True
+        needs = triage_inputs(rule)
+        if needs is None:
+            return True   # a rule the table does not know: nothing about it is forgotten
         repo = ref.rpartition("#")[0]
-        return bool(repo) and whole_skipped(engine, "triage.prune", "issues:" + repo)
+        return any(whole_skipped(engine, "triage.prune", name if name in ("agents", "decisions") else "%s:%s" % (name, repo))
+                   for name in needs if name in ("agents", "decisions") or repo)
     return keep
 
 
@@ -20335,6 +20383,8 @@ def _chat_clear_pass(engine, decisions, now):
         engine.__dict__["chat_clear_mode"] = mode
         if previous is not None or why:
             engine.audit.append(engine.actor, "chat_clear.mode", "chat_clear", {"mode": mode, "was": previous, "why": why})
+    if whole_skipped(engine, "chat_clear.offers", "notices"):
+        return   # #805: a held PR whose notice was not read is absent from the holds: its offer (the head the person was shown) must not be forgotten and re-recorded
     cc = load_module("chat_clear")
     names = label_names(engine.config)
     holds = chat_clear_holds(decisions, names)
