@@ -510,3 +510,46 @@ test("#846: a session with no record is looked up again only after the negative 
   t += 11000;
   assert.equal(tmpFor({ OPENCODE_SESSION_ID: "ses_late1" }), path.join(w.root, "late"));
 });
+
+// ---- #846 review: no step after the shims can take them off PATH. Branches of the hook, each with a test:
+// (1) spec missing or not an object: nothing to do; (2) spec.env unreadable: left as it was; (3) PATH unreadable as text: the shims alone;
+// (4) spec.env not writable: left as it was; (5) the resolver throws or returns a non-string/promise: shims on PATH, TMPDIR unchanged.
+const throwers = [
+  ["Error", () => { throw new Error("boom"); }],
+  ["TypeError", () => { throw new TypeError("bad"); }],
+  ["a non-Error throw", () => { throw "just a string"; }], // eslint-disable-line no-throw-literal
+  ["a rejected promise", () => Promise.reject(new Error("late"))],
+  ["a resolved promise", () => Promise.resolve("/x")],
+  ["an object", () => ({ dir: "/x" })],
+];
+for (const [label, resolver] of throwers) {
+  test(`#846: a resolver that fails with ${label} leaves the shims first on PATH and TMPDIR unchanged`, async () => {
+    const spec = { command: "true", env: baseEnv("ses_aaa1") };
+    makeShellHook("/kit/shims", resolver)(spec);
+    assert.equal(spec.env.PATH, "/kit/shims:/usr/bin");
+    assert.equal(spec.env.TMPDIR, "/var/shared");
+    assert.deepEqual({ ...spec.env, PATH: 0 }, { ...baseEnv("ses_aaa1"), PATH: 0 });
+    await new Promise((r) => setImmediate(r)); // an unhandled rejection would fail the run here
+  });
+}
+
+test("#846: the other branches of the hook never drop the shims", () => {
+  const hook = makeShellHook("/kit/shims", () => { throw new Error("x"); });
+  assert.doesNotThrow(() => hook(undefined));
+  assert.doesNotThrow(() => hook(null));
+  assert.doesNotThrow(() => hook("text"));
+  const noEnv = { command: "true" };
+  hook(noEnv);
+  assert.equal(noEnv.env.PATH, "/kit/shims");
+  const oddPath = { env: { PATH: { toString() { throw new Error("no text"); } }, HOME: "/h" } };
+  hook(oddPath);
+  assert.equal(oddPath.env.PATH, "/kit/shims");
+  assert.equal(oddPath.env.HOME, "/h");
+  const dup = { env: { PATH: "/usr/bin:/kit/shims:/bin" } };
+  hook(dup);
+  assert.equal(dup.env.PATH, "/kit/shims:/usr/bin:/bin");
+  const frozen = Object.freeze({ env: { PATH: "/usr/bin" }, command: "true" });
+  assert.doesNotThrow(() => hook(frozen)); // an unwritable spec is left as it was, never thrown
+  const unreadable = { get env() { throw new Error("getter"); } };
+  assert.doesNotThrow(() => hook(unreadable));
+});

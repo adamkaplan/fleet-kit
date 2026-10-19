@@ -546,18 +546,33 @@ export function makeTmpResolver({ stateDir, root, now = Date.now, fsm = fs, warn
 
 export function makeShellHook(dir, tmpFor = null) {
   return function createBefore(spec) {
+    // The shims are the account guard: they go on PATH FIRST and are written to the spec before anything optional runs, so no later step
+    // (the TMPDIR resolver, a bad value) can leave a worker on the real gh and git. Each step has its own guard (#846).
+    if (!spec || typeof spec !== "object") return;
+    let env;
     try {
-      if (!spec || typeof spec !== "object") return;
-      const env = Object.assign({}, spec.env);
+      env = Object.assign({}, spec.env);
+    } catch {
+      return; // an environment that cannot be read is left as it was
+    }
+    try {
       const rest = String(env.PATH || "").split(path.delimiter).filter((p) => p && p !== dir);
       env.PATH = [dir, ...rest].join(path.delimiter);
-      if (tmpFor) {
-        const tmp = tmpFor(spec.env);
-        if (tmp) env.TMPDIR = tmp;
-      }
+    } catch {
+      env.PATH = dir; // a PATH that cannot be read as text: the shims still come first
+    }
+    try {
       spec.env = env;
     } catch {
-      // Whatever goes wrong, the command runs as it was.
+      return;
+    }
+    if (!tmpFor) return;
+    try {
+      const tmp = tmpFor(env);
+      if (typeof tmp === "string" && tmp) env.TMPDIR = tmp; // a promise or anything else is ignored
+      if (tmp && typeof tmp.then === "function") tmp.then(undefined, () => {}); // a rejected promise is not left unhandled
+    } catch {
+      // the TMPDIR part is skipped; PATH already carries the shims
     }
   };
 }
