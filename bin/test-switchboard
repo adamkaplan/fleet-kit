@@ -23172,7 +23172,7 @@ class TestSweep(Base):
     # finding source (sweep_findings) and its fresh re-read (sweep_verify) fixed to one finding of the kind under test,
     # so every member of SWEEP_KINDS (the table the code loops over) gets the same cases.
     def one_finding(self, kind):
-        ref = "acme/api#%d" % (abs(hash(kind)) % 900 + 50)
+        ref = "acme/api#%d" % (50 + sorted(sb.SWEEP_KINDS).index(kind))
         return ref, mock.patch.multiple(sb, sweep_findings=lambda *a, **k: [(kind, ref)], sweep_verify=lambda *a, **k: True)
 
     def lines(self, ref):
@@ -23213,6 +23213,27 @@ class TestSweep(Base):
                     self.sweep_real([])
                     self.assertEqual(len(self.engine.sweep.facts), 1)
                     self.assertEqual([d["woken"] for d in self.lines(ref)], [True, True])
+
+    def test_849_a_wake_queued_later_the_same_day_is_logged_once_more_as_woken(self):
+        for kind in sorted(sb.SWEEP_KINDS):
+            with self.subTest(kind=kind):
+                self.setUp()
+                ref, patch = self.one_finding(kind)
+                with patch:
+                    self.engine.config["sweep"]["enabled"] = False
+                    self.sweep_real([])
+                    self.engine.config["sweep"]["enabled"] = True
+                    self.sweep_real([])
+                    self.sweep_real([])
+                    self.assertEqual([d["woken"] for d in self.lines(ref)], [False, True])
+
+    def test_849_only_the_findings_the_fact_names_read_woken(self):
+        kinds = sorted(sb.SWEEP_KINDS)[:2]
+        refs = ["acme/api#%d" % (60 + n) for n in range(2)]
+        self.engine.config["sweep"]["max_findings"] = 1
+        with mock.patch.multiple(sb, sweep_findings=lambda *a, **k: list(zip(kinds, refs)), sweep_verify=lambda *a, **k: True):
+            self.sweep_real([])
+        self.assertEqual(sorted(sum(([d["woken"] for d in self.lines(r)] for r in refs), [])), [False, True])
 
     def test_849_shadow_mode_logs_woken_false_and_queues_nothing(self):
         for kind in sorted(sb.SWEEP_KINDS):
@@ -24360,7 +24381,7 @@ class TestTriage(Base):
     # source (triage_findings) and its fresh re-read (triage_verify) fixed to one finding of the rule under test, so every
     # member of TRIAGE_KINDS (the table the code loops over) gets the same cases. An OO flag is never a wake of its own.
     def one_rule(self, rule):
-        ref = "acme/api#%d" % (abs(hash(rule)) % 900 + 50)
+        ref = "acme/api#%d" % (50 + sorted(sb.TRIAGE_KINDS).index(rule))
         return ref, mock.patch.multiple(sb, triage_findings=lambda *a, **k: ([(rule, ref, {})], {}, []),
                                         triage_verify=lambda *a, **k: True)
 
@@ -24429,6 +24450,18 @@ class TestTriage(Base):
                     self.world.tick(120)
                     self.pass_now()
                     self.assertEqual([d["woken"] for d in self.tlines(ref)], [True, True])
+
+    def test_849_a_wake_queued_later_the_same_day_is_logged_once_more_as_woken(self):
+        for rule in sorted(set(sb.TRIAGE_KINDS) - {"OO"}):
+            with self.subTest(rule=rule):
+                self.setUp()
+                ref, patch = self.one_rule(rule)
+                with patch:
+                    self.pass_now()                                                   # shadow: audited, nobody woken
+                    self.engine.config["triage"]["enabled"] = True
+                    self.pass_now()
+                    self.pass_now()
+                    self.assertEqual([d["woken"] for d in self.tlines(ref)], [False, True])
 
     def test_849_shadow_mode_logs_woken_false_for_every_rule(self):
         for rule in sorted(sb.TRIAGE_KINDS):

@@ -12242,6 +12242,7 @@ class SweepState:
         self.alarmed = {}        # (kind, ref) -> time cos was last told
         self.withdrawn = set()   # refs already audited as withdrawn
         self.logged = set()      # (kind, ref, day): findings already audited today
+        self.woken_logged = set()  # (kind, ref, day): of those, the ones audited as woken (a later wake the same day is audited once more)
         self.facts = {}          # key -> (summary, created): the pending cos facts, until they age out
         self.deferred_since = {}  # repo or "*" -> when S3 was first deferred for it
         self.confirmed = {}      # (kind, ref) -> when a fresh read last bore the finding out
@@ -12700,13 +12701,18 @@ def sweep_decisions(engine, decisions, now, errors=()):
     findings.sort()
     day = int(now // 86400)
     due = [(k, r) for k, r in findings
-           if cfg["enabled"] and now - state.alarmed.get((k, r), 0) >= cfg["realarm_hours"] * 3600]   # what is woken this pass
+           if cfg["enabled"] and now - state.alarmed.get((k, r), 0) >= cfg["realarm_hours"] * 3600]   # what is queued this pass
+    woken = set(due[:cfg["max_findings"]])   # the fact names at most this many: the rest are counted, not named
     for kind, ref in findings:
-        if (kind, ref, day) not in state.logged:
+        once = (kind, ref, day)
+        if once not in state.logged or ((kind, ref) in woken and once not in state.woken_logged):
             if len(state.logged) > 5000:
                 state.logged.clear()
-            state.logged.add((kind, ref, day))
-            detail = {"kind": kind, "ref": ref, "what": SWEEP_KINDS[kind], "woken": (kind, ref) in due}
+                state.woken_logged.clear()
+            state.logged.add(once)
+            if (kind, ref) in woken:
+                state.woken_logged.add(once)
+            detail = {"kind": kind, "ref": ref, "what": SWEEP_KINDS[kind], "woken": (kind, ref) in woken}
             if (kind, ref) in state.sources:
                 detail["source"] = state.sources[(kind, ref)]["source"]   # #805: what raised it, so the reason is readable from the audit
                 detail["match"] = _one_line(state.sources[(kind, ref)]["match"], 80)
@@ -13012,7 +13018,7 @@ class TriageState:
         self.enriched = {}       # (rule, ref) -> evidence the fresh read added
         self.live = {}           # #576: (repo, number) -> {"token": the issue's updated time, "info": the label's age facts or None, "at"}: one timeline read each
         self.reasons = {}        # (rule, ref) -> the worded reason of a finding that carries one (`awaiting-live expired`)
-        self.logged, self.facts, self.current = set(), {}, {}
+        self.logged, self.woken_logged, self.facts, self.current = set(), set(), {}, {}
         self.started, self.day, self.day_counts = 0, None, {}
         self.summarised = None
         self.seen = None         # #349: the stale digest's memory (bin/triage_digest.py), loaded at the first pass
@@ -13760,7 +13766,6 @@ def triage_pass(engine, decisions, now, errors=()):
     due, invalid = triage_digest_due(engine, state, [(r, ref) for r, ref, _ in findings if r != "OO"],
                                      [(r, ref) for r, ref, _ in candidates if r != "OO"], cfg, now, owner_t6)
     triage_logged_seed(state, due, cfg, now, day)   # #849: before the commit below rewrites the memory
-    raw_due = due
     if cfg["enabled"] and cfg.get("backoff", True):   # #406: warm up first, then at most one digest per interval; a held digest keeps its memory untouched
         before = state.meta["swept"]
         open_units = sum(len(u) for u in unchecked_units.values()) + sum(1 for r in repos if (r, "issues") not in state.units and r not in state.unreadable)   # a list not read yet is a finding not checked
@@ -13798,10 +13803,14 @@ def triage_pass(engine, decisions, now, errors=()):
     else:
         woken = set()
     for rule, ref, evidence in findings:   # #849: the audit line says what was done: woken only when this pass queued a wake for it
-        if (rule, ref, day) not in state.logged:
+        once = (rule, ref, day)
+        if once not in state.logged or ((rule, ref) in woken and once not in state.woken_logged):
             if len(state.logged) > 20000:
                 state.logged.clear()
-            state.logged.add((rule, ref, day))
+                state.woken_logged.clear()
+            state.logged.add(once)
+            if (rule, ref) in woken:
+                state.woken_logged.add(once)
             engine._note("triage.finding", ref, {"rule": rule, "ref": ref, "what": TRIAGE_KINDS[rule],
                                                  "evidence": evidence, "woken": (rule, ref) in woken, "applied": False})
     triage_daily_summary(engine, state, cfg, now, day, repos)
