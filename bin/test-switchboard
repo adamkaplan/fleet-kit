@@ -12341,7 +12341,25 @@ class TestChatClearHook(Base):
 
     def hook(self, decisions=None):
         self.engine.discover(self.world.clock.now())
+        sb.decisions_from_notices(self.engine, self.world.clock.now())               # the REAL notice reader marks the input, as in every pass
         sb.chat_clear_pass(self.engine, self.decisions() if decisions is None else decisions, self.world.clock.now())
+
+    def test_the_offers_are_kept_while_the_notice_read_is_not_whole_and_dropped_only_by_a_whole_pass(self):
+        self.hook()                                                                  # the PR is held: its offer records the head shown
+        cc = sb.load_module("chat_clear")
+        before = cc.read_offers(self.world.state)
+        self.assertEqual(len(before), 1)
+        now = self.world.clock.now()
+        item = {"repo": "acme/api", "number": 99, "created": now, "note": None, "from": "platform"}
+        skipped = {"at": 0, "facts": None, "stale": True, "skipped": True, "confirmed": None, "error": "budget"}
+        with mock.patch.object(sb, "read_pr_notices", return_value=[item]), mock.patch.object(sb, "notice_facts", return_value=skipped):
+            sb.decisions_from_notices(self.engine, now)                              # the REAL reader: one noticed PR unread
+        self.assertFalse(sb.whole(self.engine, "notices")[0])
+        sb.chat_clear_pass(self.engine, [], now)                                     # the held PR is absent from this list: no evidence it left
+        self.assertEqual(cc.read_offers(self.world.state), before)                   # the head the person was shown is kept
+        self.assertIn("whole.skipped", [e["event"] for e in self.world.audit()])
+        self.hook(decisions=[])                                                      # a whole pass without the PR: its offer goes
+        self.assertEqual(cc.read_offers(self.world.state), {})
 
     def say(self, text, lasts=0, **kw):
         self.world.tick(5)
@@ -24629,6 +24647,29 @@ class FakeOwnerlessHub(FakeTriageHub):
         return self.open_total.get(repo, len(self.open.get(repo, {})))
 
 
+class TestReadWholeAuditTable(unittest.TestCase):
+    """#805: the docs audit lists every absence-driven consumer with its input, whether it checked before, and its fix or how it is guarded."""
+    NAMED = ("escalation-key prune", "triage seen-memory prune", "T5 and T6", "load alert", "stalled count", "sweep S2", "once-only memory",
+             "closed-label", "merged-label", "reminders prune", "temp janitor", "worktree reclaim", "container reaper", "retire", "auto-retire",
+             "delivered-message", "cursor prunes", "ownerless", "stale-ask", "chat-clear offers", "notice expiry")
+
+    def rows(self):
+        text = (REPO / "docs" / "switchboard.md").read_text()
+        start = text.index("**Reads that are not whole: the audit of every absence-driven consumer (#805).**")
+        block = text[start:text.index("**The stale digest (#349).**", start)]
+        return [[c.strip() for c in line.strip().strip("|").split("|")] for line in block.splitlines() if line.startswith("| ") and not line.startswith("| ---") and not line.startswith("| Consumer")]
+
+    def test_every_named_consumer_has_a_row_with_all_four_columns_filled(self):
+        rows = self.rows()
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertEqual(len(row), 4, row)
+            self.assertTrue(all(row), row)
+        joined = " ".join(" ".join(r) for r in rows).lower()
+        for name in self.NAMED:
+            self.assertIn(name.lower(), joined, name)
+
+
 class TestOwnerlessSummary(Base):
     """#605: ownerless, quiet issues of a team repository are one daily line to the Chief of Staff and the repository's orchestrators; nothing is written to any issue."""
 
@@ -24676,6 +24717,26 @@ class TestOwnerlessSummary(Base):
             self.add(n, created=10, author="alice", labels=["agent:other-crew"])                # another crew's owner label: owned
         for n in range(200, 205):
             self.add(n, created=10, updated=1, author="alice")                                   # touched yesterday
+
+    def test_a_fleet_that_was_not_read_whole_raises_no_ownerless_line_and_the_next_whole_pass_raises_it(self):
+        self.populate()
+        with mock.patch.object(self.engine.herdr, "agent_list", side_effect=sb.HerdrError("down")):
+            self.engine.discover(self.world.clock.now())                             # the REAL discovery: herdr unreachable
+        self.assertFalse(sb.whole(self.engine, "agents")[0])
+        self.go()
+        self.assertEqual(self.told("cos"), [])                                       # nothing is ownerless on evidence from a partial fleet
+        self.engine.discover(self.world.clock.now())
+        self.assertEqual(sb.whole(self.engine, "agents"), (True, ""))
+        self.go()
+        self.assertEqual(len(self.lines("cos")), 1)                                  # the genuine line, once
+
+    def test_the_agents_mark_is_not_whole_when_the_discovery_raises_and_never_inherited(self):
+        self.engine.discover(self.world.clock.now())
+        self.assertTrue(sb.whole(self.engine, "agents")[0])
+        with mock.patch.object(self.engine.herdr, "agent_list", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                self.engine.discover(self.world.clock.now())
+        self.assertFalse(sb.whole(self.engine, "agents")[0])
 
     def test_s1_s2_one_line_with_the_count_the_oldest_age_and_five_links_and_nothing_per_issue(self):
         self.populate()

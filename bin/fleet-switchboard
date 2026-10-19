@@ -4336,7 +4336,15 @@ class Switchboard:
                 _one_line("; ".join(str(c) for c in programs), 120) or "nothing")
 
     def discover(self, now, entries=None):
-        """Every fleet agent: a herdr agent whose v2 session carries `metadata.fleet.name`."""
+        """Every fleet agent: a herdr agent whose v2 session carries `metadata.fleet.name`. Also marks the `agents` input (#805): not whole when
+        it starts, whole only when it finished with no problem, so a discovery that raised or was partial leaves it not whole."""
+        read_mark(self, "agents", False, "the discovery did not finish", now)
+        found = self._discover(now, entries)
+        problems = list(found.problems or ())
+        read_mark(self, "agents", not problems, "the fleet could not be read whole: %s" % _one_line(problems[0], 80) if problems else "", now)
+        return found
+
+    def _discover(self, now, entries=None):
         found = Discovery()
         self.discovery = found
         if entries is None:
@@ -13209,6 +13217,8 @@ def triage_ownerless_pass(engine, state, cfg, now):
     options = triage_ownerless_options(cfg)
     if options is None or engine.state_dir is None:
         return {}
+    if whole_skipped(engine, "triage.ownerless", "agents"):
+        return {}   # #805: an issue is ownerless when no running agent owns it: a fleet that was not read whole is no evidence of that
     module, shown = load_module("triage_ownerless"), {}
     try:
         discovery, ours = getattr(engine, "discovery", None), triage_our_logins(engine, cfg)
@@ -20335,6 +20345,8 @@ def _chat_clear_pass(engine, decisions, now):
         engine.__dict__["chat_clear_mode"] = mode
         if previous is not None or why:
             engine.audit.append(engine.actor, "chat_clear.mode", "chat_clear", {"mode": mode, "was": previous, "why": why})
+    if whole_skipped(engine, "chat_clear.offers", "notices"):
+        return   # #805: a held PR whose notice was not read is absent from the holds: its offer (the head the person was shown) must not be forgotten and re-recorded
     cc = load_module("chat_clear")
     names = label_names(engine.config)
     holds = chat_clear_holds(decisions, names)
