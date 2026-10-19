@@ -22188,6 +22188,31 @@ class TestLegitimateWaiting(WaitingInputs, ReportBase):
             self.report(kind, "x")
             self.assertEqual(self.predicate().codes, ["last-report"])
 
+    def test_a_launch_checkpoint_is_not_a_wait_a_bad_reminder_is_unread_and_the_window_and_two_pull_requests_are_judged(self):
+        now = self.world.clock.now
+        sb.add_reminder(self.world.state, "coder", now() + 600, now(), "report", issue=2, condition={"while_running": "coder"})
+        self.assertEqual(self.predicate().state, "clear", "a checkpoint is not a worker waiting")
+        sb.add_reminder(self.world.state, "coder", now() + 600, now(), "look", issue=2)
+        self.assertEqual(self.predicate().codes, ["reminder"])
+        path = self.world.state / "reminders.json"
+        raw = json.loads(path.read_text())
+        for item in (raw if isinstance(raw, list) else raw.get("reminders", [])):
+            item["at"] = "soon"
+        path.write_text(json.dumps(raw))
+        self.assertEqual(self.predicate().state, "unread")
+        path.unlink()
+        self.world.engine.config["review_window_minutes"] = 10
+        self.set_lists(pr_extra={"created_at": sb.iso(now() - 599)})
+        self.assertEqual(self.predicate().codes, ["review-window"])
+        self.set_lists(pr_extra={"created_at": sb.iso(now() - 600)})
+        self.assertEqual(self.predicate().state, "clear", "the boundary: exactly the window is over")
+        self.set_lists(pr_extra={})
+        self.hub.records.append({"number": 12, "body": "PLAN: https://github.com/%s/issues/2\n" % self.REPO, "updated_at": sb.iso(self.t0), "created_at": sb.iso(self.t0 - 86400),
+                                 "head": {"sha": "d" * 40}, "labels": [], "requested_reviewers": [{"login": "r"}]})
+        self.world.engine.__dict__.pop("ci_record_state")
+        sb.ci_record_pass(self.world.engine, now())
+        self.assertEqual(self.predicate().codes, ["review-requested"], "one of two pull requests is waiting: the worker is")
+
     def test_a_blocked_or_question_report_is_waiting_without_any_input(self):
         for kind in ("blocked", "question"):
             self.report(kind, "which one?")

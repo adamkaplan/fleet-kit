@@ -8473,7 +8473,7 @@ def legitimately_waiting(engine, observation, issue, repo, last):
     `issue_at`, `pr`, `number`, `head`, `pr_at` describe what it found for the caller's movement judgement. Guards: its last report is blocked
     or question; an awaiting label on the issue or its pull request; CI running or queued at the head of a pull request naming the issue; a
     review requested on a non-draft pull request, or one younger than `review_window_minutes` (the list holds no reviews, so "no review yet" is
-    the window; a draft awaits no review); a reminder of the worker's own due later naming the issue; a human-tier decision for the issue or its
+    the window; a draft awaits no review); a reminder due later naming the issue (not the checkpoint `launch` sets); a human-tier decision for the issue or its
     pull request."""
     out = types.SimpleNamespace(state="unread", reason="", codes=[], issue_at=None, pr=None, number=None, head=None, pr_at=None)
     now = engine.now()
@@ -8530,7 +8530,11 @@ def legitimately_waiting(engine, observation, issue, repo, last):
                     reasons.append(("review-window", "#%d is younger than the review window" % number))
     try:
         for reminder in read_reminders(engine.state_dir):
-            if reminder.get("to") == observation.name and reminder.get("issue") == issue and reminder["at"] > now:
+            at = reminder.get("at")
+            if not _is_number(at):
+                return out   # a reminder whose time cannot be read: fails toward saying nothing
+            if (reminder.get("to") == observation.name and reminder.get("issue") == issue and at > now
+                    and "while_running" not in (reminder.get("condition") or {})):   # the checkpoint `launch` sets is the boss's, not the worker waiting
                 reasons.append(("reminder", "it set a reminder for later"))
                 break
     except ReminderError:
