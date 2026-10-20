@@ -41,6 +41,10 @@ DEFAULT_LAUNCHER = "cloud-worker"
 CLOUD_DIR = "cloud"
 DEFAULT_DIRECTORY = "/work"   # the session's directory in the pod: the scratch volume (writable by the image's user via fsGroup); /workspace does not exist there
 CLOUD_WORKER_AGENT = "worker"   # the agent the image defines (cloud/worker/agents/worker.md): a cloud session always runs it; the local --agent name is only recorded
+# The options of the launcher's `create` that `launch --cloud` hands over: ONE table. Taken from the launcher on main (commit fb4b9f2,
+# cloud/launcher/cloud_worker.py `create`: --shape S|M, --stack); a name here that the launcher does not know makes its create fail (exit 2).
+CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack"}
+LAUNCHER_SHAPES = ("S", "M")   # the launcher's SHAPES keys; the launcher's own default (S) applies when --shape is not given
 POD_DIR_ROOTS = ("/work", "/home/worker")   # the only roots a cloud session directory may be under (a local path does not exist in the pod)
 WORK_REPO = "/work/repo"      # where the worker clones the repository: the launcher's end hook (CW_WORKDIR default) pushes from here
 SETUP_PREAMBLE = """Setup (do this first, before the task below):
@@ -1068,6 +1072,8 @@ def _launch(args, runner, now, reserve):
     source = use_settings()   # before any setting is read: the allow-list, the preflight and the launcher all read this one source
     print("%s: cloud settings from %s" % (H["PROG"], source), file=sys.stderr)
     check_allowed(repo)   # before anything is read, minted or created
+    if getattr(args, "stack", False) and args.shape and args.shape not in LAUNCHER_SHAPES:   # exact membership in a tuple; after the allow-list, before the preflight, any token or call
+        raise Refusal("--shape %r is not a pod shape (%s); nothing was created" % (str(args.shape)[:40], " or ".join(LAUNCHER_SHAPES)))
     try:   # the repository preflight, before any token is minted; FAIL CLOSED: a missing, killed or silent program refuses (stdout stays the one JSON line)
         print(_lib().check_repo_preflight(repo, {k: v for k, v in os.environ.items() if k not in CLUSTER_DROP}), file=sys.stderr)
     except _lib().CloudError as err:
@@ -1082,10 +1088,12 @@ def _launch(args, runner, now, reserve):
         raise LaunchError("a cloud worker named %s already exists (`%s retire %s` ends it)" % (name, H["PROG"], name))
     brief = H["read_brief"](args.brief_file, sys.stdin)
     run_id = secrets_module.token_hex(16)   # this command's nonce: recorded on what `create` makes, so a later stop can say it is ours
-    options = ["--repo", repo, "--branch", branch, "--run-id", run_id]
-    for flag, value in (("--idle", args.idle), ("--hard", args.hard), ("--shape", args.shape)):
+    options = [CREATE_OPTION["repo"], repo, CREATE_OPTION["branch"], branch, CREATE_OPTION["run_id"], run_id]
+    for key, value in (("idle", args.idle), ("hard", args.hard), ("shape", args.shape)):
         if value:
-            options += [flag, str(value)]
+            options += [CREATE_OPTION[key], str(value)]
+    if getattr(args, "stack", False):   # only on request: a launch without --stack hands the launcher exactly what it always did
+        options.append(CREATE_OPTION["stack"])
     if os.environ.get("CW_PULL_SECRET"):
         options += ["--pull-secret", os.environ["CW_PULL_SECRET"]]
     recovery = VaultRecovery(cloud_dir(state) / VAULT_LOCK_NAME, lambda detail: _audit(engine, "cloud.vault_check", name, detail))
