@@ -5858,6 +5858,103 @@ class TestLaunch(Base):
         self.assertIn("no `pane:` line", sb.charter_pane_update(self.engine, gh, {"charter": 5, "repo": "acme/app"}, "w1:p8"))
         self.assertEqual(len(patches), 1)
 
+    # -- a retired or closed agent leaves pane-health.json (the record the workspace health pane draws from), on whole reads only
+
+    def retired_entry(self, session, **extra):
+        return dict({"at": int(self.world.clock.now()), "by": "x", "reason": "finished", "session": session, "auto": False}, **extra)
+
+    def test_s1_s7_s5_a_pass_prunes_retired_agents_and_keeps_a_live_a_relaunched_and_a_detached_one(self):
+        self.engine.state_dir = self.world.state
+        self.world.add_agent("coder", fleet={"role": "coder"})
+        self.detach("coder")
+        self.health()                                                   # platform (live) and coder (detached) are recorded
+        row = lambda ses, role: {"session": ses, "pane": "w1:p9", "role": role, "workspace": "w9"}
+        data = sb.read_pane_health(self.world.state)
+        for n in ("r1", "r2", "r3"):
+            data["agents"][n] = row("ses_" + n, "orchestrator")
+            data["states"][n] = {"state": "unknown", "session": "ses_" + n}
+        data["agents"]["relaunch"] = row("ses_new", "orchestrator")      # retired under an OLD session, running again under a new one
+        sb.write_pane_health(self.world.state, data)
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {**{n: self.retired_entry("ses_" + n) for n in ("r1", "r2", "r3")},
+                                                            "relaunch": self.retired_entry("ses_old")})
+        self.health(1)
+        agents = sb.read_pane_health(self.world.state)
+        self.assertEqual(sorted(agents["agents"]), ["coder", "platform", "relaunch"])
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {"platform": self.retired_entry(None), "coder": self.retired_entry(None)})   # a record with NO session covers nothing
+        self.health(2)
+        self.assertEqual(sorted(sb.read_pane_health(self.world.state)["agents"]), ["coder", "platform", "relaunch"])
+        self.assertFalse(sb.retired_agent({"x": {"session": None}}, "x", None))
+        self.assertNotIn("r1", agents["states"])
+        self.assertEqual(agents["states"]["coder"]["state"], sb.PANE_DETACHED)
+
+    def test_s5_a_pane_closed_after_the_final_report_is_pruned_with_its_auto_retire(self):
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.worker()
+        self.health()
+        self.assertIn("worker", sb.read_pane_health(self.world.state)["agents"])
+        sb.record_last_report(self.world.state, "worker", "done", self.world.clock.now())
+        self.kill("worker")
+        for n in range(sb.PANE_MISSING_PASSES):
+            self.health(n)
+        self.assertEqual(sb.read_retired(self.world.state)["worker"]["auto"], True)
+        self.assertNotIn("worker", sb.read_pane_health(self.world.state)["agents"])
+
+    def test_s3_s6_a_half_read_prunes_nothing(self):
+        self.engine.state_dir = self.world.state
+        self.health()
+        data = sb.read_pane_health(self.world.state)
+        data["agents"]["old"] = {"session": "ses_old", "pane": "w1:p9", "role": "orchestrator", "workspace": "w9"}
+        sb.write_pane_health(self.world.state, data)
+        sb._write_small(self.world.state, sb.RETIRED_FILE, {"old": self.retired_entry("ses_old")})
+        path = self.world.state / sb.PANE_HEALTH_FILE
+        before = path.read_bytes()
+        discovery = self.engine.discover(self.world.clock.now())
+        discovery.problems = ["list not whole"]                         # the agent list is a half-read
+        sb.pane_health_pass(self.engine, self.world.clock.now() + 1)
+        self.assertEqual(path.read_bytes(), before)
+        with mock.patch.object(sb, "read_retired_strict", side_effect=sb.RetiredUnreadable("half")):   # the retired list is a half-read, yet `read_retired` still names "old"
+            self.health(2)
+        self.assertIn("old", sb.read_pane_health(self.world.state)["agents"])
+        self.health(3)                                                   # a whole read prunes it
+        self.assertNotIn("old", sb.read_pane_health(self.world.state)["agents"])
+
+    def test_s8_a_pruned_retired_agent_is_still_found_by_the_retire_undo_reattach_and_the_boss_lookup(self):
+        for key in [k for k in os.environ if k.startswith(("HERDR_", "OPENCODE_")) and k != "HERDR_PANE_ID"]:
+            self.addCleanup(os.environ.__setitem__, key, os.environ[key])
+            del os.environ[key]                                           # a clean environment: nothing masks a record the prune dropped
+        self.addCleanup(os.environ.pop, "HERDR_WORKSPACE_ID", None)
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        self.worker()
+        self.health()
+        session = self.world.sessions["worker"]
+        self.as_("boss")
+        before = dict(sb.read_pane_health(self.world.state)["agents"]["worker"])
+        self.assertTrue(before.get("workspace"), "the pass records the workspace")
+        code, out, err = self.run_cli("retire", "worker", "--reason", "done")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("worker", sb.read_pane_health(self.world.state)["agents"])     # pruned in the same step as the retire
+        kept = sb.known_agent(self.world.state, "worker")
+        for field in set(before) - {"seen"}:                              # every field of the pane record but `seen` survives the prune (a null one is the same as none)
+            self.assertEqual(kept.get(field), before[field], field)
+        self.assertEqual(set(before) - {"seen", "session"}, set(sb.RETIRED_RECORD_FIELDS), "a field the pass records that the retirement does not keep")
+        self.assertEqual(sb.read_retired(self.world.state)["worker"]["session"], session)
+        self.assertEqual(sb.known_session(self.world.state, "worker", {}), session)
+        self.kill("worker")
+        self.health(1)
+        self.assertNotIn("worker", sb.read_pane_health(self.world.state)["agents"])
+        discovery = self.engine.discover(self.world.clock.now())
+        self.assertIsNone(sb.reattach_caller_problem(self.engine, self.world.route, self.world.clock.now, discovery, "worker", None))   # boss lookup, session from retired.json
+        code, out, err = self.run_cli("retire", "worker", "--reason", "again")           # retiring a pruned agent again still works
+        self.assertEqual(code, 0, err)
+        code, out, err = self.run_cli("reattach", "worker")                                # a retired agent is refused until undone, as before
+        self.assertNotEqual(code, 0)
+        code, out, err = self.run_cli("retire", "--undo", "worker")                       # the boss and session come from retired.json
+        self.assertEqual(code, 0, err)
+        code, out, err = self.run_cli("reattach", "worker")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["session"], session)
+        self.assertEqual(sb.read_pane_health(self.world.state)["agents"].get("worker", {}).get("workspace"), before["workspace"])   # --undo put the whole record back
+
     def test_reattach_by_a_dead_panes_remembered_record_and_it_refuses_when_the_session_is_gone(self):
         os.environ["HERDR_WORKSPACE_ID"] = "w1"
         self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})

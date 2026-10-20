@@ -6673,6 +6673,36 @@ def prune_retired(retired, now):
     return retired
 
 
+def retired_agent(retired, name, session):
+    """True when `name` is retired for THIS session (a retirement with no session covers any); a relaunch under the same name is not."""
+    entry = retired.get(name)
+    return isinstance(entry, dict) and entry.get("session") is not None and entry.get("session") == session   # no session on the record: it covers nothing
+
+
+RETIRED_RECORD_FIELDS = ("pane", "role", "charter", "repo", "workspace", "cwd")   # what the pane record holds besides the session (and `seen`, which nothing reads)
+
+
+def pane_record_of(row):
+    """What a retirement keeps of a pane record (`record` in retired.json), so the prune loses nothing a reader needs."""
+    return {k: row[k] for k in RETIRED_RECORD_FIELDS if isinstance(row, dict) and row.get(k) is not None}
+
+
+def known_agent(state_dir, name, known=None):
+    """The pane record of a fleet agent: the live one, else (a retired agent is pruned from the pane record) the one kept in retired.json with its session.
+    {} when neither exists. The one lookup every reader of a possibly pruned agent uses."""
+    if known:
+        return known
+    entry = read_retired(state_dir).get(name)
+    if not isinstance(entry, dict) or entry.get("headless") or not entry.get("session"):
+        return {}
+    return dict(entry["record"] if isinstance(entry.get("record"), dict) else {}, session=entry["session"])
+
+
+def known_session(state_dir, name, known):
+    """The session of a fleet agent: the pane record's, else the retired record's."""
+    return known_agent(state_dir, name, known).get("session") or (read_retired(state_dir).get(name) or {}).get("session")
+
+
 def read_retired(state_dir):
     return _read_small(state_dir, RETIRED_FILE)
 
@@ -6815,6 +6845,11 @@ def pane_health_pass(engine, now):
     data = read_pane_health(engine.state_dir)
     agents, states, missing = data["agents"], data["states"], data["missing"]
     retired = read_retired(engine.state_dir)
+    try:
+        read_retired_strict(engine.state_dir)
+        retired_whole = True
+    except RetiredUnreadable:
+        retired_whole = False   # a half-read retired list removes nothing (#805)
     names = list(discovery.agents)
     sessions = [o.session_id for o in discovery.agents.values()]
     budget = PANE_CHECKS_PER_PASS
@@ -6872,7 +6907,7 @@ def pane_health_pass(engine, now):
             if last.get("state") in ("done", "failed") and 0 <= now - (last.get("at") or 0) <= lookback:
                 # its boss closed the tab AFTER the worker's final `done`/`failed` report: finished on purpose, not dead
                 entry = {"at": int(now), "by": "the switchboard", "reason": "its pane closed after its final %s report" % last["state"],
-                         "session": agents[name].get("session"), "auto": True}
+                         "session": agents[name].get("session"), "auto": True, "record": pane_record_of(agents[name])}
                 try:
                     with agent_lock(engine.state_dir, "files", seconds=2):
                         current = prune_retired(read_retired(engine.state_dir), now)
@@ -6895,6 +6930,10 @@ def pane_health_pass(engine, now):
             if engine.audit is not None:
                 engine.audit.append(engine.actor, "fleetpane.dead", name, {"pane": agents[name].get("pane"), "session": agents[name].get("session")})
     engine.pane_alerts = {n: v for n, v in states.items() if v.get("state") in (PANE_DETACHED, PANE_DEAD) and n in agents and n not in retired}
+    if retired_whole:   # a retired agent (name AND session) leaves the record the pane draws from; its session stays in retired.json for reattach and --undo
+        for name in [n for n in agents if retired_agent(retired, n, agents[n].get("session"))]:
+            for table in (agents, states, missing):
+                table.pop(name, None)
     try:
         write_pane_health(engine.state_dir, {"agents": agents, "states": states, "missing": missing, "at": int(now)})
     except OSError as err:
@@ -7141,9 +7180,10 @@ def reattach_caller_problem(engine, runner, now, discovery, name, session=None, 
         return None
     if target is None:   # a dead agent is not discovered: its boss is in the session's STORED metadata
         try:
-            known = read_pane_health(engine.state_dir)["agents"].get(name) or {}
-            stored = _fleet_meta(engine.v2.session_get(session or known.get("session"))) or {} if (session or known.get("session")) else {}
-            stored = load_module("reassign").overlay(engine.state_dir, stored, session or known.get("session")) if stored else stored   # a reassigned worker's new boss, not the one it was launched with
+            known = known_agent(engine.state_dir, name, read_pane_health(engine.state_dir)["agents"].get(name))
+            known_sid = session or known.get("session")
+            stored = _fleet_meta(engine.v2.session_get(known_sid)) or {} if known_sid else {}
+            stored = load_module("reassign").overlay(engine.state_dir, stored, known_sid) if stored else stored   # a reassigned worker's new boss, not the one it was launched with
             boss = resolve_boss(discovery, stored.get("reports_to")) if stored.get("reports_to") else None
         except Exception:
             boss = None
@@ -7155,7 +7195,7 @@ def reattach_caller_problem(engine, runner, now, discovery, name, session=None, 
 
 
 def _reattach_locked(args, runner, now, engine, state, name, discovery):
-    known = read_pane_health(state)["agents"].get(name) or {}
+    known = known_agent(state, name, read_pane_health(state)["agents"].get(name))
     seen = discovery.agents.get(name)
     session_id = args.session or (seen.session_id if seen else None) or known.get("session")
     if not session_id:
@@ -7414,7 +7454,7 @@ def cmd_retire(args, runner, now):
         raise LaunchError("refused: %s" % who)
     reason = " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", args.reason or "").split())[:200]
     seen = discovery.agents.get(name)
-    known = read_pane_health(state)["agents"].get(name) or {}
+    known = known_agent(state, name, read_pane_health(state)["agents"].get(name))   # a pruned retired agent is still known
     close_pane, close_by, close_note, headless_kept = None, None, None, None
     if getattr(args, "close", False) and not args.undo and seen is not None and seen.headless:
         close_note = "headless: it has no terminal, so there is nothing to close"
@@ -7446,6 +7486,8 @@ def cmd_retire(args, runner, now):
             data = read_pane_health(state)
             data["states"].pop(name, None)
             data["missing"].pop(name, None)
+            if entry.get("session") and not entry.get("headless") and name not in data["agents"]:
+                data["agents"][name] = dict(entry["record"] if isinstance(entry.get("record"), dict) else {}, session=entry["session"])   # the retire pruned its row: put back all of it
             try:
                 write_pane_health(state, data)
             except OSError:
@@ -7463,6 +7505,8 @@ def cmd_retire(args, runner, now):
         prune_retired(retired, now())
         retired[name] = {"at": int(now()), "by": identify_who(engine, runner, now), "reason": reason or "finished",
                          "session": (seen.session_id if seen else None) or known.get("session"), "auto": False}
+        if known:
+            retired[name]["record"] = pane_record_of(known)   # the pane record is pruned below: keep what reattach and --undo read
         if headless_lost:
             retired[name]["session"] = headless_kept["session"]
         if headless_kept is not None:
@@ -7473,6 +7517,8 @@ def cmd_retire(args, runner, now):
             raise LaunchError("%s could not be written (%s): %s was not retired, try again" % (RETIRED_FILE, err.strerror or err, name)) from None
     data = read_pane_health(state)
     data["states"].pop(name, None)
+    data["agents"].pop(name, None)   # pruned in the same step as the retire: the session is in retired.json
+    data["missing"].pop(name, None)
     try:
         write_pane_health(state, data)
     except OSError:
