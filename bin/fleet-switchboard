@@ -564,6 +564,71 @@ def unknown_config_lines():
     return lines
 
 
+def validate_opencode_key(config, source):
+    opencode = config["opencode"]
+    if opencode is not None and (not isinstance(opencode, str) or not os.path.isabs(opencode)):
+        raise ConfigError("%s: 'opencode' must be the absolute path of the OpenCode v2 binary, got %r"
+                          % (source, opencode))
+
+
+def validate_herdr_key(config, source):
+    if not isinstance(config["herdr"], str) or not config["herdr"].strip():
+        raise ConfigError("%s: 'herdr' must be a non-empty string (a path or a command name), got %r"
+                          % (source, config["herdr"]))
+
+
+def validate_env_key(config, key, source):
+    """`opencode_env` / `launch_env`: an object of NAME: value strings. Returns a copy."""
+    env = config[key]
+    if not isinstance(env, dict):
+        raise ConfigError("%s: %r must be an object of NAME: value strings, got %r"
+                          % (source, key, type(env).__name__))
+    for name, value in env.items():
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
+            raise ConfigError("%s: %r has an invalid variable name: %r" % (source, key, name))
+        if not isinstance(value, str):
+            raise ConfigError("%s: %r value for %s must be a string" % (source, key, name))
+    return dict(env)
+
+
+def validate_v2_transport_key(config, source):
+    if config["v2_transport"] not in ("auto", "cli"):
+        raise ConfigError("%s: 'v2_transport' must be \"auto\" or \"cli\", got %r" % (source, config["v2_transport"]))
+
+
+def validate_positive_key(config, key, source):
+    if not _is_number(config[key]) or config[key] <= 0:
+        raise ConfigError("%s: %r must be a positive number, got %r" % (source, key, config[key]))
+
+
+def validate_gh_key(config, source):
+    if not isinstance(config["gh"], str) or not config["gh"].strip():
+        raise ConfigError("%s: 'gh' must be a non-empty string (a path or a command name), got %r"
+                          % (source, config["gh"]))
+
+
+def validate_impact_hold_key(config, source):
+    if config.get("impact_hold") is not None:
+        try:
+            impact_floor.validate_hold_config(config["impact_hold"])
+        except ValueError as err:
+            raise ConfigError("%s: %s" % (source, err)) from None
+
+
+def apply_declared_key(config, raw, key, name, source):
+    """A key a module declares (`CONFIG_KEY`): its default when the file has none, then the module's own validator."""
+    module = _declared_module(name, key)
+    default = getattr(module, "CONFIG_DEFAULT", None)
+    if key not in raw and default is not None:
+        config[key] = copy.deepcopy(default)
+    try:
+        module.validate(config.get(key), source)
+    except ValueError as err:
+        raise ConfigError(str(err)) from None
+    except Exception as err:   # a validator that fails any other way is a broken module, not a bad value: still the whole configuration, naming the file
+        raise ConfigError("config module %s.py: its validator failed (%s: %s): no configuration is loaded" % (name, type(err).__name__, _one_line(str(err), 160))) from None
+
+
 def validate_config(raw, source="config"):
     """Defaults overlaid with `raw`, fully checked. Raises ConfigError."""
     if not isinstance(raw, dict):
@@ -576,13 +641,8 @@ def validate_config(raw, source="config"):
     config = dict(DEFAULTS)
     config["opencode_env"], config["launch_env"] = {}, {}
     config.update(raw)
-    opencode = config["opencode"]
-    if opencode is not None and (not isinstance(opencode, str) or not os.path.isabs(opencode)):
-        raise ConfigError("%s: 'opencode' must be the absolute path of the OpenCode v2 binary, got %r"
-                          % (source, opencode))
-    if not isinstance(config["herdr"], str) or not config["herdr"].strip():
-        raise ConfigError("%s: 'herdr' must be a non-empty string (a path or a command name), got %r"
-                          % (source, config["herdr"]))
+    validate_opencode_key(config, source)
+    validate_herdr_key(config, source)
     if config["send_to_working"] not in ("steer", "queue"):
         raise ConfigError("%s: 'send_to_working' must be \"steer\" or \"queue\", got %r"
                           % (source, config["send_to_working"]))
@@ -593,16 +653,7 @@ def validate_config(raw, source="config"):
         raise ConfigError("%s: 'opencode_executable' must be an absolute path, got %r" % (source, executable))
     envs = {}
     for key in ("opencode_env", "launch_env"):
-        env = config[key]
-        if not isinstance(env, dict):
-            raise ConfigError("%s: %r must be an object of NAME: value strings, got %r"
-                              % (source, key, type(env).__name__))
-        for name, value in env.items():
-            if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
-                raise ConfigError("%s: %r has an invalid variable name: %r" % (source, key, name))
-            if not isinstance(value, str):
-                raise ConfigError("%s: %r value for %s must be a string" % (source, key, name))
-        envs[key] = dict(env)
+        envs[key] = validate_env_key(config, key, source)
     validate_disk_guard(config["disk_guard"], source)
     try:
         load_reds().settings(config["reds"])
@@ -617,16 +668,7 @@ def validate_config(raw, source="config"):
     except ValueError as err:
         raise ConfigError(str(err))
     for key, name in sorted(declared.items(), key=lambda item: item[1]):   # the modules that declare their own key: its default, then its validator
-        module = _declared_module(name, key)
-        default = getattr(module, "CONFIG_DEFAULT", None)
-        if key not in raw and default is not None:
-            config[key] = copy.deepcopy(default)
-        try:
-            module.validate(config.get(key), source)
-        except ValueError as err:
-            raise ConfigError(str(err)) from None
-        except Exception as err:   # a validator that fails any other way is a broken module, not a bad value: still the whole configuration, naming the file
-            raise ConfigError("config module %s.py: its validator failed (%s: %s): no configuration is loaded" % (name, type(err).__name__, _one_line(str(err), 160))) from None
+        apply_declared_key(config, raw, key, name, source)
     if not isinstance(config["docker_reaper"], bool):
         raise ConfigError("%s: 'docker_reaper' must be true or false, got %r" % (source, config["docker_reaper"]))
     if config["v2_events"] not in ("auto", "off"):
@@ -635,8 +677,7 @@ def validate_config(raw, source="config"):
         raise ConfigError("%s: 'v2_plugin_events' must be \"auto\" or \"off\", got %r" % (source, config["v2_plugin_events"]))
     if not isinstance(config["v2_light"], bool):
         raise ConfigError("%s: 'v2_light' must be true or false, got %r" % (source, config["v2_light"]))
-    if config["v2_transport"] not in ("auto", "cli"):
-        raise ConfigError("%s: 'v2_transport' must be \"auto\" or \"cli\", got %r" % (source, config["v2_transport"]))
+    validate_v2_transport_key(config, source)
     for key in ("v2_cache_seconds", "v2_reads_per_pass", "v2_reads_per_minute"):
         if not isinstance(config[key], int) or isinstance(config[key], bool) or config[key] < 0:
             raise ConfigError("%r must be a whole number of at least 0, got %r" % (key, config[key]))
@@ -644,8 +685,7 @@ def validate_config(raw, source="config"):
         raise ConfigError("%r must be a number above 0, got %r" % ("clear_remind_minutes", config["clear_remind_minutes"]))
     for key in ("batch_seconds", "engaged_minutes", "call_timeout_seconds", "send_timeout_seconds", "poll_seconds",
                 "worker_lookback_hours", "stalled_working_hours", "review_window_minutes", "rider_max_age_seconds"):
-        if not _is_number(config[key]) or config[key] <= 0:
-            raise ConfigError("%s: %r must be a positive number, got %r" % (source, key, config[key]))
+        validate_positive_key(config, key, source)
     if not retire_idle_window_ok(config["retire_idle_minutes"]):
         raise ConfigError("%s: 'retire_idle_minutes' must be a finite number from %d to %d, got %r" % (source, RETIRE_IDLE_MIN, RETIRE_IDLE_MAX, config["retire_idle_minutes"]))
     validate_intent_config(config, source)
@@ -664,11 +704,7 @@ def validate_config(raw, source="config"):
     validate_worktree_config(config, source)
     validate_orphan_config(config, source)
     validate_order_burst(config, source)
-    if config.get("impact_hold") is not None:   # #179 L4: the hold is off unless `enabled` is true
-        try:
-            impact_floor.validate_hold_config(config["impact_hold"])
-        except ValueError as err:
-            raise ConfigError("%s: %s" % (source, err)) from None
+    validate_impact_hold_key(config, source)   # #179 L4: the hold is off unless `enabled` is true
     validate_sweep_config(config, source)  # #117
     validate_triage_config(config, source)  # #130
     validate_plan_evaluators(config, source)  # #107: who may record a plan scenario's verdict
@@ -10047,14 +10083,11 @@ def repo_of_tag(tag, repos):
     return decision_core.repo_of_tag(tag, repos)
 
 
-def validate_decisions_config(config, source):
+def validate_awaiting_labels(config, source):
     label = config["awaiting_label"]
     if label is not None and (not isinstance(label, str) or not label.strip() or "\n" in label or "," in label):
         raise ConfigError("%s: 'awaiting_label' must be a label name without a comma or a newline, or null (the "
                           "default, `<OS user>:awaiting-user`), got %r" % (source, label))
-    hours = config["decisions_lookback_hours"]
-    if not _is_number(hours) or hours <= 0:
-        raise ConfigError("%s: 'decisions_lookback_hours' must be a positive number, got %r" % (source, hours))
     cos_label = config["awaiting_cos_label"]
     if cos_label is not None and (not isinstance(cos_label, str) or not cos_label.strip() or "\n" in cos_label
                                   or "," in cos_label):
@@ -10062,6 +10095,13 @@ def validate_decisions_config(config, source):
                           "default, `<OS user>:awaiting-cos`), got %r" % (source, cos_label))
     if cos_label is not None and cos_label == label:
         raise ConfigError("%s: 'awaiting_cos_label' and 'awaiting_label' must differ, both are %r" % (source, label))
+
+
+def validate_decisions_config(config, source):
+    hours = config["decisions_lookback_hours"]
+    if not _is_number(hours) or hours <= 0:
+        raise ConfigError("%s: 'decisions_lookback_hours' must be a positive number, got %r" % (source, hours))
+    validate_awaiting_labels(config, source)
     grace = config["decisions_cos_grace_seconds"]
     if not _is_number(grace) or grace < 0:
         raise ConfigError("%s: 'decisions_cos_grace_seconds' must be a number of seconds, 0 or more, got %r"
@@ -15634,9 +15674,7 @@ def _validate_github(config, source):
             isinstance(e, str) and GITHUB_EVENT_RE.match(e) for e in events):
         raise ConfigError("%s: 'github_events' must be a non-empty list of event names such as "
                           "\"issue_comment\", got %r" % (source, events))
-    if not isinstance(config["gh"], str) or not config["gh"].strip():
-        raise ConfigError("%s: 'gh' must be a non-empty string (a path or a command name), got %r"
-                          % (source, config["gh"]))
+    validate_gh_key(config, source)
     if not _is_number(config["github_lookback_hours"]) or config["github_lookback_hours"] <= 0:
         raise ConfigError("%s: 'github_lookback_hours' must be a positive number, got %r"
                           % (source, config["github_lookback_hours"]))
@@ -17967,6 +18005,102 @@ def build_engine(runner, now, actor, writable=True, socket_call=None):
     return engine, state, config
 
 
+# ---- the private entry of `impact clear` and `review record` (#996, slice A: built, tested and NOT wired: nothing in the clear or the record calls it yet)
+
+ENTRY_CONFIG_KEYS = {   # each configuration key the entry reads, and why: a read of any other key fails a test
+    "gh": "the gh binary every GitHub read and write runs",
+    "call_timeout_seconds": "the timeout of every gh call and of the clients' calls",
+    "excluded_repos": "a repository the fleet never reads (the account gate refuses it)",
+    "intent_repo": "the repository the plan and intent issues are read from (the intent reader)",
+    "awaiting_label": "the label that marks a decision for the owner (the clear removes it)",
+    "awaiting_cos_label": "the label that marks a decision for the Chief of Staff (the clear removes it)",
+    "impact_floor": "the floor's own configuration (its module declares and validates it)",
+    "impact_hold": "whether the hold is enforced and its settings",
+    "delegated_clear": "the owner's standing orders for the Chief of Staff's clear",
+    "opencode": "the OpenCode v2 binary, for the caller's identity (the owner-only check)",
+    "opencode_env": "the environment the v2 client runs with",
+    "v2_transport": "how the v2 client talks to OpenCode",
+    "herdr": "the herdr binary, for the caller's identity",
+}
+
+
+def entry_config(path=None):
+    """The configuration of the private entry: ONLY the keys of `ENTRY_CONFIG_KEYS`, each with its default and its own validation (the validators `validate_config` also calls, one for each key, so a bad value
+    refuses with the same words), and none of the rest of the file (#996). A missing file means every default applies; an unreadable or invalid one is a ConfigError, as in `load_config`."""
+    path = Path(path) if path else config_path()
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        text = "{}"
+    except OSError as err:
+        raise ConfigError("cannot read %s: %s" % (path, err.strerror or err))
+    try:
+        raw = json.loads(text)
+    except ValueError as err:
+        raise ConfigError("%s is not valid JSON: %s" % (path, err))
+    if not isinstance(raw, dict):
+        raise ConfigError("%s must be a JSON object" % path)
+    source = str(path)
+    config = {key: copy.deepcopy(DEFAULTS[key]) for key in ENTRY_CONFIG_KEYS if key in DEFAULTS}
+    config["opencode_env"] = {}
+    for key in ENTRY_CONFIG_KEYS:
+        if key in raw:
+            config[key] = raw[key]
+    validate_opencode_key(config, source)
+    validate_herdr_key(config, source)
+    config["opencode_env"] = validate_env_key(config, "opencode_env", source)
+    validate_v2_transport_key(config, source)
+    validate_positive_key(config, "call_timeout_seconds", source)
+    validate_gh_key(config, source)
+    validate_intent_repo_key(config, source)
+    validate_awaiting_labels(config, source)
+    for key in ("excluded_repos", "impact_floor"):   # a key its module declares: the module's default, then its validator
+        apply_declared_key(config, raw, key, CONFIG_MUST_DECLARE[key], source)
+    validate_impact_hold_key(config, source)
+    return config
+
+
+class ClearContext:
+    """What `impact clear` and `review record` read from the daemon's engine, and nothing else (#996): the state directory, the audit log, the caller's actor, the clock, the gh runner and its account gate and the
+    intent reader, over the entry's own configuration. It is not the engine: it holds none of its clients, fact sources or delivery rule."""
+
+    def __init__(self, config, state_dir, audit, actor, now, gh_runner, accounts, intents):
+        self.config, self.state_dir, self.audit, self.actor, self.now = config, state_dir, audit, actor, now
+        self.gh_runner, self.accounts, self.intents = gh_runner, accounts, intents
+        self._last = {}
+
+    def _external(self, event, subject, detail):
+        if self.audit is None:
+            raise RuntimeError("read-only switchboard asked to write: %s %s" % (event, subject))
+        return self.audit.external(self.actor, event, subject, detail)
+
+    def _note(self, event, subject, detail):
+        """Audit a non-write event once per change, not once per pass."""
+        if self.audit is None or self._last.get((event, subject)) == detail:
+            return
+        self._last[(event, subject)] = detail
+        self.audit.append(self.actor, event, subject, detail)
+
+
+def clear_context(runner, now, actor="cli", writable=True):
+    """(context, state directory, configuration) for the two commands: what `build_engine` returns for them, built from `entry_config` only (never the engine, never the whole configuration)."""
+    config = entry_config()
+    active_faults()
+    state = ensure_state_dir()
+    audit = AuditLog(state / "audit.jsonl") if writable else None
+    accounts = GhAccounts(config, runner, now)
+    accounts.audit, accounts.actor = audit, actor   # the rate-limit pause is audited, once per episode
+    intents = intent_reader_for(config, runner, now)
+    if intents is not None:
+        intents.accounts = accounts   # ONE gate for every read of one account
+    return ClearContext(config, state, audit, actor, now, runner, accounts, intents), state, config
+
+
+def identity_clients(config, runner):
+    """(herdr client, v2 client) for the caller's identity, from the entry's own keys."""
+    return HerdrClient(config["herdr"], runner), V2Client(config["opencode"], config["opencode_env"], runner, config["call_timeout_seconds"], transport=config["v2_transport"])
+
+
 def enable_conditional_reads(engine):
     """The daemon's GitHub reads ask with `-i` and keep ETags (see `GhAccounts.read`). Nothing else turns it on."""
     accounts = getattr(engine, "accounts", None)
@@ -19131,10 +19265,14 @@ INTENT_LINE_LIMIT = 240  # characters per header line
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
-def validate_intent_config(config, source):
+def validate_intent_repo_key(config, source):
     repo = config["intent_repo"]
     if repo is not None and not (isinstance(repo, str) and REPO_RE.match(repo)):
         raise ConfigError("%s: 'intent_repo' must be OWNER/REPO or null, got %r" % (source, repo))
+
+
+def validate_intent_config(config, source):
+    validate_intent_repo_key(config, source)
     if not isinstance(config["intent_required"], bool):
         raise ConfigError("%s: 'intent_required' must be true or false, got %r" % (source, config["intent_required"]))
 
@@ -22621,7 +22759,7 @@ def owner_terminal_problem(stdin=None, stdout=None, ps=None, start_pid=None, dep
     return "the process chain is deeper than %d: it cannot be established" % depth
 
 
-def gates_caller_kind(runner, now):
+def caller_kind(clients):
     """THE ONE human-terminal check: every command that must be run by the owner in person asks this function, and no other code
     decides who is a person. Today: `verdict --as owner`, `gates mode`, `gates off|on`, `move` (its operator path) and `waive` (its chief-of-staff caller is an agent
     session; its person path asks this function like the rest). Returns (kind, who[, role]).
@@ -22630,8 +22768,8 @@ def gates_caller_kind(runner, now):
     it as a person; or the registry cannot be read). All agents share one GitHub login, so the login cannot be the test: it is the
     session identity. A mistake-guard, not a boundary: an agent that unsets its own session and pane variables looks like a person."""
     try:
-        engine, _, _ = build_engine(runner, now, "cli", writable=False)
-        fleet = caller_fleet(engine.herdr, engine.v2, os.environ)
+        herdr, v2 = clients()
+        fleet = caller_fleet(herdr, v2, os.environ)
     except IdentityUncertain:
         return "unknown", "unknown (an uncertain identity is refused, never read as a person: #138)"
     except CallerError:
@@ -22642,6 +22780,19 @@ def gates_caller_kind(runner, now):
     except (V2Error, HerdrError):
         return "unknown", "unknown (the registry could not be read)"
     return "agent", fleet.get("name") or "an agent", fleet.get("role")
+
+
+def gates_caller_kind(runner, now):
+    """The check above, over the engine's own clients (every owner-only command)."""
+    def clients():
+        engine, _, _ = build_engine(runner, now, "cli", writable=False)
+        return engine.herdr, engine.v2
+    return caller_kind(clients)
+
+
+def entry_caller_kind(runner, now):
+    """The same check, over the private entry's own clients (#996, slice A: not called yet): one body, two constructors, so the answer is the same by construction."""
+    return caller_kind(lambda: identity_clients(entry_config(), runner))
 
 
 def gates_caller_may_switch(runner, now):

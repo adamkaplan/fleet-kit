@@ -34249,6 +34249,133 @@ class TestImpactHold(LedgerBase):
         self.assertIn("nothing touches credentials", detail["reason"])
         self.assertNotEqual(detail["by"], "owner")
 
+    # ---- #996 slice A: the private entry's configuration reader and context (built and tested, NOT wired)
+
+    CONFIG_SAMPLES = {"no file at all": None, "an empty object": {}, "every key of the table set": {"gh": "/usr/bin/gh", "call_timeout_seconds": 7, "intent_repo": "acme/intents", "awaiting_label": "me:wait", "awaiting_cos_label": "me:cos",
+                                                                                                        "herdr": "/opt/herdr", "opencode": "/opt/opencode", "opencode_env": {"A_B": "c"}, "v2_transport": "cli", "impact_hold": {"enabled": True}, "delegated_clear": {"orders": []}},
+                      "keys the entry does not read": {"poll_seconds": 5, "triage": {"enabled": False}}}
+    CONFIG_INVALID = {"gh": "", "call_timeout_seconds": 0, "intent_repo": "not a repo", "awaiting_label": "a,b", "awaiting_cos_label": "x\ny", "herdr": "", "opencode": "relative/path", "opencode_env": {"bad name": "x"}, "v2_transport": "pigeon"}
+
+    def entry_config_file(self, content):
+        import tempfile
+        directory = Path(tempfile.mkdtemp(prefix="entry-config-"))
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = directory / "config.json"
+        if content is not None:
+            path.write_text(json.dumps(content))
+        return path
+
+    def test_the_entry_config_reads_only_its_keys_and_each_equals_what_the_whole_loader_gives_and_a_mutant_that_loads_the_whole_config_is_caught(self):
+        reads = []
+        class Recorder(dict):
+            def __contains__(self, key):
+                reads.append(key)
+                return dict.__contains__(self, key)
+            def __getitem__(self, key):
+                reads.append(key)
+                return dict.__getitem__(self, key)
+            def get(self, key, default=None):
+                reads.append(key)
+                return dict.get(self, key, default)
+        real_loads = json.loads
+        for label, content in self.CONFIG_SAMPLES.items():
+            with self.subTest(label):
+                path = self.entry_config_file(content)
+                del reads[:]
+                with mock.patch.object(json, "loads", lambda text, **k: Recorder(real_loads(text, **k))):
+                    config = sb.entry_config(path)
+                self.assertTrue(set(reads) <= set(sb.ENTRY_CONFIG_KEYS), "the entry read keys outside its table: %s" % sorted(set(reads) - set(sb.ENTRY_CONFIG_KEYS)))
+                whole = sb.load_config(path)
+                for key in sb.ENTRY_CONFIG_KEYS:
+                    self.assertEqual(config.get(key), whole.get(key), "%s: the entry's value equals the whole loader's" % key)
+                self.assertEqual(sorted(set(config) - set(sb.ENTRY_CONFIG_KEYS)), [], "nothing but the table's keys")
+        with self.subTest("the mutant: an entry that loads the whole configuration hands over far more than the table"):
+            path = self.entry_config_file({})
+            with mock.patch.object(sb, "entry_config", sb.load_config):
+                config = sb.entry_config(path)
+            self.assertGreater(len(set(config) - set(sb.ENTRY_CONFIG_KEYS)), 20, "a build that loads the whole configuration carries the daemon's other settings: the table's test sees it")
+
+    def test_a_bad_value_of_each_key_the_entry_reads_refuses_with_the_whole_loaders_own_words(self):
+        for key, bad in self.CONFIG_INVALID.items():
+            with self.subTest(key):
+                path = self.entry_config_file({key: bad})
+                with self.assertRaises(sb.ConfigError) as whole:
+                    sb.load_config(path)
+                with self.assertRaises(sb.ConfigError) as entry:
+                    sb.entry_config(path)
+                self.assertEqual(str(entry.exception), str(whole.exception))
+        for label, text in (("not JSON", "{not json"), ("not an object", "[1]")):
+            with self.subTest(label):
+                path = self.entry_config_file(None)
+                path.write_text(text)
+                with self.assertRaises(sb.ConfigError):
+                    sb.entry_config(path)
+
+    def test_the_context_has_what_the_clear_reads_and_builds_neither_the_engine_nor_the_whole_configuration(self):
+        import tempfile
+        state_home = Path(tempfile.mkdtemp(prefix="entry-state-"))
+        self.addCleanup(shutil.rmtree, state_home, True)
+        seen = set()
+        def hook(frame, event, arg):
+            if event == "call" and os.path.basename(frame.f_code.co_filename) == "fleet-switchboard" and (frame.f_code.co_name in ("build_engine", "load_config", "load_runnable_config", "validate_config") or getattr(frame.f_code, "co_qualname", "") == "Switchboard.__init__"):
+                seen.add("%s:%s" % (os.path.basename(frame.f_code.co_filename), frame.f_code.co_name))
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(state_home), "XDG_CONFIG_HOME": str(state_home)}):
+            sys.setprofile(hook)
+            try:
+                context, state, config = sb.clear_context(self.route, self.world.clock.now, "cli", writable=True)
+            finally:
+                sys.setprofile(None)
+        self.assertEqual(sorted(seen), [], "the context is built without the engine and without the whole configuration")
+        for member in ("accounts", "actor", "audit", "config", "gh_runner", "intents", "now", "state_dir", "_external", "_note"):
+            self.assertTrue(hasattr(context, member), member)
+        self.assertEqual((context.actor, context.state_dir, context.config), ("cli", state, config))
+        self.assertIsNotNone(context.audit)
+        read_only, _, _ = None, None, None
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(state_home), "XDG_CONFIG_HOME": str(state_home)}):
+            read_only, _, _ = sb.clear_context(self.route, self.world.clock.now, "cli", writable=False)
+        self.assertIsNone(read_only.audit)
+        with self.assertRaises(RuntimeError):
+            read_only._external("e", "s", {})
+        context._note("e", "s", {"a": 1})
+        context._note("e", "s", {"a": 1})   # once per change
+        lines = [l for l in (state / "audit.jsonl").read_text().splitlines() if '"e"' in l]
+        self.assertEqual(len(lines), 1)
+
+    def test_slice_a_is_not_wired_nothing_in_the_clear_or_the_record_calls_the_entry_and_both_run_as_on_main(self):
+        import ast
+        names = ("entry_config", "clear_context", "entry_caller_kind", "identity_clients")
+        callers = {name: set() for name in names}
+        for path in sorted(BIN.glob("*.py")) + [BIN / "fleet-switchboard"]:
+            for fn in [n for n in ast.walk(ast.parse(path.read_text())) if isinstance(n, ast.FunctionDef)]:
+                for x in ast.walk(fn):
+                    if isinstance(x, ast.Call) and getattr(x.func, "id", getattr(x.func, "attr", None)) in names:
+                        callers[getattr(x.func, "id", getattr(x.func, "attr", None))].add(fn.name)
+        self.assertEqual({k: sorted(v) for k, v in callers.items()}, {"entry_config": ["clear_context", "entry_caller_kind"], "clear_context": [], "entry_caller_kind": [], "identity_clients": ["entry_caller_kind"]},
+                         "the entry is called only by its own functions in slice A: nothing in the clear, the record or any command calls clear_context or entry_caller_kind")
+        calls = []
+        for name in names:
+            original = getattr(sb, name)
+            patcher = mock.patch.object(sb, name, (lambda *a, __o=original, __n=name, **k: (calls.append(__n), __o(*a, **k))[1]))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.delegate(); self.floor_pr(path="migrations/0002.sql"); self.files_of_pr("migrations/0002.sql"); self.passes()
+        code, out, err = self.under()
+        self.assertEqual(code, 0, err)
+        self.record_pr_setup()
+        code, err, entry = self.record_run(self.EXPLICIT)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(calls, [], "the real clear and the real record never called the entry")
+
+    def test_the_owner_only_check_has_one_body_for_both_constructors(self):
+        import ast
+        tree = ast.parse((BIN / "fleet-switchboard").read_text())
+        defs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+        calls = lambda name: {getattr(x.func, "id", None) for x in ast.walk(defs[name]) if isinstance(x, ast.Call)}
+        self.assertIn("caller_kind", calls("gates_caller_kind"))
+        self.assertIn("caller_kind", calls("entry_caller_kind"))
+        self.assertIn("caller_fleet", calls("caller_kind"))
+        self.assertNotIn("caller_fleet", calls("gates_caller_kind") | calls("entry_caller_kind"), "the identity rule is in the one body")
+
     # ---- #940 slice 1: ONE closure, derived from the clear's real call graph, read by the refusal and the owner hold
 
     def closure_sets(self):
