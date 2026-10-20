@@ -85,6 +85,25 @@ def _small(state_dir, name):
     return raw if isinstance(raw, dict) else {}
 
 
+def _old_retired(state_dir):
+    """(retired map, problem) from the old `retired.json`: a MISSING file is empty; one that is unreadable, not JSON, not a map of objects or too large is a
+    problem (the fold must never read corruption as 'nobody is retired': that would let a retired agent come back)."""
+    try:
+        with open(str(Path(state_dir) / RETIRED_DERIVED), "rb") as handle:
+            raw = handle.read(1000001)
+    except FileNotFoundError:
+        return {}, None
+    except OSError as err:
+        return {}, "%s cannot be read (%s)" % (RETIRED_DERIVED, getattr(err, "strerror", None) or type(err).__name__)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeError):
+        return {}, "%s is not valid JSON" % RETIRED_DERIVED
+    if not isinstance(data, dict) or len(raw) > 1000000 or not all(isinstance(v, dict) for v in data.values()):
+        return {}, "%s is not a map of retired agents" % RETIRED_DERIVED
+    return data, None
+
+
 def pane_record(row):
     """What a retirement keeps of an agent row."""
     return {k: row[k] for k in RECORD_FIELDS if isinstance(row, dict) and row.get(k) is not None}
@@ -106,7 +125,9 @@ def fold_old(state_dir, now=None):
     of `state/cloud/*.json`. Nothing is lost: the seven fields, every retirement incl. `record` and `headless`. Pure: reads, writes nothing."""
     now = int(time.time() if now is None else now)
     health = _small(state_dir, PANE_HEALTH)
-    retired = {k: v for k, v in _small(state_dir, RETIRED_DERIVED).items() if isinstance(v, dict)}
+    retired, problem = _old_retired(state_dir)
+    if problem:
+        return _empty(False, "%s: nothing read" % problem)
     states = health.get("states") if isinstance(health.get("states"), dict) else {}
     agents = {}
     for name, row in (health.get("agents") if isinstance(health.get("agents"), dict) else {}).items():
@@ -213,6 +234,8 @@ def _migrate(state_dir):
             if found is not None:
                 return found
             doc = fold_old(state_dir)
+            if not doc["whole"]:
+                return doc
             _write_atomic(Path(state_dir) / FILE, _text(doc))
             _derive(state_dir, doc)
             return doc
@@ -263,7 +286,7 @@ def _mutate(state_dir, change):
             if changed:
                 _write_atomic(Path(state_dir) / FILE, _text(doc))
                 _derive(state_dir, doc)
-                _audit(state_dir, events)
+            _audit(state_dir, events)   # a change that wrote nothing may still carry an event (a REFUSED removal is audited with its reason)
             return {"changed": changed, "problem": problem}
     except TimeoutError as err:
         return {"changed": False, "problem": str(err)}
@@ -340,9 +363,12 @@ def reconcile_remove(state_dir, name, evidence, whole):
             return False, [], None
         if row.get("state") != "dead" or not isinstance(evidence, dict) or evidence.get("pane_listed") is not False \
                 or evidence.get("process_found") is not False:
-            return False, [], "%s is not shown dead by the evidence: nothing removed" % name
+            why = "%s is not shown dead by the evidence: nothing removed" % name
+            return False, [{"event": "reconcile_refused", "name": name, "evidence": evidence if isinstance(evidence, dict) else None, "why": why}], why
         doc["agents"].pop(name)
         return True, [{"event": "reconcile_remove", "name": name, "evidence": evidence, "session": row.get("session")}], None
     if whole is not True:
-        return {"changed": False, "problem": "the read was not whole: nothing removed"}
+        why = "the read was not whole: nothing removed"
+        _audit(state_dir, [{"event": "reconcile_refused", "name": name, "evidence": evidence if isinstance(evidence, dict) else None, "why": why}])
+        return {"changed": False, "problem": why}
     return _mutate(state_dir, change)
