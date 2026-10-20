@@ -61,7 +61,7 @@ Each setting's name, whether the file requires it, and its kind (name, path, com
 | `CW_CLUSTER_ADMIN_CMD` | no | command | a command that prints the cluster administrator kubeconfig (instead of the vault read) |
 | `CW_GIT_TOKEN_CMD` | no | command | a command that prints the one-hour git token; default is the GitHub App mint beside the launcher (`app_token.py`) |
 | `CW_APP_ID_CMD`, `CW_APP_INSTALLATION_CMD`, `CW_APP_KEY_CMD` | no | command | commands that print the GitHub App's id, installation id and key instead of the vault read (`app_token.py`) |
-| `CW_VAULT_CHECK_DIR` | no | path | reserved for the vault access check's checkout path: accepted and checked, not used yet |
+| `CW_VAULT_CHECK_DIR` | no (needed once the vault refuses this machine) | path | the checkout of the vault access check, an absolute path (see section 2b) |
 
 The template (neutral placeholders; copy, edit, keep only what you need, and set the file to `0600`):
 
@@ -99,7 +99,7 @@ CW_CLOUD_NAMESPACE=cw
 # CW_APP_ID_CMD=/home/user/bin/print-app-id
 # CW_APP_INSTALLATION_CMD=/home/user/bin/print-app-installation
 # CW_APP_KEY_CMD=/home/user/bin/print-app-key
-# reserved: the vault access check's checkout path
+# optional, but needed when the vault refuses this machine: the vault access check's checkout
 # CW_VAULT_CHECK_DIR=/home/user/vault-check
 ```
 
@@ -128,6 +128,36 @@ The child sees only:
 
 `CW_GITHUB_API_BASE`, `CW_PREFLIGHT_TOKEN_CMD`, `CW_GIT_TOKEN_CMD`, proxy variables, `GH_`/`GITHUB_` token variables, `HOME` and `PATH` set in your shell are ignored by `launch --cloud` and `run-task`: nothing in the environment can point the check at another host, and your `HOME`, `PATH` and `PYTHON*` cannot run code inside it. The token route's own settings (`CW_APP_*_CMD`, `CW_OPENSSL`, `AZURE_CONFIG_DIR`) are trusted operator configuration: they are run or read as given.
 
+## 2b. The vault access check
+
+The vault only answers machines on its firewall's list. When a vault read is **refused for that reason** (and only then), `launch --cloud`
+runs the vault access check once and reads the vault once more. Any other vault error (no permission, a missing secret, not signed in,
+unreachable) is not retried and runs nothing. The check belongs to its owner and is run unchanged: it adds at most one single-address rule,
+only this machine's own address, and never removes or widens a rule. `launch` gives it no address and no option.
+
+Set `CW_VAULT_CHECK_DIR` to the checkout the owner of the vault access check provides. Because `python3 -m` loads anything under the checkout,
+**every entry** of it is judged without following links: each directory and file (every `__init__.py` too) must be owned by you, not
+group- or world-writable and not a symlink (the top-level `.git` directory is not walked). The module must be a regular file, and
+**every parent** of the checkout up to `/` must be a real directory owned by root or you and not group- or world-writable (a sticky one is fine). The lock file's parents get the same check.
+A missing key or a bad path refuses the launch (exit status 2), names `CW_VAULT_CHECK_DIR` and runs nothing; an unset key
+does not matter while the vault already answers. The check runs from that checkout as you, with a cleaned environment (a fixed `PATH`, no `PYTHON*` and none of your variables, your `az` sign-in found as for the preflight) and
+a limit of 300 seconds. Its `HOME` is your real home taken from the password database, never from the `HOME` variable, so the check's own log line goes under your home as its owner expects (ask its owner for the exact file); `TMPDIR` is a private directory removed afterwards.
+
+Two launches never run it at once: one lock file (mode 0600, in the cloud state directory) is held around the check; a second launch waits,
+then reads the vault again first, and runs the check only if the vault still refuses.
+
+What `launch` does with the check's exit code (every run writes one audit line, `cloud.vault_check`, with the outcome and the code, never an address):
+
+| Exit | Meaning | Launch |
+|---|---|---|
+| 0 | the vault answered; nothing was changed | reads again and continues |
+| 10 | an address was added and the vault now answers | continues, and **prints the check's count line once** (`rules A -> B, date`): forward it to whoever records it; `launch` cannot message a lane |
+| 20 | refused by the check's own rules (its cap of 6 rules is reached, or an address it will not add) | stops, exit 2: ask the owner of the vault access check; it will not add more, and only it prunes |
+| 30 | added, but the vault still refused after 90 seconds | stops, exit 2: ask the owner of the vault access check |
+| 40 or any other code, or no code (timed out) | the check failed | stops, exit 2: ask the owner of the vault access check |
+
+Nothing is created when it stops. The check's own output is never printed.
+
 ## 3. Run one worker
 
 ```text
@@ -153,7 +183,7 @@ fleet-switchboard launch coder7 --cloud --stack --agent coder --repo acme-org/wi
 - The pod runs on the Sysbox runtime class (`sysbox-runc`) in its own user namespace, as a non-root user. No capability is added, it is never privileged, and it has no host path, Docker socket or service-account token.
 - `--shape` is `S` (2 CPU, 4 GiB) or `M` (4 CPU, 8 GiB). Leave it out for the launcher's own default, `S` (4 GiB): the measured stack lane peaked at 0.8 to 1.35 GiB. The memory limit stays; the pod is never unlimited.
 - The first pod on a fresh node may wait for the node's runtime to be ready (a short delay, a few minutes at most); the launcher notices that case and creates the pod again, up to 3 attempts. You do not retry it.
-- `--stack` needs `--cloud`, and an unknown `--shape` is refused with `--stack`. Both refuse (exit 2) before any setting is read, any token is minted or any cluster call is made, and the order of section 2 is unchanged.
+- `--stack` needs `--cloud`, and an unknown `--shape` is refused with `--stack`. `--stack` without `--cloud` is refused first of all; an unknown shape is refused right after the allow-list check (step 1 of section 2). Both exit 2 before any token is minted or any cluster call is made, and the order of section 2 is unchanged. `--shape` without `--stack` is passed to the launcher as before.
 
 ## 4. What a worker can and cannot do
 
