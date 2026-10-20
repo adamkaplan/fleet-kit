@@ -58506,8 +58506,12 @@ class TestHeavySlots(Base):
     def test_s9_a_wrapper_killed_with_sigkill_leaves_a_run_that_the_orphan_bound_stops_and_audits(self):
         """The 2 h 13 min case for real: the watchdog lives in the wrapper, the wrapper is killed, the run keeps the slot; the orphan bound (clock moved past the ceiling)
         stops the sleeping run and reports it with source orphan. A run whose wrapper is alive is not touched by the same check."""
-        if shutil.which("lsof") is None:
+        found = shutil.which("lsof", path=os.environ["PATH"] + os.pathsep + "/usr/sbin" + os.pathsep + "/usr/bin")
+        if found is None:
             self.skipTest("lsof is needed to find what holds the slot")
+        patch = mock.patch.dict(os.environ, {"PATH": os.environ["PATH"] + os.pathsep + os.path.dirname(found)})   # a runner's PATH may lack /usr/sbin
+        patch.start()
+        self.addCleanup(patch.stop)
         wrapper = self.start("sleep", "300", name="orphan-lane")
         self.assertTrue(self.until(lambda: any(h["pid"] and h["pid"] != wrapper.pid and h["name"] != "?" for h in self.hs.holders(self.state(), 3)), 120), self.why({"w": wrapper}))
         held = self.hs.holders(self.state(), 3)[0]
