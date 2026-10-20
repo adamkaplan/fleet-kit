@@ -66328,6 +66328,25 @@ class TestReconcileOnRead(unittest.TestCase):
         broken = lambda name, agent: 1 / 0
         self.assertEqual(self.mod.reconcile_on_read(self.dir, reg.read(self.dir), broken, reg), [])
 
+    def test_s3_a_half_known_live_check_removes_nothing(self):
+        reg = self.registry()
+        for live in ({"pane": False, "process": None}, {"pane": True, "process": False}, {"pane": None, "process": False}):
+            self.assertEqual(self.mod.reconcile_on_read(self.dir, reg.read(self.dir), lambda n, a, live=live: live, reg), [], live)
+        self.assertIn("ghost", reg.read(self.dir)["agents"])
+
+    def test_s3_reconcile_agents_on_read_removes_through_the_real_registry_with_herdr_gone_and_keeps_it_when_herdr_is_down(self):
+        class Herdr:
+            def __init__(self, reason):
+                self.reason = reason
+
+            def pane_get(self, pane):
+                raise sb.HerdrError(self.reason, "pane not found" if self.reason == "exit" else "cannot reach herdr: No such file or directory")
+        reg = self.registry()
+        self.assertEqual(sb.reconcile_agents_on_read(self.dir, Herdr("unavailable")), [])
+        self.assertIn("ghost", reg.read(self.dir)["agents"])
+        self.assertEqual(sb.reconcile_agents_on_read(self.dir, Herdr("exit")), ["ghost"])
+        self.assertEqual(sorted(reg.read(self.dir)["agents"]), ["alpha", "bare"])
+
     def test_s3_herdr_live_check_says_gone_only_when_herdr_says_no_such_pane(self):
         class Herdr:
             def __init__(self, error=None, procs=()):
@@ -66335,13 +66354,16 @@ class TestReconcileOnRead(unittest.TestCase):
 
             def pane_get(self, pane):
                 if self.error:
-                    raise sb.HerdrError("x", self.error)
+                    raise sb.HerdrError(*(self.error if isinstance(self.error, tuple) else ("exit", self.error)))
                 return {}
 
             def pane_process_info(self, pane):
                 return list(self.procs)
         agent = {"pane": "p_1"}
-        self.assertEqual(sb.herdr_live_check(Herdr("pane not found"))("a", agent), {"pane": False, "process": False})
+        self.assertEqual(sb.herdr_live_check(Herdr(("exit", "pane not found")))("a", agent), {"pane": False, "process": False})
+        # herdr down or missing: its OS text says "No such file or directory", which is NOT a gone pane
+        for reason in ("unavailable", "timeout", "bad_json", "bad_shape"):
+            self.assertEqual(sb.herdr_live_check(Herdr((reason, "cannot reach herdr: No such file or directory")))("a", agent), {"pane": None, "process": None})
         self.assertEqual(sb.herdr_live_check(Herdr("socket closed"))("a", agent), {"pane": None, "process": None})
         self.assertEqual(sb.herdr_live_check(Herdr(procs=[{"cmdline": "x"}]))("a", agent), {"pane": True, "process": True})
         self.assertEqual(sb.herdr_live_check(Herdr())("a", agent), {"pane": True, "process": False})
@@ -66362,13 +66384,6 @@ class TestReconcileOnRead(unittest.TestCase):
                 if "reconcile_remove(" in path.read_text(errors="replace") and path.name not in allowed:
                     hits.append(str(path.relative_to(BIN.parent)))
         self.assertEqual(hits, [])
-
-    def test_s7_a_day_of_daemon_passes_with_no_view_reading_removes_nothing(self):
-        reg = self.registry()
-        for _ in range(24 * 12):   # a pass is a read of nothing: only a view's reconcile_on_read can call the registry
-            reg.read(self.dir)
-        self.assertEqual([l for l in self.audit_lines() if l.get("event") == "reconcile_remove"], [])
-        self.assertEqual(sorted(reg.read(self.dir)["agents"]), sorted(self.AGENTS))
 
     def views(self):
         """The text of the four Python views drawn over a state directory that holds a dead agent, a live one and one with no state row."""
@@ -66393,20 +66408,11 @@ class TestReconcileOnRead(unittest.TestCase):
         for view, text in self.views().items():
             with self.subTest(view=view):
                 self.assertNotIn("?", text.replace("`", "").replace("%s " % sb.PROG, "") if view == "decisions" else text)
-        self.assertEqual(self.mod.state_word(None, 6), "      ")
-        self.assertEqual(self.mod.state_word("garbage", 3), "   ")
 
     def test_s10_no_python_view_draws_the_word_dead(self):
         for view, text in self.views().items():
             with self.subTest(view=view):
                 self.assertNotIn("dead", text.lower())
-
-    def test_s10_a_dead_agent_is_not_drawn_and_its_neighbours_are(self):
-        reg = self.registry()
-        self.assertEqual(sorted(self.mod.drawn_agents(reg.read(self.dir))), ["alpha", "bare"])
-        self.assertEqual(self.mod.drawn_agents(self.registry(whole=False).read(self.dir)), {})
-        self.assertIsNone(self.mod.drawable_state("dead"))
-        self.assertIsNone(self.mod.drawable_state("?"))
 
 
 class TestModuleLoader(Base):

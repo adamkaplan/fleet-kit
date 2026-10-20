@@ -7122,8 +7122,10 @@ def herdr_live_check(herdr):
         try:
             herdr.pane_get(pane)
         except HerdrError as err:
-            text = str(err).lower()
-            gone = "not found" in text or "no such" in text or "unknown pane" in text
+            # Gone only when herdr ANSWERED with an error naming the pane (reason "exit"). A herdr that is down, slow or garbled (unavailable, timeout,
+            # bad_json, bad_shape) is no evidence: its OS text ("No such file or directory") must not read as a gone pane.
+            text = str(getattr(err, "detail", "") or "").lower()
+            gone = getattr(err, "reason", None) == "exit" and ("not found" in text or "no such" in text or "unknown pane" in text)
             return {"pane": False, "process": False} if gone else {"pane": None, "process": None}
         try:
             return {"pane": True, "process": bool(herdr.pane_process_info(pane))}

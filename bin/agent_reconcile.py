@@ -6,7 +6,8 @@ Three rules, all from docs/agent-registry.md:
    `registry.reconcile_remove`. The registry checks the evidence itself and audits the removal. Nothing else removes an agent this way, and no
    scheduled sweep does (a test derives the callers of `reconcile_remove` from the code).
 2. Only a WHOLE read acts (the #805 rule): a partial or failed read removes nothing.
-3. A view never prints "?" for an agent's state and never renders the state "dead": it draws a live state or nothing.
+3. A view never prints "?" for an agent's state and never renders the state "dead": it draws a live state or nothing (status and the sidebar
+   do; tests pin all five views).
 
 The registry module is passed in (default: the sibling `registry.py`), so a test can hand in a small fake of the same API.
 """
@@ -17,18 +18,6 @@ import time
 
 DEAD = "dead"
 # What a view may draw. `dead` is removed, not drawn; anything not listed (an unknown word, a missing state) is drawn as nothing.
-DRAWABLE_STATES = ("working", "blocked", "idle", "detached")
-
-
-def drawable_state(state):
-    """The state word a view may print for an agent, or None (draw no state word at all). Never "dead", never "?"."""
-    return state if state in DRAWABLE_STATES else None
-
-
-def state_word(state, width=0):
-    """The text a view puts in a state column: the word, or blanks of the same width. Never "?"."""
-    word = drawable_state(state) or ""
-    return word.ljust(width)
 
 
 def _load_registry():
@@ -78,14 +67,6 @@ def reconcile_on_read(state_dir, read, live_check, registry=None):
         if isinstance(result, dict) and result.get("changed"):
             removed.append(name)
     return removed
-
-
-def drawn_agents(read):
-    """The agents of a registry read that a view may draw, as {name: agent}: every one except a `dead` one (it is removed, not drawn). An agent with
-    no state is drawn with no state word. A read that is not whole draws none."""
-    if not isinstance(read, dict) or read.get("whole") is not True:
-        return {}
-    return {n: a for n, a in (read.get("agents") or {}).items() if isinstance(a, dict) and a.get("state") != DEAD}
 
 
 if __name__ == "__main__":
