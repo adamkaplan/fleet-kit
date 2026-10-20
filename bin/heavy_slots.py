@@ -131,6 +131,22 @@ def _is_focused(program, rest, short):
     return program == "unittest" and bool(chosen) and chosen[0] != "discover"   # a dotted name is a focused run; bare or `discover` is the whole suite
 
 
+def program_of(command):
+    """The program a command runs once its wrappers are skipped (`timeout 900 bin/test-switchboard` is `test-switchboard`): what a refusal names."""
+    return _split(command)[0]
+
+
+def worktree_of(cwd, run=subprocess.run):
+    """The git top-level of `cwd`, by real path (a subdirectory or a symlink reads as the same worktree), or None when it cannot be told (then nothing is refused)."""
+    try:
+        done = run(["git", "rev-parse", "--show-toplevel"], cwd=cwd, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0 or not done.stdout.strip():
+        return None
+    return os.path.realpath(done.stdout.strip())
+
+
 def _is_full(program, rest, short):
     return (program.startswith("test-") or program in ("pytest", "unittest") or [program] + rest[:1] in (["make", "test"], ["npm", "test"], ["go", "test"]))
 
@@ -316,6 +332,10 @@ def _alive(pid, start):
     return not start or _process_start(pid) in ("", start)
 
 
+class Refused(HeavyError):
+    """The run is refused (exit 64): a full-suite job of this worktree is already queued or running."""
+
+
 class QueueUnusable(Exception):
     """The order file cannot be read, written or locked: the caller falls back to taking whatever slot is free."""
 
@@ -325,7 +345,8 @@ class Line:
     An entry is {"pid", "start", "name", "short"}, in arrival order; an entry whose process is gone is dropped at the next look, so a dead waiter never blocks the
     ones behind it. The waiter at the head of the line is the only one that tries an ordinary slot: a slot that frees goes to the one that has waited longest."""
 
-    def __init__(self, state_dir, name, short=False, pid=None, alive=_alive, start_of=_process_start, lock_tries=50, lock_pause=0.02, slots=DEFAULT_SLOTS, held=None, note=None):
+    def __init__(self, state_dir, name, short=False, pid=None, alive=_alive, start_of=_process_start, lock_tries=50, lock_pause=0.02, slots=DEFAULT_SLOTS, held=None, note=None, meta=None):
+        self.meta = dict(meta or {})   # what a refusal reads of an entry (kind, worktree, program, since); never what decides the order
         self.dir, self.name, self.short = str(state_dir), name, bool(short)
         if not os.path.isdir(self.dir):
             raise OSError(errno.ENOENT, "no state directory")   # the caller takes whatever slot is free, as before
@@ -426,8 +447,9 @@ class Line:
     def _mine(self, entry):
         return entry["pid"] == self.pid and entry["start"] == self.start
 
-    def _update(self, join):
-        """Under the lock: drop the entries of processes that are gone, add this caller at the end when `join` and not there yet, write back if changed; the entries."""
+    def _update(self, join, refuse=None):
+        """Under the lock: drop the entries of processes that are gone, add this caller at the end when `join` and not there yet, write back if changed; the entries.
+        `refuse(entries)` is asked under the lock, before this caller joins: a text to refuse with (Refused, nothing written) or None."""
         try:
             lock = self._locked()
         except OSError as err:
@@ -437,7 +459,10 @@ class Line:
             holding = self.held()
             kept = [entry for entry in entries if self._mine(entry) or (entry["pid"] not in holding and self._still_there(entry))]
             if join and not any(self._mine(entry) for entry in kept):
-                kept.append({"pid": self.pid, "start": self.start, "name": _plain(self.name, 40), "short": self.short})
+                reason = refuse([entry for entry in kept if not self._mine(entry)]) if refuse is not None else None
+                if reason:
+                    raise Refused(reason)
+                kept.append(dict(self.meta, pid=self.pid, start=self.start, name=_plain(self.name, 40), short=self.short))
             if kept != entries:
                 self._write(kept)
             return kept
@@ -464,9 +489,9 @@ class Line:
         self.verified.pop(key, None)
         return False
 
-    def place(self):
-        """This caller's place in the line (1 is the head), joining at the end the first time. Raises QueueUnusable."""
-        entries = self._update(True)
+    def place(self, refuse=None):
+        """This caller's place in the line (1 is the head), joining at the end the first time. Raises QueueUnusable, and Refused when `refuse` says so."""
+        entries = self._update(True, refuse)
         self.joined = True
         return next(index for index, entry in enumerate(entries, 1) if self._mine(entry))
 
@@ -526,6 +551,60 @@ def held_by(state_dir, slots=DEFAULT_SLOTS):
         finally:
             os.close(fd)
     return pids
+
+
+def _held_records(state_dir, slots=DEFAULT_SLOTS):
+    """The record of each slot held NOW (the express slot included), as the holder wrote it. Nothing is created."""
+    found = []
+    for index in list(range(slots)) + [EXPRESS]:
+        try:
+            fd = os.open(slot_path(state_dir, index), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError:
+            continue
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                continue   # free
+            except OSError as err:
+                if err.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                    continue
+            info = _read_info(fd)
+            if any(_pid_alive(info.get(key)) for key in ("pid", "wrapper")):   # a record the last holder left behind, under a lock a new holder has just taken, names nobody who is running
+                found.append(info)
+        finally:
+            os.close(fd)
+    return found
+
+
+def _pid_alive(pid):
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid < 2:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _since_text(since):
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(since)) if isinstance(since, (int, float)) and not isinstance(since, bool) else "unknown time"
+
+
+def refusal(state_dir, worktree, entries, slots=DEFAULT_SLOTS):
+    """The sentence that refuses a full-suite job in `worktree`, naming the first one already running (a held slot) or else queued (`entries`, in arrival order);
+    None when there is none. Only live ones are read: a held slot is a lock that is held, an entry is dropped when its process is gone."""
+    def one(info):
+        return (info.get("kind") == "full" and info.get("worktree") == worktree)
+    first = next((info for info in _held_records(state_dir, slots) if one(info)), None) or next((entry for entry in entries if one(entry)), None)
+    if first is None:
+        return None
+    pid = first.get("pid")
+    return ("heavy: refused: a full-suite job is already queued or running in this worktree (%s, %s, pid %s, since %s)"
+            % (_plain(first.get("name", "?"), 40), _plain(first.get("program") or first.get("command") or "?", 80), pid if isinstance(pid, int) and not isinstance(pid, bool) else "unknown",
+               _since_text(first.get("since"))))
 
 
 def _describe(held):
@@ -952,10 +1031,12 @@ def _stop_orphan(state_dir, index, info, out, clock, watchdog, start_of, decided
 
 
 def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name=None, environ=None, out=None, clock=time.time, sleep=time.sleep,
-        which=shutil.which, watchdog=None, short=False, line=None, ceiling=None, ceiling_config=None, on_stop=None):
+        which=shutil.which, watchdog=None, short=False, line=None, ceiling=None, ceiling_config=None, on_stop=None, worktree=None):
     """Wait for a slot, run `command` in it, return its exit status. 75 when no slot came within `wait_max` seconds, 127 when the command does not exist.
     A watchdog stops a runaway: 137 past the memory ceiling, 124 past the time ceiling of the run's KIND (see `classify`, `resolve_ceiling`: `ceiling` is the run's own
     request, else FLEET_HEAVY_MAX_SECONDS; `ceiling_config` the config's `heavy` value; `on_stop(phase, info, holder, lane)` is called with "decided" before a time stop and "told" after it (also for an orphan this wrapper finds while it waits)); `watchdog` is a dict of Watchdog keyword arguments and `line` one of Line's (tests).
+    A full-suite job (the kind `classify` says, and no other reading) is refused with 64 while another is queued or running in the same worktree (`worktree`: the git top-level
+    of the working directory by real path, or a function that gives it, tests); a focused run, another worktree or a worktree that cannot be told is never refused.
     Callers wait in arrival order (`Line`); `short` declares the command short: it may use the express slot when the ordinary ones are busy and is stopped after
     EXPRESS_SECONDS by the watchdog."""
     environ = os.environ if environ is None else environ
@@ -974,6 +1055,8 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
     except ValueError:
         every = WAIT_REPORT_SECONDS
     next_report = started + every
+    kind = classify(command, short)
+    where = (worktree or worktree_of)(os.getcwd()) if kind == "full" and unslotted is None else None
     got = {"signal": None}
     child = {"p": None}
 
@@ -992,14 +1075,18 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
     try:
         if unslotted is None:
             try:
-                queue = Line(state_dir, name, short, **dict({"slots": slots, "note": out.write}, **(line or {})))
+                queue = Line(state_dir, name, short, **dict({"slots": slots, "note": out.write, "meta": {"kind": kind, "worktree": where, "program": program_of(command), "since": int(started)}}, **(line or {})))
             except OSError:
                 queue = None
         while unslotted is None:
             place = None
             if queue is not None:
                 try:
-                    place = queue.place()
+                    place = queue.place((lambda entries: refusal(state_dir, where, entries, slots))) if where else queue.place()
+                except Refused as err:   # a first full-suite job of this worktree is queued or running: this one is not run
+                    out.write("%s\n" % err)
+                    out.flush()
+                    return EXIT_USAGE
                 except QueueUnusable as err:   # the order cannot be kept: the present behaviour (whoever polls first), said once
                     if not queue_noted:
                         queue_noted = True
@@ -1040,13 +1127,12 @@ def run(command, state_dir, slots=DEFAULT_SLOTS, wait_max=DEFAULT_WAIT_MAX, name
         if queue is not None and not (queue.leave() or queue.leave()):   # it has its slot (or none will come): out of the line at once; one more try before it says so
             out.write("heavy: could not leave the waiting order: the others pass this caller's ticket once its slot shows as held\n")
         env = dict(environ)
-        kind = classify(command, short)
         mem_mb = ceilings(environ)[0]
         max_seconds = resolve_ceiling(kind, environ, ceiling, ceiling_config)
         if fd is not None and short and index == EXPRESS:   # the express slot's own time ceiling (an environment value may only make it shorter)
             max_seconds = min(max_seconds, EXPRESS_SECONDS)
         lane = holder_name(environ)
-        extra = {"kind": kind, "ceiling": max_seconds, "lane": lane, "wstart": _own_start() if fd is not None else ""}
+        extra = {"kind": kind, "ceiling": max_seconds, "lane": lane, "wstart": _own_start() if fd is not None else "", "worktree": where, "program": program_of(command)}
         if fd is not None:
             _record(fd, name, os.getpid(), command[0], clock(), extra)   # at once, so a killed holder's old record is never shown for this one
             os.set_inheritable(fd, True)   # the command keeps the lock: the slot is busy while it runs, whatever happens to this wrapper

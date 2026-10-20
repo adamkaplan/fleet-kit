@@ -25055,6 +25055,70 @@ PREFLIGHT_CLASSES = (
     ("public-names", 60, (("python3", "bin/check-public-names"),), None),
     ("cloud", 600, (("bin/test-cloud-worker",), ("bin/test-cloud-launcher",), ("cloud/tests/test-cloud",)), "cloud/"),
 )
+# The preflight sub-checks CI runs for the pull request itself (#942): (command, the name it is shown by). Each row is skipped, with a line that says so, when the
+# workflow at the base runs that command on `pull_request`; every other sub-check of PREFLIGHT_CLASSES always runs. Not being able to tell is a run.
+PREFLIGHT_CI_SKIPS = (("bin/test-cloud-launcher", "cloud launcher"),)
+PREFLIGHT_WORKFLOW = ".github/workflows/test.yml"
+PREFLIGHT_STEP_IF = ("${{ !cancelled() }}", "${{ always() }}", "${{ success() }}", "${{ success() || failure() }}", "always()", "success()")   # a step condition that still runs it
+
+
+def workflow_job_running(text, command):
+    """The name of a job of the workflow `text` that runs `command` on `pull_request`, or None when it cannot be told: a text-only reading (no YAML library), the
+    safe side being None. The job needs no job-level `if`; the step that runs the command needs no `continue-on-error` and no condition but one of PREFLIGHT_STEP_IF."""
+    lines = text.splitlines()
+    try:
+        top = next(i for i, line in enumerate(lines) if re.match(r"on\s*:", line))
+        jobs = next(i for i, line in enumerate(lines) if line.rstrip() == "jobs:")
+    except StopIteration:
+        return None
+    head = lines[top]
+    block = [head] + [line for line in lines[top + 1:jobs] if line.startswith((" ", "\t")) or not line.strip()]
+    if not any(re.match(r"\s*(on\s*:\s*)?(\[.*\bpull_request\b.*\]|pull_request\s*:?)\s*(#.*)?$", line) or re.match(r"on\s*:.*\bpull_request\b", line) for line in block if not line.lstrip().startswith("#")):
+        return None
+    name, found = None, []
+    for line in lines[jobs + 1:]:
+        if line and not line.startswith(" ") and not line.startswith("#"):
+            break
+        job = re.fullmatch(r"  ([A-Za-z0-9_-]+):\s*", line)
+        if job:
+            name = job.group(1)
+            found.append((name, []))
+        elif found:
+            found[-1][1].append(line)
+    for name, body in found:
+        if any(re.match(r"    if\s*:", line) for line in body):
+            continue
+        steps, current = [], None
+        for line in body:
+            if re.match(r"      - ", line):
+                current = [line]
+                steps.append(current)
+            elif current is not None:
+                current.append(line)
+        for step in steps:
+            live = [line for line in step if not line.lstrip().startswith("#") and not re.match(r"\s*(- )?name\s*:", line)]
+            if not any(re.search(r"(^|[\s|&;(:])%s(\s|$)" % re.escape(command), line) for line in live):
+                continue
+            conditions = [re.sub(r"^\s*(- )?if\s*:\s*", "", line).strip() for line in step if re.match(r"\s*(- )?if\s*:", line)]
+            if any(re.match(r"\s*continue-on-error\s*:\s*(?!false)", line) for line in step) or any(c not in PREFLIGHT_STEP_IF for c in conditions):
+                continue
+            return name
+    return None
+
+
+def preflight_ci_runs(runner, root, command, changed):
+    """The job name when CI runs `command` for this pull request (the workflow file runs it on `pull_request`, and this branch does not change the workflow, so the file
+    in the work tree is the one at the base), else None. It reads a file and makes no git call."""
+    if changed is None or PREFLIGHT_WORKFLOW in changed:
+        return None
+    try:
+        with open(os.path.join(root, PREFLIGHT_WORKFLOW), encoding="utf-8") as handle:
+            text = handle.read(262144)
+    except (OSError, UnicodeDecodeError):
+        return None
+    return workflow_job_running(text, command)
+
+
 PREFLIGHT_CEILING_MAX = 3600   # the absolute maximum of any class's ceiling, in seconds: a hung class still ends
 
 
@@ -25104,6 +25168,12 @@ def cmd_preflight_pr(args, runner, now):
             ceiling = preflight_ceiling(base_ceiling, load1, cores)
             if under is not None and changed is not None and not any(path.startswith(under) for path in changed):
                 continue
+            commands = list(commands)
+            for skipped, shown in PREFLIGHT_CI_SKIPS:
+                job = preflight_ci_runs(runner, root, skipped, changed) if (skipped,) in commands else None
+                if job:
+                    commands.remove((skipped,))
+                    print("preflight-pr: %s: skipped, CI runs it for this pull request (job %s)" % (shown, job))
             env = dict(os.environ, FLEET_HEAVY_MAX_SECONDS=str(ceiling))   # the ceiling runs INSIDE the slot (heavy's watchdog starts when the slot is granted): a wait in the queue is never a timeout
             sys.stderr.write("preflight-pr: %s: waiting for a slot, then running (ceiling %ds once running)\n" % (name, ceiling))
             if under is not None:

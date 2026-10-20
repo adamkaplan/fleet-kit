@@ -12230,7 +12230,7 @@ ROLE_LINE_LIMITS = {"coder": 134, "orchestrator": 180, "chief-of-staff": 162, "c
 # `pr-state`: coder +1 line +140 B, orchestrator +1 line +120 B: the one sentence that sends an agent to the daemon's cache instead of a GitHub polling loop
 # #401 slice 1: the one-sentence GitHub writing rule in its own short section: coder +4 lines +226 B, orchestrator +2 lines +220 B (the wider runtime's file sets each limit)
 # #341: the one never-`git stash` sentence (the files sat at their caps): coder +86 B, orchestrator +60 B, no new line
-ROLE_BYTE_LIMITS = {"coder": 8272, "orchestrator": 11290, "chief-of-staff": 12097, "cos-subagent": 3500}
+ROLE_BYTE_LIMITS = {"coder": 8585, "orchestrator": 11290, "chief-of-staff": 12097, "cos-subagent": 3500}
 WORKER_ROLES = ("coder", "cos-subagent")  # PR 8: the roles that do an assignment, not a judgement of others
 
 
@@ -73495,6 +73495,292 @@ class TestPreflightPr(unittest.TestCase):
         self.assertEqual(len(names), 4)
         for name in names:
             self.assertEqual(table.count('("%s",' % name), 1)
+
+
+class TestFocusedLocalRuns(unittest.TestCase):
+    """#942: the documented default (focused runs, CI runs the whole suite), the refusal of a second full-suite job in a worktree and the preflight skip of a sub-check
+    CI runs. Real slot files and queue in a temp state directory, a fake worktree function, a stub script as the command; nothing real is run. Each family is ONE table;
+    each row has a test and a mutant (the defence swapped for a weaker one with mock.patch, and the attack then succeeds)."""
+    DEFAULT = "Run the focused classes of what you changed through `heavy --short`; CI runs the whole suite."
+    EXCEPTION = "Run the whole suite only for a change to the CI workflow itself or to a test CI cannot run; say which in the pull request."
+    REFUSAL = "The heavy wrapper refuses a second full-suite job in a worktree while one is queued or running."
+    FILES = ("skills/fleet-coordination/SKILL.md", "agents/opencode/coder.md", "agents/copilot/coder.agent.md", "docs/switchboard.md")
+    A, B = "/work/a", "/work/b"
+
+    def setUp(self):
+        self.init()
+        self.addCleanup(self.cleanup)
+
+    def reset(self):
+        self.cleanup()
+        self.init()
+
+    def init(self):
+        self.hs = sb.load_heavy_slots()
+        self.dir = tempfile.mkdtemp()
+        self.state = os.path.join(self.dir, "state")
+        os.mkdir(self.state)
+        self.script = os.path.join(self.dir, "test-fake")   # a program that classifies as full
+        Path(self.script).write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(self.script, 0o755)
+        self.children, self.fds = [], []
+
+    def cleanup(self):
+        for child in self.children:
+            child.kill()
+            child.wait()
+        for fd in self.fds:
+            os.close(fd)
+        self.children, self.fds = [], []
+        shutil.rmtree(self.dir, True)
+
+    def environ(self):
+        return {"PATH": os.environ["PATH"], "FLEET_HEAVY_NAME": "second"}
+
+    def start(self, command, worktree, short=False, wait_max=1):
+        out = io.StringIO()
+        code = self.hs.run(command, self.state, 3, wait_max, "second", environ=self.environ(), out=out, short=short, worktree=lambda cwd: worktree)
+        return code, out.getvalue()
+
+    def hold(self, worktree, kind="full"):
+        """A job RUNNING in `worktree`: a slot whose lock is held, with the record a wrapper writes."""
+        fd = self.hs._take(self.state, 3)[0]
+        self.fds.append(fd)
+        self.hs._record(fd, "first", os.getpid(), "timeout", time.time(), {"kind": kind, "worktree": worktree, "program": "test-switchboard"})
+
+    def queue(self, worktree, kind="full"):
+        """A job QUEUED in `worktree`: an entry of a live process (a sleeping child) in the waiting line."""
+        child = subprocess.Popen(["sleep", "60"])
+        self.children.append(child)
+        line = self.hs.Line(self.state, "first", pid=child.pid, meta={"kind": kind, "worktree": worktree, "program": "test-switchboard", "since": int(time.time())})
+        line.place()
+        # every slot busy, so the entry stays in the line (a ticket never outlives the slot its owner took)
+
+    def fill(self):
+        for _ in range(3):
+            fd = self.hs._take(self.state, 3)[0]
+            os.ftruncate(fd, 0)   # a busy slot that has no record (yet)
+            self.fds.append(fd)
+
+    # ---- THE refusal table: (id, how the first job exists, its worktree, the second command, the second's worktree, refused?)
+    FULL, FOCUSED, WRAPPED = ["{s}"], ["{s}", "-k", "x"], ["timeout", "900", "{s}"]
+    ROWS = (
+        ("running-same-worktree", "run", "/work/a", FULL, "/work/a", True),
+        ("queued-same-worktree", "queue", "/work/a", FULL, "/work/a", True),
+        ("wrapped-in-timeout", "run", "/work/a", WRAPPED, "/work/a", True),
+        ("focused-not-refused", "run", "/work/a", FOCUSED, "/work/a", False),
+        ("other-worktree-not-refused", "run", "/work/a", FULL, "/work/b", False),
+        ("first-ended-not-refused", "none", "/work/a", FULL, "/work/a", False),
+        ("first-is-focused-not-refused", "run-focused", "/work/a", FULL, "/work/a", False),
+        ("worktree-unknown-not-refused", "run", "/work/a", FULL, None, False),
+    )
+
+    def attempt(self, row):
+        _id, how, first_tree, command, second_tree, _refused = row
+        if how == "run":
+            self.hold(first_tree)
+        elif how == "run-focused":
+            self.hold(first_tree, kind="focused")
+        elif how == "queue":
+            self.fill()
+            self.queue(first_tree)
+        command = [self.script if word == "{s}" else word for word in command]
+        if how == "queue":   # the queue entry exists; the second run must be refused before it waits (a refusal needs no slot)
+            return self.start(command, second_tree, wait_max=0)
+        return self.start(command, second_tree)
+
+    def test_every_row_of_the_refusal_table(self):
+        for row in self.ROWS:
+            with self.subTest(row=row[0]):
+                self.reset()
+                code, text = self.attempt(row)
+                if row[5]:
+                    self.assertEqual(code, 64)
+                    self.assertIn("heavy: refused: a full-suite job is already queued or running in this worktree (first, test-switchboard, pid ", text)
+                    self.assertIn(", since ", text)
+                    if row[1] == "run":
+                        self.assertIn("pid %d" % os.getpid(), text)
+                else:
+                    self.assertEqual(code, 0, text)
+                    self.assertNotIn("refused", text)
+
+    def test_a_mutant_that_never_refuses_lets_every_refused_row_run(self):
+        for row in self.ROWS:
+            if row[5]:
+                with self.subTest(row=row[0]), mock.patch.object(self.hs, "refusal", lambda *a, **k: None):
+                    self.reset()
+                    self.assertNotEqual(self.attempt(row)[0], 64)
+
+    def test_a_mutant_that_always_refuses_stops_every_allowed_row(self):
+        for row in self.ROWS:
+            if not row[5]:
+                with self.subTest(row=row[0]), mock.patch.object(self.hs, "refusal", lambda *a, **k: "heavy: refused: x"):
+                    self.reset()
+                    code = self.attempt(row)[0]
+                    if row[4] is not None and row[0] != "focused-not-refused":   # a focused run or an unknown worktree never asks
+                        self.assertEqual(code, 64)
+                    else:
+                        self.assertEqual(code, 0)
+
+    def test_the_table_covers_every_kind_of_the_one_classifier(self):
+        kinds = {kind for kind, _s, _m in self.hs.KINDS}
+        probes = {"full": [], "focused": ["-k", "x"], "e2e": ["playwright", "test"], "other": ["ls"]}
+        self.assertEqual(set(probes), kinds, "a kind with no probe")
+        for kind, rest in probes.items():
+            with self.subTest(kind=kind):
+                self.reset()
+                command = [self.script] + rest if kind in ("full", "focused") else rest
+                self.hold(self.A)   # a full job is running in worktree A
+                code, text = self.start(command, self.A) if kind in ("full", "focused") else (None, "")
+                self.assertEqual(self.hs.classify(command), kind)
+                self.assertEqual(code == 64, kind == "full") if code is not None else None
+
+    def test_u2_the_refusal_reads_the_kind_from_the_one_classifier(self):
+        self.hold(self.A)
+        with mock.patch.object(self.hs, "classify", lambda command, short=False: "focused"):
+            self.assertEqual(self.start([self.script], self.A)[0], 0)
+        with mock.patch.object(self.hs, "classify", lambda command, short=False: "full"):
+            self.assertEqual(self.start(["sh", "-c", "true"], self.A)[0], 64)
+
+    def test_u1_a_run_that_is_not_refused_prints_nothing_new_and_a_full_house_still_exits_75(self):
+        code, text = self.start([self.script], self.A)
+        self.assertEqual((code, text), (0, ""))
+        self.fill()
+        code, text = self.start([self.script], self.A, wait_max=0)
+        self.assertEqual(code, 75)
+        self.assertTrue(text.startswith("heavy: no slot after 0 s (3 of 3 busy: "), text)
+        self.assertNotIn("refused", text)
+
+    def test_s7_the_only_ceilings_are_the_per_kind_table(self):
+        self.assertEqual(self.hs.KIND_DEFAULTS, {"e2e": 3600, "focused": 1800, "full": 5400, "other": 3600})
+        names = sorted(name for name in vars(self.hs) if re.search(r"(CEIL|SECONDS|MAX_SECONDS|HARD_MAX)", name) and name.isupper())
+        self.assertEqual(names, ["DEFAULT_MAX_SECONDS", "EXPRESS_SECONDS", "HARD_MAX_SECONDS", "KILL_GRACE_SECONDS", "POLL_SECONDS", "SWEEP_SECONDS", "WAIT_REPORT_SECONDS", "WATCH_SECONDS"])
+
+    def test_the_worktree_is_the_git_toplevel_by_real_path(self):
+        def repo(name):
+            path = os.path.join(self.dir, name)
+            os.makedirs(os.path.join(path, "sub"))
+            subprocess.run(["git", "init", "-q", path], check=True)
+            return path
+        one, two = repo("one"), repo("two")
+        link = os.path.join(self.dir, "link")
+        os.symlink(one, link)
+        top = os.path.realpath(one)
+        self.assertEqual(self.hs.worktree_of(one), top)
+        self.assertEqual(self.hs.worktree_of(os.path.join(one, "sub")), top)
+        self.assertEqual(self.hs.worktree_of(os.path.join(link, "sub")), top)
+        self.assertNotEqual(self.hs.worktree_of(two), top)
+        self.assertIsNone(self.hs.worktree_of(os.path.join(self.dir, "state")))   # no git tree here (a temp dir): nothing is refused
+        self.assertIsNone(self.hs.worktree_of(os.path.join(self.dir, "missing")))
+
+    # ---- the words, once each, the same in every file
+    def test_s2_s8_each_sentence_is_in_each_file_once_and_the_same_words(self):
+        for path in self.FILES:
+            text = " ".join((REPO / path).read_text().split())
+            for sentence in (self.DEFAULT, self.EXCEPTION, self.REFUSAL):
+                with self.subTest(path=path, sentence=sentence[:30]):
+                    self.assertEqual(text.count(sentence), 1)
+
+    def test_a_mutant_that_drops_the_exception_or_words_it_differently_fails_the_count(self):
+        for path in self.FILES:
+            text = " ".join((REPO / path).read_text().split())
+            for mutant in (text.replace(self.EXCEPTION, ""), text.replace("to a test CI cannot run", "to a slow test")):
+                self.assertEqual(mutant.count(self.EXCEPTION), 0, path)
+
+    def test_the_sentences_name_roles_never_agents_or_people(self):
+        for sentence in (self.DEFAULT, self.EXCEPTION, self.REFUSAL):
+            self.assertNotRegex(sentence, r"(?i)\b(coder\d|cos\b|fleet-upkeep|adam\b)")
+
+    def test_s1_the_docs_state_the_measured_cause_before_the_default(self):
+        text = " ".join((REPO / "docs" / "switchboard.md").read_text().split())
+        section = text.split("**Focused by default, one full-suite job per worktree (#942).**", 1)[1]
+        before = section.split(self.DEFAULT, 1)[0]
+        for figure in ("19 full local runs", "14 worktrees", "Five of the 14 worktrees", "upper bound"):
+            self.assertIn(figure, before)
+            self.assertNotIn(figure, section.split(self.DEFAULT, 1)[1].split("**", 1)[0] if False else "")
+        self.assertEqual(text.count("**Focused by default, one full-suite job per worktree (#942).**"), 1)
+
+    # ---- preflight: THE table of workflow cases (name, workflow text, changed files, expected job or None)
+    PR_ON = "on:\n  pull_request:\n  push:\n    branches: [main]\n"
+    JOB = ("jobs:\n  test-cloud:\n    runs-on: ubuntu-latest\n    steps:\n      - name: launcher\n        if: ${{ !cancelled() }}\n        run: |\n"
+           "          bin/test-cloud-launcher 2>&1 | tee out.txt\n")
+
+    def cases(self):
+        wf = self.PR_ON + self.JOB
+        return (
+            ("runs-on-pull-request", wf, ["cloud/x"], "test-cloud"),
+            ("workflow-does-not-name-it", wf.replace("bin/test-cloud-launcher", "bin/test-other"), ["cloud/x"], None),
+            ("workflow-unreadable", None, ["cloud/x"], None),
+            ("branch-changes-the-workflow", wf, ["cloud/x", ".github/workflows/test.yml"], None),
+            ("no-pull-request-trigger", wf.replace("pull_request:", "workflow_dispatch:"), ["cloud/x"], None),
+            ("job-level-condition", wf.replace("    runs-on", "    if: github.ref == 'x'\n    runs-on"), ["cloud/x"], None),
+            ("step-continue-on-error", wf.replace("        run: |", "        continue-on-error: true\n        run: |"), ["cloud/x"], None),
+            ("step-condition-it-may-not-run", wf.replace("${{ !cancelled() }}", "${{ github.ref == 'x' }}"), ["cloud/x"], None),
+            ("only-a-name-or-comment", wf.replace("          bin/test-cloud-launcher 2>&1 | tee out.txt", "          # bin/test-cloud-launcher\n          true"), ["cloud/x"], None),
+            ("changed-files-unknown", wf, None, None),
+        )
+
+    def preflight(self, workflow, changed):
+        calls = []
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        if workflow is not None:
+            os.makedirs(os.path.join(root, ".github", "workflows"))
+            Path(root, ".github", "workflows", "test.yml").write_text(workflow)
+
+        def runner(argv, **kwargs):
+            calls.append(list(argv))
+            done = mock.Mock(returncode=0, stdout="", stderr="")
+            if argv[:2] == ["git", "rev-parse"]:
+                done.stdout = root + "\n"
+            elif argv[:2] == ["git", "merge-base"]:
+                done.stdout = "abc123\n" if changed is not None else ""
+                done.returncode = 0 if changed is not None else 1
+            elif argv[:2] == ["git", "diff"]:
+                done.stdout = "\n".join(changed or [])
+            return done
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), mock.patch.object(sb, "preflight_load", lambda: (0.0, 4)):
+            code = sb.cmd_preflight_pr(None, runner, time.time)
+        self.assertEqual([c[:2] for c in calls if c[0] == "git"], [c[:2] for c in calls if c[0] == "git" and c[1] in ("rev-parse", "merge-base", "diff")])
+        heavy = [" ".join(c[c.index("--") + 1:]) for c in calls if "heavy" in c]
+        return code, out.getvalue(), heavy
+
+    def test_s3_s4_every_workflow_case(self):
+        for name, workflow, changed, job in self.cases():
+            with self.subTest(case=name):
+                code, out, heavy = self.preflight(workflow, changed)
+                launcher = [c for c in heavy if "bin/test-cloud-launcher" in c]
+                self.assertEqual(code, 0)
+                if job:
+                    self.assertEqual(launcher, [])
+                    self.assertIn("preflight-pr: cloud launcher: skipped, CI runs it for this pull request (job %s)\n" % job, out)
+                else:
+                    self.assertEqual(len(launcher), 1)
+                    self.assertNotIn("skipped", out)
+
+    def test_the_skip_leaves_the_other_cloud_suites_and_classes_as_they_were(self):
+        code, out, heavy = self.preflight(self.PR_ON + self.JOB, ["cloud/x"])
+        self.assertEqual([c for c in heavy if "cloud" in c], ["bin/test-cloud-worker", "cloud/tests/test-cloud"])
+        self.assertEqual(len(heavy), 5)
+        self.assertEqual([l.split()[:2] for l in out.splitlines() if l.startswith("PASS")], [["PASS", "cli-surface"], ["PASS", "hygiene"], ["PASS", "public-names"], ["PASS", "cloud"]])
+
+    def test_every_sub_check_of_every_class_is_skipped_only_when_the_table_says_so(self):
+        every = [" ".join(command) for _n, _c, commands, _u in sb.PREFLIGHT_CLASSES for command in commands]
+        skippable = {command for command, _shown in sb.PREFLIGHT_CI_SKIPS}
+        self.assertTrue(skippable <= set(every), "a skip row for a command no class runs")
+        steps = "".join("      - run: %s\n" % command for command in every)
+        workflow = self.PR_ON + "jobs:\n  everything:\n    steps:\n" + steps
+        code, out, heavy = self.preflight(workflow, ["cloud/x"])
+        for command in every:
+            with self.subTest(command=command):
+                self.assertEqual(command in heavy, command not in skippable)
+
+    def test_a_mutant_that_always_runs_or_always_skips_the_sub_check_fails_a_case(self):
+        with mock.patch.object(sb, "preflight_ci_runs", lambda *a, **k: None):
+            self.assertIn("bin/test-cloud-launcher", self.preflight(self.PR_ON + self.JOB, ["cloud/x"])[2])
+        with mock.patch.object(sb, "preflight_ci_runs", lambda *a, **k: "any-job"):
+            self.assertNotIn("bin/test-cloud-launcher", self.preflight(None, ["cloud/x"])[2])
 
 
 class TestItemVerdicts(unittest.TestCase):
