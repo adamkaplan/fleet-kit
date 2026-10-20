@@ -22912,7 +22912,7 @@ class OwnedInputs(WaitingInputs):
 
     def pr(self, number, body, age=None, base="main", created=None, head=None, **extra):
         return dict({"number": number, "body": body, "age": self.OLD if age is None else age, "created": 86400 if created is None else created, "base": base,
-                     "head": head or "a" * 40}, **extra)
+                     "head": "a" * 40 if head is None else head}, **extra)
 
     def plan(self, n):
         return "PLAN: https://github.com/%s/issues/%d\n" % (self.REPO, n)
@@ -22931,6 +22931,8 @@ class OwnedInputs(WaitingInputs):
             f = scene["issues"].get(n, {})
             record = {"number": n, "updated_at": sb.iso(now - f.get("age", self.OLD)), "created_at": sb.iso(now - self.OLD),
                       "labels": [{"name": l} for l in f.get("labels", ())]}
+            if f.get("bad_time"):
+                record["updated_at"] = "not a time"
             if f.get("parent") is not None:
                 record["parent_issue_url"] = "https://api.github.com/repos/%s/issues/%d" % (f.get("parent_repo", self.REPO), f["parent"])
             return record
@@ -22938,7 +22940,7 @@ class OwnedInputs(WaitingInputs):
         engine.triage.units[(self.REPO, "issues")] = {"at": now, "data": [row(n) for n in range(1, 100)], "truncated": False, "error": None}
         sb.read_mark(engine, "issues:" + self.REPO, True, "", now)
         sb.read_mark(engine, "decisions", True, "", now)
-        self.hub.records = [{"number": p["number"], "body": p["body"], "updated_at": sb.iso(now - p["age"]), "created_at": sb.iso(now - p["created"]),
+        self.hub.records = [{"number": p["number"], "body": p["body"], "updated_at": "not a time" if p["age"] == "never" else sb.iso(now - p["age"]), "created_at": sb.iso(now - p["created"]),
                              "head": {"sha": p["head"]}, "base": {"ref": p["base"]}, "labels": [{"name": l} for l in p.get("labels", ())],
                              **{k: v for k, v in p.items() if k in ("requested_reviewers", "requested_teams", "draft")}} for p in scene["prs"]]
         engine.__dict__.pop("ci_record_state", None)
@@ -23032,6 +23034,30 @@ class TestWorkerOwned(OwnedInputs, ReportBase):
         self.late()
         self.assertEqual(len(self.stalled()), 1)
 
+    def test_an_owned_item_whose_time_or_head_cannot_be_read_is_not_judged_by_either_rule(self):
+        """An owned work item with no readable updated time, or an owned pull request with no readable head or time, is an input not read whole:
+        no wake and no nudge (default-deny), and the rule speaks once the input is readable."""
+        for name, bad in (("work item time", dict(issues={4: {"bad_time": True}})), ("pull request head", dict(prs=[self.pr(10, self.plan(3), head=0)])),
+                          ("pull request time", dict(prs=[self.pr(10, self.plan(3), age="never")]))):
+            for rule in ("stalled", "seam"):
+                with self.subTest(input=name, rule=rule):
+                    self.setUp()
+                    if rule == "seam":
+                        self.idle()
+                    else:
+                        self.late()
+                    self.set_scene(**bad)
+                    self.assertEqual(self.said(rule), [], "not judged")
+                    self.setUp()
+                    self.set_scene(prs=[self.pr(10, self.plan(3))])
+                    self.idle() if rule == "seam" else self.late()
+                    self.apply()
+                    self.assertEqual(len(self.said(rule)), 2 if rule == "seam" else 1, "the control with readable inputs speaks")
+
+    def said(self, rule):
+        self.apply()
+        return [f for f in self.derive() if (":seam:" if rule == "seam" else ":stalled:") in f.key]
+
     # -- the rules (S3, S4, S5) -------------------------------------------------------------------------------------------------------------
     def stalled(self):
         self.apply()
@@ -23067,7 +23093,7 @@ class TestWorkerOwned(OwnedInputs, ReportBase):
         (wake,) = self.stalled()
         self.assertRegex(wake.summary, r"^no movement for 2\.5h on acme/widget-service#1[01] ")
 
-    def test_S4_the_head_memory_is_per_pull_request_a_mutant_that_keeps_one_per_worker_is_caught(self):
+    def test_S4_the_head_of_each_owned_pull_request_is_remembered_on_its_own(self):
         self.set_scene(prs=[self.pr(10, self.plan(3)), self.pr(11, self.plan(4))])
         self.stalled()
         self.late()
