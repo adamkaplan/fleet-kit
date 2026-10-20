@@ -1171,7 +1171,7 @@ def cmd_read(args, runner, now):
         return H["EXIT_OK"]
     else:   # a local agent, on the local service
         seen = engine.discover(engine.now()).agents.get(args.name)
-        session = seen.session_id if seen else (H["read_pane_health"](state)["agents"].get(args.name) or {}).get("session")
+        session = seen.session_id if seen else H["known_agent"](state, args.name, H["read_pane_health"](state)["agents"].get(args.name)).get("session")
         if not session:
             raise LaunchError("%s is not a fleet agent this switchboard has seen" % args.name)
         v2 = engine.v2
