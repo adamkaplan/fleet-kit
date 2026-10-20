@@ -73658,6 +73658,18 @@ class TestFocusedLocalRuns(unittest.TestCase):
             self.assertEqual(self.start([self.script], self.A)[0], 0)
         self.assertTrue(seen, "no record naming the worktree when the line was left")
 
+    def test_the_marker_preflight_looks_for_is_in_the_text_the_wrapper_writes(self):
+        hs = sb.load_heavy_slots()
+        text = hs.refusal(self.state_for_marker(), "/work/a", [{"kind": "full", "worktree": "/work/a", "name": "n", "pid": 1, "since": 1}])
+        source = SWITCHBOARD.read_text()
+        literal = re.search(r'"(heavy: refused: [^"]+)" in \(done\.stderr', source).group(1)
+        self.assertTrue(text.startswith(literal), text)
+
+    def state_for_marker(self):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, True)
+        return directory
+
     def test_a_test_that_itself_exits_64_is_a_plain_failure_not_a_refusal(self):
         def runner(argv, **kwargs):
             return mock.Mock(returncode=64 if "heavy" in argv else 0, stdout="/r\n", stderr="usage error\n" if "heavy" in argv else "")

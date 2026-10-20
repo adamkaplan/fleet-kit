@@ -584,6 +584,7 @@ def _pid_alive(pid, start=None):
     """Is the process the record names still there? With its recorded start time a reused pid is another process (the pid alone only when no start time was recorded)."""
     if not isinstance(pid, int) or isinstance(pid, bool) or pid < 2:
         return False
+    # (`ps` that cannot be read gives no start time, and the holder then counts as live: the refusal fails closed on that path)
     return _alive(pid, start if isinstance(start, str) else "")
 
 
