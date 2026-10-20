@@ -32193,7 +32193,8 @@ class TestImpactFloorOwnerDecision(LedgerBase):
         self.assertNotIn("owner_decide(", source, "no second copy of the rule")
 
 
-VERBS = ["add_argument", "add_argument_group", "add_mutually_exclusive_group", "add_parser", "add_subparsers", "set_defaults"]   # pinned equal to the matrix by a test of the allow table
+VERBS = ["add_argument", "add_argument_group", "add_mutually_exclusive_group", "add_parser", "add_subparsers", "set_defaults"]
+FREE_KEYWORDS = ["help", "dest", "metavar", "required", "nargs", "const", "func"]   # pinned equal to the matrix by a test of the allow table
 
 
 class TestRegistrarFloor(LedgerBase):
@@ -32229,7 +32230,7 @@ class TestRegistrarFloor(LedgerBase):
         """The same lint over a registrar written alone, with the real closure names: [(registrar, verb, name)] (the whole-file route is `found`, used where the diff matters)."""
         import ast
         unit = ast.parse("def add_zzz_parsers(sub):\n    " + body.replace("\n", "\n    ") + "\n").body[0]
-        return [("add_zzz_parsers", v, n) for v, n in self.dc._registrar_unit(unit, set(self.names), set(range(1, 1000)), verbs=VERBS)]
+        return [("add_zzz_parsers", v, n) for v, n in self.dc._registrar_unit(unit, set(self.names), set(range(1, 1000)), builtins=set(self.rule["registrar_allow"]["pure_builtins"]), named_helpers=set(self.rule["registrar_allow"]["helpers"]), verbs=VERBS, free_keywords=FREE_KEYWORDS)]
 
     def pick(self):
         """One closure definition, one binding and one imported module of the real closure (derived: the first of each, never named here)."""
@@ -32248,7 +32249,7 @@ class TestRegistrarFloor(LedgerBase):
             "__import__": ("__import__('os')", ("imports", "__import__")),
             "a call of a closure function": ("%s()" % function, ("calls", function)),
             "a call through a closure module": ("%s.thing()" % module, ("calls", module)),
-            "a call of a builtin": ("len(sub)", ("calls", "len")),
+            "a call of a builtin outside the table": ("iter(sub)", ("calls", "iter")),
             "a call through a module outside the closure": ("gc.get_objects()", ("calls", "gc")),
             "ctypes": ("ctypes.memmove(0, 0, 0)", ("calls", "ctypes")),
             "exec": ("exec('x = 1')", ("calls", "exec")),
@@ -32278,6 +32279,19 @@ class TestRegistrarFloor(LedgerBase):
             "another command's parser rewritten": ('sub.choices["impact"].set_defaults(impact_action="floor")', ("uses", "choices")),
             "a write onto a function reached through an action": ('p = sub.add_parser("zzz")\np._actions[-1].type.mark = 1', ("rebinds", "mark")),
             "another command's actions rewritten": ('for a in sub.choices["review"]._actions:\n    a.default = "x"', ("uses", "choices")),
+            "a data name rebound to a module": ("s = ''\ns = %s\ns.system('x')" % module, ("calls", "s")),
+            "a data name rebound to a non-closure module": ("s = ''\ns = os\ns.system('x')", ("calls", "s")),
+            "aliases on add_parser": ("sub.add_parser('x', aliases=['review'])", ("calls", "aliases")),
+            "set_defaults on the handed parser": ("sub.set_defaults(a=1)", ("calls", "set_defaults on the handed parser")),
+            "type=eval with a default string": ("p = sub.add_parser('z')\np.add_argument('--x', default=\"__import__('os').getcwd()\", type=eval)", ("calls", "eval")),
+            "type=exec": ("p = sub.add_parser('z')\np.add_argument('--x', default='1', type=exec)", ("calls", "exec")),
+            "type=compile": ("p = sub.add_parser('z')\np.add_argument('--x', type=compile)", ("calls", "compile")),
+            "type=open": ("p = sub.add_parser('z')\np.add_argument('--x', default='/etc/passwd', type=open)", ("calls", "open")),
+            "type=setattr": ("p = sub.add_parser('z')\np.add_argument('--x', type=setattr)", ("calls", "setattr")),
+            "type=print": ("p = sub.add_parser('z')\np.add_argument('--x', default='a', type=print)", ("calls", "print")),
+            "type= a closure function": ("p = sub.add_parser('z')\np.add_argument('--x', type=%s)" % function, ("calls", function)),
+            "action= a closure function": ("p = sub.add_parser('z')\np.add_argument('--x', action=%s)" % function, ("calls", function)),
+            "action=eval": ("p = sub.add_parser('z')\np.add_argument('--x', action=eval)", ("calls", "eval")),
             "a bare read": ("%s" % function, ("uses", function)),
             "a loop source": ("for f in [%s]:\n    pass" % function, ("uses", function)),
             "a closure name handed to a foreign call": ("print(%s)" % function, ("uses", function)),
@@ -32287,14 +32301,20 @@ class TestRegistrarFloor(LedgerBase):
     def allowed_table(self):
         function, binding, module = self.pick()
         return {
-            "a value of its own parser's method": "t = sub.add_parser('x', type=%s, help=%s)\nt.add_argument('--a', default=%s)" % (function, module, binding),
-            "a nested value of an argument": "t = sub.add_parser('x')\nt.add_argument('--a', choices=(%s, 1))" % function,
-            "a loop over its own parsers": "a = sub.add_parser('a')\nb = sub.add_parser('b')\nfor p in (a, b):\n    p.add_argument('--x', default=%s)" % function,
+            "a value of its own parser's method": "t = sub.add_parser('x', type=int, help=%s)\nt.add_argument('--a', default=1, metavar=%s)" % (module, binding),
+            "a nested value of an argument": "t = sub.add_parser('x')\nt.add_argument('--a', choices=(1, 2), help=%s)" % function,
+            "a loop over its own parsers": "a = sub.add_parser('a')\nb = sub.add_parser('b')\nfor p in (a, b):\n    p.add_argument('--x', default=1, help=%s)" % function,
             "its own parser's actions": "a = sub.add_parser('a')\nfor action in a._actions:\n    action.default = 1",
             "a constant read of a module": "t = sub.add_parser('x')\nt.add_argument('--a', default=argparse.SUPPRESS)",
             "a flag with a computed help": "t = sub.add_parser('x')\nt.add_argument('--a', help='%d' % 1 + 'x'.join(['a']))",
             "a built parser's actions read and set to literals (the ledger registrar)": "v = sub.add_parser('v')\nfor action in v._actions:\n    action.nargs, action.default = '?', None",
             "a chain of its own parser's methods": "sub.add_parser('x').add_argument('--a')",
+            "a table builtin and a string action": "t = sub.add_parser('x')\nt.add_argument('--a', type=int, default=1, action='store_true')",
+            "set_defaults with a stored function": "t = sub.add_parser('x')\nt.set_defaults(func=%s)" % function,
+            "a type that is a lambda over table builtins": "t = sub.add_parser('x')\nt.add_argument('--a', type=lambda v: int(v))",
+            "a local dict of safe values": "given = {'default': argparse.SUPPRESS} if sub else {}\nt = sub.add_parser('x')\nt.add_argument('--a', **given)",
+            "set_defaults on a parser it built": "t = sub.add_parser('x')\nt.set_defaults(a=1)",
+            "a name that stays data": "s = ''\ns.join(['a'])",
             "a literal stored on a parser it built": "t = sub.add_parser('x')\nt.usage = 'u'",
             "a function it defines itself": "def inner(v):\n    return v\nsub.add_parser('x', help=inner('a'))",
         }
@@ -32496,8 +32516,11 @@ class TestRegistrarFloor(LedgerBase):
             self.assertTrue(hasattr(builtins_module, name), name)
             self.assertNotIn(name, self.FORBIDDEN_BUILTINS)
         self.assertEqual(len(allow["pure_builtins"]), len(set(allow["pure_builtins"])), "a member twice")
-        self.assertEqual(sorted(allow), ["helpers", "meaning", "parser_methods", "pure_builtins"])
+        self.assertEqual(sorted(allow), ["free_keywords", "helpers", "meaning", "parser_methods", "pure_builtins"])
         self.assertEqual(allow["parser_methods"], VERBS, "the verbs this test file writes its rules with are the matrix's")
+        self.assertEqual(allow["free_keywords"], FREE_KEYWORDS)
+        for member in ("type", "action", "default", "choices", "default_factory"):
+            self.assertNotIn(member, allow["free_keywords"], "a keyword argparse applies or runs is not free")
         for member in ("choices", "_name_parser_map", "_actions", "_defaults", "_registries", "parser_class", "parse_args", "register", "__setattr__"):
             self.assertNotIn(member, allow["parser_methods"], "a member of the handed parser that reaches other commands is not a verb")
 
@@ -32556,10 +32579,10 @@ class TestRegistrarFloor(LedgerBase):
                 "class IssueNo(int):\n    def __new__(cls, n):\n        self = super().__new__(cls, n)\n        self.repo = None\n        return self\n"
                 "def parse_ref(text):\n    found = _REF.match(text.strip()) if isinstance(text, str) else None\n    if not found or int(text) < 1:\n        raise ValueError(str(text))\n    return IssueNo(int(text))\n"
                 "def ref_arg(text):\n    return parse_ref(text)\ndef main():\n    return 1\n")
-        rule = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": [], "registrar_allow": {"pure_builtins": ["int", "isinstance", "str"], "helpers": ["IssueNo", "parse_ref", "ref_arg"], "parser_methods": VERBS}}
+        rule = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": [], "registrar_allow": {"pure_builtins": ["int", "isinstance", "str"], "helpers": ["IssueNo", "parse_ref", "ref_arg"], "parser_methods": VERBS, "free_keywords": FREE_KEYWORDS}}
         registrar = "def add_x_parsers(sub):\n    t = sub.add_parser('x')\n    t.add_argument('--issue', type=ref_arg, default=int('1'))\n"
         self.assertEqual(self.dc.registrar_findings(fake, fake + registrar, rule), ([], None))
-        self.assertEqual(self.dc.registrar_findings(fake, fake + registrar, dict(rule, registrar_allow={"pure_builtins": [], "helpers": [], "parser_methods": VERBS}))[0] != [], True, "with no table the same edit is held")
+        self.assertEqual(self.dc.registrar_findings(fake, fake + registrar, dict(rule, registrar_allow={"pure_builtins": [], "helpers": [], "parser_methods": VERBS, "free_keywords": FREE_KEYWORDS}))[0] != [], True, "with no table the same edit is held")
         edited = (fake + registrar).replace("    return IssueNo(int(found.group(1)))" if False else "    return IssueNo(int(text))\n", "    x = 1\n    return IssueNo(int(text))\n")
         got, why = self.dc.registrar_findings(fake + registrar, edited, rule)
         self.assertEqual([g[1:] for g in got], [("rebinds", "parse_ref")], got)
@@ -32571,23 +32594,23 @@ class TestRegistrarFloor(LedgerBase):
         for builtin in allow["pure_builtins"]:
             with self.subTest(builtin):
                 text = fake + "def add_a_parsers(sub):\n    sub.add_parser('x', help=%s(['a']))\n" % builtin
-                with_it = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": [], "registrar_allow": {"pure_builtins": [builtin], "helpers": [], "parser_methods": VERBS}}
-                without = dict(with_it, registrar_allow={"pure_builtins": [x for x in allow["pure_builtins"] if x != builtin], "helpers": [], "parser_methods": VERBS})
+                with_it = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": [], "registrar_allow": {"pure_builtins": [builtin], "helpers": [], "parser_methods": VERBS, "free_keywords": FREE_KEYWORDS}}
+                without = dict(with_it, registrar_allow={"pure_builtins": [x for x in allow["pure_builtins"] if x != builtin], "helpers": [], "parser_methods": VERBS, "free_keywords": FREE_KEYWORDS})
                 self.assertEqual(self.dc.registrar_findings(fake, text, with_it)[0], [], builtin)
                 self.assertTrue(self.dc.registrar_findings(fake, text, without)[0], "the mutant without %s is not held" % builtin)
         for helper in allow["helpers"]:
             with self.subTest(helper):
                 text = fake.replace("def hlp(t):", "def %s(t):" % helper) + "def add_a_parsers(sub):\n    sub.add_parser('x', type=%s)\n" % helper
-                with_it = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": [], "registrar_allow": {"pure_builtins": [], "helpers": [helper], "parser_methods": VERBS}}
-                without = dict(with_it, registrar_allow={"pure_builtins": [], "helpers": [x for x in allow["helpers"] if x != helper], "parser_methods": VERBS})
+                with_it = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": [], "registrar_allow": {"pure_builtins": [], "helpers": [helper], "parser_methods": VERBS, "free_keywords": FREE_KEYWORDS}}
+                without = dict(with_it, registrar_allow={"pure_builtins": [], "helpers": [x for x in allow["helpers"] if x != helper], "parser_methods": VERBS, "free_keywords": FREE_KEYWORDS})
                 self.assertEqual(self.dc.registrar_findings(fake.replace("def hlp(t):", "def %s(t):" % helper), text, with_it)[0], [], helper)
                 self.assertTrue(self.dc.registrar_findings(fake.replace("def hlp(t):", "def %s(t):" % helper), text, without)[0], "the mutant without %s is not held" % helper)
 
     # ---- the mutants: a small daemon file with its own closure, the table run on the REAL lint and on a copy of it with ONE thing changed
     FAKE = ("import re\nimport json\nREGISTRAR_NAME_RE = re.compile(r'add_[a-z0-9_]+_parsers')\nFIELDS = ('a', 'b')\nHOOKS = []\n"
             "def fn():\n    return json.dumps(HOOKS)\ndef main():\n    fn()\n    return FIELDS, HOOKS, re, hh\n"
-            "def hh(text):\n    import os\n    return os.fspath(text)\ndef hh2(text):\n    import os\n    return text\n")   # a registration helper OUTSIDE the closure (as on a registrar split), whose body a registrar's lint would hold
-    FAKE_RULE = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": [], "registrar_allow": {"pure_builtins": ["int", "str"], "helpers": ["hh", "hh2"], "parser_methods": VERBS}}
+            "def hh(text):\n    import os\n    return os.fspath(text)\ndef hh2(text):\n    import os\n    return text\nSTATES = FIELDS + FIELDS\n")   # a registration helper OUTSIDE the closure (as on a registrar split), whose body a registrar's lint would hold
+    FAKE_RULE = {"closure_roots": ["main"], "rating_roots": [], "dynamic_actions": [], "registrar_allow": {"pure_builtins": ["int", "str"], "helpers": ["hh", "hh2"], "parser_methods": VERBS, "free_keywords": FREE_KEYWORDS}}
 
     def table_failures(self, dc):
         """[row that does not hold] for the table below, run on the lint module `dc` (the real one, or a mutant of it)."""
@@ -32623,7 +32646,7 @@ class TestRegistrarFloor(LedgerBase):
         ):
             has(label, reg(body), want)
         for label, body in (
-            ("own parser values", "t = sub.add_parser('x', type=fn, help=json)\nt.add_argument('--a', default=re.SUPPRESS)"), ("loop over own parsers", "a = sub.add_parser('a')\nb = sub.add_parser('b')\nfor p in (a, b):\n    p.add_argument('--x', default=fn)"),
+            ("own parser values", "t = sub.add_parser('x', type=int, help=json)\nt.add_argument('--a', default=re.SUPPRESS, metavar=fn)"), ("loop over own parsers", "a = sub.add_parser('a')\nb = sub.add_parser('b')\nfor p in (a, b):\n    p.add_argument('--x', default=1, help=fn)"),
             ("own parser actions", "a = sub.add_parser('a')\nfor action in a._actions:\n    action.default = 1"), ("data loop", "t = sub.add_parser('x')\nfor f in FIELDS:\n    t.add_argument('--' + f.replace('_', '-'))"),
             ("defined function", "def inner(v):\n    return v\nsub.add_parser('x', help=inner('a'))"),
         ):
@@ -32660,6 +32683,19 @@ class TestRegistrarFloor(LedgerBase):
             has(label, reg(body), want)
         clean("a built parser's actions read and set to literals", reg("v = sub.add_parser('v')\nfor action in v._actions:\n    action.nargs, action.default = '?', None"))
         clean("a chain of its own parser's methods", reg("sub.add_parser('x').add_argument('--a')"))
+        for label, body, want in (("type=eval", "p = sub.add_parser('z')\np.add_argument('--x', default='1', type=eval)", ("calls", "eval")), ("type= a closure function", "p = sub.add_parser('z')\np.add_argument('--x', type=fn)", ("calls", "fn")),
+                                  ("action= a name", "p = sub.add_parser('z')\np.add_argument('--x', action=hh)", ("calls", "action")), ("choices= a mutable list", "p = sub.add_parser('z')\np.add_argument('--x', choices=HOOKS)", ("calls", "HOOKS")),
+                                  ("a default that is a closure call", "p = sub.add_parser('z')\np.add_argument('--x', default=fn())", ("calls", "fn"))):
+            has(label, reg(body), want)
+        clean("set_defaults with a stored closure function", reg("t = sub.add_parser('x')\nt.set_defaults(func=fn)"))
+        clean("a keyword that is free", reg("t = sub.add_parser('x')\nt.add_argument('--a', help=fn, metavar=HOOKS, nargs='?', const=json)"))
+        clean("choices of a computed module constant", reg("sub.add_parser('x').add_argument('--a', choices=STATES)"))
+        clean("a local dict of safe values", reg("given = {'default': re.SUPPRESS} if sub else {}\nt = sub.add_parser('x')\nt.add_argument('--a', **given)"))
+        has("a data name rebound to a module", reg("s = ''\ns = json\ns.dumps(1)"), ("calls", "s"))
+        has("aliases on add_parser", reg("sub.add_parser('x', aliases=['review'])"), ("calls", "aliases"))
+        has("set_defaults on the handed parser", reg("sub.set_defaults(a=1)"), ("calls", "set_defaults on the handed parser"))
+        clean("set_defaults on a parser it built", reg("t = sub.add_parser('x')\nt.set_defaults(a=1)"))
+        clean("a name that stays data", reg("s = ''\ns.join(['a'])"))
         clean("a pure builtin of the table", reg("sub.add_parser('x', default=int('1'), help=str(2))"))
         has("a builtin outside the table", reg("sorted(sub)"), ("calls", "sorted"))
         clean("a named helper is not read as part of the registrar", reg("t = sub.add_parser('x')\nt.add_argument('--i', type=hh)\nhh('1')"))
@@ -32670,7 +32706,7 @@ class TestRegistrarFloor(LedgerBase):
         except Exception:
             bad.append("a helper edit holds")
         try:
-            got, why = dc.registrar_findings(fake, fake, dict(rule, registrar_allow={"pure_builtins": "int", "helpers": [], "parser_methods": VERBS}))
+            got, why = dc.registrar_findings(fake, fake, dict(rule, registrar_allow={"pure_builtins": "int", "helpers": [], "parser_methods": VERBS, "free_keywords": FREE_KEYWORDS}))
             if got is not None or not why:
                 bad.append("an unreadable table holds")
         except Exception:
@@ -32777,6 +32813,15 @@ class TestRegistrarFloor(LedgerBase):
         ("a non-literal store on a built parser is allowed", "and _is_data(x.value, data | set(literals)) for target in x.targets", "for target in x.targets"),
         ("a built parser's actions are not its own", "or (isinstance(x.iter, ast.Attribute) and isinstance(x.iter.value, ast.Name) and x.iter.value.id in built)):\n                sources = [x.target]   # `for p in", "or False):\n                sources = [x.target]   # `for p in"),
         ("a chain of verbs is only one call long", "or verb_chain(inner)", "or False"),
+        ("a rebound data name stays data", "if any(v is None or not _is_data(v, (data - {n}) | set(literals)) for v in bindings.get(n, [])):", "if False:"),
+        ("aliases are not held", "if any(k.arg == \"aliases\" for k in x.keywords):", "if False:"),
+        ("set_defaults on the handle is not held", "if fname == \"set_defaults\" and isinstance(x.func, ast.Attribute)", "if False and isinstance(x.func, ast.Attribute)"),
+        ("a keyword is always free", "if key in free_keywords:\n                        continue", "if True:\n                        continue"),
+        ("action takes any value", "if key == \"action\" and not (isinstance(value, ast.Constant) and isinstance(value.value, str)):", "if False:"),
+        ("a value argparse may run is not checked", "bad = unsafe(value)\n                    if bad:", "bad = None\n                    if bad:"),
+        ("a local is never resolved through its bindings", "if all(unsafe(v) is None for v in bindings[expr.id]):", "if False:"),
+        ("a computed module constant is not data", "if isinstance(expr, ast.BinOp):\n        return _is_const_expr(expr.left, data) and _is_const_expr(expr.right, data)", "if False:\n        return _is_const_expr(expr.left, data) and _is_const_expr(expr.right, data)"),
+        ("a method of data is not safe", "if isinstance(callee, ast.Attribute) and isinstance(callee.value, ast.Name) and (callee.value.id in data", "if False and isinstance(callee, ast.Attribute) and isinstance(callee.value, ast.Name) and (callee.value.id in data"),
         ("a default that is not data is not held", "for a, default in param_defaults:", "for a, default in []:"),
         ("a rebound parser name is not held", '                    note(x, "rebinds", y.id)', "                    pass"),
         ("a registrar bound under an if is not read", "for node in _module_statements(head.body):\n        for name, unit in _binds_registrar(node, patterns):", "for node in head.body:\n        for name, unit in _binds_registrar(node, patterns):"),
