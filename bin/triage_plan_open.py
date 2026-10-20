@@ -64,7 +64,7 @@ def split_batch_waiting(prs, links, integration_branch):
     """(judged, waiting): `links` (from `merged_links`) split by whether the change is still waiting for the batch.
 
     A link waits only when its pull request merged with a base that EQUALS the configured integration branch and no merged batch pull request is in the
-    records already read: one whose head is the integration branch and whose base is the repository's default branch, merged at or after the member.
+    records already read: one whose head is the integration branch and whose base is the repository's default branch (any other known base when the default cannot be read), merged at or after the member.
     Anything else is judged as before: no integration branch configured (not a non-empty string), a base that cannot be read, another branch, the
     default branch, or a doubt of any kind. Reads nothing new; the branch name comes only from the configuration."""
     if not (isinstance(integration_branch, str) and integration_branch):
@@ -79,7 +79,8 @@ def split_batch_waiting(prs, links, integration_branch):
             records[number] = record
         base = record.get("base")
         default = ((base.get("repo") or {}).get("default_branch") if isinstance(base, dict) and isinstance(base.get("repo"), dict) else None)
-        if _ref(record, "head") == integration_branch and isinstance(default, str) and default and _ref(record, "base") == default:
+        to = _ref(record, "base")
+        if _ref(record, "head") == integration_branch and to and to != integration_branch and (to == default if isinstance(default, str) and default else True):   # the default unreadable: any other known base counts, or the issue would wait on a batch that already merged
             batches.append(str(record["merged_at"]))
     judged, waiting = {}, {}
     for issue, link in links.items():

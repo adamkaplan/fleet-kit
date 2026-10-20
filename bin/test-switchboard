@@ -25473,13 +25473,15 @@ class TestTriage(Base):
                   "head": {"ref": head}, "base": {"ref": base, "repo": {"default_branch": default}}}
         if base is self.MISSING:
             record["base"] = {"repo": {"default_branch": default}}
+        if default is self.MISSING:   # the record carries no base.repo at all: the default cannot be read
+            record["base"].pop("repo")
         self.hub.pulls.setdefault("acme/api", []).append(record)
 
     def waiting(self):
         return self.engine.triage.current["waiting_for_batch"]
 
     def batch_cases(self):
-        """(case, member base, integration setting, extra batch record or None, T12 expected, waiting expected): one table for S1, S3 to S6."""
+        """(case, member base, integration setting, extra batch record or None, T12 expected, waiting expected): one table for S1, S3 to S6 and the batch's own base, head, time and readability."""
         batch = dict(number=900, body="Batch.", base="main", head="stage", hours_ago=1.0)   # merged AFTER the member (1 h ago against 2 h)
         old_batch = dict(batch, hours_ago=3.0)                                              # merged BEFORE the member: not its batch
         return [
@@ -25493,6 +25495,18 @@ class TestTriage(Base):
             ("batch reached the default branch", "stage", "stage", batch, 1, 0),
             ("a batch merged before the member does not count", "stage", "stage", old_batch, 0, 1),
             ("a merged PR from the same head into another base is no batch", "stage", "stage", dict(batch, base="topic"), 0, 1),
+            ("a base that contains the branch is not the branch", "stage-2", "stage", None, 1, 0),
+            ("a base that contains the branch, as a suffix", "upstage", "stage", None, 1, 0),
+            ("a base the branch contains", "sta", "stage", None, 1, 0),
+            ("a merged PR from another head into the default branch is no batch", "stage", "stage", dict(batch, head="feature-y"), 0, 1),
+            ("a batch from a head that contains the branch is no batch", "stage", "stage", dict(batch, head="stage-2"), 0, 1),
+            ("a batch at the same second as the member counts (at or after)", "stage", "stage", dict(batch, hours_ago=2.0), 1, 0),
+            ("a batch just before the member does not count", "stage", "stage", dict(batch, hours_ago=2.01), 0, 1),
+            ("the batch record has no base.repo: it still counts", "stage", "stage", dict(batch, default=self.MISSING), 1, 0),
+            ("no base.repo and a base of the integration branch: no batch", "stage", "stage", dict(batch, base="stage", default=self.MISSING), 0, 1),
+            ("no base.repo and no base: a doubt, still waiting", "stage", "stage", dict(batch, base=None, default=self.MISSING), 0, 1),
+            ("no base.repo and another head: no batch", "stage", "stage", dict(batch, head="feature-y", default=self.MISSING), 0, 1),
+            ("a default that differs from the batch base: no batch", "stage", "stage", dict(batch, base="topic", default="main"), 0, 1),
             ("integration not configured", "stage", None, None, 1, 0),
             ("integration name that matches nothing", "stage", "rollup-x", None, 1, 0),
             ("integration set to a non-string", "stage", 7, None, 1, 0),
@@ -25537,10 +25551,44 @@ class TestTriage(Base):
                         self.assertEqual([r for r in family if self.only(r)], [])    # none of T1, T11, T12 fires for it
                         self.assertEqual(self.waiting(), 1)
                     elif state == "control: no merged record":
-                        self.assertTrue(fired or rule == "T12")                      # T1 and T11 fire on their own conditions
+                        self.assertEqual(self.only("T12"), [])                       # no merged record: T12 cannot fire
+                        self.assertEqual(fired, rule != "T12")                       # T1 and T11 fire on their own conditions
                     else:
-                        self.assertTrue(fired if rule == "T12" else True)
+                        self.assertEqual(fired, rule == "T12")                       # the batch merged: T12 fires for its issue and gives T1 and T11 their usual way
+                        self.assertEqual(self.only("T12"), ["acme/api#%d" % issue[rule]])
                         self.assertEqual(self.waiting(), 0)
+
+    def test_t12_a_charter_or_an_ask_is_never_waiting_for_the_batch_and_its_t1_t11_are_not_quieted(self):
+        # The pass: a charter and its ask whose part merged into the integration branch are never counted as waiting.
+        self.add(1, created=30, updated=10, labels=["x:orchestrator", "kind"], body="## Decision required\nx")
+        self.add(2, created=20, updated=10, parent=1, labels=["kind"], body="Next: go")
+        self.branch_pr(200, "Part of #1.", base="stage")
+        self.branch_pr(201, "Part of #2.", base="stage")
+        self.go(passes=3, integration_branch="stage")
+        self.assertEqual(self.waiting(), 0)
+        # The rule itself (the real function): the quieting of T1 and T11 is for a work item only, never a charter or an ask.
+        now = self.world.clock.now()
+        for kind in ("charters", "asks", None):
+            ctx = {"charters": set(), "asks": set(), "chain": set(), "owned": set(), "unresolved": set()}
+            if kind:
+                ctx[kind] = {5}
+            item = sb.triage_norm(tri_issue(now, 5, created=10, updated=10, labels=["kind"]))
+            for waiting in (None, {5}):
+                with self.subTest(kind=kind, waiting=bool(waiting)):
+                    found, _ = sb.triage_rules(item, [], ctx, sb.triage_sla(self.engine.config["triage"], "acme/api"), now, {"bot"}, [], set(), waiting=waiting)
+                    quiet = kind is None and waiting
+                    self.assertEqual("T1" in found or "T11" in found, not quiet)
+
+    def test_t12_the_integration_branch_setting_is_known_to_the_loader_and_defaults_to_none(self):
+        self.assertIsNone(sb.TRIAGE_DEFAULTS["integration_branch"])
+        with mock.patch.object(sb, "warn_unknown_config") as warn:
+            sb.validate_triage_config({"triage": {"integration_branch": "stage"}}, "cfg")
+            sb.validate_triage_config({"triage": {"integration_branch": None}}, "cfg")
+            sb.validate_triage_config({"triage": {}}, "cfg")
+        warn.assert_not_called()
+        for bad in (7, ["stage"], "", True):
+            with self.subTest(bad=bad), self.assertRaises(sb.ConfigError):
+                sb.validate_triage_config({"triage": {"integration_branch": bad}}, "cfg")
 
     def test_t12_nothing_is_written_for_a_waiting_issue_and_the_totals_name_it_apart(self):
         self.charter()

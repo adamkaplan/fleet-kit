@@ -13592,6 +13592,8 @@ def validate_triage_config(config, source):
                           % (source, ", ".join(unknown), ", ".join(TRIAGE_DEFAULTS)), 'triage', unknown, list(TRIAGE_DEFAULTS))
     section = dict(TRIAGE_DEFAULTS, **raw)
     where = "%s: 'triage" % source
+    if section["integration_branch"] is not None and not (isinstance(section["integration_branch"], str) and section["integration_branch"]):   # #921
+        raise ConfigError("%s.integration_branch' must be a branch name or null, got %r" % (where, section["integration_branch"]))
     for key in ("enabled", "daily_summary", "backoff"):
         if not isinstance(section[key], bool):
             raise ConfigError("%s.%s' must be true or false, got %r" % (where, key, section[key]))
