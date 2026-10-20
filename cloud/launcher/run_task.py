@@ -107,7 +107,12 @@ class Driver:
 
     def git_token(self):
         raw = self.env.get("CW_GIT_TOKEN_CMD")
+        mode = getattr(self.a, "token_mode", None) or "default"
+        if raw and mode != "default":
+            raise cw.CloudError("--token-mode %s does not combine with CW_GIT_TOKEN_CMD; nothing was created" % mode, cw.EXIT_USAGE)
         cmd = shlex.split(raw) if raw else [sys.executable, os.path.join(HERE, "app_token.py"), self.a.repo]
+        if mode != "default":
+            cmd += ["--mode", mode]
         try:
             p = subprocess.run(cmd, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL, env=dict(self.env, GH_REPO=self.a.repo))
         except (OSError, subprocess.TimeoutExpired, ValueError):
@@ -446,6 +451,7 @@ def main(argv=None, env=None):
     p.add_argument("brief_file")
     p.add_argument("--pull-secret")
     p.add_argument("--image")
+    p.add_argument("--token-mode", choices=cw.TOKEN_MODES, help="the git token's permissions (default: contents and pull requests write; read-only: contents read)")
     try:
         a = p.parse_args(argv)
     except SystemExit as e:
@@ -458,6 +464,14 @@ def main(argv=None, env=None):
     except cw.CloudError as e:
         print("run-task: %s" % e, file=sys.stderr)
         return e.code
+    try:   # the flag, else the settings key CW_TOKEN_MODE (the launch command's rule): a driver run must not hand a write token to a read-only setting
+        a.token_mode, _ = cw.token_mode_choice(a.token_mode, env)
+    except cw.CloudError as e:
+        print("run-task: %s" % e, file=sys.stderr)
+        return e.code
+    if a.token_mode != "default" and env.get("CW_GIT_TOKEN_CMD"):   # before the preflight (which mints a token) and any pod
+        print("run-task: --token-mode %s does not combine with CW_GIT_TOKEN_CMD; nothing was created" % a.token_mode, file=sys.stderr)
+        return 2
     try:   # FAIL CLOSED: a missing, killed or silent preflight refuses
         print(cw.check_repo_preflight(a.repo, env))  # the repository preflight: after the allow-list, before any token is minted
     except cw.CloudError as e:

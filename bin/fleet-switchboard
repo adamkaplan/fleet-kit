@@ -18323,6 +18323,9 @@ def cmd_launch(args, runner, now, socket_call=None):
     if getattr(args, "stack", False) and not getattr(args, "cloud", False):   # before anything is read or called: the option is the cloud launcher's
         sys.stderr.write("%s: --stack needs --cloud: the nested Docker stack is a cloud worker's pod; nothing was created\n" % PROG)
         return EXIT_USAGE
+    if getattr(args, "token_mode", None) and not getattr(args, "cloud", False):   # before anything is read or called: the option is the cloud launcher's
+        sys.stderr.write("%s: --token-mode needs --cloud: it chooses the permissions of a cloud worker's git token; nothing was created\n" % PROG)
+        return EXIT_USAGE
     if getattr(args, "cloud", False):   # a worker in the cloud (#371): its own module; nothing below runs
         return run_cloud("cmd_launch", args, runner, now)
     refuse_cloud_name(args.name)   # a name that has a cloud record is not launched locally (#640)
@@ -28422,6 +28425,7 @@ def build_parser():
     launch.add_argument("--hard", help="With --cloud: stop after this long whatever it does (default 2h)")
     launch.add_argument("--shape", help="With --cloud: the pod shape, S (2 CPU, 4 GiB; the launcher's default) or M (4 CPU, 8 GiB)")
     launch.add_argument("--stack", action="store_true", help="With --cloud: a pod that can run a nested Docker stack (the Sysbox runtime class, its own user namespace, no capability added, no privileged mode). Off by default; the launch without it is unchanged. The first pod on a fresh node may wait for the node's runtime: the launcher retries")
+    launch.add_argument("--token-mode", choices=("default", "read-only"), help="With --cloud: the permissions of the worker's git token: default (contents and pull requests write) or read-only (contents read: the worker cannot push, open a pull request or comment). Wins over the settings key CW_TOKEN_MODE for this run; absent both: default")
     pending = sub.add_parser("pending", help="What is pending for an agent, and why it waits or is held")
     pending.add_argument("name", help="The agent's fleet name")
     pending.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead")

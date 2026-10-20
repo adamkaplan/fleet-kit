@@ -166,12 +166,14 @@ hash for the pod name. Shape rates are placeholders (`S` 0.10, `M` 0.20 USD/hour
 A guard is enforced where the action takes effect (the repository's rules, the token's scope), not in a wrapper.
 These two programs are the server side of that. Neither writes a file; neither prints a secret.
 
-**`app_token.py OWNER/REPO`** prints a one-hour GitHub App installation token for that one repository, and nothing
+**`app_token.py OWNER/REPO [--mode default|read-only]`** prints a one-hour GitHub App installation token for that one repository, and nothing
 else, on stdout. It refuses (exit 1, one line on stderr naming the key, never a value) to print a token unless:
 
 - the answer lists exactly the one repository and expires within 61 minutes, and
-- its `permissions` equal exactly `contents: write`, `pull_requests: write`, `metadata: read`: no extra key, no higher
-  level, none missing.
+- its `permissions` equal exactly the set of the requested mode, none other: no extra key, no higher level, none missing.
+  `default` (no `permissions` in the request) is `contents: write`, `pull_requests: write`, `metadata: read`; `read-only`
+  (the request carries exactly that `permissions` subset) is `contents: read`, `metadata: read`. The mode is an argument,
+  never read from the environment; an unknown, empty or repeated mode is a usage error (exit 2) before any vault call.
 
 The private key travels only through a pipe to `openssl`; only `https://api.github.com` is used (`CW_GITHUB_API_BASE`
 may name a loopback `http` address, for tests).

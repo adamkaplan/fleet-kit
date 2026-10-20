@@ -62,6 +62,7 @@ Each setting's name, whether the file requires it, and its kind (name, path, com
 | `CW_CLUSTER_ADMIN_SECRET` | no | secret-name | the name of the vault secret that holds the cluster administrator kubeconfig (default `cw-cluster-admin-kubeconfig`): 1 to 127 letters, digits and hyphens; the name, never its content |
 | `CW_CLUSTER_TOKEN_DURATION` | no | duration | the cluster token's requested life: 1 to 3 digits and `m` or `h`, from `1m` to `60m` (default `20m`; `1h` is the same as `60m`) |
 | `CW_GIT_TOKEN_CMD` | no | command | a command that prints the one-hour git token; default is the GitHub App mint beside the launcher (`app_token.py`) |
+| `CW_TOKEN_MODE` | no | name | `default` or `read-only`: the permissions of the worker's git token (see "Token modes" below); `launch --cloud --token-mode` wins for one run |
 | `CW_APP_ID_CMD`, `CW_APP_INSTALLATION_CMD`, `CW_APP_KEY_CMD` | no | command | commands that print the GitHub App's id, installation id and key instead of the vault read (`app_token.py`) |
 | `CW_VAULT_CHECK_DIR` | no (needed once the vault refuses this machine) | path | the checkout of the vault access check, an absolute path (see section 2b) |
 
@@ -103,6 +104,8 @@ CW_CLOUD_NAMESPACE=cw
 # CW_CLUSTER_ADMIN_SECRET=acme-cluster-admin
 # CW_CLUSTER_TOKEN_DURATION=20m
 # CW_GIT_TOKEN_CMD=/home/user/bin/print-git-token
+# optional: the git token's permissions, default or read-only
+# CW_TOKEN_MODE=read-only
 # CW_APP_ID_CMD=/home/user/bin/print-app-id
 # CW_APP_INSTALLATION_CMD=/home/user/bin/print-app-installation
 # CW_APP_KEY_CMD=/home/user/bin/print-app-key
@@ -174,6 +177,17 @@ What `launch` does with the check's exit code (every run writes one audit line, 
 | 40 or any other code, or no code (timed out) | the check failed | stops, exit 2: ask the owner of the vault access check |
 
 Nothing is created when it stops. The check's own output is never printed.
+
+## Token modes
+
+The worker's git token is a one-hour GitHub App installation token for the one repository. There are two modes, chosen per run:
+
+- `default`: `contents: write`, `pull_requests: write`, `metadata: read`. The request names no permissions (the App's whole set, as before) and the answer must carry exactly these.
+- `read-only`: `contents: read`, `metadata: read`. The request asks GitHub for exactly this subset (`POST /app/installations/{id}/access_tokens` takes an optional `permissions` object, a subset of what the App was granted) and the answer must carry exactly it.
+
+Choose with `launch --cloud --token-mode read-only` or the settings key `CW_TOKEN_MODE=read-only`. The flag wins for that run, in both directions, and one line on stderr says which source decided. Neither given: `default`. `CW_TOKEN_MODE` narrows a credential, so it is never read as unset or dropped: a blank value, or an environment value when the settings file exists but does not hold the key, is refused naming the key.
+
+A read-only worker can clone and read, and cannot push, open a pull request or comment: GitHub refuses each. `read-only` refuses to launch when `CW_GIT_TOKEN_CMD` is set (a custom command's permissions cannot be proved), before any token or pod. The repository preflight runs unchanged, so a short-lived default token exists on the launcher for seconds before a read-only run; the worker never holds it. The audit line `cloud.created` carries `access_mode` (`default` or `read-only`; the audit redacts any key with "token" in its name, so the field is not called token_mode; it never holds a token).
 
 ## 3. Run one worker
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """app-token: print a one-hour GitHub App installation token for ONE repository, to stdout, and nothing else.
 
-usage: app_token.py OWNER/REPO
+usage: app_token.py OWNER/REPO [--mode default|read-only]
 
 The App id, private key and installation id are read from the vault by commands (stdout of each, in memory only):
   CW_APP_ID_CMD, CW_APP_KEY_CMD, CW_APP_INSTALLATION_CMD
@@ -11,7 +11,8 @@ The App id, private key and installation id are read from the vault by commands 
 The key goes to `openssl dgst -sha256 -sign /dev/fd/N` through a pipe: never a file, an argument or the environment.
 The 9-minute app JWT and the token are never printed except the token, once, on stdout. Errors go to stderr, never a value.
 Only https://api.github.com is used; CW_GITHUB_API_BASE may name a loopback http URL (tests).
-The answer must carry EXACTLY the permissions below (no extra key, no higher level, none missing), else no token is printed.
+The answer must carry EXACTLY the permissions of the requested mode (PERMISSION_MODES: no extra key, no higher level, none missing), else no token
+is printed. The mode is an ARGUMENT of this command, never read from the environment (a process that sets a name must not change the request).
 CW_OPENSSL names the openssl binary (default openssl).
 """
 import base64
@@ -32,7 +33,14 @@ import token_mint  # noqa: E402
 API = "https://api.github.com"
 MAX_TOKEN_SECONDS = 61 * 60
 MAX_BYTES = 1_000_000  # the most of any GitHub answer or vault command output that is read
-EXPECTED_PERMISSIONS = {"contents": "write", "pull_requests": "write", "metadata": "read"}
+# THE table of modes and their permission sets. The request (read-only only) and the check of the answer are both derived from the row.
+# default sends no `permissions` object (the App's whole set, as always) and checks the answer for exactly its row.
+PERMISSION_MODES = {
+    "default": {"contents": "write", "pull_requests": "write", "metadata": "read"},
+    "read-only": {"contents": "read", "metadata": "read"},
+}
+DEFAULT_MODE = "default"
+EXPECTED_PERMISSIONS = PERMISSION_MODES[DEFAULT_MODE]
 
 
 def open_url(req, timeout=30):
@@ -118,22 +126,35 @@ def api_base():
     return base.rstrip("/")
 
 
-def check_permissions(perms):
-    """Refuse unless perms is exactly EXPECTED_PERMISSIONS. Names a key, never a value."""
+def check_permissions(perms, mode=DEFAULT_MODE):
+    """Refuse unless perms is exactly the set of the mode. Names a key, never a value."""
+    if mode not in PERMISSION_MODES:
+        die("refusing: unknown token mode", 2)
+    expected = PERMISSION_MODES[mode]
     if not isinstance(perms, dict):
         die("refusing: the answer carries no permissions object")
     for k in sorted(perms):
-        if k not in EXPECTED_PERMISSIONS:
+        if k not in expected:
             die("refusing: the token carries an extra permission: %s" % str(k)[:40])
-    for k, want in EXPECTED_PERMISSIONS.items():
+    for k, want in expected.items():
         if k not in perms:
             die("refusing: the token lacks the permission: %s" % k)
         if perms[k] != want:
             die("refusing: the token has a different level for the permission: %s" % k)
 
 
-def mint(target):
-    """Return a token for target (OWNER/REPO), or exit through die(). Never prints."""
+def request_body(repo, mode):
+    """The body of the token request for a mode: default carries the repository only; any other mode carries exactly its permissions."""
+    body = {"repositories": [repo]}
+    if mode != DEFAULT_MODE:
+        body["permissions"] = dict(PERMISSION_MODES[mode])
+    return body
+
+
+def mint(target, mode=DEFAULT_MODE):
+    """Return a token for target (OWNER/REPO) in a mode, or exit through die(). Never prints."""
+    if mode not in PERMISSION_MODES:
+        die("refusing: unknown token mode", 2)
     repo = target.split("/", 1)[1]
     app_id = vault("CW_APP_ID_CMD", "cw-app-id").strip()
     inst = vault("CW_APP_INSTALLATION_CMD", "cw-app-installation-id").strip()
@@ -147,7 +168,7 @@ def mint(target):
     jwt = signing + "." + b64(sign(key, signing.encode()))
     del key
     req = urllib.request.Request("%s/app/installations/%s/access_tokens" % (api_base(), inst),
-                                 data=json.dumps({"repositories": [repo]}).encode(), method="POST",
+                                 data=json.dumps(request_body(repo, mode)).encode(), method="POST",
                                  headers={"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json",
                                           "Content-Type": "application/json", "X-GitHub-Api-Version": "2022-11-28",
                                           "User-Agent": "cw-app-token"})
@@ -176,14 +197,24 @@ def mint(target):
         die("the answer has no readable expiry")
     if exp - dt.datetime.now(dt.timezone.utc).timestamp() > MAX_TOKEN_SECONDS:
         die("refusing: the token lives longer than 61 minutes")
-    check_permissions(ans.get("permissions"))
+    check_permissions(ans.get("permissions"), mode)
     return token
 
 
+def parse_args(argv):
+    """(target, mode) from `OWNER/REPO [--mode MODE]`; a usage error (status 2, before any vault or network call) for anything else:
+    an unknown, empty or repeated mode, an unknown option, a missing target."""
+    if not argv or not valid_target(argv[0]) or len(argv) not in (1, 3) or (len(argv) == 3 and argv[1] != "--mode"):
+        die("usage: app_token.py OWNER/REPO [--mode %s]" % "|".join(PERMISSION_MODES), 2)
+    mode = argv[2] if len(argv) == 3 else DEFAULT_MODE
+    if mode not in PERMISSION_MODES:
+        die("usage: --mode is one of %s" % ", ".join(PERMISSION_MODES), 2)
+    return argv[0], mode
+
+
 def main(argv):
-    if len(argv) != 1 or not valid_target(argv[0]):
-        die("usage: app_token.py OWNER/REPO", 2)
-    sys.stdout.write(mint(argv[0]))
+    target, mode = parse_args(argv)
+    sys.stdout.write(mint(target, mode))
     sys.stdout.flush()
 
 
