@@ -1,7 +1,7 @@
 """The settings file (#876, slice 1): the one reader `apply_settings`, its refusals, and the driver's use of it. Offline, no cluster.
 
 Every set below is derived from the code's own tables (SETTINGS, SECRET_SHAPES), with a completeness test, so a new member that has no case here fails."""
-import io, json, os, stat, sys, tempfile, unittest
+import io, json, os, re, stat, sys, tempfile, unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
@@ -36,7 +36,7 @@ HOSTILE = {   # per key: values that must be refused (each through the REAL pars
                        "a@sha256:" + "ab12" * 16 + "@sha256:" + "ab12" * 16, "reg.example/../x@sha256:" + "ab12" * 16, "x//y@sha256:" + "ab12" * 16],
     "CW_CLOUD_SERVER": ["http://169.254.169.254", "file:///x", "-flag", "x y", "cluster.example.internal", "https://user@host.example", "https://host.example/path",
                         "https://host.example?x=1", "https://host.example#f", "https://127.0.0.1", "https://localhost", "https://169.254.169.254", "https://[::1]",
-                        "https://0.0.0.0", "https://2130706433", "https://metadata.google.internal", "https://host.example:99999", "https://0x7f000001", "https://2130706433", "https://017700000001", "https://127.1", "https://0177.0.0.1", "https://0x7f.0.0.1", "https://localhost.", "https://host.example.", "https://a.0x7f", "https://10.0.0.4", "https://192.168.1.1", "https://100.64.0.1", "https://[fd00:ec2::254]", "https://[fe80::1]", "https://224.0.0.1", "https://[::ffff:10.0.0.1]", "https://0x7f000001:6443", "https://12345", "https://1.2.3", "https://host.example:abc",
+                        "https://0.0.0.0", "https://2130706433", "https://metadata.google.internal", "https://host.example:99999", "https://a.localhost", "https://metadata", "https://[ff0e::1]", "https://[::ffff:8.8.8.8]", "https://[64:ff9b::808:808]", "https://[2002:808:808::1]", "https://[2001:0:4136:e378:8000:63bf:3fff:fdd2]", "https://[2606:4700:4700::1111%25eth0]", "https://[2606:4700:4700::1111%eth0]", "https://host.example\t", "https://ho\tst.example", "https://host.example\x0b", "https://8.8.8.8 :6443", "https://8.8.8.8\x1f", "https://0x7f000001", "https://017700000001", "https://127.1", "https://0177.0.0.1", "https://0x7f.0.0.1", "https://host.example.", "https://a.0x7f", "https://10.0.0.4", "https://192.168.1.1", "https://100.64.0.1", "https://[fd00:ec2::254]", "https://[fe80::1]", "https://224.0.0.1", "https://[::ffff:10.0.0.1]", "https://0x7f000001:6443", "https://12345", "https://1.2.3", "https://host.example:abc",
                         "https://", "https://ho st.example", "https://[::ffff:127.0.0.1]", "ftp://host.example", "https://host.example\\x"],
     "CW_CLOUD_CA_FILE": ["relative.pem", "/home/user/../etc/x", "-x", "$HOME/x"],
     "CW_PULL_SECRET": ["A_B", "a b", "-", "a/b", "$(x)", "UPPER"],
@@ -51,7 +51,7 @@ HOSTILE = {   # per key: values that must be refused (each through the REAL pars
     "CW_APP_INSTALLATION_CMD": ["-x"], "CW_APP_KEY_CMD": ["-x"],
     "CW_VAULT_CHECK_DIR": ["check", "/a/../b", "-x"],
 }
-CONTROL = ["\x00", "\r", "\x0b", "\x0c", "\x1c", "\x1b", "\x7f", "\x01"]
+CONTROL = ["\t", "\x00", "\r", "\x0b", "\x0c", "\x1c", "\x1b", "\x7f", "\x01"]
 
 
 def body(values):
@@ -161,11 +161,33 @@ class ValueRules(Dir):
             self.assertTrue(server("https://0x7f000001"))   # the 0x rule removed: the hex alias gets through
             self.assertFalse(server("https://2130706433"))  # (the letter rule still holds the all-digit ones)
         with mock.patch.object(cw, "_has_letter", lambda label: True):
-            self.assertTrue(server("https://2130706433") is False)   # the digit rule alone refuses it
-            self.assertTrue(server("https://127.1") is False)
+            self.assertFalse(server("https://2130706433"))   # the digit rule alone refuses it
+            self.assertFalse(server("https://127.1"))
         with mock.patch.object(cw, "_has_letter", lambda label: True), mock.patch.object(cw, "_integer_host_label", lambda label: False):
             for alias in ("https://2130706433", "https://127.1", "https://017700000001", "https://0x7f.0.0.1", "https://0177.0.0.1"):
                 self.assertTrue(server(alias), alias)   # both rules removed: every alias gets through
+
+    def test_each_server_sub_rule_is_caught_only_by_its_own_hostile_value(self):
+        server = cw.VALIDATORS["CW_CLOUD_SERVER"][1]
+        cases = (("_REFUSED_HOSTS", (), "https://metadata"), ("_REFUSED_HOSTS", (), "https://localhost"), ("_REFUSED_SUFFIX", ".never-matches", "https://a.localhost"),
+                 ("_BAD_CHARS", re.compile("(?!)"), "https://8.8.8.8\t:6443"), ("_BAD_CHARS", re.compile("(?!)"), "https://cluster.example.be\n"),
+                 ("_BAD_CHARS", re.compile("(?!)"), "https://[2606:4700:4700::1111%25eth0]"), ("_V4_EMBEDDING_NETS", (), "https://[::ffff:8.8.8.8]"),
+                 ("_V4_EMBEDDING_NETS", (), "https://[64:ff9b::808:808]"))
+        for name, replacement, value in cases:
+            with self.subTest(rule=name, value=value):
+                self.assertFalse(server(value))
+                with mock.patch.object(cw, name, replacement):
+                    self.assertTrue(server(value), "with %s removed the value is still refused: the case does not test it" % name)
+        for value in ("https://[ff0e::1]", "https://224.0.0.1"):
+            with self.subTest(rule="_multicast", value=value):
+                self.assertFalse(server(value))
+                with mock.patch.object(cw, "_multicast", lambda ip: False):
+                    self.assertTrue(server(value))
+
+    def test_the_server_rule_judges_the_string_as_written(self):
+        server = cw.VALIDATORS["CW_CLOUD_SERVER"][1]
+        for value in ("https://127.0.0.1\t", "https://host\t.example", "https://8.8.8.8\n", "https://8.8.8.8\r", "https://cluster.example.be\x00"):
+            self.assertFalse(server(value), repr(value))
 
     def test_a_bad_file_leaves_the_environment_byte_identical(self):
         env = dict(GOOD, CW_TOOLING_REPO="acme-org/tooling", HOME="/home/user")

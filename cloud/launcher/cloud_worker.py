@@ -1099,6 +1099,9 @@ _GUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}
 _BARE_PROGRAM = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._+-]*")
 _NUMBER = re.compile(r"[0-9]+(?:\.[0-9]+)?")
 _REFUSED_HOSTS = ("localhost", "metadata", "metadata.google.internal")
+_REFUSED_SUFFIX = ".localhost"
+_BAD_CHARS = re.compile(r"[\s\x00-\x1f\x7f%?#@\\]")   # urlsplit silently drops a tab, CR or LF: judge the string as written, so none may be there
+_V4_EMBEDDING_NETS = tuple(__import__("ipaddress").ip_network(n) for n in ("::ffff:0:0/96", "64:ff9b::/96", "2002::/16", "2001::/32"))   # IPv4-mapped, NAT64, 6to4, Teredo
 
 
 def _integer_host_label(label):
@@ -1110,9 +1113,18 @@ def _has_letter(label):
     return any(c.isalpha() for c in label)
 
 
+def _embeds_ipv4(ip):
+    """An IPv6 literal that carries an IPv4 address inside (mapped, NAT64, 6to4, Teredo): a cluster address has no use for one, and it can reach a loopback or private address."""
+    return ip.version == 6 and any(ip in net for net in _V4_EMBEDDING_NETS)
+
+
+def _multicast(ip):
+    return ip.is_multicast
+
+
 def _server_ok(value):
     import ipaddress
-    if not value.startswith("https://") or any(c in value for c in "?#@\\ "):
+    if not value.startswith("https://") or _BAD_CHARS.search(value):
         return False
     try:
         parts = urllib.parse.urlsplit(value)
@@ -1127,11 +1139,9 @@ def _server_ok(value):
     except ValueError:
         low = host.lower()
         last = low.rsplit(".", 1)[-1]   # an all-numeric or hex-looking last label (2130706433, 127.1, 0x7f000001, 0177.0.0.1) is an integer host a resolver may read as an address
-        return (bool(_HOST.fullmatch(host)) and low not in _REFUSED_HOSTS and not low.endswith(".localhost") and _has_letter(last)
+        return (bool(_HOST.fullmatch(host)) and low not in _REFUSED_HOSTS and not low.endswith(_REFUSED_SUFFIX) and _has_letter(last)
                 and not _integer_host_label(last))
-    if getattr(ip, "ipv4_mapped", None):
-        ip = ip.ipv4_mapped
-    return ip.is_global and not ip.is_multicast   # not loopback, link-local, private, shared, reserved, unspecified or a metadata address
+    return ip.is_global and not _multicast(ip) and not _embeds_ipv4(ip)   # not loopback, link-local, private, shared, reserved, unspecified, multicast or a metadata address
 
 
 def _allowed_ok(value):
@@ -1236,7 +1246,8 @@ def parse_settings(text, path="the settings file"):
     line number and the key, never the value. An empty value counts as not set."""
     values = {}
     for number, line in enumerate(text.split("\n"), 1):
-        bad = [c for c in line if (ord(c) < 32 and c != "\t") or ord(c) == 127]
+        lead = line.lstrip(" \t")   # a tab is allowed in leading indentation and inside a comment line, nowhere else
+        bad = [c for c in lead if (ord(c) < 32 and not (c == "\t" and lead.startswith("#"))) or ord(c) == 127]
         if bad:
             key = line.split("=", 1)[0].strip() if "=" in line and line.split("=", 1)[0].strip() in SETTING_KINDS else None
             raise _bad(path, "line %d%s has a control character (a NUL, a carriage return or another: use plain LF text)" % (number, " (%s)" % key if key else ""))
