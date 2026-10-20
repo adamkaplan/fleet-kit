@@ -23497,6 +23497,7 @@ BLOCK_FLAG_TABLE = (   # (flag, dest, mode): `refused` (the block carries it: gi
     ("--reviewer", "reviewer", "accepted"), ("--summary", "summary", "accepted"),
     ("--verdict", "verdict", "refused"), ("--head", "head", "refused"), ("--blocks", "blocks", "refused"), ("--notes", "notes", "refused"), ("--impact-action", "impact_action", "refused"),
     ("--impact-class", "impact_class", "wins"), ("--impact-severity", "impact_severity", "wins"), ("--impact-probability", "impact_probability", "wins"), ("--impact-reason", "impact_reason", "wins"),
+    ("--confirms-carry", "confirms_carry", "accepted"),   # (#815) a flag with no value: the reviewer's own confirmation, never a line of the block
 )
 
 

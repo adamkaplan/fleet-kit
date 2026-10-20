@@ -14928,6 +14928,18 @@ class TestClearCarryInTheDaemon(Base):
         self.assertEqual(([w for w in self.writes if w[1].endswith("/pulls/7")], self.body), ([], before))
         self.assertFalse(sb.pr_marker_state([], self.body, now=0)["captain"], "the gate reads no hold from the text")
 
+    def test_891_a_carried_clear_touches_no_hold_label_and_a_re_hold_never_writes_the_owners_own_hold(self):
+        owner_hold = self.names[sb.OWNER_HOLD_KEY]
+        self.clear()
+        self.writes.clear()
+        new = self.merge_main()
+        self.assertEqual(self.hold(new, labels=(owner_hold,)), 0)
+        self.assertEqual((len(self.events("gate.clear_carried")), self.writes), (1, []), "carried: no label is added, adopted or removed, the owner's own hold included")
+        self.writes.clear()
+        changed = self.api.rev("feature")
+        self.assertEqual(self.hold(changed, labels=(owner_hold,)), 0)   # the same head again: still nothing
+        self.assertEqual([w for w in self.adds() if owner_hold in json.dumps(w)], [], "the owner's own hold is never written by the daemon")
+
     def test_830_a_pure_merge_carry_is_not_held_again_and_a_changed_pull_request_is(self):
         self.clear()
         new = self.merge_main()
@@ -33390,7 +33402,8 @@ class TestBlockTable(LedgerBase):
         return self.run_as("coder", "review", "record", self.PR, "--reviewer", reviewer, "--block", self.block(extra, "impact-action: none\n" if reviewer == "impact" else ""), *more)
 
     ROW_FLAGS = {"--verdict": ("approve",), "--head": (LEDGER_HEAD,), "--blocks": ("1",), "--notes": ("1",), "--impact-action": ("none",),
-                 "--impact-class": ("data",), "--impact-severity": ("Marginal",), "--impact-probability": ("Remote",), "--impact-reason": ("a reason",), "--summary": ("one line",)}
+                 "--impact-class": ("data",), "--impact-severity": ("Marginal",), "--impact-probability": ("Remote",), "--impact-reason": ("a reason",), "--summary": ("one line",),
+                 "--confirms-carry": ()}   # (#815) a flag with no value: stored as True
 
     def test_the_table_has_every_record_flag_once(self):
         parser = sb.build_parser()
@@ -33419,7 +33432,7 @@ class TestBlockTable(LedgerBase):
                     self.assertEqual(code, 0, err)
                     self.assertEqual(len(self.records()), before + 1)
                     if flag != "--summary":
-                        self.assertEqual(self.records()[-1][dest], self.ROW_FLAGS[flag][0])
+                        self.assertEqual(self.records()[-1].get("carry_confirmed" if dest == "confirms_carry" else dest), (self.ROW_FLAGS[flag] or (True,))[0])
         code, out, err = self.record("--blocks", "0", "--notes", "0")
         self.assertEqual(code, 0, err)   # 0 is the default: cannot be told from absent
 
@@ -34023,7 +34036,9 @@ class TestImpactRejudge(LedgerBase):
         if expected:
             self.assertIn(label, record["added"], "an adopted label is in the record a daemon-added label is kept in")
             self.assertEqual(record["merge_label_added"], self.names["merge-captain"] in record["added"])
-            self.assertEqual(sorted(record), ["added", "at", "head", "merge_label_added"], "the record keeps its shape")
+            rehold = case == "hand_rehold_wants_it"   # (#815) the record carries `rehold: True` ONLY when the pass was a re-hold (the sweep reads it); an adoption of any other case does not
+            self.assertEqual(sorted(record), ["added", "at", "head", "merge_label_added"] + (["rehold"] if rehold else []), "the record keeps its shape")
+            self.assertEqual(record.get("rehold"), True if rehold else None, "the re-hold mark is written for a re-hold and for nothing else")
         elif case in ("not_holds_by_hand", "cleared_this_head", "cleared_other_head_rated_here"):
             self.assertIsNone(record if case != "cleared_this_head" else None, "nothing was written")
         if case in ("hand_floor_holds", "cleared_other_head_floor_holds") and not wanted_by_floor:
