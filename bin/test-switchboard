@@ -57517,27 +57517,6 @@ class TestMadeUpPids(unittest.TestCase):
                     add(node.elts[2], "row pgid")
         return sorted(set(hits))
 
-    @staticmethod
-    def sorted_against_a_positional_list(source, skip=("TestMadeUpPids",)):
-        """[line]: an assertion that sets `sorted(...)` of made-up numbers against a list LITERAL of two or more of them in the order they were asked for. The
-        numbers ascend only while the helper does not wrap at the top of the range, so the expected side is sorted too (`sorted([...])`)."""
-        tree = ast.parse(source)
-        skipped = {id(inner) for node in tree.body if isinstance(node, ast.ClassDef) and node.name in skip for inner in ast.walk(node)}
-        is_px = lambda n: isinstance(n, ast.Subscript) and isinstance(n.value, ast.Attribute) and n.value.attr == "px"
-        is_sorted = lambda n: isinstance(n, ast.Call) and getattr(n.func, "id", None) == "sorted"
-        hits = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and getattr(node.func, "attr", "") in ("assertEqual", "assertListEqual", "assertSequenceEqual") and id(node) not in skipped:
-                if any(is_sorted(a) for a in node.args[:2]):
-                    hits.extend(a.lineno for a in node.args[:2] if isinstance(a, (ast.List, ast.Tuple)) and sum(1 for x in ast.walk(a) if is_px(x)) >= 2)
-        return sorted(set(hits))
-
-    def test_no_test_sets_sorted_made_up_numbers_against_an_unsorted_list_of_them(self):
-        self.assertEqual(self.sorted_against_a_positional_list(Path(__file__).read_text()), [])
-        mutant = "self.assertEqual(sorted(sent), [self.px[1], self.px[2]])"
-        self.assertEqual(len(self.sorted_against_a_positional_list(mutant)), 1)
-        self.assertEqual(self.sorted_against_a_positional_list("self.assertEqual(sorted(sent), sorted([self.px[1], self.px[2]]))"), [])
-
     def test_no_integer_literal_stands_in_for_a_process_anywhere_in_the_test_file(self):
         self.assertEqual(self.pid_literals(Path(__file__).read_text()), [])
 
@@ -57551,30 +57530,91 @@ class TestMadeUpPids(unittest.TestCase):
             with self.subTest(clean=clean):
                 self.assertEqual(self.pid_literals(clean), [])
 
-    def test_s4_each_group_that_stands_in_for_a_process_passes_when_its_old_numbers_are_the_real_parent_and_grandparent(self):
+    @staticmethod
+    def all_subclasses(base):
+        found = []
+        for cls in base.__subclasses__():
+            found += [cls] + TestMadeUpPids.all_subclasses(cls)
+        return list(dict.fromkeys(found))
+
+    @staticmethod
+    def stand_in_tests_of(cls):
+        """The tests of `cls` that ask for a made-up number, found from the code: a test whose source, or the source of `setUp` or of a method of the class it
+        calls (followed through, as far as it goes), mentions `self.px` or `made_up_pid`. A class whose `setUp` asks makes every test of it one."""
+        def mentions(name, seen):
+            if name in seen:
+                return False
+            seen.add(name)
+            member = getattr(cls, name, None)
+            if member is None or not callable(member):
+                return False
+            try:
+                source = inspect.getsource(member)
+            except (OSError, TypeError):
+                return False
+            if "self.px" in source or "made_up_pid" in source:
+                return True
+            return any(mentions(called, seen) for called in set(re.findall(r"self\.(\w+)\(", source)) if hasattr(cls, called))
+        return [n for n in dir(cls) if n.startswith("test") and callable(getattr(cls, n)) and (mentions("setUp", set()) or mentions(n, {"setUp"}))]
+
+    def stand_in_groups(self):
         module = sys.modules[__name__]
-        groups = {"daemon command": [(TestDaemonCommand, None)],
-                  "heavy watchdog": [(TestHeavyWatchdog, None)],
-                  "heavy queue and fifo": [(TestHeavyQueueLogic, None), (TestHeavyFifo, None)],
-                  "orphan reaper": [(TestLaunch, name) for name in (
-                      "test_the_orphan_allow_list_picks_only_exact_matches_of_this_user_past_the_grace_and_never_a_protected_target",
-                      "test_the_reap_is_a_dry_run_by_default_signals_term_then_kill_audited_and_refuses_a_stranger_and_the_kill_switch",
-                      "test_a_pid_whose_command_changed_before_the_signal_is_not_signalled_and_the_orphan_config_is_validated")],
-                  "headless restart notice": [(TestHeadlessRestartNotice, None)],
-                  "heavy readiness": [(TestHeavySlotsReadiness, "test_the_readiness_decision_is_the_final_record_not_the_lock_and_not_the_wrappers_first_record")]}
-        for group, members in groups.items():
-            real_parent = ("test_odd_file_names_in_the_state_directory_are_left_alone_and_never_stop_the_wrapper",)   # it uses the REAL parent as its live process
-            chosen = [(cls, n) for cls, name in members
-                      for n in ([name] if name else [n for n in dir(cls) if n.startswith("test") and callable(getattr(cls, n)) and n not in real_parent])]
-            parent, grand = 4243, 4242      # the old made-up numbers become the real parent and grandparent of this run
-            for base in (4240, _pid_limit() - 2):   # and once from near the top of the range, where the helper wraps to small numbers: no test may depend on the order
-                suite, result = unittest.TestSuite(cls(n) for cls, n in chosen), unittest.TestResult()   # a suite empties itself when it runs: one per base
-                with mock.patch.object(os, "getppid", lambda: parent), mock.patch.object(module, "_ancestors", lambda: {os.getpid(), parent, grand}), \
+        real_parent = ("test_odd_file_names_in_the_state_directory_are_left_alone_and_never_stop_the_wrapper",)   # it uses the REAL parent as its live process
+        return {cls.__name__: [n for n in self.stand_in_tests_of(cls) if n not in real_parent] for cls in self.all_subclasses(StandInPids)
+                if cls is not TestMadeUpPids and cls.__module__ == module.__name__}
+
+    def run_groups(self, groups, bases):
+        """Each group with 4243 and 4242 as the real parent and grandparent, once per base. [(group, base, tests run, failures, numbers handed out, wrapped)]."""
+        module, runs = sys.modules[__name__], []
+        for group, names in groups.items():
+            cls = getattr(module, group)
+            for base in bases:
+                suite, result = unittest.TestSuite(cls(n) for n in names), unittest.TestResult()   # a suite empties itself when it runs: one per base
+                given = set(_MADE_UP_GIVEN)
+                with mock.patch.object(os, "getppid", lambda: 4243), mock.patch.object(module, "_ancestors", lambda: {os.getpid(), 4243, 4242}), \
                         mock.patch.object(module, "_MADE_UP_NEXT", [base]):
                     suite.run(result)
-                with self.subTest(group=group, base=base):
-                    self.assertGreater(result.testsRun, 0)
-                    self.assertEqual([str(e[0]) for e in result.failures + result.errors], [])
+                handed = sorted(_MADE_UP_GIVEN - given)
+                runs.append((group, base, result.testsRun, [str(e[0]) for e in result.failures + result.errors], len(handed), bool(handed) and handed[0] < base))
+        return runs
+
+    def assert_wrapped(self, runs, groups):
+        """The run from the top of the range happened and the helper wrapped in it, for every group that asked for more numbers than fit above the base."""
+        top = _pid_limit() - 2
+        for group, names in groups.items():
+            mine = [r for r in runs if r[0] == group and r[1] == top]
+            self.assertEqual(len(mine), 1, "no run from the top of the range for %s" % group)
+            if mine[0][4] > 3:
+                self.assertTrue(mine[0][5], "the helper asked for %d numbers from the top and never wrapped for %s" % (mine[0][4], group))
+        self.assertTrue(any(r[5] for r in runs), "no group wrapped at all")
+
+    def test_every_class_that_stands_in_for_a_process_passes_when_its_old_numbers_are_the_real_parent_and_grandparent_from_both_ends_of_the_range(self):
+        """Derived, not listed: every subclass of StandInPids, every test of it that asks for a made-up number, with the old numbers as the real parent and
+        grandparent, from base 4240 and from the top of the range (where the helper wraps to small numbers, so no test may depend on the order of numbers)."""
+        groups = {g: names for g, names in self.stand_in_groups().items() if names}
+        self.assertGreaterEqual(len(groups), 5)
+        runs = self.run_groups(groups, (4240, _pid_limit() - 2))
+        for group, base, ran, failed, handed, wrapped in runs:
+            with self.subTest(group=group, base=base):
+                self.assertGreater(ran, 0)
+                self.assertEqual(failed, [])
+        self.assert_wrapped(runs, groups)
+
+    def test_dropping_the_run_from_the_top_of_the_range_fails_the_wrap_assertion(self):
+        groups = {"TestHeavyWatchdog": ["test_s10_only_the_group_or_tree_the_wrapper_started_is_signalled_never_another_process"]}   # it asks for more than 3 numbers
+        with self.assertRaises(AssertionError):
+            self.assert_wrapped(self.run_groups(groups, (4240,)), groups)                        # the mutant: only the low base
+        self.assert_wrapped(self.run_groups(groups, (4240, _pid_limit() - 2)), groups)           # the real thing passes
+
+    def test_the_fake_herdrs_pane_shell_number_is_made_up_from_either_end_of_the_range(self):
+        module = sys.modules[__name__]
+        for base in (4240, _pid_limit() - 2):
+            with mock.patch.object(module, "_MADE_UP_NEXT", [base]), mock.patch.object(module, "_ancestors", lambda: {os.getpid(), 4243, 4242}), \
+                    mock.patch.object(os, "getppid", lambda: 4243):
+                herdr = FakeHerdr(mock.Mock())
+                self.assertEqual(herdr.shell_pid, herdr.shell_pid)
+                self.assertNotIn(herdr.shell_pid, (os.getpid(), 4243, 4242))
+                self.assertFalse(_pid_alive(herdr.shell_pid))
 
     def test_the_old_numbers_are_never_handed_out_when_they_are_the_parent_and_grandparent(self):
         module = sys.modules[__name__]
