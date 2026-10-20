@@ -54,6 +54,8 @@ SETUP_PREAMBLE = """Setup (do this first, before the task below):
 
 Task:
 """
+READ_ONLY_LINE = ("Note: the git token is read-only. The clone works; do not try to push or to open a pull request or a comment (GitHub refuses them). "
+                  "Report what you found in your answer instead.\n\n")   # a hint: the control is the token's own permissions
 RECORD_MAX = 8192
 PASSWORD_MAX = 512
 LAUNCH_SECONDS = 900                      # `create` returns only once the worker answers
@@ -1017,10 +1019,35 @@ def model_entry():
     return json.dumps({MODEL_PROVIDER: entry})
 
 
-def git_token(repo, cluster):
-    """The one-hour git token for ONE repository: CW_GIT_TOKEN_CMD, else the mint (cloud/launcher/app_token.py REPO), as the driver does."""
+TOKEN_MODES = ("default", "read-only")   # the mint's table of modes (cloud/launcher/app_token.py PERMISSION_MODES); the test compares the two
+
+
+def token_mode(args, environ=None):
+    """(mode, source) for this launch: the flag wins, else the settings key CW_TOKEN_MODE, else default. The source is "the flag", "the settings"
+    or None (neither chose). A key value that is not a mode is refused naming the key, never the value."""
+    environ = os.environ if environ is None else environ
+    flag = getattr(args, "token_mode", None)
+    if flag is not None:
+        if flag not in TOKEN_MODES:
+            raise Refusal("--token-mode is one of %s; nothing was created" % ", ".join(TOKEN_MODES))
+        return flag, "the flag"
+    key = environ.get("CW_TOKEN_MODE")
+    if key:
+        if key not in TOKEN_MODES:
+            raise Refusal("CW_TOKEN_MODE must be exactly %s; nothing was created" % " or ".join(TOKEN_MODES))
+        return key, "the settings"
+    return "default", None
+
+
+def git_token(repo, cluster, mode="default"):
+    """The one-hour git token for ONE repository: CW_GIT_TOKEN_CMD, else the mint (cloud/launcher/app_token.py REPO [--mode read-only]), as the driver
+    does. The mode is an argument of the mint, never an environment name. A read-only token is never claimed from a custom command."""
     raw = os.environ.get("CW_GIT_TOKEN_CMD")
+    if raw and mode != "default":
+        raise Refusal("--token-mode %s does not combine with CW_GIT_TOKEN_CMD (a custom command's permissions cannot be proved); nothing was created" % mode)
     argv = shlex.split(raw) if raw else [sys.executable, str(Path(__file__).resolve().parent.parent / "cloud" / "launcher" / "app_token.py"), repo]
+    if mode != "default":
+        argv += ["--mode", mode]
     env = {k: v for k, v in os.environ.items() if k not in CLUSTER_DROP}
     ran = _capture(argv, env=dict(env, GH_REPO=repo))
     token = (ran[1] if ran and ran[0] == 0 else "").strip()
@@ -1072,6 +1099,11 @@ def _launch(args, runner, now, reserve):
     source = use_settings()   # before any setting is read: the allow-list, the preflight and the launcher all read this one source
     print("%s: cloud settings from %s" % (H["PROG"], source), file=sys.stderr)
     check_allowed(repo)   # before anything is read, minted or created
+    mode, decided_by = token_mode(args)
+    if decided_by:
+        print("%s: git token mode %s (from %s)" % (H["PROG"], mode, decided_by), file=sys.stderr)
+    if mode != "default" and os.environ.get("CW_GIT_TOKEN_CMD"):   # before the preflight (which mints a token), any token or pod
+        raise Refusal("--token-mode %s does not combine with CW_GIT_TOKEN_CMD (a custom command's permissions cannot be proved); nothing was created" % mode)
     if getattr(args, "stack", False) and args.shape and args.shape not in LAUNCHER_SHAPES:   # exact membership in a tuple; after the allow-list, before the preflight, any token or call
         raise Refusal("--shape %r is not a pod shape (%s); nothing was created" % (str(args.shape)[:40], " or ".join(LAUNCHER_SHAPES)))
     try:   # the repository preflight, before any token is minted; FAIL CLOSED: a missing, killed or silent program refuses (stdout stays the one JSON line)
@@ -1100,7 +1132,7 @@ def _launch(args, runner, now, reserve):
     with Cluster(recovery) as cluster:
         model = model_entry()
         cluster.add(model)
-        token = git_token(repo, cluster)
+        token = git_token(repo, cluster, mode)
         cluster.add(token)
         read_fd, write_fd = os.pipe()
         try:
@@ -1120,7 +1152,7 @@ def _launch(args, runner, now, reserve):
                     os.close(write_fd)
             del model, token
             if code != 0:
-                _audit(engine, "cloud.create_failed", name, {"exit": code, "reason": _one(note, 160)})
+                _audit(engine, "cloud.create_failed", name, {"exit": code, "reason": _one(note, 160), "access_mode": mode})
                 raise LaunchError("the cloud worker was not created: %s" % _reason(code, note))
             try:
                 password = _read_password(read_fd)
@@ -1144,7 +1176,8 @@ def _launch(args, runner, now, reserve):
             _stop_after_failure(engine, runner, name, run_id, "launch: record not stored", cluster)
             raise LaunchError("the worker was created but its record could not be stored (%s); stop was requested" % _one(cluster.clean(str(err), 100), 100)) from None
         _audit(engine, "cloud.created", name, {"runtime_id": record["runtime_id"], "host": urllib.parse.urlsplit(record["url"]).hostname,
-                                               "idle_deadline": record.get("idle_deadline"), "hard_deadline": record.get("hard_deadline")})
+                                               "idle_deadline": record.get("idle_deadline"), "hard_deadline": record.get("hard_deadline"),
+                                               "access_mode": mode})
         try:   # a local agent may have taken the name while the pod was being made; discovery that cannot answer counts as a failure (cannot tell)
             taken = engine.discover(engine.now()).agents.get(name) is not None
             problem = "a local fleet agent named %s appeared while the pod was being made" % name if taken else None
@@ -1165,7 +1198,7 @@ def _launch(args, runner, now, reserve):
                 record["session"] = session
                 save_record(state, record)
                 if brief:
-                    v2.prompt(session, SETUP_PREAMBLE % {"repo": repo, "branch": branch} + brief, {"fleet": {"from": "switchboard", "brief": True}})
+                    v2.prompt(session, SETUP_PREAMBLE % {"repo": repo, "branch": branch} + (READ_ONLY_LINE if mode == "read-only" else "") + brief, {"fleet": {"from": "switchboard", "brief": True}})
         except (H["V2Error"], H["V2Unreachable"], CloudError, OSError, KeyError, TypeError) as err:
             stopped = _stop_after_failure(engine, runner, name, run_id, "launch failed: %s" % _one(cluster.clean(str(err), 80), 80), cluster)
             if stopped:

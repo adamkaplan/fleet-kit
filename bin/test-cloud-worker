@@ -2113,6 +2113,248 @@ class TestVaultCheckProcess(VaultBase):
         holder.join(30)
 
 
+class TestTokenMode(Base):
+    """#960: `launch --cloud --token-mode default|read-only` and the settings key CW_TOKEN_MODE. The mint itself (the request and the answer check) is
+    cloud/launcher/tests/test_token_mode.py; here the launch is real and the mint is a recorder that answers a synthetic token."""
+
+    DIGEST = "registry.example.internal/acme/worker@sha256:" + "ab12" * 16
+
+    def setUp(self):
+        super().setUp()
+        os.environ.pop("CW_GIT_TOKEN_CMD", None)   # the real mint path (recorded, never run): a custom command is the refusal's own case
+        self.cw = sb.load_module("cloud_worker").bind(sb.__dict__)
+        self.trace = self.home / "trace.log"
+        marker = ["sh", "-c", 'echo preflight >> "%s"; echo "preflight: preflight ok: deletion, non_fast_forward, pull_request"' % self.trace]
+        hook = mock.patch.object(sb.load_module("cloud_worker").bind(sb.__dict__)._lib(), "PREFLIGHT_ARGV", marker)
+        hook.start()
+        self.addCleanup(hook.stop)
+        self.mints = []
+        os.environ.pop("CW_TOKEN_MODE", None)
+        real = self.cw._capture
+
+        def capture(argv, *a, **kw):
+            if argv and str(argv[1] if len(argv) > 1 else "").endswith("app_token.py"):
+                self.mints.append(list(argv[2:]))
+                with open(self.trace, "a") as f:
+                    f.write("mint\n")
+                return 0, GIT_TOKEN + "\n", ""
+            return real(argv, *a, **kw)
+        patch = mock.patch.object(self.cw, "_capture", capture)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def settings_file(self, **extra):
+        path = self.home / "cloud.env"
+        values = {"CW_ALLOWED_REPOS": "acme-org/widget-service", "CW_CLOUD_IMAGE": self.DIGEST, "CW_CLOUD_NAMESPACE": "cw",
+                  "CW_CLOUD_SERVER": os.environ["CW_CLOUD_SERVER"], "CW_VAULT_SUBSCRIPTION": os.environ["CW_VAULT_SUBSCRIPTION"],
+                  "CW_VAULT_NAME": os.environ["CW_VAULT_NAME"], "CW_MODEL_AUTH_FILE": os.environ["CW_MODEL_AUTH_FILE"],
+                  "CW_KUBECTL": os.environ["CW_KUBECTL"], **extra}
+        path.write_text("".join("%s=%s\n" % kv for kv in values.items()))
+        path.chmod(0o600)
+        patch = mock.patch.object(self.cw._lib(), "SETTINGS_PATH", str(path))
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def trace_lines(self):
+        return self.trace.read_text().split() if self.trace.exists() else []
+
+    def nothing_ran(self):
+        self.assertEqual((self.stub_calls(), self.mints, self.trace_lines(), self.jsonl("kubectl.log")), ([], [], [], []))
+
+    def audit(self, event):
+        return [json.loads(l[l.index("{"):]) if "{" in l else l for p in self.state.rglob("*") if p.is_file() for l in p.read_text(errors="replace").splitlines() if event in l]
+
+    # -- the choice: flag, key, both, neither
+    def test_the_flag_the_key_both_and_neither_choose_the_mode_the_mint_is_asked_for(self):
+        cases = (("flag only", ("--token-mode", "read-only"), None, ["--mode", "read-only"], "the flag"),
+                 ("key only", (), "read-only", ["--mode", "read-only"], "the settings"),
+                 ("flag read-only over key default", ("--token-mode", "read-only"), "default", ["--mode", "read-only"], "the flag"),
+                 ("flag default over key read-only", ("--token-mode", "default"), "read-only", [], "the flag"),
+                 ("key default", (), "default", [], "the settings"),
+                 ("neither", (), None, [], None))
+        for label, flags, key, want, source in cases:
+            with self.subTest(case=label):
+                self.state_clean_all()
+                if key:
+                    self.settings_file(CW_TOKEN_MODE=key)
+                code, out, err = self.launch_with("--cloud", *flags)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.mints, [[ "acme-org/widget-service", *want]])
+                lines = [l for l in err.splitlines() if "git token mode" in l]
+                self.assertEqual(len(lines), 1 if source else 0, err)
+                if source:
+                    self.assertIn("from " + source, lines[0])
+
+    def test_a_key_that_is_not_a_mode_is_refused_naming_the_key_never_the_value_from_the_file_and_the_environment(self):
+        for value in ("Read-Only", "write", "read_only", "readonly"):
+            with self.subTest(source="file", value=value):
+                self.settings_file(CW_TOKEN_MODE=value)
+                code, out, err = self.launch_with("--cloud")
+                self.assertEqual(code, 2, err)
+                self.assertIn("CW_TOKEN_MODE", err)
+                self.assertNotIn(value, err)
+                self.nothing_ran()
+            with self.subTest(source="environment", value=value):
+                self.cw._lib().SETTINGS_PATH = str(self.home / "no-such-file")
+                with mock.patch.dict(os.environ, {"CW_TOKEN_MODE": value}):
+                    code, out, err = self.launch_with("--cloud")
+                self.assertEqual(code, 2, err)
+                self.assertIn("CW_TOKEN_MODE", err)
+                self.assertNotIn(value, err)
+                self.nothing_ran()
+
+    def test_a_key_in_the_file_and_the_environment_that_differ_follows_the_existing_clash_refusal(self):
+        self.settings_file(CW_TOKEN_MODE="read-only")
+        with mock.patch.dict(os.environ, {"CW_TOKEN_MODE": "default"}):
+            code, out, err = self.launch_with("--cloud", "--token-mode", "default")
+        self.assertEqual(code, 2, err)
+        self.assertIn("CW_TOKEN_MODE", err)
+        self.assertIn("differently", err)
+        self.nothing_ran()
+
+    def test_a_bad_flag_value_is_refused_by_the_parser_and_the_flag_needs_cloud(self):
+        for value in ("write", "Read-Only", "", "read_only"):
+            with self.subTest(value=value):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    code, out, err = self.launch_with("--cloud", "--token-mode", value)
+                self.assertNotEqual(code, 0)
+                self.nothing_ran()
+        for mode in ("default", "read-only"):
+            with self.subTest(without_cloud=mode):
+                code, out, err = self.launch_with("--token-mode", mode)
+                self.assertEqual(code, 2, err)
+                self.assertIn("--cloud", err)
+                self.nothing_ran()
+
+    # -- a custom token command is never trusted for read-only
+    def test_read_only_with_a_custom_token_command_refuses_before_the_preflight_any_token_or_pod(self):
+        for how in (("flag", ("--token-mode", "read-only"), None), ("key", (), "read-only")):
+            with self.subTest(chosen_by=how[0]):
+                if how[2]:
+                    self.settings_file(CW_TOKEN_MODE=how[2], CW_GIT_TOKEN_CMD="cat %s" % (self.stub_dir / "git_token"))
+                    code, out, err = self.launch_with("--cloud")
+                else:
+                    with mock.patch.dict(os.environ, {"CW_GIT_TOKEN_CMD": "cat %s" % (self.stub_dir / "git_token")}):
+                        code, out, err = self.launch_with("--cloud", *how[1])
+                self.assertEqual(code, 2, err)
+                self.assertIn("CW_GIT_TOKEN_CMD", err)
+                self.nothing_ran()
+                self.assertFalse((self.state / "cloud").exists() and list((self.state / "cloud").glob("*")))
+
+    def test_default_with_a_custom_token_command_is_as_before(self):
+        with mock.patch.dict(os.environ, {"CW_GIT_TOKEN_CMD": "cat %s" % (self.stub_dir / "git_token")}):
+            code, out, err = self.launch_with("--cloud", "--token-mode", "default")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.mints, [])
+        self.assertEqual(self.trace_lines(), ["preflight"])
+
+    def test_the_custom_command_mutant_that_trusts_it_is_caught(self):
+        with mock.patch.dict(os.environ, {"CW_GIT_TOKEN_CMD": "cat %s" % (self.stub_dir / "git_token")}), \
+                mock.patch.object(self.cw, "token_mode", lambda args, environ=None: ("default", None)):   # a build that ignored the mode
+            code, out, err = self.launch_with("--cloud", "--token-mode", "read-only")
+        self.assertEqual(code, 0, err)   # it would create a pod: the real build refuses (the test above)
+        self.assertTrue(self.stub_calls())
+
+    # -- every other check runs unchanged, in the same order
+    def test_the_read_only_launch_trace_differs_from_the_default_one_only_in_the_mints_mode(self):
+        traces = {}
+        for mode in ("default", "read-only"):
+            self.state_clean_all()
+            code, out, err = self.launch_with("--cloud", "--token-mode", mode)
+            self.assertEqual(code, 0, err)
+            creates = [c for c in self.stub_calls() if c[0] == "create"]
+            self.assertEqual(len(creates), 1)
+            traces[mode] = (self.trace_lines(), [m[:1] for m in self.mints], self.shaped(creates[0]),
+                            [l for l in err.splitlines() if "token mode" not in l and "cloud settings from" not in l])
+        self.assertEqual(traces["default"][0], ["preflight", "mint"])   # the preflight ran exactly once, before the mint
+        self.assertEqual(traces["read-only"], traces["default"])
+        self.assertEqual(self.shaped(creates[0]), json.loads((BIN.parent / "cloud" / "tests" / "fixtures" / "launch-create-argv.json").read_text()))   # the create argv is the stored one
+
+    def test_a_default_launch_passes_no_mode_argument(self):
+        code, out, err = self.launch_with("--cloud")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.mints, [["acme-org/widget-service"]])
+
+    def test_the_allow_list_is_checked_before_the_mode_is_acted_on(self):
+        code, out, err = self.launch_with("--cloud", "--token-mode", "read-only", repo="acme-org/other-service")
+        self.assertEqual(code, 2, err)
+        self.assertIn("allow-list", err)
+        self.nothing_ran()
+
+    def test_the_worker_brief_says_the_clone_is_read_only_only_in_that_mode(self):
+        for mode in ("default", "read-only"):
+            with self.subTest(mode=mode):
+                self.state_clean_all()
+                self.remote.messages.clear()
+                code, out, err = self.launch_with("--cloud", "--token-mode", mode)
+                self.assertEqual(code, 0, err)
+                text = " ".join(m["text"] for m in self.remote.messages if m["type"] == "user")
+                self.assertEqual("the git token is read-only" in text, mode == "read-only")
+
+    def state_clean_all(self):
+        os.environ.pop("CW_TOKEN_MODE", None)   # the settings reader copies the file's values into the environment
+        self.cw._lib().SETTINGS_PATH = None     # no settings file unless this case writes one
+        for name in ("calls.log", "kubectl.log", "login.log"):
+            self.stub_dir.joinpath(name).unlink(missing_ok=True)
+        self.mints.clear()
+        self.trace.unlink(missing_ok=True)
+        for path in list((self.state / "cloud").glob("*")) if (self.state / "cloud").exists() else []:
+            path.unlink()
+
+    # -- the audit
+    def test_the_audit_names_the_mode_on_success_and_failure_and_holds_no_token(self):
+        for mode in ("default", "read-only"):
+            with self.subTest(mode=mode, outcome="created"):
+                self.state_clean_all()
+                code, out, err = self.launch_with("--cloud", "--token-mode", mode)
+                self.assertEqual(code, 0, err)
+                lines = self.audit("cloud.created")[-1:]   # the audit log keeps earlier subtests' lines
+                self.assertTrue(lines)
+                self.assertTrue(all(('"access_mode": "%s"' % mode) in json.dumps(l) for l in lines), lines)
+                everything = "\n".join(self.everything_written().values()) + out + err
+                self.assertNotIn(GIT_TOKEN, everything)
+            with self.subTest(mode=mode, outcome="create failed"):
+                self.state_clean_all()
+                with mock.patch.dict(os.environ, {"STUB_CREATE_FAIL": "1"}):
+                    code, out, err = self.launch_with("--cloud", "--token-mode", mode, name="coder8")
+                self.assertNotEqual(code, 0)
+                lines = self.audit("cloud.create_failed")[-1:]
+                self.assertTrue(lines)
+                self.assertTrue(all(('"access_mode": "%s"' % mode) in json.dumps(l) for l in lines), lines)
+                everything = "\n".join(self.everything_written().values()) + out + err
+                self.assertNotIn(GIT_TOKEN, everything)
+                self.assertNotIn(ADMIN_KUBECONFIG.split("ADMINSECRET")[1][:10], everything)
+
+    def test_mutants_of_the_launch_places_each_change_what_the_tests_observe(self):
+        """One mutant per place the mode is resolved, passed or recorded: the right build mints --mode read-only and audits it; each mutant shows a
+        different result (no mode argument, or no audit field)."""
+        orig_token = self.cw.git_token
+        mutants = {"flag ignored": ("token_mode", lambda args, environ=None: ("default", None)),
+                   "mode not passed to the mint": ("git_token", lambda repo, cluster, mode="default": orig_token(repo, cluster, "default"))}
+        for label, (name, fake) in mutants.items():
+            with self.subTest(mutant=label):
+                self.state_clean_all()
+                with mock.patch.object(self.cw, name, fake):
+                    code, out, err = self.launch_with("--cloud", "--token-mode", "read-only")
+                self.assertEqual(code, 0, err)
+                self.assertNotEqual(self.mints, [["acme-org/widget-service", "--mode", "read-only"]])
+        with self.subTest(mutant="audit field dropped"):
+            self.state_clean_all()
+            real_audit = self.cw._audit
+            with mock.patch.object(self.cw, "_audit", lambda engine, event, name, detail: real_audit(engine, event, name, {k: v for k, v in detail.items() if k != "access_mode"})):
+                code, out, err = self.launch_with("--cloud", "--token-mode", "read-only")
+            self.assertEqual(code, 0, err)
+            self.assertNotIn("access_mode", json.dumps(self.audit("cloud.created")[-1:]))
+
+    # -- the launch's table of modes is the mint's
+    def test_the_launch_modes_are_the_mints_table(self):
+        sys.path.insert(0, str(BIN.parent / "cloud" / "launcher"))
+        import app_token
+        self.assertEqual(set(self.cw.TOKEN_MODES), set(app_token.PERMISSION_MODES))
+        lib = self.cw._lib()
+        self.assertEqual({m for m in app_token.PERMISSION_MODES if lib.VALIDATORS["CW_TOKEN_MODE"][1](m)}, set(app_token.PERMISSION_MODES))
+
+
 if __name__ == "__main__":
     result = unittest.main(exit=False, verbosity=1).result
     print("RESULT: %s" % ("PASS" if result.wasSuccessful() else "FAIL"))

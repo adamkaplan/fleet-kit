@@ -83,6 +83,8 @@ default `app_token.py OWNER/NAME` beside the driver, the one-hour GitHub App tok
 the launcher with both handed over inherited pipes (`--run-secret-fd`), port-forwards, opens a session, sends the brief,
 waits for idle, then stops the worker (the end hook pushes the work; the pod and its Secrets are deleted).
 
+With `--token-mode read-only` (or `CW_TOKEN_MODE=read-only` in the settings) the token is `contents: read` and `metadata: read` only: the worker cannot push, open a pull request or comment; `default` is `contents: write`, `pull_requests: write`, `metadata: read`. Read-only refuses when `CW_GIT_TOKEN_CMD` is set; the flag wins over the key. See `docs/cloud-operator-quickstart.md`, "Token modes".
+
 - A normal end, a failure and an interrupt (SIGINT, SIGTERM) all clean up, and it says exactly once
   `per-run secret NAME-run cleaned` or `per-run secret NAME-run REMAINS: delete it with: <command>`.
 - A worker whose end hook cannot push is kept so the work is not lost; its per-run Secret is still deleted and the
