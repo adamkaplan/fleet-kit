@@ -172,6 +172,10 @@ class _FreshNodeRace(Exception):
     """The pod's sandbox failed on the handler-not-known message: the node's containerd was not yet configured."""
 
 
+class _PodVanished(Exception):
+    """The pending stack pod existed and then a get said not found (seen on a fresh node when its runtime restarted)."""
+
+
 class Interrupted(BaseException):
     """SIGINT or SIGTERM during create: not an Exception, so no handler in between swallows it."""
 
@@ -953,31 +957,64 @@ class Launcher:
         """Wait for a stack pod; on the fresh-node race (the runtime handler is not yet known to the node's containerd) delete
         THE POD ONLY and create it again with the same run id and nonce, at most STACK_ATTEMPTS times inside
         STACK_RACE_WINDOW_SECONDS. The password Secret and the per-run Secret are made once, before the first attempt, and are
-        never touched here: the pod refers to them by name, so a second attempt reads the same objects. Any other failure is not retried."""
+        never touched here: the pod refers to them by name, so a second attempt reads the same objects. The same bounded retry also
+        recreates a pod that VANISHES while pending (it was seen, then a get says not found); a pod never seen, and any other
+        failure, are not retried."""
         deadline = self.clock() + dt.timedelta(seconds=STACK_RACE_WINDOW_SECONDS)
         attempt = 1
         while True:
+            seen = []   # this attempt's pod: set once a get returned it
+
+            def watch(pod, seen=seen):
+                if pod is None and seen:
+                    raise _PodVanished("pod vanished")
+                if pod is not None:
+                    seen.append(1)
+                    self._raise_on_race(name, pod)
             try:
-                self._wait_ready(name, seconds, lambda pod: self._raise_on_race(name, pod))
-            except _FreshNodeRace as race:
+                self._wait_ready(name, seconds, watch)
+            except (_FreshNodeRace, _PodVanished) as race:
                 last = attempt >= STACK_ATTEMPTS or self.clock() >= deadline
                 self.audit(worker, "pod/" + name, "create-attempt", 0.0, False,
                            "attempt %d of %d: %s%s" % (attempt, STACK_ATTEMPTS, race, "; giving up" if last else "; recreating the pod"))
                 if last:
+                    if isinstance(race, _PodVanished):
+                        raise CloudError("the worker pod could not start: the pod vanished while pending (the fresh-node race: the node's "
+                                         "runtime restarted); gave up after %d attempt(s)" % attempt) from None
                     raise CloudError("the worker pod could not start: the node's runtime handler %s was not ready (the fresh-node race: %s); "
                                      "gave up after %d attempt(s)" % (STACK_RUNTIME_CLASS, race, attempt)) from None
                 if self._mine("pod", name) is False:
                     self.foreign.append("pod/" + name)
                     raise CloudError("the pod %s is not this call's (its run id does not match); left whole" % name) from None
+                self._refuse_if_removed(name, made)   # a stop, the reaper or someone else removed this call's own objects: not the race
                 self.kube.delete_pod_and_wait(name)
                 attempt += 1
                 self._make(made, "pod", self.kube.apply, spec)
+                self._refuse_if_removed(name, made)   # a stop that deleted the pod, then its Secrets, may have landed between the check and here
                 continue
             except CloudError as e:
                 self.audit(worker, "pod/" + name, "create-attempt", 0.0, False, "attempt %d of %d: %s" % (attempt, STACK_ATTEMPTS, e))
                 raise
+            self._refuse_if_removed(name, made)   # the stop's Secret deletes may have come after the pod went: never report a pod whose Secrets are gone
             self.audit(worker, "pod/" + name, "create-attempt", 0.0, True, "attempt %d of %d: ready" % (attempt, STACK_ATTEMPTS))
             return
+
+    def _refuse_if_removed(self, name, made):
+        gone = self._own_objects_gone(name, made)
+        if gone:
+            raise CloudError("the worker pod was removed from outside (%s no longer exist(s) or are not this call's): not recreated, and not reported ready" % ", ".join(gone)) from None
+
+    def _own_objects_gone(self, name, made):
+        """The Secrets this call made that are no longer this call's in the cluster: missing, or (with a run id) carrying another's."""
+        gone = []   # a get that errors (not "not found") raises CloudError: the create fails, it never reads as "still there"
+        for kind, label, get in (("secret", "secret/%s-pw" % name, lambda: self.kube.get_secret(name + "-pw")),
+                                 ("run", "secret/%s-run" % name, lambda: self.kube.get_run_secret(name))):
+            if not made[kind]:
+                continue
+            obj = get()
+            if not obj or (self.run_id and ((obj.get("metadata") or {}).get("labels") or {}).get("cw/run-id") != self.run_id):
+                gone.append(label)
+        return gone
 
     def _raise_on_race(self, name, pod):
         uid = (pod or {}).get("metadata", {}).get("uid")
