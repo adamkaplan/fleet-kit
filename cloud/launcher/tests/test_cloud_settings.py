@@ -36,7 +36,7 @@ HOSTILE = {   # per key: values that must be refused (each through the REAL pars
                        "a@sha256:" + "ab12" * 16 + "@sha256:" + "ab12" * 16, "reg.example/../x@sha256:" + "ab12" * 16, "x//y@sha256:" + "ab12" * 16],
     "CW_CLOUD_SERVER": ["http://169.254.169.254", "file:///x", "-flag", "x y", "cluster.example.internal", "https://user@host.example", "https://host.example/path",
                         "https://host.example?x=1", "https://host.example#f", "https://127.0.0.1", "https://localhost", "https://169.254.169.254", "https://[::1]",
-                        "https://0.0.0.0", "https://2130706433", "https://metadata.google.internal", "https://host.example:99999", "https://host.example:abc",
+                        "https://0.0.0.0", "https://2130706433", "https://metadata.google.internal", "https://host.example:99999", "https://0x7f000001", "https://2130706433", "https://017700000001", "https://127.1", "https://0177.0.0.1", "https://0x7f.0.0.1", "https://localhost.", "https://host.example.", "https://a.0x7f", "https://10.0.0.4", "https://192.168.1.1", "https://100.64.0.1", "https://[fd00:ec2::254]", "https://[fe80::1]", "https://224.0.0.1", "https://[::ffff:10.0.0.1]", "https://0x7f000001:6443", "https://12345", "https://1.2.3", "https://host.example:abc",
                         "https://", "https://ho st.example", "https://[::ffff:127.0.0.1]", "ftp://host.example", "https://host.example\\x"],
     "CW_CLOUD_CA_FILE": ["relative.pem", "/home/user/../etc/x", "-x", "$HOME/x"],
     "CW_PULL_SECRET": ["A_B", "a b", "-", "a/b", "$(x)", "UPPER"],
@@ -151,9 +151,21 @@ class ValueRules(Dir):
             cw.check_repo_allowed("acme-org/widget-service", {"CW_ALLOWED_REPOS": raw})   # what the validator accepts, the check accepts
 
     def test_a_good_server_form_is_accepted(self):
-        for value in ("https://cluster.example.internal:6443", "https://cluster.example.internal", "https://cluster.example.internal/", "https://10.0.0.4:6443", "https://[2001:db8::1]:443", "https://aks-dns-1a2b3c4d.hcp.example.azmk8s.io:443"):
+        for value in ("https://cluster.example.internal:6443", "https://cluster.example.internal", "https://cluster.example.internal/", "https://8.8.8.8:6443", "https://[2606:4700:4700::1111]:443", "https://aks-dns-1a2b3c4d.hcp.example.azmk8s.io:443", "https://cluster.example.be", "https://api.example.de", "https://x.example.cd", "https://face", "https://a.dead"):
             with self.subTest(value):
                 self.assertTrue(cw.VALIDATORS["CW_CLOUD_SERVER"][1](value))
+
+    def test_each_host_alias_rule_is_the_one_that_catches_its_aliases(self):
+        server = cw.VALIDATORS["CW_CLOUD_SERVER"][1]
+        with mock.patch.object(cw, "_integer_host_label", lambda label: False):
+            self.assertTrue(server("https://0x7f000001"))   # the 0x rule removed: the hex alias gets through
+            self.assertFalse(server("https://2130706433"))  # (the letter rule still holds the all-digit ones)
+        with mock.patch.object(cw, "_has_letter", lambda label: True):
+            self.assertTrue(server("https://2130706433") is False)   # the digit rule alone refuses it
+            self.assertTrue(server("https://127.1") is False)
+        with mock.patch.object(cw, "_has_letter", lambda label: True), mock.patch.object(cw, "_integer_host_label", lambda label: False):
+            for alias in ("https://2130706433", "https://127.1", "https://017700000001", "https://0x7f.0.0.1", "https://0177.0.0.1"):
+                self.assertTrue(server(alias), alias)   # both rules removed: every alias gets through
 
     def test_a_bad_file_leaves_the_environment_byte_identical(self):
         env = dict(GOOD, CW_TOOLING_REPO="acme-org/tooling", HOME="/home/user")

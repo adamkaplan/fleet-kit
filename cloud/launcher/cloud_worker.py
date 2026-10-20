@@ -1101,6 +1101,15 @@ _NUMBER = re.compile(r"[0-9]+(?:\.[0-9]+)?")
 _REFUSED_HOSTS = ("localhost", "metadata", "metadata.google.internal")
 
 
+def _integer_host_label(label):
+    """An all-digit label, or 0x and hex digits: the forms a resolver (inet_aton) reads as an integer address (2130706433, 127.1, 0x7f000001)."""
+    return label.isdigit() or bool(re.fullmatch(r"0[xX][0-9a-fA-F]*", label))
+
+
+def _has_letter(label):
+    return any(c.isalpha() for c in label)
+
+
 def _server_ok(value):
     import ipaddress
     if not value.startswith("https://") or any(c in value for c in "?#@\\ "):
@@ -1114,13 +1123,15 @@ def _server_ok(value):
     if not host or parts.path not in ("", "/") or (port is not None and not 0 < port < 65536):
         return False
     try:
-        ip = ipaddress.ip_address(host)
+        ip = ipaddress.ip_address(host)   # the stdlib's canonical parse: only a dotted-quad IPv4 or an IPv6 literal gets here
     except ValueError:
         low = host.lower()
-        return bool(_HOST.fullmatch(host)) and low not in _REFUSED_HOSTS and not low.endswith(".localhost") and any(c.isalpha() for c in low.rsplit(".", 1)[-1])
+        last = low.rsplit(".", 1)[-1]   # an all-numeric or hex-looking last label (2130706433, 127.1, 0x7f000001, 0177.0.0.1) is an integer host a resolver may read as an address
+        return (bool(_HOST.fullmatch(host)) and low not in _REFUSED_HOSTS and not low.endswith(".localhost") and _has_letter(last)
+                and not _integer_host_label(last))
     if getattr(ip, "ipv4_mapped", None):
         ip = ip.ipv4_mapped
-    return not (ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast or ip.is_reserved)
+    return ip.is_global and not ip.is_multicast   # not loopback, link-local, private, shared, reserved, unspecified or a metadata address
 
 
 def _allowed_ok(value):
@@ -1143,7 +1154,7 @@ VALIDATORS = {
     "CW_TOOLING_REPO": ("one OWNER/NAME", lambda v: _repo_key(v) is not None),
     "CW_CLOUD_IMAGE": ("an image by digest, [registry[:port]/]path@sha256:<64 lowercase hex>, no tag, nothing else",
                        lambda v: bool(_IMAGE_CHARS.fullmatch(v.split("@")[0])) and bool(_IMAGE_REF.fullmatch(v))),
-    "CW_CLOUD_SERVER": ("an https URL with a host (no user, query, fragment, path, file: or http:, and no loopback, link-local or metadata address)", _server_ok),
+    "CW_CLOUD_SERVER": ("an https URL with a host (no user, query, fragment, path, file: or http:; a host name whose last label has a letter, is not all digits and does not start with 0x, or a public IP literal: no loopback, link-local, private or metadata address)", _server_ok),
     "CW_CLOUD_CA_FILE": ("an absolute path with no .. segment", _path_ok),
     "CW_PULL_SECRET": ("a Kubernetes name (lowercase letters, digits, - and .)", lambda v: bool(_SECRET_NAME.fullmatch(v))),
     "CW_VAULT_SUBSCRIPTION": ("a subscription GUID", lambda v: bool(_GUID.fullmatch(v))),
