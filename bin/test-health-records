@@ -64,6 +64,14 @@ class Usage(unittest.TestCase):
         self.assertEqual(u["context"]["tokens"], 3000)
         self.assertTrue(u["partial"])
 
+    def test_retired_sessions_leave_the_body_and_none_or_empty_drops_nothing(self):
+        rec = hr.Recorder(lambda: NOW)
+        rec.ingest_message("ses_a", msg("m1", 1000, 0.02, NOW + 10))
+        rec.ingest_message("ses_b", msg("m2", 1000, 0.02, NOW + 10))
+        self.assertEqual(set(rec.body(retired_sessions={"ses_a"})["usage"]), {"ses_b"})
+        self.assertEqual(set(rec.body(retired_sessions=None)["usage"]), {"ses_a", "ses_b"})
+        self.assertEqual(set(rec.body(retired_sessions=set())["usage"]), {"ses_a", "ses_b"})
+
     def test_no_limit_means_no_percent(self):
         rec = hr.Recorder(lambda: NOW)
         rec.ingest_message("ses_a", msg("m1", 1000, 0.01))
