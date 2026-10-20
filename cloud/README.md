@@ -127,6 +127,8 @@ after install, so a worker pod selects the pool label `sysbox-install=yes` itsel
 cloud/tests/test-cloud          # prints RESULT: PASS
 ```
 
+**The rule for every test of the cloud tree (#956):** a test that starts a server or another long-lived child process starts it through `cloud/worker/tests/stub_support.py` (`start` registers the cleanup first; the cleanup kills the child's whole process group, waits, and asserts the port is free), or registers its own cleanup for that very process. The stub server also ends by itself (on SIGTERM, when its parent is gone, and after an idle cap), because a SIGKILLed runner runs no cleanup. `cloud/launcher/tests/test_stub_cleanup.py` scans the cloud tests by syntax tree and fails any start site that does neither, with a case and a mutant per site.
+
 It runs `kubectl apply --dry-run=client` on each manifest (an offline parse when no API server answers), runs the
 manifest's own `sed` on a legacy-keyed config twice (second pass changes nothing), and checks the scan: 0 hits on a clean
 directory and image, a failure on a planted token and on an image with one baked in, and that it never prints the value.

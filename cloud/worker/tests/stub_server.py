@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """A stub headless server on loopback, for the driver tests. usage: stub_server.py PORT.
-STUB_LOG (file): one line per event. STUB_PID_FILE: our pid. STUB_DRIP (seconds): the record's message read drips one byte per interval. STUB_MODE: ok (default) | never-healthy | busy-forever | die (exit 3 at start)."""
+STUB_LOG (file): one line per event. STUB_PID_FILE: our pid. STUB_DRIP (seconds): the record's message read drips one byte per interval. STUB_MODE: ok (default) | never-healthy | busy-forever | die (exit 3 at start).
+Ends by itself: on SIGTERM (an inherited ignore is reset), when its parent is gone (checked every second), and after STUB_IDLE_SECONDS (default 600) with no request."""
 import http.server
 import json
 import os
+import signal
 import socketserver
 import sys
+import threading
+import time
 
 MODE = os.environ.get("STUB_MODE", "ok")
 LOG = os.environ.get("STUB_LOG")
 polls = {"n": 0}
+LAST = {"t": time.time()}   # the last request, for the idle cap
 
 
 def log(msg):
@@ -28,6 +33,10 @@ class H(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def handle_one_request(self):
+        LAST["t"] = time.time()
+        super().handle_one_request()
 
     def do_GET(self):
         if not self.headers.get("Authorization", "").startswith("Basic "):
@@ -116,4 +125,19 @@ class Server(http.server.ThreadingHTTPServer):
         self.server_name, self.server_port = self.server_address[0], self.server_address[1]
 
 
+# Self-defence, so a stub can never outlive its run (#956). A SIGTERM ignored by a parent is inherited across exec: reset it. macOS has no
+# parent-death signal and a SIGKILLed runner runs no teardown: watch the parent pid once a second, and end after an idle lifetime cap.
+signal.signal(signal.SIGTERM, signal.SIG_DFL)
+PARENT = os.getppid()
+IDLE = float(os.environ.get("STUB_IDLE_SECONDS", "600"))
+
+
+def watch():
+    while True:
+        time.sleep(1)
+        if os.getppid() != PARENT or time.time() - LAST["t"] > IDLE:
+            os._exit(0)
+
+
+threading.Thread(target=watch, daemon=True).start()
 Server(("127.0.0.1", int(sys.argv[1])), H).serve_forever()

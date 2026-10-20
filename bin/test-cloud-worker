@@ -34,6 +34,8 @@ spec = importlib.util.spec_from_loader("cw_fleet_switchboard", loader)
 sb = importlib.util.module_from_spec(spec)
 sys.modules["cw_fleet_switchboard"] = sb   # what the removed load_module() did before executing
 loader.exec_module(sb)
+sys.path.insert(0, str(BIN.parent / "cloud" / "worker" / "tests"))
+import stub_support  # noqa: E402  (starts a child with a cleanup that always runs: #956)
 
 PASSWORD = "pw-" + "x" * 20
 
@@ -745,7 +747,7 @@ class TestWiring(Base):
         (self.stub_dir / "pf_hang").write_text("")
         before = len((self.stub_dir / "pf.pid").read_text().split())
         env = dict(os.environ, FLEET_SWITCHBOARD_UNDER_TEST="1")
-        child = subprocess.Popen([sys.executable, str(BIN / "fleet-switchboard"), "read", "coder7"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        child = stub_support.start(self, [sys.executable, str(BIN / "fleet-switchboard"), "read", "coder7"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         deadline = time.time() + 60
         while time.time() < deadline and len((self.stub_dir / "pf.pid").read_text().split()) == before and child.poll() is None:
             time.sleep(0.1)
@@ -766,7 +768,7 @@ class TestWiring(Base):
     def test_u3_a_killed_command_leaves_a_directory_that_the_next_command_sweeps(self):
         self.assertEqual(self.launch()[0], 0)
         self.root.mkdir(mode=0o700, exist_ok=True)
-        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead = stub_support.start(self, [sys.executable, "-c", "pass"])
         dead.wait()
         stale = self.root / ("cmd-%d-abcd1234" % dead.pid)
         stale.mkdir(mode=0o700)
@@ -894,7 +896,7 @@ class TestSignalsAndOrphans(Base):
         (self.stub_dir / "pf_hang").write_text("")
         before = len((self.stub_dir / "pf.pid").read_text().split())
         env = dict(os.environ, FLEET_SWITCHBOARD_UNDER_TEST="1")
-        child = subprocess.Popen([sys.executable, str(BIN / "fleet-switchboard"), "read", "coder7"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        child = stub_support.start(self, [sys.executable, str(BIN / "fleet-switchboard"), "read", "coder7"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         deadline = time.time() + 60
         while time.time() < deadline and len((self.stub_dir / "pf.pid").read_text().split()) == before:
             time.sleep(0.1)
