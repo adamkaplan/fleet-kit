@@ -11400,6 +11400,7 @@ class TestShimReadCache(Base):
             self.assertTrue(module.never_cached("repos/o/n/%s" % word) or module.never_cached(word), word)
             self.assertIsNone(module.cacheable_read(["api", "/%s/" % word.upper()]), word)
         self.assertIsNotNone(module.cacheable_read(["api", "repos/acme/app/issues/5"]))
+        self.assertIsNotNone(module.cacheable_read(["api", "repos/user/status/issues/1"]), "an owner or repository NAMED like a state word is still a name")
 
     def test_m1_a_read_in_flight_across_a_write_by_the_same_agent_never_stores_its_old_answer(self):
         module = self.shim_module()

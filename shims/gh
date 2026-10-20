@@ -171,8 +171,13 @@ def normal_api_path(path):
 
 
 def never_cached(path):
+    """True for a path that reports a state (see NEVER_CACHED): its first word, or any word after `repos/<owner>/<name>/` (the owner and the name are a name, not a word)."""
     try:
-        return any(seg in NEVER_CACHED or seg.startswith("..") for seg in normal_api_path(path)) or not normal_api_path(path)
+        segments = normal_api_path(path)
+        if not segments or any(seg.startswith("..") for seg in segments):
+            return True
+        words = segments[3:] if segments[0] == "repos" else segments[:1]
+        return any(seg in NEVER_CACHED for seg in words)
     except Exception:
         return True
 
