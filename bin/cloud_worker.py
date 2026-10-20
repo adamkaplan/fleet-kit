@@ -507,6 +507,15 @@ def _scrub_lib():
     return _lib().scrub
 
 
+def use_settings():
+    """THE settings source of every cloud command: the launcher library's one reader (`apply_settings`): the private settings file when it
+    exists, else the environment as before. Returns the source (the file's path or "environment"). A refusal is exit 2, nothing called."""
+    try:
+        return _lib().apply_settings()
+    except _lib().CloudError as err:
+        raise Refusal(str(err).replace("refused: ", "", 1)) from None
+
+
 _OWNER_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
 _NAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,100}")
 
@@ -752,6 +761,7 @@ class Cluster:
             # otherwise, which ends the process with no cleanup and leaves the tunnel (its own session gets no hangup) running
             self.old = {sig: signal.signal(sig, self._on_signal) for sig in HANDLED_SIGNALS}
         try:
+            use_settings()   # idempotent: the same file gives the same values; send, read, retire and status log in from the file too
             server = (os.environ.get("CW_CLOUD_SERVER") or "").strip()
             if not server:
                 raise Refusal("CW_CLOUD_SERVER is not set: no cluster to reach; nothing was changed")
@@ -966,6 +976,8 @@ def _launch(args, runner, now, reserve):
         raise LaunchError("--cloud needs --repo OWNER/REPO and --branch BRANCH")
     if not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}", branch) or branch.startswith("-"):
         raise LaunchError("--branch is not a branch name: %r" % branch)
+    source = use_settings()   # before any setting is read: the allow-list, the preflight and the launcher all read this one source
+    print("%s: cloud settings from %s" % (H["PROG"], source), file=sys.stderr)
     check_allowed(repo)   # before anything is read, minted or created
     try:   # the repository preflight, before any token is minted; FAIL CLOSED: a missing, killed or silent program refuses (stdout stays the one JSON line)
         print(_lib().check_repo_preflight(repo, {k: v for k, v in os.environ.items() if k not in CLUSTER_DROP}), file=sys.stderr)
