@@ -143,10 +143,16 @@ elif cmd == "get" and args[1] == "pod":
                     st.setdefault("secret_labels", {})[args[2] + "-" + k[5:]] = {"cw/run-id": "ffffffffffffffff"}
                 elif k.startswith("late-"):   # a stop in flight: the Secrets go on the NEXT call after the pod's
                     st.setdefault("late_kills", []).append(args[2] + "-" + k[5:])
+                elif k.startswith("ready-"):   # a stop in flight: the Secrets go on the first get that sees the next pod Running
+                    st.setdefault("ready_kills", []).append(args[2] + "-" + k[6:])
                 else:
                     st.get("secrets", {}).pop(args[2] + "-" + k, None)
             save(); missing('pods "%s"' % args[2])
         pod["seen_once"] = True; save()
+    if pod.get("status", {}).get("phase") == "Running" and st.get("ready_kills"):
+        for k in st.pop("ready_kills"):
+            st.get("secrets", {}).pop(k, None)
+        save()
     print(json.dumps(pod))
 elif cmd == "get" and args[1] == "pods":
     items = list(st.get("pods", {}).values())

@@ -395,6 +395,25 @@ class FreshNodeRace(Base):
         self.assertEqual(len(self.pod_creates()), 2)
         self.assertEqual(len(self.attempts()), 1)   # the second pod was never waited on
 
+    def test_a_stop_whose_secret_deletes_land_after_the_recreate_check_is_not_reported_ready(self):   # kills: no check before the ready line
+        err = self._outside("ready-pw,ready-run")
+        self.assertIn("removed from outside", err)
+        self.assertEqual(len(self.pod_creates()), 2)
+        self.assertFalse(any("ready" in a["reason"] for a in self.audit_lines() if a.get("action") == "create-attempt" and a["ok"]))
+        self.assertEqual(self.st()["pods"], {})
+
+    # THE STOP RACE: every check the lane added, with the test that kills its mutant (the call removed from _start_stack_pod)
+    STOP_RACE_CHECKS = {
+        "before the delete (pre-delete)": "test_a_stop_during_the_window_is_not_recreated",
+        "straight after the recreate (post-recreate)": "test_a_stop_in_flight_whose_secret_deletes_come_after_the_recreate",
+        "before the ready line (pre-ready)": "test_a_stop_whose_secret_deletes_land_after_the_recreate_check_is_not_reported_ready",
+    }
+
+    def test_every_stop_race_check_has_a_named_test(self):   # kills: a check listed here with no test
+        for check, name in self.STOP_RACE_CHECKS.items():
+            with self.subTest(check=check):
+                self.assertTrue(callable(getattr(self, name, None)), name)
+
     def test_a_secret_of_another_run_is_not_this_calls(self):   # kills: a presence-only check
         self.assertIn("removed from outside", self._outside("swap-pw"))
         self.assertEqual(len(self.pod_creates()), 1)
