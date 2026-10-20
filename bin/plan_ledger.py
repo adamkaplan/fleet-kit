@@ -498,6 +498,34 @@ def enforced_view(report, enforced):
     return report
 
 
+def impact_rating_fact(entries, level, roles):
+    """The impact-rating fact `gates` shows (#892): `entries` are the independent reviewer's records at exactly this head, `level` is what the delegated clear's own scoring says of them
+    (the level of the highest record whose recorded role counts AND that carries a usable score; None otherwise), `roles` the matrix's `rating_roles` (the block the scoring reads). Four shapes:
+    none recorded; a role that counts with a score; a role that counts with NO usable score (it clears nothing by score); a role that does not count."""
+    if not entries:
+        return {"recorded": False}
+    if level:
+        return {"recorded": True, "role_counts": True, "scored": True, "level": level}
+    if any(e.get("by_role") in roles for e in entries):
+        return {"recorded": True, "role_counts": True, "scored": False}
+    role = entries[-1].get("by_role")
+    return {"recorded": True, "role_counts": False, "scored": False, "role": role if isinstance(role, str) else None}
+
+
+def impact_rating_line(rating, head):
+    """The ONE line `gates` prints about the independent impact rating at the head (#892). `rating` is `impact_rating_fact`'s answer, or {"problem"} (it could not be read). Output text only."""
+    at = (head or "?")[:8]
+    if rating.get("problem"):
+        return "impact rating at %s: unknown (%s)" % (at, rating["problem"])
+    if not rating.get("recorded"):
+        return "impact rating at %s: no impact rating recorded" % at
+    if rating.get("scored"):
+        return "impact rating at %s: %s; its recorded role counts as the independent rating" % (at, rating.get("level"))
+    if rating.get("role_counts"):
+        return "impact rating at %s: its recorded role counts as the independent rating, but the record carries no usable score (it clears nothing by score)" % at
+    return "impact rating at %s: recorded by role %s; recorded, not counted as the independent rating" % (at, rating.get("role") or "unrecorded")
+
+
 def render_gates(report, pr):
     """The lines `gates` prints."""
     if report.get("enforced"):
@@ -523,9 +551,12 @@ def render_gates(report, pr):
     for s in report.get("scenarios", []):
         for note in s["void"]:
             lines.append("  %s: %s" % (s["id"], note))
+    rating = report.get("impact_rating")
+    if isinstance(rating, dict):
+        lines.append("  " + impact_rating_line(rating, report.get("head")))
     reviews = report.get("reviews")
     if reviews:
-        lines.append("  reviewers (shadow, not counted; recorded by the PR's own session, so not independent): %d of %d recorded at %s%s" % (
+        lines.append("  reviewers (plan-review panel verdicts: shadow, not counted by any gate): %d of %d recorded at %s%s" % (
             len(reviews["recorded"]), len(reviews["expected"]), (report.get("head") or "?")[:8],
             ": " + ", ".join("%s %s" % kv for kv in sorted(reviews["recorded"].items())) if reviews["recorded"] else "")
             + ("; missing %s" % ", ".join(reviews["missing"]) if reviews["missing"] else ""))
