@@ -12851,6 +12851,7 @@ class TestChatClearHook(Base):
         report = {"pr": self.PR, "head": self.H1, "reasons": ["x"], "floor_paths": [], "globs": []}
         self.assertEqual(sb.apply_impact_hold(self.engine, self.REPO, 9, report, {"labels": []}), 0, "the same head: the daemon does not re-add the hold")
         self.assertEqual([w for w in self.writes if w[0] == "POST"], [w for w in self.writes if w[1].endswith("/comments")])
+        self.pr["headRefOid"] = self.H2   # the pull request really is at the new head (#891: a write is only for the head the pull request has when it is read)
         self.assertGreater(sb.apply_impact_hold(self.engine, self.REPO, 9, dict(report, head=self.H2), {"labels": []}), 0, "a new head is judged and held again")
 
     def test_s11_the_core_removes_only_owner_tier_labels_and_refuses_anything_else_or_a_moved_head(self):
