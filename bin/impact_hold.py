@@ -872,11 +872,11 @@ def impact_clear_core(engine, runner, repo, number, who, reason, remove=None, he
                 remove += authors_hold_labels(names, raw, remove)   # #742: the OWNER's clear lifts the author's own hold with the floor's, from THIS read (the PR's labels at the cleared head)
             elif names[OWNER_HOLD_KEY] in authors_hold_labels(names, raw, remove):   # #891: whatever the score, with its OWN audited reason
                 why = "%s carries %s, the owner's own hold: only the owner's plain clear lifts it, never the Chief of Staff under an order, whatever the score" % (pr, names[OWNER_HOLD_KEY])
-                engine.audit.append(engine.actor, "gate.hold_clear_refused", pr, {"head": current, "by": who, "under_order": under_order["number"], "owner_hold": True, "why": load_module("delegated_clear").whole_line(why), "causes": [load_module("delegated_clear").cause("owner_hold_label", why)]})
+                engine.audit.append(engine.actor, "gate.hold_clear_refused", pr, {"head": current, "by": who, "under_order": under_order["number"], "owner_hold": True, **load_module("delegated_clear").audit_parts(why, [load_module("delegated_clear").cause("owner_hold_label", why)])})
                 raise NoticeError(why)
             elif names["merge-captain"] in authors_hold_labels(names, raw, remove):
                 why = "%s carries a %s label the switchboard did not add: it is a person's own hold, not the Chief of Staff's to lift under an order; the owner clears it" % (pr, names["merge-captain"])
-                engine.audit.append(engine.actor, "gate.hold_clear_refused", pr, {"head": current, "by": who, "under_order": under_order["number"], "why": load_module("delegated_clear").whole_line(why), "causes": [load_module("delegated_clear").cause("person_hold_label", why)]})
+                engine.audit.append(engine.actor, "gate.hold_clear_refused", pr, {"head": current, "by": who, "under_order": under_order["number"], **load_module("delegated_clear").audit_parts(why, [load_module("delegated_clear").cause("person_hold_label", why)])})
                 raise NoticeError(why)   # nothing is written: the check runs before the clear is recorded
         else:
             remove = list(remove)
@@ -1049,7 +1049,7 @@ def cmd_impact_clear(args, runner, now):
             delegated, why = delegated_clear_checks(engine, runner, now, kind, under)
             if delegated is None:
                 if engine.audit is not None:
-                    engine.audit.append(engine.actor, "gate.hold_clear_refused", "%s#%d" % (repo, number), {"by": who, "under_order": under, "why": load_module("delegated_clear").whole_line(why), "causes": [load_module("delegated_clear").cause("order", why)]})
+                    engine.audit.append(engine.actor, "gate.hold_clear_refused", "%s#%d" % (repo, number), dict({"by": who, "under_order": under}, **load_module("delegated_clear").audit_parts(why, [load_module("delegated_clear").cause("order", why)])))
                 sys.stderr.write("%s: impact clear: refused: %s\n" % (PROG, load_module("delegated_clear").whole_line(why)))
                 return EXIT_USAGE
         else:
@@ -1092,7 +1092,7 @@ def cmd_impact_clear(args, runner, now):
             report, why = delegated_clear_pr_checks(engine, runner, repo, number, delegated.get("threshold"), info)
             if why:
                 if engine.audit is not None:
-                    engine.audit.append(engine.actor, "gate.hold_clear_refused", "%s#%d" % (repo, number), dict({"by": kind[1], "under_order": delegated["number"], "why": load_module("delegated_clear").whole_line(why), "causes": info.get("causes") or [load_module("delegated_clear").cause("order", why)]}, **({"score": info.get("score"), "threshold": delegated["threshold"]} if delegated.get("threshold") else {})))
+                    engine.audit.append(engine.actor, "gate.hold_clear_refused", "%s#%d" % (repo, number), dict({"by": kind[1], "under_order": delegated["number"], **load_module("delegated_clear").audit_parts(why, info.get("causes") or [load_module("delegated_clear").cause("order", why)])}, **({"score": info.get("score"), "threshold": delegated["threshold"]} if delegated.get("threshold") else {})))
                 sys.stderr.write("%s: impact clear: refused: %s\n" % (PROG, load_module("delegated_clear").whole_line(why)))
                 return EXIT_USAGE
             extra = {"head": report["head"], "via": "order:%d" % delegated["number"], "under_order": dict(delegated, score=info.get("score"))}

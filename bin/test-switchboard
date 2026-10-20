@@ -72457,6 +72457,28 @@ class TestPullFileListRead(LedgerBase):
         self.assertIn(detail["why"], err, "and the printed line is whole too")
         self.assertEqual(len([c for c in detail["causes"] if c["kind"] == "clear_code"]), 40)
 
+    def test_s13_a_control_character_in_a_file_name_never_reaches_the_audit_or_the_terminal(self):
+        files = FakePullFiles.make(3)
+        files[1]["filename"] = "shims/a\x1b[31m\x07.sh"
+        self.serve(files)
+        code, out, err = self.run_clear()
+        detail = self.refusal_audit()
+        self.assertEqual(code, 2)
+        for text in [detail["why"], err] + [c["text"] + (c["path"] or "") for c in detail["causes"]]:
+            self.assertNotRegex(text.replace("\n", ""), r"[\x00-\x1f\x7f-\x9f]")
+
+    def test_s13_the_one_bound_is_what_an_audit_line_holds_and_it_says_how_much_was_left_out(self):
+        module = sb.load_module("delegated_clear")
+        long = "x" * (module.AUDIT_LINE_MAX + 50)
+        line = module.whole_line(long)
+        self.assertTrue(line.startswith("x" * module.AUDIT_LINE_MAX) and "50 more characters not kept" in line)
+        self.assertEqual(module.whole_line("y" * module.AUDIT_LINE_MAX), "y" * module.AUDIT_LINE_MAX, "exactly at the bound nothing is cut")
+        many = [module.cause("clear_code", "z" * 5000, "bin/p%d.py" % i) for i in range(1000)]
+        parts = module.audit_parts("why", many)
+        self.assertEqual(len(parts["causes"]) + parts["causes_omitted"], 1000)
+        self.assertLessEqual(len(json.dumps(parts)), module.AUDIT_LINE_MAX + 5000)
+        self.assertNotIn("causes_omitted", module.audit_parts("why", many[:5]))
+
     def test_s15_no_writer_of_a_refusal_on_the_clear_path_cuts_the_reason(self):
         text = (BIN / "impact_hold.py").read_text()
         appends = [m.group(0) for m in re.finditer(r'engine\.audit\.append\([^\n]*"gate\.hold_clear_refused"[^\n]*', text)]

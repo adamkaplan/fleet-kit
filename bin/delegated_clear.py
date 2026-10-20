@@ -296,9 +296,30 @@ CAUSE_RULES = {
 }
 
 
-def whole_line(text):
-    """`text` on one line with nothing cut: the audit file and the terminal hold what the reason says (#967)."""
-    return " ".join(str(text or "").split())
+AUDIT_LINE_MAX = 1 << 20   # characters of ONE refusal the audit and the terminal keep: the audit file rotates at 20 MiB, so one line is held to a twentieth of it. The only bound; when it is reached the line says so.
+
+
+def whole_line(text, limit=AUDIT_LINE_MAX):
+    """`text` on one line, with control characters (an escape sequence in a file name) turned to spaces and nothing cut until the one physical bound, which says how much was left out."""
+    line = " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(text or "")).split())
+    if len(line) <= limit:
+        return line
+    return line[:limit] + " ... (%d more characters not kept: one audit line holds at most %d)" % (len(line) - limit, limit)
+
+
+def audit_parts(why, causes):
+    """{"why", "causes"} for the audit detail: the whole reason, and the cause records (control characters out of their text and path) up to the same bound; `causes_omitted` says how many did not fit."""
+    kept, size = [], 0
+    for item in causes:
+        record = dict(item, text=whole_line(item.get("text")), path=whole_line(item["path"]) if isinstance(item.get("path"), str) else item.get("path"))
+        size += len(json.dumps(record))
+        if size > AUDIT_LINE_MAX:
+            break
+        kept.append(record)
+    parts = {"why": whole_line(why), "causes": kept}
+    if len(kept) < len(causes):
+        parts["causes_omitted"] = len(causes) - len(kept)
+    return parts
 
 
 def cause(kind, text, path=None):
