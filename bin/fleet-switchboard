@@ -21703,7 +21703,7 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
         record = ("hold", None)   # an unreadable ledger is an unknown rating: it holds
     owner = impact_floor.owner_decide(matrix, paths, [(sev, prob, None) for sev, prob in rated_pairs], unknown, hit, narrow, record)
     daemon_file = ((matrix.get("owner_hold") or {}).get("delegated_clear") or {}).get("daemon_file")
-    if daemon_file and daemon_file in paths and isinstance(head, str):   # #940: a change to the daemon file that touches the clear's closure is held for the owner, by the one closure the refusal reads
+    if daemon_file and (daemon_file in paths or not complete or not isinstance(head, str)):   # #940: a change to the daemon file that touches the clear's closure is held for the owner, by the one closure the refusal reads; a file list that is not complete, or a head that cannot be read, cannot say the daemon file is untouched, so it is judged (and holds when it cannot be read)
         closure_reasons = clear_closure_hold(engine, repo, number, head)
         if closure_reasons:
             owner = ("hold", owner[1] + closure_reasons)

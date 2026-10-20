@@ -34340,6 +34340,7 @@ class B:
         self.assertIn("passed", defs, "a function passed as a callback to a parameter is a name the closure reads")
         self.assertNotIn("delta", members["A"], "a name nothing spells out stays outside")
 
+    @unittest.skipIf(sys.version_info < (3, 11), "the trace names a method by co_qualname, new in Python 3.11")
     def traced_definitions(self, run, source_path, handlers=()):
         """The top-level definitions of `source_path` (and the methods of its classes) that executed while `run()` ran, by a profile hook: {(top-level name, method or None)}. With `handlers` (names of daemon
         functions) the hook is on only while one of them runs: the clear's own code, not the parser the entry point built before it."""
@@ -34454,9 +34455,60 @@ class B:
         self.files_of_pr("bin/fleet-switchboard", mapped=None)   # nothing the clear touches in the change: neither refuses nor holds for this reason
         report = sb.pr_floor_report(self.world.engine, "acme/app", 9)
         self.assertFalse([r for r in report["owner_reasons"] if "clear's closure" in r], report["owner_reasons"])
-        with mock.patch.object(sb, "delegated_clear_map", lambda *a, **k: None):   # unreadable: the hold fails toward hold
+        with mock.patch.object(sb, "delegated_clear_map", lambda *a, **k: None):   # unreadable: the hold fails toward hold, with its own reason
             report = sb.pr_floor_report(self.world.engine, "acme/app", 9)
         self.assertEqual(report["owner_decision"], "hold")
+        self.assertTrue([r for r in report["owner_reasons"] if "cannot be read or mapped to the clear's closure" in r], report["owner_reasons"])
+
+    def test_the_closure_hold_fails_toward_hold_on_every_unreadable_branch_and_is_silent_when_the_daemon_file_is_untouched(self):
+        dc = sb.load_module("delegated_clear")
+        engine = self.world.engine
+        engine.gh_runner = self.route
+        def hold(listing=None, pulls=None, raises=None, compare=None, mapped=("unset",)):
+            def get(engine_, runner, repo):
+                def call(path):
+                    if raises:
+                        raise raises
+                    if "/files" in path:
+                        return listing(path) if callable(listing) else listing
+                    if "/compare/" in path:
+                        return compare if compare is not None else {"merge_base_commit": {"sha": "m" * 40}}
+                    return pulls if pulls is not None else {"head": {"sha": "h" * 40}, "base": {"sha": "b" * 40}}
+                return call
+            patchers = [mock.patch.object(sb, "impact_carry_get", get)]
+            if mapped != ("unset",):
+                patchers.append(mock.patch.object(sb, "delegated_clear_map", lambda *a, **k: mapped))
+            for patcher in patchers:
+                patcher.start()
+            try:
+                return sb.clear_closure_hold(engine, "acme/app", 9, "h" * 40)
+            finally:
+                for patcher in patchers:
+                    patcher.stop()
+        daemon = "bin/fleet-switchboard"
+        modified = [{"filename": daemon, "status": "modified", "sha": "e" * 40, "patch": "@@ -1 +1 @@\n-a\n+b"}]
+        self.assertEqual(hold(listing=[{"filename": "docs/x.md", "status": "modified"}]), [], "the daemon file is untouched: no reason")
+        cases = {"a file list that is not a list": hold(listing={"message": "no"}), "more than 3000 files": hold(listing=lambda path: [{"filename": "f%d" % i, "status": "modified"} for i in range(100)]),
+                 "a daemon file that is added": hold(listing=[{"filename": daemon, "status": "added"}]), "a daemon file that is removed": hold(listing=[{"filename": daemon, "status": "removed"}]),
+                 "a daemon file that is renamed": hold(listing=[{"filename": "bin/elsewhere", "previous_filename": daemon, "status": "renamed"}]),
+                 "a head that moved": hold(listing=modified, pulls={"head": {"sha": "x" * 40}, "base": {"sha": "b" * 40}}), "no merge base": hold(listing=modified, compare={}),
+                 "a change that cannot be mapped": hold(listing=modified, mapped=None), "an exception": hold(listing=modified, raises=ValueError("boom"))}
+        expect = {"a file list that is not a list": "cannot be judged", "more than 3000 files": "more than 3000 files", "a daemon file that is added": "is added", "a daemon file that is removed": "is removed",
+                  "a daemon file that is renamed": "is renamed", "a head that moved": "moved", "no merge base": "cannot be read or mapped", "a change that cannot be mapped": "cannot be read or mapped", "an exception": "cannot be judged"}
+        for label, reasons in cases.items():
+            with self.subTest(label):
+                self.assertTrue(reasons and expect[label] in reasons[0], "%s: %r" % (label, reasons))
+        with self.subTest("the install's own files cannot be read"):
+            with mock.patch.object(dc, "_tree_of", side_effect=OSError("gone")):
+                reasons = hold(listing=modified)
+            self.assertTrue(reasons and "cannot be read or mapped" in reasons[0], reasons)
+        with self.subTest("a change that touches the closure is held with the mapper's reasons"):
+            self.assertEqual(hold(listing=modified, mapped=["it changes cmd_review, part of the clear (head file)"]), ["the change touches the clear's closure: it changes cmd_review, part of the clear (head file)"])
+
+    def test_the_clears_own_module_has_only_plain_top_level_functions_so_the_roots_scan_reads_all_of_it(self):
+        import ast
+        tree = ast.parse((BIN / "impact_hold.py").read_text())
+        self.assertEqual([type(n).__name__ for n in tree.body if isinstance(n, (ast.ClassDef, ast.AsyncFunctionDef))], [], "a class or an async function in bin/impact_hold.py would be missed by the roots scan (moved_roots reads plain functions): extend the scan first")
 
     def test_a_changed_line_in_each_member_of_the_closure_is_refused_and_a_mutant_that_drops_any_member_is_caught_and_a_change_outside_is_not_refused(self):
         import ast, difflib
