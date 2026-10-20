@@ -35818,7 +35818,7 @@ class TestImpactHold(LedgerBase):
             self.assertEqual(reads, [], "%s reads no rating input from the shared namespace" % name)
 
     # The vocabulary of a registrar (ONE table, #924): everything else is a finding. A registrar sets up ITS OWN parsers: it reads its own parameter (`sub`), the names it binds itself, literals, and the names below.
-    REGISTRAR_VALUES = frozenset({"AGENTS_VERIFY_TIMEOUT", "BATCH_ROWS_MAX", "CHARTER_HELP", "COS_WORKSPACE_LABEL", "DAEMON_HEALTH_WAIT", "DECISIONS_STALE_SECONDS", "IMPACT_RATING_FIELDS", "MEASURE_SCAN_MAX", "ORDERS_HEADING",
+    REGISTRAR_VALUES = frozenset({"AGENTS_VERIFY_TIMEOUT", "BATCH_ROWS_MAX", "BLOCK_TABLE_TEXT", "CHARTER_HELP", "COS_WORKSPACE_LABEL", "DAEMON_HEALTH_WAIT", "DECISIONS_STALE_SECONDS", "IMPACT_RATING_FIELDS", "MEASURE_SCAN_MAX", "ORDERS_HEADING",
                                   "ORDER_MAX_CHARS", "PROG", "REPORT_MAX", "REPORT_STATES", "add_decision_list_flags", "float", "int", "issue_arg"})   # constants and converters the registrars read
     REGISTRAR_MODULES = frozenset({"argparse", "plan_ledger", "scenario"})   # modules: only `Name.UPPER_CASE_CONSTANT` is read from them (`argparse.SUPPRESS`), never anything else, never the name alone
     REGISTRAR_ATTRIBUTES = frozenset({"add_argument", "add_parser", "add_subparsers", "add_mutually_exclusive_group", "add_argument_group", "set_defaults", "replace", "split", "join", "format", "default", "dest", "nargs"})   # what a registrar calls or reads on its own objects
