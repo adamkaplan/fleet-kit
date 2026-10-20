@@ -171,7 +171,7 @@ _ROOTS_CACHE = {}
 
 def _tree_of(path):
     """The parsed file at `path`, kept while its size and time are the same (the daemon file is 30,000 lines)."""
-    stat = Path(path).stat()
+    stat = Path(path).stat()   # an unreadable or unparsable install file raises here: every caller refuses or holds on it (`delegated_clear_map` returns None, `clear_closure_hold` holds), tested
     key = (str(path), stat.st_size, stat.st_mtime_ns)
     if key not in _ROOTS_CACHE:
         _ROOTS_CACHE.clear()
@@ -335,12 +335,11 @@ def closure(tree, roots, dynamic_actions=()):
     roots = list(defs) if "*" in roots else list(roots)   # `*`: every function of the module (a module the clear runs and no recording says which)
     seen, globals_, refs, members, todo = set(), set(), set(), {}, list(roots)
 
-    node_of, spelled_out, units = [None], [], []
+    spelled_out = []
 
     def walk(nodes):
         while nodes:
-            node_of[0] = unit = nodes.pop()
-            units.append(unit)
+            unit = nodes.pop()
             for x in ast.walk(unit):
                 if isinstance(x, ast.Name):
                     refs.add(x.id)
