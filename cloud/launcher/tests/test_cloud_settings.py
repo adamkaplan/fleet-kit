@@ -21,9 +21,9 @@ OPTIONAL_SAMPLES = {"CW_TOOLING_REPO": "acme-org/tooling", "CW_CLOUD_CA_FILE": "
                     "CW_APP_KEY_CMD": "cat /home/user/key", "CW_VAULT_CHECK_DIR": "/home/user/check"}
 SAMPLES = {   # one value per secret shape (built here, never a real secret)
     "a JWT": "eyJhbGciOiJIUzI1" + "." + "eyJzdWIiOiJ4eHh4",
-    "a PEM header": "-----BEGIN PRIVATE KEY-----",
-    "a URL with a password": "https://user:hunter2pass@host.example/x",
-    "a 40-character hex string": "git-cred 0123456789abcdef0123456789abcdef01234567",
+    "a PEM header": "-----BEGIN " + "PRIVATE KEY-----",
+    "a URL with a password": "https://user:" + "hunter2" + "pass@host.example/x",
+    "a 40-character hex string": "git-cred " + "0123456789abcdef" * 2 + "01234567",
 }
 for _prefix in cw._PREFIXES:
     SAMPLES["token prefix " + _prefix.strip()] = "x " + _prefix + "A1b2C3d4E5f6G7h8"
@@ -49,7 +49,7 @@ HOSTILE = {   # per key: values that must be refused (each through the REAL pars
                         "https://8.8.8.8 :6443", "https://8.8.8.8\x1f", "https://host.example.be\x0c",
                         "https://[", "https://[::1", "https://a]b", "https://host.example.be:99999999999", "https://host.example.be:-1", "https://host.0X1f",
                         "https://x.0XAB", "https://0X7F000001", "https://METADATA.google.internal", "https://A.LOCALHOST", "https://" + ".".join(["a" * 63] * 3 + ["b" * 59, "be"]),
-                        "https://host.example.be:", "https://user:pw@host.example.be"],
+                        "https://host.example.be:", "https://user:" + "pw@host.example.be"],
     "CW_CLOUD_CA_FILE": ["relative.pem", "/home/user/../etc/x", "-x", "$HOME/x"],
     "CW_PULL_SECRET": ["A_B", "a b", "-", "a/b", "$(x)", "UPPER"],
     "CW_VAULT_SUBSCRIPTION": ["sub-example", "0000", "00000000-0000-0000-0000-00000000000g", "$(x)", "a;b", "00000000-0000-0000-0000-000000000000 "[:-1] + "0"],
@@ -388,7 +388,7 @@ class Reader(Dir):
                     self.assertNotIn(value.split()[-1], err)
 
     def test_s3_a_40_hex_string_is_refused_in_a_command_only(self):
-        value = "0123456789abcdef0123456789abcdef01234567"
+        value = "0123456789abcdef" * 2 + "01234567"
         self.refused(body(dict(GOOD, CW_GIT_TOKEN_CMD="echo " + value)))
         self.write(body(dict(GOOD, CW_PULL_SECRET=value)))   # not a command: no shape (the image digest holds 64 hex and is fine)
         cw.apply_settings({}, self.path)

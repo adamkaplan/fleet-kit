@@ -1381,8 +1381,8 @@ class TestSettingsFile(Base):
 
     def test_s3_a_secret_shaped_value_is_refused_for_every_shape_and_never_printed(self):
         lib = self.lib
-        samples = {"a JWT": "eyJhbGciOiJIUzI1.eyJzdWIiOiJ4eHh4", "a PEM header": "-----BEGIN PRIVATE KEY-----",
-                   "a URL with a password": "https://user:hunter2pass@host.example/x", "a 40-character hex string": "x 0123456789abcdef0123456789abcdef01234567"}
+        samples = {"a JWT": "eyJ" + "hbGciOiJIUzI1" + "." + "eyJ" + "zdWIiOiJ4eHh4", "a PEM header": "-----BEGIN " + "PRIVATE KEY-----",
+                   "a URL with a password": "https://user:" + "hunter2" + "pass@host.example/x", "a 40-character hex string": "x " + "0123456789abcdef" * 2 + "01234567"}
         samples.update({"token prefix " + p.strip(): "x " + p + "A1b2C3d4E5f6G7h8" for p in lib._PREFIXES})
         self.assertEqual(set(samples), {name for name, _, _ in lib.SECRET_SHAPES})   # every member of the family has a case
         for shape, value in samples.items():
