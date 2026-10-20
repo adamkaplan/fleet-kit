@@ -36,6 +36,7 @@ from pathlib import Path
 
 H = {}   # the switchboard's own namespace, set by bind()
 
+_OWN_BIN = Path(__file__).resolve().parent   # fixed at import
 LAUNCHER_ENV = "FLEET_CLOUD_WORKER_BIN"   # the launcher program; default `cloud-worker` on PATH
 DEFAULT_LAUNCHER = "cloud-worker"
 CLOUD_DIR = "cloud"
@@ -357,13 +358,24 @@ def checkout_launcher_path():
     return Path(__file__).resolve().parent.parent / "cloud" / "launcher" / "cloud-worker"
 
 
+_WALK = []
+
+
+def _walk():
+    """The one walk (bin/path_walk.py, beside this file), loaded once by path from where THIS module was imported."""
+    if not _WALK:
+        spec = importlib.util.spec_from_file_location("path_walk", str(_OWN_BIN / "path_walk.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _WALK.append(module)
+    return _WALK[0]
+
+
 def _checkout_launcher_problem(path):
     """Why the checkout's launcher is not used, or None. The file and every parent go through the one walk of bin/path_walk.py (`entry_problem`,
     `parents_problem`: lstat, never followed). The entry itself is the kit's `cloud-worker` link to its sibling `cloud_worker.py` (a bare file name in
     the same directory): that target is the file judged: a regular file, executable, the user's, not group- or world-writable. A plain file is judged as it is."""
-    spec = importlib.util.spec_from_file_location("path_walk", str(Path(__file__).resolve().parent / "path_walk.py"))   # the one walk, loaded by path
-    walk = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(walk)
+    walk = _walk()
     entry_problem, parents_problem = walk.entry_problem, walk.parents_problem
     try:
         found = os.lstat(path)
@@ -384,6 +396,9 @@ def _checkout_launcher_problem(path):
     if not found.st_mode & 0o100:
         return "is not executable"
     return entry_problem(found, "itself") or parents_problem(str(target))
+
+
+LAUNCHER_ORDER = ("variable", "checkout", "path")   # the lookup's sources, first wins; none left is a refusal (tests derive the ordering rules from this)
 
 
 def launcher_argv():

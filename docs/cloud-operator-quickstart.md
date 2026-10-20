@@ -119,6 +119,7 @@ Nothing needs to be on your `PATH`. `launch --cloud` (and `send`, `read`, `retir
 
 1. `FLEET_CLOUD_WORKER_BIN`, when set: the program it names, unchanged. It is an environment variable only, not a key of the settings file.
 2. The launcher of the switchboard's **own checkout**: `cloud/launcher/cloud-worker`, found relative to the switchboard's own `bin/cloud_worker.py`. It is used only when it is a regular executable file (the kit ships it as a link to the sibling `cloud_worker.py`, which is then the file judged) owned by you and not group- or world-writable, and every parent directory up to `/` passes the same walk as the vault access check (no symlink, owned by root or you, not group- or world-writable unless sticky).
+   "Own checkout" means the checkout that holds the running `bin/cloud_worker.py`, never the working directory. A lane that runs the switchboard from a worktree of a branch under review therefore uses THAT branch's launcher: it is the same checkout as the running script, so the trust root is unchanged.
 3. `cloud-worker` on the `PATH`, as before.
 4. Otherwise `launch` refuses (exit status 2, before any vault, cluster or launcher call), naming `FLEET_CLOUD_WORKER_BIN` and the checkout path it looked in.
 

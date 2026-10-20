@@ -1763,6 +1763,156 @@ class TestLauncherLookup(Base):
         self.assertIsNone(self.mod._checkout_launcher_problem(str(real)))
 
 
+class TestLauncherLookupInputs(Base):
+    """S17, the whole family: every INPUT the lookup could read (the variable, the checkout's own file, the working directory, the PATH, a symlinked
+    checkout, an unsafe checkout) x the launcher it must give. The REAL checkout_launcher_path runs: only the module's own location is moved."""
+
+    def setUp(self):
+        super().setUp()
+        self.mod = sb.load_module("cloud_worker")
+        self.base = Path(os.path.realpath(self.home))
+        self.checkout = self.make_checkout(self.base / "checkout")
+        self.decoy = self.make_checkout(self.base / "decoy")           # a valid-looking checkout the working directory holds
+        self.on_path = self.base / "on-path"
+        self.on_path.mkdir()
+        shutil.copy(str(self.stub), str(self.on_path / "cloud-worker"))
+        (self.on_path / "cloud-worker").chmod(0o755)
+        os.environ.pop("FLEET_CLOUD_WORKER_BIN", None)
+        self.cwd = os.getcwd()
+        self.addCleanup(os.chdir, self.cwd)
+
+    def make_checkout(self, root):
+        (root / "bin").mkdir(parents=True)
+        (root / "bin" / "cloud_worker.py").write_text("")
+        (root / "cloud" / "launcher").mkdir(parents=True)
+        entry = root / "cloud" / "launcher" / "cloud-worker"
+        shutil.copy(str(self.stub), str(entry))
+        entry.chmod(0o755)
+        return root
+
+    def lookup(self, module_dir=None, path=None, cwd=None, variable=None):
+        """launcher_argv() with the module located in module_dir/bin, the PATH given (the stub directory kept for kubectl and az), the cwd given."""
+        module_dir = module_dir or self.checkout
+        env = {"PATH": path if path is not None else "/usr/bin:/bin"}
+        if variable:
+            env["FLEET_CLOUD_WORKER_BIN"] = variable
+        os.chdir(str(cwd or self.cwd))
+        with mock.patch.object(self.mod, "__file__", str(module_dir / "bin" / "cloud_worker.py")), mock.patch.dict(os.environ, env):
+            return self.mod.launcher_argv()
+
+    def entry_of(self, root):
+        return str(Path(os.path.realpath(root)) / "cloud" / "launcher" / "cloud-worker")
+
+    def test_the_table_of_inputs_and_the_launcher_each_gives(self):
+        path = str(self.on_path) + ":/usr/bin:/bin"
+        link = self.base / "link-to-checkout"
+        os.symlink(str(self.checkout), str(link))
+        table = [
+            ("the checkout's own file, nothing else", dict(), self.entry_of(self.checkout)),
+            ("the working directory holds another checkout", dict(cwd=self.decoy), self.entry_of(self.checkout)),
+            ("a different cloud-worker on the PATH", dict(path=path), self.entry_of(self.checkout)),                      # the checkout comes BEFORE the PATH
+            ("the variable wins over both", dict(path=path, cwd=self.decoy, variable="/opt/acme/launcher"), "/opt/acme/launcher"),
+            ("a symlinked checkout: judged on its real parents, the real path is run", dict(module_dir=link), self.entry_of(self.checkout)),
+        ]
+        for label, args, expected in table:
+            with self.subTest(label):
+                self.assertEqual(self.lookup(**args), [expected])
+
+    def test_an_unsafe_checkout_launcher_never_falls_to_the_working_directory(self):
+        (self.checkout / "cloud" / "launcher" / "cloud-worker").chmod(0o644)
+        with self.assertRaises(self.mod.Refusal) as caught:
+            self.lookup(cwd=self.decoy)
+        self.assertIn(self.entry_of(self.checkout), str(caught.exception))
+        self.assertNotIn(str(self.decoy), str(caught.exception))
+
+    def test_an_unsafe_checkout_launcher_falls_to_the_path_and_the_working_directory_is_never_looked_in(self):
+        (self.checkout / "cloud" / "launcher" / "cloud-worker").chmod(0o644)
+        self.assertEqual(self.lookup(cwd=self.decoy, path=str(self.on_path) + ":/usr/bin:/bin"), ["cloud-worker"])
+
+
+    # ---- the ordering class: one rule per adjacent pair of LAUNCHER_ORDER, one mutant that picks the OTHER candidate
+
+    def candidates(self, name):
+        """What it takes for source `name` to offer a launcher, and the argv it then gives: (lookup arguments, expected argv)."""
+        return {"variable": (dict(variable="/opt/acme/launcher"), ["/opt/acme/launcher"]),
+                "checkout": (dict(), [self.entry_of(self.checkout)]),
+                "path": (dict(path=str(self.on_path) + ":/usr/bin:/bin"), ["cloud-worker"])}[name]
+
+    def ordering_failures(self):
+        """Every rule the lookup must keep, checked on the module as it is now: the failures it names (an empty list on the real build)."""
+        bad = []
+        order = self.mod.LAUNCHER_ORDER
+        for i, early in enumerate(order[:-1]):
+            for late in order[i + 1:]:
+                args = {**self.candidates(late)[0], **self.candidates(early)[0]}
+                if early == "checkout":
+                    args.pop("variable", None)
+                want = self.candidates(early)[1]                        # the earlier source's launcher must be the one given
+                try:
+                    got = self.lookup(**args)
+                except self.mod.Refusal:
+                    got = "refused"
+                if got != want:
+                    bad.append("%s before %s" % (early, late))
+        # the checkout is vetted: an unsafe one is skipped, and the working directory is never a source
+        (self.checkout / "cloud" / "launcher" / "cloud-worker").chmod(0o644)
+        try:
+            got = self.lookup(cwd=self.decoy, path=str(self.on_path) + ":/usr/bin:/bin")
+        except self.mod.Refusal:
+            got = "refused"
+        if got != ["cloud-worker"]:
+            bad.append("an unsafe checkout falls to the PATH, never to the working directory")
+        try:
+            self.lookup(cwd=self.decoy)
+            bad.append("the working directory is a source")
+        except self.mod.Refusal:
+            pass
+        (self.checkout / "cloud" / "launcher" / "cloud-worker").chmod(0o755)
+        try:
+            got = self.lookup(cwd=self.decoy)
+        except self.mod.Refusal:
+            got = "refused"
+        if got != [self.entry_of(self.checkout)]:
+            bad.append("the working directory beats the checkout")
+        return bad
+
+    def test_the_real_lookup_keeps_every_ordering_rule(self):
+        self.assertEqual(self.mod.LAUNCHER_ORDER, ("variable", "checkout", "path"))
+        self.assertEqual(self.ordering_failures(), [])
+
+    def test_a_mutant_per_rule_is_caught(self):
+        real_argv, real_path = self.mod.launcher_argv, self.mod.checkout_launcher_path
+        which = shutil.which
+
+        def mutant_path_first():            # the PATH is consulted before the checkout's own launcher
+            found = which("cloud-worker")
+            return [found] if found else real_argv()
+
+        def mutant_variable_last():         # the variable only after the checkout
+            own = real_path()
+            if self.mod._checkout_launcher_problem(str(own)) is None:
+                return [str(own)]
+            return real_argv()
+
+        def mutant_cwd():                   # the working directory instead of the module's own location
+            return Path(os.getcwd()) / "cloud" / "launcher" / "cloud-worker"
+
+        def mutant_path_only():             # no checkout lookup at all
+            given = os.environ.get("FLEET_CLOUD_WORKER_BIN")
+            if given:
+                return [given]
+            if which("cloud-worker"):
+                return ["cloud-worker"]
+            raise self.mod.Refusal("none")
+
+        for label, patch in (("path before checkout", mock.patch.object(self.mod, "launcher_argv", mutant_path_first)),
+                             ("checkout before variable", mock.patch.object(self.mod, "launcher_argv", mutant_variable_last)),
+                             ("working directory as the checkout", mock.patch.object(self.mod, "checkout_launcher_path", mutant_cwd)),
+                             ("no checkout lookup", mock.patch.object(self.mod, "launcher_argv", mutant_path_only))):
+            with self.subTest(label), patch:
+                self.assertNotEqual(self.ordering_failures(), [], label)
+
+
 class VaultBase(Base):
     """#876 slice 2: the vault access check, run by `launch --cloud` only after a vault read was refused for the firewall (offline: a fake `az` and a
     fake check module in a temp checkout)."""
