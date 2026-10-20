@@ -64073,7 +64073,7 @@ class TestStructuralRuleInReviewing(unittest.TestCase):
         self.assertEqual(os.environ.get(sb.UNDER_TEST_ENV), "1")
         self.assertIsNone(sb.default_installed_agents_dir())
         with tempfile.TemporaryDirectory() as data, unittest.mock.patch.dict(os.environ, {"XDG_DATA_HOME": data}):
-            os.environ.pop("FLEET_SWITCHBOARD_UNDER_TEST", None)
+            os.environ.pop(sb.UNDER_TEST_ENV, None)
             self.assertEqual(sb.default_installed_agents_dir(), Path(data) / sb.PROG / "profile" / "config" / "opencode" / "agents")
 
     def test_verify_with_no_folder_named_reads_no_installed_file_under_the_suite(self):
