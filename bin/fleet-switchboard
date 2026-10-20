@@ -10382,7 +10382,8 @@ def pr_ci_of(rollup):
 CAPTAIN_MARK = "MERGE: captain"
 CAPTAIN_MERGE_LABELS = ("merge-captain", "merge-automatic")
 CAPTAIN_HOLD_LABELS = ("hold-security", "hold-credential", "hold-contract", "hold-policy", "hold-prod-config",
-                       "hold-other-area", "hold-impact")
+                       "hold-other-area", "hold-impact", "hold-owner")   # hold-owner (#891): the owner's own hold, only the owner's plain clear lifts it; the daemon never adds, adopts or lifts it
+OWNER_HOLD_KEY = "hold-owner"   # #891: the owner's own hold: never the daemon's (not added, not adopted, not restored by a re-hold), never lifted by a delegated clear
 # TRANSITION WINDOW (#133): a PR is held for the person when it carries the `merge-captain` label, OR (until this date, 30
 # days after the labels landed on 2026-10-11) when its body's first non-empty line says `MERGE: captain`. The line is read only inside the window.
 # TO DROP THE MARKER: set this to None (one line), after telling the Chief of Staff; the sweep's "marker without label" finding exists
@@ -31338,7 +31339,8 @@ LABEL_SPECS = (("orchestrator", "5319e7", "A charter: an orchestrator's standing
                ("hold-policy", "d93f0b", "Held: a policy or permission rule"),
                ("hold-prod-config", "d93f0b", "Held: production configuration"),
                ("hold-other-area", "d93f0b", "Held: an area owned by another team"),
-               ("hold-impact", "d93f0b", "Held: the impact floor or an independent rating says the change is high-impact"))
+               ("hold-impact", "d93f0b", "Held: the impact floor or an independent rating says the change is high-impact"),
+               ("hold-owner", "d93f0b", "The owner's own hold; only the owner lifts it"))
 
 
 def label_names(config):
