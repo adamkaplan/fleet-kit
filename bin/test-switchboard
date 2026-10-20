@@ -11383,7 +11383,7 @@ class TestShimReadCache(Base):
         self.assertEqual((status, len(calls)), (0, 1))
 
     def test_m2_paths_that_report_a_state_are_never_cached_in_any_spelling(self):
-        forms = ["rate_limit", "/rate_limit", "rate_limit?x=1", "RATE_LIMIT", "rate_limit/", "https://api.github.com/rate_limit", "%72ate_limit", "repos/../rate_limit",
+        forms = ["rate_limit", "/rate_limit", "rate_limit?x=1", "RATE_LIMIT", "rate_limit/", "https://api.github.com/rate_limit", "%72ate_limit", "%2572ate_limit", "repos/../rate_limit",
                  "api/v3/rate_limit", "user", "user/", "applications/abc/token", "installation/repositories", "notifications",
                  "repos/acme/app/commits/abc/check-runs", "repos/acme/app/commits/abc/status", "repos/acme/app/actions/runs/1", "repos/acme/app/actions/jobs/2"]
         for form in forms:
@@ -11449,6 +11449,57 @@ class TestShimReadCache(Base):
         self.assertEqual(len(self.network()), 2, "another account is another key")
         self.run_shim("api", self.PATH, "--paginate")
         self.assertEqual(len(self.network()), 3, "a call of another shape is never answered from the cache")
+
+    def overlapped(self, module, entry_age, answer, write_between=True):
+        """Run cached_read for a path with an entry of `entry_age` seconds, while a write by the same agent happens during the request. Returns (status, files left)."""
+        os.environ["FLEET_SWITCHBOARD_STATE"] = str(self.state)
+        self.addCleanup(os.environ.pop, "FLEET_SWITCHBOARD_STATE", None)
+        shutil.rmtree(str(self.state / "gh-read-cache"), ignore_errors=True)
+        directory = module.cache_directory(create=True)
+        file = module.cache_file(directory, "worker", "acme-a", self.PATH)
+        module.cache_store(directory, file, '"v1"', '{"old":1}', time.time() - entry_age)
+        out = io.BytesIO()
+
+        class Out:
+            def isatty(self):
+                return False
+            buffer = out
+
+        def request(argv, **kw):
+            if write_between:
+                module.cache_drop("worker")   # the same agent writes while the request is in flight
+            return subprocess.CompletedProcess(argv, 0, answer, b"")
+
+        with mock.patch.object(module.subprocess, "run", request), mock.patch.object(module.sys, "stdout", Out()):
+            status = module.cached_read("gh", {}, ["api", self.PATH], "worker", "acme-a", None)
+        return status, [n for n in os.listdir(directory) if n.endswith(".json")], out.getvalue()
+
+    def test_every_store_of_the_cache_is_guarded_by_the_write_mark_and_each_is_pinned(self):
+        """Completeness: the shim's cache is written in exactly these places; a new one must be added here with an overlapped test."""
+        source = SHIM.read_text()
+        self.assertEqual(source.count("cache_store("), 3, "one definition and two call sites (the 304 refresh and the 2xx store): pin any new one below")
+        self.assertEqual(source.count("not raced"), 2, "both call sites are behind the write mark")
+        module = self.shim_module()
+        # the 304 refresh: an old entry is revalidated while the same agent writes: nothing is rewritten, and the next read goes to GitHub
+        status, files, out = self.overlapped(module, 40, b"HTTP/2.0 304 Not Modified\r\n\r\n")
+        self.assertEqual((status, files), (0, []))
+        # the 2xx store: same overlap
+        status, files, out = self.overlapped(module, 40, b'HTTP/2.0 200 OK\r\nEtag: "v2"\r\n\r\n{"new":1}')
+        self.assertEqual((status, files, out), (0, [], b'{"new":1}'))
+        # and with no write in between both are stored (the guard is not a blanket refusal)
+        status, files, out = self.overlapped(module, 40, b"HTTP/2.0 304 Not Modified\r\n\r\n", write_between=False)
+        self.assertEqual((status, len(files), out), (0, 1, b'{"old":1}'))
+        # the drop itself removes only this agent's entries
+        directory = module.cache_directory()
+        other = module.cache_file(directory, "someone", "acme-a", self.PATH)
+        module.cache_store(directory, other, None, "{}", time.time())
+        module.cache_drop("worker")
+        self.assertTrue(os.path.exists(other))
+
+    def test_m2_double_percent_encoding_is_read_as_what_it_decodes_to(self):
+        module = self.shim_module()
+        self.assertEqual(module.normal_api_path("%2572ate_limit"), ["rate_limit"])
+        self.assertTrue(module.never_cached("%2572ate_limit"))
 
     def test_the_cache_is_private_and_holds_no_token(self):
         self.run_shim("api", self.PATH, env={"GH_TOKEN": "secrettoken"})
