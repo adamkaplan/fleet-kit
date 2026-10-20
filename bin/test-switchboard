@@ -32098,7 +32098,7 @@ class TestImpactRejudge(LedgerBase):
         for item in records:   # the pull request's labels as the live read sees them
             self.prs.setdefault(item["number"], {})["labels"] = [dict(l) for l in item["labels"]]
         for number, names in (live or {}).items():   # ... unless somebody changed them since the list was read
-            self.prs.setdefault(number, {})["labels"] = [{"name": n} for n in names]
+            self.prs.setdefault(number, {})["labels"] = [{"name": n} if isinstance(n, str) else n for n in names]   # a non-name entry is a cut read
         if not hasattr(self, "engine"):
             self.hub = FakeHub({"acme/app": records})
             self.engine = self.world.new_engine("daemon")
@@ -32275,18 +32275,19 @@ class TestImpactRejudge(LedgerBase):
         late = {"clears": {"p": {"at": "soon"}}, "applied": {"p": {"added": [hold], "at": 1}}}
         self.assertEqual(sb._labels_ours(names, late, "p"), [], "a clear whose time cannot be read counts as after the record")
 
-    def test_a_label_a_person_added_after_the_list_was_read_is_never_claimed_by_the_record(self):
+    def test_a_label_a_person_added_after_the_list_was_read_is_adopted_because_the_rule_holds_the_pull_request(self):   # #891: this was "never claimed" before adoption
         self.files(10, "shims/gh")
         self.passes([self.listed(10)], live={10: [self.names["merge-captain"]]})   # the list said no labels; by the write the person's merge label is there
         self.assertEqual([w[2]["labels"] for w in self.posts(10)], [[self.names["hold-impact"]]], "only the missing label is added")
         recorded = json.loads((self.world.state / "impact-hold.json").read_text())["applied"]["acme/app#10"]
-        self.assertEqual((recorded["added"], recorded["merge_label_added"]), ([self.names["hold-impact"]], False))
-        self.files(10, "docs/a.md")   # the pull request stops holding: the release takes off the daemon's label only
+        self.assertEqual((recorded["added"], recorded["merge_label_added"]), (sorted(self.both()), True), "the person's label is adopted: the rule holds this head")
+        self.assertEqual([e["detail"]["label"] for e in self.events("gate.label_adopted")], [self.names["merge-captain"]])
+        self.files(10, "docs/a.md")   # the pull request stops holding: the release takes off the daemon's labels, adopted ones included
         self.writes.clear()
         with mock.patch.object(sb.impact_floor, "rule_fingerprint", lambda: "version-two"):
             self.passes([self.listed(10, [self.names["hold-impact"], self.names["merge-captain"]])], advance=400,
                         live={10: [self.names["hold-impact"], self.names["merge-captain"]]})
-        self.assertEqual([w[1].rsplit("/", 1)[-1] for w in self.removals(10)], [urllib.parse.quote(self.names["hold-impact"], safe="")])
+        self.assertEqual(sorted(w[1].rsplit("/", 1)[-1] for w in self.removals(10)), sorted(urllib.parse.quote(n, safe="") for n in self.both()))
 
     def test_the_dry_run_and_the_daemon_make_the_same_decisions_over_the_same_pull_requests(self):
         names = self.names
@@ -32484,6 +32485,229 @@ class TestImpactRejudge(LedgerBase):
         self.files(10, "shims/gh", head=LEDGER_NEW_HEAD)
         self.passes([self.listed(10, head=LEDGER_NEW_HEAD)], advance=400)
         self.assertEqual(len(self.posts(10)), 1, "a new head is held again")
+
+    # -- #891: a hold label put on by hand is the daemon's own once the rule holds the pull request at its head
+
+    ADOPT_HEAD_OTHER = "c" * 40
+    ADOPT_ORDER = {"number": 5, "text": "the owner's standing order"}
+
+    def adopt_labels(self):
+        """Every hold label the daemon can add or clear, DERIVED from the code: the captain marker and each `hold-*` class (the key sets the clear and the label pass use)."""
+        keys = ("merge-captain",) + tuple(sb.CAPTAIN_HOLD_LABELS)
+        return [(key, self.names[key]) for key in keys]
+
+    def adopt_state(self, **parts):
+        state = {"clears": {}, "applied": {}}
+        state.update(parts)
+        (self.world.state / "impact-hold.json").write_text(json.dumps(state))
+
+    def fresh_pass(self, records, live=None):
+        """One more pass of the REAL daemon that re-judges every pull request (the rule's fingerprint is new, so the pass's own memory of a judged head does not skip it)."""
+        self.fresh = getattr(self, "fresh", 0) + 1
+        with mock.patch.object(sb.impact_floor, "rule_fingerprint", lambda k=self.fresh: "fresh-%d" % k):
+            self.passes(records, advance=400, live=live)
+
+    def adopted(self, number=10):
+        return [e["detail"] for e in self.events("gate.label_adopted") if e["subject"] == "acme/app#%d" % number]
+
+    def recorded(self, number=10):
+        return sb.read_impact_state(self.world.state)[0]["applied"].get("acme/app#%d" % number)
+
+    def rated_here(self, number=10, head=LEDGER_HEAD):
+        sb.plan_ledger.append_entry(self.world.state, {"kind": "review_record", "pr": "acme/app#%d" % number, "head": head, "reviewer": "impact", "verdict": "approve",
+                                                       "blocks": 0, "notes": 0, "by": "rev", "by_role": "reviewer", "impact_action": "second-review", "summary": "x"}, 1)
+
+    def run_adopt_case(self, label, case):
+        """One (label, case) cell of the table: drive the REAL pass (or the real re-hold function) and return nothing; the assertions are in the cell."""
+        n = 10
+        captain, impact = self.names["merge-captain"], self.names["hold-impact"]
+        wanted_by_floor = label in (captain, impact)
+        if case in ("hand_floor_holds", "daemon_present", "absent", "cleared_this_head", "cleared_other_head_floor_holds"):
+            self.files(n, "shims/gh")
+        else:
+            self.files(n, "docs/a.md")
+        on_pr = [] if case == "absent" else [label]
+        if case == "daemon_present":
+            self.adopt_state(applied={"acme/app#%d" % n: {"head": LEDGER_HEAD, "merge_label_added": label == captain, "added": [label], "at": 5}})
+        elif case == "cleared_this_head":
+            self.adopt_state(clears={"acme/app#%d" % n: {"head": LEDGER_HEAD, "reason": "x", "by": "own", "at": 1, "removed": [label]}})
+        elif case in ("cleared_other_head_floor_holds", "hand_rehold_wants_it", "cleared_other_head_rated_here"):
+            self.adopt_state(clears={"acme/app#%d" % n: {"head": self.ADOPT_HEAD_OTHER, "reason": "x", "by": "own", "at": 1, "removed": [label]}})
+        if case == "cleared_other_head_rated_here":
+            self.rated_here(n)
+        if case == "hand_rehold_wants_it":
+            self.passes([])   # the engine
+            self.prs[n]["labels"] = [{"name": l} for l in on_pr]
+            report = sb.pr_floor_report(self.engine, "acme/app", n)
+            self.assertTrue(sb._impact_rehold_now(self.engine, "acme/app", n, "acme/app#%d" % n, report, {"labels": []}), "the re-hold path holds it again")
+        else:
+            self.passes([self.listed(n, on_pr)], live={n: on_pr})
+        return wanted_by_floor
+
+    def assert_adopt_cell(self, label, case):
+        wanted_by_floor = self.run_adopt_case(label, case)
+        got, record = self.adopted(), self.recorded()
+        if case in ("hand_floor_holds", "cleared_other_head_floor_holds"):
+            expected = [label] if wanted_by_floor else []   # `hold-owner` is not a label the rule writes: never adopted
+        elif case == "hand_rehold_wants_it":
+            expected = [] if label == self.names[sb.OWNER_HOLD_KEY] else [label]   # the owner's own hold is never the daemon's, a re-hold does not restore it
+        else:
+            expected = []
+        self.assertEqual([d["label"] for d in got], expected, "%s / %s" % (label, case))
+        self.assertTrue(all(d["head"] == (LEDGER_HEAD) for d in got))
+        if expected:
+            self.assertIn(label, record["added"], "an adopted label is in the record a daemon-added label is kept in")
+            self.assertEqual(record["merge_label_added"], self.names["merge-captain"] in record["added"])
+            self.assertEqual(sorted(record), ["added", "at", "head", "merge_label_added"], "the record keeps its shape")
+        elif case in ("not_holds_by_hand", "cleared_this_head", "cleared_other_head_rated_here"):
+            self.assertIsNone(record if case != "cleared_this_head" else None, "nothing was written")
+        if case in ("hand_floor_holds", "cleared_other_head_floor_holds") and not wanted_by_floor:
+            self.assertNotIn(label, [l for w in self.posts(10) for l in w[2]["labels"]], "a class the rule does not write is never written by it")
+
+    ADOPT_CASES = ("hand_floor_holds", "hand_rehold_wants_it", "daemon_present", "absent", "not_holds_by_hand", "cleared_this_head",
+                   "cleared_other_head_rated_here", "cleared_other_head_floor_holds")
+
+    def test_the_adoption_table_is_the_labels_the_code_names_by_the_cases_and_every_cell_has_its_test(self):
+        labels = [name for _, name in self.adopt_labels()]
+        self.assertEqual(len(labels), 9, "the captain marker and 8 hold classes (hold-owner is one of them)")
+        self.assertIn(self.names["hold-owner"], labels)
+        from_specs = {self.names[key] for key, _, _ in sb.LABEL_SPECS if key.startswith("hold-")}
+        self.assertEqual({n for k, n in self.adopt_labels() if k != "merge-captain"}, from_specs, "the label bootstrap creates exactly the hold classes the table names")
+        import chat_clear as cc
+        self.assertEqual(set(cc.HOLD_KEYS + cc.OTHER_HOLD_KEYS), {k for k, _ in self.adopt_labels() if k != "merge-captain"}, "the chat clear names every hold class, offered or not")
+        self.assertFalse(cc.is_offerable(self.names, [self.names["hold-impact"], self.names["hold-owner"]]), "a chat clear never offers the owner's own hold")
+        self.assertEqual(sorted(labels), sorted(sb.authors_hold_labels(self.names, {"labels": list(self.names.values())}, [])),
+                         "the table's labels are the labels the clear classes as the fleet's own holds (one derivation)")
+        made = {name[len("test_adoption_cell_"):] for name in dir(type(self)) if name.startswith("test_adoption_cell_")}
+        want = {"%s__%s" % (key.replace("-", "_"), case) for key, _ in self.adopt_labels() for case in self.ADOPT_CASES}
+        self.assertEqual(made, want, "one test per label and case: a new class or case without one fails here")
+
+    def test_a_hand_label_adopted_is_recorded_audited_once_and_the_delegated_clear_lifts_it(self):
+        n = 10
+        self.files(n, "shims/gh")
+        self.passes([self.listed(n, self.both())], live={n: self.both()})
+        self.assertEqual(sorted(d["label"] for d in self.adopted()), sorted(self.both()))
+        self.assertEqual(self.posts(n), [], "nothing was written to GitHub: the labels were there")
+        self.assertEqual((self.recorded()["added"], self.recorded()["merge_label_added"]), (sorted(self.both()), True))
+        lines = sb.impact_clear_core(self.engine, self.route, "acme/app", n, "boss", "a judged false hold", head=LEDGER_HEAD, via="order:5", under_order=self.ADOPT_ORDER)
+        self.assertTrue(lines[0].startswith("cleared the impact hold"), lines)
+        self.assertEqual(sorted(w[1].rsplit("/", 1)[-1] for w in self.removals(n)), sorted(urllib.parse.quote(l, safe="") for l in self.both()))
+
+    def test_the_owners_own_hold_is_refused_by_the_delegated_clear_whatever_the_score_with_its_own_reason_and_lifted_by_the_owners_plain_clear(self):
+        n, owner = 10, self.names["hold-owner"]
+        self.files(n, "shims/gh")
+        everything = self.both() + [owner]
+        self.passes([self.listed(n, everything)], live={n: everything})
+        self.assertEqual(sorted(d["label"] for d in self.adopted()), sorted(self.both()), "adopted: the rule's labels, never the owner's own hold")
+        self.assertNotIn(owner, self.recorded()["added"])
+        for order in (dict(self.ADOPT_ORDER), dict(self.ADOPT_ORDER, threshold="High", score="Low")):
+            with self.assertRaises(sb.NoticeError) as raised:
+                sb.impact_clear_core(self.engine, self.route, "acme/app", n, "boss", "r", head=LEDGER_HEAD, via="order:5", under_order=order)
+            self.assertIn("owner's own hold", str(raised.exception))
+        self.assertEqual((self.removals(n), self.events("gate.hold_cleared")), ([], []))
+        refused = [e for e in self.events("gate.hold_clear_refused")]
+        self.assertEqual([(e["detail"]["owner_hold"], "owner's own hold" in e["detail"]["why"]) for e in refused], [(True, True)] * 2, "its own audited reason")
+        sb.impact_clear_core(self.engine, self.route, "acme/app", n, "owner", "r", head=LEDGER_HEAD)   # the owner's PLAIN clear
+        self.assertIn(urllib.parse.quote(owner, safe=""), [w[1].rsplit("/", 1)[-1] for w in self.removals(n)])
+
+    def test_a_re_hold_never_puts_the_owners_own_hold_back_and_a_record_that_lists_it_does_not_make_it_ours(self):
+        n, owner = 10, self.names["hold-owner"]
+        self.files(n, "docs/a.md")
+        self.adopt_state(clears={"acme/app#10": {"head": self.ADOPT_HEAD_OTHER, "reason": "x", "by": "own", "at": 1, "removed": [owner, self.names["hold-impact"]]}})
+        self.passes([self.listed(n)], live={n: []})
+        self.assertEqual([l for w in self.posts(n) for l in w[2]["labels"] if l == owner], [], "not restored")
+        names = self.names
+        listed = {"clears": {}, "applied": {"p": {"added": [owner, names["hold-impact"]], "at": 1, "head": "h", "merge_label_added": False}}}
+        self.assertEqual(sb._labels_ours(names, listed, "p", wide=True), [names["hold-impact"]])
+
+    def test_without_adoption_the_same_hand_label_is_refused_and_a_label_on_a_pull_request_the_rule_does_not_hold_stays_a_persons(self):
+        n = 10
+        self.files(n, "docs/a.md")   # the rule does not hold this one
+        self.passes([self.listed(n, self.both())], live={n: self.both()})
+        self.assertEqual((self.adopted(), self.recorded()), ([], None))
+        with self.assertRaises(sb.NoticeError) as raised:
+            sb.impact_clear_core(self.engine, self.route, "acme/app", n, "boss", "r", head=LEDGER_HEAD, via="order:5", under_order=self.ADOPT_ORDER)
+        self.assertIn("a person's own hold", str(raised.exception))
+        self.assertEqual(self.removals(n), [])
+        self.assertEqual(self.events("gate.hold_cleared"), [])
+
+    def test_adoption_is_once_across_passes_and_a_restart_and_a_clear_and_a_new_head_treat_it_as_the_daemons_own(self):
+        n = 10
+        self.files(n, "shims/gh")
+        for _ in range(3):
+            self.fresh_pass([self.listed(n, self.both())], live={n: self.both()})
+        self.assertEqual(len(self.adopted()), 2, "2 labels, each audited once over 3 passes")
+        del self.engine   # a restart: the engine is new, the state file is all that is left
+        self.fresh_pass([self.listed(n, self.both())], live={n: self.both()})
+        self.assertEqual(len(self.adopted()), 2, "a restart adopts and audits nothing more")
+        sb.impact_clear_core(self.engine, self.route, "acme/app", n, "boss", "r", head=LEDGER_HEAD, via="order:5", under_order=self.ADOPT_ORDER)
+        self.assertIsNone(self.recorded(), "a clear consumes the record exactly as for a daemon label")
+        self.files(n, "shims/gh", head=LEDGER_NEW_HEAD)
+        self.writes.clear()
+        self.fresh_pass([self.listed(n, head=LEDGER_NEW_HEAD)], live={n: []})
+        self.assertEqual(sorted(l for w in self.posts(n) for l in w[2]["labels"]), sorted(self.both()), "re-applied at the new head")
+        self.assertEqual(self.recorded()["head"], LEDGER_NEW_HEAD)
+        self.assertEqual(len(self.adopted()), 2, "re-applied labels are the daemon's, never adopted")
+
+    def test_a_cut_label_read_or_a_state_noted_unreadable_adopts_nothing(self):
+        n, captain = 10, self.names["merge-captain"]
+        self.files(n, "shims/gh")
+        self.passes([self.listed(n)], live={n: []})
+        for cut in ([{"name": captain}, {"name": None}], [{"name": captain}, {}], [captain, 7]):
+            self.adopt_state()
+            self.prs[n]["labels"] = cut
+            self.fresh_pass([self.listed(n)], live={n: cut})
+            self.assertEqual(self.adopted(), [], repr(cut))
+            self.assertNotIn(captain, (self.recorded(n) or {}).get("added", []), repr(cut))
+        self.prs[n]["labels"] = [{"name": captain}]
+        (self.world.state / "impact-hold.json").write_text("{not json")
+        self.fresh_pass([self.listed(n)], live={n: [captain]})
+        self.assertEqual(self.adopted(), [], "a state noted unreadable in this pass adopts nothing in it")
+        report = sb.pr_floor_report(self.engine, "acme/app", n)
+        self.adopt_state()
+        self.prs[n]["labels"] = None   # the labels field is not a list at all: the apply raises, as before, and nothing is recorded
+        with self.assertRaises(Exception):
+            sb.apply_impact_hold(self.engine, "acme/app", n, dict(report, reasons=["x"]), {})
+        self.assertEqual(self.adopted(), [])
+
+    def test_a_pull_request_of_a_repository_the_daemon_does_not_watch_is_never_adopted_or_written(self):
+        self.files(10, "shims/gh")
+        self.passes([])
+        other = self.listed(11, self.both())
+        self.prs[11] = dict(self.prs.get(10), labels=[{"name": l} for l in self.both()])
+        self.hub.prs["acme/other"] = [other]   # listed by the hub, but the repository is under neither plan_gates nor impact_floor
+        before = len(self.writes)
+        sb.ci_record_pass(self.engine, self.t + 400)
+        sb.impact_would_hold_pass(self.engine, self.t + 400)
+        self.assertEqual((self.adopted(11), len(self.writes) - before), ([], 0))
+        self.assertIsNone(sb.read_impact_state(self.world.state)[0]["applied"].get("acme/other#11"))
+        self.assertEqual([e for e in self.events("gate.label_adopted") if e["subject"].startswith("acme/other")], [])
+
+    def test_an_adopting_pass_makes_no_extra_gh_call_and_the_dry_run_names_the_adoption(self):
+        n = 10
+        self.files(n, "shims/gh")
+        self.passes([self.listed(n, self.both())], live={n: self.both()})
+        self.assertEqual(self.view_reads, [n], "one floor read, as for any judged pull request")
+        code, out, err = self.run_as("coder", "impact", "hold", "--dry-run", "--repo", "acme/app")
+        self.assertEqual(code, 0, err)
+        self.assertIn("already labelled", out, "after the adoption it is recorded: nothing more to adopt")
+        del self.engine
+        self.adopt_state()
+        before = len(self.adopted())
+        code, out, err = self.run_as("coder", "impact", "hold", "--dry-run", "--repo", "acme/app")
+        self.assertIn("would adopt", out)
+        self.assertEqual(len(self.adopted()), before, "the dry run writes and audits nothing")
+
+
+def _adoption_cells():
+    for _key in ("merge-captain",) + tuple(sb.CAPTAIN_HOLD_LABELS):
+        for _case in TestImpactRejudge.ADOPT_CASES:
+            def cell(self, _key=_key, _case=_case):
+                self.assert_adopt_cell(self.names[_key], _case)
+            setattr(TestImpactRejudge, "test_adoption_cell_%s__%s" % (_key.replace("-", "_"), _case), cell)
+
+
+_adoption_cells()
 
 
 class TestImpactHold(LedgerBase):

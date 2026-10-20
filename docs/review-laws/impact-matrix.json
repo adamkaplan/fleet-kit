@@ -438,6 +438,7 @@
         "LABEL_SPECS",
         "NOTIFY_CLEAR_DEADLINE_SECONDS",
         "NoticeError",
+        "OWNER_HOLD_KEY",
         "PROG",
         "Path",
         "_PLAN_ISSUE_RE",
