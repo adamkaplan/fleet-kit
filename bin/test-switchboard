@@ -74244,7 +74244,7 @@ OLD_SOURCE_ALLOWED = {
 # Live observers: they ask herdr which panes exist right now (`agent list`). Each is a NAMED entry with its reason, never a silent skip. fleet-heartbeat is
 # a dated, PENDING entry (the Chief of Staff decided: no standing exception); the other two are the live source the registry is fed from.
 LIVE_OBSERVERS = {
-    "fleet-heartbeat": "PENDING SLICE 5 (listed 2026-10-20): reads the herdr agent list itself to decide who to wake; slice 5 makes it derive who exists from the registry and DELETES this entry. Not a standing exception",
+    "fleet-heartbeat": "slice 5 landed (#923, 2026-10-20): who exists now comes from the registry; the herdr agent list stays only as its live observation of panes (its supervision state), and decides nobody exists. Listed so a future change is seen",
     "fleet-switchboard": "discovery and the pane check: the live source the registry is fed from (herdr and the v2 service), not a record of who exists",
     "proof-switchboard": "the proof harness finds the pane of one session in a lab; it keeps no list",
 }
