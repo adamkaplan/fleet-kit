@@ -354,6 +354,7 @@
         "bin/queue_ejections.py",
         "bin/reassign.py",
         "bin/reds.py",
+        "bin/registry.py",
         "bin/report_fold.py",
         "bin/spotlight_guard.py",
         "bin/triage_digest.py",
@@ -395,6 +396,9 @@
           "validate"
         ],
         "bin/reassign.py": [
+          "*"
+        ],
+        "bin/registry.py": [
           "*"
         ],
         "bin/reds.py": [
