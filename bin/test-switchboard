@@ -13201,7 +13201,7 @@ class TestChatClearHook(Base):
         self.assertEqual(len(reads), 1, calls)
         self.assertIn("sessionID=" + self.world.sessions["cos"], reads[0])
         self.assertEqual(len(self.events("chat_clear.verdict")), 2)
-        (read,) = self.events("chat_clear.read")
+        read = self.events("chat_clear.read")[-1]   # one line per change: the empty page first, then the two
         self.assertEqual((read["detail"]["records"], read["detail"]["light"]), (2, True), "the cost line the body promises: records and bytes")
         self.assertGreater(read["detail"]["bytes"], 0)
 
