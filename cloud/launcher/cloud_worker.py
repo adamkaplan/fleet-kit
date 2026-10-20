@@ -1664,7 +1664,7 @@ VALIDATORS = {
     "CW_APP_INSTALLATION_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
     "CW_APP_KEY_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
     "CW_CLUSTER_ADMIN_SECRET": ("a vault secret name: 1 to 127 letters, digits and hyphens, starting with a letter or digit", lambda v: bool(_VAULT_SECRET_NAME.fullmatch(v))),
-    "CW_TOKEN_MODE": ("exactly default or read-only", lambda v: v in ("default", "read-only")),
+    "CW_TOKEN_MODE": ("exactly default or read-only", lambda v: v in TOKEN_MODES),
     "CW_CLUSTER_TOKEN_DURATION": ("a duration of 1 to 3 digits and m or h, from 1m to 60m (for example 20m or 1h)", _duration_ok),
     "CW_VAULT_CHECK_DIR": ("an absolute path with no .. segment", _path_ok),
 }
@@ -1762,6 +1762,25 @@ def parse_settings(text, path="the settings file"):
     if missing:
         raise _bad(path, "lacks the required setting%s %s" % ("s" if len(missing) > 1 else "", ", ".join(missing)))
     return values
+
+
+TOKEN_MODES = ("default", "read-only")   # the git token's modes: the mint's own table (app_token.PERMISSION_MODES; a test compares the two)
+
+
+def token_mode_choice(flag, env):
+    """(mode, source) of ONE launch, for the launch command and the driver alike: the flag wins, else the settings key CW_TOKEN_MODE, else default.
+    The source is "the flag", "the settings" or None. A flag or key that is not exactly a mode, an empty key included, is refused naming the
+    name and never the value (a key that is set but empty never falls back to the broader token)."""
+    if flag is not None:
+        if flag not in TOKEN_MODES:
+            raise CloudError("--token-mode is one of %s; nothing was created" % ", ".join(TOKEN_MODES), EXIT_USAGE)
+        return flag, "the flag"
+    key = env.get("CW_TOKEN_MODE")
+    if key is not None:
+        if key not in TOKEN_MODES:
+            raise CloudError("CW_TOKEN_MODE must be exactly %s; nothing was created" % " or ".join(TOKEN_MODES), EXIT_USAGE)
+        return key, "the settings"
+    return "default", None
 
 
 def apply_settings(env=None, path=None):

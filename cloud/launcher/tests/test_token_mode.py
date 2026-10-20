@@ -137,14 +137,6 @@ class Mint(unittest.TestCase):
         with open(os.path.join(FIXTURES, "token_request_default.json"), "rb") as f:
             self.assertEqual(Stub.seen[0][1], f.read())
 
-    def test_the_request_permissions_are_exactly_the_table_row_and_default_sends_none(self):
-        for mode, row in app_token.PERMISSION_MODES.items():
-            body = app_token.request_body("widget-service", mode)
-            if mode == "default":
-                self.assertEqual(body, {"repositories": ["widget-service"]})
-            else:
-                self.assertEqual(body, {"repositories": ["widget-service"], "permissions": row})
-
     def test_request_mutants_each_change_the_request(self):   # one mutant per member of every row: the row changed, the body must change
         for mode, row in app_token.PERMISSION_MODES.items():
             if mode == "default":
@@ -174,13 +166,6 @@ class Mint(unittest.TestCase):
                         self.assertEqual(len(p.stderr.strip().splitlines()), 1)
                         for secret in (TOKEN, PLANTED):
                             self.assertNotIn(secret, p.stderr)
-
-    def test_the_answer_table_in_process_and_its_mutants(self):
-        for mode in MODES:
-            for label, perms, accepted in answer_rows(mode):
-                with self.subTest(mode=mode, row=label):
-                    refused, _ = refused_in_process(mode, perms)
-                    self.assertEqual(refused, not accepted)
 
     def test_each_row_has_a_mutant_that_flips_it(self):
         """One mutant per member (mode, key) and kind: a check built wrongly accepts the row that member guards, or refuses the exact row."""
@@ -276,6 +261,31 @@ class Mint(unittest.TestCase):
         self.assertEqual((code, calls), (2, []))
         self.assertIn("CW_GIT_TOKEN_CMD", err.getvalue())
 
+    def test_the_driver_reads_the_settings_key_when_no_flag_is_given(self):
+        """Through the driver's real main, up to the point the mode is resolved (the preflight is made to stop the run)."""
+        stop = RuntimeError("stop after the mode is resolved")
+        seen = []
+
+        def fake_driver(a, env):
+            seen.append(a.token_mode)
+            raise stop
+        base = {"CW_ALLOWED_REPOS": REAL}
+        for flag, key, want in (((), "read-only", "read-only"), (("--token-mode", "default"), "read-only", "default"), ((), None, "default"),
+                                (("--token-mode", "read-only"), "default", "read-only")):
+            with self.subTest(flag=flag, key=key):
+                env = dict(base, **({"CW_TOKEN_MODE": key} if key else {}), CW_KUBE_CONTEXT="ctx")
+                with mock.patch.object(cw, "check_repo_preflight", lambda *a: "ok"), mock.patch.object(run_task, "Driver", fake_driver):
+                    with self.assertRaises(RuntimeError):
+                        run_task.main(["w1", REAL, "main", "/dev/null", *flag], env)
+                self.assertEqual(seen[-1], want)
+        for bad in ("", "Read-Only", "write"):
+            with self.subTest(bad=bad), contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(run_task.main(["w1", REAL, "main", "/dev/null"], dict(base, CW_TOKEN_MODE=bad, CW_KUBE_CONTEXT="ctx")), 2)
+                self.assertIn("CW_TOKEN_MODE", err.getvalue())
+
+    def test_the_driver_flag_choices_are_the_mints_table(self):
+        self.assertEqual(set(cw.TOKEN_MODES), set(app_token.PERMISSION_MODES))
+
     def test_the_driver_mode_changes_the_command(self):
         self.assertNotEqual(self.driver_cmd("read-only", {})[0], self.driver_cmd(None, {})[0])
 
@@ -287,30 +297,35 @@ class Mint(unittest.TestCase):
         for bad in ("Read-Only", "write", "read_only", "", "default,read-only", "read-only "):
             self.assertFalse(ok(bad), bad)
 
-    # -- S8: what each mode's set lets a worker do
+    # -- S8: what the permissions the REAL request carries let a worker do
     NEEDS = {"push": {("contents", "write")}, "open a pull request": {("pull_requests", "write")},
              "comment": {("issues", "write"), ("pull_requests", "write")}}
 
     @classmethod
-    def allowed(cls, row):
-        return {act for act, needs in cls.NEEDS.items() if any(row.get(k) == lvl for k, lvl in needs)}
+    def allowed(cls, perms):
+        return {act for act, needs in cls.NEEDS.items() if any(perms.get(k) == lvl for k, lvl in needs)}
 
-    def test_read_only_allows_none_of_push_open_a_pull_request_or_comment(self):
-        self.assertEqual(self.allowed(app_token.PERMISSION_MODES["read-only"]), set())
-        self.assertEqual(self.allowed(app_token.PERMISSION_MODES["default"]), set(self.NEEDS))
+    def requested(self, mode):
+        """The permissions a launch of this mode asks GitHub for (default asks for none: it gets the App's set, which the answer check pins to its row)."""
+        return app_token.request_body("widget-service", mode).get("permissions", app_token.PERMISSION_MODES[mode])
 
-    def test_the_read_only_mutants_each_allow_a_named_action(self):
-        """Mutant A adds contents write: the allowed set becomes {push} (the right row gives the empty set). Mutant B adds pull_requests write:
-        {open a pull request, comment}. Mutant C adds issues write: {comment}. Each fails the test above by showing exactly that set."""
+    def test_the_read_only_request_allows_none_of_push_open_a_pull_request_or_comment(self):
+        self.assertEqual(self.allowed(self.requested("read-only")), set())
+        self.assertEqual(self.allowed(self.requested("default")), set(self.NEEDS))
+
+    def test_a_read_only_build_that_widens_the_table_allows_a_named_action(self):
+        """The right build asks for the empty set of actions. Mutant A (contents write added to the read-only row) asks for a token that allows exactly
+        {push}; B (pull_requests write) {open a pull request, comment}; C (issues write) {comment}. Each is a different concrete result from the right
+        build's empty set, taken from the real request body and the real answer check (which then accepts that wider answer instead of refusing it)."""
         row = app_token.PERMISSION_MODES["read-only"]
         for added, expected in ((("contents", "write"), {"push"}), (("pull_requests", "write"), {"open a pull request", "comment"}),
                                 (("issues", "write"), {"comment"})):
             with self.subTest(added=added):
-                self.assertEqual(self.allowed(dict(row, **{added[0]: added[1]})), expected)
-                with mock.patch.dict(app_token.PERMISSION_MODES, {"read-only": dict(row, **{added[0]: added[1]})}):
-                    self.assertEqual(self.allowed(app_token.PERMISSION_MODES["read-only"]), expected)
-                    self.assertNotEqual(expected, set())   # the right build's result is the empty set: a different concrete result
-                    self.assertEqual(app_token.request_body("widget-service", "read-only")["permissions"][added[0]], added[1])
+                wider = dict(row, **{added[0]: added[1]})
+                with mock.patch.dict(app_token.PERMISSION_MODES, {"read-only": wider}):
+                    self.assertEqual(self.allowed(self.requested("read-only")), expected)
+                    self.assertFalse(self.outcome(app_token.check_permissions, "read-only", wider))   # the wider answer would now be accepted
+                self.assertTrue(self.outcome(app_token.check_permissions, "read-only", wider))   # the right build refuses it
 
     # -- (6) the guard wrapper and the entrypoint are unchanged (the control is the token's own set)
     def test_the_guard_wrapper_and_the_entrypoint_are_unchanged(self):

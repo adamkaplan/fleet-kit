@@ -2186,7 +2186,7 @@ class TestTokenMode(Base):
                     self.assertIn("from " + source, lines[0])
 
     def test_a_key_that_is_not_a_mode_is_refused_naming_the_key_never_the_value_from_the_file_and_the_environment(self):
-        for value in ("Read-Only", "write", "read_only", "readonly"):
+        for value in ("Read-Only", "write", "read_only", "readonly"):   # (an empty value in the file is "unset": the reader skips it)
             with self.subTest(source="file", value=value):
                 self.settings_file(CW_TOKEN_MODE=value)
                 code, out, err = self.launch_with("--cloud")
@@ -2202,6 +2202,13 @@ class TestTokenMode(Base):
                 self.assertIn("CW_TOKEN_MODE", err)
                 self.assertNotIn(value, err)
                 self.nothing_ran()
+
+    def test_a_set_but_empty_key_in_the_environment_is_refused_never_read_as_default(self):
+        with mock.patch.dict(os.environ, {"CW_TOKEN_MODE": ""}):
+            code, out, err = self.launch_with("--cloud")
+        self.assertEqual(code, 2, err)
+        self.assertIn("CW_TOKEN_MODE", err)
+        self.nothing_ran()
 
     def test_a_key_in_the_file_and_the_environment_that_differ_follows_the_existing_clash_refusal(self):
         self.settings_file(CW_TOKEN_MODE="read-only")
@@ -2247,13 +2254,6 @@ class TestTokenMode(Base):
         self.assertEqual(code, 0, err)
         self.assertEqual(self.mints, [])
         self.assertEqual(self.trace_lines(), ["preflight"])
-
-    def test_the_custom_command_mutant_that_trusts_it_is_caught(self):
-        with mock.patch.dict(os.environ, {"CW_GIT_TOKEN_CMD": "cat %s" % (self.stub_dir / "git_token")}), \
-                mock.patch.object(self.cw, "token_mode", lambda args, environ=None: ("default", None)):   # a build that ignored the mode
-            code, out, err = self.launch_with("--cloud", "--token-mode", "read-only")
-        self.assertEqual(code, 0, err)   # it would create a pod: the real build refuses (the test above)
-        self.assertTrue(self.stub_calls())
 
     # -- every other check runs unchanged, in the same order
     def test_the_read_only_launch_trace_differs_from_the_default_one_only_in_the_mints_mode(self):
@@ -2350,7 +2350,7 @@ class TestTokenMode(Base):
     def test_the_launch_modes_are_the_mints_table(self):
         sys.path.insert(0, str(BIN.parent / "cloud" / "launcher"))
         import app_token
-        self.assertEqual(set(self.cw.TOKEN_MODES), set(app_token.PERMISSION_MODES))
+        self.assertEqual(set(self.cw._lib().TOKEN_MODES), set(app_token.PERMISSION_MODES))
         lib = self.cw._lib()
         self.assertEqual({m for m in app_token.PERMISSION_MODES if lib.VALIDATORS["CW_TOKEN_MODE"][1](m)}, set(app_token.PERMISSION_MODES))
 

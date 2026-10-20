@@ -1019,24 +1019,16 @@ def model_entry():
     return json.dumps({MODEL_PROVIDER: entry})
 
 
-TOKEN_MODES = ("default", "read-only")   # the mint's table of modes (cloud/launcher/app_token.py PERMISSION_MODES); the test compares the two
 
 
 def token_mode(args, environ=None):
-    """(mode, source) for this launch: the flag wins, else the settings key CW_TOKEN_MODE, else default. The source is "the flag", "the settings"
-    or None (neither chose). A key value that is not a mode is refused naming the key, never the value."""
+    """(mode, source) for this launch: the launcher library's ONE rule (`token_mode_choice`): the flag wins, else the settings key CW_TOKEN_MODE, else
+    default. The source is "the flag", "the settings" or None (neither chose). A bad value is a Refusal naming the key, never the value."""
     environ = os.environ if environ is None else environ
-    flag = getattr(args, "token_mode", None)
-    if flag is not None:
-        if flag not in TOKEN_MODES:
-            raise Refusal("--token-mode is one of %s; nothing was created" % ", ".join(TOKEN_MODES))
-        return flag, "the flag"
-    key = environ.get("CW_TOKEN_MODE")
-    if key:
-        if key not in TOKEN_MODES:
-            raise Refusal("CW_TOKEN_MODE must be exactly %s; nothing was created" % " or ".join(TOKEN_MODES))
-        return key, "the settings"
-    return "default", None
+    try:
+        return _lib().token_mode_choice(getattr(args, "token_mode", None), environ)
+    except _lib().CloudError as err:
+        raise Refusal(str(err)) from None
 
 
 def git_token(repo, cluster, mode="default"):

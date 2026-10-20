@@ -451,7 +451,7 @@ def main(argv=None, env=None):
     p.add_argument("brief_file")
     p.add_argument("--pull-secret")
     p.add_argument("--image")
-    p.add_argument("--token-mode", choices=("default", "read-only"), help="the git token's permissions (default: contents and pull requests write; read-only: contents read)")
+    p.add_argument("--token-mode", choices=cw.TOKEN_MODES, help="the git token's permissions (default: contents and pull requests write; read-only: contents read)")
     try:
         a = p.parse_args(argv)
     except SystemExit as e:
@@ -464,7 +464,12 @@ def main(argv=None, env=None):
     except cw.CloudError as e:
         print("run-task: %s" % e, file=sys.stderr)
         return e.code
-    if a.token_mode not in (None, "default") and env.get("CW_GIT_TOKEN_CMD"):   # before the preflight (which mints a token) and any pod
+    try:   # the flag, else the settings key CW_TOKEN_MODE (the launch command's rule): a driver run must not hand a write token to a read-only setting
+        a.token_mode, _ = cw.token_mode_choice(a.token_mode, env)
+    except cw.CloudError as e:
+        print("run-task: %s" % e, file=sys.stderr)
+        return e.code
+    if a.token_mode != "default" and env.get("CW_GIT_TOKEN_CMD"):   # before the preflight (which mints a token) and any pod
         print("run-task: --token-mode %s does not combine with CW_GIT_TOKEN_CMD; nothing was created" % a.token_mode, file=sys.stderr)
         return 2
     try:   # FAIL CLOSED: a missing, killed or silent preflight refuses
