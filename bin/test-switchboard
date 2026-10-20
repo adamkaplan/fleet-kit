@@ -72246,7 +72246,7 @@ class FakePullFiles:
 
     def view(self):
         """what `gh pr view --json files,...` says: at most 100 files, a rename without its source"""
-        shown = [{"path": f["filename"], "additions": 1, "deletions": 1, "changeType": f["status"].upper()} for f in self.files[:100]]
+        shown = [{"path": f["filename"] if isinstance(f, dict) else "x", "additions": 1, "deletions": 1, "changeType": f["status"].upper() if isinstance(f, dict) else "MODIFIED"} for f in self.files[:100]]
         return {"headRefOid": self.HEAD, "baseRefOid": "b" * 40, "changedFiles": self.count, "files": shown}
 
     def fault(self, key):
@@ -72343,6 +72343,14 @@ class TestPullFileListRead(LedgerBase):
                 api = self.serve(FakePullFiles.make(size))
                 report, why = self.check()
                 self.assertEqual((why, report is not None), (None, True), size)
+
+    def test_the_clear_reuses_the_floors_paged_list_each_page_asked_once_for_a_rename_pull_request(self):
+        files = FakePullFiles.make(250)
+        files[3] = dict(files[3], status="renamed", previous_filename="docs/old.md")
+        api = self.serve(files)
+        report, why = self.check()
+        self.assertEqual(why, None)
+        self.assertEqual([api.pages_asked(n) for n in (1, 2, 3, 4)], [1, 1, 1, 0], "the floor read the pages; the clear did not read them again")
 
     def test_u4_a_view_that_vouches_for_its_list_makes_no_paged_read_for_the_floor(self):
         api = self.serve(FakePullFiles.make(38))
@@ -72587,7 +72595,7 @@ class TestPullFileListRead(LedgerBase):
 
     def words(self, kind):
         return {"read_failed": "after one retry", "not_a_list": "was not a list", "over_limit": "more than 3000 changed files", "head_moved": "head moved",
-                "cut": "GitHub itself says the file list is cut", "no_source": "no known source path", "not_recorded": "no reason was recorded"}[kind]
+                "cut": "GitHub itself says the file list is cut", "bad_entry": "is not a file entry", "no_count": "count of changed files was missing", "no_source": "no known source path", "not_recorded": "no reason was recorded"}[kind]
 
     def drive(self, kind, detail=None):
         """the refusal text the real clear gives for each kind of failure in the table (`detail` picks which failed read for read_failed)"""
@@ -72610,6 +72618,12 @@ class TestPullFileListRead(LedgerBase):
             self.serve(FakePullFiles.make(3001))
         elif kind == "head_moved":
             self.serve(FakePullFiles.make(38), heads=[FakePullFiles.HEAD, "d" * 40])
+        elif kind == "bad_entry":
+            api = self.serve(FakePullFiles.make(150))
+            api.files[0] = "bad"
+        elif kind == "no_count":
+            api = self.serve(FakePullFiles.make(38))
+            api.count = None
         elif kind == "cut":
             self.serve(FakePullFiles.make(38), count=40)
         elif kind == "no_source":
@@ -72735,7 +72749,17 @@ class TestPullFileListRead(LedgerBase):
             self.serve(FakePullFiles.make(38), count=40)
             self.assertIn("itself says", self.drive("cut"))
 
+        def dropped():
+            api = self.serve(FakePullFiles.make(150))
+            api.files[0] = "bad"
+            self.assertIn("is not a file entry", self.drive("bad_entry"))
+
+        def nocount():
+            self.assertIn("count of changed files was missing", self.drive("no_count"))
+
         mutants = {
+            "a missing count is not refused as such": ('        raise FileListError("no_count")', '        pass', nocount),
+            "an entry that is not a file is dropped": ('                raise FileListError("bad_entry", page, position, "a %s, not an object" % type(entry).__name__)', '                continue', dropped),
             "one page only": ('        if len(got) < FILE_PAGE:\n            break', '        break', whole),
             "every failure is a cut list": ('FileListError("read_failed", what + error_class(err))', 'FileListError("cut", 0, 0)', lambda: self.assertIn("after one retry", self.drive("read_failed"))),
             "no retry": ("    for _ in (1, 2):", "    for _ in (1,):", transient),

@@ -185,6 +185,8 @@ FILE_REFUSALS = {
     "over_limit": "the pull request has more than %d changed files, more than GitHub lists: too many to read in full",
     "head_moved": "the pull request's head moved while it was being checked (%s, then %s): nothing was cleared",
     "cut": "GitHub itself says the file list is cut: it listed %d of %d changed files",
+    "bad_entry": "page %d, position %d of the changed files is not a file entry (%s)",
+    "no_count": "the pull request's count of changed files was missing, so the list cannot be checked against it",
     "no_source": "%d renamed or copied file(s) with no known source path (%s)",
     "not_recorded": "the file list was not read in full (no reason was recorded)",
 }
@@ -245,13 +247,18 @@ def read_pr_files(get, repo, number):
     files = []
     for page in range(1, FILE_PAGES + 1):
         got = read_with_retry(get, "repos/%s/pulls/%d/files?per_page=%d&page=%d" % (repo, number, FILE_PAGE, page), lambda a: isinstance(a, list), "page %d: " % page)
-        files.extend(f for f in got if isinstance(f, dict))
+        for position, entry in enumerate(got, 1):   # a list is not yet a list of files: an entry that is not one is refused with its place, never dropped (dropping it would make the count differ and blame GitHub)
+            if not isinstance(entry, dict):
+                raise FileListError("bad_entry", page, position, "a %s, not an object" % type(entry).__name__)
+            if not isinstance(entry.get("filename"), str) or not entry["filename"]:
+                raise FileListError("bad_entry", page, position, "no file name")
+            files.append(entry)
         if len(got) < FILE_PAGE:
             break
     else:
         raise FileListError("over_limit", FILE_LIMIT)   # the page after the 3000th file still has files
     if total is None:
-        raise FileListError("read_failed", "the pull request's count of changed files was missing")
+        raise FileListError("no_count")
     if total != len(files):
         raise FileListError("cut", len(files), total)
     return files, pull
