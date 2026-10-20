@@ -1360,7 +1360,6 @@ def run(args):
         return 127
     plan = None
     warn_shared_body_file(args)
-    args = canonical_pr_merge(args)   # one canonical form of `pr merge` for every probe below (#962)
     args, over_found, over_reason = take_over_review(args)   # the shim's own flag never reaches gh or the signing
     write = is_write(args)
     lookup = Lookup(write=write)   # one identity lookup, one deadline, for the name and the account together
