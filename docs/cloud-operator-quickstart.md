@@ -40,13 +40,13 @@ ${EDITOR:-vi} ~/.config/fleet-switchboard/cloud.env
 ls -l ~/.config/fleet-switchboard/cloud.env   # -rw-------
 ```
 
-Each setting's name, whether the file requires it, and its kind (name, path, command, digest-ref, number, secret-name, duration):
+Each setting's name, whether the file requires it, and its kind (name, https URL, path, command, digest-ref, number, secret-name, duration):
 
 | Setting | Required | Kind | What it is |
 |---|---|---|---|
 | `CW_ALLOWED_REPOS` | yes | name | comma-separated `OWNER/NAME` the launcher may use, e.g. `acme-org/widget-service`; no wildcard. Unset or empty refuses everything. |
 | `CW_CLOUD_IMAGE` | yes | digest-ref | the worker image, by digest: `name@sha256:<64 hex>`; a tag refuses. (`--image` on the command line stays as it was.) |
-| `CW_CLOUD_SERVER` | yes | name | the cluster API address: `https://NAME[:PORT]`, where NAME is a DNS name with at least two labels (an IP address of any form, including `[::1]`, `127.1` and `0x7f000001`, is refused: a cluster reached by IP needs a DNS name), a last label that has a letter and is not all digits or `0x`, and a port from 1 to 65535; no user, query, fragment, path, `file:` or `http:` |
+| `CW_CLOUD_SERVER` | yes | https URL | an https URL whose host is a DNS name (`https://NAME[:PORT]`), where NAME is a DNS name with at least two labels (an IP address of any form, including `[::1]`, `127.1` and `0x7f000001`, is refused: a cluster reached by IP needs a DNS name), a last label that has a letter and is not all digits or `0x`, and a port from 1 to 65535; no user, query, fragment, path, `file:` or `http:` |
 | `CW_VAULT_SUBSCRIPTION` | yes | name | the vault's subscription, a GUID |
 | `CW_VAULT_NAME` | yes | name | the vault's name: 3 to 24 letters, digits and hyphens, starting with a letter |
 | `CW_CLOUD_NAMESPACE` | yes | name | the namespace the workers live in: a DNS label; `default` and `kube-*` are refused |
@@ -75,7 +75,7 @@ The template (neutral placeholders; copy, edit, keep only what you need, and set
 CW_ALLOWED_REPOS=acme-org/widget-service
 # the worker image, by digest
 CW_CLOUD_IMAGE=registry.example.internal/acme/worker@sha256:0000000000000000000000000000000000000000000000000000000000000000
-# the cluster API address
+# the cluster: an https URL whose host is a DNS name (https://NAME[:PORT])
 CW_CLOUD_SERVER=https://cluster.example.internal:6443
 # the vault that holds the cluster login
 CW_VAULT_SUBSCRIPTION=00000000-0000-0000-0000-000000000000
@@ -122,6 +122,8 @@ Nothing needs to be on your `PATH`. `launch --cloud` (and `send`, `read`, `retir
    "Own checkout" means the checkout that holds the running `bin/cloud_worker.py`, never the working directory. A lane that runs the switchboard from a worktree of a branch under review therefore uses THAT branch's launcher: it is the same checkout as the running script, so the trust root is unchanged.
 3. `cloud-worker` on the `PATH`, as before.
 4. Otherwise `launch` refuses (exit status 2, before any vault, cluster or launcher call), naming `FLEET_CLOUD_WORKER_BIN` and the checkout path it looked in.
+
+Limit: the checks judge the launcher file once, just before it runs. A process running as the same user can still replace the file in that window, or edit the switchboard itself: the checks guard against OTHER users, not against yourself.
 
 ## 2. Order of checks
 

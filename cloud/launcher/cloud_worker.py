@@ -1515,7 +1515,7 @@ SETTINGS = (
     ("CW_ALLOWED_REPOS", True, "name"),            # comma-separated OWNER/NAME
     ("CW_TOOLING_REPO", False, "name"),
     ("CW_CLOUD_IMAGE", True, "digest-ref"),
-    ("CW_CLOUD_SERVER", True, "name"),             # the cluster API address
+    ("CW_CLOUD_SERVER", True, "name"),             # an https URL whose host is a DNS name (https://NAME[:PORT]); its kind label stays "name"
     ("CW_CLOUD_CA_FILE", False, "path"),
     ("CW_PULL_SECRET", False, "name"),             # the NAME of a Secret, never its content
     ("CW_VAULT_SUBSCRIPTION", True, "name"),
