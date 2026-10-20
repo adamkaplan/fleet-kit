@@ -26601,6 +26601,114 @@ class TestOwnerlessSummary(Base):
         for change in ({"assignees": ["x"]}, {"number": 5}, {"number": 6}, {"number": 7}, {"owner_body": True}):
             self.assertTrue(module.is_claimed(dict(base, **change), ctx), change)
 
+    # #889: an ownerless, quiet issue parked until a future date is counted apart as `parked`; ONE table of cases drives every output of the family (OUTPUTS).
+    PARKED = 50          # the case issue: quiet 30 days, so older than everything else (a wrong build shows in the oldest age and in the links)
+    OUTPUTS = ("count", "oldest", "links", "parked_total", "send_gate", "report", "report_line", "audit")
+
+    def day(self, offset):
+        return datetime.datetime.fromtimestamp(self.world.clock.now() + offset * 86400, datetime.timezone.utc).strftime("%Y-%m-%d")
+
+    def cases(self):
+        lab, other = ["u:parked"], ["u:parked-ish"]
+        return {   # kind: (labels, body, hidden)
+            "future date": (lab, "Parked until: %s" % self.day(30), True),
+            "tomorrow": (lab, "Parked until: %s" % self.day(1), True),
+            "today": (lab, "Parked until: %s" % self.day(0), True),                 # parked through the end of that UTC day, as the reader and T3 say
+            "past date": (lab, "Parked until: %s" % self.day(-2), False),
+            "no date": (lab, "nothing here", False),
+            "malformed date": (lab, "Parked until: 2099-1-1", False),
+            "impossible date": (lab, "Parked until: 2099-02-30", False),
+            "two date lines": (lab, "Parked until: %s\nParked until: %s" % (self.day(30), self.day(40)), False),
+            "label without date": (lab, "", False),
+            "date without label": ([], "Parked until: %s" % self.day(30), False),
+            "another label": (other, "Parked until: %s" % self.day(30), False),
+            "date beyond the ceiling": (lab, "Parked until: 9999-12-31", False),
+            "date in a quote": (lab, "> Parked until: %s" % self.day(30), False),
+        }
+
+    def run_case(self, labels, body):
+        self.hub.open[self.TEAM] = {}
+        self.add(self.PARKED, created=40, updated=30, author="alice", labels=labels, body=body)
+        for n in (60, 61, 62):
+            self.add(n, created=15, updated=10 + n - 60, author="alice")
+        self.go()
+        state = sb.triage_state(self.engine)
+        return {"lines": self.lines("cos"), "shown": state.current.get("ownerless", {}).get(self.TEAM),
+                "report": "\n".join(sb.triage_status_lines(state.current)),
+                "audit": [e for e in self.world.audit() if e["event"] == "triage.ownerless"]}
+
+    def test_every_case_agrees_across_every_output_of_the_family(self):
+        link = "https://github.com/acme/web/issues/%d" % self.PARKED
+        for kind, (labels, body, hidden) in self.cases().items():
+            with self.subTest(kind):
+                self.setUp()
+                out = self.run_case(labels, body)
+                (line,) = out["lines"]
+                listed, parked, oldest = (3, 1, 12) if hidden else (4, 0, 30)
+                checked = {
+                    "count": "%d open issue(s)" % listed in line,
+                    "oldest": "oldest quiet for %d day(s)" % oldest in line,
+                    "links": (link in line) is (not hidden) and line.count("https://github.com/acme/web/issues/") == listed,
+                    "parked_total": "parked %d;" % parked in line,
+                    "send_gate": len(out["lines"]) == 1,
+                    "report": out["shown"]["count"] == listed and out["shown"]["parked"] == parked and out["shown"]["oldest_days"] == oldest,
+                    "report_line": "%d open issue(s) with no owner and quiet; parked %d;" % (listed, parked) in out["report"],
+                    "audit": out["audit"][-1]["detail"]["count"] == listed and out["audit"][-1]["detail"]["parked"] == parked,
+                }
+                self.assertEqual(set(checked), set(self.OUTPUTS))
+                self.assertEqual({k: v for k, v in checked.items() if not v}, {}, line)
+
+    def test_the_table_has_every_kind_of_case_the_ask_names(self):
+        self.assertTrue({"future date", "today", "past date", "no date", "malformed date", "label without date", "date without label"} <= set(self.cases()))
+        self.assertGreater(len([1 for c in self.cases().values() if c[2]]), 0)
+        self.assertGreater(len([1 for c in self.cases().values() if not c[2]]), 0)
+
+    def test_only_parked_issues_send_no_line_but_are_counted_in_the_report(self):
+        self.add(self.PARKED, created=40, updated=30, author="alice", labels=["u:parked"], body="Parked until: %s" % self.day(30))
+        self.go()
+        self.assertEqual(self.lines("cos"), [])
+        self.assertEqual(sb.triage_state(self.engine).current["ownerless"][self.TEAM]["parked"], 1)
+
+    def test_a_parked_issue_that_is_owned_or_recently_touched_is_not_counted_as_parked(self):
+        body = "Parked until: %s" % self.day(30)
+        self.add(self.PARKED, created=40, updated=30, author="alice", labels=["u:parked"], body=body, assignees=["carol"])
+        self.add(51, created=40, updated=1, author="alice", labels=["u:parked"], body=body)
+        self.add(52, created=40, updated=30, author="alice", labels=["u:parked"], body=body, pr=True)
+        self.go()
+        self.assertEqual(sb.triage_state(self.engine).current["ownerless"][self.TEAM]["parked"], 0)
+
+    def test_the_rule_reads_the_one_date_reader_and_has_no_parser_of_its_own(self):
+        import inspect
+        source = inspect.getsource(sb.load_module("triage_ownerless"))
+        for word in ("strptime", "Parked until", "re.compile", "datetime"):
+            self.assertNotIn(word, source)
+        self.assertIn("parked_until(", inspect.getsource(sb.triage_norm))
+        self.assertIn("triage_parked_now(", inspect.getsource(sb.triage_rules))   # T3 uses the same predicate
+
+    def test_the_parked_predicate_is_the_only_input_a_mutant_can_change(self):
+        module = sb.load_module("triage_ownerless")
+        item = {"number": 1, "pr": False, "state": "open", "labels": set(), "author": "alice", "assignees": [], "updated": 0.0, "owner_body": False}
+        ctx = {"chain": set(), "owned": set(), "unresolved": set()}
+        now = 10 * 86400.0
+        self.assertEqual(module.ownerless_split({1: item}, ctx, (), (), now), ([(1, 10.0)], []))
+        self.assertEqual(module.ownerless_split({1: item}, ctx, (), (), now, parked_now=lambda i, n: True), ([], [(1, 10.0)]))
+
+    def test_nothing_is_written_to_any_issue_with_parked_issues_present(self):
+        self.add(self.PARKED, created=40, updated=30, author="alice", labels=["u:parked"], body="Parked until: %s" % self.day(30))
+        self.add(60, created=15, author="alice")
+        self.go()
+        self.assertFalse(hasattr(self.hub, "write"), "the fake hub has no write method: a write cannot even be asked for")
+        self.assertFalse([a for a in self.runs if "--method" in a or "PATCH" in a or "POST" in a or "DELETE" in a])
+
+    def test_a_not_whole_read_counts_nothing_and_sends_nothing(self):
+        self.add(self.PARKED, created=40, updated=30, author="alice", labels=["u:parked"], body="Parked until: %s" % self.day(30))
+        self.add(60, created=15, author="alice")
+        with mock.patch.object(self.engine.herdr, "agent_list", side_effect=sb.HerdrError("down")):
+            self.engine.discover(self.world.clock.now())
+        self.go()
+        self.assertEqual(self.told("cos"), [])
+        self.assertNotIn(self.TEAM, sb.triage_state(self.engine).current.get("ownerless", {}))
+
 
 class TestTriageDigest(Base):
     """#349: the stale digest: one per pass, a backoff, changes, parked, 'seen, leave', the cost figure. It reuses the triage
