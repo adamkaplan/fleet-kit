@@ -25274,7 +25274,7 @@ def agent_body(text):
 
 def default_installed_agents_dir():
     """Where `install` writes the agent files of the private profile. Under the test suite there is none unless a test names one: the suite never reads the machine's own profile."""
-    if os.environ.get("FLEET_SWITCHBOARD_UNDER_TEST"):
+    if os.environ.get(UNDER_TEST_ENV):
         return None
     return _xdg("XDG_DATA_HOME", ".local/share") / PROG / "profile" / "config" / "opencode" / "agents"
 

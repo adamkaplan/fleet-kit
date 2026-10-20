@@ -64051,18 +64051,37 @@ class TestStructuralRuleInReviewing(unittest.TestCase):
         for word in ("acme/", "`list`", "table of the allowed commands", "one mutant per row"):
             self.assertIn(word, example)
 
+    FRONT_MATTER_SHA256 = {   # the front matter (permissions, mode, steps, model) of each definition, as a literal: this change moved none of it
+        "reviewer-architecture.md": "6ba86e43d65158f32f23a484ef5ecc37dd931c5c64838a4408914b8a64cdada9",
+        "reviewer-code.md": "780c9e18932f04f922a0a87d25bf31a2e1c7ea1f702bcee8406744d76219e913",
+        "reviewer-impact.md": "f94f58e5ae55912c10ed936118320e90d280a73f00657113df0ab7439192fa79",
+        "reviewer-security.md": "f10e5a595f25d6690bb7f92f7b5006ed39f3b1ce2a70967880151680e0d3c477",
+        "reviewer-test.md": "c1ef1b6c4bbd3dc43026d77cef875f32ac9d706a5ffa862b0c22b325433e932d",
+    }
+
     def test_the_rule_is_in_the_body_never_in_the_front_matter_of_a_definition(self):
-        done = subprocess.run(["git", "merge-base", "HEAD", "origin/integration"], cwd=str(REPO), capture_output=True, text=True)
-        if done.returncode != 0:
-            self.skipTest("no origin/integration here to compare the front matter with (a shallow clone): the front matter is not compared")
-        for path in sorted((REPO / "agents" / "reviewers").glob("*.md")):
+        paths = sorted((REPO / "agents" / "reviewers").glob("*.md"))
+        self.assertEqual([p.name for p in paths], sorted(self.FRONT_MATTER_SHA256), "a definition added or removed: pin its front matter here")
+        for path in paths:
             with self.subTest(definition=path.name):
                 front, body = path.read_text().split("\n---\n", 1)
                 self.assertNotIn("decides from text", front)
                 self.assertIn(STRUCTURAL_RULE, " ".join(body.split()))
-                base = subprocess.run(["git", "show", "%s:agents/reviewers/%s" % (done.stdout.strip(), path.name)], cwd=str(REPO), capture_output=True, text=True)
-                if base.returncode == 0:   # a definition that is new since the base has nothing to compare with
-                    self.assertEqual(front, base.stdout.split("\n---\n", 1)[0], "the front matter (permissions, mode, steps, model) is as it was at the base")
+                self.assertEqual(hashlib.sha256(front.encode()).hexdigest(), self.FRONT_MATTER_SHA256[path.name], "the front matter changed")
+
+    def test_the_default_installed_folder_is_none_under_the_suite_and_the_install_folder_outside_it(self):
+        self.assertEqual(os.environ.get(sb.UNDER_TEST_ENV), "1")
+        self.assertIsNone(sb.default_installed_agents_dir())
+        with tempfile.TemporaryDirectory() as data, unittest.mock.patch.dict(os.environ, {"XDG_DATA_HOME": data}):
+            os.environ.pop("FLEET_SWITCHBOARD_UNDER_TEST", None)
+            self.assertEqual(sb.default_installed_agents_dir(), Path(data) / sb.PROG / "profile" / "config" / "opencode" / "agents")
+
+    def test_verify_with_no_folder_named_reads_no_installed_file_under_the_suite(self):
+        listing = TestAgentsVerify("listing").listing()
+        with unittest.mock.patch.object(sb, "stale_installed_agents", wraps=sb.stale_installed_agents) as spy, \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            sb.main(["agents", "verify"], runner=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, listing, ""))
+        self.assertEqual(spy.call_args.args[0], None)
 
     def verify(self, installed_dir):
         listing = TestAgentsVerify("listing").listing()
