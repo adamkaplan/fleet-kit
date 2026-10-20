@@ -74244,7 +74244,7 @@ OLD_SOURCE_ALLOWED = {
 # Live observers: they ask herdr which panes exist right now (`agent list`). Each is a NAMED entry with its reason, never a silent skip. fleet-heartbeat is
 # a dated, PENDING entry (the Chief of Staff decided: no standing exception); the other two are the live source the registry is fed from.
 LIVE_OBSERVERS = {
-    "fleet-heartbeat": "slice 5 landed (#923, 2026-10-20): who exists now comes from the registry; the herdr agent list stays only as its live observation of panes (its supervision state), and decides nobody exists. Listed so a future change is seen",
+    "fleet-heartbeat": "2026-11-03, remove by (cos): live-pane observation (bell filter); identity from the registry; the bell moves into the registry in #973",
     "fleet-switchboard": "discovery and the pane check: the live source the registry is fed from (herdr and the v2 service), not a record of who exists",
     "proof-switchboard": "the proof harness finds the pane of one session in a lab; it keeps no list",
 }
@@ -74574,6 +74574,10 @@ class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
         self.assertEqual(set(LIVE_OBSERVERS) - found, set(), "an entry of LIVE_OBSERVERS no longer reads the live list: remove it")
         for name, reason in LIVE_OBSERVERS.items():
             self.assertGreater(len(reason), 40, name)
+        dated = {n: r for n, r in LIVE_OBSERVERS.items() if re.match(r"\d{4}-\d{2}-\d{2}\b", r)}
+        self.assertIn("fleet-heartbeat", dated, "the heartbeat is a DATED entry, never a standing one")
+        for name, reason in dated.items():
+            self.assertGreaterEqual(reason[:10], _dt.date.today().isoformat(), "%s is past its remove-by date" % name)
 
     def test_the_sidebar_plugin_is_a_view_of_derived_output_and_is_listed(self):
         for rel, source in DERIVED_VIEWS.items():
