@@ -432,6 +432,19 @@ def claim_notice(state_dir, account, now):
         os.close(fd)
 
 
+def release_notice(state_dir, account):
+    """Give the hour back when the message could not be made after the claim: the next call tries again. Best effort."""
+    try:
+        name = hashlib.sha256(account.encode("utf-8")).hexdigest()[:16]
+        fd = os.open(os.path.join(state_dir, NOTICE_DIR, name), os.O_RDWR)
+        try:
+            os.ftruncate(fd, 0)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
 def notice_text(account, remaining, limit, agent, calls, total):
     """The one message to the top spender's orchestrator. Fixed words and numbers only: the account's name, two budget figures and the agent's name."""
     share = int(round(100.0 * calls / total)) if total else 0

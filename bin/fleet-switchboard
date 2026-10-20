@@ -15784,7 +15784,11 @@ def cmd_budget_notice(args, runner, now):
         print("no message: one already went for this account in the last hour")
         return EXIT_OK
     text = calls.notice_text(_one_line(account, 40), low[0], low[1], top[0], top[1], top[2])
-    item = add_reminder(state, to, moment, moment, text)
+    try:
+        item = add_reminder(state, to, moment, moment, text)
+    except Exception:
+        calls.release_notice(str(state), account)   # the hour was claimed and no message was made: give it back
+        raise
     engine.audit.append("cli", "budget.notice", to, {"account": _one_line(account, 40), "agent": top[0], "id": item["id"]})
     print("told %s about %s" % (to, top[0]))
     return EXIT_OK

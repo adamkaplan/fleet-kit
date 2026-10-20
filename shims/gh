@@ -354,18 +354,73 @@ def warn_low(account, low):
 
 # ---- the top spender (#949): below the low-budget line the lane that spent most in the last hour is told, once an hour per account, and only its non-cached reads wait.
 # There is NO per-agent cap, count or quota here or in any configuration: the top spender is a RANKING of the last hour, recomputed from the daemon's record at every
-# call, never a limit and never remembered. The wait is bounded and ends the moment the account is no longer low; nothing is refused.
+# call, never a limit and never remembered. The wait is bounded and ends the moment no account the caller tops is low; nothing is refused.
+#
+# WHAT A CALLER CAN SET. This block reads NO environment variable of its own: the state directory is the account's home from the password database (never HOME,
+# XDG_STATE_HOME or FLEET_SWITCHBOARD_STATE), the switchboard program is the one beside this shim (never FLEET_SWITCHBOARD_BIN), the marker FLEET_SWITCHBOARD_OWN_GH
+# is not honoured here, the timeouts are constants, and it looks at EVERY low account (never the one a configuration variable maps this call to). The one thing it
+# cannot defend is the identity itself: "who is this caller" is the switchboard's answer from the caller's own session and pane. A caller can only make ITSELF wait
+# less, never another agent wait more or the message stop. A test derives every environment name this file reads and lists the ones that switch the wait off.
 SLOW_SECONDS = 2.0            # the longest any one uncached read of the top spender waits
 NOTICE_EVERY = 3600           # at most one message per account in this many seconds
+WHO_SECONDS = 3.0             # the identity question's own deadline
 NOT_AGENTS = frozenset(("daemon", "unknown", "other"))   # lanes that are not an agent a message can name
-SLOW = [False]                # set for THIS call when its caller is the top spender of the low account and the call is a read
+SLOW = [False]                # set for THIS call when its caller is the top spender of a low account and the call is a read
+FIXED_STATE = [None]          # test seams, set by a test's own wrapper in the same process, never from the environment
+FIXED_PROGRAM = [None]
 
 
-def top_spender(account):
+def fixed_state_directory():
+    """The switchboard's state directory as the account's home says (the password database), not as any variable says. None when it cannot be told."""
+    if FIXED_STATE[0]:
+        return FIXED_STATE[0]
+    try:
+        import pwd
+        return os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".local", "state", "fleet-switchboard")
+    except Exception:
+        return None
+
+
+def fixed_switchboard():
+    """The switchboard program: the one beside this shim (`../bin/fleet-switchboard` of this file's real path), else the one `install` linked in the account's home
+    (the password database's). Never FLEET_SWITCHBOARD_BIN."""
+    if FIXED_PROGRAM[0]:
+        return FIXED_PROGRAM[0]
+    candidates = [os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "bin", "fleet-switchboard")]
+    try:
+        import pwd
+        candidates.append(os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".local", "bin", "fleet-switchboard"))
+    except Exception:
+        pass
+    for candidate in candidates:
+        real = os.path.realpath(candidate)
+        if os.path.isfile(real) and os.access(real, os.X_OK):
+            return real
+    return None
+
+
+def low_accounts(state):
+    """{account: (remaining, limit)} for every account the daemon's fresh reading puts below LOW_FRACTION of its budget."""
+    try:
+        with open(os.path.join(state, USAGE_FILE)) as handle:
+            body = json.loads(handle.read(200001))
+        at, found = body["at"], {}
+        if not isinstance(at, (int, float)) or isinstance(at, bool) or time.time() - at > USAGE_FRESH:
+            return {}
+        for account, row in body["accounts"].items():
+            remaining, limit = row["remaining"], row["limit"]
+            if all(isinstance(n, (int, float)) and not isinstance(n, bool) for n in (remaining, limit)) and limit > 0 and remaining < LOW_FRACTION * limit:
+                found[account] = (int(remaining), int(limit))
+        return found
+    except Exception:
+        return {}
+
+
+def top_spender(account, state=None):
     """(agent, its calls, all agent calls) for the lane that spent most on `account` in the last hour (this hour and the one before it, from the daemon's hourly
     record), or None. The daemon and an unknown lane are never named. A ranking only: nothing is stored."""
     try:
-        with open(os.path.join(state_directory(), CALLS_ON)) as handle:
+        with open(os.path.join(state or fixed_state_directory(), CALLS_ON)) as handle:
             hours = json.loads(handle.read(2000001))["hours"]
         now_hour = int(time.time()) // 3600 * 3600
         spent = {}
@@ -383,15 +438,15 @@ def top_spender(account):
         return None
 
 
-def tell_top_spender(account):
+def tell_top_spender(state, account):
     """Ask the switchboard to tell the top spender's orchestrator, when no message went for this account in the last hour (the stamp's age: one stat). The
     switchboard itself checks the budget, ranks the lanes, claims the hour under a lock and builds the message: all this passes it is the account's name, so
     a direct call to it cannot invent a message. Never raises, never waits long."""
     try:
-        binary = switchboard_binary()
+        binary = fixed_switchboard()
         if not binary:
             return
-        stamp = os.path.join(state_directory(), "gh-low-told", _digest(account)[:16])
+        stamp = os.path.join(state, "gh-low-told", _digest(account)[:16])
         try:
             info = os.stat(stamp)
             if info.st_size > 0 and 0 <= time.time() - info.st_mtime < NOTICE_EVERY:
@@ -403,23 +458,42 @@ def tell_top_spender(account):
         pass
 
 
-def low_budget_caller(lookup, account, low, write):
-    """Below the line: tell the top spender's orchestrator (once an hour) and mark THIS call to wait when its caller is that agent and the call is a read.
-    The caller is the name the identity answer gives (the switchboard's answer for this session): never an environment variable, which a caller could set to
-    any name. Never raises."""
+def caller_name():
+    """The caller's fleet name from the fixed switchboard's identity answer (its session, never an environment variable of this file's), or None."""
     try:
-        top = top_spender(account)
-        if top is None:
+        binary = fixed_switchboard()
+        if not binary:
+            return None
+        done = subprocess.run([binary, "whoami", "--json"], capture_output=True, text=True, timeout=WHO_SECONDS)
+        name = json.loads(done.stdout).get("name") if done.returncode == 0 else None
+        return name if isinstance(name, str) and NAME_RE.match(name) else None
+    except Exception:
+        return None
+
+
+def low_budget_caller(write):
+    """Below the line, for every low account: tell its top spender's orchestrator (once an hour) and mark THIS call to wait when its caller is a top spender and the
+    call is a read. Reads nothing from the environment (see above). Never raises."""
+    try:
+        state = fixed_state_directory()
+        if not state:
             return
-        tell_top_spender(account)
-        if not write and lookup.identity().get("name") == top[0]:
-            SLOW[0] = True
+        tops = {}
+        for account in low_accounts(state):
+            top = top_spender(account, state)
+            if top is not None:
+                tops[account] = top
+                tell_top_spender(state, account)
+        if tops and not write:
+            name = caller_name()
+            if name is not None and any(top[0] == name for top in tops.values()):
+                SLOW[0] = True
     except Exception:
         pass
 
 
 def slow_if_top_spender():
-    """The bounded wait of an UNCACHED read by the top spender while its account is low (a cached read never reaches here, a write and every other agent never
+    """The bounded wait of an UNCACHED read by a top spender while its account is low (a cached read never reaches here, a write and every other agent never
     set it). Once per call; never a refusal."""
     if SLOW[0]:
         SLOW[0] = False
@@ -1587,6 +1661,8 @@ def run(args):
             return 1
     audit_write(args, lookup, "passed", write, hold_repo, hold_number)
     warn_text(args)
+    if command_words(args) and command_words(args)[0] not in NO_NETWORK_GROUPS:
+        low_budget_caller(write)   # the top spender's message and wait: reads nothing from the environment, and the switchboard's own marker does not skip it
     served = None
     try:
         own = os.environ.get("FLEET_SWITCHBOARD_OWN_GH") == "1"
@@ -1600,7 +1676,6 @@ def run(args):
             low = budget_low(account)
             if low is not None:
                 warn_low(account, low)
-                low_budget_caller(lookup, account, low, write)
             if not write and plan is None and not APP_DIRS:
                 served = cached_read(gh, env, args, agent, account, low)
     except Exception:
