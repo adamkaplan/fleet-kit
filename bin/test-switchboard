@@ -186,22 +186,50 @@ def _live_pids():
         return set()
 
 
+_MADE_UP_BLOCK = [64]            # a test is given room for this many numbers above the base, or the helper wraps BEFORE its first number
+_MADE_UP_FRESH = [True]          # the next call is the first of a test (set at the start of every test run)
+_MADE_UP_TEST = [None]           # the id of the test that is running
+_MADE_UP_BY_TEST = {}            # test id -> the numbers it was given, in order: recorded WHERE THE HELPER IS CALLED, by any caller
+
+
+def _recording_run(original):
+    def run(self, result=None):
+        before = (_MADE_UP_TEST[0], _MADE_UP_FRESH[0])
+        _MADE_UP_TEST[0], _MADE_UP_FRESH[0] = self.id(), True
+        _MADE_UP_BY_TEST.pop(self.id(), None)      # one run of a test at a time
+        try:
+            return original(self, result)
+        finally:
+            _MADE_UP_TEST[0], _MADE_UP_FRESH[0] = before
+    return run
+
+
+unittest.TestCase.run = _recording_run(unittest.TestCase.run)
+
+
 def made_up_pid():
-    """A process number no process has now: not this process, not its parent, not a live process, not a number given before in this run (it asks for a
-    number above the largest live one and proves it is not alive; at the top of the range it wraps to the free numbers below)."""
+    """A process number no process has now: not this process, not its parent or grandparents, not a live process, not a number given before in this run.
+    It asks for a number above the largest live one and proves it is not alive. A wrap to the small numbers at the top of the range happens only BETWEEN tests
+    (before the first number of a test, when its block does not fit above the base): inside one test the numbers only ever ascend, so no test can depend on
+    their order, and a test that asks for more than fits raises instead of wrapping. The test id is recorded with each number (`_MADE_UP_BY_TEST`)."""
     with _MADE_UP_LOCK:
         if _MADE_UP_NEXT[0] is None:
-            # FLEET_TEST_PID_BASE pins where the first look starts (a run near the top of the range wraps, which no test may depend on); default: above the largest live process
+            # FLEET_TEST_PID_BASE pins where the first look starts (to run from the top of the range); default: above the largest live process
             _MADE_UP_NEXT[0] = int(os.environ.get("FLEET_TEST_PID_BASE") or 0) or max(_live_pids() | {os.getpid(), os.getppid()}) + 1
         limit, never = _pid_limit(), _ancestors() | {os.getpid(), os.getppid()}
-        start = _MADE_UP_NEXT[0] if 1 < _MADE_UP_NEXT[0] <= limit else 2
-        for pid in list(range(start, limit + 1)) + list(range(2, start)):
+        start = _MADE_UP_NEXT[0]
+        if _MADE_UP_FRESH[0]:
+            _MADE_UP_FRESH[0] = False
+            if not 1 < start <= limit - _MADE_UP_BLOCK[0]:
+                start = 2                      # between tests: begin again from the small numbers
+        for pid in range(start, limit + 1):
             if pid in _MADE_UP_GIVEN or pid in never or _pid_alive(pid):
                 continue
             _MADE_UP_GIVEN.add(pid)
             _MADE_UP_NEXT[0] = pid + 1
+            _MADE_UP_BY_TEST.setdefault(_MADE_UP_TEST[0], []).append(pid)
             return pid
-    raise AssertionError("no free process number left to stand in for a process")
+    raise AssertionError("a test asked for more made-up process numbers than fit above %d: a wrap inside one test would make their order depend on the machine" % start)
 
 
 class PidTable(dict):
@@ -2233,7 +2261,9 @@ class FakeHerdr:
     @property
     def shell_pid(self):
         """The shell process number the fake reports for a pane: made up (a number no live process has), the same for the life of this fake."""
-        return self.__dict__.setdefault("_shell_pid", made_up_pid())
+        if "_shell_pid" not in self.__dict__:
+            self.__dict__["_shell_pid"] = made_up_pid()
+        return self.__dict__["_shell_pid"]
 
     def _process_info(self, rest):
         positional, flags = parse_flags(rest, ("--pane",))
@@ -57419,7 +57449,8 @@ class TestMadeUpPids(unittest.TestCase):
         self.addCleanup(child.wait)
         module, proofs, real = sys.modules[__name__], {}, _pid_alive
         spy = lambda pid: proofs.__setitem__(pid, real(pid)) or proofs[pid]           # the proof the helper made for each number it looked at
-        with mock.patch.object(module, "_MADE_UP_NEXT", [child.pid]), mock.patch.object(module, "_MADE_UP_GIVEN", set()), mock.patch.object(module, "_pid_alive", spy):
+        with mock.patch.object(module, "_MADE_UP_NEXT", [child.pid]), mock.patch.object(module, "_MADE_UP_GIVEN", set()), mock.patch.object(module, "_pid_alive", spy), \
+                mock.patch.object(module, "_MADE_UP_BLOCK", [0]):
             numbers = [made_up_pid() for _ in range(50)]
         self.assertEqual(len(set(numbers)), 50)
         self.assertNotIn(child.pid, numbers)                          # the live number it started at is skipped
@@ -57615,6 +57646,45 @@ class TestMadeUpPids(unittest.TestCase):
                 self.assertEqual(herdr.shell_pid, herdr.shell_pid)
                 self.assertNotIn(herdr.shell_pid, (os.getpid(), 4243, 4242))
                 self.assertFalse(_pid_alive(herdr.shell_pid))
+
+    def test_a_wrap_never_happens_inside_one_test_and_a_test_that_needs_more_numbers_than_fit_raises(self):
+        module = sys.modules[__name__]
+        top = _pid_limit()
+        with mock.patch.object(module, "_MADE_UP_GIVEN", set()), mock.patch.object(module, "_pid_alive", lambda pid: False), mock.patch.object(module, "_ancestors", lambda: set()), \
+                mock.patch.object(module, "_MADE_UP_FRESH", [False]), mock.patch.object(module, "_MADE_UP_NEXT", [top - 1]):
+            self.assertEqual([made_up_pid(), made_up_pid()], [top - 1, top])
+            with self.assertRaises(AssertionError):
+                made_up_pid()                                  # the next number would have to wrap: inside a test that is refused, never done
+
+    def test_a_wrap_happens_between_tests_and_inside_each_test_the_numbers_ascend_from_any_base(self):
+        module = sys.modules[__name__]
+
+        class Asks(unittest.TestCase):
+            numbers = []
+
+            def test_a(self):
+                Asks.numbers.append([made_up_pid() for _ in range(5)])
+
+            test_b = test_a
+
+        for base in (4240, _pid_limit() - 2, _pid_limit() - 70, _pid_limit() - 63):
+            Asks.numbers.clear()
+            with mock.patch.object(module, "_MADE_UP_NEXT", [base]), mock.patch.object(module, "_ancestors", lambda: set()):
+                result = unittest.TestResult()
+                unittest.TestSuite([Asks("test_a"), Asks("test_b")]).run(result)
+            with self.subTest(base=base):
+                self.assertEqual([str(e[0]) for e in result.failures + result.errors], [])
+                self.assertEqual(len(Asks.numbers), 2)
+                for got in Asks.numbers:
+                    self.assertEqual(got, sorted(got))
+                    self.assertEqual(len(set(got)), 5)
+                if base > _pid_limit() - _MADE_UP_BLOCK[0] - 1:
+                    self.assertLess(Asks.numbers[0][0], base)   # it wrapped, and before the first number of the test
+
+    def test_every_test_that_has_asked_for_numbers_so_far_in_this_process_was_given_them_in_ascending_order(self):
+        """Recorded WHERE THE HELPER IS CALLED, by any caller (a fixture, a fake, a mixin): the registry holds every test that asked, with its numbers."""
+        self.assertTrue(_MADE_UP_BY_TEST)
+        self.assertEqual([test for test, got in _MADE_UP_BY_TEST.items() if got != sorted(got) or len(set(got)) != len(got)], [])
 
     def test_the_old_numbers_are_never_handed_out_when_they_are_the_parent_and_grandparent(self):
         module = sys.modules[__name__]
