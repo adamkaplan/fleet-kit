@@ -1,8 +1,8 @@
 """The temp-directory janitor (ask #321). Pure of the switchboard: the caller hands it the directories, the clock, the settings and an audit
 function. It looks at the TOP-LEVEL entries of the temp directory only, and an entry is removed (as a unit) when ALL of these hold:
 
-  - it is older than `days`: the latest modification, change or birth time of the entry and of anything inside it, and the access time of every file and
-    link (a READ keeps it too; a directory's own access time is not counted, because listing it, as this walk does, would keep it for ever; a bounded walk; a
+  - it is older than `days`: the latest modification, change or birth time of the entry and of anything inside it, and the access time of every regular file
+    (a READ keeps it too; a directory's or a link's own access time is not counted, because listing the one and resolving the other, as this run does, would keep it for ever; a bounded walk; a
     tree too big to judge, or an access time that cannot be read, is kept; the change time is what a restore with tar or cp -a cannot fake);
   - the fleet's own records do not name it: its full path, or its basename when that is at least six characters, does not occur in any state
     file of the state directory (`*.json` and `*.jsonl`, never the compressed archives; a big file is read by its tail);
@@ -189,9 +189,9 @@ def _atime(info):
 
 
 def _read_stamp(info):
-    """`_stamp` plus the access time of what is not a directory (a read of a file counts as touching it). Raises when the access time cannot be read."""
+    """`_stamp` plus the access time of a regular file (a read of its content counts as touching it). A directory's and a link's are not counted: listing the one and reading the other (`realpath` does, on Linux) is the janitor's own doing. Raises when the access time cannot be read."""
     stamp = _stamp(info)
-    return stamp if stat.S_ISDIR(info.st_mode) else max(stamp, _atime(info))
+    return max(stamp, _atime(info)) if stat.S_ISREG(info.st_mode) else stamp
 
 
 def _newest(path, deadline, clock=time.monotonic):

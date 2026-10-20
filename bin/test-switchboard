@@ -59300,6 +59300,13 @@ class TestJanitorLiveKeeps(Base):
             self.assertEqual(sb.read_janitor_record(self.world.state, sb.TEMP_JANITOR_GATE_FILE), (False, {}))
         self.assertEqual(sb.janitor_apply_allowed(self.world.state, "r")[1], "unreadable")
 
+    def test_a_links_own_access_time_is_not_a_read(self):
+        link = self.temp / "old-link"
+        os.symlink(str(self.home), str(link))
+        os.utime(str(link), (self.now, self.now - 10 * 86400), follow_symlinks=False)   # only the link's access time is new
+        self.apply()
+        self.assertFalse(os.path.lexists(str(link)))
+
     def test_u1_an_entry_nothing_owns_uses_or_touched_is_removed_as_before(self):
         gone = [self.old("old-%d.log" % n) for n in range(2)] + [self.old("old-dir", directory=True)]
         self.registry({"live": {"cwd": str(self.home / "elsewhere")}})
