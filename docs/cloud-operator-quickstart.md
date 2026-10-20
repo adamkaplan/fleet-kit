@@ -6,21 +6,102 @@ Names below are examples (`acme-org/widget-service`, `/home/user`).
 
 ## 1. Settings
 
-Set these in the shell that runs `launch` (never in a file the worker can read):
+The preferred place for every setting is ONE private file, `~/.config/fleet-switchboard/cloud.env` (it sits beside the
+switchboard's own `config.json`; with `XDG_CONFIG_HOME` set, under that). `launch --cloud`, `send`, `read`, `retire` and the `cloud-worker`
+driver all read it through the same function. The old way, `CW_*` variables set in the shell that runs `launch`, still works **when there is no file**.
 
-| Setting | What it is |
-|---|---|
-| `CW_ALLOWED_REPOS` | comma-separated `OWNER/NAME` the launcher may use, e.g. `acme-org/widget-service`. Unset or empty refuses everything. |
-| `CW_TOOLING_REPO` | the tooling's own repository: refused even when it is on the list |
-| `CW_CLOUD_IMAGE` | the worker image (or pass `--image`) |
-| `CW_CLOUD_SERVER` | the cluster API address, for the service-account login |
-| `CW_CLOUD_CA_FILE` | optional path to the cluster's CA certificate |
-| `CW_PULL_SECRET` | optional name of the image pull secret in the namespace |
-| cluster token | either `CW_CLUSTER_TOKEN_CMD` (a command that prints a short-lived token) or the vault settings `CW_VAULT_SUBSCRIPTION` and `CW_VAULT_NAME` |
-| `CW_GIT_TOKEN_CMD` | optional command that prints the one-hour git token; default is the GitHub App mint beside the launcher (`app_token.py`) |
-| `CW_MODEL_AUTH_FILE` | the OpenCode auth file; only its `github-copilot` entry travels to the worker |
-| `CW_RUN_RECORD_DIR` | where the run record is written when a worker stops (default: `runs/` beside the audit file) |
-| `CW_CLOUD_SPEND_CAP_USD` | spend cap in USD for one create (default 25; an invalid value refuses) |
+How the two sources behave:
+
+- When the file exists it is the only source: the environment is not read for any setting in the table below.
+- A setting that the file and the environment BOTH set to different values refuses the launch, naming the setting and both sources (never a value). Unset one.
+- With no file, nothing changes: the environment is read exactly as before.
+- `launch` prints once which source it used: the file's path, or `environment`.
+- The path has no environment override. A different path is a test hook inside the test suite only.
+
+What the file must be (anything else refuses, naming the file and the problem, before any cluster or vault call):
+
+- a regular file (not a symlink), owned by you, mode `0600`: any group or other permission bit refuses (so `0640`, `0604`, `0644` and `0666` do);
+- in a directory owned by you that is not group- or world-writable;
+- plain `KEY=VALUE` lines: `#` starts a comment line, blank lines are skipped, the value is the rest of the line as written. No quotes, no `$VAR` or `$(...)`
+  expansion, and nothing is run when the file is read. A quoted value, an unknown key, a repeated key or a malformed line refuses;
+- **every value is checked against its own rule** (the table below; a setting with no rule is refused), and a value with a control character (a NUL, a tab inside a value, a carriage return, so a CRLF file too) is refused naming the line;
+- **no secret**: a value shaped like one (a token prefix such as `ghp_`, `github_pat_`, `sk-`, `AKIA`, `Bearer `; a JWT; a PEM header; a URL with a password;
+  a 40-character hex string inside a command) refuses, naming the key and never printing the value. A command that prints a secret is fine; the secret itself is not. The shape check is a guardrail, not a boundary: other secret formats are not recognised, so keep secrets out of the file yourself;
+- a file with more than one hard link refuses. Settings are applied all at once: a refused file leaves the environment untouched.
+
+Known limits (not checked): only the file's own directory is checked for owner and write bits, so a group-writable grandparent such as `~/.config` at `0770`, and a symlink in the directory path (it is followed), are not caught; and with `CW_CLUSTER_TOKEN_CMD` set the two vault settings are still required, validated and then unused.
+
+Create it so that nobody else can ever read it (the template is below; fill in your own values):
+
+```sh
+umask 077
+mkdir -p ~/.config/fleet-switchboard
+${EDITOR:-vi} ~/.config/fleet-switchboard/cloud.env
+ls -l ~/.config/fleet-switchboard/cloud.env   # -rw-------
+```
+
+Each setting's name, whether the file requires it, and its kind (name, path, command, digest-ref, number):
+
+| Setting | Required | Kind | What it is |
+|---|---|---|---|
+| `CW_ALLOWED_REPOS` | yes | name | comma-separated `OWNER/NAME` the launcher may use, e.g. `acme-org/widget-service`; no wildcard. Unset or empty refuses everything. |
+| `CW_CLOUD_IMAGE` | yes | digest-ref | the worker image, by digest: `name@sha256:<64 hex>`; a tag refuses. (`--image` on the command line stays as it was.) |
+| `CW_CLOUD_SERVER` | yes | name | the cluster API address: `https://NAME[:PORT]`, where NAME is a DNS name with at least two labels (an IP address of any form, including `[::1]`, `127.1` and `0x7f000001`, is refused: a cluster reached by IP needs a DNS name), a last label that has a letter and is not all digits or `0x`, and a port from 1 to 65535; no user, query, fragment, path, `file:` or `http:` |
+| `CW_VAULT_SUBSCRIPTION` | yes | name | the vault's subscription, a GUID |
+| `CW_VAULT_NAME` | yes | name | the vault's name: 3 to 24 letters, digits and hyphens, starting with a letter |
+| `CW_CLOUD_NAMESPACE` | yes | name | the namespace the workers live in: a DNS label; `default` and `kube-*` are refused |
+| `CW_TOOLING_REPO` | no | name | the tooling's own repository: refused even when it is on the list |
+| `CW_CLOUD_CA_FILE` | no | path | absolute path to the cluster's CA certificate |
+| `CW_PULL_SECRET` | no | name | name of the image pull secret in the namespace (the name, never its content) |
+| `CW_KUBECTL` | no | path | the `kubectl` program (default: `kubectl` on `PATH`) |
+| `CW_MODEL_AUTH_FILE` | no | path | the OpenCode auth file; only its `github-copilot` entry travels to the worker |
+| `CW_RUN_RECORD_DIR` | no | path | where the run record is written when a worker stops (default: `runs/` beside the audit file) |
+| `CW_CLOUD_SPEND_CAP_USD` | no | number | spend cap in USD for one create (default 25; an invalid value refuses) |
+| `CW_CLUSTER_TOKEN_CMD` | no | command | a command that prints a short-lived cluster token (instead of the vault route) |
+| `CW_CLUSTER_ADMIN_CMD` | no | command | a command that prints the cluster administrator kubeconfig (instead of the vault read) |
+| `CW_GIT_TOKEN_CMD` | no | command | a command that prints the one-hour git token; default is the GitHub App mint beside the launcher (`app_token.py`) |
+| `CW_APP_ID_CMD`, `CW_APP_INSTALLATION_CMD`, `CW_APP_KEY_CMD` | no | command | commands that print the GitHub App's id, installation id and key instead of the vault read (`app_token.py`) |
+| `CW_VAULT_CHECK_DIR` | no | path | reserved for the vault access check's checkout path: accepted and checked, not used yet |
+
+The template (neutral placeholders; copy, edit, keep only what you need, and set the file to `0600`):
+
+```text
+# cloud.env: the cloud launcher's settings. No quotes, no secrets, one KEY=VALUE per line.
+# the repositories a worker may be made for (comma-separated OWNER/NAME)
+CW_ALLOWED_REPOS=acme-org/widget-service
+# the worker image, by digest
+CW_CLOUD_IMAGE=registry.example.internal/acme/worker@sha256:0000000000000000000000000000000000000000000000000000000000000000
+# the cluster API address
+CW_CLOUD_SERVER=https://cluster.example.internal:6443
+# the vault that holds the cluster login
+CW_VAULT_SUBSCRIPTION=00000000-0000-0000-0000-000000000000
+CW_VAULT_NAME=acme-vault
+# the namespace the workers live in
+CW_CLOUD_NAMESPACE=cw
+# optional: the tooling's own repository (refused even when listed)
+# CW_TOOLING_REPO=acme-org/tooling
+# optional: the cluster CA certificate (absolute path)
+# CW_CLOUD_CA_FILE=/home/user/cluster-ca.pem
+# optional: the name of the image pull secret
+# CW_PULL_SECRET=acme-pull
+# optional: the kubectl program
+# CW_KUBECTL=/usr/local/bin/kubectl
+# optional: the OpenCode auth file
+# CW_MODEL_AUTH_FILE=/home/user/.local/share/opencode/auth.json
+# optional: where run records are written
+# CW_RUN_RECORD_DIR=/home/user/cloud-runs
+# optional: the spend cap in USD for one create
+# CW_CLOUD_SPEND_CAP_USD=25
+# optional commands that print a token (the command, never the token)
+# CW_CLUSTER_TOKEN_CMD=/home/user/bin/print-cluster-token
+# CW_CLUSTER_ADMIN_CMD=/home/user/bin/print-cluster-kubeconfig
+# CW_GIT_TOKEN_CMD=/home/user/bin/print-git-token
+# CW_APP_ID_CMD=/home/user/bin/print-app-id
+# CW_APP_INSTALLATION_CMD=/home/user/bin/print-app-installation
+# CW_APP_KEY_CMD=/home/user/bin/print-app-key
+# reserved: the vault access check's checkout path
+# CW_VAULT_CHECK_DIR=/home/user/vault-check
+```
 
 Before reading the vault, do whatever your deployment requires (for example a sign-in or an access request). This repository does not
 do it for you.
