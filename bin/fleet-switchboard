@@ -340,6 +340,7 @@ DEFAULTS = {
     "engaged_minutes": 10,
     "retire_idle_minutes": 10,     # `retire --close`: a pane herdr reads as working is closed without --force only when its session has had no turn and no activity this long
     "call_timeout_seconds": 20,
+    "clear_remind_minutes": 15,    # #827: a cleared, mergeable pull request with gates READY that the lane has not merged this long gets ONE reminder per head
     "send_timeout_seconds": 60,    # `send` as a whole (the sum of its v2 and herdr calls): past it, a clear failure line, never a silent minutes-long wait
     "poll_seconds": 5,
     "cpu_guard": None,             # load over cores and swap: None = defaults (high_ratio 3 for 5 minutes, swap_percent 90 for 5 minutes, each wakes the Chief of Staff once per episode); false = off; or {"high_ratio": n, "minutes": n, "swap_percent": n, "swap_minutes": n}
@@ -639,6 +640,8 @@ def validate_config(raw, source="config"):
     for key in ("v2_cache_seconds", "v2_reads_per_pass", "v2_reads_per_minute"):
         if not isinstance(config[key], int) or isinstance(config[key], bool) or config[key] < 0:
             raise ConfigError("%r must be a whole number of at least 0, got %r" % (key, config[key]))
+    if not _is_number(config["clear_remind_minutes"]) or config["clear_remind_minutes"] <= 0:
+        raise ConfigError("%r must be a number above 0, got %r" % ("clear_remind_minutes", config["clear_remind_minutes"]))
     for key in ("batch_seconds", "engaged_minutes", "call_timeout_seconds", "send_timeout_seconds", "poll_seconds",
                 "worker_lookback_hours", "stalled_working_hours", "review_window_minutes", "rider_max_age_seconds"):
         if not _is_number(config[key]) or config[key] <= 0:
@@ -10437,6 +10440,22 @@ def is_captain(pr, now=None):
     return pr_marker_state((pr or {}).get("labels"), (pr or {}).get("body"), now)["captain"]
 
 
+def sweep_clear_agrees(engine, repo, number, labels, marker):
+    """(#827, S6b) True when the ONLY disagreement of a pull request's merge label and its first-line marker is an author's `merge-captain` label still on it beside an automatic line, and the owner's clear is recorded for the
+    EXACT head the pull request has now (the daemon's own list read; an unknown head, an unreadable impact state or a clear on another head agree with nothing): the clear is the owner's answer for that head, so the leftover label is not a
+    disagreement to finish. Read-only."""
+    try:
+        kinds = _label_kind(labels, CAPTAIN_MERGE_LABELS)
+        if kinds != ["merge-captain"] or marker != "automatic" or engine.state_dir is None:
+            return False
+        pictures = getattr(engine, "ci_record_state", None)
+        head = ((pictures.pr_state.get("%s#%d" % (plan_ledger.normal_repo(repo), number)) if pictures is not None else None) or {}).get("head")
+        clears, problem = read_impact_state(engine.state_dir)
+        return not problem and isinstance(head, str) and bool(head) and (clears["clears"].get("%s#%d" % (repo, number)) or {}).get("head") == head
+    except Exception:
+        return False
+
+
 def pr_login(user):
     login = user.get("login") if isinstance(user, dict) else None
     return login if isinstance(login, str) and login else None
@@ -11771,6 +11790,10 @@ def publish_decisions(engine):
     except Exception as err:
         engine._note("impact.error", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
     try:
+        clear_notice_pass(engine, now)   # #827: delivers the clear notices still pending, drops one whose pull request merged, closed or changed head, and sends the one "cleared, merge it" reminder
+    except Exception as err:
+        engine._note("gate.clear_notify_failed", None, {"error": _one_line("%s: %s" % (type(err).__name__, err), 200)})
+    try:
         merged_labels = load_module("merged_labels")   # #559: the merge and hold labels of a merged PR come off (fresh read, fleet labels only)
         merged_labels.run_pass(types.SimpleNamespace(**{n: globals()[n] for n in merged_labels.NEEDS}), engine, now,
                                ((engine.config.get("impact_hold") or {}).get("calls_per_pass") or IMPACT_PASS_CALLS))   # its own cap of gh reads, the impact hold's setting
@@ -12436,7 +12459,7 @@ def sweep_read_repo(hub, repo, now, window_days, regex, budget, strong):
         items[number] = {"pr": _is_pr(record), "labels": names,
                          "section": sweep_has_section(body), "heading": sweep_has_heading(body),
                          "captain": is_captain({"labels": names, "body": body}),
-                         "captain_findings": pr_marker_state(names, body)["findings"], "holds": pr_hold_reasons(names),
+                         "captain_findings": pr_marker_state(names, body)["findings"], "holds": pr_hold_reasons(names), "marker": pr_marker(body),
                          "author": (pr_login(record.get("user")) or "").lower(),
                          "created": parse_iso(record.get("created_at")), "updated": parse_iso(record.get("updated_at")),
                          "assignees": [(pr_login(a) or "").lower() for a in record.get("assignees") or [] if isinstance(a, dict)],
@@ -12602,7 +12625,7 @@ def sweep_findings(engine, state, decisions, home, now, cfg, regex, defer=(), de
                         item.get("created"), now, SWEEP_S6A_GRACE) and sweep_ours(
                         engine, repo, number, item.get("author", ""), item.get("assignees"), notices):
                     found.add(("S6a", ref_text(repo, number)))   # only OUR PR: another team's author may carry the line
-                if "disagree" in item["captain_findings"]:
+                if "disagree" in item["captain_findings"] and not sweep_clear_agrees(engine, repo, number, item["labels"], item.get("marker")):
                     found.add(("S6b", ref_text(repo, number)))
     for repo, picture in state.repos.items():
         if repo in defer or "*" in defer:
@@ -12715,7 +12738,7 @@ def sweep_verify(engine, state, kind, ref, now, cfg, regex, budget):
             return False
         if kind == "S6a" and sweep_within(parse_iso(data.get("created_at")), now, SWEEP_S6A_GRACE):
             return False   # opened a moment ago: the label is applied after it opens
-        return is_pr and want in pr_marker_state(names, body)["findings"]
+        return is_pr and want in pr_marker_state(names, body)["findings"] and not (kind == "S6b" and sweep_clear_agrees(engine, repo, number, names, pr_marker(body)))
     if kind in ("S1a", "S1b"):
         if is_pr:
             return False
@@ -21345,6 +21368,15 @@ def impact_carry_get(engine, runner, repo):
 
 CLEAR_NOTIFIED_FILE = "clear-notified.json"
 CLEAR_NOTIFIED_MAX = 400
+CLEAR_PENDING_FILE = "clear-notice-pending.json"   # #827: the notices of owner clears not yet delivered to everyone they are for
+CLEAR_PENDING_MAX = 100
+CLEAR_PENDING_BODY_MAX = 4000   # the pull request body as far as the lane lookup needs it (its PLAN line)
+CLEAR_NOTICE_KINDS = ("clear", "carry")   # THE one table of notice kinds: the record, the delivery and the pass accept these and no other; a test derives the callers from the code and fails on a kind missing here
+CLEAR_NOTICE_BACKOFF = (60, 120, 300, 900, 1800, 3600)   # seconds before the next try of a failed notice or reminder, by the number of tries made (the last step repeats): a lane that is down for a while still gets it
+CLEAR_NOTICE_MAX_AGE_SECONDS = 86400   # a notice or a reminder is given up (audited) only after this long: the budget is time, never a count of fast tries
+CLEAR_NOTICE_CLAIM_SECONDS = 90   # a delivery in flight is not started again within this (longer than a send is allowed to take)
+CLEAR_NOTICE_PASS_MAX = 3       # deliveries one daemon pass makes
+CLEAR_REMINDED_FILE = "clear-reminded.json"   # #827: the heads whose "cleared, merge it" reminder is done
 _PLAN_ISSUE_RE = re.compile(r"github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(?:issues|pull)/([0-9]+)")
 
 

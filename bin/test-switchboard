@@ -249,7 +249,7 @@ class TestConfig(Base):
         self.assertFalse(self.config_file.exists())
         self.assertEqual(sb.load_config(), {
             "opencode": None, "opencode_env": {}, "opencode_executable": None, "launch_env": {},
-            "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "retire_idle_minutes": 10, "call_timeout_seconds": 20, "send_timeout_seconds": 60, "poll_seconds": 5,
+            "herdr": "herdr", "batch_seconds": 90, "engaged_minutes": 10, "retire_idle_minutes": 10, "call_timeout_seconds": 20, "clear_remind_minutes": 15, "send_timeout_seconds": 60, "poll_seconds": 5,
             "worker_lookback_hours": 24, "stalled_working_hours": 2, "review_window_minutes": 60, "send_to_working": "steer", "launch_default": "headless",
             "rider_max_age_seconds": 3600, "report_triage": sb.REPORT_TRIAGE_DEFAULTS,  # PR 13
             "github_repos": [], "gh": "gh", "github_lookback_hours": 24, "github_port": None, "github_ignore_authors": [],
@@ -13662,7 +13662,9 @@ class TestClearNotice(Base):
 
     def route(self, argv, **kwargs):
         if argv[0] == FAKE_GH and argv[1:3] == ["pr", "view"]:
-            raw = {"state": "OPEN", "headRefOid": self.head, "title": "t", "labels": [{"name": n} for n in self.labels], "body": self.body}
+            if getattr(self, "unreadable", False):
+                return subprocess.CompletedProcess(argv, 1, "", "HTTP 502")
+            raw = {"state": getattr(self, "pr_state", "OPEN"), "headRefOid": self.head, "title": "t", "labels": [{"name": n} for n in self.labels], "body": self.body}
             return subprocess.CompletedProcess(argv, 0, json.dumps(raw), "")
         if argv[0] == FAKE_GH and argv[1] == "api" and "--method" in argv:
             self.order.append(argv[argv.index("--method") + 1] + " " + argv[2].rsplit("/", 1)[-1])
@@ -13930,6 +13932,346 @@ class TestClearNotice(Base):
         self.clear()
         (cleared,) = self.events("gate.hold_cleared")
         self.assertEqual(cleared["detail"]["removed"], [self.names["hold-impact"], self.names["merge-captain"]], "#742: the author's merge label comes off with the clear")
+
+
+    # ---- #827: a recorded clear's notice is never lost: pending record, the daemon pass, one reminder
+
+    def pending(self):
+        return sb._read_small(self.world.state, sb.CLEAR_PENDING_FILE)
+
+    def delivered(self):
+        return sb._read_small(self.world.state, sb.CLEAR_NOTIFIED_FILE)
+
+    def later(self, seconds=sb.CLEAR_NOTICE_CLAIM_SECONDS + 1):
+        self.world.clock.t += seconds
+        return self.world.clock.now()
+
+    def pass_(self, seconds=None):
+        sb.clear_notice_pass(self.engine, self.later() if seconds is None else self.later(seconds))
+
+    def block_sends(self):
+        """Every send blocks until released: the notice times out at the deadline, as a slow send does under load. Returns the event."""
+        release = threading.Event()
+        self.addCleanup(release.set)
+        self.real_send = self.engine.send
+        self.send_returned = []
+
+        def slow(*a, **k):
+            release.wait(30)   # only a safety: the tests release it themselves
+            self.send_returned.append(1)
+            return self.real_send(*a, **k)
+        self.engine.send = slow
+        return release
+
+    def settle(self):
+        for late in [t for t in threading.enumerate() if t.name == "clear-notice"]:
+            late.join(5)
+
+    def test_s2_a_notice_that_times_out_is_pending_the_command_says_queued_and_the_next_pass_delivers_it_exactly_once(self):
+        release = self.block_sends()
+        with mock.patch.object(sb, "NOTIFY_CLEAR_DEADLINE_SECONDS", 0.05):
+            lines = self.clear()
+        self.assertEqual((release.is_set(), self.send_returned), (False, []), "the command returned while the send was still blocked: it did not wait for it (no clock)")
+        self.assertTrue(any("queued for delivery" in l for l in lines), lines)
+        key = sb._clear_notice_key(self.REPO, 7, self.HEAD, "clear")
+        self.assertIn(key, self.pending())
+        self.assertNotIn(key, self.delivered())
+        release.set()
+        self.settle()   # the late thread of the command may finish its own sends: it is the same record, told once
+        self.engine.send = self.real_send
+        self.pass_()
+        self.pass_()
+        self.assertEqual(len(self.told("cos")), 1)
+        self.assertEqual(self.pending(), {})
+        self.assertIn(key, self.delivered())
+
+    def test_s2_a_notice_cut_off_with_the_process_is_delivered_by_the_pass_to_both_recipients(self):
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now(), boss="orch-a")
+        self.engine.send = lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt())   # the process dies in the first send
+        self.clear()
+        key = sb._clear_notice_key(self.REPO, 7, self.HEAD, "clear")
+        self.assertIn(key, self.pending())
+        self.assertEqual((self.told("cos"), self.told("orch-a")), ([], []))
+        self.engine.send = self.world.new_engine("daemon").send
+        self.pass_()
+        self.assertEqual((len(self.told("cos")), len(self.told("orch-a"))), (1, 1))
+        self.assertEqual(self.pending(), {})
+
+    def test_s3_a_delivered_notice_is_never_repeated_and_only_the_recipient_not_yet_told_is_told_on_a_retry(self):
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now(), boss="orch-a")
+        real = self.engine.send
+        self.engine.send = lambda s, r, t, **k: {"sent": False, "reason": "down"} if r == "orch-a" else real(s, r, t, **k)
+        self.clear()
+        key = sb._clear_notice_key(self.REPO, 7, self.HEAD, "clear")
+        self.assertEqual(self.pending()[key]["sent"], ["chief-of-staff"])
+        self.engine.send = real
+        self.pass_()
+        self.pass_()
+        self.pass_()
+        self.assertEqual((len(self.told("cos")), len(self.told("orch-a"))), (1, 1), "cos was told once, the lane once")
+        self.assertEqual(self.pending(), {})
+        sb.notify_clear(self.engine, "clear", self.REPO, 7, self.HEAD, reason="again", body="")
+        self.assertEqual((len(self.told("cos")), len(self.told("orch-a"))), (1, 1), "a delivered notice is not made again")
+
+    def make_pending(self, kind):
+        """One pending notice of `kind`, made by the real `notify_clear` with a send that fails; every kind of `sb.CLEAR_NOTICE_KINDS` has its own call."""
+        self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+        extra = {"clear": dict(reason="a fixture"), "carry": dict(previous="f" * 40)}[kind]
+        sb.notify_clear(self.engine, kind, self.REPO, 7, self.HEAD, body="", **extra)
+        self.assertEqual(list(self.pending()), [sb._clear_notice_key(self.REPO, 7, self.HEAD, kind)])
+        self.engine.send = self.world.new_engine("daemon").send
+
+    def test_the_kinds_table_is_complete_derived_from_the_callers(self):
+        import ast
+        seen = set()
+        for path in (BIN / "fleet-switchboard", BIN / "impact_hold.py"):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "notify_clear" and len(node.args) > 1 and isinstance(node.args[1], ast.Constant):
+                    seen.add(node.args[1].value)
+        self.assertEqual(seen, set(sb.CLEAR_NOTICE_KINDS), "every kind a caller notifies is in the table, and the table holds no other")
+        sb.clear_notice_record(self.engine, "nonsense", self.REPO, 7, self.HEAD)
+        self.assertEqual(self.pending(), {}, "a kind outside the table is never recorded")
+
+    def test_s4_for_every_kind_a_pull_request_merged_or_closed_or_with_a_new_head_drops_the_pending_record_and_sends_nothing(self):
+        for kind in sb.CLEAR_NOTICE_KINDS:
+            for label, state, head in (("merged", "MERGED", self.HEAD), ("closed", "CLOSED", self.HEAD), ("head changed", "OPEN", "b" * 40)):
+                with self.subTest(kind=kind, why=label):
+                    self.setUp()
+                    self.make_pending(kind)
+                    self.pr_state, self.head = state, head
+                    self.pass_()
+                    self.assertEqual(self.pending(), {})
+                    self.assertEqual(self.world.admissions("cos"), [])
+                    (event,) = self.events("gate.clear_notice_dropped")
+                    self.assertTrue(event["detail"]["why"], label)
+
+    def test_s8_for_every_kind_a_pull_request_that_cannot_be_read_whole_keeps_the_record_and_sends_nothing(self):
+        for kind in sb.CLEAR_NOTICE_KINDS:
+            with self.subTest(kind=kind):
+                self.setUp()
+                self.make_pending(kind)
+                self.unreadable = True
+                self.pass_()
+                self.assertEqual(len(self.pending()), 1)
+                self.assertEqual((self.world.admissions("cos"), self.events("gate.clear_notice_dropped")), ([], []))
+                self.unreadable = False
+                self.pass_()
+                self.assertEqual((len(self.world.admissions("cos")), self.pending()), (1, {}))
+
+    def test_s2_for_every_kind_and_the_standing_order_variant_a_failed_notice_is_pending_and_the_pass_delivers_it_once(self):
+        order = {"number": 5, "text": "clear fixtures", "by": "cos"}
+        paths = [(kind, {}) for kind in sb.CLEAR_NOTICE_KINDS] + [("clear", {"under_order": order})]
+        for kind, extra in paths:
+            with self.subTest(kind=kind, extra=sorted(extra)):
+                self.setUp()
+                self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+                kw = dict(extra, **({"previous": "f" * 40} if kind == "carry" else {"reason": "a fixture"}))
+                sb.notify_clear(self.engine, kind, self.REPO, 7, self.HEAD, body="", **kw)
+                self.assertIn(sb._clear_notice_key(self.REPO, 7, self.HEAD, kind), self.pending())
+                self.engine.send = self.world.new_engine("daemon").send
+                self.pass_()
+                self.pass_()
+                (told,) = self.world.admissions("cos")
+                self.assertEqual(self.pending(), {})
+                self.assertIn(self.HEAD[:8], told["text"])
+                self.assertEqual(("under the owner's standing order" in told["text"], "carried" in told["text"]), (bool(extra), kind == "carry"))
+
+    def test_the_notice_wording_is_the_same_whether_the_command_or_the_pass_sends_it(self):
+        self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+        self.clear(reason="the same words")
+        self.engine.send = self.world.new_engine("daemon").send
+        self.pass_()
+        (line,) = self.told("cos")
+        self.assertTrue(line.startswith('owner cleared %s at %s: "the same words"; ' % (self.PR, "a" * 8)), line)
+
+    def test_a_token_in_the_reason_is_never_written_to_the_pending_file(self):
+        token = "ghp_" + "a1B2c3D4e5F6g7H8i9J0" * 2
+        self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+        self.clear(reason="x " + token)
+        self.assertNotIn("a1B2c3D4e5F6g7H8i9J0", (Path(self.world.state) / sb.CLEAR_PENDING_FILE).read_text())
+
+    # -- the one reminder
+
+    def ready_pr(self, mergeable="MERGEABLE", ready=True, state="open", head=None, examined=None, whole=True):
+        picture = self.engine.__dict__.setdefault("ci_record_state", sb.CiRecordState())
+        head = head or self.HEAD
+        picture.pr_state["%s#7" % self.REPO] = {"state": state, "head": head, "mergeable": mergeable, "gates": {"ready": ready, "missing": []}, "examined_head": examined or head}
+        sb.read_mark(self.engine, "pulls:" + self.REPO, whole, "" if whole else "cut", self.world.clock.now())
+
+    def reminders(self):
+        return [a for a in self.world.admissions("orch-a") if "cleared, merge it" in a["text"]]
+
+    def test_s6_one_reminder_per_head_after_the_delay_and_a_new_cleared_head_gets_its_own(self):
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now(), boss="orch-a")
+        self.clear()
+        self.ready_pr()
+        self.pass_(14 * 60 - sb.CLEAR_NOTICE_CLAIM_SECONDS - 1)
+        self.assertEqual(self.reminders(), [], "not before clear_remind_minutes")
+        self.pass_(120)
+        self.pass_()
+        self.pass_()
+        self.assertEqual(len(self.reminders()), 1)
+        self.head = "c" * 40
+        self.clear()
+        self.ready_pr(head="c" * 40)
+        self.pass_(15 * 60)
+        self.pass_()
+        self.assertEqual(len(self.reminders()), 2)
+
+    def count_sends(self, only=None, to=None):
+        """Wrap the engine's send: every call to it is counted (the ones whose text holds `only`, when given); a send that always fails. Returns the list of calls."""
+        calls = []
+
+        def down(sender, recipient, text, **kw):
+            if (only is None or only in text) and (to is None or recipient == to):
+                calls.append(self.world.clock.now())
+                return {"sent": False, "reason": "down"}
+            return self.real_send(sender, recipient, text, **kw)
+        self.real_send = self.world.new_engine("daemon").send
+        self.engine.send = down
+        return calls
+
+    def run_cadence(self, seconds, step=5):
+        """The daemon's REAL pass cadence: a pass every `step` seconds of the fake clock for `seconds` (never one jump per pass)."""
+        for _ in range(seconds // step):
+            sb.clear_notice_pass(self.engine, self.later(step))
+
+    def test_s3_for_every_kind_a_lane_that_is_down_for_ten_minutes_still_gets_the_notice_when_it_is_back_and_the_retries_are_spaced(self):
+        for kind in sb.CLEAR_NOTICE_KINDS:
+            with self.subTest(kind=kind):
+                self.setUp()
+                calls = self.count_sends(to="chief-of-staff")
+                extra = {"clear": dict(reason="a fixture"), "carry": dict(previous="f" * 40)}[kind]
+                sb.notify_clear(self.engine, kind, self.REPO, 7, self.HEAD, body="", **extra)
+                self.assertEqual(len(calls), 1, "the command tries once")
+                self.run_cadence(55)
+                self.assertEqual(len(calls), 1, "nothing is retried in the first minute: the 5 s passes do not spend the tries")
+                self.run_cadence(545)   # ten minutes in all
+                self.assertEqual(len(calls), 1 + len(sb.CLEAR_NOTICE_BACKOFF[:3]), "retries after the backoff steps (1, 2 and 5 minutes), not one per pass")
+                self.assertEqual(len(self.pending()), 1, "ten minutes down: still pending, not given up")
+                self.assertEqual(self.events("gate.clear_notice_abandoned"), [])
+                self.engine.send = self.real_send   # the lane is back
+                self.run_cadence(sb.CLEAR_NOTICE_BACKOFF[3] + 5)
+                self.assertEqual(self.pending(), {})
+                self.assertEqual(len(self.world.admissions("cos")), 1, "told once")
+
+    def test_s3_for_every_kind_a_notice_pending_for_longer_than_the_age_bound_is_given_up_loudly_never_by_a_count(self):
+        for kind in sb.CLEAR_NOTICE_KINDS:
+            with self.subTest(kind=kind):
+                self.setUp()
+                calls = self.count_sends(to="chief-of-staff")
+                extra = {"clear": dict(reason="a fixture"), "carry": dict(previous="f" * 40)}[kind]
+                sb.notify_clear(self.engine, kind, self.REPO, 7, self.HEAD, body="", **extra)
+                self.run_cadence(3600)
+                self.assertEqual(len(self.pending()), 1, "an hour of failures is not a reason to give up")
+                before = len(calls)
+                sb.clear_notice_pass(self.engine, self.later(sb.CLEAR_NOTICE_MAX_AGE_SECONDS))
+                (event,) = self.events("gate.clear_notice_abandoned")
+                self.assertIn("gave up", event["detail"]["why"])
+                self.assertEqual((self.pending(), len(calls)), ({}, before))
+
+    def test_a_malformed_pending_entry_is_quarantined_and_the_notices_after_it_are_still_delivered(self):
+        self.make_pending("clear")
+        pending = self.pending()
+        (good,) = pending
+        for label, bad in {"at": {"at": "x"}, "claimed": {"claimed": "y"}, "next_at": {"next_at": []}, "not a notice": {"kind": "nope"}, "under_order": {"under_order": 3}}.items():
+            with self.subTest(label):
+                poisoned = dict(pending, poison=dict(dict(pending[good], number=9), **bad))
+                poisoned["poison"]["at"] = poisoned["poison"].get("at", 0)
+                sb._write_small(self.world.state, sb.CLEAR_PENDING_FILE, poisoned)
+                sb.clear_notice_pass(self.engine, self.later())
+                self.assertEqual(self.pending(), {}, "the good one is delivered and the poison is gone")
+                self.assertTrue(self.events("gate.clear_notice_quarantined"))
+                self.world.admissions("cos").clear() if False else None
+                self.setUp()
+                self.make_pending("clear")
+                pending = self.pending()
+                (good,) = pending
+
+    def test_the_cap_of_pending_notices_audits_what_it_drops(self):
+        filler = {sb._clear_notice_key(self.REPO, 100 + i, "e" * 40, "clear"): {"repo": self.REPO, "number": 100 + i, "head": "e" * 40, "kind": "clear", "at": i + 1, "claimed": 0, "attempts": 0, "sent": []} for i in range(sb.CLEAR_PENDING_MAX)}
+        sb._write_small(self.world.state, sb.CLEAR_PENDING_FILE, filler)
+        self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+        sb.notify_clear(self.engine, "clear", self.REPO, 7, self.HEAD, reason="x", body="")
+        self.assertEqual(len(self.pending()), sb.CLEAR_PENDING_MAX)
+        (event,) = self.events("gate.clear_notice_dropped_cap")
+        self.assertIn("oldest", event["detail"]["why"])
+
+    def test_a_corrupt_pending_file_is_kept_aside_and_audited_never_overwritten_silently(self):
+        path = Path(self.world.state) / sb.CLEAR_PENDING_FILE
+        path.write_text("{ this is not json")
+        self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+        sb.notify_clear(self.engine, "clear", self.REPO, 7, self.HEAD, reason="x", body="")
+        self.assertEqual(Path(str(path) + ".corrupt").read_text(), "{ this is not json")
+        self.assertTrue(self.events("gate.clear_notice_corrupt"))
+        self.assertEqual(len(self.pending()), 1, "the new notice is recorded in a fresh file")
+
+    def test_one_pull_request_is_read_once_per_pass_however_many_notices_are_pending_for_it(self):
+        self.make_pending("clear")
+        self.engine.send = lambda *a, **k: {"sent": False, "reason": "down"}
+        sb.notify_clear(self.engine, "carry", self.REPO, 7, self.HEAD, body="", previous="f" * 40)
+        self.engine.send = self.world.new_engine("daemon").send
+        self.assertEqual(len(self.pending()), 2)
+        self.later()
+        reads = []
+        real = sb.read_pr_json
+        with mock.patch.object(sb, "read_pr_json", side_effect=lambda *a, **k: (reads.append(1), real(*a, **k))[1]):
+            sb.clear_notice_pass(self.engine, self.later())
+        self.assertEqual(len(reads), 1)
+
+    def test_a_reminder_send_that_always_fails_is_spaced_by_the_backoff_given_up_only_by_age_and_never_recorded_as_sent(self):
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now(), boss="orch-a")
+        self.clear()
+        self.ready_pr()
+        calls = self.count_sends(only="cleared, merge it")
+        self.run_cadence(15 * 60)
+        first = len(calls)
+        self.assertEqual(first, 1, "the first reminder is tried once at the delay")
+        self.run_cadence(10 * 60)
+        self.assertEqual(len(calls), 1 + len(sb.CLEAR_NOTICE_BACKOFF[:3]) - 1 + (1 if sb.CLEAR_NOTICE_BACKOFF[0] + sb.CLEAR_NOTICE_BACKOFF[1] + sb.CLEAR_NOTICE_BACKOFF[2] <= 10 * 60 else 0), "spaced by the backoff, not one per pass")
+        self.assertEqual(self.events("gate.clear_remind_abandoned"), [])
+        sb.clear_notice_pass(self.engine, self.later(sb.CLEAR_NOTICE_MAX_AGE_SECONDS))
+        self.assertEqual(self.events("gate.clear_reminded"), [], "a reminder that was never delivered is not recorded as sent")
+        (event,) = self.events("gate.clear_remind_abandoned")
+        self.assertIn("down", event["detail"]["error"])
+
+    def test_s7_no_reminder_when_not_mergeable_not_ready_not_open_at_the_cleared_head_or_not_examined_there(self):
+        cases = {"conflicting": dict(mergeable="CONFLICTING"), "gates not ready": dict(ready=False), "draft": dict(state="draft"), "gone": dict(state="gone"),
+                 "head moved": dict(head="d" * 40, examined="d" * 40), "not examined at the head": dict(examined="d" * 40)}
+        for label, kw in cases.items():
+            with self.subTest(label):
+                self.setUp()
+                sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now(), boss="orch-a")
+                self.clear()
+                self.ready_pr(**kw)
+                self.pass_(16 * 60)
+                self.assertEqual(self.reminders(), [], label)
+
+    def test_s8_a_list_that_is_not_whole_gives_no_reminder_and_the_reminder_comes_when_it_is(self):
+        sb.record_pr_notice(self.world.state, self.REPO, 7, "worker", "ready", self.world.clock.now(), boss="orch-a")
+        self.clear()
+        self.ready_pr(whole=False)
+        self.pass_(16 * 60)
+        self.assertEqual(self.reminders(), [])
+        self.ready_pr()
+        self.pass_()
+        self.assertEqual(len(self.reminders()), 1)
+
+    def test_a_lane_that_cannot_be_resolved_is_not_guessed_and_nobody_is_reminded(self):
+        self.body = "no plan here\n"
+        self.no_ledger_plan()
+        self.clear()
+        self.ready_pr()
+        self.pass_(16 * 60)
+        self.assertEqual([a for n in ("orch-a", "orch-b", "worker") for a in self.world.admissions(n) if "cleared, merge it" in a["text"]], [])
+        self.assertEqual(len(self.events("gate.clear_remind_skipped")), 1)
+
+    def test_the_remind_delay_is_a_configuration_key_with_a_default_of_15(self):
+        self.assertEqual(sb.DEFAULTS["clear_remind_minutes"], 15)
+        self.assertEqual(sb.validate_config({"clear_remind_minutes": 5})["clear_remind_minutes"], 5)
+        for bad in (0, -1, "x", True):
+            with self.subTest(bad), self.assertRaises(sb.ConfigError):
+                sb.validate_config({"clear_remind_minutes": bad})
 
 
 class TestClearRemovesTheAuthorsHold(Base):
@@ -26081,6 +26423,37 @@ class TestCaptainSweepFindings(TestSweep):
         self.sweep()
         self.sweep()
         self.assertEqual(self.found(), [("S6a", "acme/api#40"), ("S6b", "acme/api#41"), ("S6b", "acme/api#42")])
+
+    def test_s6b_a_recorded_clear_at_the_current_head_makes_the_leftover_author_label_agree_with_an_automatic_line(self):
+        captain = self.USER.replace("awaiting-user", "merge-captain")
+        head, other = "a" * 40, "b" * 40
+        picture = self.engine.__dict__.setdefault("ci_record_state", sb.CiRecordState())
+        self.engine.state_dir = self.world.state
+        state = {"clears": {"acme/api#50": {"head": head, "by": "owner", "at": 1}, "acme/api#51": {"head": other, "by": "owner", "at": 1}}, "applied": {}}
+        sb.write_impact_state(self.world.state, state)
+        for number in (50, 51, 52, 53):
+            picture.pr_state["acme/api#%d" % number] = {"state": "open", "head": head}
+        picture.pr_state["acme/api#53"] = {"state": "open"}   # head unknown: agrees with nothing
+        self.hub.open = {50: sweep_issue(50, "MERGE: automatic\nx", [captain], pr=True),   # cleared at this head
+                         51: sweep_issue(51, "MERGE: automatic\nx", [captain], pr=True),   # cleared at ANOTHER head
+                         52: sweep_issue(52, "MERGE: automatic\nx", [captain], pr=True),   # never cleared
+                         53: sweep_issue(53, "MERGE: automatic\nx", [captain], pr=True)}   # cleared? no: head unknown
+        sb.write_impact_state(self.world.state, dict(state, clears=dict(state["clears"], **{"acme/api#53": {"head": head, "by": "owner", "at": 1}})))
+        self.sweep()
+        self.sweep()
+        self.assertEqual(self.found(), [("S6b", "acme/api#51"), ("S6b", "acme/api#52"), ("S6b", "acme/api#53")])
+
+    def test_s6b_the_clear_only_excuses_a_captain_label_beside_an_automatic_line(self):
+        automatic = self.USER.replace("awaiting-user", "merge-automatic")
+        head = "a" * 40
+        picture = self.engine.__dict__.setdefault("ci_record_state", sb.CiRecordState())
+        self.engine.state_dir = self.world.state
+        sb.write_impact_state(self.world.state, {"clears": {"acme/api#60": {"head": head, "by": "owner", "at": 1}}, "applied": {}})
+        picture.pr_state["acme/api#60"] = {"state": "open", "head": head}
+        self.hub.open = {60: sweep_issue(60, "MERGE: captain\nx", [automatic], pr=True)}   # the other disagreement is not the author's leftover label
+        self.sweep()
+        self.sweep()
+        self.assertEqual(self.found(), [("S6b", "acme/api#60")])
 
     def test_s9_a_merge_or_hold_label_left_on_a_merged_or_closed_pr_is_flagged_and_nothing_is_removed(self):
         captain = self.USER.replace("awaiting-user", "merge-captain")
