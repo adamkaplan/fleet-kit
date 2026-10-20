@@ -23030,8 +23030,8 @@ class TestWorkerOwned(OwnedInputs, ReportBase):
             self.scene["issues"][n] = {"parent": n - 1 if n > 6 else 2}
         self.apply()
         issues = self.owned_numbers()[0]
-        self.assertIn(6 + sb.OWNED_DEPTH - 1, issues)
-        self.assertNotIn(6 + sb.OWNED_DEPTH, issues, "the walk is bounded")
+        self.assertIn(6 + sb.TRIAGE_ANCESTOR_DEPTH - 1, issues)
+        self.assertNotIn(6 + sb.TRIAGE_ANCESTOR_DEPTH, issues, "the walk is bounded")
 
     def test_S12_a_stray_mention_does_not_move_or_hold_an_idle_assignment_and_the_rule_wakes_once(self):
         self.set_scene(prs=[self.pr(10, "Looks at #3 in prose\n", age=self.RECENT, created=self.OLD)])
@@ -23101,8 +23101,8 @@ class TestWorkerOwned(OwnedInputs, ReportBase):
                     self.late()
                     try:
                         silent = self.said("stalled") == []
-                    except Exception:
-                        silent = False   # the mutant breaks the rule outright
+                    except TypeError:
+                        silent = False   # without the time check, max() over an unreadable time breaks the rule outright (the only crash expected)
                     self.assertFalse(silent, "without this member's check the rule no longer stays silent on the bad input: the case above catches the mutant")
         self.assertEqual(set(examples), set(sb.OWNED_READABLE))
 

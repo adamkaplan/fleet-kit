@@ -8673,7 +8673,7 @@ def _owned_work_items(ctx):
     """The issues below the assignment through the parent links of the issue list: a visited set and a depth bound make a cycle end the walk."""
     plain = [r for r in ctx.records if isinstance(r, dict) and isinstance(r.get("number"), int) and "pull_request" not in r]
     found, seen, frontier = [], {ctx.issue}, {ctx.issue}
-    for _ in range(OWNED_DEPTH):
+    for _ in range(TRIAGE_ANCESTOR_DEPTH):   # the one bound on parent links (defined with the triage walk below; read at call time)
         nxt = set()
         for r in plain:
             parent, url = parent_of(r), r.get("parent_issue_url")
@@ -8693,7 +8693,6 @@ def _owned_pulls(ctx):
         isinstance(ref, list) and ref[1] in ctx.numbers and plan_ledger.normal_repo(ref[0] or ctx.repo) == ctx.key for ref in pr_body_refs(r.get("body")))]
 
 
-OWNED_DEPTH = 8   # parent links followed below the assignment (the same bound as TRIAGE_ANCESTOR_DEPTH)
 # #874: THE table of what a worker owns: kind -> (where the daemon already holds it, the builder). `worker_owned` LOOPS OVER it in this order (a
 # later kind may read the numbers of the earlier ones), so a kind cannot exist in code and not here; the tests are parametrised over it.
 OWNED_KINDS = {
