@@ -72925,10 +72925,17 @@ OLD_AGENT_SOURCES = re.compile(r"read_pane_health|PANE_HEALTH_FILE|RETIRED_FILE|
 # Each entry names who removes it and by when; the test fails on an entry that no longer matches (shrink it) and on one past its date. The scan covers every
 # tracked file that is not a test or a document: Python by AST (aliases and constant concatenations resolved), anything else by text.
 OLD_SOURCE_ALLOWED = {
-    ("bin/fleet-switchboard", "<module>", "PANE_HEALTH_FILE"): "2026-12-20, last slice (#903): the derived pane-health.json goes with the old files",
-    ("bin/fleet-switchboard", "<module>", "RETIRED_FILE"): "2026-12-20, last slice (#903): the derived retired.json goes with the old files",
-    ("bin/fleet-switchboard", "read_pane_health", "PANE_HEALTH_FILE"): "2026-12-20, last slice (#903)",
-    ("bin/fleet-switchboard", "write_pane_health", "PANE_HEALTH_FILE"): "2026-12-20, last slice (#903): the derived output the sidebar reads",
+    ("bin/fleet-switchboard", "<module>", "PANE_HEALTH_FILE"): "2026-12-20, last slice of #903 (slice 2 owns it): the constant of the derived file",
+    ("bin/fleet-switchboard", "<module>", "RETIRED_FILE"): "2026-12-20, last slice of #903 (slice 2 owns it): the constant of the derived file",
+    ("bin/fleet-switchboard", "read_pane_health", "PANE_HEALTH_FILE"): "2026-12-20, last slice of #903 (slice 2 owns it): the derived-file reader",
+    ("bin/fleet-switchboard", "write_pane_health", "PANE_HEALTH_FILE"): "2026-12-20, last slice of #903 (slice 2 owns it): the derived-file writer the sidebar reads",
+    ("bin/fleet-switchboard", "<module>", "pane-health.json"): "2026-12-20, last slice of #903 (slice 2 owns it): the file name; the derived output goes with the old files",
+    ("bin/fleet-switchboard", "<module>", "retired.json"): "2026-12-20, last slice of #903 (slice 2 owns it): the file name; the derived output goes with the old files",
+    ("bin/fleet-switchboard", "_reattach_locked", "pane-health.json"): "2026-12-20, last slice of #903 (slice 2 owns it): reattach's message about the derived file",
+    ("bin/fleet-switchboard", "_reattach_locked", "read_pane_health"): "2026-12-20, last slice of #903 (slice 2 owns it): reattach reads the pane record it rewrites (derived)",
+    ("bin/fleet-switchboard", "cmd_retire", "read_pane_health"): "2026-12-20, last slice of #903 (slice 2 owns it): retire prunes the derived pane record it rewrites",
+    ("bin/fleet-switchboard", "pane_health_pass", "pane-health.json"): "2026-12-20, last slice of #903 (slice 2 owns it): the pane pass writes the derived file",
+    ("bin/fleet-switchboard", "pane_health_pass", "read_pane_health"): "2026-12-20, last slice of #903 (slice 2 owns it): the pane pass reads the pane states it wrote (derived)",
 }
 # Live observers: they ask herdr which panes exist right now (`agent list`). Each is a NAMED entry with its reason, never a silent skip. fleet-heartbeat is
 # a dated, PENDING entry (the Chief of Staff decided: no standing exception); the other two are the live source the registry is fed from.
@@ -73130,6 +73137,85 @@ class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
         self.assertNotIn("bin/registry.py", [p for p in tracked_files() if scanned(p)])
         self.assertIn("bin/fleet-switchboard", [p for p in tracked_files() if scanned(p)])
         self.assertTrue(any(p.startswith("plugins/") and scanned(p) for p in tracked_files()), "the scan reaches subdirectories")
+
+    # Every function that reads the registry through the seam is a view; each has the test that retires an agent (or breaks the registry) and checks that view.
+    # The table is checked against the code: a new caller of the seam with no row fails `test_every_view_that_reads_the_registry_has_its_retire_test`.
+    VIEW_TESTS = {
+        "health_write": "test_the_health_records_keep_everything_when_the_registry_is_not_whole_or_the_retirement_has_no_session",
+        "pane_health_status_lines": "test_s2_a_retired_agent_leaves_every_view_at_its_next_read",
+        "decisions_from_reports": "test_s2_a_retired_agent_leaves_every_view_at_its_next_read",
+        "load_tick": "test_a_half_read_registry_alerts_nobody_and_a_retired_orchestrator_has_no_figures",
+        "cmd_reattach_all": "test_reattach_all_detached_acts_on_the_registrys_list_and_nothing_on_a_half_read",
+        "worktree_session_in_use": "test_a_worktree_that_is_the_session_directory_of_a_non_retired_agent_is_kept_though_its_pane_sits_elsewhere",
+        "cmd_disk_reclaim_worktrees": "test_the_sweep_is_a_dry_run_by_default_only_considers_retired_agents_and_apply_is_the_operators_or_cos",
+        "watch_problem": "test_watch_refuses_a_worker_with_a_terminal_an_unknown_name_and_a_retired_worker_and_opens_nothing",
+        "cmd_watch": "test_watch_refuses_a_worker_with_a_terminal_an_unknown_name_and_a_retired_worker_and_opens_nothing",
+        "WorkerFacts.seam_facts": "test_a_retired_worker_gets_nothing_and_another_name_does_not_silence_it",
+        "WorkerFacts.stalled_facts": "test_a_retired_worker_gets_none",
+        "triage_stop": "test_a_retired_worker_is_not_nudged_nor_reported_as_stopped_and_the_model_is_not_asked",
+        "testers_status": "test_a_corrupt_or_unreadable_retired_file_disables_every_launched_tester_and_says_so",
+        "launched_testers_for": "test_a_retired_tester_stops_counting_and_is_not_listed",
+        "item_agents": "test_item_agents_raises_when_discovery_or_the_retired_list_fails",
+        "known_session": "test_s8_a_pruned_retired_agent_is_still_found_by_the_retire_undo_reattach_and_the_boss_lookup",
+        "cmd_retire": "test_s8_a_pruned_retired_agent_is_still_found_by_the_retire_undo_reattach_and_the_boss_lookup",
+    }
+
+    def registry_callers(self):
+        """Every function (or method) of bin/fleet-switchboard that calls the registry seam, found by the AST."""
+        seam = {"registry_read", "registry_retired", "registry_retired_strict", "read_retired"}
+        tree = ast.parse((BIN / "fleet-switchboard").read_text())
+        found = set()
+        for node in tree.body:
+            owners = [(node.name, node)] if isinstance(node, ast.FunctionDef) else \
+                     [(node.name + "." + m.name, m) for m in node.body if isinstance(m, ast.FunctionDef)] if isinstance(node, ast.ClassDef) else []
+            for name, fn in owners:
+                if name not in seam and any(isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id in seam for c in ast.walk(fn)):
+                    found.add(name)
+        return found
+
+    def test_every_view_that_reads_the_registry_has_its_retire_test(self):
+        callers = self.registry_callers()
+        self.assertEqual(callers - set(self.VIEW_TESTS), set(), "a view reads the registry and has no retire-then-check test in VIEW_TESTS")
+        self.assertEqual(set(self.VIEW_TESTS) - callers, set(), "VIEW_TESTS names a function that no longer reads the registry")
+        text = Path(__file__).read_text() if "__file__" in globals() else (BIN / "test-switchboard").read_text()
+        for view, test in sorted(self.VIEW_TESTS.items()):
+            with self.subTest(view=view):
+                self.assertRegex(text, r"    def %s\(self" % re.escape(test), "%s names a test that does not exist" % view)
+
+    def test_a_half_read_registry_alerts_nobody_and_a_retired_orchestrator_has_no_figures(self):
+        state = str(self.world.state)
+        reg = self.registry()
+        engine = types.SimpleNamespace(state_dir=state, now=lambda: time.time(), audit=None, actor="daemon", intents=None,
+                                       config={"load_alert": sb.load_fleet_health().validate({"enabled": True}, "x")})
+        orch = lambda n: types.SimpleNamespace(name=n, session_id="s-" + n, fleet={"role": "orchestrator", "charter": 1, "repo": "acme/widget"}, status="idle")
+        discovery = types.SimpleNamespace(agents={"o-live": orch("o-live"), "o-gone": orch("o-gone")}, problems=[])
+        reg.upsert(state, "o-live", {"session": "s-o-live", "role": "orchestrator"})
+        reg.upsert(state, "o-gone", {"session": "s-o-gone", "role": "orchestrator"})
+        reg.retire(state, "o-gone", "x", "finished", session="s-o-gone")
+        sb.load_tick(engine, discovery)
+        self.assertEqual(set(json.loads((self.world.state / "load.json").read_text())["latest"]), {"o-live"})
+        (self.world.state / "load.json").unlink()
+        (self.world.state / "registry.json").write_text("{not json")   # not whole: the tick does nothing (no figures, no alert) (#805)
+        self.assertEqual(sb.load_tick(engine, discovery), [])
+        self.assertFalse((self.world.state / "load.json").exists())
+
+    def test_reattach_all_detached_acts_on_the_registrys_list_and_nothing_on_a_half_read(self):
+        state = self.world.state
+        reg = self.registry()
+        for name in ("a-1", "a-2", "a-3"):
+            reg.upsert(str(state), name, {"session": "ses_" + name, "pane": "p_" + name, "state": "detached"})
+        reg.retire(str(state), "a-3", "x", "finished", session="ses_a-3")
+        stale = {"agents": {"old-%d" % i: {"session": "ses_old%d" % i} for i in range(16)}, "states": {"old-%d" % i: {"state": "detached", "pane": "p"} for i in range(16)}, "missing": {}}
+        (state / "pane-health.json").write_text(json.dumps(stale))
+        acted = []
+        with mock.patch.object(sb, "cmd_reattach", side_effect=lambda one, *a, **k: acted.append(one.name) or sb.EXIT_OK):
+            code = sb.cmd_reattach_all(types.SimpleNamespace(workspace=None), subprocess.run, self.world.clock.now, None)
+        self.assertEqual((code, sorted(acted)), (sb.EXIT_OK, ["a-1", "a-2"]), "the registry's detached, not retired agents; never the stale file's 16")
+        (state / "registry.json").write_text("{not json")
+        acted.clear()
+        with mock.patch.object(sb, "cmd_reattach", side_effect=lambda one, *a, **k: acted.append(one.name) or sb.EXIT_OK):
+            code = sb.cmd_reattach_all(types.SimpleNamespace(workspace=None), subprocess.run, self.world.clock.now, None)
+        self.assertEqual((code, acted), (sb.EXIT_ERROR, []))
 
     def test_a_live_read_of_herdr_agents_is_a_named_exception_with_its_reason(self):
         found = set()
