@@ -9113,15 +9113,15 @@ class WorkflowPlanPins(unittest.TestCase):
     def touching(entry):
         return entry.replace("**", "sub/file.txt") if "**" in entry else entry
 
-    def plan(self, text, listtext, event, base="", draft=False, files=("docs/other.md",), integration=True, moves=()):
+    def plan(self, text, listtext, event, base="", draft=False, files=("docs/other.md",), integration=True, moves=(), head_list=None, unrelated=False):
         """Run the plan job's script from `text` and return the matrix rows it writes."""
         start = text.index("          python3 - <<'PY'\n")
         end = text.index("\n          PY\n", start)
         script = "\n".join(l[10:] for l in text[start:end + len("\n          PY")].splitlines()) + "\n"
-        tmp = self.repo_for(listtext, tuple(files), integration, tuple(moves))
+        tmp = self.repo_for(listtext, tuple(files), integration, tuple(moves), head_list, unrelated)
         out = Path(tmp) / "out.txt"
         out.write_text("")
-        env = dict(os.environ, EVENT=event, BASE=base, DRAFT="true" if draft else "false", PATH_LIST=".github/macos-platform-paths.txt", GITHUB_OUTPUT=str(out))
+        env = dict(os.environ, EVENT=event, BASE=base, DRAFT="true" if draft else "false", GITHUB_OUTPUT=str(out))
         done = subprocess.run(["bash", "-c", script], cwd=tmp, env=env, capture_output=True, text=True)
         if done.returncode:
             raise AssertionError("the plan script failed: " + done.stderr[-400:])
@@ -9131,9 +9131,9 @@ class WorkflowPlanPins(unittest.TestCase):
     _repos = {}
 
     @classmethod
-    def repo_for(cls, listtext, files, integration, moves=()):
+    def repo_for(cls, listtext, files, integration, moves=(), head_list=None, unrelated=False):
         """A throwaway repository (made once per shape, the script only reads it): a base commit holding the list and, on top, a change that touches `files`."""
-        key = (listtext, files, integration, moves)
+        key = (listtext, files, integration, moves, head_list, unrelated)
         if key not in cls._repos:
             tmp = tempfile.mkdtemp(prefix="plan-pin-")
             def git(*args):
@@ -9158,6 +9158,12 @@ class WorkflowPlanPins(unittest.TestCase):
                 for src, dst in moves:
                     (Path(tmp) / dst).parent.mkdir(parents=True, exist_ok=True)
                     git("mv", src, dst)
+            if unrelated:   # a head with no common history with the base: the three-dot diff fails while the base list reads fine
+                git("checkout", "-q", "--orphan", "pr")
+                git("rm", "-rq", "--cached", ".")
+                (Path(tmp) / "keep").write_text("y\n")
+            if head_list is not None:   # the pull request rewrites the list on its own side
+                (Path(tmp) / ".github" / "macos-platform-paths.txt").write_text(head_list)
             for f in files:
                 path = Path(tmp) / f
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -9196,7 +9202,7 @@ class WorkflowPlanPins(unittest.TestCase):
         check("\n  test-cloud:\n    needs: plan\n    name: ${{ matrix.cloud }}\n" in text, "test-cloud is named by the plan's cloud name")
         check(jobs.count("include: ${{ fromJSON(needs.plan.outputs.matrix) }}") == 2, "both take the plan's matrix")
         check(jobs.count("ref: ${{ matrix.ref }}") == 2, "the nightly leg checks out its own ref")
-        check("PATH_LIST: .github/macos-platform-paths.txt\n" in text, "the plan reads the one list file")
+        check("PATH_LIST" not in text and 'LIST = ".github/macos-platform-paths.txt"' in text and "origin/\" + base + \":\" + LIST" in text, "the plan reads the one list file, from the base")
         groups = self.groups(listtext)
         check(sorted(groups) == sorted(self.GROUPS) and all(groups.values()), "the list names all 5 groups")
         for entry in self.retypable(listtext):
@@ -9220,6 +9226,17 @@ class WorkflowPlanPins(unittest.TestCase):
             src = self.touching(first)
             check(key(run("pull_request", "integration", files=(), moves=((src, "docs/moved.txt"),))) == both, "a file moved OUT of a listed path runs macOS")
         check(key(run("pull_request", "gone-branch")) == both, "a failed diff (no such base) runs macOS")
+        # Which list each probe reads: the BASE branch's (the throwaway repository's base commit holds `listtext`); `head_list` is what
+        # the pull request itself writes. A pull request must not be able to rewrite the list that gates it.
+        nothing = "# group: nothing\nnever/matches/**\n"
+        check(key(run("pull_request", "integration", files=("shims/x",), head_list=nothing)) == both, "a pull request that rewrites the list to match nothing AND touches a shim runs macOS")
+        check(key(run("pull_request", "integration", files=(), head_list=nothing)) == both, "a pull request that only rewrites the list runs macOS (the list file itself is a fixed path)")
+        check(key(run("pull_request", "integration", files=(".github/macos-platform-paths.txt",))) == both, "a list edit runs macOS")
+        check(key(run("pull_request", "integration", files=("docs/other.md",), head_list="# group: x\ndocs/**\n")) == both, "a pull request that adds a harmless entry runs macOS (the list file is touched)")
+        check(key(run("pull_request", "integration", files=("docs/other.md",))) == ["test (ubuntu-latest)"], "the base list decides: docs only stays Ubuntu only")
+        check(key(run("pull_request", "integration", files=("docs/other.md",), unrelated=True)) == both, "a diff that fails (no common history) runs macOS although the base list reads fine")
+        bare = "\n".join(l for l in listtext.splitlines() if l.strip() != ".github/macos-platform-paths.txt") + "\n"
+        check(key(run("pull_request", "integration", files=(".github/macos-platform-paths.txt",), listtext=bare)) == both, "the list file's own path is fixed in the script: a list edit runs macOS even if the base list does not name itself")
         for bad in ("", "# group: shims\n\n", None):
             check(key(run("pull_request", "integration", listtext=bad)) == both, "a list that is empty, comment-only or missing runs macOS")
         check("fetch-depth: 0" in jobs.split("\n  test:\n", 1)[0], "the plan checkout has the full history")
@@ -9258,8 +9275,8 @@ class WorkflowPlanPins(unittest.TestCase):
             self.assertIn(old, text, "the mutant's anchor moved: " + old)
             return text.replace(old, new, 1)
         out = [
-            ("macOS for every pull request", swap("macos = diff.returncode != 0 or any(", "macos = True or any("), listtext),
-            ("macOS dropped from every pull request into integration", swap("macos = diff.returncode != 0 or any(", "macos = False and any("), listtext),
+            ("macOS for every pull request", swap("macos = diff.returncode != 0 or LIST in files or any(", "macos = True or LIST in files or any("), listtext),
+            ("macOS dropped from every pull request into integration", swap("macos = diff.returncode != 0 or LIST in files or any(", "macos = False and any("), listtext),
             ("the nightly trigger dropped", swap('  schedule:\n    - cron: "0 5 * * *"\n', ""), listtext),
             ("the nightly legs dropped", swap('if event == "schedule":', 'if event == "never":'), listtext),
             ("the nightly without integration", swap('["main"] + (["integration"]', '["main"] + ([]'), listtext),
@@ -9267,12 +9284,14 @@ class WorkflowPlanPins(unittest.TestCase):
             ("macOS skipped for a pull request into main", swap("macos = not draft", "macos = False"), listtext),
             ("the draft rule dropped", swap("macos = not draft", "macos = True"), listtext),
             ("ready_for_review dropped", swap("types: [opened, synchronize, reopened, ready_for_review]", "types: [opened, synchronize, reopened]"), listtext),
-            ("the path list not read", swap("PATH_LIST: .github/macos-platform-paths.txt", "PATH_LIST: .github/missing.txt"), listtext),
+            ("the path list not read", swap('LIST = ".github/macos-platform-paths.txt"', 'LIST = ".github/missing.txt"'), listtext),
+            ("the list read from the head, no self-touch rule", swap('shown = git("show", "origin/" + base + ":" + LIST)', 'shown = git("show", "HEAD:" + LIST)').replace("or LIST in files ", ""), listtext),
+            ("no self-touch rule", swap("or LIST in files ", ""), listtext),
             ("the path list emptied", text, "# group: shims\n"),
             ("renames detected", swap('"diff", "--no-renames", "--name-only"', '"diff", "--name-only"'), listtext),
-            ("a failed diff skips macOS", swap("macos = diff.returncode != 0 or any(", "macos = diff.returncode == 0 and any("), listtext),
+            ("a failed diff skips macOS", swap("macos = diff.returncode != 0 or LIST in files or any(", "macos = diff.returncode == 0 and any("), listtext),
             ("an empty list runs no macOS", swap("if not patterns:", "if False:"), listtext),
-            ("a missing list crashes", swap("except OSError:", "except FileNotFoundError:\n                      raise"), listtext),
+            ("a missing list crashes", swap("if shown.returncode == 0 else []", "if shown.returncode == 0 else [][0]"), listtext),
             ("the plan checkout shallow", swap("    steps:\n      - uses: actions/checkout@v5\n        with:\n          fetch-depth: 0\n", "    steps:\n      - uses: actions/checkout@v5\n"), listtext),
             ("edited among the types", swap("types: [opened, synchronize, reopened, ready_for_review]", "types: [opened, synchronize, reopened, ready_for_review, edited]"), listtext),
             ("the job renamed", swap("name: ${{ matrix.name }}", "name: macos-${{ matrix.os }}"), listtext),
