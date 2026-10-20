@@ -31988,7 +31988,7 @@ class TestImpactClassAndNarrowForm(LedgerBase):
         rule = sb.load_impact_floor().owner_hold_rule(sb.load_impact_floor().load_matrix())
         classes = rule[0] + rule[1]
         self.assertEqual(len(classes), 10)
-        self.assertEqual(text.count("impact-class"), 1)
+        self.assertEqual(text.count("impact-class: <class of the hold"), 1)   # the block's class line is said once (the --block table names the flag too, #895)
         self.assertIn("always names its class", text)
         self.assertIn("A hold without a class is rejected", text)
         self.assertNotIn("Leave the class line out", text)
@@ -61962,7 +61962,7 @@ class TestReviewerSubagents(LedgerBase):
     def test_block_takes_nothing_else_and_the_flag_form_is_still_there(self):
         code, out, err = self.record_block("coder", "code", self.block_text(), "--verdict", "approve")
         self.assertEqual(code, 2)
-        self.assertIn("give nothing else", err)
+        self.assertIn(sb.BLOCK_TABLE_TEXT, err)
         self.assertEqual(self.record("coder", "code", "approve")[0], 0)
 
     # -- the shadow line
