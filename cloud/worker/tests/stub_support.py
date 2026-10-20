@@ -28,16 +28,21 @@ def free_port():
 
 
 def port_is_free(port):
+    """True only when the connect is REFUSED. A timeout (a listener that never accepts fills its backlog and the next SYN is dropped), an
+    accepted connection, a reset and any other OS error all mean something may still hold the port: not free."""
     try:
         socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
-    except OSError:
+    except ConnectionRefusedError:
         return True
+    except OSError:
+        return False
     return False
 
 
 def spawn(argv, **kw):
     """Popen in a NEW session (its own process group, pgid == pid), so the whole group can be ended. No cleanup: use start() in a test."""
     kw["start_new_session"] = True
+    kw["env"] = dict(kw.get("env") or os.environ, STUB_PARENT_PID=str(os.getpid()))   # the stub compares its parent to THIS, not to getppid() at its start
     p = subprocess.Popen(argv, **kw)
     p.pgid = p.pid   # recorded now: the group is ours, whatever the child does later
     return p
@@ -93,4 +98,5 @@ def start(test, argv, port=None, **kw):
 
 def exec_stub(port):
     """For a fake tool that must BECOME the stub (fake_kubectl port-forward): the stub watches its parent and ends by itself."""
+    os.environ["STUB_PARENT_PID"] = str(os.getppid())   # the parent as of now, before the stub starts
     os.execv(sys.executable, [sys.executable, STUB, str(port)])

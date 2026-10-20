@@ -128,7 +128,8 @@ class Server(http.server.ThreadingHTTPServer):
 # Self-defence, so a stub can never outlive its run (#956). A SIGTERM ignored by a parent is inherited across exec: reset it. macOS has no
 # parent-death signal and a SIGKILLed runner runs no teardown: watch the parent pid once a second, and end after an idle lifetime cap.
 signal.signal(signal.SIGTERM, signal.SIG_DFL)
-PARENT = os.getppid()
+# The parent is named by the starter (STUB_PARENT_PID): a parent that died during startup would otherwise leave getppid() already 1 here.
+PARENT = int(os.environ.get("STUB_PARENT_PID") or os.getppid())
 IDLE = float(os.environ.get("STUB_IDLE_SECONDS", "600"))
 
 

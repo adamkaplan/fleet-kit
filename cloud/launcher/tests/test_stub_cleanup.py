@@ -5,6 +5,7 @@ setUp that raises; the stub server ends by itself (SIGTERM even when the parent 
 of the cloud tests finds every place that starts a child process by its syntax tree, with one case per site and one mutant per site
 (the cleanup removed) that the scan must catch. Offline: loopback only. Children are only ever the ones this file started: never a name pattern."""
 import ast
+import errno
 import http.client
 import io
 import os
@@ -177,13 +178,59 @@ class TestStubEndsByItself(unittest.TestCase):
         self.assertTrue(wait_until(lambda: p.poll() is not None, 6), "the idle stub is still running")
 
 
+class TestPortCheckOutcomes(unittest.TestCase):
+    """port_is_free over every outcome of the connect: only a refusal is free."""
+
+    def outcome(self, effect):
+        with mock.patch.object(stub_support.socket, "create_connection", side_effect=effect):
+            return stub_support.port_is_free(1)
+
+    def test_refused_is_free(self):
+        self.assertTrue(self.outcome(ConnectionRefusedError()))
+
+    def test_a_timeout_is_not_free(self):
+        self.assertFalse(self.outcome(socket.timeout()))
+
+    def test_an_accepted_connection_is_not_free(self):
+        self.assertFalse(self.outcome([mock.MagicMock()]))
+
+    def test_a_reset_is_not_free(self):
+        self.assertFalse(self.outcome(ConnectionResetError()))
+
+    def test_another_os_error_is_not_free(self):
+        self.assertFalse(self.outcome(OSError(errno.EHOSTUNREACH, "no route")))
+
+    def test_a_listener_that_never_accepts_is_never_free(self):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        s.listen(1)
+        self.addCleanup(s.close)
+        port = s.getsockname()[1]
+        self.assertEqual([stub_support.port_is_free(port) for _ in range(8)], [False] * 8)   # past the backlog
+
+
+class TestStubParentDiesDuringStartup(unittest.TestCase):
+    def test_a_stub_whose_parent_died_before_it_started_ends_by_itself(self):
+        port = stub_support.free_port()
+        # The "parent" starts the stub (which names it in STUB_PARENT_PID) and is killed at once: the stub's own getppid() at its start may already be 1.
+        mid_code = ("import os,subprocess,sys\n"
+                    "env=dict(os.environ,STUB_PARENT_PID=str(os.getpid()))\n"
+                    "p=subprocess.Popen(['sh','-c','sleep 1; exec \"$0\" \"$@\"',sys.executable,sys.argv[1],sys.argv[2]],env=env)\n"
+                    "print(p.pid,flush=True)\nos._exit(0)\n")
+        mid = stub_support.spawn([sys.executable, "-c", mid_code, STUB, str(port)], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(stub_support.stop_group, mid, port)
+        pid = int(mid.stdout.readline())
+        mid.wait()
+        self.assertTrue(wait_until(lambda: not pid_alive(pid), 6), "a stub that lost its parent during startup is still running")
+
+
 class TestStopGroupPins(unittest.TestCase):
     """What the helper promises, pinned one at a time: the port check, the pid-reuse guard, and the stub's idle timer."""
 
     def listener(self):
         s = socket.socket()
         s.bind(("127.0.0.1", 0))
-        s.listen(5)
+        s.listen(5)   # never accepts: after 5 checks the backlog is full and a Linux connect times out
         self.addCleanup(s.close)
         return s, s.getsockname()[1]
 
