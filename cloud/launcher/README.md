@@ -99,7 +99,7 @@ The switchboard (`bin/cloud_worker.py`) calls this launcher; the settings below 
   past its hard deadline), so a poller of `status` causes one vault read and one mint per call.
 - `CW_CLUSTER_TOKEN_CMD` and `CW_CLUSTER_ADMIN_CMD` run through `sh -c` from the caller's environment, like `TMPDIR`: they are guardrails of the operator's own account, not a boundary against an agent that can set the environment.
 - **A missing vault is a refusal.** When the vault is unreachable or the credential unreadable, the command exits 2 with a
-  message naming the vault pre-check (the operator runs the platform team's firewall check first) and makes no cluster call.
+  message naming the vault pre-check (`launch --cloud` runs the vault access check itself after a firewall refusal: see docs/cloud-operator-quickstart.md, section 2b) and makes no cluster call.
 - **`launch --cloud`** creates the session in `/work` (the scratch volume; `--dir` overrides) and puts a setup preamble before the brief: clone the repository into `/work/repo`, switch to the task branch, work only there (the end hook pushes from `/work/repo`). It checks the allow-list, mints the token, reads the model entry and the git token, and hands both to
   `create` as per-run secrets through pipes (`--run-secret-fd`), then sends the session and the brief through a tunnel.
 - **`send`, `read`, `status`** each open a `kubectl port-forward` to the pod for the length of the command and kill it
@@ -123,6 +123,12 @@ The password reaches slice C once, on a file descriptor it passes with `--passwo
 
 **Other choices where the contract was silent.** Deadlines live on the pod as annotations (`cw/hard-deadline`,
 `cw/idle-seconds`); the reaper honours the record's `hard_deadline` read-only when `CW_CLOUD_RECORD_DIR` is set.
+**The cluster-side floor.** Every pod from `render_pod` (the one builder; shapes S and M, with or without a pull secret or run secrets) sets
+`spec.activeDeadlineSeconds` = the `--max-hard` cap + `POD_DEADLINE_GRACE_SECONDS` (300 s). The cap, not the initial hard limit, because
+Kubernetes cannot raise the field on a running pod, so `extend` within the cap must stay legal; the grace lets the reaper (record, end hook)
+act first. The cap's default is 8h, so the floor is always finite. A pod past it is `Failed` with reason `DeadlineExceeded`; `stop` and the
+reaper delete a `Failed` pod and its Secrets (the record is still written). The kubelet counts from the pod's start, a little after
+the create's own clock, so the floor can trail the stored cap by scheduling time: that is within the grace by design.
 `extend` and `max-hard` are measured from the pod's start. A pod whose hook failed is annotated `cw/kept`;
 `delete` needs `cw/hook-ran` or `--force` (exit 6). The reaper retries a kept pod each pass (the OPEN item on
 exceeding the hard limit and alerting is not decided: it exits 1 from `reap` so a scheduler can alert). The spend cap
