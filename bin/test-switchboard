@@ -4442,10 +4442,11 @@ class TestLaunch(Base):
             self.world.v2.sessions[self.world.sessions[name]]["directory"] = str(self.work)
         self.detach("platform")
         self.detach("ops")
-        sb.write_pane_health(self.world.state, {"agents": {}, "missing": {}, "states": {
-            "platform": {"state": "detached", "pane": self.world.panes["platform"], "session": self.world.sessions["platform"]},
-            "ops": {"state": "detached", "pane": self.world.panes["ops"], "session": self.world.sessions["ops"]},
-            "ghost": {"state": "dead", "pane": "w1:p99", "session": "ses_gone"}}})
+        reg = sb.load_module("registry")   # the agent list reattach --all-detached walks is the registry's
+        for name, row in (("platform", {"session": self.world.sessions["platform"], "pane": self.world.panes["platform"], "state": "detached"}),
+                          ("ops", {"session": self.world.sessions["ops"], "pane": self.world.panes["ops"], "state": "detached"}),
+                          ("ghost", {"session": "ses_gone", "pane": "w1:p99", "state": "dead"})):
+            reg.upsert(str(self.world.state), name, row)
         base = self.world.route
 
         def wrong_login(argv, **kw):
@@ -30984,10 +30985,10 @@ class TestLaunchTesters(LedgerBase):
     def test_a_missing_retired_file_means_nobody_is_retired(self):
         (self.world.state / sb.RETIRED_FILE).unlink(missing_ok=True)
         self.assertEqual(self.verdict("ltst", "S2", "tester")[0], 0)
-        self.assertEqual(sb.read_retired_strict(self.world.state), {})
+        self.assertEqual(sb.registry_retired_strict(self.world.state), {})
 
     def test_a_corrupt_or_unreadable_retired_file_disables_every_launched_tester_and_says_so(self):
-        path = self.world.state / sb.RETIRED_FILE
+        path = self.world.state / "registry.json"   # the record the verdict authority reads
         for label, content in (("corrupt json", b'{"ltst": {"at": 1,'), ("empty bytes", b""), ("garbage", b"\xff\xfe not json \x00"),
                                ("a list", b"[]"), ("a record that is not an object", b'{"ltst": "retired"}'), ("a bare string", b'"x"')):
             with self.subTest(content=label):
@@ -31001,7 +31002,7 @@ class TestLaunchTesters(LedgerBase):
                 self.assertEqual(len(events), before + 1, "a loud audit event")
                 self.assertEqual(events[-1]["detail"]["effect"], "launch-record testers disabled")
                 with self.assertRaises(sb.RetiredUnreadable):
-                    sb.read_retired_strict(self.world.state)
+                    sb.registry_retired_strict(self.world.state)
                 fleets = {"orch": {"role": "orchestrator", "repo": "acme/app"}, "ltst": {"role": "tester", "repo": "acme/app", "reports_to": "orch", "launched_by": "orch"}}
                 agents = {"ok": True, "list": [{"observation": {"name": n, "session": "s-" + n}} for n in fleets]}
                 self.assertEqual(sb.testers_status({"plan_evaluators": {}, "intent_repo": "acme/app"}, agents, fleets, self.world.state),
@@ -31010,7 +31011,7 @@ class TestLaunchTesters(LedgerBase):
         path.unlink()
 
     def test_an_unreadable_directory_instead_of_a_file_also_fails_closed(self):
-        path = self.world.state / sb.RETIRED_FILE
+        path = self.world.state / "registry.json"   # the record the verdict authority reads
         path.mkdir()
         try:
             self.assertEqual(self.verdict("ltst", "S2", "tester")[0], 2)
@@ -67568,7 +67569,7 @@ class TestLoadAlert(Base):
 
     def test_the_coder_count_leaves_out_retired_and_finished_coders(self):
         """#549: a workspace read c0/6 with six coders on its books and none busy: only live coders are counted."""
-        (self.state_dir / "retired.json").write_text(json.dumps({"c-retired": {"at": self.T0, "session": "s"}}))
+        set_retired(self.state_dir, {"c-retired": {"at": self.T0, "session": "s"}})
         (self.state_dir / "last-reports.json").write_text(json.dumps({"c-done": {"state": "done", "at": self.T0}, "c-failed": {"state": "failed", "at": self.T0}}))
         engine = types.SimpleNamespace(state_dir=str(self.state_dir), now=lambda: self.T0, audit=None, actor="daemon", intents=None,
                                        config={"load_alert": self.health.validate({"enabled": True}, "x")})
@@ -67584,7 +67585,7 @@ class TestLoadAlert(Base):
     def _load_names(self, orchs, retired=None, bodies=None, unreadable=False):
         """Run load_tick over `orchs` ({name: session}) and return the names that got figures."""
         if retired is not None:
-            (self.state_dir / "retired.json").write_text(json.dumps(retired))
+            set_retired(self.state_dir, retired)
         def _api(path, repo):
             if unreadable:
                 raise RuntimeError("charters unreadable")
@@ -70555,7 +70556,7 @@ class TestAdoption(LanesCase):
         elif guard == "listed":
             self.world.herdr.plain_terminals = []
         elif guard == "unnamed" and variant == "pane-health record only":
-            (Path(self.world.state) / sb.PANE_HEALTH_FILE).write_text(json.dumps({"agents": {"ghost": {"pane": pane, "session": "ses_x"}}, "states": {}, "missing": {}}))
+            sb.load_module("registry").upsert(str(self.world.state), "ghost", {"pane": pane, "session": "ses_x"})   # a registry row only: the pane an agent record holds
         elif guard == "unnamed":   # herdr's own agent list names a pane that is no fleet agent (a session with no fleet metadata)
             self.world.herdr.plain_terminals = []
             session = self.world.v2.create_session({})
@@ -70571,7 +70572,7 @@ class TestAdoption(LanesCase):
         elif guard == "worktree":   # the owner's shell in a directory below an agent's own cwd (a repository root), not in a registered worktree
             root = self.home / "repo-root"
             (root / "docs").mkdir(parents=True, exist_ok=True)
-            (Path(self.world.state) / sb.PANE_HEALTH_FILE).write_text(json.dumps({"agents": {"orch": {"pane": "w9:p9", "session": "ses_y", "cwd": str(root)}}, "states": {}, "missing": {}}))
+            sb.load_module("registry").upsert(str(self.world.state), "orch", {"pane": "w9:p9", "session": "ses_y", "cwd": str(root)})
             plain["cwd"] = plain["foreground_cwd"] = str(root / "docs")
         elif guard == "idle":
             pass
@@ -70640,7 +70641,7 @@ class TestAdoption(LanesCase):
         self.bare_world()
         self.main("close-pane", "w1:p90")
         self.world.tick(11 * 60)
-        (Path(self.world.state) / sb.PANE_HEALTH_FILE).write_bytes(b"{not json")
+        (Path(self.world.state) / "registry.json").write_bytes(b"{not json")   # the agent list the guards read
         code, out, err = self.main("close-pane", "w1:p90")
         self.assertEqual((code, self.world.herdr.closed), (1, []), err)
         self.assertIn("cannot be read", err)
@@ -72486,7 +72487,7 @@ class TestAgentRegistry(unittest.TestCase):
         self.assertEqual(self.reg.upsert(self.state, "b", {"session": "ses_y"}), {"changed": False, "problem": got["problem"]})
         self.assertEqual((self.state / "registry.json").read_text(), text)
         with self.assertRaises(sb.RetiredUnreadable):
-            sb.read_retired_strict(self.state)
+            sb.registry_retired_strict(self.state)
         for bad in ("{", "[]", '{"version": "1"}', '{"version": 1, "agents": []}'):
             (self.state / "registry.json").write_text(bad)
             self.assertFalse(self.reg.read(self.state)["whole"], bad)
@@ -74496,6 +74497,402 @@ class TestBudgetNotice(BaselineWorld):
     def test_s9_the_shim_change_is_held_for_the_owner_as_a_credentials_path(self):
         paths = sb.impact_floor.load_matrix()["owner_hold"]["top_tier_paths"]
         self.assertTrue(sb.impact_floor.matches("shims/gh", paths["credentials"]), "shims/gh is a top-tier credentials path: its pull request holds for the owner")
+
+
+OLD_AGENT_SOURCES = re.compile(r"read_pane_health|PANE_HEALTH_FILE|RETIRED_FILE|pane-health\.json|retired\.json")   # the old copies of the agent list (docs/agent-registry.md)
+# THE RULE: an old token appears ONLY in the registry module (bin/registry.py, which folds and derives them) and in this DATED list of (file, function, token).
+# Each entry names who removes it and by when; the test fails on an entry that no longer matches (shrink it) and on one past its date. The scan covers every
+# tracked file that is not a test or a document: Python by AST (aliases and constant concatenations resolved), anything else by text.
+OLD_SOURCE_ALLOWED = {
+    ("bin/fleet-switchboard", "adopt_before_close", "RETIRED_FILE"): "2026-12-20, last slice of #903 (the adoption code owns it): only the key of the strict-record table, the read itself is the registry's",
+    ("bin/fleet-switchboard", "adopt_workers", "RETIRED_FILE"): "2026-12-20, last slice of #903 (the adoption code owns it): only the key of the strict-record table, the read itself is the registry's",
+    ("bin/fleet-switchboard", "repoint_workers", "RETIRED_FILE"): "2026-12-20, last slice of #903 (the adoption code owns it): only the key of the strict-record table, the read itself is the registry's",
+    ("bin/fleet-switchboard", "write_boss_records", "RETIRED_FILE"): "2026-12-20, last slice of #903 (the adoption code owns it): only the key of the strict-record table, the read itself is the registry's",
+    ("bin/fleet-switchboard", "<module>", "PANE_HEALTH_FILE"): "2026-12-20, last slice of #903 (slice 2 owns it): the constant of the derived file",
+    ("bin/fleet-switchboard", "<module>", "RETIRED_FILE"): "2026-12-20, last slice of #903 (slice 2 owns it): the constant of the derived file",
+    ("bin/fleet-switchboard", "read_pane_health", "PANE_HEALTH_FILE"): "2026-12-20, last slice of #903 (slice 2 owns it): the derived-file reader",
+    ("bin/fleet-switchboard", "write_pane_health", "PANE_HEALTH_FILE"): "2026-12-20, last slice of #903 (slice 2 owns it): the derived-file writer the sidebar reads",
+    ("bin/fleet-switchboard", "<module>", "pane-health.json"): "2026-12-20, last slice of #903 (slice 2 owns it): the file name; the derived output goes with the old files",
+    ("bin/fleet-switchboard", "<module>", "retired.json"): "2026-12-20, last slice of #903 (slice 2 owns it): the file name; the derived output goes with the old files",
+    ("bin/fleet-switchboard", "_reattach_locked", "pane-health.json"): "2026-12-20, last slice of #903 (slice 2 owns it): reattach's message about the derived file",
+    ("bin/fleet-switchboard", "_reattach_locked", "read_pane_health"): "2026-12-20, last slice of #903 (slice 2 owns it): reattach reads the pane record it rewrites (derived)",
+    ("bin/fleet-switchboard", "cmd_retire", "read_pane_health"): "2026-12-20, last slice of #903 (slice 2 owns it): retire prunes the derived pane record it rewrites",
+    ("bin/fleet-switchboard", "pane_health_pass", "pane-health.json"): "2026-12-20, last slice of #903 (slice 2 owns it): the pane pass writes the derived file",
+    ("bin/fleet-switchboard", "pane_health_pass", "read_pane_health"): "2026-12-20, last slice of #903 (slice 2 owns it): the pane pass reads the pane states it wrote (derived)",
+}
+# Live observers: the call sites that ask herdr which panes exist right now (`"agent", "list"`), keyed by (file, function), each a NAMED entry with its reason,
+# never a silent skip. fleet-heartbeat is DATED (the Chief of Staff's choice: remove by 2026-11-03); the other two are the live source the registry is fed from.
+LIVE_OBSERVERS = {
+    ("bin/fleet-heartbeat", "tabs_with_agents"): "2026-11-03, remove by (cos): live-pane observation (bell filter); identity from the registry; the bell moves into the registry in #973",
+    ("bin/fleet-switchboard", "agent_list"): "discovery's own herdr client: the live source the registry is fed from (herdr and the v2 service), not a record of who exists",
+    ("bin/proof-switchboard", "pane_of_session"): "the proof harness finds the pane of one session in a lab; it keeps no list",
+}
+# Views that read an old file from outside Python, from their own installed copy: derived output of the registry until the last slice (docs/agent-registry.md).
+DERIVED_VIEWS = {"plugins/fleet-decisions-tui/health.mjs": "pane-health.json"}
+
+
+def _fold(node):
+    """The string an expression builds, with what is not a constant left out: a constant, a `+` chain, a `%` format, an f-string, `sep.join([...])`. None for
+    anything else. `s + "/retired" + ".json"` folds to "/retired.json", the way a reader of the file would name it."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
+        left, right = _fold(node.left), _fold(node.right)
+        if isinstance(node.op, ast.Mod):
+            return left
+        return (left or "") + (right or "") if left is not None or right is not None else None
+    if isinstance(node, ast.JoinedStr):
+        return "".join(v.value for v in node.values if isinstance(v, ast.Constant) and isinstance(v.value, str))
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "join" and isinstance(node.func.value, ast.Constant) \
+            and node.args and isinstance(node.args[0], (ast.List, ast.Tuple)):
+        parts = [e.value for e in node.args[0].elts if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+        return node.func.value.value.join(parts)
+    return None
+
+
+def old_source_reads(path, text):
+    """{(function, token)} for every use of an old agent-list source in the Python source `text`: a name, an attribute, an import (and its alias, wherever it is
+    called), a string or a concatenation of strings, outside a docstring. A source that is not Python is read as text: [("<text>", token)]."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return sorted({("<text>", m.group(0)) for m in OLD_AGENT_SOURCES.finditer(text)})
+    found, aliases = set(), {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if OLD_AGENT_SOURCES.search(alias.name):
+                    aliases[alias.asname or alias.name.split(".")[-1]] = OLD_AGENT_SOURCES.search(alias.name).group(0)
+
+    def walk(node, fn):
+        for child in ast.iter_child_nodes(node):
+            inner = child.name if fn is None and isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else fn
+            hit = None
+            if isinstance(child, (ast.Import, ast.ImportFrom)):
+                hit = next((OLD_AGENT_SOURCES.search(a.name).group(0) for a in child.names if OLD_AGENT_SOURCES.search(a.name)), None)
+            elif isinstance(child, ast.Name) and (OLD_AGENT_SOURCES.search(child.id) or child.id in aliases):
+                hit = OLD_AGENT_SOURCES.search(child.id).group(0) if OLD_AGENT_SOURCES.search(child.id) else aliases[child.id]
+            elif isinstance(child, ast.Attribute) and OLD_AGENT_SOURCES.search(child.attr):
+                hit = OLD_AGENT_SOURCES.search(child.attr).group(0)
+            elif isinstance(child, (ast.Constant, ast.BinOp, ast.JoinedStr, ast.Call)) and _fold(child) is not None and OLD_AGENT_SOURCES.search(_fold(child)) and not isinstance(node, ast.Expr):
+                hit = OLD_AGENT_SOURCES.search(_fold(child)).group(0)
+            if hit:
+                found.add((inner or "<module>", hit))
+            if not (isinstance(child, (ast.BinOp, ast.JoinedStr)) and _fold(child) is not None and hit):   # a folded expression is one finding
+                walk(child, inner)
+    walk(tree, None)
+    return sorted(found)
+
+
+def duplicate_defs(text):
+    """[(scope, name)] for every class or function defined twice in one scope of the Python source `text`: a second definition silently shadows the first (a merge that doubles a block).
+    A decorated function (a property's setter, an overload) is a deliberate second definition and is left out."""
+    tree = ast.parse(text)
+    found = []
+    for scope in [tree] + [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]:
+        seen = {}
+        for node in scope.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not getattr(node, "decorator_list", None):
+                seen[node.name] = seen.get(node.name, 0) + 1
+        found += [(getattr(scope, "name", "<module>"), name) for name, n in seen.items() if n > 1]
+    return sorted(found)
+
+
+def tracked_files():
+    """Every file git tracks (the repository's own list, never a directory walk), as repository-relative paths."""
+    out = subprocess.run(["git", "ls-files", "-z"], cwd=str(BIN.parent), capture_output=True, check=True).stdout.decode()
+    return [p for p in out.split("\0") if p and os.path.isfile(str(BIN.parent / p)) and not os.path.islink(str(BIN.parent / p))]
+
+
+def scanned(path):
+    """True for a file the scan judges: not a test, a fixture, a document, or the registry module itself."""
+    name = os.path.basename(path)
+    skip = (path == "bin/registry.py" or path.endswith((".md", ".json", ".txt", ".lock", ".png", ".svg"))
+            or name.startswith("test") or ".test." in name or "/tests/" in path or "/fixtures/" in path or path.startswith(("docs/", ".github/")))
+    return not skip
+
+
+class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
+    """#918 (slice 3 of #903): every view of the agent list reads the registry and nothing else."""
+
+    def registry(self):
+        return sb.load_module("registry")
+
+    def health_file_usage(self, state, sessions):
+        """The `usage` of health-records.json as the daemon's end-of-pass `health_write` writes it (the real wiring), for agents with one message each."""
+        recorder = sb.load_health_records().Recorder(time.time)
+        for n, sid in sessions.items():
+            recorder.ingest_message(sid, {"id": "m-" + n, "role": "assistant", "tokens": {"input": 10, "output": 5, "reasoning": 0, "cache": {"read": 0, "write": 0}}, "cost": 0.01, "time": {"created": time.time() * 1000}})
+        engine = types.SimpleNamespace(state_dir=state, config={}, health=recorder, ci_record_state=None, audit=None, actor="daemon")
+        path = Path(state) / "health-records.json"
+        path.unlink() if path.exists() else None
+        sb.health_write(engine, None, time.time())
+        return json.loads(path.read_text())["usage"]
+
+    def test_the_health_records_keep_everything_when_the_registry_is_not_whole_or_the_retirement_has_no_session(self):
+        state = str(self.world.state)
+        sessions = {"h-one": "ses_h1", "h-two": "ses_h2"}
+        reg = self.registry()
+        reg.retire(state, "h-two", "orchestrator", "finished", session="ses_h2")
+        self.assertEqual(set(self.health_file_usage(state, sessions)), {"ses_h1"}, "a whole read drops the retired session")
+        reg.retire(state, "h-one", "orchestrator", "finished")   # no session: it covers nothing
+        self.assertEqual(set(self.health_file_usage(state, sessions)), {"ses_h1"})
+        (self.world.state / "registry.json").write_text("{not json")   # not whole: nothing is dropped
+        self.assertEqual(set(self.health_file_usage(state, sessions)), {"ses_h1", "ses_h2"})
+
+    def test_s2_a_retired_agent_leaves_every_view_at_its_next_read(self):
+        state = str(self.world.state)
+        for name in ("w-one", "w-two", "w-three"):
+            self.add_worker(name)
+            self.say(name, "question", "%s asks" % name, 5)
+        reg = self.registry()
+        self.assertEqual(len(self.fresh()["decisions"]), 3)
+        for name in ("w-one", "w-two", "w-three"):
+            reg.upsert(state, name, dict(reg.get(state, name) or {}, session=self.world.sessions[name], state="detached", pane="p_" + name))
+            self.assertEqual((reg.get(state, name) or {}).get("state"), "detached")
+        sessions = {n: self.world.sessions[n] for n in ("w-one", "w-two", "w-three")}
+
+        def views():
+            out = {}
+            repair = [l for l in sb.pane_health_status_lines(state, time.time()) if "need repair" in l]
+            out["status"] = {n for n in sessions if any(n in l for l in repair)}
+            out["decisions"] = {n for n in sessions if any(d.get("agent") == n for d in self.fresh()["decisions"])}
+            out["health records"] = {n for n, sid in sessions.items() if sid in self.health_file_usage(state, sessions)}
+            fleet = lambda n, role, **kw: types.SimpleNamespace(name=n, session_id=sessions.get(n, "o"), fleet=dict({"role": role, "reports_to": "w-orch"}, **kw), status="working")
+            engine = types.SimpleNamespace(state_dir=state, now=lambda: time.time(), audit=None, actor="daemon", intents=None,
+                                           config={"load_alert": sb.load_fleet_health().validate({"enabled": True}, "x")})
+            orch = types.SimpleNamespace(name="w-orch", session_id="o", fleet={"role": "orchestrator", "charter": 1, "repo": "acme/widget"}, status="idle")
+            found = {"w-orch": orch, **{n: fleet(n, "coder") for n in sessions}}
+            reg.upsert(state, "w-orch", {"session": "o", "role": "orchestrator", "state": "idle"})
+            sb.load_tick(engine, types.SimpleNamespace(agents=found, problems=[]))
+            load = json.loads((self.world.state / "load.json").read_text())["latest"]["w-orch"]
+            out["load line"] = load["busy"] + load["idle"]   # the coders it counts
+            return out
+        before = views()
+        self.assertEqual(before.pop("load line"), 3)
+        for view, names in before.items():
+            self.assertEqual(names, set(sessions), "%s lists all three before the retire" % view)
+        self.assertTrue(reg.retire(state, "w-two", "orchestrator", "finished", session=sessions["w-two"])["changed"])
+        after = views()
+        self.assertEqual(after.pop("load line"), 2)
+        for view, names in after.items():
+            self.assertEqual(names, {"w-one", "w-three"}, "%s dropped the retired agent at its next read" % view)
+
+    def test_s1_status_lists_the_registrys_agents_and_not_a_stale_pane_health_file(self):
+        state = str(self.world.state)
+        reg = self.registry()
+        for name in ("a-1", "a-2", "a-3"):
+            reg.upsert(state, name, {"session": "ses_" + name, "pane": "p_" + name, "state": "detached"})
+        stale = {"agents": {"old-%d" % i: {"session": "ses_old%d" % i} for i in range(16)}, "states": {"old-%d" % i: {"state": "detached", "pane": "p"} for i in range(16)}, "missing": {}}
+        (self.world.state / "pane-health.json").write_text(json.dumps(stale))
+        (line,) = [l for l in sb.pane_health_status_lines(state, time.time()) if "need repair" in l]
+        self.assertIn("3 agent(s) need repair", line)
+        self.assertNotIn("old-", line)
+
+    def test_a_registry_that_cannot_be_read_is_said_and_never_filled_from_an_old_file(self):
+        state = self.world.state
+        (state / "registry.json").write_text("{not json")
+        (state / "pane-health.json").write_text(json.dumps({"agents": {"x": {"session": "s"}}, "states": {"x": {"state": "detached", "pane": "p"}}}))
+        lines = sb.pane_health_status_lines(str(state), time.time())
+        self.assertEqual(len(lines), 1)
+        self.assertIn("registry could not be read", lines[0])
+        with self.assertRaises(sb.RetiredUnreadable):
+            sb.registry_retired_strict(str(state))
+        self.assertEqual(sb.registry_retired(str(state)), {})
+
+    def old_source_findings(self):
+        found = {}
+        for path in tracked_files():
+            if not scanned(path):
+                continue
+            try:
+                text = (BIN.parent / path).read_text()
+            except (OSError, UnicodeError):
+                continue
+            for fn, token in old_source_reads(path, text):
+                found[(path, fn, token)] = True
+        return found
+
+    def test_no_code_reads_an_agent_list_from_anywhere_but_the_registry(self):
+        found = self.old_source_findings()
+        derived = {"plugins/fleet-decisions-tui/health.mjs"}   # the sidebar plugin: listed as derived output in DERIVED_VIEWS, with its own test
+        for key in sorted(found):
+            if key[0] in derived:
+                continue
+            with self.subTest(file=key[0], function=key[1], token=key[2]):
+                self.assertIn(key, OLD_SOURCE_ALLOWED, "%s:%s names an old agent-list source (%s): read registry.read, or list it with a remove-by date" % key)
+        today = _dt.date.today().isoformat()
+        for key, why in sorted(OLD_SOURCE_ALLOWED.items()):
+            with self.subTest(entry=key):
+                self.assertIn(key, found, "%s:%s (%s) is on the allow-list but no longer matches: remove it" % key)
+                self.assertRegex(why, r"^\d{4}-\d{2}-\d{2}\b", "each entry starts with its remove-by date")
+                self.assertGreaterEqual(why[:10], today, "%s:%s (%s) is past its remove-by date" % key)
+
+    def test_the_scan_catches_every_way_a_new_view_can_name_an_old_source(self):
+        cases = {
+            "a function": ("def a_view(s):\n    return read_pane_health(s)\n", [("a_view", "read_pane_health")]),
+            "an alias": ("from m import read_pane_health as rr\n\ndef v(s):\n    return rr(s)\n", [("<module>", "read_pane_health"), ("v", "read_pane_health")]),
+            "a concatenation": ("def v(s):\n    return open('pane-' + 'health.json').read()\n", [("v", "pane-health.json")]),
+            "a file name": ("def v(s):\n    return open(s + '/retired.json').read()\n", [("v", "retired.json")]),
+            "not python": ("cat $STATE/pane-health.json\n", [("<text>", "pane-health.json")]),
+            "a join": ("def v(s):\n    return open('-'.join(['pane', 'health']) + '.json')\n", [("v", "pane-health.json")]),
+            "a join of the whole name": ("def v(s):\n    return open('.'.join(['retired', 'json']))\n", [("v", "retired.json")]),
+            "an f-string": ("def v(s):\n    return open(f'{s}/retired.json')\n", [("v", "retired.json")]),
+            "a format": ("def v(s):\n    return open('%s/pane-health.json' % s)\n", [("v", "pane-health.json")]),
+            "a chain with a variable": ("def v(s):\n    return open(s + '/retired' + '.json')\n", [("v", "retired.json")]),
+            "a clean view": ("def ok(s):\n    return registry_read(s)\n", []),
+        }
+        for label, (text, want) in cases.items():
+            with self.subTest(label):
+                self.assertEqual(old_source_reads("x", text), want)
+        self.assertNotIn("bin/registry.py", [p for p in tracked_files() if scanned(p)])
+        self.assertIn("bin/fleet-switchboard", [p for p in tracked_files() if scanned(p)])
+        self.assertTrue(any(p.startswith("plugins/") and scanned(p) for p in tracked_files()), "the scan reaches subdirectories")
+
+    # Every function that reads the registry through the seam is a view; each has the test that retires an agent (or breaks the registry) and checks that view.
+    # The table is checked against the code: a new caller of the seam with no row fails `test_every_view_that_reads_the_registry_has_its_retire_test`.
+    VIEW_TESTS = {
+        "health_write": ("test_the_health_records_keep_everything_when_the_registry_is_not_whole_or_the_retirement_has_no_session", "health_file_usage"),
+        "pane_health_status_lines": ("test_s2_a_retired_agent_leaves_every_view_at_its_next_read", "pane_health_status_lines"),
+        "decisions_from_reports": ("test_s2_a_retired_agent_leaves_every_view_at_its_next_read", "fresh()"),
+        "load_tick": ("test_a_half_read_registry_alerts_nobody_and_a_retired_orchestrator_has_no_figures", "load_tick"),
+        "_strict_retired": ("test_a_live_boss_whose_retired_record_names_no_session_keeps_its_worker", "retire"),
+        "bare_pane_context": ("test_an_unreadable_input_of_the_context_refuses_the_close", "close-pane"),
+        "cmd_reattach_all": ("test_reattach_all_detached_acts_on_the_registrys_list_and_nothing_on_a_half_read", "cmd_reattach_all"),
+        "worktree_session_in_use": ("test_a_worktree_that_is_the_session_directory_of_a_non_retired_agent_is_kept_though_its_pane_sits_elsewhere", "worktree_in_use"),
+        "cmd_disk_reclaim_worktrees": ("test_the_sweep_is_a_dry_run_by_default_only_considers_retired_agents_and_apply_is_the_operators_or_cos", "reclaim-worktrees"),
+        "watch_problem": ("test_known_session_and_watch_follow_the_registrys_retired_record", "watch_problem"),
+        "cmd_watch": ("test_watch_refuses_a_worker_with_a_terminal_an_unknown_name_and_a_retired_worker_and_opens_nothing", "watch"),
+        "WorkerFacts.seam_facts": ("test_a_retired_worker_gets_nothing_and_another_name_does_not_silence_it", "seam"),
+        "WorkerFacts.stalled_facts": ("test_a_retired_worker_gets_none", "stalled"),
+        "triage_stop": ("test_a_retired_worker_is_not_nudged_nor_reported_as_stopped_and_the_model_is_not_asked", "triage"),
+        "testers_status": ("test_a_corrupt_or_unreadable_retired_file_disables_every_launched_tester_and_says_so", "testers_status"),
+        "launched_testers_for": ("test_a_retired_tester_stops_counting_and_is_not_listed", "verdict"),
+        "item_agents": ("test_item_agents_fails_closed_on_a_half_read_registry", "item_agents"),
+        "known_session": ("test_known_session_and_watch_follow_the_registrys_retired_record", "known_session"),
+        "cmd_retire": ("test_retire_frees_the_name_of_a_headless_worker_and_undo_restores_the_record_unless_the_name_was_taken", "undo"),
+    }
+
+    def registry_callers(self):
+        """Every function (or method) of bin/fleet-switchboard that calls the registry seam, found by the AST."""
+        seam = {"registry_read", "registry_retired", "registry_retired_strict", "read_retired", "read_retired_strict", "registry_agents_strict"}
+        tree = ast.parse((BIN / "fleet-switchboard").read_text())
+        found = set()
+        for node in tree.body:
+            owners = [(node.name, node)] if isinstance(node, ast.FunctionDef) else \
+                     [(node.name + "." + m.name, m) for m in node.body if isinstance(m, ast.FunctionDef)] if isinstance(node, ast.ClassDef) else []
+            for name, fn in owners:
+                if name not in seam and any(isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id in seam for c in ast.walk(fn)):
+                    found.add(name)
+        return found
+
+    def test_every_view_that_reads_the_registry_has_its_retire_test(self):
+        callers = self.registry_callers()
+        self.assertEqual(callers - set(self.VIEW_TESTS), set(), "a view reads the registry and has no retire-then-check test in VIEW_TESTS")
+        self.assertEqual(set(self.VIEW_TESTS) - callers, set(), "VIEW_TESTS names a function that no longer reads the registry")
+        text = Path(__file__).read_text() if "__file__" in globals() else (BIN / "test-switchboard").read_text()
+        for view, test in sorted(self.VIEW_TESTS.items()):
+            with self.subTest(view=view):
+                test, token = test
+                found = re.search(r"    def %s\(self.*?(?=\n    def |\nclass |\Z)" % re.escape(test), text, re.S)
+                self.assertIsNotNone(found, "%s names a test that does not exist" % view)
+                self.assertIn(token, found.group(0), "%s: the mapped test %s never reaches the view (it should contain %r)" % (view, test, token))
+
+    def test_a_half_read_registry_alerts_nobody_and_a_retired_orchestrator_has_no_figures(self):
+        state = str(self.world.state)
+        reg = self.registry()
+        engine = types.SimpleNamespace(state_dir=state, now=lambda: time.time(), audit=None, actor="daemon", intents=None,
+                                       config={"load_alert": sb.load_fleet_health().validate({"enabled": True}, "x")})
+        orch = lambda n: types.SimpleNamespace(name=n, session_id="s-" + n, fleet={"role": "orchestrator", "charter": 1, "repo": "acme/widget"}, status="idle")
+        discovery = types.SimpleNamespace(agents={"o-live": orch("o-live"), "o-gone": orch("o-gone")}, problems=[])
+        reg.upsert(state, "o-live", {"session": "s-o-live", "role": "orchestrator"})
+        reg.upsert(state, "o-gone", {"session": "s-o-gone", "role": "orchestrator"})
+        reg.retire(state, "o-gone", "x", "finished", session="s-o-gone")
+        sb.load_tick(engine, discovery)
+        self.assertEqual(set(json.loads((self.world.state / "load.json").read_text())["latest"]), {"o-live"})
+        (self.world.state / "load.json").unlink()
+        (self.world.state / "registry.json").write_text("{not json")   # not whole: the tick does nothing (no figures, no alert) (#805)
+        self.assertEqual(sb.load_tick(engine, discovery), [])
+        self.assertFalse((self.world.state / "load.json").exists())
+
+    def test_reattach_all_detached_acts_on_the_registrys_list_and_nothing_on_a_half_read(self):
+        state = self.world.state
+        reg = self.registry()
+        for name in ("a-1", "a-2", "a-3"):
+            reg.upsert(str(state), name, {"session": "ses_" + name, "pane": "p_" + name, "state": "detached"})
+        reg.retire(str(state), "a-3", "x", "finished", session="ses_a-3")
+        stale = {"agents": {"old-%d" % i: {"session": "ses_old%d" % i} for i in range(16)}, "states": {"old-%d" % i: {"state": "detached", "pane": "p"} for i in range(16)}, "missing": {}}
+        (state / "pane-health.json").write_text(json.dumps(stale))
+        acted = []
+        with mock.patch.object(sb, "cmd_reattach", side_effect=lambda one, *a, **k: acted.append(one.name) or sb.EXIT_OK):
+            code = sb.cmd_reattach_all(types.SimpleNamespace(workspace=None), subprocess.run, self.world.clock.now, None)
+        self.assertEqual((code, sorted(acted)), (sb.EXIT_OK, ["a-1", "a-2"]), "the registry's detached, not retired agents; never the stale file's 16")
+        (state / "registry.json").write_text("{not json")
+        acted.clear()
+        with mock.patch.object(sb, "cmd_reattach", side_effect=lambda one, *a, **k: acted.append(one.name) or sb.EXIT_OK):
+            code = sb.cmd_reattach_all(types.SimpleNamespace(workspace=None), subprocess.run, self.world.clock.now, None)
+        self.assertEqual((code, acted), (sb.EXIT_ERROR, []))
+
+    def test_known_session_and_watch_follow_the_registrys_retired_record(self):
+        state = str(self.world.state)
+        reg = self.registry()
+        reg.upsert(state, "k-1", {"session": "ses_k1", "pane": "p1"})
+        reg.retire(state, "k-1", "x", "finished", session="ses_k1")
+        self.assertEqual(sb.known_session(state, "k-1", None), "ses_k1", "a retired agent's session is found in the registry")
+        reg.upsert(state, "k-2", {"session": "ses_k2", "pane": "p2"})
+        reg.retire(state, "k-2", "x", "finished", session="ses_k2", extra={"headless": {"session": "ses_k2"}})   # a headless worker: no pane record is kept, ONLY the retired record names the session
+        self.assertEqual(sb.known_agent(state, "k-2"), {}, "no pane record")
+        self.assertEqual(sb.known_session(state, "k-2", None), "ses_k2", "the fallback reads the retired record")
+        engine = types.SimpleNamespace()
+        self.assertIn("is retired", sb.watch_problem(engine, state, "k-1", types.SimpleNamespace(agents={})))
+        reg.unretire(state, "k-1")
+        self.assertNotIn("is retired", sb.watch_problem(engine, state, "k-1", types.SimpleNamespace(agents={})) or "")
+
+    def test_item_agents_fails_closed_on_a_half_read_registry(self):
+        (self.world.state / "registry.json").write_text("{not json")
+        ctx = types.SimpleNamespace(engine=types.SimpleNamespace(now=lambda: 1, state_dir=str(self.world.state), discover=lambda now: types.SimpleNamespace(agents={})), repo="acme/api", config={})
+        with self.assertRaises(sb.ItemAgentsUnreadable):
+            sb.item_agents(ctx)
+
+    def test_a_live_read_of_herdr_agents_is_a_named_exception_with_its_reason(self):
+        found = set()
+        for path in sorted(BIN.iterdir()):
+            if not path.is_file() or path.name.startswith("test") or path.name == "registry.py":
+                continue
+            try:
+                tree = ast.parse(path.read_text())
+            except (OSError, UnicodeError, SyntaxError):
+                continue
+            for fn in ast.walk(tree):
+                if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for call in ast.walk(fn):
+                        if isinstance(call, ast.Call):
+                            parts = [a.value for a in call.args if isinstance(a, ast.Constant)]
+                            if any(parts[i:i + 2] == ["agent", "list"] for i in range(len(parts))):
+                                found.add(("bin/" + path.name, fn.name))
+        self.assertEqual(found - set(LIVE_OBSERVERS), set(), "a new reader of the live agent list: read the registry, or name it in LIVE_OBSERVERS with a reason")
+        self.assertEqual(set(LIVE_OBSERVERS) - found, set(), "an entry of LIVE_OBSERVERS no longer reads the live list: remove it")
+        for key, reason in LIVE_OBSERVERS.items():
+            self.assertGreater(len(reason), 40, key)
+        dated = {k: r for k, r in LIVE_OBSERVERS.items() if re.match(r"\d{4}-\d{2}-\d{2}\b", r)}
+        self.assertEqual(set(dated), {("bin/fleet-heartbeat", "tabs_with_agents")}, "the heartbeat is a DATED entry, never a standing one")
+        for key, reason in dated.items():
+            self.assertGreaterEqual(reason[:10], _dt.date.today().isoformat(), "%s is past its remove-by date" % (key,))
+
+    def test_no_test_class_or_function_is_defined_twice_in_a_scope(self):
+        self.assertEqual(duplicate_defs((BIN / "test-switchboard").read_text()), [], "a second definition shadows the first: delete the copy a merge left")
+        doubled = "class A:\n    def test_x(self):\n        pass\n\n    def test_x(self):\n        pass\n"   # the mutant: a block twice
+        self.assertEqual(duplicate_defs(doubled), [("A", "test_x")])
+        self.assertEqual(duplicate_defs("class B:\n    @property\n    def v(self): pass\n\n    @v.setter\n    def v(self, x): pass\n"), [])
+
+    def test_the_sidebar_plugin_is_a_view_of_derived_output_and_is_listed(self):
+        for rel, source in DERIVED_VIEWS.items():
+            text = (BIN.parent / rel).read_text()
+            self.assertIn(source, text, "%s reads %s" % (rel, source))
+        # every plugin file naming an old agent-list file is in the list: a new one cannot slip by
+        for path in sorted((BIN.parent / "plugins").rglob("*")):
+            if path.is_file() and path.suffix in (".mjs", ".js", ".tsx") and not path.name.endswith(".test.mjs") and OLD_AGENT_SOURCES.search(path.read_text()):
+                self.assertIn(str(path.relative_to(BIN.parent)), DERIVED_VIEWS, "%s reads an old agent list: read the registry or list it as derived" % path)
 
 
 if __name__ == "__main__":
