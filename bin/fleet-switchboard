@@ -6706,16 +6706,17 @@ def known_agent(state_dir, name, known=None):
 
 def known_session(state_dir, name, known):
     """The session of a fleet agent: the pane record's, else the retired record's."""
-    return known_agent(state_dir, name, known).get("session") or (read_retired(state_dir).get(name) or {}).get("session")
+    found = known_agent(state_dir, name, known).get("session")
+    return found or (read_retired(state_dir).get(name) or {}).get("session")
 
 
 def read_retired(state_dir):
     """The retired map, from the registry (`retired.json` is derived output of it now); a registry that is not whole reads as empty (display only)."""
-    return {k: v for k, v in load_module("registry").read(state_dir)["retired"].items() if isinstance(v, dict)}
+    return registry_retired(state_dir)
 
 
 class RetiredUnreadable(Exception):
-    """retired.json exists but cannot be read as the {name: record} map it is (#372): for the tester gate that is NOT the same as an empty list."""
+    """The registry cannot be read whole (#372): for the tester gate that is NOT the same as an empty list of retired agents."""
 
 
 def registry_read(state_dir):
@@ -6750,10 +6751,7 @@ def read_retired_strict(state_dir):
     """The retired map, or RetiredUnreadable. A registry that is MISSING is an empty map (nobody retired); one that is not whole (corrupt, newer version,
     unreadable) raises. `read_retired` reads all of those as empty, which is right for a display but would let a retired tester record verdicts again:
     the verdict authority (launch-record testers) uses this one and fails closed."""
-    reg = load_module("registry").read(state_dir)
-    if not reg["whole"]:
-        raise RetiredUnreadable(reg["problem"] or "the agent registry cannot be read")
-    return {k: v for k, v in reg["retired"].items()}
+    return registry_retired_strict(state_dir)
 
 
 def _prune_last_reports(data):

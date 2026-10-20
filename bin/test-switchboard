@@ -71062,6 +71062,28 @@ class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
     def registry(self):
         return sb.load_module("registry")
 
+    def health_file_usage(self, state, sessions):
+        """The `usage` of health-records.json as the daemon's end-of-pass `health_write` writes it (the real wiring), for agents with one message each."""
+        recorder = sb.load_health_records().Recorder(time.time)
+        for n, sid in sessions.items():
+            recorder.ingest_message(sid, {"id": "m-" + n, "role": "assistant", "tokens": {"input": 10, "output": 5, "reasoning": 0, "cache": {"read": 0, "write": 0}}, "cost": 0.01, "time": {"created": time.time() * 1000}})
+        engine = types.SimpleNamespace(state_dir=state, config={}, health=recorder, ci_record_state=None, audit=None, actor="daemon")
+        path = Path(state) / "health-records.json"
+        path.unlink() if path.exists() else None
+        sb.health_write(engine, None, time.time())
+        return json.loads(path.read_text())["usage"]
+
+    def test_the_health_records_keep_everything_when_the_registry_is_not_whole_or_the_retirement_has_no_session(self):
+        state = str(self.world.state)
+        sessions = {"h-one": "ses_h1", "h-two": "ses_h2"}
+        reg = self.registry()
+        reg.retire(state, "h-two", "orchestrator", "finished", session="ses_h2")
+        self.assertEqual(set(self.health_file_usage(state, sessions)), {"ses_h1"}, "a whole read drops the retired session")
+        reg.retire(state, "h-one", "orchestrator", "finished")   # no session: it covers nothing
+        self.assertEqual(set(self.health_file_usage(state, sessions)), {"ses_h1"})
+        (self.world.state / "registry.json").write_text("{not json")   # not whole: nothing is dropped
+        self.assertEqual(set(self.health_file_usage(state, sessions)), {"ses_h1", "ses_h2"})
+
     def test_s2_a_retired_agent_leaves_every_view_at_its_next_read(self):
         state = str(self.world.state)
         for name in ("w-one", "w-two", "w-three"):
@@ -71070,7 +71092,8 @@ class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
         reg = self.registry()
         self.assertEqual(len(self.fresh()["decisions"]), 3)
         for name in ("w-one", "w-two", "w-three"):
-            self.assertTrue(reg.upsert(state, name, dict(reg.get(state, name) or {}, session=self.world.sessions[name], state="detached", pane="p_" + name))["changed"] or reg.get(state, name))
+            reg.upsert(state, name, dict(reg.get(state, name) or {}, session=self.world.sessions[name], state="detached", pane="p_" + name))
+            self.assertEqual((reg.get(state, name) or {}).get("state"), "detached")
         sessions = {n: self.world.sessions[n] for n in ("w-one", "w-two", "w-three")}
 
         def views():
@@ -71078,12 +71101,7 @@ class TestEveryViewDerivesFromTheRegistry(BaselineWorld):
             repair = [l for l in sb.pane_health_status_lines(state, time.time()) if "need repair" in l]
             out["status"] = {n for n in sessions if any(n in l for l in repair)}
             out["decisions"] = {n for n in sessions if any(d.get("agent") == n for d in self.fresh()["decisions"])}
-            recorder = sb.load_health_records().Recorder(time.time)
-            for n, sid in sessions.items():
-                recorder.ingest_message(sid, {"id": "m-" + n, "role": "assistant", "tokens": {"input": 10, "output": 5, "reasoning": 0, "cache": {"read": 0, "write": 0}}, "cost": 0.01, "time": {"created": time.time() * 1000}})
-            retired = {r.get("session") for r in reg.read(state)["retired"].values()}
-            body = recorder.body(retired_sessions=retired)
-            out["health records"] = {n for n, sid in sessions.items() if sid in body["usage"]}
+            out["health records"] = {n for n, sid in sessions.items() if sid in self.health_file_usage(state, sessions)}
             fleet = lambda n, role, **kw: types.SimpleNamespace(name=n, session_id=sessions.get(n, "o"), fleet=dict({"role": role, "reports_to": "w-orch"}, **kw), status="working")
             engine = types.SimpleNamespace(state_dir=state, now=lambda: time.time(), audit=None, actor="daemon", intents=None,
                                            config={"load_alert": sb.load_fleet_health().validate({"enabled": True}, "x")})

@@ -210,7 +210,7 @@ class Recorder:
         `usage` cannot be fed. `retired_sessions`: the sessions the registry lists as retired (the records are a view of it: they leave); `watched`: the repositories whose events the daemon receives (a running forwarder): one with no push reads 0."""
         with self.lock:
             out = self._body(tool_body, light, watched)
-        if retired_sessions:   # a view of the registry: a retired agent's session leaves (None: the registry was not read whole, nothing is dropped)
+        if retired_sessions:   # a view of the registry: a retired agent's session leaves (None, or an empty set: nothing is dropped; the caller passes None when the registry was not read whole)
             for table in ("tool_calls", "usage", "steps"):
                 out[table] = {s: v for s, v in out[table].items() if s not in retired_sessions}
         return out
