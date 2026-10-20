@@ -23106,6 +23106,43 @@ class TestWorkerOwned(OwnedInputs, ReportBase):
                     self.assertFalse(silent, "without this member's check the rule no longer stays silent on the bad input: the case above catches the mutant")
         self.assertEqual(set(examples), set(sb.OWNED_READABLE))
 
+    def test_a_reminder_whose_issue_is_not_a_number_never_raises_and_holds_nothing(self):
+        """Every `in w.numbers` / `in ctx.numbers` of the change (the reminder guard, the decision refs, the parent walk, the pull request references) takes
+        a number from a place that already holds only numbers, except the reminders file, which a person can edit: a list, a dict, a string and a bool
+        there answer as the old `==` did (not waiting)."""
+        now = self.world.clock.now
+        for name, bad in (("a list", [2]), ("a dict", {"n": 2}), ("a string", "2"), ("a bool", True), ("null", None), ("a float", 2.0)):
+            with self.subTest(issue=name):
+                self.setUp()
+                sb.add_reminder(self.world.state, "coder", now() + 600, now(), "look", issue=2)
+                items = sb.read_reminders(self.world.state)
+                items[0]["issue"] = bad
+                sb.write_reminders(self.world.state, items)
+                got = self.predicate()
+                self.assertEqual((got.state, got.codes), ("clear", []))
+        self.setUp()   # the control: a real number on a work item still waits
+        sb.add_reminder(self.world.state, "coder", now() + 600, now(), "look", issue=3)
+        self.assertEqual(self.predicate().codes, ["reminder"])
+
+    def test_the_mutant_that_tests_membership_without_the_number_check_raises_on_a_list_and_a_dict(self):
+        now = self.world.clock.now
+        needs, check = sb.WAITING_GUARDS["reminder"]
+        def raw(w):
+            for reminder in sb.read_reminders(w.engine.state_dir):
+                if reminder.get("to") == w.observation.name and reminder.get("issue") in w.numbers:
+                    return ["it set a reminder for later"]
+            return []
+        for name, bad in (("a list", [2]), ("a dict", {"n": 2})):
+            with self.subTest(issue=name):
+                self.setUp()
+                sb.add_reminder(self.world.state, "coder", now() + 600, now(), "look", issue=2)
+                items = sb.read_reminders(self.world.state)
+                items[0]["issue"] = bad
+                sb.write_reminders(self.world.state, items)
+                with mock.patch.dict(sb.WAITING_GUARDS, {"reminder": (needs, raw)}):
+                    with self.assertRaises(TypeError):
+                        self.predicate()
+
     def said(self, rule):
         self.apply()
         return [f for f in self.derive() if (":seam:" if rule == "seam" else ":stalled:") in f.key]

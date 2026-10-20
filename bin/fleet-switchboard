@@ -8639,13 +8639,19 @@ def _guard_review_window(w):
     return found
 
 
+def _is_issue_number(value):
+    """An issue number is an int and not a bool: a hand-edited reminders file may hold a list, a dict, a string or a bool there, and a set test on an
+    unhashable one raises (the old `==` answered no)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _guard_reminder(w):
     try:
         reminders = read_reminders(w.engine.state_dir)
     except ReminderError:
         raise _Unread() from None   # an unreadable file, or a reminder with no readable time (read_reminders refuses it): fails toward saying nothing
     for reminder in reminders:
-        if (reminder.get("to") == w.observation.name and reminder.get("issue") in w.numbers and reminder["at"] > w.now
+        if (reminder.get("to") == w.observation.name and _is_issue_number(reminder.get("issue")) and reminder["issue"] in w.numbers and reminder["at"] > w.now
                 and "while_running" not in (reminder.get("condition") or {})):   # the checkpoint `launch` sets is the boss's, not the worker waiting
             return ["it set a reminder for later"]
     return []
