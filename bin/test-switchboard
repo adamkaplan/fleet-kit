@@ -4661,13 +4661,33 @@ class TestLaunch(Base):
         now = self.world.clock.now()
         self.dead_worker({"state": "working", "at": now - 3 * 3600})
         lines = "\n".join(sb.pane_health_status_lines(self.world.state, now))
-        self.assertNotIn("DEAD", lines)   # #919: status never draws a dead agent; the wake (S2) carries the hint
+        self.assertIn("last report: working 3h ago", lines)   # a final done would have retired it already
+        self.assertIn("fleet-switchboard retire worker", lines)
+        self.assertIn("fleet-switchboard reattach worker", lines)
+
+    def test_dead_hint_s1b_once_the_registry_holds_the_agents_status_does_not_draw_a_dead_one(self):
+        now = self.world.clock.now()
+        self.dead_worker({"state": "working", "at": now - 3 * 3600})
+        (self.world.state / "registry.json").write_text(json.dumps({"version": 1, "agents": {}, "retired": {}}))   # #919: the registry removes it on read
+        lines = "\n".join(sb.pane_health_status_lines(self.world.state, now))
+        self.assertNotIn("DEAD", lines)
         self.assertNotIn("worker", lines)
-        entry = {"state": "working", "at": now - 3 * 3600}
-        text = sb.dead_hint.hint("worker", entry, now)
-        self.assertIn("last report: working 3h ago", text)   # a final done would have retired it already
-        self.assertIn("fleet-switchboard retire worker", text)
-        self.assertIn("fleet-switchboard reattach worker", text)
+
+    def test_reading_status_removes_a_dead_agent_through_the_registry_once_with_one_audit_line(self):
+        """S3 through the real status path: `collect_status` over a registry holding a dead agent whose pane herdr no longer has."""
+        self.dead_worker()
+        self.write_config({"opencode": FAKE_OPENCODE, "herdr": FAKE_HERDR})
+        reg = sb.load_module("registry")
+        pane = sb.read_pane_health(self.world.state)["agents"]["worker"]
+        reg.upsert(self.world.state, "worker", {"session": pane["session"], "pane": pane["pane"], "role": "coder", "workspace": "w1"})
+        path = self.world.state / "registry.json"
+        doc = json.loads(path.read_text())
+        doc["agents"]["worker"]["state"] = "dead"
+        path.write_text(json.dumps(doc))
+        sb.collect_status(self.world.route, self.world.clock.now)
+        self.assertNotIn("worker", reg.read(self.world.state)["agents"])
+        audit = [json.loads(l) for l in (self.world.state / "registry-audit.jsonl").read_text().splitlines()]
+        self.assertEqual(len([l for l in audit if l.get("event") == "reconcile_remove"]), 1)
 
     def test_dead_hint_s2_the_wake_says_no_report_since_launch_and_both_hints(self):
         self.dead_worker()
@@ -4706,8 +4726,8 @@ class TestLaunch(Base):
 
     def test_dead_hint_s6_a_corrupt_file_says_no_report_since_launch(self):
         self.dead_worker(None)
-        facts = [f for f in sb.PaneFacts.__call__(self.fact_source()) if "worker is DEAD" in f.summary]
-        self.assertIn("no report since launch", facts[0].summary)   # the wake says it; status no longer draws a dead agent (#919)
+        lines = "\n".join(sb.pane_health_status_lines(self.world.state, self.world.clock.now()))
+        self.assertIn("no report since launch", lines)
 
     def test_dead_hint_s7_nothing_is_written(self):
         now = self.world.clock.now()
@@ -66346,6 +66366,36 @@ class TestReconcileOnRead(unittest.TestCase):
         self.assertIn("ghost", reg.read(self.dir)["agents"])
         self.assertEqual(sb.reconcile_agents_on_read(self.dir, Herdr("exit")), ["ghost"])
         self.assertEqual(sorted(reg.read(self.dir)["agents"]), ["alpha", "bare"])
+
+    def test_s3_the_callers_own_guards_with_a_recording_registry(self):
+        """The caller's guards, not the registry's backstop: a recording fake counts the calls, so a removed guard shows."""
+        class Recording:
+            def __init__(self):
+                self.calls = []
+
+            def reconcile_remove(self, state_dir, name, evidence, whole):
+                self.calls.append((name, evidence, whole))
+                return {"changed": True, "problem": None}
+        dead = {"ghost": {"state": "dead", "pane": "p_9"}}
+        whole = {"whole": True, "agents": dead}
+        cases = {
+            "not whole": ({"whole": False, "agents": dead}, {"pane": False, "process": False}, 0),
+            "whole key missing": ({"agents": dead}, {"pane": False, "process": False}, 0),
+            "pane unchecked": (whole, {"pane": None, "process": False}, 0),
+            "process unchecked": (whole, {"pane": False, "process": None}, 0),
+            "process present": (whole, {"pane": False, "process": True}, 0),
+            "pane present": (whole, {"pane": True, "process": False}, 0),
+            "both gone": (whole, {"pane": False, "process": False}, 1),
+            "recorded live": ({"whole": True, "agents": {"ghost": {"state": "working"}}}, {"pane": False, "process": False}, 0),
+        }
+        for label, (read, live, count) in cases.items():
+            with self.subTest(case=label):
+                rec = Recording()
+                self.mod.reconcile_on_read(self.dir, read, lambda n, a, live=live: live, rec)
+                self.assertEqual(len(rec.calls), count)
+                if count:
+                    self.assertEqual(rec.calls[0][2], True)
+                    self.assertEqual((rec.calls[0][1]["pane_listed"], rec.calls[0][1]["process_found"]), (False, False))
 
     def test_s3_herdr_live_check_says_gone_only_when_herdr_says_no_such_pane(self):
         class Herdr:
