@@ -1659,6 +1659,110 @@ cat "$STUB_DIR/admin_kubeconfig"
 """
 
 
+class TestLauncherLookup(Base):
+    """S17: the launcher is the variable's program, else the checkout's own, else `cloud-worker` on the PATH, else a refusal (exit 2, zero calls)."""
+
+    def setUp(self):
+        super().setUp()
+        self.mod = sb.load_module("cloud_worker")
+        self.fake = Path(os.path.realpath(self.home)) / "checkout"
+        self.entry = self.fake / "cloud" / "launcher" / "cloud-worker"
+        self.entry.parent.mkdir(parents=True)
+        shutil.copy(str(self.stub), str(self.entry))
+        self.entry.chmod(0o755)
+        self.bare = self.home / "bare-path"
+        self.bare.mkdir()
+        moved = self.stub_dir / "launcher-stub"            # nothing called cloud-worker is on the PATH (the stub directory stays on it for kubectl and az)
+        self.stub.rename(moved)
+        self.stub = moved
+        os.environ["PATH"] = "%s:%s" % (self.bare, os.environ["PATH"])
+        patch = mock.patch.object(self.mod, "checkout_launcher_path", lambda: self.entry)
+        patch.start()
+        self.addCleanup(patch.stop)
+        os.environ.pop("FLEET_CLOUD_WORKER_BIN", None)
+
+    def test_an_empty_environment_uses_the_launcher_of_the_checkout(self):
+        code, out, err = self.launch()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sum(1 for c in self.stub_calls() if "create" in c), 1)   # the checkout's launcher was called once
+
+    def test_the_variable_still_wins_over_the_checkout(self):
+        other = self.home / "other"
+        other.mkdir()
+        elsewhere = other / "cloud-worker"
+        elsewhere.write_text("#!/bin/sh\nexit 7\n")
+        elsewhere.chmod(0o755)
+        os.environ["FLEET_CLOUD_WORKER_BIN"] = str(elsewhere)
+        code, out, err = self.launch()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.stub_calls(), [])           # the checkout's launcher was never called
+
+    def test_the_path_is_the_last_resort_before_the_refusal(self):
+        self.entry.chmod(0o644)                            # the checkout's is unusable
+        path_launcher = self.bare / "cloud-worker"
+        shutil.copy(str(self.stub), str(path_launcher))
+        path_launcher.chmod(0o755)
+        self.assertEqual(self.mod.launcher_argv(), ["cloud-worker"])
+
+    def refused(self):
+        code, out, err = self.launch()
+        self.assertEqual(code, 2, err)
+        self.assertIn("FLEET_CLOUD_WORKER_BIN", err)
+        self.assertIn(str(self.entry), err)
+        self.assertEqual(self.stub_calls(), [])
+        self.assertEqual(sum("no cloud launcher found" in line for line in err.splitlines()), 1)
+        self.assertFalse((self.state / "cloud" / "coder7.json").exists())
+
+    def test_with_neither_it_refuses_naming_both_places_and_calls_nothing(self):
+        self.entry.unlink()
+        self.refused()
+
+    def test_an_unsafe_checkout_launcher_is_not_used(self):
+        """One case per judgement of the one walk: not executable, group-writable, world-writable, a link naming a path, a directory, a writable parent."""
+        def not_exec():
+            self.entry.chmod(0o644)
+
+        def group_writable():
+            self.entry.chmod(0o775)
+
+        def world_writable():
+            self.entry.chmod(0o757)
+
+        def link_elsewhere():
+            self.entry.unlink()
+            os.symlink(str(self.stub), str(self.entry))
+
+        def directory():
+            self.entry.unlink()
+            self.entry.mkdir()
+
+        def parent_writable():
+            self.entry.parent.chmod(0o777)
+            self.addCleanup(self.entry.parent.chmod, 0o755)
+
+        for case in (not_exec, group_writable, world_writable, link_elsewhere, directory, parent_writable):
+            with self.subTest(case=case.__name__):
+                self.setUp_again()
+                case()
+                self.assertIsNotNone(self.mod._checkout_launcher_problem(str(self.entry)))
+                self.assertRaises(self.mod.Refusal, self.mod.launcher_argv)
+
+    def setUp_again(self):
+        if self.entry.is_dir() and not self.entry.is_symlink():
+            self.entry.rmdir()
+        elif self.entry.is_symlink() or self.entry.exists():
+            self.entry.unlink()
+        self.entry.parent.chmod(0o755)
+        shutil.copy(str(self.stub), str(self.entry))
+        self.entry.chmod(0o755)
+
+    def test_the_kits_own_launcher_link_is_accepted(self):
+        """The real checkout's `cloud-worker` is a link to its sibling cloud_worker.py: judged by that file, the entry used is the link."""
+        real = Path(self.mod.__file__).resolve().parent.parent / "cloud" / "launcher" / "cloud-worker"
+        self.assertTrue(real.is_symlink())
+        self.assertIsNone(self.mod._checkout_launcher_problem(str(real)))
+
+
 class VaultBase(Base):
     """#876 slice 2: the vault access check, run by `launch --cloud` only after a vault read was refused for the firewall (offline: a fake `az` and a
     fake check module in a temp checkout)."""
