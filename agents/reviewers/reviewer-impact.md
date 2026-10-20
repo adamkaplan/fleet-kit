@@ -99,6 +99,12 @@ findings:
 - <rule id> | note | <file:line> | <why> | <what would resolve it>
 ```
 
+The coder records your block with `review record --block`. A block with no `impact-severity:` and `impact-probability:` line is recorded WITHOUT a score and clears nothing by score, so always give both.
+
+<!-- block-table:begin -->
+With --block, refused (the block carries them): --verdict, --head, --blocks, --notes, --impact-action; accepted: --reviewer, --summary, --impact-class, --impact-severity, --impact-probability, --impact-reason, and of these --impact-class, --impact-severity, --impact-probability, --impact-reason win over the block's own lines
+<!-- block-table:end -->
+
 `approve` means nothing blocks. `request-changes` needs at least one blocking finding that cites a rule. `comment` is proposals only.
 
 ## Never

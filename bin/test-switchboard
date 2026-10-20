@@ -32141,6 +32141,114 @@ class TestImpactClassAndNarrowForm(LedgerBase):
                             "a # line inside a tracked block is content")
 
 
+class TestBlockTable(LedgerBase):
+    """#895: `review record --block`: one table of what goes with it, said the same in the help, the refusal and the agent definition; a record with no score says so on stderr."""
+
+    def setUp(self):
+        super().setUp()
+        self.extra_config = dict(FLOOR_CONFIG, plan_gates={"repos": {"acme/app": {"mode": "shadow"}}})
+        self.configure()
+        self.pr = dict(self.pr, baseRefOid="c" * 40, changedFiles=1, files=[{"path": "docs/a.md", "additions": 1, "deletions": 0}])
+
+    def block(self, extra="", action="impact-action: none\n"):
+        path = self.world.state / "block.txt"
+        path.write_text("verdict: approve\nhead: %s\n%s%sfindings:\n" % (LEDGER_HEAD, action, extra))
+        return str(path)
+
+    def records(self):
+        return [e for e in self.ledger() if e["kind"] == "review_record"]
+
+    def record(self, *more, reviewer="impact", extra=""):
+        return self.run_as("coder", "review", "record", self.PR, "--reviewer", reviewer, "--block", self.block(extra, "impact-action: none\n" if reviewer == "impact" else ""), *more)
+
+    ROW_FLAGS = {"--verdict": ("approve",), "--head": (LEDGER_HEAD,), "--blocks": ("1",), "--notes": ("1",), "--impact-action": ("none",),
+                 "--impact-class": ("data",), "--impact-severity": ("Marginal",), "--impact-probability": ("Remote",), "--impact-reason": ("a reason",), "--summary": ("one line",)}
+
+    def test_the_table_has_every_record_flag_once(self):
+        parser = sb.build_parser()
+        sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction)).choices["review"]
+        record = next(a for a in sub._actions if isinstance(a, argparse._SubParsersAction)).choices["record"]
+        flags = {o for a in record._actions for o in a.option_strings if o.startswith("--") and o not in ("--help", "--block")}
+        listed = [flag for flag, _, _ in sb.BLOCK_FLAG_TABLE]
+        self.assertEqual(sorted(listed), sorted(set(listed)))
+        self.assertEqual(set(listed), flags)
+        self.assertEqual({mode for _, _, mode in sb.BLOCK_FLAG_TABLE} - {"refused", "accepted", "wins"}, set())
+        self.assertEqual(sorted(self.ROW_FLAGS), sorted(set(listed) - {"--reviewer"}))
+
+    def test_each_row_does_what_the_table_says(self):
+        for flag, dest, mode in sb.BLOCK_FLAG_TABLE:
+            if flag == "--reviewer":
+                continue
+            with self.subTest(flag=flag):
+                before = len(self.records())
+                pair = ("--impact-probability", "Remote") if flag == "--impact-severity" else ("--impact-severity", "Marginal") if flag == "--impact-probability" else ()
+                code, out, err = self.record(flag, *self.ROW_FLAGS[flag], *pair)
+                if mode == "refused":
+                    self.assertEqual(code, 2)
+                    self.assertIn(sb.BLOCK_TABLE_TEXT, err)
+                    self.assertEqual(len(self.records()), before)
+                else:
+                    self.assertEqual(code, 0, err)
+                    self.assertEqual(len(self.records()), before + 1)
+                    if flag != "--summary":
+                        self.assertEqual(self.records()[-1][dest], self.ROW_FLAGS[flag][0])
+        code, out, err = self.record("--blocks", "0", "--notes", "0")
+        self.assertEqual(code, 0, err)   # 0 is the default: cannot be told from absent
+
+    def test_a_flag_wins_over_the_blocks_line(self):
+        self.assertEqual(self.record("--impact-severity", "Critical", extra="impact-severity: Marginal\nimpact-probability: Remote\n")[0], 0)
+        self.assertEqual((self.records()[-1]["impact_severity"], self.records()[-1]["impact_probability"]), ("Critical", "Remote"))
+
+    def test_the_table_is_said_the_same_in_the_help_the_refusal_and_the_definition(self):
+        text = sb.BLOCK_TABLE_TEXT
+        self.assertEqual(text, sb.block_table_text())
+        sub = next(a for a in sb.build_parser()._actions if isinstance(a, argparse._SubParsersAction)).choices["review"]
+        record = next(a for a in sub._actions if isinstance(a, argparse._SubParsersAction)).choices["record"]
+        self.assertIn(text, next(a for a in record._actions if "--block" in a.option_strings).help)
+        definition = (REPO / "agents" / "reviewers" / "reviewer-impact.md").read_text()
+        self.assertEqual(definition.split("<!-- block-table:begin -->\n", 1)[1].split("\n<!-- block-table:end -->", 1)[0], text)
+        self.assertEqual(self.record("--head", LEDGER_HEAD)[2].count(text), 1)
+        self.assertEqual((REPO / "bin" / "fleet-switchboard").read_text().count('("--verdict", "verdict", "refused")'), 1)
+
+    def test_the_warning_with_and_without_a_score(self):
+        scored = "impact-severity: Marginal\nimpact-probability: Remote\n"
+        cases = ((dict(), True), (dict(extra=scored), False), (dict(extra="impact-reason: why\n"), True))
+        for kwargs, warns in cases:
+            with self.subTest(**kwargs):
+                before = len(self.records())
+                code, out, err = self.record(**kwargs)
+                self.assertEqual(code, 0)
+                self.assertEqual(len(self.records()), before + 1)
+                self.assertTrue(out.startswith("recorded impact review"))
+                if warns:
+                    self.assertEqual(len(err.strip().splitlines()), 1)
+                    for word in ("WITHOUT a score", "clears nothing by score", "--impact-severity", "--impact-probability"):
+                        self.assertIn(word, err)
+                else:
+                    self.assertEqual(err, "")
+        code, out, err = self.record("--impact-severity", "Marginal", "--impact-probability", "Remote")
+        self.assertEqual((code, err), (0, ""))
+        code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve")
+        self.assertEqual(code, 0)
+        self.assertIn("WITHOUT a score", err)
+        code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--verdict", "approve", "--impact-severity", "Marginal", "--impact-probability", "Remote")
+        self.assertEqual((code, err), (0, ""))
+
+    def test_other_reviewers_never_get_the_warning(self):
+        for reviewer in ("code", "architecture", "security", "test"):
+            with self.subTest(reviewer=reviewer):
+                code, out, err = self.record(reviewer=reviewer)
+                self.assertEqual((code, err), (0, ""))
+
+    def test_the_family_of_only_x_refusals_says_what_it_accepts(self):
+        code, out, err = self.run_as("coder", "review", "checkout", self.PR, "--remove", "somewhere")
+        self.assertNotEqual(code, 0, err)   # refused (its own exit code, not changed here)
+        self.assertIn("--remove takes only the directory", err)
+        code, out, err = self.run_as("coder", "notice", "withdraw", self.PR, "a note")
+        self.assertEqual(code, 2)
+        self.assertIn("notice withdraw takes only the PR", err)
+
+
 class TestImpactRejudge(LedgerBase):
     """#451 slice 3: the daemon's hold labels follow the OWNER-HOLD rule; a hold it applied that no longer holds is taken off (only the labels it added);
     the list is posted once for each version of the rule; an unreadable matrix file changes nothing and says so once. A fake gh records every write."""

@@ -22938,6 +22938,23 @@ def parse_review_block(text):
 
 IMPACT_CLASS_RE = re.compile(r"[a-z][a-z-]{0,31}")
 IMPACT_RATING_FIELDS = ("impact_severity", "impact_probability", "impact_reason")   # the record's rating fields: the code's one table (parse, record, flags)
+# #895: `review record --block`: the ONE table of which flags go with it. The refusal, the `--block` help and the impact reviewer's agent definition all say BLOCK_TABLE_TEXT (rendered here, never retyped).
+BLOCK_FLAG_TABLE = (   # (flag, dest, mode): `refused` (the block carries it: giving it is an error), `accepted` (goes with --block), `wins` (accepted, and the flag wins over the block's own line)
+    ("--reviewer", "reviewer", "accepted"), ("--summary", "summary", "accepted"),
+    ("--verdict", "verdict", "refused"), ("--head", "head", "refused"), ("--blocks", "blocks", "refused"), ("--notes", "notes", "refused"), ("--impact-action", "impact_action", "refused"),
+    ("--impact-class", "impact_class", "wins"), ("--impact-severity", "impact_severity", "wins"), ("--impact-probability", "impact_probability", "wins"), ("--impact-reason", "impact_reason", "wins"),
+)
+
+
+def block_table_text():
+    """The table as one sentence: what `review record --block` refuses and what it accepts."""
+    pick = lambda *modes: ", ".join(flag for flag, _, mode in BLOCK_FLAG_TABLE if mode in modes)
+    return ("With --block, refused (the block carries them): %s; accepted: %s, and of these %s win over the block's own lines"
+            % (pick("refused"), pick("accepted", "wins"), pick("wins")))
+
+
+BLOCK_TABLE_TEXT = block_table_text()
+NO_SCORE_TEXT = ("recorded WITHOUT a score (no impact severity and probability): it clears nothing by score; add --impact-severity and --impact-probability, or `impact-severity:` and `impact-probability:` lines in the block")
 RATING_INPUTS = IMPACT_RATING_FIELDS + ("impact_action", "impact_class", "block")   # every input of `review record` that decides the rating: read ONLY by `rating_inputs`, from the raw argv
 
 
@@ -22999,8 +23016,9 @@ def cmd_review(args, runner, now):
         action, klass = given.get("impact_action"), given.get("impact_class")
         rating_in = {name: given.get(name) for name in IMPACT_RATING_FIELDS}
         if given.get("block") is not None:   # the reviewer's returned text: the coder session records it
-            if args.verdict or args.head or args.blocks or args.notes or action:
-                raise ReviewError("--block carries the verdict, head, counts and impact action itself: give nothing else")
+            carried = {"verdict": args.verdict, "head": args.head, "blocks": args.blocks, "notes": args.notes, "impact_action": action}
+            if any(carried[dest] for flag, dest, mode in BLOCK_FLAG_TABLE if mode == "refused"):
+                raise ReviewError(BLOCK_TABLE_TEXT)
             fields, why = parse_review_block(_read_capped(given["block"], REVIEW_TABLE_MAX))
             if fields is None:
                 raise ReviewError("refused: %s" % why)
@@ -23078,6 +23096,8 @@ def cmd_review(args, runner, now):
         print("recorded %s review %s at %s (%s): %d of %d reviewers recorded at this head%s" % (
             args.reviewer, args.verdict, head[:8], ref, len(got["recorded"]), len(got["expected"]),
             "; missing %s" % ", ".join(got["missing"]) if got["missing"] else ""))
+        if args.reviewer == "impact" and not (entry.get("impact_severity") and entry.get("impact_probability")):
+            sys.stderr.write("%s: review: %s\n" % (PROG, NO_SCORE_TEXT))
         return EXIT_OK
     except (ReviewError, plan_ledger.LedgerError, ConfigError, IdentityUncertain, CallerError) as err:
         sys.stderr.write("%s: review: %s\n" % (PROG, _one_line(str(err), 400)))
@@ -23288,7 +23308,7 @@ def add_review_parsers(sub):
     record.add_argument("--reviewer", required=True, help="code | architecture | security | impact | test")
     record.add_argument("--head", help="The commit judged (default: the PR's head; a different one is refused)")
     record.add_argument("--verdict", help="approve | request-changes | comment | incomplete")
-    record.add_argument("--block", help="File (or - for stdin) holding the verdict block a reviewer returned: verdict, head, counts and impact action are read from it")
+    record.add_argument("--block", help="File (or - for stdin) holding the verdict block a reviewer returned: verdict, head, counts and impact action are read from it. " + BLOCK_TABLE_TEXT)
     record.add_argument("--blocks", type=int, default=0, help="Blocking findings (each cites a rule)")
     record.add_argument("--notes", type=int, default=0, help="Notes and proposals")
     record.add_argument("--impact-action", dest="impact_action", choices=("hold", "second-review", "none"),
