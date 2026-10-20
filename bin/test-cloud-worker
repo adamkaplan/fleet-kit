@@ -2219,6 +2219,15 @@ class TestTokenMode(Base):
                 self.assertIn("CW_TOKEN_MODE", err)
                 self.nothing_ran()
 
+    def test_the_environment_asks_read_only_but_the_file_lacks_the_key_is_refused_never_dropped(self):
+        self.settings_file()   # a file that does not hold CW_TOKEN_MODE
+        with mock.patch.dict(os.environ, {"CW_TOKEN_MODE": "read-only"}):
+            code, out, err = self.launch_with("--cloud")
+        self.assertEqual(code, 2, err)
+        self.assertIn("CW_TOKEN_MODE", err)
+        self.assertEqual(self.mints, [])
+        self.nothing_ran()
+
     def test_a_key_in_the_file_and_the_environment_that_differ_follows_the_existing_clash_refusal(self):
         self.settings_file(CW_TOKEN_MODE="read-only")
         with mock.patch.dict(os.environ, {"CW_TOKEN_MODE": "default"}):

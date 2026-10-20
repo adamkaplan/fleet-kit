@@ -396,6 +396,70 @@ class NarrowingSettings(unittest.TestCase):
             with self.subTest(key=key), mock.patch.dict(cw.VALIDATORS, {key: (words, test)}):   # a plain row: no flag
                 self.assertNotIn(key, cw.parse_settings(self.REQUIRED + "%s=\n" % key))   # the blank is dropped: the broader default would apply
 
+    # -- the file and the environment together (the file is the one source when it exists)
+    def apply(self, file_lines, env):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("CW_TMPDIR")) as d:
+            path = os.path.join(d, "cloud.env")
+            with open(path, "w") as f:
+                f.write(self.REQUIRED + file_lines)
+            os.chmod(path, 0o600)
+            env = dict(env)
+            source = cw.apply_settings(env, path)
+            return source, env
+
+    SAMPLE = {"CW_TOKEN_MODE": ("read-only", "default")}   # per narrowing row: a value, and a different valid one
+
+    def test_every_narrowing_row_has_a_sample_here(self):
+        self.assertEqual(self.narrowing(), sorted(self.SAMPLE))
+
+    def test_the_file_lacks_the_key_and_the_environment_sets_it_is_refused_never_dropped(self):
+        for key in self.narrowing():
+            for value in self.SAMPLE[key] + ("", "  "):
+                with self.subTest(key=key, value=value), self.assertRaises(cw.CloudError) as caught:
+                    self.apply("", {key: value})
+                self.assertIn(key, str(caught.exception))
+                self.assertNotIn(value.strip() or "\0", str(caught.exception).replace(key, ""))
+
+    def test_the_file_sets_the_key_and_the_environment_differs_or_is_blank_is_refused_naming_the_key(self):
+        for key in self.narrowing():
+            mine, other = self.SAMPLE[key]
+            for env_value in (other, "", " "):
+                with self.subTest(key=key, env=env_value), self.assertRaises(cw.CloudError) as caught:
+                    self.apply("%s=%s\n" % (key, mine), {key: env_value})
+                self.assertIn(key, str(caught.exception))
+
+    def test_the_file_alone_the_same_value_in_both_and_the_environment_alone_are_taken(self):
+        for key in self.narrowing():
+            mine, _ = self.SAMPLE[key]
+            with self.subTest(key=key, route="file alone"):
+                source, env = self.apply("%s=%s\n" % (key, mine), {})
+                self.assertEqual(env[key], mine)
+            with self.subTest(key=key, route="same in both"):
+                source, env = self.apply("%s=%s\n" % (key, mine), {key: mine})
+                self.assertEqual(env[key], mine)
+            with self.subTest(key=key, route="environment alone (no file)"):
+                env = {key: mine}
+                self.assertEqual(cw.apply_settings(env, "/nonexistent/cloud.env"), "environment")
+                self.assertEqual(self.ENV_ROUTE[key](mine), (mine, "the settings"))
+
+    def test_mutant_the_flag_removed_lets_the_environment_value_be_dropped_silently(self):
+        for key in self.narrowing():
+            words, test = cw.VALIDATORS[key]
+            mine, _ = self.SAMPLE[key]
+            with self.subTest(key=key), mock.patch.dict(cw.VALIDATORS, {key: (words, test)}):   # a plain row: no flag
+                source, env = self.apply("", {key: mine})
+                self.assertNotIn(key, env)   # the read-only request was dropped: the write default would apply
+
+    def test_every_row_declares_narrows_and_a_row_cannot_be_built_without_it(self):
+        for key, row in cw.VALIDATORS.items():
+            with self.subTest(key=key):
+                self.assertIsInstance(row, tuple)
+                self.assertEqual(type(row).__name__, "_Rule")
+                self.assertIn(row.narrows, (True, False))
+        self.assertEqual({k for k in cw.VALIDATORS}, {k for k, _, _ in cw.SETTINGS})
+        with self.assertRaises(TypeError):
+            cw._rule("words", lambda v: True)
+
     def test_a_blank_line_that_is_not_narrowing_is_still_unset(self):
         self.assertNotIn("CW_PULL_SECRET", cw.parse_settings(self.REQUIRED + "CW_PULL_SECRET=\n"))
 

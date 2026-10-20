@@ -1643,42 +1643,44 @@ def _duration_ok(value):
 # THE table of value rules: one row per setting, the rule's words (shown in a refusal, never the value) and its test. DEFAULT-DENY: a setting with no
 # row is refused, and a test fails when SETTINGS and this table differ. Every value also refuses control characters (checked before this table).
 class _Rule(tuple):
-    """A row of VALIDATORS: (the rule's words, its test), and a flag `narrows` for a setting whose purpose is to NARROW what a credential may do.
-    A blank value of such a setting in the file is refused naming the key, never read as unset (unset means the broader default)."""
+    """A row of VALIDATORS: (the rule's words, its test), and `narrows`: whether the setting's purpose is to NARROW what a credential may do. For such a
+    setting a blank value, in the file or the environment, is refused naming the key and never read as unset (unset means the broader default), and the
+    environment may not set it when the file does not (the file is the one source, so it would be dropped)."""
     narrows = False
 
 
-def _narrowing(words, test):
+def _rule(words, test, narrows):
+    """Every row of VALIDATORS is built here and DECLARES `narrows` (True or False, no default): a forgotten flag is a TypeError, not a silent False."""
     row = _Rule((words, test))
-    row.narrows = True
+    row.narrows = bool(narrows)
     return row
 
 
 VALIDATORS = {
-    "CW_ALLOWED_REPOS": ("a comma-separated list of OWNER/NAME entries, no wildcard", _allowed_ok),
-    "CW_TOOLING_REPO": ("one OWNER/NAME", lambda v: _repo_key(v) is not None),
-    "CW_CLOUD_IMAGE": ("an image by digest, [registry[:port]/]path@sha256:<64 lowercase hex>, no tag, nothing else",
-                       lambda v: bool(_IMAGE_CHARS.fullmatch(v.split("@")[0])) and bool(_IMAGE_REF.fullmatch(v))),
-    "CW_CLOUD_SERVER": ("an https URL whose host is a DNS name (no IP literal of any form, no user, query, fragment, path, file: or http:)", _server_ok),
-    "CW_CLOUD_CA_FILE": ("an absolute path with no .. segment", _path_ok),
-    "CW_PULL_SECRET": ("a Kubernetes name (lowercase letters, digits, - and .)", lambda v: bool(_SECRET_NAME.fullmatch(v))),
-    "CW_VAULT_SUBSCRIPTION": ("a subscription GUID", lambda v: bool(_GUID.fullmatch(v))),
-    "CW_VAULT_NAME": ("a vault name: 3 to 24 letters, digits and hyphens, starting with a letter", lambda v: bool(_VAULT_NAME.fullmatch(v))),
-    "CW_CLOUD_NAMESPACE": ("a DNS label that is not default or kube-*", lambda v: bool(_NAMESPACE.fullmatch(v)) and v != "default" and not v.startswith("kube-")),
-    "CW_KUBECTL": ("an absolute path with no .. segment, or a bare program name", lambda v: _path_ok(v) or bool(_BARE_PROGRAM.fullmatch(v))),
-    "CW_MODEL_AUTH_FILE": ("an absolute path with no .. segment", _path_ok),
-    "CW_RUN_RECORD_DIR": ("an absolute path with no .. segment", _path_ok),
-    "CW_CLOUD_SPEND_CAP_USD": ("a number above 0 and at most 100000", _number_ok),
-    "CW_CLUSTER_TOKEN_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
-    "CW_CLUSTER_ADMIN_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
-    "CW_GIT_TOKEN_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
-    "CW_APP_ID_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
-    "CW_APP_INSTALLATION_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
-    "CW_APP_KEY_CMD": ("a command that does not start with -", lambda v: not v.startswith("-")),
-    "CW_CLUSTER_ADMIN_SECRET": ("a vault secret name: 1 to 127 letters, digits and hyphens, starting with a letter or digit", lambda v: bool(_VAULT_SECRET_NAME.fullmatch(v))),
-    "CW_TOKEN_MODE": _narrowing("exactly default or read-only", lambda v: v in TOKEN_MODES),
-    "CW_CLUSTER_TOKEN_DURATION": ("a duration of 1 to 3 digits and m or h, from 1m to 60m (for example 20m or 1h)", _duration_ok),
-    "CW_VAULT_CHECK_DIR": ("an absolute path with no .. segment", _path_ok),
+    "CW_ALLOWED_REPOS": _rule("a comma-separated list of OWNER/NAME entries, no wildcard", _allowed_ok, False),
+    "CW_TOOLING_REPO": _rule("one OWNER/NAME", lambda v: _repo_key(v) is not None, False),
+    "CW_CLOUD_IMAGE": _rule("an image by digest, [registry[:port]/]path@sha256:<64 lowercase hex>, no tag, nothing else",
+                       lambda v: bool(_IMAGE_CHARS.fullmatch(v.split("@")[0])) and bool(_IMAGE_REF.fullmatch(v)), False),
+    "CW_CLOUD_SERVER": _rule("an https URL whose host is a DNS name (no IP literal of any form, no user, query, fragment, path, file: or http:)", _server_ok, False),
+    "CW_CLOUD_CA_FILE": _rule("an absolute path with no .. segment", _path_ok, False),
+    "CW_PULL_SECRET": _rule("a Kubernetes name (lowercase letters, digits, - and .)", lambda v: bool(_SECRET_NAME.fullmatch(v)), False),
+    "CW_VAULT_SUBSCRIPTION": _rule("a subscription GUID", lambda v: bool(_GUID.fullmatch(v)), False),
+    "CW_VAULT_NAME": _rule("a vault name: 3 to 24 letters, digits and hyphens, starting with a letter", lambda v: bool(_VAULT_NAME.fullmatch(v)), False),
+    "CW_CLOUD_NAMESPACE": _rule("a DNS label that is not default or kube-*", lambda v: bool(_NAMESPACE.fullmatch(v)) and v != "default" and not v.startswith("kube-"), False),
+    "CW_KUBECTL": _rule("an absolute path with no .. segment, or a bare program name", lambda v: _path_ok(v) or bool(_BARE_PROGRAM.fullmatch(v)), False),
+    "CW_MODEL_AUTH_FILE": _rule("an absolute path with no .. segment", _path_ok, False),
+    "CW_RUN_RECORD_DIR": _rule("an absolute path with no .. segment", _path_ok, False),
+    "CW_CLOUD_SPEND_CAP_USD": _rule("a number above 0 and at most 100000", _number_ok, False),
+    "CW_CLUSTER_TOKEN_CMD": _rule("a command that does not start with -", lambda v: not v.startswith("-"), False),
+    "CW_CLUSTER_ADMIN_CMD": _rule("a command that does not start with -", lambda v: not v.startswith("-"), False),
+    "CW_GIT_TOKEN_CMD": _rule("a command that does not start with -", lambda v: not v.startswith("-"), False),
+    "CW_APP_ID_CMD": _rule("a command that does not start with -", lambda v: not v.startswith("-"), False),
+    "CW_APP_INSTALLATION_CMD": _rule("a command that does not start with -", lambda v: not v.startswith("-"), False),
+    "CW_APP_KEY_CMD": _rule("a command that does not start with -", lambda v: not v.startswith("-"), False),
+    "CW_CLUSTER_ADMIN_SECRET": _rule("a vault secret name: 1 to 127 letters, digits and hyphens, starting with a letter or digit", lambda v: bool(_VAULT_SECRET_NAME.fullmatch(v)), False),
+    "CW_TOKEN_MODE": _rule("exactly default or read-only", lambda v: v in TOKEN_MODES, True),
+    "CW_CLUSTER_TOKEN_DURATION": _rule("a duration of 1 to 3 digits and m or h, from 1m to 60m (for example 20m or 1h)", _duration_ok, False),
+    "CW_VAULT_CHECK_DIR": _rule("an absolute path with no .. segment", _path_ok, False),
 }
 _SETTING_LINE = re.compile(r"([A-Z][A-Z0-9_]*)=(.*)")
 
@@ -1807,6 +1809,12 @@ def apply_settings(env=None, path=None):
     if text is None:
         return "environment"
     values = parse_settings(text, path)
+    narrowing = [name for name, _, _ in SETTINGS if getattr(VALIDATORS.get(name), "narrows", False) and env.get(name) is not None]
+    dropped = [name for name in narrowing if not env[name].strip() or name not in values]   # blank, or the file (the one source) lacks it: it would be dropped
+    if dropped:
+        raise CloudError("refused: %s is set in the environment but %s in the file %s (the file is the one source when it exists, so the environment value "
+                         "would be dropped and the broader permission set used): set it in the file or unset it; nothing was called"
+                         % (", ".join(dropped), "blank or missing", path), EXIT_USAGE)
     clash = [name for name, _, _ in SETTINGS if env.get(name) and name in values and env[name].strip() != values[name]]
     if clash:
         raise CloudError("refused: %s is set differently in the file %s and in the environment: unset one (the file is the one source when it exists); "
