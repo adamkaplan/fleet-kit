@@ -41,6 +41,10 @@ DEFAULT_LAUNCHER = "cloud-worker"
 CLOUD_DIR = "cloud"
 DEFAULT_DIRECTORY = "/work"   # the session's directory in the pod: the scratch volume (writable by the image's user via fsGroup); /workspace does not exist there
 CLOUD_WORKER_AGENT = "worker"   # the agent the image defines (cloud/worker/agents/worker.md): a cloud session always runs it; the local --agent name is only recorded
+# The options of the launcher's `create` that `launch --cloud` hands over: ONE table. Taken from the launcher on main (commit fb4b9f2,
+# cloud/launcher/cloud_worker.py `create`: --shape S|M, --stack); a name here that the launcher does not know makes its create fail (exit 2).
+CREATE_OPTION = {"repo": "--repo", "branch": "--branch", "run_id": "--run-id", "idle": "--idle", "hard": "--hard", "shape": "--shape", "stack": "--stack"}
+LAUNCHER_SHAPES = ("S", "M")   # the launcher's SHAPES keys; the launcher's own default (S) applies when --shape is not given
 POD_DIR_ROOTS = ("/work", "/home/worker")   # the only roots a cloud session directory may be under (a local path does not exist in the pod)
 WORK_REPO = "/work/repo"      # where the worker clones the repository: the launcher's end hook (CW_WORKDIR default) pushes from here
 SETUP_PREAMBLE = """Setup (do this first, before the task below):
@@ -1068,6 +1072,8 @@ def _launch(args, runner, now, reserve):
     source = use_settings()   # before any setting is read: the allow-list, the preflight and the launcher all read this one source
     print("%s: cloud settings from %s" % (H["PROG"], source), file=sys.stderr)
     check_allowed(repo)   # before anything is read, minted or created
+    if getattr(args, "stack", False) and args.shape and args.shape not in LAUNCHER_SHAPES:   # exact membership in a tuple; after the allow-list, before the preflight, any token or call
+        raise Refusal("--shape %r is not a pod shape (%s); nothing was created" % (str(args.shape)[:40], " or ".join(LAUNCHER_SHAPES)))
     try:   # the repository preflight, before any token is minted; FAIL CLOSED: a missing, killed or silent program refuses (stdout stays the one JSON line)
         print(_lib().check_repo_preflight(repo, {k: v for k, v in os.environ.items() if k not in CLUSTER_DROP}), file=sys.stderr)
     except _lib().CloudError as err:
@@ -1082,10 +1088,12 @@ def _launch(args, runner, now, reserve):
         raise LaunchError("a cloud worker named %s already exists (`%s retire %s` ends it)" % (name, H["PROG"], name))
     brief = H["read_brief"](args.brief_file, sys.stdin)
     run_id = secrets_module.token_hex(16)   # this command's nonce: recorded on what `create` makes, so a later stop can say it is ours
-    options = ["--repo", repo, "--branch", branch, "--run-id", run_id]
-    for flag, value in (("--idle", args.idle), ("--hard", args.hard), ("--shape", args.shape)):
+    options = [CREATE_OPTION["repo"], repo, CREATE_OPTION["branch"], branch, CREATE_OPTION["run_id"], run_id]
+    for key, value in (("idle", args.idle), ("hard", args.hard), ("shape", args.shape)):
         if value:
-            options += [flag, str(value)]
+            options += [CREATE_OPTION[key], str(value)]
+    if getattr(args, "stack", False):   # only on request: a launch without --stack hands the launcher exactly what it always did
+        options.append(CREATE_OPTION["stack"])
     if os.environ.get("CW_PULL_SECRET"):
         options += ["--pull-secret", os.environ["CW_PULL_SECRET"]]
     recovery = VaultRecovery(cloud_dir(state) / VAULT_LOCK_NAME, lambda detail: _audit(engine, "cloud.vault_check", name, detail))
@@ -1168,8 +1176,21 @@ def _launch(args, runner, now, reserve):
             if _stop_after_failure(engine, runner, name, run_id, "launch interrupted", cluster):
                 remove_record(state, name)
             raise
+    _registry_note(engine, "upsert", state, name, {"session": session, "repo": repo, "role": args.role, "kind": "cloud", "run_id": run_id, "state": "working"})   # a cloud worker is an agent (#903)
     print(json.dumps({"name": name, "session": session, "runtime_id": record["runtime_id"], "url": record["url"], "cloud": True}, sort_keys=True))
     return H["EXIT_OK"]
+
+
+def _registry_note(engine, what, state, name, *args):
+    """The cloud launcher and reaper are WRITERS of the agent registry: `upsert` on launch, `retire` once the pod is stopped. The stop itself stays
+    this launcher's act; a registry that cannot be written is said in the audit, never raised (the pod's own record is still the launcher's)."""
+    try:
+        registry = H["load_module"]("registry")
+        got = registry.upsert(state, name, args[0]) if what == "upsert" else registry.retire(state, name, "cloud-worker", args[0])
+        if got["problem"]:
+            _audit(engine, "cloud.registry_error", name, {"why": _one(got["problem"], 120)})
+    except Exception as err:
+        _audit(engine, "cloud.registry_error", name, {"why": _one(str(err), 120)})
 
 
 def _record_from_create(name, body):
@@ -1273,7 +1294,7 @@ def cmd_read(args, runner, now):
         return H["EXIT_OK"]
     else:   # a local agent, on the local service
         seen = engine.discover(engine.now()).agents.get(args.name)
-        session = seen.session_id if seen else H["known_agent"](state, args.name, H["read_pane_health"](state)["agents"].get(args.name)).get("session")
+        session = seen.session_id if seen else H["known_agent"](state, args.name).get("session")
         if not session:
             raise LaunchError("%s is not a fleet agent this switchboard has seen" % args.name)
         v2 = engine.v2
@@ -1402,6 +1423,7 @@ def cmd_retire(args, runner, now, record):
         raise LaunchError("stop of %s failed: %s: the record is kept" % (args.name, _reason(code, note)))
     # The run record (slice 3, #638) is written by the launcher's stop; no call is needed here when it lands: this is its hook point (after the
     # end hook, before the endpoint record goes).
+    _registry_note(engine, "retire", state, args.name, reason)
     remove_record(state, args.name)
     wip, pushed = (body or {}).get("wip_branch"), (body or {}).get("pushed")
     print("%s is retired: its pod and scratch volume are deleted%s" % (
