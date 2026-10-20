@@ -32393,10 +32393,86 @@ class TestAgentBlockCounts(TestBlockTable):
         code, out, err = self.run_as("coder", "gates", self.PR)
         self.assertNotIn("no agent block", out)
 
+    VERDICT_BLOCKS = {"approve": "", "comment": "", "request-changes": "- R-CODE-1 | block | bin/x:1 | why | fix\n", "incomplete": ""}
+
+    def test_only_an_incomplete_verdict_fails_to_count_and_says_so_in_its_own_line(self):
+        mod = sb.load_module("delegated_clear")
+        for verdict, finding in self.VERDICT_BLOCKS.items():
+            with self.subTest(verdict=verdict):
+                path = self.world.state / "v.txt"
+                path.write_text("verdict: %s\nhead: %s\nimpact-action: none\n%sfindings:\n%s" % (verdict, LEDGER_HEAD, self.SCORED, finding))
+                code, out, err = self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--block", str(path))
+                self.assertEqual(code, 0, err)
+                scored = self.score()
+                if verdict == "incomplete":
+                    self.assertIsNone(scored["level"])
+                    self.assertEqual(scored["reasons"], [mod.INCOMPLETE_VERDICT])
+                    self.assertNotEqual(mod.INCOMPLETE_VERDICT, mod.NO_AGENT_BLOCK)
+                else:
+                    self.assertEqual(scored["reasons"], [])
+                    self.assertEqual(scored["level"], sb.impact_floor.load_matrix()["cells"]["Marginal"]["Remote"]["level"])
+        self.assertEqual(sorted(self.VERDICT_BLOCKS), sorted(sb.plan_ledger.REVIEW_VERDICTS))   # derived: a new verdict word must be added here
+
+    def test_floor_and_gates_say_the_incomplete_line_not_the_missing_block_line(self):
+        mod = sb.load_module("delegated_clear")
+        path = self.world.state / "v.txt"
+        path.write_text("verdict: incomplete\nhead: %s\nimpact-action: none\n%sfindings:\n" % (LEDGER_HEAD, self.SCORED))
+        self.assertEqual(self.run_as("coder", "review", "record", self.PR, "--reviewer", "impact", "--block", str(path))[0], 0)
+        for argv in (("impact", "floor", self.PR), ("gates", self.PR)):
+            out = self.run_as("coder", *argv)[1]
+            self.assertEqual(out.count(mod.INCOMPLETE_VERDICT), 1, argv)
+            self.assertEqual(out.count(mod.NO_AGENT_BLOCK), 0, argv)
+
+    def test_the_definition_says_read_every_hunk_return_incomplete_and_where_the_matrix_words_come_from(self):
+        text = (REPO / "agents" / "reviewers" / "reviewer-impact.md").read_text()
+        for phrase in ("every hunk", "verdict: incomplete", "reads only the verdict word", "impact matrix --for-rater"):
+            self.assertIn(phrase, text.replace("EVERY", "every"))
+
+    def state_files(self):
+        return {str(p.relative_to(self.world.state)): p.read_bytes() for p in sorted(self.world.state.rglob("*")) if p.is_file()}
+
+    def test_impact_matrix_prints_the_files_words_cell_by_cell_and_writes_nothing(self):
+        before = self.state_files()
+        code, out, err = self.run_as("coder", "impact", "matrix", "--json")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.state_files(), before)
+        printed = json.loads(out)
+        file = json.loads((REPO / "docs" / "review-laws" / "impact-matrix.json").read_text())
+        for severity, row in file["cells"].items():
+            for probability, cell in row.items():
+                self.assertEqual(printed["cells"][severity][probability], cell, (severity, probability))
+        self.assertEqual(sum(len(r) for r in printed["cells"].values()), sum(len(r) for r in file["cells"].values()))
+        rules = file["owner_hold"]["delegated_clear"]["score"]["floor"]["rules"]
+        self.assertEqual(printed["floor_rules"], rules)
+        self.assertEqual((printed["severities"], printed["probabilities"]), (file["severities"], file["probabilities"]))
+        text = self.run_as("coder", "impact", "matrix")[1]
+        for severity, row in file["cells"].items():
+            for probability, cell in row.items():
+                self.assertIn("cell %s / %s: level %s, action %s" % (severity, probability, cell["level"], cell["action"]), text)
+        for rule_id, cls in rules.items():
+            self.assertIn("floor rule %s: class %s" % (rule_id, cls), text)
+
+    def test_impact_matrix_for_rater_prints_the_floor_reports_rule_ids_and_paths(self):
+        paths = ["shims/gh", "docs/a.md"]
+        self.pr = dict(self.pr, changedFiles=len(paths), files=[{"path": p, "additions": 1, "deletions": 0} for p in paths])
+        before = self.state_files()
+        code, out, err = self.run_as("coder", "impact", "matrix", "--for-rater", self.PR, "--json")
+        self.assertEqual(code, 0, err)
+        printed = json.loads(out)["for_rater"]
+        report = json.loads(self.run_as("coder", "impact", "floor", self.PR, "--json")[1])
+        rules = json.loads((REPO / "docs" / "review-laws" / "impact-matrix.json").read_text())["owner_hold"]["delegated_clear"]["score"]["floor"]["rules"]
+        expected = {rule_id: sorted(report["top_tier_hits"][cls]) for rule_id, cls in rules.items() if report["top_tier_hits"].get(cls)}
+        self.assertTrue(expected, "the fixture changes a floor path")
+        self.assertEqual(printed["floor_hits"], expected)
+        self.assertEqual(self.state_files(), before)
+        text = self.run_as("coder", "impact", "matrix", "--for-rater", self.PR)[1]
+        for rule_id, paths in expected.items():
+            self.assertIn("floor hit %s: %s" % (rule_id, ", ".join(paths)), text)
+
     def test_the_limit_is_said_in_the_docs_and_the_definition(self):
         for path in ("docs/switchboard.md", "agents/reviewers/reviewer-impact.md"):
             text = (REPO / path).read_text()
-            self.assertEqual(text.count("not that the agent produced it"), 1, path)
+            self.assertIn("not that the agent produced it", text, path)
             self.assertIn("mistake-guard", text)
 
     def test_only_the_scorer_reads_the_score_fields(self):
@@ -34143,7 +34219,8 @@ class TestImpactHold(LedgerBase):
             del block["floor"]["rules"][removed]
             cls = rules[removed]
             report = {"pr": "acme/app#9", "head": LEDGER_HEAD, "top_tier_hits": {cls: ["x"]}}
-            entries = [{"kind": "review_record", "pr": "acme/app#9", "head": LEDGER_HEAD, "reviewer": "impact", "by_role": "reviewer", "impact_severity": self.cell_of("Medium")[0], "impact_probability": self.cell_of("Medium")[1]}]
+            entries = [{"kind": "review_record", "pr": "acme/app#9", "head": LEDGER_HEAD, "reviewer": "impact", "by_role": "reviewer", "impact_severity": self.cell_of("Medium")[0], "impact_probability": self.cell_of("Medium")[1],
+                        "block_sha256": "a" * 64, "block_impact_severity": self.cell_of("Medium")[0], "block_impact_probability": self.cell_of("Medium")[1]}]
             mod = sb.load_module("delegated_clear")
             self.assertEqual(mod.judge(block, sb.impact_floor.load_matrix()["cells"], entries, report, "Serious")["reasons"], [], "the floor of %s lives in the data only" % cls)
             self.assertTrue(mod.judge(self.block(), sb.impact_floor.load_matrix()["cells"], entries, report, "Serious")["reasons"])
@@ -34504,7 +34581,8 @@ class TestImpactHold(LedgerBase):
             "good reason, unknown probability": ("bin/reassign.py", [dict(floor_good, prob="Sometimes")], True, "unknown"),
             "two records disagree: low then high": ("docs/notes.md", [good, dict(good, sev=high[0], prob=high[1])], True, "High"),
             "two records disagree: high then low": ("docs/notes.md", [dict(good, sev=high[0], prob=high[1]), good], True, "High"),
-            "a good record and an unreadable one at the same head": ("docs/notes.md", [good, dict(good, sev=None)], True, "unknown"),
+            "a good record and one with no score of the block's beside it: the second counts for nothing (#901) and the first clears": ("docs/notes.md", [good, dict(good, sev=None)], False, None),
+            "a good record beside one whose block carries a score the matrix does not know": ("docs/notes.md", [good, dict(good, sev="Huge")], True, "unknown"),
             "a record at another head only": ("docs/notes.md", [dict(good, head="d" * 40)], True, "no independent impact rating"),
             "a record for another pull request only": ("docs/notes.md", [dict(good, pr="acme/app#10")], True, "no independent impact rating"),
             "a record by the pull request's own author (a coder)": ("docs/notes.md", [dict(good, role="coder")], True, "no independent impact rating"),
@@ -34544,17 +34622,24 @@ class TestImpactHold(LedgerBase):
         """A ledger record built WITHOUT the helper: any shape, including those the record command refuses (an older record with an action and no severity or probability)."""
         entry = {"kind": "review_record", "pr": "acme/app#9", "head": LEDGER_HEAD, "reviewer": "impact", "verdict": "approve", "blocks": 0, "notes": 0, "by": "rev", "by_role": "reviewer"}
         entry.update(fields)
+        entry.setdefault("block_sha256", "a" * 64)   # #901: the record carries the agent's block, whose own lines equal the typed ones (a missing field stays missing)
+        for name in ("impact_severity", "impact_probability"):
+            if name in entry and entry[name] is not KEEP_OUT:
+                entry.setdefault("block_" + name, entry[name])
         return sb.plan_ledger.append_entry(self.world.state, {k: v for k, v in entry.items() if v is not KEEP_OUT}, self.world.clock.now())
 
     def test_raw_mixed_records_reach_the_real_judge_and_the_bad_one_refuses_in_either_order(self):
         low, high = self.cell_of("Low"), self.cell_of("High")
         valid = dict(impact_action="none", impact_severity=low[0], impact_probability=low[1])
         older = dict(impact_action="hold", impact_class="authority")   # every record made before this change: an action, no severity, no probability
-        shapes = {"an action and no severity or probability, after a valid Low": [valid, older], "the same, before it": [older, valid], "an action with an unknown severity": [valid, dict(valid, impact_severity="Huge")],
-                  "a good severity with no probability": [valid, dict(valid, impact_probability=KEEP_OUT)], "a good probability with no severity": [valid, dict(valid, impact_severity=KEEP_OUT)],
-                  "two records that disagree, low first": [valid, dict(valid, impact_severity=high[0], impact_probability=high[1], impact_action="hold")],
-                  "the author's record with an action": [dict(valid, by_role="coder")], "another head's record with an action": [dict(valid, head="d" * 40)]}
-        for label, records in shapes.items():
+        # shape: (records, refused). A record that carries no score of the agent's block is IGNORED by the score since #901 (it counts for nothing, as every record made before blocks were kept), so the valid record beside it still clears;
+        # a record whose block carries a score the matrix does not know, a higher disagreeing score, the author's and another head's record still refuse
+        shapes = {"an action and no severity or probability, after a valid Low": ([valid, older], False), "the same, before it": ([older, valid], False), "an action with an unknown severity": ([valid, dict(valid, impact_severity="Huge")], True),
+                  "a good severity with no probability": ([valid, dict(valid, impact_probability=KEEP_OUT)], False), "a good probability with no severity": ([valid, dict(valid, impact_severity=KEEP_OUT)], False),
+                  "two records that disagree, low first": ([valid, dict(valid, impact_severity=high[0], impact_probability=high[1], impact_action="hold")], True),
+                  "the older record alone (no score, no block score)": ([older], True),
+                  "the author's record with an action": ([dict(valid, by_role="coder")], True), "another head's record with an action": ([dict(valid, head="d" * 40)], True)}
+        for label, (records, refused) in shapes.items():
             with self.subTest(label):
                 self.writes.clear()
                 self.ledger_reset()
@@ -34563,9 +34648,10 @@ class TestImpactHold(LedgerBase):
                 for record in records:
                     self.raw_record(**record)
                 code, out, err = self.under()
-                self.assertEqual(code, 2, err)
-                self.assertEqual(self.deletes(), [])
-                self.assertTrue(any(t in err for t in ("no severity and probability", "High", "no independent impact rating")), err)
+                self.assertEqual(code == 2, refused, err)
+                if refused:
+                    self.assertEqual(self.deletes(), [])
+                    self.assertTrue(any(t in err for t in ("no severity and probability", "High", "no independent impact rating", "no agent block")), err)
         self.ledger_reset()   # the control: the valid record alone clears
         self.score_config("Serious")
         self.scored_pr()

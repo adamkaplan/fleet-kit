@@ -141,6 +141,18 @@ def counts_by_block(entry):
             and isinstance(entry.get("impact_probability"), str) and entry.get("impact_probability") == entry.get("block_impact_probability"))
 
 
+INCOMPLETE_VERDICT = ("the independent impact rating at this head is an `incomplete` verdict: the rater said it did not read the whole change, so it clears nothing by score; "
+                      "re-run the rating and record a complete one")   # #901 clause 8: one line, said by the clear's refusal, `impact floor` and `gates`
+
+
+def uncounted_line(entries):
+    """The one line saying why records that exist do not count by score (`NO_AGENT_BLOCK` or `INCOMPLETE_VERDICT`), or None when one counts. `entries` are the independent reviewer's records at the head, already filtered by role. The machine reads only the verdict WORD, never prose."""
+    mine = [e for e in entries if isinstance(e, dict)]
+    if not mine or any(counts_by_block(e) and e.get("verdict") != "incomplete" for e in mine):
+        return None
+    return INCOMPLETE_VERDICT if any(counts_by_block(e) and e.get("verdict") == "incomplete" for e in mine) else NO_AGENT_BLOCK
+
+
 def judge(block, cells, entries, report, threshold):
     """{"level": the score or None, "reasons": [why refused]} (no reasons: the score is at or below `threshold`, so the clear may go on). `block` is the matrix's score block, `cells` its `cells` (severity ->
     probability -> {"level"}), `entries` the ledger's entries (the caller filtered nothing: this checks kind, reviewer, pr, EXACT head and the recorded role again), `report` the owner-hold report (`pr`, `head`,
@@ -151,7 +163,7 @@ def judge(block, cells, entries, report, threshold):
     ladder = block["ladder"]
     if threshold not in block["delegable_levels"] or threshold not in ladder:
         return {"level": None, "reasons": ["the threshold %r is unknown: refused" % (threshold,)]}
-    counted, bad, unblocked = [], 0, 0
+    counted, bad, unblocked, incomplete = [], 0, 0, 0
     for entry in entries if isinstance(entries, list) else []:
         if not isinstance(entry, dict) or entry.get("kind") != "review_record" or entry.get("reviewer") != "impact" or entry.get("pr") != report.get("pr") or entry.get("head") != report.get("head") or not report.get("head"):
             continue
@@ -159,6 +171,9 @@ def judge(block, cells, entries, report, threshold):
             continue   # the pull request's author, the Chief of Staff, any other role (or a record made before roles were kept) is not the independent rating
         if not counts_by_block(entry):
             unblocked += 1   # #901: only the agent's own block counts by score
+            continue
+        if entry.get("verdict") == "incomplete":
+            incomplete += 1   # #901 clause 8: a rater that read only part of the change says `incomplete`: it counts for nothing
             continue
         level = ((cells.get(entry.get("impact_severity")) or {}).get(entry.get("impact_probability")) or {}).get("level") if isinstance(entry.get("impact_severity"), str) and isinstance(entry.get("impact_probability"), str) else None
         if level not in ladder:
@@ -169,6 +184,8 @@ def judge(block, cells, entries, report, threshold):
         return {"level": None, "reasons": ["a rating at this head has no severity and probability the matrix knows: the score is unknown, refused"]}
     if not counted and unblocked:
         return {"level": None, "reasons": [NO_AGENT_BLOCK]}
+    if not counted and incomplete:
+        return {"level": None, "reasons": [INCOMPLETE_VERDICT]}
     if not counted:
         return {"level": None, "reasons": ["there is no independent impact rating at this head: the score is unknown, refused"]}
     top = max(i for i, _, _ in counted)

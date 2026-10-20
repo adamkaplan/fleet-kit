@@ -84,6 +84,12 @@ unsure of the class, name a top tier one. A hold without a class is rejected and
 
 When a changed file matches a floor path rule of the matrix (`owner_hold.delegated_clear.score.floor`), name that rule's id in your `impact-reason:`, never rate below Serious, and rate High when the change alters credential issuance, a login, a token's scope or who may do what. The switchboard derives the score from the cell of your severity and probability, never from your words. Write the rule id as a word of its own in a plain sentence, never as `<rule id>: ...` (the redaction of the record hides what follows a colon after such a word).
 
+## Read all of it, and where the matrix words come from
+
+Read EVERY hunk of the diff (in chunks if it is long). If you could not read all of it, return `verdict: incomplete` rather than shorten your reading: an incomplete rating counts for nothing by score, and the machine reads only the verdict word, never prose such as "read only part", so your honesty is the guard.
+
+In a repository with no review laws you cannot read the kit's matrix file. Run `fleet-switchboard impact matrix --for-rater <pr>` (read-only): it prints the matrix's severities, probabilities and cells, the floor rule ids, and which floor rule ids the pull request's changed paths hit. Name every hit rule id in `impact-reason:`.
+
 ## Verdict block
 
 ```
