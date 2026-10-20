@@ -21723,6 +21723,9 @@ def pr_floor_report(engine, repo, number, rated_pairs=()):
 
 def cmd_impact(args, runner, now):
     """`impact floor|hold|clear`."""
+    if REGISTRARS_RAN and args.impact_action == "clear":   # #924: at the point of effect too: the clear never runs in a process where a registrar ran
+        sys.stderr.write("%s: impact clear: refused: a command registrar ran in this process\n" % PROG)
+        return EXIT_ERROR
     return {"floor": cmd_impact_floor, "hold": cmd_impact_hold, "clear": cmd_impact_clear, "delegated": cmd_impact_delegated}[args.impact_action](args, runner, now)
 
 
@@ -23513,6 +23516,9 @@ def rating_inputs(raw_argv):
 def cmd_review(args, runner, now):
     """`review laws <pr>` (print the laws and overlay from the PR's base commit) and `review record <pr> --reviewer X ...` (a reviewer writes
     its result per head). Reads GitHub with GETs only; `record` writes the hash-chained ledger and the audit."""
+    if REGISTRARS_RAN and args.review_cmd == "record":   # #924: at the point of effect too: the record is never written in a process where a registrar ran
+        sys.stderr.write("%s: review record: refused: a command registrar ran in this process\n" % PROG)
+        return EXIT_ERROR
     if args.review_cmd == "measure":
         return cmd_review_measure(args, runner, now)
     if args.review_cmd == "checkout":
@@ -28548,7 +28554,7 @@ def dispatch(args, known, runner=subprocess.run, now=time.time, wait=None, spawn
 
 
 DIRECT_COMMANDS = {"review": ("review_cmd", "record"), "impact": ("impact_action", "clear")}   # #924: the action, the destination of its subcommand and the subcommand of the two commands that run BEFORE any registrar: `review record` and `impact clear`
-REGISTRARS_RAN = False   # True for the length of a `main` that built the full parser (it called every registrar); `review record` and `impact clear` refuse to run while it is True
+REGISTRARS_RAN = False   # True while `main` builds the full parser and parses with it (every registrar runs in that window); `cmd_review` (record), `cmd_impact` and `cmd_impact_clear` and `impact_clear_core` (the clear) REFUSE while it is True: a registrar that calls them is stopped at the point of effect
 
 
 def direct_command(raw):
@@ -28590,6 +28596,7 @@ def main(argv=None, runner=subprocess.run, now=time.time, wait=None, spawn=subpr
             return EXIT_USAGE if exit_.code not in (0, None) else EXIT_OK
         if held is not None:
             replaced = replaced_by(held, snapshot())   # for EVERY action (#924): the clear's code, the rating's path and every helper they read are the code that was loaded
+            REGISTRARS_RAN = False   # the registrars and the parse are over: what dispatch runs (the daemon's own chat clear among it) is not a registrar's call
             if replaced:
                 sys.stderr.write("%s: %s: a command registrar replaced code a command runs by (%s): nothing ran\n" % (PROG, getattr(args, "action", "?"), ", ".join(replaced[:5])))
                 return EXIT_ERROR
