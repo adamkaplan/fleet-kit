@@ -178,6 +178,10 @@ class _FreshNodeRace(Exception):
     """The pod's sandbox failed on the handler-not-known message: the node's containerd was not yet configured."""
 
 
+class _PodVanished(Exception):
+    """The pending stack pod existed and then a get said not found (seen on a fresh node when its runtime restarted)."""
+
+
 class Interrupted(BaseException):
     """SIGINT or SIGTERM during create: not an Exception, so no handler in between swallows it."""
 
@@ -440,38 +444,8 @@ VAULT_CHECK_MAX_ENTRIES = 200000       # a checkout with more entries than this 
 VAULT_CHECK_SKIP = (".git",)           # the top-level version-control directory is never loaded by the interpreter
 
 
-def _entry_problem(found, what):
-    """One lstat result judged: not a link, owned by the user, not group- or world-writable. Returns a reason or None."""
-    if stat.S_ISLNK(found.st_mode):
-        return "has %s that is a symlink" % what
-    if found.st_uid != os.getuid():
-        return "has %s that is not owned by the user" % what
-    if found.st_mode & 0o022:
-        return "has %s that is group- or world-writable" % what
-    return None
-
-
-def parents_problem(path):
-    """THE walk up from a trusted path (an absolute one): every parent from / down is judged with lstat, never followed: no symlink, owned by root or
-    the user, and not group- or world-writable unless it carries the sticky bit. A reason (never the path) or None. Every trusted path of the vault
-    check (the checkout and the lock's directory) goes through this one function."""
-    parts = [x for x in path.split("/") if x]
-    here = "/"
-    for part in [""] + parts[:-1]:
-        here = os.path.join(here, part) if part else "/"
-        try:
-            found = os.lstat(here)
-        except OSError:
-            return "has a parent that cannot be read"
-        if stat.S_ISLNK(found.st_mode):
-            return "has a parent that is a symlink"
-        if not stat.S_ISDIR(found.st_mode):
-            return "has a parent that is not a directory"
-        if found.st_uid not in (0, os.getuid()):
-            return "has a parent that is owned by another user"
-        if found.st_mode & 0o022 and not found.st_mode & stat.S_ISVTX:
-            return "has a parent that is group- or world-writable"
-    return None
+sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "bin"))   # LAST: the launcher's own modules win a name
+from path_walk import entry_problem as _entry_problem, parents_problem  # noqa: E402  (the one walk, also used by the installer)
 
 
 def vault_check_dir_problem(checkout):
@@ -1182,31 +1156,64 @@ class Launcher:
         """Wait for a stack pod; on the fresh-node race (the runtime handler is not yet known to the node's containerd) delete
         THE POD ONLY and create it again with the same run id and nonce, at most STACK_ATTEMPTS times inside
         STACK_RACE_WINDOW_SECONDS. The password Secret and the per-run Secret are made once, before the first attempt, and are
-        never touched here: the pod refers to them by name, so a second attempt reads the same objects. Any other failure is not retried."""
+        never touched here: the pod refers to them by name, so a second attempt reads the same objects. The same bounded retry also
+        recreates a pod that VANISHES while pending (it was seen, then a get says not found); a pod never seen, and any other
+        failure, are not retried."""
         deadline = self.clock() + dt.timedelta(seconds=STACK_RACE_WINDOW_SECONDS)
         attempt = 1
         while True:
+            seen = []   # this attempt's pod: set once a get returned it
+
+            def watch(pod, seen=seen):
+                if pod is None and seen:
+                    raise _PodVanished("pod vanished")
+                if pod is not None:
+                    seen.append(1)
+                    self._raise_on_race(name, pod)
             try:
-                self._wait_ready(name, seconds, lambda pod: self._raise_on_race(name, pod))
-            except _FreshNodeRace as race:
+                self._wait_ready(name, seconds, watch)
+            except (_FreshNodeRace, _PodVanished) as race:
                 last = attempt >= STACK_ATTEMPTS or self.clock() >= deadline
                 self.audit(worker, "pod/" + name, "create-attempt", 0.0, False,
                            "attempt %d of %d: %s%s" % (attempt, STACK_ATTEMPTS, race, "; giving up" if last else "; recreating the pod"))
                 if last:
+                    if isinstance(race, _PodVanished):
+                        raise CloudError("the worker pod could not start: the pod vanished while pending (the fresh-node race: the node's "
+                                         "runtime restarted); gave up after %d attempt(s)" % attempt) from None
                     raise CloudError("the worker pod could not start: the node's runtime handler %s was not ready (the fresh-node race: %s); "
                                      "gave up after %d attempt(s)" % (STACK_RUNTIME_CLASS, race, attempt)) from None
                 if self._mine("pod", name) is False:
                     self.foreign.append("pod/" + name)
                     raise CloudError("the pod %s is not this call's (its run id does not match); left whole" % name) from None
+                self._refuse_if_removed(name, made)   # a stop, the reaper or someone else removed this call's own objects: not the race
                 self.kube.delete_pod_and_wait(name)
                 attempt += 1
                 self._make(made, "pod", self.kube.apply, spec)
+                self._refuse_if_removed(name, made)   # a stop that deleted the pod, then its Secrets, may have landed between the check and here
                 continue
             except CloudError as e:
                 self.audit(worker, "pod/" + name, "create-attempt", 0.0, False, "attempt %d of %d: %s" % (attempt, STACK_ATTEMPTS, e))
                 raise
+            self._refuse_if_removed(name, made)   # the stop's Secret deletes may have come after the pod went: never report a pod whose Secrets are gone
             self.audit(worker, "pod/" + name, "create-attempt", 0.0, True, "attempt %d of %d: ready" % (attempt, STACK_ATTEMPTS))
             return
+
+    def _refuse_if_removed(self, name, made):
+        gone = self._own_objects_gone(name, made)
+        if gone:
+            raise CloudError("the worker pod was removed from outside (%s no longer exist(s) or are not this call's): not recreated, and not reported ready" % ", ".join(gone)) from None
+
+    def _own_objects_gone(self, name, made):
+        """The Secrets this call made that are no longer this call's in the cluster: missing, or (with a run id) carrying another's."""
+        gone = []   # a get that errors (not "not found") raises CloudError: the create fails, it never reads as "still there"
+        for kind, label, get in (("secret", "secret/%s-pw" % name, lambda: self.kube.get_secret(name + "-pw")),
+                                 ("run", "secret/%s-run" % name, lambda: self.kube.get_run_secret(name))):
+            if not made[kind]:
+                continue
+            obj = get()
+            if not obj or (self.run_id and ((obj.get("metadata") or {}).get("labels") or {}).get("cw/run-id") != self.run_id):
+                gone.append(label)
+        return gone
 
     def _raise_on_race(self, name, pod):
         uid = (pod or {}).get("metadata", {}).get("uid")
@@ -1836,17 +1843,34 @@ def _reap_exit_line(clock, why):
     print("cloud-worker: %s reaper exiting: %s" % (iso(now), why), file=sys.stderr)
 
 
-def reaper_lock(audit_path):
-    """The one lock between reapers: an exclusive, non-blocking flock on a 0600 file in the private state directory (the audit
-    file's), held for the process's life; the kernel drops it when the process dies, however it dies. Returns the open file.
-    Raises ReaperLocked for a second reaper, a state directory or lock file that is not the user's own, or a link at the path."""
-    directory = os.path.dirname(os.path.abspath(audit_path))
+def _user_state_dir():
+    """The user's state directory from the password database, never from the environment: where two reapers of one user must agree."""
+    return os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".local", "state", "cw-cloud")
+
+
+REAPER_LOCK_ROOT = os.path.join(_user_state_dir(), "locks")   # tests point it at a temporary directory
+
+
+def reaper_identity(env, namespace):
+    """What a reaper ACTS ON: the cluster it logs in to and the namespace. Two reapers with this the same are rivals, whatever their audit
+    file, state directory or other settings say."""
+    return "\n".join([(env.get("CW_CLOUD_SERVER") or "").strip(), (env.get("CW_KUBE_CONTEXT") or "").strip(),
+                      (env.get("CW_KUBECONFIG") or "").strip(), namespace])
+
+
+def reaper_lock(identity, root=None):
+    """The one lock between reapers of one cluster and namespace: an exclusive, non-blocking flock on a 0600 file named for a hash of
+    `identity`, in a private per-user directory (from the password database), held for the process's life; the kernel drops it when
+    the process dies, however it dies. Returns the open descriptor. Raises ReaperLocked for a second reaper, a directory or file that
+    is not the user's own, or a link at the path."""
+    directory = root or REAPER_LOCK_ROOT
     try:
         os.makedirs(directory, mode=0o700, exist_ok=True)
         dinfo = os.stat(directory)
         if dinfo.st_uid != os.getuid() or dinfo.st_mode & 0o022:
-            raise ReaperLocked("the state directory %s is not private to this user" % directory)
-        fd = os.open(os.path.join(directory, "reaper.lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            raise ReaperLocked("the lock directory %s is not private to this user" % directory)
+        name = "reaper-%s.lock" % hashlib.sha256(identity.encode()).hexdigest()[:16]
+        fd = os.open(os.path.join(directory, name), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     except OSError as e:
         raise ReaperLocked("the reaper lock cannot be opened: %s" % e.strerror)
     info = os.fstat(fd)
@@ -1865,7 +1889,7 @@ def _reap_main(L, a, sleep):
     """The reaper's loop. Whatever ends it writes ONE line saying why (signal, error, or the end of the loop)."""
     old, why, lock = L._catch_signals(), None, None
     try:
-        lock = reaper_lock(L.audit_path)   # BEFORE the first pass: two reapers would both run an end hook for one pod
+        lock = reaper_lock(reaper_identity(L.env, L.kube.ns))   # BEFORE the first pass: two reapers would both run an end hook for one pod
         while True:
             res = L.reap()
             print(json.dumps([dict({"worker": w, "reason": r, "exit": c}, **L.reap_results.get(w, {})) for w, r, c in res]))

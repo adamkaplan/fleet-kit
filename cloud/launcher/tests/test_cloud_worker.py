@@ -43,6 +43,10 @@ class Base(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(dir=self.TMP_BASE)
         self.addCleanup(self.tmp.cleanup)
         d = self.tmp.name
+        self.lock_root = os.path.join(d, "locks")   # never the user's real lock directory: tests of one suite run side by side
+        old_root = cw.REAPER_LOCK_ROOT
+        cw.REAPER_LOCK_ROOT = self.lock_root
+        self.addCleanup(setattr, cw, "REAPER_LOCK_ROOT", old_root)
         self.state = os.path.join(d, "kube.json")
         self.write_state({"pods": {}})
         self.env = {"CW_KUBECTL": os.path.join(HERE, "fake_kubectl"), "FAKE_KUBE_STATE": self.state,

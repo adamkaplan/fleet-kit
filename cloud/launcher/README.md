@@ -17,7 +17,7 @@ Launcher, reaper, end hook and token mint for cloud workers, built to `docs/clou
   token FILE by path. After the private settings file lands, the reaper reads it as the launcher does. Every ending writes one line
   `<UTC time> reaper exiting: WHY`: end of its pass, stopped by a signal, stopped by an interrupt, an error (a crash in a pass), or
   `cluster login failed: ...` (a login failure exits non-zero). A restarted reaper stops by name and finds no pod for one the last
-  pass already stopped, so nothing is stopped twice. Only one reaper runs at a time: it takes an exclusive lock (`reaper.lock`, 0600, beside the audit file) before its first pass and a second one exits at once with `not started: another reaper holds the lock` (the kernel drops the lock when a holder dies, however it dies). A stop uses the pod's own run id where the pod carries one. The installer writes the service file only when the target is a plain file of the user's own (never through a symlink), by temp file and rename, and its uninstall removes only a file the template makes. Path settings must be absolute paths of plain characters. While the Mac sleeps the reaper pauses.
+  pass already stopped, so nothing is stopped twice. Only one reaper runs at a time: it takes an exclusive lock (a 0600 file named for the cluster and namespace in `~/.local/state/cw-cloud/locks`, found through the password database, so a different audit file or state directory is still a rival) before its first pass and a second one exits at once with `not started: another reaper holds the lock` (the kernel drops the lock when a holder dies, however it dies). A stop uses the pod's own run id where the pod carries one. The installer writes the service file only when the target is a plain file of the user's own (never through a symlink), by temp file and rename, and its uninstall removes only a file the template makes (a regular file of the user's own with other content is overwritten by install, by rename, as the installer's own path; a symlink, a non-regular file, a foreign or group-writable file is refused). Path settings must be absolute paths of plain characters. While the Mac sleeps the reaper pauses.
 - `end_hook.py`, installed in the image as `cw-end-hook`: WIP commit, push to `<worker>/wip`, one JSON line.
 - `token_mint.py`, installed as `cw-token-mint`: mints a token at start and on demand, refuses more than 3600 s,
   writes it to a tmpfs file only.
@@ -76,6 +76,16 @@ file (exit 3, `report refused`), and exits 3 (`no report yet`) when the file is 
 Ctrl-C, SIGTERM or any exception inside `create` deletes the per-run Secret and the pod it made and writes a
 `create.interrupted` (or `create.failed`) audit line naming what was cleaned. If a delete fails, stderr and the audit line
 say which pod or secret REMAINS, and the exit is non-zero (130 for a signal).
+
+## The stack create and the fresh-node race
+
+`create --stack` watches a Pending pod for a bounded window (4 minutes, at most 3 attempts) and recreates it, with the same
+run id and nonce and without touching the per-run secrets, in two cases. First, the node's runtime handler is not yet
+known (the exact `FailedCreatePodSandBox` message): the node's runtime is configured by the installer about 30 to 60
+seconds after scheduling. Second, the pending pod vanishes: a get that saw the pod then says not found, which live run B
+saw when that runtime restart took the Pending pod object with it. Each attempt writes one audit line (`attempt N of 3`,
+and `pod vanished` for the second case). Before a recreate the launcher checks that this call's own Secrets are still there: a missing one means an outside deletion (a stop, the reaper), which fails the create without recreating (the check also runs after a recreate and before ready; it narrows the race with a stop in flight and cannot close it, as the pod and Secret deletes are not one step: a stop deletes the pod first and the Secrets later, so the creator can recreate and the Secret deletes land after the last check; if that pod never starts, the create's own wait ends and its cleanup deletes it; if it started and was reported ready, the stop has finished and the only later catch is the reaper at `--hard` (or idle)). A pod that was never seen, and every other failure, is not retried. The window is checked after each attempt ends, so it bounds the count of attempts, not the wall time (worst case 3 times the `--wait` plus 150 s of delete wait). After the
+attempts or the window the create fails and the message names the race or the vanish. See `docs/cloud-worker-interface.md`.
 
 ## Driving a cloud worker from the switchboard (`launch --cloud`, `send`, `read`, `status`, `retire`)
 

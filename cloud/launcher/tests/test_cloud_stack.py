@@ -275,6 +275,193 @@ class FreshNodeRace(Base):
         self.stack("--stack")
         self.assertEqual(self.pod()["spec"]["runtimeClassName"], "sysbox-runc")
 
+    # -- the pod that vanishes while pending (S11 and the table of watch outcomes) --
+    def pod_creates(self):
+        return [o for o in self.st()["applied"] if o["kind"] == "Pod"]
+
+    def reasons(self):
+        return [l["reason"] for l in self.attempts()]
+
+    def test_s11_the_message_then_the_pod_vanishes_then_success(self):   # kills: recreate only on the event message
+        self.patch_state(plan=["race_vanish", "ok"])
+        self.stack("--stack")
+        pods = self.pod_creates()
+        self.assertEqual(len(pods), 2)
+        self.assertEqual([p["metadata"]["annotations"]["cw/run-id"] for p in pods], [self.RUN_ID] * 2)
+        self.assertEqual(self.secrets_made(), [cw.pod_name("coder7") + "-pw"])   # one secret create
+        self.assertEqual(len(self.attempts()), 2)
+        self.assertIsNotNone(self.pod())
+
+    def test_vanish_with_no_message_then_success(self):   # kills: the vanish branch removed
+        self.patch_state(plan=["vanish", "ok"])
+        self.stack("--stack")
+        self.assertEqual(len(self.pod_creates()), 2)
+        self.assertIn("pod vanished", self.reasons()[0]); self.assertFalse(self.attempts()[0]["ok"])
+        self.assertTrue(self.attempts()[1]["ok"])
+        self.assertEqual(self.secrets_made(), [cw.pod_name("coder7") + "-pw"])
+
+    def test_message_then_vanish_then_success_across_pods(self):
+        self.patch_state(plan=["race", "vanish", "ok"])
+        self.stack("--stack")
+        self.assertEqual(len(self.pod_creates()), 3)
+        self.assertIn("handler", self.reasons()[0]); self.assertIn("pod vanished", self.reasons()[1])
+        self.assertEqual(self.secrets_made(), [cw.pod_name("coder7") + "-pw"])
+
+    def test_vanish_twice_then_success(self):
+        self.patch_state(plan=["vanish", "vanish", "ok"])
+        self.stack("--stack")
+        self.assertEqual(len(self.pod_creates()), 3)
+        self.assertEqual(len(self.attempts()), 3)
+        self.assertEqual([("attempt %d of 3" % i) in r for i, r in enumerate(self.reasons(), 1)], [True] * 3)
+        self.assertEqual(self.secrets_made(), [cw.pod_name("coder7") + "-pw"])   # kills: secrets recreated per attempt
+
+    def test_vanish_three_times_fails_names_it_and_leaves_nothing(self):   # kills: the attempt cap ignored
+        self.patch_state(plan=["vanish"] * 5)
+        out, err = self.stack("--stack", code=cw.EXIT_CLOUD)
+        self.assertIn("vanished", err)
+        self.assertEqual(len(self.pod_creates()), 3)
+        self.assertEqual(len(self.attempts()), 3)
+        self.assertIn("giving up", self.reasons()[2])
+        self.assertEqual(self.secrets_made(), [cw.pod_name("coder7") + "-pw"])   # made once
+        self.assertEqual(self.st()["pods"], {}); self.assertEqual(self.st()["secrets"], {})
+        self.assertFalse(self.audit_lines()[-1]["ok"])
+
+    def test_vanish_respects_the_window(self):   # kills: the deadline ignored on the vanish branch
+        self.patch_state(plan=["vanish"] * 3)
+        old, cw.STACK_RACE_WINDOW_SECONDS = cw.STACK_RACE_WINDOW_SECONDS, 0
+        try:
+            out, err = self.stack("--stack", code=cw.EXIT_CLOUD)
+        finally:
+            cw.STACK_RACE_WINDOW_SECONDS = old
+        self.assertIn("vanished", err)
+        self.assertEqual(len(self.pod_creates()), 1)
+
+    def test_a_pod_that_never_existed_is_not_retried(self):
+        self.patch_state(hide_pod=True)
+        out, err = self.stack("--stack", "--wait", "10", code=cw.EXIT_TIMEOUT)
+        self.assertEqual(len(self.pod_creates()), 1)
+        self.assertEqual(len(self.attempts()), 1)
+        self.assertNotIn("vanished", self.reasons()[0])
+
+    def test_the_run_secret_is_made_once_when_the_pod_vanishes(self):
+        r, w = os.pipe(); os.write(w, b"x" * 12); os.close(w)
+        self.patch_state(plan=["vanish", "ok"])
+        try:
+            self.stack("--stack", "--run-secret-fd", "tok=%d" % r)
+        finally:
+            os.close(r)
+        self.assertEqual(len([c for c in self.calls("generic") if c[c.index("generic") - 1] == "secret"]), 1)
+
+    def test_a_failed_phase_is_not_retried(self):
+        self.patch_state(other_failure="failed to pull image: not found")
+        self.stack("--stack", "--wait", "10", code=cw.EXIT_TIMEOUT)
+        self.assertEqual(len(self.pod_creates()), 1)
+        self.assertNotIn("vanished", self.reasons()[0])
+
+    def _run_secret(self):
+        r, w = os.pipe(); os.write(w, b"x" * 12); os.close(w)
+        return r
+
+    def _outside(self, kills, *extra):
+        self.patch_state(plan=["vanish:" + kills, "ok"])
+        r = self._run_secret()
+        try:
+            out, err = self.stack("--stack", "--run-secret-fd", "tok=%d" % r, *extra, code=cw.EXIT_CLOUD)
+        finally:
+            os.close(r)
+        return err
+
+    def test_a_stop_during_the_window_is_not_recreated(self):   # kills: no check that the call's own objects remain
+        err = self._outside("pw,run")
+        self.assertIn("removed from outside", err)
+        self.assertEqual(len(self.pod_creates()), 1)
+        self.assertEqual(self.st()["pods"], {})
+
+    def test_a_stop_in_flight_whose_secret_deletes_come_after_the_recreate(self):   # kills: no check after the recreate
+        err = self._outside("late-pw,late-run")
+        self.assertIn("removed from outside", err)
+        self.assertEqual(len(self.pod_creates()), 2)   # the recreate happened, was refused as ready, and the cleanup ran
+        self.assertEqual(self.st()["pods"], {})
+        self.assertFalse(self.audit_lines()[-1]["ok"])
+
+    def test_the_recreate_is_checked_before_it_is_waited_on(self):   # kills: no check straight after the recreate (the ready check alone is too late)
+        self.patch_state(plan=["vanish:late-pw,late-run", "never_ready_pod"])
+        r = self._run_secret()
+        try:
+            out, err = self.stack("--stack", "--run-secret-fd", "tok=%d" % r, code=cw.EXIT_CLOUD)
+        finally:
+            os.close(r)
+        self.assertIn("removed from outside", err)
+        self.assertEqual(len(self.pod_creates()), 2)
+        self.assertEqual(len(self.attempts()), 1)   # the second pod was never waited on
+
+    def test_a_stop_whose_secret_deletes_land_after_the_recreate_check_is_not_reported_ready(self):   # kills: no check before the ready line
+        err = self._outside("ready-pw,ready-run")
+        self.assertIn("removed from outside", err)
+        self.assertEqual(len(self.pod_creates()), 2)
+        self.assertFalse(any("ready" in a["reason"] for a in self.audit_lines() if a.get("action") == "create-attempt" and a["ok"]))
+        self.assertEqual(self.st()["pods"], {})
+
+    # THE STOP RACE: every check the lane added, with the test that kills its mutant (the call removed from _start_stack_pod)
+    STOP_RACE_CHECKS = {
+        "before the delete (pre-delete)": "test_a_stop_during_the_window_is_not_recreated",
+        "straight after the recreate (post-recreate)": "test_a_stop_in_flight_whose_secret_deletes_come_after_the_recreate",
+        "before the ready line (pre-ready)": "test_a_stop_whose_secret_deletes_land_after_the_recreate_check_is_not_reported_ready",
+    }
+
+    def test_every_stop_race_check_has_a_named_test(self):   # a guard only: the named tests exist (each check's mutant was run and dies)
+        for check, name in self.STOP_RACE_CHECKS.items():
+            with self.subTest(check=check):
+                self.assertTrue(callable(getattr(self, name, None)), name)
+
+    def test_a_secret_of_another_run_is_not_this_calls(self):   # kills: a presence-only check
+        self.assertIn("removed from outside", self._outside("swap-pw"))
+        self.assertEqual(len(self.pod_creates()), 1)
+
+    def test_a_secret_deleted_alone_is_not_recreated(self):
+        for kill in ("pw", "run"):
+            with self.subTest(kill=kill):
+                self.setUp()
+                self.assertIn("removed from outside", self._outside(kill))
+                self.assertEqual(len(self.pod_creates()), 1)
+
+    def test_a_pod_deleted_alone_with_the_secrets_present_is_recreated(self):
+        self.patch_state(plan=["vanish:", "ok"])
+        r = self._run_secret()
+        try:
+            self.stack("--stack", "--run-secret-fd", "tok=%d" % r)
+        finally:
+            os.close(r)
+        self.assertEqual(len(self.pod_creates()), 2)
+
+    # the table of watch-loop outcomes, derived from the loop: each is RUN here (name: plan, state, extra args, exit, pod creates, reason word)
+    OUTCOMES = {
+        "ready": ({}, [], 0, 1, "ready"),
+        "race": ({}, ["race", "ok"], 0, 2, "handler"),
+        "vanish": ({}, ["vanish", "ok"], 0, 2, "pod vanished"),
+        "race_then_vanish": ({}, ["race_vanish", "ok"], 0, 2, "handler"),
+        "never_seen": ({"hide_pod": True}, [], cw.EXIT_TIMEOUT, 1, "timed out"),
+        "other_failure": ({"other_failure": "failed to pull image: not found"}, [], cw.EXIT_TIMEOUT, 1, "timed out"),
+        "cap": ({}, ["vanish"] * 5, cw.EXIT_CLOUD, 3, "giving up"),
+        "outside_deletion": ({}, ["vanish:pw", "ok"], cw.EXIT_CLOUD, 1, "removed from outside"),
+    }
+
+    def test_every_outcome_of_the_watch_loop_is_run(self):   # kills: a branch emptied or an outcome with no row
+        for outcome, (state, plan, code, creates, word) in self.OUTCOMES.items():
+            with self.subTest(outcome=outcome):
+                self.setUp()
+                self.patch_state(plan=plan, **state)
+                c, out, err = self.run_cli("create", "coder7", "--repo", "acme-org/widget-service", "--branch", "main", "--run-id", self.RUN_ID,
+                                           "--stack", "--wait", "10")
+                self.assertEqual(c, code, err)
+                self.assertEqual(len(self.pod_creates()), creates)
+                self.assertIn(word, err + " ".join(self.reasons()))
+                self.assertEqual(self.secrets_made(), [cw.pod_name("coder7") + "-pw"])   # never more than once
+
+    def test_the_default_create_never_watches_a_vanish(self):
+        self.stack()
+        self.assertEqual(self.calls("events"), [])
+
 
 def _with_caps(stack, caps, where="containers"):
     pod = build(_args(stack=stack))
